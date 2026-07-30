@@ -75,6 +75,7 @@ from sparkinfer.moe.fused_moe.aot import (
 HIDDEN = 6_144
 INTERMEDIATE = 512
 FC1_COLS = 2 * INTERMEDIATE
+ACCEPTED_PERFORMANCE_PSTATES = ("P0", "P1")
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -1107,8 +1108,12 @@ def _acceptance_reasons(
                 reasons.append(f"M{rows} {label} snapshot UUID differs")
             if snapshot.get("compute_mode") != "Default":
                 reasons.append(f"M{rows} {label} compute mode is not Default")
-            if snapshot.get("pstate") != "P1":
-                reasons.append(f"M{rows} {label} snapshot is not P1")
+            if snapshot.get("pstate") not in ACCEPTED_PERFORMANCE_PSTATES:
+                reasons.append(
+                    f"M{rows} {label} snapshot pstate "
+                    f"{snapshot.get('pstate')!r} is outside "
+                    f"{ACCEPTED_PERFORMANCE_PSTATES}"
+                )
             if (
                 snapshot.get("clocks_throttle_reasons.active")
                 != args.accepted_throttle_mask
@@ -1120,6 +1125,8 @@ def _acceptance_reasons(
                 )
         if before.get("clocks.current.memory") != after.get("clocks.current.memory"):
             reasons.append(f"M{rows} memory clock changed during timing")
+        if before.get("pstate") != after.get("pstate"):
+            reasons.append(f"M{rows} pstate changed during timing")
         delta_pct = clock.get("sm_clock_delta_pct")
         if (
             not isinstance(delta_pct, (int, float))
@@ -1304,7 +1311,8 @@ def main() -> None:
         "compute_capability": list(capability),
         "hardware_sm_count": int(properties.multi_processor_count),
         "clock_policy": {
-            "required_pstate": "P1",
+            "accepted_performance_pstates": list(ACCEPTED_PERFORMANCE_PSTATES),
+            "require_stable_pstate": True,
             "accepted_throttle_mask": args.accepted_throttle_mask,
             "max_sm_clock_delta_pct": args.max_sm_clock_delta_pct,
         },
