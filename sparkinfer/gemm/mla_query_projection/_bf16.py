@@ -17,6 +17,8 @@ _ROPE_DIM = 64
 _QUERY_DIM = _LATENT_DIM + _ROPE_DIM
 _MAX_M = 32
 _QUALIFIED_HEADS = frozenset((8, 11, 16))
+_GLM_H64_HEADS = 64
+_GLM_H64_QUALIFIED_HEADS = frozenset((_GLM_H64_HEADS,))
 _BLOCK_N = 32
 _BLOCK_K = 64
 _COMPILED_SIGNATURES: set[tuple[int, int, bool]] = set()
@@ -111,14 +113,17 @@ def _validate(
     q_pe: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
+    *,
+    qualified_heads: frozenset[int] = _QUALIFIED_HEADS,
+    contract: str = "the BF16 fused MLA query specialization",
 ) -> tuple[int, int, bool]:
     if q_nope.ndim != 3:
         raise ValueError(f"q_nope must have shape [H,M,192], got {q_nope.shape}")
     heads, m, nope_dim = map(int, q_nope.shape)
-    if heads not in _QUALIFIED_HEADS or not 1 <= m <= _MAX_M or nope_dim != _NOPE_DIM:
+    if heads not in qualified_heads or not 1 <= m <= _MAX_M or nope_dim != _NOPE_DIM:
         raise NotImplementedError(
-            "the BF16 fused MLA query specialization requires "
-            f"H in {sorted(_QUALIFIED_HEADS)}, 1<=M<=32, K=192; "
+            f"{contract} requires "
+            f"H in {sorted(qualified_heads)}, 1<=M<=32, K=192; "
             f"got H={heads}, M={m}, K={nope_dim}"
         )
     if tuple(weight.shape) != (heads, _NOPE_DIM, _LATENT_DIM):
@@ -181,14 +186,17 @@ def _validate(
     return heads, m, output_fp8
 
 
-def _launch(
+def _launch_validated(
     q_nope: torch.Tensor,
     weight: torch.Tensor,
     q_pe: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
+    *,
+    heads: int,
+    m: int,
+    output_fp8: bool,
 ) -> None:
-    heads, m, output_fp8 = _validate(q_nope, weight, q_pe, q_scale, out)
     block_m = 16 if m <= 16 else 32
     device_index = int(
         q_nope.device.index
@@ -236,6 +244,56 @@ def _launch(
     _COMPILED_SIGNATURES.add(signature)
 
 
+def _launch(
+    q_nope: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> None:
+    heads, m, output_fp8 = _validate(q_nope, weight, q_pe, q_scale, out)
+    _launch_validated(
+        q_nope,
+        weight,
+        q_pe,
+        q_scale,
+        out,
+        heads=heads,
+        m=m,
+        output_fp8=output_fp8,
+    )
+
+
+def _launch_glm_h64_bf16(
+    q_nope: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    if out.dtype != torch.bfloat16:
+        raise TypeError("the explicit GLM H64 MLA query output must be bfloat16")
+    heads, m, output_fp8 = _validate(
+        q_nope,
+        weight,
+        q_pe,
+        None,
+        out,
+        qualified_heads=_GLM_H64_QUALIFIED_HEADS,
+        contract="the explicit GLM H64 BF16 MLA query specialization",
+    )
+    assert not output_fp8
+    _launch_validated(
+        q_nope,
+        weight,
+        q_pe,
+        None,
+        out,
+        heads=heads,
+        m=m,
+        output_fp8=False,
+    )
+
+
 @torch.library.custom_op("sparkinfer::mla_query_projection_bf16", mutates_args=("out",))
 def _op(
     q_nope: torch.Tensor,
@@ -256,6 +314,28 @@ def _fake(
     out: torch.Tensor,
 ) -> None:
     del q_nope, weight, q_pe, q_scale, out
+
+
+@torch.library.custom_op(
+    "sparkinfer::mla_query_projection_glm_h64_bf16", mutates_args=("out",)
+)
+def _glm_h64_bf16_op(
+    q_nope: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _launch_glm_h64_bf16(q_nope, weight, q_pe, out)
+
+
+@_glm_h64_bf16_op.register_fake
+def _glm_h64_bf16_fake(
+    q_nope: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    del q_nope, weight, q_pe, out
 
 
 def run(
@@ -282,6 +362,30 @@ def run(
         if q_scale is not None:
             tensors.append(q_scale)
         for tensor in tensors:
+            tensor.record_stream(target)
+    return out
+
+
+def run_glm_h64_bf16(
+    q_nope: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    stream: Optional[object] = None,
+) -> torch.Tensor:
+    """Run the one-launch GLM H64 BF16 projection and assembly contract."""
+    if stream is None:
+        torch.ops.sparkinfer.mla_query_projection_glm_h64_bf16(
+            q_nope, weight, q_pe, out
+        )
+        return out
+    target = _torch_stream(stream, q_nope.device)
+    with torch.cuda.stream(target):
+        torch.ops.sparkinfer.mla_query_projection_glm_h64_bf16(
+            q_nope, weight, q_pe, out
+        )
+        for tensor in (q_nope, weight, q_pe, out):
             tensor.record_stream(target)
     return out
 
@@ -351,6 +455,73 @@ def prewarm(
     return len(warmed_regimes)
 
 
+def prewarm_glm_h64_bf16(
+    weight: torch.Tensor,
+    m_values: Iterable[int],
+    *,
+    stream: Optional[object] = None,
+    synchronize: bool = True,
+) -> int:
+    """Compile and first-launch every declared GLM H64 BF16 M regime."""
+    if tuple(weight.shape) != (_GLM_H64_HEADS, _NOPE_DIM, _LATENT_DIM):
+        raise ValueError(
+            "GLM H64 BF16 weight must have shape "
+            f"{(_GLM_H64_HEADS, _NOPE_DIM, _LATENT_DIM)}, "
+            f"got {tuple(weight.shape)}"
+        )
+    if weight.dtype != torch.bfloat16:
+        raise TypeError(f"GLM H64 BF16 weight must be bfloat16, got {weight.dtype}")
+    if not weight.is_cuda:
+        raise ValueError("GLM H64 BF16 weight must be a CUDA tensor")
+    if int(weight.stride(-1)) != 1:
+        raise ValueError("GLM H64 BF16 weight innermost dimension must be contiguous")
+    values = tuple(dict.fromkeys(int(value) for value in m_values if int(value) > 0))
+    for m in values:
+        if not can_implement_glm_h64_bf16(
+            num_heads=_GLM_H64_HEADS,
+            max_m=m,
+            nope_dim=_NOPE_DIM,
+            latent_dim=_LATENT_DIM,
+            output_dtype=torch.bfloat16,
+            device=weight.device,
+        ):
+            raise NotImplementedError(
+                "the explicit GLM H64 BF16 MLA query specialization cannot "
+                f"prewarm M={m}"
+            )
+    target = _torch_stream(stream, weight.device)
+    warmed_regimes: set[int] = set()
+    with torch.cuda.stream(target):
+        for m in values:
+            block_m = 16 if m <= 16 else 32
+            if block_m in warmed_regimes:
+                continue
+            warmed_regimes.add(block_m)
+            q_nope = torch.zeros(
+                (_GLM_H64_HEADS, m, _NOPE_DIM),
+                dtype=torch.bfloat16,
+                device=weight.device,
+            )
+            q_pe = torch.zeros(
+                (m, _GLM_H64_HEADS, _ROPE_DIM),
+                dtype=torch.bfloat16,
+                device=weight.device,
+            )
+            out = torch.empty(
+                (m, _GLM_H64_HEADS, _QUERY_DIM),
+                dtype=torch.bfloat16,
+                device=weight.device,
+            )
+            torch.ops.sparkinfer.mla_query_projection_glm_h64_bf16(
+                q_nope, weight, q_pe, out
+            )
+            for tensor in (q_nope, q_pe, out):
+                tensor.record_stream(target)
+    if synchronize:
+        target.synchronize()
+    return len(warmed_regimes)
+
+
 def can_implement(
     *,
     num_heads: int,
@@ -371,8 +542,36 @@ def can_implement(
     )
 
 
+def can_implement_glm_h64_bf16(
+    *,
+    num_heads: int,
+    max_m: int,
+    nope_dim: int,
+    latent_dim: int,
+    output_dtype: torch.dtype,
+    device=None,
+) -> bool:
+    """Return whether operands match the explicit one-launch GLM contract."""
+    del device
+    return bool(
+        int(num_heads) == _GLM_H64_HEADS
+        and 1 <= int(max_m) <= _MAX_M
+        and int(nope_dim) == _NOPE_DIM
+        and int(latent_dim) == _LATENT_DIM
+        and output_dtype == torch.bfloat16
+    )
+
+
 def clear_caches() -> None:
     _COMPILED_SIGNATURES.clear()
 
 
-__all__ = ["can_implement", "clear_caches", "prewarm", "run"]
+__all__ = [
+    "can_implement",
+    "can_implement_glm_h64_bf16",
+    "clear_caches",
+    "prewarm",
+    "prewarm_glm_h64_bf16",
+    "run",
+    "run_glm_h64_bf16",
+]

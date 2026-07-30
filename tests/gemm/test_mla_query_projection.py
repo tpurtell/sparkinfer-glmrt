@@ -289,3 +289,106 @@ def test_bf16_weight_requires_scale_only_for_fp8() -> None:
     out_fp8 = torch.empty(2, 8, 576, device="cuda", dtype=torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="q_scale is required"):
         mla_query_projection.run(q_nope, weight, q_pe, out_fp8)
+
+
+def _glm_h64_bf16_inputs(
+    *, m: int, seed: int = 73
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    torch.manual_seed(seed)
+    # Exercise the actual GLM views: token-major Q exposed head-major without
+    # a copy, a K prefix of the [H,448,512] resident KV-B tensor, and a RoPE
+    # suffix retaining the full 576-element token/head stride.
+    q_token_major = torch.randn(m, 64, 256, device="cuda", dtype=torch.bfloat16) * 0.5
+    q_nope = q_token_major[..., :192].permute(1, 0, 2)
+    kv_b = torch.randn(64, 448, 512, device="cuda", dtype=torch.bfloat16) * 0.05
+    weight = kv_b[:, :192, :]
+    q_full = torch.randn(m, 64, 576, device="cuda", dtype=torch.bfloat16)
+    q_pe = q_full[..., 512:]
+    return q_nope, weight, q_pe
+
+
+@pytest.mark.parametrize("m", [1, 2, 16, 32])
+def test_glm_h64_bf16_matches_staged_projection_with_production_views(m: int) -> None:
+    require_sparkinfer()
+    q_nope, weight, q_pe = _glm_h64_bf16_inputs(m=m)
+    expected = torch.cat(
+        (torch.bmm(q_nope, weight).transpose(0, 1), q_pe),
+        dim=-1,
+    )
+    backing = torch.empty(m, 64, 584, device="cuda", dtype=torch.bfloat16)
+    out = backing[..., :576]
+
+    returned = mla_query_projection.run_glm_h64_bf16(q_nope, weight, q_pe, out)
+
+    assert returned is out
+    assert torch.equal(out, expected)
+    assert torch.equal(out[..., 512:], q_pe)
+
+
+def test_glm_h64_bf16_cuda_graph_replays_fresh_strided_inputs() -> None:
+    require_sparkinfer()
+    q_nope, weight, q_pe = _glm_h64_bf16_inputs(m=4)
+    assert mla_query_projection.prewarm_glm_h64_bf16(weight, [4]) == 1
+    out = torch.empty(4, 64, 576, device="cuda", dtype=torch.bfloat16)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mla_query_projection.run_glm_h64_bf16(q_nope, weight, q_pe, out)
+
+    first_nope = torch.randn_like(q_nope)
+    first_pe = torch.randn_like(q_pe)
+    q_nope.copy_(first_nope)
+    q_pe.copy_(first_pe)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = torch.cat(
+        (torch.bmm(first_nope, weight).transpose(0, 1), first_pe),
+        dim=-1,
+    )
+    assert torch.equal(out, expected)
+
+    second_nope = torch.randn_like(q_nope)
+    q_nope.copy_(second_nope)
+    allocation_before = torch.cuda.memory_allocated()
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    allocation_after = torch.cuda.memory_allocated()
+    expected = torch.cat(
+        (torch.bmm(second_nope, weight).transpose(0, 1), first_pe),
+        dim=-1,
+    )
+    assert torch.equal(out, expected)
+    assert allocation_after == allocation_before
+
+
+def test_glm_h64_bf16_support_gate_is_explicit_and_narrow() -> None:
+    device = require_sparkinfer()
+    kwargs = dict(
+        num_heads=64,
+        max_m=32,
+        nope_dim=192,
+        latent_dim=512,
+        output_dtype=torch.bfloat16,
+        device=device,
+    )
+    assert mla_query_projection.can_implement_glm_h64_bf16(**kwargs)
+    assert not mla_query_projection.can_implement(**{**kwargs, "weight_format": "bf16"})
+    assert not mla_query_projection.can_implement_glm_h64_bf16(
+        **{**kwargs, "num_heads": 16}
+    )
+    assert not mla_query_projection.can_implement_glm_h64_bf16(
+        **{**kwargs, "max_m": 33}
+    )
+    assert not mla_query_projection.can_implement_glm_h64_bf16(
+        **{**kwargs, "output_dtype": torch.float8_e4m3fn}
+    )
+
+
+def test_glm_h64_bf16_rejects_fp8_output() -> None:
+    require_sparkinfer()
+    q_nope, weight, q_pe = _glm_h64_bf16_inputs(m=2)
+    out = torch.empty(2, 64, 576, device="cuda", dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(TypeError, match="output must be bfloat16"):
+        mla_query_projection.run_glm_h64_bf16(q_nope, weight, q_pe, out)

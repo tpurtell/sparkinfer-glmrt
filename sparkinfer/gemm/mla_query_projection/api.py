@@ -16,6 +16,71 @@ Mxfp8Weight: TypeAlias = tuple[torch.Tensor, torch.Tensor]
 MlaQueryWeight: TypeAlias = torch.Tensor | Mxfp8Weight
 
 
+def run_glm_h64_bf16(
+    q_nope: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    stream: Optional[object] = None,
+) -> torch.Tensor:
+    """Run the explicit one-launch GLM H=64 BF16 query projection.
+
+    This intentionally does not widen :func:`run`'s generic BF16 geometry.
+    It accepts a head-major ``q_nope`` view ``[64,M,192]``, the K slice of
+    GLM's sole resident KV-B tensor as ``[64,192,512]``, token-major
+    ``q_pe`` ``[M,64,64]``, and caller-owned BF16 ``out`` ``[M,64,576]``.
+    Arbitrary outer strides are supported; innermost dimensions must remain
+    contiguous.  ``1 <= M <= 32``.
+    """
+    return _bf16.run_glm_h64_bf16(
+        q_nope,
+        weight,
+        q_pe,
+        out,
+        stream=stream,
+    )
+
+
+def prewarm_glm_h64_bf16(
+    weight: torch.Tensor,
+    m_values: Iterable[int],
+    *,
+    stream: Optional[object] = None,
+    synchronize: bool = True,
+) -> int:
+    """Compile and first-launch the declared H=64 BF16 graph regimes."""
+    return _bf16.prewarm_glm_h64_bf16(
+        weight,
+        m_values,
+        stream=stream,
+        synchronize=synchronize,
+    )
+
+
+def can_implement_glm_h64_bf16(
+    *,
+    num_heads: int,
+    max_m: int,
+    nope_dim: int,
+    latent_dim: int,
+    output_dtype: torch.dtype,
+    device=None,
+) -> bool:
+    """Return whether metadata exactly matches the narrow GLM H=64 spec."""
+    return bool(
+        is_supported(device)
+        and _bf16.can_implement_glm_h64_bf16(
+            num_heads=num_heads,
+            max_m=max_m,
+            nope_dim=nope_dim,
+            latent_dim=latent_dim,
+            output_dtype=output_dtype,
+            device=device,
+        )
+    )
+
+
 def run(
     q_nope: torch.Tensor,
     weight: MlaQueryWeight,
