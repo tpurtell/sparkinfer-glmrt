@@ -52,7 +52,9 @@ def plan_glm_h64_bf16(
     Automatic policy is deliberately narrower than kernel support: the
     all-layer GLMRT gate initially promotes packed decode with ``M=2..16``.
     H64 remains available through ``policy="force"`` for the measured M=1 and
-    prefill diagnostics, without changing automatic serving behavior.
+    prefill diagnostics, without changing automatic serving behavior.  Force
+    means "use H64 wherever supported"; unsupported buckets retain the native
+    fallback so a full mixed-size qualification run remains executable.
     """
     if workload not in ("packed_decode", "prefill"):
         raise ValueError(
@@ -73,19 +75,22 @@ def plan_glm_h64_bf16(
         device=device,
     )
     if policy == "force":
-        if not supported:
-            raise NotImplementedError(
-                "forced GLM H64 BF16 query projection is unsupported for "
-                f"workload={workload}, M={rows}, H={num_heads}, "
-                f"K={nope_dim}, N={latent_dim}, dtype={output_dtype}"
+        if supported:
+            return GlmH64Bf16QueryProjectionPlan(
+                backend="sparkinfer_glm_h64_bf16",
+                workload=workload,
+                policy=policy,
+                query_rows=rows,
+                h64_supported=True,
+                reason="explicit_force",
             )
         return GlmH64Bf16QueryProjectionPlan(
-            backend="sparkinfer_glm_h64_bf16",
+            backend="native",
             workload=workload,
             policy=policy,
             query_rows=rows,
-            h64_supported=True,
-            reason="explicit_force",
+            h64_supported=False,
+            reason="explicit_force_unsupported_native_fallback",
         )
     if policy == "disable":
         return GlmH64Bf16QueryProjectionPlan(

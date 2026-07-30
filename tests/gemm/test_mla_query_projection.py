@@ -444,13 +444,15 @@ def test_glm_h64_bf16_planner_keeps_fallbacks_diagnostic_reachable() -> None:
     assert disabled.h64_supported
     assert disabled.reason == "explicit_disable"
 
-    with pytest.raises(NotImplementedError, match="forced GLM H64"):
-        mla_query_projection.plan_glm_h64_bf16(
-            workload="prefill",
-            policy="force",
-            query_rows=33,
-            **geometry,
-        )
+    forced_unsupported = mla_query_projection.plan_glm_h64_bf16(
+        workload="prefill",
+        policy="force",
+        query_rows=33,
+        **geometry,
+    )
+    assert not forced_unsupported.use_sparkinfer
+    assert not forced_unsupported.h64_supported
+    assert forced_unsupported.reason == "explicit_force_unsupported_native_fallback"
 
 
 def test_glm_h64_bf16_rejects_fp8_output() -> None:
