@@ -149,6 +149,46 @@ _W4A16_SMALL_M_DIRECT_MAX_M = 8
 # _TC_DECODE_M is retained for callers/tests that enumerate the supported sizes.
 _TC_DECODE_MAX_M = _W4A16_SMALL_M_DIRECT_MAX_M
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
+_FUSED_PACKED_O3_MAX_M = 256
+
+
+def _w4a16_fused_dsl_opt_level(
+    *,
+    size_m: int,
+    top_k: int,
+    element_dtype: str,
+    weight_layout: str,
+    scale_format: str,
+    direct_topk_routes: bool,
+    collect_activation_amax: bool,
+    intermediate_rotation: bool,
+) -> int:
+    """Select the compiler schedule for a fused W4A16 specialization.
+
+    CUTLASS DSL 4.6's O2 schedule avoids the register cliff observed by the
+    very-large serving-prefill specializations. O3 is qualified only for the
+    measured top-k=8 direct-route M<=6 range and packed-route buckets from
+    M=32 through M=256. Route-packed top-k=8 at M<=16 is flat/noisy at M=8
+    and regressed slightly at M=16, so it stays on O2. Top-1 remains O2 at
+    every M until an attributable target-GPU A/B qualifies exact buckets.
+    Keep O2 for every other layout and feature combination.
+    """
+
+    topology_qualified = (bool(direct_topk_routes) and int(size_m) <= 6) or (
+        not bool(direct_topk_routes) and int(size_m) >= 32
+    )
+    if (
+        1 <= int(size_m) <= _FUSED_PACKED_O3_MAX_M
+        and int(top_k) == 8
+        and topology_qualified
+        and element_dtype == "bf16"
+        and weight_layout == "packed"
+        and scale_format == "e4m3_k16"
+        and not collect_activation_amax
+        and not intermediate_rotation
+    ):
+        return 3
+    return 2
 
 
 @dsl_user_op
@@ -518,6 +558,7 @@ class W4A16ActivationCompileResult:
     swiglu_limit: float | None
     swiglu_alpha: float
     swiglu_beta: float
+    w13_layout: str = "w31"
 
 
 @dataclass(frozen=True)
@@ -6234,6 +6275,7 @@ class W4A16ActivationKernel:
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
+        w13_layout: str = "w31",
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6247,6 +6289,9 @@ class W4A16ActivationKernel:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if rows <= 0 or intermediate_size <= 0:
             raise ValueError("rows and intermediate_size must be positive")
+        w13_layout = str(w13_layout).lower()
+        if w13_layout not in _MODEL_OPT_W13_LAYOUTS:
+            raise ValueError("w13_layout must be 'w13' or 'w31'")
         self.rows = int(rows)
         self.intermediate_size = int(intermediate_size)
         self.activation = activation
@@ -6260,6 +6305,8 @@ class W4A16ActivationKernel:
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.fast_math = bool(fast_math)
+        self.w13_layout = w13_layout
+        self.w13_gate_first = w13_layout == "w31"
         self.cta_threads = 256
 
     @property
@@ -6276,6 +6323,7 @@ class W4A16ActivationKernel:
             self.swiglu_beta,
             self.element_dtype,
             self.fast_math,
+            self.w13_layout,
             self.cta_threads,
         )
 
@@ -6334,10 +6382,16 @@ class W4A16ActivationKernel:
                 row = idx // Int32(self.intermediate_size)
                 col = idx - row * Int32(self.intermediate_size)
                 base = row * Int32(2 * self.intermediate_size)
-                gate = fc1_flat[base + col].to(cutlass.Float32)
-                up = fc1_flat[base + Int32(self.intermediate_size) + col].to(
-                    cutlass.Float32
-                )
+                if cutlass.const_expr(self.w13_gate_first):
+                    gate = fc1_flat[base + col].to(cutlass.Float32)
+                    up = fc1_flat[base + Int32(self.intermediate_size) + col].to(
+                        cutlass.Float32
+                    )
+                else:
+                    up = fc1_flat[base + col].to(cutlass.Float32)
+                    gate = fc1_flat[base + Int32(self.intermediate_size) + col].to(
+                        cutlass.Float32
+                    )
                 gate, up = self._clamp_swiglu_inputs(gate, up)
                 sigmoid_arg = gate
                 up_term = up
@@ -7420,10 +7474,21 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
     )
+    dsl_opt_level = _w4a16_fused_dsl_opt_level(
+        size_m=size_m,
+        top_k=top_k,
+        element_dtype=element_dtype,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        direct_topk_routes=direct_topk_routes,
+        collect_activation_amax=collect_activation_amax,
+        intermediate_rotation=intermediate_rotation,
+    )
     cache_key = (
         "w4a16_fused_moe",
         device,
         kernel.__cache_key__,
+        ("dsl_opt_level", dsl_opt_level),
     )
     cached = _FUSED_CACHE.get(cache_key)
     if cached is not None:
@@ -7687,10 +7752,10 @@ def compile_w4a16_fused_moe(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.fused_moe",
-            4,
+            5,
             cache_key,
         ),
-        dsl_compile_options=OptLevel(2),
+        dsl_compile_options=OptLevel(dsl_opt_level),
     )
     result = W4A16FusedMoeCompileResult(
         compiled=compiled,
@@ -8100,6 +8165,7 @@ def compile_w4a16_activation(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    w13_layout: str = "w31",
 ) -> W4A16ActivationCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     activation = normalize_moe_activation(activation)
@@ -8119,6 +8185,7 @@ def compile_w4a16_activation(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        w13_layout=w13_layout,
     )
     cache_key = (
         "w4a16_activation",
@@ -8151,7 +8218,7 @@ def compile_w4a16_activation(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.activation",
-            1,
+            2,
             cache_key,
         ),
     )
@@ -8163,6 +8230,7 @@ def compile_w4a16_activation(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        w13_layout=kernel.w13_layout,
     )
     _ACTIVATION_CACHE[cache_key] = result
     return result

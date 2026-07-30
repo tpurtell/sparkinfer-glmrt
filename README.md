@@ -14,14 +14,14 @@ use cases please use FlashInfer, CUTLASS or TRTLLM.
 pip install sparkinfer
 ```
 
-You need Python 3.10+, `torch >= 2.12`, and an SM120/SM121 GPU. The CuTe DSL
+You need Python 3.10+, `torch >= 2.12.0a0`, and an SM120/SM121 GPU. The CuTe DSL
 compiler and its CUDA 13 libraries come in as wheel dependencies
-(`nvidia-cutlass-dsl == 4.6.0`), so there is no build step — kernels are
+(`nvidia-cutlass-dsl == 4.6.1`), so there is no build step — kernels are
 JIT-compiled on first use and cached.
 
 ## What's in here
 
-Every kernel is one op at `sparkinfer.<group>.<op>` (17 total; `list_ops()`
+Every kernel is one op at `sparkinfer.<group>.<op>` (20 total; `list_ops()`
 enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
 kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
 `<group>/_shared/` and the universal compile/scratch spine in `sparkinfer/_lib/`.

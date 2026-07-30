@@ -22,6 +22,14 @@ def _on_disk_ops() -> list[str]:
         for op_dir in sorted(group_dir.iterdir()):
             if not op_dir.is_dir() or op_dir.name.startswith("_"):
                 continue
+            init = op_dir / "__init__.py"
+            api = op_dir / "api.py"
+            if (
+                not init.is_file()
+                or not api.is_file()
+                or "META = OpMeta(" not in init.read_text()
+            ):
+                continue
             ops.append(f"{group_dir.name}.{op_dir.name}")
     return ops
 
@@ -41,6 +49,14 @@ def test_registry_matches_disk():
         assert qualname in sparkinfer._OPS
         module = importlib.import_module(f"sparkinfer.{module_path}")
         assert module.META.qualname == qualname
+
+
+def test_registry_distinguishes_ops_from_integration_namespaces():
+    sparkinfer = _sparkinfer()
+
+    assert "gemm.bf16_gemv" in sparkinfer._OPS
+    assert "integration.vllm" not in _on_disk_ops()
+    assert "quantization.mxfp6" not in _on_disk_ops()
 
 
 def test_list_ops_and_find_op():

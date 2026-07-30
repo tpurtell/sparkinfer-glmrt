@@ -105,6 +105,55 @@ one GEMM mainloop: their operand transport and MMA contracts are genuinely
 different.  Route readiness and work ownership no longer need to be entangled
 with those arithmetic choices.
 
+## Spark W4A4-FC1 / W4A16-FC2 composition
+
+`sparkinfer.moe.fused_moe.aot` exposes a top-1 AOT composition for the Spark
+serving shape whose input is already NVFP4-quantized. It deliberately uses one
+asymmetric serving representation:
+
+- W13 stays in source ModelOpt NVFP4 layout and feeds a dense W4A4 FC1;
+- the source W13 order is consumed directly by the BF16 SiLU/product kernel,
+  so there is no W13 reorder buffer;
+- W2 is repacked in place once and only the packed W4A16 view is retained.
+
+The returned owner has neither packed W13 nor source W2 storage. The caller
+must release its pre-preparation W2 references after accepting the returned
+owner; keeping such aliases would violate the one-residency lifecycle even
+though the in-place packed view uses the same allocation.
+
+The public object is a graph-safe composed fused-MoE operator, not one CUDA
+kernel. Its runtime sequence is three graph-capturable launches:
+source-layout W4A4 FC1, BF16 activation/product, then packed W4A16 FC2. FC1 and
+activation materialize their BF16 outputs in a fixed, 256-byte-aligned
+workspace. Packed FC2 retains its normal accumulation scratch and locks. The
+composition removes the old W13 reorder allocation and does not use a
+cooperative grid barrier; it does not claim that the BF16 intermediates or FC2
+scratch are register-only. If timing shows that materialization dominates, the
+next structural step is a source-W13 W4A4 FC1 epilogue that writes only the
+activated BF16 product, preserving packed W2 and the two-stage FC1/FC2 split.
+
+Capacity specializations are available for M=1, 2, 4, 8, 16, 32, 64, 128,
+256, 512, 1024, and 2048. A specialization accepts `active_rows` from one
+through its capacity, but CUDA graph capture freezes that scalar. Integrations
+must therefore capture per-active-row graphs or deliberately execute a padded
+capacity graph. Planning and FC2 launch geometry use the tuned 48-CTA Spark
+grid; the physical SM count is reported independently and is not substituted
+for that tuning constant.
+
+The prequantized input contract includes complete per-K16 E4M3 activation
+scales and has no checkpoint input-global multiplier. FC1 uses the raw
+checkpoint W13 `weight_scale_2`. FC2 uses the compensated BF16 W4A16 scalar
+created by packed W2 preparation. The exported C objects and JSON manifest
+record this scalar, storage, workspace, and launch ABI.
+
+This fork pins the CUTLASS DSL and all four accompanying DSL library packages
+to 4.6.1. Hybrid artifacts and performance evidence must report that exact
+compiler/runtime prerequisite; integrations must not install 4.6.1 over
+metadata that still declares 4.6.0. The Torch floor is `2.12.0a0`, because the
+NGC 26.05 runtime supplies a vendor build based on that prerelease; the stable
+`2.12.0` floor incorrectly rejects the image even though later stable Torch
+versions remain accepted.
+
 ## Native W4A8 convergence
 
 Native W4A8 now uses one dynamic-kernel family across the full routed range.

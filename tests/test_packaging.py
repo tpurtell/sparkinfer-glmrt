@@ -17,6 +17,14 @@ RUNTIME_CUDA_SOURCES = {
     "pcie_oneshot.cu",
     "pcie_twoshot.cu",
 }
+FORK_RUNTIME_REQUIREMENTS = {
+    "torch>=2.12.0a0",
+    "nvidia-cutlass-dsl==4.6.1",
+    "nvidia-cutlass-dsl-libs-base==4.6.1",
+    "nvidia-cutlass-dsl-libs-core==4.6.1",
+    "nvidia-cutlass-dsl-libs-cu12==4.6.1",
+    "nvidia-cutlass-dsl-libs-cu13==4.6.1",
+}
 
 
 def test_runtime_cuda_sources_are_in_package_data() -> None:
@@ -27,3 +35,12 @@ def test_runtime_cuda_sources_are_in_package_data() -> None:
     assert {
         path.name for path in (ROOT / "sparkinfer" / "comm" / "pcie").glob("*.cu")
     } == RUNTIME_CUDA_SOURCES
+
+
+def test_fork_runtime_requirements_match_ngc_and_hybrid_toolchain() -> None:
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    dependencies = set(config["project"]["dependencies"])
+
+    # NGC 26.05 ships a 2.12.0a0+ vendor build, which a >=2.12.0 stable floor
+    # rejects. Hybrid artifacts are compiled and run with the exact 4.6.1 map.
+    assert dependencies >= FORK_RUNTIME_REQUIREMENTS

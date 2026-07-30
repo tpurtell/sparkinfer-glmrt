@@ -5808,6 +5808,11 @@ def _get_compiled_dense_gemm(
         )
         return c_tensor_gpu
 
+    # AOT compositions need the exact CuTe object behind this allocation-free
+    # tensor launch. Keep it attached to the cached callable rather than
+    # recompiling through a second, subtly different fake-tensor path.
+    tensor_api._sparkinfer_compiled_kernel = compiled_kernel  # type: ignore[attr-defined]
+    tensor_api._sparkinfer_compile_key = compile_key  # type: ignore[attr-defined]
     return tensor_api
 
 

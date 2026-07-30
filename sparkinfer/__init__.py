@@ -47,6 +47,7 @@ _OPS: tuple[str, ...] = (
     "comm.pcie",
     "gemm.blockscaled",
     "gemm.block_fp8_linear",
+    "gemm.bf16_gemv",
     "gemm.bmm",
     "gemm.mxfp8_linear",
     "gemm.tensor_fp8_linear",
