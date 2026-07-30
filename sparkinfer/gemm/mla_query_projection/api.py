@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Literal, Optional, TypeAlias
 
 import torch
@@ -14,6 +15,113 @@ from . import _bf16
 
 Mxfp8Weight: TypeAlias = tuple[torch.Tensor, torch.Tensor]
 MlaQueryWeight: TypeAlias = torch.Tensor | Mxfp8Weight
+GlmH64Bf16Workload: TypeAlias = Literal["packed_decode", "prefill"]
+GlmH64Bf16Policy: TypeAlias = Literal["auto", "force", "disable"]
+GlmH64Bf16Backend: TypeAlias = Literal["native", "sparkinfer_glm_h64_bf16"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class GlmH64Bf16QueryProjectionPlan:
+    """Capture-static backend decision for the explicit GLM H=64 contract."""
+
+    backend: GlmH64Bf16Backend
+    workload: GlmH64Bf16Workload
+    policy: GlmH64Bf16Policy
+    query_rows: int
+    h64_supported: bool
+    reason: str
+
+    @property
+    def use_sparkinfer(self) -> bool:
+        return self.backend == "sparkinfer_glm_h64_bf16"
+
+
+def plan_glm_h64_bf16(
+    *,
+    workload: GlmH64Bf16Workload,
+    policy: GlmH64Bf16Policy,
+    query_rows: int,
+    num_heads: int,
+    nope_dim: int,
+    latent_dim: int,
+    output_dtype: torch.dtype,
+    device=None,
+) -> GlmH64Bf16QueryProjectionPlan:
+    """Choose SparkInfer H64 or the caller's native fallback.
+
+    Automatic policy is deliberately narrower than kernel support: the
+    all-layer GLMRT gate initially promotes packed decode with ``M=2..16``.
+    H64 remains available through ``policy="force"`` for the measured M=1 and
+    prefill diagnostics, without changing automatic serving behavior.
+    """
+    if workload not in ("packed_decode", "prefill"):
+        raise ValueError(
+            "GLM H64 BF16 workload must be 'packed_decode' or 'prefill', "
+            f"got {workload!r}"
+        )
+    if policy not in ("auto", "force", "disable"):
+        raise ValueError(
+            f"GLM H64 BF16 policy must be 'auto', 'force', or 'disable', got {policy!r}"
+        )
+    rows = int(query_rows)
+    supported = can_implement_glm_h64_bf16(
+        num_heads=num_heads,
+        max_m=rows,
+        nope_dim=nope_dim,
+        latent_dim=latent_dim,
+        output_dtype=output_dtype,
+        device=device,
+    )
+    if policy == "force":
+        if not supported:
+            raise NotImplementedError(
+                "forced GLM H64 BF16 query projection is unsupported for "
+                f"workload={workload}, M={rows}, H={num_heads}, "
+                f"K={nope_dim}, N={latent_dim}, dtype={output_dtype}"
+            )
+        return GlmH64Bf16QueryProjectionPlan(
+            backend="sparkinfer_glm_h64_bf16",
+            workload=workload,
+            policy=policy,
+            query_rows=rows,
+            h64_supported=True,
+            reason="explicit_force",
+        )
+    if policy == "disable":
+        return GlmH64Bf16QueryProjectionPlan(
+            backend="native",
+            workload=workload,
+            policy=policy,
+            query_rows=rows,
+            h64_supported=supported,
+            reason="explicit_disable",
+        )
+    if supported and workload == "packed_decode" and 2 <= rows <= 16:
+        return GlmH64Bf16QueryProjectionPlan(
+            backend="sparkinfer_glm_h64_bf16",
+            workload=workload,
+            policy=policy,
+            query_rows=rows,
+            h64_supported=True,
+            reason="automatic_packed_decode_m2_m16",
+        )
+    reason = (
+        "automatic_native_pending_m1_gate"
+        if supported and workload == "packed_decode" and rows == 1
+        else (
+            "automatic_native_pending_prefill_gate"
+            if supported and workload == "prefill"
+            else "h64_contract_unsupported"
+        )
+    )
+    return GlmH64Bf16QueryProjectionPlan(
+        backend="native",
+        workload=workload,
+        policy=policy,
+        query_rows=rows,
+        h64_supported=supported,
+        reason=reason,
+    )
 
 
 def run_glm_h64_bf16(

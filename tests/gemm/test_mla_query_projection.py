@@ -385,6 +385,74 @@ def test_glm_h64_bf16_support_gate_is_explicit_and_narrow() -> None:
     )
 
 
+def test_glm_h64_bf16_planner_keeps_fallbacks_diagnostic_reachable() -> None:
+    device = require_sparkinfer()
+    geometry = dict(
+        num_heads=64,
+        nope_dim=192,
+        latent_dim=512,
+        output_dtype=torch.bfloat16,
+        device=device,
+    )
+
+    automatic_decode = mla_query_projection.plan_glm_h64_bf16(
+        workload="packed_decode",
+        policy="auto",
+        query_rows=8,
+        **geometry,
+    )
+    assert automatic_decode.use_sparkinfer
+    assert automatic_decode.reason == "automatic_packed_decode_m2_m16"
+
+    m1_fallback = mla_query_projection.plan_glm_h64_bf16(
+        workload="packed_decode",
+        policy="auto",
+        query_rows=1,
+        **geometry,
+    )
+    assert not m1_fallback.use_sparkinfer
+    assert m1_fallback.h64_supported
+    assert m1_fallback.reason == "automatic_native_pending_m1_gate"
+
+    prefill_fallback = mla_query_projection.plan_glm_h64_bf16(
+        workload="prefill",
+        policy="auto",
+        query_rows=32,
+        **geometry,
+    )
+    assert not prefill_fallback.use_sparkinfer
+    assert prefill_fallback.h64_supported
+    assert prefill_fallback.reason == "automatic_native_pending_prefill_gate"
+
+    for workload, query_rows in (("packed_decode", 1), ("prefill", 32)):
+        forced = mla_query_projection.plan_glm_h64_bf16(
+            workload=workload,
+            policy="force",
+            query_rows=query_rows,
+            **geometry,
+        )
+        assert forced.use_sparkinfer
+        assert forced.reason == "explicit_force"
+
+    disabled = mla_query_projection.plan_glm_h64_bf16(
+        workload="packed_decode",
+        policy="disable",
+        query_rows=8,
+        **geometry,
+    )
+    assert not disabled.use_sparkinfer
+    assert disabled.h64_supported
+    assert disabled.reason == "explicit_disable"
+
+    with pytest.raises(NotImplementedError, match="forced GLM H64"):
+        mla_query_projection.plan_glm_h64_bf16(
+            workload="prefill",
+            policy="force",
+            query_rows=33,
+            **geometry,
+        )
+
+
 def test_glm_h64_bf16_rejects_fp8_output() -> None:
     require_sparkinfer()
     q_nope, weight, q_pe = _glm_h64_bf16_inputs(m=2)
