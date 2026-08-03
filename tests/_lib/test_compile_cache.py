@@ -6,7 +6,9 @@ so these assertions are load-bearing.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -345,3 +347,66 @@ def test_v6_semantic_payload_matches_independent_validators(monkeypatch):
         kernel_resources._semantic_payload_from_cache_payload(serialized_payload)
         == expected
     )
+
+
+def _write_cache_fixture(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cache_key: str = "a" * 64,
+    payload: tuple[object, ...] = ("payload",),
+) -> tuple[Path, Path]:
+    monkeypatch.setenv("SPARKINFER_COMPILE_CACHE_DIR", str(root))
+    object_path = compiler._cache_object_path(cache_key)
+    manifest_path = compiler._cache_manifest_path(cache_key)
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    object_bytes = b"ELF fixture"
+    object_path.write_bytes(object_bytes)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "sparkinfer._lib.compile_manifest.v3",
+                "cache_key": cache_key,
+                "cache_payload_repr": repr(payload),
+                "object_bytes": len(object_bytes),
+                "object_sha256": hashlib.sha256(object_bytes).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return object_path, manifest_path
+
+
+def test_disk_object_validation_binds_manifest_payload_and_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = ("payload", 1)
+    object_path, _ = _write_cache_fixture(
+        tmp_path, monkeypatch, payload=payload
+    )
+    assert compiler._validated_cute_compile_object_bytes("a" * 64, payload) == (
+        b"ELF fixture"
+    )
+    assert compiler._validated_cute_compile_object_bytes(
+        "a" * 64, ("different",)
+    ) is None
+
+    object_path.write_bytes(b"corrupt")
+    assert compiler._validated_cute_compile_object_bytes("a" * 64, payload) is None
+
+
+def test_disk_object_validation_fails_closed_without_valid_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = ("payload",)
+    _, manifest_path = _write_cache_fixture(
+        tmp_path, monkeypatch, payload=payload
+    )
+    manifest_path.unlink()
+    assert compiler._validated_cute_compile_object_bytes("a" * 64, payload) is None
+
+    _, manifest_path = _write_cache_fixture(
+        tmp_path, monkeypatch, payload=payload
+    )
+    manifest_path.write_text("not json", encoding="utf-8")
+    assert compiler._validated_cute_compile_object_bytes("a" * 64, payload) is None

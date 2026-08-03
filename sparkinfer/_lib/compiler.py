@@ -7,7 +7,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
 import tempfile
 import time
@@ -2496,21 +2495,54 @@ def _disk_cache_key_lock(cache_key: str):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _load_cute_compile_from_disk(cache_key: str):
+def _validated_cute_compile_object_bytes(
+    cache_key: str,
+    expected_payload: tuple[object, ...] | None = None,
+) -> bytes | None:
+    object_path = _cache_object_path(cache_key)
+    manifest_path = _cache_manifest_path(cache_key)
+    if not object_path.exists() or not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        object_bytes = object_path.read_bytes()
+        if manifest.get("schema") != "sparkinfer._lib.compile_manifest.v3":
+            return None
+        if manifest.get("cache_key") != cache_key:
+            return None
+        if expected_payload is not None and manifest.get("cache_payload_repr") != repr(
+            expected_payload
+        ):
+            return None
+        if manifest.get("object_bytes") != len(object_bytes):
+            return None
+        if manifest.get("object_sha256") != hashlib.sha256(object_bytes).hexdigest():
+            return None
+        return object_bytes
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _load_cute_compile_from_disk(
+    cache_key: str,
+    expected_payload: tuple[object, ...] | None = None,
+):
     from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
 
-    object_path = _cache_object_path(cache_key)
-    if not object_path.exists():
+    object_bytes = _validated_cute_compile_object_bytes(cache_key, expected_payload)
+    if object_bytes is None:
         return None
     try:
         # CUTLASS may finalize or patch the ELF while loading it.  The cache
         # object is content-addressed and its digest is recorded in the compile
-        # manifest, so never expose that canonical object to the loader.
+        # manifest. Load exactly the bytes validated above through a temporary
+        # copy so the canonical object cannot change between validation and
+        # load and is never exposed to loader-side ELF patching.
         with tempfile.TemporaryDirectory(
             prefix="sparkinfer-cute-cache-load-"
         ) as raw_stage:
-            staged_object = Path(raw_stage) / object_path.name
-            shutil.copy2(object_path, staged_object)
+            staged_object = Path(raw_stage) / f"{cache_key}.o"
+            staged_object.write_bytes(object_bytes)
             module = ExternalBinaryModule(str(staged_object))
             return getattr(module, _cache_prefix(cache_key))
     except Exception:
@@ -2657,7 +2689,7 @@ def compile(
     disk_cache_enabled = _cute_compile_disk_cache_enabled_for_payload(payload)
 
     if disk_cache_enabled:
-        compiled = _load_cute_compile_from_disk(cache_key)
+        compiled = _load_cute_compile_from_disk(cache_key, payload)
         if compiled is not None:
             with suppress(Exception):
                 _ensure_cute_compile_manifest(cache_key, payload, func)
@@ -2683,7 +2715,7 @@ def compile(
             if compiled is not None:
                 return compiled
 
-            compiled = _load_cute_compile_from_disk(cache_key)
+            compiled = _load_cute_compile_from_disk(cache_key, payload)
             if compiled is not None:
                 with suppress(Exception):
                     _ensure_cute_compile_manifest(cache_key, payload, func)
