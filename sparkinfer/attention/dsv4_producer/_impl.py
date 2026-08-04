@@ -60,6 +60,14 @@ class DSV4ProducerWeights:
 
 
 @dataclass(frozen=True)
+class DSV4KVProducerWeights:
+    kv: BlockFP8LinearWeight
+    kv_norm: torch.Tensor
+    hidden: int
+    head_dim: int = DSV4_HEAD_DIM
+
+
+@dataclass(frozen=True)
 class DSV4IndexerProducerWeights:
     q: BlockFP8LinearWeight
     weights_projection: torch.Tensor
@@ -95,7 +103,9 @@ class DSV4ProducerCaps:
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
         if self.hidden not in (4096, 7168):
-            raise ValueError(f"DSV4 producer hidden must be 4096 or 7168, got {self.hidden}")
+            raise ValueError(
+                f"DSV4 producer hidden must be 4096 or 7168, got {self.hidden}"
+            )
         if self.q_lora_rank not in (1024, 1536):
             raise ValueError(
                 f"DSV4 producer q_lora_rank must be 1024 or 1536, got {self.q_lora_rank}"
@@ -112,7 +122,9 @@ class DSV4ProducerCaps:
                 f"DSV4 producer requires {DSV4_KV_PAGE_SIZE}-token pages, got {self.page_size}"
             )
         if self.dtype != torch.bfloat16:
-            raise ValueError(f"DSV4 producer requires BF16 activations, got {self.dtype}")
+            raise ValueError(
+                f"DSV4 producer requires BF16 activations, got {self.dtype}"
+            )
 
 
 @dataclass(frozen=True)
@@ -172,7 +184,7 @@ class DSV4KVProducerBinding:
     main_slots: torch.Tensor
     cos_sin_cache: torch.Tensor
     main_kv_cache: torch.Tensor
-    weights: DSV4ProducerWeights
+    weights: DSV4KVProducerWeights | DSV4ProducerWeights
     kv_linear: BlockFP8LinearBinding
     kv_output: torch.Tensor
     eps: float
@@ -365,7 +377,9 @@ class DSV4ProducerPlan:
         qkv_scratch = arena.narrow(
             0, self.layout.qkv_linear_offset, self.layout.qkv_linear_bytes
         )
-        q_scratch = arena.narrow(0, self.layout.q_linear_offset, self.layout.q_linear_bytes)
+        q_scratch = arena.narrow(
+            0, self.layout.q_linear_offset, self.layout.q_linear_bytes
+        )
         qkv_output = (
             arena.narrow(
                 0,
@@ -444,7 +458,7 @@ class DSV4KVProducerPlan:
         main_slots: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         main_kv_cache: torch.Tensor,
-        weights: DSV4ProducerWeights,
+        weights: DSV4KVProducerWeights | DSV4ProducerWeights,
         eps: float = 1.0e-6,
         expected_m: int | None = None,
     ) -> DSV4KVProducerBinding:
@@ -457,15 +471,13 @@ class DSV4KVProducerPlan:
             main_kv_cache=main_kv_cache,
             eps=eps,
         )
-        _validate_weights(self.caps, weights)
+        _validate_kv_weights(self.caps, weights)
         arena = scratch_tensor(scratch, self._scratch_specs, owner="DSV4 KV producer")
         kv_scratch = arena.narrow(
             0, self.layout.kv_linear_offset, self.layout.kv_linear_bytes
         )
         kv_output = (
-            arena.narrow(
-                0, self.layout.kv_output_offset, self.layout.kv_output_bytes
-            )
+            arena.narrow(0, self.layout.kv_output_offset, self.layout.kv_output_bytes)
             .view(torch.bfloat16)
             .view(self.caps.max_tokens, self.caps.head_dim, 1)
             .narrow(0, 0, tokens)
@@ -567,6 +579,48 @@ def pack_dsv4_producer_weights(
     )
 
 
+def pack_dsv4_kv_producer_weights(
+    wkv: torch.Tensor,
+    wkv_scale: torch.Tensor,
+    kv_norm: torch.Tensor,
+) -> DSV4KVProducerWeights:
+    """Pack only the weights needed by integrated dSpark prompt priming."""
+
+    for name, tensor in (
+        ("wkv", wkv),
+        ("wkv_scale", wkv_scale),
+        ("kv_norm", kv_norm),
+    ):
+        _check_cuda_tensor(name, tensor)
+    if wkv.ndim != 2:
+        raise ValueError("DSV4 KV-only projection weight must be rank-2")
+    head_dim, hidden = map(int, wkv.shape)
+    if head_dim != DSV4_HEAD_DIM or hidden not in (4_096, 7_168):
+        raise ValueError(
+            "DSV4 KV-only weights require [512,4096] or [512,7168], got "
+            f"{tuple(wkv.shape)}"
+        )
+    if wkv_scale.shape != (head_dim // 128, hidden // 128):
+        raise ValueError(
+            "DSV4 KV-only scale shape must match 128x128 weight blocks, got "
+            f"{tuple(wkv_scale.shape)}"
+        )
+    if kv_norm.shape != (head_dim,):
+        raise ValueError(
+            f"DSV4 KV-only norm shape must be {(head_dim,)}, got {tuple(kv_norm.shape)}"
+        )
+    if kv_norm.dtype != torch.bfloat16 or not kv_norm.is_contiguous():
+        raise ValueError("DSV4 KV-only norm weight must be contiguous BF16")
+    if wkv_scale.device != wkv.device or kv_norm.device != wkv.device:
+        raise ValueError("DSV4 KV-only weights must share one CUDA device")
+    return DSV4KVProducerWeights(
+        kv=pack_block_fp8_linear_weight_mxfp8(wkv, wkv_scale),
+        kv_norm=kv_norm.detach(),
+        hidden=hidden,
+        head_dim=head_dim,
+    )
+
+
 def pack_dsv4_indexer_producer_weights(
     wq_b: torch.Tensor,
     wq_b_scale: torch.Tensor,
@@ -640,7 +694,9 @@ def plan_dsv4_producer(caps: DSV4ProducerCaps) -> DSV4ProducerPlan:
     q_linear_bytes = q_linear_plan.scratch_specs()[0].nbytes
     cursor = q_linear_offset + q_linear_bytes
     qkv_output_offset = _align_up(cursor)
-    cursor = qkv_output_offset + caps.max_tokens * (caps.q_lora_rank + caps.head_dim) * 2
+    cursor = (
+        qkv_output_offset + caps.max_tokens * (caps.q_lora_rank + caps.head_dim) * 2
+    )
     q_rank_offset = _align_up(cursor)
     cursor = q_rank_offset + caps.max_tokens * caps.q_lora_rank * 2
     layout = _DSV4ProducerScratchLayout(
@@ -768,6 +824,27 @@ def _validate_weights(caps: DSV4ProducerCaps, weights: DSV4ProducerWeights) -> N
         raise ValueError("DSV4 Q-B packed weight has drifted geometry")
 
 
+def _validate_kv_weights(
+    caps: DSV4ProducerCaps,
+    weights: DSV4KVProducerWeights | DSV4ProducerWeights,
+) -> None:
+    if not isinstance(weights, (DSV4KVProducerWeights, DSV4ProducerWeights)):
+        raise TypeError("DSV4 KV producer requires KVWeights or full Weights")
+    if (weights.hidden, weights.head_dim) != (caps.hidden, caps.head_dim):
+        raise ValueError(
+            "DSV4 KV producer weight geometry "
+            f"{(weights.hidden, weights.head_dim)} does not match "
+            f"{(caps.hidden, caps.head_dim)}"
+        )
+    if (
+        weights.kv.in_features != caps.hidden
+        or weights.kv.out_features != caps.head_dim
+    ):
+        raise ValueError("DSV4 KV-only packed weight has drifted geometry")
+    if weights.kv_norm.shape != (caps.head_dim,):
+        raise ValueError("DSV4 KV-only norm weight has drifted geometry")
+
+
 def _validate_indexer_weights(
     caps: DSV4IndexerProducerCaps, weights: DSV4IndexerProducerWeights
 ) -> None:
@@ -816,7 +893,9 @@ def _validate_indexer_runtime_tensors(
     ):
         _check_cuda_tensor(name, tensor)
         if tensor.device != caps.device:
-            raise ValueError(f"{name} device {tensor.device} does not match {caps.device}")
+            raise ValueError(
+                f"{name} device {tensor.device} does not match {caps.device}"
+            )
     if q_rank.ndim != 2 or q_rank.shape[1] != caps.q_lora_rank:
         raise ValueError(
             f"q_rank must have shape [tokens,{caps.q_lora_rank}], got {tuple(q_rank.shape)}"
@@ -833,7 +912,10 @@ def _validate_indexer_runtime_tensors(
         )
     if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
         raise ValueError("hidden_states must be contiguous BF16")
-    if positions.shape != (tokens,) or positions.dtype not in (torch.int32, torch.int64):
+    if positions.shape != (tokens,) or positions.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
         raise ValueError(f"positions must be int32/int64 [{tokens}]")
     if not positions.is_contiguous():
         raise ValueError("positions must be contiguous")
@@ -912,7 +994,9 @@ def _validate_kv_runtime_tensors(
     ):
         _check_cuda_tensor(name, tensor)
         if tensor.device != caps.device:
-            raise ValueError(f"{name} device {tensor.device} does not match {caps.device}")
+            raise ValueError(
+                f"{name} device {tensor.device} does not match {caps.device}"
+            )
     if hidden_states.ndim != 2 or hidden_states.shape[1] != caps.hidden:
         raise ValueError(
             f"hidden_states must have shape [tokens,{caps.hidden}], got {tuple(hidden_states.shape)}"
@@ -922,9 +1006,15 @@ def _validate_kv_runtime_tensors(
         raise ValueError(f"tokens must be in [1,{caps.max_tokens}], got {tokens}")
     if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
         raise ValueError("hidden_states must be contiguous BF16")
-    if positions.shape != (tokens,) or positions.dtype not in (torch.int32, torch.int64):
+    if positions.shape != (tokens,) or positions.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
         raise ValueError(f"positions must be int32/int64 [{tokens}]")
-    if main_slots.shape != (tokens,) or main_slots.dtype not in (torch.int32, torch.int64):
+    if main_slots.shape != (tokens,) or main_slots.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
         raise ValueError(f"main_slots must be int32/int64 [{tokens}]")
     if not positions.is_contiguous() or not main_slots.is_contiguous():
         raise ValueError("positions and main_slots must be contiguous")
@@ -1003,11 +1093,7 @@ def _normalize_rank_pack_kv_kernel(
     row = slot - page * PAGE_SIZE
     page_base = page * PAGE_BYTES
     data_base = page_base + row * PAYLOAD_BYTES
-    scale_base = (
-        page_base
-        + PAGE_SIZE * PAYLOAD_BYTES
-        + row * SCALE_BYTES
-    )
+    scale_base = page_base + PAGE_SIZE * PAYLOAD_BYTES + row * SCALE_BYTES
 
     # Store seven independently scaled 64-value NoPE groups. The integer
     # exponent path implements pow2-ceil without an approximate log2 boundary.
@@ -1268,9 +1354,9 @@ def _indexer_query_post_kernel(
     scale_bits = raw_scale.to(tl.uint32, bitcast=True)
     mantissa = scale_bits & 0x007FFFFF
     rounded_bits = (scale_bits + 0x00800000) & 0x7F800000
-    fp4_scale = tl.where(
-        mantissa != 0, rounded_bits, scale_bits & 0x7F800000
-    ).to(tl.float32, bitcast=True)
+    fp4_scale = tl.where(mantissa != 0, rounded_bits, scale_bits & 0x7F800000).to(
+        tl.float32, bitcast=True
+    )
     fp4_scale = tl.reshape(
         tl.broadcast_to(tl.expand_dims(fp4_scale, 1), (HEAD_DIM // 32, 32)),
         (HEAD_DIM,),
@@ -1429,11 +1515,13 @@ __all__ = [
     "DSV4ProducerBinding",
     "DSV4ProducerCaps",
     "DSV4KVProducerBinding",
+    "DSV4KVProducerWeights",
     "DSV4KVProducerPlan",
     "DSV4ProducerPlan",
     "DSV4ProducerWeights",
     "pack_dsv4_indexer_producer_weights",
     "pack_dsv4_producer_weights",
+    "pack_dsv4_kv_producer_weights",
     "plan_dsv4_indexer_producer",
     "plan_dsv4_kv_producer",
     "plan_dsv4_producer",

@@ -35,8 +35,8 @@ def _rope_forward(
     cos_v, sin_v = selected.chunk(2, dim=-1)
     even = pairs[..., 0] * cos_v - pairs[..., 1] * sin_v
     odd = pairs[..., 1] * cos_v + pairs[..., 0] * sin_v
-    output[..., nope_dim:] = torch.stack((even, odd), dim=-1).flatten(-2).to(
-        torch.bfloat16
+    output[..., nope_dim:] = (
+        torch.stack((even, odd), dim=-1).flatten(-2).to(torch.bfloat16)
     )
     return output
 
@@ -53,9 +53,9 @@ def _rmsnorm(
 
 
 def _block_fp8_weight(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:
-    weight = (
-        torch.randn((rows, cols), device="cuda", dtype=torch.bfloat16) / 16
-    ).to(torch.float8_e4m3fn)
+    weight = (torch.randn((rows, cols), device="cuda", dtype=torch.bfloat16) / 16).to(
+        torch.float8_e4m3fn
+    )
     scale = torch.full(
         (rows // 128, cols // 128),
         127,
@@ -110,8 +110,10 @@ def _fp4_qat_reference(values: torch.Tensor) -> torch.Tensor:
         ),
     )
     return (
-        torch.copysign(fp4, blocks) * scales[:, None]
-    ).reshape(shape).to(torch.bfloat16)
+        (torch.copysign(fp4, blocks) * scales[:, None])
+        .reshape(shape)
+        .to(torch.bfloat16)
+    )
 
 
 def test_plan_pins_flash_and_pro_caller_owned_workspace() -> None:
@@ -151,7 +153,15 @@ def test_plan_pins_flash_and_pro_caller_owned_workspace() -> None:
     assert flash_kv.layout.kv_output_offset % 1_024 == 0
     assert flash_kv.layout.kv_output_bytes == 2_048 * 512 * 2
     assert flash_kv.scratch_specs()[0].nbytes < flash.scratch_specs()[0].nbytes
-    for entry_point in ("KVPlan", "KVBinding", "plan_kv", "bind_kv", "run_kv"):
+    for entry_point in (
+        "KVPlan",
+        "KVBinding",
+        "KVWeights",
+        "plan_kv",
+        "bind_kv",
+        "pack_kv_weights",
+        "run_kv",
+    ):
         assert entry_point in dsv4_producer.META.entry_points
 
 
@@ -167,7 +177,9 @@ def test_caps_reject_absorbed_mla_and_non_native_page_geometry() -> None:
         except ValueError:
             pass
         else:
-            raise AssertionError(f"invalid DSV4 producer geometry was accepted: {kwargs}")
+            raise AssertionError(
+                f"invalid DSV4 producer geometry was accepted: {kwargs}"
+            )
 
 
 def test_indexer_plan_pins_flash_and_pro_query_producer_arena() -> None:
@@ -213,8 +225,7 @@ def test_rank_norm_and_main_kv_pack_match_checkpoint_reference() -> None:
     torch.manual_seed(20260804)
     tokens, q_rank, eps = 2, 1024, 1.0e-6
     qkv = (
-        torch.randn((tokens, q_rank + 512), device="cuda", dtype=torch.bfloat16)
-        / 3
+        torch.randn((tokens, q_rank + 512), device="cuda", dtype=torch.bfloat16) / 3
     ).contiguous()
     q_norm = (
         torch.randn((q_rank,), device="cuda", dtype=torch.bfloat16) / 8 + 1
@@ -295,12 +306,8 @@ def test_indexer_query_post_matches_checkpoint_rope_hadamard_and_fp4_qat() -> No
     positions = torch.tensor([1, 4], device="cuda", dtype=torch.int32)
     angles = torch.randn((5, 32), device="cuda", dtype=torch.float32)
     cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
-    query = torch.empty(
-        (tokens, heads, 128), device="cuda", dtype=torch.float8_e4m3fn
-    )
-    head_weights = torch.empty(
-        (tokens, heads), device="cuda", dtype=torch.float32
-    )
+    query = torch.empty((tokens, heads, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    head_weights = torch.empty((tokens, heads), device="cuda", dtype=torch.float32)
 
     _run_indexer_query_post(
         raw_query, raw_weights, positions, cos_sin, query, head_weights
@@ -338,17 +345,13 @@ def test_indexer_query_feeds_physical_slot_topk_without_remap_allocation() -> No
     positions = torch.tensor([15, 19], device=device, dtype=torch.int32)
     angles = torch.randn((20, 32), device=device, dtype=torch.float32)
     cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
-    query = torch.empty(
-        (rows, heads, 128), device=device, dtype=torch.float8_e4m3fn
-    )
+    query = torch.empty((rows, heads, 128), device=device, dtype=torch.float8_e4m3fn)
     head_weights = torch.empty((rows, heads), device=device, dtype=torch.float32)
     _run_indexer_query_post(
         raw_query, raw_weights, positions, cos_sin, query, head_weights
     )
 
-    index_rows = torch.randn(
-        (pages * 64, 128), device=device, dtype=torch.float32
-    )
+    index_rows = torch.randn((pages * 64, 128), device=device, dtype=torch.float32)
     index_cache = pack_index_k_cache_reference(index_rows)
     first = torch.tensor(
         [5, 2, 10, 1, 8, 0, 11, 4, 7, 3, 9, 6],
@@ -418,9 +421,7 @@ def test_full_indexer_producer_replays_without_serving_allocations() -> None:
     weights_projection = (
         torch.randn((heads, hidden), device="cuda", dtype=torch.bfloat16) / 64
     ).contiguous()
-    weights = dsv4_producer.pack_indexer_weights(
-        wq_b, wq_b_scale, weights_projection
-    )
+    weights = dsv4_producer.pack_indexer_weights(wq_b, wq_b_scale, weights_projection)
     plan = dsv4_producer.plan_indexer(
         dsv4_producer.IndexerCaps(
             device="cuda",
@@ -440,9 +441,7 @@ def test_full_indexer_producer_replays_without_serving_allocations() -> None:
     positions = torch.zeros((tokens,), device="cuda", dtype=torch.int32)
     cos_sin = torch.zeros((1, 64), device="cuda", dtype=torch.float32)
     cos_sin[:, :32] = 1
-    query = torch.empty(
-        (tokens, heads, 128), device="cuda", dtype=torch.float8_e4m3fn
-    )
+    query = torch.empty((tokens, heads, 128), device="cuda", dtype=torch.float8_e4m3fn)
     head_weights = torch.empty((tokens, heads), device="cuda", dtype=torch.float32)
     binding = dsv4_producer.bind_indexer(
         plan,
@@ -494,6 +493,7 @@ def test_full_flash_plan_replays_without_serving_allocations() -> None:
         q_norm,
         kv_norm,
     )
+    kv_weights = dsv4_producer.pack_kv_weights(wkv, wkv_scale, kv_norm)
     plan = dsv4_producer.plan(
         dsv4_producer.Caps(
             device="cuda",
@@ -528,9 +528,7 @@ def test_full_flash_plan_replays_without_serving_allocations() -> None:
     )
     kv_plan = dsv4_producer.plan_kv(plan.caps)
     (kv_spec,) = kv_plan.scratch_specs()
-    kv_scratch = torch.empty(
-        kv_spec.shape, dtype=kv_spec.dtype, device=kv_spec.device
-    )
+    kv_scratch = torch.empty(kv_spec.shape, dtype=kv_spec.dtype, device=kv_spec.device)
     kv_cache = torch.zeros_like(cache)
     kv_binding = dsv4_producer.bind_kv(
         kv_plan,
@@ -540,7 +538,7 @@ def test_full_flash_plan_replays_without_serving_allocations() -> None:
         main_slots=slots,
         cos_sin_cache=cos_sin,
         main_kv_cache=kv_cache,
-        weights=weights,
+        weights=kv_weights,
         expected_m=tokens,
     )
 
