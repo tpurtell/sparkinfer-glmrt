@@ -84,13 +84,14 @@ def _make_compressed_binding(
     v_head_dim: int = _COMPRESSED_HEAD_DIM,
     max_chunks_per_row: int = 64,
     max_page_table_width: int | None = None,
+    num_q_heads: int = _LOCAL_Q_HEADS,
 ):
     plan = plan_compressed_mla_scratch(
         SPARKINFERCompressedMLAScratchCaps(
             device=device,
             dtype=torch.bfloat16,
             kv_dtype=torch.uint8,
-            num_q_heads=_LOCAL_Q_HEADS,
+            num_q_heads=num_q_heads,
             head_dim=head_dim,
             v_head_dim=v_head_dim,
             max_width=topk,
@@ -141,13 +142,19 @@ def _make_cache(
     )
 
 
-def _make_q(*, rows: int, seed: int, device: torch.device | str) -> torch.Tensor:
+def _make_q(
+    *,
+    rows: int,
+    seed: int,
+    device: torch.device | str,
+    heads: int = _LOCAL_Q_HEADS,
+) -> torch.Tensor:
     device = torch.device(device)
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     q = (
         torch.randn(
-            (rows, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
+            (rows, heads, _COMPRESSED_HEAD_DIM),
             generator=gen,
             dtype=torch.float32,
             device=device,
@@ -260,6 +267,84 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
     )
     assert max_abs_short <= 0.10
     assert cos_short.item() >= 0.9995
+
+
+@torch.inference_mode()
+def test_compressed_mla_dsv4_pro_128_heads_replays_under_cuda_graph() -> None:
+    device = require_sm120()
+    clear_mla_caches()
+
+    heads = 128
+    q = _make_q(rows=1, heads=heads, seed=121, device=device)
+    swa_cache_bytes = _make_cache(
+        tokens=32,
+        page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE,
+        seed=122,
+        device=device,
+    )
+    swa_cache = swa_cache_bytes.view(torch.float8_e4m3fn)
+    swa_indices = torch.arange(16, dtype=torch.int32, device=device).unsqueeze(0)
+    swa_lengths = torch.tensor([13], dtype=torch.int32, device=device)
+    attn_sink = torch.linspace(
+        -0.1,
+        0.1,
+        heads,
+        dtype=torch.float32,
+        device=device,
+    )
+    binding = _make_compressed_binding(
+        device=device,
+        rows=1,
+        topk=16,
+        max_kv_rows=16,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        use_cuda_graph=True,
+        num_q_heads=heads,
+    )
+    out = torch.empty(
+        (1, heads, _COMPRESSED_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    compressed_mla_decode_forward(
+        swa_k_cache=swa_cache,
+        binding=binding,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+        out=out,
+    )
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = compressed_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+            out=out,
+        )
+    baseline = captured.clone()
+    graph.replay()
+
+    expected = compressed_sparse_mla_reference(
+        q,
+        swa_cache_bytes,
+        swa_indices,
+        swa_lengths,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+    )
+    assert captured.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(captured, baseline, atol=0.0, rtol=0.0)
+    max_abs = (captured.float() - expected.float()).abs().max().item()
+    cos = torch.nn.functional.cosine_similarity(
+        captured.float().reshape(-1), expected.float().reshape(-1), dim=0
+    )
+    assert max_abs <= 0.10
+    assert cos.item() >= 0.9995
 
 
 @torch.inference_mode()
