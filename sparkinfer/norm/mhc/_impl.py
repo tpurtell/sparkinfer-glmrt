@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -74,6 +75,7 @@ class SPARKINFERMHCBinding:
     outputs_are_bound: ClassVar[bool] = True
     pre_broadcasts_residual_lanes: ClassVar[bool] = True
     post_pre_fuses_layer_boundary: ClassVar[bool] = True
+    head_uses_bound_y: ClassVar[bool] = True
 
     partials: torch.Tensor | None = None
     y: torch.Tensor | None = None
@@ -82,6 +84,30 @@ class SPARKINFERMHCBinding:
     out: torch.Tensor | None = None
     split_k: int = MHC_DEFAULT_SPLIT_K
     expected_m: int | None = None
+
+    def head(
+        self,
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        *,
+        rms_eps: float,
+        hc_eps: float,
+        norm_eps: float,
+    ) -> torch.Tensor:
+        return sparkinfer_mhc_head(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            binding=self,
+        )
 
     def pre(
         self,
@@ -557,6 +583,65 @@ def _validate_post_pre_inputs(
     _require_contiguous(hc_scale, name="hc_scale")
     _require_contiguous(hc_base, name="hc_base")
     return tokens, hidden_size, MHC_MULT * hidden_size
+
+
+def _validate_head_inputs(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+) -> tuple[int, int]:
+    if residual.device.type != "cuda":
+        raise ValueError("residual must be a CUDA tensor")
+    if residual.dtype != torch.bfloat16:
+        raise ValueError(f"residual must be torch.bfloat16, got {residual.dtype}")
+    if residual.ndim != 3:
+        raise ValueError(
+            f"residual must be rank-3 [tokens, 4, hidden], got {tuple(residual.shape)}"
+        )
+    tokens, hc_mult, hidden_size = map(int, residual.shape)
+    if hc_mult != MHC_MULT:
+        raise ValueError(f"residual hc dimension must be {MHC_MULT}, got {hc_mult}")
+    if hidden_size not in MHC_SUPPORTED_HIDDEN_SIZES:
+        raise ValueError(
+            f"hidden_size={hidden_size} is not supported by mHC head; "
+            f"supported hidden sizes are {MHC_SUPPORTED_HIDDEN_SIZES}"
+        )
+    if fn.dtype != torch.float32 or tuple(fn.shape) != (
+        MHC_MULT,
+        MHC_MULT * hidden_size,
+    ):
+        raise ValueError(
+            f"fn must be float32 shape {(MHC_MULT, MHC_MULT * hidden_size)}, "
+            f"got {fn.dtype} {tuple(fn.shape)}"
+        )
+    if hc_scale.dtype != torch.float32 or tuple(hc_scale.shape) != (1,):
+        raise ValueError(
+            "hc_scale must be float32 shape [1], got "
+            f"{hc_scale.dtype} {tuple(hc_scale.shape)}"
+        )
+    if hc_base.dtype != torch.float32 or tuple(hc_base.shape) != (MHC_MULT,):
+        raise ValueError(
+            f"hc_base must be float32 shape [{MHC_MULT}], got "
+            f"{hc_base.dtype} {tuple(hc_base.shape)}"
+        )
+    if (
+        fn.device != residual.device
+        or hc_scale.device != residual.device
+        or hc_base.device != residual.device
+    ):
+        raise ValueError("fn, hc_scale, and hc_base must be on the residual device")
+    _validate_norm_weight(
+        norm_weight,
+        hidden_size=hidden_size,
+        device=residual.device,
+    )
+    _require_contiguous(residual, name="residual")
+    _require_contiguous(fn, name="fn")
+    _require_contiguous(hc_scale, name="hc_scale")
+    _require_contiguous(hc_base, name="hc_base")
+    return tokens, hidden_size
 
 
 def _validate_norm_weight(
@@ -1290,6 +1375,85 @@ def _sparkinfer_mhc_post_pre_impl(
     )
 
 
+def _sparkinfer_mhc_head_impl(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    norm_eps: float,
+    out: torch.Tensor | None = None,
+    binding: SPARKINFERMHCBinding | None = None,
+) -> torch.Tensor:
+    if binding is not None:
+        if out is not None:
+            raise ValueError(
+                "mHC binding owns the head output buffer; do not also pass out"
+            )
+        if binding.y is None:
+            raise ValueError("mHC head binding requires a caller-owned y output")
+        out = binding.y
+
+    for name, value in (
+        ("rms_eps", rms_eps),
+        ("hc_eps", hc_eps),
+        ("norm_eps", norm_eps),
+    ):
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"{name} must be finite and positive, got {value}")
+
+    tokens, hidden_size = _validate_head_inputs(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+    )
+    if out is None:
+        out = torch.empty(
+            (tokens, hidden_size),
+            dtype=residual.dtype,
+            device=residual.device,
+        )
+    else:
+        out = _slice_capacity_view(
+            out,
+            tokens=tokens,
+            tail_shape=(hidden_size,),
+            dtype=residual.dtype,
+            device=residual.device,
+            name="out",
+        )
+    if (
+        tuple(out.shape) != (tokens, hidden_size)
+        or out.dtype != residual.dtype
+        or out.device != residual.device
+    ):
+        raise ValueError(
+            "out must match shape [tokens, hidden_size], residual dtype, and device"
+        )
+    _require_contiguous(out, name="out")
+
+    if tokens != 0:
+        from sparkinfer.norm.mhc._kernels import run_mhc_head
+
+        run_mhc_head(
+            residual=residual,
+            fn=fn,
+            scale=hc_scale,
+            bias=hc_base,
+            norm_weight=norm_weight,
+            out=out,
+            rms_eps=float(rms_eps),
+            hc_eps=float(hc_eps),
+            norm_eps=float(norm_eps),
+        )
+    return out
+
+
 def _sparkinfer_mhc_post_impl(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1388,6 +1552,51 @@ def _sparkinfer_mhc_post_impl(
         "sparkinfer_mhc_post is served only by the post-only mHC kernel, which "
         f"supports hidden_size in {MHC_SUPPORTED_HIDDEN_SIZES}; "
         f"got hidden_size={hidden_size}"
+    )
+
+
+@torch.library.custom_op(
+    "sparkinfer::mhc_head_planned_functional",
+    mutates_args=(),
+)
+def _mhc_head_planned_functional_op(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    norm_eps: float,
+) -> torch.Tensor:
+    return _sparkinfer_mhc_head_impl(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        rms_eps=float(rms_eps),
+        hc_eps=float(hc_eps),
+        norm_eps=float(norm_eps),
+    )
+
+
+@_mhc_head_planned_functional_op.register_fake
+def _mhc_head_planned_functional_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    norm_eps: float,
+) -> torch.Tensor:
+    del fn, hc_scale, hc_base, norm_weight, rms_eps, hc_eps, norm_eps
+    return torch.empty(
+        (residual.shape[0], residual.shape[2]),
+        dtype=residual.dtype,
+        device=residual.device,
     )
 
 
@@ -1593,6 +1802,50 @@ def _mhc_post_planned_functional_fake(
     return torch.empty_like(residual)
 
 
+def sparkinfer_mhc_head(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    norm_eps: float,
+    out: torch.Tensor | None = None,
+    binding: SPARKINFERMHCBinding | None = None,
+) -> torch.Tensor:
+    compiling = torch.compiler.is_compiling()
+    if compiling and binding is None and out is None:
+        return torch.ops.sparkinfer.mhc_head_planned_functional(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            float(rms_eps),
+            float(hc_eps),
+            float(norm_eps),
+        )
+    if compiling:
+        raise RuntimeError(
+            "sparkinfer_mhc_head must be opaque to torch.compile; caller-owned "
+            "mHC outputs are not supported inside Dynamo."
+        )
+    return _sparkinfer_mhc_head_impl(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        out=out,
+        binding=binding,
+    )
+
+
 def sparkinfer_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1796,6 +2049,7 @@ __all__ = [
     "MHC_PARTIALS",
     "MHC_SOURCE_TILE_H",
     "MHC_SUPPORTED_HIDDEN_SIZES",
+    "sparkinfer_mhc_head",
     "sparkinfer_mhc_post",
     "sparkinfer_mhc_pre",
     "sparkinfer_mhc_post_pre",

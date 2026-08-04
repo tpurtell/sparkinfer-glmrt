@@ -34,6 +34,9 @@ from ._impl import (
     plan_mhc_scratch as plan,
 )
 from ._impl import (
+    sparkinfer_mhc_head as run_head,
+)
+from ._impl import (
     sparkinfer_mhc_post as run_post,
 )
 from ._impl import (
@@ -65,6 +68,7 @@ __all__ = [
     "Binding",
     "plan",
     "bind",
+    "run_head",
     "run_pre",
     "run_post",
     "run_post_pre",

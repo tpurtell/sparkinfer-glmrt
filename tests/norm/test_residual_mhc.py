@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparkinfer.norm.mhc._impl import SPARKINFERMHCScratchCaps, plan_mhc_scratch, sparkinfer_mhc_post, sparkinfer_mhc_post_pre, sparkinfer_mhc_pre
+from sparkinfer.norm.mhc._impl import SPARKINFERMHCScratchCaps, plan_mhc_scratch, sparkinfer_mhc_head, sparkinfer_mhc_post, sparkinfer_mhc_post_pre, sparkinfer_mhc_pre
 
 from tests._reference.helpers import require_sparkinfer
 
@@ -47,6 +47,31 @@ def _mhc_post_reference(
         post.unsqueeze(-1) * x.unsqueeze(1).float()
         + (comb.unsqueeze(-1) * residual.unsqueeze(2).float()).sum(dim=1)
     ).to(x.dtype)
+
+
+def _mhc_head_reference(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    norm_eps: float,
+) -> torch.Tensor:
+    flat = residual.flatten(1).float()
+    mixes = F.linear(flat, fn) * torch.rsqrt(
+        flat.square().mean(dim=-1, keepdim=True) + rms_eps
+    )
+    pre = torch.sigmoid(mixes * scale + bias) + hc_eps
+    collapsed = (pre.unsqueeze(-1) * residual.float()).sum(dim=1).to(torch.bfloat16)
+    collapsed_f32 = collapsed.float()
+    return (
+        collapsed_f32
+        * torch.rsqrt(collapsed_f32.square().mean(dim=-1, keepdim=True) + norm_eps)
+        * norm_weight.float()
+    ).to(residual.dtype)
 
 
 def _make_inputs(
@@ -102,6 +127,168 @@ def _make_mhc_binding(
         comb=torch.empty((tokens, 4, 4), dtype=torch.float32, device=device),
         out=torch.empty((tokens, 4, hidden_size), dtype=torch.bfloat16, device=device),
     )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "hidden_size", "seed"),
+    [(1, 4096, 92_001), (16, 4096, 92_016), (1, 7168, 92_112)],
+)
+def test_sparkinfer_mhc_head_matches_reference_and_capture(
+    tokens: int,
+    hidden_size: int,
+    seed: int,
+) -> None:
+    device = require_sparkinfer()
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    residual = (
+        torch.randn(
+            (tokens, 4, hidden_size), generator=gen, dtype=torch.float32
+        ).to(device)
+        / 3
+    ).to(torch.bfloat16).contiguous()
+    fn = (
+        torch.randn(
+            (4, 4 * hidden_size), generator=gen, dtype=torch.float32
+        ).to(device)
+        / 64
+    ).contiguous()
+    scale = (
+        torch.randn((1,), generator=gen, dtype=torch.float32).to(device) / 3
+    ).contiguous()
+    bias = (
+        torch.randn((4,), generator=gen, dtype=torch.float32).to(device) / 5
+    ).contiguous()
+    norm_weight = (
+        1
+        + torch.randn((hidden_size,), generator=gen, dtype=torch.float32).to(device)
+        / 8
+    ).to(torch.bfloat16).contiguous()
+    rms_eps = 1e-6
+    hc_eps = 1e-6
+    norm_eps = 1e-6
+    binding = _make_mhc_binding(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        device=device,
+        split_k=2 * (hidden_size // 128),
+    )
+
+    actual = binding.head(
+        residual,
+        fn,
+        scale,
+        bias,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+    )
+    expected = _mhc_head_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+    )
+    assert actual.data_ptr() == binding.y.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=1.6e-2, rtol=0.0)
+
+    functional = sparkinfer_mhc_head(
+        residual,
+        fn,
+        scale,
+        bias,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+    )
+    torch.testing.assert_close(functional, expected, atol=1.6e-2, rtol=0.0)
+
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = binding.head(
+            residual,
+            fn,
+            scale,
+            bias,
+            norm_weight,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+        )
+    captured_ptr = captured.data_ptr()
+    baseline = captured.clone()
+    graph.replay()
+    assert captured.data_ptr() == captured_ptr
+    torch.testing.assert_close(captured, baseline, atol=0.0, rtol=0.0)
+
+    residual.add_(0.125)
+    graph.replay()
+    expected_live = _mhc_head_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+    )
+    assert torch.isfinite(captured).all()
+    torch.testing.assert_close(captured, expected_live, atol=1.6e-2, rtol=0.0)
+
+
+def test_sparkinfer_mhc_head_torch_compile_functional() -> None:
+    device = require_sparkinfer()
+    hidden_size = 4096
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(92_101)
+    residual = torch.randn(
+        (1, 4, hidden_size), generator=gen, dtype=torch.float32
+    ).to(device).to(torch.bfloat16).contiguous()
+    fn = (
+        torch.randn(
+            (4, 4 * hidden_size), generator=gen, dtype=torch.float32
+        ).to(device)
+        / 64
+    ).contiguous()
+    scale = torch.ones((1,), dtype=torch.float32, device=device)
+    bias = torch.zeros((4,), dtype=torch.float32, device=device)
+    norm_weight = torch.ones((hidden_size,), dtype=torch.bfloat16, device=device)
+
+    def head(
+        residual_arg: torch.Tensor,
+        fn_arg: torch.Tensor,
+        scale_arg: torch.Tensor,
+        bias_arg: torch.Tensor,
+        norm_weight_arg: torch.Tensor,
+    ) -> torch.Tensor:
+        return sparkinfer_mhc_head(
+            residual_arg,
+            fn_arg,
+            scale_arg,
+            bias_arg,
+            norm_weight_arg,
+            rms_eps=1e-6,
+            hc_eps=1e-6,
+            norm_eps=1e-6,
+        )
+
+    eager = head(residual, fn, scale, bias, norm_weight)
+    compiled = torch.compile(head, fullgraph=True)(
+        residual,
+        fn,
+        scale,
+        bias,
+        norm_weight,
+    )
+    torch.testing.assert_close(compiled, eager, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
