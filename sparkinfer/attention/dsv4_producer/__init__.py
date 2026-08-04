@@ -10,6 +10,12 @@ both low-rank Q and raw KV.  ``run`` then:
 2. projects ``wq_b`` directly into the caller's final query buffer; and
 3. applies per-head RMS normalization and partial RoPE in place.
 
+The learned C=4 index producer consumes the same normalized Q-rank while it is
+live, projects its separate 64x128 query, applies partial RoPE, randomized
+Hadamard, and E2M1 QAT, and emits FP8 scorer queries plus FP32 learned head
+weights into caller-owned buffers.  Selection remains owned by
+``attention.nsa_indexer`` rather than duplicating its physical-slot top-k path.
+
 There is no BF16 KV staging allocation and no serving-time tensor allocation.
 The planned lifecycle is ``pack_weights`` (one time) -> ``plan`` -> ``bind``
 (views only) -> ``run`` (CUDA-graph-capture safe after prewarm).
@@ -29,11 +35,19 @@ META = OpMeta(
         "Caps",
         "Plan",
         "Binding",
+        "IndexerCaps",
+        "IndexerPlan",
+        "IndexerBinding",
+        "IndexerWeights",
         "Weights",
         "plan",
+        "plan_indexer",
         "bind",
+        "bind_indexer",
         "pack_weights",
+        "pack_indexer_weights",
         "run",
+        "run_indexer",
         "is_supported",
     ),
     dtypes=("bf16", "fp8_e4m3"),
@@ -55,13 +69,21 @@ if TYPE_CHECKING:
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        IndexerBinding,
+        IndexerCaps,
+        IndexerPlan,
+        IndexerWeights,
         Plan,
         Weights,
         bind,
+        bind_indexer,
         is_supported,
+        pack_indexer_weights,
         pack_weights,
         plan,
+        plan_indexer,
         run,
+        run_indexer,
     )
 
 install_lazy_api(globals(), META)

@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.attention import dsv4_producer
+from sparkinfer.attention import dsv4_producer, nsa_indexer
 from sparkinfer.attention._shared.mla.compressed_reference import (
     pack_compressed_mla_kv_cache_reference,
 )
 from sparkinfer.attention.dsv4_producer._impl import (
+    DSV4_INDEX_WEIGHT_SCALE,
     DSV4_KV_PAGE_BYTES,
+    _run_indexer_query_post,
     _run_normalize_query_rope,
     _run_normalize_rank_pack_kv,
+)
+from sparkinfer.attention.nsa_indexer.reference import (
+    pack_index_k_cache_reference,
+    paged_decode_logits_reference,
 )
 
 from ..conftest import require_sparkinfer
@@ -59,6 +65,55 @@ def _block_fp8_weight(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]
     return weight, scale
 
 
+def _fwht_128(values: torch.Tensor) -> torch.Tensor:
+    shape = values.shape
+    output = values.float().reshape(-1, 128)
+    width = 1
+    while width < 128:
+        groups = output.view(-1, 2, width)
+        first = groups[:, 0].clone()
+        second = groups[:, 1].clone()
+        output = torch.stack((first + second, first - second), dim=1).reshape(-1, 128)
+        width *= 2
+    return (output * (128**-0.5)).reshape(shape)
+
+
+def _fp4_qat_reference(values: torch.Tensor) -> torch.Tensor:
+    shape = values.shape
+    blocks = values.float().reshape(-1, 32)
+    scales = blocks.abs().amax(dim=1).clamp_min(6 * torch.finfo(torch.float32).tiny) / 6
+    scales = torch.pow(2.0, torch.ceil(torch.log2(scales)))
+    magnitude = (blocks.abs() / scales[:, None]).clamp_max(6)
+    fp4 = torch.where(
+        magnitude < 0.25,
+        0.0,
+        torch.where(
+            magnitude < 0.75,
+            0.5,
+            torch.where(
+                magnitude < 1.25,
+                1.0,
+                torch.where(
+                    magnitude < 1.75,
+                    1.5,
+                    torch.where(
+                        magnitude < 2.5,
+                        2.0,
+                        torch.where(
+                            magnitude < 3.5,
+                            3.0,
+                            torch.where(magnitude < 5.0, 4.0, 6.0),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return (
+        torch.copysign(fp4, blocks) * scales[:, None]
+    ).reshape(shape).to(torch.bfloat16)
+
+
 def test_plan_pins_flash_and_pro_caller_owned_workspace() -> None:
     flash = dsv4_producer.plan(
         dsv4_producer.Caps(
@@ -101,6 +156,44 @@ def test_caps_reject_absorbed_mla_and_non_native_page_geometry() -> None:
             pass
         else:
             raise AssertionError(f"invalid DSV4 producer geometry was accepted: {kwargs}")
+
+
+def test_indexer_plan_pins_flash_and_pro_query_producer_arena() -> None:
+    flash = dsv4_producer.plan_indexer(
+        dsv4_producer.IndexerCaps(
+            device="cpu", max_tokens=2_048, hidden=4_096, q_lora_rank=1_024
+        )
+    )
+    pro = dsv4_producer.plan_indexer(
+        dsv4_producer.IndexerCaps(
+            device="cpu", max_tokens=2_048, hidden=7_168, q_lora_rank=1_536
+        )
+    )
+
+    assert flash.scratch_specs()[0].name == "dsv4_indexer_producer.scratch"
+    assert flash.scratch_specs()[0].nbytes == 36_044_800
+    assert pro.scratch_specs()[0].nbytes == 37_158_912
+    assert flash.layout.q_output_bytes == 2_048 * 64 * 128 * 2
+    assert flash.layout.weights_output_bytes == 2_048 * 64 * 2
+    assert flash.layout.q_output_offset % 1_024 == 0
+    assert flash.layout.weights_output_offset % 1_024 == 0
+
+
+def test_indexer_caps_reject_cross_variant_or_non_native_geometry() -> None:
+    for kwargs in (
+        {"hidden": 4_096, "q_lora_rank": 1_536},
+        {"hidden": 7_168, "q_lora_rank": 1_024},
+        {"hidden": 4_096, "q_lora_rank": 1_024, "heads": 128},
+        {"hidden": 4_096, "q_lora_rank": 1_024, "head_dim": 64},
+    ):
+        try:
+            dsv4_producer.IndexerCaps(device="cpu", max_tokens=1, **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"invalid DSV4 indexer producer geometry was accepted: {kwargs}"
+            )
 
 
 def test_rank_norm_and_main_kv_pack_match_checkpoint_reference() -> None:
@@ -175,6 +268,199 @@ def test_query_post_matches_per_head_rmsnorm_and_partial_rope() -> None:
         nope_dim=448,
     ).reshape(tokens, heads, 512)
     torch.testing.assert_close(query, expected, rtol=0, atol=0)
+
+
+def test_indexer_query_post_matches_checkpoint_rope_hadamard_and_fp4_qat() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260807)
+    tokens, heads = 2, 64
+    raw_query = (
+        torch.randn((tokens, heads, 128), device="cuda", dtype=torch.bfloat16) / 4
+    ).contiguous()
+    raw_weights = (
+        torch.randn((tokens, heads), device="cuda", dtype=torch.bfloat16) / 3
+    ).contiguous()
+    positions = torch.tensor([1, 4], device="cuda", dtype=torch.int32)
+    angles = torch.randn((5, 32), device="cuda", dtype=torch.float32)
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
+    query = torch.empty(
+        (tokens, heads, 128), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    head_weights = torch.empty(
+        (tokens, heads), device="cuda", dtype=torch.float32
+    )
+
+    _run_indexer_query_post(
+        raw_query, raw_weights, positions, cos_sin, query, head_weights
+    )
+    torch.cuda.synchronize()
+
+    expanded_positions = positions[:, None].expand(tokens, heads).reshape(-1)
+    expected = _rope_forward(
+        raw_query.reshape(-1, 128),
+        expanded_positions,
+        cos_sin,
+        nope_dim=64,
+    ).reshape_as(raw_query)
+    expected = _fp4_qat_reference(_fwht_128(expected)).to(torch.float8_e4m3fn)
+    error = (query.float() - expected.float()).abs()
+    # Register reduction order may move a very small number of lanes across an
+    # E2M1 discontinuity; all other lanes retain the exact FP8 encoding.
+    assert int((error > 0).sum()) <= tokens * heads
+    assert float(error.max()) <= 0.25
+    expected_weights = (raw_weights * DSV4_INDEX_WEIGHT_SCALE).float()
+    torch.testing.assert_close(head_weights, expected_weights, rtol=0, atol=0)
+
+
+def test_indexer_query_feeds_physical_slot_topk_without_remap_allocation() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260808)
+    device = torch.device("cuda")
+    rows, heads, pages, topk = 2, 64, 12, 512
+    raw_query = (
+        torch.randn((rows, heads, 128), device=device, dtype=torch.bfloat16) / 3
+    ).contiguous()
+    raw_weights = (
+        torch.randn((rows, heads), device=device, dtype=torch.bfloat16) / 4
+    ).contiguous()
+    positions = torch.tensor([15, 19], device=device, dtype=torch.int32)
+    angles = torch.randn((20, 32), device=device, dtype=torch.float32)
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
+    query = torch.empty(
+        (rows, heads, 128), device=device, dtype=torch.float8_e4m3fn
+    )
+    head_weights = torch.empty((rows, heads), device=device, dtype=torch.float32)
+    _run_indexer_query_post(
+        raw_query, raw_weights, positions, cos_sin, query, head_weights
+    )
+
+    index_rows = torch.randn(
+        (pages * 64, 128), device=device, dtype=torch.float32
+    )
+    index_cache = pack_index_k_cache_reference(index_rows)
+    first = torch.tensor(
+        [5, 2, 10, 1, 8, 0, 11, 4, 7, 3, 9, 6],
+        device=device,
+        dtype=torch.int32,
+    )
+    second = torch.tensor(
+        [9, 0, 6, 11, 3, 5, 1, 8, 4, 10, 2, 7],
+        device=device,
+        dtype=torch.int32,
+    )
+    page_table = torch.stack((first, second)).contiguous()
+    seqlens = torch.tensor([700, 641], device=device, dtype=torch.int32)
+    selection_plan = nsa_indexer.plan(
+        nsa_indexer.Caps(
+            device=device,
+            source_layout=nsa_indexer.SOURCE_LAYOUT_PAGED,
+            num_q_heads=heads,
+            max_q_rows=rows,
+            max_page_table_width=pages,
+            topk=topk,
+            mode="decode",
+        )
+    )
+    (selection_spec,) = selection_plan.scratch_specs()
+    selection_scratch = torch.empty(
+        selection_spec.shape, dtype=selection_spec.dtype, device=device
+    )
+    selection_binding = selection_plan.bind(
+        scratch=selection_scratch,
+        real_page_table=page_table,
+        cache_seqlens_int32=seqlens,
+        expected_num_q_heads=heads,
+        output_physical_slots=True,
+    )
+    output = torch.empty((rows, topk), device=device, dtype=torch.int32)
+    scores = torch.empty((rows, topk), device=device, dtype=torch.float32)
+    nsa_indexer.index_topk_fp8(
+        q_fp8=query,
+        weights=head_weights,
+        index_k_cache=index_cache,
+        binding=selection_binding,
+        out_indices=output,
+        out_scores=scores,
+    )
+    torch.cuda.synchronize()
+
+    logits = paged_decode_logits_reference(
+        q_fp8=query,
+        weights=head_weights,
+        index_k_cache=index_cache,
+        real_page_table=page_table,
+        query_row_to_batch=torch.arange(rows, device=device, dtype=torch.int32),
+        seqlens_per_query=seqlens,
+    )
+    logical = torch.topk(logits, topk, dim=1).indices
+    physical = torch.gather(page_table, 1, logical // 64) * 64 + logical % 64
+    for row in range(rows):
+        assert set(output[row].tolist()) == set(physical[row].to(torch.int32).tolist())
+
+
+def test_full_indexer_producer_replays_without_serving_allocations() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260809)
+    hidden, q_rank, heads, tokens = 4_096, 1_024, 64, 1
+    wq_b, wq_b_scale = _block_fp8_weight(heads * 128, q_rank)
+    weights_projection = (
+        torch.randn((heads, hidden), device="cuda", dtype=torch.bfloat16) / 64
+    ).contiguous()
+    weights = dsv4_producer.pack_indexer_weights(
+        wq_b, wq_b_scale, weights_projection
+    )
+    plan = dsv4_producer.plan_indexer(
+        dsv4_producer.IndexerCaps(
+            device="cuda",
+            max_tokens=tokens,
+            hidden=hidden,
+            q_lora_rank=q_rank,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    q_rank_values = (
+        torch.randn((tokens, q_rank), device="cuda", dtype=torch.bfloat16) / 4
+    ).contiguous()
+    hidden_states = (
+        torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16) / 4
+    ).contiguous()
+    positions = torch.zeros((tokens,), device="cuda", dtype=torch.int32)
+    cos_sin = torch.zeros((1, 64), device="cuda", dtype=torch.float32)
+    cos_sin[:, :32] = 1
+    query = torch.empty(
+        (tokens, heads, 128), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    head_weights = torch.empty((tokens, heads), device="cuda", dtype=torch.float32)
+    binding = dsv4_producer.bind_indexer(
+        plan,
+        scratch=scratch,
+        q_rank=q_rank_values,
+        hidden_states=hidden_states,
+        positions=positions,
+        cos_sin_cache=cos_sin,
+        query=query,
+        head_weights=head_weights,
+        weights=weights,
+        expected_m=tokens,
+    )
+
+    dsv4_producer.run_indexer(binding=binding)
+    torch.cuda.synchronize()
+    eager_query = query.clone()
+    eager_weights = head_weights.clone()
+    assert bool(torch.isfinite(query.float()).all())
+    assert bool(torch.isfinite(head_weights).all())
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dsv4_producer.run_indexer(binding=binding)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(query, eager_query)
+    assert torch.equal(head_weights, eager_weights)
 
 
 def test_full_flash_plan_replays_without_serving_allocations() -> None:
