@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -32,10 +33,6 @@ _SCRATCH_ALIGNMENT = 1024
 
 def _align_up(value: int, alignment: int = _SCRATCH_ALIGNMENT) -> int:
     return ((int(value) + alignment - 1) // alignment) * alignment
-
-
-def _tensor_nbytes(tensor: torch.Tensor) -> int:
-    return int(tensor.numel()) * int(tensor.element_size())
 
 
 def _check_cuda_tensor(name: str, tensor: torch.Tensor) -> None:
@@ -286,6 +283,8 @@ def pack_dsv4_producer_weights(
         )
     if q_norm.dtype != torch.bfloat16 or kv_norm.dtype != torch.bfloat16:
         raise ValueError("DSV4 producer norm weights must be BF16")
+    if not q_norm.is_contiguous() or not kv_norm.is_contiguous():
+        raise ValueError("DSV4 producer norm weights must be contiguous")
     if any(tensor.device != wq_a.device for tensor in (wq_b, wkv, q_norm, kv_norm)):
         raise ValueError("DSV4 producer weights must share one CUDA device")
 
@@ -408,6 +407,8 @@ def _validate_runtime_tensors(
         raise ValueError(f"positions must be int32/int64 [{tokens}]")
     if main_slots.shape != (tokens,) or main_slots.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"main_slots must be int32/int64 [{tokens}]")
+    if not positions.is_contiguous() or not main_slots.is_contiguous():
+        raise ValueError("positions and main_slots must be contiguous")
     if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] != caps.rope_dim:
         raise ValueError(
             f"cos_sin_cache must have shape [positions,{caps.rope_dim}], got {tuple(cos_sin_cache.shape)}"
@@ -423,14 +424,16 @@ def _validate_runtime_tensors(
         raise ValueError(
             f"main_kv_cache must be contiguous uint8 [pages,{DSV4_KV_PAGE_BYTES}]"
         )
+    if int(main_kv_cache.shape[0]) <= 0:
+        raise ValueError("main_kv_cache must contain at least one physical page")
     if query.shape != (tokens, caps.heads, caps.head_dim):
         raise ValueError(
             f"query must have shape {(tokens, caps.heads, caps.head_dim)}, got {tuple(query.shape)}"
         )
     if query.dtype != torch.bfloat16 or not query.is_contiguous():
         raise ValueError("query must be contiguous BF16")
-    if not float(eps) > 0.0:
-        raise ValueError(f"eps must be positive, got {eps}")
+    if not math.isfinite(float(eps)) or not float(eps) > 0.0:
+        raise ValueError(f"eps must be finite and positive, got {eps}")
     return tokens
 
 

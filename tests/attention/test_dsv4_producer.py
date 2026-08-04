@@ -210,8 +210,8 @@ def test_full_flash_plan_replays_without_serving_allocations() -> None:
     hidden_states = (
         torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16) / 4
     ).contiguous()
-    positions = torch.zeros((tokens,), device="cuda", dtype=torch.int64)
-    slots = torch.zeros((tokens,), device="cuda", dtype=torch.int64)
+    positions = torch.zeros((tokens,), device="cuda", dtype=torch.int32)
+    slots = torch.zeros((tokens,), device="cuda", dtype=torch.int32)
     cos_sin = torch.zeros((1, 64), device="cuda", dtype=torch.float32)
     cos_sin[:, :32] = 1
     cache = torch.zeros((1, DSV4_KV_PAGE_BYTES), device="cuda", dtype=torch.uint8)
