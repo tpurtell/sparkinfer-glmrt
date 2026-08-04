@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.attention import sparse_mla
+from sparkinfer.attention import compressed_mla, sparse_mla
+from sparkinfer.attention._shared.mla.compressed_reference import (
+    compressed_sparse_mla_reference,
+    pack_compressed_mla_kv_cache_reference,
+)
 from sparkinfer.attention._shared.mla.reference import (
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
@@ -114,4 +118,74 @@ def test_run_decode_masks_padded_selection() -> None:
     sel[:, width // 2 :] = -1
     active.fill_(width // 2)
     out, ref = _run_public_decode(q, kv, sel, lens, active, width=width)
+    _assert_matches(out, ref)
+
+
+def test_dsv4_dspark_decode_attends_target_ring_and_all_proposal_kv() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260805)
+    rows = 5
+    heads = 64
+    target_ring = 128
+    proposal_tokens = 5
+    width = target_ring + proposal_tokens
+    page_size = 256
+    k_nope = torch.randn(
+        page_size, 448, device="cuda", dtype=torch.bfloat16
+    ) / 4
+    k_rope = torch.randn(
+        page_size, 64, device="cuda", dtype=torch.bfloat16
+    ) / 4
+    kv_cache = pack_compressed_mla_kv_cache_reference(
+        k_nope, k_rope, page_size=page_size
+    )
+    q = torch.randn(rows, heads, 512, device="cuda", dtype=torch.bfloat16) / 4
+    selected = torch.cat(
+        (
+            torch.arange(target_ring, device="cuda"),
+            torch.arange(target_ring, width, device="cuda"),
+        )
+    ).to(torch.int32)
+    selected = selected.view(1, width).expand(rows, width).contiguous()
+    active = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    plan = compressed_mla.plan(
+        compressed_mla.Caps(
+            device="cuda",
+            num_q_heads=heads,
+            max_q_rows=rows,
+            max_width=width,
+            kv_dtype=torch.uint8,
+            head_dim=512,
+            v_head_dim=512,
+            max_chunks_per_row=12,
+            page_size=page_size,
+        )
+    )
+    (scratch_spec,) = plan.scratch_specs()
+    scratch = torch.empty(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
+    )
+    binding = compressed_mla.bind(
+        plan,
+        scratch=scratch,
+        q=q,
+        swa_indices=selected,
+        swa_lengths=active,
+    )
+    out = compressed_mla.run(
+        binding=binding,
+        swa_k_cache=kv_cache,
+        sm_scale=512**-0.5,
+        swa_page_size=page_size,
+    )
+    ref = compressed_sparse_mla_reference(
+        q=q,
+        swa_k_cache=kv_cache,
+        swa_indices=selected,
+        swa_topk_lengths=active,
+        sm_scale=512**-0.5,
+        swa_page_size=page_size,
+    )
     _assert_matches(out, ref)
