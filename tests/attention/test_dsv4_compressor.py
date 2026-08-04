@@ -51,6 +51,52 @@ def _overlap_pool(
     return (kv * score.softmax(dim=0)).sum(dim=0)
 
 
+def _initial_prefill_pool(
+    projection: torch.Tensor,
+    ape: torch.Tensor,
+    *,
+    source_start: int,
+    rope_position: int,
+    head_dim: int,
+) -> torch.Tensor:
+    ratio, projected_width = ape.shape
+    overlap = projected_width == 2 * head_dim
+    if overlap:
+        current_kv = projection[
+            source_start : source_start + ratio, head_dim:projected_width
+        ]
+        current_score = (
+            projection[
+                source_start : source_start + ratio,
+                projected_width + head_dim : 2 * projected_width,
+            ]
+            + ape[:, head_dim:]
+        )
+        kv = current_kv
+        score = current_score
+        if rope_position > 0:
+            previous_kv = projection[source_start - ratio : source_start, :head_dim]
+            previous_score = (
+                projection[
+                    source_start - ratio : source_start,
+                    projected_width : projected_width + head_dim,
+                ]
+                + ape[:, :head_dim]
+            )
+            kv = torch.cat((previous_kv, current_kv), dim=0)
+            score = torch.cat((previous_score, current_score), dim=0)
+    else:
+        kv = projection[source_start : source_start + ratio, :head_dim]
+        score = (
+            projection[
+                source_start : source_start + ratio,
+                projected_width : 2 * projected_width,
+            ]
+            + ape
+        )
+    return (kv.float() * score.float().softmax(dim=0)).sum(dim=0)
+
+
 def _fwht_128(values: torch.Tensor) -> torch.Tensor:
     output = values.float()
     width = 1
@@ -354,6 +400,316 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
     # threshold. The remaining 127 lanes match the checkpoint QAT path.
     assert int((index_error > 0.04).sum()) <= 1
     assert float(index_error.max()) <= 0.25
+
+
+def test_c4_initial_prefill_emits_parallel_groups_and_exact_terminal_state() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260806)
+    hidden, eps = 4_096, 1.0e-6
+    plan = dsv4_compressor.plan(
+        dsv4_compressor.Caps(
+            device="cuda",
+            max_tokens=32,
+            hidden=hidden,
+            compress_ratio=4,
+            with_indexer=True,
+        )
+    )
+    main_wkv = _random((1_024, hidden), torch.bfloat16, 1 / 64)
+    main_wgate = _random((1_024, hidden), torch.bfloat16, 1 / 64)
+    main_ape = _random((4, 1_024), torch.float32, 1 / 16)
+    main_norm = (_random((512,), torch.bfloat16, 1 / 16) + 1).contiguous()
+    index_wkv = _random((256, hidden), torch.bfloat16, 1 / 64)
+    index_wgate = _random((256, hidden), torch.bfloat16, 1 / 64)
+    index_ape = _random((4, 256), torch.float32, 1 / 16)
+    index_norm = (_random((128,), torch.bfloat16, 1 / 16) + 1).contiguous()
+    weights = dsv4_compressor.pack_weights(
+        main_wkv,
+        main_wgate,
+        main_ape,
+        main_norm,
+        index_wkv=index_wkv,
+        index_wgate=index_wgate,
+        index_ape=index_ape,
+        index_norm=index_norm,
+    )
+    hidden_states = _random((32, hidden), torch.bfloat16)
+    projection = F.linear(hidden_states, weights.joint_projection)
+    active_groups = torch.tensor([3], device="cuda", dtype=torch.int32)
+    group_starts = torch.tensor(
+        [0, 4, 10, 0, 0, 0, 0, 0], device="cuda", dtype=torch.int32
+    )
+    group_positions = torch.tensor(
+        [0, 4, 0, 0, 0, 0, 0, 0], device="cuda", dtype=torch.int32
+    )
+    slots = torch.tensor(
+        [0, 1, 2, 63, 63, 63, 63, 63], device="cuda", dtype=torch.int32
+    )
+    active_sequences = torch.tensor([3], device="cuda", dtype=torch.int32)
+    sequence_offsets = torch.tensor(
+        [0, 10, 17, 20, 20], device="cuda", dtype=torch.int32
+    )
+    state_sequence_ids = torch.tensor([1, 0, 2, 3], device="cuda", dtype=torch.int32)
+    cos_sin = _cos_sin(32)
+    main_cache = torch.zeros((1, 37_440), device="cuda", dtype=torch.uint8)
+    index_cache = torch.zeros((1, 8_448), device="cuda", dtype=torch.uint8)
+    main_kv_state = _random((4, 8, 1_024), torch.float32)
+    main_score_state = _random((4, 8, 1_024), torch.float32)
+    index_kv_state = _random((4, 8, 256), torch.float32)
+    index_score_state = _random((4, 8, 256), torch.float32)
+    expected_main_kv = main_kv_state.clone()
+    expected_main_score = main_score_state.clone()
+    expected_index_kv = index_kv_state.clone()
+    expected_index_score = index_score_state.clone()
+
+    for sequence_slot, (source_start, source_end) in enumerate(
+        ((0, 10), (10, 17), (17, 20))
+    ):
+        state_sequence = (1, 0, 2)[sequence_slot]
+        source_tokens = source_end - source_start
+        cutoff = source_tokens // 4 * 4
+        remainder = source_tokens - cutoff
+        for expected_kv, expected_score, offset, width, ape in (
+            (expected_main_kv, expected_main_score, 0, 1_024, main_ape),
+            (expected_index_kv, expected_index_score, 2_048, 256, index_ape),
+        ):
+            expected_kv[state_sequence].zero_()
+            expected_score[state_sequence].fill_(float("-inf"))
+            if cutoff >= 4:
+                previous = projection[
+                    source_start + cutoff - 4 : source_start + cutoff,
+                    offset : offset + width,
+                ]
+                previous_score = projection[
+                    source_start + cutoff - 4 : source_start + cutoff,
+                    offset + width : offset + 2 * width,
+                ]
+                expected_kv[state_sequence, :4] = previous.float()
+                expected_score[state_sequence, :4] = previous_score.float() + ape
+            if remainder:
+                current = projection[
+                    source_start + cutoff : source_end, offset : offset + width
+                ]
+                current_score = projection[
+                    source_start + cutoff : source_end,
+                    offset + width : offset + 2 * width,
+                ]
+                expected_kv[state_sequence, 4 : 4 + remainder] = current.float()
+                expected_score[state_sequence, 4 : 4 + remainder] = (
+                    current_score.float() + ape[:remainder]
+                )
+
+    expected_main_rows = []
+    expected_index_rows = []
+    for source_start, rope_position in ((0, 0), (4, 4), (10, 0)):
+        main_pooled = _initial_prefill_pool(
+            projection[:, :2_048],
+            main_ape,
+            source_start=source_start,
+            rope_position=rope_position,
+            head_dim=512,
+        )
+        expected_main_rows.append(
+            _rope_forward(
+                _rmsnorm(main_pooled, main_norm, eps),
+                rope_position,
+                cos_sin,
+                nope_dim=448,
+            )
+        )
+        index_pooled = _initial_prefill_pool(
+            projection[:, 2_048:],
+            index_ape,
+            source_start=source_start,
+            rope_position=rope_position,
+            head_dim=128,
+        )
+        expected_index = _rope_forward(
+            _rmsnorm(index_pooled, index_norm, eps),
+            rope_position,
+            cos_sin,
+            nope_dim=64,
+        )
+        expected_index_rows.append(_fp4_qat_reference(_fwht_128(expected_index)))
+    expected_main_rows = torch.stack(expected_main_rows)
+    expected_index_rows = torch.stack(expected_index_rows)
+    expected_main_cache = pack_compressed_mla_kv_cache_reference(
+        expected_main_rows[:, :448],
+        expected_main_rows[:, 448:],
+        page_size=64,
+        num_pages=1,
+    )
+    expected_index_cache = pack_index_k_cache_reference(expected_index_rows)
+
+    scratch = torch.empty(
+        plan.scratch_specs()[0].shape, device="cuda", dtype=torch.uint8
+    )
+    binding = dsv4_compressor.bind_prefill(
+        plan,
+        scratch=scratch,
+        hidden_states=hidden_states,
+        active_groups=active_groups,
+        group_source_starts=group_starts,
+        group_rope_positions=group_positions,
+        compressed_slots=slots,
+        active_sequences=active_sequences,
+        sequence_offsets=sequence_offsets,
+        state_sequence_ids=state_sequence_ids,
+        compressed_cos_sin_cache=cos_sin,
+        compressed_main_cache=main_cache,
+        main_kv_state=main_kv_state,
+        main_score_state=main_score_state,
+        weights=weights,
+        index_cache=index_cache,
+        index_kv_state=index_kv_state,
+        index_score_state=index_score_state,
+        eps=eps,
+        initial_prefill=True,
+    )
+    dsv4_compressor.run_prefill(binding=binding)
+    torch.cuda.synchronize()
+
+    assert torch.equal(main_kv_state, expected_main_kv)
+    assert torch.equal(main_score_state, expected_main_score)
+    assert torch.equal(index_kv_state, expected_index_kv)
+    assert torch.equal(index_score_state, expected_index_score)
+    actual_nope, actual_rope = unpack_compressed_mla_kv_cache_reference(
+        main_cache, page_size=64, n_tokens=3
+    )
+    expected_nope, expected_rope = unpack_compressed_mla_kv_cache_reference(
+        expected_main_cache, page_size=64, n_tokens=3
+    )
+    torch.testing.assert_close(actual_nope, expected_nope, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(actual_rope, expected_rope, atol=0.02, rtol=0.02)
+    index_actual = unpack_index_k_cache_reference(
+        index_cache, num_tokens=3, page_size=64
+    )
+    index_expected = unpack_index_k_cache_reference(
+        expected_index_cache, num_tokens=3, page_size=64
+    )
+    index_error = (index_actual - index_expected).abs()
+    assert int((index_error > 0.04).sum()) <= 3
+    assert float(index_error.max()) <= 0.25
+
+
+def test_c128_initial_prefill_graph_replays_and_retains_only_remainder() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260807)
+    ratio, hidden, eps = 128, 4_096, 1.0e-6
+    plan = dsv4_compressor.plan(
+        dsv4_compressor.Caps(
+            device="cuda",
+            max_tokens=384,
+            hidden=hidden,
+            compress_ratio=ratio,
+            with_indexer=False,
+        )
+    )
+    main_wkv = _random((512, hidden), torch.bfloat16, 1 / 64)
+    main_wgate = _random((512, hidden), torch.bfloat16, 1 / 64)
+    main_ape = _random((ratio, 512), torch.float32, 1 / 16)
+    main_norm = (_random((512,), torch.bfloat16, 1 / 16) + 1).contiguous()
+    weights = dsv4_compressor.pack_weights(main_wkv, main_wgate, main_ape, main_norm)
+    hidden_states = _random((384, hidden), torch.bfloat16)
+    projection = F.linear(hidden_states, weights.joint_projection)
+    active_groups = torch.tensor([2], device="cuda", dtype=torch.int32)
+    group_starts = torch.tensor([0, 128, 0], device="cuda", dtype=torch.int32)
+    group_positions = torch.tensor([0, 128, 0], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([0, 1, 1], device="cuda", dtype=torch.int32)
+    active_sequences = torch.tensor([1], device="cuda", dtype=torch.int32)
+    sequence_offsets = torch.tensor([0, 260, 260], device="cuda", dtype=torch.int32)
+    state_sequence_ids = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    cos_sin = _cos_sin(384)
+    main_cache = torch.zeros((1, 1_728), device="cuda", dtype=torch.uint8)
+    kv_state = _random((2, 128, 512), torch.float32)
+    score_state = _random((2, 128, 512), torch.float32)
+    expected_kv = kv_state.clone()
+    expected_score = score_state.clone()
+    expected_kv[0].zero_()
+    expected_score[0].fill_(float("-inf"))
+    expected_kv[0, :4] = projection[256:260, :512].float()
+    expected_score[0, :4] = projection[256:260, 512:].float() + main_ape[:4]
+    expected_rows = []
+    for source_start, rope_position in ((0, 0), (128, 128)):
+        pooled = _initial_prefill_pool(
+            projection,
+            main_ape,
+            source_start=source_start,
+            rope_position=rope_position,
+            head_dim=512,
+        )
+        expected_rows.append(
+            _rope_forward(
+                _rmsnorm(pooled, main_norm, eps),
+                rope_position,
+                cos_sin,
+                nope_dim=448,
+            )
+        )
+    expected_rows = torch.stack(expected_rows)
+    expected_cache = pack_compressed_mla_kv_cache_reference(
+        expected_rows[:, :448],
+        expected_rows[:, 448:],
+        page_size=2,
+        num_pages=1,
+    )
+
+    scratch = torch.empty(
+        plan.scratch_specs()[0].shape, device="cuda", dtype=torch.uint8
+    )
+    binding = dsv4_compressor.bind_prefill(
+        plan,
+        scratch=scratch,
+        hidden_states=hidden_states,
+        active_groups=active_groups,
+        group_source_starts=group_starts,
+        group_rope_positions=group_positions,
+        compressed_slots=slots,
+        active_sequences=active_sequences,
+        sequence_offsets=sequence_offsets,
+        state_sequence_ids=state_sequence_ids,
+        compressed_cos_sin_cache=cos_sin,
+        compressed_main_cache=main_cache,
+        main_kv_state=kv_state,
+        main_score_state=score_state,
+        weights=weights,
+        eps=eps,
+        initial_prefill=True,
+    )
+    dsv4_compressor.run_prefill(binding=binding)
+    torch.cuda.synchronize()
+
+    assert torch.equal(kv_state, expected_kv)
+    assert torch.equal(score_state, expected_score)
+    actual_nope, actual_rope = unpack_compressed_mla_kv_cache_reference(
+        main_cache, page_size=2, n_tokens=2
+    )
+    expected_nope, expected_rope = unpack_compressed_mla_kv_cache_reference(
+        expected_cache, page_size=2, n_tokens=2
+    )
+    torch.testing.assert_close(actual_nope, expected_nope, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(actual_rope, expected_rope, atol=0.02, rtol=0.02)
+
+    eager_cache = main_cache.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dsv4_compressor.run_prefill(binding=binding)
+    main_cache.zero_()
+    active_groups.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.count_nonzero(main_cache[0, 576:1_152])
+    assert not torch.count_nonzero(main_cache[0, 1_160:1_168])
+    one_nope, one_rope = unpack_compressed_mla_kv_cache_reference(
+        main_cache, page_size=2, n_tokens=1
+    )
+    torch.testing.assert_close(one_nope, expected_nope[:1], atol=0.04, rtol=0.04)
+    torch.testing.assert_close(one_rope, expected_rope[:1], atol=0.02, rtol=0.02)
+
+    active_groups.fill_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(main_cache, eager_cache)
 
 
 def test_decode_binding_requires_explicit_sequence_unique_contract() -> None:
