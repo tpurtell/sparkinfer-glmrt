@@ -2557,7 +2557,11 @@ def _plan_core_workspace(
         )
         requested_route_E = int(route_num_experts or weight_E)
         full_rotation = weight_layout == "trellis3_t256"
-        route_E = requested_route_E if full_rotation else int(weight_E)
+        # A route map can expose a larger global router namespace than the
+        # local packed weights.  Never shrink below the local weight count,
+        # because callers also use route_num_experts to describe compact
+        # router subsets without remapping the weight tensors.
+        route_E = max(requested_route_E, int(weight_E))
         if full_rotation:
             if source_format != "exl3_trellis_mcg":
                 raise ValueError(
@@ -6838,7 +6842,11 @@ def _prewarm_w4a16_planned_launches(
             and element_dtype == "bf16"
             and is_gated_moe_activation(workspace.activation)
         )
-        if (full_rotation or mapped_tc_decode) and not collect_activation_amax:
+        if (
+            not is_capturing
+            and (full_rotation or mapped_tc_decode)
+            and not collect_activation_amax
+        ):
             # Capture buckets are usually powers of two, while speculative
             # decode can produce any m in this range. Precompile every exact
             # mapped-direct geometry. Packed W4A16 folds the top-k reduction
@@ -6905,7 +6913,7 @@ def _prewarm_w4a16_planned_launches(
                                 resolved_topk_sum
                             )
 
-        if build_tc_decode:
+        if build_tc_decode and not is_capturing:
             # The capture/route-pack token counts above are powers of two, but the
             # real decode shapes are seqs*(1+num_spec) (e.g. 3, 6 under MTP). The
             # binding looks up TC-decode launches by the *exact* runtime m, so build
