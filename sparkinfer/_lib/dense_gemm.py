@@ -617,6 +617,7 @@ class DenseGemmKernel:
         fused_quant_a_nope_dim: int = 0,
         fused_quant_a_rope_dim: int = 0,
         fused_quant_a_wide: bool = False,
+        fused_quant_a_scale_block_size: int = 32,
         atom_shape_24: bool = False,
         b_tile_major: bool = False,
         quantize_c: bool = False,
@@ -729,6 +730,12 @@ class DenseGemmKernel:
         # every k block from it.
         self.sfb_k_reuse = sfb_k_reuse
         self.fused_quant_a = fused_quant_a
+        if fused_quant_a_scale_block_size not in (32, 128):
+            raise ValueError(
+                "fused MXFP8 activation scale block size must be 32 or 128, "
+                f"got {fused_quant_a_scale_block_size}"
+            )
+        self.fused_quant_a_scale_block_size = fused_quant_a_scale_block_size
         # When >0, the BF16 A source is stored L-blocked along K (physical
         # [K/span, M, span], e.g. the WO tmp group-major view over [groups, M,
         # rank]): flat k = outer * span + inner reads element
@@ -3286,17 +3293,29 @@ class DenseGemmKernel:
                                         )
                             for elem in cutlass.range_constexpr(8):
                                 max_abs = fmax_f32(max_abs, fabs_f32(values[elem]))
-                            for shift in cutlass.range_constexpr(2):
+                            for shift in cutlass.range_constexpr(
+                                5
+                                if self.fused_quant_a_scale_block_size == 128
+                                else 2
+                            ):
                                 max_abs = fmax_f32(
                                     max_abs,
                                     cute.arch.shuffle_sync_bfly(
                                         max_abs, offset=1 << shift
                                     ),
                                 )
+                            if cutlass.const_expr(
+                                self.fused_quant_a_scale_block_size == 128
+                            ):
+                                max_abs = fmax_f32(
+                                    max_abs, cutlass.Float32(1.0e-4)
+                                )
                             _, scale_byte = pow2_ceil_ue8m0(
                                 max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                             )
-                            if max_abs == cutlass.Float32(0.0):
+                            if cutlass.const_expr(
+                                self.fused_quant_a_scale_block_size == 32
+                            ) and max_abs == cutlass.Float32(0.0):
                                 scale_byte = cutlass.Uint32(127)
                             inv_scale = ue8m0_to_output_scale(scale_byte)
                             payload0 = cvt_f32x4_to_e4m3x4(
@@ -3457,8 +3476,27 @@ class DenseGemmKernel:
                                             max_abs,
                                             fabs_f32(values[pair * 2 + 1]),
                                         )
+                            if cutlass.const_expr(
+                                self.fused_quant_a_scale_block_size == 128
+                            ):
+                                active_mask = cute.arch.activemask()
+                                for shift in cutlass.range_constexpr(2):
+                                    max_abs = fmax_f32(
+                                        max_abs,
+                                        cute.arch.shuffle_sync_bfly(
+                                            max_abs,
+                                            offset=1 << shift,
+                                            mask=active_mask,
+                                            mask_and_clamp=3,
+                                        ),
+                                    )
+                                max_abs = fmax_f32(
+                                    max_abs, cutlass.Float32(1.0e-4)
+                                )
                             payload, scale_byte = quantize_block_fp8_mx(values, max_abs)
-                            if max_abs == cutlass.Float32(0.0):
+                            if cutlass.const_expr(
+                                self.fused_quant_a_scale_block_size == 32
+                            ) and max_abs == cutlass.Float32(0.0):
                                 scale_byte = cutlass.Uint32(127)
                             for word in cutlass.range_constexpr(8):
                                 for byte in cutlass.range_constexpr(4):
@@ -4827,11 +4865,15 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
         *args,
         fused_quant_a_inner_span: int = 0,
         fused_quant_a_wide: bool = False,
+        fused_quant_a_scale_block_size: int = 32,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._fused_quant_a_inner_span = int(fused_quant_a_inner_span)
         self._fused_quant_a_wide = bool(fused_quant_a_wide)
+        self._fused_quant_a_scale_block_size = int(
+            fused_quant_a_scale_block_size
+        )
 
     def compile_key(self) -> tuple[object, ...]:
         # Keep the fused entry point separate even if every ordinary launch
@@ -4841,6 +4883,7 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             "fused_quant_a",
             self._fused_quant_a_inner_span,
             self._fused_quant_a_wide,
+            self._fused_quant_a_scale_block_size,
             *super().compile_key(),
         )
 
@@ -4914,6 +4957,7 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             fused_quant_a=True,
             fused_quant_a_inner_span=self._fused_quant_a_inner_span,
             fused_quant_a_wide=self._fused_quant_a_wide,
+            fused_quant_a_scale_block_size=self._fused_quant_a_scale_block_size,
             atom_shape_24=self._atom_shape_24,
             b_tile_major=self._b_tile_major,
             target_occupancy=self._target_occupancy,
@@ -4948,6 +4992,7 @@ def _get_compiled_dense_gemm_fused_quant_a(
     a_inner_span: int = 0,
     kernel_c_l: int = 1,
     a_wide: bool = False,
+    activation_scale_block_size: int = 32,
 ) -> Callable:
     launch = _DenseGemmFusedQuantALaunch(
         n=n,
@@ -4975,6 +5020,7 @@ def _get_compiled_dense_gemm_fused_quant_a(
         b_tile_major=b_tile_major,
         fused_quant_a_inner_span=a_inner_span,
         fused_quant_a_wide=a_wide,
+        fused_quant_a_scale_block_size=activation_scale_block_size,
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
@@ -6496,6 +6542,7 @@ def dense_gemm_fused_quant_a(
     sfb_k_replicated: bool = False,
     rhs_values_tiled: Optional[torch.Tensor] = None,
     a_inner_span: int = 0,
+    activation_scale_block_size: int = 32,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     _atomic_output_precleared: bool = False,
     stream: object = None,
@@ -6535,6 +6582,11 @@ def dense_gemm_fused_quant_a(
                 "L-blocked fused MXFP8 A must be a dense-GEMM mnl view over "
                 f"physical [K/span, M, span] storage, got strides {source.stride()}"
             )
+    if activation_scale_block_size not in (32, 128):
+        raise ValueError(
+            "fused MXFP8 activation scale block size must be 32 or 128, "
+            f"got {activation_scale_block_size}"
+        )
     if m < 1 or m > 8 or k % 128 != 0:
         raise ValueError(
             f"fused MXFP8 activation quantization requires 1<=M<=8 and K%128=0, got M={m}, K={k}"
@@ -6629,6 +6681,7 @@ def dense_gemm_fused_quant_a(
         a_inner_span,
         kernel_c_l,
         m == 1,
+        int(activation_scale_block_size),
     )
     compiled(
         source,

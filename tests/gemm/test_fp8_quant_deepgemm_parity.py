@@ -82,6 +82,57 @@ def test_activation_quant_byte_exact_with_deepgemm() -> None:
     torch.testing.assert_close(b_sf, dg_sf, rtol=0, atol=0)
 
 
+def test_activation_quant_k128_byte_exact_with_flash_reference() -> None:
+    """DeepSeek-V4-Flash K128 scales are repeated into four MXFP8 slots."""
+    require_sparkinfer()
+    torch.manual_seed(20260804)
+    rows, width = 9, 256
+    x = (
+        torch.randn(rows, width, device="cuda", dtype=torch.bfloat16) * 3.0
+    ).contiguous()
+    # Ensure each K32 quarter has a distinct local maximum. An accidental K32
+    # implementation therefore cannot pass merely because random maxima tie.
+    x[:, 0] = 1.0
+    x[:, 32] = 3.0
+    x[:, 64] = 7.0
+    x[:, 96] = 15.0
+
+    actual = quantize_block_fp8_linear_input_mxfp8(
+        x,
+        activation_block_size=128,
+    )
+    expected_values, expected_scale_f32 = _per_token_cast_to_fp8(x, gran_k=128)
+    expected_scale = _sf_fp32_to_e8m0_u8(expected_scale_f32)
+    expected_scale = expected_scale.repeat_interleave(4, dim=1)
+
+    torch.testing.assert_close(
+        actual.values.view(torch.uint8),
+        expected_values.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        actual.scale_rows.view(torch.uint8)[0],
+        expected_scale,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_activation_quant_k128_zero_block_uses_flash_floor() -> None:
+    """Flash clamps block amax to 1e-4 instead of assigning unit scale."""
+    require_sparkinfer()
+    x = torch.zeros((1, 128), device="cuda", dtype=torch.bfloat16)
+    actual = quantize_block_fp8_linear_input_mxfp8(
+        x,
+        activation_block_size=128,
+    )
+    _, expected_scale_f32 = _per_token_cast_to_fp8(x, gran_k=128)
+    expected_byte = _sf_fp32_to_e8m0_u8(expected_scale_f32)[0, 0]
+
+    assert bool(torch.all(actual.scale_rows.view(torch.uint8) == expected_byte))
+
+
 def test_ue8m0_rounding_matches_bit_exact_ceil() -> None:
     """ceil(log2(x))/exp2 == bit-exact ceil_to_ue8m0, incl. exact powers of two."""
     require_sparkinfer()

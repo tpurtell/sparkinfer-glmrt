@@ -41,6 +41,7 @@ class _MXFP8RowsQuantLaunch:
         source_type: type[cutlass.Numeric],
         subgroup_width: int,
         threads: int,
+        scale_block_size: int,
     ) -> None:
         self._k = int(k)
         self._groups_k = self._k // 32
@@ -48,6 +49,7 @@ class _MXFP8RowsQuantLaunch:
         self._subgroup_width = int(subgroup_width)
         self._threads = int(threads)
         self._warps_per_cta = self._threads // 32
+        self._scale_block_size = int(scale_block_size)
 
     @cute.jit
     def __call__(
@@ -95,7 +97,57 @@ class _MXFP8RowsQuantLaunch:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
-        if cutlass.const_expr(self._subgroup_width == 4):
+        if cutlass.const_expr(self._scale_block_size == 128):
+            # DeepSeek-V4-Flash quantizes one 128-value activation block with a
+            # single UE8M0 scale.  SM12x MMA still consumes a scale per 32
+            # values, so one warp quantizes the 128-value block and writes the
+            # same byte to each of its four hardware scale groups.
+            warp = Int32(tidx) // Int32(32)
+            lane = Int32(tidx) % Int32(32)
+            blocks_k = Int32(self._k // 128)
+            task = Int32(bidx) * Int32(self._warps_per_cta) + warp
+            total_tasks = m * blocks_k
+            while task < total_tasks:
+                row = task // blocks_k
+                block_k = task % blocks_k
+                values = cute.make_rmem_tensor((4,), cutlass.Float32)
+                k0 = block_k * Int32(128) + lane * Int32(4)
+                for elem in cutlass.range_constexpr(4):
+                    values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
+
+                max_abs = fabs_f32(values[0])
+                for elem in cutlass.range_constexpr(1, 4):
+                    max_abs = fmax_f32(max_abs, fabs_f32(values[elem]))
+                for shift in cutlass.range_constexpr(5):
+                    max_abs = fmax_f32(
+                        max_abs,
+                        cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
+                    )
+                # Match the model's act_quant kernel, including its non-zero
+                # floor for an all-zero (or tiny) block.
+                max_abs = fmax_f32(max_abs, cutlass.Float32(1.0e-4))
+                _, scale_byte = pow2_ceil_ue8m0(
+                    max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
+                )
+                inv_scale = ue8m0_to_output_scale(scale_byte)
+                values_u32[row, block_k * Int32(32) + lane] = (
+                    cvt_f32x4_to_e4m3x4(
+                        values[0] * inv_scale,
+                        values[1] * inv_scale,
+                        values[2] * inv_scale,
+                        values[3] * inv_scale,
+                    )
+                )
+                if lane < Int32(4):
+                    self._store_scale(
+                        scale_rows,
+                        scale_mma,
+                        row,
+                        block_k * Int32(4) + lane,
+                        scale_byte,
+                    )
+                task += Int32(gdim) * Int32(self._warps_per_cta)
+        elif cutlass.const_expr(self._subgroup_width == 4):
             # Eight 4-lane subgroups per warp each quantize one 32-value block.
             # Each lane owns eight adjacent values and emits two packed words.
             warp = Int32(tidx) // Int32(32)
@@ -246,6 +298,7 @@ def _get_compiled_mxfp8_rows_quant(
     source_dtype: torch.dtype,
     subgroup_width: int,
     threads: int,
+    scale_block_size: int,
 ) -> Callable:
     k = int(k)
     if k <= 0 or k % 32 != 0:
@@ -268,8 +321,26 @@ def _get_compiled_mxfp8_rows_quant(
         raise ValueError(
             f"MXFP8 CuTe quantizer threads must be a positive multiple of 32, got {threads}"
         )
-    launch = _MXFP8RowsQuantLaunch(k, source_type, subgroup_width, threads)
-    cache_key = (k, source_dtype_name, int(subgroup_width), int(threads))
+    if scale_block_size not in (32, 128):
+        raise ValueError(
+            "MXFP8 CuTe quantizer scale block size must be 32 or 128, "
+            f"got {scale_block_size}"
+        )
+    if k % scale_block_size != 0:
+        raise ValueError(
+            f"MXFP8 CuTe quantizer K={k} must be divisible by scale block size "
+            f"{scale_block_size}"
+        )
+    launch = _MXFP8RowsQuantLaunch(
+        k, source_type, subgroup_width, threads, scale_block_size
+    )
+    cache_key = (
+        k,
+        source_dtype_name,
+        int(subgroup_width),
+        int(threads),
+        int(scale_block_size),
+    )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
         target=launch,
@@ -349,8 +420,15 @@ def quantize_mxfp8_rows_cute(
     values: torch.Tensor,
     scale_rows: torch.Tensor,
     scale_mma: torch.Tensor,
+    *,
+    scale_block_size: int = 32,
 ) -> None:
-    """Quantize contiguous BF16 rows into the dense-GEMM MXFP8 layouts."""
+    """Quantize contiguous BF16 rows into the dense-GEMM MXFP8 layouts.
+
+    ``scale_block_size=32`` is native MXFP8. ``128`` preserves DeepSeek's
+    per-token K128 quantization by replicating each scale across four hardware
+    K32 scale slots.
+    """
 
     if source.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(
@@ -360,7 +438,11 @@ def quantize_mxfp8_rows_cute(
         raise ValueError("CuTe MXFP8 quantizer requires contiguous [M,K] input")
     subgroup_width = _WARP_SUBGROUP_WIDTH if int(source.shape[0]) > 8 else 0
     _get_compiled_mxfp8_rows_quant(
-        int(source.shape[1]), source.dtype, subgroup_width, _THREADS
+        int(source.shape[1]),
+        source.dtype,
+        subgroup_width,
+        _THREADS,
+        int(scale_block_size),
     )(
         source,
         values,

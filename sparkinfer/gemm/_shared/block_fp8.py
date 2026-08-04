@@ -69,6 +69,7 @@ class BlockFP8LinearBinding:
     # None keeps the M-independent default; set it at bind time so the warmed
     # kernel matches the regime this binding serves.
     expected_m: int | None = None
+    activation_block_size: int = 32
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return block_fp8_linear_mxfp8(binding=self, stream=stream)
@@ -115,6 +116,7 @@ class BlockFP8LinearScratchPlan:
         output: torch.Tensor,
         bias: torch.Tensor | None = None,
         expected_m: int | None = None,
+        activation_block_size: int = 32,
     ) -> BlockFP8LinearBinding:
         source_2d = _source_2d(source)
         tokens, in_features = map(int, source_2d.shape)
@@ -153,6 +155,7 @@ class BlockFP8LinearScratchPlan:
             output=output,
             bias=bias,
             expected_m=expected_m,
+            activation_block_size=activation_block_size,
         )
 
 
@@ -360,6 +363,7 @@ def build_block_fp8_linear_binding(
     output: torch.Tensor,
     bias: torch.Tensor | None = None,
     expected_m: int | None = None,
+    activation_block_size: int = 32,
 ) -> BlockFP8LinearBinding:
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
@@ -385,6 +389,7 @@ def build_block_fp8_linear_binding(
         output=output,
         bias=bias,
         expected_m=expected_m,
+        activation_block_size=activation_block_size,
     )
 
 
@@ -452,6 +457,7 @@ def _run_block_fp8_quant_kernel(
     out_scale_mma: torch.Tensor,
     tokens: int,
     in_features: int,
+    activation_block_size: int = 32,
 ) -> None:
     del tokens, in_features
     quantize_mxfp8_rows_cute(
@@ -459,6 +465,7 @@ def _run_block_fp8_quant_kernel(
         out_values,
         out_scale_rows,
         out_scale_mma,
+        scale_block_size=activation_block_size,
     )
 
 
@@ -509,8 +516,14 @@ def quantize_block_fp8_linear_input_mxfp8(
     source_tk: torch.Tensor,
     *,
     out: MXFP8Rows | None = None,
+    activation_block_size: int = 32,
 ) -> MXFP8Rows:
-    """Quantize dense BF16/FP16 rows `[tokens, K]` to native MXFP8 rows."""
+    """Quantize dense BF16/FP16 rows `[tokens, K]` to native MXFP8 rows.
+
+    ``activation_block_size=128`` preserves DeepSeek-V4-Flash's trained K128
+    activation scale while replicating it into the K32 scale layout required by
+    SM12x MXFP8 MMA.
+    """
 
     _check_gpu_tensor("source_tk", source_tk)
     if source_tk.ndim != 2:
@@ -522,6 +535,32 @@ def quantize_block_fp8_linear_input_mxfp8(
         raise ValueError("tokens must be positive")
     _check_mxfp8_k(in_features)
     if out is None:
+        if int(activation_block_size) != 32:
+            values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+                tokens,
+                in_features,
+                num_groups=1,
+                device=source_tk.device,
+                initialize_scales=False,
+            )
+            result = mxfp8_rows_from_bases(
+                values_base,
+                scale_rows_base,
+                scale_physical_base,
+                tokens,
+                in_features,
+                num_groups=1,
+            )
+            _run_block_fp8_quant_kernel(
+                source_tk,
+                result.values,
+                result.scale_rows,
+                result.scale_mma,
+                tokens,
+                in_features,
+                int(activation_block_size),
+            )
+            return result
         values_base, scale_rows_base, scale_physical_base = (
             torch.ops.sparkinfer.quantize_block_fp8_linear_input_mxfp8_alloc(
                 source_tk, tokens, in_features
@@ -538,7 +577,13 @@ def quantize_block_fp8_linear_input_mxfp8(
 
     _check_mxfp8_rows_storage(out, m=tokens, k=in_features, num_groups=1)
     _run_block_fp8_quant_kernel(
-        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features
+        source_tk,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
+        tokens,
+        in_features,
+        int(activation_block_size),
     )
     return out
 
@@ -555,6 +600,7 @@ def _block_fp8_linear_mxfp8_fused_op(
     in_features: int,
     out_features: int,
     expected_m: int,
+    activation_block_size: int,
     stream_int: int | None,
 ) -> torch.Tensor:
     # Fused, fully opaque block-FP8 linear: quantize + dense GEMM run INSIDE this
@@ -571,9 +617,13 @@ def _block_fp8_linear_mxfp8_fused_op(
             weight_scale_mma,
             expected_m=None if expected_m == 0 else expected_m,
             sfb_k_replicated=True,
+            activation_scale_block_size=activation_block_size,
             stream=stream_int,
         )[:, :, 0]
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d)
+    x_q = quantize_block_fp8_linear_input_mxfp8(
+        source_2d,
+        activation_block_size=activation_block_size,
+    )
     return dense_gemm(
         (x_q.values.reshape(tokens, in_features, 1), x_q.scale_mma),
         (weight_values.reshape(out_features, in_features, 1), weight_scale_mma),
@@ -598,6 +648,7 @@ def _block_fp8_linear_mxfp8_fused_fake(
     in_features: int,
     out_features: int,
     expected_m: int,
+    activation_block_size: int,
     stream_int: int | None,
 ) -> torch.Tensor:
     del stream_int
@@ -615,6 +666,7 @@ def block_fp8_linear_mxfp8(
     bias: torch.Tensor | None = None,
     binding: BlockFP8LinearBinding | None = None,
     expected_m: int | None = None,
+    activation_block_size: int = 32,
     stream: object = None,
 ) -> torch.Tensor:
     """Run a serialized block-FP8 linear through the native sparkinfer MXFP8 GEMM.
@@ -645,6 +697,7 @@ def block_fp8_linear_mxfp8(
         output_storage = binding.output
         bias = binding.bias
         expected_m = binding.expected_m
+        activation_block_size = binding.activation_block_size
     else:
         x_q_storage = None
         output_storage = None
@@ -678,6 +731,7 @@ def block_fp8_linear_mxfp8(
             packed_weight.in_features,
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else 0,
+            int(activation_block_size),
             stream_int,
         )
         if bias is not None:
@@ -711,12 +765,17 @@ def block_fp8_linear_mxfp8(
             out=output_storage,
             expected_m=expected_m,
             sfb_k_replicated=True,
+            activation_scale_block_size=int(activation_block_size),
             stream=stream,
         )[:, :, 0]
         if bias is not None:
             output += bias
         return output.view(*source.shape[:-1], packed_weight.out_features)
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d, out=x_q_storage)
+    x_q = quantize_block_fp8_linear_input_mxfp8(
+        source_2d,
+        out=x_q_storage,
+        activation_block_size=int(activation_block_size),
+    )
     t_quant = time.perf_counter() if _SPARKINFER_TIMING else 0.0
     output = dense_gemm(
         (x_q.values.reshape(tokens, packed_weight.in_features, 1), x_q.scale_mma),

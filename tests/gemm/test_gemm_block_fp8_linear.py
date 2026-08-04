@@ -43,8 +43,13 @@ def _reference_from_quantized_operands(
     x: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    activation_block_size: int = 32,
 ) -> torch.Tensor:
-    x_q = quantize_block_fp8_linear_input_mxfp8(x)
+    x_q = quantize_block_fp8_linear_input_mxfp8(
+        x,
+        activation_block_size=activation_block_size,
+    )
     w_q = pack_block_fp8_linear_weight_mxfp8(weight, scale)
     x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
     w_deq = dequantize_mxfp8_rows_torch(w_q.weight.values, w_q.weight.scale_rows)
@@ -64,6 +69,43 @@ def test_block_fp8_linear_matches_quantized_reference() -> None:
 
     actual = block_fp8_linear_mxfp8(x, packed)
     expected = _reference_from_quantized_operands(x, weight, scale)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_block_fp8_linear_fused_k128_matches_flash_quantized_reference() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260804)
+
+    tokens, in_features, out_features = 7, 256, 384
+    x = (
+        torch.randn((tokens, in_features), device="cuda", dtype=torch.bfloat16)
+        / 4
+    ).contiguous()
+    x[:, 0] = 1.0
+    x[:, 32] = 3.0
+    x[:, 64] = 7.0
+    x[:, 96] = 15.0
+    weight, scale = _make_block_fp8_weight(out_features, in_features)
+    packed = pack_block_fp8_linear_weight_mxfp8(weight, scale)
+
+    actual = block_fp8_linear_mxfp8(
+        x,
+        packed,
+        activation_block_size=128,
+    )
+    expected = _reference_from_quantized_operands(
+        x,
+        weight,
+        scale,
+        activation_block_size=128,
+    )
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
