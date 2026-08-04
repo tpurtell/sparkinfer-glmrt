@@ -5,6 +5,7 @@
 - ``dense_mla``: dense compressed-cache MLA for Kimi K3 geometry.
 - ``sparse_mla``: top-k-selected MLA decode/extend (DeepSeek-V3.2 / GLM NSA).
 - ``compressed_mla``: MLA decode directly from compressed KV pages (DSV4).
+- ``dsv4_producer``: checkpoint-native DSV4 query projection and KV packing.
 - ``nsa_indexer``: the NSA index stage — quantize -> score -> select.
 - ``varlen``: contiguous batched/varlen attention (reduced-assurance tier).
 """
@@ -19,6 +20,7 @@ _OP_MODULES = (
     "dense_mla",
     "sparse_mla",
     "compressed_mla",
+    "dsv4_producer",
     "nsa_indexer",
     "varlen",
 )
