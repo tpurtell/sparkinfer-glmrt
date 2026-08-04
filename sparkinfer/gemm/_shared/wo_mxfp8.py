@@ -4,6 +4,7 @@ import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 import triton
@@ -115,6 +116,8 @@ class WOProjectionBinding:
 
 @dataclass(frozen=True, kw_only=True)
 class WOProjectionInvRopeBinding:
+    serving_allocates: ClassVar[bool] = False
+    output_is_bound_arena: ClassVar[bool] = True
     o: torch.Tensor
     positions: torch.Tensor
     cos_sin_cache: torch.Tensor

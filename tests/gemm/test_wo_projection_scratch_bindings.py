@@ -220,6 +220,8 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     out = wo_impl.wo_projection_inv_rope_mxfp8(binding=binding, stream=123)
 
     assert isinstance(binding, WOProjectionInvRopeBinding)
+    assert not binding.serving_allocates
+    assert binding.output_is_bound_arena
     assert not hasattr(binding, "workspace")
     assert calls["o"] is o
     assert calls["positions"] is positions
