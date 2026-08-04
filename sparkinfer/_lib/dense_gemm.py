@@ -5118,7 +5118,90 @@ def _get_compiled_dense_gemm_fused_quant_a(
         )
         return out
 
+    # AOT consumers link the same compiled launch into a native runtime. Keep
+    # the ordinary tensor callable as the serving API while exposing the
+    # compiler artifact without rebuilding a parallel launch definition.
+    tensor_api.compiled = compiled  # type: ignore[attr-defined]
     return tensor_api
+
+
+def compile_dense_gemm_fused_quant_a_aot(
+    *,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    activation_scale_block_size: int = 32,
+    expected_m: Optional[int] = None,
+    device: Optional[torch.device] = None,
+) -> object:
+    """Compile one standalone fused BF16-to-MXFP8 GEMM for native AOT export.
+
+    The export surface intentionally admits only kernels with a single BF16
+    output buffer. Split-K variants require a second reduction launch and are
+    rejected so native callers cannot accidentally link an incomplete graph.
+    """
+
+    size_m = int(size_m)
+    size_n = int(size_n)
+    size_k = int(size_k)
+    if size_m < 1 or size_m > 8 or size_k <= 0 or size_k % 128 != 0:
+        raise ValueError(
+            "fused MXFP8 AOT requires 1<=M<=8 and positive K divisible by 128, "
+            f"got M={size_m}, K={size_k}"
+        )
+    if size_n <= 0:
+        raise ValueError(f"fused MXFP8 AOT requires positive N, got {size_n}")
+    if activation_scale_block_size not in (32, 128):
+        raise ValueError(
+            "fused MXFP8 AOT activation scale block size must be 32 or 128, "
+            f"got {activation_scale_block_size}"
+        )
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    sm_count = get_num_sm(device)
+    regime_m = size_m if expected_m is None else int(expected_m)
+    plan = _select_default_dense_gemm_plan(
+        size_m,
+        size_n,
+        size_k,
+        sm_count,
+        is_mxfp8=True,
+        expected_m=regime_m,
+    )
+    if plan.swap_ab or plan.load_path != "tma":
+        raise ValueError("fused MXFP8 AOT requires the unswapped TMA plan")
+    policy = _dense_gemm_policy_for(
+        m=size_m,
+        n=size_n,
+        k=size_k,
+        l=1,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=plan.mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        sm_count=sm_count,
+        expected_m=regime_m,
+    )
+    if policy.split_k_slices != 1:
+        raise ValueError(
+            "fused MXFP8 AOT standalone export does not support split-K: "
+            f"M={size_m}, N={size_n}, K={size_k}, slices={policy.split_k_slices}"
+        )
+    tensor_api = _get_compiled_dense_gemm_fused_quant_a(
+        size_n,
+        size_k,
+        cutlass.BFloat16,
+        policy,
+        plan.mma_tiler_mn,
+        sm_count,
+        True,
+        False,
+        0,
+        1,
+        size_m == 1,
+        int(activation_scale_block_size),
+    )
+    return tensor_api.compiled  # type: ignore[attr-defined]
 
 
 class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
