@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
@@ -69,6 +70,11 @@ def _supports_mhc_post_hidden(hidden_size: int) -> bool:
 
 @dataclass(frozen=True, kw_only=True)
 class SPARKINFERMHCBinding:
+    serving_allocates: ClassVar[bool] = False
+    outputs_are_bound: ClassVar[bool] = True
+    pre_broadcasts_residual_lanes: ClassVar[bool] = True
+    post_pre_fuses_layer_boundary: ClassVar[bool] = True
+
     partials: torch.Tensor | None = None
     y: torch.Tensor | None = None
     post_buffer: torch.Tensor | None = None

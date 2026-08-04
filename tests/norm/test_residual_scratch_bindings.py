@@ -299,6 +299,10 @@ def test_mhc_post_pre_binding_supplies_bound_outputs(monkeypatch) -> None:
         comb=comb_storage,
         out=residual_storage,
     )
+    assert binding.serving_allocates is False
+    assert binding.outputs_are_bound is True
+    assert binding.pre_broadcasts_residual_lanes is True
+    assert binding.post_pre_fuses_layer_boundary is True
     residual = torch.empty((0, 4, 16), dtype=torch.bfloat16)
     x = torch.empty((0, 16), dtype=torch.bfloat16)
     prev_post = torch.empty((0, 4, 1), dtype=torch.float32)
