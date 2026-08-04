@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
+
 import pytest
 import torch
 
@@ -9,8 +13,13 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
 )
-from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+    W4A16FusedMoeKernel,
+    W4A16TopKSumKernel,
+    run_w4a16_moe,
+)
 from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
+    W4A16MixedTrellisKernel,
     build_tiered_maps,
     combine_trellis_rotations,
     compile_mixed_trellis,
@@ -27,6 +36,60 @@ def _sm12x_available() -> bool:
         return False
     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     return major == 12 and minor in (0, 1)
+
+
+def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
+    """Keep the direct CuTe call aligned with the shared driver's ABI."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(W4A16MixedTrellisKernel.kernel)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_moe_body"
+    ]
+    assert len(calls) == 1
+
+    driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
+    assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
+    assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
+        "descriptor_map",
+        "Int32(self.total_experts)",
+        "Int32(self.total_experts)",
+        "smem_base",
+        "tid",
+        "cta",
+        "grid_x",
+        "active_m",
+        "fc1_emit",
+        "fc2_emit",
+    ]
+
+
+def test_mixed_runtime_tracks_topk_sum_contract() -> None:
+    """Keep the direct compiled top-k launch aligned with its runtime ABI."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(run_mixed_trellis)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compiled"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "topk_sum"
+    ]
+    assert len(calls) == 1
+
+    sum_parameters = inspect.signature(W4A16TopKSumKernel.__call__).parameters
+    assert len(calls[0].args) + len(calls[0].keywords) == len(sum_parameters) - 1
+    assert [ast.unparse(arg) for arg in calls[0].args[-4:]] == [
+        "Int32(launch.topk_sum.num_experts)",
+        "Int32(launch.topk_sum.route_num_experts)",
+        "m",
+        "stream",
+    ]
 
 
 def _prepared(
@@ -72,6 +135,7 @@ def _serial_tier(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor,
+    block_size_m: int = 8,
 ) -> torch.Tensor:
     m, topk = int(topk_ids.shape[0]), int(topk_ids.shape[1])
     buffers = make_w4a16_packed_buffers(
@@ -82,7 +146,7 @@ def _serial_tier(
         device=x.device,
         route_num_experts=int(expert_map.numel()),
         full_rotation=True,
-        block_size_m=8,
+        block_size_m=block_size_m,
     )
     assert buffers.rotation_a_gate is not None
     assert buffers.rotation_a_up is not None
@@ -104,7 +168,7 @@ def _serial_tier(
         expert_counts=buffers.expert_counts,
         expert_map=expert_map,
         output_expert_map=expert_map,
-        route_block_size_m=8,
+        route_block_size_m=block_size_m,
         intermediate_rotation_scales=prepared.intermediate_rotations,
         full_rotation=True,
         suh_gate_table=prepared.gate_suh,
@@ -258,6 +322,121 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
         build_tiered_maps((0, 1), (1, 2), device=torch.device("cpu"))
     with pytest.raises(ValueError, match="disjoint partition"):
         build_tiered_maps((0, 4), (1, 2), device=torch.device("cpu"))
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("candidate_block_size", [32, 64])
+def test_one_grid_large_blocks_avoid_serial_prefill_drift(
+    candidate_block_size: int,
+) -> None:
+    """Large route blocks with paired-M8 FC2 preserve one-grid arithmetic."""
+
+    torch.manual_seed(20260801)
+    device = torch.device("cuda", torch.cuda.current_device())
+    m, hidden, intermediate, topk = 64, 512, 256, 8
+    tile_config = (128, 128, 32, 512)
+    tier0_experts, tier1_experts = 6, 2
+
+    prepared_tiers = tuple(
+        _prepared(
+            experts=experts,
+            hidden=hidden,
+            intermediate=intermediate,
+            bits=bits,
+            seed=seed,
+            device=device,
+            tile_config=tile_config,
+        )
+        for experts, bits, seed in (
+            (tier0_experts, 3, 301),
+            (tier1_experts, 4, 401),
+        )
+    )
+
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    topk_ids = (
+        torch.tensor([0, 6, 1, 7, 2, 3, 4, 5], dtype=torch.int32, device=device)
+        .expand(m, -1)
+        .contiguous()
+    )
+    topk_weights = torch.softmax(
+        torch.randn((m, topk), dtype=torch.float32, device=device), dim=-1
+    )
+    props = torch.cuda.get_device_properties(device)
+    global_to_combined, descriptor = build_tiered_maps(
+        range(tier0_experts), range(tier0_experts, 8), device=device
+    )
+
+    def one_grid(
+        block_size_m: int,
+    ) -> tuple[torch.Tensor, object, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        route_slots = max_packed_route_slots(m * topk, block_size_m, 8)
+        launch = compile_mixed_trellis(
+            size_m=m,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            tier0_num_experts=tier0_experts,
+            tier1_num_experts=tier1_experts,
+            top_k=topk,
+            max_m_blocks=(route_slots + block_size_m - 1) // block_size_m,
+            moe_block_size=block_size_m,
+            sms=int(props.multi_processor_count),
+            max_shared_mem=int(props.shared_memory_per_block_optin),
+            force_tile_config=tile_config,
+        )
+        buffers = make_mixed_trellis_buffers(
+            launch, device=device, sms=int(props.multi_processor_count)
+        )
+        output = run_mixed_trellis(
+            x,
+            prepared_tiers[0],
+            prepared_tiers[1],
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            combine_trellis_rotations(*prepared_tiers),
+            launch,
+            buffers,
+        ).clone()
+        phase_outputs = (
+            buffers.fc1.clone(),
+            buffers.activated.clone(),
+            buffers.fc2.clone(),
+        )
+        return output, launch, phase_outputs
+
+    reference, reference_launch, reference_phases = one_grid(8)
+    candidate, candidate_launch, candidate_phases = one_grid(candidate_block_size)
+    torch.cuda.synchronize(device)
+
+    phase_equal = tuple(
+        torch.equal(candidate_phase, reference_phase)
+        for candidate_phase, reference_phase in zip(
+            candidate_phases, reference_phases, strict=True
+        )
+    )
+    geometry = (
+        f"packed_block={candidate_launch.moe_block_size} "
+        f"fc2_subtile={candidate_launch.fc2_moe_block_size} "
+        f"fc2_schedule_factor={candidate_launch.fc2_schedule_route_block_factor} "
+        f"regs={candidate_launch.registers_per_thread} "
+        f"local={candidate_launch.local_memory_bytes} "
+        f"smem={candidate_launch.shared_memory_bytes}"
+    )
+    assert reference_launch.moe_block_size == 8
+    assert reference_launch.fc2_moe_block_size == 8
+    assert reference_launch.fc2_schedule_route_block_factor == 1
+    assert candidate_launch.moe_block_size == candidate_block_size
+    assert candidate_launch.fc2_moe_block_size == 8
+    assert candidate_launch.fc2_schedule_route_block_factor == 2
+    assert candidate_launch.fc2_paired_m8_routes is True
+    assert phase_equal == (True, True, True), geometry
+    assert torch.equal(candidate, reference), geometry
+    assert candidate_launch.local_memory_bytes == 0
+    assert candidate_launch.shared_memory_bytes <= int(
+        props.shared_memory_per_block_optin
+    )
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")

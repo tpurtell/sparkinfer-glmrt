@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
@@ -65,7 +66,20 @@ static int dcp_block_limit_override() {
   return value;
 }
 
+static int dcp_test_delay_rank() {
+  static const int value = env_int("SPARKINFER_PCIE_DCP_TEST_DELAY_RANK", -1);
+  return value;
+}
+
+static uint64_t dcp_test_delay_cycles() {
+  static const uint64_t value = static_cast<uint64_t>(std::max(
+      0, env_int("SPARKINFER_PCIE_DCP_TEST_POST_BARRIER_DELAY_CYCLES", 0)));
+  return value;
+}
+
 struct Signal {
+  alignas(128) FlagType staging_generation;
+  FlagType active_staging_slot;
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
 };
@@ -78,8 +92,14 @@ struct RankStaging {
   void *ptrs[kMaxRanks];
 };
 
+struct DoubleStaging {
+  RankStaging slots[2];
+};
+
 template <typename T> struct __align__(16) Pack {
-  T values[8];
+  // Every transaction is exactly 16 bytes. Half/BF16 therefore carry eight
+  // elements while the raw E4M3 query-gather path carries sixteen bytes.
+  T values[16 / sizeof(T)];
 };
 
 #define DINLINE __device__ __forceinline__
@@ -97,6 +117,40 @@ static DINLINE FlagType load_flag(FlagType *address) {
   return value;
 }
 
+static DINLINE FlagType load_flag_gpu(FlagType *address) {
+  FlagType value;
+  asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
+               : "=r"(value)
+               : "l"(address)
+               : "memory");
+  return value;
+}
+
+__global__ void advance_staging_slot_kernel(Signal *self) {
+  if (threadIdx.x == 0) {
+    const FlagType generation = self->staging_generation;
+    self->active_staging_slot = generation & FlagType{1};
+    self->staging_generation = generation + FlagType{1};
+  }
+}
+
+template <int world_size>
+DINLINE void select_staging(RankStaging &staging,
+                            const DoubleStaging &staging_options,
+                            Signal *self) {
+  if (threadIdx.x == 0) {
+    // The one-CTA control node runs earlier on this stream.  Every worker CTA
+    // therefore observes one operation-wide slot regardless of worker grid
+    // size or rank launch skew.
+    const int slot = int(load_flag_gpu(&self->active_staging_slot) & FlagType{1});
+#pragma unroll
+    for (int peer = 0; peer < world_size; ++peer) {
+      staging.ptrs[peer] = staging_options.slots[slot].ptrs[peer];
+    }
+  }
+  __syncthreads();
+}
+
 // pre_sync orders in-kernel staging stores (from every warp of the block)
 // before the flag post; without staging the flags can go out immediately.
 template <int world_size, bool pre_sync>
@@ -112,6 +166,16 @@ DINLINE void start_barrier(const RankSignals &signals, Signal *self, int rank) {
         &self->peer_counter[value % 2][blockIdx.x][threadIdx.x * kFlagStride];
     store_flag(peer, value);
     while (load_flag(mine) != value) {
+    }
+  }
+  __syncthreads();
+}
+
+DINLINE void test_post_barrier_delay(int rank, int delayed_rank,
+                                     uint64_t delay_cycles) {
+  if (delay_cycles != 0 && rank == delayed_rank && threadIdx.x == 0) {
+    const uint64_t start = clock64();
+    while (clock64() - start < delay_cycles) {
     }
   }
   __syncthreads();
@@ -149,14 +213,15 @@ template <typename T, int world_size>
 __global__ void __launch_bounds__(512, 1)
     dcp_lse_reduce_kernel(const T *__restrict__ local_output,
                           const float *__restrict__ local_lse,
-                          RankStaging staging, int64_t lse_offset,
+                          DoubleStaging staging_options, int64_t lse_offset,
                           RankSignals signals, Signal *self,
                           T *__restrict__ output, int rank, int batch,
                           int total_heads, int head_dim,
                           int64_t input_stride_batch,
                           int64_t input_stride_head,
                           int64_t output_stride_batch,
-                          int64_t output_stride_head, bool natural_log) {
+                          int64_t output_stride_head, bool natural_log,
+                          int delayed_rank, uint64_t delay_cycles) {
   constexpr int kPackElems = 8;
   const int heads_per_rank = total_heads / world_size;
   const int packs_per_head = head_dim / kPackElems;
@@ -168,6 +233,9 @@ __global__ void __launch_bounds__(512, 1)
 
   const auto *local_packs = reinterpret_cast<const Pack<T> *>(local_output);
   auto *output_packs = reinterpret_cast<Pack<T> *>(output);
+
+  __shared__ RankStaging staging;
+  select_staging<world_size>(staging, staging_options, self);
 
   auto *staging_out = reinterpret_cast<Pack<T> *>(staging.ptrs[rank]);
   auto *staging_lse = reinterpret_cast<float *>(
@@ -192,6 +260,7 @@ __global__ void __launch_bounds__(512, 1)
     }
   }
   start_barrier<world_size, true>(signals, self, rank);
+  test_post_barrier_delay(rank, delayed_rank, delay_cycles);
 
   // Rotated source pointers so every later access uses a compile-time
   // index; the self source reads the local tensors directly (still hot in
@@ -262,6 +331,12 @@ __global__ void __launch_bounds__(512, 1)
         const int64_t source_base = src == rank ? local_base : staging_base;
         const Pack<T> values = rot_packs[i][source_base + pack];
         const float weight = weights[i] * inv_weight_sum;
+        // Empty DCP shards legitimately return LSE=-inf and leave their
+        // partial output undefined. IEEE 0*NaN is NaN, so do not read or
+        // accumulate an invalid contributor merely because its weight is 0.
+        if (weight == 0.0f) {
+          continue;
+        }
 #pragma unroll
         for (int element = 0; element < kPackElems; ++element) {
           accum[element] += weight * to_float(values.values[element]);
@@ -286,10 +361,11 @@ __global__ void __launch_bounds__(512, 1)
 template <typename T, int world_size>
 __global__ void __launch_bounds__(512, 1)
     all_gather_heads_kernel(const T *__restrict__ local_input,
-                            RankStaging staging, RankSignals signals,
+                            DoubleStaging staging_options, RankSignals signals,
                             Signal *self, T *__restrict__ output, int rank,
-                            int batch, int local_heads, int head_dim) {
-  constexpr int kPackElems = 8;
+                            int batch, int local_heads, int head_dim,
+                            int delayed_rank, uint64_t delay_cycles) {
+  constexpr int kPackElems = 16 / sizeof(T);
   const int packs_per_head = head_dim / kPackElems;
   const int total_heads = local_heads * world_size;
   const int rows = batch * total_heads;
@@ -298,6 +374,9 @@ __global__ void __launch_bounds__(512, 1)
   const int warp_first = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
   const int warp_stride = gridDim.x * warps_per_block;
   const auto *local_packs = reinterpret_cast<const Pack<T> *>(local_input);
+
+  __shared__ RankStaging staging;
+  select_staging<world_size>(staging, staging_options, self);
 
   auto *staging_out = reinterpret_cast<Pack<T> *>(staging.ptrs[rank]);
   for (int row = warp_first; row < rows; row += warp_stride) {
@@ -313,6 +392,7 @@ __global__ void __launch_bounds__(512, 1)
     }
   }
   start_barrier<world_size, true>(signals, self, rank);
+  test_post_barrier_delay(rank, delayed_rank, delay_cycles);
 
   auto *output_packs = reinterpret_cast<Pack<T> *>(output);
   for (int row = warp_first; row < rows; row += warp_stride) {
@@ -339,11 +419,11 @@ public:
   int world_size_;
   RankSignals signals_{};
   Signal *self_signal_;
-  RankStaging staging_[2]{};
+  DoubleStaging staging_{};
   int64_t output_capacity_elems_;
   int64_t lse_offset_;
   int64_t lse_capacity_;
-  int slot_ = 0;
+
 
   PCIeDCPA2A(Signal **signals,
              const std::vector<std::array<void *, 2>> &staging,
@@ -354,8 +434,8 @@ public:
         lse_capacity_(lse_capacity) {
     for (int peer = 0; peer < world_size_; ++peer) {
       signals_.signals[peer] = signals[peer];
-      staging_[0].ptrs[peer] = staging[peer][0];
-      staging_[1].ptrs[peer] = staging[peer][1];
+      staging_.slots[0].ptrs[peer] = staging[peer][0];
+      staging_.slots[1].ptrs[peer] = staging[peer][1];
     }
   }
 
@@ -394,21 +474,25 @@ public:
       throw std::runtime_error("threads must be a multiple of 32");
     }
 
-    // Staging happens inside the kernel (warp-per-row, before the start
-    // barrier); no host staging memcpys are issued.
-    const int slot = slot_++ % 2;
+    // Select one staging slot per execution in a graph-capturable device node.
+    // Worker CTA count may change large -> small -> large without leaving
+    // dormant per-block parity counters behind.
     const int heads_per_rank = total_heads / world_size_;
     const int rows = batch * heads_per_rank;
     const int warps_per_block = threads / 32;
     const int blocks = std::max(
         1, std::min(block_limit, (rows + warps_per_block - 1) / warps_per_block));
+    advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_signal_);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
+    const int delayed_rank = dcp_test_delay_rank();
+    const uint64_t delay_cycles = dcp_test_delay_cycles();
 
 #define LAUNCH(world)                                                          \
   dcp_lse_reduce_kernel<T, world><<<blocks, threads, 0, stream>>>(             \
-      partial_output, partial_lse, staging_[slot], lse_offset_, signals_,      \
-      self_signal_, output, rank_, batch, total_heads, head_dim,               \
+      partial_output, partial_lse, staging_, lse_offset_, signals_,           \
+      self_signal_, output, rank_, batch, total_heads, head_dim,              \
       input_stride_batch, input_stride_head, output_stride_batch,              \
-      output_stride_head, natural_log)
+      output_stride_head, natural_log, delayed_rank, delay_cycles)
     switch (world_size_) {
     case 2:
       LAUNCH(2);
@@ -430,13 +514,15 @@ public:
   void all_gather_heads(cudaStream_t stream, const T *local_input, T *output,
                         int batch, int local_heads, int head_dim, int threads,
                         int block_limit) {
+    constexpr int kPackElems = 16 / sizeof(T);
     const int total_heads = local_heads * world_size_;
     const int64_t output_elems = int64_t(batch) * total_heads * head_dim;
     if (output_elems > output_capacity_elems_) {
       throw std::runtime_error("PCIe DCP all-gather staging capacity exceeded");
     }
-    if (head_dim % 8 != 0) {
-      throw std::runtime_error("head_dim must be a multiple of 8");
+    if (head_dim % kPackElems != 0) {
+      throw std::runtime_error(
+          "head_dim must align to a 16-byte gather transaction");
     }
     if (threads < world_size_ || threads > 1024) {
       throw std::runtime_error("invalid thread count");
@@ -455,18 +541,21 @@ public:
       throw std::runtime_error("threads must be a multiple of 32");
     }
 
-    // Staging happens inside the kernel (warp-per-row, before the start
-    // barrier); no host staging memcpy is issued.
-    const int slot = slot_++ % 2;
+    // Slot ownership is published by a device control node, including for
+    // back-to-back eager launches and every CUDA graph replay.
     const int rows = batch * total_heads;
     const int warps_per_block = threads / 32;
     const int blocks = std::max(
         1, std::min(block_limit, (rows + warps_per_block - 1) / warps_per_block));
+    advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_signal_);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
+    const int delayed_rank = dcp_test_delay_rank();
+    const uint64_t delay_cycles = dcp_test_delay_cycles();
 
 #define LAUNCH(world)                                                          \
   all_gather_heads_kernel<T, world><<<blocks, threads, 0, stream>>>(           \
-      local_input, staging_[slot], signals_, self_signal_, output, rank_,      \
-      batch, local_heads, head_dim)
+      local_input, staging_, signals_, self_signal_, output, rank_, batch,    \
+      local_heads, head_dim, delayed_rank, delay_cycles)
     switch (world_size_) {
     case 2:
       LAUNCH(2);
@@ -630,8 +719,17 @@ static void all_gather_heads(fptr_t pointer, torch::Tensor &local_input,
         reinterpret_cast<nv_bfloat16 *>(output.data_ptr()), int(batch),
         int(local_heads), int(head_dim), int(threads), int(block_limit));
     break;
+  case at::ScalarType::Float8_e4m3fn:
+    // The gather is a bitwise exchange. Treat E4M3 records as bytes; no
+    // arithmetic or conversion occurs in this path.
+    runtime->all_gather_heads(
+        stream, reinterpret_cast<const uint8_t *>(local_input.data_ptr()),
+        reinterpret_cast<uint8_t *>(output.data_ptr()), int(batch),
+        int(local_heads), int(head_dim), int(threads), int(block_limit));
+    break;
   default:
-    TORCH_CHECK(false, "local_input must be float16 or bfloat16");
+    TORCH_CHECK(false,
+                "local_input must be float16, bfloat16, or float8_e4m3fn");
   }
 }
 
