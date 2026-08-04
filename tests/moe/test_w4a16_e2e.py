@@ -27,6 +27,7 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
 from sparkinfer.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     MoEMicroKernelW4A16SmallMDirect,
+    _candidate_tile_fits,
     _w4a16_stream_is_capturing,
     _small_m_direct_supported,
     compile_w4a16_fused_moe,
@@ -46,6 +47,20 @@ from tests._reference.helpers import (
     run_tp_moe_fp4,
 )
 from tests._reference.w4a16_reference import compare_to_reference, moe_reference_w4a16
+
+
+def test_w4a16_native_tp4_ultra_fc2_tile_survives_cache_key_validation() -> None:
+    assert _candidate_tile_fits(
+        problem_n=4096,
+        problem_k=512,
+        cta_m_blocks=1,
+        tile_n=512,
+        tile_k=32,
+        cta_threads=256,
+        max_shared_mem=_DEFAULT_MAX_SHARED_MEM - 512,
+        scale_format="e8m0_k32",
+        weight_layout="packed",
+    )
 
 
 def test_w4a16_fused_compile_rejects_unresolved_capture_launch(

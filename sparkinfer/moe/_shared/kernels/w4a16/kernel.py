@@ -412,7 +412,16 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
+    ultra_fc2_tile = (
+        int(tile_n) == 512
+        and int(tile_k) == 32
+        and int(cta_threads) == 256
+    )
+    if (
+        int(tile_n) < 64
+        or (int(tile_k) < 64 and not ultra_fc2_tile)
+        or int(cta_threads) < 128
+    ):
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
