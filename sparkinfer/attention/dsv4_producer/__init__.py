@@ -19,6 +19,10 @@ weights into caller-owned buffers.  Selection remains owned by
 There is no BF16 KV staging allocation and no serving-time tensor allocation.
 The planned lifecycle is ``pack_weights`` (one time) -> ``plan`` -> ``bind``
 (views only) -> ``run`` (CUDA-graph-capture safe after prewarm).
+
+Integrated dSpark prompt priming uses ``plan_kv``/``bind_kv``/``run_kv`` to
+project and pack only the target-main KV rows.  It shares the packed weights
+and exact cache format above without paying for unused query projections.
 """
 
 from __future__ import annotations
@@ -39,15 +43,20 @@ META = OpMeta(
         "IndexerPlan",
         "IndexerBinding",
         "IndexerWeights",
+        "KVPlan",
+        "KVBinding",
         "Weights",
         "plan",
         "plan_indexer",
+        "plan_kv",
         "bind",
         "bind_indexer",
+        "bind_kv",
         "pack_weights",
         "pack_indexer_weights",
         "run",
         "run_indexer",
+        "run_kv",
         "is_supported",
     ),
     dtypes=("bf16", "fp8_e4m3"),
@@ -73,17 +82,22 @@ if TYPE_CHECKING:
         IndexerCaps,
         IndexerPlan,
         IndexerWeights,
+        KVBinding,
+        KVPlan,
         Plan,
         Weights,
         bind,
         bind_indexer,
+        bind_kv,
         is_supported,
         pack_indexer_weights,
         pack_weights,
         plan,
         plan_indexer,
+        plan_kv,
         run,
         run_indexer,
+        run_kv,
     )
 
 install_lazy_api(globals(), META)

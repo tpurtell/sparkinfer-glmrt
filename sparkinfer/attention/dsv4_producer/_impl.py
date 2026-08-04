@@ -49,6 +49,7 @@ def _check_cuda_tensor(name: str, tensor: torch.Tensor) -> None:
 @dataclass(frozen=True)
 class DSV4ProducerWeights:
     qkv_rank: BlockFP8LinearWeight
+    kv: BlockFP8LinearWeight
     q: BlockFP8LinearWeight
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
@@ -126,6 +127,15 @@ class _DSV4ProducerScratchLayout:
 
 
 @dataclass(frozen=True)
+class _DSV4KVProducerScratchLayout:
+    nbytes: int
+    kv_linear_offset: int
+    kv_linear_bytes: int
+    kv_output_offset: int
+    kv_output_bytes: int
+
+
+@dataclass(frozen=True)
 class _DSV4IndexerProducerScratchLayout:
     nbytes: int
     q_linear_offset: int
@@ -153,6 +163,22 @@ class DSV4ProducerBinding:
 
     def run(self) -> torch.Tensor:
         return run_dsv4_producer(binding=self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class DSV4KVProducerBinding:
+    hidden_states: torch.Tensor
+    positions: torch.Tensor
+    main_slots: torch.Tensor
+    cos_sin_cache: torch.Tensor
+    main_kv_cache: torch.Tensor
+    weights: DSV4ProducerWeights
+    kv_linear: BlockFP8LinearBinding
+    kv_output: torch.Tensor
+    eps: float
+
+    def run(self) -> torch.Tensor:
+        return run_dsv4_kv_producer(binding=self)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -396,6 +422,75 @@ class DSV4ProducerPlan:
         )
 
 
+@dataclass(frozen=True)
+class DSV4KVProducerPlan:
+    caps: DSV4ProducerCaps
+    layout: _DSV4KVProducerScratchLayout
+    kv_linear_plan: BlockFP8LinearScratchPlan
+    _scratch_specs: tuple[ScratchBufferSpec, ...]
+
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
+        return self._scratch_specs
+
+    def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
+
+    def bind(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        main_slots: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        main_kv_cache: torch.Tensor,
+        weights: DSV4ProducerWeights,
+        eps: float = 1.0e-6,
+        expected_m: int | None = None,
+    ) -> DSV4KVProducerBinding:
+        tokens = _validate_kv_runtime_tensors(
+            self.caps,
+            hidden_states=hidden_states,
+            positions=positions,
+            main_slots=main_slots,
+            cos_sin_cache=cos_sin_cache,
+            main_kv_cache=main_kv_cache,
+            eps=eps,
+        )
+        _validate_weights(self.caps, weights)
+        arena = scratch_tensor(scratch, self._scratch_specs, owner="DSV4 KV producer")
+        kv_scratch = arena.narrow(
+            0, self.layout.kv_linear_offset, self.layout.kv_linear_bytes
+        )
+        kv_output = (
+            arena.narrow(
+                0, self.layout.kv_output_offset, self.layout.kv_output_bytes
+            )
+            .view(torch.bfloat16)
+            .view(self.caps.max_tokens, self.caps.head_dim, 1)
+            .narrow(0, 0, tokens)
+        )
+        kv_linear = self.kv_linear_plan.bind(
+            scratch=kv_scratch,
+            source=hidden_states,
+            packed_weight=weights.kv,
+            output=kv_output,
+            expected_m=expected_m,
+            activation_block_size=128,
+        )
+        return DSV4KVProducerBinding(
+            hidden_states=hidden_states,
+            positions=positions,
+            main_slots=main_slots,
+            cos_sin_cache=cos_sin_cache,
+            main_kv_cache=main_kv_cache,
+            weights=weights,
+            kv_linear=kv_linear,
+            kv_output=kv_output,
+            eps=float(eps),
+        )
+
+
 def pack_dsv4_producer_weights(
     wq_a: torch.Tensor,
     wq_a_scale: torch.Tensor,
@@ -461,6 +556,7 @@ def pack_dsv4_producer_weights(
     qkv_scale = torch.cat((wq_a_scale, wkv_scale), dim=0)
     return DSV4ProducerWeights(
         qkv_rank=pack_block_fp8_linear_weight_mxfp8(qkv_weight, qkv_scale),
+        kv=pack_block_fp8_linear_weight_mxfp8(wkv, wkv_scale),
         q=pack_block_fp8_linear_weight_mxfp8(wq_b, wq_b_scale),
         q_norm=q_norm.detach(),
         kv_norm=kv_norm.detach(),
@@ -569,6 +665,44 @@ def plan_dsv4_producer(caps: DSV4ProducerCaps) -> DSV4ProducerPlan:
     )
 
 
+def plan_dsv4_kv_producer(caps: DSV4ProducerCaps) -> DSV4KVProducerPlan:
+    """Plan the dSpark target-main path without unused query scratch."""
+
+    kv_linear_plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device=caps.device,
+            max_tokens=caps.max_tokens,
+            in_features=caps.hidden,
+            out_features=caps.head_dim,
+            output_dtype=caps.dtype,
+        )
+    )
+    cursor = 0
+    kv_linear_offset = _align_up(cursor)
+    kv_linear_bytes = kv_linear_plan.scratch_specs()[0].nbytes
+    cursor = kv_linear_offset + kv_linear_bytes
+    kv_output_offset = _align_up(cursor)
+    kv_output_bytes = caps.max_tokens * caps.head_dim * 2
+    cursor = kv_output_offset + kv_output_bytes
+    layout = _DSV4KVProducerScratchLayout(
+        nbytes=_align_up(cursor),
+        kv_linear_offset=kv_linear_offset,
+        kv_linear_bytes=kv_linear_bytes,
+        kv_output_offset=kv_output_offset,
+        kv_output_bytes=kv_output_bytes,
+    )
+    return DSV4KVProducerPlan(
+        caps=caps,
+        layout=layout,
+        kv_linear_plan=kv_linear_plan,
+        _scratch_specs=(
+            scratch_buffer_spec(
+                "dsv4_kv_producer.scratch", nbytes=layout.nbytes, device=caps.device
+            ),
+        ),
+    )
+
+
 def plan_dsv4_indexer_producer(
     caps: DSV4IndexerProducerCaps,
 ) -> DSV4IndexerProducerPlan:
@@ -623,6 +757,11 @@ def _validate_weights(caps: DSV4ProducerCaps, weights: DSV4ProducerWeights) -> N
         caps.q_lora_rank + caps.head_dim
     ):
         raise ValueError("DSV4 joint Q-rank/KV packed weight has drifted geometry")
+    if (
+        weights.kv.in_features != caps.hidden
+        or weights.kv.out_features != caps.head_dim
+    ):
+        raise ValueError("DSV4 KV-only packed weight has drifted geometry")
     if weights.q.in_features != caps.q_lora_rank or weights.q.out_features != (
         caps.heads * caps.head_dim
     ):
@@ -733,13 +872,43 @@ def _validate_runtime_tensors(
     query: torch.Tensor,
     eps: float,
 ) -> int:
+    tokens = _validate_kv_runtime_tensors(
+        caps,
+        hidden_states=hidden_states,
+        positions=positions,
+        main_slots=main_slots,
+        cos_sin_cache=cos_sin_cache,
+        main_kv_cache=main_kv_cache,
+        eps=eps,
+    )
+    _check_cuda_tensor("query", query)
+    if query.device != caps.device:
+        raise ValueError(f"query device {query.device} does not match {caps.device}")
+    if query.shape != (tokens, caps.heads, caps.head_dim):
+        raise ValueError(
+            f"query must have shape {(tokens, caps.heads, caps.head_dim)}, got {tuple(query.shape)}"
+        )
+    if query.dtype != torch.bfloat16 or not query.is_contiguous():
+        raise ValueError("query must be contiguous BF16")
+    return tokens
+
+
+def _validate_kv_runtime_tensors(
+    caps: DSV4ProducerCaps,
+    *,
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    main_slots: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    main_kv_cache: torch.Tensor,
+    eps: float,
+) -> int:
     for name, tensor in (
         ("hidden_states", hidden_states),
         ("positions", positions),
         ("main_slots", main_slots),
         ("cos_sin_cache", cos_sin_cache),
         ("main_kv_cache", main_kv_cache),
-        ("query", query),
     ):
         _check_cuda_tensor(name, tensor)
         if tensor.device != caps.device:
@@ -777,12 +946,6 @@ def _validate_runtime_tensors(
         )
     if int(main_kv_cache.shape[0]) <= 0:
         raise ValueError("main_kv_cache must contain at least one physical page")
-    if query.shape != (tokens, caps.heads, caps.head_dim):
-        raise ValueError(
-            f"query must have shape {(tokens, caps.heads, caps.head_dim)}, got {tuple(query.shape)}"
-        )
-    if query.dtype != torch.bfloat16 or not query.is_contiguous():
-        raise ValueError("query must be contiguous BF16")
     if not math.isfinite(float(eps)) or not float(eps) > 0.0:
         raise ValueError(f"eps must be finite and positive, got {eps}")
     return tokens
@@ -817,16 +980,19 @@ def _normalize_rank_pack_kv_kernel(
 ):
     token = tl.program_id(0)
 
-    qd = tl.arange(0, Q_BLOCK)
-    qmask = qd < Q_RANK
-    qv = tl.load(qkv + token * qkv_stride_t + qd, mask=qmask, other=0.0).to(tl.float32)
-    q_inv = tl.rsqrt(tl.sum(qv * qv, axis=0) / Q_RANK + eps)
-    qw = tl.load(q_norm + qd, mask=qmask, other=0.0).to(tl.float32)
-    tl.store(
-        q_rank_out + token * q_rank_stride_t + qd,
-        (qv * q_inv * qw).to(tl.bfloat16),
-        mask=qmask,
-    )
+    if Q_RANK > 0:
+        qd = tl.arange(0, Q_BLOCK)
+        qmask = qd < Q_RANK
+        qv = tl.load(qkv + token * qkv_stride_t + qd, mask=qmask, other=0.0).to(
+            tl.float32
+        )
+        q_inv = tl.rsqrt(tl.sum(qv * qv, axis=0) / Q_RANK + eps)
+        qw = tl.load(q_norm + qd, mask=qmask, other=0.0).to(tl.float32)
+        tl.store(
+            q_rank_out + token * q_rank_stride_t + qd,
+            (qv * q_inv * qw).to(tl.bfloat16),
+            mask=qmask,
+        )
 
     kd = tl.arange(0, HEAD_DIM)
     kv = tl.load(qkv + token * qkv_stride_t + Q_RANK + kd).to(tl.float32)
@@ -961,6 +1127,46 @@ def _run_normalize_rank_pack_kv(
         float(eps),
         Q_RANK=q_rank,
         Q_BLOCK=triton.next_power_of_2(q_rank),
+        HEAD_DIM=DSV4_HEAD_DIM,
+        NOPE_DIM=DSV4_NOPE_DIM,
+        ROPE_DIM=DSV4_ROPE_DIM,
+        PAGE_SIZE=DSV4_KV_PAGE_SIZE,
+        PAYLOAD_BYTES=DSV4_KV_PAYLOAD_BYTES,
+        SCALE_BYTES=DSV4_KV_SCALE_BYTES,
+        PAGE_BYTES=DSV4_KV_PAGE_BYTES,
+        FP8_MAX=DSV4_FP8_MAX,
+        num_warps=8,
+    )
+
+
+def _run_normalize_pack_kv(
+    kv: torch.Tensor,
+    kv_norm: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    main_kv_cache: torch.Tensor,
+    *,
+    eps: float,
+) -> None:
+    tokens = int(kv.shape[0])
+    _normalize_rank_pack_kv_kernel[(tokens,)](
+        kv,
+        kv_norm,
+        kv_norm,
+        positions,
+        slots,
+        cos_sin_cache,
+        kv,
+        main_kv_cache.view(torch.float8_e4m3fn),
+        main_kv_cache.view(torch.bfloat16),
+        main_kv_cache,
+        kv.stride(0),
+        kv.stride(0),
+        cos_sin_cache.stride(0),
+        float(eps),
+        Q_RANK=0,
+        Q_BLOCK=1,
         HEAD_DIM=DSV4_HEAD_DIM,
         NOPE_DIM=DSV4_NOPE_DIM,
         ROPE_DIM=DSV4_ROPE_DIM,
@@ -1168,6 +1374,25 @@ def run_dsv4_producer(*, binding: DSV4ProducerBinding) -> torch.Tensor:
     return binding.query
 
 
+def run_dsv4_kv_producer(*, binding: DSV4KVProducerBinding) -> torch.Tensor:
+    """Project and pack dSpark target-main KV without producing a query."""
+
+    if not isinstance(binding, DSV4KVProducerBinding):
+        raise TypeError("run_dsv4_kv_producer requires a DSV4KVProducerBinding")
+    block_fp8_linear_mxfp8(binding=binding.kv_linear)
+    kv = binding.kv_output[:, :, 0]
+    _run_normalize_pack_kv(
+        kv,
+        binding.weights.kv_norm,
+        binding.positions,
+        binding.main_slots,
+        binding.cos_sin_cache,
+        binding.main_kv_cache,
+        eps=binding.eps,
+    )
+    return kv
+
+
 def run_dsv4_indexer_producer(
     *, binding: DSV4IndexerProducerBinding
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1203,12 +1428,16 @@ __all__ = [
     "DSV4IndexerProducerWeights",
     "DSV4ProducerBinding",
     "DSV4ProducerCaps",
+    "DSV4KVProducerBinding",
+    "DSV4KVProducerPlan",
     "DSV4ProducerPlan",
     "DSV4ProducerWeights",
     "pack_dsv4_indexer_producer_weights",
     "pack_dsv4_producer_weights",
     "plan_dsv4_indexer_producer",
+    "plan_dsv4_kv_producer",
     "plan_dsv4_producer",
     "run_dsv4_indexer_producer",
+    "run_dsv4_kv_producer",
     "run_dsv4_producer",
 ]

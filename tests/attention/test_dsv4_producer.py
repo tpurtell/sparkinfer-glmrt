@@ -142,6 +142,18 @@ def test_plan_pins_flash_and_pro_caller_owned_workspace() -> None:
     assert flash.layout.qkv_output_offset % 1024 == 0
     assert flash.layout.q_rank_offset % 1024 == 0
 
+    flash_kv = dsv4_producer.plan_kv(flash.caps)
+    pro_kv = dsv4_producer.plan_kv(pro.caps)
+    assert flash_kv.scratch_specs()[0].name == "dsv4_kv_producer.scratch"
+    assert flash_kv.scratch_specs()[0].nbytes == 11_010_048
+    assert pro_kv.scratch_specs()[0].nbytes == 17_694_720
+    assert flash_kv.layout.kv_linear_offset == 0
+    assert flash_kv.layout.kv_output_offset % 1_024 == 0
+    assert flash_kv.layout.kv_output_bytes == 2_048 * 512 * 2
+    assert flash_kv.scratch_specs()[0].nbytes < flash.scratch_specs()[0].nbytes
+    for entry_point in ("KVPlan", "KVBinding", "plan_kv", "bind_kv", "run_kv"):
+        assert entry_point in dsv4_producer.META.entry_points
+
 
 def test_caps_reject_absorbed_mla_and_non_native_page_geometry() -> None:
     for kwargs in (
@@ -514,12 +526,31 @@ def test_full_flash_plan_replays_without_serving_allocations() -> None:
         weights=weights,
         expected_m=tokens,
     )
+    kv_plan = dsv4_producer.plan_kv(plan.caps)
+    (kv_spec,) = kv_plan.scratch_specs()
+    kv_scratch = torch.empty(
+        kv_spec.shape, dtype=kv_spec.dtype, device=kv_spec.device
+    )
+    kv_cache = torch.zeros_like(cache)
+    kv_binding = dsv4_producer.bind_kv(
+        kv_plan,
+        scratch=kv_scratch,
+        hidden_states=hidden_states,
+        positions=positions,
+        main_slots=slots,
+        cos_sin_cache=cos_sin,
+        main_kv_cache=kv_cache,
+        weights=weights,
+        expected_m=tokens,
+    )
 
     dsv4_producer.run(binding=binding)
+    dsv4_producer.run_kv(binding=kv_binding)
     torch.cuda.synchronize()
     eager_query = query.clone()
     eager_cache = cache.clone()
     assert bool(torch.isfinite(eager_query).all())
+    torch.testing.assert_close(kv_cache, eager_cache, rtol=0, atol=0)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -530,3 +561,11 @@ def test_full_flash_plan_replays_without_serving_allocations() -> None:
 
     torch.testing.assert_close(query, eager_query, rtol=0, atol=0)
     torch.testing.assert_close(cache, eager_cache, rtol=0, atol=0)
+
+    kv_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(kv_graph):
+        dsv4_producer.run_kv(binding=kv_binding)
+    for _ in range(3):
+        kv_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(kv_cache, eager_cache, rtol=0, atol=0)
