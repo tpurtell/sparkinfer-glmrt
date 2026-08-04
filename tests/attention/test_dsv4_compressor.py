@@ -1,0 +1,402 @@
+from __future__ import annotations
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from sparkinfer.attention import dsv4_compressor
+from sparkinfer.attention._shared.mla.compressed_reference import (
+    pack_compressed_mla_kv_cache_reference,
+    unpack_compressed_mla_kv_cache_reference,
+)
+from sparkinfer.attention.nsa_indexer.reference import (
+    pack_index_k_cache_reference,
+    unpack_index_k_cache_reference,
+)
+
+from ..conftest import require_sparkinfer
+
+
+def _rope_forward(
+    values: torch.Tensor,
+    position: int,
+    cos_sin: torch.Tensor,
+    *,
+    nope_dim: int,
+) -> torch.Tensor:
+    output = values.clone()
+    pairs = values[nope_dim:].float().unflatten(-1, (-1, 2))
+    cos_v, sin_v = cos_sin[position].chunk(2)
+    even = pairs[:, 0] * cos_v - pairs[:, 1] * sin_v
+    odd = pairs[:, 1] * cos_v + pairs[:, 0] * sin_v
+    output[nope_dim:] = torch.stack((even, odd), dim=-1).flatten().to(torch.bfloat16)
+    return output
+
+
+def _rmsnorm(values: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    values = values.to(torch.bfloat16).float()
+    return (values * torch.rsqrt(values.square().mean() + eps) * weight.float()).to(
+        torch.bfloat16
+    )
+
+
+def _overlap_pool(
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    *,
+    head_dim: int,
+) -> torch.Tensor:
+    kv = torch.cat((kv_state[:4, :head_dim], kv_state[4:, head_dim:]), dim=0)
+    score = torch.cat((score_state[:4, :head_dim], score_state[4:, head_dim:]), dim=0)
+    return (kv * score.softmax(dim=0)).sum(dim=0)
+
+
+def _fwht_128(values: torch.Tensor) -> torch.Tensor:
+    output = values.float()
+    width = 1
+    while width < 128:
+        groups = output.view(-1, 2, width)
+        first = groups[:, 0].clone()
+        second = groups[:, 1].clone()
+        output = torch.stack((first + second, first - second), dim=1).flatten()
+        width *= 2
+    return output * (128**-0.5)
+
+
+def _fp4_qat_reference(values: torch.Tensor) -> torch.Tensor:
+    blocks = values.float().view(-1, 32)
+    scales = blocks.abs().amax(dim=1).clamp_min(6 * torch.finfo(torch.float32).tiny) / 6
+    scales = torch.pow(2.0, torch.ceil(torch.log2(scales)))
+    magnitude = (blocks.abs() / scales[:, None]).clamp_max(6)
+    fp4 = torch.where(
+        magnitude < 0.25,
+        0.0,
+        torch.where(
+            magnitude < 0.75,
+            0.5,
+            torch.where(
+                magnitude < 1.25,
+                1.0,
+                torch.where(
+                    magnitude < 1.75,
+                    1.5,
+                    torch.where(
+                        magnitude < 2.5,
+                        2.0,
+                        torch.where(
+                            magnitude < 3.5,
+                            3.0,
+                            torch.where(magnitude < 5.0, 4.0, 6.0),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return (torch.copysign(fp4, blocks) * scales[:, None]).flatten().to(torch.bfloat16)
+
+
+def _random(shape: tuple[int, ...], dtype: torch.dtype, scale: float = 1.0):
+    return (torch.randn(shape, device="cuda", dtype=dtype) * scale).contiguous()
+
+
+def _cos_sin(rows: int) -> torch.Tensor:
+    angles = torch.randn((rows, 32), device="cuda", dtype=torch.float32)
+    return torch.cat((angles.cos(), angles.sin()), dim=1).contiguous()
+
+
+def test_plan_pins_c4_and_c128_arena_and_state_geometry() -> None:
+    c4 = dsv4_compressor.plan(
+        dsv4_compressor.Caps(
+            device="cpu",
+            max_tokens=2_048,
+            hidden=4_096,
+            compress_ratio=4,
+            with_indexer=True,
+        )
+    )
+    c128 = dsv4_compressor.plan(
+        dsv4_compressor.Caps(
+            device="cpu",
+            max_tokens=2_048,
+            hidden=4_096,
+            compress_ratio=128,
+            with_indexer=False,
+        )
+    )
+
+    assert c4.caps.joint_projection_width == 2_560
+    assert c4.caps.state_rows == 8
+    assert c4.caps.main_page_rows == 64
+    assert c4.caps.main_page_bytes == 37_440
+    assert c4.scratch_specs()[0].nbytes == 10_485_760
+    assert c128.caps.joint_projection_width == 1_024
+    assert c128.caps.state_rows == 128
+    assert c128.caps.main_page_rows == 2
+    assert c128.caps.main_page_bytes == 1_728
+    assert c128.scratch_specs()[0].nbytes == 4_194_304
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"compress_ratio": 4, "with_indexer": False},
+        {"compress_ratio": 128, "with_indexer": True},
+        {"compress_ratio": 8, "with_indexer": False},
+    ],
+)
+def test_caps_fail_closed_on_non_model_compressor_combinations(kwargs) -> None:
+    with pytest.raises(ValueError):
+        dsv4_compressor.Caps(device="cpu", max_tokens=1, hidden=4_096, **kwargs)
+
+
+def test_c128_decode_updates_fp32_state_and_direct_packed_page() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260804)
+    ratio, hidden, eps = 128, 4_096, 1.0e-6
+    plan = dsv4_compressor.plan(
+        dsv4_compressor.Caps(
+            device="cuda",
+            max_tokens=1,
+            hidden=hidden,
+            compress_ratio=ratio,
+            with_indexer=False,
+        )
+    )
+    main_wkv = _random((512, hidden), torch.bfloat16, 1 / 64)
+    main_wgate = _random((512, hidden), torch.bfloat16, 1 / 64)
+    main_ape = _random((ratio, 512), torch.float32, 1 / 16)
+    main_norm = (_random((512,), torch.bfloat16, 1 / 16) + 1).contiguous()
+    weights = dsv4_compressor.pack_weights(main_wkv, main_wgate, main_ape, main_norm)
+    hidden_states = _random((1, hidden), torch.bfloat16)
+    positions = torch.tensor([127], device="cuda", dtype=torch.int32)
+    sequence_ids = torch.tensor([0], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([0], device="cuda", dtype=torch.int32)
+    cos_sin = _cos_sin(256)
+    main_cache = torch.zeros(
+        (1, plan.caps.main_page_bytes), device="cuda", dtype=torch.uint8
+    )
+    kv_state = _random((1, 128, 512), torch.float32, 1 / 4)
+    score_state = _random((1, 128, 512), torch.float32, 1 / 4)
+    expected_kv = kv_state.clone()
+    expected_score = score_state.clone()
+    projection = F.linear(hidden_states, weights.joint_projection)
+    expected_kv[0, 127] = projection[0, :512].float()
+    expected_score[0, 127] = projection[0, 512:].float() + main_ape[127]
+    pooled = (expected_kv[0] * expected_score[0].softmax(dim=0)).sum(dim=0)
+    expected = _rope_forward(_rmsnorm(pooled, main_norm, eps), 0, cos_sin, nope_dim=448)
+    expected_cache = pack_compressed_mla_kv_cache_reference(
+        expected[None, :448], expected[None, 448:], page_size=2, num_pages=1
+    )
+
+    scratch = torch.empty(
+        plan.scratch_specs()[0].shape, device="cuda", dtype=torch.uint8
+    )
+    binding = dsv4_compressor.bind_decode(
+        plan,
+        scratch=scratch,
+        hidden_states=hidden_states,
+        positions=positions,
+        sequence_ids=sequence_ids,
+        compressed_slots=slots,
+        compressed_cos_sin_cache=cos_sin,
+        compressed_main_cache=main_cache,
+        main_kv_state=kv_state,
+        main_score_state=score_state,
+        weights=weights,
+        eps=eps,
+        rows_are_sequence_unique=True,
+    )
+    dsv4_compressor.run_decode(binding=binding)
+    torch.cuda.synchronize()
+
+    assert torch.equal(kv_state, expected_kv)
+    assert torch.equal(score_state, expected_score)
+    actual_nope, actual_rope = unpack_compressed_mla_kv_cache_reference(
+        main_cache, page_size=2, n_tokens=1
+    )
+    expected_nope, expected_rope = unpack_compressed_mla_kv_cache_reference(
+        expected_cache, page_size=2, n_tokens=1
+    )
+    torch.testing.assert_close(actual_nope, expected_nope, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(actual_rope, expected_rope, atol=0.02, rtol=0.02)
+
+    eager_cache = main_cache.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dsv4_compressor.run_decode(binding=binding)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(main_cache, eager_cache)
+
+
+def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
+    require_sparkinfer()
+    torch.manual_seed(20260805)
+    hidden, eps = 4_096, 1.0e-6
+    plan = dsv4_compressor.plan(
+        dsv4_compressor.Caps(
+            device="cuda",
+            max_tokens=1,
+            hidden=hidden,
+            compress_ratio=4,
+            with_indexer=True,
+        )
+    )
+    main_wkv = _random((1_024, hidden), torch.bfloat16, 1 / 64)
+    main_wgate = _random((1_024, hidden), torch.bfloat16, 1 / 64)
+    main_ape = _random((4, 1_024), torch.float32, 1 / 16)
+    main_norm = (_random((512,), torch.bfloat16, 1 / 16) + 1).contiguous()
+    index_wkv = _random((256, hidden), torch.bfloat16, 1 / 64)
+    index_wgate = _random((256, hidden), torch.bfloat16, 1 / 64)
+    index_ape = _random((4, 256), torch.float32, 1 / 16)
+    index_norm = (_random((128,), torch.bfloat16, 1 / 16) + 1).contiguous()
+    weights = dsv4_compressor.pack_weights(
+        main_wkv,
+        main_wgate,
+        main_ape,
+        main_norm,
+        index_wkv=index_wkv,
+        index_wgate=index_wgate,
+        index_ape=index_ape,
+        index_norm=index_norm,
+    )
+    hidden_states = _random((1, hidden), torch.bfloat16)
+    positions = torch.tensor([3], device="cuda", dtype=torch.int32)
+    sequence_ids = torch.tensor([0], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([0], device="cuda", dtype=torch.int32)
+    cos_sin = _cos_sin(32)
+    main_cache = torch.zeros((1, 37_440), device="cuda", dtype=torch.uint8)
+    index_cache = torch.zeros((1, 8_448), device="cuda", dtype=torch.uint8)
+    main_kv_state = _random((1, 8, 1_024), torch.float32, 1 / 4)
+    main_score_state = _random((1, 8, 1_024), torch.float32, 1 / 4)
+    index_kv_state = _random((1, 8, 256), torch.float32, 1 / 4)
+    index_score_state = _random((1, 8, 256), torch.float32, 1 / 4)
+    expected_main_kv = main_kv_state.clone()
+    expected_main_score = main_score_state.clone()
+    expected_index_kv = index_kv_state.clone()
+    expected_index_score = index_score_state.clone()
+    projection = F.linear(hidden_states, weights.joint_projection)[0]
+    expected_main_kv[0, 7] = projection[:1_024].float()
+    expected_main_score[0, 7] = projection[1_024:2_048].float() + main_ape[3]
+    expected_index_kv[0, 7] = projection[2_048:2_304].float()
+    expected_index_score[0, 7] = projection[2_304:].float() + index_ape[3]
+    main_pooled = _overlap_pool(
+        expected_main_kv[0], expected_main_score[0], head_dim=512
+    )
+    expected_main = _rope_forward(
+        _rmsnorm(main_pooled, main_norm, eps), 0, cos_sin, nope_dim=448
+    )
+    index_pooled = _overlap_pool(
+        expected_index_kv[0], expected_index_score[0], head_dim=128
+    )
+    expected_index = _rope_forward(
+        _rmsnorm(index_pooled, index_norm, eps), 0, cos_sin, nope_dim=64
+    )
+    expected_index = _fp4_qat_reference(_fwht_128(expected_index))
+    expected_main_cache = pack_compressed_mla_kv_cache_reference(
+        expected_main[None, :448],
+        expected_main[None, 448:],
+        page_size=64,
+        num_pages=1,
+    )
+    expected_index_cache = pack_index_k_cache_reference(expected_index[None])
+    rolled_main_kv = expected_main_kv[:, 4:].clone()
+    rolled_main_score = expected_main_score[:, 4:].clone()
+    rolled_index_kv = expected_index_kv[:, 4:].clone()
+    rolled_index_score = expected_index_score[:, 4:].clone()
+
+    scratch = torch.empty(
+        plan.scratch_specs()[0].shape, device="cuda", dtype=torch.uint8
+    )
+    binding = dsv4_compressor.bind_decode(
+        plan,
+        scratch=scratch,
+        hidden_states=hidden_states,
+        positions=positions,
+        sequence_ids=sequence_ids,
+        compressed_slots=slots,
+        compressed_cos_sin_cache=cos_sin,
+        compressed_main_cache=main_cache,
+        main_kv_state=main_kv_state,
+        main_score_state=main_score_state,
+        weights=weights,
+        index_cache=index_cache,
+        index_kv_state=index_kv_state,
+        index_score_state=index_score_state,
+        eps=eps,
+        rows_are_sequence_unique=True,
+    )
+    dsv4_compressor.run_decode(binding=binding)
+    torch.cuda.synchronize()
+
+    assert torch.equal(main_kv_state[:, :4], rolled_main_kv)
+    assert torch.equal(main_score_state[:, :4], rolled_main_score)
+    assert torch.equal(index_kv_state[:, :4], rolled_index_kv)
+    assert torch.equal(index_score_state[:, :4], rolled_index_score)
+    main_nope, main_rope = unpack_compressed_mla_kv_cache_reference(
+        main_cache, page_size=64, n_tokens=1
+    )
+    expected_nope, expected_rope = unpack_compressed_mla_kv_cache_reference(
+        expected_main_cache, page_size=64, n_tokens=1
+    )
+    torch.testing.assert_close(main_nope, expected_nope, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(main_rope, expected_rope, atol=0.02, rtol=0.02)
+    index_actual = unpack_index_k_cache_reference(
+        index_cache, num_tokens=1, page_size=64
+    )
+    index_expected = unpack_index_k_cache_reference(
+        expected_index_cache, num_tokens=1, page_size=64
+    )
+    index_error = (index_actual - index_expected).abs()
+    # FP32 reduction order can move a value across one discontinuous E2M1
+    # threshold. The remaining 127 lanes match the checkpoint QAT path.
+    assert int((index_error > 0.04).sum()) <= 1
+    assert float(index_error.max()) <= 0.25
+
+
+def test_decode_binding_requires_explicit_sequence_unique_contract() -> None:
+    require_sparkinfer()
+    plan = dsv4_compressor.plan(
+        dsv4_compressor.Caps(
+            device="cuda",
+            max_tokens=1,
+            hidden=4_096,
+            compress_ratio=128,
+            with_indexer=False,
+        )
+    )
+    weights = dsv4_compressor.pack_weights(
+        torch.zeros((512, 4_096), device="cuda", dtype=torch.bfloat16),
+        torch.zeros((512, 4_096), device="cuda", dtype=torch.bfloat16),
+        torch.zeros((128, 512), device="cuda", dtype=torch.float32),
+        torch.ones((512,), device="cuda", dtype=torch.bfloat16),
+    )
+    with pytest.raises(ValueError, match="sequence-unique"):
+        dsv4_compressor.bind_decode(
+            plan,
+            scratch=torch.empty(
+                plan.scratch_specs()[0].shape, device="cuda", dtype=torch.uint8
+            ),
+            hidden_states=torch.zeros((1, 4_096), device="cuda", dtype=torch.bfloat16),
+            positions=torch.zeros((1,), device="cuda", dtype=torch.int32),
+            sequence_ids=torch.zeros((1,), device="cuda", dtype=torch.int32),
+            compressed_slots=torch.zeros((1,), device="cuda", dtype=torch.int32),
+            compressed_cos_sin_cache=torch.zeros(
+                (128, 64), device="cuda", dtype=torch.float32
+            ),
+            compressed_main_cache=torch.zeros(
+                (1, 1_728), device="cuda", dtype=torch.uint8
+            ),
+            main_kv_state=torch.zeros(
+                (1, 128, 512), device="cuda", dtype=torch.float32
+            ),
+            main_score_state=torch.full(
+                (1, 128, 512),
+                float("-inf"),
+                device="cuda",
+                dtype=torch.float32,
+            ),
+            weights=weights,
+        )
