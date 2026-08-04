@@ -190,6 +190,41 @@ class DSV4CompressorPrefillBinding:
         run_dsv4_compressor_prefill(binding=self)
 
 
+@dataclass(frozen=True, kw_only=True)
+class DSV4CompressorContinuationBinding:
+    hidden_states: torch.Tensor
+    active_groups: torch.Tensor
+    group_sequence_slots: torch.Tensor
+    group_rope_positions: torch.Tensor
+    compressed_slots: torch.Tensor
+    active_sequences: torch.Tensor
+    sequence_offsets: torch.Tensor
+    sequence_start_positions: torch.Tensor
+    state_sequence_ids: torch.Tensor
+    compressed_cos_sin_cache: torch.Tensor
+    compressed_main_cache: torch.Tensor
+    main_kv_state: torch.Tensor
+    main_score_state: torch.Tensor
+    index_cache: torch.Tensor | None
+    index_kv_state: torch.Tensor | None
+    index_score_state: torch.Tensor | None
+    weights: DSV4CompressorWeights
+    projection: torch.Tensor
+    compress_ratio: int
+    eps: float
+
+    @property
+    def group_capacity(self) -> int:
+        return int(self.group_sequence_slots.shape[0])
+
+    @property
+    def sequence_capacity(self) -> int:
+        return int(self.state_sequence_ids.shape[0])
+
+    def run_continuation(self) -> None:
+        run_dsv4_compressor_continuation(binding=self)
+
+
 @dataclass(frozen=True)
 class DSV4CompressorPlan:
     caps: DSV4CompressorCaps
@@ -352,6 +387,101 @@ class DSV4CompressorPlan:
             compressed_slots=compressed_slots,
             active_sequences=active_sequences,
             sequence_offsets=sequence_offsets,
+            state_sequence_ids=state_sequence_ids,
+            compressed_cos_sin_cache=compressed_cos_sin_cache,
+            compressed_main_cache=compressed_main_cache,
+            main_kv_state=main_kv_state,
+            main_score_state=main_score_state,
+            index_cache=index_cache,
+            index_kv_state=index_kv_state,
+            index_score_state=index_score_state,
+            weights=weights,
+            projection=projection,
+            compress_ratio=self.caps.compress_ratio,
+            eps=float(eps),
+        )
+
+    def bind_continuation(
+        self,
+        *,
+        scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        hidden_states: torch.Tensor,
+        active_groups: torch.Tensor,
+        group_sequence_slots: torch.Tensor,
+        group_rope_positions: torch.Tensor,
+        compressed_slots: torch.Tensor,
+        active_sequences: torch.Tensor,
+        sequence_offsets: torch.Tensor,
+        sequence_start_positions: torch.Tensor,
+        state_sequence_ids: torch.Tensor,
+        compressed_cos_sin_cache: torch.Tensor,
+        compressed_main_cache: torch.Tensor,
+        main_kv_state: torch.Tensor,
+        main_score_state: torch.Tensor,
+        weights: DSV4CompressorWeights,
+        index_cache: torch.Tensor | None = None,
+        index_kv_state: torch.Tensor | None = None,
+        index_score_state: torch.Tensor | None = None,
+        eps: float = 1.0e-6,
+        expected_m: int | None = None,
+        ordered_continuation: bool = False,
+    ) -> DSV4CompressorContinuationBinding:
+        if not ordered_continuation:
+            raise ValueError(
+                "continuation must be acknowledged as one ordered chunk per "
+                "sequence with persistent state from every preceding token"
+            )
+        tokens = _validate_runtime_tensors(
+            self.caps,
+            hidden_states=hidden_states,
+            positions=group_sequence_slots,
+            sequence_ids=group_rope_positions,
+            compressed_slots=compressed_slots,
+            compressed_cos_sin_cache=compressed_cos_sin_cache,
+            compressed_main_cache=compressed_main_cache,
+            main_kv_state=main_kv_state,
+            main_score_state=main_score_state,
+            index_cache=index_cache,
+            index_kv_state=index_kv_state,
+            index_score_state=index_score_state,
+            eps=eps,
+            metadata_tokens=int(group_sequence_slots.shape[0]),
+        )
+        _validate_continuation_metadata(
+            self.caps,
+            active_groups=active_groups,
+            group_sequence_slots=group_sequence_slots,
+            group_rope_positions=group_rope_positions,
+            compressed_slots=compressed_slots,
+            active_sequences=active_sequences,
+            sequence_offsets=sequence_offsets,
+            sequence_start_positions=sequence_start_positions,
+            state_sequence_ids=state_sequence_ids,
+            state_sequences=int(main_kv_state.shape[0]),
+        )
+        if expected_m is not None and tokens != int(expected_m):
+            raise ValueError(f"expected_m={expected_m} does not match tokens={tokens}")
+        _validate_weights(self.caps, weights)
+        arena = scratch_tensor(scratch, self._scratch_specs, owner="DSV4 compressor")
+        projection = (
+            arena.narrow(
+                0,
+                self.layout.projection_offset,
+                self.layout.projection_bytes,
+            )
+            .view(torch.bfloat16)
+            .view(self.caps.max_tokens, self.caps.joint_projection_width)
+            .narrow(0, 0, tokens)
+        )
+        return DSV4CompressorContinuationBinding(
+            hidden_states=hidden_states,
+            active_groups=active_groups,
+            group_sequence_slots=group_sequence_slots,
+            group_rope_positions=group_rope_positions,
+            compressed_slots=compressed_slots,
+            active_sequences=active_sequences,
+            sequence_offsets=sequence_offsets,
+            sequence_start_positions=sequence_start_positions,
             state_sequence_ids=state_sequence_ids,
             compressed_cos_sin_cache=compressed_cos_sin_cache,
             compressed_main_cache=compressed_main_cache,
@@ -680,6 +810,68 @@ def _validate_prefill_metadata(
     if sequence_capacity > state_sequences:
         raise ValueError(
             f"sequence capacity {sequence_capacity} exceeds state capacity {state_sequences}"
+        )
+
+
+def _validate_continuation_metadata(
+    caps: DSV4CompressorCaps,
+    *,
+    active_groups: torch.Tensor,
+    group_sequence_slots: torch.Tensor,
+    group_rope_positions: torch.Tensor,
+    compressed_slots: torch.Tensor,
+    active_sequences: torch.Tensor,
+    sequence_offsets: torch.Tensor,
+    sequence_start_positions: torch.Tensor,
+    state_sequence_ids: torch.Tensor,
+    state_sequences: int,
+) -> None:
+    for name, tensor in (
+        ("active_groups", active_groups),
+        ("group_sequence_slots", group_sequence_slots),
+        ("group_rope_positions", group_rope_positions),
+        ("compressed_slots", compressed_slots),
+        ("active_sequences", active_sequences),
+        ("sequence_offsets", sequence_offsets),
+        ("sequence_start_positions", sequence_start_positions),
+        ("state_sequence_ids", state_sequence_ids),
+    ):
+        _check_cuda_tensor(name, tensor)
+        if tensor.device != caps.device:
+            raise ValueError(
+                f"{name} device {tensor.device} does not match {caps.device}"
+            )
+        if tensor.dtype != torch.int32 or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous int32")
+    if active_groups.numel() != 1 or active_sequences.numel() != 1:
+        raise ValueError(
+            "active_groups and active_sequences must each contain one int32"
+        )
+    group_capacity = int(group_sequence_slots.shape[0])
+    if group_sequence_slots.ndim != 1:
+        raise ValueError("group_sequence_slots must be rank-1")
+    if group_rope_positions.shape != (group_capacity,) or compressed_slots.shape != (
+        group_capacity,
+    ):
+        raise ValueError("continuation group metadata arrays must share one capacity")
+    if group_capacity > caps.max_tokens:
+        raise ValueError(
+            f"continuation group capacity {group_capacity} exceeds max tokens "
+            f"{caps.max_tokens}"
+        )
+    if state_sequence_ids.ndim != 1 or state_sequence_ids.numel() <= 0:
+        raise ValueError("state_sequence_ids must be a non-empty rank-1 tensor")
+    sequence_capacity = int(state_sequence_ids.shape[0])
+    if sequence_offsets.shape != (sequence_capacity + 1,):
+        raise ValueError(f"sequence_offsets must have shape [{sequence_capacity + 1}]")
+    if sequence_start_positions.shape != (sequence_capacity,):
+        raise ValueError(
+            f"sequence_start_positions must have shape [{sequence_capacity}]"
+        )
+    if sequence_capacity > min(state_sequences, caps.max_tokens):
+        raise ValueError(
+            f"sequence capacity {sequence_capacity} exceeds state/token capacity "
+            f"{min(state_sequences, caps.max_tokens)}"
         )
 
 
@@ -1686,6 +1878,661 @@ def _prefill_finalize_state_kernel(
         tl.store(score_state + state_base + pd, scores, mask=pmask)
 
 
+@triton.jit
+def _continuation_load_dimension(
+    projection,
+    state,
+    ape,
+    sequence_chunk_offset,
+    chunk_logical_start,
+    state_sequence,
+    source_position,
+    d,
+    valid_mask,
+    projection_stride_t,
+    state_stride_seq,
+    state_stride_row,
+    PROJECTION_OFFSET: tl.constexpr,
+    PROJECTED_WIDTH: tl.constexpr,
+    RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+    SCORE: tl.constexpr,
+):
+    source_valid = source_position >= 0
+    from_projection = source_position >= chunk_logical_start
+    projection_row = sequence_chunk_offset + source_position - chunk_logical_start
+    projection_d = d + PROJECTED_WIDTH if SCORE else d
+    masked_value = float("-inf") if SCORE else 0.0
+    projected = tl.load(
+        projection
+        + projection_row * projection_stride_t
+        + PROJECTION_OFFSET
+        + projection_d,
+        mask=valid_mask & source_valid & from_projection,
+        other=masked_value,
+    ).to(tl.float32)
+    lane = source_position % RATIO
+    if SCORE:
+        projected += tl.load(
+            ape + lane * PROJECTED_WIDTH + d,
+            mask=valid_mask & source_valid & from_projection,
+            other=0.0,
+        )
+
+    initial_group_start = chunk_logical_start - chunk_logical_start % RATIO
+    if OVERLAP:
+        state_row = tl.where(
+            source_position >= initial_group_start,
+            RATIO + lane,
+            lane,
+        )
+    else:
+        state_row = lane
+    state_base = state_sequence * state_stride_seq + state_row * state_stride_row
+    carried = tl.load(
+        state + state_base + d,
+        mask=valid_mask & source_valid & ~from_projection,
+        other=masked_value,
+    ).to(tl.float32)
+    return tl.where(from_projection, projected, carried)
+
+
+@triton.jit
+def _continuation_pool_dimension(
+    projection,
+    kv_state,
+    score_state,
+    ape,
+    sequence_chunk_offset,
+    chunk_logical_start,
+    state_sequence,
+    group_start,
+    d,
+    valid_mask,
+    projection_stride_t,
+    state_stride_seq,
+    state_stride_row,
+    PROJECTION_OFFSET: tl.constexpr,
+    PROJECTED_WIDTH: tl.constexpr,
+    RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    current_d = HEAD_DIM + d if OVERLAP else d
+    row_max = tl.where(
+        valid_mask,
+        tl.full((HEAD_DIM,), float("-inf"), tl.float32),
+        tl.zeros((HEAD_DIM,), tl.float32),
+    )
+    for row in range(RATIO):
+        current_position = group_start + row
+        current_score = _continuation_load_dimension(
+            projection,
+            score_state,
+            ape,
+            sequence_chunk_offset,
+            chunk_logical_start,
+            state_sequence,
+            current_position,
+            current_d,
+            valid_mask,
+            projection_stride_t,
+            state_stride_seq,
+            state_stride_row,
+            PROJECTION_OFFSET=PROJECTION_OFFSET,
+            PROJECTED_WIDTH=PROJECTED_WIDTH,
+            RATIO=RATIO,
+            OVERLAP=OVERLAP,
+            SCORE=True,
+        )
+        row_max = tl.maximum(row_max, current_score)
+        if OVERLAP:
+            previous_mask = valid_mask & (group_start > 0)
+            previous_position = group_start - RATIO + row
+            previous_score = _continuation_load_dimension(
+                projection,
+                score_state,
+                ape,
+                sequence_chunk_offset,
+                chunk_logical_start,
+                state_sequence,
+                previous_position,
+                d,
+                previous_mask,
+                projection_stride_t,
+                state_stride_seq,
+                state_stride_row,
+                PROJECTION_OFFSET=PROJECTION_OFFSET,
+                PROJECTED_WIDTH=PROJECTED_WIDTH,
+                RATIO=RATIO,
+                OVERLAP=OVERLAP,
+                SCORE=True,
+            )
+            row_max = tl.maximum(row_max, previous_score)
+
+    numerator = tl.zeros((HEAD_DIM,), tl.float32)
+    denominator = tl.zeros((HEAD_DIM,), tl.float32)
+    for row in range(RATIO):
+        current_position = group_start + row
+        current_score = _continuation_load_dimension(
+            projection,
+            score_state,
+            ape,
+            sequence_chunk_offset,
+            chunk_logical_start,
+            state_sequence,
+            current_position,
+            current_d,
+            valid_mask,
+            projection_stride_t,
+            state_stride_seq,
+            state_stride_row,
+            PROJECTION_OFFSET=PROJECTION_OFFSET,
+            PROJECTED_WIDTH=PROJECTED_WIDTH,
+            RATIO=RATIO,
+            OVERLAP=OVERLAP,
+            SCORE=True,
+        )
+        current_value = _continuation_load_dimension(
+            projection,
+            kv_state,
+            ape,
+            sequence_chunk_offset,
+            chunk_logical_start,
+            state_sequence,
+            current_position,
+            current_d,
+            valid_mask,
+            projection_stride_t,
+            state_stride_seq,
+            state_stride_row,
+            PROJECTION_OFFSET=PROJECTION_OFFSET,
+            PROJECTED_WIDTH=PROJECTED_WIDTH,
+            RATIO=RATIO,
+            OVERLAP=OVERLAP,
+            SCORE=False,
+        )
+        current_weight = tl.exp(current_score - row_max)
+        numerator += current_weight * current_value
+        denominator += current_weight
+        if OVERLAP:
+            previous_mask = valid_mask & (group_start > 0)
+            previous_position = group_start - RATIO + row
+            previous_score = _continuation_load_dimension(
+                projection,
+                score_state,
+                ape,
+                sequence_chunk_offset,
+                chunk_logical_start,
+                state_sequence,
+                previous_position,
+                d,
+                previous_mask,
+                projection_stride_t,
+                state_stride_seq,
+                state_stride_row,
+                PROJECTION_OFFSET=PROJECTION_OFFSET,
+                PROJECTED_WIDTH=PROJECTED_WIDTH,
+                RATIO=RATIO,
+                OVERLAP=OVERLAP,
+                SCORE=True,
+            )
+            previous_value = _continuation_load_dimension(
+                projection,
+                kv_state,
+                ape,
+                sequence_chunk_offset,
+                chunk_logical_start,
+                state_sequence,
+                previous_position,
+                d,
+                previous_mask,
+                projection_stride_t,
+                state_stride_seq,
+                state_stride_row,
+                PROJECTION_OFFSET=PROJECTION_OFFSET,
+                PROJECTED_WIDTH=PROJECTED_WIDTH,
+                RATIO=RATIO,
+                OVERLAP=OVERLAP,
+                SCORE=False,
+            )
+            previous_weight = tl.exp(previous_score - row_max)
+            numerator += previous_weight * previous_value
+            denominator += previous_weight
+    return numerator / tl.maximum(denominator, 1.0)
+
+
+@triton.jit
+def _continuation_pool_pack_main_kernel(
+    projection,
+    active_groups,
+    group_sequence_slots,
+    group_rope_positions,
+    compressed_slots,
+    sequence_offsets,
+    sequence_start_positions,
+    state_sequence_ids,
+    cos_sin,
+    kv_state,
+    score_state,
+    ape,
+    norm,
+    cache_fp8,
+    cache_bf16,
+    cache_u8,
+    projection_stride_t,
+    cos_sin_stride_pos,
+    state_stride_seq,
+    state_stride_row,
+    eps,
+    PROJECTION_OFFSET: tl.constexpr,
+    PROJECTED_WIDTH: tl.constexpr,
+    RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    PAGE_ROWS: tl.constexpr,
+    PAYLOAD_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    PAGE_BYTES: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    group = tl.program_id(0)
+    if group < tl.load(active_groups):
+        sequence_slot = tl.load(group_sequence_slots + group)
+        sequence_chunk_offset = tl.load(sequence_offsets + sequence_slot)
+        chunk_logical_start = tl.load(sequence_start_positions + sequence_slot)
+        state_sequence = tl.load(state_sequence_ids + sequence_slot).to(tl.int64)
+        group_start = tl.load(group_rope_positions + group)
+        d = tl.arange(0, HEAD_DIM)
+        valid = d < HEAD_DIM
+        pooled = (
+            _continuation_pool_dimension(
+                projection,
+                kv_state,
+                score_state,
+                ape,
+                sequence_chunk_offset,
+                chunk_logical_start,
+                state_sequence,
+                group_start,
+                d,
+                valid,
+                projection_stride_t,
+                state_stride_seq,
+                state_stride_row,
+                PROJECTION_OFFSET=PROJECTION_OFFSET,
+                PROJECTED_WIDTH=PROJECTED_WIDTH,
+                RATIO=RATIO,
+                OVERLAP=OVERLAP,
+                HEAD_DIM=HEAD_DIM,
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        inv = tl.rsqrt(tl.sum(pooled * pooled, axis=0) / HEAD_DIM + eps)
+        normalized = (
+            (pooled * inv * tl.load(norm + d).to(tl.float32))
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+
+        rope_mask = d >= NOPE_DIM
+        partner_d = NOPE_DIM + ((d - NOPE_DIM) ^ 1)
+        partner_pooled = (
+            _continuation_pool_dimension(
+                projection,
+                kv_state,
+                score_state,
+                ape,
+                sequence_chunk_offset,
+                chunk_logical_start,
+                state_sequence,
+                group_start,
+                partner_d,
+                rope_mask,
+                projection_stride_t,
+                state_stride_seq,
+                state_stride_row,
+                PROJECTION_OFFSET=PROJECTION_OFFSET,
+                PROJECTED_WIDTH=PROJECTED_WIDTH,
+                RATIO=RATIO,
+                OVERLAP=OVERLAP,
+                HEAD_DIM=HEAD_DIM,
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        partner_normalized = (
+            (
+                partner_pooled
+                * inv
+                * tl.load(norm + partner_d, mask=rope_mask, other=0.0).to(tl.float32)
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        pair = tl.maximum((d - NOPE_DIM) >> 1, 0)
+        cs = cos_sin + group_start * cos_sin_stride_pos
+        cos_v = tl.load(cs + pair, mask=rope_mask, other=1.0)
+        sin_v = tl.load(cs + ROPE_DIM // 2 + pair, mask=rope_mask, other=0.0)
+        rotated = tl.where(
+            ((d - NOPE_DIM) & 1) == 0,
+            normalized * cos_v - partner_normalized * sin_v,
+            normalized * cos_v + partner_normalized * sin_v,
+        )
+        output = tl.where(rope_mask, rotated, normalized)
+
+        slot = tl.load(compressed_slots + group).to(tl.int64)
+        page = slot // PAGE_ROWS
+        page_row = slot - page * PAGE_ROWS
+        page_base = page * PAGE_BYTES
+        data_base = page_base + page_row * PAYLOAD_BYTES
+        scale_base = page_base + PAGE_ROWS * PAYLOAD_BYTES + page_row * SCALE_BYTES
+        for scale_group in range(NOPE_DIM // 64):
+            scale_mask = (d >= scale_group * 64) & (d < (scale_group + 1) * 64)
+            max_abs = tl.maximum(
+                tl.max(tl.where(scale_mask, tl.abs(output), 0.0), axis=0),
+                1.0e-4,
+            )
+            raw_scale = max_abs / FP8_MAX
+            bits = raw_scale.to(tl.uint32, bitcast=True)
+            mantissa = bits & 0x007FFFFF
+            rounded_bits = (bits + 0x00800000) & 0x7F800000
+            scale_bits = tl.where(mantissa != 0, rounded_bits, bits & 0x7F800000)
+            scale = scale_bits.to(tl.float32, bitcast=True)
+            quant = tl.maximum(tl.minimum(output / scale, FP8_MAX), -FP8_MAX)
+            tl.store(
+                cache_fp8 + data_base + d,
+                quant.to(tl.float8e4nv),
+                mask=scale_mask,
+            )
+            tl.store(
+                cache_u8 + scale_base + scale_group,
+                (scale_bits >> 23).to(tl.uint8),
+            )
+        tl.store(
+            cache_bf16 + data_base // 2 + d - NOPE_DIM // 2,
+            output.to(tl.bfloat16),
+            mask=rope_mask,
+        )
+        tl.store(cache_u8 + scale_base + 7, 0)
+
+
+@triton.jit
+def _continuation_pool_pack_index_kernel(
+    projection,
+    active_groups,
+    group_sequence_slots,
+    group_rope_positions,
+    compressed_slots,
+    sequence_offsets,
+    sequence_start_positions,
+    state_sequence_ids,
+    cos_sin,
+    kv_state,
+    score_state,
+    ape,
+    norm,
+    cache_fp8,
+    cache_fp32,
+    projection_stride_t,
+    cos_sin_stride_pos,
+    state_stride_seq,
+    state_stride_row,
+    eps,
+    PROJECTION_OFFSET: tl.constexpr,
+    PROJECTED_WIDTH: tl.constexpr,
+    RATIO: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    PAGE_ROWS: tl.constexpr,
+    PAGE_BYTES: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    group = tl.program_id(0)
+    if group < tl.load(active_groups):
+        sequence_slot = tl.load(group_sequence_slots + group)
+        sequence_chunk_offset = tl.load(sequence_offsets + sequence_slot)
+        chunk_logical_start = tl.load(sequence_start_positions + sequence_slot)
+        state_sequence = tl.load(state_sequence_ids + sequence_slot).to(tl.int64)
+        group_start = tl.load(group_rope_positions + group)
+        d = tl.arange(0, HEAD_DIM)
+        valid = d < HEAD_DIM
+        pooled = (
+            _continuation_pool_dimension(
+                projection,
+                kv_state,
+                score_state,
+                ape,
+                sequence_chunk_offset,
+                chunk_logical_start,
+                state_sequence,
+                group_start,
+                d,
+                valid,
+                projection_stride_t,
+                state_stride_seq,
+                state_stride_row,
+                PROJECTION_OFFSET=PROJECTION_OFFSET,
+                PROJECTED_WIDTH=PROJECTED_WIDTH,
+                RATIO=RATIO,
+                OVERLAP=True,
+                HEAD_DIM=HEAD_DIM,
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        inv = tl.rsqrt(tl.sum(pooled * pooled, axis=0) / HEAD_DIM + eps)
+        normalized = (
+            (pooled * inv * tl.load(norm + d).to(tl.float32))
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        rope_mask = d >= NOPE_DIM
+        partner_d = NOPE_DIM + ((d - NOPE_DIM) ^ 1)
+        partner_pooled = (
+            _continuation_pool_dimension(
+                projection,
+                kv_state,
+                score_state,
+                ape,
+                sequence_chunk_offset,
+                chunk_logical_start,
+                state_sequence,
+                group_start,
+                partner_d,
+                rope_mask,
+                projection_stride_t,
+                state_stride_seq,
+                state_stride_row,
+                PROJECTION_OFFSET=PROJECTION_OFFSET,
+                PROJECTED_WIDTH=PROJECTED_WIDTH,
+                RATIO=RATIO,
+                OVERLAP=True,
+                HEAD_DIM=HEAD_DIM,
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        partner_normalized = (
+            (
+                partner_pooled
+                * inv
+                * tl.load(norm + partner_d, mask=rope_mask, other=0.0).to(tl.float32)
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        pair = tl.maximum((d - NOPE_DIM) >> 1, 0)
+        cs = cos_sin + group_start * cos_sin_stride_pos
+        cos_v = tl.load(cs + pair, mask=rope_mask, other=1.0)
+        sin_v = tl.load(cs + ROPE_DIM // 2 + pair, mask=rope_mask, other=0.0)
+        rotated = tl.where(
+            ((d - NOPE_DIM) & 1) == 0,
+            normalized * cos_v - partner_normalized * sin_v,
+            normalized * cos_v + partner_normalized * sin_v,
+        )
+        hadamard = tl.where(rope_mask, rotated, normalized)
+        hadamard = _fwht_stage(hadamard, d, WIDTH=1, HEAD_DIM=HEAD_DIM)
+        hadamard = _fwht_stage(hadamard, d, WIDTH=2, HEAD_DIM=HEAD_DIM)
+        hadamard = _fwht_stage(hadamard, d, WIDTH=4, HEAD_DIM=HEAD_DIM)
+        hadamard = _fwht_stage(hadamard, d, WIDTH=8, HEAD_DIM=HEAD_DIM)
+        hadamard = _fwht_stage(hadamard, d, WIDTH=16, HEAD_DIM=HEAD_DIM)
+        hadamard = _fwht_stage(hadamard, d, WIDTH=32, HEAD_DIM=HEAD_DIM)
+        hadamard = _fwht_stage(hadamard, d, WIDTH=64, HEAD_DIM=HEAD_DIM)
+        hadamard = (hadamard * 0.08838834764831845).to(tl.bfloat16).to(tl.float32)
+
+        blocks = tl.reshape(tl.abs(hadamard), (HEAD_DIM // 32, 32))
+        block_max = tl.max(blocks, axis=1)
+        raw_fp4_scale = tl.maximum(block_max, 6.0 * 1.1754943508222875e-38) / 6.0
+        scale_bits = raw_fp4_scale.to(tl.uint32, bitcast=True)
+        mantissa = scale_bits & 0x007FFFFF
+        rounded_bits = (scale_bits + 0x00800000) & 0x7F800000
+        fp4_scale = tl.where(mantissa != 0, rounded_bits, scale_bits & 0x7F800000).to(
+            tl.float32, bitcast=True
+        )
+        fp4_scale = tl.reshape(
+            tl.broadcast_to(tl.expand_dims(fp4_scale, 1), (HEAD_DIM // 32, 32)),
+            (HEAD_DIM,),
+        )
+        magnitude = tl.minimum(tl.abs(hadamard) / fp4_scale, 6.0)
+        fp4 = tl.where(
+            magnitude < 0.25,
+            0.0,
+            tl.where(
+                magnitude < 0.75,
+                0.5,
+                tl.where(
+                    magnitude < 1.25,
+                    1.0,
+                    tl.where(
+                        magnitude < 1.75,
+                        1.5,
+                        tl.where(
+                            magnitude < 2.5,
+                            2.0,
+                            tl.where(
+                                magnitude < 3.5,
+                                3.0,
+                                tl.where(magnitude < 5.0, 4.0, 6.0),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        fp4 = tl.where(hadamard < 0.0, -fp4, fp4) * fp4_scale
+        fp4 = fp4.to(tl.bfloat16).to(tl.float32)
+        cache_scale = tl.max(tl.abs(fp4), axis=0) / FP8_MAX
+        cache_scale = tl.where(cache_scale > 0.0, cache_scale, 1.0)
+        quant = tl.maximum(tl.minimum(fp4 / cache_scale, FP8_MAX), -FP8_MAX)
+        slot = tl.load(compressed_slots + group).to(tl.int64)
+        page = slot // PAGE_ROWS
+        page_row = slot - page * PAGE_ROWS
+        page_base = page * PAGE_BYTES
+        tl.store(
+            cache_fp8 + page_base + page_row * HEAD_DIM + d,
+            quant.to(tl.float8e4nv),
+        )
+        tl.store(
+            cache_fp32 + (page_base + PAGE_ROWS * HEAD_DIM) // 4 + page_row,
+            cache_scale,
+        )
+
+
+@triton.jit
+def _continuation_finalize_state_kernel(
+    projection,
+    active_sequences,
+    sequence_offsets,
+    sequence_start_positions,
+    state_sequence_ids,
+    kv_state,
+    score_state,
+    ape,
+    projection_stride_t,
+    state_stride_seq,
+    state_stride_row,
+    PROJECTION_OFFSET: tl.constexpr,
+    PROJECTED_WIDTH: tl.constexpr,
+    PROJECTED_BLOCK: tl.constexpr,
+    RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+    STATE_ROW_START: tl.constexpr,
+):
+    sequence_slot = tl.program_id(0)
+    state_row = STATE_ROW_START + tl.program_id(1)
+    if sequence_slot < tl.load(active_sequences):
+        sequence_chunk_offset = tl.load(sequence_offsets + sequence_slot)
+        sequence_chunk_end = tl.load(sequence_offsets + sequence_slot + 1)
+        chunk_logical_start = tl.load(sequence_start_positions + sequence_slot)
+        state_sequence = tl.load(state_sequence_ids + sequence_slot).to(tl.int64)
+        logical_end = chunk_logical_start + sequence_chunk_end - sequence_chunk_offset
+        cutoff = logical_end // RATIO * RATIO
+        remainder = logical_end - cutoff
+        if OVERLAP:
+            previous = state_row < RATIO
+            lane = tl.where(previous, state_row, state_row - RATIO)
+            fill = tl.where(previous, cutoff >= RATIO, lane < remainder)
+            source_position = tl.where(
+                previous,
+                cutoff - RATIO + lane,
+                cutoff + lane,
+            )
+        else:
+            lane = state_row
+            fill = lane < remainder
+            source_position = cutoff + lane
+        pd = tl.arange(0, PROJECTED_BLOCK)
+        pmask = pd < PROJECTED_WIDTH
+        values = _continuation_load_dimension(
+            projection,
+            kv_state,
+            ape,
+            sequence_chunk_offset,
+            chunk_logical_start,
+            state_sequence,
+            source_position,
+            pd,
+            pmask & fill,
+            projection_stride_t,
+            state_stride_seq,
+            state_stride_row,
+            PROJECTION_OFFSET=PROJECTION_OFFSET,
+            PROJECTED_WIDTH=PROJECTED_WIDTH,
+            RATIO=RATIO,
+            OVERLAP=OVERLAP,
+            SCORE=False,
+        )
+        scores = _continuation_load_dimension(
+            projection,
+            score_state,
+            ape,
+            sequence_chunk_offset,
+            chunk_logical_start,
+            state_sequence,
+            source_position,
+            pd,
+            pmask & fill,
+            projection_stride_t,
+            state_stride_seq,
+            state_stride_row,
+            PROJECTION_OFFSET=PROJECTION_OFFSET,
+            PROJECTED_WIDTH=PROJECTED_WIDTH,
+            RATIO=RATIO,
+            OVERLAP=OVERLAP,
+            SCORE=True,
+        )
+        values = tl.where(fill, values, 0.0)
+        scores = tl.where(fill, scores, float("-inf"))
+        state_base = state_sequence * state_stride_seq + state_row * state_stride_row
+        tl.store(kv_state + state_base + pd, values, mask=pmask)
+        tl.store(score_state + state_base + pd, scores, mask=pmask)
+
+
 def _run_main(binding: DSV4CompressorBinding) -> None:
     ratio = binding.compress_ratio
     projected_width = DSV4_HEAD_DIM * (2 if ratio == 4 else 1)
@@ -1898,6 +2745,202 @@ def run_dsv4_compressor_prefill(*, binding: DSV4CompressorPrefillBinding) -> Non
         )
 
 
+def _run_continuation_main(binding: DSV4CompressorContinuationBinding) -> None:
+    if binding.group_capacity == 0:
+        return
+    ratio = binding.compress_ratio
+    projected_width = DSV4_HEAD_DIM * (2 if ratio == 4 else 1)
+    page_rows = DSV4_SOURCE_PAGE_SIZE // ratio
+    page_bytes = _compressed_main_page_bytes(ratio)
+    _continuation_pool_pack_main_kernel[(binding.group_capacity,)](
+        binding.projection,
+        binding.active_groups,
+        binding.group_sequence_slots,
+        binding.group_rope_positions,
+        binding.compressed_slots,
+        binding.sequence_offsets,
+        binding.sequence_start_positions,
+        binding.state_sequence_ids,
+        binding.compressed_cos_sin_cache,
+        binding.main_kv_state,
+        binding.main_score_state,
+        binding.weights.main_ape,
+        binding.weights.main_norm,
+        binding.compressed_main_cache.view(torch.float8_e4m3fn),
+        binding.compressed_main_cache.view(torch.bfloat16),
+        binding.compressed_main_cache,
+        binding.projection.stride(0),
+        binding.compressed_cos_sin_cache.stride(0),
+        binding.main_kv_state.stride(0),
+        binding.main_kv_state.stride(1),
+        binding.eps,
+        PROJECTION_OFFSET=0,
+        PROJECTED_WIDTH=projected_width,
+        RATIO=ratio,
+        OVERLAP=ratio == 4,
+        HEAD_DIM=DSV4_HEAD_DIM,
+        NOPE_DIM=DSV4_NOPE_DIM,
+        ROPE_DIM=DSV4_ROPE_DIM,
+        PAGE_ROWS=page_rows,
+        PAYLOAD_BYTES=DSV4_KV_PAYLOAD_BYTES,
+        SCALE_BYTES=DSV4_KV_SCALE_BYTES,
+        PAGE_BYTES=page_bytes,
+        FP8_MAX=DSV4_FP8_MAX,
+        num_warps=8,
+    )
+
+
+def _run_continuation_index(binding: DSV4CompressorContinuationBinding) -> None:
+    if binding.group_capacity == 0:
+        return
+    assert binding.index_cache is not None
+    assert binding.index_kv_state is not None
+    assert binding.index_score_state is not None
+    assert binding.weights.index_ape is not None
+    assert binding.weights.index_norm is not None
+    _continuation_pool_pack_index_kernel[(binding.group_capacity,)](
+        binding.projection,
+        binding.active_groups,
+        binding.group_sequence_slots,
+        binding.group_rope_positions,
+        binding.compressed_slots,
+        binding.sequence_offsets,
+        binding.sequence_start_positions,
+        binding.state_sequence_ids,
+        binding.compressed_cos_sin_cache,
+        binding.index_kv_state,
+        binding.index_score_state,
+        binding.weights.index_ape,
+        binding.weights.index_norm,
+        binding.index_cache.view(torch.float8_e4m3fn),
+        binding.index_cache.view(torch.float32),
+        binding.projection.stride(0),
+        binding.compressed_cos_sin_cache.stride(0),
+        binding.index_kv_state.stride(0),
+        binding.index_kv_state.stride(1),
+        binding.eps,
+        PROJECTION_OFFSET=2 * 1_024,
+        PROJECTED_WIDTH=256,
+        RATIO=4,
+        HEAD_DIM=DSV4_INDEX_HEAD_DIM,
+        NOPE_DIM=64,
+        ROPE_DIM=DSV4_ROPE_DIM,
+        PAGE_ROWS=DSV4_INDEX_PAGE_SIZE,
+        PAGE_BYTES=DSV4_INDEX_PAGE_BYTES,
+        FP8_MAX=DSV4_FP8_MAX,
+        num_warps=4,
+    )
+
+
+def _launch_continuation_finalize_phase(
+    binding: DSV4CompressorContinuationBinding,
+    *,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    ape: torch.Tensor,
+    projection_offset: int,
+    projected_width: int,
+    state_row_start: int,
+    state_rows: int,
+) -> None:
+    ratio = binding.compress_ratio
+    _continuation_finalize_state_kernel[(binding.sequence_capacity, state_rows)](
+        binding.projection,
+        binding.active_sequences,
+        binding.sequence_offsets,
+        binding.sequence_start_positions,
+        binding.state_sequence_ids,
+        kv_state,
+        score_state,
+        ape,
+        binding.projection.stride(0),
+        kv_state.stride(0),
+        kv_state.stride(1),
+        PROJECTION_OFFSET=projection_offset,
+        PROJECTED_WIDTH=projected_width,
+        PROJECTED_BLOCK=triton.next_power_of_2(projected_width),
+        RATIO=ratio,
+        OVERLAP=ratio == 4,
+        STATE_ROW_START=state_row_start,
+        num_warps=4,
+    )
+
+
+def _finalize_continuation_state(
+    binding: DSV4CompressorContinuationBinding,
+    *,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    ape: torch.Tensor,
+    projection_offset: int,
+    projected_width: int,
+) -> None:
+    ratio = binding.compress_ratio
+    _launch_continuation_finalize_phase(
+        binding,
+        kv_state=kv_state,
+        score_state=score_state,
+        ape=ape,
+        projection_offset=projection_offset,
+        projected_width=projected_width,
+        state_row_start=0,
+        state_rows=ratio,
+    )
+    if ratio == 4:
+        # Preserve old current rows until the previous window has consumed
+        # them; the two launches are ordered on the binding's CUDA stream.
+        _launch_continuation_finalize_phase(
+            binding,
+            kv_state=kv_state,
+            score_state=score_state,
+            ape=ape,
+            projection_offset=projection_offset,
+            projected_width=projected_width,
+            state_row_start=ratio,
+            state_rows=ratio,
+        )
+
+
+def run_dsv4_compressor_continuation(
+    *, binding: DSV4CompressorContinuationBinding
+) -> None:
+    """Run one ordered continuation chunk per active sequence without allocation."""
+
+    if not isinstance(binding, DSV4CompressorContinuationBinding):
+        raise TypeError(
+            "run_dsv4_compressor_continuation requires a "
+            "DSV4CompressorContinuationBinding"
+        )
+    torch.mm(
+        binding.hidden_states,
+        binding.weights.joint_projection_t,
+        out=binding.projection,
+    )
+    _run_continuation_main(binding)
+    if binding.compress_ratio == 4:
+        _run_continuation_index(binding)
+    _finalize_continuation_state(
+        binding,
+        kv_state=binding.main_kv_state,
+        score_state=binding.main_score_state,
+        ape=binding.weights.main_ape,
+        projection_offset=0,
+        projected_width=DSV4_HEAD_DIM * (2 if binding.compress_ratio == 4 else 1),
+    )
+    if binding.compress_ratio == 4:
+        assert binding.index_kv_state is not None
+        assert binding.index_score_state is not None
+        assert binding.weights.index_ape is not None
+        _finalize_continuation_state(
+            binding,
+            kv_state=binding.index_kv_state,
+            score_state=binding.index_score_state,
+            ape=binding.weights.index_ape,
+            projection_offset=2 * 1_024,
+            projected_width=256,
+        )
+
+
 def run_dsv4_compressor_decode(*, binding: DSV4CompressorBinding) -> None:
     """Run one sequence-unique decode row per active sequence without allocation."""
 
@@ -1916,11 +2959,13 @@ def run_dsv4_compressor_decode(*, binding: DSV4CompressorBinding) -> None:
 __all__ = [
     "DSV4CompressorBinding",
     "DSV4CompressorCaps",
+    "DSV4CompressorContinuationBinding",
     "DSV4CompressorPlan",
     "DSV4CompressorPrefillBinding",
     "DSV4CompressorWeights",
     "pack_dsv4_compressor_weights",
     "plan_dsv4_compressor",
+    "run_dsv4_compressor_continuation",
     "run_dsv4_compressor_decode",
     "run_dsv4_compressor_prefill",
 ]

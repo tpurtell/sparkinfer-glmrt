@@ -10,8 +10,11 @@ produces the randomized-Hadamard index cache in its planar FP8+FP32-scale ABI.
 The decode binding requires at most one row for each sequence.  Initial prefill
 uses a separate fixed-capacity binding: it projects the graph bucket once,
 emits complete groups in parallel, and finalizes each sequence's exact terminal
-state once.  Ordered continuation chunks remain outside this surface because
-accepting them as decode would race sequence-local state and change semantics.
+state once.  Ordered continuation chunks cannot use the decode binding because
+that would race sequence-local state and change semantics.  They use a third
+binding that combines carried FP32 state with one ordered chunk projection,
+emits every newly completed group in parallel, and finalizes state in
+sequence-safe phases.
 """
 
 from __future__ import annotations
@@ -28,13 +31,16 @@ META = OpMeta(
         "Caps",
         "Plan",
         "Binding",
+        "ContinuationBinding",
         "PrefillBinding",
         "Weights",
         "plan",
         "bind_decode",
+        "bind_continuation",
         "bind_prefill",
         "pack_weights",
         "run_decode",
+        "run_continuation",
         "run_prefill",
         "is_supported",
     ),
@@ -54,15 +60,18 @@ if TYPE_CHECKING:
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        ContinuationBinding,
         Plan,
         PrefillBinding,
         Weights,
         bind_decode,
+        bind_continuation,
         bind_prefill,
         is_supported,
         pack_weights,
         plan,
         run_decode,
+        run_continuation,
         run_prefill,
     )
 

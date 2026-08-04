@@ -7,11 +7,13 @@ from . import META
 from ._impl import (
     DSV4CompressorBinding as Binding,
     DSV4CompressorCaps as Caps,
+    DSV4CompressorContinuationBinding as ContinuationBinding,
     DSV4CompressorPlan as Plan,
     DSV4CompressorPrefillBinding as PrefillBinding,
     DSV4CompressorWeights as Weights,
     pack_dsv4_compressor_weights as pack_weights,
     plan_dsv4_compressor as plan,
+    run_dsv4_compressor_continuation as run_continuation,
     run_dsv4_compressor_decode as run_decode,
     run_dsv4_compressor_prefill as run_prefill,
 )
@@ -29,6 +31,12 @@ def bind_prefill(plan: Plan, **kwargs) -> PrefillBinding:
     return plan.bind_prefill(**kwargs)
 
 
+def bind_continuation(plan: Plan, **kwargs) -> ContinuationBinding:
+    """Bind ordered continuation tensors and caller-owned scratch; creates views only."""
+
+    return plan.bind_continuation(**kwargs)
+
+
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with Triton installed."""
 
@@ -39,13 +47,16 @@ __all__ = [
     "Caps",
     "Plan",
     "Binding",
+    "ContinuationBinding",
     "PrefillBinding",
     "Weights",
     "plan",
     "bind_decode",
+    "bind_continuation",
     "bind_prefill",
     "pack_weights",
     "run_decode",
+    "run_continuation",
     "run_prefill",
     "is_supported",
 ]
