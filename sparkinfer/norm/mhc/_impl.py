@@ -32,6 +32,19 @@ MHC_DEFAULT_BLOCK_H = 512
 MHC_SOURCE_TILE_H = 128
 MHC_GRAM_BLOCK_H = 1024
 MHC_SUPPORTED_HIDDEN_SIZES = (4096, 7168)
+MHC_DEFAULT_EPS = 1.0e-6
+
+
+def _is_default_mhc_epsilon(value: float) -> bool:
+    """Accept the configured epsilon after a normal f32 ABI round trip."""
+
+    value = float(value)
+    return math.isfinite(value) and math.isclose(
+        value,
+        MHC_DEFAULT_EPS,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    )
 
 
 def _required_mhc_split_k(hidden_size: int, block_k: int) -> int:
@@ -877,8 +890,8 @@ def _sparkinfer_mhc_pre_impl(
             block_k=block_k,
             block_h=block_h,
         )
-        and float(rms_eps) == 1.0e-6
-        and float(hc_eps) == 1.0e-6
+        and _is_default_mhc_epsilon(rms_eps)
+        and _is_default_mhc_epsilon(hc_eps)
         and sinkhorn_iters == 20
     ):
         from sparkinfer.norm.mhc._kernels import (
@@ -934,7 +947,8 @@ def _sparkinfer_mhc_pre_impl(
         f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
         "sinkhorn_iters=20); got "
         f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
-        f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}"
+        f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}, "
+        f"rms_eps={float(rms_eps)!r}, hc_eps={float(hc_eps)!r}"
     )
 
 
@@ -1178,8 +1192,8 @@ def _sparkinfer_mhc_post_pre_impl(
             block_k=block_k,
             block_h=block_h,
         )
-        and float(rms_eps) == 1.0e-6
-        and float(hc_eps) == 1.0e-6
+        and _is_default_mhc_epsilon(rms_eps)
+        and _is_default_mhc_epsilon(hc_eps)
         and sinkhorn_iters == 20
     ):
         # The Gram-trick fused post_pre is THE mHC decode post_pre kernel: one
@@ -1373,7 +1387,8 @@ def _sparkinfer_mhc_post_pre_impl(
         f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
         "sinkhorn_iters=20); got "
         f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
-        f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}"
+        f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}, "
+        f"rms_eps={float(rms_eps)!r}, hc_eps={float(hc_eps)!r}"
     )
 
 

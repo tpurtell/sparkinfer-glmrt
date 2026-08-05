@@ -4,9 +4,24 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparkinfer.norm.mhc._impl import SPARKINFERMHCScratchCaps, plan_mhc_scratch, sparkinfer_mhc_head, sparkinfer_mhc_post, sparkinfer_mhc_post_pre, sparkinfer_mhc_pre
-
+from sparkinfer.norm.mhc._impl import (
+    SPARKINFERMHCScratchCaps,
+    _is_default_mhc_epsilon,
+    plan_mhc_scratch,
+    sparkinfer_mhc_head,
+    sparkinfer_mhc_post,
+    sparkinfer_mhc_post_pre,
+    sparkinfer_mhc_pre,
+)
 from tests._reference.helpers import require_sparkinfer
+
+
+def test_default_mhc_epsilon_accepts_f32_abi_round_trip() -> None:
+    f32_epsilon = float(torch.tensor(1.0e-6, dtype=torch.float32).item())
+
+    assert _is_default_mhc_epsilon(1.0e-6)
+    assert _is_default_mhc_epsilon(f32_epsilon)
+    assert not _is_default_mhc_epsilon(1.1e-6)
 
 
 def _mhc_pre_reference(
