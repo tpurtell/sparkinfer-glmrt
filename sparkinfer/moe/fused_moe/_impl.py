@@ -2585,7 +2585,7 @@ def _plan_core_workspace(
         topk = max(int(num_topk), 1)
         token_capacity = (routed_capacity + topk - 1) // topk
         direct_route_slots_by_block: dict[int, int] = {}
-        if weight_layout == "packed":
+        if weight_layout in ("packed", "trellis3_t256"):
             direct_m_cap = _MAX_DIRECT_TOPK_ROUTE_M
             if dtype == torch.bfloat16 and is_gated_moe_activation(activation):
                 direct_m_cap = _TC_DECODE_MAX_M
@@ -2649,7 +2649,7 @@ def _plan_core_workspace(
         # route geometry here as well.
         direct_decode_capacity = routed_capacity // max(int(num_topk), 1)
         if (
-            weight_layout in ("packed", "nf3_2p1")
+            weight_layout in ("packed", "nf3_2p1", "trellis3_t256")
             and dtype == torch.bfloat16
             and is_gated_moe_activation(activation)
             and direct_decode_capacity >= 1
