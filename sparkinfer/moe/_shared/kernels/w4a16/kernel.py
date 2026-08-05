@@ -128,7 +128,7 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis3_t256_proj"}
 _NF3_CODEBOOK = (-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0)
 # Native EXL3 t256 tiles contain 256 tail-biting codes at one compile-time
 # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
-_TRELLIS256_BITS = (3, 4, 5, 6)
+_TRELLIS256_BITS = (2, 3, 4, 5, 6)
 _SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e8m0_k32": "e8m0_k32",

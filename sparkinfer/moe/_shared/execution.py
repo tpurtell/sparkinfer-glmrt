@@ -300,8 +300,10 @@ class MoEWeightPreparationPlan:
         )
         if self.source_format == "exl3_trellis_mcg":
             bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
-            if bits not in (3, 4, 5, 6):
-                raise ValueError(f"trellis_bits must be one of 3, 4, 5, 6; got {bits}")
+            if bits not in (2, 3, 4, 5, 6):
+                raise ValueError(
+                    f"trellis_bits must be one of 2, 3, 4, 5, 6; got {bits}"
+                )
             tile_config = self.trellis_tile_config or (64, 256, 64, 256)
             tile_config = tuple(int(value) for value in tile_config)
             if len(tile_config) != 4 or any(

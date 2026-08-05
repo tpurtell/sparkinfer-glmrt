@@ -76,6 +76,25 @@ def test_fused_moe_metadata_advertises_trellis_input_dtypes() -> None:
     assert {"bf16", "fp16"}.issubset(FUSED_MOE_META.dtypes)
 
 
+def test_weight_plan_accepts_true_two_bit_exl3_trellis() -> None:
+    plan = _weight_plan(
+        num_experts=384,
+        hidden_size=7168,
+        intermediate_size=768,
+        input_dtype=torch.bfloat16,
+        trellis_bits=2,
+    )
+    assert plan.trellis_bits == 2
+    with pytest.raises(ValueError, match="one of 2, 3, 4, 5, 6"):
+        _weight_plan(
+            num_experts=384,
+            hidden_size=7168,
+            intermediate_size=768,
+            input_dtype=torch.bfloat16,
+            trellis_bits=1,
+        )
+
+
 def test_rotation_placeholder_must_be_materialized_before_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -668,16 +687,24 @@ def test_full_rotation_topk16_route_parallel_sum_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("activation", ["silu", "situ"])
+@pytest.mark.parametrize(
+    "input_dtype,activation,bits",
+    [
+        (torch.bfloat16, "silu", 2),
+        (torch.bfloat16, "silu", 3),
+        (torch.bfloat16, "situ", 3),
+        (torch.float16, "silu", 3),
+        (torch.float16, "situ", 3),
+    ],
+)
 def test_planned_full_rotation_matches_reference_and_captures(
     input_dtype: torch.dtype,
     activation: str,
+    bits: int,
 ) -> None:
     torch.manual_seed(20260721)
     device = torch.device("cuda", torch.cuda.current_device())
     experts, hidden, intermediate = 2, 128, 128
-    bits = 3
     tile_config = (64, 128, 64, 128)
     w13 = torch.randint(
         -32768,

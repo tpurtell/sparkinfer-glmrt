@@ -6281,14 +6281,16 @@ def packed_dequant_trellis_to_half2x4(
     with w7=win_a, w6=win_a>>bits, ... w4=win_a>>(3*bits), and
          w3=win_b, w2=win_b>>bits, ... w0=win_b>>(3*bits).
 
-    ``bits`` is a trace-time specialization in {3,4,5,6}, so the generated PTX
+    ``bits`` is a trace-time specialization in {2,3,4,5,6}, so the generated PTX
     keeps the same immediate shifts as exl3's templated dq4/dq8 implementations.
     The caller supplies independently valid four-weight windows for 5/6 bpw,
     whose full eight-weight span can cross three ring words.
     """
     bits = int(bits)
-    if bits not in (3, 4, 5, 6):
-        raise ValueError(f"unsupported trellis bitrate {bits}; expected 3, 4, 5, or 6")
+    if bits not in (2, 3, 4, 5, 6):
+        raise ValueError(
+            f"unsupported trellis bitrate {bits}; expected 2, 3, 4, 5, or 6"
+        )
     asm = """
         {
             .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
@@ -6352,8 +6354,10 @@ def packed_dequant_trellis_stream_to_half2x4(
     34 bits and cannot be represented by one 32-bit base window.
     """
     bits = int(bits)
-    if bits not in (3, 4, 5, 6):
-        raise ValueError(f"unsupported trellis bitrate {bits}; expected 3, 4, 5, or 6")
+    if bits not in (2, 3, 4, 5, 6):
+        raise ValueError(
+            f"unsupported trellis bitrate {bits}; expected 2, 3, 4, 5, or 6"
+        )
     asm = """
         {
             .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;

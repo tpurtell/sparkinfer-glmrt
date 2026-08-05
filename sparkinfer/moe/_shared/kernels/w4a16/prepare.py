@@ -1572,10 +1572,10 @@ def _trellis256_bits_from_native_tensor(tensor: torch.Tensor, *, name: str) -> i
             f"{tensor.dtype} tile width"
         )
     bits = last // words_per_bit
-    if bits not in (3, 4, 5, 6):
+    if bits not in (2, 3, 4, 5, 6):
         raise ValueError(
             f"trellis3_t256 {name} encodes unsupported {bits}-bpw storage; "
-            "expected 3, 4, 5, or 6"
+            "expected 2, 3, 4, 5, or 6"
         )
     return bits
 
@@ -1667,13 +1667,14 @@ def prepare_trellis256_moe_weights(
         raise ValueError("trellis3_t256 W4A16 weights require fp16 or bf16 activations")
     requested_trellis_bits = None if trellis_bits is None else int(trellis_bits)
     if requested_trellis_bits is not None and requested_trellis_bits not in (
+        2,
         3,
         4,
         5,
         6,
     ):
         raise ValueError(
-            "trellis3_t256 bits must be one of 3, 4, 5, or 6, "
+            "trellis3_t256 bits must be one of 2, 3, 4, 5, or 6, "
             f"got {requested_trellis_bits}"
         )
     if num_experts <= 0:

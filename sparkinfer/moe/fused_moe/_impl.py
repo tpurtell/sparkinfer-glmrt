@@ -2572,8 +2572,8 @@ def _plan_core_workspace(
                     "full-rotation Trellis requires hidden and intermediate "
                     "dimensions divisible by 128"
                 )
-            if int(trellis_bits) not in (3, 4, 5, 6):
-                raise ValueError("trellis_bits must be one of 3, 4, 5, 6")
+            if int(trellis_bits) not in (2, 3, 4, 5, 6):
+                raise ValueError("trellis_bits must be one of 2, 3, 4, 5, 6")
             trellis_tile_config = trellis_tile_config or (64, 256, 64, 256)
         routed_capacity = max(int(routed_rows), 1)
         fc1_cols = _activation_w1_rows(activation, int(n))
