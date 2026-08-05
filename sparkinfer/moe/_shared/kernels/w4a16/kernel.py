@@ -9752,15 +9752,17 @@ def _w4a16_fused_moe_launch_flat(
         raise ValueError("full_rotation launch requires the raw rotation input")
     if rotation_input is None:
         rotation_input = a_input
-    broadcast_suh = False
-    if full_rotation:
+        broadcast_suh = False
+        if full_rotation:
         if suh_gate_table is None or suh_up_table is None:
             raise ValueError(
                 "full_rotation launch requires suh_gate_table and suh_up_table"
             )
         suh_gate_arg = suh_gate_table.reshape(-1)
         suh_up_arg = suh_up_table.reshape(-1)
-        broadcast_suh = num_experts > 1 and suh_gate_arg.numel() == hidden_size
+            # E=1 makes broadcast [1,H] and per-expert [E,H] physically
+            # identical. Select stride zero in that unambiguous case too.
+            broadcast_suh = suh_gate_arg.numel() == hidden_size
         if broadcast_suh != (suh_up_arg.numel() == hidden_size):
             raise ValueError(
                 "suh gate/up tables must both be per-expert or both broadcast"
