@@ -96,6 +96,7 @@ class SPARKINFERMHCBinding:
         rms_eps: float,
         hc_eps: float,
         norm_eps: float,
+        collapsed_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return sparkinfer_mhc_head(
             residual,
@@ -106,6 +107,7 @@ class SPARKINFERMHCBinding:
             rms_eps=rms_eps,
             hc_eps=hc_eps,
             norm_eps=norm_eps,
+            collapsed_out=collapsed_out,
             binding=self,
         )
 
@@ -1386,6 +1388,7 @@ def _sparkinfer_mhc_head_impl(
     hc_eps: float,
     norm_eps: float,
     out: torch.Tensor | None = None,
+    collapsed_out: torch.Tensor | None = None,
     binding: SPARKINFERMHCBinding | None = None,
 ) -> torch.Tensor:
     if binding is not None:
@@ -1437,6 +1440,21 @@ def _sparkinfer_mhc_head_impl(
         )
     _require_contiguous(out, name="out")
 
+    if collapsed_out is not None:
+        collapsed_out = _slice_capacity_view(
+            collapsed_out,
+            tokens=tokens,
+            tail_shape=(hidden_size,),
+            dtype=residual.dtype,
+            device=residual.device,
+            name="collapsed_out",
+        )
+        if collapsed_out is None:
+            raise AssertionError("collapsed_out validation unexpectedly returned None")
+        _require_contiguous(collapsed_out, name="collapsed_out")
+        if collapsed_out.data_ptr() == out.data_ptr():
+            raise ValueError("collapsed_out and normalized out must not alias")
+
     if tokens != 0:
         from sparkinfer.norm.mhc._kernels import run_mhc_head
 
@@ -1447,6 +1465,7 @@ def _sparkinfer_mhc_head_impl(
             bias=hc_base,
             norm_weight=norm_weight,
             out=out,
+            collapsed_out=collapsed_out,
             rms_eps=float(rms_eps),
             hc_eps=float(hc_eps),
             norm_eps=float(norm_eps),
@@ -1813,10 +1832,11 @@ def sparkinfer_mhc_head(
     hc_eps: float,
     norm_eps: float,
     out: torch.Tensor | None = None,
+    collapsed_out: torch.Tensor | None = None,
     binding: SPARKINFERMHCBinding | None = None,
 ) -> torch.Tensor:
     compiling = torch.compiler.is_compiling()
-    if compiling and binding is None and out is None:
+    if compiling and binding is None and out is None and collapsed_out is None:
         return torch.ops.sparkinfer.mhc_head_planned_functional(
             residual,
             fn,
@@ -1842,6 +1862,7 @@ def sparkinfer_mhc_head(
         hc_eps=hc_eps,
         norm_eps=norm_eps,
         out=out,
+        collapsed_out=collapsed_out,
         binding=binding,
     )
 

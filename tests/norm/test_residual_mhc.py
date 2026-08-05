@@ -74,6 +74,23 @@ def _mhc_head_reference(
     ).to(residual.dtype)
 
 
+def _mhc_head_collapsed_reference(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    flat = residual.flatten(1).float()
+    mixes = F.linear(flat, fn) * torch.rsqrt(
+        flat.square().mean(dim=-1, keepdim=True) + rms_eps
+    )
+    pre = torch.sigmoid(mixes * scale + bias) + hc_eps
+    return (pre.unsqueeze(-1) * residual.float()).sum(dim=1).to(residual.dtype)
+
+
 def _make_inputs(
     *,
     tokens: int,
@@ -173,6 +190,9 @@ def test_sparkinfer_mhc_head_matches_reference_and_capture(
         device=device,
         split_k=2 * (hidden_size // 128),
     )
+    collapsed = torch.empty(
+        (tokens, hidden_size), dtype=torch.bfloat16, device=device
+    )
 
     actual = binding.head(
         residual,
@@ -183,6 +203,7 @@ def test_sparkinfer_mhc_head_matches_reference_and_capture(
         rms_eps=rms_eps,
         hc_eps=hc_eps,
         norm_eps=norm_eps,
+        collapsed_out=collapsed,
     )
     expected = _mhc_head_reference(
         residual,
@@ -195,6 +216,15 @@ def test_sparkinfer_mhc_head_matches_reference_and_capture(
         norm_eps=norm_eps,
     )
     assert actual.data_ptr() == binding.y.data_ptr()
+    expected_collapsed = _mhc_head_collapsed_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+    )
+    torch.testing.assert_close(collapsed, expected_collapsed, atol=1.6e-2, rtol=0.0)
     torch.testing.assert_close(actual, expected, atol=1.6e-2, rtol=0.0)
 
     functional = sparkinfer_mhc_head(
@@ -221,12 +251,15 @@ def test_sparkinfer_mhc_head_matches_reference_and_capture(
             rms_eps=rms_eps,
             hc_eps=hc_eps,
             norm_eps=norm_eps,
+            collapsed_out=collapsed,
         )
     captured_ptr = captured.data_ptr()
     baseline = captured.clone()
+    collapsed_baseline = collapsed.clone()
     graph.replay()
     assert captured.data_ptr() == captured_ptr
     torch.testing.assert_close(captured, baseline, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(collapsed, collapsed_baseline, atol=0.0, rtol=0.0)
 
     residual.add_(0.125)
     graph.replay()
@@ -240,7 +273,18 @@ def test_sparkinfer_mhc_head_matches_reference_and_capture(
         hc_eps=hc_eps,
         norm_eps=norm_eps,
     )
+    expected_collapsed_live = _mhc_head_collapsed_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+    )
     assert torch.isfinite(captured).all()
+    torch.testing.assert_close(
+        collapsed, expected_collapsed_live, atol=1.6e-2, rtol=0.0
+    )
     torch.testing.assert_close(captured, expected_live, atol=1.6e-2, rtol=0.0)
 
 

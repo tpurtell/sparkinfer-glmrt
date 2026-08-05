@@ -231,12 +231,14 @@ def _mhc_head_fused_kernel(
     scale,
     bias,
     norm_weight,
+    collapsed_out,
     out,
     rms_eps,
     hc_eps,
     norm_eps,
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    STORE_COLLAPSED: tl.constexpr,
 ):
     token = tl.program_id(0)
     h = tl.arange(0, BLOCK_H)
@@ -303,6 +305,12 @@ def _mhc_head_fused_kernel(
     collapsed = (pre0 * r0 + pre1 * r1 + pre2 * r2 + pre3 * r3).to(
         tl.bfloat16
     )
+    if STORE_COLLAPSED:
+        tl.store(
+            collapsed_out + token * HIDDEN_SIZE + h,
+            collapsed,
+            mask=mask,
+        )
     collapsed_f32 = collapsed.to(tl.float32)
     output_rms = tl.rsqrt(
         tl.sum(collapsed_f32 * collapsed_f32) / HIDDEN_SIZE + norm_eps
@@ -6313,6 +6321,7 @@ def _run_mhc_head_launch(
     bias: torch.Tensor,
     norm_weight: torch.Tensor,
     out: torch.Tensor,
+    collapsed_out: torch.Tensor | None,
     rms_eps: float,
     hc_eps: float,
     norm_eps: float,
@@ -6325,6 +6334,17 @@ def _run_mhc_head_launch(
     _validate_tensor_shape("bias", bias, (_MHC_MULT,))
     _validate_tensor_shape("norm_weight", norm_weight, (hidden_size,))
     _validate_tensor_shape("out", out, (tokens, hidden_size))
+    if collapsed_out is not None:
+        _validate_tensor_shape(
+            "collapsed_out", collapsed_out, (tokens, hidden_size)
+        )
+        if collapsed_out.dtype != residual.dtype:
+            raise ValueError(
+                "collapsed_out must use the residual BF16 dtype, got "
+                f"{collapsed_out.dtype}"
+            )
+        if collapsed_out.data_ptr() == out.data_ptr():
+            raise ValueError("collapsed_out and normalized out must not alias")
     if tokens == 0:
         return
     block_h = triton.next_power_of_2(hidden_size)
@@ -6334,12 +6354,14 @@ def _run_mhc_head_launch(
         scale,
         bias,
         norm_weight,
+        out if collapsed_out is None else collapsed_out,
         out,
         float(rms_eps),
         float(hc_eps),
         float(norm_eps),
         HIDDEN_SIZE=hidden_size,
         BLOCK_H=block_h,
+        STORE_COLLAPSED=collapsed_out is not None,
         num_warps=8,
     )
 
@@ -6366,6 +6388,7 @@ def _mhc_head_launch_op(
         bias=bias,
         norm_weight=norm_weight,
         out=out,
+        collapsed_out=None,
         rms_eps=rms_eps,
         hc_eps=hc_eps,
         norm_eps=norm_eps,
@@ -6387,6 +6410,52 @@ def _mhc_head_launch_fake(
     return None
 
 
+@torch.library.custom_op(
+    "sparkinfer::mhc_head_with_collapsed_launch",
+    mutates_args=("collapsed_out", "out"),
+)
+def _mhc_head_with_collapsed_launch_op(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    collapsed_out: torch.Tensor,
+    out: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    norm_eps: float,
+) -> None:
+    _run_mhc_head_launch(
+        residual=residual,
+        fn=fn,
+        scale=scale,
+        bias=bias,
+        norm_weight=norm_weight,
+        collapsed_out=collapsed_out,
+        out=out,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+    )
+
+
+@_mhc_head_with_collapsed_launch_op.register_fake
+def _mhc_head_with_collapsed_launch_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    collapsed_out: torch.Tensor,
+    out: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    norm_eps: float,
+) -> None:
+    return None
+
+
 def run_mhc_head(
     *,
     residual: torch.Tensor,
@@ -6395,21 +6464,36 @@ def run_mhc_head(
     bias: torch.Tensor,
     norm_weight: torch.Tensor,
     out: torch.Tensor,
+    collapsed_out: torch.Tensor | None = None,
     rms_eps: float,
     hc_eps: float,
     norm_eps: float,
 ) -> None:
-    torch.ops.sparkinfer.mhc_head_launch(
-        residual,
-        fn,
-        scale,
-        bias,
-        norm_weight,
-        out,
-        float(rms_eps),
-        float(hc_eps),
-        float(norm_eps),
-    )
+    if collapsed_out is None:
+        torch.ops.sparkinfer.mhc_head_launch(
+            residual,
+            fn,
+            scale,
+            bias,
+            norm_weight,
+            out,
+            float(rms_eps),
+            float(hc_eps),
+            float(norm_eps),
+        )
+    else:
+        torch.ops.sparkinfer.mhc_head_with_collapsed_launch(
+            residual,
+            fn,
+            scale,
+            bias,
+            norm_weight,
+            collapsed_out,
+            out,
+            float(rms_eps),
+            float(hc_eps),
+            float(norm_eps),
+        )
 
 
 __all__ = [

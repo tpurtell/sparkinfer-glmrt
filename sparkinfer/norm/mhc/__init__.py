@@ -6,7 +6,8 @@ signatures differ: ``run_pre`` broadcasts a rank-2 residual into the four
 lanes at model entry, ``run_post_pre`` is the steady-state fused post+pre
 boundary between sublayers/layers, and ``run_post`` is the terminal mix-back.
 ``run_head`` performs the checkpoint's terminal four-lane sigmoid collapse and
-RMSNorm. Sinkhorn-normalized mix matrices; hidden sizes 4096/7168; mix
+RMSNorm, and can retain the pre-norm collapse in a second caller-owned output.
+Sinkhorn-normalized mix matrices; hidden sizes 4096/7168; mix
 constants exposed as ``MIXES`` / ``MULT`` / ``PARTIALS``. A bound lifecycle
 uses only caller-owned scratch and outputs.
 
