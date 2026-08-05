@@ -886,6 +886,9 @@ def test_c4_ordered_continuation_combines_carried_state_and_chunk_projection() -
         group_sequence_slots=torch.tensor(
             [1, 0, 0, 0, 0, 0], device="cuda", dtype=torch.int32
         ),
+        group_source_positions=torch.tensor(
+            [0, 4, 8, 0, 0, 0], device="cuda", dtype=torch.int32
+        ),
         group_rope_positions=torch.tensor(
             [0, 4, 8, 0, 0, 0], device="cuda", dtype=torch.int32
         ),
@@ -1022,7 +1025,8 @@ def test_c128_ordered_continuation_crosses_boundary_and_graph_replays() -> None:
         )
         expected_kv[sequence_slot], expected_score[sequence_slot] = kv, score
 
-    cos_sin = _cos_sin(384)
+    global_cos_sin = _cos_sin(384)
+    cos_sin = global_cos_sin[128:].contiguous()
     main_cache = torch.zeros((1, 1_728), device="cuda", dtype=torch.uint8)
     pooled = _initial_prefill_pool(
         full_projection[0],
@@ -1032,7 +1036,7 @@ def test_c128_ordered_continuation_crosses_boundary_and_graph_replays() -> None:
         head_dim=512,
     )
     expected_output = _rope_forward(
-        _rmsnorm(pooled, main_norm, eps), 128, cos_sin, nope_dim=448
+        _rmsnorm(pooled, main_norm, eps), 128, global_cos_sin, nope_dim=448
     )
     expected_cache = pack_compressed_mla_kv_cache_reference(
         expected_output[None, :448],
@@ -1051,8 +1055,11 @@ def test_c128_ordered_continuation_crosses_boundary_and_graph_replays() -> None:
         group_sequence_slots=torch.tensor(
             [0, 0, 0, 0], device="cuda", dtype=torch.int32
         ),
-        group_rope_positions=torch.tensor(
+        group_source_positions=torch.tensor(
             [128, 0, 0, 0], device="cuda", dtype=torch.int32
+        ),
+        group_rope_positions=torch.tensor(
+            [0, 0, 0, 0], device="cuda", dtype=torch.int32
         ),
         compressed_slots=torch.tensor([0, 1, 1, 1], device="cuda", dtype=torch.int32),
         active_sequences=torch.tensor([2], device="cuda", dtype=torch.int32),

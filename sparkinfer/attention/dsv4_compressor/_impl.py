@@ -195,6 +195,7 @@ class DSV4CompressorContinuationBinding:
     hidden_states: torch.Tensor
     active_groups: torch.Tensor
     group_sequence_slots: torch.Tensor
+    group_source_positions: torch.Tensor
     group_rope_positions: torch.Tensor
     compressed_slots: torch.Tensor
     active_sequences: torch.Tensor
@@ -408,6 +409,7 @@ class DSV4CompressorPlan:
         hidden_states: torch.Tensor,
         active_groups: torch.Tensor,
         group_sequence_slots: torch.Tensor,
+        group_source_positions: torch.Tensor,
         group_rope_positions: torch.Tensor,
         compressed_slots: torch.Tensor,
         active_sequences: torch.Tensor,
@@ -451,6 +453,7 @@ class DSV4CompressorPlan:
             self.caps,
             active_groups=active_groups,
             group_sequence_slots=group_sequence_slots,
+            group_source_positions=group_source_positions,
             group_rope_positions=group_rope_positions,
             compressed_slots=compressed_slots,
             active_sequences=active_sequences,
@@ -477,6 +480,7 @@ class DSV4CompressorPlan:
             hidden_states=hidden_states,
             active_groups=active_groups,
             group_sequence_slots=group_sequence_slots,
+            group_source_positions=group_source_positions,
             group_rope_positions=group_rope_positions,
             compressed_slots=compressed_slots,
             active_sequences=active_sequences,
@@ -818,6 +822,7 @@ def _validate_continuation_metadata(
     *,
     active_groups: torch.Tensor,
     group_sequence_slots: torch.Tensor,
+    group_source_positions: torch.Tensor,
     group_rope_positions: torch.Tensor,
     compressed_slots: torch.Tensor,
     active_sequences: torch.Tensor,
@@ -829,6 +834,7 @@ def _validate_continuation_metadata(
     for name, tensor in (
         ("active_groups", active_groups),
         ("group_sequence_slots", group_sequence_slots),
+        ("group_source_positions", group_source_positions),
         ("group_rope_positions", group_rope_positions),
         ("compressed_slots", compressed_slots),
         ("active_sequences", active_sequences),
@@ -850,8 +856,10 @@ def _validate_continuation_metadata(
     group_capacity = int(group_sequence_slots.shape[0])
     if group_sequence_slots.ndim != 1:
         raise ValueError("group_sequence_slots must be rank-1")
-    if group_rope_positions.shape != (group_capacity,) or compressed_slots.shape != (
-        group_capacity,
+    if (
+        group_source_positions.shape != (group_capacity,)
+        or group_rope_positions.shape != (group_capacity,)
+        or compressed_slots.shape != (group_capacity,)
     ):
         raise ValueError("continuation group metadata arrays must share one capacity")
     if group_capacity > caps.max_tokens:
@@ -2107,6 +2115,7 @@ def _continuation_pool_pack_main_kernel(
     projection,
     active_groups,
     group_sequence_slots,
+    group_source_positions,
     group_rope_positions,
     compressed_slots,
     sequence_offsets,
@@ -2144,7 +2153,8 @@ def _continuation_pool_pack_main_kernel(
         sequence_chunk_offset = tl.load(sequence_offsets + sequence_slot)
         chunk_logical_start = tl.load(sequence_start_positions + sequence_slot)
         state_sequence = tl.load(state_sequence_ids + sequence_slot).to(tl.int64)
-        group_start = tl.load(group_rope_positions + group)
+        group_start = tl.load(group_source_positions + group)
+        rope_position = tl.load(group_rope_positions + group)
         d = tl.arange(0, HEAD_DIM)
         valid = d < HEAD_DIM
         pooled = (
@@ -2214,7 +2224,7 @@ def _continuation_pool_pack_main_kernel(
             .to(tl.float32)
         )
         pair = tl.maximum((d - NOPE_DIM) >> 1, 0)
-        cs = cos_sin + group_start * cos_sin_stride_pos
+        cs = cos_sin + rope_position * cos_sin_stride_pos
         cos_v = tl.load(cs + pair, mask=rope_mask, other=1.0)
         sin_v = tl.load(cs + ROPE_DIM // 2 + pair, mask=rope_mask, other=0.0)
         rotated = tl.where(
@@ -2265,6 +2275,7 @@ def _continuation_pool_pack_index_kernel(
     projection,
     active_groups,
     group_sequence_slots,
+    group_source_positions,
     group_rope_positions,
     compressed_slots,
     sequence_offsets,
@@ -2298,7 +2309,8 @@ def _continuation_pool_pack_index_kernel(
         sequence_chunk_offset = tl.load(sequence_offsets + sequence_slot)
         chunk_logical_start = tl.load(sequence_start_positions + sequence_slot)
         state_sequence = tl.load(state_sequence_ids + sequence_slot).to(tl.int64)
-        group_start = tl.load(group_rope_positions + group)
+        group_start = tl.load(group_source_positions + group)
+        rope_position = tl.load(group_rope_positions + group)
         d = tl.arange(0, HEAD_DIM)
         valid = d < HEAD_DIM
         pooled = (
@@ -2367,7 +2379,7 @@ def _continuation_pool_pack_index_kernel(
             .to(tl.float32)
         )
         pair = tl.maximum((d - NOPE_DIM) >> 1, 0)
-        cs = cos_sin + group_start * cos_sin_stride_pos
+        cs = cos_sin + rope_position * cos_sin_stride_pos
         cos_v = tl.load(cs + pair, mask=rope_mask, other=1.0)
         sin_v = tl.load(cs + ROPE_DIM // 2 + pair, mask=rope_mask, other=0.0)
         rotated = tl.where(
@@ -2756,6 +2768,7 @@ def _run_continuation_main(binding: DSV4CompressorContinuationBinding) -> None:
         binding.projection,
         binding.active_groups,
         binding.group_sequence_slots,
+        binding.group_source_positions,
         binding.group_rope_positions,
         binding.compressed_slots,
         binding.sequence_offsets,
@@ -2802,6 +2815,7 @@ def _run_continuation_index(binding: DSV4CompressorContinuationBinding) -> None:
         binding.projection,
         binding.active_groups,
         binding.group_sequence_slots,
+        binding.group_source_positions,
         binding.group_rope_positions,
         binding.compressed_slots,
         binding.sequence_offsets,
