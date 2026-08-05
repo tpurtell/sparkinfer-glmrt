@@ -192,6 +192,7 @@ def _plan(
     route_num_experts: int,
     block_size_m: int,
     device: torch.device | str,
+    swiglu_limit: float | None = None,
 ) -> fused_moe.Plan:
     return fused_moe.plan(
         fused_moe.Caps(
@@ -202,6 +203,7 @@ def _plan(
             weight_plan=weights.plan,
             quant_mode="w4a16",
             w4a16_block_size_m=block_size_m,
+            swiglu_limit=swiglu_limit,
         )
     )
 
@@ -451,6 +453,7 @@ def _reference_full_rotation(
     down_svh: torch.Tensor,
     *,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     device = x.device
     experts = int(w2.shape[0])
@@ -501,6 +504,9 @@ def _reference_full_rotation(
                 svh=up_svh[expert],
                 store_fp16=True,
             )
+            if swiglu_limit is not None:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             if activation == "situ":
                 activated = (
                     4.0
@@ -688,19 +694,21 @@ def test_full_rotation_topk16_route_parallel_sum_matches_reference() -> None:
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize(
-    "input_dtype,activation,bits",
+    "input_dtype,activation,bits,swiglu_limit",
     [
-        (torch.bfloat16, "silu", 2),
-        (torch.bfloat16, "silu", 3),
-        (torch.bfloat16, "situ", 3),
-        (torch.float16, "silu", 3),
-        (torch.float16, "situ", 3),
+        (torch.bfloat16, "silu", 2, None),
+        (torch.bfloat16, "silu", 2, 10.0),
+        (torch.bfloat16, "silu", 3, None),
+        (torch.bfloat16, "situ", 3, None),
+        (torch.float16, "silu", 3, None),
+        (torch.float16, "situ", 3, None),
     ],
 )
 def test_planned_full_rotation_matches_reference_and_captures(
     input_dtype: torch.dtype,
     activation: str,
     bits: int,
+    swiglu_limit: float | None,
 ) -> None:
     torch.manual_seed(20260721)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -752,6 +760,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         route_num_experts=4,
         block_size_m=8,
         device=device,
+        swiglu_limit=swiglu_limit,
     )
     assert plan.caps.w4a16_block_size_m == 8
     assert plan.full_rotation
@@ -808,6 +817,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         intermediate_rotations,
         down_svh,
         activation=activation,
+        swiglu_limit=swiglu_limit,
     )
     relative_error = (mapped_eager - reference).norm() / reference.norm().clamp_min(
         1.0e-9
