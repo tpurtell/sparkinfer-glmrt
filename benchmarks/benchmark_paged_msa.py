@@ -13,9 +13,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
-from sparkinfer.attention.paged._forward import paged_attention_forward
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention._shared.contiguous.api import clear_attention_caches
+from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
 
 
 MSA_TOPK = 16
@@ -159,7 +159,7 @@ def _make_scratch_plan(
     msa_block_sparse: bool,
 ) -> object:
     return plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from sparkinfer.comm.pcie.pcie_dma import _normalize_fp8_mode
+from b12x.comm.pcie.pcie_dma import _normalize_fp8_mode
 
 
 @pytest.mark.parametrize("value", [None, "", "0", "false", "off", "no"])

@@ -3,12 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer._lib.intrinsics import FLOAT4_E2M1_MAX, fp4_quantize_values_torch, pack_grouped_fp4_values, swizzle_block_scale
-import sparkinfer.moe.fused_moe._impl as tp_moe
-from sparkinfer.moe.fused_moe._impl import clear_tp_moe_caches
-from sparkinfer.moe._shared.kernels.reference import compare_to_reference, moe_reference_nvfp4
+from b12x._lib.intrinsics import FLOAT4_E2M1_MAX, fp4_quantize_values_torch, pack_grouped_fp4_values, swizzle_block_scale
+import b12x.moe.fused_moe._impl as tp_moe
+from b12x.moe.fused_moe._impl import clear_tp_moe_caches
+from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_nvfp4
 
-from tests._reference.helpers import prepare_tp_moe_fp4_experts, require_sparkinfer, run_tp_moe_fp4
+from tests._reference.helpers import prepare_tp_moe_fp4_experts, require_b12x, run_tp_moe_fp4
 
 
 BACKEND_CASES = [
@@ -87,7 +87,7 @@ def _run_activation_case(
     micro_dynamic_cutover: int,
     fast_math: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device = require_sparkinfer()
+    device = require_b12x()
     (
         x,
         topk_ids,
@@ -162,7 +162,7 @@ def _run_single_token_multi_expert_case(
     topk_ids_dtype: torch.dtype,
     micro_dynamic_cutover: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(7)
 
     m, E, k, n = 1, 4, 128, 128
@@ -351,7 +351,7 @@ def test_dynamic_deterministic_multislice_matches_atomic_and_repeats(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Grouped deterministic FC2 slices preserve FC1 input and accumulate."""
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260716)
     m, experts_count, k, n, topk = 29, 32, 256, 384, 6
 
@@ -416,10 +416,10 @@ def test_dynamic_deterministic_multislice_matches_atomic_and_repeats(
         torch.cuda.synchronize(device)
         return output
 
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_TILE_MN", "16x128")
-    monkeypatch.delenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
+    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", "16x128")
+    monkeypatch.delenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
     atomic = run()
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     deterministic = run()
     repeat = run()
 

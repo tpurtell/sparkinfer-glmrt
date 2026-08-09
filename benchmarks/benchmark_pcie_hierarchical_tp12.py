@@ -1,4 +1,4 @@
-"""Exact Kimi-K3 TP12 decode all-reduce benchmark.
+"""Exact Kimi-K3 TP12/TP16 decode all-reduce benchmark.
 
 Measures CUDA-graph replay for the two BF16 collective shapes used by each K3
 MoE layer:
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import socket
+import argparse
 from statistics import median
 
 os.environ.setdefault("NCCL_IB_DISABLE", "1")
@@ -25,8 +26,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie import AllReduce
-from sparkinfer.comm.pcie.pcie_hierarchical import SUPPORTED_BLOCKS
+from b12x.comm.pcie import AllReduce
+from b12x.comm.pcie.pcie_hierarchical import SUPPORTED_BLOCKS, _pick_blocks
 
 
 def _free_port() -> int:
@@ -99,7 +100,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.all_reduce(peer_count, op=dist.ReduceOp.MAX)
         if rank == 0:
             print(
-                "elements,bytes,blocks,nccl_median_us,custom_median_us,"
+                "world_size,elements,bytes,blocks,nccl_median_us,custom_median_us,"
                 "speedup,nccl_min_us,nccl_max_us,custom_min_us,custom_max_us,"
                 "nccl_max_abs_error,custom_max_abs_error,max_rank_delta,"
                 "max_mapped_peers",
@@ -116,14 +117,37 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             )
             fp32_ref = inp.float()
             dist.all_reduce(fp32_ref)
+            gathered_inputs = [torch.empty_like(inp) for _ in range(world_size)]
+            dist.all_gather(gathered_inputs, inp)
+            island_partials = []
+            for island_base in range(0, world_size, 4):
+                partial = torch.zeros_like(inp, dtype=torch.float32)
+                for peer in range(island_base, island_base + 4):
+                    partial.add_(gathered_inputs[peer].float())
+                island_partials.append(partial)
+            grouped_ref_fp32 = torch.zeros_like(inp, dtype=torch.float32)
+            for partial in island_partials:
+                grouped_ref_fp32.add_(partial)
+            grouped_ref = grouped_ref_fp32.to(torch.bfloat16)
             nccl_actual = inp.clone()
             dist.all_reduce(nccl_actual)
             nccl_max_abs_error = (nccl_actual.float() - fp32_ref).abs().max()
             dist.all_reduce(nccl_max_abs_error, op=dist.ReduceOp.MAX)
 
-            for blocks in SUPPORTED_BLOCKS:
+            blocks_to_test = (
+                (_pick_blocks(elements),)
+                if runtime._runtime.double_buffered
+                else SUPPORTED_BLOCKS
+            )
+            for blocks in blocks_to_test:
                 actual = runtime.all_reduce(inp, blocks=blocks)
                 torch.cuda.synchronize(device)
+                if not torch.equal(actual, grouped_ref):
+                    grouped_delta = (actual.float() - grouped_ref.float()).abs().max()
+                    raise AssertionError(
+                        "custom output differs from the exact grouped-order "
+                        f"reference: {grouped_delta.item()}"
+                    )
                 custom_max_abs_error = (actual.float() - fp32_ref).abs().max()
                 dist.all_reduce(custom_max_abs_error, op=dist.ReduceOp.MAX)
 
@@ -185,7 +209,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     nccl_med = float(median(nccl_us))
                     custom_med = float(median(custom_us))
                     print(
-                        f"{elements},{elements * 2},{blocks},"
+                        f"{world_size},{elements},{elements * 2},{blocks},"
                         f"{nccl_med:.3f},{custom_med:.3f},"
                         f"{nccl_med / custom_med:.4f},"
                         f"{min(nccl_us):.3f},{max(nccl_us):.3f},"
@@ -204,10 +228,14 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 
 def main() -> None:
-    world_size = 12
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--world-size", type=int, choices=(12, 16), default=16)
+    args = parser.parse_args()
+    world_size = args.world_size
     if torch.cuda.device_count() < world_size:
         raise RuntimeError(
-            f"TP12 benchmark needs 12 CUDA devices, found {torch.cuda.device_count()}"
+            f"TP{world_size} benchmark needs {world_size} CUDA devices, "
+            f"found {torch.cuda.device_count()}"
         )
     mp.spawn(
         _worker,

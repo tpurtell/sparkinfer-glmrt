@@ -4,8 +4,8 @@ import math
 
 import torch
 
-from sparkinfer.attention.nsa_indexer._impl import msa_topk_blocks
-from sparkinfer.attention.nsa_indexer.msa_reference import (
+from b12x.attention.nsa_indexer._impl import msa_topk_blocks
+from b12x.attention.nsa_indexer.msa_reference import (
     MSA_BLOCK_TOKENS,
     MSA_SM_SCALE,
     MSA_TOPK_BLOCKS,
@@ -15,7 +15,7 @@ from sparkinfer.attention.nsa_indexer.msa_reference import (
     msa_select_blocks_reference,
     quantize_msa_q_fp8_reference,
 )
-from sparkinfer.attention.nsa_indexer.reference import (
+from b12x.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     unpack_index_k_cache_reference,
 )

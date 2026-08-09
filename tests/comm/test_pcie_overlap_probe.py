@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from sparkinfer.comm.pcie.overlap_probe import (
+from b12x.comm.pcie.overlap_probe import (
     BackendDecision,
     ProbeConfig,
     decide_query_split,
@@ -186,7 +186,7 @@ def test_tp_backend_requires_material_dma_gain() -> None:
         minimum_backend_gain=0.02,
     )
 
-    assert win.backend == "sparkinfer-dma"
+    assert win.backend == "b12x-dma"
     assert win.dma_gain == pytest.approx(0.2)
     assert noise.backend == "nccl"
 
@@ -204,9 +204,9 @@ def _backend(backend: str) -> BackendDecision:
 def test_dma_crossover_requires_winning_tail() -> None:
     points = [
         (1024, _backend("nccl")),
-        (2048, _backend("sparkinfer-dma")),
-        (4096, _backend("sparkinfer-dma")),
-        (8192, _backend("sparkinfer-dma")),
+        (2048, _backend("b12x-dma")),
+        (4096, _backend("b12x-dma")),
+        (8192, _backend("b12x-dma")),
     ]
     late_loss = [*points, (16384, _backend("nccl"))]
 

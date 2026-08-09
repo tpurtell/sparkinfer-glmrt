@@ -5,22 +5,22 @@ import math
 import pytest
 import torch
 
-from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from benchmarks.benchmark_paged_attention import (
     _capture_backend_graph,
     _capture_flashinfer_fa2_graph,
     _make_uniform_paged_inputs,
     _quantize_paged_kv_cache_global_e4m3,
 )
-from sparkinfer.attention.paged.reference import paged_attention_reference
-from sparkinfer.attention.paged._forward import _build_extend_forward_kernel
-from sparkinfer.attention.paged.traits import select_paged_forward_traits_from_plan
-from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
-from sparkinfer.attention.paged._forward import paged_attention_forward
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
-from sparkinfer.attention.paged.planner import create_paged_plan
+from b12x.attention.paged.reference import paged_attention_reference
+from b12x.attention.paged._forward import _build_extend_forward_kernel
+from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
+from b12x.attention._shared.contiguous.api import clear_attention_caches
+from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged.planner import create_paged_plan
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 from tests._reference.paged_attention_helpers import quantize_paged_kv_cache_e4m3
 from .test_attention_paged_planner import _make_inputs
 
@@ -85,7 +85,7 @@ class _PagedScratchHarness:
             **kwargs,
         )
         self._scratch_plan = plan_paged_attention_scratch(
-            SPARKINFERPagedAttentionScratchCaps(
+            B12XPagedAttentionScratchCaps(
                 device=self.q.device,
                 mode=self.mode,
                 dtype=self.q.dtype,
@@ -291,7 +291,7 @@ def _run_decode_reference_check(
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_short_context() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
         cache_seqlens=[64, 128, 192],
@@ -325,7 +325,7 @@ def test_paged_forward_matches_reference_decode_short_context() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_dense_page128() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1],
         cache_seqlens=[200, 384],
@@ -366,7 +366,7 @@ def test_paged_forward_matches_reference_decode_dense_page128() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1, 1, 1, 1, 1, 1],
         cache_seqlens=[64, 64, 64, 64, 64, 64, 64, 64],
@@ -410,7 +410,7 @@ def test_paged_forward_matches_reference_fp8_decode_short_context_batch8() -> No
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_with_sliding_window_and_sink() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
         cache_seqlens=[128, 192, 256],
@@ -449,7 +449,7 @@ def test_paged_forward_matches_reference_decode_with_sliding_window_and_sink() -
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_with_relative_bias() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
         cache_seqlens=[128, 256, 384],
@@ -501,7 +501,7 @@ def test_paged_forward_large_relative_bias_is_numerically_stable(
     mode: str,
     q_seqlen: int,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[q_seqlen],
         cache_seqlens=[222],
@@ -589,7 +589,7 @@ def test_paged_forward_decode_graph_replays_with_relative_bias(
     window_left: int,
     relative_extent: int,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1],
@@ -619,7 +619,7 @@ def test_paged_forward_decode_graph_replays_with_relative_bias(
         device=q.device,
     )
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -706,7 +706,7 @@ def test_paged_forward_decode_graph_replays_with_relative_bias(
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_decode_mimo_gqa_shape_with_sliding_window_and_sink() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[1, 1, 1],
         cache_seqlens=[128, 192, 256],
@@ -749,7 +749,7 @@ def test_paged_forward_matches_reference_decode_mimo_gqa_shape_with_sliding_wind
 
 @torch.inference_mode()
 def test_paged_forward_attention_sink_affects_denominator_only() -> None:
-    require_sparkinfer()
+    require_b12x()
     q_heads = 8
     kv_heads = 1
     head_dim = 256
@@ -785,8 +785,8 @@ def test_paged_forward_attention_sink_affects_denominator_only() -> None:
 def test_paged_forward_native_fp8_qkv_matches_reference_fp8_decode_short_context_batch8(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
-    monkeypatch.setenv("SPARKINFER_TURBO_ATTN", "1")
+    require_b12x()
+    monkeypatch.setenv("B12X_TURBO_ATTN", "1")
     output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=64)
     assert plan_desc.endswith(",split")
     assert (output - ref_out).abs().max().item() <= 0.02
@@ -795,7 +795,7 @@ def test_paged_forward_native_fp8_qkv_matches_reference_fp8_decode_short_context
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[64, 64],
@@ -830,7 +830,7 @@ def test_paged_forward_matches_reference_without_split_bf16_extend() -> None:
 @torch.inference_mode()
 def test_paged_forward_bf16_extend_dual_tma_tail_matches_reference() -> None:
     """Replay the one-stage BF16 K/V TMA specialization as a serving graph."""
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[4],
@@ -1000,7 +1000,7 @@ def test_paged_forward_bf16_extend_dual_tma_tail_matches_reference() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_extend_dense_page128() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[256, 384],
@@ -1043,10 +1043,10 @@ def test_paged_forward_matches_reference_extend_dense_page128() -> None:
 def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
-    import sparkinfer.attention.paged._forward as paged_api
+    import b12x.attention.paged._forward as paged_api
 
     forward_specs: list[str] = []
 
@@ -1061,7 +1061,7 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
         if compile_spec.kernel_id == "attention.paged.forward":
             forward_specs.append(repr(compile_spec))
 
-    monkeypatch.setattr(paged_api, "sparkinfer_launch", fake_launch)
+    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
 
     batch = 4
     page_size = 128
@@ -1087,7 +1087,7 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
         return k_cache, v_cache
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=device,
             mode="extend",
             dtype=dtype,
@@ -1170,7 +1170,7 @@ def test_paged_extend_dense_page128_compile_key_uses_fixed_capacity(
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_extend_with_sliding_window_and_sink() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[320, 384],
@@ -1215,7 +1215,7 @@ def test_paged_forward_matches_reference_extend_with_sliding_window_and_sink() -
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_extend_with_relative_bias() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[320, 384],
@@ -1271,7 +1271,7 @@ def test_paged_forward_matches_reference_extend_with_relative_bias() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_with_fp8_kv_extend() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[2048, 4096],
@@ -1316,7 +1316,7 @@ def test_paged_forward_matches_reference_with_fp8_kv_extend() -> None:
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_with_split_fp8_decode() -> None:
-    require_sparkinfer()
+    require_b12x()
     output, fa2_out, plan_desc = _run_decode_graph_check(cache_seqlen=512)
     assert plan_desc.endswith(",split")
     assert (output - fa2_out).abs().max().item() <= 0.01
@@ -1327,8 +1327,8 @@ def test_paged_forward_matches_reference_with_split_fp8_decode() -> None:
 def test_paged_forward_native_fp8_qkv_matches_reference_with_split_fp8_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
-    monkeypatch.setenv("SPARKINFER_TURBO_ATTN", "1")
+    require_b12x()
+    monkeypatch.setenv("B12X_TURBO_ATTN", "1")
     output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=8192)
     assert plan_desc.endswith(",split")
     assert (output - ref_out).abs().max().item() <= 0.01
@@ -1337,7 +1337,7 @@ def test_paged_forward_native_fp8_qkv_matches_reference_with_split_fp8_decode(
 
 @torch.inference_mode()
 def test_paged_forward_matches_reference_with_bf16_kv_extend() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5],
         cache_seqlens=[2048, 4096],

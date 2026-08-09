@@ -7,16 +7,16 @@ import pytest
 import torch
 import cutlass
 
-import sparkinfer._lib.dense_gemm as dense_module
-from sparkinfer._lib.intrinsics import quantize_grouped_nvfp4_torch
-from sparkinfer._lib.utils import convert_sf_from_mma_layout, get_num_sm
-from sparkinfer._lib.dense_gemm import (
+import b12x._lib.dense_gemm as dense_module
+from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.utils import convert_sf_from_mma_layout, get_num_sm
+from b12x._lib.dense_gemm import (
     DenseGemmKernel,
     _select_default_dense_gemm_plan,
     _select_default_mma_tiler_mn,
     dense_gemm,
 )
-from sparkinfer.gemm._shared.wo_mxfp8 import (
+from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
     quantize_mxfp8_rows_torch,
@@ -26,7 +26,7 @@ _FLASHINFER_ROOT = pathlib.Path(__file__).resolve().parents[2] / "flashinfer"
 if _FLASHINFER_ROOT.exists():
     sys.path.insert(0, str(_FLASHINFER_ROOT))
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def _import_flashinfer_gemm():
@@ -95,6 +95,118 @@ def _run_dense_gemm(
     )
 
 
+def _block_fp8_reference(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[0]
+    a_dequant = (
+        a.float().view(m, k // 128, 128) * a_scale[:, :, None]
+    ).reshape(m, k)
+    b_dequant = (
+        b.float().view(n // 128, 128, k // 128, 128)
+        * b_scale[:, None, :, None]
+    ).reshape(n, k)
+    return (a_dequant @ b_dequant.T).to(torch.bfloat16)
+
+
+def _run_block_fp8_dense(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[0]
+    return dense_gemm(
+        (a.view(m, k, 1), a_scale),
+        (b.view(n, k, 1), b_scale),
+        out=out,
+        ab_dtype="float8_e4m3fn",
+        sf_dtype="float32",
+        c_dtype="bfloat16",
+        sf_vec_size=128,
+        expected_m=m,
+        block_fp8=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [(1, 128, 256), (8, 256, 512), (17, 128, 384), (129, 256, 256)],
+)
+def test_dense_gemm_block_fp8_matches_quantized_reference(
+    m: int,
+    n: int,
+    k: int,
+) -> None:
+    require_b12x()
+    torch.manual_seed(80 + m)
+    a = (torch.randn(m, k, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, device="cuda") / 8).to(torch.float8_e4m3fn)
+    a_scale = (torch.rand(m, k // 128, device="cuda") + 0.25).contiguous()
+    b_scale = (
+        torch.rand(n // 128, k // 128, device="cuda") + 0.25
+    ).contiguous()
+
+    actual = _run_block_fp8_dense(a, b, a_scale, b_scale)[:, :, 0]
+    reference = _block_fp8_reference(a, b, a_scale, b_scale)
+
+    torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-3)
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), reference.float().flatten(), dim=0
+    )
+    assert cosine.item() >= 0.9999
+
+
+def test_dense_gemm_block_fp8_graph_replay_reads_live_scales() -> None:
+    require_b12x()
+    torch.manual_seed(91)
+    m, n, k = 2, 128, 256
+    a = (torch.randn(m, k, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, device="cuda") / 8).to(torch.float8_e4m3fn)
+    a_scale = torch.ones((m, k // 128), device="cuda")
+    b_scale = torch.ones((n // 128, k // 128), device="cuda")
+    graph_out = torch.empty((m, n, 1), device="cuda", dtype=torch.bfloat16)
+
+    _run_block_fp8_dense(a, b, a_scale, b_scale, out=graph_out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_block_fp8_dense(a, b, a_scale, b_scale, out=graph_out)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    first = graph_out.clone()
+    a_scale.mul_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_out, first * 2, rtol=0, atol=0)
+
+
+def test_dense_gemm_block_fp8_split_k_matches_quantized_reference() -> None:
+    require_b12x()
+    torch.manual_seed(93)
+    m, n, k = 2, 4096, 4096
+    a = (torch.randn(m, k, device="cuda") / 16).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, device="cuda") / 16).to(torch.float8_e4m3fn)
+    a_scale = (torch.rand(m, k // 128, device="cuda") + 0.25).contiguous()
+    b_scale = (
+        torch.rand(n // 128, k // 128, device="cuda") + 0.25
+    ).contiguous()
+
+    actual = _run_block_fp8_dense(a, b, a_scale, b_scale)[:, :, 0]
+    reference = _block_fp8_reference(a, b, a_scale, b_scale)
+
+    torch.testing.assert_close(actual, reference, rtol=2e-2, atol=4e-3)
+
+
 @pytest.mark.parametrize("M,N,K", [
     (128, 128, 128),
     (256, 128, 128),
@@ -110,7 +222,7 @@ def _run_dense_gemm(
 def test_dense_gemm_matches_flashinfer_cudnn(
     M: int, N: int, K: int, c_dtype_str: str,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     mm_fp4 = _require_cudnn_fp4()
     torch.manual_seed(42)
 
@@ -160,7 +272,7 @@ def test_dense_gemm_fp4_swap_ab_small_tilen_matches_flashinfer_cudnn(
     mma_tiler_mn: tuple[int, int],
     load_path: str,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     mm_fp4 = _require_cudnn_fp4()
     torch.manual_seed(7)
 
@@ -276,10 +388,44 @@ def test_dense_gemm_fp8_small_tile_and_swap_support_matrix() -> None:
         )
 
 
+def test_dense_gemm_block_fp8_support_matrix() -> None:
+    base = dict(
+        ab_dtype=cutlass.Float8E4M3FN,
+        sf_dtype=cutlass.Float32,
+        sf_vec_size=128,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=(32, 128),
+        cluster_shape_mn=(1, 1),
+        n=1024,
+        k=4096,
+        l=1,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        block_fp8=True,
+    )
+
+    assert DenseGemmKernel.can_implement(
+        **base,
+        load_path="tma",
+        swap_ab=False,
+    )
+    assert not DenseGemmKernel.can_implement(
+        **base,
+        load_path="cpasync",
+        swap_ab=False,
+    )
+    assert not DenseGemmKernel.can_implement(
+        **base,
+        load_path="tma",
+        swap_ab=True,
+    )
+
+
 def test_dense_gemm_mxfp8_bk64_grouped_batches_use_their_own_scales(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(29)
 
     # Use the real grouped WO-A geometry. The manual BK64 path is deliberately
@@ -345,7 +491,7 @@ def test_dense_gemm_shared_expert_pair_replays_under_cuda_graph(
     gate_shape: tuple[int, int, int],
     down_shape: tuple[int, int, int],
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(1234)
 
     gate_m, gate_n, gate_k = gate_shape

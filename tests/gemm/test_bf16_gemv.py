@@ -1,4 +1,4 @@
-"""Tests for the small-N bf16 GEMV (``sparkinfer::bf16_gemv_small_n``).
+"""Tests for the small-N bf16 GEMV (``b12x::bf16_gemv_small_n``).
 
 The decode path routes unquantized small-N bf16 linears (GDN ``in_proj_ba``)
 through a one-CTA-per-column CUTE GEMV instead of cuBLAS's 16x16 WMMA pick.
@@ -16,13 +16,13 @@ cuda_required = pytest.mark.skipif(
 
 
 def _op():
-    from sparkinfer.gemm import bf16_gemv
+    from b12x.gemm import bf16_gemv
 
     # The package API is lazy (install_lazy_api); touching the attribute
     # imports _kernel, which registers the torch custom op.
     bf16_gemv.bf16_gemv_small_n  # noqa: B018
 
-    return torch.ops.sparkinfer.bf16_gemv_small_n
+    return torch.ops.b12x.bf16_gemv_small_n
 
 
 def _assert_matches_f32_ref(y: torch.Tensor, x: torch.Tensor, w: torch.Tensor):
@@ -67,7 +67,7 @@ def test_last_element_contributes():
 @cuda_required
 def test_large_m_falls_back_to_cublas():
     """m > SMALL_M_MAX must take the in-op F.linear fallback (prefill)."""
-    from sparkinfer.gemm.bf16_gemv import SMALL_M_MAX
+    from b12x.gemm.bf16_gemv import SMALL_M_MAX
 
     op = _op()
     torch.manual_seed(1)

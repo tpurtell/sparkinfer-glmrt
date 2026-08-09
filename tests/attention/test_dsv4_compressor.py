@@ -4,17 +4,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparkinfer.attention import dsv4_compressor
-from sparkinfer.attention._shared.mla.compressed_reference import (
+from b12x.attention import dsv4_compressor
+from b12x.attention._shared.mla.compressed_reference import (
     pack_compressed_mla_kv_cache_reference,
     unpack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer.attention.nsa_indexer.reference import (
+from b12x.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     unpack_index_k_cache_reference,
 )
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def _rope_forward(
@@ -225,7 +225,7 @@ def test_caps_fail_closed_on_non_model_compressor_combinations(kwargs) -> None:
 
 
 def test_c128_decode_updates_fp32_state_and_direct_packed_page() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260804)
     ratio, hidden, eps = 128, 4_096, 1.0e-6
     plan = dsv4_compressor.plan(
@@ -306,7 +306,7 @@ def test_c128_decode_updates_fp32_state_and_direct_packed_page() -> None:
 
 
 def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260805)
     hidden, eps = 4_096, 1.0e-6
     plan = dsv4_compressor.plan(
@@ -431,7 +431,7 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
 
 
 def test_c4_initial_prefill_emits_parallel_groups_and_exact_terminal_state() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260806)
     hidden, eps = 4_096, 1.0e-6
     plan = dsv4_compressor.plan(
@@ -621,7 +621,7 @@ def test_c4_initial_prefill_emits_parallel_groups_and_exact_terminal_state() -> 
 
 
 def test_c128_initial_prefill_graph_replays_and_retains_only_remainder() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260807)
     ratio, hidden, eps = 128, 4_096, 1.0e-6
     plan = dsv4_compressor.plan(
@@ -741,7 +741,7 @@ def test_c128_initial_prefill_graph_replays_and_retains_only_remainder() -> None
 
 
 def test_c4_ordered_continuation_combines_carried_state_and_chunk_projection() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260808)
     hidden, eps = 4_096, 1.0e-6
     plan = dsv4_compressor.plan(
@@ -970,7 +970,7 @@ def test_c4_ordered_continuation_combines_carried_state_and_chunk_projection() -
 
 
 def test_c128_ordered_continuation_crosses_boundary_and_graph_replays() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260809)
     ratio, hidden, eps = 128, 4_096, 1.0e-6
     plan = dsv4_compressor.plan(
@@ -1110,7 +1110,7 @@ def test_c128_ordered_continuation_crosses_boundary_and_graph_replays() -> None:
 
 
 def test_decode_binding_requires_explicit_sequence_unique_contract() -> None:
-    require_sparkinfer()
+    require_b12x()
     plan = dsv4_compressor.plan(
         dsv4_compressor.Caps(
             device="cuda",

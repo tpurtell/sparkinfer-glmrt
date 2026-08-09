@@ -20,7 +20,7 @@ import statistics
 
 import torch
 
-from sparkinfer.moe import fused_moe
+from b12x.moe import fused_moe
 
 
 def _parse_args() -> argparse.Namespace:

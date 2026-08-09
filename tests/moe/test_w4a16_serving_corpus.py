@@ -7,18 +7,18 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from sparkinfer._lib.intrinsics import swizzle_block_scale
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x._lib.intrinsics import swizzle_block_scale
+from b12x.moe._shared.kernels.w4a16.host import (
     plan_w4a16_buffers,
     select_route_block_size_m,
 )
-from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     compile_w4a16_fused_moe,
     compile_w4a16_topk_sum,
     run_w4a16_moe,
 )
-from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+from b12x.moe._shared.kernels.w4a16.prepare import (
     make_w4a16_packed_buffers,
     prepare_w4a16_modelopt_nvfp4_weights,
 )

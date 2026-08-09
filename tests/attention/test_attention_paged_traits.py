@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sparkinfer.attention.paged.planner import create_paged_plan
-from sparkinfer.attention.paged.traits import (
+from b12x.attention.paged.planner import create_paged_plan
+from b12x.attention.paged.traits import (
     select_paged_forward_traits,
     select_paged_forward_traits_from_plan,
 )

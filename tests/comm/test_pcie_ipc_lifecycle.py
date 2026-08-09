@@ -6,13 +6,13 @@ import weakref
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A, PCIeDCPA2APool
-from sparkinfer.comm.pcie.pcie_oneshot import (
+from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A, PCIeDCPA2APool
+from b12x.comm.pcie.pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
 )
-from sparkinfer.comm.pcie.pcie_twoshot import PCIeTwoShotSP
+from b12x.comm.pcie.pcie_twoshot import PCIeTwoShotSP
 
 
 class _FakeChannel:
@@ -42,15 +42,15 @@ def test_pool_explicit_close_coordinates_imports_before_exports(monkeypatch) -> 
     pool._all_channels = [channel_a, channel_b]
     pool._channels = {1: channel_a, 2: channel_b}
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -87,7 +87,7 @@ def test_pool_destructor_is_nonblocking_and_does_not_touch_cuda_ownership(
     pool._all_channels = [channel]
     pool._channels = {1: channel}
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
 
@@ -148,8 +148,6 @@ def _fake_twoshot(events: list[object]) -> PCIeTwoShotSP:
     runtime.world_size = 2
     runtime.device = torch.device("cpu")
     runtime.exchange_group = object()
-    runtime._ext = _FakeExt(events)
-    runtime._fptr = 123
     runtime._owned_buffers = [_Shared(1000, (2000, 3000))]
     runtime._ipc = _FakeIPC(events)
     runtime.max_rows = 8
@@ -157,6 +155,8 @@ def _fake_twoshot(events: list[object]) -> PCIeTwoShotSP:
     runtime._closed = False
     runtime._ipc_imports_closed = False
     runtime._ipc_exports_freed = False
+    runtime._coordinated_close_complete = False
+    runtime._closed_ipc_import_indices = set()
     return runtime
 
 
@@ -183,7 +183,7 @@ def _fake_dcp(events: list[object]) -> PCIeDCPA2A:
     runtime.world_size = 2
     runtime.device = torch.device("cpu")
     runtime.exchange_group = None
-    runtime._ext = _FakeExt(events)
+    runtime._legacy_ext_module = _FakeExt(events)
     runtime._ptr = 123
     runtime._owned_buffers = [_Shared(1000, (2000, 3000))]
     runtime._ipc = _FakeIPC(events)
@@ -248,15 +248,15 @@ def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None
     runtime = _fake_twoshot(events)
     runtime.device = torch.device("cuda:0")
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -266,14 +266,12 @@ def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None
     assert events == [
         "synchronize",
         "barrier",
-        ("dispose", 123),
         ("close", 2000),
         ("close", 3000),
         "barrier",
         ("free", 1000),
         "barrier",
     ]
-    assert runtime._fptr == 0
     assert runtime._owned_buffers == []
     assert runtime._ipc_imports_closed
     assert runtime._ipc_exports_freed
@@ -285,14 +283,13 @@ def test_twoshot_destructor_retains_imports_and_exports_without_cuda_calls(
     events: list[object] = []
     runtime = _fake_twoshot(events)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
 
     runtime.__del__()
 
     assert events == []
-    assert runtime._fptr == 123
     assert runtime._owned_buffers != []
     assert not runtime._ipc_exports_freed
 
@@ -310,8 +307,8 @@ def test_real_gc_quarantines_dcp_and_twoshot_ownership(runtime_factory) -> None:
     retained = _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(runtime_id)
     assert runtime_ref() is retained
     assert events == []
-    pointer_attr = "_ptr" if isinstance(retained, PCIeDCPA2A) else "_fptr"
-    assert getattr(retained, pointer_attr) == 123
+    if isinstance(retained, PCIeDCPA2A):
+        assert retained._ptr == 123
     assert retained._owned_buffers
     assert not retained._ipc_exports_freed
 
@@ -386,13 +383,15 @@ def test_strict_close_reports_unmap_failure_retains_exports_and_retries_only_fai
     ):
         runtime.close()
 
-    assert events == [
-        ("dispose", 123),
+    expected_events = (
+        [] if isinstance(runtime, PCIeTwoShotSP) else [("dispose", 123)]
+    )
+    assert events == expected_events + [
         ("close", 2000),
         ("close", 3000),
     ]
-    pointer_attr = "_ptr" if isinstance(runtime, PCIeOneshotAllReduce) else "_fptr"
-    assert getattr(runtime, pointer_attr) == 0
+    if isinstance(runtime, PCIeOneshotAllReduce):
+        assert runtime._ptr == 0
     assert runtime._closed
     assert not runtime._ipc_imports_closed
     assert not runtime._ipc_exports_freed
@@ -400,8 +399,7 @@ def test_strict_close_reports_unmap_failure_retains_exports_and_retries_only_fai
 
     runtime.close()
 
-    assert events == [
-        ("dispose", 123),
+    assert events == expected_events + [
         ("close", 2000),
         ("close", 3000),
         ("close", 2000),
@@ -412,7 +410,7 @@ def test_strict_close_reports_unmap_failure_retains_exports_and_retries_only_fai
     assert runtime._owned_buffers == []
 
 
-@pytest.mark.parametrize("runtime_factory", (_fake_oneshot, _fake_twoshot))
+@pytest.mark.parametrize("runtime_factory", (_fake_oneshot,))
 def test_strict_close_reports_native_dispose_failure_without_losing_pointer(
     runtime_factory,
 ) -> None:
@@ -424,8 +422,7 @@ def test_strict_close_reports_native_dispose_failure_without_losing_pointer(
     with pytest.raises(RuntimeError, match="failed during IPC unmap"):
         runtime.close()
 
-    pointer_attr = "_ptr" if isinstance(runtime, PCIeOneshotAllReduce) else "_fptr"
-    assert getattr(runtime, pointer_attr) == 123
+    assert runtime._ptr == 123
     assert events == [
         ("dispose", 123),
         ("close", 2000),
@@ -436,7 +433,7 @@ def test_strict_close_reports_native_dispose_failure_without_losing_pointer(
 
     runtime.close()
 
-    assert getattr(runtime, pointer_attr) == 0
+    assert runtime._ptr == 0
     assert events == [
         ("dispose", 123),
         ("close", 2000),
@@ -461,8 +458,10 @@ def test_strict_close_reports_free_failure_and_retains_only_failed_export(
     with pytest.raises(RuntimeError, match="failed during IPC export free"):
         runtime.close()
 
-    assert events == [
-        ("dispose", 123),
+    expected_events = (
+        [] if isinstance(runtime, PCIeTwoShotSP) else [("dispose", 123)]
+    )
+    assert events == expected_events + [
         ("close", 2000),
         ("close", 3000),
         ("close", 5000),
@@ -496,15 +495,15 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
     )
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: next(peer_statuses)(local_status),
     )
 
@@ -517,10 +516,13 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
 
     runtime.close()
 
-    assert events == [
+    expected_events = [
         "synchronize",
         "barrier",
-        ("dispose", 123),
+    ]
+    if isinstance(runtime, PCIeOneshotAllReduce):
+        expected_events.append(("dispose", 123))
+    expected_events += [
         ("close", 2000),
         ("close", 3000),
         "synchronize",
@@ -529,6 +531,7 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
         ("free", 1000),
         "barrier",
     ]
+    assert events == expected_events
     assert runtime._ipc_exports_freed
 
 
@@ -541,11 +544,11 @@ def test_status_exchange_failure_retains_local_exports(monkeypatch) -> None:
         raise RuntimeError("status exchange failed")
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         fail_status_exchange,
     )
 
@@ -582,15 +585,15 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
     )
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        "b12x.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: next(peer_statuses)(local_status),
     )
 
@@ -605,10 +608,13 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
     runtime.close()
 
     assert events == events_after_success
-    assert events == [
+    expected_events = [
         "synchronize",
         "barrier",
-        ("dispose", 123),
+    ]
+    if isinstance(runtime, PCIeOneshotAllReduce):
+        expected_events.append(("dispose", 123))
+    expected_events += [
         ("close", 2000),
         ("close", 3000),
         "barrier",
@@ -618,6 +624,7 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
         "barrier",
         "barrier",
     ]
+    assert events == expected_events
     assert runtime._coordinated_close_complete
 
 
@@ -632,8 +639,8 @@ def test_gc_never_attempts_native_dispose_or_ipc_unmap(
     runtime.__del__()
 
     assert events == []
-    pointer_attr = "_ptr" if isinstance(runtime, PCIeOneshotAllReduce) else "_fptr"
-    assert getattr(runtime, pointer_attr) == 123
+    if isinstance(runtime, PCIeOneshotAllReduce):
+        assert runtime._ptr == 123
     assert not runtime._ipc_imports_closed
     assert not runtime._ipc_exports_freed
     assert runtime._owned_buffers

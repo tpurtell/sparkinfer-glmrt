@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.moe._shared.kernels.activations import (
+from b12x.moe._shared.kernels.activations import (
     SITU,
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
@@ -14,7 +14,7 @@ from sparkinfer.moe._shared.kernels.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
-from sparkinfer.moe._shared.kernels.reference import _apply_gated_activation
+from b12x.moe._shared.kernels.reference import _apply_gated_activation
 
 
 def test_situ_activation_contract() -> None:

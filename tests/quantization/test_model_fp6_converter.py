@@ -6,14 +6,14 @@ import pathlib
 import pytest
 import torch
 
-from sparkinfer.quantization.mxfp6.model_fp6 import (
+from b12x.quantization.mxfp6.model_fp6 import (
     SafetensorsModel,
     convert_dense_model_to_fp6,
     convert_moe_model_to_fp6,
     discover_dense_linears,
     discover_moe_experts,
 )
-from sparkinfer.quantization.mxfp6.fp6_safetensors_export import (
+from b12x.quantization.mxfp6.fp6_safetensors_export import (
     export_dense_model_to_fp6_safetensors,
     export_moe_model_to_fp6_safetensors,
 )
@@ -113,7 +113,7 @@ def test_moe_convert_cpu_roundtrip(tmp_path) -> None:
     art = tmp_path / "out" / "layer_0.moe_fp6.safetensors"
     assert art.is_file()
 
-    from sparkinfer.quantization.mxfp6 import load_fp6_moe_weights
+    from b12x.quantization.mxfp6 import load_fp6_moe_weights
 
     w = load_fp6_moe_weights(str(art), device="cpu")
     assert w.num_experts == 2 and w.k == 64 and w.n == 32
@@ -203,7 +203,7 @@ def test_load_fp6_moe_checkpoint_cpu(tmp_path) -> None:
     export_moe_model_to_fp6_safetensors(
         tmp_path / "m", out, limit_layers=1, device="cpu", use_gpu=False, verbose=False
     )
-    from sparkinfer.quantization.mxfp6.fp6_safetensors_load import load_fp6_moe_checkpoint
+    from b12x.quantization.mxfp6.fp6_safetensors_load import load_fp6_moe_checkpoint
 
     layers = load_fp6_moe_checkpoint(str(out), device="cpu")
     assert set(layers) == {0}
@@ -223,7 +223,7 @@ def test_load_fp6_dense_checkpoint_cpu(tmp_path) -> None:
     export_dense_model_to_fp6_safetensors(
         tmp_path / "d", out, device="cpu", use_gpu=False, verbose=False
     )
-    from sparkinfer.quantization.mxfp6.fp6_safetensors_load import load_fp6_dense_checkpoint
+    from b12x.quantization.mxfp6.fp6_safetensors_load import load_fp6_dense_checkpoint
 
     weights = load_fp6_dense_checkpoint(str(out), device="cpu")
     name = "model.language_model.layers.0.mlp.gate_proj"

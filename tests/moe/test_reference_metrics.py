@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.moe._shared.kernels.reference import compare_to_reference
+from b12x.moe._shared.kernels.reference import compare_to_reference
 from tests._reference.w4a16_reference import compare_to_reference as compare_w4a16
 
 

@@ -37,9 +37,9 @@ def main() -> int:
         print("CUDA is required")
         return 2
 
-    from sparkinfer._lib.fp6 import SF_VEC_SIZE_FP6, as_grouped_mxfp6_scale_view
-    from sparkinfer._lib.dense_gemm import dense_gemm
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x._lib.fp6 import SF_VEC_SIZE_FP6, as_grouped_mxfp6_scale_view
+    from b12x._lib.dense_gemm import dense_gemm
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         _TILE,
         _quantize_matrix_fp6_bytes,
         quantize_dense_weight_to_fp6,

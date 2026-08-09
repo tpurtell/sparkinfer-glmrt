@@ -254,7 +254,7 @@ def make_msa_q2k_indices(
     return q2k.contiguous()
 
 
-# Harvested from sparkinfer tests/test_attention_paged_planner.py
+# Harvested from b12x tests/test_attention_paged_planner.py
 def _make_inputs(
     *,
     q_seqlens: list[int],

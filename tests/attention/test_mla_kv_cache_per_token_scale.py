@@ -14,13 +14,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention._shared.mla.kv_cache import (
+from b12x.attention._shared.mla.kv_cache import (
     clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache,
     concat_and_cache_nvfp4_mla_fp8_rope,
 )
 
 from .._reference.helpers import dequantize_nvfp4_mla_nope
-from ..conftest import require_sparkinfer as require_sm120
+from ..conftest import require_b12x as require_sm120
 
 
 _RECORD_BYTES = 368

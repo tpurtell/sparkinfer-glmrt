@@ -11,12 +11,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer._lib.intrinsics import (
+from b12x._lib.intrinsics import (
     _fp4_encode_nibbles,
     fp4_quantize_values_torch,
     quant_dequant_mxfp8_torch,
 )
-from sparkinfer.moe._shared.kernels.reference import (
+from b12x.moe._shared.kernels.reference import (
     decompose_nvfp4_scales_to_mx_residual,
     moe_reference_f32,
     moe_reference_w4a8_mx,
@@ -291,7 +291,7 @@ def test_w4a8_oracle_beats_w4a4_oracle(activation: str) -> None:
     )
 
     # w4a4 oracle on the same packed weights/scales (global scales 1.0).
-    from sparkinfer._lib.intrinsics import swizzle_block_scale
+    from b12x._lib.intrinsics import swizzle_block_scale
 
     w1_swizzled = swizzle_block_scale(w1_scales.to(torch.float8_e4m3fn)).view(torch.uint8)
     w2_swizzled = swizzle_block_scale(w2_scales.to(torch.float8_e4m3fn)).view(torch.uint8)

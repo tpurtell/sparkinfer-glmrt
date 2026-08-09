@@ -1,8 +1,8 @@
-# sparkinfer
+# b12x
 
-`sparkinfer` (formerly `b12x`) is an SM120/SM121 CuTe DSL kernel library for local
-LLM inference. It specifically targets DGX Spark, RTX Spark and the
-Blackwell-based RTX cards (RTX 6000 Pro, RTX 5090).
+`b12x` is an SM120/SM121 CuTe DSL kernel library for local LLM inference.
+It specifically targets DGX Spark, RTX Spark and the Blackwell-based RTX
+cards (RTX 6000 Pro, RTX 5090).
 
 It is *not* intended to be used in production/datacenter environments, both due to
 architecture mismatches and the fast-moving pace of the library. For mission-critical
@@ -11,7 +11,7 @@ use cases please use FlashInfer, CUTLASS or TRTLLM.
 ## Install
 
 ```bash
-pip install sparkinfer
+pip install b12x
 ```
 
 You need Python 3.10+, `torch >= 2.12`, and an SM120/SM121 GPU. The CuTe DSL
@@ -21,10 +21,10 @@ JIT-compiled on first use and cached.
 
 ## What's in here
 
-Every kernel is one op at `sparkinfer.<group>.<op>` (17 total; `list_ops()`
+Every kernel is one op at `b12x.<group>.<op>` (17 total; `list_ops()`
 enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
 kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
-`<group>/_shared/` and the universal compile/scratch spine in `sparkinfer/_lib/`.
+`<group>/_shared/` and the universal compile/scratch spine in `b12x/_lib/`.
 
 **`gemm`** — a dense block-scaled GEMM (NVFP4/MXFP8 operands, BF16/FP16/FP32
 out) plus fused linears on top of it: `gemm.blockscaled` (one-shot), MXFP8
@@ -46,19 +46,19 @@ parallel).
 
 **the rest** — `norm.mhc` (fused RMSNorm + hyper-connection residual),
 `quantization.{nvfp4,mxfp8}` (row quantizers), and `comm.pcie` (IPC-backed PCIe
-collectives). `sparkinfer` owns planning, scratch layout, and policy, so
+collectives). `b12x` owns planning, scratch layout, and policy, so
 serving stacks only supply metadata and capacity limits.
 
 ## Using it
 
-Every stateful kernel lives at `sparkinfer.<group>.<op>` and shares the **same
+Every stateful kernel lives at `b12x.<group>.<op>` and shares the **same
 shape** — `plan` the work, size scratch from the plan, `bind` your tensors as
 views, `run`. The module path carries the context, so the verbs and role
 classes (`Caps`/`Plan`/`Binding`) are uniform across families:
 
 ```python
 # norm — fused RMSNorm + hyper-connection residual mixing
-from sparkinfer.norm import mhc
+from b12x.norm import mhc
 
 plan    = mhc.plan(mhc.Caps(...))
 spec    = plan.scratch_specs()[0]
@@ -69,7 +69,7 @@ residual, post, comb, y = mhc.run_post_pre(..., binding=binding)
 
 ```python
 # moe — fused tensor-parallel routed-expert FFN (weights prepped once per model)
-from sparkinfer.moe import fused_moe
+from b12x.moe import fused_moe
 
 wplan   = fused_moe.plan_weights(quant_modes="nvfp4",
                                  source_format="modelopt_nvfp4", ...)
@@ -84,7 +84,7 @@ out     = fused_moe.run(binding=binding)
 
 ```python
 # attention — MLA decode from compressed KV pages (DeepSeek-V3.2)
-from sparkinfer.attention import compressed_mla
+from b12x.attention import compressed_mla
 
 plan    = compressed_mla.plan(compressed_mla.Caps(...))
 spec    = plan.scratch_specs()[0]
@@ -98,15 +98,15 @@ out = compressed_mla.run(swa_k_cache=swa, binding=binding, sm_scale=scale, ...)
 allocates), which is what makes captured graphs safe; `run*` executes and is
 CUDA-graph-capture safe. One-shot ops (`gemm.blockscaled.mm`,
 `quantization.mxfp8.quantize_rows`) are plain functions; `comm.pcie`
-collectives are stateful classes. `sparkinfer.list_ops()` enumerates the full
+collectives are stateful classes. `b12x.list_ops()` enumerates the full
 set; every op exports `is_supported()`. Underneath, kernels register as torch
-custom ops in the private `sparkinfer::` namespace (torch.compile / CUDA-graph
+custom ops in the private `b12x::` namespace (torch.compile / CUDA-graph
 integration) — prefer the Python API.
 
 ## PCIe DMA wire modes
 
 `PCIeDmaAllReduce` can compress eligible BF16 all-reduces. Configure it with
-`SPARKINFER_PCIE_DMA_FP8`, or pass the same value as the `fp8=` constructor
+`B12X_PCIE_DMA_FP8`, or pass the same value as the `fp8=` constructor
 argument. Integrations such as vLLM can forward their own launch setting to
 that constructor.
 
@@ -135,26 +135,26 @@ Compressed transport requires BF16 input and a per-rank shard divisible by
 128 elements; other shapes use the BF16 path:
 
 ```bash
-SPARKINFER_PCIE_DMA_FP8=i8_ring python -m your_server
+B12X_PCIE_DMA_FP8=i8_ring python -m your_server
 ```
 
 Compilation happens lazily per shape/config and is cached. For serving, warm
 up the shapes you need, then freeze:
 
 ```python
-import sparkinfer
+import b12x
 
 # ... run warmup traffic covering every shape you will serve ...
-sparkinfer.freeze_kernel_resolution("serving")
+b12x.freeze_kernel_resolution("serving")
 ```
 
 After the freeze, any request that would trigger a new kernel compile raises
 `KernelResolutionFrozenError` instead of stalling a live request (or worse,
 compiling inside CUDA graph capture).
 
-Set `SPARKINFER_PRINT_COMPILE_PROGRESS=1` to log each compiler invocation with its
+Set `B12X_PRINT_COMPILE_PROGRESS=1` to log each compiler invocation with its
 cache-key parameters and duration — useful for figuring out what warmup
-actually covered. `SPARKINFER_TIMING=1` enables per-kernel timing logs.
+actually covered. `B12X_TIMING=1` enables per-kernel timing logs.
 
 ## Where to look next
 

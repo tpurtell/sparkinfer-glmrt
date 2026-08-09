@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_dma import _normalize_fp8_mode
+from b12x.comm.pcie.pcie_dma import _normalize_fp8_mode
 
 
 VALUE_BLOCK = 32

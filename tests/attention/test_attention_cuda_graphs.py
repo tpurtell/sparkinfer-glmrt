@@ -5,15 +5,15 @@ import math
 import pytest
 import torch
 
-from sparkinfer.attention.paged.reference import paged_attention_reference
-from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
-from sparkinfer.attention.paged._forward import paged_attention_forward
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
-from sparkinfer.attention.paged.planner import create_paged_plan
-from sparkinfer.attention.paged.planner import plan_extend_graph_capacity
-from sparkinfer.attention.paged.planner import plan_verify_graph_capacity
+from b12x.attention.paged.reference import paged_attention_reference
+from b12x.attention._shared.contiguous.api import clear_attention_caches
+from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged.planner import create_paged_plan
+from b12x.attention.paged.planner import plan_extend_graph_capacity
+from b12x.attention.paged.planner import plan_verify_graph_capacity
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 from tests._reference.paged_attention_helpers import make_paged_inputs, quantize_paged_kv_cache_e4m3
 
 
@@ -37,7 +37,7 @@ def test_laguna_fp8_verifier_replays_fixed_graph_across_context_lengths(
     page_size: int,
     window_left: int,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
     torch.manual_seed(113)
     device = torch.device("cuda")
@@ -85,7 +85,7 @@ def test_laguna_fp8_verifier_replays_fixed_graph_across_context_lengths(
     )
     cache_seqlens.fill_(capacity.representative_cache_seqlen)
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=device,
             mode="verify",
             dtype=q.dtype,
@@ -164,7 +164,7 @@ def test_laguna_fp8_verifier_replays_fixed_graph_across_context_lengths(
 @torch.inference_mode()
 def test_laguna_fp8_extend_replays_smaller_uneven_query_capacity() -> None:
     """Live query partitions are packed on device under one fixed graph plan."""
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
     torch.manual_seed(4129)
     device = torch.device("cuda")
@@ -218,7 +218,7 @@ def test_laguna_fp8_extend_replays_smaller_uneven_query_capacity() -> None:
     output = torch.empty_like(q)
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=device,
             mode="extend",
             dtype=q.dtype,
@@ -337,7 +337,7 @@ def test_laguna_fp8_extend_replays_smaller_uneven_query_capacity() -> None:
 @torch.inference_mode()
 def test_laguna_fp8_extend_reuses_dynamic_worklist_grid() -> None:
     """A shared compiled entry must launch the current graph-static capacity."""
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
     torch.manual_seed(4130)
     device = torch.device("cuda")
@@ -390,7 +390,7 @@ def test_laguna_fp8_extend_reuses_dynamic_worklist_grid() -> None:
             window_left=-1,
         )
         scratch_plan = plan_paged_attention_scratch(
-            SPARKINFERPagedAttentionScratchCaps(
+            B12XPagedAttentionScratchCaps(
                 device=device,
                 mode="extend",
                 dtype=q.dtype,
@@ -516,7 +516,7 @@ class _PagedGraphScratchHarness:
                 1,
             )
             self._scratch_plan = plan_paged_attention_scratch(
-                SPARKINFERPagedAttentionScratchCaps(
+                B12XPagedAttentionScratchCaps(
                     device=self.q.device,
                     mode=self.mode,
                     dtype=self.q.dtype,
@@ -625,7 +625,7 @@ class _PagedGraphScratchHarness:
     strict=False,
 )
 def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata() -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
@@ -706,7 +706,7 @@ def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata(
     strict=False,
 )
 def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata() -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
@@ -779,7 +779,7 @@ def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata()
     strict=False,
 )
 def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(

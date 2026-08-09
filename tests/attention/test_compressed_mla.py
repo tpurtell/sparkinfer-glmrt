@@ -6,19 +6,19 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from sparkinfer.attention._shared.mla.compressed_api import (
+from b12x.attention._shared.mla.compressed_api import (
     _validate_compressed_cache_layout,
 )
-from sparkinfer.attention._shared.mla.kernel import (
+from b12x.attention._shared.mla.kernel import (
     _cache_block_stride_bytes as _decode_cache_block_stride_bytes,
 )
-from sparkinfer.attention._shared.mla.prefill import (
+from b12x.attention._shared.mla.prefill import (
     _cache_block_stride_bytes as _prefill_cache_block_stride_bytes,
 )
-from sparkinfer.attention._shared.mla.prefill_mg import (
+from b12x.attention._shared.mla.prefill_mg import (
     _cache_block_stride_bytes as _prefill_mg_cache_block_stride_bytes,
 )
-from sparkinfer.attention._shared.mla.compressed_reference import (
+from b12x.attention._shared.mla.compressed_reference import (
     COMPRESSED_MLA_BYTES_PER_TOKEN,
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
@@ -26,14 +26,14 @@ from sparkinfer.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer.attention import compressed_mla
+from b12x.attention import compressed_mla
 
-SPARKINFERCompressedMLAScratchCaps = compressed_mla.Caps
+B12XCompressedMLAScratchCaps = compressed_mla.Caps
 clear_mla_caches = compressed_mla.clear_caches
 compressed_mla_decode_forward = compressed_mla.run
 plan_compressed_mla_scratch = compressed_mla.plan
 
-from ..conftest import require_sparkinfer as require_sm120
+from ..conftest import require_b12x as require_sm120
 
 
 _COMPRESSED_HEAD_DIM = 512
@@ -164,7 +164,7 @@ def _make_compressed_binding(
     num_q_heads: int = _LOCAL_Q_HEADS,
 ):
     plan = plan_compressed_mla_scratch(
-        SPARKINFERCompressedMLAScratchCaps(
+        B12XCompressedMLAScratchCaps(
             device=device,
             dtype=torch.bfloat16,
             kv_dtype=torch.uint8,

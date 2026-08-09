@@ -3,15 +3,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention._shared.mla import api, traits
-from sparkinfer.attention._shared.mla.kernel import (
+from b12x.attention._shared.mla import api, traits
+from b12x.attention._shared.mla.kernel import (
     run_unified_decode,
 )
-from sparkinfer.attention._shared.mla.prefill_mg import (
+from b12x.attention._shared.mla.prefill_mg import (
     run_unified_prefill_mg,
 )
-from sparkinfer.attention._shared.mla.smem import make_smem_layout
-from sparkinfer.attention._shared.mla.traits import (
+from b12x.attention._shared.mla.smem import make_smem_layout
+from b12x.attention._shared.mla.traits import (
     ComputeMode,
     ModelType,
     ScaleFormat,

@@ -3,7 +3,7 @@
 This is the byte-exact comparison-against-DeepGEMM that the SM120 dense-FP8 port
 never had: the prior work *asserted* "activations are stored at 1x32 ue8m0,
 identical to DeepGEMM's 1d1d" but never measured it, and the GEMM correctness
-gate compared sparkinfer against a reference that consumed sparkinfer's *own* quantized FP8,
+gate compared b12x against a reference that consumed b12x's *own* quantized FP8,
 so any divergence from DeepGEMM was invisible. These tests pin the contract:
 
   1. ACTIVATION quant is byte-for-byte identical to DeepGEMM `per_token_cast_to_fp8`
@@ -21,13 +21,13 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.gemm._shared.block_fp8 import (
+from b12x.gemm._shared.block_fp8 import (
     pack_block_fp8_linear_weight_mxfp8,
     quantize_block_fp8_linear_input_mxfp8,
 )
-from sparkinfer.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
+from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 # --- DeepGEMM reference (verbatim from deepgemm-other/deep_gemm/utils/math.py) ---
@@ -62,8 +62,8 @@ def _relfro(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def test_activation_quant_byte_exact_with_deepgemm() -> None:
-    """sparkinfer activation MXFP8 quant == DeepGEMM per_token_cast_to_fp8 (gran_k=32)."""
-    require_sparkinfer()
+    """b12x activation MXFP8 quant == DeepGEMM per_token_cast_to_fp8 (gran_k=32)."""
+    require_b12x()
     torch.manual_seed(0)
     M, K = 64, 5376  # Nemotron down-proj K (= 42 * 128)
     x = (torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 3.0)
@@ -76,7 +76,7 @@ def test_activation_quant_byte_exact_with_deepgemm() -> None:
     dg_vals = dg_vals.view(torch.uint8)
     dg_sf = _sf_fp32_to_e8m0_u8(dg_sf_f)
 
-    # sparkinfer quantizes at 32-element K groups -> one UE8M0 scale per 32.
+    # b12x quantizes at 32-element K groups -> one UE8M0 scale per 32.
     assert b_sf.shape[1] == K // 32, f"expected gran_k=32 scale grid, got {b_sf.shape}"
     torch.testing.assert_close(b_vals, dg_vals, rtol=0, atol=0)
     torch.testing.assert_close(b_sf, dg_sf, rtol=0, atol=0)
@@ -84,7 +84,7 @@ def test_activation_quant_byte_exact_with_deepgemm() -> None:
 
 def test_activation_quant_k128_byte_exact_with_flash_reference() -> None:
     """DeepSeek-V4-Flash K128 scales are repeated into four MXFP8 slots."""
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260804)
     rows, width = 9, 256
     x = (
@@ -121,7 +121,7 @@ def test_activation_quant_k128_byte_exact_with_flash_reference() -> None:
 
 def test_activation_quant_k128_zero_block_uses_flash_floor() -> None:
     """Flash clamps block amax to 1e-4 instead of assigning unit scale."""
-    require_sparkinfer()
+    require_b12x()
     x = torch.zeros((1, 128), device="cuda", dtype=torch.bfloat16)
     actual = quantize_block_fp8_linear_input_mxfp8(
         x,
@@ -135,7 +135,7 @@ def test_activation_quant_k128_zero_block_uses_flash_floor() -> None:
 
 def test_ue8m0_rounding_matches_bit_exact_ceil() -> None:
     """ceil(log2(x))/exp2 == bit-exact ceil_to_ue8m0, incl. exact powers of two."""
-    require_sparkinfer()
+    require_b12x()
     dev = "cuda"
     ks = torch.arange(-30, 30, device=dev, dtype=torch.float32)
     pow2 = 448.0 * torch.exp2(ks)
@@ -167,7 +167,7 @@ def test_weight_pack_requantizes_arbitrary_fp32_scales_to_parity() -> None:
     The fix must (a) reach near the irreducible e4m3 floor and (b) be strictly
     better than the old "round the scale, keep stale FP8 values" behaviour.
     """
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(0)
     N, K = 4096, 4096
     w_fp8, s_fp32, w_orig = _deepseek_checkpoint(N, K, "cuda")
@@ -190,7 +190,7 @@ def test_weight_pack_requantizes_arbitrary_fp32_scales_to_parity() -> None:
 
 def test_weight_pack_keeps_ue8m0_values_verbatim() -> None:
     """Already-UE8M0 scales must NOT trigger re-quant: FP8 values stay byte-identical."""
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(0)
     N, K = 2048, 2048
     w_orig = (torch.randn(N, K, device="cuda") * 0.2).to(torch.bfloat16).float()

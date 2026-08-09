@@ -33,16 +33,16 @@ from cutlass import Int32, Uint32
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
-from sparkinfer._lib.intrinsics import (
+from b12x._lib.intrinsics import (
     e2m1x8_to_e4m3x8,
     ld_shared_u32,
     mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
 )
-from sparkinfer._lib.dense_gemm import DenseGemmKernel
+from b12x._lib.dense_gemm import DenseGemmKernel
 from tests.moe.test_w4a8_fragment_probe import _e4m3_bytes, _pack_b
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 _TILE_N = 128
 _TILE_K = 128  # fp4 positions -> 64 bytes per row
@@ -313,7 +313,7 @@ def test_tma_b_layout_dump_matches_swizzle_formula():
     """P1: the physical (row, chunk) -> smem offset mapping equals the
     primary byte-domain Swizzle<2,4,3> formula, for both stages, with an
     8192B stage stride."""
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     b_words = _make_b_source(device, n_tiles=1, k_tiles=2)
     dump = _run("dump", b_words).cpu()
@@ -356,7 +356,7 @@ def test_tma_b_corrected_read_formula():
     """P2: the consumer-shaped corrected read returns exactly the source
     word for every (n_in, kb, lane_c), on both stages (8192B apart) and a
     non-zero k_tile (FC2 pair second-tile analogue)."""
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     b_words = _make_b_source(device, n_tiles=1, k_tiles=4)
     src = b_words.cpu().view(_TILE_N, 16, 4)
@@ -379,7 +379,7 @@ def test_tma_b_gemm_bit_exact():
     reproduces the torch oracle bit-exactly (dyadic data, unit scales), on
     both stages (the fused gate/up granule halves are exactly stage 0/1 of
     this layout, 8192B apart)."""
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     torch.manual_seed(7)
     a_vals = torch.tensor([0.0, 0.5, 1.0, 2.0, -1.0, -0.5, 4.0, -2.0], device=device)

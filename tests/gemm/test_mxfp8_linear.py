@@ -1,7 +1,7 @@
 """gemm.mxfp8_linear: ModelOpt MXFP8 linear vs quantized reference, K-padding
 semantics, and CUDA-graph capture of the default fused path.
 
-Curated from sparkinfer tests/test_gemm_mxfp8_linear.py (kept whole — it was
+Curated from b12x tests/test_gemm_mxfp8_linear.py (kept whole — it was
 already tight).
 """
 
@@ -11,13 +11,13 @@ import cutlass.cute as cute
 import pytest
 import torch
 
-from sparkinfer.gemm import block_fp8_linear as bfl
-from sparkinfer.gemm import mxfp8_linear
-from sparkinfer.gemm._shared.wo_mxfp8 import (
+from b12x.gemm import block_fp8_linear as bfl
+from b12x.gemm import mxfp8_linear
+from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
 )
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def require_mxf8_mma() -> None:
@@ -75,7 +75,7 @@ def _make_inputs(tokens: int, in_features: int, out_features: int):
 
 
 def test_mm_matches_quantized_reference_small_n() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260614)
 
@@ -91,7 +91,7 @@ def test_mm_matches_quantized_reference_small_n() -> None:
 
 
 def test_mm_pads_k32_to_dense_tile() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260615)
 
@@ -117,7 +117,7 @@ def test_mm_pads_k32_to_dense_tile() -> None:
 
 
 def test_mm_default_fused_path_captures_with_k_padding() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260616)
 

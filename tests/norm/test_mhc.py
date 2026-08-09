@@ -4,14 +4,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparkinfer.norm import mhc
+from b12x.norm import mhc
 
-SPARKINFERMHCScratchCaps = mhc.Caps
-sparkinfer_mhc_post = mhc.run_post
-sparkinfer_mhc_post_pre = mhc.run_post_pre
+B12XMHCScratchCaps = mhc.Caps
+b12x_mhc_post = mhc.run_post
+b12x_mhc_post_pre = mhc.run_post_pre
 plan_mhc_scratch = mhc.plan
 
-from ..conftest import require_sparkinfer as require_sm120
+from ..conftest import require_b12x as require_sm120
 
 
 def _mhc_pre_reference(
@@ -102,7 +102,7 @@ def _make_mhc_binding(
 ):
     max_tokens = max(tokens, expected_m or tokens)
     plan = plan_mhc_scratch(
-        SPARKINFERMHCScratchCaps(
+        B12XMHCScratchCaps(
             device=device,
             max_tokens=max_tokens,
             hidden_size=hidden_size,
@@ -125,7 +125,7 @@ def _make_mhc_binding(
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
-def test_sparkinfer_mhc_fused_post_pre_match_reference(tokens: int) -> None:
+def test_b12x_mhc_fused_post_pre_match_reference(tokens: int) -> None:
     device = require_sm120()
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
@@ -152,7 +152,7 @@ def test_sparkinfer_mhc_fused_post_pre_match_reference(tokens: int) -> None:
     if tokens == 3:
         prev_post_arg = prev_post_arg.unsqueeze(-1).contiguous()
 
-    residual_cur, post, comb, y = sparkinfer_mhc_post_pre(
+    residual_cur, post, comb, y = b12x_mhc_post_pre(
         x,
         residual,
         prev_post_arg,
@@ -199,7 +199,7 @@ def test_sparkinfer_mhc_fused_post_pre_match_reference(tokens: int) -> None:
 
 
 @pytest.mark.parametrize("tokens", [1, 3])
-def test_sparkinfer_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> None:
+def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> None:
     device = require_sm120()
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
@@ -231,7 +231,7 @@ def test_sparkinfer_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int)
         sinkhorn_iters=20,
     )
 
-    residual_cur, post, comb, y = sparkinfer_mhc_post_pre(
+    residual_cur, post, comb, y = b12x_mhc_post_pre(
         x,
         residual,
         prev_post.contiguous(),
@@ -274,7 +274,7 @@ def test_sparkinfer_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
 
 
-def test_sparkinfer_mhc_fused_post_pre_graph_capture() -> None:
+def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
     device = require_sm120()
     tokens = 2
     hidden_size = 4096
@@ -307,7 +307,7 @@ def test_sparkinfer_mhc_fused_post_pre_graph_capture() -> None:
     comb = binding.comb_buffer
 
     def run() -> None:
-        sparkinfer_mhc_post_pre(
+        b12x_mhc_post_pre(
             x,
             residual,
             prev_post_arg,

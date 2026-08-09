@@ -16,8 +16,8 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer._lib.intrinsics import cvt_e8m0_to_f32, fabs_f32, fmax_f32, swizzle_block_scale
-from sparkinfer._lib.fp6 import (
+from b12x._lib.intrinsics import cvt_e8m0_to_f32, fabs_f32, fmax_f32, swizzle_block_scale
+from b12x._lib.fp6 import (
     _decode_fp6_e2m3,
     _decode_fp6_e3m2,
     build_fp6_decode_lut,
@@ -28,31 +28,31 @@ from sparkinfer._lib.fp6 import (
     pack_fp6_codes_tensor,
     quantize_grouped_mxfp6_torch,
 )
-from sparkinfer.moe._shared.kernels.mxfp6_moe import moe_mxfp6_quantize_input_block_containers
+from b12x.moe._shared.kernels.mxfp6_moe import moe_mxfp6_quantize_input_block_containers
 
 # TODO(port): the FP6 BS1 decode micro kernel's geometry/dispatch surface
 # (MXFP6_BLOCK_SIZE, _MAX_DIRECT_K_SEGMENTS, _mxfp6_micro_k_segments_for_k,
 # _mxfp6_micro_shapes_ok, is_supported_mxfp6) was not ported upstream, and the
-# historical b12x.integration.tp_moe host API (allocate_tp_moe_workspace /
-# b12x_moe_fp6 / clear_tp_moe_caches) has no sparkinfer equivalent. Tests that
+# retired pre-facade b12x.integration.tp_moe host API (allocate_tp_moe_workspace /
+# b12x_moe_fp6 / clear_tp_moe_caches) is not part of the current API. Tests that
 # depend on either are kept as reference behind pytest.skip gates; rewrite them
-# against sparkinfer.moe.fused_moe (quant_mode="w6a8_mx") once the run path
+# against b12x.moe.fused_moe (quant_mode="w6a8_mx") once the run path
 # lands. The decode/scale/quant primitive tests below remain live.
 try:
-    from sparkinfer.moe._shared.kernels.micro import (
+    from b12x.moe._shared.kernels.micro import (
         MXFP6_BLOCK_SIZE,
         _MAX_DIRECT_K_SEGMENTS,
         _mxfp6_micro_k_segments_for_k,
         _mxfp6_micro_shapes_ok,
         MoEMicroKernelBackend,
     )
-    from sparkinfer.moe._shared.kernels.silu import MoEMicroKernelSilu
+    from b12x.moe._shared.kernels.silu import MoEMicroKernelSilu
 
     _HAS_FP6_MICRO = True
 except ImportError:  # pragma: no cover - upstream has no FP6 micro kernel yet
     _HAS_FP6_MICRO = False
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 _FP6_MICRO_SKIP = "pending: FP6 micro kernel port (symbols not upstream)"
 
@@ -93,7 +93,7 @@ def _to_cute_tensor(x: torch.Tensor, dtype) -> cute.Tensor:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("fmt", ["e3m2", "e2m3"])
 def test_fp6_decode_lut_matches_host(fmt: str) -> None:
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
 
     lut = build_fp6_decode_lut(fmt, device=device)
@@ -158,7 +158,7 @@ def test_mxfp6_micro_shapes_predicate_rejects_invalid() -> None:
 def test_is_supported_mxfp6_default_off(monkeypatch) -> None:
     if not _HAS_FP6_MICRO:
         pytest.skip(_FP6_MICRO_SKIP)
-    monkeypatch.delenv("SPARKINFER_ENABLE_FP6_MICRO", raising=False)
+    monkeypatch.delenv("B12X_ENABLE_FP6_MICRO", raising=False)
     assert MoEMicroKernelBackend.is_supported_mxfp6(1, 2048, 512, 8, 256) is False
     assert MoEMicroKernelSilu.is_supported_mxfp6(1, 128, 128, 8, 4) is False
 
@@ -166,7 +166,7 @@ def test_is_supported_mxfp6_default_off(monkeypatch) -> None:
 def test_is_supported_mxfp6_opt_in(monkeypatch) -> None:
     if not _HAS_FP6_MICRO:
         pytest.skip(_FP6_MICRO_SKIP)
-    monkeypatch.setenv("SPARKINFER_ENABLE_FP6_MICRO", "1")
+    monkeypatch.setenv("B12X_ENABLE_FP6_MICRO", "1")
     assert MoEMicroKernelBackend.is_supported_mxfp6(1, 2048, 512, 8, 256) is True
     assert MoEMicroKernelSilu.is_supported_mxfp6(2, 2048, 512, 8, 256) is True
     # Shape predicate still applies when enabled.
@@ -177,7 +177,7 @@ def test_is_supported_mxfp6_env_falsey_values(monkeypatch) -> None:
     if not _HAS_FP6_MICRO:
         pytest.skip(_FP6_MICRO_SKIP)
     for val in ("0", "false", "off", "no", ""):
-        monkeypatch.setenv("SPARKINFER_ENABLE_FP6_MICRO", val)
+        monkeypatch.setenv("B12X_ENABLE_FP6_MICRO", val)
         assert MoEMicroKernelBackend.is_supported_mxfp6(1, 2048, 512, 8, 256) is False
 
 
@@ -237,7 +237,7 @@ class _Fp6GemvKernel:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("fmt", ["e3m2", "e2m3"])
 def test_fp6_gemv_inner_loop_matches_reference(fmt: str) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(0)
     device = torch.device("cuda")
     rows, k = 64, 256
@@ -300,7 +300,7 @@ class _Fp6SwizzledScaleKernel:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_fp6_swizzled_scale_addressing_matches_unswizzled() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(1)
     device = torch.device("cuda")
     rows, k = 128, 256  # rows multiple of 128 so the swizzle has no row padding
@@ -367,7 +367,7 @@ class _Fp6PackedDecodeKernel:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("fmt", ["e3m2", "e2m3"])
 def test_fp6_packed_weight_decode_matches_reference(fmt: str) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(2)
     device = torch.device("cuda")
     rows, k = 64, 256
@@ -453,7 +453,7 @@ class _Fp6ActQuantKernel:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("fmt_a", ["e3m2", "e2m3"])
 def test_fp6_activation_quant_matches_torch_reference(fmt_a: str) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(3)
     device = torch.device("cuda")
     rows, k = 8, 128
@@ -555,8 +555,8 @@ class _Fp6Fc1Kernel:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_fp6_fc1_gemv_on_production_storage() -> None:
-    require_sparkinfer()
-    from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+    require_b12x()
+    from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
     torch.manual_seed(4)
     device = torch.device("cuda")
@@ -687,8 +687,8 @@ class _Fp6Fc1GateKernel:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_fp6_fc1_gate_intermediate() -> None:
-    require_sparkinfer()
-    from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+    require_b12x()
+    from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
     torch.manual_seed(5)
     device = torch.device("cuda")
@@ -885,13 +885,13 @@ class _Fp6MoeBs1Kernel:
 @pytest.mark.parametrize("m", [1, 4])
 def test_fp6_moe_bs1_micro_matches_static(m: int) -> None:
     pytest.skip("pending: fused_moe-based rewrite")
-    require_sparkinfer()
-    from b12x.integration.tp_moe import (  # historical b12x reference (module TODO)
+    require_b12x()
+    from b12x.integration.tp_moe import (  # retired pre-facade API (module TODO)
         allocate_tp_moe_workspace,
         b12x_moe_fp6,
         clear_tp_moe_caches,
     )
-    from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+    from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
     clear_tp_moe_caches()
     torch.manual_seed(7)
@@ -978,13 +978,13 @@ def test_fp6_moe_bs1_micro_matches_static(m: int) -> None:
 @pytest.mark.parametrize("m", [1, 4])
 def test_fp6_micro_dispatch_matches_static_via_b12x_moe_fp6(monkeypatch, m: int) -> None:
     pytest.skip("pending: fused_moe-based rewrite")
-    require_sparkinfer()
-    from b12x.integration.tp_moe import (  # historical b12x reference (module TODO)
+    require_b12x()
+    from b12x.integration.tp_moe import (  # retired pre-facade API (module TODO)
         allocate_tp_moe_workspace,
         b12x_moe_fp6,
         clear_tp_moe_caches,
     )
-    from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+    from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
     torch.manual_seed(11)
     device = torch.device("cuda")
@@ -1015,9 +1015,9 @@ def test_fp6_micro_dispatch_matches_static_via_b12x_moe_fp6(monkeypatch, m: int)
         torch.cuda.synchronize()
         return out
 
-    monkeypatch.setenv("SPARKINFER_ENABLE_FP6_MICRO", "0")
+    monkeypatch.setenv("B12X_ENABLE_FP6_MICRO", "0")
     static_out = _run()
-    monkeypatch.setenv("SPARKINFER_ENABLE_FP6_MICRO", "1")
+    monkeypatch.setenv("B12X_ENABLE_FP6_MICRO", "1")
     micro_out = _run()
 
     cos = torch.nn.functional.cosine_similarity(
@@ -1035,13 +1035,13 @@ def test_fp6_micro_dispatch_matches_static_via_b12x_moe_fp6(monkeypatch, m: int)
 def test_fp6_micro_dispatch_larger_shapes(monkeypatch, m: int, k: int, n: int) -> None:
     """K/N > one CTA exercise the row-stride loops; K,N=512 the runtime blk loop."""
     pytest.skip("pending: fused_moe-based rewrite")
-    require_sparkinfer()
-    from b12x.integration.tp_moe import (  # historical b12x reference (module TODO)
+    require_b12x()
+    from b12x.integration.tp_moe import (  # retired pre-facade API (module TODO)
         allocate_tp_moe_workspace,
         b12x_moe_fp6,
         clear_tp_moe_caches,
     )
-    from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+    from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
     torch.manual_seed(23)
     device = torch.device("cuda")
@@ -1072,9 +1072,9 @@ def test_fp6_micro_dispatch_larger_shapes(monkeypatch, m: int, k: int, n: int) -
         torch.cuda.synchronize()
         return out
 
-    monkeypatch.setenv("SPARKINFER_ENABLE_FP6_MICRO", "0")
+    monkeypatch.setenv("B12X_ENABLE_FP6_MICRO", "0")
     static_out = _run()
-    monkeypatch.setenv("SPARKINFER_ENABLE_FP6_MICRO", "1")
+    monkeypatch.setenv("B12X_ENABLE_FP6_MICRO", "1")
     micro_out = _run()
 
     cos = torch.nn.functional.cosine_similarity(

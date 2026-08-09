@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from sparkinfer.gemm import mla_query_projection
+from b12x.gemm import mla_query_projection
 
 
 HEADS = 64

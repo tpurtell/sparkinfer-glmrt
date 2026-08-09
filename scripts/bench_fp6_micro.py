@@ -2,8 +2,8 @@
 """Decode-latency benchmark: MX-FP6 (W6A8) BS1 micro kernel vs dynamic fused path.
 
 Builds a synthetic routed-MoE layer, quantizes it to packed MX-FP6, then times
-the ``sparkinfer.moe.fused_moe`` plan/bind/run flow with
-``SPARKINFER_ENABLE_FP6_MICRO`` off (dynamic fused path) and on (BS1 decode
+the ``b12x.moe.fused_moe`` plan/bind/run flow with
+``B12X_ENABLE_FP6_MICRO`` off (dynamic fused path) and on (BS1 decode
 micro kernel). Reports per-call latency, speedup, and the cosine similarity
 between the two outputs so a regression in either is obvious.
 
@@ -68,8 +68,8 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this benchmark")
 
-    from sparkinfer.moe import fused_moe
-    from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+    from b12x.moe import fused_moe
+    from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
     # Fully-qualified device: the scratch binder compares device strings
     # exactly, and tensors allocated on "cuda" report "cuda:0".
@@ -166,7 +166,7 @@ def main() -> None:
                 torch.randn(m, topk, device=device), dim=-1
             ).float()
 
-            os.environ["SPARKINFER_ENABLE_FP6_MICRO"] = "0"
+            os.environ["B12X_ENABLE_FP6_MICRO"] = "0"
             run = make_runner(m, x, topk_ids, topk_weights)
             dyn_out = run().clone()
 
@@ -182,7 +182,7 @@ def main() -> None:
             )
             t_dyn = _bench_once(run, args.iters, args.warmup)
 
-            os.environ["SPARKINFER_ENABLE_FP6_MICRO"] = "1"
+            os.environ["B12X_ENABLE_FP6_MICRO"] = "1"
             run = make_runner(m, x, topk_ids, topk_weights)
             micro_out = run().clone()
             check_outputs(
@@ -199,7 +199,7 @@ def main() -> None:
             speedup = t_dyn / t_micro if t_micro > 0 else float("nan")
             print(f"{m:>4} {t_dyn:>12.4f} {t_micro:>12.4f} {speedup:>9.2f} {cos:>9.4f}")
     finally:
-        os.environ.pop("SPARKINFER_ENABLE_FP6_MICRO", None)
+        os.environ.pop("B12X_ENABLE_FP6_MICRO", None)
 
 
 if __name__ == "__main__":

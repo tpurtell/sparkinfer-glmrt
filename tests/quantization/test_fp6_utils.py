@@ -4,7 +4,7 @@ import cutlass
 import pytest
 import torch
 
-from sparkinfer._lib.utils import (
+from b12x._lib.utils import (
     MXFP6_MMA_K,
     MXFP6_SF_DTYPE_STR,
     MXFP6_SF_VEC_SIZE,

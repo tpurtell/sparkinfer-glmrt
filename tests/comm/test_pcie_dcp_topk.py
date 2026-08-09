@@ -3,49 +3,62 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_dcp_topk import (
+from b12x.comm.pcie.pcie_dcp_topk import (
     PCIeDCPTopKOwnerExchange,
+    _SIGNAL_BYTES,
     _candidate_staging_layout,
     owner_stage_reference,
 )
+from b12x.comm.pcie._dcp_cute_common import signal_bytes
 
 
-class _FakeExt:
+class _FakeOwner(PCIeDCPTopKOwnerExchange):
     def __init__(self) -> None:
+        super().__init__(
+            rank=1,
+            world_size=2,
+            device="cpu",
+            signal_ptrs=(10, 20),
+            staging0_ptrs=(30, 40),
+            staging1_ptrs=(62, 72),
+            max_rows=8,
+            topk=4,
+        )
+        shape = (self.max_owner_rows, self.world_size * self.topk)
+        self._candidate_views = tuple(
+            (
+                torch.empty(shape, dtype=torch.int32),
+                torch.empty(shape, dtype=torch.float32),
+            )
+            for _ in range(2)
+        )
         self.stage_calls: list[tuple] = []
-        self.dispose_owner_calls: list[int] = []
 
-    def init_dcp_topk_owner_exchange(self, *args):
-        return 1234
-
-    def stage_owner_candidates(
-        self, pointer, local_indices, local_scores, threads, block_limit
+    def _launch_stage(
+        self,
+        local_indices,
+        local_scores,
+        *,
+        slot,
+        rows,
+        threads,
+        blocks,
+        wait_for_prior_consumer,
     ):
-        world_size = 2
-        rank = 1
-        owner_rows = local_indices.shape[0] // world_size
-        row_slice = slice(rank * owner_rows, (rank + 1) * owner_rows)
-        indices = local_indices[row_slice].repeat(1, world_size)
-        scores = local_scores[row_slice].repeat(1, world_size)
-        self.stage_calls.append((pointer, threads, block_limit))
-        return indices, scores
+        owner_rows = rows // self.world_size
+        row_slice = slice(self.rank * owner_rows, (self.rank + 1) * owner_rows)
+        views = self._candidate_views[slot]
+        views[0][:owner_rows].copy_(
+            local_indices[row_slice].repeat(1, self.world_size)
+        )
+        views[1][:owner_rows].copy_(
+            local_scores[row_slice].repeat(1, self.world_size)
+        )
+        self.stage_calls.append((slot, threads, blocks, wait_for_prior_consumer))
 
-    def dispose_owner_exchange(self, pointer):
-        self.dispose_owner_calls.append(pointer)
 
-
-def _make_owner(ext: _FakeExt | None = None) -> PCIeDCPTopKOwnerExchange:
-    return PCIeDCPTopKOwnerExchange(
-        rank=1,
-        world_size=2,
-        device="cpu",
-        signal_ptrs=(10, 20),
-        staging0_ptrs=(30, 40),
-        staging1_ptrs=(50, 60),
-        max_rows=8,
-        topk=4,
-        ext_module=ext or _FakeExt(),
-    )
+def _make_owner() -> PCIeDCPTopKOwnerExchange:
+    return _FakeOwner()
 
 
 def test_candidate_staging_layout_is_aligned():
@@ -60,6 +73,10 @@ def test_candidate_staging_layout_is_aligned():
     assert owner.slot_bytes == 256
     assert owner.staging1_offset == 1024
     assert owner.slab_bytes == 1280
+
+
+def test_topk_signal_layout_matches_the_shared_barrier_abi():
+    assert signal_bytes(128) == _SIGNAL_BYTES
 
 
 def test_owner_stage_reference_preserves_rank_major_order_and_score_bits():
@@ -89,8 +106,7 @@ def test_owner_stage_reference_preserves_rank_major_order_and_score_bits():
 
 
 def test_owner_dispatches_and_disposes():
-    ext = _FakeExt()
-    owner = _make_owner(ext)
+    owner = _make_owner()
     indices = torch.arange(32, dtype=torch.int32).reshape(8, 4)
     scores = torch.arange(32, dtype=torch.float32).reshape(8, 4) / 10
 
@@ -102,10 +118,57 @@ def test_owner_dispatches_and_disposes():
     )
     assert torch.equal(candidate_indices, indices[4:].repeat(1, 2))
     assert torch.equal(candidate_scores, scores[4:].repeat(1, 2))
-    assert ext.stage_calls == [(1234, 128, 32)]
+    assert owner.stage_calls == [(0, 128, 1, False)]
 
     owner.close()
-    assert ext.dispose_owner_calls == [1234]
+    assert owner._closed
+
+
+@pytest.mark.parametrize("eager_calls, expected_slot", [(0, 0), (1, 1), (2, 0)])
+def test_graph_capture_pins_the_next_staging_slot_and_enables_prior_wait(
+    monkeypatch,
+    eager_calls,
+    expected_slot,
+):
+    owner = _make_owner()
+    indices = torch.arange(32, dtype=torch.int32).reshape(8, 4)
+    scores = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    capture_state = False
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_topk._is_current_stream_capturing",
+        lambda _device: capture_state,
+    )
+    monkeypatch.setattr(owner, "prepare_graph", lambda **kwargs: None)
+    monkeypatch.setattr(
+        "b12x.comm.pcie._dcp_topk_cute.is_topk_stage_prepared",
+        lambda *args: True,
+    )
+
+    for _ in range(eager_calls):
+        owner.stage_candidates(indices, scores)
+    capture_state = True
+    with owner.capture():
+        first_indices, first_scores = owner.stage_candidates(indices, scores)
+    capture_state = False
+    second_indices, second_scores = owner.stage_candidates(indices + 100, scores + 1)
+    capture_state = True
+    with owner.capture():
+        third_indices, third_scores = owner.stage_candidates(indices + 200, scores + 2)
+
+    assert owner._graph_slot == expected_slot
+    assert first_indices.data_ptr() == second_indices.data_ptr()
+    assert second_indices.data_ptr() == third_indices.data_ptr()
+    assert first_scores.data_ptr() == second_scores.data_ptr()
+    assert second_scores.data_ptr() == third_scores.data_ptr()
+    eager_stages = [
+        (slot % 2, 512, 1, False) for slot in range(eager_calls)
+    ]
+    assert owner.stage_calls == eager_stages + [
+        (expected_slot, 512, 1, True),
+        (expected_slot, 512, 1, True),
+        (expected_slot, 512, 1, True),
+    ]
+    assert torch.equal(third_indices, (indices + 200)[4:].repeat(1, 2))
 
 
 def test_owner_rejects_invalid_contracts():
@@ -147,5 +210,4 @@ def test_configuration_rejects_invalid_capacity_and_topk():
             staging1_ptrs=(9, 10, 11, 12),
             max_rows=6,
             topk=4,
-            ext_module=_FakeExt(),
         )

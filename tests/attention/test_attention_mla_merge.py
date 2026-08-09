@@ -5,9 +5,9 @@ from dataclasses import dataclass
 
 import torch
 
-import sparkinfer.attention._shared.mla.merge as mla_merge
+import b12x.attention._shared.mla.merge as mla_merge
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 _HEAD_DIM = 512
@@ -221,7 +221,7 @@ def _assert_replay_matches_oracle(
 
 
 def _run_fixed_merge_graph_case(*, with_sink: bool) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     rows = 4
     heads = 32
     chunks = 5

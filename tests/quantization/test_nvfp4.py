@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer._lib.intrinsics import quantize_grouped_nvfp4_torch
-from sparkinfer.quantization import nvfp4
+from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x.quantization import nvfp4
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def test_run_matches_torch_grouped_quantizer() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260720)
 
     m, k = 256, 512
@@ -31,7 +31,7 @@ def test_run_matches_torch_grouped_quantizer() -> None:
     )
     # Invert as_grouped_scale_view's logical permutation to recover the
     # physical contiguous scale-storage contract the TMA kernel writes
-    # (mirrors sparkinfer tests/test_bf16_to_fp4_tma.py).
+    # (mirrors b12x tests/test_bf16_to_fp4_tma.py).
     ref_scales = ref_scale_view.permute(5, 2, 4, 0, 1, 3).contiguous().view(torch.uint8)
 
     plan = nvfp4.plan(m, k)

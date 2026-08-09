@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""Validate a converted MX-FP6 MoE layer artifact against the sparkinfer FP6 kernel.
+"""Validate a converted MX-FP6 MoE layer artifact against the b12x FP6 kernel.
 
 Loads a ``layer_{L}.moe_fp6.safetensors`` produced by
 ``scripts/quantize_model_fp6.py`` (or ``scripts/quantize_moe_fp6.py``), checks
 its tensors match the kernel's input contract, then actually runs it through
-``sparkinfer.moe.fused_moe`` (quant_mode ``w6a8_mx``) on random tokens at
+``b12x.moe.fused_moe`` (quant_mode ``w6a8_mx``) on random tokens at
 several token counts and asserts the output is the right shape, finite, and
 non-zero.
 
@@ -22,7 +22,7 @@ import time
 
 import torch
 
-from sparkinfer.quantization.mxfp6 import load_fp6_moe_weights
+from b12x.quantization.mxfp6 import load_fp6_moe_weights
 
 
 def _act_fmt_for_source(source_format: str) -> str:
@@ -41,7 +41,7 @@ def _fast_dequant(packed_2d, swizzled_scales, num_fp6, fmt, gs=1.0):
     rather than the per-element Python loop in ``dequant_mxfp6_torch`` (which is
     intractable at E=256/K=2048).
     """
-    from sparkinfer._lib.fp6 import (
+    from b12x._lib.fp6 import (
         _fp6_e2m3_lut,
         _fp6_e3m2_lut,
         expand_mxfp6_packed_to_bytes,
@@ -72,7 +72,7 @@ def _fast_qdq(x, fmt):
     64-entry LUT, then dequant. Fully tensorized over ``(rows, K)`` -- no per-element
     Python loops or ``.item()`` syncs (the reason the naive path took ~an hour).
     """
-    from sparkinfer._lib.fp6 import (
+    from b12x._lib.fp6 import (
         FLOAT6_E2M3_MAX,
         FLOAT6_E3M2_MAX,
         _fp6_e2m3_lut,
@@ -145,7 +145,7 @@ def _unswizzle_grid(swizzled: torch.Tensor, rows: int, num_blocks: int) -> torch
     ``prepare_weights`` validates UNswizzled grids and applies the MMA swizzle
     itself; the artifact stores the already-swizzled bytes, so invert them.
     """
-    from sparkinfer._lib.fp6 import unswizzle_mxfp6_scales
+    from b12x._lib.fp6 import unswizzle_mxfp6_scales
 
     return torch.stack(
         [unswizzle_mxfp6_scales(swizzled[eid], rows, num_blocks)
@@ -154,8 +154,8 @@ def _unswizzle_grid(swizzled: torch.Tensor, rows: int, num_blocks: int) -> torch
 
 
 def _run(x, weights, topk_ids, topk_weights):
-    """Run the artifact through sparkinfer.moe.fused_moe (quant_mode w6a8_mx)."""
-    from sparkinfer.moe import fused_moe
+    """Run the artifact through b12x.moe.fused_moe (quant_mode w6a8_mx)."""
+    from b12x.moe import fused_moe
 
     device = x.device
     m, k = x.shape

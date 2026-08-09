@@ -6,10 +6,10 @@ import cutlass.cute as cute
 import pytest
 import torch
 
-from sparkinfer.gemm import tensor_fp8_linear
-from sparkinfer.gemm.tensor_fp8_linear import api as tensor_fp8_api
+from b12x.gemm import tensor_fp8_linear
+from b12x.gemm.tensor_fp8_linear import api as tensor_fp8_api
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def require_mxf8_mma() -> None:
@@ -34,7 +34,7 @@ def _make_inputs(tokens: int, in_features: int, out_features: int):
 
 
 def test_mm_matches_static_tensor_fp8_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260729)
 
@@ -53,7 +53,7 @@ def test_mm_matches_static_tensor_fp8_reference() -> None:
 
 
 def test_mm_pads_k32_to_dense_tile() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260730)
 
@@ -76,7 +76,7 @@ def test_mm_pads_k32_to_dense_tile() -> None:
 
 
 def test_mm_uses_plain_fp8_mma_not_scale_storage() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260731)
 
@@ -107,7 +107,7 @@ def test_is_supported_honors_kernel_probe(monkeypatch) -> None:
 
 
 def test_mm_default_path_captures() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260801)
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from sparkinfer.quantization.mxfp6.fp6_checkpoint import (
+from b12x.quantization.mxfp6.fp6_checkpoint import (
     load_act_fmt_overrides,
     parse_act_fmt_overrides,
     resolve_activation_format,
@@ -72,7 +72,7 @@ def test_parse_rejects_bad_fmt() -> None:
 
 
 def test_load_merges_env_before_config(monkeypatch) -> None:
-    monkeypatch.setenv("SPARKINFER_FP6_ACT_FMT_OVERRIDES", "*.linear_attn.*=e2m3")
+    monkeypatch.setenv("B12X_FP6_ACT_FMT_OVERRIDES", "*.linear_attn.*=e2m3")
     qcfg = {"activation_format_overrides": {"*.linear_attn.*": "e3m2", "*.mlp.*": "e4m3"}}
     got = load_act_fmt_overrides(qcfg)
     # Env first: first match for linear_attn is e2m3, not the config e3m2.

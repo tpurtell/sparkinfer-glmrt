@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention._shared.mla import api, traits
-from sparkinfer.attention._shared.mla.kernel import run_unified_decode
-from sparkinfer.attention._shared.mla.prefill_mg import run_unified_prefill_mg
-from sparkinfer.attention._shared.mla.smem import make_smem_layout
-from sparkinfer.attention._shared.mla.traits import ComputeMode, ModelType, ScaleFormat
+from b12x.attention._shared.mla import api, traits
+from b12x.attention._shared.mla.kernel import run_unified_decode
+from b12x.attention._shared.mla.prefill_mg import run_unified_prefill_mg
+from b12x.attention._shared.mla.smem import make_smem_layout
+from b12x.attention._shared.mla.traits import ComputeMode, ModelType, ScaleFormat
 
 
 def test_nvfp4_decode_allocates_bf16_q_staging() -> None:

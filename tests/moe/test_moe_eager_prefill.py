@@ -12,12 +12,12 @@ from benchmarks.benchmark_moe import (
     load_expert_weights,
     make_routed_inputs,
 )
-from sparkinfer.moe.fused_moe._impl import (
+from b12x.moe.fused_moe._impl import (
     clear_tp_moe_caches,
 )
-from sparkinfer.moe._shared.kernels.reference import compare_to_reference, moe_reference_nvfp4
+from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_nvfp4
 
-from tests._reference.helpers import prepare_tp_moe_fp4_experts, require_sparkinfer, run_tp_moe_fp4
+from tests._reference.helpers import prepare_tp_moe_fp4_experts, require_b12x, run_tp_moe_fp4
 
 
 def _require_model_weights() -> None:
@@ -39,7 +39,7 @@ def _make_spec() -> ModelSpec:
 
 
 def test_moe_eager_prefill_matches_oracle_across_shapes() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_model_weights()
 
     clear_tp_moe_caches()

@@ -1,23 +1,23 @@
 # MX-FP6 vLLM integration
 
-sparkinfer is a **called library**: vLLM does not auto-discover its kernels.
+b12x is a **called library**: vLLM does not auto-discover its kernels.
 FP4 works today because the maintainer's vLLM fork contains a private shim under
-``sparkinfer/integration/`` (``tp_moe.py``, ``mla.py``, ...).  FP6 follows the
-same pattern via ``sparkinfer/integration/vllm/``.
+``b12x/integration/`` (``tp_moe.py``, ``mla.py``, ...).  FP6 follows the
+same pattern via ``b12x/integration/vllm/``.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     subgraph vllmFork [vLLM fork]
-        Plugin["plugin.py register_sparkinfer_fp6"]
-        Config["SparkInferFp6Config"]
+        Plugin["plugin.py register_b12x_fp6"]
+        Config["B12XFp6Config"]
         Plugin --> Config
     end
-    subgraph shim [sparkinfer.integration.vllm]
+    subgraph shim [b12x.integration.vllm]
         Config --> Serving["fp6_serving.py"]
     end
-    subgraph spark [sparkinfer public API]
+    subgraph spark [b12x public API]
         Serving --> FusedMoE["moe.fused_moe w6a8_mx"]
         Serving --> DenseOp["quantization.mxfp6 dense"]
         Serving --> Gemv["gemm.bf16_gemv"]
@@ -26,9 +26,9 @@ flowchart LR
 
 ## Checkpoint detection
 
-A model is routed to sparkinfer FP6 when **both** are true:
+A model is routed to b12x FP6 when **both** are true:
 
-1. ``SPARKINFER_ENABLE_FP6=1`` (legacy ``B12X_ENABLE_FP6`` also accepted)
+1. ``B12X_ENABLE_FP6=1``
 2. ``config.json`` contains:
 
    ```json
@@ -52,7 +52,7 @@ Produce checkpoints with ``scripts/quantize_model_fp6.py``.
 
 1. vLLM loader places packed weights + unswizzled scales into registered params.
 2. ``process_weights_after_loading`` swizzles scales once, builds
-   ``FP6DenseWeight``, registers ``sparkinfer::fp6_dense_linear``.
+   ``FP6DenseWeight``, registers ``b12x::fp6_dense_linear``.
 3. ``apply`` calls the opaque custom op (CUDA-graph safe).
 
 ### MoE (``w6a8_mx``)
@@ -83,15 +83,15 @@ Copy (or symlink) these files into the private integration tree of a vLLM fork
 that already carries the FP4 glue:
 
 ```text
-sparkinfer/integration/vllm/fp6_serving.py
-sparkinfer/integration/vllm/plugin.py
-sparkinfer/integration/vllm/__init__.py
+b12x/integration/vllm/fp6_serving.py
+b12x/integration/vllm/plugin.py
+b12x/integration/vllm/__init__.py
 ```
 
 Register the entry point as documented in
-[sparkinfer/integration/vllm/README.md](../sparkinfer/integration/vllm/README.md).
+[b12x/integration/vllm/README.md](../b12x/integration/vllm/README.md).
 
-No changes to sparkinfer kernel code are required — the shim only calls the
+No changes to b12x kernel code are required — the shim only calls the
 public ``fused_moe`` and ``quantization.mxfp6`` surfaces validated in Phase 1.
 
 ## KLD / determinism
@@ -99,7 +99,7 @@ public ``fused_moe`` and ``quantization.mxfp6`` surfaces validated in Phase 1.
 For bit-identical KLD scoring:
 
 ```bash
-export SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=1
+export B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1
 export TORCH_COMPILE_DISABLE=1
 ```
 

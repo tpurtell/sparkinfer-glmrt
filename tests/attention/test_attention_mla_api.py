@@ -5,8 +5,8 @@ import math
 import pytest
 import torch
 
-from sparkinfer.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, sparse_mla_decode_forward, sparse_mla_extend_forward
-from sparkinfer.attention._shared.mla.packed import extract_packed_kv_runtime_views
+from b12x.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, sparse_mla_decode_forward, sparse_mla_extend_forward
+from b12x.attention._shared.mla.packed import extract_packed_kv_runtime_views
 
 
 class _FakeMLAWorkspace:
@@ -95,7 +95,7 @@ class _FakeMLAWorkspace:
         cache_seqlens_int32: torch.Tensor,
         nsa_cache_seqlens_int32: torch.Tensor,
     ):
-        from sparkinfer.attention.sparse_mla._scratch import build_sparse_mla_binding
+        from b12x.attention.sparse_mla._scratch import build_sparse_mla_binding
 
         return build_sparse_mla_binding(
             scratch=self,
@@ -207,7 +207,7 @@ def test_sparse_mla_decode_keeps_query_head_shape(monkeypatch) -> None:
         return q_all[:, :, :v_head_dim].clone()
 
     monkeypatch.setattr(
-        "sparkinfer.attention._shared.mla.api.sparse_mla_reference",
+        "b12x.attention._shared.mla.api.sparse_mla_reference",
         fake_sparse_mla_reference,
     )
 
@@ -258,7 +258,7 @@ def test_sparse_mla_decode_with_lse_uses_reference_lse_base2(monkeypatch) -> Non
         return output, lse
 
     monkeypatch.setattr(
-        "sparkinfer.attention._shared.mla.api.sparse_mla_reference",
+        "b12x.attention._shared.mla.api.sparse_mla_reference",
         fake_sparse_mla_reference,
     )
 
@@ -312,7 +312,7 @@ def test_sparse_mla_decode_with_lse_natural_scales_reference_lse(
         return output, lse
 
     monkeypatch.setattr(
-        "sparkinfer.attention._shared.mla.api.sparse_mla_reference",
+        "b12x.attention._shared.mla.api.sparse_mla_reference",
         fake_sparse_mla_reference,
     )
 
@@ -359,7 +359,7 @@ def test_sparse_mla_extend_passes_runtime_metadata(monkeypatch) -> None:
         return q_all[:, :8, :].clone()
 
     monkeypatch.setattr(
-        "sparkinfer.attention._shared.mla.api.sparse_mla_reference",
+        "b12x.attention._shared.mla.api.sparse_mla_reference",
         fake_sparse_mla_reference,
     )
 
@@ -458,7 +458,7 @@ def test_sparse_mla_verify_uses_reference_when_sm120_unavailable(monkeypatch) ->
         return q_all[:, :, :v_head_dim].clone()
 
     monkeypatch.setattr(
-        "sparkinfer.attention._shared.mla.api.sparse_mla_reference",
+        "b12x.attention._shared.mla.api.sparse_mla_reference",
         fake_sparse_mla_reference,
     )
 
@@ -509,7 +509,7 @@ def test_sparse_mla_extend_uses_reference_when_sm120_unavailable(monkeypatch) ->
         return q_all[:, :, :v_head_dim].clone()
 
     monkeypatch.setattr(
-        "sparkinfer.attention._shared.mla.api.sparse_mla_reference",
+        "b12x.attention._shared.mla.api.sparse_mla_reference",
         fake_sparse_mla_reference,
     )
 
@@ -582,7 +582,7 @@ def test_sparse_mla_extend_passes_active_token_counts_to_reference(monkeypatch) 
         return q_all[:, :, :v_head_dim].clone()
 
     monkeypatch.setattr(
-        "sparkinfer.attention._shared.mla.api.sparse_mla_reference",
+        "b12x.attention._shared.mla.api.sparse_mla_reference",
         fake_sparse_mla_reference,
     )
 

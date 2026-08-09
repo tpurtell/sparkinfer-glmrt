@@ -9,11 +9,11 @@ from __future__ import annotations
 import pytest
 
 
-def require_sparkinfer():
+def require_b12x():
     """Skip unless running on a consumer-Blackwell (SM120/SM121) GPU."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
-        pytest.skip("CUDA required for experimental sparkinfer tests")
+        pytest.skip("CUDA required for experimental b12x tests")
     major, minor = torch.cuda.get_device_capability(torch.device("cuda"))
     if major != 12 or minor not in (0, 1):
         pytest.skip(f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}")

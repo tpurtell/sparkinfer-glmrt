@@ -17,8 +17,8 @@ cuda_required = pytest.mark.skipif(
 
 def _gemm_operands(m: int, n: int, k: int, source_format: str):
     """Quantized operands for one case, mirroring ``dense_fp6_linear_expanded``."""
-    from sparkinfer._lib.fp6 import SF_VEC_SIZE_FP6, as_grouped_mxfp6_scale_view
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x._lib.fp6 import SF_VEC_SIZE_FP6, as_grouped_mxfp6_scale_view
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         _TILE,
         _quantize_matrix_fp6_bytes,
         quantize_dense_weight_to_fp6,
@@ -57,16 +57,16 @@ def _gemm_operands(m: int, n: int, k: int, source_format: str):
 @pytest.mark.parametrize(
     "m,n,k,source_format",
     [
-        (1, 6144, 512, "e2m3"),  # (16,128) decode tile, 4 K-tiles
+        (1, 6144, 512, "e2m3"),  # decode tile (heuristic (16,64)), 4 K-tiles
         (1, 6144, 512, "e3m2"),  # same tile, other FP6 sub-format
         (3, 6144, 512, "e2m3"),  # MTP verify shape, same tile
-        (5, 6144, 512, "e2m3"),  # (64,128) small-M coarse tile
+        (5, 6144, 512, "e2m3"),  # small-M shape, same decode tile
         (128, 256, 256, "e2m3"),  # small square, 2 K-tiles
         (128, 6144, 512, "e2m3"),  # prefill-ish wide-N tile
     ],
 )
 def test_b_packed_matches_b_preexpanded(m, n, k, source_format):
-    from sparkinfer._lib.dense_gemm import dense_gemm
+    from b12x._lib.dense_gemm import dense_gemm
 
     fp6w, a_operand, b_sf, common = _gemm_operands(m, n, k, source_format)
 
@@ -91,7 +91,7 @@ def test_b_packed_matches_b_preexpanded(m, n, k, source_format):
 
 @cuda_required
 def test_b_packed_rejects_bad_shapes():
-    from sparkinfer._lib.dense_gemm import dense_gemm
+    from b12x._lib.dense_gemm import dense_gemm
 
     fp6w, a_operand, b_sf, common = _gemm_operands(1, 256, 256, "e2m3")
     y = torch.empty((1, 256, 1), device="cuda", dtype=torch.bfloat16)
@@ -116,6 +116,47 @@ def test_b_packed_rejects_bad_shapes():
 
 
 @cuda_required
+def test_dense_gemm_rejects_misaligned_row_scale():
+    from b12x._lib.dense_gemm import dense_gemm
+
+    fp6w, a_operand, b_sf, common = _gemm_operands(1, 256, 256, "e2m3")
+    out = torch.empty((1, 256, 1), device="cuda", dtype=torch.bfloat16)
+    storage = torch.ones(2, device="cuda", dtype=torch.bfloat16)
+    row_scale = storage[1:]
+    assert row_scale.is_contiguous() and row_scale.data_ptr() % 16 != 0
+
+    with pytest.raises(ValueError, match="row_scale"):
+        dense_gemm(
+            a_operand,
+            (fp6w.expanded_weight(), b_sf),
+            out=out,
+            b_preexpanded=True,
+            row_scale=row_scale,
+            **common,
+        )
+
+
+@cuda_required
+@pytest.mark.parametrize("missing", ["x", "scale"])
+def test_dense_gemm_requires_fused_inputs_as_a_pair(missing):
+    from b12x._lib.dense_gemm import dense_gemm
+
+    fp6w, a_operand, b_sf, common = _gemm_operands(1, 256, 256, "e2m3")
+    out = torch.empty((1, 256, 1), device="cuda", dtype=torch.bfloat16)
+    x = torch.zeros((1, 256), device="cuda", dtype=torch.bfloat16)
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="provided together"):
+        dense_gemm(
+            a_operand,
+            (fp6w.expanded_weight(), b_sf),
+            out=out,
+            b_preexpanded=True,
+            x_bf16=None if missing == "x" else x,
+            w_gscale=None if missing == "scale" else scale,
+            **common,
+        )
+@cuda_required
 @pytest.mark.parametrize("m", [1, 3, 128])
 def test_linear_autodetects_packed_weight(m):
     """``dense_fp6_linear_expanded`` must route a packed weight via b_packed.
@@ -124,7 +165,7 @@ def test_linear_autodetects_packed_weight(m):
     wide-N layers) into one shared entry point; format detection from the K
     extent must yield bit-identical results to the expanded path.
     """
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear_expanded,
         quantize_dense_weight_to_fp6,
     )
@@ -153,7 +194,7 @@ def test_gemm_weight_selection_threshold(monkeypatch):
     returned, no expansion is materialized, and the end-to-end linear stays
     bit-identical to the expanded path.
     """
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+    import b12x.quantization.mxfp6.fp6_dense_weights as fdw
 
     torch.manual_seed(0)
     n, k = 6144, 512
@@ -178,9 +219,9 @@ def test_gemm_weight_selection_threshold(monkeypatch):
 
 @cuda_required
 def test_custom_op_accepts_packed_weight():
-    """The opaque ``sparkinfer::fp6_dense_linear`` op works with a packed weight arg."""
-    import sparkinfer.quantization.mxfp6.fp6_dense_op  # noqa: F401
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import quantize_dense_weight_to_fp6
+    """The opaque ``b12x::fp6_dense_linear`` op works with a packed weight arg."""
+    import b12x.quantization.mxfp6.fp6_dense_op  # noqa: F401
+    from b12x.quantization.mxfp6.fp6_dense_weights import quantize_dense_weight_to_fp6
 
     torch.manual_seed(0)
     n, k = 6144, 512
@@ -189,6 +230,6 @@ def test_custom_op_accepts_packed_weight():
     x = (torch.randn(1, k, device="cuda") * 0.1).to(torch.bfloat16)
 
     args = (fp6w.scale_storage, fp6w.global_scale, fp6w.fmt, n, k)
-    y_exp = torch.ops.sparkinfer.fp6_dense_linear(x, fp6w.expanded_weight(), *args)
-    y_pk = torch.ops.sparkinfer.fp6_dense_linear(x, fp6w.packed, *args)
+    y_exp = torch.ops.b12x.fp6_dense_linear(x, fp6w.expanded_weight(), *args)
+    y_pk = torch.ops.b12x.fp6_dense_linear(x, fp6w.packed, *args)
     torch.testing.assert_close(y_pk, y_exp, rtol=0.0, atol=0.0)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sparkinfer.gemm._shared.wo_mxfp8 import _should_use_exact_b16_wo
+from b12x.gemm._shared.wo_mxfp8 import _should_use_exact_b16_wo
 
 
 def test_exact_b16_wo_is_spark_only() -> None:

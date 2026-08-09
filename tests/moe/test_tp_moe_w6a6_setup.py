@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-# TODO(port): this whole suite exercised the historical b12x.integration.tp_moe
+# TODO(port): this whole suite exercised the retired pre-facade b12x.integration.tp_moe
 # host layer (quant-mode normalization, workspace planning, and
-# prepare_b12x_fp6_moe_weights), which has no upstream sparkinfer equivalent.
+# prepare_b12x_fp6_moe_weights), which is not part of the current API.
 # The test bodies are kept as reference behind pytest.skip gates; rewrite them
-# against sparkinfer.moe.fused_moe plan_weights/prepare_weights/plan/bind/run
+# against b12x.moe.fused_moe plan_weights/prepare_weights/plan/bind/run
 # (quant_mode="w6a8_mx", source_format="mxfp6_e2m3") once the w6a8_mx run path
 # lands.
 
 import pytest
 
-from sparkinfer._lib.utils import mxfp6_packed_k_bytes
+from b12x._lib.utils import mxfp6_packed_k_bytes
 
 
 def _tp_moe():
-    from b12x.integration import tp_moe  # historical b12x reference (module TODO)
+    from b12x.integration import tp_moe  # retired pre-facade API (module TODO)
 
     return tp_moe
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.gemm._shared.wo_mxfp8 import (
+from b12x.gemm._shared.wo_mxfp8 import (
     FP8_E4M3_MAX,
     MXFP8Rows,
     WO_A_INPUT_QUANT_GROUP_SIZE,
@@ -28,7 +28,7 @@ from sparkinfer.gemm._shared.wo_mxfp8 import (
     wo_projection_mxfp8,
 )
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def _assert_close_bf16(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -158,7 +158,7 @@ def _sglang_wo_a_input_quant_reference(source_tgd: torch.Tensor) -> MXFP8Rows:
 
 
 def test_pack_mxfp8_scales_round_trips_grouped_rows() -> None:
-    require_sparkinfer()
+    require_b12x()
 
     groups, m, k = 3, 5, 256
     sf_k = k // 32
@@ -187,7 +187,7 @@ def test_pack_mxfp8_scales_round_trips_grouped_rows() -> None:
 
 
 def test_pack_fp8_block_scaled_weight_expands_grouped_scales() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260523)
 
     groups, m, k = 2, 129, 256
@@ -242,7 +242,7 @@ def test_pack_fp8_block_scaled_weight_expands_grouped_scales() -> None:
 
 
 def test_pack_fp8_block_scaled_weight_accepts_float_scales() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260524)
 
     groups, m, k = 4, 1024, 4096
@@ -291,7 +291,7 @@ def test_pack_fp8_block_scaled_weight_accepts_float_scales() -> None:
 
 
 def test_quantize_mxfp8_rows_dequantizes_on_gpu() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260522)
 
     source = (
@@ -310,7 +310,7 @@ def test_quantize_mxfp8_rows_dequantizes_on_gpu() -> None:
 
 
 def test_wo_activation_quant_kernels_match_gpu_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31000)
 
     tokens, groups, group_width, rank = 3, 4, 512, 64
@@ -378,7 +378,7 @@ def test_wo_activation_quant_kernels_match_gpu_reference() -> None:
 
 
 def test_wo_a_inv_rope_input_quant_uses_mxfp8_32_column_groups() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31005)
 
     tokens = 3
@@ -437,7 +437,7 @@ def test_wo_a_inv_rope_input_quant_uses_mxfp8_32_column_groups() -> None:
 
 
 def test_wo_b_dense_gemm_ignores_poisoned_activation_scale_padding() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31006)
 
     tokens, rank, groups, hidden = 1, 1024, 4, 128
@@ -488,7 +488,7 @@ def test_wo_b_dense_gemm_ignores_poisoned_activation_scale_padding() -> None:
 
 
 def test_wo_a_dense_gemm_ignores_poisoned_activation_scale_padding() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31008)
 
     tokens, groups, heads_per_group = 1, 2, 4
@@ -558,7 +558,7 @@ def test_wo_a_dense_gemm_ignores_poisoned_activation_scale_padding() -> None:
 
 
 def test_wo_a_dense_gemm_mxfp8_matches_quantized_gpu_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31001)
 
     tokens, groups, group_width, rank = 2, 2, 128, 64
@@ -587,7 +587,7 @@ def test_wo_a_dense_gemm_mxfp8_matches_quantized_gpu_reference() -> None:
 
 
 def test_two_gemm_wo_projection_group_major_path_matches_quantized_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31002)
 
     tokens, groups, group_width, rank, hidden = 2, 2, 128, 64, 128
@@ -623,7 +623,7 @@ def test_two_gemm_wo_projection_group_major_path_matches_quantized_reference() -
 def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference() -> None:
     """TP8 collapses DSV4's eight output groups to one local WO group."""
 
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31005)
 
     tokens, groups, group_width, rank, hidden = 3, 1, 512, 128, 128
@@ -666,7 +666,7 @@ def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference() ->
 
 
 def test_two_gemm_wo_projection_replays_under_graph() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31003)
 
     tokens, groups, group_width, rank, hidden = 1, 2, 128, 64, 128
@@ -707,7 +707,7 @@ def test_two_gemm_wo_projection_replays_under_graph() -> None:
 def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding() -> (
     None
 ):
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31007)
 
     tokens = 1
@@ -780,7 +780,7 @@ def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(
 def test_inv_rope_planned_wo_uses_bound_arena_and_replays_under_graph(
     tokens: int,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31014 + tokens)
 
     groups, heads_per_group = 2, 4
@@ -869,7 +869,7 @@ def test_wo_projection_expected_m_hint_is_byte_identical() -> None:
     # leaving the result byte-identical (tiling does not change the block-scaled
     # MMA). hidden=2048 (>1536) so expected_m=64 actually selects a different
     # wo_b tile (32x128) than the default (64x128).
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31004)
 
     tokens, groups, group_width, rank, hidden = 32, 2, 128, 64, 2048
@@ -911,7 +911,7 @@ def test_wo_projection_expected_m_hint_is_byte_identical() -> None:
 
 
 def test_wo_projection_block_scaled_weight_pack_runs_graph() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31004)
 
     tokens, groups, group_width, rank, hidden = 1, 2, 128, 128, 128
@@ -966,7 +966,7 @@ def test_wo_projection_block_scaled_weight_pack_runs_graph() -> None:
 
 
 def test_wo_dense_gemms_sfb_k_reuse_is_byte_identical() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31007)
 
     tokens, groups, group_width, rank, hidden = 5, 2, 256, 128, 256
@@ -1026,7 +1026,7 @@ def test_wo_dense_gemms_sfb_k_reuse_is_byte_identical() -> None:
 def _wo_b_fused_vs_unfused(
     tokens: int, rank: int, groups: int, hidden: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from sparkinfer.gemm._shared.wo_mxfp8 import wo_b_dense_gemm_fused_quant_mxfp8
+    from b12x.gemm._shared.wo_mxfp8 import wo_b_dense_gemm_fused_quant_mxfp8
 
     tmp = empty_dense_gemm_mnl_view(
         tokens, rank, groups, device="cuda", dtype=torch.bfloat16
@@ -1048,7 +1048,7 @@ def _wo_b_fused_vs_unfused(
 
 
 def test_wo_b_fused_quant_matches_unfused_small_shapes() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31008)
 
     for tokens in (1, 3, 8):
@@ -1060,7 +1060,7 @@ def test_wo_b_fused_quant_matches_unfused_small_shapes() -> None:
 
 
 def test_wo_b_fused_quant_matches_unfused_split_k_serving_shape() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31009)
 
     # DS4-Flash TP2 WO-B: N=4096, K=4096 -> the decode policy picks 2-way
@@ -1074,9 +1074,9 @@ def test_wo_b_fused_quant_matches_unfused_split_k_serving_shape() -> None:
 
 
 def test_wo_a_fused_quant_matches_unfused_small_shapes() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31010)
-    from sparkinfer.gemm._shared.wo_mxfp8 import wo_a_dense_gemm_fused_quant_mxfp8
+    from b12x.gemm._shared.wo_mxfp8 import wo_a_dense_gemm_fused_quant_mxfp8
 
     for tokens, groups, group_width, rank in (
         (1, 2, 256, 128),
@@ -1108,9 +1108,9 @@ def test_wo_a_fused_quant_matches_unfused_small_shapes() -> None:
 
 
 def test_wo_a_fused_quant_inv_rope_matches_unfused() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31011)
-    from sparkinfer.gemm._shared.wo_mxfp8 import wo_a_dense_gemm_fused_quant_mxfp8
+    from b12x.gemm._shared.wo_mxfp8 import wo_a_dense_gemm_fused_quant_mxfp8
 
     tokens, groups, heads_per_group = 3, 2, 4
     head_dim, nope_dim, rope_dim = 128, 96, 32
@@ -1168,7 +1168,7 @@ def test_wo_a_fused_quant_inv_rope_matches_unfused() -> None:
 
 
 def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31012)
 
     # DS4-Flash TP2 serving shape at decode M: the fused route must replay
@@ -1242,7 +1242,7 @@ def test_wo_quant_cute_paths_match_triton_bit_exact(quant_path: str) -> None:
     that a symbol name alone identifies a specialization.
     """
 
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31013)
 
     tokens, groups, heads_per_group = 130, 2, 4
@@ -1270,7 +1270,7 @@ def test_wo_quant_cute_paths_match_triton_bit_exact(quant_path: str) -> None:
             atol=0,
         )
 
-    from sparkinfer.gemm.wo_projection._quant_cute import (
+    from b12x.gemm.wo_projection._quant_cute import (
         quantize_wo_group_major_rows_cute,
         quantize_wo_grouped_rows_cute,
     )

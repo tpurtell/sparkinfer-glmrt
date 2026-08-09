@@ -7,16 +7,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sparkinfer.attention.paged._forward as paged_api
-import sparkinfer.attention.paged._scratch as scratch_api
-from sparkinfer.attention.paged.reference import paged_attention_reference
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionBinding, SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
+import b12x.attention.paged._forward as paged_api
+import b12x.attention.paged._scratch as scratch_api
+from b12x.attention.paged.reference import paged_attention_reference
+from b12x.attention.paged._scratch import B12XPagedAttentionBinding, B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
-def _caps() -> SPARKINFERPagedAttentionScratchCaps:
-    return SPARKINFERPagedAttentionScratchCaps(
+def _caps() -> B12XPagedAttentionScratchCaps:
+    return B12XPagedAttentionScratchCaps(
         device="cpu",
         mode="decode",
         dtype=torch.bfloat16,
@@ -46,8 +46,8 @@ def _runtime_tensors():
     return q, k_cache, v_cache, output, page_table, cache_seqlens, cu_seqlens_q
 
 
-def _prepared_cpu_decode_graph_scratch() -> scratch_api.SPARKINFERPagedAttentionScratch:
-    return scratch_api.SPARKINFERPagedAttentionScratch(
+def _prepared_cpu_decode_graph_scratch() -> scratch_api.B12XPagedAttentionScratch:
+    return scratch_api.B12XPagedAttentionScratch(
         shared_scratch=torch.empty(1, dtype=torch.uint8),
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
@@ -336,22 +336,22 @@ def test_decode_graph_capture_prepare_and_forward_insert_one_updater(
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
-        scratch_api.SPARKINFERPagedAttentionScratch,
+        scratch_api.B12XPagedAttentionScratch,
         "_bind_runtime_metadata",
         lambda self, page_table, cache_seqlens, cu_seqlens_q: None,
     )
     monkeypatch.setattr(
-        scratch_api.SPARKINFERPagedAttentionScratch,
+        scratch_api.B12XPagedAttentionScratch,
         "_copy_cached_plan_metadata",
         lambda self, cache: None,
     )
 
-    def update(self: scratch_api.SPARKINFERPagedAttentionScratch) -> None:
+    def update(self: scratch_api.B12XPagedAttentionScratch) -> None:
         nonlocal calls
         calls += 1
 
     monkeypatch.setattr(
-        scratch_api.SPARKINFERPagedAttentionScratch,
+        scratch_api.B12XPagedAttentionScratch,
         "update_decode_graph_replay_metadata_from_runtime_cache_seqlens",
         update,
     )
@@ -389,7 +389,7 @@ def test_paged_attention_scratch_bind_returns_common_binding_type(
         self._plan = object()
         return self
 
-    monkeypatch.setattr(scratch_api.SPARKINFERPagedAttentionScratch, "prepare", fake_prepare)
+    monkeypatch.setattr(scratch_api.B12XPagedAttentionScratch, "prepare", fake_prepare)
 
     binding = plan.bind(
         scratch=scratch,
@@ -404,8 +404,8 @@ def test_paged_attention_scratch_bind_returns_common_binding_type(
         active_total_q=2,
     )
 
-    assert isinstance(binding, SPARKINFERPagedAttentionBinding)
-    assert isinstance(binding.scratch, scratch_api.SPARKINFERPagedAttentionScratch)
+    assert isinstance(binding, B12XPagedAttentionBinding)
+    assert isinstance(binding.scratch, scratch_api.B12XPagedAttentionScratch)
     assert binding.q is q
     assert binding.output is output
     assert calls["page_table"] is page_table
@@ -418,7 +418,7 @@ def test_paged_attention_scratch_bind_returns_common_binding_type(
 def test_paged_attention_binding_run_uses_function_binding_argument(monkeypatch) -> None:
     scratch = object()
     q, k_cache, v_cache, output, *_ = _runtime_tensors()
-    binding = SPARKINFERPagedAttentionBinding(
+    binding = B12XPagedAttentionBinding(
         scratch=scratch,
         q=q,
         k_cache=k_cache,
@@ -440,7 +440,7 @@ def test_paged_attention_binding_run_uses_function_binding_argument(monkeypatch)
 def test_paged_attention_forward_rejects_binding_plus_runtime_tensors() -> None:
     scratch = object()
     q, k_cache, v_cache, output, *_ = _runtime_tensors()
-    binding = SPARKINFERPagedAttentionBinding(
+    binding = B12XPagedAttentionBinding(
         scratch=scratch,
         q=q,
         k_cache=k_cache,
@@ -468,7 +468,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference(
     window_left: int,
     use_attention_sink: bool,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     paged_api.clear_paged_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q = (
@@ -495,7 +495,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference(
     max_batch = len(q_seqlens)
     max_partial_rows = max_batch * 64 if mode == "decode" else 0
     plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode=mode,
             dtype=q.dtype,
@@ -567,7 +567,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference(
 def test_mimo_v25_packed_diffkv_scratch_matches_reference_with_strided_q(
     mode: str,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     paged_api.clear_paged_caches()
 
     q_seqlens = [5] if mode == "extend" else [1]
@@ -586,7 +586,7 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference_with_strided_q(
     max_partial_rows = max_batch * 64 if mode == "decode" else 0
     max_work_items = 516 if mode == "extend" else 256
     plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode=mode,
             dtype=q.dtype,
@@ -645,11 +645,11 @@ def test_mimo_v25_packed_diffkv_scratch_matches_reference_with_strided_q(
 
 
 def test_mimo_v25_extend_replans_from_warmup_to_single_short_prompt() -> None:
-    require_sparkinfer()
+    require_b12x()
     paged_api.clear_paged_caches()
 
     plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device="cuda",
             mode="extend",
             dtype=torch.bfloat16,
@@ -721,7 +721,7 @@ def test_mimo_v25_extend_replans_from_warmup_to_single_short_prompt() -> None:
 
 @torch.inference_mode()
 def test_mimo_v25_packed_diffkv_scratch_cuda_graph_replays_with_updated_metadata() -> None:
-    require_sparkinfer()
+    require_b12x()
     paged_api.clear_paged_caches()
 
     batch = 4
@@ -743,7 +743,7 @@ def test_mimo_v25_packed_diffkv_scratch_cuda_graph_replays_with_updated_metadata
         dtype=torch.float32,
     )
     plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -901,7 +901,7 @@ def _run_mimo_v25_fp8_decode_graph_case(
     v_descale = torch.ones((batch, 1), device=q.device, dtype=torch.float32)
 
     plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1001,7 +1001,7 @@ def _run_mimo_v25_fp8_decode_graph_case(
 def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     paged_api.clear_paged_caches()
 
     captured_specs = []
@@ -1016,7 +1016,7 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
         del kernel, compile_args, runtime_args
         captured_specs.append(compile_spec)
 
-    monkeypatch.setattr(paged_api, "sparkinfer_launch", capture_launch)
+    monkeypatch.setattr(paged_api, "b12x_launch", capture_launch)
 
     def bind_no_split_decode(batch: int) -> None:
         q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
@@ -1030,7 +1030,7 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
             )
         )
         plan = plan_paged_attention_scratch(
-            SPARKINFERPagedAttentionScratchCaps(
+            B12XPagedAttentionScratchCaps(
                 device=q.device,
                 mode="decode",
                 dtype=q.dtype,
@@ -1090,14 +1090,14 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
 def test_mimo_v25_fp8_decode_graph_non_split_ignores_worklist_bucket_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     paged_api.clear_paged_caches()
 
     def fail_regular_metadata_update(**kwargs: object) -> None:
         raise AssertionError("non-split decode should not update chunk metadata")
 
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
+        "b12x.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
         fail_regular_metadata_update,
     )
     cache_seqlens = [129, 193, 257, 385, 449, 513, 577]
@@ -1121,7 +1121,7 @@ def test_mimo_v25_fp8_decode_graph_non_split_ignores_worklist_bucket_shape(
 def test_mimo_v25_fp8_decode_graph_pads_large_power2_page_table_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     paged_api.clear_paged_caches()
 
     def fail_regular_metadata_update(**kwargs: object) -> None:
@@ -1130,7 +1130,7 @@ def test_mimo_v25_fp8_decode_graph_pads_large_power2_page_table_width(
         )
 
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
+        "b12x.attention.paged.graph_replay.update_regular_decode_graph_chunk_metadata",
         fail_regular_metadata_update,
     )
     _run_mimo_v25_fp8_decode_graph_case(

@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.moe import fused_moe
-import sparkinfer.moe.fused_moe._impl as fused_moe_impl
+from b12x.moe import fused_moe
+import b12x.moe.fused_moe._impl as fused_moe_impl
 
 
 def _weight_plan() -> fused_moe.WeightsPlan:

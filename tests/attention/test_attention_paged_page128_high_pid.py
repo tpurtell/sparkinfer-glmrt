@@ -6,15 +6,15 @@ import pytest
 import torch
 
 from benchmarks.benchmark_paged_attention import _capture_backend_graph
-from sparkinfer.attention.paged._scratch import (
-    SPARKINFERPagedAttentionScratchCaps,
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
     plan_paged_attention_scratch,
 )
-from sparkinfer.attention.paged.planner import plan_decode_graph_capacity
-from sparkinfer.attention.paged.reference import paged_attention_reference
-from sparkinfer.attention.paged.traits import select_paged_forward_traits_from_plan
+from b12x.attention.paged.planner import plan_decode_graph_capacity
+from b12x.attention.paged.reference import paged_attention_reference
+from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 _ALLOCATOR_COUNTERS = (
@@ -39,7 +39,7 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _require_exact_laguna_device() -> torch.device:
-    device = require_sparkinfer()
+    device = require_b12x()
     if torch.cuda.get_device_capability(device) != (12, 0):
         pytest.skip("the exact Laguna KV128 specialization requires SM120")
     return device
@@ -247,7 +247,7 @@ def _make_laguna_graph_plan(
         force_split_kv=True,
     )
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -635,7 +635,7 @@ def test_laguna_kv128_b8_regular_graph_replay_handles_heterogeneous_lengths() ->
 
 @torch.inference_mode()
 def test_page128_graph_replay_handles_page_ids_past_int32_byte_offset() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260721)
 
     page_size = 128
@@ -696,7 +696,7 @@ def test_page128_graph_replay_handles_page_ids_past_int32_byte_offset() -> None:
     output = torch.empty_like(q)
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=device,
             mode="decode",
             dtype=q.dtype,

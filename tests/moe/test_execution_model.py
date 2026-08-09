@@ -1,5 +1,5 @@
 """moe declarative execution model: MoESpec / ExecutionPlan planner contracts
-(CPU-only). Ported from sparkinfer tests/test_moe_execution_model.py; exercises the
+(CPU-only). Ported from b12x tests/test_moe_execution_model.py; exercises the
 public plan_weights/plan_execution verbs plus the _shared.execution vocabulary.
 """
 
@@ -8,9 +8,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.moe import fused_moe
-from sparkinfer.moe.fused_moe import _impl as tp_moe_impl
-from sparkinfer.moe._shared.execution import (
+from b12x.moe import fused_moe
+from b12x.moe.fused_moe import _impl as tp_moe_impl
+from b12x.moe._shared.execution import (
     GemmEngine,
     MoERegime,
     OperandEncoding,
@@ -25,7 +25,7 @@ from sparkinfer.moe._shared.execution import (
     make_moe_spec,
 )
 
-plan_sparkinfer_fp4_moe_weights = fused_moe.plan_weights
+plan_b12x_fp4_moe_weights = fused_moe.plan_weights
 plan_tp_moe_execution = fused_moe.plan_execution
 
 
@@ -38,7 +38,7 @@ def _weight_plan(
     num_experts: int = 32,
     w4a16_layout: PreparedWeightLayout | None = None,
 ):
-    return plan_sparkinfer_fp4_moe_weights(
+    return plan_b12x_fp4_moe_weights(
         quant_modes=quant_modes,
         source_format=source_format,
         activation="silu",
@@ -245,7 +245,7 @@ def test_glm52_tp8_nvfp4_crosses_from_micro_to_dynamic_at_m8(
 ) -> None:
     """The GLM decode M=8 case uses dynamic's atomic output contract."""
 
-    monkeypatch.delenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
 
     weights = _weight_plan(
         "nvfp4",
@@ -273,7 +273,7 @@ def test_glm52_tp8_nvfp4_crosses_from_micro_to_dynamic_at_m8(
     assert plans[8].implementation == "dynamic"
     assert not plans[8].deterministic_output
 
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     deterministic_m8 = plan_tp_moe_execution(
         num_tokens=8,
         num_topk=8,
@@ -290,8 +290,8 @@ def test_native_w4a8_m1_alone_selects_fixed_materialized_regime(
 ) -> None:
     """M=1 specializes unified dynamic; neighboring decode sizes do not."""
 
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_WORK_SOURCE", "materialized_queue")
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_W4A8_MATERIALIZED", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "materialized_queue")
+    monkeypatch.setenv("B12X_DYNAMIC_W4A8_MATERIALIZED", "1")
     common = dict(
         quant_mode="w4a8_mx",
         activation="silu",

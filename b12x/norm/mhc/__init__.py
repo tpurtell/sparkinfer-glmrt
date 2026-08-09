@@ -1,0 +1,88 @@
+"""mHC residual for SM12x: fused RMSNorm + hyper-connection mixing +
+projection (DeepSeek-style), BF16 with TF32 projection paths.
+
+Three phases share one plan/binding; the phase is the verb because the
+signatures differ: ``run_pre`` broadcasts a rank-2 residual into the four
+lanes at model entry, ``run_post_pre`` is the steady-state fused post+pre
+boundary between sublayers/layers, and ``run_post`` is the terminal mix-back.
+``run_head`` performs the checkpoint's terminal four-lane sigmoid collapse and
+RMSNorm, and can retain the pre-norm collapse in a second caller-owned output.
+Sinkhorn-normalized mix matrices; hidden sizes 4096/7168; mix
+constants exposed as ``MIXES`` / ``MULT`` / ``PARTIALS``. A bound lifecycle
+uses only caller-owned scratch and outputs.
+
+Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) ->
+``run_*`` (capture safe; torch.compile-safe via opaque custom ops).
+
+Example:
+    from b12x.norm import mhc
+
+    plan    = mhc.plan(mhc.Caps(...))
+    spec    = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = mhc.bind(plan, scratch=scratch, ...)
+    residual, post, comb, y = mhc.run_post_pre(..., binding=binding)
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from ..._lib.meta import OpMeta, Provenance, install_lazy_api
+
+META = OpMeta(
+    name="mhc",
+    group="norm",
+    api_style="planned",
+    entry_points=(
+        "Caps",
+        "Plan",
+        "Binding",
+        "plan",
+        "bind",
+        "run_head",
+        "run_pre",
+        "run_post",
+        "run_post_pre",
+        "MIXES",
+        "MULT",
+        "PARTIALS",
+        "DEFAULT_SPLIT_K",
+        "DEFAULT_BLOCK_K",
+        "DEFAULT_BLOCK_H",
+        "is_supported",
+    ),
+    dtypes=("bf16",),
+    provenance=Provenance(
+        repo="https://github.com/lukealonso/b12x",
+        commit="6627d342",
+        paths=(
+            "b12x/integration/residual.py",
+            "b12x/integration/residual_kernels.py",
+        ),
+    ),
+    test_path="tests/norm/test_mhc.py",
+    since="0.7.0",
+)
+
+if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
+    from .api import (  # noqa: F401
+        DEFAULT_BLOCK_H,
+        DEFAULT_BLOCK_K,
+        DEFAULT_SPLIT_K,
+        MIXES,
+        MULT,
+        PARTIALS,
+        Binding,
+        Caps,
+        Plan,
+        bind,
+        is_supported,
+        plan,
+        run_post,
+        run_post_pre,
+        run_head,
+        run_pre,
+    )
+
+install_lazy_api(globals(), META)

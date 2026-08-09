@@ -21,23 +21,23 @@ import torch
 
 from tests._reference import dsv4_extra_ref, dsv4_ref, glm_ref, prefill_ref
 
-import sparkinfer.attention._shared.mla.api as mla_api
-from sparkinfer.attention._shared.mla.api import (
+import b12x.attention._shared.mla.api as mla_api
+from b12x.attention._shared.mla.api import (
     sparse_mla_decode_forward as _sparse_mla_decode_forward,
     sparse_mla_extend_forward as _sparse_mla_extend_forward,
 )
-from sparkinfer.attention._shared.mla.compressed_api import (
+from b12x.attention._shared.mla.compressed_api import (
     compressed_mla_decode_forward as _compressed_mla_decode_forward,
 )
-from sparkinfer.attention._shared.mla.compressed_reference import (
+from b12x.attention._shared.mla.compressed_reference import (
     compressed_mla_page_nbytes,
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer._lib.intrinsics import get_sm_version
-from sparkinfer.attention.compressed_mla._scratch import SPARKINFERCompressedMLAScratchCaps, _compressed_mla_scratch_layout, _materialize_compressed_mla_scratch
+from b12x._lib.intrinsics import get_sm_version
+from b12x.attention.compressed_mla._scratch import B12XCompressedMLAScratchCaps, _compressed_mla_scratch_layout, _materialize_compressed_mla_scratch
 
-from tests._reference.helpers import require_sparkinfer as _require_sparkinfer
+from tests._reference.helpers import require_b12x as _require_b12x
 
 
 # GLM_NSA uncompressed decode contract: q_head_dim = d_nope + d_rope = 512 + 64 = 576,
@@ -50,10 +50,10 @@ _SM_SCALE = 1.0 / math.sqrt(_GLM_Q_HEAD_DIM)
 
 
 def test_cache_block_stride_distinguishes_flat_contiguous_and_packed_views() -> None:
-    import sparkinfer.attention._shared.mla.kernel as decode_kernel
-    import sparkinfer.attention._shared.mla.prefill as prefill_dispatch
-    import sparkinfer.attention._shared.mla.prefill_mg as prefill_mg
-    from sparkinfer.attention._shared.mla.traits import ModelType
+    import b12x.attention._shared.mla.kernel as decode_kernel
+    import b12x.attention._shared.mla.prefill as prefill_dispatch
+    import b12x.attention._shared.mla.prefill_mg as prefill_mg
+    from b12x.attention._shared.mla.traits import ModelType
 
     page_size = 64
     payload = page_size * _GLM_KV_BYTES_PER_TOKEN
@@ -172,12 +172,12 @@ def compressed_mla_decode_forward(
     )
 
 
-def require_sparkinfer_sparse_mla() -> torch.device:
+def require_b12x_sparse_mla() -> torch.device:
     """Skip unless a real SM120+ device is present (mirrors the compressed-MLA pattern).
 
     The routing branch under test is only reachable on SM120 hardware.
     """
-    device = _require_sparkinfer()
+    device = _require_b12x()
     if get_sm_version(device) < 120:
         pytest.skip("SM120 sparse MLA dispatch requires an SM120+ device")
     return device
@@ -195,9 +195,9 @@ def _make_glm_decode_inputs(device: torch.device, num_q_heads: int = _NUM_Q_HEAD
     )
     page_table_1 = torch.zeros((rows, width), dtype=torch.int32, device=device)
     cache_seqlens = torch.full((rows,), width, dtype=torch.int32, device=device)
-    from sparkinfer.attention._shared.workspace import SPARKINFERAttentionWorkspace
+    from b12x.attention._shared.workspace import B12XAttentionWorkspace
 
-    workspace = SPARKINFERAttentionWorkspace.for_contract(
+    workspace = B12XAttentionWorkspace.for_contract(
         mode="decode",
         device=device,
         dtype=torch.bfloat16,
@@ -237,7 +237,7 @@ def test_glm_decode_default_routes_to_sm120(monkeypatch) -> None:
     without compiling a kernel for tiny inputs, and pin the legacy reference so any
     accidental legacy fallthrough would be counted (it must stay zero).
     """
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     counters = _force_legacy_reference(monkeypatch)
 
     routed = {"calls": 0}
@@ -247,7 +247,7 @@ def test_glm_decode_default_routes_to_sm120(monkeypatch) -> None:
         routed["calls"] += 1
         return q_all[:, :, :_GLM_V_HEAD_DIM].clone()
 
-    import sparkinfer.attention._shared.mla.kernel as unified_launch
+    import b12x.attention._shared.mla.kernel as unified_launch
 
     monkeypatch.setattr(unified_launch, "run_unified_decode", fake_run_unified_decode)
 
@@ -274,7 +274,7 @@ def test_glm_decode_default_routes_to_sm120(monkeypatch) -> None:
 
 @torch.inference_mode()
 def test_glm_decode_backend_legacy_is_retired() -> None:
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
 
     q_all, kv_cache, page_table_1, cache_seqlens, workspace = _make_glm_decode_inputs(device)
     with pytest.raises(ValueError, match="legacy sparse MLA kernels have been retired"):
@@ -301,7 +301,7 @@ def test_glm_decode_valid_contract_routes_to_sm120(monkeypatch) -> None:
     legacy reference does NOT run. We monkeypatch run_unified_decode to a sentinel
     so the routing decision is observed without compiling a kernel for tiny inputs.
     """
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     counters = _force_legacy_reference(monkeypatch)
 
     routed = {"calls": 0}
@@ -311,7 +311,7 @@ def test_glm_decode_valid_contract_routes_to_sm120(monkeypatch) -> None:
         routed["calls"] += 1
         return q_all[:, :, :_GLM_V_HEAD_DIM].clone()
 
-    import sparkinfer.attention._shared.mla.kernel as unified_launch
+    import b12x.attention._shared.mla.kernel as unified_launch
 
     monkeypatch.setattr(unified_launch, "run_unified_decode", fake_run_unified_decode)
 
@@ -350,9 +350,9 @@ def _make_glm_extend_inputs(device: torch.device, num_q_heads: int = _NUM_Q_HEAD
     )
     selected = torch.zeros((rows, width), dtype=torch.int32, device=device)
     cache_seqlens = torch.full((rows,), width, dtype=torch.int32, device=device)
-    from sparkinfer.attention._shared.workspace import SPARKINFERAttentionWorkspace
+    from b12x.attention._shared.workspace import B12XAttentionWorkspace
 
-    workspace = SPARKINFERAttentionWorkspace.for_contract(
+    workspace = B12XAttentionWorkspace.for_contract(
         mode=mode,
         device=device,
         dtype=torch.bfloat16,
@@ -378,7 +378,7 @@ def test_glm_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
     The launcher is exercised end-to-end by .sm120port/probes/glm_prefill_e2e_check.py
     vs glm_prefill_ref; here we prove ONLY the GATE intercepts a prefill-like GLM
     contract and routes to prefill (not decode / not legacy split)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     counters = _force_legacy_reference(monkeypatch)
 
     routed = {"prefill": 0, "decode": 0}
@@ -399,7 +399,7 @@ def test_glm_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
         routed["decode"] += 1
         return q_all[:, :, :_GLM_V_HEAD_DIM].clone()
 
-    import sparkinfer.attention._shared.mla.kernel as unified_launch
+    import b12x.attention._shared.mla.kernel as unified_launch
 
     monkeypatch.setattr(unified_launch, "run_unified_prefill", fake_run_unified_prefill)
     monkeypatch.setattr(unified_launch, "run_unified_decode", fake_run_unified_decode)
@@ -428,7 +428,7 @@ def test_glm_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
 def test_glm_decode_mode_still_routes_to_unified_decode(monkeypatch) -> None:
     """(3a) The decode mode still routes to run_unified_decode (prefill routing is
     gated on workspace.mode -- decode must NOT regress to prefill)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     _force_legacy_reference(monkeypatch)
 
     routed = {"prefill": 0, "decode": 0}
@@ -443,7 +443,7 @@ def test_glm_decode_mode_still_routes_to_unified_decode(monkeypatch) -> None:
         routed["decode"] += 1
         return q_all[:, :, :_GLM_V_HEAD_DIM].clone()
 
-    import sparkinfer.attention._shared.mla.kernel as unified_launch
+    import b12x.attention._shared.mla.kernel as unified_launch
 
     monkeypatch.setattr(unified_launch, "run_unified_prefill", fake_run_unified_prefill)
     monkeypatch.setattr(unified_launch, "run_unified_decode", fake_run_unified_decode)
@@ -489,7 +489,7 @@ def _make_dsv4_compressed_case(device, *, topk, seed=0):
 
 
 def _make_dsv4_scratch(device, *, topk, max_chunks):
-    caps = SPARKINFERCompressedMLAScratchCaps(
+    caps = B12XCompressedMLAScratchCaps(
         device=device, num_q_heads=_DSV4_HEADS, max_q_rows=1, max_width=topk,
         head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
         max_chunks_per_row=max_chunks, page_size=_DSV4_PAGE,
@@ -505,7 +505,7 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
     """DSV4 main-cache contract: compressed_mla_decode_forward routes to
     SM120 sparse MLA.run_unified_decode (kernel split-K partials + reused base-2 merge)
     and matches compressed_sparse_mla_reference."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     del monkeypatch
 
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=topk)
@@ -523,7 +523,7 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
     torch.cuda.synchronize()
     assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
 
-    import sparkinfer.attention._shared.mla.kernel as launch
+    import b12x.attention._shared.mla.kernel as launch
 
     plan = launch.LAST_DECODE_PLAN
     assert plan.get("native_dsv4_h8") is True
@@ -551,7 +551,7 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(monkeypatch, mod
     """DSV4 compressed contract in a prefill-like mode routes
     compressed_mla_decode_forward to SM120 sparse MLA.run_unified_prefill (single-pass
     DSV4 prefill), NOT run_unified_decode."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     routed = {"prefill": 0, "decode": 0, "lse_ptr": None}
 
     def fake_run_unified_prefill(*, q, output=None, lse_out=None, **kwargs):
@@ -571,7 +571,7 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(monkeypatch, mod
         routed["decode"] += 1
         raise AssertionError("prefill mode must not route to decode")
 
-    import sparkinfer.attention._shared.mla.kernel as unified_pkg
+    import b12x.attention._shared.mla.kernel as unified_pkg
 
     monkeypatch.setattr(unified_pkg, "run_unified_prefill", fake_run_unified_prefill)
     monkeypatch.setattr(unified_pkg, "run_unified_decode", fake_run_unified_decode)
@@ -606,7 +606,7 @@ def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> No
 
     A mapped indexed_page_table raises because the active gather addresses the
     extra cache by raw slot id; that guard is checked separately."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     del monkeypatch
 
     topk, extra_topk, pbs_extra = 64, 128, 2
@@ -658,7 +658,7 @@ def test_dsv4_compressed_decode_mapped_extra_page_table_raises() -> None:
     UNSUPPORTED (upstream FlashInfer addresses the extra cache by raw slot id only).
     Per the no-legacy-fallback directive the dispatch must RAISE a clear error, not
     silently route to legacy."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     topk = 64
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=7)
     scratch = _make_dsv4_scratch(device, topk=topk * 2, max_chunks=8)
@@ -686,7 +686,7 @@ def test_dsv4_compressed_decode_mapped_extra_page_table_raises() -> None:
 def test_dsv4_compressed_decode_partial_extra_trio_raises() -> None:
     """A partial dual-cache trio (some-but-not-all indexed_* args) is a HARD ERROR
     matching upstream's required-together ICHECK (sparse_mla_sm120.cu:171-174)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     topk = 64
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=11)
     scratch = _make_dsv4_scratch(device, topk=topk * 2, max_chunks=8)
@@ -712,7 +712,7 @@ def test_dsv4_compressed_decode_partial_extra_trio_raises() -> None:
 def test_glm_decode_backend_kwarg_routes_to_unified(monkeypatch) -> None:
     """(b') backend="sm120" routes the GLM decode to SM120 sparse MLA even with
     an explicit backend kwarg (GLM_NSA implemented; the gate routes via run_unified_decode)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     counters = _force_legacy_reference(monkeypatch)
 
     routed = {"calls": 0}
@@ -722,7 +722,7 @@ def test_glm_decode_backend_kwarg_routes_to_unified(monkeypatch) -> None:
         routed["calls"] += 1
         return q_all[:, :, :_GLM_V_HEAD_DIM].clone()
 
-    import sparkinfer.attention._shared.mla.kernel as unified_launch
+    import b12x.attention._shared.mla.kernel as unified_launch
 
     monkeypatch.setattr(unified_launch, "run_unified_decode", fake_run_unified_decode)
 
@@ -747,7 +747,7 @@ def test_glm_decode_backend_kwarg_routes_to_unified(monkeypatch) -> None:
 
 
 # ── DSV4 LAUNCHER NUMERICS (P7): run_unified_decode vs dsv4_ref ────────────────
-# These exercise the REAL launcher (sparkinfer.attention._shared.mla.kernel.
+# These exercise the REAL launcher (b12x.attention._shared.mla.kernel.
 # run_unified_decode = warp-specialized 288-thread DSV4 decode -> per-split
 # NORMALIZED partials in mid_out/mid_lse -> the REUSED split.py base-2 merge) for
 # num_heads=128, topk in {64,128,512}, and BOTH num_splits=1 and a forced>1
@@ -794,7 +794,7 @@ def _merge_base2_lse(mid_lse: torch.Tensor) -> torch.Tensor:
 
 
 def _make_dsv4_scratch_heads(device, *, topk, max_chunks, num_heads):
-    caps = SPARKINFERCompressedMLAScratchCaps(
+    caps = B12XCompressedMLAScratchCaps(
         device=device, num_q_heads=num_heads, max_q_rows=1, max_width=topk,
         head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
         max_chunks_per_row=max_chunks, page_size=_DSV4_PAGE,
@@ -808,7 +808,7 @@ def _run_unified_dsv4(device, *, topk, forced_num_splits, seed):
     """Build a dsv4_ref DSV4 decode case (num_heads=128), repack the KV into the
     compressed page layout, run the REAL launcher, and return
     (got_O, got_lse, exp_O, exp_lse, eff_splits)."""
-    from sparkinfer.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention._shared.mla.kernel import run_unified_decode
 
     case = dsv4_ref.make_dsv4_decode_case(
         num_heads=_UNIFIED_NUM_HEADS, topk=topk, num_tokens=1,
@@ -860,7 +860,7 @@ def test_unified_decode_launcher_matches_dsv4_ref(topk, forced_num_splits) -> No
     the dsv4_ref oracle for num_heads=128 at the validated P5 gate, for BOTH
     num_splits=1 and a forced>1 split (the multi-split chunk-aligned partition is
     numerically identical to single-split)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse, eff_splits = _run_unified_dsv4(
         device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
     )
@@ -893,7 +893,7 @@ def test_unified_decode_multi_split_equals_single_split(topk, forced_num_splits)
     """A forced multi-split decode must equal the single-split decode (same
     chunk-aligned candidate partition, merged base-2): each candidate is owned by
     exactly one split, so the reduction is exact, not just within-tolerance."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_single, _, _, _, _ = _run_unified_dsv4(
         device, topk=topk, forced_num_splits=1, seed=topk,
     )
@@ -913,7 +913,7 @@ def test_unified_decode_multi_split_equals_single_split(topk, forced_num_splits)
 # extra chunks (gather from indexed_k_cache with its own page size) folded into
 # ONE online softmax + the reused base-2 merge, vs dsv4_extra_decode_reference.
 def _run_unified_dsv4_extra(device, *, topk, extra_topk, forced_num_splits, seed):
-    from sparkinfer.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention._shared.mla.kernel import run_unified_decode
 
     pbs_extra = 2
     main_blocks = _UNIFIED_NUM_BLOCKS
@@ -964,7 +964,7 @@ def test_unified_decode_dual_cache_matches_extra_ref(topk, extra_topk, forced_nu
     """run_unified_decode DSV4 dual-cache (main + extra, ONE online softmax over the
     union) matches dsv4_extra_decode_reference for num_heads=128, topk=512 x
     extra_topk in {64,128}, single AND forced>1 split, at the P5 gate."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_O, exp_O = _run_unified_dsv4_extra(
         device, topk=topk, extra_topk=extra_topk,
         forced_num_splits=forced_num_splits, seed=topk + extra_topk,
@@ -980,8 +980,8 @@ def test_unified_decode_dual_cache_matches_extra_ref(topk, extra_topk, forced_nu
 def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> None:
     """DSV4 dual-cache prefill heads=80 uses the split MG path (64-head paired
     prefix + 16-head tail) and matches the PyTorch extra-cache oracle."""
-    device = require_sparkinfer_sparse_mla()
-    from sparkinfer.attention._shared.mla.kernel import run_unified_prefill
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_prefill
 
     num_heads = 80
     topk, extra_topk, pbs_extra = 128, 128, 2
@@ -1032,8 +1032,8 @@ def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> N
 def test_unified_prefill_dsv4_valid_hpb_8_matches_prefill_ref() -> None:
     """DSV4 prefill heads=8 uses a single MG group with VALID_HPB=8 and must not
     read or reduce the zero-padded upper half of the HPB=16 tile."""
-    device = require_sparkinfer_sparse_mla()
-    from sparkinfer.attention._shared.mla.kernel import run_unified_prefill
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_prefill
 
     num_tokens, num_heads, topk = 16, 8, 128
     num_blocks = 8
@@ -1084,8 +1084,8 @@ def test_unified_prefill_glm_tp8_topk2048_matches_reference(
     """GLM 5.x TP8 has eight local attention heads and a 2048-token sparse
     selection.  Exercise that serving shape directly, including the
     VALID_HPB=8 tail and both contiguous and vLLM packed page-strided caches."""
-    device = require_sparkinfer_sparse_mla()
-    from sparkinfer.attention._shared.mla.kernel import run_unified_prefill
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_prefill
 
     num_tokens, num_heads, topk = 2, 8, 2048
     case = glm_ref.make_glm_decode_case(
@@ -1133,9 +1133,9 @@ def test_unified_prefill_glm_tp8_topk2048_matches_reference(
     # two-pass PV math: HIGH occupies rows 0..7 and LOW rows 8..15 of one m16
     # tile. Gate its serving default against the former path before comparing
     # either result to the independent reference.
-    monkeypatch.setenv("SPARKINFER_MLA_SM120_PREFILL_PACK_HILO_ROWS", "0")
+    monkeypatch.setenv("B12X_MLA_SM120_PREFILL_PACK_HILO_ROWS", "0")
     legacy_output, legacy_lse = run(contiguous_cache)
-    monkeypatch.setenv("SPARKINFER_MLA_SM120_PREFILL_PACK_HILO_ROWS", "1")
+    monkeypatch.setenv("B12X_MLA_SM120_PREFILL_PACK_HILO_ROWS", "1")
     optimized_output, optimized_lse = run(contiguous_cache)
     assert torch.equal(optimized_output, legacy_output)
     assert torch.equal(optimized_lse, legacy_lse)
@@ -1159,7 +1159,7 @@ def test_unified_prefill_glm_tp8_topk2048_matches_reference(
 def test_unified_decode_dual_cache_extra_zero_equals_main_only() -> None:
     """extra_topk=0 (no extra cache) must reduce to the single-cache decode: the
     dual reference's concat is a no-op, so the unified main-only path matches."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     # main-only via the single-cache launcher path (extra args omitted) vs the
     # dual reference with extra_topk=0 (== dsv4_decode_reference).
     got_O, _, exp_O, _, _ = _run_unified_dsv4(
@@ -1185,7 +1185,7 @@ def test_unified_decode_dual_cache_zero_width_main_extra_only(
 
     This is the P10h zero-width-main fix: cute.make_layout(0) is illegal, so the
     main topk_row is elided to a degenerate 1-extent view that is never read."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_O, exp_O = _run_unified_dsv4_extra(
         device, topk=0, extra_topk=extra_topk,
         forced_num_splits=forced_num_splits, seed=extra_topk + 13,
@@ -1210,9 +1210,9 @@ _GLM_PAGE = 64             # GLM decode page_block_size (stride = idx*656; pbs-i
 
 
 def _make_glm_sparse_scratch(device, *, topk, max_chunks, num_heads, s_kv):
-    from sparkinfer.attention.sparse_mla._scratch import SPARKINFERSparseMLAScratchCaps, plan_sparse_mla_scratch
+    from b12x.attention.sparse_mla._scratch import B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
 
-    caps = SPARKINFERSparseMLAScratchCaps(
+    caps = B12XSparseMLAScratchCaps(
         device=device, num_q_heads=num_heads, max_q_rows=1, max_batch=1,
         max_width=max(topk, 1), max_kv_rows=s_kv,
         head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
@@ -1234,7 +1234,7 @@ def _run_unified_glm(
     use_length_tensor=True,
 ):
     """Build a glm_ref GLM decode case and run the real unified launcher."""
-    from sparkinfer.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention._shared.mla.kernel import run_unified_decode
 
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
@@ -1280,8 +1280,8 @@ def test_unified_decode_glm_tp8_native_swap_ab_matches_reference(
     forced_num_splits,
 ) -> None:
     """GLM TP8 uses the native four-warp swapped-QK decode specialization."""
-    device = require_sparkinfer_sparse_mla()
-    import sparkinfer.attention._shared.mla.kernel as launch
+    device = require_b12x_sparse_mla()
+    import b12x.attention._shared.mla.kernel as launch
 
     got_O, exp_O, _ = _run_unified_glm(
         device,
@@ -1311,16 +1311,16 @@ def test_unified_decode_glm_tp8_native_matches_padded_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The native TP8 path preserves the former padded decode numerics."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     kwargs = dict(
         topk=256,
         forced_num_splits=4,
         seed=52_016,
         num_heads=8,
     )
-    monkeypatch.setenv("SPARKINFER_MLA_SM120_GLM_H8_NATIVE", "0")
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_H8_NATIVE", "0")
     padded, _, _ = _run_unified_glm(device, **kwargs)
-    monkeypatch.setenv("SPARKINFER_MLA_SM120_GLM_H8_NATIVE", "1")
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_H8_NATIVE", "1")
     native, _, _ = _run_unified_glm(device, **kwargs)
     assert _cosine(native, padded) > 0.999999
     assert (native - padded).abs().max().item() < 1e-3
@@ -1329,8 +1329,8 @@ def test_unified_decode_glm_tp8_native_matches_padded_path(
 @torch.inference_mode()
 def test_unified_decode_glm_tp8_native_scalar_length_matches_reference() -> None:
     """The uniform scalar-length entry uses the same native TP8 math path."""
-    device = require_sparkinfer_sparse_mla()
-    import sparkinfer.attention._shared.mla.kernel as launch
+    device = require_b12x_sparse_mla()
+    import b12x.attention._shared.mla.kernel as launch
 
     got_O, exp_O, _ = _run_unified_glm(
         device,
@@ -1355,7 +1355,7 @@ def test_unified_decode_launcher_matches_glm_ref(topk, forced_num_splits) -> Non
     """run_unified_decode GLM_NSA branch (ARBITRARY_FP32 inline scales,
     V_HAS_ROPE=false, 512/128/4) matches the glm_ref oracle for num_heads=128 at
     the looser GLM gate (cos > 0.995, O atol 3e-2), for single AND forced>1 split."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_O, exp_O, eff_splits = _run_unified_glm(
         device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
     )
@@ -1372,7 +1372,7 @@ def test_unified_decode_launcher_matches_glm_ref(topk, forced_num_splits) -> Non
 def test_unified_decode_glm_multi_split_equals_single_split(topk, forced_num_splits) -> None:
     """A forced GLM multi-split decode must match the single-split decode (same
     chunk-aligned candidate partition, merged base-2)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_single, _, _ = _run_unified_glm(device, topk=topk, forced_num_splits=1, seed=topk)
     got_multi, _, eff_splits = _run_unified_glm(
         device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
@@ -1390,9 +1390,9 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
     """GLM_NSA decode with num_tokens in {1,4,16}, num_heads=128, and MIXED
     per-token active_token_counts (the GLM topk_length) matches glm_decode_reference
     per token at the GLM gate (cos > 0.995)."""
-    device = require_sparkinfer_sparse_mla()
-    from sparkinfer.attention._shared.mla.kernel import run_unified_decode
-    from sparkinfer.attention.sparse_mla._scratch import SPARKINFERSparseMLAScratchCaps, plan_sparse_mla_scratch
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention.sparse_mla._scratch import B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
 
     topk = 512
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
@@ -1413,7 +1413,7 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
     ).float()
 
     n_chunks = (topk + 64 - 1) // 64
-    caps = SPARKINFERSparseMLAScratchCaps(
+    caps = B12XSparseMLAScratchCaps(
         device=device, num_q_heads=_GLM_NUM_HEADS, max_q_rows=num_tokens,
         max_batch=num_tokens, max_width=topk, max_kv_rows=s_kv,
         head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
@@ -1448,8 +1448,8 @@ def test_unified_decode_glm_return_lse_matches_reference(topk, forced_num_splits
     """GLM_NSA decode return_lse: the FINAL base-2 LSE reconstructed from mid_lse
     matches the glm_ref oracle base-2 LSE (the GLM branch shares the merge + LSE
     reconstruction with DSV4)."""
-    device = require_sparkinfer_sparse_mla()
-    from sparkinfer.attention._shared.mla.kernel import run_unified_decode
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_decode
 
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
@@ -1509,7 +1509,7 @@ def _run_unified_dsv4_feature(
     """Run the REAL unified DSV4 decode launcher for an arbitrary head count, with
     optional attn_sink fold + return_lse, and return
     (got_O, got_lse_or_None, exp_O, exp_lse_log2, attn_sink)."""
-    from sparkinfer.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention._shared.mla.kernel import run_unified_decode
 
     case = dsv4_ref.make_dsv4_decode_case(
         num_heads=num_heads, topk=topk, num_tokens=1,
@@ -1556,7 +1556,7 @@ def test_unified_decode_attn_sink_matches_reference(topk, forced_num_splits) -> 
     """attn_sink fold (wired into the split.py sink-merge, upstream's sink-in-merge
     design) matches the dsv4_ref oracle (which folds sink as output *= sigmoid(lse_e
     - sink))."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_O, _, exp_O, _, sink = _run_unified_dsv4_feature(
         device, topk=topk, num_heads=_UNIFIED_NUM_HEADS, with_sink=True,
         return_lse=False, lse_scale="base2", forced_num_splits=forced_num_splits,
@@ -1576,7 +1576,7 @@ def test_unified_decode_attn_sink_matches_reference(topk, forced_num_splits) -> 
 def test_unified_decode_return_lse_matches_reference(topk, forced_num_splits) -> None:
     """return_lse returns the FINAL base-2 LSE reconstructed from the per-split
     mid_lse; it matches the dsv4_ref base-2 LSE (no sink)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse_log2, _ = _run_unified_dsv4_feature(
         device, topk=topk, num_heads=_UNIFIED_NUM_HEADS, with_sink=False,
         return_lse=True, lse_scale="base2", forced_num_splits=forced_num_splits,
@@ -1596,7 +1596,7 @@ def test_unified_decode_return_lse_matches_reference(topk, forced_num_splits) ->
 def test_unified_decode_return_lse_natural_scale() -> None:
     """return_lse with lse_scale='natural' returns the natural-log LSE (= base-2 *
     ln2)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     _, got_lse_nat, _, exp_lse_log2, _ = _run_unified_dsv4_feature(
         device, topk=256, num_heads=_UNIFIED_NUM_HEADS, with_sink=False,
         return_lse=True, lse_scale="natural", forced_num_splits=1, seed=99,
@@ -1616,7 +1616,7 @@ def test_unified_decode_valid_hpb_small_and_nonmult16(num_heads, forced_num_spli
     (not multiples of 16)} match the dsv4_ref oracle (which attends per-head over
     only the valid heads). The kernel zero-pads the HPB=16 tile and gates writes to
     the valid head rows via the (up to two) per-head-block grids."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     topk = 256
     got_O, _, exp_O, _, _ = _run_unified_dsv4_feature(
         device, topk=topk, num_heads=num_heads, with_sink=False,
@@ -1636,7 +1636,7 @@ def test_unified_decode_valid_hpb_small_and_nonmult16(num_heads, forced_num_spli
 def test_unified_decode_valid_hpb_with_lse_and_sink() -> None:
     """A non-multiple-of-16 head shard (24) WITH both attn_sink + return_lse: O and
     the sink-folded LSE both match the reference on exactly the valid heads."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse_log2, sink = _run_unified_dsv4_feature(
         device, topk=256, num_heads=24, with_sink=True,
         return_lse=True, lse_scale="base2", forced_num_splits=2, seed=4242,
@@ -1693,7 +1693,7 @@ def _run_unified_dsv4_multitoken(
     """Build a multi-token DSV4 case, optionally -1-pad indices past each token's
     length, run the REAL launcher with per-token swa_topk_lengths, and compare per
     token against dsv4_decode_reference(topk_length=lengths)."""
-    from sparkinfer.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention._shared.mla.kernel import run_unified_decode
 
     case = dsv4_ref.make_dsv4_decode_case(
         num_heads=_MT_HEADS, topk=topk, num_tokens=num_tokens,
@@ -1717,7 +1717,7 @@ def _run_unified_dsv4_multitoken(
     )
 
     n_chunks = (topk + 64 - 1) // 64
-    caps = SPARKINFERCompressedMLAScratchCaps(
+    caps = B12XCompressedMLAScratchCaps(
         device=device, num_q_heads=_MT_HEADS, max_q_rows=num_tokens, max_width=topk,
         head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
         max_chunks_per_row=max(8, forced_num_splits, n_chunks), page_size=_DSV4_PAGE,
@@ -1744,7 +1744,7 @@ def test_unified_decode_multitoken_per_token_length(num_tokens, neg_pad_past_len
     BOTH when the caller passes real lengths with valid indices (a; the OLD uniform
     kernel was latently wrong) AND when the caller -1-pads indices past the length
     (b; the OLD uniform kernel was already correct via idx<0)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     topk = 512
     lengths = _mixed_lengths(num_tokens, topk, device)
     got_O, exp_O = _run_unified_dsv4_multitoken(
@@ -1768,7 +1768,7 @@ def test_unified_decode_multitoken_old_uniform_was_wrong_for_valid_indices() -> 
     the length (no -1 padding), the per-token kernel must DIFFER from a uniform
     full-topk decode (proving the per-token masking actually changes the result --
     i.e. the old uniform-length kernel was latently wrong for this contract)."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     topk, num_tokens = 512, 4
     # Real mixed lengths < topk for the short tokens.
     lengths = _mixed_lengths(num_tokens, topk, device)
@@ -1803,7 +1803,7 @@ def test_unified_decode_uniform_length_batch_matches_reference() -> None:
     """A multi-token batch whose every topk_length[t] == topk must match the
     reference. CUDA dispatch avoids a host read of the length tensor, so uniform
     batches can still use the per-token entrypoint."""
-    device = require_sparkinfer_sparse_mla()
+    device = require_b12x_sparse_mla()
     topk, num_tokens = 512, 4
     full = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
     got_O, exp_O = _run_unified_dsv4_multitoken(
@@ -1818,8 +1818,8 @@ def test_unified_decode_uniform_length_batch_matches_reference() -> None:
 def test_unified_decode_mixed_length_routes_to_per_token_kernel() -> None:
     """A genuinely-mixed-length multi-token batch must route to the per-token
     kernel (per_token_len=True in the plan side-channel)."""
-    device = require_sparkinfer_sparse_mla()
-    import sparkinfer.attention._shared.mla.kernel as L
+    device = require_b12x_sparse_mla()
+    import b12x.attention._shared.mla.kernel as L
     topk, num_tokens = 512, 4
     lengths = _mixed_lengths(num_tokens, topk, device)
     _run_unified_dsv4_multitoken(
@@ -1837,8 +1837,8 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
     """DSV4 dual-cache decode with MIXED per-token MAIN topk_length AND per-token
     EXTRA extra_topk_length (num_tokens in {1,4,16}, num_heads=128) matches
     dsv4_extra_decode_reference over the masked union, per token."""
-    device = require_sparkinfer_sparse_mla()
-    from sparkinfer.attention._shared.mla.kernel import run_unified_decode
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_decode
 
     topk, extra_topk, pbs_extra = 512, 128, 2
     main_blocks = _UNIFIED_NUM_BLOCKS
@@ -1867,7 +1867,7 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
     exp_O = exp_O.float()
 
     n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
-    caps = SPARKINFERCompressedMLAScratchCaps(
+    caps = B12XCompressedMLAScratchCaps(
         device=device, num_q_heads=_MT_HEADS, max_q_rows=num_tokens,
         max_width=topk + extra_topk, head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
         max_chunks_per_row=max(8, n_chunks), page_size=_DSV4_PAGE,
@@ -1933,8 +1933,8 @@ def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
     must produce O==0 (cos==1 via _cosine's 0-norm guard, plus an explicit norm
     check) -- without the empty-row guard it normalized a spurious all-masked softmax
     sum to garbage (the cos~0.20 extend failure)."""
-    device = require_sparkinfer_sparse_mla()
-    from sparkinfer.attention._shared.mla.kernel import run_unified_prefill
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_prefill
 
     # MG-eligible GLM width (topk in {512,1024,2048}); the off-64-boundary
     # partial-last-tile + zero-row coverage now comes from the MIXED per-token

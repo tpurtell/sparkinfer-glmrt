@@ -32,14 +32,14 @@ The dense block-scaled GEMM accepts `ab_dtype="float6_e2m3fn"` (plus per-operand
   explicit format qualifiers.
 - **Packed-B streaming** (`b_packed=True`): B is TMA-loaded in its 3:4 packed
   form and expanded to byte-container in smem, saving 25% of B-side HBM
-  traffic. Gated by `SPARKINFER_PACKED_B_MIN_N` (large-N layers only).
+  traffic. Gated by `B12X_PACKED_B_MIN_N` (large-N layers only).
 - **Small-M decode tiles**: m<=16 activations use a small-M quantizer (only
   real rows computed) and narrow MMA tiles.
 - **Per-row activation global scale**: per-tensor amax makes output depend on
   batch composition (chunked prefill changes results); per-row scaling makes
   each row's quantization independent, matching BF16 cuBLAS semantics.
-  Default on; `SPARKINFER_DENSE_PER_ROW_GS=0` for A/B.
-- **Fused quant prologue** (`SPARKINFER_DENSE_FUSED_QUANT=1`): producer warp
+  Default on; `B12X_DENSE_PER_ROW_GS=0` for A/B.
+- **Fused quant prologue** (`B12X_DENSE_FUSED_QUANT=1`): producer warp
   quantizes BF16 x directly into sA/sSFA. Measured ~10% slower at M=1 than
   the separate quantizer on RTX PRO 6000; numerically bit-identical. Kept as
   an off-by-default gate.
@@ -58,7 +58,7 @@ activation quantization reused from the w4a8 path, FP6 MMA emitted per K
 block via `kernels/mxfp6_moe.py`. Scheduling is the unified dynamic
 persistent-grid backend; the combine is the standard atomic scatter by
 default, or the deterministic `route_output` + top-k sum when
-`SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=1` / `Caps.deterministic_output=True`
+`B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1` / `Caps.deterministic_output=True`
 (required for bit-reproducible KLD scoring; measured 1.3-4.4x slower on the
 combine — scoring only, not serving).
 
@@ -82,14 +82,14 @@ rotation (NO-GO: +0.00012 worse).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SPARKINFER_PACKED_B_MIN_N` | 12288 | Min out_features for packed-B streaming |
-| `SPARKINFER_DENSE_PER_ROW_GS` | on | Per-row activation global scale (dense, m>1) |
-| `SPARKINFER_DENSE_PERSISTENT_SCRATCH` | on | Persistent decode-quant scratch |
-| `SPARKINFER_DENSE_FUSED_QUANT` | off | Fused quant prologue (slower; A/B gate) |
-| `SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT` | off | Deterministic MoE combine (scoring) |
-| `SPARKINFER_ENABLE_FP6_MICRO` | off | BS1 MoE micro-kernel opt-in |
-| `SPARKINFER_FP6_ACT_FMT_OVERRIDES` | unset | `pat=fmt` fnmatch per-linear activation format overrides |
-| `SPARKINFER_DISABLE_BF16_GEMV` | off | Disable small-N GEMV routing |
+| `B12X_PACKED_B_MIN_N` | 12288 | Min out_features for packed-B streaming |
+| `B12X_DENSE_PER_ROW_GS` | on | Per-row activation global scale (dense, m>1) |
+| `B12X_DENSE_PERSISTENT_SCRATCH` | on | Persistent decode-quant scratch |
+| `B12X_DENSE_FUSED_QUANT` | off | Fused quant prologue (slower; A/B gate) |
+| `B12X_DYNAMIC_DETERMINISTIC_OUTPUT` | off | Deterministic MoE combine (scoring) |
+| `B12X_ENABLE_FP6_MICRO` | off | BS1 MoE micro-kernel opt-in |
+| `B12X_FP6_ACT_FMT_OVERRIDES` | unset | `pat=fmt` fnmatch per-linear activation format overrides |
+| `B12X_DISABLE_BF16_GEMV` | off | Disable small-N GEMV routing |
 
 ## Quantization tooling
 

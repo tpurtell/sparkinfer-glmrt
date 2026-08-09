@@ -9,14 +9,14 @@ import torch
 from cutlass import Float32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer._lib.intrinsics import (
+from b12x._lib.intrinsics import (
     bfloat2_mul,
     bfloat2_to_float2_scaled,
     broadcast_f32_to_bfloat2,
     fp8x4_e4m3_to_bfloat2x2,
 )
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 class TinyFp8Bf16DequantKernel:
@@ -108,7 +108,7 @@ def _to_cute_tensor(x: torch.Tensor, dtype) -> cute.Tensor:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_tiny_fp8_bf16_dequant_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(0)
     device = torch.device("cuda")
 

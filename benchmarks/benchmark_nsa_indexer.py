@@ -15,13 +15,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from sparkinfer.attention.nsa_indexer.reference import (
+from b12x.attention.nsa_indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from sparkinfer.attention.nsa_indexer._impl import build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, paged_decode_logits, uses_paged_mqa_schedule
-from sparkinfer.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_CONTIGUOUS, INDEXER_SOURCE_LAYOUT_PAGED, SPARKINFERIndexerScratchCaps, plan_indexer_scratch
+from b12x.attention.nsa_indexer._impl import build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, paged_decode_logits, uses_paged_mqa_schedule
+from b12x.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_CONTIGUOUS, INDEXER_SOURCE_LAYOUT_PAGED, B12XIndexerScratchCaps, plan_indexer_scratch
 
 from benchmarks.common import (
     bench_cuda_graph,
@@ -315,7 +315,7 @@ def _run_decode_case(
 
     prepare_decode_graph()
     decode_plan = plan_indexer_scratch(
-        SPARKINFERIndexerScratchCaps(
+        B12XIndexerScratchCaps(
             device=device,
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=cfg.num_heads,
@@ -469,7 +469,7 @@ def _run_extend_case(
     )
     seqlens_expanded = per_request_ke.repeat(batch)
     contiguous_plan = plan_indexer_scratch(
-        SPARKINFERIndexerScratchCaps(
+        B12XIndexerScratchCaps(
             device=device,
             source_layout=INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
             num_q_heads=cfg.num_heads,

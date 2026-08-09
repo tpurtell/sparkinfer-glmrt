@@ -12,8 +12,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
-from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+from b12x.attention._shared.contiguous.api import clear_attention_caches
+from b12x.attention.paged.workspace import PagedAttentionWorkspace
 from tests.test_attention_paged_planner import _make_inputs
 
 _PAGE_SIZE = 64
@@ -62,11 +62,11 @@ def _build_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Ten
 
 def _dump_words(*, use_tma: bool) -> torch.Tensor:
     overrides = {
-        "SPARKINFER_PAGED_KV_DEBUG_DUMP": "SVWORDS",
-        "SPARKINFER_PAGED_KV_TMA": "1" if use_tma else None,
-        "SPARKINFER_PAGED_KV_TMA_COPYFRAG_QK": None,
-        "SPARKINFER_PAGED_KV_TMA_COPYFRAG_PV": None,
-        "SPARKINFER_PAGED_KV_TMA_DONOR_GEMM": None,
+        "B12X_PAGED_KV_DEBUG_DUMP": "SVWORDS",
+        "B12X_PAGED_KV_TMA": "1" if use_tma else None,
+        "B12X_PAGED_KV_TMA_COPYFRAG_QK": None,
+        "B12X_PAGED_KV_TMA_COPYFRAG_PV": None,
+        "B12X_PAGED_KV_TMA_DONOR_GEMM": None,
     }
     with _env(overrides):
         clear_attention_caches()

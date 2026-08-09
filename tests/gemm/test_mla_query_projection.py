@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer import gemm
-from sparkinfer.gemm import mla_query_projection
-from tests._reference.helpers import require_sparkinfer
+from b12x import gemm
+from b12x.gemm import mla_query_projection
+from tests._reference.helpers import require_b12x
 from tests.gemm.test_bmm import _make_pack, _rhs_views, _spec
 
 
@@ -79,7 +79,7 @@ def _reference_bf16_weight(
 def test_fused_query_matches_two_stage_reference(
     num_heads: int, m: int, output_dtype: torch.dtype
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe, q_scale = _inputs(num_heads=num_heads, m=m)
     reference_bf16 = _reference_bf16(q_nope, weight, q_pe)
     expected = (
@@ -113,7 +113,7 @@ def test_fused_query_matches_two_stage_reference(
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_fused_query_cuda_graph_replays_fresh_inputs(output_dtype: torch.dtype) -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe, q_scale = _inputs(num_heads=8, m=4)
     assert mla_query_projection.prewarm(weight, [4], output_dtype=output_dtype) == 1
     out = torch.empty(4, 8, 576, device="cuda", dtype=output_dtype)
@@ -148,7 +148,7 @@ def test_fused_query_cuda_graph_replays_fresh_inputs(output_dtype: torch.dtype) 
 
 
 def test_fused_query_support_gate_is_narrow() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     kwargs = dict(
         num_heads=8,
         max_m=32,
@@ -167,7 +167,7 @@ def test_fused_query_support_gate_is_narrow() -> None:
 
 
 def test_fused_query_rejects_wrong_rope_layout() -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe, q_scale = _inputs(num_heads=8, m=2)
     out = torch.empty(2, 8, 576, device="cuda", dtype=torch.bfloat16)
 
@@ -176,7 +176,7 @@ def test_fused_query_rejects_wrong_rope_layout() -> None:
 
 
 def test_fused_query_requires_scale_only_for_fp8() -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe, _ = _inputs(num_heads=8, m=2)
     out_bf16 = torch.empty(2, 8, 576, device="cuda", dtype=torch.bfloat16)
     mla_query_projection.run(q_nope, weight, q_pe, out_bf16)
@@ -192,7 +192,7 @@ def test_fused_query_requires_scale_only_for_fp8() -> None:
 def test_bf16_weight_matches_staged_projection(
     num_heads: int, m: int, output_dtype: torch.dtype
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe, q_scale = _bf16_inputs(num_heads=num_heads, m=m)
     reference_bf16 = _reference_bf16_weight(q_nope, weight, q_pe)
 
@@ -225,7 +225,7 @@ def test_bf16_weight_matches_staged_projection(
 def test_bf16_weight_cuda_graph_replays_fresh_inputs(
     output_dtype: torch.dtype,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe, q_scale = _bf16_inputs(num_heads=11, m=4)
     assert mla_query_projection.prewarm(weight, [4], output_dtype=output_dtype) == 1
     out = torch.empty(4, 11, 576, device="cuda", dtype=output_dtype)
@@ -259,7 +259,7 @@ def test_bf16_weight_cuda_graph_replays_fresh_inputs(
 
 
 def test_bf16_weight_supports_virtual_tp_heads() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     kwargs = dict(
         num_heads=11,
         max_m=32,
@@ -281,7 +281,7 @@ def test_bf16_weight_supports_virtual_tp_heads() -> None:
 
 
 def test_bf16_weight_requires_scale_only_for_fp8() -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe, _ = _bf16_inputs(num_heads=8, m=2)
     out_bf16 = torch.empty(2, 8, 576, device="cuda", dtype=torch.bfloat16)
     mla_query_projection.run(q_nope, weight, q_pe, out_bf16)
@@ -309,7 +309,7 @@ def _glm_h64_bf16_inputs(
 
 @pytest.mark.parametrize("m", [1, 2, 16, 32])
 def test_glm_h64_bf16_matches_staged_projection_with_production_views(m: int) -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe = _glm_h64_bf16_inputs(m=m)
     expected = torch.cat(
         (torch.bmm(q_nope, weight).transpose(0, 1), q_pe),
@@ -326,7 +326,7 @@ def test_glm_h64_bf16_matches_staged_projection_with_production_views(m: int) ->
 
 
 def test_glm_h64_bf16_cuda_graph_replays_fresh_strided_inputs() -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe = _glm_h64_bf16_inputs(m=4)
     assert mla_query_projection.prewarm_glm_h64_bf16(weight, [4]) == 1
     out = torch.empty(4, 64, 576, device="cuda", dtype=torch.bfloat16)
@@ -363,7 +363,7 @@ def test_glm_h64_bf16_cuda_graph_replays_fresh_strided_inputs() -> None:
 
 
 def test_glm_h64_bf16_support_gate_is_explicit_and_narrow() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     kwargs = dict(
         num_heads=64,
         max_m=32,
@@ -386,7 +386,7 @@ def test_glm_h64_bf16_support_gate_is_explicit_and_narrow() -> None:
 
 
 def test_glm_h64_bf16_planner_keeps_fallbacks_diagnostic_reachable() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     geometry = dict(
         num_heads=64,
         nope_dim=192,
@@ -456,7 +456,7 @@ def test_glm_h64_bf16_planner_keeps_fallbacks_diagnostic_reachable() -> None:
 
 
 def test_glm_h64_bf16_rejects_fp8_output() -> None:
-    require_sparkinfer()
+    require_b12x()
     q_nope, weight, q_pe = _glm_h64_bf16_inputs(m=2)
     out = torch.empty(2, 64, 576, device="cuda", dtype=torch.float8_e4m3fn)
 

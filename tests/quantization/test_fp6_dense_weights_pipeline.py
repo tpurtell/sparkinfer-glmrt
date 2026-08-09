@@ -3,14 +3,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.quantization.mxfp6 import (
+from b12x.quantization.mxfp6 import (
     FP6DenseWeight,
     dense_fp6_linear,
     load_fp6_dense_weight,
     quantize_dense_weight_to_fp6,
     save_fp6_dense_weight,
 )
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for FP6 GPU tests"
@@ -27,7 +27,7 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 def test_dense_fp6_weight_pipeline_roundtrip_and_equivalence(
     source_format: str, tmp_path
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(3)
     m, n, k = 128, 256, 128
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.2
@@ -56,7 +56,7 @@ def test_dense_fp6_weight_pipeline_roundtrip_and_equivalence(
 
 
 def test_dense_fp6_linear_pads_non_tile_token_count() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(5)
     m, n, k = 70, 256, 128  # m not a multiple of 128
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.2

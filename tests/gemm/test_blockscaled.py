@@ -1,8 +1,8 @@
 """gemm.blockscaled: NVFP4/MXFP8 dense block-scaled GEMM.
 
-Curated from sparkinfer tests/test_gemm_stack.py: flashinfer-core cuDNN oracle
+Curated from b12x tests/test_gemm_stack.py: flashinfer-core cuDNN oracle
 parity (NVFP4), grouped MXFP8 per-batch scale correctness, and CUDA-graph
-replay. Exhaustive tile/support-matrix sweeps stay in the sparkinfer repo.
+replay. Exhaustive tile/support-matrix sweeps stay in the b12x repo.
 """
 
 from __future__ import annotations
@@ -10,17 +10,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer._lib import dense_gemm as dense_module
-from sparkinfer._lib.intrinsics import quantize_grouped_nvfp4_torch
-from sparkinfer._lib.utils import convert_sf_from_mma_layout
-from sparkinfer.gemm import blockscaled
-from sparkinfer.gemm._shared.wo_mxfp8 import (
+from b12x._lib import dense_gemm as dense_module
+from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.utils import convert_sf_from_mma_layout
+from b12x.gemm import blockscaled
+from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
     quantize_mxfp8_rows_torch,
 )
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def _require_cudnn_fp4_oracle():
@@ -97,7 +97,7 @@ def _mm_nvfp4(
     ],
 )
 def test_mm_nvfp4_matches_flashinfer_cudnn(m, n, k, c_dtype) -> None:
-    require_sparkinfer()
+    require_b12x()
     mm_fp4 = _require_cudnn_fp4_oracle()
     torch.manual_seed(42)
 
@@ -128,7 +128,7 @@ def test_mm_nvfp4_matches_flashinfer_cudnn(m, n, k, c_dtype) -> None:
 def test_mm_mxfp8_grouped_batches_use_their_own_scales(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(29)
 
     # Real grouped WO-A geometry; force the shape-gated BK64 specialization so
@@ -176,7 +176,7 @@ def test_mm_mxfp8_grouped_batches_use_their_own_scales(
 
 
 def test_mm_pair_replays_under_cuda_graph() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(1234)
 
     gate_m, gate_n, gate_k = 32, 2048, 512

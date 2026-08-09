@@ -10,16 +10,16 @@ import torch
 
 pytest.importorskip("cutlass")
 
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
 )
-from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel import (
     W4A16FusedMoeKernel,
     W4A16TopKSumKernel,
     run_w4a16_moe,
 )
-from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
+from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     MixedTrellisRotations,
     W4A16MixedTrellisKernel,
     _validate_mixed_trellis_tier_storage,
@@ -30,7 +30,7 @@ from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
     make_mixed_trellis_buffers,
     run_mixed_trellis,
 )
-from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_moe_weights,
 )
 

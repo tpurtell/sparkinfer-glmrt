@@ -22,7 +22,7 @@ ANTI-FALLBACK PROOF.  The unified dispatch FALLS BACK to legacy for unsupported
 features, so a silent fallback would make unified==legacy (fake parity).  We do
 NOT trust the env flag.  We install TWO spies:
 
-  (1) launch counter: wrap sparkinfer._lib.compiler.launch and count every launch
+  (1) launch counter: wrap b12x._lib.compiler.launch and count every launch
       whose compile_spec.kernel_id contains "sm120" (i.e. the REAL
       UnifiedDecodeKernel / UnifiedPrefillKernel cubin compile+launch).  CUDA
       graphs capture these launches during warmup+capture; replay re-issues the
@@ -59,8 +59,8 @@ from benchmarks.common import (
     resolve_l2_flush_bytes,
 )
 
-from sparkinfer.attention._shared.workspace import SPARKINFERAttentionWorkspace
-from sparkinfer.attention._shared.mla.compressed_reference import (
+from b12x.attention._shared.workspace import B12XAttentionWorkspace
+from b12x.attention._shared.mla.compressed_reference import (
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
     COMPRESSED_MLA_NOPE_DIM,
@@ -68,9 +68,9 @@ from sparkinfer.attention._shared.mla.compressed_reference import (
     compressed_mla_page_nbytes,
     pack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer.attention._shared.mla.reference import pack_mla_kv_cache_reference
-from sparkinfer.attention._shared.mla.api import clear_mla_caches, sparse_mla_decode_forward
-from sparkinfer.attention._shared.mla.compressed_api import compressed_mla_decode_forward
+from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
+from b12x.attention._shared.mla.api import clear_mla_caches, sparse_mla_decode_forward
+from b12x.attention._shared.mla.compressed_api import compressed_mla_decode_forward
 
 _MLA_NOPE_DIM = 512   # GLM kv_lora_rank (nope) dim
 _MLA_ROPE_DIM = 64    # GLM qk_rope_head_dim
@@ -80,14 +80,14 @@ _GLM_KV_BYTES_PER_TOKEN = 656
 _DSV4_HEAD_DIM = COMPRESSED_MLA_HEAD_DIM              # 512
 _DSV4_PREFILL_PAGE = 64    # the page_block_size the unified prefill kernel uses
 
-_UNIFIED_ENV = "SPARKINFER_MLA_SM120_ROUTE_REMOVED"
+_UNIFIED_ENV = "B12X_MLA_SM120_ROUTE_REMOVED"
 
 
 # --------------------------------------------------------------------------- #
 # Spies: prove the unified kernel actually compiled + launched.
 # --------------------------------------------------------------------------- #
 class UnifiedSpy:
-    """Counts (a) real unified cubin launches via sparkinfer._lib.compiler.launch, and
+    """Counts (a) real unified cubin launches via b12x._lib.compiler.launch, and
     (b) dispatch-entrypoint calls into run_unified_decode / run_unified_prefill.
 
     Both are installed as wrappers around the genuine implementations (pass-through
@@ -106,9 +106,9 @@ class UnifiedSpy:
         self.prefill_dispatch = 0
 
     def install(self) -> None:
-        import sparkinfer._lib.compiler as compiler_mod
-        import sparkinfer.attention._shared.mla.kernel as launch_mod
-        import sparkinfer.attention._shared.mla.prefill as prefill_mod
+        import b12x._lib.compiler as compiler_mod
+        import b12x.attention._shared.mla.kernel as launch_mod
+        import b12x.attention._shared.mla.prefill as prefill_mod
 
         real_launch = compiler_mod.launch
 
@@ -124,16 +124,16 @@ class UnifiedSpy:
                 compile_kwargs=compile_kwargs,
             )
 
-        # launch.py captured `launch as sparkinfer_launch` at import; patch that binding
+        # launch.py captured `launch as b12x_launch` at import; patch that binding
         # too so the decode launcher's own reference is intercepted.
         self._saved.append((compiler_mod, "launch", compiler_mod.launch))
         compiler_mod.launch = spy_launch
-        if hasattr(launch_mod, "sparkinfer_launch"):
-            self._saved.append((launch_mod, "sparkinfer_launch", launch_mod.sparkinfer_launch))
-            launch_mod.sparkinfer_launch = spy_launch
-        if hasattr(prefill_mod, "sparkinfer_launch"):
-            self._saved.append((prefill_mod, "sparkinfer_launch", prefill_mod.sparkinfer_launch))
-            prefill_mod.sparkinfer_launch = spy_launch
+        if hasattr(launch_mod, "b12x_launch"):
+            self._saved.append((launch_mod, "b12x_launch", launch_mod.b12x_launch))
+            launch_mod.b12x_launch = spy_launch
+        if hasattr(prefill_mod, "b12x_launch"):
+            self._saved.append((prefill_mod, "b12x_launch", prefill_mod.b12x_launch))
+            prefill_mod.b12x_launch = spy_launch
 
         # Dispatch-entrypoint wrappers. The APIs import the promoted root
         # ``kernel.py`` entrypoints inside the call. Patch that binding.
@@ -182,7 +182,7 @@ def unified_enabled(enabled: bool):
 # warmup+capture, then time replays.
 # --------------------------------------------------------------------------- #
 def _time_graph(run, *, spy: UnifiedSpy, warmup: int, replays: int, l2_flush):
-    import sparkinfer.attention._shared.mla.kernel as _launch_mod
+    import b12x.attention._shared.mla.kernel as _launch_mod
 
     spy.reset()
     _launch_mod.LAST_DECODE_PLAN.clear()
@@ -245,7 +245,7 @@ def _make_dsv4_inputs(*, rows, num_heads, topk, device, seed):
 
 
 def _make_dsv4_workspace(*, rows, num_heads, topk, device, max_chunks):
-    return SPARKINFERAttentionWorkspace.for_fixed_capacity(
+    return B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
         device=device,
         dtype=torch.bfloat16,
@@ -325,7 +325,7 @@ def _make_glm_workspace(*, rows, num_heads, topk, device):
     # page_size=1 so the unified GLM gather treats each selected index as a single
     # 656B token record (stride_kv_block = page_size * 656). The legacy sparse
     # decode reads the same (n_tokens,1,656) cache with token-level page_table_1.
-    return SPARKINFERAttentionWorkspace.for_fixed_capacity(
+    return B12XAttentionWorkspace.for_fixed_capacity(
         mode="decode",
         device=device,
         dtype=torch.bfloat16,
@@ -393,7 +393,7 @@ def _import_prefill_ref():
 
 
 def _repack_prefill_to_compressed(packed_dsv4, page_size, num_blocks, dsv4_ref):
-    import sparkinfer.attention._shared.mla.compressed_reference as cr
+    import b12x.attention._shared.mla.compressed_reference as cr
     bpt = dsv4_ref.DSV4_KV_GMEM_STRIDE  # 584
     page_nbytes = cr.compressed_mla_page_nbytes(page_size)
     flat = packed_dsv4.reshape(num_blocks, page_size * bpt)
@@ -404,7 +404,7 @@ def _repack_prefill_to_compressed(packed_dsv4, page_size, num_blocks, dsv4_ref):
 
 def bench_dsv4_prefill(*, num_tokens, num_heads, topk, device, spy, warmup, replays, l2_flush, seed):
     prefill_ref, dsv4_ref = _import_prefill_ref()
-    from sparkinfer.attention._shared.mla.prefill import run_unified_prefill as _direct_prefill
+    from b12x.attention._shared.mla.prefill import run_unified_prefill as _direct_prefill
 
     page_size = _DSV4_PREFILL_PAGE
     num_blocks = max(2, (topk + page_size - 1) // page_size + 1)
@@ -429,7 +429,7 @@ def bench_dsv4_prefill(*, num_tokens, num_heads, topk, device, spy, warmup, repl
     #      prefill_dispatch is counted -- _direct_prefill above is only imported to
     #      assert the symbol exists.
     del _direct_prefill
-    import sparkinfer.attention._shared.mla.prefill as prefill_mod
+    import b12x.attention._shared.mla.prefill as prefill_mod
 
     def run_unified():
         return prefill_mod.run_unified_prefill(

@@ -8,33 +8,33 @@ import torch
 
 import cutlass
 
-from sparkinfer.attention.paged._forward import (
+from b12x.attention.paged._forward import (
     _build_extend_forward_kernel,
     _descriptor_row_ptrs,
     _encode_plane_tma_descriptors,
     _to_kernel_tensor,
     _torch_to_cutlass_dtype,
 )
-from sparkinfer.attention.paged.forward_paged import (
+from b12x.attention.paged.forward_paged import (
     PagedBf16ExtendRawForwardKernel,
     PagedFp8DecodeRawForwardKernel,
     PagedFp8ExtendRawForwardKernel,
 )
-from sparkinfer.attention.paged.merge import PagedPersistentMergeKernel
-from sparkinfer.attention.paged.reference import paged_attention_reference
-from sparkinfer.attention.paged.traits import select_paged_forward_traits_from_plan
-from sparkinfer._lib.compiler import (
+from b12x.attention.paged.merge import PagedPersistentMergeKernel
+from b12x.attention.paged.reference import paged_attention_reference
+from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
+from b12x._lib.compiler import (
     KernelCompileSpec,
-    compile as sparkinfer_compile,
+    compile as b12x_compile,
     run_compiled,
 )
-from sparkinfer._lib.utils import current_cuda_stream
-from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
-from sparkinfer.attention.paged._forward import paged_attention_forward
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
-from sparkinfer.attention.paged.planner import create_paged_plan
+from b12x._lib.utils import current_cuda_stream
+from b12x.attention._shared.contiguous.api import clear_attention_caches
+from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged.planner import create_paged_plan
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 from tests._reference.paged_attention_helpers import make_paged_inputs, quantize_paged_kv_cache_e4m3
 
 
@@ -108,7 +108,7 @@ def _make_fixed_graph_binding(
         graph_chunk_policy=True,
     )
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode=mode,
             dtype=q.dtype,
@@ -171,7 +171,7 @@ def _make_fixed_graph_binding(
 @torch.inference_mode()
 def test_paged_fp8_prefill_size_graph_oracle(q_len: int) -> None:
     """Pin every requested generic-prefill size to an oracle and graph replay."""
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
         make_paged_inputs(
@@ -255,7 +255,7 @@ def _run_paged_forward_graph_oracle(
     disable_split_kv: bool,
 ) -> None:
     """Exercise an API-routed PagedForward graph with live inputs."""
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
     mode = "decode" if disable_split_kv else "verify"
     q_len = 1 if mode == "decode" else 4
@@ -585,7 +585,7 @@ def _compile_raw_launch(
         ("cta_tile_q", case.cta_tile_q),
         ("page_size", case.page_size),
     )
-    compiled = sparkinfer_compile(kernel, *args, compile_spec=raw_spec)
+    compiled = b12x_compile(kernel, *args, compile_spec=raw_spec)
 
     final_output = raw_output
     final_lse = raw_lse.transpose(0, 1) if not case.split_kv else raw_lse
@@ -636,7 +636,7 @@ def _compile_raw_launch(
             ("head_dim", _HEAD_DIM),
             ("persistent_ctas", 2),
         )
-        merge_compiled = sparkinfer_compile(
+        merge_compiled = b12x_compile(
             merge_kernel,
             *merge_args,
             compile_spec=merge_spec,
@@ -683,7 +683,7 @@ def _launch_compiled_pair(
 @torch.inference_mode()
 def test_paged_unreachable_raw_body_graph_oracle(case: _RawCase) -> None:
     """Migration-only proof for raw bodies that have no serving call sites."""
-    require_sparkinfer()
+    require_b12x()
     cache_len = 128 if case.split_kv else 64
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
         make_paged_inputs(
@@ -797,7 +797,7 @@ _RAW_PAGE128_HIGH_PID_CASES = (
 @torch.inference_mode()
 def test_raw_extend_page128_graph_handles_high_pool_page_id(case: _RawCase) -> None:
     """Exercise raw two/four-plane TMA helpers beyond a 2^31 byte offset."""
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260722 + case.q_len)
 
     kv_dtype = torch.float8_e4m3fn if case.fp8_kv else torch.bfloat16
@@ -966,10 +966,10 @@ def test_paged_fp8_planewords_atom_byte_contract_graph(
     request: pytest.FixtureRequest,
 ) -> None:
     """Check every PLANEWORDS byte through the supported CuTe-atom path."""
-    require_sparkinfer()
-    monkeypatch.setenv("SPARKINFER_PAGED_KV_TMA", "1")
-    monkeypatch.setenv("SPARKINFER_PAGED_KV_DEBUG_DUMP", "PLANEWORDS")
-    monkeypatch.setenv("SPARKINFER_PAGED_KV_TMA_PLANE_SWIZZLE", "3,4,3")
+    require_b12x()
+    monkeypatch.setenv("B12X_PAGED_KV_TMA", "1")
+    monkeypatch.setenv("B12X_PAGED_KV_DEBUG_DUMP", "PLANEWORDS")
+    monkeypatch.setenv("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "3,4,3")
     clear_attention_caches()
     request.addfinalizer(clear_attention_caches)
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
@@ -1080,7 +1080,7 @@ def test_paged_fp8_planewords_atom_byte_contract_graph(
         ("page_size", _PAGE_SIZE),
         ("head_dim", _HEAD_DIM),
     )
-    compiled = sparkinfer_compile(kernel, *args, compile_spec=spec)
+    compiled = b12x_compile(kernel, *args, compile_spec=spec)
     expected = _fp8_planewords_expected(
         v_fp8,
         int(page_table[0, 0].item()),

@@ -17,28 +17,28 @@ from typing import Any
 import pytest
 import torch
 
-from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
-from sparkinfer.attention.nsa_indexer._impl import build_paged_mqa_schedule_metadata, clear_indexer_caches
-from sparkinfer.attention.nsa_indexer.fused_indexer import (
+from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.attention.nsa_indexer._impl import build_paged_mqa_schedule_metadata, clear_indexer_caches
+from b12x.attention.nsa_indexer.fused_indexer import (
     _COOP_STATE_WORDS,
     fused_indexer_scratch_capacity,
     run_fused_paged_indexer,
 )
-from sparkinfer.attention.nsa_indexer.kernel import (
+from b12x.attention.nsa_indexer.kernel import (
     _split_index_k_cache_runtime_views,
     build_indexer_paged_logits_kernel_binding,
     build_indexer_paged_supertile_logits_kernel_binding,
     build_indexer_paged_tiled_logits_kernel_binding,
 )
-from sparkinfer.attention.nsa_indexer.persistent_topk import (
+from b12x.attention.nsa_indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
     run_persistent_topk2048,
 )
-from sparkinfer.attention.nsa_indexer.reference import (
+from b12x.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from sparkinfer._lib.compiler import compile_cache_info
+from b12x._lib.compiler import compile_cache_info
 
 
 pytestmark = pytest.mark.skipif(
@@ -460,7 +460,7 @@ def test_nsa_paged_scheduled_multi_graph_live_gpu_oracle() -> None:
 
 def test_nsa_paged_stream_graph_live_gpu_oracle(monkeypatch) -> None:
     """Streamed supertile scorer without the tiled-top-k selector helper."""
-    monkeypatch.setenv("SPARKINFER_INDEXER_STREAM_SCORER", "1")
+    monkeypatch.setenv("B12X_INDEXER_STREAM_SCORER", "1")
     device = torch.device("cuda")
     generator = torch.Generator(device="cpu").manual_seed(83_401)
     rows, heads, max_pages, cache_pages = 2, 64, 8, 96

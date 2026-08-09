@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.quantization.mxfp6.fp6_checkpoint import (
+from b12x.quantization.mxfp6.fp6_checkpoint import (
     build_quantization_config,
     dequantize_linear_from_fp6,
     quantize_linear_to_fp6,

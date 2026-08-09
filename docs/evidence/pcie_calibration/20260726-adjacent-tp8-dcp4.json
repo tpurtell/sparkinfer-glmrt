@@ -695,10 +695,10 @@
     }
   },
   "provenance": {
-    "command": "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8 -m sparkinfer.comm.pcie.overlap_probe --tp-size 8 --dcp-size 4 --context-tokens 8192,65536,131072 --output adjacent-gpu0-7-f3fb62c.json",
+    "command": "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8 -m b12x.comm.pcie.overlap_probe --tp-size 8 --dcp-size 4 --context-tokens 8192,65536,131072 --output adjacent-gpu0-7-f3fb62c.json",
     "cuda_version": "13.2",
     "source_revision": "f3fb62c8af5bf6759e28a067b4e6fc8732a9e497",
-    "source_worktree": "/root/vllm/worktrees/sparkinfer-pcie-calibration-pr-20260726",
+    "source_worktree": "/root/vllm/worktrees/b12x-pcie-calibration-pr-20260726",
     "torch_version": "2.12.0+cu132"
   },
   "query_split": [
@@ -1164,7 +1164,7 @@
     },
     {
       "decision": {
-        "backend": "sparkinfer-dma",
+        "backend": "b12x-dma",
         "dma_gain": 0.06093374705179362,
         "dma_ms": 0.8837440013885498,
         "nccl_ms": 0.9410880208015442,
@@ -1209,7 +1209,7 @@
     },
     {
       "decision": {
-        "backend": "sparkinfer-dma",
+        "backend": "b12x-dma",
         "dma_gain": 0.10130182815466274,
         "dma_ms": 3.2825920581817627,
         "nccl_ms": 3.6526079177856445,

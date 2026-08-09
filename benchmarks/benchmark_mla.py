@@ -18,32 +18,32 @@ import torch
 import triton
 import triton.language as tl
 
-from sparkinfer.attention._shared.workspace import default_sparse_mla_split_decode_config_for_width
-from sparkinfer.attention.nsa_indexer.reference import (
+from b12x.attention._shared.workspace import default_sparse_mla_split_decode_config_for_width
+from b12x.attention.nsa_indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from sparkinfer.attention._shared.mla.reference import (
+from b12x.attention._shared.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
 )
-from sparkinfer.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, clear_mla_caches, sparse_mla_decode_forward, sparse_mla_extend_forward
-from sparkinfer.attention.sparse_mla._scratch import SPARKINFERSparseMLAScratchCaps, plan_sparse_mla_scratch
-from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
+from b12x.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, clear_mla_caches, sparse_mla_decode_forward, sparse_mla_extend_forward
+from b12x.attention.sparse_mla._scratch import B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
+from b12x.attention.nsa_indexer.contiguous_kernel import (
     _PREFILL512_BLOCK_K,
     _PREFILL512_BLOCK_Q,
     _PREFILL_BLOCK_Q,
 )
-from sparkinfer.attention.nsa_indexer.tiled_topk import run_tiled_supertile_topk
-from sparkinfer.attention.nsa_indexer.persistent_topk import (
+from b12x.attention.nsa_indexer.tiled_topk import run_tiled_supertile_topk
+from b12x.attention.nsa_indexer.persistent_topk import (
     run_persistent_topk2048,
     supports_persistent_topk2048,
 )
-from sparkinfer.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, contiguous_tiled_topk, paged_decode_logits, uses_paged_mqa_schedule
-from sparkinfer.attention.nsa_indexer.contiguous_kernel import resolve_contiguous_prefill_block_k
-from sparkinfer.attention.nsa_indexer.paged import index_topk_fp8, prepare_paged_indexer_metadata
-from sparkinfer.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_PAGED, SPARKINFERIndexerScratchCaps, plan_indexer_scratch
+from b12x.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, contiguous_tiled_topk, paged_decode_logits, uses_paged_mqa_schedule
+from b12x.attention.nsa_indexer.contiguous_kernel import resolve_contiguous_prefill_block_k
+from b12x.attention.nsa_indexer.paged import index_topk_fp8, prepare_paged_indexer_metadata
+from b12x.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_PAGED, B12XIndexerScratchCaps, plan_indexer_scratch
 
 from benchmarks.common import (
     bench_cuda_graph,
@@ -83,8 +83,8 @@ MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
 _RAGGED_TOPK_CHUNK = 4096
-_NSA_PREFILL_BLOCK_K_ENV = "SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
-_NSA_DECODE_TOPK_BACKEND_ENV = "SPARKINFER_NSA_DECODE_TOPK_BACKEND"
+_NSA_PREFILL_BLOCK_K_ENV = "B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
+_NSA_DECODE_TOPK_BACKEND_ENV = "B12X_NSA_DECODE_TOPK_BACKEND"
 
 
 def _align_up(value: int, multiple: int) -> int:
@@ -321,7 +321,7 @@ class CaseReport:
         default_factory=lambda: SanityMetrics(max_abs=0.0, rmse=0.0, cos=1.0)
     )
     flashinfer_mla_sanity: SanityMetrics | None = None
-    sparkinfer_vs_flashinfer_sanity: SanityMetrics | None = None
+    b12x_vs_flashinfer_sanity: SanityMetrics | None = None
 
     @property
     def total_us(self) -> float:
@@ -333,7 +333,7 @@ class CaseReport:
 
     @property
     def mla_ratio_vs_flashinfer(self) -> float:
-        """SPARKINFER latency divided by FlashInfer latency; lower is faster."""
+        """B12X latency divided by FlashInfer latency; lower is faster."""
 
         if self.flashinfer_mla_us <= 0.0:
             return 0.0
@@ -955,7 +955,7 @@ def _flashinfer_paged_kv_view(
     *,
     page_size: int,
 ) -> torch.Tensor:
-    """Expose sparkinfer's packed GLM records through FlashInfer's paged view."""
+    """Expose b12x's packed GLM records through FlashInfer's paged view."""
 
     record_bytes = 656
     if kv_cache.dtype != torch.uint8 or kv_cache.shape[-1] != record_bytes:
@@ -1114,7 +1114,7 @@ def _make_mla_binding(
     nsa_cache_seqlens_int32: torch.Tensor,
 ):
     plan = plan_sparse_mla_scratch(
-        SPARKINFERSparseMLAScratchCaps(
+        B12XSparseMLAScratchCaps(
             mode=mode,
             device=device,
             dtype=torch.bfloat16,
@@ -1462,7 +1462,7 @@ def _run_decode_case(
     mla_sanity = _compare(actual_output, expected_output)
     _check_mla_sanity(case=case, label="MLA", metrics=mla_sanity)
     flashinfer_mla_sanity = None
-    sparkinfer_vs_flashinfer_sanity = None
+    b12x_vs_flashinfer_sanity = None
     if flashinfer_output is not None:
         flashinfer_mla_sanity = _compare(flashinfer_output, expected_output)
         _check_mla_sanity(
@@ -1470,11 +1470,11 @@ def _run_decode_case(
             label="FlashInfer MLA",
             metrics=flashinfer_mla_sanity,
         )
-        sparkinfer_vs_flashinfer_sanity = _compare(actual_output, flashinfer_output)
+        b12x_vs_flashinfer_sanity = _compare(actual_output, flashinfer_output)
         _check_mla_sanity(
             case=case,
-            label="SPARKINFER vs FlashInfer MLA",
-            metrics=sparkinfer_vs_flashinfer_sanity,
+            label="B12X vs FlashInfer MLA",
+            metrics=b12x_vs_flashinfer_sanity,
         )
     del actual_output
     del expected_output
@@ -1582,7 +1582,7 @@ def _run_decode_case(
         indexer_topk_path=decode_topk_backend.replace("_", "-"),
         mla_sanity=mla_sanity,
         flashinfer_mla_sanity=flashinfer_mla_sanity,
-        sparkinfer_vs_flashinfer_sanity=sparkinfer_vs_flashinfer_sanity,
+        b12x_vs_flashinfer_sanity=b12x_vs_flashinfer_sanity,
     )
 
 
@@ -1657,7 +1657,7 @@ def _run_prefill_or_verify_case(
     ).repeat_interleave(case.q_len)
     if use_paged_prefill:
         # vLLM expands the single request's block table across all query rows;
-        # preserving stride(0)==0 is part of the production sparkinfer contract.
+        # preserving stride(0)==0 is part of the production b12x contract.
         live_real_page_table = base_real_page_table[:1].expand(case.total_q, -1)
     else:
         live_real_page_table = base_real_page_table.index_select(
@@ -1859,7 +1859,7 @@ def _run_prefill_or_verify_case(
         mla_workspace_mode = "verify"
     elif use_paged_prefill:
         paged_prefill_plan = plan_indexer_scratch(
-            SPARKINFERIndexerScratchCaps(
+            B12XIndexerScratchCaps(
                 device=device,
                 source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
                 num_q_heads=cfg.index_n_heads,
@@ -2154,7 +2154,7 @@ def _run_prefill_or_verify_case(
     mla_sanity = _compare(actual_output, expected_output)
     _check_mla_sanity(case=case, label="MLA", metrics=mla_sanity)
     flashinfer_mla_sanity = None
-    sparkinfer_vs_flashinfer_sanity = None
+    b12x_vs_flashinfer_sanity = None
     if flashinfer_output is not None:
         flashinfer_mla_sanity = _compare(flashinfer_output, expected_output)
         _check_mla_sanity(
@@ -2162,11 +2162,11 @@ def _run_prefill_or_verify_case(
             label="FlashInfer MLA",
             metrics=flashinfer_mla_sanity,
         )
-        sparkinfer_vs_flashinfer_sanity = _compare(actual_output, flashinfer_output)
+        b12x_vs_flashinfer_sanity = _compare(actual_output, flashinfer_output)
         _check_mla_sanity(
             case=case,
-            label="SPARKINFER vs FlashInfer MLA",
-            metrics=sparkinfer_vs_flashinfer_sanity,
+            label="B12X vs FlashInfer MLA",
+            metrics=b12x_vs_flashinfer_sanity,
         )
     del actual_output
     del expected_output
@@ -2320,7 +2320,7 @@ def _run_prefill_or_verify_case(
         indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
         flashinfer_mla_sanity=flashinfer_mla_sanity,
-        sparkinfer_vs_flashinfer_sanity=sparkinfer_vs_flashinfer_sanity,
+        b12x_vs_flashinfer_sanity=b12x_vs_flashinfer_sanity,
     )
 
 
@@ -2416,7 +2416,7 @@ def _render_case_line(report: CaseReport) -> str:
     if report.flashinfer_mla_us > 0.0:
         reference_desc = (
             f" fi_mla={report.flashinfer_mla_us:8.2f} us"
-            f" sparkinfer/fi={report.mla_ratio_vs_flashinfer:.3f}x"
+            f" b12x/fi={report.mla_ratio_vs_flashinfer:.3f}x"
         )
     if report.flashinfer_mla_sanity is not None:
         reference_desc += (
@@ -2424,11 +2424,11 @@ def _render_case_line(report: CaseReport) -> str:
             f" fi_rmse={report.flashinfer_mla_sanity.rmse:.6g}"
             f" fi_cos={report.flashinfer_mla_sanity.cos:.7f}"
         )
-    if report.sparkinfer_vs_flashinfer_sanity is not None:
+    if report.b12x_vs_flashinfer_sanity is not None:
         reference_desc += (
-            f" sparkinfer_fi_max_abs={report.sparkinfer_vs_flashinfer_sanity.max_abs:.6g}"
-            f" sparkinfer_fi_rmse={report.sparkinfer_vs_flashinfer_sanity.rmse:.6g}"
-            f" sparkinfer_fi_cos={report.sparkinfer_vs_flashinfer_sanity.cos:.7f}"
+            f" b12x_fi_max_abs={report.b12x_vs_flashinfer_sanity.max_abs:.6g}"
+            f" b12x_fi_rmse={report.b12x_vs_flashinfer_sanity.rmse:.6g}"
+            f" b12x_fi_cos={report.b12x_vs_flashinfer_sanity.cos:.7f}"
         )
     return (
         f"glm52-{report.case.mode:6s} tp8 bs={report.case.batch_size:2d} "
@@ -2491,7 +2491,7 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
         lines.extend(
             [
                 f"  flashinfer:  {flashinfer_geo:.2f} us",
-                f"  sparkinfer/fi:     {ratio_geo:.3f}x (<1 means sparkinfer faster)",
+                f"  b12x/fi:     {ratio_geo:.3f}x (<1 means b12x faster)",
             ]
         )
     return lines
@@ -2579,7 +2579,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--print-raw-samples",
         action="store_true",
-        help="print every step, sparkinfer MLA, and reference MLA replay sample",
+        help="print every step, b12x MLA, and reference MLA replay sample",
     )
     parser.add_argument("--seed", type=int, default=70_000)
     parser.add_argument("--pool-factor", type=int, default=DEFAULT_POOL_FACTOR)
@@ -2641,7 +2641,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("auto", "256", "512"),
         default=None,
         help=(
-            "override SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K for contiguous/prefill NSA logits; "
+            "override B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K for contiguous/prefill NSA logits; "
             "default preserves the existing environment"
         ),
     )

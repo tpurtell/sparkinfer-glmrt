@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import os
 import socket
+from math import gcd
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_dma import PCIeDmaAllReduce, _load_extension
+from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce, _load_kernels
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_DMA_TEST") != "1",
-    reason="set SPARKINFER_RUN_PCIE_DMA_TEST=1 to run PCIe ring allreduce GPU tests",
+    os.getenv("B12X_RUN_PCIE_DMA_TEST") != "1",
+    reason="set B12X_RUN_PCIE_DMA_TEST=1 to run PCIe ring allreduce GPU tests",
 )
 
 
@@ -47,7 +48,7 @@ def _assert_close(actual: torch.Tensor, ref: torch.Tensor, world_size: int) -> N
     # Stepwise low-precision ring adds; allow world_size half-ulps around the
     # fp32 reference. Compressed wire modes need a wider band because the ring
     # can requantize partial sums at each reduce-scatter hop.
-    if os.getenv("SPARKINFER_PCIE_DMA_FP8", "0") not in ("", "0"):
+    if os.getenv("B12X_PCIE_DMA_FP8", "0") not in ("", "0"):
         torch.testing.assert_close(
             actual.float(), ref, rtol=1.5e-1, atol=6e-2 * world_size
         )
@@ -70,23 +71,42 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     )
     hidden = 6144
     max_rows = 512
+    row_multiple = (world_size * 8) // gcd(hidden, world_size * 8)
+
+    def valid_rows(rows: int) -> int:
+        return ((rows + row_multiple - 1) // row_multiple) * row_multiple
+
     ring = PCIeDmaAllReduce(
         exchange_group=dist.group.WORLD,
         device=device,
         max_bytes=max_rows * hidden * 4,
     )
     try:
-        explicit_inp = _make_input(8, hidden, torch.bfloat16, device, rank, 0)
+        explicit_inp = _make_input(
+            valid_rows(8), hidden, torch.bfloat16, device, rank, 0
+        )
         explicit_ref = _reference(explicit_inp)
         explicit_out = torch.empty_like(explicit_inp)
+        with pytest.raises(ValueError, match="device"):
+            ring.all_reduce(explicit_inp, out=torch.empty_like(explicit_inp, device="cpu"))
+        with pytest.raises(ValueError, match="device"):
+            ring.all_reduce(
+                explicit_inp,
+                out=torch.empty_like(explicit_inp, device=(rank + 1) % world_size),
+            )
+        wrong_device = (rank + 1) % world_size
+        torch.cuda.set_device(wrong_device)
         ring.all_reduce(explicit_inp, out=explicit_out)
+        assert torch.cuda.current_device() == wrong_device
+        torch.cuda.set_device(rank)
         torch.cuda.synchronize(device)
         _assert_close(explicit_out, explicit_ref, world_size)
 
         retained_outputs: list[torch.Tensor] = []
         retained_refs: list[torch.Tensor] = []
         for dtype in (torch.bfloat16,):
-            for rows in (8, 64, 256):
+            for requested_rows in (8, 64, 256):
+                rows = valid_rows(requested_rows)
                 inp = _make_input(rows, hidden, dtype, device, rank, 0)
                 ref = _reference(inp)
                 out = ring.all_reduce(inp)
@@ -103,7 +123,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     _assert_close(retained, retained_ref, world_size)
 
         # Captured callers provide stable output storage explicitly.
-        rows = 256
+        rows = valid_rows(256)
         dtype = torch.bfloat16
         inp = _make_input(rows, hidden, dtype, device, rank, 0)
         out = torch.empty_like(inp)
@@ -126,17 +146,17 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def test_pcie_dma_all_reduce_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DMA_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_DMA_WORLD_SIZE", "2"))
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    _load_extension()
+    _load_kernels()
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
 
 def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
-    os.environ["SPARKINFER_PCIE_DMA_FP8"] = mode
+    os.environ["B12X_PCIE_DMA_FP8"] = mode
     _worker(rank, world_size, port)
 
 
@@ -157,12 +177,12 @@ def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
 def test_pcie_dma_all_reduce_compressed_wire(mode: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DMA_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_DMA_WORLD_SIZE", "2"))
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    _load_extension()
+    _load_kernels()
     mp.spawn(
         _fp8_worker,
         args=(world_size, _free_port(), mode),
@@ -186,11 +206,11 @@ def test_pcie_dma_mxfp8_codec_matches_cpu_reference() -> None:
     storage = torch.empty(elems + elems // 32, dtype=torch.uint8, device=device)
     output = torch.empty_like(source)
 
-    ext = _load_extension()
-    ext.dma_quant_mx(
+    kernels = _load_kernels()
+    kernels.dma_quant_mx(
         source.data_ptr(), storage.data_ptr(), storage.data_ptr() + elems, elems
     )
-    ext.dma_dequant_store_mx(
+    kernels.dma_dequant_store_mx(
         output.data_ptr(), storage.data_ptr(), storage.data_ptr() + elems, elems
     )
     torch.cuda.synchronize(device)
@@ -212,3 +232,77 @@ def test_pcie_dma_mxfp8_codec_matches_cpu_reference() -> None:
     assert torch.equal(actual_scales, expected_scales)
     assert torch.equal(actual_payload, expected_payload.reshape(-1).view(torch.uint8))
     assert torch.equal(output.cpu(), expected_output.to(torch.bfloat16))
+
+
+def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
+    """Lock the CUDA E8M0/SATFINITE edge semantics without native code."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    device = torch.device("cuda:0")
+    bit_patterns = torch.arange(1 << 16, dtype=torch.int32).to(torch.int16)
+    source_values = bit_patterns.view(torch.bfloat16)
+    source = source_values.to(device).repeat_interleave(32)
+    payload = torch.empty(source.numel(), dtype=torch.uint8, device=device)
+    scales = torch.empty(1 << 16, dtype=torch.uint8, device=device)
+
+    kernels = _load_kernels()
+    kernels.dma_quant_mx(
+        source.data_ptr(), payload.data_ptr(), scales.data_ptr(), source.numel()
+    )
+    torch.cuda.synchronize(device)
+
+    # __nv_cvt_float_to_e8m0(amax / 448, SATFINITE, round-positive-inf).
+    # For a finite normal BF16 value, division by 448 (= 1.75 * 2**8)
+    # increments the resulting exponent exactly when its significand exceeds
+    # 1.75. E8M0 reserves byte 0 for 2**-127 and saturates infinity to 254.
+    absolute_bits = bit_patterns.to(torch.int32) & 0x7FFF
+    exponent = absolute_bits >> 7
+    fraction = absolute_bits & 0x7F
+    expected_scales = torch.clamp(
+        exponent - 8 + (fraction > 96).to(torch.int32), min=0
+    )
+    expected_scales = torch.where(
+        absolute_bits == 0, torch.full_like(expected_scales, 127), expected_scales
+    )
+    expected_scales = torch.where(
+        exponent == 255,
+        torch.where(
+            fraction == 0,
+            torch.full_like(expected_scales, 254),
+            torch.full_like(expected_scales, 255),
+        ),
+        expected_scales,
+    ).to(torch.uint8)
+
+    scale_exponents = expected_scales.to(torch.int32) - 127
+    scale_values = torch.pow(2.0, scale_exponents.to(torch.float32))
+    scale_values = torch.where(
+        expected_scales == 0, torch.tensor(2.0**-127), scale_values
+    )
+    scale_values = torch.where(
+        expected_scales == 255, torch.tensor(float("nan")), scale_values
+    )
+    expected_payload = (
+        source_values.float() / scale_values
+    ).to(torch.float8_e4m3fn).view(torch.uint8)
+    is_inf = (exponent == 255) & (fraction == 0)
+    is_nan = (exponent == 255) & (fraction != 0)
+    expected_payload = torch.where(
+        is_inf,
+        torch.where(
+            (bit_patterns.to(torch.int32) & 0x8000) != 0,
+            torch.full_like(expected_payload, 0xFE),
+            torch.full_like(expected_payload, 0x7E),
+        ),
+        expected_payload,
+    )
+    expected_payload = torch.where(
+        is_nan, torch.full_like(expected_payload, 0x7F), expected_payload
+    )
+
+    assert torch.equal(scales.cpu(), expected_scales)
+    assert torch.equal(
+        payload.cpu(), expected_payload.repeat_interleave(32)
+    )

@@ -3,16 +3,16 @@ from __future__ import annotations
 import pytest
 import torch
 
-import sparkinfer.moe.ep_moe._impl as ep_moe
-from sparkinfer._lib.intrinsics import swizzle_block_scale
-from sparkinfer.moe.ep_moe._impl import (
+import b12x.moe.ep_moe._impl as ep_moe
+from b12x._lib.intrinsics import swizzle_block_scale
+from b12x.moe.ep_moe._impl import (
     EPMoEScratchCaps,
     plan_ep_moe_scratch,
     prepare_ep_expert_map,
-    sparkinfer_ep_moe_fp4,
+    b12x_ep_moe_fp4,
 )
-from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights
+from b12x.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     route_block_sizes_for_capacity,
     route_pack_token_capacity,
@@ -21,7 +21,7 @@ from tests._reference.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 
 
 def _weight_plan(*, local_experts: int = 4, dtype: torch.dtype = torch.bfloat16):
-    return plan_sparkinfer_fp4_moe_weights(
+    return plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="modelopt_nvfp4",
         activation="silu",
@@ -253,7 +253,7 @@ def _run_ep_rank(
         expert_map=prepared_map,
         output=output,
     )
-    return sparkinfer_ep_moe_fp4(binding=binding), binding
+    return b12x_ep_moe_fp4(binding=binding), binding
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

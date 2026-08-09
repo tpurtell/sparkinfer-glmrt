@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from benchmarks.checkpoint_loader import IndexedSafetensorLoader
-from sparkinfer.moe._shared.kernels.reference import (
+from b12x.moe._shared.kernels.reference import (
     OracleMetrics,
     compare_to_reference,
     decompose_nvfp4_scales_to_mx_residual,
@@ -36,12 +36,12 @@ from sparkinfer.moe._shared.kernels.reference import (
     moe_reference_w4a16_f32,
     unswizzle_block_scale,
 )
-from sparkinfer.moe._shared.kernels.reference_flashinfer import (
+from b12x.moe._shared.kernels.reference_flashinfer import (
     FlashInferTrtllmFP4E8M0K32Weights,
     moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared,
     prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
 )
-from sparkinfer.moe._shared.kernels.activations import (
+from b12x.moe._shared.kernels.activations import (
     SUPPORTED_MOE_ACTIVATIONS,
     SWIGLUOAI_DEFAULT_ALPHA,
     SWIGLUOAI_DEFAULT_BETA,
@@ -50,7 +50,7 @@ from sparkinfer.moe._shared.kernels.activations import (
     moe_activation_w1_rows,
     normalize_moe_activation,
 )
-from sparkinfer._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
+from b12x._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from tests._reference.w4a16_reference import moe_reference_w4a16
 
@@ -492,7 +492,7 @@ def resolve_model_path(
 ) -> pathlib.Path:
     if override is not None:
         return override
-    env_path = os.environ.get("SPARKINFER_MODEL_PATH")
+    env_path = os.environ.get("B12X_MODEL_PATH")
     if env_path:
         return pathlib.Path(env_path)
     if profile.default_model_path is not None and profile.default_model_path.is_dir():
@@ -557,7 +557,7 @@ class ExpertWeights:
 
 @dataclass(frozen=True)
 class FlashInferMXFP4Weights:
-    """FlashInfer-owned MXFP4 tensors prepared before SPARKINFER repacks its source."""
+    """FlashInfer-owned MXFP4 tensors prepared before B12X repacks its source."""
 
     fc1_expert_weights: torch.Tensor
     fc2_expert_weights: torch.Tensor
@@ -1002,7 +1002,7 @@ def load_expert_weights(
         print(" done.")
 
         # The compressed-tensors W4A16 checkpoint stores per-tensor global
-        # scales as the inverse convention of the SPARKINFER W4A16 path.  Fold
+        # scales as the inverse convention of the B12X W4A16 path.  Fold
         # 1 / weight_global_scale into the FP4 block scales and launch with
         # unit alphas so the benchmark exercises the same model contract.
         up_sf = (
@@ -1086,8 +1086,8 @@ def load_expert_weights(
             down_sf[eid] = loader.get_tensor(f"{ep}.{down_proj}.scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
         print(" done.")
 
-        # Match vLLM FusedMoE loading for the SPARKINFER backend: native DeepSeek V4
-        # FP4 W13 source is contiguous [w1/gate, w3/up], and SPARKINFER receives it
+        # Match vLLM FusedMoE loading for the B12X backend: native DeepSeek V4
+        # FP4 W13 source is contiguous [w1/gate, w3/up], and B12X receives it
         # without an additional row swap.
         w13_weight = torch.cat([gate_w, up_w], dim=1).contiguous()
         w13_sf = torch.cat([gate_sf, up_sf], dim=1).contiguous()
@@ -1534,7 +1534,7 @@ def get_w4a16_prepare_scales(
     return params.g1_alphas, params.g2_alphas, weights.source_format
 
 
-def plan_sparkinfer_benchmark_weights(
+def plan_b12x_benchmark_weights(
     weights: ExpertWeights,
     *,
     quant_mode: str,
@@ -1542,11 +1542,11 @@ def plan_sparkinfer_benchmark_weights(
     w4a16_native: bool = False,
 ):
     """Choose the benchmark's sole authoritative weight layout."""
-    from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights
-    from sparkinfer.moe._shared.execution import PreparedWeightLayout
+    from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights
+    from b12x.moe._shared.execution import PreparedWeightLayout
 
     quant_mode = quant_mode.lower()
-    return plan_sparkinfer_fp4_moe_weights(
+    return plan_b12x_fp4_moe_weights(
         quant_modes=quant_mode,
         source_format=weights.source_format,
         activation=activation,
@@ -1563,7 +1563,7 @@ def plan_sparkinfer_benchmark_weights(
     )
 
 
-def prepare_sparkinfer_benchmark_weights(
+def prepare_b12x_benchmark_weights(
     weights: ExpertWeights,
     params: ScaleContractParams,
     *,
@@ -1573,11 +1573,11 @@ def prepare_sparkinfer_benchmark_weights(
     plan=None,
 ):
     """Execute the benchmark's planner-selected authoritative layout."""
-    from sparkinfer.moe.fused_moe._impl import prepare_sparkinfer_fp4_moe_weights
+    from b12x.moe.fused_moe._impl import prepare_b12x_fp4_moe_weights
 
     quant_mode = quant_mode.lower()
     if plan is None:
-        plan = plan_sparkinfer_benchmark_weights(
+        plan = plan_b12x_benchmark_weights(
             weights,
             quant_mode=quant_mode,
             activation=activation,
@@ -1597,7 +1597,7 @@ def prepare_sparkinfer_benchmark_weights(
         w1_global_scale = params.g1_alphas * params.a1_gscale
         w2_global_scale = params.g2_alphas * params.a2_gscale
 
-    experts = prepare_sparkinfer_fp4_moe_weights(
+    experts = prepare_b12x_fp4_moe_weights(
         plan=plan,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
@@ -1811,7 +1811,7 @@ def force_convert_nvfp4_weights_to_mxfp4(
 ) -> ExpertWeights:
     """Re-quantize a ModelOpt NVFP4 MoE source to native MXFP4 E8M0/K32.
 
-    This is intentionally an offline preparation step, before the sparkinfer weight
+    This is intentionally an offline preparation step, before the b12x weight
     planner runs.  Each expert is reconstructed with the checkpoint's complete
     input/weight scale contract and then quantized onto a fresh K/32 power-of-
     two scale grid.  The result is a real ``fp4_e8m0_k32`` source for the
@@ -1934,7 +1934,7 @@ def prepare_flashinfer_mxfp4_weights(
         )
 
     # FlashInfer's SwiGLU CUTLASS kernel consumes FC1 as [up/w3; gate/w1].
-    # SPARKINFER calls that source order w13; checkpoint-native w31 is [gate; up].
+    # B12X calls that source order w13; checkpoint-native w31 is [gate; up].
     swap_fc1_halves = weights.w13_layout == "w31"
     if weights.w13_layout not in {"w13", "w31"}:
         raise ValueError(f"unsupported W13 layout {weights.w13_layout!r}")
@@ -2407,12 +2407,12 @@ def check_oracle_metrics(
     return failures
 
 
-def _clear_sparkinfer_caches() -> None:
-    from sparkinfer.moe.fused_moe._impl import clear_tp_moe_caches
+def _clear_b12x_caches() -> None:
+    from b12x.moe.fused_moe._impl import clear_tp_moe_caches
 
     clear_tp_moe_caches()
     try:
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import clear_w4a16_kernel_cache
+        from b12x.moe._shared.kernels.w4a16.kernel import clear_w4a16_kernel_cache
     except ImportError:
         return
     clear_w4a16_kernel_cache()
@@ -2485,7 +2485,7 @@ def compare_graph_replay_outputs(
 
 
 def allocate_layer_chain_workspace():
-    from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
+    from b12x.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
 
     return allocate_tp_moe_workspace_pool()
 
@@ -2502,7 +2502,7 @@ def run_moe_layer_chain(
     output_buffers: Sequence[torch.Tensor] | None = None,
     workspace,
 ) -> list[torch.Tensor]:
-    from sparkinfer.moe.fused_moe._impl import sparkinfer_moe_fp4, build_tp_moe_fp4_binding
+    from b12x.moe.fused_moe._impl import b12x_moe_fp4, build_tp_moe_fp4_binding
 
     if not (
         len(experts_stack) == len(topk_ids_per_layer)
@@ -2536,7 +2536,7 @@ def run_moe_layer_chain(
             quant_mode=quant_mode,
             **activation_params.kwargs(),
         )
-        current = sparkinfer_moe_fp4(binding=binding)
+        current = b12x_moe_fp4(binding=binding)
         layer_outputs.append(current)
     return layer_outputs
 
@@ -2617,13 +2617,13 @@ def bench_multilayer_graph_mode(
             "against an eager layer chain."
         )
     print("Multi-layer graph mode")
-    print("Backend: sparkinfer")
+    print("Backend: b12x")
     print(f"Quant mode: {args.quant_mode}")
     print(f"Layers: {layer_start}..{layer_start + graph_num_layers - 1}")
     print("Patterns: disjoint, overlap, random")
     print()
 
-    _clear_sparkinfer_caches()
+    _clear_b12x_caches()
     weights_stack = load_expert_weight_stack(
         model_path,
         spec,
@@ -2640,7 +2640,7 @@ def bench_multilayer_graph_mode(
             args.scale_contract,
             args.quant_mode,
         )
-        experts, _ = prepare_sparkinfer_benchmark_weights(
+        experts, _ = prepare_b12x_benchmark_weights(
             weights,
             params,
             quant_mode=args.quant_mode,
@@ -2806,7 +2806,7 @@ def bench_multilayer_graph_mode(
 
 
 def bench_e2e() -> None:
-    from sparkinfer.moe.fused_moe._impl import default_moe_quant_mode
+    from b12x.moe.fused_moe._impl import default_moe_quant_mode
 
     quant_mode_default = default_moe_quant_mode()
     parser = argparse.ArgumentParser()
@@ -3087,7 +3087,7 @@ def bench_e2e() -> None:
     if args.routing_repeat_period:
         print(f"Routing repeat period: {args.routing_repeat_period} tokens")
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
-    backend_label = "sparkinfer"
+    backend_label = "b12x"
     print(f"Backend: {backend_label}")
     print(f"Reference: {args.reference}")
     print(f"Scale contract: {args.scale_contract}")
@@ -3143,7 +3143,7 @@ def bench_e2e() -> None:
         )
     print(f"Source format: {weights.source_format}")
     params = get_quant_mode_params(weights, args.scale_contract, args.quant_mode)
-    weight_plan = plan_sparkinfer_benchmark_weights(
+    weight_plan = plan_b12x_benchmark_weights(
         weights,
         quant_mode=args.quant_mode,
         activation=args.activation,
@@ -3188,7 +3188,7 @@ def bench_e2e() -> None:
             del oracle_x, oracle_ids, oracle_topk, oracle_output
         torch.cuda.synchronize()
         # FlashInfer validation may have prepared a test-only alternate model
-        # representation.  It must not survive into SPARKINFER preparation/runtime.
+        # representation.  It must not survive into B12X preparation/runtime.
         weights.oracle_flashinfer_weights = None
         weights.oracle_w13_weight = None
         weights.oracle_w13_scale = None
@@ -3211,7 +3211,7 @@ def bench_e2e() -> None:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         print(" done.")
-    experts, params = prepare_sparkinfer_benchmark_weights(
+    experts, params = prepare_b12x_benchmark_weights(
         weights,
         params,
         quant_mode=args.quant_mode,
@@ -3222,7 +3222,7 @@ def bench_e2e() -> None:
     backend_w4a16_weights = None
     make_backend_w4a16_buffers = None
     if use_w4a16:
-        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+        from b12x.moe._shared.kernels.w4a16.prepare import (
             make_w4a16_packed_buffers as make_w4a16_buffers,
         )
 
@@ -3245,20 +3245,20 @@ def bench_e2e() -> None:
         args.activation,
     )
 
-    from sparkinfer.moe.fused_moe._impl import (
+    from b12x.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
-        sparkinfer_moe_fp4,
+        b12x_moe_fp4,
         build_tp_moe_fp4_binding,
     )
     w4a16_moe = None
     if use_w4a16:
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+        from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 
         w4a16_moe = run_w4a16_moe
 
-    _clear_sparkinfer_caches()
+    _clear_b12x_caches()
 
-    print("  Warming up sparkinfer (compilation)...", end="", flush=True)
+    print("  Warming up b12x (compilation)...", end="", flush=True)
     x_warm, topk_ids_w, topk_weights_w = make_profile_routed_inputs(
         model_profile,
         weights,
@@ -3310,7 +3310,7 @@ def bench_e2e() -> None:
             unit_scale_contract=unit_scale_contract,
             **activation_params.kwargs(),
         )
-        sparkinfer_moe_fp4(binding=warmup_binding)
+        b12x_moe_fp4(binding=warmup_binding)
     torch.cuda.synchronize()
     print(" done.")
 
@@ -3325,7 +3325,7 @@ def bench_e2e() -> None:
                 activation=args.activation, checkpoint_family=model_profile.checkpoint_family,
             )
             rp = get_quant_mode_params(rw, args.scale_contract, args.quant_mode)
-            rexperts, _ = prepare_sparkinfer_benchmark_weights(
+            rexperts, _ = prepare_b12x_benchmark_weights(
                 rw,
                 rp,
                 quant_mode=args.quant_mode,
@@ -3352,7 +3352,7 @@ def bench_e2e() -> None:
                 unit_scale_contract=unit_scale_contract,
                 **activation_params.kwargs(),
             )
-            sparkinfer_moe_fp4(binding=binding_r)
+            b12x_moe_fp4(binding=binding_r)
         torch.cuda.synchronize()
         print(f" {spec.tp_size} ranks done.")
 
@@ -3467,7 +3467,7 @@ def bench_e2e() -> None:
                     backend_binding.topk_ids.copy_(topk_ids_local)
                 if topk_weights_local is not backend_binding.topk_weights:
                     backend_binding.topk_weights.copy_(topk_weights_local)
-                return sparkinfer_moe_fp4(binding=backend_binding)
+                return b12x_moe_fp4(binding=backend_binding)
 
             def impl_e2e() -> torch.Tensor:
                 if args.include_routing:
@@ -3781,7 +3781,7 @@ def bench_e2e() -> None:
         # ---- TP-parallel graph replay ----
         if tp_parallel_ranks:
             tp_n = len(tp_parallel_ranks)
-            label = f"sparkinfer TP={tp_n} parallel"
+            label = f"b12x TP={tp_n} parallel"
             print(f"  {label} (CUDA graph):".ljust(28), end="", flush=True)
             try:
                 # Per-rank inputs, outputs, workspaces
@@ -3813,7 +3813,7 @@ def bench_e2e() -> None:
                 ]
 
                 def launch_tp_rank(r: int) -> None:
-                    sparkinfer_moe_fp4(binding=tp_bindings[r])
+                    b12x_moe_fp4(binding=tp_bindings[r])
 
                 # Warm eager launches
                 for r, stream in enumerate(tp_streams):

@@ -7,8 +7,8 @@ import sys
 import pytest
 import torch
 
-from sparkinfer.attention.nsa_indexer.reference import pack_index_k_cache_reference
-from sparkinfer.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, paged_decode_logits
+from b12x.attention.nsa_indexer.reference import pack_index_k_cache_reference
+from b12x.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, paged_decode_logits
 
 
 _SGLANG_PYTHON_ROOT = Path("/home/luke/projects/sglang/python")
@@ -25,11 +25,11 @@ def _import_sglang_nsa_indexer():
     except Exception as exc:  # pragma: no cover - environment-dependent import path
         pytest.skip(f"unable to import sglang NSA indexer: {exc}")
     if not (
-        hasattr(module.Indexer, "_use_sparkinfer_indexer")
-        or hasattr(module.Indexer, "_use_sparkinfer_mla_indexer")
+        hasattr(module.Indexer, "_use_b12x_indexer")
+        or hasattr(module.Indexer, "_use_b12x_mla_indexer")
     ):
         pytest.skip(
-            "sglang NSA/DSA indexer no longer exposes the legacy sparkinfer boundary hooks"
+            "sglang NSA/DSA indexer no longer exposes the legacy b12x boundary hooks"
         )
     return module
 
@@ -136,8 +136,8 @@ class _FakeAttnBackend:
         self.model_v_head_dim = int(v_head_dim)
         self._workspaces: dict[tuple[str, torch.device], object] = {}
 
-    def _get_sparkinfer_workspace(self, *, mode: str, v_head_dim: int):
-        from sparkinfer.attention._shared.workspace import SPARKINFERAttentionWorkspace
+    def _get_b12x_workspace(self, *, mode: str, v_head_dim: int):
+        from b12x.attention._shared.workspace import B12XAttentionWorkspace
 
         normalized_mode = "verify" if mode == "target_verify" else mode
         key = (normalized_mode, self.device)
@@ -145,7 +145,7 @@ class _FakeAttnBackend:
         if workspace is not None:
             return workspace
         max_total_q = 64 if normalized_mode != "decode" else 32
-        workspace = SPARKINFERAttentionWorkspace.for_fixed_capacity(
+        workspace = B12XAttentionWorkspace.for_fixed_capacity(
             mode=normalized_mode,
             device=self.device,
             dtype=torch.bfloat16,
@@ -166,9 +166,9 @@ class _FakeAttnBackend:
         self._workspaces[key] = workspace
         return workspace
 
-    def get_sparkinfer_indexer_paged_workspace(self, *, forward_batch):
+    def get_b12x_indexer_paged_workspace(self, *, forward_batch):
         del forward_batch
-        return self._get_sparkinfer_workspace(mode="decode", v_head_dim=self.model_v_head_dim)
+        return self._get_b12x_workspace(mode="decode", v_head_dim=self.model_v_head_dim)
 
 
 class _FakePagedMetadata:
@@ -323,14 +323,14 @@ class _FakeRaggedMetadata:
         return output
 
 
-def _get_sparkinfer_impl_name(module) -> str:
-    return "sparkinfer" if hasattr(module.Indexer, "_use_sparkinfer_indexer") else "sparkinfer_mla"
+def _get_b12x_impl_name(module) -> str:
+    return "b12x" if hasattr(module.Indexer, "_use_b12x_indexer") else "b12x_mla"
 
 
-def _get_use_sparkinfer_indexer_method(module):
-    method = getattr(module.Indexer, "_use_sparkinfer_indexer", None)
+def _get_use_b12x_indexer_method(module):
+    method = getattr(module.Indexer, "_use_b12x_indexer", None)
     if method is None:
-        method = getattr(module.Indexer, "_use_sparkinfer_mla_indexer")
+        method = getattr(module.Indexer, "_use_b12x_mla_indexer")
     return method
 
 
@@ -339,11 +339,11 @@ def _make_fake_indexer(module, *, topk: int, num_heads: int):
         index_topk = topk
         layer_id = 0
         n_heads = num_heads
-        _sparkinfer_indexer_phantoms = None
-        _use_sparkinfer_indexer = staticmethod(_get_use_sparkinfer_indexer_method(module))
-        _get_sparkinfer_paged_topk = module.Indexer._get_sparkinfer_paged_topk
-        _get_sparkinfer_ragged_topk = module.Indexer._get_sparkinfer_ragged_topk
-        _get_sparkinfer_indexer_phantoms = module.Indexer._get_sparkinfer_indexer_phantoms
+        _b12x_indexer_phantoms = None
+        _use_b12x_indexer = staticmethod(_get_use_b12x_indexer_method(module))
+        _get_b12x_paged_topk = module.Indexer._get_b12x_paged_topk
+        _get_b12x_ragged_topk = module.Indexer._get_b12x_ragged_topk
+        _get_b12x_indexer_phantoms = module.Indexer._get_b12x_indexer_phantoms
 
         @staticmethod
         def _should_chunk_mqa_logits(num_q: int, num_k: int, device: torch.device):
@@ -389,7 +389,7 @@ def _make_paged_candidate_tables(
     return page_table_1, real_page_table
 
 
-def test_sglang_sparkinfer_indexer_paged_boundary_matches_sparkinfer_reference() -> None:
+def test_sglang_b12x_indexer_paged_boundary_matches_b12x_reference() -> None:
     module = _import_sglang_nsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_100)
@@ -424,7 +424,7 @@ def test_sglang_sparkinfer_indexer_paged_boundary_matches_sparkinfer_reference()
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
             "attn_backend": _FakeAttnBackend(
-                impl_name=_get_sparkinfer_impl_name(module),
+                impl_name=_get_b12x_impl_name(module),
                 device=torch.device("cpu"),
                 topk=topk,
                 num_heads=num_heads,
@@ -462,7 +462,7 @@ def test_sglang_sparkinfer_indexer_paged_boundary_matches_sparkinfer_reference()
     assert torch.equal(actual, expected)
 
 
-def test_sglang_sparkinfer_indexer_paged_boundary_respects_active_decode_rows() -> None:
+def test_sglang_b12x_indexer_paged_boundary_respects_active_decode_rows() -> None:
     module = _import_sglang_nsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_102)
@@ -498,7 +498,7 @@ def test_sglang_sparkinfer_indexer_paged_boundary_respects_active_decode_rows() 
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
             "attn_backend": _FakeAttnBackend(
-                impl_name=_get_sparkinfer_impl_name(module),
+                impl_name=_get_b12x_impl_name(module),
                 device=torch.device("cpu"),
                 topk=topk,
                 num_heads=num_heads,
@@ -537,7 +537,7 @@ def test_sglang_sparkinfer_indexer_paged_boundary_respects_active_decode_rows() 
     assert torch.equal(actual, torch.cat([expected, padding], dim=0))
 
 
-def test_sglang_sparkinfer_indexer_ragged_boundary_matches_sparkinfer_reference() -> None:
+def test_sglang_b12x_indexer_ragged_boundary_matches_b12x_reference() -> None:
     module = _import_sglang_nsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_101)
@@ -574,7 +574,7 @@ def test_sglang_sparkinfer_indexer_ragged_boundary_matches_sparkinfer_reference(
             "forward_mode": _FakeExtendMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
             "attn_backend": _FakeAttnBackend(
-                impl_name=_get_sparkinfer_impl_name(module),
+                impl_name=_get_b12x_impl_name(module),
                 device=torch.device("cpu"),
                 topk=topk,
                 num_heads=num_heads,
@@ -634,7 +634,7 @@ def test_sglang_sparkinfer_indexer_ragged_boundary_matches_sparkinfer_reference(
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for graph capture coverage"
 )
-def test_sglang_sparkinfer_indexer_paged_boundary_cuda_graph_capture() -> None:
+def test_sglang_b12x_indexer_paged_boundary_cuda_graph_capture() -> None:
     module = _import_sglang_nsa_indexer()
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -679,7 +679,7 @@ def test_sglang_sparkinfer_indexer_paged_boundary_cuda_graph_capture() -> None:
             "forward_mode": _FakeDecodeMode(),
             "token_to_kv_pool": _FakePool(index_k_cache),
             "attn_backend": _FakeAttnBackend(
-                impl_name=_get_sparkinfer_impl_name(module),
+                impl_name=_get_b12x_impl_name(module),
                 device=device,
                 topk=topk,
                 num_heads=num_heads,

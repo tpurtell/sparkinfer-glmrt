@@ -2,18 +2,18 @@
 MoE output (the strongest single consistency check across both moe ops), and
 a captured binding must observe changed routes on replay.
 
-Curated from sparkinfer tests/test_ep_moe_api.py; scratch-sizing and contract
-validation unit tests stay in the sparkinfer repo.
+Curated from b12x tests/test_ep_moe_api.py; scratch-sizing and contract
+validation unit tests stay in the b12x repo.
 """
 
 from __future__ import annotations
 
 import torch
 
-from sparkinfer.moe import ep_moe
+from b12x.moe import ep_moe
 
 from .._reference.helpers import run_tp_moe_fp4
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 from .test_fused_moe import make_modelopt_weights, prepare_experts
 
 
@@ -58,7 +58,7 @@ def _run_ep_rank(
 
 
 def test_ep_rank_partials_sum_to_full_fused_moe() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260630)
 
     global_e, hidden_size, intermediate_size = 7, 128, 128
@@ -109,7 +109,7 @@ def test_ep_rank_partials_sum_to_full_fused_moe() -> None:
 
 
 def test_binding_replays_with_changed_routes_under_cuda_graph() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260631)
 
     global_e, hidden_size, intermediate_size = 4, 128, 128

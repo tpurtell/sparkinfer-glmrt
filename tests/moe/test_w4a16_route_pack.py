@@ -5,8 +5,8 @@ import math
 import pytest
 import torch
 
-from sparkinfer.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
+from b12x.moe._shared.kernels.w4a16.host import (
     route_block_sizes_for_capacity,
     select_route_block_size_m,
 )

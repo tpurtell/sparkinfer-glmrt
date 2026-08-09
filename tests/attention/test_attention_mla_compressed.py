@@ -6,14 +6,14 @@ import math
 import pytest
 import torch
 
-import sparkinfer.attention._shared.mla.compressed_api as compressed_api_impl
-import sparkinfer.attention._shared.mla.merge as mla_split_impl
-from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
-from sparkinfer.attention._shared.workspace import (
-    SPARKINFERAttentionArena,
-    SPARKINFERAttentionArenaCaps,
+import b12x.attention._shared.mla.compressed_api as compressed_api_impl
+import b12x.attention._shared.mla.merge as mla_split_impl
+from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.attention._shared.workspace import (
+    B12XAttentionArena,
+    B12XAttentionArenaCaps,
 )
-from sparkinfer.attention._shared.mla.compressed_reference import (
+from b12x.attention._shared.mla.compressed_reference import (
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_C4_PAGE_SIZE,
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
@@ -23,20 +23,20 @@ from sparkinfer.attention._shared.mla.compressed_reference import (
     gather_compressed_mla_kv_cache_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer.attention._shared.mla.compressed_api import (
+from b12x.attention._shared.mla.compressed_api import (
     _should_use_sm121_single_pass_decode,
 )
-from sparkinfer.attention._shared.mla.kernel import _dsv4_h16_auto
-from sparkinfer.attention._shared.mla.compressed_config import (
+from b12x.attention._shared.mla.kernel import _dsv4_h16_auto
+from b12x.attention._shared.mla.compressed_config import (
     compressed_mla_split_config_for_contract,
 )
-from sparkinfer.attention._shared.mla.api import clear_mla_caches
-from sparkinfer.attention._shared.mla.compressed_api import compressed_mla_decode_forward
-from sparkinfer.attention._shared.mla.compressed_config import compressed_mla_split_chunks_for_contract
-from sparkinfer.attention.compressed_mla._scratch import SPARKINFERCompressedMLAScratchCaps, plan_compressed_mla_scratch
-from sparkinfer._lib.compiler import clear_compile_cache, compile_cache_info
+from b12x.attention._shared.mla.api import clear_mla_caches
+from b12x.attention._shared.mla.compressed_api import compressed_mla_decode_forward
+from b12x.attention._shared.mla.compressed_config import compressed_mla_split_chunks_for_contract
+from b12x.attention.compressed_mla._scratch import B12XCompressedMLAScratchCaps, plan_compressed_mla_scratch
+from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 _COMPRESSED_HEAD_DIM = 512
@@ -154,7 +154,7 @@ def _make_split_merge_tensors(
 
 @torch.inference_mode()
 def test_split_sink_merge_live_rows_do_not_resolve_new_kernel() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_compile_cache()
     mla_split_impl.clear_sparse_mla_merge_kernel_cache()
 
@@ -220,7 +220,7 @@ def _make_compressed_binding(
     max_page_table_width: int | None = None,
 ):
     plan = plan_compressed_mla_scratch(
-        SPARKINFERCompressedMLAScratchCaps(
+        B12XCompressedMLAScratchCaps(
             device=device,
             dtype=torch.bfloat16,
             kv_dtype=torch.uint8,
@@ -325,7 +325,7 @@ def test_compressed_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
 
 
 def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     selected_widths = (128, 640, 2880)
     graph_q_rows = 16
     compressed_prefill_q = 8192
@@ -373,14 +373,14 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
         paged_indexer_logits_k_rows=4160 * 64,
         paged_indexer_tile_logits_k_rows=32768,
     )
-    capped = SPARKINFERAttentionArena.required_nbytes(
-        SPARKINFERAttentionArenaCaps(**base_caps, mla_max_q_chunks=mla_max_q_chunks)
+    capped = B12XAttentionArena.required_nbytes(
+        B12XAttentionArenaCaps(**base_caps, mla_max_q_chunks=mla_max_q_chunks)
     )
-    layout = SPARKINFERAttentionArena._layout(
-        SPARKINFERAttentionArenaCaps(**base_caps, mla_max_q_chunks=mla_max_q_chunks)
+    layout = B12XAttentionArena._layout(
+        B12XAttentionArenaCaps(**base_caps, mla_max_q_chunks=mla_max_q_chunks)
     )
-    legacy_ragged = SPARKINFERAttentionArena.required_nbytes(
-        SPARKINFERAttentionArenaCaps(
+    legacy_ragged = B12XAttentionArena.required_nbytes(
+        B12XAttentionArenaCaps(
             **{
                 **base_caps,
                 "extend_max_kv_rows": compressed_prefill_q * max(selected_widths),
@@ -398,7 +398,7 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
     assert capped < int(2.25 * (1 << 30))
 
 def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     gen = torch.Generator(device=device)
     gen.manual_seed(31)
 
@@ -438,7 +438,7 @@ def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
 def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     monkeypatch,
 ) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
     del monkeypatch
 
@@ -503,7 +503,7 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
 
 @torch.inference_mode()
 def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=21, device=device)
@@ -608,7 +608,7 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     width = 32
@@ -675,7 +675,7 @@ def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     swa_page_size = 256
@@ -742,7 +742,7 @@ def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     rows = 8
@@ -812,7 +812,7 @@ def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=71, device=device)
@@ -882,7 +882,7 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
 
 @torch.inference_mode()
 def test_compressed_mla_mapped_page_table_is_rejected() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=181, device=device)
@@ -926,7 +926,7 @@ def test_compressed_mla_mapped_page_table_is_rejected() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_rejects_row_shared_mapped_page_table() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     rows = 3
@@ -985,7 +985,7 @@ def test_compressed_mla_rejects_row_shared_mapped_page_table() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_rejects_live_mapped_page_table() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     indexed_cache = _make_cache(
@@ -1031,7 +1031,7 @@ def test_compressed_mla_rejects_live_mapped_page_table() -> None:
 
 @torch.inference_mode()
 def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     rows = 8
@@ -1151,7 +1151,7 @@ def test_compressed_mla_prefill_is_run_to_run_deterministic() -> None:
     persistent-max reads must complete before the row-sum reduction overwrites
     the scratch. Without it, outputs wobble run-to-run (worst for short
     topk_lengths) and depend on unrelated memory traffic."""
-    device = require_sparkinfer()
+    device = require_b12x()
     clear_mla_caches()
 
     rows, width = 8, 512

@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import torch
 
-import sparkinfer as sparkinfer
-from sparkinfer._lib.compiler import compile_cache_info
-from sparkinfer._lib.intrinsics import swizzle_block_scale
+import b12x
+from b12x._lib.compiler import compile_cache_info
+from b12x._lib.intrinsics import swizzle_block_scale
 
 from .._reference.helpers import make_tp_moe_fp4_binding, prepare_tp_moe_fp4_experts
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def make_modelopt_weights(
@@ -83,10 +83,10 @@ def prepare_experts(
 
 
 def test_run_w4a16_replays_under_cuda_graph_with_frozen_resolution() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260715)
 
-    from sparkinfer.moe import fused_moe
+    from b12x.moe import fused_moe
 
     global_e, hidden_size, intermediate_size = 4, 128, 128
     m, topk = 8, 2
@@ -115,7 +115,7 @@ def test_run_w4a16_replays_under_cuda_graph_with_frozen_resolution() -> None:
     torch.cuda.synchronize()
 
     misses_before = compile_cache_info()["compile_misses"]
-    sparkinfer.freeze_kernel_resolution("fused-moe graph capture test")
+    b12x.freeze_kernel_resolution("fused-moe graph capture test")
     try:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -124,7 +124,7 @@ def test_run_w4a16_replays_under_cuda_graph_with_frozen_resolution() -> None:
             graph.replay()
         torch.cuda.synchronize()
     finally:
-        sparkinfer.unfreeze_kernel_resolution()
+        b12x.unfreeze_kernel_resolution()
 
     assert compile_cache_info()["compile_misses"] == misses_before, (
         "no kernel may compile during or after warm capture"
@@ -140,10 +140,10 @@ def test_run_w4a16_m9_graph_replay_with_prequeued_aux_work() -> None:
     CTA through software grid barriers. Prequeued shared-expert work must not
     prevent whole-grid admission when the serving graph replays.
     """
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260723)
 
-    from sparkinfer.moe import fused_moe
+    from b12x.moe import fused_moe
 
     device = torch.device("cuda")
     global_e, hidden_size, intermediate_size = 16, 6144, 512

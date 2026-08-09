@@ -4,14 +4,14 @@ import cutlass.cute as cute
 import pytest
 import torch
 
-from sparkinfer.gemm._shared.block_fp8 import quantize_block_fp8_linear_input_mxfp8
-from sparkinfer.gemm.mxfp8_linear._kernel import (
+from b12x.gemm._shared.block_fp8 import quantize_block_fp8_linear_input_mxfp8
+from b12x.gemm.mxfp8_linear._kernel import (
     mxfp8_linear,
     pack_mxfp8_linear_weight,
 )
-from sparkinfer.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
+from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def require_mxf8_mma() -> None:
@@ -70,7 +70,7 @@ def _reference_from_packed(source: torch.Tensor, packed_weight) -> torch.Tensor:
 
 
 def test_mxfp8_linear_matches_quantized_reference_small_n() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260614)
 
@@ -99,7 +99,7 @@ def test_mxfp8_linear_matches_quantized_reference_small_n() -> None:
 
 
 def test_mxfp8_linear_pads_k32_to_dense_tile() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260615)
 
@@ -138,7 +138,7 @@ def test_mxfp8_linear_pads_k32_to_dense_tile() -> None:
 
 
 def test_mxfp8_linear_default_fused_path_captures_with_k_padding() -> None:
-    require_sparkinfer()
+    require_b12x()
     require_mxf8_mma()
     torch.manual_seed(20260616)
 

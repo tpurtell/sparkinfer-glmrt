@@ -3,14 +3,14 @@
 Reproduces the external FlashInfer-cutlass comparison: E=256, K=4096,
 I_tp=1024, top-k 6, identical random mxfp4 weights + e8m0 scales for every
 mode, CUDA-event timing after warmup (kernel-only, no act-quant pass for the
-BF16-input modes — matching how the sparkinfer entry points consume BF16).
+BF16-input modes — matching how the b12x entry points consume BF16).
 
 Reference bar (external, RTX PRO 6000-class SM120, FI cutlass mxfp4 x mxfp8,
 autotuned, including its MXFP8 act-quant):
     m=1024: 1.18 ms | m=4096: 1.65 ms | m=8192: 3.22 ms | m=16384: 5.95 ms
 
 Usage:
-    SPARKINFER_CUTE_COMPILE_DISK_CACHE=0 python benchmarks/benchmark_ds4_moe.py \
+    B12X_COMPILE_DISK_CACHE=0 python benchmarks/benchmark_ds4_moe.py \
         --modes w4a8_mx,w4a16 --m 1024,4096,8192,16384
 """
 
@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from sparkinfer._lib.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
+from b12x._lib.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
 
 DS4_E = 256
 DS4_K = 4096
@@ -174,7 +174,7 @@ def _bench_fi_cutlass(
     return start.elapsed_time(end) / iters
 
 
-def _bench_sparkinfer(
+def _bench_b12x(
     mode: str,
     experts,
     m: int,
@@ -183,9 +183,9 @@ def _bench_sparkinfer(
     warmup: int,
     device: torch.device,
 ) -> float:
-    from sparkinfer.moe.fused_moe._impl import (
+    from b12x.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
-        sparkinfer_moe_fp4,
+        b12x_moe_fp4,
         build_tp_moe_fp4_binding,
         clear_tp_moe_caches,
     )
@@ -213,7 +213,7 @@ def _bench_sparkinfer(
     )
 
     def launch():
-        sparkinfer_moe_fp4(binding=binding)
+        b12x_moe_fp4(binding=binding)
 
     for _ in range(warmup):
         launch()
@@ -228,18 +228,18 @@ def _bench_sparkinfer(
     return start.elapsed_time(end) / iters
 
 
-def _prepare_sparkinfer_experts(mode: str, source_weights: dict):
+def _prepare_b12x_experts(mode: str, source_weights: dict):
     """Transfer one private source copy into the mode's canonical owner."""
-    from sparkinfer.moe.fused_moe._impl import (
-        plan_sparkinfer_fp4_moe_weights,
-        prepare_sparkinfer_fp4_moe_weights,
+    from b12x.moe.fused_moe._impl import (
+        plan_b12x_fp4_moe_weights,
+        prepare_b12x_fp4_moe_weights,
     )
 
     owned = {
         name: value.clone() if isinstance(value, torch.Tensor) else value
         for name, value in source_weights.items()
     }
-    plan = plan_sparkinfer_fp4_moe_weights(
+    plan = plan_b12x_fp4_moe_weights(
         quant_modes=mode,
         source_format="fp4_e8m0_k32",
         activation="silu",
@@ -249,7 +249,7 @@ def _prepare_sparkinfer_experts(mode: str, source_weights: dict):
         intermediate_size=DS4_I_TP,
         w13_layout="w13",
     )
-    return prepare_sparkinfer_fp4_moe_weights(
+    return prepare_b12x_fp4_moe_weights(
         plan=plan,
         w1_global_scale=owned["alphas"],
         w2_global_scale=owned["alphas"],
@@ -290,7 +290,7 @@ def main() -> None:
     )
     modes = [s.strip() for s in args.modes.split(",") if s.strip()]
     experts_by_mode = {
-        mode: _prepare_sparkinfer_experts(mode, weights)
+        mode: _prepare_b12x_experts(mode, weights)
         for mode in modes
         if mode != "fi_cutlass"
     }
@@ -304,7 +304,7 @@ def main() -> None:
                     weights, m, iters=args.iters, warmup=args.warmup, device=device
                 )
             else:
-                ms = _bench_sparkinfer(
+                ms = _bench_b12x(
                     mode,
                     experts_by_mode[mode],
                     m,

@@ -12,18 +12,18 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
 
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
+    os.getenv("B12X_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
     reason=(
-        "set SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
+        "set B12X_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
         "RMSNorm GPU tests"
     ),
 )
 TEST_TIMEOUT_SECONDS = float(
-    os.getenv("SPARKINFER_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300")
+    os.getenv("B12X_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300")
 )
 
 
@@ -100,10 +100,7 @@ def _dim3_tuple(value) -> tuple[int, int, int]:
 
 def _cuda_graph_kernel_chain(
     graph: torch.cuda.CUDAGraph,
-) -> tuple[
-    tuple[tuple[int, int, int], tuple[int, int, int]],
-    tuple[tuple[int, int, int], tuple[int, int, int]],
-]:
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     graph_handle = graph.raw_cuda_graph()
     result, _, num_nodes = cudart.cudaGraphGetNodes(graph_handle)
     assert result == cudart.cudaError_t.cudaSuccess
@@ -120,38 +117,9 @@ def _cuda_graph_kernel_chain(
         assert result == cudart.cudaError_t.cudaSuccess
         if node_type == kernel_type:
             kernel_nodes.append(node)
-    assert len(kernel_nodes) == 2, (
-        "staged fused capture must contain one slot-control node followed by "
-        f"one worker node, found {len(kernel_nodes)} kernel nodes"
-    )
-
-    edge_query = cudart.cudaGraphGetEdges(graph_handle)
-    assert edge_query[0] == cudart.cudaError_t.cudaSuccess
-    num_edges = int(edge_query[-1])
-    edges = cudart.cudaGraphGetEdges(graph_handle, num_edges)
-    result, from_nodes, to_nodes, returned_edges = (
-        edges[0],
-        edges[1],
-        edges[2],
-        edges[-1],
-    )
-    assert result == cudart.cudaError_t.cudaSuccess
-    assert returned_edges == num_edges
-    kernel_edges = []
-    for source, destination in zip(
-        from_nodes[:num_edges],
-        to_nodes[:num_edges],
-        strict=True,
-    ):
-        result, source_type = cudart.cudaGraphNodeGetType(source)
-        assert result == cudart.cudaError_t.cudaSuccess
-        result, destination_type = cudart.cudaGraphNodeGetType(destination)
-        assert result == cudart.cudaError_t.cudaSuccess
-        if source_type == kernel_type and destination_type == kernel_type:
-            kernel_edges.append((source, destination))
-    assert len(kernel_edges) == 1, (
-        "staged fused capture must directly order its control node before its "
-        f"worker node, found {len(kernel_edges)} kernel-to-kernel edges"
+    assert len(kernel_nodes) == 1, (
+        "CuTe staged fused capture must fold device slot selection into its "
+        f"worker, found {len(kernel_nodes)} kernel nodes"
     )
 
     def geometry(node) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
@@ -165,11 +133,10 @@ def _cuda_graph_kernel_chain(
         assert result == cudart.cudaError_t.cudaSuccess
         return _dim3_tuple(params.gridDim), _dim3_tuple(params.blockDim)
 
-    control, worker = map(geometry, kernel_edges[0])
-    assert control == ((1, 1, 1), (1, 1, 1))
+    worker = geometry(kernel_nodes[0])
     assert worker[0][0] > 1
     assert worker[1][0] >= 64
-    return control, worker
+    return worker
 
 
 def _run_eager(
@@ -206,6 +173,10 @@ def _run_eager(
                 epsilon,
             )
             torch.cuda.synchronize(device)
+            wrong_device = (rank + 1) % dist.get_world_size()
+            exercise_device_guard = dtype == torch.float16 and rows == 1 and hidden_size == 6144
+            if exercise_device_guard:
+                torch.cuda.set_device(wrong_device)
             out, residual_out = pool.all_reduce_fused_add_rms_norm(
                 inp,
                 residual,
@@ -213,6 +184,9 @@ def _run_eager(
                 epsilon,
                 channel_id="eager:fused-rmsnorm",
             )
+            if exercise_device_guard:
+                assert torch.cuda.current_device() == wrong_device
+                torch.cuda.set_device(rank)
             torch.cuda.synchronize(device)
             _assert_close(out, expected_out, dtype)
             _assert_close(residual_out, expected_residual, dtype)
@@ -249,14 +223,12 @@ def _run_graph(
             residual_out=residual,
             channel_id="graph:fused-rmsnorm",
         )
-    # Staged capture is now control + worker, in that order. The registered
-    # path still launches only its worker, but public graph capture deliberately
-    # requires stable eager staging buffers and therefore exercises this
-    # two-node contract.
+    # CuTe folds device-side slot selection into the worker, so staged capture
+    # preserves the one-kernel production topology.
     _cuda_graph_kernel_chain(graph)
     stream = torch.cuda.current_stream(device)
     offset = 0
-    if os.getenv("SPARKINFER_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
+    if os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
         remote_source = (rank + 1) % dist.get_world_size()
         offset = remote_source * inp.numel() * inp.element_size()
     snapshots = [_local_eager_words(channel, stream, offset=offset)]
@@ -333,7 +305,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("SPARKINFER_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 6, 8, 10):
         pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
     if torch.cuda.device_count() < world_size:

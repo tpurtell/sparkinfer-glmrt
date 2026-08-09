@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer._lib.intrinsics import swizzle_block_scale
-from sparkinfer._lib.fp6 import (
+from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.fp6 import (
     FLOAT6_E3M2_MAX,
     SF_VEC_SIZE_FP6,
     _encode_fp6_nearest,
@@ -12,17 +12,17 @@ from sparkinfer._lib.fp6 import (
     dequant_mxfp6_torch,
     quantize_grouped_mxfp6_torch,
 )
-from sparkinfer._lib.utils import mxfp6_packed_k_bytes
-from sparkinfer._lib.dense_gemm import dense_gemm
-from sparkinfer.quantization.mxfp6 import allocate_bf16_to_fp6_tma_outputs, compile_bf16_to_fp6_tma
-from tests._reference.helpers import require_sparkinfer
+from b12x._lib.utils import mxfp6_packed_k_bytes
+from b12x._lib.dense_gemm import dense_gemm
+from b12x.quantization.mxfp6 import allocate_bf16_to_fp6_tma_outputs, compile_bf16_to_fp6_tma
+from tests._reference.helpers import require_b12x
 
-# TODO(port): several tests below drove the historical b12x.integration.tp_moe
+# TODO(port): several tests below drove the retired pre-facade b12x.integration.tp_moe
 # host API (allocate_tp_moe_workspace / b12x_moe_fp6 / clear_tp_moe_caches) and
 # the b12x.integration.fp6_serving adapter (B12XFP6MoEMethod), which have no
-# upstream sparkinfer equivalent. Those test bodies are kept as reference behind
+# upstream b12x equivalent. Those test bodies are kept as reference behind
 # pytest.skip("pending: fused_moe-based rewrite") gates; rewrite them against the
-# sparkinfer.moe.fused_moe plan/bind/run flow once the w6a8_mx run path lands.
+# b12x.moe.fused_moe plan/bind/run flow once the w6a8_mx run path lands.
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for FP6 GPU tests"
@@ -71,7 +71,7 @@ def _quantize_bf16_matrix(bf16: torch.Tensor, fmt: str = "e3m2") -> tuple[torch.
 
 @pytest.mark.parametrize("fmt", ["e3m2", "e2m3"])
 def test_bf16_to_fp6_tma_matches_torch_reference(fmt: str) -> None:
-    require_sparkinfer()
+    require_b12x()
     m = k = 128
     torch.manual_seed(7)
     bf16 = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.25
@@ -103,7 +103,7 @@ def test_bf16_to_fp6_tma_matches_torch_reference(fmt: str) -> None:
 
 
 def test_dense_gemm_mxfp6_nonzero_vs_torch_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     # NOTE(port): the original test cleared the b12x tp_moe compile caches here
     # (clear_tp_moe_caches); upstream has no tp_moe layer, and the dense GEMM
     # path below does not need it.
@@ -217,8 +217,8 @@ def _synthetic_mxfp6_moe_weights(
 
 def test_moe_fp6_synthetic_smoke() -> None:
     pytest.skip("pending: fused_moe-based rewrite")
-    require_sparkinfer()
-    from b12x.integration.tp_moe import (  # historical b12x reference (module TODO)
+    require_b12x()
+    from b12x.integration.tp_moe import (  # retired pre-facade API (module TODO)
         allocate_tp_moe_workspace,
         b12x_moe_fp6,
         clear_tp_moe_caches,
@@ -322,8 +322,8 @@ def _fp6_dequant_grouped_weight(
 
 def test_moe_fp6_numeric_vs_reference() -> None:
     pytest.skip("pending: fused_moe-based rewrite")
-    require_sparkinfer()
-    from b12x.integration.tp_moe import (  # historical b12x reference (module TODO)
+    require_b12x()
+    from b12x.integration.tp_moe import (  # retired pre-facade API (module TODO)
         allocate_tp_moe_workspace,
         b12x_moe_fp6,
         clear_tp_moe_caches,
@@ -433,7 +433,7 @@ def test_bf16_to_fp6_tma_multi_ktile_row_stride(shape, fmt: str) -> None:
     K>128 with non-uniform per-block magnitudes so the ``grow*96*k_tiles`` stride is
     mandatory and any layout collapse shows up.
     """
-    require_sparkinfer()
+    require_b12x()
     m, k = shape
     torch.manual_seed(7)
     bf16 = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.25
@@ -480,8 +480,8 @@ def test_moe_fp6_multi_ktile_numeric(backend: str, monkeypatch) -> None:
     which feeds the MoE expert weights. K=512 is the smallest multi-K-tile case.
     """
     pytest.skip("pending: fused_moe-based rewrite")
-    require_sparkinfer()
-    from b12x.integration.tp_moe import (  # historical b12x reference (module TODO)
+    require_b12x()
+    from b12x.integration.tp_moe import (  # retired pre-facade API (module TODO)
         allocate_tp_moe_workspace,
         b12x_moe_fp6,
         clear_tp_moe_caches,
@@ -490,7 +490,7 @@ def test_moe_fp6_multi_ktile_numeric(backend: str, monkeypatch) -> None:
 
     # Force the backend via the routed-pairs cutover (default 640).
     monkeypatch.setenv(
-        "SPARKINFER_STATIC_COMPACT_CUTOVER_PAIRS", "0" if backend == "dynamic" else "640"
+        "B12X_STATIC_COMPACT_CUTOVER_PAIRS", "0" if backend == "dynamic" else "640"
     )
     clear_tp_moe_caches()
     device = torch.device("cuda")
@@ -566,8 +566,8 @@ def test_fp6_safetensors_loader_matches_pt_path() -> None:
     ``quantize_moe_weights_to_fp6`` (which packs the stacked (2N,K) at once)
     exactly — proving the safetensors round-trip preserves the kernel layout.
     """
-    require_sparkinfer()
-    from sparkinfer.quantization.mxfp6 import (
+    require_b12x()
+    from b12x.quantization.mxfp6 import (
         load_fp6_moe_weights_from_safetensors,
         quantize_linear_to_fp6,
         quantize_moe_weights_to_fp6,
@@ -627,8 +627,8 @@ def test_fp6_dense_safetensors_loader_numeric() -> None:
     swizzles the scales and reuses dense_fp6_linear (whose alpha=1/(a_gs*w_gs) is
     correct at w_gs=1). K>128 exercises the multi-K-tile GEMM path.
     """
-    require_sparkinfer()
-    from sparkinfer.quantization.mxfp6 import (
+    require_b12x()
+    from b12x.quantization.mxfp6 import (
         dense_fp6_linear,
         load_fp6_dense_weight_from_safetensors,
         quantize_linear_to_fp6,
@@ -664,9 +664,9 @@ def test_fp6_serving_moe_method_apply() -> None:
     args) end-to-end, independent of disk I/O.
     """
     pytest.skip("pending: fused_moe-based rewrite")
-    require_sparkinfer()
-    from b12x.integration.fp6_serving import B12XFP6MoEMethod  # historical b12x reference (module TODO)
-    from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+    require_b12x()
+    from b12x.integration.fp6_serving import B12XFP6MoEMethod  # retired pre-facade API (module TODO)
+    from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
     device = torch.device("cuda")
     experts, n, k, m, topk = 8, 256, 512, 8, 2

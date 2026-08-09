@@ -3,28 +3,28 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention._shared.mla.kernel import (
+from b12x.attention._shared.mla.kernel import (
     run_unified_decode,
 )
-from sparkinfer.attention._shared.mla.kv_cache import (
+from b12x.attention._shared.mla.kv_cache import (
     clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache,
     concat_and_cache_nvfp4_mla_fp8_rope,
 )
-from sparkinfer.attention._shared.mla.prefill_mg import (
+from b12x.attention._shared.mla.prefill_mg import (
     run_unified_prefill_mg,
 )
-from sparkinfer.attention._shared.mla.traits import (
+from b12x.attention._shared.mla.traits import (
     ComputeMode,
     ModelType,
     ScaleFormat,
 )
-from sparkinfer.attention.sparse_mla._scratch import (
-    SPARKINFERSparseMLAScratchCaps,
+from b12x.attention.sparse_mla._scratch import (
+    B12XSparseMLAScratchCaps,
     plan_sparse_mla_scratch,
 )
 
 from .._reference.helpers import E2M1_TO_FLOAT32
-from ..conftest import require_sparkinfer as require_sm120
+from ..conftest import require_b12x as require_sm120
 
 
 _RECORD_BYTES = 368
@@ -439,7 +439,7 @@ def test_writer_records_feed_production_head_multisplit_decode() -> None:
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
     sm_scale = _HEAD_DIM**-0.5
 
-    caps = SPARKINFERSparseMLAScratchCaps(
+    caps = B12XSparseMLAScratchCaps(
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,

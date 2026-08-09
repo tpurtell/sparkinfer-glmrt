@@ -4,14 +4,14 @@ import cutlass
 import pytest
 import torch
 
-from sparkinfer._lib.utils import mxfp6_packed_k_bytes
-from sparkinfer.quantization.mxfp6 import (
+from b12x._lib.utils import mxfp6_packed_k_bytes
+from b12x.quantization.mxfp6 import (
     allocate_bf16_to_fp6_tma_outputs,
     compile_bf16_to_fp6_tma,
 )
 # Underscore alias: pytest tries to collect any module-level class named
 # Test* (PytestCollectionWarning — TestKernel has an __init__).
-from sparkinfer.quantization.mxfp6.bf16_to_fp6_tma import TestKernel as _TestKernel
+from b12x.quantization.mxfp6.bf16_to_fp6_tma import TestKernel as _TestKernel
 
 
 def test_bf16_to_fp6_tma_kernel_import() -> None:

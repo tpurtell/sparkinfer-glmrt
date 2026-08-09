@@ -1,1 +1,1 @@
-recursive-include sparkinfer/gemm/trellis_linear/csrc *.cu *.cuh *.h LICENSE*
+recursive-include b12x/gemm/trellis_linear/csrc *.cu *.cuh *.h LICENSE*

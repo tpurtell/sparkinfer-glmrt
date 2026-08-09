@@ -22,11 +22,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import bench_cuda_graph, capture_cuda_graph, require_sm120
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     route_pack_numel_capacity,
 )
-from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel import (
     pack_topk_routes_by_expert,
 )
 

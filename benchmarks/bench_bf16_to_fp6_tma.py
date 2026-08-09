@@ -12,7 +12,7 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
-from sparkinfer.quantization.mxfp6 import allocate_bf16_to_fp6_tma_outputs, compile_bf16_to_fp6_tma
+from b12x.quantization.mxfp6 import allocate_bf16_to_fp6_tma_outputs, compile_bf16_to_fp6_tma
 
 
 def _parse_args() -> argparse.Namespace:

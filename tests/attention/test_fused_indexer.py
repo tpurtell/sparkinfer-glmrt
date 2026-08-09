@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention.nsa_indexer.fused_indexer import (
+from b12x.attention.nsa_indexer.fused_indexer import (
     KV_LAYOUT_CONTIGUOUS_MLA,
     KV_LAYOUT_PAGED,
     SparseNSAFusedIndexerKernel,

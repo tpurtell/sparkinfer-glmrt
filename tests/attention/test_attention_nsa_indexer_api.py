@@ -6,32 +6,32 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
-from sparkinfer.attention.nsa_indexer.kernel import (
+from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.attention.nsa_indexer.kernel import (
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _split_index_k_cache_runtime_views,
     run_paged_tiled_logits_kernel,
     run_paged_supertile_logits_kernel,
 )
-from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
+from b12x.attention.nsa_indexer.contiguous_kernel import (
     build_indexer_contiguous_logits_kernel_binding,
 )
-from sparkinfer.attention.nsa_indexer.tiled_topk import run_row_topk
-from sparkinfer.attention.nsa_indexer.reference import (
+from b12x.attention.nsa_indexer.tiled_topk import run_row_topk
+from b12x.attention.nsa_indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from sparkinfer.attention.nsa_indexer._impl import IndexerContiguousMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, contiguous_tiled_topk, paged_decode_logits, uses_paged_mqa_schedule
-from sparkinfer.attention.nsa_indexer.contiguous_kernel import resolve_contiguous_prefill_block_k
-from sparkinfer.attention.nsa_indexer.scratch import (
-    SPARKINFERIndexerContiguousScratchCaps,
-    SPARKINFERIndexerPagedScratchCaps,
+from b12x.attention.nsa_indexer._impl import IndexerContiguousMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, contiguous_tiled_topk, paged_decode_logits, uses_paged_mqa_schedule
+from b12x.attention.nsa_indexer.contiguous_kernel import resolve_contiguous_prefill_block_k
+from b12x.attention.nsa_indexer.scratch import (
+    B12XIndexerContiguousScratchCaps,
+    B12XIndexerPagedScratchCaps,
     INDEXER_PAGED_ROUTE_TILED,
     plan_indexer_contiguous_scratch,
     plan_indexer_paged_scratch,
 )
-from sparkinfer._lib.compiler import clear_compile_cache, compile_cache_info
+from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
 
 _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
@@ -94,7 +94,7 @@ def _bind_paged_decode(
     topk: int = 1,
 ):
     plan = plan_indexer_paged_scratch(
-        SPARKINFERIndexerPagedScratchCaps(
+        B12XIndexerPagedScratchCaps(
             device=real_page_table.device,
             num_q_heads=int(num_q_heads),
             max_q_rows=int(real_page_table.shape[0]),
@@ -128,7 +128,7 @@ def _bind_contiguous_topk(
     k_quant, k_scale = kv_fp8
     max_q_rows = int(q_rows) if q_rows is not None else int(k_start.shape[0])
     plan = plan_indexer_contiguous_scratch(
-        SPARKINFERIndexerContiguousScratchCaps(
+        B12XIndexerContiguousScratchCaps(
             device=k_quant.device,
             num_q_heads=int(num_q_heads),
             max_q_rows=max_q_rows,
@@ -168,7 +168,7 @@ def _bind_staged_contiguous_logits(
     q_rows = int(k_start.shape[0])
     k_rows = int(k_quant.shape[0])
     plan = plan_indexer_contiguous_scratch(
-        SPARKINFERIndexerContiguousScratchCaps(
+        B12XIndexerContiguousScratchCaps(
             device=q_fp8.device,
             num_q_heads=int(q_fp8.shape[1]),
             max_q_rows=q_rows,
@@ -334,8 +334,8 @@ def test_uses_paged_mqa_schedule_only_for_long_rows() -> None:
 def test_sparse_nsa_contiguous_prefill_block_k_auto_targets_long_bs1_prefill(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("SPARKINFER_NSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
-    monkeypatch.delenv("SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K", raising=False)
+    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
+    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", raising=False)
 
     assert (
         resolve_contiguous_prefill_block_k(
@@ -364,8 +364,8 @@ def test_sparse_nsa_contiguous_prefill_block_k_auto_targets_long_bs1_prefill(
 
 
 def test_sparse_nsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> None:
-    monkeypatch.delenv("SPARKINFER_NSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
-    monkeypatch.setenv("SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "256")
+    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
+    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "256")
     assert (
         resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
@@ -375,7 +375,7 @@ def test_sparse_nsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> Non
         == 256
     )
 
-    monkeypatch.setenv("SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
+    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
     assert (
         resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
@@ -391,7 +391,7 @@ def test_sparse_nsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> Non
             num_heads=64,
         )
 
-    monkeypatch.setenv("SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "bad")
+    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "bad")
     with pytest.raises(ValueError, match="auto, 256, or 512"):
         resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
@@ -1220,7 +1220,7 @@ def test_contiguous_tiled_topk_graph_replay_tracks_live_weights(monkeypatch) -> 
     not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage"
 )
 def test_contiguous_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
-    monkeypatch.setenv("SPARKINFER_NSA_TOPK_SUPERTILE_K", "3072")
+    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "3072")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1288,7 +1288,7 @@ def test_contiguous_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
     # Force >= 3 supertile chunks so the fold exercises the middle (is_first=False)
     # kernel specialization and the full carry ping-pong (not just the 2-chunk
     # first+last pair). k_rows / supertile_k = 5 chunks regardless of block_k.
-    monkeypatch.setenv("SPARKINFER_NSA_TOPK_SUPERTILE_K", "2048")
+    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "2048")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1365,8 +1365,8 @@ def test_contiguous_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
 def test_contiguous_tiled_topk_live_rows_do_not_resolve_new_kernel(
     monkeypatch, tmp_path
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_CACHE_DIR", str(tmp_path / "cute-cache"))
-    monkeypatch.setenv("SPARKINFER_NSA_TOPK_SUPERTILE_K", "32768")
+    monkeypatch.setenv("B12X_COMPILE_CACHE_DIR", str(tmp_path / "cute-cache"))
+    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "32768")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1535,7 +1535,7 @@ def test_row_topk_graph_replay_tracks_live_logits_and_lengths() -> None:
 def test_row_topk_live_rows_do_not_resolve_new_kernel(
     tmp_path, monkeypatch, topk: int
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_CUTE_COMPILE_CACHE_DIR", str(tmp_path / "cute-cache"))
+    monkeypatch.setenv("B12X_COMPILE_CACHE_DIR", str(tmp_path / "cute-cache"))
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1591,8 +1591,8 @@ def test_row_topk_live_rows_do_not_resolve_new_kernel(
     reason="CUDA required for indexer compile-cache coverage",
 )
 def test_row_topk_gather_table_width_and_stride_are_runtime(monkeypatch) -> None:
-    monkeypatch.setenv("SPARKINFER_COMPILE_DISK_CACHE", "0")
-    monkeypatch.setenv("SPARKINFER_COMPILE_MEMORY_CACHE", "1")
+    monkeypatch.setenv("B12X_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("B12X_COMPILE_MEMORY_CACHE", "1")
     clear_compile_cache()
     clear_indexer_caches()
 
@@ -1633,7 +1633,7 @@ def test_row_topk_gather_table_width_and_stride_are_runtime(monkeypatch) -> None
     not torch.cuda.is_available(), reason="CUDA required for BK512 prefill coverage"
 )
 def test_contiguous_logits_cuda_prefill512_sampled_logits(monkeypatch) -> None:
-    monkeypatch.setenv("SPARKINFER_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
+    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")

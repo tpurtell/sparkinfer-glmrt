@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer import freeze_kernel_resolution, unfreeze_kernel_resolution
-from sparkinfer.gemm._shared.block_fp8 import (
+from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.gemm._shared.block_fp8 import (
     BlockFP8LinearScratchCaps,
     block_fp8_linear_mxfp8,
     pack_block_fp8_linear_weight_mxfp8,
     plan_block_fp8_linear_scratch,
     quantize_block_fp8_linear_input_mxfp8,
 )
-from sparkinfer.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
+from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def _make_block_fp8_weight(
@@ -57,7 +57,7 @@ def _reference_from_quantized_operands(
 
 
 def test_block_fp8_linear_matches_quantized_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260523)
 
     tokens, in_features, out_features = 7, 256, 384
@@ -80,7 +80,7 @@ def test_block_fp8_linear_matches_quantized_reference() -> None:
 
 
 def test_block_fp8_linear_fused_k128_matches_flash_quantized_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260804)
 
     tokens, in_features, out_features = 7, 256, 384
@@ -117,7 +117,7 @@ def test_block_fp8_linear_fused_k128_matches_flash_quantized_reference() -> None
 
 
 def test_block_fp8_linear_replays_under_cuda_graph() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260524)
 
     tokens, in_features, out_features = 1, 128, 256
@@ -166,7 +166,7 @@ def test_block_fp8_linear_replays_under_cuda_graph() -> None:
 
 
 def test_block_fp8_linear_scratch_binding_replays_under_cuda_graph() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260526)
 
     tokens, in_features, out_features = 1, 128, 256
@@ -215,7 +215,7 @@ def test_block_fp8_linear_scratch_binding_replays_under_cuda_graph() -> None:
 
 
 def test_block_fp8_linear_default_fused_path_captures() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260525)
 
     tokens, in_features, out_features = 1, 128, 256
@@ -241,7 +241,7 @@ def test_block_fp8_linear_default_fused_path_captures() -> None:
 
 
 def test_block_fp8_linear_live_m_does_not_resolve_new_dense_kernel() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260528)
 
     warm_tokens, live_tokens = 4096, 1824
@@ -278,7 +278,7 @@ def test_block_fp8_linear_live_m_does_not_resolve_new_dense_kernel() -> None:
 
 
 def test_block_fp8_linear_small_live_m_reuses_prefill_dense_kernel() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260529)
 
     warm_tokens = 512
@@ -317,8 +317,8 @@ def test_block_fp8_linear_expected_m_decode_regime_reuses_kernel() -> None:
     # 32x128 tile) must (a) produce byte-identical output to the default
     # (tile choice does not change the block-scaled MMA result) and (b) be
     # reused for every live M in the regime under frozen resolution.
-    require_sparkinfer()
-    from sparkinfer._lib.dense_gemm import _select_default_mma_tiler_mn
+    require_b12x()
+    from b12x._lib.dense_gemm import _select_default_mma_tiler_mn
 
     torch.manual_seed(20260530)
     in_features, out_features = 1024, 8192  # wide-N (>1536) MXFP8 regime
@@ -368,7 +368,7 @@ def test_block_fp8_linear_expected_m_decode_regime_reuses_kernel() -> None:
 
 def test_block_fp8_linear_expected_m_short_k_large_n_matches_reference() -> None:
     """Exercise the production expected_m route through 128x128x64."""
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260702)
 
     tokens, in_features, out_features = 16, 1024, 16384

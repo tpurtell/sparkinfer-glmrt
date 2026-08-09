@@ -7,17 +7,17 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.attention import compressed_mla, sparse_mla
-from sparkinfer.attention._shared.mla.compressed_reference import (
+from b12x.attention import compressed_mla, sparse_mla
+from b12x.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer.attention._shared.mla.reference import (
+from b12x.attention._shared.mla.reference import (
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
 )
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 NOPE_DIM = 512
 ROPE_DIM = 64
@@ -100,14 +100,14 @@ def _assert_matches(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 
 def test_run_decode_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, kv, sel, lens, active = _make_case(rows=4, heads=16, cache_tokens=512, width=128)
     out, ref = _run_public_decode(q, kv, sel, lens, active, width=128)
     _assert_matches(out, ref)
 
 
 def test_run_decode_masks_padded_selection() -> None:
-    require_sparkinfer()
+    require_b12x()
     width = 128
     q, kv, sel, lens, active = _make_case(
         rows=4, heads=16, cache_tokens=512, width=width
@@ -122,7 +122,7 @@ def test_run_decode_masks_padded_selection() -> None:
 
 
 def test_dsv4_dspark_decode_attends_target_ring_and_all_proposal_kv() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260805)
     rows = 5
     heads = 64

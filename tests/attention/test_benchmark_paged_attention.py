@@ -9,7 +9,7 @@ from benchmarks.benchmark_paged_attention import (
     _active_split_kv_temporary_results,
     _balanced_graph_replay_schedule,
     _build_decode_replay_cases,
-    _capture_sparkinfer_decode_graph_bucket,
+    _capture_b12x_decode_graph_bucket,
     _capture_flashinfer_decode_graph_bucket,
     _cosine_similarity,
     _decode_reference_output,
@@ -28,7 +28,7 @@ from benchmarks.benchmark_paged_attention import (
     require_cuda,
 )
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def test_benchmark_requires_cuda_without_restricting_compute_capability(
@@ -62,13 +62,13 @@ def test_raw_samples_record_balanced_timing_contract(tmp_path) -> None:
         "method": "paired-interleaved-ab-ba",
         "sample_index": "replay-pair-index",
         "pair_count": 2,
-        "even_pair_order": ["sparkinfer", "flashinfer-fa2"],
-        "odd_pair_order": ["flashinfer-fa2", "sparkinfer"],
+        "even_pair_order": ["b12x", "flashinfer-fa2"],
+        "odd_pair_order": ["flashinfer-fa2", "b12x"],
     }
 
     _record_samples(
         output_path,
-        backend="sparkinfer",
+        backend="b12x",
         case={"case_contract_sha256": "test"},
         samples_ms=[0.01, 0.02],
         timing=timing,
@@ -98,7 +98,7 @@ def test_observed_decode_graph_topology_reports_device_schedule() -> None:
     observed = _observe_decode_graph_replay_topology(FakeWorkspace(), batch=2)
 
     assert observed == {
-        "schema": "sparkinfer-decode-graph-observed-topology-v2",
+        "schema": "b12x-decode-graph-observed-topology-v2",
         "source": "captured-device-lut-updater",
         "scheduling_mode": "compact-valid-mask",
         "kv_chunk_size_tokens": 512,
@@ -123,15 +123,15 @@ def test_observed_decode_graph_topology_reports_device_schedule() -> None:
 def test_decode_graph_metadata_records_flashinfer_host_plan_asymmetry() -> None:
     policy = _decode_graph_replay_policy_metadata(flashinfer_backend="fa2")
     backends = policy["backends"]
-    sparkinfer = backends["sparkinfer"]
+    b12x = backends["b12x"]
     flashinfer = backends["flashinfer-fa2"]
 
     assert policy["measurement_scope"] == "captured-cuda-graph-replay-only"
-    assert sparkinfer["strict_live_length_graph_safe"] is True
-    assert "no page-table" in sparkinfer["runtime_metadata_binding"]
-    assert sparkinfer["live_length_dependent_host_planning"] is False
-    assert sparkinfer["planning_excluded_from_timing"] == []
-    assert sparkinfer["planning_timed"]
+    assert b12x["strict_live_length_graph_safe"] is True
+    assert "no page-table" in b12x["runtime_metadata_binding"]
+    assert b12x["live_length_dependent_host_planning"] is False
+    assert b12x["planning_excluded_from_timing"] == []
+    assert b12x["planning_timed"]
     assert flashinfer["strict_live_length_graph_safe"] is False
     assert flashinfer["live_length_dependent_host_planning"] is True
     assert flashinfer["planning_timed"] == []
@@ -142,15 +142,15 @@ def test_decode_graph_metadata_records_flashinfer_host_plan_asymmetry() -> None:
 
     base_timing = {
         "method": "paired-interleaved-ab-ba",
-        "even_pair_order": ["sparkinfer", "flashinfer-fa2"],
-        "odd_pair_order": ["flashinfer-fa2", "sparkinfer"],
+        "even_pair_order": ["b12x", "flashinfer-fa2"],
+        "odd_pair_order": ["flashinfer-fa2", "b12x"],
     }
     timing = _decode_graph_timing_metadata(
         base_timing,
         flashinfer_backend="fa2",
     )
     assert timing["method"] == "paired-interleaved-ab-ba"
-    assert timing["even_pair_order"] == ["sparkinfer", "flashinfer-fa2"]
+    assert timing["even_pair_order"] == ["b12x", "flashinfer-fa2"]
     assert timing["replay_policy"] == policy
 
 
@@ -308,7 +308,7 @@ def test_decode_graph_bucket_policy_kv4_uses_kv_head_aware_chunk_budget() -> Non
 
 @torch.inference_mode()
 def test_decode_graph_bucket_kv4_captures_exact_production_grid() -> None:
-    require_sparkinfer()
+    require_b12x()
     policy = _resolve_decode_graph_bucket_policy(
         batch=16,
         q_dtype=torch.bfloat16,
@@ -333,7 +333,7 @@ def test_decode_graph_bucket_kv4_captures_exact_production_grid() -> None:
         kv_dtype=torch.bfloat16,
         seed=23,
     )
-    bucket = _capture_sparkinfer_decode_graph_bucket(
+    bucket = _capture_b12x_decode_graph_bucket(
         shared=shared,
         policy=policy,
         warmup=1,
@@ -384,7 +384,7 @@ def test_decode_graph_bucket_policy_rejects_nonproduction_overrides(
 def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
 
     policy = _resolve_decode_graph_bucket_policy(
         batch=1,
@@ -410,19 +410,19 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
         kv_dtype=torch.bfloat16,
         seed=17,
     )
-    sparkinfer_bucket = _capture_sparkinfer_decode_graph_bucket(
+    b12x_bucket = _capture_b12x_decode_graph_bucket(
         shared=shared,
         policy=policy,
         warmup=1,
     )
-    assert sparkinfer_bucket.current_plan_desc.endswith(",split")
-    assert sparkinfer_bucket.current_plan_desc.startswith("chunk=device-lut,")
-    assert sparkinfer_bucket.workspace._decode_graph_chunk_pages_lut is not None
-    assert sparkinfer_bucket.workspace.request_indices.numel() == policy.max_work_items
-    assert sparkinfer_bucket.workspace._uses_plan_owned_decode_graph_metadata is True
-    assert sparkinfer_bucket.scratch_plan._decode_graph_replay_state_captured is True
-    assert sparkinfer_bucket.forward_traits_contract["cta_tile_kv"] > 0
-    assert sparkinfer_bucket.forward_traits_contract["num_mma_kv"] > 0
+    assert b12x_bucket.current_plan_desc.endswith(",split")
+    assert b12x_bucket.current_plan_desc.startswith("chunk=device-lut,")
+    assert b12x_bucket.workspace._decode_graph_chunk_pages_lut is not None
+    assert b12x_bucket.workspace.request_indices.numel() == policy.max_work_items
+    assert b12x_bucket.workspace._uses_plan_owned_decode_graph_metadata is True
+    assert b12x_bucket.scratch_plan._decode_graph_replay_state_captured is True
+    assert b12x_bucket.forward_traits_contract["cta_tile_kv"] > 0
+    assert b12x_bucket.forward_traits_contract["num_mma_kv"] > 0
     fa2_bucket = _capture_flashinfer_decode_graph_bucket(
         shared=shared,
         page_size=64,
@@ -436,11 +436,11 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
         backend="fa2",
     )
 
-    sparkinfer_graph_id = id(sparkinfer_bucket.graph)
+    b12x_graph_id = id(b12x_bucket.graph)
     fa2_graph_id = id(fa2_bucket.graph)
-    sparkinfer_plan_id = id(sparkinfer_bucket.workspace.plan)
-    sparkinfer_page_table_ptr = sparkinfer_bucket.current_page_table.data_ptr()
-    sparkinfer_cache_seqlens_ptr = sparkinfer_bucket.current_cache_seqlens.data_ptr()
+    b12x_plan_id = id(b12x_bucket.workspace.plan)
+    b12x_page_table_ptr = b12x_bucket.current_page_table.data_ptr()
+    b12x_cache_seqlens_ptr = b12x_bucket.current_cache_seqlens.data_ptr()
 
     def reject_host_replan(**_kwargs: object) -> None:
         raise AssertionError("decode graph replay must not build a live host PagedPlan")
@@ -451,13 +451,13 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
     )
 
     for context_tokens in (16_384, 131_072):
-        sparkinfer_bucket.prepare_replay(context_tokens=context_tokens)
+        b12x_bucket.prepare_replay(context_tokens=context_tokens)
         fa2_bucket.prepare_replay(context_tokens=context_tokens)
         ref_out = _decode_reference_output(
-            read_only_snapshot=sparkinfer_bucket.read_only_snapshot,
+            read_only_snapshot=b12x_bucket.read_only_snapshot,
         )
 
-        _strict_backend_replay_for_correctness(sparkinfer_bucket)
+        _strict_backend_replay_for_correctness(b12x_bucket)
         _strict_guarded_replay_for_correctness(
             backend="flashinfer-fa2",
             graph=fa2_bucket.graph,
@@ -466,16 +466,16 @@ def test_decode_graph_buckets_reuse_single_graph_across_long_contexts_and_match_
             read_only_inputs=fa2_bucket.read_only_inputs,
         )
 
-        assert id(sparkinfer_bucket.graph) == sparkinfer_graph_id
-        assert id(sparkinfer_bucket.workspace.plan) == sparkinfer_plan_id
-        assert sparkinfer_bucket.current_page_table.data_ptr() == sparkinfer_page_table_ptr
+        assert id(b12x_bucket.graph) == b12x_graph_id
+        assert id(b12x_bucket.workspace.plan) == b12x_plan_id
+        assert b12x_bucket.current_page_table.data_ptr() == b12x_page_table_ptr
         assert (
-            sparkinfer_bucket.current_cache_seqlens.data_ptr()
-            == sparkinfer_cache_seqlens_ptr
+            b12x_bucket.current_cache_seqlens.data_ptr()
+            == b12x_cache_seqlens_ptr
         )
         assert id(fa2_bucket.graph) == fa2_graph_id
 
-        assert _relative_l2_error(sparkinfer_bucket.output, ref_out) <= 0.02
-        assert _cosine_similarity(sparkinfer_bucket.output, ref_out) >= 0.9999
+        assert _relative_l2_error(b12x_bucket.output, ref_out) <= 0.02
+        assert _cosine_similarity(b12x_bucket.output, ref_out) >= 0.9999
         assert _relative_l2_error(fa2_bucket.output_view, ref_out) <= 0.005
         assert _cosine_similarity(fa2_bucket.output_view, ref_out) >= 0.99999

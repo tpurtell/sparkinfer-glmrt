@@ -148,7 +148,7 @@ def main() -> None:
     finally:
         handle.remove()
 
-    from sparkinfer.quantization.mxfp6.calib_io import save_hidden_states
+    from b12x.quantization.mxfp6.calib_io import save_hidden_states
 
     x = torch.cat(captured, dim=0)
     out = save_hidden_states(

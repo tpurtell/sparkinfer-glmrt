@@ -1,4 +1,4 @@
-"""End-to-end w4a8_nvfp4 dispatch through sparkinfer_moe_fp4 with real weights.
+"""End-to-end w4a8_nvfp4 dispatch through b12x_moe_fp4 with real weights.
 
 Gates the Phase-5 serving integration: the same entry point, scratch binding,
 and checkpoint weights as the nvfp4 path, with
@@ -52,8 +52,8 @@ def _weights():
 
 def test_unswizzle_batched_matches_reference() -> None:
     _skip_if_unavailable()
-    from sparkinfer.moe.fused_moe._impl import _unswizzle_block_scales_batched
-    from sparkinfer.moe._shared.kernels.reference import unswizzle_block_scale
+    from b12x.moe.fused_moe._impl import _unswizzle_block_scales_batched
+    from b12x.moe._shared.kernels.reference import unswizzle_block_scale
 
     spec = _make_spec()
     weights = _weights()
@@ -67,7 +67,7 @@ def test_unswizzle_batched_matches_reference() -> None:
 
 
 def _run_mode(m: int, quant_mode: str | None, seed: int) -> torch.Tensor:
-    from sparkinfer.moe.fused_moe._impl import (
+    from b12x.moe.fused_moe._impl import (
         clear_tp_moe_caches,
     )
 
@@ -103,8 +103,8 @@ def _run_mode(m: int, quant_mode: str | None, seed: int) -> torch.Tensor:
 
 def _w4a8_oracle(m: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Run moe_reference_w4a8_mx on the real checkpoint weights."""
-    from sparkinfer.moe.fused_moe._impl import _derive_w4a8_weight_grids
-    from sparkinfer.moe._shared.kernels.reference import moe_reference_w4a8_mx
+    from b12x.moe.fused_moe._impl import _derive_w4a8_weight_grids
+    from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
 
     device = torch.device("cuda")
     spec = _make_spec()
@@ -183,11 +183,11 @@ def test_nvfp4_fused_micro_graph_replay_with_prequeued_aux_work() -> None:
         pytest.skip("No CUDA")
 
     from benchmarks.benchmark_moe import make_shape_only_expert_weights
-    from sparkinfer.moe.fused_moe._impl import (
+    from b12x.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
         build_tp_moe_fp4_binding,
         clear_tp_moe_caches,
-        sparkinfer_moe_fp4,
+        b12x_moe_fp4,
     )
 
     clear_tp_moe_caches()
@@ -237,7 +237,7 @@ def test_nvfp4_fused_micro_graph_replay_with_prequeued_aux_work() -> None:
         quant_mode="nvfp4",
     )
 
-    sparkinfer_moe_fp4(binding=binding)
+    b12x_moe_fp4(binding=binding)
     torch.cuda.synchronize()
     expected = output.clone()
 
@@ -245,7 +245,7 @@ def test_nvfp4_fused_micro_graph_replay_with_prequeued_aux_work() -> None:
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
-        sparkinfer_moe_fp4(binding=binding)
+        b12x_moe_fp4(binding=binding)
     torch.cuda.current_stream().wait_stream(capture_stream)
     torch.cuda.synchronize()
 

@@ -1,7 +1,7 @@
-# SparkInfer MX-FP6: making and serving FP6 quants
+# B12X MX-FP6: making and serving FP6 quants
 
 End-to-end guide: how to produce an MX-FP6 checkpoint from a BF16 HF model,
-and how to serve it with SparkInfer + nightly vLLM. Reference numbers
+and how to serve it with B12X + nightly vLLM. Reference numbers
 (classification, KLD, performance) live in `fp6-results.md`; kernel-level
 format details in `mxfp6-w6a8.md`; plugin internals in
 `mxfp6-vllm-integration.md`.
@@ -75,12 +75,12 @@ size/quality trade are `--include-linear-attn` and `--include-vision`; use
 
 ---
 
-## 2. Serving with SparkInfer + nightly vLLM
+## 2. Serving with B12X + nightly vLLM
 
 ### 2.1 Install (serving venv — KLD scoring uses its own venv, see §2.6)
 
-vLLM nightly pins its own torch; sparkinfer declares `torch>=2.12`. Keep
-the venv on **vLLM's pinned stack** and install sparkinfer with
+vLLM nightly pins its own torch; b12x declares `torch>=2.12`. Keep
+the venv on **vLLM's pinned stack** and install b12x with
 `--no-deps` so it cannot upgrade torch out from under vLLM's precompiled
 binaries:
 
@@ -94,48 +94,49 @@ uv pip install --index-url https://download.pytorch.org/whl/cu130 \
 # 2. nightly vLLM from source with precompiled kernels:
 cd vllm && VLLM_USE_PRECOMPILED=1 uv pip install -e . && cd ..
 
-# 3. sparkinfer — --no-deps is MANDATORY (see above):
-uv pip install -e /path/to/sparkinfer --no-deps
+# 3. b12x — --no-deps is MANDATORY (see above):
+uv pip install -e /path/to/b12x --no-deps
 
-python -c "import torchvision, vllm, sparkinfer; print('stack OK')"
+python -c "import torchvision, vllm, b12x; print('stack OK')"
 ```
 
 If torch 2.13.x ever appears in an install log, the pin was broken —
 re-run steps 1-3 in order.
 
-Installing sparkinfer registers the vLLM plugin automatically via the
+Installing b12x registers the vLLM plugin automatically via the
 `vllm.general_plugins` entry point
-(`sparkinfer.integration.vllm.plugin:register_sparkinfer_fp6`); it runs in
-every vLLM process (front end, engine core, TP workers). `sparkinfer_fp6`
+(`b12x.integration.vllm.plugin:register_b12x_fp6`); it runs in
+every vLLM process (front end, engine core, TP workers). `b12x_fp6`
 is **not** a stock vLLM quant method — without the package installed,
-`--quantization sparkinfer_fp6` will not resolve.
+`--quantization b12x_fp6` will not resolve.
 
 ### 2.2 Environment gates
 
 | Variable | Purpose |
 |---|---|
-| `SPARKINFER_ENABLE_FP6=1` | Master gate. Unset/0 = the plugin stays inert and vLLM uses its native paths. |
-| `SPARKINFER_FP6_MODEL_DIR=<checkpoint dir>` | Where the plugin indexes FP6 tensors. Export **unconditionally** per launch: a stale value from a previous launch mis-classifies layers and trips loader shape asserts. |
-| `SPARKINFER_ENABLE_FP6_MICRO=0` | Keep the fast fused dense kernel (the BS1 micro kernel is slower for these workloads). |
-| `SPARKINFER_DENSE_PER_ROW_IN_KERNEL` | Default 1 (fused in-kernel per-row activation quant). `0` = host-chain A/B fallback, bit-identical but ~1.7 ms/token slower at decode. |
+| `B12X_ENABLE_FP6=1` | Master gate. Unset/0 = the plugin stays inert and vLLM uses its native paths. |
+| `B12X_FP6_MODEL_DIR=<checkpoint dir>` | Where the plugin indexes FP6 tensors. Export **unconditionally** per launch: a stale value from a previous launch mis-classifies layers and trips loader shape asserts. |
+| `B12X_ENABLE_FP6_MICRO=0` | Keep the fast fused dense kernel (the BS1 micro kernel is slower for these workloads). |
+| `B12X_DENSE_PER_ROW_IN_KERNEL` | Default `1`: compute per-row activation scaling in the small-M quantizer and the large-M row-scale/TMA path. `0` uses the equivalent host-side chain. |
+| `B12X_DENSE_PERSISTENT_SCRATCH` | Default `1`: retain stream-local quantization workspaces. CUDA-graph capture requires a sufficiently sized eager workspace prewarmed for each capture stream and fails instead of allocating during capture. |
 
 Never leak KLD-scoring-only variables into serving: unset
-`TORCH_COMPILE_DISABLE` and `SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT`
+`TORCH_COMPILE_DISABLE` and `B12X_DYNAMIC_DETERMINISTIC_OUTPUT`
 (the launch scripts below do this).
 
 ### 2.3 Minimal launch
 
 ```bash
-export SPARKINFER_ENABLE_FP6=1
-export SPARKINFER_FP6_MODEL_DIR=/path/to/fp6-checkpoint
+export B12X_ENABLE_FP6=1
+export B12X_FP6_MODEL_DIR=/path/to/fp6-checkpoint
 
 vllm serve /path/to/fp6-checkpoint \
-  --quantization sparkinfer_fp6 \
+  --quantization b12x_fp6 \
   --served-model-name my-model-fp6 \
   --trust-remote-code
 ```
 
-`--quantization sparkinfer_fp6` is optional — the plugin claims any
+`--quantization b12x_fp6` is optional — the plugin claims any
 checkpoint whose `config.json` carries `quant_method=modelopt` +
 `quant_algo=W6A6` when the enable gate is set. At TP>1 on Blackwell add
 `--disable-custom-all-reduce` (vLLM's custom all-reduce kernel crashes
@@ -170,14 +171,14 @@ set -euo pipefail
 #
 # Model:
 #   - Base:    Qwen/Qwen3.6-27B  (arch tag: qwen3_5, ~28B params)
-#   - Quant:   SparkInfer MX-FP6 (W6A6 schema tag): 6-bit weights on disk,
+#   - Quant:   B12X MX-FP6 (W6A6 schema tag): 6-bit weights on disk,
 #              activations quantized at runtime to FP8 E4M3 (W6A8 execution).
 #              quantization_config = {"quant_method":"modelopt","quant_algo":"W6A6"}
 #              Golden-rule Linear coverage: MLP + full attention + linear_attn
 #              projections quantized to FP6 (this is the "_la" build that drops
 #              below the FP8 size). IGNORED / kept BF16: lm_head, visual tower,
 #              mtp head, embeddings, router gates, norms.
-#              Served by the SparkInfer fused dense kernel (not the micro kernel).
+#              Served by the B12X fused dense kernel (not the micro kernel).
 #
 # Architecture notes (from the upstream Qwen/Qwen3.6-27B card):
 #   - Hybrid 64-layer stack:
@@ -190,18 +191,18 @@ set -euo pipefail
 #   - Native ctx: 262,144 tokens (so 131,072 here needs no YaRN override).
 #
 # ------------------------------------------------------------
-# PREREQUISITE -- register the SparkInfer FP6 quantization in vLLM
+# PREREQUISITE -- register the B12X FP6 quantization in vLLM
 # ------------------------------------------------------------
-#   "sparkinfer_fp6" is NOT a stock vLLM quant method. vLLM's native ModelOpt
-#   path does not implement W6A6, so the sparkinfer package must be installed
+#   "b12x_fp6" is NOT a stock vLLM quant method. vLLM's native ModelOpt
+#   path does not implement W6A6, so the b12x package must be installed
 #   in the serving venv: its "vllm.general_plugins" entry point
-#   (sparkinfer.integration.vllm.plugin:register_sparkinfer_fp6) registers the
-#   SparkInferFp6Config in every vLLM process (front, engine-core, TP workers).
-#   Until then, `--quantization sparkinfer_fp6` will not resolve.
+#   (b12x.integration.vllm.plugin:register_b12x_fp6) registers the
+#   B12XFp6Config in every vLLM process (front, engine-core, TP workers).
+#   Until then, `--quantization b12x_fp6` will not resolve.
 #
 #   The two env gates below are what the FP6 serving layer keys off of:
-#     SPARKINFER_ENABLE_FP6=1        -> select the FP6 path (else native fallback)
-#     SPARKINFER_ENABLE_FP6_MICRO=0  -> use the fast fused kernel, not the BS1
+#     B12X_ENABLE_FP6=1        -> select the FP6 path (else native fallback)
+#     B12X_ENABLE_FP6_MICRO=0  -> use the fast fused kernel, not the BS1
 #                                       micro kernel (slower for this workload).
 #
 # VRAM fit on 1x 96 GiB Blackwell:
@@ -223,14 +224,14 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-# --- SparkInfer FP6 gates (see PREREQUISITE above) ---
-export SPARKINFER_ENABLE_FP6="${SPARKINFER_ENABLE_FP6:-1}"
-export SPARKINFER_ENABLE_FP6_MICRO="${SPARKINFER_ENABLE_FP6_MICRO:-0}"
-# The vLLM plugin (sparkinfer.integration.vllm.plugin) reads the FP6 checkpoint
-# dir from SPARKINFER_FP6_MODEL_DIR in every process, including spawned TP
+# --- B12X FP6 gates (see PREREQUISITE above) ---
+export B12X_ENABLE_FP6="${B12X_ENABLE_FP6:-1}"
+export B12X_ENABLE_FP6_MICRO="${B12X_ENABLE_FP6_MICRO:-0}"
+# The vLLM plugin (b12x.integration.vllm.plugin) reads the FP6 checkpoint
+# dir from B12X_FP6_MODEL_DIR in every process, including spawned TP
 # workers. Set below once MODEL_DIR is known.
 # Make sure KLD-scoring-only vars never leak into serving:
-unset TORCH_COMPILE_DISABLE SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT 2>/dev/null || true
+unset TORCH_COMPILE_DISABLE B12X_DYNAMIC_DETERMINISTIC_OUTPUT 2>/dev/null || true
 
 # --- vLLM / CUDA behavior ---
 export VLLM_NO_USAGE_STATS=1
@@ -246,7 +247,7 @@ export OMP_NUM_THREADS=8
 # Recent vLLM nightlies gate these endpoints on the --profiler-config CLI arg
 # (vllm/entrypoints/serve/profile/api_router.py); the old VLLM_TORCH_PROFILER_DIR
 # env var no longer registers them. PROFILE=1 enables; traces (.json.gz) land in
-# PROFILE_DIR; summarize with sparkinfer scripts/summarize_vllm_trace.py.
+# PROFILE_DIR; summarize with b12x scripts/summarize_vllm_trace.py.
 PROFILE="${PROFILE:-0}"
 PROFILE_DIR="${PROFILE_DIR:-/tmp/vllm_prof}"
 if [[ "$PROFILE" == "1" ]]; then
@@ -272,16 +273,15 @@ if [[ -z "$API_KEY" ]]; then
   exit 2
 fi
 
-# Local SparkInfer MX-FP6 (W6A6) checkpoint. Override at launch time if needed:
+# Local B12X MX-FP6 (W6A6) checkpoint. Override at launch time if needed:
 #   MODEL_DIR=/path/to/model ./qwen3.6-27b-fp6.sh
 MODEL_DIR="${MODEL_DIR:-/media/fmodels/TheHouseOfTheDude/qwen3-6_27B_dense_fp6_la}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.6-27B-FP6-W6A6}"
 # Tell the FP6 vLLM plugin where the weights live (inherited by workers).
-# Set UNCONDITIONALLY: a stale SPARKINFER_FP6_MODEL_DIR from a previous launch
+# Set UNCONDITIONALLY: a stale B12X_FP6_MODEL_DIR from a previous launch
 # makes the plugin index the wrong checkpoint -> wrong FP6/BF16 classification
 # -> loader shape asserts (this exact failure hit the 35B MoE KLD run).
-export SPARKINFER_FP6_MODEL_DIR="$MODEL_DIR"
-unset B12X_FP6_MODEL_DIR 2>/dev/null || true  # legacy name must not shadow it
+export B12X_FP6_MODEL_DIR="$MODEL_DIR"
 # The FP6 export copies tokenizer.json/tokenizer_config.json and
 # chat_template.jinja, so keep tokenizer resolution local by default.
 TOKENIZER="${TOKENIZER:-$MODEL_DIR}"
@@ -310,10 +310,10 @@ TOKENIZER_MODE="${TOKENIZER_MODE:-hf}"
 CONFIG_FORMAT="${CONFIG_FORMAT:-auto}"
 LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 
-# SparkInfer MX-FP6 (W6A6). Requires the sparkinfer package installed in the
+# B12X MX-FP6 (W6A6). Requires the b12x package installed in the
 # serving venv (see PREREQUISITE above). Set QUANTIZATION="" to let vLLM
 # auto-detect from config.json (works because the plugin overrides modelopt).
-QUANTIZATION="${QUANTIZATION:-sparkinfer_fp6}"
+QUANTIZATION="${QUANTIZATION:-b12x_fp6}"
 
 # Qwen3.6 ships a custom modeling file (qwen3_5 / qwen3_next family).
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
@@ -383,7 +383,7 @@ fi
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
 
 # Eager mode escape hatch. The FP6 linear is an opaque torch custom op
-# (sparkinfer::fp6_dense_linear), so mode-3 compile + CUDA graphs work
+# (b12x::fp6_dense_linear), so mode-3 compile + CUDA graphs work
 # normally; set ENFORCE_EAGER=1 only to isolate kernel issues from
 # compile/capture issues during bring-up.
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
@@ -469,8 +469,8 @@ echo "  MODEL_DIR=${MODEL_DIR}"
 echo "  SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
 echo "  TOKENIZER=${TOKENIZER}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "  SPARKINFER_ENABLE_FP6=${SPARKINFER_ENABLE_FP6} (micro=${SPARKINFER_ENABLE_FP6_MICRO})"
-echo "  SPARKINFER_FP6_MODEL_DIR=${SPARKINFER_FP6_MODEL_DIR}"
+echo "  B12X_ENABLE_FP6=${B12X_ENABLE_FP6} (micro=${B12X_ENABLE_FP6_MICRO})"
+echo "  B12X_FP6_MODEL_DIR=${B12X_FP6_MODEL_DIR}"
 echo "  TP_SIZE=${TP_SIZE}"
 echo "  MAX_MODEL_LEN=${MAX_MODEL_LEN}"
 echo "  KV_CACHE_DTYPE=${KV_CACHE_DTYPE}"
@@ -514,14 +514,14 @@ set -euo pipefail
 # Model:
 #   - Base:    Qwen/Qwen3.6-35B-A3B  (arch tag: qwen3_5 MoE family, ~35B total
 #              / ~3B active params)
-#   - Quant:   SparkInfer MX-FP6 (W6A6 schema tag): 6-bit weights on disk,
+#   - Quant:   B12X MX-FP6 (W6A6 schema tag): 6-bit weights on disk,
 #              activations quantized at runtime to FP8 E4M3 (W6A8 execution).
 #              quantization_config = {"quant_method":"modelopt","quant_algo":"W6A6"}
 #              Coverage: all 256 routed experts per layer (gate/up/down), the
 #              shared expert, MLP + full attention + linear_attn projections.
 #              IGNORED / kept BF16: lm_head, visual tower, mtp head, embeddings,
 #              router gates (mlp.gate / shared_expert_gate), norms, GDN aux.
-#              Routed experts run through the SparkInfer fused MoE kernel
+#              Routed experts run through the B12X fused MoE kernel
 #              (FusedMoE binding); everything else uses the dense FP6 path.
 #
 # Architecture notes:
@@ -532,14 +532,14 @@ set -euo pipefail
 #   - Vision encoder present (VL model); MTP head trained-in (kept BF16).
 #
 # ------------------------------------------------------------
-# PREREQUISITE -- register the SparkInfer FP6 quantization in vLLM
+# PREREQUISITE -- register the B12X FP6 quantization in vLLM
 # ------------------------------------------------------------
-#   "sparkinfer_fp6" is NOT a stock vLLM quant method; the sparkinfer package
-#   (sparkinfer.integration.vllm.plugin, wired via the vllm.general_plugins
-#   entry point in sparkinfer's pyproject) must be installed in the serving
+#   "b12x_fp6" is NOT a stock vLLM quant method; the b12x package
+#   (b12x.integration.vllm.plugin, wired via the vllm.general_plugins
+#   entry point in b12x's pyproject) must be installed in the serving
 #   venv. The env gates:
-#     SPARKINFER_ENABLE_FP6=1        -> select the FP6 path (else native fallback)
-#     SPARKINFER_ENABLE_FP6_MICRO=0  -> dense linears use the fused kernel. The
+#     B12X_ENABLE_FP6=1        -> select the FP6 path (else native fallback)
+#     B12X_ENABLE_FP6_MICRO=0  -> dense linears use the fused kernel. The
 #                                       MoE expert path picks its own backend
 #                                       per shape.
 #
@@ -560,11 +560,11 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-# --- SparkInfer FP6 gates (see PREREQUISITE above) ---
-export SPARKINFER_ENABLE_FP6="${SPARKINFER_ENABLE_FP6:-1}"
-export SPARKINFER_ENABLE_FP6_MICRO="${SPARKINFER_ENABLE_FP6_MICRO:-0}"
+# --- B12X FP6 gates (see PREREQUISITE above) ---
+export B12X_ENABLE_FP6="${B12X_ENABLE_FP6:-1}"
+export B12X_ENABLE_FP6_MICRO="${B12X_ENABLE_FP6_MICRO:-0}"
 # Make sure KLD-scoring-only vars never leak into serving:
-unset TORCH_COMPILE_DISABLE SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT 2>/dev/null || true
+unset TORCH_COMPILE_DISABLE B12X_DYNAMIC_DETERMINISTIC_OUTPUT 2>/dev/null || true
 
 # --- vLLM / CUDA behavior ---
 export VLLM_NO_USAGE_STATS=1
@@ -596,17 +596,16 @@ if [[ -z "$API_KEY" ]]; then
   exit 2
 fi
 
-# Local SparkInfer MX-FP6 (W6A6) checkpoint. Override at launch time if needed:
+# Local B12X MX-FP6 (W6A6) checkpoint. Override at launch time if needed:
 #   MODEL_DIR=/path/to/model ./qwen3.6-35b-a3b-fp6.sh
 MODEL_DIR="${MODEL_DIR:-/media/fmodels/TheHouseOfTheDude/qwen3-6_35B-A3B_moe_fp6}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.6-35B-A3B-FP6-W6A6}"
 # Tell the FP6 vLLM plugin where the weights live (inherited by workers).
-# Set UNCONDITIONALLY: a stale SPARKINFER_FP6_MODEL_DIR from a previous launch
+# Set UNCONDITIONALLY: a stale B12X_FP6_MODEL_DIR from a previous launch
 # makes the plugin index the wrong checkpoint -> wrong FP6/BF16 classification
 # -> loader shape asserts / silent BF16 fallback (the Cydonia lesson; also hit
 # the 35B MoE KLD run when the 27B dir was still exported).
-export SPARKINFER_FP6_MODEL_DIR="$MODEL_DIR"
-unset B12X_FP6_MODEL_DIR 2>/dev/null || true  # legacy name must not shadow it
+export B12X_FP6_MODEL_DIR="$MODEL_DIR"
 # The FP6 export copies tokenizer.json/tokenizer_config.json and
 # chat_template.jinja, so keep tokenizer resolution local by default.
 TOKENIZER="${TOKENIZER:-$MODEL_DIR}"
@@ -633,9 +632,9 @@ TOKENIZER_MODE="${TOKENIZER_MODE:-hf}"
 CONFIG_FORMAT="${CONFIG_FORMAT:-auto}"
 LOAD_FORMAT="${LOAD_FORMAT:-auto}"
 
-# SparkInfer MX-FP6 (W6A6). Set QUANTIZATION="" to let vLLM auto-detect from
+# B12X MX-FP6 (W6A6). Set QUANTIZATION="" to let vLLM auto-detect from
 # config.json (works because the plugin overrides the modelopt method).
-QUANTIZATION="${QUANTIZATION:-sparkinfer_fp6}"
+QUANTIZATION="${QUANTIZATION:-b12x_fp6}"
 
 # Qwen3.6 ships a custom modeling file (qwen3_5 / qwen3_next family).
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
@@ -678,7 +677,7 @@ ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 
 # CUDA graph setup. The FP6 MoE binding warm-runs the resolved capture sizes
 # at weight-load time automatically (it reads vLLM's compilation config;
-# SPARKINFER_MOE_WARM_MS overrides) — no manual sync with the plugin is needed.
+# B12X_MOE_WARM_MS overrides) — no manual sync with the plugin is needed.
 CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-full_decode_only}"
 # Default capture sizes are derived from the MTP spec: vLLM pads decode
 # batches to the next captured size, so the list must reach at least the
@@ -787,8 +786,8 @@ echo "  MODEL_DIR=${MODEL_DIR}"
 echo "  SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
 echo "  TOKENIZER=${TOKENIZER}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "  SPARKINFER_ENABLE_FP6=${SPARKINFER_ENABLE_FP6} (micro=${SPARKINFER_ENABLE_FP6_MICRO})"
-echo "  SPARKINFER_FP6_MODEL_DIR=${SPARKINFER_FP6_MODEL_DIR}"
+echo "  B12X_ENABLE_FP6=${B12X_ENABLE_FP6} (micro=${B12X_ENABLE_FP6_MICRO})"
+echo "  B12X_FP6_MODEL_DIR=${B12X_FP6_MODEL_DIR}"
 echo "  TP_SIZE=${TP_SIZE}"
 echo "  MAX_MODEL_LEN=${MAX_MODEL_LEN}"
 echo "  KV_CACHE_DTYPE=${KV_CACHE_DTYPE}"
@@ -830,20 +829,20 @@ python3.12 -m venv venv-kld && source venv-kld/bin/activate
 uv pip install --index-url https://download.pytorch.org/whl/cu130 \
   torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
 cd vllm-kld && VLLM_USE_PRECOMPILED=1 uv pip install -e . && cd ..
-uv pip install -e /path/to/sparkinfer --no-deps
+uv pip install -e /path/to/b12x --no-deps
 ```
 
 Scoring runs offline (not against a server) with deterministic eager
 execution, from the `vllm-kld` checkout with `venv-kld` active:
 
 ```bash
-export SPARKINFER_ENABLE_FP6=1
-export SPARKINFER_FP6_MODEL_DIR=/path/to/fp6-checkpoint
+export B12X_ENABLE_FP6=1
+export B12X_FP6_MODEL_DIR=/path/to/fp6-checkpoint
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TORCH_COMPILE_DISABLE=1   # mandatory for reproducible KLD
 
 python examples/offline_inference/score_mode_kld.py \
-  --model "$SPARKINFER_FP6_MODEL_DIR" \
+  --model "$B12X_FP6_MODEL_DIR" \
   --reference-logits /path/to/ref_logits_<base>_ctx2048_s512 \
   --dataset wikitext --dataset-config wikitext-2-raw-v1 \
   --context-length 2048 --stride 512 \
@@ -860,9 +859,9 @@ unset it).
 
 | Symptom | Cause / fix |
 |---|---|
-| `--quantization sparkinfer_fp6` "invalid choice" | sparkinfer not installed in the serving venv; the plugin entry point never ran. |
-| Loader `AssertionError` in `vllm/model_executor/parameter.py` | `SPARKINFER_FP6_MODEL_DIR` points at a different checkpoint than the one being served (stale export). Export it unconditionally per launch. |
-| `torchvision::nms` missing after installing sparkinfer | torch got upgraded past vLLM's pin — reinstall per §2.1 (sparkinfer with `--no-deps`). |
+| `--quantization b12x_fp6` "invalid choice" | b12x not installed in the serving venv; the plugin entry point never ran. |
+| Loader `AssertionError` in `vllm/model_executor/parameter.py` | `B12X_FP6_MODEL_DIR` points at a different checkpoint than the one being served (stale export). Export it unconditionally per launch. |
+| `torchvision::nms` missing after installing b12x | torch got upgraded past vLLM's pin — reinstall per §2.1 (b12x with `--no-deps`). |
 | CUDA error `custom_all_reduce.cuh ... invalid argument` at TP>1 | Blackwell sm_120 custom all-reduce vs CUDA graphs; pass `--disable-custom-all-reduce` (scripts do it automatically). |
 | `--speculative-config ... cannot be converted` | JSON default embedded in `${VAR:-...}` — bash truncates at the first `}`. Assign JSON via a plain `if [[ -z ... ]]` block (scripts already do). |
 | Mamba/DeltaNet cudagraph cache assert during MTP capture | Set `MAX_CUDAGRAPH_CAPTURE_SIZE=4` (or 1), or `ENABLE_MTP=0` to isolate. |

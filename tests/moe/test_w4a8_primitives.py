@@ -15,10 +15,10 @@ import cutlass
 import cutlass.cute as cute
 import pytest
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from sparkinfer._lib.intrinsics import (
+from b12x._lib.intrinsics import (
     MX_SF_VEC_SIZE,
     broadcast_f32_to_half2,
     e2m1x8_mul_residual_to_e4m3x8,
@@ -31,7 +31,7 @@ from sparkinfer._lib.intrinsics import (
     silu_mul_quantize_block_fp8_mx,
 )
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -203,9 +203,28 @@ def _e2m1_lut_f32(device: torch.device) -> torch.Tensor:
     return torch.cat([mags, -mags])
 
 
+def _native_trellis_tile(edges: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack 256 cyclic edge symbols with EXL's native SWAP16 ordering."""
+    values = edges.to(torch.int64) & ((1 << bits) - 1)
+    spans = values.reshape(16, 16)
+    symbol_shifts = torch.arange(bits - 1, -1, -1, device=edges.device)
+    bitstream = ((spans[..., None] >> symbol_shifts) & 1).reshape(16, bits * 16)
+    word_shifts = torch.arange(15, -1, -1, device=edges.device)
+    words = (bitstream.reshape(16, bits, 16) << word_shifts).sum(dim=-1)
+    flat = words.reshape(16 * bits)
+    return flat.reshape(-1, 2).flip(-1).reshape(-1).to(torch.int16).contiguous()
+
+
+def _cyclic_trellis_states(edges: torch.Tensor, bits: int) -> torch.Tensor:
+    states = torch.zeros_like(edges, dtype=torch.int64)
+    for lag in range((16 + bits - 1) // bits):
+        states |= torch.roll(edges.to(torch.int64), shifts=lag) << (lag * bits)
+    return (states & 0xFFFF).to(torch.int32)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_e2m1x8_to_e4m3x8_exact() -> None:
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     torch.manual_seed(0)
     # All 16 codes in every nibble position, plus random patterns.
@@ -232,7 +251,7 @@ def test_e2m1x8_to_e4m3x8_exact() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_e2m1x8_mul_residual_to_e4m3x8_matches_f16_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     torch.manual_seed(1)
     n = 4096
@@ -301,7 +320,7 @@ def _run_quant(kernel_cls, x: torch.Tensor, up: torch.Tensor) -> tuple[torch.Ten
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_quantize_block_fp8_mx_bit_exact() -> None:
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     torch.manual_seed(2)
     blocks = [
@@ -325,7 +344,7 @@ def test_quantize_block_fp8_mx_bit_exact() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_silu_mul_quantize_block_fp8_mx_close_to_torch() -> None:
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     torch.manual_seed(3)
     rows = 512
@@ -409,7 +428,7 @@ class _QdE4M3Kernel:
 
     @cute.kernel
     def kernel(self, mIn: cute.Tensor, mOut: cute.Tensor):
-        from sparkinfer._lib.intrinsics import mx_scale_from_amax32, quant_dequant_e4m3_2
+        from b12x._lib.intrinsics import mx_scale_from_amax32, quant_dequant_e4m3_2
 
         tidx = cute.arch.thread_idx()[0]
         bidx = cute.arch.block_idx()[0]
@@ -435,7 +454,7 @@ class _QdE4M3Kernel:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_quant_dequant_e4m3_2_matches_prefill_quantizer() -> None:
     """The micro a8_mx round-trip must bit-match quant_dequant_mxfp8_torch."""
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     torch.manual_seed(5)
     x = torch.cat(

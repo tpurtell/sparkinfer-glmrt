@@ -7,9 +7,9 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sparkinfer.moe._shared.kernels.reference import compare_to_reference, moe_reference_w4a8_mx
+from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_w4a8_mx
 
-from tests._reference.helpers import make_tp_moe_fp4_binding, require_sparkinfer
+from tests._reference.helpers import make_tp_moe_fp4_binding, require_b12x
 from .test_w4a8_dynamic_kernel import _run_w4a8_dynamic
 from .test_w4a8_mx_tp_moe import (
     _E,
@@ -112,7 +112,7 @@ def test_w4a8_direct_tile_recipe_activation_matches_oracle_under_graph(
 ) -> None:
     """Cover every direct tile/recipe/activation specialization under replay."""
 
-    require_sparkinfer()
+    require_b12x()
     # M16 also supplies the decode-sized boundary; the remaining inputs cross
     # their tile boundary so tail predicates execute in every specialization.
     m = {16: 1, 32: 33, 64: 65, 128: 129}[tile_m]
@@ -151,7 +151,7 @@ def test_w4a8_packed_prefill_matches_oracle_under_graph(
 ) -> None:
     """Exercise activation packing and routed prefill at serving-scale M."""
 
-    require_sparkinfer()
+    require_b12x()
     output, reference, launch, state = _run_w4a8_dynamic(
         recipe=recipe,
         activation=activation,
@@ -184,11 +184,11 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
 ) -> None:
     """Prove the serving materialized route/phase1/phase2 prefill graph."""
 
-    require_sparkinfer()
-    from sparkinfer.moe.fused_moe._impl import sparkinfer_moe_fp4, clear_tp_moe_caches
+    require_b12x()
+    from b12x.moe.fused_moe._impl import b12x_moe_fp4, clear_tp_moe_caches
 
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_TILE_MN", "64x128")
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", "64x128")
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     clear_tp_moe_caches()
     device = torch.device("cuda")
     m = 4096
@@ -260,7 +260,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     assert route_end <= intermediate_begin or intermediate_end <= route_begin
 
     def launch() -> None:
-        sparkinfer_moe_fp4(binding=binding)
+        b12x_moe_fp4(binding=binding)
 
     launch()
     torch.cuda.synchronize()
@@ -328,7 +328,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     # The serving default is atomic scatter.  It must not reserve the routed
     # deterministic output (M * top-k * K BF16 values), but it must preserve
     # the same fixed-address graph and poison-overwrite contracts.
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "0")
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "0")
     clear_tp_moe_caches()
     atomic_output = torch.full_like(output, float("nan"))
     atomic_binding = make_tp_moe_fp4_binding(
@@ -345,7 +345,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     assert tuple(atomic_binding.route_output.shape) == (1, _K)
 
     def atomic_launch() -> None:
-        sparkinfer_moe_fp4(binding=atomic_binding)
+        b12x_moe_fp4(binding=atomic_binding)
 
     atomic_launch()
     torch.cuda.synchronize()
@@ -382,4 +382,4 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
         ValueError,
         match="deterministic route-output capacity mismatch",
     ):
-        sparkinfer_moe_fp4(binding=replace(atomic_binding, deterministic_output=True))
+        b12x_moe_fp4(binding=replace(atomic_binding, deterministic_output=True))

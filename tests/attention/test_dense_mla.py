@@ -7,9 +7,9 @@ from pathlib import Path
 
 import torch
 
-from sparkinfer.attention import dense_mla
+from b12x.attention import dense_mla
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 FP8 = torch.float8_e4m3fn
 HEADS = 8
@@ -73,10 +73,10 @@ def test_source_is_standalone_cute() -> None:
     root = Path(dense_mla.__file__).resolve().parent
     forbidden = (
         "triton",
-        "sparkinfer.attention.paged",
-        "sparkinfer.attention.sparse_mla",
-        "sparkinfer.attention.nsa_indexer",
-        "sparkinfer.attention._shared.mla",
+        "b12x.attention.paged",
+        "b12x.attention.sparse_mla",
+        "b12x.attention.nsa_indexer",
+        "b12x.attention._shared.mla",
     )
     for path in root.glob("*.py"):
         tree = ast.parse(path.read_text(), filename=str(path))
@@ -99,7 +99,7 @@ def test_public_types_are_module_scoped_names() -> None:
 
 
 def test_partial_row_budget_changes_native_split_policy() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     plan = dense_mla.plan(
         dense_mla.Caps(
             device=device,
@@ -121,7 +121,7 @@ def test_partial_row_budget_changes_native_split_policy() -> None:
 
 @torch.inference_mode()
 def test_bf16_multi_request_decode_matches_reference() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260730)
     batch = 4
     page_size = 16
@@ -244,7 +244,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
 
 @torch.inference_mode()
 def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260731)
     query_rows = 5
     page_size = 16
@@ -320,7 +320,7 @@ def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
 
 @torch.inference_mode()
 def test_bf16_query_tiled_causal_extend_matches_reference() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260732)
     query_rows = 7
     page_size = 16
@@ -390,7 +390,7 @@ def test_bf16_query_tiled_causal_extend_matches_reference() -> None:
 
 @torch.inference_mode()
 def test_padded_page_stride_matches_reference() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260801)
     page_size = 16
     pages = 5
@@ -470,7 +470,7 @@ def test_padded_page_stride_matches_reference() -> None:
 
 @torch.inference_mode()
 def test_cuda_graph_replay_is_allocation_stable_and_reads_live_inputs() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260802)
     page_size = 16
     pages = 8
@@ -553,7 +553,7 @@ def test_cuda_graph_replay_is_allocation_stable_and_reads_live_inputs() -> None:
 @torch.inference_mode()
 def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
     """The 1M K3 plan must not touch inactive split storage or cache pages."""
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260803)
     page_size = 768
     page_width = (131_072 + page_size - 1) // page_size
@@ -602,7 +602,9 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         cu_seqlens_q=cu_seqlens_q,
         q_scale=q_scale,
         kv_scale=kv_scale,
+        active_splits=1,
     )
+    assert binding.active_splits == 1
     dense_mla.compile(binding=binding)
     actual_output, actual_lse = dense_mla.run(binding=binding)
     torch.cuda.synchronize()
@@ -636,10 +638,32 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         expected_lse,
     )
 
+    # The active prefix preserves the maximum-context split boundaries and
+    # only omits mathematically empty tail splits. It must therefore match a
+    # full-plan launch exactly, including the BF16 output bits.
+    full_output = torch.empty_like(output)
+    full_binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=full_output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+    assert full_binding.active_splits == plan.num_splits
+    full_actual, full_lse = dense_mla.run(binding=full_binding)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(full_actual, captured_output, rtol=0, atol=0)
+    torch.testing.assert_close(full_lse, captured_lse, rtol=0, atol=0)
+
 
 @torch.inference_mode()
 def test_page_ids_past_int32_scaled_offset_match_reference() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260803)
     page_size = 16
     record_bytes = (
@@ -732,7 +756,7 @@ def test_page_ids_past_int32_scaled_offset_match_reference() -> None:
 
 @torch.inference_mode()
 def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260803)
     page_size = 768
     record_bytes = QK_DIM

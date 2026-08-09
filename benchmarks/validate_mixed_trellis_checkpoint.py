@@ -11,12 +11,12 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from sparkinfer.moe._shared.kernels.w4a16.host import (
+from b12x.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
 )
-from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
-from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
+from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     MixedTrellisRotations,
     build_tiered_maps,
     combine_trellis_rotations,
@@ -24,7 +24,7 @@ from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
     make_mixed_trellis_buffers,
     run_mixed_trellis,
 )
-from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_moe_weights,
 )
 

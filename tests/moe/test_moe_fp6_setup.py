@@ -4,16 +4,16 @@ from __future__ import annotations
 
 # TODO(port): the FP6 extensions of the fused-MoE backends (the static backend
 # base `_MoEStaticKernelBase`, the micro backend's `MXFP6_BLOCK_SIZE` /
-# `is_supported_mxfp6`) were not ported upstream; the sparkinfer FP6 MoE route
-# is sparkinfer.moe.fused_moe with quant_mode="w6a8_mx" instead. The affected
+# `is_supported_mxfp6`) were not ported upstream; the b12x FP6 MoE route
+# is b12x.moe.fused_moe with quant_mode="w6a8_mx" instead. The affected
 # tests are kept as reference behind pytest.skip gates.
 
 import cutlass
 import pytest
 
-from sparkinfer._lib.utils import mxfp6_tile_k, mxfp6_num_k_blocks
-from sparkinfer.moe._shared.kernels import mxfp6_moe
-from sparkinfer.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+from b12x._lib.utils import mxfp6_tile_k, mxfp6_num_k_blocks
+from b12x.moe._shared.kernels import mxfp6_moe
+from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
 
 
 def test_mxfp6_moe_helpers_import():
@@ -27,7 +27,7 @@ def test_mxfp6_tile_k_matches_moe_expectation():
 
 def test_moe_static_dynamic_init_tile_k_default():
     pytest.skip("pending: FP6 static-backend port (_MoEStaticKernelBase not upstream)")
-    from sparkinfer.moe._shared.kernels.static import _MoEStaticKernelBase
+    from b12x.moe._shared.kernels.static import _MoEStaticKernelBase
 
     backend = _MoEStaticKernelBase(
         sf_vec_size=32,
@@ -41,7 +41,7 @@ def test_moe_static_dynamic_init_tile_k_default():
 
 def test_micro_mxfp6_not_supported():
     pytest.skip("pending: FP6 micro kernel port (is_supported_mxfp6 not upstream)")
-    from sparkinfer.moe._shared.kernels.micro import (
+    from b12x.moe._shared.kernels.micro import (
         MXFP6_BLOCK_SIZE,
         MoEMicroKernelBackend,
     )

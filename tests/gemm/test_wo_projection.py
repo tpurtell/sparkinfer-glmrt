@@ -2,27 +2,27 @@
 a quantized torch reference, plus the fused inverse-RoPE variant replaying
 under CUDA-graph capture with poisoned scale padding.
 
-Curated from sparkinfer tests/test_gemm_wo_projection.py (1.2k lines upstream);
+Curated from b12x tests/test_gemm_wo_projection.py (1.2k lines upstream);
 split-GEMM leaves, packing round-trips, and byte-identity policy tests stay
-in the sparkinfer repo.
+in the b12x repo.
 """
 
 from __future__ import annotations
 
 import torch
 
-from sparkinfer.gemm import wo_projection as wo
-from sparkinfer.gemm._shared.wo_mxfp8 import (
+from b12x.gemm import wo_projection as wo
+from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
     quantize_wo_projection_weights_mxfp8_torch,
 )
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def test_plan_bind_run_singleton_group_matches_quantized_reference() -> None:
     """TP8 collapses DSV4's eight output groups to one local WO group."""
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31005)
 
     tokens, groups, group_width, rank, hidden = 3, 1, 512, 128, 128
@@ -74,7 +74,7 @@ def test_plan_bind_run_singleton_group_matches_quantized_reference() -> None:
 
 
 def test_run_inv_rope_replays_under_graph_with_uninitialized_scale_padding() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(31007)
 
     tokens = 1

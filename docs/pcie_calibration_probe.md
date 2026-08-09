@@ -1,13 +1,13 @@
 # PCIe Calibration Probe
 
-`sparkinfer.comm.pcie.overlap_probe` is a standalone, vLLM-independent
-calibrator for GLM-shaped TP and DCP traffic. It measures real SparkInfer and
+`b12x.comm.pcie.overlap_probe` is a standalone, vLLM-independent
+calibrator for GLM-shaped TP and DCP traffic. It measures real B12X and
 NCCL collectives on the deployed rank topology instead of inferring policy
 from PCIe link labels alone.
 
 ## Numeric contract
 
-Automatic policy is lossless-only. The TP comparison uses SparkInfer
+Automatic policy is lossless-only. The TP comparison uses B12X
 `DmaAllReduce` with `dma_wire_mode=0`, which transports BF16 without wire
 quantization, and validates its result against NCCL before timing it.
 
@@ -20,7 +20,7 @@ choices and can never be enabled by the generated policy.
 The probe reports the median of the slowest rank after warmup and records the
 physical rank-to-GPU mapping. It calibrates three independent decisions:
 
-1. NCCL versus lossless BF16 SparkInfer DMA over a TP payload ladder. DMA is
+1. NCCL versus lossless BF16 B12X DMA over a TP payload ladder. DMA is
    selected only at the start of a sustained winning tail.
 2. One-layer CKV prefetch by timing isolated and concurrent TP/CKV collectives
    in both launch orders. Any material regression or pathological contention
@@ -31,13 +31,13 @@ physical rank-to-GPU mapping. It calibrates three independent decisions:
 
 ## Run
 
-Run from a SparkInfer checkout inside an image that contains its build
+Run from a B12X checkout inside an image that contains its build
 dependencies:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 torchrun --standalone --nproc-per-node=8 \
-  -m sparkinfer.comm.pcie.overlap_probe \
+  -m b12x.comm.pcie.overlap_probe \
   --tp-size 8 \
   --dcp-size 4 \
   --context-tokens 8192,65536,131072 \
@@ -87,7 +87,7 @@ faster. Decisions use the pessimistic median from both launch orders.
 ### Reproducible evidence
 
 - Probe source: commit `f3fb62c8af5bf6759e28a067b4e6fc8732a9e497`, worktree
-  `/root/vllm/worktrees/sparkinfer-pcie-calibration-pr-20260726`.
+  `/root/vllm/worktrees/b12x-pcie-calibration-pr-20260726`.
 - Runtime: PyTorch `2.12.0+cu132`; CUDA `13.2`; nine measured samples after
   three warmup iterations for every mode and point.
 - [Adjacent GPU 0-7 raw JSON](evidence/pcie_calibration/20260726-adjacent-tp8-dcp4.json)
@@ -98,7 +98,7 @@ Adjacent command:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 torchrun --standalone --nproc-per-node=8 \
-  -m sparkinfer.comm.pcie.overlap_probe \
+  -m b12x.comm.pcie.overlap_probe \
   --tp-size 8 --dcp-size 4 \
   --context-tokens 8192,65536,131072 \
   --output adjacent-gpu0-7-f3fb62c.json
@@ -109,7 +109,7 @@ Interleaved command:
 ```bash
 CUDA_VISIBLE_DEVICES=0,2,4,6,8,10,12,14 \
 torchrun --standalone --nproc-per-node=8 \
-  -m sparkinfer.comm.pcie.overlap_probe \
+  -m b12x.comm.pcie.overlap_probe \
   --tp-size 8 --dcp-size 4 \
   --context-tokens 8192,65536,131072 \
   --output interleaved-gpu-even-f3fb62c.json

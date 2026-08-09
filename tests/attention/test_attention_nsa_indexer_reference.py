@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.attention.nsa_indexer.reference import (
+from b12x.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     contiguous_logits_reference,
     paged_decode_logits_reference,

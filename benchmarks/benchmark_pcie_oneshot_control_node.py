@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 from cuda.bindings import runtime as cudart
 
-SCHEMA_NAME = "sparkinfer.pcie_oneshot_control_node.run"
+SCHEMA_NAME = "b12x.pcie_oneshot_control_node.run"
 SCHEMA_VERSION = 3
 DTYPE_NAME = "bfloat16"
 TOP_LEVEL_KEYS = {
@@ -249,10 +249,10 @@ def _verified_implementation(
 ) -> tuple[object, type, dict[str, object]]:
     """Import, build, and bind the implementation to exact source/binary hashes."""
 
-    module = importlib.import_module("sparkinfer.comm.pcie.pcie_oneshot")
+    module = importlib.import_module("b12x.comm.pcie.pcie_oneshot")
     module_path = Path(module.__file__).resolve()
     expected_module = (
-        implementation_root / "sparkinfer/comm/pcie/pcie_oneshot.py"
+        implementation_root / "b12x/comm/pcie/pcie_oneshot.py"
     ).resolve()
     if module_path != expected_module:
         raise RuntimeError(
@@ -430,7 +430,7 @@ def _environment_toggles() -> dict[str, str]:
         key: value
         for key, value in sorted(os.environ.items())
         if key in EXPLICIT_ENV_KEYS
-        or key.startswith("SPARKINFER_")
+        or key.startswith("B12X_")
         or key.startswith("NCCL_")
         or key.startswith("TORCH_NCCL_")
     }

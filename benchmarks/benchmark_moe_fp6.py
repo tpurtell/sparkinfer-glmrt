@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Small-batch W6A8 MX-FP6 MoE benchmark using synthetic quantized expert weights.
 
-Drives the upstream ``sparkinfer.moe.fused_moe`` plan/bind/run flow with
+Drives the upstream ``b12x.moe.fused_moe`` plan/bind/run flow with
 ``quant_mode="w6a8_mx"`` / ``source_format="mxfp6_e2m3"`` and times CUDA-graph
 replays of ``fused_moe.run``.  Graph capture is safe here: ``bind`` is
 documented capture-safe (views only, never allocates) and the analogous
@@ -47,8 +47,8 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
-    from sparkinfer.moe import fused_moe
-    from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+    from b12x.moe import fused_moe
+    from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
     # Fully-qualified device: the scratch binder compares device strings
     # exactly, and tensors allocated on "cuda" report "cuda:0".

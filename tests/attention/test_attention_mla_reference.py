@@ -10,16 +10,16 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from sparkinfer.attention._shared.mla.reference import (
+from b12x.attention._shared.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
     unpack_mla_kv_cache_reference,
 )
-from sparkinfer.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, clear_mla_caches, sparse_mla_decode_forward, sparse_mla_extend_forward
-from sparkinfer.attention.sparse_mla._scratch import SPARKINFERSparseMLAScratchCaps, plan_sparse_mla_scratch
+from b12x.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, clear_mla_caches, sparse_mla_decode_forward, sparse_mla_extend_forward
+from b12x.attention.sparse_mla._scratch import B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 MODEL_PATH = Path("/data/models/GLM-5.1-NVFP4")
@@ -220,7 +220,7 @@ def _make_sparse_mla_binding(
     use_cuda_graph: bool = False,
 ):
     plan = plan_sparse_mla_scratch(
-        SPARKINFERSparseMLAScratchCaps(
+        B12XSparseMLAScratchCaps(
             mode=mode,
             device=device,
             dtype=torch.bfloat16,
@@ -343,7 +343,7 @@ def _embed_mla_cache_in_pool(
 
 @pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_mla_pack_roundtrip_matches_unquantized_cache(cache_len: int) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cfg, _q_all, k_nope, k_rope = _make_glm_case(
@@ -366,7 +366,7 @@ def test_glm51_layer0_mla_pack_roundtrip_matches_unquantized_cache(cache_len: in
 
 @pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_decode(cache_len: int) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cfg, q_all, k_nope, k_rope = _make_glm_case(
@@ -403,7 +403,7 @@ def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_decode(cache
 
 @pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_extend(cache_len: int) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cfg, q_all, k_nope, k_rope = _make_glm_case(
@@ -439,7 +439,7 @@ def test_glm51_layer0_sparse_mla_reference_matches_dense_oracle_for_extend(cache
 
 
 def test_glm51_layer0_sparse_mla_reference_handles_sparse_indices_and_padding() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = 129
@@ -489,7 +489,7 @@ def test_glm51_layer0_sparse_mla_reference_handles_sparse_indices_and_padding() 
 
 
 def test_glm51_layer0_decode_api_handles_sparse_indices_and_padding() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = 129
@@ -548,7 +548,7 @@ def test_glm51_layer0_decode_api_handles_sparse_indices_and_padding() -> None:
 
 
 def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = 129
@@ -619,7 +619,7 @@ def test_glm51_layer0_extend_api_handles_sparse_indices_and_padding() -> None:
 
 @pytest.mark.parametrize("width", [129, 511, 1024, 2048])
 def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(width: int) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = max(width, 2050)
@@ -672,7 +672,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_split_widths(width: in
 
 @pytest.mark.parametrize("width", [129, 511, 1024, 2048])
 def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = max(width + 17, 2050)
@@ -731,7 +731,7 @@ def test_glm51_layer0_decode_api_split_handles_sparse_padding(width: int) -> Non
 
 @pytest.mark.parametrize("width", [129, 2048])
 def test_glm51_layer0_decode_api_matches_dense_oracle_for_boundary_widths(width: int) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = max(width, 2050)
@@ -783,7 +783,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_boundary_widths(width:
 
 
 def test_glm51_layer0_decode_split_graph_replay_handles_runtime_padding_changes() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = 2050
@@ -857,7 +857,7 @@ def test_glm51_layer0_decode_split_graph_replay_handles_runtime_padding_changes(
 
 
 def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = 2050
@@ -924,7 +924,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads() -> No
 
 
 def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_view_cache() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = 2050
@@ -994,7 +994,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle_for_local_tp_heads_fp8_vie
 
 @pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_decode_api_matches_dense_oracle(cache_len: int) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cfg, q_all, k_nope, k_rope = _make_glm_case(
@@ -1046,7 +1046,7 @@ def test_glm51_layer0_decode_api_matches_dense_oracle(cache_len: int) -> None:
 
 @pytest.mark.parametrize("cache_len", _GLM_CACHE_BOUNDARY_CASES)
 def test_glm51_layer0_extend_api_matches_dense_oracle(cache_len: int) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     q_len = 5
@@ -1103,7 +1103,7 @@ def test_glm51_layer0_extend_api_matches_dense_oracle(cache_len: int) -> None:
 
 
 def test_glm51_layer0_extend_api_respects_active_token_counts() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     _require_glm_weights()
 
     cache_len = 2050

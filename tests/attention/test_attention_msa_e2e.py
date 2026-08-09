@@ -4,14 +4,14 @@ import math
 
 import torch
 
-from sparkinfer.attention.nsa_indexer.reference import pack_index_k_cache_reference
-from sparkinfer.attention.paged.reference import msa_attention_reference
-from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
-from sparkinfer.attention.paged._forward import paged_attention_forward
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
-from sparkinfer.attention.paged.planner import create_paged_plan
+from b12x.attention.nsa_indexer.reference import pack_index_k_cache_reference
+from b12x.attention.paged.reference import msa_attention_reference
+from b12x.attention._shared.contiguous.api import clear_attention_caches
+from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged.planner import create_paged_plan
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 from tests._reference.paged_attention_helpers import make_paged_inputs
 
 
@@ -191,7 +191,7 @@ def _run_msa_extend_attention(
     )
     assert plan.msa_union_tile is True
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="extend",
             dtype=q.dtype,
@@ -232,7 +232,7 @@ def _run_msa_extend_attention(
 
 @torch.inference_mode()
 def test_msa_decode_indexer_selection_to_attention_graph_replay_contract() -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     batch = 2
@@ -261,7 +261,7 @@ def test_msa_decode_indexer_selection_to_attention_graph_replay_contract() -> No
     q2k_indices = torch.empty((4, batch, _MSA_TOPK), dtype=torch.int32, device=q.device)
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -420,7 +420,7 @@ def test_msa_decode_indexer_selection_to_attention_graph_replay_contract() -> No
 
 @torch.inference_mode()
 def test_msa_prefill_indexer_selection_to_union_attention_contract() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[8, 5],
         cache_seqlens=[384, 512],

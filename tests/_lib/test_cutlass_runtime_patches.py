@@ -17,7 +17,7 @@ pytest.importorskip("cutlass")
 PROBE = """
 import json, os
 {env_setup}
-from sparkinfer._lib import runtime_patches as rp
+from b12x._lib import runtime_patches as rp
 rp.apply_cutlass_runtime_patches()
 rp.apply_cutlass_runtime_patches()  # second call must be a guarded no-op
 print(json.dumps({{
@@ -42,7 +42,7 @@ def _run(env_setup: str) -> dict:
 
 def test_patches_apply_by_default():
     data = _run(
-        'os.environ.pop("SPARKINFER_DISABLE_CUTLASS_RUNTIME_PATCHES", None)'
+        'os.environ.pop("B12X_DISABLE_CUTLASS_RUNTIME_PATCHES", None)'
     )
     assert data["warning_patched"] is True
     assert data["frameinfo_patched"] is True
@@ -50,7 +50,7 @@ def test_patches_apply_by_default():
 
 def test_kill_switch_disables_all_patches():
     data = _run(
-        'os.environ["SPARKINFER_DISABLE_CUTLASS_RUNTIME_PATCHES"] = "1"'
+        'os.environ["B12X_DISABLE_CUTLASS_RUNTIME_PATCHES"] = "1"'
     )
     assert data["warning_patched"] is False
     assert data["frameinfo_patched"] is False

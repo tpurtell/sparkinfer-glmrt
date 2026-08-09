@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_oneshot import (
+from b12x.comm.pcie.pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
@@ -20,6 +20,8 @@ from sparkinfer.comm.pcie.pcie_oneshot import (
     _require_full_grid_residency,
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     _RETAINED_FAILED_IPC_EXPORTS,
+    _CuTeOneshotState,
+    _enable_device_slot_selection,
     parse_pcie_oneshot_max_size,
 )
 
@@ -174,7 +176,7 @@ def test_full_grid_residency_rejects_mig_like_capacity_collectively(
         "get_device_properties",
         lambda device: SimpleNamespace(multi_processor_count=84),
     )
-    monkeypatch.setenv("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", "32")
+    monkeypatch.setenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "32")
     exchanged = []
 
     def exchange(
@@ -189,7 +191,7 @@ def test_full_grid_residency_rejects_mig_like_capacity_collectively(
         return ((f"RuntimeError: {local_error}",), ())
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._exchange_setup_failures", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_setup_failures", exchange
     )
 
     group = object()
@@ -226,6 +228,28 @@ def test_compute_crossover_size_runs_fine_sweep():
     assert 48 * 1024 in seen_sizes
     assert 56 * 1024 in seen_sizes
     assert results[-1].size_bytes == 64 * 1024
+
+
+def test_graph_slot_bias_preserves_the_next_host_slot() -> None:
+    state = _CuTeOneshotState(
+        rank=0,
+        world_size=2,
+        signal_ptrs=(100, 200),
+        rank_data=torch.empty(256, dtype=torch.uint8),
+        signal_table_address=0,
+        next_table_offset=128,
+        registered_tables={},
+        eager_tables=(300, 400),
+        eager_slot=5,
+    )
+
+    _enable_device_slot_selection(state, capturing=True)
+
+    assert state.device_slot_selection
+    assert state.slot_bias == 1
+    state.eager_slot = 8
+    _enable_device_slot_selection(state, capturing=True)
+    assert state.slot_bias == 1
 
 
 def test_register_buffer_is_idempotent_for_same_mapping():
@@ -387,7 +411,7 @@ def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
     state = {"stream_key": 11}
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: state["stream_key"],
     )
 
@@ -404,7 +428,7 @@ def test_runtime_can_disable_stream_affinity(monkeypatch):
     state = {"stream_key": 11}
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: state["stream_key"],
     )
 
@@ -488,7 +512,7 @@ def test_autotune_never_benchmarks_past_eager_capacity(monkeypatch):
         return ceiling_bytes, []
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._compute_crossover_size", fake_compute
+        "b12x.comm.pcie.pcie_oneshot._compute_crossover_size", fake_compute
     )
     monkeypatch.setattr(torch.cuda, "Stream", lambda *, device: object())
 
@@ -543,7 +567,7 @@ def test_allocate_shared_buffer_cleans_up_on_failed_peer_open(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_object, group: (
             [local_object, (), ()]
             if isinstance(local_object, tuple)
@@ -583,7 +607,7 @@ def test_failed_setup_export_free_is_retained_and_retryable(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_object, group: [local_object, ()],
     )
 
@@ -651,7 +675,7 @@ def test_failed_peer_setup_export_free_is_retained_and_retryable(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match="exports were retained") as exc:
@@ -716,7 +740,7 @@ def test_peer_setup_and_unmap_failure_retains_export_and_closes_each_import_once
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match=r"retained.*peer unmap failed") as exc:
@@ -766,7 +790,7 @@ def test_handle_exchange_failure_retains_export_until_collective_retry(monkeypat
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match="handle exchange failed") as exc:
@@ -822,7 +846,7 @@ def test_import_status_exchange_failure_retains_imports_for_retry(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match="import-open status") as exc:
@@ -861,7 +885,7 @@ def test_failed_native_cleanup_is_owned_and_retried_before_export_free(monkeypat
             raise RuntimeError("transient native dispose failure")
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -918,7 +942,7 @@ def test_peer_native_cleanup_failure_blocks_every_rank_from_unmapping(monkeypatc
         return [local_status, ()]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match="rollback native cleanup") as exc:
@@ -969,7 +993,7 @@ def test_native_cleanup_verdict_exchange_failure_retains_imports(monkeypatch):
         return [local_status, ()]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match="cleanup status exchange") as exc:
@@ -1020,7 +1044,7 @@ def test_initial_native_verdict_exchange_retains_complete_setup_until_retry(
         return [local_status, ()]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match="must be coordinated by every rank") as exc:
@@ -1077,7 +1101,7 @@ def test_free_status_exchange_failure_keeps_coordination_ticket_without_double_f
         return [local_status, ()]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match="free status exchange") as exc:
@@ -1121,7 +1145,7 @@ def test_retained_generation_blocks_second_setup_before_cuda_allocation(monkeypa
         return [local_status, ()]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
     with pytest.raises(RuntimeError, match="preparation status") as exc:
@@ -1182,7 +1206,7 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_object, group: (
             [local_object, (), ()]
             if isinstance(local_object, tuple)
@@ -1244,7 +1268,7 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_object, group: (
             [local_object, (), ()]
             if isinstance(local_object, tuple)
@@ -1276,7 +1300,7 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
         "torch.distributed.get_process_group_ranks", lambda group=None: [0, 1]
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device",
+        "b12x.comm.pcie.pcie_oneshot._object_broadcast_device",
         lambda group: "cpu",
     )
 
@@ -1308,7 +1332,7 @@ def test_nonmonotonic_process_group_order_is_preserved_for_handle_slots(
         lambda group=None: list(nonmonotonic_ranks),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device",
+        "b12x.comm.pcie.pcie_oneshot._object_broadcast_device",
         lambda group: "cpu",
     )
 
@@ -1334,7 +1358,7 @@ def test_register_graph_buffers_noops_when_no_rank_registered_buffers(monkeypatc
         "torch.distributed.get_process_group_ranks", lambda group=None: [0, 1]
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device",
+        "b12x.comm.pcie.pcie_oneshot._object_broadcast_device",
         lambda group: "cpu",
     )
     monkeypatch.setattr(
@@ -1401,7 +1425,7 @@ def test_pool_creates_distinct_channels_per_stream_key(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: 7 if stream is None else int(stream),
     )
 
@@ -1430,7 +1454,7 @@ def test_collective_logical_channel_preparation_is_canonical(monkeypatch):
         lambda stream_key: created.append(stream_key) or object(),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_state, group: [local_state, local_state],
     )
 
@@ -1463,7 +1487,7 @@ def test_collective_logical_channel_mismatch_rejects_before_allocation(monkeypat
         return [local_state, (("other",), existing)]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
@@ -1487,7 +1511,7 @@ def test_invalid_logical_channel_id_is_rejected_collectively_before_allocation(
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -1512,7 +1536,7 @@ def test_empty_logical_channel_set_still_enters_collective_contract(monkeypatch)
         return [local_state, (("peer-channel",), existing)]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
@@ -1535,7 +1559,7 @@ def test_collective_capture_requires_stable_semantic_id(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_status, group: [local_status, ()],
     )
 
@@ -1564,7 +1588,7 @@ def test_collective_capture_allows_opposite_order_from_agreed_catalog(monkeypatc
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: int(stream),
     )
 
@@ -1576,7 +1600,7 @@ def test_collective_capture_allows_opposite_order_from_agreed_catalog(monkeypatc
         return [local_state, ("graph:draft", catalog)]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with pool.capture(7, channel_id="graph:target") as channel:
@@ -1608,7 +1632,7 @@ def test_collective_capture_rejects_divergent_catalog_before_allocation(monkeypa
         return [local_state, ("graph:target", ())]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with (
@@ -1642,7 +1666,7 @@ def test_collective_capture_rejects_differing_unprepared_ids(monkeypatch):
         return [local_state, ("graph:unknown", catalog)]
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
     )
 
     with (
@@ -1669,11 +1693,11 @@ def test_collective_capture_preserves_same_id_convenience_allocation(monkeypatch
         lambda stream_key: created.append(stream_key) or channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: int(stream),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_state, group: [local_state, local_state],
     )
 
@@ -1702,11 +1726,11 @@ def test_collective_capture_routes_eager_warmup_to_graph_channel(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: 7 if stream is None else int(stream),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
         lambda local_state, group: [local_state, local_state],
     )
 
@@ -1733,7 +1757,7 @@ def test_collective_eager_channel_requires_id_and_rejects_duplicate_stream_owner
     pool.exchange_group = object()
     pool._logical_channels["eager:model"] = eager
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: int(stream),
     )
 
@@ -1762,7 +1786,7 @@ def test_pool_reuses_single_channel_across_stream_keys(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: 7 if stream is None else int(stream),
     )
 
@@ -1782,20 +1806,21 @@ def test_pool_requires_precreated_channel_during_capture(monkeypatch):
     )
 
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: 7,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        "b12x.comm.pcie.pcie_oneshot._is_current_stream_capturing",
         lambda device: True,
     )
 
-    with pytest.raises(RuntimeError, match="before capture starts"):
+    with pytest.raises(RuntimeError, match=r"pool\.capture\(\)"):
         pool.for_stream()
 
     pool._channels[7] = _make_runtime(eager=True)
 
-    assert pool.for_stream() is pool._channels[7]
+    with pytest.raises(RuntimeError, match=r"pool\.capture\(\)"):
+        pool.for_stream()
 
 
 def test_nested_capture_reuses_its_outer_channel(monkeypatch):
@@ -1815,13 +1840,13 @@ def test_nested_capture_reuses_its_outer_channel(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        "b12x.comm.pcie.pcie_oneshot._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -1854,13 +1879,13 @@ def test_pool_restores_nested_capture_mappings_in_lifo_order(monkeypatch):
         channel_factory=lambda stream_key: _make_runtime(eager=True),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        "b12x.comm.pcie.pcie_oneshot._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -1909,13 +1934,13 @@ def test_reused_capture_stream_keys_get_distinct_channels(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: (
             current_stream[0] if stream is None else int(stream)
         ),
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        "b12x.comm.pcie.pcie_oneshot._is_current_stream_capturing",
         lambda device: capturing[0],
     )
 
@@ -1959,7 +1984,7 @@ def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
         channel_factory=make_channel,
     )
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        "b12x.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: 3 if stream is None else int(stream),
     )
 
@@ -2002,7 +2027,7 @@ def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
     pool._all_channels.append(transient)
     pool._channels[7] = transient
     monkeypatch.setattr(
-        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        "b12x.comm.pcie.pcie_oneshot.dist.barrier",
         lambda *, group: events.append("barrier"),
     )
 

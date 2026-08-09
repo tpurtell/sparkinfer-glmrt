@@ -46,14 +46,14 @@ from benchmarks.benchmark_moe import (
     get_scale_contract_params,
     load_expert_weights,
     make_routed_inputs,
-    prepare_sparkinfer_benchmark_weights,
+    prepare_b12x_benchmark_weights,
     require_sm120,
 )
-from sparkinfer.cute.utils import get_max_active_clusters, get_num_sm
-from sparkinfer.integration.tp_moe import (
-    SPARKINFERFP4ExpertWeights,
+from b12x.cute.utils import get_max_active_clusters, get_num_sm
+from b12x.integration.tp_moe import (
+    B12XFP4ExpertWeights,
     allocate_tp_moe_workspace_pool,
-    sparkinfer_moe_fp4,
+    b12x_moe_fp4,
     build_tp_moe_fp4_binding,
     clear_tp_moe_caches,
     select_tp_moe_backend,
@@ -66,7 +66,7 @@ _SUMMARY = False
 _VERBOSE = False
 _WORKER_GPU_ID = 0
 _WORKER_SPEC_CACHE: dict[int, ModelSpec] = {}
-_WORKER_EXPERT_CACHE: dict[tuple[str, str], SPARKINFERFP4ExpertWeights] = {}
+_WORKER_EXPERT_CACHE: dict[tuple[str, str], B12XFP4ExpertWeights] = {}
 
 
 @dataclass(frozen=True)
@@ -231,7 +231,7 @@ def _build_sweep_points(*, token_list: list[int], top_k_list: list[int]) -> list
 
 
 def _mac_env_name(backend: str) -> str:
-    return f"SPARKINFER_{backend.upper()}_MAX_ACTIVE_CLUSTERS"
+    return f"B12X_{backend.upper()}_MAX_ACTIVE_CLUSTERS"
 
 
 def _mac_limit() -> int:
@@ -259,9 +259,9 @@ def _temporary_backend_env(
     requested_mac: int,
 ) -> Iterator[None]:
     env_names = (
-        "SPARKINFER_MICRO_MAX_ACTIVE_CLUSTERS",
-        "SPARKINFER_DYNAMIC_MAX_ACTIVE_CLUSTERS",
-        "SPARKINFER_MICRO_DYNAMIC_CUTOVER_PAIRS",
+        "B12X_MICRO_MAX_ACTIVE_CLUSTERS",
+        "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
+        "B12X_MICRO_DYNAMIC_CUTOVER_PAIRS",
     )
     previous = {name: os.environ.get(name) for name in env_names}
     try:
@@ -273,11 +273,11 @@ def _temporary_backend_env(
                 raise ValueError(
                     "micro is only defined for workloads with at most 8 tokens"
                 )
-            os.environ["SPARKINFER_MICRO_DYNAMIC_CUTOVER_PAIRS"] = str(
+            os.environ["B12X_MICRO_DYNAMIC_CUTOVER_PAIRS"] = str(
                 point.routed_rows + 1
             )
         elif backend == "dynamic":
-            os.environ["SPARKINFER_MICRO_DYNAMIC_CUTOVER_PAIRS"] = "0"
+            os.environ["B12X_MICRO_DYNAMIC_CUTOVER_PAIRS"] = "0"
         else:
             raise ValueError(f"unsupported backend override: {backend}")
         yield
@@ -369,7 +369,7 @@ def _capture_and_measure_candidate(
     args: argparse.Namespace,
     point: SweepPoint,
     spec: ModelSpec,
-    experts: SPARKINFERFP4ExpertWeights,
+    experts: B12XFP4ExpertWeights,
     backend: str,
     requested_mac: int,
     device: torch.device,
@@ -404,7 +404,7 @@ def _capture_and_measure_candidate(
             )
 
         def run() -> None:
-            sparkinfer_moe_fp4(binding=binding)
+            b12x_moe_fp4(binding=binding)
 
         graph = _capture_graph(run, warmup=args.warmup)
         samples_ms = _bench_graph(graph, replays=args.replays)
@@ -443,7 +443,7 @@ def _ensure_worker_context(
     model_path: pathlib.Path,
     top_k: int,
     scale_contract: str,
-) -> tuple[ModelSpec, SPARKINFERFP4ExpertWeights]:
+) -> tuple[ModelSpec, B12XFP4ExpertWeights]:
     global _WORKER_SPEC_CACHE, _WORKER_EXPERT_CACHE
     require_sm120()
     torch.empty(1, device="cuda")
@@ -458,7 +458,7 @@ def _ensure_worker_context(
         # prepared owner per worker and rebuild only the cheap ModelSpec.
         weights = load_expert_weights(model_path, spec)
         params = get_scale_contract_params(weights, scale_contract)
-        experts, _ = prepare_sparkinfer_benchmark_weights(
+        experts, _ = prepare_b12x_benchmark_weights(
             weights,
             params,
             quant_mode="nvfp4",

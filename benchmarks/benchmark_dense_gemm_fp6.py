@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark MX-FP6 block-scaled dense GEMM (sparkinfer) with optional torch reference check."""
+"""Benchmark MX-FP6 block-scaled dense GEMM (b12x) with optional torch reference check."""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ from benchmarks.fp6_common import (
     make_l2_flush_fn,
     resolve_l2_flush_bytes,
 )
-from sparkinfer._lib.fp6 import SF_VEC_SIZE_FP6, dequant_mxfp6_torch
-from sparkinfer._lib.dense_gemm import _expand_packed_mxfp6_ab, dense_gemm
+from b12x._lib.fp6 import SF_VEC_SIZE_FP6, dequant_mxfp6_torch
+from b12x._lib.dense_gemm import _expand_packed_mxfp6_ab, dense_gemm
 
 from tests.quantization.test_fp6_gpu import _bf16_global_scale, _quantize_bf16_matrix
 
@@ -117,7 +117,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
-    print("MX-FP6 dense GEMM (sparkinfer, CUDA graph replay)")
+    print("MX-FP6 dense GEMM (b12x, CUDA graph replay)")
     for m in args.m:
         times = bench_one_fp6(
             m,

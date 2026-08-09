@@ -9,9 +9,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
-from sparkinfer.comm.pcie.pcie_twoshot import PCIeTwoShotSP
+from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
+from b12x.comm.pcie.pcie_twoshot import PCIeTwoShotSP
 
 
 def _free_port() -> int:
@@ -93,7 +93,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 
 def test_asymmetric_argument_failures_reject_all_ranks_before_ipc() -> None:
-    if os.getenv("SPARKINFER_PCIE_TEST_COLLECTIVE_VALIDATION") != "1":
+    if os.getenv("B12X_PCIE_TEST_COLLECTIVE_VALIDATION") != "1":
         pytest.skip("set the collective-validation GPU gate to run this test")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")

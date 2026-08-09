@@ -12,8 +12,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
-from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+from b12x.attention._shared.contiguous.api import clear_attention_caches
+from b12x.attention.paged.workspace import PagedAttentionWorkspace
 from tests.test_attention_paged_planner import _make_inputs
 from tests.test_paged_attention_workspace_api import _quantize_paged_kv_cache_e4m3
 
@@ -42,9 +42,9 @@ def _env(overrides: dict[str, str | None]):
 
 def _dump_words(*, use_tma: bool) -> torch.Tensor:
     overrides = {
-        "SPARKINFER_PAGED_KV_DEBUG_DUMP": "SREGS",
-        "SPARKINFER_PAGED_KV_TMA": "1" if use_tma else None,
-        "SPARKINFER_PAGED_KV_TMA_FP8_RAW_ISSUE": "1" if use_tma else None,
+        "B12X_PAGED_KV_DEBUG_DUMP": "SREGS",
+        "B12X_PAGED_KV_TMA": "1" if use_tma else None,
+        "B12X_PAGED_KV_TMA_FP8_RAW_ISSUE": "1" if use_tma else None,
     }
     with _env(overrides):
         clear_attention_caches()

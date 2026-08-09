@@ -88,7 +88,7 @@ def prepare_tp_moe_fp4_experts(
     w13_layout: str = "w13",
 ):
     """Prepare one explicit expert owner from source tensors for a test."""
-    from sparkinfer.moe import fused_moe
+    from b12x.moe import fused_moe
 
     normalized_mode = quant_mode.lower()
     weight_E = int(w1_fp4.shape[0])
@@ -138,7 +138,7 @@ def make_tp_moe_fp4_binding(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ):
-    from sparkinfer.moe import fused_moe
+    from b12x.moe import fused_moe
 
     modes = experts.plan.quant_modes
     if quant_mode is None:
@@ -181,7 +181,7 @@ def make_tp_moe_fp4_binding(
 
 
 def run_tp_moe_fp4(**kwargs) -> torch.Tensor:
-    from sparkinfer.moe import fused_moe
+    from b12x.moe import fused_moe
 
     return fused_moe.run(binding=make_tp_moe_fp4_binding(**kwargs))
 
@@ -379,10 +379,10 @@ def llama_rms_norm(
     return (x_fp32 * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
 
 
-def require_sparkinfer() -> torch.device:
+def require_b12x() -> torch.device:
     """Skip unless a real SM120/SM121 device is present (migrated-test gate)."""
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for sparkinfer tests")
+        pytest.skip("CUDA is required for b12x tests")
     major, minor = torch.cuda.get_device_capability()
     if major != 12 or minor not in (0, 1):
         pytest.skip(f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}")

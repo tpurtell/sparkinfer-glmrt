@@ -9,14 +9,14 @@ import cutlass
 import torch
 from cutlass import Int32
 
-from sparkinfer.attention.nsa_indexer.tiled_topk import (
+from b12x.attention.nsa_indexer.tiled_topk import (
     SparseNSATiledTopkKernel,
     _run_cached_host_launcher,
     _tensor_meta_key,
     _to_kernel_tensor,
 )
-from sparkinfer.attention.nsa_indexer.persistent_topk import run_persistent_topk2048
-from sparkinfer._lib.utils import current_cuda_stream
+from b12x.attention.nsa_indexer.persistent_topk import run_persistent_topk2048
+from b12x._lib.utils import current_cuda_stream
 
 
 def _make_inputs(rows: int, cols: int, topk: int, seed: int):

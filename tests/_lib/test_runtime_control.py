@@ -1,4 +1,4 @@
-"""Serving freeze guards (ported semantics from sparkinfer runtime_control)."""
+"""Serving freeze guards (ported semantics from b12x runtime_control)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import importlib
 
 import pytest
 
-rc = importlib.import_module("sparkinfer._lib.runtime_control")
+rc = importlib.import_module("b12x._lib.runtime_control")
 
 
 def test_freeze_blocks_kernel_resolution_with_context():
@@ -37,6 +37,6 @@ def test_compilation_aliases_are_the_same_functions():
 
 
 def test_namespace_root_reexports():
-    sparkinfer = importlib.import_module("sparkinfer")
-    assert sparkinfer.freeze_kernel_resolution is rc.freeze_kernel_resolution
-    assert sparkinfer.KernelResolutionFrozenError is rc.KernelResolutionFrozenError
+    b12x = importlib.import_module("b12x")
+    assert b12x.freeze_kernel_resolution is rc.freeze_kernel_resolution
+    assert b12x.KernelResolutionFrozenError is rc.KernelResolutionFrozenError

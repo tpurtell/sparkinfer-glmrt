@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer._lib.fp6 import (
+from b12x._lib.fp6 import (
     FLOAT6_E2M3_MAX,
     FLOAT6_E3M2_MAX,
     SF_VEC_SIZE_FP6,

@@ -3,26 +3,26 @@ from __future__ import annotations
 import ctypes
 import os
 import socket
+import time
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-import sparkinfer.comm.pcie.pcie_dcp_a2a as pcie_dcp_a2a
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
-from sparkinfer.comm.pcie.pcie_dcp_a2a import (
+import b12x.comm.pcie.pcie_dcp_a2a as pcie_dcp_a2a
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
+from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
-    _load_extension,
     _staging_layout,
     lse_reduce_scatter_reference,
 )
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_DCP_A2A_TEST") != "1",
-    reason="set SPARKINFER_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
+    os.getenv("B12X_RUN_PCIE_DCP_A2A_TEST") != "1",
+    reason="set B12X_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
 )
 
 TOTAL_HEADS = 16
@@ -108,7 +108,7 @@ def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
     assert channel._ipc is not None
     assert len(channel._owned_buffers) == 1
     layout = _staging_layout(
-        signal_bytes=int(channel._ext.meta_size()),
+        signal_bytes=pcie_dcp_a2a._SIGNAL_BYTES,
         world_size=channel.world_size,
         max_batch_size=channel.max_batch_size,
         total_heads=channel.total_heads,
@@ -148,7 +148,16 @@ def _check_eager(
                 dtype,
                 device,
             )
-            gathered_q = pool.all_gather_heads(local_q, channel_id="eager:dcp")
+            wrong_device = (rank + 1) % world_size
+            guard_gather = dtype == torch.bfloat16 and step == 1
+            if guard_gather:
+                torch.cuda.set_device(wrong_device)
+            gathered_q = pool.all_gather_heads(
+                local_q, channel_id="eager:dcp"
+            )
+            if guard_gather:
+                assert torch.cuda.current_device() == wrong_device
+                torch.cuda.set_device(rank)
             expected_q = torch.cat(
                 [
                     _rank_query(
@@ -166,9 +175,15 @@ def _check_eager(
             torch.testing.assert_close(gathered_q, expected_q, rtol=0, atol=0)
 
             partial_output, partial_lse = _rank_inputs(step, rank, batch, dtype, device)
+            guard_reduce = dtype == torch.bfloat16 and step == 2
+            if guard_reduce:
+                torch.cuda.set_device(wrong_device)
             out = pool.lse_reduce_scatter(
                 partial_output, partial_lse, channel_id="eager:dcp"
             )
+            if guard_reduce:
+                assert torch.cuda.current_device() == wrong_device
+                torch.cuda.set_device(rank)
             torch.cuda.synchronize(device)
             expected = _reference(
                 step,
@@ -363,15 +378,21 @@ def _check_graph(
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
+    with pool.capture(
+        stream, channel_id="graph:layer-stack"
+    ) as graph_channel, torch.cuda.graph(graph, stream=stream):
         for layer in range(layers):
-            channel.all_gather_heads(local_queries[layer], gathered_queries[layer])
-            channel.lse_reduce_scatter(inputs[layer], lses[layer], outputs[layer])
+            graph_channel.all_gather_heads(
+                local_queries[layer], gathered_queries[layer]
+            )
+            graph_channel.lse_reduce_scatter(
+                inputs[layer], lses[layer], outputs[layer]
+            )
     stream.synchronize()
 
-    replay_count = int(os.getenv("SPARKINFER_PCIE_DCP_GRAPH_REPLAYS", "8"))
+    replay_count = int(os.getenv("B12X_PCIE_DCP_GRAPH_REPLAYS", "8"))
     if replay_count <= 0:
-        raise ValueError("SPARKINFER_PCIE_DCP_GRAPH_REPLAYS must be positive")
+        raise ValueError("B12X_PCIE_DCP_GRAPH_REPLAYS must be positive")
     for replay in range(replay_count):
         expected = []
         expected_queries = []
@@ -595,6 +616,174 @@ def _check_teardown_retry(
     assert pool._closed
 
 
+def _check_queued_mixed_grid_graph(
+    pool: PCIeDCPA2APool,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    """Stress slot retirement across odd, mixed-grid graph replays.
+
+    The graph intentionally contains 2-block gather, 16-block LSE, then
+    2-block gather.  Its odd transport-node count flips the starting slot on
+    every replay.  Replays are queued without a rank barrier or device sync,
+    and rank zero pauses after its first enqueue so peer hosts can enqueue the
+    next replay before rank zero enqueues its matching launch.
+    """
+
+    batch = MAX_BATCH
+    local_heads = TOTAL_HEADS // world_size
+    query_a = torch.empty(
+        1,
+        local_heads,
+        QUERY_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query_b = torch.empty_like(query_a)
+    gathered_a = torch.empty(
+        1,
+        TOTAL_HEADS,
+        QUERY_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    gathered_b = torch.empty_like(gathered_a)
+    partial_output = torch.empty(
+        batch,
+        TOTAL_HEADS,
+        HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    partial_lse = torch.empty(
+        batch,
+        TOTAL_HEADS,
+        dtype=torch.float32,
+        device=device,
+    )
+    reduced = torch.empty(
+        batch,
+        local_heads,
+        HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    dist.barrier()
+    with pool.capture(channel_id="graph:mixed-grid") as channel, torch.cuda.graph(
+        graph
+    ):
+        channel.all_gather_heads(query_a, gathered_a)
+        channel.lse_reduce_scatter(partial_output, partial_lse, reduced)
+        channel.all_gather_heads(query_b, gathered_b)
+
+    replay_steps = (4100, 4200, 4300)
+    local_payloads = []
+    local_lses = []
+    local_queries_a = []
+    local_queries_b = []
+    for step in replay_steps:
+        payload, lse = _rank_inputs(
+            step,
+            rank,
+            batch,
+            torch.bfloat16,
+            device,
+        )
+        local_payloads.append(payload)
+        local_lses.append(lse)
+        local_queries_a.append(
+            _rank_query(
+                step + 100,
+                rank,
+                world_size,
+                1,
+                torch.bfloat16,
+                device,
+            )
+        )
+        local_queries_b.append(
+            _rank_query(
+                step + 200,
+                rank,
+                world_size,
+                1,
+                torch.bfloat16,
+                device,
+            )
+        )
+
+    reduced_snapshots = [torch.empty_like(reduced) for _ in replay_steps]
+    gathered_a_snapshots = [torch.empty_like(gathered_a) for _ in replay_steps]
+    gathered_b_snapshots = [torch.empty_like(gathered_b) for _ in replay_steps]
+    torch.cuda.synchronize(device)
+    for replay_index in range(len(replay_steps)):
+        partial_output.copy_(local_payloads[replay_index])
+        partial_lse.copy_(local_lses[replay_index])
+        query_a.copy_(local_queries_a[replay_index])
+        query_b.copy_(local_queries_b[replay_index])
+        graph.replay()
+        reduced_snapshots[replay_index].copy_(reduced)
+        gathered_a_snapshots[replay_index].copy_(gathered_a)
+        gathered_b_snapshots[replay_index].copy_(gathered_b)
+        if replay_index == 0 and rank == 0:
+            time.sleep(0.02)
+    torch.cuda.synchronize(device)
+    dist.barrier()
+
+    for replay_index, step in enumerate(replay_steps):
+        expected_reduced = _reference(
+            step,
+            rank,
+            world_size,
+            batch,
+            torch.bfloat16,
+            device,
+        )
+        expected_a = torch.cat(
+            [
+                _rank_query(
+                    step + 100,
+                    source,
+                    world_size,
+                    1,
+                    torch.bfloat16,
+                    device,
+                )
+                for source in range(world_size)
+            ],
+            dim=1,
+        )
+        expected_b = torch.cat(
+            [
+                _rank_query(
+                    step + 200,
+                    source,
+                    world_size,
+                    1,
+                    torch.bfloat16,
+                    device,
+                )
+                for source in range(world_size)
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(
+            reduced_snapshots[replay_index],
+            expected_reduced,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        torch.testing.assert_close(
+            gathered_a_snapshots[replay_index], expected_a, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            gathered_b_snapshots[replay_index], expected_b, rtol=0, atol=0
+        )
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -616,15 +805,25 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     closed = False
     try:
         pool.prepare_channels(("eager:dcp", "graph"))
+        if rank == 0:
+            print("A2A GPU gate: eager", flush=True)
         _check_eager(pool, rank, world_size, device)
         dist.barrier()
         _check_eager_adjacency(pool, rank, world_size, device)
         dist.barrier()
         _check_semantic_capture_warmup(pool, rank, world_size, device)
         dist.barrier()
+        if rank == 0:
+            print("A2A GPU gate: graph replay", flush=True)
         _check_graph(pool, rank, world_size, device)
+        dist.barrier()
+        if rank == 0:
+            print("A2A GPU gate: queued mixed-grid skew", flush=True)
+        _check_queued_mixed_grid_graph(pool, rank, world_size, device)
+        if rank == 0:
+            print("A2A GPU gate: complete", flush=True)
         torch.cuda.synchronize(device)
-        if os.getenv("SPARKINFER_PCIE_DCP_TEST_TEARDOWN_RETRY", "0") == "1":
+        if os.getenv("B12X_PCIE_DCP_TEST_TEARDOWN_RETRY", "0") == "1":
             _check_teardown_retry(pool, rank, device)
             closed = True
     finally:
@@ -637,7 +836,7 @@ def _residency_rejection_worker(rank: int, world_size: int, port: int) -> None:
     if rank != 0:
         # Simulate one constrained/MIG-like rank in an otherwise full device
         # group; every peer must reject before any IPC allocation.
-        os.environ.pop("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", None)
+        os.environ.pop("B12X_PCIE_TEST_VISIBLE_SM_COUNT", None)
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group(
@@ -718,36 +917,35 @@ def _preflight_rejection_worker(rank: int, world_size: int, port: int) -> None:
 
 def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
     if (
-        os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
-        or os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") == "1"
+        os.getenv("B12X_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
+        or os.getenv("B12X_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") == "1"
     ):
         pytest.skip("running the reduced-SM residency rejection gate")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 8):
-        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
+    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    if world_size not in (2, 4, 8, 16):
+        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    _load_extension()
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
 
 def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
-    if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") != "1":
+    if os.getenv("B12X_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") != "1":
         pytest.skip("set the reduced-SM residency rejection gate to run this test")
-    visible_sms = int(os.getenv("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
+    visible_sms = int(os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
     assert 0 < visible_sms < pcie_dcp_a2a.DCP_A2A_REQUIRED_SMS, (
-        "set SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT below "
+        "set B12X_PCIE_TEST_VISIBLE_SM_COUNT below "
         f"{pcie_dcp_a2a.DCP_A2A_REQUIRED_SMS} to exercise the residency gate"
     )
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 8):
-        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
+    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    if world_size not in (2, 4, 8, 16):
+        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
@@ -761,11 +959,11 @@ def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
 
 
 def test_pcie_dcp_a2a_coordinates_one_rank_preflight_failure_before_ipc():
-    if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") != "1":
+    if os.getenv("B12X_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") != "1":
         pytest.skip("set the one-rank preflight rejection gate to run this test")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 8):
         pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
     if torch.cuda.device_count() < world_size:

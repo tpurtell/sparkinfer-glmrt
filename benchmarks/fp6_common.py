@@ -109,7 +109,7 @@ def unswizzled_ue8m0_grid(w_bf16: torch.Tensor) -> torch.Tensor:
     (``prepare_w6a8_mxfp6_weights``) applies the MMA swizzle itself. Shared
     here so the two FP6 MoE benches cannot silently diverge from the rule.
     """
-    from sparkinfer._lib.fp6 import (
+    from b12x._lib.fp6 import (
         FLOAT6_E2M3_MAX,
         SF_VEC_SIZE_FP6,
         _ue8m0_scale_from_block_max,

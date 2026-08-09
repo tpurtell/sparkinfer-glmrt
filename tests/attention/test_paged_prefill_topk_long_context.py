@@ -27,8 +27,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention.nsa_indexer._impl import clear_indexer_caches
-from sparkinfer.attention.nsa_indexer.paged import (
+from b12x.attention.nsa_indexer._impl import clear_indexer_caches
+from b12x.attention.nsa_indexer.paged import (
     index_topk_fp8,
     pack_paged_index_k_cache_reference,
     prepare_paged_indexer_metadata,
@@ -116,7 +116,7 @@ def _run_indexer(
     supertile_k: int,
     output_physical_slots: bool,
 ) -> torch.Tensor:
-    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", str(supertile_k))
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", str(supertile_k))
     seqlens = scene["seqlens"]
     shared_page_table = scene["shared_page_table"]
     binding = _bind_paged_indexer(
@@ -221,8 +221,8 @@ def test_paged_prefill_topk_logical_output_two_level_fold(monkeypatch) -> None:
 
 def test_paged_prefill_topk_logical_output_adaptive_carry(monkeypatch) -> None:
     """A zero candidate budget selects the exact carry path for logical output."""
-    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "auto")
-    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "0")
+    monkeypatch.setenv("B12X_INDEXER_TWO_LEVEL_FOLD", "auto")
+    monkeypatch.setenv("B12X_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "0")
     device = torch.device("cuda")
     scene = _build_scene(device, 32768, "monotonic")
     selected = _run_indexer(
@@ -259,7 +259,7 @@ def test_paged_prefill_topk_width_does_not_recompile(monkeypatch) -> None:
     Two consecutive prefill runs at distinct page-table widths must compile the
     tiled top-k kernel exactly once: the second width reuses the first's cubin.
     """
-    from sparkinfer._lib.compiler import clear_compile_cache, compile_cache_info
+    from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
     device = torch.device("cuda")
     scene_narrow = _build_scene(device, 16384, "monotonic")
@@ -272,8 +272,8 @@ def test_paged_prefill_topk_width_does_not_recompile(monkeypatch) -> None:
 
     # Force every cache key to actually compile (skip the on-disk cache) but keep
     # the in-memory cache on so a repeated identical key is a hit, not a recompile.
-    monkeypatch.setenv("SPARKINFER_COMPILE_DISK_CACHE", "0")
-    monkeypatch.setenv("SPARKINFER_COMPILE_MEMORY_CACHE", "1")
+    monkeypatch.setenv("B12X_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("B12X_COMPILE_MEMORY_CACHE", "1")
     clear_compile_cache()
 
     selected_narrow = _run_indexer(

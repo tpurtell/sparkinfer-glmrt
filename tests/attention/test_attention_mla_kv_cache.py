@@ -3,21 +3,21 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention._shared.mla.kernel import run_unified_decode
-from sparkinfer.attention._shared.mla.kv_cache import (
+from b12x.attention._shared.mla.kernel import run_unified_decode
+from b12x.attention._shared.mla.kv_cache import (
     clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache,
     concat_and_cache_nvfp4_mla_fp8_rope,
 )
-from sparkinfer.attention._shared.mla.prefill_mg import run_unified_prefill_mg
-from sparkinfer.attention._shared.mla.traits import ComputeMode, ModelType, ScaleFormat
-from sparkinfer.attention.sparse_mla._scratch import (
-    SPARKINFERSparseMLAScratchCaps,
+from b12x.attention._shared.mla.prefill_mg import run_unified_prefill_mg
+from b12x.attention._shared.mla.traits import ComputeMode, ModelType, ScaleFormat
+from b12x.attention.sparse_mla._scratch import (
+    B12XSparseMLAScratchCaps,
     plan_sparse_mla_scratch,
 )
 
 from tests._reference.helpers import (
     dequantize_nvfp4_mla_nope,
-    require_sparkinfer,
+    require_b12x,
 )
 
 
@@ -255,7 +255,7 @@ def _dequantize_records(
 def test_writer_preserves_skipped_slots_and_writes_the_record_abi(
     dtype: torch.dtype,
 ) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     num_tokens = 6
     kv_c, k_pe, expected_packed, expected_group_scales, expected_rope_scales = (
         _make_exactly_quantizable_inputs(
@@ -437,7 +437,7 @@ def _assert_reader_matches_dequantized_records(
 def test_writer_records_feed_production_head_multisplit_decode(
     per_token_scale: bool,
 ) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     topk = 129
     q, cache, indices = _make_written_reader_case(
         rows=1,
@@ -449,7 +449,7 @@ def test_writer_records_feed_production_head_multisplit_decode(
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
     sm_scale = _HEAD_DIM**-0.5
 
-    caps = SPARKINFERSparseMLAScratchCaps(
+    caps = B12XSparseMLAScratchCaps(
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,
@@ -512,7 +512,7 @@ def test_writer_records_feed_production_head_multisplit_decode(
 def test_writer_records_feed_production_head_multitile_prefill_mg(
     per_token_scale: bool,
 ) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     topk = 129
     q, cache, indices = _make_written_reader_case(
         rows=2,

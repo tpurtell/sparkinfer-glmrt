@@ -5,21 +5,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sparkinfer.moe.fused_moe._impl as tp_moe_impl
-from sparkinfer.moe.fused_moe._impl import (
-    SPARKINFERFP4ExpertWeights,
+import b12x.moe.fused_moe._impl as tp_moe_impl
+from b12x.moe.fused_moe._impl import (
+    B12XFP4ExpertWeights,
     TPMoEFP4Binding,
     TPMoERouteBinding,
     TPMoEScratchCaps,
     TPMoESparseFP4Binding,
     build_tp_moe_route_binding,
     build_tp_moe_sparse_fp4_binding,
-    plan_sparkinfer_fp4_moe_weights,
+    plan_b12x_fp4_moe_weights,
     plan_tp_moe_scratch,
-    prepare_sparkinfer_fp4_moe_weights,
+    prepare_b12x_fp4_moe_weights,
 )
-from sparkinfer.moe._shared.execution import PreparedWeightLayout
-from sparkinfer.moe._shared.kernels.w4a8.weights import repack_w4a8_weights
+from b12x.moe._shared.execution import PreparedWeightLayout
+from b12x.moe._shared.kernels.w4a8.weights import repack_w4a8_weights
 
 
 def _weight_plan(
@@ -32,7 +32,7 @@ def _weight_plan(
     activation: str = "silu",
     w4a16_layout: PreparedWeightLayout | None = None,
 ):
-    return plan_sparkinfer_fp4_moe_weights(
+    return plan_b12x_fp4_moe_weights(
         quant_modes=quant_mode,
         source_format=source_format,
         activation=activation,
@@ -59,9 +59,9 @@ def _caps(**overrides) -> TPMoEScratchCaps:
 
 def _clear_moe_force_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
-        "SPARKINFER_MOE_FORCE_A8",
-        "SPARKINFER_FORCE_MOE_A8",
-        "SPARKINFER_MOE_FORCE_A16",
+        "B12X_MOE_FORCE_A8",
+        "B12X_FORCE_MOE_A8",
+        "B12X_MOE_FORCE_A16",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -69,14 +69,14 @@ def _clear_moe_force_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_dynamic_deterministic_output_is_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
+    monkeypatch.delenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
 
     assert not tp_moe_impl._dynamic_deterministic_output_enabled(
         quant_mode="nvfp4",
         device=torch.device("cuda"),
     )
 
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
 
     assert tp_moe_impl._dynamic_deterministic_output_enabled(
         quant_mode="nvfp4",
@@ -96,9 +96,9 @@ def test_moe_force_envs_do_not_override_explicit_quant_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_moe_force_env(monkeypatch)
-    monkeypatch.setenv("SPARKINFER_MOE_FORCE_A8", "1")
-    monkeypatch.setenv("SPARKINFER_FORCE_MOE_A8", "1")
-    monkeypatch.setenv("SPARKINFER_MOE_FORCE_A16", "1")
+    monkeypatch.setenv("B12X_MOE_FORCE_A8", "1")
+    monkeypatch.setenv("B12X_FORCE_MOE_A8", "1")
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
 
     assert tp_moe_impl.default_moe_quant_mode() == "nvfp4"
     assert tp_moe_impl._normalize_quant_mode(None) == "nvfp4"
@@ -207,7 +207,7 @@ def test_explicit_w4a8_mx_prepares_native_e8m0_source_in_place() -> None:
         w2_scale_original.clamp(max=247).contiguous(),
     )
 
-    weight_plan = plan_sparkinfer_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
         activation="silu",
@@ -217,7 +217,7 @@ def test_explicit_w4a8_mx_prepares_native_e8m0_source_in_place() -> None:
         intermediate_size=n,
         w13_layout="w31",
     )
-    prepared = prepare_sparkinfer_fp4_moe_weights(
+    prepared = prepare_b12x_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=w1_source,
         w1_blockscale=w1_scale,
@@ -295,7 +295,7 @@ def _experts(
     tensors: dict[str, torch.Tensor],
     weight_plan=None,
     payload: object | None = None,
-) -> SPARKINFERFP4ExpertWeights:
+) -> B12XFP4ExpertWeights:
     if weight_plan is None:
         weight_plan = _weight_plan(
             experts=int(tensors["w1_fp4"].shape[0]),
@@ -361,7 +361,7 @@ def _experts(
         canonical_s1 = getattr(value, "w13_sfb", getattr(value, "w13_scale", None))
         canonical_w2 = getattr(value, "w2_rp", getattr(value, "w2", None))
         canonical_s2 = getattr(value, "w2_sfb", getattr(value, "w2_scale", None))
-    return SPARKINFERFP4ExpertWeights(
+    return B12XFP4ExpertWeights(
         plan=weight_plan,
         a1_gscale=tensors["a1_gscale"],
         w1_fp4=canonical_w1,
@@ -377,7 +377,7 @@ def _experts(
 
 def _binding_args(
     tensors: dict[str, torch.Tensor],
-    experts: SPARKINFERFP4ExpertWeights,
+    experts: B12XFP4ExpertWeights,
 ) -> dict[str, object]:
     return {
         "a": tensors["a"],
@@ -530,7 +530,7 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
 ) -> None:
     """Trellis must not pay the generic W4A16 compile-bucket memory cost."""
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
-    weight_plan = plan_sparkinfer_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="exl3_trellis_mcg",
         activation="silu",
@@ -579,7 +579,7 @@ def test_trellis_scratch_plan_resolves_default_route_block(
         "_plan_full_rotation_w4a16_launches",
         lambda **_kwargs: ((), ()),
     )
-    weight_plan = plan_sparkinfer_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="exl3_trellis_mcg",
         activation="silu",
@@ -610,7 +610,7 @@ def test_trellis_scratch_plan_resolves_default_route_block(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""
-    weight_plan = plan_sparkinfer_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="exl3_trellis_mcg",
         activation="silu",
@@ -666,7 +666,7 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
         "_plan_full_rotation_w4a16_launches",
         lambda **_kwargs: (fused_launches, sums),
     )
-    weight_plan = plan_sparkinfer_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="exl3_trellis_mcg",
         activation="silu",
@@ -719,7 +719,7 @@ def test_w4a16_decode_scratch_covers_direct_topk_geometry(
     monkeypatch: pytest.MonkeyPatch,
     tokens: int,
 ) -> None:
-    from sparkinfer.moe._shared.kernels.w4a16.host import (
+    from b12x.moe._shared.kernels.w4a16.host import (
         max_packed_route_slots,
         packed_gemm_scratch_elements,
         select_route_block_size_m,
@@ -895,7 +895,7 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     )
     calls = {}
 
-    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
     def _fake_run_w4a16(*args, **kwargs):
         calls.update(kwargs)
@@ -903,7 +903,7 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
 
     monkeypatch.setattr(w4a16_kernel, "run_w4a16_moe", _fake_run_w4a16)
 
-    result = tp_moe_impl.sparkinfer_moe_fp4(binding=binding)
+    result = tp_moe_impl.b12x_moe_fp4(binding=binding)
 
     assert result is output
     assert calls["activation_amax"] is activation_amax
@@ -923,7 +923,7 @@ def test_activation_amax_is_w4a16_only() -> None:
     )
 
     with pytest.raises(NotImplementedError, match="only supported for W4A16"):
-        tp_moe_impl.sparkinfer_moe_fp4(binding=binding)
+        tp_moe_impl.b12x_moe_fp4(binding=binding)
 
 
 def test_tp_moe_scratch_plan_binding_maps_caller_owned_scratch() -> None:
@@ -1029,7 +1029,7 @@ def test_tp_moe_fp4_binding_rehydrates_micro_workspace_view(
         lambda **kwargs: calls.update(kwargs),
     )
 
-    result = tp_moe_impl.sparkinfer_moe_fp4(binding=binding)
+    result = tp_moe_impl.b12x_moe_fp4(binding=binding)
 
     assert result is output
     assert isinstance(calls["workspace"], tp_moe_impl.TPMicroWorkspace)
@@ -1060,7 +1060,7 @@ def test_tp_moe_fp4_binding_rehydrates_dynamic_workspace_view(
         lambda **kwargs: calls.update(kwargs),
     )
 
-    result = tp_moe_impl.sparkinfer_moe_fp4(binding=binding)
+    result = tp_moe_impl.b12x_moe_fp4(binding=binding)
 
     assert result is output
     assert binding.route_output is not None
@@ -1158,7 +1158,7 @@ def test_tp_moe_sparse_fp4_builder_returns_common_binding_type() -> None:
         scratch=scratch,
         hidden_states=tensors["a"],
         experts=experts,
-        routing=tp_moe_impl.SPARKINFERTopKRouting(
+        routing=tp_moe_impl.B12XTopKRouting(
             topk_weights=tensors["topk_weights"],
             topk_ids=tensors["topk_ids"],
         ),
@@ -1186,7 +1186,7 @@ def test_tp_moe_fp4_binding_run_uses_function_binding_argument(monkeypatch) -> N
         calls.update(kwargs)
         return sentinel
 
-    monkeypatch.setattr(tp_moe_impl, "sparkinfer_moe_fp4", fake_moe_fp4)
+    monkeypatch.setattr(tp_moe_impl, "b12x_moe_fp4", fake_moe_fp4)
 
     assert binding.run() is sentinel
     assert calls["binding"] is binding
@@ -1207,7 +1207,7 @@ def test_tp_moe_route_binding_run_uses_function_binding_argument(monkeypatch) ->
         calls.update(kwargs)
         return sentinel
 
-    monkeypatch.setattr(tp_moe_impl, "sparkinfer_route_experts_fast", fake_route)
+    monkeypatch.setattr(tp_moe_impl, "b12x_route_experts_fast", fake_route)
 
     assert binding.run() is sentinel
     assert calls["binding"] is binding
@@ -1222,7 +1222,7 @@ def test_tp_moe_sparse_fp4_binding_run_uses_function_binding_argument(
         scratch=scratch,
         hidden_states=tensors["a"],
         experts=_experts(tensors),
-        routing=tp_moe_impl.SPARKINFERTopKRouting(
+        routing=tp_moe_impl.B12XTopKRouting(
             topk_weights=tensors["topk_weights"],
             topk_ids=tensors["topk_ids"],
         ),
@@ -1234,7 +1234,7 @@ def test_tp_moe_sparse_fp4_binding_run_uses_function_binding_argument(
         calls.update(kwargs)
         return sentinel
 
-    monkeypatch.setattr(tp_moe_impl, "sparkinfer_sparse_moe_fp4", fake_sparse)
+    monkeypatch.setattr(tp_moe_impl, "b12x_sparse_moe_fp4", fake_sparse)
 
     assert binding.run() is sentinel
     assert calls["binding"] is binding
@@ -1250,7 +1250,7 @@ def test_tp_moe_fp4_binding_owns_runtime_tensors() -> None:
     )
 
     with pytest.raises(TypeError):
-        tp_moe_impl.sparkinfer_moe_fp4(tensors["a"], binding=binding)
+        tp_moe_impl.b12x_moe_fp4(tensors["a"], binding=binding)
 
 
 def test_tp_moe_route_binding_owns_runtime_tensors() -> None:
@@ -1263,7 +1263,7 @@ def test_tp_moe_route_binding_owns_runtime_tensors() -> None:
     )
 
     with pytest.raises(TypeError):
-        tp_moe_impl.sparkinfer_route_experts_fast(hidden_states, binding=binding)
+        tp_moe_impl.b12x_route_experts_fast(hidden_states, binding=binding)
 
 
 def test_tp_moe_sparse_fp4_binding_owns_runtime_tensors() -> None:
@@ -1274,14 +1274,14 @@ def test_tp_moe_sparse_fp4_binding_owns_runtime_tensors() -> None:
         scratch=scratch,
         hidden_states=tensors["a"],
         experts=experts,
-        routing=tp_moe_impl.SPARKINFERTopKRouting(
+        routing=tp_moe_impl.B12XTopKRouting(
             topk_weights=tensors["topk_weights"],
             topk_ids=tensors["topk_ids"],
         ),
     )
 
     with pytest.raises(TypeError):
-        tp_moe_impl.sparkinfer_sparse_moe_fp4(
+        tp_moe_impl.b12x_sparse_moe_fp4(
             tensors["a"],
             experts=experts,
             binding=binding,
@@ -1290,14 +1290,14 @@ def test_tp_moe_sparse_fp4_binding_owns_runtime_tensors() -> None:
 
 def test_tp_moe_fp4_entrypoint_requires_tensors_or_binding() -> None:
     with pytest.raises(TypeError):
-        tp_moe_impl.sparkinfer_moe_fp4()
+        tp_moe_impl.b12x_moe_fp4()
 
 
 def test_tp_moe_route_entrypoint_requires_inputs_or_binding() -> None:
     with pytest.raises(TypeError):
-        tp_moe_impl.sparkinfer_route_experts_fast()
+        tp_moe_impl.b12x_route_experts_fast()
 
 
 def test_tp_moe_sparse_fp4_entrypoint_requires_inputs_or_binding() -> None:
     with pytest.raises(TypeError):
-        tp_moe_impl.sparkinfer_sparse_moe_fp4()
+        tp_moe_impl.b12x_sparse_moe_fp4()

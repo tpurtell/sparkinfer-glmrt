@@ -3,16 +3,16 @@ from __future__ import annotations
 import pytest
 import torch
 
-import sparkinfer.moe.fused_moe._impl as tp_moe
-from sparkinfer._lib.intrinsics import pack_grouped_fp4_values, swizzle_block_scale
-from sparkinfer.moe._shared.kernels.reference import (
+import b12x.moe.fused_moe._impl as tp_moe
+from b12x._lib.intrinsics import pack_grouped_fp4_values, swizzle_block_scale
+from b12x.moe._shared.kernels.reference import (
     moe_reference_w4a16_f32,
     moe_reference_w4a16_fp4_e8m0_k32,
 )
-from sparkinfer.moe._shared.kernels.reference_flashinfer import (
+from b12x.moe._shared.kernels.reference_flashinfer import (
     prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
 )
-from sparkinfer.moe._shared.kernels.micro import MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend
+from b12x.moe._shared.kernels.micro import MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend
 from tests._reference.w4a16_reference import moe_reference_w4a16
 
 

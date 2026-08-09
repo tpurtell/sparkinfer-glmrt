@@ -5,16 +5,16 @@ import math
 import pytest
 import torch
 
-from sparkinfer.attention.paged.reference import (
+from b12x.attention.paged.reference import (
     materialize_paged_kv_cache,
     msa_attention_reference,
 )
-from sparkinfer.attention._shared.contiguous.api import clear_attention_caches
-from sparkinfer.attention.paged._forward import paged_attention_forward
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionScratchCaps, plan_paged_attention_scratch
-from sparkinfer.attention.paged.planner import create_paged_plan
+from b12x.attention._shared.contiguous.api import clear_attention_caches
+from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged.planner import create_paged_plan
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 from tests._reference.paged_attention_helpers import (
     make_msa_q2k_indices,
     make_paged_inputs,
@@ -124,7 +124,7 @@ def _run_msa_decode(
     assert page_size <= plan.kv_chunk_size <= 32 * page_size
     assert plan.total_num_partial_rows >= plan.new_batch_size
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -196,7 +196,7 @@ def _run_msa_extend(
     assert plan.cta_tile_q in (16, 128)
     assert plan.new_batch_size > 0
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="extend",
             dtype=q.dtype,
@@ -242,7 +242,7 @@ def _run_msa_extend(
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_msa_attention_reference_matches_dense_mask_small_decode(page_size: int) -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 1],
         cache_seqlens=[129, 513],
@@ -272,7 +272,7 @@ def test_msa_attention_reference_matches_dense_mask_small_decode(page_size: int)
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_msa_attention_reference_ignores_poisoned_padding(page_size: int) -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1],
         cache_seqlens=[127],
@@ -308,7 +308,7 @@ def test_msa_attention_reference_ignores_poisoned_padding(page_size: int) -> Non
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_msa_attention_reference_handles_varlen_extend_causality(page_size: int) -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[5, 3],
         cache_seqlens=[200, 384],
@@ -343,7 +343,7 @@ def _lse_base2_to_natural(lse: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_msa_decode_eager_bf16_matches_reference_tail_cases(page_size: int) -> None:
-    require_sparkinfer()
+    require_b12x()
     cache_lens = [1, 64, 127, 128, 129, 200, 2047, 2048, 5000]
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1] * len(cache_lens),
@@ -381,7 +381,7 @@ def test_msa_decode_eager_bf16_matches_reference_tail_cases(page_size: int) -> N
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_msa_decode_eager_bf16_split_chunk_invariance(page_size: int) -> None:
-    require_sparkinfer()
+    require_b12x()
     cache_lens = [1, 64, 127, 128, 129, 200, 2047, 2048, 5000]
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1] * len(cache_lens),
@@ -450,7 +450,7 @@ def test_msa_decode_eager_bf16_split_chunk_invariance(page_size: int) -> None:
 def test_msa_decode_eager_fp8_kv_matches_reference(
     page_size: int, vllm_combined: bool, fixed_split_size: int | None
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     cache_lens = [129, 2048, 5000]
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1] * len(cache_lens),
@@ -522,7 +522,7 @@ def test_msa_decode_eager_fp8_kv_matches_reference(
 def test_msa_extend_eager_bf16_matches_reference_varlen(
     page_size: int, msa_union_tile: bool | None
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 5, 300],
         cache_seqlens=[129, 384, 640],
@@ -581,7 +581,7 @@ def test_msa_extend_eager_bf16_matches_reference_varlen(
 def test_msa_extend_eager_fp8_kv_matches_reference_varlen(
     page_size: int, msa_union_tile: bool | None, vllm_combined: bool
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 5, 300],
         cache_seqlens=[129, 384, 640],
@@ -645,7 +645,7 @@ def test_msa_extend_eager_fp8_kv_matches_reference_varlen(
 
 
 def test_msa_extend_eager_fp8_page128_minimax_vllm_shape_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[396],
         cache_seqlens=[396],
@@ -709,7 +709,7 @@ def test_msa_extend_eager_fp8_page128_minimax_vllm_shape_matches_reference() -> 
 
 
 def test_msa_extend_fp8_worklist_capacity_is_compile_keyed() -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
@@ -797,7 +797,7 @@ def test_msa_extend_fp8_worklist_capacity_is_compile_keyed() -> None:
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_msa_extend_rejects_per_token_fp8(page_size: int) -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[5],
         cache_seqlens=[384],
@@ -828,7 +828,7 @@ def test_msa_extend_rejects_per_token_fp8(page_size: int) -> None:
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_msa_extend_qo_len_one_matches_decode(page_size: int) -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 1],
         cache_seqlens=[129, 2048],
@@ -882,7 +882,7 @@ def test_msa_extend_qo_len_one_matches_decode(page_size: int) -> None:
 def test_msa_decode_cuda_graph_replays_with_mutating_metadata_and_q2k(
     page_size: int, vllm_combined_kv: bool, kv_dtype: str
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     batch = 2
@@ -933,7 +933,7 @@ def test_msa_decode_cuda_graph_replays_with_mutating_metadata_and_q2k(
     q2k_data_ptr = int(q2k_indices.data_ptr())
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1084,7 +1084,7 @@ def test_msa_decode_cuda_graph_replays_with_mutating_metadata_and_q2k(
 
 @torch.inference_mode()
 def test_msa_decode_cuda_graph_captures_minimax_metadata_update_contract() -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     batch = 4
@@ -1149,7 +1149,7 @@ def test_msa_decode_cuda_graph_captures_minimax_metadata_update_contract() -> No
     cu_seqlens_q_data_ptr = int(cu_seqlens_q.data_ptr())
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1303,7 +1303,7 @@ def test_msa_decode_cuda_graph_captures_minimax_metadata_update_contract() -> No
 def test_msa_decode_cuda_graph_replays_minimax_bucket1_after_prefill(
     kv_dtype: str,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     page_size = 128
@@ -1381,7 +1381,7 @@ def test_msa_decode_cuda_graph_replays_minimax_bucket1_after_prefill(
     cu_seqlens_q_data_ptr = int(cu_seqlens_q.data_ptr())
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1512,7 +1512,7 @@ def test_msa_decode_cuda_graph_replays_minimax_bucket1_after_prefill(
 def test_msa_decode_cuda_graph_replays_minimax_padded_bucket_after_prefill(
     kv_dtype: str,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
     bucket = 16
@@ -1594,7 +1594,7 @@ def test_msa_decode_cuda_graph_replays_minimax_padded_bucket_after_prefill(
     )
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -1715,9 +1715,9 @@ def test_msa_decode_cuda_graph_replays_minimax_padded_bucket_after_prefill(
 
 
 def test_msa_decode_graph_metadata_skips_zero_length_padded_rows() -> None:
-    require_sparkinfer()
+    require_b12x()
 
-    from sparkinfer.attention.paged.graph_replay import (
+    from b12x.attention.paged.graph_replay import (
         update_msa_decode_graph_chunk_metadata,
     )
 
@@ -1763,10 +1763,10 @@ def test_msa_decode_graph_metadata_skips_zero_length_padded_rows() -> None:
 def test_msa_decode_graph_compile_key_is_stable_within_minimax_batch_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
-    import sparkinfer.attention.paged._forward as paged_api
+    import b12x.attention.paged._forward as paged_api
 
     forward_specs: list[str] = []
 
@@ -1781,13 +1781,13 @@ def test_msa_decode_graph_compile_key_is_stable_within_minimax_batch_bucket(
         if compile_spec.kernel_id == "attention.paged.forward":
             forward_specs.append(repr(compile_spec))
 
-    monkeypatch.setattr(paged_api, "sparkinfer_launch", fake_launch)
+    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
 
     spec_by_batch: dict[int, str] = {}
     for batch in (1, 2, 4, 8, 16):
         page_table_width = 80
         scratch_plan = plan_paged_attention_scratch(
-            SPARKINFERPagedAttentionScratchCaps(
+            B12XPagedAttentionScratchCaps(
                 device=torch.device("cuda"),
                 mode="decode",
                 dtype=torch.bfloat16,
@@ -1871,10 +1871,10 @@ def test_msa_decode_graph_compile_key_is_stable_within_minimax_batch_bucket(
 def test_msa_extend_compile_key_does_not_require_decode_graph_flags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     clear_attention_caches()
 
-    import sparkinfer.attention.paged._forward as paged_api
+    import b12x.attention.paged._forward as paged_api
 
     forward_specs: list[str] = []
 
@@ -1889,7 +1889,7 @@ def test_msa_extend_compile_key_does_not_require_decode_graph_flags(
         if compile_spec.kernel_id == "attention.paged.forward":
             forward_specs.append(repr(compile_spec))
 
-    monkeypatch.setattr(paged_api, "sparkinfer_launch", fake_launch)
+    monkeypatch.setattr(paged_api, "b12x_launch", fake_launch)
 
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[8, 4],
@@ -1928,7 +1928,7 @@ def test_msa_extend_compile_key_does_not_require_decode_graph_flags(
 
 def test_msa_decode_eager_bf16_page128_vllm_combined_cache_matches_reference() -> None:
     """vLLM MiniMax-M3 cache shape: combined [N, 2, 128, H, D] with K/V strided slices."""
-    require_sparkinfer()
+    require_b12x()
     cache_lens = [1, 64, 127, 128, 129, 200, 2047, 2048, 5000]
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1] * len(cache_lens),
@@ -1987,7 +1987,7 @@ def test_msa_decode_eager_bf16_page128_vllm_combined_cache_matches_reference() -
 
 
 def test_msa_extend_eager_bf16_page128_vllm_combined_cache_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 5, 300],
         cache_seqlens=[129, 384, 640],
@@ -2036,7 +2036,7 @@ def test_msa_extend_eager_bf16_page128_vllm_combined_cache_matches_reference() -
 
 
 def test_msa_extend_qo_len_one_page128_vllm_combined_cache_matches_decode() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 1],
         cache_seqlens=[129, 2048],
@@ -2067,7 +2067,7 @@ def test_msa_extend_qo_len_one_page128_vllm_combined_cache_matches_decode() -> N
 
 
 def test_paged_plan_accepts_dense_page128() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1],
         cache_seqlens=[200],
@@ -2092,7 +2092,7 @@ def test_paged_plan_accepts_dense_page128() -> None:
 
 
 def test_paged_plan_accepts_page128_fp8_kv() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1],
         cache_seqlens=[200],

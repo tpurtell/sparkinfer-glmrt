@@ -10,24 +10,24 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_ONESHOT_OPPOSITE_ORDER") != "1",
+    os.getenv("B12X_RUN_PCIE_ONESHOT_OPPOSITE_ORDER") != "1",
     reason=(
-        "set SPARKINFER_RUN_PCIE_ONESHOT_OPPOSITE_ORDER=1 to run the "
+        "set B12X_RUN_PCIE_ONESHOT_OPPOSITE_ORDER=1 to run the "
         "four-rank opposite-order PCIe oneshot GPU test"
     ),
 )
 
 WORLD_SIZE = 4
-EAGER_ITERS = int(os.getenv("SPARKINFER_PCIE_OPPOSITE_EAGER_ITERS", "64"))
-GRAPH_REPLAYS = int(os.getenv("SPARKINFER_PCIE_OPPOSITE_GRAPH_REPLAYS", "64"))
+EAGER_ITERS = int(os.getenv("B12X_PCIE_OPPOSITE_EAGER_ITERS", "64"))
+GRAPH_REPLAYS = int(os.getenv("B12X_PCIE_OPPOSITE_GRAPH_REPLAYS", "64"))
 TEST_TIMEOUT_SECONDS = float(
-    os.getenv("SPARKINFER_PCIE_OPPOSITE_TIMEOUT_SECONDS", "180")
+    os.getenv("B12X_PCIE_OPPOSITE_TIMEOUT_SECONDS", "180")
 )
-NUMEL = int(os.getenv("SPARKINFER_PCIE_OPPOSITE_NUMEL", "32768"))
+NUMEL = int(os.getenv("B12X_PCIE_OPPOSITE_NUMEL", "32768"))
 
 
 def _free_port() -> int:

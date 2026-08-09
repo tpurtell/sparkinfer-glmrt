@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-import sparkinfer.comm.pcie.pcie_dcp_a2a as dcp
-import sparkinfer.comm.pcie.pcie_oneshot as oneshot
-import sparkinfer.comm.pcie.pcie_twoshot as twoshot
+import b12x.comm.pcie.pcie_dcp_a2a as dcp
+import b12x.comm.pcie.pcie_oneshot as oneshot
+import b12x.comm.pcie.pcie_twoshot as twoshot
 
 
 def _mock_collective_failure(monkeypatch) -> None:
@@ -478,7 +478,6 @@ def test_dcp_direct_cuda_constructor_executes_all_collective_gates(
     assert events == [
         "preflight",
         "residency",
-        "preflight",
         "contract",
         "native-init",
         "native-verdict",

@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-import sparkinfer.comm.pcie.pcie_allreduce as pcie_allreduce
-from sparkinfer.comm.pcie.pcie_allreduce import (
+import b12x.comm.pcie.pcie_allreduce as pcie_allreduce
+from b12x.comm.pcie import _hierarchical_cute
+from b12x.comm.pcie.pcie_allreduce import (
     PCIeAllReduce,
     _algorithm_for_world_size,
 )
-from sparkinfer.comm.pcie.pcie_hierarchical import (
+from b12x.comm.pcie.pcie_hierarchical import (
+    _buffer_modes_from_env,
+    _make_layout,
     _pick_blocks,
     _selected_peers,
+    _threads_from_env,
+    _vectorized_bf16x2_from_env,
+    _vectorized_bf16x2_max_elements_from_env,
+    _wait_nanosleep_cycles_from_env,
 )
 
 
@@ -178,3 +186,208 @@ def test_pick_blocks_for_k3_decode(elements: int, expected: int) -> None:
 def test_pick_blocks_rejects_empty_input() -> None:
     with pytest.raises(ValueError, match="positive"):
         _pick_blocks(0)
+
+
+@pytest.mark.parametrize(
+    ("double_buffered", "deferred_consumption", "expected"),
+    [
+        ("0", "0", (False, False)),
+        ("1", "0", (True, False)),
+        ("0", "1", (False, True)),
+    ],
+)
+def test_hierarchical_buffer_modes_are_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    double_buffered: str,
+    deferred_consumption: str,
+    expected: tuple[bool, bool],
+) -> None:
+    monkeypatch.setenv(
+        "B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER",
+        double_buffered,
+    )
+    monkeypatch.setenv(
+        "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
+        deferred_consumption,
+    )
+    assert _buffer_modes_from_env() == expected
+
+
+def test_hierarchical_buffer_modes_reject_ambiguous_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER", "1")
+    monkeypatch.setenv(
+        "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
+        "1",
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _buffer_modes_from_env()
+
+
+@pytest.mark.parametrize("value", ["0", "16", "32", "64", "1024"])
+def test_hierarchical_wait_nanosleep_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(
+        "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
+        value,
+    )
+    assert _wait_nanosleep_cycles_from_env() == int(value)
+
+
+@pytest.mark.parametrize("value", ["-1", "1025", "not-an-int"])
+def test_hierarchical_wait_nanosleep_cycles_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(
+        "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
+        value,
+    )
+    with pytest.raises(ValueError):
+        _wait_nanosleep_cycles_from_env()
+
+
+@pytest.mark.parametrize("value", ["32", "128", "224", "256", "1024"])
+def test_hierarchical_threads(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_THREADS", value)
+    assert _threads_from_env() == int(value)
+
+
+@pytest.mark.parametrize("value", ["0", "31", "225", "1056", "bad"])
+def test_hierarchical_threads_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_THREADS", value)
+    with pytest.raises(ValueError):
+        _threads_from_env()
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True)])
+def test_hierarchical_vectorized_bf16x2(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_BF16X2", value)
+    assert _vectorized_bf16x2_from_env() is expected
+
+
+def test_hierarchical_vectorized_bf16x2_rejects_invalid_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_BF16X2", "true")
+    with pytest.raises(ValueError):
+        _vectorized_bf16x2_from_env()
+
+
+@pytest.mark.parametrize("value", ["0", "7168", "57344", str(1 << 30)])
+def test_hierarchical_vectorized_bf16x2_max_elements(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(
+        "B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
+        value,
+    )
+    assert _vectorized_bf16x2_max_elements_from_env() == int(value)
+
+
+@pytest.mark.parametrize("value", ["-1", str((1 << 30) + 1), "bad"])
+def test_hierarchical_vectorized_bf16x2_max_elements_rejects_invalid_value(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv(
+        "B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
+        value,
+    )
+    with pytest.raises(ValueError):
+        _vectorized_bf16x2_max_elements_from_env()
+
+
+@pytest.mark.parametrize("max_elements", [1, 3584, 4096, 7168])
+def test_hierarchical_slab_layout_matches_native_alignment(
+    max_elements: int,
+) -> None:
+    layout = _make_layout(max_elements)
+    assert layout.stage[0] == 69_888
+    for slot in range(2):
+        assert layout.partial[slot] == (
+            (layout.stage[slot] + max_elements * 2 + 255) // 256
+        ) * 256
+        assert layout.final[slot] == (
+            (layout.partial[slot] + max_elements * 4 + 255) // 256
+        ) * 256
+        if slot == 0:
+            assert layout.stage[1] == (
+                (layout.final[0] + max_elements * 2 + 255) // 256
+            ) * 256
+    assert layout.bytes == (
+        (layout.final[1] + max_elements * 2 + 255) // 256
+    ) * 256
+    assert all(
+        value % 256 == 0
+        for offsets in (layout.stage, layout.partial, layout.final)
+        for value in offsets
+    )
+    assert layout.bytes % 256 == 0
+
+
+def test_hierarchical_protocol_intrinsics_pin_native_ptx_modifiers() -> None:
+    assert "ld.acquire.sys.global.u32" in inspect.getsource(
+        _hierarchical_cute._load_acquire_sys_u32
+    )
+    assert "st.release.sys.global.u32" in inspect.getsource(
+        _hierarchical_cute._store_release_sys_u32
+    )
+    assert "fence.sc.sys" in inspect.getsource(_hierarchical_cute._fence_sc_sys)
+    assert "nanosleep.u32 $0" in inspect.getsource(_hierarchical_cute._nanosleep)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "rank", "island", "local_rank", "leader_rank"),
+    [
+        (12, 0, 0, 0, 0),
+        (12, 5, 1, 1, 4),
+        (12, 11, 2, 3, 8),
+        (16, 15, 3, 3, 12),
+    ],
+)
+def test_hierarchical_launch_specializes_rank_topology(
+    world_size: int,
+    rank: int,
+    island: int,
+    local_rank: int,
+    leader_rank: int,
+) -> None:
+    launch = _hierarchical_cute._HierarchicalLaunch(world_size, rank)
+
+    assert launch._rank == rank
+    assert launch._island == island
+    assert launch._local_rank == local_rank
+    assert launch._leader_rank == leader_rank
+
+
+def test_hierarchical_launch_uses_direct_slab_pointer_parameters() -> None:
+    parameters = inspect.signature(
+        _hierarchical_cute._HierarchicalLaunch.kernel
+    ).parameters
+
+    assert tuple(parameters)[1:17] == tuple(f"slab{rank}" for rank in range(16))
+    assert "rank" not in parameters
+    assert "slabs" not in parameters
+
+
+@pytest.mark.parametrize(("world_size", "rank"), [(8, 0), (12, -1), (12, 12)])
+def test_hierarchical_launch_rejects_invalid_specialization(
+    world_size: int, rank: int
+) -> None:
+    with pytest.raises(ValueError):
+        _hierarchical_cute._HierarchicalLaunch(world_size, rank)

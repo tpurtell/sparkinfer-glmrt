@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparkinfer.attention.paged import graph_replay
-from sparkinfer.attention.paged._forward import (
+from b12x.attention.paged import graph_replay
+from b12x.attention.paged._forward import (
     _capture_decode_graph_replay_metadata_if_needed,
 )
-from sparkinfer.attention.paged._scratch import SPARKINFERPagedAttentionBinding
-from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+from b12x.attention.paged._scratch import B12XPagedAttentionBinding
+from b12x.attention.paged.workspace import PagedAttentionWorkspace
 
 
 def _make_cpu_decode_graph_workspace(
@@ -334,10 +334,10 @@ def test_public_binding_cannot_bypass_exact_decode_graph_bucket(
         ValueError,
         match=f"{invalid_kind} total_q must exactly match",
     ):
-        from sparkinfer.attention.paged._forward import paged_attention_forward
+        from b12x.attention.paged._forward import paged_attention_forward
 
         paged_attention_forward(
-            binding=SPARKINFERPagedAttentionBinding(
+            binding=B12XPagedAttentionBinding(
                 scratch=workspace,
                 q=bound_q,
                 k_cache=k_cache,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Decode-latency micro-benchmark for the sparkinfer FP6 *dense* linear path.
+"""Decode-latency micro-benchmark for the b12x FP6 *dense* linear path.
 
 Localizes the vLLM ~2 tok/s decode bottleneck by isolating a single FP6 dense
 linear at decode batch size (M=1). For each representative ``(out_features,
@@ -89,16 +89,16 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this benchmark")
 
-    from sparkinfer._lib.fp6 import (
+    from b12x._lib.fp6 import (
         SF_VEC_SIZE_FP6,
         as_grouped_mxfp6_scale_view,
         mx_gs_numerator,
     )
-    import sparkinfer._lib.dense_gemm as _dense_mod
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as _wmod
-    from sparkinfer._lib.dense_gemm import dense_gemm
-    from sparkinfer.quantization.mxfp6 import dense_fp6_linear, quantize_dense_weight_to_fp6
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    import b12x._lib.dense_gemm as _dense_mod
+    import b12x.quantization.mxfp6.fp6_dense_weights as _wmod
+    from b12x._lib.dense_gemm import dense_gemm
+    from b12x.quantization.mxfp6 import dense_fp6_linear, quantize_dense_weight_to_fp6
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         _quantize_matrix_fp6_bytes,
         _quantize_matrix_fp6_bytes_small_m,
         _TILE,

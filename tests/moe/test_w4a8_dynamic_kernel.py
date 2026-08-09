@@ -13,20 +13,20 @@ import pytest
 import torch
 from cutlass.cute.runtime import make_ptr
 
-from sparkinfer._lib.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
-from sparkinfer._lib.compiler import KernelCompileSpec, compile as sparkinfer_compile
+from b12x._lib.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
+from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 
 _OPT_LEVEL_2 = _DSLOptLevel(2)
-from sparkinfer.moe.fused_moe._impl import _DynamicMoEW4A8Launch, current_cuda_stream
-from sparkinfer.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
-from sparkinfer.moe._shared.kernels.reference import (
+from b12x.moe.fused_moe._impl import _DynamicMoEW4A8Launch, current_cuda_stream
+from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+from b12x.moe._shared.kernels.reference import (
     compare_to_reference,
     decompose_nvfp4_scales_to_mx_residual,
     moe_reference_w4a8_mx,
 )
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 _TILE_M = 128
 _TILE_N = 128
@@ -241,7 +241,7 @@ def _run_w4a8_dynamic(
     def _compile_or_override(*args, **kwargs):
         if compiled_override is not None:
             return compiled_override
-        return sparkinfer_compile(*args, **kwargs)
+        return b12x_compile(*args, **kwargs)
 
     compiled = _compile_or_override(
         launch,
@@ -344,11 +344,11 @@ def _run_w4a8_dynamic(
     if capture_intermediate:
         if not return_debug:
             raise ValueError("capture_intermediate requires return_debug=True")
-        from sparkinfer._lib.intrinsics import (
+        from b12x._lib.intrinsics import (
             _ue8m0_output_scale_torch,
             pow2_ceil_ue8m0_torch,
         )
-        from sparkinfer.moe._shared.kernels.reference import (
+        from b12x.moe._shared.kernels.reference import (
             _make_fp4_lut,
             _quant_dequant_mxfp8_rows,
             _w4a8_effective_weight,
@@ -456,7 +456,7 @@ def _run_w4a8_dynamic(
     if capture_fc1_raw:
         if not return_debug:
             raise ValueError("capture_fc1_raw requires return_debug=True")
-        from sparkinfer.moe._shared.kernels.reference import (
+        from b12x.moe._shared.kernels.reference import (
             _make_fp4_lut,
             _quant_dequant_mxfp8_rows,
             _w4a8_effective_weight,
@@ -722,7 +722,7 @@ def _run_w4a8_dynamic(
 @pytest.mark.parametrize("recipe", ["w4a8_mx", "w4a8_nvfp4"])
 @pytest.mark.parametrize("activation", ["silu", "situ", "relu2"])
 def test_w4a8_dynamic_matches_oracle(recipe: str, activation: str) -> None:
-    require_sparkinfer()
+    require_b12x()
     out, ref = _run_w4a8_dynamic(
         recipe=recipe, activation=activation,
         E=4, m=8, K=256, n=128, top_k=2, seed=11,
@@ -740,7 +740,7 @@ def test_w4a8_dynamic_small_tile_parallel_regime_matches_oracle(
     activation: str,
 ) -> None:
     """Exercise the production M16/four-MMA/two-DMA regime directly."""
-    require_sparkinfer()
+    require_b12x()
     kernel = MoEDynamicKernelBackend(
         16,
         (16, _TILE_N),
@@ -768,7 +768,7 @@ def test_w4a8_dynamic_small_tile_parallel_regime_matches_oracle(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_nvfp4_relu2_m32_rows_16_17_match_oracle() -> None:
     """Guard the FC1-A/FC2-residual alias handoff at the first M16 boundary."""
-    require_sparkinfer()
+    require_b12x()
     m = 18
     topk_ids = torch.tensor(
         [[0, 1 + token % 3] for token in range(m)],
@@ -814,7 +814,7 @@ def test_w4a8_nvfp4_relu2_m32_rows_16_17_match_oracle() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_dynamic_boundary_m_sizes() -> None:
-    require_sparkinfer()
+    require_b12x()
     for m in (1, 3, 127, 129):
         out, ref = _run_w4a8_dynamic(
             recipe="w4a8_mx", activation="silu",
@@ -828,7 +828,7 @@ def test_w4a8_dynamic_boundary_m_sizes() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     """Capture the w4a8 launch in a CUDA graph; replay must track routing."""
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     torch.manual_seed(7)
     E, m, K, n, top_k = 4, 8, 256, 128, 2
@@ -907,7 +907,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     def fake_ptr_u32():
         return make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16)
 
-    compiled = sparkinfer_compile(
+    compiled = b12x_compile(
         launch,
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),

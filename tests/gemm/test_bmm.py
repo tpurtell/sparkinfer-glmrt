@@ -3,11 +3,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import pytest
-import sparkinfer
+import b12x
 import torch
 
-from sparkinfer import gemm
-from tests._reference.helpers import require_sparkinfer
+from b12x import gemm
+from tests._reference.helpers import require_b12x
 
 # The two qualified geometries, represented as zero-copy views of one
 # larger rowwise-MXFP8 allocation.
@@ -102,7 +102,7 @@ def _graph_output(
 
 @pytest.fixture(scope="module")
 def packed_rhs() -> Mapping[str, tuple[torch.Tensor, torch.Tensor]]:
-    require_sparkinfer()
+    require_b12x()
     values, scales = _make_pack()
     rhs_by_major = _rhs_views(values, scales)
     for major, rhs in rhs_by_major.items():
@@ -113,17 +113,17 @@ def packed_rhs() -> Mapping[str, tuple[torch.Tensor, torch.Tensor]]:
 
 
 def test_registry_import_order_preserves_flat_bmm_function() -> None:
-    sparkinfer.list_ops()
+    b12x.list_ops()
     flat_bmm = gemm.bmm
     assert callable(flat_bmm)
     assert not hasattr(flat_bmm, "mm")
 
-    sparkinfer.list_ops()
+    b12x.list_ops()
     assert gemm.bmm is flat_bmm
 
 
 def test_public_contract_is_generic() -> None:
-    meta = sparkinfer.find_op("gemm.bmm")
+    meta = b12x.find_op("gemm.bmm")
     assert meta.qualname == "gemm.bmm"
     assert set(meta.entry_points) == {
         "bmm",
@@ -140,7 +140,7 @@ def test_public_contract_is_generic() -> None:
 
 
 def test_rhs_views_are_zero_copy() -> None:
-    require_sparkinfer()
+    require_b12x()
     values, scales = _make_pack(seed=11)
     rhs_by_major = _rhs_views(values, scales)
     n_values, n_scales = rhs_by_major["n"]
@@ -327,7 +327,7 @@ def test_output_with_internal_overlap_is_rejected(packed_rhs) -> None:
 
 
 def test_can_implement_reports_only_qualified_specialization() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     kwargs = dict(
         batch=BATCH,
         max_m=32,
@@ -348,7 +348,7 @@ def test_can_implement_reports_only_qualified_specialization() -> None:
 @pytest.mark.parametrize("b_major", ["n", "k"])
 def test_tp8_geometry_matches_reference_and_cuda_graph(b_major: str) -> None:
     """The GLM TP8 shard uses eight MLA heads per rank."""
-    require_sparkinfer()
+    require_b12x()
     batch = 8
     m = 4
     values, scales = _make_pack(seed=23, batch=batch)

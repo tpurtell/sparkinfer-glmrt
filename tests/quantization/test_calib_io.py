@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from sparkinfer.quantization.mxfp6.calib_io import load_hidden_states, save_hidden_states
+from b12x.quantization.mxfp6.calib_io import load_hidden_states, save_hidden_states
 
 
 def test_hidden_states_roundtrip(tmp_path: Path) -> None:

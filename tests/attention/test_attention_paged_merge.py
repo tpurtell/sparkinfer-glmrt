@@ -4,16 +4,16 @@ import torch
 
 import cutlass
 
-from sparkinfer.attention.paged._forward import (
+from b12x.attention.paged._forward import (
     _build_merge_kernel,
     _to_kernel_tensor,
     _torch_to_cutlass_dtype,
 )
-from sparkinfer.attention.paged.merge import PagedPersistentMergeKernel
-from sparkinfer._lib.compiler import compile as sparkinfer_compile
-from sparkinfer._lib.utils import current_cuda_stream
+from b12x.attention.paged.merge import PagedPersistentMergeKernel
+from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.utils import current_cuda_stream
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def test_b1_regular_decode_graph_uses_four_merge_warps() -> None:
@@ -151,13 +151,13 @@ def _run_merge_kernel(
         else _to_kernel_tensor(total_rows_ptr, cutlass.Int32, assumed_align=4),
         current_cuda_stream(),
     )
-    compiled = sparkinfer_compile(kernel, *args)
+    compiled = b12x_compile(kernel, *args)
     compiled(*args)
 
 
 @torch.inference_mode()
 def test_paged_persistent_merge_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
         _make_merge_problem()
     )
@@ -188,7 +188,7 @@ def test_paged_persistent_merge_matches_reference() -> None:
 
 @torch.inference_mode()
 def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
-    require_sparkinfer()
+    require_b12x()
     partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
         _make_merge_problem()
     )
@@ -224,7 +224,7 @@ def test_paged_persistent_merge_respects_dynamic_total_rows() -> None:
 
 @torch.inference_mode()
 def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
-    require_sparkinfer()
+    require_b12x()
     partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
         _make_merge_problem(counts=[8, 7, 5])
     )
@@ -255,7 +255,7 @@ def test_paged_persistent_merge_handles_more_than_one_partial_per_ty() -> None:
 
 @torch.inference_mode()
 def test_paged_persistent_merge_regular_decode_graph_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     counts = [1, 3, 2, 4]
     partial_o, partial_lse, merge_indptr, output, lse, total_rows_ptr, cache_seqlens, kv_chunk_size_ptr = (
         _make_regular_decode_graph_merge_problem(counts=counts)

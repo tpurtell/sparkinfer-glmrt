@@ -3,7 +3,7 @@
 
 The GDN ``in_proj_ba`` (N ~ 64-128, K = hidden) stays bf16 in the FP6 serving
 path, and at decode sizes cuBLAS picks a ~28 us 16x16 WMMA tile kernel for it
-(48 calls/step ~= 1.35 ms/step). ``sparkinfer::bf16_gemv_small_n`` replaces that
+(48 calls/step ~= 1.35 ms/step). ``b12x::bf16_gemv_small_n`` replaces that
 with a one-CTA-per-column reduction kernel; this script measures both.
 
 READ THE ``graph`` COLUMNS, NOT THE ``eager`` ONES. In eager mode the CUTE
@@ -79,15 +79,15 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required")
 
-    from sparkinfer.gemm import bf16_gemv
+    from b12x.gemm import bf16_gemv
 
     # The package API is lazy (install_lazy_api); touching the attribute
     # imports _kernel, which registers the torch custom op.
     bf16_gemv.bf16_gemv_small_n  # noqa: B018
 
-    from sparkinfer.gemm.bf16_gemv._kernel import SMALL_M_MAX
+    from b12x.gemm.bf16_gemv._kernel import SMALL_M_MAX
 
-    op = torch.ops.sparkinfer.bf16_gemv_small_n
+    op = torch.ops.b12x.bf16_gemv_small_n
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
 

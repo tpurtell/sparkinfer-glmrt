@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import cutlass
 
-from sparkinfer._lib.utils import mxfp6_tile_k
-from sparkinfer._lib.dense_gemm import DenseGemmKernel
+from b12x._lib.utils import mxfp6_tile_k
+from b12x._lib.dense_gemm import DenseGemmKernel
 
 
 def test_dense_gemm_can_implement_mxfp6_e3m2() -> None:

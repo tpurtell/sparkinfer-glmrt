@@ -9,22 +9,22 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_ONESHOT_TORTURE") != "1",
-    reason="set SPARKINFER_RUN_PCIE_ONESHOT_TORTURE=1 to run PCIe oneshot CUDA torture tests",
+    os.getenv("B12X_RUN_PCIE_ONESHOT_TORTURE") != "1",
+    reason="set B12X_RUN_PCIE_ONESHOT_TORTURE=1 to run PCIe oneshot CUDA torture tests",
 )
 
 TORTURE_EAGER_ITERS = int(
-    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_EAGER_ITERS", "256")
+    os.getenv("B12X_PCIE_ONESHOT_TORTURE_EAGER_ITERS", "256")
 )
 TORTURE_GRAPH_REPLAYS = int(
-    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_GRAPH_REPLAYS", "256")
+    os.getenv("B12X_PCIE_ONESHOT_TORTURE_GRAPH_REPLAYS", "256")
 )
 TORTURE_MULTISTREAM_ITERS = int(
-    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_MULTISTREAM_ITERS", "256")
+    os.getenv("B12X_PCIE_ONESHOT_TORTURE_MULTISTREAM_ITERS", "256")
 )
 
 
@@ -103,12 +103,12 @@ def _run_graph_scratch_reuse(
 
     graph = torch.cuda.CUDAGraph()
     with (
-        pool.capture(stream, channel_id="graph:torture") as channel,
+        pool.capture(stream, channel_id="graph:torture") as graph_channel,
         torch.cuda.graph(graph, stream=stream),
     ):
         for layer in range(layers):
             scratch.copy_(sources[layer])
-            channel.all_reduce(scratch, out=outs[layer])
+            graph_channel.all_reduce(scratch, out=outs[layer])
     stream.synchronize()
 
     for iteration in range(TORTURE_GRAPH_REPLAYS):
@@ -124,7 +124,7 @@ def _run_graph_scratch_reuse(
     # the final layer on every replay. Both slots are overwritten by this
     # 17-layer graph, so merely counting changed slots cannot identify the
     # selected parity: the final two layer markers must exchange positions.
-    snapshots = [_local_eager_words(channel, stream)]
+    snapshots = [_local_eager_words(graph_channel, stream)]
     expected_words = [
         tuple(int(source.view(torch.uint64)[0].item()) for source in sources[-2:])
     ]
@@ -133,7 +133,7 @@ def _run_graph_scratch_reuse(
             fill_sources(iteration)
             graph.replay()
         stream.synchronize()
-        snapshots.append(_local_eager_words(channel, stream))
+        snapshots.append(_local_eager_words(graph_channel, stream))
         expected_words.append(
             tuple(int(source.view(torch.uint64)[0].item()) for source in sources[-2:])
         )
@@ -218,7 +218,7 @@ def test_pcie_oneshot_eager_graph_and_multistream_torture():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     available = torch.cuda.device_count()
-    requested = int(os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
+    requested = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
     if requested not in (2, 4, 6, 8, 10):
         pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
     if available < requested:

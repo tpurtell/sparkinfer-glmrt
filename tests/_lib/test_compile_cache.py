@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-compiler = importlib.import_module("sparkinfer._lib.compiler")
+compiler = importlib.import_module("b12x._lib.compiler")
 kernel_resources = importlib.import_module(
     "validation.cutlass_migration.evidence.kernel_resources"
 )
@@ -23,9 +23,9 @@ ptx_capture = importlib.import_module(
 )
 
 
-def test_package_root_is_the_sparkinfer_package():
+def test_package_root_is_the_b12x_package():
     root = compiler._PACKAGE_ROOT
-    assert root.name == "sparkinfer", root
+    assert root.name == "b12x", root
     assert (root / "_lib" / "compiler.py").is_file()
 
 
@@ -35,30 +35,30 @@ def test_fingerprint_tracks_source_edits(tmp_path, monkeypatch):
     pycache.mkdir()
     monkeypatch.setattr(compiler, "_PACKAGE_ROOT", tmp_path)
 
-    before = compiler._compute_sparkinfer_package_fingerprint()
+    before = compiler._compute_b12x_package_fingerprint()
 
     (pycache / "kernel.cpython-312.pyc").write_bytes(b"ignored")
-    assert compiler._compute_sparkinfer_package_fingerprint() == before, (
+    assert compiler._compute_b12x_package_fingerprint() == before, (
         "__pycache__ must not affect the fingerprint"
     )
 
     (tmp_path / "kernel.py").write_text("x = 2\n")
-    after = compiler._compute_sparkinfer_package_fingerprint()
+    after = compiler._compute_b12x_package_fingerprint()
     assert after != before, "editing any source must change the fingerprint"
 
 
 def test_cache_dir_resolution_order(monkeypatch):
-    for name in ("SPARKINFER_COMPILE_CACHE_DIR", "XDG_CACHE_HOME"):
+    for name in ("B12X_COMPILE_CACHE_DIR", "XDG_CACHE_HOME"):
         monkeypatch.delenv(name, raising=False)
 
     assert compiler._cute_compile_cache_dir() == (
-        Path.home() / ".cache" / "sparkinfer" / "compile"
+        Path.home() / ".cache" / "b12x" / "compile"
     )
 
     monkeypatch.setenv("XDG_CACHE_HOME", "/xdg")
-    assert compiler._cute_compile_cache_dir() == Path("/xdg/sparkinfer/compile")
+    assert compiler._cute_compile_cache_dir() == Path("/xdg/b12x/compile")
 
-    monkeypatch.setenv("SPARKINFER_COMPILE_CACHE_DIR", "/explicit")
+    monkeypatch.setenv("B12X_COMPILE_CACHE_DIR", "/explicit")
     assert compiler._cute_compile_cache_dir() == Path("/explicit")
 
 
@@ -97,7 +97,7 @@ def test_disk_cache_key_includes_device_uuid_and_forwards_ordinal(monkeypatch):
         {},
     )
 
-    assert payload[0] == "sparkinfer_cute_compile_cache_v3"
+    assert payload[0] == "b12x_cute_compile_cache_v3"
     assert payload[4] == ("device_uuid", "gpu-3")
     assert repeated_payload == payload
     assert seen["ordinal"] == 3
@@ -247,7 +247,7 @@ def test_explicit_cache_payload_includes_device_uuid(monkeypatch):
     )
 
     assert len(payload) == 11
-    assert payload[0] == "sparkinfer_cute_compile_cache_v6_explicit_spec"
+    assert payload[0] == "b12x_cute_compile_cache_v6_explicit_spec"
     assert payload[4] == device_uuid
     assert payload[5:11] == (
         compile_spec.hash_key,
@@ -260,9 +260,9 @@ def test_explicit_cache_payload_includes_device_uuid(monkeypatch):
 
 
 def test_uuid_unavailable_disables_disk_cache(monkeypatch):
-    monkeypatch.setenv("SPARKINFER_COMPILE_DISK_CACHE", "1")
+    monkeypatch.setenv("B12X_COMPILE_DISK_CACHE", "1")
     payload = (
-        "sparkinfer_cute_compile_cache_v3",
+        "b12x_cute_compile_cache_v3",
         ("function", "test", "kernel"),
         "package",
         "toolchain",
@@ -301,7 +301,7 @@ def test_explicit_memory_cache_hit_skips_freeze_and_disk_payload(monkeypatch):
             AssertionError("memory hit rebuilt the disk payload")
         ),
     )
-    runtime_control = importlib.import_module("sparkinfer._lib.runtime_control")
+    runtime_control = importlib.import_module("b12x._lib.runtime_control")
 
     runtime_control.freeze_kernel_resolution("cached compile remains launchable")
     try:
@@ -318,7 +318,7 @@ def test_explicit_memory_cache_hit_skips_freeze_and_disk_payload(monkeypatch):
 
 def test_frozen_memory_miss_rejects_before_disk_cache_load(monkeypatch):
     cute = pytest.importorskip("cutlass.cute")
-    runtime_control = importlib.import_module("sparkinfer._lib.runtime_control")
+    runtime_control = importlib.import_module("b12x._lib.runtime_control")
     compile_spec = compiler.KernelCompileSpec.from_facts(
         "test.freeze.disk_hit",
         1,

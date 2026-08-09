@@ -11,7 +11,7 @@ packed MX-FP6. Two output formats:
   patched ``config.json`` + copied tokenizer/aux files.
 * ``--format pt``: per-layer ``.moe_fp6.safetensors`` / ``.dense_fp6.safetensors``
   artifacts for kernel validation (load MoE layers with
-  ``sparkinfer.quantization.mxfp6.load_fp6_moe_weights``). The flag name is
+  ``b12x.quantization.mxfp6.load_fp6_moe_weights``). The flag name is
   historical; output is safetensors (pickle persistence is not supported).
 
 Routed experts plus the non-expert 2-D Linears (attention, shared experts; and
@@ -45,7 +45,7 @@ import argparse
 
 import torch
 
-from sparkinfer.quantization.mxfp6 import (
+from b12x.quantization.mxfp6 import (
     SafetensorsModel,
     convert_dense_model_to_fp6,
     convert_moe_model_to_fp6,

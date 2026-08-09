@@ -9,8 +9,8 @@ import time
 
 import torch
 
-from sparkinfer._lib.intrinsics import quantize_grouped_nvfp4_torch
-from sparkinfer._lib.utils import get_hardware_info
+from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.utils import get_hardware_info
 
 
 FLOAT4_E2M1_MAX = 6.0
@@ -93,7 +93,7 @@ def nvidia_smi_gpu_mode_snapshot() -> dict[str, object]:
 
 def require_sm120() -> torch.device:
     if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required to run sparkinfer benchmarks")
+        raise SystemExit("CUDA is required to run b12x benchmarks")
     return torch.device("cuda")
 
 

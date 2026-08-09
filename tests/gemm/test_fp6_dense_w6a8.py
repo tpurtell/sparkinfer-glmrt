@@ -1,9 +1,4 @@
-"""Dense W6A8 (E4M3 activations + E2M3 weights) smoke tests.
-
-Gate 1.1: the dense runtime must honor ``activation_format=e4m3`` from
-``mxfp6_w6a8`` checkpoints — same weight bytes as W6A6, different live
-activation quantization + ``e4m3.e2m3`` MMA.
-"""
+"""Correctness tests for E4M3-activation/E2M3-weight dense W6A8."""
 from __future__ import annotations
 
 import pytest
@@ -23,7 +18,7 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 @cuda_required
 def test_w6a8_dense_linear_numeric():
     """W6A8 dense path produces a non-trivial, high-cosine result vs BF16."""
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -47,7 +42,7 @@ def test_w6a8_dense_linear_numeric():
 @pytest.mark.parametrize("m", [1, 3, 16, 128])
 def test_w6a8_dense_matches_across_m(m):
     """Small-M and large-M W6A8 paths agree on shared rows (amax pinned)."""
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -61,22 +56,12 @@ def test_w6a8_dense_matches_across_m(m):
     x[0, 0] = 8.0  # pin amax in row 0 so every slice shares a_gs
     y_full = dense_fp6_linear(x, fp6w)
     y_m = dense_fp6_linear(x[:m], fp6w)
-    if m == 1:
-        # m=1 uses per-tensor quantization; m=128 uses per-row.  Same
-        # effective global scale (30.0) but the per-row path pre-scales in
-        # float32→bf16 while the per-tensor kernel applies gs directly in
-        # FP32. The bf16 roundtrip changes a few codes — high cosine is
-        # enough.
-        cos = _cos(y_m, y_full[:m])
-        assert cos > 0.999, f"m=1 vs full cosine {cos:.6f}"
-    else:
-        # m>1: both paths use per-row scaling → row-independent → exact.
-        torch.testing.assert_close(y_m, y_full[:m], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(y_m, y_full[:m], rtol=0.0, atol=0.0)
 
 
 @cuda_required
 def test_w6a8_source_format_sets_act_fmt():
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import quantize_dense_weight_to_fp6
+    from b12x.quantization.mxfp6.fp6_dense_weights import quantize_dense_weight_to_fp6
 
     w = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
     w6a8 = quantize_dense_weight_to_fp6(w, source_format="mxfp6_w6a8")
@@ -98,11 +83,10 @@ def test_w6a8_source_format_sets_act_fmt():
     ],
 )
 def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
-    """Phase 4.1: fused quant→GEMM must produce the same output as the
-    standalone-quant + GEMM path (bit-identical)."""
-    import sparkinfer._lib.dense_gemm as _dense_mod
-    import sparkinfer.quantization.mxfp6.fp6_dense_weights as _wmod
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    """Fused m=1 quantization is exact; larger M keeps the same kernel."""
+    import b12x._lib.dense_gemm as _dense_mod
+    import b12x.quantization.mxfp6.fp6_dense_weights as _wmod
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -114,6 +98,18 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     )
     x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 0.2
 
+    # Require the m=1 arms to resolve distinct compiled kernels so the
+    # comparison exercises both code paths. Live M is not itself a compile key.
+    resolved: list[object] = []
+    _resolve = _dense_mod._get_compiled_dense_gemm_mxfp6
+
+    def _spy(*args, **kwargs):
+        compiled = _resolve(*args, **kwargs)
+        resolved.append(compiled)
+        return compiled
+
+    monkeypatch.setattr(_dense_mod, "_get_compiled_dense_gemm_mxfp6", _spy)
+
     monkeypatch.setattr(_dense_mod, "_DENSE_FUSED_QUANT", False)
     monkeypatch.setattr(_wmod, "_DENSE_FUSED_QUANT", False)
     y_unfused = dense_fp6_linear(x, fp6w)
@@ -122,17 +118,31 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     monkeypatch.setattr(_wmod, "_DENSE_FUSED_QUANT", True)
     y_fused = dense_fp6_linear(x, fp6w)
 
+    assert len(resolved) == 2, f"expected one GEMM per arm, got {len(resolved)}"
+    if m == 1:
+        assert resolved[0] is not resolved[1], (
+            "fused and unfused arms resolved the SAME compiled kernel; the "
+            "compile cache key is blind to the fused-quant flag, so this "
+            "comparison is vacuous"
+        )
+    else:
+        assert resolved[0] is resolved[1], (
+            f"the fused prologue must be inert at m={m}: it derives one "
+            "per-tensor global scale, so enabling it above m=1 would drop "
+            "per-row activation scaling and make a row's output depend on "
+            "which other rows share its launch"
+        )
+
     assert y_fused.shape == y_unfused.shape
     assert torch.isfinite(y_fused).all()
+    # Both arms are bit-identical at every m: at m=1 the two paths derive the
+    # same per-tensor scale, and above m=1 the flag is inert. The cosine is a
+    # readable first failure message; assert_close at zero tolerance is the
+    # gate, and no m gets a tolerance — that would re-admit the per-tensor
+    # downgrade this parametrization exists to forbid.
     cos = _cos(y_fused, y_unfused)
-    if m == 1:
-        # m=1: both paths use per-tensor scaling → bit-identical.
-        assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
-        torch.testing.assert_close(y_fused, y_unfused, rtol=0, atol=0)
-    else:
-        # m>1: unfused uses per-row activation scaling (deterministic) while
-        # fused uses per-tensor; different quantization → close but not equal.
-        assert cos > 0.99, f"fused/unfused cosine sim {cos:.6f} < 0.99"
+    assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
+    torch.testing.assert_close(y_fused, y_unfused, rtol=0, atol=0)
 
 
 @cuda_required
@@ -149,7 +159,7 @@ def test_dense_fp6_linear_deterministic(m, n, k):
     """dense_fp6_linear must produce bit-identical output on every call
     for the same input.  Covers small-M decode (m=1), mid-M (m=128),
     and large-M prefill/KLD-scoring (m=2048) paths."""
-    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+    from b12x.quantization.mxfp6.fp6_dense_weights import (
         dense_fp6_linear,
         quantize_dense_weight_to_fp6,
     )
@@ -171,10 +181,10 @@ def test_dense_fp6_linear_deterministic(m, n, k):
 
 
 class TestPackedGemmTPAware:
-    """Phase 3.1: use_packed_gemm must use full (unsharded) N, not per-GPU N."""
+    """Packed-weight policy uses full, unsharded N."""
 
     def _make_weight(self, out_f, in_f, *, unsharded=0):
-        from sparkinfer.quantization.mxfp6.fp6_dense_weights import FP6DenseWeight
+        from b12x.quantization.mxfp6.fp6_dense_weights import FP6DenseWeight
 
         return FP6DenseWeight(
             packed=torch.empty(out_f, (3 * in_f) // 4, dtype=torch.uint8),

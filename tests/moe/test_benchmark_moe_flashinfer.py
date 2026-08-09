@@ -10,7 +10,7 @@ from benchmarks.benchmark_moe import (
     _dequant_nvfp4_expert,
     _requantize_flashinfer_mxfp4_stack,
 )
-from sparkinfer._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics import swizzle_block_scale
 
 
 def test_dequant_mxfp4_expert_applies_e8m0_k32_scale() -> None:

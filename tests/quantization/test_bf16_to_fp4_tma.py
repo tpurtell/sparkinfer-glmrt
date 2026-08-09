@@ -10,13 +10,13 @@ import sys
 import pytest
 import torch
 
-from sparkinfer._lib.intrinsics import as_grouped_scale_view, quantize_grouped_nvfp4_torch
-from sparkinfer.quantization.nvfp4._impl import (
+from b12x._lib.intrinsics import as_grouped_scale_view, quantize_grouped_nvfp4_torch
+from b12x.quantization.nvfp4._impl import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,
 )
 
-from tests._reference.helpers import dequantize_grouped_nvfp4, require_sparkinfer
+from tests._reference.helpers import dequantize_grouped_nvfp4, require_b12x
 
 
 def _reference(
@@ -86,7 +86,7 @@ _RESOURCE_SHAPES = [
 def test_dsl_compile_option_provenance_is_fresh_process_stable(
     tmp_path: Path,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     script = r"""
 import json
 import hashlib
@@ -94,13 +94,13 @@ import os
 from pathlib import Path
 import sys
 
-os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = sys.argv[1]
+os.environ["B12X_COMPILE_CACHE_DIR"] = sys.argv[1]
 
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.compiler import OptLevel
 
-from sparkinfer._lib.compiler import (
+from b12x._lib.compiler import (
     _compile_kwargs_json_key,
     _dsl_compile_options_kwargs_key,
 )
@@ -109,7 +109,7 @@ from validation.cutlass_migration.core.comparison_identity import (
     normalize_comparison_compile_options,
     normalize_comparison_compile_environment,
 )
-from sparkinfer.quantization.nvfp4._impl import (
+from b12x.quantization.nvfp4._impl import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,
 )
@@ -182,7 +182,7 @@ package_runtime = (
     "/tmp/site-packages/nvidia_cutlass_dsl/cu13/lib/"
     "libcute_dsl_runtime.so"
 )
-custom_runtime = "/opt/sparkinfer-custom/libserving_runtime.so"
+custom_runtime = "/opt/b12x-custom/libserving_runtime.so"
 synthetic_raw_environment = [
     ["CUDA_PATH", "/opt/cuda"],
     ["CUTE_DSL_LIBS", package_runtime + os.pathsep + custom_runtime],
@@ -248,7 +248,7 @@ print(json.dumps(result, sort_keys=True))
 def test_bf16_to_fp4_tma_compile_identity_separates_strategy_and_mac(
     tmp_path: Path,
 ) -> None:
-    require_sparkinfer()
+    require_b12x()
     cache_dir = tmp_path / "compile-cache"
     script = r"""
 import json
@@ -256,12 +256,12 @@ import os
 from pathlib import Path
 import sys
 
-os.environ["SPARKINFER_CUTE_COMPILE_CACHE_DIR"] = sys.argv[1]
+os.environ["B12X_COMPILE_CACHE_DIR"] = sys.argv[1]
 
 import torch
 
-import sparkinfer.quantization.nvfp4._impl as quantization
-from sparkinfer._lib.compiler import clear_compile_cache, compile_cache_info
+import b12x.quantization.nvfp4._impl as quantization
+from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
 clear_compile_cache()
 quantization._KERNEL_CACHE.clear()
@@ -348,7 +348,7 @@ def test_bf16_to_fp4_tma_eager_exact(
     K: int,
     global_scale_value: float,
 ) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     source = _random_source(
         device,
         M,
@@ -384,7 +384,7 @@ def test_bf16_to_fp4_tma_graph_replay_exact(
     K: int,
     global_scale_value: float,
 ) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     source = _random_source(
         device,
         M,
@@ -483,7 +483,7 @@ def test_bf16_to_fp4_tma_graph_replay_exact(
 
 
 def test_bf16_to_fp4_tma_fp8_scale_boundaries_graph_exact() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     M = K = 128
     # Each group of 16 values targets one E4M3 scale encoding. This spans
     # zero, two subnormal values, the minimum normal value, and both sides of
@@ -623,7 +623,7 @@ def test_bf16_to_fp4_tma_fp8_scale_boundaries_graph_exact() -> None:
 
 
 def test_bf16_to_fp4_tma_rejects_invalid_capacity_and_aliasing() -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     with pytest.raises(ValueError, match="multiples"):
         compile_bf16_to_fp4_tma(127, 128)
     with pytest.raises(ValueError, match="multiples"):

@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 """Offline-quantize BF16 MoE expert weights to MX-FP6 (W6A6) and save them.
 
-The output file fed the historical ``b12x.integration.tp_moe.b12x_moe_fp6`` host
-API directly; upstream the consumer is ``sparkinfer.moe.fused_moe`` (load with
-``sparkinfer.quantization.mxfp6.load_fp6_moe_weights``). Activations are NOT quantized here:
+The output is consumed by ``b12x.moe.fused_moe`` (load with
+``b12x.quantization.mxfp6.load_fp6_moe_weights``). Activations are NOT quantized here:
 they are quantized on the fly inside the kernel at inference time.
 
 Input checkpoint (``--input``) must be a safetensors file containing BF16
@@ -27,7 +26,7 @@ import argparse
 
 import torch
 
-from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6, save_fp6_moe_weights
+from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6, save_fp6_moe_weights
 
 
 def _pick(d: dict, *keys: str) -> torch.Tensor:

@@ -5,13 +5,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[2]
-TRELLIS_SOURCE_DIR = ROOT / "sparkinfer" / "gemm" / "trellis_linear" / "csrc"
+TRELLIS_SOURCE_DIR = ROOT / "b12x" / "gemm" / "trellis_linear" / "csrc"
 
 
 def test_trellis_runtime_sources_and_license_are_in_source_manifest() -> None:
     manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
     assert (
-        "recursive-include sparkinfer/gemm/trellis_linear/csrc *.cu *.cuh *.h LICENSE*"
+        "recursive-include b12x/gemm/trellis_linear/csrc *.cu *.cuh *.h LICENSE*"
     ) in manifest.splitlines()
 
     required = (

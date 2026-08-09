@@ -2,28 +2,28 @@
 from __future__ import annotations
 
 # TODO(port): the kernel-equivalence half of this suite drove the historical
-# b12x.integration.tp_moe host API, which has no upstream sparkinfer equivalent.
+# b12x.integration.tp_moe host API, which is not part of the current API.
 # The test is kept as reference behind pytest.skip("pending: fused_moe-based
-# rewrite"); rewrite it against the sparkinfer.moe.fused_moe plan/bind/run flow
+# rewrite"); rewrite it against the b12x.moe.fused_moe plan/bind/run flow
 # once the w6a8_mx run path lands.
 
 import pytest
 import torch
 
-from sparkinfer._lib.intrinsics import swizzle_block_scale
-from sparkinfer._lib.fp6 import (
+from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.fp6 import (
     FLOAT6_E2M3_MAX,
     SF_VEC_SIZE_FP6,
     _ue8m0_scale_from_block_max,
     quantize_grouped_mxfp6_torch,
 )
-from sparkinfer.quantization.mxfp6 import (
+from b12x.quantization.mxfp6 import (
     FP6MoEWeights,
     load_fp6_moe_weights,
     quantize_moe_weights_to_fp6,
     save_fp6_moe_weights,
 )
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def _reference_recipe(w1_bf, w2_bf, *, fmt="e2m3"):
@@ -55,10 +55,10 @@ def _reference_recipe(w1_bf, w2_bf, *, fmt="e2m3"):
 
 
 def _run_kernel(x, weights: FP6MoEWeights, topk_ids, topk_weights):
-    # TODO(port): drove the historical b12x.integration.tp_moe host API, which
-    # has no upstream sparkinfer equivalent; rewrite against the
-    # sparkinfer.moe.fused_moe plan/bind/run flow once the w6a8_mx run path lands.
-    from b12x.integration.tp_moe import (  # historical b12x reference (see TODO)
+    # TODO(port): drove the retired pre-facade b12x.integration.tp_moe host API, which
+    # is not part of the current API; rewrite against the
+    # b12x.moe.fused_moe plan/bind/run flow once the w6a8_mx run path lands.
+    from b12x.integration.tp_moe import (  # retired pre-facade API (see TODO)
         allocate_tp_moe_workspace,
         b12x_moe_fp6,
         clear_tp_moe_caches,
@@ -88,7 +88,7 @@ def _cos(a, b):
 
 def test_fp6_moe_weight_pipeline_roundtrip_and_equivalence(tmp_path) -> None:
     pytest.skip("pending: fused_moe-based rewrite")
-    require_sparkinfer()
+    require_b12x()
     device = torch.device("cuda")
     m, k, n, experts, topk = 4, 128, 128, 2, 1
     torch.manual_seed(11)

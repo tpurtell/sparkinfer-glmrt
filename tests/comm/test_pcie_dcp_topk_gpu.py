@@ -7,21 +7,40 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from cuda.bindings import runtime as cudart
 
-from sparkinfer.comm.pcie.pcie_dcp_topk import (
+from b12x.comm.pcie.pcie_dcp_topk import (
     PCIeDCPTopKOwnerExchange,
-    _load_extension,
     owner_stage_reference,
 )
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_DCP_TOPK_TEST") != "1",
-    reason="set SPARKINFER_RUN_PCIE_DCP_TOPK_TEST=1 to run GPU tests",
+    os.getenv("B12X_RUN_PCIE_DCP_TOPK_TEST") != "1",
+    reason="set B12X_RUN_PCIE_DCP_TOPK_TEST=1 to run GPU tests",
 )
 
 MAX_ROWS = 64
 TOPK = 2048
+
+
+def _cuda_graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
+    graph_handle = graph.raw_cuda_graph()
+    result, _, num_nodes = cudart.cudaGraphGetNodes(graph_handle)
+    assert result == cudart.cudaError_t.cudaSuccess
+    result, nodes, returned_nodes = cudart.cudaGraphGetNodes(
+        graph_handle,
+        num_nodes,
+    )
+    assert result == cudart.cudaError_t.cudaSuccess
+    assert returned_nodes == num_nodes
+    kernel_type = cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+    kernel_count = 0
+    for node in nodes[:num_nodes]:
+        result, node_type = cudart.cudaGraphNodeGetType(node)
+        assert result == cudart.cudaError_t.cudaSuccess
+        kernel_count += node_type == kernel_type
+    return kernel_count
 
 
 def _free_port() -> int:
@@ -104,9 +123,15 @@ def _worker(
         eager_output_ptrs = []
         for step, rows in enumerate(test_rows):
             local_indices, local_scores = _inputs(step, rank, rows, device)
+            wrong_device = (rank + 1) % tp_world_size
+            if step == 0:
+                torch.cuda.set_device(wrong_device)
             candidate_indices, candidate_scores = owner.stage_candidates(
                 local_indices, local_scores
             )
+            if step == 0:
+                assert torch.cuda.current_device() == wrong_device
+                torch.cuda.set_device(rank)
             eager_output_ptrs.append(candidate_indices.data_ptr())
             torch.cuda.synchronize(device)
 
@@ -118,6 +143,19 @@ def _worker(
                 torch.stack([item[1] for item in rank_inputs]),
                 dcp_rank,
             )
+            if not torch.equal(candidate_indices, expected_indices):
+                mismatch = (candidate_indices != expected_indices).nonzero()
+                details = [
+                    (
+                        tuple(int(value) for value in index.tolist()),
+                        int(candidate_indices[tuple(index)].item()),
+                        int(expected_indices[tuple(index)].item()),
+                    )
+                    for index in mismatch[:16]
+                ]
+                raise AssertionError(
+                    f"rank={rank} step={step} rows={rows} index mismatches={details}"
+                )
             torch.testing.assert_close(
                 candidate_indices, expected_indices, rtol=0, atol=0
             )
@@ -142,9 +180,9 @@ def _worker(
             dtype=torch.float32,
             device=device,
         )
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
         dist.barrier()
-        with torch.cuda.graph(graph):
+        with graph_owner.capture(), torch.cuda.graph(graph):
             graph_candidate_indices, graph_candidate_scores = (
                 graph_owner.stage_candidates(graph_indices, graph_scores)
             )
@@ -155,10 +193,29 @@ def _worker(
             consumed_indices.copy_(graph_candidate_indices)
             consumed_scores.copy_(graph_candidate_scores)
 
+        # The transport remains one kernel node. Rank zero's deliberate skew
+        # contributes the only additional kernel; the two consumers are memcpy
+        # nodes. The fixed-slot safety barrier is part of the transport kernel.
+        assert _cuda_graph_kernel_count(graph) == 1 + int(dcp_rank == 0)
+        assert graph_owner._graph_slot is not None
+        graph_views = graph_owner._candidate_views[graph_owner._graph_slot]
+        assert (
+            graph_candidate_indices.data_ptr()
+            == graph_views[0].data_ptr()
+        )
+        assert (
+            graph_candidate_scores.data_ptr()
+            == graph_views[1].data_ptr()
+        )
+        assert graph_candidate_indices.data_ptr() == graph_owner._staging_ptrs[
+            graph_owner._graph_slot
+        ][dcp_rank]
+
         # Queue several replays without host/device synchronization. Every
         # replay writes the capture-stable slab, then consumes it on the same
-        # stream before the next replay can overwrite it.
-        replay_steps = tuple(range(20, 24))
+        # stream. The next replay's in-kernel peer barrier prevents any rank
+        # from overwriting it until all prior consumers have retired.
+        replay_steps = tuple(range(20, 27))
         replay_inputs = [
             _inputs(replay_step, rank, graph_rows, device)
             for replay_step in replay_steps
@@ -203,8 +260,8 @@ def _worker(
 def test_pcie_dcp_topk_exact_owner_exchange():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    tp_world_size = int(os.getenv("SPARKINFER_PCIE_DCP_TOPK_TP", "8"))
-    dcp_world_size = int(os.getenv("SPARKINFER_PCIE_DCP_TOPK_DCP", "4"))
+    tp_world_size = int(os.getenv("B12X_PCIE_DCP_TOPK_TP", "8"))
+    dcp_world_size = int(os.getenv("B12X_PCIE_DCP_TOPK_DCP", "4"))
     if (
         tp_world_size not in (2, 3, 4, 6, 8)
         or dcp_world_size not in (2, 3, 4, 6, 8)
@@ -213,7 +270,6 @@ def test_pcie_dcp_topk_exact_owner_exchange():
         pytest.skip("unsupported TP/DCP top-k geometry")
     if torch.cuda.device_count() < tp_world_size:
         pytest.skip(f"need {tp_world_size} CUDA devices")
-    _load_extension()
     mp.spawn(
         _worker,
         args=(tp_world_size, dcp_world_size, _free_port()),

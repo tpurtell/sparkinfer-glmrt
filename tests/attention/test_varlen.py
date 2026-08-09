@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from ..conftest import require_sparkinfer as require_sm120
+from ..conftest import require_b12x as require_sm120
 
 
 def _require_contiguous_backend() -> torch.device:
@@ -26,8 +26,8 @@ def _run_attention_with_plan(
     softmax_scale: Optional[float] = None,
     attention_sink_bias: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from sparkinfer.attention._shared.contiguous import (
-        sparkinfer_attention_forward,
+    from b12x.attention._shared.contiguous import (
+        b12x_attention_forward,
         plan_attention_scratch,
     )
 
@@ -42,7 +42,7 @@ def _run_attention_with_plan(
         softmax_scale=softmax_scale,
         attention_sink_bias=attention_sink_bias,
     )
-    return sparkinfer_attention_forward(binding=binding)
+    return b12x_attention_forward(binding=binding)
 
 
 def _run_varlen_attention_with_plan(
@@ -59,8 +59,8 @@ def _run_varlen_attention_with_plan(
     softmax_scale: Optional[float] = None,
     attention_sink_bias: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from sparkinfer.attention._shared.contiguous import (
-        sparkinfer_varlen_attention_forward,
+    from b12x.attention._shared.contiguous import (
+        b12x_varlen_attention_forward,
         plan_varlen_attention_scratch,
     )
 
@@ -80,7 +80,7 @@ def _run_varlen_attention_with_plan(
         softmax_scale=softmax_scale,
         attention_sink_bias=attention_sink_bias,
     )
-    return sparkinfer_varlen_attention_forward(binding=binding)
+    return b12x_varlen_attention_forward(binding=binding)
 
 
 def _vision_reference_attention_segment(
@@ -348,7 +348,7 @@ def test_contiguous_attention_matches_sglang_torch_ref(
     window_size: Tuple[int, int],
 ) -> None:
     device = _require_contiguous_backend()
-    from sparkinfer.attention._shared.contiguous import (
+    from b12x.attention._shared.contiguous import (
         clear_attention_caches,
         create_attention_plan,
     )
@@ -387,7 +387,7 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
     None
 ):
     device = _require_contiguous_backend()
-    from sparkinfer.attention._shared.contiguous import (
+    from b12x.attention._shared.contiguous import (
         clear_attention_caches,
         create_varlen_attention_plan,
     )

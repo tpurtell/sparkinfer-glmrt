@@ -25,7 +25,7 @@ rp-contiguous unit covers logical rows {r, r+8, r+16, r+24} at one k-window
 import pytest
 import torch
 
-from sparkinfer.moe.fused_moe._impl import (
+from b12x.moe.fused_moe._impl import (
     _e8m0_scale_to_w4a8_sfb_inplace,
     _logical_weight_to_w4a8_rp_inplace,
 )

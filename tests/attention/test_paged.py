@@ -2,7 +2,7 @@
 the eager public lifecycle (plan -> bind -> run), BF16 and FP8 KV — the same
 call sequence vLLM's integration uses.
 
-Note: sparkinfer's paged CUDA-graph replay tests are stale against the current
+Note: b12x's paged CUDA-graph replay tests are stale against the current
 decode-graph planner heuristics (they fail upstream too), so they were not
 ported; graph coverage for the attention family comes from
 test_compressed_mla.py until they are refreshed.
@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.attention import paged
-from sparkinfer.attention.paged.reference import (
+from b12x.attention import paged
+from b12x.attention.paged.reference import (
     paged_attention_reference,
 )
 
@@ -21,7 +21,7 @@ from .._reference.paged_attention_helpers import (
     make_paged_inputs,
     quantize_paged_kv_cache_e4m3,
 )
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def _run_eager(
@@ -86,7 +86,7 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def test_run_decode_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 1, 1, 1],
         cache_seqlens=[64, 128, 192, 256],
@@ -105,7 +105,7 @@ def test_run_decode_matches_reference() -> None:
 
 
 def test_run_decode_fp8_kv_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 1, 1, 1],
         cache_seqlens=[64, 192, 256, 448],
@@ -143,7 +143,7 @@ def test_run_decode_fp8_kv_matches_reference() -> None:
 
 
 def test_run_extend_matches_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[8, 16],
         cache_seqlens=[128, 192],

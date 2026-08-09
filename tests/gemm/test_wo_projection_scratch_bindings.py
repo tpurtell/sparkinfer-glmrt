@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-import sparkinfer.gemm._shared.wo_mxfp8 as wo_impl
-from sparkinfer.gemm._shared.wo_mxfp8 import WOProjectionBinding, WOProjectionInvRopeBinding, WOProjectionScratchCaps, empty_mxfp8_rows_for_dense_gemm, plan_wo_projection_scratch
-from sparkinfer.gemm._shared.wo_mxfp8 import WOProjectionMXFP8Weights
+import b12x.gemm._shared.wo_mxfp8 as wo_impl
+from b12x.gemm._shared.wo_mxfp8 import WOProjectionBinding, WOProjectionInvRopeBinding, WOProjectionScratchCaps, empty_mxfp8_rows_for_dense_gemm, plan_wo_projection_scratch
+from b12x.gemm._shared.wo_mxfp8 import WOProjectionMXFP8Weights
 
 
 def _weights(
@@ -198,24 +198,11 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         calls["rope_dim"] = rope_dim
         calls["clear_output"] = clear_output
 
-    def fake_wo_a(x_q, wo_a, *, out, expected_m=None, stream=None, **kwargs):
-        calls["x_q"] = x_q
-        calls["wo_a"] = wo_a
-        calls["tmp_out"] = out
-        calls["expected_m"] = expected_m
-        calls["wo_a_stream"] = stream
-        return out
-
-    def fake_wo_b(tmp, wo_b, *, out, expected_m=None, stream=None, **kwargs):
-        calls["tmp"] = tmp
-        calls["wo_b"] = wo_b
-        calls["output_out"] = out
-        calls["wo_b_stream"] = stream
-        return out
-
-    monkeypatch.setattr(wo_impl, "_run_wo_a_quant_kernel", fake_quantize)
-    monkeypatch.setattr(wo_impl, "wo_a_dense_gemm_mxfp8", fake_wo_a)
-    monkeypatch.setattr(wo_impl, "wo_b_dense_gemm_fused_quant_mxfp8", fake_wo_b)
+    monkeypatch.setattr(
+        wo_impl.torch.ops.b12x,
+        "wo_projection_inv_rope_mxfp8_fused",
+        fake_fused,
+    )
 
     out = wo_impl.wo_projection_inv_rope_mxfp8(binding=binding, stream=123)
 

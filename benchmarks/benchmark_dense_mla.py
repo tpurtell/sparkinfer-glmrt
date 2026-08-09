@@ -17,7 +17,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sparkinfer.attention import dense_mla
+from b12x.attention import dense_mla
 
 FP8 = torch.float8_e4m3fn
 
@@ -37,7 +37,7 @@ def _source_sha256() -> str:
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parents[1]
     paths = [
-        *sorted((root / "sparkinfer/attention/dense_mla").glob("*.py")),
+        *sorted((root / "b12x/attention/dense_mla").glob("*.py")),
         Path(__file__).resolve(),
     ]
     for path in paths:

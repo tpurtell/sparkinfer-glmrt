@@ -1,6 +1,6 @@
-# SparkInfer MX-FP6: classification, accuracy (KLD) and performance results
+# B12X MX-FP6: classification, accuracy (KLD) and performance results
 
-Reference numbers for the SparkInfer MX-FP6 quantization as validated on the
+Reference numbers for the B12X MX-FP6 quantization as validated on the
 Qwen3.6 family. Companion document: `fp6-user-guide.md` (how to make and run
 an FP6 quant). Kernel-level format details: `mxfp6-w6a8.md`; vLLM wiring:
 `mxfp6-vllm-integration.md`.
@@ -56,7 +56,7 @@ correctly-rounded-division re-baseline:
 
 | Model | Mean KLD | Determinism |
 |---|---|---|
-| Qwen3.6-27B (dense, W6A8 runtime) | **0.034599** | bit-identical across 3 runs, including the `SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0` host-chain fallback |
+| Qwen3.6-27B (dense, W6A8 runtime) | **0.034599** | bit-identical across 3 runs, including the `B12X_DENSE_PER_ROW_IN_KERNEL=0` host-chain fallback |
 | Qwen3.6-35B-A3B (MoE, W6A8 runtime) | **0.015388** | bit-identical across 2 runs |
 
 Notes:

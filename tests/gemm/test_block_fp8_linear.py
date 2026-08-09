@@ -1,20 +1,20 @@
 """gemm.block_fp8_linear: quantized-reference parity + the planned lifecycle
 (plan -> bind -> run) replaying under CUDA-graph capture.
 
-Curated from sparkinfer tests/test_gemm_block_fp8_linear.py; kernel-reuse and
-regime-policy tests stay in the sparkinfer repo.
+Curated from b12x tests/test_gemm_block_fp8_linear.py; kernel-reuse and
+regime-policy tests stay in the b12x repo.
 """
 
 from __future__ import annotations
 
 import torch
 
-from sparkinfer.gemm import block_fp8_linear as bfl
-from sparkinfer.gemm._shared.wo_mxfp8 import (
+from b12x.gemm import block_fp8_linear as bfl
+from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
 )
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def _make_block_fp8_weight(
@@ -48,7 +48,7 @@ def _reference(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor):
 
 
 def test_run_matches_quantized_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260523)
 
     tokens, in_features, out_features = 7, 256, 384
@@ -68,7 +68,7 @@ def test_run_matches_quantized_reference() -> None:
 
 
 def test_plan_bind_run_replays_under_cuda_graph() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260526)
 
     tokens, in_features, out_features = 1, 128, 256

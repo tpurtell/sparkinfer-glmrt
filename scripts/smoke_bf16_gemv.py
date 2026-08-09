@@ -17,8 +17,8 @@ Run it in BOTH venvs and compare:
     ~/kld-nightly-vllm/venv/bin/python scripts/smoke_bf16_gemv.py --n 96 --k 5120
 
 Use the real in_proj_ba (N, K) from the server log line
-"sparkinfer FP6: small-N bf16 GEMV for ... (N=..., K=...)". To rule the disk cache
-in/out, rerun with SPARKINFER_COMPILE_DISK_CACHE=0.
+"b12x FP6: small-N bf16 GEMV for ... (N=..., K=...)". To rule the disk cache
+in/out, rerun with B12X_COMPILE_DISK_CACHE=0.
 """
 from __future__ import annotations
 
@@ -46,9 +46,9 @@ def main() -> None:
         flush=True,
     )
 
-    from sparkinfer._lib.compiler import compile_cache_info
-    from sparkinfer.gemm.bf16_gemv import SMALL_M_MAX
-    from sparkinfer.gemm.bf16_gemv._kernel import compile_bf16_gemv_small_n
+    from b12x._lib.compiler import compile_cache_info
+    from b12x.gemm.bf16_gemv import SMALL_M_MAX
+    from b12x.gemm.bf16_gemv._kernel import compile_bf16_gemv_small_n
 
     n, k = args.n, args.k
     m_max = args.m_max or SMALL_M_MAX

@@ -12,12 +12,12 @@ Run: CUDA_VISIBLE_DEVICES=0 python tests/test_tp_moe_prequant_parity.py
 
 import torch
 
-from sparkinfer.moe.fused_moe._impl import (
+from b12x.moe.fused_moe._impl import (
     TPMoEScratchCaps,
-    sparkinfer_moe_fp4,
-    plan_sparkinfer_fp4_moe_weights,
+    b12x_moe_fp4,
+    plan_b12x_fp4_moe_weights,
     plan_tp_moe_scratch,
-    prepare_sparkinfer_fp4_moe_weights,
+    prepare_b12x_fp4_moe_weights,
 )
 
 E, M, K, N_TP, TOPK = 32, 64, 6144, 512, 8
@@ -45,7 +45,7 @@ def main() -> None:
     a1_gs = torch.full((1,), 1.7, dtype=torch.float32, device=device)
     a2_gs = torch.ones(1, dtype=torch.float32, device=device)
 
-    weight_plan = plan_sparkinfer_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="nvfp4",
         source_format="modelopt_nvfp4",
         activation="silu",
@@ -55,7 +55,7 @@ def main() -> None:
         intermediate_size=N_TP,
         w13_layout="w31",
     )
-    prepared = prepare_sparkinfer_fp4_moe_weights(
+    prepared = prepare_b12x_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=w1_fp4,
         w1_blockscale=w1_bs,
@@ -102,7 +102,7 @@ def main() -> None:
             a_prequant=a_prequant,
             a_prequant_scale=a_prequant_scale,
         )
-        sparkinfer_moe_fp4(binding=binding)
+        b12x_moe_fp4(binding=binding)
         torch.cuda.synchronize()
         return out
 

@@ -6,13 +6,13 @@ import weakref
 import pytest
 import torch
 
-from sparkinfer.attention.paged._scratch import (
-    SPARKINFERPagedAttentionScratchCaps,
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
     plan_paged_attention_scratch,
 )
-from sparkinfer.attention.paged.reference import paged_attention_reference
+from b12x.attention.paged.reference import paged_attention_reference
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 from tests._reference.paged_attention_helpers import make_paged_inputs
 
 
@@ -47,7 +47,7 @@ def _make_decode_plan(
     max_partial_rows: int = 512,
 ):
     plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="decode",
             dtype=q.dtype,
@@ -163,7 +163,7 @@ def _assert_matches_reference(
 @torch.inference_mode()
 def test_compact_decode_graph_metadata_covers_every_query_tile() -> None:
     """GQA 128 / D256 has eight metadata query tiles at CTA tile Q=16."""
-    require_sparkinfer()
+    require_b12x()
     batch = 2
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
         make_paged_inputs(
@@ -281,7 +281,7 @@ def test_compact_decode_graph_metadata_covers_every_query_tile() -> None:
 @torch.inference_mode()
 def test_prebound_decode_graph_run_pins_owning_plan_replay_state() -> None:
     """Capturing only ``binding.run()`` must pin the Plan's addresses."""
-    require_sparkinfer()
+    require_b12x()
     batch = 2
     page_table_width = 66
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
@@ -407,7 +407,7 @@ def test_prebound_decode_graph_run_pins_owning_plan_replay_state() -> None:
 @torch.inference_mode()
 def test_decode_graph_plan_owned_replay_state_survives_shared_scratch_and_big_pid() -> None:
     """Two Plans may share numerical scratch without sharing replay metadata."""
-    require_sparkinfer()
+    require_b12x()
     batch = 2
     page_size = 64
     page_table_width = 66

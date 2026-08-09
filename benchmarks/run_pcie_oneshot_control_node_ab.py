@@ -21,8 +21,8 @@ from contextlib import suppress
 from pathlib import Path
 
 
-RUN_SCHEMA = {"name": "sparkinfer.pcie_oneshot_control_node.run", "version": 3}
-SUITE_SCHEMA = {"name": "sparkinfer.pcie_oneshot_control_node.ab_suite", "version": 3}
+RUN_SCHEMA = {"name": "b12x.pcie_oneshot_control_node.run", "version": 3}
+SUITE_SCHEMA = {"name": "b12x.pcie_oneshot_control_node.ab_suite", "version": 3}
 RUN_TOP_LEVEL_KEYS = {
     "schema",
     "contract",
@@ -362,7 +362,7 @@ def _validate_run(
     if set(provenance) != PROVENANCE_KEYS:
         raise ValueError("run provenance schema mismatch")
     expected_module = (
-        implementation_root / "sparkinfer/comm/pcie/pcie_oneshot.py"
+        implementation_root / "b12x/comm/pcie/pcie_oneshot.py"
     ).resolve()
     expected_source = expected_module.with_suffix(".cu")
     if Path(provenance["module_path"]).resolve() != expected_module:

@@ -35,9 +35,9 @@ import argparse
 import torch
 import torch.nn.functional as F
 
-from sparkinfer._lib.fp6 import _decode_fp6_e2m3, _decode_fp6_e3m2
-from sparkinfer.quantization.mxfp6.fp6_safetensors_export import _layer_expert_matrices
-from sparkinfer.quantization.mxfp6.model_fp6 import SafetensorsModel, discover_moe_experts
+from b12x._lib.fp6 import _decode_fp6_e2m3, _decode_fp6_e3m2
+from b12x.quantization.mxfp6.fp6_safetensors_export import _layer_expert_matrices
+from b12x.quantization.mxfp6.model_fp6 import SafetensorsModel, discover_moe_experts
 
 _FMT_MAX = {"e3m2": 28.0, "e2m3": 7.5, "e4m3": 448.0}
 _BLOCK = 32
@@ -170,7 +170,7 @@ def main() -> None:
 
     # Hidden states: real captured ones if provided, else unit-RMS gaussian.
     if args.x_from:
-        from sparkinfer.quantization.mxfp6.calib_io import load_hidden_states
+        from b12x.quantization.mxfp6.calib_io import load_hidden_states
 
         x = load_hidden_states(args.x_from, device=device)
         if x.shape[-1] != k:

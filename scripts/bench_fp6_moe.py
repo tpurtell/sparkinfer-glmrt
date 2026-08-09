@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Microbenchmark: sparkinfer W6A8 MX-FP6 fused MoE vs a BF16 grouped-MoE baseline.
+"""Microbenchmark: b12x W6A8 MX-FP6 fused MoE vs a BF16 grouped-MoE baseline.
 
-Drives the upstream ``sparkinfer.moe.fused_moe`` plan/bind/run flow with
+Drives the upstream ``b12x.moe.fused_moe`` plan/bind/run flow with
 ``quant_mode="w6a8_mx"`` / ``source_format="mxfp6_e2m3"`` across token counts,
 and compares against a straightforward BF16 grouped MoE (the same gated-SiLU
 math in full precision).  This is the Step 5 acceptance gate for the FP6 MoE
@@ -31,8 +31,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from benchmarks.fp6_common import bf16_grouped_moe, unswizzled_ue8m0_grid
-from sparkinfer.moe import fused_moe
-from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
+from b12x.moe import fused_moe
+from b12x.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
 
 def _time_ms(fn, warmup: int, iters: int) -> float:
@@ -76,10 +76,10 @@ def main() -> None:
             f"w6a8_mx requires K % 128 == 0 and N % 128 == 0, got K={k} N={n}"
         )
 
-    det = os.environ.get("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "")
+    det = os.environ.get("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "")
     print(
         "deterministic combine "
-        f"(SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT): {'ON' if det == '1' else 'off'}"
+        f"(B12X_DYNAMIC_DETERMINISTIC_OUTPUT): {'ON' if det == '1' else 'off'}"
     )
 
     print(f"quantizing random weights: E={e} K={k} N={n} topk={topk}")

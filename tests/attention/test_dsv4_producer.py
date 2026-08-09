@@ -2,23 +2,23 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.attention import dsv4_producer, nsa_indexer
-from sparkinfer.attention._shared.mla.compressed_reference import (
+from b12x.attention import dsv4_producer, nsa_indexer
+from b12x.attention._shared.mla.compressed_reference import (
     pack_compressed_mla_kv_cache_reference,
 )
-from sparkinfer.attention.dsv4_producer._impl import (
+from b12x.attention.dsv4_producer._impl import (
     DSV4_INDEX_WEIGHT_SCALE,
     DSV4_KV_PAGE_BYTES,
     _run_indexer_query_post,
     _run_normalize_query_rope,
     _run_normalize_rank_pack_kv,
 )
-from sparkinfer.attention.nsa_indexer.reference import (
+from b12x.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
 
-from ..conftest import require_sparkinfer
+from ..conftest import require_b12x
 
 
 def _rope_forward(
@@ -221,7 +221,7 @@ def test_indexer_caps_reject_cross_variant_or_non_native_geometry() -> None:
 
 
 def test_rank_norm_and_main_kv_pack_match_checkpoint_reference() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260804)
     tokens, q_rank, eps = 2, 1024, 1.0e-6
     qkv = (
@@ -268,7 +268,7 @@ def test_rank_norm_and_main_kv_pack_match_checkpoint_reference() -> None:
 
 
 def test_query_post_matches_per_head_rmsnorm_and_partial_rope() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260805)
     tokens, heads, eps = 2, 64, 1.0e-6
     query = (
@@ -294,7 +294,7 @@ def test_query_post_matches_per_head_rmsnorm_and_partial_rope() -> None:
 
 
 def test_indexer_query_post_matches_checkpoint_rope_hadamard_and_fp4_qat() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260807)
     tokens, heads = 2, 64
     raw_query = (
@@ -332,7 +332,7 @@ def test_indexer_query_post_matches_checkpoint_rope_hadamard_and_fp4_qat() -> No
 
 
 def test_indexer_query_feeds_physical_slot_topk_without_remap_allocation() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260808)
     device = torch.device("cuda")
     rows, heads, pages, topk = 2, 64, 12, 512
@@ -414,7 +414,7 @@ def test_indexer_query_feeds_physical_slot_topk_without_remap_allocation() -> No
 
 
 def test_full_indexer_producer_replays_without_serving_allocations() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260809)
     hidden, q_rank, heads, tokens = 4_096, 1_024, 64, 1
     wq_b, wq_b_scale = _block_fp8_weight(heads * 128, q_rank)
@@ -475,7 +475,7 @@ def test_full_indexer_producer_replays_without_serving_allocations() -> None:
 
 
 def test_full_flash_plan_replays_without_serving_allocations() -> None:
-    require_sparkinfer()
+    require_b12x()
     torch.manual_seed(20260806)
     hidden, q_rank, heads, tokens = 4096, 1024, 64, 1
     wq_a, wq_a_scale = _block_fp8_weight(q_rank, hidden)

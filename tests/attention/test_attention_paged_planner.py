@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparkinfer.attention.paged.planner import (
+from b12x.attention.paged.planner import (
     PagedPlanBudget,
     build_decode_chunk_pages_lut,
     create_paged_plan,
@@ -16,8 +16,8 @@ from sparkinfer.attention.paged.planner import (
     plan_verify_graph_capacity,
     resolve_decode_graph_ctas_per_sm,
 )
-from sparkinfer.attention.paged._scratch import (
-    SPARKINFERPagedAttentionScratchCaps,
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
     _paged_attention_scratch_layout,
     plan_decode_graph_scratch_envelope,
     plan_paged_attention_scratch,
@@ -138,7 +138,7 @@ def test_paged_scratch_shapes_follow_plan_metadata() -> None:
         cu_seqlens_q,
     )
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=q.device,
             mode="extend",
             dtype=q.dtype,
@@ -857,7 +857,7 @@ def test_decode_graph_scratch_envelope_covers_every_batch_layout(
     bucket_nbytes: list[int] = []
     for batch in range(1, max_batch + 1):
         capacity = plan_decode_graph_capacity(**geometry, batch=batch)
-        caps = SPARKINFERPagedAttentionScratchCaps(
+        caps = B12XPagedAttentionScratchCaps(
             device=geometry["device"],
             mode="decode",
             dtype=geometry["q_dtype"],
@@ -932,7 +932,7 @@ def test_decode_graph_scratch_envelope_applies_direct_only_storage_cap(
 
 
 def test_prepare_decode_graph_replay_state_respects_direct_only_caps() -> None:
-    caps = SPARKINFERPagedAttentionScratchCaps(
+    caps = B12XPagedAttentionScratchCaps(
         device=torch.device("cuda"),
         mode="decode",
         dtype=torch.bfloat16,
@@ -982,7 +982,7 @@ def test_prepare_windowed_decode_uses_nonmonotone_lut_worst_page_count() -> None
     assert capacity.worst_page_count < capacity.max_effective_kv_pages
 
     scratch_plan = plan_paged_attention_scratch(
-        SPARKINFERPagedAttentionScratchCaps(
+        B12XPagedAttentionScratchCaps(
             device=torch.device("cuda"),
             mode="decode",
             dtype=torch.bfloat16,
