@@ -16,6 +16,7 @@ from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
 from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 from b12x.moe._shared.kernels.w4a16.prepare import (
     PreparedW4A16MoeWeights,
+    prepare_trellis256_moe_weights,
     prepare_qsrt_atom_moe_weights,
     prepare_qsrt_pair_moe_weights,
 )
@@ -102,6 +103,52 @@ def test_weight_plan_accepts_true_two_bit_exl3_trellis() -> None:
             input_dtype=torch.bfloat16,
             trellis_bits=1,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_prepare_supplied_mcg_k2_tensors_zero_copy() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts, hidden, intermediate, bits = 2, 128, 128, 2
+    w13 = torch.empty(
+        (
+            2,
+            experts,
+            hidden // 16,
+            intermediate // 16,
+            16 * bits,
+        ),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.empty(
+        (
+            experts,
+            intermediate // 16,
+            hidden // 16,
+            16 * bits,
+        ),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    prepared = prepare_trellis256_moe_weights(
+        w13,
+        w2,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        activation="silu",
+        fc1_tile_n=128,
+        fc2_tile_n=128,
+        w13_layout="trellis3_t256_proj",
+        trellis_bits=bits,
+        codebook="mcg",
+    )
+
+    assert prepared.trellis_bits == bits
+    assert prepared.trellis_codebook == "mcg"
+    assert prepared.w13.data_ptr() == w13.data_ptr()
+    assert prepared.w2.data_ptr() == w2.data_ptr()
 
 
 def test_qsrt_atom_plan_is_explicit_and_fail_closed() -> None:

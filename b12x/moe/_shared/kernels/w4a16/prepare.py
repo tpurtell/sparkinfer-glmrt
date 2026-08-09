@@ -1769,10 +1769,10 @@ def prepare_trellis256_moe_weights(
                 f"trellis3_t256 w13/w2 bitrate mismatch: {w13_bits} vs {w2_bits}"
             )
         resolved_trellis_bits = w13_bits
-        if resolved_trellis_bits not in (3, 4, 5, 6):
+        if resolved_trellis_bits not in (2, 3, 4, 5, 6):
             raise ValueError(
-                "legacy EXL3 trellis3_t256 tensors must encode 3, 4, 5, or "
-                f"6 bpw, got {resolved_trellis_bits}"
+                "legacy EXL3 trellis3_t256 tensors must encode 2, 3, 4, 5, "
+                f"or 6 bpw, got {resolved_trellis_bits}"
             )
         if (
             requested_trellis_bits is not None
