@@ -50,7 +50,7 @@ META = OpMeta(
     provenance=Provenance(
         repo="https://github.com/local-inference-lab/sparkinfer",
         commit="native",
-        paths=("sparkinfer/attention/dsv4_compressor/_impl.py",),
+        paths=("b12x/attention/dsv4_compressor/_impl.py",),
     ),
     test_path="tests/attention/test_dsv4_compressor.py",
     since="0.8.0",

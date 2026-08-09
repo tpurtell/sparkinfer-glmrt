@@ -1,4 +1,4 @@
-"""Public surface for :mod:`sparkinfer.attention.dsv4_compressor`."""
+"""Public surface for :mod:`b12x.attention.dsv4_compressor`."""
 
 from __future__ import annotations
 

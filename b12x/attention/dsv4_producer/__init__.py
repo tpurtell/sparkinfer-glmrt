@@ -68,8 +68,8 @@ META = OpMeta(
         repo="https://github.com/local-inference-lab/sparkinfer",
         commit="native",
         paths=(
-            "sparkinfer/attention/dsv4_producer/_impl.py",
-            "sparkinfer/gemm/_shared/block_fp8.py",
+            "b12x/attention/dsv4_producer/_impl.py",
+            "b12x/gemm/_shared/block_fp8.py",
         ),
     ),
     test_path="tests/attention/test_dsv4_producer.py",
