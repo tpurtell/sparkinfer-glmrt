@@ -700,7 +700,9 @@ class UnifiedDecodeKernel:
         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
         q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
-        if cutlass.const_expr(t.has_extra_cache or t.latent_scale_per_token):
+        if cutlass.const_expr(
+            t.scale_format == ScaleFormat.UE8M0_BYTE or t.latent_scale_per_token
+        ):
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
         else:
             kv_sc_addr = Int32(0)
@@ -1517,7 +1519,9 @@ class UnifiedDecodeKernel:
         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
         q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
-        if cutlass.const_expr(t.has_extra_cache or t.latent_scale_per_token):
+        if cutlass.const_expr(
+            t.scale_format == ScaleFormat.UE8M0_BYTE or t.latent_scale_per_token
+        ):
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
         else:
             kv_sc_addr = Int32(0)
@@ -2322,7 +2326,9 @@ def _cache_block_stride_bytes(
         COMPRESSED_MLA_BYTES_PER_TOKEN,
     )
 
-    if int(model_type) == int(ModelType.GLM_NSA):
+    if record_bytes is not None:
+        expected = int(page_size) * int(record_bytes)
+    elif int(model_type) == int(ModelType.GLM_NSA):
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
@@ -2394,10 +2400,13 @@ def _sparse_mla_decode_grid_flat_launch(
         and _env_glm_h8_native_enabled()
     )
     native_dsv4_h8 = bool(
-        int(model_type) == int(ModelType.DSV4) and int(valid_hpb) == 8
+        int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) != int(ScaleFormat.NVFP4_E4M3)
+        and int(valid_hpb) == 8
     )
     native_dsv4_h16 = bool(
         int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) != int(ScaleFormat.NVFP4_E4M3)
         and int(valid_hpb) == 16
         and int(head_block_offset) == 0
         and (int(topk) + _CAND_WINDOW - 1) // _CAND_WINDOW
@@ -2849,7 +2858,13 @@ def run_unified_decode(
     if scale_format_override is not None:
         scale_format = int(scale_format_override)
     if scale_format == ScaleFormat.NVFP4_E4M3 and fp8_rope_override is None:
-        record_bytes = int(swa_k_cache.shape[-1])
+        cache_width = int(swa_k_cache.shape[-1])
+        record_bytes = (
+            432
+            if swa_k_cache.ndim == 2
+            and cache_width == int(swa_page_size) * 432
+            else cache_width
+        )
         if record_bytes not in (368, 432):
             raise ValueError(
                 f"NVFP4 cache record must be 368 or 432 bytes, got {record_bytes}"
@@ -2875,12 +2890,15 @@ def run_unified_decode(
         fp8_rope=fp8_rope_override,
         latent_scale_per_token=bool(latent_scale_per_token),
     )
-    if scale_format == ScaleFormat.NVFP4_E4M3 and int(swa_k_cache.shape[-1]) != int(
+    cache_record_bytes = int(swa_k_cache.shape[-1])
+    if swa_k_cache.ndim == 2:
+        cache_record_bytes //= int(swa_page_size)
+    if scale_format == ScaleFormat.NVFP4_E4M3 and cache_record_bytes != int(
         traits.kv_gmem_stride
     ):
         raise ValueError(
             "NVFP4 cache record width disagrees with fp8_rope_override: "
-            f"got {int(swa_k_cache.shape[-1])} bytes, expected "
+            f"got {cache_record_bytes} bytes, expected "
             f"{int(traits.kv_gmem_stride)}"
         )
     d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
@@ -2902,6 +2920,7 @@ def run_unified_decode(
 
     h16_allowed = bool(
         int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) != int(ScaleFormat.NVFP4_E4M3)
         and heads % 16 == 0
         and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
     )
@@ -2926,6 +2945,7 @@ def run_unified_decode(
         native_dsv4_h16 = bool(h16_allowed and h16_mode)
     native_dsv4_h8 = bool(
         int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) != int(ScaleFormat.NVFP4_E4M3)
         and heads % 8 == 0
         and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
         and not native_dsv4_h16
@@ -3104,6 +3124,7 @@ def run_unified_decode(
             indexed_k_cache,
             page_size=pbs_extra,
             model_type=int(model_type),
+            record_bytes=int(traits.kv_gmem_stride),
         )
         extra_kv_flat = _cache_base_tensor(indexed_k_cache)
         extra_indices_t = indexed_indices.contiguous()

@@ -14,7 +14,7 @@ import cutlass
 import cutlass.cute as cute
 
 from .smem import SM120_SMEM_CARVEOUT_BYTES
-from .traits import ComputeMode, UnifiedMLATraits
+from .traits import ComputeMode, ModelType, ScaleFormat, UnifiedMLATraits
 
 
 _MG_N_HG = 2
@@ -109,7 +109,8 @@ def make_smem_layout_mg(
     # footer in kv_sc). GLM (ARBITRARY_FP32, no extra cache) stages the 528B
     # NoPE+inline-fp32-scales row (scales inline, NO footer) PLUS a kv_rope buffer
     # (GLM has no global-rope path in MG). Both share the rest of the MG layout.
-    is_glm = not traits.has_extra_cache
+    is_glm = traits.model_type == ModelType.GLM_NSA
+    inline_kv_scales = traits.scale_format != ScaleFormat.UE8M0_BYTE
     if mg_n_hg not in (1, 2):
         raise ValueError(
             f"MG prefill layout supports mg_n_hg in {{1, 2}}, got {mg_n_hg}"
@@ -199,7 +200,7 @@ def make_smem_layout_mg(
     off = kv_fp8_off + kv_fp8_buf_bytes * bufs
 
     kv_sc_off = off
-    if is_glm:
+    if inline_kv_scales:
         if traits.latent_scale_per_token:
             # NVFP4 per-token mode: one fp32 second-level latent scale per
             # candidate ([292, 296) of the 368B record), scalar-gathered like
@@ -339,7 +340,8 @@ def get_prefill_mg_shared_storage_cls(
     class SharedStorageMG:
         pass
 
-    is_glm = not traits.has_extra_cache
+    is_glm = traits.model_type == ModelType.GLM_NSA
+    inline_kv_scales = traits.scale_format != ScaleFormat.UE8M0_BYTE
 
     # Tail (kv_fp8 .. w_fp8) is identical across DSV4 compute modes. DSV4
     # stages a separate UE8M0 footer ``kv_sc`` (rope from global/L2). GLM has NO
@@ -347,7 +349,7 @@ def get_prefill_mg_shared_storage_cls(
     # reads rope from global/L2, so it allocates NEITHER kv_sc nor kv_rope. Each
     # model is its own compiled specialization, so the GLM struct cannot perturb
     # the DSV4 struct.
-    if is_glm and not traits.latent_scale_per_token:
+    if inline_kv_scales and not traits.latent_scale_per_token:
         kv_scale_field = {}
     else:
         kv_scale_field = {
@@ -425,7 +427,7 @@ def get_prefill_mg_shared_storage_cls(
             "q_sc": layout.q_sc_off,
         }
     expected_offsets["kv_fp8"] = layout.kv_fp8_off
-    if not is_glm or traits.latent_scale_per_token:
+    if not inline_kv_scales or traits.latent_scale_per_token:
         expected_offsets["kv_sc"] = layout.kv_sc_off
     expected_offsets.update(
         {

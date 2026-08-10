@@ -51,7 +51,9 @@ def _cache_block_stride_bytes(
         COMPRESSED_MLA_BYTES_PER_TOKEN,
     )
 
-    if model_type == ModelType.GLM_NSA:
+    if record_bytes is not None:
+        expected = int(page_size) * int(record_bytes)
+    elif model_type == ModelType.GLM_NSA:
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
@@ -184,8 +186,8 @@ def run_unified_prefill(
         scale_format = inferred_scale_format
     else:
         scale_format = int(scale_format)
-        if q_head_dim == _GLM_HEAD_DIM and scale_format == ScaleFormat.NVFP4_E4M3:
-            # NVFP4 GLM-family prefill runs the BF16-QK MG arm (native E2M1
+        if scale_format == ScaleFormat.NVFP4_E4M3:
+            # NVFP4 prefill runs the BF16-QK MG arm (native E2M1
             # dequant + BF16 MMA); FP8 compute would misread the 432B record.
             compute_mode = ComputeMode.BF16
         elif scale_format != inferred_scale_format:
@@ -360,13 +362,12 @@ def run_unified_prefill(
     _mg_nvfp4 = (
         _mg_enabled
         and not has_extra
-        and model_type == ModelType.GLM_NSA
         and scale_format == ScaleFormat.NVFP4_E4M3
     )
     if _mg_nvfp4 and topk in (128, 512, 1024, 2048):
         return _run_partitioned_mg(
             compute_mode=ComputeMode.BF16,
-            model_type=ModelType.GLM_NSA,
+            model_type=model_type,
             scale_format=ScaleFormat.NVFP4_E4M3,
         )
     _mg_base = (
@@ -394,6 +395,21 @@ def run_unified_prefill(
     # into a paired prefix plus optional 16/8-head single-group tails. Everything
     # else RAISEs (the decode-reuse has_extra body has been removed -- no fallback).
     if has_extra:
+        if (
+            model_type == ModelType.DSV4
+            and scale_format == ScaleFormat.NVFP4_E4M3
+            and int(topk) == 128
+        ):
+            return _run_partitioned_mg(
+                compute_mode=ComputeMode.BF16,
+                model_type=ModelType.DSV4,
+                scale_format=ScaleFormat.NVFP4_E4M3,
+                extra_kv_cache=extra_kv_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                extra_page_block_size=extra_page_block_size,
+                stride_extra_kv_block=stride_extra_kv_block,
+            )
         if model_type == ModelType.DSV4 and int(topk) == 128:
             return _run_partitioned_mg(
                 compute_mode=ComputeMode.BF16,

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from b12x.attention._shared.mla.compressed_api import (
+    _compressed_mla_scale_format,
     _validate_compressed_cache_layout,
 )
 from b12x.attention._shared.mla.kernel import (
@@ -27,6 +28,12 @@ from b12x.attention._shared.mla.compressed_reference import (
     pack_compressed_mla_kv_cache_reference,
 )
 from b12x.attention import compressed_mla
+from b12x.attention._shared.mla.traits import (
+    ComputeMode,
+    ModelType,
+    ScaleFormat,
+    make_unified_traits,
+)
 
 B12XCompressedMLAScratchCaps = compressed_mla.Caps
 clear_mla_caches = compressed_mla.clear_caches
@@ -60,6 +67,27 @@ def test_compressed_mla_layout_accepts_contiguous_and_padded_pages(
         page_size=page_size,
         name="cache",
     )
+
+    nvfp4 = torch.empty((2, page_size * 432), dtype=torch.uint8)
+    _validate_compressed_cache_layout(nvfp4, page_size=page_size, name="cache")
+    assert (
+        _compressed_mla_scale_format(nvfp4, page_size=page_size, name="cache")
+        == ScaleFormat.NVFP4_E4M3
+    )
+
+
+def test_dsv4_nvfp4_traits_use_unpadded_record() -> None:
+    traits = make_unified_traits(
+        ModelType.DSV4,
+        ComputeMode.BF16,
+        ScaleFormat.NVFP4_E4M3,
+        fp8_rope=False,
+    )
+    assert traits.kv_gmem_stride == 432
+    assert traits.kv_smem_stride == 288
+    assert traits.d_nope == 448
+    assert traits.d_v == 512
+    assert traits.has_extra_cache
 
 
 def test_compressed_mla_layout_rejects_short_page() -> None:

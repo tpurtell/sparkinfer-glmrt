@@ -117,9 +117,42 @@ def make_unified_traits(
         )
 
     if model_type == ModelType.DSV4:
+        if scale_format == ScaleFormat.NVFP4_E4M3:
+            if fp8_rope_requested:
+                raise ValueError("DSV4 NVFP4 requires the 432-byte BF16-RoPE record")
+            if latent_scale_per_token:
+                raise ValueError(
+                    "DSV4 NVFP4 does not define a per-token outer latent scale"
+                )
+            return UnifiedMLATraits(
+                model_type=ModelType.DSV4,
+                compute_mode=ComputeMode.BF16,
+                scale_format=ScaleFormat.NVFP4_E4M3,
+                d_nope=448,
+                d_rope=64,
+                d_v=512,
+                quant_tile=64,
+                num_scales=7,
+                n_v_chunks=8,
+                nt_per_warp_xv=1,
+                kv_gmem_stride=432,
+                kv_smem_stride=288,
+                q_nope_stride=456,
+                bi=64,
+                hpb=16,
+                block_threads=288,
+                math_threads=256,
+                bulk_tx_bytes=26624,
+                v_has_rope=False,
+                has_extra_cache=True,
+                fp8_rope=False,
+                rope_gmem_offset=304,
+                rope_payload_bytes=128,
+                rope_scale_offset=-1,
+            )
         if scale_format != ScaleFormat.UE8M0_BYTE:
             raise ValueError(
-                "DSV4 requires ScaleFormat.UE8M0_BYTE (footer); "
+                "DSV4 requires ScaleFormat.UE8M0_BYTE or NVFP4_E4M3; "
                 f"got scale_format={scale_format!r}"
             )
         # DSV4 column of verified_traits.md (UE8M0_BYTE, V_HAS_ROPE=true).

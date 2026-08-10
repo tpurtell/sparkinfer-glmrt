@@ -239,7 +239,8 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
 
     # --- Double-buffered KV footer scales (DSV4 UE8M0; inline -> 0 for GLM). ---
     kv_sc_off = off
-    if traits.has_extra_cache:
+    has_kv_footer = traits.scale_format == ScaleFormat.UE8M0_BYTE
+    if has_kv_footer:
         # DSV4: 8 footer bytes/token (7 UE8M0 + 1 pad). Separately gathered.
         kv_sc_stride = 8  # SCALE_BYTES_PER_TOKEN
         kv_sc_buf_bytes = bi * kv_sc_stride
@@ -312,7 +313,10 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     off = _align_up(off, 16)
     w_head_sc2_off = off
     w_head_sc2_bytes = (
-        n_v_chunks * hpb * 4 + 8 * sm_p_full_stride * 2 if traits.has_extra_cache else 0
+        n_v_chunks * hpb * 4 + 8 * sm_p_full_stride * 2
+        if traits.scale_format == ScaleFormat.UE8M0_BYTE
+        and traits.scale_format != ScaleFormat.NVFP4_E4M3
+        else 0
     )
     off = w_head_sc2_off + w_head_sc2_bytes
 
@@ -393,7 +397,7 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
                 int(layout.kv_sc_buf_bytes * layout.kv_bufs),
             ]
         }
-        if (traits.has_extra_cache or traits.latent_scale_per_token)
+        if (traits.scale_format == ScaleFormat.UE8M0_BYTE or traits.latent_scale_per_token)
         else {}
     )
     w_head_sc2_field = (
@@ -405,7 +409,7 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
                 16,
             ]
         }
-        if traits.has_extra_cache
+        if traits.scale_format == ScaleFormat.UE8M0_BYTE
         else {}
     )
     SharedStorage.__annotations__ = {
@@ -479,9 +483,9 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
         "token_idx": layout.token_idx_off,
         "sm_p_full": layout.sm_p_full_off,
     }
-    if traits.has_extra_cache or traits.latent_scale_per_token:
+    if traits.scale_format == ScaleFormat.UE8M0_BYTE or traits.latent_scale_per_token:
         expected_offsets["kv_sc"] = layout.kv_sc_off
-    if traits.has_extra_cache:
+    if traits.scale_format == ScaleFormat.UE8M0_BYTE:
         expected_offsets["w_head_sc2"] = layout.w_head_sc2_off
     actual_offsets = dict(storage_cls._offsets)
     if actual_offsets != expected_offsets:
@@ -521,7 +525,7 @@ def _assert_model(model_type: int, compute_mode: int, scale_format: int) -> int:
         f"traits={traits.q_nope_stride}"
     )
     # DSV4 has the separate UE8M0 footer buffer; GLM keeps scales inline.
-    if traits.has_extra_cache:
+    if traits.scale_format == ScaleFormat.UE8M0_BYTE:
         assert layout.kv_sc_buf_bytes == traits.bi * 8, (
             f"DSV4 kv_sc footer buf must be BI*8; got {layout.kv_sc_buf_bytes}"
         )
@@ -546,6 +550,7 @@ def _run_module_asserts() -> None:
 
     dsv4 = _assert_model(ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
     _assert_model(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.UE8M0_BYTE)
+    _assert_model(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
