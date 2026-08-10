@@ -9523,13 +9523,30 @@ def _query_w4a16_kernel_resources(compiled: object) -> tuple[str, int, int] | No
         raise RuntimeError(
             f"cudaLibraryGetKernel failed for {symbols[0]}: {kernel_status}"
         )
-    attributes_status, attributes = cuda_runtime.cudaFuncGetAttributes(kernel_handle)
-    if attributes_status != success:
+    # cudaLibraryGetKernel returns cudaKernel_t, not a legacy function symbol.
+    # cuda-bindings 13.1 documents accepting that handle in
+    # cudaFuncGetAttributes, but its generated void-pointer converter rejects
+    # the typed object. Query the kernel through the matching driver API.
+    cu_kernel = cuda.CUkernel(int(kernel_handle))
+    device = cuda.CUdevice(int(torch.cuda.current_device()))
+    driver_success = cuda.CUresult.CUDA_SUCCESS
+    registers_status, registers_per_thread = cuda.cuKernelGetAttribute(
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS,
+        cu_kernel,
+        device,
+    )
+    local_status, local_memory_bytes = cuda.cuKernelGetAttribute(
+        cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+        cu_kernel,
+        device,
+    )
+    if registers_status != driver_success or local_status != driver_success:
         raise RuntimeError(
-            f"cudaFuncGetAttributes failed for {symbols[0]}: {attributes_status}"
+            f"cuKernelGetAttribute failed for {symbols[0]}: "
+            f"registers={registers_status}, local={local_status}"
         )
-    registers_per_thread = int(getattr(attributes, "numRegs", -1))
-    local_memory_bytes = int(getattr(attributes, "localSizeBytes", -1))
+    registers_per_thread = int(registers_per_thread)
+    local_memory_bytes = int(local_memory_bytes)
     if registers_per_thread < 0 or local_memory_bytes < 0:
         raise RuntimeError(f"incomplete CUDA function attributes for {symbols[0]}")
     return symbols[0], registers_per_thread, local_memory_bytes

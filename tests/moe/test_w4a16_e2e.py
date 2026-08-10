@@ -37,6 +37,7 @@ from b12x.moe._shared.kernels.w4a16.kernel import (
     _small_m_direct_supported,
     compile_w4a16_fused_moe,
     compile_w4a16_topk_sum,
+    _query_w4a16_kernel_resources,
     run_w4a16_moe,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
@@ -75,6 +76,58 @@ def test_w4a16_small_m_host_barrier_reset_kill_switch(
     assert _small_m_direct_host_barrier_reset_enabled()
     monkeypatch.setenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "0")
     assert not _small_m_direct_host_barrier_reset_enabled()
+
+
+def test_w4a16_resource_query_uses_cuda_kernel_attribute_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    library = object()
+    executor = type(
+        "Executor",
+        (),
+        {"jit_module": type("JitModule", (), {"cuda_library": (library,)})()},
+    )()
+    compiled = type(
+        "Compiled",
+        (),
+        {
+            "kernel_info": {"test_kernel": object()},
+            "to": lambda self, device: executor,
+        },
+    )()
+    kernel_handle = type("KernelHandle", (), {"__int__": lambda self: 1234})()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(
+        w4a16_kernel.cuda_runtime,
+        "cudaLibraryGetKernel",
+        lambda candidate, symbol: (
+            w4a16_kernel.cuda_runtime.cudaError_t.cudaSuccess,
+            kernel_handle,
+        ),
+    )
+    monkeypatch.setattr(w4a16_kernel.cuda, "CUkernel", lambda value: ("kernel", value))
+    monkeypatch.setattr(w4a16_kernel.cuda, "CUdevice", lambda value: ("device", value))
+
+    calls = []
+
+    def fake_get_attribute(attribute, kernel, device):
+        calls.append((attribute, kernel, device))
+        value = 128 if len(calls) == 1 else 16
+        return w4a16_kernel.cuda.CUresult.CUDA_SUCCESS, value
+
+    monkeypatch.setattr(
+        w4a16_kernel.cuda,
+        "cuKernelGetAttribute",
+        fake_get_attribute,
+    )
+
+    assert _query_w4a16_kernel_resources(compiled) == ("test_kernel", 128, 16)
+    assert [call[1:] for call in calls] == [
+        (("kernel", 1234), ("device", 2)),
+        (("kernel", 1234), ("device", 2)),
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
