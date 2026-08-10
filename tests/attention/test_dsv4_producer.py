@@ -6,9 +6,17 @@ from b12x.attention import dsv4_producer, nsa_indexer
 from b12x.attention._shared.mla.compressed_reference import (
     pack_compressed_mla_kv_cache_reference,
 )
+from b12x.attention._shared.mla.kernel import run_unified_decode
+from b12x.attention._shared.mla.traits import ScaleFormat
+from b12x.attention.compressed_mla._scratch import (
+    B12XCompressedMLAScratchCaps,
+    _compressed_mla_scratch_layout,
+    _materialize_compressed_mla_scratch,
+)
 from b12x.attention.dsv4_producer._impl import (
     DSV4_INDEX_WEIGHT_SCALE,
     DSV4_KV_PAGE_BYTES,
+    DSV4_NVFP4_PAGE_BYTES,
     _run_indexer_query_post,
     _run_normalize_query_rope,
     _run_normalize_rank_pack_kv,
@@ -19,6 +27,10 @@ from b12x.attention.nsa_indexer.reference import (
 )
 
 from ..conftest import require_b12x
+from .._reference.helpers import (
+    dequantize_nvfp4_mla_nope,
+    pack_dsv4_nvfp4_record_reference,
+)
 
 
 def _rope_forward(
@@ -143,6 +155,18 @@ def test_plan_pins_flash_and_pro_caller_owned_workspace() -> None:
     assert flash.layout.q_linear_offset % 1024 == 0
     assert flash.layout.qkv_output_offset % 1024 == 0
     assert flash.layout.q_rank_offset % 1024 == 0
+    assert flash.caps.main_page_bytes == DSV4_KV_PAGE_BYTES
+    assert (
+        dsv4_producer.Caps(
+            device="cpu",
+            max_tokens=1,
+            hidden=4096,
+            q_lora_rank=1024,
+            heads=64,
+            cache_format="nvfp4",
+        ).main_page_bytes
+        == DSV4_NVFP4_PAGE_BYTES
+    )
 
     flash_kv = dsv4_producer.plan_kv(flash.caps)
     pro_kv = dsv4_producer.plan_kv(pro.caps)
@@ -218,6 +242,179 @@ def test_indexer_caps_reject_cross_variant_or_non_native_geometry() -> None:
             raise AssertionError(
                 f"invalid DSV4 indexer producer geometry was accepted: {kwargs}"
             )
+
+
+def test_native_dsv4_nvfp4_writer_matches_432_byte_record_and_replays() -> None:
+    require_b12x()
+    torch.manual_seed(20260811)
+    tokens, q_rank, eps = 2, 1_024, 1.0e-6
+    qkv = torch.randn((tokens, q_rank + 512), device="cuda", dtype=torch.bfloat16)
+    q_norm = torch.randn((q_rank,), device="cuda", dtype=torch.bfloat16)
+    kv_norm = torch.randn((512,), device="cuda", dtype=torch.bfloat16)
+    positions = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([0, 257], device="cuda", dtype=torch.int32)
+    cos_sin = torch.randn((2, 64), device="cuda", dtype=torch.float32)
+    q_rank_out = torch.empty((tokens, q_rank), device="cuda", dtype=torch.bfloat16)
+    cache = torch.full(
+        (2, DSV4_NVFP4_PAGE_BYTES), 0xA5, device="cuda", dtype=torch.uint8
+    )
+
+    def run() -> None:
+        _run_normalize_rank_pack_kv(
+            qkv,
+            q_norm,
+            kv_norm,
+            positions,
+            slots,
+            cos_sin,
+            q_rank_out,
+            cache,
+            eps=eps,
+            cache_format="nvfp4",
+        )
+
+    run()
+    torch.cuda.synchronize()
+    eager_cache = cache.clone()
+    eager_q_rank = q_rank_out.clone()
+
+    kv = qkv[:, q_rank:].float()
+    normalized = (
+        kv * torch.rsqrt(kv.square().mean(dim=-1, keepdim=True) + eps) * kv_norm.float()
+    ).to(torch.bfloat16)
+    expected = normalized.clone()
+    pairs = normalized[:, 448:].float().reshape(tokens, 32, 2)
+    selected = cos_sin[positions.long()]
+    cos_v, sin_v = selected.chunk(2, dim=-1)
+    expected[:, 448:] = (
+        torch.stack(
+            (
+                pairs[..., 0] * cos_v - pairs[..., 1] * sin_v,
+                pairs[..., 1] * cos_v + pairs[..., 0] * sin_v,
+            ),
+            dim=-1,
+        )
+        .reshape(tokens, 64)
+        .to(torch.bfloat16)
+    )
+    expected_records = pack_dsv4_nvfp4_record_reference(expected)
+    actual_records = torch.stack((cache[0, :432], cache[1, 432:864]))
+    assert torch.equal(actual_records, expected_records)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(cache, eager_cache)
+    assert torch.equal(q_rank_out, eager_q_rank)
+
+    # Consume those exact producer records through the native DSV4 decode arm.
+    records = torch.stack((eager_cache[0, :432], eager_cache[1, 432:864]))
+    dequantized, _ = dequantize_nvfp4_mla_nope(records)
+    rope = records[:, 304:432].contiguous().view(torch.bfloat16).float()
+    keys = torch.cat((dequantized[:, :448], rope), dim=1)
+    query = torch.randn((1, 8, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.tensor([[0, 257]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([2], device="cuda", dtype=torch.int32)
+    sm_scale = 512**-0.5
+    scores = torch.matmul(query[0].float(), keys.t()) * sm_scale
+    expected_output = torch.matmul(scores.softmax(dim=-1), dequantized).unsqueeze(0)
+    caps = B12XCompressedMLAScratchCaps(
+        device=torch.device("cuda"),
+        num_q_heads=8,
+        max_q_rows=1,
+        max_width=2,
+        head_dim=512,
+        v_head_dim=512,
+        max_chunks_per_row=8,
+        page_size=256,
+    )
+    layout = _compressed_mla_scratch_layout(caps)
+    workspace = _materialize_compressed_mla_scratch(
+        caps,
+        torch.zeros(layout.nbytes, device="cuda", dtype=torch.uint8),
+        layout,
+    )
+    output = torch.empty_like(query)
+
+    def decode() -> None:
+        run_unified_decode(
+            q_all=query,
+            swa_k_cache=eager_cache,
+            swa_indices=indices,
+            swa_topk_lengths=lengths,
+            workspace=workspace,
+            sm_scale=sm_scale,
+            swa_page_size=256,
+            forced_num_splits=1,
+            out=output,
+            scale_format_override=ScaleFormat.NVFP4_E4M3,
+        )
+
+    decode()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output.float(), expected_output, atol=3.0e-2, rtol=3.0e-2
+    )
+    decode_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(decode_graph):
+        decode()
+    output.fill_(float("nan"))
+    decode_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output.float(), expected_output, atol=3.0e-2, rtol=3.0e-2
+    )
+
+
+def test_native_dsv4_nvfp4_writer_addresses_pages_past_int32_byte_range() -> None:
+    """Keep the production pool offset arithmetic wider than 32 bits."""
+
+    require_b12x()
+    torch.manual_seed(20260812)
+    q_rank, eps = 1_024, 1.0e-6
+    high_page = (2**31) // DSV4_NVFP4_PAGE_BYTES + 1
+    high_row = 17
+    qkv = torch.randn((1, q_rank + 512), device="cuda", dtype=torch.bfloat16)
+    q_norm = torch.ones((q_rank,), device="cuda", dtype=torch.bfloat16)
+    kv_norm = torch.ones((512,), device="cuda", dtype=torch.bfloat16)
+    positions = torch.zeros((1,), device="cuda", dtype=torch.int32)
+    slots = torch.tensor([high_page * 256 + high_row], device="cuda", dtype=torch.int64)
+    cos_sin = torch.zeros((1, 64), device="cuda", dtype=torch.float32)
+    cos_sin[:, :32] = 1
+    q_rank_out = torch.empty((1, q_rank), device="cuda", dtype=torch.bfloat16)
+    cache = torch.empty(
+        (high_page + 1, DSV4_NVFP4_PAGE_BYTES),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    try:
+        cache[high_page].fill_(0xA5)
+        _run_normalize_rank_pack_kv(
+            qkv,
+            q_norm,
+            kv_norm,
+            positions,
+            slots,
+            cos_sin,
+            q_rank_out,
+            cache,
+            eps=eps,
+            cache_format="nvfp4",
+        )
+        torch.cuda.synchronize()
+
+        start = high_row * 432
+        record = cache[high_page, start : start + 432]
+        assert torch.count_nonzero(record[:288]) > 0
+        assert torch.count_nonzero(record[288:304]) == 0
+        assert torch.all(cache[high_page, start - 432 : start] == 0xA5)
+        assert torch.all(cache[high_page, start + 432 : start + 864] == 0xA5)
+    finally:
+        del cache
+        torch.cuda.empty_cache()
 
 
 def test_rank_norm_and_main_kv_pack_match_checkpoint_reference() -> None:

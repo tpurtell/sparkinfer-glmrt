@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from b12x.attention import dsv4_compressor
+from b12x.attention.dsv4_compressor._impl import _run_main
 from b12x.attention._shared.mla.compressed_reference import (
     pack_compressed_mla_kv_cache_reference,
     unpack_compressed_mla_kv_cache_reference,
@@ -15,6 +18,10 @@ from b12x.attention.nsa_indexer.reference import (
 )
 
 from ..conftest import require_b12x
+from .._reference.helpers import (
+    dequantize_nvfp4_mla_nope,
+    pack_dsv4_nvfp4_record_reference,
+)
 
 
 def _rope_forward(
@@ -305,7 +312,10 @@ def test_c128_decode_updates_fp32_state_and_direct_packed_page() -> None:
     assert torch.equal(main_cache, eager_cache)
 
 
-def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
+@pytest.mark.parametrize("cache_format", ("fp8", "nvfp4"))
+def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages(
+    cache_format: str,
+) -> None:
     require_b12x()
     torch.manual_seed(20260805)
     hidden, eps = 4_096, 1.0e-6
@@ -316,6 +326,7 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
             hidden=hidden,
             compress_ratio=4,
             with_indexer=True,
+            cache_format=cache_format,
         )
     )
     main_wkv = _random((1_024, hidden), torch.bfloat16, 1 / 64)
@@ -341,7 +352,9 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
     sequence_ids = torch.tensor([0], device="cuda", dtype=torch.int32)
     slots = torch.tensor([0], device="cuda", dtype=torch.int32)
     cos_sin = _cos_sin(32)
-    main_cache = torch.zeros((1, 37_440), device="cuda", dtype=torch.uint8)
+    main_cache = torch.zeros(
+        (1, plan.caps.main_page_bytes), device="cuda", dtype=torch.uint8
+    )
     index_cache = torch.zeros((1, 8_448), device="cuda", dtype=torch.uint8)
     main_kv_state = _random((1, 8, 1_024), torch.float32, 1 / 4)
     main_score_state = _random((1, 8, 1_024), torch.float32, 1 / 4)
@@ -409,14 +422,32 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
     assert torch.equal(main_score_state[:, :4], rolled_main_score)
     assert torch.equal(index_kv_state[:, :4], rolled_index_kv)
     assert torch.equal(index_score_state[:, :4], rolled_index_score)
-    main_nope, main_rope = unpack_compressed_mla_kv_cache_reference(
-        main_cache, page_size=64, n_tokens=1
-    )
-    expected_nope, expected_rope = unpack_compressed_mla_kv_cache_reference(
-        expected_main_cache, page_size=64, n_tokens=1
-    )
-    torch.testing.assert_close(main_nope, expected_nope, atol=0.04, rtol=0.04)
-    torch.testing.assert_close(main_rope, expected_rope, atol=0.02, rtol=0.02)
+    if cache_format == "nvfp4":
+        expected_record = pack_dsv4_nvfp4_record_reference(expected_main[None])
+        actual_record = main_cache[0, :432]
+        assert torch.count_nonzero(actual_record[288:304]) == 0
+        actual_latent, _ = dequantize_nvfp4_mla_nope(actual_record[None])
+        expected_latent, _ = dequantize_nvfp4_mla_nope(expected_record)
+        latent_error = (actual_latent - expected_latent).abs()
+        # FP32 pooling reduction order may move one value across an E2M1
+        # threshold; the remaining record must match the reference quantizer.
+        assert int((latent_error > 0.12).sum()) <= 1
+        assert float(latent_error.max()) <= 0.25
+        torch.testing.assert_close(
+            actual_record[304:].view(torch.bfloat16).float(),
+            expected_record[0, 304:].view(torch.bfloat16).float(),
+            atol=0.02,
+            rtol=0.02,
+        )
+    else:
+        main_nope, main_rope = unpack_compressed_mla_kv_cache_reference(
+            main_cache, page_size=64, n_tokens=1
+        )
+        expected_nope, expected_rope = unpack_compressed_mla_kv_cache_reference(
+            expected_main_cache, page_size=64, n_tokens=1
+        )
+        torch.testing.assert_close(main_nope, expected_nope, atol=0.04, rtol=0.04)
+        torch.testing.assert_close(main_rope, expected_rope, atol=0.02, rtol=0.02)
     index_actual = unpack_index_k_cache_reference(
         index_cache, num_tokens=1, page_size=64
     )
@@ -428,6 +459,65 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages() -> None:
     # threshold. The remaining 127 lanes match the checkpoint QAT path.
     assert int((index_error > 0.04).sum()) <= 1
     assert float(index_error.max()) <= 0.25
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dsv4_compressor.run_decode(binding=binding)
+    graph.replay()
+    torch.cuda.synchronize()
+    if cache_format == "nvfp4":
+        assert torch.count_nonzero(main_cache[0, 288:304]) == 0
+
+
+def test_native_dsv4_nvfp4_compressor_addresses_pages_past_int32_byte_range() -> None:
+    """Exercise a live C4 page whose byte base is greater than 2 GiB."""
+
+    require_b12x()
+    torch.manual_seed(20260812)
+    page_bytes = 64 * 432
+    high_page = (2**31) // page_bytes + 1
+    high_row = 7
+    projection = _random((1, 2_048), torch.bfloat16)
+    positions = torch.tensor([3], device="cuda", dtype=torch.int32)
+    sequence_ids = torch.zeros((1,), device="cuda", dtype=torch.int32)
+    compressed_slots = torch.tensor(
+        [high_page * 64 + high_row], device="cuda", dtype=torch.int64
+    )
+    cos_sin = torch.zeros((1, 64), device="cuda", dtype=torch.float32)
+    cos_sin[:, :32] = 1
+    cache = torch.empty((high_page + 1, page_bytes), device="cuda", dtype=torch.uint8)
+    binding = SimpleNamespace(
+        compress_ratio=4,
+        cache_format="nvfp4",
+        hidden_states=torch.empty((1, 1), device="cuda", dtype=torch.bfloat16),
+        projection=projection,
+        positions=positions,
+        sequence_ids=sequence_ids,
+        compressed_slots=compressed_slots,
+        compressed_cos_sin_cache=cos_sin,
+        main_kv_state=_random((1, 8, 1_024), torch.float32),
+        main_score_state=_random((1, 8, 1_024), torch.float32),
+        compressed_main_cache=cache,
+        weights=SimpleNamespace(
+            main_ape=_random((4, 1_024), torch.float32),
+            main_norm=torch.ones((512,), device="cuda", dtype=torch.bfloat16),
+        ),
+        eps=1.0e-6,
+    )
+    try:
+        cache[high_page].fill_(0xA5)
+        _run_main(binding)
+        torch.cuda.synchronize()
+
+        start = high_row * 432
+        record = cache[high_page, start : start + 432]
+        assert torch.count_nonzero(record[:288]) > 0
+        assert torch.count_nonzero(record[288:304]) == 0
+        assert torch.all(cache[high_page, start - 432 : start] == 0xA5)
+        assert torch.all(cache[high_page, start + 432 : start + 864] == 0xA5)
+    finally:
+        del cache
+        torch.cuda.empty_cache()
 
 
 def test_c4_initial_prefill_emits_parallel_groups_and_exact_terminal_state() -> None:

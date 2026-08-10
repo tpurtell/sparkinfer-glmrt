@@ -6,7 +6,8 @@ and ``wkv`` once at load time, so one hidden-row quantization and GEMM emits
 both low-rank Q and raw KV.  ``run`` then:
 
 1. normalizes low-rank Q and normalizes/RoPE-packs KV directly into the DSV4
-   256-source-token physical page;
+   256-source-token physical page, in either the 584-byte FP8/UE8M0 record or
+   the native 432-byte E2M1/E4M3 NVFP4 record;
 2. projects ``wq_b`` directly into the caller's final query buffer; and
 3. applies per-head RMS normalization and partial RoPE in place.
 
@@ -20,7 +21,9 @@ There is no BF16 KV staging allocation and no serving-time tensor allocation.
 The planned lifecycle is ``pack_weights`` (one time) -> ``plan`` -> ``bind``
 (views only) -> ``run`` (CUDA-graph-capture safe after prewarm).
 
-Integrated dSpark prompt priming uses ``plan_kv``/``bind_kv``/``run_kv`` to
+``Caps.cache_format`` owns the page ABI and validates the caller's byte width;
+the format cannot be relabeled after planning. Integrated dSpark prompt priming
+uses ``plan_kv``/``bind_kv``/``run_kv`` to
 project and pack only the target-main KV rows.  It shares the packed weights
 and exact cache format above without paying for unused query projections.
 """

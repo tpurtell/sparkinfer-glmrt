@@ -6,6 +6,8 @@ are concatenated once at load time.  ``run_decode`` projects the hidden rows
 into the planned arena, updates sequence-local C=4 overlap or C=128 state,
 and writes completed groups directly into the compressed MLA page.  C=4 also
 produces the randomized-Hadamard index cache in its planar FP8+FP32-scale ABI.
+The main compressed page follows ``Caps.cache_format``: legacy FP8/UE8M0 or
+the native 432-byte-per-row DSV4 NVFP4 record consumed by compressed MLA.
 
 The decode binding requires at most one row for each sequence.  Initial prefill
 uses a separate fixed-capacity binding: it projects the graph bucket once,

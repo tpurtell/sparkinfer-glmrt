@@ -17,6 +17,7 @@ DSV4_ROPE_DIM = 64
 DSV4_SOURCE_PAGE_SIZE = 256
 DSV4_KV_PAYLOAD_BYTES = 576
 DSV4_KV_SCALE_BYTES = 8
+DSV4_NVFP4_RECORD_BYTES = 432
 DSV4_INDEX_HEAD_DIM = 128
 DSV4_INDEX_PAGE_SIZE = 64
 DSV4_INDEX_PAGE_BYTES = 8_448
@@ -28,8 +29,10 @@ def _align_up(value: int, alignment: int = _SCRATCH_ALIGNMENT) -> int:
     return ((int(value) + alignment - 1) // alignment) * alignment
 
 
-def _compressed_main_page_bytes(ratio: int) -> int:
+def _compressed_main_page_bytes(ratio: int, cache_format: str = "fp8") -> int:
     rows = DSV4_SOURCE_PAGE_SIZE // int(ratio)
+    if cache_format == "nvfp4":
+        return rows * DSV4_NVFP4_RECORD_BYTES
     return _align_up(
         rows * (DSV4_KV_PAYLOAD_BYTES + DSV4_KV_SCALE_BYTES),
         DSV4_KV_PAYLOAD_BYTES,
@@ -63,6 +66,7 @@ class DSV4CompressorCaps:
     hidden: int
     compress_ratio: int
     with_indexer: bool
+    cache_format: str = "fp8"
     dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self) -> None:
@@ -74,6 +78,7 @@ class DSV4CompressorCaps:
         object.__setattr__(self, "hidden", int(self.hidden))
         object.__setattr__(self, "compress_ratio", int(self.compress_ratio))
         object.__setattr__(self, "with_indexer", bool(self.with_indexer))
+        object.__setattr__(self, "cache_format", str(self.cache_format).strip().lower())
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
         if self.hidden not in (4_096, 7_168):
@@ -88,6 +93,11 @@ class DSV4CompressorCaps:
             raise ValueError(
                 "DSV4 C=4 layers require the learned index compressor and "
                 "C=128 layers must not carry one"
+            )
+        if self.cache_format not in ("fp8", "nvfp4"):
+            raise ValueError(
+                "DSV4 compressor cache_format must be fp8 or nvfp4, got "
+                f"{self.cache_format!r}"
             )
         if self.dtype != torch.bfloat16:
             raise ValueError(
@@ -124,7 +134,7 @@ class DSV4CompressorCaps:
 
     @property
     def main_page_bytes(self) -> int:
-        return _compressed_main_page_bytes(self.compress_ratio)
+        return _compressed_main_page_bytes(self.compress_ratio, self.cache_format)
 
 
 @dataclass(frozen=True)
@@ -150,6 +160,7 @@ class DSV4CompressorBinding:
     weights: DSV4CompressorWeights
     projection: torch.Tensor
     compress_ratio: int
+    cache_format: str
     eps: float
 
     def run_decode(self) -> None:
@@ -176,6 +187,7 @@ class DSV4CompressorPrefillBinding:
     weights: DSV4CompressorWeights
     projection: torch.Tensor
     compress_ratio: int
+    cache_format: str
     eps: float
 
     @property
@@ -212,6 +224,7 @@ class DSV4CompressorContinuationBinding:
     weights: DSV4CompressorWeights
     projection: torch.Tensor
     compress_ratio: int
+    cache_format: str
     eps: float
 
     @property
@@ -307,6 +320,7 @@ class DSV4CompressorPlan:
             weights=weights,
             projection=projection,
             compress_ratio=self.caps.compress_ratio,
+            cache_format=self.caps.cache_format,
             eps=float(eps),
         )
 
@@ -399,6 +413,7 @@ class DSV4CompressorPlan:
             weights=weights,
             projection=projection,
             compress_ratio=self.caps.compress_ratio,
+            cache_format=self.caps.cache_format,
             eps=float(eps),
         )
 
@@ -497,6 +512,7 @@ class DSV4CompressorPlan:
             weights=weights,
             projection=projection,
             compress_ratio=self.caps.compress_ratio,
+            cache_format=self.caps.cache_format,
             eps=float(eps),
         )
 
@@ -884,6 +900,108 @@ def _validate_continuation_metadata(
 
 
 @triton.jit
+def _float_to_e2m1(value):
+    magnitude = tl.abs(value)
+    code = tl.where(
+        magnitude <= 0.25,
+        0,
+        tl.where(
+            magnitude < 0.75,
+            1,
+            tl.where(
+                magnitude <= 1.25,
+                2,
+                tl.where(
+                    magnitude < 1.75,
+                    3,
+                    tl.where(
+                        magnitude <= 2.5,
+                        4,
+                        tl.where(
+                            magnitude < 3.5,
+                            5,
+                            tl.where(magnitude <= 5.0, 6, 7),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return code.to(tl.uint8) | ((value < 0).to(tl.uint8) << 3)
+
+
+@triton.jit
+def _store_main_cache_row(
+    output,
+    d,
+    page,
+    page_row,
+    cache_fp8,
+    cache_bf16,
+    cache_u8,
+    NOPE_DIM: tl.constexpr,
+    PAGE_ROWS: tl.constexpr,
+    PAYLOAD_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    PAGE_BYTES: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    NVFP4: tl.constexpr,
+):
+    page_base = page * PAGE_BYTES
+    rope_mask = d >= NOPE_DIM
+    if NVFP4:
+        data_base = page_base + page_row * 432
+        quant_input = output.to(tl.bfloat16).to(tl.float32)
+        quant_3d = tl.reshape(quant_input, (32, 8, 2))
+        lo, hi = tl.split(quant_3d)
+        max_abs = tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi), axis=1))
+        raw_scale = tl.maximum(max_abs * (1.0 / 6.0), 1.1754943508222875e-38)
+        scale_fp8 = raw_scale.to(tl.float8e4nv)
+        decoded_scale = scale_fp8.to(tl.float32)
+        inv_scale = tl.reshape(1.0 / decoded_scale, (32, 1))
+        packed = _float_to_e2m1(lo * inv_scale) | (_float_to_e2m1(hi * inv_scale) << 4)
+        tl.store(cache_u8 + data_base + tl.arange(0, 256), tl.reshape(packed, (256,)))
+        tl.store(
+            cache_u8 + data_base + 256 + tl.arange(0, 32),
+            scale_fp8.to(tl.uint8, bitcast=True),
+        )
+        tl.store(cache_u8 + data_base + 288 + tl.arange(0, 16), 0)
+        tl.store(
+            cache_bf16 + (data_base + 304) // 2 + d - NOPE_DIM,
+            quant_input.to(tl.bfloat16),
+            mask=rope_mask,
+        )
+    else:
+        data_base = page_base + page_row * PAYLOAD_BYTES
+        scale_base = page_base + PAGE_ROWS * PAYLOAD_BYTES + page_row * SCALE_BYTES
+        for group in range(NOPE_DIM // 64):
+            group_mask = (d >= group * 64) & (d < (group + 1) * 64)
+            max_abs = tl.maximum(
+                tl.max(tl.where(group_mask, tl.abs(output), 0.0), axis=0),
+                1.0e-4,
+            )
+            raw_scale = max_abs / FP8_MAX
+            bits = raw_scale.to(tl.uint32, bitcast=True)
+            mantissa = bits & 0x007FFFFF
+            rounded_bits = (bits + 0x00800000) & 0x7F800000
+            scale_bits = tl.where(mantissa != 0, rounded_bits, bits & 0x7F800000)
+            scale = scale_bits.to(tl.float32, bitcast=True)
+            quant = tl.maximum(tl.minimum(output / scale, FP8_MAX), -FP8_MAX)
+            tl.store(
+                cache_fp8 + data_base + d,
+                quant.to(tl.float8e4nv),
+                mask=group_mask,
+            )
+            tl.store(cache_u8 + scale_base + group, (scale_bits >> 23).to(tl.uint8))
+        tl.store(
+            cache_bf16 + data_base // 2 + d - NOPE_DIM // 2,
+            output.to(tl.bfloat16),
+            mask=rope_mask,
+        )
+        tl.store(cache_u8 + scale_base + 7, 0)
+
+
+@triton.jit
 def _update_pool_pack_main_kernel(
     projection,
     positions,
@@ -915,6 +1033,7 @@ def _update_pool_pack_main_kernel(
     SCALE_BYTES: tl.constexpr,
     PAGE_BYTES: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    NVFP4: tl.constexpr,
 ):
     token = tl.program_id(0)
     position = tl.load(positions + token)
@@ -1100,34 +1219,52 @@ def _update_pool_pack_main_kernel(
         slot = tl.load(compressed_slots + token).to(tl.int64)
         page = slot // PAGE_ROWS
         page_row = slot - page * PAGE_ROWS
-        page_base = page * PAGE_BYTES
-        data_base = page_base + page_row * PAYLOAD_BYTES
-        scale_base = page_base + PAGE_ROWS * PAYLOAD_BYTES + page_row * SCALE_BYTES
-        for group in range(NOPE_DIM // 64):
-            group_mask = (d >= group * 64) & (d < (group + 1) * 64)
-            max_abs = tl.maximum(
-                tl.max(tl.where(group_mask, tl.abs(output), 0.0), axis=0),
-                1.0e-4,
+        if NVFP4:
+            _store_main_cache_row(
+                output,
+                d,
+                page,
+                page_row,
+                cache_fp8,
+                cache_bf16,
+                cache_u8,
+                NOPE_DIM=NOPE_DIM,
+                PAGE_ROWS=PAGE_ROWS,
+                PAYLOAD_BYTES=PAYLOAD_BYTES,
+                SCALE_BYTES=SCALE_BYTES,
+                PAGE_BYTES=PAGE_BYTES,
+                FP8_MAX=FP8_MAX,
+                NVFP4=True,
             )
-            raw_scale = max_abs / FP8_MAX
-            bits = raw_scale.to(tl.uint32, bitcast=True)
-            mantissa = bits & 0x007FFFFF
-            rounded_bits = (bits + 0x00800000) & 0x7F800000
-            scale_bits = tl.where(mantissa != 0, rounded_bits, bits & 0x7F800000)
-            scale = scale_bits.to(tl.float32, bitcast=True)
-            quant = tl.maximum(tl.minimum(output / scale, FP8_MAX), -FP8_MAX)
+        else:
+            page_base = page * PAGE_BYTES
+            data_base = page_base + page_row * PAYLOAD_BYTES
+            scale_base = page_base + PAGE_ROWS * PAYLOAD_BYTES + page_row * SCALE_BYTES
+            for group in range(NOPE_DIM // 64):
+                group_mask = (d >= group * 64) & (d < (group + 1) * 64)
+                max_abs = tl.maximum(
+                    tl.max(tl.where(group_mask, tl.abs(output), 0.0), axis=0),
+                    1.0e-4,
+                )
+                raw_scale = max_abs / FP8_MAX
+                bits = raw_scale.to(tl.uint32, bitcast=True)
+                mantissa = bits & 0x007FFFFF
+                rounded_bits = (bits + 0x00800000) & 0x7F800000
+                scale_bits = tl.where(mantissa != 0, rounded_bits, bits & 0x7F800000)
+                scale = scale_bits.to(tl.float32, bitcast=True)
+                quant = tl.maximum(tl.minimum(output / scale, FP8_MAX), -FP8_MAX)
+                tl.store(
+                    cache_fp8 + data_base + d,
+                    quant.to(tl.float8e4nv),
+                    mask=group_mask,
+                )
+                tl.store(cache_u8 + scale_base + group, (scale_bits >> 23).to(tl.uint8))
             tl.store(
-                cache_fp8 + data_base + d,
-                quant.to(tl.float8e4nv),
-                mask=group_mask,
+                cache_bf16 + data_base // 2 + d - NOPE_DIM // 2,
+                output.to(tl.bfloat16),
+                mask=rope_mask,
             )
-            tl.store(cache_u8 + scale_base + group, (scale_bits >> 23).to(tl.uint8))
-        tl.store(
-            cache_bf16 + data_base // 2 + d - NOPE_DIM // 2,
-            output.to(tl.bfloat16),
-            mask=rope_mask,
-        )
-        tl.store(cache_u8 + scale_base + 7, 0)
+            tl.store(cache_u8 + scale_base + 7, 0)
 
         if OVERLAP:
             for row in range(RATIO):
@@ -1547,6 +1684,7 @@ def _prefill_pool_pack_main_kernel(
     SCALE_BYTES: tl.constexpr,
     PAGE_BYTES: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    NVFP4: tl.constexpr,
 ):
     group = tl.program_id(0)
     if group < tl.load(active_groups):
@@ -1622,37 +1760,55 @@ def _prefill_pool_pack_main_kernel(
         slot = tl.load(compressed_slots + group).to(tl.int64)
         page = slot // PAGE_ROWS
         page_row = slot - page * PAGE_ROWS
-        page_base = page * PAGE_BYTES
-        data_base = page_base + page_row * PAYLOAD_BYTES
-        scale_base = page_base + PAGE_ROWS * PAYLOAD_BYTES + page_row * SCALE_BYTES
-        for scale_group in range(NOPE_DIM // 64):
-            scale_mask = (d >= scale_group * 64) & (d < (scale_group + 1) * 64)
-            max_abs = tl.maximum(
-                tl.max(tl.where(scale_mask, tl.abs(output), 0.0), axis=0),
-                1.0e-4,
+        if NVFP4:
+            _store_main_cache_row(
+                output,
+                d,
+                page,
+                page_row,
+                cache_fp8,
+                cache_bf16,
+                cache_u8,
+                NOPE_DIM=NOPE_DIM,
+                PAGE_ROWS=PAGE_ROWS,
+                PAYLOAD_BYTES=PAYLOAD_BYTES,
+                SCALE_BYTES=SCALE_BYTES,
+                PAGE_BYTES=PAGE_BYTES,
+                FP8_MAX=FP8_MAX,
+                NVFP4=True,
             )
-            raw_scale = max_abs / FP8_MAX
-            bits = raw_scale.to(tl.uint32, bitcast=True)
-            mantissa = bits & 0x007FFFFF
-            rounded_bits = (bits + 0x00800000) & 0x7F800000
-            scale_bits = tl.where(mantissa != 0, rounded_bits, bits & 0x7F800000)
-            scale = scale_bits.to(tl.float32, bitcast=True)
-            quant = tl.maximum(tl.minimum(output / scale, FP8_MAX), -FP8_MAX)
+        else:
+            page_base = page * PAGE_BYTES
+            data_base = page_base + page_row * PAYLOAD_BYTES
+            scale_base = page_base + PAGE_ROWS * PAYLOAD_BYTES + page_row * SCALE_BYTES
+            for scale_group in range(NOPE_DIM // 64):
+                scale_mask = (d >= scale_group * 64) & (d < (scale_group + 1) * 64)
+                max_abs = tl.maximum(
+                    tl.max(tl.where(scale_mask, tl.abs(output), 0.0), axis=0),
+                    1.0e-4,
+                )
+                raw_scale = max_abs / FP8_MAX
+                bits = raw_scale.to(tl.uint32, bitcast=True)
+                mantissa = bits & 0x007FFFFF
+                rounded_bits = (bits + 0x00800000) & 0x7F800000
+                scale_bits = tl.where(mantissa != 0, rounded_bits, bits & 0x7F800000)
+                scale = scale_bits.to(tl.float32, bitcast=True)
+                quant = tl.maximum(tl.minimum(output / scale, FP8_MAX), -FP8_MAX)
+                tl.store(
+                    cache_fp8 + data_base + d,
+                    quant.to(tl.float8e4nv),
+                    mask=scale_mask,
+                )
+                tl.store(
+                    cache_u8 + scale_base + scale_group,
+                    (scale_bits >> 23).to(tl.uint8),
+                )
             tl.store(
-                cache_fp8 + data_base + d,
-                quant.to(tl.float8e4nv),
-                mask=scale_mask,
+                cache_bf16 + data_base // 2 + d - NOPE_DIM // 2,
+                output.to(tl.bfloat16),
+                mask=rope_mask,
             )
-            tl.store(
-                cache_u8 + scale_base + scale_group,
-                (scale_bits >> 23).to(tl.uint8),
-            )
-        tl.store(
-            cache_bf16 + data_base // 2 + d - NOPE_DIM // 2,
-            output.to(tl.bfloat16),
-            mask=rope_mask,
-        )
-        tl.store(cache_u8 + scale_base + 7, 0)
+            tl.store(cache_u8 + scale_base + 7, 0)
 
 
 @triton.jit
@@ -2146,6 +2302,7 @@ def _continuation_pool_pack_main_kernel(
     SCALE_BYTES: tl.constexpr,
     PAGE_BYTES: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    NVFP4: tl.constexpr,
 ):
     group = tl.program_id(0)
     if group < tl.load(active_groups):
@@ -2237,37 +2394,55 @@ def _continuation_pool_pack_main_kernel(
         slot = tl.load(compressed_slots + group).to(tl.int64)
         page = slot // PAGE_ROWS
         page_row = slot - page * PAGE_ROWS
-        page_base = page * PAGE_BYTES
-        data_base = page_base + page_row * PAYLOAD_BYTES
-        scale_base = page_base + PAGE_ROWS * PAYLOAD_BYTES + page_row * SCALE_BYTES
-        for scale_group in range(NOPE_DIM // 64):
-            scale_mask = (d >= scale_group * 64) & (d < (scale_group + 1) * 64)
-            max_abs = tl.maximum(
-                tl.max(tl.where(scale_mask, tl.abs(output), 0.0), axis=0),
-                1.0e-4,
+        if NVFP4:
+            _store_main_cache_row(
+                output,
+                d,
+                page,
+                page_row,
+                cache_fp8,
+                cache_bf16,
+                cache_u8,
+                NOPE_DIM=NOPE_DIM,
+                PAGE_ROWS=PAGE_ROWS,
+                PAYLOAD_BYTES=PAYLOAD_BYTES,
+                SCALE_BYTES=SCALE_BYTES,
+                PAGE_BYTES=PAGE_BYTES,
+                FP8_MAX=FP8_MAX,
+                NVFP4=True,
             )
-            raw_scale = max_abs / FP8_MAX
-            bits = raw_scale.to(tl.uint32, bitcast=True)
-            mantissa = bits & 0x007FFFFF
-            rounded_bits = (bits + 0x00800000) & 0x7F800000
-            scale_bits = tl.where(mantissa != 0, rounded_bits, bits & 0x7F800000)
-            scale = scale_bits.to(tl.float32, bitcast=True)
-            quant = tl.maximum(tl.minimum(output / scale, FP8_MAX), -FP8_MAX)
+        else:
+            page_base = page * PAGE_BYTES
+            data_base = page_base + page_row * PAYLOAD_BYTES
+            scale_base = page_base + PAGE_ROWS * PAYLOAD_BYTES + page_row * SCALE_BYTES
+            for scale_group in range(NOPE_DIM // 64):
+                scale_mask = (d >= scale_group * 64) & (d < (scale_group + 1) * 64)
+                max_abs = tl.maximum(
+                    tl.max(tl.where(scale_mask, tl.abs(output), 0.0), axis=0),
+                    1.0e-4,
+                )
+                raw_scale = max_abs / FP8_MAX
+                bits = raw_scale.to(tl.uint32, bitcast=True)
+                mantissa = bits & 0x007FFFFF
+                rounded_bits = (bits + 0x00800000) & 0x7F800000
+                scale_bits = tl.where(mantissa != 0, rounded_bits, bits & 0x7F800000)
+                scale = scale_bits.to(tl.float32, bitcast=True)
+                quant = tl.maximum(tl.minimum(output / scale, FP8_MAX), -FP8_MAX)
+                tl.store(
+                    cache_fp8 + data_base + d,
+                    quant.to(tl.float8e4nv),
+                    mask=scale_mask,
+                )
+                tl.store(
+                    cache_u8 + scale_base + scale_group,
+                    (scale_bits >> 23).to(tl.uint8),
+                )
             tl.store(
-                cache_fp8 + data_base + d,
-                quant.to(tl.float8e4nv),
-                mask=scale_mask,
+                cache_bf16 + data_base // 2 + d - NOPE_DIM // 2,
+                output.to(tl.bfloat16),
+                mask=rope_mask,
             )
-            tl.store(
-                cache_u8 + scale_base + scale_group,
-                (scale_bits >> 23).to(tl.uint8),
-            )
-        tl.store(
-            cache_bf16 + data_base // 2 + d - NOPE_DIM // 2,
-            output.to(tl.bfloat16),
-            mask=rope_mask,
-        )
-        tl.store(cache_u8 + scale_base + 7, 0)
+            tl.store(cache_u8 + scale_base + 7, 0)
 
 
 @triton.jit
@@ -2549,7 +2724,7 @@ def _run_main(binding: DSV4CompressorBinding) -> None:
     ratio = binding.compress_ratio
     projected_width = DSV4_HEAD_DIM * (2 if ratio == 4 else 1)
     page_rows = DSV4_SOURCE_PAGE_SIZE // ratio
-    page_bytes = _compressed_main_page_bytes(ratio)
+    page_bytes = _compressed_main_page_bytes(ratio, binding.cache_format)
     _update_pool_pack_main_kernel[(int(binding.hidden_states.shape[0]),)](
         binding.projection,
         binding.positions,
@@ -2581,6 +2756,7 @@ def _run_main(binding: DSV4CompressorBinding) -> None:
         SCALE_BYTES=DSV4_KV_SCALE_BYTES,
         PAGE_BYTES=page_bytes,
         FP8_MAX=DSV4_FP8_MAX,
+        NVFP4=binding.cache_format == "nvfp4",
         num_warps=8,
     )
 
@@ -2627,7 +2803,7 @@ def _run_prefill_main(binding: DSV4CompressorPrefillBinding) -> None:
     ratio = binding.compress_ratio
     projected_width = DSV4_HEAD_DIM * (2 if ratio == 4 else 1)
     page_rows = DSV4_SOURCE_PAGE_SIZE // ratio
-    page_bytes = _compressed_main_page_bytes(ratio)
+    page_bytes = _compressed_main_page_bytes(ratio, binding.cache_format)
     _prefill_pool_pack_main_kernel[(binding.group_capacity,)](
         binding.projection,
         binding.active_groups,
@@ -2655,6 +2831,7 @@ def _run_prefill_main(binding: DSV4CompressorPrefillBinding) -> None:
         SCALE_BYTES=DSV4_KV_SCALE_BYTES,
         PAGE_BYTES=page_bytes,
         FP8_MAX=DSV4_FP8_MAX,
+        NVFP4=binding.cache_format == "nvfp4",
         num_warps=8,
     )
 
@@ -2763,7 +2940,7 @@ def _run_continuation_main(binding: DSV4CompressorContinuationBinding) -> None:
     ratio = binding.compress_ratio
     projected_width = DSV4_HEAD_DIM * (2 if ratio == 4 else 1)
     page_rows = DSV4_SOURCE_PAGE_SIZE // ratio
-    page_bytes = _compressed_main_page_bytes(ratio)
+    page_bytes = _compressed_main_page_bytes(ratio, binding.cache_format)
     _continuation_pool_pack_main_kernel[(binding.group_capacity,)](
         binding.projection,
         binding.active_groups,
@@ -2799,6 +2976,7 @@ def _run_continuation_main(binding: DSV4CompressorContinuationBinding) -> None:
         SCALE_BYTES=DSV4_KV_SCALE_BYTES,
         PAGE_BYTES=page_bytes,
         FP8_MAX=DSV4_FP8_MAX,
+        NVFP4=binding.cache_format == "nvfp4",
         num_warps=8,
     )
 

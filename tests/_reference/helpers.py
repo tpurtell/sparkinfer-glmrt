@@ -31,6 +31,56 @@ E2M1_TO_FLOAT32 = [
 ]
 
 
+def pack_dsv4_nvfp4_record_reference(values: torch.Tensor) -> torch.Tensor:
+    """Pack normalized/rotated 512-D DSV4 latents into native 432-B rows."""
+
+    rows = int(values.shape[0])
+    grouped = values.float().reshape(rows, 32, 16)
+    raw_scale = (grouped.abs().amax(dim=-1) / 6.0).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    scales = raw_scale.to(torch.float8_e4m3fn)
+    scaled = grouped / scales.float().unsqueeze(-1)
+    magnitude = scaled.abs()
+    codes = torch.where(
+        magnitude <= 0.25,
+        0,
+        torch.where(
+            magnitude < 0.75,
+            1,
+            torch.where(
+                magnitude <= 1.25,
+                2,
+                torch.where(
+                    magnitude < 1.75,
+                    3,
+                    torch.where(
+                        magnitude <= 2.5,
+                        4,
+                        torch.where(
+                            magnitude < 3.5,
+                            5,
+                            torch.where(magnitude <= 5.0, 6, 7),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    ).to(torch.uint8)
+    codes |= torch.signbit(scaled).to(torch.uint8) << 3
+    pairs = codes.reshape(rows, 256, 2)
+    packed = pairs[..., 0] | (pairs[..., 1] << 4)
+    return torch.cat(
+        (
+            packed,
+            scales.view(torch.uint8),
+            torch.zeros((rows, 16), device=values.device, dtype=torch.uint8),
+            values[:, 448:].contiguous().view(torch.uint8).reshape(rows, 128),
+        ),
+        dim=1,
+    )
+
+
 def dequantize_nvfp4_mla_nope(
     records: torch.Tensor,
     *,

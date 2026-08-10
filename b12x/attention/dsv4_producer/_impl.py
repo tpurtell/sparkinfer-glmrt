@@ -27,6 +27,8 @@ DSV4_KV_PAGE_SIZE = 256
 DSV4_KV_PAYLOAD_BYTES = 576
 DSV4_KV_SCALE_BYTES = 8
 DSV4_KV_PAGE_BYTES = 149_760
+DSV4_NVFP4_RECORD_BYTES = 432
+DSV4_NVFP4_PAGE_BYTES = DSV4_KV_PAGE_SIZE * DSV4_NVFP4_RECORD_BYTES
 DSV4_FP8_MAX = 448.0
 DSV4_INDEX_HEADS = 64
 DSV4_INDEX_HEAD_DIM = 128
@@ -89,6 +91,7 @@ class DSV4ProducerCaps:
     nope_dim: int = DSV4_NOPE_DIM
     rope_dim: int = DSV4_ROPE_DIM
     page_size: int = DSV4_KV_PAGE_SIZE
+    cache_format: str = "fp8"
     dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self) -> None:
@@ -100,6 +103,7 @@ class DSV4ProducerCaps:
         object.__setattr__(self, "hidden", int(self.hidden))
         object.__setattr__(self, "q_lora_rank", int(self.q_lora_rank))
         object.__setattr__(self, "heads", int(self.heads))
+        object.__setattr__(self, "cache_format", str(self.cache_format).strip().lower())
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
         if self.hidden not in (4096, 7168):
@@ -121,10 +125,23 @@ class DSV4ProducerCaps:
             raise ValueError(
                 f"DSV4 producer requires {DSV4_KV_PAGE_SIZE}-token pages, got {self.page_size}"
             )
+        if self.cache_format not in ("fp8", "nvfp4"):
+            raise ValueError(
+                "DSV4 producer cache_format must be fp8 or nvfp4, got "
+                f"{self.cache_format!r}"
+            )
         if self.dtype != torch.bfloat16:
             raise ValueError(
                 f"DSV4 producer requires BF16 activations, got {self.dtype}"
             )
+
+    @property
+    def main_page_bytes(self) -> int:
+        return (
+            DSV4_NVFP4_PAGE_BYTES
+            if self.cache_format == "nvfp4"
+            else DSV4_KV_PAGE_BYTES
+        )
 
 
 @dataclass(frozen=True)
@@ -171,6 +188,7 @@ class DSV4ProducerBinding:
     q_linear: BlockFP8LinearBinding
     qkv_output: torch.Tensor
     q_rank: torch.Tensor
+    cache_format: str
     eps: float
 
     def run(self) -> torch.Tensor:
@@ -187,6 +205,7 @@ class DSV4KVProducerBinding:
     weights: DSV4KVProducerWeights | DSV4ProducerWeights
     kv_linear: BlockFP8LinearBinding
     kv_output: torch.Tensor
+    cache_format: str
     eps: float
 
     def run(self) -> torch.Tensor:
@@ -432,6 +451,7 @@ class DSV4ProducerPlan:
             q_linear=q_linear,
             qkv_output=qkv_output,
             q_rank=q_rank,
+            cache_format=self.caps.cache_format,
             eps=float(eps),
         )
 
@@ -499,6 +519,7 @@ class DSV4KVProducerPlan:
             weights=weights,
             kv_linear=kv_linear,
             kv_output=kv_output,
+            cache_format=self.caps.cache_format,
             eps=float(eps),
         )
 
@@ -1027,18 +1048,50 @@ def _validate_kv_runtime_tensors(
         raise ValueError("cos_sin_cache must be contiguous FP32")
     if (
         main_kv_cache.ndim != 2
-        or main_kv_cache.shape[1] != DSV4_KV_PAGE_BYTES
+        or main_kv_cache.shape[1] != caps.main_page_bytes
         or main_kv_cache.dtype != torch.uint8
         or not main_kv_cache.is_contiguous()
     ):
         raise ValueError(
-            f"main_kv_cache must be contiguous uint8 [pages,{DSV4_KV_PAGE_BYTES}]"
+            "main_kv_cache must be contiguous uint8 "
+            f"[pages,{caps.main_page_bytes}] for {caps.cache_format}"
         )
     if int(main_kv_cache.shape[0]) <= 0:
         raise ValueError("main_kv_cache must contain at least one physical page")
     if not math.isfinite(float(eps)) or not float(eps) > 0.0:
         raise ValueError(f"eps must be finite and positive, got {eps}")
     return tokens
+
+
+@triton.jit
+def _float_to_e2m1(value):
+    magnitude = tl.abs(value)
+    code = tl.where(
+        magnitude <= 0.25,
+        0,
+        tl.where(
+            magnitude < 0.75,
+            1,
+            tl.where(
+                magnitude <= 1.25,
+                2,
+                tl.where(
+                    magnitude < 1.75,
+                    3,
+                    tl.where(
+                        magnitude <= 2.5,
+                        4,
+                        tl.where(
+                            magnitude < 3.5,
+                            5,
+                            tl.where(magnitude <= 5.0, 6, 7),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return code.to(tl.uint8) | ((value < 0).to(tl.uint8) << 3)
 
 
 @triton.jit
@@ -1067,6 +1120,7 @@ def _normalize_rank_pack_kv_kernel(
     SCALE_BYTES: tl.constexpr,
     PAGE_BYTES: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    NVFP4: tl.constexpr,
 ):
     token = tl.program_id(0)
 
@@ -1092,55 +1146,109 @@ def _normalize_rank_pack_kv_kernel(
     page = slot // PAGE_SIZE
     row = slot - page * PAGE_SIZE
     page_base = page * PAGE_BYTES
-    data_base = page_base + row * PAYLOAD_BYTES
-    scale_base = page_base + PAGE_SIZE * PAYLOAD_BYTES + row * SCALE_BYTES
 
-    # Store seven independently scaled 64-value NoPE groups. The integer
-    # exponent path implements pow2-ceil without an approximate log2 boundary.
-    gd = tl.arange(0, 64)
-    for group in range(NOPE_DIM // 64):
-        dim = group * 64 + gd
-        values = tl.load(qkv + token * qkv_stride_t + Q_RANK + dim).to(tl.float32)
-        weights = tl.load(kv_norm + dim).to(tl.float32)
-        values = (values * k_inv * weights).to(tl.bfloat16).to(tl.float32)
-        max_abs = tl.maximum(tl.max(tl.abs(values), axis=0), 1.0e-4)
-        raw_scale = max_abs / FP8_MAX
-        bits = raw_scale.to(tl.uint32, bitcast=True)
-        mantissa = bits & 0x007FFFFF
-        rounded = (bits + 0x00800000) & 0x7F800000
-        scale_bits = tl.where(mantissa != 0, rounded, bits & 0x7F800000)
-        scale = scale_bits.to(tl.float32, bitcast=True)
-        quant = tl.maximum(tl.minimum(values / scale, FP8_MAX), -FP8_MAX)
-        tl.store(cache_fp8 + data_base + dim, quant.to(tl.float8e4nv))
-        tl.store(cache_u8 + scale_base + group, (scale_bits >> 23).to(tl.uint8))
+    if NVFP4:
+        # Quantize the complete rotated latent because V consumes all 512
+        # dimensions; K reads 0:448 plus the separately stored BF16 RoPE tail.
+        dim = tl.arange(0, HEAD_DIM)
+        raw = tl.load(qkv + token * qkv_stride_t + Q_RANK + dim).to(tl.float32)
+        weight = tl.load(kv_norm + dim).to(tl.float32)
+        normalized = (raw * k_inv * weight).to(tl.bfloat16).to(tl.float32)
+        rope_mask = dim >= NOPE_DIM
+        rope_dim = dim - NOPE_DIM
+        partner_dim = NOPE_DIM + (rope_dim ^ 1)
+        partner_raw = tl.load(
+            qkv + token * qkv_stride_t + Q_RANK + partner_dim,
+            mask=rope_mask,
+            other=0.0,
+        ).to(tl.float32)
+        partner_weight = tl.load(kv_norm + partner_dim, mask=rope_mask, other=0.0).to(
+            tl.float32
+        )
+        partner = (partner_raw * k_inv * partner_weight).to(tl.bfloat16).to(tl.float32)
+        pos = tl.load(positions + token)
+        pair = tl.maximum(rope_dim >> 1, 0)
+        cs = cos_sin + pos * cos_sin_stride_pos
+        cos_v = tl.load(cs + pair, mask=rope_mask, other=1.0)
+        sin_v = tl.load(cs + ROPE_DIM // 2 + pair, mask=rope_mask, other=0.0)
+        rotated = tl.where(
+            (rope_dim & 1) == 0,
+            normalized * cos_v - partner * sin_v,
+            normalized * cos_v + partner * sin_v,
+        )
+        output = tl.where(rope_mask, rotated, normalized).to(tl.bfloat16).to(tl.float32)
+        data_base = page_base + row * 432
+        quant_3d = tl.reshape(output, (32, 8, 2))
+        lo, hi = tl.split(quant_3d)
+        max_abs = tl.maximum(tl.max(tl.abs(lo), axis=1), tl.max(tl.abs(hi), axis=1))
+        raw_scale = tl.maximum(max_abs * (1.0 / 6.0), 1.1754943508222875e-38)
+        scale_fp8 = raw_scale.to(tl.float8e4nv)
+        decoded_scale = scale_fp8.to(tl.float32)
+        inv_scale = tl.reshape(1.0 / decoded_scale, (32, 1))
+        packed = _float_to_e2m1(lo * inv_scale) | (_float_to_e2m1(hi * inv_scale) << 4)
+        tl.store(cache_u8 + data_base + tl.arange(0, 256), tl.reshape(packed, (256,)))
+        tl.store(
+            cache_u8 + data_base + 256 + tl.arange(0, 32),
+            scale_fp8.to(tl.uint8, bitcast=True),
+        )
+        tl.store(cache_u8 + data_base + 288 + tl.arange(0, 16), 0)
+        rope_local = dim - NOPE_DIM
+        tl.store(
+            cache_bf16 + (data_base + 304) // 2 + rope_local,
+            output.to(tl.bfloat16),
+            mask=rope_mask,
+        )
+    else:
+        data_base = page_base + row * PAYLOAD_BYTES
+        scale_base = page_base + PAGE_SIZE * PAYLOAD_BYTES + row * SCALE_BYTES
+        # Store seven independently scaled 64-value NoPE groups. The integer
+        # exponent path implements pow2-ceil without an approximate log2 boundary.
+        gd = tl.arange(0, 64)
+        for group in range(NOPE_DIM // 64):
+            dim = group * 64 + gd
+            values = tl.load(qkv + token * qkv_stride_t + Q_RANK + dim).to(tl.float32)
+            weights = tl.load(kv_norm + dim).to(tl.float32)
+            values = (values * k_inv * weights).to(tl.bfloat16).to(tl.float32)
+            max_abs = tl.maximum(tl.max(tl.abs(values), axis=0), 1.0e-4)
+            raw_scale = max_abs / FP8_MAX
+            bits = raw_scale.to(tl.uint32, bitcast=True)
+            mantissa = bits & 0x007FFFFF
+            rounded = (bits + 0x00800000) & 0x7F800000
+            scale_bits = tl.where(mantissa != 0, rounded, bits & 0x7F800000)
+            scale = scale_bits.to(tl.float32, bitcast=True)
+            quant = tl.maximum(tl.minimum(values / scale, FP8_MAX), -FP8_MAX)
+            tl.store(cache_fp8 + data_base + dim, quant.to(tl.float8e4nv))
+            tl.store(cache_u8 + scale_base + group, (scale_bits >> 23).to(tl.uint8))
 
-    # The RoPE cache is [cos(32), sin(32)] and the model uses adjacent complex
-    # pairs. Store the rotated BF16 lane directly behind the NoPE payload.
-    rd = tl.arange(0, ROPE_DIM)
-    rope_raw = tl.load(qkv + token * qkv_stride_t + Q_RANK + NOPE_DIM + rd).to(
-        tl.float32
-    )
-    rope_weight = tl.load(kv_norm + NOPE_DIM + rd).to(tl.float32)
-    rope = (rope_raw * k_inv * rope_weight).to(tl.bfloat16).to(tl.float32)
-    partner_d = rd ^ 1
-    partner_raw = tl.load(
-        qkv + token * qkv_stride_t + Q_RANK + NOPE_DIM + partner_d
-    ).to(tl.float32)
-    partner_weight = tl.load(kv_norm + NOPE_DIM + partner_d).to(tl.float32)
-    partner = (partner_raw * k_inv * partner_weight).to(tl.bfloat16).to(tl.float32)
-    pos = tl.load(positions + token)
-    pair = rd >> 1
-    cs = cos_sin + pos * cos_sin_stride_pos
-    cos_v = tl.load(cs + pair)
-    sin_v = tl.load(cs + ROPE_DIM // 2 + pair)
-    rotated = tl.where(
-        (rd & 1) == 0,
-        rope * cos_v - partner * sin_v,
-        rope * cos_v + partner * sin_v,
-    )
-    rope_bf16_offset = (data_base + NOPE_DIM) // 2
-    tl.store(cache_bf16 + rope_bf16_offset + rd, rotated.to(tl.bfloat16))
-    tl.store(cache_u8 + scale_base + 7, 0)
+        # Store the rotated BF16 lane directly behind the NoPE payload.
+        rd = tl.arange(0, ROPE_DIM)
+        rope_raw = tl.load(qkv + token * qkv_stride_t + Q_RANK + NOPE_DIM + rd).to(
+            tl.float32
+        )
+        rope_weight = tl.load(kv_norm + NOPE_DIM + rd).to(tl.float32)
+        rope = (rope_raw * k_inv * rope_weight).to(tl.bfloat16).to(tl.float32)
+        partner_d = rd ^ 1
+        partner_raw = tl.load(
+            qkv + token * qkv_stride_t + Q_RANK + NOPE_DIM + partner_d
+        ).to(tl.float32)
+        partner_weight = tl.load(kv_norm + NOPE_DIM + partner_d).to(tl.float32)
+        partner = (partner_raw * k_inv * partner_weight).to(tl.bfloat16).to(tl.float32)
+        pos = tl.load(positions + token)
+        pair = rd >> 1
+        cs = cos_sin + pos * cos_sin_stride_pos
+        cos_v = tl.load(cs + pair)
+        sin_v = tl.load(cs + ROPE_DIM // 2 + pair)
+        rotated = tl.where(
+            (rd & 1) == 0,
+            rope * cos_v - partner * sin_v,
+            rope * cos_v + partner * sin_v,
+        )
+        rope_bf16_offset = (data_base + NOPE_DIM) // 2
+        tl.store(
+            cache_bf16 + rope_bf16_offset + rd,
+            rotated.to(tl.bfloat16),
+        )
+        tl.store(cache_u8 + scale_base + 7, 0)
 
 
 @triton.jit
@@ -1193,6 +1301,7 @@ def _run_normalize_rank_pack_kv(
     main_kv_cache: torch.Tensor,
     *,
     eps: float,
+    cache_format: str = "fp8",
 ) -> None:
     tokens = int(qkv.shape[0])
     q_rank = int(q_rank_out.shape[1])
@@ -1219,8 +1328,11 @@ def _run_normalize_rank_pack_kv(
         PAGE_SIZE=DSV4_KV_PAGE_SIZE,
         PAYLOAD_BYTES=DSV4_KV_PAYLOAD_BYTES,
         SCALE_BYTES=DSV4_KV_SCALE_BYTES,
-        PAGE_BYTES=DSV4_KV_PAGE_BYTES,
+        PAGE_BYTES=(
+            DSV4_NVFP4_PAGE_BYTES if cache_format == "nvfp4" else DSV4_KV_PAGE_BYTES
+        ),
         FP8_MAX=DSV4_FP8_MAX,
+        NVFP4=cache_format == "nvfp4",
         num_warps=8,
     )
 
@@ -1234,6 +1346,7 @@ def _run_normalize_pack_kv(
     main_kv_cache: torch.Tensor,
     *,
     eps: float,
+    cache_format: str = "fp8",
 ) -> None:
     tokens = int(kv.shape[0])
     _normalize_rank_pack_kv_kernel[(tokens,)](
@@ -1259,8 +1372,11 @@ def _run_normalize_pack_kv(
         PAGE_SIZE=DSV4_KV_PAGE_SIZE,
         PAYLOAD_BYTES=DSV4_KV_PAYLOAD_BYTES,
         SCALE_BYTES=DSV4_KV_SCALE_BYTES,
-        PAGE_BYTES=DSV4_KV_PAGE_BYTES,
+        PAGE_BYTES=(
+            DSV4_NVFP4_PAGE_BYTES if cache_format == "nvfp4" else DSV4_KV_PAGE_BYTES
+        ),
         FP8_MAX=DSV4_FP8_MAX,
+        NVFP4=cache_format == "nvfp4",
         num_warps=8,
     )
 
@@ -1449,6 +1565,7 @@ def run_dsv4_producer(*, binding: DSV4ProducerBinding) -> torch.Tensor:
         binding.q_rank,
         binding.main_kv_cache,
         eps=binding.eps,
+        cache_format=binding.cache_format,
     )
     block_fp8_linear_mxfp8(binding=binding.q_linear)
     _run_normalize_query_rope(
@@ -1475,6 +1592,7 @@ def run_dsv4_kv_producer(*, binding: DSV4KVProducerBinding) -> torch.Tensor:
         binding.cos_sin_cache,
         binding.main_kv_cache,
         eps=binding.eps,
+        cache_format=binding.cache_format,
     )
     return kv
 
