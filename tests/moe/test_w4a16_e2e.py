@@ -213,6 +213,7 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
         experts=expert_weights,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        output=torch.empty_like(x),
         quant_mode="w4a16",
     )
     expected = _reference_w4a16(
