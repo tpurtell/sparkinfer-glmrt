@@ -257,6 +257,7 @@ class W4A16MixedTrellisKernel:
                 topk_weights,
                 c_tmp,
                 locks,
+                cutlass.Int64(0),
                 smem_base,
                 tid,
                 first_route_block,
@@ -282,6 +283,7 @@ class W4A16MixedTrellisKernel:
                     topk_weights,
                     c_tmp,
                     locks,
+                    cutlass.Int64(0),
                     smem_base,
                     tid,
                     first_route_block + Int32(subtile),
@@ -761,6 +763,8 @@ class W4A16MixedTrellisKernel:
             gate_suh,
             up_suh,
             descriptor_map,
+            cutlass.Int64(0),
+            cutlass.Int64(0),
             total_experts,
             total_experts,
             smem_base,
@@ -834,6 +838,11 @@ def compile_mixed_trellis(
             scale_format="e4m3_k32",
             w13_layout="trellis3_t256_proj",
             trellis_bits=bits,
+            # EXL3 artifacts use the MCG trellis.  The uniform kernel's
+            # default is SQG, whose decoder requires a live LUT pointer; if
+            # inherited here it silently interprets every mixed MCG tile with
+            # the wrong codebook.
+            trellis_codebook="mcg",
             intermediate_rotation=True,
             full_rotation=True,
             rotation_input_dtype=rotation_input_dtype,

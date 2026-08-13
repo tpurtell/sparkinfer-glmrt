@@ -2475,6 +2475,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            cutlass.const_expr(0),
         )
 
         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
@@ -2487,6 +2488,8 @@ class W4A16GemmKernel:
             s_sh_rd,
             Int32(0),
             Int32(0),
+            reduce_k_tile,
+            cutlass.const_expr(0),
         )
         a0_regs_cur = cute.make_rmem_tensor((2,), Uint32)
         a0_regs_next = cute.make_rmem_tensor((2,), Uint32)
@@ -3009,6 +3012,7 @@ class W4A16GemmKernel:
                             kk,
                             tile_idx,
                             k_tiles,
+                            reduce_k_tile,
                         )
 
                         self._prefetch_pipeline_step(
@@ -3037,6 +3041,7 @@ class W4A16GemmKernel:
                             a_rows_per_iter,
                             output_n_tile,
                             expert_idx,
+                            cutlass.const_expr(0),
                         )
 
                         for jj in cutlass.range_constexpr(4):
@@ -3077,6 +3082,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(0),
                     Int32(0),
+                    reduce_k_tile + tile_idx,
+                    cutlass.const_expr(0),
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_cur,
@@ -3865,6 +3872,7 @@ class W4A16GemmKernel:
         kk: cutlass.Constexpr[int],
         tile_idx: Int32,
         k_tiles: Int32,
+        reduce_k_tile: Int32,
     ):
         self._clear_b_scale_register_bundle(b_scale_next)
         self._clear_a_register_bundle_m8(a0_regs_next)
@@ -3880,6 +3888,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(pipe),
                     Int32(kk + 1),
+                    reduce_k_tile + tile_idx,
+                    cutlass.const_expr(0),
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_next,
@@ -3907,6 +3917,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     next_pipe,
                     Int32(0),
+                    reduce_k_tile + next_tile,
+                    cutlass.const_expr(0),
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_next,
