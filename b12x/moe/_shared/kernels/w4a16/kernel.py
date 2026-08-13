@@ -9006,7 +9006,7 @@ def compile_w4a16_fused_moe(
     # routing for the whole {1,2,4,8} range, so it lifts the default decode cap.
     direct_topk_m_cap = (
         _W4A16_SMALL_M_DIRECT_MAX_M
-        if tc_decode_fused_sum or use_expert_map
+        if tc_decode_fused_sum or use_expert_map or full_rotation
         else _MAX_DIRECT_TOPK_ROUTE_M
     )
     direct_weight_layout_ok = weight_layout == "packed" or (
