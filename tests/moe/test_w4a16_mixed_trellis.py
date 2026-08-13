@@ -145,8 +145,10 @@ def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
 
     driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
     assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
-    assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
+    assert [ast.unparse(arg) for arg in calls[0].args[-12:]] == [
         "descriptor_map",
+        "cutlass.Int64(0)",
+        "cutlass.Int64(0)",
         "total_experts",
         "total_experts",
         "smem_base",
@@ -282,8 +284,10 @@ def _serial_tier(
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("direct_topk_routes", [False, True])
 def test_mixed_k3_k4_matches_serial_and_captures(
     route_ids_dtype: torch.dtype,
+    direct_topk_routes: bool,
 ) -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -328,10 +332,16 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         max_m_blocks=8,
         sms=int(props.multi_processor_count),
         max_shared_mem=int(props.shared_memory_per_block_optin),
-        force_tile_config=(128, 128, 128, 128),
+        force_tile_config=(
+            (64, 128, 64, 128)
+            if direct_topk_routes
+            else (128, 128, 128, 128)
+        ),
         route_ids_dtype=route_ids_dtype,
+        direct_topk_routes=direct_topk_routes,
     )
     assert launch.local_memory_bytes == 0
+    assert launch.direct_topk_routes is direct_topk_routes
     global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
     rotations = combine_trellis_rotations(tier0, tier1)
     buffers = make_mixed_trellis_buffers(
