@@ -126,7 +126,11 @@ class DSV4CompressorCaps:
 
     @property
     def state_rows(self) -> int:
-        return self.coefficient * self.compress_ratio
+        # Keep one complete history window plus one equally sized guard
+        # window.  Continuation state is addressed by absolute logical
+        # position, so jointly evaluated speculative suffixes cannot overwrite
+        # the accepted history needed when the suffix is retried or rejected.
+        return 2 * self.coefficient * self.compress_ratio
 
     @property
     def main_page_rows(self) -> int:
@@ -1023,6 +1027,7 @@ def _update_pool_pack_main_kernel(
     PROJECTION_OFFSET: tl.constexpr,
     PROJECTED_WIDTH: tl.constexpr,
     PROJECTED_BLOCK: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
     RATIO: tl.constexpr,
     OVERLAP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -1039,7 +1044,7 @@ def _update_pool_pack_main_kernel(
     position = tl.load(positions + token)
     sequence = tl.load(sequence_ids + token).to(tl.int64)
     lane = position % RATIO
-    state_row = lane + RATIO if OVERLAP else lane
+    state_row = position % STATE_ROWS
     state_base = sequence * state_stride_seq + state_row * state_stride_row
 
     pd = tl.arange(0, PROJECTED_BLOCK)
@@ -1067,27 +1072,30 @@ def _update_pool_pack_main_kernel(
         d = tl.arange(0, HEAD_DIM)
         row_max = tl.full((HEAD_DIM,), float("-inf"), tl.float32)
         for row in range(RATIO):
+            group_start = position + 1 - RATIO
             if OVERLAP:
-                previous_base = sequence * state_stride_seq + row * state_stride_row
-                current_base = (
-                    sequence * state_stride_seq + (RATIO + row) * state_stride_row
-                )
+                previous_row = (group_start - RATIO + row) % STATE_ROWS
+                current_row = (group_start + row) % STATE_ROWS
+                previous_base = sequence * state_stride_seq + previous_row * state_stride_row
+                current_base = sequence * state_stride_seq + current_row * state_stride_row
                 previous_score = tl.load(score_state + previous_base + d)
                 current_score = tl.load(score_state + current_base + HEAD_DIM + d)
                 row_max = tl.maximum(row_max, previous_score)
                 row_max = tl.maximum(row_max, current_score)
             else:
-                row_base = sequence * state_stride_seq + row * state_stride_row
+                current_row = (group_start + row) % STATE_ROWS
+                row_base = sequence * state_stride_seq + current_row * state_stride_row
                 row_max = tl.maximum(row_max, tl.load(score_state + row_base + d))
 
         numerator = tl.zeros((HEAD_DIM,), tl.float32)
         denominator = tl.zeros((HEAD_DIM,), tl.float32)
         for row in range(RATIO):
+            group_start = position + 1 - RATIO
             if OVERLAP:
-                previous_base = sequence * state_stride_seq + row * state_stride_row
-                current_base = (
-                    sequence * state_stride_seq + (RATIO + row) * state_stride_row
-                )
+                previous_row = (group_start - RATIO + row) % STATE_ROWS
+                current_row = (group_start + row) % STATE_ROWS
+                previous_base = sequence * state_stride_seq + previous_row * state_stride_row
+                current_base = sequence * state_stride_seq + current_row * state_stride_row
                 previous_score = tl.load(score_state + previous_base + d)
                 current_score = tl.load(score_state + current_base + HEAD_DIM + d)
                 previous_weight = tl.exp(previous_score - row_max)
@@ -1098,7 +1106,8 @@ def _update_pool_pack_main_kernel(
                 )
                 denominator += previous_weight + current_weight
             else:
-                row_base = sequence * state_stride_seq + row * state_stride_row
+                current_row = (group_start + row) % STATE_ROWS
+                row_base = sequence * state_stride_seq + current_row * state_stride_row
                 row_score = tl.load(score_state + row_base + d)
                 row_weight = tl.exp(row_score - row_max)
                 numerator += row_weight * tl.load(kv_state + row_base + d)
@@ -1119,11 +1128,12 @@ def _update_pool_pack_main_kernel(
             tl.zeros((HEAD_DIM,), tl.float32),
         )
         for row in range(RATIO):
+            group_start = position + 1 - RATIO
             if OVERLAP:
-                previous_base = sequence * state_stride_seq + row * state_stride_row
-                current_base = (
-                    sequence * state_stride_seq + (RATIO + row) * state_stride_row
-                )
+                previous_row = (group_start - RATIO + row) % STATE_ROWS
+                current_row = (group_start + row) % STATE_ROWS
+                previous_base = sequence * state_stride_seq + previous_row * state_stride_row
+                current_base = sequence * state_stride_seq + current_row * state_stride_row
                 previous_score = tl.load(
                     score_state + previous_base + partner_d,
                     mask=rope_mask,
@@ -1137,7 +1147,8 @@ def _update_pool_pack_main_kernel(
                 partner_max = tl.maximum(partner_max, previous_score)
                 partner_max = tl.maximum(partner_max, current_score)
             else:
-                row_base = sequence * state_stride_seq + row * state_stride_row
+                current_row = (group_start + row) % STATE_ROWS
+                row_base = sequence * state_stride_seq + current_row * state_stride_row
                 partner_max = tl.maximum(
                     partner_max,
                     tl.load(
@@ -1149,11 +1160,12 @@ def _update_pool_pack_main_kernel(
         partner_num = tl.zeros((HEAD_DIM,), tl.float32)
         partner_den = tl.zeros((HEAD_DIM,), tl.float32)
         for row in range(RATIO):
+            group_start = position + 1 - RATIO
             if OVERLAP:
-                previous_base = sequence * state_stride_seq + row * state_stride_row
-                current_base = (
-                    sequence * state_stride_seq + (RATIO + row) * state_stride_row
-                )
+                previous_row = (group_start - RATIO + row) % STATE_ROWS
+                current_row = (group_start + row) % STATE_ROWS
+                previous_base = sequence * state_stride_seq + previous_row * state_stride_row
+                current_base = sequence * state_stride_seq + current_row * state_stride_row
                 previous_score = tl.load(
                     score_state + previous_base + partner_d,
                     mask=rope_mask,
@@ -1178,7 +1190,8 @@ def _update_pool_pack_main_kernel(
                 )
                 partner_den += previous_weight + current_weight
             else:
-                row_base = sequence * state_stride_seq + row * state_stride_row
+                current_row = (group_start + row) % STATE_ROWS
+                row_base = sequence * state_stride_seq + current_row * state_stride_row
                 partner_score = tl.load(
                     score_state + row_base + partner_d,
                     mask=rope_mask,
@@ -1266,24 +1279,6 @@ def _update_pool_pack_main_kernel(
             )
             tl.store(cache_u8 + scale_base + 7, 0)
 
-        if OVERLAP:
-            for row in range(RATIO):
-                previous_base = sequence * state_stride_seq + row * state_stride_row
-                current_base = (
-                    sequence * state_stride_seq + (RATIO + row) * state_stride_row
-                )
-                tl.store(
-                    kv_state + previous_base + pd,
-                    tl.load(kv_state + current_base + pd, mask=pmask, other=0.0),
-                    mask=pmask,
-                )
-                tl.store(
-                    score_state + previous_base + pd,
-                    tl.load(score_state + current_base + pd, mask=pmask, other=0.0),
-                    mask=pmask,
-                )
-
-
 @triton.jit
 def _fwht_stage(values, d, WIDTH: tl.constexpr, HEAD_DIM: tl.constexpr):
     shaped = tl.reshape(values, (HEAD_DIM // (2 * WIDTH), 2, WIDTH))
@@ -1311,6 +1306,7 @@ def _update_pool_pack_index_kernel(
     eps,
     PROJECTION_OFFSET: tl.constexpr,
     PROJECTED_WIDTH: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
     RATIO: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
@@ -1323,7 +1319,7 @@ def _update_pool_pack_index_kernel(
     position = tl.load(positions + token)
     sequence = tl.load(sequence_ids + token).to(tl.int64)
     lane = position % RATIO
-    state_row = RATIO + lane
+    state_row = position % STATE_ROWS
     state_base = sequence * state_stride_seq + state_row * state_stride_row
     pd = tl.arange(0, PROJECTED_WIDTH)
     projected = tl.load(
@@ -1342,13 +1338,14 @@ def _update_pool_pack_index_kernel(
 
     emits = lane + 1 == RATIO
     if emits:
+        group_start = position + 1 - RATIO
         d = tl.arange(0, HEAD_DIM)
         row_max = tl.full((HEAD_DIM,), float("-inf"), tl.float32)
         for row in range(RATIO):
-            previous_base = sequence * state_stride_seq + row * state_stride_row
-            current_base = (
-                sequence * state_stride_seq + (RATIO + row) * state_stride_row
-            )
+            previous_row = (group_start - RATIO + row) % STATE_ROWS
+            current_row = (group_start + row) % STATE_ROWS
+            previous_base = sequence * state_stride_seq + previous_row * state_stride_row
+            current_base = sequence * state_stride_seq + current_row * state_stride_row
             row_max = tl.maximum(row_max, tl.load(score_state + previous_base + d))
             row_max = tl.maximum(
                 row_max, tl.load(score_state + current_base + HEAD_DIM + d)
@@ -1356,10 +1353,10 @@ def _update_pool_pack_index_kernel(
         numerator = tl.zeros((HEAD_DIM,), tl.float32)
         denominator = tl.zeros((HEAD_DIM,), tl.float32)
         for row in range(RATIO):
-            previous_base = sequence * state_stride_seq + row * state_stride_row
-            current_base = (
-                sequence * state_stride_seq + (RATIO + row) * state_stride_row
-            )
+            previous_row = (group_start - RATIO + row) % STATE_ROWS
+            current_row = (group_start + row) % STATE_ROWS
+            previous_base = sequence * state_stride_seq + previous_row * state_stride_row
+            current_base = sequence * state_stride_seq + current_row * state_stride_row
             previous_score = tl.load(score_state + previous_base + d)
             current_score = tl.load(score_state + current_base + HEAD_DIM + d)
             previous_weight = tl.exp(previous_score - row_max)
@@ -1385,10 +1382,10 @@ def _update_pool_pack_index_kernel(
             tl.zeros((HEAD_DIM,), tl.float32),
         )
         for row in range(RATIO):
-            previous_base = sequence * state_stride_seq + row * state_stride_row
-            current_base = (
-                sequence * state_stride_seq + (RATIO + row) * state_stride_row
-            )
+            previous_row = (group_start - RATIO + row) % STATE_ROWS
+            current_row = (group_start + row) % STATE_ROWS
+            previous_base = sequence * state_stride_seq + previous_row * state_stride_row
+            current_base = sequence * state_stride_seq + current_row * state_stride_row
             partner_max = tl.maximum(
                 partner_max,
                 tl.load(
@@ -1408,10 +1405,10 @@ def _update_pool_pack_index_kernel(
         partner_num = tl.zeros((HEAD_DIM,), tl.float32)
         partner_den = tl.zeros((HEAD_DIM,), tl.float32)
         for row in range(RATIO):
-            previous_base = sequence * state_stride_seq + row * state_stride_row
-            current_base = (
-                sequence * state_stride_seq + (RATIO + row) * state_stride_row
-            )
+            previous_row = (group_start - RATIO + row) % STATE_ROWS
+            current_row = (group_start + row) % STATE_ROWS
+            previous_base = sequence * state_stride_seq + previous_row * state_stride_row
+            current_base = sequence * state_stride_seq + current_row * state_stride_row
             previous_score = tl.load(
                 score_state + previous_base + partner_d,
                 mask=rope_mask,
@@ -1527,20 +1524,6 @@ def _update_pool_pack_index_kernel(
             cache_fp32 + (page_base + PAGE_ROWS * HEAD_DIM) // 4 + page_row,
             cache_scale,
         )
-
-        for row in range(RATIO):
-            previous_base = sequence * state_stride_seq + row * state_stride_row
-            current_base = (
-                sequence * state_stride_seq + (RATIO + row) * state_stride_row
-            )
-            tl.store(
-                kv_state + previous_base + pd, tl.load(kv_state + current_base + pd)
-            )
-            tl.store(
-                score_state + previous_base + pd,
-                tl.load(score_state + current_base + pd),
-            )
-
 
 @triton.jit
 def _prefill_pool_dimension(
@@ -1987,8 +1970,8 @@ def _prefill_finalize_state_kernel(
     PROJECTION_OFFSET: tl.constexpr,
     PROJECTED_WIDTH: tl.constexpr,
     PROJECTED_BLOCK: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
     RATIO: tl.constexpr,
-    OVERLAP: tl.constexpr,
 ):
     sequence_slot = tl.program_id(0)
     state_row = tl.program_id(1)
@@ -1997,21 +1980,12 @@ def _prefill_finalize_state_kernel(
         source_start = tl.load(sequence_offsets + sequence_slot)
         source_end = tl.load(sequence_offsets + sequence_slot + 1)
         source_tokens = source_end - source_start
-        cutoff = (source_tokens // RATIO) * RATIO
-        remainder = source_tokens - cutoff
-        if OVERLAP:
-            previous = state_row < RATIO
-            lane = tl.where(previous, state_row, state_row - RATIO)
-            fill = tl.where(previous, cutoff >= RATIO, lane < remainder)
-            source_row = tl.where(
-                previous,
-                source_start + cutoff - RATIO + lane,
-                source_start + cutoff + lane,
-            )
-        else:
-            lane = state_row
-            fill = lane < remainder
-            source_row = source_start + cutoff + lane
+        last_position = source_tokens - 1
+        cycles = tl.maximum((last_position - state_row) // STATE_ROWS, 0)
+        source_position = state_row + cycles * STATE_ROWS
+        fill = source_position <= last_position
+        source_row = source_start + source_position
+        lane = source_position % RATIO
         pd = tl.arange(0, PROJECTED_BLOCK)
         pmask = pd < PROJECTED_WIDTH
         state_base = state_sequence * state_stride_seq + state_row * state_stride_row
@@ -2058,8 +2032,8 @@ def _continuation_load_dimension(
     state_stride_row,
     PROJECTION_OFFSET: tl.constexpr,
     PROJECTED_WIDTH: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
     RATIO: tl.constexpr,
-    OVERLAP: tl.constexpr,
     SCORE: tl.constexpr,
 ):
     source_valid = source_position >= 0
@@ -2083,15 +2057,7 @@ def _continuation_load_dimension(
             other=0.0,
         )
 
-    initial_group_start = chunk_logical_start - chunk_logical_start % RATIO
-    if OVERLAP:
-        state_row = tl.where(
-            source_position >= initial_group_start,
-            RATIO + lane,
-            lane,
-        )
-    else:
-        state_row = lane
+    state_row = source_position % STATE_ROWS
     state_base = state_sequence * state_stride_seq + state_row * state_stride_row
     carried = tl.load(
         state + state_base + d,
@@ -2118,6 +2084,7 @@ def _continuation_pool_dimension(
     state_stride_row,
     PROJECTION_OFFSET: tl.constexpr,
     PROJECTED_WIDTH: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
     RATIO: tl.constexpr,
     OVERLAP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -2145,8 +2112,8 @@ def _continuation_pool_dimension(
             state_stride_row,
             PROJECTION_OFFSET=PROJECTION_OFFSET,
             PROJECTED_WIDTH=PROJECTED_WIDTH,
+            STATE_ROWS=STATE_ROWS,
             RATIO=RATIO,
-            OVERLAP=OVERLAP,
             SCORE=True,
         )
         row_max = tl.maximum(row_max, current_score)
@@ -2168,8 +2135,8 @@ def _continuation_pool_dimension(
                 state_stride_row,
                 PROJECTION_OFFSET=PROJECTION_OFFSET,
                 PROJECTED_WIDTH=PROJECTED_WIDTH,
+                STATE_ROWS=STATE_ROWS,
                 RATIO=RATIO,
-                OVERLAP=OVERLAP,
                 SCORE=True,
             )
             row_max = tl.maximum(row_max, previous_score)
@@ -2193,8 +2160,8 @@ def _continuation_pool_dimension(
             state_stride_row,
             PROJECTION_OFFSET=PROJECTION_OFFSET,
             PROJECTED_WIDTH=PROJECTED_WIDTH,
+            STATE_ROWS=STATE_ROWS,
             RATIO=RATIO,
-            OVERLAP=OVERLAP,
             SCORE=True,
         )
         current_value = _continuation_load_dimension(
@@ -2212,8 +2179,8 @@ def _continuation_pool_dimension(
             state_stride_row,
             PROJECTION_OFFSET=PROJECTION_OFFSET,
             PROJECTED_WIDTH=PROJECTED_WIDTH,
+            STATE_ROWS=STATE_ROWS,
             RATIO=RATIO,
-            OVERLAP=OVERLAP,
             SCORE=False,
         )
         current_weight = tl.exp(current_score - row_max)
@@ -2237,8 +2204,8 @@ def _continuation_pool_dimension(
                 state_stride_row,
                 PROJECTION_OFFSET=PROJECTION_OFFSET,
                 PROJECTED_WIDTH=PROJECTED_WIDTH,
+                STATE_ROWS=STATE_ROWS,
                 RATIO=RATIO,
-                OVERLAP=OVERLAP,
                 SCORE=True,
             )
             previous_value = _continuation_load_dimension(
@@ -2256,8 +2223,8 @@ def _continuation_pool_dimension(
                 state_stride_row,
                 PROJECTION_OFFSET=PROJECTION_OFFSET,
                 PROJECTED_WIDTH=PROJECTED_WIDTH,
+                STATE_ROWS=STATE_ROWS,
                 RATIO=RATIO,
-                OVERLAP=OVERLAP,
                 SCORE=False,
             )
             previous_weight = tl.exp(previous_score - row_max)
@@ -2292,6 +2259,7 @@ def _continuation_pool_pack_main_kernel(
     eps,
     PROJECTION_OFFSET: tl.constexpr,
     PROJECTED_WIDTH: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
     RATIO: tl.constexpr,
     OVERLAP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -2331,6 +2299,7 @@ def _continuation_pool_pack_main_kernel(
                 state_stride_row,
                 PROJECTION_OFFSET=PROJECTION_OFFSET,
                 PROJECTED_WIDTH=PROJECTED_WIDTH,
+                STATE_ROWS=STATE_ROWS,
                 RATIO=RATIO,
                 OVERLAP=OVERLAP,
                 HEAD_DIM=HEAD_DIM,
@@ -2364,6 +2333,7 @@ def _continuation_pool_pack_main_kernel(
                 state_stride_row,
                 PROJECTION_OFFSET=PROJECTION_OFFSET,
                 PROJECTED_WIDTH=PROJECTED_WIDTH,
+                STATE_ROWS=STATE_ROWS,
                 RATIO=RATIO,
                 OVERLAP=OVERLAP,
                 HEAD_DIM=HEAD_DIM,
@@ -2470,6 +2440,7 @@ def _continuation_pool_pack_index_kernel(
     eps,
     PROJECTION_OFFSET: tl.constexpr,
     PROJECTED_WIDTH: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
     RATIO: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
@@ -2505,6 +2476,7 @@ def _continuation_pool_pack_index_kernel(
                 state_stride_row,
                 PROJECTION_OFFSET=PROJECTION_OFFSET,
                 PROJECTED_WIDTH=PROJECTED_WIDTH,
+                STATE_ROWS=STATE_ROWS,
                 RATIO=RATIO,
                 OVERLAP=True,
                 HEAD_DIM=HEAD_DIM,
@@ -2537,6 +2509,7 @@ def _continuation_pool_pack_index_kernel(
                 state_stride_row,
                 PROJECTION_OFFSET=PROJECTION_OFFSET,
                 PROJECTED_WIDTH=PROJECTED_WIDTH,
+                STATE_ROWS=STATE_ROWS,
                 RATIO=RATIO,
                 OVERLAP=True,
                 HEAD_DIM=HEAD_DIM,
@@ -2646,33 +2619,21 @@ def _continuation_finalize_state_kernel(
     PROJECTION_OFFSET: tl.constexpr,
     PROJECTED_WIDTH: tl.constexpr,
     PROJECTED_BLOCK: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
     RATIO: tl.constexpr,
-    OVERLAP: tl.constexpr,
-    STATE_ROW_START: tl.constexpr,
 ):
     sequence_slot = tl.program_id(0)
-    state_row = STATE_ROW_START + tl.program_id(1)
+    state_row = tl.program_id(1)
     if sequence_slot < tl.load(active_sequences):
         sequence_chunk_offset = tl.load(sequence_offsets + sequence_slot)
         sequence_chunk_end = tl.load(sequence_offsets + sequence_slot + 1)
         chunk_logical_start = tl.load(sequence_start_positions + sequence_slot)
         state_sequence = tl.load(state_sequence_ids + sequence_slot).to(tl.int64)
         logical_end = chunk_logical_start + sequence_chunk_end - sequence_chunk_offset
-        cutoff = logical_end // RATIO * RATIO
-        remainder = logical_end - cutoff
-        if OVERLAP:
-            previous = state_row < RATIO
-            lane = tl.where(previous, state_row, state_row - RATIO)
-            fill = tl.where(previous, cutoff >= RATIO, lane < remainder)
-            source_position = tl.where(
-                previous,
-                cutoff - RATIO + lane,
-                cutoff + lane,
-            )
-        else:
-            lane = state_row
-            fill = lane < remainder
-            source_position = cutoff + lane
+        last_position = logical_end - 1
+        cycles = tl.maximum((last_position - state_row) // STATE_ROWS, 0)
+        source_position = state_row + cycles * STATE_ROWS
+        fill = source_position <= last_position
         pd = tl.arange(0, PROJECTED_BLOCK)
         pmask = pd < PROJECTED_WIDTH
         values = _continuation_load_dimension(
@@ -2690,8 +2651,8 @@ def _continuation_finalize_state_kernel(
             state_stride_row,
             PROJECTION_OFFSET=PROJECTION_OFFSET,
             PROJECTED_WIDTH=PROJECTED_WIDTH,
+            STATE_ROWS=STATE_ROWS,
             RATIO=RATIO,
-            OVERLAP=OVERLAP,
             SCORE=False,
         )
         scores = _continuation_load_dimension(
@@ -2709,8 +2670,8 @@ def _continuation_finalize_state_kernel(
             state_stride_row,
             PROJECTION_OFFSET=PROJECTION_OFFSET,
             PROJECTED_WIDTH=PROJECTED_WIDTH,
+            STATE_ROWS=STATE_ROWS,
             RATIO=RATIO,
-            OVERLAP=OVERLAP,
             SCORE=True,
         )
         values = tl.where(fill, values, 0.0)
@@ -2746,6 +2707,7 @@ def _run_main(binding: DSV4CompressorBinding) -> None:
         PROJECTION_OFFSET=0,
         PROJECTED_WIDTH=projected_width,
         PROJECTED_BLOCK=triton.next_power_of_2(projected_width),
+        STATE_ROWS=int(binding.main_kv_state.shape[1]),
         RATIO=ratio,
         OVERLAP=ratio == 4,
         HEAD_DIM=DSV4_HEAD_DIM,
@@ -2786,6 +2748,7 @@ def _run_index(binding: DSV4CompressorBinding) -> None:
         binding.eps,
         PROJECTION_OFFSET=2 * 1_024,
         PROJECTED_WIDTH=256,
+        STATE_ROWS=int(binding.index_kv_state.shape[1]),
         RATIO=4,
         HEAD_DIM=DSV4_INDEX_HEAD_DIM,
         NOPE_DIM=64,
@@ -2892,8 +2855,8 @@ def _finalize_prefill_state(
         PROJECTION_OFFSET=projection_offset,
         PROJECTED_WIDTH=projected_width,
         PROJECTED_BLOCK=triton.next_power_of_2(projected_width),
+        STATE_ROWS=int(kv_state.shape[1]),
         RATIO=binding.compress_ratio,
-        OVERLAP=binding.compress_ratio == 4,
         num_warps=4,
     )
 
@@ -2966,6 +2929,7 @@ def _run_continuation_main(binding: DSV4CompressorContinuationBinding) -> None:
         binding.eps,
         PROJECTION_OFFSET=0,
         PROJECTED_WIDTH=projected_width,
+        STATE_ROWS=int(binding.main_kv_state.shape[1]),
         RATIO=ratio,
         OVERLAP=ratio == 4,
         HEAD_DIM=DSV4_HEAD_DIM,
@@ -3013,6 +2977,7 @@ def _run_continuation_index(binding: DSV4CompressorContinuationBinding) -> None:
         binding.eps,
         PROJECTION_OFFSET=2 * 1_024,
         PROJECTED_WIDTH=256,
+        STATE_ROWS=int(binding.index_kv_state.shape[1]),
         RATIO=4,
         HEAD_DIM=DSV4_INDEX_HEAD_DIM,
         NOPE_DIM=64,
@@ -3032,10 +2997,9 @@ def _launch_continuation_finalize_phase(
     ape: torch.Tensor,
     projection_offset: int,
     projected_width: int,
-    state_row_start: int,
-    state_rows: int,
 ) -> None:
     ratio = binding.compress_ratio
+    state_rows = int(kv_state.shape[1])
     _continuation_finalize_state_kernel[(binding.sequence_capacity, state_rows)](
         binding.projection,
         binding.active_sequences,
@@ -3051,9 +3015,8 @@ def _launch_continuation_finalize_phase(
         PROJECTION_OFFSET=projection_offset,
         PROJECTED_WIDTH=projected_width,
         PROJECTED_BLOCK=triton.next_power_of_2(projected_width),
+        STATE_ROWS=state_rows,
         RATIO=ratio,
-        OVERLAP=ratio == 4,
-        STATE_ROW_START=state_row_start,
         num_warps=4,
     )
 
@@ -3067,7 +3030,6 @@ def _finalize_continuation_state(
     projection_offset: int,
     projected_width: int,
 ) -> None:
-    ratio = binding.compress_ratio
     _launch_continuation_finalize_phase(
         binding,
         kv_state=kv_state,
@@ -3075,22 +3037,7 @@ def _finalize_continuation_state(
         ape=ape,
         projection_offset=projection_offset,
         projected_width=projected_width,
-        state_row_start=0,
-        state_rows=ratio,
     )
-    if ratio == 4:
-        # Preserve old current rows until the previous window has consumed
-        # them; the two launches are ordered on the binding's CUDA stream.
-        _launch_continuation_finalize_phase(
-            binding,
-            kv_state=kv_state,
-            score_state=score_state,
-            ape=ape,
-            projection_offset=projection_offset,
-            projected_width=projected_width,
-            state_row_start=ratio,
-            state_rows=ratio,
-        )
 
 
 def run_dsv4_compressor_continuation(

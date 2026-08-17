@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
 
 from b12x.attention import dsv4_compressor
-from b12x.attention.dsv4_compressor._impl import _run_main
+from b12x.attention.dsv4_compressor._impl import (
+    _continuation_finalize_state_kernel,
+    _run_main,
+)
 from b12x.attention._shared.mla.compressed_reference import (
     pack_compressed_mla_kv_cache_reference,
     unpack_compressed_mla_kv_cache_reference,
@@ -53,8 +57,10 @@ def _overlap_pool(
     *,
     head_dim: int,
 ) -> torch.Tensor:
-    kv = torch.cat((kv_state[:4, :head_dim], kv_state[4:, head_dim:]), dim=0)
-    score = torch.cat((score_state[:4, :head_dim], score_state[4:, head_dim:]), dim=0)
+    kv = torch.cat((kv_state[:4, :head_dim], kv_state[4:8, head_dim:]), dim=0)
+    score = torch.cat(
+        (score_state[:4, :head_dim], score_state[4:8, head_dim:]), dim=0
+    )
     return (kv * score.softmax(dim=0)).sum(dim=0)
 
 
@@ -112,24 +118,94 @@ def _state_from_history(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     projected_width = int(ape.shape[1])
     overlap = projected_width in (1_024, 256) and ratio == 4
-    state_rows = ratio * (2 if overlap else 1)
+    history_rows = ratio * (2 if overlap else 1)
+    state_rows = 2 * history_rows
     kv = torch.zeros((state_rows, projected_width), device="cuda", dtype=torch.float32)
     score = torch.full_like(kv, float("-inf"))
     source_tokens = int(projection.shape[0])
-    cutoff = source_tokens // ratio * ratio
-    remainder = source_tokens - cutoff
-    if overlap and cutoff >= ratio:
-        previous = projection[cutoff - ratio : cutoff]
-        kv[:ratio] = previous[:, :projected_width].float()
-        score[:ratio] = previous[:, projected_width:].float() + ape
-    if remainder:
-        current = projection[cutoff:source_tokens]
-        state_start = ratio if overlap else 0
-        kv[state_start : state_start + remainder] = current[:, :projected_width].float()
-        score[state_start : state_start + remainder] = (
-            current[:, projected_width:].float() + ape[:remainder]
-        )
+    source_indices = torch.arange(
+        max(0, source_tokens - state_rows), source_tokens, device="cuda"
+    )
+    state_indices = source_indices % state_rows
+    kv[state_indices] = projection[source_indices, :projected_width].float()
+    score[state_indices] = (
+        projection[source_indices, projected_width:].float()
+        + ape[source_indices % ratio]
+    )
     return kv, score
+
+
+def _finalize_state_only(
+    projection: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    ape: torch.Tensor,
+    *,
+    logical_start: int,
+) -> None:
+    projected_width = int(ape.shape[1])
+    ratio = int(ape.shape[0])
+    state_rows = int(kv_state.shape[1])
+    _continuation_finalize_state_kernel[(1, state_rows)](
+        projection,
+        torch.tensor([1], device="cuda", dtype=torch.int32),
+        torch.tensor([0, projection.shape[0]], device="cuda", dtype=torch.int32),
+        torch.tensor([logical_start], device="cuda", dtype=torch.int32),
+        torch.tensor([0], device="cuda", dtype=torch.int32),
+        kv_state,
+        score_state,
+        ape,
+        projection.stride(0),
+        kv_state.stride(0),
+        kv_state.stride(1),
+        PROJECTION_OFFSET=0,
+        PROJECTED_WIDTH=projected_width,
+        PROJECTED_BLOCK=triton.next_power_of_2(projected_width),
+        STATE_ROWS=state_rows,
+        RATIO=ratio,
+        num_warps=4,
+    )
+
+
+@pytest.mark.parametrize(
+    ("ratio", "projected_width", "prefix_rows"),
+    ((4, 1_024, 10), (128, 512, 130)),
+)
+def test_position_ring_discards_rejected_speculative_frontier(
+    ratio: int, projected_width: int, prefix_rows: int
+) -> None:
+    require_b12x()
+    torch.manual_seed(20260818 + ratio)
+    ape = _random((ratio, projected_width), torch.float32, 1 / 16)
+    prefix = _random((prefix_rows, 2 * projected_width), torch.bfloat16)
+    speculative = _random((6, 2 * projected_width), torch.bfloat16)
+    retry = _random((1, 2 * projected_width), torch.bfloat16)
+    initial_kv, initial_score = _state_from_history(prefix, ape, ratio=ratio)
+    kv_state = initial_kv[None].clone()
+    score_state = initial_score[None].clone()
+
+    _finalize_state_only(
+        speculative,
+        kv_state,
+        score_state,
+        ape,
+        logical_start=prefix_rows,
+    )
+    # Only speculative[0] was accepted. Replaying the next logical position
+    # must not inherit speculative[1:] from the rejected suffix.
+    _finalize_state_only(
+        retry,
+        kv_state,
+        score_state,
+        ape,
+        logical_start=prefix_rows + 1,
+    )
+    torch.cuda.synchronize()
+
+    accepted = torch.cat((prefix, speculative[:1], retry), dim=0)
+    expected_kv, expected_score = _state_from_history(accepted, ape, ratio=ratio)
+    torch.testing.assert_close(kv_state[0], expected_kv, atol=0, rtol=0)
+    torch.testing.assert_close(score_state[0], expected_score, atol=0, rtol=0)
 
 
 def _fwht_128(values: torch.Tensor) -> torch.Tensor:
@@ -207,12 +283,12 @@ def test_plan_pins_c4_and_c128_arena_and_state_geometry() -> None:
     )
 
     assert c4.caps.joint_projection_width == 2_560
-    assert c4.caps.state_rows == 8
+    assert c4.caps.state_rows == 16
     assert c4.caps.main_page_rows == 64
     assert c4.caps.main_page_bytes == 37_440
     assert c4.scratch_specs()[0].nbytes == 10_485_760
     assert c128.caps.joint_projection_width == 1_024
-    assert c128.caps.state_rows == 128
+    assert c128.caps.state_rows == 256
     assert c128.caps.main_page_rows == 2
     assert c128.caps.main_page_bytes == 1_728
     assert c128.scratch_specs()[0].nbytes == 4_194_304
@@ -257,14 +333,16 @@ def test_c128_decode_updates_fp32_state_and_direct_packed_page() -> None:
     main_cache = torch.zeros(
         (1, plan.caps.main_page_bytes), device="cuda", dtype=torch.uint8
     )
-    kv_state = _random((1, 128, 512), torch.float32, 1 / 4)
-    score_state = _random((1, 128, 512), torch.float32, 1 / 4)
+    kv_state = _random((1, 256, 512), torch.float32, 1 / 4)
+    score_state = _random((1, 256, 512), torch.float32, 1 / 4)
     expected_kv = kv_state.clone()
     expected_score = score_state.clone()
     projection = F.linear(hidden_states, weights.joint_projection)
     expected_kv[0, 127] = projection[0, :512].float()
     expected_score[0, 127] = projection[0, 512:].float() + main_ape[127]
-    pooled = (expected_kv[0] * expected_score[0].softmax(dim=0)).sum(dim=0)
+    pooled = (
+        expected_kv[0, :ratio] * expected_score[0, :ratio].softmax(dim=0)
+    ).sum(dim=0)
     expected = _rope_forward(_rmsnorm(pooled, main_norm, eps), 0, cos_sin, nope_dim=448)
     expected_cache = pack_compressed_mla_kv_cache_reference(
         expected[None, :448], expected[None, 448:], page_size=2, num_pages=1
@@ -348,7 +426,7 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages(
         index_norm=index_norm,
     )
     hidden_states = _random((1, hidden), torch.bfloat16)
-    positions = torch.tensor([3], device="cuda", dtype=torch.int32)
+    positions = torch.tensor([7], device="cuda", dtype=torch.int32)
     sequence_ids = torch.tensor([0], device="cuda", dtype=torch.int32)
     slots = torch.tensor([0], device="cuda", dtype=torch.int32)
     cos_sin = _cos_sin(32)
@@ -356,10 +434,10 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages(
         (1, plan.caps.main_page_bytes), device="cuda", dtype=torch.uint8
     )
     index_cache = torch.zeros((1, 8_448), device="cuda", dtype=torch.uint8)
-    main_kv_state = _random((1, 8, 1_024), torch.float32, 1 / 4)
-    main_score_state = _random((1, 8, 1_024), torch.float32, 1 / 4)
-    index_kv_state = _random((1, 8, 256), torch.float32, 1 / 4)
-    index_score_state = _random((1, 8, 256), torch.float32, 1 / 4)
+    main_kv_state = _random((1, 16, 1_024), torch.float32, 1 / 4)
+    main_score_state = _random((1, 16, 1_024), torch.float32, 1 / 4)
+    index_kv_state = _random((1, 16, 256), torch.float32, 1 / 4)
+    index_score_state = _random((1, 16, 256), torch.float32, 1 / 4)
     expected_main_kv = main_kv_state.clone()
     expected_main_score = main_score_state.clone()
     expected_index_kv = index_kv_state.clone()
@@ -373,13 +451,13 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages(
         expected_main_kv[0], expected_main_score[0], head_dim=512
     )
     expected_main = _rope_forward(
-        _rmsnorm(main_pooled, main_norm, eps), 0, cos_sin, nope_dim=448
+        _rmsnorm(main_pooled, main_norm, eps), 4, cos_sin, nope_dim=448
     )
     index_pooled = _overlap_pool(
         expected_index_kv[0], expected_index_score[0], head_dim=128
     )
     expected_index = _rope_forward(
-        _rmsnorm(index_pooled, index_norm, eps), 0, cos_sin, nope_dim=64
+        _rmsnorm(index_pooled, index_norm, eps), 4, cos_sin, nope_dim=64
     )
     expected_index = _fp4_qat_reference(_fwht_128(expected_index))
     expected_main_cache = pack_compressed_mla_kv_cache_reference(
@@ -389,11 +467,6 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages(
         num_pages=1,
     )
     expected_index_cache = pack_index_k_cache_reference(expected_index[None])
-    rolled_main_kv = expected_main_kv[:, 4:].clone()
-    rolled_main_score = expected_main_score[:, 4:].clone()
-    rolled_index_kv = expected_index_kv[:, 4:].clone()
-    rolled_index_score = expected_index_score[:, 4:].clone()
-
     scratch = torch.empty(
         plan.scratch_specs()[0].shape, device="cuda", dtype=torch.uint8
     )
@@ -418,10 +491,10 @@ def test_c4_decode_rolls_overlap_and_writes_main_and_index_pages(
     dsv4_compressor.run_decode(binding=binding)
     torch.cuda.synchronize()
 
-    assert torch.equal(main_kv_state[:, :4], rolled_main_kv)
-    assert torch.equal(main_score_state[:, :4], rolled_main_score)
-    assert torch.equal(index_kv_state[:, :4], rolled_index_kv)
-    assert torch.equal(index_score_state[:, :4], rolled_index_score)
+    assert torch.equal(main_kv_state, expected_main_kv)
+    assert torch.equal(main_score_state, expected_main_score)
+    assert torch.equal(index_kv_state, expected_index_kv)
+    assert torch.equal(index_score_state, expected_index_score)
     if cache_format == "nvfp4":
         expected_record = pack_dsv4_nvfp4_record_reference(expected_main[None])
         actual_record = main_cache[0, :432]
@@ -495,8 +568,8 @@ def test_native_dsv4_nvfp4_compressor_addresses_pages_past_int32_byte_range() ->
         sequence_ids=sequence_ids,
         compressed_slots=compressed_slots,
         compressed_cos_sin_cache=cos_sin,
-        main_kv_state=_random((1, 8, 1_024), torch.float32),
-        main_score_state=_random((1, 8, 1_024), torch.float32),
+        main_kv_state=_random((1, 16, 1_024), torch.float32),
+        main_score_state=_random((1, 16, 1_024), torch.float32),
         compressed_main_cache=cache,
         weights=SimpleNamespace(
             main_ape=_random((4, 1_024), torch.float32),
@@ -571,10 +644,10 @@ def test_c4_initial_prefill_emits_parallel_groups_and_exact_terminal_state() -> 
     cos_sin = _cos_sin(32)
     main_cache = torch.zeros((1, 37_440), device="cuda", dtype=torch.uint8)
     index_cache = torch.zeros((1, 8_448), device="cuda", dtype=torch.uint8)
-    main_kv_state = _random((4, 8, 1_024), torch.float32)
-    main_score_state = _random((4, 8, 1_024), torch.float32)
-    index_kv_state = _random((4, 8, 256), torch.float32)
-    index_score_state = _random((4, 8, 256), torch.float32)
+    main_kv_state = _random((4, 16, 1_024), torch.float32)
+    main_score_state = _random((4, 16, 1_024), torch.float32)
+    index_kv_state = _random((4, 16, 256), torch.float32)
+    index_score_state = _random((4, 16, 256), torch.float32)
     expected_main_kv = main_kv_state.clone()
     expected_main_score = main_score_state.clone()
     expected_index_kv = index_kv_state.clone()
@@ -584,38 +657,18 @@ def test_c4_initial_prefill_emits_parallel_groups_and_exact_terminal_state() -> 
         ((0, 10), (10, 17), (17, 20))
     ):
         state_sequence = (1, 0, 2)[sequence_slot]
-        source_tokens = source_end - source_start
-        cutoff = source_tokens // 4 * 4
-        remainder = source_tokens - cutoff
-        for expected_kv, expected_score, offset, width, ape in (
-            (expected_main_kv, expected_main_score, 0, 1_024, main_ape),
-            (expected_index_kv, expected_index_score, 2_048, 256, index_ape),
-        ):
-            expected_kv[state_sequence].zero_()
-            expected_score[state_sequence].fill_(float("-inf"))
-            if cutoff >= 4:
-                previous = projection[
-                    source_start + cutoff - 4 : source_start + cutoff,
-                    offset : offset + width,
-                ]
-                previous_score = projection[
-                    source_start + cutoff - 4 : source_start + cutoff,
-                    offset + width : offset + 2 * width,
-                ]
-                expected_kv[state_sequence, :4] = previous.float()
-                expected_score[state_sequence, :4] = previous_score.float() + ape
-            if remainder:
-                current = projection[
-                    source_start + cutoff : source_end, offset : offset + width
-                ]
-                current_score = projection[
-                    source_start + cutoff : source_end,
-                    offset + width : offset + 2 * width,
-                ]
-                expected_kv[state_sequence, 4 : 4 + remainder] = current.float()
-                expected_score[state_sequence, 4 : 4 + remainder] = (
-                    current_score.float() + ape[:remainder]
-                )
+        main_state = _state_from_history(
+            projection[source_start:source_end, :2_048], main_ape, ratio=4
+        )
+        index_state = _state_from_history(
+            projection[source_start:source_end, 2_048:], index_ape, ratio=4
+        )
+        expected_main_kv[state_sequence], expected_main_score[state_sequence] = (
+            main_state
+        )
+        expected_index_kv[state_sequence], expected_index_score[state_sequence] = (
+            index_state
+        )
 
     expected_main_rows = []
     expected_index_rows = []
@@ -739,14 +792,13 @@ def test_c128_initial_prefill_graph_replays_and_retains_only_remainder() -> None
     state_sequence_ids = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     cos_sin = _cos_sin(384)
     main_cache = torch.zeros((1, 1_728), device="cuda", dtype=torch.uint8)
-    kv_state = _random((2, 128, 512), torch.float32)
-    score_state = _random((2, 128, 512), torch.float32)
+    kv_state = _random((2, 256, 512), torch.float32)
+    score_state = _random((2, 256, 512), torch.float32)
     expected_kv = kv_state.clone()
     expected_score = score_state.clone()
-    expected_kv[0].zero_()
-    expected_score[0].fill_(float("-inf"))
-    expected_kv[0, :4] = projection[256:260, :512].float()
-    expected_score[0, :4] = projection[256:260, 512:].float() + main_ape[:4]
+    expected_kv[0], expected_score[0] = _state_from_history(
+        projection[:260], main_ape, ratio=ratio
+    )
     expected_rows = []
     for source_start, rope_position in ((0, 0), (128, 128)):
         pooled = _initial_prefill_pool(
@@ -889,10 +941,10 @@ def test_c4_ordered_continuation_combines_carried_state_and_chunk_projection() -
         for prefix, chunk in zip(prefix_projection, chunk_projection, strict=True)
     )
 
-    main_kv_state = _random((4, 8, 1_024), torch.float32)
-    main_score_state = _random((4, 8, 1_024), torch.float32)
-    index_kv_state = _random((4, 8, 256), torch.float32)
-    index_score_state = _random((4, 8, 256), torch.float32)
+    main_kv_state = _random((4, 16, 1_024), torch.float32)
+    main_score_state = _random((4, 16, 1_024), torch.float32)
+    index_kv_state = _random((4, 16, 256), torch.float32)
+    index_score_state = _random((4, 16, 256), torch.float32)
     state_ids = (1, 0, 2)
     for sequence_slot, state_sequence in enumerate(state_ids):
         prefix = prefix_projection[sequence_slot]
@@ -1098,8 +1150,8 @@ def test_c128_ordered_continuation_crosses_boundary_and_graph_replays() -> None:
         for prefix, chunk in zip(prefix_projection, chunk_projection, strict=True)
     )
 
-    kv_state = _random((3, 128, 512), torch.float32)
-    score_state = _random((3, 128, 512), torch.float32)
+    kv_state = _random((3, 256, 512), torch.float32)
+    score_state = _random((3, 256, 512), torch.float32)
     for sequence_slot in range(2):
         kv, score = _state_from_history(
             prefix_projection[sequence_slot], main_ape, ratio=ratio
@@ -1233,10 +1285,10 @@ def test_decode_binding_requires_explicit_sequence_unique_contract() -> None:
                 (1, 1_728), device="cuda", dtype=torch.uint8
             ),
             main_kv_state=torch.zeros(
-                (1, 128, 512), device="cuda", dtype=torch.float32
+                (1, 256, 512), device="cuda", dtype=torch.float32
             ),
             main_score_state=torch.full(
-                (1, 128, 512),
+                (1, 256, 512),
                 float("-inf"),
                 device="cuda",
                 dtype=torch.float32,
