@@ -461,7 +461,41 @@ def _get_compiled_mxfp8_rows_quant(
             current_cuda_stream(),
         )
 
+    # Native runtimes use the same compiled launch as the tensor API.  Keeping
+    # the artifact attached here prevents AOT exporters from rebuilding a
+    # second, subtly different quantizer definition.
+    launch_tensors.compiled = raw  # type: ignore[attr-defined]
     return launch_tensors
+
+
+def compile_mxfp8_rows_quant_aot(
+    *,
+    size_k: int,
+    source_dtype: torch.dtype = torch.bfloat16,
+    scale_block_size: int = 32,
+    expected_m: int = 2048,
+) -> object:
+    """Compile a runtime-M row quantizer for native AOT export.
+
+    ``expected_m`` selects the same launch geometry as the public tensor API;
+    live M and the bounded grid size remain runtime arguments in the exported
+    ABI.
+    """
+
+    size_k = int(size_k)
+    expected_m = int(expected_m)
+    if expected_m <= 0:
+        raise ValueError(f"MXFP8 quantizer AOT expected_m must be positive, got {expected_m}")
+    subgroup_width = _WARP_SUBGROUP_WIDTH if expected_m > 8 else 0
+    tensor_api = _get_compiled_mxfp8_rows_quant(
+        size_k,
+        source_dtype,
+        subgroup_width,
+        _THREADS,
+        int(scale_block_size),
+        "linear",
+    )
+    return tensor_api.compiled  # type: ignore[attr-defined]
 
 
 def quantize_mxfp8_rows_cute(

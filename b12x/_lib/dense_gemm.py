@@ -5248,6 +5248,10 @@ def _get_compiled_dense_gemm_mxfp6(
         )
         return c_tensor_gpu
 
+    # AOT consumers link the exact planner-selected launch used by the tensor
+    # API.  Expose the compiler artifact without duplicating the kernel
+    # definition in exporter code.
+    tensor_api.compiled = compiled_kernel  # type: ignore[attr-defined]
     return tensor_api
 
 
@@ -5594,6 +5598,118 @@ def compile_dense_gemm_fused_quant_a_aot(
         1,
         size_m == 1,
         int(activation_scale_block_size),
+    )
+    return tensor_api.compiled  # type: ignore[attr-defined]
+
+
+def compile_dense_gemm_mxfp8_aot(
+    *,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    expected_m: Optional[int] = None,
+    sfb_k_replicated: bool = False,
+    sm_count: Optional[int] = None,
+    device: Optional[torch.device] = None,
+) -> object:
+    """Compile one runtime-M MXFP8-to-BF16 GEMM for native AOT export.
+
+    ``size_m`` is the largest live-M regime represented by the export.  The
+    generated launch still receives live M at runtime, matching ``dense_gemm``.
+    Only the standalone, non-split-K output form is admitted.
+    """
+
+    size_m = int(size_m)
+    size_n = int(size_n)
+    size_k = int(size_k)
+    if size_m <= 0 or size_n <= 0 or size_k <= 0 or size_k % 128 != 0:
+        raise ValueError(
+            "MXFP8 AOT requires positive M/N and positive K divisible by 128, "
+            f"got M={size_m}, N={size_n}, K={size_k}"
+        )
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    if sm_count is None:
+        sm_count = get_num_sm(device)
+    sm_count = int(sm_count)
+    if sm_count <= 0:
+        raise ValueError(f"MXFP8 AOT sm_count must be positive, got {sm_count}")
+    regime_m = size_m if expected_m is None else int(expected_m)
+    if regime_m <= 0:
+        raise ValueError(f"MXFP8 AOT expected_m must be positive, got {regime_m}")
+
+    plan = _select_default_dense_gemm_plan(
+        size_m,
+        size_n,
+        size_k,
+        sm_count,
+        is_mxfp8=True,
+        expected_m=regime_m,
+    )
+    if plan.swap_ab or plan.load_path != "tma":
+        raise ValueError("MXFP8 AOT requires the unswapped TMA plan")
+    tile_k = _select_mxfp8_tile_k(
+        size_m, size_n, size_k, regime_m, sm_count
+    )
+    _validate_mxfp8_bk64_plan(tile_k, plan.mma_tiler_mn, False)
+    policy = _dense_gemm_policy_for(
+        m=size_m,
+        n=size_n,
+        k=size_k,
+        l=1,
+        ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
+        mma_tiler_mn=plan.mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        sm_count=sm_count,
+        expected_m=regime_m,
+    )
+    if policy.split_k_slices != 1:
+        raise ValueError(
+            "MXFP8 AOT standalone export does not support split-K: "
+            f"M={size_m}, N={size_n}, K={size_k}, slices={policy.split_k_slices}"
+        )
+    sfb_k_reuse = bool(sfb_k_replicated)
+    tensor_api = _get_compiled_dense_gemm(
+        n=size_n,
+        k=size_k,
+        l=1,
+        c_l=1,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=cutlass.Float8E4M3FN,
+        sf_dtype=cutlass.Float8E8M0FNU,
+        c_dtype=cutlass.BFloat16,
+        alpha_dtype=cutlass.Float32,
+        sf_vec_size=32,
+        mma_k=32,
+        tile_k=tile_k,
+        mma_tiler_mn=plan.mma_tiler_mn,
+        cluster_shape_mn=(1, 1),
+        policy=policy,
+        sm_count=sm_count,
+        sm_version="sm_120",
+        load_path=plan.load_path,
+        swap_ab=False,
+        sfb_k_reuse=sfb_k_reuse,
+        b_tile_major=False,
+        alpha_is_one=True,
+        direct_sfa_live16=_use_direct_sfa_live16(
+            m=size_m,
+            n=size_n,
+            k=size_k,
+            l=1,
+            sf_vec_size=32,
+            tile_k=tile_k,
+            mma_tiler_mn=plan.mma_tiler_mn,
+            load_path=plan.load_path,
+            swap_ab=False,
+            b_tile_major=False,
+            sfb_k_reuse=sfb_k_reuse,
+            alpha_is_one=True,
+            is_mxfp8=True,
+        ),
     )
     return tensor_api.compiled  # type: ignore[attr-defined]
 
@@ -6351,6 +6467,10 @@ def _get_compiled_dense_gemm(
         )
         return c_tensor_gpu
 
+    # AOT consumers link the exact planner-selected launch used by the tensor
+    # API.  Expose the compiler artifact without duplicating the kernel
+    # definition in exporter code.
+    tensor_api.compiled = compiled_kernel  # type: ignore[attr-defined]
     return tensor_api
 
 
