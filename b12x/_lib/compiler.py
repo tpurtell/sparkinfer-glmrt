@@ -2504,7 +2504,10 @@ def _validated_cute_compile_object_bytes(
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         object_bytes = object_path.read_bytes()
-        if manifest.get("schema") != "sparkinfer._lib.compile_manifest.v3":
+        if manifest.get("schema") not in {
+            "b12x._lib.compile_manifest.v3",
+            "sparkinfer._lib.compile_manifest.v3",
+        }:
             return None
         if manifest.get("cache_key") != cache_key:
             return None

@@ -396,8 +396,9 @@ def _write_cache_fixture(
     *,
     cache_key: str = "a" * 64,
     payload: tuple[object, ...] = ("payload",),
+    schema: str = "b12x._lib.compile_manifest.v3",
 ) -> tuple[Path, Path]:
-    monkeypatch.setenv("SPARKINFER_COMPILE_CACHE_DIR", str(root))
+    monkeypatch.setenv("B12X_COMPILE_CACHE_DIR", str(root))
     object_path = compiler._cache_object_path(cache_key)
     manifest_path = compiler._cache_manifest_path(cache_key)
     object_path.parent.mkdir(parents=True, exist_ok=True)
@@ -406,7 +407,7 @@ def _write_cache_fixture(
     manifest_path.write_text(
         json.dumps(
             {
-                "schema": "sparkinfer._lib.compile_manifest.v3",
+                "schema": schema,
                 "cache_key": cache_key,
                 "cache_payload_repr": repr(payload),
                 "object_bytes": len(object_bytes),
@@ -434,6 +435,21 @@ def test_disk_object_validation_binds_manifest_payload_and_bytes(
 
     object_path.write_bytes(b"corrupt")
     assert compiler._validated_cute_compile_object_bytes("a" * 64, payload) is None
+
+
+def test_disk_object_validation_accepts_legacy_sparkinfer_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = ("payload", 1)
+    _write_cache_fixture(
+        tmp_path,
+        monkeypatch,
+        payload=payload,
+        schema="sparkinfer._lib.compile_manifest.v3",
+    )
+    assert compiler._validated_cute_compile_object_bytes("a" * 64, payload) == (
+        b"ELF fixture"
+    )
 
 
 def test_disk_object_validation_fails_closed_without_valid_manifest(
