@@ -511,6 +511,7 @@ def build_compressed_mla_binding(
             scratch=scratch,
             rows=rows,
             name="indexed_indices",
+            allow_row_shared=True,
         )
         indexed_width = int(indexed_indices.shape[1])
         indexed_lengths = _validate_i32_vector(
