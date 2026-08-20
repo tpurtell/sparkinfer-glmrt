@@ -345,6 +345,31 @@ def test_indexer_paged_default_supertile_is_capped_by_fixed_capacity(
     assert automatic.layout.nbytes < explicit.layout.nbytes
 
 
+def test_indexer_paged_default_uses_dsv4_learned_selector_supertile(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("B12X_PAGED_INDEX_SUPERTILE_K", raising=False)
+    common = dict(
+        device="cpu",
+        source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
+        num_q_heads=64,
+        max_q_rows=2048,
+        max_page_table_width=1584,
+        mode="prefill",
+        shared_page_table=True,
+    )
+
+    flash = plan_indexer_scratch(B12XIndexerScratchCaps(**common, topk=512))
+    pro = plan_indexer_scratch(B12XIndexerScratchCaps(**common, topk=1024))
+    glm = plan_indexer_scratch(B12XIndexerScratchCaps(**common, topk=2048))
+
+    assert flash.layout.supertile_tokens == 33792
+    assert pro.layout.supertile_tokens == 33792
+    assert flash.layout.max_chunks == 3
+    assert pro.layout.max_chunks == 3
+    assert glm.layout.supertile_tokens == 32768
+
+
 def test_indexer_common_packed_scratch_sizes_from_indexer_k_rows() -> None:
     context_tokens = 256 * 1024
     supertile_context_tokens = 32 * 1024

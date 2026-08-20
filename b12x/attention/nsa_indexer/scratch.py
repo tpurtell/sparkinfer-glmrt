@@ -29,6 +29,8 @@ from b12x._lib.scratch import (
 
 _PAGED_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_INDEX_SUPERTILE_K"
 _PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
+_PAGED_INDEX_SUPERTILE_REBALANCE_NUMERATOR = 9
+_PAGED_INDEX_SUPERTILE_REBALANCE_DENOMINATOR = 8
 _PAGED_INDEX_TILE_BLOCK_Q = 32
 _PAGED_INDEX_TILE_BLOCK_K = 512
 _PAGED_INDEX_HEAD_DIM = 128
@@ -742,12 +744,13 @@ def _resolve_indexer_paged_supertile_tokens(
     raw_tokens: int,
     *,
     capacity_tokens: int | None = None,
+    default_tokens: int = _PAGED_INDEX_SUPERTILE_K_DEFAULT,
 ) -> int:
     use_capacity_default = False
     if int(raw_tokens) <= 0:
         raw = os.environ.get(_PAGED_INDEX_SUPERTILE_K_ENV)
         if raw is None:
-            raw_tokens = _PAGED_INDEX_SUPERTILE_K_DEFAULT
+            raw_tokens = int(default_tokens)
             use_capacity_default = True
         else:
             try:
@@ -771,6 +774,43 @@ def _resolve_indexer_paged_supertile_tokens(
         ) * _PAGED_INDEX_TILE_BLOCK_K
         tokens = min(tokens, max(capacity, _PAGED_INDEX_TILE_BLOCK_K))
     return tokens
+
+
+def _default_indexer_paged_supertile_tokens(
+    caps: B12XIndexerPagedScratchCaps,
+) -> int:
+    """Choose the fixed-capacity selector chunk for known serving shapes.
+
+    DSV4's learned selector is the row-shared 64-head, top-k <= 1024 shape.
+    Rebalance a small terminal chunk across the preceding chunks when doing so
+    grows the default width by at most 12.5%. This removes Pro's mostly-empty
+    fourth chunk (32,768 -> 33,792 rows) without changing the wider GLM/NSA
+    top-k-2048 policy. Explicit caps and ``B12X_PAGED_INDEX_SUPERTILE_K``
+    remain authoritative.
+    """
+
+    base = _PAGED_INDEX_SUPERTILE_K_DEFAULT
+    if not (
+        bool(caps.shared_page_table)
+        and int(caps.num_q_heads) == 64
+        and int(caps.topk) <= 1024
+    ):
+        return base
+    capacity = int(caps.max_page_table_width) * int(caps.page_size)
+    complete_chunks = capacity // base
+    if complete_chunks <= 0 or capacity % base == 0:
+        return base
+    balanced = (
+        (capacity + complete_chunks - 1) // complete_chunks
+        + _PAGED_INDEX_TILE_BLOCK_K
+        - 1
+    ) // _PAGED_INDEX_TILE_BLOCK_K * _PAGED_INDEX_TILE_BLOCK_K
+    if (
+        balanced * _PAGED_INDEX_SUPERTILE_REBALANCE_DENOMINATOR
+        <= base * _PAGED_INDEX_SUPERTILE_REBALANCE_NUMERATOR
+    ):
+        return balanced
+    return base
 
 
 def _resolve_indexer_paged_route(
@@ -865,6 +905,7 @@ def _indexer_paged_scratch_layout(
     supertile_tokens = _resolve_indexer_paged_supertile_tokens(
         int(caps.paged_tile_logits_k_rows),
         capacity_tokens=int(caps.max_page_table_width) * page_size,
+        default_tokens=_default_indexer_paged_supertile_tokens(caps),
     )
     if supertile_tokens % page_size != 0:
         raise ValueError(

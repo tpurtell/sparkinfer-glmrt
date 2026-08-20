@@ -67,6 +67,11 @@ back toward the shared GLM/NSA indexer structure without regressing GLM.
   paged-scorer schedule threshold, so a 4096-row prefill chunk plans a
   65024-token C4 supertile while still consuming the live full page table at
   runtime.
+- The row-shared DSV4 learned-selector shape rebalances a small terminal chunk
+  when that needs at most 12.5% more width. Pro's 101,376-row capacity therefore
+  uses three 33,792-row chunks instead of three 32,768-row chunks plus a tiny
+  tail. Wider GLM/NSA top-k-2048 plans retain the 32,768-row default, and
+  explicit planner or environment overrides remain authoritative.
 
 ## Current Benchmark Snapshot
 
