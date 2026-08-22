@@ -238,6 +238,9 @@ _W4A16_REGS_SM121 = {
     (256, 1, 8, 8, False): 158,
     (128, 1, 4, 8, False): 154,
     (128, 1, 8, 4, False): 143,
+    # Measured from the SM121 K64/N256 packed-Trellis specialization. It uses
+    # the full register ceiling without spilling and therefore admits one CTA.
+    (256, 1, 16, 4, False): 255,
     (256, 2, 16, 4, False): 212,
     (128, 2, 4, 8, False): 215,
     (128, 2, 8, 4, False): 214,
