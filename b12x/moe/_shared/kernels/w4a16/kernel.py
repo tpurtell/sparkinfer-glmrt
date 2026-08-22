@@ -248,6 +248,10 @@ _W4A16_REGS_SM121 = {
     # FC2 keeps the paired-M8 schedule qualified by mixed_trellis.py.
     (256, 2, 8, 8, False): 175,
     (256, 3, 16, 4, False): 249,
+    # The block-48 K128/N128 packed-Trellis fused variants measured 250--254
+    # registers/thread with zero local memory on SM121. Keep the conservative
+    # ceiling: every measured variant is a one-CTA specialization.
+    (256, 3, 8, 8, False): 255,
     (128, 3, 4, 8, False): 249,
     (128, 3, 8, 4, False): 250,
     (256, 4, 16, 4, False): 255,
