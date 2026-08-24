@@ -588,6 +588,7 @@ class W4A16TopKSumCompileResult:
     route_num_experts: int = 0
     route_ids_dtype: torch.dtype = torch.int32
     use_expert_map: bool = False
+    full_rotation_output_dtype: str = "fp32"
 
 
 @dataclass(frozen=True)
@@ -7829,6 +7830,7 @@ class W4A16TopKSumKernel:
         hidden_size: int,
         element_dtype: str = "bf16",
         full_rotation: bool = False,
+        full_rotation_output_dtype: str = "fp32",
         num_experts: int = 0,
         route_num_experts: int = 0,
         use_expert_map: bool = False,
@@ -7843,6 +7845,8 @@ class W4A16TopKSumKernel:
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.full_rotation = bool(full_rotation)
+        self.full_rotation_output_dtype = str(full_rotation_output_dtype)
+        self.full_rotation_output_bf16 = self.full_rotation_output_dtype == "bf16"
         self.num_experts = int(num_experts)
         self.route_num_experts = int(route_num_experts)
         self.use_expert_map = bool(use_expert_map)
@@ -7855,6 +7859,10 @@ class W4A16TopKSumKernel:
             if self.num_experts <= 0:
                 raise ValueError("expert-map top-k sum requires num_experts > 0")
         if self.full_rotation:
+            if self.full_rotation_output_dtype not in {"fp32", "bf16"}:
+                raise ValueError(
+                    "full-rotation top-k sum output dtype must be 'fp32' or 'bf16'"
+                )
             if self.element_dtype != "fp16":
                 raise ValueError("full-rotation top-k sum requires fp16 route values")
             if self.hidden_size % 128 != 0:
@@ -7863,6 +7871,10 @@ class W4A16TopKSumKernel:
                 )
             if self.num_experts <= 0:
                 raise ValueError("full-rotation top-k sum requires num_experts > 0")
+        elif self.full_rotation_output_dtype != "fp32":
+            raise ValueError(
+                "full_rotation_output_dtype is only valid with full_rotation=True"
+            )
         self.route_warps = 8
         self.cta_threads = 256
 
@@ -8049,10 +8061,16 @@ class W4A16TopKSumKernel:
                         acc2 += route_values[value_base + Int32(2)] * weight
                         acc3 += route_values[value_base + Int32(3)] * weight
                     out_base = token * Int32(self.hidden_size) + col0
-                    output_flat[out_base + Int32(0)] = acc0
-                    output_flat[out_base + Int32(1)] = acc1
-                    output_flat[out_base + Int32(2)] = acc2
-                    output_flat[out_base + Int32(3)] = acc3
+                    if cutlass.const_expr(self.full_rotation_output_bf16):
+                        output_flat[out_base + Int32(0)] = cutlass.BFloat16(acc0)
+                        output_flat[out_base + Int32(1)] = cutlass.BFloat16(acc1)
+                        output_flat[out_base + Int32(2)] = cutlass.BFloat16(acc2)
+                        output_flat[out_base + Int32(3)] = cutlass.BFloat16(acc3)
+                    else:
+                        output_flat[out_base + Int32(0)] = acc0
+                        output_flat[out_base + Int32(1)] = acc1
+                        output_flat[out_base + Int32(2)] = acc2
+                        output_flat[out_base + Int32(3)] = acc3
             return
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
         total = active_m * Int32(self.hidden_size)
@@ -9682,6 +9700,7 @@ def compile_w4a16_topk_sum(
     hidden_size: int,
     element_dtype: str = "bf16",
     full_rotation: bool = False,
+    full_rotation_output_dtype: str = "fp32",
     num_experts: int = 0,
     route_num_experts: int = 0,
     route_ids_dtype: torch.dtype = torch.int32,
@@ -9700,6 +9719,7 @@ def compile_w4a16_topk_sum(
         topk,
         hidden_size,
         bool(full_rotation),
+        str(full_rotation_output_dtype),
         None if full_rotation else int(num_experts),
         None if full_rotation else int(route_num_experts),
         str(route_ids_dtype),
@@ -9715,7 +9735,21 @@ def compile_w4a16_topk_sum(
         )
 
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    output_dtype = cutlass.Float32 if full_rotation else cutlass_dtype
+    if full_rotation:
+        if full_rotation_output_dtype == "fp32":
+            output_dtype = cutlass.Float32
+        elif full_rotation_output_dtype == "bf16":
+            output_dtype = cutlass.BFloat16
+        else:
+            raise ValueError(
+                "full_rotation_output_dtype must be 'fp32' or 'bf16'"
+            )
+    else:
+        if full_rotation_output_dtype != "fp32":
+            raise ValueError(
+                "full_rotation_output_dtype is only valid with full_rotation=True"
+            )
+        output_dtype = cutlass_dtype
     output_fake = make_ptr(output_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     topk_weights_fake = make_ptr(
         cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
@@ -9736,6 +9770,7 @@ def compile_w4a16_topk_sum(
         hidden_size=hidden_size,
         element_dtype=element_dtype,
         full_rotation=full_rotation,
+        full_rotation_output_dtype=full_rotation_output_dtype,
         num_experts=num_experts,
         route_num_experts=route_num_experts,
         use_expert_map=use_expert_map,
@@ -9772,6 +9807,7 @@ def compile_w4a16_topk_sum(
         route_num_experts=int(route_num_experts),
         route_ids_dtype=route_ids_dtype,
         use_expert_map=bool(use_expert_map),
+        full_rotation_output_dtype=str(full_rotation_output_dtype),
     )
     _SUM_CACHE[cache_key] = result
     return result
