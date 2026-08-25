@@ -15,6 +15,7 @@ from b12x.attention.paged.planner import (
     plan_extend_graph_capacity,
     plan_verify_graph_capacity,
     resolve_decode_graph_ctas_per_sm,
+    use_paged_extend_fp8_pv_repack,
 )
 from b12x.attention.paged._scratch import (
     B12XPagedAttentionScratchCaps,
@@ -62,6 +63,45 @@ def _make_inputs(
         offsets.append(offsets[-1] + q_len)
     cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
     return q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q
+
+
+def _fp8_pv_repack_plan(*, num_qo_tiles: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        mode="extend",
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        cta_tile_q=64,
+        window_left=-1,
+        msa_block_sparse=False,
+        num_qo_tiles=num_qo_tiles,
+        num_kv_heads=4,
+    )
+
+
+def test_fp8_pv_repack_policy_uses_sm_wave_cutoff() -> None:
+    assert use_paged_extend_fp8_pv_repack(
+        _fp8_pv_repack_plan(num_qo_tiles=384),
+        resident_ctas_per_sm=2,
+        num_sms=48,
+    )
+    assert not use_paged_extend_fp8_pv_repack(
+        _fp8_pv_repack_plan(num_qo_tiles=385),
+        resident_ctas_per_sm=2,
+        num_sms=48,
+    )
+
+
+def test_fp8_pv_repack_policy_rejects_other_contracts() -> None:
+    plan = _fp8_pv_repack_plan(num_qo_tiles=192)
+    plan.head_dim_vo = 128
+    assert not use_paged_extend_fp8_pv_repack(
+        plan,
+        resident_ctas_per_sm=2,
+        num_sms=48,
+    )
 
 
 def test_paged_infers_decode_mode() -> None:
@@ -899,6 +939,11 @@ def test_decode_graph_scratch_envelope_applies_direct_only_storage_cap(
         "get_device_properties",
         lambda _device: SimpleNamespace(multi_processor_count=159),
     )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 0),
+    )
     envelope = plan_decode_graph_scratch_envelope(
         device=torch.device("cuda:0"),
         q_dtype=torch.bfloat16,
@@ -1393,6 +1438,53 @@ def test_decode_graph_ctas_per_sm_uses_smaller_minimax_bs1_to_bs4_budget() -> No
         )
         == 1
     )
+
+
+def test_sm121_h256_decode_uses_one_wave_only_when_it_fills_most_sms(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=48),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 1),
+    )
+
+    expected_chunks = {1: 12, 2: 6, 4: 3, 8: 3}
+    for kv_dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        for batch, chunks in expected_chunks.items():
+            capacity = plan_decode_graph_capacity(
+                device=torch.device("cuda:0"),
+                q_dtype=torch.bfloat16,
+                kv_dtype=kv_dtype,
+                num_q_heads=24,
+                num_kv_heads=4,
+                head_dim_qk=256,
+                head_dim_vo=256,
+                page_size=64,
+                batch=batch,
+                max_cache_page_count=512,
+            )
+            assert capacity.max_chunks_per_request == chunks
+
+    explicit_two_wave = plan_decode_graph_capacity(
+        device=torch.device("cuda:0"),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=24,
+        num_kv_heads=4,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        page_size=64,
+        batch=1,
+        max_cache_page_count=512,
+        graph_ctas_per_sm=2,
+    )
+    assert explicit_two_wave.max_chunks_per_request == 24
 
 
 def test_build_decode_chunk_pages_lut_uses_heuristic() -> None:

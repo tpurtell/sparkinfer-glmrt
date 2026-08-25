@@ -213,8 +213,8 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
         experts=expert_weights,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        output=torch.empty_like(x),
         quant_mode="w4a16",
+        output=torch.empty_like(x),
     )
     expected = _reference_w4a16(
         x,
@@ -397,8 +397,10 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         n=2048,
         activation="silu",
         trellis_bits=3,
+        trellis_codebook="mcg",
+        trellis_pair_kinds=None,
         trellis_tile_config=None,
-        qsrt_storage_format=None,
+        coupled_hadamard=False,
     )
     fused_calls: list[dict[str, object]] = []
     resolved_fused = object()
@@ -436,8 +438,8 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         swiglu_alpha=1.0,
         swiglu_beta=1.0,
         scale_format="e4m3_k32",
-        weight_layout="trellis3_t256",
-        w13_layout="trellis3_t256_proj",
+        weight_layout="trellis_t256",
+        w13_layout="trellis_t256_proj",
         collect_activation_amax=False,
     )
 
@@ -453,7 +455,7 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         for direct_m in range(1, _W4A16_SMALL_M_DIRECT_MAX_M + 1)
     )
     assert (
-        workspace.planned_fused_moe_launches[("trellis3_t256", "e4m3_k32", 3072, False)]
+        workspace.planned_fused_moe_launches[("trellis_t256", "e4m3_k32", 3072, False)]
         is resolved_fused
     )
 
@@ -806,6 +808,7 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             swiglu_limit=10.0 if activation == "silu" else None,
         )
 
@@ -2273,27 +2276,30 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
     )
     w1_global = torch.ones(local_experts, dtype=torch.float32, device=device)
     w2_global = torch.ones(local_experts, dtype=torch.float32, device=device)
-    weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
+    config = fused_moe.PackedConfig(
         source_format="fp4_e8m0_k32",
+        w13_layout="w13",
+    )
+    weight_plan = fused_moe.plan_weights(
+        config=config,
         activation=activation,
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=local_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        w13_layout="w13",
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
-        params_dtype=torch.bfloat16,
-        w1_fp4=w1,
-        w1_blockscale=w1_scale,
-        w1_global_scale=w1_global,
-        a1_gscale=torch.ones_like(w1_global),
-        w2_fp4=w2,
-        w2_blockscale=w2_scale,
-        w2_global_scale=w2_global,
-        a2_gscale=torch.ones_like(w2_global),
+        weights=fused_moe.PackedWeights(
+            w13=w1,
+            w2=w2,
+            w13_block_scales=w1_scale,
+            w2_block_scales=w2_scale,
+            w13_global_scales=w1_global,
+            w2_global_scales=w2_global,
+            input_scale=torch.ones_like(w1_global),
+            intermediate_scale=torch.ones_like(w2_global),
+        ),
     )
     plan = fused_moe.plan(
         fused_moe.Caps(
@@ -2301,8 +2307,8 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
             num_topk=topk,
             route_num_experts=global_experts,
             device=device,
+            config=config,
             weight_plan=prepared.plan,
-            quant_mode="w4a16",
             core_token_counts=(1, 8),
             frozen=True,
         )
@@ -2327,7 +2333,6 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
         topk_ids=topk_ids,
         output=output,
         input_scales_static=True,
-        unit_scale_contract=True,
         route_expert_map=expert_map,
     )
     legacy_ids = torch.zeros_like(topk_ids)
@@ -2342,7 +2347,6 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
         topk_ids=legacy_ids,
         output=legacy_output,
         input_scales_static=True,
-        unit_scale_contract=True,
     )
 
     def route_pack_must_not_run(*args, **kwargs):
@@ -3088,6 +3092,7 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
         block_expert_ids=buffers.block_expert_ids,
         packed_route_count=buffers.packed_route_count,
         expert_offsets=buffers.expert_offsets,
+        expert_counts=buffers.expert_counts,
         swiglu_limit=swiglu_limit,
     )
     torch.cuda.synchronize()
@@ -3112,6 +3117,7 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             swiglu_limit=swiglu_limit,
         )
     graph.replay()
@@ -3199,6 +3205,7 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
         )

@@ -96,7 +96,7 @@ def choose_num_splits(
         max(int(max_cache_tokens), 1) + _CANDIDATES_PER_CHUNK - 1
     ) // _CANDIDATES_PER_CHUNK
     query_tiles = (max(int(max_total_q), 1) + int(query_tile) - 1) // int(query_tile)
-    head_tiles = max(1, int(num_q_heads) // 8)
+    head_tiles = max(1, (int(num_q_heads) + 7) // 8)
     splits = _wave_balanced_splits(
         num_chunks=num_chunks,
         independent_tiles=query_tiles * head_tiles,

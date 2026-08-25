@@ -37,7 +37,47 @@ The canonical numeric recipes are:
 | W4A8 on NVFP4 | MXFP8 E4M3 / E8M0 K/32 | E4M3 K/16 | E8M0 K/32 base × K/16 residual |
 | native W4A8-MX | MXFP8 E4M3 / E8M0 K/32 | E8M0 K/32 | E8M0 K/32 |
 | W4A16 | BF16 / none | E4M3 K/16 or E8M0 K/32 | source-preserving |
-| W4A16-NF3 (`nf3_2p1`) | BF16 / none | E4M3 K/32 | source-preserving |
+
+## Coupled trellis transforms
+
+Trellis-coded expert weights arrive in the BTX container
+(``docs/btx-checkpoint-format.md``), which stores a fixed-rate trellis
+payload for each expert matrix. Its coupled transform declaration applies
+the same exact activation-boundary coordinate change at K2, K3, and K4:
+
+```text
+expert input
+  -> normalized 512-wide Hadamard
+  -> shared gate/up input scale
+  -> ordinary 128-wide gate/up transforms
+  -> compact trellis FC1
+  -> inverse ordinary transforms
+  -> coupled gate/up signs and 128-wide transforms
+  -> coordinatewise gated activation
+  -> coupled 128-wide post-activation transform
+  -> ordinary down-projection transform
+  -> compact trellis FC2
+  -> route reduction
+  -> inverse 512-wide residual transform
+```
+
+The extra transforms are an exact reparameterization before weight
+quantization. They do not alter the unquantized expert function. Gate and up
+share one input scale, and the intermediate rotation tensor stores the three
+ordinary projection rows followed by two preactivation rows and one
+post-activation row. The local hidden width must be divisible by 512 and the
+local intermediate width by 128.
+
+The BTX manifest declares the transform explicitly (``hadamard.coupled``
+with its block widths). Ordinary per-matrix transforms remain valid only for
+artifacts whose metadata specifies them; the runtime does not infer transform
+type from the trellis bit rate.
+
+The W4A16 path keeps BF16 activation operands. The W4A8 path evaluates the
+same transform contract, quantizes the FC1 and FC2 activation operands to
+MXFP8, and decodes the same compact E4M3 weight labels directly into tensor-core
+operands. Both paths require caller-owned fixed scratch and support CUDA graph
+replay without runtime allocation.
 
 The current kernel families map onto those axes as follows:
 

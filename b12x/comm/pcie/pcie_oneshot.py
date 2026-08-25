@@ -114,6 +114,51 @@ def _push_mode_enabled() -> bool:
     return os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0")
 
 
+def _tp2_remote_push_enabled() -> bool:
+    """Enable the qualified fused TP2 remote-write transport."""
+
+    return os.getenv("B12X_PCIE_TP2_REMOTE_PUSH", "0") not in ("", "0")
+
+
+def _tp4_remote_push_enabled() -> bool:
+    """Enable the qualified fused TP4 remote-write transport."""
+
+    return os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
+
+
+def _tp8_owner_reduce_enabled() -> bool:
+    """Enable the qualified topology-scoped fused TP8 transport by default."""
+
+    return os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") not in ("", "0")
+
+
+def _uses_sharded_eager_storage(
+    world_size: int,
+    transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
+) -> bool:
+    """Return whether staged fused transport needs one shard per source."""
+
+    push, tp2_remote, tp4_remote, tp8_owner = (
+        _transport_policy_contract() if transport_policy is None else transport_policy
+    )
+    return push or (
+        (world_size == 2 and tp2_remote)
+        or (world_size == 4 and tp4_remote)
+        or (world_size == 8 and tp8_owner)
+    )
+
+
+def _transport_policy_contract() -> tuple[bool, bool, bool, bool]:
+    """Values that must agree across ranks before IPC storage is allocated."""
+
+    return (
+        _push_mode_enabled(),
+        _tp2_remote_push_enabled(),
+        _tp4_remote_push_enabled(),
+        _tp8_owner_reduce_enabled(),
+    )
+
+
 def _is_weak_contiguous(inp: torch.Tensor) -> bool:
     if inp.is_contiguous():
         return True
@@ -234,12 +279,15 @@ def _object_broadcast_device(group: ProcessGroup) -> torch.device | str:
             backend = dist.get_backend(group)
     except Exception as exc:
         raise RuntimeError(
-            "PCIe oneshot IPC exchange requires a CUDA/NCCL process group"
+            "PCIe object exchange requires a valid process group"
         ) from exc
     backend_name = str(backend).lower()
+    if "gloo" in backend_name:
+        return torch.device("cpu")
     if "nccl" not in backend_name:
         raise RuntimeError(
-            f"PCIe oneshot IPC exchange requires an NCCL process group, got {backend}"
+            "PCIe object exchange requires an NCCL or Gloo process group, "
+            f"got {backend}"
         )
     if not torch.cuda.is_available():
         raise RuntimeError("PCIe oneshot IPC exchange requires CUDA")
@@ -569,9 +617,7 @@ def _require_full_grid_residency(
         visible_sms = int(
             torch.cuda.get_device_properties(device).multi_processor_count
         )
-        test_visible_sms = int(
-            os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0"
-        )
+        test_visible_sms = int(os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
         if test_visible_sms > 0:
             visible_sms = min(visible_sms, test_visible_sms)
         if visible_sms < required_sms:
@@ -1206,6 +1252,9 @@ class _CuTeOneshotState:
     registered_tables: dict[int, int]
     eager_tables: Optional[tuple[int, int]] = None
     eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
+    eager_buffer_bytes: Optional[int] = None
+    transport_policy: tuple[bool, bool, bool, bool] = (False, False, False, False)
+    sharded_eager_storage: bool = False
     eager_slot: int = 0
     device_slot_selection: bool = False
     slot_bias: int = 0
@@ -1235,6 +1284,8 @@ class _CuTeOneshotBackend:
         self._lock = RLock()
         self._next_handle = 1
         self._states: dict[int, _CuTeOneshotState] = {}
+
+    supports_eager_storage_contract = True
 
     @staticmethod
     def meta_size() -> int:
@@ -1315,6 +1366,8 @@ class _CuTeOneshotBackend:
         handle: int,
         pointers0: Sequence[int],
         pointers1: Sequence[int],
+        eager_buffer_bytes: Optional[int] = None,
+        transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
     ) -> None:
         state = self._state(handle)
         ptrs0 = tuple(int(pointer) for pointer in pointers0)
@@ -1323,6 +1376,18 @@ class _CuTeOneshotBackend:
         table1 = self._write_table(state, ptrs1)
         state.eager_tables = (table0, table1)
         state.eager_ptrs = (ptrs0, ptrs1)
+        state.eager_buffer_bytes = (
+            None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+        )
+        state.transport_policy = (
+            _transport_policy_contract()
+            if transport_policy is None
+            else tuple(bool(value) for value in transport_policy)
+        )
+        state.sharded_eager_storage = _uses_sharded_eager_storage(
+            state.world_size,
+            state.transport_policy,
+        )
         state.registered_tables[ptrs0[state.rank]] = table0
         state.registered_tables[ptrs1[state.rank]] = table1
         state.eager_slot = 0
@@ -1331,9 +1396,7 @@ class _CuTeOneshotBackend:
     def _launch_geometry(size_packs: int) -> tuple[int, int]:
         threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "256"))
         threads = min(512, max(64, (threads // 32) * 32))
-        block_limit = int(
-            os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8")
-        )
+        block_limit = int(os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8"))
         if block_limit <= 0 or block_limit > _MAX_BLOCKS:
             raise ValueError(
                 f"B12X_PCIE_ONESHOT_BLOCK_LIMIT must be in [1, {_MAX_BLOCKS}]"
@@ -1345,6 +1408,43 @@ class _CuTeOneshotBackend:
     def _fused_threads() -> int:
         threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", "256"))
         return min(512, max(64, (threads // 32) * 32))
+
+    @staticmethod
+    def _fused_topology_mode(
+        state: _CuTeOneshotState,
+        inp: torch.Tensor,
+    ) -> Optional[str]:
+        """Select only topology transports with a qualified shape contract."""
+
+        if (
+            state.eager_tables is None
+            or state.eager_buffer_bytes is None
+            or inp.dtype not in (torch.float16, torch.bfloat16)
+            or inp.ndim == 0
+        ):
+            return None
+        hidden = int(inp.shape[-1])
+        if hidden <= 0 or inp.numel() % hidden != 0:
+            return None
+        rows = inp.numel() // hidden
+        _, tp2_remote, tp4_remote, tp8_owner = state.transport_policy
+        if (
+            state.world_size == 8
+            and tp8_owner
+            and hidden in (4096, 6144)
+            and 2 <= rows <= 8
+        ):
+            return "stage_tp8_owner"
+        if (
+            state.world_size == 4
+            and tp4_remote
+            and hidden in (4096, 6144)
+            and 1 <= rows <= 32
+        ):
+            return "stage_remote_push"
+        if state.world_size == 2 and tp2_remote and hidden == 4096 and 1 <= rows <= 32:
+            return "stage_remote_push"
+        return None
 
     @classmethod
     def _fused_launch_config(
@@ -1360,17 +1460,20 @@ class _CuTeOneshotBackend:
         if override > 0:
             ctas_per_row = override
         else:
-            min_ctas = (
-                hidden_packs + threads * _REG_PACKS - 1
-            ) // (threads * _REG_PACKS)
+            min_ctas = (hidden_packs + threads * _REG_PACKS - 1) // (
+                threads * _REG_PACKS
+            )
             ctas_per_row = max(max(1, 3 // rows), min_ctas)
         ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
-        register_normalize = (
-            hidden_packs + ctas_per_row * threads - 1
-        ) // (ctas_per_row * threads) <= _REG_PACKS
-        if state.eager_tables is None:
+        register_normalize = (hidden_packs + ctas_per_row * threads - 1) // (
+            ctas_per_row * threads
+        ) <= _REG_PACKS
+        topology_mode = cls._fused_topology_mode(state, inp)
+        if topology_mode is not None:
+            mode = topology_mode
+        elif state.eager_tables is None:
             mode = "registered"
-        elif _push_mode_enabled():
+        elif state.transport_policy[0]:
             mode = "stage_push"
         else:
             mode = "stage_pull"
@@ -1378,11 +1481,7 @@ class _CuTeOneshotBackend:
 
     @staticmethod
     def _device_index(device: torch.device) -> int:
-        return (
-            device.index
-            if device.index is not None
-            else torch.cuda.current_device()
-        )
+        return device.index if device.index is not None else torch.cuda.current_device()
 
     def prepare_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
         """Compile/load every graph slot variant without launching a kernel."""
@@ -1412,7 +1511,10 @@ class _CuTeOneshotBackend:
         """Compile/load fused graph variants without launching a kernel."""
 
         state = self._state(handle)
-        if state.eager_tables is None and int(inp.data_ptr()) not in state.registered_tables:
+        if (
+            state.eager_tables is None
+            and int(inp.data_ptr()) not in state.registered_tables
+        ):
             raise RuntimeError("input buffer is not registered")
         mode, single_cta, register_normalize, threads = self._fused_launch_config(
             state, inp
@@ -1421,9 +1523,7 @@ class _CuTeOneshotBackend:
 
         device_index = self._device_index(inp.device)
         variants = (
-            ((True, 0), (True, 1))
-            if state.eager_tables is not None
-            else ((False, 0),)
+            ((True, 0), (True, 1)) if state.eager_tables is not None else ((False, 0),)
         )
         for device_slot_selection, slot_bias in variants:
             get_fused_oneshot_launcher(
@@ -1440,9 +1540,7 @@ class _CuTeOneshotBackend:
             )
 
     @staticmethod
-    def _select_table(
-        state: _CuTeOneshotState, input_pointer: int
-    ) -> tuple[int, bool]:
+    def _select_table(state: _CuTeOneshotState, input_pointer: int) -> tuple[int, bool]:
         if state.eager_tables is not None:
             if state.device_slot_selection:
                 # The two 16-entry tables are adjacent in rank_data.  A
@@ -1477,9 +1575,7 @@ class _CuTeOneshotBackend:
             capturing and state.eager_tables is not None
         )
         prospective_slot_bias = (
-            state.slot_bias
-            if state.device_slot_selection
-            else state.eager_slot & 1
+            state.slot_bias if state.device_slot_selection else state.eager_slot & 1
         )
         if capturing:
             from ._oneshot_cute import is_oneshot_launcher_prepared
@@ -1498,7 +1594,11 @@ class _CuTeOneshotBackend:
                     "cold PCIe oneshot CUDA graph capture is not allowed; "
                     "call prepare_graph_all_reduce() before capture"
                 )
-        if capturing and state.eager_tables is not None and not state.device_slot_selection:
+        if (
+            capturing
+            and state.eager_tables is not None
+            and not state.device_slot_selection
+        ):
             # The graph epoch begins at zero.  Bias it to the host slot that
             # would have been selected for this invocation, then keep both
             # values fixed in the captured specialization.
@@ -1563,9 +1663,7 @@ class _CuTeOneshotBackend:
             capturing and state.eager_tables is not None
         )
         prospective_slot_bias = (
-            state.slot_bias
-            if state.device_slot_selection
-            else state.eager_slot & 1
+            state.slot_bias if state.device_slot_selection else state.eager_slot & 1
         )
         if capturing:
             from ._oneshot_cute import is_fused_oneshot_launcher_prepared
@@ -1602,9 +1700,9 @@ class _CuTeOneshotBackend:
         if override > 0:
             ctas_per_row = override
         else:
-            min_ctas = (
-                hidden_packs + threads * _REG_PACKS - 1
-            ) // (threads * _REG_PACKS)
+            min_ctas = (hidden_packs + threads * _REG_PACKS - 1) // (
+                threads * _REG_PACKS
+            )
             ctas_per_row = max(max(1, 3 // rows), min_ctas)
         ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
         assert single_cta_check == (ctas_per_row == 1)
@@ -1650,7 +1748,7 @@ class _CuTeOneshotBackend:
                 hidden_packs,
                 rows,
                 ctas_per_row,
-                inp.numel() // pack_elems,
+                int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
                 float(epsilon),
                 blocks,
             )
@@ -1664,9 +1762,7 @@ class _CuTeOneshotBackend:
     def register_graph_buffers(self, handle: int, handles, offsets) -> None:
         self._state(handle)
         if any(handles) or any(offsets):
-            raise RuntimeError(
-                "CuTe oneshot graph capture requires eager IPC buffers"
-            )
+            raise RuntimeError("CuTe oneshot graph capture requires eager IPC buffers")
 
     def dispose(self, handle: int) -> None:
         with self._lock:
@@ -1766,6 +1862,7 @@ class PCIeOneshotAllReduce:
             normalized_eager_bytes = (
                 None if eager_buffer_bytes is None else int(eager_buffer_bytes)
             )
+            normalized_transport_policy = _transport_policy_contract()
             if normalized_world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(f"unsupported world size {normalized_world_size}")
             if not 0 <= normalized_rank < normalized_world_size:
@@ -1832,6 +1929,7 @@ class PCIeOneshotAllReduce:
                 normalized_eager0,
                 normalized_eager1,
                 normalized_eager_bytes,
+                normalized_transport_policy,
                 normalized_max_size,
                 normalized_rank_data_bytes,
             )
@@ -1853,6 +1951,7 @@ class PCIeOneshotAllReduce:
             normalized_eager0,
             normalized_eager1,
             normalized_eager_bytes,
+            normalized_transport_policy,
             normalized_max_size,
             normalized_rank_data_bytes,
         ) = normalized
@@ -1865,6 +1964,7 @@ class PCIeOneshotAllReduce:
             eager_buffer_ptrs0=normalized_eager0,
             eager_buffer_ptrs1=normalized_eager1,
             eager_buffer_bytes=normalized_eager_bytes,
+            transport_policy=normalized_transport_policy,
             exchange_group=resolved_group,
             ipc=ipc,
             owned_buffers=owned_buffers,
@@ -1911,6 +2011,7 @@ class PCIeOneshotAllReduce:
                     self.rank_data_bytes,
                     self.eager_buffer_bytes,
                     self._pending_eager_ptrs is not None,
+                    self._transport_policy,
                 ),
             )
 
@@ -1941,6 +2042,7 @@ class PCIeOneshotAllReduce:
         eager_buffer_ptrs0: Optional[Sequence[int]],
         eager_buffer_ptrs1: Optional[Sequence[int]],
         eager_buffer_bytes: Optional[int],
+        transport_policy: tuple[bool, bool, bool, bool],
         exchange_group: Optional[ProcessGroup],
         ipc: Optional[CudaRTLibrary],
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
@@ -1958,6 +2060,11 @@ class PCIeOneshotAllReduce:
         self.rank_data_bytes = int(rank_data_bytes)
         self.eager_buffer_bytes = (
             None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+        )
+        self._transport_policy = tuple(bool(value) for value in transport_policy)
+        self._sharded_eager_storage = _uses_sharded_eager_storage(
+            self.world_size,
+            self._transport_policy,
         )
         self._ipc = ipc
         self._ext = ext_module
@@ -1993,11 +2100,24 @@ class PCIeOneshotAllReduce:
             )
             if self._pending_eager_ptrs is not None:
                 self._eager_ptrs = self._pending_eager_ptrs
-                self._ext.register_pcie_buffers(
-                    self._ptr,
-                    list(self._eager_ptrs[0]),
-                    list(self._eager_ptrs[1]),
-                )
+                if getattr(
+                    self._ext,
+                    "supports_eager_storage_contract",
+                    False,
+                ):
+                    self._ext.register_pcie_buffers(
+                        self._ptr,
+                        list(self._eager_ptrs[0]),
+                        list(self._eager_ptrs[1]),
+                        self.eager_buffer_bytes,
+                        self._transport_policy,
+                    )
+                else:
+                    self._ext.register_pcie_buffers(
+                        self._ptr,
+                        list(self._eager_ptrs[0]),
+                        list(self._eager_ptrs[1]),
+                    )
         except Exception as exc:
             init_error = exc
         finally:
@@ -2068,6 +2188,7 @@ class PCIeOneshotAllReduce:
             normalized_eager_bytes = int(eager_buffer_bytes)
             normalized_max_size = int(max_size)
             normalized_rank_data_bytes = int(rank_data_bytes)
+            normalized_transport_policy = _transport_policy_contract()
             if world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(f"unsupported world size {world_size}")
             if device_obj.type != "cuda":
@@ -2085,14 +2206,19 @@ class PCIeOneshotAllReduce:
                 normalized_eager_bytes,
                 normalized_max_size,
                 normalized_rank_data_bytes,
+                normalized_transport_policy,
             )
 
-        device_obj, eager_buffer_bytes, max_size, rank_data_bytes = (
-            _run_collective_preallocation_setup(
-                owner="PCIe oneshot argument validation",
-                exchange_group=exchange_group,
-                setup=validate_factory_arguments,
-            )
+        (
+            device_obj,
+            eager_buffer_bytes,
+            max_size,
+            rank_data_bytes,
+            transport_policy,
+        ) = _run_collective_preallocation_setup(
+            owner="PCIe oneshot argument validation",
+            exchange_group=exchange_group,
+            setup=validate_factory_arguments,
         )
 
         _require_full_grid_residency(
@@ -2121,7 +2247,7 @@ class PCIeOneshotAllReduce:
                 eager_buffer_bytes,
                 max_size,
                 rank_data_bytes,
-                _push_mode_enabled(),
+                transport_policy,
             ),
         )
 
@@ -2129,6 +2255,10 @@ class PCIeOneshotAllReduce:
             exchange_group,
             signal_bytes=signal_bytes,
             eager_buffer_bytes=eager_buffer_bytes,
+            sharded_eager_storage=_uses_sharded_eager_storage(
+                world_size,
+                transport_policy,
+            ),
             ipc=ipc,
         )
         owned_buffers = [channel_buffers.owned_buffer]
@@ -2140,6 +2270,7 @@ class PCIeOneshotAllReduce:
             eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
             eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
             eager_buffer_bytes=eager_buffer_bytes,
+            transport_policy=transport_policy,
             exchange_group=exchange_group,
             ipc=ipc,
             owned_buffers=owned_buffers,
@@ -2203,8 +2334,21 @@ class PCIeOneshotAllReduce:
         *,
         zero_fill: bool,
         ipc: CudaRTLibrary,
+        peer_ranks: Optional[Sequence[int]] = None,
     ) -> _OwnedSharedBuffer:
         _require_no_retained_ipc_setup(exchange_group)
+        world_size = dist.get_world_size(group=exchange_group)
+        rank = dist.get_rank(group=exchange_group)
+        selected_peers = (
+            set(range(world_size)) - {rank}
+            if peer_ranks is None
+            else {int(peer) for peer in peer_ranks}
+        )
+        if rank in selected_peers or any(
+            not 0 <= peer < world_size for peer in selected_peers
+        ):
+            raise ValueError("peer_ranks must contain valid remote group ranks")
+
         local_ptr: int | None = None
         local_handle: bytes | None = None
         prepare_error: BaseException | None = None
@@ -2307,8 +2451,6 @@ class PCIeOneshotAllReduce:
         peer_ptrs: list[int] = []
         remote_ptrs: list[int] = []
         try:
-            world_size = dist.get_world_size(group=exchange_group)
-            rank = dist.get_rank(group=exchange_group)
             handles = _broadcast_gather_object(local_handle, exchange_group)
         except Exception as exchange_error:
             # No rank has opened an import before handle exchange completes.
@@ -2331,6 +2473,9 @@ class PCIeOneshotAllReduce:
         for idx, handle in enumerate(handles):
             if idx == rank:
                 peer_ptrs.append(local_ptr)
+                continue
+            if idx not in selected_peers:
+                peer_ptrs.append(0)
                 continue
             try:
                 remote_ptr = ipc.cudaIpcOpenMemHandleBytes(handle)
@@ -2399,6 +2544,7 @@ class PCIeOneshotAllReduce:
         *,
         signal_bytes: int,
         eager_buffer_bytes: int,
+        sharded_eager_storage: bool,
         ipc: CudaRTLibrary,
     ) -> _ChannelSharedBuffers:
         signal_bytes = int(signal_bytes)
@@ -2407,7 +2553,7 @@ class PCIeOneshotAllReduce:
             raise ValueError("signal_bytes must be positive")
         if eager_buffer_bytes <= 0:
             raise ValueError("eager_buffer_bytes must be positive")
-        if _push_mode_enabled():
+        if sharded_eager_storage:
             eager_buffer_bytes *= dist.get_world_size(group=exchange_group)
 
         signal_offset = 0
@@ -2523,7 +2669,9 @@ class PCIeOneshotAllReduce:
         if not self.should_allreduce(inp) or inp.ndim == 0:
             raise ValueError("input does not satisfy fused PCIe oneshot requirements")
         if inp.shape[-1] * inp.element_size() % 16 != 0:
-            raise ValueError("the last input dimension must occupy a multiple of 16 bytes")
+            raise ValueError(
+                "the last input dimension must occupy a multiple of 16 bytes"
+            )
         self._check_stream()
         self._prepare_input(inp, peer_input_ptrs)
         self._ext.prepare_fused_all_reduce(self._ptr, inp)
@@ -3030,6 +3178,7 @@ class PCIeOneshotAllReducePool:
             normalized_rank_data_bytes = int(rank_data_bytes)
             normalized_single_channel = bool(single_channel)
             normalized_max_concurrent_channels = int(max_concurrent_channels)
+            normalized_transport_policy = _transport_policy_contract()
             if normalized_world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(f"unsupported world size {normalized_world_size}")
             if not 0 <= normalized_rank < normalized_world_size:
@@ -3075,6 +3224,7 @@ class PCIeOneshotAllReducePool:
                 normalized_rank_data_bytes,
                 normalized_single_channel,
                 normalized_max_concurrent_channels,
+                normalized_transport_policy,
             )
 
         if channel_factory is None and resolved_group is not None:
@@ -3095,7 +3245,12 @@ class PCIeOneshotAllReducePool:
             self.rank_data_bytes,
             self.single_channel,
             self.max_concurrent_channels,
+            self._transport_policy,
         ) = normalized
+        self._sharded_eager_storage = _uses_sharded_eager_storage(
+            self.world_size,
+            self._transport_policy,
+        )
         self.exchange_group = resolved_group
         self.process_group = self.exchange_group
         self._channel_factory = channel_factory
@@ -3145,7 +3300,7 @@ class PCIeOneshotAllReducePool:
                     self.rank_data_bytes,
                     self.single_channel,
                     self.max_concurrent_channels,
-                    _push_mode_enabled(),
+                    self._transport_policy,
                 ),
             )
             # A genuine single-channel pool has no independent eager/graph
@@ -3223,6 +3378,7 @@ class PCIeOneshotAllReducePool:
             self.exchange_group,
             signal_bytes=self._signal_bytes,
             eager_buffer_bytes=self.eager_buffer_bytes,
+            sharded_eager_storage=self._sharded_eager_storage,
             ipc=self._ipc,
         )
         owned_buffers = [channel_buffers.owned_buffer]
@@ -3234,6 +3390,7 @@ class PCIeOneshotAllReducePool:
             eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
             eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
             eager_buffer_bytes=self.eager_buffer_bytes,
+            transport_policy=self._transport_policy,
             exchange_group=self.exchange_group,
             ipc=self._ipc,
             owned_buffers=owned_buffers,
@@ -3486,9 +3643,7 @@ class PCIeOneshotAllReducePool:
                         inp, peer_input_ptrs=peer_input_ptrs
                     )
             else:
-                channel.prepare_graph_all_reduce(
-                    inp, peer_input_ptrs=peer_input_ptrs
-                )
+                channel.prepare_graph_all_reduce(inp, peer_input_ptrs=peer_input_ptrs)
 
     def prepare_graph_fused_add_rms_norm(
         self,

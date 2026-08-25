@@ -10,10 +10,19 @@ def _causal_mask_right_aligned(
     seqlen_k: int,
     *,
     device: torch.device,
+    query_start: int = 0,
+    query_total: int | None = None,
 ) -> torch.Tensor:
-    q_idx = torch.arange(seqlen_q, device=device, dtype=torch.int32).view(seqlen_q, 1)
+    if query_total is None:
+        query_total = seqlen_q
+    q_idx = torch.arange(
+        query_start,
+        query_start + seqlen_q,
+        device=device,
+        dtype=torch.int32,
+    ).view(seqlen_q, 1)
     k_idx = torch.arange(seqlen_k, device=device, dtype=torch.int32).view(1, seqlen_k)
-    return k_idx > (q_idx + seqlen_k - seqlen_q)
+    return k_idx > (q_idx + seqlen_k - query_total)
 
 
 def attention_reference(
@@ -26,6 +35,8 @@ def attention_reference(
     window_left: int = -1,
     attention_sink_bias: torch.Tensor | None = None,
     relative_attention_bias: torch.Tensor | None = None,
+    _query_start: int = 0,
+    _query_total: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute exact self-attention for contiguous rank-3 or rank-4 tensors.
 
@@ -58,6 +69,15 @@ def attention_reference(
         raise ValueError("k and v must have the same sequence length and head count")
     if q_heads % kv_heads != 0:
         raise ValueError(f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}")
+    _query_start = int(_query_start)
+    if _query_total is None:
+        _query_total = seqlen_q
+    _query_total = int(_query_total)
+    if _query_start < 0 or _query_total < _query_start + seqlen_q:
+        raise ValueError(
+            "query slice must satisfy 0 <= _query_start and "
+            "_query_start + seqlen_q <= _query_total"
+        )
 
     if softmax_scale is None:
         softmax_scale = head_dim_qk**-0.5
@@ -86,13 +106,16 @@ def attention_reference(
                 f"{tuple(relative_attention_bias.shape)}"
             )
         relative_extent = int(relative_attention_bias.shape[3])
-        q_idx = torch.arange(seqlen_q, device=scores.device, dtype=torch.int64).view(
-            seqlen_q, 1
-        )
+        q_idx = torch.arange(
+            _query_start,
+            _query_start + seqlen_q,
+            device=scores.device,
+            dtype=torch.int64,
+        ).view(seqlen_q, 1)
         k_idx = torch.arange(seqlen_k, device=scores.device, dtype=torch.int64).view(
             1, seqlen_k
         )
-        distance = q_idx + seqlen_k - seqlen_q - k_idx
+        distance = q_idx + seqlen_k - _query_total - k_idx
         in_extent = (distance >= 0) & (distance < relative_extent)
         distance = distance.clamp(min=0, max=relative_extent - 1)
         bias = relative_attention_bias.to(
@@ -107,19 +130,26 @@ def attention_reference(
         )
     if causal:
         causal_mask = _causal_mask_right_aligned(
-            seqlen_q, seqlen_k, device=scores.device
+            seqlen_q,
+            seqlen_k,
+            device=scores.device,
+            query_start=_query_start,
+            query_total=_query_total,
         )
         scores = scores.masked_fill(
             causal_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf")
         )
     if window_left >= 0:
-        q_idx = torch.arange(seqlen_q, device=scores.device, dtype=torch.int32).view(
-            seqlen_q, 1
-        )
+        q_idx = torch.arange(
+            _query_start,
+            _query_start + seqlen_q,
+            device=scores.device,
+            dtype=torch.int32,
+        ).view(seqlen_q, 1)
         k_idx = torch.arange(seqlen_k, device=scores.device, dtype=torch.int32).view(
             1, seqlen_k
         )
-        causal_limit = q_idx + seqlen_k - seqlen_q
+        causal_limit = q_idx + seqlen_k - _query_total
         window_mask = k_idx < (causal_limit - int(window_left))
         scores = scores.masked_fill(
             window_mask.view(1, 1, seqlen_q, seqlen_k), float("-inf")
@@ -208,6 +238,7 @@ def paged_attention_reference(
     window_left: int = -1,
     attention_sink_bias: torch.Tensor | None = None,
     relative_attention_bias: torch.Tensor | None = None,
+    query_block_size: int | None = 256,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference paged self-attention for the SGLang serving contract.
 
@@ -230,6 +261,8 @@ def paged_attention_reference(
     head_dim_vo = int(v_cache.shape[-1])
     if softmax_scale is None:
         softmax_scale = head_dim_qk**-0.5
+    if query_block_size is not None and int(query_block_size) <= 0:
+        raise ValueError("query_block_size must be positive or None")
 
     out = torch.empty((total_q, q_heads, head_dim_vo), dtype=q.dtype, device=q.device)
     lse = torch.empty((total_q, q_heads), dtype=torch.float32, device=q.device)
@@ -246,22 +279,34 @@ def paged_attention_reference(
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        out_cur, lse_cur = attention_reference(
-            q[q_start:q_end],
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_left=window_left,
-            attention_sink_bias=attention_sink_bias,
-            relative_attention_bias=(
-                None
-                if relative_attention_bias is None
-                else relative_attention_bias[q_start:q_end]
-            ),
+        request_q_len = q_end - q_start
+        block_size = (
+            request_q_len
+            if query_block_size is None
+            else min(int(query_block_size), request_q_len)
         )
-        out[q_start:q_end].copy_(out_cur)
-        lse[q_start:q_end].copy_(lse_cur.transpose(0, 1))
+        for block_start in range(0, request_q_len, block_size):
+            block_end = min(block_start + block_size, request_q_len)
+            global_start = q_start + block_start
+            global_end = q_start + block_end
+            out_cur, lse_cur = attention_reference(
+                q[global_start:global_end],
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_left=window_left,
+                attention_sink_bias=attention_sink_bias,
+                relative_attention_bias=(
+                    None
+                    if relative_attention_bias is None
+                    else relative_attention_bias[global_start:global_end]
+                ),
+                _query_start=block_start,
+                _query_total=request_q_len,
+            )
+            out[global_start:global_end].copy_(out_cur)
+            lse[global_start:global_end].copy_(lse_cur.transpose(0, 1))
     return out, lse
 
 

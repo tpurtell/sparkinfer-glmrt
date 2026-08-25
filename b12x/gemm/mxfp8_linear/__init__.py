@@ -1,15 +1,13 @@
-"""ModelOpt MXFP8 linear for SM12x (one-shot).
+"""Compatibility alias for ModelOpt MXFP8 ``blockscaled`` calls.
 
-``pack_weight`` converts a ModelOpt MXFP8 checkpoint weight into the
-dense-GEMM layout (host-side, one-time); ``mm`` quantizes the BF16/FP16
-input inline and runs the native MXFP8 GEMM.  Dispatches through an opaque
-torch custom op, so it is torch.compile- and CUDA-graph-safe.
+New code should use ``b12x.gemm.blockscaled.pack_weight``, ``.mm``, and
+``.prewarm``. This module retains its original names for compatibility.
 
 Example:
-    from b12x.gemm import mxfp8_linear
+    from b12x.gemm import blockscaled
 
-    weight = mxfp8_linear.pack_weight(w_mxfp8, w_scale)   # one-time
-    out = mxfp8_linear.mm(x, weight, expected_m=x.shape[0])
+    weight = blockscaled.pack_weight(w_mxfp8, w_scale)   # one-time
+    out = blockscaled.mm(x, weight, expected_m=x.shape[0])
 """
 
 from __future__ import annotations

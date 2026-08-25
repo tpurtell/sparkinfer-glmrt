@@ -135,12 +135,8 @@ def _make_mxfp4_weights(device: torch.device, *, seed: int) -> _Weights:
     )
     # E8M0 byte 122 is exactly 2^-5.  These are checkpoint-native logical
     # K/32 grids; production preparation repacks them for tiny decode.
-    w1_scale = torch.full(
-        (_E, 2 * _N, _K // 32), 122, dtype=torch.uint8, device=device
-    )
-    w2_scale = torch.full(
-        (_E, _K, _N // 32), 122, dtype=torch.uint8, device=device
-    )
+    w1_scale = torch.full((_E, 2 * _N, _K // 32), 122, dtype=torch.uint8, device=device)
+    w2_scale = torch.full((_E, _K, _N // 32), 122, dtype=torch.uint8, device=device)
     alpha = torch.ones(_E, dtype=torch.float32, device=device)
     unit = torch.ones(_E, dtype=torch.float32, device=device)
     return _Weights(
@@ -202,6 +198,13 @@ def _nvfp4_oracle(
 ) -> torch.Tensor:
     # This is the pure-Torch GPU oracle; it does not instantiate or call a CuTe
     # kernel and consumes the original checkpoint layout directly.
+    active = (inputs.topk_ids >= 0) & (inputs.topk_ids < _E)
+    oracle_ids = torch.where(
+        active, inputs.topk_ids, torch.zeros_like(inputs.topk_ids)
+    ).contiguous()
+    oracle_weights = torch.where(
+        active, inputs.topk_weights, torch.zeros_like(inputs.topk_weights)
+    ).contiguous()
     return moe_reference_nvfp4(
         inputs.a,
         weights.w1_fp4,
@@ -212,8 +215,8 @@ def _nvfp4_oracle(
         weights.w2_alpha,
         weights.a1_scale,
         weights.a2_scale,
-        inputs.topk_ids,
-        inputs.topk_weights,
+        oracle_ids,
+        oracle_weights,
         _E,
         _K,
         _N,
@@ -225,6 +228,13 @@ def _nvfp4_oracle(
 def _mxfp4_oracle(weights: _Weights, inputs: _Inputs) -> torch.Tensor:
     # No prepared/repacked tensor participates in this oracle.  It consumes the
     # checkpoint-native FP4 + E8M0 grids and emulates MXFP8 activation rounding.
+    active = (inputs.topk_ids >= 0) & (inputs.topk_ids < _E)
+    oracle_ids = torch.where(
+        active, inputs.topk_ids, torch.zeros_like(inputs.topk_ids)
+    ).contiguous()
+    oracle_weights = torch.where(
+        active, inputs.topk_weights, torch.zeros_like(inputs.topk_weights)
+    ).contiguous()
     return moe_reference_w4a8_mx(
         inputs.a.float(),
         weights.w1_fp4,
@@ -235,8 +245,8 @@ def _mxfp4_oracle(weights: _Weights, inputs: _Inputs) -> torch.Tensor:
         weights.w2_scale,
         None,
         weights.w2_alpha,
-        inputs.topk_ids,
-        inputs.topk_weights,
+        oracle_ids,
+        oracle_weights,
         _E,
         _K,
         _N,
@@ -271,13 +281,13 @@ def _prepare_and_bind(
     )
     scratch_plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
+            config=experts.plan.checkpoint_config,
             max_tokens=int(inputs.a.shape[0]),
             num_topk=_TOPK,
             device=inputs.a.device,
             weight_plan=experts.plan,
             core_token_counts=(int(inputs.a.shape[0]),),
             route_num_experts=0,
-            quant_mode=quant_mode,
             frozen=True,
         )
     )
@@ -376,8 +386,8 @@ def _run_live_graph_check(
         max_normalized_rmse=max_normalized_rmse,
     )
 
-    # Mutate every live serving input in place.  IDs remain in range and each
-    # token still selects two distinct experts with positive normalized weights.
+    # Mutate every live serving input in place. The replay may include inactive
+    # route IDs, which must remain graph-safe without changing the binding.
     initial.a.copy_(changed.a)
     initial.topk_ids.copy_(changed.topk_ids)
     initial.topk_weights.copy_(changed.topk_weights)
@@ -498,6 +508,44 @@ def test_standard_moe_dynamic_prefill_live_graph_oracle(
     )
 
 
+def test_standard_moe_dynamic_inactive_route_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore inactive routes in the production NVFP4 dynamic graph path."""
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(device, seed=201)
+    initial = _make_inputs(device, m=40, seed=202, route_shift=0)
+    changed = _make_inputs(device, m=40, seed=203, route_shift=2)
+    changed.topk_ids[-8:].fill_(-1)
+    initial_reference = _nvfp4_oracle(weights, initial)
+    changed_reference = _nvfp4_oracle(weights, changed)
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == 32
+    assert launch_plan.execution.tile_n == 128
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="standard-moe-dynamic-graph-m40",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+    assert case.binding.output is not None
+    assert torch.count_nonzero(case.binding.output[-8:]).item() == 0
+
+
 def test_standard_moe_tiny_decode_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -531,6 +579,40 @@ def test_standard_moe_tiny_decode_live_graph_oracle(
         initial_reference=initial_reference,
         changed_reference=changed_reference,
         context="standard-moe-tiny-decode-phases-1-2",
+        min_cos=0.998,
+        max_normalized_rmse=0.05,
+    )
+
+
+def test_standard_moe_tiny_decode_inactive_route_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore scheduler-padding routes during tiny-decode graph replay."""
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_mxfp4_weights(device, seed=301)
+    initial = _make_inputs(device, m=2, seed=302, route_shift=0)
+    changed = _make_inputs(device, m=2, seed=303, route_shift=2)
+    changed.topk_ids[1, 1] = -1
+
+    initial_reference = _mxfp4_oracle(weights, initial)
+    changed_reference = _mxfp4_oracle(weights, changed)
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+    )
+    assert case.scratch_plan.launch_plan.implementation == "micro"
+    assert case.binding.implementation == "micro"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="standard-moe-tiny-decode-inactive-route",
         min_cos=0.998,
         max_normalized_rmse=0.05,
     )

@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-from ..._lib.dense_gemm import (
-    dense_gemm as mm,
-)
-from ..._lib.dense_gemm import (
-    dense_gemm_fused_quant_a as mm_fused_quant_a,
-)
-from ..._lib.dense_gemm import (
-    dense_gemm_fused_quant_a_grouped as mm_fused_quant_a_grouped,
-)
 from ..._lib.gating import default_is_supported
+from ._linear import (
+    Weight,
+    blockscaled_mm as mm,
+    pack_weight,
+    prewarm,
+)
 from . import META
 
 
@@ -20,4 +17,10 @@ def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 
 
-__all__ = ["mm", "mm_fused_quant_a", "mm_fused_quant_a_grouped", "is_supported"]
+__all__ = [
+    "Weight",
+    "is_supported",
+    "mm",
+    "pack_weight",
+    "prewarm",
+]

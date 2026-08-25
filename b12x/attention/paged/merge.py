@@ -291,6 +291,7 @@ def _threadblock_sync_state(
     s_partial: cute.Tensor,
     s_lse: cute.Tensor,
     *,
+    head_dim: cutlass.Constexpr[int],
     vec_size: cutlass.Constexpr[int],
     bdy: cutlass.Constexpr[int],
     finite_states: cutlass.Constexpr[bool],
@@ -301,7 +302,7 @@ def _threadblock_sync_state(
     if const_expr(finite_states and vec_size == 8):
         _store_shared_f32x8_as_bf16(
             shared_ptr_to_u32(
-                s_partial.iterator + Int32(ty * 128 + base_k)
+                s_partial.iterator + Int32(ty * head_dim + base_k)
             ),
             state_o,
         )
@@ -322,7 +323,7 @@ def _threadblock_sync_state(
             _load_shared_bf16x8_to_f32(
                 other_o,
                 shared_ptr_to_u32(
-                    s_partial.iterator + Int32(iter_idx * 128 + base_k)
+                    s_partial.iterator + Int32(iter_idx * head_dim + base_k)
                 ),
             )
         else:
@@ -1044,6 +1045,7 @@ class PagedPersistentMergeKernel:
                     state_d,
                     s_partial,
                     s_lse,
+                    head_dim=head_dim,
                     vec_size=self.vec_size,
                     bdy=self.bdy,
                     finite_states=(
@@ -1387,6 +1389,7 @@ class LagunaVerifierMergeKernel:
                 state_d,
                 s_partial,
                 s_lse,
+                head_dim=self.head_dim,
                 vec_size=self.vec_size,
                 bdy=self.bdy,
                 finite_states=True,

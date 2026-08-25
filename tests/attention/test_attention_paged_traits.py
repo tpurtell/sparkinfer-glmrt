@@ -86,6 +86,97 @@ def test_paged_fp8_traits_use_more_kv_mmas_than_bf16_traits() -> None:
     assert fp8_traits.cta_tile_kv > bf16_traits.cta_tile_kv
 
 
+def test_sm121_long_bf16_extend_amortizes_wider_kv_tile(monkeypatch) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 1),
+    )
+
+    def make_plan(*, total_q: int, kv_chunk_size: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            mode="extend",
+            enable_cuda_graph=True,
+            split_kv=False,
+            msa_block_sparse=False,
+            window_left=-1,
+            page_size=64,
+            cta_tile_q=64,
+            head_dim_qk=256,
+            head_dim_vo=256,
+            num_q_heads=24,
+            num_kv_heads=4,
+            gqa_group_size=6,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            total_q=total_q,
+            kv_chunk_size=kv_chunk_size,
+            page_table_shape=(1, 512),
+            device=torch.device("cuda", 0),
+        )
+
+    short_traits = select_paged_forward_traits_from_plan(
+        make_plan(total_q=4096, kv_chunk_size=12288)
+    )
+    long_traits = select_paged_forward_traits_from_plan(
+        make_plan(total_q=4096, kv_chunk_size=13312)
+    )
+
+    assert short_traits.num_mma_kv == 1
+    assert short_traits.cta_tile_kv == 16
+    assert short_traits.num_ctas_per_sm == 2
+    assert long_traits.num_mma_kv == 2
+    assert long_traits.cta_tile_kv == 32
+    assert long_traits.num_ctas_per_sm == 1
+
+
+def test_sm121_long_bf16_extend_can_force_narrow_tile(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_PAGED_EXTEND_BF16_N16", "1")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 1))
+    plan = SimpleNamespace(
+        mode="extend",
+        enable_cuda_graph=True,
+        split_kv=False,
+        msa_block_sparse=False,
+        window_left=-1,
+        page_size=64,
+        cta_tile_q=64,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        num_q_heads=24,
+        num_kv_heads=4,
+        gqa_group_size=6,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        total_q=2048,
+        kv_chunk_size=32768,
+        page_table_shape=(1, 512),
+        device=torch.device("cuda", 0),
+    )
+
+    traits = select_paged_forward_traits_from_plan(plan)
+
+    assert traits.num_mma_kv == 1
+    assert traits.cta_tile_kv == 16
+    assert traits.num_ctas_per_sm == 2
+
+
 def test_paged_bf16_decode_traits_cover_padded_sync_storage_for_128_vo() -> None:
     traits = select_paged_forward_traits(
         cta_tile_q=16,
@@ -120,6 +211,48 @@ def test_paged_fp8_decode_traits_keep_minimax_head128_tile_within_page() -> None
     assert traits.cta_tile_kv == 64
 
 
+def test_sm121_fp8_gqa6_h256_decode_compacts_sync_storage(monkeypatch) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 1))
+    plan = SimpleNamespace(
+        mode="decode",
+        enable_cuda_graph=True,
+        split_kv=True,
+        msa_block_sparse=False,
+        window_left=-1,
+        page_size=64,
+        cta_tile_q=16,
+        head_dim_qk=256,
+        head_dim_vo=256,
+        num_q_heads=24,
+        num_kv_heads=4,
+        gqa_group_size=6,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        device=torch.device("cuda", 0),
+    )
+
+    traits = select_paged_forward_traits_from_plan(plan)
+
+    assert traits.cta_tile_kv == 64
+    assert traits.shared_storage_bytes == 40960
+    assert traits.launch_smem_bytes == 41984
+    assert traits.num_ctas_per_sm == 2
+
+    monkeypatch.setenv("B12X_PAGED_GQA6_COMPACT_SYNC", "0")
+    baseline_traits = select_paged_forward_traits_from_plan(plan)
+    assert baseline_traits.shared_storage_bytes == 66048
+    assert baseline_traits.launch_smem_bytes == 67584
+    assert baseline_traits.num_ctas_per_sm == 1
+
+
 def test_laguna_page128_split_graph_traits_consume_one_physical_page(
     monkeypatch,
 ) -> None:
@@ -141,6 +274,7 @@ def test_laguna_page128_split_graph_traits_consume_one_physical_page(
         enable_cuda_graph=True,
         split_kv=True,
         msa_block_sparse=False,
+        window_left=-1,
         page_size=128,
         cta_tile_q=16,
         head_dim_qk=128,
@@ -186,6 +320,7 @@ def test_laguna_page128_traits_reject_same_gqa_nonproduction_head_counts(
             enable_cuda_graph=True,
             split_kv=True,
             msa_block_sparse=False,
+            window_left=-1,
             page_size=128,
             cta_tile_q=16,
             head_dim_qk=128,

@@ -18,6 +18,25 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
+def f32_as_u32(value: Float32, *, loc=None, ip=None) -> Uint32:
+    """Bitcast float32 to uint32 without numeric conversion."""
+
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_global_u64(addr: Int64, *, loc=None, ip=None) -> Uint64:
     return Uint64(
         llvm.inline_asm(
@@ -195,9 +214,7 @@ def unpack_bf16x2(value: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32
 
 
 @dsl_user_op
-def pack_f32x2_to_f16x2(
-    lo: Float32, hi: Float32, *, loc=None, ip=None
-) -> Uint32:
+def pack_f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -217,9 +234,7 @@ def pack_f32x2_to_f16x2(
 
 
 @dsl_user_op
-def pack_f32x2_to_bf16x2(
-    lo: Float32, hi: Float32, *, loc=None, ip=None
-) -> Uint32:
+def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
     """Match two scalar ``__float2bfloat16`` conversions without saturation."""
     return Uint32(
         llvm.inline_asm(
@@ -313,9 +328,7 @@ def ld_relaxed_gpu_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def atomic_add_global_u32(
-    addr: Int64, value: Uint32, *, loc=None, ip=None
-) -> Uint32:
+def atomic_add_global_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -482,6 +495,60 @@ def rsqrt_approx_f32(value: Float32, *, loc=None, ip=None) -> Float32:
             "rsqrt.approx.f32 $0, $1;",
             "=f,f",
             has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def float_order_key(value: Float32, *, loc=None, ip=None) -> Uint32:
+    """Map a float onto a u32 whose unsigned order matches float order.
+
+    Lets a (score, expert) pair be packed into one integer key, so "better
+    candidate" becomes a plain integer max and the tie-break stops costing a
+    second comparison.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .u32 bits, mask;
+                mov.b32 bits, $1;
+                shr.u32 mask, bits, 31;
+                mul.lo.u32 mask, mask, 0x7fffffff;
+                or.b32 mask, mask, 0x80000000;
+                xor.b32 $0, bits, mask;
+            }
+            """,
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def redux_max_u32(value: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Warp-wide unsigned max in one instruction.
+
+    ``cute.arch.warp_redux_sync`` exposes the float variant, which libNVVM
+    rejects for sm_120a; the integer one is what the kernel actually needs.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(value).ir_value(loc=loc, ip=ip)],
+            "redux.sync.max.u32 $0, $1, 0xffffffff;",
+            "=r,r",
+            has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,

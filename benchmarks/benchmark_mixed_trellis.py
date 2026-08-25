@@ -57,7 +57,7 @@ def _prepared(bits: int, experts: int, seed: int, device: torch.device):
         device=device,
         seed=seed,
         params_dtype=torch.float16,
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=bits,
         gate_suh=scales((experts, HIDDEN)),
         up_suh=scales((experts, HIDDEN)),
@@ -102,9 +102,9 @@ def _serial_state(m, tier, expert_map, props, device):
         element_dtype="fp16",
         sms=int(props.multi_processor_count),
         max_shared_mem=int(props.shared_memory_per_block_optin),
-        weight_layout="trellis3_t256",
+        weight_layout="trellis_t256",
         scale_format="e4m3_k32",
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=int(tier.trellis_bits),
         force_tile_config=TILE_CONFIG,
         intermediate_rotation=True,
@@ -446,7 +446,6 @@ def main() -> None:
             print(
                 f"m={m:4d} serial={serial_med:9.2f}us mixed={mixed_med:9.2f}us "
                 f"speedup={serial_med / mixed_med:6.3f}x rel={float(rel):.3e} "
-                f"regs={launch.registers_per_thread} local={launch.local_memory_bytes} "
                 f"buffers={mixed_buffer_bytes / 2**20:.1f}/{serial_buffer_bytes / 2**20:.1f}MiB"
             )
         elif args.variant in ("serial", "serial-overlap"):
@@ -460,7 +459,6 @@ def main() -> None:
             assert launch is not None
             print(
                 f"m={m:4d} variant=mixed time={mixed_med:9.2f}us "
-                f"regs={launch.registers_per_thread} local={launch.local_memory_bytes} "
                 f"buffers={mixed_buffer_bytes / 2**20:.1f}MiB"
             )
 

@@ -17,14 +17,13 @@ Example:
       python benchmarks/benchmark_trellis_pair_moe_tp12.py \
         --tokens 1,4,16 --route-fixture /path/to/layer-rank.safetensors \
         --scenarios P33,sparse --replays 200 \
-        --require-known-resources --require-no-local-memory \
         --output out/trellis-pair-moe-tp12.json
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -43,6 +42,13 @@ try:
 except ModuleNotFoundError:  # Direct ``python benchmarks/...py`` execution.
     from common import make_l2_flush_fn, nvidia_smi_gpu_mode_snapshot
 from b12x.moe import fused_moe
+from b12x.moe._shared.kernels.w4a16.btx_compat import (
+    lift_qsrt_atoms_v1_extent,
+)
+from b12x.moe.fused_moe._impl import (
+    plan_b12x_fp4_moe_weights,
+    prepare_b12x_fp4_moe_weights,
+)
 
 
 _HIDDEN = 3584
@@ -57,7 +63,6 @@ _FIXTURE_KIND = "kquant_qsrt_tp12_benchmark_fixture"
 _FIXTURE_SCHEMA_VERSION = 1
 _RESULT_KIND = "b12x_trellis_pair_moe_tp12_benchmark"
 _RESULT_SCHEMA_VERSION = 1
-_CODEBOOK_SOURCE_FORMATS = {"sqg_xor_cheb_t12": "qsrt_sqg_e4m3"}
 
 
 @dataclass(frozen=True)
@@ -463,19 +468,6 @@ def _prepare_weights(
     sparse_p24_experts: int,
     route_fixture: _RouteFixture | None = None,
 ) -> fused_moe.ExpertWeights:
-    weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
-        source_format=_CODEBOOK_SOURCE_FORMATS[codebook],
-        activation="situ",
-        params_dtype=torch.bfloat16,
-        num_experts=experts,
-        hidden_size=_HIDDEN,
-        intermediate_size=_LOCAL_INTERMEDIATE,
-        w13_layout="w13",
-        trellis_bits=3,
-        trellis_tile_config=_TILES,
-        qsrt_storage_format="qsrt_atoms_v1",
-    )
     w13 = _random_i16(
         (2, experts, _PAIR_WORDS),
         device=device,
@@ -518,17 +510,47 @@ def _prepare_weights(
     format_codes = (
         (fc1_modes.to(torch.uint8) << 4) | fc2_modes.to(torch.uint8)
     ).contiguous()
-    return fused_moe.prepare_weights(
-        plan=weight_plan,
+    pair_kinds = {"P33"}
+    if bool(fc1_modes.any()) or bool(fc2_modes.any()):
+        pair_kinds.add("P24")
+    weight_plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="btx",
+        activation="situ",
         params_dtype=torch.bfloat16,
-        qsrt_atom_payload=atom_payload,
-        qsrt_first_atom_slot=0,
-        qsrt_layer_index=12,
-        qsrt_expert_ids=expert_ids,
-        qsrt_format_codes=format_codes,
+        num_experts=experts,
+        hidden_size=_HIDDEN,
+        intermediate_size=_LOCAL_INTERMEDIATE,
+        w13_layout="w13",
+        trellis_bits=3,
+        trellis_codebook=codebook,
+        trellis_rate_granularity="per_expert_pair",
+        trellis_pair_kinds=sorted(pair_kinds),
+        trellis_tile_config=_TILES,
+    )
+    weight_plan = replace(
+        weight_plan,
+        checkpoint_config=fused_moe.PackedConfig(
+            source_format="fp4_e8m0_k32"
+        ),
+    )
+    btx_layer = lift_qsrt_atoms_v1_extent(
+        atom_payload,
+        first_atom_slot=0,
+        layer_index=12,
+        expert_ids=expert_ids,
+        format_codes=format_codes,
+        hidden_size=_HIDDEN,
+        global_intermediate_size=_LOCAL_INTERMEDIATE,
         gate_suh=hidden_rotation,
         up_suh=hidden_rotation,
         down_svh=hidden_rotation,
+    )
+    return prepare_b12x_fp4_moe_weights(
+        plan=weight_plan,
+        params_dtype=torch.bfloat16,
+        btx_layer=btx_layer,
+        btx_device=device,
     )
 
 
@@ -585,12 +607,12 @@ def _capture_case(
     ).to(torch.bfloat16)
     plan = fused_moe.plan(
         fused_moe.Caps(
+            config=weights.plan.checkpoint_config,
             max_tokens=tokens,
             num_topk=_TOPK,
             route_num_experts=_ROUTE_EXPERTS,
             device=device,
             weight_plan=weights.plan,
-            quant_mode="w4a16",
             w4a16_block_size_m=8,
         )
     )
@@ -655,18 +677,7 @@ def _capture_case(
         ),
     }
     fused_launch = binding.fused_launch
-    registers_per_thread = int(
-        getattr(fused_launch, "registers_per_thread", -1)
-    )
-    local_memory_bytes = int(getattr(fused_launch, "local_memory_bytes", -1))
     kernel_summary: dict[str, object] = {
-        "resource_scope": "fused_route_fc1_situ_fc2",
-        "kernel_symbol": getattr(fused_launch, "kernel_symbol", None),
-        "resource_introspection_available": (
-            registers_per_thread >= 0 and local_memory_bytes >= 0
-        ),
-        "registers_per_thread": registers_per_thread,
-        "local_memory_bytes_per_thread": local_memory_bytes,
         "preplanned_launch_available": fused_launch is not None,
     }
     if fused_launch is not None:
@@ -792,7 +803,7 @@ def main() -> None:
     parser.add_argument(
         "--codebook",
         choices=tuple(_CODEBOOK_SOURCE_FORMATS),
-        default="sqg_xor_cheb_t12",
+        default="sqg_e4m3",
         help="SQG-XOR-Cheb-T12 reconstruction used by every trellis scenario",
     )
     parser.add_argument(
@@ -828,16 +839,6 @@ def main() -> None:
     parser.add_argument("--cold-replays", type=int, default=50)
     parser.add_argument("--bootstrap-replicates", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=20260801)
-    parser.add_argument(
-        "--require-known-resources",
-        action="store_true",
-        help="fail unless CUDA function attributes are available for every case",
-    )
-    parser.add_argument(
-        "--require-no-local-memory",
-        action="store_true",
-        help="fail unless every fused kernel reports zero local bytes/thread",
-    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -942,7 +943,6 @@ def main() -> None:
             "cuda_graph_replay_allocation_stable_required": True,
             "paired_timing_bootstrap_replicates": args.bootstrap_replicates,
             "correctness": "finite eager output and bit-exact eager/graph replay",
-            "kernel_resource_scope": "fused route/FC1/SiTU/FC2 kernel only",
         },
         "device": {
             "name": props.name,
@@ -1003,22 +1003,6 @@ def main() -> None:
             mode_summaries[scenario] = mode_summary
             kernel_summaries[scenario] = kernel_summary
             correctness_summaries[scenario] = correctness_summary
-            resources_known = bool(
-                kernel_summary["resource_introspection_available"]
-            )
-            local_memory_bytes = int(
-                kernel_summary["local_memory_bytes_per_thread"]
-            )
-            if args.require_known_resources and not resources_known:
-                raise RuntimeError(
-                    f"{scenario}/tokens={tokens} has unavailable CUDA resource data; "
-                    "use a fresh B12X_COMPILE_CACHE_DIR"
-                )
-            if args.require_no_local_memory and local_memory_bytes != 0:
-                raise RuntimeError(
-                    f"{scenario}/tokens={tokens} reports "
-                    f"{local_memory_bytes} local bytes/thread"
-                )
 
         allocated_before_timing = int(torch.cuda.memory_allocated(device))
         reserved_before_timing = int(torch.cuda.memory_reserved(device))

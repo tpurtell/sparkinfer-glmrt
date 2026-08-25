@@ -221,6 +221,31 @@ def sqg_xor_cheb_t12_lut(device: torch.device | str) -> torch.Tensor:
     return _sqg_xor_cheb_t12_lut_device(resolved.type, index)
 
 
+@functools.cache
+def _sqg_xor_cheb_t12_direct_lut_device(
+    device_type: str,
+    device_index: int | None,
+) -> torch.Tensor:
+    device = torch.device(device_type, device_index)
+    return sqg_xor_cheb_t12_direct_lut_cpu().to(device=device).contiguous()
+
+
+def sqg_xor_cheb_t12_direct_lut(device: torch.device | str) -> torch.Tensor:
+    """Return the process-lifetime rate-indexed 192 KiB direct state table.
+
+    Rows are the K2/K3/K4 slices in rate order: byte(state, bits) =
+    table[((bits - 2) << 16) | state]. Each byte precomposes the frozen
+    XOR-Cheb rank map with the modal T12 staircase, so lookups are
+    bit-identical to the in-kernel T12 decode.
+    """
+
+    resolved = torch.device(device)
+    index = resolved.index
+    if resolved.type == "cuda" and index is None:
+        index = torch.cuda.current_device()
+    return _sqg_xor_cheb_t12_direct_lut_device(resolved.type, index)
+
+
 def _sqg_xor_cheb_t12_rank_for_codewords(
     codewords: torch.Tensor, bits: int
 ) -> torch.Tensor:

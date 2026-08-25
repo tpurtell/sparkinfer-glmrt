@@ -11,8 +11,9 @@ import cutlass.cute as cute
 import pytest
 import torch
 
+from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x.gemm import block_fp8_linear as bfl
-from b12x.gemm import mxfp8_linear
+from b12x.gemm import blockscaled, mxfp8_linear
 from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
 )
@@ -90,6 +91,55 @@ def test_mm_matches_quantized_reference_small_n() -> None:
     )
 
 
+@pytest.mark.parametrize("tokens", (2, 3, 8, 15, 16, 17, 32, 99))
+def test_mm_writes_all_rows_for_unaligned_output_width(tokens: int) -> None:
+    """A small-batch GEMM must store every live row when N spans multiple tiles."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260814 + tokens)
+
+    source, _, packed = _make_inputs(tokens, 7168, 132)
+    actual = mxfp8_linear.mm(source, packed, expected_m=tokens)
+    expected = _reference_from_packed(source, packed)
+    torch.cuda.synchronize()
+
+    assert actual.shape == (tokens, 132)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-2,
+    )
+
+
+def test_mm_unaligned_output_stride_captures_and_replays() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260822)
+
+    source, _, packed = _make_inputs(8, 7168, 132)
+    replacement = torch.randn_like(source).div_(4)
+    mxfp8_linear.mm(source, packed)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = mxfp8_linear.mm(source, packed)
+    source.copy_(replacement)
+    expected = _reference_from_packed(source, packed)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-2,
+    )
+
+
 def test_mm_pads_k32_to_dense_tile() -> None:
     require_b12x()
     require_mxf8_mma()
@@ -136,3 +186,73 @@ def test_mm_default_fused_path_captures_with_k_padding() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+
+def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260823)
+
+    tokens, in_features, out_features = 6, 128, 64
+    source, _, packed = _make_inputs(tokens, in_features, out_features)
+    source_q = bfl.quantize_input(source)
+    source_scale_storage = convert_sf_from_mma_layout(
+        source_q.scale_mma,
+        m=tokens,
+        k=in_features,
+        num_groups=1,
+        sf_vec_size=32,
+    )
+    expected = blockscaled.mm(source, packed)
+    actual_native_scale = blockscaled.mm(
+        (source_q.values, source_q.scale_mma),
+        packed,
+        out_dtype=torch.bfloat16,
+    )
+    actual_serialized_scale = blockscaled.mm(
+        (source_q.values, source_scale_storage),
+        packed,
+        out_dtype=torch.bfloat16,
+    )
+
+    torch.testing.assert_close(actual_native_scale, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_serialized_scale, expected, rtol=0, atol=0)
+
+    blockscaled.prewarm(
+        packed,
+        [tokens],
+        input_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = blockscaled.mm(
+            (source_q.values, source_scale_storage),
+            packed,
+            out_dtype=torch.bfloat16,
+        )
+    output_ptr = graph_output.data_ptr()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert graph_output.data_ptr() == output_ptr
+    torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
+
+
+def test_blockscaled_mm_accepts_compact_mxfp8_scales_with_k_padding() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260824)
+
+    source, _, packed = _make_inputs(6, 160, 40)
+    source_values, source_scale_rows = _quantize_modelopt_mxfp8_rows(source)
+    actual = blockscaled.mm(
+        (source_values, source_scale_rows),
+        packed,
+        out_dtype=torch.bfloat16,
+    )
+    expected = blockscaled.mm(source, packed)
+
+    assert actual.shape == (6, 40)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

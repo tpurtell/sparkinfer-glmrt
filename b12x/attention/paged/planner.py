@@ -54,6 +54,7 @@ _PAGED_EXTEND_BF16_CHUNK_TABLE_PAGES = (
 )
 
 _DEFAULT_GRAPH_CTAS_PER_SM = 2
+_FP8_PV_REPACK_MAX_RESIDENT_WAVES = 16
 _MSA_TOPK = 16
 _MSA_BLOCK_TOKENS = 128
 _BF16_MINIMAX_DECODE_MAX_CHUNKS = (
@@ -86,6 +87,39 @@ def _ceil_div(x: int, y: int) -> int:
 
 def _align_up(x: int, y: int) -> int:
     return _ceil_div(x, y) * y
+
+
+def use_paged_extend_fp8_pv_repack(
+    plan: "PagedPlan",
+    *,
+    resident_ctas_per_sm: int,
+    num_sms: int | None = None,
+) -> bool:
+    """Select CTA-wide FP8 V widening for low-wave dense extend grids."""
+
+    if (
+        plan.mode != "extend"
+        or plan.dtype != torch.bfloat16
+        or plan.kv_dtype != _FP8_KV_DTYPE
+        or int(plan.head_dim_qk) != 256
+        or int(plan.head_dim_vo) != 256
+        or int(plan.page_size) != 64
+        or int(plan.cta_tile_q) != 64
+        or int(plan.window_left) >= 0
+        or bool(plan.msa_block_sparse)
+    ):
+        return False
+    resident_ctas_per_sm = max(int(resident_ctas_per_sm), 1)
+    if num_sms is None:
+        num_sms = int(
+            torch.cuda.get_device_properties(plan.device).multi_processor_count
+        )
+    num_sms = max(int(num_sms), 1)
+    active_ctas = int(plan.num_qo_tiles) * int(plan.num_kv_heads)
+    resident_wave_capacity = num_sms * resident_ctas_per_sm
+    return active_ctas <= (
+        _FP8_PV_REPACK_MAX_RESIDENT_WAVES * resident_wave_capacity
+    )
 
 
 def _msa_decode_chunk_tokens(policy_batch: int) -> int:
@@ -302,6 +336,55 @@ def _sm121_gqa8_decode_chunk_budget(
     if 992 <= max_pages <= 1056:
         return 17 if kv_dtype == torch.bfloat16 else 18
     return None
+
+
+def _sm121_h256_one_wave_decode_chunk_budget(
+    *,
+    device: torch.device,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    batch: int,
+    num_kv_heads: int,
+    query_tiles_per_request: int,
+    window_left: int,
+) -> int | None:
+    """Cap dense H256 decode at one wave when it still fills most SMs.
+
+    The H256 kernel is occupancy-heavy enough that a second captured wave adds
+    merge and scheduling work without helping when the regular one-wave grid
+    already covers the machine.  Keep two-wave capacity for batch/head
+    geometries whose integer per-request split would leave more than one
+    quarter of the SMs idle.
+    """
+
+    if not (
+        q_dtype == torch.bfloat16
+        and kv_dtype in (torch.bfloat16, _FP8_KV_DTYPE)
+        and int(head_dim_qk) == 256
+        and int(head_dim_vo) == 256
+        and int(page_size) == 64
+        and int(batch) >= 1
+        and int(num_kv_heads) >= 1
+        and int(query_tiles_per_request) >= 1
+        and int(window_left) < 0
+        and tuple(torch.cuda.get_device_capability(device)) == (12, 1)
+    ):
+        return None
+
+    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    ctas_per_request_chunk = (
+        int(batch) * int(num_kv_heads) * int(query_tiles_per_request)
+    )
+    one_wave_chunks = num_sms // ctas_per_request_chunk
+    if one_wave_chunks <= 0:
+        return None
+    active_ctas = one_wave_chunks * ctas_per_request_chunk
+    if active_ctas * 4 < num_sms * 3:
+        return None
+    return int(one_wave_chunks)
 
 
 def _is_laguna_fp8_gqa6_analytic_decode_graph(
@@ -1198,6 +1281,23 @@ def plan_decode_graph_capacity(
     )
     if sm121_gqa8_chunks is not None:
         max_chunks_budget = min(max_chunks_budget, sm121_gqa8_chunks)
+    if graph_ctas_per_sm is None:
+        sm121_h256_one_wave_chunks = _sm121_h256_one_wave_decode_chunk_budget(
+            device=device,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            page_size=page_size,
+            batch=batch,
+            num_kv_heads=num_kv_heads,
+            query_tiles_per_request=query_tiles_per_request,
+            window_left=window_left,
+        )
+        if sm121_h256_one_wave_chunks is not None:
+            max_chunks_budget = min(
+                max_chunks_budget, sm121_h256_one_wave_chunks
+            )
 
     split_policy_supported = q_dtype == torch.bfloat16 and (
         _merge_backend_supports_split_kv(

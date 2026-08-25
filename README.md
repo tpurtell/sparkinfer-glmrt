@@ -26,11 +26,14 @@ enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
 kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
 `<group>/_shared/` and the universal compile/scratch spine in `b12x/_lib/`.
 
-**`gemm`** — a dense block-scaled GEMM (NVFP4/MXFP8 operands, BF16/FP16/FP32
-out) plus fused linears on top of it: `gemm.blockscaled` (one-shot), MXFP8
-(`gemm.mxfp8_linear`), 128×128 block-FP8 (`gemm.block_fp8_linear`), and the
-fused MLA query projection (`gemm.mla_query_projection`) and grouped
-WO-projection (`gemm.wo_projection`) used around MLA attention.
+**`gemm`** — `gemm.blockscaled` is the common dense interface for raw
+NVFP4/MXFP4/MXFP8/block-FP8 operands and packed MXFP8/tensor-FP8 weights; it
+owns `mm`, `pack_weight`, and serving `prewarm`. The legacy
+`gemm.mxfp8_linear` and `gemm.tensor_fp8_linear` imports are compatibility
+aliases. `gemm.block_fp8_linear` retains a separate planned interface because
+it owns caller-provided scratch and inline requantization. The fused MLA query
+projection (`gemm.mla_query_projection`) and grouped WO projection
+(`gemm.wo_projection`) are used around MLA attention.
 
 **`attention`** — `attention.paged` (paged-KV decode/extend, FP8 KV, MSA block
 sparse, CUDA-graph-replayable), `attention.sparse_mla` and

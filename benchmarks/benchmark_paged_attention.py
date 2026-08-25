@@ -869,6 +869,21 @@ def _parse_csv_ints(value: str) -> list[int]:
 
 
 BENCHMARK_PROFILES: dict[str, dict[str, object]] = {
+    "qwen3.8-27b": {
+        "mode": "decode-graph-buckets",
+        "batch": 8,
+        "batch_buckets": "1,2,4,8,12,16",
+        "decode_contexts": "128,16384,32768,65536,131072",
+        "capture_context": 0,
+        "q_seqlens": "1",
+        "cache_seqlens": "64,512,2048,8192",
+        "page_size": 64,
+        "q_heads": 24,
+        "kv_heads": 4,
+        "head_dim": 256,
+        "dtype": "bf16",
+        "kv_dtype": "same",
+    },
     "qwen-gqa": {
         "mode": "decode-graph-buckets",
         "batch": 8,
@@ -1733,12 +1748,6 @@ def _resolve_decode_graph_bucket_policy(
             "decode-graph-buckets uses the production device-LUT replay policy; "
             "--fixed-split-pages is only supported by legacy-matrix"
         )
-    if graph_ctas_per_sm_override > 0:
-        raise ValueError(
-            "decode-graph-buckets uses the production device-LUT replay policy; "
-            "--graph-ctas-per-sm is only supported by legacy-matrix"
-        )
-
     if capture_context_override > 0:
         capture_context_tokens = int(capture_context_override)
         source = "manual"
@@ -1773,6 +1782,11 @@ def _resolve_decode_graph_bucket_policy(
         page_size=page_size,
         batch=batch,
         max_cache_page_count=capture_page_count,
+        graph_ctas_per_sm=(
+            int(graph_ctas_per_sm_override)
+            if graph_ctas_per_sm_override > 0
+            else None
+        ),
     )
 
     return DecodeGraphBucketPolicy(
@@ -2191,12 +2205,7 @@ def _capture_backend_graph(
         )
         capture_plan = workspace.plan
         replay_plan = None
-    elif window_left >= 0:
-        if fixed_split_pages is not None or graph_ctas_per_sm is not None:
-            raise ValueError(
-                "sliding decode graph replay uses the production workspace "
-                "policy; fixed split and CTA overrides are not supported"
-            )
+    elif fixed_split_pages is None and graph_ctas_per_sm is None:
         workspace.prepare_decode_graph_replay_state(
             batch=int(capture_page_table.shape[0]),
             total_q_capacity=int(q.shape[0]),
