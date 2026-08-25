@@ -27,6 +27,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     W4A16MixedTrellisKernel,
     _check_descriptor_projection_counts,
     _mixed_route_num_experts,
+    _normalize_mixed_trellis_format,
     _require_capture_safe_descriptor_metadata,
     _validate_mixed_trellis_tier_storage,
     bind_mixed_trellis,
@@ -765,14 +766,33 @@ def test_mixed_k3_k4_k5_partition_reuses_one_compiled_object() -> None:
 
 
 @pytest.mark.parametrize(
-    ("codebook", "bits", "message"),
+    ("codebook", "bits"),
     [
-        ("sqg_xor_cheb_t12", (3, 4, 5), "only the MCG codebook"),
-        ("mcg", (3, 4, 6), "one K3, one K4, and one K5 tier"),
-        ("mcg", (3, 3, 5), "one K3, one K4, and one K5 tier"),
+        ("mcg", (2, 3)),
+        ("mcg", (2, 4, 6)),
+        ("sqg_e4m3", (2, 3, 4)),
+        ("sqg_fp16", (5, 6)),
     ],
 )
-def test_compile_mixed_trellis3_rejects_unqualified_formats(
+def test_mixed_trellis_format_accepts_every_legal_bounded_family(
+    codebook: str,
+    bits: tuple[int, ...],
+) -> None:
+    normalized, actual = _normalize_mixed_trellis_format(codebook, bits)
+    assert actual == bits
+    assert normalized == codebook
+
+
+@pytest.mark.parametrize(
+    ("codebook", "bits", "message"),
+    [
+        ("sqg_xor_cheb_t12", (3, 4, 5), "unsupported trellis codebook"),
+        ("mcg", (3, 3, 5), "tiers must be distinct"),
+        ("mcg", (2, 3, 7), "defined only for K2/K3/K4/K5/K6"),
+        ("sqg_e4m3", (2, 3, 5), "defined only for K2/K3/K4"),
+    ],
+)
+def test_compile_mixed_trellis3_rejects_illegal_formats(
     codebook: str,
     bits: tuple[int, int, int],
     message: str,

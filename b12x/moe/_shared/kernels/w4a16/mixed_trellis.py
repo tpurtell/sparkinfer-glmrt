@@ -2,7 +2,7 @@
 
 The route packer assigns every global expert to one combined expert namespace.
 Input/intermediate rotations therefore run once. Per-tile dispatch resolves the
-combined expert to a bitrate-specialized K2 through K5 decoder while preserving
+combined expert to a bitrate-specialized K2 through K6 decoder while preserving
 the single cooperative FC1/activation/FC2 grid used by homogeneous trellis
 execution. The decoder codebook is a compile-time parameter shared with the
 fused W4A16 kernel ABI.
@@ -28,6 +28,10 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x.moe._shared.trellis_codebooks import (
+    normalize_codebook,
+    validate_codebook_bits,
+)
 
 from .host import (
     max_packed_route_slots,
@@ -80,10 +84,35 @@ class MixedTrellisCompileResult:
 
 @dataclass(frozen=True)
 class MixedTrellis3CompileResult(MixedTrellisCompileResult):
-    """Launch metadata for the qualified K3/K4/K5 three-tier specialization."""
+    """Launch metadata for a descriptor-selected three-tier specialization."""
 
     tier2_num_experts: int
     tier2_bits: int
+
+
+def _normalize_mixed_trellis_format(
+    codebook: str | int,
+    bits: Sequence[int],
+) -> tuple[str, tuple[int, ...]]:
+    """Validate one compile-time codebook/tier-set selection.
+
+    Expert membership and projection descriptors remain runtime artifact data;
+    only the distinct decoder tiers and their common codebook specialize a
+    kernel. This is deliberately independent of model identity.
+    """
+
+    normalized = normalize_codebook(codebook)
+    tiers = tuple(int(value) for value in bits)
+    if len(tiers) not in (2, 3):
+        raise ValueError("mixed Trellis requires exactly two or three tiers")
+    if len(set(tiers)) != len(tiers):
+        raise ValueError(
+            "mixed Trellis tiers must be distinct; "
+            f"got {tuple(f'K{value}' for value in tiers)}"
+        )
+    for value in tiers:
+        validate_codebook_bits(normalized, value)
+    return normalized, tiers
 
 
 @dataclass(frozen=True)
@@ -1761,14 +1790,23 @@ def compile_mixed_trellis(
     fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
         int(value) for value in force_tile_config
     )
-    trellis_codebook = str(trellis_codebook).lower()
+    trellis_codebook, bits = _normalize_mixed_trellis_format(
+        trellis_codebook,
+        (tier0_bits, tier1_bits),
+    )
+    tier0_bits, tier1_bits = bits
     direct_topk_routes = bool(direct_topk_routes)
     if fc1_tile_k < 128 and not direct_topk_routes:
         raise ValueError(
             "mixed Trellis FC1 requires tile_k >= 128; narrower K tiles lose "
             "large-M cross-tier partial reductions"
         )
-    total_experts = int(tier0_num_experts) + int(tier1_num_experts)
+    counts = (int(tier0_num_experts), int(tier1_num_experts))
+    if any(value <= 0 or value > _MAX_TIER_EXPERTS for value in counts):
+        raise ValueError(
+            "two-tier mixed Trellis requires each tier to contain 1..256 slots"
+        )
+    total_experts = sum(counts)
     if route_num_experts is None:
         route_num_experts = total_experts
     route_num_experts = int(route_num_experts)
@@ -2005,12 +2043,10 @@ def compile_mixed_trellis3(
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
     if int(size_m) * int(top_k) > torch.iinfo(torch.int32).max:
         raise ValueError("mixed Trellis routed-row count must fit in int32")
-    trellis_codebook = str(trellis_codebook).lower()
-    if trellis_codebook != "mcg":
-        raise ValueError(
-            "three-tier mixed Trellis supports only the MCG codebook; "
-            f"got {trellis_codebook!r}"
-        )
+    trellis_codebook, bits = _normalize_mixed_trellis_format(
+        trellis_codebook,
+        (tier0_bits, tier1_bits, tier2_bits),
+    )
     counts = tuple(
         int(value)
         for value in (
@@ -2022,11 +2058,6 @@ def compile_mixed_trellis3(
     if any(value <= 0 or value > _MAX_TIER_EXPERTS for value in counts):
         raise ValueError(
             "three-tier mixed Trellis requires each tier to contain 1..256 slots"
-        )
-    bits = tuple(int(value) for value in (tier0_bits, tier1_bits, tier2_bits))
-    if set(bits) != {3, 4, 5}:
-        raise ValueError(
-            "three-tier mixed Trellis requires one K3, one K4, and one K5 tier"
         )
     fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
         int(value) for value in force_tile_config
