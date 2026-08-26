@@ -708,7 +708,11 @@ def prepare_projection_native_trellis_weights(
             intermediate_rotations=intermediate_rotations,
             down_svh=down_svh,
             rotation_columns=3 * intermediate_size,
-            tile_config=(128, 256, 64, 256),
+            # Preparation validates equal CTA ownership for the two pair
+            # tiles.  The mixed runtime may compile a wider FC1 K tile over
+            # these same projection-native bytes; no weight relayout depends
+            # on this metadata choice.
+            tile_config=(64, 256, 64, 256),
             required_fc1_tile_n=256,
             dummy_scale=dummy_scale,
             workspace=shared_workspace,
