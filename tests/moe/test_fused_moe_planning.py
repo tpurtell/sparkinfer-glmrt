@@ -421,6 +421,16 @@ def test_direct_exl3_projection_plan_preserves_k2_tier_family(
     assert plan._core_workspace_plan.projection_mixed_trellis
 
 
+def test_projection_mixed_bind_zeroes_cooperative_workspace_before_launch() -> None:
+    source = inspect.getsource(
+        fused_moe_impl._bind_projection_mixed_trellis_from_views
+    )
+
+    zero = source.index('tensors["kernel_workspace"].zero_()')
+    buffers = source.index("buffers = MixedTrellisBuffers(")
+    assert zero < buffers
+
+
 def test_empty_projection_tier_uses_one_dummy_plane() -> None:
     value = trellis_impl._projection_native(
         torch.empty((4, 1), dtype=torch.uint8),

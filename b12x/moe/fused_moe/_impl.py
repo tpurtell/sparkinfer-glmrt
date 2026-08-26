@@ -7500,6 +7500,14 @@ def _bind_projection_mixed_trellis_from_views(
             f"float32[{m},{core_plan.k}] on {a.device}"
         )
 
+    # The mixed cooperative kernel uses the tail of this arena for its
+    # grid-wide barrier count and epoch, and the prefix for GEMM reduction
+    # locks. Caller-owned scratch is deliberately mapped without initialization,
+    # so arbitrary first-use bytes can leave every resident CTA spinning at the
+    # first barrier. Keep the initialization on the launch stream; under graph
+    # capture this memset is recorded and replayed before the cooperative grid.
+    tensors["kernel_workspace"].zero_()
+
     buffers = MixedTrellisBuffers(
         rotation_gate=tensors["rotation_a_gate"],
         rotation_up=tensors["rotation_a_up"],
