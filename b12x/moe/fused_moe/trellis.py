@@ -53,19 +53,15 @@ class ProjectionTrellisTierWeights:
 
 @dataclass(frozen=True)
 class PreparedProjectionTrellisWeights:
-    """Prepared three-tier MCG weights and projection descriptor tables."""
+    """Prepared two- or three-tier MCG weights and descriptor tables."""
 
-    tiers: tuple[
-        PreparedW4A16MoeWeights,
-        PreparedW4A16MoeWeights,
-        PreparedW4A16MoeWeights,
-    ]
+    tiers: tuple[PreparedW4A16MoeWeights, ...]
     global_to_combined: torch.Tensor
     descriptor_map: torch.Tensor
     rotations: MixedTrellisRotations
-    gate_counts: tuple[int, int, int]
-    up_counts: tuple[int, int, int]
-    tier_bits: tuple[int, int, int]
+    gate_counts: tuple[int, ...]
+    up_counts: tuple[int, ...]
+    tier_bits: tuple[int, ...]
     w13: torch.Tensor
     w2: torch.Tensor
     w13_scale: torch.Tensor
@@ -644,11 +640,7 @@ def _projection_prepared(
 
 
 def prepare_projection_native_trellis_weights(
-    native_tiers: tuple[
-        ProjectionTrellisTierWeights,
-        ProjectionTrellisTierWeights,
-        ProjectionTrellisTierWeights,
-    ],
+    native_tiers: tuple[ProjectionTrellisTierWeights, ...],
     *,
     gate_suh: torch.Tensor,
     up_suh: torch.Tensor,
@@ -662,14 +654,18 @@ def prepare_projection_native_trellis_weights(
 ) -> PreparedProjectionTrellisWeights:
     """Wrap three projection-native MCG tiers without format conversion."""
 
-    if len(native_tiers) != 3:
-        raise ValueError("projection-mixed Trellis requires exactly three tiers")
+    if len(native_tiers) not in (2, 3):
+        raise ValueError("projection-mixed Trellis requires two or three tiers")
     tier_bits = tuple(int(tier.bits) for tier in native_tiers)
-    if len(set(tier_bits)) != 3 or any(bit not in (2, 3, 4, 5, 6) for bit in tier_bits):
+    if len(set(tier_bits)) != len(native_tiers) or any(
+        bit not in (2, 3, 4, 5, 6) for bit in tier_bits
+    ):
         raise ValueError(
             "projection-mixed MCG tiers must be three distinct K2..K6 values"
         )
-    if tuple(sorted(tier_bits)) != tier_bits or tier_bits[2] != tier_bits[0] + 2:
+    if tuple(sorted(tier_bits)) != tier_bits or any(
+        right != left + 1 for left, right in zip(tier_bits, tier_bits[1:])
+    ):
         raise ValueError("projection-mixed MCG tiers must be consecutive and ordered")
     device = native_tiers[0].w13.device
     if any(tier.w13.device != device or tier.w2.device != device for tier in native_tiers):
@@ -744,7 +740,7 @@ def prepare_projection_native_trellis_weights(
             prepared_tiers, tier_w13, tier_w2, strict=True
         )
     )
-    assert len(tier_tuple) == 3
+    assert len(tier_tuple) == len(native_tiers)
 
     tier_id_by_bit = {bit: index for index, bit in enumerate(tier_bits)}
     tiers_by_projection = []
@@ -762,27 +758,29 @@ def prepare_projection_native_trellis_weights(
         tiers_by_projection[0],
         tiers_by_projection[1],
         tiers_by_projection[2],
-        tier_slots=(num_experts, num_experts, num_experts),
+        tier_slots=(num_experts,) * len(native_tiers),
         device=device,
     )
     broadcast_input = int(gate_suh.shape[0]) == 1
     broadcast_output = int(down_svh.shape[0]) == 1
     rotations = MixedTrellisRotations(
-        intermediate=torch.cat((intermediate_rotations,) * 3, dim=0).contiguous(),
+        intermediate=torch.cat(
+            (intermediate_rotations,) * len(native_tiers), dim=0
+        ).contiguous(),
         gate_suh=(
             gate_suh
             if broadcast_input
-            else torch.cat((gate_suh,) * 3, dim=0).contiguous()
+            else torch.cat((gate_suh,) * len(native_tiers), dim=0).contiguous()
         ),
         up_suh=(
             up_suh
             if broadcast_input
-            else torch.cat((up_suh,) * 3, dim=0).contiguous()
+            else torch.cat((up_suh,) * len(native_tiers), dim=0).contiguous()
         ),
         down_svh=(
             down_svh
             if broadcast_output
-            else torch.cat((down_svh,) * 3, dim=0).contiguous()
+            else torch.cat((down_svh,) * len(native_tiers), dim=0).contiguous()
         ),
     )
     gate_counts = tuple(len(tier.gate_experts) for tier in native_tiers)
@@ -794,7 +792,7 @@ def prepare_projection_native_trellis_weights(
         rotations=rotations,
         gate_counts=gate_counts,
         up_counts=up_counts,
-        tier_bits=tier_bits,  # type: ignore[arg-type]
+        tier_bits=tier_bits,
         w13=combined_w13,
         w2=combined_w2,
         w13_scale=dummy_scale,

@@ -416,7 +416,7 @@ def test_direct_exl3_projection_plan_preserves_k2_tier_family(
     plan = fused_moe.plan(_exl3_projection_caps())
 
     assert plan.caps.source_format == "exl3_trellis_mcg"
-    assert plan._core_workspace_plan.implementation == "trellis_mixed3"
+    assert plan._core_workspace_plan.implementation == "trellis_mixed"
     assert plan._core_workspace_plan.trellis_bits == 2
     assert plan._core_workspace_plan.projection_mixed_trellis
 
