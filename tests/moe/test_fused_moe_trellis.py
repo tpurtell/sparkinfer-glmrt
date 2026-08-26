@@ -268,6 +268,7 @@ def _plan(
     route_num_experts: int,
     block_size_m: int,
     device: torch.device | str,
+    swiglu_limit: float | None = None,
 ) -> fused_moe.Plan:
     return fused_moe.plan(
         fused_moe.Caps(
@@ -278,6 +279,7 @@ def _plan(
             weight_plan=weights.plan,
             quant_mode="w4a16",
             w4a16_block_size_m=block_size_m,
+            swiglu_limit=swiglu_limit,
         )
     )
 
@@ -655,6 +657,7 @@ def _reference_full_rotation(
     down_svh: torch.Tensor,
     *,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     device = x.device
     experts = int(w2.shape[0])
@@ -682,6 +685,7 @@ def _reference_full_rotation(
         intermediate_rotations,
         down_svh,
         activation=activation,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -698,6 +702,7 @@ def _reference_full_rotation_decoded(
     down_svh: torch.Tensor,
     *,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     device = x.device
     experts = int(down_weights.shape[0])
@@ -739,6 +744,9 @@ def _reference_full_rotation_decoded(
                 svh=up_svh[expert],
                 store_fp16=True,
             )
+            if swiglu_limit is not None:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             if activation == "situ":
                 activated = (
                     4.0
@@ -1168,11 +1176,20 @@ def test_full_rotation_topk16_route_parallel_sum_matches_reference(bits: int) ->
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("activation", ["silu", "situ"])
+@pytest.mark.parametrize(
+    "input_dtype,activation,swiglu_limit",
+    [
+        (torch.bfloat16, "silu", None),
+        (torch.bfloat16, "silu", 10.0),
+        (torch.bfloat16, "situ", None),
+        (torch.float16, "silu", None),
+        (torch.float16, "situ", None),
+    ],
+)
 def test_planned_full_rotation_matches_reference_and_captures(
     input_dtype: torch.dtype,
     activation: str,
+    swiglu_limit: float | None,
 ) -> None:
     torch.manual_seed(20260721)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1224,13 +1241,17 @@ def test_planned_full_rotation_matches_reference_and_captures(
         route_num_experts=4,
         block_size_m=8,
         device=device,
+        swiglu_limit=swiglu_limit,
     )
     assert plan.caps.w4a16_block_size_m == 8
     assert plan.full_rotation
 
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    x = (torch.randn((2, hidden), device=device) * 1.0e-3).to(input_dtype)
+    # Exercise the clamp in the clamped case; the historical tiny input never
+    # drove a reconstructed FC1 value past DeepSeek's limit.
+    input_scale = 1.0 if swiglu_limit is not None else 1.0e-3
+    x = (torch.randn((2, hidden), device=device) * input_scale).to(input_dtype)
     local_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
     global_ids = torch.tensor([[1, 3], [3, 1]], dtype=torch.int64, device=device)
     router_weights = torch.tensor(
@@ -1285,6 +1306,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         intermediate_rotations,
         down_svh,
         activation=activation,
+        swiglu_limit=swiglu_limit,
     )
     relative_error = (mapped_eager - reference).norm() / reference.norm().clamp_min(
         1.0e-9
