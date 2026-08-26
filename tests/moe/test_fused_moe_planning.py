@@ -437,6 +437,46 @@ def test_trellis_exact_launch_widths_cover_decode_only(
     assert fused_moe_impl._trellis_exact_launch_token_counts(capacity) == expected
 
 
+@pytest.mark.parametrize(
+    ("tokens", "top_k", "direct_exl3", "expected"),
+    (
+        (1, 6, True, True),
+        (12, 6, True, True),
+        (13, 6, True, False),
+        (9, 8, True, True),
+        (10, 8, True, False),
+        (12, 6, False, False),
+    ),
+)
+def test_projection_mixed_direct_route_limit_is_bounded(
+    tokens: int,
+    top_k: int,
+    direct_exl3: bool,
+    expected: bool,
+) -> None:
+    assert (
+        fused_moe_impl._projection_mixed_direct_topk_routes(
+            tokens,
+            top_k,
+            direct_exl3=direct_exl3,
+        )
+        is expected
+    )
+
+
+def test_projection_mixed_tile_config_preserves_decode_and_widens_packed_fc1() -> None:
+    configured = (64, 256, 64, 128)
+
+    assert fused_moe_impl._projection_mixed_tile_config(
+        configured,
+        direct_topk_routes=True,
+    ) == configured
+    assert fused_moe_impl._projection_mixed_tile_config(
+        configured,
+        direct_topk_routes=False,
+    ) == (128, 256, 64, 128)
+
+
 def test_projection_mixed_bind_zeroes_cooperative_workspace_before_launch() -> None:
     source = inspect.getsource(
         fused_moe_impl._bind_projection_mixed_trellis_from_views

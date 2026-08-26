@@ -6963,6 +6963,52 @@ def _trellis_exact_launch_token_counts(capacity_tokens: int) -> tuple[int, ...]:
     )
 
 
+_MIXED_TRELLIS_DIRECT_ROUTE_LIMIT = 72
+
+
+def _projection_mixed_direct_topk_routes(
+    token_count: int,
+    top_k: int,
+    *,
+    direct_exl3: bool,
+) -> bool:
+    """Keep bounded two-tier decode widths out of the packed K128 kernel.
+
+    Projection-mixed packed execution requires an FC1 K tile of at least 128
+    to preserve cross-tier reductions.  For at most 72 live routes, issuing
+    the exact routes directly is both bounded and measurably cheaper; larger
+    shapes retain expert-grouped route packing and weight reuse.
+    """
+
+    token_count = int(token_count)
+    top_k = int(top_k)
+    return bool(
+        direct_exl3
+        and token_count > 0
+        and top_k > 0
+        and token_count * top_k <= _MIXED_TRELLIS_DIRECT_ROUTE_LIMIT
+    )
+
+
+def _projection_mixed_tile_config(
+    configured: tuple[int, int, int, int] | None,
+    *,
+    direct_topk_routes: bool,
+) -> tuple[int, int, int, int]:
+    """Resolve a legal decode/packed mixed-Trellis tile geometry."""
+
+    if configured is None:
+        return (
+            (64, 128, 64, 128)
+            if direct_topk_routes
+            else (128, 128, 128, 128)
+        )
+    fc1_k, fc1_n, fc2_k, fc2_n = (int(value) for value in configured)
+    if not direct_topk_routes and fc1_k < 128:
+        fc1_k = 128
+    return fc1_k, fc1_n, fc2_k, fc2_n
+
+
 def _plan_full_rotation_w4a16_launches(
     *,
     caps: TPMoEScratchCaps,
@@ -7244,6 +7290,11 @@ def _plan_projection_mixed_trellis_launches(
             broadcast_suh: bool,
             broadcast_svh: bool,
         ):
+            direct_topk_routes = _projection_mixed_direct_topk_routes(
+                token_count,
+                core_plan.num_topk,
+                direct_exl3=direct_exl3,
+            )
             common = dict(
                 size_m=token_count,
                 hidden_size=core_plan.k,
@@ -7255,8 +7306,10 @@ def _plan_projection_mixed_trellis_launches(
                 max_m_blocks=route_blocks,
                 sms=sms,
                 max_shared_mem=max_shared_mem,
-                force_tile_config=core_plan.trellis_tile_config
-                or (128, 128, 128, 128),
+                force_tile_config=_projection_mixed_tile_config(
+                    core_plan.trellis_tile_config,
+                    direct_topk_routes=direct_topk_routes,
+                ),
                 trellis_codebook="mcg",
                 tier0_bits=tier_bits[0],
                 tier1_bits=tier_bits[1],
@@ -7267,7 +7320,10 @@ def _plan_projection_mixed_trellis_launches(
                 broadcast_svh=broadcast_svh,
             )
             if direct_exl3:
-                return compile_mixed_trellis(**common)
+                return compile_mixed_trellis(
+                    **common,
+                    direct_topk_routes=direct_topk_routes,
+                )
             return compile_mixed_trellis3(
                 **common,
                 tier2_num_experts=core_plan.weight_E,
