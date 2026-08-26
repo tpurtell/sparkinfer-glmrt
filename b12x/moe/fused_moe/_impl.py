@@ -897,7 +897,7 @@ class TPMoEScratchPlan:
         default=(), repr=False
     )
     _mixed_trellis_launches: tuple[
-        tuple[torch.dtype, bool, bool, object], ...
+        tuple[int, torch.dtype, bool, bool, object], ...
     ] = field(default=(), repr=False)
 
     @property
@@ -6952,6 +6952,17 @@ def plan_tp_moe_arena_layout(
     )
 
 
+def _trellis_exact_launch_token_counts(capacity_tokens: int) -> tuple[int, ...]:
+    """Return exact decode widths and one capacity-sized prefill width."""
+
+    capacity_tokens = max(int(capacity_tokens), 1)
+    return (
+        tuple(range(1, capacity_tokens + 1))
+        if capacity_tokens <= 32
+        else (capacity_tokens,)
+    )
+
+
 def _plan_full_rotation_w4a16_launches(
     *,
     caps: TPMoEScratchCaps,
@@ -7032,11 +7043,7 @@ def _plan_full_rotation_w4a16_launches(
         # speedup over the retired Trellis wrapper comes from specializing the
         # small live shapes instead of always launching its M=32 capacity
         # kernel.  Large prefill plans retain one capacity launch.
-        fused_token_counts = (
-            tuple(range(1, capacity_tokens + 1))
-            if capacity_tokens <= 32
-            else (capacity_tokens,)
-        )
+        fused_token_counts = _trellis_exact_launch_token_counts(capacity_tokens)
 
         def compile_fused(token_count: int) -> object:
             return compile_w4a16_fused_moe(
@@ -7180,8 +7187,8 @@ def _plan_projection_mixed_trellis_launches(
     caps: TPMoEScratchCaps,
     core_plan: _TPCoreWorkspacePlan,
     capacity_tokens: int,
-) -> tuple[tuple[torch.dtype, bool, bool, object], ...]:
-    """Compile every graph-reachable three-tier MCG launch specialization."""
+) -> tuple[tuple[int, torch.dtype, bool, bool, object], ...]:
+    """Compile every graph-reachable projection-mixed MCG specialization."""
 
     if not core_plan.projection_mixed_trellis:
         return ()
@@ -7232,12 +7239,13 @@ def _plan_projection_mixed_trellis_launches(
             )
         )
         def compile_launch(
+            token_count: int,
             ids_dtype: torch.dtype,
             broadcast_suh: bool,
             broadcast_svh: bool,
         ):
             common = dict(
-                size_m=capacity_tokens,
+                size_m=token_count,
                 hidden_size=core_plan.k,
                 intermediate_size=core_plan.n,
                 tier0_num_experts=core_plan.weight_E,
@@ -7272,18 +7280,26 @@ def _plan_projection_mixed_trellis_launches(
         )
         broadcast_suh_values = caps.mixed_trellis_broadcast_suh or (False, True)
         broadcast_svh_values = caps.mixed_trellis_broadcast_svh or (False, True)
+        launch_token_counts = _trellis_exact_launch_token_counts(capacity_tokens)
         launches = tuple(
             (
+                token_count,
                 ids_dtype,
                 broadcast_suh,
                 broadcast_svh,
-                compile_launch(ids_dtype, broadcast_suh, broadcast_svh),
+                compile_launch(
+                    token_count,
+                    ids_dtype,
+                    broadcast_suh,
+                    broadcast_svh,
+                ),
             )
+            for token_count in launch_token_counts
             for ids_dtype in route_id_dtypes
             for broadcast_suh in broadcast_suh_values
             for broadcast_svh in broadcast_svh_values
         )
-        for _, _, _, launch in launches:
+        for _, _, _, _, launch in launches:
             if int(launch.blocks_per_sm) > 4:
                 raise RuntimeError(
                     "projection-mixed Trellis exceeds the planned workspace "
@@ -7332,7 +7348,10 @@ def _plan_projection_mixed_trellis_launches(
             device=core_plan.device,
         )
         for ids_dtype in route_id_dtypes:
-            launch = next(item[3] for item in launches if item[0] == ids_dtype)
+            launch = max(
+                (item[4] for item in launches if item[1] == ids_dtype),
+                key=lambda candidate: int(candidate.size_m),
+            )
             warmup_mixed_trellis_route_pack(
                 launch,
                 route_buffers,
@@ -7454,10 +7473,11 @@ def _bind_projection_mixed_trellis_from_views(
     launch = next(
         (
             candidate
-            for ids_dtype, candidate_suh, candidate_svh, candidate in (
+            for token_count, ids_dtype, candidate_suh, candidate_svh, candidate in (
                 scratch_plan._mixed_trellis_launches
             )
-            if ids_dtype == topk_ids.dtype
+            if token_count == m
+            and ids_dtype == topk_ids.dtype
             and candidate_suh == broadcast_suh
             and candidate_svh == broadcast_svh
         ),

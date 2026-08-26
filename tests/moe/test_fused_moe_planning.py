@@ -421,6 +421,22 @@ def test_direct_exl3_projection_plan_preserves_k2_tier_family(
     assert plan._core_workspace_plan.projection_mixed_trellis
 
 
+@pytest.mark.parametrize(
+    ("capacity", "expected"),
+    (
+        (1, (1,)),
+        (4, (1, 2, 3, 4)),
+        (32, tuple(range(1, 33))),
+        (33, (33,)),
+        (4096, (4096,)),
+    ),
+)
+def test_trellis_exact_launch_widths_cover_decode_only(
+    capacity: int, expected: tuple[int, ...]
+) -> None:
+    assert fused_moe_impl._trellis_exact_launch_token_counts(capacity) == expected
+
+
 def test_projection_mixed_bind_zeroes_cooperative_workspace_before_launch() -> None:
     source = inspect.getsource(
         fused_moe_impl._bind_projection_mixed_trellis_from_views
