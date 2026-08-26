@@ -765,6 +765,9 @@ class TPMoEScratchCaps:
     deterministic_output: bool | None = None
     w4a16_block_size_m: int | None = None
     w4a16_fast_math: bool = True
+    mixed_trellis_route_id_dtypes: tuple[torch.dtype, ...] | None = None
+    mixed_trellis_broadcast_suh: tuple[bool, ...] | None = None
+    mixed_trellis_broadcast_svh: tuple[bool, ...] | None = None
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -816,6 +819,23 @@ class TPMoEScratchCaps:
                 raise ValueError("w4a16_block_size_m must be one of 8, 16, 32, 48, 64")
             object.__setattr__(self, "w4a16_block_size_m", block_size_m)
         object.__setattr__(self, "w4a16_fast_math", bool(self.w4a16_fast_math))
+        if self.mixed_trellis_route_id_dtypes is not None:
+            dtypes = tuple(self.mixed_trellis_route_id_dtypes)
+            if not dtypes or len(set(dtypes)) != len(dtypes) or any(
+                dtype not in (torch.int32, torch.int64) for dtype in dtypes
+            ):
+                raise ValueError(
+                    "mixed_trellis_route_id_dtypes must contain unique int32/int64 dtypes"
+                )
+            object.__setattr__(self, "mixed_trellis_route_id_dtypes", dtypes)
+        for name in ("mixed_trellis_broadcast_suh", "mixed_trellis_broadcast_svh"):
+            values = getattr(self, name)
+            if values is None:
+                continue
+            normalized = tuple(bool(value) for value in values)
+            if not normalized or len(set(normalized)) != len(normalized):
+                raise ValueError(f"{name} must contain unique boolean values")
+            object.__setattr__(self, name, normalized)
         object.__setattr__(self, "frozen", bool(self.frozen))
 
     @property
@@ -7246,6 +7266,12 @@ def _plan_projection_mixed_trellis_launches(
                 tier2_bits=tier_bits[2],
             )
 
+        route_id_dtypes = caps.mixed_trellis_route_id_dtypes or (
+            torch.int32,
+            torch.int64,
+        )
+        broadcast_suh_values = caps.mixed_trellis_broadcast_suh or (False, True)
+        broadcast_svh_values = caps.mixed_trellis_broadcast_svh or (False, True)
         launches = tuple(
             (
                 ids_dtype,
@@ -7253,9 +7279,9 @@ def _plan_projection_mixed_trellis_launches(
                 broadcast_svh,
                 compile_launch(ids_dtype, broadcast_suh, broadcast_svh),
             )
-            for ids_dtype in (torch.int32, torch.int64)
-            for broadcast_suh in (False, True)
-            for broadcast_svh in (False, True)
+            for ids_dtype in route_id_dtypes
+            for broadcast_suh in broadcast_suh_values
+            for broadcast_svh in broadcast_svh_values
         )
         for _, _, _, launch in launches:
             if int(launch.blocks_per_sm) > 4:
@@ -7305,7 +7331,7 @@ def _plan_projection_mixed_trellis_launches(
             dtype=torch.int32,
             device=core_plan.device,
         )
-        for ids_dtype in (torch.int32, torch.int64):
+        for ids_dtype in route_id_dtypes:
             launch = next(item[3] for item in launches if item[0] == ids_dtype)
             warmup_mixed_trellis_route_pack(
                 launch,
