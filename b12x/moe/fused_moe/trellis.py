@@ -387,7 +387,7 @@ def _projection_native(
     if not experts:
         if fc1:
             return torch.zeros(
-                (1, hidden_tiles, 2 * slots, 16 * bits),
+                (1, hidden_tiles, slots, 16 * bits),
                 dtype=torch.int16,
                 device=atoms.device,
             )

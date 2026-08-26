@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import b12x.moe.fused_moe._impl as fused_moe_impl
+import b12x.moe.fused_moe.trellis as trellis_impl
 from b12x.moe import fused_moe
 
 
@@ -418,6 +419,20 @@ def test_direct_exl3_projection_plan_preserves_k2_tier_family(
     assert plan._core_workspace_plan.implementation == "trellis_mixed3"
     assert plan._core_workspace_plan.trellis_bits == 2
     assert plan._core_workspace_plan.projection_mixed_trellis
+
+
+def test_empty_projection_tier_uses_one_dummy_plane() -> None:
+    value = trellis_impl._projection_native(
+        torch.empty((4, 1), dtype=torch.uint8),
+        experts=[],
+        projection=0,
+        bits=2,
+        offsets=[],
+        hidden_size=128,
+        fc1=True,
+    )
+
+    assert value.shape == (1, 8, 4, 32)
 
 
 @pytest.mark.parametrize(
