@@ -252,7 +252,7 @@ def plan_weights(
             w4a16_layout="trellis_native",
             trellis_bits=3,
             trellis_tile_config=(
-                (128, 256, 64, 256)
+                (64, 256, 64, 256)
                 if source.codebook.value == "mcg"
                 else (64, 256, 64, 256)
             ),

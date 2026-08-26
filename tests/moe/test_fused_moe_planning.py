@@ -48,7 +48,7 @@ def _trellis_caps() -> fused_moe.Caps:
         w13_layout="w31",
         w4a16_layout="trellis_native",
         trellis_bits=3,
-        trellis_tile_config=(128, 256, 64, 256),
+        trellis_tile_config=(64, 256, 64, 256),
         trellis_codebook="mcg",
         trellis_rate_granularity="per_expert_projection",
     )
@@ -75,7 +75,7 @@ def _exl3_projection_caps() -> fused_moe.Caps:
         w13_layout="trellis_t256_proj",
         w4a16_layout="trellis_native",
         trellis_bits=2,
-        trellis_tile_config=(128, 256, 64, 256),
+        trellis_tile_config=(64, 256, 64, 256),
         trellis_codebook="mcg",
         trellis_rate_granularity="per_expert_projection",
     )
