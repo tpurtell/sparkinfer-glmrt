@@ -2769,7 +2769,8 @@ def _plan_core_workspace(
                 full_rotation=True,
                 projection_mixed_trellis=True,
                 trellis_bits=int(trellis_bits),
-                trellis_tile_config=trellis_tile_config or (64, 256, 64, 256),
+                trellis_tile_config=trellis_tile_config
+                or (128, 128, 128, 128),
                 trellis_codebook="mcg",
                 coupled_hadamard=False,
                 route_block_size_m=block_size_m,
@@ -7219,7 +7220,7 @@ def _plan_projection_mixed_trellis_launches(
                     sms=sms,
                     max_shared_mem=max_shared_mem,
                     force_tile_config=core_plan.trellis_tile_config
-                    or (64, 256, 64, 256),
+                    or (128, 128, 128, 128),
                     trellis_codebook="mcg",
                     tier0_bits=tier_bits[0],
                     tier1_bits=tier_bits[1],
