@@ -63,6 +63,32 @@ def _trellis_caps() -> fused_moe.Caps:
     )
 
 
+def _exl3_projection_caps() -> fused_moe.Caps:
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=512,
+        w13_layout="trellis_t256_proj",
+        w4a16_layout="trellis_native",
+        trellis_bits=2,
+        trellis_tile_config=(128, 256, 64, 256),
+        trellis_codebook="mcg",
+        trellis_rate_granularity="per_expert_projection",
+    )
+    return fused_moe.Caps(
+        max_tokens=16,
+        num_topk=6,
+        route_num_experts=256,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a16",
+    )
+
+
 def _small_packed_caps() -> fused_moe.Caps:
     weight_plan = fused_moe.plan_weights(
         quant_modes="w4a16",
@@ -380,6 +406,18 @@ def test_projection_mixed_config_selects_fixed_mixed_workspace(
     assert specs["rotation_a_gate"].shape == (3072 * 8, 6144)
     assert specs["rotation_a_up"].shape == (3072 * 8, 6144)
     assert specs["full_rotation_output"].shape == (3072, 6144)
+
+
+def test_direct_exl3_projection_plan_preserves_k2_tier_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+    plan = fused_moe.plan(_exl3_projection_caps())
+
+    assert plan.caps.source_format == "exl3_trellis_mcg"
+    assert plan._core_workspace_plan.implementation == "trellis_mixed3"
+    assert plan._core_workspace_plan.trellis_bits == 2
+    assert plan._core_workspace_plan.projection_mixed_trellis
 
 
 @pytest.mark.parametrize(
