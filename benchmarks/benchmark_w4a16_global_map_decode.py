@@ -152,17 +152,22 @@ def main() -> None:
         device=device,
     ).view(e8m0_dtype)
     unit_scales = torch.ones(local_experts, dtype=torch.float32, device=device)
-    config = fused_moe.PackedConfig(
-        source_format="fp4_e8m0_k32",
-        w13_layout="w13",
+    source = fused_moe.PackedSource(
+        format=fused_moe.PackedSourceFormat.MXFP4_E8M0_K32,
+        w13_layout=fused_moe.W13Layout.W13,
     )
     weight_plan = fused_moe.plan_weights(
-        config=config,
-        activation=activation,
-        dtype=torch.bfloat16,
-        num_experts=local_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
+        source=source,
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A16,
+            nonlinearity=activation,
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        ),
     )
     experts = fused_moe.prepare_weights(
         plan=weight_plan,
@@ -178,18 +183,16 @@ def main() -> None:
         ),
     )
 
-    plan = fused_moe.plan(
-        fused_moe.Caps(
+    plan = fused_moe.plan_execution(
+        experts=experts,
+        capacity=fused_moe.ExecutionCapacity(
             max_tokens=8,
-            num_topk=topk,
+            top_k=topk,
+            warmup_token_counts=(1, 8),
             route_num_experts=global_experts,
-            device=device,
-            config=config,
-            weight_plan=experts.plan,
-            core_token_counts=(1, 8),
-            frozen=True,
-        )
+        ),
     )
+    fused_moe.prewarm(plan)
     scratch_spec = plan.scratch_specs()[0]
     scratch = torch.empty(
         scratch_spec.shape,
@@ -212,7 +215,8 @@ def main() -> None:
         )
 
     mapped_output = torch.empty_like(x)
-    mapped_binding = plan.bind(
+    mapped_binding = fused_moe.bind(
+        plan,
         scratch=scratch,
         a=x,
         experts=experts,
@@ -228,7 +232,8 @@ def main() -> None:
     local_weights = topk_weights.masked_fill(~active, 0.0).contiguous()
     local_ids = local_ids.clamp_min(0).to(torch.int32).contiguous()
     legacy_kernel_output = torch.empty_like(x)
-    legacy_kernel_binding = plan.bind(
+    legacy_kernel_binding = fused_moe.bind(
+        plan,
         scratch=scratch,
         a=x,
         experts=experts,

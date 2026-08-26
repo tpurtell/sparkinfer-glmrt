@@ -81,7 +81,7 @@ def test_source_is_standalone_cute() -> None:
         "triton",
         "b12x.attention.paged",
         "b12x.attention.sparse_mla",
-        "b12x.attention.nsa_indexer",
+        "b12x.attention.dsa_indexer",
         "b12x.attention._shared.mla",
     )
     for path in root.glob("*.py"):

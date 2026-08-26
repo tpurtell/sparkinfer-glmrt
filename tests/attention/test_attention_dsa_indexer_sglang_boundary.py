@@ -7,14 +7,21 @@ import sys
 import pytest
 import torch
 
-from b12x.attention.nsa_indexer.reference import pack_index_k_cache_reference
-from b12x.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, paged_decode_logits
+from b12x.attention.dsa_indexer.reference import pack_index_k_cache_reference
+from b12x.attention.dsa_indexer._impl import (
+    IndexerContiguousMetadata,
+    IndexerPagedDecodeMetadata,
+    build_paged_mqa_schedule_metadata,
+    clear_indexer_caches,
+    contiguous_logits,
+    paged_decode_logits,
+)
 
 
 _SGLANG_PYTHON_ROOT = Path("/home/luke/projects/sglang/python")
 
 
-def _import_sglang_nsa_indexer():
+def _import_sglang_dsa_indexer():
     if not _SGLANG_PYTHON_ROOT.exists():
         pytest.skip(f"sglang sources not found at {_SGLANG_PYTHON_ROOT}")
     root = str(_SGLANG_PYTHON_ROOT)
@@ -390,7 +397,7 @@ def _make_paged_candidate_tables(
 
 
 def test_sglang_b12x_indexer_paged_boundary_matches_b12x_reference() -> None:
-    module = _import_sglang_nsa_indexer()
+    module = _import_sglang_dsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_100)
 
@@ -463,7 +470,7 @@ def test_sglang_b12x_indexer_paged_boundary_matches_b12x_reference() -> None:
 
 
 def test_sglang_b12x_indexer_paged_boundary_respects_active_decode_rows() -> None:
-    module = _import_sglang_nsa_indexer()
+    module = _import_sglang_dsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_102)
 
@@ -538,7 +545,7 @@ def test_sglang_b12x_indexer_paged_boundary_respects_active_decode_rows() -> Non
 
 
 def test_sglang_b12x_indexer_ragged_boundary_matches_b12x_reference() -> None:
-    module = _import_sglang_nsa_indexer()
+    module = _import_sglang_dsa_indexer()
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_101)
 
@@ -635,7 +642,7 @@ def test_sglang_b12x_indexer_ragged_boundary_matches_b12x_reference() -> None:
     not torch.cuda.is_available(), reason="CUDA required for graph capture coverage"
 )
 def test_sglang_b12x_indexer_paged_boundary_cuda_graph_capture() -> None:
-    module = _import_sglang_nsa_indexer()
+    module = _import_sglang_dsa_indexer()
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(73_103)

@@ -23,9 +23,8 @@ scales are UE8M0 (``float8_e8m0fnu`` bytes) at ``sf_vec_size=32``:
 * ``hidden_states``  ``(M, K)``      bfloat16 activations (quantized to FP6 in-kernel)
 * ``topk_weights``   ``(M, topk)``   float32 router weights
 * ``topk_ids``       ``(M, topk)``   int32 expert ids
-* prepared experts from :func:`b12x.moe.fused_moe.prepare_weights` with a
-  ``PackedConfig(source_format="mxfp6_e2m3", w13_layout="w13")`` and FC1 rows
-  in ``[up; gate]``
+* prepared experts from :func:`b12x.moe.fused_moe.prepare_weights` with an
+  ``MXFP6_E8M0_K32`` source and FC1 rows in ``[up; gate]``
 * output ``(M, K)`` bfloat16.
 
 Routing is the framework's responsibility.  :class:`B12XFP6MoEMethod.apply`
@@ -66,8 +65,8 @@ _SCRATCH_CACHE: dict[tuple, tuple[Any, tuple[torch.Tensor, ...]]] = {}
 # Deduped fused_moe weight plans, keyed by geometry.  Every MoE layer of a
 # model shares one plan object, which is what makes the scratch cache above
 # actually shared (its key includes ``id(weight_plan)``) and keeps
-# ``fused_moe.bind``'s ``experts.plan == caps.weight_plan`` check trivially
-# true for scratch planned against the shared object.
+# the prepared expert owners and execution plans reference the same canonical
+# weight plan.
 _WEIGHT_PLAN_CACHE: dict[tuple, Any] = {}
 
 
@@ -91,17 +90,22 @@ def get_fp6_moe_weight_plan(
     )
     plan = _WEIGHT_PLAN_CACHE.get(key)
     if plan is None:
-        config = fused_moe.PackedConfig(
-            source_format=source_format,
-            w13_layout="w13",  # [up; gate] FC1 rows.
+        source = fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat(source_format),
+            w13_layout=fused_moe.W13Layout.W13,
         )
         plan = fused_moe.plan_weights(
-            config=config,
-            activation=activation,
-            dtype=torch.bfloat16,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
+            source=source,
+            activation=fused_moe.ActivationSpec(
+                mode=fused_moe.ActivationMode.A8,
+                nonlinearity=activation,
+                io_dtype=torch.bfloat16,
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            ),
         )
         _WEIGHT_PLAN_CACHE[key] = plan
     return plan
@@ -194,18 +198,19 @@ class B12XFP6MoEMethod:
         )
         cached = _SCRATCH_CACHE.get(key)
         if cached is None:
-            plan = fused_moe.plan(
-                fused_moe.Caps(
+            plan = fused_moe.plan_execution(
+                experts=self.experts_prepared,
+                capacity=fused_moe.ExecutionCapacity(
                     max_tokens=m,
-                    num_topk=topk,
-                    device=device,
-                    config=self.weight_plan.checkpoint_config,
-                    weight_plan=self.weight_plan,
-                    core_token_counts=(m,),
+                    top_k=topk,
+                    warmup_token_counts=(m,),
                     route_num_experts=0,
+                ),
+                routing=fused_moe.RoutingSpec(
                     apply_router_weight_on_input=self.apply_router_weight_on_input,
-                )
+                ),
             )
+            fused_moe.prewarm(plan)
             scratch = tuple(
                 torch.empty(
                     shape,

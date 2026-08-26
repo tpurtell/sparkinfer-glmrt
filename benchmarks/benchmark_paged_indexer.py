@@ -13,13 +13,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn
-from b12x.attention.nsa_indexer._impl import uses_paged_mqa_schedule
-from b12x.attention.nsa_indexer.kernel import (
+from b12x.attention.dsa_indexer._impl import uses_paged_mqa_schedule
+from b12x.attention.dsa_indexer.kernel import (
     run_paged_supertile_logits_kernel,
 )
-from b12x.attention.nsa_indexer._impl import clear_indexer_caches
-from b12x.attention.nsa_indexer.paged import index_topk_fp8, pack_paged_index_k_cache_reference, prepare_paged_indexer_metadata, resolve_replicated_num_q_heads
-from b12x.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_PAGED, B12XIndexerScratchCaps, plan_indexer_scratch
+from b12x.attention.dsa_indexer._impl import clear_indexer_caches
+from b12x.attention.dsa_indexer.paged import (
+    index_topk_fp8,
+    pack_paged_index_k_cache_reference,
+    prepare_paged_indexer_metadata,
+    resolve_replicated_num_q_heads,
+)
+from b12x.attention.dsa_indexer.scratch import (
+    INDEXER_SOURCE_LAYOUT_PAGED,
+    B12XIndexerScratchCaps,
+    plan_indexer_scratch,
+)
 
 
 def _make_page_table(
@@ -34,9 +43,7 @@ def _make_page_table(
     if int(page_stride) == 0:
         # vLLM's single-request prefill path expands one row without packing;
         # b12x receives a stride-0 row-shared page table.
-        table = torch.full(
-            (1, page_table_width), -1, dtype=torch.int32, device=device
-        )
+        table = torch.full((1, page_table_width), -1, dtype=torch.int32, device=device)
         table[0, :pages_per_row] = torch.arange(
             pages_per_row, dtype=torch.int32, device=device
         )
@@ -128,9 +135,7 @@ def _validate_analytic_topk(
     expected_valid_scores = expected_scores[valid_mask]
     if not bool(torch.isfinite(actual_valid_scores).all().item()):
         raise AssertionError("top-k valid scores are non-finite")
-    max_abs = float(
-        (actual_valid_scores - expected_valid_scores).abs().max().item()
-    )
+    max_abs = float((actual_valid_scores - expected_valid_scores).abs().max().item())
     torch.testing.assert_close(
         actual_valid_scores, expected_valid_scores, rtol=2e-3, atol=2e-3
     )
@@ -200,9 +205,7 @@ def _graph_time_us(
             graph.replay()
             torch.cuda.synchronize()
         print(
-            profiler.key_averages().table(
-                sort_by="self_cuda_time_total", row_limit=40
-            )
+            profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=40)
         )
 
     # Flush L2 BEFORE start.record() each iter (stream-ordered, so excluded from the
@@ -318,7 +321,11 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--eager", action="store_true", help="time eager launches instead of graph replay")
+    parser.add_argument(
+        "--eager",
+        action="store_true",
+        help="time eager launches instead of graph replay",
+    )
     parser.add_argument(
         "--no-l2-flush",
         action="store_true",
@@ -388,15 +395,15 @@ def main() -> None:
     analytic_scores = None
     if args.check:
         if str(args.mode) not in ("supertile-topk", "fused-topk"):
-            raise ValueError(
-                "--check validates --mode supertile-topk or fused-topk"
-            )
+            raise ValueError("--check validates --mode supertile-topk or fused-topk")
         if page_stride != 0 and page_stride < page_table_width:
             raise ValueError(
                 "--check with distinct page tables requires page_stride >= "
                 "page_table_width"
             )
-        q_source = torch.zeros((rows, num_heads, 128), dtype=torch.float32, device=device)
+        q_source = torch.zeros(
+            (rows, num_heads, 128), dtype=torch.float32, device=device
+        )
         q_source[..., 0] = 1.0
         q_fp8 = q_source.to(torch.float8_e4m3fn)
         weights = torch.full(
@@ -429,9 +436,7 @@ def main() -> None:
             dtype=torch.uint8,
             device=device,
         )
-        quant_plane = packed_index_k_cache[:, : 64 * 128].view(
-            cache_num_pages, 64, 128
-        )
+        quant_plane = packed_index_k_cache[:, : 64 * 128].view(cache_num_pages, 64, 128)
         fp8_max_byte = int(
             torch.tensor(448.0, dtype=torch.float8_e4m3fn).view(torch.uint8).item()
         )
@@ -441,14 +446,18 @@ def main() -> None:
         )
     else:
         q_fp8 = (
-            torch.randn((rows, num_heads, 128), generator=gen, dtype=torch.float32).to(device)
+            torch.randn((rows, num_heads, 128), generator=gen, dtype=torch.float32).to(
+                device
+            )
             / 2
         ).to(torch.float8_e4m3fn)
-        weights = torch.randn(
-            (rows, num_heads), generator=gen, dtype=torch.float32
-        ).to(device)
+        weights = torch.randn((rows, num_heads), generator=gen, dtype=torch.float32).to(
+            device
+        )
         k_source = (
-            torch.randn((cache_tokens, 128), generator=gen, dtype=torch.float32).to(device)
+            torch.randn((cache_tokens, 128), generator=gen, dtype=torch.float32).to(
+                device
+            )
             / 3
         )
         packed_index_k_cache = pack_paged_index_k_cache_reference(k_source)
@@ -467,9 +476,8 @@ def main() -> None:
         # per-block allocation. Consecutive logical pages for that layer are
         # then separated by the aggregate bytes for every cache slot.
         backing_bytes = (
-            (cache_num_pages - 1) * cache_page_stride_bytes
-            + logical_cache_page_bytes
-        )
+            cache_num_pages - 1
+        ) * cache_page_stride_bytes + logical_cache_page_bytes
         packed_backing = torch.empty(backing_bytes, dtype=torch.uint8, device=device)
         index_k_cache = torch.as_strided(
             packed_backing,
@@ -502,9 +510,7 @@ def main() -> None:
             + torch.arange(rows, dtype=torch.int32, device=device)
         ).clamp_(min=1, max=max_seq_len)
     else:
-        seqlens = torch.full(
-            (rows,), max_seq_len, dtype=torch.int32, device=device
-        )
+        seqlens = torch.full((rows,), max_seq_len, dtype=torch.int32, device=device)
     plan = plan_indexer_scratch(
         B12XIndexerScratchCaps(
             device=device,
@@ -527,7 +533,9 @@ def main() -> None:
     )
     supertile_k = int(plan.layout.supertile_tokens)
     if int(args.persistent_ctas) > 0:
-        raise ValueError("--persistent-ctas was removed with the workspace-backed indexer path")
+        raise ValueError(
+            "--persistent-ctas was removed with the workspace-backed indexer path"
+        )
     schedule_out = None
     build_schedule = None
     if bench_mode == "supertile-topk":
@@ -547,8 +555,7 @@ def main() -> None:
     )
     scratch_specs = plan.shapes_and_dtypes()
     scratch = [
-        torch.empty(shape, dtype=dtype, device=device)
-        for shape, dtype in scratch_specs
+        torch.empty(shape, dtype=dtype, device=device) for shape, dtype in scratch_specs
     ]
     binding = plan.bind(
         scratch=scratch,
@@ -567,8 +574,7 @@ def main() -> None:
     if bench_mode == "fused-topk":
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         planned_ctas = int(
-            fused_ctas
-            or max(1, min(page_table_width, num_sms // max(rows, 1)))
+            fused_ctas or max(1, min(page_table_width, num_sms // max(rows, 1)))
         )
         try:
             fused_cache = binding.scratch.get_fused_indexer_scratch(topk=topk)
@@ -581,7 +587,7 @@ def main() -> None:
             # The benchmark can force the primitive outside the production row
             # routing gate. Keep that comparison graph-realistic with one fixed,
             # preinitialized workspace rather than per-replay allocations.
-            from b12x.attention.nsa_indexer.fused_indexer import (
+            from b12x.attention.dsa_indexer.fused_indexer import (
                 fused_indexer_scratch_capacity,
             )
 
@@ -615,8 +621,10 @@ def main() -> None:
                 preinitialize_tile_logits=False,
             )
         if bench_mode == "fused-topk":
-            from b12x.attention.nsa_indexer.kernel import _split_index_k_cache_runtime_views
-            from b12x.attention.nsa_indexer.fused_indexer import run_fused_paged_indexer
+            from b12x.attention.dsa_indexer.kernel import (
+                _split_index_k_cache_runtime_views,
+            )
+            from b12x.attention.dsa_indexer.fused_indexer import run_fused_paged_indexer
 
             assert fused_cache is not None
             quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
@@ -633,7 +641,8 @@ def main() -> None:
                 out_values=out_scores,
                 ctas_per_group=fused_ctas,
                 merge_threshold=(
-                    None if args.fused_merge_threshold < 0
+                    None
+                    if args.fused_merge_threshold < 0
                     else int(args.fused_merge_threshold)
                 ),
                 pack_values=fused_cache[0],
@@ -679,9 +688,7 @@ def main() -> None:
             # [num_blocks, 64, 1, 132] pages (planar [64*128 quant][64*4
             # fp32-scale] bytes), and clean_logits=False (the top-k masks by
             # context length).
-            num_sms = torch.cuda.get_device_properties(
-                device
-            ).multi_processor_count
+            num_sms = torch.cuda.get_device_properties(device).multi_processor_count
             ref_context_lens = seqlens.view(rows, 1).contiguous()
             ref_q = q_fp8.view(rows, 1, num_heads, 128)
             ref_kv_cache = torch.as_strided(
@@ -827,7 +834,9 @@ def main() -> None:
                 l2_flush=l2_flush,
             )
         ref_median_us = statistics.median(ref_samples_us)
-        ref_kind = "paged+persistent_topk" if not shared_page_table else "contig+topk_per_row"
+        ref_kind = (
+            "paged+persistent_topk" if not shared_page_table else "contig+topk_per_row"
+        )
         ref_summary = (
             f" ref=deepgemm_sm120({ref_kind}) ref_median_us={ref_median_us:.2f} "
             f"b12x/ref={statistics.median(samples_us) / ref_median_us:.4f}x "

@@ -4,11 +4,14 @@ import math
 
 import torch
 
-from b12x.attention.nsa_indexer.reference import pack_index_k_cache_reference
+from b12x.attention.dsa_indexer.reference import pack_index_k_cache_reference
 from b12x.attention.paged.reference import msa_attention_reference
 from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._forward import paged_attention_forward
-from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention.paged._scratch import (
+    B12XPagedAttentionScratchCaps,
+    plan_paged_attention_scratch,
+)
 from b12x.attention.paged.planner import create_paged_plan
 
 from tests._reference.helpers import require_b12x
@@ -67,7 +70,9 @@ def _select_msa_topk_blocks(
     del values
 
     gathered = block_scores.gather(2, indices)
-    valid = torch.isfinite(gathered) | indices.eq(local.expand(num_heads, total_q, topk))
+    valid = torch.isfinite(gathered) | indices.eq(
+        local.expand(num_heads, total_q, topk)
+    )
     sentinel = torch.full_like(indices, torch.iinfo(torch.int32).max)
     selected = torch.where(valid, indices, sentinel)
     selected, _ = selected.sort(dim=2)
@@ -101,19 +106,25 @@ def _decode_msa_q2k_from_index_cache(
     num_blocks = (width + _MSA_BLOCK_TOKENS - 1) // _MSA_BLOCK_TOKENS
 
     k_pages = _unpack_index_cache_pages(index_k_cache)
-    page_ids = page_table.to(torch.long).clamp_(min=0, max=max(int(k_pages.shape[0]) - 1, 0))
+    page_ids = page_table.to(torch.long).clamp_(
+        min=0, max=max(int(k_pages.shape[0]) - 1, 0)
+    )
     k_rows = k_pages.index_select(0, page_ids.reshape(-1)).view(
         batch,
         page_table_width * _INDEX_PAGE_SIZE,
         _INDEX_HEAD_DIM,
     )
-    q_idx = q.view(batch, kv_heads, q_per_kv, _INDEX_HEAD_DIM)[:, :, 0, :].to(torch.float32)
+    q_idx = q.view(batch, kv_heads, q_per_kv, _INDEX_HEAD_DIM)[:, :, 0, :].to(
+        torch.float32
+    )
     scores = torch.matmul(q_idx, k_rows.transpose(1, 2)) * _MSA_SCALE
 
     token_pos = torch.arange(width, dtype=torch.long, device=q.device)
     valid = token_pos.view(1, 1, width) < cache_seqlens.to(torch.long).view(batch, 1, 1)
     scores = scores.masked_fill(~valid, float("-inf"))
-    block_scores = scores.view(batch, kv_heads, num_blocks, _MSA_BLOCK_TOKENS).amax(dim=3)
+    block_scores = scores.view(batch, kv_heads, num_blocks, _MSA_BLOCK_TOKENS).amax(
+        dim=3
+    )
     block_scores = block_scores.permute(1, 0, 2).contiguous()
     query_positions = (cache_seqlens - 1).clamp_min(0)
     return _select_msa_topk_blocks(block_scores, query_positions, out=out)
@@ -153,7 +164,10 @@ def _prefill_msa_q2k_from_index_cache(
             token_local = q_row - q_start
             visible = max(token_local + cache_len - qo_len + 1, 1)
             num_blocks = (visible + _MSA_BLOCK_TOKENS - 1) // _MSA_BLOCK_TOKENS
-            scores = torch.matmul(q_idx[q_row], k_rows[:visible].transpose(0, 1)) * _MSA_SCALE
+            scores = (
+                torch.matmul(q_idx[q_row], k_rows[:visible].transpose(0, 1))
+                * _MSA_SCALE
+            )
             padded = torch.full(
                 (num_kv_heads, num_blocks * _MSA_BLOCK_TOKENS),
                 float("-inf"),
@@ -161,7 +175,9 @@ def _prefill_msa_q2k_from_index_cache(
                 device=q.device,
             )
             padded[:, :visible].copy_(scores)
-            block_scores = padded.view(num_kv_heads, num_blocks, _MSA_BLOCK_TOKENS).amax(dim=2)
+            block_scores = padded.view(
+                num_kv_heads, num_blocks, _MSA_BLOCK_TOKENS
+            ).amax(dim=2)
             selected = _select_msa_topk_blocks(
                 block_scores.unsqueeze(1),
                 torch.tensor([visible - 1], dtype=torch.int32, device=q.device),
@@ -363,9 +379,11 @@ def test_msa_decode_indexer_selection_to_attention_graph_replay_contract() -> No
         >= 0.999
     )
 
-    q_next, k_next, v_next, page_table_next, cache_seqlens_next, cu_seqlens_q_next = make_case(
-        [1, 129],
-        seed=3102,
+    q_next, k_next, v_next, page_table_next, cache_seqlens_next, cu_seqlens_q_next = (
+        make_case(
+            [1, 129],
+            seed=3102,
+        )
     )
     q.copy_(q_next)
     k_cache.copy_(k_next)

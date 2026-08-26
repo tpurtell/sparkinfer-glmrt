@@ -27,15 +27,19 @@ from b12x.attention._shared.mla.api import (
     sparse_mla_extend_forward as _sparse_mla_extend_forward,
 )
 from b12x.attention._shared.mla.compressed_api import (
-    compressed_mla_decode_forward as _compressed_mla_decode_forward,
+    compressed_sparse_mla_decode_forward as _compressed_sparse_mla_decode_forward,
 )
 from b12x.attention._shared.mla.compressed_reference import (
-    compressed_mla_page_nbytes,
+    compressed_sparse_mla_page_nbytes,
     compressed_sparse_mla_reference,
-    pack_compressed_mla_kv_cache_reference,
+    pack_compressed_sparse_mla_kv_cache_reference,
 )
 from b12x._lib.intrinsics import get_sm_version
-from b12x.attention.compressed_mla._scratch import B12XCompressedMLAScratchCaps, _compressed_mla_scratch_layout, _materialize_compressed_mla_scratch
+from b12x.attention.compressed_sparse_mla._scratch import (
+    B12XCompressedSparseMLAScratchCaps,
+    _compressed_sparse_mla_scratch_layout,
+    _materialize_compressed_sparse_mla_scratch,
+)
 
 from tests._reference.helpers import require_b12x as _require_b12x
 
@@ -104,7 +108,15 @@ def test_cache_block_stride_distinguishes_flat_contiguous_and_packed_views() -> 
     assert prefill_mg._cache_base_tensor(packed_rank3).numel() == expected_span
 
 
-def sparse_mla_decode_forward(*, workspace=None, q_all=None, page_table_1=None, cache_seqlens_int32=None, nsa_cache_seqlens_int32=None, **kwargs):
+def sparse_mla_decode_forward(
+    *,
+    workspace=None,
+    q_all=None,
+    page_table_1=None,
+    cache_seqlens_int32=None,
+    nsa_cache_seqlens_int32=None,
+    **kwargs,
+):
     if workspace is not None:
         binding = workspace.bind_sparse_mla(
             q=q_all,
@@ -122,7 +134,15 @@ def sparse_mla_decode_forward(*, workspace=None, q_all=None, page_table_1=None, 
     )
 
 
-def sparse_mla_extend_forward(*, workspace=None, q_all=None, selected_token_offsets=None, cache_seqlens_int32=None, nsa_cache_seqlens_int32=None, **kwargs):
+def sparse_mla_extend_forward(
+    *,
+    workspace=None,
+    q_all=None,
+    selected_token_offsets=None,
+    cache_seqlens_int32=None,
+    nsa_cache_seqlens_int32=None,
+    **kwargs,
+):
     if workspace is not None:
         binding = workspace.bind_sparse_mla(
             q=q_all,
@@ -140,7 +160,7 @@ def sparse_mla_extend_forward(*, workspace=None, q_all=None, selected_token_offs
     )
 
 
-def compressed_mla_decode_forward(
+def compressed_sparse_mla_decode_forward(
     *,
     workspace=None,
     q_all=None,
@@ -160,8 +180,8 @@ def compressed_mla_decode_forward(
             indexed_lengths=indexed_topk_lengths,
             indexed_page_table=indexed_page_table,
         )
-        return _compressed_mla_decode_forward(binding=binding, **kwargs)
-    return _compressed_mla_decode_forward(
+        return _compressed_sparse_mla_decode_forward(binding=binding, **kwargs)
+    return _compressed_sparse_mla_decode_forward(
         q_all=q_all,
         swa_indices=swa_indices,
         swa_topk_lengths=swa_topk_lengths,
@@ -218,7 +238,16 @@ def _force_legacy_reference(monkeypatch) -> dict[str, int]:
     """Count any unexpected PyTorch reference fallback use."""
     counters = {"reference_calls": 0}
 
-    def fake_reference(*, q_all, kv_cache, page_table_1, active_token_counts, sm_scale, v_head_dim, **kwargs):
+    def fake_reference(
+        *,
+        q_all,
+        kv_cache,
+        page_table_1,
+        active_token_counts,
+        sm_scale,
+        v_head_dim,
+        **kwargs,
+    ):
         del kv_cache, page_table_1, active_token_counts, sm_scale, kwargs
         counters["reference_calls"] += 1
         return q_all[:, :, :v_head_dim].clone()
@@ -276,7 +305,9 @@ def test_glm_decode_default_routes_to_sm120(monkeypatch) -> None:
 def test_glm_decode_backend_legacy_is_retired() -> None:
     device = require_b12x_sparse_mla()
 
-    q_all, kv_cache, page_table_1, cache_seqlens, workspace = _make_glm_decode_inputs(device)
+    q_all, kv_cache, page_table_1, cache_seqlens, workspace = _make_glm_decode_inputs(
+        device
+    )
     with pytest.raises(ValueError, match="legacy sparse MLA kernels have been retired"):
         sparse_mla_decode_forward(
             q_all=q_all,
@@ -337,8 +368,9 @@ def test_glm_decode_valid_contract_routes_to_sm120(monkeypatch) -> None:
 
 
 # ── P10 (3a) PREFILL routing: extend/verify/draft_extend -> run_unified_prefill ──
-def _make_glm_extend_inputs(device: torch.device, num_q_heads: int = _NUM_Q_HEADS,
-                            mode: str = "extend"):
+def _make_glm_extend_inputs(
+    device: torch.device, num_q_heads: int = _NUM_Q_HEADS, mode: str = "extend"
+):
     """A tiny GLM (q=576) prefill-like (extend) call + its workspace."""
     rows = 1
     width = 4
@@ -419,9 +451,9 @@ def test_glm_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
     )
 
     assert output.shape == (1, 16, _GLM_V_HEAD_DIM)
-    assert routed["prefill"] == 1   # prefill intercepted
-    assert routed["decode"] == 0    # NOT decode
-    assert counters["reference_calls"] == 0   # NOT legacy
+    assert routed["prefill"] == 1  # prefill intercepted
+    assert routed["decode"] == 0  # NOT decode
+    assert counters["reference_calls"] == 0  # NOT legacy
 
 
 @torch.inference_mode()
@@ -466,9 +498,9 @@ def test_glm_decode_mode_still_routes_to_unified_decode(monkeypatch) -> None:
 
 
 # ── DSV4 MAIN-CACHE compressed decode (P7): real kernel + split-K + merge ──────
-_DSV4_HEADS = 32          # local q heads (4 native head blocks of HPB=8)
+_DSV4_HEADS = 32  # local q heads (4 native head blocks of HPB=8)
 _DSV4_HEAD_DIM = 512
-_DSV4_PAGE = 64           # compressed page_size for the test cache
+_DSV4_PAGE = 64  # compressed page_size for the test cache
 _DSV4_SM_SCALE = 1.0 / math.sqrt(_DSV4_HEAD_DIM)
 
 
@@ -476,33 +508,60 @@ def _make_dsv4_compressed_case(device, *, topk, seed=0):
     gen = torch.Generator(device=device).manual_seed(seed)
     num_blocks = 16
     n_tokens = num_blocks * _DSV4_PAGE
-    k_nope = (torch.randn((n_tokens, 448), generator=gen, dtype=torch.float32, device=device) / 10).clamp(-1, 1)
-    k_rope = (torch.randn((n_tokens, 64), generator=gen, dtype=torch.float32, device=device) / 10).clamp(-1, 1)
-    cache = pack_compressed_mla_kv_cache_reference(
+    k_nope = (
+        torch.randn((n_tokens, 448), generator=gen, dtype=torch.float32, device=device)
+        / 10
+    ).clamp(-1, 1)
+    k_rope = (
+        torch.randn((n_tokens, 64), generator=gen, dtype=torch.float32, device=device)
+        / 10
+    ).clamp(-1, 1)
+    cache = pack_compressed_sparse_mla_kv_cache_reference(
         k_nope, k_rope.to(torch.bfloat16), page_size=_DSV4_PAGE, num_pages=num_blocks
     )
-    q = (torch.randn((1, _DSV4_HEADS, _DSV4_HEAD_DIM), generator=gen, dtype=torch.float32, device=device) / 10).clamp(-1, 1).to(torch.bfloat16)
-    idx = torch.randint(0, n_tokens, (1, topk), generator=gen, dtype=torch.int32, device=device)
-    idx[:, topk // 2:] = -1  # invalidate the back half (matches dsv4_ref cases)
+    q = (
+        (
+            torch.randn(
+                (1, _DSV4_HEADS, _DSV4_HEAD_DIM),
+                generator=gen,
+                dtype=torch.float32,
+                device=device,
+            )
+            / 10
+        )
+        .clamp(-1, 1)
+        .to(torch.bfloat16)
+    )
+    idx = torch.randint(
+        0, n_tokens, (1, topk), generator=gen, dtype=torch.int32, device=device
+    )
+    idx[:, topk // 2 :] = -1  # invalidate the back half (matches dsv4_ref cases)
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
     return q, cache, idx, lengths
 
 
 def _make_dsv4_scratch(device, *, topk, max_chunks):
-    caps = B12XCompressedMLAScratchCaps(
-        device=device, num_q_heads=_DSV4_HEADS, max_q_rows=1, max_width=topk,
-        head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
-        max_chunks_per_row=max_chunks, page_size=_DSV4_PAGE,
+    caps = B12XCompressedSparseMLAScratchCaps(
+        device=device,
+        num_q_heads=_DSV4_HEADS,
+        max_q_rows=1,
+        max_width=topk,
+        head_dim=_DSV4_HEAD_DIM,
+        v_head_dim=_DSV4_HEAD_DIM,
+        max_chunks_per_row=max_chunks,
+        page_size=_DSV4_PAGE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    return _materialize_compressed_mla_scratch(caps, storage, layout)
+    return _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
 
 @torch.inference_mode()
 @pytest.mark.parametrize("topk", [64, 128, 512])
-def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatch, topk) -> None:
-    """DSV4 main-cache contract: compressed_mla_decode_forward routes to
+def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(
+    monkeypatch, topk
+) -> None:
+    """DSV4 main-cache contract: compressed_sparse_mla_decode_forward routes to
     SM120 sparse MLA.run_unified_decode (kernel split-K partials + reused base-2 merge)
     and matches compressed_sparse_mla_reference."""
     device = require_b12x_sparse_mla()
@@ -511,7 +570,7 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=topk)
     scratch = _make_dsv4_scratch(device, topk=topk, max_chunks=8)
 
-    out = compressed_mla_decode_forward(
+    out = compressed_sparse_mla_decode_forward(
         q_all=q,
         swa_k_cache=cache,
         swa_indices=idx,
@@ -539,17 +598,21 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(monkeypatc
         q, cache, idx, lengths, sm_scale=_DSV4_SM_SCALE, swa_page_size=_DSV4_PAGE
     )[0].float()
     got = out[0].float()
-    cos = float((got.flatten().double() @ exp.flatten().double()) /
-                (got.flatten().double().norm() * exp.flatten().double().norm()))
+    cos = float(
+        (got.flatten().double() @ exp.flatten().double())
+        / (got.flatten().double().norm() * exp.flatten().double().norm())
+    )
     assert cos > 0.999, f"DSV4 unified decode cos={cos}"
     assert (got - exp).abs().max().item() < 2e-2
 
 
 @torch.inference_mode()
 @pytest.mark.parametrize("mode", ["extend", "verify", "draft_extend"])
-def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(monkeypatch, mode) -> None:
+def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(
+    monkeypatch, mode
+) -> None:
     """DSV4 compressed contract in a prefill-like mode routes
-    compressed_mla_decode_forward to SM120 sparse MLA.run_unified_prefill (single-pass
+    compressed_sparse_mla_decode_forward to SM120 sparse MLA.run_unified_prefill (single-pass
     DSV4 prefill), NOT run_unified_decode."""
     device = require_b12x_sparse_mla()
     routed = {"prefill": 0, "decode": 0, "lse_ptr": None}
@@ -583,7 +646,7 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(monkeypatch, mod
     # the materialized scratch mode is mutable).
     scratch.mode = mode
 
-    out = compressed_mla_decode_forward(
+    out = compressed_sparse_mla_decode_forward(
         q_all=q,
         swa_k_cache=cache,
         swa_indices=idx,
@@ -612,14 +675,24 @@ def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> No
     topk, extra_topk, pbs_extra = 64, 128, 2
     main_blocks = 16
     case = dsv4_extra_ref.make_dsv4_extra_decode_case(
-        num_heads=_DSV4_HEADS, topk=topk, extra_topk=extra_topk, num_tokens=1,
-        num_blocks=main_blocks, page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
-        invalidate_half=True, with_sink=False, device=device, seed=11,
+        num_heads=_DSV4_HEADS,
+        topk=topk,
+        extra_topk=extra_topk,
+        num_tokens=1,
+        num_blocks=main_blocks,
+        page_block_size=_DSV4_PAGE,
+        pbs_extra=pbs_extra,
+        invalidate_half=True,
+        with_sink=False,
+        device=device,
+        seed=11,
     )
     q = case["q"].contiguous()
     swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
     extra_blocks = case["extra_kv_cache"].shape[0]
-    idx_cache = _repack_dsv4_to_compressed(case["extra_kv_cache"], pbs_extra, extra_blocks)
+    idx_cache = _repack_dsv4_to_compressed(
+        case["extra_kv_cache"], pbs_extra, extra_blocks
+    )
     main_idx = case["topk_indices"].contiguous()
     extra_idx = case["extra_indices"].contiguous()
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
@@ -627,9 +700,11 @@ def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> No
     exp_O = case["expected_O"][0].float()
 
     n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
-    scratch = _make_dsv4_scratch(device, topk=topk + extra_topk, max_chunks=max(8, n_chunks))
+    scratch = _make_dsv4_scratch(
+        device, topk=topk + extra_topk, max_chunks=max(8, n_chunks)
+    )
 
-    out = compressed_mla_decode_forward(
+    out = compressed_sparse_mla_decode_forward(
         q_all=q,
         swa_k_cache=swa_cache,
         swa_indices=main_idx,
@@ -646,8 +721,10 @@ def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> No
     assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
 
     got = out[0].float()
-    cos = float((got.flatten().double() @ exp_O.flatten().double()) /
-                (got.flatten().double().norm() * exp_O.flatten().double().norm()))
+    cos = float(
+        (got.flatten().double() @ exp_O.flatten().double())
+        / (got.flatten().double().norm() * exp_O.flatten().double().norm())
+    )
     assert cos > 0.999, f"DSV4 dual-cache unified decode cos={cos}"
     assert (got - exp_O).abs().max().item() < 2e-2
 
@@ -666,7 +743,7 @@ def test_dsv4_compressed_decode_mapped_extra_page_table_raises() -> None:
     page_table = torch.zeros((1, topk), dtype=torch.int32, device=device)
 
     with pytest.raises(ValueError, match="mapped"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             q_all=q,
             swa_k_cache=cache,
             swa_indices=idx,
@@ -693,14 +770,14 @@ def test_dsv4_compressed_decode_partial_extra_trio_raises() -> None:
     scratch.fixed_capacity = False
 
     with pytest.raises(ValueError, match="(?i)dual-cache|together|trio"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             q_all=q,
             swa_k_cache=cache,
             swa_indices=idx,
             swa_topk_lengths=lengths,
-            indexed_k_cache=cache,        # extra cache provided
-            indexed_indices=idx,          # extra indices provided
-            indexed_topk_lengths=None,    # MISSING -> partial trio
+            indexed_k_cache=cache,  # extra cache provided
+            indexed_indices=idx,  # extra indices provided
+            indexed_topk_lengths=None,  # MISSING -> partial trio
             indexed_page_size=_DSV4_PAGE,
             workspace=scratch,
             sm_scale=_DSV4_SM_SCALE,
@@ -753,7 +830,7 @@ def test_glm_decode_backend_kwarg_routes_to_unified(monkeypatch) -> None:
 # num_heads=128, topk in {64,128,512}, and BOTH num_splits=1 and a forced>1
 # split, comparing final O + base-2 LSE to the pure-PyTorch dsv4_ref oracle at
 # the validated P5 gate (cos > 0.999, O atol 2e-2, lse atol 5e-2).
-_UNIFIED_NUM_HEADS = 128       # full DSV4 head count (8 head blocks of HPB=16)
+_UNIFIED_NUM_HEADS = 128  # full DSV4 head count (8 head blocks of HPB=16)
 _UNIFIED_NUM_BLOCKS = 64
 _LN2 = math.log(2.0)
 
@@ -765,10 +842,12 @@ def _cosine(got: torch.Tensor, exp: torch.Tensor) -> float:
     return 1.0 if denom == 0 else float((a @ b).item() / denom)
 
 
-def _repack_dsv4_to_compressed(packed_dsv4: torch.Tensor, page_size: int, num_blocks: int) -> torch.Tensor:
+def _repack_dsv4_to_compressed(
+    packed_dsv4: torch.Tensor, page_size: int, num_blocks: int
+) -> torch.Tensor:
     """Re-lay the dsv4_ref (nb,bs,1,584) cache into the compressed flat
     [pages, page_nbytes] layout the launcher reads (swa_k_cache.reshape(-1) with
-    per-page stride = compressed_mla_page_nbytes(page_size)).
+    per-page stride = compressed_sparse_mla_page_nbytes(page_size)).
 
     The data (pbs*576) + footer (pbs*8) = pbs*584 bytes are byte-identical
     between the two packings (the verified P7 layout finding); only the per-page
@@ -777,9 +856,11 @@ def _repack_dsv4_to_compressed(packed_dsv4: torch.Tensor, page_size: int, num_bl
     """
     bs = page_size
     bpt = dsv4_ref.DSV4_KV_GMEM_STRIDE  # 584
-    page_nbytes = compressed_mla_page_nbytes(page_size)
+    page_nbytes = compressed_sparse_mla_page_nbytes(page_size)
     flat = packed_dsv4.reshape(num_blocks, bs * bpt)
-    out = torch.zeros(num_blocks, page_nbytes, dtype=torch.uint8, device=packed_dsv4.device)
+    out = torch.zeros(
+        num_blocks, page_nbytes, dtype=torch.uint8, device=packed_dsv4.device
+    )
     out[:, : bs * bpt] = flat
     return out
 
@@ -794,14 +875,19 @@ def _merge_base2_lse(mid_lse: torch.Tensor) -> torch.Tensor:
 
 
 def _make_dsv4_scratch_heads(device, *, topk, max_chunks, num_heads):
-    caps = B12XCompressedMLAScratchCaps(
-        device=device, num_q_heads=num_heads, max_q_rows=1, max_width=topk,
-        head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
-        max_chunks_per_row=max_chunks, page_size=_DSV4_PAGE,
+    caps = B12XCompressedSparseMLAScratchCaps(
+        device=device,
+        num_q_heads=num_heads,
+        max_q_rows=1,
+        max_width=topk,
+        head_dim=_DSV4_HEAD_DIM,
+        v_head_dim=_DSV4_HEAD_DIM,
+        max_chunks_per_row=max_chunks,
+        page_size=_DSV4_PAGE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    return _materialize_compressed_mla_scratch(caps, storage, layout)
+    return _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
 
 def _run_unified_dsv4(device, *, topk, forced_num_splits, seed):
@@ -811,22 +897,33 @@ def _run_unified_dsv4(device, *, topk, forced_num_splits, seed):
     from b12x.attention._shared.mla.kernel import run_unified_decode
 
     case = dsv4_ref.make_dsv4_decode_case(
-        num_heads=_UNIFIED_NUM_HEADS, topk=topk, num_tokens=1,
-        num_blocks=_UNIFIED_NUM_BLOCKS, page_block_size=_DSV4_PAGE,
-        invalidate_half=True, with_sink=False, device=device, seed=seed,
+        num_heads=_UNIFIED_NUM_HEADS,
+        topk=topk,
+        num_tokens=1,
+        num_blocks=_UNIFIED_NUM_BLOCKS,
+        page_block_size=_DSV4_PAGE,
+        invalidate_half=True,
+        with_sink=False,
+        device=device,
+        seed=seed,
     )
-    q = case["q"].contiguous()                    # [1, 128, 512] bf16
-    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, _UNIFIED_NUM_BLOCKS)
-    idx = case["topk_indices"].contiguous()       # [1, topk] int32
+    q = case["q"].contiguous()  # [1, 128, 512] bf16
+    swa_cache = _repack_dsv4_to_compressed(
+        case["kv_cache"], _DSV4_PAGE, _UNIFIED_NUM_BLOCKS
+    )
+    idx = case["topk_indices"].contiguous()  # [1, topk] int32
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
-    exp_O = case["expected_O"][0].float()         # [128, 512]
-    exp_lse = case["expected_lse"][0].float()     # [128]
+    exp_O = case["expected_O"][0].float()  # [128, 512]
+    exp_lse = case["expected_lse"][0].float()  # [128]
     sm_scale = case["sm_scale"]
 
     n_chunks = (topk + 64 - 1) // 64
     max_chunks = max(8, forced_num_splits)
     scratch = _make_dsv4_scratch_heads(
-        device, topk=topk, max_chunks=max_chunks, num_heads=_UNIFIED_NUM_HEADS,
+        device,
+        topk=topk,
+        max_chunks=max_chunks,
+        num_heads=_UNIFIED_NUM_HEADS,
     )
 
     out = run_unified_decode(
@@ -842,19 +939,28 @@ def _run_unified_dsv4(device, *, topk, forced_num_splits, seed):
     torch.cuda.synchronize()
 
     eff_splits = min(forced_num_splits, n_chunks)
-    got_O = out[0].float()                                       # [128, 512]
+    got_O = out[0].float()  # [128, 512]
     # Per-split base-2 LSE partials live in the workspace mid_lse after the call;
     # the base-2 merge reconstructs the final LSE (= mid_lse[:, 0] when 1 split).
-    mid_lse = scratch.tmp_lse[:1, :_UNIFIED_NUM_HEADS, :eff_splits][0]  # [128, eff_splits]
-    got_lse = _merge_base2_lse(mid_lse)                          # [128]
+    mid_lse = scratch.tmp_lse[:1, :_UNIFIED_NUM_HEADS, :eff_splits][
+        0
+    ]  # [128, eff_splits]
+    got_lse = _merge_base2_lse(mid_lse)  # [128]
     return got_O, got_lse, exp_O, exp_lse, eff_splits
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("topk,forced_num_splits", [
-    (64, 1), (128, 1), (512, 1),     # single split (trivial 1-split merge)
-    (64, 2), (128, 2), (512, 4),     # forced multi-split (chunk-aligned ranges)
-])
+@pytest.mark.parametrize(
+    "topk,forced_num_splits",
+    [
+        (64, 1),
+        (128, 1),
+        (512, 1),  # single split (trivial 1-split merge)
+        (64, 2),
+        (128, 2),
+        (512, 4),  # forced multi-split (chunk-aligned ranges)
+    ],
+)
 def test_unified_decode_launcher_matches_dsv4_ref(topk, forced_num_splits) -> None:
     """run_unified_decode (kernel split-K partials + reused base-2 merge) matches
     the dsv4_ref oracle for num_heads=128 at the validated P5 gate, for BOTH
@@ -862,7 +968,10 @@ def test_unified_decode_launcher_matches_dsv4_ref(topk, forced_num_splits) -> No
     numerically identical to single-split)."""
     device = require_b12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse, eff_splits = _run_unified_dsv4(
-        device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
+        device,
+        topk=topk,
+        forced_num_splits=forced_num_splits,
+        seed=topk,
     )
 
     if forced_num_splits > 1:
@@ -889,16 +998,24 @@ def test_unified_decode_launcher_matches_dsv4_ref(topk, forced_num_splits) -> No
 
 @torch.inference_mode()
 @pytest.mark.parametrize("topk,forced_num_splits", [(128, 2), (512, 2), (512, 4)])
-def test_unified_decode_multi_split_equals_single_split(topk, forced_num_splits) -> None:
+def test_unified_decode_multi_split_equals_single_split(
+    topk, forced_num_splits
+) -> None:
     """A forced multi-split decode must equal the single-split decode (same
     chunk-aligned candidate partition, merged base-2): each candidate is owned by
     exactly one split, so the reduction is exact, not just within-tolerance."""
     device = require_b12x_sparse_mla()
     got_single, _, _, _, _ = _run_unified_dsv4(
-        device, topk=topk, forced_num_splits=1, seed=topk,
+        device,
+        topk=topk,
+        forced_num_splits=1,
+        seed=topk,
     )
     got_multi, _, _, _, eff_splits = _run_unified_dsv4(
-        device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
+        device,
+        topk=topk,
+        forced_num_splits=forced_num_splits,
+        seed=topk,
     )
     assert eff_splits > 1, "forced multi-split did not partition into >1 split"
     delta = (got_multi - got_single).abs().max().item()
@@ -918,14 +1035,24 @@ def _run_unified_dsv4_extra(device, *, topk, extra_topk, forced_num_splits, seed
     pbs_extra = 2
     main_blocks = _UNIFIED_NUM_BLOCKS
     case = dsv4_extra_ref.make_dsv4_extra_decode_case(
-        num_heads=_UNIFIED_NUM_HEADS, topk=topk, extra_topk=extra_topk, num_tokens=1,
-        num_blocks=main_blocks, page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
-        invalidate_half=True, with_sink=False, device=device, seed=seed,
+        num_heads=_UNIFIED_NUM_HEADS,
+        topk=topk,
+        extra_topk=extra_topk,
+        num_tokens=1,
+        num_blocks=main_blocks,
+        page_block_size=_DSV4_PAGE,
+        pbs_extra=pbs_extra,
+        invalidate_half=True,
+        with_sink=False,
+        device=device,
+        seed=seed,
     )
     q = case["q"].contiguous()
     swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
     extra_blocks = case["extra_kv_cache"].shape[0]
-    idx_cache = _repack_dsv4_to_compressed(case["extra_kv_cache"], pbs_extra, extra_blocks)
+    idx_cache = _repack_dsv4_to_compressed(
+        case["extra_kv_cache"], pbs_extra, extra_blocks
+    )
     main_idx = case["topk_indices"].contiguous()
     extra_idx = case["extra_indices"].contiguous()
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
@@ -934,7 +1061,9 @@ def _run_unified_dsv4_extra(device, *, topk, extra_topk, forced_num_splits, seed
 
     n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
     scratch = _make_dsv4_scratch_heads(
-        device, topk=topk + extra_topk, max_chunks=max(8, forced_num_splits, n_chunks),
+        device,
+        topk=topk + extra_topk,
+        max_chunks=max(8, forced_num_splits, n_chunks),
         num_heads=_UNIFIED_NUM_HEADS,
     )
     out = run_unified_decode(
@@ -956,21 +1085,33 @@ def _run_unified_dsv4_extra(device, *, topk, extra_topk, forced_num_splits, seed
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("topk,extra_topk,forced_num_splits", [
-    (512, 64, 1), (512, 128, 1),     # single split spanning both sections
-    (512, 64, 4), (512, 128, 6),     # forced multi-split (chunk-aligned, both sections)
-])
-def test_unified_decode_dual_cache_matches_extra_ref(topk, extra_topk, forced_num_splits) -> None:
+@pytest.mark.parametrize(
+    "topk,extra_topk,forced_num_splits",
+    [
+        (512, 64, 1),
+        (512, 128, 1),  # single split spanning both sections
+        (512, 64, 4),
+        (512, 128, 6),  # forced multi-split (chunk-aligned, both sections)
+    ],
+)
+def test_unified_decode_dual_cache_matches_extra_ref(
+    topk, extra_topk, forced_num_splits
+) -> None:
     """run_unified_decode DSV4 dual-cache (main + extra, ONE online softmax over the
     union) matches dsv4_extra_decode_reference for num_heads=128, topk=512 x
     extra_topk in {64,128}, single AND forced>1 split, at the P5 gate."""
     device = require_b12x_sparse_mla()
     got_O, exp_O = _run_unified_dsv4_extra(
-        device, topk=topk, extra_topk=extra_topk,
-        forced_num_splits=forced_num_splits, seed=topk + extra_topk,
+        device,
+        topk=topk,
+        extra_topk=extra_topk,
+        forced_num_splits=forced_num_splits,
+        seed=topk + extra_topk,
     )
     cos = _cosine(got_O, exp_O)
-    assert cos > 0.999, f"dual topk={topk} extra={extra_topk} splits={forced_num_splits} O cos={cos}"
+    assert cos > 0.999, (
+        f"dual topk={topk} extra={extra_topk} splits={forced_num_splits} O cos={cos}"
+    )
     assert (got_O - exp_O).abs().max().item() < 2e-2, (
         f"dual topk={topk} extra={extra_topk} splits={forced_num_splits} O atol exceeded"
     )
@@ -987,25 +1128,42 @@ def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> N
     topk, extra_topk, pbs_extra = 128, 128, 2
     main_blocks = 16
     case = dsv4_extra_ref.make_dsv4_extra_decode_case(
-        num_heads=num_heads, topk=topk, extra_topk=extra_topk, num_tokens=1,
-        num_blocks=main_blocks, page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
-        invalidate_half=False, with_sink=False, device=device, seed=8080,
+        num_heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        num_tokens=1,
+        num_blocks=main_blocks,
+        page_block_size=_DSV4_PAGE,
+        pbs_extra=pbs_extra,
+        invalidate_half=False,
+        with_sink=False,
+        device=device,
+        seed=8080,
     )
     q = case["q"].contiguous()
     swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
     extra_blocks = case["extra_kv_cache"].shape[0]
-    idx_cache = _repack_dsv4_to_compressed(case["extra_kv_cache"], pbs_extra, extra_blocks)
+    idx_cache = _repack_dsv4_to_compressed(
+        case["extra_kv_cache"], pbs_extra, extra_blocks
+    )
     main_idx = case["topk_indices"].contiguous()
     extra_idx = case["extra_indices"].contiguous()
     main_len = torch.full((1,), topk, dtype=torch.int32, device=device)
     extra_len = torch.full((1,), extra_topk, dtype=torch.int32, device=device)
 
     exp_O, _ = dsv4_extra_ref.dsv4_extra_decode_reference(
-        q, case["kv_cache"], main_idx, case["sm_scale"],
-        case["extra_kv_cache"], extra_idx,
-        page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
-        topk_length=main_len, extra_topk_length=extra_len,
-        main_kv_dequant=case["kv_dequant"], extra_kv_dequant=case["extra_kv_dequant"],
+        q,
+        case["kv_cache"],
+        main_idx,
+        case["sm_scale"],
+        case["extra_kv_cache"],
+        extra_idx,
+        page_block_size=_DSV4_PAGE,
+        pbs_extra=pbs_extra,
+        topk_length=main_len,
+        extra_topk_length=extra_len,
+        main_kv_dequant=case["kv_dequant"],
+        extra_kv_dequant=case["extra_kv_dequant"],
     )
 
     O, _ = run_unified_prefill(
@@ -1163,18 +1321,24 @@ def test_unified_decode_dual_cache_extra_zero_equals_main_only() -> None:
     # main-only via the single-cache launcher path (extra args omitted) vs the
     # dual reference with extra_topk=0 (== dsv4_decode_reference).
     got_O, _, exp_O, _, _ = _run_unified_dsv4(
-        device, topk=512, forced_num_splits=1, seed=512,
+        device,
+        topk=512,
+        forced_num_splits=1,
+        seed=512,
     )
     cos = _cosine(got_O, exp_O)
     assert cos > 0.999, f"extra=0 main-only cos={cos}"
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("extra_topk,forced_num_splits", [
-    (64, 1),     # single extra chunk, single split (zero-width main only)
-    (128, 1),    # two extra chunks, single split spanning both
-    (128, 2),    # forced multi-split over the extra-only chunk range
-])
+@pytest.mark.parametrize(
+    "extra_topk,forced_num_splits",
+    [
+        (64, 1),  # single extra chunk, single split (zero-width main only)
+        (128, 1),  # two extra chunks, single split spanning both
+        (128, 2),  # forced multi-split over the extra-only chunk range
+    ],
+)
 def test_unified_decode_dual_cache_zero_width_main_extra_only(
     extra_topk, forced_num_splits
 ) -> None:
@@ -1187,8 +1351,11 @@ def test_unified_decode_dual_cache_zero_width_main_extra_only(
     main topk_row is elided to a degenerate 1-extent view that is never read."""
     device = require_b12x_sparse_mla()
     got_O, exp_O = _run_unified_dsv4_extra(
-        device, topk=0, extra_topk=extra_topk,
-        forced_num_splits=forced_num_splits, seed=extra_topk + 13,
+        device,
+        topk=0,
+        extra_topk=extra_topk,
+        forced_num_splits=forced_num_splits,
+        seed=extra_topk + 13,
     )
     cos = _cosine(got_O, exp_O)
     assert cos > 0.999, (
@@ -1205,18 +1372,27 @@ def test_unified_decode_dual_cache_zero_width_main_extra_only(
 # e4m3 + unit-sfb path is lossier than DSV4, so the tolerance is the looser GLM
 # band (cos > 0.995, O atol 3e-2), matching glm_ref's own brute-force self-test
 # tolerance. The unified GLM kernel reuses the SAME split.py base-2 merge as DSV4.
-_GLM_NUM_HEADS = 128       # full GLM head count (8 head blocks of HPB=16)
-_GLM_PAGE = 64             # GLM decode page_block_size (stride = idx*656; pbs-invariant)
+_GLM_NUM_HEADS = 128  # full GLM head count (8 head blocks of HPB=16)
+_GLM_PAGE = 64  # GLM decode page_block_size (stride = idx*656; pbs-invariant)
 
 
 def _make_glm_sparse_scratch(device, *, topk, max_chunks, num_heads, s_kv):
-    from b12x.attention.sparse_mla._scratch import B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
+    from b12x.attention.sparse_mla._scratch import (
+        B12XSparseMLAScratchCaps,
+        plan_sparse_mla_scratch,
+    )
 
     caps = B12XSparseMLAScratchCaps(
-        device=device, num_q_heads=num_heads, max_q_rows=1, max_batch=1,
-        max_width=max(topk, 1), max_kv_rows=s_kv,
-        head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
-        max_chunks_per_row=max_chunks, page_size=_GLM_PAGE,
+        device=device,
+        num_q_heads=num_heads,
+        max_q_rows=1,
+        max_batch=1,
+        max_width=max(topk, 1),
+        max_kv_rows=s_kv,
+        head_dim=glm_ref.GLM_Q_HEAD_DIM,
+        v_head_dim=glm_ref.GLM_D_V,
+        max_chunks_per_row=max_chunks,
+        page_size=_GLM_PAGE,
     )
     plan = plan_sparse_mla_scratch(caps)
     (spec,) = plan.scratch_specs()
@@ -1238,26 +1414,38 @@ def _run_unified_glm(
 
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
-        num_heads=num_heads, topk=topk, num_blocks=nblk,
-        page_block_size=_GLM_PAGE, invalidate_half=True, seed=seed, device=device,
+        num_heads=num_heads,
+        topk=topk,
+        num_blocks=nblk,
+        page_block_size=_GLM_PAGE,
+        invalidate_half=True,
+        seed=seed,
+        device=device,
     )
-    q = case["q"].contiguous()                    # [1, 128, 576] bf16
-    kv_cache = case["kv_cache"].contiguous()      # (nblk*64, 1, 656) uint8 GLM
-    idx = case["topk_indices"].contiguous()       # [1, topk] int32
-    exp_O = case["expected_O"][0].float()         # [128, 512]
+    q = case["q"].contiguous()  # [1, 128, 576] bf16
+    kv_cache = case["kv_cache"].contiguous()  # (nblk*64, 1, 656) uint8 GLM
+    idx = case["topk_indices"].contiguous()  # [1, topk] int32
+    exp_O = case["expected_O"][0].float()  # [128, 512]
     sm_scale = case["sm_scale"]
     s_kv = kv_cache.shape[0]
 
     n_chunks = (topk + 64 - 1) // 64
     max_chunks = max(8, forced_num_splits)
     plan, storage = _make_glm_sparse_scratch(
-        device, topk=topk, max_chunks=max_chunks, num_heads=num_heads, s_kv=s_kv,
+        device,
+        topk=topk,
+        max_chunks=max_chunks,
+        num_heads=num_heads,
+        s_kv=s_kv,
     )
     cache_seqlens = torch.full((1,), s_kv, dtype=torch.int32, device=device)
     nsa_seqlens = torch.full((1,), topk, dtype=torch.int32, device=device)
     binding = plan.bind(
-        scratch=storage, q=q, selected_indices=idx,
-        cache_seqlens_int32=cache_seqlens, nsa_cache_seqlens_int32=nsa_seqlens,
+        scratch=storage,
+        q=q,
+        selected_indices=idx,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_seqlens,
     )
 
     out = run_unified_decode(
@@ -1347,17 +1535,26 @@ def test_unified_decode_glm_tp8_native_scalar_length_matches_reference() -> None
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("topk,forced_num_splits", [
-    (64, 1), (128, 1), (512, 1),     # single split (trivial 1-split merge)
-    (128, 2), (512, 4),              # forced multi-split (chunk-aligned ranges)
-])
+@pytest.mark.parametrize(
+    "topk,forced_num_splits",
+    [
+        (64, 1),
+        (128, 1),
+        (512, 1),  # single split (trivial 1-split merge)
+        (128, 2),
+        (512, 4),  # forced multi-split (chunk-aligned ranges)
+    ],
+)
 def test_unified_decode_launcher_matches_glm_ref(topk, forced_num_splits) -> None:
     """run_unified_decode GLM_NSA branch (ARBITRARY_FP32 inline scales,
     V_HAS_ROPE=false, 512/128/4) matches the glm_ref oracle for num_heads=128 at
     the looser GLM gate (cos > 0.995, O atol 3e-2), for single AND forced>1 split."""
     device = require_b12x_sparse_mla()
     got_O, exp_O, eff_splits = _run_unified_glm(
-        device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
+        device,
+        topk=topk,
+        forced_num_splits=forced_num_splits,
+        seed=topk,
     )
     cos = _cosine(got_O, exp_O)
     assert cos > 0.995, f"GLM topk={topk} splits={forced_num_splits} O cos={cos}"
@@ -1369,13 +1566,20 @@ def test_unified_decode_launcher_matches_glm_ref(topk, forced_num_splits) -> Non
 
 @torch.inference_mode()
 @pytest.mark.parametrize("topk,forced_num_splits", [(128, 2), (512, 4)])
-def test_unified_decode_glm_multi_split_equals_single_split(topk, forced_num_splits) -> None:
+def test_unified_decode_glm_multi_split_equals_single_split(
+    topk, forced_num_splits
+) -> None:
     """A forced GLM multi-split decode must match the single-split decode (same
     chunk-aligned candidate partition, merged base-2)."""
     device = require_b12x_sparse_mla()
-    got_single, _, _ = _run_unified_glm(device, topk=topk, forced_num_splits=1, seed=topk)
+    got_single, _, _ = _run_unified_glm(
+        device, topk=topk, forced_num_splits=1, seed=topk
+    )
     got_multi, _, eff_splits = _run_unified_glm(
-        device, topk=topk, forced_num_splits=forced_num_splits, seed=topk,
+        device,
+        topk=topk,
+        forced_num_splits=forced_num_splits,
+        seed=topk,
     )
     assert eff_splits > 1, "forced GLM multi-split did not partition into >1 split"
     delta = (got_multi - got_single).abs().max().item()
@@ -1392,44 +1596,70 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
     per token at the GLM gate (cos > 0.995)."""
     device = require_b12x_sparse_mla()
     from b12x.attention._shared.mla.kernel import run_unified_decode
-    from b12x.attention.sparse_mla._scratch import B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
+    from b12x.attention.sparse_mla._scratch import (
+        B12XSparseMLAScratchCaps,
+        plan_sparse_mla_scratch,
+    )
 
     topk = 512
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
-        num_heads=_GLM_NUM_HEADS, topk=topk, num_tokens=num_tokens, num_blocks=nblk,
-        page_block_size=_GLM_PAGE, invalidate_half=False, seed=3000 + num_tokens,
+        num_heads=_GLM_NUM_HEADS,
+        topk=topk,
+        num_tokens=num_tokens,
+        num_blocks=nblk,
+        page_block_size=_GLM_PAGE,
+        invalidate_half=False,
+        seed=3000 + num_tokens,
         device=device,
     )
-    q = case["q"].contiguous()                    # [T, 128, 576]
+    q = case["q"].contiguous()  # [T, 128, 576]
     kv_cache = case["kv_cache"].contiguous()
-    idx = case["topk_indices"].contiguous()       # [T, topk] (all valid)
+    idx = case["topk_indices"].contiguous()  # [T, topk] (all valid)
     sm_scale = case["sm_scale"]
     s_kv = kv_cache.shape[0]
     lengths = _mixed_lengths(num_tokens, topk, device)
 
     exp_O = glm_ref.glm_decode_reference(
-        q, kv_cache, idx, sm_scale, active_token_counts=lengths,
+        q,
+        kv_cache,
+        idx,
+        sm_scale,
+        active_token_counts=lengths,
     ).float()
 
     n_chunks = (topk + 64 - 1) // 64
     caps = B12XSparseMLAScratchCaps(
-        device=device, num_q_heads=_GLM_NUM_HEADS, max_q_rows=num_tokens,
-        max_batch=num_tokens, max_width=topk, max_kv_rows=s_kv,
-        head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
-        max_chunks_per_row=max(8, n_chunks), page_size=_GLM_PAGE,
+        device=device,
+        num_q_heads=_GLM_NUM_HEADS,
+        max_q_rows=num_tokens,
+        max_batch=num_tokens,
+        max_width=topk,
+        max_kv_rows=s_kv,
+        head_dim=glm_ref.GLM_Q_HEAD_DIM,
+        v_head_dim=glm_ref.GLM_D_V,
+        max_chunks_per_row=max(8, n_chunks),
+        page_size=_GLM_PAGE,
     )
     plan = plan_sparse_mla_scratch(caps)
     (spec,) = plan.scratch_specs()
     storage = torch.zeros(spec.shape, dtype=spec.dtype, device=device)
     cache_seqlens = torch.full((num_tokens,), s_kv, dtype=torch.int32, device=device)
     binding = plan.bind(
-        scratch=storage, q=q, selected_indices=idx,
-        cache_seqlens_int32=cache_seqlens, nsa_cache_seqlens_int32=lengths,
+        scratch=storage,
+        q=q,
+        selected_indices=idx,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=lengths,
     )
     out = run_unified_decode(
-        q_all=q, swa_k_cache=kv_cache, swa_indices=idx, swa_topk_lengths=lengths,
-        workspace=binding.scratch, sm_scale=sm_scale, swa_page_size=_GLM_PAGE,
+        q_all=q,
+        swa_k_cache=kv_cache,
+        swa_indices=idx,
+        swa_topk_lengths=lengths,
+        workspace=binding.scratch,
+        sm_scale=sm_scale,
+        swa_page_size=_GLM_PAGE,
         forced_num_splits=2,
     )
     torch.cuda.synchronize()
@@ -1444,7 +1674,9 @@ def test_unified_decode_glm_multitoken_per_token_length(num_tokens) -> None:
 
 @torch.inference_mode()
 @pytest.mark.parametrize("topk,forced_num_splits", [(128, 1), (512, 4)])
-def test_unified_decode_glm_return_lse_matches_reference(topk, forced_num_splits) -> None:
+def test_unified_decode_glm_return_lse_matches_reference(
+    topk, forced_num_splits
+) -> None:
     """GLM_NSA decode return_lse: the FINAL base-2 LSE reconstructed from mid_lse
     matches the glm_ref oracle base-2 LSE (the GLM branch shares the merge + LSE
     reconstruction with DSV4)."""
@@ -1453,8 +1685,13 @@ def test_unified_decode_glm_return_lse_matches_reference(topk, forced_num_splits
 
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
-        num_heads=_GLM_NUM_HEADS, topk=topk, num_blocks=nblk,
-        page_block_size=_GLM_PAGE, invalidate_half=True, seed=topk + 5, device=device,
+        num_heads=_GLM_NUM_HEADS,
+        topk=topk,
+        num_blocks=nblk,
+        page_block_size=_GLM_PAGE,
+        invalidate_half=True,
+        seed=topk + 5,
+        device=device,
     )
     q = case["q"].contiguous()
     kv_cache = case["kv_cache"].contiguous()
@@ -1466,13 +1703,20 @@ def test_unified_decode_glm_return_lse_matches_reference(topk, forced_num_splits
 
     max_chunks = max(8, forced_num_splits)
     plan, storage = _make_glm_sparse_scratch(
-        device, topk=topk, max_chunks=max_chunks, num_heads=_GLM_NUM_HEADS, s_kv=s_kv,
+        device,
+        topk=topk,
+        max_chunks=max_chunks,
+        num_heads=_GLM_NUM_HEADS,
+        s_kv=s_kv,
     )
     cache_seqlens = torch.full((1,), s_kv, dtype=torch.int32, device=device)
     nsa_seqlens = torch.full((1,), topk, dtype=torch.int32, device=device)
     binding = plan.bind(
-        scratch=storage, q=q, selected_indices=idx,
-        cache_seqlens_int32=cache_seqlens, nsa_cache_seqlens_int32=nsa_seqlens,
+        scratch=storage,
+        q=q,
+        selected_indices=idx,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=nsa_seqlens,
     )
     out_o, out_lse = run_unified_decode(
         q_all=q,
@@ -1504,7 +1748,15 @@ def test_unified_decode_glm_return_lse_matches_reference(topk, forced_num_splits
 
 
 def _run_unified_dsv4_feature(
-    device, *, topk, num_heads, with_sink, return_lse, lse_scale, forced_num_splits, seed
+    device,
+    *,
+    topk,
+    num_heads,
+    with_sink,
+    return_lse,
+    lse_scale,
+    forced_num_splits,
+    seed,
 ):
     """Run the REAL unified DSV4 decode launcher for an arbitrary head count, with
     optional attn_sink fold + return_lse, and return
@@ -1512,22 +1764,35 @@ def _run_unified_dsv4_feature(
     from b12x.attention._shared.mla.kernel import run_unified_decode
 
     case = dsv4_ref.make_dsv4_decode_case(
-        num_heads=num_heads, topk=topk, num_tokens=1,
-        num_blocks=_UNIFIED_NUM_BLOCKS, page_block_size=_DSV4_PAGE,
-        invalidate_half=True, with_sink=with_sink, device=device, seed=seed,
+        num_heads=num_heads,
+        topk=topk,
+        num_tokens=1,
+        num_blocks=_UNIFIED_NUM_BLOCKS,
+        page_block_size=_DSV4_PAGE,
+        invalidate_half=True,
+        with_sink=with_sink,
+        device=device,
+        seed=seed,
     )
-    q = case["q"].contiguous()                    # [1, H, 512] bf16
-    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, _UNIFIED_NUM_BLOCKS)
-    idx = case["topk_indices"].contiguous()       # [1, topk] int32
+    q = case["q"].contiguous()  # [1, H, 512] bf16
+    swa_cache = _repack_dsv4_to_compressed(
+        case["kv_cache"], _DSV4_PAGE, _UNIFIED_NUM_BLOCKS
+    )
+    idx = case["topk_indices"].contiguous()  # [1, topk] int32
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
-    exp_O = case["expected_O"][0].float()         # [H, 512]
-    exp_lse_log2 = case["expected_lse"][0].float()  # [H] base-2 (sink-folded if with_sink)
+    exp_O = case["expected_O"][0].float()  # [H, 512]
+    exp_lse_log2 = case["expected_lse"][
+        0
+    ].float()  # [H] base-2 (sink-folded if with_sink)
     sm_scale = case["sm_scale"]
-    attn_sink = case["attn_sink"]                 # [H] f32 or None
+    attn_sink = case["attn_sink"]  # [H] f32 or None
 
     max_chunks = max(8, forced_num_splits)
     scratch = _make_dsv4_scratch_heads(
-        device, topk=topk, max_chunks=max_chunks, num_heads=num_heads,
+        device,
+        topk=topk,
+        max_chunks=max_chunks,
+        num_heads=num_heads,
     )
 
     out = run_unified_decode(
@@ -1558,8 +1823,13 @@ def test_unified_decode_attn_sink_matches_reference(topk, forced_num_splits) -> 
     - sink))."""
     device = require_b12x_sparse_mla()
     got_O, _, exp_O, _, sink = _run_unified_dsv4_feature(
-        device, topk=topk, num_heads=_UNIFIED_NUM_HEADS, with_sink=True,
-        return_lse=False, lse_scale="base2", forced_num_splits=forced_num_splits,
+        device,
+        topk=topk,
+        num_heads=_UNIFIED_NUM_HEADS,
+        with_sink=True,
+        return_lse=False,
+        lse_scale="base2",
+        forced_num_splits=forced_num_splits,
         seed=topk + 1,
     )
     assert sink is not None
@@ -1578,8 +1848,13 @@ def test_unified_decode_return_lse_matches_reference(topk, forced_num_splits) ->
     mid_lse; it matches the dsv4_ref base-2 LSE (no sink)."""
     device = require_b12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse_log2, _ = _run_unified_dsv4_feature(
-        device, topk=topk, num_heads=_UNIFIED_NUM_HEADS, with_sink=False,
-        return_lse=True, lse_scale="base2", forced_num_splits=forced_num_splits,
+        device,
+        topk=topk,
+        num_heads=_UNIFIED_NUM_HEADS,
+        with_sink=False,
+        return_lse=True,
+        lse_scale="base2",
+        forced_num_splits=forced_num_splits,
         seed=topk + 2,
     )
     cos = _cosine(got_O, exp_O)
@@ -1598,8 +1873,14 @@ def test_unified_decode_return_lse_natural_scale() -> None:
     ln2)."""
     device = require_b12x_sparse_mla()
     _, got_lse_nat, _, exp_lse_log2, _ = _run_unified_dsv4_feature(
-        device, topk=256, num_heads=_UNIFIED_NUM_HEADS, with_sink=False,
-        return_lse=True, lse_scale="natural", forced_num_splits=1, seed=99,
+        device,
+        topk=256,
+        num_heads=_UNIFIED_NUM_HEADS,
+        with_sink=False,
+        return_lse=True,
+        lse_scale="natural",
+        forced_num_splits=1,
+        seed=99,
     )
     exp_lse_nat = exp_lse_log2 * _LN2
     assert (got_lse_nat - exp_lse_nat).abs().max().item() < 5e-2, (
@@ -1611,7 +1892,9 @@ def test_unified_decode_return_lse_natural_scale() -> None:
 @torch.inference_mode()
 @pytest.mark.parametrize("num_heads", [8, 24, 48])
 @pytest.mark.parametrize("forced_num_splits", [1, 4])
-def test_unified_decode_valid_hpb_small_and_nonmult16(num_heads, forced_num_splits) -> None:
+def test_unified_decode_valid_hpb_small_and_nonmult16(
+    num_heads, forced_num_splits
+) -> None:
     """VALID_HPB<16 / non-multiple-of-16 head shards: num_heads in {8 (<16), 24, 48
     (not multiples of 16)} match the dsv4_ref oracle (which attends per-head over
     only the valid heads). The kernel zero-pads the HPB=16 tile and gates writes to
@@ -1619,8 +1902,13 @@ def test_unified_decode_valid_hpb_small_and_nonmult16(num_heads, forced_num_spli
     device = require_b12x_sparse_mla()
     topk = 256
     got_O, _, exp_O, _, _ = _run_unified_dsv4_feature(
-        device, topk=topk, num_heads=num_heads, with_sink=False,
-        return_lse=False, lse_scale="base2", forced_num_splits=forced_num_splits,
+        device,
+        topk=topk,
+        num_heads=num_heads,
+        with_sink=False,
+        return_lse=False,
+        lse_scale="base2",
+        forced_num_splits=forced_num_splits,
         seed=num_heads * 7 + 3,
     )
     assert got_O.shape == (num_heads, _DSV4_HEAD_DIM)
@@ -1638,8 +1926,14 @@ def test_unified_decode_valid_hpb_with_lse_and_sink() -> None:
     the sink-folded LSE both match the reference on exactly the valid heads."""
     device = require_b12x_sparse_mla()
     got_O, got_lse, exp_O, exp_lse_log2, sink = _run_unified_dsv4_feature(
-        device, topk=256, num_heads=24, with_sink=True,
-        return_lse=True, lse_scale="base2", forced_num_splits=2, seed=4242,
+        device,
+        topk=256,
+        num_heads=24,
+        with_sink=True,
+        return_lse=True,
+        lse_scale="base2",
+        forced_num_splits=2,
+        seed=4242,
     )
     assert sink is not None
     assert got_O.shape == (24, _DSV4_HEAD_DIM)
@@ -1688,7 +1982,14 @@ def _mixed_lengths(num_tokens: int, topk: int, device: torch.device) -> torch.Te
 
 
 def _run_unified_dsv4_multitoken(
-    device, *, num_tokens, topk, lengths, neg_pad_past_len, forced_num_splits, seed,
+    device,
+    *,
+    num_tokens,
+    topk,
+    lengths,
+    neg_pad_past_len,
+    forced_num_splits,
+    seed,
 ):
     """Build a multi-token DSV4 case, optionally -1-pad indices past each token's
     length, run the REAL launcher with per-token swa_topk_lengths, and compare per
@@ -1696,13 +1997,21 @@ def _run_unified_dsv4_multitoken(
     from b12x.attention._shared.mla.kernel import run_unified_decode
 
     case = dsv4_ref.make_dsv4_decode_case(
-        num_heads=_MT_HEADS, topk=topk, num_tokens=num_tokens,
-        num_blocks=_UNIFIED_NUM_BLOCKS, page_block_size=_DSV4_PAGE,
-        invalidate_half=False, with_sink=False, device=device, seed=seed,
+        num_heads=_MT_HEADS,
+        topk=topk,
+        num_tokens=num_tokens,
+        num_blocks=_UNIFIED_NUM_BLOCKS,
+        page_block_size=_DSV4_PAGE,
+        invalidate_half=False,
+        with_sink=False,
+        device=device,
+        seed=seed,
     )
-    q = case["q"].contiguous()                              # [T, 128, 512]
-    swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, _UNIFIED_NUM_BLOCKS)
-    idx = case["topk_indices"].contiguous()                # [T, topk] (all valid)
+    q = case["q"].contiguous()  # [T, 128, 512]
+    swa_cache = _repack_dsv4_to_compressed(
+        case["kv_cache"], _DSV4_PAGE, _UNIFIED_NUM_BLOCKS
+    )
+    idx = case["topk_indices"].contiguous()  # [T, topk] (all valid)
 
     if neg_pad_past_len:
         # Case (b): force indices at position >= length[t] to the -1 sentinel.
@@ -1712,23 +2021,38 @@ def _run_unified_dsv4_multitoken(
 
     # Reference always masks per-token by length (and by idx<0 for case (b)).
     exp_O, _ = dsv4_ref.dsv4_decode_reference(
-        q, case["kv_cache"], idx, case["sm_scale"],
-        page_block_size=_DSV4_PAGE, topk_length=lengths, kv_dequant=case["kv_dequant"],
+        q,
+        case["kv_cache"],
+        idx,
+        case["sm_scale"],
+        page_block_size=_DSV4_PAGE,
+        topk_length=lengths,
+        kv_dequant=case["kv_dequant"],
     )
 
     n_chunks = (topk + 64 - 1) // 64
-    caps = B12XCompressedMLAScratchCaps(
-        device=device, num_q_heads=_MT_HEADS, max_q_rows=num_tokens, max_width=topk,
-        head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
-        max_chunks_per_row=max(8, forced_num_splits, n_chunks), page_size=_DSV4_PAGE,
+    caps = B12XCompressedSparseMLAScratchCaps(
+        device=device,
+        num_q_heads=_MT_HEADS,
+        max_q_rows=num_tokens,
+        max_width=topk,
+        head_dim=_DSV4_HEAD_DIM,
+        v_head_dim=_DSV4_HEAD_DIM,
+        max_chunks_per_row=max(8, forced_num_splits, n_chunks),
+        page_size=_DSV4_PAGE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    scratch = _materialize_compressed_mla_scratch(caps, storage, layout)
+    scratch = _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
     out = run_unified_decode(
-        q_all=q, swa_k_cache=swa_cache, swa_indices=idx, swa_topk_lengths=lengths,
-        workspace=scratch, sm_scale=case["sm_scale"], swa_page_size=_DSV4_PAGE,
+        q_all=q,
+        swa_k_cache=swa_cache,
+        swa_indices=idx,
+        swa_topk_lengths=lengths,
+        workspace=scratch,
+        sm_scale=case["sm_scale"],
+        swa_page_size=_DSV4_PAGE,
         forced_num_splits=forced_num_splits,
     )
     torch.cuda.synchronize()
@@ -1738,7 +2062,9 @@ def _run_unified_dsv4_multitoken(
 @torch.inference_mode()
 @pytest.mark.parametrize("num_tokens", [1, 4, 16])
 @pytest.mark.parametrize("neg_pad_past_len", [False, True])
-def test_unified_decode_multitoken_per_token_length(num_tokens, neg_pad_past_len) -> None:
+def test_unified_decode_multitoken_per_token_length(
+    num_tokens, neg_pad_past_len
+) -> None:
     """run_unified_decode honours MIXED per-token topk_length for num_tokens in
     {1,4,16}, num_heads=128, matching the multi-token reference per token --
     BOTH when the caller passes real lengths with valid indices (a; the OLD uniform
@@ -1748,8 +2074,13 @@ def test_unified_decode_multitoken_per_token_length(num_tokens, neg_pad_past_len
     topk = 512
     lengths = _mixed_lengths(num_tokens, topk, device)
     got_O, exp_O = _run_unified_dsv4_multitoken(
-        device, num_tokens=num_tokens, topk=topk, lengths=lengths,
-        neg_pad_past_len=neg_pad_past_len, forced_num_splits=2, seed=1000 + num_tokens,
+        device,
+        num_tokens=num_tokens,
+        topk=topk,
+        lengths=lengths,
+        neg_pad_past_len=neg_pad_past_len,
+        forced_num_splits=2,
+        seed=1000 + num_tokens,
     )
     for t in range(num_tokens):
         cos = _cosine(got_O[t], exp_O[t])
@@ -1774,14 +2105,24 @@ def test_unified_decode_multitoken_old_uniform_was_wrong_for_valid_indices() -> 
     lengths = _mixed_lengths(num_tokens, topk, device)
     # Per-token correct result (valid indices, masked only by length).
     got_pertok, exp_pertok = _run_unified_dsv4_multitoken(
-        device, num_tokens=num_tokens, topk=topk, lengths=lengths,
-        neg_pad_past_len=False, forced_num_splits=1, seed=2024,
+        device,
+        num_tokens=num_tokens,
+        topk=topk,
+        lengths=lengths,
+        neg_pad_past_len=False,
+        forced_num_splits=1,
+        seed=2024,
     )
     # Uniform full-topk decode of the SAME inputs (lengths == topk -> scalar path).
     full = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
     got_uniform, _ = _run_unified_dsv4_multitoken(
-        device, num_tokens=num_tokens, topk=topk, lengths=full,
-        neg_pad_past_len=False, forced_num_splits=1, seed=2024,
+        device,
+        num_tokens=num_tokens,
+        topk=topk,
+        lengths=full,
+        neg_pad_past_len=False,
+        forced_num_splits=1,
+        seed=2024,
     )
     # The per-token path matches the length-masked reference.
     for t in range(num_tokens):
@@ -1807,8 +2148,13 @@ def test_unified_decode_uniform_length_batch_matches_reference() -> None:
     topk, num_tokens = 512, 4
     full = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
     got_O, exp_O = _run_unified_dsv4_multitoken(
-        device, num_tokens=num_tokens, topk=topk, lengths=full,
-        neg_pad_past_len=False, forced_num_splits=1, seed=99,
+        device,
+        num_tokens=num_tokens,
+        topk=topk,
+        lengths=full,
+        neg_pad_past_len=False,
+        forced_num_splits=1,
+        seed=99,
     )
     for t in range(num_tokens):
         assert _cosine(got_O[t], exp_O[t]) > 0.999, f"uniform batch token {t}"
@@ -1820,11 +2166,17 @@ def test_unified_decode_mixed_length_routes_to_per_token_kernel() -> None:
     kernel (per_token_len=True in the plan side-channel)."""
     device = require_b12x_sparse_mla()
     import b12x.attention._shared.mla.kernel as L
+
     topk, num_tokens = 512, 4
     lengths = _mixed_lengths(num_tokens, topk, device)
     _run_unified_dsv4_multitoken(
-        device, num_tokens=num_tokens, topk=topk, lengths=lengths,
-        neg_pad_past_len=False, forced_num_splits=1, seed=99,
+        device,
+        num_tokens=num_tokens,
+        topk=topk,
+        lengths=lengths,
+        neg_pad_past_len=False,
+        forced_num_splits=1,
+        seed=99,
     )
     assert L.LAST_DECODE_PLAN.get("per_token_len") is True, (
         "mixed-length batch did not route to the per-token kernel"
@@ -1843,14 +2195,24 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
     topk, extra_topk, pbs_extra = 512, 128, 2
     main_blocks = _UNIFIED_NUM_BLOCKS
     case = dsv4_extra_ref.make_dsv4_extra_decode_case(
-        num_heads=_MT_HEADS, topk=topk, extra_topk=extra_topk, num_tokens=num_tokens,
-        num_blocks=main_blocks, page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
-        invalidate_half=False, with_sink=False, device=device, seed=7000 + num_tokens,
+        num_heads=_MT_HEADS,
+        topk=topk,
+        extra_topk=extra_topk,
+        num_tokens=num_tokens,
+        num_blocks=main_blocks,
+        page_block_size=_DSV4_PAGE,
+        pbs_extra=pbs_extra,
+        invalidate_half=False,
+        with_sink=False,
+        device=device,
+        seed=7000 + num_tokens,
     )
     q = case["q"].contiguous()
     swa_cache = _repack_dsv4_to_compressed(case["kv_cache"], _DSV4_PAGE, main_blocks)
     extra_blocks = case["extra_kv_cache"].shape[0]
-    idx_cache = _repack_dsv4_to_compressed(case["extra_kv_cache"], pbs_extra, extra_blocks)
+    idx_cache = _repack_dsv4_to_compressed(
+        case["extra_kv_cache"], pbs_extra, extra_blocks
+    )
     main_idx = case["topk_indices"].contiguous()
     extra_idx = case["extra_indices"].contiguous()
 
@@ -1858,29 +2220,48 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
     extra_len = _mixed_lengths(num_tokens, extra_topk, device)
 
     exp_O, _ = dsv4_extra_ref.dsv4_extra_decode_reference(
-        q, case["kv_cache"], main_idx, case["sm_scale"],
-        case["extra_kv_cache"], extra_idx,
-        page_block_size=_DSV4_PAGE, pbs_extra=pbs_extra,
-        topk_length=main_len, extra_topk_length=extra_len,
-        main_kv_dequant=case["kv_dequant"], extra_kv_dequant=case["extra_kv_dequant"],
+        q,
+        case["kv_cache"],
+        main_idx,
+        case["sm_scale"],
+        case["extra_kv_cache"],
+        extra_idx,
+        page_block_size=_DSV4_PAGE,
+        pbs_extra=pbs_extra,
+        topk_length=main_len,
+        extra_topk_length=extra_len,
+        main_kv_dequant=case["kv_dequant"],
+        extra_kv_dequant=case["extra_kv_dequant"],
     )
     exp_O = exp_O.float()
 
     n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
-    caps = B12XCompressedMLAScratchCaps(
-        device=device, num_q_heads=_MT_HEADS, max_q_rows=num_tokens,
-        max_width=topk + extra_topk, head_dim=_DSV4_HEAD_DIM, v_head_dim=_DSV4_HEAD_DIM,
-        max_chunks_per_row=max(8, n_chunks), page_size=_DSV4_PAGE,
+    caps = B12XCompressedSparseMLAScratchCaps(
+        device=device,
+        num_q_heads=_MT_HEADS,
+        max_q_rows=num_tokens,
+        max_width=topk + extra_topk,
+        head_dim=_DSV4_HEAD_DIM,
+        v_head_dim=_DSV4_HEAD_DIM,
+        max_chunks_per_row=max(8, n_chunks),
+        page_size=_DSV4_PAGE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    scratch = _materialize_compressed_mla_scratch(caps, storage, layout)
+    scratch = _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
     out = run_unified_decode(
-        q_all=q, swa_k_cache=swa_cache, swa_indices=main_idx, swa_topk_lengths=main_len,
-        workspace=scratch, sm_scale=case["sm_scale"], swa_page_size=_DSV4_PAGE,
-        indexed_k_cache=idx_cache, indexed_indices=extra_idx,
-        indexed_topk_lengths=extra_len, indexed_page_size=pbs_extra,
+        q_all=q,
+        swa_k_cache=swa_cache,
+        swa_indices=main_idx,
+        swa_topk_lengths=main_len,
+        workspace=scratch,
+        sm_scale=case["sm_scale"],
+        swa_page_size=_DSV4_PAGE,
+        indexed_k_cache=idx_cache,
+        indexed_indices=extra_idx,
+        indexed_topk_lengths=extra_len,
+        indexed_page_size=pbs_extra,
         forced_num_splits=2,
     )
     torch.cuda.synchronize()
@@ -1906,7 +2287,9 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
 # glm_decode_reference (the single-pass prefill shares the GLM s0-s7 math), settling
 # both contracts: real per-token lengths with VALID indices past the length (the case
 # the masking bug got catastrophically wrong) AND -1-padded indices.
-def _glm_prefill_mixed_lengths(num_tokens: int, topk: int, device: torch.device) -> torch.Tensor:
+def _glm_prefill_mixed_lengths(
+    num_tokens: int, topk: int, device: torch.device
+) -> torch.Tensor:
     """Per-token MIXED lengths with a TRUE zero-length row at token 1 (the
     extend-API zero active_token_counts contract). Other tokens are off-64-boundary
     and spread across [1, topk]; token 0 is full topk so a uniform check can't hide
@@ -1914,9 +2297,9 @@ def _glm_prefill_mixed_lengths(num_tokens: int, topk: int, device: torch.device)
     base = [topk, 0, topk - 7, 64 + 13, 1, 128 + 5, topk // 2, 3]
     vals = [base[i % len(base)] for i in range(num_tokens)]
     if num_tokens >= 1:
-        vals[0] = topk           # full-length token
+        vals[0] = topk  # full-length token
     if num_tokens >= 2:
-        vals[1] = 0              # TRUE zero-length row (the catastrophic case)
+        vals[1] = 0  # TRUE zero-length row (the catastrophic case)
     vals = [max(0, min(int(v), topk)) for v in vals]
     return torch.tensor(vals, dtype=torch.int32, device=device)
 
@@ -1943,13 +2326,18 @@ def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
     topk = 512
     nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
     case = glm_ref.make_glm_decode_case(
-        num_heads=_GLM_NUM_HEADS, topk=topk, num_tokens=num_tokens, num_blocks=nblk,
-        page_block_size=_GLM_PAGE, invalidate_half=False, seed=9000 + num_tokens,
+        num_heads=_GLM_NUM_HEADS,
+        topk=topk,
+        num_tokens=num_tokens,
+        num_blocks=nblk,
+        page_block_size=_GLM_PAGE,
+        invalidate_half=False,
+        seed=9000 + num_tokens,
         device=device,
     )
-    q = case["q"].contiguous()                    # [T, 128, 576]
+    q = case["q"].contiguous()  # [T, 128, 576]
     kv_cache = case["kv_cache"].contiguous()
-    idx = case["topk_indices"].contiguous()       # [T, topk] (ALL valid -> non -1-padded)
+    idx = case["topk_indices"].contiguous()  # [T, topk] (ALL valid -> non -1-padded)
     sm_scale = case["sm_scale"]
     lengths = _glm_prefill_mixed_lengths(num_tokens, topk, device)
     assert int((lengths == 0).sum()) >= 1, "test must include a true zero-length row"
@@ -1964,12 +2352,20 @@ def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
 
     # Reference masks per token by length (and idx<0 for the padded case).
     exp_O = glm_ref.glm_decode_reference(
-        q, kv_cache, idx, sm_scale, active_token_counts=lengths,
+        q,
+        kv_cache,
+        idx,
+        sm_scale,
+        active_token_counts=lengths,
     ).float()
 
     O, lse = run_unified_prefill(
-        q=q, kv_cache=kv_cache, topk_indices=idx, sm_scale=sm_scale,
-        page_block_size=_GLM_PAGE, topk_length=lengths,
+        q=q,
+        kv_cache=kv_cache,
+        topk_indices=idx,
+        sm_scale=sm_scale,
+        page_block_size=_GLM_PAGE,
+        topk_length=lengths,
     )
     torch.cuda.synchronize()
     got = O.float()

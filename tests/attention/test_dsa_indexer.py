@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.reference import (
     pack_index_k_cache_reference,
     contiguous_logits_reference,
     paged_decode_logits_reference,
@@ -26,7 +26,9 @@ def _make_real_page_table(
         dtype=torch.int32,
         device=device,
     )
-    for row_idx, (page_start, seq_len) in enumerate(zip(page_starts, seqlens, strict=True)):
+    for row_idx, (page_start, seq_len) in enumerate(
+        zip(page_starts, seqlens, strict=True)
+    ):
         block_count = (int(seq_len) + 63) // 64
         if block_count:
             real_page_table[row_idx, :block_count] = torch.arange(
@@ -49,7 +51,12 @@ def _manual_paged_logits(
 ) -> torch.Tensor:
     num_queries = q_fp8.shape[0]
     width_tokens = real_page_table.shape[1] * 64
-    out = torch.full((num_queries, width_tokens), float("-inf"), dtype=torch.float32, device=q_fp8.device)
+    out = torch.full(
+        (num_queries, width_tokens),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
     q_fp32 = q_fp8.to(torch.float32)
     weights_f = weights.to(torch.float32)
     for query_row in range(int(query_row_to_batch.numel())):
@@ -69,7 +76,11 @@ def _manual_paged_logits(
 def _quantize_rows_to_kv_fp8(k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = k.abs().amax(dim=1) / _FP8_E4M3_MAX
     scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    quant = (k / scale.unsqueeze(1)).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    quant = (
+        (k / scale.unsqueeze(1))
+        .clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
     return quant, scale.to(torch.float32)
 
 
@@ -82,7 +93,12 @@ def _manual_contiguous_logits(
     k_end: torch.Tensor,
 ) -> torch.Tensor:
     num_queries = q_fp8.shape[0]
-    out = torch.full((num_queries, k_matrix.shape[0]), float("-inf"), dtype=torch.float32, device=q_fp8.device)
+    out = torch.full(
+        (num_queries, k_matrix.shape[0]),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
     q_fp32 = q_fp8.to(torch.float32)
     weights_f = weights.to(torch.float32)
     for query_row in range(int(k_start.numel())):
@@ -128,7 +144,9 @@ def _scalar_paged_logits_oracle(
                     q_fp8[query_row, head].to(torch.float32),
                     k_dequant[physical].to(torch.float32),
                 )
-                acc = acc + torch.relu(score) * weights[query_row, head].to(torch.float32)
+                acc = acc + torch.relu(score) * weights[query_row, head].to(
+                    torch.float32
+                )
             out[query_row, logical_pos] = acc
     return out
 
@@ -157,18 +175,25 @@ def _scalar_contiguous_logits_oracle(
                     q_fp8[query_row, head].to(torch.float32),
                     k_dequant[key_row].to(torch.float32),
                 )
-                acc = acc + torch.relu(score) * weights[query_row, head].to(torch.float32)
+                acc = acc + torch.relu(score) * weights[query_row, head].to(
+                    torch.float32
+                )
             out[query_row, key_row] = acc
     return out
 
 
 @torch.inference_mode()
-def test_pack_nsa_index_k_cache_roundtrip_matches_input_for_odd_lengths() -> None:
+def test_pack_dsa_index_k_cache_roundtrip_matches_input_for_odd_lengths() -> None:
     device = torch.device("cpu")
     for num_tokens in (63, 64, 65, 127, 128, 129):
         gen = torch.Generator(device="cpu")
         gen.manual_seed(70_000 + num_tokens)
-        k = torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 4
+        k = (
+            torch.randn(
+                (num_tokens, 128), generator=gen, dtype=torch.float32, device=device
+            )
+            / 4
+        )
         packed = pack_index_k_cache_reference(k)
         unpacked = unpack_index_k_cache_reference(packed, num_tokens=num_tokens)
         max_abs = (unpacked - k).abs().max().item()
@@ -195,13 +220,23 @@ def test_paged_decode_logits_reference_matches_manual() -> None:
         width_blocks=width_blocks,
         device=device,
     )
-    k = torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 3
+    k = (
+        torch.randn(
+            (num_tokens, 128), generator=gen, dtype=torch.float32, device=device
+        )
+        / 3
+    )
     index_k_cache = pack_index_k_cache_reference(k)
     unpacked = unpack_index_k_cache_reference(index_k_cache, num_tokens=num_tokens)
     q_fp8 = (
-        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 2
+        torch.randn(
+            (q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device
+        )
+        / 2
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32, device=device)
+    weights = torch.randn(
+        (q_rows, num_heads), generator=gen, dtype=torch.float32, device=device
+    )
 
     actual = paged_decode_logits_reference(
         q_fp8=q_fp8,
@@ -232,10 +267,18 @@ def test_contiguous_logits_reference_matches_manual() -> None:
     num_heads = 3
     k_rows = 80
     q_fp8 = (
-        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 2
+        torch.randn(
+            (q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device
+        )
+        / 2
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32, device=device)
-    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device) / 3
+    weights = torch.randn(
+        (q_rows, num_heads), generator=gen, dtype=torch.float32, device=device
+    )
+    k = (
+        torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device)
+        / 3
+    )
     kv_fp8 = _quantize_rows_to_kv_fp8(k)
     k_start = torch.tensor([0, 4, 12, 40, 40], dtype=torch.int32, device=device)
     k_end = torch.tensor([8, 20, 20, 56, 40], dtype=torch.int32, device=device)
@@ -258,7 +301,9 @@ def test_contiguous_logits_reference_matches_manual() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_paged_decode_logits_reference_matches_scalar_oracle_for_expanded_queries() -> None:
+def test_paged_decode_logits_reference_matches_scalar_oracle_for_expanded_queries() -> (
+    None
+):
     device = torch.device("cpu")
     gen = torch.Generator(device="cpu")
     gen.manual_seed(71_003)
@@ -274,13 +319,23 @@ def test_paged_decode_logits_reference_matches_scalar_oracle_for_expanded_querie
     q_rows = 4
     num_heads = 5
     num_tokens = 8 * 64
-    k = torch.randn((num_tokens, 128), generator=gen, dtype=torch.float32, device=device) / 5
+    k = (
+        torch.randn(
+            (num_tokens, 128), generator=gen, dtype=torch.float32, device=device
+        )
+        / 5
+    )
     index_k_cache = pack_index_k_cache_reference(k)
     k_dequant = unpack_index_k_cache_reference(index_k_cache, num_tokens=num_tokens)
     q_fp8 = (
-        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 3
+        torch.randn(
+            (q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device
+        )
+        / 3
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32, device=device)
+    weights = torch.randn(
+        (q_rows, num_heads), generator=gen, dtype=torch.float32, device=device
+    )
     query_row_to_batch = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device=device)
     seqlens_per_query = torch.tensor([65, 9, 130, 0], dtype=torch.int32, device=device)
 
@@ -313,10 +368,18 @@ def test_contiguous_logits_reference_matches_scalar_oracle_for_clamped_ranges() 
     num_heads = 4
     k_rows = 19
     q_fp8 = (
-        torch.randn((q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device) / 4
+        torch.randn(
+            (q_rows, num_heads, 128), generator=gen, dtype=torch.float32, device=device
+        )
+        / 4
     ).to(torch.float8_e4m3fn)
-    weights = torch.randn((q_rows, num_heads), generator=gen, dtype=torch.float32, device=device)
-    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device) / 4
+    weights = torch.randn(
+        (q_rows, num_heads), generator=gen, dtype=torch.float32, device=device
+    )
+    k = (
+        torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device)
+        / 4
+    )
     kv_fp8 = _quantize_rows_to_kv_fp8(k)
     k_dequant = kv_fp8[0].to(torch.float32) * kv_fp8[1].unsqueeze(1)
     k_start = torch.tensor([-3, 0, 7, 18], dtype=torch.int32, device=device)

@@ -161,17 +161,22 @@ def _run(x, weights, topk_ids, topk_weights):
     m, k = x.shape
     e, n, tk = weights.num_experts, weights.n, topk_ids.shape[1]
 
-    config = fused_moe.PackedConfig(
-        source_format="mxfp6_e2m3",
-        w13_layout="w13",
+    source = fused_moe.PackedSource(
+        format=fused_moe.PackedSourceFormat.MXFP6_E8M0_K32,
+        w13_layout=fused_moe.W13Layout.W13,
     )
     weight_plan = fused_moe.plan_weights(
-        config=config,
-        activation=weights.activation,
-        dtype=torch.bfloat16,
-        num_experts=e,
-        hidden_size=k,
-        intermediate_size=n,
+        source=source,
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A8,
+            nonlinearity=weights.activation,
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=e,
+            hidden_size=k,
+            intermediate_size=n,
+        ),
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
@@ -191,17 +196,16 @@ def _run(x, weights, topk_ids, topk_weights):
         ),
     )
     fused_moe.clear_caches()
-    plan = fused_moe.plan(
-        fused_moe.Caps(
+    plan = fused_moe.plan_execution(
+        experts=prepared,
+        capacity=fused_moe.ExecutionCapacity(
             max_tokens=m,
-            num_topk=tk,
-            device=device,
-            config=config,
-            weight_plan=weight_plan,
-            core_token_counts=(m,),
+            top_k=tk,
+            warmup_token_counts=(m,),
             route_num_experts=0,
-        )
+        ),
     )
+    fused_moe.prewarm(plan)
     scratch = tuple(
         torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[i].device)
         for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())

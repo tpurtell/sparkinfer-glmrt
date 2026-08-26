@@ -1,7 +1,7 @@
 """b12x — consumer-Blackwell (SM120/SM121) kernels.
 
 CuTe-DSL kernels for NVFP4/MXFP4/MXFP8 GEMM, fused MoE, attention (paged,
-dense/sparse/compressed MLA, NSA indexing), quantization, mHC residual, and PCIe
+dense/sparse/compressed MLA, DSA indexing), quantization, mHC residual, and PCIe
 collectives, ported from the b12x project.  One grammar everywhere:
 
 - ops live at ``b12x.<group>.<op>`` and declare themselves via ``META``;
@@ -42,10 +42,10 @@ _OPS: tuple[str, ...] = (
     "attention.paged",
     "attention.dense_mla",
     "attention.sparse_mla",
-    "attention.compressed_mla",
+    "attention.compressed_sparse_mla",
     "attention.dsv4_compressor",
     "attention.dsv4_producer",
-    "attention.nsa_indexer",
+    "attention.dsa_indexer",
     "attention.varlen",
     "comm.pcie",
     "gemm.bf16_gemv",

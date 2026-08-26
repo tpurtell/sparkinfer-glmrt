@@ -319,6 +319,28 @@ def test_decode_graph_bucket_policy_kv4_uses_kv_head_aware_chunk_budget() -> Non
     assert policy.max_chunks_per_request <= expected_architecture_budget
 
 
+def test_decode_graph_bucket_policy_accepts_manual_chunk_capacity() -> None:
+    policy = _resolve_decode_graph_bucket_policy(
+        batch=2,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=64,
+        q_heads=24,
+        kv_heads=4,
+        head_dim=256,
+        decode_contexts=[128, 16_384],
+        capture_context_override=0,
+        fixed_split_pages_override=0,
+        graph_ctas_per_sm_override=0,
+        max_chunks_per_request_override=7,
+    )
+
+    assert policy.source == "manual-chunks"
+    assert policy.max_chunks_per_request == 7
+    assert policy.max_work_items == 14
+    assert policy.max_partial_rows == 14
+
+
 @torch.inference_mode()
 def test_decode_graph_bucket_kv4_captures_exact_production_grid() -> None:
     require_b12x()

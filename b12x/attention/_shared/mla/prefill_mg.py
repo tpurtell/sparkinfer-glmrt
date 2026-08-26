@@ -198,7 +198,7 @@ def _cache_block_stride_bytes(
     record_bytes: int | None = None,
 ) -> int:
     from b12x.attention._shared.mla.compressed_reference import (
-        COMPRESSED_MLA_BYTES_PER_TOKEN,
+        COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
     if record_bytes is not None:
@@ -209,7 +209,7 @@ def _cache_block_stride_bytes(
         rec = int(record_bytes) if record_bytes is not None else _GLM_IO_STRIDE
         expected = int(page_size) * rec
     else:
-        expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
+        expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
     if is_glm and cache.is_contiguous():
         return expected
     # Use the tensor's physical page stride for padded views.

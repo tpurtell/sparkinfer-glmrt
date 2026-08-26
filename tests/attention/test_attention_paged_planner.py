@@ -1130,7 +1130,7 @@ def test_decode_graph_chunk_pages_uses_finer_fp8_minimax_bs1_splits() -> None:
     )
 
 
-def test_decode_graph_sm121_bf16_gqa8_bs1_uses_measured_capacity_budgets(
+def test_decode_graph_bf16_gqa8_bs1_scales_capacity_budgets_with_sms(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1197,8 +1197,39 @@ def test_decode_graph_sm121_bf16_gqa8_bs1_uses_measured_capacity_budgets(
     assert longer_bucket.max_partial_rows == 17
     assert longer_bucket.chunk_pages_lut[-1] == 61
 
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=188),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (12, 0),
+    )
+    for max_cache_page_count, expected_chunks in (
+        (257, 74),
+        (513, 55),
+        (1025, 67),
+    ):
+        capacity = plan_decode_graph_capacity(
+            device=torch.device("cuda:0"),
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            num_q_heads=8,
+            num_kv_heads=1,
+            head_dim_qk=256,
+            head_dim_vo=256,
+            page_size=64,
+            batch=1,
+            max_cache_page_count=max_cache_page_count,
+        )
+        assert capacity.max_chunks_per_request == expected_chunks
+        assert capacity.max_work_items == expected_chunks
+        assert capacity.max_partial_rows == expected_chunks
 
-def test_decode_graph_sm121_fp8_gqa8_bs1_uses_measured_capacity_budgets(
+
+def test_decode_graph_fp8_gqa8_bs1_scales_capacity_budgets_with_sms(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1267,23 +1298,34 @@ def test_decode_graph_sm121_fp8_gqa8_bs1_uses_measured_capacity_budgets(
 
     monkeypatch.setattr(
         torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=188),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
         "get_device_capability",
         lambda _device: (12, 0),
     )
-    other_architecture = plan_decode_graph_capacity(
-        device=torch.device("cuda:0"),
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
-        num_q_heads=8,
-        num_kv_heads=1,
-        head_dim_qk=256,
-        head_dim_vo=256,
-        page_size=64,
-        batch=1,
-        max_cache_page_count=513,
-    )
-    assert other_architecture.max_chunks_per_request == 96
-    assert other_architecture.chunk_pages_lut[-1] == 6
+    for max_cache_page_count, expected_chunks in (
+        (257, 86),
+        (513, 71),
+        (1025, 71),
+    ):
+        capacity = plan_decode_graph_capacity(
+            device=torch.device("cuda:0"),
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.float8_e4m3fn,
+            num_q_heads=8,
+            num_kv_heads=1,
+            head_dim_qk=256,
+            head_dim_vo=256,
+            page_size=64,
+            batch=1,
+            max_cache_page_count=max_cache_page_count,
+        )
+        assert capacity.max_chunks_per_request == expected_chunks
+        assert capacity.max_work_items == expected_chunks
+        assert capacity.max_partial_rows == expected_chunks
 
 
 def test_decode_graph_page128_laguna_keeps_adaptive_one_wave_grid(
@@ -1440,21 +1482,30 @@ def test_decode_graph_ctas_per_sm_uses_smaller_minimax_bs1_to_bs4_budget() -> No
     )
 
 
-def test_sm121_h256_decode_uses_one_wave_only_when_it_fills_most_sms(
+@pytest.mark.parametrize(
+    ("capability", "sm_count", "expected_chunks"),
+    (
+        ((12, 1), 48, {1: 12, 2: 6, 4: 3, 8: 3}),
+        ((12, 0), 188, {1: 47, 2: 23, 4: 11, 8: 5}),
+    ),
+)
+def test_sm12x_h256_decode_uses_one_wave_only_when_it_fills_most_sms(
     monkeypatch,
+    capability: tuple[int, int],
+    sm_count: int,
+    expected_chunks: dict[int, int],
 ) -> None:
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _device: SimpleNamespace(multi_processor_count=48),
+        lambda _device: SimpleNamespace(multi_processor_count=sm_count),
     )
     monkeypatch.setattr(
         torch.cuda,
         "get_device_capability",
-        lambda _device: (12, 1),
+        lambda _device: capability,
     )
 
-    expected_chunks = {1: 12, 2: 6, 4: 3, 8: 3}
     for kv_dtype in (torch.bfloat16, torch.float8_e4m3fn):
         for batch, chunks in expected_chunks.items():
             capacity = plan_decode_graph_capacity(
@@ -1484,7 +1535,7 @@ def test_sm121_h256_decode_uses_one_wave_only_when_it_fills_most_sms(
         max_cache_page_count=512,
         graph_ctas_per_sm=2,
     )
-    assert explicit_two_wave.max_chunks_per_request == 24
+    assert explicit_two_wave.max_chunks_per_request == sm_count // 2
 
 
 def test_build_decode_chunk_pages_lut_uses_heuristic() -> None:

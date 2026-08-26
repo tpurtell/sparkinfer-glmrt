@@ -1,4 +1,4 @@
-"""Public surface for attention.compressed_mla (docs in the op ``__init__``)."""
+"""Public surface for attention.compressed_sparse_mla (docs in the op ``__init__``)."""
 
 from __future__ import annotations
 
@@ -7,25 +7,25 @@ from .._shared.mla.api import (
     clear_mla_caches as clear_caches,
 )
 from .._shared.mla.compressed_api import (
-    compressed_mla_decode_forward as run,
+    compressed_sparse_mla_decode_forward as run,
 )
 from .._shared.mla.compressed_api import (
-    compressed_mla_split_chunks_for_contract as split_chunks_for_contract,
+    compressed_sparse_mla_split_chunks_for_contract as split_chunks_for_contract,
 )
 from ._scratch import (
-    B12XCompressedMLABinding as Binding,
+    B12XCompressedSparseMLABinding as Binding,
 )
 from ._scratch import (
-    B12XCompressedMLAScratch as Scratch,
+    B12XCompressedSparseMLAScratch as Scratch,
 )
 from ._scratch import (
-    B12XCompressedMLAScratchCaps as Caps,
+    B12XCompressedSparseMLAScratchCaps as Caps,
 )
 from ._scratch import (
-    B12XCompressedMLAScratchPlan as Plan,
+    B12XCompressedSparseMLAScratchPlan as Plan,
 )
 from ._scratch import (
-    plan_compressed_mla_scratch as plan,
+    plan_compressed_sparse_mla_scratch as plan,
 )
 from . import META
 

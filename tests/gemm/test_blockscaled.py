@@ -142,6 +142,42 @@ def test_serialized_mm_keeps_planning_opaque_to_dynamo() -> None:
     assert torch.ops.b12x.dense_gemm_launch not in targets
 
 
+def test_recipe_wrappers_keep_planning_opaque_to_dynamo() -> None:
+    lhs_values = torch.empty((6, 64), dtype=torch.uint8)
+    lhs_scale = torch.empty((128, 4), dtype=torch.uint8)
+    rhs_values = torch.empty((48, 64), dtype=torch.uint8)
+    rhs_scale = torch.empty((128, 4), dtype=torch.uint8)
+    alpha = torch.ones(1, dtype=torch.float32)
+
+    def run_mxfp4(lhs_values, lhs_scale, rhs_values, rhs_scale):
+        return blockscaled.mm_mxfp4(
+            lhs_values,
+            lhs_scale,
+            rhs_values,
+            rhs_scale,
+        )
+
+    def run_nvfp4(lhs_values, lhs_scale, rhs_values, rhs_scale, alpha):
+        return blockscaled.mm_nvfp4(
+            lhs_values,
+            lhs_scale,
+            rhs_values,
+            rhs_scale,
+            alpha,
+        )
+
+    for run, args in (
+        (run_mxfp4, (lhs_values, lhs_scale, rhs_values, rhs_scale)),
+        (run_nvfp4, (lhs_values, lhs_scale, rhs_values, rhs_scale, alpha)),
+    ):
+        graph, _ = torch._dynamo.export(run)(*args)
+        targets = {
+            node.target for node in graph.graph.nodes if node.op == "call_function"
+        }
+        assert torch.ops.b12x.blockscaled_serialized in targets
+        assert torch.ops.b12x.dense_gemm_launch not in targets
+
+
 def _make_quantized_operand(
     shape: tuple[int, int, int],
     *,
@@ -338,6 +374,13 @@ def test_mm_serialized_mxfp4_matches_independent_dequantized_reference() -> None
         sf_vec_size=32,
         expected_m=m,
     )
+    compatibility = blockscaled.mm_mxfp4(
+        lhs_values,
+        lhs_scale_storage,
+        rhs_values,
+        rhs_scale_storage,
+        expected_m=m,
+    )
     lhs_dequant = _dequantize_mxfp4_rows(lhs_values, lhs_scale_rows)
     rhs_dequant = _dequantize_mxfp4_rows(rhs_values, rhs_scale_rows)
     expected = (lhs_dequant.to(torch.bfloat16) @ rhs_dequant.to(torch.bfloat16).T).to(
@@ -346,6 +389,7 @@ def test_mm_serialized_mxfp4_matches_independent_dequantized_reference() -> None
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(compatibility, actual, rtol=0, atol=0)
 
     # Serving qualification: compile first, then capture/replay without a
     # workspace or output-address change.
@@ -359,13 +403,11 @@ def test_mm_serialized_mxfp4_matches_independent_dequantized_reference() -> None
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_output = blockscaled.mm(
-            (lhs_values, lhs_scale_storage),
-            (rhs_values, rhs_scale_storage),
-            ab_dtype="float4_e2m1fn",
-            sf_dtype="float8_e8m0fnu",
-            c_dtype="bfloat16",
-            sf_vec_size=32,
+        graph_output = blockscaled.mm_mxfp4(
+            lhs_values,
+            lhs_scale_storage,
+            rhs_values,
+            rhs_scale_storage,
             expected_m=m,
         )
     output_ptr = graph_output.data_ptr()
@@ -403,6 +445,15 @@ def test_mm_serialized_nvfp4_and_block_fp8_match_native_views() -> None:
         expected_m=m,
     )
     torch.testing.assert_close(serialized_nvfp4, native_nvfp4, rtol=0, atol=0)
+    compatibility_nvfp4 = blockscaled.mm_nvfp4(
+        lhs[0][:, :, 0],
+        convert_sf_from_mma_layout(lhs[1], m=m, k=k, num_groups=1),
+        rhs[0][:, :, 0],
+        convert_sf_from_mma_layout(rhs[1], m=n, k=k, num_groups=1),
+        alpha,
+        expected_m=m,
+    )
+    torch.testing.assert_close(compatibility_nvfp4, serialized_nvfp4, rtol=0, atol=0)
 
     lhs_fp8 = torch.randn((m, k), device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
@@ -434,6 +485,18 @@ def test_mm_serialized_nvfp4_and_block_fp8_match_native_views() -> None:
     )
     torch.testing.assert_close(serialized_block_fp8, native_block_fp8, rtol=0, atol=0)
 
+    compatibility_block_fp8 = blockscaled.mm_block_fp8(
+        lhs_fp8,
+        lhs_scale,
+        rhs_fp8,
+        rhs_scale,
+        out_dtype=torch.bfloat16,
+        expected_m=m,
+    )
+    torch.testing.assert_close(
+        compatibility_block_fp8, native_block_fp8, rtol=0, atol=0
+    )
+
 
 def test_blockscaled_public_surface_and_compatibility_aliases() -> None:
     from b12x.gemm import mxfp8_linear, tensor_fp8_linear
@@ -441,6 +504,9 @@ def test_blockscaled_public_surface_and_compatibility_aliases() -> None:
     assert blockscaled.META.entry_points == (
         "Weight",
         "mm",
+        "mm_mxfp4",
+        "mm_nvfp4",
+        "mm_block_fp8",
         "pack_weight",
         "prewarm",
         "is_supported",

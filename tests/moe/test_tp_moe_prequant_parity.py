@@ -10,8 +10,6 @@ match bitwise; report max deltas either way.
 Run: CUDA_VISIBLE_DEVICES=0 python tests/test_tp_moe_prequant_parity.py
 """
 
-from dataclasses import replace
-
 import torch
 
 from b12x.moe.fused_moe._impl import (
@@ -21,8 +19,6 @@ from b12x.moe.fused_moe._impl import (
     plan_tp_moe_scratch,
     prepare_b12x_fp4_moe_weights,
 )
-from b12x.moe.fused_moe.config import PackedConfig
-
 E, M, K, N_TP, TOPK = 32, 64, 6144, 512, 8
 
 
@@ -48,9 +44,7 @@ def main() -> None:
     a1_gs = torch.full((1,), 1.7, dtype=torch.float32, device=device)
     a2_gs = torch.ones(1, dtype=torch.float32, device=device)
 
-    config = PackedConfig(source_format="modelopt_nvfp4", w13_layout="w31")
-    weight_plan = replace(
-        plan_b12x_fp4_moe_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="nvfp4",
         source_format="modelopt_nvfp4",
         activation="silu",
@@ -59,8 +53,6 @@ def main() -> None:
         hidden_size=K,
         intermediate_size=N_TP,
         w13_layout="w31",
-        ),
-        checkpoint_config=config,
     )
     prepared = prepare_b12x_fp4_moe_weights(
         plan=weight_plan,
@@ -76,11 +68,11 @@ def main() -> None:
     )
 
     caps = TPMoEScratchCaps(
-        config=config,
         max_tokens=M,
         num_topk=TOPK,
         device=device,
         weight_plan=weight_plan,
+        quant_mode="nvfp4",
         apply_router_weight_on_input=False,
     )
     plan = plan_tp_moe_scratch(caps)

@@ -4,7 +4,7 @@ Multi-head latent attention over top-k-selected KV tokens from a paged
 cache (DSV4: head_dim 576 = 512 nope + 64 rope, v_head_dim 512), FP8-e4m3
 or BF16 compute, split-KV decode with on-device merge; a single-pass decode
 path is selected automatically on SM121. Selection indices typically come
-from ``attention.nsa_indexer``.
+from ``attention.dsa_indexer``.
 
 Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) ->
 ``run_decode`` / ``run_extend`` (capture safe).

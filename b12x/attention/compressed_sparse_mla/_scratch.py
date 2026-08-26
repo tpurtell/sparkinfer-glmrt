@@ -8,10 +8,10 @@ from dataclasses import dataclass
 import torch
 
 from b12x.attention._shared.mla.compressed_config import (
-    compressed_mla_split_config_for_contract,
+    compressed_sparse_mla_split_config_for_contract,
 )
 from b12x.attention._shared.mla.compressed_reference import (
-    COMPRESSED_MLA_HEAD_DIM,
+    COMPRESSED_SPARSE_MLA_HEAD_DIM,
 )
 from b12x.attention._shared.workspace import (
     _split_output_buffer_from_tmp,
@@ -32,7 +32,7 @@ from b12x._lib.scratch import (
 
 
 @dataclass(frozen=True, kw_only=True)
-class B12XCompressedMLAScratchCaps:
+class B12XCompressedSparseMLAScratchCaps:
     device: torch.device | str
     num_q_heads: int
     max_q_rows: int
@@ -40,8 +40,8 @@ class B12XCompressedMLAScratchCaps:
     max_page_table_width: int | None = None
     dtype: torch.dtype = torch.bfloat16
     kv_dtype: torch.dtype = torch.uint8
-    head_dim: int = COMPRESSED_MLA_HEAD_DIM
-    v_head_dim: int = COMPRESSED_MLA_HEAD_DIM
+    head_dim: int = COMPRESSED_SPARSE_MLA_HEAD_DIM
+    v_head_dim: int = COMPRESSED_SPARSE_MLA_HEAD_DIM
     max_batch: int | None = None
     max_kv_rows: int = 0
     max_chunks_per_row: int = 64
@@ -86,7 +86,7 @@ class B12XCompressedMLAScratchCaps:
 
 
 @dataclass(frozen=True, kw_only=True)
-class _B12XCompressedMLAScratchLayout:
+class _B12XCompressedSparseMLAScratchLayout:
     nbytes: int
     max_q_chunks: int
     tmp_output_offset_bytes: int
@@ -98,7 +98,7 @@ class _B12XCompressedMLAScratchLayout:
 
 
 @dataclass(kw_only=True)
-class B12XCompressedMLAScratch:
+class B12XCompressedSparseMLAScratch:
     """Component-owned compressed MLA scratch views over caller-owned storage."""
 
     shared_scratch: torch.Tensor
@@ -162,8 +162,8 @@ class B12XCompressedMLAScratch:
         indexed_indices: torch.Tensor | None = None,
         indexed_lengths: torch.Tensor | None = None,
         indexed_page_table: torch.Tensor | None = None,
-    ) -> "B12XCompressedMLABinding":
-        return build_compressed_mla_binding(
+    ) -> "B12XCompressedSparseMLABinding":
+        return build_compressed_sparse_mla_binding(
             scratch=self,
             q=q,
             swa_indices=swa_indices,
@@ -175,7 +175,7 @@ class B12XCompressedMLAScratch:
 
 
 @dataclass(frozen=True, kw_only=True)
-class B12XCompressedMLABinding:
+class B12XCompressedSparseMLABinding:
     scratch: object
     q: torch.Tensor
     swa_indices: torch.Tensor
@@ -185,9 +185,9 @@ class B12XCompressedMLABinding:
     indexed_page_table: torch.Tensor | None = None
 
 
-def _compressed_mla_scratch_layout(
-    caps: B12XCompressedMLAScratchCaps,
-) -> _B12XCompressedMLAScratchLayout:
+def _compressed_sparse_mla_scratch_layout(
+    caps: B12XCompressedSparseMLAScratchCaps,
+) -> _B12XCompressedSparseMLAScratchLayout:
     max_total_q = max(int(caps.max_q_rows), 1)
     max_chunks_per_row = max(int(caps.max_chunks_per_row), 1)
     default_q_chunks = max_total_q * max_chunks_per_row
@@ -228,7 +228,7 @@ def _compressed_mla_scratch_layout(
     cursor += dtype_nbytes(torch.float32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
-    return _B12XCompressedMLAScratchLayout(
+    return _B12XCompressedSparseMLAScratchLayout(
         nbytes=max(int(cursor), SCRATCH_ALIGN_BYTES),
         max_q_chunks=max_q_chunks,
         tmp_output_offset_bytes=tmp_output_offset_bytes,
@@ -250,8 +250,8 @@ def _shape_only_scratch_tensor(
     return base.as_strided(shape, (0,) * len(shape))
 
 
-def _install_compressed_mla_contract_phantoms(
-    scratch: B12XCompressedMLAScratch,
+def _install_compressed_sparse_mla_contract_phantoms(
+    scratch: B12XCompressedSparseMLAScratch,
 ) -> None:
     storage = scratch.shared_scratch
     scratch._contract_q = _shape_only_scratch_tensor(
@@ -303,11 +303,11 @@ def _install_compressed_mla_contract_phantoms(
     )
 
 
-def _materialize_compressed_mla_scratch(
-    caps: B12XCompressedMLAScratchCaps,
+def _materialize_compressed_sparse_mla_scratch(
+    caps: B12XCompressedSparseMLAScratchCaps,
     scratch_storage: torch.Tensor,
-    layout: _B12XCompressedMLAScratchLayout,
-) -> B12XCompressedMLAScratch:
+    layout: _B12XCompressedSparseMLAScratchLayout,
+) -> B12XCompressedSparseMLAScratch:
     max_total_q = max(int(caps.max_q_rows), 1)
     tmp_output, _ = materialize_scratch_strided_view(
         scratch_storage,
@@ -356,7 +356,7 @@ def _materialize_compressed_mla_scratch(
         shape=(1,),
         dtype=torch.float32,
     )
-    scratch = B12XCompressedMLAScratch(
+    scratch = B12XCompressedSparseMLAScratch(
         shared_scratch=scratch_storage,
         device=caps.device,
         dtype=caps.dtype,
@@ -379,8 +379,8 @@ def _materialize_compressed_mla_scratch(
         num_chunks_ptr=num_chunks_ptr,
         sm_scale_tensor=sm_scale_tensor,
     )
-    _install_compressed_mla_contract_phantoms(scratch)
-    split_cfg = compressed_mla_split_config_for_contract(
+    _install_compressed_sparse_mla_contract_phantoms(scratch)
+    split_cfg = compressed_sparse_mla_split_config_for_contract(
         rows=caps.max_q_rows,
         width=caps.max_width,
         max_chunks=caps.max_chunks_per_row,
@@ -418,9 +418,9 @@ def _normalize_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
         raise ValueError(
             f"q heads {int(q.shape[1])} do not match scratch heads {scratch.num_q_heads}"
         )
-    if int(q.shape[2]) != COMPRESSED_MLA_HEAD_DIM:
+    if int(q.shape[2]) != COMPRESSED_SPARSE_MLA_HEAD_DIM:
         raise ValueError(
-            f"q head_dim must be {COMPRESSED_MLA_HEAD_DIM}, got {int(q.shape[2])}"
+            f"q head_dim must be {COMPRESSED_SPARSE_MLA_HEAD_DIM}, got {int(q.shape[2])}"
         )
     if q.dtype != torch.bfloat16:
         raise TypeError(f"q must have dtype torch.bfloat16, got {q.dtype}")
@@ -481,7 +481,7 @@ def _validate_i32_vector(
     return tensor
 
 
-def build_compressed_mla_binding(
+def build_compressed_sparse_mla_binding(
     *,
     scratch: object,
     q: torch.Tensor,
@@ -490,7 +490,7 @@ def build_compressed_mla_binding(
     indexed_indices: torch.Tensor | None = None,
     indexed_lengths: torch.Tensor | None = None,
     indexed_page_table: torch.Tensor | None = None,
-) -> B12XCompressedMLABinding:
+) -> B12XCompressedSparseMLABinding:
     q = _normalize_q(q, scratch=scratch)
     rows = int(q.shape[0])
     swa_indices = _normalize_i32_matrix(
@@ -547,7 +547,7 @@ def build_compressed_mla_binding(
         raise ValueError(
             f"compressed MLA width {total_width} exceeds scratch topk {scratch.topk}"
         )
-    return B12XCompressedMLABinding(
+    return B12XCompressedSparseMLABinding(
         scratch=scratch,
         q=q,
         swa_indices=swa_indices,
@@ -575,9 +575,9 @@ def _validate_i32_contiguous(
 
 
 @dataclass(frozen=True)
-class B12XCompressedMLAScratchPlan:
-    caps: B12XCompressedMLAScratchCaps
-    layout: _B12XCompressedMLAScratchLayout
+class B12XCompressedSparseMLAScratchPlan:
+    caps: B12XCompressedSparseMLAScratchCaps
+    layout: _B12XCompressedSparseMLAScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
@@ -596,18 +596,18 @@ class B12XCompressedMLAScratchPlan:
         indexed_indices: torch.Tensor | None = None,
         indexed_lengths: torch.Tensor | None = None,
         indexed_page_table: torch.Tensor | None = None,
-    ) -> B12XCompressedMLABinding:
+    ) -> B12XCompressedSparseMLABinding:
         scratch_storage = scratch_tensor(
             scratch,
             self._scratch_specs,
             owner="compressed MLA",
         )
-        scratch_views = _materialize_compressed_mla_scratch(
+        scratch_views = _materialize_compressed_sparse_mla_scratch(
             self.caps,
             scratch_storage,
             self.layout,
         )
-        return build_compressed_mla_binding(
+        return build_compressed_sparse_mla_binding(
             scratch=scratch_views,
             q=q,
             swa_indices=swa_indices,
@@ -618,16 +618,16 @@ class B12XCompressedMLAScratchPlan:
         )
 
 
-def plan_compressed_mla_scratch(
-    caps: B12XCompressedMLAScratchCaps,
-) -> B12XCompressedMLAScratchPlan:
-    layout = _compressed_mla_scratch_layout(caps)
-    return B12XCompressedMLAScratchPlan(
+def plan_compressed_sparse_mla_scratch(
+    caps: B12XCompressedSparseMLAScratchCaps,
+) -> B12XCompressedSparseMLAScratchPlan:
+    layout = _compressed_sparse_mla_scratch_layout(caps)
+    return B12XCompressedSparseMLAScratchPlan(
         caps=caps,
         layout=layout,
         _scratch_specs=(
             scratch_buffer_spec(
-                "compressed_mla.scratch",
+                "compressed_sparse_mla.scratch",
                 nbytes=int(layout.nbytes),
                 device=caps.device,
             ),
@@ -637,10 +637,10 @@ def plan_compressed_mla_scratch(
 
 __all__ = [
     "ScratchBufferSpec",
-    "B12XCompressedMLABinding",
-    "B12XCompressedMLAScratch",
-    "B12XCompressedMLAScratchCaps",
-    "B12XCompressedMLAScratchPlan",
-    "build_compressed_mla_binding",
-    "plan_compressed_mla_scratch",
+    "B12XCompressedSparseMLABinding",
+    "B12XCompressedSparseMLAScratch",
+    "B12XCompressedSparseMLAScratchCaps",
+    "B12XCompressedSparseMLAScratchPlan",
+    "build_compressed_sparse_mla_binding",
+    "plan_compressed_sparse_mla_scratch",
 ]

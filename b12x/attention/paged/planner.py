@@ -290,7 +290,23 @@ def _laguna_page128_one_wave_chunk_budget(
     )
 
 
-def _sm121_gqa8_decode_chunk_budget(
+def _scale_chunk_budget_for_sm_count(
+    chunks_at_reference_count: int,
+    *,
+    num_sms: int,
+    reference_sm_count: int,
+) -> int:
+    return max(
+        (
+            int(chunks_at_reference_count) * int(num_sms)
+            + int(reference_sm_count) // 2
+        )
+        // int(reference_sm_count),
+        1,
+    )
+
+
+def _h256_gqa8_decode_chunk_budget(
     *,
     device: torch.device,
     q_dtype: torch.dtype,
@@ -304,7 +320,7 @@ def _sm121_gqa8_decode_chunk_budget(
     max_effective_kv_pages: int,
     window_left: int,
 ) -> int | None:
-    """Return the measured GB10 split budget for the H256 GQA8 contract."""
+    """Return the SM-scaled split budget for the H256 GQA8 contract."""
 
     if not (
         q_dtype == torch.bfloat16
@@ -321,24 +337,30 @@ def _sm121_gqa8_decode_chunk_budget(
             or 992 <= int(max_effective_kv_pages) <= 1056
         )
         and int(window_left) < 0
-        and tuple(torch.cuda.get_device_capability(device)) == (12, 1)
+        and int(torch.cuda.get_device_capability(device)[0]) == 12
     ):
         return None
-    # Graph-first sweeps on the 48-SM GB10 found distinct latency knees at the
-    # 16K, 32K, and 64K serving capacities.  Express them as maximum chunk
-    # counts so the device LUT remains adaptive for every live length captured
-    # by the same graph.
+    # Preserve the measured chunks-per-SM knees while the device LUT adapts to
+    # every live length captured by the same graph.
+    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    reference_sm_count = 48
     max_pages = int(max_effective_kv_pages)
     if 224 <= max_pages <= 288:
-        return 19 if kv_dtype == torch.bfloat16 else 22
-    if 480 <= max_pages <= 544:
-        return 14 if kv_dtype == torch.bfloat16 else 18
-    if 992 <= max_pages <= 1056:
-        return 17 if kv_dtype == torch.bfloat16 else 18
-    return None
+        reference_chunks = 19 if kv_dtype == torch.bfloat16 else 22
+    elif 480 <= max_pages <= 544:
+        reference_chunks = 14 if kv_dtype == torch.bfloat16 else 18
+    elif 992 <= max_pages <= 1056:
+        reference_chunks = 17 if kv_dtype == torch.bfloat16 else 18
+    else:
+        return None
+    return _scale_chunk_budget_for_sm_count(
+        reference_chunks,
+        num_sms=num_sms,
+        reference_sm_count=reference_sm_count,
+    )
 
 
-def _sm121_h256_one_wave_decode_chunk_budget(
+def _h256_one_wave_decode_chunk_budget(
     *,
     device: torch.device,
     q_dtype: torch.dtype,
@@ -370,7 +392,7 @@ def _sm121_h256_one_wave_decode_chunk_budget(
         and int(num_kv_heads) >= 1
         and int(query_tiles_per_request) >= 1
         and int(window_left) < 0
-        and tuple(torch.cuda.get_device_capability(device)) == (12, 1)
+        and int(torch.cuda.get_device_capability(device)[0]) == 12
     ):
         return None
 
@@ -1266,7 +1288,7 @@ def plan_decode_graph_capacity(
     )
     if one_wave_chunks is not None:
         max_chunks_budget = min(max_chunks_budget, one_wave_chunks)
-    sm121_gqa8_chunks = _sm121_gqa8_decode_chunk_budget(
+    gqa8_chunks = _h256_gqa8_decode_chunk_budget(
         device=device,
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
@@ -1279,10 +1301,10 @@ def plan_decode_graph_capacity(
         max_effective_kv_pages=max_effective_kv_pages,
         window_left=window_left,
     )
-    if sm121_gqa8_chunks is not None:
-        max_chunks_budget = min(max_chunks_budget, sm121_gqa8_chunks)
+    if gqa8_chunks is not None:
+        max_chunks_budget = min(max_chunks_budget, gqa8_chunks)
     if graph_ctas_per_sm is None:
-        sm121_h256_one_wave_chunks = _sm121_h256_one_wave_decode_chunk_budget(
+        h256_one_wave_chunks = _h256_one_wave_decode_chunk_budget(
             device=device,
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
@@ -1294,10 +1316,8 @@ def plan_decode_graph_capacity(
             query_tiles_per_request=query_tiles_per_request,
             window_left=window_left,
         )
-        if sm121_h256_one_wave_chunks is not None:
-            max_chunks_budget = min(
-                max_chunks_budget, sm121_h256_one_wave_chunks
-            )
+        if h256_one_wave_chunks is not None:
+            max_chunks_budget = min(max_chunks_budget, h256_one_wave_chunks)
 
     split_policy_supported = q_dtype == torch.bfloat16 and (
         _merge_backend_supports_split_kv(

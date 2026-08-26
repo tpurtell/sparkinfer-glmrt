@@ -93,17 +93,22 @@ def main() -> None:
     # w1_bf/w2_bf are kept alive: the correctness gates below need an
     # independent BF16 ground truth, not just micro-vs-dynamic agreement.
 
-    config = fused_moe.PackedConfig(
-        source_format="mxfp6_e2m3",
-        w13_layout="w13",
+    source = fused_moe.PackedSource(
+        format=fused_moe.PackedSourceFormat.MXFP6_E8M0_K32,
+        w13_layout=fused_moe.W13Layout.W13,
     )
     weight_plan = fused_moe.plan_weights(
-        config=config,
-        activation="silu",
-        dtype=torch.bfloat16,
-        num_experts=experts,
-        hidden_size=k,
-        intermediate_size=n,
+        source=source,
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A8,
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=experts,
+            hidden_size=k,
+            intermediate_size=n,
+        ),
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
@@ -122,17 +127,16 @@ def main() -> None:
     def make_runner(m: int, x, topk_ids, topk_weights):
         """(Re)plan + bind under the CURRENT env so dispatch re-decides."""
         fused_moe.clear_caches()
-        plan = fused_moe.plan(
-            fused_moe.Caps(
+        plan = fused_moe.plan_execution(
+            experts=prepared,
+            capacity=fused_moe.ExecutionCapacity(
                 max_tokens=m,
-                num_topk=topk,
-                device=device,
-                config=config,
-                weight_plan=weight_plan,
-                core_token_counts=(m,),
+                top_k=topk,
+                warmup_token_counts=(m,),
                 route_num_experts=0,
-            )
+            ),
         )
+        fused_moe.prewarm(plan)
         scratch = tuple(
             torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[i].device)
             for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())

@@ -18,22 +18,29 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.attention._shared.mla.compressed_reference import (
-    COMPRESSED_MLA_BYTES_PER_TOKEN,
-    COMPRESSED_MLA_C128_PAGE_SIZE,
-    COMPRESSED_MLA_C4_PAGE_SIZE,
-    COMPRESSED_MLA_DSV4_PAGE_SIZE,
-    COMPRESSED_MLA_HEAD_DIM,
-    COMPRESSED_MLA_NOPE_DIM,
-    COMPRESSED_MLA_ROPE_DIM,
-    COMPRESSED_MLA_SWA_TOKENS,
-    compressed_mla_page_nbytes,
+    COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
+    COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
+    COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
+    COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+    COMPRESSED_SPARSE_MLA_HEAD_DIM,
+    COMPRESSED_SPARSE_MLA_NOPE_DIM,
+    COMPRESSED_SPARSE_MLA_ROPE_DIM,
+    COMPRESSED_SPARSE_MLA_SWA_TOKENS,
+    compressed_sparse_mla_page_nbytes,
     compressed_sparse_mla_reference,
-    pack_compressed_mla_kv_cache_reference,
+    pack_compressed_sparse_mla_kv_cache_reference,
 )
 from b12x.attention._shared.mla.api import clear_mla_caches
-from b12x.attention._shared.mla.compressed_api import compressed_mla_decode_forward
-from b12x.attention._shared.mla.compressed_config import compressed_mla_split_chunks_for_contract
-from b12x.attention.compressed_mla._scratch import B12XCompressedMLAScratchCaps, plan_compressed_mla_scratch
+from b12x.attention._shared.mla.compressed_api import (
+    compressed_sparse_mla_decode_forward,
+)
+from b12x.attention._shared.mla.compressed_config import (
+    compressed_sparse_mla_split_chunks_for_contract,
+)
+from b12x.attention.compressed_sparse_mla._scratch import (
+    B12XCompressedSparseMLAScratchCaps,
+    plan_compressed_sparse_mla_scratch,
+)
 
 from benchmarks.common import (
     bench_cuda_graph,
@@ -44,7 +51,7 @@ from benchmarks.common import (
 )
 
 
-_SM_SCALE = 1.0 / math.sqrt(COMPRESSED_MLA_HEAD_DIM)
+_SM_SCALE = 1.0 / math.sqrt(COMPRESSED_SPARSE_MLA_HEAD_DIM)
 _ALGORITHM_COS_TOL = 0.995
 _DECODE_TARGET_US = 25.0
 _PREFILL4096_TARGET_US = 2_000.0
@@ -123,7 +130,7 @@ class TargetSummary:
 
 
 @dataclass(frozen=True)
-class DSV4CompressedMLAProfile:
+class DSV4CompressedSparseMLAProfile:
     swa_width: int
     c4_indexed_width: int
     c128_indexed_width: int
@@ -244,13 +251,13 @@ def _trace_layer_weights(config: dict[str, object]) -> dict[str, int]:
     }
 
 
-def _derive_dsv4_compressed_mla_profile(
+def _derive_dsv4_compressed_sparse_mla_profile(
     config: dict[str, object],
     *,
     full_token_capacity: int | None = None,
     c128_pool_size: int | None = None,
-) -> DSV4CompressedMLAProfile:
-    sliding_window = int(config.get("sliding_window", COMPRESSED_MLA_SWA_TOKENS))
+) -> DSV4CompressedSparseMLAProfile:
+    sliding_window = int(config.get("sliding_window", COMPRESSED_SPARSE_MLA_SWA_TOKENS))
     c4_topk = int(config.get("index_topk", _DEFAULT_INDEX_TOPK))
     max_positions = int(config.get("max_position_embeddings", 0))
     compress_ratios_raw = config.get("compress_ratios", ())
@@ -266,7 +273,7 @@ def _derive_dsv4_compressed_mla_profile(
     c128_source_tokens = full_token_capacity
     if c128_source_tokens is None:
         if c128_pool_size is not None:
-            c128_source_tokens = c128_pool_size * COMPRESSED_MLA_C128_PAGE_SIZE
+            c128_source_tokens = c128_pool_size * COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE
         else:
             c128_source_tokens = max_positions
 
@@ -289,7 +296,7 @@ def _derive_dsv4_compressed_mla_profile(
     if c128_indexed_width:
         selected_widths.add(swa_width + c128_indexed_width)
 
-    return DSV4CompressedMLAProfile(
+    return DSV4CompressedSparseMLAProfile(
         swa_width=swa_width,
         c4_indexed_width=c4_indexed_width,
         c128_indexed_width=c128_indexed_width,
@@ -327,7 +334,7 @@ def _parse_cases(
                     BenchmarkCase(
                         name=name,
                         rows=row_count,
-                        swa_width=COMPRESSED_MLA_SWA_TOKENS,
+                        swa_width=COMPRESSED_SPARSE_MLA_SWA_TOKENS,
                         indexed_width=0,
                         indexed_page_size=None,
                     )
@@ -339,7 +346,7 @@ def _parse_cases(
                         rows=row_count,
                         swa_width=0,
                         indexed_width=c4_indexed_width,
-                        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+                        indexed_page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
                     )
                 )
             elif name == "c128":
@@ -349,7 +356,7 @@ def _parse_cases(
                         rows=row_count,
                         swa_width=0,
                         indexed_width=c128_indexed_width,
-                        indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+                        indexed_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
                     )
                 )
             elif name == "swa-c4":
@@ -357,9 +364,9 @@ def _parse_cases(
                     BenchmarkCase(
                         name=name,
                         rows=row_count,
-                        swa_width=COMPRESSED_MLA_SWA_TOKENS,
+                        swa_width=COMPRESSED_SPARSE_MLA_SWA_TOKENS,
                         indexed_width=c4_indexed_width,
-                        indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+                        indexed_page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
                     )
                 )
             elif name == "swa-c128":
@@ -367,9 +374,9 @@ def _parse_cases(
                     BenchmarkCase(
                         name=name,
                         rows=row_count,
-                        swa_width=COMPRESSED_MLA_SWA_TOKENS,
+                        swa_width=COMPRESSED_SPARSE_MLA_SWA_TOKENS,
                         indexed_width=c128_indexed_width,
-                        indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+                        indexed_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
                     )
                 )
             else:
@@ -381,9 +388,9 @@ def _parse_cases(
 
 
 def _resolve_case_widths(args: argparse.Namespace) -> tuple[int, int]:
-    profile: DSV4CompressedMLAProfile | None = None
+    profile: DSV4CompressedSparseMLAProfile | None = None
     if args.model_config is not None:
-        profile = _derive_dsv4_compressed_mla_profile(
+        profile = _derive_dsv4_compressed_sparse_mla_profile(
             _load_model_config(args.model_config),
             full_token_capacity=args.full_token_capacity,
             c128_pool_size=args.c128_pool_size,
@@ -429,13 +436,13 @@ def _runtime_valid_widths(
     if case.indexed_width:
         if case.indexed_page_size is None:
             raise ValueError("indexed_width requires indexed_page_size")
-        if COMPRESSED_MLA_DSV4_PAGE_SIZE % case.indexed_page_size:
+        if COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE % case.indexed_page_size:
             raise ValueError(
                 "indexed page size must divide the DSV4 page size: "
-                f"{case.indexed_page_size} vs {COMPRESSED_MLA_DSV4_PAGE_SIZE}"
+                f"{case.indexed_page_size} vs {COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE}"
             )
         compression_ratio = (
-            COMPRESSED_MLA_DSV4_PAGE_SIZE // case.indexed_page_size
+            COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE // case.indexed_page_size
         )
         indexed_valid = min(case.indexed_width, context_length // compression_ratio)
     return swa_valid, indexed_valid
@@ -449,7 +456,7 @@ def _planned_split_chunks(
     max_chunks = None
     if production_decode_cap:
         max_chunks = max(1, math.ceil(case.topk / _DECODE_SPLIT_TILE))
-    return compressed_mla_split_chunks_for_contract(
+    return compressed_sparse_mla_split_chunks_for_contract(
         rows=case.rows,
         width=max(1, case.topk),
         max_chunks=max_chunks,
@@ -462,7 +469,7 @@ def _make_q(
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     q = torch.randn(
-        (rows, num_q_heads, COMPRESSED_MLA_HEAD_DIM),
+        (rows, num_q_heads, COMPRESSED_SPARSE_MLA_HEAD_DIM),
         generator=gen,
         dtype=torch.float32,
         device=device,
@@ -481,7 +488,7 @@ def _make_compressed_cache(
     gen.manual_seed(seed)
     k_nope = (
         torch.randn(
-            (tokens, COMPRESSED_MLA_NOPE_DIM),
+            (tokens, COMPRESSED_SPARSE_MLA_NOPE_DIM),
             generator=gen,
             dtype=torch.float32,
             device=device,
@@ -490,14 +497,14 @@ def _make_compressed_cache(
     )
     k_rope = (
         torch.randn(
-            (tokens, COMPRESSED_MLA_ROPE_DIM),
+            (tokens, COMPRESSED_SPARSE_MLA_ROPE_DIM),
             generator=gen,
             dtype=torch.float32,
             device=device,
         )
         * 0.05
     )
-    return pack_compressed_mla_kv_cache_reference(
+    return pack_compressed_sparse_mla_kv_cache_reference(
         k_nope,
         k_rope.to(dtype=torch.bfloat16),
         page_size=page_size,
@@ -541,7 +548,7 @@ def _make_cache_views(
         )
     if byte_offset < 0:
         raise ValueError(f"byte_offset must be non-negative, got {byte_offset}")
-    nominal_page_bytes = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
+    nominal_page_bytes = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
     if page_nbytes < nominal_page_bytes:
         raise ValueError(
             f"packed page has {page_nbytes} bytes, smaller than nominal "
@@ -590,8 +597,8 @@ def _make_cache_views(
 
     flashinfer_view = torch.as_strided(
         b12x_view,
-        size=(pages, int(page_size), COMPRESSED_MLA_BYTES_PER_TOKEN),
-        stride=(page_stride, COMPRESSED_MLA_BYTES_PER_TOKEN, 1),
+        size=(pages, int(page_size), COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN),
+        stride=(page_stride, COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN, 1),
     )
     return CacheViews(b12x=b12x_view, flashinfer=flashinfer_view)
 
@@ -671,15 +678,15 @@ def _make_binding(
         case,
         production_decode_cap=production_decode_cap,
     )
-    plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
-        device=device,
-        num_q_heads=num_q_heads,
+    plan = plan_compressed_sparse_mla_scratch(
+        B12XCompressedSparseMLAScratchCaps(
+            device=device,
+            num_q_heads=num_q_heads,
             max_q_rows=case.rows,
             max_width=max(1, case.topk),
-        head_dim=COMPRESSED_MLA_HEAD_DIM,
-        v_head_dim=COMPRESSED_MLA_HEAD_DIM,
-        max_batch=case.rows,
+            head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
+            v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
+            max_batch=case.rows,
             page_size=swa_page_size,
             max_chunks_per_row=split_chunks,
         )
@@ -823,10 +830,12 @@ def _benchmark_case(
     if cache_num_pages:
         if cache_page_stride_bytes <= 0:
             raise ValueError("cache_num_pages requires a positive packed-cache stride")
-        indexed_byte_offset = compressed_mla_page_nbytes(swa_page_size)
+        indexed_byte_offset = compressed_sparse_mla_page_nbytes(swa_page_size)
         largest_payload_end = indexed_byte_offset
         if case.indexed_page_size is not None:
-            largest_payload_end += compressed_mla_page_nbytes(case.indexed_page_size)
+            largest_payload_end += compressed_sparse_mla_page_nbytes(
+                case.indexed_page_size
+            )
         if largest_payload_end > cache_page_stride_bytes:
             raise ValueError(
                 "SWA and indexed cache payloads do not fit in one packed block: "
@@ -851,9 +860,7 @@ def _benchmark_case(
     swa_valid, indexed_valid = _runtime_valid_widths(
         case, context_length=context_length
     )
-    swa_lengths = torch.full(
-        (case.rows,), swa_valid, dtype=torch.int32, device=device
-    )
+    swa_lengths = torch.full((case.rows,), swa_valid, dtype=torch.int32, device=device)
 
     indexed_cache: CacheViews | None = None
     indexed_indices: torch.Tensor | None = None
@@ -905,7 +912,7 @@ def _benchmark_case(
 
     def run() -> torch.Tensor:
         nonlocal output
-        output = compressed_mla_decode_forward(
+        output = compressed_sparse_mla_decode_forward(
             binding=binding,
             swa_k_cache=swa_cache.b12x,
             swa_page_size=swa_page_size,
@@ -1323,7 +1330,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--swa-page-size",
         type=int,
-        default=COMPRESSED_MLA_DSV4_PAGE_SIZE,
+        default=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
         help="physical SWA page size; vLLM's DeepSeek-V4 cache uses 64",
     )
     parser.add_argument(

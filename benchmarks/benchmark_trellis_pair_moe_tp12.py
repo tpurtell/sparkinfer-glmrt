@@ -23,7 +23,7 @@ Example:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -528,12 +528,6 @@ def _prepare_weights(
         trellis_pair_kinds=sorted(pair_kinds),
         trellis_tile_config=_TILES,
     )
-    weight_plan = replace(
-        weight_plan,
-        checkpoint_config=fused_moe.PackedConfig(
-            source_format="fp4_e8m0_k32"
-        ),
-    )
     btx_layer = lift_qsrt_atoms_v1_extent(
         atom_payload,
         first_atom_slot=0,
@@ -607,12 +601,12 @@ def _capture_case(
     ).to(torch.bfloat16)
     plan = fused_moe.plan(
         fused_moe.Caps(
-            config=weights.plan.checkpoint_config,
             max_tokens=tokens,
             num_topk=_TOPK,
             route_num_experts=_ROUTE_EXPERTS,
             device=device,
             weight_plan=weights.plan,
+            quant_mode="w4a16",
             w4a16_block_size_m=8,
         )
     )

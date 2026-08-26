@@ -1,22 +1,22 @@
-"""Compressed MLA decode for SM12x (DeepSeek-V3.2).
+"""Compressed sparse MLA for DeepSeek V4 on SM12x.
 
 Decode directly from compressed KV pages: a sliding-window cache plus an
 indexed (top-k-selected) cache, fused-merged into the caller's output.
-Head dim is fixed to DSV4's 512 + 64. Single-pass decode on SM121.
+Head dim is fixed to 512 (448 NoPE + 64 RoPE). Single-pass decode on SM121.
 
 Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) -> ``run``
 (capture safe). ``split_chunks_for_contract`` exposes the fixed
 split-planning contract integrations preplan against.
 
 Example:
-    from b12x.attention import compressed_mla
+    from b12x.attention import compressed_sparse_mla
 
-    plan    = compressed_mla.plan(compressed_mla.Caps(...))
+    plan    = compressed_sparse_mla.plan(compressed_sparse_mla.Caps(...))
     spec    = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    binding = compressed_mla.bind(plan, scratch=scratch, q=q,
+    binding = compressed_sparse_mla.bind(plan, scratch=scratch, q=q,
                                   swa_indices=idx, swa_lengths=lens, ...)
-    out = compressed_mla.run(swa_k_cache=swa, binding=binding,
+    out = compressed_sparse_mla.run(swa_k_cache=swa, binding=binding,
                              sm_scale=scale, ...)
 """
 
@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
-    name="compressed_mla",
+    name="compressed_sparse_mla",
     group="attention",
     api_style="planned",
     entry_points=(
@@ -53,7 +53,7 @@ META = OpMeta(
             "b12x/integration/compressed_scratch.py",
         ),
     ),
-    test_path="tests/attention/test_compressed_mla.py",
+    test_path="tests/attention/test_compressed_sparse_mla.py",
     since="0.7.0",
 )
 

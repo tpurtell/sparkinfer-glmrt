@@ -155,7 +155,7 @@ def _plan_candidates(
     tile_mn_list: list[tuple[int, int]] | None,
     load_path_list: list[str] | None,
     swap_ab_list: list[bool] | None,
-    target_occupancy_list: list[int] | None,
+    target_occupancy_list: list[int] | None = None,
 ) -> list[Candidate]:
     if joint:
         tile_storage = (
@@ -180,6 +180,7 @@ def _plan_candidates(
         for tile_k in tile_k_list
         for load_path in load_paths
         for target_occupancy in (target_occupancy_list or [None])
+        if not (tile == (128, 128) and tile_k == 512)
     ]
 
 
@@ -210,6 +211,7 @@ def _baseline(
     *,
     m: int,
     n: int,
+    k: int,
     plan: object,
 ) -> torch.Tensor:
     out = torch.empty((m, n, 1), device="cuda", dtype=torch.bfloat16)
@@ -225,7 +227,7 @@ def _baseline(
         mma_tiler_mn=plan.mma_tiler_mn,
         load_path=plan.load_path,
         swap_ab=plan.swap_ab,
-        _tile_k_override=128,
+        _tile_k_override=128 if k % 128 == 0 else None,
     )
     torch.cuda.synchronize()
     return out[:, :, 0].clone()
@@ -347,18 +349,6 @@ def main() -> None:
                     sm_count,
                     is_mxfp8=False,
                 )
-                baseline = _baseline(
-                    a_packed,
-                    a_sf,
-                    b_packed,
-                    b_sf,
-                    alpha,
-                    m=m,
-                    n=shape.n,
-                    plan=plan,
-                )
-                prepared: list[CandidateRun] = []
-
                 candidates = _plan_candidates(
                     plan,
                     tile_k_list=args.tile_k_list,
@@ -368,6 +358,32 @@ def main() -> None:
                     swap_ab_list=args.swap_ab_list,
                     target_occupancy_list=args.target_occupancy_list,
                 )
+                if not any(
+                    shape.k % candidate.tile_k == 0 for candidate in candidates
+                ):
+                    for candidate in candidates:
+                        output.write(
+                            f"{shape.name}\t{m}\t{shape.n}\t{shape.k}\t"
+                            f"{candidate.tile_mn[0]}\t{candidate.tile_mn[1]}\t"
+                            f"{candidate.tile_k}\t{candidate.load_path}\t"
+                            f"{int(candidate.swap_ab)}\t"
+                            f"{candidate.target_occupancy or 'auto'}\t"
+                            "not_divisible\t\t\t\t\t\t\n"
+                        )
+                    print(f"  M={m:<3} no requested tile K divides K={shape.k}")
+                    continue
+                baseline = _baseline(
+                    a_packed,
+                    a_sf,
+                    b_packed,
+                    b_sf,
+                    alpha,
+                    m=m,
+                    n=shape.n,
+                    k=shape.k,
+                    plan=plan,
+                )
+                prepared: list[CandidateRun] = []
                 for candidate in candidates:
                     if shape.k % candidate.tile_k:
                         output.write(

@@ -1,39 +1,51 @@
-"""Fused tensor-parallel MoE for SM12x: route -> FC1 -> activation -> FC2 ->
-scatter, in one launch family.
+"""Fused tensor-parallel MoE for SM12x.
 
-Checkpoint encodings are described by ``PackedConfig`` or ``TrellisConfig``;
-kernel recipes remain private planner policy. The
-``quantization_config.b12x_trellis`` schema represents the mcg, sqg_e4m3, and
-sqg_fp16 codebooks. Routed execution currently implements MCG K3/K4/K5 and
-SQG-E4M3 K3.
-Activations: silu, situ, relu2, swigluoai_uninterleave. Kernel regimes are
-private planner policy selected by ``plan`` from checkpoint metadata and
-serving capacity.
+The canonical API keeps checkpoint encoding, prepared representation, and
+activation precision independent:
 
-Weight lifecycle (host-side, one-time):
-    ``plan_weights`` -> ``prepare_weights`` -> ``ExpertWeights``
-Runtime lifecycle:
-    ``plan(Caps)`` -> ``bind`` / ``bind_sparse`` / ``bind_route``
-    (allocation-free views) -> ``run`` / ``run_sparse`` / ``route``
-    (CUDA-graph capture safe)
-``required_nbytes(Caps)`` prices that scratch without compiling launches or
-retaining storage.
-``route_topk`` is a standalone one-shot top-k router; ``run_sparse`` fuses
-gate -> top-k -> experts from router logits.
-
-Example:
+    import torch
     from b12x.moe import fused_moe
 
-    config  = fused_moe.PackedConfig(source_format="modelopt_nvfp4")
-    wplan   = fused_moe.plan_weights(config=config, ...)
-    experts = fused_moe.prepare_weights(
-        plan=wplan, weights=fused_moe.PackedWeights(...))
-    plan    = fused_moe.plan(fused_moe.Caps(config=config, weight_plan=wplan, ...))
-    spec    = plan.scratch_specs()[0]
+    source = fused_moe.PackedSource(
+        format=fused_moe.PackedSourceFormat.MXFP4_E8M0_K32,
+        w13_layout=fused_moe.W13Layout.W31,
+    )
+    activation = fused_moe.ActivationSpec(
+        mode=fused_moe.ActivationMode.A8,
+        nonlinearity="silu",
+        io_dtype=torch.bfloat16,
+    )
+    geometry = fused_moe.MoEGeometry(
+        num_experts=128,
+        hidden_size=4096,
+        intermediate_size=14336,
+    )
+    weight_plan = fused_moe.plan_weights(
+        source=source,
+        activation=activation,
+        geometry=geometry,
+    )
+    experts = fused_moe.prepare_weights(plan=weight_plan, weights=weights)
+    execution = fused_moe.plan_execution(
+        experts=experts,
+        capacity=fused_moe.ExecutionCapacity(max_tokens=4096, top_k=8),
+    )
+    fused_moe.prewarm(execution)
+    spec = execution.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    binding = fused_moe.bind(plan, scratch=scratch, a=x, experts=experts,
-                             topk_weights=tw, topk_ids=ti)
-    out     = fused_moe.run(binding=binding)
+    binding = fused_moe.bind(
+        execution,
+        scratch=scratch,
+        a=x,
+        experts=experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    output = fused_moe.run(binding=binding)
+
+``quant_modes`` planning, flat tensor preparation, ``Caps``/``plan``, and the
+lightweight ``plan_execution`` call remain available as the compatibility
+contract consumed by official vLLM releases.
 """
 
 from __future__ import annotations
@@ -47,35 +59,55 @@ META = OpMeta(
     group="moe",
     api_style="planned",
     entry_points=(
+        "ActivationMode",
+        "ActivationSpec",
+        "Binding",
         "Caps",
-        "PackedConfig",
+        "ExecutionCapacity",
+        "ExecutionPlan",
+        "ExecutionVariant",
+        "ExpertWeights",
+        "MoEGeometry",
+        "PackedSource",
+        "PackedSourceFormat",
         "PackedWeights",
         "Plan",
-        "Binding",
-        "SparseBinding",
+        "PreparedExperts",
+        "PreparedWeightFormat",
         "RouteBinding",
-        "ExpertWeights",
         "Routing",
+        "RoutingSpec",
+        "ScaleEncoding",
         "ScaleFactors",
+        "ScratchRequirement",
+        "SparseBinding",
         "TrellisConfig",
         "TrellisWeights",
+        "W13Layout",
+        "WeightEncoding",
+        "WeightPacking",
+        "WeightPlan",
+        "WeightPlanConstraints",
+        "WeightSource",
         "WeightsPlan",
-        "plan",
-        "required_nbytes",
-        "plan_weights",
-        "prepare_weights",
-        "prepare_fc2_weights",
-        "prewarm_fc2",
         "bind",
-        "bind_sparse",
         "bind_route",
+        "bind_sparse",
+        "clear_caches",
+        "is_supported",
+        "plan",
+        "plan_execution",
+        "plan_weights",
+        "prepare_fc2_weights",
+        "prepare_weights",
+        "prewarm",
+        "prewarm_fc2",
+        "required_nbytes",
+        "route",
+        "route_topk",
         "run",
         "run_fc2",
         "run_sparse",
-        "route",
-        "route_topk",
-        "is_supported",
-        "clear_caches",
     ),
     dtypes=("bf16", "fp16"),
     recipes=(
@@ -98,18 +130,36 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        ActivationMode,
+        ActivationSpec,
         Binding,
         Caps,
+        ExecutionCapacity,
+        ExecutionPlan,
+        ExecutionVariant,
         ExpertWeights,
-        PackedConfig,
+        MoEGeometry,
+        PackedSource,
+        PackedSourceFormat,
         PackedWeights,
         Plan,
+        PreparedExperts,
+        PreparedWeightFormat,
         RouteBinding,
         Routing,
+        RoutingSpec,
+        ScaleEncoding,
         ScaleFactors,
+        ScratchRequirement,
         SparseBinding,
         TrellisConfig,
         TrellisWeights,
+        W13Layout,
+        WeightEncoding,
+        WeightPacking,
+        WeightPlan,
+        WeightPlanConstraints,
+        WeightSource,
         WeightsPlan,
         bind,
         bind_route,
@@ -117,11 +167,13 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         clear_caches,
         is_supported,
         plan,
-        required_nbytes,
+        plan_execution,
         plan_weights,
-        prepare_weights,
         prepare_fc2_weights,
+        prepare_weights,
+        prewarm,
         prewarm_fc2,
+        required_nbytes,
         route,
         route_topk,
         run,

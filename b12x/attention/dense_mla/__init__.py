@@ -56,7 +56,7 @@ META = OpMeta(
         paths=(
             "b12x/attention/paged/",
             "b12x/attention/_shared/mla/",
-            "b12x/attention/nsa_indexer/",
+            "b12x/attention/dsa_indexer/",
         ),
     ),
     test_path="tests/attention/test_dense_mla.py",

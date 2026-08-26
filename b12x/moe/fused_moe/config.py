@@ -27,41 +27,6 @@ class ScaleGranularity(str, Enum):
     PER_EXPERT = "per_expert"
 
 
-_PACKED_SOURCE_FORMATS = frozenset(
-    {
-        "modelopt_nvfp4",
-        "fp4_e8m0_k32",
-        "compressed_tensors",
-        "mxfp6_e2m3",
-    }
-)
-
-
-@dataclass(frozen=True)
-class PackedConfig:
-    """Checkpoint encoding metadata for ordinary packed MoE weights.
-
-    This deliberately describes storage, not a runtime quantization recipe.
-    The planner selects its private execution recipe from the encoding and
-    target device.
-    """
-
-    source_format: str
-    w13_layout: str = "w13"
-
-    def __post_init__(self) -> None:
-        source_format = str(self.source_format).lower()
-        if source_format not in _PACKED_SOURCE_FORMATS:
-            raise ValueError(
-                f"unsupported packed MoE source format {source_format!r}"
-            )
-        w13_layout = str(self.w13_layout).lower()
-        if w13_layout not in {"w13", "w31"}:
-            raise ValueError("PackedConfig.w13_layout must be 'w13' or 'w31'")
-        object.__setattr__(self, "source_format", source_format)
-        object.__setattr__(self, "w13_layout", w13_layout)
-
-
 def _object(
     value: object,
     *,
@@ -432,7 +397,6 @@ class TrellisConfig:
 
 
 __all__ = [
-    "PackedConfig",
     "RateGranularity",
     "ScaleGranularity",
     "TrellisCodebook",

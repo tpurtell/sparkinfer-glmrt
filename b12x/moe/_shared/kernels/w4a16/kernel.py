@@ -191,6 +191,7 @@ _MAX_DIRECT_TOPK_ROUTE_M = 6
 _W4A16_SMALL_M_DIRECT_MAX_M = 8
 _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
 _TC_DECODE_PACK_COLLIDING_PAIRS = 3
+_TC_DECODE_PACK_SM_COVERAGE_CAP = 64
 _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR = 7
 _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR = 8
 
@@ -202,15 +203,10 @@ def _trellis256_execution_lut(
         return sqg_fp16_d3l_descriptors(device)
     return sqg_xor_cheb_t12_lut(device)
 
-# TC-decode: a small-M decode specialization that runs on the PACKED W4A16
-# object (the same weights/scales the prefill GEMM uses). It reuses the packed
-# tensor-core MMA inner loop but folds the top-k sum into the FC2 store
-# epilogue (dropping the separate top-k-sum launch). It never regresses vs the
-# packed GEMM within its supported M range, so it is ALWAYS used for the small-M
-# direct-topk decode sizes — there is no opt-in/opt-out switch.
-# TC-decode is available for the whole small-M direct-topk range. Its only hard
-# ceiling is the direct-topk route cap (above it, expert route-packing wins).
-# _TC_DECODE_M is retained for callers/tests that enumerate the supported sizes.
+# TC-decode runs on the packed W4A16 object and folds the top-k sum into the FC2
+# store epilogue. It is available across the small-M direct-topk range; the
+# planner switches to expert-packed routing when route reuse amortizes packing.
+# _TC_DECODE_M is retained for callers and tests that enumerate the range.
 _TC_DECODE_MAX_M = _W4A16_SMALL_M_DIRECT_MAX_M
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
 
@@ -227,8 +223,9 @@ def _w4a16_tc_decode_preferred(
     With ``r`` uniformly distributed routes over ``E`` experts, the birthday
     approximation predicts ``r * (r - 1) / (2 * E)`` colliding route pairs.
     Route packing starts to amortize its histogram/sort and separate top-k sum
-    once it can cover most of the machine and predicts several reusable expert
-    rows.
+    once it predicts several reusable expert rows and enough routed rows to
+    cover the machine. The coverage proxy saturates because every routed row
+    fans out into multiple FC tiles.
     """
 
     m = int(m)
@@ -238,9 +235,10 @@ def _w4a16_tc_decode_preferred(
     if m < 1 or m > _TC_DECODE_MAX_M:
         return False
     routed_rows = m * topk
+    coverage_sms = min(sms, _TC_DECODE_PACK_SM_COVERAGE_CAP)
     pack_has_reuse = (
         routed_rows * _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR
-        >= sms * _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR
+        >= coverage_sms * _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR
         and routed_rows * (routed_rows - 1)
         >= 2 * _TC_DECODE_PACK_COLLIDING_PAIRS * num_experts
     )

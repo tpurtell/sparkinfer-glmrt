@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.reference import (
     pack_index_k_cache_reference,
     contiguous_logits_reference,
     paged_decode_logits_reference,
@@ -183,7 +183,7 @@ def _scalar_contiguous_logits_oracle(
 
 
 @torch.inference_mode()
-def test_pack_nsa_index_k_cache_roundtrip_matches_input_for_odd_lengths() -> None:
+def test_pack_dsa_index_k_cache_roundtrip_matches_input_for_odd_lengths() -> None:
     device = torch.device("cpu")
     for num_tokens in (63, 64, 65, 127, 128, 129):
         gen = torch.Generator(device="cpu")

@@ -8,11 +8,11 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x.attention.nsa_indexer._impl import (
+from b12x.attention.dsa_indexer._impl import (
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
 )
-from b12x.attention.nsa_indexer.msa_reference import (
+from b12x.attention.dsa_indexer.msa_reference import (
     MSA_BLOCK_TOKENS,
 )
 from b12x._lib.scratch_layout import (
@@ -95,7 +95,7 @@ class B12XIndexerScratchCaps:
     paged_logits_k_rows: int = 0
     route: str = INDEXER_PAGED_ROUTE_AUTO
     prefill_block_k: int = _INDEXER_CONTIGUOUS_PREFILL_BLOCK_K
-    score_mode: str = "nsa"
+    score_mode: str = "dsa"
     num_idx_heads: int = 1
 
     def __post_init__(self) -> None:
@@ -127,9 +127,9 @@ class B12XIndexerScratchCaps:
             )
         object.__setattr__(self, "route", route)
         score_mode = str(self.score_mode).lower()
-        if score_mode not in ("nsa", "msa"):
+        if score_mode not in ("dsa", "msa"):
             raise ValueError(
-                f"indexer scratch score_mode must be nsa or msa, got {score_mode!r}"
+                f"indexer scratch score_mode must be dsa or msa, got {score_mode!r}"
             )
         object.__setattr__(self, "score_mode", score_mode)
 
@@ -202,7 +202,7 @@ class B12XIndexerPagedScratchCaps:
     mode: str = "decode"
     shared_page_table: bool = False
     route: str = INDEXER_PAGED_ROUTE_AUTO
-    score_mode: str = "nsa"
+    score_mode: str = "dsa"
     num_idx_heads: int = 1
 
     def __post_init__(self) -> None:
@@ -249,9 +249,9 @@ class B12XIndexerPagedScratchCaps:
         object.__setattr__(self, "shared_page_table", bool(self.shared_page_table))
         object.__setattr__(self, "route", route)
         score_mode = str(self.score_mode).lower()
-        if score_mode not in ("nsa", "msa"):
+        if score_mode not in ("dsa", "msa"):
             raise ValueError(
-                f"indexer paged scratch score_mode must be nsa or msa, got {score_mode!r}"
+                f"indexer paged scratch score_mode must be dsa or msa, got {score_mode!r}"
             )
         object.__setattr__(self, "score_mode", score_mode)
 
@@ -266,7 +266,7 @@ class B12XIndexerContiguousScratchCaps:
     k_dtype: torch.dtype = torch.float8_e4m3fn
     supertile_k: int = 32768
     prefill_block_k: int = _INDEXER_CONTIGUOUS_PREFILL_BLOCK_K
-    score_mode: str = "nsa"
+    score_mode: str = "dsa"
     num_idx_heads: int = 1
 
     def __post_init__(self) -> None:
@@ -298,9 +298,10 @@ class B12XIndexerContiguousScratchCaps:
         object.__setattr__(self, "supertile_k", supertile_k)
         object.__setattr__(self, "prefill_block_k", prefill_block_k)
         score_mode = str(self.score_mode).lower()
-        if score_mode not in ("nsa", "msa"):
+        if score_mode not in ("dsa", "msa"):
             raise ValueError(
-                f"indexer contiguous scratch score_mode must be nsa or msa, got {score_mode!r}"
+                "indexer contiguous scratch score_mode must be dsa or msa, "
+                f"got {score_mode!r}"
             )
         object.__setattr__(self, "score_mode", score_mode)
 
@@ -813,6 +814,26 @@ def _default_indexer_paged_supertile_tokens(
     return base
 
 
+def resolve_paged_prefill_k_rows(
+    *,
+    max_page_table_width: int,
+    page_size: int = 64,
+    supertile_k: int = 0,
+) -> int:
+    """Resolve the K-row window streamed by paged prefill."""
+    page_size = max(int(page_size), 1)
+    tokens = _resolve_indexer_paged_supertile_tokens(
+        int(supertile_k),
+        capacity_tokens=max(int(max_page_table_width), 1) * page_size,
+    )
+    if tokens % page_size != 0:
+        raise ValueError(
+            "paged indexer prefill K rows must be divisible by page_size, "
+            f"got k_rows={tokens}, page_size={page_size}"
+        )
+    return tokens
+
+
 def _resolve_indexer_paged_route(
     caps: B12XIndexerPagedScratchCaps,
     *,
@@ -831,10 +852,10 @@ def _resolve_indexer_paged_route(
         else:
             route = INDEXER_PAGED_ROUTE_TILED
             if os.getenv("B12X_FUSED_INDEXER", "1") != "0":
-                from b12x.attention.nsa_indexer.fused_indexer import (
+                from b12x.attention.dsa_indexer.fused_indexer import (
                     resolve_fused_indexer_path,
                 )
-                from b12x.attention.nsa_indexer.kernel import (
+                from b12x.attention.dsa_indexer.kernel import (
                     _num_q_head_tiles,
                 )
 
@@ -848,7 +869,7 @@ def _resolve_indexer_paged_route(
                 ) and _num_q_head_tiles(int(caps.num_q_heads)) in (1, 2, 4):
                     route = INDEXER_PAGED_ROUTE_FUSED
     if route == INDEXER_PAGED_ROUTE_PACKED_CONTIGUOUS:
-        from b12x.attention.nsa_indexer.contiguous_kernel import (
+        from b12x.attention.dsa_indexer.contiguous_kernel import (
             resolve_contiguous_prefill_block_k,
         )
 
@@ -868,10 +889,10 @@ def _resolve_indexer_paged_route(
     elif route == INDEXER_PAGED_ROUTE_FUSED:
         if bool(caps.shared_page_table) or str(caps.mode) == "prefill":
             raise ValueError("fused paged indexer route is decode-only")
-        from b12x.attention.nsa_indexer.fused_indexer import (
+        from b12x.attention.dsa_indexer.fused_indexer import (
             resolve_fused_indexer_path,
         )
-        from b12x.attention.nsa_indexer.kernel import (
+        from b12x.attention.dsa_indexer.kernel import (
             _num_q_head_tiles,
         )
 
@@ -940,7 +961,7 @@ def _indexer_paged_scratch_layout(
     fused_pack_elements = 0
     fused_state_words = 0
     if route == INDEXER_PAGED_ROUTE_FUSED:
-        from b12x.attention.nsa_indexer.fused_indexer import (
+        from b12x.attention.dsa_indexer.fused_indexer import (
             fused_indexer_scratch_capacity,
         )
 
@@ -1614,7 +1635,7 @@ def _materialize_indexer_contiguous_scratch(
     )
     k_quant_bytes = k_quant.view(torch.uint8)
     if k_quant.device.type == "cuda":
-        from b12x.attention.nsa_indexer.contiguous_kernel import (
+        from b12x.attention.dsa_indexer.contiguous_kernel import (
             _encode_contiguous_k_tma_descriptor_into,
         )
 
@@ -2420,4 +2441,5 @@ __all__ = [
     "plan_indexer_scratch",
     "plan_indexer_paged_scratch",
     "plan_indexer_contiguous_scratch",
+    "resolve_paged_prefill_k_rows",
 ]

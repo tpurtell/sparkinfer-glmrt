@@ -70,12 +70,7 @@ def _weight_plan(
         trellis_tile_config=tile_config,
         coupled_hadamard=coupled_hadamard,
     )
-    return replace(
-        plan,
-        checkpoint_config=fused_moe.PackedConfig(
-            source_format="fp4_e8m0_k32"
-        ),
-    )
+    return plan
 
 
 def _caps(**overrides) -> fused_moe.Caps:
@@ -98,8 +93,8 @@ def _caps(**overrides) -> fused_moe.Caps:
         input_dtype=values.pop("input_dtype"),
     )
     return fused_moe.Caps(
-        config=weight_plan.checkpoint_config,
         weight_plan=weight_plan,
+        quant_mode="w4a16",
         **values,
     )
 
@@ -276,12 +271,12 @@ def _plan(
 ) -> fused_moe.Plan:
     return fused_moe.plan(
         fused_moe.Caps(
-            config=weights.plan.checkpoint_config,
             max_tokens=max_tokens,
             num_topk=num_topk,
             route_num_experts=route_num_experts,
             device=device,
             weight_plan=weights.plan,
+            quant_mode="w4a16",
             w4a16_block_size_m=block_size_m,
         )
     )

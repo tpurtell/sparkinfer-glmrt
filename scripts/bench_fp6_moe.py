@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Microbenchmark: b12x W6A8 MX-FP6 fused MoE vs a BF16 grouped-MoE baseline.
 
-Drives the upstream ``b12x.moe.fused_moe`` plan/bind/run flow with a
-``PackedConfig(source_format="mxfp6_e2m3")`` across token counts,
+Drives the ``b12x.moe.fused_moe`` plan/bind/run flow with an
+``MXFP6_E8M0_K32`` source across token counts,
 and compares against a straightforward BF16 grouped MoE (the same gated-SiLU
 math in full precision).  This is the Step 5 acceptance gate for the FP6 MoE
 port: each token count prints a correctness line (max_abs / rmse / cosine vs
@@ -91,17 +91,22 @@ def main() -> None:
     w1_grid = unswizzled_ue8m0_grid(w1_bf)
     w2_grid = unswizzled_ue8m0_grid(w2_bf)
 
-    config = fused_moe.PackedConfig(
-        source_format="mxfp6_e2m3",
-        w13_layout="w13",
+    source = fused_moe.PackedSource(
+        format=fused_moe.PackedSourceFormat.MXFP6_E8M0_K32,
+        w13_layout=fused_moe.W13Layout.W13,
     )
     weight_plan = fused_moe.plan_weights(
-        config=config,
-        activation="silu",
-        dtype=torch.bfloat16,
-        num_experts=e,
-        hidden_size=k,
-        intermediate_size=n,
+        source=source,
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A8,
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=e,
+            hidden_size=k,
+            intermediate_size=n,
+        ),
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
@@ -129,17 +134,16 @@ def main() -> None:
         ).to(torch.float32)
 
         fused_moe.clear_caches()
-        plan = fused_moe.plan(
-            fused_moe.Caps(
+        plan = fused_moe.plan_execution(
+            experts=prepared,
+            capacity=fused_moe.ExecutionCapacity(
                 max_tokens=m,
-                num_topk=tk,
-                device=device,
-                config=config,
-                weight_plan=weight_plan,
-                core_token_counts=(m,),
+                top_k=tk,
+                warmup_token_counts=(m,),
                 route_num_experts=0,
-            )
+            ),
         )
+        fused_moe.prewarm(plan)
         scratch = tuple(
             torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[i].device)
             for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())

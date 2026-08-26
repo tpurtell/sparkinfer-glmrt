@@ -46,7 +46,7 @@ from b12x._lib.scratch import (
 from b12x._lib.utils import current_cuda_stream
 
 # Kept in lock-step with the source kernels we fuse.
-from b12x.attention.nsa_indexer.persistent_topk import (
+from b12x.attention.dsa_indexer.persistent_topk import (
     _RADIX,
     _RADIX_THRESHOLD,
     _STATE_ARRIVAL_COUNTER,
@@ -56,7 +56,7 @@ from b12x.attention.nsa_indexer.persistent_topk import (
     _group_barrier,
     _state_offset,
 )
-from b12x.attention.nsa_indexer.tiled_topk import (
+from b12x.attention.dsa_indexer.tiled_topk import (
     _SCAN_UNROLL,
     _SMEM_CANDS,
     _SUPPORTED_TOPK,
@@ -70,7 +70,7 @@ from b12x.attention.nsa_indexer.tiled_topk import (
     _smem_xadd,
 )
 from b12x._lib.intrinsics import ld_shared_f32
-from b12x.attention.nsa_indexer.kernel import (
+from b12x.attention.dsa_indexer.kernel import (
     _stream_issue_k_page_cp_async,
     _INDEX_HEAD_DIM,
     _PAGE_SIZE,
@@ -107,9 +107,12 @@ from b12x._lib.intrinsics import (
 # Triage kill-switch: B12X_INDEXER_DIRECT_K=0 forces every variant back to
 # the staged pipeline (which also restores the v2 cache keys), so serving can
 # A/B the direct-L2 score in place without a checkout change.
-_DIRECT_K_SCORE_ENABLED = os.environ.get(
-    "B12X_INDEXER_DIRECT_K", "1"
-).lower() not in {"0", "false", "no", ""}
+_DIRECT_K_SCORE_ENABLED = os.environ.get("B12X_INDEXER_DIRECT_K", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "",
+}
 
 _THREADS_PER_CTA = 1024
 # Per-CTA K-slice cap (cooperative split granularity). Matches persistent_topk's
@@ -1096,7 +1099,7 @@ def _fused_radix_select(
         i += Int32(_RADIX_THREADS)
 
 
-class SparseNSAFusedIndexerKernel:
+class DSAFusedIndexerKernel:
     """paged fused score+top-k, v1: single-CTA-per-row, scalar K-load, 1024 threads.
 
     Score phase: warps 0-3 (tx < _PAGED_THREADS_PER_CTA) reuse the paged scorer's
@@ -1549,13 +1552,10 @@ class SparseNSAFusedIndexerKernel:
                                     tsel = t1
                                 scale_addr = get_ptr_as_int64(
                                     k_scales,
-                                    Int64(pid)
-                                    * Int64(self.k_scales_row_stride)
+                                    Int64(pid) * Int64(self.k_scales_row_stride)
                                     + Int64(tip0 + col),
                                 )
-                                val = Float32(
-                                    tsel * ld_global_nc_f32(scale_addr)
-                                )
+                                val = Float32(tsel * ld_global_nc_f32(scale_addr))
                                 if cutlass.const_expr(self.paged_output):
                                     gidx = pid * Int32(_PAGE_SIZE) + tip0 + col
                                 else:
@@ -2389,7 +2389,7 @@ def _build_fused_indexer_kernel(
     vectorized_q_load: bool = False,
     q_row_stride_bytes: int = 0,
 ):
-    return SparseNSAFusedIndexerKernel(
+    return DSAFusedIndexerKernel(
         num_heads_static=num_heads_static,
         topk=topk,
         kv_layout=kv_layout,

@@ -1,6 +1,6 @@
 """Regression test: paged prefill indexer top-k must stay correct on low-contrast rows.
 
-The tiled radix-select top-k (``SparseNSATiledTopkKernel``, reached via ``index_topk_fp8``
+The tiled radix-select top-k (``DSATiledTopkKernel``, reached via ``index_topk_fp8``
 / ``packed_contiguous``) buckets candidates by the top bits of the score and stores the
 threshold bucket in a fixed shared buffer (``_SMEM_CANDS``). When a single bucket
 holds more candidates than that buffer -- e.g. many tokens with near-equal scores, as
@@ -27,8 +27,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention.nsa_indexer._impl import clear_indexer_caches
-from b12x.attention.nsa_indexer.paged import (
+from b12x.attention.dsa_indexer._impl import clear_indexer_caches
+from b12x.attention.dsa_indexer.paged import (
     index_topk_fp8,
     pack_paged_index_k_cache_reference,
     prepare_paged_indexer_metadata,

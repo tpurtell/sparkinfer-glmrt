@@ -18,8 +18,10 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x.attention._shared.workspace import default_sparse_mla_split_decode_config_for_width
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention._shared.workspace import (
+    default_sparse_mla_split_decode_config_for_width,
+)
+from b12x.attention.dsa_indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
@@ -28,22 +30,49 @@ from b12x.attention._shared.mla.reference import (
     dense_mla_reference,
     pack_mla_kv_cache_reference,
 )
-from b12x.attention._shared.mla.api import MLASparseDecodeMetadata, MLASparseExtendMetadata, clear_mla_caches, sparse_mla_decode_forward, sparse_mla_extend_forward
-from b12x.attention.sparse_mla._scratch import B12XSparseMLAScratchCaps, plan_sparse_mla_scratch
-from b12x.attention.nsa_indexer.contiguous_kernel import (
+from b12x.attention._shared.mla.api import (
+    MLASparseDecodeMetadata,
+    MLASparseExtendMetadata,
+    clear_mla_caches,
+    sparse_mla_decode_forward,
+    sparse_mla_extend_forward,
+)
+from b12x.attention.sparse_mla._scratch import (
+    B12XSparseMLAScratchCaps,
+    plan_sparse_mla_scratch,
+)
+from b12x.attention.dsa_indexer.contiguous_kernel import (
     _PREFILL512_BLOCK_K,
     _PREFILL512_BLOCK_Q,
     _PREFILL_BLOCK_Q,
 )
-from b12x.attention.nsa_indexer.tiled_topk import run_tiled_supertile_topk
-from b12x.attention.nsa_indexer.persistent_topk import (
+from b12x.attention.dsa_indexer.tiled_topk import run_tiled_supertile_topk
+from b12x.attention.dsa_indexer.persistent_topk import (
     run_persistent_topk2048,
     supports_persistent_topk2048,
 )
-from b12x.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, contiguous_tiled_topk, paged_decode_logits, uses_paged_mqa_schedule
-from b12x.attention.nsa_indexer.contiguous_kernel import resolve_contiguous_prefill_block_k
-from b12x.attention.nsa_indexer.paged import index_topk_fp8, prepare_paged_indexer_metadata
-from b12x.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_PAGED, B12XIndexerScratchCaps, plan_indexer_scratch
+from b12x.attention.dsa_indexer._impl import (
+    IndexerContiguousMetadata,
+    IndexerPagedDecodeMetadata,
+    build_paged_mqa_schedule_metadata,
+    clear_indexer_caches,
+    contiguous_logits,
+    contiguous_tiled_topk,
+    paged_decode_logits,
+    uses_paged_mqa_schedule,
+)
+from b12x.attention.dsa_indexer.contiguous_kernel import (
+    resolve_contiguous_prefill_block_k,
+)
+from b12x.attention.dsa_indexer.paged import (
+    index_topk_fp8,
+    prepare_paged_indexer_metadata,
+)
+from b12x.attention.dsa_indexer.scratch import (
+    INDEXER_SOURCE_LAYOUT_PAGED,
+    B12XIndexerScratchCaps,
+    plan_indexer_scratch,
+)
 
 from benchmarks.common import (
     bench_cuda_graph,
@@ -83,8 +112,8 @@ MLA_MAX_ABS_TOL = 0.10
 MLA_RMSE_TOL = 0.005
 MLA_COS_TOL = 0.9995
 _RAGGED_TOPK_CHUNK = 4096
-_NSA_PREFILL_BLOCK_K_ENV = "B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
-_NSA_DECODE_TOPK_BACKEND_ENV = "B12X_NSA_DECODE_TOPK_BACKEND"
+_DSA_PREFILL_BLOCK_K_ENV = "B12X_DSA_CONTIGUOUS_PREFILL_BLOCK_K"
+_DSA_DECODE_TOPK_BACKEND_ENV = "B12X_DSA_DECODE_TOPK_BACKEND"
 
 
 def _align_up(value: int, multiple: int) -> int:
@@ -190,9 +219,7 @@ def _make_vllm_packed_cache_views(
         stride=(block_stride_bytes, mla_record_bytes, 1),
     )
     strided_index.copy_(index_k_cache)
-    strided_mla.copy_(
-        mla_kv_cache.view(num_pages, int(page_size), mla_record_bytes)
-    )
+    strided_mla.copy_(mla_kv_cache.view(num_pages, int(page_size), mla_record_bytes))
     return strided_index, strided_mla
 
 
@@ -265,7 +292,9 @@ class DecodeCase:
                 f"{len(self.row_cache_lens)} vs {self.batch_size}"
             )
         if any(cache_len <= 0 for cache_len in self.row_cache_lens):
-            raise ValueError(f"row_cache_lens must be positive, got {self.row_cache_lens}")
+            raise ValueError(
+                f"row_cache_lens must be positive, got {self.row_cache_lens}"
+            )
         if max(self.row_cache_lens) != self.cache_len:
             raise ValueError(
                 f"row_cache_lens max must equal cache_len {self.cache_len}, got {self.row_cache_lens}"
@@ -325,8 +354,10 @@ class CaseReport:
 
     @property
     def total_us(self) -> float:
-        if self.metadata_us == 0.0 and self.replay_us == 0.0 and (
-            self.indexer_us > 0.0 or self.mla_us > 0.0
+        if (
+            self.metadata_us == 0.0
+            and self.replay_us == 0.0
+            and (self.indexer_us > 0.0 or self.mla_us > 0.0)
         ):
             return self.indexer_us + self.mla_us
         return self.metadata_us + self.replay_us
@@ -342,7 +373,9 @@ class CaseReport:
 
 class BenchmarkFailure(RuntimeError):
     def __init__(self, case: DecodeCase, message: str):
-        super().__init__(f"bs={case.batch_size} ctx={case.cache_len} topk={case.topk}: {message}")
+        super().__init__(
+            f"bs={case.batch_size} ctx={case.cache_len} topk={case.topk}: {message}"
+        )
         self.case = case
 
 
@@ -362,7 +395,9 @@ def _resolve_cached_hf_config(
     if isinstance(cached_config, str):
         return pathlib.Path(cached_config)
 
-    cache_desc = "the configured Hugging Face cache" if cache_root is None else str(cache_root)
+    cache_desc = (
+        "the configured Hugging Face cache" if cache_root is None else str(cache_root)
+    )
     raise SystemExit(
         f"cached Hugging Face config not found for {repo_id!r} in {cache_desc}; "
         "populate the cache or pass --model-config /path/to/config.json"
@@ -509,7 +544,9 @@ def _build_decode_cases(
     allowed_modes = {"decode", "prefill", "verify"}
     for mode in modes:
         if mode not in allowed_modes:
-            raise ValueError(f"unsupported mode {mode!r}, expected one of {sorted(allowed_modes)}")
+            raise ValueError(
+                f"unsupported mode {mode!r}, expected one of {sorted(allowed_modes)}"
+            )
     for batch_size in batch_sizes:
         if batch_size <= 0:
             raise ValueError(f"batch sizes must be positive, got {batch_size}")
@@ -614,7 +651,9 @@ def _assert_decode_contract_match(
     del page_table_1, seqlens, topk
     sort_pad = torch.iinfo(actual.dtype).max
     actual_canon = torch.sort(torch.where(actual >= 0, actual, sort_pad), dim=1).values
-    expected_canon = torch.sort(torch.where(expected >= 0, expected, sort_pad), dim=1).values
+    expected_canon = torch.sort(
+        torch.where(expected >= 0, expected, sort_pad), dim=1
+    ).values
     if not torch.equal(actual_canon, expected_canon):
         mismatch = int((actual_canon != expected_canon).sum().item())
         raise BenchmarkFailure(case, f"topk mismatch: {mismatch} differing entries")
@@ -671,14 +710,18 @@ def _select_paged_topk_from_logits(
                 raise
 
     if backend == "sgl":
-        raise RuntimeError("SGL fused topk backend is unavailable for this decode topk call")
+        raise RuntimeError(
+            "SGL fused topk backend is unavailable for this decode topk call"
+        )
 
     rows = logits.shape[0]
     output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
     gather_k = min(topk, logits.shape[1], page_table_1.shape[1])
     if gather_k == 0:
         return output
-    topk_values, topk_pos = torch.topk(logits, k=gather_k, dim=1, largest=True, sorted=False)
+    topk_values, topk_pos = torch.topk(
+        logits, k=gather_k, dim=1, largest=True, sorted=False
+    )
     if query_row_to_batch is None:
         gathered = torch.gather(page_table_1, 1, topk_pos.to(torch.long))
     else:
@@ -712,7 +755,9 @@ def _rank_topk_candidates(
     pos_order = torch.argsort(positions, dim=1, descending=False, stable=True)
     positions = torch.gather(positions, 1, pos_order)
     values = torch.gather(values, 1, pos_order)
-    value_order = torch.argsort(values, dim=1, descending=True, stable=True)[:, :gather_k]
+    value_order = torch.argsort(values, dim=1, descending=True, stable=True)[
+        :, :gather_k
+    ]
     return (
         torch.gather(values, 1, value_order),
         torch.gather(positions, 1, value_order),
@@ -755,7 +800,9 @@ def _select_ragged_topk_from_logits_chunked(
             device=logits.device,
         ).unsqueeze(0)
         valid = (positions >= row_start) & (positions < row_end)
-        masked_logits = torch.where(valid, chunk_logits, torch.full_like(chunk_logits, float("-inf")))
+        masked_logits = torch.where(
+            valid, chunk_logits, torch.full_like(chunk_logits, float("-inf"))
+        )
         chunk_values, chunk_pos = torch.topk(
             masked_logits,
             k=local_k,
@@ -792,7 +839,11 @@ def _select_ragged_topk_from_logits(
     lengths: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    if _sgl_fast_topk_transform_ragged_fused is not None and logits.is_cuda and topk == 2048:
+    if (
+        _sgl_fast_topk_transform_ragged_fused is not None
+        and logits.is_cuda
+        and topk == 2048
+    ):
         try:
             return _sgl_fast_topk_transform_ragged_fused(
                 score=logits,
@@ -858,7 +909,9 @@ def _make_decode_graph_prepare(
         graph_nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens_int32)
         if graph_paged_mqa_schedule_metadata is not None:
             if schedule_block_kv is None:
-                raise ValueError("schedule_block_kv must be provided when graph schedule metadata is set")
+                raise ValueError(
+                    "schedule_block_kv must be provided when graph schedule metadata is set"
+                )
             build_paged_mqa_schedule_metadata(
                 graph_cache_seqlens_int32,
                 schedule_block_kv,
@@ -944,8 +997,12 @@ def _make_mla_inputs(
         .div_(4.0)
         .to(torch.bfloat16)
     )
-    k_nope_pool = scatter_rows_into_pool(k_nope, pool_locs=pool_locs, pool_tokens=pool_tokens)
-    k_rope_pool = scatter_rows_into_pool(k_rope, pool_locs=pool_locs, pool_tokens=pool_tokens)
+    k_nope_pool = scatter_rows_into_pool(
+        k_nope, pool_locs=pool_locs, pool_tokens=pool_tokens
+    )
+    k_rope_pool = scatter_rows_into_pool(
+        k_rope, pool_locs=pool_locs, pool_tokens=pool_tokens
+    )
     kv_cache = pack_mla_kv_cache_reference(k_nope_pool, k_rope_pool)
     return q_all, k_nope_pool, k_rope_pool, kv_cache
 
@@ -1161,8 +1218,12 @@ def _make_extend_kv_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     data_bytes = page_size * 128
     total_rows = int(seq_lens.sum().item())
-    k_bytes = torch.empty((total_rows, 128), dtype=torch.uint8, device=index_k_cache.device)
-    scale_bytes = torch.empty((total_rows, 4), dtype=torch.uint8, device=index_k_cache.device)
+    k_bytes = torch.empty(
+        (total_rows, 128), dtype=torch.uint8, device=index_k_cache.device
+    )
+    scale_bytes = torch.empty(
+        (total_rows, 4), dtype=torch.uint8, device=index_k_cache.device
+    )
     write_row = 0
     for batch_row in range(real_page_table.shape[0]):
         seq_len = int(seq_lens[batch_row].item())
@@ -1176,7 +1237,9 @@ def _make_extend_kv_fp8(
                 data_bytes + slot * 4 : data_bytes + (slot + 1) * 4,
             ]
             write_row += 1
-    return k_bytes.view(torch.float8_e4m3fn), scale_bytes.view(torch.float32).squeeze(-1)
+    return k_bytes.view(torch.float8_e4m3fn), scale_bytes.view(torch.float32).squeeze(
+        -1
+    )
 
 
 def _run_decode_case(
@@ -1197,9 +1260,13 @@ def _run_decode_case(
 ) -> CaseReport:
     if pool_factor <= 0:
         raise ValueError(f"pool_factor must be positive, got {pool_factor}")
-    graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
+    graph_width = _resolve_graph_width(
+        cache_len=case.cache_len, graph_width=graph_width
+    )
     aligned_graph_width = _align_up(graph_width, cfg.page_size)
-    pool_tokens = _align_up(max(case.cache_len, case.cache_len * pool_factor), cfg.page_size)
+    pool_tokens = _align_up(
+        max(case.cache_len, case.cache_len * pool_factor), cfg.page_size
+    )
     pool_locs = make_sparse_pool_locs(
         active_tokens=case.cache_len,
         pool_tokens=pool_tokens,
@@ -1267,7 +1334,11 @@ def _run_decode_case(
     graph_cache_seqlens = torch.empty_like(full_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
     graph_active_width_override = None
-    if case.batch_size == 1 and case.q_len == 1 and case.cache_len == aligned_graph_width:
+    if (
+        case.batch_size == 1
+        and case.q_len == 1
+        and case.cache_len == aligned_graph_width
+    ):
         graph_active_width_override = torch.tensor(
             [aligned_graph_width],
             dtype=torch.int32,
@@ -1348,7 +1419,9 @@ def _run_decode_case(
         weights=weights,
         index_k_cache=index_k_cache,
         real_page_table=graph_real_page_table,
-        query_row_to_batch=torch.arange(case.batch_size, dtype=torch.int32, device=device),
+        query_row_to_batch=torch.arange(
+            case.batch_size, dtype=torch.int32, device=device
+        ),
         seqlens_per_query=graph_cache_seqlens,
         page_size=cfg.page_size,
     )
@@ -1537,9 +1610,7 @@ def _run_decode_case(
             replays=replays,
             l2_flush=l2_flush,
         )
-        flashinfer_mla_us = statistics.median(
-            flashinfer_mla_stats["replay_us"]
-        )
+        flashinfer_mla_us = statistics.median(flashinfer_mla_stats["replay_us"])
 
     clear_indexer_caches()
     clear_mla_caches()
@@ -1610,9 +1681,13 @@ def _run_prefill_or_verify_case(
     use_paged_prefill = case.mode == "prefill" and prefill_indexer_layout == "paged"
     if use_paged_prefill and case.batch_size != 1:
         raise ValueError("paged prefill indexer benchmark requires batch_size=1")
-    graph_width = _resolve_graph_width(cache_len=case.cache_len, graph_width=graph_width)
+    graph_width = _resolve_graph_width(
+        cache_len=case.cache_len, graph_width=graph_width
+    )
     aligned_graph_width = _align_up(graph_width, cfg.page_size)
-    pool_tokens = _align_up(max(case.cache_len, case.cache_len * pool_factor), cfg.page_size)
+    pool_tokens = _align_up(
+        max(case.cache_len, case.cache_len * pool_factor), cfg.page_size
+    )
     pool_locs = make_sparse_pool_locs(
         active_tokens=case.cache_len,
         pool_tokens=pool_tokens,
@@ -1670,7 +1745,9 @@ def _run_prefill_or_verify_case(
         dtype=torch.int32,
         device=device,
     )
-    expanded_cache_seqlens = torch.repeat_interleave(batch_cache_seqlens, repeats=case.q_len)
+    expanded_cache_seqlens = torch.repeat_interleave(
+        batch_cache_seqlens, repeats=case.q_len
+    )
     nsa_cache_seqlens = torch.full(
         (case.total_q,),
         case.topk,
@@ -1710,12 +1787,9 @@ def _run_prefill_or_verify_case(
     graph_batch_cache_seqlens = torch.empty_like(batch_cache_seqlens)
     graph_expanded_cache_seqlens = torch.empty_like(expanded_cache_seqlens)
     graph_nsa_cache_seqlens = torch.empty_like(nsa_cache_seqlens)
-    use_graph_schedule_metadata = (
-        not use_paged_prefill
-        and uses_paged_mqa_schedule(
-            q_rows=case.total_q,
-            max_pages=graph_real_page_table.shape[1],
-        )
+    use_graph_schedule_metadata = not use_paged_prefill and uses_paged_mqa_schedule(
+        q_rows=case.total_q,
+        max_pages=graph_real_page_table.shape[1],
     )
     graph_schedule_metadata = (
         torch.empty(
@@ -1733,7 +1807,8 @@ def _run_prefill_or_verify_case(
         device=device,
     ).repeat(case.batch_size)
     live_contiguous_k_start = torch.repeat_interleave(
-        torch.arange(case.batch_size, dtype=torch.int32, device=device) * case.cache_len,
+        torch.arange(case.batch_size, dtype=torch.int32, device=device)
+        * case.cache_len,
         case.q_len,
     )
     graph_contiguous_k_start = torch.empty_like(live_contiguous_k_start)
@@ -1912,8 +1987,10 @@ def _run_prefill_or_verify_case(
         clear_indexer_caches()
         actual_topk = run_indexer()
         torch.cuda.synchronize()
-        expected_logical_topk = graph_expanded_cache_seqlens[:, None] - case.topk + torch.arange(
-            case.topk, dtype=torch.int32, device=device
+        expected_logical_topk = (
+            graph_expanded_cache_seqlens[:, None]
+            - case.topk
+            + torch.arange(case.topk, dtype=torch.int32, device=device)
         )
         expected_topk = _remap_logical_topk_to_physical(
             logical_indices=expected_logical_topk,
@@ -1924,9 +2001,7 @@ def _run_prefill_or_verify_case(
         actual_topk_sorted = torch.sort(actual_topk, dim=1).values
         expected_topk_sorted = torch.sort(expected_topk, dim=1).values
         if not torch.equal(actual_topk_sorted, expected_topk_sorted):
-            mismatch = int(
-                (actual_topk_sorted != expected_topk_sorted).sum().item()
-            )
+            mismatch = int((actual_topk_sorted != expected_topk_sorted).sum().item())
             raise BenchmarkFailure(
                 case,
                 f"paged prefill topk mismatch: {mismatch} differing entries",
@@ -1957,12 +2032,18 @@ def _run_prefill_or_verify_case(
         _use_tiled_output = use_tiled_topk
         if _use_tiled_output and _prefill_block_k is None:
             raise BenchmarkFailure(case, "tiled topk requires the prefill indexer path")
-        _block_q = _PREFILL512_BLOCK_Q if _prefill_block_k == _PREFILL512_BLOCK_K else _PREFILL_BLOCK_Q
+        _block_q = (
+            _PREFILL512_BLOCK_Q
+            if _prefill_block_k == _PREFILL512_BLOCK_K
+            else _PREFILL_BLOCK_Q
+        )
 
         _tiled_tile_logits = [None]  # mutable holder for the tiled output
         if _use_tiled_output:
             num_q_tiles = (case.total_q + _block_q - 1) // _block_q
-            num_k_tiles = (int(extend_kv_fp8[0].shape[0]) + _prefill_block_k - 1) // _prefill_block_k
+            num_k_tiles = (
+                int(extend_kv_fp8[0].shape[0]) + _prefill_block_k - 1
+            ) // _prefill_block_k
             tile_size = _block_q * _prefill_block_k
             _tiled_tile_logits[0] = torch.empty(
                 (num_q_tiles * num_k_tiles * tile_size,),
@@ -1984,7 +2065,11 @@ def _run_prefill_or_verify_case(
             return result
 
         def _run_tiled_topk(tile_logits_result=None):
-            tl = tile_logits_result if tile_logits_result is not None else _tiled_tile_logits[0]
+            tl = (
+                tile_logits_result
+                if tile_logits_result is not None
+                else _tiled_tile_logits[0]
+            )
             topk_val = min(case.topk, case.cache_len)
             _, topk_indices = run_tiled_supertile_topk(
                 tile_logits=tl,
@@ -2030,16 +2115,33 @@ def _run_prefill_or_verify_case(
         if skip_indexer_logits_fill and not _use_tiled_output:
             # In tiled mode, there's no -inf scatter matrix to validate
             torch.cuda.synchronize()
-            sample_rows = sorted({0, logits_for_topk.shape[0] // 2, logits_for_topk.shape[0] - 1})
+            sample_rows = sorted(
+                {0, logits_for_topk.shape[0] // 2, logits_for_topk.shape[0] - 1}
+            )
             for sample_row in sample_rows:
                 row_start = int(graph_contiguous_k_start[sample_row].item())
-                row_end = int((graph_contiguous_k_start[sample_row] + graph_contiguous_lengths[sample_row]).item())
-                if row_start > 0 and not torch.isneginf(logits_for_topk[sample_row, :row_start]).all():
-                    raise BenchmarkFailure(case, f"no-fill logits prefix was not -inf for row {sample_row}")
-                if row_end < logits_for_topk.shape[1] and not torch.isneginf(
-                    logits_for_topk[sample_row, row_end:]
-                ).all():
-                    raise BenchmarkFailure(case, f"no-fill logits suffix was not -inf for row {sample_row}")
+                row_end = int(
+                    (
+                        graph_contiguous_k_start[sample_row]
+                        + graph_contiguous_lengths[sample_row]
+                    ).item()
+                )
+                if (
+                    row_start > 0
+                    and not torch.isneginf(
+                        logits_for_topk[sample_row, :row_start]
+                    ).all()
+                ):
+                    raise BenchmarkFailure(
+                        case, f"no-fill logits prefix was not -inf for row {sample_row}"
+                    )
+                if (
+                    row_end < logits_for_topk.shape[1]
+                    and not torch.isneginf(logits_for_topk[sample_row, row_end:]).all()
+                ):
+                    raise BenchmarkFailure(
+                        case, f"no-fill logits suffix was not -inf for row {sample_row}"
+                    )
         if not use_runtime_ragged_topk:
             expected_logits = contiguous_logits_reference(
                 q_fp8=q_fp8,
@@ -2198,6 +2300,7 @@ def _run_prefill_or_verify_case(
         indexer_logits_us = statistics.median(indexer_logits_stats["replay_us"])
 
         if case.mode == "verify":
+
             def run_indexer_topk():
                 return _select_paged_topk_from_logits(
                     logits=logits_for_topk,
@@ -2208,9 +2311,11 @@ def _run_prefill_or_verify_case(
                     query_row_to_batch=query_row_to_batch,
                 )
         elif _use_tiled_output:
+
             def run_indexer_topk():
                 return _run_tiled_topk()
         else:
+
             def run_indexer_topk():
                 return _select_ragged_topk_from_logits(
                     logits=logits_for_topk,
@@ -2226,9 +2331,7 @@ def _run_prefill_or_verify_case(
             prepare=prepare_verify_graph,
             l2_flush=l2_flush,
         )
-        indexer_topk_us = statistics.median(
-            indexer_topk_stats["replay_us"]
-        )
+        indexer_topk_us = statistics.median(indexer_topk_stats["replay_us"])
 
     clear_mla_caches()
     prepare_verify_graph()
@@ -2249,9 +2352,7 @@ def _run_prefill_or_verify_case(
             replays=replays,
             l2_flush=l2_flush,
         )
-        flashinfer_mla_us = statistics.median(
-            flashinfer_mla_stats["replay_us"]
-        )
+        flashinfer_mla_us = statistics.median(flashinfer_mla_stats["replay_us"])
     mla_forward_us = 0.0
     mla_merge_us = 0.0
 
@@ -2309,13 +2410,17 @@ def _run_prefill_or_verify_case(
         indexer_logits_fill=(
             True
             if case.mode == "verify"
-            else False if use_paged_prefill else not skip_indexer_logits_fill
+            else False
+            if use_paged_prefill
+            else not skip_indexer_logits_fill
         ),
         indexer_tiled_topk=_use_tiled_output if case.mode == "prefill" else False,
         indexer_topk_path=(
             "paged-streaming"
             if use_paged_prefill
-            else "tiled" if _use_tiled_output and case.mode == "prefill" else "scatter"
+            else "tiled"
+            if _use_tiled_output and case.mode == "prefill"
+            else "scatter"
         ),
         indexer_prefill_block_k=indexer_prefill_block_k,
         mla_sanity=mla_sanity,
@@ -2329,8 +2434,8 @@ def collect_case_reports(
     *,
     device: torch.device | None = None,
 ) -> list[CaseReport]:
-    if getattr(args, "nsa_prefill_block_k", None) is not None:
-        os.environ[_NSA_PREFILL_BLOCK_K_ENV] = args.nsa_prefill_block_k
+    if getattr(args, "dsa_prefill_block_k", None) is not None:
+        os.environ[_DSA_PREFILL_BLOCK_K_ENV] = args.dsa_prefill_block_k
     cfg = _load_glm_contract_config(
         tp_size=args.tp_size,
         tp_rank=args.tp_rank,
@@ -2395,16 +2500,16 @@ def collect_case_reports(
 def _render_case_line(report: CaseReport) -> str:
     split_flag = "on" if report.split_enabled else "off"
     fill_flag = "fill" if report.indexer_logits_fill else "skipfill"
-    topk_path = report.indexer_topk_path or ("tiled" if report.indexer_tiled_topk else "scatter")
+    topk_path = report.indexer_topk_path or (
+        "tiled" if report.indexer_tiled_topk else "scatter"
+    )
     if report.indexer_prefill_block_k is not None:
         idx_bk = str(report.indexer_prefill_block_k)
     else:
         idx_bk = "decode" if report.case.mode == "prefill" else "paged"
     row_ctx_desc = ""
     if report.case.mode == "decode" and report.case.is_heterogeneous_decode:
-        row_ctx_desc = (
-            f" rowctx={min(report.case.decode_row_cache_lens):6d}-{report.case.cache_len:6d}"
-        )
+        row_ctx_desc = f" rowctx={min(report.case.decode_row_cache_lens):6d}-{report.case.cache_len:6d}"
     sanity_desc = ""
     if report.mla_sanity is not None:
         sanity_desc = (
@@ -2478,9 +2583,7 @@ def _render_summary_lines(reports: list[CaseReport]) -> list[str]:
         f"  mla fwd:     {mla_forward_geo:.2f} us",
         f"  mla merge:   {mla_merge_geo:.2f} us",
     ]
-    reference_reports = [
-        report for report in reports if report.flashinfer_mla_us > 0.0
-    ]
+    reference_reports = [report for report in reports if report.flashinfer_mla_us > 0.0]
     if reference_reports:
         flashinfer_geo = _geomean(
             [report.flashinfer_mla_us for report in reference_reports]
@@ -2566,7 +2669,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--decode-topk-backend",
         choices=("auto", "sgl", "torch", "cute-persistent"),
-        default=os.getenv(_NSA_DECODE_TOPK_BACKEND_ENV, "auto").replace("_", "-"),
+        default=os.getenv(_DSA_DECODE_TOPK_BACKEND_ENV, "auto").replace("_", "-"),
         help=(
             "decode topk selector backend; cute-persistent enables the experimental "
             "large-N CuTe persistent TopK=2048 path"
@@ -2602,7 +2705,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=True,
         help=(
-            "skip the prefill NSA logits -inf initialization when the logits are consumed "
+            "skip the prefill DSA logits -inf initialization when the logits are consumed "
             "only by ragged topk; the benchmark validates sampled invalid logits regions"
         ),
     )
@@ -2610,7 +2713,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--keep-indexer-logits-fill",
         action="store_false",
         dest="skip_indexer_logits_fill",
-        help="preserve the legacy prefill NSA logits -inf initialization.",
+        help="preserve the prefill DSA logits -inf initialization.",
     )
     parser.add_argument(
         "--use-tiled-topk",
@@ -2637,12 +2740,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--nsa-prefill-block-k",
+        "--dsa-prefill-block-k",
         choices=("auto", "256", "512"),
         default=None,
         help=(
-            "override B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K for contiguous/prefill NSA logits; "
-            "default preserves the existing environment"
+            "override B12X_DSA_CONTIGUOUS_PREFILL_BLOCK_K for contiguous/prefill DSA logits; "
+            "default leaves the environment unchanged"
         ),
     )
     return _apply_benchmark_preset(parser.parse_args(argv))
@@ -2651,7 +2754,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.preset == TARGET_DSV4_TRACE_PRESET:
-        from benchmarks.benchmark_compressed_mla import main as compressed_mla_main
+        from benchmarks.benchmark_compressed_sparse_mla import (
+            main as compressed_sparse_mla_main,
+        )
 
         forwarded = [
             "--preset",
@@ -2671,7 +2776,7 @@ def main(argv: list[str] | None = None) -> int:
             forwarded.append("--print-raw-samples")
         if args.model_config is not None:
             forwarded.extend(("--model-config", str(args.model_config)))
-        return compressed_mla_main(forwarded)
+        return compressed_sparse_mla_main(forwarded)
 
     device = require_sm120()
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
@@ -2683,9 +2788,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"L2 flush: {flush_desc}")
     if args.reference == "flashinfer":
         try:
-            flashinfer_version, flashinfer_revision = (
-                _flashinfer_reference_identity()
-            )
+            flashinfer_version, flashinfer_revision = _flashinfer_reference_identity()
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -2704,14 +2807,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.print_raw_samples:
             raw_us = ",".join(f"{sample:.2f}" for sample in report.step_samples_us)
             print(f"  step_raw_us=[{raw_us}]")
-            mla_raw_us = ",".join(
-                f"{sample:.2f}" for sample in report.mla_samples_us
-            )
+            mla_raw_us = ",".join(f"{sample:.2f}" for sample in report.mla_samples_us)
             print(f"  mla_raw_us=[{mla_raw_us}]")
             if report.flashinfer_mla_samples_us:
                 flashinfer_raw_us = ",".join(
-                    f"{sample:.2f}"
-                    for sample in report.flashinfer_mla_samples_us
+                    f"{sample:.2f}" for sample in report.flashinfer_mla_samples_us
                 )
                 print(f"  flashinfer_mla_raw_us=[{flashinfer_raw_us}]")
     for line in _render_summary_lines(reports):

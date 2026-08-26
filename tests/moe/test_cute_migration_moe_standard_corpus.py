@@ -281,11 +281,11 @@ def _prepare_and_bind(
     )
     scratch_plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
-            config=experts.plan.checkpoint_config,
             max_tokens=int(inputs.a.shape[0]),
             num_topk=_TOPK,
             device=inputs.a.device,
             weight_plan=experts.plan,
+            quant_mode=quant_mode,
             core_token_counts=(int(inputs.a.shape[0]),),
             route_num_experts=0,
             frozen=True,

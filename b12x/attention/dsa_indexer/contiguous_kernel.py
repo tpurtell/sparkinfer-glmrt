@@ -1,4 +1,4 @@
-"""CuTeDSL contiguous logits kernel for the non-paged NSA contract."""
+"""CuTeDSL contiguous logits kernel for the non-paged DSA contract."""
 
 from __future__ import annotations
 
@@ -87,12 +87,8 @@ _PREFILL512_Q_HEADS_BATCH = 7  # Exp29: BF16 weights free 4KB smem, 10 batches v
 _PREFILL512_H32_Q_HEADS_BATCH = 7
 _PREFILL512_H32_WEIGHT_COLS = 32
 
-_NSA_CONTIGUOUS_PREFILL_THRESHOLD_ENV = (
-    "B12X_NSA_CONTIGUOUS_PREFILL_THRESHOLD"
-)
-_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV = (
-    "B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K"
-)
+_DSA_CONTIGUOUS_PREFILL_THRESHOLD_ENV = "B12X_DSA_CONTIGUOUS_PREFILL_THRESHOLD"
+_DSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV = "B12X_DSA_CONTIGUOUS_PREFILL_BLOCK_K"
 _PREFILL512_MIN_Q_ROWS = 1024
 _PREFILL512_MIN_K_ROWS = 4096
 _PREFILL512_SUPPORTED_NUM_HEADS = (32, 64)
@@ -168,7 +164,7 @@ class IndexerContiguousLogitsKernelBinding:
     tile_k_offset: int = 0
     tile_num_k_tiles: int | None = None
     prefill_block_k: int | None = None
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM
     q_u32: torch.Tensor | None = None
     q_bytes: torch.Tensor | None = None
     weights_kernel: torch.Tensor | None = None
@@ -198,7 +194,7 @@ def build_indexer_contiguous_logits_kernel_binding(
     tile_k_offset: int = 0,
     tile_num_k_tiles: int | None = None,
     prefill_block_k: int | None = None,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     q_u32: torch.Tensor | None = None,
     q_bytes: torch.Tensor | None = None,
     weights_kernel: torch.Tensor | None = None,
@@ -368,7 +364,7 @@ def _view_last_dim_as_u32(tensor: torch.Tensor) -> torch.Tensor:
 
 
 @lru_cache(maxsize=1)
-def get_sparse_nsa_contiguous_shared_storage_cls():
+def get_dsa_contiguous_shared_storage_cls():
     class SharedStorage:
         pass
 
@@ -400,7 +396,7 @@ def get_sparse_nsa_contiguous_shared_storage_cls():
 
 
 @lru_cache(maxsize=1)
-def get_sparse_nsa_contiguous_prefill_shared_storage_cls():
+def get_dsa_contiguous_prefill_shared_storage_cls():
     class SharedStorage:
         pass
 
@@ -954,7 +950,7 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
         )
 
 
-class SparseNSAContiguousLogitsKernel:
+class DSAContiguousLogitsKernel:
     """Ragged logits kernel with Q and weights read from global memory.
 
     Phase 1+2+3: Q/weights from global, warp-ballot liveness, TMA SWIZZLE_128B (no k_linear/repack).
@@ -964,7 +960,7 @@ class SparseNSAContiguousLogitsKernel:
         self,
         *,
         tiled_output: bool = False,
-        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     ):
         self._tiled_output = tiled_output
         self._score_mode = int(score_mode)
@@ -1059,7 +1055,7 @@ class SparseNSAContiguousLogitsKernel:
 
         smem = cutlass.utils.SmemAllocator()
 
-        SharedStorage = get_sparse_nsa_contiguous_shared_storage_cls()
+        SharedStorage = get_dsa_contiguous_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
@@ -1333,7 +1329,7 @@ def st_shared_v4_f32(
     )
 
 
-def get_sparse_nsa_prefill512_shared_storage_cls(q_heads_batch: int):
+def get_dsa_prefill512_shared_storage_cls(q_heads_batch: int):
     q_heads_batch = int(q_heads_batch)
 
     class SharedStorage:
@@ -1506,7 +1502,7 @@ def _prefill_qk_mma_from_smem_q(
         )
 
 
-class SparseNSAContiguousLogitsPrefillKernel:
+class DSAContiguousLogitsPrefillKernel:
     """Prefill-specialized contiguous logits kernel with _PREFILL_BLOCK_K=256.
 
     Uses 2 Q-warps x 4 K-warps = 256 threads. Each K-warp covers 64 K-rows
@@ -1520,7 +1516,7 @@ class SparseNSAContiguousLogitsPrefillKernel:
         self,
         *,
         tiled_output: bool = False,
-        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
         block_score_output: bool = False,
     ):
         self._tiled_output = tiled_output
@@ -1625,7 +1621,7 @@ class SparseNSAContiguousLogitsPrefillKernel:
 
         smem = cutlass.utils.SmemAllocator()
 
-        SharedStorage = get_sparse_nsa_contiguous_prefill_shared_storage_cls()
+        SharedStorage = get_dsa_contiguous_prefill_shared_storage_cls()
         storage = smem.allocate(SharedStorage)
         mbar_ptr_k = storage.mbar_ptr_k.data_ptr()
         k_perm_base_addr = shared_ptr_to_u32(storage.k_perm.data_ptr())
@@ -2053,9 +2049,7 @@ class SparseNSAContiguousLogitsPrefillKernel:
                             logits_out[q_row, k_row] = Float32(-Float32.inf)
 
 
-class SparseNSAContiguousLogitsPrefillKernelBlockScores(
-    SparseNSAContiguousLogitsPrefillKernel
-):
+class DSAContiguousLogitsPrefillKernelBlockScores(DSAContiguousLogitsPrefillKernel):
     """Distinct compile identity for the MSA block-score specialization.
 
     The implementation and ABI intentionally remain inherited from the
@@ -2065,7 +2059,7 @@ class SparseNSAContiguousLogitsPrefillKernelBlockScores(
     """
 
 
-class SparseNSAContiguousLogitsPrefill512Kernel:
+class DSAContiguousLogitsPrefill512Kernel:
     """Experimental prefill scorer with _PREFILL512_BLOCK_K=512.
 
     This halves the K-CTA count versus the BK=256 prefill scorer. To keep
@@ -2078,7 +2072,7 @@ class SparseNSAContiguousLogitsPrefill512Kernel:
         *,
         tiled_output: bool = False,
         q_heads_batch: int = _PREFILL512_Q_HEADS_BATCH,
-        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     ):
         self._tiled_output = tiled_output
         self._q_heads_batch = int(q_heads_batch)
@@ -2176,7 +2170,7 @@ class SparseNSAContiguousLogitsPrefill512Kernel:
 
         smem = cutlass.utils.SmemAllocator()
 
-        SharedStorage = get_sparse_nsa_prefill512_shared_storage_cls(
+        SharedStorage = get_dsa_prefill512_shared_storage_cls(
             self._q_heads_batch,
         )
         storage = smem.allocate(SharedStorage)
@@ -2597,16 +2591,16 @@ class SparseNSAContiguousLogitsPrefill512Kernel:
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_contiguous_prefill_kernel(
+def _build_dsa_contiguous_prefill_kernel(
     *,
     tiled_output: bool = False,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     block_score_output: bool = False,
-) -> SparseNSAContiguousLogitsPrefillKernel:
+) -> DSAContiguousLogitsPrefillKernel:
     kernel_type = (
-        SparseNSAContiguousLogitsPrefillKernelBlockScores
+        DSAContiguousLogitsPrefillKernelBlockScores
         if block_score_output
-        else SparseNSAContiguousLogitsPrefillKernel
+        else DSAContiguousLogitsPrefillKernel
     )
     return kernel_type(
         tiled_output=tiled_output,
@@ -2616,38 +2610,38 @@ def _build_sparse_nsa_contiguous_prefill_kernel(
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_contiguous_prefill512_kernel(
+def _build_dsa_contiguous_prefill512_kernel(
     *,
     tiled_output: bool = False,
     num_heads: int = 0,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
-) -> SparseNSAContiguousLogitsPrefill512Kernel:
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
+) -> DSAContiguousLogitsPrefill512Kernel:
     if int(num_heads) == _PREFILL512_H32_WEIGHT_COLS:
-        return SparseNSAContiguousLogitsPrefill512Kernel(
+        return DSAContiguousLogitsPrefill512Kernel(
             tiled_output=tiled_output,
             q_heads_batch=_PREFILL512_H32_Q_HEADS_BATCH,
             score_mode=score_mode,
         )
-    return SparseNSAContiguousLogitsPrefill512Kernel(
+    return DSAContiguousLogitsPrefill512Kernel(
         tiled_output=tiled_output,
         score_mode=score_mode,
     )
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_contiguous_kernel(
+def _build_dsa_contiguous_kernel(
     *,
     tiled_output: bool = False,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
-) -> SparseNSAContiguousLogitsKernel:
-    return SparseNSAContiguousLogitsKernel(
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
+) -> DSAContiguousLogitsKernel:
+    return DSAContiguousLogitsKernel(
         tiled_output=tiled_output,
         score_mode=score_mode,
     )
 
 
-def _use_sparse_nsa_contiguous_prefill(valid_q_rows: int) -> bool:
-    prefill_env = os.environ.get(_NSA_CONTIGUOUS_PREFILL_THRESHOLD_ENV, None)
+def _use_dsa_contiguous_prefill(valid_q_rows: int) -> bool:
+    prefill_env = os.environ.get(_DSA_CONTIGUOUS_PREFILL_THRESHOLD_ENV, None)
     if prefill_env is not None:
         return int(prefill_env) > 0
     return valid_q_rows >= 256
@@ -2679,7 +2673,7 @@ def resolve_contiguous_prefill_block_k(
 ) -> int | None:
     """Resolve the contiguous scorer path for the current shape.
 
-    Returns None for the decode scorer, 256 for the existing prefill tile, or
+    Returns None for the decode scorer, 256 for the standard prefill tile, or
     512 for the larger experimental prefill tile.
     """
 
@@ -2688,11 +2682,11 @@ def resolve_contiguous_prefill_block_k(
     num_heads = int(num_heads)
     if valid_q_rows <= 0 or k_rows <= 0:
         return None
-    if not _use_sparse_nsa_contiguous_prefill(valid_q_rows):
+    if not _use_dsa_contiguous_prefill(valid_q_rows):
         return None
 
     block_k_env = (
-        os.environ.get(_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV, "auto").strip().lower()
+        os.environ.get(_DSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV, "auto").strip().lower()
     )
     if block_k_env in ("", "auto"):
         return (
@@ -2714,12 +2708,12 @@ def resolve_contiguous_prefill_block_k(
         )
         if reasons:
             raise ValueError(
-                f"{_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV}=512 is unsupported for this shape: "
+                f"{_DSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV}=512 is unsupported for this shape: "
                 + "; ".join(reasons)
             )
         return _PREFILL512_BLOCK_K
     raise ValueError(
-        f"{_NSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV} must be auto, 256, or 512; got {block_k_env!r}"
+        f"{_DSA_CONTIGUOUS_PREFILL_BLOCK_K_ENV} must be auto, 256, or 512; got {block_k_env!r}"
     )
 
 
@@ -2846,9 +2840,9 @@ def run_contiguous_logits_kernel(
     )
     tile_k_offset = 0 if tile_k_offset is None else int(tile_k_offset)
     score_mode = (
-        IndexerScoreMode.NSA_RELU_SUM if score_mode is None else int(score_mode)
+        IndexerScoreMode.DSA_RELU_SUM if score_mode is None else int(score_mode)
     )
-    if score_mode not in (IndexerScoreMode.NSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
+    if score_mode not in (IndexerScoreMode.DSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
         raise ValueError(f"unsupported indexer score_mode {score_mode}")
 
     if not supports_contiguous_logits_kernel(
@@ -2860,7 +2854,7 @@ def run_contiguous_logits_kernel(
         k_end=k_end,
     ):
         raise ValueError(
-            "sparse NSA contiguous logits kernel only supports the exact CUDA FP8 contract"
+            "DSA contiguous logits kernel only supports the exact CUDA FP8 contract"
         )
 
     q_rows_total = int(q_fp8.shape[0])
@@ -3028,19 +3022,19 @@ def run_contiguous_logits_kernel(
     )
 
     if _prefill_block_k == _PREFILL512_BLOCK_K:
-        kernel = _build_sparse_nsa_contiguous_prefill512_kernel(
+        kernel = _build_dsa_contiguous_prefill512_kernel(
             tiled_output=_tiled_output,
             num_heads=int(q_fp8.shape[1]),
             score_mode=score_mode,
         )
     elif _use_prefill:
-        kernel = _build_sparse_nsa_contiguous_prefill_kernel(
+        kernel = _build_dsa_contiguous_prefill_kernel(
             tiled_output=_tiled_output,
             score_mode=score_mode,
             block_score_output=False,
         )
     else:
-        kernel = _build_sparse_nsa_contiguous_kernel(
+        kernel = _build_dsa_contiguous_kernel(
             tiled_output=_tiled_output,
             score_mode=score_mode,
         )
@@ -3311,7 +3305,7 @@ def run_contiguous_block_scores_kernel(
         k_tma_prefill_desc_ptrs = _dummy_contiguous_k_tma_desc_ptrs(device_index)
 
     output_num_k_tiles = max(1, (k_rows + _PREFILL_BLOCK_K - 1) // _PREFILL_BLOCK_K)
-    kernel = _build_sparse_nsa_contiguous_prefill_kernel(
+    kernel = _build_dsa_contiguous_prefill_kernel(
         tiled_output=False,
         score_mode=IndexerScoreMode.MSA_BILINEAR,
         block_score_output=True,

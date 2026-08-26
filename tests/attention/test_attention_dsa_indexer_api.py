@@ -7,24 +7,35 @@ import pytest
 import torch
 
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.attention.nsa_indexer.kernel import (
+from b12x.attention.dsa_indexer.kernel import (
     PAGED_MQA_LOGITS_SCHEDULE_PAGES_PER_SPLIT,
     _split_index_k_cache_runtime_views,
     run_paged_tiled_logits_kernel,
     run_paged_supertile_logits_kernel,
 )
-from b12x.attention.nsa_indexer.contiguous_kernel import (
+from b12x.attention.dsa_indexer.contiguous_kernel import (
     build_indexer_contiguous_logits_kernel_binding,
 )
-from b12x.attention.nsa_indexer.tiled_topk import run_row_topk
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.tiled_topk import run_row_topk
+from b12x.attention.dsa_indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.attention.nsa_indexer._impl import IndexerContiguousMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, contiguous_tiled_topk, paged_decode_logits, uses_paged_mqa_schedule
-from b12x.attention.nsa_indexer.contiguous_kernel import resolve_contiguous_prefill_block_k
-from b12x.attention.nsa_indexer.scratch import (
+from b12x.attention.dsa_indexer._impl import (
+    IndexerContiguousMetadata,
+    build_paged_mqa_schedule_metadata,
+    clear_indexer_caches,
+    contiguous_logits,
+    contiguous_tiled_topk,
+    paged_decode_logits,
+    uses_paged_mqa_schedule,
+)
+from b12x.attention.dsa_indexer.contiguous_kernel import (
+    resolve_contiguous_prefill_block_k,
+)
+from b12x.attention.dsa_indexer import resolve_paged_prefill_k_rows
+from b12x.attention.dsa_indexer.scratch import (
     B12XIndexerContiguousScratchCaps,
     B12XIndexerPagedScratchCaps,
     INDEXER_PAGED_ROUTE_TILED,
@@ -251,7 +262,7 @@ def _paged_mqa_schedule_reference(
     return torch.tensor(out, dtype=torch.int32)
 
 
-def test_sparse_nsa_index_runtime_views_preserve_page_stride() -> None:
+def test_dsa_index_runtime_views_preserve_page_stride() -> None:
     device = torch.device("cpu")
     page_count = 3
     page_bytes = 64 * (128 + 4)
@@ -293,7 +304,15 @@ def test_contiguous_prefill512_policy_allows_padded_k_rows() -> None:
     )
 
 
-def test_paged_nsa_glm_front_door_does_not_expose_paged_window_contract() -> None:
+def test_paged_prefill_k_rows_match_plan_capacity_and_override(monkeypatch) -> None:
+    assert resolve_paged_prefill_k_rows(max_page_table_width=128) == 8192
+    assert resolve_paged_prefill_k_rows(max_page_table_width=1024) == 32768
+
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "16384")
+    assert resolve_paged_prefill_k_rows(max_page_table_width=128) == 16384
+
+
+def test_paged_dsa_glm_front_door_does_not_expose_paged_window_contract() -> None:
     glm_params = inspect.signature(run_paged_tiled_logits_kernel).parameters
     paged_params = inspect.signature(run_paged_supertile_logits_kernel).parameters
 
@@ -331,11 +350,11 @@ def test_uses_paged_mqa_schedule_only_for_long_rows() -> None:
     assert uses_paged_mqa_schedule(q_rows=8, max_pages=2048)
 
 
-def test_sparse_nsa_contiguous_prefill_block_k_auto_targets_long_bs1_prefill(
+def test_dsa_contiguous_prefill_block_k_auto_targets_long_bs1_prefill(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
-    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", raising=False)
+    monkeypatch.delenv("B12X_DSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
+    monkeypatch.delenv("B12X_DSA_CONTIGUOUS_PREFILL_BLOCK_K", raising=False)
 
     assert (
         resolve_contiguous_prefill_block_k(
@@ -363,9 +382,9 @@ def test_sparse_nsa_contiguous_prefill_block_k_auto_targets_long_bs1_prefill(
     )
 
 
-def test_sparse_nsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> None:
-    monkeypatch.delenv("B12X_NSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
-    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "256")
+def test_dsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_DSA_CONTIGUOUS_PREFILL_THRESHOLD", raising=False)
+    monkeypatch.setenv("B12X_DSA_CONTIGUOUS_PREFILL_BLOCK_K", "256")
     assert (
         resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
@@ -375,7 +394,7 @@ def test_sparse_nsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> Non
         == 256
     )
 
-    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
+    monkeypatch.setenv("B12X_DSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
     assert (
         resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
@@ -391,7 +410,7 @@ def test_sparse_nsa_contiguous_prefill_block_k_env_overrides(monkeypatch) -> Non
             num_heads=64,
         )
 
-    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "bad")
+    monkeypatch.setenv("B12X_DSA_CONTIGUOUS_PREFILL_BLOCK_K", "bad")
     with pytest.raises(ValueError, match="auto, 256, or 512"):
         resolve_contiguous_prefill_block_k(
             valid_q_rows=2048,
@@ -1220,7 +1239,7 @@ def test_contiguous_tiled_topk_graph_replay_tracks_live_weights(monkeypatch) -> 
     not torch.cuda.is_available(), reason="CUDA required for tiled topk coverage"
 )
 def test_contiguous_tiled_topk_matches_scatter_logits(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "3072")
+    monkeypatch.setenv("B12X_DSA_TOPK_SUPERTILE_K", "3072")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1288,7 +1307,7 @@ def test_contiguous_tiled_topk_streaming_fold_many_chunks(monkeypatch) -> None:
     # Force >= 3 supertile chunks so the fold exercises the middle (is_first=False)
     # kernel specialization and the full carry ping-pong (not just the 2-chunk
     # first+last pair). k_rows / supertile_k = 5 chunks regardless of block_k.
-    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "2048")
+    monkeypatch.setenv("B12X_DSA_TOPK_SUPERTILE_K", "2048")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1366,7 +1385,7 @@ def test_contiguous_tiled_topk_live_rows_do_not_resolve_new_kernel(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.setenv("B12X_COMPILE_CACHE_DIR", str(tmp_path / "cute-cache"))
-    monkeypatch.setenv("B12X_NSA_TOPK_SUPERTILE_K", "32768")
+    monkeypatch.setenv("B12X_DSA_TOPK_SUPERTILE_K", "32768")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -1600,9 +1619,11 @@ def test_row_topk_gather_table_width_and_stride_are_runtime(monkeypatch) -> None
     rows, topk = 17, 512
 
     def select(width: int) -> None:
-        row_logits = torch.arange(
-            width, dtype=torch.float32, device=device
-        ).expand(rows, -1).contiguous()
+        row_logits = (
+            torch.arange(width, dtype=torch.float32, device=device)
+            .expand(rows, -1)
+            .contiguous()
+        )
         lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
         gather_table = torch.arange(
             rows * width, dtype=torch.int32, device=device
@@ -1633,7 +1654,7 @@ def test_row_topk_gather_table_width_and_stride_are_runtime(monkeypatch) -> None
     not torch.cuda.is_available(), reason="CUDA required for BK512 prefill coverage"
 )
 def test_contiguous_logits_cuda_prefill512_sampled_logits(monkeypatch) -> None:
-    monkeypatch.setenv("B12X_NSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
+    monkeypatch.setenv("B12X_DSA_CONTIGUOUS_PREFILL_BLOCK_K", "512")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")

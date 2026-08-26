@@ -54,7 +54,7 @@ _HIST_SLOTS = _COARSE_RADIX_BINS + 128
 # still covers wider or degenerate threshold buckets.
 _SMEM_CANDS = 8192
 _SCAN_UNROLL = 4
-_SUPERTILE_K_ENV = "B12X_NSA_TOPK_SUPERTILE_K"
+_SUPERTILE_K_ENV = "B12X_DSA_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
 
 
@@ -211,10 +211,9 @@ def _emit_global_index_virtual(
         if gidx >= Int32(0):
             page_col = gidx // page_size
             page_offset = gidx - page_col * page_size
-            page_table_index = (
-                Int64(row_idx) * Int64(output_page_table_row_stride)
-                + Int64(page_col)
-            )
+            page_table_index = Int64(row_idx) * Int64(
+                output_page_table_row_stride
+            ) + Int64(page_col)
             page_id = Int32(output_page_table[page_table_index])
             if page_id >= Int32(0):
                 physical_idx = page_id * page_size + page_offset
@@ -518,7 +517,7 @@ def _flat_tensor_meta_key(tensor):
     )
 
 
-class SparseNSATiledTopkKernel:
+class DSATiledTopkKernel:
     def __init__(
         self,
         *,
@@ -1250,7 +1249,7 @@ def _build_tiled_topk_kernel(
     output_physical_slots: bool = False,
     extent_splits: int = 1,
 ):
-    return SparseNSATiledTopkKernel(
+    return DSATiledTopkKernel(
         is_tiled=True,
         block_q=block_q,
         block_k=block_k,
@@ -1264,7 +1263,7 @@ def _build_tiled_topk_kernel(
 
 @lru_cache(maxsize=8)
 def _build_row_topk_kernel(topk: int, output_physical_slots: bool = False):
-    return SparseNSATiledTopkKernel(
+    return DSATiledTopkKernel(
         is_tiled=False,
         block_q=1,
         block_k=1,

@@ -1,4 +1,4 @@
-"""Persistent large-N TopK=2048 selector for NSA decode logits."""
+"""Persistent large-N TopK=2048 selector for DSA decode logits."""
 
 from __future__ import annotations
 
@@ -307,7 +307,7 @@ def _store_output_index(
     output[row_idx * output_stride + output_pos] = out_val
 
 
-class SparseNSAPersistentTopK2048Kernel:
+class DSAPersistentTopK2048Kernel:
     def __init__(self, *, paged_output: bool, topk: int = _TOPK):
         self.paged_output = bool(paged_output)
         self.topk_static = int(topk)
@@ -735,7 +735,7 @@ class SparseNSAPersistentTopK2048Kernel:
 
 @lru_cache(maxsize=16)
 def _build_persistent_topk_kernel(*, paged_output: bool, topk: int = _TOPK):
-    return SparseNSAPersistentTopK2048Kernel(paged_output=paged_output, topk=topk)
+    return DSAPersistentTopK2048Kernel(paged_output=paged_output, topk=topk)
 
 
 def clear_persistent_topk2048_kernel_cache() -> None:

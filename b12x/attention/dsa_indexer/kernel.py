@@ -1,4 +1,4 @@
-"""CuTeDSL paged decode score kernel for the paged NSA contract."""
+"""CuTeDSL paged decode score kernel for the paged DSA contract."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ _BLACKWELL_TINY_STRIDED_TMA_MAX_BACKING_BYTES = 128 * 1024
 
 
 class IndexerScoreMode:
-    NSA_RELU_SUM = 0
+    DSA_RELU_SUM = 0
     MSA_BILINEAR = 1
 
 
@@ -98,7 +98,7 @@ class IndexerPagedLogitsKernelBinding:
     active_width: torch.Tensor | None = None
     page_size: int = _PAGE_SIZE
     preinitialize_invalid_logits: bool = True
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM
     output_mode: int = IndexerOutputMode.TOKEN_LOGITS
     page_scores: torch.Tensor | None = None
 
@@ -155,7 +155,7 @@ def build_indexer_paged_logits_kernel_binding(
     active_width: torch.Tensor | None = None,
     page_size: int = _PAGE_SIZE,
     preinitialize_invalid_logits: bool = True,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     output_mode: int = IndexerOutputMode.TOKEN_LOGITS,
     page_scores: torch.Tensor | None = None,
 ) -> IndexerPagedLogitsKernelBinding:
@@ -366,17 +366,17 @@ def _make_paged_index_k_tma_source(
 
 
 @lru_cache(maxsize=16)
-def _default_sparse_nsa_persistent_ctas(device_index: int) -> int:
+def _default_dsa_persistent_ctas(device_index: int) -> int:
     num_sms = int(torch.cuda.get_device_properties(device_index).multi_processor_count)
     return max(num_sms * 4, 1)
 
 
-def _resolve_sparse_nsa_persistent_ctas(
+def _resolve_dsa_persistent_ctas(
     *,
     device_index: int,
     q_rows: int,
 ) -> int:
-    persistent_ctas = _default_sparse_nsa_persistent_ctas(device_index)
+    persistent_ctas = _default_dsa_persistent_ctas(device_index)
     if q_rows >= 4:
         persistent_ctas = max(persistent_ctas // 2, 1)
     return persistent_ctas
@@ -538,7 +538,7 @@ def _compute_mxfp8_tile_partials(
     s_partial_logits: cute.Tensor,
     partial_row_base: Int32,
     head_tile_slot: Int32,
-    score_mode: cutlass.Constexpr[int] = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: cutlass.Constexpr[int] = IndexerScoreMode.DSA_RELU_SUM,
 ):
     group_id = lane // Int32(4)
     thread_id_in_group = lane % Int32(4)
@@ -754,7 +754,7 @@ def _issue_index_k_tma_copy(
     load_tma(src_idx=page_id, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
-class SparseNSAPagedLogitsKernel:
+class DSAPagedLogitsKernel:
     """One CTA reuses a query row across a small tile of paged candidate positions."""
 
     def __init__(
@@ -765,7 +765,7 @@ class SparseNSAPagedLogitsKernel:
         tiled_output: bool = False,
         tile_block_q: int = _PAGED_TILED_BLOCK_Q,
         tile_block_k: int = _PAGED_TILED_BLOCK_K,
-        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     ):
         self.persistent_ctas = int(persistent_ctas)
         self.num_heads_static = int(num_heads_static)
@@ -1106,12 +1106,11 @@ class SparseNSAPagedLogitsKernel:
                 work_idx += Int32(self.persistent_ctas)
 
 
-class SparseNSAPagedSupertileLogitsKernel(SparseNSAPagedLogitsKernel):
+class DSAPagedSupertileLogitsKernel(DSAPagedLogitsKernel):
     """Paged supertile adapter over a full paged table.
 
-    The shared paged NSA scorer keeps its historical public ABI. This wrapper
-    exposes the extra page offset and width scalars only to paged supertile
-    callers.
+    The shared paged scorer keeps its public ABI. This wrapper exposes the
+    extra page offset and width scalars only to paged supertile callers.
     """
 
     @cute.jit
@@ -1198,14 +1197,14 @@ def _should_use_schedule_multi_row_kernel(
     )
 
 
-class SparseNSAScheduledSingleRowLogitsKernel:
+class DSAScheduledSingleRowLogitsKernel:
     """Schedule-driven scorer for the long single-row decode case."""
 
     def __init__(
         self,
         parallel_ctas: int,
         num_heads_static: int,
-        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
         output_mode: int = IndexerOutputMode.TOKEN_LOGITS,
     ):
         self.parallel_ctas = int(parallel_ctas)
@@ -1568,14 +1567,14 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                 page_col += Int32(self.parallel_ctas)
 
 
-class SparseNSAScheduledMultiRowLogitsKernel:
+class DSAScheduledMultiRowLogitsKernel:
     """Schedule-driven scorer for long multi-row decode."""
 
     def __init__(
         self,
         parallel_ctas: int,
         num_heads_static: int,
-        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
         output_mode: int = IndexerOutputMode.TOKEN_LOGITS,
     ):
         self.parallel_ctas = int(parallel_ctas)
@@ -1976,25 +1975,25 @@ class SparseNSAScheduledMultiRowLogitsKernel:
 
 
 @lru_cache(maxsize=32)
-def _build_sparse_nsa_paged_kernel(
+def _build_dsa_paged_kernel(
     persistent_ctas: int,
     num_heads_static: int,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
-) -> SparseNSAPagedLogitsKernel:
-    return SparseNSAPagedLogitsKernel(
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
+) -> DSAPagedLogitsKernel:
+    return DSAPagedLogitsKernel(
         persistent_ctas, num_heads_static, score_mode=score_mode
     )
 
 
 @lru_cache(maxsize=32)
-def _build_sparse_nsa_paged_tiled_kernel(
+def _build_dsa_paged_tiled_kernel(
     persistent_ctas: int,
     num_heads_static: int,
     tile_block_q: int,
     tile_block_k: int,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
-) -> SparseNSAPagedLogitsKernel:
-    return SparseNSAPagedLogitsKernel(
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
+) -> DSAPagedLogitsKernel:
+    return DSAPagedLogitsKernel(
         persistent_ctas,
         num_heads_static,
         tiled_output=True,
@@ -2005,14 +2004,14 @@ def _build_sparse_nsa_paged_tiled_kernel(
 
 
 @lru_cache(maxsize=32)
-def _build_sparse_nsa_paged_supertile_kernel(
+def _build_dsa_paged_supertile_kernel(
     persistent_ctas: int,
     num_heads_static: int,
     tile_block_q: int,
     tile_block_k: int,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
-) -> SparseNSAPagedSupertileLogitsKernel:
-    return SparseNSAPagedSupertileLogitsKernel(
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
+) -> DSAPagedSupertileLogitsKernel:
+    return DSAPagedSupertileLogitsKernel(
         persistent_ctas,
         num_heads_static,
         tiled_output=True,
@@ -2023,13 +2022,13 @@ def _build_sparse_nsa_paged_supertile_kernel(
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_schedule_single_row_kernel(
+def _build_dsa_schedule_single_row_kernel(
     parallel_ctas: int,
     num_heads_static: int,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     output_mode: int = IndexerOutputMode.TOKEN_LOGITS,
-) -> SparseNSAScheduledSingleRowLogitsKernel:
-    return SparseNSAScheduledSingleRowLogitsKernel(
+) -> DSAScheduledSingleRowLogitsKernel:
+    return DSAScheduledSingleRowLogitsKernel(
         parallel_ctas,
         num_heads_static,
         score_mode,
@@ -2038,13 +2037,13 @@ def _build_sparse_nsa_schedule_single_row_kernel(
 
 
 @lru_cache(maxsize=16)
-def _build_sparse_nsa_schedule_multi_row_kernel(
+def _build_dsa_schedule_multi_row_kernel(
     parallel_ctas: int,
     num_heads_static: int,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     output_mode: int = IndexerOutputMode.TOKEN_LOGITS,
-) -> SparseNSAScheduledMultiRowLogitsKernel:
-    return SparseNSAScheduledMultiRowLogitsKernel(
+) -> DSAScheduledMultiRowLogitsKernel:
+    return DSAScheduledMultiRowLogitsKernel(
         parallel_ctas,
         num_heads_static,
         score_mode,
@@ -2074,11 +2073,11 @@ def _split_index_k_cache_runtime_views(
 
 
 def clear_indexer_kernel_cache() -> None:
-    _build_sparse_nsa_paged_kernel.cache_clear()
-    _build_sparse_nsa_paged_tiled_kernel.cache_clear()
-    _build_sparse_nsa_paged_supertile_kernel.cache_clear()
-    _build_sparse_nsa_schedule_single_row_kernel.cache_clear()
-    _build_sparse_nsa_schedule_multi_row_kernel.cache_clear()
+    _build_dsa_paged_kernel.cache_clear()
+    _build_dsa_paged_tiled_kernel.cache_clear()
+    _build_dsa_paged_supertile_kernel.cache_clear()
+    _build_dsa_schedule_single_row_kernel.cache_clear()
+    _build_dsa_schedule_multi_row_kernel.cache_clear()
 
 
 def supports_paged_logits_kernel(
@@ -2207,9 +2206,9 @@ def run_paged_logits_kernel(
         else bool(preinitialize_invalid_logits)
     )
     score_mode = (
-        IndexerScoreMode.NSA_RELU_SUM if score_mode is None else int(score_mode)
+        IndexerScoreMode.DSA_RELU_SUM if score_mode is None else int(score_mode)
     )
-    if score_mode not in (IndexerScoreMode.NSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
+    if score_mode not in (IndexerScoreMode.DSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
         raise ValueError(f"unsupported indexer score_mode {score_mode}")
     output_mode = (
         IndexerOutputMode.TOKEN_LOGITS if output_mode is None else int(output_mode)
@@ -2234,7 +2233,7 @@ def run_paged_logits_kernel(
         page_size=page_size,
     ):
         raise ValueError(
-            "sparse NSA paged logits kernel only supports the exact CUDA page_size=64 FP8 contract"
+            "DSA paged logits kernel only supports the exact CUDA page_size=64 FP8 contract"
         )
 
     rows = q_fp8.shape[0]
@@ -2396,7 +2395,7 @@ def run_paged_logits_kernel(
             raise ValueError(
                 "schedule_metadata is required for the scheduled single-row decode path"
             )
-        kernel = _build_sparse_nsa_schedule_single_row_kernel(
+        kernel = _build_dsa_schedule_single_row_kernel(
             _SCHEDULE_SINGLE_ROW_PARALLEL_CTAS,
             q_fp8.shape[1],
             score_mode,
@@ -2424,7 +2423,7 @@ def run_paged_logits_kernel(
             raise ValueError(
                 "schedule_metadata is required for the scheduled multi-row decode path"
             )
-        kernel = _build_sparse_nsa_schedule_multi_row_kernel(
+        kernel = _build_dsa_schedule_multi_row_kernel(
             _SCHEDULE_MULTI_ROW_PARALLEL_CTAS,
             q_fp8.shape[1],
             score_mode,
@@ -2452,11 +2451,11 @@ def run_paged_logits_kernel(
             raise NotImplementedError(
                 "PAGE_HEAD_MAX output is only implemented for scheduled paged decode routes"
             )
-        persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
+        persistent_ctas = _resolve_dsa_persistent_ctas(
             device_index=device_index,
             q_rows=rows,
         )
-        kernel = _build_sparse_nsa_paged_kernel(
+        kernel = _build_dsa_paged_kernel(
             persistent_ctas,
             q_fp8.shape[1],
             score_mode,
@@ -2745,7 +2744,7 @@ def _run_paged_tiled_logits_kernel_common(
         page_size=page_size,
     ):
         raise ValueError(
-            "sparse NSA paged tiled logits kernel only supports the exact CUDA page_size=64 FP8 contract"
+            "DSA paged tiled logits kernel only supports the exact CUDA page_size=64 FP8 contract"
         )
     if active_width.shape != (1,):
         raise ValueError(
@@ -2880,7 +2879,7 @@ def _run_paged_tiled_logits_kernel_common(
             dynamic_dims=(0,),
         ),
     )
-    persistent_ctas = _resolve_sparse_nsa_persistent_ctas(
+    persistent_ctas = _resolve_dsa_persistent_ctas(
         device_index=device_index,
         q_rows=rows,
     )
@@ -2889,7 +2888,7 @@ def _run_paged_tiled_logits_kernel_common(
             device_index=device_index,
             q_rows=rows,
         )
-        kernel = _build_sparse_nsa_paged_stream_supertile_kernel(
+        kernel = _build_dsa_paged_stream_supertile_kernel(
             stream_ctas,
             q_fp8.shape[1],
             int(tile_block_q),
@@ -2915,7 +2914,7 @@ def _run_paged_tiled_logits_kernel_common(
             *common_cache_key,
         )
     elif supertile:
-        kernel = _build_sparse_nsa_paged_supertile_kernel(
+        kernel = _build_dsa_paged_supertile_kernel(
             persistent_ctas,
             q_fp8.shape[1],
             int(tile_block_q),
@@ -2937,7 +2936,7 @@ def _run_paged_tiled_logits_kernel_common(
             *common_cache_key,
         )
     else:
-        kernel = _build_sparse_nsa_paged_tiled_kernel(
+        kernel = _build_dsa_paged_tiled_kernel(
             persistent_ctas,
             q_fp8.shape[1],
             int(tile_block_q),
@@ -3110,7 +3109,7 @@ def _compute_mxfp8_tile_partials_qldm(
     s_partial_logits: cute.Tensor,
     partial_row_base: Int32,
     partial_col: Int32,
-    score_mode: cutlass.Constexpr[int] = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: cutlass.Constexpr[int] = IndexerScoreMode.DSA_RELU_SUM,
 ):
     """Score core with BOTH operands ldmatrix-loaded from permuted smem.
 
@@ -3258,7 +3257,7 @@ def _stream_issue_k_page_cp_async(
         cp_async_u32_shared_global(s_addr, g_addr)
 
 
-class SparseNSAPagedStreamLogitsKernel:
+class DSAPagedStreamLogitsKernel:
     """Persistent streamed paged scorer (tiled-output supertile contract)."""
 
     def __init__(
@@ -3268,7 +3267,7 @@ class SparseNSAPagedStreamLogitsKernel:
         *,
         tile_block_q: int = _PAGED_TILED_BLOCK_Q,
         tile_block_k: int = _PAGED_TILED_BLOCK_K,
-        score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+        score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
         k_quant_page_stride: int,
         k_scales_row_stride: int,
     ):
@@ -3654,16 +3653,16 @@ class SparseNSAPagedStreamLogitsKernel:
 
 
 @lru_cache(maxsize=None)
-def _build_sparse_nsa_paged_stream_supertile_kernel(
+def _build_dsa_paged_stream_supertile_kernel(
     persistent_ctas: int,
     num_heads_static: int,
     tile_block_q: int,
     tile_block_k: int,
     k_quant_page_stride: int,
     k_scales_row_stride: int,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
-) -> SparseNSAPagedStreamLogitsKernel:
-    return SparseNSAPagedStreamLogitsKernel(
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
+) -> DSAPagedStreamLogitsKernel:
+    return DSAPagedStreamLogitsKernel(
         persistent_ctas,
         num_heads_static,
         tile_block_q=tile_block_q,

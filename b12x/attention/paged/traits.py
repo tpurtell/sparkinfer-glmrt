@@ -11,12 +11,9 @@ from b12x._lib.smem import make_tma_aligned_payload_storage
 from .planner import PagedPlan
 
 _FP8_KV_DTYPE = torch.float8_e4m3fn
-# Paired GB10 graph timings after dense-mask branching put the BF16 H256
-# N16/N32 crossover between 640 and 704 average N16 loop iterations at the
-# adverse BS8/Q4096 corner.  Stay on the conservative edge of that bracket;
-# scale the threshold below by the measured residency loss of the candidate
-# rather than keying policy to a model or head count.
+_BF16_EXTEND_LOW_SM_MAX_SMS = 64
 _BF16_EXTEND_WIDE_TILE_MIN_NARROW_ITERS_PER_LOST_CTA = 704
+_BF16_EXTEND_HIGH_SM_MIN_NARROW_ITERS = 3
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -576,8 +573,20 @@ def select_paged_forward_traits_from_plan(
         _BF16_EXTEND_WIDE_TILE_MIN_NARROW_ITERS_PER_LOST_CTA
         * lost_resident_ctas
     )
+    num_sms = int(
+        torch.cuda.get_device_properties(plan.device).multi_processor_count
+    )
+    active_ctas = int(plan.num_qo_tiles) * int(plan.num_kv_heads)
+    # N32 loses one resident CTA.  Retain N16 for the two-iteration region
+    # unless the N32 grid occupies at most one quarter of the SMs.
+    high_sm_wide_tile = num_sms > _BF16_EXTEND_LOW_SM_MAX_SMS and (
+        narrow_loop_iters >= _BF16_EXTEND_HIGH_SM_MIN_NARROW_ITERS
+        or active_ctas * 4 <= num_sms
+    )
     return (
         wide_traits
-        if force_wide_bf16_extend or narrow_loop_iters >= min_narrow_loop_iters
+        if force_wide_bf16_extend
+        or high_sm_wide_tile
+        or narrow_loop_iters >= min_narrow_loop_iters
         else traits
     )

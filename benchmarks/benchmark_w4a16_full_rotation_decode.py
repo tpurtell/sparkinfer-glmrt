@@ -15,7 +15,6 @@ geometry used by layers containing hundreds of EXL3 experts.
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import gc
 import statistics
 
@@ -162,12 +161,6 @@ def main() -> None:
             trellis_codebook="mcg",
             trellis_tile_config=tile_config,
         )
-        weight_plan = replace(
-            weight_plan,
-            checkpoint_config=fused_moe.PackedConfig(
-                source_format="fp4_e8m0_k32"
-            ),
-        )
         value = prepare_trellis256_moe_weights(
             w13,
             w2,
@@ -206,12 +199,12 @@ def main() -> None:
         )
         plan = fused_moe.plan(
             fused_moe.Caps(
-                config=weight_plan.checkpoint_config,
                 max_tokens=1,
                 num_topk=topk,
                 route_num_experts=route_experts,
                 device=device,
                 weight_plan=weights.plan,
+                quant_mode="w4a16",
                 w4a16_block_size_m=8,
             )
         )

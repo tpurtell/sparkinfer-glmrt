@@ -5,10 +5,11 @@
 - ``dense_mla``: dense compressed-cache MLA with strided physical records and
   optional causal sliding-window masking.
 - ``sparse_mla``: top-k-selected MLA, including strided physical records.
-- ``compressed_mla``: MLA decode directly from compressed KV pages (DSV4).
+- ``compressed_sparse_mla``: sparse MLA directly from compressed KV pages
+  (DSV4).
 - ``dsv4_compressor``: DSV4 learned gated-pooling state and cache producer.
 - ``dsv4_producer``: checkpoint-native DSV4 query projection and KV packing.
-- ``nsa_indexer``: the NSA index stage — quantize -> score -> select.
+- ``dsa_indexer``: the DSA index stage — quantize -> score -> select.
 - ``varlen``: contiguous batched/varlen attention (reduced-assurance tier).
 """
 
@@ -21,10 +22,10 @@ _OP_MODULES = (
     "paged",
     "dense_mla",
     "sparse_mla",
-    "compressed_mla",
+    "compressed_sparse_mla",
     "dsv4_compressor",
     "dsv4_producer",
-    "nsa_indexer",
+    "dsa_indexer",
     "varlen",
 )
 

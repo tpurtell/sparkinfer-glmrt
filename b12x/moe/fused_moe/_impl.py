@@ -8,7 +8,7 @@ import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -96,9 +96,6 @@ from b12x._lib.scratch import (
 )
 
 from ._route_pack_cache import route_pack_prewarm_key
-
-if TYPE_CHECKING:
-    from .config import PackedConfig, TrellisConfig
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
@@ -755,8 +752,8 @@ class TPMoEScratchCaps:
     max_tokens: int
     num_topk: int
     device: torch.device | str
-    config: PackedConfig | TrellisConfig
     weight_plan: MoEWeightPreparationPlan
+    quant_mode: str
     core_token_counts: tuple[int, ...] | None = None
     route_num_experts: int | None = None
     route_logits_dtype: torch.dtype | None = None
@@ -776,16 +773,15 @@ class TPMoEScratchCaps:
         object.__setattr__(self, "device", torch.device(self.device))
         if not isinstance(self.weight_plan, MoEWeightPreparationPlan):
             raise TypeError("weight_plan must be a MoEWeightPreparationPlan")
-        from b12x.moe.fused_moe.config import PackedConfig, TrellisConfig
-
-        if not isinstance(self.config, (PackedConfig, TrellisConfig)):
-            raise TypeError("config must be a PackedConfig or TrellisConfig")
-        if self.weight_plan.checkpoint_config != self.config:
+        quant_mode = _normalize_quant_mode_for_source(
+            self.quant_mode,
+            self.weight_plan.source_format,
+        )
+        if quant_mode not in self.weight_plan.quant_modes:
             raise ValueError(
-                "config does not match the checkpoint config captured by weight_plan"
+                f"quant_mode={quant_mode!r} is absent from the weight plan"
             )
-        if len(self.weight_plan.quant_modes) != 1:
-            raise ValueError("weight_plan must resolve exactly one private recipe")
+        object.__setattr__(self, "quant_mode", quant_mode)
         if self.core_token_counts is not None:
             object.__setattr__(
                 self,
@@ -825,12 +821,6 @@ class TPMoEScratchCaps:
     @property
     def weight_E(self) -> int:
         return self.weight_plan.num_experts
-
-    @property
-    def quant_mode(self) -> str:
-        """Private execution recipe derived by ``plan_weights``."""
-
-        return next(iter(self.weight_plan.quant_modes))
 
     @property
     def k(self) -> int:
@@ -912,6 +902,7 @@ class TPMoEScratchPlan:
         output: torch.Tensor | None = None,
         input_scales_static: bool = False,
         fast_math: bool | None = None,
+        unit_scale_contract: bool = False,
         activation_amax: torch.Tensor | None = None,
         layer_idx: int | None = None,
         route_expert_map: torch.Tensor | None = None,
@@ -984,7 +975,7 @@ class TPMoEScratchPlan:
             input_scales_static=input_scales_static,
             fast_math=fast_math,
             quant_mode=self.caps.quant_mode,
-            unit_scale_contract=False,
+            unit_scale_contract=unit_scale_contract,
             swiglu_limit=self.caps.swiglu_limit,
             swiglu_alpha=self.caps.swiglu_alpha,
             swiglu_beta=self.caps.swiglu_beta,
@@ -5538,6 +5529,7 @@ def prepare_b12x_fp4_moe_weights(
 def prepare_b12x_trellis_v2_weights(
     *,
     plan: MoEWeightPreparationPlan,
+    config: object,
     weights: object,
 ) -> B12XFP4ExpertWeights:
     """Prepare canonical v2 trellis tensors into the normal expert owner."""
@@ -5546,9 +5538,8 @@ def prepare_b12x_trellis_v2_weights(
     from b12x.moe.fused_moe.trellis import prepare_trellis_weights
     from b12x.moe.fused_moe.weights import TrellisWeights
 
-    config = plan.checkpoint_config
     if not isinstance(config, TrellisConfig):
-        raise TypeError("the weight plan does not contain a TrellisConfig")
+        raise TypeError("config must be a TrellisConfig")
     if not isinstance(weights, TrellisWeights):
         raise TypeError("trellis preparation requires TrellisWeights")
     params_dtype = {
@@ -7112,10 +7103,11 @@ def _plan_projection_mixed_trellis_launches(
 def _uses_projection_mixed_trellis(
     weight_plan: MoEWeightPreparationPlan,
 ) -> bool:
-    from b12x.moe.fused_moe.config import TrellisCodebook, TrellisConfig
-
-    config = weight_plan.checkpoint_config
-    return isinstance(config, TrellisConfig) and config.codebook is TrellisCodebook.MCG
+    return (
+        weight_plan.source_format in _TRELLIS_SOURCE_FORMATS
+        and weight_plan.trellis_codebook == "mcg"
+        and weight_plan.trellis_rate_granularity == "per_expert_projection"
+    )
 
 
 def _bind_projection_mixed_trellis_from_views(
@@ -7374,7 +7366,11 @@ def tp_moe_required_nbytes(caps: TPMoEScratchCaps) -> int:
     return _plan_tp_moe_arena_layout_from_caps(caps).total_nbytes
 
 
-def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
+def plan_tp_moe_scratch(
+    caps: TPMoEScratchCaps,
+    *,
+    prewarm_launches: bool = True,
+) -> TPMoEScratchPlan:
     deterministic_output = caps.deterministic_output
     layout = _plan_tp_moe_arena_layout_from_caps(
         caps,
@@ -7429,16 +7425,21 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         swiglu_alpha=launch_plan.swiglu_alpha,
         swiglu_beta=launch_plan.swiglu_beta,
     )
-    fused_launches, topk_sum_launches = _plan_full_rotation_w4a16_launches(
-        caps=caps,
-        core_plan=core_workspace_plan,
-        capacity_tokens=capacity_tokens,
-    )
-    mixed_trellis_launches = _plan_projection_mixed_trellis_launches(
-        caps=caps,
-        core_plan=core_workspace_plan,
-        capacity_tokens=capacity_tokens,
-    )
+    if prewarm_launches:
+        fused_launches, topk_sum_launches = _plan_full_rotation_w4a16_launches(
+            caps=caps,
+            core_plan=core_workspace_plan,
+            capacity_tokens=capacity_tokens,
+        )
+        mixed_trellis_launches = _plan_projection_mixed_trellis_launches(
+            caps=caps,
+            core_plan=core_workspace_plan,
+            capacity_tokens=capacity_tokens,
+        )
+    else:
+        fused_launches = ()
+        topk_sum_launches = ()
+        mixed_trellis_launches = ()
     return TPMoEScratchPlan(
         caps=caps,
         layout=layout,

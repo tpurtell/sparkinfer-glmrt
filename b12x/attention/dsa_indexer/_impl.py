@@ -1,4 +1,4 @@
-"""NSA indexer API for paged and contiguous logits contracts."""
+"""DSA indexer API for paged and contiguous logits contracts."""
 
 from __future__ import annotations
 
@@ -53,9 +53,7 @@ from .persistent_topk import clear_persistent_topk2048_kernel_cache
 
 _INDEX_HEAD_DIM = 128
 _INT32_MAX = torch.iinfo(torch.int32).max
-_VALIDATE_PAGE_IDS = bool(
-    int(os.getenv("B12X_NSA_VALIDATE_PAGE_IDS", "0"))
-)
+_VALIDATE_PAGE_IDS = bool(int(os.getenv("B12X_DSA_VALIDATE_PAGE_IDS", "0")))
 
 
 def _is_cuda_graph_capture_active(device: torch.device) -> bool:
@@ -150,7 +148,7 @@ def build_paged_mqa_schedule_metadata(
 
 
 def clear_indexer_caches() -> None:
-    """Clear any cached NSA indexer runtime state."""
+    """Clear any cached DSA indexer runtime state."""
     clear_indexer_kernel_cache()
     clear_tiled_topk_kernel_cache()
     clear_persistent_topk2048_kernel_cache()
@@ -586,7 +584,7 @@ def paged_decode_logits(
     page_size: int = 64,
     preinitialize_invalid_logits: bool = True,
     active_width_override: torch.Tensor | None = None,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     binding=None,
 ) -> torch.Tensor:
     if binding is not None:
@@ -608,7 +606,7 @@ def paged_decode_logits(
     if metadata is None:
         raise TypeError("paged_decode_logits requires metadata or binding")
     score_mode = int(score_mode)
-    if score_mode not in (IndexerScoreMode.NSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
+    if score_mode not in (IndexerScoreMode.DSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
         raise ValueError(f"unsupported indexer score_mode {score_mode}")
 
     weights_f = _validate_paged_decode_inputs(
@@ -690,7 +688,7 @@ def paged_decode_logits(
         page_size=page_size,
     ):
         raise NotImplementedError(
-            "B12X sparse NSA paged logits requires the production CUDA FP8 "
+            "B12X DSA paged logits requires the production CUDA FP8 "
             "kernel contract; refusing to run the reference fallback. "
             f"q_fp8 shape={tuple(q_fp8.shape)} dtype={q_fp8.dtype} "
             f"device={q_fp8.device}, weights shape={tuple(weights_f.shape)} "
@@ -1081,7 +1079,7 @@ def contiguous_logits(
     metadata: IndexerContiguousMetadata | None = None,
     preinitialize_invalid_logits: bool = True,
     tile_logits: torch.Tensor | None = None,
-    score_mode: int = IndexerScoreMode.NSA_RELU_SUM,
+    score_mode: int = IndexerScoreMode.DSA_RELU_SUM,
     binding=None,
 ) -> torch.Tensor:
     strict_binding = False
@@ -1105,7 +1103,7 @@ def contiguous_logits(
     if metadata is None:
         raise TypeError("contiguous_logits requires metadata or binding")
     score_mode = int(score_mode)
-    if score_mode not in (IndexerScoreMode.NSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
+    if score_mode not in (IndexerScoreMode.DSA_RELU_SUM, IndexerScoreMode.MSA_BILINEAR):
         raise ValueError(f"unsupported indexer score_mode {score_mode}")
     k_start = metadata.k_start
     k_end = metadata.k_end
@@ -1155,7 +1153,7 @@ def contiguous_logits(
         )
         return result
 
-    if score_mode != IndexerScoreMode.NSA_RELU_SUM:
+    if score_mode != IndexerScoreMode.DSA_RELU_SUM:
         raise NotImplementedError(
             "contiguous_logits score_mode=MSA_BILINEAR requires the CUDA FP8 scorer contract"
         )
@@ -1498,7 +1496,7 @@ def contiguous_tiled_topk(
     supertile_k: int | None = None,
     binding=None,
 ) -> torch.Tensor:
-    """Run the prefill NSA scorer in K-supertiles and consume each tile with tiled topk."""
+    """Run the prefill DSA scorer in K-supertiles and consume each tile with tiled topk."""
 
     strict_binding = False
     if binding is not None:

@@ -279,9 +279,6 @@ class MoEWeightPreparationPlan:
     weight_layouts: frozenset[PreparedWeightLayout]
     scale_layouts: frozenset[PreparedScaleLayout]
     storage_policy: WeightStoragePolicy
-    # Public checkpoint configuration captured by the normal plan/prepare
-    # lifecycle. Runtime policy remains in the private MoE specs above.
-    checkpoint_config: object | None = None
     trellis_bits: int | None = None
     trellis_tile_config: tuple[int, int, int, int] | None = None
     coupled_hadamard: bool = False

@@ -7,8 +7,6 @@ second public checkpoint format.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 import torch
 
@@ -71,12 +69,6 @@ def _make_expert_weights(
         trellis_codebook="sqg_e4m3",
         trellis_tile_config=(128, 128, 128, 128),
         coupled_hadamard=True,
-    )
-    plan = replace(
-        plan,
-        checkpoint_config=fused_moe.PackedConfig(
-            source_format="fp4_e8m0_k32"
-        ),
     )
     dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
     ones_e = torch.ones(E, dtype=torch.float32, device=device)
@@ -142,12 +134,12 @@ def test_w4a8_trellis_micro_serving_matches_reference(m: int) -> None:
 
     plan = fused_moe.plan(
         fused_moe.Caps(
-            config=experts.plan.checkpoint_config,
             max_tokens=m,
             num_topk=topk,
             route_num_experts=E,
             device=device,
             weight_plan=experts.plan,
+            quant_mode="w4a8_mx",
         )
     )
     spec = plan.scratch_specs()[0]

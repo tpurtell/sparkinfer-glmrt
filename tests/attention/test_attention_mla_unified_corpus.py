@@ -7,11 +7,11 @@ import pytest
 import torch
 
 from b12x.attention._shared.mla.compressed_reference import (
-    COMPRESSED_MLA_HEAD_DIM,
-    COMPRESSED_MLA_NOPE_DIM,
-    COMPRESSED_MLA_ROPE_DIM,
+    COMPRESSED_SPARSE_MLA_HEAD_DIM,
+    COMPRESSED_SPARSE_MLA_NOPE_DIM,
+    COMPRESSED_SPARSE_MLA_ROPE_DIM,
     compressed_sparse_mla_reference,
-    pack_compressed_mla_kv_cache_reference,
+    pack_compressed_sparse_mla_kv_cache_reference,
 )
 from b12x.attention._shared.mla.kernel import run_unified_decode, run_unified_prefill
 from b12x.attention._shared.mla.reference import (
@@ -20,13 +20,21 @@ from b12x.attention._shared.mla.reference import (
 )
 from b12x.attention._shared.mla.traits import ScaleFormat
 from b12x._lib.intrinsics import pack_grouped_fp4_values
-from b12x.attention.compressed_mla._scratch import B12XCompressedMLAScratchCaps, _compressed_mla_scratch_layout, _materialize_compressed_mla_scratch
+from b12x.attention.compressed_sparse_mla._scratch import (
+    B12XCompressedSparseMLAScratchCaps,
+    _compressed_sparse_mla_scratch_layout,
+    _materialize_compressed_sparse_mla_scratch,
+)
 
-from tests._reference.helpers import dequantize_token_major_nvfp4, ref_fp4_quant, require_b12x
+from tests._reference.helpers import (
+    dequantize_token_major_nvfp4,
+    ref_fp4_quant,
+    require_b12x,
+)
 
 
 _PAGE_SIZE = 64
-_SM_SCALE = 1.0 / math.sqrt(COMPRESSED_MLA_HEAD_DIM)
+_SM_SCALE = 1.0 / math.sqrt(COMPRESSED_SPARSE_MLA_HEAD_DIM)
 _GLM_Q_DIM = 576
 _GLM_V_DIM = 512
 _GLM_SM_SCALE = 1.0 / math.sqrt(_GLM_Q_DIM)
@@ -63,16 +71,16 @@ def _make_cache(
     generator: torch.Generator,
 ) -> torch.Tensor:
     k_nope = torch.empty(
-        (tokens, COMPRESSED_MLA_NOPE_DIM),
+        (tokens, COMPRESSED_SPARSE_MLA_NOPE_DIM),
         dtype=torch.float32,
         device=device,
     ).normal_(mean=0.0, std=0.35, generator=generator)
     k_rope = torch.empty(
-        (tokens, COMPRESSED_MLA_ROPE_DIM),
+        (tokens, COMPRESSED_SPARSE_MLA_ROPE_DIM),
         dtype=torch.float32,
         device=device,
     ).normal_(mean=0.0, std=0.35, generator=generator)
-    return pack_compressed_mla_kv_cache_reference(
+    return pack_compressed_sparse_mla_kv_cache_reference(
         k_nope,
         k_rope,
         page_size=_PAGE_SIZE,
@@ -92,7 +100,7 @@ def _make_inputs(
     generator.manual_seed(46_120 + rows * 100 + heads)
 
     q_a = torch.empty(
-        (rows, heads, COMPRESSED_MLA_HEAD_DIM),
+        (rows, heads, COMPRESSED_SPARSE_MLA_HEAD_DIM),
         dtype=torch.bfloat16,
         device=device,
     ).normal_(mean=0.0, std=0.2, generator=generator)
@@ -268,19 +276,19 @@ def _make_decode_workspace(
     width: int,
     device: torch.device,
 ):
-    caps = B12XCompressedMLAScratchCaps(
+    caps = B12XCompressedSparseMLAScratchCaps(
         device=device,
         num_q_heads=heads,
         max_q_rows=rows,
         max_width=width,
-        head_dim=COMPRESSED_MLA_HEAD_DIM,
-        v_head_dim=COMPRESSED_MLA_HEAD_DIM,
+        head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
+        v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
         max_chunks_per_row=8,
         page_size=_PAGE_SIZE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(layout.nbytes, dtype=torch.uint8, device=device)
-    return _materialize_compressed_mla_scratch(caps, storage, layout)
+    return _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
 
 
 @torch.inference_mode()
@@ -310,7 +318,7 @@ def test_unified_decode_entrypoint_live_graph_oracle(entrypoint: str) -> None:
         device=device,
     )
     output = torch.empty(
-        (rows, heads, COMPRESSED_MLA_HEAD_DIM),
+        (rows, heads, COMPRESSED_SPARSE_MLA_HEAD_DIM),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -369,7 +377,7 @@ def test_unified_prefill_entrypoint_live_graph_oracle(entrypoint: str) -> None:
         device=device,
     )
     output = torch.empty(
-        (rows, heads, COMPRESSED_MLA_HEAD_DIM),
+        (rows, heads, COMPRESSED_SPARSE_MLA_HEAD_DIM),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -1010,7 +1018,7 @@ def test_unified_glm_decode_live_graph_oracle(entrypoint: str) -> None:
         per_token=per_token,
         device=device,
     )
-    caps = B12XCompressedMLAScratchCaps(
+    caps = B12XCompressedSparseMLAScratchCaps(
         device=device,
         num_q_heads=heads,
         max_q_rows=rows,
@@ -1020,9 +1028,9 @@ def test_unified_glm_decode_live_graph_oracle(entrypoint: str) -> None:
         max_chunks_per_row=8,
         page_size=_PAGE_SIZE,
     )
-    layout = _compressed_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(layout.nbytes, dtype=torch.uint8, device=device)
-    workspace = _materialize_compressed_mla_scratch(caps, storage, layout)
+    workspace = _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
     output = torch.empty(
         (rows, heads, _GLM_V_DIM),
         dtype=torch.bfloat16,

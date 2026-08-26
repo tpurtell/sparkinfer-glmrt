@@ -1,7 +1,7 @@
-"""NSA indexer for SM12x: the index stage of Native Sparse Attention.
+"""DeepSeek Sparse Attention indexer for SM12x.
 
 A three-stage pipeline whose outputs feed ``attention.sparse_mla`` /
-``attention.compressed_mla``:
+``attention.compressed_sparse_mla``:
 
 1. quantize — ``quantize_q_fp8`` (index-Q to FP8 e4m3, MXFP8 tiling;
    INDEX_HEAD_DIM 128).
@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
-    name="nsa_indexer",
+    name="dsa_indexer",
     group="attention",
     api_style="planned",
     entry_points=(
@@ -75,6 +75,7 @@ META = OpMeta(
         "index_topk_fp8",
         "resolve_local_num_q_heads",
         "resolve_replicated_num_q_heads",
+        "resolve_paged_prefill_k_rows",
         "INDEX_HEAD_DIM",
         "PAGED_INDEX_PAGE_SIZE",
         "SOURCE_LAYOUT_PAGED",
@@ -98,9 +99,9 @@ META = OpMeta(
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
         commit="6627d342",
-        paths=("b12x/attention/indexer/",),
+        paths=("b12x/attention/dsa_indexer/",),
     ),
-    test_path="tests/attention/test_nsa_indexer.py",
+    test_path="tests/attention/test_dsa_indexer.py",
     since="0.7.0",
 )
 

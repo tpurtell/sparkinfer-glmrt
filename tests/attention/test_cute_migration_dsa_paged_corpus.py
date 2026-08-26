@@ -1,4 +1,4 @@
-"""Exact GPU/graph corpus for the NSA paged, fused, and persistent kernels.
+"""Exact GPU/graph corpus for the DSA paged, fused, and persistent kernels.
 
 Each test captures one production CUTLASS specialization, replays two changed
 live scenarios, and compares the replayed result with an independent GPU
@@ -18,23 +18,26 @@ import pytest
 import torch
 
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.attention.nsa_indexer._impl import build_paged_mqa_schedule_metadata, clear_indexer_caches
-from b12x.attention.nsa_indexer.fused_indexer import (
+from b12x.attention.dsa_indexer._impl import (
+    build_paged_mqa_schedule_metadata,
+    clear_indexer_caches,
+)
+from b12x.attention.dsa_indexer.fused_indexer import (
     _COOP_STATE_WORDS,
     fused_indexer_scratch_capacity,
     run_fused_paged_indexer,
 )
-from b12x.attention.nsa_indexer.kernel import (
+from b12x.attention.dsa_indexer.kernel import (
     _split_index_k_cache_runtime_views,
     build_indexer_paged_logits_kernel_binding,
     build_indexer_paged_supertile_logits_kernel_binding,
     build_indexer_paged_tiled_logits_kernel_binding,
 )
-from b12x.attention.nsa_indexer.persistent_topk import (
+from b12x.attention.dsa_indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
     run_persistent_topk2048,
 )
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
@@ -281,8 +284,8 @@ def _capture_prototype(
     )
 
 
-def test_nsa_paged_base_graph_live_gpu_oracle() -> None:
-    """Unscheduled tiled scorer: one SparseNSAPagedLogitsKernel specialization."""
+def test_dsa_paged_base_graph_live_gpu_oracle() -> None:
+    """Unscheduled tiled scorer: one DSAPagedLogitsKernel specialization."""
     device = torch.device("cuda")
     generator = torch.Generator(device="cpu").manual_seed(83_101)
     rows, heads, max_pages, cache_pages = 4, 8, 8, 96
@@ -328,7 +331,7 @@ def test_nsa_paged_base_graph_live_gpu_oracle() -> None:
     graph, captured = _capture_once(
         binding.run,
         device=device,
-        reason="NSA paged-base migration replay must use the warmed specialization",
+        reason="DSA paged-base migration replay must use the warmed specialization",
     )
     assert captured.data_ptr() == tile_logits.data_ptr()
     output_ptr = tile_logits.data_ptr()
@@ -423,7 +426,7 @@ def _run_scheduled_graph_case(*, rows: int, seed: int) -> None:
     graph, captured = _capture_once(
         binding.run,
         device=device,
-        reason="scheduled NSA migration replay must use the warmed specialization",
+        reason="scheduled DSA migration replay must use the warmed specialization",
     )
     output_ptr = captured.data_ptr()
     assert tuple(captured.shape) == (rows, max_pages * _PAGE_SIZE)
@@ -448,17 +451,17 @@ def _run_scheduled_graph_case(*, rows: int, seed: int) -> None:
         )
 
 
-def test_nsa_paged_scheduled_single_graph_live_gpu_oracle() -> None:
+def test_dsa_paged_scheduled_single_graph_live_gpu_oracle() -> None:
     """Long one-row decode: one scheduled-single specialization."""
     _run_scheduled_graph_case(rows=1, seed=83_201)
 
 
-def test_nsa_paged_scheduled_multi_graph_live_gpu_oracle() -> None:
+def test_dsa_paged_scheduled_multi_graph_live_gpu_oracle() -> None:
     """Long two-row decode: one scheduled-multi specialization."""
     _run_scheduled_graph_case(rows=2, seed=83_301)
 
 
-def test_nsa_paged_stream_graph_live_gpu_oracle(monkeypatch) -> None:
+def test_dsa_paged_stream_graph_live_gpu_oracle(monkeypatch) -> None:
     """Streamed supertile scorer without the tiled-top-k selector helper."""
     monkeypatch.setenv("B12X_INDEXER_STREAM_SCORER", "1")
     device = torch.device("cuda")
@@ -508,7 +511,7 @@ def test_nsa_paged_stream_graph_live_gpu_oracle(monkeypatch) -> None:
     graph, captured = _capture_once(
         binding.run,
         device=device,
-        reason="NSA paged-stream migration replay must use the warmed specialization",
+        reason="DSA paged-stream migration replay must use the warmed specialization",
     )
     assert captured.data_ptr() == tile_logits.data_ptr()
     output_ptr = tile_logits.data_ptr()
@@ -572,7 +575,7 @@ def _fused_topk_reference(
     return torch.stack(expected_values), expected_indices
 
 
-def test_nsa_fused_graph_live_gpu_oracle() -> None:
+def test_dsa_fused_graph_live_gpu_oracle() -> None:
     """Paged score+top-k with one fixed-capacity cooperative-merge policy."""
     device = torch.device("cuda")
     generator = torch.Generator(device="cpu").manual_seed(83_501)
@@ -645,7 +648,7 @@ def test_nsa_fused_graph_live_gpu_oracle() -> None:
     graph, captured = _capture_once(
         run,
         device=device,
-        reason="NSA fused migration replay must use the warmed specialization",
+        reason="DSA fused migration replay must use the warmed specialization",
     )
     assert captured[0].data_ptr() == out_indices.data_ptr()
     assert captured[1].data_ptr() == out_values.data_ptr()
@@ -711,7 +714,7 @@ def _persistent_topk_reference(
     return selected.values, torch.gather(page_table, 1, selected.indices)
 
 
-def test_nsa_persistent_topk_graph_live_gpu_oracle() -> None:
+def test_dsa_persistent_topk_graph_live_gpu_oracle() -> None:
     """Paged-output persistent radix top-k above the 32K route threshold."""
     device = torch.device("cuda")
     generator = torch.Generator(device="cpu").manual_seed(83_601)
@@ -777,7 +780,7 @@ def test_nsa_persistent_topk_graph_live_gpu_oracle() -> None:
     graph, captured = _capture_once(
         run,
         device=device,
-        reason="NSA persistent-top-k migration replay must use the warmed specialization",
+        reason="DSA persistent-top-k migration replay must use the warmed specialization",
     )
     assert captured.data_ptr() == output.data_ptr()
     output_ptr = output.data_ptr()

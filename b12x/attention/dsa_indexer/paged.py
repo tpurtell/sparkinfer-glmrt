@@ -13,19 +13,19 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x.attention.nsa_indexer._impl import (
+from b12x.attention.dsa_indexer._impl import (
     build_paged_mqa_schedule_metadata,
     uses_paged_mqa_schedule,
 )
-from b12x.attention.nsa_indexer.contiguous_kernel import (
+from b12x.attention.dsa_indexer.contiguous_kernel import (
     run_contiguous_logits_kernel,
 )
-from b12x.attention.nsa_indexer.kernel import (
+from b12x.attention.dsa_indexer.kernel import (
     _env_indexer_stream_scorer_enabled,
     _split_index_k_cache_runtime_views,
     run_paged_supertile_logits_kernel,
 )
-from b12x.attention.nsa_indexer.tiled_topk import (
+from b12x.attention.dsa_indexer.tiled_topk import (
     run_row_topk,
     run_tiled_topk,
 )
@@ -38,7 +38,7 @@ _TWO_LEVEL_MAX_SLICES = 32
 _TWO_LEVEL_FOLD_MODE_ENV = "B12X_INDEXER_TWO_LEVEL_FOLD"
 _TWO_LEVEL_FOLD_MAX_MIB_ENV = "B12X_INDEXER_TWO_LEVEL_FOLD_MAX_MIB"
 _TWO_LEVEL_FOLD_MAX_MIB_DEFAULT = 256
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
     unpack_index_k_cache_reference,
@@ -416,8 +416,7 @@ def _validate_raw_page_lengths(
         )
     if (
         real_page_table.device.type == "cuda"
-        and os.getenv("B12X_VALIDATE_PAGED_INDEXER_CUDA_VALUES", "0")
-        != "1"
+        and os.getenv("B12X_VALIDATE_PAGED_INDEXER_CUDA_VALUES", "0") != "1"
     ):
         return
     if cache_seqlens_int32.numel() == 0:
@@ -850,7 +849,7 @@ def index_topk_fp8(
     output_physical_slots = bool(getattr(binding, "output_physical_slots", False))
     # Fused score+top-k route: single launch, no logits blob. Route selection is
     # owned by the scratch plan; launch only carries it out.
-    from b12x.attention.nsa_indexer.fused_indexer import (
+    from b12x.attention.dsa_indexer.fused_indexer import (
         run_fused_paged_indexer,
     )
 

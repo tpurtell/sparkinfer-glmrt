@@ -2,7 +2,7 @@
 
 Eager PLAN -> BIND -> KERNEL, never a workspace/arena. bind() maps the
 caller-owned scratch tensor into per-spec kernel-argument VIEWS and returns a
-plain B12XSparseMLAScratch views container (mirroring B12XCompressedMLAScratch).
+plain B12XSparseMLAScratch views container (mirroring B12XCompressedSparseMLAScratch).
 It never constructs a B12XAttentionWorkspace / arena, allocates, or init-writes.
 The unified SM120 sparse-MLA decode/extend kernels duck-type the workspace
 (tmp_output/tmp_lse/output_buffer/final_lse/num_chunks_ptr/kv_chunk_size_ptr/

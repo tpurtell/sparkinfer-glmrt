@@ -6,8 +6,8 @@ import pytest
 import torch
 
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.attention.nsa_indexer._impl import clear_indexer_caches
-from b12x.attention.nsa_indexer.persistent_topk import (
+from b12x.attention.dsa_indexer._impl import clear_indexer_caches
+from b12x.attention.dsa_indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
     run_persistent_topk2048,
 )

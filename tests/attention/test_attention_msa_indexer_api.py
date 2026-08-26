@@ -4,18 +4,28 @@ import pytest
 import torch
 
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-from b12x.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, clear_indexer_caches, msa_contiguous_block_scores, msa_decode_query_positions, msa_paged_decode_block_scores, msa_q2k_indices_decode, msa_q2k_indices_prefill, quantize_msa_q_fp8
-from b12x.attention.nsa_indexer.msa_reference import MSA_SM_SCALE
-from b12x.attention.nsa_indexer.contiguous_kernel import (
+from b12x.attention.dsa_indexer._impl import (
+    IndexerContiguousMetadata,
+    IndexerPagedDecodeMetadata,
+    clear_indexer_caches,
+    msa_contiguous_block_scores,
+    msa_decode_query_positions,
+    msa_paged_decode_block_scores,
+    msa_q2k_indices_decode,
+    msa_q2k_indices_prefill,
+    quantize_msa_q_fp8,
+)
+from b12x.attention.dsa_indexer.msa_reference import MSA_SM_SCALE
+from b12x.attention.dsa_indexer.contiguous_kernel import (
     run_contiguous_block_scores_kernel,
 )
-from b12x.attention.nsa_indexer.msa_reference import (
+from b12x.attention.dsa_indexer.msa_reference import (
     msa_contiguous_block_scores_reference,
     msa_paged_decode_block_scores_reference,
     msa_q2k_indices_reference,
 )
-from b12x.attention.nsa_indexer.reference import pack_index_k_cache_reference
-from b12x.attention.nsa_indexer.scratch import (
+from b12x.attention.dsa_indexer.reference import pack_index_k_cache_reference
+from b12x.attention.dsa_indexer.scratch import (
     B12XIndexerContiguousScratchCaps,
     B12XIndexerPagedScratchCaps,
     plan_indexer_contiguous_scratch,
@@ -347,7 +357,9 @@ def test_msa_contiguous_scratch_binding_owns_prefill_outputs() -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for MSA prefill coverage"
 )
-def test_msa_contiguous_binding_rejects_duplicate_outputs_and_runs_valid_kernel() -> None:
+def test_msa_contiguous_binding_rejects_duplicate_outputs_and_runs_valid_kernel() -> (
+    None
+):
     device = torch.device("cuda")
     q_fp8, q_scale, kv_fp8, metadata = _make_msa_contiguous_case(
         rows=3,

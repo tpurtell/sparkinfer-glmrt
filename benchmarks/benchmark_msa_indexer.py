@@ -12,8 +12,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.nsa_indexer._impl import IndexerContiguousMetadata, IndexerPagedDecodeMetadata, build_paged_mqa_schedule_metadata, clear_indexer_caches, msa_q2k_indices_decode, msa_q2k_indices_prefill, quantize_msa_q_fp8
-from b12x.attention.nsa_indexer.reference import pack_index_k_cache_reference
+from b12x.attention.dsa_indexer._impl import (
+    IndexerContiguousMetadata,
+    IndexerPagedDecodeMetadata,
+    build_paged_mqa_schedule_metadata,
+    clear_indexer_caches,
+    msa_q2k_indices_decode,
+    msa_q2k_indices_prefill,
+    quantize_msa_q_fp8,
+)
+from b12x.attention.dsa_indexer.reference import pack_index_k_cache_reference
 
 from benchmarks.common import (
     bench_cuda_graph,
@@ -45,7 +53,12 @@ def _make_q(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
-    q = torch.randn((rows, heads, 128), generator=gen, dtype=torch.float32, device=device) / 3
+    q = (
+        torch.randn(
+            (rows, heads, 128), generator=gen, dtype=torch.float32, device=device
+        )
+        / 3
+    )
     return quantize_msa_q_fp8(q)
 
 
@@ -63,15 +76,22 @@ def _make_decode_case(
     k_rows = pages * page_size
     gen = torch.Generator(device=device)
     gen.manual_seed(seed + 1)
-    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device) / 3
+    k = (
+        torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device)
+        / 3
+    )
     index_k_cache = pack_index_k_cache_reference(k)
-    real_page_table = torch.arange(pages, dtype=torch.int32, device=device).view(1, pages)
+    real_page_table = torch.arange(pages, dtype=torch.int32, device=device).view(
+        1, pages
+    )
     real_page_table = real_page_table.expand(rows, pages).contiguous()
     seqlens = torch.full((rows,), ctx_tokens, dtype=torch.int32, device=device)
     metadata = IndexerPagedDecodeMetadata(
         real_page_table=real_page_table,
         cache_seqlens_int32=seqlens,
-        paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(seqlens, page_size),
+        paged_mqa_schedule_metadata=build_paged_mqa_schedule_metadata(
+            seqlens, page_size
+        ),
     )
     return q_fp8, q_scale, index_k_cache, metadata
 
@@ -83,14 +103,24 @@ def _make_prefill_case(
     k_rows: int,
     seed: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], IndexerContiguousMetadata]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor],
+    IndexerContiguousMetadata,
+]:
     q_fp8, q_scale = _make_q(rows=rows, heads=heads, seed=seed, device=device)
     gen = torch.Generator(device=device)
     gen.manual_seed(seed + 1)
-    k = torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device) / 3
+    k = (
+        torch.randn((k_rows, 128), generator=gen, dtype=torch.float32, device=device)
+        / 3
+    )
     kv_fp8 = _quantize_rows_to_kv_fp8(k)
     k_start = torch.zeros((rows,), dtype=torch.int32, device=device)
-    k_end = torch.arange(1, rows + 1, dtype=torch.int32, device=device).clamp(max=k_rows)
+    k_end = torch.arange(1, rows + 1, dtype=torch.int32, device=device).clamp(
+        max=k_rows
+    )
     metadata = IndexerContiguousMetadata(k_start=k_start, k_end=k_end)
     return q_fp8, q_scale, kv_fp8, metadata
 
@@ -107,7 +137,9 @@ def _gbps(bytes_touched: int, us: float) -> float:
     return float(bytes_touched) / (us * 1000.0)
 
 
-def _run_decode(args: argparse.Namespace, device: torch.device, l2_flush) -> list[dict[str, object]]:
+def _run_decode(
+    args: argparse.Namespace, device: torch.device, l2_flush
+) -> list[dict[str, object]]:
     rows_out: list[dict[str, object]] = []
     for q_rows in args.rows:
         for heads in args.heads:
@@ -129,7 +161,9 @@ def _run_decode(args: argparse.Namespace, device: torch.device, l2_flush) -> lis
                         metadata=metadata,
                     )
 
-                median_us = _bench_graph(run, warmup=args.warmup, replays=args.iters, l2_flush=l2_flush)
+                median_us = _bench_graph(
+                    run, warmup=args.warmup, replays=args.iters, l2_flush=l2_flush
+                )
                 bytes_touched = q_rows * heads * ctx_tokens * (128 + 4)
                 rows_out.append(
                     {
@@ -144,7 +178,9 @@ def _run_decode(args: argparse.Namespace, device: torch.device, l2_flush) -> lis
     return rows_out
 
 
-def _run_prefill(args: argparse.Namespace, device: torch.device, l2_flush) -> list[dict[str, object]]:
+def _run_prefill(
+    args: argparse.Namespace, device: torch.device, l2_flush
+) -> list[dict[str, object]]:
     rows_out: list[dict[str, object]] = []
     for q_rows in args.rows:
         for heads in args.heads:
@@ -166,7 +202,9 @@ def _run_prefill(args: argparse.Namespace, device: torch.device, l2_flush) -> li
                         metadata=metadata,
                     )
 
-                median_us = _bench_graph(run, warmup=args.warmup, replays=args.iters, l2_flush=l2_flush)
+                median_us = _bench_graph(
+                    run, warmup=args.warmup, replays=args.iters, l2_flush=l2_flush
+                )
                 bytes_touched = q_rows * heads * k_rows * (128 + 4)
                 rows_out.append(
                     {
@@ -196,12 +234,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=("decode", "prefill"), default="decode")
     parser.add_argument("--rows", type=_parse_csv_ints, default=[1, 4, 16, 64])
     parser.add_argument("--heads", type=_parse_csv_ints, default=[1, 4])
-    parser.add_argument("--ctx", type=_parse_csv_ints, default=[8192, 32768, 131072, 262144])
+    parser.add_argument(
+        "--ctx", type=_parse_csv_ints, default=[8192, 32768, 131072, 262144]
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=93_001)
-    parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("results.msa_indexer.tsv"))
-    parser.add_argument("--flush-l2", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--output", type=pathlib.Path, default=pathlib.Path("results.msa_indexer.tsv")
+    )
+    parser.add_argument(
+        "--flush-l2", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
     return parser.parse_args(argv)
 
@@ -215,7 +259,11 @@ def main(argv: list[str] | None = None) -> None:
         print(f"L2 flush: on ({flush_bytes / (1 << 20):.1f} MiB per replay)")
     else:
         print("L2 flush: off")
-    rows = _run_decode(args, device, l2_flush) if args.mode == "decode" else _run_prefill(args, device, l2_flush)
+    rows = (
+        _run_decode(args, device, l2_flush)
+        if args.mode == "decode"
+        else _run_prefill(args, device, l2_flush)
+    )
     for row in rows:
         print(
             f"{row['mode']} rows={row['rows']} heads={row['heads']} ctx={row['ctx']} "

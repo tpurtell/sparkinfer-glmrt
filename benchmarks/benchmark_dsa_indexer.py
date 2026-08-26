@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark realistic SGLang-like NSA decode plus eager-prefill chunks."""
+"""Benchmark realistic SGLang-like DSA decode plus eager-prefill chunks."""
 
 from __future__ import annotations
 
@@ -15,13 +15,24 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
 
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.reference import (
     contiguous_logits_reference,
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )
-from b12x.attention.nsa_indexer._impl import build_paged_mqa_schedule_metadata, clear_indexer_caches, contiguous_logits, paged_decode_logits, uses_paged_mqa_schedule
-from b12x.attention.nsa_indexer.scratch import INDEXER_SOURCE_LAYOUT_CONTIGUOUS, INDEXER_SOURCE_LAYOUT_PAGED, B12XIndexerScratchCaps, plan_indexer_scratch
+from b12x.attention.dsa_indexer._impl import (
+    build_paged_mqa_schedule_metadata,
+    clear_indexer_caches,
+    contiguous_logits,
+    paged_decode_logits,
+    uses_paged_mqa_schedule,
+)
+from b12x.attention.dsa_indexer.scratch import (
+    INDEXER_SOURCE_LAYOUT_CONTIGUOUS,
+    INDEXER_SOURCE_LAYOUT_PAGED,
+    B12XIndexerScratchCaps,
+    plan_indexer_scratch,
+)
 
 from benchmarks.common import (
     bench_cuda_graph,
@@ -132,7 +143,9 @@ def _make_page_table(
     num_tokens = int(token_locs_cpu.numel())
     out = torch.full((rows, width), -1, dtype=torch.int32)
     for row in range(rows):
-        perm = torch.randperm(num_tokens, generator=gen, dtype=torch.int64)[:valid_per_row]
+        perm = torch.randperm(num_tokens, generator=gen, dtype=torch.int64)[
+            :valid_per_row
+        ]
         ids = token_locs_cpu[perm].to(torch.int32)
         out[row, :valid_per_row] = ids
     return out.to(device=device)
@@ -143,7 +156,7 @@ def _assert_exact_match(actual: torch.Tensor, expected: torch.Tensor) -> None:
         return
     mismatch = int((actual != expected).sum().item())
     raise AssertionError(
-        f"NSA indexer correctness mismatch: {mismatch} differing entries, "
+        f"DSA indexer correctness mismatch: {mismatch} differing entries, "
         f"actual[0]={actual[0].tolist()} expected[0]={expected[0].tolist()}"
     )
 
@@ -183,12 +196,16 @@ def _select_ragged_topk_from_logits(
     gather_k = min(topk, logits.shape[1])
     if gather_k == 0:
         return output
-    positions = torch.arange(logits.shape[1], device=logits.device, dtype=torch.int32).unsqueeze(0)
+    positions = torch.arange(
+        logits.shape[1], device=logits.device, dtype=torch.int32
+    ).unsqueeze(0)
     row_start = k_start.unsqueeze(1)
     row_end = row_start + lengths.unsqueeze(1)
     valid = (positions >= row_start) & (positions < row_end)
     masked_logits = torch.where(valid, logits, torch.full_like(logits, float("-inf")))
-    topk_pos = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[:, :gather_k]
+    topk_pos = torch.argsort(masked_logits, dim=1, descending=True, stable=True)[
+        :, :gather_k
+    ]
     topk_values = torch.gather(masked_logits, 1, topk_pos)
     output[:, :gather_k] = torch.where(
         torch.isfinite(topk_values),
@@ -207,8 +224,12 @@ def _make_extend_kv_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     data_bytes = page_size * 128
     total_rows = int(seq_lens.sum().item())
-    k_bytes = torch.empty((total_rows, 128), dtype=torch.uint8, device=index_k_cache.device)
-    scale_bytes = torch.empty((total_rows, 4), dtype=torch.uint8, device=index_k_cache.device)
+    k_bytes = torch.empty(
+        (total_rows, 128), dtype=torch.uint8, device=index_k_cache.device
+    )
+    scale_bytes = torch.empty(
+        (total_rows, 4), dtype=torch.uint8, device=index_k_cache.device
+    )
     write_row = 0
     for batch_row in range(real_page_table.shape[0]):
         seq_len = int(seq_lens[batch_row].item())
@@ -222,7 +243,9 @@ def _make_extend_kv_fp8(
                 data_bytes + slot * 4 : data_bytes + (slot + 1) * 4,
             ]
             write_row += 1
-    return k_bytes.view(torch.float8_e4m3fn), scale_bytes.view(torch.float32).squeeze(-1)
+    return k_bytes.view(torch.float8_e4m3fn), scale_bytes.view(torch.float32).squeeze(
+        -1
+    )
 
 
 def _resolve_graph_width(*, cache_len: int, graph_width: int) -> int:
@@ -304,7 +327,9 @@ def _run_decode_case(
 
     def prepare_decode_graph() -> None:
         graph_page_table_1[:, :cache_len].copy_(live_page_table_1)
-        graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(live_real_page_table)
+        graph_real_page_table[:, : live_real_page_table.shape[1]].copy_(
+            live_real_page_table
+        )
         graph_seqlens.copy_(seqlens)
         if graph_schedule_metadata is not None:
             build_paged_mqa_schedule_metadata(
@@ -430,7 +455,9 @@ def _run_extend_case(
         device=device,
         page_size=cfg.page_size,
     )
-    q_fp8, weights = _make_q_and_weights(rows=total_q, cfg=cfg, seed=seed, device=device)
+    q_fp8, weights = _make_q_and_weights(
+        rows=total_q, cfg=cfg, seed=seed, device=device
+    )
     index_k_cache = _make_index_k_cache(
         active_tokens=cache_len,
         pool_locs=pool_locs,
@@ -459,7 +486,9 @@ def _run_extend_case(
         page_size=cfg.page_size,
     )
     contiguous_lengths = [q_len] * batch
-    batch_offsets = torch.arange(batch, dtype=torch.int32, device=device) * valid_per_row
+    batch_offsets = (
+        torch.arange(batch, dtype=torch.int32, device=device) * valid_per_row
+    )
     k_start = torch.repeat_interleave(batch_offsets, q_len)
     per_request_ke = torch.arange(
         valid_per_row - q_len + 1,
@@ -558,7 +587,9 @@ def _run_extend_case(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("decode", "extend", "both"), default="decode")
+    parser.add_argument(
+        "--mode", choices=("decode", "extend", "both"), default="decode"
+    )
     parser.add_argument("--decode-rows", default="1,16")
     parser.add_argument("--extend-batches", default="8")
     parser.add_argument(
@@ -591,7 +622,9 @@ def main() -> None:
     device = require_sm120()
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
     l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
-    flush_desc = f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)" if l2_flush else "off"
+    flush_desc = (
+        f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)" if l2_flush else "off"
+    )
     print(f"L2 flush: {flush_desc}", file=sys.stderr)
     cfg = _load_glm_config()
     cache_lens = _parse_csv_ints(args.cache_lens)

@@ -48,7 +48,7 @@ def _cache_block_stride_bytes(
     record_bytes: int | None = None,
 ) -> int:
     from b12x.attention._shared.mla.compressed_reference import (
-        COMPRESSED_MLA_BYTES_PER_TOKEN,
+        COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
     if record_bytes is not None:
@@ -59,7 +59,7 @@ def _cache_block_stride_bytes(
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
         expected = int(page_size) * rec
     else:
-        expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
+        expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
     if model_type == ModelType.GLM_NSA and cache.is_contiguous():
         return expected
     # The runtime page stride is part of the packed/padded cache contract.
@@ -328,9 +328,12 @@ def run_unified_prefill(
     #     XV stays FP8). FlashInfer routes topk==128 to this BF16-QK kernel (the
     #     small K-loop where the Q-quant prologue would dominate); it lands a
     #     TIGHTER numeric (no Q-quant loss) than FP8.
-    _mg_enabled = os.environ.get(
-        "B12X_MLA_SM120_PREFILL_MG", "1"
-    ) not in ("0", "false", "False", "off")
+    _mg_enabled = os.environ.get("B12X_MLA_SM120_PREFILL_MG", "1") not in (
+        "0",
+        "false",
+        "False",
+        "off",
+    )
     # ── GLM (ARBITRARY_FP32, q=576, v_has_rope=False) MG gate ──────────────────
     # GLM has the SAME FlashInfer MG head-group structure as DSV4 (one CTA fuses
     # MG_N_HG HPB head groups, sharing the KV gather), differing only in the math

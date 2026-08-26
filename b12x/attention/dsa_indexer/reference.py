@@ -1,4 +1,4 @@
-"""PyTorch references for NSA indexer logits contracts."""
+"""PyTorch references for DSA indexer logits contracts."""
 
 from __future__ import annotations
 

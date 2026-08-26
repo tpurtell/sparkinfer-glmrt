@@ -1,4 +1,9 @@
 from b12x.moe._shared.kernels.w4a16.kernel import (
+    _TC_DECODE_MAX_M,
+    _TC_DECODE_PACK_COLLIDING_PAIRS,
+    _TC_DECODE_PACK_SM_COVERAGE_CAP,
+    _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR,
+    _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR,
     _candidate_tile_fits,
     _w4a16_tc_decode_preferred,
 )
@@ -46,6 +51,33 @@ def test_other_sub64_k_tiles_remain_unsupported() -> None:
 
 def test_tc_decode_planner_keeps_underfilled_direct_route() -> None:
     assert _w4a16_tc_decode_preferred(m=8, topk=6, num_experts=256, sms=188)
+
+
+def test_tc_decode_planner_caps_route_coverage_on_large_gpus() -> None:
+    assert _w4a16_tc_decode_preferred(m=6, topk=8, num_experts=256, sms=188)
+    assert not _w4a16_tc_decode_preferred(m=7, topk=8, num_experts=256, sms=188)
+
+
+def test_tc_decode_coverage_cap_preserves_smaller_gpu_policy() -> None:
+    for sms in range(1, _TC_DECODE_PACK_SM_COVERAGE_CAP + 1):
+        for m in range(1, _TC_DECODE_MAX_M + 1):
+            for topk in (1, 4, 6, 8, 16):
+                for num_experts in (1, 64, 128, 256, 512):
+                    routed_rows = m * topk
+                    uncapped_pack_has_reuse = (
+                        routed_rows * _TC_DECODE_PACK_SM_COVERAGE_DENOMINATOR
+                        >= sms * _TC_DECODE_PACK_SM_COVERAGE_NUMERATOR
+                        and routed_rows * (routed_rows - 1)
+                        >= 2
+                        * _TC_DECODE_PACK_COLLIDING_PAIRS
+                        * num_experts
+                    )
+                    assert _w4a16_tc_decode_preferred(
+                        m=m,
+                        topk=topk,
+                        num_experts=num_experts,
+                        sms=sms,
+                    ) is not uncapped_pack_has_reuse
 
 
 def test_tc_decode_planner_packs_near_full_machine_with_expected_reuse() -> None:

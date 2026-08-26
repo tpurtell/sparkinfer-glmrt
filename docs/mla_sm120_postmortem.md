@@ -19,7 +19,7 @@ commits (`5f342b2e` base → `9349aa31`), validated on RTX PRO 6000 Blackwell (s
   multi-token mixed per-token-length decode, dual-cache (extra tokens, incl. zero-width main),
   split-K + base-2 merge.
 - **It is the only wired sparse-MLA CUDA backend.** The existing front-door functions
-  (`sparse_mla_decode_forward`, `sparse_mla_extend_forward`, `compressed_mla_decode_forward`)
+  (`sparse_mla_decode_forward`, `sparse_mla_extend_forward`, `compressed_sparse_mla_decode_forward`)
   route here automatically on SM120+ CUDA. Unsupported backends, including `backend="legacy"`,
   **RAISE**. Genuinely-upstream-unsupported contracts (mapped `indexed_page_table`, partial
   dual-cache trio) **RAISE** — no silent legacy fallback.
