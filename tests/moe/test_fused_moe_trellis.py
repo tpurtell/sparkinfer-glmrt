@@ -279,6 +279,7 @@ def _plan(
     block_size_m: int,
     device: torch.device | str,
     swiglu_limit: float | None = None,
+    full_rotation_output_dtype: torch.dtype = torch.float32,
 ) -> fused_moe.Plan:
     return fused_moe.plan(
         fused_moe.Caps(
@@ -290,6 +291,7 @@ def _plan(
             quant_mode="w4a16",
             w4a16_block_size_m=block_size_m,
             swiglu_limit=swiglu_limit,
+            full_rotation_output_dtype=full_rotation_output_dtype,
         )
     )
 
@@ -1210,14 +1212,15 @@ def test_full_rotation_topk16_route_parallel_sum_matches_reference(bits: int) ->
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize(
-    "input_dtype,activation,bits,swiglu_limit",
+    "input_dtype,activation,bits,swiglu_limit,output_dtype",
     [
-        (torch.bfloat16, "silu", 2, None),
-        (torch.bfloat16, "silu", 2, 10.0),
-        (torch.bfloat16, "silu", 3, None),
-        (torch.bfloat16, "situ", 3, None),
-        (torch.float16, "silu", 3, None),
-        (torch.float16, "situ", 3, None),
+        (torch.bfloat16, "silu", 2, None, torch.float32),
+        (torch.bfloat16, "silu", 2, None, torch.bfloat16),
+        (torch.bfloat16, "silu", 2, 10.0, torch.float32),
+        (torch.bfloat16, "silu", 3, None, torch.float32),
+        (torch.bfloat16, "situ", 3, None, torch.float32),
+        (torch.float16, "silu", 3, None, torch.float32),
+        (torch.float16, "situ", 3, None, torch.float32),
     ],
 )
 def test_planned_full_rotation_matches_reference_and_captures(
@@ -1225,6 +1228,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
     activation: str,
     bits: int,
     swiglu_limit: float | None,
+    output_dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(20260721)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1276,6 +1280,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         block_size_m=8,
         device=device,
         swiglu_limit=swiglu_limit,
+        full_rotation_output_dtype=output_dtype,
     )
     assert plan.caps.w4a16_block_size_m == 8
     assert plan.full_rotation
@@ -1290,7 +1295,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
     )
     route_map = torch.tensor([0, 0, 0, 1], dtype=torch.int32, device=device)
     output_map = torch.tensor([-1, 0, -1, 1], dtype=torch.int32, device=device)
-    external_output = torch.empty((2, hidden), dtype=torch.float32, device=device)
+    external_output = torch.empty((2, hidden), dtype=output_dtype, device=device)
 
     mapped = fused_moe.bind(
         plan,
@@ -1308,6 +1313,39 @@ def test_planned_full_rotation_matches_reference_and_captures(
     assert mapped_output.data_ptr() == external_output.data_ptr()
     mapped_eager = mapped_output.clone()
 
+    if output_dtype == torch.bfloat16:
+        fp32_plan = _plan(
+            weights,
+            max_tokens=2,
+            num_topk=2,
+            route_num_experts=4,
+            block_size_m=8,
+            device=device,
+            swiglu_limit=swiglu_limit,
+            full_rotation_output_dtype=torch.float32,
+        )
+        fp32_spec = fp32_plan.scratch_specs()[0]
+        fp32_scratch = torch.empty(
+            fp32_spec.shape, dtype=fp32_spec.dtype, device=fp32_spec.device
+        )
+        fp32_external = torch.empty(
+            (2, hidden), dtype=torch.float32, device=device
+        )
+        fp32_mapped = fused_moe.bind(
+            fp32_plan,
+            scratch=fp32_scratch,
+            a=x,
+            experts=weights,
+            topk_weights=router_weights,
+            topk_ids=global_ids,
+            route_expert_map=route_map,
+            output_expert_map=output_map,
+            output=fp32_external,
+        )
+        fp32_result = fused_moe.run(binding=fp32_mapped)
+        torch.cuda.synchronize(device)
+        assert torch.equal(mapped_eager, fp32_result.to(torch.bfloat16))
+
     identity = fused_moe.bind(
         plan,
         scratch=scratch,
@@ -1318,7 +1356,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
     )
     identity_output = identity.run()
     torch.cuda.synchronize(device)
-    assert identity_output.dtype == torch.float32
+    assert identity_output.dtype == output_dtype
     assert torch.allclose(identity_output, mapped_eager, rtol=2.0e-3, atol=2.0e-3)
 
     reference = _reference_full_rotation(
@@ -1334,11 +1372,10 @@ def test_planned_full_rotation_matches_reference_and_captures(
         activation=activation,
         swiglu_limit=swiglu_limit,
     )
-    relative_error = (mapped_eager - reference).norm() / reference.norm().clamp_min(
-        1.0e-9
-    )
+    comparison = mapped_eager.float()
+    relative_error = (comparison - reference).norm() / reference.norm().clamp_min(1.0e-9)
     cosine = torch.nn.functional.cosine_similarity(
-        mapped_eager.flatten(), reference.flatten(), dim=0
+        comparison.flatten(), reference.flatten(), dim=0
     )
     assert float(relative_error) <= 2.0e-2
     assert float(cosine) >= 0.999

@@ -687,6 +687,7 @@ class _TPCoreWorkspacePlan:
     num_topk: int
     device: torch.device
     dtype: torch.dtype
+    full_rotation_output_dtype: torch.dtype
     deterministic_output: bool = False
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
@@ -761,6 +762,7 @@ class TPMoEScratchCaps:
     deterministic_output: bool | None = None
     w4a16_block_size_m: int | None = None
     w4a16_fast_math: bool = True
+    full_rotation_output_dtype: torch.dtype = torch.float32
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -811,6 +813,10 @@ class TPMoEScratchCaps:
             if block_size_m not in (8, 16, 32, 48, 64):
                 raise ValueError("w4a16_block_size_m must be one of 8, 16, 32, 48, 64")
             object.__setattr__(self, "w4a16_block_size_m", block_size_m)
+        if self.full_rotation_output_dtype not in (torch.float32, torch.bfloat16):
+            raise TypeError(
+                "full_rotation_output_dtype must be torch.float32 or torch.bfloat16"
+            )
         object.__setattr__(self, "w4a16_fast_math", bool(self.w4a16_fast_math))
         object.__setattr__(self, "frozen", bool(self.frozen))
 
@@ -2334,7 +2340,7 @@ def _build_tp_moe_fp4_binding_from_views(
         if output is None:
             output = tensors["full_rotation_output"][:m]
         elif (
-            output.dtype != torch.float32
+            output.dtype != plan.full_rotation_output_dtype
             or output.device != a.device
             or output.ndim != 2
             or tuple(output.shape)
@@ -2345,8 +2351,9 @@ def _build_tp_moe_fp4_binding_from_views(
             or not output.is_contiguous()
         ):
             raise ValueError(
-                "full-rotation Trellis output must be a contiguous FP32 live "
-                "or capacity buffer on the input device"
+                "full-rotation Trellis output must be a contiguous "
+                f"{plan.full_rotation_output_dtype} live or capacity buffer "
+                "on the input device"
             )
         output = output[:m]
         # The persistent fused kernel uses this scratch for grid-barrier state.
@@ -2525,10 +2532,15 @@ def _plan_core_workspace(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    full_rotation_output_dtype: torch.dtype = torch.float32,
 ) -> _TPCoreWorkspacePlan:
     source_format = _normalize_fp4_source_format(source_format)
     quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
+    if implementation != "w4a16" and full_rotation_output_dtype != torch.float32:
+        raise ValueError(
+            "full_rotation_output_dtype is only valid for full-rotation Trellis"
+        )
     deterministic_output = bool(deterministic_output and implementation == "dynamic")
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
@@ -2562,6 +2574,14 @@ def _plan_core_workspace(
         )
         requested_route_E = int(route_num_experts or weight_E)
         full_rotation = weight_layout == "trellis3_t256"
+        if full_rotation_output_dtype not in (torch.float32, torch.bfloat16):
+            raise TypeError(
+                "full_rotation_output_dtype must be torch.float32 or torch.bfloat16"
+            )
+        if not full_rotation and full_rotation_output_dtype != torch.float32:
+            raise ValueError(
+                "full_rotation_output_dtype is only valid for full-rotation Trellis"
+            )
         # A route map can expose a larger global router namespace than the
         # local packed weights.  Never shrink below the local weight count,
         # because callers also use route_num_experts to describe compact
@@ -2763,7 +2783,7 @@ def _plan_core_workspace(
                     _TensorAllocSpec(
                         "full_rotation_output",
                         (max_tokens, int(k)),
-                        torch.float32,
+                        full_rotation_output_dtype,
                     ),
                     _TensorAllocSpec(
                         "rotation_a_gate",
@@ -2795,6 +2815,7 @@ def _plan_core_workspace(
             num_topk=num_topk,
             device=device,
             dtype=dtype,
+            full_rotation_output_dtype=full_rotation_output_dtype,
             deterministic_output=False,
             full_rotation=full_rotation,
             trellis_bits=int(trellis_bits),
@@ -2866,6 +2887,7 @@ def _plan_core_workspace(
             num_topk=num_topk,
             device=device,
             dtype=dtype,
+            full_rotation_output_dtype=torch.float32,
             deterministic_output=False,
             tensor_specs=common_specs
             + (
@@ -2993,6 +3015,7 @@ def _plan_core_workspace(
         num_topk=num_topk,
         device=device,
         dtype=dtype,
+        full_rotation_output_dtype=torch.float32,
         deterministic_output=deterministic_output,
         dynamic_physical_tiles=dynamic_tiles,
         dynamic_task_capacity=dynamic_max_tasks,
@@ -6384,6 +6407,7 @@ def plan_tp_moe_arena_layout(
     collect_activation_amax: bool = False,
     deterministic_output: bool | None = None,
     w4a16_block_size_m: int | None = None,
+    full_rotation_output_dtype: torch.dtype = torch.float32,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     if not isinstance(weight_plan, MoEWeightPreparationPlan):
@@ -6484,6 +6508,7 @@ def plan_tp_moe_arena_layout(
             swiglu_limit=plan.swiglu_limit,
             swiglu_alpha=plan.swiglu_alpha,
             swiglu_beta=plan.swiglu_beta,
+            full_rotation_output_dtype=full_rotation_output_dtype,
         )
         core_nbytes = max(core_nbytes, _core_workspace_nbytes(core_plan))
     if route_num_experts > 0:
@@ -6566,6 +6591,11 @@ def _plan_full_rotation_w4a16_launches(
         bucket_tokens=False,
     )
     rotation_input_dtype = _w4a16_element_dtype(core_plan.dtype)
+    full_rotation_output_dtype = (
+        "bf16"
+        if core_plan.full_rotation_output_dtype == torch.bfloat16
+        else "fp32"
+    )
 
     with torch.cuda.device(core_plan.device):
         props = torch.cuda.get_device_properties(core_plan.device)
@@ -6632,6 +6662,7 @@ def _plan_full_rotation_w4a16_launches(
                     hidden_size=core_plan.k,
                     element_dtype="fp16",
                     full_rotation=True,
+                    full_rotation_output_dtype=full_rotation_output_dtype,
                     num_experts=core_plan.weight_E,
                     route_num_experts=(core_plan.route_E if mapped else 0),
                     route_ids_dtype=ids_dtype,
@@ -6754,6 +6785,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=deterministic_output,
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
+        full_rotation_output_dtype=caps.full_rotation_output_dtype,
     )
 
 
@@ -6811,6 +6843,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         swiglu_limit=launch_plan.swiglu_limit,
         swiglu_alpha=launch_plan.swiglu_alpha,
         swiglu_beta=launch_plan.swiglu_beta,
+        full_rotation_output_dtype=caps.full_rotation_output_dtype,
     )
     fused_launches, topk_sum_launches = _plan_full_rotation_w4a16_launches(
         caps=caps,
@@ -7638,12 +7671,12 @@ def build_tp_moe_fp4_binding(
             scale_format = _w4a16_scale_format_for_source(source_format)
         if workspace.full_rotation:
             if workspace.full_rotation_output is None:
-                raise RuntimeError("Trellis workspace is missing its FP32 output")
+                raise RuntimeError("Trellis workspace is missing its output")
             if output is None:
                 common_kwargs["output"] = workspace.full_rotation_output[:m]
             else:
                 if (
-                    output.dtype != torch.float32
+                    output.dtype != workspace.full_rotation_output.dtype
                     or output.device != a.device
                     or output.ndim != 2
                     or tuple(output.shape)
@@ -7654,8 +7687,9 @@ def build_tp_moe_fp4_binding(
                     or not output.is_contiguous()
                 ):
                     raise ValueError(
-                        "full-rotation Trellis output must be a contiguous FP32 "
-                        "live or capacity buffer on the input device"
+                        "full-rotation Trellis output must match the contiguous "
+                        "workspace output dtype and live/capacity shape on the "
+                        "input device"
                     )
                 common_kwargs["output"] = output[:m]
             if topk_ids.dtype not in (torch.int32, torch.int64):
@@ -10437,7 +10471,15 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 "the W4A16 weight plan did not materialize its required representation"
             )
         full_rotation = getattr(prepared, "weight_layout", "") == "trellis3_t256"
-        output_dtype = torch.float32 if full_rotation else a.dtype
+        output_dtype = (
+            output.dtype
+            if full_rotation and output is not None
+            else (torch.float32 if full_rotation else a.dtype)
+        )
+        if full_rotation and output_dtype not in (torch.float32, torch.bfloat16):
+            raise TypeError(
+                "full-rotation output must be torch.float32 or torch.bfloat16"
+            )
         if output is None:
             if torch.cuda.is_current_stream_capturing():
                 raise ValueError(

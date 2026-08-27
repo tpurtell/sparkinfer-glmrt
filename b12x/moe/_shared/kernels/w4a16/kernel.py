@@ -10812,6 +10812,9 @@ def _w4a16_topk_sum_launch_flat(
     svh_table: torch.Tensor | None = None,
 ) -> None:
     full_rotation = bool(full_rotation)
+    full_rotation_output_dtype = (
+        "bf16" if full_rotation and output.dtype == torch.bfloat16 else "fp32"
+    )
     route_ids_dtype = (
         torch.int32 if route_expert_ids is None else route_expert_ids.dtype
     )
@@ -10828,6 +10831,7 @@ def _w4a16_topk_sum_launch_flat(
         hidden_size=hidden_size,
         element_dtype=element_dtype,
         full_rotation=full_rotation,
+        full_rotation_output_dtype=full_rotation_output_dtype,
         num_experts=num_experts,
         route_num_experts=route_num_experts,
         route_ids_dtype=route_ids_dtype,
@@ -10853,7 +10857,15 @@ def _w4a16_topk_sum_launch_flat(
             assumed_align=16,
         ),
         make_ptr(
-            cutlass.Float32 if full_rotation else _cutlass_element_dtype(element_dtype),
+            (
+                cutlass.BFloat16
+                if full_rotation_output_dtype == "bf16"
+                else (
+                    cutlass.Float32
+                    if full_rotation
+                    else _cutlass_element_dtype(element_dtype)
+                )
+            ),
             output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
@@ -11739,9 +11751,10 @@ def run_w4a16_moe(
         element_dtype = _normalize_element_dtype(prepared_dtype)
         if element_dtype != "fp16":
             raise TypeError("full_rotation requires fp16 prepared weights/scratch")
-        if output.dtype != torch.float32:
+        if output.dtype not in (torch.float32, torch.bfloat16):
             raise TypeError(
-                f"full_rotation output must be torch.float32, got {output.dtype}"
+                "full_rotation output must be torch.float32 or torch.bfloat16, "
+                f"got {output.dtype}"
             )
     else:
         element_dtype = rotation_input_dtype
@@ -12700,6 +12713,9 @@ def run_w4a16_moe(
         full_rotation or use_direct_topk_routes
     )
     if topk_sum_launch is not None:
+        full_rotation_output_dtype = (
+            "bf16" if full_rotation and output.dtype == torch.bfloat16 else "fp32"
+        )
         expected_sum = (
             topk,
             hidden_size,
@@ -12708,6 +12724,7 @@ def run_w4a16_moe(
             0 if not sum_uses_map else int(sum_expert_map.numel()),
             topk_ids.dtype if full_rotation or sum_uses_map else torch.int32,
             sum_uses_map,
+            full_rotation_output_dtype,
         )
         actual_sum = (
             int(topk_sum_launch.topk),
@@ -12717,6 +12734,7 @@ def run_w4a16_moe(
             int(getattr(topk_sum_launch, "route_num_experts", 0)),
             getattr(topk_sum_launch, "route_ids_dtype", torch.int32),
             bool(getattr(topk_sum_launch, "use_expert_map", False)),
+            str(getattr(topk_sum_launch, "full_rotation_output_dtype", "fp32")),
         )
         if actual_sum != expected_sum:
             raise RuntimeError(

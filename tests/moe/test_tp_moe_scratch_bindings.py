@@ -607,6 +607,50 @@ def test_trellis_scratch_plan_resolves_default_route_block(
     assert 4096 not in plan.layout.core_token_counts
 
 
+def test_trellis_scratch_plan_can_own_bf16_epilogue_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_plan_full_rotation_w4a16_launches",
+        lambda **_kwargs: ((), ()),
+    )
+    weight_plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        trellis_bits=4,
+        trellis_tile_config=(64, 128, 64, 128),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=4,
+            core_token_counts=(4,),
+            num_topk=2,
+            route_num_experts=0,
+            device="cpu",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=8,
+            full_rotation_output_dtype=torch.bfloat16,
+        )
+    )
+
+    assert plan._core_workspace_plan.full_rotation_output_dtype == torch.bfloat16
+    output_spec = next(
+        spec
+        for spec in plan._core_workspace_plan.tensor_specs
+        if spec.name == "full_rotation_output"
+    )
+    assert output_spec.shape == (4, 128)
+    assert output_spec.dtype == torch.bfloat16
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""
