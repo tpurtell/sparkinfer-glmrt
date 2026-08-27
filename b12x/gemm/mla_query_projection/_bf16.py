@@ -12,6 +12,7 @@ import triton.language as tl
 from .._shared.mxfp8_bmm import _overlaps, _torch_stream
 
 _NOPE_DIM = 192
+_GLM_NOPE_DIM = 256
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _QUERY_DIM = _LATENT_DIM + _ROPE_DIM
@@ -21,7 +22,7 @@ _GLM_H64_HEADS = 64
 _GLM_H64_QUALIFIED_HEADS = frozenset((_GLM_H64_HEADS,))
 _BLOCK_N = 32
 _BLOCK_K = 64
-_COMPILED_SIGNATURES: set[tuple[int, int, bool]] = set()
+_COMPILED_SIGNATURES: set[tuple[int, int, bool, bool, int]] = set()
 
 
 @triton.jit
@@ -41,6 +42,7 @@ def _mla_query_projection_bf16_kernel(
     out_stride_m,
     out_stride_h,
     OUTPUT_FP8: tl.constexpr,
+    ZERO_ROPE: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     LATENT_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -85,13 +87,16 @@ def _mla_query_projection_bf16_kernel(
     # from the projected columns and removes the separate concat/quant launch.
     if n_block == 0:
         rope_cols = tl.arange(0, ROPE_DIM)
-        pe_ptrs = (
-            q_pe_ptr
-            + rows[:, None] * pe_stride_m
-            + head * pe_stride_h
-            + rope_cols[None, :]
-        )
-        rope = tl.load(pe_ptrs, mask=row_mask[:, None], other=0.0)
+        if ZERO_ROPE:
+            rope = tl.zeros((BLOCK_M, ROPE_DIM), tl.bfloat16)
+        else:
+            pe_ptrs = (
+                q_pe_ptr
+                + rows[:, None] * pe_stride_m
+                + head * pe_stride_h
+                + rope_cols[None, :]
+            )
+            rope = tl.load(pe_ptrs, mask=row_mask[:, None], other=0.0)
         rope_out_ptrs = (
             out_ptr
             + rows[:, None] * out_stride_m
@@ -116,24 +121,34 @@ def _validate(
     *,
     qualified_heads: frozenset[int] = _QUALIFIED_HEADS,
     contract: str = "the BF16 fused MLA query specialization",
+    allow_nope: bool = False,
+    expected_nope_dim: int = _NOPE_DIM,
 ) -> tuple[int, int, bool]:
     if q_nope.ndim != 3:
         raise ValueError(f"q_nope must have shape [H,M,192], got {q_nope.shape}")
     heads, m, nope_dim = map(int, q_nope.shape)
-    if heads not in qualified_heads or not 1 <= m <= _MAX_M or nope_dim != _NOPE_DIM:
+    if (
+        heads not in qualified_heads
+        or not 1 <= m <= _MAX_M
+        or nope_dim != expected_nope_dim
+    ):
         raise NotImplementedError(
             f"{contract} requires "
-            f"H in {sorted(qualified_heads)}, 1<=M<=32, K=192; "
+            f"H in {sorted(qualified_heads)}, 1<=M<=32, K={expected_nope_dim}; "
             f"got H={heads}, M={m}, K={nope_dim}"
         )
-    if tuple(weight.shape) != (heads, _NOPE_DIM, _LATENT_DIM):
+    if tuple(weight.shape) != (heads, expected_nope_dim, _LATENT_DIM):
         raise ValueError(
             "weight must have shape "
-            f"{(heads, _NOPE_DIM, _LATENT_DIM)}, got {tuple(weight.shape)}"
+            f"{(heads, expected_nope_dim, _LATENT_DIM)}, got {tuple(weight.shape)}"
         )
-    if tuple(q_pe.shape) != (m, heads, _ROPE_DIM):
+    valid_q_pe_shapes = {(m, heads, _ROPE_DIM)}
+    if allow_nope:
+        valid_q_pe_shapes.add((m, heads, 0))
+    if tuple(q_pe.shape) not in valid_q_pe_shapes:
         raise ValueError(
-            f"q_pe must have shape {(m, heads, _ROPE_DIM)}, got {tuple(q_pe.shape)}"
+            f"q_pe must have shape in {sorted(valid_q_pe_shapes)}, "
+            f"got {tuple(q_pe.shape)}"
         )
     if tuple(out.shape) != (m, heads, _QUERY_DIM):
         raise ValueError(
@@ -196,6 +211,7 @@ def _launch_validated(
     heads: int,
     m: int,
     output_fp8: bool,
+    zero_rope: bool = False,
 ) -> None:
     block_m = 16 if m <= 16 else 32
     device_index = int(
@@ -203,7 +219,8 @@ def _launch_validated(
         if q_nope.device.index is not None
         else torch.cuda.current_device()
     )
-    signature = (device_index, block_m, output_fp8)
+    nope_dim = int(q_nope.shape[-1])
+    signature = (device_index, block_m, output_fp8, zero_rope, nope_dim)
     if (
         torch.cuda.is_current_stream_capturing()
         and signature not in _COMPILED_SIGNATURES
@@ -232,7 +249,8 @@ def _launch_validated(
         out.stride(0),
         out.stride(1),
         OUTPUT_FP8=output_fp8,
-        NOPE_DIM=_NOPE_DIM,
+        ZERO_ROPE=zero_rope,
+        NOPE_DIM=nope_dim,
         LATENT_DIM=_LATENT_DIM,
         ROPE_DIM=_ROPE_DIM,
         BLOCK_M=block_m,
@@ -272,6 +290,7 @@ def _launch_glm_h64_bf16(
 ) -> None:
     if out.dtype != torch.bfloat16:
         raise TypeError("the explicit GLM H64 MLA query output must be bfloat16")
+    zero_rope = q_pe.ndim == 3 and int(q_pe.shape[-1]) == 0
     heads, m, output_fp8 = _validate(
         q_nope,
         weight,
@@ -280,6 +299,8 @@ def _launch_glm_h64_bf16(
         out,
         qualified_heads=_GLM_H64_QUALIFIED_HEADS,
         contract="the explicit GLM H64 BF16 MLA query specialization",
+        allow_nope=True,
+        expected_nope_dim=_GLM_NOPE_DIM if zero_rope else _NOPE_DIM,
     )
     assert not output_fp8
     _launch_validated(
@@ -291,6 +312,7 @@ def _launch_glm_h64_bf16(
         heads=heads,
         m=m,
         output_fp8=False,
+        zero_rope=zero_rope,
     )
 
 
@@ -461,12 +483,14 @@ def prewarm_glm_h64_bf16(
     *,
     stream: Optional[object] = None,
     synchronize: bool = True,
+    nope: bool = False,
 ) -> int:
     """Compile and first-launch every declared GLM H64 BF16 M regime."""
-    if tuple(weight.shape) != (_GLM_H64_HEADS, _NOPE_DIM, _LATENT_DIM):
+    expected_nope_dim = _GLM_NOPE_DIM if nope else _NOPE_DIM
+    if tuple(weight.shape) != (_GLM_H64_HEADS, expected_nope_dim, _LATENT_DIM):
         raise ValueError(
             "GLM H64 BF16 weight must have shape "
-            f"{(_GLM_H64_HEADS, _NOPE_DIM, _LATENT_DIM)}, "
+            f"{(_GLM_H64_HEADS, expected_nope_dim, _LATENT_DIM)}, "
             f"got {tuple(weight.shape)}"
         )
     if weight.dtype != torch.bfloat16:
@@ -480,7 +504,7 @@ def prewarm_glm_h64_bf16(
         if not can_implement_glm_h64_bf16(
             num_heads=_GLM_H64_HEADS,
             max_m=m,
-            nope_dim=_NOPE_DIM,
+            nope_dim=expected_nope_dim,
             latent_dim=_LATENT_DIM,
             output_dtype=torch.bfloat16,
             device=weight.device,
@@ -498,12 +522,12 @@ def prewarm_glm_h64_bf16(
                 continue
             warmed_regimes.add(block_m)
             q_nope = torch.zeros(
-                (_GLM_H64_HEADS, m, _NOPE_DIM),
+                (_GLM_H64_HEADS, m, expected_nope_dim),
                 dtype=torch.bfloat16,
                 device=weight.device,
             )
             q_pe = torch.zeros(
-                (m, _GLM_H64_HEADS, _ROPE_DIM),
+                (m, _GLM_H64_HEADS, 0 if nope else _ROPE_DIM),
                 dtype=torch.bfloat16,
                 device=weight.device,
             )
@@ -556,7 +580,7 @@ def can_implement_glm_h64_bf16(
     return bool(
         int(num_heads) == _GLM_H64_HEADS
         and 1 <= int(max_m) <= _MAX_M
-        and int(nope_dim) == _NOPE_DIM
+        and int(nope_dim) in (_NOPE_DIM, _GLM_NOPE_DIM)
         and int(latent_dim) == _LATENT_DIM
         and output_dtype == torch.bfloat16
     )

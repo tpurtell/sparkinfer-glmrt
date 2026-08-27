@@ -140,9 +140,11 @@ def run_glm_h64_bf16(
     """Run the explicit one-launch GLM H=64 BF16 query projection.
 
     This intentionally does not widen :func:`run`'s generic BF16 geometry.
-    It accepts a head-major ``q_nope`` view ``[64,M,192]``, the K slice of
-    GLM's sole resident KV-B tensor as ``[64,192,512]``, token-major
-    ``q_pe`` ``[M,64,64]``, and caller-owned BF16 ``out`` ``[M,64,576]``.
+    It accepts a head-major ``q_nope`` view ``[64,M,192]`` plus a 64-wide
+    ``q_pe``, or GLM-5.3's NoPE ``q_nope`` view ``[64,M,256]`` plus an empty
+    ``q_pe`` view.  The corresponding K slice of the resident KV-B tensor is
+    ``[64,K,512]`` and caller-owned BF16 ``out`` is ``[M,64,576]``.  The
+    NoPE form writes an exact-zero suffix directly in the fused epilogue.
     Arbitrary outer strides are supported; innermost dimensions must remain
     contiguous.  ``1 <= M <= 32``.
     """
@@ -161,6 +163,7 @@ def prewarm_glm_h64_bf16(
     *,
     stream: Optional[object] = None,
     synchronize: bool = True,
+    nope: bool = False,
 ) -> int:
     """Compile and first-launch the declared H=64 BF16 graph regimes."""
     return _bf16.prewarm_glm_h64_bf16(
@@ -168,6 +171,7 @@ def prewarm_glm_h64_bf16(
         m_values,
         stream=stream,
         synchronize=synchronize,
+        nope=nope,
     )
 
 
