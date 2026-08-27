@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x.attention._shared.mla import api, traits
+from b12x.attention._shared.mla import api, smem, traits
 from b12x.attention._shared.mla.kernel import (
     run_unified_decode,
 )
@@ -58,6 +58,15 @@ def test_api_uses_traits_fp8_rope_gate(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(traits, "KV_FP8_ROPE_ENABLED", False)
     assert api._resolve_kv_fp8_rope(None) is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_smem_module_asserts_do_not_depend_on_glm_fp8_rope_env(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    monkeypatch.setattr(traits, "KV_FP8_ROPE_ENABLED", enabled)
+    smem._run_module_asserts()
 
 
 def _run_invalid_nvfp4_decode(*, record_bytes: int, fp8_rope: bool | None) -> None:

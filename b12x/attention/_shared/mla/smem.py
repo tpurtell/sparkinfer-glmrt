@@ -507,11 +507,25 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
 # import time (pure Python) and guard against a layout change blowing the SM120
 # carveout or desyncing KV_SMEM_STRIDE / Q_NOPE_STRIDE from the traits.
 # ---------------------------------------------------------------------------
-def _assert_model(model_type: int, compute_mode: int, scale_format: int) -> int:
+def _assert_model(
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    *,
+    fp8_rope: bool = False,
+) -> int:
     # Imported lazily to keep this module's top-level import order simple.
     from .traits import make_unified_traits
 
-    traits = make_unified_traits(model_type, compute_mode, scale_format)
+    # Module assertions validate fixed cache ABIs, not the process-wide GLM
+    # KV_FP8_ROPE selection.  Passing the mode explicitly also prevents the
+    # GLM-only compact-record gate from leaking into the DSV4 NVFP4 check.
+    traits = make_unified_traits(
+        model_type,
+        compute_mode,
+        scale_format,
+        fp8_rope=fp8_rope,
+    )
     layout = make_smem_layout(traits)
     # This constructor validates every typed field offset and the exact total
     # that CUTLASS DSL 4.6 infers for the launch's dynamic shared memory.
@@ -554,6 +568,12 @@ def _run_module_asserts() -> None:
     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
+    _assert_model(
+        ModelType.GLM_NSA,
+        ComputeMode.BF16,
+        ScaleFormat.NVFP4_E4M3,
+        fp8_rope=True,
+    )
     # Sanity on the expected magnitudes (~92KB DSV4, ~96KB GLM after the
     # double-buffered KV + footer + w_fp8 refinements).
     assert 80 * 1024 <= dsv4 <= 96 * 1024, f"DSV4 smem {dsv4}B outside ~92KB band"
