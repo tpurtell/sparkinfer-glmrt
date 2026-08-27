@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from b12x.norm.mhc._impl import (
     B12XMHCScratchCaps,
     _is_default_mhc_epsilon,
+    _is_supported_mhc_rms_epsilon,
     plan_mhc_scratch,
     b12x_mhc_head,
     b12x_mhc_post,
@@ -22,6 +23,15 @@ def test_default_mhc_epsilon_accepts_f32_abi_round_trip() -> None:
     assert _is_default_mhc_epsilon(1.0e-6)
     assert _is_default_mhc_epsilon(f32_epsilon)
     assert not _is_default_mhc_epsilon(1.1e-6)
+
+
+def test_glm_mhc_rms_epsilon_is_supported() -> None:
+    glm_f32_epsilon = float(torch.tensor(1.0e-5, dtype=torch.float32).item())
+
+    assert _is_supported_mhc_rms_epsilon(1.0e-6)
+    assert _is_supported_mhc_rms_epsilon(1.0e-5)
+    assert _is_supported_mhc_rms_epsilon(glm_f32_epsilon)
+    assert not _is_supported_mhc_rms_epsilon(1.1e-5)
 
 
 def _mhc_pre_reference(
@@ -592,6 +602,75 @@ def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> No
     ).to(torch.bfloat16)
     torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
     torch.testing.assert_close(y, y_ref, rtol=0.0, atol=6e-3)
+    torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
+
+
+def test_b12x_mhc_fused_post_pre_glm_eps_matches_reference() -> None:
+    device = require_b12x()
+    tokens = 1
+    hidden_size = 4096
+    rms_eps = 1.0e-5
+    hc_eps = 1.0e-6
+    norm_eps = 1.0e-5
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        seed=91_553,
+        device=device,
+    )
+    binding = _make_mhc_binding(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        device=device,
+    )
+    norm_weight = torch.ones(
+        (hidden_size,), dtype=torch.bfloat16, device=device
+    )
+    _, prev_post, prev_comb = _mhc_pre_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=20,
+    )
+
+    residual_cur, post, comb, y = b12x_mhc_post_pre(
+        x,
+        residual,
+        prev_post.contiguous(),
+        prev_comb.contiguous(),
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=20,
+        binding=binding,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+    residual_ref = _mhc_post_reference(x, residual, prev_post, prev_comb)
+    y_raw_ref, post_ref, comb_ref = _mhc_pre_reference(
+        residual_ref,
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=20,
+        y_dtype=torch.float32,
+    )
+    y_ref = (
+        y_raw_ref.to(torch.bfloat16).float()
+        * torch.rsqrt(y_raw_ref.square().mean(dim=-1, keepdim=True) + norm_eps)
+        * norm_weight.float()
+    ).to(torch.bfloat16)
+
+    torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
+    torch.testing.assert_close(y, y_ref, rtol=0.0, atol=8e-3)
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
 

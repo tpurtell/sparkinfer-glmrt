@@ -33,6 +33,7 @@ MHC_SOURCE_TILE_H = 128
 MHC_GRAM_BLOCK_H = 1024
 MHC_SUPPORTED_HIDDEN_SIZES = (4096, 7168)
 MHC_DEFAULT_EPS = 1.0e-6
+MHC_GLM_RMS_EPS = 1.0e-5
 
 
 def _is_default_mhc_epsilon(value: float) -> bool:
@@ -44,6 +45,16 @@ def _is_default_mhc_epsilon(value: float) -> bool:
         MHC_DEFAULT_EPS,
         rel_tol=0.0,
         abs_tol=1.0e-12,
+    )
+
+
+def _is_supported_mhc_rms_epsilon(value: float) -> bool:
+    """Admit the trained DeepSeek and GLM RMS epsilon specializations."""
+
+    value = float(value)
+    return math.isfinite(value) and any(
+        math.isclose(value, supported, rel_tol=0.0, abs_tol=1.0e-12)
+        for supported in (MHC_DEFAULT_EPS, MHC_GLM_RMS_EPS)
     )
 
 
@@ -889,7 +900,7 @@ def _b12x_mhc_pre_impl(
             block_k=block_k,
             block_h=block_h,
         )
-        and _is_default_mhc_epsilon(rms_eps)
+        and _is_supported_mhc_rms_epsilon(rms_eps)
         and _is_default_mhc_epsilon(hc_eps)
         and sinkhorn_iters == 20
     ):
@@ -1191,7 +1202,7 @@ def _b12x_mhc_post_pre_impl(
             block_k=block_k,
             block_h=block_h,
         )
-        and _is_default_mhc_epsilon(rms_eps)
+        and _is_supported_mhc_rms_epsilon(rms_eps)
         and _is_default_mhc_epsilon(hc_eps)
         and sinkhorn_iters == 20
     ):
