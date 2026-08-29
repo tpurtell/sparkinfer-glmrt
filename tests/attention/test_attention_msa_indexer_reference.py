@@ -4,8 +4,8 @@ import math
 
 import torch
 
-from b12x.attention.nsa_indexer._impl import msa_topk_blocks
-from b12x.attention.nsa_indexer.msa_reference import (
+from b12x.attention.dsa_indexer._impl import msa_topk_blocks
+from b12x.attention.dsa_indexer.msa_reference import (
     MSA_BLOCK_TOKENS,
     MSA_SM_SCALE,
     MSA_TOPK_BLOCKS,
@@ -15,7 +15,7 @@ from b12x.attention.nsa_indexer.msa_reference import (
     msa_select_blocks_reference,
     quantize_msa_q_fp8_reference,
 )
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.reference import (
     pack_index_k_cache_reference,
     unpack_index_k_cache_reference,
 )
@@ -146,12 +146,16 @@ def test_msa_paged_decode_block_scores_reference_matches_token_loop() -> None:
     gen.manual_seed(91_102)
     k = torch.randn((total_pages * 64, 128), generator=gen, dtype=torch.float32) / 4
     index_k_cache = pack_index_k_cache_reference(k)
-    k_dequant = unpack_index_k_cache_reference(index_k_cache, num_tokens=total_pages * 64)
+    k_dequant = unpack_index_k_cache_reference(
+        index_k_cache, num_tokens=total_pages * 64
+    )
     real_page_table = torch.full((3, width_pages), -1, dtype=torch.int32)
     seqlens = torch.tensor([63, 129, 255], dtype=torch.int32)
     for row, start in enumerate(page_starts):
         pages = (int(seqlens[row]) + 63) // 64
-        real_page_table[row, :pages] = torch.arange(start, start + pages, dtype=torch.int32)
+        real_page_table[row, :pages] = torch.arange(
+            start, start + pages, dtype=torch.int32
+        )
 
     actual = msa_paged_decode_block_scores_reference(
         q_fp8=q_fp8,
@@ -180,7 +184,9 @@ def test_msa_select_blocks_reference_forces_local_sorts_and_pads() -> None:
         query_positions=torch.tensor([0], dtype=torch.int32),
         topk=MSA_TOPK_BLOCKS,
     )
-    expected = torch.tensor([[[0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]]])
+    expected = torch.tensor(
+        [[[0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]]]
+    )
     assert torch.equal(actual, expected.to(torch.int32))
 
     all_inf = torch.full((1, 1, 4), float("-inf"), dtype=torch.float32)
@@ -189,7 +195,9 @@ def test_msa_select_blocks_reference_forces_local_sorts_and_pads() -> None:
         query_positions=torch.tensor([2 * MSA_BLOCK_TOKENS], dtype=torch.int32),
         topk=6,
     )
-    assert torch.equal(forced, torch.tensor([[[2, -1, -1, -1, -1, -1]]], dtype=torch.int32))
+    assert torch.equal(
+        forced, torch.tensor([[[2, -1, -1, -1, -1, -1]]], dtype=torch.int32)
+    )
 
 
 def test_msa_topk_blocks_matches_reference_with_block_base() -> None:
@@ -198,7 +206,9 @@ def test_msa_topk_blocks_matches_reference_with_block_base() -> None:
     scores[:, 0, 4:8] = torch.tensor([0.1, 0.4, 0.2, 0.3])
     scores[:, 1, 2:6] = torch.tensor([0.5, 0.1, 0.3, 0.2])
     scores = scores + jitter
-    query_positions = torch.tensor([5 * MSA_BLOCK_TOKENS, 3 * MSA_BLOCK_TOKENS], dtype=torch.int32)
+    query_positions = torch.tensor(
+        [5 * MSA_BLOCK_TOKENS, 3 * MSA_BLOCK_TOKENS], dtype=torch.int32
+    )
     block_base = torch.tensor([4, 2], dtype=torch.int32)
 
     actual = msa_topk_blocks(

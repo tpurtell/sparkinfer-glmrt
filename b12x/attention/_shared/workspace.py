@@ -347,7 +347,7 @@ class B12XAttentionArenaCaps:
     max_chunks_per_row: int = 64
     reserve_extend_indexer_logits: bool = True
     reserve_paged_indexer_logits: bool = True
-    reserve_compressed_mla_staging: bool = False
+    reserve_compressed_sparse_mla_staging: bool = False
     reserve_mhc: bool = False
     mhc_max_tokens: int = 0
     mhc_hidden_size: int = 0
@@ -445,8 +445,8 @@ class B12XAttentionArenaCaps:
         )
         object.__setattr__(
             self,
-            "reserve_compressed_mla_staging",
-            bool(self.reserve_compressed_mla_staging),
+            "reserve_compressed_sparse_mla_staging",
+            bool(self.reserve_compressed_sparse_mla_staging),
         )
         object.__setattr__(self, "reserve_mhc", bool(self.reserve_mhc))
         object.__setattr__(self, "mhc_max_tokens", max(int(self.mhc_max_tokens), 0))
@@ -902,7 +902,7 @@ class B12XAttentionArena:
             compressed_indexed_lengths_stage_offset_bytes
         ) = 0
         compressed_indexed_page_table_stage_offset_bytes = 0
-        if caps.reserve_compressed_mla_staging:
+        if caps.reserve_compressed_sparse_mla_staging:
             compressed_q_stage_nbytes = (
                 mla_max_total_q
                 * int(caps.num_q_heads)
@@ -1756,12 +1756,12 @@ class B12XAttentionWorkspace:
     indexer_contiguous_lengths: torch.Tensor | None = None
     indexer_contiguous_mapped_indices: torch.Tensor | None = None
     indexer_paged_logits: torch.Tensor | None = None
-    compressed_mla_q_stage: torch.Tensor | None = None
-    compressed_mla_swa_indices_stage: torch.Tensor | None = None
-    compressed_mla_swa_lengths_stage: torch.Tensor | None = None
-    compressed_mla_indexed_indices_stage: torch.Tensor | None = None
-    compressed_mla_indexed_lengths_stage: torch.Tensor | None = None
-    compressed_mla_indexed_page_table_stage: torch.Tensor | None = None
+    compressed_sparse_mla_q_stage: torch.Tensor | None = None
+    compressed_sparse_mla_swa_indices_stage: torch.Tensor | None = None
+    compressed_sparse_mla_swa_lengths_stage: torch.Tensor | None = None
+    compressed_sparse_mla_indexed_indices_stage: torch.Tensor | None = None
+    compressed_sparse_mla_indexed_lengths_stage: torch.Tensor | None = None
+    compressed_sparse_mla_indexed_page_table_stage: torch.Tensor | None = None
     # Phantom tensors for stable host-launcher cache keys (fixed_capacity only).
     _contract_q: torch.Tensor | None = None
     _contract_kv_rows: torch.Tensor | None = None
@@ -1914,7 +1914,7 @@ class B12XAttentionWorkspace:
         paged_indexer_logits_k_rows: int = 0,
         paged_indexer_tile_logits_k_rows: int = 0,
         max_chunks_per_row: int = 64,
-        reserve_compressed_mla_staging: bool = False,
+        reserve_compressed_sparse_mla_staging: bool = False,
     ) -> B12XAttentionWorkspace:
         device = _canonical_device(device)
         if indexer_num_q_heads is None:
@@ -1950,7 +1950,7 @@ class B12XAttentionWorkspace:
             padded_heads=padded_heads,
             max_chunks_per_row=max_chunks_per_row,
             reserve_paged_indexer_logits=reserve_paged_indexer_logits,
-            reserve_compressed_mla_staging=reserve_compressed_mla_staging,
+            reserve_compressed_sparse_mla_staging=reserve_compressed_sparse_mla_staging,
             paged_indexer_logits_q_rows=int(paged_indexer_logits_q_rows),
             paged_indexer_logits_k_rows=int(paged_indexer_logits_k_rows),
             paged_indexer_tile_logits_k_rows=int(paged_indexer_tile_logits_k_rows),
@@ -1984,7 +1984,7 @@ class B12XAttentionWorkspace:
         topk = int(self.indexer_topk)
         if topk <= 0:
             return
-        from b12x.attention.nsa_indexer.fused_indexer import (
+        from b12x.attention.dsa_indexer.fused_indexer import (
             fused_indexer_scratch_max_rows,
             fused_indexer_scratch_capacity,
         )
@@ -2018,7 +2018,7 @@ class B12XAttentionWorkspace:
             raise RuntimeError(
                 "fused indexer scratch unavailable (non-CUDA workspace or topk<=0)"
             )
-        from b12x.attention.nsa_indexer.fused_indexer import (
+        from b12x.attention.dsa_indexer.fused_indexer import (
             fused_indexer_scratch_max_rows,
             fused_indexer_scratch_capacity,
         )
@@ -2196,41 +2196,47 @@ class B12XAttentionWorkspace:
             dtype=torch.float32,
         )
         if self.compressed_q_stage_nbytes:
-            self.compressed_mla_q_stage, _ = _materialize_arena_view(
+            self.compressed_sparse_mla_q_stage, _ = _materialize_arena_view(
                 self.shared_arena,
                 offset_bytes=self.arena.compressed_q_stage_offset_bytes,
                 shape=(max_total_q, int(self.num_q_heads), int(self.head_dim)),
                 dtype=self.dtype,
             )
-            self.compressed_mla_swa_indices_stage, _ = _materialize_arena_view(
+            self.compressed_sparse_mla_swa_indices_stage, _ = _materialize_arena_view(
                 self.shared_arena,
                 offset_bytes=self.arena.compressed_swa_indices_stage_offset_bytes,
                 shape=(max_total_q, int(self.topk)),
                 dtype=torch.int32,
             )
-            self.compressed_mla_swa_lengths_stage, _ = _materialize_arena_view(
+            self.compressed_sparse_mla_swa_lengths_stage, _ = _materialize_arena_view(
                 self.shared_arena,
                 offset_bytes=self.arena.compressed_swa_lengths_stage_offset_bytes,
                 shape=(max_total_q,),
                 dtype=torch.int32,
             )
-            self.compressed_mla_indexed_indices_stage, _ = _materialize_arena_view(
-                self.shared_arena,
-                offset_bytes=self.arena.compressed_indexed_indices_stage_offset_bytes,
-                shape=(max_total_q, int(self.topk)),
-                dtype=torch.int32,
+            self.compressed_sparse_mla_indexed_indices_stage, _ = (
+                _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=self.arena.compressed_indexed_indices_stage_offset_bytes,
+                    shape=(max_total_q, int(self.topk)),
+                    dtype=torch.int32,
+                )
             )
-            self.compressed_mla_indexed_lengths_stage, _ = _materialize_arena_view(
-                self.shared_arena,
-                offset_bytes=self.arena.compressed_indexed_lengths_stage_offset_bytes,
-                shape=(max_total_q,),
-                dtype=torch.int32,
+            self.compressed_sparse_mla_indexed_lengths_stage, _ = (
+                _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=self.arena.compressed_indexed_lengths_stage_offset_bytes,
+                    shape=(max_total_q,),
+                    dtype=torch.int32,
+                )
             )
-            self.compressed_mla_indexed_page_table_stage, _ = _materialize_arena_view(
-                self.shared_arena,
-                offset_bytes=self.arena.compressed_indexed_page_table_stage_offset_bytes,
-                shape=(max_total_q, int(self.max_page_table_width)),
-                dtype=torch.int32,
+            self.compressed_sparse_mla_indexed_page_table_stage, _ = (
+                _materialize_arena_view(
+                    self.shared_arena,
+                    offset_bytes=self.arena.compressed_indexed_page_table_stage_offset_bytes,
+                    shape=(max_total_q, int(self.max_page_table_width)),
+                    dtype=torch.int32,
+                )
             )
 
         if indexer_k_rows > 0:
@@ -2526,7 +2532,7 @@ class B12XAttentionWorkspace:
         # workspace capacity instead of the live ragged row count for this prefill.
         return buffer
 
-    def bind_compressed_mla(
+    def bind_compressed_sparse_mla(
         self,
         *,
         q: torch.Tensor,
@@ -2536,11 +2542,11 @@ class B12XAttentionWorkspace:
         indexed_lengths: torch.Tensor | None = None,
         indexed_page_table: torch.Tensor | None = None,
     ):
-        from b12x.attention.compressed_mla._scratch import (
-            build_compressed_mla_binding,
+        from b12x.attention.compressed_sparse_mla._scratch import (
+            build_compressed_sparse_mla_binding,
         )
 
-        return build_compressed_mla_binding(
+        return build_compressed_sparse_mla_binding(
             scratch=self,
             q=q,
             swa_indices=swa_indices,

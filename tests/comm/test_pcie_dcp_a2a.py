@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from b12x.comm.pcie import kimi_topk16
 from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
@@ -131,16 +134,39 @@ class _FakeKimiRuntime(PCIeDCPA2A):
         device_slot_selection,
     ):
         del local_router, correction_bias, slot, device_slot_selection
-        out_down.copy_(torch.cat((local_down,) * 16, dim=1))
+        out_down.copy_(torch.cat((local_down,) * self.world_size, dim=1))
         topk_weights.fill_(1.0 / 16.0)
         topk_ids.copy_(torch.arange(16, dtype=torch.int32).view(1, 16))
+
+    def _launch_kimi_topk16(
+        self,
+        router_logits,
+        correction_bias,
+        output_weights,
+        output_ids,
+        *,
+        threads,
+    ):
+        del router_logits, correction_bias, threads
+        output_weights.fill_(1.0 / 16.0)
+        output_ids.copy_(
+            torch.arange(16, dtype=torch.int32)
+            .view(1, 16)
+            .expand(output_ids.shape[0], -1)
+        )
+
 
 def _make_runtime() -> PCIeDCPA2A:
     return _FakeRuntime()
 
 
-def _make_kimi_tp16_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
-    world_size = 16
+def _make_kimi_runtime(
+    world_size: int,
+    ext: _FakeExt | None = None,
+    *,
+    max_batch_size: int = 8,
+) -> PCIeDCPA2A:
+    query_head_dim = 7168 // world_size + 3584 // world_size
     return _FakeKimiRuntime(
         rank=0,
         world_size=world_size,
@@ -148,13 +174,13 @@ def _make_kimi_tp16_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
         signal_ptrs=tuple(range(100, 100 + world_size)),
         staging0_ptrs=tuple(range(200, 200 + world_size)),
         staging1_ptrs=tuple(range(300, 300 + world_size)),
-        max_batch_size=1,
+        max_batch_size=max_batch_size,
         total_heads=world_size,
-        head_dim=672,
-        output_capacity_elems=world_size * 672,
-        lse_offset=world_size * 672 * 2,
-        lse_capacity=world_size,
-        query_head_dim=672,
+        head_dim=query_head_dim,
+        output_capacity_elems=max_batch_size * world_size * query_head_dim,
+        lse_offset=max_batch_size * world_size * query_head_dim * 2,
+        lse_capacity=max_batch_size * world_size,
+        query_head_dim=query_head_dim,
         ext_module=ext or _FakeExt(),
     )
 
@@ -415,7 +441,9 @@ def test_lse_launch_preserves_native_launch_bounds_contract() -> None:
     assert "min_blocks_per_mp=1," in source
 
 
-def test_all_gather_uses_constexpr_direct_source_pointers() -> None:
+def test_all_gather_resolves_one_peer_address_before_each_copy() -> None:
+    """The peer selector must not clone the memory transaction per rank."""
+
     from b12x.comm.pcie import _dcp_a2a_cute as kernels
 
     kernel_source = inspect.getsource(kernels._AllGatherHeadsLaunch.kernel)
@@ -425,7 +453,8 @@ def test_all_gather_uses_constexpr_direct_source_pointers() -> None:
     assert "if cutlass.const_expr(source == self._rank):" in read_phase
     assert "source_words = local_input" in read_phase
     assert "source_words = self._staging_words(staging[source])" in read_phase
-    assert "source_address" not in read_phase
+    assert "source_address = Int64(" in read_phase
+    assert "_copy_16b_addr(" in read_phase
     assert "source_words = cute.make_ptr(" not in read_phase
 
 
@@ -629,11 +658,18 @@ def test_runtime_accepts_head_major_input_and_output():
     torch.testing.assert_close(actual, partial_output[:, :16])
 
 
-def test_kimi_tp16_pair_topk_dispatches_compact_outputs() -> None:
+@pytest.mark.parametrize("world_size", (2, 4, 8, 16))
+def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
     ext = _FakeExt()
-    runtime = _make_kimi_tp16_runtime(ext)
-    local_down = torch.arange(224, dtype=torch.bfloat16).view(1, 224)
-    local_router = torch.arange(56, dtype=torch.float32).view(1, 56)
+    runtime = _make_kimi_runtime(world_size, ext)
+    local_down_width = 3584 // world_size
+    local_router_width = 896 // world_size
+    local_down = torch.arange(
+        local_down_width, dtype=torch.bfloat16
+    ).view(1, local_down_width)
+    local_router = torch.arange(
+        local_router_width, dtype=torch.float32
+    ).view(1, local_router_width)
     correction_bias = torch.zeros(896, dtype=torch.float32)
 
     down, weights, ids = runtime.all_gather_pair_kimi_topk(
@@ -647,6 +683,109 @@ def test_kimi_tp16_pair_topk_dispatches_compact_outputs() -> None:
     assert ids.shape == (1, 16)
     torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
     assert torch.equal(ids, torch.arange(16, dtype=torch.int32).view(1, 16))
+    runtime.close()
+
+
+@pytest.mark.parametrize("world_size", (2, 4, 8, 16))
+@pytest.mark.parametrize("rows", (1, 8))
+def test_kimi_topk16_dispatches_compact_outputs(
+    world_size: int, rows: int
+) -> None:
+    runtime = _make_kimi_runtime(world_size)
+    router_logits = torch.arange(
+        rows * 896, dtype=torch.float32
+    ).view(rows, 896)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    weights, ids = runtime.kimi_topk16(router_logits, correction_bias)
+
+    assert weights.shape == (rows, 16)
+    assert ids.shape == (rows, 16)
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
+    assert torch.equal(
+        ids,
+        torch.arange(16, dtype=torch.int32).view(1, 16).expand(rows, -1),
+    )
+    runtime.close()
+
+
+@pytest.mark.parametrize("rows", (0, 9))
+def test_kimi_topk16_rejects_out_of_range_rows(rows: int) -> None:
+    runtime = _make_kimi_runtime(2)
+    router_logits = torch.zeros((rows, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    try:
+        with pytest.raises(ValueError, match="must be between 1"):
+            runtime.kimi_topk16(router_logits, correction_bias)
+    finally:
+        runtime.close()
+
+
+def test_kimi_topk16_capture_requires_caller_owned_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_kimi_runtime(2)
+    router_logits = torch.zeros((1, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: True,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="caller-owned output_weights"):
+            runtime.kimi_topk16(router_logits, correction_bias)
+    finally:
+        runtime.close()
+
+
+def test_stateless_kimi_topk16_rejects_cpu_tensors() -> None:
+    with pytest.raises(ValueError, match="requires CUDA tensors"):
+        kimi_topk16(
+            torch.zeros((1, 896), dtype=torch.float32),
+            torch.zeros(896, dtype=torch.float32),
+        )
+
+
+def test_stateless_kimi_topk16_requires_no_communication_state() -> None:
+    parameters = inspect.signature(kimi_topk16).parameters
+    communication_state = {
+        "rank",
+        "world_size",
+        "process_group",
+        "runtime",
+        "pool",
+        "dcp_pool",
+        "channel",
+        "channel_id",
+    }
+    assert communication_state.isdisjoint(parameters)
+
+
+@pytest.mark.parametrize("world_size", (2, 4, 8, 16))
+def test_kimi_pair_topk_graph_prewarm_uses_runtime_world_size(
+    monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+) -> None:
+    runtime = _make_kimi_runtime(world_size)
+    compiled: list[tuple[int, int, int, bool, bool]] = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: False,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setitem(
+        sys.modules,
+        "b12x.comm.pcie._dcp_a2a_cute",
+        SimpleNamespace(
+            _get_compiled_all_gather_pair=lambda *args: compiled.append(args)
+        ),
+    )
+
+    runtime.prepare_graph_all_gather_pair_kimi_topk()
+
+    assert compiled == [(world_size, 0, 512, True, True)]
     runtime.close()
 
 

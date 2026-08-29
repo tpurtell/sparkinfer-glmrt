@@ -15,7 +15,7 @@ The learned C=4 index producer consumes the same normalized Q-rank while it is
 live, projects its separate 64x128 query, applies partial RoPE, randomized
 Hadamard, and E2M1 QAT, and emits FP8 scorer queries plus FP32 learned head
 weights into caller-owned buffers.  Selection remains owned by
-``attention.nsa_indexer`` rather than duplicating its physical-slot top-k path.
+``attention.dsa_indexer`` rather than duplicating its physical-slot top-k path.
 
 There is no BF16 KV staging allocation and no serving-time tensor allocation.
 The planned lifecycle is ``pack_weights`` (one time) -> ``plan`` -> ``bind``

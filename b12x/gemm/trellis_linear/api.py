@@ -16,8 +16,6 @@ from ...moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_dense_weight,
     prepare_trellis256_pair_dense_weight,
 )
-from .w4a8 import _compile_dense as _compile_w4a8_dense
-from .w4a8 import run_trellis256_dense_w4a8
 from . import META
 
 PreparedWeight = PreparedTrellis256DenseWeight
@@ -109,41 +107,14 @@ def run(
     )
 
 
-def run_w4a8(
-    x: torch.Tensor,
-    weight: PreparedWeight,
-    *,
-    output: Optional[torch.Tensor] = None,
-    input_f16: Optional[torch.Tensor] = None,
-    rotated_f16: Optional[torch.Tensor] = None,
-    quantized=None,
-    gemm_output_f16: Optional[torch.Tensor] = None,
-    output_f16: Optional[torch.Tensor] = None,
-    hadamard_128=None,
-) -> torch.Tensor:
-    """Execute direct E4M3 Trellis decode through SM120 W4A8 MMA."""
-    return run_trellis256_dense_w4a8(
-        x,
-        weight,
-        output=output,
-        input_f16=input_f16,
-        rotated_f16=rotated_f16,
-        quantized=quantized,
-        gemm_output_f16=gemm_output_f16,
-        output_f16=output_f16,
-        hadamard_128=hadamard_128,
-    )
-
-
 def is_supported(device=None) -> bool:
     """True when the SM120/SM121 Trellis kernel stack is available."""
     return default_is_supported(device, requires=META.requires)
 
 
 def clear_caches() -> None:
-    """Clear compiled W4A16 and direct-W4A8 specializations."""
+    """Clear compiled W4A16 specializations."""
     clear_w4a16_kernel_cache()
-    _compile_w4a8_dense.cache_clear()
 
 
 __all__ = list(META.entry_points)

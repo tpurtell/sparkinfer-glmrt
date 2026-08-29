@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from benchmarks.benchmark_paged_attention import (
+    BENCHMARK_PROFILES,
     _active_split_kv_temporary_results,
     _balanced_graph_replay_schedule,
     _build_decode_replay_cases,
@@ -29,6 +30,18 @@ from benchmarks.benchmark_paged_attention import (
 )
 
 from tests._reference.helpers import require_b12x
+
+
+def test_qwen38_27b_profile_uses_checkpoint_full_attention_geometry() -> None:
+    profile = BENCHMARK_PROFILES["qwen3.8-27b"]
+
+    assert profile["mode"] == "decode-graph-buckets"
+    assert profile["page_size"] == 64
+    assert profile["q_heads"] == 24
+    assert profile["kv_heads"] == 4
+    assert profile["head_dim"] == 256
+    assert profile["dtype"] == "bf16"
+    assert profile["kv_dtype"] == "same"
 
 
 def test_benchmark_requires_cuda_without_restricting_compute_capability(
@@ -306,6 +319,28 @@ def test_decode_graph_bucket_policy_kv4_uses_kv_head_aware_chunk_budget() -> Non
     assert policy.max_chunks_per_request <= expected_architecture_budget
 
 
+def test_decode_graph_bucket_policy_accepts_manual_chunk_capacity() -> None:
+    policy = _resolve_decode_graph_bucket_policy(
+        batch=2,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=64,
+        q_heads=24,
+        kv_heads=4,
+        head_dim=256,
+        decode_contexts=[128, 16_384],
+        capture_context_override=0,
+        fixed_split_pages_override=0,
+        graph_ctas_per_sm_override=0,
+        max_chunks_per_request_override=7,
+    )
+
+    assert policy.source == "manual-chunks"
+    assert policy.max_chunks_per_request == 7
+    assert policy.max_work_items == 14
+    assert policy.max_partial_rows == 14
+
+
 @torch.inference_mode()
 def test_decode_graph_bucket_kv4_captures_exact_production_grid() -> None:
     require_b12x()
@@ -352,19 +387,10 @@ def test_decode_graph_bucket_kv4_captures_exact_production_grid() -> None:
     assert _cosine_similarity(bucket.output, ref_out) >= 0.9999
 
 
-@pytest.mark.parametrize(
-    ("fixed_split_pages", "graph_ctas_per_sm", "match"),
-    [
-        (8, 0, "--fixed-split-pages is only supported by legacy-matrix"),
-        (0, 4, "--graph-ctas-per-sm is only supported by legacy-matrix"),
-    ],
-)
-def test_decode_graph_bucket_policy_rejects_nonproduction_overrides(
-    fixed_split_pages: int,
-    graph_ctas_per_sm: int,
-    match: str,
-) -> None:
-    with pytest.raises(ValueError, match=match):
+def test_decode_graph_bucket_policy_rejects_fixed_split_override() -> None:
+    with pytest.raises(
+        ValueError, match="--fixed-split-pages is only supported by legacy-matrix"
+    ):
         _resolve_decode_graph_bucket_policy(
             batch=1,
             q_dtype=torch.bfloat16,
@@ -375,9 +401,27 @@ def test_decode_graph_bucket_policy_rejects_nonproduction_overrides(
             head_dim=256,
             decode_contexts=[128],
             capture_context_override=0,
-            fixed_split_pages_override=fixed_split_pages,
-            graph_ctas_per_sm_override=graph_ctas_per_sm,
+            fixed_split_pages_override=8,
+            graph_ctas_per_sm_override=0,
         )
+
+
+def test_decode_graph_bucket_policy_accepts_graph_cta_sweep_override() -> None:
+    policy = _resolve_decode_graph_bucket_policy(
+        batch=1,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=64,
+        q_heads=8,
+        kv_heads=1,
+        head_dim=256,
+        decode_contexts=[128],
+        capture_context_override=0,
+        fixed_split_pages_override=0,
+        graph_ctas_per_sm_override=4,
+    )
+
+    assert policy.graph_ctas_per_sm == 4
 
 
 @torch.inference_mode()

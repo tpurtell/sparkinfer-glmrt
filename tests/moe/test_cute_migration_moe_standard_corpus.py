@@ -62,13 +62,21 @@ class _BoundCase:
     binding: object
 
 
-def _make_nvfp4_weights(device: torch.device, *, seed: int) -> _Weights:
+def _make_nvfp4_weights(
+    device: torch.device,
+    *,
+    seed: int,
+    num_experts: int = _E,
+    hidden_size: int = _K,
+    intermediate_size: int = _N,
+    logical_intermediate_size: int | None = None,
+) -> _Weights:
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     w1_fp4 = torch.randint(
         0,
         256,
-        (_E, 2 * _N, _K // 2),
+        (num_experts, 2 * intermediate_size, hidden_size // 2),
         dtype=torch.uint8,
         device=device,
         generator=generator,
@@ -76,7 +84,7 @@ def _make_nvfp4_weights(device: torch.device, *, seed: int) -> _Weights:
     w2_fp4 = torch.randint(
         0,
         256,
-        (_E, _K, _N // 2),
+        (num_experts, hidden_size, intermediate_size // 2),
         dtype=torch.uint8,
         device=device,
         generator=generator,
@@ -86,21 +94,34 @@ def _make_nvfp4_weights(device: torch.device, *, seed: int) -> _Weights:
     # A constant exact power of two keeps the synthetic layer well-conditioned
     # while the random FP4 payload still exercises every nibble value.
     w1_logical_scale = torch.full(
-        (_E, 2 * _N, _K // 16),
+        (num_experts, 2 * intermediate_size, hidden_size // 16),
         2.0**-5,
         dtype=torch.float32,
         device=device,
     ).to(torch.float8_e4m3fn)
     w2_logical_scale = torch.full(
-        (_E, _K, _N // 16),
+        (num_experts, hidden_size, intermediate_size // 16),
         2.0**-5,
         dtype=torch.float32,
         device=device,
     ).to(torch.float8_e4m3fn)
+    if logical_intermediate_size is not None:
+        logical_n = int(logical_intermediate_size)
+        if not (0 < logical_n <= intermediate_size and logical_n % 16 == 0):
+            raise ValueError(
+                "logical_intermediate_size must be positive, 16-aligned, and "
+                "no larger than intermediate_size"
+            )
+        w1_fp4[:, logical_n:intermediate_size].zero_()
+        w1_fp4[:, intermediate_size + logical_n :].zero_()
+        w2_fp4[:, :, logical_n // 2 :].zero_()
+        w1_logical_scale[:, logical_n:intermediate_size].fill_(0)
+        w1_logical_scale[:, intermediate_size + logical_n :].fill_(0)
+        w2_logical_scale[:, :, logical_n // 16 :].fill_(0)
     w1_scale = swizzle_block_scale_reference(w1_logical_scale).contiguous()
     w2_scale = swizzle_block_scale_reference(w2_logical_scale).contiguous()
-    w1_alpha = torch.linspace(0.5, 0.8, _E, dtype=torch.float32, device=device)
-    w2_alpha = torch.linspace(0.6, 0.9, _E, dtype=torch.float32, device=device)
+    w1_alpha = torch.linspace(0.5, 0.8, num_experts, dtype=torch.float32, device=device)
+    w2_alpha = torch.linspace(0.6, 0.9, num_experts, dtype=torch.float32, device=device)
     unit = torch.ones(1, dtype=torch.float32, device=device)
     return _Weights(
         w1_fp4=w1_fp4,
@@ -135,12 +156,8 @@ def _make_mxfp4_weights(device: torch.device, *, seed: int) -> _Weights:
     )
     # E8M0 byte 122 is exactly 2^-5.  These are checkpoint-native logical
     # K/32 grids; production preparation repacks them for tiny decode.
-    w1_scale = torch.full(
-        (_E, 2 * _N, _K // 32), 122, dtype=torch.uint8, device=device
-    )
-    w2_scale = torch.full(
-        (_E, _K, _N // 32), 122, dtype=torch.uint8, device=device
-    )
+    w1_scale = torch.full((_E, 2 * _N, _K // 32), 122, dtype=torch.uint8, device=device)
+    w2_scale = torch.full((_E, _K, _N // 32), 122, dtype=torch.uint8, device=device)
     alpha = torch.ones(_E, dtype=torch.float32, device=device)
     unit = torch.ones(_E, dtype=torch.float32, device=device)
     return _Weights(
@@ -161,29 +178,32 @@ def _make_inputs(
     m: int,
     seed: int,
     route_shift: int,
+    num_experts: int = _E,
+    hidden_size: int = _K,
+    topk: int = _TOPK,
 ) -> _Inputs:
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     a = (
-        torch.randn(m, _K, dtype=torch.float32, device=device, generator=generator)
+        torch.randn(
+            m, hidden_size, dtype=torch.float32, device=device, generator=generator
+        )
         * 0.35
     ).to(torch.bfloat16)
     token = torch.arange(m, dtype=torch.int32, device=device)
     topk_ids = torch.stack(
-        (
-            (token + route_shift) % _E,
-            (token + route_shift + 1) % _E,
-        ),
+        tuple((token + route_shift + idx) % num_experts for idx in range(topk)),
         dim=1,
     ).contiguous()
     topk_weights = torch.rand(
-        m, _TOPK, dtype=torch.float32, device=device, generator=generator
+        m, topk, dtype=torch.float32, device=device, generator=generator
     ).add_(0.25)
     topk_weights.div_(topk_weights.sum(dim=1, keepdim=True))
 
     assert topk_ids.dtype is torch.int32 and topk_ids.is_contiguous()
-    assert bool(((topk_ids >= 0) & (topk_ids < _E)).all().item())
-    assert bool((topk_ids[:, 0] != topk_ids[:, 1]).all().item())
+    assert bool(((topk_ids >= 0) & (topk_ids < num_experts)).all().item())
+    if topk > 1:
+        assert bool((topk_ids[:, :-1] != topk_ids[:, 1:]).all().item())
     assert bool((topk_weights > 0).all().item())
     torch.testing.assert_close(
         topk_weights.sum(dim=1),
@@ -199,9 +219,19 @@ def _nvfp4_oracle(
     inputs: _Inputs,
     *,
     quant_scale_math: str = "direct_division",
+    num_experts: int = _E,
+    hidden_size: int = _K,
+    intermediate_size: int = _N,
 ) -> torch.Tensor:
     # This is the pure-Torch GPU oracle; it does not instantiate or call a CuTe
     # kernel and consumes the original checkpoint layout directly.
+    active = (inputs.topk_ids >= 0) & (inputs.topk_ids < num_experts)
+    oracle_ids = torch.where(
+        active, inputs.topk_ids, torch.zeros_like(inputs.topk_ids)
+    ).contiguous()
+    oracle_weights = torch.where(
+        active, inputs.topk_weights, torch.zeros_like(inputs.topk_weights)
+    ).contiguous()
     return moe_reference_nvfp4(
         inputs.a,
         weights.w1_fp4,
@@ -212,11 +242,11 @@ def _nvfp4_oracle(
         weights.w2_alpha,
         weights.a1_scale,
         weights.a2_scale,
-        inputs.topk_ids,
-        inputs.topk_weights,
-        _E,
-        _K,
-        _N,
+        oracle_ids,
+        oracle_weights,
+        num_experts,
+        hidden_size,
+        intermediate_size,
         activation="silu",
         quant_scale_math=quant_scale_math,
     )
@@ -225,6 +255,13 @@ def _nvfp4_oracle(
 def _mxfp4_oracle(weights: _Weights, inputs: _Inputs) -> torch.Tensor:
     # No prepared/repacked tensor participates in this oracle.  It consumes the
     # checkpoint-native FP4 + E8M0 grids and emulates MXFP8 activation rounding.
+    active = (inputs.topk_ids >= 0) & (inputs.topk_ids < _E)
+    oracle_ids = torch.where(
+        active, inputs.topk_ids, torch.zeros_like(inputs.topk_ids)
+    ).contiguous()
+    oracle_weights = torch.where(
+        active, inputs.topk_weights, torch.zeros_like(inputs.topk_weights)
+    ).contiguous()
     return moe_reference_w4a8_mx(
         inputs.a.float(),
         weights.w1_fp4,
@@ -235,8 +272,8 @@ def _mxfp4_oracle(weights: _Weights, inputs: _Inputs) -> torch.Tensor:
         weights.w2_scale,
         None,
         weights.w2_alpha,
-        inputs.topk_ids,
-        inputs.topk_weights,
+        oracle_ids,
+        oracle_weights,
         _E,
         _K,
         _N,
@@ -251,6 +288,7 @@ def _prepare_and_bind(
     *,
     quant_mode: str,
     source_format: str,
+    num_topk: int = _TOPK,
 ) -> _BoundCase:
     from b12x.moe.fused_moe._impl import TPMoEScratchCaps, plan_tp_moe_scratch
 
@@ -272,12 +310,12 @@ def _prepare_and_bind(
     scratch_plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
             max_tokens=int(inputs.a.shape[0]),
-            num_topk=_TOPK,
+            num_topk=num_topk,
             device=inputs.a.device,
             weight_plan=experts.plan,
+            quant_mode=quant_mode,
             core_token_counts=(int(inputs.a.shape[0]),),
             route_num_experts=0,
-            quant_mode=quant_mode,
             frozen=True,
         )
     )
@@ -341,6 +379,10 @@ def _run_live_graph_check(
     context: str,
     min_cos: float,
     max_normalized_rmse: float,
+    exact_zero_rows: slice | None = None,
+    replay_count: int = 1,
+    require_bit_exact_replay: bool = True,
+    assert_no_replay_allocations: bool = False,
 ) -> None:
     from b12x.moe.fused_moe._impl import b12x_moe_fp4
 
@@ -376,21 +418,55 @@ def _run_live_graph_check(
         max_normalized_rmse=max_normalized_rmse,
     )
 
-    # Mutate every live serving input in place.  IDs remain in range and each
-    # token still selects two distinct experts with positive normalized weights.
+    # Mutate every live serving input in place. The replay may include inactive
+    # route IDs, which must remain graph-safe without changing the binding.
     initial.a.copy_(changed.a)
     initial.topk_ids.copy_(changed.topk_ids)
     initial.topk_weights.copy_(changed.topk_weights)
-    output.fill_(37.0)  # Poison proves the captured launch owns output reset.
-    graph.replay()
-    torch.cuda.synchronize()
-    _assert_oracle(
-        output,
-        changed_reference,
-        context=f"{context}:live-replay",
-        min_cos=min_cos,
-        max_normalized_rmse=max_normalized_rmse,
-    )
+    live_tensors = (*case.scratch, initial.a, initial.topk_ids, initial.topk_weights, output)
+    live_addresses = tuple(tensor.data_ptr() for tensor in live_tensors)
+    replay_output = None
+    for replay_idx in range(replay_count):
+        output.fill_(37.0)  # Poison proves the captured launch owns output reset.
+        if assert_no_replay_allocations:
+            allocation_count_before = torch.cuda.memory_stats()[
+                "allocation.all.allocated"
+            ]
+            allocated_bytes_before = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        if assert_no_replay_allocations:
+            assert (
+                torch.cuda.memory_stats()["allocation.all.allocated"]
+                == allocation_count_before
+            ), (context, replay_idx, "CUDA allocation during graph replay")
+            assert torch.cuda.memory_allocated() == allocated_bytes_before, (
+                context,
+                replay_idx,
+                "live CUDA bytes changed during graph replay",
+            )
+            assert tuple(tensor.data_ptr() for tensor in live_tensors) == live_addresses, (
+                context,
+                replay_idx,
+                "serving tensor address changed during graph replay",
+            )
+        _assert_oracle(
+            output,
+            changed_reference,
+            context=f"{context}:live-replay-{replay_idx}",
+            min_cos=min_cos,
+            max_normalized_rmse=max_normalized_rmse,
+        )
+        if exact_zero_rows is not None:
+            assert torch.count_nonzero(output[exact_zero_rows]).item() == 0
+        if replay_output is None:
+            replay_output = output.clone()
+        elif require_bit_exact_replay:
+            assert torch.equal(output, replay_output), (
+                context,
+                "graph replay changed the output bit pattern",
+                replay_idx,
+            )
 
     changed_rmse = (
         (output.float() - initial_output.float()).square().mean().sqrt().item()
@@ -463,6 +539,100 @@ def test_standard_moe_micro_live_graph_oracle(
     )
 
 
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 6])
+def test_standard_moe_qwen38_nvfp4_padding_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    m: int,
+) -> None:
+    """Ignore a fully padded row at Qwen3.8 TP4 decode geometry."""
+
+    num_experts = 512
+    hidden_size = 2560
+    intermediate_size = 192
+    topk = 10
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(
+        device,
+        seed=111,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        logical_intermediate_size=160,
+    )
+    initial = _make_inputs(
+        device,
+        m=m,
+        seed=112,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    changed = _make_inputs(
+        device,
+        m=m,
+        seed=113,
+        route_shift=17,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    if m > 1:
+        changed.topk_ids[-1].fill_(-1)
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    if m > 1:
+        assert torch.count_nonzero(changed_reference[-1]).item() == 0
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+    )
+    assert tuple(initial.a.shape) == (m, hidden_size)
+    assert tuple(weights.w1_fp4.shape) == (
+        num_experts,
+        2 * intermediate_size,
+        hidden_size // 2,
+    )
+    assert tuple(weights.w2_fp4.shape) == (
+        num_experts,
+        hidden_size,
+        intermediate_size // 2,
+    )
+    assert case.scratch_plan.launch_plan.implementation == "micro"
+    assert case.binding.implementation == "micro"
+    case.scratch[0].fill_(0xFF)
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="standard-moe-qwen38-nvfp4-padding",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+        exact_zero_rows=slice(m - 1, m) if m > 1 else None,
+        replay_count=3,
+    )
+
+
 def test_standard_moe_dynamic_prefill_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -498,6 +668,125 @@ def test_standard_moe_dynamic_prefill_live_graph_oracle(
     )
 
 
+@pytest.mark.parametrize("m", [80, 96])
+def test_standard_moe_nvfp4_tp4_padded_prefill_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    m: int,
+) -> None:
+    """Exercise the TP4 N160-to-N192 padded expert prefill contract."""
+
+    num_experts = 512
+    hidden_size = 2560
+    intermediate_size = 192
+    topk = 10
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(
+        device,
+        seed=221,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        logical_intermediate_size=160,
+    )
+    initial = _make_inputs(
+        device,
+        m=m,
+        seed=222,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    changed = _make_inputs(
+        device,
+        m=m,
+        seed=223,
+        route_shift=113,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == 16
+    assert launch_plan.execution.tile_n == 128
+    case.scratch[0].view(torch.uint8).fill_(0xFF)
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=f"standard-moe-nvfp4-tp4-padded-prefill-m{m}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+        replay_count=3,
+        require_bit_exact_replay=False,
+        assert_no_replay_allocations=True,
+    )
+
+
+def test_standard_moe_dynamic_inactive_route_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore inactive routes in the production NVFP4 dynamic graph path."""
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(device, seed=201)
+    initial = _make_inputs(device, m=40, seed=202, route_shift=0)
+    changed = _make_inputs(device, m=40, seed=203, route_shift=2)
+    changed.topk_ids[-8:].fill_(-1)
+    initial_reference = _nvfp4_oracle(weights, initial)
+    changed_reference = _nvfp4_oracle(weights, changed)
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == 32
+    assert launch_plan.execution.tile_n == 128
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="standard-moe-dynamic-graph-m40",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+    assert case.binding.output is not None
+    assert torch.count_nonzero(case.binding.output[-8:]).item() == 0
+
+
 def test_standard_moe_tiny_decode_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -531,6 +820,40 @@ def test_standard_moe_tiny_decode_live_graph_oracle(
         initial_reference=initial_reference,
         changed_reference=changed_reference,
         context="standard-moe-tiny-decode-phases-1-2",
+        min_cos=0.998,
+        max_normalized_rmse=0.05,
+    )
+
+
+def test_standard_moe_tiny_decode_inactive_route_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ignore scheduler-padding routes during tiny-decode graph replay."""
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_mxfp4_weights(device, seed=301)
+    initial = _make_inputs(device, m=2, seed=302, route_shift=0)
+    changed = _make_inputs(device, m=2, seed=303, route_shift=2)
+    changed.topk_ids[1, 1] = -1
+
+    initial_reference = _mxfp4_oracle(weights, initial)
+    changed_reference = _mxfp4_oracle(weights, changed)
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+    )
+    assert case.scratch_plan.launch_plan.implementation == "micro"
+    assert case.binding.implementation == "micro"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="standard-moe-tiny-decode-inactive-route",
         min_cos=0.998,
         max_normalized_rmse=0.05,
     )

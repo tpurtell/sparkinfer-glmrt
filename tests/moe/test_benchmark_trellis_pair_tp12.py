@@ -7,7 +7,6 @@ from safetensors.torch import save_file
 import torch
 
 from benchmarks.benchmark_trellis_pair_moe_tp12 import (
-    _CODEBOOK_SOURCE_FORMATS,
     _FIXTURE_KIND,
     _FIXTURE_SCHEMA_VERSION,
     _RouteReplay,
@@ -16,10 +15,6 @@ from benchmarks.benchmark_trellis_pair_moe_tp12 import (
     _paired_ratio_bootstrap,
     _write_new_result,
 )
-
-
-def test_qsrt_benchmark_uses_sqg_xor_cheb_t12() -> None:
-    assert _CODEBOOK_SOURCE_FORMATS["sqg_xor_cheb_t12"] == "qsrt_sqg_e4m3"
 
 
 def _write_route_fixture(

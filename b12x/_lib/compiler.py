@@ -46,6 +46,7 @@ _EXECUTOR_CACHE_ATTR = "_b12x_cached_default_executor"
 _VLLM_ENGINE_STARTED_ENV = "B12X_ENGINE_STARTED"
 _POST_ENGINE_START_LOG_ENV = "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START"
 _PRINT_COMPILE_PROGRESS_ENV = "B12X_PRINT_COMPILE_PROGRESS"
+_HOST_SERIALIZED_COMPILE_KERNEL_IDS = frozenset({"integration.tp_moe.dynamic"})
 
 
 @dataclass(frozen=True)
@@ -1360,7 +1361,8 @@ def _call_cute_compile(
     cache_key: str,
 ) -> Any:
     if not _cute_compile_progress_enabled():
-        return compile_callable(func, *args, **kwargs)
+        with _host_compile_capacity_lock(compile_spec):
+            return compile_callable(func, *args, **kwargs)
 
     global _COMPILE_PROGRESS_COUNT
     global _COMPILE_PROGRESS_TOTAL_SECONDS
@@ -1387,7 +1389,8 @@ def _call_cute_compile(
     )
     started = time.perf_counter()
     try:
-        compiled = compile_callable(func, *args, **kwargs)
+        with _host_compile_capacity_lock(compile_spec):
+            compiled = compile_callable(func, *args, **kwargs)
     except BaseException as exc:
         elapsed = time.perf_counter() - started
         with _COMPILE_PROGRESS_LOCK:
@@ -1411,6 +1414,47 @@ def _call_cute_compile(
         flush=True,
     )
     return compiled
+
+
+def _host_compile_capacity_limited(
+    compile_spec: KernelCompileSpec | None,
+) -> bool:
+    return bool(
+        compile_spec is not None
+        and compile_spec.kernel_id in _HOST_SERIALIZED_COMPILE_KERNEL_IDS
+    )
+
+
+@contextmanager
+def _host_compile_capacity_lock(compile_spec: KernelCompileSpec | None):
+    if not _host_compile_capacity_limited(compile_spec):
+        yield
+        return
+
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+
+    kernel_id = compile_spec.kernel_id
+    lock_dir = _cute_compile_cache_dir() / ".capacity-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{kernel_id}.lock"
+    wait_started = time.perf_counter()
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        waited = time.perf_counter() - wait_started
+        if _cute_compile_progress_enabled() and waited >= 0.01:
+            print(
+                f"[b12x cute.compile] compile-slot-acquired kernel={kernel_id} "
+                f"wait_s={waited:.3f}",
+                flush=True,
+            )
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _iter_fingerprint_files(root: Path) -> list[Path]:
@@ -1931,6 +1975,12 @@ def _compile_options_cache_key(compile_callable: Any) -> tuple[str, ...]:
         if value:
             serialized.append(value)
     return tuple(serialized)
+
+
+def _dsl_compile_options_kwargs_key(compile_callable: Any) -> tuple[str, ...]:
+    """Return the raw subscripted compile options for cache provenance."""
+
+    return _compile_options_cache_key(compile_callable)
 
 
 def _compile_disk_cache_payload(
@@ -2674,7 +2724,9 @@ def compile(
 
             compile_callable = CompileCallable(dsl_compile_options)
         kwargs = dict(kwargs)
-        kwargs["__dsl_compile_options_key"] = _structural_cache_key(dsl_compile_options)
+        kwargs["__dsl_compile_options_key"] = _dsl_compile_options_kwargs_key(
+            compile_callable
+        )
     memory_cache_key = _compile_memory_cache_key(
         compile_callable, func, args, kwargs, compile_spec
     )

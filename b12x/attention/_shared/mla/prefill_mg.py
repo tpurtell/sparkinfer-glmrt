@@ -71,12 +71,19 @@ from .decode_math import (
 )
 from .io_mg import io_issue_gather_dsv4_nope, io_issue_gather_glm_mg
 from .smem_mg import get_prefill_mg_shared_storage_cls, make_smem_layout_mg
-from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
+from .traits import (
+    ComputeMode,
+    ModelType,
+    ScaleFormat,
+    is_glm_model_type,
+    make_unified_traits,
+)
 
 
 _CAND_WINDOW = 64
 _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
+_GLM_NEXT_HEAD_DIM = 512
 _PREFILL_BLOCK_THREADS = 384
 _PREFILL_IO_THREADS = 128
 _IO_REGS = 32
@@ -198,7 +205,7 @@ def _cache_block_stride_bytes(
     record_bytes: int | None = None,
 ) -> int:
     from b12x.attention._shared.mla.compressed_reference import (
-        COMPRESSED_MLA_BYTES_PER_TOKEN,
+        COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
     if record_bytes is not None:
@@ -209,8 +216,10 @@ def _cache_block_stride_bytes(
         rec = int(record_bytes) if record_bytes is not None else _GLM_IO_STRIDE
         expected = int(page_size) * rec
     else:
-        expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
-    # Use the tensor's physical page stride for exact-payload and padded views.
+        expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+    if is_glm and cache.is_contiguous():
+        return expected
+    # Use the tensor's physical page stride for padded views.
     if cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:
@@ -2346,13 +2355,16 @@ class UnifiedPrefillMGKernel:
         # W XV, V==nope (no XV-rope), 656/528 KV geometry, KV-rope from global/L2,
         # Q-rope registerized (aliased onto W_FP8). DSV4 is the scale_format==0 /
         # has_extra arm and is byte-identical.
-        is_glm = cutlass.const_expr(t.model_type == ModelType.GLM_NSA)
+        is_glm = cutlass.const_expr(
+            t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
+        )
+        has_rope = cutlass.const_expr(t.d_rope > 0)
         # NVFP4 (E2M1 + E4M3 group-16) GLM-family arm: BF16-QK with native
         # in-register dequant, BF16 P.V staged in the dead W_FP8 region, and
         # the 432B/288B record geometry. is_glm stays true for NVFP4 so the
         # shared GLM staging (io gather / kv_sc absence / q_rope alias) applies.
         is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
-        q_head_dim = cutlass.const_expr(_GLM_HEAD_DIM if is_glm else _DSV4_HEAD_DIM)
+        q_head_dim = cutlass.const_expr(t.d_nope + t.d_rope)
         # Compile-time head-group count: 1 (heads==16) or 2 (heads % 32 == 0). All
         # group-1 work below const_expr-elides when n_hg==1 (single-group MG).
         n_hg = cutlass.const_expr(self.mg_n_hg)
@@ -2539,6 +2551,7 @@ class UnifiedPrefillMGKernel:
                         io_threads=_PREFILL_IO_THREADS,
                         scale_format=t.scale_format,
                         fp8_rope=t.fp8_rope,
+                        has_rope=has_rope,
                         per_token_latent_scale=t.latent_scale_per_token,
                         kv_sc_dst_addr=kv_sc_addr,
                     )
@@ -2677,6 +2690,7 @@ class UnifiedPrefillMGKernel:
                                 io_threads=_PREFILL_IO_THREADS,
                                 scale_format=t.scale_format,
                                 fp8_rope=t.fp8_rope,
+                                has_rope=has_rope,
                                 per_token_latent_scale=t.latent_scale_per_token,
                                 kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
                             )
@@ -2847,7 +2861,7 @@ class UnifiedPrefillMGKernel:
                         num_threads=self.math_threads,
                         barrier_id=2,
                     )
-                if cutlass.const_expr(is_glm):
+                if cutlass.const_expr(is_glm and has_rope):
                     # GLM FP8 registerizes Q-rope (the smem scratch aliases W_FP8,
                     # only live in S0/XV-free): preload the bf16 Q-rope A operands
                     # to registers, then sync so W_FP8 is free for S6 -- exactly
@@ -3144,7 +3158,7 @@ class UnifiedPrefillMGKernel:
                             scale_format=t.scale_format,
                             valid_hpb=t.hpb,
                         )
-                    if cutlass.const_expr(is_glm):
+                    if cutlass.const_expr(is_glm and has_rope):
                         # GLM QK-RoPE: Q-rope A from preloaded registers, KV-rope B
                         # from global/L2 (GLM record packing), once per tile reused
                         # across head groups. v_has_rope=False so there is no XV-rope.
@@ -3165,7 +3179,7 @@ class UnifiedPrefillMGKernel:
                             scale_format=t.scale_format,
                             fp8_rope=t.fp8_rope,
                         )
-                    else:
+                    elif cutlass.const_expr(not is_glm):
                         # Fused QK-RoPE: KV-RoPE B operand gathered ONCE per CTA tile
                         # (vectorized nc.u32 b16-pair), reused across head groups --
                         # matches FlashInfer's prefetch_kv_rope reuse.
@@ -3784,7 +3798,7 @@ def _sparse_mla_prefill_mg_flat_launch(
             f"mg_n_hg==1 for the 8-head shard); got active_heads={active_heads}"
         )
     pack_hilo_rows = (
-        int(model_type) == int(ModelType.GLM_NSA)
+        is_glm_model_type(model_type)
         and int(scale_format) == int(ScaleFormat.ARBITRARY_FP32)
         and int(mg_n_hg) == 1
         and valid_hpb == 8
@@ -4143,7 +4157,7 @@ def run_unified_prefill_mg(
     head_offset: int = 0,
 ):
     model_type = int(model_type)
-    is_glm = model_type == ModelType.GLM_NSA
+    is_glm = is_glm_model_type(model_type)
     # DSV4 dual-cache (has_extra) union. all-or-none + DSV4-only (GLM has no extra
     # section). Forced BF16-QK by the caller (FI ships dual-cache as BF16 only).
     has_extra = extra_kv_cache is not None
@@ -4161,7 +4175,13 @@ def run_unified_prefill_mg(
     if scale_format is None:
         scale_format = ScaleFormat.ARBITRARY_FP32 if is_glm else ScaleFormat.UE8M0_BYTE
     scale_format = int(scale_format)
-    expected_qdim = _GLM_HEAD_DIM if is_glm else _DSV4_HEAD_DIM
+    expected_qdim = {
+        ModelType.DSV4: _DSV4_HEAD_DIM,
+        ModelType.GLM_NSA: _GLM_HEAD_DIM,
+        ModelType.GLM_NEXT: _GLM_NEXT_HEAD_DIM,
+    }.get(model_type)
+    if expected_qdim is None:
+        raise ValueError(f"unsupported sparse MLA model_type={model_type}")
     if int(q.shape[-1]) != expected_qdim:
         raise ValueError(
             f"SM120 sparse MLA MG prefill ({'GLM' if is_glm else 'DSV4'}) expects "
@@ -4226,6 +4246,13 @@ def run_unified_prefill_mg(
         fp8_rope=fp8_rope,
         latent_scale_per_token=bool(latent_scale_per_token),
     )
+    if model_type == ModelType.GLM_NEXT and int(kv_cache.shape[-1]) != int(
+        traits.kv_gmem_stride
+    ):
+        raise ValueError(
+            "GLM_NEXT sparse MLA MG cache record must be 528 bytes, got "
+            f"{int(kv_cache.shape[-1])}"
+        )
     # heads_per_cta = mg_n_hg * HPB. mg_n_hg==2 covers paired head groups; mg_n_hg==1
     # covers a single-group launch, including 16-head tails and the heads==8
     # valid_hpb shard. The caller picks mg_n_hg and active head range.

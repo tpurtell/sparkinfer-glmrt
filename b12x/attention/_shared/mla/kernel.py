@@ -60,6 +60,7 @@ from .traits import (
     ModelType,
     ScaleFormat,
     infer_model_type,
+    is_glm_model_type,
     make_unified_traits,
 )
 
@@ -77,6 +78,7 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
+_GLM_NEXT_KV_GMEM_STRIDE = 528
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -2323,19 +2325,21 @@ def _cache_block_stride_bytes(
     record_bytes: int | None = None,
 ) -> int:
     from b12x.attention._shared.mla.compressed_reference import (
-        COMPRESSED_MLA_BYTES_PER_TOKEN,
+        COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
     if record_bytes is not None:
         expected = int(page_size) * int(record_bytes)
-    elif int(model_type) == int(ModelType.GLM_NSA):
+    elif is_glm_model_type(model_type):
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
         expected = int(page_size) * rec
     else:
-        expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
-    # Use the tensor's physical page stride for exact-payload and padded views.
+        expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+    if is_glm_model_type(model_type) and cache.is_contiguous():
+        return expected
+    # Use the tensor's physical page stride for padded views.
     if cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:
@@ -2748,6 +2752,7 @@ def run_unified_decode(
     forced_num_splits: int | None = None,
     out: torch.Tensor | None = None,
     scale_format_override: int | None = None,
+    model_type_override: int | None = None,
     fp8_rope_override: bool | None = None,
     latent_scale_per_token: bool = False,
 ):
@@ -2798,16 +2803,20 @@ def run_unified_decode(
                 "indexed_indices, and indexed_page_size together (partial extra "
                 "trio is unsupported, matching upstream sparse_mla_sm120.cu:171-174)"
             )
-        if int(q_all.shape[-1]) != _DSV4_HEAD_DIM:
+        if int(q_all.shape[-1]) != _DSV4_HEAD_DIM or (
+            model_type_override is not None
+            and int(model_type_override) != int(ModelType.DSV4)
+        ):
             raise ValueError(
                 "SM120 sparse MLA decode dual-cache (extra tokens) is DSV4-only "
-                "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
+                "(explicit ModelType.DSV4); GLM/DSV3.2 has no extra cache"
             )
 
     q_head_dim = int(q_all.shape[-1])
     if q_head_dim not in (_DSV4_HEAD_DIM, _GLM_HEAD_DIM):
         raise NotImplementedError(
-            f"SM120 sparse MLA decode supports q_head_dim 512 (DSV4) or 576 (GLM); "
+            "SM120 sparse MLA decode supports q_head_dim 512 (DSV4 or explicit "
+            "GLM_NEXT) or 576 (GLM_NSA); "
             f"got {q_head_dim}"
         )
 
@@ -2853,7 +2862,9 @@ def run_unified_decode(
     h_blocks = h_blocks_full + (1 if rem_heads else 0)
 
     model_type, compute_mode, scale_format = infer_model_type(
-        q_head_dim, swa_k_cache.dtype
+        q_head_dim,
+        swa_k_cache.dtype,
+        model_type=model_type_override,
     )
     if scale_format_override is not None:
         scale_format = int(scale_format_override)
@@ -2893,6 +2904,14 @@ def run_unified_decode(
     cache_record_bytes = int(swa_k_cache.shape[-1])
     if swa_k_cache.ndim == 2:
         cache_record_bytes //= int(swa_page_size)
+    if (
+        int(model_type) == int(ModelType.GLM_NEXT)
+        and cache_record_bytes != _GLM_NEXT_KV_GMEM_STRIDE
+    ):
+        raise ValueError(
+            "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
+            f"{cache_record_bytes}"
+        )
     if scale_format == ScaleFormat.NVFP4_E4M3 and cache_record_bytes != int(
         traits.kv_gmem_stride
     ):

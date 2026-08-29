@@ -14,6 +14,8 @@ Supported (MG) shapes:
   * DSV4 dual-cache (extra/indexed tokens): topk==128, heads % 8 == 0,
     pbs_extra in {2, 64} (BF16-QK), using the same head partitioning.
   * GLM_NSA: topk in {512, 1024, 2048}
+  * GLM_NEXT: topk in {512, 1024, 2048, 2051, 2112}; 2112 is an
+    alignment-only container whose per-row ``topk_length`` remains 2051.
 Anything else (other topk, unsupported heads, GLM dual, etc.) raises ValueError.
 DSV4 + GLM DECODE kernels are untouched and stay byte-identical.
 """
@@ -29,6 +31,7 @@ from .traits import (
     ModelType,
     ScaleFormat,
     infer_model_type,
+    is_glm_model_type,
     make_unified_traits,
 )
 
@@ -48,20 +51,21 @@ def _cache_block_stride_bytes(
     record_bytes: int | None = None,
 ) -> int:
     from b12x.attention._shared.mla.compressed_reference import (
-        COMPRESSED_MLA_BYTES_PER_TOKEN,
+        COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
     if record_bytes is not None:
         expected = int(page_size) * int(record_bytes)
-    elif model_type == ModelType.GLM_NSA:
+    elif is_glm_model_type(model_type):
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
         expected = int(page_size) * rec
     else:
-        expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
-    # The runtime page stride is part of the cache contract. It can be either
-    # the exact payload width or a larger packed/padded stride.
+        expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+    if is_glm_model_type(model_type) and cache.is_contiguous():
+        return expected
+    # The runtime page stride is part of the packed/padded cache contract.
     if cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:
@@ -116,6 +120,7 @@ def run_unified_prefill(
     stride_extra_kv_block: int | None = None,
     workspace=None,
     scale_format: int | None = None,
+    model_type: int | None = None,
     latent_scale: float = 1.0,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
@@ -126,8 +131,9 @@ def run_unified_prefill(
     FlashInfer-shaped multi-group (MG) prefill kernel (``run_unified_prefill_mg``).
     Unsupported shapes HARD-FAIL (raise-not-fallback); there is no decode-reuse path.
 
-    Routes DSV4 (q_head_dim==512, UE8M0 footer, V_HAS_ROPE) AND GLM_NSA
-    (q_head_dim==576, ARBITRARY_FP32 inline scales, V==nope) through the SAME kernel
+    Routes DSV4 (q_head_dim==512, UE8M0 footer, V_HAS_ROPE), GLM_NSA
+    (q_head_dim==576, ARBITRARY_FP32 inline scales, V==nope), and explicit
+    GLM_NEXT (q_head_dim==512, ARBITRARY_FP32 inline scales, no RoPE) through the SAME kernel
     via the traits const_expr branches (model_type/scale_format/v_has_rope/
     nt_per_warp_xv), exactly like the decode launcher. DSV4 additionally supports a
     DUAL-CACHE union (extra_kv_cache / extra_indices / extra_topk_length /
@@ -136,10 +142,12 @@ def run_unified_prefill(
     chunks). The extra cache is DSV4-only (GLM has no extra section -> RAISE).
 
     Args:
-      q:            (T, heads, D_QK) bf16. D_QK 512 (DSV4) or 576 (GLM_NSA).
+      q:            (T, heads, D_QK) bf16. D_QK 512 (DSV4/explicit GLM_NEXT)
+                    or 576 (GLM_NSA).
       kv_cache:     flat uint8 MAIN KV cache (reshaped to 1-D).
       topk_indices: (T, topk) int32 flat slot ids (-1 = invalid sentinel).
-      sm_scale:     softmax scale (typically D_QK**-0.5).
+      sm_scale:     caller-owned physical softmax scale. GLM_NEXT uses
+                    256**-0.5 even though its absorbed query width is 512.
       page_block_size: tokens per MAIN KV block (64 for DSV4/GLM).
       topk_length:  optional (T,) int32 per-token MAIN valid length; entries past it
                     are masked. Defaults to full ``topk`` for every token.
@@ -165,8 +173,9 @@ def run_unified_prefill(
         # Genuinely-unsupported contract -> error like upstream (infer_model_type
         # ICHECKs d_qk in {512, 576}). NOT a legacy fallback.
         raise ValueError(
-            f"SM120 sparse MLA prefill supports DSV4 (q_head_dim=512) or GLM_NSA "
-            f"(q_head_dim=576); got q_head_dim={q_head_dim}"
+            "SM120 sparse MLA prefill supports q_head_dim=512 (DSV4 or "
+            "explicit GLM_NEXT) or q_head_dim=576 (GLM_NSA); "
+            f"got q_head_dim={q_head_dim}"
         )
 
     num_tokens, heads, _ = q.shape
@@ -180,7 +189,9 @@ def run_unified_prefill(
         )
 
     model_type, compute_mode, inferred_scale_format = infer_model_type(
-        q_head_dim, kv_cache.dtype
+        q_head_dim,
+        kv_cache.dtype,
+        model_type=model_type,
     )
     if scale_format is None:
         scale_format = inferred_scale_format
@@ -211,6 +222,13 @@ def run_unified_prefill(
         fp8_rope=fp8_rope,
         latent_scale_per_token=bool(latent_scale_per_token),
     )
+    if model_type == ModelType.GLM_NEXT and int(kv_cache.shape[-1]) != int(
+        traits.kv_gmem_stride
+    ):
+        raise ValueError(
+            "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
+            f"{int(kv_cache.shape[-1])}"
+        )
     d_v = int(traits.d_v)
 
     # ── DSV4 dual-cache: validate the extra trio (all-or-none) and that it is DSV4. ──
@@ -327,9 +345,12 @@ def run_unified_prefill(
     #     XV stays FP8). FlashInfer routes topk==128 to this BF16-QK kernel (the
     #     small K-loop where the Q-quant prologue would dominate); it lands a
     #     TIGHTER numeric (no Q-quant loss) than FP8.
-    _mg_enabled = os.environ.get(
-        "B12X_MLA_SM120_PREFILL_MG", "1"
-    ) not in ("0", "false", "False", "off")
+    _mg_enabled = os.environ.get("B12X_MLA_SM120_PREFILL_MG", "1") not in (
+        "0",
+        "false",
+        "False",
+        "off",
+    )
     # ── GLM (ARBITRARY_FP32, q=576, v_has_rope=False) MG gate ──────────────────
     # GLM has the SAME FlashInfer MG head-group structure as DSV4 (one CTA fuses
     # MG_N_HG HPB head groups, sharing the KV gather), differing only in the math
@@ -346,13 +367,16 @@ def run_unified_prefill(
     _mg_glm = (
         _mg_enabled
         and not has_extra
-        and model_type == ModelType.GLM_NSA
+        and is_glm_model_type(model_type)
         and scale_format == ScaleFormat.ARBITRARY_FP32
     )
-    if _mg_glm and topk in (512, 1024, 2048):
+    glm_topk_supported = topk in (512, 1024, 2048) or (
+        model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
+    )
+    if _mg_glm and glm_topk_supported:
         return _run_partitioned_mg(
             compute_mode=ComputeMode.FP8,
-            model_type=ModelType.GLM_NSA,
+            model_type=model_type,
             scale_format=ScaleFormat.ARBITRARY_FP32,
         )
     # ── NVFP4 (E2M1 + E4M3 group-16, GLM-family) MG gate ───────────────────────
@@ -439,7 +463,8 @@ def run_unified_prefill(
         "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 "
         "(BF16-QK, heads%8==0); "
         "DSV4 dual-cache topk==128 with heads%8==0 and pbs_extra in {2, 64}; "
-        "GLM_NSA topk in {512, 1024, 2048}; "
+        "GLM_NSA topk in {512, 1024, 2048}; GLM_NEXT topk in "
+        "{512, 1024, 2048, 2051, 2112}; "
         "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}. "
         "No decode-reuse fallback."
     )

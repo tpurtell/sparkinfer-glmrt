@@ -11,6 +11,9 @@ from b12x._lib.smem import make_tma_aligned_payload_storage
 from .planner import PagedPlan
 
 _FP8_KV_DTYPE = torch.float8_e4m3fn
+_BF16_EXTEND_LOW_SM_MAX_SMS = 64
+_BF16_EXTEND_WIDE_TILE_MIN_NARROW_ITERS_PER_LOST_CTA = 704
+_BF16_EXTEND_HIGH_SM_MIN_NARROW_ITERS = 3
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -236,6 +239,11 @@ def select_paged_forward_traits(
             spilled_warps * compact_sync_rows * sync_o_row_stride * 4
         )
         cta_sync_md_bytes = spilled_warps * compact_sync_rows * 8
+        # The compact epilogue keeps warp zero in registers and spills only
+        # the other KV warps.  Its cooperative BF16 store must use a separate
+        # staging plane: aliasing that plane onto the first spilled warp is
+        # unsafe once H256 needs more than one cooperative store iteration.
+        compact_store_stage_bytes = compact_sync_rows * head_dim_vo * 4
     else:
         cta_sync_o_bytes = (
             4
@@ -245,6 +253,7 @@ def select_paged_forward_traits(
         cta_sync_md_bytes = (
             8 if num_warps_kv == 1 else num_warps_kv * cta_tile_q * 8
         )
+        compact_store_stage_bytes = 0
     cta_sync_storage_bytes = cta_sync_o_bytes + cta_sync_md_bytes
     smem_o_bytes = cta_tile_q * head_dim_vo * o_bytes
 
@@ -287,7 +296,7 @@ def select_paged_forward_traits(
         candidate_payload_bytes = _align_up(
             max(
                 candidate_qkv_bytes,
-                cta_sync_storage_bytes,
+                cta_sync_storage_bytes + compact_store_stage_bytes,
                 smem_o_bytes,
                 minimum_shared_storage_bytes,
             ),
@@ -432,23 +441,31 @@ def select_paged_forward_traits_from_plan(
         )
     elif (
         plan.mode == "decode"
-        and device_capability == (12, 0)
+        and os.environ.get("B12X_PAGED_GQA6_COMPACT_SYNC", "1") != "0"
+        and device_capability[0] >= 12
         and plan.enable_cuda_graph
         and plan.split_kv
         and not plan.msa_block_sparse
         and plan.window_left < 0
-        and plan.page_size == 128
+        and plan.page_size in (64, 128)
         and plan.cta_tile_q == 16
-        and plan.head_dim_qk == 128
-        and plan.head_dim_vo == 128
-        and plan.num_q_heads == 24
-        and plan.num_kv_heads == 4
+        and plan.head_dim_qk in (128, 256)
+        and plan.head_dim_vo == plan.head_dim_qk
         and plan.gqa_group_size == 6
         and plan.dtype == torch.bfloat16
         and plan.kv_dtype == _FP8_KV_DTYPE
         and resolved_o_dtype == torch.bfloat16
     ):
-        if os.environ.get("B12X_PAGED_LAGUNA_DECODE_N128", "0") == "1":
+        # Single-row GQA6 decode needs only the six live query rows from the
+        # three non-owner KV warps.  Derive the compact allocation from that
+        # static contract for both H128 and H256 instead of keying residency
+        # to a model name or exact head count.
+        if (
+            device_capability == (12, 0)
+            and plan.page_size == 128
+            and plan.head_dim_qk == 128
+            and os.environ.get("B12X_PAGED_LAGUNA_DECODE_N128", "0") == "1"
+        ):
             exact_num_mma_kv = 2
         compact_sync_rows = plan.gqa_group_size
     elif (
@@ -492,7 +509,7 @@ def select_paged_forward_traits_from_plan(
         # extra loop iteration per physical page for substantially lower
         # register and shared-memory pressure.
         exact_num_mma_kv = 4
-    return select_paged_forward_traits(
+    traits = select_paged_forward_traits(
         cta_tile_q=plan.cta_tile_q,
         head_dim_qk=plan.head_dim_qk,
         head_dim_vo=plan.head_dim_vo,
@@ -503,4 +520,73 @@ def select_paged_forward_traits_from_plan(
         exact_num_mma_kv=exact_num_mma_kv,
         minimum_shared_storage_bytes=minimum_shared_storage_bytes,
         compact_sync_rows=compact_sync_rows,
+    )
+    force_wide_bf16_extend = (
+        os.environ.get("B12X_PAGED_EXTEND_BF16_N32", "0") == "1"
+    )
+    force_narrow_bf16_extend = (
+        os.environ.get("B12X_PAGED_EXTEND_BF16_N16", "0") == "1"
+    )
+    wide_bf16_extend_family = (
+        exact_num_mma_kv is None
+        and plan.mode == "extend"
+        and plan.enable_cuda_graph
+        and not plan.msa_block_sparse
+        and not plan.split_kv
+        and plan.cta_tile_q == 64
+        and plan.head_dim_qk == 256
+        and plan.head_dim_vo == 256
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == torch.bfloat16
+        and resolved_o_dtype == torch.bfloat16
+        and device_capability[0] >= 12
+        and traits.num_mma_kv == 1
+    )
+    if not wide_bf16_extend_family or force_narrow_bf16_extend:
+        return traits
+
+    wide_traits = select_paged_forward_traits(
+        cta_tile_q=plan.cta_tile_q,
+        head_dim_qk=plan.head_dim_qk,
+        head_dim_vo=plan.head_dim_vo,
+        q_dtype=plan.dtype,
+        kv_dtype=plan.kv_dtype,
+        o_dtype=resolved_o_dtype,
+        device=plan.device,
+        exact_num_mma_kv=2,
+        minimum_shared_storage_bytes=minimum_shared_storage_bytes,
+        compact_sync_rows=compact_sync_rows,
+    )
+    batch_capacity = max(int(plan.page_table_shape[0]), 1)
+    average_q_len = (int(plan.total_q) + batch_capacity - 1) // batch_capacity
+    average_visible_kv = max(int(plan.kv_chunk_size) - average_q_len // 2, 1)
+    if plan.window_left >= 0:
+        average_visible_kv = min(average_visible_kv, int(plan.window_left) + 1)
+    narrow_loop_iters = (
+        average_visible_kv + int(traits.cta_tile_kv) - 1
+    ) // int(traits.cta_tile_kv)
+    lost_resident_ctas = max(
+        int(traits.num_ctas_per_sm) - int(wide_traits.num_ctas_per_sm),
+        1,
+    )
+    min_narrow_loop_iters = (
+        _BF16_EXTEND_WIDE_TILE_MIN_NARROW_ITERS_PER_LOST_CTA
+        * lost_resident_ctas
+    )
+    num_sms = int(
+        torch.cuda.get_device_properties(plan.device).multi_processor_count
+    )
+    active_ctas = int(plan.num_qo_tiles) * int(plan.num_kv_heads)
+    # N32 loses one resident CTA.  Retain N16 for the two-iteration region
+    # unless the N32 grid occupies at most one quarter of the SMs.
+    high_sm_wide_tile = num_sms > _BF16_EXTEND_LOW_SM_MAX_SMS and (
+        narrow_loop_iters >= _BF16_EXTEND_HIGH_SM_MIN_NARROW_ITERS
+        or active_ctas * 4 <= num_sms
+    )
+    return (
+        wide_traits
+        if force_wide_bf16_extend
+        or high_sm_wide_tile
+        or narrow_loop_iters >= min_narrow_loop_iters
+        else traits
     )

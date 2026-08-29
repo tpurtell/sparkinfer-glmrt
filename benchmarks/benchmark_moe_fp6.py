@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Small-batch W6A8 MX-FP6 MoE benchmark using synthetic quantized expert weights.
 
-Drives the upstream ``b12x.moe.fused_moe`` plan/bind/run flow with
-``quant_mode="w6a8_mx"`` / ``source_format="mxfp6_e2m3"`` and times CUDA-graph
+Drives the ``b12x.moe.fused_moe`` plan/bind/run flow with an
+``MXFP6_E8M0_K32`` source and times CUDA-graph
 replays of ``fused_moe.run``.  Graph capture is safe here: ``bind`` is
 documented capture-safe (views only, never allocates) and the analogous
 w4a8_mx dynamic path is graph-capture gated upstream
@@ -73,39 +73,46 @@ def main() -> None:
     w2_grid = unswizzled_ue8m0_grid(w2_bf)
 
     fused_moe.clear_caches()
+    source = fused_moe.PackedSource(
+        format=fused_moe.PackedSourceFormat.MXFP6_E8M0_K32,
+        w13_layout=fused_moe.W13Layout.W13,
+    )
     weight_plan = fused_moe.plan_weights(
-        quant_modes="w6a8_mx",
-        source_format="mxfp6_e2m3",
-        activation="silu",
-        params_dtype=torch.bfloat16,
-        num_experts=e,
-        hidden_size=k,
-        intermediate_size=n,
-        w13_layout="w13",  # [up; gate] FC1 rows (the only w6a8_mx layout)
+        source=source,
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A8,
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=e,
+            hidden_size=k,
+            intermediate_size=n,
+        ),
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
-        w1_fp4=w.w1_fp6,  # packed FP6 code bytes ride the fp4-named args
-        w1_blockscale=w1_grid,
-        w1_global_scale=w.w1_alphas,
-        a1_gscale=w.a1_gscale,
-        w2_fp4=w.w2_fp6,
-        w2_blockscale=w2_grid,
-        w2_global_scale=w.w2_alphas,
-        a2_gscale=w.a2_gscale,
-        params_dtype=torch.bfloat16,
+        weights=fused_moe.PackedWeights(
+            w13=w.w1_fp6,
+            w2=w.w2_fp6,
+            w13_block_scales=w1_grid,
+            w2_block_scales=w2_grid,
+            w13_global_scales=w.w1_alphas,
+            w2_global_scales=w.w2_alphas,
+            input_scale=w.a1_gscale,
+            intermediate_scale=w.a2_gscale,
+        ),
     )
-    plan = fused_moe.plan(
-        fused_moe.Caps(
+    plan = fused_moe.plan_execution(
+        experts=prepared,
+        capacity=fused_moe.ExecutionCapacity(
             max_tokens=m,
-            num_topk=topk,
-            device=device,
-            weight_plan=weight_plan,
-            core_token_counts=(m,),
+            top_k=topk,
+            warmup_token_counts=(m,),
             route_num_experts=0,
-            quant_mode="w6a8_mx",
-        )
+        ),
     )
+    fused_moe.prewarm(plan)
     scratch = tuple(
         torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[i].device)
         for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())

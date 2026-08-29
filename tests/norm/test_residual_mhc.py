@@ -428,6 +428,116 @@ def test_b12x_mhc_pre_broadcast_match_reference(tokens: int) -> None:
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
 
 
+def test_glm53_mhc_rms_eps_match_reference() -> None:
+    device = require_b12x()
+    tokens = 3
+    hidden_size = 4096
+    rms_eps = 1e-5
+    hc_eps = 1e-6
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        seed=53_001,
+        device=device,
+    )
+    fn_broadcast = fn.view(24, 4, hidden_size).sum(dim=1).contiguous()
+    norm_gen = torch.Generator(device="cpu")
+    norm_gen.manual_seed(53_002)
+    norm_weight = (
+        torch.randn((hidden_size,), generator=norm_gen, dtype=torch.float32)
+        .to(device)
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+
+    residual_cur, post, comb, y = b12x_mhc_pre(
+        x,
+        fn_broadcast,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=20,
+        norm_weight=norm_weight,
+        norm_eps=rms_eps,
+        binding=_make_mhc_binding(
+            tokens=tokens,
+            hidden_size=hidden_size,
+            device=device,
+        ),
+    )
+    torch.cuda.synchronize(device)
+
+    residual_ref = x.unsqueeze(1).expand(-1, 4, -1)
+    y_raw_ref, post_ref, comb_ref = _mhc_pre_reference(
+        residual_ref,
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=20,
+        y_dtype=torch.float32,
+    )
+    norm_scale = torch.rsqrt(
+        y_raw_ref.square().mean(dim=-1, keepdim=True) + rms_eps
+    )
+    y_ref = (
+        y_raw_ref.to(torch.bfloat16).float()
+        * norm_scale
+        * norm_weight.float()
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(y, y_ref, rtol=0.0, atol=6e-3)
+    torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
+
+    next_residual, next_post, next_comb, next_y = b12x_mhc_post_pre(
+        x,
+        residual_cur,
+        post,
+        comb,
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=20,
+        norm_weight=norm_weight,
+        norm_eps=rms_eps,
+        binding=_make_mhc_binding(
+            tokens=tokens,
+            hidden_size=hidden_size,
+            device=device,
+        ),
+    )
+    torch.cuda.synchronize(device)
+
+    next_residual_ref = _mhc_post_reference(x, residual_cur, post, comb)
+    next_y_raw_ref, next_post_ref, next_comb_ref = _mhc_pre_reference(
+        next_residual_ref,
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=20,
+        y_dtype=torch.float32,
+    )
+    next_norm_scale = torch.rsqrt(
+        next_y_raw_ref.square().mean(dim=-1, keepdim=True) + rms_eps
+    )
+    next_y_ref = (
+        next_y_raw_ref.to(torch.bfloat16).float()
+        * next_norm_scale
+        * norm_weight.float()
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(next_residual, next_residual_ref, rtol=0.0, atol=2e-2)
+    torch.testing.assert_close(next_y, next_y_ref, rtol=0.0, atol=6e-3)
+    torch.testing.assert_close(next_post, next_post_ref, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(next_comb, next_comb_ref, rtol=2e-6, atol=4e-5)
+
+
 @pytest.mark.parametrize("tokens", [1, 3, 8])
 def test_b12x_mhc_post_match_reference(tokens: int) -> None:
     device = require_b12x()

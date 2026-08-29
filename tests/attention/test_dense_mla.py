@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
 import torch
 
 from b12x.attention import dense_mla
@@ -24,6 +25,11 @@ def _scratch(plan: dense_mla.Plan) -> torch.Tensor:
         dtype=spec.dtype,
         device=spec.device,
     )
+
+
+def test_is_supported_accepts_implicit_current_device() -> None:
+    require_b12x()
+    assert dense_mla.is_supported()
 
 
 def _guarded_scratch(
@@ -75,7 +81,7 @@ def test_source_is_standalone_cute() -> None:
         "triton",
         "b12x.attention.paged",
         "b12x.attention.sparse_mla",
-        "b12x.attention.nsa_indexer",
+        "b12x.attention.dsa_indexer",
         "b12x.attention._shared.mla",
     )
     for path in root.glob("*.py"):
@@ -96,6 +102,77 @@ def test_public_types_are_module_scoped_names() -> None:
     assert dense_mla.Binding.__name__ == "Binding"
     assert dense_mla.Scratch.__name__ == "Scratch"
     assert dense_mla.Budget.__name__ == "Budget"
+
+
+@torch.inference_mode()
+def test_fp8_physical_record_stride_ignores_padding() -> None:
+    device = require_b12x()
+    torch.manual_seed(20260813)
+    rows = 2
+    heads = 16
+    pages = 3
+    page_size = 64
+    physical_width = 1088
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="decode",
+            kv_dtype=FP8,
+            num_q_heads=heads,
+            page_size=page_size,
+            max_total_q=rows,
+            max_batch=rows,
+            max_cache_tokens=65,
+            max_page_table_width=2,
+            num_cache_pages=pages,
+            physical_record_width=physical_width,
+        )
+    )
+    q_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
+    kv_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
+    q = (torch.randn(rows, heads, QK_DIM, device=device) * 10).to(FP8)
+    cache = torch.empty(
+        pages,
+        page_size,
+        physical_width,
+        dtype=FP8,
+        device=device,
+    )
+    cache[..., :QK_DIM] = (
+        torch.randn(pages, page_size, QK_DIM, device=device) * 10
+    ).to(FP8)
+    cache[..., QK_DIM:] = (
+        (torch.randn(pages, page_size, physical_width - QK_DIM, device=device) * 100)
+        .clamp(-448, 448)
+        .to(FP8)
+    )
+    page_table = torch.tensor([[2, 0], [1, 2]], dtype=torch.int32, device=device)
+    cache_seqlens = torch.tensor([64, 65], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.arange(rows + 1, dtype=torch.int32, device=device)
+    output = torch.empty(rows, heads, VALUE_DIM, dtype=torch.bfloat16, device=device)
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_scale=kv_scale,
+        q_scale=q_scale,
+    )
+    actual, actual_lse = dense_mla.run(binding=binding)
+    expected, expected_lse = dense_mla.reference(
+        q,
+        cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        kv_scale=kv_scale,
+        q_scale=q_scale,
+    )
+    _assert_matches(actual, actual_lse, expected, expected_lse)
 
 
 def test_partial_row_budget_changes_native_split_policy() -> None:
@@ -119,8 +196,9 @@ def test_partial_row_budget_changes_native_split_policy() -> None:
     assert plan.chunks_per_split == 2
 
 
+@pytest.mark.parametrize("heads", [8, 12])
 @torch.inference_mode()
-def test_bf16_multi_request_decode_matches_reference() -> None:
+def test_bf16_multi_request_decode_matches_reference(heads: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260730)
     batch = 4
@@ -131,7 +209,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
             device=device,
             mode="decode",
             kv_dtype=torch.bfloat16,
-            num_q_heads=HEADS,
+            num_q_heads=heads,
             page_size=page_size,
             max_total_q=batch,
             max_batch=batch,
@@ -140,7 +218,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
             num_cache_pages=pages,
         )
     )
-    q = (torch.randn(batch, HEADS, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
+    q = (torch.randn(batch, heads, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
     cache = (torch.randn(pages, page_size, QK_DIM, device=device) * 0.1).to(
         torch.bfloat16
     )
@@ -165,7 +243,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
         device=device,
     )
     output = torch.full(
-        (batch, HEADS, VALUE_DIM),
+        (batch, heads, VALUE_DIM),
         float("nan"),
         dtype=torch.bfloat16,
         device=device,
@@ -177,7 +255,7 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
     # stale tensor-layout assumptions.
     small_output = torch.empty(
         1,
-        HEADS,
+        heads,
         VALUE_DIM,
         dtype=torch.bfloat16,
         device=device,
@@ -242,8 +320,9 @@ def test_bf16_multi_request_decode_matches_reference() -> None:
     )
 
 
+@pytest.mark.parametrize("heads", [8, 12])
 @torch.inference_mode()
-def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
+def test_fp8_query_tiled_causal_extend_matches_reference(heads: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260731)
     query_rows = 5
@@ -254,7 +333,7 @@ def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
             device=device,
             mode="extend",
             kv_dtype=FP8,
-            num_q_heads=HEADS,
+            num_q_heads=heads,
             page_size=page_size,
             max_total_q=query_rows,
             max_batch=1,
@@ -264,7 +343,7 @@ def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
         )
     )
     assert plan.query_tile == 4
-    q_float = torch.randn(query_rows, HEADS, QK_DIM, device=device) * 0.14
+    q_float = torch.randn(query_rows, heads, QK_DIM, device=device) * 0.14
     cache_float = torch.randn(pages, page_size, QK_DIM, device=device) * 0.1
     q_scale = (q_float.abs().max() / 400).reshape(1).float()
     kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
@@ -283,7 +362,7 @@ def test_fp8_query_tiled_causal_extend_matches_reference() -> None:
     )
     output = torch.empty(
         query_rows,
-        HEADS,
+        heads,
         VALUE_DIM,
         dtype=torch.bfloat16,
         device=device,
@@ -773,12 +852,15 @@ def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
         dtype=FP8,
         device=device,
     )
-    cache_float = torch.randn(
-        live_pages,
-        page_size,
-        QK_DIM,
-        device=device,
-    ) * 0.1
+    cache_float = (
+        torch.randn(
+            live_pages,
+            page_size,
+            QK_DIM,
+            device=device,
+        )
+        * 0.1
+    )
     kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
     cache[high_page:] = (cache_float / kv_scale).to(FP8)
     page_table = torch.arange(

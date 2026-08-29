@@ -14,10 +14,14 @@ from b12x.moe._shared.kernels.micro import MoEMicroKernelBackend
 
 
 class MoEMicroKernelSitu(MoEMicroKernelBackend):
-    """Reserved micro specialization.
+    """SiTU micro specialization, trellis-only.
 
-    SiTU currently stays on the fused dynamic family because the compact
-    NVFP4 intermediate quantization has not passed its correctness gate.
+    The compact NVFP4 intermediate quantization has not passed its
+    correctness gate, so ``is_supported`` stays False and the nvfp4-family
+    dispatch never selects this class. The trellis_t256 arm quantizes its
+    intermediate through per-32 UE8M0 E4M3 (a8_mx) instead; the w4a8_mx
+    trellis band dispatches it explicitly and constructs this class with
+    ``weight_layout="trellis_t256"``.
     """
 
     @classmethod
@@ -33,10 +37,13 @@ class MoEMicroKernelSitu(MoEMicroKernelBackend):
         return False
 
     def __init__(self, *args: object, **kwargs: object):
-        del args, kwargs
-        raise NotImplementedError(
-            "SiTU compact micro is disabled; select the fused dynamic kernel"
-        )
+        if kwargs.get("weight_layout") != "trellis_t256":
+            raise NotImplementedError(
+                "SiTU compact micro serves only the trellis_t256 weight "
+                "layout; select the fused dynamic kernel"
+            )
+        kwargs["activation"] = SITU
+        super().__init__(*args, **kwargs)
 
 
 class MoEDynamicKernelSitu(MoEDynamicKernelBackend):
@@ -53,6 +60,8 @@ class MoEDynamicKernelSitu(MoEDynamicKernelBackend):
         swap_ab: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
+        trellis_bits: int | None = None,
+        trellis_coupled: bool = False,
         direct_routing: bool = False,
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
@@ -72,6 +81,8 @@ class MoEDynamicKernelSitu(MoEDynamicKernelBackend):
             swap_ab=swap_ab,
             quant_recipe=quant_recipe,
             w4a8_repacked=w4a8_repacked,
+            trellis_bits=trellis_bits,
+            trellis_coupled=trellis_coupled,
             direct_routing=direct_routing,
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,

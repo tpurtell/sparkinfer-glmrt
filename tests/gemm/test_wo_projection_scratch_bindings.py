@@ -198,10 +198,25 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         calls["rope_dim"] = rope_dim
         calls["clear_output"] = clear_output
 
+    def fake_wo_a(x_q, wo_a, *, out, expected_m=None, stream=None, **kwargs):
+        calls["x_q"] = x_q
+        calls["wo_a"] = wo_a
+        calls["tmp_out"] = out
+        calls["expected_m"] = expected_m
+        calls["wo_a_stream"] = stream
+        return out
+
+    def fake_wo_b_fused(tmp, wo_b, *, out, stream=None, **kwargs):
+        calls["tmp"] = tmp
+        calls["wo_b"] = wo_b
+        calls["output_out"] = out
+        calls["wo_b_stream"] = stream
+        return out
+
+    monkeypatch.setattr(wo_impl, "_run_wo_a_quant_kernel", fake_quantize)
+    monkeypatch.setattr(wo_impl, "wo_a_dense_gemm_mxfp8", fake_wo_a)
     monkeypatch.setattr(
-        wo_impl.torch.ops.b12x,
-        "wo_projection_inv_rope_mxfp8_fused",
-        fake_fused,
+        wo_impl, "wo_b_dense_gemm_fused_quant_mxfp8", fake_wo_b_fused
     )
 
     out = wo_impl.wo_projection_inv_rope_mxfp8(binding=binding, stream=123)

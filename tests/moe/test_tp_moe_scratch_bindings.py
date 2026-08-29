@@ -20,8 +20,6 @@ from b12x.moe.fused_moe._impl import (
 )
 from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.w4a8.weights import repack_w4a8_weights
-
-
 def _weight_plan(
     quant_mode: str = "nvfp4",
     *,
@@ -484,6 +482,41 @@ def test_w4a8_mx_tp6_prefill_scratch_uses_repacked_n128_extent(
     )
 
 
+def test_nvfp4_mid_atom_gate_boundary_caps_dynamic_tile_m(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (32, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        256,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (64, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="relu2",
+    ) == (128, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        96 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (128, 128)
+
+
 def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -499,9 +532,9 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     base_caps = dict(
         device="cpu",
         weight_plan=weight_plan,
+        quant_mode="w4a16",
         num_topk=8,
         route_num_experts=0,
-        quant_mode="w4a16",
     )
     plan_4080 = plan_tp_moe_scratch(
         TPMoEScratchCaps(max_tokens=4080, core_token_counts=(4080,), **base_caps)
@@ -532,7 +565,8 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="exl3_trellis_mcg",
+        source_format="btx",
+        trellis_codebook="mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=256,
@@ -581,7 +615,8 @@ def test_trellis_scratch_plan_resolves_default_route_block(
     )
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="exl3_trellis_mcg",
+        source_format="btx",
+        trellis_codebook="mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=256,
@@ -618,13 +653,14 @@ def test_trellis_scratch_plan_can_own_bf16_epilogue_output(
     )
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="exl3_trellis_mcg",
+        source_format="b12x_trellis",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=8,
         hidden_size=128,
         intermediate_size=128,
         trellis_bits=4,
+        trellis_codebook="mcg",
         trellis_tile_config=(64, 128, 64, 128),
     )
     plan = plan_tp_moe_scratch(
@@ -656,7 +692,8 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="exl3_trellis_mcg",
+        source_format="btx",
+        trellis_codebook="mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=8,
@@ -712,7 +749,8 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
     )
     weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
-        source_format="exl3_trellis_mcg",
+        source_format="btx",
+        trellis_codebook="mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=8,
@@ -937,6 +975,8 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
         activation_amax=activation_amax,
         layer_idx=2,
     )
+    assert binding.expert_counts is not None
+    assert tuple(binding.expert_counts.shape) == (8,)
     calls = {}
 
     import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
@@ -952,6 +992,7 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     assert result is output
     assert calls["activation_amax"] is activation_amax
     assert calls["layer_idx"] == 2
+    assert calls["expert_counts"] is binding.expert_counts
 
 
 def test_activation_amax_is_w4a16_only() -> None:

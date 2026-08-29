@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Microbenchmark: b12x W6A8 MX-FP6 fused MoE vs a BF16 grouped-MoE baseline.
 
-Drives the upstream ``b12x.moe.fused_moe`` plan/bind/run flow with
-``quant_mode="w6a8_mx"`` / ``source_format="mxfp6_e2m3"`` across token counts,
+Drives the ``b12x.moe.fused_moe`` plan/bind/run flow with an
+``MXFP6_E8M0_K32`` source across token counts,
 and compares against a straightforward BF16 grouped MoE (the same gated-SiLU
 math in full precision).  This is the Step 5 acceptance gate for the FP6 MoE
 port: each token count prints a correctness line (max_abs / rmse / cosine vs
@@ -91,27 +91,35 @@ def main() -> None:
     w1_grid = unswizzled_ue8m0_grid(w1_bf)
     w2_grid = unswizzled_ue8m0_grid(w2_bf)
 
+    source = fused_moe.PackedSource(
+        format=fused_moe.PackedSourceFormat.MXFP6_E8M0_K32,
+        w13_layout=fused_moe.W13Layout.W13,
+    )
     weight_plan = fused_moe.plan_weights(
-        quant_modes="w6a8_mx",
-        source_format="mxfp6_e2m3",
-        activation="silu",
-        params_dtype=torch.bfloat16,
-        num_experts=e,
-        hidden_size=k,
-        intermediate_size=n,
-        w13_layout="w13",  # [up; gate] FC1 rows (the only w6a8_mx layout)
+        source=source,
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A8,
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=e,
+            hidden_size=k,
+            intermediate_size=n,
+        ),
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
-        w1_fp4=w.w1_fp6,  # packed FP6 code bytes ride the fp4-named args
-        w1_blockscale=w1_grid,
-        w1_global_scale=w.w1_alphas,
-        a1_gscale=w.a1_gscale,
-        w2_fp4=w.w2_fp6,
-        w2_blockscale=w2_grid,
-        w2_global_scale=w.w2_alphas,
-        a2_gscale=w.a2_gscale,
-        params_dtype=torch.bfloat16,
+        weights=fused_moe.PackedWeights(
+            w13=w.w1_fp6,
+            w2=w.w2_fp6,
+            w13_block_scales=w1_grid,
+            w2_block_scales=w2_grid,
+            w13_global_scales=w.w1_alphas,
+            w2_global_scales=w.w2_alphas,
+            input_scale=w.a1_gscale,
+            intermediate_scale=w.a2_gscale,
+        ),
     )
 
     print(f"\n{'tokens':>7} {'backend':>8} {'fp6_ms':>9} {'fp6_tok/s':>11} "
@@ -126,24 +134,16 @@ def main() -> None:
         ).to(torch.float32)
 
         fused_moe.clear_caches()
-        exec_plan = fused_moe.plan_execution(
-            num_tokens=m,
-            num_topk=tk,
-            device=device,
-            weight_plan=weight_plan,
-            quant_mode="w6a8_mx",
-        )
-        plan = fused_moe.plan(
-            fused_moe.Caps(
+        plan = fused_moe.plan_execution(
+            experts=prepared,
+            capacity=fused_moe.ExecutionCapacity(
                 max_tokens=m,
-                num_topk=tk,
-                device=device,
-                weight_plan=weight_plan,
-                core_token_counts=(m,),
+                top_k=tk,
+                warmup_token_counts=(m,),
                 route_num_experts=0,
-                quant_mode="w6a8_mx",
-            )
+            ),
         )
+        fused_moe.prewarm(plan)
         scratch = tuple(
             torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[i].device)
             for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
@@ -186,7 +186,8 @@ def main() -> None:
                 args.warmup, args.iters,
             )
             speedup = bf16_ms / fp6_ms
-        print(f"{m:>7} {exec_plan.implementation:>8} {fp6_ms:>9.3f} {tok_s:>11.0f} "
+        print(f"{m:>7} {plan.launch_plan.implementation:>8} "
+              f"{fp6_ms:>9.3f} {tok_s:>11.0f} "
               f"{bf16_ms:>9.3f} {speedup:>7.2f}x")
 
 

@@ -55,7 +55,7 @@ barriers), or **caller** — never a bind-time arena materialization.
 
 ## The canonical pattern
 
-`B12XCompressedMLAScratch` (`b12x/integration/compressed_scratch.py`) is the gold
+`B12XCompressedSparseMLAScratch` (`b12x/integration/compressed_scratch.py`) is the gold
 template, and `B12XSparseMLAScratch` (`sparse_mla_scratch.py`) mirrors it:
 
 ```

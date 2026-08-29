@@ -24,7 +24,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch.nn.functional as F
 
-from benchmarks.checkpoint_loader import IndexedSafetensorLoader
 from b12x.moe._shared.kernels.reference import (
     OracleMetrics,
     compare_to_reference,
@@ -816,6 +815,8 @@ def load_expert_weights(
             source_format=shape_source_format,
         )
 
+    from benchmarks.checkpoint_loader import IndexedSafetensorLoader
+
     cfg = _load_config(model_path)
     loader = IndexedSafetensorLoader(model_path)
 
@@ -1220,6 +1221,8 @@ def load_gate_weight(
     layer_idx: int = 0,
 ) -> torch.Tensor:
     """Load the replicated sparse-gate projection for a Qwen-style MoE block."""
+    from benchmarks.checkpoint_loader import IndexedSafetensorLoader
+
     cfg = _load_config(model_path)
     assert cfg["num_experts"] == spec.num_experts
     assert cfg["hidden_size"] == spec.hidden_size
@@ -2831,6 +2834,12 @@ def bench_e2e() -> None:
         ),
     )
     parser.add_argument("--model-profile", choices=sorted(MODEL_PROFILES), default="qwen397b")
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Override top-k for a synthetic shape-only model profile.",
+    )
     parser.add_argument("--tp-size", type=int, default=None, help="Override TP size from model profile")
     parser.add_argument("--tp-parallel", action="store_true", help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams")
     parser.add_argument("--model-path", type=pathlib.Path, default=None)
@@ -2905,6 +2914,23 @@ def bench_e2e() -> None:
             "route to the micro decode kernel. For w31 sources (e.g. DeepSeek V4 "
             "Flash) the W13 halves are reordered to w13 at prep time."
         ),
+    )
+    parser.add_argument(
+        "--w4a16-route-policy",
+        choices=["auto", "direct", "packed"],
+        default="auto",
+        help=(
+            "Override direct TC-decode versus expert-packed routing for planner "
+            "sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--w4a16-tile-config",
+        type=int,
+        nargs=4,
+        metavar=("FC1_K", "FC1_N", "FC2_K", "FC2_N"),
+        default=None,
+        help="Override the fused W4A16 FC1/FC2 tiles for planner sweeps.",
     )
     parser.add_argument("--validate", choices=["none", "oracle"], default=None)
     parser.add_argument(
@@ -3028,6 +3054,10 @@ def bench_e2e() -> None:
         )
     if args.force_mxfp4 and args.quant_mode != "w4a8_mx":
         raise ValueError("--force-mxfp4 requires --quant-mode w4a8_mx")
+    if args.w4a16_route_policy != "auto" and not use_w4a16:
+        raise ValueError("--w4a16-route-policy requires --quant-mode w4a16")
+    if args.w4a16_tile_config is not None and not use_w4a16:
+        raise ValueError("--w4a16-tile-config requires --quant-mode w4a16")
     if args.flashinfer_tune_max_num_tokens <= 0:
         raise ValueError("--flashinfer-tune-max-num-tokens must be positive")
     if (
@@ -3058,10 +3088,41 @@ def bench_e2e() -> None:
     require_sm120()
     torch.empty(1, device="cuda")
     device = torch.device("cuda")
+    if (
+        args.w4a16_route_policy != "auto"
+        or args.w4a16_tile_config is not None
+    ):
+        from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+        if args.w4a16_route_policy != "auto":
+            force_direct = args.w4a16_route_policy == "direct"
+
+            def forced_tc_decode_preferred(**_: int) -> bool:
+                return force_direct
+
+            w4a16_kernel._w4a16_tc_decode_preferred = forced_tc_decode_preferred
+
+        if args.w4a16_tile_config is not None:
+            real_compile = w4a16_kernel.compile_w4a16_fused_moe
+            forced_tiles = tuple(args.w4a16_tile_config)
+
+            def compile_with_forced_tiles(*compile_args, **compile_kwargs):
+                compile_kwargs["force_tile_config"] = forced_tiles
+                return real_compile(*compile_args, **compile_kwargs)
+
+            w4a16_kernel.compile_w4a16_fused_moe = compile_with_forced_tiles
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
     spec = build_model_spec(model_path, model_profile, tp_size_override=args.tp_size)
+    if args.top_k is not None:
+        if model_profile.shape is None:
+            raise ValueError("--top-k is limited to synthetic shape-only profiles")
+        if args.top_k < 1 or args.top_k > spec.num_experts:
+            raise ValueError(
+                f"--top-k must be in [1, {spec.num_experts}], got {args.top_k}"
+            )
+        spec = replace(spec, top_k=args.top_k)
     _validate_reference_case(args, spec, model_profile, batch_sizes)
     if args.reference == "flashinfer-mxfp8" and (
         spec.hidden_size % 128 or spec.I_tp % 128
@@ -3095,6 +3156,8 @@ def bench_e2e() -> None:
     print(f"Fast math: {'on' if args.fast_math else 'off'}")
     if use_w4a16:
         print("W4A16 kernel: fused W4A16 FC1+FC2")
+        print(f"W4A16 route policy: {args.w4a16_route_policy}")
+        print(f"W4A16 tile config: {args.w4a16_tile_config or 'auto'}")
     if swiglu_limit is not None:
         print(f"SwiGLU limit: {swiglu_limit:g}")
     if swiglu_alpha is not None:

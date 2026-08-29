@@ -21,6 +21,15 @@ import statistics
 import torch
 
 from b12x.moe import fused_moe
+from b12x.moe._shared.execution import PreparedWeightLayout
+from b12x.moe._shared.kernels.w4a16.prepare import (
+    prepare_trellis256_moe_weights,
+)
+from b12x.moe.fused_moe._impl import (
+    B12XFP4ExpertWeights,
+    _PreparedWeightRepresentation,
+    plan_b12x_fp4_moe_weights,
+)
 
 
 _PRODUCTION_TILES = (64, 256, 64, 256)
@@ -139,9 +148,9 @@ def main() -> None:
     print("tiles                         median_us    min_us    rel_error    cosine")
 
     for tile_config in tile_configs:
-        weight_plan = fused_moe.plan_weights(
+        weight_plan = plan_b12x_fp4_moe_weights(
             quant_modes="w4a16",
-            source_format="exl3_trellis_mcg",
+            source_format="btx",
             activation="situ",
             params_dtype=torch.bfloat16,
             num_experts=experts,
@@ -149,18 +158,44 @@ def main() -> None:
             intermediate_size=intermediate_size,
             w13_layout="w13",
             trellis_bits=3,
+            trellis_codebook="mcg",
             trellis_tile_config=tile_config,
         )
-        weights = fused_moe.prepare_weights(
-            plan=weight_plan,
-            params_dtype=torch.bfloat16,
-            w1_fp4=w13,
-            w2_fp4=w2,
+        value = prepare_trellis256_moe_weights(
+            w13,
+            w2,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=experts,
+            activation="situ",
+            fc1_tile_n=tile_config[1],
+            fc2_tile_n=tile_config[3],
+            params_dtype=torch.float16,
+            w13_layout="trellis_t256_proj",
+            trellis_bits=3,
+            codebook="mcg",
             gate_suh=shared_h_rotation,
             up_suh=shared_h_rotation,
             intermediate_rotations=intermediate_rotations,
             down_svh=shared_h_rotation,
-            trellis_mcg=0xCBAC1FED,
+            tile_config=tile_config,
+        )
+        unit = torch.ones((), dtype=torch.float32, device=value.w13.device)
+        weights = B12XFP4ExpertWeights(
+            plan=weight_plan,
+            a1_gscale=unit,
+            w1_fp4=value.w13,
+            w1_blockscale=value.w13_scale,
+            w1_alphas=value.w13_global_scale,
+            a2_gscale=unit,
+            w2_fp4=value.w2,
+            w2_blockscale=value.w2_scale,
+            w2_alphas=value.w2_global_scale,
+            representation=_PreparedWeightRepresentation(
+                quant_mode="w4a16",
+                layout=PreparedWeightLayout.TRELLIS_NATIVE,
+                value=value,
+            ),
         )
         plan = fused_moe.plan(
             fused_moe.Caps(

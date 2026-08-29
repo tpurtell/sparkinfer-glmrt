@@ -34,6 +34,7 @@ MHC_GRAM_BLOCK_H = 1024
 MHC_SUPPORTED_HIDDEN_SIZES = (4096, 7168)
 MHC_DEFAULT_EPS = 1.0e-6
 MHC_GLM_RMS_EPS = 1.0e-5
+MHC_SUPPORTED_RMS_EPS = (MHC_DEFAULT_EPS, MHC_GLM_RMS_EPS)
 
 
 def _is_default_mhc_epsilon(value: float) -> bool:
@@ -54,7 +55,7 @@ def _is_supported_mhc_rms_epsilon(value: float) -> bool:
     value = float(value)
     return math.isfinite(value) and any(
         math.isclose(value, supported, rel_tol=0.0, abs_tol=1.0e-12)
-        for supported in (MHC_DEFAULT_EPS, MHC_GLM_RMS_EPS)
+        for supported in MHC_SUPPORTED_RMS_EPS
     )
 
 
@@ -955,6 +956,7 @@ def _b12x_mhc_pre_impl(
         f"(hidden_size divisible by {MHC_GRAM_BLOCK_H}, "
         f"split_k=hc_mult*hidden_size/{MHC_DEFAULT_BLOCK_K}, "
         f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
+        f"rms_eps in {MHC_SUPPORTED_RMS_EPS}, hc_eps=1e-06, "
         "sinkhorn_iters=20); got "
         f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
         f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}, "
@@ -1395,6 +1397,7 @@ def _b12x_mhc_post_pre_impl(
         f"(hidden_size divisible by {MHC_GRAM_BLOCK_H}, "
         f"split_k=hc_mult*hidden_size/{MHC_DEFAULT_BLOCK_K}, "
         f"block_k={MHC_DEFAULT_BLOCK_K}, block_h={MHC_DEFAULT_BLOCK_H}, "
+        f"rms_eps in {MHC_SUPPORTED_RMS_EPS}, hc_eps=1e-06, "
         "sinkhorn_iters=20); got "
         f"hidden_size={hidden_size}, split_k={split_k}, block_k={block_k}, "
         f"block_h={block_h}, sinkhorn_iters={sinkhorn_iters}, "

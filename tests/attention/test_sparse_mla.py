@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import torch
 
-from b12x.attention import compressed_mla, sparse_mla
+from b12x.attention import compressed_sparse_mla as compressed_mla
+from b12x.attention import sparse_mla
 from b12x.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference,
-    pack_compressed_mla_kv_cache_reference,
+    pack_compressed_sparse_mla_kv_cache_reference as pack_compressed_mla_kv_cache_reference,
 )
 from b12x.attention._shared.mla.reference import (
     pack_mla_kv_cache_reference,

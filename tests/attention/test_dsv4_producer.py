@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import torch
 
-from b12x.attention import dsv4_producer, nsa_indexer
+from b12x.attention import dsa_indexer as nsa_indexer
+from b12x.attention import dsv4_producer
 from b12x.attention._shared.mla.compressed_reference import (
-    pack_compressed_mla_kv_cache_reference,
+    pack_compressed_sparse_mla_kv_cache_reference as pack_compressed_mla_kv_cache_reference,
 )
 from b12x.attention._shared.mla.kernel import run_unified_decode
 from b12x.attention._shared.mla.traits import ScaleFormat
-from b12x.attention.compressed_mla._scratch import (
-    B12XCompressedMLAScratchCaps,
-    _compressed_mla_scratch_layout,
-    _materialize_compressed_mla_scratch,
+from b12x.attention.compressed_sparse_mla._scratch import (
+    B12XCompressedSparseMLAScratchCaps as B12XCompressedMLAScratchCaps,
+    _compressed_sparse_mla_scratch_layout as _compressed_mla_scratch_layout,
+    _materialize_compressed_sparse_mla_scratch as _materialize_compressed_mla_scratch,
 )
 from b12x.attention.dsv4_producer._impl import (
     DSV4_INDEX_WEIGHT_SCALE,
@@ -21,7 +22,7 @@ from b12x.attention.dsv4_producer._impl import (
     _run_normalize_query_rope,
     _run_normalize_rank_pack_kv,
 )
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
 )

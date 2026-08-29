@@ -132,7 +132,8 @@ def test_public_contract_is_generic() -> None:
         "is_bmm_supported",
     }
     assert callable(gemm.mm)
-    assert gemm.mm is gemm.blockscaled.mm
+    assert gemm.mm.__module__ == "b12x._lib.dense_gemm"
+    assert gemm.mm.__name__ == "dense_gemm"
     assert callable(gemm.bmm)
     assert not hasattr(gemm.bmm, "mm")
     assert not hasattr(gemm, "Weight")

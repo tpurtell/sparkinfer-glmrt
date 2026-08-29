@@ -19,7 +19,6 @@ from b12x.moe.fused_moe._impl import (
     plan_tp_moe_scratch,
     prepare_b12x_fp4_moe_weights,
 )
-
 E, M, K, N_TP, TOPK = 32, 64, 6144, 512, 8
 
 

@@ -1,10 +1,14 @@
 """Dense block-scaled GEMM for SM12x: ``C = (A·SFA) @ (B·SFB)``.
 
 One-shot functional op over the shared SM120 warp-MMA engine (no TMEM, no
-tcgen05, no 2-CTA).  Recipes: NVFP4 (Float4E2M1 values, e4m3 scales, vec 16),
-MXFP4 (e8m0 scales, vec 32), MXFP8 (e4m3 values, e8m0 scales, vec 32).
+tcgen05, no 2-CTA). Recipes: NVFP4 (Float4E2M1 values, e4m3 scales, vec 16),
+MXFP4 (e8m0 scales, vec 32), MXFP8 (e4m3 values, e8m0 scales, vec 32), and
+tensor-scaled FP8. ``mm`` accepts raw ``(values, scales)`` operand pairs or a
+weight returned by ``pack_weight``. A packed MXFP8 weight accepts either a
+BF16/FP16 activation or a prequantized ``(values, scales)`` pair with compact
+row-major or F8_128x4-swizzled UE8M0 scales. Pass swizzled storage flattened
+(or as its native 6D view); a 2D ``[M,K/32]`` scale is interpreted as compact.
 ``expected_m`` is a DeepGEMM-style regime hint (decode vs prefill tiles).
-Fused variants quantize the A operand inline (optionally grouped).
 
 Example:
     from b12x.gemm import blockscaled
@@ -27,9 +31,13 @@ META = OpMeta(
     group="gemm",
     api_style="oneshot",
     entry_points=(
+        "Weight",
         "mm",
-        "mm_fused_quant_a",
-        "mm_fused_quant_a_grouped",
+        "mm_mxfp4",
+        "mm_nvfp4",
+        "mm_block_fp8",
+        "pack_weight",
+        "prewarm",
         "is_supported",
     ),
     dtypes=("bf16", "fp16", "fp32", "fp8_e4m3", "fp4_e2m1"),
@@ -46,10 +54,14 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        Weight,
         is_supported,
         mm,
-        mm_fused_quant_a,
-        mm_fused_quant_a_grouped,
+        mm_block_fp8,
+        mm_mxfp4,
+        mm_nvfp4,
+        pack_weight,
+        prewarm,
     )
 
 install_lazy_api(globals(), META)

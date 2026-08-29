@@ -29,6 +29,7 @@ from .merge import (
     PagedPersistentMergeKernel,
     default_paged_persistent_ctas,
 )
+from .planner import use_paged_extend_fp8_pv_repack
 from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
 
 _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
@@ -512,6 +513,7 @@ def _build_extend_forward_kernel(
     msa_block_sparse: bool,
     msa_union_tile: bool,
     page_size: int,
+    use_fp8_pv_repack: bool,
 ) -> object:
     return build_extend_forward_kernel(
         traits,
@@ -523,6 +525,7 @@ def _build_extend_forward_kernel(
         msa_block_sparse=msa_block_sparse,
         msa_union_tile=msa_union_tile,
         page_size=page_size,
+        use_fp8_pv_repack=use_fp8_pv_repack,
     )
 
 
@@ -978,6 +981,10 @@ def paged_attention_forward(
     if plan.mode == "extend":
         if plan.split_kv:
             raise ValueError("extend plans no longer support split-kv")
+        use_fp8_pv_repack = use_paged_extend_fp8_pv_repack(
+            plan,
+            resident_ctas_per_sm=int(traits.num_ctas_per_sm),
+        )
         forward_kernel = _build_extend_forward_kernel(
             traits,
             use_native_fp8_qk,
@@ -988,6 +995,7 @@ def paged_attention_forward(
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
             page_size,
+            use_fp8_pv_repack,
         )
     elif use_laguna_verify_kernel:
         forward_kernel = _build_laguna_verify_forward_kernel(

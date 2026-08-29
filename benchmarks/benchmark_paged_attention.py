@@ -869,6 +869,21 @@ def _parse_csv_ints(value: str) -> list[int]:
 
 
 BENCHMARK_PROFILES: dict[str, dict[str, object]] = {
+    "qwen3.8-27b": {
+        "mode": "decode-graph-buckets",
+        "batch": 8,
+        "batch_buckets": "1,2,4,8,12,16",
+        "decode_contexts": "128,16384,32768,65536,131072",
+        "capture_context": 0,
+        "q_seqlens": "1",
+        "cache_seqlens": "64,512,2048,8192",
+        "page_size": 64,
+        "q_heads": 24,
+        "kv_heads": 4,
+        "head_dim": 256,
+        "dtype": "bf16",
+        "kv_dtype": "same",
+    },
     "qwen-gqa": {
         "mode": "decode-graph-buckets",
         "batch": 8,
@@ -1727,18 +1742,13 @@ def _resolve_decode_graph_bucket_policy(
     capture_context_override: int,
     fixed_split_pages_override: int,
     graph_ctas_per_sm_override: int,
+    max_chunks_per_request_override: int = 0,
 ) -> DecodeGraphBucketPolicy:
     if fixed_split_pages_override > 0:
         raise ValueError(
             "decode-graph-buckets uses the production device-LUT replay policy; "
             "--fixed-split-pages is only supported by legacy-matrix"
         )
-    if graph_ctas_per_sm_override > 0:
-        raise ValueError(
-            "decode-graph-buckets uses the production device-LUT replay policy; "
-            "--graph-ctas-per-sm is only supported by legacy-matrix"
-        )
-
     if capture_context_override > 0:
         capture_context_tokens = int(capture_context_override)
         source = "manual"
@@ -1762,18 +1772,41 @@ def _resolve_decode_graph_bucket_policy(
         + page_size
         - 1
     ) // page_size
-    capacity = paged.decode_graph_capacity(
-        device=torch.device("cuda", torch.cuda.current_device()),
-        q_dtype=q_dtype,
-        kv_dtype=kv_dtype,
-        num_q_heads=q_heads,
-        num_kv_heads=kv_heads,
-        head_dim_qk=head_dim,
-        head_dim_vo=head_dim,
-        page_size=page_size,
-        batch=batch,
-        max_cache_page_count=capture_page_count,
-    )
+    def resolve_capacity(
+        max_work_items: int | None = None,
+        max_partial_rows: int | None = None,
+    ) -> object:
+        return paged.decode_graph_capacity(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=q_heads,
+            num_kv_heads=kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            batch=batch,
+            max_cache_page_count=capture_page_count,
+            graph_ctas_per_sm=(
+                int(graph_ctas_per_sm_override)
+                if graph_ctas_per_sm_override > 0
+                else None
+            ),
+            max_work_items=max_work_items,
+            max_partial_rows=max_partial_rows,
+        )
+
+    capacity = resolve_capacity()
+    if max_chunks_per_request_override > 0:
+        capacity = resolve_capacity(
+            max_work_items=(
+                batch
+                * capacity.query_tiles_per_request
+                * max_chunks_per_request_override
+            ),
+            max_partial_rows=batch * max_chunks_per_request_override,
+        )
+        source = "manual-chunks"
 
     return DecodeGraphBucketPolicy(
         batch=int(batch),
@@ -2191,12 +2224,7 @@ def _capture_backend_graph(
         )
         capture_plan = workspace.plan
         replay_plan = None
-    elif window_left >= 0:
-        if fixed_split_pages is not None or graph_ctas_per_sm is not None:
-            raise ValueError(
-                "sliding decode graph replay uses the production workspace "
-                "policy; fixed split and CTA overrides are not supported"
-            )
+    elif fixed_split_pages is None and graph_ctas_per_sm is None:
         workspace.prepare_decode_graph_replay_state(
             batch=int(capture_page_table.shape[0]),
             total_q_capacity=int(q.shape[0]),
@@ -3293,6 +3321,7 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
             capture_context_override=int(args.capture_context),
             fixed_split_pages_override=int(args.fixed_split_pages),
             graph_ctas_per_sm_override=int(args.graph_ctas_per_sm),
+            max_chunks_per_request_override=int(args.max_chunks_per_request),
         )
         shared = _make_decode_bucket_shared_inputs(
             batch=batch,
@@ -3816,6 +3845,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--capture-cache-seqlen", type=int, default=0)
     parser.add_argument("--graph-ctas-per-sm", type=int, default=0)
     parser.add_argument(
+        "--max-chunks-per-request",
+        type=int,
+        default=0,
+        help=(
+            "cap each decode-graph request to this many device-LUT chunks; "
+            "zero preserves the production planner"
+        ),
+    )
+    parser.add_argument(
         "--paged-mode",
         choices=["auto", "decode", "extend", "verify"],
         default="auto",
@@ -3892,6 +3930,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--paged-mode is currently supported only in legacy-matrix mode")
     if args.replays <= 0:
         raise ValueError("--replays must be positive for graph-replay benchmarking")
+    if args.max_chunks_per_request < 0:
+        raise ValueError("--max-chunks-per-request must be nonnegative")
     _gqa_group_size(q_heads=args.q_heads, kv_heads=args.kv_heads)
     _initialize_raw_sample_log(args.raw_samples_jsonl, args=args, argv=argv)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)

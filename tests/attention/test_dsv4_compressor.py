@@ -13,10 +13,10 @@ from b12x.attention.dsv4_compressor._impl import (
     _run_main,
 )
 from b12x.attention._shared.mla.compressed_reference import (
-    pack_compressed_mla_kv_cache_reference,
-    unpack_compressed_mla_kv_cache_reference,
+    pack_compressed_sparse_mla_kv_cache_reference as pack_compressed_mla_kv_cache_reference,
+    unpack_compressed_sparse_mla_kv_cache_reference as unpack_compressed_mla_kv_cache_reference,
 )
-from b12x.attention.nsa_indexer.reference import (
+from b12x.attention.dsa_indexer.reference import (
     pack_index_k_cache_reference,
     unpack_index_k_cache_reference,
 )

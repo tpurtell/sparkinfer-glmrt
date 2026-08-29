@@ -18,7 +18,7 @@ except ImportError:  # Keep the pure-PyTorch fallback usable outside vLLM images
 
 from .merge import clear_sparse_mla_merge_kernel_cache
 from .reference import sparse_mla_reference
-from .traits import kv_fp8_rope_enabled
+from .traits import ModelType, kv_fp8_rope_enabled
 
 _MLA_STRATEGY_ENV = "B12X_MLA_PREFILL_STRATEGY"
 _MLA_FORCE_SINGLE_PASS_ENV = "B12X_MLA_FORCE_SINGLE_PASS"
@@ -26,6 +26,8 @@ _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
 _MLA_SM120_BACKEND = "sm120"
 # GLM_NSA uncompressed decode contract (q_head_dim = d_nope+d_rope = 512+64).
 _MLA_UNIFIED_GLM_Q_HEAD_DIM = 576
+_MLA_UNIFIED_GLM_NEXT_Q_HEAD_DIM = 512
+_MLA_UNIFIED_GLM_NEXT_RECORD_BYTES = 528
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
 _MLA_SINGLE_PASS_TARGET_TOPK = 2048
 _LN2 = math.log(2.0)
@@ -93,6 +95,9 @@ class MLASparseExtendMetadata:
 def clear_mla_caches() -> None:
     """Clear any cached MLA runtime state."""
     clear_sparse_mla_merge_kernel_cache()
+    from .kv_cache import clear_glm_next_mla_kv_cache_kernel_cache
+
+    clear_glm_next_mla_kv_cache_kernel_cache()
 
 
 def _is_cuda_graph_capture_active(device: torch.device) -> bool:
@@ -243,6 +248,39 @@ def _get_mla_output_view(
     return output_buffer[:rows, :heads, :v_head_dim]
 
 
+def _get_mla_lse_view(
+    *,
+    workspace: object,
+    q_all: torch.Tensor,
+) -> torch.Tensor:
+    rows = int(q_all.shape[0])
+    heads = int(q_all.shape[1])
+    final_lse = workspace.final_lse
+    if final_lse is None:
+        raise RuntimeError("workspace is missing MLA final LSE buffer")
+    if final_lse.device != q_all.device:
+        raise ValueError(
+            f"workspace MLA final LSE buffer is on {final_lse.device}, "
+            f"expected {q_all.device}"
+        )
+    if final_lse.dtype != torch.float32:
+        raise TypeError(
+            "workspace MLA final LSE buffer must have dtype torch.float32, "
+            f"got {final_lse.dtype}"
+        )
+    if final_lse.ndim != 2:
+        raise ValueError(
+            f"workspace MLA final LSE buffer must be rank 2, got {final_lse.ndim}"
+        )
+    if int(final_lse.shape[0]) < rows or int(final_lse.shape[1]) < heads:
+        raise ValueError(
+            "workspace MLA final LSE buffer is too small: "
+            f"buffer={tuple(final_lse.shape)} required=({rows}, {heads})"
+        )
+    _validate_tensor_storage_bounds(final_lse, name="workspace MLA final LSE buffer")
+    return final_lse[:rows, :heads]
+
+
 def _validate_split_control_tensors(
     *,
     workspace: object,
@@ -387,6 +425,7 @@ def sparse_mla_decode_forward(
     backend: str | None = None,
     forced_num_splits: int | None = None,
     scale_format: int | None = None,
+    model_type: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -419,6 +458,7 @@ def sparse_mla_decode_forward(
         backend=backend,
         forced_num_splits=forced_num_splits,
         scale_format=scale_format,
+        model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
     )
@@ -439,6 +479,7 @@ def sparse_mla_extend_forward(
     lse_scale: Literal["base2", "natural"] = "base2",
     identity_page_table: bool = False,
     scale_format: int | None = None,
+    model_type: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -472,6 +513,7 @@ def sparse_mla_extend_forward(
         lse_scale=lse_scale,
         identity_page_table=identity_page_table,
         scale_format=scale_format,
+        model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
     )
@@ -495,6 +537,7 @@ def _run_sparse_mla(
     backend: str | None = None,
     forced_num_splits: int | None = None,
     scale_format: int | None = None,
+    model_type: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -592,7 +635,55 @@ def _run_sparse_mla(
         if scale_format is not None
         else getattr(workspace, "scale_format", None)
     )
-    if int(scale_format_for_call or -1) == 2 and fp8_rope is None:
+    planned_model_type = getattr(workspace, "model_type", None)
+    if planned_model_type is not None:
+        planned_model_type = int(planned_model_type)
+    if (
+        model_type is not None
+        and planned_model_type is not None
+        and int(model_type) != planned_model_type
+    ):
+        raise ValueError(
+            "sparse MLA run model_type does not match its plan: "
+            f"run={int(model_type)}, plan={planned_model_type}"
+        )
+    model_type_for_call = (
+        int(model_type)
+        if model_type is not None
+        else planned_model_type
+    )
+    if model_type_for_call is not None:
+        model_type_for_call = int(model_type_for_call)
+    if model_type_for_call == ModelType.GLM_NEXT:
+        if int(q_all.shape[-1]) != _MLA_UNIFIED_GLM_NEXT_Q_HEAD_DIM:
+            raise ValueError(
+                "GLM_NEXT sparse MLA requires q_head_dim=512, got "
+                f"{int(q_all.shape[-1])}"
+            )
+        if int(kv_cache.shape[-1]) != _MLA_UNIFIED_GLM_NEXT_RECORD_BYTES:
+            raise ValueError(
+                "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
+                f"{int(kv_cache.shape[-1])}"
+            )
+        if scale_format_for_call not in (None, 1):
+            raise ValueError(
+                "GLM_NEXT sparse MLA requires scale_format=1 "
+                f"(ARBITRARY_FP32), got {scale_format_for_call}"
+            )
+        if fp8_rope not in (None, False):
+            raise ValueError("GLM_NEXT sparse MLA has no RoPE cache payload")
+        scale_format_for_call = 1
+        fp8_rope_for_call = False
+    elif model_type_for_call not in (None, ModelType.GLM_NSA):
+        raise ValueError(
+            "attention.sparse_mla supports ModelType.GLM_NSA or "
+            f"ModelType.GLM_NEXT; got model_type={model_type_for_call}"
+        )
+    if (
+        model_type_for_call != ModelType.GLM_NEXT
+        and int(scale_format_for_call or -1) == 2
+        and fp8_rope is None
+    ):
         # Normal vLLM calls arrive through b12x.integration.mla, whose stable
         # public signature does not carry this new option. The allocated record
         # is therefore the authoritative process-lifetime ABI at this boundary;
@@ -604,7 +695,7 @@ def _run_sparse_mla(
                 f"{record_bytes}"
             )
         fp8_rope_for_call = record_bytes == 368
-    else:
+    elif model_type_for_call != ModelType.GLM_NEXT:
         fp8_rope_for_call = _resolve_kv_fp8_rope(fp8_rope)
     if int(scale_format_for_call or -1) == 2:
         expected_record_bytes = 368 if fp8_rope_for_call else 432
@@ -684,10 +775,15 @@ def _run_sparse_mla(
         )
     if _sm120_route:
         q_head_dim = int(q_all.shape[-1])
-        if q_head_dim != _MLA_UNIFIED_GLM_Q_HEAD_DIM:
+        expected_q_head_dim = (
+            _MLA_UNIFIED_GLM_NEXT_Q_HEAD_DIM
+            if model_type_for_call == ModelType.GLM_NEXT
+            else _MLA_UNIFIED_GLM_Q_HEAD_DIM
+        )
+        if q_head_dim != expected_q_head_dim:
             raise ValueError(
-                f"SM120 sparse MLA decode requires the GLM_NSA contract "
-                f"(q_head_dim={_MLA_UNIFIED_GLM_Q_HEAD_DIM}); got q_head_dim={q_head_dim}"
+                "SM120 sparse MLA requires the selected GLM contract "
+                f"(q_head_dim={expected_q_head_dim}); got q_head_dim={q_head_dim}"
             )
         if workspace.mode in ("extend", "verify", "draft_extend"):
             return _run_sm120_prefill(
@@ -703,6 +799,7 @@ def _run_sparse_mla(
                 return_lse=return_lse,
                 lse_scale=lse_scale,
                 scale_format=scale_format_for_call,
+                model_type=model_type_for_call,
                 fp8_rope=fp8_rope_for_call,
                 latent_scale_per_token=latent_scale_per_token,
             )
@@ -722,6 +819,7 @@ def _run_sparse_mla(
             lse_scale=lse_scale,
             forced_num_splits=forced_num_splits,
             scale_format_override=scale_format_for_call,
+            model_type_override=model_type_for_call,
             fp8_rope_override=fp8_rope_for_call,
             latent_scale_per_token=latent_scale_per_token,
         )
@@ -768,6 +866,7 @@ def _run_sm120_prefill(
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
     scale_format: int | None = None,
+    model_type: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -779,6 +878,10 @@ def _run_sm120_prefill(
         q_all=q_all,
         v_head_dim=v_head_dim,
     )
+    lse_out = _get_mla_lse_view(
+        workspace=workspace,
+        q_all=q_all,
+    )
     _, lse_base2 = run_unified_prefill(
         q=q_all,
         kv_cache=kv_cache,
@@ -789,7 +892,9 @@ def _run_sm120_prefill(
         topk_length=active_token_counts,
         attn_sink=attn_sink,
         output=output,
+        lse_out=lse_out,
         scale_format=scale_format,
+        model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
     )

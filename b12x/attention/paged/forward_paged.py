@@ -52,6 +52,7 @@ from b12x._lib.intrinsics import (
     ldmatrix_m8n8x4_trans_b16,
     ldmatrix_m8n8x4_trans_left_half_b16,
     ldmatrix_m8n8x4_trans_right_half_b16,
+    ldmatrix_m16n16x1_trans_b8,
     mxfp8_mma_m16n8k32_f32_e4m3,
     pack_f32x2_to_bfloat2,
     frag_layout_swizzle_16b_to_8b,
@@ -2534,6 +2535,77 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
 
 
 @cute.jit
+def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1_m16n16_b8(
+    o_frag: cute.Tensor,
+    p_frag: cute.Tensor,
+    v_plane0_base_addr: Int32,
+    v_plane1_base_addr: Int32,
+    lane,
+    warp_kv_idx,
+    row_base,
+    num_mma_d_vo,
+    upcast_stride_plane,
+    v_scale,
+):
+    """Load exact FP8 decode PV fragments with SM120 byte ldmatrix."""
+    v_scale_bf2 = broadcast_f32_to_bfloat2(v_scale)
+    upcast_stride_full = upcast_stride_plane * Int32(2)
+    lane_row = lane % 16
+    lane_row = (
+        (lane_row & Int32(0x1))
+        | ((lane_row & Int32(0x4)) >> Int32(1))
+        | ((lane_row & Int32(0x8)) >> Int32(1))
+        | ((lane_row & Int32(0x2)) << Int32(2))
+    )
+    v_row = row_base + warp_kv_idx * 16 + lane_row
+    a0 = bfloat2_mul(p_frag[0, 0, 0], v_scale_bf2)
+    a1 = Uint32(0)
+    a2 = bfloat2_mul(p_frag[0, 0, 2], v_scale_bf2)
+    a3 = Uint32(0)
+    for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+        v_offset = _permuted_offset_128b(
+            v_row,
+            mma_d,
+            upcast_stride_full,
+        )
+        v_addr = _smem_addr_from_split_planes_128b(
+            v_plane0_base_addr,
+            v_plane1_base_addr,
+            v_offset,
+            upcast_stride_full,
+        )
+        b_f8_0, b_f8_1 = ldmatrix_m16n16x1_trans_b8(v_addr)
+        b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_0)
+        b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_1)
+        d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
+            o_frag[0, mma_d, 0],
+            o_frag[0, mma_d, 1],
+            o_frag[0, mma_d, 2],
+            o_frag[0, mma_d, 3],
+            o_frag[0, mma_d, 4],
+            o_frag[0, mma_d, 5],
+            o_frag[0, mma_d, 6],
+            o_frag[0, mma_d, 7],
+            a0,
+            a1,
+            a2,
+            a3,
+            b0,
+            b1,
+            b2,
+            b3,
+        )
+        o_frag[0, mma_d, 0] = d0
+        o_frag[0, mma_d, 1] = d1
+        o_frag[0, mma_d, 2] = d2
+        o_frag[0, mma_d, 3] = d3
+        o_frag[0, mma_d, 4] = d4
+        o_frag[0, mma_d, 5] = d5
+        o_frag[0, mma_d, 6] = d6
+        o_frag[0, mma_d, 7] = d7
+
+
+@cute.jit
 def _literal_pv_mma_into_ofrag_mxfp8_raw(
     o_frag: cute.Tensor,
     p_frag: cute.Tensor,
@@ -3469,6 +3541,18 @@ class PagedForwardKernel:
             and dtype_q == cutlass.BFloat16
             and traits.num_warps_kv == 1
             and traits.num_mma_kv % 2 == 0
+        )
+        self.use_m16n16_b8_fp8_decode_pv = (
+            os.environ.get("B12X_PAGED_DECODE_FP8_PV_M16N16_B8", "1") == "1"
+            and decode_only
+            and self.kv_is_fp8
+            and dtype_q == cutlass.BFloat16
+            and dtype_o == cutlass.BFloat16
+            and traits.head_dim_vo == 256
+            and traits.num_mma_q == 1
+            and traits.num_mma_kv == 1
+            and not self.laguna_fp8_head_pair_decode
+            and not self.use_native_fp8_pv_mma
         )
         self.decode_native_fp8_runtime_chunk_guard = (
             self.use_native_fp8_qk_mma
@@ -5054,9 +5138,11 @@ class PagedForwardKernel:
         )
         decode_qwen_single_row_fastpath = const_expr(
             self.decode_only
+            and os.environ.get("B12X_PAGED_GQA6_COMPACT_SYNC", "1") != "0"
             and not self.has_relative_attention_bias
             and (
                 self.single_request_decode_graph
+                or self.single_qtile_decode_graph
                 or self.analytic_laguna_decode_graph
             )
             and self.split_kv
@@ -5112,7 +5198,14 @@ class PagedForwardKernel:
                     ),
                 )
                 sDecodeStage = cute.make_tensor(
-                    cute.recast_ptr(sync_head_ptr, dtype=self.dtype_o),
+                    cute.recast_ptr(
+                        # Do not alias the cooperative output stage onto the
+                        # first spilled KV-warp plane.  H128 completes its
+                        # store in one iteration and hid the race; at H256,
+                        # later row/dimension reads can observe packed output.
+                        sync_head_ptr + Int32(sync_o_elems + sync_md_elems),
+                        dtype=self.dtype_o,
+                    ),
                     cute.make_layout(
                         (1, self.gqa_group_size, self.traits.head_dim_vo * 2),
                         stride=(
@@ -5216,7 +5309,14 @@ class PagedForwardKernel:
             and self.traits.num_mma_kv == 1
             and self.traits.num_warps_q == 1
             and self.traits.num_warps_kv == 4
-            and (self.gqa_group_size == 6 or self.gqa_group_size == 8)
+            and (
+                self.gqa_group_size == 8
+                or (
+                    self.gqa_group_size == 6
+                    and self.traits.head_dim_qk == 128
+                    and self.traits.head_dim_vo == 128
+                )
+            )
         )
         decode_bf16_row0_fastpath = const_expr(
             decode_row_metadata_fastpath
@@ -5225,7 +5325,14 @@ class PagedForwardKernel:
             and self.traits.num_mma_kv == 1
             and self.traits.num_warps_q == 1
             and self.traits.num_warps_kv == 4
-            and (self.gqa_group_size == 6 or self.gqa_group_size == 8)
+            and (
+                self.gqa_group_size == 8
+                or (
+                    self.gqa_group_size == 6
+                    and self.traits.head_dim_qk == 128
+                    and self.traits.head_dim_vo == 128
+                )
+            )
         )
         decode_bf16_row0_merge_fastpath = const_expr(decode_bf16_row0_fastpath)
         decode_bf16_row0_qk_fastpath = const_expr(decode_bf16_row0_fastpath)
@@ -6763,32 +6870,56 @@ class PagedForwardKernel:
                     ):
                         if group_size == Int32(8) or group_size == Int32(6):
                             if const_expr(num_mma_kv == 1):
-                                _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
-                                    o_frag,
-                                    p_frag,
-                                    shared_ptr_to_u32(
-                                        sVStageBytes.iterator
-                                        + v_stage_plane_offset
-                                        + Int32(0 * kv_plane_total_bytes)
-                                    ),
-                                    shared_ptr_to_u32(
-                                        sVStageBytes.iterator
-                                        + v_stage_plane_offset
-                                        + v_plane1_total_offset
-                                    ),
-                                    sVPlane0,
-                                    lane,
-                                    warp_kv_idx,
-                                    Int32(0)
-                                    if const_expr(self.traits.num_warps_kv > 1)
-                                    else subtile_base,
-                                    num_mma_d_vo,
-                                    tc_upcast_stride_plane,
-                                    v_scale,
-                                    math_head_lane,
-                                    consume_stage_idx,
-                                    self.laguna_fp8_head_pair_wide_math,
-                                )
+                                if const_expr(self.use_m16n16_b8_fp8_decode_pv):
+                                    _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1_m16n16_b8(
+                                        o_frag,
+                                        p_frag,
+                                        shared_ptr_to_u32(
+                                            sVStageBytes.iterator
+                                            + v_stage_plane_offset
+                                            + Int32(0 * kv_plane_total_bytes)
+                                        ),
+                                        shared_ptr_to_u32(
+                                            sVStageBytes.iterator
+                                            + v_stage_plane_offset
+                                            + v_plane1_total_offset
+                                        ),
+                                        lane,
+                                        warp_kv_idx,
+                                        Int32(0)
+                                        if const_expr(self.traits.num_warps_kv > 1)
+                                        else subtile_base,
+                                        num_mma_d_vo,
+                                        tc_upcast_stride_plane,
+                                        v_scale,
+                                    )
+                                else:
+                                    _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
+                                        o_frag,
+                                        p_frag,
+                                        shared_ptr_to_u32(
+                                            sVStageBytes.iterator
+                                            + v_stage_plane_offset
+                                            + Int32(0 * kv_plane_total_bytes)
+                                        ),
+                                        shared_ptr_to_u32(
+                                            sVStageBytes.iterator
+                                            + v_stage_plane_offset
+                                            + v_plane1_total_offset
+                                        ),
+                                        sVPlane0,
+                                        lane,
+                                        warp_kv_idx,
+                                        Int32(0)
+                                        if const_expr(self.traits.num_warps_kv > 1)
+                                        else subtile_base,
+                                        num_mma_d_vo,
+                                        tc_upcast_stride_plane,
+                                        v_scale,
+                                        math_head_lane,
+                                        consume_stage_idx,
+                                        self.laguna_fp8_head_pair_wide_math,
+                                    )
                             else:
                                 _literal_pv_mma_into_ofrag_plane_fp8_raw_row0(
                                     o_frag,
@@ -8227,15 +8358,7 @@ class PagedFp8DecodeRawForwardKernel:
             tma_atom_K,
             tma_atom_V,
         ).launch(
-            grid=(
-                (
-                    self.analytic_verify_max_chunks,
-                    mKCache.shape[2],
-                    self.analytic_verify_batch,
-                )
-                if self.use_q64_laguna_verifier
-                else (mBlockValidMask.shape[0], mKCache.shape[2], 1)
-            ),
+            grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, 1, 4],
             # 67,584 B including barriers/alignment on SM120: one CTA/SM.
             min_blocks_per_mp=1,
@@ -9006,7 +9129,7 @@ class PagedBf16ExtendRawForwardKernel:
             tma_atom_K,
             tma_atom_V,
         ).launch(
-            grid=launch_grid,
+            grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, 4, 1],
             # 99,328 B including barriers/alignment on SM120: one CTA/SM.
             min_blocks_per_mp=1,

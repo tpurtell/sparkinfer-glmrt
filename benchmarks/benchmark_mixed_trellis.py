@@ -20,10 +20,11 @@ from b12x.moe._shared.kernels.w4a16.kernel import (
 )
 from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     MixedTrellisRotations,
+    bind_mixed_trellis,
     build_ordered_maps,
     compile_mixed_trellis,
     make_mixed_trellis_buffers,
-    run_mixed_trellis,
+    run_bound_mixed_trellis,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_moe_weights,
@@ -57,7 +58,7 @@ def _prepared(bits: int, experts: int, seed: int, device: torch.device):
         device=device,
         seed=seed,
         params_dtype=torch.float16,
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=bits,
         gate_suh=scales((experts, HIDDEN)),
         up_suh=scales((experts, HIDDEN)),
@@ -102,9 +103,9 @@ def _serial_state(m, tier, expert_map, props, device):
         element_dtype="fp16",
         sms=int(props.multi_processor_count),
         max_shared_mem=int(props.shared_memory_per_block_optin),
-        weight_layout="trellis3_t256",
+        weight_layout="trellis_t256",
         scale_format="e4m3_k32",
-        w13_layout="trellis3_t256_proj",
+        w13_layout="trellis_t256_proj",
         trellis_bits=int(tier.trellis_bits),
         force_tile_config=TILE_CONFIG,
         intermediate_rotation=True,
@@ -391,34 +392,34 @@ def main() -> None:
             mixed_buffers = make_mixed_trellis_buffers(
                 launch, device=device, sms=int(props.multi_processor_count)
             )
+            mixed_binding = bind_mixed_trellis(
+                mixed_tier0,
+                mixed_tier1,
+                global_map,
+                descriptor,
+                rotations,
+                launch,
+            )
             if args.separate_fc2:
                 mixed_buffers.fc2 = torch.empty_like(mixed_buffers.rotation_gate)
 
             def mixed_fn(
                 mixed_tier0=mixed_tier0,
                 mixed_tier1=mixed_tier1,
-                rotations=rotations,
-                launch=launch,
+                mixed_binding=mixed_binding,
                 mixed_buffers=mixed_buffers,
                 x=x,
                 weights=weights,
                 ids=ids,
-                global_map=global_map,
-                descriptor=descriptor,
             ):
                 assert mixed_tier0 is not None and mixed_tier1 is not None
-                assert rotations is not None and launch is not None
+                assert mixed_binding is not None
                 assert mixed_buffers is not None
-                run_mixed_trellis(
+                run_bound_mixed_trellis(
                     x,
-                    mixed_tier0,
-                    mixed_tier1,
                     weights,
                     ids,
-                    global_map,
-                    descriptor,
-                    rotations,
-                    launch,
+                    mixed_binding,
                     mixed_buffers,
                 )
 
@@ -446,7 +447,6 @@ def main() -> None:
             print(
                 f"m={m:4d} serial={serial_med:9.2f}us mixed={mixed_med:9.2f}us "
                 f"speedup={serial_med / mixed_med:6.3f}x rel={float(rel):.3e} "
-                f"regs={launch.registers_per_thread} local={launch.local_memory_bytes} "
                 f"buffers={mixed_buffer_bytes / 2**20:.1f}/{serial_buffer_bytes / 2**20:.1f}MiB"
             )
         elif args.variant in ("serial", "serial-overlap"):
@@ -460,7 +460,6 @@ def main() -> None:
             assert launch is not None
             print(
                 f"m={m:4d} variant=mixed time={mixed_med:9.2f}us "
-                f"regs={launch.registers_per_thread} local={launch.local_memory_bytes} "
                 f"buffers={mixed_buffer_bytes / 2**20:.1f}MiB"
             )
 

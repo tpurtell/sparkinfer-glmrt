@@ -4,8 +4,8 @@
 - ``bmm``: dtype-dispatched batched matrix multiplication.
 - ``blockscaled``: one-shot dense block-scaled GEMM (NVFP4 / MXFP4 / MXFP8).
 - ``block_fp8_linear``: DeepSeek-style serialized block-FP8 linear via MXFP8.
-- ``mxfp8_linear``: ModelOpt MXFP8 linear (one-shot).
-- ``tensor_fp8_linear``: static per-tensor FP8 linear via the SM12x dense GEMM.
+- ``mxfp8_linear`` / ``tensor_fp8_linear``: compatibility aliases for
+  ``blockscaled`` packed-weight calls.
 - ``mla_query_projection``: fused MXFP8 MLA query projection and assembly.
 - ``trellis_linear``: native EXL3 Trellis W4A16/direct-W4A8 dense linear.
 - ``wo_projection``: fused MLA WO-A/WO-B projections (+ inverse-RoPE variant).

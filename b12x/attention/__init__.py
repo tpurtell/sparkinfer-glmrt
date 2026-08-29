@@ -2,12 +2,16 @@
 
 - ``paged``: paged-KV self-attention (decode + extend, FP8 KV, MSA
   block-sparse variant) with on-device graph-replay metadata staging.
-- ``dense_mla``: dense compressed-cache MLA for Kimi K3 geometry.
-- ``sparse_mla``: top-k-selected MLA decode/extend (DeepSeek-V3.2 / GLM NSA).
-- ``compressed_mla``: MLA decode directly from compressed KV pages (DSV4).
+- ``dense_mla``: dense compressed-cache MLA with strided physical records and
+  optional causal sliding-window masking.
+- ``sparse_mla``: top-k-selected MLA, including strided physical records.
+- ``compressed_sparse_mla``: sparse MLA directly from compressed KV pages
+  (DSV4).
 - ``dsv4_compressor``: DSV4 learned gated-pooling state and cache producer.
 - ``dsv4_producer``: checkpoint-native DSV4 query projection and KV packing.
-- ``nsa_indexer``: the NSA index stage — quantize -> score -> select.
+- ``dsa_indexer``: the DSA index stage — quantize -> score -> select.
+- ``qsa``: grouped-selector sparse GQA over caller-populated, read-only main
+  BF16 paged K/V.
 - ``varlen``: contiguous batched/varlen attention (reduced-assurance tier).
 """
 
@@ -20,10 +24,11 @@ _OP_MODULES = (
     "paged",
     "dense_mla",
     "sparse_mla",
-    "compressed_mla",
+    "compressed_sparse_mla",
     "dsv4_compressor",
     "dsv4_producer",
-    "nsa_indexer",
+    "dsa_indexer",
+    "qsa",
     "varlen",
 )
 

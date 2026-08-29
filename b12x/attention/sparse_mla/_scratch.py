@@ -2,7 +2,7 @@
 
 Eager PLAN -> BIND -> KERNEL, never a workspace/arena. bind() maps the
 caller-owned scratch tensor into per-spec kernel-argument VIEWS and returns a
-plain B12XSparseMLAScratch views container (mirroring B12XCompressedMLAScratch).
+plain B12XSparseMLAScratch views container (mirroring B12XCompressedSparseMLAScratch).
 It never constructs a B12XAttentionWorkspace / arena, allocates, or init-writes.
 The unified SM120 sparse-MLA decode/extend kernels duck-type the workspace
 (tmp_output/tmp_lse/output_buffer/final_lse/num_chunks_ptr/kv_chunk_size_ptr/
@@ -34,6 +34,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
+from b12x.attention._shared.mla.traits import ModelType
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -46,6 +47,7 @@ class B12XSparseMLAScratchCaps:
     kv_dtype: torch.dtype = torch.bfloat16
     head_dim: int = 576
     v_head_dim: int = 512
+    model_type: int | None = None
     mode: Literal["decode", "extend", "verify", "draft_extend"] = "decode"
     max_batch: int | None = None
     max_kv_rows: int = 0
@@ -65,6 +67,14 @@ class B12XSparseMLAScratchCaps:
         object.__setattr__(self, "max_width", max(int(self.max_width), 1))
         object.__setattr__(self, "head_dim", max(int(self.head_dim), 1))
         object.__setattr__(self, "v_head_dim", max(int(self.v_head_dim), 1))
+        if self.model_type is not None:
+            object.__setattr__(self, "model_type", int(self.model_type))
+            if int(self.model_type) == int(ModelType.GLM_NEXT):
+                if int(self.head_dim) != 512 or int(self.v_head_dim) != 512:
+                    raise ValueError(
+                        "ModelType.GLM_NEXT requires head_dim=512 and "
+                        f"v_head_dim=512; got {self.head_dim} and {self.v_head_dim}"
+                    )
         max_batch = self.max_q_rows if self.max_batch is None else self.max_batch
         object.__setattr__(self, "max_batch", max(int(max_batch), 1))
         object.__setattr__(self, "max_kv_rows", max(int(self.max_kv_rows), 0))
@@ -122,6 +132,7 @@ class B12XSparseMLAScratch:
     kv_chunk_size_value: int | None = None
     num_chunks_value: int | None = None
     sm_scale_value: float | None = None
+    model_type: int | None = None
 
     def set_split_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
         if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
@@ -310,9 +321,9 @@ def _sparse_mla_scratch_layout(
     num_q_heads = int(caps.num_q_heads)
     v_head_dim = int(caps.v_head_dim)
     max_chunks_per_row = max(int(caps.max_chunks_per_row), 1)
-    # Only the split-K DECODE path needs tmp_output/tmp_lse/final_lse + split
-    # control. The single-pass prefill (extend/verify/draft_extend) only writes
-    # output_buffer, so it gets a standalone output view -- no multi-chunk scratch.
+    # Only the split-K DECODE path needs tmp_output/tmp_lse + split control.
+    # Every mode owns output and final-LSE views so prefill never allocates its
+    # LSE output during capture.
     split = caps.mode == "decode"
 
     cursor = 0
@@ -354,6 +365,9 @@ def _sparse_mla_scratch_layout(
         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         output_offset_bytes = cursor
         cursor += max_total_q * num_q_heads * v_head_dim * dtype_nbytes(caps.dtype)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+        final_lse_offset_bytes = cursor
+        cursor += max_total_q * num_q_heads * dtype_nbytes(torch.float32)
         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     sm_scale_offset_bytes = cursor
@@ -412,12 +426,6 @@ def _materialize_sparse_mla_scratch(
             shape=(max_total_q, num_q_heads, max_chunks_per_row),
             dtype=torch.float32,
         )
-        final_lse, _ = materialize_scratch_view(
-            scratch_storage,
-            offset_bytes=layout.final_lse_offset_bytes,
-            shape=(max_total_q, num_q_heads),
-            dtype=torch.float32,
-        )
         kv_chunk_size_ptr, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.kv_chunk_size_offset_bytes,
@@ -447,6 +455,13 @@ def _materialize_sparse_mla_scratch(
                 dtype=caps.dtype,
             )
 
+    final_lse, _ = materialize_scratch_view(
+        scratch_storage,
+        offset_bytes=layout.final_lse_offset_bytes,
+        shape=(max_total_q, num_q_heads),
+        dtype=torch.float32,
+    )
+
     sm_scale_tensor, _ = materialize_scratch_view(
         scratch_storage,
         offset_bytes=layout.sm_scale_offset_bytes,
@@ -462,6 +477,7 @@ def _materialize_sparse_mla_scratch(
         num_q_heads=num_q_heads,
         head_dim=caps.head_dim,
         v_head_dim=v_head_dim,
+        model_type=caps.model_type,
         topk=caps.max_width,
         max_total_q=caps.max_q_rows,
         max_batch=caps.max_batch,

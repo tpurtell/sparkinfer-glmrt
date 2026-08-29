@@ -1,0 +1,227 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: en-US
+tone_instructions: >-
+  Be concise, technical, and evidence-first. Report concrete defects and
+  contract violations; do not invent hypothetical threats, broad defensive
+  rewrites, or style churn.
+
+reviews:
+  profile: chill
+  request_changes_workflow: true
+  poem: false
+  auto_title_instructions: >-
+    Name the resulting behavior or corrected invariant in repository terms. Do
+    not use lifecycle labels, codenames, issue numbers, or conversational
+    references as the subject.
+  high_level_summary_instructions: >-
+    Describe the resulting behavior, technical reason, compatibility impact,
+    and validation as a present-state technical summary. Do not narrate attempts,
+    pivots, review discussion, or development chronology.
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        Apply the repository's AGENTS.md as review criteria. Prioritize material
+        correctness, compatibility, performance, and serving-lifecycle defects.
+        Do not request speculative hardening, generalized frameworks, broad
+        refactors, compatibility shims, fallback layers, or test expansion when
+        a small local correction enforces the actual invariant.
+
+        Require claims to match evidence:
+        - A performance claim must identify the real target path, comparison
+          revisions, command, worktree, physical GPU and mode, correctness state,
+          raw timings, and ratio direction. A reduced case must be labeled as a
+          proxy and cannot establish production-path performance.
+        - Correctness must precede timing. Treat a failed oracle, non-finite or
+          zero output, quantization mismatch, boundary failure, capture failure,
+          replay allocation, or unstable address as blocking evidence.
+        - Do not accept claims of fused, direct, native, or production execution
+          when the path uses packed adapters, reference implementations,
+          CPU/Torch fallbacks, or a route that production does not execute.
+        - A security claim must identify attacker-controlled input, the trust
+          boundary it crosses, reachability, and concrete impact. Same-process
+          caller misuse, malformed internal tensors, and explicitly configured
+          diagnostic endpoints are correctness or robustness concerns unless the
+          PR demonstrates a security boundary. Use the accurate classification.
+
+        Preserve architectural ownership and hot-path behavior:
+        - b12x owns planning, scratch layout, and policy. Integrations provide
+          metadata and capacity limits; they must not duplicate per-shape plans,
+          caches, dispatch policy, or workspace policy.
+        - Enforce invariants once at parsing, artifact loading, plan, bind, model
+          initialization, or admission when those boundaries have the required
+          information. Flag per-run predicates, cache lookups, allocations,
+          reallocations, synchronization, or fallback selection that executes on
+          every invocation without being required by dynamic input semantics.
+        - Preserve CUDA graph capture and replay, stable addresses, and fixed or
+          preplanned workspace capacity. A path that only works eagerly is not a
+          serving implementation.
+        - Keep compressed MLA and GLM MLA/NSA contracts separate. In W4A16,
+          activations are BF16 and weights are dequantized inline; activation-scale
+          math is a contract violation.
+
+        Review scope proportionally. New runtime dependencies, native modules or
+        extensions, and entirely new execution or kernel paths require an explicit
+        architectural purpose, compatibility analysis, and direct validation.
+        They are not acceptable incidental fixes. Tests should exercise the
+        smallest meaningful invariant and real boundary without building a large
+        policy framework around a small check.
+
+        Enforce context-independent prose in changed documentation, comments,
+        docstrings, names, errors, tests, reports, commit messages, and PR text.
+        Flag a violation when a technically capable reader with the repository but
+        without the author conversation or development history cannot identify the
+        referenced system, behavior, evidence, or status. Apply these criteria:
+        - Describe present behavior, purpose, invariants, interfaces, evidence,
+          and limitations directly. Do not narrate attempts or the development
+          journey.
+        - Do not use lifecycle words such as "phase", "pilot", "next", "current",
+          "new", "old", or "latest" as identities. Ordinary grammatical uses are
+          allowed when the referenced object is locally unambiguous.
+        - Reject false definite references such as "the experiment", "the
+          capture", or "this approach" unless the object was introduced locally.
+        - At first reference, name the semantic role and, when needed for use or
+          reproduction, the durable path, schema, revision, manifest, or hash.
+          Explain a concept before introducing its codename or profile label.
+        - Canonical documentation specifies the repository as it exists. Put
+          chronology and rejected approaches only in explicitly historical
+          material; update stale specifications instead of layering a changelog
+          into them.
+        - Express status as implemented, qualified, research-only, or unsupported.
+          Express evidence as conditions, measurement, result, and conclusion.
+        - Comments explain invariants, intent, or non-obvious constraints, never
+          change history. A TODO must state the missing condition and the criterion
+          for removal.
+        - PRs and commits state resulting behavior, technical reason,
+          compatibility impact, and validation. They do not recount attempts,
+          pivots, or conversational context.
+
+    - path: "b12x/**/*.py"
+      instructions: |
+        Distinguish host orchestration from device-executed CuTe DSL code before
+        assessing cost or safety. For any changed arithmetic that scales a page,
+        block, or row identifier into an element or byte offset, require Int64
+        multiplication and a live big-id test beyond the Int32 overflow boundary.
+        Do not suggest a device-kernel modification as security hardening. Review
+        device-kernel changes only against their stated correctness or performance
+        purpose and the repository's kernel qualification requirements.
+
+    - path: "b12x/**/*.{cu,cuh,cpp}"
+      instructions: |
+        Native code must be the explicit subject of the PR, not an incidental
+        implementation of a security, validation, packaging, or integration fix.
+        Require a direct need, supported-build analysis, real-path correctness
+        coverage, and target-hardware evidence. Reject a parallel native path when
+        an existing shared implementation can express the required behavior.
+
+    - path: "tests/**"
+      instructions: |
+        Require tests to exercise the real contract boundary and failure mode.
+        Reference-only, CPU-only, mocked, or reduced tests do not establish a GPU
+        production-path claim. Kernel pool-index tests must include live pages past
+        the Int32 scaled-offset boundary. Keep test machinery proportional to the
+        invariant; flag large harnesses that primarily test defensive plumbing.
+
+  pre_merge_checks:
+    custom_checks:
+      - name: "Context-independent repository prose"
+        mode: error
+        instructions: |
+          Inspect changed documentation, comments, docstrings, user-visible names,
+          errors, tests, reports, commit messages, PR title, and PR description.
+
+          Fail if any changed prose requires author conversation or unrecorded
+          development history to understand. A failure includes any of:
+          1. A lifecycle label such as Phase 2, pilot, next, current, new, old, or
+             latest is used as an object's identity rather than as a locally clear
+             modifier.
+          2. A definite reference such as "the experiment", "the 1M-token
+             capture", or "this approach" has no locally introduced referent.
+          3. A codename, profile number, experiment label, or implementation
+             shorthand is used before the semantic concept it denotes is stated.
+          4. Canonical documentation narrates chronology, attempts, pivots, or
+             rejected work instead of specifying present behavior. Explicitly
+             historical documents and changelogs are exempt.
+          5. A status claim cannot be classified as implemented, qualified,
+             research-only, or unsupported from the text.
+          6. Evidence is presented as a story rather than stating conditions,
+             measurement, result, and conclusion.
+          7. A comment describes change history instead of an invariant, intent,
+             or non-obvious constraint.
+          8. A TODO omits either the missing condition or its removal criterion.
+          9. A PR or commit message recounts attempts or discussion instead of the
+             resulting behavior, technical reason, compatibility impact, and
+             validation.
+
+          Pass when all changed prose is self-contained under these rules. Do not
+          fail ordinary grammatical uses of the listed words when the referenced
+          object is locally explicit.
+
+      - name: "Security claim and implementation scope"
+        mode: error
+        instructions: |
+          Apply this check only when the PR, linked issue, commit, or code presents
+          a change as a security fix, security hardening, vulnerability fix, or
+          defense against hostile input. Otherwise pass.
+
+          Fail unless the PR identifies attacker-controlled input, a meaningful
+          trust boundary, reachable behavior, concrete impact, and why the chosen
+          enforcement boundary is the smallest sufficient fix. Treat malformed
+          same-process API calls or internal tensors as correctness/robustness,
+          not security, unless an external trust boundary is demonstrated.
+
+          Fail a security-scoped change if it does any of the following:
+          - modifies device-executed kernel code;
+          - adds a native module or extension;
+          - adds a runtime dependency;
+          - introduces an entirely new kernel or execution path;
+          - adds an unconditional predicate, allocation, cache lookup,
+            synchronization, or fallback decision to a run or graph-replay path;
+          - changes compiler/cache identity, benchmark meaning, provenance
+            semantics, supported artifact layouts, or public workflow behavior
+            without proving that change is necessary to close the demonstrated
+            boundary;
+          - builds a policy engine or broad abstraction when a small standard-
+            library check at parse, load, bind, plan, initialization, or admission
+            would enforce the invariant.
+
+          Pass only when the security classification and implementation scope are
+          both supported by repository-visible evidence.
+
+      - name: "Serving hot-path invariants"
+        mode: error
+        instructions: |
+          Apply this check when the PR changes planning, binding, integration,
+          dispatch, execution, workspace, warmup, capture, or replay behavior.
+          Otherwise pass.
+
+          Fail if b12x policy is duplicated in an integration instead of receiving
+          metadata or capacity limits. Fail if an invariant that is knowable at
+          artifact load, model initialization, plan, bind, or admission is checked
+          again on every run. Fail if a captured or replayed path can allocate,
+          reallocate, grow a cache, select a slow/fake fallback, synchronize for
+          host policy, change an address, or exceed fixed/preplanned workspace.
+
+          Pass when the diff preserves one-time planning, stable bindings and
+          addresses, fixed capacity, allocation-free replay, and direct execution
+          of the claimed production path. Dynamic predicates required by actual
+          per-request semantics are allowed when the PR identifies that necessity.
+
+      - name: "Performance claim evidence"
+        mode: error
+        instructions: |
+          Apply this check only when the PR title, description, commits, or changed
+          prose claims a speedup, slowdown, performance equivalence, no regression,
+          lower overhead, or production performance. Otherwise pass.
+
+          Fail unless repository-visible evidence names the real target command and
+          path, comparison revisions, worktree, physical GPU and operating mode,
+          correctness state, raw timing samples, and ratio direction. Fail if a
+          proxy, CPU/reference route, changed benchmark semantic, or failed
+          correctness case is used as performance evidence. Pass when the claim is
+          bounded to the measured conditions and the required provenance is present.
+
+knowledge_base:
+  learnings:
+    scope: local

@@ -69,6 +69,7 @@ _DSV4_FOOTER_BYTES = 8  # 7 UE8M0 + 1 pad; == SCALE_BYTES_PER_TOKEN.
 _GLM_GMEM_STRIDE = 656
 _GLM_NOPE_SCALE_BYTES = 528  # 512 e4m3 + 16 inline fp32; bulk #1 (-> kv_fp8 row).
 _GLM_ROPE_BYTES = 128  # 64 bf16; bulk #2 (-> kv_rope).
+_GLM_NEXT_GMEM_STRIDE = 528  # Same latent+scales row, with no RoPE suffix.
 
 # NVFP4 MLA latent layout: 256B E2M1 NoPE + 32B E4M3 scales + 16B pad + 128B
 # BF16 RoPE. The NoPE+scale+pad region is staged as a 288B row; decode math
@@ -177,9 +178,11 @@ def io_issue_gather(
             _ROPE = Int32(_NVFP4_ROPE_BYTES)
             _ROPE_SRC = Int64(_NVFP4_ROPE_SRC)
     else:
-        _IOS = Int64(_GLM_GMEM_STRIDE)  # 656 per-token contiguous record
+        _IOS = Int64(
+            _GLM_GMEM_STRIDE if rope_smem_stride else _GLM_NEXT_GMEM_STRIDE
+        )
         _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)  # 528 nope+inline-fp32 -> kv_fp8
-        _ROPE = Int32(_GLM_ROPE_BYTES)  # 128 -> kv_rope
+        _ROPE = Int32(_GLM_ROPE_BYTES if rope_smem_stride else 0)
         _ROPE_SRC = Int64(_GLM_NOPE_SCALE_BYTES)  # rope follows nope+scales
     _FOOT = Int32(scale_bytes_per_token)
 
@@ -214,12 +217,13 @@ def io_issue_gather(
                 _NOPE,
                 full_mbar_u32,
             )
-            cp_async_bulk_g2s_mbar(
-                kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
-                data_base_i64 + _ROPE_SRC,
-                _ROPE,
-                full_mbar_u32,
-            )
+            if cutlass.const_expr(rope_smem_stride > 0):
+                cp_async_bulk_g2s_mbar(
+                    kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
+                    data_base_i64 + _ROPE_SRC,
+                    _ROPE,
+                    full_mbar_u32,
+                )
 
     def _issue_payload():
         eo = Int32(0)
@@ -262,12 +266,13 @@ def io_issue_gather(
                         _NOPE,
                         full_mbar_u32,
                     )
-                    cp_async_bulk_g2s_mbar(
-                        kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
-                        data_base_i64 + _ROPE_SRC,
-                        _ROPE,
-                        full_mbar_u32,
-                    )
+                    if cutlass.const_expr(rope_smem_stride > 0):
+                        cp_async_bulk_g2s_mbar(
+                            kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
+                            data_base_i64 + _ROPE_SRC,
+                            _ROPE,
+                            full_mbar_u32,
+                        )
             eo += Int32(io_threads)
 
     # Native H16 can overlap the random scalar footer load with the much larger

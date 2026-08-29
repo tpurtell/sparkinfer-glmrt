@@ -30,6 +30,15 @@ from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
     st_global_u32,
 )
+from b12x._lib.intrinsics import (
+    mxfp8_mma_m16n8k32_f32_e4m3,
+    st_shared_u32,
+)
+from b12x.moe._shared.kernels.w4a8_trellis_decode import (
+    _w4a8_stage_trellis_b_tile,
+    _w4a8_trellis_lane_geom,
+    _w4a8_trellis_pair_words_both,
+)
 
 
 class W4A8MaterializedPhase2Kernel:
@@ -62,6 +71,8 @@ class W4A8MaterializedPhase2Kernel:
         *,
         source_tile_m: int = 128,
         deterministic_output: bool = False,
+        trellis_bits: int | None = None,
+        trellis_direct_lut: bool = False,
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
@@ -70,6 +81,20 @@ class W4A8MaterializedPhase2Kernel:
         self.source_tile_m = int(source_tile_m)
         self.source_halves = self.source_tile_m // self.tile_m
         self.deterministic_output = bool(deterministic_output)
+        if trellis_bits is not None and trellis_bits not in (2, 3, 4):
+            raise ValueError(
+                f"trellis_bits must be 2, 3, or 4, got {trellis_bits!r}"
+            )
+        self.w4a8_trellis = trellis_bits is not None
+        self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
+        # Direct-LUT decode gathers each byte from the rate-indexed 192 KiB
+        # global state table instead of hashing into a 4 KiB shared T12
+        # staircase; the shared region is then not allocated.
+        self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
+        if self.w4a8_trellis:
+            self.trellis_lut_offset = self.shared_bytes
+            if not self.trellis_direct_lut:
+                self.shared_words = (self.shared_bytes + 4096 + 3) // 4
 
     @cute.jit
     def __call__(
@@ -85,6 +110,7 @@ class W4A8MaterializedPhase2Kernel:
         expert_tile_base: cute.Tensor,
         down_alpha: cute.Tensor,
         global_scale: cute.Tensor,
+        trellis_lut: cute.Tensor,
         intermediate_tiles: cutlass.Int32,
         packed_output_tiles: cutlass.Int32,
         max_active_clusters: cutlass.Int32,
@@ -105,6 +131,7 @@ class W4A8MaterializedPhase2Kernel:
             expert_tile_base,
             down_alpha,
             global_scale,
+            trellis_lut,
             intermediate_tiles,
             packed_output_tiles,
         ).launch(
@@ -181,46 +208,72 @@ class W4A8MaterializedPhase2Kernel:
                 get_ptr_as_int64(intermediate_u32, sf_src),
             )
 
-        # Prepared weights are N256 tile-major.  Select the N128 half and
-        # compact its four K32 chunks into the phase-B shared tile.
-        packed_tile = output_tile >> Int32(1)
-        packed_half = output_tile & Int32(1)
-        b_tile = (
-            expert_idx * packed_output_tiles + packed_tile
-        ) * intermediate_tiles + intermediate_slice
-        b_word_base = Int64(b_tile) * Int64(4096)
-        for i in cutlass.range_constexpr(
-            (4 * 4 * 32 + self.threads_per_cta - 1) // self.threads_per_cta
-        ):
-            idx = tid + Int32(i * self.threads_per_cta)
-            if idx < Int32(4 * 4 * 32):
-                lane = idx & Int32(31)
-                kc = idx >> Int32(5)
-                chunk = kc & Int32(3)
-                kb = kc >> Int32(2)
-                src_word = (
-                    b_word_base
-                    + Int64(kb * 8 * 32 * 4)
-                    + Int64((packed_half * Int32(4) + chunk) * Int32(32 * 4))
-                    + Int64(lane * Int32(4))
-                )
-                cp_async4_shared_global(
-                    b_base + (idx << Int32(4)),
-                    get_ptr_as_int64(down_rp, src_word),
-                )
+        if cutlass.const_expr(self.w4a8_trellis):
+            # Expert-major [E][K16][N16] trellis windows over the down
+            # projection (K = intermediate, N = hidden); stage the slice's
+            # eight K16 rows for this N128 output tile. SFB stays unstaged.
+            tr_n16_cnt = packed_output_tiles * Int32(16)
+            tr_k16_stride = tr_n16_cnt * Int32(8 * self.trellis_bits)
+            tr_eu = Int64(intermediate_tiles * Int32(8)) * Int64(tr_k16_stride)
+            tr_base = (
+                Int64(expert_idx) * tr_eu
+                + Int64(intermediate_slice * Int32(8)) * Int64(tr_k16_stride)
+                + Int64(output_tile * Int32(8))
+                * Int64(8 * self.trellis_bits)
+            )
+            _w4a8_stage_trellis_b_tile(
+                down_rp,
+                b_base,
+                tr_base,
+                tr_k16_stride,
+                self.trellis_bits,
+                tid,
+                self.threads_per_cta,
+                8,
+            )
+        else:
+            # Prepared weights are N256 tile-major.  Select the N128 half and
+            # compact its four K32 chunks into the phase-B shared tile.
+            packed_tile = output_tile >> Int32(1)
+            packed_half = output_tile & Int32(1)
+            b_tile = (
+                expert_idx * packed_output_tiles + packed_tile
+            ) * intermediate_tiles + intermediate_slice
+            b_word_base = Int64(b_tile) * Int64(4096)
+            for i in cutlass.range_constexpr(
+                (4 * 4 * 32 + self.threads_per_cta - 1) // self.threads_per_cta
+            ):
+                idx = tid + Int32(i * self.threads_per_cta)
+                if idx < Int32(4 * 4 * 32):
+                    lane = idx & Int32(31)
+                    kc = idx >> Int32(5)
+                    chunk = kc & Int32(3)
+                    kb = kc >> Int32(2)
+                    src_word = (
+                        b_word_base
+                        + Int64(kb * 8 * 32 * 4)
+                        + Int64((packed_half * Int32(4) + chunk) * Int32(32 * 4))
+                        + Int64(lane * Int32(4))
+                    )
+                    cp_async4_shared_global(
+                        b_base + (idx << Int32(4)),
+                        get_ptr_as_int64(down_rp, src_word),
+                    )
 
-        # The N128 half contains 16 n8 scale rows, eight u32 words each.
-        sfb_word_base = Int64(b_tile) * Int64(256)
-        for i in cutlass.range_constexpr(
-            ((16 * 8) // 4 + self.threads_per_cta - 1) // self.threads_per_cta
-        ):
-            idx = tid + Int32(i * self.threads_per_cta)
-            if idx < Int32((16 * 8) // 4):
-                src_word = sfb_word_base + Int64(packed_half * Int32(16 * 8) + idx * 4)
-                cp_async4_shared_global(
-                    sfb_base + (idx << Int32(4)),
-                    get_ptr_as_int64(down_sfb_rp, src_word),
-                )
+            # The N128 half contains 16 n8 scale rows, eight u32 words each.
+            sfb_word_base = Int64(b_tile) * Int64(256)
+            for i in cutlass.range_constexpr(
+                ((16 * 8) // 4 + self.threads_per_cta - 1) // self.threads_per_cta
+            ):
+                idx = tid + Int32(i * self.threads_per_cta)
+                if idx < Int32((16 * 8) // 4):
+                    src_word = sfb_word_base + Int64(
+                        packed_half * Int32(16 * 8) + idx * 4
+                    )
+                    cp_async4_shared_global(
+                        sfb_base + (idx << Int32(4)),
+                        get_ptr_as_int64(down_sfb_rp, src_word),
+                    )
 
     @cute.jit
     def _run_task(
@@ -233,6 +286,7 @@ class W4A8MaterializedPhase2Kernel:
         token_weights: cute.Tensor,
         down_alpha: cute.Tensor,
         global_scale: cute.Tensor,
+        trellis_lut: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
         warp_idx: Int32,
@@ -248,6 +302,15 @@ class W4A8MaterializedPhase2Kernel:
         lane = tid & Int32(31)
         q = lane >> Int32(2)
         c = lane & Int32(3)
+        if cutlass.const_expr(self.w4a8_trellis):
+            tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(
+                lane, self.trellis_bits
+            )
+            trellis_lut_addr = Int64(
+                smem_base + Int32(self.trellis_lut_offset)
+            )
+            if cutlass.const_expr(self.trellis_direct_lut):
+                trellis_lut_addr = trellis_lut.iterator.toint()
 
         self._stage_slice(
             intermediate_u32,
@@ -337,25 +400,78 @@ class W4A8MaterializedPhase2Kernel:
                     a_frag[blk, 2] = a2
                     a_frag[blk, 3] = a3
 
-                w0, w1, w2, w3 = ld_shared_v4_u32(
-                    b_base
-                    + (((Int32(kb * 4) + warp_idx) * Int32(32) + lane) << Int32(4))
-                )
-                words = cute.make_rmem_tensor((4,), Uint32)
-                words[0] = w0
-                words[1] = w1
-                words[2] = w2
-                words[3] = w3
+                dn_b0 = cute.make_rmem_tensor((4,), Uint32)
+                dn_b1 = cute.make_rmem_tensor((4,), Uint32)
+                if cutlass.const_expr(self.w4a8_trellis):
+                    for th in cutlass.range_constexpr(2):
+                        tr_n16 = warp_idx * Int32(2) + Int32(th)
+                        tr_b0 = (Int32(kb * 16) + tr_n16) * Int32(
+                            8 * self.trellis_bits
+                        )
+                        d_lo0, d_lo1, d_hi0, d_hi1 = (
+                            _w4a8_trellis_pair_words_both(
+                                b_base,
+                                lane,
+                                tr_b0,
+                                tr_b0 + Int32(64 * self.trellis_bits),
+                                tr_ia,
+                                tr_ib,
+                                tr_s2,
+                                self.trellis_bits,
+                                trellis_lut_addr,
+                                not self.trellis_direct_lut,
+                                self.trellis_direct_lut,
+                            )
+                        )
+                        dn_b0[th * 2] = d_lo0
+                        dn_b1[th * 2] = d_lo1
+                        dn_b0[th * 2 + 1] = d_hi0
+                        dn_b1[th * 2 + 1] = d_hi1
+                else:
+                    w0, w1, w2, w3 = ld_shared_v4_u32(
+                        b_base
+                        + (((Int32(kb * 4) + warp_idx) * Int32(32) + lane) << Int32(4))
+                    )
+                    words = cute.make_rmem_tensor((4,), Uint32)
+                    words[0] = w0
+                    words[1] = w1
+                    words[2] = w2
+                    words[3] = w3
+                    for nt in cutlass.range_constexpr(4):
+                        wb0, wb1 = e2m1x8_to_qmma_e2m1x8(words[nt])
+                        dn_b0[nt] = wb0
+                        dn_b1[nt] = wb1
                 for nt in cutlass.range_constexpr(4):
                     n8 = warp_idx * Int32(4) + Int32(nt)
-                    b0, b1 = e2m1x8_to_qmma_e2m1x8(words[nt])
-                    sfb_word = ld_shared_u32(
-                        sfb_base + ((n8 * Int32(8) + q) << Int32(2))
-                    )
+                    b0 = dn_b0[nt]
+                    b1 = dn_b1[nt]
+                    sfb_word = Uint32(0x7F7F7F7F)
+                    if cutlass.const_expr(not self.w4a8_trellis):
+                        sfb_word = ld_shared_u32(
+                            sfb_base + ((n8 * Int32(8) + q) << Int32(2))
+                        )
                     for blk in cutlass.range_constexpr(4):
                         fragment = facc[blk][nt]
-                        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
-                            fragment[0],
+                        if cutlass.const_expr(self.w4a8_trellis):
+                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                                fragment[0],
+                                fragment[1],
+                                fragment[2],
+                                fragment[3],
+                                a_frag[blk, 0],
+                                a_frag[blk, 1],
+                                a_frag[blk, 2],
+                                a_frag[blk, 3],
+                                b0,
+                                b1,
+                                asc[blk],
+                                sfb_word,
+                                bid_a=kb,
+                                bid_b=kb,
+                            )
+                        else:
+                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
+                                fragment[0],
                             fragment[1],
                             fragment[2],
                             fragment[3],
@@ -450,6 +566,7 @@ class W4A8MaterializedPhase2Kernel:
         expert_tile_base: cute.Tensor,
         down_alpha: cute.Tensor,
         global_scale: cute.Tensor,
+        trellis_lut: cute.Tensor,
         intermediate_tiles: cutlass.Int32,
         packed_output_tiles: cutlass.Int32,
     ):
@@ -470,6 +587,20 @@ class W4A8MaterializedPhase2Kernel:
 
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        if cutlass.const_expr(
+            self.w4a8_trellis and not self.trellis_direct_lut
+        ):
+            trellis_lut_u32 = cute.recast_tensor(trellis_lut, cutlass.Uint32)
+            lut_copy_i = Int32(tidx)
+            while lut_copy_i < Int32(1024):
+                st_shared_u32(
+                    smem_base
+                    + Int32(self.trellis_lut_offset)
+                    + (lut_copy_i << Int32(2)),
+                    Uint32(trellis_lut_u32[lut_copy_i]),
+                )
+                lut_copy_i += Int32(self.threads_per_cta)
+            cute.arch.sync_threads()
 
         rows_capacity = Int32(token_map.shape[0])
         num_experts = Int32(expert_tile_base.shape[0] - 1)
@@ -503,6 +634,7 @@ class W4A8MaterializedPhase2Kernel:
                     token_weights,
                     down_alpha,
                     global_scale,
+                    trellis_lut,
                     smem_base,
                     tid,
                     warp_idx,

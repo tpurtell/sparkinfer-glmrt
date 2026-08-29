@@ -1,18 +1,16 @@
-"""Static per-tensor FP8 linear for SM12x.
+"""Compatibility alias for tensor-scaled FP8 ``blockscaled`` calls.
 
-``pack_weight`` keeps serialized E4M3 weights unchanged, prepares unit UE8M0
-scale-factor storage once, and records the combined activation/weight
-dequantization scale. ``mm`` consumes an already-quantized E4M3 activation and
-runs the native SM12x dense GEMM with the combined scale in its FP32 epilogue.
+New code should use ``b12x.gemm.blockscaled.pack_weight``, ``.mm``, and
+``.prewarm``. This module retains its original names for compatibility.
 
 Example:
-    from b12x.gemm import tensor_fp8_linear
+    from b12x.gemm import blockscaled
 
-    packed = tensor_fp8_linear.pack_weight(
+    packed = blockscaled.pack_weight(
         weight_fp8,
         input_scale * weight_scale,
     )
-    output = tensor_fp8_linear.mm(input_fp8, packed)
+    output = blockscaled.mm(input_fp8, packed)
 """
 
 from __future__ import annotations

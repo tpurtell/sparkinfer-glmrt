@@ -15,15 +15,20 @@ from b12x.comm.pcie.pcie_oneshot import (
     _compute_crossover_size,
     _finish_collective_runtime_setup,
     _group_ranks,
+    _object_broadcast_device,
     _OwnedSharedBuffer,
     _require_no_retained_ipc_setup,
     _require_full_grid_residency,
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     _RETAINED_FAILED_IPC_EXPORTS,
+    _CuTeOneshotBackend,
     _CuTeOneshotState,
     _enable_device_slot_selection,
+    _transport_policy_contract,
+    _uses_sharded_eager_storage,
     parse_pcie_oneshot_max_size,
 )
+from b12x.comm.pcie._oneshot_cute import _FusedOneshotLaunch
 
 
 @pytest.fixture(autouse=True)
@@ -250,6 +255,178 @@ def test_graph_slot_bias_preserves_the_next_host_slot() -> None:
     state.eager_slot = 8
     _enable_device_slot_selection(state, capturing=True)
     assert state.slot_bias == 1
+
+
+def _make_cute_state(world_size: int, *, eager: bool = True) -> _CuTeOneshotState:
+    transport_policy = _transport_policy_contract()
+    return _CuTeOneshotState(
+        rank=0,
+        world_size=world_size,
+        signal_ptrs=tuple(range(100, 100 + world_size)),
+        rank_data=torch.empty(256, dtype=torch.uint8),
+        signal_table_address=0,
+        next_table_offset=128,
+        registered_tables={},
+        eager_tables=(300, 400) if eager else None,
+        eager_buffer_bytes=128 * 1024 if eager else None,
+        transport_policy=transport_policy,
+        sharded_eager_storage=_uses_sharded_eager_storage(
+            world_size,
+            transport_policy,
+        ),
+    )
+
+
+def test_tp8_owner_launcher_rejects_float32() -> None:
+    with pytest.raises(ValueError, match="requires float16 or bfloat16"):
+        _FusedOneshotLaunch(
+            "float32",
+            world_size=8,
+            rank=0,
+            mode="stage_tp8_owner",
+            single_cta=True,
+            register_normalize=True,
+            device_slot_selection=False,
+            slot_bias=0,
+            threads=256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("rows", "hidden", "dtype", "expected"),
+    (
+        (1, 6144, torch.bfloat16, "stage_pull"),
+        (2, 4096, torch.float16, "stage_tp8_owner"),
+        (4, 6144, torch.bfloat16, "stage_tp8_owner"),
+        (8, 6144, torch.bfloat16, "stage_tp8_owner"),
+        (9, 6144, torch.bfloat16, "stage_pull"),
+        (4, 8192, torch.bfloat16, "stage_pull"),
+        (4, 6144, torch.float32, "stage_pull"),
+    ),
+)
+def test_tp8_owner_reduce_default_has_a_bounded_shape_contract(
+    monkeypatch,
+    rows: int,
+    hidden: int,
+    dtype: torch.dtype,
+    expected: str,
+) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.delenv("B12X_PCIE_TP8_OWNER_REDUCE", raising=False)
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(8), torch.empty((rows, hidden), dtype=dtype)
+    )
+    assert mode == expected
+
+
+def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(8), torch.empty((4, 6144), dtype=torch.bfloat16)
+    )
+    assert mode == "stage_pull"
+
+
+@pytest.mark.parametrize(
+    ("world_size", "env_name", "shape", "expected_when_enabled"),
+    (
+        (2, "B12X_PCIE_TP2_REMOTE_PUSH", (4, 4096), "stage_remote_push"),
+        (4, "B12X_PCIE_TP4_REMOTE_PUSH", (32, 6144), "stage_remote_push"),
+    ),
+)
+def test_tp2_tp4_remote_push_is_opt_in(
+    monkeypatch,
+    world_size: int,
+    env_name: str,
+    shape: tuple[int, int],
+    expected_when_enabled: str,
+) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.delenv(env_name, raising=False)
+    inp = torch.empty(shape, dtype=torch.bfloat16)
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(world_size), inp
+    )
+    assert mode == "stage_pull"
+
+    monkeypatch.setenv(env_name, "1")
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(world_size), inp
+    )
+    assert mode == expected_when_enabled
+
+
+def test_topology_policy_is_immutable_after_channel_setup(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
+    state = _make_cute_state(4)
+
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        state,
+        torch.empty((4, 6144), dtype=torch.bfloat16),
+    )
+
+    assert mode == "stage_remote_push"
+
+
+@pytest.mark.parametrize(
+    ("world_size", "env_name", "shape"),
+    (
+        (2, "B12X_PCIE_TP2_REMOTE_PUSH", (4, 6144)),
+        (2, "B12X_PCIE_TP2_REMOTE_PUSH", (33, 4096)),
+        (4, "B12X_PCIE_TP4_REMOTE_PUSH", (33, 6144)),
+        (4, "B12X_PCIE_TP4_REMOTE_PUSH", (4, 8192)),
+    ),
+)
+def test_tp2_tp4_remote_push_falls_back_outside_qualified_shapes(
+    monkeypatch,
+    world_size: int,
+    env_name: str,
+    shape: tuple[int, int],
+) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv(env_name, "1")
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(world_size),
+        torch.empty(shape, dtype=torch.bfloat16),
+    )
+    assert mode == "stage_pull"
+
+
+def test_registered_fused_input_never_selects_topology_transport(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(4, eager=False),
+        torch.empty((4, 6144), dtype=torch.bfloat16),
+    )
+    assert mode == "registered"
+
+
+def test_topology_transport_storage_policy_matches_opt_in_defaults(
+    monkeypatch,
+) -> None:
+    for name in (
+        "B12X_PCIE_ONESHOT_PUSH",
+        "B12X_PCIE_TP2_REMOTE_PUSH",
+        "B12X_PCIE_TP4_REMOTE_PUSH",
+        "B12X_PCIE_TP8_OWNER_REDUCE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert not _uses_sharded_eager_storage(2)
+    assert not _uses_sharded_eager_storage(4)
+    assert _uses_sharded_eager_storage(8)
+    assert _transport_policy_contract() == (False, False, False, True)
+
+    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
+    assert _uses_sharded_eager_storage(4)
+    assert not _uses_sharded_eager_storage(8)
+    assert _transport_policy_contract() == (False, False, True, False)
 
 
 def test_register_buffer_is_idempotent_for_same_mapping():
@@ -1147,6 +1324,8 @@ def test_retained_generation_blocks_second_setup_before_cuda_allocation(monkeypa
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
 
     with pytest.raises(RuntimeError, match="preparation status") as exc:
         PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -1218,6 +1397,7 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
         exchange_group,
         signal_bytes=signal_bytes,
         eager_buffer_bytes=eager_bytes,
+        sharded_eager_storage=False,
         ipc=ipc,
     )
 
@@ -1237,6 +1417,55 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
         2000 + eager1_offset,
         3000 + eager1_offset,
     )
+
+
+def test_shared_buffer_maps_only_selected_peers(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.opened = []
+
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, ptr, value, size):
+            pass
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            ptr = {
+                b"remote-1": 2001,
+                b"remote-2": 2002,
+                b"remote-3": 2003,
+            }[handle]
+            self.opened.append(ptr)
+            return ptr
+
+    ipc = FakeIPC()
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 4)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_object, group: (
+            [local_object, (), (), ()]
+            if isinstance(local_object, tuple)
+            else [local_object, b"remote-1", b"remote-2", b"remote-3"]
+        ),
+    )
+
+    shared = PCIeOneshotAllReduce._allocate_shared_buffer(
+        object(),
+        256,
+        zero_fill=True,
+        ipc=ipc,
+        peer_ranks=(1, 3),
+    )
+
+    assert ipc.opened == [2001, 2003]
+    assert shared.local_ptr == 1000
+    assert shared.peer_ptrs == (1000, 2001, 0, 2003)
+    assert shared.remote_ptrs == (2001, 2003)
 
 
 def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
@@ -1281,6 +1510,7 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
             object(),
             signal_bytes=300,
             eager_buffer_bytes=128,
+            sharded_eager_storage=False,
             ipc=ipc,
         )
 
@@ -1317,6 +1547,15 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
     assert ext.register_graph_buffers_calls == [
         (12345, [[1, 2, 3], [9, 8, 7]], [[0, 64], [16, 80]])
     ]
+
+
+def test_object_broadcast_uses_cpu_for_gloo(monkeypatch):
+    group = object()
+    monkeypatch.setattr(
+        "torch.distributed.get_backend", lambda group=None: "gloo"
+    )
+
+    assert _object_broadcast_device(group) == torch.device("cpu")
 
 
 def test_nonmonotonic_process_group_order_is_preserved_for_handle_slots(
@@ -1486,9 +1725,7 @@ def test_collective_logical_channel_mismatch_rejects_before_allocation(monkeypat
         _requested, existing = local_state
         return [local_state, (("other",), existing)]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
         pool.prepare_channels(("target",))
@@ -1535,9 +1772,7 @@ def test_empty_logical_channel_set_still_enters_collective_contract(monkeypatch)
         _, existing = local_state
         return [local_state, (("peer-channel",), existing)]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
         pool.prepare_channels(())
@@ -1599,9 +1834,7 @@ def test_collective_capture_allows_opposite_order_from_agreed_catalog(monkeypatc
         assert requested == "graph:target"
         return [local_state, ("graph:draft", catalog)]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with pool.capture(7, channel_id="graph:target") as channel:
         assert channel is target
@@ -1631,9 +1864,7 @@ def test_collective_capture_rejects_divergent_catalog_before_allocation(monkeypa
             return [(), ()]
         return [local_state, ("graph:target", ())]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with (
         pytest.raises(RuntimeError, match="prepared channel catalog differs"),
@@ -1665,9 +1896,7 @@ def test_collective_capture_rejects_differing_unprepared_ids(monkeypatch):
         _, catalog = local_state
         return [local_state, ("graph:unknown", catalog)]
 
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
-    )
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
 
     with (
         pytest.raises(RuntimeError, match="unprepared logical channels"),

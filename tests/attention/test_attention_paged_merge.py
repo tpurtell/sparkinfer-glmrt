@@ -9,7 +9,10 @@ from b12x.attention.paged._forward import (
     _to_kernel_tensor,
     _torch_to_cutlass_dtype,
 )
-from b12x.attention.paged.merge import PagedPersistentMergeKernel
+from b12x.attention.paged.merge import (
+    LagunaVerifierMergeKernel,
+    PagedPersistentMergeKernel,
+)
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.utils import current_cuda_stream
 
@@ -25,6 +28,8 @@ def test_b1_regular_decode_graph_uses_four_merge_warps() -> None:
         True,
         True,
         False,
+        False,
+        False,
     )
     b2 = _build_merge_kernel(
         torch.bfloat16,
@@ -34,10 +39,12 @@ def test_b1_regular_decode_graph_uses_four_merge_warps() -> None:
         True,
         True,
         False,
+        False,
+        False,
     )
 
-    assert b1.bdy == 4
-    assert b2.bdy == 3
+    assert b1.bdx * b1.bdy // 32 == 4
+    assert b2.bdx * b2.bdy // 32 == 3
 
 
 def _merge_reference_base2(
@@ -149,6 +156,26 @@ def _run_merge_kernel(
         None
         if total_rows_ptr is None
         else _to_kernel_tensor(total_rows_ptr, cutlass.Int32, assumed_align=4),
+        current_cuda_stream(),
+    )
+    compiled = b12x_compile(kernel, *args)
+    compiled(*args)
+
+
+def _run_laguna_verify_merge_kernel(
+    kernel: LagunaVerifierMergeKernel,
+    partial_o: torch.Tensor,
+    partial_lse: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+) -> None:
+    args = (
+        _to_kernel_tensor(partial_o, cutlass.BFloat16),
+        _to_kernel_tensor(partial_lse, cutlass.Float32),
+        _to_kernel_tensor(cache_seqlens, cutlass.Int32, assumed_align=4),
+        _to_kernel_tensor(output, cutlass.BFloat16),
+        _to_kernel_tensor(lse, cutlass.Float32),
         current_cuda_stream(),
     )
     compiled = b12x_compile(kernel, *args)
@@ -292,4 +319,74 @@ def test_paged_persistent_merge_regular_decode_graph_matches_reference() -> None
         compact_lse.append(partial_lse[row_start:row_end])
     ref_out, ref_lse = _merge_reference_base2(torch.cat(compact_o, dim=0), torch.cat(compact_lse, dim=0), merge_indptr)
     assert torch.allclose(output.to(torch.float32), ref_out, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(lse, ref_lse, atol=2e-3, rtol=2e-3)
+
+
+@torch.inference_mode()
+def test_laguna_verifier_merge_matches_reference() -> None:
+    require_b12x()
+    torch.manual_seed(117)
+    rows = 8
+    num_heads = 24
+    head_dim = 128
+    chunks_per_row = 4
+    partial_o = (
+        torch.randn(
+            rows * chunks_per_row,
+            num_heads,
+            head_dim,
+            device="cuda",
+        )
+        / 4
+    ).to(torch.bfloat16)
+    partial_lse = (
+        torch.randn(
+            rows * chunks_per_row,
+            num_heads,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        * 2
+        - 1
+    )
+    cache_seqlens = torch.tensor([256], dtype=torch.int32, device="cuda")
+    output = torch.full(
+        (rows, num_heads, head_dim),
+        -77.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    lse = torch.full(
+        (num_heads, rows),
+        -99.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    kernel = LagunaVerifierMergeKernel(rows * num_heads)
+
+    _run_laguna_verify_merge_kernel(
+        kernel,
+        partial_o,
+        partial_lse,
+        cache_seqlens,
+        output,
+        lse,
+    )
+    torch.cuda.synchronize()
+
+    merge_indptr = torch.arange(
+        0,
+        (rows + 1) * chunks_per_row,
+        chunks_per_row,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    ref_out, ref_lse = _merge_reference_base2(
+        partial_o,
+        partial_lse,
+        merge_indptr,
+    )
+    assert torch.allclose(
+        output.to(torch.float32), ref_out, atol=2e-2, rtol=2e-2
+    )
     assert torch.allclose(lse, ref_lse, atol=2e-3, rtol=2e-3)

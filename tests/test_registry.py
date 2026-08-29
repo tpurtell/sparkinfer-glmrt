@@ -4,6 +4,8 @@ lockstep, and every op honors the META/__all__ shape (invariant #3)."""
 from __future__ import annotations
 
 import importlib
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,7 +22,11 @@ def _on_disk_ops() -> list[str]:
         if not group_dir.is_dir() or group_dir.name.startswith("_"):
             continue
         for op_dir in sorted(group_dir.iterdir()):
-            if not op_dir.is_dir() or op_dir.name.startswith("_"):
+            if (
+                not op_dir.is_dir()
+                or op_dir.name.startswith("_")
+                or not (op_dir / "api.py").is_file()
+            ):
                 continue
             ops.append(f"{group_dir.name}.{op_dir.name}")
     return ops
@@ -41,6 +47,66 @@ def test_registry_matches_disk():
         assert qualname in b12x._OPS
         module = importlib.import_module(f"b12x.{module_path}")
         assert module.META.qualname == qualname
+
+
+@pytest.mark.parametrize(
+    ("group_name", "op_names"),
+    (
+        ("attention", ("qsa",)),
+        ("norm", ("hyperconnection",)),
+        (
+            "sequence",
+            ("ple_hash", "ple_embedding", "ple", "gdn_decode", "mtp_feedback"),
+        ),
+    ),
+)
+def test_qwen3_8_flash_next_ops_are_discoverable_from_group_namespaces(
+    group_name: str,
+    op_names: tuple[str, ...],
+):
+    b12x = _b12x()
+    group = getattr(b12x, group_name)
+    assert set(op_names) <= set(group.__all__)
+    assert set(op_names) <= set(dir(group))
+    for op_name in op_names:
+        op = getattr(group, op_name)
+        assert op.META is b12x.find_op(f"{group_name}.{op_name}")
+
+
+def test_namespace_and_registry_imports_stay_lightweight():
+    script = """
+import sys
+
+before = set(sys.modules)
+import b12x
+import b12x.attention
+import b12x.norm
+import b12x.sequence
+b12x.list_ops()
+
+introduced = set(sys.modules) - before
+heavy_prefixes = ("torch", "triton", "cutlass")
+heavy = sorted(
+    name
+    for name in introduced
+    if any(name == prefix or name.startswith(prefix + ".") for prefix in heavy_prefixes)
+)
+apis = sorted(
+    name
+    for name in introduced
+    if name.startswith("b12x.") and name.endswith(".api")
+)
+assert not heavy, heavy
+assert not apis, apis
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_list_ops_and_find_op():

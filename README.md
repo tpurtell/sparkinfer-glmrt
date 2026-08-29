@@ -1,6 +1,6 @@
 # b12x
 
-`b12x` is an SM120/SM121 CuTe DSL kernel library for local LLM inference.
+`b12x` is an SM120/SM121 CuTe DSL and Triton kernel library for local LLM inference.
 It specifically targets DGX Spark, RTX Spark and the Blackwell-based RTX
 cards (RTX 6000 Pro, RTX 5090).
 
@@ -16,27 +16,32 @@ pip install b12x
 
 You need Python 3.10+, `torch >= 2.12`, and an SM120/SM121 GPU. The CuTe DSL
 compiler and its CUDA 13 libraries come in as wheel dependencies
-(`nvidia-cutlass-dsl == 4.6.0`), so there is no build step — kernels are
+(`nvidia-cutlass-dsl == 4.6.2`), so there is no build step — kernels are
 JIT-compiled on first use and cached.
 
 ## What's in here
 
-Every kernel is one op at `b12x.<group>.<op>` (17 total; `list_ops()`
-enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
-kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
+Every kernel is one op at `b12x.<group>.<op>`; `list_ops()` enumerates the
+complete set. The op owns its `plan`/`bind`/`run` facade in `api.py`; the
+kernel guts sit in `_impl.py`/`_kernel*.py`; cross-op lowering lives in
 `<group>/_shared/` and the universal compile/scratch spine in `b12x/_lib/`.
 
-**`gemm`** — a dense block-scaled GEMM (NVFP4/MXFP8 operands, BF16/FP16/FP32
-out) plus fused linears on top of it: `gemm.blockscaled` (one-shot), MXFP8
-(`gemm.mxfp8_linear`), 128×128 block-FP8 (`gemm.block_fp8_linear`), and the
-fused MLA query projection (`gemm.mla_query_projection`) and grouped
-WO-projection (`gemm.wo_projection`) used around MLA attention.
+**`gemm`** — `gemm.blockscaled` is the common dense interface for raw
+NVFP4/MXFP4/MXFP8/block-FP8 operands and packed MXFP8/tensor-FP8 weights; it
+owns `mm`, `pack_weight`, and serving `prewarm`. The legacy
+`gemm.mxfp8_linear` and `gemm.tensor_fp8_linear` imports are compatibility
+aliases. `gemm.block_fp8_linear` retains a separate planned interface because
+it owns caller-provided scratch and inline requantization. The fused MLA query
+projection (`gemm.mla_query_projection`) and grouped WO projection
+(`gemm.wo_projection`) are used around MLA attention.
 
 **`attention`** — `attention.paged` (paged-KV decode/extend, FP8 KV, MSA block
 sparse, CUDA-graph-replayable), `attention.sparse_mla` and
-`attention.compressed_mla` (top-k / compressed-page MLA — distinct contracts,
-kept separate on purpose), `attention.nsa_indexer` (the NSA/MSA quantize →
-score → select pipeline), and `attention.varlen` (contiguous batched/varlen).
+`attention.compressed_sparse_mla` (top-k / compressed-page MLA — distinct
+contracts, kept separate on purpose), `attention.dsa_indexer` (the DSA/MSA quantize →
+score → select pipeline), `attention.qsa` (group-selected exact sparse GQA
+decode over caller-populated, read-only main BF16 K/V), and `attention.varlen`
+(contiguous batched/varlen).
 
 **`moe`** — `moe.fused_moe`, fused FP4 TP MoE across a micro-kernel decode
 path, a unified dynamic path (persistent grid, `nvfp4`/`w4a8_mx`/`w4a8_nvfp4`),
@@ -45,9 +50,17 @@ math), with SiLU/ReLU2/SwiGLU-OAI activations; plus `moe.ep_moe` (expert
 parallel).
 
 **the rest** — `norm.mhc` (fused RMSNorm + hyper-connection residual),
+`norm.hyperconnection` (learned multi-stream residual primitives),
+`sequence.{ple_hash,ple_embedding,ple}` (prime-hashed embedding IDs, fused
+quantized lookup, and short-convolution state), `sequence.gdn_decode` (packed
+recurrent decode),
+`sequence.mtp_feedback` (MTP token/multi-stream feedback fusion),
 `quantization.{nvfp4,mxfp8}` (row quantizers), and `comm.pcie` (IPC-backed PCIe
-collectives). `b12x` owns planning, scratch layout, and policy, so
-serving stacks only supply metadata and capacity limits.
+collectives). The Qwen3.8-Flash-Next QSA, HyperConnection, PLE, GDN decode,
+and MTP feedback Triton implementations are correctness references and are
+not throughput-qualified production kernels.
+`b12x` owns planning, scratch layout, and policy, so serving stacks only supply
+metadata and capacity limits.
 
 ## Using it
 
@@ -83,15 +96,15 @@ out     = fused_moe.run(binding=binding)
 ```
 
 ```python
-# attention — MLA decode from compressed KV pages (DeepSeek-V3.2)
-from b12x.attention import compressed_mla
+# attention — sparse MLA from compressed KV pages (DeepSeek V4)
+from b12x.attention import compressed_sparse_mla
 
-plan    = compressed_mla.plan(compressed_mla.Caps(...))
+plan    = compressed_sparse_mla.plan(compressed_sparse_mla.Caps(...))
 spec    = plan.scratch_specs()[0]
 scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-binding = compressed_mla.bind(plan, scratch=scratch, q=q,
+binding = compressed_sparse_mla.bind(plan, scratch=scratch, q=q,
                               swa_indices=idx, swa_lengths=lens, ...)
-out = compressed_mla.run(swa_k_cache=swa, binding=binding, sm_scale=scale, ...)
+out = compressed_sparse_mla.run(swa_k_cache=swa, binding=binding, sm_scale=scale, ...)
 ```
 
 `plan` is host-side and may allocate; `bind` only narrows/views (never

@@ -6,6 +6,13 @@
 - Treat CUDA graph capture/replay, warmup behavior, stable allocation, and
   fixed or preplanned workspace capacity as serving requirements, not optional
   benchmark details.
+- Never include live request quantities in a kernel compile or cache key. Token,
+  row, batch, sequence, expert, page, block, and occupancy counts must be runtime
+  scalar launch arguments that drive dynamic grids and masks. Compile and cache
+  keys may include only static model geometry, planned capacity, device identity,
+  and toolchain identity. Precompile capacity specializations before graph capture,
+  and test multiple live counts under frozen kernel resolution to prove that they
+  reuse the same compiled callable.
 - Correctness gates come before performance claims. Validate oracles,
   cosine/top-k equality, nonzero tensors, quantization semantics, and boundary
   behavior before interpreting timings.

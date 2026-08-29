@@ -14,26 +14,29 @@ from b12x.attention._shared.workspace import (
     B12XAttentionArenaCaps,
 )
 from b12x.attention._shared.mla.compressed_reference import (
-    COMPRESSED_MLA_C128_PAGE_SIZE,
-    COMPRESSED_MLA_C4_PAGE_SIZE,
-    COMPRESSED_MLA_DSV4_PAGE_SIZE,
-    COMPRESSED_MLA_SWA_TOKENS,
-    compressed_mla_page_nbytes,
+    COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
+    COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
+    COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+    COMPRESSED_SPARSE_MLA_SWA_TOKENS,
+    compressed_sparse_mla_page_nbytes,
     compressed_sparse_mla_reference,
-    gather_compressed_mla_kv_cache_reference,
-    pack_compressed_mla_kv_cache_reference,
-)
-from b12x.attention._shared.mla.compressed_api import (
-    _should_use_sm121_single_pass_decode,
-)
-from b12x.attention._shared.mla.kernel import _dsv4_h16_auto
-from b12x.attention._shared.mla.compressed_config import (
-    compressed_mla_split_config_for_contract,
+    gather_compressed_sparse_mla_kv_cache_reference,
+    pack_compressed_sparse_mla_kv_cache_reference,
 )
 from b12x.attention._shared.mla.api import clear_mla_caches
-from b12x.attention._shared.mla.compressed_api import compressed_mla_decode_forward
-from b12x.attention._shared.mla.compressed_config import compressed_mla_split_chunks_for_contract
-from b12x.attention.compressed_mla._scratch import B12XCompressedMLAScratchCaps, plan_compressed_mla_scratch
+from b12x.attention._shared.mla.compressed_api import (
+    _should_use_sm121_single_pass_decode,
+    compressed_sparse_mla_decode_forward,
+)
+from b12x.attention._shared.mla.compressed_config import (
+    compressed_sparse_mla_split_chunks_for_contract,
+    compressed_sparse_mla_split_config_for_contract,
+)
+from b12x.attention._shared.mla.kernel import _dsv4_h16_auto
+from b12x.attention.compressed_sparse_mla._scratch import (
+    B12XCompressedSparseMLAScratchCaps,
+    plan_compressed_sparse_mla_scratch,
+)
 from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
 from tests._reference.helpers import require_b12x
@@ -218,9 +221,10 @@ def _make_compressed_binding(
     v_head_dim: int = _COMPRESSED_HEAD_DIM,
     max_chunks_per_row: int = 64,
     max_page_table_width: int | None = None,
+    decode_row_capacity: int | None = None,
 ):
-    plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
+    plan = plan_compressed_sparse_mla_scratch(
+        B12XCompressedSparseMLAScratchCaps(
             device=device,
             dtype=torch.bfloat16,
             kv_dtype=torch.uint8,
@@ -233,6 +237,7 @@ def _make_compressed_binding(
             max_batch=rows,
             max_kv_rows=max_kv_rows,
             max_chunks_per_row=max_chunks_per_row,
+            decode_row_capacity=decode_row_capacity,
         )
     )
     (spec,) = plan.scratch_specs()
@@ -268,7 +273,7 @@ def _make_cache(
         torch.randn((tokens, 64), generator=gen, dtype=torch.float32, device=device)
         * 0.05
     )
-    return pack_compressed_mla_kv_cache_reference(
+    return pack_compressed_sparse_mla_kv_cache_reference(
         k_nope,
         k_rope.to(dtype=torch.bfloat16),
         page_size=page_size,
@@ -291,28 +296,40 @@ def _make_q(*, rows: int, seed: int, device: torch.device | str) -> torch.Tensor
     return q.to(dtype=torch.bfloat16)
 
 
-def test_compressed_mla_page_byte_widths_match_padded_layout() -> None:
-    assert COMPRESSED_MLA_DSV4_PAGE_SIZE == 256
-    assert COMPRESSED_MLA_SWA_TOKENS == 128
-    assert COMPRESSED_MLA_C4_PAGE_SIZE == COMPRESSED_MLA_DSV4_PAGE_SIZE // 4
-    assert COMPRESSED_MLA_C128_PAGE_SIZE == COMPRESSED_MLA_DSV4_PAGE_SIZE // 128
-    assert compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE) == 149760
-    assert compressed_mla_page_nbytes(COMPRESSED_MLA_C4_PAGE_SIZE) == 37440
-    assert compressed_mla_page_nbytes(COMPRESSED_MLA_C128_PAGE_SIZE) == 1728
+def test_compressed_sparse_mla_page_byte_widths_match_padded_layout() -> None:
+    assert COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE == 256
+    assert COMPRESSED_SPARSE_MLA_SWA_TOKENS == 128
+    assert (
+        COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE == COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE // 4
+    )
+    assert (
+        COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE
+        == COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE // 128
+    )
+    assert (
+        compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE)
+        == 149760
+    )
+    assert (
+        compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE) == 37440
+    )
+    assert (
+        compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE) == 1728
+    )
 
 
-def test_compressed_mla_decode_does_not_pin_flash_tp2_heads_by_default() -> None:
-    signature = inspect.signature(compressed_mla_decode_forward)
+def test_compressed_sparse_mla_decode_does_not_pin_flash_tp2_heads_by_default() -> None:
+    signature = inspect.signature(compressed_sparse_mla_decode_forward)
     assert signature.parameters["expected_num_q_heads"].default is None
 
 
-def test_compressed_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
-    graph_rows_cfg = compressed_mla_split_config_for_contract(
+def test_compressed_sparse_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
+    graph_rows_cfg = compressed_sparse_mla_split_config_for_contract(
         rows=192,
         width=384,
         max_chunks=6,
     )
-    larger_prefill_cfg = compressed_mla_split_config_for_contract(
+    larger_prefill_cfg = compressed_sparse_mla_split_config_for_contract(
         rows=257,
         width=384,
         max_chunks=6,
@@ -324,18 +341,174 @@ def test_compressed_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
     assert larger_prefill_cfg.num_chunks == 1
 
 
-def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
+@pytest.mark.parametrize(
+    ("decode_row_capacity", "last_decode_row"),
+    [
+        pytest.param(144, 256, id="legacy-floor"),
+        pytest.param(384, 384, id="mns64-k5"),
+        pytest.param(512, 512, id="mns64-k7"),
+        pytest.param(768, 768, id="mns128-k5"),
+    ],
+)
+def test_compressed_sparse_mla_declared_decode_row_capacity_extends_contract(
+    decode_row_capacity: int,
+    last_decode_row: int,
+) -> None:
+    decode_cfg = compressed_sparse_mla_split_config_for_contract(
+        rows=last_decode_row,
+        width=384,
+        max_chunks=6,
+        decode_row_capacity=decode_row_capacity,
+    )
+    next_cfg = compressed_sparse_mla_split_config_for_contract(
+        rows=last_decode_row + 1,
+        width=384,
+        max_chunks=6,
+        decode_row_capacity=decode_row_capacity,
+    )
+
+    assert decode_cfg.chunk_size == 64
+    assert decode_cfg.num_chunks == 6
+    assert next_cfg.chunk_size == 1024
+    assert next_cfg.num_chunks == 1
+
+
+def test_compressed_sparse_mla_declared_decode_row_capacity_rejects_nonpositive() -> (
+    None
+):
+    with pytest.raises(ValueError, match="decode_row_capacity must be positive"):
+        compressed_sparse_mla_split_config_for_contract(
+            rows=1,
+            width=384,
+            max_chunks=6,
+            decode_row_capacity=0,
+        )
+
+
+@pytest.mark.parametrize("rows", [1, 24, 65, 144, 192, 256])
+@pytest.mark.parametrize("width", [128, 384, 2176, 4608])
+@pytest.mark.parametrize("decode_row_capacity", [144, 384, 768])
+def test_declared_capacity_preserves_legacy_plans_through_256_rows(
+    rows: int,
+    width: int,
+    decode_row_capacity: int,
+) -> None:
+    legacy = compressed_sparse_mla_split_config_for_contract(
+        rows=rows,
+        width=width,
+    )
+    declared = compressed_sparse_mla_split_config_for_contract(
+        rows=rows,
+        width=width,
+        decode_row_capacity=decode_row_capacity,
+    )
+
+    assert declared == legacy
+
+
+@pytest.mark.parametrize("rows", [384, 512, 768])
+@torch.inference_mode()
+def test_declared_decode_capacity_matches_reference_under_graph_replay(
+    rows: int,
+) -> None:
+    device = require_b12x()
+    clear_mla_caches()
+    width = 384
+    live_width = 32
+    q = _make_q(rows=rows, seed=6130 + rows, device=device)
+    swa_cache_bytes = _make_cache(
+        tokens=64,
+        page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        seed=6131 + rows,
+        device=device,
+    )
+    swa_cache = swa_cache_bytes.view(torch.float8_e4m3fn)
+    base_indices = torch.arange(live_width, dtype=torch.int32, device=device)
+    swa_indices = torch.full(
+        (rows, width),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    swa_indices[:, :live_width] = base_indices
+    swa_lengths = torch.full(
+        (rows,),
+        live_width,
+        dtype=torch.int32,
+        device=device,
+    )
+    attn_sink = torch.linspace(
+        -0.1,
+        0.1,
+        _LOCAL_Q_HEADS,
+        dtype=torch.float32,
+        device=device,
+    )
+    split_cap = math.ceil(width / 64)
+    binding = _make_compressed_binding(
+        device=device,
+        rows=rows,
+        topk=width,
+        max_kv_rows=rows * width,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        use_cuda_graph=True,
+        max_chunks_per_row=split_cap,
+        decode_row_capacity=rows,
+    )
+
+    captured_out: torch.Tensor | None = None
+
+    def run() -> torch.Tensor:
+        nonlocal captured_out
+        captured_out = compressed_sparse_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+        )
+        return captured_out
+
+    run()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert captured_out is not None
+
+    expected = compressed_sparse_mla_reference(
+        q,
+        swa_cache_bytes,
+        swa_indices,
+        swa_lengths,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+    )
+    max_abs = (captured_out.float() - expected.float()).abs().max().item()
+    cosine = torch.nn.functional.cosine_similarity(
+        captured_out.float().reshape(-1),
+        expected.float().reshape(-1),
+        dim=0,
+    )
+    assert max_abs <= 0.10
+    assert cosine.item() >= 0.9995
+
+
+def test_compressed_sparse_mla_arena_scratch_uses_contract_q_chunks() -> None:
     device = require_b12x()
     selected_widths = (128, 640, 2880)
     graph_q_rows = 16
     compressed_prefill_q = 8192
     max_chunks_per_row = max(
-        compressed_mla_split_chunks_for_contract(rows=graph_q_rows, width=width)
+        compressed_sparse_mla_split_chunks_for_contract(rows=graph_q_rows, width=width)
         for width in selected_widths
     )
     mla_max_q_chunks = max(
         max(graph_q_rows, compressed_prefill_q)
-        * compressed_mla_split_chunks_for_contract(
+        * compressed_sparse_mla_split_chunks_for_contract(
             rows=max(graph_q_rows, compressed_prefill_q),
             width=width,
         )
@@ -365,7 +538,7 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
         max_chunks_per_row=max_chunks_per_row,
         reserve_extend_indexer_logits=False,
         reserve_paged_indexer_logits=True,
-        reserve_compressed_mla_staging=True,
+        reserve_compressed_sparse_mla_staging=True,
         reserve_mhc=True,
         mhc_max_tokens=4096,
         mhc_hidden_size=4096,
@@ -397,12 +570,16 @@ def test_compressed_mla_arena_scratch_uses_contract_q_chunks() -> None:
     assert legacy_ragged > capped * 3
     assert capped < int(2.25 * (1 << 30))
 
-def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
+
+def test_compressed_sparse_mla_reference_pack_gathers_across_padded_pages() -> None:
     device = require_b12x()
     gen = torch.Generator(device=device)
     gen.manual_seed(31)
 
-    for page_size in (COMPRESSED_MLA_C4_PAGE_SIZE, COMPRESSED_MLA_C128_PAGE_SIZE):
+    for page_size in (
+        COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
+        COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
+    ):
         tokens = page_size * 2 + 1
         k_nope = (
             torch.randn(
@@ -414,7 +591,7 @@ def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
             torch.randn((tokens, 64), generator=gen, dtype=torch.float32, device=device)
             * 0.05
         ).to(torch.bfloat16)
-        cache = pack_compressed_mla_kv_cache_reference(
+        cache = pack_compressed_sparse_mla_kv_cache_reference(
             k_nope, k_rope, page_size=page_size
         )
         indices = torch.tensor(
@@ -423,7 +600,7 @@ def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
             device=device,
         )
 
-        gathered, _ = gather_compressed_mla_kv_cache_reference(
+        gathered, _ = gather_compressed_sparse_mla_kv_cache_reference(
             cache, indices, page_size=page_size
         )
         expected_rope = k_rope[indices.to(torch.long)].float()
@@ -435,7 +612,7 @@ def test_compressed_mla_reference_pack_gathers_across_padded_pages() -> None:
 
 
 @torch.inference_mode()
-def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
+def test_compressed_sparse_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     monkeypatch,
 ) -> None:
     device = require_b12x()
@@ -447,20 +624,20 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
     live_rows = 1
     live_width = 512
     page_table_width = 4097
-    max_chunks_per_row = compressed_mla_split_chunks_for_contract(
+    max_chunks_per_row = compressed_sparse_mla_split_chunks_for_contract(
         rows=live_rows,
         width=contract_width,
     )
     q = _make_q(rows=live_rows, seed=121, device=device)
     swa_cache = torch.empty(
-        (1, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
+        (1, compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
     swa_indices = torch.zeros((live_rows, live_width), dtype=torch.int32, device=device)
     swa_lengths = torch.zeros((live_rows,), dtype=torch.int32, device=device)
     indexed_cache = torch.empty(
-        (1, compressed_mla_page_nbytes(COMPRESSED_MLA_C4_PAGE_SIZE)),
+        (1, compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
@@ -490,28 +667,37 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
         max_page_table_width=page_table_width,
     )
 
-    with torch.inference_mode(), torch.no_grad():
-        with pytest.raises(ValueError, match="mapped indexed_page_table"):
-            compressed_api_impl.compressed_mla_decode_forward(
-                swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
-                binding=binding,
-                indexed_k_cache=indexed_cache,
-                indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-                sm_scale=_SM_SCALE,
-            )
+    with (
+        torch.inference_mode(),
+        torch.no_grad(),
+        pytest.raises(ValueError, match="mapped indexed_page_table"),
+    ):
+        compressed_api_impl.compressed_sparse_mla_decode_forward(
+            swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
+            binding=binding,
+            indexed_k_cache=indexed_cache,
+            indexed_page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
+            sm_scale=_SM_SCALE,
+        )
 
 
 @torch.inference_mode()
-def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
+def test_compressed_sparse_mla_shared_core_replays_under_cuda_graph() -> None:
     device = require_b12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=21, device=device)
     swa_cache_bytes = _make_cache(
-        tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=22, device=device
+        tokens=32,
+        page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        seed=22,
+        device=device,
     )
     indexed_cache_bytes = _make_cache(
-        tokens=32, page_size=COMPRESSED_MLA_C128_PAGE_SIZE, seed=23, device=device
+        tokens=32,
+        page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
+        seed=23,
+        device=device,
     )
     swa_cache = swa_cache_bytes.view(torch.float8_e4m3fn)
     indexed_cache = indexed_cache_bytes.view(torch.float8_e4m3fn)
@@ -539,11 +725,11 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
 
     def run() -> torch.Tensor:
         nonlocal captured_out
-        captured_out = compressed_mla_decode_forward(
+        captured_out = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             indexed_k_cache=indexed_cache,
-            indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+            indexed_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
             attn_sink=attn_sink,
             sm_scale=_SM_SCALE,
         )
@@ -566,7 +752,7 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
         extra_k_cache=indexed_cache_bytes,
         extra_indices=indexed_indices,
         extra_topk_lengths=indexed_lengths,
-        extra_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+        extra_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
         attn_sink=attn_sink,
         sm_scale=_SM_SCALE,
     )
@@ -594,7 +780,7 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
         extra_k_cache=indexed_cache_bytes,
         extra_indices=indexed_indices,
         extra_topk_lengths=indexed_lengths,
-        extra_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+        extra_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
         attn_sink=attn_sink,
         sm_scale=_SM_SCALE,
     )
@@ -607,7 +793,7 @@ def test_compressed_mla_shared_core_replays_under_cuda_graph() -> None:
 
 
 @torch.inference_mode()
-def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
+def test_compressed_sparse_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
     device = require_b12x()
     clear_mla_caches()
 
@@ -619,14 +805,14 @@ def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
     k_nope[20, 0] = 1
     k_rope = torch.zeros((width, 64), dtype=torch.bfloat16, device=device)
     swa_cache = torch.empty(
-        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
+        (0, compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
-    indexed_cache = pack_compressed_mla_kv_cache_reference(
+    indexed_cache = pack_compressed_sparse_mla_kv_cache_reference(
         k_nope,
         k_rope,
-        page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+        page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
     )
     swa_indices = torch.empty((1, 0), dtype=torch.int32, device=device)
     indexed_indices = torch.arange(width, dtype=torch.int32, device=device).unsqueeze(0)
@@ -649,11 +835,11 @@ def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
 
     def run() -> torch.Tensor:
         nonlocal captured_out
-        captured_out = compressed_mla_decode_forward(
+        captured_out = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             indexed_k_cache=indexed_cache,
-            indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+            indexed_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
             sm_scale=1.0,
         )
         return captured_out
@@ -674,7 +860,7 @@ def test_compressed_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
 
 
 @torch.inference_mode()
-def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
+def test_compressed_sparse_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
     device = require_b12x()
     clear_mla_caches()
 
@@ -705,7 +891,7 @@ def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
 
     def run() -> torch.Tensor:
         nonlocal captured_out
-        captured_out = compressed_mla_decode_forward(
+        captured_out = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             swa_page_size=swa_page_size,
@@ -741,7 +927,7 @@ def test_compressed_mla_swa_page_size_256_replays_under_cuda_graph() -> None:
 
 
 @torch.inference_mode()
-def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
+def test_compressed_sparse_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
     device = require_b12x()
     clear_mla_caches()
 
@@ -749,7 +935,10 @@ def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
     width = 8
     q = _make_q(rows=rows, seed=81, device=device)
     swa_cache = _make_cache(
-        tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=82, device=device
+        tokens=32,
+        page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        seed=82,
+        device=device,
     )
     swa_indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
     swa_lengths = torch.empty((rows,), dtype=torch.int32, device=device)
@@ -777,7 +966,7 @@ def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
 
     def run() -> torch.Tensor:
         nonlocal captured_out
-        captured_out = compressed_mla_decode_forward(
+        captured_out = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,
@@ -811,16 +1000,21 @@ def test_compressed_mla_prefill_swa_only_replays_under_cuda_graph() -> None:
 
 
 @torch.inference_mode()
-def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -> None:
+def test_compressed_sparse_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -> (
+    None
+):
     device = require_b12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=71, device=device)
     swa_cache = _make_cache(
-        tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=72, device=device
+        tokens=32,
+        page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        seed=72,
+        device=device,
     )
     indexed_cache = _make_cache(
-        tokens=4, page_size=COMPRESSED_MLA_C128_PAGE_SIZE, seed=73, device=device
+        tokens=4, page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE, seed=73, device=device
     )
     swa_indices = torch.arange(8, dtype=torch.int32, device=device).unsqueeze(0)
     indexed_indices = torch.full((1, 4), -1, dtype=torch.int32, device=device)
@@ -843,11 +1037,11 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
 
     def run() -> torch.Tensor:
         nonlocal captured_out
-        captured_out = compressed_mla_decode_forward(
+        captured_out = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             indexed_k_cache=indexed_cache,
-            indexed_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+            indexed_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
             sm_scale=_SM_SCALE,
         )
         return captured_out
@@ -869,7 +1063,7 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
         extra_k_cache=indexed_cache,
         extra_indices=indexed_indices,
         extra_topk_lengths=indexed_lengths,
-        extra_page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+        extra_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
         sm_scale=_SM_SCALE,
     )
     max_abs = (captured_out.float() - expected.float()).abs().max().item()
@@ -881,19 +1075,19 @@ def test_compressed_mla_clamp_to_one_negative_extra_replays_under_cuda_graph() -
 
 
 @torch.inference_mode()
-def test_compressed_mla_mapped_page_table_is_rejected() -> None:
+def test_compressed_sparse_mla_mapped_page_table_is_rejected() -> None:
     device = require_b12x()
     clear_mla_caches()
 
     q = _make_q(rows=1, seed=181, device=device)
     swa_cache = torch.empty(
-        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
+        (0, compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
     indexed_cache = _make_cache(
         tokens=64,
-        page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+        page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
         seed=182,
         device=device,
     )
@@ -910,35 +1104,37 @@ def test_compressed_mla_mapped_page_table_is_rejected() -> None:
         swa_lengths=swa_lengths,
         indexed_indices=torch.arange(8, dtype=torch.int32, device=device).unsqueeze(0),
         indexed_lengths=indexed_lengths,
-        indexed_page_table=torch.arange(2, dtype=torch.int32, device=device).unsqueeze(0),
+        indexed_page_table=torch.arange(2, dtype=torch.int32, device=device).unsqueeze(
+            0
+        ),
         use_cuda_graph=True,
     )
 
     with pytest.raises(ValueError, match="mapped indexed_page_table"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             indexed_k_cache=indexed_cache,
-            indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+            indexed_page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
             sm_scale=_SM_SCALE,
         )
 
 
 @torch.inference_mode()
-def test_compressed_mla_rejects_row_shared_mapped_page_table() -> None:
+def test_compressed_sparse_mla_rejects_row_shared_mapped_page_table() -> None:
     device = require_b12x()
     clear_mla_caches()
 
     rows = 3
     q = _make_q(rows=rows, seed=186, device=device)
     swa_cache = torch.empty(
-        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
+        (0, compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
     indexed_cache = _make_cache(
         tokens=128,
-        page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+        page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
         seed=187,
         device=device,
     )
@@ -974,28 +1170,28 @@ def test_compressed_mla_rejects_row_shared_mapped_page_table() -> None:
     )
 
     with pytest.raises(ValueError, match="mapped indexed_page_table"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             indexed_k_cache=indexed_cache,
-            indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+            indexed_page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
             sm_scale=_SM_SCALE,
         )
 
 
 @torch.inference_mode()
-def test_compressed_mla_rejects_live_mapped_page_table() -> None:
+def test_compressed_sparse_mla_rejects_live_mapped_page_table() -> None:
     device = require_b12x()
     clear_mla_caches()
 
     indexed_cache = _make_cache(
         tokens=64,
-        page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+        page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
         seed=192,
         device=device,
     )
     swa_cache = torch.empty(
-        (0, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)),
+        (0, compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE)),
         dtype=torch.uint8,
         device=device,
     )
@@ -1020,24 +1216,27 @@ def test_compressed_mla_rejects_live_mapped_page_table() -> None:
         use_cuda_graph=False,
     )
     with pytest.raises(ValueError, match="mapped indexed_page_table"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding3,
             indexed_k_cache=indexed_cache,
-            indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+            indexed_page_size=COMPRESSED_SPARSE_MLA_C4_PAGE_SIZE,
             sm_scale=_SM_SCALE,
         )
 
 
 @torch.inference_mode()
-def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
+def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
     device = require_b12x()
     clear_mla_caches()
 
     rows = 8
     q = _make_q(rows=rows, seed=311, device=device)
     swa_cache = _make_cache(
-        tokens=32, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=312, device=device
+        tokens=32,
+        page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        seed=312,
+        device=device,
     )
     attn_sink = torch.linspace(
         -0.2, 0.15, _LOCAL_Q_HEADS, dtype=torch.float32, device=device
@@ -1068,7 +1267,7 @@ def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
             swa_lengths=swa_lengths,
         )
         binding.scratch.mode = mode
-        baseline = compressed_mla_decode_forward(
+        baseline = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,
@@ -1082,7 +1281,7 @@ def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
             dtype=torch.bfloat16,
             device=device,
         )
-        returned = compressed_mla_decode_forward(
+        returned = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,
@@ -1110,7 +1309,7 @@ def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
         device=device,
     )
     with pytest.raises(ValueError, match="out must have shape"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,
@@ -1123,7 +1322,7 @@ def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
         device=device,
     )
     with pytest.raises(TypeError, match="out must be bfloat16"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,
@@ -1136,7 +1335,7 @@ def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
         device=device,
     )[..., ::2]
     with pytest.raises(ValueError, match="out must be contiguous"):
-        compressed_mla_decode_forward(
+        compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,
@@ -1146,7 +1345,7 @@ def test_compressed_mla_out_param_writes_directly_and_matches() -> None:
 
 
 @torch.inference_mode()
-def test_compressed_mla_prefill_is_run_to_run_deterministic() -> None:
+def test_compressed_sparse_mla_prefill_is_run_to_run_deterministic() -> None:
     """Guards the s4_finalize_row_sum_mg2 scratch-reuse barrier: the epilogue's
     persistent-max reads must complete before the row-sum reduction overwrites
     the scratch. Without it, outputs wobble run-to-run (worst for short
@@ -1157,15 +1356,17 @@ def test_compressed_mla_prefill_is_run_to_run_deterministic() -> None:
     rows, width = 8, 512
     q = _make_q(rows=rows, seed=411, device=device)
     swa_cache = _make_cache(
-        tokens=64, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, seed=412, device=device
+        tokens=64,
+        page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        seed=412,
+        device=device,
     )
     swa_indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
     swa_lengths = torch.empty((rows,), dtype=torch.int32, device=device)
     for row in range(rows):
         length = min(width, row + 1)
         swa_indices[row, :length] = (
-            torch.arange(row, row - length, -1, dtype=torch.int32, device=device)
-            % 64
+            torch.arange(row, row - length, -1, dtype=torch.int32, device=device) % 64
         )
         swa_lengths[row] = length
     attn_sink = torch.linspace(
@@ -1183,7 +1384,7 @@ def test_compressed_mla_prefill_is_run_to_run_deterministic() -> None:
     binding.scratch.mode = "extend"
 
     def call() -> torch.Tensor:
-        return compressed_mla_decode_forward(
+        return compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,

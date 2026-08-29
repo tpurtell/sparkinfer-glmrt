@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..._lib.gating import default_is_supported
+from .._shared.mla.traits import ModelType
 from .._shared.mla.api import (
     MLASparseDecodeMetadata as DecodeMetadata,
 )
@@ -17,6 +18,10 @@ from .._shared.mla.api import (
 )
 from .._shared.mla.api import (
     sparse_mla_extend_forward as run_extend,
+)
+from .._shared.mla.kv_cache import (
+    compile_glm_next_mla_cache_writer,
+    concat_and_cache_glm_next_mla,
 )
 from ._scratch import (
     B12XSparseMLABinding as Binding,
@@ -51,6 +56,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "ModelType",
     "Caps",
     "Plan",
     "Binding",
@@ -61,6 +67,8 @@ __all__ = [
     "bind",
     "run_decode",
     "run_extend",
+    "compile_glm_next_mla_cache_writer",
+    "concat_and_cache_glm_next_mla",
     "is_supported",
     "clear_caches",
 ]

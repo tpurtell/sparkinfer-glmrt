@@ -574,11 +574,11 @@ class CollectiveOverlapProbe:
         self._initialize_query_split()
 
     def _initialize_query_split(self) -> None:
-        from b12x.attention.nsa_indexer.paged import (
+        from b12x.attention.dsa_indexer.paged import (
             index_topk_fp8,
             prepare_paged_indexer_metadata,
         )
-        from b12x.attention.nsa_indexer.scratch import (
+        from b12x.attention.dsa_indexer.scratch import (
             INDEXER_SOURCE_LAYOUT_PAGED,
             B12XIndexerScratchCaps,
             plan_indexer_scratch,
@@ -651,7 +651,7 @@ class CollectiveOverlapProbe:
         )
         self.gathered_indices = torch.empty_like(self.full_indices)
 
-        from b12x.attention.nsa_indexer.tiled_topk import run_row_topk
+        from b12x.attention.dsa_indexer.tiled_topk import run_row_topk
 
         self._run_row_topk = run_row_topk
         shards = config.indexer_shards

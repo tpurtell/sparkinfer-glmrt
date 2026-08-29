@@ -109,7 +109,7 @@ def make_smem_layout_mg(
     # footer in kv_sc). GLM (ARBITRARY_FP32, no extra cache) stages the 528B
     # NoPE+inline-fp32-scales row (scales inline, NO footer) PLUS a kv_rope buffer
     # (GLM has no global-rope path in MG). Both share the rest of the MG layout.
-    is_glm = traits.model_type == ModelType.GLM_NSA
+    is_glm = traits.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
     inline_kv_scales = traits.scale_format != ScaleFormat.UE8M0_BYTE
     if mg_n_hg not in (1, 2):
         raise ValueError(
@@ -340,7 +340,7 @@ def get_prefill_mg_shared_storage_cls(
     class SharedStorageMG:
         pass
 
-    is_glm = traits.model_type == ModelType.GLM_NSA
+    is_glm = traits.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
     inline_kv_scales = traits.scale_format != ScaleFormat.UE8M0_BYTE
 
     # Tail (kv_fp8 .. w_fp8) is identical across DSV4 compute modes. DSV4
@@ -531,6 +531,18 @@ def _run_module_asserts() -> None:
             f"{SM120_SMEM_CARVEOUT_BYTES}B (mg_n_hg={nhg})"
         )
         get_prefill_mg_shared_storage_cls(glm, mg_n_hg=nhg)
+
+    glm_next = make_unified_traits(
+        ModelType.GLM_NEXT, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32
+    )
+    for nhg in (1, 2):
+        gl = make_smem_layout_mg(glm_next, mg_n_hg=nhg)
+        assert gl.kv_smem_stride == 528
+        assert gl.kv_sc_buf_bytes == 0
+        assert gl.kv_rope_buf_bytes == 0
+        assert gl.q_rope_stride == 8  # Dummy aliased storage; no RoPE math runs.
+        assert gl.total_bytes < SM120_SMEM_CARVEOUT_BYTES
+        get_prefill_mg_shared_storage_cls(glm_next, mg_n_hg=nhg)
 
 
 _run_module_asserts()

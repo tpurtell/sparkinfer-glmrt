@@ -339,33 +339,39 @@ def s0_quantize_q_to_smem(
     )
 
     # --- Step 1: copy Q-rope bf16 -> smem; zero-fill invalid heads. ---
-    if cutlass.const_expr(vectorized_rope_copy):
-        chunks_per_head = d_rope // 4
-        i = tid
-        while i < Int32(hpb * chunks_per_head):
-            h = i // Int32(chunks_per_head)
-            chunk = i - h * Int32(chunks_per_head)
-            d = chunk * Int32(4)
-            q0 = Uint32(0)
-            q1 = Uint32(0)
-            if h < valid_hpb:
-                q_off = cute.crd2idx((head_base + h, Int32(d_nope) + d), q_token.layout)
-                q0, q1 = ld_global_nc_v2_u32(get_ptr_as_int64(q_token, q_off))
-            s_addr = q_rope_base_addr + (h * Int32(q_rope_stride) + d) * Int32(2)
-            st_shared_u32(s_addr, q0)
-            st_shared_u32(s_addr + Int32(4), q1)
-            i += Int32(num_threads)
-    else:
-        i = tid
-        while i < Int32(hpb * d_rope):
-            h = i // Int32(d_rope)
-            d = i - h * Int32(d_rope)
-            s_byte = (h * Int32(q_rope_stride) + d) * Int32(2)
-            val = Float32(0.0)
-            if h < valid_hpb:
-                val = Float32(q_token[head_base + h, Int32(d_nope) + d])
-            st_shared_bf16_from_f32(_smem_byte(q_rope_base_addr, s_byte), val)
-            i += Int32(num_threads)
+    if cutlass.const_expr(d_rope > 0):
+        if cutlass.const_expr(vectorized_rope_copy):
+            chunks_per_head = d_rope // 4
+            i = tid
+            while i < Int32(hpb * chunks_per_head):
+                h = i // Int32(chunks_per_head)
+                chunk = i - h * Int32(chunks_per_head)
+                d = chunk * Int32(4)
+                q0 = Uint32(0)
+                q1 = Uint32(0)
+                if h < valid_hpb:
+                    q_off = cute.crd2idx(
+                        (head_base + h, Int32(d_nope) + d), q_token.layout
+                    )
+                    q0, q1 = ld_global_nc_v2_u32(get_ptr_as_int64(q_token, q_off))
+                s_addr = (
+                    q_rope_base_addr
+                    + (h * Int32(q_rope_stride) + d) * Int32(2)
+                )
+                st_shared_u32(s_addr, q0)
+                st_shared_u32(s_addr + Int32(4), q1)
+                i += Int32(num_threads)
+        else:
+            i = tid
+            while i < Int32(hpb * d_rope):
+                h = i // Int32(d_rope)
+                d = i - h * Int32(d_rope)
+                s_byte = (h * Int32(q_rope_stride) + d) * Int32(2)
+                val = Float32(0.0)
+                if h < valid_hpb:
+                    val = Float32(q_token[head_base + h, Int32(d_nope) + d])
+                st_shared_bf16_from_f32(_smem_byte(q_rope_base_addr, s_byte), val)
+                i += Int32(num_threads)
 
     # --- Steps 2-3: per-(head,tile) absmax over valid heads. ---
     # Keep the dynamic-loop index names distinct across const_expr branches:

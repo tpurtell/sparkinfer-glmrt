@@ -5,7 +5,7 @@ call sequence vLLM's integration uses.
 Note: b12x's paged CUDA-graph replay tests are stale against the current
 decode-graph planner heuristics (they fail upstream too), so they were not
 ported; graph coverage for the attention family comes from
-test_compressed_mla.py until they are refreshed.
+test_compressed_sparse_mla.py until they are refreshed.
 """
 
 from __future__ import annotations

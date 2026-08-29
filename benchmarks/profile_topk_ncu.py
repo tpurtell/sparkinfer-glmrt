@@ -9,13 +9,13 @@ import cutlass
 import torch
 from cutlass import Int32
 
-from b12x.attention.nsa_indexer.tiled_topk import (
-    SparseNSATiledTopkKernel,
+from b12x.attention.dsa_indexer.tiled_topk import (
+    DSATiledTopkKernel,
     _run_cached_host_launcher,
     _tensor_meta_key,
     _to_kernel_tensor,
 )
-from b12x.attention.nsa_indexer.persistent_topk import run_persistent_topk2048
+from b12x.attention.dsa_indexer.persistent_topk import run_persistent_topk2048
 from b12x._lib.utils import current_cuda_stream
 
 
@@ -28,14 +28,16 @@ def _make_inputs(rows: int, cols: int, topk: int, seed: int):
     return scores, lengths, row_starts
 
 
-def _make_cute_runner(scores: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor, topk: int):
+def _make_cute_runner(
+    scores: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor, topk: int
+):
     rows, cols = scores.shape
     values = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
     output = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
     flat_scores = scores.reshape(-1).contiguous()
     flat_values = values.reshape(-1).contiguous()
     flat_output = output.reshape(-1).contiguous()
-    kernel = SparseNSATiledTopkKernel(is_tiled=False)
+    kernel = DSATiledTopkKernel(is_tiled=False)
 
     def run():
         args = (
@@ -69,11 +71,15 @@ def _make_cute_runner(scores: torch.Tensor, lengths: torch.Tensor, row_starts: t
     return run, output
 
 
-def _make_persistent_runner(scores: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor, topk: int):
+def _make_persistent_runner(
+    scores: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor, topk: int
+):
     del row_starts
     if topk != 2048:
         raise ValueError("persistent mode supports topk=2048")
-    output = torch.empty((scores.shape[0], topk), dtype=torch.int32, device=scores.device)
+    output = torch.empty(
+        (scores.shape[0], topk), dtype=torch.int32, device=scores.device
+    )
 
     def run():
         run_persistent_topk2048(
@@ -86,7 +92,9 @@ def _make_persistent_runner(scores: torch.Tensor, lengths: torch.Tensor, row_sta
     return run, output
 
 
-def _make_sgl_runner(scores: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor, topk: int):
+def _make_sgl_runner(
+    scores: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor, topk: int
+):
     from sgl_kernel.top_k import fast_topk_transform_ragged_fused
 
     output_holder: list[torch.Tensor | None] = [None]
@@ -143,7 +151,9 @@ def main() -> None:
     if args.topk > args.cols:
         raise ValueError(f"topk ({args.topk}) must be <= cols ({args.cols})")
 
-    scores, lengths, row_starts = _make_inputs(args.rows, args.cols, args.topk, args.seed)
+    scores, lengths, row_starts = _make_inputs(
+        args.rows, args.cols, args.topk, args.seed
+    )
     if args.mode == "cute":
         run, _ = _make_cute_runner(scores, lengths, row_starts, args.topk)
     elif args.mode == "persistent":

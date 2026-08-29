@@ -125,6 +125,7 @@ def _run_forced_split_decode_graph(
     cache_seqlens_capture: list[int],
     cache_seqlens_replay: list[int] | None = None,
     seed: int = 73,
+    num_pages: int = 4096,
 ) -> None:
     clear_attention_caches()
     batch = len(cache_seqlens_capture)
@@ -140,7 +141,7 @@ def _run_forced_split_decode_graph(
         kv_heads=kv_heads,
         head_dim=head_dim,
         page_table_width=width,
-        num_pages=4096,
+        num_pages=num_pages,
     )
     harness = _ForcedSplitDecodeGraphHarness(q, k_cache, v_cache)
     harness.prepare(page_table, cache_seqlens, cu_seqlens_q)
@@ -223,6 +224,20 @@ def test_forced_split_decode_graph_gqa8_head_dim256() -> None:
         head_dim=256,
         cache_seqlens_capture=[4096, 4096, 4096, 4096],
         cache_seqlens_replay=[512, 1536, 3072, 4096],
+    )
+
+
+@torch.inference_mode()
+def test_qwen38_gqa6_head_dim256_split_decode_graph_matches_reference() -> None:
+    """Qwen3.8 TP1 full attention: 24 Q heads / 4 KV heads / H256."""
+    require_b12x()
+    _run_forced_split_decode_graph(
+        q_heads=24,
+        kv_heads=4,
+        head_dim=256,
+        cache_seqlens_capture=[128],
+        cache_seqlens_replay=[65],
+        num_pages=8,
     )
 
 

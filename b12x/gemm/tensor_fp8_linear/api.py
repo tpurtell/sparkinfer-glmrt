@@ -3,20 +3,12 @@
 from __future__ import annotations
 
 from ..._lib.gating import default_is_supported
-from ._kernel import (
+from ..blockscaled._linear import (
     TensorFP8LinearWeight as Weight,
 )
+from ..blockscaled.api import mm, pack_weight, prewarm
 from ._kernel import (
     is_tensor_fp8_linear_supported as _kernel_is_supported,
-)
-from ._kernel import (
-    pack_tensor_fp8_linear_weight as pack_weight,
-)
-from ._kernel import (
-    prewarm_tensor_fp8_linear as prewarm,
-)
-from ._kernel import (
-    tensor_fp8_linear as mm,
 )
 from . import META
 

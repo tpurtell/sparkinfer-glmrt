@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-import b12x.attention.nsa_indexer.contiguous_kernel as contiguous_kernel
-import b12x.attention.nsa_indexer.kernel as paged_kernel
+import b12x.attention.dsa_indexer.contiguous_kernel as contiguous_kernel
+import b12x.attention.dsa_indexer.kernel as paged_kernel
 
 
 def _paged_tensors():
@@ -100,7 +100,9 @@ def test_paged_tiled_logits_kernel_binding_supplies_common_call(monkeypatch) -> 
         calls.update(kwargs)
         return "tile-logits"
 
-    monkeypatch.setattr(paged_kernel, "_run_paged_tiled_logits_kernel_common", fake_common)
+    monkeypatch.setattr(
+        paged_kernel, "_run_paged_tiled_logits_kernel_common", fake_common
+    )
 
     assert paged_kernel.run_paged_tiled_logits_kernel(binding=binding) == "tile-logits"
     assert calls["q_fp8"] is q_fp8
@@ -117,7 +119,9 @@ def test_paged_tiled_logits_kernel_binding_supplies_common_call(monkeypatch) -> 
     assert calls["supertile"] is False
 
 
-def test_paged_supertile_logits_kernel_binding_supplies_common_call(monkeypatch) -> None:
+def test_paged_supertile_logits_kernel_binding_supplies_common_call(
+    monkeypatch,
+) -> None:
     (
         q_fp8,
         weights,
@@ -145,7 +149,9 @@ def test_paged_supertile_logits_kernel_binding_supplies_common_call(monkeypatch)
         calls.update(kwargs)
         return "supertile-logits"
 
-    monkeypatch.setattr(paged_kernel, "_run_paged_tiled_logits_kernel_common", fake_common)
+    monkeypatch.setattr(
+        paged_kernel, "_run_paged_tiled_logits_kernel_common", fake_common
+    )
 
     assert (
         paged_kernel.run_paged_supertile_logits_kernel(binding=binding)
@@ -179,8 +185,12 @@ def test_paged_logits_kernel_rejects_binding_plus_runtime_tensors() -> None:
         paged_kernel.run_paged_logits_kernel(binding=binding, q_fp8=q_fp8)
 
 
-def test_contiguous_logits_kernel_binding_run_uses_binding_argument(monkeypatch) -> None:
-    q_fp8, weights, k_quant, k_scale, k_start, k_end, tile_logits = _contiguous_tensors()
+def test_contiguous_logits_kernel_binding_run_uses_binding_argument(
+    monkeypatch,
+) -> None:
+    q_fp8, weights, k_quant, k_scale, k_start, k_end, tile_logits = (
+        _contiguous_tensors()
+    )
     binding = contiguous_kernel.build_indexer_contiguous_logits_kernel_binding(
         q_fp8=q_fp8,
         weights=weights,
@@ -206,7 +216,9 @@ def test_contiguous_logits_kernel_binding_run_uses_binding_argument(monkeypatch)
 
 
 def test_contiguous_logits_kernel_rejects_binding_plus_runtime_tensors() -> None:
-    q_fp8, weights, k_quant, k_scale, k_start, k_end, _tile_logits = _contiguous_tensors()
+    q_fp8, weights, k_quant, k_scale, k_start, k_end, _tile_logits = (
+        _contiguous_tensors()
+    )
     binding = contiguous_kernel.build_indexer_contiguous_logits_kernel_binding(
         q_fp8=q_fp8,
         weights=weights,

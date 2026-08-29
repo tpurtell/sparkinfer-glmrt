@@ -3,8 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-import b12x.attention.nsa_indexer.persistent_topk as persistent_topk_impl
-from b12x.attention.nsa_indexer.persistent_topk import B12XPersistentTopK2048Binding, B12XPersistentTopK2048ScratchCaps, plan_persistent_topk2048_scratch
+import b12x.attention.dsa_indexer.persistent_topk as persistent_topk_impl
+from b12x.attention.dsa_indexer.persistent_topk import (
+    B12XPersistentTopK2048Binding,
+    B12XPersistentTopK2048ScratchCaps,
+    plan_persistent_topk2048_scratch,
+)
 
 
 def _plan():
@@ -46,7 +50,9 @@ def test_persistent_topk2048_scratch_plan_binds_caller_owned_arena() -> None:
     assert binding.scratch.data_ptr() == scratch.data_ptr()
 
 
-def test_persistent_topk2048_binding_run_uses_function_binding_argument(monkeypatch) -> None:
+def test_persistent_topk2048_binding_run_uses_function_binding_argument(
+    monkeypatch,
+) -> None:
     plan = _plan()
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
