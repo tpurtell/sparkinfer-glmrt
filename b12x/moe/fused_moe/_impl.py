@@ -86,6 +86,14 @@ from b12x.moe._shared.execution import (
 )
 from b12x.moe._shared.trellis_codebooks import SQG_E4M3
 from b12x.moe._shared.tuning import lookup_max_active_clusters
+from b12x.policy import (
+    DeviceIdentity,
+    InvalidPreplannedPolicyError,
+    PolicyContext,
+    PolicyResolution,
+    PolicySource,
+    get_auto_policy,
+)
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
 )
@@ -96,11 +104,15 @@ from b12x._lib.scratch import (
 )
 
 from ._route_pack_cache import route_pack_prewarm_key
+from ._policy import (
+    MOE_DECODE_POLICY,
+    MoeDecodeConfig,
+    MoeDecodeQuery,
+)
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1"
-    or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
 )
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -116,6 +128,8 @@ _LEVEL_TILE_N = 128
 _DYNAMIC_SLICE_CHUNK = 1
 _DYNAMIC_WORK_SOURCE_ENV = "B12X_DYNAMIC_WORK_SOURCE"
 _DYNAMIC_WORK_SOURCE_DEFAULT = "materialized_queue"
+_DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV = "B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN"
+_DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS = 256
 _DYNAMIC_WORK_SOURCES = {
     "persistent_grid",
     "materialized_queue",
@@ -742,6 +756,7 @@ class TPMoEPlan:
     max_tokens_per_launch: int
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
+    policy_resolution: PolicyResolution[MoeDecodeConfig] | None = None
 
     @property
     def deterministic_output(self) -> bool:
@@ -767,12 +782,18 @@ class TPMoEScratchCaps:
     w4a16_block_size_m: int | None = None
     w4a16_fast_math: bool = True
     full_rotation_output_dtype: torch.dtype = torch.float32
+    policy_context: PolicyContext | None = None
     frozen: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
         object.__setattr__(self, "device", torch.device(self.device))
+        policy_context = self.policy_context or get_auto_policy(self.device)
+        if not isinstance(policy_context, PolicyContext):
+            raise TypeError("policy_context must be a PolicyContext")
+        policy_context.require_device(self.device)
+        object.__setattr__(self, "policy_context", policy_context)
         if not isinstance(self.weight_plan, MoEWeightPreparationPlan):
             raise TypeError("weight_plan must be a MoEWeightPreparationPlan")
         quant_mode = _normalize_quant_mode_for_source(
@@ -882,9 +903,9 @@ class TPMoEScratchPlan:
     _prewarmed_topk_sum_launches: tuple[tuple[torch.dtype, bool, object], ...] = field(
         default=(), repr=False
     )
-    _mixed_trellis_launches: tuple[
-        tuple[torch.dtype, bool, bool, object], ...
-    ] = field(default=(), repr=False)
+    _mixed_trellis_launches: tuple[tuple[torch.dtype, bool, bool, object], ...] = field(
+        default=(), repr=False
+    )
 
     @property
     def full_rotation(self) -> bool:
@@ -971,6 +992,7 @@ class TPMoEScratchPlan:
             fast_math = self.caps.w4a16_fast_math
         return _build_tp_moe_fp4_binding_from_views(
             plan=self._core_workspace_plan,
+            execution_plan=self.launch_plan,
             tensors=tensors,
             a=a,
             experts=experts,
@@ -981,6 +1003,7 @@ class TPMoEScratchPlan:
             input_scales_static=input_scales_static,
             fast_math=fast_math,
             quant_mode=self.caps.quant_mode,
+            policy_context=self.caps.policy_context,
             unit_scale_contract=unit_scale_contract,
             swiglu_limit=self.caps.swiglu_limit,
             swiglu_alpha=self.caps.swiglu_alpha,
@@ -1009,12 +1032,14 @@ class TPMoEFP4Binding:
     num_topk: int
     device: torch.device
     dtype: torch.dtype
+    execution_plan: TPMoEPlan | None = None
     apply_router_weight_on_input: bool = False
     output: torch.Tensor | None = None
     output_cast_target: torch.Tensor | None = None
     input_scales_static: bool = False
     fast_math: bool | None = None
     quant_mode: str | None = None
+    policy_context: PolicyContext | None = None
     deterministic_output: bool = False
     unit_scale_contract: bool = False
     swiglu_limit: float | None = None
@@ -1628,9 +1653,7 @@ def _select_dynamic_tile_mn(
         if routed_rows > 16 * num_experts:
             return (32, _LEVEL_TILE_N)
         return (16, _LEVEL_TILE_N)
-    activation_spec = _get_activation_kernel_spec(
-        activation, quant_mode=quant_mode
-    )
+    activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
     activation = activation_spec.activation
     if activation == "relu2":
         return (_LEVEL_TILE_M, _LEVEL_TILE_N)
@@ -1782,6 +1805,41 @@ def _nvfp4_dynamic_direct_candidate(
         and _dynamic_work_source() != "ready_queue"
         and not deterministic_output
     )
+
+
+@triton.jit(do_not_specialize=["live_routes"])
+def _dynamic_route_plan_kernel(
+    topk_ids,
+    row_counts,
+    expert_tile_base,
+    live_routes,
+    NUM_EXPERTS: tl.constexpr,
+    TILE_M: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_ROUTES: tl.constexpr,
+):
+    """Build the grouped expert histogram and padded tile prefix in one CTA."""
+    experts = tl.arange(0, BLOCK_E)
+    expert_mask = experts < NUM_EXPERTS
+    tl.store(row_counts + experts, 0, mask=expert_mask)
+    tl.debug_barrier()
+
+    routes = tl.arange(0, BLOCK_ROUTES)
+    expert_ids = tl.load(
+        topk_ids + routes,
+        mask=routes < live_routes,
+        other=-1,
+    ).to(tl.int32)
+    valid = (routes < live_routes) & (expert_ids >= 0) & (expert_ids < NUM_EXPERTS)
+    tl.atomic_add(row_counts + expert_ids, 1, mask=valid, sem="relaxed")
+    tl.debug_barrier()
+
+    counts = tl.load(row_counts + experts, mask=expert_mask, other=0)
+    tiles = (counts + TILE_M - 1) // TILE_M
+    tiles = tl.where(expert_mask, tiles, 0)
+    inclusive = tl.cumsum(tiles, axis=0)
+    tl.store(expert_tile_base + experts, inclusive - tiles, mask=expert_mask)
+    tl.store(expert_tile_base + NUM_EXPERTS, tl.sum(tiles, axis=0))
 
 
 def _dynamic_direct_routing_candidate(
@@ -2174,6 +2232,84 @@ def select_tp_moe_backend(
     return "dynamic"
 
 
+def _heuristic_moe_decode_config(
+    query: MoeDecodeQuery,
+    _device: DeviceIdentity | None,
+) -> MoeDecodeConfig:
+    backend = select_tp_moe_backend(
+        num_tokens=query.num_tokens,
+        num_topk=query.top_k,
+        quant_mode=query.quant_mode,
+    )
+    if backend == "micro" and not _band_runs_direct_micro(
+        num_tokens=query.num_tokens,
+        k=query.hidden_size,
+        n=query.intermediate_size,
+        num_topk=query.top_k,
+        weight_E=query.num_experts,
+        activation=query.activation,
+        quant_mode=query.quant_mode,
+    ):
+        backend = "dynamic"
+    return MoeDecodeConfig(
+        backend=backend,
+        route_planner="internal",
+        max_active_clusters=None,
+    )
+
+
+def _current_moe_policy_context() -> PolicyContext:
+    return get_auto_policy()
+
+
+def _resolve_moe_decode_policy(
+    *,
+    num_tokens: int,
+    num_topk: int,
+    num_experts: int,
+    k: int,
+    n: int,
+    activation: str,
+    quant_mode: str,
+    source_format: str = "modelopt_nvfp4",
+    context: PolicyContext | None = None,
+) -> PolicyResolution[MoeDecodeConfig]:
+    query = MoeDecodeQuery(
+        quant_mode=_normalize_quant_mode(quant_mode),
+        source_format=_normalize_fp4_source_format(source_format),
+        activation=normalize_moe_activation(activation),
+        num_experts=int(num_experts),
+        hidden_size=int(k),
+        intermediate_size=int(n),
+        top_k=int(num_topk),
+        num_tokens=int(num_tokens),
+        routed_rows=int(num_tokens) * int(num_topk),
+    )
+    context = context or _current_moe_policy_context()
+    if "B12X_MICRO_DYNAMIC_CUTOVER_PAIRS" in os.environ:
+        resolution = context.resolve(
+            MOE_DECODE_POLICY,
+            query,
+            override=_heuristic_moe_decode_config(query, context.device),
+        )
+    else:
+        resolution = context.resolve(MOE_DECODE_POLICY, query)
+    if resolution.config.backend == "micro" and not _band_runs_direct_micro(
+        num_tokens=query.num_tokens,
+        k=query.hidden_size,
+        n=query.intermediate_size,
+        num_topk=query.top_k,
+        weight_E=query.num_experts,
+        activation=query.activation,
+        quant_mode=query.quant_mode,
+    ):
+        message = "MoE decode policy selected micro for an unsupported query"
+        if resolution.source is PolicySource.PREPLANNED:
+            raise InvalidPreplannedPolicyError(message)
+        raise ValueError(message)
+    return resolution
+
+
 def _dynamic_task_geometry(
     E: int,
     n: int,
@@ -2259,6 +2395,7 @@ def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
 def _build_tp_moe_fp4_binding_from_views(
     *,
     plan: _TPCoreWorkspacePlan,
+    execution_plan: TPMoEPlan,
     tensors: Dict[str, torch.Tensor],
     a: torch.Tensor,
     experts: B12XFP4ExpertWeights,
@@ -2269,6 +2406,7 @@ def _build_tp_moe_fp4_binding_from_views(
     input_scales_static: bool = False,
     fast_math: bool | None = None,
     quant_mode: str | None = None,
+    policy_context: PolicyContext | None = None,
     unit_scale_contract: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
@@ -2440,12 +2578,14 @@ def _build_tp_moe_fp4_binding_from_views(
         num_topk=plan.num_topk,
         device=plan.device,
         dtype=plan.dtype,
+        execution_plan=execution_plan,
         apply_router_weight_on_input=bool(apply_router_weight_on_input),
         output=output,
         output_cast_target=output_cast_target,
         input_scales_static=bool(input_scales_static),
         fast_math=fast_math,
         quant_mode=quant_mode,
+        policy_context=policy_context,
         deterministic_output=plan.deterministic_output,
         unit_scale_contract=unit_scale_contract,
         swiglu_limit=swiglu_limit,
@@ -2671,18 +2811,13 @@ def _plan_core_workspace(
             if int(trellis_bits) not in (2, 3, 4, 5, 6):
                 raise ValueError("trellis_bits must be one of 2, 3, 4, 5, 6")
             trellis_tile_config = trellis_tile_config or (64, 256, 64, 256)
-            if trellis_pair_kinds and (
-                int(trellis_bits) != 3 or int(n) != 256
-            ):
+            if trellis_pair_kinds and (int(trellis_bits) != 3 or int(n) != 256):
                 raise ValueError(
-                    "per-expert-pair btx extents require n=256 and "
-                    "trellis_bits=3"
+                    "per-expert-pair btx extents require n=256 and trellis_bits=3"
                 )
         if projection_mixed_trellis:
             if not full_rotation or trellis_codebook != "mcg":
-                raise ValueError(
-                    "projection-mixed Trellis requires native MCG weights"
-                )
+                raise ValueError("projection-mixed Trellis requires native MCG weights")
             if activation != "silu":
                 raise NotImplementedError(
                     "projection-mixed Trellis execution currently requires silu"
@@ -2781,7 +2916,12 @@ def _plan_core_workspace(
                     (routed_capacity, int(k)),
                     torch.float16,
                 ),
-                _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32),
+                _TensorAllocSpec(
+                    "kernel_workspace",
+                    (sms * 4 + 2,),
+                    torch.int32,
+                    init="zeros",
+                ),
             )
             return _TPCoreWorkspacePlan(
                 implementation="trellis_mixed3",
@@ -2805,7 +2945,7 @@ def _plan_core_workspace(
                 full_rotation=True,
                 projection_mixed_trellis=True,
                 trellis_bits=3,
-                trellis_tile_config=(128, 256, 64, 256),
+                trellis_tile_config=(128, 128, 128, 128),
                 trellis_codebook="mcg",
                 coupled_hadamard=False,
                 route_block_size_m=block_size_m,
@@ -3658,6 +3798,41 @@ def _derive_w4a8_weight_grids(
     scales = _unswizzle_block_scales_batched(blockscale_u8, rows, k_dim // 16)
     ue8m0, residual = decompose_nvfp4_scales_to_mx_residual(scales)
     return ue8m0.contiguous(), residual.view(torch.uint8).contiguous()
+
+
+def _pad_w4a8_grid_rows(
+    grid: torch.Tensor,
+    *,
+    logical_n: int,
+    is_gated: bool,
+) -> torch.Tensor:
+    padded_n = align_up(logical_n, _LEVEL_TILE_N)
+    if padded_n == logical_n:
+        return grid
+    padded_rows = 2 * padded_n if is_gated else padded_n
+    padded = grid.new_zeros((grid.shape[0], padded_rows, grid.shape[2]))
+    if is_gated:
+        padded[:, :logical_n].copy_(grid[:, :logical_n])
+        padded[:, padded_n : padded_n + logical_n].copy_(
+            grid[:, logical_n : 2 * logical_n]
+        )
+    else:
+        padded[:, :logical_n].copy_(grid)
+    return padded
+
+
+def _pad_w4a8_grid_columns(
+    grid: torch.Tensor,
+    *,
+    logical_n: int,
+    elements_per_scale: int,
+) -> torch.Tensor:
+    padded_columns = align_up(logical_n, _LEVEL_TILE_N) // elements_per_scale
+    if padded_columns == grid.shape[2]:
+        return grid
+    padded = grid.new_zeros((grid.shape[0], grid.shape[1], padded_columns))
+    padded[:, :, : grid.shape[2]].copy_(grid)
+    return padded
 
 
 def _as_e8m0_k32_grid(
@@ -4845,11 +5020,35 @@ def _get_weight_views(
     )
     if _is_w4a8_quant_mode(quant_mode):
         if quant_mode == "w4a8_nvfp4":
-            views.sfb_w13_mx, views.w13_residual = _derive_w4a8_weight_grids(
-                bs_u8, w1_n, k
+            dynamic_w13_storage = _pad_w4a8_grid_rows(
+                w1_fp4,
+                logical_n=n,
+                is_gated=activation_spec.is_gated,
             )
-            views.sfb_down_mx, views.down_residual = _derive_w4a8_weight_grids(
+            views.w13_fp4 = dynamic_w13_storage.permute(1, 2, 0).view(torch.uint8)
+            w13_mx, w13_residual = _derive_w4a8_weight_grids(bs_u8, w1_n, k)
+            down_mx, down_residual = _derive_w4a8_weight_grids(
                 w2_blockscale.view(torch.uint8), k, n
+            )
+            views.sfb_w13_mx = _pad_w4a8_grid_rows(
+                w13_mx,
+                logical_n=n,
+                is_gated=activation_spec.is_gated,
+            )
+            views.w13_residual = _pad_w4a8_grid_rows(
+                w13_residual,
+                logical_n=n,
+                is_gated=activation_spec.is_gated,
+            )
+            views.sfb_down_mx = _pad_w4a8_grid_columns(
+                down_mx,
+                logical_n=n,
+                elements_per_scale=32,
+            )
+            views.down_residual = _pad_w4a8_grid_columns(
+                down_residual,
+                logical_n=n,
+                elements_per_scale=16,
             )
         else:
             # w4a8_mx: the checkpoint E8M0 K/32 grids feed the kernel
@@ -5296,17 +5495,12 @@ def prepare_b12x_fp4_moe_weights(
                 f"btx manifest codebook {manifest.codebook!r} does not match "
                 f"the plan's trellis_codebook {plan.trellis_codebook!r}"
             )
-        if (
-            manifest.rates.bits is not None
-            and manifest.rates.bits != plan.trellis_bits
-        ):
+        if manifest.rates.bits is not None and manifest.rates.bits != plan.trellis_bits:
             raise ValueError(
                 f"btx manifest declares bits={manifest.rates.bits}; the plan "
                 f"declares trellis_bits={plan.trellis_bits}"
             )
-        if manifest.rates.structure != (
-            plan.trellis_rate_granularity or "uniform"
-        ):
+        if manifest.rates.structure != (plan.trellis_rate_granularity or "uniform"):
             raise ValueError(
                 "btx manifest rate structure "
                 f"{manifest.rates.structure!r} does not match the plan's "
@@ -5314,13 +5508,11 @@ def prepare_b12x_fp4_moe_weights(
             )
         if (manifest.rates.pair_kinds or None) != plan.trellis_pair_kinds:
             raise ValueError(
-                "btx manifest pair kinds do not match the plan's "
-                "trellis_pair_kinds"
+                "btx manifest pair kinds do not match the plan's trellis_pair_kinds"
             )
         if manifest.hadamard.coupled != plan.coupled_hadamard:
             raise ValueError(
-                "btx manifest coupled-Hadamard declaration does not match "
-                "the plan"
+                "btx manifest coupled-Hadamard declaration does not match the plan"
             )
         if (
             manifest.geometry.num_experts != plan.num_experts
@@ -5349,9 +5541,7 @@ def prepare_b12x_fp4_moe_weights(
             layout=PreparedWeightLayout.TRELLIS_NATIVE,
             value=value,
         )
-        input_scale = torch.ones(
-            (), dtype=torch.float32, device=value.w13.device
-        )
+        input_scale = torch.ones((), dtype=torch.float32, device=value.w13.device)
         return B12XFP4ExpertWeights(
             plan=plan,
             a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
@@ -5769,7 +5959,10 @@ def _resolve_workspace_layout(
     n: int,
     activation: str,
     quant_mode: str = "nvfp4",
+    source_format: str = "modelopt_nvfp4",
     weight_layout: str | None = None,
+    policy_context: PolicyContext | None = None,
+    policy_resolution: PolicyResolution[MoeDecodeConfig] | None = None,
 ) -> tuple[str, int, int]:
     routed_rows = num_tokens * num_topk
     if _normalize_quant_mode(quant_mode) == "w4a16":
@@ -5846,8 +6039,13 @@ def _resolve_workspace_layout(
         # than the w4a8 dynamic kernel at m=8/topk=10 (0.076 vs 0.169 ms), so
         # the w4a8 micro band covers all micro-capable m, not just the
         # routed-pairs cutover tuned for nvfp4.
+        micro_routing_supported = not (
+            normalized_quant_mode == "w4a8_nvfp4"
+            and routed_rows > _DIRECT_ROUTING_MAX_ROUTED_ROWS
+        )
         if (
-            band == "micro" or num_tokens <= _MICRO_MAX_TOKENS
+            micro_routing_supported
+            and (band == "micro" or num_tokens <= _MICRO_MAX_TOKENS)
         ) and _band_runs_direct_micro(
             num_tokens=num_tokens,
             k=k,
@@ -5866,23 +6064,20 @@ def _resolve_workspace_layout(
             activation=activation,
         )
         return "dynamic", weight_E, align_up(routed_rows, tile_m)
-    implementation = select_tp_moe_backend(
-        num_tokens=num_tokens,
-        num_topk=num_topk,
-        quant_mode=quant_mode,
-    )
-    if implementation == "micro" and not _band_runs_direct_micro(
-        num_tokens=num_tokens,
-        k=k,
-        n=n,
-        num_topk=num_topk,
-        weight_E=weight_E,
-        activation=activation,
-        quant_mode=quant_mode,
-    ):
-        # Tiny-decode band, but micro cannot run this shape; dynamic is the
-        # general fallback.
-        implementation = "dynamic"
+    decode_policy = policy_resolution
+    if decode_policy is None:
+        decode_policy = _resolve_moe_decode_policy(
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            num_experts=weight_E,
+            k=k,
+            n=n,
+            activation=activation,
+            quant_mode=quant_mode,
+            source_format=source_format,
+            context=policy_context,
+        )
+    implementation = decode_policy.config.backend
     if implementation == "micro":
         return implementation, max(1, routed_rows), max(1, routed_rows)
     tile_m, _ = _select_dynamic_tile_mn(
@@ -5907,6 +6102,7 @@ def plan_tp_moe_execution(
     swiglu_beta: float | None = None,
     apply_router_weight_on_input: bool = False,
     deterministic_output: bool | None = None,
+    policy_context: PolicyContext | None = None,
 ) -> TPMoEPlan:
     """Lower one recipe from an authoritative weight-preparation plan.
 
@@ -5929,6 +6125,10 @@ def plan_tp_moe_execution(
     except KeyError as exc:
         raise TypeError(f"unsupported MoE plan dtype {weight_plan.io_dtype!r}") from exc
     device = torch.device(device)
+    policy_context = policy_context or get_auto_policy(device)
+    if not isinstance(policy_context, PolicyContext):
+        raise TypeError("policy_context must be a PolicyContext")
+    policy_context.require_device(device)
     weight_E = weight_plan.num_experts
     k = weight_plan.hidden_size
     n = weight_plan.intermediate_size
@@ -5949,6 +6149,19 @@ def plan_tp_moe_execution(
         ).activation
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     routed_rows = num_tokens * num_topk
+    policy_resolution = None
+    if quant_mode == "nvfp4":
+        policy_resolution = _resolve_moe_decode_policy(
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            num_experts=weight_E,
+            k=k,
+            n=n,
+            activation=activation,
+            quant_mode=quant_mode,
+            source_format=source_format,
+            context=policy_context,
+        )
     implementation, state_E, max_rows = _resolve_workspace_layout(
         num_tokens=num_tokens,
         weight_E=weight_E,
@@ -5957,7 +6170,10 @@ def plan_tp_moe_execution(
         n=n,
         activation=activation,
         quant_mode=quant_mode,
+        source_format=source_format,
         weight_layout=weight_plan.w4a8_weight_layout,
+        policy_context=policy_context,
+        policy_resolution=policy_resolution,
     )
     dynamic_physical_tiles = None
     dynamic_task_capacity = None
@@ -6088,6 +6304,7 @@ def plan_tp_moe_execution(
         max_tokens_per_launch=max_tokens_per_launch,
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
+        policy_resolution=policy_resolution,
     )
 
 
@@ -6653,6 +6870,7 @@ def plan_tp_moe_arena_layout(
     deterministic_output: bool | None = None,
     w4a16_block_size_m: int | None = None,
     full_rotation_output_dtype: torch.dtype = torch.float32,
+    policy_context: PolicyContext | None = None,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     if not isinstance(weight_plan, MoEWeightPreparationPlan):
@@ -6723,6 +6941,7 @@ def plan_tp_moe_arena_layout(
             swiglu_beta=swiglu_beta,
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=deterministic_output,
+            policy_context=policy_context,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -7206,9 +7425,7 @@ def _bind_projection_mixed_trellis_from_views(
     m = int(a.shape[0])
     capacity_tokens = core_plan.routed_rows // core_plan.num_topk
     if m <= 0 or m > capacity_tokens:
-        raise ValueError(
-            f"input rows must be in [1,{capacity_tokens}], got {m}"
-        )
+        raise ValueError(f"input rows must be in [1,{capacity_tokens}], got {m}")
     expected_routes = (m, core_plan.num_topk)
     if tuple(topk_weights.shape) != expected_routes:
         raise ValueError(
@@ -7295,6 +7512,9 @@ def _bind_projection_mixed_trellis_from_views(
             f"float32[{m},{core_plan.k}] on {a.device}"
         )
 
+    # This caller-owned arena may contain arbitrary bytes. The cooperative
+    # mixed grid reads its barrier count and sense before writing them.
+    tensors["kernel_workspace"].zero_()
     buffers = MixedTrellisBuffers(
         rotation_gate=tensors["rotation_a_gate"],
         rotation_up=tensors["rotation_a_up"],
@@ -7340,11 +7560,13 @@ def _bind_projection_mixed_trellis_from_views(
         num_topk=core_plan.num_topk,
         device=core_plan.device,
         dtype=core_plan.dtype,
+        execution_plan=scratch_plan.launch_plan,
         output=output_tensor,
         output_cast_target=output_cast_target,
         input_scales_static=bool(input_scales_static),
         fast_math=True,
         quant_mode="w4a16",
+        policy_context=scratch_plan.caps.policy_context,
         routed_rows_capacity=core_plan.routed_rows,
         layer_idx=layer_idx,
         route_block_size_m=core_plan.route_block_size_m,
@@ -7406,6 +7628,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         deterministic_output=deterministic_output,
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
         full_rotation_output_dtype=caps.full_rotation_output_dtype,
+        policy_context=caps.policy_context,
     )
 
 
@@ -7436,6 +7659,7 @@ def plan_tp_moe_scratch(
         swiglu_beta=caps.swiglu_beta,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         deterministic_output=deterministic_output,
+        policy_context=caps.policy_context,
     )
     resolved_block_size_m = _resolve_trellis_route_block_size(caps)
     core_workspace_plan = _plan_core_workspace(
@@ -7813,12 +8037,8 @@ def _prewarm_w4a16_planned_launches(
                         w13_layout=w13_layout,
                         collect_activation_amax=False,
                         trellis_bits=workspace.trellis_bits,
-                        fc1_trellis_pair_kind=_fc_trellis_pair_kind(
-                            workspace
-                        ),
-                        fc2_trellis_pair_kind=_fc_trellis_pair_kind(
-                            workspace
-                        ),
+                        fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
+                        fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                         force_tile_config=workspace.trellis_tile_config,
                         direct_topk_routes=True,
                         use_expert_map=True,
@@ -7959,6 +8179,7 @@ def materialize_tp_moe_arena_workspaces(
             swiglu_beta=swiglu_beta,
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=deterministic_output,
+            policy_context=caps.policy_context,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -8224,8 +8445,24 @@ def build_tp_moe_fp4_binding(
         quant_mode=quant_mode,
         device=a.device,
     )
+    plan = None
     deterministic_output = False
+    if isinstance(workspace, TPMoEWorkspacePool) or quant_mode != "w4a16":
+        plan = plan_tp_moe_execution(
+            num_tokens=m,
+            num_topk=num_topk,
+            device=a.device,
+            weight_plan=experts.plan,
+            quant_mode=quant_mode,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=requested_deterministic_output,
+        )
+        deterministic_output = plan.deterministic_output
     if isinstance(workspace, TPMoEWorkspacePool):
+        assert plan is not None
         weight_layout = "packed"
         scale_format = "e4m3_k16"
         if quant_mode == "w4a16":
@@ -8241,19 +8478,6 @@ def build_tp_moe_fp4_binding(
             else:
                 weight_layout = _w4a16_weight_layout_for_source(source_format)
                 scale_format = _w4a16_scale_format_for_source(source_format)
-        plan = plan_tp_moe_execution(
-            num_tokens=m,
-            num_topk=num_topk,
-            device=a.device,
-            weight_plan=experts.plan,
-            quant_mode=quant_mode,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            deterministic_output=requested_deterministic_output,
-        )
-        deterministic_output = plan.deterministic_output
         workspace = _resolve_workspace(
             workspace,
             plan=plan,
@@ -8287,6 +8511,7 @@ def build_tp_moe_fp4_binding(
         input_scales_static=bool(input_scales_static),
         fast_math=fast_math,
         quant_mode=quant_mode,
+        execution_plan=plan,
         deterministic_output=deterministic_output,
         unit_scale_contract=unit_scale_contract,
         swiglu_limit=swiglu_limit,
@@ -9175,32 +9400,52 @@ class _DynamicMoEW4A8Launch:
                 (rows_padded * (self._n + self._n // 32) // 4,), stride=(1,)
             ),
         )
+        w13_grid_rows = self._w1_n
+        down_mx_columns = self._n // 32
+        down_residual_columns = self._n // 16
+        if cutlass.const_expr(self._kernel.w4a8_residual):
+            padded_n = align_up(self._n, _LEVEL_TILE_N)
+            w13_grid_rows = 2 * padded_n if self._kernel.is_gated else padded_n
+            down_mx_columns = padded_n // 32
+            down_residual_columns = padded_n // 16
         sfb_w13_mx = cute.make_tensor(
             sfb_w13_mx_ptr,
             layout=cute.make_layout(
-                (self._w1_n, self._k // 32, row_counts.shape[0]),
-                stride=(self._k // 32, 1, self._w1_n * (self._k // 32)),
+                (w13_grid_rows, self._k // 32, row_counts.shape[0]),
+                stride=(
+                    self._k // 32,
+                    1,
+                    w13_grid_rows * (self._k // 32),
+                ),
             ),
         )
         sfb_down_mx = cute.make_tensor(
             sfb_down_mx_ptr,
             layout=cute.make_layout(
-                (self._k, self._n // 32, row_counts.shape[0]),
-                stride=(self._n // 32, 1, self._k * (self._n // 32)),
+                (self._k, down_mx_columns, row_counts.shape[0]),
+                stride=(down_mx_columns, 1, self._k * down_mx_columns),
             ),
         )
         w13_residual = cute.make_tensor(
             w13_residual_ptr,
             layout=cute.make_layout(
-                (self._w1_n, self._k // 16, row_counts.shape[0]),
-                stride=(self._k // 16, 1, self._w1_n * (self._k // 16)),
+                (w13_grid_rows, self._k // 16, row_counts.shape[0]),
+                stride=(
+                    self._k // 16,
+                    1,
+                    w13_grid_rows * (self._k // 16),
+                ),
             ),
         )
         down_residual = cute.make_tensor(
             down_residual_ptr,
             layout=cute.make_layout(
-                (self._k, self._n // 16, row_counts.shape[0]),
-                stride=(self._n // 16, 1, self._k * (self._n // 16)),
+                (self._k, down_residual_columns, row_counts.shape[0]),
+                stride=(
+                    down_residual_columns,
+                    1,
+                    self._k * down_residual_columns,
+                ),
             ),
         )
         num_experts = row_counts.shape[0]
@@ -9210,21 +9455,15 @@ class _DynamicMoEW4A8Launch:
             # [E][K16(I)][N16(K)]. SFB tensors are compile-time dead
             # (identity UE8M0 word).
             _tr_bits = int(self._kernel.trellis_bits)
-            _tr_w13_u32 = (
-                2 * (self._k // 16) * ((self._w1_n // 2) // 16) * 8 * _tr_bits
-            )
+            _tr_w13_u32 = 2 * (self._k // 16) * ((self._w1_n // 2) // 16) * 8 * _tr_bits
             _tr_down_u32 = (self._n // 16) * (self._k // 16) * 8 * _tr_bits
             w13_rp = cute.make_tensor(
                 w13_rp_ptr,
-                layout=cute.make_layout(
-                    (num_experts * _tr_w13_u32,), stride=(1,)
-                ),
+                layout=cute.make_layout((num_experts * _tr_w13_u32,), stride=(1,)),
             )
             down_rp = cute.make_tensor(
                 down_rp_ptr,
-                layout=cute.make_layout(
-                    (num_experts * _tr_down_u32,), stride=(1,)
-                ),
+                layout=cute.make_layout((num_experts * _tr_down_u32,), stride=(1,)),
             )
             _tr_sentinel = cute.make_layout((1,), stride=(1,))
             w13_sfb_rp = cute.make_tensor(w13_sfb_rp_ptr, layout=_tr_sentinel)
@@ -9358,9 +9597,7 @@ class _DynamicMoEW4A8Launch:
                             row_counts.shape[0]
                             * (
                                 6
-                                if getattr(
-                                    self._kernel, "trellis_coupled", False
-                                )
+                                if getattr(self._kernel, "trellis_coupled", False)
                                 else 3
                             )
                             * self._n,
@@ -9389,6 +9626,7 @@ def _get_dynamic_kernel(
     quant_mode: str = "nvfp4",
     w4a8_repacked: bool = False,
     direct_routing: bool = False,
+    external_route_plan: bool = False,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -9483,6 +9721,7 @@ def _get_dynamic_kernel(
         work_source,
         bool(w4a8_repacked),
         bool(direct_routing),
+        bool(external_route_plan),
         materialize_intermediate,
         int(trellis_bits),
         bool(trellis_coupled),
@@ -9533,6 +9772,8 @@ def _get_dynamic_kernel(
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
     kernel_kwargs["direct_routing"] = bool(direct_routing)
+    if external_route_plan:
+        kernel_kwargs["external_route_plan"] = True
     if is_w4a8 and int(trellis_bits) > 0:
         kernel_kwargs["quant_recipe"] = "w4a8_trellis"
         kernel_kwargs["w4a8_repacked"] = True
@@ -9647,12 +9888,16 @@ def _get_dynamic_kernel(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
     w1_n = activation_spec.w1_rows(n)
+    dynamic_w1_n = w1_n
+    if quant_mode == "w4a8_nvfp4":
+        padded_n = align_up(n, _LEVEL_TILE_N)
+        dynamic_w1_n = 2 * padded_n if activation_spec.is_gated else padded_n
     # w6a8_mx weight tensors are the 3:4-packed FP6 bytes, so their gmem K
     # extent is 3K/4 one-byte elements (the kernel expands to full-K
     # byte-containers in smem).
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (w1_n, 3 * k // 4 if is_w6a8 else k, E),
+        (dynamic_w1_n, 3 * k // 4 if is_w6a8 else k, E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -9746,9 +9991,7 @@ def _get_dynamic_kernel(
         *(
             (
                 make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(
-                    cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
-                ),
+                make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
                 make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
                 make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
                 make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -9869,15 +10112,15 @@ def _launch_dynamic_flat(
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
+    external_route_plan_requested: bool,
+    policy_max_active_clusters: int,
     volatile_launch_state: bool,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
     # A trellis-native w4a8 binding carries the fp16 boundary rotations in
     # the sfb slot (the QMMA repack stores int32 scale words there); the
     # trellis geometry is recovered from the operand extents.
-    w4a8_trellis = (
-        _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
-    )
+    w4a8_trellis = _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
     trellis_bits = 0
     trellis_coupled = False
     trellis_lut_tensor = None
@@ -9890,10 +10133,7 @@ def _launch_dynamic_flat(
         payload_u32 = w13_rp.numel() * w13_rp.element_size() // 4
         window_words = 2 * E * (k // 16) * (n // 16) * 8
         trellis_bits = payload_u32 // window_words
-        if (
-            trellis_bits not in (2, 3, 4)
-            or trellis_bits * window_words != payload_u32
-        ):
+        if trellis_bits not in (2, 3, 4) or trellis_bits * window_words != payload_u32:
             raise RuntimeError(
                 "w4a8 trellis payload extent does not match the launch "
                 f"shape (E={E}, k={k}, n={n}, payload_u32={payload_u32})"
@@ -9958,6 +10198,22 @@ def _launch_dynamic_flat(
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
     )
+    external_route_plan_supported = bool(
+        quant_mode == "nvfp4"
+        and activation == "silu"
+        and selected_tile_m == 16
+        and routed_rows <= _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
+        and not direct_routing
+        and not deterministic_output
+        and _dynamic_work_source() == _DYNAMIC_WORK_SOURCE_DEFAULT
+    )
+    external_route_plan = bool(
+        external_route_plan_supported
+        and _env_flag(
+            _DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV,
+            default=external_route_plan_requested,
+        )
+    )
     if materialize_intermediate:
         required_intermediate_bytes = (
             physical_tiles_capacity * selected_tile_m * (n + n // 32)
@@ -10008,6 +10264,19 @@ def _launch_dynamic_flat(
                 routed_rows * max(1, (k + 255) // 256),
             )
         effective_mac = min(effective_mac, direct_task_count)
+    if (
+        external_route_plan
+        and policy_max_active_clusters > 0
+        and _first_env(
+            "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
+            "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
+        )
+        is None
+    ):
+        effective_mac = min(
+            effective_mac,
+            policy_max_active_clusters,
+        )
     # Do not enlarge this grid beyond the measured resident count: the fused
     # kernel has a resident-grid barrier, so over-launching would deadlock.
     compiled, mac = _get_dynamic_kernel(
@@ -10024,6 +10293,7 @@ def _launch_dynamic_flat(
         quant_mode=quant_mode,
         w4a8_repacked=w4a8_repacked,
         direct_routing=direct_routing,
+        external_route_plan=external_route_plan,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
@@ -10035,6 +10305,20 @@ def _launch_dynamic_flat(
     if volatile_launch_state:
         barrier_count.zero_()
         barrier_epoch.zero_()
+
+    if external_route_plan:
+        block_e = 1 << (int(E) - 1).bit_length()
+        _dynamic_route_plan_kernel[(1,)](
+            flat_ids,
+            row_counts,
+            expert_tile_base,
+            routed_rows,
+            NUM_EXPERTS=E,
+            TILE_M=selected_tile_m,
+            BLOCK_E=block_e,
+            BLOCK_ROUTES=_DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS,
+            num_warps=8,
+        )
 
     def _gptr(dtype, t, align=16):
         return make_ptr(
@@ -10194,8 +10478,11 @@ def _tp_moe_dynamic_launch_op(
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
-    volatile_launch_state: bool,
+    launch_policy: int,
 ) -> None:
+    volatile_launch_state = bool(launch_policy & 1)
+    external_route_plan_requested = bool(launch_policy & 2)
+    policy_max_active_clusters = (launch_policy >> 2) - 1
     _launch_dynamic_flat(
         packed_a_view=packed_a_view,
         packed_a_flat=packed_a_flat,
@@ -10260,6 +10547,8 @@ def _tp_moe_dynamic_launch_op(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        external_route_plan_requested=external_route_plan_requested,
+        policy_max_active_clusters=policy_max_active_clusters,
         volatile_launch_state=volatile_launch_state,
     )
 
@@ -10329,8 +10618,9 @@ def _tp_moe_dynamic_launch_fake(
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
-    volatile_launch_state: bool,
+    launch_policy: int,
 ) -> None:
+    del launch_policy
     return None
 
 
@@ -10360,8 +10650,17 @@ def _launch_dynamic(
     swiglu_limit: float | None = None,
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
+    external_route_plan_requested: bool = False,
+    policy_max_active_clusters: int = -1,
 ) -> None:
     del stream
+    if policy_max_active_clusters < -1:
+        raise ValueError("policy_max_active_clusters must be -1 or nonnegative")
+    launch_policy = (
+        int(bool(workspace.volatile_launch_state))
+        | (int(bool(external_route_plan_requested)) << 1)
+        | ((int(policy_max_active_clusters) + 1) << 2)
+    )
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
         raise RuntimeError(
             "deterministic dynamic launch exceeds the planned route-output "
@@ -10445,7 +10744,7 @@ def _launch_dynamic(
         swiglu_limit,
         float(swiglu_alpha),
         float(swiglu_beta),
-        workspace.volatile_launch_state,
+        launch_policy,
     )
 
 
@@ -11035,9 +11334,7 @@ def _launch_micro(
     # activation wrappers such as SiTU keep is_supported False to hold the
     # nvfp4-family compact path closed while serving the trellis arm.
     shape_supported = (
-        MoEMicroKernelBackend.is_supported
-        if w4a8_trellis
-        else micro_cls.is_supported
+        MoEMicroKernelBackend.is_supported if w4a8_trellis else micro_cls.is_supported
     )
     use_micro_direct = (
         quant_mode == "nvfp4" or _is_w4a8_quant_mode(quant_mode)
@@ -11463,18 +11760,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
         return _finalize_trellis_output(binding, result)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
-    plan = plan_tp_moe_execution(
-        num_tokens=m,
-        num_topk=num_topk,
-        device=device,
-        weight_plan=experts.plan,
-        quant_mode=quant_mode,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        deterministic_output=bool(binding.deterministic_output),
-    )
+    plan = binding.execution_plan
+    if plan is None:
+        raise RuntimeError(
+            "TP MoE binding is missing its execution plan; construct bindings "
+            "with TPMoEScratchPlan.bind() or build_tp_moe_fp4_binding()"
+        )
 
     impl = plan.implementation
     max_rows = plan.max_rows
@@ -11504,8 +11795,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
 
         micro_w4a8_trellis = (
             quant_mode == "w4a8_mx"
-            and getattr(prepared_payload, "weight_layout", None)
-            == "trellis_t256"
+            and getattr(prepared_payload, "weight_layout", None) == "trellis_t256"
         )
         if micro_w4a8_trellis:
             wv = _w4a8_trellis_weight_views(
@@ -11601,6 +11891,15 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
 
     if impl == "dynamic":
         deterministic_output = plan.deterministic_output
+        decode_config = MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=None,
+        )
+        if quant_mode == "nvfp4":
+            if plan.policy_resolution is None:
+                raise RuntimeError("NVFP4 MoE plan is missing its policy resolution")
+            decode_config = plan.policy_resolution.config
         dense_w4a8_candidate = _w4a8_dynamic_dense_candidate(
             quant_mode=quant_mode,
             activation=activation,
@@ -11652,6 +11951,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            external_route_plan_requested=decode_config.route_planner == "triton",
+            policy_max_active_clusters=(
+                -1
+                if decode_config.max_active_clusters is None
+                else decode_config.max_active_clusters
+            ),
             share_input_across_experts=(
                 (quant_mode == "nvfp4" and a1_gscale.numel() == 1)
                 or (
@@ -11695,8 +12000,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
-                != "0"
+                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
             share_expert_scales=(
                 activation in ("relu2", "silu")
@@ -12055,9 +12359,7 @@ def _select_experts_reference(
     )
 
 
-def b12x_route_experts_fast(
-    *, binding: TPMoERouteBinding
-) -> B12XTopKRouting:
+def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current

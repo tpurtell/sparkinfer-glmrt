@@ -696,6 +696,7 @@ class MoEDynamicKernelBackend:
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
         direct_routing: bool = False,
+        external_route_plan: bool = False,
         materialize_intermediate: bool = False,
         work_source: str = _WORK_SOURCE_MATERIALIZED_QUEUE,
         swiglu_limit: float | None = None,
@@ -838,6 +839,7 @@ class MoEDynamicKernelBackend:
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         self.w4a8_repacked = bool(w4a8_repacked)
         self.direct_routing = bool(direct_routing)
+        self.external_route_plan = bool(external_route_plan)
         self.materialize_intermediate = bool(materialize_intermediate)
         self.w4a8_m1_materialized = bool(
             self.w4a8_repacked
@@ -944,6 +946,15 @@ class MoEDynamicKernelBackend:
             raise ValueError(
                 "direct routing requires non-streaming NVFP4 or repacked "
                 "W4A8 MX (materialized execution is M16-only)"
+            )
+        if self.external_route_plan and not (
+            quant_recipe == "nvfp4"
+            and not self.direct_routing
+            and work_source == _WORK_SOURCE_MATERIALIZED_QUEUE
+        ):
+            raise ValueError(
+                "external route planning requires grouped NVFP4 with the "
+                "materialized work source"
             )
         if self.is_w4a8 and swap_ab:
             raise ValueError("w4a8 recipes do not support swap_ab yet")
@@ -2884,10 +2895,13 @@ class MoEDynamicKernelBackend:
         if cutlass.const_expr(not self.direct_routing):
             i = flat_tid
             while i < num_experts:
-                row_counts[i] = Int32(0)
                 expert_write_rows[i] = Int32(0)
+                if cutlass.const_expr(not self.external_route_plan):
+                    row_counts[i] = Int32(0)
                 i += flat_stride
-            if flat_tid < num_experts + Int32(1):
+            if cutlass.const_expr(
+                not self.external_route_plan
+            ) and flat_tid < num_experts + Int32(1):
                 expert_tile_base[flat_tid] = Int32(0)
 
         # Atomic scatter accumulates into the caller output and must start at
@@ -3017,7 +3031,11 @@ class MoEDynamicKernelBackend:
         # routing decode instead gives every routed pair its own physical M tile:
         # this removes the histogram, serial expert prefix, and two resident-
         # grid barriers while retaining the exact same compute/task body.
-        if cutlass.const_expr(not self.direct_routing):
+        # The external route-plan specialization gets the grouped histogram and
+        # prefix from an ordered Triton launch and skips the same control phase.
+        if cutlass.const_expr(
+            not self.direct_routing and not self.external_route_plan
+        ):
             hist_idx = flat_tid
             while hist_idx < total_pairs:
                 expert_id = topk_ids[hist_idx].to(Int32)

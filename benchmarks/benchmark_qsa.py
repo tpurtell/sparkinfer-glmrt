@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.attention import qsa
+from b12x.policy import PolicyContext
 from b12x.attention.qsa.reference import (
     gemma_rmsnorm_reference,
     packed_stream_compress_reference,
@@ -436,9 +437,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise BenchmarkFailure("warmup and replay counts must be positive")
     if args.l2_flush_bytes < 0:
         raise BenchmarkFailure("L2 flush bytes must be non-negative")
-    if any(rows > 4096 for rows in (*args.rows, *args.prefill_rows)):
+    if any(rows > 8192 for rows in (*args.rows, *args.prefill_rows)):
         raise BenchmarkFailure(
-            "row counts above 4096 require an explicit harness change"
+            "row counts above 8192 require an explicit harness change"
         )
 
 
@@ -792,10 +793,11 @@ def _prepare_case(
     seed: int,
     main_cache_layout: str,
     kv_cache_dtype: str,
+    policy: PolicyContext | None = None,
 ) -> PreparedCase:
     kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else torch.bfloat16
     caps = _make_caps(case, device, kv_dtype=kv_dtype)
-    plan = qsa.plan(caps)
+    plan = qsa.plan(caps, policy=policy)
     (scratch_spec,) = plan.scratch_specs()
     scratch = torch.empty(
         scratch_spec.shape,
@@ -953,7 +955,7 @@ def _prepare_case(
         generator=generator,
         device=device,
     )
-    if case.kind == "speculative":
+    if case.kind in {"prefill", "speculative"}:
         index_query[1:].copy_(index_query[:1].expand(case.rows - 1, -1, -1))
     raw_key = _random_bf16(
         (case.rows, INDEX_HEAD_DIM), generator=generator, device=device
@@ -1499,6 +1501,7 @@ def _run_case(
     device: torch.device,
     l2_flush: Callable[[], None] | None,
     case_index: int,
+    policy: PolicyContext | None = None,
 ) -> dict[str, object]:
     prepared = _prepare_case(
         case,
@@ -1506,6 +1509,7 @@ def _run_case(
         seed=args.seed + 1009 * case_index,
         main_cache_layout=args.main_cache_layout,
         kv_cache_dtype=args.kv_cache_dtype,
+        policy=policy,
     )
     eager_output, correctness, eager_persistent_state = _validate_correctness(prepared)
     eager_selected = prepared.binding.selected_positions[: case.rows].clone()

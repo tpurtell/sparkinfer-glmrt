@@ -10,13 +10,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ..._lib.scratch_layout import (
-    layout_wo_projection as _layout_wo_projection,
-    materialize_scratch_strided_view as _materialize_arena_strided_view,
-    materialize_scratch_view as _materialize_arena_view,
-    wo_mxfp8_scale_physical_shape as _wo_mxfp8_scale_physical_shape,
-)
-from b12x._lib.utils import cuda_stream_to_int
 from b12x._lib.dense_gemm import (
     _WO_SPARK_MAX_SMS,
     dense_gemm,
@@ -27,6 +20,25 @@ from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
+)
+from b12x._lib.utils import cuda_stream_to_int
+from b12x.gemm.wo_projection._policy import (
+    WO_PROJECTION_POLICY,
+    WoProjectionQuery,
+)
+from b12x.policy import PolicyContext, get_auto_policy
+
+from ..._lib.scratch_layout import (
+    layout_wo_projection as _layout_wo_projection,
+)
+from ..._lib.scratch_layout import (
+    materialize_scratch_strided_view as _materialize_arena_strided_view,
+)
+from ..._lib.scratch_layout import (
+    materialize_scratch_view as _materialize_arena_view,
+)
+from ..._lib.scratch_layout import (
+    wo_mxfp8_scale_physical_shape as _wo_mxfp8_scale_physical_shape,
 )
 
 FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
@@ -171,6 +183,7 @@ class WOProjectionScratchPlan:
     caps: WOProjectionScratchCaps
     layout: object
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -2270,7 +2283,26 @@ def _build_wo_projection_inv_rope_binding_from_views(
 
 def plan_wo_projection_scratch(
     caps: WOProjectionScratchCaps,
+    *,
+    policy: PolicyContext | None = None,
 ) -> WOProjectionScratchPlan:
+    if not isinstance(caps, WOProjectionScratchCaps):
+        raise TypeError("caps must be WOProjectionScratchCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        WO_PROJECTION_POLICY,
+        WoProjectionQuery(
+            dtype=str(caps.dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            groups=caps.groups,
+            group_width=caps.group_width,
+            rank=caps.rank,
+            hidden=caps.hidden,
+        ),
+    )
     layout = _layout_wo_projection(
         offset_bytes=0,
         tokens=caps.max_tokens,
@@ -2289,6 +2321,7 @@ def plan_wo_projection_scratch(
                 device=caps.device,
             ),
         ),
+        policy_resolution=resolution,
     )
 
 

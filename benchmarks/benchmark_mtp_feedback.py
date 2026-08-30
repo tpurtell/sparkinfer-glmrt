@@ -210,6 +210,7 @@ def _make_binding(
     seed: int,
     device: torch.device,
     capacity_tokens: int,
+    policy=None,
 ) -> mtp.Binding:
     """Allocate and bind one case exclusively through the public lifecycle."""
 
@@ -220,7 +221,7 @@ def _make_binding(
         streams=_STREAMS,
         dtype=_DTYPE,
     )
-    planned = mtp.plan(caps)
+    planned = mtp.plan(caps, policy=policy)
     (scratch_spec,) = planned.scratch_specs()
     generator = torch.Generator(device=device).manual_seed(seed)
     scratch = torch.empty(
@@ -377,12 +378,14 @@ def _benchmark_profile(
     samples: int,
     l2_flush,
     capacity_tokens: int,
+    policy=None,
 ) -> dict[str, Any]:
     binding = _make_binding(
         profile,
         seed=seed,
         device=device,
         capacity_tokens=capacity_tokens,
+        policy=policy,
     )
     reference = mtp.reference.feedback(
         binding.token_embedding,

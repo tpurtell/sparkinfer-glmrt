@@ -37,6 +37,8 @@ META = OpMeta(
         # planning + scratch
         "Caps",
         "Plan",
+        "DsaIndexerConfig",
+        "DsaIndexerQuery",
         "PagedScratch",
         "ContiguousScratch",
         "PagedBinding",

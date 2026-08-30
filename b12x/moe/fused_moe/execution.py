@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from ..._lib.scratch import ScratchBufferSpec
+from ...policy import PolicyContext, get_auto_policy
 from .._shared.execution import MoEExecutionPlan
 from ._impl import (
     TPMoEPlan,
@@ -97,6 +98,7 @@ class ExecutionPlan:
         caps: TPMoEScratchCaps,
         impl: TPMoEScratchPlan,
         variants: tuple[ExecutionVariant, ...],
+        policy: PolicyContext,
     ) -> None:
         self.experts = experts
         self.capacity = capacity
@@ -104,6 +106,7 @@ class ExecutionPlan:
         self._caps = caps
         self._impl = impl
         self.variants = variants
+        self.policy = policy
         self._prewarmed = False
 
     @property
@@ -140,6 +143,7 @@ def _variant(
     capacity: ExecutionCapacity,
     routing: RoutingSpec,
     quant_mode: str,
+    policy: PolicyContext,
 ) -> ExecutionVariant:
     activation = experts.plan.activation
     impl = plan_tp_moe_execution(
@@ -153,6 +157,7 @@ def _variant(
         swiglu_beta=activation.swiglu_beta,
         apply_router_weight_on_input=routing.apply_router_weight_on_input,
         deterministic_output=routing.deterministic_output,
+        policy_context=policy,
     )
     return ExecutionVariant(
         tokens=tokens,
@@ -168,6 +173,7 @@ def plan_execution(
     experts: PreparedExperts,
     capacity: ExecutionCapacity,
     routing: RoutingSpec | None = None,
+    policy: PolicyContext | None = None,
 ) -> ExecutionPlan:
     """Plan scratch and launch variants without compiling CUDA launches."""
 
@@ -178,6 +184,10 @@ def plan_execution(
     routing = routing or RoutingSpec()
     if not isinstance(routing, RoutingSpec):
         raise TypeError("routing must be a RoutingSpec")
+    policy = policy or get_auto_policy(experts.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(experts.device)
     quant_modes = experts.plan._impl.quant_modes
     if len(quant_modes) != 1:
         raise ValueError("canonical weight plans must resolve one activation mode")
@@ -199,6 +209,7 @@ def plan_execution(
         swiglu_beta=activation.swiglu_beta,
         collect_activation_amax=routing.collect_activation_amax,
         deterministic_output=routing.deterministic_output,
+        policy_context=policy,
         frozen=True,
     )
     impl = plan_tp_moe_scratch(caps, prewarm_launches=False)
@@ -209,6 +220,7 @@ def plan_execution(
             capacity=capacity,
             routing=routing,
             quant_mode=quant_mode,
+            policy=policy,
         )
         for tokens in counts
     )
@@ -219,6 +231,7 @@ def plan_execution(
         caps=caps,
         impl=impl,
         variants=variants,
+        policy=policy,
     )
 
 

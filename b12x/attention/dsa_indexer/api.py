@@ -72,6 +72,7 @@ from .paged import (
     resolve_local_num_q_heads,
     resolve_replicated_num_q_heads,
 )
+from ._policy import DsaIndexerConfig, DsaIndexerQuery
 from .paged import (
     IndexerPagedMetadata as PagedMetadata,
 )

@@ -8,6 +8,7 @@ from typing import Any, overload
 import torch
 
 from ..._lib.gating import default_is_supported
+from ...policy import PolicyContext
 from .._shared.routing import route_topk
 from . import META
 from . import _vllm_compat as _compat
@@ -28,6 +29,7 @@ from ._impl import (
     b12x_sparse_moe_fp4 as run_sparse,
 )
 from .config import TrellisConfig
+from ._policy import MoeDecodeConfig, MoeDecodeQuery
 from .execution import (
     ExecutionCapacity,
     ExecutionPlan,
@@ -193,6 +195,7 @@ def plan_execution(
     experts: PreparedExperts,
     capacity: ExecutionCapacity,
     routing: RoutingSpec | None = None,
+    policy: PolicyContext | None = None,
 ) -> ExecutionPlan: ...
 
 
@@ -268,6 +271,8 @@ __all__ = [
     "ExecutionVariant",
     "ExpertWeights",
     "MoEGeometry",
+    "MoeDecodeConfig",
+    "MoeDecodeQuery",
     "PackedSource",
     "PackedSourceFormat",
     "PackedWeights",

@@ -15,6 +15,9 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
+from b12x.policy import PolicyContext, get_auto_policy
+
+from ._policy import PLE_POLICY, PleQuery
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -228,6 +231,7 @@ class LayerPlan:
     caps: LayerCaps
     layout: _LayerScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     @property
     def state_length(self) -> int:
@@ -247,8 +251,32 @@ class LayerPlan:
         return bind_layer(self, **kwargs)
 
 
-def plan_layer(caps: LayerCaps) -> LayerPlan:
+def plan_layer(
+    caps: LayerCaps,
+    *,
+    policy: PolicyContext | None = None,
+) -> LayerPlan:
     """Plan fixed-capacity PLE math and state-gather scratch."""
+    if not isinstance(caps, LayerCaps):
+        raise TypeError("caps must be LayerCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        PLE_POLICY,
+        PleQuery(
+            mode=caps.mode,
+            dtype=str(caps.dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            max_seqs=caps.max_seqs,
+            max_speculative_tokens=caps.max_speculative_tokens,
+            streams=caps.streams,
+            hidden_size=caps.hidden_size,
+            kernel_size=caps.kernel_size,
+            dilation=caps.dilation,
+        ),
+    )
     normalized_u_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = normalized_u_offset_bytes
     cursor += caps.max_tokens * caps.channels * dtype_nbytes(caps.dtype)
@@ -269,7 +297,12 @@ def plan_layer(caps: LayerCaps) -> LayerPlan:
         error_code_offset_bytes=error_code_offset_bytes,
     )
     spec = scratch_buffer_spec("ple_layer", nbytes=cursor, device=caps.device)
-    return LayerPlan(caps=caps, layout=layout, _scratch_specs=(spec,))
+    return LayerPlan(
+        caps=caps,
+        layout=layout,
+        _scratch_specs=(spec,),
+        policy_resolution=resolution,
+    )
 
 
 def bind_layer(

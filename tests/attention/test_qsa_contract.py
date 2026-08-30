@@ -703,9 +703,10 @@ def test_qsa_target_caps_scale_caller_owned_topk_scratch(max_q_rows: int) -> Non
     assert planned._layout.total_nbytes > planned._layout.topk_offset_bytes
 
 
-def test_qsa_prefill_capacity_reuses_bounded_row_workspace() -> None:
+def test_qsa_prefill_capacity_uses_full_row_workspace() -> None:
+    device = require_sm120()
     common = {
-        "device": "cuda:8",
+        "device": device,
         "max_batch": 32,
         "max_raw_state_slots": 32,
         "max_seq_len": 262144,
@@ -728,10 +729,10 @@ def test_qsa_prefill_capacity_reuses_bounded_row_workspace() -> None:
     decode = qsa.plan(qsa.Caps(max_q_rows=128, **common))
     prefill = qsa.plan(qsa.Caps(max_q_rows=4096, **common))
 
-    assert decode.workspace_q_rows == prefill.workspace_q_rows == 128
-    assert prefill.scratch_specs()[0].nbytes - decode.scratch_specs()[0].nbytes == (
-        4096 - 128
-    ) * torch.int32.itemsize
+    assert decode.workspace_q_rows == 128
+    assert prefill.workspace_q_rows == 4096
+    assert decode.max_split_row_product == 128 * 16
+    assert prefill.max_split_row_product == 4096 * 16
 
 
 @pytest.mark.parametrize("rows", [1, 16, 32, 257, 513])

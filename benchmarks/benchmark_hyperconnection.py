@@ -263,6 +263,7 @@ def build_plan_binding(
     *,
     device: torch.device | str,
     tokens: int,
+    policy=None,
 ) -> tuple[hc.Plan, hc.Binding]:
     """Build the public Caps -> plan -> bind lifecycle for one profile."""
     profile = Profile(tokens=tokens)
@@ -276,7 +277,8 @@ def build_plan_binding(
             streams=profile.streams,
             lowrank=profile.lowrank,
             dtype=DTYPE,
-        )
+        ),
+        policy=policy,
     )
     binding = hc.bind(
         plan,
@@ -390,11 +392,16 @@ def _make_case(
     *,
     seed: int,
     device: torch.device,
+    policy=None,
 ) -> _Case:
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     width = profile.streams * profile.hidden_size
-    plan, binding = build_plan_binding(device=device, tokens=profile.tokens)
+    plan, binding = build_plan_binding(
+        device=device,
+        tokens=profile.tokens,
+        policy=policy,
+    )
     return _Case(
         profile=profile,
         plan=plan,

@@ -10,18 +10,20 @@ from typing import ClassVar
 
 import torch
 
+from b12x._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
 from b12x._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
     align_up,
     dtype_nbytes,
     materialize_scratch_view,
 )
-from b12x._lib.scratch import (
-    ScratchBufferSpec,
-    scratch_buffer_spec,
-    scratch_tensor,
-)
+from b12x.policy import PolicyContext, get_auto_policy
 
+from ._policy import MHC_POLICY, MhcQuery
 
 MHC_MULT = 4
 MHC_MIXES = (2 + MHC_MULT) * MHC_MULT
@@ -239,6 +241,7 @@ class B12XMHCScratchPlan:
     caps: B12XMHCScratchCaps
     layout: _MHCScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -498,7 +501,26 @@ def _layout_mhc_scratch(caps: B12XMHCScratchCaps) -> _MHCScratchLayout:
     )
 
 
-def plan_mhc_scratch(caps: B12XMHCScratchCaps) -> B12XMHCScratchPlan:
+def plan_mhc_scratch(
+    caps: B12XMHCScratchCaps,
+    *,
+    policy: PolicyContext | None = None,
+) -> B12XMHCScratchPlan:
+    if not isinstance(caps, B12XMHCScratchCaps):
+        raise TypeError("caps must be B12XMHCScratchCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        MHC_POLICY,
+        MhcQuery(
+            dtype=str(caps.dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            hidden_size=caps.hidden_size,
+            split_k=caps.split_k,
+        ),
+    )
     layout = _layout_mhc_scratch(caps)
     return B12XMHCScratchPlan(
         caps=caps,
@@ -510,6 +532,7 @@ def plan_mhc_scratch(caps: B12XMHCScratchCaps) -> B12XMHCScratchPlan:
                 device=caps.device,
             ),
         ),
+        policy_resolution=resolution,
     )
 
 
@@ -1216,14 +1239,14 @@ def _b12x_mhc_post_pre_impl(
         # reference; Sinkhorn is ~0.015us/iter so the cost is negligible). The
         # Gram + RMSNorm are skipped when there is no fused norm_weight.
         from b12x.norm.mhc._kernels import (
-            run_mhc_finalize_gram,
             _selected_post_pre_decode_split_n,
+            mhc_prefill_tf32_project_splits,
+            run_mhc_finalize_gram,
             run_mhc_post_pre_functional,
             run_mhc_post_pre_partial,
             run_mhc_post_pre_prefill_block_m_partial,
             run_mhc_post_pre_prefill_gram,
             run_mhc_post_pre_prefill_partial,
-            mhc_prefill_tf32_project_splits,
             run_mhc_prefill_bf16_project,
             run_mhc_prefill_tf32_project,
         )

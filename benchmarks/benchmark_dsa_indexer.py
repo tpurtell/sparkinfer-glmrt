@@ -23,7 +23,7 @@ from b12x.attention.dsa_indexer.reference import (
 from b12x.attention.dsa_indexer._impl import (
     build_paged_mqa_schedule_metadata,
     clear_indexer_caches,
-    contiguous_logits,
+    contiguous_tiled_topk,
     paged_decode_logits,
     uses_paged_mqa_schedule,
 )
@@ -159,6 +159,12 @@ def _assert_exact_match(actual: torch.Tensor, expected: torch.Tensor) -> None:
         f"DSA indexer correctness mismatch: {mismatch} differing entries, "
         f"actual[0]={actual[0].tolist()} expected[0]={expected[0].tolist()}"
     )
+
+
+def _assert_topk_set_match(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    actual_sorted = torch.sort(actual, dim=1).values
+    expected_sorted = torch.sort(expected, dim=1).values
+    _assert_exact_match(actual_sorted, expected_sorted)
 
 
 def _select_paged_topk_from_logits(
@@ -514,19 +520,20 @@ def _run_extend_case(
         gather_rows=int(kv_fp8[0].shape[0]),
         topk=topk,
     )
+    contiguous_scratch = contiguous_binding.scratch
+    contiguous_scratch.k_quant[: int(kv_fp8[0].shape[0])].copy_(kv_fp8[0])
+    contiguous_scratch.k_scale[: int(kv_fp8[1].shape[0])].copy_(kv_fp8[1])
+    bound_kv_fp8 = (
+        contiguous_scratch.k_quant[: int(kv_fp8[0].shape[0])],
+        contiguous_scratch.k_scale[: int(kv_fp8[1].shape[0])],
+    )
 
     def run():
-        logits = contiguous_logits(
+        return contiguous_tiled_topk(
             q_fp8=q_fp8,
             weights=weights,
-            kv_fp8=kv_fp8,
+            kv_fp8=bound_kv_fp8,
             binding=contiguous_binding,
-        )
-        return _select_ragged_topk_from_logits(
-            logits=logits,
-            k_start=k_start,
-            lengths=seqlens_expanded,
-            topk=topk,
         )
 
     clear_indexer_caches()
@@ -545,7 +552,7 @@ def _run_extend_case(
         topk=topk,
     )
     torch.cuda.synchronize()
-    _assert_exact_match(actual[: expected.shape[0]], expected)
+    _assert_topk_set_match(actual[: expected.shape[0]], expected)
 
     for _ in range(warmup):
         if l2_flush is not None:

@@ -8,12 +8,10 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x.attention.dsa_indexer._impl import (
-    IndexerContiguousMetadata,
-    IndexerPagedDecodeMetadata,
-)
-from b12x.attention.dsa_indexer.msa_reference import (
-    MSA_BLOCK_TOKENS,
+from b12x._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
 )
 from b12x._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
@@ -21,11 +19,16 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
-from b12x._lib.scratch import (
-    ScratchBufferSpec,
-    scratch_buffer_spec,
-    scratch_tensor,
+from b12x.attention.dsa_indexer._impl import (
+    IndexerContiguousMetadata,
+    IndexerPagedDecodeMetadata,
 )
+from b12x.attention.dsa_indexer.msa_reference import (
+    MSA_BLOCK_TOKENS,
+)
+from b12x.policy import PolicyContext, get_auto_policy
+
+from ._policy import DSA_INDEXER_POLICY, DsaIndexerQuery
 
 _PAGED_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_INDEX_SUPERTILE_K"
 _PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
@@ -2346,6 +2349,7 @@ def plan_indexer_contiguous_scratch(
 class B12XIndexerScratchPlan:
     caps: B12XIndexerScratchCaps
     inner: B12XIndexerPagedScratchPlan | B12XIndexerContiguousScratchPlan
+    policy_resolution: object | None = None
 
     @property
     def layout(self):
@@ -2370,7 +2374,32 @@ class B12XIndexerScratchPlan:
 
 def plan_indexer_scratch(
     caps: B12XIndexerScratchCaps,
+    *,
+    policy: PolicyContext | None = None,
 ) -> B12XIndexerScratchPlan:
+    if not isinstance(caps, B12XIndexerScratchCaps):
+        raise TypeError("caps must be B12XIndexerScratchCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        DSA_INDEXER_POLICY,
+        DsaIndexerQuery(
+            source_layout=caps.source_layout,
+            mode=caps.mode,
+            dtype=str(caps.dtype).removeprefix("torch."),
+            kv_dtype=str(caps.kv_dtype).removeprefix("torch."),
+            num_q_heads=caps.num_q_heads,
+            num_idx_heads=caps.num_idx_heads,
+            max_q_rows=caps.max_q_rows,
+            max_k_rows=0 if caps.max_k_rows is None else caps.max_k_rows,
+            top_k=caps.topk,
+            page_size=caps.page_size,
+            score_mode=caps.score_mode,
+            shared_page_table=caps.shared_page_table,
+        ),
+    )
     if caps.source_layout == INDEXER_SOURCE_LAYOUT_PAGED:
         assert caps.max_page_table_width is not None
         inner = plan_indexer_paged_scratch(
@@ -2415,7 +2444,11 @@ def plan_indexer_scratch(
         )
     else:
         raise ValueError(f"unsupported indexer source_layout {caps.source_layout!r}")
-    return B12XIndexerScratchPlan(caps=caps, inner=inner)
+    return B12XIndexerScratchPlan(
+        caps=caps,
+        inner=inner,
+        policy_resolution=resolution,
+    )
 
 
 __all__ = [

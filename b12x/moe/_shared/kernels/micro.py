@@ -956,13 +956,11 @@ class MoEMicroKernelBackend:
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
         w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
-        if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
-            # Native ModelOpt rows contain exactly n/8 packed u32 values.
+        if cutlass.const_expr(cfg.n % 64 != 0):
+            # Source-native rows contain exactly n/8 packed u32 values.
             # w2_sf_cols is padded to four scale columns, so its control-block
             # count overstates the physical W2/packed-scale extent when n is a
-            # multiple of 16 but not 64 (for example, n=144). Keep the existing
-            # predicate byte-for-byte for the aligned production shapes, and
-            # gate odd-shape loads against the logical packed row instead.
+            # multiple of 16 but not 64 (for example, n=144).
             w_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
@@ -1234,7 +1232,7 @@ class MoEMicroKernelBackend:
                 kk_off = Int32(kk) * n_u32_per_expert + chunk_base
                 cb_idx = Int32(nc) * Int32(4) + lane_cb
                 w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
-                if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                if cutlass.const_expr(cfg.n % 64 != 0):
                     packed_u32 = Int32(nc * 32) + lane
                     w_valid = Int32(1) if packed_u32 < Int32(cfg.n // 8) else Int32(0)
                 # If the last 256-value chunk overhangs logical n, lanes past
@@ -1242,15 +1240,7 @@ class MoEMicroKernelBackend:
                 # The padded scale grid can look full at widths such as n=496,
                 # so its control-block count is not a valid activation bound.
                 # The weight is zero there, but 0 * NaN still poisons the sum.
-                # Preserve the legacy predicate for non-W4A16 modes and emit
-                # no extra work for 256-aligned native ModelOpt shapes.
-                if cutlass.const_expr(
-                    (self.w4a16_mode and cfg.n % 256 != 0)
-                    or (
-                        (not self.w4a16_mode)
-                        and (cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4
-                    )
-                ):
+                if cutlass.const_expr(cfg.n % 256 != 0):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)
@@ -1440,6 +1430,8 @@ class MoEMicroKernelBackend:
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
         w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
+        if cutlass.const_expr(cfg.n % 64 != 0):
+            w_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
         out_acc0 = Float32(0.0)
@@ -1716,7 +1708,7 @@ class MoEMicroKernelBackend:
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
         w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
-        if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+        if cutlass.const_expr(cfg.n % 64 != 0):
             w_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
@@ -2008,13 +2000,13 @@ class MoEMicroKernelBackend:
                 chunk_base = Int32(nc) * Int32(128)
                 cb_idx = Int32(nc) * Int32(4) + lane_cb
                 w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
-                if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                if cutlass.const_expr(cfg.n % 64 != 0):
                     packed_u32 = Int32(nc * 32) + lane
                     w_valid = Int32(1) if packed_u32 < Int32(cfg.n // 8) else Int32(0)
                 if cutlass.const_expr(nc + 1 < cfg.fc2_n_chunks):
                     next_cb_idx = Int32(nc + 1) * Int32(4) + lane_cb
                     next_w_valid = Int32(1) if next_cb_idx < num_cb else Int32(0)
-                    if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                    if cutlass.const_expr(cfg.n % 64 != 0):
                         next_packed_u32 = Int32((nc + 1) * 32) + lane
                         next_w_valid = (
                             Int32(1)
@@ -2061,7 +2053,7 @@ class MoEMicroKernelBackend:
                     )
                     next_cb_idx = lane_cb
                     next_w_valid = Int32(1) if next_cb_idx < num_cb else Int32(0)
-                    if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                    if cutlass.const_expr(cfg.n % 64 != 0):
                         next_w_valid = (
                             Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
                         )
@@ -2132,13 +2124,7 @@ class MoEMicroKernelBackend:
                 kk_off = token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
                 # See _m1_fc2_rowpair_wide: logical n, not the padded scale
                 # grid, determines whether the native intermediate tail is live.
-                if cutlass.const_expr(
-                    (self.w4a16_mode and cfg.n % 256 != 0)
-                    or (
-                        (not self.w4a16_mode)
-                        and (cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4
-                    )
-                ):
+                if cutlass.const_expr(cfg.n % 256 != 0):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)

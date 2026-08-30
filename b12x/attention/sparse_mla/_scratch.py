@@ -18,9 +18,10 @@ from typing import Literal
 
 import torch
 
-from b12x.attention._shared.workspace import (
-    _split_output_buffer_from_tmp,
-    _split_tmp_output_stride,
+from b12x._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
 )
 from b12x._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
@@ -29,12 +30,14 @@ from b12x._lib.scratch_layout import (
     materialize_scratch_strided_view,
     materialize_scratch_view,
 )
-from b12x._lib.scratch import (
-    ScratchBufferSpec,
-    scratch_buffer_spec,
-    scratch_tensor,
-)
 from b12x.attention._shared.mla.traits import ModelType
+from b12x.attention._shared.workspace import (
+    _split_output_buffer_from_tmp,
+    _split_tmp_output_stride,
+)
+from b12x.policy import PolicyContext, get_auto_policy
+
+from ._policy import SPARSE_MLA_POLICY, SparseMlaQuery
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -501,6 +504,7 @@ class B12XSparseMLAScratchPlan:
     caps: B12XSparseMLAScratchCaps
     layout: _B12XSparseMLAScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -538,7 +542,31 @@ class B12XSparseMLAScratchPlan:
 
 def plan_sparse_mla_scratch(
     caps: B12XSparseMLAScratchCaps,
+    *,
+    policy: PolicyContext | None = None,
 ) -> B12XSparseMLAScratchPlan:
+    if not isinstance(caps, B12XSparseMLAScratchCaps):
+        raise TypeError("caps must be B12XSparseMLAScratchCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        SPARSE_MLA_POLICY,
+        SparseMlaQuery(
+            mode=caps.mode,
+            dtype=str(caps.dtype).removeprefix("torch."),
+            kv_dtype=str(caps.kv_dtype).removeprefix("torch."),
+            num_q_heads=caps.num_q_heads,
+            qk_head_dim=caps.head_dim,
+            v_head_dim=caps.v_head_dim,
+            max_q_rows=caps.max_q_rows,
+            max_width=caps.max_width,
+            page_size=caps.page_size,
+            model_type=caps.model_type,
+            head_major_output=caps.head_major_output,
+        ),
+    )
     layout = _sparse_mla_scratch_layout(caps)
     return B12XSparseMLAScratchPlan(
         caps=caps,
@@ -550,6 +578,7 @@ def plan_sparse_mla_scratch(
                 device=caps.device,
             ),
         ),
+        policy_resolution=resolution,
     )
 
 

@@ -13,12 +13,15 @@ from ._contract import (
     plan,
     run,
 )
+from ._policy import QsaConfig, QsaQuery
 
 __all__ = [
     "CacheRequirements",
     "Caps",
     "Plan",
     "Binding",
+    "QsaConfig",
+    "QsaQuery",
     "cache_requirements",
     "plan",
     "bind",

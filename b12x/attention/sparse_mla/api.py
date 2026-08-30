@@ -26,6 +26,7 @@ from .._shared.mla.kv_cache import (
 from ._scratch import (
     B12XSparseMLABinding as Binding,
 )
+from ._policy import SparseMlaConfig, SparseMlaQuery
 from ._scratch import (
     B12XSparseMLAScratch as Scratch,
 )
@@ -63,6 +64,8 @@ __all__ = [
     "Scratch",
     "DecodeMetadata",
     "ExtendMetadata",
+    "SparseMlaConfig",
+    "SparseMlaQuery",
     "plan",
     "bind",
     "run_decode",
