@@ -383,6 +383,7 @@ def test_vllm_compat_prepares_finalized_mcg_trellis_tensors() -> None:
     assert experts.source_format == "b12x_trellis"
     assert experts.representation is not None
     assert experts.representation.layout.value == "trellis_native"
+    assert experts.representation.value.params_dtype == torch.float16
     assert experts.w1_fp4.untyped_storage().data_ptr() == w13.untyped_storage().data_ptr()
     assert experts.w2_fp4.untyped_storage().data_ptr() == w2.untyped_storage().data_ptr()
 

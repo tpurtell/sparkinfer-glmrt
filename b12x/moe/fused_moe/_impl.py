@@ -5505,7 +5505,10 @@ def prepare_b12x_fp4_moe_weights(
             activation=plan.activation,
             fc1_tile_n=tile_config[1],
             fc2_tile_n=tile_config[3],
-            params_dtype=params_dtype,
+            # Full-rotation Trellis keeps its rotation tables and internal
+            # scratch in FP16 even when the public activation/output contract
+            # is BF16. This mirrors the BTX preparation path below.
+            params_dtype=torch.float16,
             w13_layout="trellis_t256_proj",
             trellis_bits=plan.trellis_bits,
             dummy_scale=dummy_scale,
