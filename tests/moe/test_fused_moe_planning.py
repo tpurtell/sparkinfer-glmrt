@@ -327,6 +327,66 @@ def test_canonical_trellis_preparation_uses_the_typed_source() -> None:
     assert experts.intermediate_size == 256
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vllm_compat_prepares_finalized_mcg_trellis_tensors() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_experts, hidden_size, intermediate_size, bits = 2, 128, 128, 4
+    plan = fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="b12x_trellis",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        trellis_bits=bits,
+        trellis_codebook="mcg",
+        trellis_tile_config=(64, 128, 64, 128),
+    )
+    w13 = torch.zeros(
+        (
+            2,
+            num_experts,
+            hidden_size // 16,
+            intermediate_size // 16,
+            16 * bits,
+        ),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.zeros(
+        (
+            num_experts,
+            intermediate_size // 16,
+            hidden_size // 16,
+            16 * bits,
+        ),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    def ones(*shape: int) -> torch.Tensor:
+        return torch.ones(shape, dtype=torch.float16, device=device)
+
+    experts = fused_moe.prepare_weights(
+        plan=plan,
+        params_dtype=torch.bfloat16,
+        w1_fp4=w13,
+        w2_fp4=w2,
+        gate_suh=ones(num_experts, hidden_size),
+        up_suh=ones(num_experts, hidden_size),
+        intermediate_rotations=ones(num_experts, 3 * intermediate_size),
+        down_svh=ones(num_experts, hidden_size),
+        trellis_mcg=0xCBAC1FED,
+    )
+
+    assert experts.source_format == "b12x_trellis"
+    assert experts.representation is not None
+    assert experts.representation.layout.value == "trellis_native"
+    assert experts.w1_fp4.untyped_storage().data_ptr() == w13.untyped_storage().data_ptr()
+    assert experts.w2_fp4.untyped_storage().data_ptr() == w2.untyped_storage().data_ptr()
+
+
 def test_runtime_rejects_unimplemented_orthogonal_trellis_combination() -> None:
     value = _k3_config().to_dict()
     value["codebook"] = "mcg"

@@ -5456,6 +5456,11 @@ def prepare_b12x_fp4_moe_weights(
     btx_layer: object | None = None,
     btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
+    gate_suh: torch.Tensor | None = None,
+    up_suh: torch.Tensor | None = None,
+    intermediate_rotations: torch.Tensor | None = None,
+    down_svh: torch.Tensor | None = None,
+    trellis_mcg: int | None = None,
 ) -> B12XFP4ExpertWeights:
     """Transfer source tensors into the planner-selected runtime owner."""
 
@@ -5465,6 +5470,69 @@ def prepare_b12x_fp4_moe_weights(
     if actual_dtype != plan.io_dtype:
         raise ValueError(
             f"params_dtype={actual_dtype!r} does not match plan dtype={plan.io_dtype!r}"
+        )
+    if plan.source_format == "b12x_trellis":
+        from b12x.moe._shared.kernels.w4a16.prepare import (
+            prepare_trellis256_moe_weights,
+        )
+
+        if w1_fp4 is None or w2_fp4 is None:
+            raise ValueError(
+                "b12x_trellis preparation requires both w1_fp4 and w2_fp4"
+            )
+        rotations = {
+            "gate_suh": gate_suh,
+            "up_suh": up_suh,
+            "intermediate_rotations": intermediate_rotations,
+            "down_svh": down_svh,
+        }
+        missing = sorted(name for name, value in rotations.items() if value is None)
+        if missing:
+            raise ValueError(
+                "b12x_trellis preparation is missing: " + ", ".join(missing)
+            )
+        if plan.trellis_codebook != "mcg" or trellis_mcg != 0xCBAC1FED:
+            raise ValueError(
+                "b12x_trellis MCG preparation requires trellis_mcg=0xCBAC1FED"
+            )
+        tile_config = plan.trellis_tile_config or (64, 256, 64, 256)
+        value = prepare_trellis256_moe_weights(
+            w13=w1_fp4,
+            w2=w2_fp4,
+            hidden_size=plan.hidden_size,
+            intermediate_size=plan.intermediate_size,
+            num_experts=plan.num_experts,
+            activation=plan.activation,
+            fc1_tile_n=tile_config[1],
+            fc2_tile_n=tile_config[3],
+            params_dtype=params_dtype,
+            w13_layout="trellis_t256_proj",
+            trellis_bits=plan.trellis_bits,
+            dummy_scale=dummy_scale,
+            codebook=plan.trellis_codebook,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate_rotations,
+            down_svh=down_svh,
+            tile_config=tile_config,
+        )
+        representation = _PreparedWeightRepresentation(
+            quant_mode="w4a16",
+            layout=PreparedWeightLayout.TRELLIS_NATIVE,
+            value=value,
+        )
+        input_scale = torch.ones((), dtype=torch.float32, device=value.w13.device)
+        return B12XFP4ExpertWeights(
+            plan=plan,
+            a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
+            w1_fp4=value.w13,
+            w1_blockscale=value.w13_scale,
+            w1_alphas=value.w13_global_scale,
+            a2_gscale=a2_gscale if a2_gscale is not None else input_scale,
+            w2_fp4=value.w2,
+            w2_blockscale=value.w2_scale,
+            w2_alphas=value.w2_global_scale,
+            representation=representation,
         )
     if plan.source_format == "btx":
         from b12x.moe._shared.kernels.w4a16.btx import (

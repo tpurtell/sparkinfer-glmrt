@@ -80,6 +80,11 @@ def prepare_weights(
     btx_layer: object | None = None,
     btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
+    gate_suh: torch.Tensor | None = None,
+    up_suh: torch.Tensor | None = None,
+    intermediate_rotations: torch.Tensor | None = None,
+    down_svh: torch.Tensor | None = None,
+    trellis_mcg: int | None = None,
 ) -> ExpertWeights:
     return prepare_b12x_fp4_moe_weights(
         plan=plan,
@@ -95,6 +100,11 @@ def prepare_weights(
         btx_layer=btx_layer,
         btx_device=btx_device,
         dummy_scale=dummy_scale,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
+        trellis_mcg=trellis_mcg,
     )
 
 

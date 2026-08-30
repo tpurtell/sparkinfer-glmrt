@@ -155,6 +155,11 @@ def prepare_weights(
     btx_layer: object | None = None,
     btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
+    gate_suh: torch.Tensor | None = None,
+    up_suh: torch.Tensor | None = None,
+    intermediate_rotations: torch.Tensor | None = None,
+    down_svh: torch.Tensor | None = None,
+    trellis_mcg: int | None = None,
 ) -> ExpertWeights: ...
 
 
@@ -176,6 +181,11 @@ def prepare_weights(**kwargs: Any) -> PreparedExperts | ExpertWeights:
             "btx_layer",
             "btx_device",
             "dummy_scale",
+            "gate_suh",
+            "up_suh",
+            "intermediate_rotations",
+            "down_svh",
+            "trellis_mcg",
         }
         mixed = sorted(legacy.intersection(kwargs))
         if mixed:
