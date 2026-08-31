@@ -16,6 +16,9 @@ from b12x.moe._shared.kernels.activations import (
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
+# Expert-mapped BF16 decode keeps direct top-k routing through this token count.
+# Scratch owners use the same bound to remain allocation-free under graph capture.
+W4A16_MAPPED_DIRECT_MAX_TOKENS = 8
 
 
 @dataclass(frozen=True)

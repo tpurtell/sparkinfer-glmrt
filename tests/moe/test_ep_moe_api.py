@@ -5,6 +5,7 @@ import torch
 
 import b12x.moe.ep_moe._impl as ep_moe
 from b12x._lib.intrinsics import swizzle_block_scale
+from b12x.moe import fused_moe
 from b12x.moe.ep_moe._impl import (
     EPMoEScratchCaps,
     plan_ep_moe_scratch,
@@ -30,6 +31,21 @@ def _weight_plan(*, local_experts: int = 4, dtype: torch.dtype = torch.bfloat16)
         hidden_size=128,
         intermediate_size=128,
         w13_layout="w13",
+    )
+
+
+def _trellis_weight_plan(*, local_experts: int = 4):
+    return fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="b12x_trellis",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=local_experts,
+        hidden_size=128,
+        intermediate_size=128,
+        trellis_bits=3,
+        trellis_codebook="mcg",
+        trellis_tile_config=(64, 128, 64, 128),
     )
 
 
@@ -175,6 +191,30 @@ def test_ep_scratch_reserves_route_pack_power_of_two_capacity(
     assert layout["intermediate_cache2"].elements == 3 * 2 * 128
 
 
+def test_ep_trellis_scratch_owns_full_rotation_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ep_moe, "get_num_sm", lambda _device: 120)
+    max_tokens, topk, hidden_size = 3, 2, 128
+    plan = plan_ep_moe_scratch(
+        EPMoEScratchCaps(
+            max_tokens=max_tokens,
+            num_topk=topk,
+            global_num_experts=8,
+            device="cpu",
+            weight_plan=_trellis_weight_plan(local_experts=4),
+        )
+    )
+
+    layout = {spec.name: spec for spec in plan._layout}
+    routed_rows = max_tokens * topk
+    assert layout["intermediate_cache13"].dtype == torch.float16
+    assert layout["intermediate_cache2"].dtype == torch.float16
+    assert layout["rotation_a_gate"].elements == routed_rows * hidden_size
+    assert layout["rotation_a_up"].elements == routed_rows * hidden_size
+    assert layout["kernel_workspace"].elements == 120 * 4 + 2
+
+
 def test_ep_contract_requires_w4a16_bf16() -> None:
     with pytest.raises(TypeError, match="BF16"):
         EPMoEScratchCaps(
@@ -246,6 +286,34 @@ def _prepare_experts(
         w2_alphas=w2_alpha.index_select(0, selected).clone(),
         activation="silu",
         quant_mode="w4a16",
+    )
+
+
+def _prepare_trellis_experts(
+    *,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    expert_ids: torch.Tensor,
+):
+    selected = expert_ids.to(device=w13.device, dtype=torch.long)
+    local_e = int(selected.numel())
+    hidden_size = int(w13.shape[2]) * 16
+    intermediate_size = int(w13.shape[3]) * 16
+
+    def ones(*shape: int) -> torch.Tensor:
+        return torch.ones(shape, dtype=torch.float16, device=w13.device)
+
+    plan = _trellis_weight_plan(local_experts=local_e)
+    return fused_moe.prepare_weights(
+        plan=plan,
+        params_dtype=torch.bfloat16,
+        w1_fp4=w13.index_select(1, selected).clone(),
+        w2_fp4=w2.index_select(0, selected).clone(),
+        gate_suh=ones(local_e, hidden_size),
+        up_suh=ones(local_e, hidden_size),
+        intermediate_rotations=ones(local_e, 3 * intermediate_size),
+        down_svh=ones(local_e, hidden_size),
+        trellis_mcg=0xCBAC1FED,
     )
 
 
@@ -359,6 +427,107 @@ def test_ep_rank_partials_sum_to_full_w4a16_moe() -> None:
     )
     assert float(cosine.item()) > 0.999
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ep_trellis_partials_sum_to_full_moe() -> None:
+    """BF16 EP must execute the FP16-internal full-rotation Trellis payload."""
+
+    torch.manual_seed(20260902)
+    global_e, hidden_size, intermediate_size, bits = 4, 128, 128, 3
+    m, topk = 8, 2
+    device = torch.device("cuda", torch.cuda.current_device())
+    a = (torch.randn(m, hidden_size, device=device) * 0.25).to(torch.bfloat16)
+    w13 = torch.randint(
+        -32768,
+        32768,
+        (
+            2,
+            global_e,
+            hidden_size // 16,
+            intermediate_size // 16,
+            16 * bits,
+        ),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.randint(
+        -32768,
+        32768,
+        (
+            global_e,
+            intermediate_size // 16,
+            hidden_size // 16,
+            16 * bits,
+        ),
+        dtype=torch.int16,
+        device=device,
+    )
+    topk_ids = torch.randint(0, global_e, (m, topk), dtype=torch.int32, device=device)
+    topk_weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1)
+
+    global_experts = _prepare_trellis_experts(
+        w13=w13,
+        w2=w2,
+        expert_ids=torch.arange(global_e),
+    )
+    expected = run_tp_moe_fp4(
+        a=a,
+        experts=global_experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=None,
+        quant_mode="w4a16",
+    )
+
+    partials = []
+    for rank in range(2):
+        global_ids = torch.arange(rank, global_e, 2)
+        local_experts = _prepare_trellis_experts(
+            w13=w13,
+            w2=w2,
+            expert_ids=global_ids,
+        )
+        expert_map = torch.full((global_e,), -1, dtype=torch.int32, device=device)
+        expert_map[global_ids.to(device=device)] = torch.arange(
+            global_ids.numel(), dtype=torch.int32, device=device
+        )
+        partial, binding = _run_ep_rank(
+            a=a,
+            experts=local_experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+        )
+        assert binding.full_rotation
+        partials.append(partial.clone())
+
+    actual = partials[0] + partials[1]
+    torch.cuda.synchronize()
+    assert torch.isfinite(expected).all()
+    assert torch.isfinite(actual).all()
+    assert int(torch.count_nonzero(expected).item()) > 0
+    assert int(torch.count_nonzero(actual).item()) > 0
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), expected.float().flatten(), dim=0
+    )
+    assert float(cosine.item()) > 0.999
+    # EP rounds each rank-local partial to BF16 before vLLM's all-reduce;
+    # the full TP reference accumulates every route in FP32 before one cast.
+    torch.testing.assert_close(actual.float(), expected, rtol=0.2, atol=0.3)
+
+    binding.run()
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        binding.run()
+    topk_ids.copy_((topk_ids + 1) % global_e)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = binding.output.clone()
+    binding.run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replayed, binding.output, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

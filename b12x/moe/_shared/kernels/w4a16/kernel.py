@@ -102,6 +102,7 @@ from b12x.moe._shared.kernels.w4a16.route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )
 from b12x.moe._shared.kernels.w4a16.host import (
+    W4A16_MAPPED_DIRECT_MAX_TOKENS,
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
@@ -188,7 +189,7 @@ _SCALE_FORMATS = {
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
 _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
-_W4A16_SMALL_M_DIRECT_MAX_M = 8
+_W4A16_SMALL_M_DIRECT_MAX_M = W4A16_MAPPED_DIRECT_MAX_TOKENS
 _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
 _TC_DECODE_PACK_COLLIDING_PAIRS = 3
 _TC_DECODE_PACK_SM_COVERAGE_CAP = 64
