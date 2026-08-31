@@ -51,6 +51,40 @@ def test_prepare_ep_expert_map_accepts_linear_and_round_robin_placement() -> Non
     assert round_robin.local_num_experts == 3
 
 
+@pytest.mark.parametrize("placement", ["linear", "round_robin"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_glm_288_experts_map_exactly_to_144_local_slots(
+    placement: str,
+    rank: int,
+) -> None:
+    """Exercise GLM's real EP2 geometry, including local slots 127/128/143."""
+
+    global_experts = 288
+    local_experts = 144
+    expert_map = torch.full((global_experts,), -1, dtype=torch.int32)
+    if placement == "linear":
+        global_ids = torch.arange(rank * local_experts, (rank + 1) * local_experts)
+    else:
+        global_ids = torch.arange(rank, global_experts, 2)
+    expert_map[global_ids] = torch.arange(local_experts, dtype=torch.int32)
+
+    prepared = prepare_ep_expert_map(
+        expert_map,
+        local_num_experts=local_experts,
+        global_num_experts=global_experts,
+    )
+
+    assert prepared.tensor[global_ids[0]].item() == 0
+    assert prepared.tensor[global_ids[127]].item() == 127
+    assert prepared.tensor[global_ids[128]].item() == 128
+    assert prepared.tensor[global_ids[143]].item() == 143
+    if placement == "linear":
+        nonlocal_id = local_experts if rank == 0 else 0
+    else:
+        nonlocal_id = 1 - rank
+    assert prepared.tensor[nonlocal_id].item() == -1
+
+
 @pytest.mark.parametrize(
     ("values", "local_experts", "match"),
     [

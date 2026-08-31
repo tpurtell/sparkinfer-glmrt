@@ -159,3 +159,51 @@ def test_binding_replays_with_changed_routes_under_cuda_graph() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(replayed, binding.output, rtol=0, atol=0)
+
+
+def test_repeated_local_routes_preserve_weights_and_order() -> None:
+    require_b12x()
+    torch.manual_seed(20260901)
+
+    global_e, hidden_size, intermediate_size = 4, 128, 128
+    m, topk = 8, 2
+    a = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    weights = make_modelopt_weights(
+        experts=global_e,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    topk_ids = (
+        torch.tensor([[2, 2]], dtype=torch.int32, device="cuda")
+        .expand(m, -1)
+        .contiguous()
+    )
+    topk_weights = (
+        torch.tensor([[0.25, 0.75]], dtype=torch.float32, device="cuda")
+        .expand(m, -1)
+        .contiguous()
+    )
+
+    global_experts = prepare_experts(a, weights, torch.arange(global_e))
+    expected = run_tp_moe_fp4(
+        a=a,
+        experts=global_experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=torch.empty_like(a),
+        quant_mode="w4a16",
+    )
+    local_global_ids = torch.tensor([0, 2])
+    local_experts = prepare_experts(a, weights, local_global_ids)
+    expert_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32, device="cuda")
+    actual, _ = _run_ep_rank(
+        a=a,
+        experts=local_experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        expert_map=expert_map,
+    )
+
+    torch.cuda.synchronize()
+    assert int(torch.count_nonzero(actual).item()) > 0
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
