@@ -687,6 +687,58 @@ def test_trellis_scratch_plan_can_own_bf16_epilogue_output(
     assert output_spec.dtype == torch.bfloat16
 
 
+def test_full_rotation_binds_bf16_input_to_fp16_prepared_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_plan_full_rotation_w4a16_launches",
+        lambda **_kwargs: ((), ()),
+    )
+    weight_plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.float16,
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        trellis_bits=2,
+        trellis_codebook="mcg",
+        trellis_tile_config=(64, 128, 64, 128),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=4,
+            core_token_counts=(4,),
+            num_topk=2,
+            route_num_experts=0,
+            device="cpu",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=8,
+            full_rotation_output_dtype=torch.bfloat16,
+        )
+    )
+    tensors = _runtime_tensors(m=3, n=128)
+    payload = SimpleNamespace(
+        params_dtype=torch.float16,
+        weight_layout="trellis_t256",
+        scale_format="e4m3_k32",
+    )
+    experts = _experts(tensors, weight_plan, payload)
+
+    binding = plan.bind(
+        scratch=_scratch_for_plan(plan),
+        **_binding_args(tensors, experts),
+    )
+
+    assert binding.a.dtype == torch.bfloat16
+    assert experts.plan.io_dtype == "float16"
+    assert binding.output.dtype == torch.bfloat16
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""

@@ -2854,7 +2854,10 @@ def _build_tp_moe_fp4_binding_from_views(
         source_format=source_format,
         activation=activation,
         w13_layout=w13_layout,
-        dtype=a.dtype,
+        # Full-rotation Trellis accepts BF16 or FP16 activations, but its
+        # prepared weights and internal GEMM scratch are always FP16.  Keep
+        # that weight-side contract separate from the live activation dtype.
+        dtype=torch.float16 if plan.full_rotation else a.dtype,
         hidden_size=k,
     )
     num_topk = int(topk_ids.shape[1])
