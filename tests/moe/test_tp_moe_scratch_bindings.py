@@ -729,6 +729,15 @@ def test_full_rotation_binds_bf16_input_to_fp16_prepared_weights(
     )
     experts = _experts(tensors, weight_plan, payload)
 
+    assert (
+        tp_moe_impl._prepared_dtype_for_runtime(
+            experts,
+            quant_mode="w4a16",
+            activation_dtype=torch.bfloat16,
+        )
+        == torch.float16
+    )
+
     binding = plan.bind(
         scratch=_scratch_for_plan(plan),
         **_binding_args(tensors, experts),

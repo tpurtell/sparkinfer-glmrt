@@ -640,6 +640,23 @@ def _prepared_payload_for_runtime(
     return experts.representation_for(quant_mode)
 
 
+def _prepared_dtype_for_runtime(
+    experts: B12XFP4ExpertWeights,
+    *,
+    quant_mode: str,
+    activation_dtype: torch.dtype,
+) -> torch.dtype:
+    """Return the weight-side dtype independently of live activations."""
+
+    prepared = experts.representation_for(quant_mode)
+    if (
+        str(quant_mode).lower() == "w4a16"
+        and getattr(prepared, "weight_layout", "") == "trellis_t256"
+    ):
+        return torch.float16
+    return activation_dtype
+
+
 def _select_prepared_quant_mode(
     experts: B12XFP4ExpertWeights,
     requested: str | None,
@@ -2854,10 +2871,11 @@ def _build_tp_moe_fp4_binding_from_views(
         source_format=source_format,
         activation=activation,
         w13_layout=w13_layout,
-        # Full-rotation Trellis accepts BF16 or FP16 activations, but its
-        # prepared weights and internal GEMM scratch are always FP16.  Keep
-        # that weight-side contract separate from the live activation dtype.
-        dtype=torch.float16 if plan.full_rotation else a.dtype,
+        dtype=_prepared_dtype_for_runtime(
+            experts,
+            quant_mode=quant_mode,
+            activation_dtype=a.dtype,
+        ),
         hidden_size=k,
     )
     num_topk = int(topk_ids.shape[1])
@@ -12661,13 +12679,18 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
     num_topk = topk_ids.shape[1]
     m, k = a.shape
+    prepared_contract_dtype = _prepared_dtype_for_runtime(
+        experts,
+        quant_mode=quant_mode,
+        activation_dtype=a.dtype,
+    )
     prepared_payload = _prepared_payload_for_runtime(
         experts,
         quant_mode=quant_mode,
         source_format=source_format,
         activation=activation,
         w13_layout=w13_layout,
-        dtype=a.dtype,
+        dtype=prepared_contract_dtype,
         hidden_size=k,
     )
     device = a.device
@@ -12677,10 +12700,10 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             f"prepared hidden_size mismatch: expected {k}, got {prepared_hidden}"
         )
     prepared_dtype = experts.plan.io_dtype
-    if prepared_dtype != str(a.dtype).removeprefix("torch."):
+    if prepared_dtype != str(prepared_contract_dtype).removeprefix("torch."):
         raise TypeError(
-            f"prepared weights were built for {prepared_dtype}, but a has "
-            f"dtype {a.dtype}"
+            f"prepared weights were built for {prepared_dtype}, but runtime "
+            f"requires {prepared_contract_dtype} for input dtype {a.dtype}"
         )
     weight_E = experts.num_experts
     n = experts.intermediate_size
