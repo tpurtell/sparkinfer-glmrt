@@ -27,6 +27,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     W4A16MixedTrellisKernel,
     _check_descriptor_projection_counts,
     _mixed_route_num_experts,
+    _normalize_mixed_trellis_format,
     _require_capture_safe_descriptor_metadata,
     _validate_mixed_trellis_tier_storage,
     bind_mixed_trellis,
@@ -404,10 +405,15 @@ def _serial_tier(
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
-def test_mixed_k3_k4_matches_serial_and_captures(
+@pytest.mark.parametrize(
+    "codebook,bits", [("mcg", (2, 3)), ("mcg", (3, 4)), ("sqg_e4m3", (2, 3))]
+)
+@pytest.mark.parametrize("direct_topk_routes", [False, True])
+def test_mixed_two_tier_matches_serial_and_captures(
     route_ids_dtype: torch.dtype,
     codebook: str,
+    bits: tuple[int, int],
+    direct_topk_routes: bool,
 ) -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -416,7 +422,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         experts=2,
         hidden=hidden,
         intermediate=intermediate,
-        bits=3,
+        bits=bits[0],
         seed=301,
         device=device,
         codebook=codebook,
@@ -425,13 +431,13 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         experts=2,
         hidden=hidden,
         intermediate=intermediate,
-        bits=4,
+        bits=bits[1],
         seed=401,
         device=device,
         codebook=codebook,
     )
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
-    # Global expert ids deliberately interleave K3 and K4 tiers. The combined
+    # Global expert ids deliberately interleave the two bitrate tiers. The combined
     # namespace remains tier ordered so weight and rotation tables stay dense.
     topk_ids = torch.tensor([[0, 1], [3, 2]], dtype=route_ids_dtype, device=device)
     topk_weights = torch.tensor(
@@ -454,10 +460,18 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         max_m_blocks=8,
         sms=int(props.multi_processor_count),
         max_shared_mem=int(props.shared_memory_per_block_optin),
-        force_tile_config=(128, 128, 128, 128),
+        force_tile_config=(
+            (64, 128, 64, 128)
+            if direct_topk_routes
+            else (128, 128, 128, 128)
+        ),
         route_ids_dtype=route_ids_dtype,
         trellis_codebook=codebook,
+        tier0_bits=bits[0],
+        tier1_bits=bits[1],
+        direct_topk_routes=direct_topk_routes,
     )
+    assert launch.direct_topk_routes is direct_topk_routes
     global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
     rotations = combine_trellis_rotations(tier0, tier1)
     buffers = make_mixed_trellis_buffers(
@@ -815,14 +829,33 @@ def test_mixed_k3_k4_k5_partition_reuses_one_compiled_object() -> None:
 
 
 @pytest.mark.parametrize(
-    ("codebook", "bits", "message"),
+    ("codebook", "bits"),
     [
-        ("sqg_xor_cheb_t12", (3, 4, 5), "only the MCG codebook"),
-        ("mcg", (3, 4, 6), "one K3, one K4, and one K5 tier"),
-        ("mcg", (3, 3, 5), "one K3, one K4, and one K5 tier"),
+        ("mcg", (2, 3)),
+        ("mcg", (2, 4, 6)),
+        ("sqg_e4m3", (2, 3, 4)),
+        ("sqg_fp16", (5, 6)),
     ],
 )
-def test_compile_mixed_trellis3_rejects_unqualified_formats(
+def test_mixed_trellis_format_accepts_every_legal_bounded_family(
+    codebook: str,
+    bits: tuple[int, ...],
+) -> None:
+    normalized, actual = _normalize_mixed_trellis_format(codebook, bits)
+    assert actual == bits
+    assert normalized == codebook
+
+
+@pytest.mark.parametrize(
+    ("codebook", "bits", "message"),
+    [
+        ("sqg_xor_cheb_t12", (3, 4, 5), "unsupported trellis codebook"),
+        ("mcg", (3, 3, 5), "tiers must be distinct"),
+        ("mcg", (2, 3, 7), "defined only for K2/K3/K4/K5/K6"),
+        ("sqg_e4m3", (2, 3, 5), "defined only for K2/K3/K4"),
+    ],
+)
+def test_compile_mixed_trellis3_rejects_illegal_formats(
     codebook: str,
     bits: tuple[int, int, int],
     message: str,

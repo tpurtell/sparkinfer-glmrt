@@ -155,11 +155,12 @@ def prepare_weights(
     btx_layer: object | None = None,
     btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
+    projection_tiers: object | None = None,
     gate_suh: torch.Tensor | None = None,
     up_suh: torch.Tensor | None = None,
     intermediate_rotations: torch.Tensor | None = None,
     down_svh: torch.Tensor | None = None,
-    trellis_mcg: int | None = None,
+    trellis_mcg: torch.Tensor | int | None = None,
 ) -> ExpertWeights: ...
 
 

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import b12x.moe.fused_moe._impl as fused_moe_impl
+import b12x.moe.fused_moe.trellis as trellis_impl
 from b12x.moe import fused_moe
 from b12x.policy import (
     DeviceIdentity,
@@ -78,6 +79,32 @@ def _trellis_caps() -> fused_moe.Caps:
         weight_plan=weight_plan,
         quant_mode="w4a16",
         w4a16_block_size_m=64,
+    )
+
+
+def _exl3_projection_caps() -> fused_moe.Caps:
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=512,
+        w13_layout="trellis_t256_proj",
+        w4a16_layout="trellis_native",
+        trellis_bits=2,
+        trellis_tile_config=(128, 128, 128, 128),
+        trellis_codebook="mcg",
+        trellis_rate_granularity="per_expert_projection",
+    )
+    return fused_moe.Caps(
+        max_tokens=16,
+        num_topk=6,
+        route_num_experts=256,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a16",
     )
 
 
@@ -524,6 +551,98 @@ def test_projection_mixed_config_selects_fixed_mixed_workspace(
     assert specs["rotation_a_up"].shape == (3072 * 8, 6144)
     assert specs["full_rotation_output"].shape == (3072, 6144)
     assert specs["kernel_workspace"].init == "zeros"
+
+
+def test_direct_exl3_projection_plan_preserves_k2_tier_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+    plan = fused_moe.plan(_exl3_projection_caps())
+
+    assert plan.caps.source_format == "exl3_trellis_mcg"
+    assert plan._core_workspace_plan.implementation == "trellis_mixed"
+    assert plan._core_workspace_plan.trellis_bits == 2
+    assert plan._core_workspace_plan.projection_mixed_trellis
+
+
+@pytest.mark.parametrize(
+    ("capacity", "expected"),
+    (
+        (1, (1,)),
+        (4, (1, 2, 3, 4)),
+        (32, tuple(range(1, 33))),
+        (33, (33,)),
+        (4096, (4096,)),
+    ),
+)
+def test_trellis_exact_launch_widths_cover_decode_only(
+    capacity: int, expected: tuple[int, ...]
+) -> None:
+    assert fused_moe_impl._trellis_exact_launch_token_counts(capacity) == expected
+
+
+@pytest.mark.parametrize(
+    ("tokens", "top_k", "direct_exl3", "expected"),
+    (
+        (1, 6, True, True),
+        (12, 6, True, True),
+        (13, 6, True, False),
+        (9, 8, True, True),
+        (10, 8, True, False),
+        (12, 6, False, False),
+    ),
+)
+def test_projection_mixed_direct_route_limit_is_bounded(
+    tokens: int,
+    top_k: int,
+    direct_exl3: bool,
+    expected: bool,
+) -> None:
+    assert (
+        fused_moe_impl._projection_mixed_direct_topk_routes(
+            tokens,
+            top_k,
+            direct_exl3=direct_exl3,
+        )
+        is expected
+    )
+
+
+def test_projection_mixed_tile_config_preserves_decode_and_widens_packed_fc1() -> None:
+    configured = (64, 256, 64, 128)
+
+    assert fused_moe_impl._projection_mixed_tile_config(
+        configured,
+        direct_topk_routes=True,
+    ) == configured
+    assert fused_moe_impl._projection_mixed_tile_config(
+        configured,
+        direct_topk_routes=False,
+    ) == (128, 256, 64, 128)
+
+
+def test_projection_mixed_bind_zeroes_cooperative_workspace_before_launch() -> None:
+    source = inspect.getsource(
+        fused_moe_impl._bind_projection_mixed_trellis_from_views
+    )
+
+    zero = source.index('tensors["kernel_workspace"].zero_()')
+    buffers = source.index("buffers = MixedTrellisBuffers(")
+    assert zero < buffers
+
+
+def test_empty_projection_tier_uses_one_dummy_plane() -> None:
+    value = trellis_impl._projection_native(
+        torch.empty((4, 1), dtype=torch.uint8),
+        experts=[],
+        projection=0,
+        bits=2,
+        offsets=[],
+        hidden_size=128,
+        fc1=True,
+    )
+
+    assert value.shape == (1, 8, 4, 32)
 
 
 @pytest.mark.parametrize(

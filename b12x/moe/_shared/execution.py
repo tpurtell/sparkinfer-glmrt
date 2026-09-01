@@ -161,10 +161,13 @@ _SOURCE_FORMATS = {
     "fp4_e8m0_k32",
     "compressed_tensors",
     "mxfp6_e2m3",
+    "exl3_trellis_mcg",
     "b12x_trellis",
     "btx",
 }
-_TRELLIS_SOURCE_FORMATS = frozenset({"b12x_trellis", "btx"})
+_TRELLIS_SOURCE_FORMATS = frozenset(
+    {"exl3_trellis_mcg", "b12x_trellis", "btx"}
+)
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
@@ -175,6 +178,7 @@ _SOURCES_BY_QUANT_MODE = {
             "modelopt_nvfp4",
             "fp4_e8m0_k32",
             "compressed_tensors",
+            "exl3_trellis_mcg",
             "b12x_trellis",
             "btx",
         }
@@ -329,8 +333,6 @@ class MoEWeightPreparationPlan:
                     f"{self.trellis_codebook!r}"
                 )
             _validate_trellis_codebook_bits(codebook, bits)
-            if codebook == "mcg" and bits == 2:
-                raise ValueError("MCG Trellis weights require trellis_bits>=3")
             object.__setattr__(self, "trellis_codebook", codebook)
             tile_config = self.trellis_tile_config or (64, 256, 64, 256)
             tile_config = tuple(int(value) for value in tile_config)

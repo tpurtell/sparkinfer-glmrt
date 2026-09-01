@@ -7483,6 +7483,10 @@ class W4A16FusedMoeKernel:
                 b0, b1, b2, b3 = self._load_coupled_pre_quad(
                     fc1_flat, rotations_flat, row, expert, p0 + Int32(1), lane
                 )
+                a0, a1 = self._clamp_swiglu_inputs(a0, a1)
+                a2, a3 = self._clamp_swiglu_inputs(a2, a3)
+                b0, b1 = self._clamp_swiglu_inputs(b0, b1)
+                b2, b3 = self._clamp_swiglu_inputs(b2, b3)
                 if cutlass.const_expr(self.activation_is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
                     linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
@@ -7643,6 +7647,10 @@ class W4A16FusedMoeKernel:
                 iu1 = uh1 * svu1
                 iu2 = uh2 * svu2
                 iu3 = uh3 * svu3
+                ig0, iu0 = self._clamp_swiglu_inputs(ig0, iu0)
+                ig1, iu1 = self._clamp_swiglu_inputs(ig1, iu1)
+                ig2, iu2 = self._clamp_swiglu_inputs(ig2, iu2)
+                ig3, iu3 = self._clamp_swiglu_inputs(ig3, iu3)
                 down = isz + isz
                 sd0 = rot_scales_flat[s_base + down + Int32(0)].to(cutlass.Float32)
                 sd1 = rot_scales_flat[s_base + down + Int32(1)].to(cutlass.Float32)

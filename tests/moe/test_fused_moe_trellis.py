@@ -102,6 +102,55 @@ def _caps(**overrides) -> fused_moe.Caps:
 def test_fused_moe_metadata_advertises_trellis_input_dtypes() -> None:
     assert {"bf16", "fp16"}.issubset(FUSED_MOE_META.dtypes)
 
+
+def test_weight_plan_accepts_native_mcg_k2_trellis() -> None:
+    plan = _weight_plan(
+        num_experts=256,
+        hidden_size=7168,
+        intermediate_size=768,
+        input_dtype=torch.bfloat16,
+        trellis_bits=2,
+        codebook="mcg",
+    )
+    assert plan.trellis_bits == 2
+    assert plan.trellis_codebook == "mcg"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_prepare_supplied_mcg_k2_tensors_zero_copy() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts, hidden, intermediate, bits = 2, 128, 128, 2
+    w13 = torch.empty(
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.empty(
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    prepared = prepare_trellis256_moe_weights(
+        w13,
+        w2,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        activation="silu",
+        fc1_tile_n=128,
+        fc2_tile_n=128,
+        w13_layout="trellis_t256_proj",
+        trellis_bits=bits,
+        codebook="mcg",
+    )
+
+    assert prepared.trellis_bits == 2
+    assert prepared.trellis_codebook == "mcg"
+    assert prepared.w13.data_ptr() == w13.data_ptr()
+    assert prepared.w2.data_ptr() == w2.data_ptr()
+
+
 def test_rotation_placeholder_must_be_materialized_before_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1205,7 +1254,10 @@ def test_planned_full_rotation_matches_reference_and_captures(
 
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    x = (torch.randn((2, hidden), device=device) * 1.0e-3).to(input_dtype)
+    # Exercise the clamp in the clamped case; the historical tiny input never
+    # drove a reconstructed FC1 value past DeepSeek's limit.
+    input_scale = 1.0 if swiglu_limit is not None else 1.0e-3
+    x = (torch.randn((2, hidden), device=device) * input_scale).to(input_dtype)
     local_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
     global_ids = torch.tensor([[1, 3], [3, 1]], dtype=torch.int64, device=device)
     router_weights = torch.tensor(

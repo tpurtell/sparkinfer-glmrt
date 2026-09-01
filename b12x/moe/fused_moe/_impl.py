@@ -85,7 +85,7 @@ from b12x.moe._shared.execution import (
     _SOURCE_FORMATS as _EXECUTION_SOURCE_FORMATS,
     _TRELLIS_SOURCE_FORMATS as _EXECUTION_TRELLIS_SOURCE_FORMATS,
 )
-from b12x.moe._shared.trellis_codebooks import SQG_E4M3
+from b12x.moe._shared.trellis_codebooks import MCG, SQG_E4M3
 from b12x.moe._shared.tuning import lookup_max_active_clusters
 from b12x.policy import (
     DeviceIdentity,
@@ -790,6 +790,9 @@ class TPMoEScratchCaps:
     w4a16_fast_math: bool = True
     full_rotation_output_dtype: torch.dtype = torch.float32
     policy_context: PolicyContext | None = None
+    mixed_trellis_route_id_dtypes: tuple[torch.dtype, ...] | None = None
+    mixed_trellis_broadcast_suh: tuple[bool, ...] | None = None
+    mixed_trellis_broadcast_svh: tuple[bool, ...] | None = None
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -850,6 +853,23 @@ class TPMoEScratchCaps:
                 "full_rotation_output_dtype must be torch.float32 or torch.bfloat16"
             )
         object.__setattr__(self, "w4a16_fast_math", bool(self.w4a16_fast_math))
+        if self.mixed_trellis_route_id_dtypes is not None:
+            dtypes = tuple(self.mixed_trellis_route_id_dtypes)
+            if not dtypes or len(set(dtypes)) != len(dtypes) or any(
+                dtype not in (torch.int32, torch.int64) for dtype in dtypes
+            ):
+                raise ValueError(
+                    "mixed_trellis_route_id_dtypes must contain unique int32/int64 dtypes"
+                )
+            object.__setattr__(self, "mixed_trellis_route_id_dtypes", dtypes)
+        for name in ("mixed_trellis_broadcast_suh", "mixed_trellis_broadcast_svh"):
+            values = getattr(self, name)
+            if values is None:
+                continue
+            normalized = tuple(bool(value) for value in values)
+            if not normalized or len(set(normalized)) != len(normalized):
+                raise ValueError(f"{name} must contain unique boolean values")
+            object.__setattr__(self, name, normalized)
         object.__setattr__(self, "frozen", bool(self.frozen))
 
     @property
@@ -910,9 +930,9 @@ class TPMoEScratchPlan:
     _prewarmed_topk_sum_launches: tuple[tuple[torch.dtype, bool, object], ...] = field(
         default=(), repr=False
     )
-    _mixed_trellis_launches: tuple[tuple[torch.dtype, bool, bool, object], ...] = field(
-        default=(), repr=False
-    )
+    _mixed_trellis_launches: tuple[
+        tuple[int, torch.dtype, bool, bool, object], ...
+    ] = field(default=(), repr=False)
 
     @property
     def full_rotation(self) -> bool:
@@ -3276,7 +3296,11 @@ def _plan_core_workspace(
                 ),
             )
             return _TPCoreWorkspacePlan(
-                implementation="trellis_mixed3",
+                implementation=(
+                    "trellis_mixed"
+                    if source_format == "exl3_trellis_mcg"
+                    else "trellis_mixed3"
+                ),
                 quant_mode=quant_mode,
                 activation=activation,
                 swiglu_limit=swiglu_limit,
@@ -3296,8 +3320,9 @@ def _plan_core_workspace(
                 deterministic_output=False,
                 full_rotation=True,
                 projection_mixed_trellis=True,
-                trellis_bits=3,
-                trellis_tile_config=(128, 128, 128, 128),
+                trellis_bits=int(trellis_bits),
+                trellis_tile_config=trellis_tile_config
+                or (128, 128, 128, 128),
                 trellis_codebook="mcg",
                 coupled_hadamard=False,
                 route_block_size_m=block_size_m,
@@ -5929,7 +5954,7 @@ def prepare_b12x_fp4_moe_weights(
     up_suh: torch.Tensor | None = None,
     intermediate_rotations: torch.Tensor | None = None,
     down_svh: torch.Tensor | None = None,
-    trellis_mcg: int | None = None,
+    trellis_mcg: torch.Tensor | int | None = None,
 ) -> B12XFP4ExpertWeights:
     """Transfer source tensors into the planner-selected runtime owner."""
 
@@ -6082,6 +6107,109 @@ def prepare_b12x_fp4_moe_weights(
             value=value,
         )
         input_scale = torch.ones((), dtype=torch.float32, device=value.w13.device)
+        return B12XFP4ExpertWeights(
+            plan=plan,
+            a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
+            w1_fp4=value.w13,
+            w1_blockscale=value.w13_scale,
+            w1_alphas=value.w13_global_scale,
+            a2_gscale=a2_gscale if a2_gscale is not None else input_scale,
+            w2_fp4=value.w2,
+            w2_blockscale=value.w2_scale,
+            w2_alphas=value.w2_global_scale,
+            representation=representation,
+        )
+    if plan.source_format == "exl3_trellis_mcg":
+        if plan.trellis_rate_granularity == "per_expert_projection":
+            raise ValueError(
+                "projection-mixed EXL3 preparation requires projection_tiers"
+            )
+        if plan.quant_modes != frozenset({"w4a16"}):
+            raise ValueError("EXL3 Trellis weights support only w4a16")
+        if w1_fp4 is None or w2_fp4 is None:
+            raise ValueError("EXL3 Trellis preparation requires both weight payloads")
+        if trellis_mcg is None:
+            raise ValueError(
+                "EXL3 Trellis preparation requires the checkpoint MCG marker"
+            )
+        marker = (
+            int(trellis_mcg.item())
+            if isinstance(trellis_mcg, torch.Tensor)
+            else int(trellis_mcg)
+        ) & 0xFFFFFFFF
+        if marker != 0xCBAC1FED:
+            raise ValueError(
+                f"unexpected EXL3 MCG marker {marker:#010x}; expected 0xcbac1fed"
+            )
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (gate_suh, up_suh, intermediate_rotations, down_svh)
+        ):
+            raise ValueError(
+                "EXL3 Trellis preparation requires gate/up/intermediate/down rotations"
+            )
+        assert gate_suh is not None and up_suh is not None
+        assert intermediate_rotations is not None and down_svh is not None
+        h_side_shapes = (
+            (plan.num_experts, plan.hidden_size),
+            (1, plan.hidden_size),
+        )
+        for name, tensor, shapes in (
+            ("gate_suh", gate_suh, h_side_shapes),
+            ("up_suh", up_suh, h_side_shapes),
+            (
+                "intermediate_rotations",
+                intermediate_rotations,
+                ((plan.num_experts, 3 * plan.intermediate_size),),
+            ),
+            ("down_svh", down_svh, h_side_shapes),
+        ):
+            if tensor.dtype != torch.float16:
+                raise TypeError(f"{name} must be torch.float16, got {tensor.dtype}")
+            if tuple(tensor.shape) not in shapes:
+                raise ValueError(
+                    f"{name} must have shape {shapes}, got {tuple(tensor.shape)}"
+                )
+            if tensor.device != w1_fp4.device or not tensor.is_contiguous():
+                raise ValueError(
+                    f"{name} must be contiguous on {w1_fp4.device}"
+                )
+        if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
+            raise ValueError(
+                "gate_suh and up_suh must both be per-expert or both broadcast"
+            )
+        from b12x.moe._shared.kernels.w4a16.prepare import (
+            prepare_trellis256_moe_weights,
+        )
+
+        tile_config = plan.trellis_tile_config or (64, 256, 64, 256)
+        value = prepare_trellis256_moe_weights(
+            w1_fp4,
+            w2_fp4,
+            hidden_size=plan.hidden_size,
+            intermediate_size=plan.intermediate_size,
+            num_experts=plan.num_experts,
+            activation=plan.activation,
+            params_dtype=params_dtype,
+            fc1_tile_n=tile_config[1],
+            fc2_tile_n=tile_config[3],
+            w13_layout="trellis_t256_proj",
+            trellis_bits=plan.trellis_bits,
+            dummy_scale=dummy_scale,
+            codebook=MCG,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate_rotations,
+            down_svh=down_svh,
+            tile_config=tile_config,
+            workspace=w1_fp4.view(torch.int32).reshape(-1)[:1],
+        )
+        representation = _PreparedWeightRepresentation(
+            quant_mode="w4a16",
+            layout=PreparedWeightLayout.TRELLIS_NATIVE,
+            value=value,
+        )
+        input_scale = torch.ones((), dtype=torch.float32, device=w1_fp4.device)
         return B12XFP4ExpertWeights(
             plan=plan,
             a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
@@ -6326,6 +6454,87 @@ def prepare_b12x_trellis_v2_weights(
         hidden_size=plan.hidden_size,
         intermediate_size=plan.intermediate_size,
     )
+    representation = _PreparedWeightRepresentation(
+        quant_mode="w4a16",
+        layout=PreparedWeightLayout.TRELLIS_NATIVE,
+        value=value,
+    )
+    unit_input = torch.ones((), dtype=torch.float32, device=value.w13.device)
+    return B12XFP4ExpertWeights(
+        plan=plan,
+        a1_gscale=unit_input,
+        w1_fp4=value.w13,
+        w1_blockscale=value.w13_scale,
+        w1_alphas=value.w13_global_scale,
+        a2_gscale=unit_input,
+        w2_fp4=value.w2,
+        w2_blockscale=value.w2_scale,
+        w2_alphas=value.w2_global_scale,
+        representation=representation,
+    )
+
+
+def prepare_b12x_projection_native_trellis_weights(
+    *,
+    plan: MoEWeightPreparationPlan,
+    native_tiers: object,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+    down_svh: torch.Tensor,
+) -> B12XFP4ExpertWeights:
+    """Prepare projection-major MCG tensors into the standard expert owner."""
+
+    from b12x.moe.fused_moe.trellis import (
+        ProjectionTrellisTierWeights,
+        prepare_projection_native_trellis_weights,
+    )
+
+    if plan.source_format != "exl3_trellis_mcg":
+        raise ValueError(
+            "projection-native Trellis preparation requires "
+            "source_format='exl3_trellis_mcg'"
+        )
+    if plan.quant_modes != frozenset({"w4a16"}):
+        raise ValueError("projection-native Trellis supports only w4a16")
+    if plan.trellis_rate_granularity != "per_expert_projection":
+        raise ValueError(
+            "projection-native Trellis requires per_expert_projection rates"
+        )
+    if not isinstance(native_tiers, tuple) or len(native_tiers) != 2 or any(
+        not isinstance(tier, ProjectionTrellisTierWeights) for tier in native_tiers
+    ):
+        raise TypeError(
+            "direct EXL3 native_tiers must contain two ProjectionTrellisTierWeights"
+        )
+    params_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }.get(plan.io_dtype)
+    if params_dtype is None:
+        raise TypeError(
+            f"unsupported projection-native activation dtype {plan.io_dtype!r}"
+        )
+    value = prepare_projection_native_trellis_weights(
+        native_tiers,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
+        activation=plan.activation,
+        params_dtype=params_dtype,
+        num_experts=plan.num_experts,
+        hidden_size=plan.hidden_size,
+        intermediate_size=plan.intermediate_size,
+    )
+    expected_tiers = tuple(
+        int(plan.trellis_bits or 3) + offset for offset in range(2)
+    )
+    if value.tier_bits != expected_tiers:
+        raise ValueError(
+            "projection-native tier family differs from the plan: "
+            f"weights={value.tier_bits}, plan={expected_tiers}"
+        )
     representation = _PreparedWeightRepresentation(
         quant_mode="w4a16",
         layout=PreparedWeightLayout.TRELLIS_NATIVE,
@@ -7479,6 +7688,63 @@ def plan_tp_moe_arena_layout(
     )
 
 
+def _trellis_exact_launch_token_counts(capacity_tokens: int) -> tuple[int, ...]:
+    """Return exact decode widths and one capacity-sized prefill width."""
+
+    capacity_tokens = max(int(capacity_tokens), 1)
+    return (
+        tuple(range(1, capacity_tokens + 1))
+        if capacity_tokens <= 32
+        else (capacity_tokens,)
+    )
+
+
+_MIXED_TRELLIS_DIRECT_ROUTE_LIMIT = 72
+
+
+def _projection_mixed_direct_topk_routes(
+    token_count: int,
+    top_k: int,
+    *,
+    direct_exl3: bool,
+) -> bool:
+    """Keep bounded two-tier decode widths out of the packed K128 kernel.
+
+    Projection-mixed packed execution requires an FC1 K tile of at least 128
+    to preserve cross-tier reductions.  For at most 72 live routes, issuing
+    the exact routes directly is both bounded and measurably cheaper; larger
+    shapes retain expert-grouped route packing and weight reuse.
+    """
+
+    token_count = int(token_count)
+    top_k = int(top_k)
+    return bool(
+        direct_exl3
+        and token_count > 0
+        and top_k > 0
+        and token_count * top_k <= _MIXED_TRELLIS_DIRECT_ROUTE_LIMIT
+    )
+
+
+def _projection_mixed_tile_config(
+    configured: tuple[int, int, int, int] | None,
+    *,
+    direct_topk_routes: bool,
+) -> tuple[int, int, int, int]:
+    """Resolve a legal decode/packed mixed-Trellis tile geometry."""
+
+    if configured is None:
+        return (
+            (64, 128, 64, 128)
+            if direct_topk_routes
+            else (128, 128, 128, 128)
+        )
+    fc1_k, fc1_n, fc2_k, fc2_n = (int(value) for value in configured)
+    if not direct_topk_routes and fc1_k < 128:
+        fc1_k = 128
+    return fc1_k, fc1_n, fc2_k, fc2_n
+
+
 def _plan_full_rotation_w4a16_launches(
     *,
     caps: TPMoEScratchCaps,
@@ -7568,11 +7834,7 @@ def _plan_full_rotation_w4a16_launches(
         # speedup over the retired Trellis wrapper comes from specializing the
         # small live shapes instead of always launching its M=32 capacity
         # kernel.  Large prefill plans retain one capacity launch.
-        fused_token_counts = (
-            tuple(range(1, capacity_tokens + 1))
-            if capacity_tokens <= 32
-            else (capacity_tokens,)
-        )
+        fused_token_counts = _trellis_exact_launch_token_counts(capacity_tokens)
 
         def compile_fused(token_count: int) -> object:
             return compile_w4a16_fused_moe(
@@ -7717,8 +7979,8 @@ def _plan_projection_mixed_trellis_launches(
     caps: TPMoEScratchCaps,
     core_plan: _TPCoreWorkspacePlan,
     capacity_tokens: int,
-) -> tuple[tuple[torch.dtype, bool, bool, object], ...]:
-    """Compile every graph-reachable MCG K3/K4/K5 launch specialization."""
+) -> tuple[tuple[int, torch.dtype, bool, bool, object], ...]:
+    """Compile every graph-reachable projection-mixed MCG specialization."""
 
     if not core_plan.projection_mixed_trellis:
         return ()
@@ -7737,6 +7999,7 @@ def _plan_projection_mixed_trellis_launches(
     from b12x.moe._shared.kernels.w4a16.kernel import _DEFAULT_MAX_SHARED_MEM
     from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
         MixedTrellisBuffers,
+        compile_mixed_trellis,
         compile_mixed_trellis3,
         warmup_mixed_trellis_route_pack,
     )
@@ -7752,6 +8015,11 @@ def _plan_projection_mixed_trellis_launches(
     route_blocks = (route_slots + block_size_m - 1) // block_size_m
     rotation_input_dtype = _w4a16_element_dtype(core_plan.dtype)
 
+    direct_exl3 = caps.weight_plan.source_format == "exl3_trellis_mcg"
+    tier_count = 2 if direct_exl3 else 3
+    tier_bits = tuple(
+        int(core_plan.trellis_bits) + offset for offset in range(tier_count)
+    )
     with torch.cuda.device(core_plan.device):
         props = torch.cuda.get_device_properties(core_plan.device)
         sms = int(props.multi_processor_count)
@@ -7762,38 +8030,78 @@ def _plan_projection_mixed_trellis_launches(
                 _DEFAULT_MAX_SHARED_MEM,
             )
         )
+        def compile_launch(
+            token_count: int,
+            ids_dtype: torch.dtype,
+            broadcast_suh: bool,
+            broadcast_svh: bool,
+        ):
+            direct_topk_routes = _projection_mixed_direct_topk_routes(
+                token_count,
+                core_plan.num_topk,
+                direct_exl3=direct_exl3,
+            )
+            common = dict(
+                size_m=token_count,
+                hidden_size=core_plan.k,
+                intermediate_size=core_plan.n,
+                tier0_num_experts=core_plan.weight_E,
+                tier1_num_experts=core_plan.weight_E,
+                route_num_experts=core_plan.route_E,
+                top_k=core_plan.num_topk,
+                max_m_blocks=route_blocks,
+                sms=sms,
+                max_shared_mem=max_shared_mem,
+                force_tile_config=_projection_mixed_tile_config(
+                    core_plan.trellis_tile_config,
+                    direct_topk_routes=direct_topk_routes,
+                ),
+                trellis_codebook="mcg",
+                tier0_bits=tier_bits[0],
+                tier1_bits=tier_bits[1],
+                moe_block_size=block_size_m,
+                rotation_input_dtype=rotation_input_dtype,
+                route_ids_dtype=ids_dtype,
+                broadcast_suh=broadcast_suh,
+                broadcast_svh=broadcast_svh,
+            )
+            if direct_exl3:
+                return compile_mixed_trellis(
+                    **common,
+                    direct_topk_routes=direct_topk_routes,
+                )
+            return compile_mixed_trellis3(
+                **common,
+                tier2_num_experts=core_plan.weight_E,
+                tier2_bits=tier_bits[2],
+            )
+
+        route_id_dtypes = caps.mixed_trellis_route_id_dtypes or (
+            torch.int32,
+            torch.int64,
+        )
+        broadcast_suh_values = caps.mixed_trellis_broadcast_suh or (False, True)
+        broadcast_svh_values = caps.mixed_trellis_broadcast_svh or (False, True)
+        launch_token_counts = _trellis_exact_launch_token_counts(capacity_tokens)
         launches = tuple(
             (
+                token_count,
                 ids_dtype,
                 broadcast_suh,
                 broadcast_svh,
-                compile_mixed_trellis3(
-                    size_m=capacity_tokens,
-                    hidden_size=core_plan.k,
-                    intermediate_size=core_plan.n,
-                    tier0_num_experts=core_plan.weight_E,
-                    tier1_num_experts=core_plan.weight_E,
-                    tier2_num_experts=core_plan.weight_E,
-                    route_num_experts=core_plan.route_E,
-                    top_k=core_plan.num_topk,
-                    max_m_blocks=route_blocks,
-                    sms=sms,
-                    max_shared_mem=max_shared_mem,
-                    force_tile_config=core_plan.trellis_tile_config
-                    or (128, 256, 64, 256),
-                    trellis_codebook="mcg",
-                    moe_block_size=block_size_m,
-                    rotation_input_dtype=rotation_input_dtype,
-                    route_ids_dtype=ids_dtype,
-                    broadcast_suh=broadcast_suh,
-                    broadcast_svh=broadcast_svh,
+                compile_launch(
+                    token_count,
+                    ids_dtype,
+                    broadcast_suh,
+                    broadcast_svh,
                 ),
             )
-            for ids_dtype in (torch.int32, torch.int64)
-            for broadcast_suh in (False, True)
-            for broadcast_svh in (False, True)
+            for token_count in launch_token_counts
+            for ids_dtype in route_id_dtypes
+            for broadcast_suh in broadcast_suh_values
+            for broadcast_svh in broadcast_svh_values
         )
-        for _, _, _, launch in launches:
+        for _, _, _, _, launch in launches:
             if int(launch.blocks_per_sm) > 4:
                 raise RuntimeError(
                     "projection-mixed Trellis exceeds the planned workspace "
@@ -7841,8 +8149,11 @@ def _plan_projection_mixed_trellis_launches(
             dtype=torch.int32,
             device=core_plan.device,
         )
-        for ids_dtype in (torch.int32, torch.int64):
-            launch = next(item[3] for item in launches if item[0] == ids_dtype)
+        for ids_dtype in route_id_dtypes:
+            launch = max(
+                (item[4] for item in launches if item[1] == ids_dtype),
+                key=lambda candidate: int(candidate.size_m),
+            )
             warmup_mixed_trellis_route_pack(
                 launch,
                 route_buffers,
@@ -7881,6 +8192,7 @@ def _bind_projection_mixed_trellis_from_views(
 
     from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
         MixedTrellisBuffers,
+        bind_mixed_trellis,
         bind_mixed_trellis3,
     )
     from b12x.moe.fused_moe.trellis import PreparedProjectionTrellisWeights
@@ -7945,16 +8257,27 @@ def _bind_projection_mixed_trellis_from_views(
         raise ValueError(
             f"prepared weights must be on {a.device}, got {prepared.w13.device}"
         )
+    expected_tier_count = 2 if core_plan.implementation == "trellis_mixed" else 3
+    expected_tier_bits = tuple(
+        int(core_plan.trellis_bits) + offset
+        for offset in range(expected_tier_count)
+    )
+    if prepared.tier_bits != expected_tier_bits:
+        raise ValueError(
+            "prepared projection-mixed Trellis tiers do not match the plan: "
+            f"prepared={prepared.tier_bits}, planned={expected_tier_bits}"
+        )
 
     broadcast_suh = int(prepared.rotations.gate_suh.shape[0]) == 1
     broadcast_svh = int(prepared.rotations.down_svh.shape[0]) == 1
     launch = next(
         (
             candidate
-            for ids_dtype, candidate_suh, candidate_svh, candidate in (
+            for token_count, ids_dtype, candidate_suh, candidate_svh, candidate in (
                 scratch_plan._mixed_trellis_launches
             )
-            if ids_dtype == topk_ids.dtype
+            if token_count == m
+            and ids_dtype == topk_ids.dtype
             and candidate_suh == broadcast_suh
             and candidate_svh == broadcast_svh
         ),
@@ -7997,8 +8320,12 @@ def _bind_projection_mixed_trellis_from_views(
             f"float32[{m},{core_plan.k}] on {a.device}"
         )
 
-    # This caller-owned arena may contain arbitrary bytes. The cooperative
-    # mixed grid reads its barrier count and sense before writing them.
+    # The mixed cooperative kernel uses the tail of this arena for its
+    # grid-wide barrier count and epoch, and the prefix for GEMM reduction
+    # locks. Caller-owned scratch is deliberately mapped without initialization,
+    # so arbitrary first-use bytes can leave every resident CTA spinning at the
+    # first barrier. Keep the initialization on the launch stream; under graph
+    # capture this memset is recorded and replayed before the cooperative grid.
     tensors["kernel_workspace"].zero_()
     buffers = MixedTrellisBuffers(
         rotation_gate=tensors["rotation_a_gate"],
@@ -8020,23 +8347,33 @@ def _bind_projection_mixed_trellis_from_views(
         fc2_scratch=tensors["fc2_c_tmp"],
         workspace=tensors["kernel_workspace"],
     )
-    mixed_binding = bind_mixed_trellis3(
-        prepared.tiers[0],
-        prepared.tiers[1],
-        prepared.tiers[2],
-        prepared.global_to_combined,
-        prepared.descriptor_map,
-        prepared.rotations,
-        launch,
+    bind_common = dict(
+        global_to_combined=prepared.global_to_combined,
+        descriptor_map=prepared.descriptor_map,
+        rotations=prepared.rotations,
+        launch=launch,
         gate_experts=prepared.gate_counts,
         up_experts=prepared.up_counts,
     )
+    if core_plan.implementation == "trellis_mixed":
+        mixed_binding = bind_mixed_trellis(
+            prepared.tiers[0],
+            prepared.tiers[1],
+            **bind_common,
+        )
+    else:
+        mixed_binding = bind_mixed_trellis3(
+            prepared.tiers[0],
+            prepared.tiers[1],
+            prepared.tiers[2],
+            **bind_common,
+        )
     return TPMoEFP4Binding(
         a=a,
         experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        implementation="trellis_mixed3",
+        implementation=core_plan.implementation,
         state_E=core_plan.state_E,
         weight_E=core_plan.weight_E,
         max_rows=core_plan.max_rows,
@@ -12098,16 +12435,23 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     experts = binding.experts
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("binding.experts must be a B12XFP4ExpertWeights")
-    if binding.implementation == "trellis_mixed3":
+    if binding.implementation in {"trellis_mixed", "trellis_mixed3"}:
         from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
+            MixedTrellisBinding,
             MixedTrellis3Binding,
             MixedTrellisBuffers,
+            run_bound_mixed_trellis,
             run_bound_mixed_trellis3,
         )
 
         mixed_binding = binding.mixed_trellis_binding
         mixed_buffers = binding.mixed_trellis_buffers
-        if not isinstance(mixed_binding, MixedTrellis3Binding):
+        expected_binding = (
+            MixedTrellisBinding
+            if binding.implementation == "trellis_mixed"
+            else MixedTrellis3Binding
+        )
+        if not isinstance(mixed_binding, expected_binding):
             raise TypeError(
                 "projection-mixed Trellis binding is missing prepared artifacts"
             )
@@ -12115,13 +12459,22 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             raise TypeError(
                 "projection-mixed Trellis binding is missing scratch buffers"
             )
-        result = run_bound_mixed_trellis3(
-            binding.a,
-            binding.topk_weights,
-            binding.topk_ids,
-            mixed_binding,
-            mixed_buffers,
-        )
+        if isinstance(mixed_binding, MixedTrellisBinding):
+            result = run_bound_mixed_trellis(
+                binding.a,
+                binding.topk_weights,
+                binding.topk_ids,
+                mixed_binding,
+                mixed_buffers,
+            )
+        else:
+            result = run_bound_mixed_trellis3(
+                binding.a,
+                binding.topk_weights,
+                binding.topk_ids,
+                mixed_binding,
+                mixed_buffers,
+            )
         return _finalize_trellis_output(binding, result)
     plan = binding.execution_plan
     if plan is None:

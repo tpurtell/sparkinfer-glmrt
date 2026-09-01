@@ -16,6 +16,7 @@ from ._impl import (
     plan_tp_moe_execution,
     plan_tp_moe_scratch,
     prepare_b12x_fp4_moe_weights,
+    prepare_b12x_projection_native_trellis_weights,
     tp_moe_required_nbytes,
 )
 
@@ -80,12 +81,31 @@ def prepare_weights(
     btx_layer: object | None = None,
     btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
+    projection_tiers: object | None = None,
     gate_suh: torch.Tensor | None = None,
     up_suh: torch.Tensor | None = None,
     intermediate_rotations: torch.Tensor | None = None,
     down_svh: torch.Tensor | None = None,
-    trellis_mcg: int | None = None,
+    trellis_mcg: torch.Tensor | int | None = None,
 ) -> ExpertWeights:
+    if projection_tiers is not None:
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (gate_suh, up_suh, intermediate_rotations, down_svh)
+        ):
+            raise ValueError(
+                "projection-native Trellis preparation requires all rotations"
+            )
+        assert gate_suh is not None and up_suh is not None
+        assert intermediate_rotations is not None and down_svh is not None
+        return prepare_b12x_projection_native_trellis_weights(
+            plan=plan,
+            native_tiers=projection_tiers,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate_rotations,
+            down_svh=down_svh,
+        )
     return prepare_b12x_fp4_moe_weights(
         plan=plan,
         params_dtype=params_dtype,

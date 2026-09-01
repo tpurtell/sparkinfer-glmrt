@@ -426,7 +426,7 @@ def test_compressed_sparse_mla_dsv4_pro_128_heads_replays_under_cuda_graph() -> 
         device=device,
     )
 
-    compressed_mla_decode_forward(
+    compressed_sparse_mla_decode_forward(
         swa_k_cache=swa_cache,
         binding=binding,
         attn_sink=attn_sink,
@@ -436,7 +436,7 @@ def test_compressed_sparse_mla_dsv4_pro_128_heads_replays_under_cuda_graph() -> 
     torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = compressed_mla_decode_forward(
+        captured = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,

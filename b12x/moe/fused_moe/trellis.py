@@ -29,23 +29,39 @@ from .weights import ScaleFactors, TrellisWeights
 
 _ATOM_CHANNELS = 32
 _PROJECTIONS = 3
-_TIERS = (3, 4, 5)
+_CANONICAL_TIERS = (3, 4, 5)
+
+
+@dataclass(frozen=True)
+class ProjectionTrellisTierWeights:
+    """One native MCG tier with projection-tight expert membership.
+
+    ``w13`` stores the gate members followed immediately by the up members;
+    ``w2`` stores the down members.  The membership tuples preserve the global
+    expert IDs represented by those compact physical slots.  This is also the
+    direct preparation boundary for projection-major EXL3 checkpoints, so an
+    integration can load straight into the final tier allocations.
+    """
+
+    bits: int
+    w13: torch.Tensor
+    w2: torch.Tensor
+    gate_experts: tuple[int, ...]
+    up_experts: tuple[int, ...]
+    down_experts: tuple[int, ...]
 
 
 @dataclass(frozen=True)
 class PreparedProjectionTrellisWeights:
-    """Prepared MCG K3/K4/K5 tiers and their projection descriptor tables."""
+    """Prepared two- or three-tier MCG weights and descriptor tables."""
 
-    tiers: tuple[
-        PreparedW4A16MoeWeights,
-        PreparedW4A16MoeWeights,
-        PreparedW4A16MoeWeights,
-    ]
+    tiers: tuple[PreparedW4A16MoeWeights, ...]
     global_to_combined: torch.Tensor
     descriptor_map: torch.Tensor
     rotations: MixedTrellisRotations
-    gate_counts: tuple[int, int, int]
-    up_counts: tuple[int, int, int]
+    gate_counts: tuple[int, ...]
+    up_counts: tuple[int, ...]
+    tier_bits: tuple[int, ...]
     w13: torch.Tensor
     w2: torch.Tensor
     w13_scale: torch.Tensor
@@ -367,7 +383,7 @@ def _projection_native(
     if not experts:
         if fc1:
             return torch.zeros(
-                (1, hidden_tiles, 2 * slots, 16 * bits),
+                (1, hidden_tiles, slots, 16 * bits),
                 dtype=torch.int16,
                 device=atoms.device,
             )
@@ -538,6 +554,7 @@ def _projection_prepared(
     up_suh: torch.Tensor,
     intermediate: torch.Tensor,
     down_svh: torch.Tensor,
+    activation: str,
 ) -> PreparedProjectionTrellisWeights:
     if config.codebook is not TrellisCodebook.MCG:
         raise ValueError("projection-tiered trellis execution requires codebook 'mcg'")
@@ -556,12 +573,10 @@ def _projection_prepared(
             ]
             for projection in range(_PROJECTIONS)
         )
-        for bit in _TIERS
+        for bit in _CANONICAL_TIERS
     )
-    dummy_scale = torch.zeros(4, dtype=torch.uint8, device=weights.atoms.device)
-    shared_workspace: torch.Tensor | None = None
-    tiers: list[PreparedW4A16MoeWeights] = []
-    for tier_index, bit in enumerate(_TIERS):
+    native_tiers: list[ProjectionTrellisTierWeights] = []
+    for tier_index, bit in enumerate(_CANONICAL_TIERS):
         gate_ids, up_ids, down_ids = memberships[tier_index]
         gate = _projection_native(
             weights.atoms,
@@ -600,18 +615,94 @@ def _projection_prepared(
             ).contiguous()
         else:
             w13 = gate
+        native_tiers.append(
+            ProjectionTrellisTierWeights(
+                bits=bit,
+                w13=w13,
+                w2=down,
+                gate_experts=tuple(gate_ids),
+                up_experts=tuple(up_ids),
+                down_experts=tuple(down_ids),
+            )
+        )
+    return prepare_projection_native_trellis_weights(
+        tuple(native_tiers),  # type: ignore[arg-type]
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate.reshape(num_experts, -1),
+        down_svh=down_svh,
+        activation=activation,
+        params_dtype=params_dtype,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+
+
+def prepare_projection_native_trellis_weights(
+    native_tiers: tuple[ProjectionTrellisTierWeights, ...],
+    *,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+    down_svh: torch.Tensor,
+    activation: str,
+    params_dtype: torch.dtype,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> PreparedProjectionTrellisWeights:
+    """Wrap two or three projection-native MCG tiers without conversion."""
+
+    if len(native_tiers) not in (2, 3):
+        raise ValueError("projection-mixed Trellis requires two or three tiers")
+    tier_bits = tuple(int(tier.bits) for tier in native_tiers)
+    if len(set(tier_bits)) != len(native_tiers) or any(
+        bit not in (2, 3, 4, 5, 6) for bit in tier_bits
+    ):
+        raise ValueError(
+            "projection-mixed MCG tiers must be distinct K2..K6 values"
+        )
+    if tuple(sorted(tier_bits)) != tier_bits or any(
+        right != left + 1
+        for left, right in zip(tier_bits, tier_bits[1:], strict=True)
+    ):
+        raise ValueError("projection-mixed MCG tiers must be consecutive and ordered")
+    device = native_tiers[0].w13.device
+    if any(tier.w13.device != device or tier.w2.device != device for tier in native_tiers):
+        raise ValueError("projection-mixed tier payloads must share one device")
+
+    memberships = tuple(
+        (tier.gate_experts, tier.up_experts, tier.down_experts)
+        for tier in native_tiers
+    )
+    for projection, membership_index in (("gate", 0), ("up", 1), ("down", 2)):
+        flattened = [
+            expert
+            for tier_memberships in memberships
+            for expert in tier_memberships[membership_index]
+        ]
+        if sorted(flattened) != list(range(num_experts)):
+            raise ValueError(
+                f"projection-mixed {projection} memberships must partition 0..{num_experts - 1}"
+            )
+
+    dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
+    shared_workspace: torch.Tensor | None = None
+    prepared_tiers: list[PreparedW4A16MoeWeights] = []
+    for native in native_tiers:
         prepared = _finalize_prepared_trellis_weights(
-            context=f"MCG K{bit} projection-tier preparation",
-            device=weights.atoms.device,
+            context=f"MCG K{native.bits} projection-tier preparation",
+            device=device,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
             params_dtype=params_dtype,
-            w13=w13,
-            w2=down,
+            w13=native.w13,
+            w2=native.w2,
             gate_suh=gate_suh,
             up_suh=up_suh,
-            intermediate_rotations=intermediate.reshape(num_experts, -1),
+            intermediate_rotations=intermediate_rotations,
             down_svh=down_svh,
             rotation_columns=3 * intermediate_size,
             tile_config=(128, 128, 128, 128),
@@ -619,7 +710,7 @@ def _projection_prepared(
             dummy_scale=dummy_scale,
             workspace=shared_workspace,
             codebook="mcg",
-            trellis_bits=bit,
+            trellis_bits=native.bits,
             fc1_pair_kind=None,
             fc2_pair_kind=None,
             fc1_pair_modes=None,
@@ -627,62 +718,74 @@ def _projection_prepared(
         )
         if shared_workspace is None:
             shared_workspace = prepared.workspace
-        prepared = replace(
-            prepared,
-            w2_global_scale=torch.ones(
-                (max(len(down_ids), 1),),
-                dtype=torch.float32,
-                device=weights.atoms.device,
-            ),
+        prepared_tiers.append(
+            replace(
+                prepared,
+                w2_global_scale=torch.ones(
+                    (max(len(native.down_experts), 1),),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
         )
-        tiers.append(prepared)
 
     combined_w13, tier_w13 = _coalesce_payloads(
-        tuple(tier.w13 for tier in tiers)
+        tuple(tier.w13 for tier in prepared_tiers)
     )
-    combined_w2, tier_w2 = _coalesce_payloads(tuple(tier.w2 for tier in tiers))
-    rebound = [
+    combined_w2, tier_w2 = _coalesce_payloads(
+        tuple(tier.w2 for tier in prepared_tiers)
+    )
+    tier_tuple = tuple(
         replace(tier, w13=w13, w2=w2)
-        for tier, w13, w2 in zip(tiers, tier_w13, tier_w2, strict=True)
-    ]
-    tier_tuple = tuple(rebound)
-    assert len(tier_tuple) == 3
+        for tier, w13, w2 in zip(
+            prepared_tiers, tier_w13, tier_w2, strict=True
+        )
+    )
+    assert len(tier_tuple) == len(native_tiers)
 
-    tier_ids = {bit: index for index, bit in enumerate(_TIERS)}
-    gate_tiers = [tier_ids[int(value)] for value in bits[:, 0]]
-    up_tiers = [tier_ids[int(value)] for value in bits[:, 1]]
-    down_tiers = [tier_ids[int(value)] for value in bits[:, 2]]
+    tier_id_by_bit = {bit: index for index, bit in enumerate(tier_bits)}
+    tiers_by_projection = []
+    for membership_index in range(3):
+        assigned = [-1] * num_experts
+        for native in native_tiers:
+            for expert in (
+                native.gate_experts,
+                native.up_experts,
+                native.down_experts,
+            )[membership_index]:
+                assigned[expert] = tier_id_by_bit[native.bits]
+        tiers_by_projection.append(assigned)
     route, descriptor = build_projection_tiered_maps(
-        gate_tiers,
-        up_tiers,
-        down_tiers,
-        tier_slots=(num_experts, num_experts, num_experts),
-        device=weights.atoms.device,
+        tiers_by_projection[0],
+        tiers_by_projection[1],
+        tiers_by_projection[2],
+        tier_slots=(num_experts,) * len(native_tiers),
+        device=device,
     )
     broadcast_input = int(gate_suh.shape[0]) == 1
     broadcast_output = int(down_svh.shape[0]) == 1
     rotations = MixedTrellisRotations(
-        intermediate=torch.cat((intermediate,) * 3, dim=0)
-        .reshape(3 * num_experts, -1)
-        .contiguous(),
+        intermediate=torch.cat(
+            (intermediate_rotations,) * len(native_tiers), dim=0
+        ).contiguous(),
         gate_suh=(
             gate_suh
             if broadcast_input
-            else torch.cat((gate_suh,) * 3, dim=0).contiguous()
+            else torch.cat((gate_suh,) * len(native_tiers), dim=0).contiguous()
         ),
         up_suh=(
             up_suh
             if broadcast_input
-            else torch.cat((up_suh,) * 3, dim=0).contiguous()
+            else torch.cat((up_suh,) * len(native_tiers), dim=0).contiguous()
         ),
         down_svh=(
             down_svh
             if broadcast_output
-            else torch.cat((down_svh,) * 3, dim=0).contiguous()
+            else torch.cat((down_svh,) * len(native_tiers), dim=0).contiguous()
         ),
     )
-    gate_counts = tuple(len(tier[0]) for tier in memberships)
-    up_counts = tuple(len(tier[1]) for tier in memberships)
+    gate_counts = tuple(len(tier.gate_experts) for tier in native_tiers)
+    up_counts = tuple(len(tier.up_experts) for tier in native_tiers)
     return PreparedProjectionTrellisWeights(
         tiers=tier_tuple,  # type: ignore[arg-type]
         global_to_combined=route,
@@ -690,6 +793,7 @@ def _projection_prepared(
         rotations=rotations,
         gate_counts=gate_counts,
         up_counts=up_counts,
+        tier_bits=tier_bits,
         w13=combined_w13,
         w2=combined_w2,
         w13_scale=dummy_scale,
@@ -805,7 +909,13 @@ def prepare_trellis_weights(
         up_suh=up_suh,
         intermediate=intermediate,
         down_svh=down_svh,
+        activation=activation,
     )
 
 
-__all__ = ["PreparedProjectionTrellisWeights", "prepare_trellis_weights"]
+__all__ = [
+    "PreparedProjectionTrellisWeights",
+    "ProjectionTrellisTierWeights",
+    "prepare_projection_native_trellis_weights",
+    "prepare_trellis_weights",
+]
