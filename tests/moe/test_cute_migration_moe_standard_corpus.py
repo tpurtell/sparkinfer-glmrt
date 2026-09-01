@@ -747,6 +747,58 @@ def test_standard_moe_dynamic_prefill_live_graph_oracle(
     )
 
 
+@pytest.mark.parametrize("tile_m", [16, 32, 64, 128])
+@pytest.mark.parametrize("intermediate_size", [112, 144])
+def test_standard_moe_nvfp4_n16_tail_dynamic_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    tile_m: int,
+    intermediate_size: int,
+) -> None:
+    """Keep a 16-mod-32 gated FC1 half boundary exact in dynamic MoE."""
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", f"{tile_m}x128")
+    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
+    weights = _make_nvfp4_weights(
+        device,
+        seed=204,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(device, m=16, seed=205, route_shift=0)
+    changed = _make_inputs(device, m=16, seed=206, route_shift=2)
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == tile_m
+    assert case.binding.implementation == "dynamic"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=f"standard-moe-dynamic-n{intermediate_size}-m{tile_m}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
 @pytest.mark.parametrize("m", [4, 7])
 def test_standard_moe_external_route_plan_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,

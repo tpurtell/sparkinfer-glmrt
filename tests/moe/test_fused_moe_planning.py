@@ -101,6 +101,64 @@ def _small_packed_caps() -> fused_moe.Caps:
     )
 
 
+def _preplanned_w4a16_workspace(*, activation: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        activation=activation,
+        device=torch.device("cpu"),
+        full_rotation=False,
+        num_topk=8,
+        planned_direct_topk_launches={4: "direct-topk"},
+        planned_fused_moe_launches={
+            ("packed", "e4m3_k16", 8, False): "route-packed"
+        },
+        planned_mapped_direct_launches={4: "mapped-direct"},
+        planned_tc_decode_launches={4: "tc-decode"},
+        planned_token_counts=frozenset({8}),
+        planned_topk_sum_launches={4: "sum-4", 8: "sum-8"},
+        weight_E=288,
+    )
+
+
+def test_w4a16_preplanned_relu2_direct_uses_direct_topk_kernel() -> None:
+    workspace = _preplanned_w4a16_workspace(activation="relu2")
+
+    launches = fused_moe_impl._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="packed",
+        route_mode="direct",
+    )
+
+    assert launches == ("direct-topk", "sum-4")
+
+
+def test_w4a16_preplanned_silu_direct_uses_tc_decode_kernel() -> None:
+    workspace = _preplanned_w4a16_workspace(activation="silu")
+
+    launches = fused_moe_impl._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="packed",
+        route_mode="direct",
+    )
+
+    assert launches == ("tc-decode", "sum-4")
+
+
+def test_w4a16_preplanned_packed_mode_rejects_mapped_direct_kernel() -> None:
+    workspace = _preplanned_w4a16_workspace(activation="silu")
+
+    launches = fused_moe_impl._w4a16_preplanned_launches(
+        workspace,
+        token_count=4,
+        weight_layout="packed",
+        use_route_expert_map=True,
+        route_mode="packed",
+    )
+
+    assert launches == ("route-packed", "sum-8")
+
+
 def _subset_router_caps() -> fused_moe.Caps:
     weight_plan = fused_moe.plan_weights(
         quant_modes="w4a16",
@@ -721,6 +779,8 @@ def test_canonical_plan_execution_carries_explicit_policy() -> None:
             backend="dynamic",
             route_planner="internal",
             max_active_clusters=None,
+            dynamic_tile_m=128,
+            dynamic_route_mode="grouped",
         ),
     )
 
@@ -887,6 +947,8 @@ def test_tp_moe_plan_retains_one_policy_resolution(
             backend="dynamic",
             route_planner="triton",
             max_active_clusters=12,
+            dynamic_tile_m=128,
+            dynamic_route_mode="grouped",
         ),
         source=PolicySource.PREPLANNED,
         component_id="moe.decode",
@@ -926,6 +988,40 @@ def test_tp_moe_plan_retains_one_policy_resolution(
     assert calls == 1
     assert plan.policy_resolution is resolution
     assert plan.implementation == "dynamic"
+    assert plan.execution.tile_m == 128
+
+
+@pytest.mark.parametrize(
+    ("tile_m", "external", "direct", "cluster_cap"),
+    (
+        (16, False, False, -1),
+        (16, False, True, 0),
+        (32, True, False, 12),
+        (64, False, False, 48),
+        (128, True, False, 188),
+    ),
+)
+def test_dynamic_launch_policy_round_trips_planned_tile(
+    tile_m: int,
+    external: bool,
+    direct: bool,
+    cluster_cap: int,
+) -> None:
+    encoded = fused_moe_impl._encode_dynamic_launch_policy(
+        volatile_launch_state=True,
+        external_route_plan_requested=external,
+        policy_max_active_clusters=cluster_cap,
+        planned_tile_m=tile_m,
+        planned_direct_routing=direct,
+    )
+
+    assert fused_moe_impl._decode_dynamic_launch_policy(encoded) == (
+        True,
+        external,
+        tile_m,
+        direct,
+        cluster_cap,
+    )
 
 
 @pytest.mark.parametrize(
@@ -995,7 +1091,33 @@ def test_gb10_qwen38_flash_next_decode_reports_profile_provenance(
 
     assert resolution.source is PolicySource.PREPLANNED
     assert resolution.profile_id == "nvidia.gb10.48sm"
-    assert resolution.rule_name == "config-435fd9dd1fdb"
+    assert resolution.rule_name is not None
+    assert resolution.rule_name.startswith("config-")
+    assert resolution.config.dynamic_tile_m == 16
     assert resolution.config.backend == "dynamic"
     assert resolution.config.route_planner == "triton"
     assert resolution.config.max_active_clusters == 36
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "route_mode"),
+    ((1, "packed"), (2, "packed"), (4, "packed"), (8, "packed")),
+)
+def test_gb10_glm53_w4a16_profile_selects_measured_route_kernel(
+    num_tokens: int,
+    route_mode: str,
+) -> None:
+    resolution = fused_moe_impl._resolve_moe_decode_policy(
+        num_tokens=num_tokens,
+        num_topk=8,
+        num_experts=288,
+        k=4096,
+        n=1024,
+        activation="silu",
+        quant_mode="w4a16",
+        context=_policy_context(_GB10_IDENTITY),
+    )
+
+    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.config.backend == "w4a16"
+    assert resolution.config.w4a16_route_mode == route_mode

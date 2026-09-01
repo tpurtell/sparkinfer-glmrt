@@ -15,6 +15,7 @@ from b12x.policy.generation import (
     ComponentGeneratorRegistry,
     GenerationContext,
     GenerationSettings,
+    MeasurementPartition,
     measurement_partitions,
     ProgressReporter,
     select_measurement_partitions,
@@ -34,8 +35,10 @@ from b12x.policy.generation.runner import (
 from b12x.tools.generate_gpu_profile import (
     _is_generated_profile_data,
     _parse_devices,
+    _parse_partition_shard,
     _parser,
     _profile_id_for_device,
+    _select_partition_shard,
 )
 
 _DEVICE = DeviceIdentity(
@@ -88,6 +91,15 @@ def test_parallel_device_ranges_expand_without_duplicates() -> None:
         _parse_devices("0-2,2")
     with pytest.raises(ValueError, match="ascending"):
         _parse_devices("3-1")
+
+
+def test_partition_shard_parser_uses_human_friendly_indices() -> None:
+    assert _parse_partition_shard("1/3") == (0, 3)
+    assert _parse_partition_shard("3/3") == (2, 3)
+    with pytest.raises(ValueError, match="look like"):
+        _parse_partition_shard("0/3")
+    with pytest.raises(ValueError, match="exceed"):
+        _parse_partition_shard("4/3")
 
 
 def test_default_profile_id_reuses_embedded_multi_target_profile() -> None:
@@ -176,6 +188,42 @@ class _Generator:
         )
 
 
+@dataclass(frozen=True)
+class _PartitionedGenerator(_Generator):
+    partition_ids: tuple[str, ...] = ("large-a", "large-b", "small-a", "small-b")
+
+    def measurement_partitions(
+        self,
+        context: GenerationContext,
+    ) -> tuple[MeasurementPartition, ...]:
+        del context
+        work_units = {
+            "large-a": 10,
+            "large-b": 9,
+            "small-a": 2,
+            "small-b": 1,
+        }
+        return tuple(
+            MeasurementPartition(
+                component_id=self.component_id,
+                partition_id=partition_id,
+                work_units=work_units[partition_id],
+                case_count=work_units[partition_id],
+                description=partition_id,
+            )
+            for partition_id in self.partition_ids
+        )
+
+    def select_measurement_partitions(
+        self,
+        partition_ids: tuple[str, ...],
+    ) -> _PartitionedGenerator:
+        return _PartitionedGenerator(
+            component_id=self.component_id,
+            partition_ids=partition_ids,
+        )
+
+
 def test_nonpartitionable_generator_is_one_parallel_work_item(tmp_path) -> None:
     generator = _Generator("attention.gqa")
     context = GenerationContext(
@@ -197,6 +245,39 @@ def test_nonpartitionable_generator_is_one_parallel_work_item(tmp_path) -> None:
         )
         is generator
     )
+
+
+def test_cross_host_partition_shards_are_complete_disjoint_and_balanced(
+    tmp_path,
+) -> None:
+    generator = _PartitionedGenerator("moe.decode")
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+
+    first = _select_partition_shard(
+        (generator,),
+        context,
+        shard_index=0,
+        shard_count=2,
+    )[0]
+    second = _select_partition_shard(
+        (generator,),
+        context,
+        shard_index=1,
+        shard_count=2,
+    )[0]
+
+    first_ids = set(first.partition_ids)
+    second_ids = set(second.partition_ids)
+    assert first_ids.isdisjoint(second_ids)
+    assert first_ids | second_ids == set(generator.partition_ids)
+    assert sum(item.work_units for item in first.measurement_partitions(context)) == 11
+    assert sum(item.work_units for item in second.measurement_partitions(context)) == 11
 
 
 def test_registry_and_runner_assemble_all_components(tmp_path) -> None:

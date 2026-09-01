@@ -23,7 +23,7 @@ from b12x._lib.scratch_layout import (
 )
 from b12x.policy import PolicyContext, get_auto_policy
 
-from ._policy import MHC_POLICY, MhcQuery
+from ._policy import MHC_POLICY, MhcConfig, MhcQuery
 
 MHC_MULT = 4
 MHC_MIXES = (2 + MHC_MULT) * MHC_MULT
@@ -103,6 +103,7 @@ class B12XMHCBinding:
     pre_broadcasts_residual_lanes: ClassVar[bool] = True
     post_pre_fuses_layer_boundary: ClassVar[bool] = True
     head_uses_bound_y: ClassVar[bool] = True
+    plan: "B12XMHCScratchPlan"
     partials: torch.Tensor | None = None
     y: torch.Tensor | None = None
     post_buffer: torch.Tensor | None = None
@@ -241,6 +242,7 @@ class B12XMHCScratchPlan:
     caps: B12XMHCScratchCaps
     layout: _MHCScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    config: MhcConfig
     policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
@@ -304,6 +306,7 @@ class B12XMHCScratchPlan:
             device=self.caps.device,
         )
         return B12XMHCBinding(
+            plan=self,
             partials=partials,
             y=y,
             post_buffer=post,
@@ -532,6 +535,7 @@ def plan_mhc_scratch(
                 device=caps.device,
             ),
         ),
+        config=resolution.config,
         policy_resolution=resolution,
     )
 
@@ -1026,6 +1030,7 @@ def _b12x_mhc_post_pre_impl(
         or comb_out is not None
     )
     partials = None
+    planned_config: MhcConfig | None = None
     if binding is not None:
         extras = [
             name
@@ -1043,6 +1048,7 @@ def _b12x_mhc_post_pre_impl(
                 f"do not also pass {', '.join(extras)}"
             )
         partials = binding.partials
+        planned_config = binding.plan.config
         residual_out = binding.out
         y_out = binding.y
         post_out = binding.post_buffer
@@ -1273,10 +1279,19 @@ def _b12x_mhc_post_pre_impl(
         prefill_min_tokens = int(
             os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96")
         )
-        use_prefill_tf32_mma = _use_mhc_prefill_tf32_project(
-            norm_weight=norm_weight,
-            policy_m=policy_m,
-        )
+        if planned_config is not None:
+            tf32_enabled = planned_config.backend == "tf32_tma"
+            tf32_override = os.environ.get("B12X_MHC_PREFILL_TF32_MMA")
+            if tf32_override is None:
+                tf32_override = os.environ.get("B12X_MHC_PREFILL_BF16_MMA")
+            if tf32_override is not None:
+                tf32_enabled = tf32_override != "0"
+            use_prefill_tf32_mma = norm_weight is not None and tf32_enabled
+        else:
+            use_prefill_tf32_mma = _use_mhc_prefill_tf32_project(
+                norm_weight=norm_weight,
+                policy_m=policy_m,
+            )
         use_prefill_bf16_mma = (
             _use_mhc_prefill_bf16_project(
                 norm_weight=norm_weight,
@@ -1333,6 +1348,7 @@ def _b12x_mhc_post_pre_impl(
                 out=residual_out,
                 fn=fn,
                 partials=partials,
+                config=planned_config,
             )
         elif use_prefill_bf16_mma:
             run_mhc_post_pre_prefill_gram(
@@ -1406,6 +1422,7 @@ def _b12x_mhc_post_pre_impl(
                 mhc_prefill_tf32_project_splits(
                     tokens=tokens,
                     hidden_size=hidden_size,
+                    config=planned_config,
                 )
                 if use_prefill_tf32_mma
                 else 1

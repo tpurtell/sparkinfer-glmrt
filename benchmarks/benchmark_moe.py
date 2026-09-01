@@ -468,6 +468,16 @@ MODEL_PROFILES = {
         default_quant_mode="w4a8_nvfp4",
         default_validate="none",
     ),
+    "glm53-flash": ModelProfile(
+        label="GLM-5.3 Flash",
+        checkpoint_family="glm53_flash",
+        default_layer_idx=3,
+        tp_size=1,
+        hf_repo_id=None,
+        default_model_path=pathlib.Path("/data/models/GLM-5.3-Flash-4p67"),
+        default_quant_mode="nvfp4",
+        default_validate="oracle",
+    ),
     "glm53-flash-shape": ModelProfile(
         label="GLM-5.3 Flash (shape)",
         checkpoint_family="glm53_flash_shape",
@@ -661,7 +671,7 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
             tp_size=tp,
             tp_rank=tp_rank,
         )
-    if profile.checkpoint_family == "glm":
+    if profile.checkpoint_family in {"glm", "glm53_flash"}:
         return ModelSpec(
             hidden_size=cfg["hidden_size"],
             intermediate_size=cfg["moe_intermediate_size"],
@@ -863,6 +873,7 @@ def load_expert_weights(
         "nano35_w4a16_shape",
         "dsv4f_shape",
         "dsv4f_nvfp4_shape",
+        "glm53_flash_shape",
         "laguna_s21_shape",
         "minimax_m3_shape",
         "qwen38_flash_next_shape",
@@ -882,8 +893,17 @@ def load_expert_weights(
     cfg = _load_config(model_path)
     loader = IndexedSafetensorLoader(model_path)
 
-    if checkpoint_family in {"qwen", "glm", "minimax_m2", "minimax_m3"}:
-        if checkpoint_family in {"glm", "minimax_m2"} and activation != "silu":
+    if checkpoint_family in {
+        "qwen",
+        "glm",
+        "glm53_flash",
+        "minimax_m2",
+        "minimax_m3",
+    }:
+        if (
+            checkpoint_family in {"glm", "glm53_flash", "minimax_m2"}
+            and activation != "silu"
+        ):
             raise ValueError(f"{checkpoint_family} FP4 benchmark only supports silu experts")
         if checkpoint_family == "minimax_m3" and activation != SWIGLUOAI_UNINTERLEAVE:
             raise ValueError("minimax_m3 FP4 benchmark expects swigluoai_uninterleave experts")
@@ -901,10 +921,17 @@ def load_expert_weights(
             gate_proj = "w1"
             up_proj = "w3"
             down_proj = "w2"
-        else:
+        elif checkpoint_family == "glm":
             cfg_num_experts = cfg["n_routed_experts"]
             cfg_intermediate_size = cfg["moe_intermediate_size"]
             prefix = f"model.layers.{layer_idx}.mlp.experts"
+            gate_proj = "gate_proj"
+            up_proj = "up_proj"
+            down_proj = "down_proj"
+        else:
+            cfg_num_experts = cfg["n_routed_experts"]
+            cfg_intermediate_size = cfg["moe_intermediate_size"]
+            prefix = f"model.language_model.layers.{layer_idx}.mlp.experts"
             gate_proj = "gate_proj"
             up_proj = "up_proj"
             down_proj = "down_proj"
@@ -936,7 +963,9 @@ def load_expert_weights(
             gate_w[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight").narrow(0, tp_off, I_tp).to(device)
             gate_sf[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight_scale").narrow(0, tp_off, I_tp).to(device)
             gate_gs[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight_scale_2").to(device)
-            gate_is[eid] = loader.get_tensor(f"{ep}.{gate_proj}.input_scale").to(device)
+            gate_is[eid] = loader.get_tensor(
+                f"{ep}.{gate_proj}.input_scale"
+            ).to(device)
 
             up_w[eid] = loader.get_tensor(f"{ep}.{up_proj}.weight").narrow(0, tp_off, I_tp).to(device)
             up_sf[eid] = loader.get_tensor(f"{ep}.{up_proj}.weight_scale").narrow(0, tp_off, I_tp).to(device)
@@ -944,7 +973,9 @@ def load_expert_weights(
             down_w[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight").narrow(1, tp_off_packed, I_tp // 2).to(device)
             down_sf[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight_scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
             down_gs[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight_scale_2").to(device)
-            down_is[eid] = loader.get_tensor(f"{ep}.{down_proj}.input_scale").to(device)
+            down_is[eid] = loader.get_tensor(
+                f"{ep}.{down_proj}.input_scale"
+            ).to(device)
         print(" done.")
 
         if checkpoint_family == "minimax_m3":

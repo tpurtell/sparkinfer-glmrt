@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from types import SimpleNamespace
 
 from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
 from benchmarks.benchmark_paged_attention import BENCHMARK_PROFILES
 from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
-from b12x.policy import DeviceIdentity, list_profiled_components, profile_from_dict
+from b12x.policy import (
+    EMBEDDED_REGISTRY,
+    DeviceIdentity,
+    list_profiled_components,
+    profile_from_dict,
+)
 from b12x.policy.generation import (
     CheckpointStore,
     GenerationContext,
@@ -39,8 +45,14 @@ from b12x.policy.generation.providers.gpu_workers import GdnBenchmarkFactory
 from b12x.policy.generation.providers.qualification import (
     _DsaIndexerProbe,
     DsaIndexerGenerator,
-    MhcGenerator,
     SparseMlaGenerator,
+)
+from b12x.policy.generation.providers.norm_sequence import (
+    MhcGenerator,
+    _MhcSession,
+    _hyperconnection_cases,
+    _mhc_cases,
+    _mtp_feedback_cases,
 )
 from b12x.policy.generation.registry import ComponentGeneratorRegistry
 from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery
@@ -134,6 +146,45 @@ def test_gdn_corpus_includes_qwen_and_glm_decay_contracts() -> None:
     assert exercised == {case.query for case in cases}
 
 
+def test_embedded_gdn_profiles_cover_every_corpus_query() -> None:
+    cases_by_query = {case.query: case for case in gdn_cases()}
+
+    for profile in EMBEDDED_REGISTRY.list_profiles():
+        component = profile.component("attention.gdn")
+        assert component is not None, profile.profile_id
+        for query, case in cases_by_query.items():
+            hit = component.lookup(query)
+            assert hit is not None, (profile.profile_id, query.to_dict())
+            expected_backend = (
+                "triton" if case.metadata["decay_recipe"] == "kda" else "cutedsl"
+            )
+            assert hit.config["backend"] == expected_backend, (
+                profile.profile_id,
+                query.to_dict(),
+                hit.config,
+            )
+
+
+def test_embedded_norm_sequence_profiles_cover_every_corpus_query() -> None:
+    component_cases = {
+        "norm.hyperconnection": _hyperconnection_cases(),
+        "sequence.mtp_feedback": _mtp_feedback_cases(),
+    }
+
+    for profile in EMBEDDED_REGISTRY.list_profiles():
+        for component_id, cases in component_cases.items():
+            component = profile.component(component_id)
+            assert component is not None, (profile.profile_id, component_id)
+            for case in cases:
+                hit = component.lookup(case.query)
+                assert hit is not None, (
+                    profile.profile_id,
+                    component_id,
+                    case.query.to_dict(),
+                )
+                assert hit.config["backend"] == "cutedsl"
+
+
 def test_attention_capacity_axes_cover_serving_and_prefill_buckets() -> None:
     expected_sequence_capacities = (
         *range(1, 17),
@@ -144,6 +195,11 @@ def test_attention_capacity_axes_cover_serving_and_prefill_buckets() -> None:
     )
     assert expected_sequence_capacities == COMMON_SEQUENCE_CAPACITIES
     assert COMMON_PREFILL_TOKEN_CAPACITIES == (1_024, 2_048, 4_096, 8_192)
+
+    for cases in (_hyperconnection_cases(), _mtp_feedback_cases()):
+        capacities = {int(case.query["max_tokens"]) for case in cases}
+        assert set(COMMON_SEQUENCE_CAPACITIES) <= capacities
+        assert {512, *COMMON_PREFILL_TOKEN_CAPACITIES} <= capacities
 
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         int(case.query["max_q_rows"])
@@ -297,7 +353,36 @@ def test_attention_corpus_manifests_are_content_addressed() -> None:
         assert len(manifest["corpus_sha256"]) == 64
 
 
-def test_glm_fixed_backend_qualification_envelope_matches_presets() -> None:
+def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
+    case = next(
+        case
+        for case in _mhc_cases()
+        if case.query["hidden_size"] == 4_096
+        and case.query["max_tokens"] == 3_072
+    )
+    configs = tuple(
+        candidate.config.to_dict()
+        for candidate in _MhcSession(SimpleNamespace(device=None)).candidates(case)
+    )
+
+    assert any(config["backend"] == "native" for config in configs)
+    assert any(
+        config
+        == {
+            "backend": "tf32_tma",
+            "projection_tile_m": 64,
+            "projection_tile_n": 24,
+            "projection_tile_k": 64,
+            "projection_num_stages": 2,
+            "projection_num_m_warps": 4,
+            "projection_num_n_warps": 1,
+            "projection_k_splits": 8,
+        }
+        for config in configs
+    )
+
+
+def test_glm_profile_generation_envelope_matches_presets() -> None:
     dsa_queries = DsaIndexerGenerator().reviewed_queries()
     sparse_queries = SparseMlaGenerator().reviewed_queries()
     mhc_queries = MhcGenerator().reviewed_queries()
@@ -320,6 +405,13 @@ def test_glm_fixed_backend_qualification_envelope_matches_presets() -> None:
         and query.split_k == 64
         for query in mhc_queries
     )
+    assert {4_096, 7_168} == {query.hidden_size for query in mhc_queries}
+    assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
+        query.max_tokens for query in mhc_queries
+    }
+    assert {2_304, 3_072, 3_584} <= {
+        query.max_tokens for query in mhc_queries
+    }
     assert {query.score_mode for query in dsa_queries} == {"dsa", "msa"}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_q_rows for query in dsa_queries if query.mode == "prefill"

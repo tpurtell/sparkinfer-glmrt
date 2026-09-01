@@ -43,10 +43,11 @@ class MoeRecipe:
             raise ValueError(
                 "minimum_intermediate_size must satisfy the recipe alignment"
             )
-        if self.source_format == "btx" and not self.trellis_variant:
-            raise ValueError("BTX recipes require a trellis_variant")
-        if self.source_format != "btx" and self.trellis_variant is not None:
-            raise ValueError("trellis_variant is valid only for BTX recipes")
+        is_trellis = self.source_format in {"btx", "b12x_trellis"}
+        if is_trellis and not self.trellis_variant:
+            raise ValueError("Trellis recipes require a trellis_variant")
+        if not is_trellis and self.trellis_variant is not None:
+            raise ValueError("trellis_variant is valid only for Trellis recipes")
 
     def physical_intermediate_size(self, logical_size: int) -> int:
         return align_up(
@@ -209,7 +210,7 @@ MOE_RECIPES = (
     MoeRecipe(
         recipe_id="trellis-glm-w4a16",
         quant_mode="w4a16",
-        source_format="btx",
+        source_format="b12x_trellis",
         intermediate_alignment=128,
         minimum_intermediate_size=128,
         trellis_variant="glm-mcg-projection-tiered",
@@ -217,7 +218,7 @@ MOE_RECIPES = (
     MoeRecipe(
         recipe_id="trellis-k3-w4a16",
         quant_mode="w4a16",
-        source_format="btx",
+        source_format="b12x_trellis",
         intermediate_alignment=256,
         minimum_intermediate_size=256,
         trellis_variant="k3-sqg-uniform-coupled",

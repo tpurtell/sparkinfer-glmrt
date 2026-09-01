@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+from collections import defaultdict
 from collections.abc import Mapping
 from importlib import metadata
 from pathlib import Path
@@ -29,6 +30,7 @@ from b12x.policy.generation import (
     GenerationSettings,
     MeasurementPartition,
     measurement_partitions,
+    select_measurement_partitions,
 )
 from b12x.policy.generation.parallel import run_parallel_measurements
 from b12x.policy.generation.progress import RichProgressReporter
@@ -217,6 +219,58 @@ def _parse_devices(raw: str) -> tuple[str, ...]:
     return tuple(f"cuda:{ordinal}" for ordinal in ordinals)
 
 
+def _parse_partition_shard(raw: str) -> tuple[int, int]:
+    match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", raw.strip())
+    if match is None:
+        raise ValueError("--partition-shard must look like 1/2")
+    ordinal, count = (int(value) for value in match.groups())
+    if ordinal > count:
+        raise ValueError("--partition-shard index cannot exceed its shard count")
+    return ordinal - 1, count
+
+
+def _select_partition_shard(
+    generators: tuple[ComponentGenerator, ...],
+    context: GenerationContext,
+    *,
+    shard_index: int,
+    shard_count: int,
+) -> tuple[ComponentGenerator, ...]:
+    partitions = measurement_partitions(generators, context)
+    if shard_count > len(partitions):
+        raise ValueError(
+            f"cannot split {len(partitions)} measurement partitions into "
+            f"{shard_count} shards"
+        )
+    assignments: list[list[MeasurementPartition]] = [
+        [] for _ in range(shard_count)
+    ]
+    loads = [0] * shard_count
+    for partition in sorted(
+        partitions,
+        key=lambda item: (
+            -item.work_units,
+            item.component_id,
+            item.partition_id,
+        ),
+    ):
+        target = min(range(shard_count), key=lambda index: (loads[index], index))
+        assignments[target].append(partition)
+        loads[target] += partition.work_units
+
+    selected_by_component: dict[str, list[str]] = defaultdict(list)
+    for partition in assignments[shard_index]:
+        selected_by_component[partition.component_id].append(partition.partition_id)
+    return tuple(
+        select_measurement_partitions(
+            generator,
+            tuple(sorted(selected_by_component[generator.component_id])),
+        )
+        for generator in generators
+        if generator.component_id in selected_by_component
+    )
+
+
 def _detect_devices(device_specs: tuple[str, ...]) -> tuple[DetectedDevice, ...]:
     if not device_specs:
         raise ValueError("at least one CUDA device is required")
@@ -303,6 +357,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--profile-id")
     parser.add_argument("--components", default="all")
+    parser.add_argument(
+        "--partition-shard",
+        help="measure one workload-balanced cross-host shard, for example 1/2",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument(
@@ -420,6 +478,21 @@ def main(argv: list[str] | None = None) -> int:
             max_candidate_seconds=args.max_candidate_seconds,
         ),
     )
+    if args.partition_shard is not None:
+        try:
+            shard_index, shard_count = _parse_partition_shard(args.partition_shard)
+            generators = _select_partition_shard(
+                generators,
+                context,
+                shard_index=shard_index,
+                shard_count=shard_count,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        console.print(
+            f"Partition shard: {shard_index + 1}/{shard_count} "
+            f"({len(measurement_partitions(generators, context))} partitions)"
+        )
     device_labels = ", ".join(f"cuda:{item.ordinal}" for item in detected_devices)
     console.print(
         f"[bold]{profile_id}[/bold] on {device_labels} "

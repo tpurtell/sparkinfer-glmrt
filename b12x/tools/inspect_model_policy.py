@@ -563,7 +563,7 @@ _MOE_PRESETS = {
     ),
     "kimi-k3": MoePreset(
         quant_mode="w4a16",
-        source_format="btx",
+        source_format="b12x_trellis",
         activation="situ",
         num_experts=896,
         hidden_size=3_584,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -7,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from b12x.policy import DeviceIdentity
+from b12x.moe.fused_moe import _impl as fused_moe_impl
+from b12x.policy import EMBEDDED_REGISTRY, DeviceIdentity
 from b12x.policy.generation import (
     CheckpointStore,
     GenerationContext,
@@ -38,7 +42,11 @@ from b12x.policy.generation.providers.moe_gpu_worker import (
     MoeGpuBenchmarkFactory,
     _activation_mode,
     _benchmark_input_scale,
+    _candidate_environment,
     _candidate_reference_output,
+    _candidates_for_geometry,
+    _condition_benchmark_inputs,
+    _concrete_candidate_path,
     _cosine_similarity,
     _finite_float_or_none,
     _is_fatal_accelerator_error,
@@ -48,7 +56,11 @@ from b12x.policy.generation.providers.moe_gpu_worker import (
     _MoeRemoteWorkerError,
     _packed_weights,
     _reset_cuda_graphs,
+    _relative_norm_error,
     _trellis_weights,
+    _uniform_w4a16_reference,
+    _w4a16_direct_path,
+    _w4a16_weight_layout,
 )
 from b12x.policy.serialization import profile_from_dict
 
@@ -60,13 +72,151 @@ _DEVICE = DeviceIdentity(
 )
 
 
+def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
+) -> None:
+    cases = expand_sweep_cases()
+    queries = {tuple(sorted(case.query().items())): case.query() for case in cases}
+    base_queries = {}
+    for case in cases:
+        query = case.query()
+        query.pop("num_tokens")
+        query.pop("routed_rows")
+        base_queries.setdefault(tuple(sorted(query.items())), query)
+    for base_query in base_queries.values():
+        top_k = int(base_query["top_k"])
+        direct_limit = fused_moe_impl._DIRECT_ROUTING_MAX_ROUTED_ROWS // top_k
+        triton_limit = (
+            fused_moe_impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS // top_k
+        )
+        for num_tokens in (9, direct_limit, direct_limit + 1, triton_limit + 1):
+            if not 1 <= num_tokens <= 8_192:
+                continue
+            query = {
+                **base_query,
+                "num_tokens": num_tokens,
+                "routed_rows": num_tokens * top_k,
+            }
+            queries.setdefault(tuple(sorted(query.items())), query)
+
+    for profile in EMBEDDED_REGISTRY.list_profiles():
+        component = profile.component("moe.decode")
+        assert component is not None, profile.profile_id
+        for query in queries.values():
+            hit = component.lookup(query)
+            assert hit is not None, (profile.profile_id, query)
+            assert _config_covers_query(query, hit.config), (
+                profile.profile_id,
+                query,
+                hit.config,
+            )
+
+
 def test_modelopt_w4a8_profile_worker_uses_a8_activation() -> None:
     from b12x.moe import fused_moe
 
     assert _activation_mode("w4a8_nvfp4") is fused_moe.ActivationMode.A8
 
 
-def test_relu2_w4a16_profile_fixture_conditions_synthetic_inputs() -> None:
+def test_candidate_environment_uses_default_w4a8_specializations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = (
+        "B12X_DYNAMIC_W4A8_MATERIALIZED",
+        "B12X_DYNAMIC_W4A8_SHARE_INPUT",
+        "B12X_W4A8_TINY_DECODE",
+    )
+    for name in names:
+        monkeypatch.setenv(name, "0")
+    candidate = MoeCandidate.create(
+        {
+            "backend": "dynamic",
+            "dynamic_route_mode": "grouped",
+            "dynamic_tile_m": 16,
+            "route_planner": "internal",
+            "max_active_clusters": None,
+            "w4a16_route_mode": None,
+        }
+    )
+
+    with _candidate_environment(candidate):
+        assert all(name not in os.environ for name in names)
+
+    assert all(os.environ[name] == "0" for name in names)
+
+
+def test_correctness_gate_detects_scale_errors_that_cosine_cannot() -> None:
+    reference = torch.tensor([1.0, 2.0, 3.0])
+    scaled = reference * 1.0e-8
+
+    assert _cosine_similarity(scaled, reference) > 0.999
+    assert _relative_norm_error(scaled, reference) > 0.99
+
+
+@pytest.mark.parametrize("activation", ("silu", "relu2"))
+def test_uniform_w4a16_tuner_reference_is_independent_of_routes(
+    activation: str,
+) -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "modelopt-w4a16"
+        and geometry.activation == activation
+    )
+    x = torch.tensor([[1.0, -0.5], [0.25, 0.75]])
+    topk_weights = torch.tensor([[0.25, 0.75], [0.9, 0.1]])
+
+    output = _uniform_w4a16_reference(
+        geometry,
+        x=x,
+        topk_weights=topk_weights,
+    )
+
+    fc1 = x.sum(dim=-1) * 0.5
+    if activation == "silu":
+        intermediate = torch.nn.functional.silu(fc1) * fc1
+    else:
+        intermediate = torch.square(torch.relu(fc1))
+    expected = intermediate * (0.5 * geometry.intermediate_size)
+    assert torch.allclose(output[:, 0], expected)
+    assert torch.equal(output, output[:, :1].expand_as(output))
+
+
+@pytest.mark.parametrize(
+    ("quant_mode", "backend", "w4a16_route_mode"),
+    (
+        ("w4a16", "dynamic", None),
+        ("w4a8_mx", "w4a16", "packed"),
+        ("w4a8_nvfp4", "w4a16", "packed"),
+    ),
+)
+def test_profile_coverage_rejects_cross_family_backends(
+    quant_mode: str,
+    backend: str,
+    w4a16_route_mode: str | None,
+) -> None:
+    query = {
+        "quant_mode": quant_mode,
+        "source_format": "modelopt_nvfp4",
+        "activation": "silu",
+        "num_experts": 256,
+        "hidden_size": 4096,
+        "intermediate_size": 1024,
+        "top_k": 8,
+        "num_tokens": 4,
+    }
+    config = {
+        "backend": backend,
+        "dynamic_route_mode": "grouped" if backend == "dynamic" else None,
+        "dynamic_tile_m": 16 if backend == "dynamic" else None,
+        "route_planner": "internal",
+        "max_active_clusters": None,
+        "w4a16_route_mode": w4a16_route_mode,
+    }
+
+    assert not _config_covers_query(query, config)
+
+
+def test_relu2_w4a16_profile_fixture_uses_full_scale_conditioned_inputs() -> None:
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
@@ -74,7 +224,529 @@ def test_relu2_w4a16_profile_fixture_conditions_synthetic_inputs() -> None:
         and geometry.activation == "relu2"
     )
 
-    assert _benchmark_input_scale(geometry) == 2.0**-20
+    assert _benchmark_input_scale(geometry) == 1.0
+
+
+def test_uniform_w4a16_profile_fixture_has_stable_positive_projections() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "modelopt-w4a16"
+        and geometry.activation == "silu"
+    )
+    generator = torch.Generator(device="cpu").manual_seed(17)
+    inputs = torch.randn(
+        (8, geometry.hidden_size),
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    conditioned = _condition_benchmark_inputs(geometry, inputs)
+
+    expected_sum = geometry.hidden_size**0.5
+    assert torch.allclose(
+        conditioned.sum(dim=-1),
+        torch.full((8,), expected_sum),
+        rtol=0.0,
+        atol=1.0e-3,
+    )
+
+
+def test_w4a16_tuner_enumerates_distinct_kernel_routes() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == "w4a16"
+    )
+
+    configs = tuple(
+        candidate.config.to_dict()
+        for candidate in _candidates_for_geometry(geometry, sm_count=48)
+    )
+
+    assert {config["backend"] for config in configs} == {"w4a16"}
+    assert {config["w4a16_route_mode"] for config in configs} == {
+        "direct",
+        "packed",
+    }
+    assert all(config["dynamic_tile_m"] is None for config in configs)
+
+
+def test_projection_mixed_trellis_enumerates_only_its_packed_route() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.trellis_variant == "glm-mcg-projection-tiered"
+    )
+    configs = tuple(
+        candidate.config.to_dict()
+        for candidate in _candidates_for_geometry(geometry, sm_count=188)
+    )
+
+    assert [config["w4a16_route_mode"] for config in configs] == ["packed"]
+    assert all(config["backend"] == "w4a16" for config in configs)
+
+
+def test_w4a16_tuner_models_native_and_packed_route_kernels() -> None:
+    cases = expand_sweep_cases()
+    glm_decode = next(
+        case
+        for case in cases
+        if case.geometry.recipe.recipe_id == "modelopt-w4a16"
+        and case.geometry.activation == "silu"
+        and case.top_k == 8
+        and case.num_tokens == 8
+        and case.route_pattern == "balanced"
+    )
+    e8m0_decode = next(
+        case
+        for case in cases
+        if case.geometry.recipe.recipe_id == "e8m0-w4a16"
+        and case.geometry.activation == "silu"
+        and case.geometry.intermediate_size % 128 == 0
+        and case.is_model_native_top_k
+        and case.num_tokens == 8
+        and case.route_pattern == "balanced"
+    )
+    compressed_direct = next(
+        case
+        for case in cases
+        if case.geometry.recipe.recipe_id == "compressed-tensors-w4a16"
+        and case.geometry.activation == "relu2"
+        and case.is_model_native_top_k
+        and case.num_tokens == 6
+        and case.route_pattern == "balanced"
+    )
+    relu2_direct = next(
+        case
+        for case in cases
+        if case.geometry.recipe.recipe_id == "modelopt-w4a16"
+        and case.geometry.activation == "relu2"
+        and case.num_tokens == 6
+        and case.route_pattern == "balanced"
+    )
+    relu2_packed_only = next(
+        case
+        for case in cases
+        if case.geometry.key == relu2_direct.geometry.key
+        and case.top_k == relu2_direct.top_k
+        and case.num_tokens == 16
+        and case.route_pattern == "balanced"
+    )
+
+    assert _w4a16_weight_layout(glm_decode.geometry) == "modelopt"
+    assert (
+        _w4a16_direct_path(glm_decode.geometry, glm_decode)
+        == "w4a16.small_m_direct"
+    )
+    assert _w4a16_weight_layout(e8m0_decode.geometry) == "packed"
+    assert (
+        _w4a16_direct_path(e8m0_decode.geometry, e8m0_decode)
+        == "w4a16.tc_decode"
+    )
+    assert _w4a16_weight_layout(compressed_direct.geometry) == "packed"
+    assert (
+        _w4a16_direct_path(compressed_direct.geometry, compressed_direct)
+        == "w4a16.direct_topk"
+    )
+    assert (
+        _w4a16_direct_path(relu2_direct.geometry, relu2_direct)
+        == "w4a16.small_m_direct"
+    )
+    assert _w4a16_direct_path(relu2_packed_only.geometry, relu2_packed_only) is None
+
+
+def test_w4a16_tuner_layout_matches_canonical_weight_planning() -> None:
+    from b12x.moe import fused_moe
+
+    expected_layout = {
+        fused_moe.WeightPacking.SOURCE_NATIVE: "modelopt",
+        fused_moe.WeightPacking.MMA_PACKED: "packed",
+    }
+    geometries = (
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == "w4a16"
+        and geometry.recipe.trellis_variant is None
+    )
+    for geometry in geometries:
+        source = fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat(geometry.recipe.source_format),
+            w13_layout=(
+                fused_moe.W13Layout.W31
+                if geometry.recipe.source_format == "modelopt_nvfp4"
+                else fused_moe.W13Layout.W13
+            ),
+        )
+        plan = fused_moe.plan_weights(
+            source=source,
+            activation=fused_moe.ActivationSpec(
+                mode=fused_moe.ActivationMode.A16,
+                nonlinearity=geometry.activation,
+                io_dtype=torch.bfloat16,
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=geometry.num_experts,
+                hidden_size=geometry.hidden_size,
+                intermediate_size=geometry.intermediate_size,
+            ),
+        )
+
+        assert _w4a16_weight_layout(geometry) == expected_layout[
+            plan.prepared_format.packing
+        ]
+
+
+def test_concrete_candidate_path_reads_the_exact_execution_variant() -> None:
+    case = next(
+        case
+        for case in expand_sweep_cases()
+        if case.geometry.recipe.recipe_id == "modelopt-w4a16"
+        and case.geometry.activation == "silu"
+        and case.top_k == 8
+        and case.num_tokens == 8
+        and case.route_pattern == "balanced"
+    )
+    candidate = MoeCandidate.create(
+        {
+            "backend": "w4a16",
+            "dynamic_route_mode": None,
+            "dynamic_tile_m": None,
+            "route_planner": "internal",
+            "max_active_clusters": None,
+            "w4a16_route_mode": "direct",
+        }
+    )
+    resolved_config = fused_moe_impl.MoeDecodeConfig.from_profile(candidate.config)
+    actual_plan = SimpleNamespace(
+        deterministic_output=False,
+        policy_resolution=SimpleNamespace(config=resolved_config),
+    )
+    variant = SimpleNamespace(
+        _impl=actual_plan,
+        execution=SimpleNamespace(tile_m=None),
+        implementation="w4a16",
+    )
+    capacity_plan = SimpleNamespace(variant_for=lambda _tokens: variant)
+
+    assert (
+        _concrete_candidate_path(
+            geometry=case.geometry,
+            case=case,
+            candidate=candidate,
+            plan=capacity_plan,
+            binding=SimpleNamespace(implementation="w4a16"),
+            prepared_payload=SimpleNamespace(weight_layout="modelopt"),
+        )
+        == "w4a16.small_m_direct"
+    )
+
+
+def test_concrete_candidate_path_reports_projection_mixed_trellis() -> None:
+    case = next(
+        case
+        for case in expand_sweep_cases()
+        if case.geometry.recipe.recipe_id == "trellis-glm-w4a16"
+        and case.is_model_native_top_k
+        and case.num_tokens == 8
+        and case.route_pattern == "balanced"
+    )
+    candidate = MoeCandidate.create(
+        {
+            "backend": "w4a16",
+            "dynamic_route_mode": None,
+            "dynamic_tile_m": None,
+            "route_planner": "internal",
+            "max_active_clusters": None,
+            "w4a16_route_mode": "packed",
+        }
+    )
+    resolved_config = fused_moe_impl.MoeDecodeConfig.from_profile(candidate.config)
+    variant = SimpleNamespace(
+        _impl=SimpleNamespace(
+            deterministic_output=False,
+            policy_resolution=SimpleNamespace(config=resolved_config),
+        ),
+        execution=SimpleNamespace(tile_m=None),
+        implementation="w4a16",
+    )
+
+    assert (
+        _concrete_candidate_path(
+            geometry=case.geometry,
+            case=case,
+            candidate=candidate,
+            plan=SimpleNamespace(variant_for=lambda _tokens: variant),
+            binding=SimpleNamespace(implementation="trellis_mixed3"),
+            prepared_payload=SimpleNamespace(weight_layout="trellis_mixed3"),
+        )
+        == "w4a16.trellis_mixed3"
+    )
+
+
+@pytest.mark.parametrize(
+    ("recipe_id", "backend", "tile_m", "route_mode", "expected"),
+    (
+        ("e8m0-w4a8", "micro", None, None, "w4a8.tiny_decode"),
+        (
+            "modelopt-w4a8-nvfp4",
+            "micro",
+            None,
+            None,
+            "w4a8.direct_micro",
+        ),
+        ("e8m0-w4a8", "dynamic", 16, "direct", "w4a8.dynamic.direct.m16"),
+        ("e8m0-w4a8", "dynamic", 16, "grouped", "w4a8.dynamic.decode.m16"),
+        ("e8m0-w4a8", "dynamic", 32, "grouped", "w4a8.dynamic.dense.m32"),
+        (
+            "modelopt-w4a8-nvfp4",
+            "dynamic",
+            16,
+            "grouped",
+            "w4a8.dynamic.grouped.m16",
+        ),
+    ),
+)
+def test_concrete_candidate_path_reports_w4a8_specializations(
+    monkeypatch: pytest.MonkeyPatch,
+    recipe_id: str,
+    backend: str,
+    tile_m: int | None,
+    route_mode: str | None,
+    expected: str,
+) -> None:
+    monkeypatch.delenv("B12X_DYNAMIC_WORK_SOURCE", raising=False)
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == recipe_id
+        and geometry.activation == "silu"
+    )
+    case = next(
+        case
+        for case in expand_sweep_cases(geometries=(geometry,))
+        if case.is_model_native_top_k
+        and case.num_tokens == 1
+        and case.route_pattern == "balanced"
+    )
+    candidate = MoeCandidate.create(
+        {
+            "backend": backend,
+            "dynamic_route_mode": route_mode,
+            "dynamic_tile_m": tile_m,
+            "route_planner": "internal",
+            "max_active_clusters": None,
+            "w4a16_route_mode": None,
+        }
+    )
+    resolved_config = fused_moe_impl.MoeDecodeConfig.from_profile(candidate.config)
+    variant = SimpleNamespace(
+        _impl=SimpleNamespace(
+            deterministic_output=False,
+            policy_resolution=SimpleNamespace(config=resolved_config),
+        ),
+        execution=SimpleNamespace(tile_m=tile_m),
+        implementation=backend,
+    )
+
+    assert (
+        _concrete_candidate_path(
+            geometry=geometry,
+            case=case,
+            candidate=candidate,
+            plan=SimpleNamespace(variant_for=lambda _tokens: variant),
+            binding=SimpleNamespace(implementation=backend),
+            prepared_payload=SimpleNamespace(weight_layout="prepared"),
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("quant_mode", "route_modes"),
+    (("w4a8_mx", {"direct", "grouped"}), ("w4a8_nvfp4", {"grouped"})),
+)
+def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
+    quant_mode: str,
+    route_modes: set[str],
+) -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == quant_mode
+    )
+
+    configs = tuple(
+        candidate.config.to_dict()
+        for candidate in _candidates_for_geometry(geometry, sm_count=48)
+    )
+
+    assert sum(config["backend"] == "micro" for config in configs) == 1
+    assert {
+        config["dynamic_tile_m"] for config in configs if config["backend"] == "dynamic"
+    } == {16, 32, 64, 128}
+    assert {
+        config["dynamic_route_mode"]
+        for config in configs
+        if config["backend"] == "dynamic"
+    } == route_modes
+    assert all(config["w4a16_route_mode"] is None for config in configs)
+
+
+def test_nvfp4_triton_route_candidates_only_use_the_supported_tile() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == "nvfp4"
+        and geometry.activation == "silu"
+    )
+
+    configs = tuple(
+        candidate.config
+        for candidate in _candidates_for_geometry(geometry, sm_count=48)
+        if candidate.config["route_planner"] == "triton"
+    )
+
+    assert configs
+    assert {config["dynamic_tile_m"] for config in configs} == {16}
+    assert {config["dynamic_route_mode"] for config in configs} == {"grouped"}
+
+
+def test_every_corpus_geometry_and_capacity_has_an_applicable_candidate() -> None:
+    candidates_by_geometry = {}
+    checked = set()
+    missing = []
+    for case in expand_sweep_cases():
+        key = (case.geometry.key, case.top_k, case.num_tokens)
+        if key in checked:
+            continue
+        checked.add(key)
+        candidates = candidates_by_geometry.get(case.geometry.key)
+        if candidates is None:
+            candidates = _candidates_for_geometry(case.geometry, sm_count=188)
+            candidates_by_geometry[case.geometry.key] = candidates
+        if not moe_gpu_worker._eligible_candidates_for_case(
+            case.geometry,
+            case,
+            candidates,
+        ):
+            missing.append(case.case_id)
+
+    assert not missing
+
+
+@pytest.mark.parametrize(
+    ("quant_mode", "expect_dynamic_direct"),
+    (("w4a8_mx", True), ("w4a8_nvfp4", False)),
+)
+def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
+    quant_mode: str,
+    expect_dynamic_direct: bool,
+) -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == quant_mode
+        and geometry.activation == "silu"
+    )
+    cases = expand_sweep_cases(geometries=(geometry,))
+    small = next(
+        case
+        for case in cases
+        if case.is_model_native_top_k
+        and case.num_tokens == 1
+        and case.route_pattern == "balanced"
+    )
+    large = next(
+        case
+        for case in cases
+        if case.is_model_native_top_k
+        and case.num_tokens == 8
+        and case.route_pattern == "balanced"
+    )
+    candidates = _candidates_for_geometry(geometry, sm_count=48)
+
+    small_configs = tuple(
+        candidate.config
+        for candidate in moe_gpu_worker._eligible_candidates_for_case(
+            geometry,
+            small,
+            candidates,
+        )
+    )
+    large_configs = tuple(
+        candidate.config
+        for candidate in moe_gpu_worker._eligible_candidates_for_case(
+            geometry,
+            large,
+            candidates,
+        )
+    )
+
+    assert any(config["backend"] == "micro" for config in small_configs)
+    assert any(
+        config["backend"] == "dynamic"
+        and config["dynamic_tile_m"] == 16
+        and config["dynamic_route_mode"] == "grouped"
+        for config in small_configs
+    )
+    assert (
+        any(
+            config["backend"] == "dynamic"
+            and config["dynamic_tile_m"] == 16
+            and config["dynamic_route_mode"] == "direct"
+            for config in small_configs
+        )
+        is expect_dynamic_direct
+    )
+    assert not any(
+        config["backend"] == "dynamic"
+        and config["dynamic_route_mode"] == "direct"
+        for config in large_configs
+    )
+    if quant_mode == "w4a8_nvfp4":
+        assert any(config["backend"] == "micro" for config in large_configs)
+
+
+def test_w4a8_tuner_does_not_treat_gb10_micro_preference_as_support() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == "w4a8_mx"
+        and geometry.hidden_size == 6144
+        and geometry.intermediate_size == 1024
+    )
+    case = next(
+        case
+        for case in expand_sweep_cases(geometries=(geometry,))
+        if case.is_model_native_top_k
+        and case.num_tokens == 3
+        and case.route_pattern == "balanced"
+    )
+    candidates = _candidates_for_geometry(geometry, sm_count=_DEVICE.sm_count)
+
+    eligible = moe_gpu_worker._eligible_candidates_for_case(
+        geometry,
+        case,
+        candidates,
+    )
+    heuristic = fused_moe_impl._heuristic_moe_decode_config(
+        fused_moe_impl.MoeDecodeQuery(
+            quant_mode=geometry.recipe.quant_mode,
+            source_format=geometry.recipe.source_format,
+            activation=geometry.activation,
+            num_experts=geometry.num_experts,
+            hidden_size=geometry.hidden_size,
+            intermediate_size=geometry.intermediate_size,
+            top_k=case.top_k,
+            num_tokens=case.num_tokens,
+            routed_rows=case.routed_rows,
+        ),
+        _DEVICE,
+    )
+
+    assert any(candidate.config["backend"] == "micro" for candidate in eligible)
+    assert heuristic.backend == "dynamic"
 
 
 class _Session(AbstractContextManager["_Session"]):
@@ -82,13 +754,37 @@ class _Session(AbstractContextManager["_Session"]):
         self,
         calls: list[tuple[str, tuple[str, ...]]],
         *,
-        tunable: bool,
+        quant_mode: str,
     ) -> None:
         self._calls = calls
-        self._candidates = tuple(
-            MoeCandidate.create({"backend": backend})
-            for backend in (("micro", "dynamic") if tunable else ("dynamic",))
-        )
+        if quant_mode == "w4a16":
+            configs = (
+                {
+                    "backend": "w4a16",
+                    "dynamic_route_mode": None,
+                    "dynamic_tile_m": None,
+                    "route_planner": "internal",
+                    "max_active_clusters": None,
+                    "w4a16_route_mode": route_mode,
+                }
+                for route_mode in ("packed", "direct")
+            )
+        else:
+            backends = ("dynamic",) if quant_mode == "w6a8_mx" else ("micro", "dynamic")
+            configs = (
+                {
+                    "backend": backend,
+                    "dynamic_route_mode": (
+                        "grouped" if backend == "dynamic" else None
+                    ),
+                    "dynamic_tile_m": 128 if backend == "dynamic" else None,
+                    "route_planner": "internal",
+                    "max_active_clusters": None,
+                    "w4a16_route_mode": None,
+                }
+                for backend in backends
+            )
+        self._candidates = tuple(MoeCandidate.create(config) for config in configs)
 
     @property
     def candidates(self) -> tuple[MoeCandidate, ...]:
@@ -105,6 +801,10 @@ class _Session(AbstractContextManager["_Session"]):
             candidate
             for candidate in candidates
             if not (candidate.config["backend"] == "micro" and case.num_tokens > 8)
+            and not (
+                candidate.config.get("w4a16_route_mode") == "direct"
+                and case.num_tokens > 8
+            )
         )
 
     def measure(self, case, candidates, *, correctness=False):
@@ -115,10 +815,12 @@ class _Session(AbstractContextManager["_Session"]):
         measurements = []
         for candidate in candidates:
             backend = candidate.config["backend"]
+            route_mode = candidate.config.get("w4a16_route_mode")
+            is_decode_candidate = backend == "micro" or route_mode == "direct"
             if case.num_tokens == 1:
-                latency = 10.0 if backend == "micro" else 20.0
+                latency = 10.0 if is_decode_candidate else 20.0
             else:
-                latency = 30.0 if backend == "micro" else 15.0
+                latency = 30.0 if is_decode_candidate else 15.0
             if case.route_pattern == "hot":
                 latency *= 1.1
             measurements.append(
@@ -140,7 +842,28 @@ class _Factory:
         del context
         return _Session(
             self.calls,
-            tunable=geometry.recipe.quant_mode == "nvfp4",
+            quant_mode=geometry.recipe.quant_mode,
+        )
+
+
+class _CandidateSpecificScreenSession(_Session):
+    def eligible_candidates(self, case, candidates):
+        return tuple(
+            candidate
+            for candidate in candidates
+            if candidate.config["backend"] != "micro" or case.num_tokens == 1
+        )
+
+
+@dataclass
+class _CandidateSpecificScreenFactory:
+    calls: list[tuple[str, tuple[str, ...]]]
+
+    def __call__(self, geometry, context):
+        del context
+        return _CandidateSpecificScreenSession(
+            self.calls,
+            quant_mode=geometry.recipe.quant_mode,
         )
 
 
@@ -276,7 +999,54 @@ def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> No
     assert component.lookup({**base_query, "num_tokens": 2_048}) is None
 
 
-def test_prefill_capacities_are_qualified_once_per_geometry(
+def test_correctness_screen_uses_an_eligible_anchor_per_candidate(tmp_path) -> None:
+    calls = []
+    generator = _generator(calls, token_counts=(1, 4))
+    generator._benchmark_factory = _CandidateSpecificScreenFactory(calls)
+
+    result = generator.generate(
+        _context(tmp_path),
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+
+    cases_by_id = {case.case_id: case for case in generator._cases}
+    screen_tokens = [cases_by_id[case_id].num_tokens for case_id, _ in calls[:2]]
+    assert screen_tokens == [1, 4]
+    profile = profile_from_dict(
+        {
+            "profile_id": "nvidia.synthetic.48sm",
+            "targets": [
+                {
+                    "vendor": "nvidia",
+                    "compute_capability": [12, 1],
+                    "sm_count": 48,
+                    "product_name": "Synthetic GPU",
+                }
+            ],
+            "components": [result.component],
+        }
+    )
+    component = profile.component("moe.decode")
+    assert component is not None
+    assert (
+        component.lookup(
+            {
+                "quant_mode": "nvfp4",
+                "source_format": "modelopt_nvfp4",
+                "activation": "silu",
+                "num_experts": 16,
+                "hidden_size": 256,
+                "intermediate_size": 64,
+                "top_k": 2,
+                "num_tokens": 1,
+            }
+        ).config["backend"]
+        == "micro"
+    )
+
+
+def test_prefill_capacities_are_measured_for_each_top_k(
     tmp_path,
 ) -> None:
     calls = []
@@ -299,10 +1069,12 @@ def test_prefill_capacities_are_qualified_once_per_geometry(
         if cases_by_id[case_id].num_tokens >= 512
     ]
     assert {(case.num_tokens, case.top_k) for case in capacity_calls} == {
+        (512, 1),
         (512, 2),
+        (1_024, 1),
         (1_024, 2),
     }
-    assert result.component["coverage"]["qualified_capacity_query_points"] == 2
+    assert result.component["coverage"]["measured_query_points"] == 6
 
     profile = profile_from_dict(
         {
@@ -352,18 +1124,27 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
     configs = {
         "micro": {
             "backend": "micro",
+            "dynamic_route_mode": None,
+            "dynamic_tile_m": None,
             "route_planner": "internal",
             "max_active_clusters": None,
+            "w4a16_route_mode": None,
         },
         "triton": {
             "backend": "dynamic",
+            "dynamic_route_mode": "grouped",
+            "dynamic_tile_m": 16,
             "route_planner": "triton",
             "max_active_clusters": 24,
+            "w4a16_route_mode": None,
         },
         "dynamic": {
             "backend": "dynamic",
+            "dynamic_route_mode": "grouped",
+            "dynamic_tile_m": 128,
             "route_planner": "internal",
             "max_active_clusters": None,
+            "w4a16_route_mode": None,
         },
     }
     measured = tuple(
@@ -420,8 +1201,8 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
                 "components": [
                     {
                         "component_id": "moe.decode",
-                        "query_schema_version": 2,
-                        "config_schema_version": 1,
+                        "query_schema_version": 3,
+                        "config_schema_version": 3,
                         "planner": decision_node_to_dict(planner),
                     }
                 ],
@@ -441,6 +1222,69 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
         )
 
 
+@pytest.mark.parametrize("top_k", (1, 2))
+def test_sparse_token_coverage_preserves_dynamic_direct_boundary(top_k: int) -> None:
+    base_query = {
+        "quant_mode": "nvfp4",
+        "source_format": "modelopt_nvfp4",
+        "activation": "silu",
+        "num_experts": 256,
+        "hidden_size": 4096,
+        "intermediate_size": 1024,
+        "top_k": top_k,
+    }
+    direct = {
+        "backend": "dynamic",
+        "dynamic_route_mode": "direct",
+        "dynamic_tile_m": 16,
+        "route_planner": "internal",
+        "max_active_clusters": None,
+        "w4a16_route_mode": None,
+    }
+    grouped = {**direct, "dynamic_route_mode": "grouped"}
+    direct_limit = fused_moe_impl._DIRECT_ROUTING_MAX_ROUTED_ROWS // top_k
+    measured = tuple(
+        DecisionRecord.create(
+            query={**base_query, "num_tokens": num_tokens},
+            config=config,
+        )
+        for num_tokens, config in (
+            (1, direct),
+            (direct_limit, direct),
+            (64, grouped),
+            (128, grouped),
+        )
+    )
+    dense = synthesize_integer_axis_coverage(
+        measured,
+        field="num_tokens",
+        minimum=1,
+        maximum=128,
+        config_is_valid=_config_covers_query,
+    )
+    sparse = _synthesize_token_capacity_coverage(
+        measured,
+        minimum=1,
+        maximum=128,
+    )
+    field_order = (*base_query, "num_tokens")
+    dense_tree = build_axis_tree(
+        dense,
+        field_order=field_order,
+        range_fields=frozenset({"num_tokens"}),
+    )
+    sparse_tree = build_axis_tree(
+        sparse,
+        field_order=field_order,
+        range_fields=frozenset({"num_tokens"}),
+        nearest_range_bounds={"num_tokens": (1, 128)},
+    )
+
+    for num_tokens in range(1, 129):
+        query = {**base_query, "num_tokens": num_tokens}
+        assert sparse_tree.lookup(query).config == dense_tree.lookup(query).config
+
+
 def test_moe_resume_retries_checkpoint_when_every_candidate_errored(
     tmp_path,
 ) -> None:
@@ -453,12 +1297,13 @@ def test_moe_resume_retries_checkpoint_when_every_candidate_errored(
         for case in generator._cases
         if case.num_tokens == 4 and case.route_pattern == "balanced"
     )
-    candidates = _Session([], tunable=True).candidates
+    candidates = _Session([], quant_mode="nvfp4").candidates
     checkpoints.save(
         generator.component_id,
         f"screen-{case.case_id}",
         {
-            "schema_version": 1,
+            "schema_version": 2,
+            "candidate_contract_version": 1,
             "generation": context.checkpoint_metadata(),
             "case_id": case.case_id,
             "query": case.query(),
@@ -482,10 +1327,8 @@ def test_moe_resume_retries_checkpoint_when_every_candidate_errored(
         checkpoints=checkpoints,
     )
 
-    assert calls[0] == (
-        case.case_id,
-        tuple(candidate.candidate_id for candidate in candidates),
-    )
+    assert calls[0][0] == case.case_id
+    assert set(calls[0][1]) == {candidate.candidate_id for candidate in candidates}
     refreshed = checkpoints.load(
         generator.component_id,
         f"screen-{case.case_id}",
@@ -645,7 +1488,7 @@ def test_trellis_profile_worker_uses_serving_dtype(
     recipe = MoeRecipe(
         recipe_id="trellis-test",
         quant_mode="w4a16",
-        source_format="btx",
+        source_format="b12x_trellis",
         intermediate_alignment=128,
         minimum_intermediate_size=128,
         trellis_variant=variant,
@@ -699,7 +1542,7 @@ def test_projection_mixed_bind_initializes_grid_barrier_workspace() -> None:
     recipe = MoeRecipe(
         recipe_id="trellis-bind-test",
         quant_mode="w4a16",
-        source_format="btx",
+        source_format="b12x_trellis",
         intermediate_alignment=128,
         minimum_intermediate_size=128,
         trellis_variant="glm-mcg-projection-tiered",
@@ -725,9 +1568,12 @@ def test_projection_mixed_bind_initializes_grid_barrier_workspace() -> None:
         MOE_DECODE,
         fused_moe.MoeDecodeConfig.from_profile(
             {
-                "backend": "dynamic",
+                "backend": "w4a16",
+                "dynamic_route_mode": None,
+                "dynamic_tile_m": None,
                 "route_planner": "internal",
                 "max_active_clusters": None,
+                "w4a16_route_mode": "packed",
             }
         ),
     )
@@ -759,7 +1605,7 @@ def test_projection_mixed_bind_initializes_grid_barrier_workspace() -> None:
     assert int(torch.count_nonzero(workspace)) == 0
 
 
-def test_single_backend_geometries_are_gpu_qualified_before_profile_coverage(
+def test_w4a16_geometries_race_direct_and_packed_kernels(
     tmp_path,
 ) -> None:
     calls = []
@@ -771,14 +1617,14 @@ def test_single_backend_geometries_are_gpu_qualified_before_profile_coverage(
         checkpoints=CheckpointStore(tmp_path / "checkpoints"),
     )
 
-    assert len(calls) == 5
-    assert result.evidence["gpu_measurement_cases"] == 5
+    assert len(calls) == 9
+    assert result.evidence["gpu_measurement_cases"] == 9
     assert "precomputed_cases" not in result.evidence
     assert result.component["coverage"]["measured_query_points"] == 2
     assert result.component["coverage"]["runtime_query_points"] == 4
 
 
-def test_single_backend_does_not_repeat_qualification_at_capacity(tmp_path) -> None:
+def test_w4a16_prefill_capacities_are_measured(tmp_path) -> None:
     calls = []
     generator = _generator(
         calls,
@@ -796,8 +1642,8 @@ def test_single_backend_does_not_repeat_qualification_at_capacity(tmp_path) -> N
     measured_tokens = {
         cases_by_id[case_id].num_tokens for case_id, _candidate_ids in calls
     }
-    assert measured_tokens == {1}
-    assert result.component["coverage"]["qualified_capacity_query_points"] == 0
+    assert measured_tokens == {1, 512, 1_024}
+    assert result.component["coverage"]["measured_query_points"] == 3
 
 
 def test_production_moe_factory_isolates_each_geometry_process(tmp_path) -> None:
@@ -851,6 +1697,94 @@ def test_moe_process_session_retries_accelerator_failure_once(
     assert len(requests) == 2
     assert discards == ["discard"]
     assert result.metrics["worker_retries"] == 1
+
+
+def test_moe_remote_worker_error_is_picklable() -> None:
+    original = _MoeRemoteWorkerError(
+        operation="measure",
+        exception_type="AcceleratorError",
+        error="CUDA illegal address",
+        remote_traceback="remote stack",
+    )
+
+    with ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=multiprocessing.get_context("spawn"),
+    ) as executor:
+        restored = executor.submit(
+            _MoeRemoteWorkerError,
+            original.operation,
+            original.exception_type,
+            original.remote_error,
+            original.remote_traceback,
+        ).result()
+
+    assert restored.operation == original.operation
+    assert restored.exception_type == original.exception_type
+    assert restored.remote_error == original.remote_error
+    assert restored.remote_traceback == original.remote_traceback
+    assert str(restored) == str(original)
+
+
+def test_moe_process_session_isolates_failed_candidate_after_batch_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    generator = _generator([])
+    geometry = next(
+        geometry
+        for geometry in generator._geometries
+        if len(_candidates_for_geometry(geometry, sm_count=48)) >= 3
+    )
+    case = next(case for case in generator._cases if case.geometry == geometry)
+    session = _MoeProcessSession(geometry, _context(tmp_path))
+    candidates = session.candidates[:3]
+    requests = []
+    discards = []
+
+    monkeypatch.setattr(session, "_start", lambda: None)
+
+    def request(operation, **payload):
+        candidate_ids = payload["candidate_ids"]
+        requests.append(candidate_ids)
+        if len(candidate_ids) > 1 or candidate_ids == (candidates[1].candidate_id,):
+            raise _MoeRemoteWorkerError(
+                operation="measure",
+                exception_type="AcceleratorError",
+                error="CUDA illegal address",
+            )
+        candidate = next(
+            candidate
+            for candidate in candidates
+            if candidate.candidate_id == candidate_ids[0]
+        )
+        return {
+            "measurements": [
+                MoeMeasurement(
+                    candidate=candidate,
+                    latency_us=10.0,
+                    cosine=1.0,
+                ).to_dict()
+            ]
+        }
+
+    monkeypatch.setattr(session, "_request", request)
+    monkeypatch.setattr(session, "_discard_worker", lambda: discards.append(True))
+
+    results = session.measure(case, candidates, correctness=True)
+
+    assert requests == [
+        tuple(candidate.candidate_id for candidate in candidates),
+        (candidates[0].candidate_id,),
+        (candidates[1].candidate_id,),
+        (candidates[2].candidate_id,),
+    ]
+    assert len(discards) == 2
+    assert results[0].error is None
+    assert results[1].latency_us is None
+    assert results[1].error == "AcceleratorError: CUDA illegal address"
+    assert results[2].error is None
+    assert all(result.metrics["worker_retries"] == 1 for result in results)
 
 
 def test_moe_geometry_worker_binds_device_before_starting_session(

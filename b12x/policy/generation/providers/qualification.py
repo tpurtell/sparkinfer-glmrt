@@ -580,146 +580,6 @@ class _SparseMlaProbe:
         return tuple(measurements)
 
 
-class _MhcProbe:
-    _CASES = (
-        (4, 4_096, 64),
-        (6, 4_096, 64),
-        (32, 4_096, 64),
-        (4, 7_168, 112),
-    )
-
-    @property
-    def case_count(self) -> int:
-        return len(self._CASES)
-
-    @property
-    def case_ids(self) -> tuple[str, ...]:
-        return tuple(
-            f"post-pre-m{tokens}-h{hidden_size}"
-            for tokens, hidden_size, _split_k in self._CASES
-        )
-
-    @property
-    def description(self) -> str:
-        return "production mHC post/pre graph qualification"
-
-    def __call__(
-        self,
-        context: GenerationContext,
-    ) -> tuple[GpuProbeMeasurement, ...]:
-        import torch
-
-        from b12x.norm import mhc
-        from b12x.policy import PolicyContext, PolicyMode
-        from benchmarks.benchmark_residual import (
-            _make_inputs,
-            _mhc_pre_reference,
-            _post_pre_reference,
-        )
-
-        device = torch.device("cuda", context.device_ordinal)
-        flush = _l2_flush_fn(device, enabled=context.settings.cold_l2)
-        policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
-        measurements = []
-        for index, (tokens, hidden_size, split_k) in enumerate(self._CASES):
-            residual, x, fn, scale, bias = _make_inputs(
-                tokens=tokens,
-                hidden_size=hidden_size,
-                seed=context.settings.seed + 17 * index,
-                device=device,
-            )
-            plan = mhc.plan(
-                mhc.Caps(
-                    device=device,
-                    max_tokens=tokens,
-                    hidden_size=hidden_size,
-                    split_k=split_k,
-                ),
-                policy=policy,
-            )
-            scratch = tuple(
-                torch.empty(shape, dtype=dtype, device=device)
-                for shape, dtype in plan.shapes_and_dtypes()
-            )
-            output = torch.empty(
-                (tokens, 4, hidden_size),
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            y = torch.empty(
-                (tokens, hidden_size),
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            post = torch.empty((tokens, 4), dtype=torch.float32, device=device)
-            comb = torch.empty((tokens, 4, 4), dtype=torch.float32, device=device)
-            binding = mhc.bind(
-                plan,
-                scratch=scratch,
-                tokens=tokens,
-                y=y,
-                post=post,
-                comb=comb,
-                out=output,
-            )
-            _, prev_post, prev_comb = _mhc_pre_reference(
-                residual,
-                fn,
-                scale,
-                bias,
-                rms_eps=1.0e-6,
-                hc_eps=1.0e-6,
-                sinkhorn_iters=20,
-            )
-            prev_post = prev_post.contiguous()
-            prev_comb = prev_comb.contiguous()
-            expected, _expected_y, _expected_post, _expected_comb = (
-                _post_pre_reference(
-                    x,
-                    residual,
-                    prev_post,
-                    prev_comb,
-                    fn,
-                    scale,
-                    bias,
-                    rms_eps=1.0e-6,
-                    hc_eps=1.0e-6,
-                    sinkhorn_iters=20,
-                    norm_weight=None,
-                    norm_eps=1.0e-6,
-                )
-            )
-
-            def run() -> None:
-                mhc.run_post_pre(
-                    x,
-                    residual,
-                    prev_post,
-                    prev_comb,
-                    fn,
-                    scale,
-                    bias,
-                    rms_eps=1.0e-6,
-                    hc_eps=1.0e-6,
-                    sinkhorn_iters=20,
-                    binding=binding,
-                )
-
-            measurements.append(
-                _timed_graph_measurement(
-                    context=context,
-                    label=f"post-pre-m{tokens}-h{hidden_size}",
-                    run=run,
-                    output=output,
-                    expected=expected,
-                    flush=flush,
-                )
-            )
-            gc.collect()
-            torch.cuda.empty_cache()
-        return tuple(measurements)
-
-
 class _EpMoeProbe:
     _CASES = ((4, 4), (16, 8))
 
@@ -1085,34 +945,6 @@ class SparseMlaGenerator(MeasuredPolicyGenerator):
         )
 
 
-class MhcGenerator(MeasuredPolicyGenerator):
-    """Generate a measured policy for mHC residual fusion."""
-
-    def __init__(self) -> None:
-        from b12x.norm.mhc._policy import MHC_POLICY, MhcQuery
-
-        queries = tuple(
-            MhcQuery(
-                dtype="bfloat16",
-                max_tokens=tokens,
-                hidden_size=hidden_size,
-                split_k=split_k,
-            )
-            for tokens, hidden_size, split_k in (
-                (4, 4_096, 64),
-                (6, 4_096, 64),
-                (32, 4_096, 64),
-                (4, 7_168, 112),
-            )
-        )
-        super().__init__(
-            policy=MHC_POLICY,
-            queries=queries,
-            encode_config=lambda config: config.to_dict(),
-            probe=_MhcProbe(),
-        )
-
-
 class EpMoeGenerator(MeasuredPolicyGenerator):
     """Generate a measured policy for replicated-input EP MoE."""
 
@@ -1142,6 +974,5 @@ class EpMoeGenerator(MeasuredPolicyGenerator):
 __all__ = [
     "DsaIndexerGenerator",
     "EpMoeGenerator",
-    "MhcGenerator",
     "SparseMlaGenerator",
 ]

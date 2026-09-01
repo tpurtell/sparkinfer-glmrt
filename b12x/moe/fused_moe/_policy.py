@@ -11,8 +11,6 @@ from b12x.policy import (
     DeviceIdentity,
     FrozenMapping,
 )
-
-
 @dataclass(frozen=True)
 class MoeDecodeQuery:
     quant_mode: str
@@ -44,13 +42,19 @@ class MoeDecodeConfig:
     backend: str
     route_planner: str
     max_active_clusters: int | None
+    dynamic_tile_m: int | None = None
+    dynamic_route_mode: str | None = None
+    w4a16_route_mode: str | None = None
 
     @classmethod
     def from_profile(cls, payload: FrozenMapping) -> "MoeDecodeConfig":
         expected = {
             "backend",
+            "dynamic_route_mode",
+            "dynamic_tile_m",
             "max_active_clusters",
             "route_planner",
+            "w4a16_route_mode",
         }
         if set(payload) != expected:
             raise ValueError(
@@ -60,6 +64,9 @@ class MoeDecodeConfig:
         backend = payload["backend"]
         route_planner = payload["route_planner"]
         max_active_clusters = payload["max_active_clusters"]
+        dynamic_tile_m = payload["dynamic_tile_m"]
+        dynamic_route_mode = payload["dynamic_route_mode"]
+        w4a16_route_mode = payload["w4a16_route_mode"]
         if not isinstance(backend, str) or not isinstance(route_planner, str):
             raise TypeError("MoE backend and route_planner must be strings")
         if max_active_clusters is not None and (
@@ -67,10 +74,21 @@ class MoeDecodeConfig:
             or isinstance(max_active_clusters, bool)
         ):
             raise TypeError("max_active_clusters must be an integer or null")
+        if dynamic_tile_m is not None and (
+            not isinstance(dynamic_tile_m, int) or isinstance(dynamic_tile_m, bool)
+        ):
+            raise TypeError("dynamic_tile_m must be an integer or null")
+        if dynamic_route_mode is not None and not isinstance(dynamic_route_mode, str):
+            raise TypeError("dynamic_route_mode must be a string or null")
+        if w4a16_route_mode is not None and not isinstance(w4a16_route_mode, str):
+            raise TypeError("w4a16_route_mode must be a string or null")
         return cls(
             backend=backend,
             route_planner=route_planner,
             max_active_clusters=max_active_clusters,
+            dynamic_tile_m=dynamic_tile_m,
+            dynamic_route_mode=dynamic_route_mode,
+            w4a16_route_mode=w4a16_route_mode,
         )
 
 
@@ -79,12 +97,28 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
-    if config.backend not in {"micro", "dynamic"}:
+    if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
+    if query.quant_mode == "w4a16":
+        if config.backend != "w4a16":
+            raise ValueError("W4A16 queries require the W4A16 backend")
+        if config.w4a16_route_mode not in {"direct", "packed"}:
+            raise ValueError("W4A16 route mode must be 'direct' or 'packed'")
+    else:
+        if config.backend == "w4a16":
+            raise ValueError("the W4A16 backend requires quant_mode='w4a16'")
+        if config.w4a16_route_mode is not None:
+            raise ValueError("w4a16_route_mode is only valid for W4A16")
+    if query.quant_mode == "w6a8_mx" and config.backend != "dynamic":
+        raise ValueError("W6A8-MX queries require the dynamic backend")
     if config.route_planner not in {"internal", "triton"}:
         raise ValueError(f"unsupported MoE route planner {config.route_planner!r}")
     if config.route_planner == "triton" and config.backend != "dynamic":
         raise ValueError("the Triton route planner requires dynamic MoE")
+    if config.route_planner == "triton" and config.dynamic_route_mode != "grouped":
+        raise ValueError("the Triton route planner requires grouped dynamic routing")
+    if config.route_planner == "triton" and config.dynamic_tile_m != 16:
+        raise ValueError("the Triton route planner requires dynamic_tile_m=16")
     if config.route_planner == "triton" and not (
         query.quant_mode == "nvfp4"
         and query.activation == "silu"
@@ -95,6 +129,17 @@ def validate_moe_decode_config(
         )
     if config.max_active_clusters is not None and config.max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
+    if config.route_planner != "triton" and config.max_active_clusters is not None:
+        raise ValueError("max_active_clusters requires the Triton route planner")
+    if config.backend == "dynamic":
+        if config.dynamic_tile_m not in {16, 32, 64, 128}:
+            raise ValueError("dynamic_tile_m must be one of 16, 32, 64, 128")
+        if config.dynamic_route_mode not in {"direct", "grouped"}:
+            raise ValueError("dynamic_route_mode must be 'direct' or 'grouped'")
+    elif config.dynamic_tile_m is not None:
+        raise ValueError("dynamic_tile_m is only valid for dynamic MoE")
+    elif config.dynamic_route_mode is not None:
+        raise ValueError("dynamic_route_mode is only valid for dynamic MoE")
 
 
 def make_moe_decode_policy(
@@ -105,8 +150,8 @@ def make_moe_decode_policy(
 ) -> ComponentPolicy[MoeDecodeQuery, MoeDecodeConfig]:
     return ComponentPolicy(
         component_id=MOE_DECODE,
-        query_schema_version=2,
-        config_schema_version=1,
+        query_schema_version=3,
+        config_schema_version=3,
         query_fields=frozenset(
             {
                 "activation",
@@ -123,8 +168,11 @@ def make_moe_decode_policy(
         config_fields=frozenset(
             {
                 "backend",
+                "dynamic_route_mode",
+                "dynamic_tile_m",
                 "max_active_clusters",
                 "route_planner",
+                "w4a16_route_mode",
             }
         ),
         encode_query=MoeDecodeQuery.profile_fields,

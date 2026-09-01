@@ -261,7 +261,9 @@ PLANNING_COMPONENTS = (
         mode=PlanningPolicyMode.PROFILED,
         component_id=MHC,
         policy_ref="b12x.norm.mhc._policy:MHC_POLICY",
-        generator_ref="b12x.policy.generation.providers.qualification:MhcGenerator",
+        generator_ref=(
+            "b12x.policy.generation.providers.norm_sequence:MhcGenerator"
+        ),
     ),
     PlanningComponentRegistration(
         op_qualname="quantization.nvfp4",

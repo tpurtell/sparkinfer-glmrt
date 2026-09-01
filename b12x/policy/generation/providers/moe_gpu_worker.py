@@ -22,23 +22,45 @@ from b12x.policy.generation.moe_corpus import (
 
 from .moe import MoeCandidate, MoeMeasurement
 
+_MAX_RELATIVE_NORM_ERROR = 0.1
+_TUNER_OVERRIDE_ENV = (
+    "B12X_DIRECT_CUTE_OPTIONS",
+    "B12X_DYNAMIC_DETERMINISTIC_OUTPUT",
+    "B12X_DYNAMIC_ENABLE_MULTICTA",
+    "B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN",
+    "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
+    "B12X_DYNAMIC_SWAP_AB",
+    "B12X_DYNAMIC_TILE_MN",
+    "B12X_DYNAMIC_W4A8_MATERIALIZED",
+    "B12X_DYNAMIC_W4A8_REPACKED",
+    "B12X_DYNAMIC_W4A8_SHARE_INPUT",
+    "B12X_DYNAMIC_WORK_SOURCE",
+    "B12X_ENABLE_DYNAMIC_DOWN_SCALE",
+    "B12X_LEVEL10_ENABLE_MULTICTA",
+    "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
+    "B12X_MICRO_DYNAMIC_CUTOVER_PAIRS",
+    "B12X_MICRO_MAX_ACTIVE_CLUSTERS",
+    "B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS",
+    "B12X_MOE_TILE_MN",
+    "B12X_NVFP4_SPLIT_DECODE",
+    "B12X_W4A16_SMALL_M_DIRECT",
+    "B12X_W4A16_SMALL_M_HOST_BARRIER_RESET",
+    "B12X_W4A16_SMALL_M_SPLITK",
+    "B12X_W4A8_TINY_DECODE",
+)
+
 
 @contextmanager
 def _candidate_environment(candidate: MoeCandidate):
     del candidate
-    names = (
-        "B12X_MICRO_DYNAMIC_CUTOVER_PAIRS",
-        "B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN",
-        "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
-        "B12X_LEVEL10_MAX_ACTIVE_CLUSTERS",
-        "B12X_MICRO_MAX_ACTIVE_CLUSTERS",
-    )
-    previous = {name: os.environ.get(name) for name in names}
+    previous = {name: os.environ.get(name) for name in _TUNER_OVERRIDE_ENV}
     try:
-        for name in names:
+        for name in _TUNER_OVERRIDE_ENV:
             os.environ.pop(name, None)
         from b12x.moe.fused_moe import _impl
 
+        _impl._DYNAMIC_DOWN_SCALE_CACHE = None
+        _impl._DYNAMIC_MULTICTA_CACHE = None
         _impl._MAC_CACHE.clear()
         _impl._MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE.clear()
         yield
@@ -62,15 +84,25 @@ def _activation_mode(quant_mode: str):
 
 
 def _benchmark_input_scale(geometry: MoePhysicalGeometry) -> float:
-    if (
-        geometry.recipe.quant_mode == "w4a16"
-        and geometry.activation == "relu2"
-        and geometry.recipe.source_format != "btx"
-    ):
-        return 2.0**-20
-    if geometry.recipe.source_format == "btx":
+    if geometry.recipe.source_format in {"btx", "b12x_trellis"}:
         return 1.0e-2
     return 1.0
+
+
+def _condition_benchmark_inputs(
+    geometry: MoePhysicalGeometry,
+    x: object,
+):
+    """Keep uniform W4A16 fixtures out of saturated activation tails."""
+
+    if not (
+        geometry.recipe.quant_mode == "w4a16"
+        and geometry.recipe.source_format not in {"btx", "b12x_trellis"}
+    ):
+        return x
+    x.sub_(x.mean(dim=-1, keepdim=True))
+    x.add_(geometry.hidden_size**-0.5)
+    return x
 
 
 def _packed_weights(
@@ -240,13 +272,9 @@ def _trellis_weights(
 
     variant = geometry.recipe.trellis_variant
     if variant is None:
-        raise ValueError("BTX geometry is missing its Trellis variant")
+        raise ValueError("Trellis geometry is missing its Trellis variant")
     config = _trellis_config(variant=variant)
-    io_dtype = (
-        torch.float16
-        if variant == "k3-sqg-uniform-coupled"
-        else torch.bfloat16
-    )
+    io_dtype = torch.float16 if variant == "k3-sqg-uniform-coupled" else torch.bfloat16
     weight_plan = fused_moe.plan_weights(
         source=config,
         activation=fused_moe.ActivationSpec(
@@ -339,7 +367,7 @@ def _prepare_experts(
     *,
     device: object,
 ):
-    if geometry.recipe.source_format == "btx":
+    if geometry.recipe.source_format in {"btx", "b12x_trellis"}:
         return _trellis_weights(geometry, device=device)
     return _packed_weights(geometry, device=device)
 
@@ -401,6 +429,67 @@ def _cosine_similarity(left, right) -> float:
             dim=0,
         )
     )
+
+
+def _stable_l2_norm(value) -> float:
+    import torch
+
+    flattened = value.float().flatten()
+    scale = float(torch.amax(torch.abs(flattened)))
+    if scale == 0.0:
+        return 0.0
+    if not math.isfinite(scale):
+        return math.inf
+    return scale * float(torch.linalg.vector_norm(flattened / scale))
+
+
+def _relative_norm_error(value, reference) -> float:
+    value_norm = _stable_l2_norm(value)
+    reference_norm = _stable_l2_norm(reference)
+    if reference_norm == 0.0:
+        return 0.0 if value_norm == 0.0 else math.inf
+    return abs(value_norm - reference_norm) / reference_norm
+
+
+def _uniform_w4a16_reference(
+    geometry: MoePhysicalGeometry,
+    *,
+    x: object,
+    topk_weights: object,
+):
+    """Independent oracle for the tuner's constant non-Trellis W4A16 weights."""
+
+    import torch
+
+    from b12x.moe._shared.kernels.activations import is_gated_moe_activation
+    from b12x.moe._shared.kernels.reference import (
+        _apply_gated_activation,
+        _normalize_reference_swiglu_params,
+    )
+
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            geometry.activation,
+            None,
+            None,
+            None,
+        )
+    )
+    fc1 = x.float().sum(dim=-1) * 0.5
+    if is_gated_moe_activation(activation):
+        intermediate = _apply_gated_activation(
+            fc1,
+            fc1,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+    else:
+        intermediate = torch.square(torch.relu(fc1))
+    down = intermediate * (0.5 * geometry.intermediate_size)
+    routed = down * topk_weights.float().sum(dim=-1)
+    return routed[:, None].expand(-1, geometry.hidden_size).contiguous()
 
 
 def _finite_float_or_none(value: float) -> float | None:
@@ -517,9 +606,17 @@ class _PreparedCandidate:
     graph: object
     output: object
     actual_implementation: str
+    concrete_path: str
     route_planner: str
     max_active_clusters: int | None
+    dynamic_tile_m: int | None
+    dynamic_route_mode: str | None
+    w4a16_route_mode: str | None
     owners: tuple[object, ...]
+
+
+class _CandidateContractError(RuntimeError):
+    pass
 
 
 def _reset_cuda_graphs(
@@ -535,27 +632,60 @@ def _candidates_for_geometry(
     sm_count: int,
 ) -> tuple[MoeCandidate, ...]:
     recipe = geometry.recipe
-    if recipe.quant_mode != "nvfp4":
-        return (
+    if recipe.quant_mode == "w4a16":
+        route_modes = (
+            ("packed",)
+            if _uses_projection_mixed_trellis(geometry)
+            else ("packed", "direct")
+        )
+        return tuple(
             MoeCandidate.create(
                 {
-                    "backend": "dynamic",
+                    "backend": "w4a16",
+                    "dynamic_route_mode": None,
+                    "dynamic_tile_m": None,
                     "route_planner": "internal",
                     "max_active_clusters": None,
+                    "w4a16_route_mode": route_mode,
                 }
-            ),
+            )
+            for route_mode in route_modes
         )
-    candidates = [
+    dynamic_tile_ms = (128,) if recipe.quant_mode == "w6a8_mx" else (16, 32, 64, 128)
+    candidates = []
+    if recipe.quant_mode != "w6a8_mx":
+        candidates.append(
+            MoeCandidate.create(
+                {
+                    "backend": "micro",
+                    "dynamic_route_mode": None,
+                    "dynamic_tile_m": None,
+                    "route_planner": "internal",
+                    "max_active_clusters": None,
+                    "w4a16_route_mode": None,
+                }
+            )
+        )
+    dynamic_route_modes = (
+        ("grouped", "direct")
+        if recipe.quant_mode in {"nvfp4", "w4a8_mx"}
+        else ("grouped",)
+    )
+    candidates.extend(
         MoeCandidate.create(
             {
-                "backend": backend,
+                "backend": "dynamic",
+                "dynamic_route_mode": route_mode,
+                "dynamic_tile_m": tile_m,
                 "route_planner": "internal",
                 "max_active_clusters": None,
+                "w4a16_route_mode": None,
             }
         )
-        for backend in ("micro", "dynamic")
-    ]
-    if geometry.activation == "silu":
+        for tile_m in dynamic_tile_ms
+        for route_mode in dynamic_route_modes
+    )
+    if recipe.quant_mode == "nvfp4" and geometry.activation == "silu":
         cluster_caps = {
             max(1, sm_count // 4),
             max(1, sm_count // 2),
@@ -566,13 +696,78 @@ def _candidates_for_geometry(
             MoeCandidate.create(
                 {
                     "backend": "dynamic",
+                    "dynamic_route_mode": "grouped",
+                    "dynamic_tile_m": tile_m,
                     "route_planner": "triton",
                     "max_active_clusters": cluster_cap,
+                    "w4a16_route_mode": None,
                 }
             )
+            for tile_m in (16,)
             for cluster_cap in sorted(cluster_caps)
         )
     return tuple(candidates)
+
+
+def _w4a16_weight_layout(geometry: MoePhysicalGeometry) -> str:
+    from b12x.moe.fused_moe import _impl
+
+    return _impl._w4a16_weight_layout_for_source(
+        geometry.recipe.source_format,
+        intermediate_size=geometry.intermediate_size,
+    )
+
+
+def _uses_projection_mixed_trellis(geometry: MoePhysicalGeometry) -> bool:
+    variant = geometry.recipe.trellis_variant
+    return variant is not None and _trellis_config(variant=variant).projection_mixed
+
+
+def _w4a16_prepared_weight_layout(geometry: MoePhysicalGeometry) -> str:
+    if _uses_projection_mixed_trellis(geometry):
+        return "trellis_mixed3"
+    return _w4a16_weight_layout(geometry)
+
+
+def _w4a16_direct_path(
+    geometry: MoePhysicalGeometry,
+    case: MoeSweepCase,
+) -> str | None:
+    from b12x.moe.fused_moe import _impl
+    from b12x.moe._shared.kernels.activations import is_gated_moe_activation
+    from b12x.moe._shared.kernels.w4a16.kernel import (
+        _MAX_DIRECT_TOPK_ROUTE_M,
+        _TC_DECODE_MAX_M,
+    )
+
+    if _uses_projection_mixed_trellis(geometry):
+        return None
+    weight_layout = _w4a16_weight_layout(geometry)
+    query = _impl.MoeDecodeQuery(
+        quant_mode=geometry.recipe.quant_mode,
+        source_format=geometry.recipe.source_format,
+        activation=geometry.activation,
+        num_experts=geometry.num_experts,
+        hidden_size=geometry.hidden_size,
+        intermediate_size=geometry.intermediate_size,
+        top_k=case.top_k,
+        num_tokens=case.num_tokens,
+        routed_rows=case.routed_rows,
+    )
+    if not _impl._w4a16_direct_routing_supported(query):
+        return None
+    if weight_layout == "modelopt":
+        return "w4a16.small_m_direct"
+    if weight_layout != "packed":
+        return None
+    if (
+        case.num_tokens <= _TC_DECODE_MAX_M
+        and is_gated_moe_activation(geometry.activation)
+    ):
+        return "w4a16.tc_decode"
+    if case.num_tokens <= _MAX_DIRECT_TOPK_ROUTE_M:
+        return "w4a16.direct_topk"
+    return None
 
 
 def _eligible_candidates_for_case(
@@ -584,22 +779,221 @@ def _eligible_candidates_for_case(
 
     eligible = []
     for candidate in candidates:
-        if candidate.config["route_planner"] == "triton" and case.routed_rows > 256:
-            continue
-        if candidate.config["backend"] == "micro" and not (
-            _impl._band_runs_direct_micro(
-                num_tokens=case.num_tokens,
-                k=geometry.hidden_size,
-                n=geometry.intermediate_size,
-                num_topk=case.top_k,
-                weight_E=geometry.num_experts,
-                activation=geometry.activation,
+        if candidate.config["backend"] == "dynamic":
+            dynamic_n = _impl._dynamic_kernel_intermediate_size(
+                geometry.intermediate_size,
+                geometry.recipe.quant_mode,
+            )
+            try:
+                _impl._select_dynamic_tile_mn(
+                    case.routed_rows,
+                    dynamic_n,
+                    geometry.recipe.quant_mode,
+                    num_experts=geometry.num_experts,
+                    activation=geometry.activation,
+                    planned_tile_m=candidate.config["dynamic_tile_m"],
+                )
+            except ValueError:
+                continue
+        if candidate.config["route_planner"] == "triton":
+            if not _impl._dynamic_external_route_plan_supported(
                 quant_mode=geometry.recipe.quant_mode,
+                activation=geometry.activation,
+                routed_rows=case.routed_rows,
+                planned_tile_m=candidate.config["dynamic_tile_m"],
+                dynamic_route_mode=candidate.config["dynamic_route_mode"],
+                deterministic_output=False,
+            ):
+                continue
+        if candidate.config["backend"] == "micro" and not _impl._policy_micro_supported(
+            _impl.MoeDecodeQuery(
+                quant_mode=geometry.recipe.quant_mode,
+                source_format=_impl._canonical_moe_policy_source_format(
+                    geometry.recipe.source_format
+                ),
+                activation=geometry.activation,
+                num_experts=geometry.num_experts,
+                hidden_size=geometry.hidden_size,
+                intermediate_size=geometry.intermediate_size,
+                top_k=case.top_k,
+                num_tokens=case.num_tokens,
+                routed_rows=case.routed_rows,
             )
         ):
             continue
+        if (
+            candidate.config["backend"] == "w4a16"
+            and candidate.config["w4a16_route_mode"] == "direct"
+            and _w4a16_direct_path(geometry, case) is None
+        ):
+            continue
+        if (
+            candidate.config["backend"] == "dynamic"
+            and candidate.config["dynamic_route_mode"] == "direct"
+        ):
+            dynamic_n = _impl._dynamic_kernel_intermediate_size(
+                geometry.intermediate_size,
+                geometry.recipe.quant_mode,
+            )
+            try:
+                _impl._dynamic_direct_routing_selected(
+                    route_mode="direct",
+                    quant_mode=geometry.recipe.quant_mode,
+                    activation=geometry.activation,
+                    routed_rows=case.routed_rows,
+                    num_experts=geometry.num_experts,
+                    n=dynamic_n,
+                    deterministic_output=False,
+                    planned_tile_m=candidate.config["dynamic_tile_m"],
+                )
+            except RuntimeError:
+                continue
         eligible.append(candidate)
     return tuple(eligible)
+
+
+def _concrete_candidate_path(
+    *,
+    geometry: MoePhysicalGeometry,
+    case: MoeSweepCase,
+    candidate: MoeCandidate,
+    plan: object,
+    binding: object,
+    prepared_payload: object,
+) -> str:
+    from b12x.moe.fused_moe import _impl
+
+    config = candidate.config
+    expected_implementation = str(config["backend"])
+    variant = plan.variant_for(case.num_tokens)
+    actual_plan = variant._impl
+    actual_implementation = str(variant.implementation)
+    if actual_implementation != expected_implementation:
+        raise _CandidateContractError(
+            f"candidate {expected_implementation!r} resolved to "
+            f"{actual_implementation!r}"
+        )
+    bound_implementation = str(binding.implementation)
+    resolution = actual_plan.policy_resolution
+    if resolution is None:
+        raise _CandidateContractError("candidate plan has no policy resolution")
+    actual_config = resolution.config
+    for field in ("route_planner", "max_active_clusters"):
+        if getattr(actual_config, field) != config[field]:
+            raise _CandidateContractError(
+                f"candidate {field}={config[field]!r} resolved to "
+                f"{getattr(actual_config, field)!r}"
+            )
+
+    if expected_implementation == "w4a16":
+        route_mode = str(config["w4a16_route_mode"])
+        actual_route_mode = actual_config.w4a16_route_mode
+        if actual_route_mode != route_mode:
+            raise _CandidateContractError(
+                f"W4A16 candidate route mode {route_mode!r} resolved to "
+                f"{actual_route_mode!r}"
+            )
+        expected_layout = _w4a16_prepared_weight_layout(geometry)
+        actual_layout = getattr(prepared_payload, "weight_layout", None)
+        if actual_layout != expected_layout:
+            raise _CandidateContractError(
+                f"W4A16 candidate expected {expected_layout!r} weights but "
+                f"prepared {actual_layout!r}"
+            )
+        if bound_implementation == "trellis_mixed3":
+            if actual_layout != "trellis_mixed3" or route_mode != "packed":
+                raise _CandidateContractError(
+                    "projection-mixed Trellis requires packed Trellis routing"
+                )
+            return "w4a16.trellis_mixed3"
+        if bound_implementation != expected_implementation:
+            raise _CandidateContractError(
+                f"W4A16 candidate bound {bound_implementation!r}"
+            )
+        if route_mode == "packed":
+            return "w4a16.route_packed"
+        expected_path = _w4a16_direct_path(geometry, case)
+        if expected_path is None:
+            raise _CandidateContractError(
+                "W4A16 direct candidate reached an unsupported route shape"
+            )
+        return expected_path
+
+    if bound_implementation != expected_implementation:
+        raise _CandidateContractError(
+            f"candidate {expected_implementation!r} bound "
+            f"{bound_implementation!r}"
+        )
+
+    if expected_implementation == "micro":
+        quant_mode = geometry.recipe.quant_mode
+        if quant_mode == "w4a8_mx":
+            if getattr(prepared_payload, "weight_layout", None) == "trellis_t256":
+                return "w4a8.trellis_micro"
+            return "w4a8.tiny_decode"
+        if quant_mode == "w4a8_nvfp4":
+            return "w4a8.direct_micro"
+        return "nvfp4.direct_micro"
+
+    planned_tile_m = variant.execution.tile_m
+    if planned_tile_m != config["dynamic_tile_m"]:
+        raise _CandidateContractError(
+            f"dynamic candidate tile M={config['dynamic_tile_m']} resolved to "
+            f"M={planned_tile_m}"
+        )
+    planned_route_mode = actual_config.dynamic_route_mode
+    if planned_route_mode != config["dynamic_route_mode"]:
+        raise _CandidateContractError(
+            f"dynamic candidate route mode {config['dynamic_route_mode']!r} "
+            f"resolved to {planned_route_mode!r}"
+        )
+    if actual_config.route_planner == "triton":
+        if not _impl._dynamic_external_route_plan_supported(
+            quant_mode=geometry.recipe.quant_mode,
+            activation=geometry.activation,
+            routed_rows=case.routed_rows,
+            planned_tile_m=planned_tile_m,
+            dynamic_route_mode=planned_route_mode,
+            deterministic_output=actual_plan.deterministic_output,
+        ):
+            raise _CandidateContractError(
+                "Triton route-planner candidate resolved to an internal route plan"
+            )
+    quant_mode = geometry.recipe.quant_mode
+    if quant_mode in {"w4a8_mx", "w4a8_nvfp4"}:
+        if planned_route_mode == "direct":
+            specialization = "direct"
+        elif _impl._w4a8_dynamic_decode_candidate(
+            quant_mode=quant_mode,
+            activation=geometry.activation,
+            routed_rows=case.routed_rows,
+            num_experts=geometry.num_experts,
+            n=geometry.intermediate_size,
+            deterministic_output=actual_plan.deterministic_output,
+            planned_tile_m=planned_tile_m,
+        ):
+            specialization = "decode"
+        elif _impl._w4a8_dynamic_dense_candidate(
+            quant_mode=quant_mode,
+            activation=geometry.activation,
+            routed_rows=case.routed_rows,
+            num_experts=geometry.num_experts,
+            k=geometry.hidden_size,
+            n=geometry.intermediate_size,
+            deterministic_output=actual_plan.deterministic_output,
+            planned_tile_m=planned_tile_m,
+        ):
+            specialization = "dense"
+        else:
+            specialization = "grouped"
+        return f"w4a8.dynamic.{specialization}.m{planned_tile_m}"
+    if quant_mode == "nvfp4":
+        specialization = str(planned_route_mode)
+        return (
+            f"nvfp4.dynamic.{specialization}.m{planned_tile_m}."
+            f"route_{actual_config.route_planner}"
+        )
+    return f"{quant_mode}.dynamic.m{planned_tile_m}"
 
 
 class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
@@ -628,6 +1022,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         self._query_key: tuple[int, int] | None = None
         self._query_inputs: _QueryInputs | None = None
         self._prepared_candidates: dict[str, _PreparedCandidate] = {}
+        self._candidate_signatures: dict[tuple[object, ...], str] = {}
         self._flush = _l2_flush_fn(
             self._device,
             enabled=context.settings.cold_l2,
@@ -648,6 +1043,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
 
         if isinstance(exc, Exception) and _is_fatal_accelerator_error(exc):
             self._prepared_candidates.clear()
+            self._candidate_signatures.clear()
             self._query_inputs = None
             self._query_key = None
             self._flush = None
@@ -668,6 +1064,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         torch.cuda.synchronize(self._device)
         _reset_cuda_graphs(tuple(self._prepared_candidates.values()))
         self._prepared_candidates.clear()
+        self._candidate_signatures.clear()
         self._query_inputs = None
         self._query_key = None
         gc.collect()
@@ -714,7 +1111,8 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             (case.num_tokens, self._geometry.hidden_size),
             dtype=torch.float32,
             generator=generator,
-        ).to(
+        )
+        x = _condition_benchmark_inputs(self._geometry, x).to(
             device=self._device,
             dtype=self._experts.plan.activation.io_dtype,
         )
@@ -744,9 +1142,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         cached = self._prepared_candidates.get(candidate.candidate_id)
         if cached is not None:
             return cached
-        candidate_config = fused_moe.MoeDecodeConfig.from_profile(
-            candidate.config
-        )
+        candidate_config = fused_moe.MoeDecodeConfig.from_profile(candidate.config)
         policy = get_auto_policy(self._device).with_override(
             MOE_DECODE,
             candidate_config,
@@ -759,16 +1155,6 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             ),
             policy=policy,
         )
-        actual_implementation = plan.variant_for(case.num_tokens).implementation
-        expected_implementation = str(candidate.config["backend"])
-        if (
-            self._geometry.recipe.quant_mode == "nvfp4"
-            and actual_implementation != expected_implementation
-        ):
-            raise RuntimeError(
-                f"candidate {expected_implementation!r} resolved to "
-                f"{actual_implementation!r}"
-            )
         fused_moe.prewarm(plan)
         scratch = {
             spec.name: torch.empty(
@@ -802,6 +1188,39 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             input_scales_static=True,
         )
         _verify_cooperative_workspace(binding)
+        concrete_path = _concrete_candidate_path(
+            geometry=self._geometry,
+            case=case,
+            candidate=candidate,
+            plan=plan,
+            binding=binding,
+            prepared_payload=payload,
+        )
+        actual_implementation = str(binding.implementation)
+        variant = plan.variant_for(case.num_tokens)
+        resolution = variant._impl.policy_resolution
+        if resolution is None:
+            raise _CandidateContractError("candidate plan has no policy resolution")
+        resolved_config = resolution.config
+        signature = (
+            concrete_path,
+            resolved_config.route_planner,
+            resolved_config.max_active_clusters,
+            resolved_config.dynamic_tile_m,
+            resolved_config.dynamic_route_mode,
+            resolved_config.w4a16_route_mode,
+        )
+        aliased_candidate = self._candidate_signatures.get(signature)
+        if (
+            aliased_candidate is not None
+            and aliased_candidate != candidate.candidate_id
+        ):
+            raise _CandidateContractError(
+                f"MoE candidates {aliased_candidate} and "
+                f"{candidate.candidate_id} resolve to the same concrete "
+                f"launch contract {signature!r}"
+            )
+        self._candidate_signatures[signature] = candidate.candidate_id
 
         def run() -> None:
             fused_moe.run(binding=binding)
@@ -817,8 +1236,12 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             graph=graph,
             output=output,
             actual_implementation=actual_implementation,
-            route_planner=candidate_config.route_planner,
-            max_active_clusters=candidate_config.max_active_clusters,
+            concrete_path=concrete_path,
+            route_planner=resolved_config.route_planner,
+            max_active_clusters=resolved_config.max_active_clusters,
+            dynamic_tile_m=resolved_config.dynamic_tile_m,
+            dynamic_route_mode=resolved_config.dynamic_route_mode,
+            w4a16_route_mode=resolved_config.w4a16_route_mode,
             owners=(plan, scratch, binding),
         )
         self._prepared_candidates[candidate.candidate_id] = prepared
@@ -860,6 +1283,10 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                     prepared.output,
                     eager_output,
                 )
+                relative_norm_error = _relative_norm_error(
+                    prepared.output,
+                    comparison,
+                )
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
@@ -882,6 +1309,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                     finite
                     and cosine >= settings.minimum_cosine
                     and graph_cosine >= settings.minimum_cosine
+                    and relative_norm_error <= _MAX_RELATIVE_NORM_ERROR
                     and allocated_after <= allocated_before
                 )
                 graph_cosine_metric = (
@@ -896,15 +1324,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                             groups=settings.groups,
                             repetitions=timed_repetitions,
                         ),
-                        cosine=(
-                            cosine
-                            if correct
-                            else None
-                        ),
+                        cosine=(cosine if correct else None),
                         error=(
-                            None
-                            if correct
-                            else "graph replay correctness gate failed"
+                            None if correct else "graph replay correctness gate failed"
                         ),
                         metrics={
                             "allocation_delta_bytes": (
@@ -919,16 +1341,19 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                             "finite": finite,
                             "graph_cosine": graph_cosine_metric,
                             "implementation": prepared.actual_implementation,
-                            "input_scale": _benchmark_input_scale(
-                                self._geometry
-                            ),
+                            "concrete_path": prepared.concrete_path,
+                            "dynamic_tile_m": prepared.dynamic_tile_m,
+                            "dynamic_route_mode": prepared.dynamic_route_mode,
+                            "input_scale": _benchmark_input_scale(self._geometry),
                             "route_planner": prepared.route_planner,
-                            "max_active_clusters": (
-                                prepared.max_active_clusters
+                            "max_active_clusters": (prepared.max_active_clusters),
+                            "relative_norm_error": _finite_float_or_none(
+                                relative_norm_error
                             ),
+                            "w4a16_route_mode": prepared.w4a16_route_mode,
                             "output_nonzero": output_nonzero,
                             "output_norm": _finite_float_or_none(
-                                prepared.output.float().norm().item()
+                                _stable_l2_norm(prepared.output)
                             ),
                         },
                     ),
@@ -939,6 +1364,8 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                     ),
                 )
         except Exception as exc:  # noqa: BLE001 - one candidate may fail closed
+            if isinstance(exc, _CandidateContractError):
+                raise
             if _is_fatal_accelerator_error(exc):
                 raise
             return _CandidateResult(
@@ -960,14 +1387,66 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         topk_weights: object,
     ):
         recipe = self._geometry.recipe
+        weights = self._experts._impl
+        if (
+            recipe.quant_mode == "w4a16"
+            and recipe.source_format not in {"btx", "b12x_trellis"}
+        ):
+            return _uniform_w4a16_reference(
+                self._geometry,
+                x=x,
+                topk_weights=topk_weights,
+            )
+        if recipe.quant_mode == "w4a8_nvfp4":
+            import torch
+
+            from b12x.moe.fused_moe import _impl
+            from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
+
+            w1_rows = int(weights.w1_fp4.shape[1])
+            w1_mx, w1_residual = _impl._derive_w4a8_weight_grids(
+                weights.w1_blockscale.view(torch.uint8),
+                w1_rows,
+                self._geometry.hidden_size,
+            )
+            w2_mx, w2_residual = _impl._derive_w4a8_weight_grids(
+                weights.w2_blockscale.view(torch.uint8),
+                self._geometry.hidden_size,
+                self._geometry.intermediate_size,
+            )
+            normalized_key = (
+                weights.w1_fp4.data_ptr(),
+                weights.w1_blockscale.data_ptr(),
+            )
+            w13_layout = (
+                "w13"
+                if normalized_key in _impl._W13_NORMALIZED_STORAGES
+                else weights.w13_layout
+            )
+            return moe_reference_w4a8_mx(
+                x.float(),
+                weights.w1_fp4,
+                w1_mx,
+                w1_residual.view(torch.float8_e4m3fn),
+                weights.w1_alphas,
+                weights.w2_fp4,
+                w2_mx,
+                w2_residual.view(torch.float8_e4m3fn),
+                weights.w2_alphas,
+                topk_ids,
+                topk_weights,
+                self._geometry.num_experts,
+                self._geometry.hidden_size,
+                self._geometry.intermediate_size,
+                activation=self._geometry.activation,
+                w13_layout=w13_layout,
+            )
         if not (
-            recipe.quant_mode == "nvfp4"
-            and recipe.source_format == "modelopt_nvfp4"
+            recipe.quant_mode == "nvfp4" and recipe.source_format == "modelopt_nvfp4"
         ):
             return None
         from b12x.moe._shared.kernels.reference import moe_reference_nvfp4
 
-        weights = self._experts._impl
         return moe_reference_nvfp4(
             x,
             weights.w1_fp4,
@@ -1009,7 +1488,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             else None
         )
         reference_kind = (
-            "independent_nvfp4" if reference_output is not None else None
+            f"independent_{self._geometry.recipe.quant_mode}"
+            if reference_output is not None
+            else None
         )
         for candidate in eligible:
             result = self._measure_candidate(
@@ -1062,8 +1543,7 @@ def _moe_geometry_worker(
                 {
                     "ok": True,
                     "candidates": [
-                        candidate.config.to_dict()
-                        for candidate in session.candidates
+                        candidate.config.to_dict() for candidate in session.candidates
                     ],
                 }
             )
@@ -1101,8 +1581,7 @@ def _moe_geometry_worker(
                         {
                             "ok": True,
                             "measurements": [
-                                measurement.to_dict()
-                                for measurement in measurements
+                                measurement.to_dict() for measurement in measurements
                             ],
                         }
                     )
@@ -1126,7 +1605,6 @@ def _moe_geometry_worker(
 class _MoeRemoteWorkerError(RuntimeError):
     def __init__(
         self,
-        *,
         operation: str,
         exception_type: str,
         error: str,
@@ -1139,6 +1617,17 @@ class _MoeRemoteWorkerError(RuntimeError):
         super().__init__(
             f"MoE GPU worker failed during {operation}: "
             f"{exception_type}: {error}\n{remote_traceback}"
+        )
+
+    def __reduce__(self):
+        return (
+            type(self),
+            (
+                self.operation,
+                self.exception_type,
+                self.remote_error,
+                self.remote_traceback,
+            ),
         )
 
     @property
@@ -1295,42 +1784,85 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
         *,
         correctness: bool = False,
     ) -> tuple[MoeMeasurement, ...]:
-        def request_measurement() -> dict[str, object]:
+        def request_measurement(
+            requested: tuple[MoeCandidate, ...],
+        ) -> dict[str, object]:
             self._start()
             return self._request(
                 "measure",
                 case=case,
                 candidate_ids=tuple(
-                    candidate.candidate_id for candidate in candidates
+                    candidate.candidate_id for candidate in requested
                 ),
                 correctness=correctness,
             )
 
-        retried = False
+        def parse_measurements(
+            response: dict[str, object],
+        ) -> tuple[MoeMeasurement, ...]:
+            raw_measurements = response.get("measurements")
+            if not isinstance(raw_measurements, list):
+                raise TypeError("MoE GPU worker measurement response is invalid")
+            return tuple(
+                MoeMeasurement.from_dict(measurement)
+                for measurement in raw_measurements
+            )
+
+        def failed_measurement(
+            candidate: MoeCandidate,
+            error: _MoeRemoteWorkerError,
+        ) -> MoeMeasurement:
+            return MoeMeasurement(
+                candidate=candidate,
+                latency_us=None,
+                cosine=None,
+                error=f"{error.exception_type}: {error.remote_error}",
+                metrics={
+                    "exception_type": error.exception_type,
+                    "worker_retries": 1,
+                },
+            )
+
         try:
-            response = request_measurement()
+            return parse_measurements(request_measurement(candidates))
         except _MoeRemoteWorkerError as exc:
             if not exc.retryable:
                 raise
             self._discard_worker()
-            response = request_measurement()
-            retried = True
-        raw_measurements = response.get("measurements")
-        if not isinstance(raw_measurements, list):
-            raise TypeError("MoE GPU worker measurement response is invalid")
-        measurements = tuple(
-            MoeMeasurement.from_dict(measurement)
-            for measurement in raw_measurements
-        )
-        if not retried:
-            return measurements
-        return tuple(
-            replace(
-                measurement,
-                metrics={**measurement.metrics.to_dict(), "worker_retries": 1},
+            if exc.operation == "startup" or len(candidates) == 1:
+                measurements = parse_measurements(request_measurement(candidates))
+                return tuple(
+                    replace(
+                        measurement,
+                        metrics={
+                            **measurement.metrics.to_dict(),
+                            "worker_retries": 1,
+                        },
+                    )
+                    for measurement in measurements
+                )
+
+        measurements = []
+        for candidate in candidates:
+            try:
+                (measurement,) = parse_measurements(
+                    request_measurement((candidate,))
+                )
+            except _MoeRemoteWorkerError as exc:
+                if not exc.retryable or exc.operation == "startup":
+                    raise
+                self._discard_worker()
+                measurement = failed_measurement(candidate, exc)
+            measurements.append(
+                replace(
+                    measurement,
+                    metrics={
+                        **measurement.metrics.to_dict(),
+                        "worker_retries": 1,
+                    },
+                )
             )
-            for measurement in measurements
-        )
+        return tuple(measurements)
 
 
 class MoeGpuBenchmarkFactory:

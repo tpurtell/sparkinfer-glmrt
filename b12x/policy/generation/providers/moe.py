@@ -49,9 +49,11 @@ _COARSE_PATTERNS = frozenset({"balanced", "hot"})
 _COARSE_TARGET_RATIO = 1.01
 _MICRO_MAX_TOKENS = 8
 _TRITON_ROUTE_MAX_ROWS = 256
-_NVFP4_CAPACITY_TOKENS = frozenset(COMMON_PREFILL_TOKEN_CAPACITIES)
-_QUALIFICATION_TOKENS = frozenset({1, 4, 7, 32, 128})
+_PREFILL_CAPACITY_TOKENS = frozenset(COMMON_PREFILL_TOKEN_CAPACITIES)
+_QUALIFICATION_TOKENS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 32, 128})
 _QUALIFICATION_PATTERNS = frozenset({"balanced", "hot"})
+_MOE_CANDIDATE_CONTRACT_VERSION = 6
+_MOE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 def _config_id(config: FrozenMapping) -> str:
@@ -186,15 +188,68 @@ def _config_covers_query(
     query: Mapping[str, object],
     config: Mapping[str, object],
 ) -> bool:
+    from b12x.moe.fused_moe import _impl
+    from b12x.moe.fused_moe._policy import (
+        MoeDecodeConfig,
+        validate_moe_decode_config,
+    )
+
     num_tokens = int(query["num_tokens"])
     top_k = int(query["top_k"])
-    if config["backend"] == "micro" and num_tokens > _MICRO_MAX_TOKENS:
+    routed_rows = num_tokens * top_k
+    policy_query = _impl.MoeDecodeQuery(
+        quant_mode=str(query["quant_mode"]),
+        source_format=str(query["source_format"]),
+        activation=str(query["activation"]),
+        num_experts=int(query["num_experts"]),
+        hidden_size=int(query["hidden_size"]),
+        intermediate_size=int(query["intermediate_size"]),
+        top_k=top_k,
+        num_tokens=num_tokens,
+        routed_rows=routed_rows,
+    )
+    try:
+        parsed_config = MoeDecodeConfig.from_profile(FrozenMapping(config))
+        validate_moe_decode_config(policy_query, parsed_config, None)
+    except (TypeError, ValueError):
+        return False
+    if config["backend"] == "micro" and not _impl._policy_micro_supported(
+        policy_query
+    ):
+        return False
+    if (
+        config["backend"] == "dynamic"
+        and config.get("dynamic_route_mode") == "direct"
+    ):
+        try:
+            _impl._dynamic_direct_routing_selected(
+                route_mode="direct",
+                quant_mode=policy_query.quant_mode,
+                activation=policy_query.activation,
+                routed_rows=routed_rows,
+                num_experts=policy_query.num_experts,
+                n=_impl._dynamic_kernel_intermediate_size(
+                    policy_query.intermediate_size,
+                    policy_query.quant_mode,
+                ),
+                deterministic_output=False,
+                planned_tile_m=config.get("dynamic_tile_m"),
+            )
+        except (RuntimeError, ValueError):
+            return False
+    if (
+        config["backend"] == "w4a16"
+        and config.get("w4a16_route_mode") == "direct"
+        and not _impl._w4a16_direct_routing_supported(policy_query)
+    ):
         return False
     if config.get("route_planner") == "triton":
         return (
             query["quant_mode"] == "nvfp4"
             and query["activation"] == "silu"
-            and num_tokens * top_k <= _TRITON_ROUTE_MAX_ROWS
+            and config.get("dynamic_tile_m") == 16
+            and config.get("dynamic_route_mode") == "grouped"
+            and routed_rows <= _TRITON_ROUTE_MAX_ROWS
         )
     return True
 
@@ -206,6 +261,8 @@ def _synthesize_token_capacity_coverage(
     maximum: int,
 ) -> tuple[DecisionRecord, ...]:
     """Represent nearest valid token anchors with compact transition points."""
+
+    from b12x.moe.fused_moe import _impl
 
     if minimum > maximum:
         raise ValueError("token coverage minimum cannot exceed maximum")
@@ -243,11 +300,14 @@ def _synthesize_token_capacity_coverage(
                 midpoint = (left + right) // 2
                 transition_points.update((midpoint, midpoint + 1))
         top_k = int(group["top_k"])
+        direct_limit = _impl._DIRECT_ROUTING_MAX_ROUTED_ROWS // top_k
         triton_limit = _TRITON_ROUTE_MAX_ROWS // top_k
         transition_points.update(
             (
                 _MICRO_MAX_TOKENS,
                 _MICRO_MAX_TOKENS + 1,
+                direct_limit,
+                direct_limit + 1,
                 triton_limit,
                 triton_limit + 1,
             )
@@ -290,7 +350,12 @@ def _coarse_cases(cases: Sequence[MoeSweepCase]) -> tuple[MoeSweepCase, ...]:
 
 
 def _has_tunable_backend(geometry: MoePhysicalGeometry) -> bool:
-    return geometry.recipe.quant_mode == "nvfp4"
+    return geometry.recipe.quant_mode in {
+        "nvfp4",
+        "w4a16",
+        "w4a8_mx",
+        "w4a8_nvfp4",
+    }
 
 
 def _measurement_cases(
@@ -303,11 +368,8 @@ def _measurement_cases(
         return tuple(
             case
             for case in cases
-            if case.num_tokens not in _NVFP4_CAPACITY_TOKENS
-            or (
-                case.is_model_native_top_k
-                and case.route_pattern in _QUALIFICATION_PATTERNS
-            )
+            if case.num_tokens not in _PREFILL_CAPACITY_TOKENS
+            or case.route_pattern in _QUALIFICATION_PATTERNS
         )
     return tuple(
         case
@@ -409,12 +471,25 @@ def _select_coarse_candidates(
     )
 
 
+def _correctness_reference_rank(candidate: MoeCandidate) -> tuple[object, ...]:
+    config = candidate.config
+    backend = config["backend"]
+    return (
+        not (backend == "w4a16" and config.get("w4a16_route_mode") == "packed"),
+        not (backend == "dynamic" and config["route_planner"] == "internal"),
+        config.get("dynamic_route_mode") == "direct",
+        backend == "micro",
+        config.get("dynamic_tile_m") or 0,
+        candidate.candidate_id,
+    )
+
+
 class MoeDecodeGenerator:
     """Generate a broad MoE planner from staged per-geometry GPU races."""
 
     component_id = MOE_DECODE
-    query_schema_version = 2
-    config_schema_version = 1
+    query_schema_version = 3
+    config_schema_version = 3
 
     def __init__(
         self,
@@ -459,8 +534,8 @@ class MoeDecodeGenerator:
             work_units=work_units,
             case_count=len(measured),
             description=(
-                f"{len(self._geometries)} physical geometries; full NVFP4 "
-                "candidate race, fixed-backend qualification, tree reduction"
+                f"{len(self._geometries)} physical geometries; concrete MoE "
+                "candidate races, fixed-backend qualification, tree reduction"
             ),
             dimensions={
                 "physical_geometries": len(self._geometries),
@@ -543,7 +618,9 @@ class MoeDecodeGenerator:
         expected_ids = [candidate.candidate_id for candidate in candidates]
         if (
             cached is not None
-            and cached.get("schema_version") == 1
+            and cached.get("schema_version") == _MOE_CHECKPOINT_SCHEMA_VERSION
+            and cached.get("candidate_contract_version")
+            == _MOE_CANDIDATE_CONTRACT_VERSION
             and context.checkpoint_metadata_matches(cached.get("generation"))
             and cached.get("case_id") == case.case_id
             and cached.get("candidate_ids") == expected_ids
@@ -574,7 +651,8 @@ class MoeDecodeGenerator:
             self.component_id,
             key,
             {
-                "schema_version": 1,
+                "schema_version": _MOE_CHECKPOINT_SCHEMA_VERSION,
+                "candidate_contract_version": _MOE_CANDIDATE_CONTRACT_VERSION,
                 "generation": context.checkpoint_metadata(),
                 "case_id": case.case_id,
                 "query": case.query(),
@@ -593,31 +671,60 @@ class MoeDecodeGenerator:
         context: GenerationContext,
         checkpoints: CheckpointStore,
     ) -> tuple[MoeCandidate, ...]:
-        anchor = min(
-            cases,
-            key=lambda case: (
-                not case.is_model_native_top_k,
-                abs(case.num_tokens - 4),
-                case.route_pattern != "balanced",
-                case.num_tokens,
-            ),
-        )
-        measurements = self._race(
-            stage="screen",
-            case=anchor,
-            candidates=session.candidates,
-            session=session,
-            context=context,
-            checkpoints=checkpoints,
-        )
+        targets_by_anchor: dict[MoeSweepCase, list[MoeCandidate]] = defaultdict(list)
+        for candidate in session.candidates:
+            eligible_cases = tuple(
+                case
+                for case in cases
+                if session.eligible_candidates(case, (candidate,))
+            )
+            if not eligible_cases:
+                continue
+            anchor = min(
+                eligible_cases,
+                key=lambda case: (
+                    not case.is_model_native_top_k,
+                    abs(case.num_tokens - 4),
+                    case.route_pattern != "balanced",
+                    case.num_tokens,
+                ),
+            )
+            targets_by_anchor[anchor].append(candidate)
+
+        survivor_ids: set[str] = set()
+        for anchor, targets in sorted(
+            targets_by_anchor.items(),
+            key=lambda item: item[0].case_id,
+        ):
+            comparators = tuple(
+                sorted(
+                    session.eligible_candidates(anchor, session.candidates),
+                    key=_correctness_reference_rank,
+                )
+            )
+            measurements = self._race(
+                stage="screen",
+                case=anchor,
+                candidates=comparators,
+                session=session,
+                context=context,
+                checkpoints=checkpoints,
+            )
+            by_id = {item.candidate.candidate_id: item for item in measurements}
+            survivor_ids.update(
+                target.candidate_id
+                for target in targets
+                if by_id[target.candidate_id].passes(context.settings.minimum_cosine)
+            )
         survivors = tuple(
-            item.candidate
-            for item in measurements
-            if item.passes(context.settings.minimum_cosine)
+            candidate
+            for candidate in session.candidates
+            if candidate.candidate_id in survivor_ids
         )
         if not survivors:
             raise RuntimeError(
-                f"all MoE candidates failed correctness for {anchor.case_id}"
+                "all MoE candidates failed correctness for "
+                f"geometry {cases[0].geometry.key}"
             )
         return survivors
 
@@ -685,7 +792,6 @@ class MoeDecodeGenerator:
             cases_by_geometry[case.geometry.key].append(case)
         full_results: list[tuple[MoeSweepCase, tuple[MoeMeasurement, ...]]] = []
         fixed_configs: dict[tuple[object, ...], FrozenMapping] = {}
-        capacity_configs: dict[tuple[object, ...], FrozenMapping] = {}
         single_candidate_route_cases = 0
         coarse_measurement_cases = 0
         for geometry_index, geometry in enumerate(self._geometries, start=1):
@@ -746,24 +852,6 @@ class MoeDecodeGenerator:
                     progress=progress,
                     checkpoints=checkpoints,
                 )
-                if _has_tunable_backend(geometry):
-                    for case in geometry_cases:
-                        if case.num_tokens not in _NVFP4_CAPACITY_TOKENS:
-                            continue
-                        eligible = session.eligible_candidates(case, candidates)
-                        if len(eligible) != 1:
-                            raise RuntimeError(
-                                "prefill capacity planning requires exactly one "
-                                f"eligible MoE candidate for {case.case_id}"
-                            )
-                        key = _query_key(case)
-                        config = eligible[0].config
-                        previous = capacity_configs.setdefault(key, config)
-                        if previous != config:
-                            raise RuntimeError(
-                                "prefill capacity routes disagree on the forced "
-                                f"MoE config for {_query_dict(case)}"
-                            )
                 progress.start_stage(
                     self.component_id,
                     stage=(
@@ -850,25 +938,9 @@ class MoeDecodeGenerator:
             )
 
         measured_query_keys = {record.query for record in records}
-        qualified_capacity_pairs = {
-            (case.geometry.key, case.num_tokens)
-            for case, _measurements in full_results
-            if case.num_tokens in _NVFP4_CAPACITY_TOKENS
-        }
         qualified_fixed_query_points = 0
-        qualified_capacity_query_points = 0
         for case in self._cases:
             config = fixed_configs.get(case.geometry.key)
-            is_capacity_config = False
-            if config is None and case.num_tokens in _NVFP4_CAPACITY_TOKENS:
-                qualification_key = (case.geometry.key, case.num_tokens)
-                if qualification_key not in qualified_capacity_pairs:
-                    raise RuntimeError(
-                        "missing GPU qualification for MoE prefill capacity "
-                        f"{case.num_tokens} and geometry {case.geometry.key}"
-                    )
-                config = capacity_configs.get(_query_key(case))
-                is_capacity_config = True
             if config is None:
                 continue
             query = FrozenMapping(_query_dict(case))
@@ -876,10 +948,7 @@ class MoeDecodeGenerator:
                 continue
             records.append(DecisionRecord(query=query, config=config))
             measured_query_keys.add(query)
-            if is_capacity_config:
-                qualified_capacity_query_points += 1
-            else:
-                qualified_fixed_query_points += 1
+            qualified_fixed_query_points += 1
 
         measured_records = tuple(records)
         token_values = {case.num_tokens for case in self._cases}
@@ -905,7 +974,6 @@ class MoeDecodeGenerator:
             "coverage": {
                 "physical_geometries": len(self._geometries),
                 "measured_query_points": len(results_by_query),
-                "qualified_capacity_query_points": qualified_capacity_query_points,
                 "qualified_fixed_query_points": qualified_fixed_query_points,
                 "runtime_query_points": len(records),
             },
@@ -926,7 +994,7 @@ class MoeDecodeGenerator:
                 "fixed_backend_qualification_tokens": sorted(_QUALIFICATION_TOKENS),
                 "fixed_backend_qualification_patterns": sorted(_QUALIFICATION_PATTERNS),
                 "prefill_token_capacities": sorted(
-                    token_values & _NVFP4_CAPACITY_TOKENS
+                    token_values & _PREFILL_CAPACITY_TOKENS
                 ),
             },
             completed_work_units=estimate.work_units,
