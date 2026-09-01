@@ -47,7 +47,18 @@ def _should_use_sm121_single_pass_decode(
         return False
     if rows < 16 or heads != 32 or int(swa_page_size) != 64:
         return False
-    if indexed_width and int(indexed_page_size or 0) != 64:
+    if indexed_width:
+        # DSV4's dual-cache single-pass dispatcher only accepts a 128-wide
+        # primary/SWA cache.  The secondary cache may occupy the remaining
+        # short-context chunks, but its page size must match the dispatcher.
+        if int(swa_width) != 128 or int(indexed_page_size or 0) != 64:
+            return False
+    elif int(swa_width) not in (128, 512):
+        # The UE8M0 DSV4 single-cache dispatcher has discrete specializations,
+        # not a generic <=10-chunk implementation.  In particular, adaptive
+        # or K6 verification can produce width 192; keep those shapes on the
+        # split-decode path instead of promoting them into an unsupported
+        # prefill specialization.
         return False
     chunks = (int(swa_width) + 63) // 64 + (int(indexed_width) + 63) // 64
     return chunks <= 10

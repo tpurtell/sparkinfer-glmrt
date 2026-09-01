@@ -92,6 +92,87 @@ def test_sm121_single_pass_decode_policy_rejects_other_regimes() -> None:
     )
 
 
+@pytest.mark.parametrize("indexed_width", [0, 512])
+def test_sm121_single_pass_decode_policy_rejects_k6_width(
+    indexed_width: int,
+) -> None:
+    assert not _should_use_sm121_single_pass_decode(
+        rows=16,
+        heads=32,
+        swa_width=192,
+        indexed_width=indexed_width,
+        swa_page_size=64,
+        indexed_page_size=64 if indexed_width else None,
+        compute_capability=(12, 1),
+    )
+
+
+def test_sm121_single_pass_decode_policy_keeps_supported_swa512() -> None:
+    assert _should_use_sm121_single_pass_decode(
+        rows=16,
+        heads=32,
+        swa_width=512,
+        indexed_width=0,
+        swa_page_size=64,
+        indexed_page_size=None,
+        compute_capability=(12, 1),
+    )
+
+
+@torch.inference_mode()
+def test_sm121_k6_width_runs_split_decode_and_matches_reference() -> None:
+    device = require_b12x()
+    if torch.cuda.get_device_capability(device) != (12, 1):
+        pytest.skip("SM121 single-pass policy regression requires DGX Spark")
+    clear_mla_caches()
+
+    rows, width = 16, 192
+    q = _make_q(rows=rows, seed=611, device=device)
+    swa_cache_bytes = _make_cache(
+        tokens=64,
+        page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        seed=612,
+        device=device,
+    )
+    swa_indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    swa_lengths = torch.empty((rows,), dtype=torch.int32, device=device)
+    for row in range(rows):
+        length = min(32, row + 1)
+        swa_indices[row, :length] = (
+            torch.arange(row, row - length, -1, dtype=torch.int32, device=device)
+            % 64
+        )
+        swa_lengths[row] = length
+    binding = _make_compressed_binding(
+        device=device,
+        rows=rows,
+        topk=width,
+        max_kv_rows=rows * width,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+    )
+
+    actual = compressed_sparse_mla_decode_forward(
+        swa_k_cache=swa_cache_bytes.view(torch.float8_e4m3fn),
+        binding=binding,
+        sm_scale=_SM_SCALE,
+    )
+    expected = compressed_sparse_mla_reference(
+        q,
+        swa_cache_bytes,
+        swa_indices,
+        swa_lengths,
+        sm_scale=_SM_SCALE,
+    )
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().reshape(-1), expected.float().reshape(-1), dim=0
+    )
+    assert max_abs <= 0.10
+    assert cosine.item() >= 0.9995
+
+
 def test_spark_h16_policy_keeps_swa_h8_and_promotes_c4() -> None:
     assert not _dsv4_h16_auto(
         rows=8,
