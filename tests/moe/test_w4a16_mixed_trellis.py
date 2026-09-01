@@ -1560,15 +1560,23 @@ def test_capture_binding_requires_host_prepared_projection_counts(
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("candidate_block_size", [32, 64])
+@pytest.mark.parametrize(
+    ("tile_config", "native_large_m_fc2"),
+    (
+        ((128, 128, 32, 512), False),
+        ((64, 256, 64, 256), True),
+    ),
+)
 def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     candidate_block_size: int,
+    tile_config: tuple[int, int, int, int],
+    native_large_m_fc2: bool,
 ) -> None:
-    """Large route blocks with M8 FC2 subtiles preserve one-grid arithmetic."""
+    """Native and fallback large-M FC2 preserve one-grid arithmetic."""
 
     torch.manual_seed(20260801)
     device = torch.device("cuda", torch.cuda.current_device())
     m, hidden, intermediate, topk = 64, 512, 256, 8
-    tile_config = (128, 128, 32, 512)
     tier0_experts, tier1_experts = 6, 2
 
     prepared_tiers = tuple(
@@ -1663,8 +1671,12 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     assert reference_launch.fc2_moe_block_size == 8
     assert reference_launch.fc2_schedule_route_block_factor == 1
     assert candidate_launch.moe_block_size == candidate_block_size
-    assert candidate_launch.fc2_moe_block_size == 8
-    assert candidate_launch.fc2_schedule_route_block_factor == 2
+    assert candidate_launch.fc2_moe_block_size == (
+        candidate_block_size if native_large_m_fc2 else 8
+    )
+    assert candidate_launch.fc2_schedule_route_block_factor == (
+        1 if native_large_m_fc2 else 2
+    )
     assert phase_equal == (True, True, True), geometry
     assert torch.equal(candidate, reference), geometry
     assert candidate_launch.shared_memory_bytes <= int(
@@ -1673,13 +1685,18 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-def test_glm52_large_m_mixed_k3_k4_matches_serial() -> None:
+@pytest.mark.parametrize(
+    "tile_config",
+    ((128, 128, 64, 256), (64, 256, 64, 256)),
+)
+def test_glm52_large_m_mixed_k3_k4_matches_serial(
+    tile_config: tuple[int, int, int, int],
+) -> None:
     """Cover the production prefill shape that exposed lost FC1 reductions."""
 
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
     m, hidden, intermediate, topk = 3072, 6144, 512, 8
-    tile_config = (128, 128, 64, 256)
     tier0_experts, tier1_experts = 192, 64
     tier0 = _prepared(
         experts=tier0_experts,

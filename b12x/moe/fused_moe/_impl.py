@@ -7752,7 +7752,7 @@ def _projection_mixed_tile_config(
     *,
     direct_topk_routes: bool,
 ) -> tuple[int, int, int, int]:
-    """Resolve a legal decode/packed mixed-Trellis tile geometry."""
+    """Resolve a mixed-Trellis tile geometry for the whole-tile scheduler."""
 
     if configured is None:
         return (
@@ -7760,10 +7760,7 @@ def _projection_mixed_tile_config(
             if direct_topk_routes
             else (128, 128, 128, 128)
         )
-    fc1_k, fc1_n, fc2_k, fc2_n = (int(value) for value in configured)
-    if not direct_topk_routes and fc1_k < 128:
-        fc1_k = 128
-    return fc1_k, fc1_n, fc2_k, fc2_n
+    return tuple(int(value) for value in configured)
 
 
 def _plan_full_rotation_w4a16_launches(

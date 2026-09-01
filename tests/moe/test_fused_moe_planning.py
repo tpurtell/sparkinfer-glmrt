@@ -608,7 +608,7 @@ def test_projection_mixed_direct_route_limit_is_bounded(
     )
 
 
-def test_projection_mixed_tile_config_preserves_decode_and_widens_packed_fc1() -> None:
+def test_projection_mixed_tile_config_preserves_whole_tile_geometry() -> None:
     configured = (64, 256, 64, 128)
 
     assert fused_moe_impl._projection_mixed_tile_config(
@@ -618,7 +618,7 @@ def test_projection_mixed_tile_config_preserves_decode_and_widens_packed_fc1() -
     assert fused_moe_impl._projection_mixed_tile_config(
         configured,
         direct_topk_routes=False,
-    ) == (128, 256, 64, 128)
+    ) == configured
 
 
 def test_projection_mixed_launch_selection_reuses_prefill_capacity() -> None:

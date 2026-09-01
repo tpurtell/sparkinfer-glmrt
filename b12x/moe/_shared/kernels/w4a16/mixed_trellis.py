@@ -1761,6 +1761,32 @@ def warmup_mixed_trellis_route_pack(
     return warmed
 
 
+def _select_mixed_fc2_kernel(
+    build_kernel,
+    *,
+    moe_block_size: int,
+    max_shared_mem: int,
+):
+    """Prefer native large-M FC2 and fall back only when resources require it."""
+
+    moe_block_size = int(moe_block_size)
+    if moe_block_size not in (32, 64):
+        return build_kernel(False)
+    try:
+        native = build_kernel(False)
+    except ValueError as exc:
+        resource_errors = (
+            "missing W4A16 register count",
+            "shared-memory footprint exceeds device opt-in limit",
+        )
+        if not any(marker in str(exc) for marker in resource_errors):
+            raise
+    else:
+        if native.shared_words * 4 <= int(max_shared_mem):
+            return native
+    return build_kernel(True)
+
+
 def compile_mixed_trellis(
     *,
     size_m: int,
@@ -1797,11 +1823,10 @@ def compile_mixed_trellis(
     )
     tier0_bits, tier1_bits = bits
     direct_topk_routes = bool(direct_topk_routes)
-    if fc1_tile_k < 128 and not direct_topk_routes:
-        raise ValueError(
-            "mixed Trellis FC1 requires tile_k >= 128; narrower K tiles lose "
-            "large-M cross-tier partial reductions"
-        )
+    # Mixed Trellis uses the whole-tile scheduler below: one CTA owns the
+    # complete K reduction for an MN tile.  The retired split-K scheduler lost
+    # cross-tier partials with K64, but keeping its K128 guard here also blocks
+    # the production K64/N256 geometry after that hazard has been removed.
     counts = (int(tier0_num_experts), int(tier1_num_experts))
     if any(value <= 0 or value > _MAX_TIER_EXPERTS for value in counts):
         raise ValueError(
@@ -1813,9 +1838,12 @@ def compile_mixed_trellis(
     route_num_experts = int(route_num_experts)
     if route_num_experts <= 0:
         raise ValueError("mixed Trellis route_num_experts must be positive")
-    grouped_m8_fc2 = int(moe_block_size) in (32, 64)
-
-    def make_kernel(num_experts: int, bits: int) -> W4A16FusedMoeKernel:
+    def make_kernel(
+        num_experts: int,
+        bits: int,
+        *,
+        grouped_m8_fc2: bool,
+    ) -> W4A16FusedMoeKernel:
         return W4A16FusedMoeKernel(
             size_m=size_m,
             hidden_size=hidden_size,
@@ -1847,10 +1875,18 @@ def compile_mixed_trellis(
             schedule_whole_tiles=True,
         )
 
-    kernel = W4A16MixedTrellisKernel(
-        driver=make_kernel(total_experts, tier0_bits),
-        tier0=make_kernel(int(tier0_num_experts), int(tier0_bits)),
-        tier1=make_kernel(int(tier1_num_experts), int(tier1_bits)),
+    def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellisKernel:
+        common = {"grouped_m8_fc2": grouped_m8_fc2}
+        return W4A16MixedTrellisKernel(
+            driver=make_kernel(total_experts, tier0_bits, **common),
+            tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
+            tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+        )
+
+    kernel = _select_mixed_fc2_kernel(
+        build_kernel,
+        moe_block_size=moe_block_size,
+        max_shared_mem=max_shared_mem,
     )
     # shared_words is the complete dynamically allocated MemRange used by the
     # cooperative kernel. CUDA permits a launch exactly at the device's
@@ -2063,20 +2099,20 @@ def compile_mixed_trellis3(
     fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
         int(value) for value in force_tile_config
     )
-    if fc1_tile_k < 128:
-        raise ValueError(
-            "mixed Trellis FC1 requires tile_k >= 128; narrower K tiles lose "
-            "large-M cross-tier partial reductions"
-        )
+    # The whole-tile scheduler gives one CTA the complete K reduction, so K64
+    # does not use the retired cross-CTA partial-reduction path.
     total_experts = sum(counts)
     if route_num_experts is None:
         route_num_experts = total_experts
     route_num_experts = int(route_num_experts)
     if route_num_experts <= 0:
         raise ValueError("mixed Trellis route_num_experts must be positive")
-    grouped_m8_fc2 = int(moe_block_size) in (32, 64)
-
-    def make_kernel(num_experts: int, trellis_bits: int) -> W4A16FusedMoeKernel:
+    def make_kernel(
+        num_experts: int,
+        trellis_bits: int,
+        *,
+        grouped_m8_fc2: bool,
+    ) -> W4A16FusedMoeKernel:
         return W4A16FusedMoeKernel(
             size_m=size_m,
             hidden_size=hidden_size,
@@ -2107,11 +2143,19 @@ def compile_mixed_trellis3(
             schedule_whole_tiles=True,
         )
 
-    kernel = W4A16MixedTrellis3Kernel(
-        driver=make_kernel(total_experts, bits[0]),
-        tier0=make_kernel(counts[0], bits[0]),
-        tier1=make_kernel(counts[1], bits[1]),
-        tier2=make_kernel(counts[2], bits[2]),
+    def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellis3Kernel:
+        common = {"grouped_m8_fc2": grouped_m8_fc2}
+        return W4A16MixedTrellis3Kernel(
+            driver=make_kernel(total_experts, bits[0], **common),
+            tier0=make_kernel(counts[0], bits[0], **common),
+            tier1=make_kernel(counts[1], bits[1], **common),
+            tier2=make_kernel(counts[2], bits[2], **common),
+        )
+
+    kernel = _select_mixed_fc2_kernel(
+        build_kernel,
+        moe_block_size=moe_block_size,
+        max_shared_mem=max_shared_mem,
     )
     if kernel.shared_words * 4 > int(max_shared_mem):
         raise ValueError(
