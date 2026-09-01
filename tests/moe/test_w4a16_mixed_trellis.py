@@ -47,6 +47,18 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
 from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_moe_weights,
 )
+from b12x.moe.fused_moe.trellis import _projection_tier_bits
+
+
+def test_projection_tier_rate_family_validation() -> None:
+    def tiers(*bits: int) -> tuple[SimpleNamespace, ...]:
+        return tuple(SimpleNamespace(bits=bit) for bit in bits)
+
+    assert _projection_tier_bits(tiers(2, 3)) == (2, 3)  # type: ignore[arg-type]
+    assert _projection_tier_bits(tiers(3, 4, 5)) == (3, 4, 5)  # type: ignore[arg-type]
+    for bits in ((3, 2), (2, 4), (2, 3, 3), (1, 2)):
+        with pytest.raises(ValueError):
+            _projection_tier_bits(tiers(*bits))  # type: ignore[arg-type]
 
 
 def _mixed_cache_key(tier0_experts: int, tier1_experts: int) -> tuple[object, ...]:

@@ -80,6 +80,25 @@ class PreparedProjectionTrellisWeights:
     trellis_codebook: str = "mcg"
 
 
+def _projection_tier_bits(
+    native_tiers: tuple[ProjectionTrellisTierWeights, ...],
+) -> tuple[int, ...]:
+    """Validate and return one ordered consecutive MCG rate family."""
+
+    tier_bits = tuple(int(tier.bits) for tier in native_tiers)
+    if len(set(tier_bits)) != len(native_tiers) or any(
+        bit not in (2, 3, 4, 5, 6) for bit in tier_bits
+    ):
+        raise ValueError(
+            "projection-mixed MCG tiers must be distinct K2..K6 values"
+        )
+    if tuple(sorted(tier_bits)) != tier_bits or any(
+        right != left + 1 for left, right in zip(tier_bits, tier_bits[1:])
+    ):
+        raise ValueError("projection-mixed MCG tiers must be consecutive and ordered")
+    return tier_bits
+
+
 def _coalesce_payloads(
     tensors: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
@@ -656,18 +675,7 @@ def prepare_projection_native_trellis_weights(
 
     if len(native_tiers) not in (2, 3):
         raise ValueError("projection-mixed Trellis requires two or three tiers")
-    tier_bits = tuple(int(tier.bits) for tier in native_tiers)
-    if len(set(tier_bits)) != len(native_tiers) or any(
-        bit not in (2, 3, 4, 5, 6) for bit in tier_bits
-    ):
-        raise ValueError(
-            "projection-mixed MCG tiers must be distinct K2..K6 values"
-        )
-    if tuple(sorted(tier_bits)) != tier_bits or any(
-        right != left + 1
-        for left, right in zip(tier_bits, tier_bits[1:], strict=True)
-    ):
-        raise ValueError("projection-mixed MCG tiers must be consecutive and ordered")
+    tier_bits = _projection_tier_bits(native_tiers)
     device = native_tiers[0].w13.device
     if any(tier.w13.device != device or tier.w2.device != device for tier in native_tiers):
         raise ValueError("projection-mixed tier payloads must share one device")
