@@ -8172,6 +8172,36 @@ def _uses_projection_mixed_trellis(
     )
 
 
+def _select_projection_mixed_trellis_launch(
+    launches: tuple[tuple[int, torch.dtype, bool, bool, object], ...],
+    *,
+    live_tokens: int,
+    route_ids_dtype: torch.dtype,
+    broadcast_suh: bool,
+    broadcast_svh: bool,
+):
+    """Select the smallest compatible launch that covers the live tail.
+
+    Decode plans contain exact M1..M32 specializations. Large prefill plans
+    deliberately compile only their capacity width, and the mixed kernel's
+    runtime ``active_size_m`` plus fixed arena safely cover every smaller live
+    tail. Selecting only exact widths made ordinary chunk tails fail despite
+    that capacity contract.
+    """
+
+    compatible = (
+        (token_capacity, candidate)
+        for token_capacity, ids_dtype, candidate_suh, candidate_svh, candidate in (
+            launches
+        )
+        if token_capacity >= int(live_tokens)
+        and ids_dtype == route_ids_dtype
+        and candidate_suh == bool(broadcast_suh)
+        and candidate_svh == bool(broadcast_svh)
+    )
+    return min(compatible, key=lambda item: item[0], default=(0, None))[1]
+
+
 def _bind_projection_mixed_trellis_from_views(
     *,
     scratch_plan: TPMoEScratchPlan,
@@ -8270,18 +8300,12 @@ def _bind_projection_mixed_trellis_from_views(
 
     broadcast_suh = int(prepared.rotations.gate_suh.shape[0]) == 1
     broadcast_svh = int(prepared.rotations.down_svh.shape[0]) == 1
-    launch = next(
-        (
-            candidate
-            for token_count, ids_dtype, candidate_suh, candidate_svh, candidate in (
-                scratch_plan._mixed_trellis_launches
-            )
-            if token_count == m
-            and ids_dtype == topk_ids.dtype
-            and candidate_suh == broadcast_suh
-            and candidate_svh == broadcast_svh
-        ),
-        None,
+    launch = _select_projection_mixed_trellis_launch(
+        scratch_plan._mixed_trellis_launches,
+        live_tokens=m,
+        route_ids_dtype=topk_ids.dtype,
+        broadcast_suh=broadcast_suh,
+        broadcast_svh=broadcast_svh,
     )
     if launch is None:
         raise RuntimeError(

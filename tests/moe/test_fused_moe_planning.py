@@ -621,6 +621,47 @@ def test_projection_mixed_tile_config_preserves_decode_and_widens_packed_fc1() -
     ) == (128, 256, 64, 128)
 
 
+def test_projection_mixed_launch_selection_reuses_prefill_capacity() -> None:
+    exact = object()
+    capacity = object()
+    launches = (
+        (1, torch.int32, False, False, exact),
+        (8192, torch.int32, False, False, capacity),
+        (8192, torch.int64, False, False, object()),
+    )
+
+    assert (
+        fused_moe_impl._select_projection_mixed_trellis_launch(
+            launches,
+            live_tokens=1,
+            route_ids_dtype=torch.int32,
+            broadcast_suh=False,
+            broadcast_svh=False,
+        )
+        is exact
+    )
+    assert (
+        fused_moe_impl._select_projection_mixed_trellis_launch(
+            launches,
+            live_tokens=99,
+            route_ids_dtype=torch.int32,
+            broadcast_suh=False,
+            broadcast_svh=False,
+        )
+        is capacity
+    )
+    assert (
+        fused_moe_impl._select_projection_mixed_trellis_launch(
+            launches,
+            live_tokens=8193,
+            route_ids_dtype=torch.int32,
+            broadcast_suh=False,
+            broadcast_svh=False,
+        )
+        is None
+    )
+
+
 def test_projection_mixed_bind_zeroes_cooperative_workspace_before_launch() -> None:
     source = inspect.getsource(
         fused_moe_impl._bind_projection_mixed_trellis_from_views
