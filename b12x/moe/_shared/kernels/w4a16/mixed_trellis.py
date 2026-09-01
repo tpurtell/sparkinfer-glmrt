@@ -48,6 +48,7 @@ from .kernel import (
     compile_w4a16_topk_sum,
     pack_topk_routes_by_expert,
 )
+from .route_pack import map_topk_routes
 
 
 @dataclass(frozen=True)
@@ -3031,12 +3032,10 @@ def run_bound_mixed_trellis(
             "mixed Trellis block-expert buffer is below request capacity"
         )
     if launch.direct_topk_routes:
-        packed = buffers.packed_route_indices[:live_routes]
-        torch.index_select(
+        packed = map_topk_routes(
+            topk_ids,
             binding.global_to_combined,
-            0,
-            topk_ids.reshape(-1),
-            out=packed,
+            mapped_ids=buffers.packed_route_indices,
         )
         block_experts = buffers.block_expert_ids
         packed_count = buffers.packed_route_count

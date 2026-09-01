@@ -20,6 +20,26 @@ _FAST_COUNT_BLOCK_T = 1024
 
 
 @triton.jit
+def _w4a16_map_routes_kernel(
+    topk_ids,
+    expert_map,
+    mapped_ids,
+    live_numel,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Map direct routes while preserving vLLM's invalid-route sentinel."""
+
+    offsets = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    live = offsets < live_numel
+    raw_ids = tl.load(topk_ids + offsets, mask=live, other=-1).to(tl.int32)
+    valid = live & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+    local_ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+    tl.store(mapped_ids + offsets, local_ids, mask=live)
+
+
+@triton.jit
 def _w4a16_route_count_kernel(
     topk_ids,
     expert_map,
@@ -75,6 +95,59 @@ def _w4a16_route_prefix_from_counts_kernel(
 
 def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
+
+
+def map_topk_routes(
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+    *,
+    mapped_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Resolve direct-route IDs without indexing on padding sentinels.
+
+    vLLM represents padded MoE routes with ``-1``.  PyTorch ``index_select``
+    asserts on those values, so the direct mixed-Trellis path uses this one
+    graph-safe map launch and leaves every invalid or unmapped route as ``-1``.
+    """
+
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must be torch.int32 or torch.int64")
+    if not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous")
+    if (
+        expert_map.dtype != torch.int32
+        or expert_map.ndim != 1
+        or not expert_map.is_contiguous()
+    ):
+        raise ValueError("expert_map must be a contiguous rank-1 int32 tensor")
+    if expert_map.device != topk_ids.device:
+        raise ValueError("expert_map must be on the same device as topk_ids")
+    num_experts = int(expert_map.numel())
+    if num_experts <= 0:
+        raise ValueError("expert_map must contain at least one route entry")
+
+    numel = int(topk_ids.numel())
+    mapped_ids = _workspace_slice(
+        mapped_ids,
+        name="mapped_ids",
+        elements=max(numel, 1),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    if numel == 0:
+        return mapped_ids[:0]
+
+    block_t = min(_next_power_of_2(numel), _FAST_COUNT_BLOCK_T)
+    _w4a16_map_routes_kernel[(triton.cdiv(numel, block_t),)](
+        topk_ids,
+        expert_map,
+        mapped_ids,
+        numel,
+        NUM_EXPERTS=num_experts,
+        BLOCK_T=block_t,
+        num_warps=4,
+    )
+    return mapped_ids[:numel]
 
 
 def _numel_capacity_for_route_workspace(
@@ -537,4 +610,4 @@ def pack_topk_routes_by_expert(
     return packed_route_indices, block_expert_ids, packed_route_count
 
 
-__all__ = ["pack_topk_routes_by_expert"]
+__all__ = ["map_topk_routes", "pack_topk_routes_by_expert"]

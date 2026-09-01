@@ -451,9 +451,11 @@ def test_mixed_two_tier_matches_serial_and_captures(
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
     # Global expert ids deliberately interleave the two bitrate tiers. The combined
     # namespace remains tier ordered so weight and rotation tables stay dense.
-    topk_ids = torch.tensor([[0, 1], [3, 2]], dtype=route_ids_dtype, device=device)
+    # The final route uses vLLM's padding sentinel. Both packed and direct
+    # routing must skip it without indexing the compact expert map.
+    topk_ids = torch.tensor([[0, 1], [3, -1]], dtype=route_ids_dtype, device=device)
     topk_weights = torch.tensor(
-        [[0.65, 0.35], [0.2, 0.8]], dtype=torch.float32, device=device
+        [[0.65, 0.35], [0.2, 0.0]], dtype=torch.float32, device=device
     )
     map0 = torch.tensor([1, -1, 0, -1], dtype=torch.int32, device=device)
     map1 = torch.tensor([-1, 1, -1, 0], dtype=torch.int32, device=device)

@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import b12x.moe._shared.kernels.w4a16.route_pack as route_pack_module
+from b12x.moe._shared.kernels.w4a16.route_pack import map_topk_routes
 from b12x.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
 from b12x.moe._shared.kernels.w4a16.host import (
     route_block_sizes_for_capacity,
@@ -76,6 +77,25 @@ def _expected_route_pack(
     ]
     expected_block_experts = torch.tensor(block_experts, dtype=torch.int32)
     return block_expert_ids, valid, expected_packed_route_count, expected_block_experts
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
+def test_direct_route_map_preserves_invalid_sentinel(
+    route_ids_dtype: torch.dtype,
+) -> None:
+    device = torch.device("cuda")
+    topk_ids = torch.tensor(
+        [[0, -1, 4], [3, 99, 1]], dtype=route_ids_dtype, device=device
+    )
+    expert_map = torch.tensor([2, -1, 3, 0, 1], dtype=torch.int32, device=device)
+    workspace = torch.full((16,), 17, dtype=torch.int32, device=device)
+
+    mapped = map_topk_routes(topk_ids, expert_map, mapped_ids=workspace)
+    torch.cuda.synchronize(device)
+
+    assert mapped.tolist() == [2, -1, 1, 0, -1, -1]
+    assert workspace[6:].tolist() == [17] * 10
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
