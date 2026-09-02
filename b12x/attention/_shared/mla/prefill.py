@@ -11,8 +11,10 @@ Supported (MG) shapes:
   * DSV4 single-cache: topk in {512, 1024, 2048} (FP8-QK) or 128 (BF16-QK)
     with 8-aligned heads split into a paired-head MG prefix plus optional
     single-group tails.
-  * DSV4 dual-cache (extra/indexed tokens): topk==128, heads % 8 == 0,
-    pbs_extra in {2, 64} (BF16-QK), using the same head partitioning.
+  * DSV4 dual-cache (extra/indexed tokens): topk in {128, 512},
+    heads % 8 == 0, pbs_extra in {2, 64} (BF16-QK), using the same
+    head partitioning. The 512-wide primary section is used by DSV4 Vision's
+    mixed-modal SWA prefix.
   * GLM_NSA: topk in {512, 1024, 2048}
   * GLM_NEXT: topk in {512, 1024, 2048, 2051, 2112}; 2112 is an
     alignment-only container whose per-row ``topk_length`` remains 2051.
@@ -422,7 +424,7 @@ def run_unified_prefill(
         if (
             model_type == ModelType.DSV4
             and scale_format == ScaleFormat.NVFP4_E4M3
-            and int(topk) == 128
+            and int(topk) in (128, 512)
         ):
             return _run_partitioned_mg(
                 compute_mode=ComputeMode.BF16,
@@ -434,11 +436,11 @@ def run_unified_prefill(
                 extra_page_block_size=extra_page_block_size,
                 stride_extra_kv_block=stride_extra_kv_block,
             )
-        if model_type == ModelType.DSV4 and int(topk) == 128:
+        if model_type == ModelType.DSV4 and int(topk) in (128, 512):
             return _run_partitioned_mg(
                 compute_mode=ComputeMode.BF16,
                 model_type=ModelType.DSV4,
-                scale_format=ScaleFormat.UE8M0_BYTE,
+                scale_format=scale_format,
                 extra_kv_cache=extra_kv_cache,
                 extra_indices=extra_indices,
                 extra_topk_length=extra_topk_length,
@@ -448,7 +450,7 @@ def run_unified_prefill(
         raise ValueError(
             f"DSV4 dual-cache prefill (heads={heads}, topk={topk}, "
             f"pbs_extra={int(extra_page_block_size)}) requires MG dispatch; only "
-            "DSV4 topk==128 with heads divisible by 8 is supported. "
+            "DSV4 topk in {128, 512} with heads divisible by 8 is supported. "
             "No decode-reuse fallback."
         )
 
@@ -462,7 +464,8 @@ def run_unified_prefill(
         "Supported (MG) shapes: single-cache heads%8==0; "
         "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 "
         "(BF16-QK, heads%8==0); "
-        "DSV4 dual-cache topk==128 with heads%8==0 and pbs_extra in {2, 64}; "
+        "DSV4 dual-cache topk in {128, 512} with heads%8==0 and "
+        "pbs_extra in {2, 64}; "
         "GLM_NSA topk in {512, 1024, 2048}; GLM_NEXT topk in "
         "{512, 1024, 2048, 2051, 2112}; "
         "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}. "

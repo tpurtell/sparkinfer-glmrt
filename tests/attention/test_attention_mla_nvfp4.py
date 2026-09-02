@@ -59,43 +59,98 @@ def test_api_uses_traits_fp8_rope_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     assert api._resolve_kv_fp8_rope(None) is False
 
 
+@pytest.mark.parametrize("packed", [False, True], ids=["contiguous", "packed"])
+@pytest.mark.parametrize("heads", [32, 64], ids=["h32", "h64"])
+@pytest.mark.parametrize(
+    ("extra_page_size", "extra_width"),
+    [(64, 512), (2, 3968)],
+    ids=["c4", "c128"],
+)
 @torch.inference_mode()
-def test_dsv4_nvfp4_mg_dual_cache_reads_rope_from_each_pool() -> None:
+def test_dsv4_nvfp4_mg_dual_cache_reads_rope_from_each_pool(
+    packed: bool,
+    heads: int,
+    extra_page_size: int,
+    extra_width: int,
+) -> None:
     device = require_b12x()
     torch.manual_seed(121_434)
-    rows, heads = 2, 32
-    main_page_size, extra_page_size = 256, 64
+    rows = 2
+    main_page_size = 64
+    main_blocks, extra_blocks = 2, 2
 
     q = torch.zeros((rows, heads, 512), dtype=torch.bfloat16, device=device)
     q[..., 448:] = torch.randn(
         (rows, heads, 64), dtype=torch.bfloat16, device=device
     )
     main_values = torch.randn(
-        (main_page_size, 512), dtype=torch.bfloat16, device=device
+        (main_blocks * main_page_size, 512), dtype=torch.bfloat16, device=device
     )
     main_values[:, 448:] = 0
     extra_values = torch.randn(
-        (extra_page_size, 512), dtype=torch.bfloat16, device=device
+        (extra_blocks * extra_page_size, 512), dtype=torch.bfloat16, device=device
     )
     extra_values[:, 448:] *= 2
 
     main_records = pack_dsv4_nvfp4_record_reference(main_values)
     extra_records = pack_dsv4_nvfp4_record_reference(extra_values)
-    main_cache = main_records.view(1, main_page_size, 1, 432)
-    extra_cache = extra_records.view(1, extra_page_size, 1, 432)
+    if packed:
+        # Match vLLM's model-wide packed slab: the two logical cache views have
+        # independent storage offsets but share a much larger physical block
+        # stride than either layer payload.
+        block_stride = 860_160
+        main_offset = 8_192
+        extra_offset = 200_000
+        backing = torch.empty(
+            (max(main_blocks, extra_blocks) - 1) * block_stride
+            + extra_offset
+            + extra_page_size * 432,
+            dtype=torch.uint8,
+            device=device,
+        )
+        main_cache = torch.as_strided(
+            backing[main_offset:],
+            size=(main_blocks, main_page_size, 1, 432),
+            stride=(block_stride, 432, 432, 1),
+        )
+        extra_cache = torch.as_strided(
+            backing[extra_offset:],
+            size=(extra_blocks, extra_page_size, 1, 432),
+            stride=(block_stride, 432, 432, 1),
+        )
+        main_cache.copy_(
+            main_records.view(main_blocks, main_page_size, 1, 432)
+        )
+        extra_cache.copy_(
+            extra_records.view(extra_blocks, extra_page_size, 1, 432)
+        )
+    else:
+        main_cache = main_records.view(main_blocks, main_page_size, 1, 432)
+        extra_cache = extra_records.view(extra_blocks, extra_page_size, 1, 432)
     main_dequant, _ = dequantize_nvfp4_mla_nope(main_records)
     extra_dequant, _ = dequantize_nvfp4_mla_nope(extra_records)
 
-    main_indices = torch.arange(
-        128, dtype=torch.int32, device=device
-    ).repeat(rows, 1)
-    extra_indices = torch.arange(
-        extra_page_size, dtype=torch.int32, device=device
-    ).repeat(rows, 1)
-    main_lengths = torch.tensor([128, 97], dtype=torch.int32, device=device)
-    extra_lengths = torch.tensor([64, 43], dtype=torch.int32, device=device)
+    main_indices = torch.full((rows, 512), -1, dtype=torch.int32, device=device)
+    main_indices[:, : main_blocks * main_page_size] = torch.arange(
+        main_blocks * main_page_size, dtype=torch.int32, device=device
+    )
+    extra_indices = torch.full(
+        (rows, extra_width), -1, dtype=torch.int32, device=device
+    )
+    extra_indices[:, : extra_blocks * extra_page_size] = torch.arange(
+        extra_blocks * extra_page_size, dtype=torch.int32, device=device
+    )
+    main_lengths = torch.tensor([97, 29], dtype=torch.int32, device=device)
+    extra_lengths = torch.tensor(
+        [extra_blocks * extra_page_size, extra_page_size],
+        dtype=torch.int32,
+        device=device,
+    )
     output = torch.empty_like(q)
     lse = torch.empty((rows, heads), dtype=torch.float32, device=device)
+    attn_sink = torch.linspace(
+        -0.8, 0.6, heads, dtype=torch.float32, device=device
+    )
 
     run_unified_prefill(
         q=q,
@@ -104,6 +159,7 @@ def test_dsv4_nvfp4_mg_dual_cache_reads_rope_from_each_pool() -> None:
         topk_length=main_lengths,
         sm_scale=512**-0.5,
         page_block_size=main_page_size,
+        attn_sink=attn_sink,
         output=output,
         lse_out=lse,
         scale_format=ScaleFormat.NVFP4_E4M3,
@@ -140,7 +196,12 @@ def test_dsv4_nvfp4_mg_dual_cache_reads_rope_from_each_pool() -> None:
             (main_dequant[main_selected], extra_dequant[extra_selected])
         )
         scores = q[row].float() @ keys.float().T * (512**-0.5)
-        expected[row] = (scores.softmax(dim=-1) @ values.float()).to(torch.bfloat16)
+        row_m = torch.maximum(scores.max(dim=-1).values, attn_sink)
+        weights = torch.exp(scores - row_m[:, None])
+        denom = weights.sum(dim=-1) + torch.exp(attn_sink - row_m)
+        expected[row] = (
+            (weights @ values.float()) / denom[:, None]
+        ).to(torch.bfloat16)
 
     torch.testing.assert_close(output, expected, atol=3.0e-3, rtol=1.0e-2)
 
