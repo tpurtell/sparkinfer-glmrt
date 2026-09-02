@@ -433,26 +433,26 @@ def _nvfp4_rope_base_off(
 
 @cute.jit
 def _ld_global_glm_rope_u32(
-    kv_cache_u8: cute.Tensor,
+    kv_cache_base_ptr: Int64,
     rope_base: Int64,
     elem: Int32,
 ) -> Uint32:
     """Load two consecutive bf16 rope elems (one u32) from global at rope_base +
     elem*2 bytes. ``elem`` is even (the lane reads bf16 pairs)."""
     return ld_global_nc_u32(
-        get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem) * Int64(2))
+        kv_cache_base_ptr + rope_base + Int64(elem) * Int64(2)
     )
 
 
 @cute.jit
 def _ld_global_nvfp4_fp8_rope_bfloat2(
-    kv_cache_u8: cute.Tensor,
+    kv_cache_base_ptr: Int64,
     rope_base: Int64,
     elem_even: Int32,
     scale: Float32,
 ) -> Uint32:
     """Load/dequant two adjacent E4M3 post-RoPE values to packed BF16."""
-    pair = ld_global_b16(get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem_even)))
+    pair = ld_global_b16(kv_cache_base_ptr + rope_base + Int64(elem_even))
     v0 = cvt_e4m3_to_f32_via_f16(pair & Uint32(0xFF)) * scale
     v1 = cvt_e4m3_to_f32_via_f16((pair >> Uint32(8)) & Uint32(0xFF)) * scale
     return pack_f32x2_to_bfloat2(v0, v1)
@@ -464,7 +464,7 @@ def s2_qk_rope_regs_mg_glm(
     qk1,
     q_rope_regs0,
     q_rope_regs1,
-    kv_cache_u8: cute.Tensor,
+    kv_cache_base_ptr: Int64,
     index_base_ptr: Int64,
     warp_first_cand: Int32,
     lane: Int32,
@@ -505,11 +505,9 @@ def s2_qk_rope_regs_mg_glm(
 
     if cutlass.const_expr(scale_format == 2 and fp8_rope):
         rope_scale, _, _, _ = ld_global_v4_f32(
-            get_ptr_as_int64(
-                kv_cache_u8,
-                rope_base
-                + Int64(_NVFP4_FP8_ROPE_SCALE_OFFSET - _NVFP4_ROPE_GMEM_OFFSET),
-            )
+            kv_cache_base_ptr
+            + rope_base
+            + Int64(_NVFP4_FP8_ROPE_SCALE_OFFSET - _NVFP4_ROPE_GMEM_OFFSET)
         )
     else:
         rope_scale = Float32(1.0)
@@ -520,18 +518,20 @@ def s2_qk_rope_regs_mg_glm(
         # b1 = rope[ko + tid*2 + 8 .. +9] of this entry's rope row.
         if cutlass.const_expr(scale_format == 2 and fp8_rope):
             b0 = _ld_global_nvfp4_fp8_rope_bfloat2(
-                kv_cache_u8, rope_base, ko + tid * Int32(2), rope_scale
+                kv_cache_base_ptr, rope_base, ko + tid * Int32(2), rope_scale
             )
             b1 = _ld_global_nvfp4_fp8_rope_bfloat2(
-                kv_cache_u8,
+                kv_cache_base_ptr,
                 rope_base,
                 ko + tid * Int32(2) + Int32(8),
                 rope_scale,
             )
         else:
-            b0 = _ld_global_glm_rope_u32(kv_cache_u8, rope_base, ko + tid * Int32(2))
+            b0 = _ld_global_glm_rope_u32(
+                kv_cache_base_ptr, rope_base, ko + tid * Int32(2)
+            )
             b1 = _ld_global_glm_rope_u32(
-                kv_cache_u8, rope_base, ko + tid * Int32(2) + Int32(8)
+                kv_cache_base_ptr, rope_base, ko + tid * Int32(2) + Int32(8)
             )
         base = Int32(ks) * Int32(4)
         d0, d1, d2, d3 = mma_m16n8k16_f32_bf16(
@@ -2940,10 +2940,21 @@ class UnifiedPrefillMGKernel:
                     if ci >= num_main_tiles:
                         index_base_ptr = get_ptr_as_int64(extra_row, split_cand_start)
 
-                # MAIN rope geometry used by the non-dual FP8 / GLM arms.
+                # Start with MAIN rope geometry. DSV4 dual-cache tiles must
+                # switch the base pointer together with indices, data, page
+                # size, and block stride; leaving RoPE on the main pool makes
+                # the NVFP4 extra section read unrelated or out-of-range rows.
                 rope_cache = kv_cache_u8
+                rope_cache_base_ptr = get_ptr_as_int64(kv_cache_u8, Int64(0))
                 rope_pbs = Int32(self.page_block_size)
                 rope_stride = stride_kv_block
+                if cutlass.const_expr(has_extra):
+                    if ci >= num_main_tiles:
+                        rope_cache_base_ptr = get_ptr_as_int64(
+                            extra_kv_cache_u8, Int64(0)
+                        )
+                        rope_pbs = Int32(self.pbs_extra)
+                        rope_stride = stride_extra_kv_block
 
                 acc0 = [
                     [
@@ -2997,7 +3008,7 @@ class UnifiedPrefillMGKernel:
                         qk1,
                         q_rope_regs0,
                         q_rope_regs1,
-                        rope_cache,
+                        rope_cache_base_ptr,
                         index_base_ptr,
                         warp_first_cand,
                         lane,
@@ -3167,7 +3178,7 @@ class UnifiedPrefillMGKernel:
                             qk1,
                             q_rope_regs0,
                             q_rope_regs1,
-                            rope_cache,
+                            rope_cache_base_ptr,
                             index_base_ptr,
                             warp_first_cand,
                             lane,
