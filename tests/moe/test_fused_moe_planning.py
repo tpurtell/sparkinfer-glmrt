@@ -94,7 +94,6 @@ def _exl3_projection_caps() -> fused_moe.Caps:
         w13_layout="trellis_t256_proj",
         w4a16_layout="trellis_native",
         trellis_bits=2,
-        trellis_tile_config=(128, 128, 128, 128),
         trellis_codebook="mcg",
         trellis_rate_granularity="per_expert_projection",
     )
@@ -563,6 +562,7 @@ def test_direct_exl3_projection_plan_preserves_k2_tier_family(
     assert plan._core_workspace_plan.implementation == "trellis_mixed"
     assert plan._core_workspace_plan.trellis_bits == 2
     assert plan._core_workspace_plan.projection_mixed_trellis
+    assert plan._core_workspace_plan.trellis_tile_config is None
 
 
 @pytest.mark.parametrize(
@@ -619,6 +619,14 @@ def test_projection_mixed_tile_config_preserves_whole_tile_geometry() -> None:
         configured,
         direct_topk_routes=False,
     ) == configured
+    assert fused_moe_impl._projection_mixed_tile_config(
+        None,
+        direct_topk_routes=True,
+    ) == (64, 128, 64, 128)
+    assert fused_moe_impl._projection_mixed_tile_config(
+        None,
+        direct_topk_routes=False,
+    ) == (128, 128, 128, 128)
 
 
 def test_projection_mixed_launch_selection_reuses_prefill_capacity() -> None:

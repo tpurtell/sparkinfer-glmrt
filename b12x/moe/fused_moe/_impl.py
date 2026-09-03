@@ -3203,7 +3203,13 @@ def _plan_core_workspace(
                 )
             if int(trellis_bits) not in (2, 3, 4, 5, 6):
                 raise ValueError("trellis_bits must be one of 2, 3, 4, 5, 6")
-            trellis_tile_config = trellis_tile_config or (64, 256, 64, 256)
+            # Projection-mixed Trellis selects separate whole-tile geometry
+            # for bounded direct decode and expert-packed prefill.  Preserve
+            # an unspecified configuration through workspace planning so
+            # _projection_mixed_tile_config() can make that live-shape choice.
+            # Uniform Trellis retains its historical fixed default.
+            if not projection_mixed_trellis:
+                trellis_tile_config = trellis_tile_config or (64, 256, 64, 256)
             if trellis_pair_kinds and (int(trellis_bits) != 3 or int(n) != 256):
                 raise ValueError(
                     "per-expert-pair btx extents require n=256 and trellis_bits=3"
@@ -3342,8 +3348,7 @@ def _plan_core_workspace(
                 full_rotation=True,
                 projection_mixed_trellis=True,
                 trellis_bits=int(trellis_bits),
-                trellis_tile_config=trellis_tile_config
-                or (128, 128, 128, 128),
+                trellis_tile_config=trellis_tile_config,
                 trellis_codebook="mcg",
                 coupled_hadamard=False,
                 route_block_size_m=block_size_m,
