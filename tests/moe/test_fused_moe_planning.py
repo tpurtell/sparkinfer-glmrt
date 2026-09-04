@@ -565,6 +565,28 @@ def test_direct_exl3_projection_plan_preserves_k2_tier_family(
     assert plan._core_workspace_plan.trellis_tile_config is None
 
 
+def test_projection_mixed_plan_allows_larger_ep_route_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+    base = _exl3_projection_caps()
+    caps = fused_moe.Caps(
+        max_tokens=base.max_tokens,
+        num_topk=base.num_topk,
+        route_num_experts=288,
+        device=base.device,
+        weight_plan=base.weight_plan,
+        quant_mode=base.quant_mode,
+        w4a16_block_size_m=base.w4a16_block_size_m,
+    )
+
+    plan = fused_moe.plan(caps)
+
+    assert plan._core_workspace_plan.weight_E == 256
+    assert plan._core_workspace_plan.route_E == 288
+    assert plan._core_workspace_plan.projection_mixed_trellis
+
+
 @pytest.mark.parametrize(
     ("capacity", "expected"),
     (
@@ -668,6 +690,43 @@ def test_projection_mixed_launch_selection_reuses_prefill_capacity() -> None:
         )
         is None
     )
+
+
+def test_projection_mixed_accepts_precomposed_ep_route_map() -> None:
+    prepared = torch.tensor([3, 1, 0, 2], dtype=torch.int32)
+    global_to_tier = torch.tensor(
+        [3, -1, 1, -1, 0, -1, 2, -1],
+        dtype=torch.int32,
+    )
+
+    selected = fused_moe_impl._projection_mixed_route_map(
+        prepared,
+        global_to_tier,
+        route_num_experts=8,
+        device=torch.device("cpu"),
+    )
+
+    assert selected.data_ptr() == global_to_tier.data_ptr()
+    assert selected.tolist() == [3, -1, 1, -1, 0, -1, 2, -1]
+
+
+def test_projection_mixed_ep_route_map_fails_closed() -> None:
+    prepared = torch.arange(4, dtype=torch.int32)
+
+    with pytest.raises(TypeError, match="torch.int32"):
+        fused_moe_impl._projection_mixed_route_map(
+            prepared,
+            torch.arange(8, dtype=torch.int64),
+            route_num_experts=8,
+            device=torch.device("cpu"),
+        )
+    with pytest.raises(ValueError, match=r"int32\[8\]"):
+        fused_moe_impl._projection_mixed_route_map(
+            prepared,
+            torch.arange(7, dtype=torch.int32),
+            route_num_experts=8,
+            device=torch.device("cpu"),
+        )
 
 
 def test_projection_mixed_bind_zeroes_cooperative_workspace_before_launch() -> None:

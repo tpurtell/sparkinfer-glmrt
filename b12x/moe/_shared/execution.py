@@ -334,21 +334,24 @@ class MoEWeightPreparationPlan:
                 )
             _validate_trellis_codebook_bits(codebook, bits)
             object.__setattr__(self, "trellis_codebook", codebook)
-            tile_config = self.trellis_tile_config or (64, 256, 64, 256)
-            tile_config = tuple(int(value) for value in tile_config)
-            if len(tile_config) != 4 or any(
-                value <= 0 or value % 16 != 0 for value in tile_config
-            ):
-                raise ValueError(
-                    "trellis_tile_config must contain four positive multiples of 16"
-                )
             object.__setattr__(self, "trellis_bits", bits)
-            object.__setattr__(self, "trellis_tile_config", tile_config)
             granularity = (
                 "uniform"
                 if self.trellis_rate_granularity is None
                 else str(self.trellis_rate_granularity).lower()
             )
+            tile_config = self.trellis_tile_config
+            if tile_config is None and granularity != "per_expert_projection":
+                tile_config = (64, 256, 64, 256)
+            if tile_config is not None:
+                tile_config = tuple(int(value) for value in tile_config)
+                if len(tile_config) != 4 or any(
+                    value <= 0 or value % 16 != 0 for value in tile_config
+                ):
+                    raise ValueError(
+                        "trellis_tile_config must contain four positive multiples of 16"
+                    )
+            object.__setattr__(self, "trellis_tile_config", tile_config)
             pair_kinds = (
                 None
                 if self.trellis_pair_kinds is None

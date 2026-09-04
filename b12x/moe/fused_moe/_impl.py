@@ -3229,11 +3229,6 @@ def _plan_core_workspace(
                 raise ValueError(
                     "projection-mixed Trellis does not support an expert transform"
                 )
-            if route_E != int(weight_E):
-                raise NotImplementedError(
-                    "projection-mixed Trellis currently requires the route and "
-                    "weight expert namespaces to match"
-                )
             if int(weight_E) > 256:
                 raise ValueError(
                     "projection-mixed Trellis supports at most 256 experts"
@@ -8225,6 +8220,42 @@ def _select_projection_mixed_trellis_launch(
     return min(compatible, key=lambda item: item[0], default=(0, None))[1]
 
 
+def _projection_mixed_route_map(
+    prepared_map: torch.Tensor,
+    route_expert_map: torch.Tensor | None,
+    *,
+    route_num_experts: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Select a precomposed route-to-tier map without live allocations.
+
+    Projection-mixed weights own a local-expert-to-tier map. Replicated-input
+    EP integrations may instead provide a static global-expert-to-tier map
+    composed once while loading the layer. The live binder only validates and
+    retains that map; it never chains or materializes mappings during replay.
+    """
+
+    selected = prepared_map if route_expert_map is None else route_expert_map
+    if not isinstance(selected, torch.Tensor):
+        raise TypeError("projection-mixed route_expert_map must be a tensor")
+    if selected.dtype != torch.int32:
+        raise TypeError(
+            "projection-mixed route_expert_map must be torch.int32, got "
+            f"{selected.dtype}"
+        )
+    if (
+        selected.ndim != 1
+        or int(selected.numel()) != int(route_num_experts)
+        or selected.device != device
+        or not selected.is_contiguous()
+    ):
+        raise ValueError(
+            "projection-mixed route_expert_map must be contiguous int32"
+            f"[{int(route_num_experts)}] on {device}"
+        )
+    return selected
+
+
 def _bind_projection_mixed_trellis_from_views(
     *,
     scratch_plan: TPMoEScratchPlan,
@@ -8253,9 +8284,9 @@ def _bind_projection_mixed_trellis_from_views(
     core_plan = scratch_plan._core_workspace_plan
     if not core_plan.projection_mixed_trellis:
         raise TypeError("scratch plan is not projection-mixed Trellis")
-    if route_expert_map is not None or output_expert_map is not None:
+    if output_expert_map is not None:
         raise NotImplementedError(
-            "projection-mixed Trellis does not yet support external expert maps"
+            "projection-mixed Trellis does not support output expert maps"
         )
     if activation_amax is not None:
         raise NotImplementedError(
@@ -8394,8 +8425,14 @@ def _bind_projection_mixed_trellis_from_views(
         fc2_scratch=tensors["fc2_c_tmp"],
         workspace=tensors["kernel_workspace"],
     )
+    global_to_combined = _projection_mixed_route_map(
+        prepared.global_to_combined,
+        route_expert_map,
+        route_num_experts=core_plan.route_E,
+        device=a.device,
+    )
     bind_common = dict(
-        global_to_combined=prepared.global_to_combined,
+        global_to_combined=global_to_combined,
         descriptor_map=prepared.descriptor_map,
         rotations=prepared.rotations,
         launch=launch,
