@@ -48,9 +48,6 @@ from .kernel import (
     compile_w4a16_topk_sum,
     pack_topk_routes_by_expert,
 )
-from .route_pack import map_topk_routes
-
-
 # Projection descriptors pack the tier in the high bits and the tier-local
 # expert in the low bits. GLM has 288 routed experts, so eight local-index bits
 # are insufficient for a valid one-tier projection. The descriptor is an
@@ -221,7 +218,7 @@ class W4A16MixedTrellisKernel:
 
     # Persistent compile keys do not include launch source text. Change this
     # version whenever the compiled argument or tensor-layout contract changes.
-    ABI_VERSION = 15
+    ABI_VERSION = 17
 
     def __init__(
         self,
@@ -548,9 +545,11 @@ class W4A16MixedTrellisKernel:
         activated: cute.Tensor,
         fc2: cute.Tensor,
         packed_route_indices: cute.Tensor,
+        raw_topk_ids: cute.Tensor,
         block_expert_ids: cute.Tensor,
         packed_route_count: cute.Tensor,
         descriptor_map_ptr: cute.Pointer,
+        global_to_combined_ptr: cute.Pointer,
         topk_weights_ptr: cute.Pointer,
         fc1_scratch: cute.Tensor,
         fc2_scratch: cute.Tensor,
@@ -573,6 +572,7 @@ class W4A16MixedTrellisKernel:
         tier1_gate_experts: cutlass.Int32,
         tier0_up_experts: cutlass.Int32,
         tier1_up_experts: cutlass.Int32,
+        route_num_experts: cutlass.Int32,
     ):
         tier0_experts = cutlass.Int64(tier0_num_experts)
         # FC2 extents are independent of the FC1 slot counts.
@@ -701,6 +701,12 @@ class W4A16MixedTrellisKernel:
             descriptor_map_ptr,
             layout=cute.make_layout((cutlass.Int64(3) * total_experts,), stride=(1,)),
         )
+        global_to_combined = cute.make_tensor(
+            global_to_combined_ptr,
+            layout=cute.make_layout(
+                (route_num_experts.to(cutlass.Int64),), stride=(1,)
+            ),
+        )
         intermediate_rotations = cute.make_tensor(
             intermediate_rotations_ptr,
             layout=cute.make_layout(
@@ -769,9 +775,11 @@ class W4A16MixedTrellisKernel:
             activated,
             fc2,
             packed_route_indices,
+            raw_topk_ids,
             block_expert_ids,
             packed_route_count,
             descriptor_map,
+            global_to_combined,
             topk_weights,
             fc1_scratch,
             fc2_scratch,
@@ -788,6 +796,7 @@ class W4A16MixedTrellisKernel:
             tier1_gate_experts,
             tier0_up_experts,
             tier1_up_experts,
+            route_num_experts,
             active_m,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -819,9 +828,11 @@ class W4A16MixedTrellisKernel:
         activated: cute.Tensor,
         fc2: cute.Tensor,
         packed_route_indices: cute.Tensor,
+        raw_topk_ids: cute.Tensor,
         block_expert_ids: cute.Tensor,
         packed_route_count: cute.Tensor,
         descriptor_map: cute.Tensor,
+        global_to_combined: cute.Tensor,
         topk_weights: cute.Tensor,
         fc1_scratch: cute.Tensor,
         fc2_scratch: cute.Tensor,
@@ -838,6 +849,7 @@ class W4A16MixedTrellisKernel:
         tier1_gate_experts: cutlass.Int32,
         tier0_up_experts: cutlass.Int32,
         tier1_up_experts: cutlass.Int32,
+        route_num_experts: cutlass.Int32,
         active_m: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -846,6 +858,22 @@ class W4A16MixedTrellisKernel:
         tid = Int32(tidx)
         cta = Int32(bidx)
         grid_x = Int32(grid_x_raw)
+
+        if cutlass.const_expr(self.driver.direct_topk_routes):
+            map_index = cta * Int32(self.cta_threads) + tid
+            map_stride = grid_x * Int32(self.cta_threads)
+            live_routes = active_m * Int32(self.top_k)
+            while map_index < live_routes:
+                global_expert = raw_topk_ids[map_index].to(Int32)
+                combined_expert = Int32(-1)
+                if (
+                    global_expert >= Int32(0)
+                    and global_expert < route_num_experts
+                ):
+                    combined_expert = global_to_combined[global_expert].to(Int32)
+                packed_route_indices[map_index] = combined_expert
+                map_index += map_stride
+            self.driver._grid_barrier(workspace, tid, grid_x)
 
         smem = cutlass.utils.SmemAllocator()
 
@@ -1981,12 +2009,14 @@ def compile_mixed_trellis(
         tensor(cutlass_dtype, compile_rows * fc1_cols),
         tensor(cutlass_dtype, compile_rows * intermediate_size),
         tensor(cutlass_dtype, compile_rows * hidden_size),
+        tensor(cutlass.Int32, compile_rows if direct_topk_routes else moe_block_size),
         tensor(
-            cutlass.Int32,
-            compile_rows if direct_topk_routes else moe_block_size,
+            cutlass.Int64 if route_ids_dtype == torch.int64 else cutlass.Int32,
+            compile_rows,
         ),
         tensor(cutlass.Int32, 1),
         tensor(cutlass.Int32, 1, align=4),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4),
         tensor(cutlass.Float32, scratch_elements),
@@ -2011,6 +2041,7 @@ def compile_mixed_trellis(
         # Up-count trace placeholders; real counts ride each launch too.
         Int32(tier0_num_experts),
         Int32(tier1_num_experts),
+        Int32(route_num_experts),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -3123,11 +3154,11 @@ def run_bound_mixed_trellis(
             "mixed Trellis block-expert buffer is below request capacity"
         )
     if launch.direct_topk_routes:
-        packed = map_topk_routes(
-            topk_ids,
-            binding.global_to_combined,
-            mapped_ids=buffers.packed_route_indices,
-        )
+        # Map global expert ids inside the cooperative grid. Uniform Trellis
+        # already follows this contract; saving one launch per MoE layer is
+        # material for speculative decode's tiny direct-route batches.
+        packed = buffers.packed_route_indices[:live_routes]
+        raw_topk_ids = topk_ids.reshape(-1)
         block_experts = buffers.block_expert_ids
         packed_count = buffers.packed_route_count
     else:
@@ -3142,6 +3173,7 @@ def run_bound_mixed_trellis(
             expert_offsets=buffers.expert_offsets,
             expert_counts=buffers.expert_counts,
         )
+        raw_topk_ids = topk_ids.reshape(-1)
     stream = current_cuda_stream()
     launch.compiled(
         make_ptr(
@@ -3158,9 +3190,11 @@ def run_bound_mixed_trellis(
         buffers.activated.view(-1),
         buffers.fc2.view(-1),
         packed,
+        raw_topk_ids,
         block_experts,
         packed_count,
         binding.descriptor_map_ptr,
+        binding.global_to_combined_ptr,
         make_ptr(
             cutlass.Float32,
             topk_weights.data_ptr(),
@@ -3190,6 +3224,7 @@ def run_bound_mixed_trellis(
         tier1_gate_experts=Int32(binding.gate_counts[1]),
         tier0_up_experts=Int32(binding.up_counts[0]),
         tier1_up_experts=Int32(binding.up_counts[1]),
+        route_num_experts=Int32(binding.route_num_experts),
     )
     launch.topk_sum.compiled(
         make_ptr(

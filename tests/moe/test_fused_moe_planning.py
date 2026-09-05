@@ -692,7 +692,7 @@ def test_projection_mixed_tile_config_preserves_whole_tile_geometry() -> None:
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
         direct_topk_routes=True,
-    ) == (64, 128, 64, 128)
+    ) == (128, 128, 128, 128)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
         direct_topk_routes=False,

@@ -7756,11 +7756,10 @@ def _projection_mixed_tile_config(
     """Resolve a mixed-Trellis tile geometry for the whole-tile scheduler."""
 
     if configured is None:
-        return (
-            (64, 128, 64, 128)
-            if direct_topk_routes
-            else (128, 128, 128, 128)
-        )
+        # SM120/SM121 GLM-5.3 K3/K4 sweeps favor K128/N128 for speculative
+        # decode as well as expert-packed mid-size batches.  The old direct
+        # K64 geometry leaves measurable throughput on the table at M3..M9.
+        return (128, 128, 128, 128)
     return tuple(int(value) for value in configured)
 
 
