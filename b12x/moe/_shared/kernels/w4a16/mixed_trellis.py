@@ -3074,8 +3074,12 @@ def run_bound_mixed_trellis(
         if launch.topk_sum.full_rotation_output_dtype == "bf16"
         else torch.float32
     )
+    expected_output_shapes = {
+        (m, launch.hidden_size),
+        (launch.size_m, launch.hidden_size),
+    }
     if (
-        tuple(buffers.output.shape) != (launch.size_m, launch.hidden_size)
+        tuple(buffers.output.shape) not in expected_output_shapes
         or buffers.output.dtype != expected_output_dtype
         or buffers.output.device != binding.device
         or not buffers.output.is_contiguous()
@@ -3083,8 +3087,9 @@ def run_bound_mixed_trellis(
     ):
         raise ValueError(
             "mixed Trellis output buffer must be contiguous, 16-byte-aligned "
-            f"{expected_output_dtype}[{launch.size_m},{launch.hidden_size}] "
-            f"on {binding.device}"
+            f"{expected_output_dtype} with live [{m},{launch.hidden_size}] or "
+            f"capacity [{launch.size_m},{launch.hidden_size}] shape on "
+            f"{binding.device}"
         )
     if int(x.data_ptr()) % 16 != 0:
         raise ValueError("mixed Trellis input must have at least 16-byte alignment")
@@ -3464,8 +3469,12 @@ def run_bound_mixed_trellis3(
         if launch.topk_sum.full_rotation_output_dtype == "bf16"
         else torch.float32
     )
+    expected_output_shapes = {
+        (m, launch.hidden_size),
+        (launch.size_m, launch.hidden_size),
+    }
     if (
-        tuple(buffers.output.shape) != (launch.size_m, launch.hidden_size)
+        tuple(buffers.output.shape) not in expected_output_shapes
         or buffers.output.dtype != expected_output_dtype
         or buffers.output.device != binding.device
         or not buffers.output.is_contiguous()
@@ -3473,8 +3482,9 @@ def run_bound_mixed_trellis3(
     ):
         raise ValueError(
             "mixed Trellis3 output buffer must be contiguous, 16-byte-aligned "
-            f"{expected_output_dtype}[{launch.size_m},{launch.hidden_size}] "
-            f"on {binding.device}"
+            f"{expected_output_dtype} with live [{m},{launch.hidden_size}] or "
+            f"capacity [{launch.size_m},{launch.hidden_size}] shape on "
+            f"{binding.device}"
         )
     if int(x.data_ptr()) % 16 != 0:
         raise ValueError("mixed Trellis input must have at least 16-byte alignment")

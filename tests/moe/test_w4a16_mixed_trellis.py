@@ -466,8 +466,11 @@ def test_mixed_two_tier_matches_serial_and_captures(
     torch.cuda.synchronize(device)
 
     props = torch.cuda.get_device_properties(device)
+    # Compile a larger capacity and hand execution the live vLLM-style output
+    # slice. The top-k epilogue receives the live row count dynamically and must
+    # accept either this view or the full standalone capacity buffer.
     launch = compile_mixed_trellis(
-        size_m=m,
+        size_m=m + 1,
         hidden_size=hidden,
         intermediate_size=intermediate,
         tier0_num_experts=2,
@@ -494,6 +497,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
     buffers = make_mixed_trellis_buffers(
         launch, device=device, sms=int(props.multi_processor_count)
     )
+    buffers.output = buffers.output[:m]
     assert buffers.output.dtype == (
         torch.bfloat16
         if full_rotation_output_dtype == "bf16"
@@ -700,9 +704,9 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
         torch.zeros((m, hidden), dtype=torch.float32, device=device),
     )
     props = torch.cuda.get_device_properties(device)
-    route_slots = max_packed_route_slots(m * topk, 8, route_num_experts)
+    route_slots = max_packed_route_slots((m + 1) * topk, 8, route_num_experts)
     launch = compile_mixed_trellis3(
-        size_m=m,
+        size_m=m + 1,
         hidden_size=hidden,
         intermediate_size=intermediate,
         tier0_num_experts=experts_per_tier,
@@ -742,6 +746,9 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
     buffers = make_mixed_trellis3_buffers(
         launch, device=device, sms=int(props.multi_processor_count)
     )
+    # Match vLLM's graph workspace contract: execution receives the live view
+    # of a larger capacity allocation.
+    buffers.output = buffers.output[:m]
 
     assert tiers[0].trellis is not None
     mismatched_tier0 = replace(
