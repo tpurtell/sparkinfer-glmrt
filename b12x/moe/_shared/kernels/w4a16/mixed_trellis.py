@@ -1813,6 +1813,7 @@ def compile_mixed_trellis(
     trellis_codebook: str = "mcg",
     moe_block_size: int = 8,
     rotation_input_dtype: str = "bf16",
+    full_rotation_output_dtype: str = "fp32",
     route_ids_dtype: torch.dtype = torch.int32,
     direct_topk_routes: bool = False,
     broadcast_suh: bool = False,
@@ -1923,6 +1924,7 @@ def compile_mixed_trellis(
         hidden_size=hidden_size,
         element_dtype="fp16",
         full_rotation=True,
+        full_rotation_output_dtype=full_rotation_output_dtype,
         num_experts=total_experts,
         route_num_experts=route_num_experts,
         route_ids_dtype=route_ids_dtype,
@@ -2078,6 +2080,7 @@ def compile_mixed_trellis3(
     trellis_codebook: str = "mcg",
     moe_block_size: int = 8,
     rotation_input_dtype: str = "bf16",
+    full_rotation_output_dtype: str = "fp32",
     route_ids_dtype: torch.dtype = torch.int32,
     broadcast_suh: bool = False,
     broadcast_svh: bool = False,
@@ -2186,6 +2189,7 @@ def compile_mixed_trellis3(
         hidden_size=hidden_size,
         element_dtype="fp16",
         full_rotation=True,
+        full_rotation_output_dtype=full_rotation_output_dtype,
         num_experts=total_experts,
         route_num_experts=route_num_experts,
         route_ids_dtype=route_ids_dtype,
@@ -2368,7 +2372,13 @@ def _make_mixed_trellis_buffers(
         ),
         fc2=rotation_gate,
         output=torch.empty(
-            (launch.size_m, launch.hidden_size), dtype=torch.float32, device=device
+            (launch.size_m, launch.hidden_size),
+            dtype=(
+                torch.bfloat16
+                if launch.topk_sum.full_rotation_output_dtype == "bf16"
+                else torch.float32
+            ),
+            device=device,
         ),
         packed_route_indices=torch.empty(route_slots, dtype=torch.int32, device=device),
         block_expert_ids=torch.empty(route_blocks, dtype=torch.int32, device=device),
@@ -3059,6 +3069,23 @@ def run_bound_mixed_trellis(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"mixed Trellis {name} must be contiguous")
+    expected_output_dtype = (
+        torch.bfloat16
+        if launch.topk_sum.full_rotation_output_dtype == "bf16"
+        else torch.float32
+    )
+    if (
+        tuple(buffers.output.shape) != (launch.size_m, launch.hidden_size)
+        or buffers.output.dtype != expected_output_dtype
+        or buffers.output.device != binding.device
+        or not buffers.output.is_contiguous()
+        or int(buffers.output.data_ptr()) % 16 != 0
+    ):
+        raise ValueError(
+            "mixed Trellis output buffer must be contiguous, 16-byte-aligned "
+            f"{expected_output_dtype}[{launch.size_m},{launch.hidden_size}] "
+            f"on {binding.device}"
+        )
     if int(x.data_ptr()) % 16 != 0:
         raise ValueError("mixed Trellis input must have at least 16-byte alignment")
 
@@ -3167,7 +3194,11 @@ def run_bound_mixed_trellis(
             assumed_align=16,
         ),
         make_ptr(
-            cutlass.Float32,
+            (
+                cutlass.BFloat16
+                if launch.topk_sum.full_rotation_output_dtype == "bf16"
+                else cutlass.Float32
+            ),
             buffers.output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
@@ -3428,6 +3459,23 @@ def run_bound_mixed_trellis3(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"mixed Trellis {name} must be contiguous")
+    expected_output_dtype = (
+        torch.bfloat16
+        if launch.topk_sum.full_rotation_output_dtype == "bf16"
+        else torch.float32
+    )
+    if (
+        tuple(buffers.output.shape) != (launch.size_m, launch.hidden_size)
+        or buffers.output.dtype != expected_output_dtype
+        or buffers.output.device != binding.device
+        or not buffers.output.is_contiguous()
+        or int(buffers.output.data_ptr()) % 16 != 0
+    ):
+        raise ValueError(
+            "mixed Trellis3 output buffer must be contiguous, 16-byte-aligned "
+            f"{expected_output_dtype}[{launch.size_m},{launch.hidden_size}] "
+            f"on {binding.device}"
+        )
     if int(x.data_ptr()) % 16 != 0:
         raise ValueError("mixed Trellis input must have at least 16-byte alignment")
 
@@ -3525,7 +3573,11 @@ def run_bound_mixed_trellis3(
             assumed_align=16,
         ),
         make_ptr(
-            cutlass.Float32,
+            (
+                cutlass.BFloat16
+                if launch.topk_sum.full_rotation_output_dtype == "bf16"
+                else cutlass.Float32
+            ),
             buffers.output.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,

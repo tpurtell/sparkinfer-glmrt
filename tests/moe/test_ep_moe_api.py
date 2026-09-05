@@ -39,7 +39,7 @@ def _trellis_weight_plan(*, local_experts: int = 4):
         quant_modes="w4a16",
         source_format="b12x_trellis",
         activation="silu",
-        params_dtype=torch.bfloat16,
+        params_dtype=torch.float16,
         num_experts=local_experts,
         hidden_size=128,
         intermediate_size=128,
@@ -215,8 +215,8 @@ def test_ep_trellis_scratch_owns_full_rotation_state(
     assert layout["kernel_workspace"].elements == 120 * 4 + 2
 
 
-def test_ep_contract_requires_w4a16_bf16() -> None:
-    with pytest.raises(TypeError, match="BF16"):
+def test_ep_contract_requires_non_trellis_w4a16_bf16() -> None:
+    with pytest.raises(TypeError, match="bfloat16"):
         EPMoEScratchCaps(
             max_tokens=1,
             num_topk=1,
@@ -306,7 +306,7 @@ def _prepare_trellis_experts(
     plan = _trellis_weight_plan(local_experts=local_e)
     return fused_moe.prepare_weights(
         plan=plan,
-        params_dtype=torch.bfloat16,
+        params_dtype=torch.float16,
         w1_fp4=w13.index_select(1, selected).clone(),
         w2_fp4=w2.index_select(0, selected).clone(),
         gate_suh=ones(local_e, hidden_size),

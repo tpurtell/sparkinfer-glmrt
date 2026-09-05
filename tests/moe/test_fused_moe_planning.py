@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -555,6 +556,20 @@ def test_projection_mixed_config_selects_fixed_mixed_workspace(
     assert specs["rotation_a_up"].shape == (3072 * 8, 6144)
     assert specs["full_rotation_output"].shape == (3072, 6144)
     assert specs["kernel_workspace"].init == "zeros"
+
+
+def test_projection_mixed_config_preserves_bf16_output_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+    caps = replace(
+        _trellis_caps(), full_rotation_output_dtype=torch.bfloat16
+    )
+    plan = fused_moe.plan(caps)
+    specs = {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
+
+    assert plan._core_workspace_plan.full_rotation_output_dtype == torch.bfloat16
+    assert specs["full_rotation_output"].dtype == torch.bfloat16
 
 
 def test_direct_exl3_projection_plan_preserves_k2_tier_family(

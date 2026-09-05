@@ -48,6 +48,7 @@ from b12x.policy import PolicyContext, get_auto_policy
 from ..fused_moe._impl import (
     B12XFP4ExpertWeights,
     _normalize_swiglu_params,
+    _prepared_dtype_for_runtime,
     _prepared_payload_for_runtime,
 )
 from ._policy import EP_MOE_POLICY, EpMoeQuery
@@ -195,10 +196,11 @@ class EPMoEScratchCaps:
             )
         if "w4a16" not in self.weight_plan.quant_modes:
             raise ValueError("replicated-input EP requires a W4A16 weight plan")
-        if self.weight_plan.io_dtype != "bfloat16":
+        expected_plan_dtype = "float16" if self.full_rotation else "bfloat16"
+        if self.weight_plan.io_dtype != expected_plan_dtype:
             raise TypeError(
-                "replicated-input W4A16 EP requires BF16 activations, got "
-                f"{self.weight_plan.io_dtype!r}"
+                "replicated-input W4A16 EP weight plan requires "
+                f"{expected_plan_dtype}, got {self.weight_plan.io_dtype!r}"
             )
         limit, alpha, beta = _normalize_swiglu_params(
             self.weight_plan.activation,
@@ -567,7 +569,11 @@ def b12x_ep_moe_fp4(*, binding: EPMoEFP4Binding) -> torch.Tensor:
         source_format=binding.experts.source_format,
         activation=binding.experts.activation,
         w13_layout=binding.experts.w13_layout,
-        dtype=binding.a.dtype,
+        dtype=_prepared_dtype_for_runtime(
+            binding.experts,
+            quant_mode="w4a16",
+            activation_dtype=binding.a.dtype,
+        ),
         hidden_size=int(binding.a.shape[1]),
     )
     if prepared is None:

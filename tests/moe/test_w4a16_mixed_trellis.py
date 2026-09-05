@@ -421,11 +421,13 @@ def _serial_tier(
     "codebook,bits", [("mcg", (2, 3)), ("mcg", (3, 4)), ("sqg_e4m3", (2, 3))]
 )
 @pytest.mark.parametrize("direct_topk_routes", [False, True])
+@pytest.mark.parametrize("full_rotation_output_dtype", ["fp32", "bf16"])
 def test_mixed_two_tier_matches_serial_and_captures(
     route_ids_dtype: torch.dtype,
     codebook: str,
     bits: tuple[int, int],
     direct_topk_routes: bool,
+    full_rotation_output_dtype: str,
 ) -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -484,12 +486,18 @@ def test_mixed_two_tier_matches_serial_and_captures(
         tier0_bits=bits[0],
         tier1_bits=bits[1],
         direct_topk_routes=direct_topk_routes,
+        full_rotation_output_dtype=full_rotation_output_dtype,
     )
     assert launch.direct_topk_routes is direct_topk_routes
     global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
     rotations = combine_trellis_rotations(tier0, tier1)
     buffers = make_mixed_trellis_buffers(
         launch, device=device, sms=int(props.multi_processor_count)
+    )
+    assert buffers.output.dtype == (
+        torch.bfloat16
+        if full_rotation_output_dtype == "bf16"
+        else torch.float32
     )
     binding = bind_mixed_trellis(
         tier0,

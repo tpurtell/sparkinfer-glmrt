@@ -3299,7 +3299,7 @@ def _plan_core_workspace(
                 _TensorAllocSpec(
                     "full_rotation_output",
                     (token_capacity, int(k)),
-                    torch.float32,
+                    full_rotation_output_dtype,
                 ),
                 _TensorAllocSpec(
                     "rotation_a_gate",
@@ -3339,7 +3339,7 @@ def _plan_core_workspace(
                 num_topk=num_topk,
                 device=device,
                 dtype=dtype,
-                full_rotation_output_dtype=torch.float32,
+                full_rotation_output_dtype=full_rotation_output_dtype,
                 deterministic_output=False,
                 full_rotation=True,
                 projection_mixed_trellis=True,
@@ -8083,6 +8083,11 @@ def _plan_projection_mixed_trellis_launches(
                 tier1_bits=tier_bits[1],
                 moe_block_size=block_size_m,
                 rotation_input_dtype=rotation_input_dtype,
+                full_rotation_output_dtype=(
+                    "bf16"
+                    if core_plan.full_rotation_output_dtype == torch.bfloat16
+                    else "fp32"
+                ),
                 route_ids_dtype=ids_dtype,
                 broadcast_suh=broadcast_suh,
                 broadcast_svh=broadcast_svh,
@@ -8371,9 +8376,10 @@ def _bind_projection_mixed_trellis_from_views(
         )
 
     output_cast_target = None
+    expected_output_dtype = core_plan.full_rotation_output_dtype
     if output is None:
         output_tensor = tensors["full_rotation_output"][:m]
-    elif output.dtype == a.dtype:
+    elif output.dtype == a.dtype and output.dtype != expected_output_dtype:
         if (
             output.device != a.device
             or output.ndim != 2
@@ -8392,14 +8398,14 @@ def _bind_projection_mixed_trellis_from_views(
         output_tensor = output
     if (
         tuple(output_tensor.shape) != (m, core_plan.k)
-        or output_tensor.dtype != torch.float32
+        or output_tensor.dtype != expected_output_dtype
         or output_tensor.device != a.device
         or not output_tensor.is_contiguous()
         or int(output_tensor.data_ptr()) % 16
     ):
         raise ValueError(
             "projection-mixed output must be contiguous, 16-byte-aligned "
-            f"float32[{m},{core_plan.k}] on {a.device}"
+            f"{expected_output_dtype}[{m},{core_plan.k}] on {a.device}"
         )
 
     # The mixed cooperative kernel uses the tail of this arena for its
