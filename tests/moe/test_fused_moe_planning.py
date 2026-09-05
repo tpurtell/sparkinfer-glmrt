@@ -619,7 +619,7 @@ def test_projection_mixed_plan_accepts_glm_288_expert_weights(
     assert plan._core_workspace_plan.projection_mixed_trellis
 
 
-def test_projection_mixed_direct_routes_have_one_workspace_block_per_route(
+def test_projection_mixed_packed_workspace_covers_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
@@ -629,10 +629,10 @@ def test_projection_mixed_direct_routes_have_one_workspace_block_per_route(
     )
     specs = {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
 
-    # Eight tokens by top-8 is the 64-route direct-kernel boundary. Packed
-    # capacity can be smaller for a four-expert layer, but direct execution
-    # names one cooperative block for every live route.
-    assert specs["block_expert_ids"].shape == (64,)
+    # The measured production policy keeps even tiny mixed-Trellis batches on
+    # the expert-packed route. Its bounded capacity requires six blocks for
+    # this four-expert, 64-route arena rather than one block per live route.
+    assert specs["block_expert_ids"].shape == (6,)
 
 
 @pytest.mark.parametrize(
@@ -654,10 +654,10 @@ def test_trellis_exact_launch_widths_cover_decode_only(
 @pytest.mark.parametrize(
     ("tokens", "top_k", "direct_exl3", "expected"),
     (
-        (1, 6, True, True),
-        (12, 6, True, True),
+        (1, 6, True, False),
+        (12, 6, True, False),
         (13, 6, True, False),
-        (9, 8, True, True),
+        (9, 8, True, False),
         (10, 8, True, False),
         (12, 6, False, False),
     ),
@@ -692,11 +692,11 @@ def test_projection_mixed_tile_config_preserves_whole_tile_geometry() -> None:
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
         direct_topk_routes=True,
-    ) == (128, 128, 128, 128)
+    ) == (64, 256, 64, 256)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
         direct_topk_routes=False,
-    ) == (128, 128, 128, 128)
+    ) == (64, 256, 64, 256)
 
 
 def test_projection_mixed_launch_selection_reuses_prefill_capacity() -> None:

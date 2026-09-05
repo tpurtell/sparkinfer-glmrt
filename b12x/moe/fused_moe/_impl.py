@@ -7721,7 +7721,10 @@ def _trellis_exact_launch_token_counts(capacity_tokens: int) -> tuple[int, ...]:
     )
 
 
-_MIXED_TRELLIS_DIRECT_ROUTE_LIMIT = 72
+# CUDA-graph measurements on SM120/SM121 show expert-packed projection-mixed
+# execution winning even at one token.  Keep the direct kernel available to
+# explicit callers, but do not select it from the production planner.
+_MIXED_TRELLIS_DIRECT_ROUTE_LIMIT = 0
 
 
 def _projection_mixed_direct_topk_routes(
@@ -7730,13 +7733,7 @@ def _projection_mixed_direct_topk_routes(
     *,
     direct_exl3: bool,
 ) -> bool:
-    """Keep bounded two-tier decode widths out of the packed K128 kernel.
-
-    Projection-mixed packed execution requires an FC1 K tile of at least 128
-    to preserve cross-tier reductions.  For at most 72 live routes, issuing
-    the exact routes directly is both bounded and measurably cheaper; larger
-    shapes retain expert-grouped route packing and weight reuse.
-    """
+    """Return whether the production planner should use direct mixed routes."""
 
     token_count = int(token_count)
     top_k = int(top_k)
@@ -7756,10 +7753,10 @@ def _projection_mixed_tile_config(
     """Resolve a mixed-Trellis tile geometry for the whole-tile scheduler."""
 
     if configured is None:
-        # SM120/SM121 GLM-5.3 K3/K4 sweeps favor K128/N128 for speculative
-        # decode as well as expert-packed mid-size batches.  The old direct
-        # K64 geometry leaves measurable throughput on the table at M3..M9.
-        return (128, 128, 128, 128)
+        # CUDA-graph sweeps across M3..M1024 favor this geometry for the
+        # production expert-packed route.  It is also the uniform-Trellis
+        # geometry, reducing the mixed dispatch tax at speculative widths.
+        return (64, 256, 64, 256)
     return tuple(int(value) for value in configured)
 
 
