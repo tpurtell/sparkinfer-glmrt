@@ -7748,14 +7748,17 @@ def _projection_mixed_direct_topk_routes(
 def _projection_mixed_tile_config(
     configured: tuple[int, int, int, int] | None,
     *,
+    token_count: int,
     direct_topk_routes: bool,
 ) -> tuple[int, int, int, int]:
     """Resolve a mixed-Trellis tile geometry for the whole-tile scheduler."""
 
     if configured is None:
-        # CUDA-graph sweeps across M3..M1024 favor this geometry for the
-        # production expert-packed route.  It is also the uniform-Trellis
-        # geometry, reducing the mixed dispatch tax at speculative widths.
+        # SM120 CUDA-graph sweeps on GLM H4096/I2048 show that the wider K128
+        # tile removes one packed-route wave at M10..M32.  Tiny speculative
+        # batches and the block-64 prefill plan remain faster with K64/N256.
+        if not direct_topk_routes and 10 <= int(token_count) <= 32:
+            return (128, 128, 128, 128)
         return (64, 256, 64, 256)
     return tuple(int(value) for value in configured)
 
@@ -8072,6 +8075,7 @@ def _plan_projection_mixed_trellis_launches(
                 max_shared_mem=max_shared_mem,
                 force_tile_config=_projection_mixed_tile_config(
                     core_plan.trellis_tile_config,
+                    token_count=token_count,
                     direct_topk_routes=direct_topk_routes,
                 ),
                 trellis_codebook="mcg",
