@@ -1403,7 +1403,7 @@ def test_build_tiered_maps_repeats_projection_independent_descriptor_row() -> No
     )
     assert route.tolist() == [1, 3, 0, 2]
     rows = descriptor.reshape(3, 4)
-    assert rows[0].tolist() == [0, 1, 1 << 8, (1 << 8) | 1]
+    assert rows[0].tolist() == [0, 1, 1 << 9, (1 << 9) | 1]
     assert torch.equal(rows[0], rows[1])
     assert torch.equal(rows[0], rows[2])
 
@@ -1426,11 +1426,11 @@ def test_projection_tiered_maps_pad_each_row_to_slot_stride() -> None:
     rows = descriptor.reshape(3, 257)
     assert torch.equal(rows[:, -1], torch.full((3,), -1, dtype=torch.int32))
     assert rows[0, 128].item() == 128
-    assert rows[0, 129].item() == 1 << 8
+    assert rows[0, 129].item() == 1 << 9
     assert rows[1, 127].item() == 127
-    assert rows[1, 128].item() == 1 << 8
+    assert rows[1, 128].item() == 1 << 9
     assert rows[2, 76].item() == 76
-    assert rows[2, 77].item() == 1 << 8
+    assert rows[2, 77].item() == 1 << 9
 
 
 def test_projection_route_namespace_must_match_the_map() -> None:
@@ -1498,6 +1498,21 @@ def test_projection_tiered_maps_support_an_empty_tier() -> None:
     assert rows[:, 255].tolist() == [255, 255, 255]
 
 
+def test_projection_tiered_maps_cover_all_288_glm_experts_in_one_tier() -> None:
+    tiers = [0] * 288
+    route, descriptor = build_projection_tiered_maps(
+        tiers,
+        tiers,
+        tiers,
+        tier_slots=(288, 0),
+        device=torch.device("cpu"),
+    )
+
+    assert route.tolist() == list(range(288))
+    rows = descriptor.reshape(3, 288)
+    assert rows[:, 287].tolist() == [287, 287, 287]
+
+
 @pytest.mark.parametrize("slots", [(256,), (256, 0, 0, 0)])
 def test_projection_tiered_maps_reject_wrong_slot_arity(slots) -> None:
     with pytest.raises(ValueError, match="exactly two or three"):
@@ -1506,9 +1521,9 @@ def test_projection_tiered_maps_reject_wrong_slot_arity(slots) -> None:
         )
 
 
-@pytest.mark.parametrize("slots", [(-1, 2), (300, -44)])
+@pytest.mark.parametrize("slots", [(-1, 2), (600, -44)])
 def test_projection_tiered_maps_reject_invalid_slots(slots) -> None:
-    with pytest.raises(ValueError, match=r"\[0, 256\]"):
+    with pytest.raises(ValueError, match=r"\[0, 512\]"):
         build_projection_tiered_maps(
             [0], [0], [0], tier_slots=slots, device=torch.device("cpu")
         )
@@ -1525,9 +1540,9 @@ def test_projection_tiered_maps_encode_gate_up_and_down_independently() -> None:
 
     assert route.tolist() == [0, 1, 2, 3]
     assert descriptor.view(3, 6).tolist() == [
-        [0, 1 << 8, 1, 2 << 8, -1, -1],
-        [1 << 8, (1 << 8) | 1, 2 << 8, 0, -1, -1],
-        [2 << 8, 0, (2 << 8) | 1, 1 << 8, -1, -1],
+        [0, 1 << 9, 1, 2 << 9, -1, -1],
+        [1 << 9, (1 << 9) | 1, 2 << 9, 0, -1, -1],
+        [2 << 9, 0, (2 << 9) | 1, 1 << 9, -1, -1],
     ]
     assert descriptor._mt_projection_counts == ((2, 1, 1), (1, 2, 1))
 

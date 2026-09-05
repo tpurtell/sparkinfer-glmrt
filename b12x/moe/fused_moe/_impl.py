@@ -3229,9 +3229,9 @@ def _plan_core_workspace(
                 raise ValueError(
                     "projection-mixed Trellis does not support an expert transform"
                 )
-            if int(weight_E) > 256:
+            if int(weight_E) > 512:
                 raise ValueError(
-                    "projection-mixed Trellis supports at most 256 experts"
+                    "projection-mixed Trellis supports at most 512 experts"
                 )
             routed_capacity = max(int(routed_rows), 1)
             topk = max(int(num_topk), 1)
@@ -3246,9 +3246,10 @@ def _plan_core_workspace(
                 block_size_m,
                 route_E,
             )
-            route_blocks_capacity = (
-                route_slots_capacity + block_size_m - 1
-            ) // block_size_m
+            route_blocks_capacity = max(
+                (route_slots_capacity + block_size_m - 1) // block_size_m,
+                min(routed_capacity, _MIXED_TRELLIS_DIRECT_ROUTE_LIMIT),
+            )
             sms = max(1, int(get_num_sm(device)))
             fc1_cols = 2 * int(n)
             tensor_specs = (
@@ -8030,7 +8031,10 @@ def _plan_projection_mixed_trellis_launches(
         block_size_m,
         core_plan.route_E,
     )
-    route_blocks = (route_slots + block_size_m - 1) // block_size_m
+    route_blocks = max(
+        (route_slots + block_size_m - 1) // block_size_m,
+        min(capacity_rows, _MIXED_TRELLIS_DIRECT_ROUTE_LIMIT),
+    )
     rotation_input_dtype = _w4a16_element_dtype(core_plan.dtype)
 
     direct_exl3 = caps.weight_plan.source_format == "exl3_trellis_mcg"

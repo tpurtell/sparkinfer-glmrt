@@ -436,7 +436,7 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
         )
 
 
-@pytest.mark.parametrize("container_width", [2051, 2112])
+@pytest.mark.parametrize("container_width", [2051, 2112, 2176])
 def test_glm_next_prefill_routes_exact_or_aligned_selector_width(
     monkeypatch: pytest.MonkeyPatch,
     container_width: int,

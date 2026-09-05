@@ -372,7 +372,7 @@ def run_unified_prefill(
         and is_glm_model_type(model_type)
         and scale_format == ScaleFormat.ARBITRARY_FP32
     )
-    glm_topk_supported = topk in (512, 1024, 2048) or (
+    glm_topk_supported = topk in (512, 1024, 2048, 2176) or (
         model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
     )
     if _mg_glm and glm_topk_supported:
@@ -390,7 +390,7 @@ def run_unified_prefill(
         and not has_extra
         and scale_format == ScaleFormat.NVFP4_E4M3
     )
-    if _mg_nvfp4 and topk in (128, 512, 1024, 2048):
+    if _mg_nvfp4 and topk in (128, 512, 1024, 2048, 2176):
         return _run_partitioned_mg(
             compute_mode=ComputeMode.BF16,
             model_type=model_type,
@@ -466,8 +466,8 @@ def run_unified_prefill(
         "(BF16-QK, heads%8==0); "
         "DSV4 dual-cache topk in {128, 512} with heads%8==0 and "
         "pbs_extra in {2, 64}; "
-        "GLM_NSA topk in {512, 1024, 2048}; GLM_NEXT topk in "
+        "GLM_NSA topk in {512, 1024, 2048, 2176}; GLM_NEXT topk in "
         "{512, 1024, 2048, 2051, 2112}; "
-        "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}. "
+        "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048, 2176}. "
         "No decode-reuse fallback."
     )

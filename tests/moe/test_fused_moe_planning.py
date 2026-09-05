@@ -82,13 +82,18 @@ def _trellis_caps() -> fused_moe.Caps:
     )
 
 
-def _exl3_projection_caps() -> fused_moe.Caps:
+def _exl3_projection_caps(
+    *,
+    num_experts: int = 256,
+    max_tokens: int = 16,
+    num_topk: int = 6,
+) -> fused_moe.Caps:
     weight_plan = fused_moe.plan_weights(
         quant_modes="w4a16",
         source_format="exl3_trellis_mcg",
         activation="silu",
         params_dtype=torch.bfloat16,
-        num_experts=256,
+        num_experts=num_experts,
         hidden_size=4096,
         intermediate_size=512,
         w13_layout="trellis_t256_proj",
@@ -98,9 +103,9 @@ def _exl3_projection_caps() -> fused_moe.Caps:
         trellis_rate_granularity="per_expert_projection",
     )
     return fused_moe.Caps(
-        max_tokens=16,
-        num_topk=6,
-        route_num_experts=256,
+        max_tokens=max_tokens,
+        num_topk=num_topk,
+        route_num_experts=num_experts,
         device="cpu",
         weight_plan=weight_plan,
         quant_mode="w4a16",
@@ -585,6 +590,34 @@ def test_projection_mixed_plan_allows_larger_ep_route_namespace(
     assert plan._core_workspace_plan.weight_E == 256
     assert plan._core_workspace_plan.route_E == 288
     assert plan._core_workspace_plan.projection_mixed_trellis
+
+
+def test_projection_mixed_plan_accepts_glm_288_expert_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+
+    plan = fused_moe.plan(_exl3_projection_caps(num_experts=288))
+
+    assert plan._core_workspace_plan.weight_E == 288
+    assert plan._core_workspace_plan.route_E == 288
+    assert plan._core_workspace_plan.projection_mixed_trellis
+
+
+def test_projection_mixed_direct_routes_have_one_workspace_block_per_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+
+    plan = fused_moe.plan(
+        _exl3_projection_caps(num_experts=4, max_tokens=8, num_topk=8)
+    )
+    specs = {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
+
+    # Eight tokens by top-8 is the 64-route direct-kernel boundary. Packed
+    # capacity can be smaller for a four-expert layer, but direct execution
+    # names one cooperative block for every live route.
+    assert specs["block_expert_ids"].shape == (64,)
 
 
 @pytest.mark.parametrize(
