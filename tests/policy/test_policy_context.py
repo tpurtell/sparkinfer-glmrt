@@ -403,6 +403,39 @@ def test_equal_priority_overlapping_rules_are_rejected() -> None:
         )
 
 
+def test_empty_component_rules_preserve_unmeasured_device_coverage() -> None:
+    from dataclasses import asdict
+
+    from b12x.policy.generation.runner import runtime_profile_payload
+    from b12x.policy.serialization import profile_from_dict
+
+    payload = runtime_profile_payload({
+        "profile_id": "nvidia.synthetic.12sm",
+        "targets": [asdict(_DEVICE)],
+        "components": [{
+            "component_id": "test.decode", "query_schema_version": 1,
+            "config_schema_version": 1, "rules": [],
+        }],
+    })
+    profile = profile_from_dict(payload)
+    registry = ProfileRegistry()
+    registry.register(profile)
+    registry.freeze()
+    query = _Query(family="a", rows=5)
+    auto = PolicyContext.for_identity(_DEVICE, registry=registry)
+    assert auto.resolve(_component(), query).source is PolicySource.HEURISTIC
+    strict = PolicyContext.for_identity(
+        _DEVICE, registry=registry, mode=PolicyMode.PREPLANNED_ONLY
+    )
+    with pytest.raises(PreplannedPolicyNotFoundError):
+        strict.resolve(_component(), query)
+    # Missing the rule-set key entirely remains malformed, even though an
+    # explicitly empty rule set survives compaction without a fake leaf.
+    del payload["components"][0]["rules"]
+    with pytest.raises(ValueError, match="exactly one"):
+        profile_from_dict(payload)
+
+
 def test_embedded_gb10_profile_is_component_scoped() -> None:
     profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
 

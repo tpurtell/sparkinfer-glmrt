@@ -1601,10 +1601,8 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     assert prepared_w4a16.weight_layout == "modelopt"
     micro_w13_scale = prepared_w4a16.micro_w13_scale
     assert micro_w13_scale is not None
-    expected_micro_w13_rows = ((rows + 63) // 64) * 64
-    assert int(micro_w13_scale.numel()) == (
-        experts * (hidden_size // 16) * expected_micro_w13_rows
-    )
+    assert micro_w13_scale.data_ptr() == w13_blockscale.data_ptr()
+    assert prepared_w4a16.micro_w2_scale.data_ptr() == w2_blockscale.data_ptr()
     assert _small_m_direct_supported(
         m=m,
         hidden_size=hidden_size,

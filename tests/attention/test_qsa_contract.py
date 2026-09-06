@@ -38,12 +38,12 @@ def _caps(
         "num_compressed_cache_pages": 4,
         "main_page_size": 32,
         "compressed_page_size": 8,
-        "q_heads": 4,
+        "q_heads": 24,
         "kv_heads": 2,
-        "head_dim": 16,
-        "index_heads": 2,
+        "head_dim": 256,
+        "index_heads": 4,
         "index_kv_heads": 1,
-        "index_head_dim": 16,
+        "index_head_dim": 128,
         "index_rotary_dim": 8,
         "compress_ratio": 4,
         "budget": 2048,
@@ -522,6 +522,77 @@ def test_qsa_plan_is_one_caller_owned_scratch_buffer() -> None:
     assert planned.caps.max_groups == 16
 
 
+def test_qsa_large_prefill_prewarm_preserves_bound_state() -> None:
+    from b12x.attention.paged import _selected_forward as selected_impl
+    from b12x.attention.qsa._policy import QsaConfig
+    from b12x.policy import PolicyContext, QSA_ATTENTION
+
+    device = require_sm120()
+    caps = qsa.Caps(
+        device=device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=65,
+        max_seq_len=64,
+        num_main_cache_pages=4,
+        num_compressed_cache_pages=4,
+        main_page_size=16,
+        compressed_page_size=4,
+        q_heads=24,
+        kv_heads=2,
+        head_dim=256,
+        index_heads=4,
+        index_kv_heads=1,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        compress_ratio=4,
+        budget=2048,
+    )
+    policy = PolicyContext.for_device(device).with_override(
+        QSA_ATTENTION,
+        QsaConfig(
+            backend="cutedsl",
+            sparse_gqa_direct_kv_warps=1,
+        ),
+    )
+    binding = _allocate_binding(caps, plan=qsa.plan(caps, policy=policy))
+    tracked = (
+        binding.main_k_cache,
+        binding.main_v_cache,
+        binding.main_block_table,
+        binding.compressed_k_cache,
+        binding.compressed_block_table,
+        binding.raw_k_ring,
+        binding.raw_logical_positions,
+        binding.raw_rope_positions,
+        binding.raw_interval_start_positions,
+        binding.raw_state_slot_ids,
+    )
+    for tensor in tracked:
+        tensor.zero_()
+    before = tuple(tensor.clone() for tensor in tracked)
+
+    selected_impl.clear_caches()
+    try:
+        qsa.prewarm(binding)
+        torch.cuda.synchronize(device)
+
+        specializations = {
+            (int(key[3]), bool(key[8]), int(key[9]))
+            for key in selected_impl._KERNEL_CACHE
+        }
+        assert specializations == {
+            (32, False, 2),
+            (64, False, 2),
+            (32, True, 1),
+            (64, True, 1),
+        }
+        for actual, expected in zip(tracked, before, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    finally:
+        selected_impl.clear_caches()
+
+
 def test_qsa_cache_requirements_are_pure_and_describe_shared_page_layout() -> None:
     requirements = qsa.cache_requirements(
         main_page_size=64,
@@ -731,8 +802,8 @@ def test_qsa_prefill_capacity_uses_full_row_workspace() -> None:
 
     assert decode.workspace_q_rows == 128
     assert prefill.workspace_q_rows == 4096
-    assert decode.max_split_row_product == 128 * 16
-    assert prefill.max_split_row_product == 4096 * 16
+    assert decode.max_split_row_product == 64 * 16
+    assert prefill.max_split_row_product == 64 * 16
 
 
 @pytest.mark.parametrize("rows", [1, 16, 32, 257, 513])
@@ -825,13 +896,13 @@ def test_qsa_separate_raw_storage_can_exceed_compressed_page_bytes() -> None:
         max_batch=1,
         max_raw_state_slots=1,
         max_q_rows=1,
-        main_page_size=32,
-        compressed_page_size=8,
+        main_page_size=16,
+        compressed_page_size=4,
         position_axes=3,
         mrope_sections=(2, 1, 1),
     )
-    assert caps.raw_page_nbytes == 264
-    assert caps.compressed_page_nbytes == 256
+    assert caps.raw_page_nbytes == 1160
+    assert caps.compressed_page_nbytes == 1024
     assert not caps.cache_requirements.shared_compressed_raw_storage_legal
     binding = _allocate_binding(caps)
     binding.main_block_table[0, 0] = 0
@@ -853,8 +924,8 @@ def test_qsa_shared_raw_storage_rejects_page_tail_overflow() -> None:
         max_batch=1,
         max_raw_state_slots=1,
         max_q_rows=1,
-        main_page_size=32,
-        compressed_page_size=8,
+        main_page_size=16,
+        compressed_page_size=4,
         position_axes=3,
         mrope_sections=(2, 1, 1),
     )
@@ -2118,7 +2189,7 @@ def test_qsa_chunked_topk_orders_mixed_scores_by_score_then_lower_group_id(
 
 def test_qsa_group_budget_2048_executes_full_decode() -> None:
     device = require_sm120()
-    caps = _caps(device, budget=8192, max_batch=1, max_raw_state_slots=1)
+    caps = _caps(device, budget=2048, max_batch=1, max_raw_state_slots=1)
     binding = _allocate_binding(caps)
     binding.main_block_table[0, 0] = 0
     binding.compressed_block_table[0, 0] = 0

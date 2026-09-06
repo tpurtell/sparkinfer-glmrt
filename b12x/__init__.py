@@ -50,6 +50,7 @@ _OPS: tuple[str, ...] = (
     "attention.qsa",
     "attention.varlen",
     "comm.pcie",
+    "comm.roce",
     "gemm.bf16_gemv",
     "gemm.bf16_vocab_projection",
     "gemm.blockscaled",
@@ -70,6 +71,7 @@ _OPS: tuple[str, ...] = (
     "sequence.ple_embedding",
     "sequence.ple",
     "sequence.gdn_decode",
+    "sequence.kda_prefill",
     "sequence.mtp_feedback",
 )
 
