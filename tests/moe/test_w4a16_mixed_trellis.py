@@ -428,10 +428,13 @@ def test_mixed_two_tier_matches_serial_and_captures(
     bits: tuple[int, int],
     direct_topk_routes: bool,
     full_rotation_output_dtype: str,
+    geometry: tuple[int, int] = (128, 128),
+    tile_config: tuple[int, int, int, int] | None = None,
 ) -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
-    m, hidden, intermediate, topk = 2, 128, 128, 2
+    hidden, intermediate = geometry
+    m, topk = 2, 2
     tier0 = _prepared(
         experts=2,
         hidden=hidden,
@@ -479,7 +482,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
         max_m_blocks=8,
         sms=int(props.multi_processor_count),
         max_shared_mem=int(props.shared_memory_per_block_optin),
-        force_tile_config=(
+        force_tile_config=tile_config or (
             (64, 128, 64, 128)
             if direct_topk_routes
             else (128, 128, 128, 128)
@@ -1814,3 +1817,17 @@ def test_glm52_large_m_mixed_k3_k4_matches_serial(
     # mixed grid reduces them in one schedule. Normal rounding stays below
     # 1e-4; the unsafe 64x256 FC1 geometry was three orders larger (~8e-3).
     assert float(relative) < 1.0e-4
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("direct", [False, True])
+def test_qwen_k4_k5_geometry_matches_serial_and_graph(direct):
+    from b12x.moe.fused_moe._impl import _projection_mixed_tile_config
+    tiles = _projection_mixed_tile_config(
+        None, hidden_size=2560, intermediate_size=640,
+        token_count=2, direct_topk_routes=direct,
+    )
+    test_mixed_two_tier_matches_serial_and_captures(
+        torch.int32, "mcg", (4, 5), direct, "bf16",
+        geometry=(2560, 640), tile_config=tiles,
+    )

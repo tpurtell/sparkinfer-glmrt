@@ -684,36 +684,50 @@ def test_projection_mixed_tile_config_preserves_whole_tile_geometry() -> None:
 
     assert fused_moe_impl._projection_mixed_tile_config(
         configured,
+        hidden_size=4096,
+        intermediate_size=2048,
         token_count=16,
         direct_topk_routes=True,
     ) == configured
     assert fused_moe_impl._projection_mixed_tile_config(
         configured,
+        hidden_size=4096,
+        intermediate_size=2048,
         token_count=16,
         direct_topk_routes=False,
     ) == configured
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
+        hidden_size=4096,
+        intermediate_size=2048,
         token_count=9,
         direct_topk_routes=True,
     ) == (64, 256, 64, 256)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
+        hidden_size=4096,
+        intermediate_size=2048,
         token_count=9,
         direct_topk_routes=False,
     ) == (64, 256, 64, 256)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
+        hidden_size=4096,
+        intermediate_size=2048,
         token_count=10,
         direct_topk_routes=False,
     ) == (128, 128, 128, 128)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
+        hidden_size=4096,
+        intermediate_size=2048,
         token_count=32,
         direct_topk_routes=False,
     ) == (128, 128, 128, 128)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
+        hidden_size=4096,
+        intermediate_size=2048,
         token_count=33,
         direct_topk_routes=False,
     ) == (64, 256, 64, 256)
@@ -1416,3 +1430,14 @@ def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
     assert resolution.source is PolicySource.HEURISTIC
     assert resolution.config.backend == "w4a16"
     assert resolution.config.w4a16_route_mode == route_mode
+
+
+def test_projection_mixed_qwen_geometry_has_whole_projection_tiles():
+    for rows in (1, 3, 9, 10, 16, 32, 33, 2048):
+        for direct in (False, True):
+            tiles = fused_moe_impl._projection_mixed_tile_config(
+                None, hidden_size=2560, intermediate_size=640,
+                token_count=rows, direct_topk_routes=direct,
+            )
+            assert 640 % tiles[1] == 0
+            assert 2560 % tiles[3] == 0

@@ -7773,6 +7773,8 @@ def _projection_mixed_direct_topk_routes(
 def _projection_mixed_tile_config(
     configured: tuple[int, int, int, int] | None,
     *,
+    hidden_size: int,
+    intermediate_size: int,
     token_count: int,
     direct_topk_routes: bool,
 ) -> tuple[int, int, int, int]:
@@ -7784,7 +7786,11 @@ def _projection_mixed_tile_config(
         # batches and the block-64 prefill plan remain faster with K64/N256.
         if not direct_topk_routes and 10 <= int(token_count) <= 32:
             return (128, 128, 128, 128)
-        return (64, 256, 64, 256)
+        # Each gate/up projection must contain whole CTA N tiles. Qwen
+        # has I=640, so GLM's N256 default is not legal for FC1.
+        # Both stages must also use the same CTA thread count.
+        tile_n = 256 if intermediate_size % 256 == 0 and hidden_size % 256 == 0 else 128
+        return (64, tile_n, 64, tile_n)
     return tuple(int(value) for value in configured)
 
 
@@ -8100,6 +8106,8 @@ def _plan_projection_mixed_trellis_launches(
                 max_shared_mem=max_shared_mem,
                 force_tile_config=_projection_mixed_tile_config(
                     core_plan.trellis_tile_config,
+                    hidden_size=core_plan.k,
+                    intermediate_size=core_plan.n,
                     token_count=token_count,
                     direct_topk_routes=direct_topk_routes,
                 ),
