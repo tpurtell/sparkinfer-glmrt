@@ -1185,6 +1185,7 @@ def test_full_rotation_topk16_route_parallel_sum_matches_reference(bits: int) ->
         (torch.bfloat16, "silu", 2, None, torch.bfloat16),
         (torch.bfloat16, "silu", 2, 10.0, torch.float32),
         (torch.bfloat16, "silu", 3, None, torch.float32),
+        (torch.bfloat16, "silu", 4, None, torch.float32),
         (torch.bfloat16, "situ", 3, None, torch.float32),
         (torch.float16, "silu", 3, None, torch.float32),
         (torch.float16, "situ", 3, None, torch.float32),

@@ -647,14 +647,20 @@ def _prepared_dtype_for_runtime(
     quant_mode: str,
     activation_dtype: torch.dtype,
 ) -> torch.dtype:
-    """Return the weight-side dtype independently of live activations."""
+    """Validate Trellis compute storage independently of its declared I/O dtype."""
 
     prepared = experts.representation_for(quant_mode)
     if (
         str(quant_mode).lower() == "w4a16"
         and getattr(prepared, "weight_layout", "") == "trellis_t256"
     ):
-        return torch.float16
+        # Full rotations always materialize FP16 GEMM operands, including
+        # weights prepared from a BF16 I/O plan. The plan's io_dtype describes
+        # that public contract, not the internal rotation scratch. Preserve
+        # both supported plan dtypes while checking the actual representation.
+        if getattr(prepared, "params_dtype", None) != torch.float16:
+            raise TypeError("full-rotation Trellis prepared operands must be float16")
+        return getattr(torch, experts.plan.io_dtype)
     return activation_dtype
 
 
@@ -9440,7 +9446,11 @@ def build_tp_moe_fp4_binding(
         source_format=source_format,
         activation=activation,
         w13_layout=w13_layout,
-        dtype=a.dtype,
+        dtype=_prepared_dtype_for_runtime(
+            experts,
+            quant_mode=quant_mode,
+            activation_dtype=a.dtype,
+        ),
         hidden_size=k,
     )
     num_topk = int(topk_ids.shape[1])

@@ -687,8 +687,9 @@ def test_trellis_scratch_plan_can_own_bf16_epilogue_output(
     assert output_spec.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("plan_dtype", [torch.float16, torch.bfloat16])
 def test_full_rotation_binds_bf16_input_to_fp16_prepared_weights(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, plan_dtype: torch.dtype,
 ) -> None:
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
     monkeypatch.setattr(
@@ -700,7 +701,7 @@ def test_full_rotation_binds_bf16_input_to_fp16_prepared_weights(
         quant_modes="w4a16",
         source_format="exl3_trellis_mcg",
         activation="silu",
-        params_dtype=torch.float16,
+        params_dtype=plan_dtype,
         num_experts=8,
         hidden_size=128,
         intermediate_size=128,
@@ -735,7 +736,7 @@ def test_full_rotation_binds_bf16_input_to_fp16_prepared_weights(
             quant_mode="w4a16",
             activation_dtype=torch.bfloat16,
         )
-        == torch.float16
+        == plan_dtype
     )
 
     binding = plan.bind(
@@ -744,8 +745,15 @@ def test_full_rotation_binds_bf16_input_to_fp16_prepared_weights(
     )
 
     assert binding.a.dtype == torch.bfloat16
-    assert experts.plan.io_dtype == "float16"
+    assert experts.plan.io_dtype == str(plan_dtype).removeprefix("torch.")
     assert binding.output.dtype == torch.bfloat16
+
+    payload.params_dtype = torch.bfloat16
+    with pytest.raises(TypeError, match="prepared operands must be float16"):
+        plan.bind(
+            scratch=_scratch_for_plan(plan),
+            **_binding_args(tensors, experts),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
