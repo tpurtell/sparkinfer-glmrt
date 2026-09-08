@@ -4421,7 +4421,17 @@ class W4A16GemmKernel:
         )
         wa = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
         wb = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
-        if cutlass.const_expr(self.trellis_bits <= 4):
+        if cutlass.const_expr(self.trellis_bits == 4):
+            # K4's eight codes occupy exactly one ring word per lane.  The
+            # preceding word is already held by the preceding warp lane.
+            previous_lane = (lane + Int32(31)) & Int32(31)
+            for jj in cutlass.range_constexpr(4):
+                tbase = base_u32 + Int32(jj * tile_u32)
+                b = ld_shared_u32(b_region + (tbase + lane) * Int32(4))
+                a = cute.arch.shuffle_sync(b, previous_lane)
+                wa[jj] = b
+                wb[jj] = (a << Uint32(16)) | (b >> Uint32(16))
+        elif cutlass.const_expr(self.trellis_bits <= 4):
             ia, ib, s2, _ = self._trellis256_lane_geom(lane, 0, 8)
             for jj in cutlass.range_constexpr(4):
                 tbase = base_u32 + Int32(jj * tile_u32)
