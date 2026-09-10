@@ -175,14 +175,17 @@ def validate_scale_component(
     experts: int,
     hidden: int,
     intermediate: int,
+    world_size: int = 4,
 ) -> P8ScaleSandwich:
     """Validate scale metadata and byte hashes, rejecting partial coupling."""
 
+    if world_size not in (2, 4) or rank not in range(world_size):
+        raise ValueError("Invalid P8 tensor-parallel topology")
     required = {
-        "schema": SCHEMA,
+        "schema": SCHEMA.replace("tp4", f"tp{world_size}"),
         "layer": str(layer),
         "rank": str(rank),
-        "world_size": "4",
+        "world_size": str(world_size),
         "component": COMPONENT,
         "composition_target": COMPOSITION_TARGET,
         "boundary": "h128-suh-svh-scale-component",
@@ -252,6 +255,7 @@ def validate_coupled_component(
     hidden: int,
     intermediate: int,
     expected_transform_sha256: str | None = None,
+    world_size: int = 4,
 ) -> P8ScaleSandwich:
     """Fail-closed validation for the complete H512/H128/sign candidate."""
 
@@ -270,10 +274,10 @@ def validate_coupled_component(
 
     local_atoms = intermediate // 32
     required = {
-        "schema": COUPLED_SCHEMA,
+        "schema": COUPLED_SCHEMA.replace("tp4", f"tp{world_size}"),
         "layer": str(layer),
         "rank": str(rank),
-        "world_size": "4",
+        "world_size": str(world_size),
         "component": COUPLED_COMPONENT,
         "composition_target": COMPOSITION_TARGET,
         "boundary": COMPOSITION_TARGET,
@@ -288,7 +292,7 @@ def validate_coupled_component(
         "sign_pre_axis": "1",
         "sign_post_axis": "2",
         "activation": "silu-cap10",
-        "global_intermediate": str(intermediate * 4),
+        "global_intermediate": str(intermediate * world_size),
         "local_atom_begin": str(rank * local_atoms),
         "tp_slice": "contiguous-atom32-v1",
         "gate_up_suh_shared": "true",
@@ -308,7 +312,7 @@ def validate_coupled_component(
     scale_metadata = dict(metadata)
     scale_metadata.update(
         {
-            "schema": SCHEMA,
+            "schema": SCHEMA.replace("tp4", f"tp{world_size}"),
             "component": COMPONENT,
             "boundary": "h128-suh-svh-scale-component",
             "cast_order": CAST_ORDER,
@@ -325,8 +329,9 @@ def validate_coupled_component(
         experts=experts,
         hidden=hidden,
         intermediate=intermediate,
+        world_size=world_size,
     )
-    signs = rank_local_coupled_signs(intermediate=intermediate, rank=rank)
+    signs = rank_local_coupled_signs(intermediate=intermediate, rank=rank, world_size=world_size)
     if metadata.get("sha256_coupled_signs_fp16") != tensor_sha256(signs):
         raise RuntimeError("coupled P8 fixed sign seed/hash mismatch")
     return P8ScaleSandwich(

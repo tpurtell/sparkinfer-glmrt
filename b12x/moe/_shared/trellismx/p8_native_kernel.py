@@ -132,8 +132,8 @@ class P8NativeTPMoE:
         self.shared_workspace = bool(shared_workspace)
         self.tp_rank = int(tp_rank)
         self.world_size = int(world_size)
-        if self.world_size != 4 or self.tp_rank not in range(4):
-            raise ValueError("P8 native supports TP4 only; TP2 validators are unsupported")
+        if self.world_size not in (2, 4) or self.tp_rank not in range(self.world_size):
+            raise ValueError("P8 native requires TP2 or TP4 with a valid rank")
         self.layer = int(layer)
         if not 3 <= self.layer <= 44:
             raise ValueError("P8 native layer must be in GLM routed layers 3..44")
@@ -180,7 +180,7 @@ class P8NativeTPMoE:
         if tp4_parent_sha256 is not None:
             if self.world_size != 2:
                 raise ValueError("Parent-pair adapter requires TP2")
-            from glm53_nvfp4.p8_tp2_repack import open_tp2_pair
+            from .p8_tp2_repack import open_tp2_pair
             source = open_tp2_pair(sidecar, tp4_parent_sha256, layer=self.layer, rank=self.tp_rank)
         else:
             source = safe_open(sidecar, framework="pt", device="cpu")
