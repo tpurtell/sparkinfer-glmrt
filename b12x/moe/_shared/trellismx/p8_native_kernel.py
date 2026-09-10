@@ -384,6 +384,8 @@ class P8NativeTPMoE:
         # kernel because the grouped M64 prefill kernels remain K4-only.
         self._compiled: dict[tuple[bool, bool], _CompiledArm] = {}
         self._coupled_reducer = None
+        self.is_sm121 = torch.cuda.get_device_capability(self.device) == (12, 1)
+        self.cooperative_grid_cap = torch.cuda.get_device_properties(self.device).multi_processor_count
 
     def _compile(self, materialized: bool, small_m: bool = False, expected_m: int | None = None) -> _CompiledArm:
         if self.compact_scale_storage and not (self.full_coupled and materialized):
@@ -763,6 +765,11 @@ class P8NativeTPMoE:
         if self.grid_policy and self.world_size == 4 and self.mac_override is None:
             from .p8_multirow_scratch import direct_grid_capacity
             launch_mac = direct_grid_capacity(m, arm.mac)
+        # The inherited grid policy was measured on a 188-SM GPU. GB10 has
+        # fewer resident CTAs; its cooperative routing phase must fit at once.
+        # One CTA per SM is a conservative bring-up bound, not a tuned policy.
+        if self.is_sm121:
+            launch_mac = min(launch_mac, self.cooperative_grid_cap)
         arm.compiled(
             _gptr(cutlass.BFloat16, x),
             _gptr(cutlass.Int32, flat_ids, 4),
