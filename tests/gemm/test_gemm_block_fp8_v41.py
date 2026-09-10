@@ -85,3 +85,20 @@ def test_precise_split_k_reduces_every_plane(slices):
     planes[-1].add_(2)
     graph.replay()
     torch.testing.assert_close(out[:, :, 0], planes.sum(0).bfloat16(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("n,k", [(5120,15360),(512,5120)])
+def test_mxfp8_aot_split_metadata_and_export(n,k,tmp_path):
+    from b12x._lib.dense_gemm import compile_dense_gemm_mxfp8_aot
+    require_b12x()
+    compiled,slices=compile_dense_gemm_mxfp8_aot(
+        size_m=1,size_n=n,size_k=k,return_split_k_metadata=True)
+    assert slices in (1,2,4)
+    compiled.export_to_c(str(tmp_path),"split","ds41_split")
+    assert (tmp_path/"split.h").stat().st_size>0
+    assert (tmp_path/"split.o").stat().st_size>0
+    if slices > 1:
+        with pytest.raises(ValueError,match="standalone export does not support split-K"):
+            compile_dense_gemm_mxfp8_aot(size_m=1,size_n=n,size_k=k)
+    else:
+        assert hasattr(compile_dense_gemm_mxfp8_aot(size_m=1,size_n=n,size_k=k),"export_to_c")

@@ -5690,12 +5690,15 @@ def compile_dense_gemm_mxfp8_aot(
     sfb_k_replicated: bool = False,
     sm_count: Optional[int] = None,
     device: Optional[torch.device] = None,
+    return_split_k_metadata: bool = False,
 ) -> object:
     """Compile one runtime-M MXFP8-to-BF16 GEMM for native AOT export.
 
     ``size_m`` is the largest live-M regime represented by the export.  The
     generated launch still receives live M at runtime, matching ``dense_gemm``.
-    Only the standalone, non-split-K output form is admitted.
+    By default only standalone BF16 output is admitted. With
+    return_split_k_metadata=True, return (compiled, slices); split plans write
+    FP32 [slices,live_m,N] planes which the caller must reduce before BF16 rounding.
     """
 
     size_m = int(size_m)
@@ -5743,23 +5746,28 @@ def compile_dense_gemm_mxfp8_aot(
         sm_count=sm_count,
         expected_m=regime_m,
     )
-    if policy.split_k_slices != 1:
+    if policy.split_k_slices != 1 and not return_split_k_metadata:
         raise ValueError(
             "MXFP8 AOT standalone export does not support split-K: "
             f"M={size_m}, N={size_n}, K={size_k}, slices={policy.split_k_slices}"
         )
+    slices = int(policy.split_k_slices)
+    if slices not in (1, 2, 4):
+        raise ValueError(f"unsupported MXFP8 AOT split count: {slices}")
+    if slices > 1:
+        policy = replace(policy, split_k_atomic_bf16=False)
     sfb_k_reuse = bool(sfb_k_replicated)
     tensor_api = _get_compiled_dense_gemm(
         n=size_n,
         k=size_k,
         l=1,
-        c_l=1,
+        c_l=slices,
         a_major="k",
         b_major="k",
         c_major="n",
         ab_dtype=cutlass.Float8E4M3FN,
         sf_dtype=cutlass.Float8E8M0FNU,
-        c_dtype=cutlass.BFloat16,
+        c_dtype=cutlass.Float32 if slices > 1 else cutlass.BFloat16,
         alpha_dtype=cutlass.Float32,
         sf_vec_size=32,
         mma_k=32,
@@ -5790,7 +5798,8 @@ def compile_dense_gemm_mxfp8_aot(
             is_mxfp8=True,
         ),
     )
-    return tensor_api.compiled  # type: ignore[attr-defined]
+    compiled = tensor_api.compiled  # type: ignore[attr-defined]
+    return (compiled, slices) if return_split_k_metadata else compiled
 
 
 class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
