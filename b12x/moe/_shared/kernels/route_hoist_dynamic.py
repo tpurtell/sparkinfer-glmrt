@@ -1484,6 +1484,17 @@ class MoEDynamicKernelBackend:
             barrier_id=6,
             num_threads=self.input_warps_per_token * self.num_threads_per_warp,
         )
+        # M64/M128 materialized routing has ten warps: five independent
+        # token pairs. Sharing barrier 6 across the last three pairs lets a
+        # pair read route slots before its own partner has written them.
+        self.input_pair_barrier_3 = pipeline.NamedBarrier(
+            barrier_id=11,
+            num_threads=self.input_warps_per_token * self.num_threads_per_warp,
+        )
+        self.input_pair_barrier_4 = pipeline.NamedBarrier(
+            barrier_id=12,
+            num_threads=self.input_warps_per_token * self.num_threads_per_warp,
+        )
         w4a8_stage_threads = (self.num_mma_warps + 1) * self.num_threads_per_warp
         self.w4a8_ready_barrier_0 = pipeline.NamedBarrier(
             barrier_id=7,
@@ -1935,8 +1946,12 @@ class MoEDynamicKernelBackend:
             self.input_pair_barrier_0.arrive_and_wait()
         elif pair_idx == Int32(1):
             self.input_pair_barrier_1.arrive_and_wait()
-        else:
+        elif pair_idx == Int32(2):
             self.input_pair_barrier_2.arrive_and_wait()
+        elif pair_idx == Int32(3):
+            self.input_pair_barrier_3.arrive_and_wait()
+        else:
+            self.input_pair_barrier_4.arrive_and_wait()
 
     @cute.jit
     def _sync_w4a8_stage_ready(self, stage: Int32):
@@ -4760,6 +4775,11 @@ class MoEDynamicKernelBackend:
                                                 Int32(self.tile_shape_mnk[0]),
                                             )
                         warp_item += Int32(1)
+
+            # Finish consuming this CTA-wide batch before the leader replaces
+            # its shared batch index. Remote-only EP routes can skip packing
+            # and otherwise let the leader overtake another warp.
+            cute.arch.sync_threads()
 
         if cutlass.const_expr(
             not self.compute_only and not self.w4a8_m1_materialized

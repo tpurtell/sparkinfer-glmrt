@@ -546,6 +546,7 @@ class P8NativeTPMoE:
                 "glm53.p8.native.tp",
                 4,
                 ("ep_local_scale_offsets", 1),
+                ("route_batch_barrier", 2),
                 ("fc1_row_alias376", 1),
                 ("requested_m_regime_direct_policy", 1),
                 ("fc1_route_hoist", 1),
