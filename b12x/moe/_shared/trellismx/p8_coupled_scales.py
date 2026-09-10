@@ -179,7 +179,7 @@ def validate_scale_component(
 ) -> P8ScaleSandwich:
     """Validate scale metadata and byte hashes, rejecting partial coupling."""
 
-    if world_size not in (2, 4) or rank not in range(world_size):
+    if world_size not in (1, 2, 4) or rank not in range(world_size):
         raise ValueError("Invalid P8 tensor-parallel topology")
     required = {
         "schema": SCHEMA.replace("tp4", f"tp{world_size}"),

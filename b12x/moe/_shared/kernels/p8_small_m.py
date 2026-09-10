@@ -77,6 +77,7 @@ class P8SmallMPhase2Kernel(W4A8MaterializedPhase2Kernel):
     p8_tile_major = False
     tile_m = 16
     p8_intermediate = 512
+    p8_experts = 288
     source_tile_m = 16
     mma_m_blocks = 1
     owned_row_groups = 4
@@ -177,7 +178,7 @@ class P8SmallMPhase2Kernel(W4A8MaterializedPhase2Kernel):
     ) -> cutlass.Float32:
         """Apply shared down svh after output H128 and before route sum."""
 
-        down_svh_base = Int32(4096 + 288 * 3 * self.p8_intermediate)
+        down_svh_base = Int32(4096 + self.p8_experts * 3 * self.p8_intermediate)
         return value * scale_component[down_svh_base + output_col].to(
             cutlass.Float32
         )

@@ -11,8 +11,8 @@ class P8SmallMGeometry:
     topk: int = 8
 
     def __post_init__(self):
-        if (self.tokens, self.experts, self.hidden, self.topk) != (1, 288, 4096, 8) or self.intermediate not in (512, 1024):
-            raise ValueError("small-M candidate requires GLM TP4/TP2 M1 geometry")
+        if (self.tokens, self.experts, self.hidden, self.topk) != (1, 288, 4096, 8) or self.intermediate not in (512, 1024, 2048):
+            raise ValueError("small-M candidate requires GLM TP4/TP2 or full-width EP M1 geometry")
 
     @property
     def physical_tiles(self):

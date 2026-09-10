@@ -111,6 +111,7 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
     p8_broadcast_a = False
     # Set by the owning runtime before compilation. TP4 remains the default.
     p8_intermediate = 512
+    p8_experts = 288
     tile_m = 16
     source_tile_m = 16
     mma_m_blocks = 1
@@ -1233,7 +1234,7 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
             output_tile = tile // Int32(self.subtiles)
             subtile = tile % Int32(self.subtiles)
             expert = task_expert[route].to(Int32)
-            if expert >= Int32(0) and expert < Int32(288):
+            if expert >= Int32(0) and expert < Int32(self.p8_experts):
                 self._run_task(
                     packed_a_u32, scale_storage, w13_rp, w13_sfb_rp,
                     intermediate_u32, token_map, alpha, input_global_scale,
@@ -1296,7 +1297,7 @@ class P8H128FC1Kernel(P8H128NarrowFC1Kernel):
     ) -> cutlass.Float32:
         # Packed scales occupy H + E*3I + H FP16 elements. Fixed signs are
         # shared by every expert on this TP rank and occupy pre[2I]|post[I].
-        sign_base = Int32(4096 + 288 * 3 * self.p8_intermediate + 4096)
+        sign_base = Int32(4096 + self.p8_experts * 3 * self.p8_intermediate + 4096)
         return scale_component[sign_base + sign_idx].to(cutlass.Float32)
 
     @cute.jit

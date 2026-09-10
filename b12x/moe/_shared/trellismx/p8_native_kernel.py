@@ -66,11 +66,11 @@ class _CompiledArm:
 
 
 class P8NativeTPMoE:
-    """Own one TP rank's physical P8 payload and launch compiled MoE kernels."""
+    """Own one TP or EP rank's physical P8 payload and launch native kernels."""
 
     def __init__(
         self,
-        sidecar: Path | tuple[Path, Path],
+        sidecar: Path | tuple[Path, ...],
         *,
         device: torch.device,
         tp_rank: int,
@@ -93,9 +93,11 @@ class P8NativeTPMoE:
         compact_input_storage: bool = False,
         shared_workspace: bool = False,
         world_size: int = 4,
-        tp4_parent_sha256: tuple[str, str] | None = None,
+        tp4_parent_sha256: tuple[str, ...] | None = None,
         prefill_chunk_tokens: int = 0,
         grid_policy: bool | None = None,
+        ep_size: int = 1,
+        ep_rank: int = 0,
         grouped_m16: bool = False,
         fuse_grouped_scratch: bool = False,
         tile_major_tasks: bool = False,
@@ -132,8 +134,13 @@ class P8NativeTPMoE:
         self.shared_workspace = bool(shared_workspace)
         self.tp_rank = int(tp_rank)
         self.world_size = int(world_size)
-        if self.world_size not in (2, 4) or self.tp_rank not in range(self.world_size):
-            raise ValueError("P8 native requires TP2 or TP4 with a valid rank")
+        self.ep_size = int(ep_size)
+        self.ep_rank = int(ep_rank)
+        if self.ep_size == 1:
+            if self.world_size not in (2, 4) or self.tp_rank not in range(self.world_size) or self.ep_rank != 0:
+                raise ValueError("P8 native requires TP2 or TP4 with a valid rank")
+        elif self.ep_size not in (2, 4) or self.ep_rank not in range(self.ep_size) or self.world_size != 1 or self.tp_rank != 0 or tp4_parent_sha256 is None:
+            raise ValueError("EP requires TP1 and four hash-bound TP4 parents")
         self.layer = int(layer)
         if not 3 <= self.layer <= 44:
             raise ValueError("P8 native layer must be in GLM routed layers 3..44")
@@ -177,7 +184,11 @@ class P8NativeTPMoE:
             )
         if self.mac_override is not None and self.mac_override <= 0:
             raise ValueError("mac_override must be positive")
-        if tp4_parent_sha256 is not None:
+        if self.ep_size > 1:
+            from .p8_ep_repack import open_ep_group
+            source = open_ep_group(sidecar, tp4_parent_sha256, layer=self.layer,
+                                   ep_rank=self.ep_rank, ep_size=self.ep_size)
+        elif tp4_parent_sha256 is not None:
             if self.world_size != 2:
                 raise ValueError("Parent-pair adapter requires TP2")
             from .p8_tp2_repack import open_tp2_pair
@@ -208,8 +219,8 @@ class P8NativeTPMoE:
             }
             scale_component_schema = schema == P8_SCALE_COMPONENT_SCHEMA
             full_coupled_schema = schema == P8_COUPLED_SCHEMA.replace("tp4", f"tp{self.world_size}")
-            if self.world_size == 2 and not full_coupled_schema:
-                raise RuntimeError("TP2 port only supports the full-coupled schema")
+            if self.world_size in (1, 2) and not full_coupled_schema:
+                raise RuntimeError("Repartitioned P8 requires the full-coupled schema")
             if (
                 not (identity_schema or scale_component_schema or full_coupled_schema)
                 or any(metadata.get(key) != value for key, value in base_required.items())
@@ -259,6 +270,9 @@ class P8NativeTPMoE:
         if tuple(w2_scale.shape) != (experts, hidden, intermediate // 32):
             raise RuntimeError(f"unexpected W2 scale shape {tuple(w2_scale.shape)}")
         self.experts = experts
+        if self.ep_size > 1 and (experts != 288 // self.ep_size or
+                metadata.get('ep_size') != str(self.ep_size) or metadata.get('ep_rank') != str(self.ep_rank)):
+            raise ValueError('EP local expert count or partition identity mismatch')
         self.scale_component = None
         self.full_coupled = bool(full_coupled_schema)
         if (self.grouped_m16 or self.fuse_grouped_scratch) and not self.full_coupled:
@@ -377,8 +391,8 @@ class P8NativeTPMoE:
             else self.zero_rotation
         )
         self.ones = torch.ones(experts, dtype=torch.float32, device=self.device)
-        if self.small_m_scheduler and self.experts != 288:
-            raise ValueError("P8 small-M requires 288 experts")
+        if self.small_m_scheduler and self.experts != 288 // self.ep_size:
+            raise ValueError("P8 expert count does not match its EP partition")
         # v11: the small-M owner path is compiled per stored rate (K3/K4/K5);
         # M>1 on a non-K4 layer is served row by row through that same exact
         # kernel because the grouped M64 prefill kernels remain K4-only.
@@ -437,6 +451,8 @@ class P8NativeTPMoE:
             kernel.p8_input_prequant_diagnostic = True
         if self.full_coupled:
             # Both M1 and grouped owners share the scale/sign plane geometry.
+            kernel.materialized_phase1_kernel.p8_experts = self.experts
+            kernel.materialized_phase2_kernel.p8_experts = self.experts
             kernel.materialized_phase1_kernel.p8_intermediate = self.intermediate
             kernel.materialized_phase2_kernel.p8_intermediate = self.intermediate
             if small_m:
@@ -529,6 +545,7 @@ class P8NativeTPMoE:
             compile_spec=KernelCompileSpec.from_fields(
                 "glm53.p8.native.tp",
                 4,
+                ("ep_local_scale_offsets", 1),
                 ("fc1_row_alias376", 1),
                 ("requested_m_regime_direct_policy", 1),
                 ("fc1_route_hoist", 1),
