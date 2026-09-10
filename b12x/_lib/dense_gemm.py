@@ -734,8 +734,6 @@ class DenseGemmKernel:
         fused_quant_a_nope_dim: int = 0,
         fused_quant_a_rope_dim: int = 0,
         fused_quant_a_wide: bool = False,
-        fused_quant_a_scale_block_size: int = 32,
-        fused_quant_bf16: Optional[bool] = None,
         atom_shape_24: bool = False,
         b_tile_major: bool = False,
         quantize_c: bool = False,
@@ -749,6 +747,7 @@ class DenseGemmKernel:
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
         plain_fp8: bool = False,
+        fused_quant_bf16: Optional[bool] = None,
         block_fp8: bool = False,
         weight_only: Optional[str] = None,
         alpha_reciprocal: bool = False,
@@ -879,12 +878,6 @@ class DenseGemmKernel:
         # every k block from it.
         self.sfb_k_reuse = sfb_k_reuse
         self.fused_quant_a = fused_quant_a
-        if fused_quant_a_scale_block_size not in (32, 128):
-            raise ValueError(
-                "fused MXFP8 activation scale block size must be 32 or 128, "
-                f"got {fused_quant_a_scale_block_size}"
-            )
-        self.fused_quant_a_scale_block_size = fused_quant_a_scale_block_size
         # When >0, the BF16 A source is stored L-blocked along K (physical
         # [K/span, M, span], e.g. the WO tmp group-major view over [groups, M,
         # rank]): flat k = outer * span + inner reads element
@@ -3784,29 +3777,17 @@ class DenseGemmKernel:
                                         )
                             for elem in cutlass.range_constexpr(8):
                                 max_abs = fmax_f32(max_abs, fabs_f32(values[elem]))
-                            for shift in cutlass.range_constexpr(
-                                5
-                                if self.fused_quant_a_scale_block_size == 128
-                                else 2
-                            ):
+                            for shift in cutlass.range_constexpr(2):
                                 max_abs = fmax_f32(
                                     max_abs,
                                     cute.arch.shuffle_sync_bfly(
                                         max_abs, offset=1 << shift
                                     ),
                                 )
-                            if cutlass.const_expr(
-                                self.fused_quant_a_scale_block_size == 128
-                            ):
-                                max_abs = fmax_f32(
-                                    max_abs, cutlass.Float32(1.0e-4)
-                                )
                             _, scale_byte = pow2_ceil_ue8m0(
                                 max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                             )
-                            if cutlass.const_expr(
-                                self.fused_quant_a_scale_block_size == 32
-                            ) and max_abs == cutlass.Float32(0.0):
+                            if max_abs == cutlass.Float32(0.0):
                                 scale_byte = cutlass.Uint32(127)
                             inv_scale = ue8m0_to_output_scale(scale_byte)
                             payload0 = cvt_f32x4_to_e4m3x4(
@@ -3967,27 +3948,8 @@ class DenseGemmKernel:
                                             max_abs,
                                             fabs_f32(values[pair * 2 + 1]),
                                         )
-                            if cutlass.const_expr(
-                                self.fused_quant_a_scale_block_size == 128
-                            ):
-                                active_mask = cute.arch.activemask()
-                                for shift in cutlass.range_constexpr(2):
-                                    max_abs = fmax_f32(
-                                        max_abs,
-                                        cute.arch.shuffle_sync_bfly(
-                                            max_abs,
-                                            offset=1 << shift,
-                                            mask=active_mask,
-                                            mask_and_clamp=3,
-                                        ),
-                                    )
-                                max_abs = fmax_f32(
-                                    max_abs, cutlass.Float32(1.0e-4)
-                                )
                             payload, scale_byte = quantize_block_fp8_mx(values, max_abs)
-                            if cutlass.const_expr(
-                                self.fused_quant_a_scale_block_size == 32
-                            ) and max_abs == cutlass.Float32(0.0):
+                            if max_abs == cutlass.Float32(0.0):
                                 scale_byte = cutlass.Uint32(127)
                             for word in cutlass.range_constexpr(8):
                                 for byte in cutlass.range_constexpr(4):
@@ -5518,10 +5480,6 @@ def _get_compiled_dense_gemm_mxfp6(
         )
         return c_tensor_gpu
 
-    # AOT consumers link the exact planner-selected launch used by the tensor
-    # API.  Expose the compiler artifact without duplicating the kernel
-    # definition in exporter code.
-    tensor_api.compiled = compiled_kernel  # type: ignore[attr-defined]
     return tensor_api
 
 
@@ -5533,15 +5491,11 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
         *args,
         fused_quant_a_inner_span: int = 0,
         fused_quant_a_wide: bool = False,
-        fused_quant_a_scale_block_size: int = 32,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._fused_quant_a_inner_span = int(fused_quant_a_inner_span)
         self._fused_quant_a_wide = bool(fused_quant_a_wide)
-        self._fused_quant_a_scale_block_size = int(
-            fused_quant_a_scale_block_size
-        )
 
     def compile_key(self) -> tuple[object, ...]:
         # Keep the fused entry point separate even if every ordinary launch
@@ -5551,7 +5505,6 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             "fused_quant_a",
             self._fused_quant_a_inner_span,
             self._fused_quant_a_wide,
-            self._fused_quant_a_scale_block_size,
             *super().compile_key(),
         )
 
@@ -5625,7 +5578,6 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             fused_quant_a=True,
             fused_quant_a_inner_span=self._fused_quant_a_inner_span,
             fused_quant_a_wide=self._fused_quant_a_wide,
-            fused_quant_a_scale_block_size=self._fused_quant_a_scale_block_size,
             atom_shape_24=self._atom_shape_24,
             b_tile_major=self._b_tile_major,
             target_occupancy=self._target_occupancy,
@@ -5660,7 +5612,6 @@ def _get_compiled_dense_gemm_fused_quant_a(
     a_inner_span: int = 0,
     kernel_c_l: int = 1,
     a_wide: bool = False,
-    activation_scale_block_size: int = 32,
 ) -> Callable:
     launch = _DenseGemmFusedQuantALaunch(
         n=n,
@@ -5688,7 +5639,6 @@ def _get_compiled_dense_gemm_fused_quant_a(
         b_tile_major=b_tile_major,
         fused_quant_a_inner_span=a_inner_span,
         fused_quant_a_wide=a_wide,
-        fused_quant_a_scale_block_size=activation_scale_block_size,
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
@@ -5786,202 +5736,7 @@ def _get_compiled_dense_gemm_fused_quant_a(
         )
         return out
 
-    # AOT consumers link the same compiled launch into a native runtime. Keep
-    # the ordinary tensor callable as the serving API while exposing the
-    # compiler artifact without rebuilding a parallel launch definition.
-    tensor_api.compiled = compiled  # type: ignore[attr-defined]
     return tensor_api
-
-
-def compile_dense_gemm_fused_quant_a_aot(
-    *,
-    size_m: int,
-    size_n: int,
-    size_k: int,
-    activation_scale_block_size: int = 32,
-    expected_m: Optional[int] = None,
-    device: Optional[torch.device] = None,
-) -> object:
-    """Compile one standalone fused BF16-to-MXFP8 GEMM for native AOT export.
-
-    The export surface intentionally admits only kernels with a single BF16
-    output buffer. Split-K variants require a second reduction launch and are
-    rejected so native callers cannot accidentally link an incomplete graph.
-    """
-
-    size_m = int(size_m)
-    size_n = int(size_n)
-    size_k = int(size_k)
-    if size_m < 1 or size_m > 8 or size_k <= 0 or size_k % 128 != 0:
-        raise ValueError(
-            "fused MXFP8 AOT requires 1<=M<=8 and positive K divisible by 128, "
-            f"got M={size_m}, K={size_k}"
-        )
-    if size_n <= 0:
-        raise ValueError(f"fused MXFP8 AOT requires positive N, got {size_n}")
-    if activation_scale_block_size not in (32, 128):
-        raise ValueError(
-            "fused MXFP8 AOT activation scale block size must be 32 or 128, "
-            f"got {activation_scale_block_size}"
-        )
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    sm_count = get_num_sm(device)
-    regime_m = size_m if expected_m is None else int(expected_m)
-    plan = _select_default_dense_gemm_plan(
-        size_m,
-        size_n,
-        size_k,
-        sm_count,
-        is_mxfp8=True,
-        expected_m=regime_m,
-    )
-    if plan.swap_ab or plan.load_path != "tma":
-        raise ValueError("fused MXFP8 AOT requires the unswapped TMA plan")
-    policy = _dense_gemm_policy_for(
-        m=size_m,
-        n=size_n,
-        k=size_k,
-        l=1,
-        ab_dtype=cutlass.Float8E4M3FN,
-        c_dtype=cutlass.BFloat16,
-        mma_tiler_mn=plan.mma_tiler_mn,
-        cluster_shape_mn=(1, 1),
-        sm_count=sm_count,
-        expected_m=regime_m,
-    )
-    if policy.split_k_slices != 1:
-        raise ValueError(
-            "fused MXFP8 AOT standalone export does not support split-K: "
-            f"M={size_m}, N={size_n}, K={size_k}, slices={policy.split_k_slices}"
-        )
-    tensor_api = _get_compiled_dense_gemm_fused_quant_a(
-        size_n,
-        size_k,
-        cutlass.BFloat16,
-        policy,
-        plan.mma_tiler_mn,
-        sm_count,
-        True,
-        False,
-        0,
-        1,
-        size_m == 1,
-        int(activation_scale_block_size),
-    )
-    return tensor_api.compiled  # type: ignore[attr-defined]
-
-
-def compile_dense_gemm_mxfp8_aot(
-    *,
-    size_m: int,
-    size_n: int,
-    size_k: int,
-    expected_m: Optional[int] = None,
-    sfb_k_replicated: bool = False,
-    sm_count: Optional[int] = None,
-    device: Optional[torch.device] = None,
-) -> object:
-    """Compile one runtime-M MXFP8-to-BF16 GEMM for native AOT export.
-
-    ``size_m`` is the largest live-M regime represented by the export.  The
-    generated launch still receives live M at runtime, matching ``dense_gemm``.
-    Only the standalone, non-split-K output form is admitted.
-    """
-
-    size_m = int(size_m)
-    size_n = int(size_n)
-    size_k = int(size_k)
-    if size_m <= 0 or size_n <= 0 or size_k <= 0 or size_k % 128 != 0:
-        raise ValueError(
-            "MXFP8 AOT requires positive M/N and positive K divisible by 128, "
-            f"got M={size_m}, N={size_n}, K={size_k}"
-        )
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    if sm_count is None:
-        sm_count = get_num_sm(device)
-    sm_count = int(sm_count)
-    if sm_count <= 0:
-        raise ValueError(f"MXFP8 AOT sm_count must be positive, got {sm_count}")
-    regime_m = size_m if expected_m is None else int(expected_m)
-    if regime_m <= 0:
-        raise ValueError(f"MXFP8 AOT expected_m must be positive, got {regime_m}")
-
-    plan = _select_default_dense_gemm_plan(
-        size_m,
-        size_n,
-        size_k,
-        sm_count,
-        is_mxfp8=True,
-        expected_m=regime_m,
-    )
-    if plan.swap_ab or plan.load_path != "tma":
-        raise ValueError("MXFP8 AOT requires the unswapped TMA plan")
-    tile_k = _select_mxfp8_tile_k(
-        size_m, size_n, size_k, regime_m, sm_count
-    )
-    _validate_mxfp8_bk64_plan(tile_k, plan.mma_tiler_mn, False)
-    policy = _dense_gemm_policy_for(
-        m=size_m,
-        n=size_n,
-        k=size_k,
-        l=1,
-        ab_dtype=cutlass.Float8E4M3FN,
-        c_dtype=cutlass.BFloat16,
-        mma_tiler_mn=plan.mma_tiler_mn,
-        cluster_shape_mn=(1, 1),
-        sm_count=sm_count,
-        expected_m=regime_m,
-    )
-    if policy.split_k_slices != 1:
-        raise ValueError(
-            "MXFP8 AOT standalone export does not support split-K: "
-            f"M={size_m}, N={size_n}, K={size_k}, slices={policy.split_k_slices}"
-        )
-    sfb_k_reuse = bool(sfb_k_replicated)
-    tensor_api = _get_compiled_dense_gemm(
-        n=size_n,
-        k=size_k,
-        l=1,
-        c_l=1,
-        a_major="k",
-        b_major="k",
-        c_major="n",
-        ab_dtype=cutlass.Float8E4M3FN,
-        sf_dtype=cutlass.Float8E8M0FNU,
-        c_dtype=cutlass.BFloat16,
-        alpha_dtype=cutlass.Float32,
-        sf_vec_size=32,
-        mma_k=32,
-        tile_k=tile_k,
-        mma_tiler_mn=plan.mma_tiler_mn,
-        cluster_shape_mn=(1, 1),
-        policy=policy,
-        sm_count=sm_count,
-        sm_version="sm_120",
-        load_path=plan.load_path,
-        swap_ab=False,
-        sfb_k_reuse=sfb_k_reuse,
-        b_tile_major=False,
-        alpha_is_one=True,
-        direct_sfa_live16=_use_direct_sfa_live16(
-            m=size_m,
-            n=size_n,
-            k=size_k,
-            l=1,
-            sf_vec_size=32,
-            tile_k=tile_k,
-            mma_tiler_mn=plan.mma_tiler_mn,
-            load_path=plan.load_path,
-            swap_ab=False,
-            b_tile_major=False,
-            sfb_k_reuse=sfb_k_reuse,
-            alpha_is_one=True,
-            is_mxfp8=True,
-        ),
-    )
-    return tensor_api.compiled  # type: ignore[attr-defined]
 
 
 class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
@@ -6753,10 +6508,6 @@ def _get_compiled_dense_gemm(
         )
         return c_tensor_gpu
 
-    # AOT consumers link the exact planner-selected launch used by the tensor
-    # API.  Expose the compiler artifact without duplicating the kernel
-    # definition in exporter code.
-    tensor_api.compiled = compiled_kernel  # type: ignore[attr-defined]
     return tensor_api
 
 
@@ -7773,7 +7524,6 @@ def dense_gemm_fused_quant_a(
     sfb_k_replicated: bool = False,
     rhs_values_tiled: Optional[torch.Tensor] = None,
     a_inner_span: int = 0,
-    activation_scale_block_size: int = 32,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     _atomic_output_precleared: bool = False,
     _split_k_workspace: Optional[torch.Tensor] = None,
@@ -7814,11 +7564,6 @@ def dense_gemm_fused_quant_a(
                 "L-blocked fused MXFP8 A must be a dense-GEMM mnl view over "
                 f"physical [K/span, M, span] storage, got strides {source.stride()}"
             )
-    if activation_scale_block_size not in (32, 128):
-        raise ValueError(
-            "fused MXFP8 activation scale block size must be 32 or 128, "
-            f"got {activation_scale_block_size}"
-        )
     if m < 1 or m > 8 or k % 128 != 0:
         raise ValueError(
             f"fused MXFP8 activation quantization requires 1<=M<=8 and K%128=0, got M={m}, K={k}"
@@ -7915,7 +7660,6 @@ def dense_gemm_fused_quant_a(
         a_inner_span,
         kernel_c_l,
         m == 1,
-        int(activation_scale_block_size),
     )
     compiled(
         source,
@@ -8030,9 +7774,7 @@ def dense_gemm(
     and weight dequantization scale.
 
     ``row_scale``: optional contiguous ``(M,)`` tensor in the C dtype, applied
-    per output row in the epilogue. It replaces a separate ``out.mul_(v)``
-    launch and reproduces that multiply bit-for-bit, including its second
-    rounding to the C dtype. MX-FP6 only.
+    per output row in the epilogue. MX-FP6 only.
 
     ``block_fp8``: accumulate ordinary E4M3 MMA over each K128 block, then
     apply compact FP32 activation ``[M,K/128]`` and weight

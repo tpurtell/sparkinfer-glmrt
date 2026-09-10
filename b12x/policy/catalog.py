@@ -15,7 +15,6 @@ from .components import (
     DSA_INDEXER,
     EP_MOE,
     GDN_ATTENTION,
-    KDA_PREFILL,
     GQA_ATTENTION,
     HYPERCONNECTION,
     MHC,
@@ -153,18 +152,6 @@ PLANNING_COMPONENTS = (
             "b12x.policy.generation.providers.tunable:DsaIndexerProfileGenerator"
         ),
     ),
-    # GLMRT's checkpoint-native DSV4 operators retain their qualified local
-    # planning rules until a complete measured profile corpus exists.  Making
-    # that ownership explicit keeps them visible to the policy catalog without
-    # silently substituting an unrelated upstream attention profile.
-    PlanningComponentRegistration(
-        op_qualname="attention.dsv4_compressor",
-        mode=PlanningPolicyMode.LOCAL,
-    ),
-    PlanningComponentRegistration(
-        op_qualname="attention.dsv4_producer",
-        mode=PlanningPolicyMode.LOCAL,
-    ),
     PlanningComponentRegistration(
         op_qualname="attention.paged",
         mode=PlanningPolicyMode.PROFILED,
@@ -285,13 +272,6 @@ PLANNING_COMPONENTS = (
         generator_ref=(
             "b12x.policy.generation.providers.attention:GdnAttentionGenerator"
         ),
-    ),
-    PlanningComponentRegistration(
-        op_qualname="sequence.kda_prefill",
-        mode=PlanningPolicyMode.PROFILED,
-        component_id=KDA_PREFILL,
-        policy_ref="b12x.sequence.kda_prefill._policy:KDA_PREFILL_POLICY",
-        generator_ref="b12x.policy.generation.providers.kda:KdaPrefillGenerator",
     ),
     PlanningComponentRegistration(
         op_qualname="sequence.mtp_feedback",

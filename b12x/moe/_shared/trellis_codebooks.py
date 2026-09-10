@@ -52,12 +52,10 @@ def normalize_codebook(codebook: str | int) -> str:
 def validate_codebook_bits(codebook: str, bits: int) -> None:
     """Reject (codebook, bitrate) pairs the decoders do not define.
 
-    The fused Trellis tile implementation has bounded K2--K6 storage. The SQG
-    codebooks further narrow that range according to their construction.
+    MCG decodes any supported tile bitrate; the SQG codebooks are defined
+    only on their construction ranges.
     """
 
-    if codebook == MCG and bits not in (2, 3, 4, 5, 6):
-        raise ValueError("mcg is defined only for K2/K3/K4/K5/K6")
     if codebook == SQG_E4M3 and bits not in (2, 3, 4):
         raise ValueError("sqg_e4m3 is defined only for K2/K3/K4")
     if codebook == SQG_FP16 and bits not in (5, 6):

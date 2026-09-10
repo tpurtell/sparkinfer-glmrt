@@ -35,9 +35,6 @@ from ._impl import (
     plan_mhc_scratch as plan,
 )
 from ._impl import (
-    b12x_mhc_head as run_head,
-)
-from ._impl import (
     b12x_mhc_post as run_post,
 )
 from ._impl import (
@@ -71,7 +68,6 @@ __all__ = [
     "MhcQuery",
     "plan",
     "bind",
-    "run_head",
     "run_pre",
     "run_post",
     "run_post_pre",

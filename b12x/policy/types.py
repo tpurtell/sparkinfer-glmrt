@@ -394,11 +394,7 @@ class ComponentProfile:
             raise ValueError(f"invalid component ID {self.component_id!r}")
         if self.query_schema_version <= 0 or self.config_schema_version <= 0:
             raise ValueError("component schema versions must be positive")
-        # An empty rule set records a registered component with no measured
-        # coverage on this device. AUTO must use its heuristic; fabricating a
-        # leaf would incorrectly mark an unqualified configuration PREPLANNED.
-        # Serialized input still requires exactly one of "rules" or "planner".
-        if self.rules and self.planner is not None:
+        if bool(self.rules) == bool(self.planner):
             raise ValueError(
                 "component profiles require exactly one of rules or planner"
             )

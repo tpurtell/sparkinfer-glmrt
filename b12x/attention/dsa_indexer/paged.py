@@ -73,25 +73,6 @@ class _PagedIndexerChunkGeometry:
     token_count: int
 
 
-def _paged_carry_halves_are_contiguous(
-    values: torch.Tensor,
-    indices: torch.Tensor,
-) -> bool:
-    """Return whether each independently launched carry half is contiguous.
-
-    A runtime row prefix of a capacity-sized ``(2, max_rows, topk)`` buffer is
-    not contiguous as one three-dimensional view because the two halves retain
-    their capacity stride.  The tiled top-k kernels consume one two-dimensional
-    half at a time, so those are the views whose layout is authoritative.
-    """
-
-    return all(
-        buffer[half].is_contiguous()
-        for buffer in (values, indices)
-        for half in range(2)
-    )
-
-
 def _paged_indexer_chunk_geometry(
     *,
     chunk_idx: int,
@@ -927,6 +908,7 @@ def index_topk_fp8(
     scratch_values, scratch_raw_indices = scratch.get_indexer_contiguous_topk_buffers(
         row_count=q_rows,
     )
+    write_final_values = out_scores is not None
     final_values = out_scores if out_scores is not None else scratch_values[:, :topk]
     final_raw_indices = (
         out_indices if out_indices is not None else scratch_raw_indices[:, :topk]
@@ -1027,9 +1009,9 @@ def index_topk_fp8(
                 "paged indexer carry indices must be a CUDA torch.int32 "
                 "tensor on the q_fp8 device"
             )
-        if not _paged_carry_halves_are_contiguous(
-            carry_buf_values,
-            carry_buf_indices,
+        if (
+            not carry_buf_values.is_contiguous()
+            or not carry_buf_indices.is_contiguous()
         ):
             raise ValueError("paged indexer carry buffers must be contiguous")
 
@@ -1182,6 +1164,7 @@ def index_topk_fp8(
                     output_values=final_values,
                     output_indices=final_raw_indices,
                     output_gather_table=fold_indices.view(q_rows, total_slices * topk),
+                    write_values=write_final_values,
                 )
         else:
             run_tiled_topk(
@@ -1207,6 +1190,7 @@ def index_topk_fp8(
                     else None
                 ),
                 output_page_size=page_size,
+                write_values=not is_last or write_final_values,
             )
 
     return final_raw_indices

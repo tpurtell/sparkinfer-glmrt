@@ -2,14 +2,10 @@
 projection (DeepSeek-style), BF16 with TF32 projection paths.
 
 Three phases share one plan/binding; the phase is the verb because the
-signatures differ: ``run_pre`` broadcasts a rank-2 residual into the four
-lanes at model entry, ``run_post_pre`` is the steady-state fused post+pre
-boundary between sublayers/layers, and ``run_post`` is the terminal mix-back.
-``run_head`` performs the checkpoint's terminal four-lane sigmoid collapse and
-RMSNorm, and can retain the pre-norm collapse in a second caller-owned output.
-Sinkhorn-normalized mix matrices; hidden sizes 4096/7168; mix
-constants exposed as ``MIXES`` / ``MULT`` / ``PARTIALS``. A bound lifecycle
-uses only caller-owned scratch and outputs.
+signatures differ: ``run_pre`` (residual -> mixed input + carry),
+``run_post`` (output mix-back), ``run_post_pre`` (fused post+pre between
+layers). Sinkhorn-normalized mix matrices; hidden sizes 4096/7168; mix
+constants exposed as ``MIXES`` / ``MULT`` / ``PARTIALS``.
 
 Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) ->
 ``run_*`` (capture safe; torch.compile-safe via opaque custom ops).
@@ -42,7 +38,6 @@ META = OpMeta(
         "MhcQuery",
         "plan",
         "bind",
-        "run_head",
         "run_pre",
         "run_post",
         "run_post_pre",
@@ -85,7 +80,6 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         plan,
         run_post,
         run_post_pre,
-        run_head,
         run_pre,
     )
 

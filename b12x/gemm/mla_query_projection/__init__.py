@@ -22,11 +22,6 @@ META = OpMeta(
         "run",
         "prewarm",
         "can_implement",
-        "run_glm_h64_bf16",
-        "prewarm_glm_h64_bf16",
-        "can_implement_glm_h64_bf16",
-        "plan_glm_h64_bf16",
-        "GlmH64Bf16QueryProjectionPlan",
         "is_supported",
         "clear_caches",
     ),
@@ -47,16 +42,11 @@ META = OpMeta(
 
 if TYPE_CHECKING:
     from .api import (  # noqa: F401
-        GlmH64Bf16QueryProjectionPlan,
         can_implement,
-        can_implement_glm_h64_bf16,
         clear_caches,
         is_supported,
         prewarm,
-        prewarm_glm_h64_bf16,
-        plan_glm_h64_bf16,
         run,
-        run_glm_h64_bf16,
     )
 
 install_lazy_api(globals(), META)

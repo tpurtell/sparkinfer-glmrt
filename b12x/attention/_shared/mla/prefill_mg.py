@@ -210,9 +210,7 @@ def _cache_block_stride_bytes(
         COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
-    if record_bytes is not None:
-        expected = int(page_size) * int(record_bytes)
-    elif is_glm:
+    if is_glm:
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_IO_STRIDE
@@ -435,26 +433,26 @@ def _nvfp4_rope_base_off(
 
 @cute.jit
 def _ld_global_glm_rope_u32(
-    kv_cache_base_ptr: Int64,
+    kv_cache_u8: cute.Tensor,
     rope_base: Int64,
     elem: Int32,
 ) -> Uint32:
     """Load two consecutive bf16 rope elems (one u32) from global at rope_base +
     elem*2 bytes. ``elem`` is even (the lane reads bf16 pairs)."""
     return ld_global_nc_u32(
-        kv_cache_base_ptr + rope_base + Int64(elem) * Int64(2)
+        get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem) * Int64(2))
     )
 
 
 @cute.jit
 def _ld_global_nvfp4_fp8_rope_bfloat2(
-    kv_cache_base_ptr: Int64,
+    kv_cache_u8: cute.Tensor,
     rope_base: Int64,
     elem_even: Int32,
     scale: Float32,
 ) -> Uint32:
     """Load/dequant two adjacent E4M3 post-RoPE values to packed BF16."""
-    pair = ld_global_b16(kv_cache_base_ptr + rope_base + Int64(elem_even))
+    pair = ld_global_b16(get_ptr_as_int64(kv_cache_u8, rope_base + Int64(elem_even)))
     v0 = cvt_e4m3_to_f32_via_f16(pair & Uint32(0xFF)) * scale
     v1 = cvt_e4m3_to_f32_via_f16((pair >> Uint32(8)) & Uint32(0xFF)) * scale
     return pack_f32x2_to_bfloat2(v0, v1)
@@ -466,7 +464,7 @@ def s2_qk_rope_regs_mg_glm(
     qk1,
     q_rope_regs0,
     q_rope_regs1,
-    kv_cache_base_ptr: Int64,
+    kv_cache_u8: cute.Tensor,
     index_base_ptr: Int64,
     warp_first_cand: Int32,
     lane: Int32,
@@ -507,9 +505,11 @@ def s2_qk_rope_regs_mg_glm(
 
     if cutlass.const_expr(scale_format == 2 and fp8_rope):
         rope_scale, _, _, _ = ld_global_v4_f32(
-            kv_cache_base_ptr
-            + rope_base
-            + Int64(_NVFP4_FP8_ROPE_SCALE_OFFSET - _NVFP4_ROPE_GMEM_OFFSET)
+            get_ptr_as_int64(
+                kv_cache_u8,
+                rope_base
+                + Int64(_NVFP4_FP8_ROPE_SCALE_OFFSET - _NVFP4_ROPE_GMEM_OFFSET),
+            )
         )
     else:
         rope_scale = Float32(1.0)
@@ -520,20 +520,18 @@ def s2_qk_rope_regs_mg_glm(
         # b1 = rope[ko + tid*2 + 8 .. +9] of this entry's rope row.
         if cutlass.const_expr(scale_format == 2 and fp8_rope):
             b0 = _ld_global_nvfp4_fp8_rope_bfloat2(
-                kv_cache_base_ptr, rope_base, ko + tid * Int32(2), rope_scale
+                kv_cache_u8, rope_base, ko + tid * Int32(2), rope_scale
             )
             b1 = _ld_global_nvfp4_fp8_rope_bfloat2(
-                kv_cache_base_ptr,
+                kv_cache_u8,
                 rope_base,
                 ko + tid * Int32(2) + Int32(8),
                 rope_scale,
             )
         else:
-            b0 = _ld_global_glm_rope_u32(
-                kv_cache_base_ptr, rope_base, ko + tid * Int32(2)
-            )
+            b0 = _ld_global_glm_rope_u32(kv_cache_u8, rope_base, ko + tid * Int32(2))
             b1 = _ld_global_glm_rope_u32(
-                kv_cache_base_ptr, rope_base, ko + tid * Int32(2) + Int32(8)
+                kv_cache_u8, rope_base, ko + tid * Int32(2) + Int32(8)
             )
         base = Int32(ks) * Int32(4)
         d0, d1, d2, d3 = mma_m16n8k16_f32_bf16(
@@ -2382,7 +2380,7 @@ class UnifiedPrefillMGKernel:
         # NVFP4 per-token latent-scale mode, which stages one fp32 per
         # candidate.  DSV4 stages XV-RoPE weights into the W_FP8 region after
         # XV-NoPE consumes it.
-        if cutlass.const_expr(is_nvfp4 or (is_glm and not t.latent_scale_per_token)):
+        if cutlass.const_expr(is_glm and not t.latent_scale_per_token):
             kv_sc_addr = Int32(0)
         else:
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
@@ -2536,7 +2534,7 @@ class UnifiedPrefillMGKernel:
                 g_end0 = Int32(_CAND_WINDOW)
                 if g_end0 > section_len:
                     g_end0 = section_len
-                if cutlass.const_expr(is_glm or is_nvfp4):
+                if cutlass.const_expr(is_glm):
                     io_issue_gather_glm_mg(
                         kv_cache_u8,
                         topk_row,
@@ -2595,87 +2593,49 @@ class UnifiedPrefillMGKernel:
                             g_end = g_start + Int32(_CAND_WINDOW)
                             if g_end > extra_section_len:
                                 g_end = extra_section_len
-                            if cutlass.const_expr(is_nvfp4):
-                                io_issue_gather_glm_mg(
-                                    extra_kv_cache_u8,
-                                    extra_row,
-                                    kv_fp8_addr + buf * kv_fp8_buf,
-                                    mbar_base + buf,
-                                    g_start,
-                                    g_end,
-                                    Int32(self.pbs_extra),
-                                    stride_extra_kv_block,
-                                    io_lane,
-                                    kv_l2_policy,
-                                    bi=t.bi,
-                                    kv_smem_stride=L.kv_smem_stride,
-                                    io_threads=_PREFILL_IO_THREADS,
-                                    scale_format=t.scale_format,
-                                    fp8_rope=t.fp8_rope,
-                                )
-                            else:
-                                io_issue_gather_dsv4_nope(
-                                    extra_kv_cache_u8,
-                                    extra_row,
-                                    kv_fp8_addr + buf * kv_fp8_buf,
-                                    kv_sc_addr + buf * kv_sc_buf,
-                                    mbar_base + buf,
-                                    g_start,
-                                    g_end,
-                                    Int32(self.pbs_extra),
-                                    stride_extra_kv_block,
-                                    io_lane,
-                                    kv_l2_policy,
-                                    bi=t.bi,
-                                    kv_smem_stride=L.kv_smem_stride,
-                                    io_threads=_PREFILL_IO_THREADS,
-                                )
+                            io_issue_gather_dsv4_nope(
+                                extra_kv_cache_u8,
+                                extra_row,
+                                kv_fp8_addr + buf * kv_fp8_buf,
+                                kv_sc_addr + buf * kv_sc_buf,
+                                mbar_base + buf,
+                                g_start,
+                                g_end,
+                                Int32(self.pbs_extra),
+                                stride_extra_kv_block,
+                                io_lane,
+                                kv_l2_policy,
+                                bi=t.bi,
+                                kv_smem_stride=L.kv_smem_stride,
+                                io_threads=_PREFILL_IO_THREADS,
+                            )
                         else:
                             g_start = next_lc * Int32(_CAND_WINDOW)
                             g_end = g_start + Int32(_CAND_WINDOW)
                             if g_end > section_len:
                                 g_end = section_len
-                            if cutlass.const_expr(is_nvfp4):
-                                io_issue_gather_glm_mg(
-                                    kv_cache_u8,
-                                    topk_row,
-                                    kv_fp8_addr + buf * kv_fp8_buf,
-                                    mbar_base + buf,
-                                    g_start,
-                                    g_end,
-                                    Int32(self.page_block_size),
-                                    stride_kv_block,
-                                    io_lane,
-                                    kv_l2_policy,
-                                    bi=t.bi,
-                                    kv_smem_stride=L.kv_smem_stride,
-                                    io_threads=_PREFILL_IO_THREADS,
-                                    scale_format=t.scale_format,
-                                    fp8_rope=t.fp8_rope,
-                                )
-                            else:
-                                io_issue_gather_dsv4_nope(
-                                    kv_cache_u8,
-                                    topk_row,
-                                    kv_fp8_addr + buf * kv_fp8_buf,
-                                    kv_sc_addr + buf * kv_sc_buf,
-                                    mbar_base + buf,
-                                    g_start,
-                                    g_end,
-                                    Int32(self.page_block_size),
-                                    stride_kv_block,
-                                    io_lane,
-                                    kv_l2_policy,
-                                    bi=t.bi,
-                                    kv_smem_stride=L.kv_smem_stride,
-                                    io_threads=_PREFILL_IO_THREADS,
-                                )
+                            io_issue_gather_dsv4_nope(
+                                kv_cache_u8,
+                                topk_row,
+                                kv_fp8_addr + buf * kv_fp8_buf,
+                                kv_sc_addr + buf * kv_sc_buf,
+                                mbar_base + buf,
+                                g_start,
+                                g_end,
+                                Int32(self.page_block_size),
+                                stride_kv_block,
+                                io_lane,
+                                kv_l2_policy,
+                                bi=t.bi,
+                                kv_smem_stride=L.kv_smem_stride,
+                                io_threads=_PREFILL_IO_THREADS,
+                            )
                     else:
                         g_start = next_lc * Int32(_CAND_WINDOW)
                         g_end = g_start + Int32(_CAND_WINDOW)
                         if g_end > section_len:
                             g_end = section_len
-                        if cutlass.const_expr(is_glm or is_nvfp4):
+                        if cutlass.const_expr(is_glm):
                             io_issue_gather_glm_mg(
                                 kv_cache_u8,
                                 topk_row,
@@ -2942,21 +2902,10 @@ class UnifiedPrefillMGKernel:
                     if ci >= num_main_tiles:
                         index_base_ptr = get_ptr_as_int64(extra_row, split_cand_start)
 
-                # Start with MAIN rope geometry. DSV4 dual-cache tiles must
-                # switch the base pointer together with indices, data, page
-                # size, and block stride; leaving RoPE on the main pool makes
-                # the NVFP4 extra section read unrelated or out-of-range rows.
+                # MAIN rope geometry used by the non-dual FP8 / GLM arms.
                 rope_cache = kv_cache_u8
-                rope_cache_base_ptr = get_ptr_as_int64(kv_cache_u8, Int64(0))
                 rope_pbs = Int32(self.page_block_size)
                 rope_stride = stride_kv_block
-                if cutlass.const_expr(has_extra):
-                    if ci >= num_main_tiles:
-                        rope_cache_base_ptr = get_ptr_as_int64(
-                            extra_kv_cache_u8, Int64(0)
-                        )
-                        rope_pbs = Int32(self.pbs_extra)
-                        rope_stride = stride_extra_kv_block
 
                 acc0 = [
                     [
@@ -3010,7 +2959,7 @@ class UnifiedPrefillMGKernel:
                         qk1,
                         q_rope_regs0,
                         q_rope_regs1,
-                        rope_cache_base_ptr,
+                        rope_cache,
                         index_base_ptr,
                         warp_first_cand,
                         lane,
@@ -3180,7 +3129,7 @@ class UnifiedPrefillMGKernel:
                             qk1,
                             q_rope_regs0,
                             q_rope_regs1,
-                            rope_cache_base_ptr,
+                            rope_cache,
                             index_base_ptr,
                             warp_first_cand,
                             lane,
@@ -4302,18 +4251,12 @@ def run_unified_prefill_mg(
                 extra_kv_cache,
                 page_size=pbs_extra,
                 is_glm=False,
-                record_bytes=int(traits.kv_gmem_stride),
             )
         extra_topk = int(extra_indices.shape[1])
         num_extra_tiles = (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
         num_tiles = num_main_tiles + num_extra_tiles
         row_xor = pbs_extra == 2
-        extra_indices_t = (
-            extra_indices
-            if int(extra_indices.stride(0)) == 0
-            and int(extra_indices.stride(1)) == 1
-            else extra_indices.contiguous()
-        )
+        extra_indices_t = extra_indices.contiguous()
         if extra_topk_length is None:
             extra_len_t = torch.full(
                 (num_tokens,), extra_topk, dtype=torch.int32, device=device

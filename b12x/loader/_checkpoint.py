@@ -8,10 +8,11 @@ import os
 from array import array
 from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 
 from ._native import load
-from ._pool import HostWeightWriter, owns_tensor
+from ._pool import HostWeightWriter, owns_storage, owns_tensor
 
 
 def _unique_object(pairs):
@@ -106,6 +107,22 @@ class DirectWeightSession:
             finally:
                 self.records = array("Q")
                 self.destinations.clear()
+
+    def materialize(self, source):
+        """Read owned transform inputs without routing arithmetic through metadata."""
+        import torch
+
+        if source.device.type != "meta":
+            return source.clone()
+        with self.allocation_scope():
+            destination = torch.empty(
+                source.shape,
+                dtype=source.dtype,
+                device=torch.device("cuda", self.device),
+            )
+        self(destination, source)
+        self.flush()
+        return destination
 
     def _metadata_values(self, entries):
         import torch
@@ -297,7 +314,16 @@ class DirectWeightSession:
             ):
                 if source.nbytes:
                     self.records.extend(
-                        (0, source.data_ptr(), source.nbytes, destination.data_ptr(), 2)
+                        (
+                            0,
+                            source.data_ptr(),
+                            source.nbytes,
+                            destination.data_ptr(),
+                            2,
+                            1,
+                            0,
+                            0,
+                        )
                     )
                     self.destinations.extend((destination, source))
                     self.metadata_copy_bytes += source.nbytes
@@ -317,9 +343,8 @@ class DirectWeightSession:
             or source.is_conj()
             or destination.is_neg()
             or destination.is_conj()
-            or not source.is_contiguous()
-            or not destination.is_contiguous()
             or source.shape != destination.shape
+            or any(stride < 0 for stride in (*source.stride(), *destination.stride()))
         ):
             raise NotImplementedError(
                 f"direct load needs an explicit transform for {entry.name}: "
@@ -327,13 +352,20 @@ class DirectWeightSession:
                 f"{destination.shape}/{destination.stride()}/{destination.dtype}"
             )
         offset = source.storage_offset() * source.element_size()
-        if offset + source.nbytes > entry.nbytes:
+        source_extent = (
+            1
+            + sum(
+                (size - 1) * stride
+                for size, stride in zip(source.shape, source.stride(), strict=False)
+            )
+        ) * source.element_size()
+        if source.numel() and offset + source_extent > entry.nbytes:
             raise ValueError(f"source view exceeds checkpoint range: {entry.name}")
         if source.nbytes == 0:
             return True
         if destination.device.index != self.device:
             raise ValueError("destination must use the session CUDA device")
-        if not owns_tensor(destination):
+        if not owns_storage(destination):
             raise ValueError(
                 f"checkpoint destination was not allocated as a weight: {entry.name}"
             )
@@ -343,19 +375,57 @@ class DirectWeightSession:
                 source.dtype == torch.bfloat16 and destination.dtype == torch.float32
             )
             if destination.dtype == source.dtype or expand:
-                self.records.extend(
-                    (
-                        entry.fd,
-                        entry.offset + offset,
-                        source.nbytes,
-                        destination.data_ptr(),
-                        int(expand),
-                    )
+                elements = 1
+                axis = source.ndim - 1
+                while axis >= 0:
+                    size = source.shape[axis]
+                    if size != 1 and (
+                        source.stride(axis) != elements
+                        or destination.stride(axis) != elements
+                    ):
+                        break
+                    elements *= size
+                    axis -= 1
+                rows = source.shape[axis] if axis >= 0 else 1
+                source_stride = (
+                    source.stride(axis) * source.element_size() if axis >= 0 else 0
                 )
+                destination_stride = (
+                    destination.stride(axis) * destination.element_size()
+                    if axis >= 0
+                    else 0
+                )
+                outer = source.shape[:axis] if axis >= 0 else ()
+                for index in product(*(range(size) for size in outer)):
+                    source_delta = (
+                        sum(i * s for i, s in zip(index, source.stride(), strict=False))
+                        * source.element_size()
+                    )
+                    destination_delta = (
+                        sum(
+                            i * s
+                            for i, s in zip(index, destination.stride(), strict=False)
+                        )
+                        * destination.element_size()
+                    )
+                    self.records.extend(
+                        (
+                            entry.fd,
+                            entry.offset + offset + source_delta,
+                            elements * source.element_size(),
+                            destination.data_ptr() + destination_delta,
+                            int(expand),
+                            rows,
+                            source_stride,
+                            destination_stride,
+                        )
+                    )
                 self.destinations.append(destination)
                 if expand:
                     self.inplace_transform_bytes += source.nbytes
             else:
+                if not source.is_contiguous() or not destination.is_contiguous():
+                    raise NotImplementedError(f"strided dtype conversion: {entry.name}")
                 self.flush()
                 if self.transform_scratch is None:
                     with self.allocation_scope():

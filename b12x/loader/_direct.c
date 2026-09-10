@@ -11,6 +11,7 @@ typedef struct {
     uint64_t destination_bytes;
     uint64_t realigned_bytes;
     uint64_t inplace_aligned_bytes;
+    uint64_t strided_copy_bytes;
     uint64_t reads;
 } direct_reader_t;
 
@@ -50,9 +51,8 @@ static PyObject *py_direct_reader(PyObject *self, PyObject *args) {
     return capsule;
 }
 
-static bool direct_read_range(direct_reader_t *reader, int fd, int64_t offset,
-                              int64_t bytes, char *destination, bool allow_direct,
-                              failure_t *failure) {
+static bool validate_direct_range(int fd, int64_t offset, int64_t bytes,
+                                  failure_t *failure) {
     struct stat status;
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || !(flags & O_DIRECT)) {
@@ -68,6 +68,13 @@ static bool direct_read_range(direct_reader_t *reader, int fd, int64_t offset,
         snprintf(failure->message, sizeof(failure->message), "invalid direct input file range");
         return false;
     }
+    return true;
+}
+
+static bool direct_read_range(direct_reader_t *reader, int fd, int64_t offset,
+                              int64_t bytes, char *destination, bool allow_direct,
+                              failure_t *failure) {
+    if (!validate_direct_range(fd, offset, bytes, failure)) return false;
     while (bytes) {
         int64_t aligned_offset = offset & ~(int64_t)(IO_ALIGNMENT - 1);
         size_t delta = offset - aligned_offset;
@@ -156,6 +163,60 @@ static void expand_bf16_inplace(char *destination, int64_t bytes) {
         uint32_t fp32 = (uint32_t)bf16 << 16;
         memcpy(destination + 4 * i, &fp32, sizeof(fp32));
     }
+}
+
+static bool direct_read_rows(direct_reader_t *reader, int fd, int64_t offset,
+                             int64_t bytes, int64_t rows, int64_t source_stride,
+                             int64_t destination_stride, char *destination,
+                             bool expand_bf16, failure_t *failure) {
+    int64_t extent = (rows - 1) * source_stride + bytes;
+    if (!validate_direct_range(fd, offset, extent, failure)) return false;
+    while (rows) {
+        int64_t aligned = offset & ~(int64_t)(IO_ALIGNMENT - 1);
+        size_t delta = offset - aligned;
+        if (rows == 1 || bytes >= IO_ALIGNMENT || !source_stride ||
+            source_stride > IO_SCRATCH_BYTES - (int64_t)delta - bytes) {
+            if (!direct_read_range(reader, fd, offset, bytes, destination, true, failure))
+                return false;
+            if (expand_bf16) expand_bf16_inplace(destination, bytes);
+            rows--;
+            if (rows) {
+                offset += source_stride;
+                destination += destination_stride;
+            }
+            continue;
+        }
+        int64_t count_rows = 1 + (IO_SCRATCH_BYTES - (int64_t)delta - bytes) / source_stride;
+        if (count_rows > rows) count_rows = rows;
+        size_t payload = (count_rows - 1) * source_stride + bytes;
+        size_t length = (delta + payload + IO_ALIGNMENT - 1) & ~(size_t)(IO_ALIGNMENT - 1);
+        ssize_t count;
+        do {
+            count = pread(fd, reader->scratch->base, length, aligned);
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            system_error(failure, "O_DIRECT strided pread (no buffered fallback)");
+            return false;
+        }
+        if ((size_t)count < delta + payload) {
+            snprintf(failure->message, sizeof(failure->message), "short O_DIRECT strided read");
+            return false;
+        }
+        reader->physical_bytes += count;
+        reader->reads++;
+        for (int64_t row = 0; row < count_rows; row++) {
+            char *target = destination + row * destination_stride;
+            memcpy(target, (char *)reader->scratch->base + delta + row * source_stride, bytes);
+            if (expand_bf16) expand_bf16_inplace(target, bytes);
+        }
+        reader->strided_copy_bytes += count_rows * bytes;
+        rows -= count_rows;
+        if (rows) {
+            offset += count_rows * source_stride;
+            destination += count_rows * destination_stride;
+        }
+    }
+    return true;
 }
 
 static PyObject *direct_into(PyObject *args, bool expand_bf16) {

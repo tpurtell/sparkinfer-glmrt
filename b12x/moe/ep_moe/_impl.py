@@ -16,7 +16,7 @@ batched-expert activation contract used by DeepEP-style integrations.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 
@@ -32,12 +32,10 @@ from b12x.moe._shared.kernels.activations import (
     moe_activation_w1_rows,
 )
 from b12x.moe._shared.kernels.w4a16.host import (
-    W4A16_MAPPED_DIRECT_MAX_TOKENS,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     route_block_sizes_for_capacity,
     route_pack_token_capacity,
-    select_route_block_size_m,
 )
 from b12x.policy import PolicyContext, get_auto_policy
 
@@ -48,7 +46,6 @@ from b12x.policy import PolicyContext, get_auto_policy
 from ..fused_moe._impl import (
     B12XFP4ExpertWeights,
     _normalize_swiglu_params,
-    _prepared_dtype_for_runtime,
     _prepared_payload_for_runtime,
 )
 from ._policy import EP_MOE_POLICY, EpMoeQuery
@@ -196,11 +193,10 @@ class EPMoEScratchCaps:
             )
         if "w4a16" not in self.weight_plan.quant_modes:
             raise ValueError("replicated-input EP requires a W4A16 weight plan")
-        expected_plan_dtype = "float16" if self.full_rotation else "bfloat16"
-        if self.weight_plan.io_dtype != expected_plan_dtype:
+        if self.weight_plan.io_dtype != "bfloat16":
             raise TypeError(
-                "replicated-input W4A16 EP weight plan requires "
-                f"{expected_plan_dtype}, got {self.weight_plan.io_dtype!r}"
+                "replicated-input W4A16 EP requires BF16 activations, got "
+                f"{self.weight_plan.io_dtype!r}"
             )
         limit, alpha, beta = _normalize_swiglu_params(
             self.weight_plan.activation,
@@ -215,12 +211,6 @@ class EPMoEScratchCaps:
     @property
     def local_num_experts(self) -> int:
         return self.weight_plan.num_experts
-
-    @property
-    def full_rotation(self) -> bool:
-        """Whether the prepared W4A16 payload uses native Trellis rotations."""
-
-        return self.weight_plan.source_format in {"b12x_trellis", "btx"}
 
 
 @dataclass(frozen=True)
@@ -347,12 +337,6 @@ class EPMoEScratchPlan:
             owner="replicated-input EP MoE",
         )
         views = _map_scratch_views(storage, self._layout)
-        kernel_workspace = views.get("kernel_workspace")
-        if kernel_workspace is not None:
-            # Full-rotation Trellis uses this caller-owned storage for its
-            # persistent grid barriers. Keep initialization in the same stream
-            # as binding so graph capture records and replays it.
-            kernel_workspace.zero_()
         return EPMoEFP4Binding(
             a=a,
             experts=experts,
@@ -376,10 +360,6 @@ class EPMoEScratchPlan:
             packed_route_count=views["packed_route_count"],
             expert_offsets=views["expert_offsets"],
             expert_counts=views["expert_counts"],
-            full_rotation=self.caps.full_rotation,
-            rotation_a_gate=views.get("rotation_a_gate"),
-            rotation_a_up=views.get("rotation_a_up"),
-            kernel_workspace=kernel_workspace,
         )
 
 
@@ -422,40 +402,16 @@ def plan_ep_moe_scratch(
     route_blocks = 1
     fc1_tmp = 1
     fc2_tmp = 1
-    direct_route_slots_by_block: dict[int, int] = {}
-    for direct_m in range(
-        1,
-        min(caps.max_tokens, W4A16_MAPPED_DIRECT_MAX_TOKENS) + 1,
-    ):
-        block_size = select_route_block_size_m(
-            direct_m,
-            caps.num_topk,
-            caps.global_num_experts,
-        )
-        direct_route_slots_by_block[block_size] = max(
-            direct_route_slots_by_block.get(block_size, 0),
-            direct_m * caps.num_topk * block_size,
-        )
-    block_sizes = tuple(
-        sorted(
-            set(
-                route_block_sizes_for_capacity(
-                    caps.max_tokens,
-                    caps.num_topk,
-                    caps.global_num_experts,
-                )
-            ).union(direct_route_slots_by_block)
-        )
+    block_sizes = route_block_sizes_for_capacity(
+        caps.max_tokens,
+        caps.num_topk,
+        caps.global_num_experts,
     )
     for block_size in block_sizes:
         slots = max_packed_route_slots(
             route_capacity_rows,
             int(block_size),
             caps.global_num_experts,
-        )
-        scratch_slots = max(
-            slots,
-            direct_route_slots_by_block.get(int(block_size), 0),
         )
         blocks = (slots + int(block_size) - 1) // int(block_size)
         route_slots = max(route_slots, slots)
@@ -464,7 +420,7 @@ def plan_ep_moe_scratch(
             fc1_tmp,
             packed_gemm_scratch_elements(
                 size_n=fc1_cols,
-                route_slots=scratch_slots,
+                route_slots=slots,
                 moe_block_size=int(block_size),
                 sms=sms,
             ),
@@ -473,39 +429,33 @@ def plan_ep_moe_scratch(
             fc2_tmp,
             packed_gemm_scratch_elements(
                 size_n=hidden_size,
-                route_slots=scratch_slots,
+                route_slots=slots,
                 moe_block_size=int(block_size),
                 sms=sms,
             ),
         )
 
-    cache_dtype = torch.float16 if caps.full_rotation else torch.bfloat16
-    layout_specs = (
+    layout, nbytes = _make_buffer_layout(
         (
-            "intermediate_cache13",
-            routed_rows * max(fc1_cols, hidden_size),
-            cache_dtype,
-        ),
-        (
-            "intermediate_cache2",
-            routed_rows * intermediate_size,
-            cache_dtype,
-        ),
-        ("fc1_c_tmp", fc1_tmp, torch.float32),
-        ("fc2_c_tmp", fc2_tmp, torch.float32),
-        ("packed_route_indices", route_slots, torch.int32),
-        ("block_expert_ids", route_blocks, torch.int32),
-        ("packed_route_count", 1, torch.int32),
-        ("expert_offsets", caps.global_num_experts + 1, torch.int32),
-        ("expert_counts", caps.global_num_experts, torch.int32),
-    )
-    if caps.full_rotation:
-        layout_specs += (
-            ("rotation_a_gate", routed_rows * hidden_size, torch.float16),
-            ("rotation_a_up", routed_rows * hidden_size, torch.float16),
-            ("kernel_workspace", sms * 4 + 2, torch.int32),
+            (
+                "intermediate_cache13",
+                routed_rows * max(fc1_cols, hidden_size),
+                torch.bfloat16,
+            ),
+            (
+                "intermediate_cache2",
+                routed_rows * intermediate_size,
+                torch.bfloat16,
+            ),
+            ("fc1_c_tmp", fc1_tmp, torch.float32),
+            ("fc2_c_tmp", fc2_tmp, torch.float32),
+            ("packed_route_indices", route_slots, torch.int32),
+            ("block_expert_ids", route_blocks, torch.int32),
+            ("packed_route_count", 1, torch.int32),
+            ("expert_offsets", caps.global_num_experts + 1, torch.int32),
+            ("expert_counts", caps.global_num_experts, torch.int32),
         )
-    layout, nbytes = _make_buffer_layout(layout_specs)
+    )
     scratch_specs = (
         scratch_buffer_spec(
             "ep_moe.scratch",
@@ -548,10 +498,6 @@ class EPMoEFP4Binding:
     packed_route_count: torch.Tensor
     expert_offsets: torch.Tensor
     expert_counts: torch.Tensor
-    full_rotation: bool
-    rotation_a_gate: torch.Tensor | None
-    rotation_a_up: torch.Tensor | None
-    kernel_workspace: torch.Tensor | None
 
     def run(self) -> torch.Tensor:
         return b12x_ep_moe_fp4(binding=self)
@@ -569,28 +515,11 @@ def b12x_ep_moe_fp4(*, binding: EPMoEFP4Binding) -> torch.Tensor:
         source_format=binding.experts.source_format,
         activation=binding.experts.activation,
         w13_layout=binding.experts.w13_layout,
-        dtype=_prepared_dtype_for_runtime(
-            binding.experts,
-            quant_mode="w4a16",
-            activation_dtype=binding.a.dtype,
-        ),
+        dtype=binding.a.dtype,
         hidden_size=int(binding.a.shape[1]),
     )
     if prepared is None:
         raise RuntimeError("the EP W4A16 weight representation was not materialized")
-    prepared_full_rotation = getattr(prepared, "weight_layout", "") == "trellis_t256"
-    if prepared_full_rotation != binding.full_rotation:
-        raise RuntimeError(
-            "the EP scratch rotation contract does not match the prepared weights"
-        )
-    if binding.full_rotation:
-        if binding.kernel_workspace is None:
-            raise RuntimeError("full-rotation EP scratch is missing kernel_workspace")
-        if binding.rotation_a_gate is None or binding.rotation_a_up is None:
-            raise RuntimeError("full-rotation EP scratch is missing A rotations")
-        # Persistent weights retain only a preparation-time placeholder. The
-        # live barrier/counter storage must come from the graph-stable EP arena.
-        prepared = replace(prepared, workspace=binding.kernel_workspace)
 
     from b12x.moe._shared.kernels.w4a16.kernel import (
         run_w4a16_moe,
@@ -618,19 +547,6 @@ def b12x_ep_moe_fp4(*, binding: EPMoEFP4Binding) -> torch.Tensor:
         swiglu_limit=binding.swiglu_limit,
         swiglu_alpha=binding.swiglu_alpha,
         swiglu_beta=binding.swiglu_beta,
-        intermediate_rotation_scales=(
-            prepared.intermediate_rotations if binding.full_rotation else None
-        ),
-        full_rotation=binding.full_rotation,
-        suh_gate_table=prepared.gate_suh if binding.full_rotation else None,
-        suh_up_table=prepared.up_suh if binding.full_rotation else None,
-        svh_table=prepared.down_svh if binding.full_rotation else None,
-        rotation_a_gate=binding.rotation_a_gate,
-        rotation_a_up=(
-            binding.rotation_a_gate
-            if binding.full_rotation and binding.experts.plan.coupled_hadamard
-            else binding.rotation_a_up
-        ),
     )
 
 

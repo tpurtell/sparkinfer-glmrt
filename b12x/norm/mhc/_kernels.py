@@ -12,8 +12,6 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as cutlass_utils
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
-import triton
-import triton.language as tl
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -223,105 +221,6 @@ _GRAM_PAIRS = 10
 _GRAM_ROW0 = 32  # gram[tile] stored at partials[token, 32 + tile, 0:10]
 # 1024 threads cover one hidden tile per loop iteration.
 _GRAM_BLOCK_H = 1024
-
-
-@triton.jit
-def _mhc_head_fused_kernel(
-    residual,
-    fn,
-    scale,
-    bias,
-    norm_weight,
-    collapsed_out,
-    out,
-    rms_eps,
-    hc_eps,
-    norm_eps,
-    HIDDEN_SIZE: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    STORE_COLLAPSED: tl.constexpr,
-):
-    token = tl.program_id(0)
-    h = tl.arange(0, BLOCK_H)
-    mask = h < HIDDEN_SIZE
-    residual_base = token * 4 * HIDDEN_SIZE + h
-
-    r0 = tl.load(residual + residual_base, mask=mask, other=0.0).to(tl.float32)
-    r1 = tl.load(
-        residual + residual_base + HIDDEN_SIZE, mask=mask, other=0.0
-    ).to(tl.float32)
-    r2 = tl.load(
-        residual + residual_base + 2 * HIDDEN_SIZE, mask=mask, other=0.0
-    ).to(tl.float32)
-    r3 = tl.load(
-        residual + residual_base + 3 * HIDDEN_SIZE, mask=mask, other=0.0
-    ).to(tl.float32)
-
-    input_rms = tl.rsqrt(
-        tl.sum(r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3)
-        / (4.0 * HIDDEN_SIZE)
-        + rms_eps
-    )
-    fn_stride = 4 * HIDDEN_SIZE
-
-    mix0 = tl.sum(
-        tl.load(fn + h, mask=mask, other=0.0) * r0
-        + tl.load(fn + HIDDEN_SIZE + h, mask=mask, other=0.0) * r1
-        + tl.load(fn + 2 * HIDDEN_SIZE + h, mask=mask, other=0.0) * r2
-        + tl.load(fn + 3 * HIDDEN_SIZE + h, mask=mask, other=0.0) * r3
-    ) * input_rms
-    mix1 = tl.sum(
-        tl.load(fn + fn_stride + h, mask=mask, other=0.0) * r0
-        + tl.load(fn + fn_stride + HIDDEN_SIZE + h, mask=mask, other=0.0) * r1
-        + tl.load(fn + fn_stride + 2 * HIDDEN_SIZE + h, mask=mask, other=0.0)
-        * r2
-        + tl.load(fn + fn_stride + 3 * HIDDEN_SIZE + h, mask=mask, other=0.0)
-        * r3
-    ) * input_rms
-    mix2 = tl.sum(
-        tl.load(fn + 2 * fn_stride + h, mask=mask, other=0.0) * r0
-        + tl.load(fn + 2 * fn_stride + HIDDEN_SIZE + h, mask=mask, other=0.0)
-        * r1
-        + tl.load(fn + 2 * fn_stride + 2 * HIDDEN_SIZE + h, mask=mask, other=0.0)
-        * r2
-        + tl.load(fn + 2 * fn_stride + 3 * HIDDEN_SIZE + h, mask=mask, other=0.0)
-        * r3
-    ) * input_rms
-    mix3 = tl.sum(
-        tl.load(fn + 3 * fn_stride + h, mask=mask, other=0.0) * r0
-        + tl.load(fn + 3 * fn_stride + HIDDEN_SIZE + h, mask=mask, other=0.0)
-        * r1
-        + tl.load(fn + 3 * fn_stride + 2 * HIDDEN_SIZE + h, mask=mask, other=0.0)
-        * r2
-        + tl.load(fn + 3 * fn_stride + 3 * HIDDEN_SIZE + h, mask=mask, other=0.0)
-        * r3
-    ) * input_rms
-
-    hc_scale = tl.load(scale)
-    pre0 = 1.0 / (1.0 + tl.exp(-(mix0 * hc_scale + tl.load(bias)))) + hc_eps
-    pre1 = 1.0 / (1.0 + tl.exp(-(mix1 * hc_scale + tl.load(bias + 1)))) + hc_eps
-    pre2 = 1.0 / (1.0 + tl.exp(-(mix2 * hc_scale + tl.load(bias + 2)))) + hc_eps
-    pre3 = 1.0 / (1.0 + tl.exp(-(mix3 * hc_scale + tl.load(bias + 3)))) + hc_eps
-
-    collapsed = (pre0 * r0 + pre1 * r1 + pre2 * r2 + pre3 * r3).to(
-        tl.bfloat16
-    )
-    if STORE_COLLAPSED:
-        tl.store(
-            collapsed_out + token * HIDDEN_SIZE + h,
-            collapsed,
-            mask=mask,
-        )
-    collapsed_f32 = collapsed.to(tl.float32)
-    output_rms = tl.rsqrt(
-        tl.sum(collapsed_f32 * collapsed_f32) / HIDDEN_SIZE + norm_eps
-    )
-    weight = tl.load(norm_weight + h, mask=mask, other=0.0).to(tl.float32)
-    tl.store(
-        out + token * HIDDEN_SIZE + h,
-        collapsed_f32 * output_rms * weight,
-        mask=mask,
-    )
 
 
 @dsl_user_op
@@ -622,6 +521,7 @@ def _selected_post_pre_partials_per_cta(
     num_tokens: int,
     hidden_size: int,
     compute_capability: tuple[int, int] | None = None,
+    schedule: str = "default",
 ) -> int:
     raw = os.environ.get("B12X_MHC_PARTIALS_PER_CTA")
     if raw is not None and raw != "":
@@ -631,6 +531,28 @@ def _selected_post_pre_partials_per_cta(
             raise ValueError(
                 f"invalid B12X_MHC_PARTIALS_PER_CTA={raw!r}"
             ) from exc
+
+    if schedule == "hidden4096_m128_v1":
+        if int(hidden_size) != _HIDDEN:
+            raise ValueError(
+                "hidden4096_m128_v1 requires hidden_size=4096"
+            )
+        tokens = int(num_tokens)
+        if tokens >= 96:
+            return _POST_PRE_PARTIALS_PER_CTA
+        if tokens >= 24:
+            return 13
+        if tokens >= 16:
+            return 7
+        if tokens >= 8:
+            return 5
+        if tokens >= 4:
+            return 3
+        if tokens >= 2:
+            return 2
+        return 1
+    if schedule != "default":
+        raise ValueError(f"unsupported mHC decode partials schedule {schedule!r}")
 
     if compute_capability is None and torch.cuda.is_available():
         compute_capability = tuple(torch.cuda.get_device_capability())
@@ -910,6 +832,7 @@ class MHCPostPrePartialKernel:
             ),
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=_MHC_PDL,
         )
 
     @cute.kernel
@@ -925,6 +848,8 @@ class MHCPostPrePartialKernel:
     ):
         hidden_tile, partial_group, token = cute.arch.block_idx()
         tidx = cute.arch.thread_idx()[0]
+        if const_expr(_MHC_PDL):
+            cute.arch.griddepcontrol_wait()
         lane = tidx % Int32(32)
         warp = tidx // Int32(32)
         nwarps = self.num_threads // 32
@@ -4148,6 +4073,7 @@ def _run_mhc_post_pre_partial_launch(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    partials_per_cta: int = 0,
 ) -> None:
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
@@ -4163,9 +4089,13 @@ def _run_mhc_post_pre_partial_launch(
         if raw_bf16x2 is not None
         else tokens == 16 and hidden_size == _HIDDEN and decode_source_splits > 0
     )
-    partials_per_cta = _selected_post_pre_partials_per_cta(
-        num_tokens=tokens,
-        hidden_size=hidden_size,
+    partials_per_cta = (
+        _validate_post_pre_partials_per_cta(int(partials_per_cta))
+        if int(partials_per_cta) > 0
+        else _selected_post_pre_partials_per_cta(
+            num_tokens=tokens,
+            hidden_size=hidden_size,
+        )
     )
     _validate_tensor_shape("x", x, (tokens, hidden_size))
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
@@ -4345,6 +4275,7 @@ def _mhc_post_pre_partial_launch_op(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool,
+    partials_per_cta: int,
 ) -> None:
     _run_mhc_post_pre_partial_launch(
         x=x,
@@ -4355,6 +4286,7 @@ def _mhc_post_pre_partial_launch_op(
         partials=partials,
         out=out,
         compute_gram=compute_gram,
+        partials_per_cta=partials_per_cta,
     )
 
 
@@ -4368,6 +4300,7 @@ def _mhc_post_pre_partial_launch_fake(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool,
+    partials_per_cta: int,
 ) -> None:
     return None
 
@@ -4382,7 +4315,13 @@ def run_mhc_post_pre_partial(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    decode_partials_schedule: str = "default",
 ) -> None:
+    partials_per_cta = _selected_post_pre_partials_per_cta(
+        num_tokens=int(x.shape[0]),
+        hidden_size=int(residual.shape[2]),
+        schedule=decode_partials_schedule,
+    )
     torch.ops.b12x.mhc_post_pre_partial_launch(
         x,
         residual,
@@ -4392,6 +4331,7 @@ def run_mhc_post_pre_partial(
         partials,
         out,
         bool(compute_gram),
+        int(partials_per_cta),
     )
 
 
@@ -5264,6 +5204,7 @@ def _legacy_mhc_prefill_tf32_config(
         geometry = (16, 8, 256, 1, 1, 1, 1)
     return MhcConfig(
         backend="tf32_tma",
+        decode_partials_schedule="default",
         projection_tile_m=geometry[0],
         projection_tile_n=geometry[1],
         projection_tile_k=geometry[2],
@@ -6434,192 +6375,8 @@ def run_mhc_post_pre_functional(
     )
 
 
-def _run_mhc_head_launch(
-    *,
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    out: torch.Tensor,
-    collapsed_out: torch.Tensor | None,
-    rms_eps: float,
-    hc_eps: float,
-    norm_eps: float,
-) -> None:
-    tokens = int(residual.shape[0])
-    hidden_size = int(residual.shape[2])
-    _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
-    _validate_tensor_shape("fn", fn, (_MHC_MULT, _MHC_MULT * hidden_size))
-    _validate_tensor_shape("scale", scale, (1,))
-    _validate_tensor_shape("bias", bias, (_MHC_MULT,))
-    _validate_tensor_shape("norm_weight", norm_weight, (hidden_size,))
-    _validate_tensor_shape("out", out, (tokens, hidden_size))
-    if collapsed_out is not None:
-        _validate_tensor_shape(
-            "collapsed_out", collapsed_out, (tokens, hidden_size)
-        )
-        if collapsed_out.dtype != residual.dtype:
-            raise ValueError(
-                "collapsed_out must use the residual BF16 dtype, got "
-                f"{collapsed_out.dtype}"
-            )
-        if collapsed_out.data_ptr() == out.data_ptr():
-            raise ValueError("collapsed_out and normalized out must not alias")
-    if tokens == 0:
-        return
-    block_h = triton.next_power_of_2(hidden_size)
-    _mhc_head_fused_kernel[(tokens,)](
-        residual,
-        fn,
-        scale,
-        bias,
-        norm_weight,
-        out if collapsed_out is None else collapsed_out,
-        out,
-        float(rms_eps),
-        float(hc_eps),
-        float(norm_eps),
-        HIDDEN_SIZE=hidden_size,
-        BLOCK_H=block_h,
-        STORE_COLLAPSED=collapsed_out is not None,
-        num_warps=8,
-    )
-
-
-@torch.library.custom_op(
-    "b12x::mhc_head_launch",
-    mutates_args=("out",),
-)
-def _mhc_head_launch_op(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    out: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    norm_eps: float,
-) -> None:
-    _run_mhc_head_launch(
-        residual=residual,
-        fn=fn,
-        scale=scale,
-        bias=bias,
-        norm_weight=norm_weight,
-        out=out,
-        collapsed_out=None,
-        rms_eps=rms_eps,
-        hc_eps=hc_eps,
-        norm_eps=norm_eps,
-    )
-
-
-@_mhc_head_launch_op.register_fake
-def _mhc_head_launch_fake(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    out: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    norm_eps: float,
-) -> None:
-    return None
-
-
-@torch.library.custom_op(
-    "b12x::mhc_head_with_collapsed_launch",
-    mutates_args=("collapsed_out", "out"),
-)
-def _mhc_head_with_collapsed_launch_op(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    collapsed_out: torch.Tensor,
-    out: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    norm_eps: float,
-) -> None:
-    _run_mhc_head_launch(
-        residual=residual,
-        fn=fn,
-        scale=scale,
-        bias=bias,
-        norm_weight=norm_weight,
-        collapsed_out=collapsed_out,
-        out=out,
-        rms_eps=rms_eps,
-        hc_eps=hc_eps,
-        norm_eps=norm_eps,
-    )
-
-
-@_mhc_head_with_collapsed_launch_op.register_fake
-def _mhc_head_with_collapsed_launch_fake(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    collapsed_out: torch.Tensor,
-    out: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    norm_eps: float,
-) -> None:
-    return None
-
-
-def run_mhc_head(
-    *,
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    out: torch.Tensor,
-    collapsed_out: torch.Tensor | None = None,
-    rms_eps: float,
-    hc_eps: float,
-    norm_eps: float,
-) -> None:
-    if collapsed_out is None:
-        torch.ops.b12x.mhc_head_launch(
-            residual,
-            fn,
-            scale,
-            bias,
-            norm_weight,
-            out,
-            float(rms_eps),
-            float(hc_eps),
-            float(norm_eps),
-        )
-    else:
-        torch.ops.b12x.mhc_head_with_collapsed_launch(
-            residual,
-            fn,
-            scale,
-            bias,
-            norm_weight,
-            collapsed_out,
-            out,
-            float(rms_eps),
-            float(hc_eps),
-            float(norm_eps),
-        )
-
-
 __all__ = [
     "run_mhc_finalize_gram",
-    "run_mhc_head",
     "run_mhc_post",
     "run_mhc_post_functional",
     "run_mhc_pre_functional",

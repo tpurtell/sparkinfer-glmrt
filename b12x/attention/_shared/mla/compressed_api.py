@@ -21,7 +21,6 @@ from .compressed_reference import (
     COMPRESSED_SPARSE_MLA_HEAD_DIM,
     compressed_sparse_mla_page_nbytes,
 )
-from .traits import ScaleFormat
 
 
 _LN2 = math.log(2.0)
@@ -47,18 +46,7 @@ def _should_use_sm121_single_pass_decode(
         return False
     if rows < 16 or heads != 32 or int(swa_page_size) != 64:
         return False
-    if indexed_width:
-        # DSV4's dual-cache single-pass dispatcher only accepts a 128-wide
-        # primary/SWA cache.  The secondary cache may occupy the remaining
-        # short-context chunks, but its page size must match the dispatcher.
-        if int(swa_width) != 128 or int(indexed_page_size or 0) != 64:
-            return False
-    elif int(swa_width) not in (128, 512):
-        # The UE8M0 DSV4 single-cache dispatcher has discrete specializations,
-        # not a generic <=10-chunk implementation.  In particular, adaptive
-        # or K6 verification can produce width 192; keep those shapes on the
-        # split-decode path instead of promoting them into an unsupported
-        # prefill specialization.
+    if indexed_width and int(indexed_page_size or 0) != 64:
         return False
     chunks = (int(swa_width) + 63) // 64 + (int(indexed_width) + 63) // 64
     return chunks <= 10
@@ -149,9 +137,6 @@ def compressed_sparse_mla_decode_forward(
         page_size=swa_page_size,
         name="swa_k_cache",
     )
-    scale_format = _compressed_sparse_mla_scale_format(
-        swa_k_cache, page_size=swa_page_size, name="swa_k_cache"
-    )
 
     swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
     if swa_indices_2d.device != q3.device:
@@ -197,15 +182,8 @@ def compressed_sparse_mla_decode_forward(
             page_size=int(indexed_page_size),
             name="indexed_k_cache",
         )
-        indexed_scale_format = _compressed_sparse_mla_scale_format(
-            indexed_k_cache,
-            page_size=int(indexed_page_size),
-            name="indexed_k_cache",
-        )
-        if indexed_scale_format != scale_format:
-            raise ValueError("main and indexed compressed MLA cache formats differ")
         indexed_indices_2d = _normalize_index_matrix(
-            indexed_indices, name="indexed_indices", allow_row_shared=True
+            indexed_indices, name="indexed_indices"
         )
         if indexed_indices_2d.device != q3.device:
             raise ValueError("indexed_indices must be on the same device as q_all")
@@ -270,7 +248,6 @@ def compressed_sparse_mla_decode_forward(
             return_lse=return_lse,
             lse_scale=lse_scale,
             out=out,
-            scale_format=scale_format,
         )
 
     if _should_use_sm121_single_pass_decode(
@@ -297,7 +274,6 @@ def compressed_sparse_mla_decode_forward(
             return_lse=return_lse,
             lse_scale=lse_scale,
             out=out,
-            scale_format=scale_format,
         )
 
     from .kernel import run_unified_decode
@@ -318,8 +294,6 @@ def compressed_sparse_mla_decode_forward(
         return_lse=return_lse,
         lse_scale=lse_scale,
         out=out,
-        scale_format_override=scale_format,
-        fp8_rope_override=False if scale_format == ScaleFormat.NVFP4_E4M3 else None,
     )
 
 
@@ -357,7 +331,6 @@ def _run_sm120_compressed_prefill(
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
     out: torch.Tensor | None = None,
-    scale_format: int = ScaleFormat.UE8M0_BYTE,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a DSV4 prefill-like (extend/verify/draft_extend) compressed call to the
     active SM120 single-pass prefill.
@@ -380,30 +353,13 @@ def _run_sm120_compressed_prefill(
             q_all=q3,
             v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
         )
-    final_lse = getattr(workspace, "final_lse", None)
-    if final_lse is None:
-        raise RuntimeError(
-            "compressed MLA prefill requires caller-owned final_lse scratch"
-        )
-    final_lse = final_lse[: int(q3.shape[0])]
-    if tuple(final_lse.shape) != (int(q3.shape[0]), int(q3.shape[1])):
-        raise ValueError(
-            "compressed MLA final_lse scratch must have live shape "
-            f"{(int(q3.shape[0]), int(q3.shape[1]))}, got {tuple(final_lse.shape)}"
-        )
-    if final_lse.dtype != torch.float32 or final_lse.device != q3.device:
-        raise ValueError(
-            "compressed MLA final_lse scratch must be float32 on the query device"
-        )
-    if not final_lse.is_contiguous():
-        raise ValueError("compressed MLA final_lse scratch must be contiguous")
 
     extra_kwargs: dict = {}
     if indexed_k_cache is not None:
         extra_kwargs = dict(
             extra_kv_cache=indexed_k_cache,
             extra_indices=_normalize_index_matrix(
-                indexed_indices, name="indexed_indices", allow_row_shared=True
+                indexed_indices, name="indexed_indices"
             ),
             extra_topk_length=indexed_topk_lengths,
             extra_page_block_size=int(indexed_page_size),
@@ -418,9 +374,6 @@ def _run_sm120_compressed_prefill(
         topk_length=swa_topk_lengths,
         attn_sink=attn_sink,
         output=output,
-        lse_out=final_lse,
-        scale_format=scale_format,
-        fp8_rope=False if scale_format == ScaleFormat.NVFP4_E4M3 else None,
         **extra_kwargs,
     )
     if not return_lse:
@@ -577,32 +530,15 @@ def _validate_compressed_cache_layout(
     page_size = int(page_size)
     if page_size <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
-    nvfp4_payload_nbytes = page_size * 432
     payload_nbytes = page_size * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
     padded_page_nbytes = compressed_sparse_mla_page_nbytes(page_size)
     page_nbytes = int(cache.shape[1])
-    if page_nbytes not in (nvfp4_payload_nbytes, payload_nbytes, padded_page_nbytes):
+    if page_nbytes not in (payload_nbytes, padded_page_nbytes):
         raise ValueError(
-            f"{name} page byte width must be one of the contiguous payload "
-            f"widths: NVFP4 {nvfp4_payload_nbytes}, "
-            f"FP8 payload {payload_nbytes}, or padded FP8 width {padded_page_nbytes} for "
+            f"{name} page byte width must be the contiguous payload "
+            f"{payload_nbytes} or padded width {padded_page_nbytes} for "
             f"page_size {page_size}, got {page_nbytes}"
         )
-
-
-def _compressed_sparse_mla_scale_format(
-    cache: torch.Tensor, *, page_size: int, name: str
-) -> int:
-    page_nbytes = int(cache.shape[1])
-    if page_nbytes == int(page_size) * 432:
-        return ScaleFormat.NVFP4_E4M3
-    payload_nbytes = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
-    if page_nbytes in (
-        payload_nbytes,
-        compressed_sparse_mla_page_nbytes(int(page_size)),
-    ):
-        return ScaleFormat.UE8M0_BYTE
-    raise ValueError(f"{name} has an unsupported compressed MLA page width")
 
 
 def _compressed_sparse_mla_cache_byte_view(

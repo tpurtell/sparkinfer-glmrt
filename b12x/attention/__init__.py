@@ -7,8 +7,6 @@
 - ``sparse_mla``: top-k-selected MLA, including strided physical records.
 - ``compressed_sparse_mla``: sparse MLA directly from compressed KV pages
   (DSV4).
-- ``dsv4_compressor``: DSV4 learned gated-pooling state and cache producer.
-- ``dsv4_producer``: checkpoint-native DSV4 query projection and KV packing.
 - ``dsa_indexer``: the DSA index stage — quantize -> score -> select.
 - ``qsa``: grouped-selector sparse GQA over caller-populated, read-only main
   BF16 paged K/V.
@@ -25,8 +23,6 @@ _OP_MODULES = (
     "dense_mla",
     "sparse_mla",
     "compressed_sparse_mla",
-    "dsv4_compressor",
-    "dsv4_producer",
     "dsa_indexer",
     "qsa",
     "varlen",
