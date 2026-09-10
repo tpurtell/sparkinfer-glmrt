@@ -733,6 +733,16 @@ class MoEDynamicKernelBackend:
         self.sf_vec_size = sf_vec_size
         self.fast_math = fast_math
         self.activation = activation
+        self.is_v41 = activation == "silu_v41"
+        if self.is_v41 and (
+            quant_recipe != "w4a8_mx"
+            or swap_ab
+            or materialize_intermediate
+            or not deterministic_output
+        ):
+            raise ValueError(
+                "V4.1 requires native unswapped W4A8 fused execution with per-route reduction"
+            )
         self.is_gated = is_gated_moe_activation(activation)
         self.is_situ = activation == SITU
         self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
@@ -1466,6 +1476,9 @@ class MoEDynamicKernelBackend:
 
     @cute.jit
     def _gated_activation_value(self, gate: cutlass.Float32, up: cutlass.Float32):
+        if cutlass.const_expr(self.is_v41):
+            gate = gate.to(cutlass.BFloat16).to(cutlass.Float32)
+            up = up.to(cutlass.BFloat16).to(cutlass.Float32)
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             neg_limit = cutlass.Float32(-self.swiglu_limit)
@@ -2852,7 +2865,7 @@ class MoEDynamicKernelBackend:
         else:
             output_bytes_per_row = cols // Int32(2)
             mx_blocks_per_row = sf_blocks_per_row  # unused placeholder
-        cols_u32 = cols // Int32(2)
+        cols_u32 = cols if cutlass.const_expr(self.is_v41) else cols // Int32(2)
         scatter_output_u32 = cute.recast_tensor(scatter_output, cutlass.Uint32)
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
@@ -3000,7 +3013,11 @@ class MoEDynamicKernelBackend:
                 m1_slot_expert_id = topk_ids[flat_tid].to(Int32)
                 if m1_slot_expert_id >= Int32(0) and m1_slot_expert_id < num_experts:
                     m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
-                    token_map[m1_physical_row] = Int32(0)
+                    token_map[m1_physical_row] = (
+                        flat_tid
+                        if cutlass.const_expr(self.deterministic_output)
+                        else Int32(0)
+                    )
                     token_weights[m1_physical_row] = topk_weights[flat_tid].to(
                         cutlass.Float32
                     )
@@ -4744,6 +4761,13 @@ class MoEDynamicKernelBackend:
                 tRS_sD = thr_copy_r2s.partition_D(sC)
                 tRS_rGate = tiled_copy_r2s.retile(gate_acc)
                 tRS_rUp = tiled_copy_r2s.retile(up_acc)
+                if cutlass.const_expr(self.is_v41):
+                    v41_coords = thr_mma.partition_C(
+                        cute.make_identity_tensor(
+                            (self.tile_shape_mnk[0], self.tile_shape_mnk[1])
+                        )
+                    )
+                    v41_rcoords = tiled_copy_r2s.retile(v41_coords)
 
                 rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
                 tRS_rD_layout = cute.make_layout(rD_shape[:3])
@@ -5695,6 +5719,15 @@ class MoEDynamicKernelBackend:
                                                 tRS_rD_slice[elem_idx] = (
                                                     self._gated_activation_value(g, u)
                                                 )
+                                                if cutlass.const_expr(self.is_v41):
+                                                    v41_row = v41_rcoords[
+                                                        (None, mma_m, mma_n)
+                                                    ][elem_idx][0]
+                                                    v41_weight = ld_shared_f32(
+                                                        scatter_weight_base_addr
+                                                        + Int32(v41_row) * Int32(4)
+                                                    )
+                                                    tRS_rD_slice[elem_idx] *= v41_weight
                                         else:
                                             for elem_idx in cutlass.range_constexpr(
                                                 cute.size(tRS_rD_slice)
@@ -6674,6 +6707,15 @@ class MoEDynamicKernelBackend:
                                                 tRS_rD_slice[elem_idx] = (
                                                     self._gated_activation_value(g, u)
                                                 )
+                                                if cutlass.const_expr(self.is_v41):
+                                                    v41_row = v41_rcoords[
+                                                        (None, mma_m, mma_n)
+                                                    ][elem_idx][0]
+                                                    v41_weight = ld_shared_f32(
+                                                        scatter_weight_base_addr
+                                                        + Int32(v41_row) * Int32(4)
+                                                    )
+                                                    tRS_rD_slice[elem_idx] *= v41_weight
                                         else:
                                             for elem_idx in cutlass.range_constexpr(
                                                 cute.size(tRS_rD_slice)
@@ -7521,6 +7563,33 @@ class MoEDynamicKernelBackend:
                                                     * down_epi_acc_slice[elem_idx]
                                                 )
 
+                                            if cutlass.const_expr(self.is_v41):
+                                                coord = v41_coords[
+                                                    (None, mma_m, mma_n)
+                                                ][elem_idx]
+                                                v41_row = Int32(coord[0])
+                                                v41_col = tile_n_base_cur + Int32(
+                                                    coord[1]
+                                                )
+                                                if (
+                                                    v41_row < valid_rows
+                                                    and v41_col < scatter_N
+                                                ):
+                                                    v41_pair = ld_shared_i32_relaxed(
+                                                        scatter_tok_base_addr
+                                                        + v41_row * Int32(4)
+                                                    )
+                                                    # One grouped task owns every intermediate
+                                                    # slice for this route and output column.
+                                                    scatter_output[
+                                                        Int64(v41_pair), v41_col
+                                                    ] = (
+                                                        scatter_output[
+                                                            Int64(v41_pair), v41_col
+                                                        ]
+                                                        + tRS_rD_slice[elem_idx]
+                                                    )
+
                                 acc_vec = tRS_rD.load()
                                 acc_vec = acc_vec.to(cutlass.BFloat16)
                                 tRS_rD_out.store(acc_vec)
@@ -7545,6 +7614,8 @@ class MoEDynamicKernelBackend:
                                     warp_epi_rows = Int32(0)
                                 tile_vec_cols = Int32(64) // Int32(8)
                                 vec_idx = lane_id
+                                if cutlass.const_expr(self.is_v41):
+                                    vec_idx = warp_epi_rows * tile_vec_cols
                                 while vec_idx < warp_epi_rows * tile_vec_cols:
                                     local_row = vec_idx // tile_vec_cols
                                     local_vec_col = vec_idx - local_row * tile_vec_cols
@@ -7557,6 +7628,8 @@ class MoEDynamicKernelBackend:
                                     wv = ld_shared_f32(
                                         scatter_weight_base_addr + cached_row * Int32(4)
                                     )
+                                    if cutlass.const_expr(self.is_v41):
+                                        wv = cutlass.Float32(1.0)
                                     if cutlass.const_expr(self.w4a8_repacked):
                                         sc_logical = Int32(
                                             cute.crd2idx(

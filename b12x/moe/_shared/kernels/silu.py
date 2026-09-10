@@ -226,3 +226,10 @@ __all__ = [
     "MoEMicroKernelSilu",
     "MoEMicroKernelSwiGLUOAI",
 ]
+
+
+class MoEDynamicKernelSiluV41(MoEDynamicKernelBackend):
+    """V4.1 BF16 projection boundaries and router-weighted SwiGLU before FP8."""
+
+    def __init__(self, sf_vec_size, mma_tiler_mn, **kwargs):
+        super().__init__(sf_vec_size, mma_tiler_mn, activation="silu_v41", **kwargs)

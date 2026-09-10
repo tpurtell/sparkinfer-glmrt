@@ -260,6 +260,15 @@ class MoESpec:
             raise ValueError(f"unsupported quant_mode {self.quant_mode!r}")
         if self.source_format not in _SOURCE_FORMATS:
             raise ValueError(f"unsupported source_format {self.source_format!r}")
+        if self.activation == "silu_v41" and (
+            self.quant_mode != "w4a8_mx"
+            or self.source_format != "fp4_e8m0_k32"
+            or self.apply_router_weight_on_input
+            or self.io_dtype != "bfloat16"
+        ):
+            raise ValueError(
+                "silu_v41 requires BF16 I/O, native FP4/K32 weights and intermediate router weighting"
+            )
         validate_moe_source_quant(
             source_format=self.source_format,
             quant_mode=self.quant_mode,
@@ -820,8 +829,8 @@ def plan_moe_weight_preparation(
             )
             continue
         if spec.quant_mode == "w4a8_mx":
-            if spec.activation not in {"silu", "situ"}:
-                raise ValueError("W4A8-MX preparation currently requires silu or situ")
+            if spec.activation not in {"silu", "silu_v41", "situ"}:
+                raise ValueError("W4A8-MX preparation requires silu, silu_v41, or situ")
             if source_format in _TRELLIS_SOURCE_FORMATS:
                 # Trellis payloads stay source-native (fully scaled E4M3
                 # after in-kernel decode; identity weight block scales).
@@ -1032,6 +1041,8 @@ def lower_moe_execution(
     """
 
     regime = MoERegime(regime)
+    if spec.activation == "silu_v41":
+        deterministic_output = True
     required_weight_layout = (
         None
         if required_weight_layout is None

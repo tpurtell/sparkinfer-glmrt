@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 
+SILU_V41 = "silu_v41"
 SITU = "situ"
 SITU_DEFAULT_BETA = 4.0
 SITU_DEFAULT_LINEAR_BETA = 25.0
@@ -14,9 +15,9 @@ SWIGLUOAI_DEFAULT_ALPHA = 1.702
 SWIGLUOAI_DEFAULT_BETA = 1.0
 
 SUPPORTED_MOE_ACTIVATIONS = frozenset(
-    {"silu", SITU, "relu2", SWIGLUOAI_UNINTERLEAVE}
+    {"silu", SILU_V41, SITU, "relu2", SWIGLUOAI_UNINTERLEAVE}
 )
-GATED_MOE_ACTIVATIONS = frozenset({"silu", SITU, SWIGLUOAI_UNINTERLEAVE})
+GATED_MOE_ACTIVATIONS = frozenset({"silu", SILU_V41, SITU, SWIGLUOAI_UNINTERLEAVE})
 
 
 def normalize_moe_activation(activation: str) -> str:
@@ -39,6 +40,10 @@ def normalize_swiglu_limit_for_activation(
     swiglu_limit: float | None,
 ) -> float | None:
     activation = normalize_moe_activation(activation)
+    if activation == SILU_V41:
+        if swiglu_limit is not None and float(swiglu_limit) != 10.0:
+            raise ValueError("silu_v41 requires the trained SwiGLU limit 10")
+        return 10.0
     if swiglu_limit is None:
         return SWIGLUOAI_DEFAULT_LIMIT if activation == SWIGLUOAI_UNINTERLEAVE else None
     if activation == SITU:
