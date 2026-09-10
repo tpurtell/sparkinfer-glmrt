@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -61,7 +62,10 @@ class _MXFP8RowsQuantLaunch:
         threads: int,
         scale_block_size: int,
         trellis_native_mma_order: bool,
+        amax_floor: float,
     ) -> None:
+        self._amax_floor = float(amax_floor)
+        self._block128_floor = max(1.0e-4, self._amax_floor)
         self._k = int(k)
         self._groups_k = self._k // 32
         self._source_type = source_type
@@ -145,7 +149,7 @@ class _MXFP8RowsQuantLaunch:
                     )
                 # Match the model's act_quant kernel, including its non-zero
                 # floor for an all-zero (or tiny) block.
-                max_abs = fmax_f32(max_abs, cutlass.Float32(1.0e-4))
+                max_abs = fmax_f32(max_abs, cutlass.Float32(self._block128_floor))
                 _, scale_byte = pow2_ceil_ue8m0(
                     max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                 )
@@ -195,6 +199,8 @@ class _MXFP8RowsQuantLaunch:
                             cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
                         )
 
+                    if cutlass.const_expr(self._amax_floor > 0.0):
+                        max_abs = fmax_f32(max_abs, cutlass.Float32(self._amax_floor))
                     _, scale_byte = pow2_ceil_ue8m0(
                         max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )
@@ -274,6 +280,8 @@ class _MXFP8RowsQuantLaunch:
                             cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
                         )
 
+                    if cutlass.const_expr(self._amax_floor > 0.0):
+                        max_abs = fmax_f32(max_abs, cutlass.Float32(self._amax_floor))
                     _, scale_byte = pow2_ceil_ue8m0(
                         max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )
@@ -303,6 +311,8 @@ class _MXFP8RowsQuantLaunch:
                     values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
 
                 max_abs = max_abs_32(values)
+                if cutlass.const_expr(self._amax_floor > 0.0):
+                    max_abs = fmax_f32(max_abs, cutlass.Float32(self._amax_floor))
                 payload, scale_byte = quantize_block_fp8_mx(values, max_abs)
                 if max_abs == cutlass.Float32(0.0):
                     scale_byte = Uint32(127)
@@ -347,7 +357,11 @@ def _get_compiled_mxfp8_rows_quant(
     threads: int,
     scale_block_size: int,
     value_order: str,
+    amax_floor: float = 0.0,
 ) -> Callable:
+    amax_floor = float(amax_floor)
+    if not math.isfinite(amax_floor) or not 0.0 <= amax_floor <= 1.0:
+        raise ValueError("MXFP8 amax_floor must be finite and between zero and one")
     k = int(k)
     if k <= 0 or k % 32 != 0:
         raise ValueError(f"MXFP8 CuTe quantizer requires K divisible by 32, got {k}")
@@ -399,6 +413,7 @@ def _get_compiled_mxfp8_rows_quant(
         threads,
         scale_block_size,
         value_order == "trellis_native_mma",
+        amax_floor,
     )
     cache_key = (
         k,
@@ -407,6 +422,7 @@ def _get_compiled_mxfp8_rows_quant(
         int(threads),
         int(scale_block_size),
         value_order,
+        amax_floor,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -480,12 +496,14 @@ def compile_mxfp8_rows_quant_aot(
     source_dtype: torch.dtype = torch.bfloat16,
     scale_block_size: int = 32,
     expected_m: int = 2048,
+    amax_floor: float = 0.0,
 ) -> object:
     """Compile a runtime-M row quantizer for native AOT export.
 
     ``expected_m`` selects the same launch geometry as the public tensor API;
     live M and the bounded grid size remain runtime arguments in the exported
-    ABI.
+    ABI. Set amax_floor=1e-4 for the official DeepSeek-V4.1 K32 contract;
+    the default retains native MXFP8's zero-group convention.
     """
 
     size_k = int(size_k)
@@ -500,6 +518,7 @@ def compile_mxfp8_rows_quant_aot(
         _THREADS,
         int(scale_block_size),
         "linear",
+        amax_floor,
     )
     return tensor_api.compiled  # type: ignore[attr-defined]
 
@@ -512,12 +531,13 @@ def quantize_mxfp8_rows_cute(
     *,
     scale_block_size: int = 32,
     value_order: str = "linear",
+    amax_floor: float = 0.0,
 ) -> None:
     """Quantize contiguous BF16 rows into dense-GEMM MXFP8 layouts.
 
     ``scale_block_size=32`` is native MXFP8. ``128`` preserves DeepSeek's
     per-token K128 quantization by replicating each scale across four hardware
-    K32 scale slots.
+    K32 scale slots. Set amax_floor=1e-4 for DeepSeek-V4.1 K32 scaling.
 
     ``trellis_native_mma`` applies the fixed within-K32 byte permutation used
     by direct native-trellis E4M3 B fragments.  It changes neither values nor
@@ -541,6 +561,7 @@ def quantize_mxfp8_rows_cute(
         _THREADS,
         int(scale_block_size),
         value_order,
+        amax_floor,
     )(
         source,
         values,
