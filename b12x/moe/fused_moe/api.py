@@ -27,6 +27,7 @@ from ._impl import (
     b12x_route_experts_fast as route,
     b12x_sparse_moe_fp4 as run_sparse,
 )
+from .._shared.kernels.v41_reduce import reduce_v41_tp4_routes
 from .config import TrellisConfig
 from .execution import (
     ExecutionCapacity,
@@ -313,5 +314,6 @@ __all__ = [
     "route_topk",
     "run",
     "run_fc2",
+    "reduce_v41_tp4_routes",
     "run_sparse",
 ]

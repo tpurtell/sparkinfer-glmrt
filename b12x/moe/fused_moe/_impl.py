@@ -1101,6 +1101,14 @@ class TPMoEFP4Binding:
     def run(self) -> torch.Tensor:
         return b12x_moe_fp4(binding=self)
 
+    def run_route_partials(self) -> torch.Tensor:
+        """Return scratch-backed FP32 [token, route, hidden] V4.1 TP partials.
+
+        The view remains valid until this binding's scratch is reused; transport
+        must consume it before that reuse, with identical route order on every rank.
+        """
+        return b12x_moe_fp4(binding=self, return_route_partials=True)
+
 
 @dataclass(frozen=True, kw_only=True)
 class TPMoERouteBinding:
@@ -11473,7 +11481,9 @@ def _finalize_trellis_output(
     return target
 
 
-def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
+def b12x_moe_fp4(
+    *, binding: TPMoEFP4Binding, return_route_partials: bool = False
+) -> torch.Tensor:
     """Execute one fully planned, prepared, and scratch-bound FP4 MoE launch."""
     if not isinstance(binding, TPMoEFP4Binding):
         raise TypeError("binding must be a TPMoEFP4Binding")
@@ -11482,6 +11492,14 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     experts = binding.experts
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("binding.experts must be a B12XFP4ExpertWeights")
+    if return_route_partials:
+        if (
+            binding.implementation != "dynamic"
+            or experts.activation != "silu_v41"
+            or binding.route_output is None
+            or binding.route_output.dtype != torch.float32
+        ):
+            raise ValueError("route partials require a planned native V4.1 binding")
     if binding.implementation in {"trellis_mixed", "trellis_mixed3"}:
         from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
             MixedTrellisBinding,
@@ -11948,7 +11966,11 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
-    if output is None:
+    if return_route_partials:
+        # Dynamic deterministic execution writes only route_output; this unused
+        # ABI argument avoids allocating a token output on the transport path.
+        scatter_output = a
+    elif output is None:
         if torch.cuda.is_current_stream_capturing():
             raise ValueError("CUDA graph capture requires a caller-owned output buffer")
         scatter_output = torch.zeros(m, k, dtype=a.dtype, device=device)
@@ -12033,6 +12055,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 )
             ),
         )
+        if return_route_partials:
+            return s.route_output[:routed_rows].view(m, num_topk, k)
         if deterministic_output:
             _launch_dynamic_topk_sum(
                 route_output=s.route_output,
