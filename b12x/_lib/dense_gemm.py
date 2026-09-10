@@ -29,7 +29,7 @@
 # This file is ported from the CUTLASS dense block-scaled GEMM example
 # and adapted for the current Blackwell GeForce target.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, List, Literal, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -171,28 +171,29 @@ class _DenseGemmPlan:
 
 
 @triton.jit
-def _reduce_split_k2_bf16_kernel(
-    partials, out, total: tl.constexpr, BLOCK: tl.constexpr
+def _reduce_split_k_bf16_kernel(
+    partials, out, total: tl.constexpr, SLICES: tl.constexpr, BLOCK: tl.constexpr
 ) -> None:
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total
-    accum = tl.load(partials + offs, mask=mask).to(tl.float32)
-    accum += tl.load(partials + total + offs, mask=mask).to(tl.float32)
+    accum = tl.full((BLOCK,), 0, tl.float32)
+    for split in tl.static_range(SLICES):
+        accum += tl.load(partials + split * total + offs, mask=mask, other=0)
     tl.store(out + offs, accum, mask=mask)
 
 
-def _reduce_split_k2_bf16(
+def _reduce_split_k_bf16(
     partials: torch.Tensor, out: torch.Tensor, *, m: int, n: int
 ) -> None:
-    """Fused 2-way split-K FP32-partials reduction (exact); faster than torch.add.
-
-    Falls back to torch.add when the scratch/output layout is not the expected
-    [m, n, 2] / [m, n, 1] contiguous-row form.
-    """
+    """Sum every FP32 split, rounding only once when storing BF16 output."""
     total = int(m) * int(n)
+    if partials.ndim != 3 or partials.dtype != torch.float32:
+        raise ValueError("split-K reduction requires three-dimensional FP32 partials")
+    slices = int(partials.shape[2])
+    if slices not in (2, 4):
+        raise ValueError("split-K reduction supports two or four partial planes")
     if (
-        partials.shape == (m, n, 2)
+        partials.shape == (m, n, slices)
         and partials.stride() == (n, 1, total)
         and out.shape == (m, n, 1)
         and out.stride()[0] == n
@@ -200,9 +201,9 @@ def _reduce_split_k2_bf16(
     ):
         block = 1024
         grid = (triton.cdiv(total, block),)
-        _reduce_split_k2_bf16_kernel[grid](partials, out, total, BLOCK=block)
+        _reduce_split_k_bf16_kernel[grid](partials, out, total, slices, BLOCK=block)
     else:
-        torch.add(partials[:, :, 0], partials[:, :, 1], out=out[:, :, 0])
+        raise ValueError("split-K reduction requires contiguous FP32 partial planes")
 
 
 # @dsl_user_op on PersistentTileSchedulerParams.__init__ can rename attributes
@@ -6931,7 +6932,7 @@ def _dense_gemm_launch_functional_op(
         stream_int,
     )
     if split_k_output and not split_k_atomic_bf16:
-        _reduce_split_k2_bf16(c_tensor_gpu, out, m=m, n=n)
+        _reduce_split_k_bf16(c_tensor_gpu, out, m=m, n=n)
     return out
 
 
@@ -7500,6 +7501,7 @@ def dense_gemm_fused_quant_a(
     out: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
     sfb_k_replicated: bool = False,
+    precise_split_k: bool = False,
     rhs_values_tiled: Optional[torch.Tensor] = None,
     a_inner_span: int = 0,
     activation_scale_block_size: int = 32,
@@ -7508,6 +7510,8 @@ def dense_gemm_fused_quant_a(
     stream: object = None,
 ) -> torch.Tensor:
     """Small-M BF16-A -> MXFP8 GEMM with activation quantization in each CTA.
+
+    precise_split_k=True accumulates split results in FP32, with one BF16 rounding.
 
     a_inner_span > 0 reads A from an L-blocked source instead of contiguous
     rows: `source` is the `[M, span, K/span]` dense-GEMM mnl view over physical
@@ -7604,6 +7608,8 @@ def dense_gemm_fused_quant_a(
     )
     split_k_slices = policy.split_k_slices
     split_k_output = split_k_slices > 1
+    if precise_split_k:
+        policy = replace(policy, split_k_atomic_bf16=False)
     split_k_atomic_bf16 = split_k_output and policy.split_k_atomic_bf16
     if out is None:
         if _atomic_output_precleared:
@@ -7654,7 +7660,7 @@ def dense_gemm_fused_quant_a(
         cuda_stream_to_int(stream),
     )
     if split_storage is not None:
-        _reduce_split_k2_bf16(split_storage.permute(1, 2, 0), out, m=m, n=n)
+        _reduce_split_k_bf16(split_storage.permute(1, 2, 0), out, m=m, n=n)
     return out
 
 
@@ -7690,6 +7696,7 @@ def dense_gemm(
     load_path: Optional[Literal["tma", "cpasync"]] = None,
     swap_ab: Optional[bool] = None,
     sfb_k_replicated: bool = False,
+    precise_split_k: bool = False,
     rhs_values_tiled: Optional[torch.Tensor] = None,
     _quantized_c: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     stream: object = None,
@@ -7709,6 +7716,8 @@ def dense_gemm(
     _target_occupancy_override: Optional[int] = None,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
+
+    precise_split_k=True accumulates split results in FP32 before output rounding.
 
     expected_m: optional regime hint (DeepGEMM-style). When set, the default tile
     is chosen for that representative M instead of being M-independent, giving a
@@ -8116,10 +8125,6 @@ def dense_gemm(
                     f"to divide evenly across slices; got K={k}, BK={tile_k}, "
                     f"slices={_split_k_slices_override}"
                 )
-            if _split_k_slices_override > 2 and not _B12X_DENSE_SPLITK_TURBO:
-                raise ValueError(
-                    "four-way split-K requires the atomic-BF16 reduction path"
-                )
         policy = _DenseGemmPolicy(
             single_work_tile_per_cta=policy.single_work_tile_per_cta,
             direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
@@ -8169,6 +8174,8 @@ def dense_gemm(
         )
         split_k_slices = 1
     split_k_output = split_k_slices > 1
+    if precise_split_k:
+        policy = replace(policy, split_k_atomic_bf16=False)
     split_k_atomic_bf16 = split_k_output and policy.split_k_atomic_bf16
     if split_k_atomic_bf16:
         kernel_c_l = l
@@ -8509,7 +8516,7 @@ def dense_gemm(
     if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None
         assert out is not None
-        _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
+        _reduce_split_k_bf16(split_scratch, out, m=m, n=n)
         result = out
     if _B12X_TIMING:
         t_launch = time.perf_counter()

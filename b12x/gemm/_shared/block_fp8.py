@@ -172,9 +172,9 @@ def _check_block_size(block_size: Sequence[int]) -> tuple[int, int]:
     if len(block_size) != 2:
         raise ValueError(f"block_size must have two elements, got {block_size}")
     block_n, block_k = int(block_size[0]), int(block_size[1])
-    if (block_n, block_k) != (128, 128):
+    if (block_n, block_k) not in ((32, 32), (128, 128)):
         raise ValueError(
-            f"b12x block FP8 linear currently supports 128x128 weight blocks, got {block_size}"
+            f"b12x block FP8 linear supports 32x32 and 128x128 weight blocks, got {block_size}"
         )
     return block_n, block_k
 
@@ -422,13 +422,13 @@ def pack_block_fp8_linear_weight_mxfp8(
 ) -> BlockFP8LinearWeight:
     """Pack serialized block-FP8 linear weights for the native b12x MXFP8 GEMM.
 
-    The checkpoint weight stays in E4M3. The 128x128 DSV-style block scales are
+    The checkpoint weight stays in E4M3. The 32x32 or 128x128 checkpoint block scales are
     expanded once to the row/32-column UE8M0 scale layout consumed by SM120 MMA.
     """
 
     _check_gpu_tensor("weight", weight)
     _check_gpu_tensor("weight_scale", weight_scale)
-    _check_block_size(block_size)
+    block_size = _check_block_size(block_size)
     if weight.ndim != 2:
         raise ValueError(f"weight must have shape [N,K], got {tuple(weight.shape)}")
     out_features, in_features = weight.shape
@@ -441,12 +441,13 @@ def pack_block_fp8_linear_weight_mxfp8(
         m=out_features,
         k=in_features,
         num_groups=1,
+        block_size=block_size,
     )
     return BlockFP8LinearWeight(
         weight=packed,
         in_features=in_features,
         out_features=out_features,
-        block_size=(128, 128),
+        block_size=block_size,
     )
 
 
@@ -601,6 +602,7 @@ def _block_fp8_linear_mxfp8_fused_op(
     out_features: int,
     expected_m: int,
     activation_block_size: int,
+    sfb_k_replicated: bool,
     stream_int: int | None,
 ) -> torch.Tensor:
     # Fused, fully opaque block-FP8 linear: quantize + dense GEMM run INSIDE this
@@ -616,7 +618,8 @@ def _block_fp8_linear_mxfp8_fused_op(
             weight_values.reshape(out_features, in_features, 1),
             weight_scale_mma,
             expected_m=None if expected_m == 0 else expected_m,
-            sfb_k_replicated=True,
+            sfb_k_replicated=sfb_k_replicated,
+            precise_split_k=not sfb_k_replicated,
             activation_scale_block_size=activation_block_size,
             stream=stream_int,
         )[:, :, 0]
@@ -632,9 +635,9 @@ def _block_fp8_linear_mxfp8_fused_op(
         c_dtype=_c_dtype_name(source_2d.dtype),
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=None if expected_m == 0 else expected_m,
-        # Weight scales come from 128x128 blocks expanded to per-32 rows, so
-        # the four SFB bytes per 128-wide k tile are identical by construction.
-        sfb_k_replicated=True,
+        # Only 128x128 checkpoint blocks allow replicated K32 weight scales.
+        sfb_k_replicated=sfb_k_replicated,
+        precise_split_k=not sfb_k_replicated,
         stream=stream_int,
     )[:, :, 0]
 
@@ -649,6 +652,7 @@ def _block_fp8_linear_mxfp8_fused_fake(
     out_features: int,
     expected_m: int,
     activation_block_size: int,
+    sfb_k_replicated: bool,
     stream_int: int | None,
 ) -> torch.Tensor:
     del stream_int
@@ -732,6 +736,7 @@ def block_fp8_linear_mxfp8(
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else 0,
             int(activation_block_size),
+            packed_weight.block_size[1] == 128,
             stream_int,
         )
         if bias is not None:
@@ -764,7 +769,8 @@ def block_fp8_linear_mxfp8(
             packed_weight.weight.scale_mma,
             out=output_storage,
             expected_m=expected_m,
-            sfb_k_replicated=True,
+            sfb_k_replicated=packed_weight.block_size[1] == 128,
+            precise_split_k=packed_weight.block_size[1] == 32,
             activation_scale_block_size=int(activation_block_size),
             stream=stream,
         )[:, :, 0]
@@ -793,7 +799,8 @@ def block_fp8_linear_mxfp8(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=output_storage,
         expected_m=expected_m,
-        sfb_k_replicated=True,
+        sfb_k_replicated=packed_weight.block_size[1] == 128,
+        precise_split_k=packed_weight.block_size[1] == 32,
         stream=stream,
     )[:, :, 0]
     t_gemm = time.perf_counter() if _B12X_TIMING else 0.0
