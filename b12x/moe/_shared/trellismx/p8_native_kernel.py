@@ -778,6 +778,10 @@ class P8NativeTPMoE:
             if self.deterministic_output
             else output
         )
+        # Grouped dispatch omits nonlocal (-1) EP routes. The reducer still
+        # visits every top-k slot, so skipped slots must start at zero.
+        if self.ep_size > 1 and not small_m:
+            kernel_output.zero_()
         launch_mac = arm.mac
         if self.grid_policy and self.world_size == 4 and self.mac_override is None:
             from .p8_multirow_scratch import direct_grid_capacity
