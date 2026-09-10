@@ -131,3 +131,44 @@ def test_v41_native_expert_routing_and_graph(m, n, experts):
     graph.replay()
     assert torch.cuda.memory_allocated() == before
     check(result, expected_changed)
+
+
+@pytest.mark.parametrize("m,n", [(1,576),(16,576),(80,576),(1,2304),(16,2304),(80,2304)])
+def test_v41_expert_tiny_activation_floor_and_graph(m,n):
+    """Isolate FC1 and FC2 floors with constant exact FP4 weights and changed inputs."""
+    require_b12x()
+    h,experts = 5120,8
+    topk = 6 if n == 576 else 3
+    x = torch.full((m,h),1e-10,device="cuda",dtype=torch.bfloat16)
+    ids = torch.arange(topk,device="cuda",dtype=torch.int32).expand(m,topk).contiguous()
+    routing = torch.ones((m,topk),device="cuda")
+    weights,scales = {},{}
+    for name,shape in [("w1",(experts,n,h//2)),("w3",(experts,n,h//2)),("w2",(experts,h,n//2))]:
+        weights[name] = torch.full(shape,0x22,device="cuda",dtype=torch.uint8)
+        scales[name] = torch.full((*shape[:-1],shape[-1]//16),121 if name == "w2" else 137,
+                                  device="cuda",dtype=torch.uint8)
+    ones = torch.ones(experts,device="cuda")
+    prepared = prepare_tp_moe_fp4_experts(
+        a=x,a1_gscale=ones,w1_fp4=torch.cat((weights["w3"],weights["w1"]),1),
+        w1_blockscale=torch.cat((scales["w3"],scales["w1"]),1),w1_alphas=ones,
+        a2_gscale=ones,w2_fp4=weights["w2"],w2_blockscale=scales["w2"],
+        w2_alphas=ones,quant_mode="w4a8_mx",source_format="fp4_e8m0_k32",activation="silu_v41")
+    binding = make_tp_moe_fp4_binding(a=x,experts=prepared,topk_weights=routing,topk_ids=ids,
+        quant_mode="w4a8_mx",swiglu_limit=10,output=torch.empty_like(x))
+    result = binding.run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = binding.run()
+    # Tiny input below E4M3's minimum after the floor; tiny routed intermediate;
+    # nonzero tiny input amplified by weights; nonzero tiny routed intermediate.
+    for value,route,zero in [(1e-10,1.0,True),(.0002,1e-12,True),(1e-8,1.0,False),(.0002,1e-7,False)]:
+        x.fill_(value)
+        routing.fill_(route)
+        ids.add_(1).remainder_(experts)
+        expected = reference(x,ids,routing,weights,scales).bfloat16()
+        assert bool((expected == 0).all()) == zero
+        graph.replay()
+        assert torch.equal(result,expected), (m,n,value,route,(result.float()-expected.float()).abs().max().item())
+    torch.cuda.synchronize()
+    graph.reset()

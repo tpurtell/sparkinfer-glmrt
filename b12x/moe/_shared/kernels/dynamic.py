@@ -1475,6 +1475,14 @@ class MoEDynamicKernelBackend:
         )
 
     @cute.jit
+    def _quantize_w4a8_block(self, values: cute.Tensor, max_abs: cutlass.Float32):
+        # Official V4.1 applies the same floor before both FC1 input
+        # quantization and routed, BF16-rounded FC2 intermediate quantization.
+        if cutlass.const_expr(self.is_v41):
+            max_abs = fmax_f32(max_abs, cutlass.Float32(1.0e-4))
+        return quantize_block_fp8_mx(values, max_abs)
+
+    @cute.jit
     def _gated_activation_value(self, gate: cutlass.Float32, up: cutlass.Float32):
         if cutlass.const_expr(self.is_v41):
             gate = gate.to(cutlass.BFloat16).to(cutlass.Float32)
@@ -2984,12 +2992,12 @@ class MoEDynamicKernelBackend:
                         m1_block_start,
                     )
                     if cutlass.const_expr(self.w4a8_trellis):
-                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
+                        m1_payload, m1_mx_scale_byte = self._quantize_w4a8_block(
                             _w4a8_trellis_permute_k32(m1_values),
                             m1_block_max,
                         )
                     else:
-                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
+                        m1_payload, m1_mx_scale_byte = self._quantize_w4a8_block(
                             m1_values,
                             m1_block_max,
                         )
@@ -3229,7 +3237,7 @@ class MoEDynamicKernelBackend:
                                         )
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
+                                                self._quantize_w4a8_block(
                                                     _w4a8_trellis_permute_k32(
                                                         values
                                                     ),
@@ -3238,7 +3246,7 @@ class MoEDynamicKernelBackend:
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
+                                                self._quantize_w4a8_block(
                                                     values, block_max
                                                 )
                                             )
@@ -3316,7 +3324,7 @@ class MoEDynamicKernelBackend:
                                         )
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
+                                                self._quantize_w4a8_block(
                                                     _w4a8_trellis_permute_k32(
                                                         values
                                                     ),
@@ -3325,7 +3333,7 @@ class MoEDynamicKernelBackend:
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
+                                                self._quantize_w4a8_block(
                                                     values, block_max
                                                 )
                                             )
@@ -3666,7 +3674,7 @@ class MoEDynamicKernelBackend:
                                             block_max = fmax_f32(block_max, fabs_f32(value))
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
+                                                self._quantize_w4a8_block(
                                                     _w4a8_trellis_permute_k32(
                                                         values
                                                     ),
@@ -3675,7 +3683,7 @@ class MoEDynamicKernelBackend:
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
+                                                self._quantize_w4a8_block(
                                                     values, block_max
                                                 )
                                             )
@@ -6225,12 +6233,12 @@ class MoEDynamicKernelBackend:
                                     values[elem_idx] = value
                                     block_max = fmax_f32(block_max, fabs_f32(value))
                                 if cutlass.const_expr(self.w4a8_trellis):
-                                    payload, mx_scale_byte = quantize_block_fp8_mx(
+                                    payload, mx_scale_byte = self._quantize_w4a8_block(
                                         _w4a8_trellis_permute_k32(values),
                                         block_max,
                                     )
                                 else:
-                                    payload, mx_scale_byte = quantize_block_fp8_mx(
+                                    payload, mx_scale_byte = self._quantize_w4a8_block(
                                         values, block_max
                                     )
                                 pay_addr = (
