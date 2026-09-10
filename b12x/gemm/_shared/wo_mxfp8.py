@@ -893,14 +893,19 @@ def _expand_block_scales_to_mxfp8_rows(
     m: int,
     k: int,
     num_groups: int,
+    block_size: tuple[int, int] = (128, 128),
 ) -> torch.Tensor:
     _check_gpu_tensor("scale", scale)
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
     _check_mxfp8_k(k)
 
-    m_tiles = math.ceil(m / MXFP8_SCALE_ROW_TILE)
-    k_tiles = math.ceil((k // MXFP8_SCALE_VEC_SIZE) / MXFP8_SCALE_K_TILE)
+    block_n, block_k = block_size
+    if block_size not in ((32, 32), (128, 128)):
+        raise ValueError(f"unsupported FP8 block size: {block_size}")
+    scale_k_repeat = block_k // MXFP8_SCALE_VEC_SIZE
+    m_tiles = math.ceil(m / block_n)
+    k_tiles = math.ceil(k / block_k)
     expected_2d = (num_groups * m_tiles, k_tiles)
     expected_3d = (num_groups, m_tiles, k_tiles)
     if scale.shape == expected_2d:
@@ -919,11 +924,11 @@ def _expand_block_scales_to_mxfp8_rows(
 
     scale_rows_u8 = (
         block_u8[:, :, None, :, None]
-        .expand(num_groups, m_tiles, MXFP8_SCALE_ROW_TILE, k_tiles, MXFP8_SCALE_K_TILE)
+        .expand(num_groups, m_tiles, block_n, k_tiles, scale_k_repeat)
         .reshape(
             num_groups,
-            m_tiles * MXFP8_SCALE_ROW_TILE,
-            k_tiles * MXFP8_SCALE_K_TILE,
+            m_tiles * block_n,
+            k_tiles * scale_k_repeat,
         )[:, :m, : k // MXFP8_SCALE_VEC_SIZE]
         .contiguous()
     )
@@ -1119,10 +1124,11 @@ def pack_fp8_block_scaled_weight_mxfp8(
     m: int,
     k: int,
     num_groups: int = 1,
+    block_size: tuple[int, int] = (128, 128),
 ) -> MXFP8Rows:
     """Pack checkpoint FP8 block-scaled weights for native MXFP8 dense GEMM.
 
-    `weight` is FP8 E4M3 and `scale` is the DSV4-style 128x128 block scale.
+    `weight` is FP8 E4M3 and `scale` uses 128x128 or native V4.1 32x32 blocks.
 
     When `scale` is an *arbitrary* fp32 block scale (the DeepSeek
     `weight_scale_inv` checkpoint format), the weight is **re-quantized** onto an
@@ -1132,6 +1138,9 @@ def pack_fp8_block_scaled_weight_mxfp8(
     FP8 values are kept verbatim and the scale is expanded as-is.
     """
 
+    block_size = tuple(block_size)
+    if block_size not in ((32, 32), (128, 128)):
+        raise ValueError(f"unsupported FP8 block size: {block_size}")
     _check_gpu_tensor("weight", weight)
     if weight.dtype != torch.float8_e4m3fn:
         raise ValueError(f"weight must be float8_e4m3fn, got {weight.dtype}")
@@ -1145,6 +1154,8 @@ def pack_fp8_block_scaled_weight_mxfp8(
     # that are already exact UE8M0 (e8m0/uint8, or a float tensor holding only
     # powers of two) keep their FP8 values verbatim.
     if not _scale_is_exact_ue8m0(scale):
+        if block_size == (32, 32):
+            raise ValueError("32x32 checkpoint scales must be exact UE8M0; requantization is unsupported")
         _check_gpu_tensor("scale", scale)
         weight, scale = _requantize_block_fp8_to_ue8m0(
             weight, scale, m=m, k=k, num_groups=num_groups
@@ -1170,6 +1181,7 @@ def pack_fp8_block_scaled_weight_mxfp8(
 
     scale_rows = _expand_block_scales_to_mxfp8_rows(
         scale,
+        block_size=block_size,
         m=m,
         k=k,
         num_groups=num_groups,

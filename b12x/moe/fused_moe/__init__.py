@@ -109,6 +109,7 @@ META = OpMeta(
         "route_topk",
         "run",
         "run_fc2",
+        "reduce_v41_tp4_routes",
         "run_sparse",
     ),
     dtypes=("bf16", "fp16"),

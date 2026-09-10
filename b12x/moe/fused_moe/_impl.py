@@ -44,6 +44,7 @@ from b12x.moe._shared.kernels.relu2 import (
 )
 from b12x.moe._shared.kernels.silu import (
     MoEDynamicKernelSilu,
+    MoEDynamicKernelSiluV41,
     MoEDynamicKernelSwiGLUOAI,
     MoEMicroKernelSilu,
     MoEMicroKernelSwiGLUOAI,
@@ -1162,6 +1163,14 @@ class TPMoEFP4Binding:
     def run(self) -> torch.Tensor:
         return b12x_moe_fp4(binding=self)
 
+    def run_route_partials(self) -> torch.Tensor:
+        """Return scratch-backed FP32 [token, route, hidden] V4.1 TP partials.
+
+        The view remains valid until this binding's scratch is reused; transport
+        must consume it before that reuse, with identical route order on every rank.
+        """
+        return b12x_moe_fp4(binding=self, return_route_partials=True)
+
 
 @dataclass(frozen=True, kw_only=True)
 class TPMoERouteBinding:
@@ -1278,6 +1287,10 @@ class _ActivationKernelSpec:
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
             )
+        if self.micro_kernel_cls is None:
+            raise NotImplementedError(
+                f"{self.activation} requires the dynamic native FP4/FP8 kernel"
+            )
         return self.micro_kernel_cls(**kernel_kwargs)
 
     def make_dynamic_kernel(
@@ -1298,6 +1311,12 @@ class _ActivationKernelSpec:
 
 
 _ACTIVATION_KERNEL_SPECS = {
+    "silu_v41": _ActivationKernelSpec(
+        activation="silu_v41",
+        is_gated=True,
+        micro_kernel_cls=None,
+        dynamic_kernel_cls=MoEDynamicKernelSiluV41,
+    ),
     "silu": _ActivationKernelSpec(
         activation="silu",
         is_gated=True,
@@ -1676,6 +1695,10 @@ def _select_dynamic_tile_mn(
         return planned_tile_m, _LEVEL_TILE_N
     routed_rows = max(1, int(routed_rows))
     num_experts = max(1, int(num_experts))
+    if activation == "silu_v41":
+        # Keep the routed BF16 boundary inside the fused FP4/FP8 kernel.
+        # Larger tiles require the materialized executor's separate boundary.
+        return (16 if routed_rows <= 16 * num_experts else 32, 128)
     if quant_mode in _W6A8_QUANT_MODES:
         # The MX-FP6 dynamic kernel builds only the (128, 128) MMA tile (its
         # ctor rejects everything else), so the M16-M64 ladder does not exist
@@ -3166,7 +3189,10 @@ def _plan_core_workspace(
         raise ValueError(
             "full_rotation_output_dtype is only valid for full-rotation Trellis"
         )
-    deterministic_output = bool(deterministic_output and implementation == "dynamic")
+    deterministic_output = bool(
+        (deterministic_output or activation == "silu_v41")
+        and implementation == "dynamic"
+    )
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
         swiglu_limit,
@@ -3824,7 +3850,11 @@ def _plan_core_workspace(
             _TensorAllocSpec(
                 "token_weights", (dynamic_rows_padded,), torch.float32, init="zeros"
             ),
-            _TensorAllocSpec("route_output", (route_output_rows, int(k)), dtype),
+            _TensorAllocSpec(
+                "route_output",
+                (route_output_rows, int(k)),
+                torch.float32 if activation == "silu_v41" else dtype,
+            ),
             _TensorAllocSpec(
                 "materialized_intermediate",
                 (materialized_intermediate_rows, int(k)),
@@ -11020,7 +11050,12 @@ def _get_dynamic_kernel(
         (E,),
         assumed_align=16,
     )
-    scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    scatter_fake = make_ptr(
+        cutlass.Float32 if activation == "silu_v41" else a_dtype,
+        16,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     token_weights_fake = make_ptr(
         alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
@@ -11470,7 +11505,10 @@ def _launch_dynamic_flat(
         w1_alpha,
         w2_alpha,
         down_input_scale,
-        _gptr(cutlass.BFloat16, scatter_output),
+        _gptr(
+            cutlass.Float32 if activation == "silu_v41" else cutlass.BFloat16,
+            scatter_output,
+        ),
         _gptr(cutlass.Int32, token_map, 4),
         _gptr(cutlass.Float32, token_weights, 4),
         m,
@@ -11910,6 +11948,39 @@ def _launch_dynamic(
     )
 
 
+@triton.jit
+def _v41_topk_sum_kernel(
+    routes,
+    output,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    row, col = offsets // K, offsets % K
+    total = tl.full((BLOCK,), 0, tl.float32)
+    for route in range(TOPK):
+        value = tl.load(routes + (row * TOPK + route) * K + col, mask=row < M, other=0)
+        # Official Expert returns BF16 once, after its complete FC2 reduction.
+        total += value.to(tl.bfloat16).to(tl.float32)
+    tl.store(output + offsets, total, mask=row < M)
+
+
+@torch.library.custom_op("b12x::v41_topk_sum", mutates_args={"output"})
+def _v41_topk_sum_launch(
+    routes: torch.Tensor, output: torch.Tensor, m: int, topk: int, k: int
+) -> None:
+    if routes.dtype != torch.float32 or output.dtype != torch.bfloat16:
+        raise TypeError("V4.1 reduction requires FP32 routes and BF16 output")
+    _v41_topk_sum_kernel[(triton.cdiv(m * k, 256),)](routes, output, m, k, topk, 256)
+
+
+@_v41_topk_sum_launch.register_fake
+def _v41_topk_sum_fake(routes, output, m, topk, k):
+    return None
+
+
 def _launch_dynamic_topk_sum(
     *,
     route_output: torch.Tensor,
@@ -11924,6 +11995,9 @@ def _launch_dynamic_topk_sum(
             "top-k reduction exceeds the planned route-output capacity: "
             f"need {m * num_topk * k} elements, got {route_output.numel()}"
         )
+    if route_output.dtype == torch.float32:
+        _v41_topk_sum_launch(route_output, output, m, num_topk, k)
+        return
     from b12x.moe._shared.kernels.w4a16.kernel import (
         compile_w4a16_topk_sum,
     )
@@ -12563,7 +12637,9 @@ def _finalize_trellis_output(
     return target
 
 
-def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
+def b12x_moe_fp4(
+    *, binding: TPMoEFP4Binding, return_route_partials: bool = False
+) -> torch.Tensor:
     """Execute one fully planned, prepared, and scratch-bound FP4 MoE launch."""
     if not isinstance(binding, TPMoEFP4Binding):
         raise TypeError("binding must be a TPMoEFP4Binding")
@@ -12572,6 +12648,14 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     experts = binding.experts
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("binding.experts must be a B12XFP4ExpertWeights")
+    if return_route_partials:
+        if (
+            binding.implementation != "dynamic"
+            or experts.activation != "silu_v41"
+            or binding.route_output is None
+            or binding.route_output.dtype != torch.float32
+        ):
+            raise ValueError("route partials require a planned native V4.1 binding")
     if binding.implementation in {"trellis_mixed", "trellis_mixed3"}:
         from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
             MixedTrellisBinding,
@@ -13055,7 +13139,11 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         flat_ids = _flatten_routing_ids(topk_ids)
         flat_weights = _flatten_routing_weights(topk_weights)
 
-    if output is None:
+    if return_route_partials:
+        # Dynamic deterministic execution writes only route_output; this unused
+        # ABI argument avoids allocating a token output on the transport path.
+        scatter_output = a
+    elif output is None:
         if torch.cuda.is_current_stream_capturing():
             raise ValueError("CUDA graph capture requires a caller-owned output buffer")
         scatter_output = torch.zeros(m, k, dtype=a.dtype, device=device)
@@ -13156,6 +13244,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 )
             ),
         )
+        if return_route_partials:
+            return s.route_output[:routed_rows].view(m, num_topk, k)
         if deterministic_output:
             _launch_dynamic_topk_sum(
                 route_output=s.route_output,
