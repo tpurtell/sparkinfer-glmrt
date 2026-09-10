@@ -25,11 +25,12 @@ from .p8_coupled_scales import (
     validate_coupled_component,
     validate_scale_component,
 )
-from .p8_smallm_schedule import P8SmallMGeometry, p8_small_m_scratch_layout, use_small_m
+from .policy_smallm_schedule import P8SmallMGeometry, p8_small_m_scratch_layout, use_small_m
+from .tile_policy import select_tile
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.utils import get_max_active_clusters
-from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+from b12x.moe._shared.kernels.route_hoist_dynamic import MoEDynamicKernelBackend
 from b12x.moe.fused_moe._impl import (
     _DynamicMoEW4A8Launch,
     _e8m0_scale_to_w4a8_sfb_inplace,
@@ -131,8 +132,8 @@ class P8NativeTPMoE:
         self.shared_workspace = bool(shared_workspace)
         self.tp_rank = int(tp_rank)
         self.world_size = int(world_size)
-        if self.world_size not in (2,4) or self.tp_rank not in range(self.world_size):
-            raise ValueError("P8 native requires TP2/TP4 rank")
+        if self.world_size != 4 or self.tp_rank not in range(4):
+            raise ValueError("P8 native supports TP4 only; TP2 validators are unsupported")
         self.layer = int(layer)
         if not 3 <= self.layer <= 44:
             raise ValueError("P8 native layer must be in GLM routed layers 3..44")
@@ -260,6 +261,10 @@ class P8NativeTPMoE:
         self.experts = experts
         self.scale_component = None
         self.full_coupled = bool(full_coupled_schema)
+        if (self.grouped_m16 or self.fuse_grouped_scratch) and not self.full_coupled:
+            raise ValueError("grouped scratch requires the full-coupled kernel owner")
+        if self.fuse_grouped_scratch and not self.grouped_m16:
+            raise ValueError("fused grouped scratch requires grouped_m16")
         if self.shared_workspace and (not self.full_coupled or self.debug_capture or self.fuse_scratch_zero):
             raise ValueError('shared workspace requires full coupling without retained debug tensors or fused arena')
         if self.compact_scale_storage and not self.full_coupled:
@@ -380,16 +385,17 @@ class P8NativeTPMoE:
         self._compiled: dict[tuple[bool, bool], _CompiledArm] = {}
         self._coupled_reducer = None
 
-    def _compile(self, materialized: bool, small_m: bool = False) -> _CompiledArm:
+    def _compile(self, materialized: bool, small_m: bool = False, expected_m: int | None = None) -> _CompiledArm:
         if self.compact_scale_storage and not (self.full_coupled and materialized):
             raise RuntimeError("compact scales cannot enter a monolithic path")
-        cache_key = (materialized, small_m)
+        selected_m = select_tile(expected_m if expected_m is not None else (1 if small_m else 4096))[0]
+        cache_key = (materialized, small_m, selected_m)
         cached = self._compiled.get(cache_key)
         if cached is not None:
             return cached
-        tile_m = 64 if materialized and not small_m else 16
+        tile_m = selected_m
         if self.grouped_m16:
-            tile_m = 16
+            raise RuntimeError("fixed M16 override conflicts with requested tile policy")
         mac = (
             self.mac_override
             if self.mac_override is not None
@@ -516,17 +522,20 @@ class P8NativeTPMoE:
             current_cuda_stream(),
             fake_ptr_u8(),
             ptr(cutlass.Float16, 16),
-            # The explicit spec IS the JIT cache key, in memory and on disk. Every
-            # field the kernel is specialised on must appear here: the stored
-            # trellis rate was missing, so in a mixed-rate model the first rate
-            # compiled per rank was served for every layer (K3, K4 and K5 alike),
-            # while single-rate closures could never see it. Version 2 retires
-            # any rate-less cache entries. Version 3 also retires pre-TP2
-            # epilogue specializations while retaining the stored-rate field.
+            # The compile spec is the JIT cache key and includes every specialized
+            # field, especially stored rate, topology and epilogue dimensions.
             compile_spec=KernelCompileSpec.from_fields(
                 "glm53.p8.native.tp",
-                3,
+                4,
+                ("fc1_row_alias376", 1),
+                ("requested_m_regime_direct_policy", 1),
+                ("fc1_route_hoist", 1),
+                ("tile_m", tile_m),
                 ("trellis_bits", self.trellis_bits),
+                ("mcg_k5_funnel", int(small_m and self.trellis_bits == 5)),
+                ("fc2_carveout100_grid564", int(small_m)),
+                ("fc2_k5_funnel", int(small_m and self.trellis_bits == 5)),
+                ("grouped_fc2_grid376", int(not small_m)),
                 ("tile_major_tasks", int(self.tile_major_tasks and small_m)),
                 ("fc1_pipeline_stages", self.fc1_pipeline_stages if small_m else 2),
                 ("fc1_warps", self.fc1_warps if small_m else 4),
@@ -576,7 +585,7 @@ class P8NativeTPMoE:
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_fields(
                 "glm53.p8.coupled_topk_h512",
-                1,
+                2,
                 ("topk", self.topk),
                 ("hidden", self.hidden),
                 ("rank", self.tp_rank),
@@ -631,7 +640,7 @@ class P8NativeTPMoE:
             small_m = m <= 16 and not self.grouped_m16
             materialized = True
         materialized = materialized or small_m
-        arm = self._compile(materialized, small_m=small_m)
+        arm = self._compile(materialized, small_m=small_m, expected_m=m)
         tile_m = arm.tile_m
         x = x.contiguous()
         flat_ids = topk_ids.to(dtype=torch.int32).contiguous().reshape(-1)
@@ -648,10 +657,12 @@ class P8NativeTPMoE:
         shared_kernel_output = None
         if fused_scratch_zero or self.shared_workspace:
             if fused_scratch_zero:
-                from .p8_multirow_scratch import direct_scratch_layout, grouped_m16_scratch_layout
-                self._scratch_layout = (direct_scratch_layout(m, self.intermediate) if small_m
-                    else grouped_m16_scratch_layout(m, self.intermediate, self.compact_input_storage))
-            layout = (p8_small_m_scratch_layout(intermediate=self.intermediate, tokens=m, shared=True)
+                from .direct_policy_scratch import direct_scratch_layout
+                self._scratch_layout = (direct_scratch_layout(m, self.intermediate, tile_m=tile_m) if small_m
+                    else p8_small_m_scratch_layout(intermediate=self.intermediate, tokens=m,
+                        shared=True, grouped=True, tile_m=tile_m, direct=False))
+            layout = (p8_small_m_scratch_layout(intermediate=self.intermediate, tokens=m, shared=True,
+                          grouped=self.full_coupled and materialized and not small_m, tile_m=tile_m, direct=small_m)
                       if self.shared_workspace else self._scratch_layout)
             assert layout is not None
             # A single GPU fill initializes all original bytes plus alignment

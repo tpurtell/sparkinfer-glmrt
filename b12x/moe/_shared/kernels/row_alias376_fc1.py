@@ -117,6 +117,7 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
     owned_row_groups = 4
     scale_sandwich = False
     diagnostic_raw_fc1 = False
+    p8_row_interleaved = False
 
     def __init__(self, tile_n: int, *, trellis_bits: int = 4):
         if tile_n not in (32, 64):
@@ -786,10 +787,18 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
             expert_idx
         ].to(cutlass.Float32)
         epilogue_base = smem_base
+        projection_row_stride = Int32(self.tile_n)
         up_epilogue_base = epilogue_base + Int32(self.tile_m * self.tile_n * 2)
+        if cutlass.const_expr(self.p8_row_interleaved):
+            projection_row_stride = Int32(2 * self.tile_n)
+            up_epilogue_base = epilogue_base + Int32(self.tile_n * 2)
         full_output_base = (
             up_epilogue_base + Int32(self.tile_m * self.tile_n * 2)
         )
+        if cutlass.const_expr(self.p8_row_interleaved):
+            # One warp owns each row. Both gate/up segments are fully read
+            # into registers before that warp overwrites its own row.
+            full_output_base = epilogue_base
         col_base = warp_idx * Int32(8 * self.p8_n8_per_warp) + (c << Int32(1))
         # Identity keeps gate/up FP32 through clipped SwiGLU.  The scale
         # sandwich instead persists both physical projections as FP16, then a
@@ -804,7 +813,7 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
                 if cutlass.const_expr(self.scale_sandwich):
                     st_shared_u32(
                         epilogue_base
-                        + (row_lo * Int32(self.tile_n) + col) * Int32(2),
+                        + (row_lo * projection_row_stride + col) * Int32(2),
                         _p8_pack_f32x2_to_half2(
                             alpha_value * gate_fragment[0],
                             alpha_value * gate_fragment[1],
@@ -812,7 +821,7 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
                     )
                     st_shared_u32(
                         epilogue_base
-                        + (row_hi * Int32(self.tile_n) + col) * Int32(2),
+                        + (row_hi * projection_row_stride + col) * Int32(2),
                         _p8_pack_f32x2_to_half2(
                             alpha_value * gate_fragment[2],
                             alpha_value * gate_fragment[3],
@@ -820,7 +829,7 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
                     )
                     st_shared_u32(
                         up_epilogue_base
-                        + (row_lo * Int32(self.tile_n) + col) * Int32(2),
+                        + (row_lo * projection_row_stride + col) * Int32(2),
                         _p8_pack_f32x2_to_half2(
                             alpha_value * up_fragment[0],
                             alpha_value * up_fragment[1],
@@ -828,7 +837,7 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
                     )
                     st_shared_u32(
                         up_epilogue_base
-                        + (row_hi * Int32(self.tile_n) + col) * Int32(2),
+                        + (row_hi * projection_row_stride + col) * Int32(2),
                         _p8_pack_f32x2_to_half2(
                             alpha_value * up_fragment[2],
                             alpha_value * up_fragment[3],
@@ -849,12 +858,12 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
                     )
                     st_shared_u32(
                         epilogue_base
-                        + (row_lo * Int32(self.tile_n) + col) * Int32(2),
+                        + (row_lo * projection_row_stride + col) * Int32(2),
                         pack_f32x2_to_bfloat2(act0, act1),
                     )
                     st_shared_u32(
                         epilogue_base
-                        + (row_hi * Int32(self.tile_n) + col) * Int32(2),
+                        + (row_hi * projection_row_stride + col) * Int32(2),
                         pack_f32x2_to_bfloat2(act2, act3),
                     )
 
@@ -921,12 +930,12 @@ class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
                             source_col = Int32(segment * 64) + (atom >> Int32(1)) * Int32(32) + within
                             source_addr = (
                                 epilogue_base
-                                + (hrow * Int32(128) + source_col) * Int32(2)
+                                + (hrow * projection_row_stride + source_col) * Int32(2)
                             )
                             if (atom & Int32(1)) != Int32(0):
                                 source_addr = (
                                     up_epilogue_base
-                                    + (hrow * Int32(128) + source_col) * Int32(2)
+                                    + (hrow * projection_row_stride + source_col) * Int32(2)
                                 )
                             raw_values[component] = _p8_ld_shared_f16_to_f32(source_addr)
                         p0, p1, p2, p3 = _w4a8_had128_quad(

@@ -51,7 +51,7 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
-from b12x.moe._shared.kernels.w4a8_mcg_decode import (
+from b12x.moe._shared.kernels.mcg_k5_funnel import (
     w4a8_trellis_pair_words_dispatch,
 )
 

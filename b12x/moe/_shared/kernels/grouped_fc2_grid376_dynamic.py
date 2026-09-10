@@ -1237,7 +1237,7 @@ class MoEDynamicKernelBackend:
             ),
         )
         if self.p8_small_m:
-            from b12x.moe._shared.kernels.p8_small_m import P8SmallMPhase2Kernel
+            from b12x.moe._shared.kernels.fc2_k5_funnel import P8SmallMPhase2Kernel
             self.materialized_phase2_kernel = P8SmallMPhase2Kernel(
                 trellis_bits=trellis_bits
             )
@@ -1252,16 +1252,16 @@ class MoEDynamicKernelBackend:
             self.materialized_phase1_kernel = P8GroupedM16FC1Kernel(trellis_bits=trellis_bits)
             self.materialized_phase2_kernel = P8GroupedM16FC2Kernel(trellis_bits=trellis_bits)
         elif self.p8_full_coupled and self.w4a8_m64_materialized:
-            from b12x.moe._shared.kernels.p8_coupled_prefill_fc1 import (
+            from b12x.moe._shared.kernels.row_alias376_prefill_fc1 import (
                 P8CoupledPrefillFC1Kernel,
             )
-            from b12x.moe._shared.kernels.p8_coupled_prefill_fc2 import (
+            from b12x.moe._shared.kernels.grouped_fc2_grid376 import (
                 P8CoupledPrefillFC2Kernel,
             )
             self.materialized_phase1_kernel = P8CoupledPrefillFC1Kernel(trellis_bits=trellis_bits)
             self.materialized_phase2_kernel = P8CoupledPrefillFC2Kernel(trellis_bits=trellis_bits)
         elif self.p8_scale_sandwich:
-            from b12x.moe._shared.kernels.p8_h128_fc1 import P8H128FC1Kernel
+            from b12x.moe._shared.kernels.k5_funnel_fc1 import P8H128FC1Kernel
             self.materialized_phase1_kernel = P8H128FC1Kernel(
                 full_coupled=self.p8_full_coupled,
                 trellis_bits=trellis_bits,

@@ -51,7 +51,7 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
-from b12x.moe._shared.kernels.w4a8_mcg_decode import (
+from b12x.moe._shared.kernels.mcg_k5_funnel import (
     w4a8_trellis_pair_words_dispatch,
 )
 
@@ -1323,3 +1323,10 @@ class P8H128FC1RawCaptureKernel(P8H128FC1Kernel):
 
     def __init__(self):
         super().__init__(full_coupled=True)
+
+
+class P8DirectM32FC1Kernel(P8H128FC1Kernel):
+    tile_m = 32
+    source_tile_m = 32
+    mma_m_blocks = 2
+    owned_row_groups = 8

@@ -128,7 +128,7 @@ class P8NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
         expert_idx: Int32,
         local_col: Int32,
     ) -> cutlass.Float32:
-        """Apply private down suh with Luke's FP32-mul -> FP16-store order."""
+        """Apply private down suh with FP32 multiply followed by FP16 store before H128 (p8_coupled_scales.py)."""
 
         scale_idx = (
             Int32(4096)

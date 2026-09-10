@@ -1,8 +1,8 @@
-"""Exact full-coupled P8 M64/N128 FC1 for materialized prefill.
+"""Exact full-coupled P8 M32/N128 FC1 for materialized prefill.
 
 This specializes the CPU/static-validated N128 owner used by decode.  It
 changes only M ownership and grouped-task traversal: four M16 MMA fragments
-cover an M64 tile, while every H128 transform remains inside one CTA.  The
+cover an M32 tile, while every H128 transform remains inside one CTA.  The
 procedural-MCG stream, E4M3/UE8M0/32 operands and native mxf8f6f4 MMA are
 unchanged. The stored rate comes from ``trellis_bits`` and controls B-operand
 staging. The decode reference is ``p8_h128_fc1.py:P8H128FC1Kernel``; its numerical
@@ -18,23 +18,29 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32
 
 from b12x._lib.intrinsics import shared_ptr_to_u32
-from b12x.moe._shared.kernels.p8_h128_fc1 import P8H128FC1Kernel
+from b12x.moe._shared.kernels.row_alias376_fc1 import P8H128FC1Kernel
 
 
 class P8CoupledPrefillFC1Kernel(P8H128FC1Kernel):
-    """One M64/N128 CTA with exact draw0/capped-SiLU coupled boundaries."""
+    """One M32/N128 CTA with exact draw0/capped-SiLU coupled boundaries."""
 
-    tile_m = 64
-    source_tile_m = 64
-    mma_m_blocks = 4
-    owned_row_groups = 16
+    p8_row_interleaved = True
+    tile_m = 32
+    source_tile_m = 32
+    mma_m_blocks = 2
+    owned_row_groups = 8
 
     def __init__(self, *, trellis_bits: int = 4) -> None:
         if int(trellis_bits) not in (3, 4, 5):
             raise ValueError("coupled P8 prefill FC1 supports K3, K4 or K5 streams")
         super().__init__(full_coupled=True, trellis_bits=int(trellis_bits))
-        if (self.tile_m, self.owned_n, self.source_tile_m) != (64, 128, 64):
-            raise ValueError("coupled P8 prefill FC1 requires exact M64/N128")
+        # GateFP16+upFP16 and transformedFP32 each occupy512 bytes/row.
+        # Their lifetimes are disjoint within a single warp-owned row.
+        self.shared_bytes = max(2 * self.stage_bytes, self.tile_m * 128 * 4)
+        self.shared_words = (self.shared_bytes + 3) // 4
+        self.trellis_lut_offset = self.shared_bytes
+        if (self.tile_m, self.owned_n, self.source_tile_m) != (32, 128, 32):
+            raise ValueError("coupled P8 prefill FC1 requires exact M32/N128")
 
     @cute.jit
     def __call__(
@@ -58,7 +64,7 @@ class P8CoupledPrefillFC1Kernel(P8H128FC1Kernel):
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        """Launch the 64 KiB owner at one CTA per SM, not the parent's two."""
+        """FC1-only376-CTA grid for188-SM target; other phase grids unchanged."""
 
         self.kernel(
             cute.recast_tensor(packed_a_storage, cutlass.Uint32),
@@ -78,7 +84,7 @@ class P8CoupledPrefillFC1Kernel(P8H128FC1Kernel):
             intermediate_tiles,
             packed_w13_tiles,
         ).launch(
-            grid=(1, 1, max_active_clusters),
+            grid=(1, 1, 376),
             block=[self.threads_per_cta, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,

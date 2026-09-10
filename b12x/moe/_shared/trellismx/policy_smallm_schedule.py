@@ -66,7 +66,7 @@ def p8_small_m_scratch_layout(*, intermediate: int = 512, tokens: int = 1, share
     if tokens < 1 or (tokens != 1 and not shared):
         raise ValueError('multi-token layout requires shared coupled workspace')
     tile_m = (64 if grouped else 16) if tile_m is None else tile_m
-    if tile_m not in (16, 64, 128):
+    if tile_m not in (16, 32, 64, 128):
         raise ValueError("unsupported scratch tile size")
     direct = not grouped if direct is None else direct
     physical_tiles = (geometry.experts + (tokens * geometry.topk + tile_m - 1) // tile_m

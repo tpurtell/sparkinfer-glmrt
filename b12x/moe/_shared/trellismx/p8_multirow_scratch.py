@@ -33,15 +33,15 @@ def direct_grid_capacity(m: int, default: int = 64) -> int:
     return {4: 192, 8: 128, 16: 192}.get(m, default)
 
 
-def grouped_m16_scratch_layout(tokens, intermediate=512, compact_input=True):
+def grouped_m16_scratch_layout(tokens, intermediate=512, compact_input=True, *, grouped=False):
     """Exact extents of the existing GLM TP4 grouped-M16 allocations."""
     if tokens < 1 or intermediate != 512:
-        raise ValueError('grouped M16 pilot requires positive tokens and I512')
+        raise ValueError('grouped M16 requires positive tokens and I512')
     base = p8_small_m_scratch_layout(intermediate=intermediate)
     tiles = 288 + (tokens * 8 + 15) // 16
     rows = tiles * 16
-    counts = dict(packed_a=(tokens if compact_input else rows) * 4096,
-                  scale_flat=tokens * 128,
+    counts = dict(packed_a=(tokens if grouped and compact_input else rows) * 4096,
+                  scale_flat=(tokens * 128 if grouped else (288 + tokens * 8 + 1) * 16 * 512),
                   intermediate_u32=rows * (intermediate + intermediate // 32) // 4,
                   tile_write_count=tiles, row_counts=288,
                   expert_write_rows=288, expert_tile_base=289,

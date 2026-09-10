@@ -1077,9 +1077,9 @@ class MoEDynamicKernelBackend:
         self.p8_fc1_tile_n = int(p8_fc1_tile_n)
         self.p8_scale_sandwich = bool(p8_scale_sandwich)
         self.p8_full_coupled = bool(p8_full_coupled)
-        self.p8_grouped_m16 = bool(
+        self.p8_grouped_m32 = bool(
             self.p8_full_coupled and materialize_intermediate
-            and not direct_routing and mma_tiler_mn == (16, 128)
+            and not direct_routing and mma_tiler_mn == (32, 128)
             and share_input_across_experts and deterministic_output
             and quant_recipe == "w4a8_trellis" and trellis_codebook == "mcg"
             and trellis_scaled and w4a8_repacked
@@ -1102,7 +1102,7 @@ class MoEDynamicKernelBackend:
             or (
                 self.p8_full_coupled
                 and materialize_intermediate
-                and (mma_tiler_mn == (64, 128) or self.p8_grouped_m16)
+                and (mma_tiler_mn == (64, 128) or self.p8_grouped_m32)
                 and share_input_across_experts
                 and deterministic_output
                 and not direct_routing
@@ -1117,7 +1117,7 @@ class MoEDynamicKernelBackend:
             and (trellis_identity_boundary or self.p8_full_coupled)
             and deterministic_output and w4a8_repacked and direct_routing
             and materialize_intermediate and share_input_across_experts
-            and mma_tiler_mn == (16, 128) and activation == "silu"
+            and mma_tiler_mn in {(16, 128), (32, 128)} and activation == "silu"
             and num_topk == 8 and not trellis_coupled and not trellis_direct_lut
         ):
             raise ValueError("P8 small-M requires the frozen M1 scaled-MCG contract")
@@ -1125,7 +1125,7 @@ class MoEDynamicKernelBackend:
             self.w4a8_repacked
             and self.direct_routing
             and self.materialize_intermediate
-            and mma_tiler_mn == (16, 128)
+            and mma_tiler_mn in {(16, 128), (32, 128)}
         )
         self.w4a8_m128_materialized = bool(
             self.w4a8_repacked
@@ -1138,7 +1138,7 @@ class MoEDynamicKernelBackend:
             and mma_tiler_mn == (64, 128)
         )
         self.w4a8_split_materialized = bool(
-            self.w4a8_m64_materialized or self.w4a8_m128_materialized or self.p8_grouped_m16
+            self.w4a8_m64_materialized or self.w4a8_m128_materialized or self.p8_grouped_m32
         )
         # Dense M64/M128 retains this kernel as a routing/input-quantization
         # front-end. Compact stream-ordered M64xN128 kernels compute FC1/FC2
@@ -1162,7 +1162,7 @@ class MoEDynamicKernelBackend:
         materialized_source_tile_m = (
             mma_tiler_mn[0] if self.w4a8_split_materialized else 128
         )
-        if self.p8_grouped_m16:
+        if self.p8_grouped_m32:
             # Inert upstream placeholders require M64/M128. Both are replaced
             # below by the M16 P8 owners before any launch.
             materialized_source_tile_m = 64
@@ -1173,13 +1173,13 @@ class MoEDynamicKernelBackend:
         # parent cannot express. If no P8 owner would replace them, the rate is passed through
         # unchanged and the parent's own validation rejects K5, which is the correct outcome.
         _p8_owns_phase1 = (
-            self.p8_grouped_m16 or
+            self.p8_grouped_m32 or
             (self.p8_full_coupled and self.w4a8_m64_materialized)
             or self.p8_scale_sandwich
             or self.p8_fc1_tile_n != 128
         )
         _p8_owns_phase2 = (
-            self.p8_grouped_m16 or
+            self.p8_grouped_m32 or
             (self.p8_full_coupled and self.w4a8_m64_materialized) or self.p8_small_m
         )
         _base_bits_unsupported = trellis_bits is not None and int(trellis_bits) not in (2, 3, 4)
@@ -1237,7 +1237,9 @@ class MoEDynamicKernelBackend:
             ),
         )
         if self.p8_small_m:
-            from b12x.moe._shared.kernels.p8_small_m import P8SmallMPhase2Kernel
+            from b12x.moe._shared.kernels.fc2_k5_funnel import P8SmallMPhase2Kernel
+            if mma_tiler_mn == (32, 128):
+                from b12x.moe._shared.kernels.direct_m32_fc2 import P8DirectM32FC2Kernel as P8SmallMPhase2Kernel
             self.materialized_phase2_kernel = P8SmallMPhase2Kernel(
                 trellis_bits=trellis_bits
             )
@@ -1247,21 +1249,24 @@ class MoEDynamicKernelBackend:
                     full_coupled=self.p8_full_coupled,
                     trellis_bits=trellis_bits,
                 )
-        if self.p8_grouped_m16:
-            from b12x.moe._shared.kernels.p8_grouped_m16 import P8GroupedM16FC1Kernel, P8GroupedM16FC2Kernel
+        if self.p8_grouped_m32:
+            from b12x.moe._shared.kernels.policy_m32_fc1 import P8CoupledPrefillFC1Kernel as P8GroupedM16FC1Kernel
+            from b12x.moe._shared.kernels.policy_m32_fc2 import P8CoupledPrefillFC2Kernel as P8GroupedM16FC2Kernel
             self.materialized_phase1_kernel = P8GroupedM16FC1Kernel(trellis_bits=trellis_bits)
             self.materialized_phase2_kernel = P8GroupedM16FC2Kernel(trellis_bits=trellis_bits)
         elif self.p8_full_coupled and self.w4a8_m64_materialized:
-            from b12x.moe._shared.kernels.p8_coupled_prefill_fc1 import (
+            from b12x.moe._shared.kernels.route_hoist_prefill import (
                 P8CoupledPrefillFC1Kernel,
             )
-            from b12x.moe._shared.kernels.p8_coupled_prefill_fc2 import (
+            from b12x.moe._shared.kernels.grouped_fc2_grid376 import (
                 P8CoupledPrefillFC2Kernel,
             )
             self.materialized_phase1_kernel = P8CoupledPrefillFC1Kernel(trellis_bits=trellis_bits)
             self.materialized_phase2_kernel = P8CoupledPrefillFC2Kernel(trellis_bits=trellis_bits)
         elif self.p8_scale_sandwich:
-            from b12x.moe._shared.kernels.p8_h128_fc1 import P8H128FC1Kernel
+            from b12x.moe._shared.kernels.route_hoist_k5 import P8H128FC1Kernel
+            if mma_tiler_mn == (32, 128):
+                from b12x.moe._shared.kernels.route_hoist_direct32 import P8DirectM32FC1Kernel as P8H128FC1Kernel
             self.materialized_phase1_kernel = P8H128FC1Kernel(
                 full_coupled=self.p8_full_coupled,
                 trellis_bits=trellis_bits,
@@ -1291,7 +1296,7 @@ class MoEDynamicKernelBackend:
                 quant_recipe == "w4a8_mx"
                 or (
                     quant_recipe == "w4a8_trellis"
-                    and (mma_tiler_mn in {(64, 128), (128, 128)} or self.p8_small_m or self.p8_grouped_m16)
+                    and (mma_tiler_mn in {(64, 128), (128, 128)} or self.p8_small_m or self.p8_grouped_m32)
                 )
             )
             and mma_tiler_mn in {(16, 128), (32, 128), (64, 128), (128, 128)}
@@ -1313,7 +1318,7 @@ class MoEDynamicKernelBackend:
                 or (
                     self.w4a8_repacked
                     and (quant_recipe == "w4a8_mx" or self.p8_small_m)
-                    and mma_tiler_mn == (16, 128)
+                    and mma_tiler_mn in {(16, 128), (32, 128)}
                 )
             )
         ):

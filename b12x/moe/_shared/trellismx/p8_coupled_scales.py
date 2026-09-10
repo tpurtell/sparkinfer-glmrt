@@ -51,14 +51,14 @@ def _hadamard_128(*, device: torch.device | str = "cpu") -> torch.Tensor:
     return (torch.stack(rows) / (128.0**0.5)).to(device=device)
 
 
-def had128_luke(
+def had128_scaled(
     value: torch.Tensor,
     *,
     suh: torch.Tensor | None = None,
     svh: torch.Tensor | None = None,
     store_fp16: bool,
 ) -> torch.Tensor:
-    """Luke ordering: optional suh multiply -> FP16 -> H128 -> optional svh."""
+    """Optional suh multiply, FP16 store, H128, then optional svh multiply."""
 
     if value.ndim != 2 or value.shape[1] % 128:
         raise ValueError("H128 input must be rank 2 with width divisible by 128")
@@ -416,17 +416,17 @@ def scale_sandwich_reference(
     """
 
     gate_svh, up_svh, down_suh = scales.split_intermediate()
-    source = had128_luke(x, suh=scales.gate_up_suh, store_fp16=True)
+    source = had128_scaled(x, suh=scales.gate_up_suh, store_fp16=True)
     gate = (source.float() @ gate_physical.float().T).to(torch.float16)
     up = (source.float() @ up_physical.float().T).to(torch.float16)
-    gate = had128_luke(gate, svh=gate_svh[0], store_fp16=True)
-    up = had128_luke(up, svh=up_svh[0], store_fp16=True)
+    gate = had128_scaled(gate, svh=gate_svh[0], store_fp16=True)
+    up = had128_scaled(up, svh=up_svh[0], store_fp16=True)
     gate_work = gate.float().clamp(max=10.0)
     up_work = up.float().clamp(min=-10.0, max=10.0)
     activated = (gate_work * torch.sigmoid(gate_work) * up_work).to(torch.float16)
-    down_input = had128_luke(activated, suh=down_suh[0], store_fp16=True)
+    down_input = had128_scaled(activated, suh=down_suh[0], store_fp16=True)
     down = (down_input.float() @ down_physical.float().T).to(torch.float16)
-    return had128_luke(down, svh=scales.down_svh, store_fp16=False)
+    return had128_scaled(down, svh=scales.down_svh, store_fp16=False)
 
 
 def quantize_e4m3_ue8m0_per32(
@@ -463,7 +463,7 @@ __all__ = [
     "TRANSFORM_ID",
     "coupled_reference",
     "hadamard_blocks",
-    "had128_luke",
+    "had128_scaled",
     "quantize_e4m3_ue8m0_per32",
     "scale_sandwich_reference",
     "qsrt_coupled_signs_reference",
@@ -472,3 +472,6 @@ __all__ = [
     "validate_scale_component",
     "validate_coupled_component",
 ]
+
+# Compatibility for callers using the original exported reference name.
+had128_luke = had128_scaled

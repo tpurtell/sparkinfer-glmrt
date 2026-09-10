@@ -10,7 +10,7 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import Int32
+from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
 
@@ -35,15 +35,15 @@ class P8CoupledTopKSumKernel:
     ):
         routes = cute.make_tensor(
             route_ptr,
-            cute.make_layout((active_m * Int32(self.topk * self.hidden),), stride=(1,)),
+            cute.make_layout((Int64(active_m) * Int64(self.topk * self.hidden),), stride=(1,)),
         )
         weights = cute.make_tensor(
             weight_ptr,
-            cute.make_layout((active_m * Int32(self.topk),), stride=(1,)),
+            cute.make_layout((Int64(active_m) * Int64(self.topk),), stride=(1,)),
         )
         output = cute.make_tensor(
             output_ptr,
-            cute.make_layout((active_m * Int32(self.hidden),), stride=(1,)),
+            cute.make_layout((Int64(active_m) * Int64(self.hidden),), stride=(1,)),
         )
         self.kernel(routes, weights, output, active_m).launch(
             grid=(active_m * Int32(self.hidden // 512), 1, 1),
@@ -78,9 +78,9 @@ class P8CoupledTopKSumKernel:
             a2 = cutlass.Float32(0.0)
             a3 = cutlass.Float32(0.0)
             for route in cutlass.range_constexpr(self.topk):
-                row = token * Int32(self.topk) + Int32(route)
+                row = Int64(token) * Int64(self.topk) + Int64(route)
                 weight = weights[row].to(cutlass.Float32)
-                base = row * Int32(self.hidden) + col
+                base = row * Int64(self.hidden) + Int64(col)
                 a0 += weight * routes[base].to(cutlass.Float32)
                 a1 += weight * routes[base + Int32(1)].to(cutlass.Float32)
                 a2 += weight * routes[base + Int32(2)].to(cutlass.Float32)
@@ -89,11 +89,6 @@ class P8CoupledTopKSumKernel:
             reduced_ptr = cute.arch.alloc_smem(cutlass.Float32, 512)
             reduced = cute.make_tensor(reduced_ptr, cute.make_layout(512))
             local = warp * Int32(128) + lane * Int32(4)
-            reduced[local] = a0
-            reduced[local + Int32(1)] = a1
-            reduced[local + Int32(2)] = a2
-            reduced[local + Int32(3)] = a3
-            cute.arch.sync_threads()
 
             # H512 = H4 tensor H128. H128 is applied within each quarter;
             # normalized H4 then couples equal coordinates across quarters.
@@ -109,7 +104,7 @@ class P8CoupledTopKSumKernel:
             x2 = reduced[quarter_col + Int32(256)]
             x3 = reduced[quarter_col + Int32(384)]
             half = cutlass.Float32(0.5)
-            out_base = token * Int32(self.hidden) + block * Int32(512) + quarter_col
+            out_base = Int64(token) * Int64(self.hidden) + Int64(block) * Int64(512) + Int64(quarter_col)
             output[out_base] = cutlass.BFloat16(half * (x0 + x1 + x2 + x3))
             output[out_base + Int32(128)] = cutlass.BFloat16(half * (x0 - x1 + x2 - x3))
             output[out_base + Int32(256)] = cutlass.BFloat16(half * (x0 + x1 - x2 - x3))

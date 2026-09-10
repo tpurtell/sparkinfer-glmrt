@@ -11,3 +11,7 @@ license does not relicense those additions. Source headers remain intact.
 This is an integration baseline, not a validated GB10 port or performance claim.
 Original SparkInfer files outside the release overlay remain present. No changes
 from this branch should be merged into main as part of the recipe work.
+
+The September 9 selected-reference `runtime-reference-20260909/b12x/b12x`
+overlay is applied on top of that base. Its source manifest is retained here.
+The vLLM reference adapter still requires SM120 and TP4/EP1.
