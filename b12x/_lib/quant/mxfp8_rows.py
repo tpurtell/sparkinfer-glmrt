@@ -34,6 +34,24 @@ _GRID_CTAS_PER_SM = 4
 _WARP_SUBGROUP_WIDTH = 4
 
 
+def _rows_quant_grid(rows: int, k: int, subgroup_width: int, threads: int, sm_count: int) -> int:
+    if subgroup_width:
+        groups_per_warp = 32 // subgroup_width
+        total_tasks = rows * ((k // 32 + groups_per_warp - 1) // groups_per_warp)
+        warps_per_cta = threads // 32
+        return min(max(1, (total_tasks + warps_per_cta - 1) // warps_per_cta),
+                   sm_count * _GRID_CTAS_PER_SM)
+    return max(1, (rows * (k // 32) + threads - 1) // threads)
+
+
+def mxfp8_rows_quant_aot_grid(*, size_k: int, rows: int, expected_m: int, sm_count: int) -> int:
+    """Native launch grid for the exact regime selected by the AOT row quantizer."""
+    if size_k <= 0 or size_k % 32 or rows <= 0 or expected_m <= 0 or sm_count <= 0:
+        raise ValueError("invalid MXFP8 row-quantizer launch geometry")
+    return _rows_quant_grid(rows, size_k, _WARP_SUBGROUP_WIDTH if expected_m > 8 else 0,
+                           _THREADS, sm_count)
+
+
 class _MXFP8RowsQuantLaunch:
     def __init__(
         self,
@@ -417,20 +435,8 @@ def _get_compiled_mxfp8_rows_quant(
         scale_rows: torch.Tensor,
         scale_mma: torch.Tensor,
     ) -> None:
-        if subgroup_width:
-            groups_per_warp = 32 // subgroup_width
-            total_tasks = int(source.shape[0]) * (
-                (k // 32 + groups_per_warp - 1) // groups_per_warp
-            )
-            warps_per_cta = threads // 32
-            natural_grid = max(1, (total_tasks + warps_per_cta - 1) // warps_per_cta)
-            sm_count = torch.cuda.get_device_properties(
-                source.device
-            ).multi_processor_count
-            grid_x = min(natural_grid, sm_count * _GRID_CTAS_PER_SM)
-        else:
-            total_blocks = int(source.shape[0]) * (k // 32)
-            grid_x = max(1, (total_blocks + threads - 1) // threads)
+        sm_count = torch.cuda.get_device_properties(source.device).multi_processor_count if subgroup_width else 1
+        grid_x = _rows_quant_grid(int(source.shape[0]), k, subgroup_width, threads, sm_count)
         raw(
             make_ptr(
                 source_type,
