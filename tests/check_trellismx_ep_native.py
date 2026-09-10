@@ -9,9 +9,11 @@ from b12x.moe._shared.trellismx.p8_native_kernel import P8NativeTPMoE
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('checkpoint',type=Path)
 p.add_argument('--layer',type=int,default=3)
+p.add_argument('--tokens',type=int,nargs='+',default=[1,8,32,128,256])
 p.add_argument('--ep-size',type=int,choices=[2,4],required=True)
 p.add_argument('--routing',choices=['owned','mixed','remote','all'],default='all')
 a=p.parse_args()
+if any(m<=0 for m in a.tokens):p.error('--tokens must be positive')
 records=sorted([r for r in json.loads((a.checkpoint/'trellismx-manifest.json').read_text())['files'] if r['layer']==a.layer],key=lambda r:r['rank'])
 paths=[a.checkpoint/r['path'] for r in records]; hashes=[r['sha256'] for r in records]
 for path,digest in zip(paths,hashes):
@@ -29,7 +31,7 @@ torch.manual_seed(20260910)
 routings=('owned','mixed','remote') if a.routing=='all' else (a.routing,)
 with torch.inference_mode():
  for routing in routings:
-  for m in (1,8,32,128,256):
+  for m in a.tokens:
    x=torch.randn(m,4096,dtype=torch.bfloat16,device='cuda')*.1
    local=torch.stack([torch.randperm(count,device='cuda')[:8] for _ in range(m)]).int()
    global_ids=local+begin
