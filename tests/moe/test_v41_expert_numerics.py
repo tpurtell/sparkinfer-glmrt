@@ -63,6 +63,10 @@ def reference(x, ids, routing, weights, scales):
     ],
 )
 def test_v41_native_expert_routing_and_graph(m, n, experts):
+    _check_v41_native_expert_routing_and_graph(m, n, experts)
+
+
+def _check_v41_native_expert_routing_and_graph(m, n, experts, after_graph_check=None):
     require_b12x()
     torch.manual_seed(4100 + m + n)
     h = 5120
@@ -143,6 +147,9 @@ def test_v41_native_expert_routing_and_graph(m, n, experts):
         ids.copy_(saved_ids)
         graph.replay()
         check(result, expected_changed)
+
+    if after_graph_check is not None:
+        after_graph_check(binding, x, ids, routing)
 
 
 @pytest.mark.parametrize("m,n", [(1,576),(16,576),(80,576),(1,2304),(16,2304),(80,2304)])

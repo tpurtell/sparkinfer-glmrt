@@ -10723,6 +10723,7 @@ def _get_dynamic_kernel(
     w4a8_repacked: bool = False,
     direct_routing: bool = False,
     external_route_plan: bool = False,
+    prequantized_input: bool = False,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -10732,6 +10733,12 @@ def _get_dynamic_kernel(
     trellis_coupled: bool = False,
     planned_tile_m: int | None = None,
 ):
+    if prequantized_input and not (
+        activation == "silu_v41" and quant_mode == "w4a8_mx"
+        and w4a8_repacked and not share_input_across_experts and deterministic_output
+        and E == 384 and k == 5120 and n == 640 and num_topk == 6
+    ):
+        raise ValueError("prequantized input requires native Spark geometry")
     quant_mode = _normalize_quant_mode(quant_mode)
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
     # with quant_recipe="w6a8_mx": Float8E4M3FN views of the 3:4-packed FP6
@@ -10840,6 +10847,7 @@ def _get_dynamic_kernel(
         bool(w4a8_repacked),
         bool(direct_routing),
         bool(external_route_plan),
+        bool(prequantized_input),
         materialize_intermediate,
         int(trellis_bits),
         bool(trellis_coupled),
@@ -10871,7 +10879,7 @@ def _get_dynamic_kernel(
         weight_dtype = cutlass.Float4E2M1FN
         a_scratch_dtype = weight_dtype
         sf_dtype = cutlass.Float8E4M3FN
-    a_dtype = cutlass.BFloat16
+    a_dtype = cutlass.Uint8 if prequantized_input else cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
     kernel_kwargs = dict(
@@ -10891,6 +10899,7 @@ def _get_dynamic_kernel(
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
     kernel_kwargs["direct_routing"] = bool(direct_routing)
+    kernel_kwargs["prequantized_input"] = bool(prequantized_input)
     if external_route_plan:
         kernel_kwargs["external_route_plan"] = True
     if is_w4a8 and int(trellis_bits) > 0:

@@ -697,6 +697,7 @@ class MoEDynamicKernelBackend:
         w4a8_repacked: bool = False,
         direct_routing: bool = False,
         external_route_plan: bool = False,
+        prequantized_input: bool = False,
         materialize_intermediate: bool = False,
         work_source: str = _WORK_SOURCE_MATERIALIZED_QUEUE,
         swiglu_limit: float | None = None,
@@ -708,6 +709,12 @@ class MoEDynamicKernelBackend:
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
     ):
+        self.prequantized_input = bool(prequantized_input)
+        if self.prequantized_input and not (
+            activation == "silu_v41" and quant_recipe == "w4a8_mx"
+            and w4a8_repacked and not share_input_across_experts
+        ):
+            raise ValueError("prequantized input requires V4.1 repacked W4A8")
         activation = normalize_moe_activation(activation)
         if quant_recipe not in {
             "nvfp4",
@@ -2923,6 +2930,13 @@ class MoEDynamicKernelBackend:
 
         num_tokens = Int32(a_input.shape[0])
         cols = Int32(a_input.shape[1])
+        wire_input = cute.make_tensor(
+            a_input.iterator,
+            layout=cute.make_layout(
+                (num_tokens, cols + cols // Int32(32)),
+                stride=(Int64(cols + cols // Int32(32)), Int64(1)),
+            ),
+        )
         scatter_base = scatter_output.iterator.toint()
         row_counts = launch_params.row_counts
         num_experts = Int32(row_counts.shape[0])
@@ -3741,33 +3755,46 @@ class MoEDynamicKernelBackend:
                                     blk_idx = lane_id
                                     while blk_idx < mx_blocks_per_row:
                                         block_start = blk_idx * Int32(32)
-                                        values = cute.make_rmem_tensor(
-                                            (32,), cutlass.Float32
-                                        )
-                                        block_max = cutlass.Float32(0.0)
-                                        for elem_idx in cutlass.range_constexpr(32):
-                                            value = cutlass.Float32(
-                                                a_input[
-                                                    token_idx, block_start + Int32(elem_idx)
-                                                ]
-                                            )
-                                            values[elem_idx] = value
-                                            block_max = fmax_f32(block_max, fabs_f32(value))
-                                        if cutlass.const_expr(self.w4a8_trellis):
-                                            payload, mx_scale_byte = (
-                                                self._quantize_w4a8_block(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
-                                                    block_max,
-                                                )
-                                            )
+                                        if cutlass.const_expr(self.prequantized_input):
+                                            payload = cute.make_rmem_tensor((8,), Uint32)
+                                            for word in cutlass.range_constexpr(8):
+                                                packed = Uint32(0)
+                                                for byte in cutlass.range_constexpr(4):
+                                                    packed = packed | (Uint32(wire_input[
+                                                        Int64(token_idx), Int64(block_start) + Int64(word * 4 + byte)
+                                                    ]) << Uint32(byte * 8))
+                                                payload[word] = packed
+                                            mx_scale_byte = Uint32(wire_input[
+                                                Int64(token_idx), Int64(cols) + Int64(blk_idx)
+                                            ])
                                         else:
-                                            payload, mx_scale_byte = (
-                                                self._quantize_w4a8_block(
-                                                    values, block_max
-                                                )
+                                            values = cute.make_rmem_tensor(
+                                                (32,), cutlass.Float32
                                             )
+                                            block_max = cutlass.Float32(0.0)
+                                            for elem_idx in cutlass.range_constexpr(32):
+                                                value = cutlass.Float32(
+                                                    a_input[
+                                                        token_idx, block_start + Int32(elem_idx)
+                                                    ]
+                                                )
+                                                values[elem_idx] = value
+                                                block_max = fmax_f32(block_max, fabs_f32(value))
+                                            if cutlass.const_expr(self.w4a8_trellis):
+                                                payload, mx_scale_byte = (
+                                                    self._quantize_w4a8_block(
+                                                        _w4a8_trellis_permute_k32(
+                                                            values
+                                                        ),
+                                                        block_max,
+                                                    )
+                                                )
+                                            else:
+                                                payload, mx_scale_byte = (
+                                                    self._quantize_w4a8_block(
+                                                        values, block_max
+                                                    )
+                                                )
                                         output_offset = (
                                             phys_row * output_bytes_per_row + block_start
                                         )
