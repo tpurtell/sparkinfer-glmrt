@@ -7,7 +7,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32, Uint8, Uint32
+from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32, T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from b12x._lib.compiler import (
     KernelCompileSpec,
@@ -28,6 +29,40 @@ from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
 )
 from b12x._lib.utils import current_cuda_stream, make_ptr
+
+
+@dsl_user_op
+def _mul_rn(a, b, *, loc=None, ip=None):
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _fma_rn(a, b, c, *, loc=None, ip=None):
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c)],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
 
 _THREADS = 256
 _GRID_CTAS_PER_SM = 4
@@ -71,6 +106,7 @@ class _WOQuantCuTeLaunch:
         positions_type: type[cutlass.Numeric],
         cos_sin_type: type[cutlass.Numeric],
         threads: int,
+        row_frequencies: bool = False,
     ) -> None:
         if mode not in ("grouped", "group_major"):
             raise ValueError(f"unsupported WO quant mode {mode!r}")
@@ -83,6 +119,7 @@ class _WOQuantCuTeLaunch:
         self._span_groups_k = self._span // 32
         self._source_type = source_type
         self._inv_rope = bool(inv_rope)
+        self._row_frequencies = bool(row_frequencies)
         self._head_dim = int(head_dim)
         self._nope_dim = int(nope_dim)
         self._rope_dim = int(rope_dim)
@@ -184,34 +221,61 @@ class _WOQuantCuTeLaunch:
                 # -0.0 payloads survive untouched on nope lanes.
                 head_d0 = k0 % Int32(self._head_dim)
                 is_rope = head_d0 >= Int32(self._nope_dim)
-                pos = Int32(positions[row])
-                half_rope = Int32(self._rope_dim // 2)
-                cs_base = pos * Int32(self._rope_dim)
-                rl_half0 = (head_d0 - Int32(self._nope_dim)) // Int32(2)
-                if rl_half0 < Int32(0):
-                    rl_half0 = Int32(0)
-                if cutlass.const_expr(self._cos_sin_type == cutlass.BFloat16):
-                    # rl_half0 is even (head_d0 and nope_dim are multiples of
-                    # 4), so each cos/sin pair sits on one aligned 4B word.
-                    cos_w = ld_global_nc_u32(
-                        get_ptr_as_int64(cos_sin, cs_base + rl_half0)
-                    )
-                    sin_w = ld_global_nc_u32(
-                        get_ptr_as_int64(cos_sin, cs_base + rl_half0 + half_rope)
-                    )
-                    cos0, cos1 = bfloat2_to_float2_scaled(cos_w, cutlass.Float32(1.0))
-                    sin0, sin1 = bfloat2_to_float2_scaled(sin_w, cutlass.Float32(1.0))
+                if cutlass.const_expr(self._row_frequencies):
+                    offset = head_d0 - Int32(self._nope_dim)
+                    if offset < Int32(0):
+                        offset = Int32(0)
+                    base = Int64(row) * Int64(self._rope_dim) + Int64(offset)
+                    cos0 = cutlass.Float32(cos_sin[base])
+                    sin0 = cutlass.Float32(cos_sin[base + Int64(1)])
+                    cos1 = cutlass.Float32(cos_sin[base + Int64(2)])
+                    sin1 = cutlass.Float32(cos_sin[base + Int64(3)])
                 else:
-                    cos0 = cutlass.Float32(cos_sin[cs_base + rl_half0])
-                    sin0 = cutlass.Float32(cos_sin[cs_base + rl_half0 + half_rope])
-                    cos1 = cutlass.Float32(cos_sin[cs_base + rl_half0 + Int32(1)])
-                    sin1 = cutlass.Float32(
-                        cos_sin[cs_base + rl_half0 + Int32(1) + half_rope]
-                    )
+                    pos = Int32(positions[row])
+                    half_rope = Int32(self._rope_dim // 2)
+                    cs_base = pos * Int32(self._rope_dim)
+                    rl_half0 = (head_d0 - Int32(self._nope_dim)) // Int32(2)
+                    if rl_half0 < Int32(0):
+                        rl_half0 = Int32(0)
+                    if cutlass.const_expr(self._cos_sin_type == cutlass.BFloat16):
+                        # rl_half0 is even (head_d0 and nope_dim are multiples of
+                        # 4), so each cos/sin pair sits on one aligned 4B word.
+                        cos_w = ld_global_nc_u32(
+                            get_ptr_as_int64(cos_sin, cs_base + rl_half0)
+                        )
+                        sin_w = ld_global_nc_u32(
+                            get_ptr_as_int64(cos_sin, cs_base + rl_half0 + half_rope)
+                        )
+                        cos0, cos1 = bfloat2_to_float2_scaled(
+                            cos_w, cutlass.Float32(1.0)
+                        )
+                        sin0, sin1 = bfloat2_to_float2_scaled(
+                            sin_w, cutlass.Float32(1.0)
+                        )
+                    else:
+                        cos0 = cutlass.Float32(cos_sin[cs_base + rl_half0])
+                        sin0 = cutlass.Float32(cos_sin[cs_base + rl_half0 + half_rope])
+                        cos1 = cutlass.Float32(cos_sin[cs_base + rl_half0 + Int32(1)])
+                        sin1 = cutlass.Float32(
+                            cos_sin[cs_base + rl_half0 + Int32(1) + half_rope]
+                        )
                 r0 = v0 * cos0 + v1 * sin0
                 r1 = v1 * cos0 - v0 * sin0
                 r2 = v2 * cos1 + v3 * sin1
                 r3 = v3 * cos1 - v2 * sin1
+                if cutlass.const_expr(self._row_frequencies):
+                    r0 = cutlass.Float32(
+                        cutlass.BFloat16(_fma_rn(v0, cos0, -_mul_rn(v1, -sin0)))
+                    )
+                    r1 = cutlass.Float32(
+                        cutlass.BFloat16(_fma_rn(v1, cos0, _mul_rn(v0, -sin0)))
+                    )
+                    r2 = cutlass.Float32(
+                        cutlass.BFloat16(_fma_rn(v2, cos1, -_mul_rn(v3, -sin1)))
+                    )
+                    r3 = cutlass.Float32(
+                        cutlass.BFloat16(_fma_rn(v3, cos1, _mul_rn(v2, -sin1)))
+                    )
                 mask = Uint32(0) - Uint32(is_rope)
                 keep = mask ^ Uint32(0xFFFFFFFF)
                 v0 = cutlass.Uint32(
@@ -353,6 +417,7 @@ def _get_compiled_wo_quant(
     rope_dim: int,
     positions_dtype: torch.dtype,
     cos_sin_dtype: torch.dtype,
+    row_frequencies: bool = False,
 ) -> Callable:
     source_type = _cutlass_source_type(source_dtype)
     positions_type = _cutlass_positions_type(positions_dtype)
@@ -369,6 +434,7 @@ def _get_compiled_wo_quant(
         positions_type,
         cos_sin_type,
         _THREADS,
+        row_frequencies,
     )
     cache_key = (
         mode,
@@ -376,6 +442,7 @@ def _get_compiled_wo_quant(
         int(span),
         str(source_dtype),
         bool(inv_rope),
+        bool(row_frequencies),
         int(head_dim),
         int(nope_dim),
         int(rope_dim),
@@ -402,7 +469,7 @@ def _get_compiled_wo_quant(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "gemm.wo_quant_cute",
-            2,
+            3,
             cache_key,
         ),
     )
@@ -542,15 +609,31 @@ __all__ = [
 ]
 
 
-def compile_wo_grouped_quant_aot(*, groups: int, group_width: int) -> object:
+def compile_wo_grouped_quant_aot(
+    *, groups: int, group_width: int, row_frequencies: bool = False
+) -> object:
     """Export grouped BF16-to-MXFP8 quantization with runtime row count/grid.
 
     Physical output values are [groups, live_rows, group_width]. Scales use
     the grouped dense-GEMM layout; callers provide stable capacity storage.
+    With row_frequencies, cos_sin_ptr holds interleaved FP32 [live_rows,32,2]
+    frequencies for inverse RoPE on the last 64 columns of each 512-column
+    head. Rotated values round to BF16 before quantization; positions_ptr is unused.
     """
     if groups < 1 or group_width < 128 or group_width % 128:
         raise ValueError("grouped quantization requires positive groups and K%128=0")
+    if row_frequencies and group_width % 512:
+        raise ValueError("row-frequency inverse RoPE requires 512-column heads")
     return _get_compiled_wo_quant(
-        "grouped", groups * group_width, group_width, torch.bfloat16,
-        False, 0, 0, 0, torch.int64, torch.bfloat16,
+        "grouped",
+        groups * group_width,
+        group_width,
+        torch.bfloat16,
+        row_frequencies,
+        512 if row_frequencies else 0,
+        448 if row_frequencies else 0,
+        64 if row_frequencies else 0,
+        torch.int64,
+        torch.float32 if row_frequencies else torch.bfloat16,
+        row_frequencies,
     ).compiled
