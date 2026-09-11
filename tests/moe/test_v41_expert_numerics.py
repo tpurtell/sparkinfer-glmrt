@@ -54,6 +54,7 @@ def reference(x, ids, routing, weights, scales):
     "m,n,experts",
     [
         (1, 576, 8),
+        (1, 576, 384),
         (16, 576, 384),
         (80, 576, 8),
         (1, 2304, 8),
@@ -131,6 +132,17 @@ def test_v41_native_expert_routing_and_graph(m, n, experts):
     graph.replay()
     assert torch.cuda.memory_allocated() == before
     check(result, expected_changed)
+    if m == 1 and n == 576 and experts == 384:
+        config = binding.execution_plan.policy_resolution.config
+        expected_mode = "direct" if torch.cuda.get_device_capability() == (12, 1) else "grouped"
+        assert config.dynamic_route_mode == expected_mode
+        saved_ids = ids.clone()
+        ids.fill_(-1)
+        graph.replay()
+        assert torch.count_nonzero(result) == 0
+        ids.copy_(saved_ids)
+        graph.replay()
+        check(result, expected_changed)
 
 
 @pytest.mark.parametrize("m,n", [(1,576),(16,576),(80,576),(1,2304),(16,2304),(80,2304)])

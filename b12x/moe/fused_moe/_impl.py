@@ -1858,6 +1858,18 @@ def _w4a8_dynamic_direct_candidate(
 ) -> bool:
     """Whether tiny prepared W4A8 can bypass grouped route compaction."""
 
+    # V4.1 keeps deterministic FP32 route planes and a fused intermediate.
+    # Do not broaden the generic materialized/shared-input decode predicate.
+    if activation == "silu_v41":
+        return bool(
+            _normalize_quant_mode(quant_mode) == "w4a8_mx"
+            and num_experts == 384
+            and n == 640
+            and 0 < routed_rows <= 6
+            and planned_tile_m in (None, 16)
+            and _dynamic_work_source() != "ready_queue"
+        )
+
     return bool(
         activation == "silu"
         and routed_rows <= _DIRECT_ROUTING_MAX_ROUTED_ROWS
@@ -2486,6 +2498,13 @@ def _heuristic_dynamic_route_mode(
         query.intermediate_size,
         query.quant_mode,
     )
+    if query.activation == "silu_v41" and not (
+        query.source_format == "fp4_e8m0_k32" and query.hidden_size == 5120
+        and query.intermediate_size == 576 and query.num_experts == 384
+        and query.top_k == 6 and query.num_tokens == 1 and query.routed_rows == 6
+        and device is not None and device.compute_capability == (12, 1)
+    ):
+        return "grouped"
     direct = _dynamic_direct_routing_candidate(
         quant_mode=query.quant_mode,
         activation=query.activation,
@@ -10721,6 +10740,12 @@ def _get_dynamic_kernel(
     # rejects swap_ab, direct_routing, materialize_intermediate, and
     # share_input_across_experts for this recipe; all of those resolve to
     # False below via their existing quant-mode predicates.
+    if activation == "silu_v41" and direct_routing and not (
+        quant_mode == "w4a8_mx" and w4a8_repacked and deterministic_output
+        and E == 384 and k == 5120 and n == 640 and num_topk == 6
+        and 0 < m <= 1 and planned_tile_m in (None, 16)
+    ):
+        raise ValueError("direct V4.1 requires Spark geometry and capacity one")
     is_w6a8 = quant_mode in _W6A8_QUANT_MODES
     share_input_across_experts = bool(
         share_input_across_experts

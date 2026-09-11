@@ -735,6 +735,10 @@ class MoEDynamicKernelBackend:
         self.fast_math = fast_math
         self.activation = activation
         self.is_v41 = activation == "silu_v41"
+        # Direct V4.1 decode assigns disjoint N1024 ranges to five tasks per
+        # route. Each retains all K slices and the original accumulation order;
+        # repeated FC1 stays local to the CTA (no global intermediate).
+        self.v41_output_shards = 5 if self.is_v41 and direct_routing else 1
         if self.is_v41 and (
             quant_recipe != "w4a8_mx"
             or swap_ab
@@ -2089,6 +2093,10 @@ class MoEDynamicKernelBackend:
         coordinates are properties of the slot itself.
         """
 
+        # Expand only the consumer domain; producer metadata and its capacity
+        # remain one record per physical M tile / intermediate group.
+        output_shard = slot % Int32(self.v41_output_shards)
+        slot = slot // Int32(self.v41_output_shards)
         m_tile = slot // num_groups
         group = slot - m_tile * num_groups
         slice_begin = group * slice_chunk
@@ -2097,7 +2105,7 @@ class MoEDynamicKernelBackend:
             slice_count = slice_chunk
         work_item[_WORK_EXPERT] = task_expert[slot].to(Int32)
         work_item[_WORK_M_TILE] = m_tile
-        work_item[_WORK_SLICE_BEGIN] = slice_begin
+        work_item[_WORK_SLICE_BEGIN] = slice_begin + output_shard * gate_tile_cnt
         work_item[_WORK_SLICE_COUNT] = slice_count
         work_item[_WORK_VALID_ROWS] = task_valid_rows[slot].to(Int32)
 
@@ -4323,7 +4331,7 @@ class MoEDynamicKernelBackend:
         if self.is_gated and not self.separate_w13_halves:
             gate_tile_cnt = intermediate_tile_cnt // Int32(2)
         output_tile_cnt = cute.size(gB_down, mode=[2])
-        phase1_output_tile_cnt = output_tile_cnt
+        phase1_output_tile_cnt = output_tile_cnt // Int32(self.v41_output_shards)
         if cutlass.const_expr(self.materialize_intermediate):
             # Phase A stops after activation quantization.  Phase B below owns
             # the full-K FC2 contraction with a finer (M, N256) work domain.
@@ -4639,6 +4647,7 @@ class MoEDynamicKernelBackend:
             materialized_tail = _ld_global_acquire_i32(
                 get_ptr_as_int64(task_tail, Int32(0))
             )
+        materialized_tail *= Int32(self.v41_output_shards)
         consumer_live = (
             Int32(0) if cutlass.const_expr(self.external_materialized_fc1) else Int32(1)
         )
@@ -4742,6 +4751,7 @@ class MoEDynamicKernelBackend:
                         tail = _ld_global_acquire_i32(
                             get_ptr_as_int64(task_tail, Int32(0))
                         )
+                        tail *= Int32(self.v41_output_shards)
                         if slot < tail:
                             self._decode_materialized_work_item(
                                 work_item,
@@ -4812,7 +4822,9 @@ class MoEDynamicKernelBackend:
             elif warp_idx < self.num_mma_warps:
                 task_expert_idx = work_item[_WORK_EXPERT]
                 task_m_tile_idx = work_item[_WORK_M_TILE]
-                task_slice_begin_idx = work_item[_WORK_SLICE_BEGIN]
+                output_shard = work_item[_WORK_SLICE_BEGIN] // route_gate_tile_cnt
+                output_tile_base = output_shard * phase1_output_tile_cnt
+                task_slice_begin_idx = work_item[_WORK_SLICE_BEGIN] % route_gate_tile_cnt
                 task_slice_count_val = work_item[_WORK_SLICE_COUNT]
                 task_valid_rows_val = work_item[_WORK_VALID_ROWS]
 
@@ -7645,7 +7657,7 @@ class MoEDynamicKernelBackend:
 
                             # Scatter using precomputed metadata (no redundant
                             # global metadata loads).
-                            output_tile_idx_cur = output_tile_idx + Int32(_fc2_out)
+                            output_tile_idx_cur = output_tile_base + output_tile_idx + Int32(_fc2_out)
                             tile_n_base_cur = output_tile_idx_cur * Int32(
                                 self.tile_shape_mnk[1]
                             )
@@ -7964,7 +7976,9 @@ class MoEDynamicKernelBackend:
             elif warp_idx < self.num_mma_warps + self.num_dma_warps:
                 task_expert_idx = work_item[_WORK_EXPERT]
                 task_m_tile_idx = work_item[_WORK_M_TILE]
-                task_slice_begin_idx = work_item[_WORK_SLICE_BEGIN]
+                output_shard = work_item[_WORK_SLICE_BEGIN] // route_gate_tile_cnt
+                output_tile_base = output_shard * phase1_output_tile_cnt
+                task_slice_begin_idx = work_item[_WORK_SLICE_BEGIN] % route_gate_tile_cnt
                 task_slice_count_val = work_item[_WORK_SLICE_COUNT]
                 task_valid_rows_val = work_item[_WORK_VALID_ROWS]
 
@@ -8561,7 +8575,7 @@ class MoEDynamicKernelBackend:
                                         w4a8_pipe_addr + Int32(16) + (par2 << Int32(2)),
                                         need2,
                                     )
-                                row_off_p = Int64(_pt) * Int64(128)
+                                row_off_p = Int64(output_tile_base + _pt) * Int64(128)
                                 if cutlass.const_expr(self.w4a8_trellis):
                                     # Down payload is expert-major [E][K16][N16]
                                     # (K = intermediate, N = hidden). Stage the
@@ -8612,7 +8626,7 @@ class MoEDynamicKernelBackend:
                                     rp_tile2 = (
                                         task_expert_idx
                                         * Int32(b_down_u32.shape[0] // 256)
-                                        + (_pt >> Int32(1))
+                                        + ((output_tile_base + _pt) >> Int32(1))
                                     ) * gate_tile_cnt + cur_slice_p
                                     _w4a8_stage_repacked_b_full(
                                         down_rp,

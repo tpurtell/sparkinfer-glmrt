@@ -97,6 +97,16 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    if query.activation == "silu_v41" and config.dynamic_route_mode == "direct":
+        if not (
+            config.backend == "dynamic" and config.route_planner == "internal"
+            and config.dynamic_tile_m == 16 and query.quant_mode == "w4a8_mx"
+            and query.source_format == "fp4_e8m0_k32"
+            and query.num_experts == 384 and query.hidden_size == 5120
+            and query.intermediate_size == 576 and query.top_k == 6
+            and query.num_tokens == 1 and query.routed_rows == 6
+        ):
+            raise ValueError("direct V4.1 requires Spark geometry and capacity one")
     if query.quant_mode == "nvfp4_auto":
         if query.source_format != "modelopt_nvfp4" or query.activation != "silu":
             raise ValueError("automatic MoE precision requires ModelOpt NVFP4 weights and SiLU")
