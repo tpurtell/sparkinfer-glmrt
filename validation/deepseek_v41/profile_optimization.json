@@ -10,7 +10,7 @@
       "changed_source": "/home/luke/projects/flashinfer-b12x-migration/pyproject.toml",
       "install": "FLASHINFER_BUILD_NO_PIP=1 BUILD_NVEP=0 CUDA_HOME=/opt/cuda uv pip install --offline --python /home/luke/projects/vllm-hh-rebase/.venv/bin/python --no-deps --no-build-isolation -e /home/luke/projects/flashinfer-b12x-migration",
       "install_note": "Version remainsflashinfer-python0.6.18. Bootstrap-install attempts were cancelled before completion; final install disabled build-hook dependency installation and rebuilt only the editable package.",
-      "tests": "42 BF16 projection GPU tests passed, including both installed-plugin import orders preserving strided FP32 projection behavior.",
+      "tests": "Installed-plugin-order projection regression now checks both numerical behavior and the public frozen-kernel-resolution boundary. A direct legacy-operator import reproduced the freeze bypass; the corrected installed-plugin paths passed both orders in the 134-case focused qualification.",
       "public_api_probe": "After loading installed plugins, public mm launched b12x Bf16GemmKernel, not legacy SmallNGemvKernel.",
       "serving": [
         {
@@ -174,6 +174,1296 @@
         "/home/luke/projects/vllm-hh-rebase/vllm/distributed/device_communicators/b12x_pcie_all_reduce.py": "8eedb02f8b3b5c6b5cb71f862845ee0c884cca2e3163ce0759ba2e832af36bb6",
         "/home/luke/projects/b12x/benchmarks/benchmark_pcie_dma.py": "5a2b4c98b093f3f98c2468fa44afd2ca9edb5af48f6e7e3c4a929d3a17db5bc3"
       }
+    },
+    {
+      "id": "mla-single-active-split-capacity-layout",
+      "status": "gpu_qualified",
+      "evidence": "A one-active-split LSE view can have strides (heads,1,1) at capacity 1 or (heads*capacity,capacity,1) at larger capacity. Choosing the first unit-stride dimension produced incompatible CuTe layout ABIs under an otherwise reused cache key.",
+      "fix": "Choose the innermost unit-stride dimension, include that layout choice in the compile key, and keep strides dynamic when no dimension is unit stride. Bump merge cache generations.",
+      "regression": "Single active split across capacities 1, 4 and 8, including sink normalization and frozen graph replay with input mutation. Failed before the fix; all 4 merge tests passed after it.",
+      "addressing_control": "Low/high physical-page native outputs were identical, compact and physical reference caches agreed, and compute-sanitizer reported zero errors. The failure was a split-merge layout/cache collision, not a high-page-address overflow."
+    },
+    {
+      "id": "paired-native-mla-pv-dequantization",
+      "status": "qualified",
+      "evidence": "Corrected production trace ranks native multi-group sparse attention as the largest prefill kernel group. The shared NVFP4 PV path decoded each adjacent BF16 pair separately for both scalar consumers.",
+      "fix": "Adjacent output-column lanes decode alternating KV entries and exchange packed pairs with xor-4 shuffles and byte permutation. Two pair decodes replace four; BF16 rounding, MMA operands, accumulation order, launch geometry, and planner policy remain unchanged.",
+      "cache_contract": "V4.0 uses 448 FP8 coordinates plus 64 BF16 RoPE coordinates. V4.1 quantizes all 512 post-RoPE coordinates: FP8/E8M0 SWA records are 528 bytes; FP4/E4M3 indexed records are 288 bytes. Both use the shared CuTe MLA implementation.",
+      "correctness": "All nine before/after full-output SHA256 values match across 6, 128 and 4096 rows and extend/decode plans. Independent format-specific oracle, query-mutation graph replay, frozen kernel resolution, and shared-pool physical offsets beyond 2^31 bytes passed.",
+      "focused_qualification": {
+        "b12x": "134 passed across compressed MLA, merge, GLM-next NVFP4 and BF16 projection contracts.",
+        "vllm": "28 passed across native workspace, CED metadata and CED model contracts."
+      },
+      "microbenchmark_comparison": [
+        {
+          "rows": 6,
+          "output_bitwise_equal": true,
+          "before_us": {
+            "extend-c1": 224.79040622711182,
+            "decode-c1": 253.0656099319458,
+            "decode-c4": 252.07040309906006
+          },
+          "after_us": {
+            "extend-c1": 118.19519996643066,
+            "decode-c1": 114.83520269393921,
+            "decode-c4": 106.0960054397583
+          },
+          "before_over_after": {
+            "extend-c1": 1.9018573198484872,
+            "decode-c1": 2.2037285082904474,
+            "decode-c4": 2.3758708167593223
+          }
+        },
+        {
+          "rows": 128,
+          "output_bitwise_equal": true,
+          "before_us": {
+            "extend-c1": 211.12639904022217,
+            "decode-c1": 236.77120208740234,
+            "decode-c4": 239.54238891601562
+          },
+          "after_us": {
+            "extend-c1": 110.47040224075317,
+            "decode-c1": 116.12800359725952,
+            "decode-c4": 112.43200302124023
+          },
+          "before_over_after": {
+            "extend-c1": 1.9111580546262954,
+            "decode-c1": 2.0388811893171117,
+            "decode-c4": 2.1305534232167167
+          }
+        },
+        {
+          "rows": 4096,
+          "output_bitwise_equal": true,
+          "before_us": {
+            "extend-c1": 4438.329696655273,
+            "decode-c1": 4998.944091796875,
+            "decode-c4": 5001.20964050293
+          },
+          "after_us": {
+            "extend-c1": 2306.4992904663086,
+            "decode-c1": 2441.427230834961,
+            "decode-c4": 2342.313575744629
+          },
+          "before_over_after": {
+            "extend-c1": 1.9242710002126076,
+            "decode-c1": 2.047549903868014,
+            "decode-c4": 2.1351580302022666
+          }
+        }
+      ],
+      "ratio_direction": "before latency / after latency; >1 is faster",
+      "limitations": "Sequential source-version diagnostics, not interleaved release-grade A/B. Post-run GPU snapshots remained P1 with memory clocks 15865 MHz and SM clocks 2527/2520 MHz; throttle mask changed from 0x0 to 0x4. No full-model speedup inferred from these microbenchmarks. Requested decode chunk capacities 1 and 4 both used one active chunk for this fixture. Full-model measurements are a separate sequential A/B, not a concurrency benchmark.",
+      "source_revisions": {
+        "b12x": "81544c5b",
+        "vllm": "3674c9d2e8"
+      },
+      "raw_artifacts": {
+        "/tmp/b12x-v41-optimization/attention-before-pair.json": "8533a78b03c9933569ad96d9c12e92e3389a0b643348538adfdfcc1e13031869",
+        "/tmp/b12x-v41-optimization/attention-after-pair.json": "b98b4e030653716045f555b177d336637773a569f42b55da905d8e23962551f3",
+        "/tmp/b12x-v41-optimization/ced-paired-attention-serving.json": "f051ea4620c64212dd8250f7d1b7459b0de18a6deb02ae908a380ddffd37d990",
+        "/tmp/b12x-v41-optimization/paired-attention-prefill-capture.json": "d41679560cb9f7f99e3a426cc24cb81165aceb76556ee0b8459c3c70a3bd3c10",
+        "/tmp/b12x-v41-optimization/canonical-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789123750411825188.pt.trace.json.gz": "f7855a391bda00a50c9a23d732ea960b9f1d58ad8c390b8942c9492f7df174eb"
+      },
+      "serving": [
+        {
+          "case": 4096,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            0.3736354709835723,
+            0.37373607099289075,
+            0.38050120102707297
+          ],
+          "after_samples_s": [
+            0.34345004899660125,
+            0.3593927869806066,
+            0.3642374519840814
+          ],
+          "before_median_s": 0.37373607099289075,
+          "after_median_s": 0.3593927869806066,
+          "before_over_after": 1.0399097715143018,
+          "output_text_equal": [
+            true,
+            true,
+            true
+          ]
+        },
+        {
+          "case": 16384,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            1.589911071001552,
+            1.5903267929679714,
+            1.5957793989800848
+          ],
+          "after_samples_s": [
+            1.4607321279472671,
+            1.4377700780169107,
+            1.4574792979983613
+          ],
+          "before_median_s": 1.5903267929679714,
+          "after_median_s": 1.4574792979983613,
+          "before_over_after": 1.0911488040701895,
+          "output_text_equal": [
+            true,
+            true,
+            true
+          ]
+        },
+        {
+          "case": "decode",
+          "metric": "decode_s_per_output_token",
+          "before_samples_s": [
+            0.009844672165382066,
+            0.0089104640472673,
+            0.009206383228283668
+          ],
+          "after_samples_s": [
+            0.009190334881633871,
+            0.008890366811015621,
+            0.00838747622828388
+          ],
+          "before_median_s": 0.009206383228283668,
+          "after_median_s": 0.008890366811015621,
+          "before_over_after": 1.035545936853414,
+          "output_text_equal": [
+            false,
+            true,
+            false
+          ]
+        }
+      ],
+      "serving_configuration": {
+        "physical_gpus": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "tensor_parallel_size": 4,
+        "engram_table_memory": "disk",
+        "max_model_len": 1048576,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 4,
+        "gpu_memory_utilization": 0.95,
+        "jit_monitor_mode": "error",
+        "kv_capacity_tokens": 4882971,
+        "requests": "Identical token IDs for all paired before/after cases; one request at a time."
+      },
+      "serving_interpretation": "Three unprofiled HTTP samples per case: 4K TTFT 0.373736 -> 0.359393 s; 16K 1.590327 -> 1.457479 s. Arithmetic outputs agree. Decode median 9.206 -> 8.890 ms/token, but ranges overlap and two of three texts differ; no established decode gain or full-model token-parity claim.",
+      "production_profile": {
+        "before_trace": "/tmp/b12x-v41-optimization/canonical-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789114307395275314.pt.trace.json.gz",
+        "after_trace": "/tmp/b12x-v41-optimization/canonical-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789123750411825188.pt.trace.json.gz",
+        "rows4096": {
+          "calls_per_arm": 80,
+          "mean_before_us": 4027.9896375,
+          "mean_after_us": 2100.1874125
+        },
+        "rows128": {
+          "calls_per_arm": 80,
+          "mean_before_us": 228.412225,
+          "mean_after_us": 116.1323
+        },
+        "unchanged_resources": {
+          "block_threads": 384,
+          "reported_registers_per_thread": 168,
+          "launch_shared_memory_bytes": 90496
+        },
+        "occupancy_note": "Profiler estimated occupancy reports zero despite successful launches; do not interpret that estimate as measured hardware occupancy."
+      },
+      "gpu_after": {
+        "time_ns": 1789123681829156237,
+        "command": [
+          "nvidia-smi",
+          "-i",
+          "0,1,2,3",
+          "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+          "--format=csv"
+        ],
+        "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2490 MHz, 15865 MHz, 0x0000000000000000, 195.20 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 193.12 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2490 MHz, 15865 MHz, 0x0000000000000000, 195.31 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2512 MHz, 15865 MHz, 0x0000000000000000, 205.35 W, 325.00 W\n"
+      },
+      "toolchain": {
+        "torch": "2.13.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "vllm": "0.27.2rc1.dev523+g3e63556c2.d20260827.cu133"
+      },
+      "command": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "benchmarks/benchmark_v41_serving.py",
+        "--label",
+        "ced-paired-attention",
+        "--repeats",
+        "3",
+        "--output",
+        "/tmp/b12x-v41-optimization/ced-paired-attention-serving.json"
+      ],
+      "worktree": "/home/luke/projects/b12x"
+    },
+    {
+      "id": "native-mla-packed-swa-and-byte-loads",
+      "status": "qualified",
+      "fix": "Reuse the existing packed E4M3-pair conversion and shared-halfword load for V4.1 SWA. Replace aligned shared-word load/shift/mask byte extraction with the existing native shared-byte instruction. Keep the same FP32 scaling and BF16 rounding points.",
+      "source_files": [
+        "b12x/attention/_shared/mla/decode_math.py",
+        "b12x/attention/_shared/mla/kernel.py",
+        "b12x/attention/_shared/mla/prefill_mg.py"
+      ],
+      "cache_generations": {
+        "decode": 35,
+        "prefill_mg": 8
+      },
+      "microbenchmark": [
+        {
+          "rows": 6,
+          "all_output_hashes_equal": true,
+          "baseline_us": {
+            "extend-c1": 118.559996287028,
+            "decode-c1": 115.11253515879314,
+            "decode-c4": 106.22186660766602
+          },
+          "packed_swa_us": {
+            "extend-c1": 86.06506983439128,
+            "decode-c1": 94.18026606241862,
+            "decode-c4": 94.19519901275635
+          },
+          "native_byte_us": {
+            "extend-c1": 70.97173531850179,
+            "decode-c1": 77.04213460286458,
+            "decode-c4": 76.72213713328044
+          },
+          "baseline_over_final": {
+            "extend-c1": 1.6705241284430075,
+            "decode-c1": 1.4941503860474943,
+            "decode-c4": 1.3845008830129317
+          }
+        },
+        {
+          "rows": 128,
+          "all_output_hashes_equal": true,
+          "baseline_us": {
+            "extend-c1": 110.64106623331706,
+            "decode-c1": 116.36373202006023,
+            "decode-c4": 112.21120357513428
+          },
+          "packed_swa_us": {
+            "extend-c1": 87.35786279042561,
+            "decode-c1": 100.26773611704509,
+            "decode-c4": 100.13759930928548
+          },
+          "native_byte_us": {
+            "extend-c1": 71.67786757151286,
+            "decode-c1": 83.80053043365479,
+            "decode-c4": 83.68639945983887
+          },
+          "baseline_over_final": {
+            "extend-c1": 1.5435875812422948,
+            "decode-c1": 1.3885798982165853,
+            "decode-c4": 1.340853523385057
+          }
+        },
+        {
+          "rows": 4096,
+          "all_output_hashes_equal": true,
+          "baseline_us": {
+            "extend-c1": 2341.355641682943,
+            "decode-c1": 2448.9110310872397,
+            "decode-c4": 2375.127410888672
+          },
+          "packed_swa_us": {
+            "extend-c1": 1897.8047688802083,
+            "decode-c1": 2177.8175354003906,
+            "decode-c4": 2179.314168294271
+          },
+          "native_byte_us": {
+            "extend-c1": 1541.751480102539,
+            "decode-c1": 1792.1972910563152,
+            "decode-c4": 1792.3082987467449
+          },
+          "baseline_over_final": {
+            "extend-c1": 1.5186336266900964,
+            "decode-c1": 1.3664293787900212,
+            "decode-c4": 1.32517793537499
+          }
+        }
+      ],
+      "correctness": "All nine complete output hashes match the pushed-checkpoint baseline across 6/128/4096 rows, extend/decode and split capacities 1/4. Independent V4.1 oracle, finite/nonzero checks, frozen query-mutation graph replay and physical offsets beyond 2^31 bytes passed. Thirteen targeted V4.1/GLM-next NVFP4 replay and high-page checks passed; no project-wide suite run.",
+      "resource_inspection": {
+        "scope": "Packed-SWA-only versus packed-SWA plus native byte loads, identical MG geometry; exact SHA256-verified host objects and bounded extracted CUDA ELF images. Offline inspection never loaded the CUDA modules. Source objects rehashed after inspection.",
+        "instructions_before": 6664,
+        "instructions_after": 4600,
+        "allocated_registers_per_thread": 168,
+        "stack_bytes": 0,
+        "local_bytes": 0,
+        "static_shared_memory_bytes": 1024,
+        "dynamic_shared_memory_bytes": 90496,
+        "notes": "No increase in the inspected resources. Counts are static SASS instructions, not executed instruction counts."
+      },
+      "ratio_direction": "baseline latency / candidate latency; >1 is faster",
+      "limitations": "Sequential source-version diagnostics, not an interleaved release-grade A/B. Sustained 1000-replay warmup, 11 samples and 30 replays/sample; raw GPU mode/clock/throttle snapshots retained. No full-model speedup inferred from kernel timings.",
+      "raw_artifacts": {
+        "/tmp/b12x-v41-optimization/attention-packed-load-baseline.json": "d8019a5f7098bf8ad9b297e16d2f4a2b07332d836af3db2dbe56c4655ce66110",
+        "/tmp/b12x-v41-optimization/attention-packed-swa.json": "4805f8ad5808348eb8e9eeefeffd7ea91651d509cabf738b0546f88b73c2dca9",
+        "/tmp/b12x-v41-optimization/attention-native-byte-load.json": "769f045355e0078ab7f82382100ec9b1324b5ae22916a0281fb0ec2dd5b2b991",
+        "/tmp/b12x-v41-optimization/attention-byte-load-resources.json": "c3972d2ab534ab1a532ee2bb88581af51950748e53bb422acff4ca5eba1b7834",
+        "/tmp/b12x-v41-optimization/ced-packed-attention-serving.json": "1ed18d76fe5513d9767c5eb72304c00290fe10b922526f9742b1255fecebb408",
+        "/tmp/b12x-v41-optimization/packed-attention-prefill-capture.json": "a7c1e4255575cf9a6b1732d4815f31a3e627b879413409846b6c2904a71309f6",
+        "/tmp/b12x-v41-optimization/canonical-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789125465621472041.pt.trace.json.gz": "2efb3b24e41ebe6c084c398a97b22c125dfb347daf493b5a8cb29e7aa0504172"
+      },
+      "serving": [
+        {
+          "case": 4096,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            0.34345004899660125,
+            0.3593927869806066,
+            0.3642374519840814
+          ],
+          "after_samples_s": [
+            0.3431904889876023,
+            0.35470665100729093,
+            0.3529510459629819
+          ],
+          "before_median_s": 0.3593927869806066,
+          "after_median_s": 0.3529510459629819,
+          "before_over_after": 1.0182510891844767,
+          "output_text_equal": [
+            true,
+            true,
+            true
+          ]
+        },
+        {
+          "case": 16384,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            1.4607321279472671,
+            1.4377700780169107,
+            1.4574792979983613
+          ],
+          "after_samples_s": [
+            1.411976044997573,
+            1.3895132340257987,
+            1.4140832719858736
+          ],
+          "before_median_s": 1.4574792979983613,
+          "after_median_s": 1.411976044997573,
+          "before_over_after": 1.032226646593616,
+          "output_text_equal": [
+            true,
+            true,
+            true
+          ]
+        },
+        {
+          "case": "decode",
+          "metric": "decode_s_per_output_token",
+          "before_samples_s": [
+            0.009190334881633871,
+            0.008890366811015621,
+            0.00838747622828388
+          ],
+          "after_samples_s": [
+            0.009878199456321941,
+            0.008124245315108185,
+            0.007978069243996631
+          ],
+          "before_median_s": 0.008890366811015621,
+          "after_median_s": 0.008124245315108185,
+          "before_over_after": 1.0943006354673614,
+          "output_text_equal": [
+            false,
+            false,
+            false
+          ]
+        }
+      ],
+      "serving_interpretation": "Three samples per case on identical prompt IDs. 4K TTFT median 0.359393 -> 0.352951 s, with overlapping sample ranges; 16K 1.457479 -> 1.411976 s with disjoint ranges. Both are about 11600 prompt tokens/s by prompt tokens/TTFT. Decode median 8.890 -> 8.124 ms/token, but ranges overlap and texts differ; no established decode gain or full-model token-parity claim.",
+      "production_profile": {
+        "trace": "/tmp/b12x-v41-optimization/canonical-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789125465621472041.pt.trace.json.gz",
+        "rows4096_calls": 80,
+        "rows4096_mean_us": 1367.7368875,
+        "rows128_calls": 80,
+        "rows128_mean_us": 76.960575,
+        "reported_registers_per_thread": 168,
+        "launch_shared_memory_bytes": 90496,
+        "block_threads": 384,
+        "next_compute_candidate": "MXFP4 paged score is now larger than the native sparse-attention group. Collective kernel durations also include waiting and require separate attribution."
+      },
+      "command": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "benchmarks/benchmark_v41_serving.py",
+        "--label",
+        "ced-packed-attention",
+        "--repeats",
+        "3",
+        "--output",
+        "/tmp/b12x-v41-optimization/ced-packed-attention-serving.json"
+      ],
+      "worktree": "/home/luke/projects/b12x",
+      "repositories": {
+        "b12x": {
+          "worktree": "/home/luke/projects/b12x",
+          "commit": "81544c5b76f869f2921b7f9f0438505846307f70",
+          "status": "M b12x/attention/_shared/mla/decode_math.py\n M b12x/attention/_shared/mla/kernel.py\n M b12x/attention/_shared/mla/prefill_mg.py\n M validation/deepseek_v41/profile_optimization.json"
+        },
+        "vllm": {
+          "worktree": "/home/luke/projects/vllm-hh-rebase",
+          "commit": "3674c9d2e853e4884454b982e0041ed10f796551",
+          "status": "?? serve-glm52.sh"
+        }
+      },
+      "toolchain": {
+        "torch": "2.13.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "vllm": "0.27.2rc1.dev523+g3e63556c2.d20260827.cu133"
+      },
+      "gpu_after": {
+        "time_ns": 1789125276986704961,
+        "command": [
+          "nvidia-smi",
+          "-i",
+          "0,1,2,3",
+          "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+          "--format=csv"
+        ],
+        "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2520 MHz, 15865 MHz, 0x0000000000000000, 199.10 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2497 MHz, 15865 MHz, 0x0000000000000000, 182.34 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2497 MHz, 15865 MHz, 0x0000000000000000, 189.48 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2550 MHz, 15865 MHz, 0x0000000000000000, 189.25 W, 325.00 W\n"
+      },
+      "serving_configuration": {
+        "physical_gpus": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "tensor_parallel_size": 4,
+        "max_model_len": 1048576,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 4,
+        "gpu_memory_utilization": 0.95,
+        "engram_table_memory": "disk",
+        "profiler_during_latency_measurement": false
+      }
+    },
+    {
+      "id": "native-tensorcore-mxfp4-paged-score",
+      "status": "qualified",
+      "fix": "Replace warp-per-candidate scalar dots with in-kernel BF16 dequantization and m16n8k16 BF16 tensor-core dots. Preserve BF16 input, dot, weighted-product and final head-sum boundaries, ordered FP32 head accumulation, and caller-owned TP-reduce-before-select contract. Keep 64 candidates/256 threads; reject the finer 32-candidate trial on the primary source-scoring workload.",
+      "source_files": [
+        "b12x/attention/dsa_indexer/mxfp4.py",
+        "tests/attention/test_dsa_indexer_mxfp4.py",
+        "benchmarks/benchmark_mxfp4_indexer.py"
+      ],
+      "compile_generation": 3,
+      "policy": "Same registered planned operation, typed config and public ABI; no backend lookup added to binding/replay and no live quantity added to compile identity.",
+      "correctness": "All 12 full BF16 score hashes match the scalar baseline. Exact independent BF16-stage oracle and top-k values pass; frozen row/visibility changes, graph mutation, stable addresses and warmed replay allocation invariants pass. Eleven focused indexer tests pass, including a new 1M-capacity/32-head case with poisoned scratch and missing high physical pages. Minimum-head/partial-width and real 16384-candidate-capacity probes pass.",
+      "oracle_correction": "The new 32-head boundary case exposed optional cuBLAS BF16 partial reductions in the old oracle. Native small/full-capacity scores were identical. The reduced-precision oracle differed at 310 scores; disabling that option and an explicit FP32-dot oracle each matched exactly. The reference now disables optional partial BF16 reductions only around the dot and restores the prior flag. No tolerance was widened.",
+      "microbenchmark": [
+        {
+          "mode": "dense",
+          "rows": 6,
+          "visible": 2048,
+          "baseline_us": {
+            "score": 10.34879982471466,
+            "score_select": 26.713600754737854
+          },
+          "tensorcore64_us": {
+            "score": 6.147199869155884,
+            "score_select": 22.539199888706207
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 1.6834981853511344,
+            "score_select": 1.1852062578371882
+          }
+        },
+        {
+          "mode": "dense",
+          "rows": 64,
+          "visible": 2048,
+          "baseline_us": {
+            "score": 75.88160037994385,
+            "score_select": 93.12639832496643
+          },
+          "tensorcore64_us": {
+            "score": 26.625600457191467,
+            "score_select": 43.006399273872375
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 2.8499488866719074,
+            "score_select": 2.165407936896112
+          }
+        },
+        {
+          "mode": "dense",
+          "rows": 6,
+          "visible": 8192,
+          "baseline_us": {
+            "score": 29.500800371170044,
+            "score_select": 47.176000475883484
+          },
+          "tensorcore64_us": {
+            "score": 14.156800508499146,
+            "score_select": 30.81279993057251
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 2.083860710861823,
+            "score_select": 1.5310520492191746
+          }
+        },
+        {
+          "mode": "dense",
+          "rows": 64,
+          "visible": 8192,
+          "baseline_us": {
+            "score": 328.6672115325928,
+            "score_select": 346.4911937713623
+          },
+          "tensorcore64_us": {
+            "score": 95.02400159835815,
+            "score_select": 116.8768048286438
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 3.4587810027384864,
+            "score_select": 2.964584754685605
+          }
+        },
+        {
+          "mode": "dense",
+          "rows": 6,
+          "visible": 16384,
+          "baseline_us": {
+            "score": 60.93760132789612,
+            "score_select": 78.2480001449585
+          },
+          "tensorcore64_us": {
+            "score": 21.275199949741364,
+            "score_select": 40.94560146331787
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 2.864255164315714,
+            "score_select": 1.9110233419103368
+          }
+        },
+        {
+          "mode": "dense",
+          "rows": 64,
+          "visible": 16384,
+          "baseline_us": {
+            "score": 657.97119140625,
+            "score_select": 678.7775993347168
+          },
+          "tensorcore64_us": {
+            "score": 202.3008108139038,
+            "score_select": 220.49760818481445
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 3.2524397146955413,
+            "score_select": 3.078389851584176
+          }
+        },
+        {
+          "mode": "candidates",
+          "rows": 6,
+          "visible": 2048,
+          "baseline_us": {
+            "score": 6.140799820423126,
+            "score_select": 21.059200167655945
+          },
+          "tensorcore64_us": {
+            "score": 6.217600032687187,
+            "score_select": 22.601599991321564
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 0.9876479329869553,
+            "score_select": 0.9317570515247655
+          }
+        },
+        {
+          "mode": "candidates",
+          "rows": 64,
+          "visible": 2048,
+          "baseline_us": {
+            "score": 18.436799943447113,
+            "score_select": 34.80960130691528
+          },
+          "tensorcore64_us": {
+            "score": 18.503999710083008,
+            "score_select": 34.89120006561279
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 0.9963683653432357,
+            "score_select": 0.9976613369977512
+          }
+        },
+        {
+          "mode": "candidates",
+          "rows": 6,
+          "visible": 8192,
+          "baseline_us": {
+            "score": 6.145599856972694,
+            "score_select": 22.545599937438965
+          },
+          "tensorcore64_us": {
+            "score": 6.241599842905998,
+            "score_select": 22.619199752807617
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 0.9846193302439255,
+            "score_select": 0.9967461353110197
+          }
+        },
+        {
+          "mode": "candidates",
+          "rows": 64,
+          "visible": 8192,
+          "baseline_us": {
+            "score": 28.892800211906433,
+            "score_select": 45.13919949531555
+          },
+          "tensorcore64_us": {
+            "score": 18.92320066690445,
+            "score_select": 36.735999584198
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 1.5268453112394575,
+            "score_select": 1.2287456447689038
+          }
+        },
+        {
+          "mode": "candidates",
+          "rows": 6,
+          "visible": 16384,
+          "baseline_us": {
+            "score": 6.871999800205231,
+            "score_select": 22.60960042476654
+          },
+          "tensorcore64_us": {
+            "score": 8.196800202131271,
+            "score_select": 24.377599358558655
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 0.8383759065419728,
+            "score_select": 0.9274744445592263
+          }
+        },
+        {
+          "mode": "candidates",
+          "rows": 64,
+          "visible": 16384,
+          "baseline_us": {
+            "score": 41.38239920139313,
+            "score_select": 57.43359923362732
+          },
+          "tensorcore64_us": {
+            "score": 20.547200739383698,
+            "score_select": 36.931198835372925
+          },
+          "exact_score_hash_equal": true,
+          "baseline_over_tensorcore64": {
+            "score": 2.014016396991426,
+            "score_select": 1.5551512283597215
+          }
+        }
+      ],
+      "resources": {
+        "old_reported_registers_per_thread": [
+          40,
+          48
+        ],
+        "new_reported_registers_per_thread": 128,
+        "inspected_dense_h8_static_shared_memory_bytes": 1024,
+        "inspected_dense_h8_dynamic_shared_memory_bytes": 22016,
+        "inspected_dense_h8_stack_bytes": 0,
+        "inspected_dense_h8_local_bytes": 0,
+        "inspected_dense_h8_hmma_instructions": 8,
+        "disposition": "Intentional register/shared-memory increase accompanies measured source-score speedup. The increased resources warrant separate inspection of masked full-capacity decode work."
+      },
+      "serving": [
+        {
+          "case": 4096,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            0.3431904889876023,
+            0.35470665100729093,
+            0.3529510459629819
+          ],
+          "after_samples_s": [
+            0.3452366149867885,
+            0.35004427999956533,
+            0.35382059100084007
+          ],
+          "before_median_s": 0.3529510459629819,
+          "after_median_s": 0.35004427999956533,
+          "before_over_after": 1.0083039950357713,
+          "output_text_equal": [
+            true,
+            true,
+            true
+          ]
+        },
+        {
+          "case": 16384,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            1.411976044997573,
+            1.3895132340257987,
+            1.4140832719858736
+          ],
+          "after_samples_s": [
+            1.3729979560011998,
+            1.3545199210057035,
+            1.3682403920101933
+          ],
+          "before_median_s": 1.411976044997573,
+          "after_median_s": 1.3682403920101933,
+          "before_over_after": 1.031964889534597,
+          "output_text_equal": [
+            true,
+            true,
+            true
+          ]
+        },
+        {
+          "case": "decode",
+          "metric": "decode_s_per_output_token",
+          "before_samples_s": [
+            0.009878199456321941,
+            0.008124245315108185,
+            0.007978069243996631
+          ],
+          "after_samples_s": [
+            0.009214945102209503,
+            0.008354617724576451,
+            0.008532709598368928
+          ],
+          "before_median_s": 0.008124245315108185,
+          "after_median_s": 0.008532709598368928,
+          "before_over_after": 0.952129592768653,
+          "output_text_equal": [
+            false,
+            false,
+            false
+          ]
+        }
+      ],
+      "serving_interpretation": "Three exact-input unprofiled samples per case: 16K TTFT 1.411976 -> 1.368240 s with disjoint ranges. 4K 0.352951 -> 0.350044 s has overlapping ranges. Decode median moved 8.124 -> 8.533 ms/token with overlapping ranges and different texts; no established decode improvement or regression, and no token-parity claim.",
+      "production_profile": {
+        "trace": "/tmp/b12x-v41-optimization/canonical-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789129999127781069.pt.trace.json.gz",
+        "score_calls_per_arm": 808,
+        "before_total_score_us": 136096.483,
+        "after_total_score_us": 46688.929,
+        "note": "Kernel durations are diagnostic; collective durations include waiting. Only separate unprofiled requests support end-to-end latency comparisons."
+      },
+      "command": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "benchmarks/benchmark_v41_serving.py",
+        "--label",
+        "ced-tensorcore-indexer",
+        "--repeats",
+        "3",
+        "--output",
+        "/tmp/b12x-v41-optimization/ced-tensorcore-indexer-serving.json"
+      ],
+      "worktree": "/home/luke/projects/b12x",
+      "repositories": {
+        "b12x": {
+          "worktree": "/home/luke/projects/b12x",
+          "commit": "81544c5b76f869f2921b7f9f0438505846307f70",
+          "status": "M README.md\n M b12x/attention/_shared/mla/decode_math.py\n M b12x/attention/_shared/mla/kernel.py\n M b12x/attention/_shared/mla/prefill_mg.py\n M b12x/attention/dsa_indexer/mxfp4.py\n M tests/attention/test_dsa_indexer_mxfp4.py\n M validation/deepseek_v41/profile_optimization.json\n?? benchmarks/benchmark_mxfp4_indexer.py"
+        },
+        "vllm": {
+          "worktree": "/home/luke/projects/vllm-hh-rebase",
+          "commit": "3674c9d2e853e4884454b982e0041ed10f796551",
+          "status": "?? serve-glm52.sh"
+        }
+      },
+      "toolchain": {
+        "torch": "2.13.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "vllm": "0.27.2rc1.dev523+g3e63556c2.d20260827.cu133"
+      },
+      "gpu_after": {
+        "time_ns": 1789129754841256179,
+        "command": [
+          "nvidia-smi",
+          "-i",
+          "0,1,2,3",
+          "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+          "--format=csv"
+        ],
+        "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2512 MHz, 15865 MHz, 0x0000000000000000, 204.29 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 191.03 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 189.59 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 196.95 W, 325.00 W\n"
+      },
+      "serving_configuration": {
+        "physical_gpus": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "tensor_parallel_size": 4,
+        "max_model_len": 1048576,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 4,
+        "gpu_memory_utilization": 0.95,
+        "engram_table_memory": "disk"
+      },
+      "ratio_direction": "baseline latency / candidate latency; >1 faster",
+      "limitations": "Sequential source-version diagnostics rather than release-grade interleaved A/B; full sample arrays, source hashes and GPU mode/clock/throttle snapshots retained. One-sample minimum-head probe is correctness evidence only. No project-wide test suite run.",
+      "raw_artifacts": {
+        "/tmp/b12x-v41-optimization/mxfp4-score-baseline.json": "b4b360fe45ab02233250df4e66c3768f804914fb0210e00543a773240d5ce94c",
+        "/tmp/b12x-v41-optimization/mxfp4-score-tensorcore.json": "47c351d996848884cad3e4f6dd17ee596bedfd404f3ada30bb45cbc0d3a49a6c",
+        "/tmp/b12x-v41-optimization/mxfp4-score-tensorcore-tile32.json": "b9916dbdfe01ded310d85732bbec32c0b8cb93056d4e0a79ddd3abc46884bf3b",
+        "/tmp/b12x-v41-optimization/mxfp4-min-head-qualification.json": "9624cb721fe78acd79b306d7f10a1ff74f28e198eda87f9cd236a7c07283c859",
+        "/tmp/b12x-v41-optimization/mxfp4-reindex-16k-qualified.json": "f0f44848fddbdbce16eb6f4ecbc44e3a8bd390fea6dc4781f857f33d34081c70",
+        "/tmp/b12x-v41-optimization/mxfp4-oracle-precision-control.json": "06939a31e202e5cd0a279fe0840261d577a83b7f8ee46d8d175ba6bcdd868440",
+        "/tmp/b12x-v41-optimization/mxfp4-score-h8-native-resources.json": "16045c8c28dc81f90c9d181a911ba37e8b9c21b8a15f103e3ded8312661bed98",
+        "/tmp/b12x-v41-optimization/ced-tensorcore-indexer-serving.json": "69f7a107963a21c66391cc5d43bae19d09657b70239cbf4cea3ef869102c60e8",
+        "/tmp/b12x-v41-optimization/tensorcore-indexer-prefill-capture.json": "ebf86152aae4fb5923702c31318925347048f4f2fb8a5ae22ed89db2064f2bf1",
+        "/tmp/b12x-v41-optimization/canonical-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789129999127781069.pt.trace.json.gz": "35974d92fa892c355d1160d529ddef11187192c40c829768708651cb9a64a743"
+      }
+    },
+    {
+      "id": "bounded-mxfp4-replay-work",
+      "status": "replay_qualified_end_to_end_gain_unestablished",
+      "fix": "Bound score dispatch to 256 CTAs per row and assign matching strided 64-column clear/compute domains. Preserve the fully defined public BF16 score tensor for TP reduction. Bound selector-preparation dispatch and write only the live private-logit prefix that the length-bounded selector consumes. Saturating progress and overflow-safe ceiling arithmetic preserve counter bounds.",
+      "compile_generation": 7,
+      "correctness": "All six complete 1M-capacity score hashes match. Frozen replay, changing visibility, stable addresses and no warmed replay allocation pass. Twelve focused tests pass, including poisoned 1M scratch, 32-head dots across multiple score stripes, missing high pages, and source newest-block selection across the 524K boundary.",
+      "kernel_comparison": [
+        {
+          "rows": 1,
+          "visible": 128,
+          "score_width": 1048576,
+          "before_us": {
+            "score": 8.198399841785431,
+            "score_select": 22.523200511932373
+          },
+          "after_us": {
+            "score": 6.249599903821945,
+            "score_select": 18.412800133228302
+          },
+          "before_over_after": {
+            "score": 1.3118279518616378,
+            "score_select": 1.223236028684541
+          },
+          "score_hash_equal": true
+        },
+        {
+          "rows": 6,
+          "visible": 128,
+          "score_width": 1048576,
+          "before_us": {
+            "score": 24.660800397396088,
+            "score_select": 53.31839919090271
+          },
+          "after_us": {
+            "score": 14.334399998188019,
+            "score_select": 24.662399291992188
+          },
+          "before_over_after": {
+            "score": 1.720392928934131,
+            "score_select": 2.161930741597191
+          },
+          "score_hash_equal": true
+        },
+        {
+          "rows": 1,
+          "visible": 8192,
+          "score_width": 1048576,
+          "before_us": {
+            "score": 14.417600631713867,
+            "score_select": 32.85439908504486
+          },
+          "after_us": {
+            "score": 7.463999837636948,
+            "score_select": 22.53279983997345
+          },
+          "before_over_after": {
+            "score": 1.931618561808327,
+            "score_select": 1.4580699832410873
+          },
+          "score_hash_equal": true
+        },
+        {
+          "rows": 6,
+          "visible": 8192,
+          "score_width": 1048576,
+          "before_us": {
+            "score": 37.34560012817383,
+            "score_select": 73.74719977378845
+          },
+          "after_us": {
+            "score": 20.854400098323822,
+            "score_select": 39.29600119590759
+          },
+          "before_over_after": {
+            "score": 1.790777963024479,
+            "score_select": 1.8767100348487549
+          },
+          "score_hash_equal": true
+        },
+        {
+          "rows": 1,
+          "visible": 16384,
+          "score_width": 1048576,
+          "before_us": {
+            "score": 14.41279947757721,
+            "score_select": 36.84479892253876
+          },
+          "after_us": {
+            "score": 8.191999793052673,
+            "score_select": 26.692798733711243
+          },
+          "before_over_after": {
+            "score": 1.759374980673237,
+            "score_select": 1.3803273043828936
+          },
+          "score_hash_equal": true
+        },
+        {
+          "rows": 6,
+          "visible": 16384,
+          "score_width": 1048576,
+          "before_us": {
+            "score": 44.755199551582336,
+            "score_select": 81.7903995513916
+          },
+          "after_us": {
+            "score": 30.934399366378784,
+            "score_select": 51.26720070838928
+          },
+          "before_over_after": {
+            "score": 1.4467777124589902,
+            "score_select": 1.5953747897533939
+          },
+          "score_hash_equal": true
+        }
+      ],
+      "serving": [
+        {
+          "case": 4096,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            0.3452366149867885,
+            0.35004427999956533,
+            0.35382059100084007
+          ],
+          "after_samples_s": [
+            0.33640768105397,
+            0.3659517429769039,
+            0.350822723004967
+          ],
+          "before_median_s": 0.35004427999956533,
+          "after_median_s": 0.350822723004967,
+          "before_over_after": 0.9977810929727302
+        },
+        {
+          "case": 16384,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            1.3729979560011998,
+            1.3545199210057035,
+            1.3682403920101933
+          ],
+          "after_samples_s": [
+            1.3749940539710224,
+            1.4228559699840844,
+            1.384587888023816
+          ],
+          "before_median_s": 1.3682403920101933,
+          "after_median_s": 1.384587888023816,
+          "before_over_after": 0.9881932406349769
+        },
+        {
+          "case": "decode",
+          "metric": "decode_s_per_output_token",
+          "before_samples_s": [
+            0.009214945102209503,
+            0.008354617724576451,
+            0.008532709598368928
+          ],
+          "after_samples_s": [
+            0.009744254212668826,
+            0.00818613688158986,
+            0.008090635692869408
+          ],
+          "before_median_s": 0.008532709598368928,
+          "after_median_s": 0.00818613688158986,
+          "before_over_after": 1.0423365406408596
+        }
+      ],
+      "interpretation": "Full-capacity six-row score+selection improves 1.60\u20132.16x in the native replay diagnostic. Three-sample HTTP measurements do not establish an end-to-end gain: 16K median moved 1.368240 -> 1.384588 s; decode 8.533 -> 8.186 ms/token has overlapping ranges. Preserve this uncertainty and measure acceptance-controlled decode next.",
+      "command": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "benchmarks/benchmark_v41_serving.py",
+        "--label",
+        "ced-bounded-indexer",
+        "--repeats",
+        "3",
+        "--output",
+        "/tmp/b12x-v41-optimization/ced-bounded-indexer-serving.json"
+      ],
+      "worktree": "/home/luke/projects/b12x",
+      "repositories": {
+        "b12x": {
+          "worktree": "/home/luke/projects/b12x",
+          "commit": "81544c5b76f869f2921b7f9f0438505846307f70",
+          "status": "M README.md\n M b12x/attention/_shared/mla/decode_math.py\n M b12x/attention/_shared/mla/kernel.py\n M b12x/attention/_shared/mla/prefill_mg.py\n M b12x/attention/dsa_indexer/mxfp4.py\n M tests/attention/test_dsa_indexer_mxfp4.py\n M validation/deepseek_v41/profile_optimization.json\n?? benchmarks/benchmark_mxfp4_indexer.py"
+        },
+        "vllm": {
+          "worktree": "/home/luke/projects/vllm-hh-rebase",
+          "commit": "3674c9d2e853e4884454b982e0041ed10f796551",
+          "status": "?? serve-glm52.sh"
+        }
+      },
+      "toolchain": {
+        "torch": "2.13.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "vllm": "0.27.2rc1.dev523+g3e63556c2.d20260827.cu133"
+      },
+      "gpu_after": {
+        "time_ns": 1789132806029066831,
+        "command": [
+          "nvidia-smi",
+          "-i",
+          "0,1,2,3",
+          "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+          "--format=csv"
+        ],
+        "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2497 MHz, 15865 MHz, 0x0000000000000000, 184.31 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2497 MHz, 15865 MHz, 0x0000000000000000, 201.92 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2490 MHz, 15865 MHz, 0x0000000000000000, 190.62 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 196.56 W, 325.00 W\n"
+      },
+      "ratio_direction": "before latency / after latency; >1 faster",
+      "raw_artifacts": {
+        "/tmp/b12x-v41-optimization/mxfp4-full-capacity-baseline.json": "ff5d4719192927d288a23768c93693def2758ec8a5270a0e74709846f449718d",
+        "/tmp/b12x-v41-optimization/mxfp4-full-capacity-persistent.json": "e42eb50307ba208058b1a2ae65ad58dcab07a8ff8c36f7640ad2ce05d5734e55",
+        "/tmp/b12x-v41-optimization/mxfp4-full-capacity-persistent-select.json": "2b9d658aac00f0fbb1fe03711e4a367d5750ac3c2e540b309ffae24eee80295f",
+        "/tmp/b12x-v41-optimization/mxfp4-full-capacity-live-prepare.json": "bb41ca2a6bd0ce011e6521028a44ebab43ed643d4eb3183521f3b1c3e6de1b11",
+        "/tmp/b12x-v41-optimization/mxfp4-score-persistent-qualified.json": "25bb7f2cb90496c3e286e3635aa2358c6a2fb4a924f2b5acf665d009f55f1e59",
+        "/tmp/b12x-v41-optimization/ced-bounded-indexer-serving.json": "8f0d013a3f8d9f0efde372fa55f9ff04fb3214e7bed9873ec27619b8e7b1aaf2"
+      }
+    },
+    {
+      "id": "v41-shared-heads-and-tp-consistent-drafting",
+      "status": "qualified",
+      "user_constraints": "Keep the V4.1 checkpoint, three draft layers, V4.1 attention/cache and mHC contracts, five proposed drafts and full vocabulary. Reuse V4.0 execution structure/kernel dispatch rather than changing draft settings or substituting a V4.0 model.",
+      "changes": [
+        "Remove V4.1-only LogitsProcessor and Markov/confidence dispatch overrides; use shared DSpark heads and normal vocabulary dispatch. The actual trace uses the existing native b12x DenseGemm paths.",
+        "Limit V4.1 metadata refresh to the padded token domain of the selected graph while retaining fixed-capacity storage.",
+        "Limit draft query-slot padding to the maximum draft query domain; retain full context preparation and rejected-row masking.",
+        "Publish TP-rank-zero confidences before both the stale CPU budget copy and GPU per-request allocation so graph shape/control decisions cannot diverge across TP replicas."
+      ],
+      "ruled_out": [
+        "The observed drafter backbone and all five Markov sampling steps were already captured in one CUDA graph; the actual query domain is five rows, not scheduler capacity.",
+        "The DFlash override already supplies the correct query length; an initial suspected CPU/GPU boundary bug was retracted and the redundant argument was removed.",
+        "The long CPU event waits in the stack trace belong to target AsyncOutput.get_output, not solely to drafter execution."
+      ],
+      "capture_evidence": {
+        "baseline_graph": 119,
+        "baseline_replays": 4,
+        "baseline_query_rows": 5,
+        "final": {
+          "short": {
+            "graph_id": 119,
+            "replays": 4,
+            "gpu_spans_us": [
+              1495.4560546875,
+              1517.3759765625,
+              1493.0556640625,
+              1493.2802734375
+            ],
+            "total_kernel_us": 5825.568,
+            "metadata_token_grids": {
+              "(1, 1, 1)": 84
+            }
+          },
+          "long": {
+            "graph_id": 119,
+            "replays": 4,
+            "gpu_spans_us": [
+              1540.9609375,
+              1508.671875,
+              1481.18359375,
+              1531.0078125
+            ],
+            "total_kernel_us": 5891.0380000000005,
+            "metadata_token_grids": {
+              "(1, 1, 1)": 84
+            }
+          }
+        },
+        "gpu_span_comparison": [
+          {
+            "context": "short",
+            "before_gpu_spans_us": [
+              1765.6923828125,
+              1752.5400390625,
+              1788.091796875,
+              1727.5478515625
+            ],
+            "after_gpu_spans_us": [
+              1495.4560546875,
+              1517.3759765625,
+              1493.0556640625,
+              1493.2802734375
+            ],
+            "before_over_after_median": 1.177163869815904
+          },
+          {
+            "context": "long",
+            "before_gpu_spans_us": [
+              1748.5322265625,
+              1768.5654296875,
+              1788.2763671875,
+              1764.5009765625
+            ],
+            "after_gpu_spans_us": [
+              1540.9609375,
+              1508.671875,
+              1481.18359375,
+              1531.0078125
+            ],
+            "before_over_after_median": 1.1623153652600116
+          }
+        ]
+      },
+      "control_plane_reproduction": "A two-GPU regression fails before confidence synchronization and passes after it. It covers both a small confidence difference selecting incompatible 2/4-token graph budgets and reversed per-request rankings under an equal total budget.",
+      "stability": "The shared-head path previously stalled in sample_tokens, including an unprofiled run. After the TP consistency fix, 18 unprofiled requests generated 6912 recorded output tokens and two additional 512-token profiled requests completed. Profile start/stop returned200. The invariant regression and sustained reproduction support the fix; no claim of an unobserved per-rank dump at the original production hang.",
+      "qualification": [
+        "Three targeted shared-Markov/tied-head GPU checks passed.",
+        "Three existing draft-input preparation checks and two bounded-domain/context-regeneration checks passed.",
+        "The new two-GPU TP consistency regression failed before and passed after the fix.",
+        "Eleven remaining adaptive-verification tests passed."
+      ],
+      "end_to_end": [
+        {
+          "case": "decode",
+          "before_median_ms_per_token": 8.088569635269687,
+          "after_median_ms_per_token": 8.015024388327683,
+          "after_samples_ms_per_token": [
+            8.138019627407559,
+            8.658982748987482,
+            7.826448893904978,
+            8.015024388327683,
+            7.321308603893746
+          ],
+          "mean_acceptance_length": 2.5207100591715976,
+          "ms_per_draft_step": 20.098116345055168
+        },
+        {
+          "case": "decode-4096",
+          "before_median_ms_per_token": 8.410415109749154,
+          "after_median_ms_per_token": 8.373508176665899,
+          "after_samples_ms_per_token": [
+            8.373508176665899,
+            8.51034477248094,
+            8.308288302071684,
+            8.094140039026446,
+            8.567986545134701
+          ],
+          "mean_acceptance_length": 2.403377110694184,
+          "ms_per_draft_step": 20.024086863080328
+        },
+        {
+          "case": "decode-16384",
+          "before_median_ms_per_token": 8.02893447050569,
+          "after_median_ms_per_token": 8.008984482262795,
+          "after_samples_ms_per_token": [
+            7.4511758236707575,
+            7.924723506028599,
+            8.184123886338272,
+            8.008984482262795,
+            8.283201921457316
+          ],
+          "mean_acceptance_length": 2.562874251497006,
+          "ms_per_draft_step": 20.284058788499447
+        }
+      ],
+      "interpretation": "Drafter CUDA graph spans improve about14\u201315% in the bounded diagnostic traces. Full decode medians remain about8.0\u20138.4ms/token with overlapping sample ranges; no broad end-to-end speedup claim. 1024-token continuations measured7.03\u20137.31ms/token but are separate workloads, not an A/B speedup.",
+      "rejected_work": "The three-draft trial was cancelled at user direction. The custom WarpNGemv experiment and its benchmark/test additions were removed; it is not part of the final implementation.",
+      "command": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "/home/luke/projects/b12x/benchmarks/benchmark_v41_serving.py",
+        "--label",
+        "decode-tp-consistent",
+        "--prefill-tokens",
+        "",
+        "--decode-context-tokens",
+        "0,4096,16384",
+        "--decode-tokens",
+        "256",
+        "--spec-metrics",
+        "--repeat-offset",
+        "10",
+        "--repeats",
+        "5",
+        "--output",
+        "/tmp/b12x-v41-optimization/decode-tp-consistent.json"
+      ],
+      "worktree": "/home/luke/projects/vllm-hh-rebase",
+      "repositories": {
+        "b12x": {
+          "worktree": "/home/luke/projects/b12x",
+          "commit": "81544c5b76f869f2921b7f9f0438505846307f70",
+          "status": "M README.md\n M b12x/attention/_shared/mla/decode_math.py\n M b12x/attention/_shared/mla/kernel.py\n M b12x/attention/_shared/mla/prefill_mg.py\n M b12x/attention/dsa_indexer/mxfp4.py\n M benchmarks/benchmark_v41_serving.py\n M tests/attention/test_dsa_indexer_mxfp4.py\n M validation/deepseek_v41/profile_optimization.json\n?? benchmarks/benchmark_mxfp4_indexer.py\n?? benchmarks/profile_v41_decode.py"
+        },
+        "vllm": {
+          "worktree": "/home/luke/projects/vllm-hh-rebase",
+          "commit": "3674c9d2e853e4884454b982e0041ed10f796551",
+          "status": "M tests/model_executor/kernels/test_b12x_linear.py\n M tests/models/test_dspark_mla.py\n M tests/v1/attention/test_b12x_v41_ced_metadata.py\n M tests/v1/attention/test_b12x_v41_workspace.py\n M tests/v1/spec_decode/test_adaptive_verification.py\n M vllm/models/deepseek_v4_1/b12x_layers.py\n M vllm/models/deepseek_v4_1/nvidia/dspark.py\n M vllm/models/deepseek_v4_1/nvidia/model.py\n M vllm/models/deepseek_v4_1/sparse_mla.py\n M vllm/v1/worker/gpu/spec_decode/adaptive_verification.py\n M vllm/v1/worker/gpu/spec_decode/dflash/speculator.py\n?? serve-glm52.sh"
+        }
+      },
+      "toolchain": {
+        "torch": "2.13.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "vllm": "0.27.2rc1.dev523+g3e63556c2.d20260827.cu133"
+      },
+      "gpu_after": {
+        "time_ns": 1789143789300917460,
+        "command": [
+          "nvidia-smi",
+          "-i",
+          "0,1,2,3",
+          "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+          "--format=csv"
+        ],
+        "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 219.80 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2520 MHz, 15865 MHz, 0x0000000000000000, 204.40 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 204.24 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2527 MHz, 15865 MHz, 0x0000000000000000, 212.47 W, 325.00 W\n"
+      },
+      "serving_configuration": {
+        "tensor_parallel_size": 4,
+        "physical_gpus": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "max_model_len": 1048576,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 4,
+        "engram_table_memory": "disk",
+        "draft_tokens": 5
+      },
+      "ratio_direction": "before latency / after latency; >1 faster",
+      "raw_artifacts": {
+        "/tmp/b12x-v41-optimization/decode-draft5-baseline.json": "5ab5379ec946ca60ca847e1e3529412164444acb4537a877b9397068b0d50a30",
+        "/tmp/b12x-v41-optimization/decode-shared-head-baseline.json": "7f1191e34ac12cbdf02a5ae368aa8ba8dcdc3406b816d65eee52be37b0372adc",
+        "/tmp/b12x-v41-optimization/decode-structural-final.json": "019e4a6fc2c993990cf144f214bf8bf69bd7b5fa586925322d58d453da197a25",
+        "/tmp/b12x-v41-optimization/decode-tp-consistent.json": "2c7a36fb9491c99f8550e633875f8b48ba7a6863e86bdb327856391f2d7aa4a9",
+        "/tmp/b12x-v41-optimization/decode-tp-consistent-long-run.json": "d2ed5a9da978be56cda75b62b645a98ffd210c8ebb37ba26d44f756b205c9b4e",
+        "/tmp/b12x-v41-optimization/drafter-fixed-short-profile.json": "fdf217919be45f981b8564fe10911dcb1b58aa880d234e893373375cf7359eac",
+        "/tmp/b12x-v41-optimization/drafter-fixed-long-profile.json": "9113bf7d6c331723c924ef7255dddef7f7319bb3c6844cfebea95e7cb87e4016",
+        "/tmp/b12x-v41-optimization/drafter-fixed-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789144199522327003.pt.trace.json.gz": "122096df4e97ba30fe3425a13a5b661c5d8b2937c2c7aca6fa3be6f68facd900",
+        "/tmp/b12x-v41-optimization/drafter-fixed-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789144205236500250.pt.trace.json.gz": "e00087fe340751ded4ea8bf7fea6b2963c232db2d5c8f82423315e15214f80a1"
+      }
     }
   ],
   "raw_artifacts": {
@@ -204,8 +1494,7 @@
   },
   "profiling_note": "Large prefill Python-stack trace exported but Torch key_averages hit recursion limit. Subsequent canonical traces disable Python stacks and optional summary generation; rawtrace export and response703 both passed.",
   "next_candidates": [
-    "Native prefill attention remains largest GPU kernel group.",
-    "V4.1 FP32 full-prefill collectives80MiB exceed current40MiB DMA plan; investigate per-dtype capacity/replay without doubling BF16 traffic.",
-    "Decode FC1 M64 padding for<=6 useful rows/expert; preserve V4.1 recipe before any kernel variant."
+    "Keep five-draft semantics fixed. Investigate remaining drafter graph costs only through measured implementation/structural changes.",
+    "Investigate the FP32 drafter collective admission path separately from wait time; do not change payload precision."
   ]
 }

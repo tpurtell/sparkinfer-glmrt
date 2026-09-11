@@ -3981,7 +3981,9 @@ def _sparse_mla_prefill_mg_flat_launch(
         # read from kv_sc smem). In that mode the launch scalar is dead, so the
         # identity fold is forced ON -- no per-scalar variants get compiled.
         # v6: paired-lane NVFP4/V4.1 PV dequantization.
-        6,
+        # v7: one packed load/conversion per V4.1 SWA pair.
+        # v8: native shared byte loads for packed dequantization.
+        8,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),

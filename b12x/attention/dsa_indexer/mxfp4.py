@@ -15,7 +15,9 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint16, Uint32
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from ..._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from ..._lib.intrinsics import (
@@ -24,6 +26,12 @@ from ..._lib.intrinsics import (
     fabs_f32,
     fmax_f32,
     fp4_decode_2,
+    get_ptr_as_int64,
+    ld_global_nc_u32,
+    ld_shared_u32,
+    ldmatrix_m8n8x4_b16,
+    mma_m16n8k16_f32_bf16,
+    shared_ptr_to_u32,
     pow2_ceil_ue8m0,
     u32_as_f32,
     ue8m0_to_output_scale,
@@ -144,11 +152,11 @@ class _Quantize:
 
 
 class _PagedScore:
-    """Direct-K DSA score, specialized for per-32 FP4 scales and BF16 stages.
+    """Paged BF16 tensor-core score with the published MXFP4 rounding stages.
 
-    A warp owns a logical candidate rather than a contiguous group of eight
-    FP8 tokens. This makes the later reindex path proportional to candidate
-    capacity and keeps every gather at the paged source (no full-context mask).
+    Each warp scores eight candidates against a sixteen-head tile. Q/K are
+    dequantized to BF16 before MMA; dot, weighted product and final head sum
+    retain their distinct BF16 boundaries before the caller's TP reduction.
     """
 
     def __init__(self, heads: int, candidates: bool, page_size: int):
@@ -177,10 +185,6 @@ class _PagedScore:
         pool_pages: Int64,
         stream: cuda.CUstream,
     ):
-        block_cols = Int32(8)
-        if cutlass.const_expr(not self.candidates):
-            if width >= Int32(65536):
-                block_cols = Int32(256)
         self.kernel(
             _flat(q),
             _flat(qs),
@@ -198,9 +202,12 @@ class _PagedScore:
             page_row_stride,
             pool_stride,
             pool_pages,
-            block_cols,
         ).launch(
-            grid=((width + block_cols - Int32(1)) // block_cols, rows, 1),
+            grid=(
+                cutlass.min((width - Int32(1)) // Int32(64) + Int32(1), Int32(256)),
+                rows,
+                1,
+            ),
             block=(256, 1, 1),
             stream=stream,
         )
@@ -224,34 +231,310 @@ class _PagedScore:
         page_row_stride: Int64,
         pool_stride: Int64,
         pool_pages: Int64,
-        block_cols: Int32,
+    ):
+        tx, _, _ = cute.arch.thread_idx()
+        bx, row, _ = cute.arch.block_idx()
+        grid_cols, _, _ = cute.arch.grid_dim()
+        grid_stride = Int32(grid_cols) * Int32(64)
+        lane = Int32(tx) & Int32(31)
+        warp = Int32(tx) // Int32(32)
+        gid, tid = lane >> Int32(2), lane & Int32(3)
+        block_start = Int32(bx) * Int32(64)
+        # Clearing and scoring own the same strided 64-column tiles. This
+        # bounds idle CTA dispatch without needing an inter-CTA barrier.
+        clear_col = block_start + Int32(tx)
+        if Int32(tx) < Int32(64):
+            while clear_col < width:
+                scores[Int64(row) * Int64(width) + Int64(clear_col)] = BFloat16(
+                    -float("inf")
+                )
+                clear_col += cutlass.min(grid_stride, width - clear_col)
+        end = width
+        if cutlass.const_expr(self.candidates):
+            end = cutlass.min(end, cutlass.max(candidate_lengths[row], Int32(0)))
+        else:
+            end = cutlass.min(
+                end, cutlass.max(Int32(0), cutlass.min(lengths[row], active[0]))
+            )
+        smem = cutlass.utils.SmemAllocator()
+        # 136 BF16 elements per row gives conflict-free 8x8 matrix rows and
+        # packed K fragments while keeping every ldmatrix address 16B aligned.
+        sk = smem.allocate_tensor(
+            BFloat16, cute.make_layout((64, 136), stride=(136, 1)), byte_alignment=16
+        )
+        sq = smem.allocate_tensor(
+            BFloat16, cute.make_layout((16, 136), stride=(136, 1)), byte_alignment=16
+        )
+        valid_keys = smem.allocate_tensor(
+            Int32, cute.make_layout((64,)), byte_alignment=16
+        )
+        k_addr = shared_ptr_to_u32(sk.iterator)
+        q_addr = shared_ptr_to_u32(sq.iterator)
+        tile_start = block_start
+        while tile_start < end:
+            for part in cutlass.range_constexpr(16):
+                pair_index = Int32(tx) + Int32(part * 256)
+                key_row = pair_index // Int32(64)
+                byte_col = pair_index % Int32(64)
+                col = tile_start + key_row
+                pos = col
+                valid = col < end
+                if cutlass.const_expr(self.candidates):
+                    if valid:
+                        pos = candidates[Int64(row) * Int64(width) + Int64(col)]
+                valid = (
+                    valid and pos >= Int32(0) and pos < lengths[row] and pos < active[0]
+                )
+                valid = valid and pos // Int32(self.page_size) < page_width
+                page = Int64(-1)
+                if valid:
+                    page = Int64(
+                        pages[
+                            Int64(row) * page_row_stride
+                            + Int64(pos // Int32(self.page_size))
+                        ]
+                    )
+                valid = valid and page >= Int64(0) and page < pool_pages
+                k0, k1 = Float32(0.0), Float32(0.0)
+                if valid:
+                    token = Int64(pos % Int32(self.page_size))
+                    kb = page * pool_stride + token * Int64(64)
+                    sb = (
+                        page * pool_stride
+                        + Int64(self.page_size * 64)
+                        + token * Int64(4)
+                    )
+                    k0, k1 = f16x2_to_f32x2(
+                        fp4_decode_2(Uint32(pool[kb + Int64(byte_col)]))
+                    )
+                    scale = u32_as_f32(
+                        Uint32(pool[sb + Int64(byte_col // Int32(16))]) << Uint32(23)
+                    )
+                    k0, k1 = k0 * scale, k1 * scale
+                sk[key_row, byte_col * Int32(2)] = BFloat16(k0)
+                sk[key_row, byte_col * Int32(2) + Int32(1)] = BFloat16(k1)
+                if byte_col == Int32(0):
+                    valid_keys[key_row] = Int32(valid)
+
+            total0, total1 = Float32(0.0), Float32(0.0)
+            for head_group in cutlass.range_constexpr((self.heads + 15) // 16):
+                for part in cutlass.range_constexpr(4):
+                    pair_index = Int32(tx) + Int32(part * 256)
+                    local_head = pair_index // Int32(64)
+                    byte_col = pair_index % Int32(64)
+                    head = Int32(head_group * 16) + local_head
+                    q0, q1 = Float32(0.0), Float32(0.0)
+                    if head < Int32(self.heads):
+                        qb = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(64)
+                        qsb = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(4)
+                        q0, q1 = f16x2_to_f32x2(
+                            fp4_decode_2(Uint32(q[qb + Int64(byte_col)]))
+                        )
+                        scale = u32_as_f32(
+                            Uint32(qs[qsb + Int64(byte_col // Int32(16))]) << Uint32(23)
+                        )
+                        q0, q1 = q0 * scale, q1 * scale
+                    sq[local_head, byte_col * Int32(2)] = BFloat16(q0)
+                    sq[local_head, byte_col * Int32(2) + Int32(1)] = BFloat16(q1)
+                cute.arch.sync_threads()
+                d0, d1, d2, d3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
+                for step in cutlass.range_constexpr(8):
+                    a_offset = (
+                        (lane & Int32(15)) * Int32(136)
+                        + Int32(step * 16)
+                        + (lane >> Int32(4)) * Int32(8)
+                    ) * Int32(2)
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(q_addr + a_offset)
+                    b_offset = (
+                        (warp * Int32(8) + gid) * Int32(136)
+                        + Int32(step * 16)
+                        + tid * Int32(2)
+                    ) * Int32(2)
+                    b0 = ld_shared_u32(k_addr + b_offset)
+                    b1 = ld_shared_u32(k_addr + b_offset + Int32(16))
+                    d0, d1, d2, d3 = mma_m16n8k16_f32_bf16(
+                        d0, d1, d2, d3, a0, a1, a2, a3, b0, b1
+                    )
+                head0 = Int32(head_group * 16) + gid
+                head1 = head0 + Int32(8)
+                w0, w1 = Float32(0.0), Float32(0.0)
+                if head0 < Int32(self.heads):
+                    w0 = Float32(weights[Int64(row) * Int64(self.heads) + Int64(head0)])
+                if head1 < Int32(self.heads):
+                    w1 = Float32(weights[Int64(row) * Int64(self.heads) + Int64(head1)])
+                p0 = Float32(
+                    BFloat16(fmax_f32(Float32(BFloat16(d0)), Float32(0.0)) * w0)
+                )
+                p1 = Float32(
+                    BFloat16(fmax_f32(Float32(BFloat16(d1)), Float32(0.0)) * w0)
+                )
+                p2 = Float32(
+                    BFloat16(fmax_f32(Float32(BFloat16(d2)), Float32(0.0)) * w1)
+                )
+                p3 = Float32(
+                    BFloat16(fmax_f32(Float32(BFloat16(d3)), Float32(0.0)) * w1)
+                )
+                # Preserve the FP32 head-sum order, including signed weights
+                # and cancellation, rather than introducing a new tree fold.
+                for head in cutlass.range_constexpr(
+                    min(16, self.heads - head_group * 16)
+                ):
+                    source_lane = Int32((head % 8) * 4) + tid
+                    if cutlass.const_expr(head < 8):
+                        total0 += cute.arch.shuffle_sync(p0, source_lane)
+                        total1 += cute.arch.shuffle_sync(p1, source_lane)
+                    else:
+                        total0 += cute.arch.shuffle_sync(p2, source_lane)
+                        total1 += cute.arch.shuffle_sync(p3, source_lane)
+                cute.arch.sync_threads()
+            if gid == Int32(0):
+                key_row = warp * Int32(8) + tid * Int32(2)
+                col = tile_start + key_row
+                if col < end and valid_keys[key_row] != Int32(0):
+                    scores[Int64(row) * Int64(width) + Int64(col)] = BFloat16(total0)
+                if col + Int32(1) < end and valid_keys[key_row + Int32(1)] != Int32(0):
+                    scores[Int64(row) * Int64(width) + Int64(col + Int32(1))] = (
+                        BFloat16(total1)
+                    )
+            # No thread may overwrite K/validity for the next tile before all
+            # warps have consumed this tile's validity flags.
+            cute.arch.sync_threads()
+            tile_start += cutlass.min(grid_stride, end - tile_start)
+
+
+@dsl_user_op
+def _mxfp4_mma(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb, *, loc=None, ip=None):
+    """Packed E2M1 m16n8k64 with two UE8M0 group scales per operand row."""
+    operands = [Uint32(v).ir_value(loc=loc, ip=ip) for v in (a0, a1, a2, a3, b0, b1)]
+    for scale in (sfa, sfb):
+        operands.extend(
+            (
+                Uint32(scale).ir_value(loc=loc, ip=ip),
+                Uint16(0).ir_value(loc=loc, ip=ip),
+                Uint16(0).ir_value(loc=loc, ip=ip),
+            )
+        )
+    operands.extend(Float32(v).ir_value(loc=loc, ip=ip) for v in (d0, d1, d2, d3))
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        operands,
+        """
+        mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0
+        {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$0,$1,$2,$3},
+        {$10}, {$11,$12}, {$13}, {$14,$15};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
+    )
+
+
+@cute.jit
+def _packed_word(data: cute.Tensor, offset: Int64):
+    return ld_global_nc_u32(get_ptr_as_int64(data, offset))
+
+
+@cute.jit
+def _scale_pair(data: cute.Tensor, offset: Int64):
+    return Uint32(data[offset]) | (Uint32(data[offset + Int64(1)]) << Uint32(8))
+
+
+class _TensorCorePagedScore(_PagedScore):
+    """Sixteen keys by eight heads per warp, with the staged BF16 score contract.
+
+    Packed MXFP4 operands enter block-scaled FP32-accumulating MMA directly.
+    ReLU, weighted-product rounding and ordered head summation remain separate;
+    tensor cores do not fuse away the model's BF16 stage boundaries.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        q: cute.Pointer,
+        qs: cute.Pointer,
+        weights: cute.Pointer,
+        pool: cute.Pointer,
+        pages: cute.Pointer,
+        lengths: cute.Pointer,
+        active: cute.Pointer,
+        candidates: cute.Pointer,
+        candidate_lengths: cute.Pointer,
+        scores: cute.Pointer,
+        rows: Int32,
+        width: Int32,
+        page_width: Int32,
+        page_row_stride: Int64,
+        pool_stride: Int64,
+        pool_pages: Int64,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            _flat(q),
+            _flat(qs),
+            _flat(weights),
+            _flat(pool),
+            _flat(pages),
+            _flat(lengths),
+            _flat(active),
+            _flat(candidates),
+            _flat(candidate_lengths),
+            _flat(scores),
+            rows,
+            width,
+            page_width,
+            page_row_stride,
+            pool_stride,
+            pool_pages,
+        ).launch(grid=((width + 63) // 64, rows, 1), block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        q: cute.Tensor,
+        qs: cute.Tensor,
+        weights: cute.Tensor,
+        pool: cute.Tensor,
+        pages: cute.Tensor,
+        lengths: cute.Tensor,
+        active: cute.Tensor,
+        candidates: cute.Tensor,
+        candidate_lengths: cute.Tensor,
+        scores: cute.Tensor,
+        rows: Int32,
+        width: Int32,
+        page_width: Int32,
+        page_row_stride: Int64,
+        pool_stride: Int64,
+        pool_pages: Int64,
     ):
         tx, _, _ = cute.arch.thread_idx()
         bx, row, _ = cute.arch.block_idx()
         lane = Int32(tx) % Int32(32)
-        block_start = Int32(bx) * block_cols
-        if block_cols > Int32(8):
-            # Each CTA owns both clearing and scoring its contiguous tile.
-            # This keeps short-context graph replay from launching one CTA
-            # per eight entries across the entire reserved context capacity.
-            clear_col = block_start + Int32(tx)
-            if clear_col < width:
-                scores[Int64(row) * Int64(width) + Int64(clear_col)] = BFloat16(
-                    -float("inf")
-                )
-            cute.arch.sync_threads()
-        end = cutlass.min(width, block_start + block_cols)
-        if block_cols > Int32(8):
-            end = cutlass.min(
-                end, cutlass.max(Int32(0), cutlass.min(lengths[row], active[0]))
-            )
-        col = block_start + Int32(tx) // Int32(32)
-        while col < end:
-            pos = col
-            valid = True
+        col = (
+            Int32(bx) * Int32(64)
+            + (Int32(tx) // Int32(32)) * Int32(16)
+            + lane // Int32(4)
+        )
+        kb = cute.make_rmem_tensor((2,), Int64)
+        sb = cute.make_rmem_tensor((2,), Int64)
+        valid_key = cute.make_rmem_tensor((2,), cutlass.Boolean)
+        totals = cute.make_rmem_tensor((2,), Float32)
+        totals.fill(0.0)
+        for part in cutlass.range_constexpr(2):
+            column = col + Int32(part * 8)
+            pos = column
+            valid = column < width
             if cutlass.const_expr(self.candidates):
-                valid = col < candidate_lengths[row]
-                pos = candidates[Int64(row) * Int64(width) + Int64(col)]
+                valid = valid and column < candidate_lengths[row]
+                if valid:
+                    pos = candidates[Int64(row) * Int64(width) + Int64(column)]
             valid = valid and pos >= Int32(0) and pos < lengths[row] and pos < active[0]
             valid = valid and pos // Int32(self.page_size) < page_width
             page = Int64(-1)
@@ -263,51 +546,81 @@ class _PagedScore:
                     ]
                 )
             valid = valid and page >= Int64(0) and page < pool_pages
-            total = Float32(0.0)
-            if valid:
-                token = Int64(pos % Int32(self.page_size))
-                kb = page * pool_stride + token * Int64(64)
-                sb = page * pool_stride + Int64(self.page_size * 64) + token * Int64(4)
-                kvals = cute.make_rmem_tensor((4,), Float32)
-                for pair in cutlass.range_constexpr(2):
-                    byte_col = lane + Int32(pair * 32)
-                    k0, k1 = f16x2_to_f32x2(
-                        fp4_decode_2(Uint32(pool[kb + Int64(byte_col)]))
-                    )
-                    scale = u32_as_f32(
-                        Uint32(pool[sb + Int64(byte_col // Int32(16))]) << Uint32(23)
-                    )
-                    kvals[pair * 2] = Float32(BFloat16(k0 * scale))
-                    kvals[pair * 2 + 1] = Float32(BFloat16(k1 * scale))
-                for head in cutlass.range(self.heads):
-                    qb = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(64)
-                    qsb = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(4)
-                    dot = Float32(0.0)
-                    for pair in cutlass.range_constexpr(2):
-                        byte_col = lane + Int32(pair * 32)
-                        q0, q1 = f16x2_to_f32x2(
-                            fp4_decode_2(Uint32(q[qb + Int64(byte_col)]))
-                        )
-                        scale = u32_as_f32(
-                            Uint32(qs[qsb + Int64(byte_col // Int32(16))]) << Uint32(23)
-                        )
-                        dot += Float32(BFloat16(q0 * scale)) * kvals[pair * 2]
-                        dot += Float32(BFloat16(q1 * scale)) * kvals[pair * 2 + 1]
-                    for shift in cutlass.range_constexpr(5):
-                        dot += cute.arch.shuffle_sync_bfly(dot, offset=1 << shift)
-                    dot = fmax_f32(Float32(BFloat16(dot)), Float32(0.0))
+            token = Int64(pos % Int32(self.page_size))
+            valid_key[part] = valid
+            kb[part] = page * pool_stride + token * Int64(64)
+            sb[part] = (
+                page * pool_stride + Int64(self.page_size * 64) + token * Int64(4)
+            )
+        for head_tile in cutlass.range_constexpr((self.heads + 7) // 8):
+            head = Int32(head_tile * 8) + lane // Int32(4)
+            qb = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(64)
+            qsb = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(4)
+            d0, d1, d2, d3 = Float32(0), Float32(0), Float32(0), Float32(0)
+            for kstep in cutlass.range_constexpr(2):
+                byte_col = Int64(kstep * 32) + Int64(lane % Int32(4)) * Int64(4)
+                a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                if valid_key[0]:
+                    a0 = _packed_word(pool, kb[0] + byte_col)
+                    a2 = _packed_word(pool, kb[0] + byte_col + Int64(16))
+                if valid_key[1]:
+                    a1 = _packed_word(pool, kb[1] + byte_col)
+                    a3 = _packed_word(pool, kb[1] + byte_col + Int64(16))
+                b0, b1 = Uint32(0), Uint32(0)
+                sfa, sfb = Uint32(0x7F7F), Uint32(0x7F7F)
+                scale_row = lane % Int32(2)
+                if valid_key[scale_row]:
+                    sfa = _scale_pair(pool, sb[scale_row] + Int64(kstep * 2))
+                if head < Int32(self.heads):
+                    b0 = _packed_word(q, qb + byte_col)
+                    b1 = _packed_word(q, qb + byte_col + Int64(16))
+                    sfb = _scale_pair(qs, qsb + Int64(kstep * 2))
+                d0, d1, d2, d3 = _mxfp4_mma(
+                    d0,
+                    d1,
+                    d2,
+                    d3,
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    b0,
+                    b1,
+                    sfa,
+                    sfb,
+                )
+            contributions = cute.make_rmem_tensor((4,), Float32)
+            dots = cute.make_rmem_tensor((4,), Float32)
+            dots[0], dots[1], dots[2], dots[3] = d0, d1, d2, d3
+            for part in cutlass.range_constexpr(4):
+                output_head = (
+                    Int32(head_tile * 8)
+                    + (lane % Int32(4)) * Int32(2)
+                    + Int32(part % 2)
+                )
+                weight = Float32(0)
+                if output_head < Int32(self.heads):
                     weight = Float32(
-                        weights[Int64(row) * Int64(self.heads) + Int64(head)]
+                        weights[Int64(row) * Int64(self.heads) + Int64(output_head)]
                     )
-                    total += Float32(BFloat16(dot * weight))
-            if lane == Int32(0):
-                # Keep invalid entries at -inf, including missing physical pages;
-                # sum-allreduce preserves -inf. No rank-local selection occurs.
-                value = BFloat16(-float("inf"))
-                if valid:
-                    value = BFloat16(total)
-                scores[Int64(row) * Int64(width) + Int64(col)] = value
-            col += Int32(8)
+                dot = fmax_f32(Float32(BFloat16(dots[part])), Float32(0))
+                contributions[part] = Float32(BFloat16(dot * weight))
+            # Preserve the scalar kernel's increasing-head FP32 sum order.
+            for head_pair in cutlass.range_constexpr(4):
+                source_lane = lane // Int32(4) * Int32(4) + Int32(head_pair)
+                for part in cutlass.range_constexpr(4):
+                    contribution = cute.arch.shuffle_sync(
+                        contributions[part], source_lane
+                    )
+                    totals[part // 2] = totals[part // 2] + contribution
+        if lane % Int32(4) == Int32(0):
+            for part in cutlass.range_constexpr(2):
+                column = col + Int32(part * 8)
+                if column < width:
+                    value = BFloat16(-float("inf"))
+                    if valid_key[part]:
+                        value = BFloat16(totals[part])
+                    scores[Int64(row) * Int64(width) + Int64(column)] = value
 
 
 class _SelectPrepare:
@@ -340,7 +653,13 @@ class _SelectPrepare:
             width,
             output_width,
         ).launch(
-            grid=((output_width + 255) // 256, rows, 1),
+            grid=(
+                cutlass.min(
+                    (output_width - Int32(1)) // Int32(256) + Int32(1), Int32(256)
+                ),
+                rows,
+                1,
+            ),
             block=(256, 1, 1),
             stream=stream,
         )
@@ -360,6 +679,8 @@ class _SelectPrepare:
     ):
         tx, _, _ = cute.arch.thread_idx()
         bx, row, _ = cute.arch.block_idx()
+        grid_cols, _, _ = cute.arch.grid_dim()
+        grid_stride = Int32(grid_cols) * Int32(256)
         col = Int32(bx) * Int32(256) + Int32(tx)
         visible = cutlass.min(
             cutlass.max(lengths[row], Int32(0)), cutlass.max(active[0], Int32(0))
@@ -371,7 +692,9 @@ class _SelectPrepare:
             extent = (extent + Int32(7)) // Int32(8)
         if col == Int32(0):
             select_lengths[row] = extent
-        if col < output_width:
+        # The selector consumes only extent entries. The private logit tail
+        # need not be initialized; the public BF16 score tail remains -inf.
+        while col < extent:
             value = Float32(-float("inf"))
             if cutlass.const_expr(self.blocks):
                 for offset in cutlass.range_constexpr(8):
@@ -384,9 +707,9 @@ class _SelectPrepare:
                 if visible > Int32(0) and col == (visible - Int32(1)) // Int32(8):
                     value = Float32(float("inf"))
             else:
-                if col < extent:
-                    value = Float32(scores[Int64(row) * Int64(width) + Int64(col)])
+                value = Float32(scores[Int64(row) * Int64(width) + Int64(col)])
             logits[Int64(row) * Int64(output_width) + Int64(col)] = value
+            col += cutlass.min(grid_stride, extent - col)
 
 
 class _SortPositions:
@@ -503,8 +826,10 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         obj = _Quantize(*recipe)
         dtypes = (BFloat16, Uint8, Uint8, Int64)
         scalars = (Int32(1), Int64(1), Int64(4352))
-    elif kind == "score":
-        obj = _PagedScore(*recipe)
+    elif kind in ("score", "score_tensorcore"):
+        obj = (_TensorCorePagedScore if kind == "score_tensorcore" else _PagedScore)(
+            *recipe
+        )
         dtypes = (
             Uint8,
             Uint8,
@@ -536,7 +861,7 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         *pointers,
         *scalars,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 2, key),
+        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 7, key),
     )
     return raw, dtypes
 
@@ -735,7 +1060,11 @@ def bind_mxfp4(
 
     caps = plan.caps
     width_capacity = caps.max_candidates or caps.max_page_table_width * caps.page_size
-    score_width = width_capacity if score_width is None else int(score_width)
+    if score_width is not None and (
+        isinstance(score_width, bool) or not isinstance(score_width, int)
+    ):
+        raise TypeError("score_width must be an integer")
+    score_width = width_capacity if score_width is None else score_width
     if not 0 < score_width <= width_capacity:
         raise ValueError("score_width must be positive and within planned capacity")
     if caps.max_candidates and score_width != caps.max_candidates:
@@ -845,8 +1174,9 @@ def score_mxfp4(binding):
         rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
     )
     page_stride = 0 if rt.page_table.shape[0] == 1 else rt.page_table.stride(0)
+    kind = "score_tensorcore" if caps.mode == "prefill" else "score"
     _launch(
-        "score",
+        kind,
         (caps.num_q_heads, bool(caps.max_candidates), caps.page_size),
         (
             binding.q_mxfp4,

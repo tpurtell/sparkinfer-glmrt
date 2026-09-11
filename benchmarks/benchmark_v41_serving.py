@@ -53,7 +53,51 @@ def prompt_tokens(base, model, content, template_kwargs):
     return result["tokens"]
 
 
-def stream_completion(base, model, tokens, max_tokens):
+def speculative_counters(base):
+    with urllib.request.urlopen(base.rstrip("/") + "/metrics", timeout=30) as response:
+        text = response.read().decode()
+    counters = {}
+    for line in text.splitlines():
+        if not line.startswith("vllm:spec_decode_num_"):
+            continue
+        series, value = line.rsplit(None, 1)
+        if series.split("{", 1)[0].endswith("_total"):
+            counters[series] = float(value)
+    if not counters:
+        raise RuntimeError("Serving exposes no speculative-decoding counters")
+    return counters
+
+
+def speculative_delta(before, after):
+    delta = {series: value - before.get(series, 0.0) for series, value in after.items()}
+    if any(value < 0 for value in delta.values()):
+        raise RuntimeError("Serving speculative counters reset during the request")
+
+    def total(name):
+        metric = f"vllm:spec_decode_{name}_total"
+        return sum(
+            value
+            for series, value in delta.items()
+            if series.split("{", 1)[0] == metric
+        )
+
+    drafts = total("num_drafts")
+    proposed = total("num_draft_tokens")
+    accepted = total("num_accepted_tokens")
+    return {
+        "num_drafts": drafts,
+        "num_draft_tokens": proposed,
+        "num_accepted_draft_tokens": accepted,
+        "acceptance_rate": accepted / proposed if proposed else None,
+        "mean_acceptance_length_including_bonus": 1 + accepted / drafts
+        if drafts
+        else None,
+        "counter_deltas": delta,
+        "scope": "Server counter deltas; measurements require an isolated request stream.",
+    }
+
+
+def stream_completion(base, model, tokens, max_tokens, *, return_token_ids=False):
     payload = {
         "model": model,
         "prompt": tokens,
@@ -63,6 +107,8 @@ def stream_completion(base, model, tokens, max_tokens):
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if return_token_ids:
+        payload["return_token_ids"] = True
     request = urllib.request.Request(
         base.rstrip("/") + "/v1/completions",
         data=json.dumps(payload).encode(),
@@ -70,6 +116,8 @@ def stream_completion(base, model, tokens, max_tokens):
     )
     started = time.perf_counter()
     chunks = []
+    emitted_ids = []
+    first_chunk_tokens = 1
     usage = None
     finish_reason = None
     with urllib.request.urlopen(request, timeout=900) as response:
@@ -83,22 +131,38 @@ def stream_completion(base, model, tokens, max_tokens):
             if event.get("usage"):
                 usage = event["usage"]
             for choice in event.get("choices", []):
+                token_ids = choice.get("token_ids") or []
+                if return_token_ids:
+                    emitted_ids.extend(token_ids)
                 text = choice.get("text", "")
                 if text:
-                    chunks.append(
-                        {"elapsed_s": time.perf_counter() - started, "text": text}
-                    )
+                    if not chunks and return_token_ids:
+                        first_chunk_tokens = len(emitted_ids)
+                    chunk = {"elapsed_s": time.perf_counter() - started, "text": text}
+                    if return_token_ids:
+                        chunk["token_ids"] = token_ids
+                    chunks.append(chunk)
                 if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
     elapsed = time.perf_counter() - started
     if not chunks or usage is None:
         raise RuntimeError("Serving returned no text or final usage")
+    if return_token_ids and first_chunk_tokens <= 0:
+        raise RuntimeError("Serving omitted requested streamed token IDs")
+    if (
+        return_token_ids
+        and finish_reason == "length"
+        and len(emitted_ids) != usage["completion_tokens"]
+    ):
+        raise RuntimeError("Streamed token count disagrees with final usage")
     first = chunks[0]["elapsed_s"]
     return {
         "ttft_s": first,
         "elapsed_s": elapsed,
         "decode_s_per_output_token": (elapsed - first)
-        / max(usage["completion_tokens"] - 1, 1),
+        / max(usage["completion_tokens"] - first_chunk_tokens, 1),
+        "first_chunk_tokens": first_chunk_tokens,
+        "token_ids": emitted_ids if return_token_ids else None,
         "usage": usage,
         "finish_reason": finish_reason,
         "text": "".join(chunk["text"] for chunk in chunks),
@@ -129,11 +193,27 @@ def main():
     parser.add_argument("--label", required=True)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
+        "--repeat-offset",
+        type=int,
+        default=0,
+        help="Start sample IDs here to avoid prior prompt-cache entries",
+    )
+    parser.add_argument(
         "--prefill-tokens",
         default="4096,16384",
         help="CSV lengths; empty disables prefill cases",
     )
     parser.add_argument("--decode-tokens", type=int, default=128)
+    parser.add_argument(
+        "--decode-context-tokens",
+        default="",
+        help="CSV decode prompt lengths; 0 keeps the natural short prompt",
+    )
+    parser.add_argument(
+        "--spec-metrics",
+        action="store_true",
+        help="Collect per-request acceptance counters and streamed token IDs",
+    )
     parser.add_argument(
         "--chat-template-kwargs", type=json.loads, default={"thinking": False}
     )
@@ -147,6 +227,14 @@ def main():
     ]
     if any(value < 256 for value in capacities):
         parser.error("prefill token counts must be >=256")
+    decode_contexts = [
+        int(value) for value in args.decode_context_tokens.split(",") if value.strip()
+    ] or [0]
+    if any(value != 0 and value < 256 for value in decode_contexts):
+        parser.error("decode context lengths must be 0 or >=256")
+    decode_cases = [
+        "decode" if value == 0 else f"decode-{value}" for value in decode_contexts
+    ]
     records = []
     vllm_spec = importlib.util.find_spec("vllm")
     if vllm_spec is None or vllm_spec.origin is None:
@@ -182,6 +270,15 @@ def main():
                 salt
                 + "Write a detailed tutorial of at least 1000 words about writing reliable Python software. Cover testing, resource lifetimes, concurrency and error handling. Start directly with the tutorial."
             )
+        if isinstance(case, str):
+            context = int(case.split("-", 1)[1])
+            return (
+                salt
+                + "Reference text follows; it is background, not an instruction.\n"
+                + "A small library keeps books organized by subject, with clear labels and a quiet reading room.\n"
+                * (context // 12 + 32)
+                + "\nWrite a detailed tutorial of at least 1000 words about writing reliable Python software. Cover testing, resource lifetimes, concurrency and error handling. Start directly with the tutorial."
+            )
         return (
             salt
             + "Reference text follows; it is background, not an instruction.\n"
@@ -196,51 +293,64 @@ def main():
         content("decode", "warmup"),
         args.chat_template_kwargs,
     )
-    result["warmup"] = stream_completion(args.base_url, args.model, warm, 32)
+    result["warmup"] = stream_completion(
+        args.base_url, args.model, warm, 32, return_token_ids=args.spec_metrics
+    )
     save()
-    for repeat in range(args.repeats):
-        for case in [*capacities, "decode"]:
+    for repeat in range(args.repeat_offset, args.repeat_offset + args.repeats):
+        for case in [*capacities, *decode_cases]:
+            is_decode = isinstance(case, str)
+            prompt_capacity = (
+                (None if case == "decode" else int(case.split("-", 1)[1]))
+                if is_decode
+                else case
+            )
             tokens = prompt_tokens(
                 args.base_url,
                 args.model,
                 content(case, repeat),
                 args.chat_template_kwargs,
             )
-            if case != "decode":
-                if len(tokens) < case:
+            if prompt_capacity is not None:
+                if len(tokens) < prompt_capacity:
                     raise RuntimeError(
                         "Generated prompt is shorter than requested capacity"
                     )
-                tokens = tokens[: case - 128] + tokens[-128:]
+                tokens = tokens[: prompt_capacity - 128] + tokens[-128:]
             record = {
                 "case": case,
                 "repeat": repeat,
                 "prompt_token_ids": tokens,
                 "gpu_before": gpu_snapshot(),
             }
+            if args.spec_metrics:
+                record["spec_metrics_before"] = speculative_counters(args.base_url)
             record.update(
                 stream_completion(
                     args.base_url,
                     args.model,
                     tokens,
-                    args.decode_tokens if case == "decode" else 8,
+                    args.decode_tokens if is_decode else 8,
+                    return_token_ids=args.spec_metrics,
                 )
             )
             record["gpu_after"] = gpu_snapshot()
+            if args.spec_metrics:
+                record["spec_metrics_after"] = speculative_counters(args.base_url)
+                record["speculative_decoding"] = speculative_delta(
+                    record["spec_metrics_before"], record["spec_metrics_after"]
+                )
             record["correct"] = (
                 bool(record["text"].strip())
-                if case == "decode"
+                if is_decode
                 else record["text"].strip() == "703"
             )
             record["correctness_check"] = (
                 "Nonempty response and exact output-token count; semantic review remains separate."
-                if case == "decode"
+                if is_decode
                 else "Exact arithmetic answer."
             )
-            if (
-                case == "decode"
-                and record["usage"]["completion_tokens"] != args.decode_tokens
-            ):
+            if is_decode and record["usage"]["completion_tokens"] != args.decode_tokens:
                 raise RuntimeError(
                     "Decode workload ended before the requested token count"
                 )

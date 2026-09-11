@@ -54,6 +54,9 @@ rows (E2M1 plus per-16 E4M3 scales, without a global scale).
 nonoverlapping ratio-1/ratio-2 compressor. The MXFP4 DSA recipe exposes a
 score/reduce/select boundary and bounded candidate indices for hierarchical
 reindexing; tensor-parallel score reduction precedes selection.
+Its native CuTe scorer dequantizes Q/K to BF16 inside the paged kernel and
+uses BF16 tensor-core dots with FP32 accumulation. Dot results, weighted
+products, and the final head sum retain their separate BF16 rounding points.
 
 
 **`moe`** — `moe.fused_moe`, fused FP4 TP MoE across a micro-kernel decode
@@ -140,6 +143,22 @@ at least 128 tokens to regenerate decoder state. Prompt-logprob requests retain
 full decoder rows. Sampling keeps its original row ABI; DSpark projects only
 the selected context rows. Replay is intentionally approximate, as described
 in the model report, rather than identical to full-decoder prefill.
+
+The [profile-guided optimization record](validation/deepseek_v41/profile_optimization.json)
+separates full-serving latency from native-kernel diagnostics. V4.1 reuses the
+shared CuTe MLA pipeline with paired-lane PV dequantization, packed SWA pair
+conversion, and native shared-byte loads. These preserve the cache formats,
+FP32 scaling, BF16 rounding, and MMA operands; they do not change the attention
+recipe. Split-merge cache identity also distinguishes dynamic layout ABIs when
+one active split occupies workspaces with different planned capacities.
+
+V4.1 drafting retains its own checkpoint, three draft layers, cache layout and
+mHC collapse, while using the shared DSpark heads and vocabulary dispatch used
+by V4.0. Query preparation is bounded by the draft query capacity; metadata
+refresh covers the selected graph's padded token domain without reallocating
+its buffers. Adaptive-verification confidences are broadcast from TP rank zero
+before both CPU budgeting and GPU compaction, so all ranks choose compatible
+graph sizes and per-request token boundaries.
 
 Engram also supports `ENGRAM_TABLE_MEMORY=ram` in the V4.1 launcher.
 Its packed E4M3 weights and E8M0 scales live in b12x CUDA-mapped host RAM;

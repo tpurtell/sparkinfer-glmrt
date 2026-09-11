@@ -2283,7 +2283,9 @@ def _sparse_mla_decode_grid_flat_launch(
         # v31: vector Q staging excluded for NVFP4 (BF16 Q) caches.
         # v32: speculative first-chunk copies gated on the split being active.
         # v33: paired-lane NVFP4/V4.1 PV dequantization.
-        33,
+        # v34: one packed load/conversion per V4.1 SWA pair.
+        # v35: native shared byte loads for packed dequantization.
+        35,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),
