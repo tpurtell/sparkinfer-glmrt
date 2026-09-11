@@ -63,7 +63,9 @@ class _MXFP8RowsQuantLaunch:
         scale_block_size: int,
         trellis_native_mma_order: bool,
         amax_floor: float,
+        wire_rows: bool = False,
     ) -> None:
+        self._wire_rows = bool(wire_rows)
         self._amax_floor = float(amax_floor)
         self._block128_floor = max(1.0e-4, self._amax_floor)
         self._k = int(k)
@@ -92,11 +94,11 @@ class _MXFP8RowsQuantLaunch:
         )
         values_u32 = cute.make_tensor(
             values_ptr,
-            cute.make_ordered_layout((m, self._k // 4), order=(1, 0)),
+            cute.make_layout((m, self._k // 4), stride=(cutlass.Int64((self._k + self._groups_k) // 4 if self._wire_rows else self._k // 4), 1)),
         )
         scale_rows = cute.make_tensor(
             scale_rows_ptr,
-            cute.make_ordered_layout((m, self._groups_k), order=(1, 0)),
+            cute.make_layout((m, self._groups_k), stride=(cutlass.Int64(self._k + self._groups_k if self._wire_rows else self._groups_k), 1)),
         )
         scale_mma = cute.make_tensor(
             scale_mma_ptr,
@@ -334,19 +336,21 @@ class _MXFP8RowsQuantLaunch:
     ) -> None:
         scale_u8 = Uint8(scale_byte)
         scale_rows[row, group] = scale_u8
-        row32 = row % Int32(32)
-        row4 = (row // Int32(32)) % Int32(4)
-        tile_m = row // Int32(128)
-        k4 = group % Int32(4)
-        tile_k = group // Int32(4)
-        scale_mma_offset = (
-            row32 * Int32(16)
-            + row4 * Int32(4)
-            + tile_m * Int32(((self._groups_k + 3) // 4) * 512)
-            + k4
-            + tile_k * Int32(512)
-        )
-        scale_mma[scale_mma_offset] = scale_u8
+        if cutlass.const_expr(not self._wire_rows):
+            row32 = row % Int32(32)
+            row4 = (row // Int32(32)) % Int32(4)
+            tile_m = row // Int32(128)
+            k4 = group % Int32(4)
+            tile_k = group // Int32(4)
+            scale_mma_offset = (
+                row32 * Int32(16)
+                + row4 * Int32(4)
+                + tile_m * Int32(((self._groups_k + 3) // 4) * 512)
+                + k4
+                + tile_k * Int32(512)
+            )
+            scale_mma[scale_mma_offset] = scale_u8
+
 
 
 @functools.cache
@@ -358,6 +362,7 @@ def _get_compiled_mxfp8_rows_quant(
     scale_block_size: int,
     value_order: str,
     amax_floor: float = 0.0,
+    wire_rows: bool = False,
 ) -> Callable:
     amax_floor = float(amax_floor)
     if not math.isfinite(amax_floor) or not 0.0 <= amax_floor <= 1.0:
@@ -406,6 +411,8 @@ def _get_compiled_mxfp8_rows_quant(
         raise ValueError(
             "non-linear MXFP8 value ordering requires scale_block_size=32"
         )
+    if wire_rows and (scale_block_size != 32 or value_order != "linear" or k % 128 != 0):
+        raise ValueError("wire rows require linear K32 quantization and K divisible by 128")
     launch = _MXFP8RowsQuantLaunch(
         k,
         source_type,
@@ -414,6 +421,7 @@ def _get_compiled_mxfp8_rows_quant(
         scale_block_size,
         value_order == "trellis_native_mma",
         amax_floor,
+        wire_rows,
     )
     cache_key = (
         k,
@@ -423,6 +431,7 @@ def _get_compiled_mxfp8_rows_quant(
         int(scale_block_size),
         value_order,
         amax_floor,
+        bool(wire_rows),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -440,7 +449,7 @@ def _get_compiled_mxfp8_rows_quant(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "gemm.mxfp8_quant_cute",
-            3,
+            4,
             cache_key,
         ),
     )
@@ -497,13 +506,17 @@ def compile_mxfp8_rows_quant_aot(
     scale_block_size: int = 32,
     expected_m: int = 2048,
     amax_floor: float = 0.0,
+    wire_rows: bool = False,
 ) -> object:
     """Compile a runtime-M row quantizer for native AOT export.
 
     ``expected_m`` selects the same launch geometry as the public tensor API;
     live M and the bounded grid size remain runtime arguments in the exported
     ABI. Set amax_floor=1e-4 for the official DeepSeek-V4.1 K32 contract;
-    the default retains native MXFP8's zero-group convention.
+    the default retains native MXFP8's zero-group convention. With wire_rows,
+    values_ptr points to row payload and scale_rows_ptr points K bytes later
+    in the same allocation; row stride is K + K/32 bytes. scale_mma_ptr is
+    unused. Caller owns sufficient nonoverlapping input/output storage.
     """
 
     size_k = int(size_k)
@@ -519,6 +532,7 @@ def compile_mxfp8_rows_quant_aot(
         int(scale_block_size),
         "linear",
         amax_floor,
+        wire_rows,
     )
     return tensor_api.compiled  # type: ignore[attr-defined]
 
