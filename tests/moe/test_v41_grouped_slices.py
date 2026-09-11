@@ -184,6 +184,7 @@ def _check_grouped_slices(width, after_case=None):
         if after_case is not None:
             after_case(
                 case=case,
+                native_inputs=(packed, wire, ids, route_weights),
                 args=args,
                 meta_view=meta_view,
                 out=out,
