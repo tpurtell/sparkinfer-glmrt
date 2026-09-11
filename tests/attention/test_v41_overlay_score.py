@@ -66,7 +66,7 @@ def test_overlay_replay(kernels, rows, width):
     with torch.cuda.graph(graph):
         launch(raw,t,rows,width,256)
     pointers=[x.data_ptr() for x in t]
-    for cycle in range(6):
+    for cycle in range(7):
         t[0].bitwise_xor_(255)
         t[2].neg_()
         if cycle==1: t[5].fill_(-1)  # invalid committed page, proposals still reachable
@@ -77,6 +77,7 @@ def test_overlay_replay(kernels, rows, width):
             t[7][:,2]=256;t[7][:,1]=0              # fully masked causal window
         if cycle==5:
             t[7][:,1]=384;t[8][:,0]=383            # final strided proposal row
+        if cycle==6: t[7][:,1]=-1  # unsigned U64 causal bound, as in native ABI
         n=t[:];n[9]=ref
         assert native(*[x.data_ptr() for x in n],rows,width,1,1,256,256,
                       torch.cuda.current_stream().cuda_stream)==0

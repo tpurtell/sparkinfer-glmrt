@@ -6,7 +6,7 @@ A warp scores sixteen candidates against 32 index heads in four MMA column tiles
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32, Uint64
 from ..._lib.intrinsics import (bf16_mma_m16n8k16_f32, fp4_decode_2,
     f16x2_to_f32x2, u32_as_f32, cvt_f32_to_bf16_bits)
 from .mxfp4 import _flat
@@ -50,7 +50,7 @@ class V41OverlayScore:
         physical=cute.make_rmem_tensor((2,),Int64)
         proposed=cute.make_rmem_tensor((2,),Int32)
         slot=metadata[row*6]
-        causal=metadata[row*6+1]
+        causal=Uint64(metadata[row*6+1])
         start=metadata[row*6+2]
         count=metadata[row*6+3]
         offset=metadata[row*6+4]
@@ -70,7 +70,7 @@ class V41OverlayScore:
                     descriptor=descriptor and offset<proposal_capacity
                     if offset<proposal_capacity and step>0:
                         descriptor=descriptor and count-1<=(proposal_capacity-1-offset)//step
-                if descriptor and pos>=0 and pos<causal:
+                if descriptor and pos>=0 and Uint64(pos)<causal:
                     if pos<committed:
                         if pos<Int64(stride)*256:
                             p=Int64(pages[slot*Int64(stride)+pos//256])*256+pos%256
