@@ -14,11 +14,9 @@ from ._kernel import (
     precompile_bf16_gemv_small_n as precompile,
 )
 
-# Routing thresholds for integrations (canonical home; formerly the vLLM
-# plugin's constants). Unquantized bf16 linears with N <= MAX_OUT and
-# K >= MIN_IN are worth routing through this small-N GEMV: catches narrow
-# projections like the GDN ``in_proj_ba`` while excluding lm_head (N = vocab)
-# and anything wide enough that cuBLAS tiles efficiently.
+# Routing hints for integrations choosing only narrow decode projections.
+# mm itself supports broad geometries and owns tensor-core/SIMT dispatch;
+# these hints are not support limits or required integration-side policy.
 SMALL_N_GEMV_MAX_OUT = 1024
 SMALL_N_GEMV_MIN_IN = 1024
 
@@ -33,14 +31,28 @@ def is_disabled() -> bool:
     )
 
 
-def mm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``y = x @ weight.T`` for bf16 ``x (m, K)`` / ``weight (N, K)``.
+def mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Native ``x @ weight.T + bias`` with BF16 or FP32 operands.
 
-    Dispatches through the opaque ``b12x::bf16_gemv_small_n`` custom op
-    (torch.compile- and CUDA-graph-safe); shapes the kernel does not cover
-    fall back to ``F.linear`` inside the op.
+    Accumulation and bias addition precede the final output cast. BF16/BF16
+    broad multi-row inputs use tensor cores; FP32 operands remain unrounded
+    in the SIMT path. Live rows and strides are runtime arguments; unsupported
+    inputs fail rather than switching compute providers. ``out`` selects
+    allocation-free serving and supports padded row strides.
     """
-    return torch.ops.b12x.bf16_gemv_small_n(x, weight)
+    if out is None:
+        return torch.ops.b12x.bf16_gemv_small_n(x, weight, bias, output_dtype)
+    if output_dtype is not None and out.dtype != output_dtype:
+        raise ValueError("output_dtype disagrees with caller-owned out")
+    torch.ops.b12x.bf16_gemv_small_n_out(x, weight, out, bias)
+    return out
 
 
 def is_supported(device=None) -> bool:

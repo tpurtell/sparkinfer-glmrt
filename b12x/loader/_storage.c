@@ -17,7 +17,9 @@
 
 typedef char require_64_bit_offsets[(sizeof(off_t) == 8 && sizeof(size_t) == 8) ? 1 : -1];
 
-enum storage_kind { SYSTEM, PINNED, PINNED_WC, REGISTERED, MANAGED, FILE_MAPPING };
+enum storage_kind {
+    SYSTEM, PINNED, PINNED_WC, REGISTERED, MANAGED, FILE_MAPPING
+};
 
 typedef struct {
     char message[512];
@@ -191,8 +193,7 @@ static storage_t *read_storage(int fd, int64_t offset, int64_t bytes,
             flags = MAP_PRIVATE;
         }
         storage->extent = length + delta;
-        void *mapped = mmap(NULL, storage->extent, PROT_READ | PROT_WRITE,
-                            flags, map_fd, map_offset);
+        void *mapped = mmap(NULL, storage->extent, PROT_READ | PROT_WRITE, flags, map_fd, map_offset);
         if (mapped == MAP_FAILED) {
             system_error(failure, "mmap");
             goto done;
@@ -332,8 +333,14 @@ static PyObject *py_stats(PyObject *self, PyObject *args) {
 #include "_pool.c"
 #include "_direct.c"
 #include "_batch.c"
+#include "_ple_reader.c"
 
 static PyMethodDef methods[] = {
+    {"ple_reader", py_ple_reader, METH_VARARGS, NULL},
+    {"ple_reader_add", py_ple_reader_add, METH_VARARGS, NULL},
+    {"ple_reader_run", py_ple_reader_run, METH_VARARGS, NULL},
+    {"ple_reader_stats", py_ple_reader_stats, METH_O,
+     "Last-call counters; staging_bytes and metadata_bytes describe persistent allocations."},
     {"batch_executor", py_batch_executor, METH_VARARGS, NULL},
     {"batch_execute", py_batch_execute, METH_VARARGS, NULL},
     {"batch_stats", py_batch_stats, METH_O, NULL},

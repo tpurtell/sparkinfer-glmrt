@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+
 from b12x.norm.mhc._policy import MhcConfig
 
 
@@ -264,6 +265,8 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
             False,
             1,
             0,
+            None,
+            None,
         )
         torch.ops.b12x.mhc_prefill_tf32_project_launch(
             torch.empty((2, 4, 4096), dtype=torch.bfloat16),
@@ -358,7 +361,6 @@ def test_tp_moe_launch_ops_have_fake_dispatch() -> None:
             2,
             4,
             4,
-            2,
             2,
             16,
             True,

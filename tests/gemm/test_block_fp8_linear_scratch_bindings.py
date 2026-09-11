@@ -50,7 +50,8 @@ def test_block_fp8_linear_scratch_plan_exposes_one_opaque_scratch_spec() -> None
     assert specs[0].nbytes == specs[0].shape[0]
 
 
-def test_block_fp8_linear_scratch_plan_binds_live_shape(monkeypatch) -> None:
+@pytest.mark.parametrize("expected_m", (None, 3, 4))
+def test_block_fp8_linear_scratch_plan_binds_live_shape(monkeypatch, expected_m) -> None:
     monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
     plan = plan_block_fp8_linear_scratch(
         BlockFP8LinearScratchCaps(
@@ -71,9 +72,11 @@ def test_block_fp8_linear_scratch_plan_binds_live_shape(monkeypatch) -> None:
         source=source,
         packed_weight=packed,
         output=output,
+        expected_m=expected_m,
     )
 
     assert isinstance(binding, BlockFP8LinearBinding)
+    assert binding.expected_m == (4 if expected_m is None else expected_m)
     assert binding.source is source
     assert binding.packed_weight is packed
     assert not hasattr(binding, "workspace")
@@ -136,11 +139,11 @@ def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     )
     calls = {}
 
-    def fake_quantize(source_tk, *, out=None, activation_block_size=32):
+    def fake_quantize(source_tk, values, scales, mma, tokens, features, *, expected_m=None, min_amax=0.0, activation_block_size=32):
         calls["source_tk"] = source_tk
-        calls["x_q_out"] = out
+        calls["x_q_out"] = values
         calls["activation_block_size"] = activation_block_size
-        return out
+        assert expected_m == 9
 
     def fake_dense_gemm(a, b, **kwargs):
         calls["a"] = a
@@ -149,13 +152,13 @@ def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
         kwargs["out"].zero_()
         return kwargs["out"]
 
-    monkeypatch.setattr(block_impl, "quantize_block_fp8_linear_input_mxfp8", fake_quantize)
+    monkeypatch.setattr(block_impl, "_run_block_fp8_quant_kernel", fake_quantize)
     monkeypatch.setattr(block_impl, "dense_gemm", fake_dense_gemm)
 
     out = block_impl.block_fp8_linear_mxfp8(binding=binding)
 
     assert calls["source_tk"].data_ptr() == source.data_ptr()
-    assert calls["x_q_out"] is binding.x_q
+    assert calls["x_q_out"] is binding.x_q.values
     assert calls["activation_block_size"] == 32
     assert calls["dense_out"] is output
     assert out.shape == (9, 256)

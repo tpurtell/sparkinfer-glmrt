@@ -14,7 +14,7 @@ import cutlass
 import cutlass.cute as cute
 
 from .smem import SM120_SMEM_CARVEOUT_BYTES
-from .traits import ComputeMode, ModelType, ScaleFormat, UnifiedMLATraits
+from .traits import ComputeMode, ScaleFormat, UnifiedMLATraits
 
 
 _MG_N_HG = 2
@@ -109,7 +109,7 @@ def make_smem_layout_mg(
     # footer in kv_sc). GLM (ARBITRARY_FP32, no extra cache) stages the 528B
     # NoPE+inline-fp32-scales row (scales inline, NO footer) PLUS a kv_rope buffer
     # (GLM has no global-rope path in MG). Both share the rest of the MG layout.
-    is_glm = traits.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
+    is_glm = not traits.has_extra_cache or traits.d_rope == 0
     inline_kv_scales = traits.scale_format != ScaleFormat.UE8M0_BYTE
     if mg_n_hg not in (1, 2):
         raise ValueError(
@@ -340,7 +340,7 @@ def get_prefill_mg_shared_storage_cls(
     class SharedStorageMG:
         pass
 
-    is_glm = traits.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
+    is_glm = not traits.has_extra_cache or traits.d_rope == 0
     inline_kv_scales = traits.scale_format != ScaleFormat.UE8M0_BYTE
 
     # Tail (kv_fp8 .. w_fp8) is identical across DSV4 compute modes. DSV4

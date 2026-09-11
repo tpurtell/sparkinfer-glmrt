@@ -33,6 +33,9 @@ class DsaIndexerQuery:
     page_size: int
     score_mode: str
     shared_page_table: bool
+    cache_format: str = "fp8"
+    max_candidates: int = 0
+    candidate_topk_blocks: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -97,7 +100,7 @@ def _validate(
 
 DSA_INDEXER_POLICY = ComponentPolicy(
     component_id=DSA_INDEXER,
-    query_schema_version=1,
+    query_schema_version=2,
     config_schema_version=1,
     query_fields=frozenset(DsaIndexerQuery.__dataclass_fields__),
     config_fields=frozenset(DsaIndexerConfig.__dataclass_fields__),

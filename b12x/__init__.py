@@ -47,6 +47,7 @@ _OPS: tuple[str, ...] = (
     "attention.dsv4_compressor",
     "attention.dsv4_producer",
     "attention.dsa_indexer",
+    "attention.mla_compress",
     "attention.qsa",
     "attention.varlen",
     "comm.pcie",
@@ -70,8 +71,11 @@ _OPS: tuple[str, ...] = (
     "sequence.ple_hash",
     "sequence.ple_embedding",
     "sequence.ple",
+    "sequence.engram",
+    "sequence.embedding",
     "sequence.gdn_decode",
     "sequence.kda_prefill",
+    "sequence.gdn_prefill",
     "sequence.mtp_feedback",
 )
 

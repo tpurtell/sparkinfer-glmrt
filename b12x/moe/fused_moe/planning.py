@@ -45,12 +45,21 @@ class ActivationSpec:
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    numerical_recipe: str = "default"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", ActivationMode(self.mode))
         object.__setattr__(self, "nonlinearity", str(self.nonlinearity).lower())
         if self.io_dtype not in {torch.bfloat16, torch.float16}:
             raise TypeError("io_dtype must be torch.bfloat16 or torch.float16")
+        if self.numerical_recipe not in {"default", "deepseek_v41"}:
+            raise ValueError(f"unsupported numerical_recipe {self.numerical_recipe!r}")
+        if self.numerical_recipe == "deepseek_v41":
+            if self.mode is not ActivationMode.A8 or self.nonlinearity != "silu" or self.io_dtype is not torch.bfloat16:
+                raise ValueError("deepseek_v41 requires A8, SiLU and BF16 I/O")
+            if self.swiglu_limit not in (None, 10.0) or self.swiglu_alpha not in (None, 1.0) or self.swiglu_beta not in (None, 0.0):
+                raise ValueError("deepseek_v41 fixes clamp=10, alpha=1 and beta=0")
+            object.__setattr__(self, "swiglu_limit", 10.0)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -242,6 +251,7 @@ def plan_weights(
             intermediate_size=geometry.intermediate_size,
             w13_layout=source.w13_layout.value,
             w4a16_layout=requested_layout,
+            numerical_recipe=activation.numerical_recipe,
         )
     elif isinstance(source, TrellisConfig):
         if activation.mode is not ActivationMode.A16:

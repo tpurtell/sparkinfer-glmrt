@@ -5,7 +5,7 @@ from __future__ import annotations
 from ..._lib.gating import default_is_supported
 
 from . import reference
-from ._cute_kernels import clear_caches
+from .._shared.delta_prefill._cute_kernels import clear_caches
 from ._impl import Binding, Caps, Plan, bind, plan, prewarm, run
 from ._policy import KdaPrefillConfig, KdaPrefillQuery
 

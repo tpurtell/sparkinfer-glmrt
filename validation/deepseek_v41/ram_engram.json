@@ -1,0 +1,296 @@
+{
+  "schema_version": 1,
+  "status": "unsafe_after_initial_smoke",
+  "storage": "CUDA-mapped pinned write-combined host RAM, using existing b12x MappedHostAllocation",
+  "worktrees": {
+    "b12x": "/home/luke/projects/b12x",
+    "vllm": "/home/luke/projects/vllm-hh-rebase"
+  },
+  "launch": {
+    "command": "DRY_RUN=0 TORCH_PROFILE_DIR= bash ./serve-ds41-flash.sh",
+    "cwd": "/home/luke/projects/vllm-hh-rebase",
+    "engram_config": {
+      "cpu_offload": false,
+      "table_memory": "ram"
+    },
+    "tensor_parallel_size": 4,
+    "expert_parallel": true,
+    "physical_gpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "gpu_memory_utilization": 0.95,
+    "max_num_seqs": 4,
+    "max_num_batched_tokens": 4096,
+    "max_model_len": "auto",
+    "resolved_max_model_len": 1048576,
+    "speculative_method": "dspark",
+    "draft_tokens": 5,
+    "profiler_enabled": false
+  },
+  "storage_contract": {
+    "table_rows": [
+      384006168,
+      384016682
+    ],
+    "bytes_per_row": 264,
+    "tp_padded_rows": [
+      384006168,
+      384016684
+    ],
+    "total_pinned_bytes": 202758032928,
+    "per_rank_pinned_bytes": 50689508232,
+    "weight_dtype": "FP8 E4M3",
+    "scale_dtype": "E8M0 raw bytes",
+    "loading": "File descriptors select only TP-local ranges. Unbuffered8MiB-bounded readinto writes directly to final mapped CPU aliases; no full-table temporary allocation or VRAM staging. Final ceil-shard padding is zeroed.",
+    "runtime": "Unchanged native resident lookup consumes CUDA aliases; mapped owners are retained by graph resource collection. Disk preparation is not enabled in RAM mode.",
+    "budget": "Incremental full packed tables plus16GiB preflight reserve against available memory; cached preflight survives worker serialization without charging allocated peers again. Old workers are not counted twice. Allocation failure has no storage fallback."
+  },
+  "qualification": {
+    "tests_command": "CUDA_VISIBLE_DEVICES=0 CUDA_HOME=/opt/cuda CUTE_DSL_ARCH=sm_120a OMP_NUM_THREADS=1 .venv/bin/python -m pytest -xq tests/models/test_deepseek_v4_1_engram.py",
+    "tests_cwd": "/home/luke/projects/vllm-hh-rebase",
+    "tests_passed": 13,
+    "coverage": [
+      "RAM/disk descriptor routing across three loader formats",
+      "TP4 rank0/rank3 exact packed shard loading and padded rows",
+      "CUDA pointer provenance confirms actual mapped host storage",
+      "CPU oracle and nonlocal/missing output masks",
+      "Frozen-resolution graph replay after model deletion/checkpoint unlink",
+      "Synchronized host updates to weight and scale planes observed without recapture",
+      "Budget boundary and serialized preflight reuse"
+    ],
+    "format": "ruff0.12.8 format",
+    "lint": "ruff E9,F63,F7,F82 passed",
+    "serving": {
+      "models": {
+        "object": "list",
+        "data": [
+          {
+            "id": "DeepSeek-V4.1-Flash",
+            "object": "model",
+            "created": 1789098726,
+            "owned_by": "vllm",
+            "root": "/data/cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+            "parent": null,
+            "max_model_len": 1048576,
+            "permission": [
+              {
+                "id": "modelperm-840fc0a8f116488b",
+                "object": "model_permission",
+                "created": 1789098726,
+                "allow_create_engine": false,
+                "allow_sampling": true,
+                "allow_logprobs": true,
+                "allow_search_indices": false,
+                "allow_view": true,
+                "allow_fine_tuning": false,
+                "organization": "*",
+                "group": null,
+                "is_blocking": false
+              }
+            ]
+          }
+        ]
+      },
+      "health": 200,
+      "prefill": {
+        "status": 200,
+        "body": {
+          "id": "chatcmpl-9e13da557aa8079f",
+          "object": "chat.completion",
+          "created": 1789098726,
+          "model": "DeepSeek-V4.1-Flash",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "703",
+                "refusal": null,
+                "annotations": null,
+                "audio": null,
+                "function_call": null,
+                "reasoning": null
+              },
+              "logprobs": null,
+              "finish_reason": "stop",
+              "stop_reason": null,
+              "token_ids": null,
+              "routed_experts": null
+            }
+          ],
+          "service_tier": null,
+          "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-1a87da12",
+          "usage": {
+            "prompt_tokens": 16446,
+            "total_tokens": 16448,
+            "completion_tokens": 2,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "prompt_logprobs": null,
+          "prompt_token_ids": null,
+          "prompt_text": null,
+          "kv_transfer_params": null,
+          "ec_transfer_params": null,
+          "metrics": null
+        }
+      },
+      "prefix_replay": {
+        "status": 200,
+        "body": {
+          "id": "chatcmpl-861ce224a10d3053",
+          "object": "chat.completion",
+          "created": 1789098730,
+          "model": "DeepSeek-V4.1-Flash",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "703",
+                "refusal": null,
+                "annotations": null,
+                "audio": null,
+                "function_call": null,
+                "reasoning": null
+              },
+              "logprobs": null,
+              "finish_reason": "stop",
+              "stop_reason": null,
+              "token_ids": null,
+              "routed_experts": null
+            }
+          ],
+          "service_tier": null,
+          "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-1a87da12",
+          "usage": {
+            "prompt_tokens": 16446,
+            "total_tokens": 16448,
+            "completion_tokens": 2,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "prompt_logprobs": null,
+          "prompt_token_ids": null,
+          "prompt_text": null,
+          "kv_transfer_params": null,
+          "ec_transfer_params": null,
+          "metrics": null
+        }
+      },
+      "decode": {
+        "status": 200,
+        "body": {
+          "id": "chatcmpl-9c652f0b9d340460",
+          "object": "chat.completion",
+          "created": 1789098730,
+          "model": "DeepSeek-V4.1-Flash",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "# Binary Search in Python: A Detailed Explanation\n\n## What Binary Search Does\n\nBinary search finds a target value in a **sorted** sequence by repeatedly halving the search space. Instead of checking every element (O(n)), it eliminates half the remaining candidates each step, achieving **O(log n)** time.\n\nThe core idea: if the middle element is smaller than the target, the target must be in the right half; if larger, in the left half.\n\n---\n\n## The Invariant\n\nThe most important concept in binary search is its **loop invariant** \u2014 a property that is true before, during, and after every iteration.\n\nFor",
+                "refusal": null,
+                "annotations": null,
+                "audio": null,
+                "function_call": null,
+                "reasoning": null
+              },
+              "logprobs": null,
+              "finish_reason": "length",
+              "stop_reason": null,
+              "token_ids": null,
+              "routed_experts": null
+            }
+          ],
+          "service_tier": null,
+          "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-1a87da12",
+          "usage": {
+            "prompt_tokens": 23,
+            "total_tokens": 151,
+            "completion_tokens": 128,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": {
+              "reasoning_tokens": 0
+            }
+          },
+          "prompt_logprobs": null,
+          "prompt_token_ids": null,
+          "prompt_text": null,
+          "kv_transfer_params": null,
+          "ec_transfer_params": null,
+          "metrics": null
+        }
+      },
+      "metrics": [
+        "vllm:spec_decode_num_drafts_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 51.0",
+        "vllm:spec_decode_num_accepted_tokens_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 80.0",
+        "vllm:prefix_cache_queries_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 32915.0",
+        "vllm:prefix_cache_hits_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 16384.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"stop\",model_name=\"DeepSeek-V4.1-Flash\"} 2.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"length\",model_name=\"DeepSeek-V4.1-Flash\"} 1.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"abort\",model_name=\"DeepSeek-V4.1-Flash\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"error\",model_name=\"DeepSeek-V4.1-Flash\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"repetition\",model_name=\"DeepSeek-V4.1-Flash\"} 0.0"
+      ]
+    }
+  },
+  "runtime_snapshot": {
+    "api_pid": 2311986,
+    "worker_pids": [
+      2317972,
+      2317973,
+      2317974,
+      2317975
+    ],
+    "hub_name": "ds41-optimization",
+    "state": "ready",
+    "gpu_model_memory_gib_per_rank": 76.25,
+    "gpu_kv_available_gib_per_rank": 7.33,
+    "kv_capacity_tokens": 4520184,
+    "full_context_concurrency_estimate": 4.31,
+    "graph_memory_gib_per_rank": 4.31,
+    "preflight_available_gib": 216.92,
+    "post_smoke_mem_available_kib": 15921908,
+    "swap_total_kib": 0,
+    "note": "Post-smoke available host RAM is about15.2GiB. Pinned tables cannot be reclaimed as file cache. Full1M initialization is verified; actual prefill smoke was16446 tokens, not1M text generation."
+  },
+  "performance": "No RAM-mode speedup claim made; previous SSD-mode performance evidence remains separately source-bound.",
+  "source_sha256": {
+    "/home/luke/projects/vllm-hh-rebase/vllm/config/engram.py": "86dcb60401faff491d5530db10e3b6bbc777063f64a0a755ab6bcc5487e726f5",
+    "/home/luke/projects/vllm-hh-rebase/vllm/config/vllm.py": "46224f83efbba4bb2b17669c894db7d6c235a54095f7ee2c618ccae41a7dc338",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/common/engram.py": "3dfd8c60e291273392798e84a927ec54c99343a5c882b67ffea0a8f1b2229080",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/model.py": "714ab9dc70dacdd8e792ab167dc83a223c98f2ab9af1312bd1540517ce75e335",
+    "/home/luke/projects/vllm-hh-rebase/tests/models/test_deepseek_v4_1_engram.py": "f1331352cb62f3f1e6695797dd59c2dfe5d96ae15021e1abc07616105e98cf34",
+    "/home/luke/projects/vllm-hh-rebase/serve-ds41-flash.sh": "8520e4097206cd8bfc6518e8fdf2d04d0d9b303f5efa5880e915c3c12df85651",
+    "/home/luke/projects/b12x/README.md": "855e6911a1bd53c7857f0e1080524d9d1e87e847b5e75fedba71a453fd468710"
+  },
+  "raw_evidence": {
+    "path": "/tmp/b12x-v41-optimization/ram-serving-smoke.json",
+    "sha256": "ec7faf657efad0d97bcd13ffc518bb8874f06faaad8a4d98ac01ba10353bd173"
+  },
+  "cleanup": {
+    "new_benchmark_scripts": false,
+    "checkpoint_changes": false,
+    "committed": false,
+    "docs_only_after_runtime_verification": [
+      "README.md",
+      "cpu_offload documentation in vllm/config/engram.py"
+    ]
+  },
+  "later_failure": {
+    "time": "2026-09-10T21:02:37",
+    "evidence": "Kernel journal reports global OOM and kills VLLM worker PID2317972, alongside unrelated desktop services. /proc/vmstat oom_kill=11 observed afterward.",
+    "conclusion": "Initial numerical and replay checks passed but do not qualify full-RAM serving memory safety. Do not restart the same configuration until peak non-table memory is accounted for.",
+    "server_state": "exited",
+    "runtime_budget": "Existing16GiB preflight reserve did not establish steady/request-time safety."
+  }
+}

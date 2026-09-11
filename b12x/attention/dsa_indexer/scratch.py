@@ -111,6 +111,9 @@ class B12XIndexerScratchCaps:
     prefill_block_k: int = _INDEXER_CONTIGUOUS_PREFILL_BLOCK_K
     score_mode: str = "dsa"
     num_idx_heads: int = 1
+    cache_format: str = "fp8"
+    max_candidates: int = 0
+    candidate_topk_blocks: int = 0
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -2478,9 +2481,30 @@ def plan_indexer_scratch(
             top_k=caps.topk,
             page_size=caps.page_size,
             score_mode=caps.score_mode,
+            cache_format=caps.cache_format,
+            max_candidates=caps.max_candidates,
+            candidate_topk_blocks=caps.candidate_topk_blocks,
             shared_page_table=caps.shared_page_table,
         ),
     )
+    if caps.cache_format == "mxfp4":
+        from .mxfp4 import plan_mxfp4
+
+        if caps.source_layout != INDEXER_SOURCE_LAYOUT_PAGED or caps.score_mode != "dsa":
+            raise ValueError("MXFP4 requires the paged DSA source layout")
+        if caps.output_physical_slots or caps.topk != 512:
+            raise ValueError("MXFP4 requires logical top-512 output")
+        if caps.max_candidates < 0 or caps.max_candidates > 16384:
+            raise ValueError("MXFP4 candidate capacity must be in [0,16384]")
+        if caps.candidate_topk_blocks not in (0, 2048):
+            raise ValueError("MXFP4 source selects exactly 2048 blocks")
+        if caps.max_candidates and caps.candidate_topk_blocks:
+            raise ValueError("MXFP4 source and reindex recipes are mutually exclusive")
+        return B12XIndexerScratchPlan(
+            caps=caps, inner=plan_mxfp4(caps), policy_resolution=resolution,
+        )
+    if caps.cache_format != "fp8":
+        raise ValueError("cache_format must be 'fp8' or 'mxfp4'")
     if caps.source_layout == INDEXER_SOURCE_LAYOUT_PAGED:
         assert caps.max_page_table_width is not None
         inner = plan_indexer_paged_scratch(

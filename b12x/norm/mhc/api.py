@@ -46,6 +46,7 @@ from ._impl import (
 from ._impl import (
     b12x_mhc_pre as run_pre,
 )
+from ._impl import run_collapse
 from . import META
 
 
@@ -75,6 +76,7 @@ __all__ = [
     "run_pre",
     "run_post",
     "run_post_pre",
+    "run_collapse",
     "MIXES",
     "MULT",
     "PARTIALS",

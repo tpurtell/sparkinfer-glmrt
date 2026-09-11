@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import heapq
+import json
 import math
 import time
 from pathlib import Path
@@ -11,7 +13,12 @@ import torch
 from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.weight_utils import _BAR_FORMAT, enable_tqdm
+from vllm.model_executor.model_loader.weight_utils import (
+    _BAR_FORMAT,
+    enable_tqdm,
+    file_source_tensor,
+    safetensors_file_sources,
+)
 
 from b12x.loader import storage_stats
 from b12x.loader._checkpoint import DirectWeightSession
@@ -21,7 +28,7 @@ logger = init_logger("vllm.model_executor.model_loader.b12x")
 
 
 class B12xModelLoader(DefaultModelLoader):
-    """Route checkpoint metadata, then O_DIRECT-read into final pinned storage."""
+    """Route checkpoint metadata, then O_DIRECT-read into final managed storage."""
 
     def __init__(self, load_config):
         options = dict(load_config.model_loader_extra_config)
@@ -53,7 +60,7 @@ class B12xModelLoader(DefaultModelLoader):
             raise ValueError("the initial b12x loader requires a CUDA device")
         index = torch.cuda.current_device() if device.index is None else device.index
         with (
-            weight_pool(allocation="pinned_wc", device=index) as allocator,
+            weight_pool(allocation="managed", device=index) as allocator,
             DirectWeightSession(
                 index, io_threads=self.io_threads, allocation_scope=allocator
             ) as session,
@@ -82,7 +89,7 @@ class B12xModelLoader(DefaultModelLoader):
         parameter_bytes = sum(p.nbytes for p in model.parameters())
         shared_bytes = sum(p.nbytes for p in model.parameters() if owns_tensor(p))
         model._b12x_loader_storage = {
-            "allocation": "pinned_wc",
+            "allocation": "managed",
             "parameter_bytes": parameter_bytes,
             "shared_parameter_bytes": shared_bytes,
             "shared_runtime_buffers": shared_runtime_buffers,
@@ -92,7 +99,7 @@ class B12xModelLoader(DefaultModelLoader):
         logger.info("b12x O_DIRECT I/O counters: %s", io_stats)
         logger.info("b12x allocation audit: no shared non-persistent runtime buffers")
         logger.info(
-            "b12x final parameters: %.3f / %.3f GiB in write-combined shared storage; "
+            "b12x final parameters: %.3f / %.3f GiB in managed shared storage; "
             "pool backing %.3f GiB",
             shared_bytes / 2**30,
             parameter_bytes / 2**30,
@@ -112,6 +119,57 @@ class B12xModelLoader(DefaultModelLoader):
             "ngram_heads_offsets",
             "ngram_heads_vocab_sizes",
         }
+
+    def _file_backed_weights_iterator(self, files, source, index_path):
+        from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
+
+        weight_map = None
+        if index_path.is_file():
+            weight_map = json.loads(index_path.read_text())["weight_map"]
+        indexed_paths = {}
+        for path in files:
+            sources = safetensors_file_sources(path)
+            file_names = {name for name in sources if source.file_weight_filter(name)}
+            resolved_path = Path(path).resolve()
+            selected = []
+            for name in sorted(sources):
+                if source.weight_name_prefixes and not name.startswith(
+                    source.weight_name_prefixes
+                ):
+                    continue
+                if weight_map is not None:
+                    indexed_file = weight_map.get(name)
+                    if indexed_file is None:
+                        continue
+                    if indexed_file not in indexed_paths:
+                        indexed_paths[indexed_file] = (
+                            index_path.parent / indexed_file
+                        ).resolve()
+                    if indexed_paths[indexed_file] != resolved_path:
+                        continue
+                if not should_skip_weight(name, self.local_expert_ids):
+                    selected.append(name)
+            file_backed = (
+                (source.prefix + name, file_source_tensor(sources[name]))
+                for name in selected
+                if name in file_names
+            )
+            # File-backed entries never enter the checkpoint direct reader, even
+            # for mixed files or before metadata-value reads and routing.
+            ordinary = (
+                self._session.weights(
+                    [path],
+                    prefixes=source.weight_name_prefixes,
+                    prefix=source.prefix,
+                    index_path=index_path,
+                    needs_values=self._needs_values,
+                    skip=lambda name: name in file_names
+                    or should_skip_weight(name, self.local_expert_ids),
+                )
+                if any(name not in file_names for name in selected)
+                else ()
+            )
+            yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])
 
     def _get_weights_iterator(self, source):
         from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
@@ -135,6 +193,13 @@ class B12xModelLoader(DefaultModelLoader):
             disable=not enable_tqdm(self.load_config.use_tqdm_on_load),
             bar_format=_BAR_FORMAT,
         ) as shards:
+            if source.file_weight_filter is not None:
+                yield from self._file_backed_weights_iterator(
+                    shards,
+                    source,
+                    Path(folder) / "model.safetensors.index.json",
+                )
+                return
             yield from self._session.weights(
                 shards,
                 prefixes=source.weight_name_prefixes,

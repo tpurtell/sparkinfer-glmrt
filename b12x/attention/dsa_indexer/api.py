@@ -37,6 +37,16 @@ from .scratch import (
     plan_indexer_scratch,
 )
 from . import META
+from .mxfp4 import (
+    MXFP4Runtime,
+    MXFP4_INDEX_PAGE_BYTES,
+    bind_mxfp4,
+    index_mxfp4_page_bytes,
+    quantize_q_mxfp4,
+    quantize_write_index_k_mxfp4,
+    score_mxfp4,
+    select_mxfp4,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -51,6 +61,10 @@ class Caps:
     mode: Literal["decode", "prefill"] = "decode"
     max_batch: int | None = None
     output_index_space: Literal["logical", "physical"] = "logical"
+    cache_format: Literal["fp8", "mxfp4"] = "fp8"
+    page_size: int = PAGED_INDEX_PAGE_SIZE
+    max_candidates: int = 0
+    candidate_topk_blocks: int = 0
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -62,15 +76,14 @@ class Caps:
             "max_q_rows",
             "max_page_table_width",
             "topk",
+            "page_size",
         ):
             value = int(getattr(self, name))
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
             object.__setattr__(self, name, value)
         if self.mode not in ("decode", "prefill"):
-            raise ValueError(
-                f"mode must be 'decode' or 'prefill', got {self.mode!r}"
-            )
+            raise ValueError(f"mode must be 'decode' or 'prefill', got {self.mode!r}")
         if self.output_index_space not in ("logical", "physical"):
             raise ValueError(
                 "output_index_space must be 'logical' or 'physical', got "
@@ -80,6 +93,31 @@ class Caps:
         if max_batch <= 0:
             raise ValueError(f"max_batch must be positive, got {max_batch}")
         object.__setattr__(self, "max_batch", max_batch)
+        object.__setattr__(self, "max_candidates", int(self.max_candidates))
+        object.__setattr__(
+            self, "candidate_topk_blocks", int(self.candidate_topk_blocks)
+        )
+        if self.cache_format not in ("fp8", "mxfp4"):
+            raise ValueError("cache_format must be 'fp8' or 'mxfp4'")
+        if self.cache_format == "fp8":
+            if self.page_size != PAGED_INDEX_PAGE_SIZE:
+                raise ValueError("FP8 indexer requires page_size=64")
+            if self.max_candidates or self.candidate_topk_blocks:
+                raise ValueError("candidate recipes require cache_format='mxfp4'")
+        else:
+            index_mxfp4_page_bytes(self.page_size)
+            if self.output_index_space != "logical":
+                raise ValueError("MXFP4 candidate positions are always logical")
+            if self.topk != 512:
+                raise ValueError("V4.1 MXFP4 indexer selects topk=512")
+            if self.num_q_heads > 32 or 32 % self.num_q_heads:
+                raise ValueError("MXFP4 indexer requires a divisor of 32 global heads")
+            if self.max_candidates < 0 or self.max_candidates > 16384:
+                raise ValueError("max_candidates must be in [0,16384]")
+            if self.candidate_topk_blocks not in (0, 2048):
+                raise ValueError("candidate_topk_blocks must be zero or 2048")
+            if self.max_candidates and self.candidate_topk_blocks:
+                raise ValueError("source and reindex recipes are mutually exclusive")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -87,12 +125,14 @@ class Binding:
     """A complete paged DSA invocation bound to one immutable plan."""
 
     plan: Plan
-    runtime: PagedBinding
-    q_fp8: torch.Tensor
+    runtime: PagedBinding | MXFP4Runtime
+    q_fp8: torch.Tensor | None
     query_weights: torch.Tensor
     index_k_cache: torch.Tensor
     output_indices: torch.Tensor
     output_scores: torch.Tensor | None = None
+    q_mxfp4: torch.Tensor | None = None
+    q_scales: torch.Tensor | None = None
 
 
 def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
@@ -110,9 +150,12 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
             topk=caps.topk,
             mode=caps.mode,
             max_batch=caps.max_batch,
-            page_size=PAGED_INDEX_PAGE_SIZE,
+            page_size=caps.page_size,
             shared_page_table=caps.mode == "prefill",
             output_physical_slots=caps.output_index_space == "physical",
+            cache_format=caps.cache_format,
+            max_candidates=caps.max_candidates,
+            candidate_topk_blocks=caps.candidate_topk_blocks,
         ),
         policy=policy,
     )
@@ -122,7 +165,7 @@ def bind(
     plan: Plan,
     *,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
-    q_fp8: torch.Tensor,
+    q_fp8: torch.Tensor | None = None,
     query_weights: torch.Tensor,
     index_k_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -130,14 +173,64 @@ def bind(
     active_width: torch.Tensor,
     output_indices: torch.Tensor,
     output_scores: torch.Tensor | None = None,
+    q_mxfp4: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
+    candidate_indices: torch.Tensor | None = None,
+    candidate_lengths: torch.Tensor | None = None,
+    candidate_output: torch.Tensor | None = None,
+    candidate_output_lengths: torch.Tensor | None = None,
+    score_width: int | None = None,
 ) -> Binding:
-    """Bind every live tensor to a paged DSA plan without launching work."""
+    """Bind live tensors without launching work.
+
+    ``score_width`` optionally bounds MXFP4 full-scan columns using a CPU-known
+    upper bound on visible compressed states. It must cover this invocation's
+    cache lengths; captured calls must cover the whole replay context range.
+    Scratch capacity and compiled kernels remain unchanged.
+    """
 
     if not isinstance(plan, Plan):
         raise TypeError("plan must be dsa_indexer.Plan")
     caps = plan.caps
     if caps.source_layout != SOURCE_LAYOUT_PAGED or caps.score_mode != "dsa":
         raise ValueError("dsa_indexer.bind requires a paged DSA plan")
+    if caps.cache_format == "mxfp4":
+        if q_fp8 is not None:
+            raise ValueError("MXFP4 packed data must be passed as q_mxfp4, not q_fp8")
+        return bind_mxfp4(
+            plan,
+            scratch=scratch,
+            q_mxfp4=q_mxfp4,
+            q_scales=q_scales,
+            query_weights=query_weights,
+            index_k_cache=index_k_cache,
+            page_table=page_table,
+            cache_lengths=cache_lengths,
+            active_width=active_width,
+            output_indices=output_indices,
+            output_scores=output_scores,
+            candidate_indices=candidate_indices,
+            candidate_lengths=candidate_lengths,
+            candidate_output=candidate_output,
+            candidate_output_lengths=candidate_output_lengths,
+            score_width=score_width,
+        )
+    if score_width is not None:
+        raise ValueError("score_width requires an MXFP4 plan")
+    if any(
+        x is not None
+        for x in (
+            q_mxfp4,
+            q_scales,
+            candidate_indices,
+            candidate_lengths,
+            candidate_output,
+            candidate_output_lengths,
+        )
+    ):
+        raise ValueError("MXFP4 tensors require an MXFP4 plan")
+    if q_fp8 is None:
+        raise ValueError("FP8 recipe requires q_fp8")
     expected_q_shape = (caps.num_q_heads, INDEX_HEAD_DIM)
     if q_fp8.ndim != 3 or tuple(q_fp8.shape[1:]) != expected_q_shape:
         raise ValueError(
@@ -147,13 +240,10 @@ def bind(
         )
     if int(q_fp8.shape[0]) > caps.max_q_rows:
         raise ValueError(
-            f"q_fp8 rows {int(q_fp8.shape[0])} exceed plan capacity "
-            f"{caps.max_q_rows}"
+            f"q_fp8 rows {int(q_fp8.shape[0])} exceed plan capacity {caps.max_q_rows}"
         )
     if q_fp8.dtype != torch.float8_e4m3fn:
-        raise TypeError(
-            f"q_fp8 must have dtype torch.float8_e4m3fn, got {q_fp8.dtype}"
-        )
+        raise TypeError(f"q_fp8 must have dtype torch.float8_e4m3fn, got {q_fp8.dtype}")
     if q_fp8.device != caps.device or not q_fp8.is_contiguous():
         raise ValueError(f"q_fp8 must be contiguous on {caps.device}")
     if query_weights.ndim == 3 and int(query_weights.shape[-1]) == 1:
@@ -184,9 +274,7 @@ def bind(
             f"dtype={index_k_cache.dtype}"
         )
     if index_k_cache.device != caps.device or int(index_k_cache.stride(1)) != 1:
-        raise ValueError(
-            f"index_k_cache must have unit inner stride on {caps.device}"
-        )
+        raise ValueError(f"index_k_cache must have unit inner stride on {caps.device}")
     runtime = plan.inner.bind(
         scratch=scratch,
         real_page_table=page_table,
@@ -240,6 +328,9 @@ def run(binding: Binding) -> torch.Tensor:
 
     if not isinstance(binding, Binding):
         raise TypeError("binding must be dsa_indexer.Binding")
+    if binding.plan.caps.cache_format == "mxfp4":
+        score(binding)
+        return select(binding)
     merge_state = binding.runtime.scratch.fused_indexer_merge_state
     if merge_state is not None:
         merge_state.zero_()
@@ -257,6 +348,33 @@ def run(binding: Binding) -> torch.Tensor:
     )
 
 
+def score(binding: Binding) -> torch.Tensor:
+    """Write BF16 rank-local weighted head sums into stable plan scratch.
+
+    MXFP4 only. Integration must all-reduce the returned tensor **in place**
+    across index-head TP ranks before ``select(binding)``. Q/K and weights are
+    BF16-rounded as in the published model; weights must already include the
+    global normalization ``128**-0.5 * 32**-0.5``. No local top-k is applied.
+    All ranks must use identical candidate ordering and visibility metadata.
+    """
+    if not isinstance(binding, Binding) or binding.plan.caps.cache_format != "mxfp4":
+        raise ValueError("staged score requires an MXFP4 binding")
+    return score_mxfp4(binding)
+
+
+def select(binding: Binding) -> torch.Tensor:
+    """Select globally reduced scores, sort logical positions, and pad -1.
+
+    Candidate sources also write their sorted, bounded block8 position list.
+    This never recomputes scores. ``run`` is the single-rank/replicated-head
+    convenience path; head-sharded TP callers must use ``score`` then their
+    BF16 all-reduce then ``select``.
+    """
+    if not isinstance(binding, Binding) or binding.plan.caps.cache_format != "mxfp4":
+        raise ValueError("staged select requires an MXFP4 binding")
+    return select_mxfp4(binding)
+
+
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0 and triton."""
     return default_is_supported(device, requires=META.requires)
@@ -269,6 +387,12 @@ __all__ = [
     "plan",
     "bind",
     "run",
+    "score",
+    "select",
+    "quantize_q_mxfp4",
+    "quantize_write_index_k_mxfp4",
+    "index_mxfp4_page_bytes",
+    "MXFP4_INDEX_PAGE_BYTES",
     "INDEX_HEAD_DIM",
     "PAGED_INDEX_PAGE_SIZE",
     "is_supported",

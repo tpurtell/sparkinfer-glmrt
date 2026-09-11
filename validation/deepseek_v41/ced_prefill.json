@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "status": "qualified",
+  "contract": {
+    "backbone_layers": 40,
+    "encoder_layers": 20,
+    "decoder_layers": 20,
+    "replay_window": 128,
+    "global_kv": "Full encoder-boundary mHC attention input, before decoder row packing; global caches use original full metadata.",
+    "decoder": "Per-request long chunks retain their trailing128 decoder rows. Short chunks continue same-request private decoder SWA. Packed positions, residual/mHC mixes and token IDs stay aligned.",
+    "prefix_reuse": "Decoder/draft SWA is not published to prefix caching. Global/encoder hits leave at least128 prompt tokens; encoder sparse retention pins that same reachable boundary. No giant encoder-hidden cache added.",
+    "outputs": "Full original-row hidden/aux ABI; discarded rows zero. Prompt-logprobs requests including zero keep full decoder rows. DSpark combines/projects only packed valid context rows, with original query anchors/rejection masks.",
+    "approximation": "Chunk-wise bounded SWA replay intentionally differs from full-decoder prefill; no exact greedy-token parity with the unoptimized reference is claimed."
+  },
+  "serving": {
+    "command": "DRY_RUN=0 ENGRAM_TABLE_MEMORY=disk TORCH_PROFILE_DIR=/tmp/b12x-v41-optimization/ced-profile TORCH_PROFILE_RECORD_SHAPES=0 TORCH_PROFILE_WITH_STACK=1 bash ./serve-ds41-flash.sh",
+    "cwd": "/home/luke/projects/vllm-hh-rebase",
+    "physical_gpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "tp": 4,
+    "max_num_seqs": 4,
+    "batch_capacity": 4096,
+    "gpu_memory_utilization": 0.95,
+    "max_model_len": 1048576,
+    "kv_capacity_tokens": 4887814,
+    "full_context_concurrency_estimate": 4.66,
+    "engram_storage": "disk",
+    "speculation": "DSpark5",
+    "jit_monitor_mode": "error",
+    "api_pid": 3766743,
+    "workers": [
+      3768235,
+      3768236,
+      3768237,
+      3768238
+    ],
+    "hub_name": "ds41-profile-optimization",
+    "profiler_during_acceptance_timings": "Configured but inactive; no profiler trace during timing."
+  },
+  "performance": {
+    "comparison": [
+      {
+        "case": 4096,
+        "metric": "ttft_s",
+        "before_s": [
+          1.0153873939998448,
+          1.0252850740216672,
+          1.0286160740070045
+        ],
+        "after_s": [
+          0.5248148110113107,
+          0.53501893900102,
+          0.5348698700545356
+        ],
+        "before_median_s": 1.0252850740216672,
+        "after_median_s": 0.5348698700545356,
+        "before_over_after": 1.916886950310229
+      },
+      {
+        "case": 16384,
+        "metric": "ttft_s",
+        "before_s": [
+          4.472422615042888,
+          4.485956371994689,
+          4.499714190023951
+        ],
+        "after_s": [
+          2.2255679029622115,
+          2.223540815000888,
+          2.227382981975097
+        ],
+        "before_median_s": 4.485956371994689,
+        "after_median_s": 2.2255679029622115,
+        "before_over_after": 2.0156456992500296
+      },
+      {
+        "case": "decode",
+        "metric": "decode_s_per_output_token",
+        "before_s": [
+          0.010313133881922341,
+          0.009157445251952681,
+          0.008991666244045926
+        ],
+        "after_s": [
+          0.010157224787289174,
+          0.008805790756128758,
+          0.008735836330456586
+        ],
+        "before_median_s": 0.009157445251952681,
+        "after_median_s": 0.008805790756128758,
+        "before_over_after": 1.039934459671231
+      }
+    ],
+    "ratio_direction": "before latency / after latency; greater than1 is faster",
+    "interpretation": "4K/16K TTFT improved1.92x/2.02x beyond the preceding structural optimization. Decode samples overlap; no established decode speedup claim.",
+    "repositories": {
+      "b12x": {
+        "worktree": "/home/luke/projects/b12x",
+        "commit": "00b69ac22e21413622c4ecd98f607a2c3e015161",
+        "status": "M README.md\n M b12x/attention/dsa_indexer/api.py\n M b12x/attention/dsa_indexer/mxfp4.py\n M b12x/gemm/bf16_gemv/__init__.py\n M b12x/gemm/bf16_gemv/_kernel.py\n M b12x/gemm/bf16_gemv/api.py\n M b12x/sequence/engram/_kernels.py\n M b12x/sequence/engram/api.py\n M tests/attention/test_dsa_indexer_mxfp4.py\n M tests/gemm/test_bf16_gemv.py\n M tests/sequence/test_engram.py\n?? benchmarks/benchmark_bf16_projection.py\n?? benchmarks/benchmark_ngram_ssd.py\n?? benchmarks/benchmark_v41_serving.py\n?? validation/deepseek_v41/ram_engram.json\n?? validation/deepseek_v41/structural_optimization.json"
+      },
+      "vllm": {
+        "worktree": "/home/luke/projects/vllm-hh-rebase",
+        "commit": "a6571d0a602ed42525a7a77cf960f39ca7f8d7a8",
+        "status": "M serve-ds41-flash.sh\n M tests/model_executor/kernels/test_b12x_linear.py\n M tests/models/test_deepseek_v4_1_compressor.py\n M tests/models/test_deepseek_v4_1_engram.py\n M tests/models/test_deepseek_v4_mega_moe.py\n M tests/models/test_dspark_mla.py\n M tests/v1/attention/test_b12x_v41_workspace.py\n M tests/v1/core/test_kv_cache_utils.py\n M tests/v1/core/test_prefix_caching.py\n M tests/v1/sample/test_logprobs.py\n M vllm/config/engram.py\n M vllm/config/vllm.py\n M vllm/models/deepseek_v4_1/attention.py\n M vllm/models/deepseek_v4_1/b12x_layers.py\n M vllm/models/deepseek_v4_1/common/engram.py\n M vllm/models/deepseek_v4_1/nvidia/b12x_moe.py\n M vllm/models/deepseek_v4_1/nvidia/dspark.py\n M vllm/models/deepseek_v4_1/nvidia/model.py\n M vllm/models/deepseek_v4_1/nvidia/model_state.py\n M vllm/models/deepseek_v4_1/nvidia/vl_model.py\n M vllm/models/deepseek_v4_1/sparse_mla.py\n M vllm/v1/core/kv_cache_coordinator.py\n M vllm/v1/core/kv_cache_manager.py\n M vllm/v1/core/kv_cache_utils.py\n M vllm/v1/core/single_type_kv_cache_manager.py\n M vllm/v1/kv_cache_interface.py\n M vllm/v1/worker/gpu/model_runner.py\n M vllm/v1/worker/gpu/sample/logprob.py\n M vllm/v1/worker/gpu/spec_decode/dflash/speculator.py\n?? serve-glm52.sh\n?? tests/models/test_deepseek_v4_1_ced_model.py\n?? tests/v1/attention/test_b12x_v41_ced_metadata.py\n?? vllm/models/deepseek_v4_1/ced.py"
+      }
+    },
+    "toolchain": {
+      "torch": "2.13.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "vllm": "0.27.2rc1.dev523+g3e63556c2.d20260827.cu133"
+    },
+    "gpu_before": {
+      "time_ns": 1789110253353057408,
+      "command": [
+        "nvidia-smi",
+        "-i",
+        "0,1,2,3",
+        "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+        "--format=csv"
+      ],
+      "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P8, 427 MHz, 405 MHz, 0x0000000000000000, 21.34 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P8, 427 MHz, 405 MHz, 0x0000000000000000, 18.94 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P8, 427 MHz, 405 MHz, 0x0000000000000000, 10.61 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P8, 427 MHz, 405 MHz, 0x0000000000000000, 18.76 W, 325.00 W\n"
+    },
+    "gpu_after": {
+      "time_ns": 1789110268277770721,
+      "command": [
+        "nvidia-smi",
+        "-i",
+        "0,1,2,3",
+        "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+        "--format=csv"
+      ],
+      "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2490 MHz, 15865 MHz, 0x0000000000000000, 206.92 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 198.07 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2497 MHz, 15865 MHz, 0x0000000000000000, 193.77 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 202.85 W, 325.00 W\n"
+    }
+  },
+  "verification": {
+    "runs": [
+      {
+        "scope": "cache/prefix policy and core model row/ABI tests",
+        "passed": 245
+      },
+      {
+        "scope": "native global KV and bounded attention (before final dependency-token regression)",
+        "passed": 10
+      },
+      {
+        "scope": "CED metadata/attention/core including functionalization, capture and streaming fixes",
+        "passed": 27
+      },
+      {
+        "scope": "metadata/core including isolated startup-warmup JIT guard",
+        "passed": 17
+      },
+      {
+        "scope": "CED metadata plus existing Engram/DSpark/linear integration",
+        "passed": 56,
+        "skipped": 1,
+        "note": "TP2 embedding check excluded by single visible GPU; unchanged path previously qualified separately."
+      },
+      {
+        "scope": "logprob runtime-count JIT reuse and >2^31 row offsets",
+        "passed": 2
+      }
+    ],
+    "counts_note": "Runs overlap; not a unique-test total.",
+    "live": "Final-source mixed long-prefill/short requests and prompt_logprobs=0 passed.16446-token prompt has a short final chunk; prefix rerun returned703 and reused16128 tokens. All three128-token decode responses were coherent.16 successful requests,0 errors at snapshot;253 accepted draft tokens.",
+    "warmup": "Metadata indices use a runtime launch bound, not a capacity specialization. Packing dtypes/layouts are prewarmed. FULL captures remain noncompact even for oversized padding descriptors. Pinned H2D staging is asynchronous.",
+    "reviews": "Resolved explicit-cache functionalization hazard using a consumed dependency tensor; resolved streaming history reset, blocking metadata H2D and FULL capture branch mismatch.",
+    "logprob_fix": "One bounded static gather tile plus runtime requested count reuses warmed log-softmax kernel across prompt_logprobs=0 and wider requests."
+  },
+  "source_sha256": {
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/ced.py": "fe956af8afeb3c708b0d677d437d985974b556f4edf7f90b54a2dfa344568781",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/attention.py": "79e3d7e21b2774bd7843a09a021d17338c02ab36a1a4fd9ab37acbe09854f63d",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/sparse_mla.py": "e85435cba6f387680917990aa2b9108a7f5ad49188401d5c3525e3fb5bd120d8",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/model.py": "a3ed139733a846c85048d2d8bf204c638f69a1b73c17f6e7ad5a4b62c1da798b",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/vl_model.py": "be5dd412de81780bb179978f165215b63db1bc6014d9121a2cd4ada39185b2b1",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/model_state.py": "faa4035dab0f996980d135b2042799bfda84febce66beac35aa0aedf247ccfb3",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/b12x_layers.py": "1b48f8d650535ba80e59cc73ef615619d02ce2c14112aef8ea4548999a6c711f",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/worker/gpu/model_runner.py": "c2bf1701454e3bb62b30bce99cf063ae3c14821473aa644912d8560a57591c3f",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py": "edf67d93ee3e94f3414008494a4d3a03f25b22e9eaae615cf45bb164b692fe2a",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/kv_cache_interface.py": "0348de0442c07d5f441a6488f1745b06d433f40cecd1f0fb6c8b5690668e2ad3",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/core/kv_cache_manager.py": "7b14e1c171d9b75c2e34c363c732f8d3b18778ed05acf4f72f379341ea4fb02f",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/core/kv_cache_coordinator.py": "5bbbd72115c0291e11d9bb796f741f8de86257f03e3f328f5781656d665230c4",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/core/single_type_kv_cache_manager.py": "a920bba581a860b6c8744cf193df392d966476eb145a8a7e1ab16f8e850a10f3",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/core/kv_cache_utils.py": "9160a0bbe200336f433ca5874716704415e26bf3043375a436c8a6bc12136ba0",
+    "/home/luke/projects/vllm-hh-rebase/tests/v1/core/test_prefix_caching.py": "e94e12f0e671786dd1ca19343a4d5f7c6b21b303918f3f87e754577ecb72b734",
+    "/home/luke/projects/vllm-hh-rebase/tests/v1/core/test_kv_cache_utils.py": "476180c660e0144bca39003b79cf537108e50abe72111f50ded557a1e5b02e58",
+    "/home/luke/projects/vllm-hh-rebase/tests/v1/attention/test_b12x_v41_workspace.py": "a09ae113ea62d5487e3c2aa440dabb0113b68934ff8ccf485f7361782493e7f5",
+    "/home/luke/projects/vllm-hh-rebase/tests/v1/attention/test_b12x_v41_ced_metadata.py": "4ee2d3060c0a1c92f68633d299e0bd9fd38263e854bf34fc74e6d61fc340243c",
+    "/home/luke/projects/vllm-hh-rebase/tests/models/test_deepseek_v4_1_ced_model.py": "caed49414b48bd9ef0182996d0c49b63d16c3874c3defd34c094a863687835da",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/worker/gpu/sample/logprob.py": "8c83ca3241df10dac1373d978f2af3ba2f59e7008a82807ee5b123da67a7ed0a",
+    "/home/luke/projects/vllm-hh-rebase/tests/v1/sample/test_logprobs.py": "029a975bb371fdba9ccfc4d2430151662bd7ef8675b41cbe6b7f5f30a0b59e27",
+    "/home/luke/projects/vllm-hh-rebase/tests/models/test_deepseek_v4_1_engram.py": "382cf8da79a43df1f7ed3f3352ee3da474482c9d4ec852e09feb3ef587a3b10d",
+    "/home/luke/projects/vllm-hh-rebase/serve-ds41-flash.sh": "61f875e007bbcbf7cc1dbc6b427b405b858c33a579d21465e9767aba7da25cfe"
+  },
+  "raw_artifact_sha256": {
+    "/tmp/b12x-v41-optimization/final-serving.json": "6094e44e97112fab1084a91dac7acf8bf8ad5fef1d8f2b21225590e66cea767a",
+    "/tmp/b12x-v41-optimization/ced-serving-prewarmed.json": "547581d5aab1d397429660b7d4394fa326050f688cfaf3c6db63981fd302f7a0",
+    "/tmp/b12x-v41-optimization/ced-qualified-serving.json": "1c18c1c9422b5d1dff0494cdc2e6b66fb0ba70e05dcb68ec6c99d9f924b3be65",
+    "/tmp/b12x-v41-optimization/ced-correctness.json": "c1883d806f9763c9a6f932042601ba56951757c70441d486763718f1b6fc8c81",
+    "/tmp/b12x-v41-optimization/ced-prompt-logprobs.json": "f4392f4f09a16c7f7920c8ba5063f14748e6df74d6aece5f99cdb77e1aa8af5b"
+  },
+  "ram_status": "Full mapped-RAM serving is unsafe after kernel-confirmed host OOM; user authorized SSD for CED qualification. See ram_engram.json.",
+  "next": "Continuous profile-guided end-to-end optimization, preserving this correctness and serving contract."
+}

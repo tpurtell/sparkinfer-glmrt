@@ -14,12 +14,15 @@ from .components import (
     COMPRESSED_SPARSE_MLA_ATTENTION,
     DSA_INDEXER,
     EP_MOE,
+    ENGRAM,
     GDN_ATTENTION,
+    GDN_PREFILL,
     KDA_PREFILL,
     GQA_ATTENTION,
     HYPERCONNECTION,
     MHC,
     MLA_ATTENTION,
+    MLA_COMPRESS,
     MOE_DECODE,
     MTP_FEEDBACK,
     NVFP4_QUANTIZATION,
@@ -166,6 +169,13 @@ PLANNING_COMPONENTS = (
         mode=PlanningPolicyMode.LOCAL,
     ),
     PlanningComponentRegistration(
+        op_qualname="attention.mla_compress",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=MLA_COMPRESS,
+        policy_ref="b12x.attention.mla_compress._policy:MLA_COMPRESS_POLICY",
+        generator_ref="b12x.attention.mla_compress._generator:MlaCompressGenerator",
+    ),
+    PlanningComponentRegistration(
         op_qualname="attention.paged",
         mode=PlanningPolicyMode.PROFILED,
         component_id=GQA_ATTENTION,
@@ -278,6 +288,13 @@ PLANNING_COMPONENTS = (
         ),
     ),
     PlanningComponentRegistration(
+        op_qualname="sequence.engram",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=ENGRAM,
+        policy_ref="b12x.sequence.engram._policy:ENGRAM_POLICY",
+        generator_ref="b12x.policy.generation.providers.engram:EngramGenerator",
+    ),
+    PlanningComponentRegistration(
         op_qualname="sequence.gdn_decode",
         mode=PlanningPolicyMode.PROFILED,
         component_id=GDN_ATTENTION,
@@ -285,6 +302,13 @@ PLANNING_COMPONENTS = (
         generator_ref=(
             "b12x.policy.generation.providers.attention:GdnAttentionGenerator"
         ),
+    ),
+    PlanningComponentRegistration(
+        op_qualname="sequence.gdn_prefill",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=GDN_PREFILL,
+        policy_ref="b12x.sequence.gdn_prefill._policy:GDN_PREFILL_POLICY",
+        generator_ref="b12x.policy.generation.providers.delta_prefill:GdnPrefillGenerator",
     ),
     PlanningComponentRegistration(
         op_qualname="sequence.kda_prefill",

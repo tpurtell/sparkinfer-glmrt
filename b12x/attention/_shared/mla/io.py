@@ -117,6 +117,8 @@ def io_issue_gather(
     split_mbar_arrival: cutlass.Constexpr = False,
     overlap_footer_gather: cutlass.Constexpr = False,
     per_token_latent_scale: cutlass.Constexpr = False,
+    dsv41: cutlass.Constexpr = False,
+    dsv41_swa: cutlass.Constexpr = True,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -161,7 +163,12 @@ def io_issue_gather(
     # Per-model gmem geometry (const_expr). DSV4: 576B data + grouped 8B footer;
     # GLM: 656B contiguous (528 nope+inline-scales + 128 rope), NO footer.
     # NVFP4: 432B contiguous (288 nope+E4M3-scales+pad + 128 rope), NO footer.
-    if cutlass.const_expr(scale_format == 0):
+    if cutlass.const_expr(dsv41):
+        _IOS = Int64(528 if dsv41_swa else 288)
+        _NOPE = Int32(528 if dsv41_swa else 288)
+        _ROPE = Int32(0)
+        _ROPE_SRC = Int64(0)
+    elif cutlass.const_expr(scale_format == 0):
         _IOS = Int64(_DSV4_IO_STRIDE)  # 576 per-token data stride
         _NOPE = Int32(_DSV4_NOPE_BYTES)  # 448 -> kv_fp8 (e4m3 nope)
         _ROPE = Int32(_DSV4_ROPE_BYTES)  # 128 -> kv_rope
@@ -328,6 +335,14 @@ def io_issue_gather(
                 idx_raw = Int32(_section_idx[cand_pos])
             # gap #9: stage the raw index (incl -1) for the S3 consumer mask.
             token_idx_view[entry] = idx_raw
+            if cutlass.const_expr(dsv41):
+                source_tag = Uint32(1 if dsv41_swa else 0)
+                if idx_raw < Int32(0):
+                    source_tag = Uint32(2)
+                st_shared_u32(
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(528),
+                    source_tag,
+                )
             if cutlass.const_expr(scale_format == 0):
                 # DSV4 grouped UE8M0 footer -> contiguous smem kv_sc. GLM has no
                 # footer (inline scales travel in the kv_fp8 nope bulk).
@@ -387,7 +402,8 @@ def io_issue_gather(
         else:
             if io_lane == Int32(0):
                 cute.arch.mbarrier_arrive_and_expect_tx(
-                    full_mbar_ptr, Int32(bulk_tx_bytes)
+                    full_mbar_ptr,
+                    Int32(bi) * _NOPE if cutlass.const_expr(dsv41) else Int32(bulk_tx_bytes),
                 )
         _issue_payload()
 

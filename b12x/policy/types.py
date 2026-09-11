@@ -380,7 +380,7 @@ DecisionNode = ProfileLeaf | ExactDecisionNode | RangeDecisionNode
 
 @dataclass(frozen=True)
 class ComponentProfile:
-    """One generated component planner on one GPU profile."""
+    """Component coverage on one GPU; an empty rule set is explicitly uncovered."""
 
     component_id: str
     query_schema_version: int
@@ -400,7 +400,7 @@ class ComponentProfile:
         # Serialized input still requires exactly one of "rules" or "planner".
         if self.rules and self.planner is not None:
             raise ValueError(
-                "component profiles require exactly one of rules or planner"
+                "component profiles cannot contain both rules and a planner"
             )
         if not isinstance(self.coverage, FrozenMapping):
             object.__setattr__(self, "coverage", FrozenMapping(self.coverage))

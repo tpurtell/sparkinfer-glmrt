@@ -140,6 +140,16 @@ def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
     raise TypeError(f"unsupported dtype {dtype}")
 
 
+def _dynamic_leading_dim(tensor: torch.Tensor) -> int | None:
+    # Singleton split views can have both head and split strides equal to one.
+    # Keep the innermost unit stride fixed so padded split capacities preserve
+    # the same dynamic head-stride ABI.
+    return next(
+        (idx for idx in range(tensor.ndim - 1, -1, -1) if tensor.stride(idx) == 1),
+        None,
+    )
+
+
 def _to_kernel_tensor(
     tensor: torch.Tensor,
     dtype: type[cutlass.Numeric],
@@ -148,11 +158,10 @@ def _to_kernel_tensor(
 ) -> cute.Tensor:
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
-    leading_dim = next(
-        (idx for idx, stride in enumerate(tensor.stride()) if stride == 1), None
-    )
-    if leading_dim is not None and tensor.ndim >= 2:
-        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+    if tensor.ndim >= 2:
+        cute_tensor = cute_tensor.mark_layout_dynamic(
+            leading_dim=_dynamic_leading_dim(tensor)
+        )
     return cute_tensor
 
 
@@ -185,6 +194,7 @@ def _tensor_compile_key(
         tensor,
         dynamic_dims=dynamic_dims,
         dynamic_strides=dynamic_strides,
+        layout=("leading_dim", _dynamic_leading_dim(tensor)),
     )
 
 
@@ -406,7 +416,9 @@ def _merge_split_partials(
     slot_lane = tid >> Int32(4)
     dim0 = group_idx * Int32(_MLA_GROUP_SIZE) + vec * Int32(8)
     if cutlass.const_expr(static_passes is None):
-        num_passes = (num_chunks + Int32(_MERGE_PASS_SLOTS - 1)) >> Int32(_MERGE_PASS_SHIFT)
+        num_passes = (num_chunks + Int32(_MERGE_PASS_SLOTS - 1)) >> Int32(
+            _MERGE_PASS_SHIFT
+        )
         for p in cutlass.range(num_passes, unroll=1):
             _merge_accumulate_pass(
                 tmp_output,
@@ -453,7 +465,9 @@ def _merge_split_partials(
             dst = get_ptr_as_int64(
                 output, cute.crd2idx((q_idx, head_idx, out_dim0), output.layout)
             )
-            store_v4_bf16x2(dst, out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7])
+            store_v4_bf16x2(
+                dst, out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]
+            )
         else:
             for i in cutlass.range_constexpr(8):
                 output[q_idx, head_idx, out_dim0 + Int32(i)] = out[i].to(
@@ -503,7 +517,9 @@ class SparseMLASplitDecodeMergeKernel:
         output: cute.Tensor,
     ):
         smem = cutlass_utils.SmemAllocator()
-        scratch = smem.allocate_tensor(Float32, cute.make_layout(_MERGE_SMEM_FLOATS), 16)
+        scratch = smem.allocate_tensor(
+            Float32, cute.make_layout(_MERGE_SMEM_FLOATS), 16
+        )
         if cutlass.const_expr(self.static_num_chunks is None):
             num_chunks = Int32(num_chunks_ptr[Int32(0)])
         else:
@@ -567,7 +583,9 @@ class SparseMLASplitDecodeSinkMergeKernel:
         output: cute.Tensor,
     ):
         smem = cutlass_utils.SmemAllocator()
-        scratch = smem.allocate_tensor(Float32, cute.make_layout(_MERGE_SMEM_FLOATS), 16)
+        scratch = smem.allocate_tensor(
+            Float32, cute.make_layout(_MERGE_SMEM_FLOATS), 16
+        )
         if cutlass.const_expr(self.static_num_chunks is None):
             num_chunks = Int32(num_chunks_ptr[Int32(0)])
         else:
@@ -592,7 +610,9 @@ def _build_sparse_mla_split_merge_kernel(
     vector_output: bool = True,
     vector_partials: bool = True,
 ) -> SparseMLASplitDecodeMergeKernel:
-    return SparseMLASplitDecodeMergeKernel(static_num_chunks, vector_output, vector_partials)
+    return SparseMLASplitDecodeMergeKernel(
+        static_num_chunks, vector_output, vector_partials
+    )
 
 
 @lru_cache(maxsize=None)
@@ -601,7 +621,9 @@ def _build_sparse_mla_split_sink_merge_kernel(
     vector_output: bool = True,
     vector_partials: bool = True,
 ) -> SparseMLASplitDecodeSinkMergeKernel:
-    return SparseMLASplitDecodeSinkMergeKernel(static_num_chunks, vector_output, vector_partials)
+    return SparseMLASplitDecodeSinkMergeKernel(
+        static_num_chunks, vector_output, vector_partials
+    )
 
 
 def _merge_vector_tensor(tensor: torch.Tensor) -> bool:
@@ -674,7 +696,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
         )
         merge_spec = KernelCompileSpec.from_key(
             "attention.mla.merge",
-            6,
+            7,
             merge_cache_key,
             labels=(
                 "tmp_output",
@@ -736,7 +758,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
     )
     merge_spec = KernelCompileSpec.from_key(
         "attention.mla.sink_merge",
-        6,
+        7,
         merge_cache_key,
         labels=(
             "tmp_output",

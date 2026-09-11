@@ -93,6 +93,7 @@ from b12x._lib.intrinsics import (
     fmax_f32,
     get_ptr_as_int64,
     max_abs_16,
+    pow2_ceil_ue8m0,
     quantize_and_pack_16_fast,
     rcp_approx_ftz,
     st_global_f32,
@@ -141,6 +142,7 @@ _GLM_NEXT_WRITER_COMPILED: dict[tuple[int, int, torch.dtype], object] = {}
 _NVFP4_WRITER_COMPILED: dict[
     tuple[int, int, torch.dtype, torch.dtype, bool, bool], object
 ] = {}
+_COMPRESSED_WRITER_COMPILED: dict[tuple[int, int, str, torch.dtype], object] = {}
 
 
 @dsl_user_op
@@ -207,11 +209,13 @@ def _glm_next_cache_record_address(
 
 
 class ConcatAndCacheNvfp4MlaFp8RopeKernel:
-    """Per-token packed GLM MLA record writer.
+    """Per-token packed MLA record writer, including V4.1 indexed records.
 
     With ``has_rope=True``, each token uses the 368-byte KV_FP8_ROPE=1
     nvfp4_ds_mla record. With ``has_rope=False``, each token uses the 304-byte
-    GLM_NEXT record and omits the RoPE lane.
+    GLM_NEXT record and omits the RoPE lane. ``dsv41=True`` instead specializes
+    the single-level group scales with their minimum floor and omits all bytes
+    after the 288-byte E2M1-plus-E4M3 record.
 
     Thread mapping (128 threads/CTA): threads 0-31 quantize one 16-dim
     group each (eight coherent 32-bit loads -> exact f32 promote -> E2M1
@@ -225,11 +229,13 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
         is_bf16: bool,
         per_token_scale: bool = False,
         has_rope: bool = True,
+        dsv41: bool = False,
     ):
         self.block_size = int(block_size)
         self.is_bf16 = bool(is_bf16)
         self.per_token_scale = bool(per_token_scale)
         self.has_rope = bool(has_rope)
+        self.dsv41 = bool(dsv41)
 
     @cute.jit
     def __call__(
@@ -352,14 +358,20 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
                     # e4m3(amax/6); values scaled by rcp.approx.ftz of the
                     # hardware-exact decode of that byte (what the reader
                     # multiplies back), then satfinite E2M1.
-                    scale_f32 = group_amax * rcp_approx_ftz(Float32(6.0))
+                    if cutlass.const_expr(self.dsv41):
+                        group_amax = fmax_f32(group_amax, Float32(6.0 * 2.0**-9))
+                        scale_f32 = group_amax / Float32(6.0)
+                    else:
+                        scale_f32 = group_amax * rcp_approx_ftz(Float32(6.0))
                     scale_u32 = cvt_f32_to_e4m3(scale_f32)
                     decoded_scale = cvt_e4m3_to_f32_via_f16(scale_u32)
                     packed64 = Uint64(0)
                     if decoded_scale != Float32(0.0):
-                        packed64 = quantize_and_pack_16_fast(
-                            vals, rcp_approx_ftz(decoded_scale)
-                        )
+                        if cutlass.const_expr(self.dsv41):
+                            inv_scale = Float32(1.0) / decoded_scale
+                        else:
+                            inv_scale = rcp_approx_ftz(decoded_scale)
+                        packed64 = quantize_and_pack_16_fast(vals, inv_scale)
                     st_global_u64(dst + tid.to(Int64) * Int64(8), packed64)
                     st_global_u8(
                         dst + Int64(_NOPE_BYTES) + tid.to(Int64),
@@ -368,20 +380,20 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
 
             # --- Zero pad: [292, 304) in static mode; [296, 304) when the
             # per-token latent scale occupies [292, 296).
-            if cutlass.const_expr(self.per_token_scale):
+            if cutlass.const_expr(self.per_token_scale and not self.dsv41):
                 if tid < Int32(_PAD_BYTES - _LATENT_SCALE_BYTES):
                     st_global_u8(
                         dst + Int64(_PAD_OFFSET + _LATENT_SCALE_BYTES) + tid.to(Int64),
                         cutlass.Uint8(0),
                     )
-            else:
+            elif cutlass.const_expr(not self.dsv41):
                 if tid < Int32(_PAD_BYTES):
                     st_global_u8(
                         dst + Int64(_PAD_OFFSET) + tid.to(Int64),
                         cutlass.Uint8(0),
                     )
 
-            if cutlass.const_expr(not self.has_rope):
+            if cutlass.const_expr(not self.has_rope and not self.dsv41):
                 if tid == Int32(_NUM_GROUPS):
                     st_global_u32(dst + Int64(_ROPE_SCALE_OFFSET), Uint32(0))
 
@@ -428,15 +440,20 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
 
 
 class ConcatAndCacheGlmNextMlaKernel:
-    """BF16 to GLM_NEXT E4M3-plus-FP32 cache writer.
+    """BF16 to GLM_NEXT FP8 or V4.1 SWA E4M3-plus-UE8M0 cache writer.
 
     Each warp owns one consecutive 128-dim quantization group.  Its 32 lanes
     load and store four adjacent values, reduce amax within the warp, and lane
-    zero writes the group's FP32 scale.  There is one CTA per source token.
+    zero writes the group's FP32 scale. V4.1 specializes this to 8-lane,
+    32-value groups and one pow2-ceil UE8M0 byte per group. There is one CTA
+    per source token.
     """
 
-    def __init__(self, block_size: int):
+    def __init__(self, block_size: int, dsv41: bool = False):
         self.block_size = int(block_size)
+        self.dsv41 = bool(dsv41)
+        self.group_size = 32 if dsv41 else _GLM_NEXT_GROUP_SIZE
+        self.lanes_per_group = self.group_size // 4
 
     @cute.jit
     def __call__(
@@ -492,11 +509,11 @@ class ConcatAndCacheGlmNextMlaKernel:
                 block_size=self.block_size,
             )
 
-            group = tid // Int32(32)
-            lane = tid - group * Int32(32)
+            group = tid // Int32(self.lanes_per_group)
+            lane = tid - group * Int32(self.lanes_per_group)
             src_elem = (
                 token64 * kv_c_stride
-                + group.to(Int64) * Int64(_GLM_NEXT_GROUP_SIZE)
+                + group.to(Int64) * Int64(self.group_size)
                 + lane.to(Int64) * Int64(4)
             )
             pair01 = _ld_global_u32(get_ptr_as_int64(kv_c, src_elem))
@@ -520,20 +537,26 @@ class ConcatAndCacheGlmNextMlaKernel:
                 group_amax,
                 cute.arch.shuffle_sync_bfly(group_amax, offset=4),
             )
-            group_amax = fmax_f32(
-                group_amax,
-                cute.arch.shuffle_sync_bfly(group_amax, offset=8),
-            )
-            group_amax = fmax_f32(
-                group_amax,
-                cute.arch.shuffle_sync_bfly(group_amax, offset=16),
-            )
+            if cutlass.const_expr(not self.dsv41):
+                group_amax = fmax_f32(
+                    group_amax,
+                    cute.arch.shuffle_sync_bfly(group_amax, offset=8),
+                )
+                group_amax = fmax_f32(
+                    group_amax,
+                    cute.arch.shuffle_sync_bfly(group_amax, offset=16),
+                )
 
-            # A unit scale for an all-zero group matches the CPU reference and
-            # avoids a zero reciprocal.  Every other group records amax/448.
-            scale = Float32(1.0)
-            if group_amax != Float32(0.0):
-                scale = group_amax * Float32(_GLM_NEXT_E4M3_MAX_RCP)
+            if cutlass.const_expr(self.dsv41):
+                scale, scale_byte = pow2_ceil_ue8m0(
+                    fmax_f32(group_amax, Float32(1e-4))
+                    * Float32(_E4M3_MAX_RCP)
+                )
+            else:
+                # Preserve the GLM_NEXT zero-group unit scale.
+                scale = Float32(1.0)
+                if group_amax != Float32(0.0):
+                    scale = group_amax * Float32(_GLM_NEXT_E4M3_MAX_RCP)
             inv_scale = rcp_approx_ftz(scale)
             packed = cvt_f32x4_to_e4m3x4(
                 v0 * inv_scale,
@@ -543,15 +566,21 @@ class ConcatAndCacheGlmNextMlaKernel:
             )
             st_global_u32(
                 dst
-                + group.to(Int64) * Int64(_GLM_NEXT_GROUP_SIZE)
+                + group.to(Int64) * Int64(self.group_size)
                 + lane.to(Int64) * Int64(4),
                 packed,
             )
             if lane == Int32(0):
-                st_global_f32(
-                    dst + Int64(_GLM_NEXT_SCALE_OFFSET) + group.to(Int64) * Int64(4),
-                    scale,
-                )
+                if cutlass.const_expr(self.dsv41):
+                    st_global_u8(
+                        dst + Int64(_GLM_NEXT_SCALE_OFFSET) + group.to(Int64),
+                        cutlass.Uint8(scale_byte & Uint32(0xFF)),
+                    )
+                else:
+                    st_global_f32(
+                        dst + Int64(_GLM_NEXT_SCALE_OFFSET) + group.to(Int64) * Int64(4),
+                        scale,
+                    )
 
 
 @lru_cache(maxsize=None)
@@ -568,8 +597,10 @@ def _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
 
 def clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache() -> None:
     _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel.cache_clear()
+    _build_compressed_cache_writer.cache_clear()
     with _GLM_NEXT_WRITER_LOCK:
         _NVFP4_WRITER_COMPILED.clear()
+        _COMPRESSED_WRITER_COMPILED.clear()
 
 
 @lru_cache(maxsize=None)
@@ -582,9 +613,11 @@ def _build_concat_and_cache_glm_next_mla_kernel(
 def clear_glm_next_mla_kv_cache_kernel_cache() -> None:
     _build_concat_and_cache_glm_next_mla_kernel.cache_clear()
     _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel.cache_clear()
+    _build_compressed_cache_writer.cache_clear()
     with _GLM_NEXT_WRITER_LOCK:
         _GLM_NEXT_WRITER_COMPILED.clear()
         _NVFP4_WRITER_COMPILED.clear()
+        _COMPRESSED_WRITER_COMPILED.clear()
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -1204,4 +1237,247 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
 
     torch.ops.b12x.concat_and_cache_nvfp4_mla_fp8_rope(
         kv_c, k_pe, kv_cache, slot_mapping, per_token_scale
+    )
+
+
+def page_nbytes(
+    page_size: int,
+    *,
+    cache_format: str = "deepseek_v4",
+    cache_kind: str = "swa",
+) -> int:
+    """Size a compressed MLA byte page (V4.1 has no page-local tail).
+
+    V4 retains its grouped-footer and existing padded page ABI. V4.1 stores
+    contiguous token records: SWA is 512 E4M3 bytes + 16 UE8M0 bytes, indexed
+    is 256 packed E2M1 bytes + 32 E4M3 scale bytes.
+    """
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0:
+        raise ValueError("page_size must be a positive integer")
+    if cache_kind not in ("swa", "indexed"):
+        raise ValueError("cache_kind must be 'swa' or 'indexed'")
+    if cache_format == "deepseek_v4":
+        from .compressed_reference import compressed_sparse_mla_page_nbytes
+
+        return compressed_sparse_mla_page_nbytes(page_size)
+    if cache_format != "deepseek_v41":
+        raise ValueError("cache_format must be 'deepseek_v4' or 'deepseek_v41'")
+    return page_size * (528 if cache_kind == "swa" else 288)
+
+
+@lru_cache(maxsize=None)
+def _build_compressed_cache_writer(page_size: int, cache_kind: str):
+    if cache_kind == "swa":
+        return ConcatAndCacheGlmNextMlaKernel(page_size, dsv41=True)
+    return ConcatAndCacheNvfp4MlaFp8RopeKernel(
+        page_size, is_bf16=True, has_rope=False, dsv41=True
+    )
+
+
+def _validate_compressed_cache_writer(
+    kv: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_size: int,
+    cache_kind: str,
+    cache_format: str,
+) -> None:
+    payload_bytes = page_nbytes(
+        page_size, cache_format=cache_format, cache_kind=cache_kind
+    )
+    if cache_format != "deepseek_v41":
+        raise ValueError("write_cache supports only cache_format='deepseek_v41'")
+    if kv.ndim != 2 or int(kv.shape[1]) != 512:
+        raise ValueError("kv must have shape [rows, 512]")
+    if kv.dtype != torch.bfloat16:
+        raise TypeError("kv must be BF16")
+    if cache.ndim != 2 or int(cache.shape[1]) < payload_bytes:
+        raise ValueError(f"cache must have shape [pages, >= {payload_bytes}]")
+    if cache.dtype != torch.uint8:
+        raise TypeError("cache must be uint8")
+    if slot_mapping.ndim != 1 or slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise TypeError("slot_mapping must be a 1-D int32 or int64 tensor")
+    if not slot_mapping.is_contiguous():
+        raise ValueError("slot_mapping must be contiguous")
+    rows = int(slot_mapping.shape[0])
+    if int(kv.shape[0]) < rows:
+        raise ValueError("kv must cover every slot_mapping row")
+    if kv.stride(1) != 1 or kv.stride(0) % 2 or kv.data_ptr() % 4:
+        raise ValueError("kv rows must be contiguous and 4-byte aligned")
+    if (
+        cache.stride(1) != 1
+        or cache.stride(0) < int(cache.shape[1])
+        or cache.stride(0) % 16
+        or cache.data_ptr() % 16
+    ):
+        raise ValueError("cache requires contiguous byte rows and 16-byte aligned pages")
+    if int(cache.shape[0]) <= 0:
+        raise ValueError("cache must contain at least one page")
+    if rows >= 2**31:
+        raise ValueError("slot_mapping row count must fit in int32 launch geometry")
+    if (
+        int(cache.shape[0]) * page_size >= 2**63
+        or int(cache.shape[0]) * int(cache.stride(0)) >= 2**63
+    ):
+        raise ValueError("cache capacity and byte offsets must fit in int64")
+    if not (kv.is_cuda and cache.is_cuda and slot_mapping.is_cuda):
+        raise ValueError("all tensors must be on CUDA")
+    if len({kv.device, cache.device, slot_mapping.device}) != 1:
+        raise ValueError("all tensors must be on the same device")
+
+
+def _compressed_cache_writer_signature(kv, slot_mapping, page_size, cache_kind):
+    return int(kv.device.index), page_size, cache_kind, slot_mapping.dtype
+
+
+def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_kind):
+    kernel = _build_compressed_cache_writer(page_size, cache_kind)
+    kv_arg = _to_kernel_tensor(kv, assumed_align=4, leading_dim=1)
+    cache_arg = _to_kernel_tensor(cache, assumed_align=16, leading_dim=1)
+    slots_arg = _to_kernel_tensor(
+        slot_mapping,
+        assumed_align=8 if slot_mapping.dtype == torch.int64 else 4,
+        leading_dim=0,
+    )
+    record_bytes = 528 if cache_kind == "swa" else 288
+    tail_args = (
+        Int64(int(cache.stride(0))),
+        Int64(record_bytes),
+        Int64(int(cache.shape[0]) * page_size),
+        Int32(int(slot_mapping.shape[0])),
+        current_cuda_stream(),
+    )
+    if cache_kind == "swa":
+        args = (kv_arg, cache_arg, slots_arg, Int64(int(kv.stride(0))), *tail_args)
+    else:
+        args = (
+            kv_arg,
+            kv_arg,
+            cache_arg,
+            slots_arg,
+            Int64(int(kv.stride(0))),
+            Int64(int(kv.stride(0))),
+            *tail_args,
+        )
+    spec = KernelCompileSpec.from_key(
+        "attention.compressed_sparse_mla.kv_cache",
+        1,
+        (
+            tensor_compile_fact("kv", kv, dynamic_dims=(0,), dynamic_strides=(0,)),
+            tensor_compile_fact(
+                "cache", cache, dynamic_dims=(0, 1), dynamic_strides=(0,)
+            ),
+            tensor_compile_fact("slot_mapping", slot_mapping, dynamic_dims=(0,)),
+            page_size,
+            cache_kind,
+            "deepseek_v41",
+        ),
+        labels=("kv", "cache", "slot_mapping", "page_size", "cache_kind", "cache_format"),
+    )
+    return kernel, args, spec
+
+
+def _compile_compressed_cache_writer(kv, cache, slot_mapping, page_size, cache_kind):
+    signature = _compressed_cache_writer_signature(kv, slot_mapping, page_size, cache_kind)
+    with _GLM_NEXT_WRITER_LOCK:
+        compiled = _COMPRESSED_WRITER_COMPILED.get(signature)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "compressed cache-writer compile miss during CUDA graph capture; "
+                "call compile_cache_writer before capture"
+            )
+        kernel, args, spec = _compressed_cache_writer_launch(
+            kv, cache, slot_mapping, page_size, cache_kind
+        )
+        compiled = compile_cute(kernel, *args, compile_spec=spec)
+        with _GLM_NEXT_WRITER_LOCK:
+            _COMPRESSED_WRITER_COMPILED[signature] = compiled
+    return compiled
+
+
+@torch.library.custom_op(
+    "b12x::write_compressed_mla_cache",
+    mutates_args=("cache",),
+)
+def _write_compressed_mla_cache_op(
+    kv: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_size: int,
+    cache_kind: str,
+) -> None:
+    if int(slot_mapping.shape[0]) == 0:
+        return
+    with torch.cuda.device(kv.device):
+        compiled = _compile_compressed_cache_writer(
+            kv, cache, slot_mapping, page_size, cache_kind
+        )
+        _, args, _ = _compressed_cache_writer_launch(
+            kv, cache, slot_mapping, page_size, cache_kind
+        )
+        run_compiled(compiled, args)
+
+
+@_write_compressed_mla_cache_op.register_fake
+def _write_compressed_mla_cache_fake(
+    kv: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_size: int,
+    cache_kind: str,
+) -> None:
+    return None
+
+
+def compile_cache_writer(
+    kv: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    page_size: int,
+    cache_kind: str,
+    cache_format: str = "deepseek_v41",
+) -> None:
+    """Precompile without writing; live row/page counts and strides are dynamic.
+
+    Prepare a nonempty representative input before frozen kernel resolution or
+    CUDA graph capture. Subsequent writes may use zero or different live rows.
+    """
+    _validate_compressed_cache_writer(
+        kv, cache, slot_mapping, page_size, cache_kind, cache_format
+    )
+    if int(slot_mapping.shape[0]) == 0:
+        raise ValueError("cache-writer compilation requires at least one row")
+    with torch.cuda.device(kv.device):
+        _compile_compressed_cache_writer(kv, cache, slot_mapping, page_size, cache_kind)
+
+
+def write_cache(
+    kv: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    page_size: int,
+    cache_kind: str,
+    cache_format: str = "deepseek_v41",
+) -> None:
+    """Write BF16 post-RoPE ``[rows, 512]`` latents to paged byte storage.
+
+    Each nonnegative in-capacity slot selects ``(slot // page_size,
+    slot % page_size)``. Negative and out-of-capacity slots are ignored; zero
+    live rows are a no-op. Pages may have a caller-owned 16-byte-aligned stride
+    larger than their payload; padding is untouched.
+
+    SWA quantizes all 512 values in groups of 32 to E4M3 with
+    ``pow2ceil(max(amax, 1e-4) / 448)`` UE8M0 scales. Indexed quantizes groups
+    of 16 to saturated E2M1 using the inverse of
+    ``E4M3(max(amax, 6 * 2**-9) / 6)``. Neither recipe has a separate RoPE tail
+    or a second-level scale.
+    """
+    _validate_compressed_cache_writer(
+        kv, cache, slot_mapping, page_size, cache_kind, cache_format
+    )
+    torch.ops.b12x.write_compressed_mla_cache(
+        kv, cache, slot_mapping, page_size, cache_kind
     )

@@ -49,6 +49,15 @@ runtime-policy and generator registrations. Package loading rejects an embedded
 profile that omits a registered component. The component schema is validated
 before a matching config is returned; invalid matching data fails closed.
 
+A newly registered component may have an explicit empty `rules` array in a
+device profile until that component is measured on the device. This means
+uncovered—not a preplanned implementation: AUTO resolves its typed heuristic
+and PREPLANNED_ONLY fails. The serialized component must still declare its
+query/config schema versions and the `rules` field; missing fields or invalid
+matching configurations remain errors. Historical measured branches must be
+restricted to their original recipe when a new numerical or cache format is
+introduced.
+
 One-shot `gemm.blockscaled` participates through the separate catalog inventory
 `ONESHOT_COMPONENTS`. Its `gemm.blockscaled_precision` policy resolves static
 weight geometry during prewarm; live M selects a precision route from

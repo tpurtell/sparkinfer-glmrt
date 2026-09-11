@@ -300,12 +300,28 @@ class MoEWeightPreparationPlan:
     trellis_rate_granularity: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
     coupled_hadamard_blocks: tuple[int, int] | None = None
+    numerical_recipe: str = "default"
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
         if not specs:
             raise ValueError("weight preparation requires at least one MoE spec")
         object.__setattr__(self, "specs", specs)
+        if self.numerical_recipe not in {"default", "deepseek_v41"}:
+            raise ValueError(f"unsupported numerical_recipe {self.numerical_recipe!r}")
+        if self.numerical_recipe == "deepseek_v41" and not (
+            self.quant_modes == frozenset({"w4a8_mx"})
+            and self.source_format == "fp4_e8m0_k32"
+            and self.activation == "silu"
+            and self.io_dtype == "bfloat16"
+            and self.hidden_size % 256 == 0
+            and self.intermediate_size % 128 == 0
+        ):
+            raise ValueError(
+                "deepseek_v41 requires BF16 SiLU, native MXFP4/E8M0-K32 "
+                "weights, A8, hidden size divisible by 256 and intermediate "
+                "size divisible by 128"
+            )
         object.__setattr__(self, "num_experts", int(self.num_experts))
         object.__setattr__(self, "hidden_size", int(self.hidden_size))
         object.__setattr__(self, "intermediate_size", int(self.intermediate_size))

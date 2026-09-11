@@ -1,0 +1,548 @@
+{
+  "schema_version": 1,
+  "status": "qualified",
+  "objective": "Optimize V4.1 prefill/decode inefficiencies and compare Engram SSD offload against Qwen3.8 Flash Next PLE",
+  "worktrees": {
+    "b12x": "/home/luke/projects/b12x",
+    "vllm": "/home/luke/projects/vllm-hh-rebase"
+  },
+  "baseline_revisions": {
+    "b12x": "00b69ac22e21413622c4ecd98f607a2c3e015161",
+    "vllm": "a6571d0a602ed42525a7a77cf960f39ca7f8d7a8"
+  },
+  "serving_configuration": {
+    "gpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "tensor_parallel_size": 4,
+    "max_model_len": "auto",
+    "max_num_batched_tokens": 4096,
+    "max_num_seqs": 4,
+    "gpu_memory_utilization": 0.95,
+    "engram_table_memory": "disk",
+    "speculative_method": "dspark",
+    "draft_tokens": 5,
+    "profiler_enabled": false,
+    "launch_command": "DRY_RUN=0 TORCH_PROFILE_DIR= VLLM_ENABLE_TORCH_PROFILER=0 bash ./serve-ds41-flash.sh"
+  },
+  "changes": [
+    "Separate indexer scratch chunking from attention execution: one full planned attention batch, not one attention call per64 tokens. Shared arena reserves metadata alongside native scratch.",
+    "Attention decode capacity includes configured CUDA graph padding, not just live request-token capacity.",
+    "Restore full indexed visibility for actual128/256-state pages; regression puts winning keys across the previous cutoff with high physical page offsets.",
+    "MXFP4 score_width bounds eager prefill score and TP-reduction tensors without changing scratch capacity or compiled callable. Captured calls retain a safe full replay bound.",
+    "Large-capacity score kernels clear contiguous256-column tiles and score valid prefixes instead of dispatching a CTA per eight mostly-invalid entries.",
+    "Native BF16 projection uses one cached geometry/type adaptive launcher with SIMT and tensor-core entrypoints. Measured selection avoids small-M regressions; FP32 operands keep SIMT; long-K FP32 partial accumulation preserves cancellation residuals.",
+    "Block32 dense plans use prewarmed configured execution capacities rather than forcing prefill tiles for all decode calls.",
+    "Lagged mHC uses fused post-pre except across the Engram residual mutation.",
+    "DSpark context preparation uses bounded existing CUDA graph infrastructure, KV-only block32 checkpoint projections, and the first-layer broadcast path.",
+    "Routed expert results remain FP32 through TP reduction and shared-expert composition before final BF16 rounding; native TP1/TP2 cancellation tests defend this boundary.",
+    "SSD Engram hashes and decodes only the prepared prefix. Default public lookup tail-zero behavior is preserved; its caller-managed prefix mode initializes output once, clears retired rows, and reuses a validated binding."
+  ],
+  "serving_comparison": [
+    {
+      "case": 4096,
+      "metric": "ttft_s",
+      "baseline_samples_s": [
+        2.8606013779644854,
+        2.871454611013178,
+        2.872898040979635
+      ],
+      "final_samples_s": [
+        1.0153873939998448,
+        1.0252850740216672,
+        1.0286160740070045
+      ],
+      "baseline_median_s": 2.871454611013178,
+      "final_median_s": 1.0252850740216672,
+      "baseline_over_final": 2.8006402158474177
+    },
+    {
+      "case": 16384,
+      "metric": "ttft_s",
+      "baseline_samples_s": [
+        11.98597244801931,
+        11.999787791981362,
+        12.017710399988573
+      ],
+      "final_samples_s": [
+        4.472422615042888,
+        4.485956371994689,
+        4.499714190023951
+      ],
+      "baseline_median_s": 11.999787791981362,
+      "final_median_s": 4.485956371994689,
+      "baseline_over_final": 2.6749675647526714
+    },
+    {
+      "case": "decode",
+      "metric": "decode_s_per_output_token",
+      "baseline_samples_s": [
+        0.00935976268488943,
+        0.009940774677280982,
+        0.010165586732107941
+      ],
+      "final_samples_s": [
+        0.008991666244045926,
+        0.009157445251952681,
+        0.010313133881922341
+      ],
+      "baseline_median_s": 0.009940774677280982,
+      "final_median_s": 0.009157445251952681,
+      "baseline_over_final": 1.0855401701867962
+    }
+  ],
+  "ratio_direction": "baseline latency / final latency; >1 is faster",
+  "interpretation": {
+    "prefill": "Clear improvement on matching4096/16384-token requests.",
+    "decode": "Median improved from9.94 to9.16ms/output token across three128-token responses; samples overlap, so do not claim a statistically established speedup.",
+    "quality": "All arithmetic requests returned703; final decode outputs were manually reviewed as coherent Python reliability tutorials. Output counts fixed at128, not token-parity qualification."
+  },
+  "toolchain": {
+    "torch": "2.13.0",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "vllm": "0.27.2rc1.dev523+g3e63556c2.d20260827.cu133"
+  },
+  "gpu_before": {
+    "time_ns": 1789094576258079216,
+    "command": [
+      "nvidia-smi",
+      "-i",
+      "0,1,2,3",
+      "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+      "--format=csv"
+    ],
+    "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P8, 427 MHz, 405 MHz, 0x0000000000000000, 22.79 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P8, 427 MHz, 405 MHz, 0x0000000000000000, 23.02 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P8, 427 MHz, 405 MHz, 0x0000000000000000, 19.17 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P8, 427 MHz, 405 MHz, 0x0000000000000000, 21.58 W, 325.00 W\n"
+  },
+  "gpu_after": {
+    "time_ns": 1789094599532805361,
+    "command": [
+      "nvidia-smi",
+      "-i",
+      "0,1,2,3",
+      "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+      "--format=csv"
+    ],
+    "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2497 MHz, 15865 MHz, 0x0000000000000000, 209.43 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2512 MHz, 15865 MHz, 0x0000000000000000, 202.56 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 197.66 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2512 MHz, 15865 MHz, 0x0000000000000000, 210.81 W, 325.00 W\n"
+  },
+  "score_microbenchmark": {
+    "cases": [
+      {
+        "rows": 1,
+        "visible_states": 128,
+        "before_us": 75.32799988985062,
+        "after_us": 30.30399978160858,
+        "ratio_before_over_after": 2.485744470456569
+      },
+      {
+        "rows": 1,
+        "visible_states": 4096,
+        "before_us": 75.32799988985062,
+        "after_us": 56.92800134420395,
+        "ratio_before_over_after": 1.3232152563093635
+      },
+      {
+        "rows": 1,
+        "visible_states": 16384,
+        "before_us": 81.4720019698143,
+        "after_us": 58.94400179386139,
+        "ratio_before_over_after": 1.3821932595404312
+      },
+      {
+        "rows": 6,
+        "visible_states": 128,
+        "before_us": 431.67999386787415,
+        "after_us": 42.59200021624565,
+        "ratio_before_over_after": 10.135236468730591
+      },
+      {
+        "rows": 6,
+        "visible_states": 4096,
+        "before_us": 441.9200122356415,
+        "after_us": 85.60000360012054,
+        "ratio_before_over_after": 5.162616748242978
+      },
+      {
+        "rows": 6,
+        "visible_states": 16384,
+        "before_us": 471.6159999370575,
+        "after_us": 112.19199746847153,
+        "ratio_before_over_after": 4.203650978489729
+      },
+      {
+        "rows": 24,
+        "visible_states": 128,
+        "before_us": 1722.9440212249756,
+        "after_us": 83.55200290679932,
+        "ratio_before_over_after": 20.621217460781725
+      },
+      {
+        "rows": 24,
+        "visible_states": 4096,
+        "before_us": 1755.7120323181152,
+        "after_us": 153.18399667739868,
+        "ratio_before_over_after": 11.461458575307947
+      },
+      {
+        "rows": 24,
+        "visible_states": 16384,
+        "before_us": 1876.5439987182617,
+        "after_us": 291.4240062236786,
+        "ratio_before_over_after": 6.439222434125573
+      },
+      {
+        "rows": 64,
+        "visible_states": 128,
+        "before_us": 4587.071895599365,
+        "after_us": 183.87199938297272,
+        "ratio_before_over_after": 24.947093146277858
+      },
+      {
+        "rows": 64,
+        "visible_states": 4096,
+        "before_us": 4687.424182891846,
+        "after_us": 321.1199939250946,
+        "ratio_before_over_after": 14.59711096028872
+      },
+      {
+        "rows": 64,
+        "visible_states": 16384,
+        "before_us": 5002.848148345947,
+        "after_us": 719.4240093231201,
+        "ratio_before_over_after": 6.953963286620008
+      }
+    ],
+    "full_visible_controls": [
+      {
+        "rows": 1,
+        "before_us": 509.5360279083252,
+        "after_us": 527.9359817504883,
+        "baseline_over_final": 0.9651473768066462
+      },
+      {
+        "rows": 6,
+        "before_us": 3058.2399368286133,
+        "after_us": 3079.7760486602783,
+        "baseline_over_final": 0.993007247445465
+      }
+    ],
+    "scope": "Native GPU graph score timing only; no TP collective/model speedup inference. Fully populated1M controls were roughlyflat (six rows +0.7%, one row +3.6% latency).",
+    "source_code": "\nimport json, sys, hashlib\nfrom pathlib import Path\nimport torch\nfrom b12x.attention import dsa_indexer as api\nfrom b12x import freeze_kernel_resolution, unfreeze_kernel_resolution\nfrom benchmarks.common import capture_cuda_graph, bench_cuda_graph, nvidia_smi_gpu_mode_snapshot\nout=Path(sys.argv[1]); device=torch.device('cuda',0); capacity=64; page=256; width=1048576; live_max=16384\nstorage=torch.empty((live_max//page+1,227840),dtype=torch.uint8,device=device)\npool=storage[:,:api.index_mxfp4_page_bytes(page)]\nkeys=torch.ones((live_max,128),dtype=torch.bfloat16,device=device)\napi.quantize_write_index_k_mxfp4(keys,index_k_cache=pool,slot_mapping=torch.arange(live_max,device=device)+page,page_size=page)\nq=torch.ones((capacity,8,128),dtype=torch.bfloat16,device=device)\npacked=torch.empty((capacity,8,64),dtype=torch.uint8,device=device); scales=torch.empty((capacity,8,4),dtype=torch.uint8,device=device)\napi.quantize_q_mxfp4(q,q_mxfp4=packed,q_scales=scales)\nweights=torch.full((capacity,8),1/64,dtype=torch.bfloat16,device=device)\ntable=torch.full((1,width//page),-1,dtype=torch.int32,device=device); table[0,:live_max//page]=torch.arange(1,live_max//page+1,device=device)\nlengths=torch.full((capacity,),128,dtype=torch.int32,device=device); active=torch.tensor([width],dtype=torch.int32,device=device)\nplan=api.plan(api.Caps(device=device,num_q_heads=8,max_q_rows=capacity,max_page_table_width=width//page,topk=512,cache_format='mxfp4',page_size=page))\nspec,=plan.scratch_specs(); scratch=torch.empty(spec.shape,dtype=spec.dtype,device=device)\nindices=torch.empty((capacity,512),dtype=torch.int32,device=device)\ndef binding(rows):\n return api.bind(plan,scratch=scratch,q_mxfp4=packed[:rows],q_scales=scales[:rows],query_weights=weights[:rows],index_k_cache=pool,page_table=table,cache_lengths=lengths[:rows],active_width=active,output_indices=indices[:rows])\napi.score(binding(1)); results=[]\nfreeze_kernel_resolution('index score baseline/optimized graph')\ntry:\n for rows in (1,6,24,64):\n  bound=binding(rows)\n  for live in (128,4096,16384):\n   lengths.fill_(live); values=api.score(bound)\n   torch.testing.assert_close(values[:,:live],torch.full_like(values[:,:live],16),rtol=0,atol=0)\n   assert torch.isneginf(values[:,live:]).all()\n   graph=capture_cuda_graph(lambda:api.score(bound),warmup=5)\n   before=nvidia_smi_gpu_mode_snapshot()\n   samples=bench_cuda_graph(graph,replays=25)['replay_us']\n   results.append({'rows':rows,'visible_states':live,'capacity_states':width,'median_us':sorted(samples)[len(samples)//2],'samples_us':samples,'gpu_before':before,'gpu_after':nvidia_smi_gpu_mode_snapshot(),'correct':True})\nfinally:unfreeze_kernel_resolution()\nresult={'source_sha256':hashlib.sha256(Path('b12x/attention/dsa_indexer/mxfp4.py').read_bytes()).hexdigest(),'command':[sys.executable,*sys.argv],'cases':results,'scope':'Native score kernel graph replay at fixed1M capacity, warm strided cache; not TP collective or full model latency.'}\nout.parent.mkdir(parents=True,exist_ok=True);out.write_text(json.dumps(result,indent=2)+'\\n')\nprint(json.dumps([{k:r[k] for k in ('rows','visible_states','median_us')} for r in results]))\n",
+    "full_visible_source_code": "\nimport json, sys, hashlib\nfrom pathlib import Path\nimport torch\nfrom b12x.attention import dsa_indexer as api\nfrom b12x import freeze_kernel_resolution, unfreeze_kernel_resolution\nfrom benchmarks.common import capture_cuda_graph, bench_cuda_graph, nvidia_smi_gpu_mode_snapshot\nout=Path(sys.argv[1]); device=torch.device('cuda',0); capacity=64; page=256; width=1048576; live_max=1048576\nstorage=torch.empty((live_max//page+1,227840),dtype=torch.uint8,device=device)\npool=storage[:,:api.index_mxfp4_page_bytes(page)]\nkeys=torch.ones((live_max,128),dtype=torch.bfloat16,device=device)\napi.quantize_write_index_k_mxfp4(keys,index_k_cache=pool,slot_mapping=torch.arange(live_max,device=device)+page,page_size=page)\nq=torch.ones((capacity,8,128),dtype=torch.bfloat16,device=device)\npacked=torch.empty((capacity,8,64),dtype=torch.uint8,device=device); scales=torch.empty((capacity,8,4),dtype=torch.uint8,device=device)\napi.quantize_q_mxfp4(q,q_mxfp4=packed,q_scales=scales)\nweights=torch.full((capacity,8),1/64,dtype=torch.bfloat16,device=device)\ntable=torch.full((1,width//page),-1,dtype=torch.int32,device=device); table[0,:live_max//page]=torch.arange(1,live_max//page+1,device=device)\nlengths=torch.full((capacity,),128,dtype=torch.int32,device=device); active=torch.tensor([width],dtype=torch.int32,device=device)\nplan=api.plan(api.Caps(device=device,num_q_heads=8,max_q_rows=capacity,max_page_table_width=width//page,topk=512,cache_format='mxfp4',page_size=page))\nspec,=plan.scratch_specs(); scratch=torch.empty(spec.shape,dtype=spec.dtype,device=device)\nindices=torch.empty((capacity,512),dtype=torch.int32,device=device)\ndef binding(rows):\n return api.bind(plan,scratch=scratch,q_mxfp4=packed[:rows],q_scales=scales[:rows],query_weights=weights[:rows],index_k_cache=pool,page_table=table,cache_lengths=lengths[:rows],active_width=active,output_indices=indices[:rows])\napi.score(binding(1)); results=[]\nfreeze_kernel_resolution('index score baseline/optimized graph')\ntry:\n for rows in (1,6):\n  bound=binding(rows)\n  for live in (1048576,):\n   lengths.fill_(live); values=api.score(bound)\n   torch.testing.assert_close(values[:,:live],torch.full_like(values[:,:live],16),rtol=0,atol=0)\n   assert torch.isneginf(values[:,live:]).all()\n   graph=capture_cuda_graph(lambda:api.score(bound),warmup=5)\n   before=nvidia_smi_gpu_mode_snapshot()\n   samples=bench_cuda_graph(graph,replays=25)['replay_us']\n   results.append({'rows':rows,'visible_states':live,'capacity_states':width,'median_us':sorted(samples)[len(samples)//2],'samples_us':samples,'gpu_before':before,'gpu_after':nvidia_smi_gpu_mode_snapshot(),'correct':True})\nfinally:unfreeze_kernel_resolution()\nresult={'source_sha256':hashlib.sha256(Path('b12x/attention/dsa_indexer/mxfp4.py').read_bytes()).hexdigest(),'command':[sys.executable,*sys.argv],'cases':results,'scope':'Native score kernel graph replay at fixed1M capacity, warm strided cache; not TP collective or full model latency.'}\nout.parent.mkdir(parents=True,exist_ok=True);out.write_text(json.dumps(result,indent=2)+'\\n')\nprint(json.dumps([{k:r[k] for k in ('rows','visible_states','median_us')} for r in results]))\n"
+  },
+  "projection_microbenchmark": {
+    "artifact": "/tmp/b12x-v41-optimization/bf16-projection-refined.json",
+    "scope": "Balanced AB/BA races of production SIMT/MMA GPU entrypoints, outside public host dispatch.",
+    "outcome": "All refined cases passed the numerical gate; selected production regimes showed no measured regressions versus SIMT in this corpus. Large4096-row gains were8.18x WO-A,8.34x compressor and10.09x DSpark auxiliary projection.",
+    "numerical_gate": "BF16 one representable step plus5e-5 cancellation floor; long-K MMA failure was diagnosed against FP64 and corrected by FP32 partial accumulation rather than accepting the failing result."
+  },
+  "ssd_comparison": {
+    "configuration": {
+      "physical_gpu": 2,
+      "tp_size": 4,
+      "tp_rank": 0,
+      "queue_depth": 64,
+      "planned_capacities": [
+        256,
+        1024,
+        4096
+      ],
+      "prepared_token_counts": [
+        1,
+        6,
+        24,
+        256,
+        4096
+      ],
+      "samples_per_eligible_case": 12
+    },
+    "comparison": [
+      {
+        "prepared_tokens": 1,
+        "engram_owner_medians_before_ms": {
+          "1": 0.283346,
+          "14": 0.270941
+        },
+        "engram_owner_medians_after_ms": {
+          "1": 0.205216,
+          "14": 0.2524465
+        },
+        "sum_engram_before_ms": 0.554287,
+        "sum_engram_after_ms": 0.4576625,
+        "qwen_owner_median_ms": 0.18670599999999998,
+        "sum_engram_after_over_qwen": 2.451246880121689
+      },
+      {
+        "prepared_tokens": 6,
+        "engram_owner_medians_before_ms": {
+          "1": 0.3509365,
+          "14": 0.370431
+        },
+        "engram_owner_medians_after_ms": {
+          "1": 0.2839115,
+          "14": 0.290481
+        },
+        "sum_engram_before_ms": 0.7213674999999999,
+        "sum_engram_after_ms": 0.5743925,
+        "qwen_owner_median_ms": 0.266057,
+        "sum_engram_after_over_qwen": 2.1589076776780916
+      },
+      {
+        "prepared_tokens": 24,
+        "engram_owner_medians_before_ms": {
+          "1": 0.5976325,
+          "14": 0.6070175
+        },
+        "engram_owner_medians_after_ms": {
+          "1": 0.523237,
+          "14": 0.5282825
+        },
+        "sum_engram_before_ms": 1.20465,
+        "sum_engram_after_ms": 1.0515195,
+        "qwen_owner_median_ms": 0.46304199999999995,
+        "sum_engram_after_over_qwen": 2.270894432902415
+      },
+      {
+        "prepared_tokens": 256,
+        "engram_owner_medians_before_ms": {
+          "1": 3.478808,
+          "14": 3.5971330000000004
+        },
+        "engram_owner_medians_after_ms": {
+          "1": 3.3935465,
+          "14": 3.677603
+        },
+        "sum_engram_before_ms": 7.075941,
+        "sum_engram_after_ms": 7.0711495,
+        "qwen_owner_median_ms": 2.871194,
+        "sum_engram_after_over_qwen": 2.4627905672692267
+      },
+      {
+        "prepared_tokens": 4096,
+        "engram_owner_medians_before_ms": {
+          "1": 50.528066499999994,
+          "14": 52.022967
+        },
+        "engram_owner_medians_after_ms": {
+          "1": 50.751416,
+          "14": 51.9959725
+        },
+        "sum_engram_before_ms": 102.55103349999999,
+        "sum_engram_after_ms": 102.7473885,
+        "qwen_owner_median_ms": 39.4230845,
+        "sum_engram_after_over_qwen": 2.6062747195745173
+      }
+    ],
+    "reader_summary": [
+      {
+        "model": "engram",
+        "owner": 1,
+        "prepared_tokens": 6,
+        "local_rows": 36.0,
+        "requested_bytes": 9504.0,
+        "read_bytes": 303104.0,
+        "read_calls": 72.0,
+        "native_reader_ms": 0.14777600000000002
+      },
+      {
+        "model": "engram",
+        "owner": 14,
+        "prepared_tokens": 6,
+        "local_rows": 36.0,
+        "requested_bytes": 9504.0,
+        "read_bytes": 305152.0,
+        "read_calls": 72.0,
+        "native_reader_ms": 0.153711
+      },
+      {
+        "model": "qwen",
+        "owner": 1,
+        "prepared_tokens": 6,
+        "local_rows": 24.0,
+        "requested_bytes": 2160.0,
+        "read_bytes": 196608.0,
+        "read_calls": 48.0,
+        "native_reader_ms": 0.150625
+      }
+    ],
+    "contracts": {
+      "engram": "Two24-head E4M3/E8M0 tables,256+8 bytes/row",
+      "qwen": "One16-head NVFP4 table,80+10 bytes/row and FP32 global scale"
+    },
+    "conclusion": "Same O_DIRECT/io_uring reader; Engram has3x ID work and8.8x logical table bytes across owners at matched TP. At C4096/T6 the sum of owner medians improved0.721\u21920.574ms; Qwen0.266ms. This is a sum of isolated owner medians, not a jointly timed full-model ratio.",
+    "limitations": [
+      "Native hash/D2H/read/decode transactions only; excludes model-state preparation, TP collective/projection and full-model inference.",
+      "Actual checkpoint planes and CPU hash/selected-row decode oracles were used.",
+      "O_DIRECT is not proof of cold SSD/controller cache."
+    ]
+  },
+  "final_checks": {
+    "passed": 113,
+    "groups": [
+      {
+        "command": "CUDA_VISIBLE_DEVICES=0 /home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -xq tests/gemm/test_bf16_gemv.py tests/attention/test_dsa_indexer_mxfp4.py tests/sequence/test_engram.py",
+        "cwd": "/home/luke/projects/b12x",
+        "passed": 65
+      },
+      {
+        "command": "CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest -xq tests/v1/attention/test_b12x_v41_workspace.py tests/models/test_deepseek_v4_1_compressor.py tests/models/test_deepseek_v4_1_engram.py tests/models/test_dspark_mla.py",
+        "cwd": "/home/luke/projects/vllm-hh-rebase",
+        "passed": 30
+      },
+      {
+        "command": "CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest -xq tests/model_executor/kernels/test_b12x_linear.py tests/models/test_deepseek_v4_mega_moe.py -k v41",
+        "cwd": "/home/luke/projects/vllm-hh-rebase",
+        "passed": 9,
+        "skipped": 2
+      },
+      {
+        "command": "CUDA_VISIBLE_DEVICES= .venv/bin/python -m pytest -xq tests/v1/spec_decode/test_dflash_dcp.py",
+        "cwd": "/home/luke/projects/vllm-hh-rebase",
+        "passed": 7
+      },
+      {
+        "command": "CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python -m pytest -xq tests/models/test_deepseek_v4_mega_moe.py::test_v41_moe_composition_preserves_small_tp_contribution tests/model_executor/kernels/test_b12x_linear.py::test_v41_vocab_embedding_sharded_global_ids_and_target_weight_tie",
+        "cwd": "/home/luke/projects/vllm-hh-rebase",
+        "passed": 2,
+        "note": "Runs both cases skipped under the single-GPU selection."
+      }
+    ],
+    "environment": {
+      "python": "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+      "CUDA_HOME": "/opt/cuda",
+      "CUTE_DSL_ARCH": "sm_120a",
+      "OMP_NUM_THREADS": "1"
+    },
+    "format": "ruff0.12.8 format",
+    "syntax_check": "ruff E9,F63,F7,F82 passed"
+  },
+  "integrated_serving": {
+    "api_pid": 1856435,
+    "worker_pids": [
+      1860040,
+      1860041,
+      1860042,
+      1860043
+    ],
+    "hub_name": "ds41-optimization",
+    "endpoint": "http://127.0.0.1:8000/v1",
+    "max_model_len": 1048576,
+    "available_kv_gib_per_rank": 7.39,
+    "kv_capacity_tokens": 4558531,
+    "estimated_full_context_concurrency": 4.35,
+    "model_loading_gib_per_rank": 76.25,
+    "profile_graph_gib_per_rank": 4.19,
+    "final_capture_gib_per_rank": 4.31,
+    "successful_requests": 15,
+    "request_errors": 0,
+    "concurrent_requests_exercised": 4,
+    "largest_actual_prompt_tokens": 65550,
+    "prefix_hit_tokens": 65536,
+    "draft_rounds": 186,
+    "accepted_draft_tokens": 254,
+    "graph_cache_rebinding": "Startup completed both memory-profile and final capture phases, including DSpark context captures.",
+    "limitation": "No four-simultaneous-full1M generation or full1M text-quality claim."
+  },
+  "structural_audit_dispositions": {
+    "removed": "Token-chunked attention; prefill-only dense policies in decode; unconditional small-N GEMV for large BF16 projections; eager DSpark context kernel chain; discarded DSpark Q projection; first-draft-layer stream repeat; separate mHC post/pre where fusion is legal; full-capacity SSD hash/gather work.",
+    "retained": "Separate normalization stages/row copies and some per-group metadata/binding validation remain. These are not the64x host dispatch amplification. Aux reconstruction and hash/quantization differences required by model semantics are preserved.",
+    "reviews": "Independent native and serving reviews found no actionable blockers; full-server mixed/prefix checks supplement the focused tests."
+  },
+  "source_sha256": {
+    "/home/luke/projects/b12x/b12x/gemm/bf16_gemv/_kernel.py": "446aad7a25686678d96e0b6662281520ea6131ed994896abdc8858317f3843e9",
+    "/home/luke/projects/b12x/b12x/gemm/bf16_gemv/api.py": "61dcee825a0d1ca9d16468a0f4ff4bbef3b3dd1312df713622e15621df3a47ac",
+    "/home/luke/projects/b12x/b12x/gemm/bf16_gemv/__init__.py": "39902a42294b7f28105cf54bdd83db152cc5b4a9f7d10c171084149e65e69282",
+    "/home/luke/projects/b12x/b12x/attention/dsa_indexer/api.py": "d87b0a64eb678f54163f93359067fc9eecb160af239e10b1ea181f91a22ecf47",
+    "/home/luke/projects/b12x/b12x/attention/dsa_indexer/mxfp4.py": "fd9e1d61771a1cfc820c617eee5a1825f2a1c63f5e3f22c9f3d272af43572677",
+    "/home/luke/projects/b12x/b12x/sequence/engram/api.py": "74aea57c871afdb79e1e77a96e1b68f596916d391c26aad2be8a8e29d9fb6560",
+    "/home/luke/projects/b12x/b12x/sequence/engram/_kernels.py": "74dec5e418315e32610508dae7dfc56108a340678ee91ce1d839a5c99ccdba3c",
+    "/home/luke/projects/b12x/tests/gemm/test_bf16_gemv.py": "c7680aa580f20709eb809096fca129ec8de87b3b8992b2b4e718662f52d23108",
+    "/home/luke/projects/b12x/tests/attention/test_dsa_indexer_mxfp4.py": "e94a4c2b4d8337645922ea75046a9b74620e6e7696d8bf8ee6045ebd5524eb4f",
+    "/home/luke/projects/b12x/tests/sequence/test_engram.py": "c36e4a1b5a4a545c1e18eb2f8e4c6c43f85e04d9996f86e6a178a0c1bc2d6f4c",
+    "/home/luke/projects/b12x/benchmarks/benchmark_v41_serving.py": "8a0bda994eea25054f32999bdc0aa516fd9b55b33f94555d6fa553bf4871ecae",
+    "/home/luke/projects/b12x/benchmarks/benchmark_bf16_projection.py": "f96beb1e656ef2c3694d32568732a8925f585ac97365429257a6da1fbfe5113a",
+    "/home/luke/projects/b12x/benchmarks/benchmark_ngram_ssd.py": "e9bbd1844dccea70b8e379d5f00db1f17d5dd1e8602161cf984a845589a07c61",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/attention.py": "38a031f132df995f83424c294e21595d338693656986000149186ffda62b92da",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/b12x_layers.py": "2930730844eeeb4ea78ecbca014e80c60818d66d9fd05c3c6a2d747d24743856",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/sparse_mla.py": "a787f95d6b0c50e869070c1065821fa61393f1b049194e2b0aed2ab628226ac5",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/common/engram.py": "ed8a189a33e13d1aa4ee2a6a1835c3c2054d777220dfefd5de37e0228ff163ed",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/b12x_moe.py": "3200e9acba582f76bed5bfc348e83763f87dd0d36a889abb4f1938fee3c70770",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/model.py": "d5e44c5f6f1a24097225ac00bb0477bd552b049f66f3f92eaab71288082e6581",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/dspark.py": "98de73d4b3ab2045851ab5d4eb88709462c656d9614701e081d790cd3aadbb69",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py": "7838f04629d0f2f77d471a93ee8d8add48297d2482004a7068c66d938d6fa5b2",
+    "/home/luke/projects/vllm-hh-rebase/tests/model_executor/kernels/test_b12x_linear.py": "37a862e03afa764c528a2068e9e1de63e535637fdbddcc42c8d6547ebc39eab9",
+    "/home/luke/projects/vllm-hh-rebase/tests/models/test_dspark_mla.py": "c8530c3c965e5b501b028a4b6fb70e8d44dd524329c0dc19df16118b9040cce3",
+    "/home/luke/projects/vllm-hh-rebase/tests/models/test_deepseek_v4_mega_moe.py": "a2743fe6572f877e5b537bf73884aa9b5bd5a057ccf2ee475155eebf561d582b",
+    "/home/luke/projects/vllm-hh-rebase/tests/models/test_deepseek_v4_1_compressor.py": "1252783bf5db1de1c50432d5b9dfa82b5047f8db0a9d21d52ef8c17463389ac4",
+    "/home/luke/projects/vllm-hh-rebase/tests/models/test_deepseek_v4_1_engram.py": "4266d61297d5409ac86f1522ca5a196e2bef9ec3e5a77e190293251ed279a21f",
+    "/home/luke/projects/vllm-hh-rebase/tests/v1/attention/test_b12x_v41_workspace.py": "8f248c63f4da434a853c45fd71dc0e2f17e76a1b35e55e8ee90f7b60d0953b7f",
+    "/home/luke/projects/b12x/README.md": "02c1cd3740a31958aa8e12c9c3bf644f72b0aeed1b46816d043f7d76ab0ceda1"
+  },
+  "raw_artifact_sha256": {
+    "/tmp/b12x-v41-optimization/baseline-serving.json": "1f7a1efd03b9b5615852824043ef38224899cf4a8c9854a87f0759d58528040b",
+    "/tmp/b12x-v41-optimization/core-optimized-serving.json": "92946f88dbf1a63756637d3494236d6c3d2302b70cd916d2b9ee1947c98a1518",
+    "/tmp/b12x-v41-optimization/final-serving.json": "6094e44e97112fab1084a91dac7acf8bf8ad5fef1d8f2b21225590e66cea767a",
+    "/tmp/b12x-v41-optimization/final-correctness.json": "215cba83aadd661c00a1b662d6d6f45ba857126b2d70149810c2aed48bd79e8b",
+    "/tmp/b12x-v41-optimization/core-comparison.json": "fa6f296d261ce59393d562c64e1005028c90f232c6a39d8df0c9c9cc12aedc1a",
+    "/tmp/b12x-v41-optimization/score-before.json": "4451bc9c660c33df06d63ca88153cd8a02f56de3c2726987b074ecfb017bd5b2",
+    "/tmp/b12x-v41-optimization/score-after.json": "314d9598fc445a3cac4bf4fe0b3b045f68a006e04bf44fae6e2ed41984c72faa",
+    "/tmp/b12x-v41-optimization/score-dense-before.json": "32cef47ede44d862055628bfbf8087e55d548f0ac84a1129c3c31ecb01213349",
+    "/tmp/b12x-v41-optimization/score-dense-after.json": "a743447a1ea61536ebee539e8217b865f71f4419c7966a8a14e5a1baba9be9f1",
+    "/tmp/b12x-v41-optimization/bf16-projection-refined.json": "e48fe740da776c582a9156cabc6962c481507184355e1f4bc5629284a953edf9",
+    "/tmp/b12x-v41-optimization/ngram-ssd-before-r0-v2.json": "7d8adf201fa2a0f1f672d6f4eb587d8e1f8725571c60025cce8f14f784a0e5a8",
+    "/tmp/b12x-v41-optimization/ngram-ssd-after-r0.json": "89315e7843a388d7c5b7436c73ab191bc7db4b0bada700fdd3d14a43bc8a3497",
+    "/tmp/b12x-v41-optimization/qwen-live-ssd-serving.json": "3a604cfb1ba051c2b628e028fa70ec2c74658ace039ad5dab6a23c2940fd2928",
+    "/tmp/b12x-v41-optimization/restored-service.json": "74dff32ece9e26b89d637b3e1665095fd46491cd16924365630893292f255b6d"
+  },
+  "cleanup": {
+    "large_raw_outputs": "/tmp/b12x-v41-optimization",
+    "benchmark_tools_retained": true,
+    "throwaway_script_files_created": false,
+    "unrelated_launcher_changes_not_committed": true,
+    "committed": false
+  },
+  "scope_clarification": "User requested Engram/SSD path timings from Qwen, not full-model serving comparisons. The requested comparison is the isolated hash/read/GPU-decode transaction. Extra Qwen serving measurements are contextual only and are not attributed to SSD overhead. The temporary262K DeepSeek comparison was stopped without benchmarking.",
+  "post_qualification": {
+    "change": "Include max_cudagraph_capture_size in dense/mHC execution-capacity planning so padded32/40/48-row graphs do not select the4096-row prefill regime.",
+    "verification": {
+      "linear_regime_and_replay_checks_passed": 7,
+      "dspark_tests_passed": 14,
+      "note": "These focused reruns overlap the earlier113 checks; the padded-bound regression is new.",
+      "lint": "ruff E9,F63,F7,F82 passed"
+    },
+    "source_sha256": {
+      "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/b12x_layers.py": "62213069daeb5aa497e5b6e5297f1ad38b279f80b87f1a3fe56119e96b3f66b5",
+      "/home/luke/projects/vllm-hh-rebase/tests/model_executor/kernels/test_b12x_linear.py": "5325bc4d9a1a987cc3ea155dd6ca0d875b522b9c8bc8846471c42a74860dff18",
+      "/home/luke/projects/b12x/benchmarks/benchmark_v41_serving.py": "29223b8724ab5ad8690a0345c9e591a74a6510d779ddce7388db255f5f172d79"
+    },
+    "benchmark_metadata": "The serving harness now records both worktrees/commits and explicit model-specific chat-template kwargs.",
+    "restoration": {
+      "api_pid": 2121362,
+      "hub_name": "ds41-optimization",
+      "max_model_len": 1048576,
+      "health_status": 200,
+      "short_arithmetic_response": "703",
+      "raw_evidence": "/tmp/b12x-v41-optimization/restored-service.json"
+    },
+    "extra_qwen_run": {
+      "artifact": "/tmp/b12x-v41-optimization/qwen-live-ssd-serving.json",
+      "environment": {
+        "DEVICE_IDS": "0,1,2,3",
+        "TP_SIZE": "4",
+        "VLLM_PLE_TABLE_MEMORY": "disk",
+        "VLLM_PLE_CPU_OFFLOAD": "0",
+        "GPU_MEMORY_UTILIZATION": "0.95",
+        "MAX_MODEL_LEN": "262144",
+        "MAX_NUM_BATCHED_TOKENS": "4096",
+        "MAX_NUM_SEQS": "4",
+        "NUM_SPECULATIVE_TOKENS": "3",
+        "TORCH_PROFILE_DIR": ""
+      },
+      "launch": "env -u CUDA_VISIBLE_DEVICES bash ./serve-qwen38-flash-next-nvfp4.sh",
+      "storage_evidence": "Launcher reported PLE n-gram table storage default: disk; _resolve_ple_table_memory uses this explicit environment setting and maps disk to io_uring (no additional-config override supplied).",
+      "scope": "Whole-model observations, not SSD-attributable timings; Qwen has different model geometry and MTP speculation. Server stopped."
+    }
+  }
+}

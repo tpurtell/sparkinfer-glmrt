@@ -7,9 +7,24 @@ lanes at model entry, ``run_post_pre`` is the steady-state fused post+pre
 boundary between sublayers/layers, and ``run_post`` is the terminal mix-back.
 ``run_head`` performs the checkpoint's terminal four-lane sigmoid collapse and
 RMSNorm, and can retain the pre-norm collapse in a second caller-owned output.
-Sinkhorn-normalized mix matrices; hidden sizes 4096/7168; mix
+Sinkhorn-normalized mix matrices; hidden sizes 4096/5120/7168; mix
 constants exposed as ``MIXES`` / ``MULT`` / ``PARTIALS``. A bound lifecycle
 uses only caller-owned scratch and outputs.
+
+V4.1 lagged input mixing: pass incoming FP32 ``pre_mix[tokens, 4]`` to
+``run_pre`` or ``run_post_pre`` and a disjoint caller-owned FP32 ``pre_out``
+(directly or at bind time). The incoming coefficients collapse this residual;
+newly predicted coefficients are written to ``pre_out`` for the next sublayer.
+The four returned tensors remain ``residual, post, comb, y``. Initialize the
+first incoming mix to one-hot. With ``norm_weight`` and ``norm_eps=1e-20``,
+RMSNorm follows the BF16-rounded collapse. Omitting both mix arguments keeps
+the original current-mix behavior. ``run_pre`` accepts either an expanded
+``[tokens, 4, hidden]`` residual with full ``fn[24, 4 * hidden]`` or the older
+broadcast ``[tokens, hidden]`` residual with pre-summed ``fn[24, hidden]``.
+Scratch ``split_k`` defaults to ``4 * hidden / 256`` (80 for hidden 5120).
+Lagged mixing specializes the existing finalize; projection remains a separate
+pass, not a single Mega-mHC kernel. Caller-owned paths support CUDA graphs,
+not Dynamo tracing.
 
 Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) ->
 ``run_*`` (capture safe; torch.compile-safe via opaque custom ops).
@@ -46,6 +61,7 @@ META = OpMeta(
         "run_pre",
         "run_post",
         "run_post_pre",
+        "run_collapse",
         "MIXES",
         "MULT",
         "PARTIALS",
@@ -87,6 +103,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         run_post_pre,
         run_head,
         run_pre,
+        run_collapse,
     )
 
 install_lazy_api(globals(), META)

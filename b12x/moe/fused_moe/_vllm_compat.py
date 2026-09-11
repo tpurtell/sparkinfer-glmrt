@@ -45,6 +45,7 @@ def plan_weights(
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
+    numerical_recipe: str = "default",
 ) -> WeightsPlan:
     return plan_b12x_fp4_moe_weights(
         quant_modes=quant_modes,
@@ -63,6 +64,7 @@ def plan_weights(
         trellis_rate_granularity=trellis_rate_granularity,
         trellis_pair_kinds=trellis_pair_kinds,
         coupled_hadamard_blocks=coupled_hadamard_blocks,
+        numerical_recipe=numerical_recipe,
     )
 
 
@@ -87,6 +89,7 @@ def prepare_weights(
     intermediate_rotations: torch.Tensor | None = None,
     down_svh: torch.Tensor | None = None,
     trellis_mcg: torch.Tensor | int | None = None,
+    immutable_input_scales: bool = False,
 ) -> ExpertWeights:
     if projection_tiers is not None:
         if not all(
@@ -125,6 +128,7 @@ def prepare_weights(
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
         trellis_mcg=trellis_mcg,
+        immutable_input_scales=immutable_input_scales,
     )
 
 

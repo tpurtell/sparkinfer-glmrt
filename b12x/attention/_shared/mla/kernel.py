@@ -17,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 import torch
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.runtime import from_dlpack
@@ -32,7 +32,7 @@ from b12x._lib.compiler import (
 from b12x._lib.compiler import (
     launch as b12x_launch,
 )
-from b12x._lib.intrinsics import shared_ptr_to_u32
+from b12x._lib.intrinsics import shared_ptr_to_u32, st_shared_u32
 
 from .decode_math import (
     s0_load_q_bf16_to_smem,
@@ -1210,6 +1210,7 @@ class UnifiedDecodeKernel:
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                     overlap_footer_gather=self.native_dsv4_h16,
                     per_token_latent_scale=t.latent_scale_per_token,
+                    dsv41=t.model_type == ModelType.DSV41,
                 )
                 packed_kw = dict(
                     kv_smem_stride=staged_kv_stride,
@@ -1272,6 +1273,7 @@ class UnifiedDecodeKernel:
                                 Int32(self.pbs_extra),
                                 stride_extra_kv_block,
                                 io_lane,
+                                dsv41_swa=False,
                                 **io_kw,
                             )
                     else:
@@ -1501,6 +1503,29 @@ class UnifiedDecodeKernel:
                 global_sum = [gsum_frag[0], gsum_frag[1]]
 
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
+                if cutlass.const_expr(t.scale_format == 0):
+                    # Mask V itself: MMA still propagates NaNs when P is zero.
+                    for part in cutlass.range_constexpr(
+                        (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                    ):
+                        entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                        if entry < Int32(t.bi) and tok_buf_view[entry] < Int32(0):
+                            for chunk in cutlass.range_constexpr(448 // 16):
+                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                st_shared_u32(
+                                    kv_fp8_b + entry * Int32(staged_kv_stride) + offset,
+                                    Uint32(0),
+                                )
+                            rope_stride = Int32(t.d_rope * 2)
+                            if cutlass.const_expr(
+                                self.native_dsv4_h8 or self.native_dsv4_h16
+                            ):
+                                rope_stride = Int32(staged_kv_stride)
+                            for chunk in cutlass.range_constexpr(128 // 16):
+                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                st_shared_u32(
+                                    kv_rope_b + entry * rope_stride + offset, Uint32(0)
+                                )
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
                 # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
@@ -1958,7 +1983,7 @@ def _cache_block_stride_bytes(
 
     if record_bytes is not None:
         expected = int(page_size) * int(record_bytes)
-    elif is_glm_model_type(model_type):
+    elif is_glm_model_type(model_type) or model_type == ModelType.DSV41:
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
@@ -2257,7 +2282,8 @@ def _sparse_mla_decode_grid_flat_launch(
         # v30: empty-split exit arrives on the speculative stage before waiting.
         # v31: vector Q staging excluded for NVFP4 (BF16 Q) caches.
         # v32: speculative first-chunk copies gated on the split being active.
-        32,
+        # v33: paired-lane NVFP4/V4.1 PV dequantization.
+        33,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),
@@ -2457,7 +2483,7 @@ def run_unified_decode(
             )
         if int(q_all.shape[-1]) != _DSV4_HEAD_DIM or (
             model_type_override is not None
-            and int(model_type_override) != int(ModelType.DSV4)
+            and int(model_type_override) not in (ModelType.DSV4, ModelType.DSV41)
         ):
             raise ValueError(
                 "SM120 sparse MLA decode dual-cache (extra tokens) is DSV4-only "
@@ -2539,6 +2565,8 @@ def run_unified_decode(
     # regimes, including C128's three chunks per split. This is a shape-only
     # policy decision, so capture and replay use the same kernel and workspace.
     max_chunks = int(workspace.max_chunks_per_row)
+    if model_type == ModelType.DSV41 and forced_num_splits is None:
+        forced_num_splits = int(workspace.num_chunks_value)
     # SM count read early: both the H8/H16 policy and the split plan need it.
     sm_count = None
     if q_all.is_cuda:
@@ -2666,6 +2694,9 @@ def run_unified_decode(
         extra_topk=extra_topk,
         preferred_num_splits=preferred_num_splits,
     )
+    # Binding only maps caller-owned views; initialize stream-ordered control
+    # words here so freshly bound storage is valid in eager and graph launches.
+    workspace.num_chunks_ptr.fill_(num_splits)
     # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
     # LAST_DECODE_PLAN["num_splits"]). Informational only.
     native_glm_h8 = bool(
@@ -2752,7 +2783,7 @@ def run_unified_decode(
             indexed_k_cache,
             page_size=pbs_extra,
             model_type=int(model_type),
-            record_bytes=int(traits.kv_gmem_stride),
+            record_bytes=288 if model_type == ModelType.DSV41 else int(traits.kv_gmem_stride),
         )
         extra_kv_flat = _cache_base_tensor(indexed_k_cache)
         extra_indices_t = (

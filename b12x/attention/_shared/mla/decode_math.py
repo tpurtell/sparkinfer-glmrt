@@ -357,10 +357,7 @@ def s0_quantize_q_to_smem(
                         (head_base + h, Int32(d_nope) + d), q_token.layout
                     )
                     q0, q1 = ld_global_nc_v2_u32(get_ptr_as_int64(q_token, q_off))
-                s_addr = (
-                    q_rope_base_addr
-                    + (h * Int32(q_rope_stride) + d) * Int32(2)
-                )
+                s_addr = q_rope_base_addr + (h * Int32(q_rope_stride) + d) * Int32(2)
                 st_shared_u32(s_addr, q0)
                 st_shared_u32(s_addr + Int32(4), q1)
                 i += Int32(num_threads)
@@ -632,7 +629,8 @@ def s0_quantize_q_vec(
             rh = tid // Int32(rope_groups)
             rg = tid - rh * Int32(rope_groups)
             st_shared_v4_u32(
-                q_rope_base_addr + (rh * Int32(q_rope_stride) + rg * Int32(8)) * Int32(2),
+                q_rope_base_addr
+                + (rh * Int32(q_rope_stride) + rg * Int32(8)) * Int32(2),
                 r0,
                 r1,
                 r2,
@@ -1459,20 +1457,47 @@ def _nvfp4_pair_bfloat2(
     staged per candidate into the contiguous kv_sc buffer by the IO gather
     (record bytes [292, 296)).
     """
-    data_byte = _ld_u8_zext(
-        kv_fp4_base_addr,
-        entry * Int32(kv_smem_stride) + (dim_even // Int32(2)),
-    )
-    vals_h2 = fp4_decode_2(data_byte)
-    v0, v1 = f16x2_to_f32x2(vals_h2)
-    scale_group = dim_even // Int32(_NVFP4_SCALE_GROUP)
-    scale_byte = _ld_u8_zext(
-        kv_fp4_base_addr,
-        entry * Int32(kv_smem_stride) + Int32(_NVFP4_SCALE_OFFSET) + scale_group,
-    )
-    scale_f = cvt_e4m3_to_f32_via_f16(scale_byte)
+    swa = Int32(0)
+    if cutlass.const_expr(kv_smem_stride == 544):
+        # DSV41's sources share a staging layout, never a cache ABI.
+        swa = ld_shared_u32(kv_fp4_base_addr + entry * Int32(544) + Int32(528)).to(
+            Int32
+        )
+    v0 = Float32(0.0)
+    v1 = Float32(0.0)
+    scale_f = Float32(0.0)
+    if swa == Int32(1):
+        v0 = cvt_e4m3_to_f32_via_f16(
+            _ld_u8_zext(kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even)
+        )
+        v1 = cvt_e4m3_to_f32_via_f16(
+            _ld_u8_zext(
+                kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even + Int32(1)
+            )
+        )
+        scale_f = _ue8m0_byte_to_fp32(
+            _ld_u8_zext(
+                kv_fp4_base_addr,
+                entry * Int32(kv_smem_stride) + Int32(512) + dim_even // Int32(32),
+            )
+        )
+    elif swa == Int32(0):
+        data_byte = _ld_u8_zext(
+            kv_fp4_base_addr,
+            entry * Int32(kv_smem_stride) + (dim_even // Int32(2)),
+        )
+        vals_h2 = fp4_decode_2(data_byte)
+        v0, v1 = f16x2_to_f32x2(vals_h2)
+        scale_group = dim_even // Int32(_NVFP4_SCALE_GROUP)
+        scale_byte = _ld_u8_zext(
+            kv_fp4_base_addr,
+            entry * Int32(kv_smem_stride) + Int32(_NVFP4_SCALE_OFFSET) + scale_group,
+        )
+        scale_f = cvt_e4m3_to_f32_via_f16(scale_byte)
     outer = latent_scale
-    if cutlass.const_expr(latent_scale_per_token):
+    if cutlass.const_expr(kv_smem_stride == 544):
+        outer = Float32(1.0)
+    elif cutlass.const_expr(latent_scale_per_token):
         outer = ld_shared_f32(kv_sc_base_addr + entry * Int32(4))
     # This is the single NVFP4 decode dequant point shared by QK and P.V.
     # Apply the outer scale before BF16 packing so both MMAs consume the same
@@ -1481,29 +1506,6 @@ def _nvfp4_pair_bfloat2(
         (v0 * scale_f) * outer,
         (v1 * scale_f) * outer,
     )
-
-
-@cute.jit
-def _nvfp4_scalar_bf16_u16(
-    kv_fp4_base_addr: Int32,
-    entry: Int32,
-    dim: Int32,
-    latent_scale: Float32,
-    *,
-    kv_smem_stride: cutlass.Constexpr,
-    latent_scale_per_token: cutlass.Constexpr = False,
-    kv_sc_base_addr: Int32 = Int32(0),
-) -> Uint32:
-    pair = _nvfp4_pair_bfloat2(
-        kv_fp4_base_addr,
-        entry,
-        dim & ~Int32(1),
-        latent_scale,
-        kv_smem_stride=kv_smem_stride,
-        latent_scale_per_token=latent_scale_per_token,
-        kv_sc_base_addr=kv_sc_base_addr,
-    )
-    return _bf16x2_extract_lane_u16(pair, dim & Int32(1))
 
 
 @cute.jit
@@ -2311,13 +2313,15 @@ def s6_xv_nope_nvfp4_bf16(
 ):
     """S6 (NVFP4): BF16 P.V over in-register dequantized E2M1 V.
 
-    V is the same 512-dim MLA latent as K-NoPE. The BF16 probabilities staged by
-    S5 are used directly as the A operand; each B scalar is dequantized from the
-    packed E2M1 byte and its E4M3 group-16 scale.
+    V is the same 512-dim MLA latent as K-NoPE. Adjacent output-column lanes
+    exchange decoded pairs, so each pair is dequantized once rather than once
+    per scalar consumer. MMA operands and their BF16 rounding remain unchanged.
     """
     p_stride = cutlass.const_expr(sm_p_stride if sm_p_stride else bi)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
+    entry_parity = gid & Int32(1)
+    pair_selector = Int32(0x5410 if entry_parity == Int32(0) else 0x3276)
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
 
@@ -2337,44 +2341,28 @@ def s6_xv_nope_nvfp4_bf16(
                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
 
                 ent0 = k_base + tid * Int32(2)
-                v0 = _nvfp4_scalar_bf16_u16(
+                pair0 = _nvfp4_pair_bfloat2(
                     kv_fp4_base_addr,
-                    ent0,
-                    col,
+                    ent0 + entry_parity,
+                    col & ~Int32(1),
                     latent_scale,
                     kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
                 )
-                v1 = _nvfp4_scalar_bf16_u16(
+                pair8 = _nvfp4_pair_bfloat2(
                     kv_fp4_base_addr,
-                    ent0 + Int32(1),
-                    col,
+                    ent0 + Int32(8) + entry_parity,
+                    col & ~Int32(1),
                     latent_scale,
                     kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
                 )
-                v8 = _nvfp4_scalar_bf16_u16(
-                    kv_fp4_base_addr,
-                    ent0 + Int32(8),
-                    col,
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                v9 = _nvfp4_scalar_bf16_u16(
-                    kv_fp4_base_addr,
-                    ent0 + Int32(9),
-                    col,
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                b0 = v0 | (v1 << Uint32(16))
-                b1 = v8 | (v9 << Uint32(16))
+                peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
+                peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
+                b0 = byte_perm(pair0, peer0, pair_selector)
+                b1 = byte_perm(pair8, peer8, pair_selector)
                 xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
                     xv0,
                     xv1,

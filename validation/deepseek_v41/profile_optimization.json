@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "goal": "Continuous profile-guided end-to-end optimization after CED acceptance",
+  "iterations": [
+    {
+      "id": "canonical-b12x-plugin-registration",
+      "status": "qualified",
+      "evidence": "Prefill trace used legacy flashinfer.b12x SmallNGemvKernel for4096-row projections. Installed vllm.general_plugins duplicatedb12x_fp6/loader IDs; FlashInfer entries imported its snapshot and overwrote torch.ops.b12x implementations.",
+      "fix": "FlashInfer entrypoints now use the selected public b12x namespace. The existing compatibility package still resolves FlashInfer-only installations; standalone+FlashInfer environments no longer activate the old snapshot through plugin discovery.",
+      "changed_source": "/home/luke/projects/flashinfer-b12x-migration/pyproject.toml",
+      "install": "FLASHINFER_BUILD_NO_PIP=1 BUILD_NVEP=0 CUDA_HOME=/opt/cuda uv pip install --offline --python /home/luke/projects/vllm-hh-rebase/.venv/bin/python --no-deps --no-build-isolation -e /home/luke/projects/flashinfer-b12x-migration",
+      "install_note": "Version remainsflashinfer-python0.6.18. Bootstrap-install attempts were cancelled before completion; final install disabled build-hook dependency installation and rebuilt only the editable package.",
+      "tests": "42 BF16 projection GPU tests passed, including both installed-plugin import orders preserving strided FP32 projection behavior.",
+      "public_api_probe": "After loading installed plugins, public mm launched b12x Bf16GemmKernel, not legacy SmallNGemvKernel.",
+      "serving": [
+        {
+          "case": 4096,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            0.5248148110113107,
+            0.53501893900102,
+            0.5348698700545356
+          ],
+          "after_samples_s": [
+            0.3820885150344111,
+            0.3946135290316306,
+            0.38569565198849887
+          ],
+          "before_median_s": 0.5348698700545356,
+          "after_median_s": 0.38569565198849887,
+          "before_over_after": 1.3867666573293
+        },
+        {
+          "case": 16384,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            2.2255679029622115,
+            2.223540815000888,
+            2.227382981975097
+          ],
+          "after_samples_s": [
+            1.6124753049807623,
+            1.6050052759819664,
+            1.608721090015024
+          ],
+          "before_median_s": 2.2255679029622115,
+          "after_median_s": 1.608721090015024,
+          "before_over_after": 1.3834392529418675
+        },
+        {
+          "case": "decode",
+          "metric": "decode_s_per_output_token",
+          "before_samples_s": [
+            0.010157224787289174,
+            0.008805790756128758,
+            0.008735836330456586
+          ],
+          "after_samples_s": [
+            0.009926385787044337,
+            0.008975353220287035,
+            0.008975116401731117
+          ],
+          "before_median_s": 0.008805790756128758,
+          "after_median_s": 0.008975353220287035,
+          "before_over_after": 0.9811079898476848
+        }
+      ],
+      "ratio_direction": "before latency / after latency; >1 faster",
+      "limitations": "Three HTTP samples/case. Decode ranges overlap, no decode speedup claim. Prior trace included Python-stack profiling overhead; only standalone unprofiled serving timings support latency comparisons.",
+      "gpu": {
+        "time_ns": 1789114153039095050,
+        "command": [
+          "nvidia-smi",
+          "-i",
+          "0,1,2,3",
+          "--query-gpu=index,uuid,name,pstate,clocks.sm,clocks.mem,clocks_throttle_reasons.active,power.draw,power.limit",
+          "--format=csv"
+        ],
+        "raw": "index, uuid, name, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active, power.draw [W], power.limit [W]\n0, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2490 MHz, 15865 MHz, 0x0000000000000000, 200.19 W, 325.00 W\n1, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 186.54 W, 325.00 W\n2, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2490 MHz, 15865 MHz, 0x0000000000000000, 176.04 W, 325.00 W\n3, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, P1, 2505 MHz, 15865 MHz, 0x0000000000000000, 187.97 W, 325.00 W\n"
+      },
+      "toolchain": {
+        "torch": "2.13.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "vllm": "0.27.2rc1.dev523+g3e63556c2.d20260827.cu133"
+      },
+      "repositories": {
+        "b12x": {
+          "worktree": "/home/luke/projects/b12x",
+          "commit": "00b69ac22e21413622c4ecd98f607a2c3e015161",
+          "status": "M README.md\n M b12x/attention/dsa_indexer/api.py\n M b12x/attention/dsa_indexer/mxfp4.py\n M b12x/gemm/bf16_gemv/__init__.py\n M b12x/gemm/bf16_gemv/_kernel.py\n M b12x/gemm/bf16_gemv/api.py\n M b12x/sequence/engram/_kernels.py\n M b12x/sequence/engram/api.py\n M tests/attention/test_dsa_indexer_mxfp4.py\n M tests/gemm/test_bf16_gemv.py\n M tests/sequence/test_engram.py\n?? benchmarks/benchmark_bf16_projection.py\n?? benchmarks/benchmark_ngram_ssd.py\n?? benchmarks/benchmark_v41_serving.py\n?? validation/deepseek_v41/ced_prefill.json\n?? validation/deepseek_v41/ram_engram.json\n?? validation/deepseek_v41/structural_optimization.json"
+        },
+        "vllm": {
+          "worktree": "/home/luke/projects/vllm-hh-rebase",
+          "commit": "a6571d0a602ed42525a7a77cf960f39ca7f8d7a8",
+          "status": "M serve-ds41-flash.sh\n M tests/model_executor/kernels/test_b12x_linear.py\n M tests/models/test_deepseek_v4_1_compressor.py\n M tests/models/test_deepseek_v4_1_engram.py\n M tests/models/test_deepseek_v4_mega_moe.py\n M tests/models/test_dspark_mla.py\n M tests/v1/attention/test_b12x_v41_workspace.py\n M tests/v1/core/test_kv_cache_utils.py\n M tests/v1/core/test_prefix_caching.py\n M tests/v1/sample/test_logprobs.py\n M vllm/config/engram.py\n M vllm/config/vllm.py\n M vllm/models/deepseek_v4_1/attention.py\n M vllm/models/deepseek_v4_1/b12x_layers.py\n M vllm/models/deepseek_v4_1/common/engram.py\n M vllm/models/deepseek_v4_1/nvidia/b12x_moe.py\n M vllm/models/deepseek_v4_1/nvidia/dspark.py\n M vllm/models/deepseek_v4_1/nvidia/model.py\n M vllm/models/deepseek_v4_1/nvidia/model_state.py\n M vllm/models/deepseek_v4_1/nvidia/vl_model.py\n M vllm/models/deepseek_v4_1/sparse_mla.py\n M vllm/v1/core/kv_cache_coordinator.py\n M vllm/v1/core/kv_cache_manager.py\n M vllm/v1/core/kv_cache_utils.py\n M vllm/v1/core/single_type_kv_cache_manager.py\n M vllm/v1/kv_cache_interface.py\n M vllm/v1/worker/gpu/model_runner.py\n M vllm/v1/worker/gpu/sample/logprob.py\n M vllm/v1/worker/gpu/spec_decode/dflash/speculator.py\n?? serve-glm52.sh\n?? tests/models/test_deepseek_v4_1_ced_model.py\n?? tests/v1/attention/test_b12x_v41_ced_metadata.py\n?? vllm/models/deepseek_v4_1/ced.py"
+        }
+      }
+    },
+    {
+      "id": "typed-dma-capacity",
+      "status": "qualified",
+      "evidence": "FP32 [4096,5120] is80MiB but the former BF16-derivedDMAplan was40MiB, forcinglarge routed reductions toPyNCCL.",
+      "fix": "Plan target/draftdtype elementbounds plusFP32, sizeworkspaceforlargestdtype, preserveBF16graph40MiB, prewarmonlydtypeboundsmeetingDMAminimum. Graphreplayusedonlyatitsqualifiedexactcapacity; otheradmittedsizesuserawDMAwithoutwirepadding.",
+      "microbenchmark": "Real publicPCIeDmaAllReduce vsout-of-placePyNcclCommunicator, TP4 hidden5120, BF16/FP32 rows1024/2048/4096, alternatingarmorder,7samplesof20calls,all-rankmaxtimings. Exactdyadicrank-sumcheckedbefore/aftertimingandinputmutation.",
+      "microbenchmark_result": "AtfullFP3280MiB: NCCL2699.9us, rawDMA2322.9us, exactreplay2483.2us. Full-capacitypaddingwasrejectedforpartialinputs:20MiBFP32fellfrom2356us to601us byusingrawDMA.10MiBBF16rawDMAremains slowerthanNCCL; itsminimum-sizepolicyisnotclaimedoptimal.",
+      "serving": [
+        {
+          "case": 4096,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            0.3820885150344111,
+            0.3946135290316306,
+            0.38569565198849887
+          ],
+          "after_samples_s": [
+            0.3736354709835723,
+            0.37373607099289075,
+            0.38050120102707297
+          ],
+          "before_median_s": 0.38569565198849887,
+          "after_median_s": 0.37373607099289075,
+          "before_over_after": 1.032000071504566
+        },
+        {
+          "case": 16384,
+          "metric": "ttft_s",
+          "before_samples_s": [
+            1.6124753049807623,
+            1.6050052759819664,
+            1.608721090015024
+          ],
+          "after_samples_s": [
+            1.589911071001552,
+            1.5903267929679714,
+            1.5957793989800848
+          ],
+          "before_median_s": 1.608721090015024,
+          "after_median_s": 1.5903267929679714,
+          "before_over_after": 1.0115663630446192
+        },
+        {
+          "case": "decode",
+          "metric": "decode_s_per_output_token",
+          "before_samples_s": [
+            0.009926385787044337,
+            0.008975353220287035,
+            0.008975116401731117
+          ],
+          "after_samples_s": [
+            0.009844672165382066,
+            0.0089104640472673,
+            0.009206383228283668
+          ],
+          "before_median_s": 0.008975353220287035,
+          "after_median_s": 0.009206383228283668,
+          "before_over_after": 0.974905453936909
+        }
+      ],
+      "interpretation": "Small observedprefillimprovement(3.2%4K,1.2%16K). Decoderangesoverlap; no decodeimprovementclaim.",
+      "tests": {
+        "native_tp4_dtype_graph_and_raw_lifetimes": "passed",
+        "adapter_tests_passed": 27,
+        "adapter_tests_skipped": 2
+      },
+      "capacity": {
+        "max_model_len": 1048576,
+        "batch_tokens": 4096,
+        "max_num_seqs": 4,
+        "gpu_memory_utilization": 0.95,
+        "kv_tokens": 4882840
+      },
+      "source_sha256": {
+        "/home/luke/projects/b12x/b12x/comm/pcie/pcie_dma.py": "be654af2fc4796740d2d190215a6a673ba8862104e464a49095df3a0ca374ef6",
+        "/home/luke/projects/vllm-hh-rebase/vllm/distributed/device_communicators/b12x_pcie_all_reduce.py": "8eedb02f8b3b5c6b5cb71f862845ee0c884cca2e3163ce0759ba2e832af36bb6",
+        "/home/luke/projects/b12x/benchmarks/benchmark_pcie_dma.py": "5a2b4c98b093f3f98c2468fa44afd2ca9edb5af48f6e7e3c4a929d3a17db5bc3"
+      }
+    }
+  ],
+  "raw_artifacts": {
+    "/tmp/b12x-v41-optimization/ced-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789110756604736665.pt.trace.json.gz": {
+      "sha256": "2b838d013ee5124400a9967bcb6a9c130c709273d9251facc0d3887ed2005dd5"
+    },
+    "/tmp/b12x-v41-optimization/ced-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789111174006070874.pt.trace.json.gz": {
+      "sha256": "3e4996a4916ff6482efee05407984ee3049e5e36bdb1995b0e3cab0ccae33c58"
+    },
+    "/tmp/b12x-v41-optimization/canonical-profile/dp0_pp0_tp0_dcp0_ep0_rank0.1789114307395275314.pt.trace.json.gz": {
+      "sha256": "8db8cbb99965fc23516c096a07dab6c891ad777519d493fe2eeec2527060c8be"
+    },
+    "/tmp/b12x-v41-optimization/ced-canonical-serving.json": {
+      "sha256": "b3963cc8b3dffd548fb3050a7494ebe62765eb23f6d7d7b735e2a692cea9d2f1"
+    },
+    "/tmp/b12x-v41-optimization/canonical-prefill-capture.json": {
+      "sha256": "9169cfb9b729c969bd886afb9e253507318ab7af4fbb71cbcb15bf23dada3804"
+    },
+    "/tmp/b12x-v41-optimization/typed-dma-benchmark.json": {
+      "sha256": "f2f7cf9a87b81500939be0e4eb0d83433eba6cd1f3e7c9f9f7fc84571a12010c"
+    },
+    "/tmp/b12x-v41-optimization/typed-dma-exact-replay-benchmark.json": {
+      "sha256": "5255111ab4d2d243e537f77221b9d438ec69b387942ddc8ec0b39394e8916a24"
+    },
+    "/tmp/b12x-v41-optimization/ced-typed-dma-serving.json": {
+      "sha256": "ff36d95ac3986544e40edd951aab9ec97c9a4571d476bc3e61561f2627eaacdb"
+    }
+  },
+  "profiling_note": "Large prefill Python-stack trace exported but Torch key_averages hit recursion limit. Subsequent canonical traces disable Python stacks and optional summary generation; rawtrace export and response703 both passed.",
+  "next_candidates": [
+    "Native prefill attention remains largest GPU kernel group.",
+    "V4.1 FP32 full-prefill collectives80MiB exceed current40MiB DMA plan; investigate per-dtype capacity/replay without doubling BF16 traffic.",
+    "Decode FC1 M64 padding for<=6 useful rows/expert; preserve V4.1 recipe before any kernel variant."
+  ]
+}

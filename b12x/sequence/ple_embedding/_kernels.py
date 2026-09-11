@@ -75,6 +75,7 @@ def _bf16_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -95,6 +96,8 @@ def _bf16_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
     row_base = local_row * tl.full((), HEAD_DIM, tl.int64)
     value = tl.load(
         weight_ptr + row_base + columns.to(tl.int64),
@@ -124,6 +127,7 @@ def _fp8_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -146,6 +150,8 @@ def _fp8_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
     row_base = local_row * tl.full((), HEAD_DIM, tl.int64)
     quantized = tl.load(
         weight_ptr + row_base + columns.to(tl.int64),
@@ -182,6 +188,7 @@ def _nvfp4_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -202,6 +209,8 @@ def _nvfp4_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
 
     packed_row_base = local_row * tl.full((), HEAD_DIM // 2, tl.int64)
     packed = tl.load(
@@ -275,6 +284,7 @@ def _launch_bf16_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
+    compact_rows: bool = False,
 ) -> None:
     grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _bf16_lookup_kernel[grid](
@@ -290,6 +300,7 @@ def _launch_bf16_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -307,6 +318,7 @@ def _launch_fp8_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
+    compact_rows: bool = False,
 ) -> None:
     grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _fp8_lookup_kernel[grid](
@@ -323,6 +335,7 @@ def _launch_fp8_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -341,6 +354,7 @@ def _launch_nvfp4_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
+    compact_rows: bool = False,
 ) -> None:
     grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _nvfp4_lookup_kernel[grid](
@@ -358,6 +372,7 @@ def _launch_nvfp4_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -566,8 +581,9 @@ def _launch_hash(
     )
 
 
+# Schema-specific names prevent reuse of incompatible Inductor artifacts.
 @torch.library.custom_op(
-    "b12x::ple_embedding_bf16_pipeline",
+    "b12x::ple_embedding_bf16_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _bf16_pipeline_op(
@@ -679,7 +695,7 @@ def _bf16_pipeline_fake(
 
 
 @torch.library.custom_op(
-    "b12x::ple_embedding_fp8_pipeline",
+    "b12x::ple_embedding_fp8_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _fp8_pipeline_op(
@@ -794,7 +810,7 @@ def _fp8_pipeline_fake(
 
 
 @torch.library.custom_op(
-    "b12x::ple_embedding_nvfp4_pipeline",
+    "b12x::ple_embedding_nvfp4_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _nvfp4_pipeline_op(
@@ -945,19 +961,22 @@ def run_pipeline(binding: Binding, *, token_count: int) -> None:
         plan._layout.hash_scratch_offset_bytes
         + plan._hash_plan.layout.error_code_offset_bytes,
     )
+    weight = binding.weight
+    weight_scale = binding.weight_scale
+    assert weight is not None
     if caps.quant_mode == "bf16":
-        torch.ops.b12x.ple_embedding_bf16_pipeline(binding.weight, *hash_args)
+        torch.ops.b12x.ple_embedding_bf16_gather_pipeline(weight, *hash_args)
     elif caps.quant_mode == "fp8_e4m3_per_tensor":
-        assert binding.weight_scale is not None
-        torch.ops.b12x.ple_embedding_fp8_pipeline(
-            binding.weight, binding.weight_scale, *hash_args
+        assert weight_scale is not None
+        torch.ops.b12x.ple_embedding_fp8_gather_pipeline(
+            weight, weight_scale, *hash_args
         )
     elif caps.quant_mode == "nvfp4_group16":
-        assert binding.weight_scale is not None
+        assert weight_scale is not None
         assert binding.weight_scale_2 is not None
-        torch.ops.b12x.ple_embedding_nvfp4_pipeline(
-            binding.weight,
-            binding.weight_scale,
+        torch.ops.b12x.ple_embedding_nvfp4_gather_pipeline(
+            weight,
+            weight_scale,
             binding.weight_scale_2,
             *hash_args,
         )

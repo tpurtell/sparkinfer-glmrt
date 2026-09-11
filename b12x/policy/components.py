@@ -5,6 +5,7 @@ DSA_INDEXER = "attention.dsa_indexer"
 GDN_ATTENTION = "attention.gdn"
 GQA_ATTENTION = "attention.gqa"
 MLA_ATTENTION = "attention.mla"
+MLA_COMPRESS = "attention.mla_compress"
 MOE_DECODE = "moe.decode"
 QSA_ATTENTION = "attention.qsa"
 SPARSE_MLA_ATTENTION = "attention.sparse_mla"
@@ -15,6 +16,8 @@ BF16_VOCAB_PROJECTION = "gemm.bf16_vocab_projection"
 WO_PROJECTION = "gemm.wo_projection"
 EP_MOE = "moe.ep_moe"
 HYPERCONNECTION = "norm.hyperconnection"
+ENGRAM = "sequence.engram"
+GDN_PREFILL = "sequence.gdn_prefill"
 KDA_PREFILL = "sequence.kda_prefill"
 MHC = "norm.mhc"
 NVFP4_QUANTIZATION = "quantization.nvfp4"
@@ -30,11 +33,14 @@ __all__ = [
     "COMPRESSED_SPARSE_MLA_ATTENTION",
     "DSA_INDEXER",
     "EP_MOE",
+    "ENGRAM",
     "GDN_ATTENTION",
     "GQA_ATTENTION",
     "HYPERCONNECTION",
+    "GDN_PREFILL",
     "KDA_PREFILL",
     "MLA_ATTENTION",
+    "MLA_COMPRESS",
     "MHC",
     "MOE_DECODE",
     "MTP_FEEDBACK",

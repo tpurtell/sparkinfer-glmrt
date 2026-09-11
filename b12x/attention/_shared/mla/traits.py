@@ -34,6 +34,7 @@ class ModelType:
     # GLM-5.3 Flash absorbed MLA: the full 512-wide query is NoPE and the
     # latent cache record carries no decoupled RoPE payload.
     GLM_NEXT = 2
+    DSV41 = 3  # Heterogeneous full post-RoPE SWA FP8 / main FP4 records.
 
 
 class ComputeMode:
@@ -117,6 +118,40 @@ def make_unified_traits(
         raise ValueError(
             "latent_scale_per_token requires ScaleFormat.NVFP4_E4M3; "
             f"got scale_format={scale_format!r}"
+        )
+
+    if model_type == ModelType.DSV41:
+        if scale_format != ScaleFormat.NVFP4_E4M3 or latent_scale_per_token:
+            raise ValueError("DSV41 requires native mixed FP8/FP4 without outer scales")
+        if fp8_rope is not None and fp8_rope:
+            raise ValueError("DSV41 quantizes all 512 post-RoPE coordinates")
+        return UnifiedMLATraits(
+            model_type=ModelType.DSV41,
+            compute_mode=ComputeMode.BF16,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+            d_nope=512,
+            d_rope=0,
+            d_v=512,
+            quant_tile=64,
+            num_scales=8,
+            n_v_chunks=8,
+            nt_per_warp_xv=1,
+            kv_gmem_stride=528,
+            # Both source records are staged verbatim. The private u32 at
+            # +528 distinguishes SWA from main for inline BF16 dequantization.
+            kv_smem_stride=544,
+            q_nope_stride=520,
+            bi=64,
+            hpb=16,
+            block_threads=288,
+            math_threads=256,
+            bulk_tx_bytes=64 * 528,
+            v_has_rope=False,
+            has_extra_cache=True,
+            fp8_rope=False,
+            rope_gmem_offset=0,
+            rope_payload_bytes=0,
+            rope_scale_offset=-1,
         )
 
     if model_type == ModelType.DSV4:
@@ -341,7 +376,7 @@ def make_unified_traits(
 
     raise ValueError(
         f"unsupported model_type {model_type!r} (DSV3_2 is dropped; "
-        "valid: ModelType.DSV4, ModelType.GLM_NSA, ModelType.GLM_NEXT)"
+        "valid: ModelType.DSV4, ModelType.DSV41, ModelType.GLM_NSA, ModelType.GLM_NEXT)"
     )
 
 
@@ -357,6 +392,7 @@ def infer_model_type(
       - DSV4:  448 + 64 = 512 -> (DSV4, FP8, UE8M0_BYTE)
       - GLM:   512 + 64 = 576 -> (GLM_NSA, FP8, ARBITRARY_FP32)
       - GLM_NEXT: 512 + 0 = 512 -> (GLM_NEXT, FP8, ARBITRARY_FP32)
+      - DSV41: 512 post-RoPE -> (DSV41, BF16, NVFP4_E4M3 mixed-source math)
 
     The 512-wide contracts are ambiguous by shape. Existing callers retain
     DSV4 as the compatibility default; GLM_NEXT callers must pass its explicit
@@ -371,6 +407,7 @@ def infer_model_type(
             ModelType.DSV4: 512,
             ModelType.GLM_NSA: 576,
             ModelType.GLM_NEXT: 512,
+            ModelType.DSV41: 512,
         }.get(model_type)
         if expected_q_head_dim is None:
             raise ValueError(f"unsupported explicit model_type={model_type!r}")
@@ -379,6 +416,8 @@ def infer_model_type(
                 f"model_type={model_type} requires q_head_dim={expected_q_head_dim}; "
                 f"got {q_head_dim}"
             )
+        if model_type == ModelType.DSV41:
+            return (ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
         if model_type == ModelType.DSV4:
             return (ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
         return (model_type, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
@@ -443,7 +482,8 @@ def resolve_unplanned_traits(
         latent_scale_per_token=bool(latent_scale_per_token),
     )
     if (
-        model_type == ModelType.GLM_NEXT or scale_format == ScaleFormat.NVFP4_E4M3
+        model_type == ModelType.GLM_NEXT
+        or (scale_format == ScaleFormat.NVFP4_E4M3 and model_type != ModelType.DSV41)
     ) and int(record_bytes) != int(traits.kv_gmem_stride):
         if model_type != ModelType.GLM_NEXT:
             raise ValueError(

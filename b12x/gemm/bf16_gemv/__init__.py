@@ -1,12 +1,13 @@
-"""BF16 small-N GEMV for narrow projections (e.g. GDN in_proj_ba) where a
-full GEMM tile wastes the CTA.
+"""Native unquantized tensor-core/SIMT projections with BF16/FP32 operands.
 
-``mm`` runs ``y = x @ weight.T`` for bf16 ``x (m, K)`` / ``weight (N, K)``
-through an opaque torch custom op (``b12x::bf16_gemv_small_n``), so it
-is torch.compile- and CUDA-graph-safe; shapes the kernel does not cover fall
-back to cuBLAS inside the op.  ``precompile`` compiles and warm-runs every
-decode-m variant for a weight's shape at load time so the hot path never
-JITs or lazily loads a module mid-capture.
+``mm`` runs ``y = x @ weight.T + bias`` through opaque torch custom ops.
+FP32 accumulation and bias addition happen before the final BF16/FP32 cast.
+Caller-owned row-strided ``out`` avoids allocation. BF16/BF16 projections
+use tiled tensor-core GEMM when their row/output geometry provides sufficient
+parallelism; small-row/skinny projections and any FP32 operand retain SIMT.
+One geometry/type-specialized compiled callable owns both GPU entrypoints.
+Live rows and input strides are runtime arguments. ``precompile`` warm-runs
+all eligible entrypoints before capture. There is no quantization or cuBLAS fallback.
 
 Example:
     from b12x.gemm import bf16_gemv
@@ -35,7 +36,7 @@ META = OpMeta(
         "SMALL_N_GEMV_MAX_OUT",
         "SMALL_N_GEMV_MIN_IN",
     ),
-    dtypes=("bf16",),
+    dtypes=("bf16", "fp32"),
     provenance=Provenance(
         repo="https://github.com/phaelon74/b12x",
         commit="9c78d553",

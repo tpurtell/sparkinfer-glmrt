@@ -3933,6 +3933,114 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
 
 
 @dsl_user_op
+def nvfp4_mma_m16n8k64_f32_e2m1(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+    tid_b: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """SM120 native NVFP4 block-scaled QMMA `m16n8k64` (E2M1 x E2M1, ue4m3).
+
+    Emits ``mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.
+    m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3``.  Both operands stay as packed
+    E2M1 nibbles (eight per u32 register) -- unlike the ``mxf8f6f4`` 1X path,
+    no byte-container expansion is required.
+
+    Fragment mapping (empirically pinned on SM120 against the NVFP4 phase
+    kernel chain in ``tests/moe/test_nvfp4_phase_kernels.py``
+    (``test_nvfp4_phase_intermediate_matches_torch``); lane l with q = l//4, c = l%4):
+
+    - A reg ``r`` nibble ``n`` holds ``A[q + 8*(r%2), 32*(r//2) + 8*c + n]``
+      -- i.e. each u32 register covers eight consecutive k values of one
+      row; regs 0/2 cover rows q (k halves 0/1) and regs 1/3 rows q+8, and
+      the lane's c index selects the 8-value k group within each half.
+    - B reg ``j`` nibble ``n`` holds ``B[q, 32*j + 8*c + n]`` (col = q).
+    - The SFA scale word of lane ``L`` carries the byte-scaled UE4M3 group
+      for one A row: rows 0..7 ride lanes 0, 4, ..., 28 (``L%4 == 0``), rows
+      8..15 ride lanes 1, 5, ..., 29 (``L%4 == 1``), and lanes with ``L%4``
+      in {2, 3} are ignored by the hardware.  Equivalently, for ``q = L>>2``
+      and ``c = L&3`` the row index is ``q + 8*(c&1)``.
+    - The SFB scale word of lane ``L`` holds ``SF_B[L//4, 0..3]`` (all 32
+      lanes valid; the hardware reads the word from lane ``4*col``).
+    - Accumulator: ``d0 = D[q, 2c]``, ``d1 = D[q, 2c+1]``,
+      ``d2 = D[q+8, 2c]``, ``d3 = D[q+8, 2c+1]``.
+
+    ``bid_a``/``bid_b``/``tid_a``/``tid_b`` are compile-time byte/thread
+    selectors reserved for future multi-atom use; the scale_vec::4X path
+    gathers its own bytes across lanes and passes zero selectors.
+    """
+    i16_ty = cutlass._mlir.ir.IntegerType.get_signless(16)
+
+    def _i16(v: int):
+        return cutlass._mlir.ir.Operation.create(
+            "llvm.mlir.constant",
+            results=[i16_ty],
+            attributes={
+                "value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(v))
+            },
+        ).result
+
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Uint32(sfa).ir_value(loc=loc, ip=ip),
+            _i16(bid_a),
+            _i16(tid_a),
+            Uint32(sfb).ir_value(loc=loc, ip=ip),
+            _i16(bid_b),
+            _i16(tid_b),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3},
+        {$10},
+        {$11, $12},
+        {$13},
+        {$14, $15};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
 def mxfp8_mma_m16n8k32_f32_e2m1(
     d0: Float32,
     d1: Float32,

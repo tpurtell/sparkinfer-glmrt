@@ -54,6 +54,26 @@ def _build() -> Path:
         "-Wextra",
         "-Werror",
     ]
+    # liburing is optional for generic checkpoint transport and resident PLE.
+    uring_cflags: list[str] = []
+    uring_ldflags: list[str] = []
+    uring_version = None
+    pkg_config = shutil.which("pkg-config")
+    if pkg_config:
+        available = subprocess.run(
+            [pkg_config, "--exists", "liburing"], capture_output=True
+        )
+        if available.returncode == 0:
+            uring_cflags = shlex.split(
+                subprocess.check_output([pkg_config, "--cflags", "liburing"], text=True)
+            )
+            uring_ldflags = shlex.split(
+                subprocess.check_output([pkg_config, "--libs", "liburing"], text=True)
+            )
+            uring_version = subprocess.check_output(
+                [pkg_config, "--modversion", "liburing"], text=True
+            ).strip()
+            flags.extend(["-DB12X_HAVE_LIBURING=1", *uring_cflags])
     version = subprocess.check_output([*compiler, "--version"], text=True)
     identity = {
         "abi": 1,
@@ -63,6 +83,8 @@ def _build() -> Path:
         "compiler": compiler,
         "version": version,
         "flags": flags,
+        "uring_ldflags": uring_ldflags,
+        "uring_version": uring_version,
         "cuda": str(cuda),
         "torch": torch.__version__,
         "headers": {
@@ -89,6 +111,7 @@ def _build() -> Path:
                 f"-L{cuda / 'lib64'}",
                 f"-Wl,-rpath,{cuda / 'lib64'}",
                 "-lcudart",
+                *uring_ldflags,
                 "-o",
                 str(output),
             ]

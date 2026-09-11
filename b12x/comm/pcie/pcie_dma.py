@@ -176,6 +176,9 @@ class PCIeDmaAllReduce:
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
         self._closed = False
+        self._eager_replays: dict[
+            torch.dtype, tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph]
+        ] = {}
 
         self.shard_capacity = _align_up(
             (self.max_bytes + self.world_size - 1) // self.world_size, SCRATCH_ALIGN
@@ -336,6 +339,61 @@ class PCIeDmaAllReduce:
             return False
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
+    def prepare_eager_replay(
+        self, dtype: torch.dtype, *, max_elements: int | None = None
+    ) -> None:
+        """Capture a planned-capacity lossless ring for later eager calls.
+
+        Call collectively before serving, with the same dtype order and bounds
+        on every rank. None uses max_bytes // dtype.itemsize; an explicit bound
+        must fit max_bytes before rounding down to a positive multiple of
+        world_size * 8. Repeated equivalent bounds reuse the graph; changing an
+        already prepared dtype's effective bound is an error.
+
+        Exact-capacity inputs reuse private source/result buffers without
+        aliasing retained outputs. Other supported sizes use the raw ring:
+        padding a large replay graph for a small input wastes wire bandwidth.
+        """
+        if self._closed or self._fp8:
+            raise ValueError("eager replay requires an open lossless DMA ring")
+        if dtype not in SUPPORTED_DTYPES:
+            raise TypeError(f"unsupported DMA replay dtype: {dtype}")
+        if max_elements is None:
+            elements = self.max_bytes // dtype.itemsize
+        else:
+            if isinstance(max_elements, bool) or not isinstance(max_elements, int):
+                raise TypeError("DMA replay max_elements must be an integer")
+            if max_elements * dtype.itemsize > self.max_bytes:
+                raise ValueError(
+                    f"DMA replay max_elements={max_elements} for {dtype} "
+                    f"exceeds max_bytes={self.max_bytes}"
+                )
+            elements = max_elements
+        alignment = self.world_size * 8
+        elements -= elements % alignment
+        if elements <= 0:
+            raise ValueError(
+                f"DMA replay capacity must contain at least {alignment} elements"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("prepare DMA eager replay before CUDA graph capture")
+        replay = self._eager_replays.get(dtype)
+        if replay is not None:
+            prepared_elements = replay[0].numel()
+            if prepared_elements != elements:
+                raise ValueError(
+                    f"DMA eager replay for {dtype} already prepared with "
+                    f"{prepared_elements} elements, requested {elements}"
+                )
+            return
+        with torch.cuda.device(self.device):
+            source = torch.zeros(elements, dtype=dtype, device=self.device)
+            result = torch.empty_like(source)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._all_reduce_on_device(source, out=result)
+        self._eager_replays[dtype] = (source, result, graph)
+
     def all_reduce(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -363,6 +421,15 @@ class PCIeDmaAllReduce:
             raise ValueError(
                 "output must match input shape/dtype/device and be contiguous"
             )
+        replay = self._eager_replays.get(inp.dtype)
+        if replay is not None and not torch.cuda.is_current_stream_capturing():
+            source, result, graph = replay
+            elements = inp.numel()
+            if elements == source.numel():
+                source.copy_(inp.view(-1))
+                graph.replay()
+                out.view(-1).copy_(result)
+                return out
         kernels = self._kernels
         world = self.world_size
         rank = self.rank
@@ -810,6 +877,7 @@ class PCIeDmaAllReduce:
         # peer allocation.  Every importer must unmap before its owner frees
         # the exported slab.
         torch.cuda.synchronize(self.device)
+        self._eager_replays.clear()
         dist.barrier(group=self.group)
         for ptr in self._slab.remote_ptrs:
             with suppress(Exception):

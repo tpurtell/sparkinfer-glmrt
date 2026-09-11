@@ -361,6 +361,7 @@ MLA_GEOMETRIES = (
 class SparseMlaGeometry:
     model_id: str
     layout: str
+    cache_format: str
     num_q_heads: int
     qk_head_dim: int
     v_head_dim: int
@@ -373,16 +374,21 @@ class SparseMlaGeometry:
 
 SPARSE_MLA_GEOMETRIES = tuple(
     SparseMlaGeometry(
-        model_id=f"deepseek-v4-flash-{contract}-h{heads}",
+        model_id=f"{model_name}-{contract}-h{heads}",
         layout="compressed_dsv4",
+        cache_format=cache_format,
         num_q_heads=heads,
         qk_head_dim=512,
-        v_head_dim=448,
+        v_head_dim=512,
         swa_width=128,
         swa_page_size=64,
         indexed_width=indexed_width,
         indexed_page_size=indexed_page_size,
         source="benchmark_compressed_sparse_mla.py TP-sliced contracts",
+    )
+    for model_name, cache_format in (
+        ("deepseek-v4-flash", "deepseek_v4"),
+        ("deepseek-v41", "deepseek_v41"),
     )
     for heads in (64, 32, 16, 8)
     for contract, indexed_width, indexed_page_size in (
@@ -821,9 +827,10 @@ def sparse_mla_cases() -> tuple[SweepCase, ...]:
         ):
             query = {
                 "layout": geometry.layout,
+                "cache_format": geometry.cache_format,
                 "mode": "decode" if rows <= 256 else "extend",
                 "q_dtype": "bfloat16",
-                "kv_dtype": "float8_e4m3fn",
+                "kv_dtype": "uint8" if geometry.cache_format == "deepseek_v41" else "float8_e4m3fn",
                 "num_q_heads": geometry.num_q_heads,
                 "qk_head_dim": geometry.qk_head_dim,
                 "v_head_dim": geometry.v_head_dim,

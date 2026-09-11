@@ -157,7 +157,8 @@ def _split_merge_fp32_oracle(
         numerator = (partials_fp32 * weights.unsqueeze(-1)).sum(dim=-2)
         return torch.where(
             has_partial.unsqueeze(-1),
-            numerator / denominator.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1),
+            numerator
+            / denominator.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1),
             torch.zeros_like(numerator),
         )
 
@@ -350,7 +351,9 @@ def test_split_merge_covers_every_slot_up_to_capacity_across_calls() -> None:
             sink = (
                 None
                 if call == 1
-                else torch.linspace(-1.0, 1.0, heads, dtype=torch.float32, device=device)
+                else torch.linspace(
+                    -1.0, 1.0, heads, dtype=torch.float32, device=device
+                )
             )
             expected = _split_merge_fp32_oracle(
                 partials, lse, chunks=chunks, attn_sink=sink
@@ -371,3 +374,61 @@ def test_split_merge_covers_every_slot_up_to_capacity_across_calls() -> None:
             torch.testing.assert_close(
                 problem.output.float(), expected, atol=1.5e-2, rtol=1.5e-2
             )
+
+
+@torch.inference_mode()
+def test_single_active_split_reuses_different_capacity_strides() -> None:
+    """A one-slot view must not specialize the head stride of a padded LSE."""
+    device = require_b12x()
+    rows, heads = 2, 16
+    sink = torch.linspace(-0.3, 0.3, heads, device=device)
+    problems = []
+    for capacity in (1, 4, 8):
+        problem = _make_fixed_merge_problem(
+            rows=rows, heads=heads, chunks=capacity, device=device
+        )
+        partials = torch.ones_like(problem.tmp_output)
+        lse = torch.full_like(problem.tmp_lse, -10)
+        lse[:, :, 0] = torch.arange(heads, device=device)[None] / 8 + 2
+        problem.num_chunks_ptr.fill_(1)
+        expected = _split_merge_fp32_oracle(partials, lse, chunks=1, attn_sink=sink)
+        binding = mla_merge.build_sparse_mla_split_decode_merge_binding(
+            tmp_output=problem.tmp_output[:, :, :1],
+            tmp_lse=problem.tmp_lse[:, :, :1],
+            num_chunks_ptr=problem.num_chunks_ptr,
+            output=problem.output,
+            num_chunks=1,
+            attn_sink=sink,
+        )
+        _install_scenario(
+            problem, partials=partials, lse=lse, live_sink=None, source_sink=None
+        )
+        binding.run()
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            problem.output.float(), expected, rtol=0.01, atol=0.01
+        )
+        problems.append((problem, partials, lse, binding))
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    freeze_kernel_resolution("single active split across padded capacity strides")
+    try:
+        for problem, partials, lse, binding in reversed(problems):
+            _install_scenario(
+                problem, partials=partials, lse=lse, live_sink=None, source_sink=None
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                binding.run()
+            partials.mul_(-2)
+            _install_scenario(
+                problem, partials=partials, lse=lse, live_sink=None, source_sink=None
+            )
+            graph.replay()
+            torch.cuda.synchronize(device)
+            expected = _split_merge_fp32_oracle(partials, lse, chunks=1, attn_sink=sink)
+            torch.testing.assert_close(
+                problem.output.float(), expected, rtol=0.01, atol=0.01
+            )
+    finally:
+        unfreeze_kernel_resolution()

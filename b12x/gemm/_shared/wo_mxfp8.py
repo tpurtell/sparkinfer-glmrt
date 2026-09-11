@@ -1147,6 +1147,11 @@ def pack_fp8_block_scaled_weight_mxfp8(
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
     _check_mxfp8_k(k)
+    block_size = tuple(block_size)
+    if block_size not in ((128, 128), (32, 32)):
+        raise ValueError(f"unsupported FP8 weight block_size {block_size}")
+    if block_size == (32, 32) and not _scale_is_exact_ue8m0(scale):
+        raise ValueError("32x32 weight scales must be exact UE8M0")
 
     # Arbitrary fp32 checkpoint scales (e.g. DeepSeek `weight_scale_inv`) are not
     # powers of two; re-quantize onto exact UE8M0 instead of rounding the scale
@@ -1181,10 +1186,10 @@ def pack_fp8_block_scaled_weight_mxfp8(
 
     scale_rows = _expand_block_scales_to_mxfp8_rows(
         scale,
-        block_size=block_size,
         m=m,
         k=k,
         num_groups=num_groups,
+        block_size=block_size,
     )
     scale_mma = pack_mxfp8_scales_for_dense_gemm(
         scale_rows,

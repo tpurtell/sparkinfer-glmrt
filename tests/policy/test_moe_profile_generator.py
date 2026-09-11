@@ -60,6 +60,7 @@ from b12x.policy.generation.providers.moe_gpu_worker import (
     _reset_cuda_graphs,
     _relative_norm_error,
     _trellis_weights,
+    _uniform_w4a8_mx_reference,
     _uniform_w4a16_reference,
     _w4a16_direct_path,
     _w4a16_weight_layout,
@@ -115,13 +116,14 @@ def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries(
             if query["quant_mode"] == "w4a16" and query["source_format"] == "modelopt_nvfp4":
                 # Native-layout measurements cannot qualify uniform MMA-packed A16.
                 assert hit is None, (profile.profile_id, query)
-                resolution = context.resolve(
-                    MOE_DECODE_POLICY, MoeDecodeQuery(**query),
-                )
+            resolution = context.resolve(
+                MOE_DECODE_POLICY, MoeDecodeQuery(**query),
+            )
+            if hit is None:
                 assert resolution.source is PolicySource.HEURISTIC
                 assert _config_covers_query(query, asdict(resolution.config))
                 continue
-            assert hit is not None, (profile.profile_id, query)
+            assert resolution.source is PolicySource.PREPLANNED
             assert _config_covers_query(query, hit.config), (
                 profile.profile_id,
                 query,
@@ -214,6 +216,7 @@ def test_profile_coverage_rejects_cross_family_backends(
 ) -> None:
     query = {
         "quant_mode": quant_mode,
+        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 256,
@@ -268,6 +271,72 @@ def test_uniform_w4a16_profile_fixture_has_stable_positive_projections() -> None
         rtol=0.0,
         atol=1.0e-3,
     )
+
+
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_uniform_w4a8_profile_reference_models_checkpoint_semantics(
+    monkeypatch, activation,
+) -> None:
+    from b12x.moe import fused_moe
+    from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
+
+    recipe = next(
+        geometry.recipe for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "e8m0-w4a8"
+    )
+    model = MoeModelGeometry(
+        model_id="oracle-test", hidden_size=256, intermediate_size=128,
+        num_experts=3, native_top_k=2, activation=activation,
+        recipe_families=(recipe.family_id,), source="test", tp_sizes=(1,),
+    )
+    (geometry,) = expand_physical_geometries(models=(model,), recipes=(recipe,))
+    monkeypatch.setattr(fused_moe, "prepare_weights", lambda *, plan, weights: weights)
+    weights = _packed_weights(geometry, device="cpu")
+    generator = torch.Generator().manual_seed(29)
+    x = _condition_benchmark_inputs(
+        geometry, torch.randn((4, 256), generator=generator),
+    )
+    # Include duplicate routes and both negative and out-of-range expert IDs.
+    topk_ids = torch.tensor([[0, 1], [2, -1], [1, 1], [3, -1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25, 0.75], [0.6, 0.4], [0.2, 0.3], [0.4, 0.6]])
+    output = _uniform_w4a8_mx_reference(
+        geometry, x=x, topk_ids=topk_ids, topk_weights=topk_weights,
+    )
+    checkpoint = moe_reference_w4a8_mx(
+        x, weights.w13, weights.w13_block_scales.view(torch.uint8), None,
+        weights.w13_global_scales,
+        weights.w2, weights.w2_block_scales.view(torch.uint8), None,
+        weights.w2_global_scales, topk_ids, topk_weights,
+        geometry.num_experts, geometry.hidden_size, geometry.intermediate_size,
+        activation=activation, w13_layout="w13",
+    )
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output[:3]) > 0
+    assert torch.count_nonzero(output[3]) == 0
+    # The checkpoint oracle also rounds the intermediate to MXFP8; the analytic
+    # oracle admits both BF16-intermediate and MXFP8-intermediate candidates.
+    assert _cosine_similarity(output, checkpoint) >= 0.998
+    assert _relative_norm_error(output, checkpoint) <= 0.12
+
+
+def test_w4a8_profile_inputs_are_mxfp8_representable() -> None:
+    from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
+
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "e8m0-w4a8"
+    )
+    generator = torch.Generator(device="cpu").manual_seed(29)
+    inputs = torch.randn(
+        (2, geometry.hidden_size),
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    conditioned = _condition_benchmark_inputs(geometry, inputs)
+
+    assert torch.equal(conditioned, quant_dequant_mxfp8_torch(conditioned))
 
 
 def test_w4a16_tuner_enumerates_distinct_kernel_routes() -> None:
@@ -592,6 +661,7 @@ def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
         geometry
         for geometry in expand_physical_geometries()
         if geometry.recipe.quant_mode == quant_mode
+        and geometry.recipe.numerical_recipe == "default"
     )
 
     configs = tuple(
@@ -665,6 +735,7 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
         geometry
         for geometry in expand_physical_geometries()
         if geometry.recipe.quant_mode == quant_mode
+        and geometry.recipe.numerical_recipe == "default"
         and geometry.activation == "silu"
     )
     cases = expand_sweep_cases(geometries=(geometry,))
@@ -1015,6 +1086,7 @@ def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> No
     assert component is not None
     base_query = {
         "quant_mode": "nvfp4",
+        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 16,
@@ -1103,6 +1175,7 @@ def test_correctness_screen_uses_an_eligible_anchor_per_candidate(tmp_path) -> N
         component.lookup(
             {
                 "quant_mode": "nvfp4",
+                "numerical_recipe": "default",
                 "source_format": "modelopt_nvfp4",
                 "activation": "silu",
                 "num_experts": 16,
@@ -1190,6 +1263,7 @@ def test_prefill_capacities_are_measured_for_each_top_k(
             hit = component.lookup(
                 {
                     "quant_mode": "nvfp4",
+                    "numerical_recipe": "default",
                     "source_format": "modelopt_nvfp4",
                     "activation": "silu",
                     "num_experts": 16,
@@ -1207,6 +1281,7 @@ def test_prefill_capacities_are_measured_for_each_top_k(
 def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> None:
     base_query = {
         "quant_mode": "nvfp4",
+        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 16,
@@ -1294,7 +1369,7 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
                 "components": [
                     {
                         "component_id": "moe.decode",
-                        "query_schema_version": 4,
+                        "query_schema_version": 5,
                         "config_schema_version": 3,
                         "planner": decision_node_to_dict(planner),
                     }
@@ -1319,6 +1394,7 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
 def test_sparse_token_coverage_preserves_dynamic_direct_boundary(top_k: int) -> None:
     base_query = {
         "quant_mode": "nvfp4",
+        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 256,

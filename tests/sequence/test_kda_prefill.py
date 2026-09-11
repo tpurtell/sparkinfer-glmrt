@@ -323,6 +323,7 @@ def make_binding(
     final_stride: int = 1,
     metadata_validation: str = "transactional",
     policy=None,
+    recurrent_state: torch.Tensor | None = None,
     **caps_extra,
 ):
     """Bind ``inputs`` (from make_inputs on a CUDA device) at planned capacity."""
@@ -331,9 +332,11 @@ def make_binding(
 
     device = inputs["q"].device
     heads = int(inputs["q"].shape[1])
+    if recurrent_state is None:
+        recurrent_state = inputs["pool"].clone()
     caps = impl.Caps(
         device=device, max_tokens=max_tokens, max_seqs=max_seqs,
-        max_state_slots=int(inputs["pool"].shape[0]), heads=heads,
+        max_state_slots=int(recurrent_state.shape[0]), heads=heads,
         null_state_index=inputs["null_state_index"], metadata_validation=metadata_validation,
         **caps_extra,
     )
@@ -362,7 +365,7 @@ def make_binding(
         "q": pad_rows(inputs["q"]), "k": pad_rows(inputs["k"]), "v": pad_rows(inputs["v"]),
         "raw_g": pad_rows(inputs["raw_g"]), "raw_beta": pad_rows(inputs["raw_beta"]),
         "A_log": inputs["A_log"], "dt_bias": inputs["dt_bias"],
-        "recurrent_state": inputs["pool"].clone(),
+        "recurrent_state": recurrent_state,
         "cu_seqlens": pad_seqs(inputs["cu_seqlens"], extra=1),
         "initial_state_indices": pad_seqs(inputs["initial"]),
         "final_state_indices": final_state_indices,
@@ -394,7 +397,7 @@ def _mirror_trace(inputs: dict):
 @pytest.mark.parametrize("lower_bound", [-5.0, -0.5])
 def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
     from ..conftest import require_b12x
-    from b12x.sequence.kda_prefill._cute_kernels import run_prepare, run_prologue, workspace_tiles
+    from b12x.sequence._shared.delta_prefill._cute_kernels import run_prepare, run_prologue, workspace_tiles
 
     device = require_b12x()
     checkpoint = [(0, 0)] * len(lengths)
@@ -475,7 +478,7 @@ def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
 )
 def test_prologue_reports_malformed_metadata(mutate, bit) -> None:
     from ..conftest import require_b12x
-    from b12x.sequence.kda_prefill._cute_kernels import run_prepare, run_prologue
+    from b12x.sequence._shared.delta_prefill._cute_kernels import run_prepare, run_prologue
 
     device = require_b12x()
     inputs = make_inputs(lengths=[20, 20], heads=2, seed=43, device=device, checkpoint=[(16, 6), (0, 0)])
@@ -594,7 +597,7 @@ def test_op_lower_bounds_and_saturated_gates(lower_bound, gate_profile) -> None:
     binding, tensors = make_binding(inputs, max_tokens=64, max_seqs=2)
     _run(binding, inputs)
     torch.cuda.synchronize(device)
-    from b12x.sequence.kda_prefill._cute_kernels import workspace_tiles
+    from b12x.sequence._shared.delta_prefill._cute_kernels import workspace_tiles
 
     live_tiles = inputs["num_tokens"] // 16
     tiles = workspace_tiles(binding)
@@ -635,6 +638,91 @@ def test_op_long_sequence_accumulation_long_memory(tokens) -> None:
     _run(binding, inputs)
     torch.cuda.synchronize(device)
     _assert_op_matches_oracle(binding, tensors, inputs)
+
+
+@pytest.mark.parametrize("high_state_slots", [False, True], ids=["low-slots", "high-slots"])
+def test_op_near_collinear_long_sequence_remains_finite(high_state_slots) -> None:
+    """Reject non-finite output or state from ill-conditioned key blocks.
+
+    Repeating one BF16 key for every token makes each sixteen-token block
+    rank one. A saturated update coefficient and slow decay amplify errors
+    in the blockwise triangular inverse. The KDA prefill
+    contract requires finite BF16 output and FP32 recurrent state for this
+    supported input.
+    """
+    from ..conftest import require_b12x
+
+    device = require_b12x()
+    tokens, heads = 16384, 1
+    inputs = make_inputs(
+        lengths=[tokens], heads=heads, seed=0, device=device, state_slots=2
+    )
+
+    torch.manual_seed(0)
+    key = torch.randn(1, heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    qk = key.expand(tokens, heads, HEAD_DIM).contiguous()
+    value_block = torch.randn(
+        16, heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    inputs.update(
+        q=qk,
+        k=qk,
+        v=value_block.repeat(tokens // 16, 1, 1),
+        raw_g=torch.full_like(qk, -12.0),
+        raw_beta=torch.full(
+            (tokens, heads), 8.0, dtype=torch.bfloat16, device=device
+        ),
+        A_log=torch.zeros(heads, dtype=torch.float32, device=device),
+        dt_bias=torch.zeros(heads, HEAD_DIM, dtype=torch.float32, device=device),
+        pool=torch.zeros(
+            2, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device
+        ),
+    )
+
+    recurrent_state = None
+    if high_state_slots:
+        slot_stride = heads * HEAD_DIM * HEAD_DIM
+        int32_max = torch.iinfo(torch.int32).max
+        high_slot = int32_max // slot_stride + 2
+        required_bytes = (high_slot + 2) * slot_stride * torch.float32.itemsize
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if free_bytes < required_bytes + 2 * 1024**3:
+            pytest.skip(
+                "KDA high-slot stability test requires "
+                f"{required_bytes + 2 * 1024**3} bytes free, found {free_bytes}"
+            )
+        recurrent_state = torch.empty(
+            high_slot + 2, heads, HEAD_DIM, HEAD_DIM,
+            dtype=torch.float32, device=device,
+        )
+        recurrent_state[high_slot:].zero_()
+        inputs["initial"] += high_slot
+        inputs["final"] += high_slot
+        assert high_slot * slot_stride > int32_max
+
+    binding, tensors = make_binding(
+        inputs, max_tokens=tokens, max_seqs=1, recurrent_state=recurrent_state
+    )
+    final_slot = int(inputs["final"][0])
+    binding.output.fill_(float("nan"))
+    tensors["recurrent_state"][final_slot].fill_(float("nan"))
+    binding.error_code.fill_(-1)
+    _run(binding, inputs)
+    torch.cuda.synchronize(device)
+
+    assert binding.error_code.item() == 0
+    output_nonfinite = (~torch.isfinite(binding.output[:tokens])).sum().item()
+    state_nonfinite = (
+        ~torch.isfinite(tensors["recurrent_state"][final_slot])
+    ).sum().item()
+    assert output_nonfinite == 0, (
+        f"output contains {output_nonfinite} non-finite values"
+    )
+    assert state_nonfinite == 0, (
+        f"state contains {state_nonfinite} non-finite values"
+    )
+    assert torch.count_nonzero(binding.output[:tokens]).item() > 0
+    assert torch.count_nonzero(tensors["recurrent_state"][final_slot]).item() > 0
 
 
 @pytest.mark.parametrize("key_profile", ["repeated", "alternating"])
@@ -880,7 +968,7 @@ def test_op_trusted_mode_accepts_strided_views() -> None:
 def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
     from ..conftest import require_b12x
     from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from b12x.sequence.kda_prefill import _cute_kernels as kernels
+    from b12x.sequence._shared.delta_prefill import _cute_kernels as kernels
 
     device = require_b12x()
     small = make_inputs(lengths=[1], heads=2, seed=75, device=device, state_slots=8)

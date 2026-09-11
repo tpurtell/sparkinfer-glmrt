@@ -587,6 +587,9 @@ _DSA_INDEXER_QUERY_FIELDS = (
     "page_size",
     "score_mode",
     "shared_page_table",
+    "cache_format",
+    "max_candidates",
+    "candidate_topk_blocks",
 )
 _DSA_INDEXER_MERGE_PAGE_TABLE_WIDTH = 512
 # (heads, top_k, decode row counts) of the serving contracts that take the fused
@@ -623,6 +626,9 @@ def _dsa_indexer_merge_cases() -> tuple[SweepCase, ...]:
                             "page_size": 64,
                             "score_mode": "dsa",
                             "shared_page_table": False,
+                            "cache_format": "fp8",
+                            "max_candidates": 0,
+                            "candidate_topk_blocks": 0,
                         },
                         metadata={
                             "seq_len": seq_len,
@@ -902,7 +908,7 @@ class DsaIndexerMergeGenerator(DiscreteSweepGenerator):
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(
             component_id=DSA_INDEXER,
-            query_schema_version=1,
+            query_schema_version=2,
             config_schema_version=1,
             query_fields=_DSA_INDEXER_QUERY_FIELDS,
             range_fields=frozenset({"max_q_rows"}),

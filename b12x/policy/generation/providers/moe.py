@@ -38,6 +38,7 @@ _QUERY_FIELDS = (
     "quant_mode",
     "source_format",
     "activation",
+    "numerical_recipe",
     "num_experts",
     "hidden_size",
     "intermediate_size",
@@ -52,7 +53,7 @@ _TRITON_ROUTE_MAX_ROWS = 256
 _PREFILL_CAPACITY_TOKENS = frozenset(COMMON_PREFILL_TOKEN_CAPACITIES)
 _QUALIFICATION_TOKENS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 32, 128})
 _QUALIFICATION_PATTERNS = frozenset({"balanced", "hot"})
-_MOE_CANDIDATE_CONTRACT_VERSION = 10
+_MOE_CANDIDATE_CONTRACT_VERSION = 12
 _MOE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
@@ -207,6 +208,7 @@ def _config_covers_query(
         top_k=top_k,
         num_tokens=num_tokens,
         routed_rows=routed_rows,
+        numerical_recipe=str(query.get("numerical_recipe", "default")),
     )
     try:
         parsed_config = MoeDecodeConfig.from_profile(FrozenMapping(config))
@@ -509,7 +511,7 @@ class MoeDecodeGenerator:
     """Generate a broad MoE planner from staged per-geometry GPU races."""
 
     component_id = MOE_DECODE
-    query_schema_version = 4
+    query_schema_version = 5
     config_schema_version = 3
 
     def __init__(

@@ -110,6 +110,7 @@ def plan_weights(
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
+    numerical_recipe: str = "default",
 ) -> WeightsPlan: ...
 
 
@@ -162,6 +163,7 @@ def prepare_weights(
     intermediate_rotations: torch.Tensor | None = None,
     down_svh: torch.Tensor | None = None,
     trellis_mcg: torch.Tensor | int | None = None,
+    immutable_input_scales: bool = False,
 ) -> ExpertWeights: ...
 
 
@@ -182,6 +184,7 @@ def prepare_weights(**kwargs: Any) -> PreparedExperts | ExpertWeights:
             "a2_gscale",
             "btx_layer",
             "btx_device",
+            "immutable_input_scales",
             "dummy_scale",
             "gate_suh",
             "up_suh",
@@ -243,7 +246,18 @@ def plan_execution(**kwargs: Any) -> ExecutionPlan | _compat.ExecutionPlan:
 
 
 def bind(plan: Plan | ExecutionPlan, **kwargs: Any) -> Binding:
-    """Bind runtime tensors and caller-owned scratch without allocating."""
+    """Bind runtime tensors and caller-owned scratch without allocating.
+
+    ``ActivationSpec(numerical_recipe="deepseek_v41")`` consumes externally
+    selected, unbiased routing weights exactly once, before FC2 quantization.
+    Its output may be BF16 (FP32 route sum followed by final rounding) or FP32.
+    Use FP32 output for expert-parallel all-reduce and shared-expert composition:
+    sum the local routed accumulators, add the dense shared expert's BF16
+    output in FP32, then cast the combined output to BF16.  Adding a shared
+    expert to the already-rounded BF16 routed result is not the same contract.
+    Global routing IDs must first be mapped to local expert IDs; use -1 for
+    nonlocal selections while retaining their original route slot and weight.
+    """
 
     if isinstance(plan, ExecutionPlan):
         if not plan.is_prewarmed:

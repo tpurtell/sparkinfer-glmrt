@@ -29,7 +29,7 @@ def test_native_v41_scales_gemm_and_graph(tokens, n, k):
     expected_scales = scale.view(torch.uint8).repeat_interleave(32,dim=0)
     assert torch.equal(packed.weight.scale_rows.reshape(n,k//32).view(torch.uint8), expected_scales)
     plan = plan_block_fp8_linear_scratch(BlockFP8LinearScratchCaps(
-        device=x.device, max_tokens=tokens, in_features=k, out_features=n))
+        device=x.device, max_tokens=tokens, in_features=k, out_features=n, block_size=(32,32)))
     scratch = tuple(torch.empty(shape, dtype=dtype, device='cuda') for shape,dtype in plan.shapes_and_dtypes())
     out = torch.empty((tokens,n,1), device='cuda', dtype=torch.bfloat16)
     binding = plan.bind(scratch=scratch, source=x, packed_weight=packed, output=out,
