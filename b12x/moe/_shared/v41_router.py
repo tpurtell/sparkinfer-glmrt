@@ -373,6 +373,16 @@ class _V41RouterScores:
 
 
 
+def v41_router_gemm_min_rows(*, experts: int) -> int:
+    """Measured SM120 crossover against the native FP32 GEMV router.
+
+    Exported as immutable dispatch metadata; this does not resolve at replay.
+    """
+    if experts not in (128, 384):
+        raise ValueError("V4.1 router experts must be 128 or 384")
+    return 16 if experts == 384 else 26
+
+
 def compile_v41_router_scores_aot(*, experts: int):
     """Compile BF16 [rows,5120] @ gate.T -> FP32 [rows,experts].
 
