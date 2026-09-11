@@ -8,7 +8,7 @@ produce inverse=-1. Duplicate IDs are retained as separate routes.
 
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
-from cutlass import Int32, Int64, Uint32
+from cutlass import Int32, Int64, Uint32, Float32, range_constexpr
 
 
 class V41RoutePlan:
@@ -116,3 +116,46 @@ class V41RoutePlan:
                 grouped_weights[base + j] = weights[pair]
                 inverse[pair] = base + j
             metadata[group, 3 + local] = row
+
+
+class V41SliceReduce:
+    """Ordered FP32 slice sum into original route order; invalid routes are zero."""
+
+    def __init__(self, width, capacity, topk=6):
+        assert width in (64, 128, 192) and capacity > 0 and topk > 0
+        self.slices = (576 + width - 1) // width
+        self.routes = capacity * topk
+        self.topk = topk
+
+    @cute.jit
+    def __call__(
+        self,
+        source: cute.Tensor,
+        dest: cute.Tensor,
+        inverse: cute.Tensor,
+        live_rows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(source, dest, inverse, live_rows).launch(
+            grid=((self.routes * 5120 + 255) // 256, 1, 1),
+            block=(256, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        source: cute.Tensor,
+        dest: cute.Tensor,
+        inverse: cute.Tensor,
+        live_rows: cute.Tensor,
+    ):
+        index = Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
+        route, col = index // 5120, index % 5120
+        if route < min(live_rows[0] * self.topk, self.routes):
+            grouped = inverse[route]
+            value = Float32(0)
+            if grouped >= 0:
+                for plane in range_constexpr(self.slices):
+                    value += source[plane, Int64(grouped), col]
+            dest[route, col] = value

@@ -82,3 +82,39 @@ def test_route_plan(capacity):
             )
         assert (meta[len(tasks) :, 1] == 0).all()
         assert [t.data_ptr() for t in tensors] == pointers
+
+
+@pytest.mark.parametrize("width", [64, 128, 192])
+def test_inverse_reduce(width):
+    from b12x.moe._shared.kernels.v41_route_plan import V41SliceReduce
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    capacity = 16
+    routes = capacity * 6
+    planes = (576 + width - 1) // width
+    source = torch.randn(planes, routes, 5120, device="cuda")
+    dest = torch.empty(routes, 5120, device="cuda")
+    inverse = torch.empty(routes, dtype=torch.int32, device="cuda")
+    live = torch.empty(1, dtype=torch.int32, device="cuda")
+    args = [from_dlpack(t) for t in [source, dest, inverse, live]]
+    fn = cute.compile(V41SliceReduce(width, capacity), *args, current_cuda_stream())
+    live.zero_()
+    fn(*args, current_cuda_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn(*args, current_cuda_stream())
+    for rows in [16, 1, 0, 6, 2, 16, 1]:
+        live.fill_(rows)
+        mapping = torch.randperm(routes, device="cuda").int()
+        mapping[::7] = -1
+        inverse.copy_(mapping)
+        source.mul_(-0.75)
+        dest.fill_(12345)
+        expected = torch.zeros(rows * 6, 5120, device="cuda")
+        valid = mapping[: rows * 6] >= 0
+        for plane in range(planes):
+            expected[valid] += source[plane, mapping[: rows * 6][valid].long()]
+        graph.replay()
+        assert torch.equal(dest[: rows * 6], expected)
+        assert (dest[rows * 6 :] == 12345).all()
