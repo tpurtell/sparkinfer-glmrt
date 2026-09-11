@@ -465,6 +465,7 @@ def _get_compiled_wo_quant(
             current_cuda_stream(),
         )
 
+    launch_tensors.compiled = raw
     return launch_tensors
 
 
@@ -539,3 +540,17 @@ __all__ = [
     "quantize_wo_group_major_rows_cute",
     "quantize_wo_grouped_rows_cute",
 ]
+
+
+def compile_wo_grouped_quant_aot(*, groups: int, group_width: int) -> object:
+    """Export grouped BF16-to-MXFP8 quantization with runtime row count/grid.
+
+    Physical output values are [groups, live_rows, group_width]. Scales use
+    the grouped dense-GEMM layout; callers provide stable capacity storage.
+    """
+    if groups < 1 or group_width < 128 or group_width % 128:
+        raise ValueError("grouped quantization requires positive groups and K%128=0")
+    return _get_compiled_wo_quant(
+        "grouped", groups * group_width, group_width, torch.bfloat16,
+        False, 0, 0, 0, torch.int64, torch.bfloat16,
+    ).compiled

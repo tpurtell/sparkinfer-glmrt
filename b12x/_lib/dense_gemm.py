@@ -5879,6 +5879,7 @@ def compile_dense_gemm_mxfp8_aot(
     size_m: int,
     size_n: int,
     size_k: int,
+    num_groups: int = 1,
     expected_m: Optional[int] = None,
     sfb_k_replicated: bool = False,
     sm_count: Optional[int] = None,
@@ -5897,6 +5898,9 @@ def compile_dense_gemm_mxfp8_aot(
     size_m = int(size_m)
     size_n = int(size_n)
     size_k = int(size_k)
+    num_groups = int(num_groups)
+    if num_groups < 1:
+        raise ValueError("MXFP8 AOT num_groups must be positive")
     if size_m <= 0 or size_n <= 0 or size_k <= 0 or size_k % 128 != 0:
         raise ValueError(
             "MXFP8 AOT requires positive M/N and positive K divisible by 128, "
@@ -5923,18 +5927,26 @@ def compile_dense_gemm_mxfp8_aot(
     )
     if plan.swap_ab or plan.load_path != "tma":
         raise ValueError("MXFP8 AOT requires the unswapped TMA plan")
+    # Match the grouped WO-A schedule, with all live row counts passed to
+    # the exported launch at runtime. Group count is static model geometry.
+    mma_tiler_mn = plan.mma_tiler_mn
+    if num_groups > 1 and size_n <= 1536:
+        if 1 <= regime_m <= 8:
+            mma_tiler_mn = (16, 64)
+        elif regime_m == 16:
+            mma_tiler_mn = (32, 64)
     tile_k = _select_mxfp8_tile_k(
         size_m, size_n, size_k, regime_m, sm_count
     )
-    _validate_mxfp8_bk64_plan(tile_k, plan.mma_tiler_mn, False)
+    _validate_mxfp8_bk64_plan(tile_k, mma_tiler_mn, False)
     policy = _dense_gemm_policy_for(
         m=size_m,
         n=size_n,
         k=size_k,
-        l=1,
+        l=num_groups,
         ab_dtype=cutlass.Float8E4M3FN,
         c_dtype=cutlass.BFloat16,
-        mma_tiler_mn=plan.mma_tiler_mn,
+        mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=(1, 1),
         sm_count=sm_count,
         expected_m=regime_m,
@@ -5944,6 +5956,8 @@ def compile_dense_gemm_mxfp8_aot(
             "MXFP8 AOT standalone export does not support split-K: "
             f"M={size_m}, N={size_n}, K={size_k}, slices={policy.split_k_slices}"
         )
+    if num_groups > 1 and policy.split_k_slices != 1:
+        raise ValueError("grouped MXFP8 AOT does not support split-K")
     slices = int(policy.split_k_slices)
     if slices not in (1, 2, 4):
         raise ValueError(f"unsupported MXFP8 AOT split count: {slices}")
@@ -5953,8 +5967,8 @@ def compile_dense_gemm_mxfp8_aot(
     tensor_api = _get_compiled_dense_gemm(
         n=size_n,
         k=size_k,
-        l=1,
-        c_l=slices,
+        l=num_groups,
+        c_l=num_groups if slices == 1 else slices,
         a_major="k",
         b_major="k",
         c_major="n",
@@ -5965,7 +5979,7 @@ def compile_dense_gemm_mxfp8_aot(
         sf_vec_size=32,
         mma_k=32,
         tile_k=tile_k,
-        mma_tiler_mn=plan.mma_tiler_mn,
+        mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=(1, 1),
         policy=policy,
         sm_count=sm_count,
@@ -5979,10 +5993,10 @@ def compile_dense_gemm_mxfp8_aot(
             m=size_m,
             n=size_n,
             k=size_k,
-            l=1,
+            l=num_groups,
             sf_vec_size=32,
             tile_k=tile_k,
-            mma_tiler_mn=plan.mma_tiler_mn,
+            mma_tiler_mn=mma_tiler_mn,
             load_path=plan.load_path,
             swap_ab=False,
             b_tile_major=False,
