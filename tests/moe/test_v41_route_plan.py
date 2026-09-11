@@ -52,6 +52,9 @@ def test_route_plan(capacity):
         source = torch.randint(-2, 386, (r,), generator=generator, dtype=torch.int32)
         if case == 0:
             source.fill_(383)  # duplicates and long runs, even within one row
+        if case == 6:
+            source.fill_(0)
+            source[:min(r, 384)] = torch.arange(min(r, 384))
         values = torch.randn(r, generator=generator)
         ids.copy_(source)
         weights.copy_(values)
@@ -71,6 +74,9 @@ def test_route_plan(capacity):
                     + [-1] * (16 - len(chunk))
                 )
                 permutation.extend(chunk)
+        # The pipeline launches this tight worst-case group bound from live rows.
+        bound = min(rows * 6, 384 + max(rows * 6 - 384, 0) // 16)
+        assert len(tasks) <= bound
         n = len(permutation)
         expected_inverse = torch.full((r,), -1, dtype=torch.int32)
         expected_inverse[permutation] = torch.arange(n, dtype=torch.int32)

@@ -1576,6 +1576,22 @@ def red_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_add_global_f32(addr: Int64, val: Float32, *, loc=None, ip=None):
+    """No-return global FP32 add; order is unspecified and subnormals flush."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Float32(val).ir_value(loc=loc, ip=ip)],
+        "red.relaxed.gpu.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def atomic_add_global_u64(addr: Int64, val: Int64, *, loc=None, ip=None) -> Int64:
     """Global 64-bit atomic add (relaxed device scope). Returns the old value."""
     return Int64(

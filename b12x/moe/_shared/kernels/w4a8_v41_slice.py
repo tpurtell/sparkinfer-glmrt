@@ -10,6 +10,12 @@ route spans and <=16 rows per group; long expert runs use multiple groups.
 Nonpositive group row counts mark inactive launch slots. Output route indices
 are grouped order. This low-level kernel is not a serving
 binding or a replacement planner policy.
+
+With atomic_tokens=True, grouped mode accumulates directly into a zero-initialized
+flat FP32 [token_capacity * 5120] output. Metadata input row IDs also select output
+tokens. This removes route/slice planes but changes FP32 addition order and flushes
+subnormal atomic operands/results; callers must qualify that numerical contract.
+The caller owns output clearing and stream ordering.
 """
 
 import cutlass
@@ -19,6 +25,8 @@ import cuda.bindings.driver as cuda
 from cutlass import Int32, Int64, Uint32, Float32
 from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
+    get_ptr_as_int64,
+    red_add_global_f32,
     e2m1x8_to_qmma_e2m1x8,
     fmax_f32,
     fmin_f32,
@@ -35,8 +43,10 @@ from b12x.moe._shared.kernels.w4a8_staging import (
 
 
 class V41FusedSliceKernel:
-    def __init__(self, width, *, grouped=False):
+    def __init__(self, width, *, grouped=False, atomic_tokens=False):
         assert width in (64, 128, 192)
+        assert not atomic_tokens or grouped
+        self.atomic_tokens = atomic_tokens
         self.grouped = grouped
         self.width = width
         self.slices = (576 + width - 1) // width
@@ -333,9 +343,14 @@ class V41FusedSliceKernel:
                         col = ot * 128 + nf * 32 + warp * 8 + c * 2 + elem % 2
                         if cutlass.const_expr(self.grouped):
                             if row < rows:
-                                out[slice_id, route_base + Int64(row), col] = acc[
-                                    nf, elem
-                                ]
+                                if cutlass.const_expr(self.atomic_tokens):
+                                    token = Int64(metadata[group, 3 + row])
+                                    red_add_global_f32(
+                                        get_ptr_as_int64(out, token * Int64(5120) + Int64(col)),
+                                        acc[nf, elem],
+                                    )
+                                else:
+                                    out[slice_id, route_base + Int64(row), col] = acc[nf, elem]
                         else:
                             out[slice_id, row, col] = acc[nf, elem]
                 cute.arch.sync_threads()

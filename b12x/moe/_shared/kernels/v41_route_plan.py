@@ -82,7 +82,7 @@ class V41RoutePlan:
             for e in range(expert):
                 count = counts[e]
                 routes += count
-                groups += (count + 15) // 16
+                groups += (count + 16 - 1) // 16
             prefixes[expert, 0] = routes
             prefixes[expert, 1] = groups
 
@@ -102,7 +102,7 @@ class V41RoutePlan:
         count = counts[expert]
         base = prefixes[expert, 0]
         group_base = prefixes[expert, 1]
-        for j in range(lane, ((count + 15) // 16) * 16, 32):
+        for j in range(lane, ((count + 16 - 1) // 16) * 16, 32):
             group = group_base + j // 16
             local = j % 16
             if local == 0:
@@ -123,6 +123,7 @@ class V41SliceReduce:
 
     def __init__(self, width, capacity, topk=6):
         assert width in (64, 128, 192) and capacity > 0 and topk > 0
+        self.capacity = capacity
         self.slices = (576 + width - 1) // width
         self.routes = capacity * topk
         self.topk = topk
@@ -135,9 +136,11 @@ class V41SliceReduce:
         inverse: cute.Tensor,
         live_rows: cute.Tensor,
         stream: cuda.CUstream,
+        rows: Int32 = -1,
     ):
+        launch_rows = self.capacity if rows < 0 else min(rows, self.capacity)
         self.kernel(source, dest, inverse, live_rows).launch(
-            grid=((self.routes * 5120 + 255) // 256, 1, 1),
+            grid=(max(1, (launch_rows * self.topk * 5120 + 255) // 256), 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
