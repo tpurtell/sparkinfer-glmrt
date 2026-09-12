@@ -14,12 +14,14 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 
 
 class V41SlicePipeline:
-    def __init__(self, capacity, width, atomic_tokens=False):
+    def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576):
         self.capacity = capacity
         self.atomic_tokens = atomic_tokens
-        self.plan = V41RoutePlan(capacity)
-        self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=atomic_tokens)
-        self.reduce = V41SliceReduce(width, capacity)
+        self.experts = experts
+        self.topk = topk
+        self.plan = V41RoutePlan(capacity, experts, topk)
+        self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=atomic_tokens, intermediate=intermediate)
+        self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate)
 
     @cute.jit
     def __call__(
@@ -78,7 +80,7 @@ class V41SlicePipeline:
             rows,
             stream,
             metadata,
-            max(1, min(rows * 6, 384 + max(rows * 6 - 384, 0) // 16)),
+            max(1, min(rows * self.topk, self.experts + max(rows * self.topk - self.experts, 0) // 16)),
         )
         if cutlass.const_expr(not self.atomic_tokens):
             self.reduce(partial, output, inverse, live, stream, rows)
@@ -93,3 +95,54 @@ class V41SlicePipeline:
         i = Int64(cute.arch.block_idx()[0]) * 256 + Int64(cute.arch.thread_idx()[0])
         if i < Int64(rows) * 5120:
             output[i] = Float32(0)
+
+
+class V41DraftSlicePipeline:
+    """Local dSpark BF16 input through FP8 quantization and ordered route output.
+
+    All temporaries belong to the caller. The quantizer uses the same K32,
+    subgroup-four, 1e-4-floor contract as the native input quantizer.
+    """
+
+    def __init__(self, capacity, width, sm_count):
+        from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
+        assert sm_count > 0
+        self.sm_count = sm_count
+        self.quant = _MXFP8RowsQuantLaunch(
+            5120, cutlass.BFloat16, 4, 256, 32, False, 1e-4, wire_rows=True
+        )
+        self.pipeline = V41SlicePipeline(
+            capacity, width, experts=128, topk=3, intermediate=2304
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        source: cute.Tensor,
+        x: cute.Tensor,
+        xs: cute.Tensor,
+        w13: cute.Tensor,
+        s13: cute.Tensor,
+        w2: cute.Tensor,
+        s2: cute.Tensor,
+        ids: cute.Tensor,
+        routing: cute.Tensor,
+        live: cute.Tensor,
+        packed: cute.Tensor,
+        counts: cute.Tensor,
+        prefixes: cute.Tensor,
+        metadata: cute.Tensor,
+        grouped: cute.Tensor,
+        inverse: cute.Tensor,
+        partial: cute.Tensor,
+        output: cute.Tensor,
+        rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        # 160 K32 groups / row, 8 groups / warp, 8 warps / CTA.
+        grid = min(max(1, (rows * 20 + 7) // 8), self.sm_count * 4)
+        self.quant(source.iterator, x.iterator, xs.iterator, xs.iterator,
+                   rows, grid, stream)
+        self.pipeline(x, xs, w13, s13, w2, s2, ids, routing, live, packed,
+                      counts, prefixes, metadata, grouped, inverse, partial,
+                      output, rows, stream)
