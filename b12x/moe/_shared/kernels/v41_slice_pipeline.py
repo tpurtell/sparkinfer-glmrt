@@ -104,6 +104,9 @@ class V41DraftSlicePipeline:
     subgroup-four, 1e-4-floor contract as the native input quantizer.
     """
 
+    # Qualified model recipe; explicit widths remain available for comparison.
+    DEFAULT_WIDTH = 192
+
     def __init__(self, capacity, width, sm_count):
         from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
         assert sm_count > 0
