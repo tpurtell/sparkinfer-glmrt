@@ -1,6 +1,9 @@
 """V4.1 M16 fused expert-slice kernel for intermediate tiling qualification.
 
 Consumes one expert's N256/K128 packed weights and prequantized MXFP8 rows.
+Intermediate width is immutable model geometry: 576 for TP4 backbone experts
+and 2304 for local dSpark experts. Packed expert strides derive from its
+128-aligned storage width; live row/group counts remain runtime arguments.
 The caller supplies 0..16 live rows in capacity-16 input/output storage. Width
 is static model tiling; row count remains a runtime launch argument. Partial
 FC2 output is FP32 and must be reduced across slices before BF16 conversion.
@@ -43,13 +46,19 @@ from b12x.moe._shared.kernels.w4a8_staging import (
 
 
 class V41FusedSliceKernel:
-    def __init__(self, width, *, grouped=False, atomic_tokens=False):
+    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576):
         assert width in (64, 128, 192)
         assert not atomic_tokens or grouped
         self.atomic_tokens = atomic_tokens
         self.grouped = grouped
         self.width = width
-        self.slices = (576 + width - 1) // width
+        assert intermediate > 0 and intermediate % 32 == 0
+        self.intermediate = intermediate
+        self.kernel_intermediate = (intermediate + 127) // 128 * 128
+        self.slices = (intermediate + width - 1) // width
+        assert self.slices * width <= self.kernel_intermediate, (
+            "slice exceeds packed storage"
+        )
 
     @cute.jit
     def __call__(
@@ -142,7 +151,7 @@ class V41FusedSliceKernel:
                 stage_repacked_b_slice(
                     w13,
                     bb,
-                    expert * Int64(819200),
+                    expert * Int64(self.kernel_intermediate * 5120 // 4),
                     Int32(40),
                     kt,
                     start,
@@ -153,10 +162,10 @@ class V41FusedSliceKernel:
                 stage_repacked_b_slice(
                     w13,
                     bb + self.width * 64,
-                    expert * Int64(819200),
+                    expert * Int64(self.kernel_intermediate * 5120 // 4),
                     Int32(40),
                     kt,
-                    start + 640,
+                    start + self.kernel_intermediate,
                     tid,
                     128,
                     self.width,
@@ -164,7 +173,7 @@ class V41FusedSliceKernel:
                 stage_repacked_sfb_slice(
                     s13,
                     sb,
-                    expert * Int64(51200),
+                    expert * Int64(self.kernel_intermediate * 5120 // 64),
                     Int32(40),
                     kt,
                     start,
@@ -175,10 +184,10 @@ class V41FusedSliceKernel:
                 stage_repacked_sfb_slice(
                     s13,
                     sb + self.width * 4,
-                    expert * Int64(51200),
+                    expert * Int64(self.kernel_intermediate * 5120 // 64),
                     Int32(40),
                     kt,
-                    start + 640,
+                    start + self.kernel_intermediate,
                     tid,
                     128,
                     self.width,
@@ -254,7 +263,7 @@ class V41FusedSliceKernel:
                     gv = fmin_f32(gv, Float32(10))
                     uv = fmax_f32(Float32(-10), fmin_f32(uv, Float32(10)))
                     value = Float32(0)
-                    if row < rows and start + col < 576:
+                    if row < rows and start + col < self.intermediate:
                         sigmoid = cute.arch.rcp_approx(
                             Float32(1) + cute.math.exp(-gv, fastmath=True)
                         )
@@ -282,8 +291,8 @@ class V41FusedSliceKernel:
                 stage_repacked_b_k_slice(
                     w2,
                     bb,
-                    expert * Int64(409600),
-                    Int32(5),
+                    expert * Int64(self.kernel_intermediate * 5120 // 8),
+                    Int32(self.kernel_intermediate // 128),
                     start,
                     ot * 128,
                     tid,
@@ -293,8 +302,8 @@ class V41FusedSliceKernel:
                 stage_repacked_sfb_k_slice(
                     s2,
                     sf,
-                    expert * Int64(25600),
-                    Int32(5),
+                    expert * Int64(self.kernel_intermediate * 5120 // 128),
+                    Int32(self.kernel_intermediate // 128),
                     start,
                     ot * 128,
                     tid,

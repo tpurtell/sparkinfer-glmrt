@@ -8,18 +8,19 @@ from b12x._lib.utils import current_cuda_stream
 from b12x.moe._shared.kernels.v41_route_plan import V41RoutePlan
 
 
+@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3)])
 @pytest.mark.parametrize("capacity", [1, 16, 80, 4096])
-def test_route_plan(capacity):
+def test_route_plan(capacity, experts, topk):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    r = capacity * 6
+    r = capacity * topk
     specs = [
         (r, torch.int32),
         (r, torch.float32),
         (1, torch.int32),
-        (384 * r, torch.int32),
-        (384, torch.int32),
-        ((384, 2), torch.int32),
+        (experts * r, torch.int32),
+        (experts, torch.int32),
+        ((experts, 2), torch.int32),
         ((r, 19), torch.int32),
         (r, torch.float32),
         (r, torch.int32),
@@ -30,7 +31,7 @@ def test_route_plan(capacity):
     weights.fill_(1)
     live.fill_(capacity)
     args = [from_dlpack(t) for t in tensors]
-    compiled = cute.compile(V41RoutePlan(capacity), *args, current_cuda_stream())
+    compiled = cute.compile(V41RoutePlan(capacity, experts, topk), *args, current_cuda_stream())
     compiled(*args, current_cuda_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -49,12 +50,12 @@ def test_route_plan(capacity):
             1,
         ]
     ):
-        source = torch.randint(-2, 386, (r,), generator=generator, dtype=torch.int32)
+        source = torch.randint(-2, experts + 2, (r,), generator=generator, dtype=torch.int32)
         if case == 0:
-            source.fill_(383)  # duplicates and long runs, even within one row
+            source.fill_(experts - 1)  # duplicates and long runs, even within one row
         if case == 6:
             source.fill_(0)
-            source[:min(r, 384)] = torch.arange(min(r, 384))
+            source[:min(r, experts)] = torch.arange(min(r, experts))
         values = torch.randn(r, generator=generator)
         ids.copy_(source)
         weights.copy_(values)
@@ -64,18 +65,18 @@ def test_route_plan(capacity):
         grouped.fill_(float("nan"))
         graph.replay()
         tasks, permutation = [], []
-        for expert in range(384):
-            locations = (source[: rows * 6] == expert).nonzero().flatten().tolist()
+        for expert in range(experts):
+            locations = (source[: rows * topk] == expert).nonzero().flatten().tolist()
             for start in range(0, len(locations), 16):
                 chunk = locations[start : start + 16]
                 tasks.append(
                     [expert, len(chunk), len(permutation)]
-                    + [p // 6 for p in chunk]
+                    + [p // topk for p in chunk]
                     + [-1] * (16 - len(chunk))
                 )
                 permutation.extend(chunk)
         # The pipeline launches this tight worst-case group bound from live rows.
-        bound = min(rows * 6, 384 + max(rows * 6 - 384, 0) // 16)
+        bound = min(rows * topk, experts + max(rows * topk - experts, 0) // 16)
         assert len(tasks) <= bound
         n = len(permutation)
         expected_inverse = torch.full((r,), -1, dtype=torch.int32)
@@ -90,21 +91,22 @@ def test_route_plan(capacity):
         assert [t.data_ptr() for t in tensors] == pointers
 
 
+@pytest.mark.parametrize("n,topk", [(576, 6), (2304, 3)])
 @pytest.mark.parametrize("width", [64, 128, 192])
-def test_inverse_reduce(width):
+def test_inverse_reduce(width, n, topk):
     from b12x.moe._shared.kernels.v41_route_plan import V41SliceReduce
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     capacity = 16
-    routes = capacity * 6
-    planes = (576 + width - 1) // width
+    routes = capacity * topk
+    planes = (n + width - 1) // width
     source = torch.randn(planes, routes, 5120, device="cuda")
     dest = torch.empty(routes, 5120, device="cuda")
     inverse = torch.empty(routes, dtype=torch.int32, device="cuda")
     live = torch.empty(1, dtype=torch.int32, device="cuda")
     args = [from_dlpack(t) for t in [source, dest, inverse, live]]
-    fn = cute.compile(V41SliceReduce(width, capacity), *args, current_cuda_stream())
+    fn = cute.compile(V41SliceReduce(width, capacity, topk, intermediate=n), *args, current_cuda_stream())
     live.zero_()
     fn(*args, current_cuda_stream())
     graph = torch.cuda.CUDAGraph()
@@ -117,10 +119,10 @@ def test_inverse_reduce(width):
         inverse.copy_(mapping)
         source.mul_(-0.75)
         dest.fill_(12345)
-        expected = torch.zeros(rows * 6, 5120, device="cuda")
-        valid = mapping[: rows * 6] >= 0
+        expected = torch.zeros(rows * topk, 5120, device="cuda")
+        valid = mapping[: rows * topk] >= 0
         for plane in range(planes):
-            expected[valid] += source[plane, mapping[: rows * 6][valid].long()]
+            expected[valid] += source[plane, mapping[: rows * topk][valid].long()]
         graph.replay()
-        assert torch.equal(dest[: rows * 6], expected)
-        assert (dest[rows * 6 :] == 12345).all()
+        assert torch.equal(dest[: rows * topk], expected)
+        assert (dest[rows * topk :] == 12345).all()

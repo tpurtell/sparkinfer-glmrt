@@ -121,10 +121,11 @@ class V41RoutePlan:
 class V41SliceReduce:
     """Ordered FP32 slice sum into original route order; invalid routes are zero."""
 
-    def __init__(self, width, capacity, topk=6):
+    def __init__(self, width, capacity, topk=6, *, intermediate=576):
         assert width in (64, 128, 192) and capacity > 0 and topk > 0
         self.capacity = capacity
-        self.slices = (576 + width - 1) // width
+        assert intermediate > 0 and intermediate % 32 == 0
+        self.slices = (intermediate + width - 1) // width
         self.routes = capacity * topk
         self.topk = topk
 

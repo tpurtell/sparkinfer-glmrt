@@ -54,16 +54,17 @@ def _metadata(ids):
     return torch.tensor(tasks, dtype=torch.int32), torch.tensor(pairs, dtype=torch.long)
 
 
+@pytest.mark.parametrize("n,topk", [(576, 6), (2304, 3)])
 @pytest.mark.parametrize("width", [64, 128, 192])
-def test_grouped_slices(width):
-    _check_grouped_slices(width)
+def test_grouped_slices(width, n, topk):
+    _check_grouped_slices(width, n=n, topk=topk)
 
 
-def _check_grouped_slices(width, after_case=None):
+def _check_grouped_slices(width, after_case=None, *, n=576, topk=6):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("Blackwell GPU required")
     torch.manual_seed(4164)
-    experts, h, n, capacity = 32, 5120, 576, 80
+    experts, h, capacity = (128 if n == 2304 else 32), 5120, 80
     weights = {}
     scales = {}
     for name, shape in [
@@ -97,32 +98,38 @@ def _check_grouped_slices(width, after_case=None):
     wire = torch.empty((capacity, 5280), device="cuda", dtype=torch.uint8)
     qa = wire[:, :h].view(torch.uint32)
     qs = wire[:, h:]
-    metadata = torch.full((64, 19), -1, device="cuda", dtype=torch.int32)
-    routing = torch.empty(capacity * 6, device="cuda")
-    out = torch.empty(((n + width - 1) // width, capacity * 6, h), device="cuda")
+    group_capacity = max(64, capacity * topk) if n == 2304 else 64
+    metadata = torch.full((group_capacity, 19), -1, device="cuda", dtype=torch.int32)
+    routing = torch.empty(capacity * topk, device="cuda")
+    out = torch.empty(((n + width - 1) // width, capacity * topk, h), device="cuda")
     args = [from_dlpack(t, assumed_align=16) for t in [qa, qs, *packed, routing, out]]
     meta_view = from_dlpack(metadata, assumed_align=16)
     compiled = cute.compile(
-        V41FusedSliceKernel(width, grouped=True),
+        V41FusedSliceKernel(width, grouped=True, intermediate=n),
         *args,
         cutlass.Int32(capacity),
         current_cuda_stream(),
         meta_view,
-        cutlass.Int32(64),
+        cutlass.Int32(group_capacity),
     )
-    compiled(*args, capacity, current_cuda_stream(), meta_view, 64)
+    compiled(*args, capacity, current_cuda_stream(), meta_view, group_capacity)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        compiled(*args, capacity, current_cuda_stream(), meta_view, 64)
-    for case_index, (case, ids) in enumerate(_routing_cases()):
-        ids = 31 - ids if case_index % 2 else ids
+        compiled(*args, capacity, current_cuda_stream(), meta_view, group_capacity)
+    cases = _routing_cases()
+    if n == 2304:
+        cases += [(f"draft{m}", torch.arange(m * topk).reshape(m, topk) % experts)
+                  for m in (5, 15, 40)]
+    for case_index, (case, ids) in enumerate(cases):
+        ids = ids[:, :topk]
+        ids = experts - 1 - ids if case_index % 2 else ids
         m = ids.shape[0]
         tasks, pairs = _metadata(ids)
         groups = len(tasks)
         routes = len(pairs)
         metadata.fill_(-1)
         metadata[:groups].copy_(tasks)
-        route_weights = torch.rand(m, 6, device="cuda")
+        route_weights = torch.rand(m, topk, device="cuda")
         route_weights.mul_(1.5 / route_weights.sum(-1, keepdim=True))
         pair_gpu = pairs.cuda()
         routing.fill_(float("nan"))
@@ -141,8 +148,8 @@ def _check_grouped_slices(width, after_case=None):
         # Change metadata and route weights inside a fixed captured launch.
         # Reverse each expert-local row run, preserving disjoint output spans.
         changed = tasks.clone()
-        changed[:, 0] = 31 - changed[:, 0]
-        ids = 31 - ids
+        changed[:, 0] = experts - 1 - changed[:, 0]
+        ids = experts - 1 - ids
         new_pairs = pairs.clone()
         for task in changed:
             count, base = int(task[1]), int(task[2])
@@ -171,6 +178,8 @@ def _check_grouped_slices(width, after_case=None):
                 dict(
                     case=case,
                     width=width,
+                    intermediate=n,
+                    topk=topk,
                     rows=m,
                     experts=int(ids.unique().numel()),
                     groups=groups,

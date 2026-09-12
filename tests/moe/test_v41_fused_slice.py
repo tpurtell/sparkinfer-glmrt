@@ -11,12 +11,13 @@ from tests.moe.test_v41_expert_numerics import reference
 from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 
 
+@pytest.mark.parametrize("n", [576, 2304])
 @pytest.mark.parametrize("width", [64, 128, 192])
-def test_v41_fused_slice(width):
+def test_v41_fused_slice(width, n):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("Blackwell GPU required")
     torch.manual_seed(4106576)
-    h, n = 5120, 576
+    h = 5120
     weights = {}
     scales = {}
     for name, shape in [
@@ -68,7 +69,7 @@ def test_v41_fused_slice(width):
     )
     args = [from_dlpack(t, assumed_align=16) for t in [qa, qs, *packed, routing, out]]
     compiled = cute.compile(
-        V41FusedSliceKernel(width), *args, cutlass.Int32(16), current_cuda_stream()
+        V41FusedSliceKernel(width, intermediate=n), *args, cutlass.Int32(16), current_cuda_stream()
     )
     results = []
     for m in [1, 2, 6, 16, 1]:
@@ -99,6 +100,7 @@ def test_v41_fused_slice(width):
             json.dumps(
                 dict(
                     width=width,
+                    intermediate=n,
                     rows=m,
                     rel_l2=rel,
                     cosine=cos,
