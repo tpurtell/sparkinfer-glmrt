@@ -5933,6 +5933,16 @@ def compile_dense_gemm_mxfp8_aot(
     # Match the grouped WO-A schedule, with all live row counts passed to
     # the exported launch at runtime. Group count is static model geometry.
     mma_tiler_mn = plan.mma_tiler_mn
+    # Native V4.1 query-A/KV expose only 20/8 output CTAs on the 188-SM
+    # coordinator. Four FP32 partial planes shorten the K loop without
+    # changing the K32 activation/weight contract. Capacity, not live M,
+    # selects this recipe; larger reservations and other devices stay intact.
+    narrow_v41_split = (
+        sm_count == 188 and num_groups == 1 and regime_m in (1, 16)
+        and size_k == 5120 and size_n in (512, 1280)
+    )
+    if narrow_v41_split:
+        mma_tiler_mn = (16, 64)
     if num_groups > 1 and size_n <= 1536:
         if 1 <= regime_m <= 8:
             mma_tiler_mn = (16, 64)
@@ -5954,6 +5964,8 @@ def compile_dense_gemm_mxfp8_aot(
         sm_count=sm_count,
         expected_m=regime_m,
     )
+    if narrow_v41_split:
+        policy = replace(policy, split_k_slices=4, split_k_atomic_bf16=False)
     if policy.split_k_slices != 1 and not return_split_k_metadata:
         raise ValueError(
             "MXFP8 AOT standalone export does not support split-K: "
