@@ -2476,6 +2476,12 @@ class DenseGemmKernel:
                                 packed_b_lookahead_state.advance()
 
                         if k_block_idx == num_k_blocks - 1:
+                            # Finish generic shared-memory operand reads before
+                            # TMA may overwrite this stage through the async
+                            # proxy. Warp/named barriers alone do not provide
+                            # this proxy ordering; concurrent traffic exposed
+                            # last-block fragments from the next ring reuse.
+                            cute.arch.fence_view_async_shared()
                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
                             mainloop_consumer_state.advance()
 
@@ -2670,6 +2676,7 @@ class DenseGemmKernel:
                     )
 
                     if k_block_idx == num_k_blocks - 1:
+                        cute.arch.fence_view_async_shared()
                         mainloop_pipeline.consumer_release(mainloop_consumer_state)
                         mainloop_consumer_state.advance()
 
