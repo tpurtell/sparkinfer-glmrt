@@ -429,7 +429,10 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
     )
     logical_n = plan.n
     n = logical_n
-    n64_repacked = bool(prepared_w4a8 and caps.weight_plan.source_format == "fp4_e8m0_k32" and int(n) % 128 == 64)
+    n64_repacked = bool(
+        prepared_w4a8 and caps.weight_plan.source_format == "fp4_e8m0_k32"
+        and caps.weight_plan.activation != "silu_v41" and int(n) % 128 == 64
+    )
     if prepared_w4a8 and int(n) % 128 != 0 and not n64_repacked:
         n = _impl._dynamic_kernel_intermediate_size(n, quant_mode)
     tile_m = plan.execution.tile_m

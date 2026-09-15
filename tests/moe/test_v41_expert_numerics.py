@@ -137,7 +137,7 @@ def _check_v41_native_expert_routing_and_graph(m, n, experts, after_graph_check=
         assert torch.cuda.memory_allocated() == before
         check(result, expected_changed)
         if m == 1 and n == 576 and experts == 384:
-            config = binding.execution_plan.policy_resolution.config
+            config = binding.execution_plan.decode_config
             expected_mode = "direct" if torch.cuda.get_device_capability() == (12, 1) else "grouped"
             assert config.dynamic_route_mode == expected_mode
             saved_ids = ids.clone()

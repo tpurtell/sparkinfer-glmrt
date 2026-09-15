@@ -2784,6 +2784,7 @@ def _heuristic_moe_decode_config(
         compact_n64_pipeline = bool(
             query.quant_mode == "w4a8_mx"
             and query.source_format == "fp4_e8m0_k32"
+            and query.activation != "silu_v41"
             and query.intermediate_size % 128 == 64
         )
         if compact_n64_pipeline:
@@ -6903,7 +6904,8 @@ def prepare_b12x_fp4_moe_weights(
             params_dtype=params_dtype,
             source_format=plan.source_format,
             w13_layout=plan.w13_layout,
-            n64_repack=plan.intermediate_size % 128 == 64,
+            # Native V4.1 keeps its padded, fused per-route reduction ABI.
+            n64_repack=plan.activation != "silu_v41" and plan.intermediate_size % 128 == 64,
         )
         representation = _PreparedWeightRepresentation(
             quant_mode="w4a8_mx",
