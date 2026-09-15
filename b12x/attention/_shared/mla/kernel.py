@@ -738,6 +738,7 @@ class UnifiedDecodeKernel:
         # aligned planes, live-row bounds and disjoint caller-owned scratch.
         assert self.native_dsv41_fp8 and self.valid_hpb == 16
         assert self.topk == 128 and self.extra_topk == 512
+        assert self.chunks_per_split == 1 and self.num_splits == 10
         assert self.swa_indices_stride_row == self.extra_indices_stride_row
         self.kernel_native_v41(q, descriptors, metadata, selected, bounds,
                                mid_out, mid_lse, sm_scale_log2).launch(
@@ -925,6 +926,16 @@ class UnifiedDecodeKernel:
             valid_request = native_v41_metadata_valid(
                 native_descriptors[token_idx, None], native_metadata[token_idx, None],
                 native_bounds[token_idx])
+            # One native split is one 64-key tile. Every warp checks both
+            # halves, so the decision is CTA-uniform without a shared barrier.
+            # Empty compressed tiles need no KV loads, quantization or MMA.
+            if valid_request and split_idx >= Int32(2):
+                first = (split_idx - Int32(2)) * Int32(64) + lane
+                id0 = extra_indices[token_idx, first]
+                id1 = extra_indices[token_idx, first + Int32(32)]
+                causal = Int64(native_metadata[token_idx, 5])
+                live = ((id0 >= Int32(0)) & (Int64(id0) < causal)) | ((id1 >= Int32(0)) & (Int64(id1) < causal))
+                valid_request = cute.arch.vote_ballot_sync(live) != Uint32(0)
             if not valid_request:
                 if tid < Int32(self.valid_hpb):
                     mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
