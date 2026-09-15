@@ -138,7 +138,7 @@ def issue_native_v41_gather(
             index, tag = key, Uint32(1 if swa else 0)
             if not valid:
                 index, tag = Int32(-1), Uint32(2)
-                value = descriptor[0]
+                value = Uint64(descriptor[0])
             token_indices[entry] = index
             row_addr = kv_addr + entry * Int32(kv_stride)
             st_shared_u32(row_addr + Int32(528), tag)
