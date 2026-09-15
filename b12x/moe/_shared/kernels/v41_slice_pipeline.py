@@ -145,7 +145,7 @@ class V41DraftSlicePipeline:
         # 160 K32 groups / row, 8 groups / warp, 8 warps / CTA.
         grid = min(max(1, (rows * 20 + 7) // 8), self.sm_count * 4)
         self.quant(source.iterator, x.iterator, xs.iterator, xs.iterator,
-                   rows, grid, stream)
+                   rows, Int32(5120), grid, stream)
         self.pipeline(x, xs, w13, s13, w2, s2, ids, routing, live, packed,
                       counts, prefixes, metadata, grouped, inverse, partial,
                       output, rows, stream)
