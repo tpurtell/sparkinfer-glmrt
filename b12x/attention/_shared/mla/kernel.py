@@ -930,12 +930,15 @@ class UnifiedDecodeKernel:
             # halves, so the decision is CTA-uniform without a shared barrier.
             # Empty compressed tiles need no KV loads, quantization or MMA.
             if valid_request and split_idx >= Int32(2):
-                first = (split_idx - Int32(2)) * Int32(64) + lane
-                id0 = extra_indices[token_idx, first]
-                id1 = extra_indices[token_idx, first + Int32(32)]
+                tile_start = (split_idx - Int32(2)) * Int32(64)
+                first_id = extra_indices[token_idx, tile_start]
                 causal = Int64(native_metadata[token_idx, 5])
-                live = ((id0 >= Int32(0)) & (Int64(id0) < causal)) | ((id1 >= Int32(0)) & (Int64(id1) < causal))
-                valid_request = cute.arch.vote_ballot_sync(live) != Uint32(0)
+                if first_id < Int32(0) or Int64(first_id) >= causal:
+                    first = tile_start + lane
+                    id0 = extra_indices[token_idx, first]
+                    id1 = extra_indices[token_idx, first + Int32(32)]
+                    live = ((id0 >= Int32(0)) & (Int64(id0) < causal)) | ((id1 >= Int32(0)) & (Int64(id1) < causal))
+                    valid_request = cute.arch.vote_ballot_sync(live) != Uint32(0)
             if not valid_request:
                 if tid < Int32(self.valid_hpb):
                     mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
