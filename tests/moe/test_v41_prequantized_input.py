@@ -4,6 +4,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
+from b12x._lib.compile_plan import attach_programs
 from b12x.moe.fused_moe import _impl as moe
 from tests.moe.test_v41_expert_numerics import _check_v41_native_expert_routing_and_graph
 
@@ -27,7 +28,7 @@ def test_prequantized_native_input(m, monkeypatch):
                 pointer = make_ptr(cutlass.Uint8, wire.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
                 return candidate(pointer, *launch[1:])
             return baseline(*launch)
-        return run, mac
+        return attach_programs(run, baseline, candidate), mac
 
     monkeypatch.setattr(moe, "_get_dynamic_kernel", get)
 
