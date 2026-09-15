@@ -7,10 +7,11 @@ import pytest
 import torch
 
 from b12x.attention import qsa
-from b12x.attention.qsa._sparse_gqa import launch_sparse_paged_gqa
-from b12x.attention.qsa import _sparse_gqa_cute_config as cute_config
+from b12x.attention.qsa import _contract as qsa_contract
 from b12x.attention.qsa import _sparse_gqa as sparse_gqa
+from b12x.attention.qsa import _sparse_gqa_cute_config as cute_config
 from b12x.attention.qsa._contract import _target_splits
+from b12x.attention.qsa._sparse_gqa import launch_sparse_paged_gqa
 
 from ..conftest import require_b12x as require_sm120
 
@@ -69,10 +70,7 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
 ) -> None:
     """Tiling head dimensions cannot change the split-pair reduction tree."""
     from b12x.attention.paged import _selected_forward as implementation
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution,
-        unfreeze_kernel_resolution,
-    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
 
     device = require_sm120()
     torch.manual_seed(20260905)
@@ -107,14 +105,13 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
 
             launch(1, 64)
             warmed = tuple(implementation._MERGE_CACHE.items())
-            freeze_kernel_resolution("cooperative QSA merge live rows/splits")
-            for rows, splits in geometries:
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    launch(rows, splits)
-                graphs[label, rows, splits] = graph
-            assert tuple(implementation._MERGE_CACHE.items()) == warmed
-            unfreeze_kernel_resolution()
+            with kernel_resolution_guard("cooperative QSA merge live rows/splits"):
+                for rows, splits in geometries:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        launch(rows, splits)
+                    graphs[label, rows, splits] = graph
+                assert tuple(implementation._MERGE_CACHE.items()) == warmed
         for rows, splits in geometries:
             partials, lse, output = buffers[rows, splits]
             for _ in range(3):
@@ -142,17 +139,13 @@ def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
                 assert torch.count_nonzero(output[0, 0]) == 0
                 assert torch.count_nonzero(output[:rows, -1]) > 0
     finally:
-        unfreeze_kernel_resolution()
         implementation.clear_caches()
 
 
 @pytest.mark.parametrize("selection_width", [2051, 2054])
 def test_split_prewarm_matches_planned_selection_capacity(selection_width: int) -> None:
     """Warmup must cover both ordinary selection and a three-column MTP tail."""
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution,
-        unfreeze_kernel_resolution,
-    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention.paged import _selected_forward as implementation
 
     device = require_sm120()
@@ -174,52 +167,51 @@ def test_split_prewarm_matches_planned_selection_capacity(selection_width: int) 
         request_ids=requests,
         selection_width=selection_width,
     )
-    freeze_kernel_resolution("planned selected-attention warmup capacity")
-    try:
+    with kernel_resolution_guard('planned selected-attention warmup capacity'):
+        try:
 
-        def launch(rows):
-            implementation.launch_sparse_gqa_split(
-                query=query[:rows],
-                key_cache=keys,
-                value_cache=values,
-                k_descale=None,
-                v_descale=None,
-                block_table=table,
-                request_ids=requests[:rows],
-                selected_positions=selected[:rows],
-                query_positions=positions[:rows],
-                partial_output=partials[:rows],
-                partial_lse=lse[:rows],
-                softmax_scale=1 / 16,
-                splits=16,
-            )
+            def launch(rows):
+                implementation.launch_sparse_gqa_split(
+                    query=query[:rows],
+                    key_cache=keys,
+                    value_cache=values,
+                    k_descale=None,
+                    v_descale=None,
+                    block_table=table,
+                    request_ids=requests[:rows],
+                    selected_positions=selected[:rows],
+                    query_positions=positions[:rows],
+                    partial_output=partials[:rows],
+                    partial_lse=lse[:rows],
+                    softmax_scale=1 / 16,
+                    splits=16,
+                )
 
-        # Compilation does not warm CUDA launch state or write caller storage.
-        launch(1)
-        for rows in (1, 4):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                launch(rows)
-            for _ in range(2):
-                query.normal_()
-                graph.replay()
-                probability = torch.softmax(lse[:rows].double(), dim=1).nan_to_num()
-                actual = (partials[:rows].double() * probability[..., None]).sum(1)
-                scores = (
-                    torch.einsum(
-                        "rhd,nd->rhn", query[:rows].double(), keys[0, :, 0].double()
+            # Compilation does not warm CUDA launch state or write caller storage.
+            launch(1)
+            for rows in (1, 4):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    launch(rows)
+                for _ in range(2):
+                    query.normal_()
+                    graph.replay()
+                    probability = torch.softmax(lse[:rows].double(), dim=1).nan_to_num()
+                    actual = (partials[:rows].double() * probability[..., None]).sum(1)
+                    scores = (
+                        torch.einsum(
+                            "rhd,nd->rhn", query[:rows].double(), keys[0, :, 0].double()
+                        )
+                        / 16
                     )
-                    / 16
-                )
-                expected = torch.einsum(
-                    "rhn,nd->rhd", scores.softmax(-1), values[0, :, 0].double()
-                )
-                torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.004)
-                assert torch.isfinite(actual).all()
-                assert torch.count_nonzero(actual) > 0
-    finally:
-        unfreeze_kernel_resolution()
-        implementation.clear_caches()
+                    expected = torch.einsum(
+                        "rhn,nd->rhd", scores.softmax(-1), values[0, :, 0].double()
+                    )
+                    torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.004)
+                    assert torch.isfinite(actual).all()
+                    assert torch.count_nonzero(actual) > 0
+        finally:
+            implementation.clear_caches()
 
 
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -228,7 +220,7 @@ def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
     kv_dtype: torch.dtype,
     live_counts: tuple[int, int],
 ) -> None:
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention.paged import _selected_forward as implementation
 
     device = require_sm120()
@@ -262,8 +254,7 @@ def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
     launch(live_counts[0])
     warmed = tuple(implementation._KERNEL_CACHE.items())
     warmed_merge = tuple(implementation._MERGE_CACHE.items())
-    freeze_kernel_resolution("QSA fixed selected-position capacity across live rows")
-    try:
+    with kernel_resolution_guard('QSA fixed selected-position capacity across live rows'):
         for rows in live_counts:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -284,8 +275,6 @@ def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
                 assert torch.all(output[:rows] == value)
                 assert tuple(implementation._KERNEL_CACHE.items()) == warmed
                 assert tuple(implementation._MERGE_CACHE.items()) == warmed_merge
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def test_qsa_caps_do_not_gate_architecture_or_tensor_parallel_layout() -> None:
@@ -313,6 +302,34 @@ def test_qsa_caps_do_not_gate_architecture_or_tensor_parallel_layout() -> None:
     with pytest.raises(ValueError, match="q_heads must be divisible by kv_heads"):
         qsa.Caps(**values)
 
+
+@pytest.mark.parametrize(
+    ("q_heads", "kv_heads"),
+    ((24, 1), (48, 3), (64, 4)),
+)
+def test_qsa_plan_hydrates_all_native_divisible_head_layouts(
+    q_heads: int,
+    kv_heads: int,
+) -> None:
+    caps = qsa.Caps(
+        device="cuda:0",
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        max_seq_len=32,
+        num_main_cache_pages=2,
+        num_compressed_cache_pages=2,
+        main_page_size=16,
+        compressed_page_size=4,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=256,
+    )
+    declaration = qsa.plan(caps)
+    declaration.contract.validate_query(declaration.query, None)
+
+    hydrated = qsa_contract._caps_from_query(declaration.query, ordinal=0)
+    assert (hydrated.q_heads, hydrated.kv_heads) == (q_heads, kv_heads)
 
 @pytest.mark.parametrize("page_size", [16, 1504, 3008])
 def test_qsa_caps_accepts_runtime_qwen_page_sizes(
@@ -1393,10 +1410,7 @@ def test_selected_paged_gqa_direct_path_is_cuda_graph_replay_safe(
 def test_sparse_gqa_reuses_direct_binary_across_runtime_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution,
-        unfreeze_kernel_resolution,
-    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention.paged import _selected_forward as selected_impl
 
     device = require_sm120()
@@ -1451,12 +1465,11 @@ def test_sparse_gqa_reuses_direct_binary_across_runtime_rows(
             == 1
         )
 
-        freeze_kernel_resolution("QSA runtime-row cache reuse test")
-        for rows in (128, 1_024):
-            assert torch.count_nonzero(launch(rows)).item() == 0
-            assert tuple(compile_targets) == compiled_after_first_launch
+        with kernel_resolution_guard("QSA runtime-row cache reuse test"):
+            for rows in (128, 1_024):
+                assert torch.count_nonzero(launch(rows)).item() == 0
+                assert tuple(compile_targets) == compiled_after_first_launch
     finally:
-        unfreeze_kernel_resolution()
         selected_impl.clear_caches()
 
 

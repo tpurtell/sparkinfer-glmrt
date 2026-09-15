@@ -1,16 +1,32 @@
 from __future__ import annotations
 
 import math
+from contextlib import ExitStack
+from contextvars import ContextVar
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.sequence import mtp_feedback as mtp
 from b12x.sequence.mtp_feedback import _cute_norm
+from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 
 from ..conftest import require_b12x as require_sm120
+
+
+_case_resources = ContextVar("mtp_case_resources")
+
+
+@pytest.fixture(autouse=True)
+def _prepared_case_lifetime():
+    with ExitStack() as resources:
+        token = _case_resources.set(resources)
+        try:
+            yield
+        finally:
+            _case_resources.reset(token)
 
 
 def _randn(
@@ -41,14 +57,7 @@ def _make_case(
         streams=streams,
         hidden_size=hidden_size,
     )
-    planned = mtp.plan(caps)
-    (scratch_spec,) = planned.scratch_specs()
     tensors = {
-        "scratch": torch.empty(
-            scratch_spec.shape,
-            dtype=scratch_spec.dtype,
-            device=device,
-        ),
         "token_embedding": _randn((max_tokens, hidden_size), device=device, scale=0.4),
         "multi_state": _randn(
             (max_tokens, streams, hidden_size), device=device, scale=0.4
@@ -74,7 +83,23 @@ def _make_case(
             device=device,
         ),
     }
-    binding = mtp.bind(planned, **tensors, tokens=tokens)
+    declaration = mtp.plan(caps, invocation=mtp.invocation_from_tensors(**tensors))
+    original_output = tensors["output"].clone()
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        tensors["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        # Prime the capacity path even when this test's requested live view is empty.
+        full = state.bind(**tensors)
+        return PreparedCall(
+            run=lambda: state.run(full), restore=lambda: tensors["output"].copy_(original_output),
+        )
+
+    resources = _case_resources.get()
+    session = resources.enter_context(PreparationSession(device=device, autotune=False, compile_workers=2))
+    request = declaration.request(name="feedback", prepare_call=prepare_call)
+    resources.enter_context(session.prepare((request,)))
+    binding = mtp.bind(declaration, **tensors, tokens=tokens)
     return binding, tensors
 
 
@@ -163,48 +188,12 @@ def test_state_norm_uses_one_flattened_stream_group() -> None:
     torch.testing.assert_close(per_stream[0, 0], per_stream[0, 1], rtol=0, atol=0)
 
 
-def test_plan_and_bind_expose_only_caller_owned_storage() -> None:
-    device = require_sm120()
-    binding, tensors = _make_case(
-        device=device,
-        max_tokens=4,
-        tokens=2,
-    )
-    planned = binding.plan
-    scratch_start = tensors["scratch"].data_ptr()
-    scratch_end = scratch_start + tensors["scratch"].numel()
-    views = (
-        binding.token_normalized,
-        binding.state_partial_sums,
-        binding.state_normalized,
-        binding.token_path,
-    )
-
-    assert binding.tokens == 2
-    assert planned.output_shape() == (4, 4, 2560)
-    assert planned.output_storage_shape() == (4, 4, 2560)
-    assert planned.output_shape(2) == (2, 4, 2560)
-    assert planned.token_projection_rows == 16
-    assert planned.state_projection_rows == 16
-    assert binding.scratch.data_ptr() == scratch_start
-    assert binding.output.data_ptr() == tensors["output"].data_ptr()
-    assert all(scratch_start <= view.data_ptr() < scratch_end for view in views)
-    assert binding.output.shape == (2, 4, 2560)
-    assert all(
-        offset % 1024 == 0
-        for offset in (
-            planned.token_normalized_offset_bytes,
-            planned.state_partial_sums_offset_bytes,
-            planned.state_normalized_offset_bytes,
-            planned.token_path_offset_bytes,
-        )
-    )
 
 
 def test_bind_rejects_bad_shapes_dtypes_and_mutable_aliases() -> None:
     device = require_sm120()
     binding, tensors = _make_case(device=device, max_tokens=2)
-    planned = binding.plan
+    planned = binding.execution
     bad = dict(tensors)
     bad["token_norm_weight"] = torch.empty((2559,), dtype=torch.bfloat16, device=device)
     with pytest.raises(ValueError, match="token_norm_weight must have shape"):
@@ -257,7 +246,7 @@ def test_zero_tokens_is_a_noop_and_live_count_is_capacity_checked() -> None:
     torch.testing.assert_close(tensors["output"], output_before, rtol=0, atol=0)
     for tokens in (-1, 4):
         with pytest.raises(ValueError, match="tokens="):
-            mtp.bind(binding.plan, **tensors, tokens=tokens)
+            mtp.bind(binding.execution, **tensors, tokens=tokens)
 
 
 @pytest.mark.parametrize(("tokens", "max_tokens"), [(1, 1), (3, 3), (17, 17)])
@@ -273,7 +262,7 @@ def test_target_s4_h2560_geometry_matches_reference(
         hidden_size=2560,
     )
     _parameterize_weights(tensors)
-    binding = mtp.bind(binding.plan, **tensors, tokens=tokens)
+    binding = mtp.bind(binding.execution, **tensors, tokens=tokens)
     expected = _reference(binding)
     actual = mtp.run(binding)
     torch.cuda.synchronize(device)
@@ -336,64 +325,15 @@ def test_cuda_graph_replay_uses_bound_scratch_and_output() -> None:
 
 
 def test_capacity_specialization_is_reused_for_distinct_live_counts_when_frozen() -> None:
-    from b12x.sequence.mtp_feedback._cute_prefill import (
-        get_cached_mtp_prefill_bf16_gemm,
-    )
-
     device = require_sm120()
     one_token, tensors = _make_case(device=device, max_tokens=17, tokens=1)
-    full_capacity = mtp.bind(one_token.plan, **tensors, tokens=17)
-    token_kernel = get_cached_mtp_prefill_bf16_gemm(
-        one_token.plan.token_projection_rows,
-        2560,
-        2560,
-        device=device,
-        streams=4,
-        add_token_path=False,
-    )
-    state_kernel = get_cached_mtp_prefill_bf16_gemm(
-        one_token.plan.state_projection_rows,
-        2560,
-        2560,
-        device=device,
-        streams=4,
-        add_token_path=True,
-    )
-    assert token_kernel is not None
-    assert state_kernel is not None
-    mtp.run(one_token)
-
-    freeze_kernel_resolution("MTP live rows must reuse capacity kernels")
-    try:
-        expected = _reference(full_capacity)
-        actual = mtp.run(full_capacity)
-        torch.cuda.synchronize(device)
-    finally:
-        unfreeze_kernel_resolution()
-
-    assert (
-        get_cached_mtp_prefill_bf16_gemm(
-            one_token.plan.token_projection_rows,
-            2560,
-            2560,
-            device=device,
-            streams=4,
-            add_token_path=False,
-        )
-        is token_kernel
-    )
-    assert (
-        get_cached_mtp_prefill_bf16_gemm(
-            one_token.plan.state_projection_rows,
-            2560,
-            2560,
-            device=device,
-            streams=4,
-            add_token_path=True,
-        )
-        is state_kernel
-    )
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=4e-2)
+    with kernel_resolution_guard("MTP live rows reuse prepared capacity kernels"):
+        for tokens in (1, 17, 0, 3):
+            binding = mtp.bind(one_token.execution, **tensors, tokens=tokens)
+            expected = _reference(binding)
+            actual = mtp.run(binding)
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=4e-2)
 
 
 def test_target_geometry_cuda_graph_replay_uses_bound_storage() -> None:
@@ -406,7 +346,7 @@ def test_target_geometry_cuda_graph_replay_uses_bound_storage() -> None:
         hidden_size=2560,
     )
     _parameterize_weights(tensors)
-    binding = mtp.bind(binding.plan, **tensors, tokens=3)
+    binding = mtp.bind(binding.execution, **tensors, tokens=3)
     mtp.run(binding)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -428,27 +368,6 @@ def test_target_geometry_cuda_graph_replay_uses_bound_storage() -> None:
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=4e-2)
 
 
-def test_target_geometry_surfaces_cute_launch_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from b12x.sequence.mtp_feedback import _kernels
-
-    device = require_sm120()
-    binding, _ = _make_case(
-        device=device,
-        max_tokens=16,
-        tokens=1,
-        streams=4,
-        hidden_size=2560,
-    )
-
-    def fail(*args, **kwargs) -> None:
-        del args, kwargs
-        raise RuntimeError("sentinel CuTe launch failure")
-
-    monkeypatch.setattr(_kernels, "_qwen_cute_projections", fail)
-    with pytest.raises(RuntimeError, match="sentinel CuTe launch failure"):
-        mtp.run(binding)
 
 
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty.*:UserWarning")
@@ -532,12 +451,9 @@ def test_standalone_cute_norm_reuses_binaries_across_live_token_counts_when_froz
         assert compiled_after_first_launch.count("_TokenNorm") == 1
         assert compiled_after_first_launch.count("_StateNorm") == 1
 
-        freeze_kernel_resolution("MTP normalization live-token cache reuse test")
-        try:
+        with kernel_resolution_guard('MTP normalization live-token cache reuse test'):
             launch(17)
             assert tuple(compile_targets) == compiled_after_first_launch
-        finally:
-            unfreeze_kernel_resolution()
     finally:
         _cute_norm.clear_caches()
 
@@ -684,7 +600,7 @@ def test_target_torch_compile_accepts_parameter_weights() -> None:
         hidden_size=2560,
     )
     _parameterize_weights(tensors)
-    binding = mtp.bind(binding.plan, **tensors, tokens=1)
+    binding = mtp.bind(binding.execution, **tensors, tokens=1)
 
     def launch() -> torch.Tensor:
         return mtp.run(binding)

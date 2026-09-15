@@ -20,6 +20,7 @@ from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from b12x._lib.compiler import b12x_package_fingerprint
 from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
 from b12x.quantization.nvfp4._impl import allocate_bf16_to_fp4_tma_outputs, compile_bf16_to_fp4_tma
+from b12x.quantization.nvfp4._tuning import TUNING, Nvfp4QuantizationQuery
 
 
 def _parse_args() -> argparse.Namespace:
@@ -114,7 +115,7 @@ def main() -> None:
     if rows_padded != m:
         inp[:m].copy_(bf16)
     out = allocate_bf16_to_fp4_tma_outputs(m, k, device=dev)
-    compiled = compile_bf16_to_fp4_tma(rows_padded, k)
+    compiled = compile_bf16_to_fp4_tma(rows_padded, k, liveness_strategy=TUNING.default_config(Nvfp4QuantizationQuery(dtype="bfloat16", rows=rows_padded, columns=k), None).liveness_strategy)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
     l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)
     flush_desc = f"on ({l2_flush_bytes / (1 << 20):.1f} MiB per launch)" if l2_flush else "off"

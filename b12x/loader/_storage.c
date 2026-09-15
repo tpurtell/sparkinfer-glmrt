@@ -18,7 +18,7 @@
 typedef char require_64_bit_offsets[(sizeof(off_t) == 8 && sizeof(size_t) == 8) ? 1 : -1];
 
 enum storage_kind {
-    SYSTEM, PINNED, PINNED_WC, REGISTERED, MANAGED, FILE_MAPPING
+    SYSTEM, PINNED, PINNED_WC, REGISTERED, MANAGED, FILE_MAPPING, DEVICE
 };
 
 typedef struct {
@@ -81,7 +81,7 @@ static void release_storage(storage_t *storage) {
         if (storage->registered) cudaHostUnregister(storage->base);
         if (storage->kind == PINNED || storage->kind == PINNED_WC)
             cudaFreeHost(storage->base);
-        else if (storage->kind == MANAGED)
+        else if (storage->kind == MANAGED || storage->kind == DEVICE)
             cudaFree(storage->base);
         else
             munmap(storage->base, storage->extent);
@@ -101,6 +101,7 @@ static bool parse_kind(const char *name, enum storage_kind *kind, failure_t *fai
     } kinds[] = {
         {"system", SYSTEM}, {"pinned", PINNED}, {"pinned_wc", PINNED_WC},
         {"registered", REGISTERED}, {"managed", MANAGED}, {"file", FILE_MAPPING},
+        {"device", DEVICE},
     };
     for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
         if (strcmp(name, kinds[i].name) == 0) {
@@ -133,6 +134,10 @@ static storage_t *read_storage(int fd, int64_t offset, int64_t bytes,
         return NULL;
     }
     if (!parse_kind(name, &kind, failure)) return NULL;
+    if (kind == DEVICE && fd >= 0) {
+        snprintf(failure->message, sizeof(failure->message), "device storage requires the GDS checkpoint transport");
+        return NULL;
+    }
     if (!cuda_ok(cudaGetDevice(&previous), "cudaGetDevice", failure)) return NULL;
     if (!cuda_ok(cudaSetDevice(device), "cudaSetDevice", failure)) goto done;
     if ((kind == SYSTEM || kind == FILE_MAPPING) &&
@@ -172,6 +177,9 @@ static storage_t *read_storage(int fd, int64_t offset, int64_t bytes,
         if (!cuda_ok(cudaHostAlloc(&storage->base, length, flags), "cudaHostAlloc", failure)) goto done;
         if (!cuda_ok(cudaHostGetDevicePointer(&storage->gpu, storage->base, 0),
                      "cudaHostGetDevicePointer", failure)) goto done;
+    } else if (kind == DEVICE) {
+        if (!cuda_ok(cudaMalloc(&storage->base, length), "cudaMalloc device weights", failure)) goto done;
+        storage->gpu = storage->base;
     } else if (kind == MANAGED) {
         if (!cuda_ok(cudaMallocManaged(&storage->base, length, cudaMemAttachGlobal),
                      "cudaMallocManaged", failure)) goto done;
@@ -352,6 +360,7 @@ static PyMethodDef methods[] = {
     {"keep_allocator", py_keep_allocator, METH_O, NULL},
     {"pool_copy", py_pool_copy, METH_VARARGS, NULL},
     {"pool_contains", py_pool_contains, METH_VARARGS, NULL},
+    {"pool_api", py_pool_api, METH_NOARGS, NULL},
     {"read", py_read, METH_VARARGS, NULL},
     {"capabilities", py_capabilities, METH_VARARGS, NULL},
     {"storage_stats", py_stats, METH_NOARGS, NULL},

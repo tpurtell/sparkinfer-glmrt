@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
+
 import torch
 
 from b12x._lib.smem import make_tma_aligned_payload_storage
 
 from .planner import PagedPlan
+from ._controls import paged_control
 
 _FP8_KV_DTYPE = torch.float8_e4m3fn
+
 _BF16_EXTEND_LOW_SM_MAX_SMS = 64
 _BF16_EXTEND_WIDE_TILE_MIN_NARROW_ITERS_PER_LOST_CTA = 704
 _BF16_EXTEND_HIGH_SM_MIN_NARROW_ITERS = 3
@@ -441,7 +443,7 @@ def select_paged_forward_traits_from_plan(
         )
     elif (
         plan.mode == "decode"
-        and os.environ.get("B12X_PAGED_GQA6_COMPACT_SYNC", "1") != "0"
+        and paged_control("B12X_PAGED_GQA6_COMPACT_SYNC", "1") != "0"
         and device_capability[0] >= 12
         and plan.enable_cuda_graph
         and plan.split_kv
@@ -464,7 +466,7 @@ def select_paged_forward_traits_from_plan(
             device_capability == (12, 0)
             and plan.page_size == 128
             and plan.head_dim_qk == 128
-            and os.environ.get("B12X_PAGED_LAGUNA_DECODE_N128", "0") == "1"
+            and paged_control("B12X_PAGED_LAGUNA_DECODE_N128", "0") == "1"
         ):
             exact_num_mma_kv = 2
         compact_sync_rows = plan.gqa_group_size
@@ -522,10 +524,10 @@ def select_paged_forward_traits_from_plan(
         compact_sync_rows=compact_sync_rows,
     )
     force_wide_bf16_extend = (
-        os.environ.get("B12X_PAGED_EXTEND_BF16_N32", "0") == "1"
+        paged_control("B12X_PAGED_EXTEND_BF16_N32", "0") == "1"
     )
     force_narrow_bf16_extend = (
-        os.environ.get("B12X_PAGED_EXTEND_BF16_N16", "0") == "1"
+        paged_control("B12X_PAGED_EXTEND_BF16_N16", "0") == "1"
     )
     wide_bf16_extend_family = (
         exact_num_mma_kv is None

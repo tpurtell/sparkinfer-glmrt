@@ -1,4 +1,4 @@
-"""Capacity planning, binding, and validation for GDN decode."""
+"""Capacity planning and binding for GDN decode."""
 
 from __future__ import annotations
 
@@ -9,23 +9,17 @@ from typing import Literal
 
 import torch
 
-from b12x.policy import PolicyContext, PolicyResolution, get_auto_policy
+from b12x.preparation import Plan
+from b12x.preparation.types import require_prepared
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.scratch_layout import (
-    SCRATCH_ALIGN_BYTES,
-    align_up,
-    dtype_nbytes,
-    materialize_scratch_view,
-)
-from ._policy import GDN_POLICY, GdnConfig, GdnQuery
+from ._tuning import GdnConfig
 
 
 GateActivation = Literal["silu", "sigmoid"]
-KdaMetadataValidation = Literal["transactional", "trusted"]
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -40,10 +34,6 @@ def _positive(name: str, value: int) -> int:
     if result <= 0:
         raise ValueError(f"{name} must be positive, got {result}")
     return result
-
-
-def _next_power_of_two(value: int) -> int:
-    return 1 << (int(value) - 1).bit_length()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -64,7 +54,6 @@ class Caps:
     gate_activation: GateActivation = "silu"
     qk_l2norm: bool = True
     null_state_index: int | None = None
-    kda_metadata_validation: KdaMetadataValidation = "transactional"
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -109,11 +98,6 @@ class Caps:
                 "gate_activation must be 'silu' or 'sigmoid', got "
                 f"{self.gate_activation!r}"
             )
-        if self.kda_metadata_validation not in ("transactional", "trusted"):
-            raise ValueError(
-                "kda_metadata_validation must be 'transactional' or 'trusted', got "
-                f"{self.kda_metadata_validation!r}"
-            )
         null_state_index = self.null_state_index
         if null_state_index is not None:
             if isinstance(null_state_index, bool):
@@ -141,20 +125,16 @@ class Caps:
 
 
 @dataclass(frozen=True)
-class Plan:
-    """Fixed GDN launch policy and caller-allocated scratch contract."""
+class _GdnLayout:
+    """Immutable GDN geometry and caller-allocated scratch contract."""
 
     caps: Caps
-    duplicate_table_size: int
-    duplicate_table_offset_bytes: int
-    error_code_offset_bytes: int
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     config: GdnConfig
     recurrent_block_k: int = 128
     recurrent_num_warps: int = 1
     norm_block: int = 128
     norm_num_warps: int = 4
-    policy_resolution: PolicyResolution[GdnConfig] | None = None
 
     @property
     def recurrent_block_v(self) -> int:
@@ -174,22 +154,18 @@ class Plan:
             )
         return (live_tokens, self.caps.value_heads, self.caps.value_head_dim)
 
-    def bind(self, **kwargs) -> "Binding":
-        return bind(self, **kwargs)
 
 
 @dataclass(frozen=True)
 class Binding:
-    """Caller-owned GDN inputs, recurrent state, output, and scratch views.
+    """Caller-owned GDN inputs, recurrent state, output, and scratch.
 
-    ``recurrent_state`` is updated transactionally. All projection and norm
-    tensors are read-only; ``output`` is the caller-owned result buffer.
+    ``recurrent_state`` is updated in place. All projection and norm tensors
+    are read-only; ``output`` is the caller-owned result buffer.
     """
 
-    plan: Plan
+    _state: _GdnLayout
     scratch: torch.Tensor
-    duplicate_slots: torch.Tensor
-    error_code: torch.Tensor
     mixed_qkv: torch.Tensor
     a: torch.Tensor
     b: torch.Tensor
@@ -204,6 +180,7 @@ class Binding:
     num_seqs: torch.Tensor
     num_tokens: torch.Tensor
     output: torch.Tensor
+    plan: Plan | None = None
 
 
 @dataclass(frozen=True)
@@ -214,10 +191,8 @@ class KdaBinding:
     ``raw_beta`` is the unactivated scalar update gate for each head.
     """
 
-    plan: Plan
+    _state: _GdnLayout
     scratch: torch.Tensor
-    duplicate_slots: torch.Tensor
-    error_code: torch.Tensor
     mixed_qkv: torch.Tensor
     raw_g: torch.Tensor
     raw_beta: torch.Tensor
@@ -232,67 +207,26 @@ class KdaBinding:
     num_seqs: torch.Tensor
     num_tokens: torch.Tensor
     output: torch.Tensor
+    plan: Plan | None = None
 
 
-def _materialize_plan(
-    caps: Caps,
-    *,
-    config: GdnConfig | None = None,
-    policy_resolution: PolicyResolution[GdnConfig] | None,
-) -> Plan:
-    if config is None:
-        config = GdnConfig(
-            backend="triton" if caps.key_heads == caps.value_heads else "cutedsl",
-            recurrent_block_v=32,
-        )
-    error_code_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
-    cursor = error_code_offset_bytes + dtype_nbytes(torch.int32)
-    duplicate_table_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
-    duplicate_table_size = _next_power_of_two(
-        2 * caps.max_seqs * caps.state_index_columns
-    )
-    cursor = duplicate_table_offset_bytes + (
-        duplicate_table_size * dtype_nbytes(torch.int64)
-    )
-    spec = scratch_buffer_spec("gdn_decode", nbytes=cursor, device=caps.device)
-    return Plan(
-        caps=caps,
-        duplicate_table_size=duplicate_table_size,
-        duplicate_table_offset_bytes=duplicate_table_offset_bytes,
-        error_code_offset_bytes=error_code_offset_bytes,
-        _scratch_specs=(spec,),
-        config=config,
-        policy_resolution=policy_resolution,
-    )
+def _scratch_layout(caps: Caps, *, config: GdnConfig) -> _GdnLayout:
+    # No kernel of the family writes scratch; the buffer is the plan's
+    # caller-owned workspace contract at its minimum size.
+    spec = scratch_buffer_spec("gdn_decode", nbytes=0, device=caps.device)
+    return _GdnLayout(caps=caps, _scratch_specs=(spec,), config=config)
 
 
-def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
-    """Plan GDN decode for a fixed serving capacity and state layout."""
+def bind(plan: Plan, **kwargs) -> Binding:
+    """Bind caller tensors to a fully prepared GDN plan."""
+    state = require_prepared(plan, "attention.gdn")
+    return state.bind(_plan=plan, **kwargs)
 
-    if not isinstance(caps, Caps):
-        raise TypeError(f"caps must be Caps, got {type(caps)!r}")
-    policy = policy or get_auto_policy(caps.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(caps.device)
-    resolution = policy.resolve(
-        GDN_POLICY,
-        GdnQuery(
-            gate_activation=caps.gate_activation,
-            qk_l2norm=caps.qk_l2norm,
-            state_dtype=str(caps.state_dtype).removeprefix("torch."),
-            key_heads=caps.key_heads,
-            value_heads=caps.value_heads,
-            max_seqs=caps.max_seqs,
-            max_tokens=caps.max_tokens,
-            state_index_columns=caps.state_index_columns,
-        ),
-    )
-    return _materialize_plan(
-        caps,
-        config=resolution.config,
-        policy_resolution=resolution,
-    )
+
+def bind_kda(plan: Plan, **kwargs) -> KdaBinding:
+    """Bind caller tensors to a fully prepared KDA plan."""
+    state = require_prepared(plan, "attention.gdn")
+    return state.bind_kda(_plan=plan, **kwargs)
 
 
 def _require_tensor(
@@ -404,9 +338,10 @@ def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
     return left_start < right_end and right_start < left_end
 
 
-def bind(
-    plan: Plan,
+def _bind(
+    plan: _GdnLayout,
     *,
+    _plan: Plan | None = None,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -438,22 +373,10 @@ def bind(
     not overlap. All live tensors for one invocation must be bound together
     before :func:`run`.
     """
-    if not isinstance(plan, Plan):
-        raise TypeError(f"plan must be Plan, got {type(plan)!r}")
+    if not isinstance(plan, _GdnLayout):
+        raise TypeError("GDN binding requires its materialized scratch layout")
     caps = plan.caps
     scratch_storage = scratch_tensor(scratch, plan.scratch_specs(), owner="GDN decode")
-    error_code, _ = materialize_scratch_view(
-        scratch_storage,
-        offset_bytes=plan.error_code_offset_bytes,
-        shape=(1,),
-        dtype=torch.int32,
-    )
-    duplicate_slots, _ = materialize_scratch_view(
-        scratch_storage,
-        offset_bytes=plan.duplicate_table_offset_bytes,
-        shape=(plan.duplicate_table_size,),
-        dtype=torch.int64,
-    )
     model = (caps.model_dtype,)
     parameter = (torch.bfloat16, torch.float32)
     if mixed_qkv.ndim != 2:
@@ -609,10 +532,9 @@ def bind(
                     f"tensor {right_name}"
                 )
     return Binding(
-        plan=plan,
+        _state=plan,
+        plan=_plan,
         scratch=scratch_storage,
-        duplicate_slots=duplicate_slots,
-        error_code=error_code,
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
@@ -630,9 +552,10 @@ def bind(
     )
 
 
-def bind_kda(
-    plan: Plan,
+def _bind_kda(
+    plan: _GdnLayout,
     *,
+    _plan: Plan | None = None,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     mixed_qkv: torch.Tensor,
     raw_g: torch.Tensor,
@@ -656,8 +579,8 @@ def bind_kda(
     All live tensors for one invocation must be bound together before
     :func:`run_kda`; binding neither copies nor stages their contents.
     """
-    if not isinstance(plan, Plan):
-        raise TypeError(f"plan must be Plan, got {type(plan)!r}")
+    if not isinstance(plan, _GdnLayout):
+        raise TypeError("KDA binding requires its materialized scratch layout")
     caps = plan.caps
     if caps.key_heads != caps.value_heads:
         raise ValueError(
@@ -671,18 +594,6 @@ def bind_kda(
         )
 
     scratch_storage = scratch_tensor(scratch, plan.scratch_specs(), owner="KDA decode")
-    error_code, _ = materialize_scratch_view(
-        scratch_storage,
-        offset_bytes=plan.error_code_offset_bytes,
-        shape=(1,),
-        dtype=torch.int32,
-    )
-    duplicate_slots, _ = materialize_scratch_view(
-        scratch_storage,
-        offset_bytes=plan.duplicate_table_offset_bytes,
-        shape=(plan.duplicate_table_size,),
-        dtype=torch.int64,
-    )
     model = (caps.model_dtype,)
     parameter = (torch.bfloat16, torch.float32)
     if mixed_qkv.ndim != 2:
@@ -851,10 +762,9 @@ def bind_kda(
                     f"tensor {right_name}"
                 )
     return KdaBinding(
-        plan=plan,
+        _state=plan,
+        plan=_plan,
         scratch=scratch_storage,
-        duplicate_slots=duplicate_slots,
-        error_code=error_code,
         mixed_qkv=mixed_qkv,
         raw_g=raw_g,
         raw_beta=raw_beta,
@@ -887,16 +797,17 @@ def run(
     state-index column. A one-column plan with one token per request is ordinary
     decode.
 
-    Device-side metadata validation is transactional. Invalid counts, sequence
-    bounds, accepted-token counts, state slots, or duplicate active state-index
-    cells poison the complete output with NaNs and leave recurrent state
-    untouched. If configured, null state cells are excluded from state access
-    and duplicate validation; a null initial checkpoint zeroes that request's
-    output. Capacity rows beyond ``num_tokens`` are zeroed.
+    Packed metadata is trusted: counts, sequence bounds, accepted-token counts,
+    and state slots must be valid, and active state-index cells must be unique.
+    If configured, a null initial checkpoint zeroes that request's output
+    without reading recurrent state, and null destination cells are not
+    written. Capacity rows beyond ``num_tokens`` are zeroed.
     """
     if not isinstance(binding, Binding):
         raise TypeError(f"binding must be Binding, got {type(binding)!r}")
-    caps = binding.plan.caps
+    if binding.plan is None:
+        raise TypeError("GDN run requires a session-prepared binding")
+    caps = binding._state.caps
     eps_value = float(eps)
     if not math.isfinite(eps_value) or eps_value <= 0.0:
         raise ValueError(f"eps must be finite and positive, got {eps_value}")
@@ -920,28 +831,10 @@ def run(
         binding.num_seqs,
         binding.num_tokens,
         binding.output,
-        binding.duplicate_slots,
-        binding.error_code,
         eps=eps_value,
         scale=scale_value,
-        max_tokens=caps.max_tokens,
-        max_seqs=caps.max_seqs,
-        state_index_columns=caps.state_index_columns,
-        max_state_slots=caps.max_state_slots,
-        key_heads=caps.key_heads,
-        value_heads=caps.value_heads,
-        key_head_dim=caps.key_head_dim,
-        value_head_dim=caps.value_head_dim,
-        gate_activation=caps.gate_activation,
-        decay_recipe="qwen",
         lower_bound=0.0,
-        qk_l2norm=caps.qk_l2norm,
-        null_state_index=caps.null_state_index,
-        block_v=binding.plan.recurrent_block_v,
-        duplicate_table_size=binding.plan.duplicate_table_size,
-        recurrent_num_warps=binding.plan.recurrent_num_warps,
-        norm_num_warps=binding.plan.norm_num_warps,
-        validate_metadata=True,
+        plan=binding.plan,
     )
     return binding.output
 
@@ -964,7 +857,9 @@ def run_kda(
     eps_value = float(eps)
     if not math.isfinite(eps_value) or eps_value <= 0.0:
         raise ValueError(f"eps must be finite and positive, got {eps_value}")
-    caps = binding.plan.caps
+    if binding.plan is None:
+        raise TypeError("KDA run requires a session-prepared binding")
+    caps = binding._state.caps
     scale_value = caps.key_head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(scale_value) or scale_value <= 0.0:
         raise ValueError(f"scale must be finite and positive, got {scale_value}")
@@ -985,28 +880,10 @@ def run_kda(
         binding.num_seqs,
         binding.num_tokens,
         binding.output,
-        binding.duplicate_slots,
-        binding.error_code,
         eps=eps_value,
         scale=scale_value,
-        max_tokens=caps.max_tokens,
-        max_seqs=caps.max_seqs,
-        state_index_columns=caps.state_index_columns,
-        max_state_slots=caps.max_state_slots,
-        key_heads=caps.key_heads,
-        value_heads=caps.value_heads,
-        key_head_dim=caps.key_head_dim,
-        value_head_dim=caps.value_head_dim,
-        gate_activation="sigmoid",
-        decay_recipe="kda",
         lower_bound=lower_bound_value,
-        qk_l2norm=caps.qk_l2norm,
-        null_state_index=caps.null_state_index,
-        block_v=binding.plan.recurrent_block_v,
-        duplicate_table_size=binding.plan.duplicate_table_size,
-        recurrent_num_warps=binding.plan.recurrent_num_warps,
-        norm_num_warps=binding.plan.norm_num_warps,
-        validate_metadata=caps.kda_metadata_validation == "transactional",
+        plan=binding.plan,
     )
     return binding.output
 
@@ -1015,10 +892,8 @@ __all__ = [
     "Binding",
     "Caps",
     "KdaBinding",
-    "Plan",
     "bind",
     "bind_kda",
-    "plan",
     "run",
     "run_kda",
 ]

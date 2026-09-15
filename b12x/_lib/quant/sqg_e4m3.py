@@ -202,14 +202,20 @@ def sqg_xor_cheb_t12_lut_cpu() -> torch.Tensor:
     return result.contiguous()
 
 
-@functools.cache
+_SQG_XOR_CHEB_T12_LUT_DEVICE: dict[tuple[str, int | None], torch.Tensor] = {}
+
+
 def _sqg_xor_cheb_t12_lut_device(
     device_type: str,
     device_index: int | None,
 ) -> torch.Tensor:
-    device = torch.device(device_type, device_index)
-    return sqg_xor_cheb_t12_lut_cpu().to(device=device).contiguous()
-
+    key = (device_type, device_index)
+    cached = _SQG_XOR_CHEB_T12_LUT_DEVICE.get(key)
+    if cached is None:
+        device = torch.device(device_type, device_index)
+        cached = sqg_xor_cheb_t12_lut_cpu().to(device=device).contiguous()
+        _SQG_XOR_CHEB_T12_LUT_DEVICE[key] = cached
+    return cached
 
 def sqg_xor_cheb_t12_lut(device: torch.device | str) -> torch.Tensor:
     """Return the process-lifetime 4 KiB modal T12 staircase."""
@@ -219,6 +225,15 @@ def sqg_xor_cheb_t12_lut(device: torch.device | str) -> torch.Tensor:
     if resolved.type == "cuda" and index is None:
         index = torch.cuda.current_device()
     return _sqg_xor_cheb_t12_lut_device(resolved.type, index)
+
+
+def sqg_xor_cheb_t12_lut_resident(device: torch.device | str) -> torch.Tensor | None:
+    """Return the resident device LUT without materializing a missing entry."""
+    resolved = torch.device(device)
+    index = resolved.index
+    if resolved.type == "cuda" and index is None:
+        index = torch.cuda.current_device()
+    return _SQG_XOR_CHEB_T12_LUT_DEVICE.get((resolved.type, index))
 
 
 @functools.cache
@@ -561,6 +576,7 @@ __all__ = [
     "sqg_cheb_normal_e4m3_state_lut_cpu",
     "sqg_xor_cheb_t12_lut",
     "sqg_xor_cheb_t12_lut_cpu",
+    "sqg_xor_cheb_t12_lut_resident",
     "sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut",
     "sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut_cpu",
 ]

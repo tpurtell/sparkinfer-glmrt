@@ -93,7 +93,7 @@ def _build() -> Path:
         },
     }
     digest = hashlib.sha256(
-        b"".join(p.read_bytes() for p in sorted(source.parent.glob("*.c")))
+        b"".join(p.read_bytes() for p in sorted((*source.parent.glob("*.c"), *source.parent.glob("*.h"))))
         + json.dumps(identity, sort_keys=True).encode()
     ).hexdigest()[:24]
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))

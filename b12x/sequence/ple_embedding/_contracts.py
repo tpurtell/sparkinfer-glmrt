@@ -15,10 +15,14 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
-from b12x.policy import PolicyContext, get_auto_policy
+from b12x.preparation import FrozenMapping, Plan
+from b12x.preparation.types import require_prepared
 from b12x.sequence import ple_hash
 
-from ._policy import PLE_EMBEDDING_POLICY, PleEmbeddingQuery
+from b12x.sequence.ple_hash._contracts import _HashLayout, _materialize_layout as _hash_layout
+from b12x.sequence.ple_hash._tuning import PleHashConfig
+from b12x.sequence.ple_hash.geometry import Geometry, compute_geometry
+from ._tuning import PleEmbeddingConfig
 
 if TYPE_CHECKING:
     from ._disk import DiskTable
@@ -249,8 +253,8 @@ class _ScratchLayout:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Plan:
-    """Hash geometry, TP table shard, storage shapes, and scratch contract.
+class TableLayout:
+    """Host-only TP table geometry, storage shapes, and scratch contract.
 
     ``weight_scale`` and ``weight_scale_2`` retain checkpoint-compatible names.
     For FP8, ``weight_scale`` is the BF16 per-table scale and
@@ -260,9 +264,7 @@ class Plan:
     """
 
     caps: Caps
-    multipliers: torch.Tensor
-    prime_sizes: torch.Tensor
-    table_offsets: torch.Tensor
+    geometry: Geometry
     table_vocab_size: int
     padded_vocab_size: int
     shard_start: int
@@ -277,9 +279,8 @@ class Plan:
     output_dtype: torch.dtype
     _ids_shape: tuple[int, int]
     _layout: _ScratchLayout
-    _hash_plan: ple_hash.Plan
+    _hash_layout: _HashLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
-    policy_resolution: object | None = None
 
     @property
     def head_count(self) -> int:
@@ -300,9 +301,6 @@ class Plan:
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
 
-    def bind(self, **kwargs) -> Binding:
-        return bind(self, **kwargs)
-
     def allocate_storage(self) -> TableStorage:
         """Allocate persistent table tensors according to ``caps.table_memory``."""
         from ._storage import allocate_storage
@@ -314,12 +312,12 @@ class Plan:
 class Binding:
     """Caller-owned fused hash, gather, and inline-dequantization tensors.
 
-    Persistent weights and scales are read-only. ``out`` and ``error_code``
-    are mutable caller-owned buffers; hash IDs and hash scratch remain private
+    Persistent weights and scales are read-only. ``out`` is the mutable
+    caller-owned result buffer; hash IDs and hash scratch remain private
     implementation details.
     """
 
-    plan: Plan
+    _state: TableLayout
     scratch: torch.Tensor
     weight: torch.Tensor | None
     weight_scale: torch.Tensor | None
@@ -330,63 +328,56 @@ class Binding:
     num_seqs: torch.Tensor
     num_tokens: torch.Tensor
     out: torch.Tensor
-    error_code: torch.Tensor
     _ids: torch.Tensor
     _hash_scratch: torch.Tensor
     _hash_binding: ple_hash.Binding
     disk_table: DiskTable | None = None
+    plan: Plan | None = None
 
 
 def plan(
     caps: Caps,
     *,
+    geometry: Geometry | None = None,
     prime_sizes: torch.Tensor | None = None,
     table_offsets: torch.Tensor | None = None,
     multipliers: torch.Tensor | None = None,
-    policy: PolicyContext | None = None,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: PleEmbeddingConfig | None = None,
 ) -> Plan:
-    """Plan hash geometry, TP-local table storage, and caller-owned scratch."""
+    """Declare the plan, retaining the actual checkpoint geometry buffers."""
+    from ._preparation import make_plan
+
     if not isinstance(caps, Caps):
-        raise TypeError(f"caps must be Caps, got {type(caps)!r}")
-    policy = policy or get_auto_policy(caps.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(caps.device)
-    resolution = policy.resolve(
-        PLE_EMBEDDING_POLICY,
-        PleEmbeddingQuery(
-            quant_mode=caps.quant_mode,
-            table_memory=caps.table_memory,
-            output_dtype=str(caps.output_dtype).removeprefix("torch."),
-            max_tokens=caps.max_tokens,
-            max_seqs=caps.max_seqs,
-            vocab_size=caps.vocab_size,
-            max_order=caps.max_order,
-            heads_per_order=caps.heads_per_order,
-            base_table_size=caps.base_table_size,
-            embedding_dim=caps.embedding_dim,
-            tp_size=caps.tp_size,
-        ),
+        raise TypeError("caps must be Caps")
+    return make_plan(
+        caps, geometry=geometry, prime_sizes=prime_sizes, table_offsets=table_offsets,
+        multipliers=multipliers, invocation=invocation, override=override,
     )
-    hash_plan = ple_hash.plan(
-        ple_hash.Caps(
-            device=caps.device,
-            max_tokens=caps.max_tokens,
-            max_seqs=caps.max_seqs,
-            vocab_size=caps.vocab_size,
-            eos_token_id=caps.eos_token_id,
-            max_order=caps.max_order,
-            heads_per_order=caps.heads_per_order,
-            dense_layer_ordinal=caps.dense_layer_ordinal,
-            base_table_size=caps.base_table_size,
-            table_alignment=caps.table_alignment,
-        ),
-        prime_sizes=prime_sizes,
-        table_offsets=table_offsets,
-        multipliers=multipliers,
-        policy=policy,
+
+
+def storage_layout(caps: Caps, *, geometry: Geometry | None = None) -> TableLayout:
+    """Calculate table storage before loading, without device allocation."""
+    if not isinstance(caps, Caps):
+        raise TypeError("caps must be Caps")
+    geometry = compute_geometry(caps) if geometry is None else geometry
+    if not isinstance(geometry, Geometry):
+        raise TypeError("geometry must be host Geometry")
+    validated = compute_geometry(
+        caps, prime_sizes=geometry.prime_sizes, table_offsets=geometry.table_offsets,
+        multipliers=geometry.multipliers,
     )
-    padded_vocab_size = int(hash_plan.padded_vocab_size)
+    if geometry != validated:
+        raise ValueError("inconsistent PLE table geometry")
+    hash_caps = ple_hash.Caps(
+        device=caps.device, max_tokens=caps.max_tokens, max_seqs=caps.max_seqs,
+        vocab_size=caps.vocab_size, eos_token_id=caps.eos_token_id,
+        max_order=caps.max_order, heads_per_order=caps.heads_per_order,
+        dense_layer_ordinal=caps.dense_layer_ordinal, base_table_size=caps.base_table_size,
+        table_alignment=caps.table_alignment,
+    )
+    hash_layout = _hash_layout(hash_caps, geometry, PleHashConfig(backend="triton"))
+    padded_vocab_size = geometry.padded_vocab_size
     if padded_vocab_size % caps.tp_size:
         raise ValueError(
             f"padded_vocab_size={padded_vocab_size} must be divisible by "
@@ -420,7 +411,7 @@ def plan(
         weight_scale_2_shape = (1,)
         weight_scale_2_dtype = torch.float32
 
-    hash_spec = hash_plan.scratch_specs()[0]
+    hash_spec = hash_layout.scratch_specs()[0]
     hash_scratch_offset_bytes = align_up(0, SCRATCH_ALIGN_BYTES)
     cursor = hash_scratch_offset_bytes + hash_spec.nbytes
     ids_offset_bytes = align_up(cursor, SCRATCH_ALIGN_BYTES)
@@ -436,15 +427,10 @@ def plan(
     scratch_spec = scratch_buffer_spec(
         "ple_embedding", nbytes=layout.nbytes, device=caps.device
     )
-    table_vocab_size = int(
-        hash_plan.table_offsets[-1].item() + hash_plan.prime_sizes[-1].item()
-    )
-    return Plan(
+    return TableLayout(
         caps=caps,
-        multipliers=hash_plan.multipliers,
-        prime_sizes=hash_plan.prime_sizes,
-        table_offsets=hash_plan.table_offsets,
-        table_vocab_size=table_vocab_size,
+        geometry=geometry,
+        table_vocab_size=geometry.table_vocab_size,
         padded_vocab_size=padded_vocab_size,
         shard_start=shard_start,
         shard_end=shard_end,
@@ -458,15 +444,21 @@ def plan(
         output_dtype=caps.output_dtype,
         _ids_shape=(caps.max_tokens, caps.head_count),
         _layout=layout,
-        _hash_plan=hash_plan,
+        _hash_layout=hash_layout,
         _scratch_specs=(scratch_spec,),
-        policy_resolution=resolution,
     )
 
 
-def bind(
-    plan: Plan,
+def bind(plan: Plan, **kwargs) -> Binding:
+    state = require_prepared(plan, "sequence.ple_embedding")
+    return state.bind(_plan=plan, **kwargs)
+
+
+def _bind(
+    plan: TableLayout,
     *,
+    _hash_state,
+    _plan: Plan | None = None,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     weight: torch.Tensor | None,
     weight_scale: torch.Tensor | None = None,
@@ -480,8 +472,8 @@ def bind(
     out: torch.Tensor,
 ) -> Binding:
     """Bind fixed-capacity hashing and local lookup tensors without allocating."""
-    if not isinstance(plan, Plan):
-        raise TypeError(f"plan must be Plan, got {type(plan)!r}")
+    if not isinstance(plan, TableLayout):
+        raise TypeError("binding requires a materialized table layout")
     caps = plan.caps
     scratch_storage = scratch_tensor(
         scratch, plan.scratch_specs(), owner="PLE embedding"
@@ -503,8 +495,8 @@ def bind(
     if caps.table_memory == "io_uring":
         from ._disk import DiskTable
 
-        if not isinstance(disk_table, DiskTable) or disk_table.plan is not plan:
-            raise ValueError("disk binding requires DiskTable belonging to this plan")
+        if not isinstance(disk_table, DiskTable) or disk_table.layout != plan:
+            raise ValueError("disk binding requires the declared table layout")
         if weight is not None:
             raise ValueError("disk binding requires weight=None")
         disk_table._require_complete()
@@ -569,7 +561,7 @@ def bind(
         dtype=plan.output_dtype,
         device=caps.device,
     )
-    hash_binding = plan._hash_plan.bind(
+    hash_binding = _hash_state.bind(
         scratch=hash_scratch,
         token_ids=token_ids,
         query_start_loc=query_start_loc,
@@ -584,9 +576,9 @@ def bind(
         ("committed_history", committed_history),
         ("num_seqs", num_seqs),
         ("num_tokens", num_tokens),
-        ("multipliers", plan.multipliers),
-        ("prime_sizes", plan.prime_sizes),
-        ("table_offsets", plan.table_offsets),
+        ("multipliers", hash_binding.geometry.multipliers),
+        ("prime_sizes", hash_binding.geometry.prime_sizes),
+        ("table_offsets", hash_binding.geometry.table_offsets),
     ]
     if weight is not None:
         read_tensors.append(("weight", weight))
@@ -612,7 +604,8 @@ def bind(
     if disk_table is not None:
         disk_table._freeze()
     return Binding(
-        plan=plan,
+        _state=plan,
+        plan=_plan,
         scratch=scratch_storage,
         weight=weight,
         weight_scale=weight_scale,
@@ -623,7 +616,6 @@ def bind(
         num_seqs=num_seqs,
         num_tokens=num_tokens,
         out=out,
-        error_code=hash_binding.error_code,
         _ids=ids,
         _hash_scratch=hash_scratch,
         _hash_binding=hash_binding,
@@ -637,18 +629,19 @@ def run(binding: Binding, *, token_count: int | None = None) -> torch.Tensor:
     The device num_tokens must fit this host launch bound. Rows after the
     bound are untouched. The bound changes grids, not kernel specializations.
     """
-    if binding.plan.caps.device.type != "cuda":
+    if binding._state.caps.device.type != "cuda":
         raise ValueError(
             "PLE embedding GPU run requires CUDA; use the explicit reference oracle"
         )
     from ._kernels import run_pipeline
 
     if token_count is None:
-        token_count = binding.plan.caps.max_tokens
-    if not 0 <= token_count <= binding.plan.caps.max_tokens:
+        token_count = binding._state.caps.max_tokens
+    if not 0 <= token_count <= binding._state.caps.max_tokens:
         raise ValueError("token_count must fit the planned token capacity")
     if binding.disk_table is not None:
-        binding.disk_table._run(binding, token_count=token_count)
+        state = require_prepared(binding.plan, "sequence.ple_embedding")
+        state.run(binding, token_count=token_count)
     else:
         run_pipeline(binding, token_count=token_count)
     return binding.out[:token_count]
@@ -659,6 +652,8 @@ __all__ = [
     "TableMemory",
     "Caps",
     "Plan",
+    "TableLayout",
+    "storage_layout",
     "Binding",
     "plan",
     "bind",

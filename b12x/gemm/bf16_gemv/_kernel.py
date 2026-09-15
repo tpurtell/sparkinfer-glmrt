@@ -8,7 +8,6 @@ types specialize both implementations; live rows and strides never do.
 
 from __future__ import annotations
 
-from threading import RLock
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -19,6 +18,8 @@ from cutlass.cute.nvgpu import warp, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compiler import run_compiled
@@ -33,15 +34,11 @@ from b12x._lib.intrinsics import (
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
-from ._prefill import prefill_mm, supports_prefill
 
 _THREADS = 128
 SMALL_M_MAX = 8  # Rows sharing a weight load, not a live-row support limit.
 _DTYPES = {torch.bfloat16: BFloat16, torch.float32: Float32}
 _NAMES = {torch.bfloat16: "bf16", torch.float32: "fp32"}
-_KERNEL_CACHE: dict[tuple, object] = {}
-_WARMED: set[tuple] = set()
-_LOCK = RLock()
 
 
 def _fadd(a, b):
@@ -95,10 +92,20 @@ def _reduce_store(
 class SmallNGemvKernel:
     """One CTA per output column and fixed tile of up to eight live rows."""
 
-    def __init__(self, n: int, k: int, bf16_operands: bool, has_bias: bool):
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        bf16_operands: bool,
+        has_bias: bool,
+        rows_per_tile: int = SMALL_M_MAX,
+    ):
         self.n, self.k = int(n), int(k)
         self.bf16_operands = bool(bf16_operands)
         self.has_bias = bool(has_bias)
+        if rows_per_tile not in (1, 2, 4, 8):
+            raise ValueError("SIMT projection supports 1, 2, 4, or 8 rows per tile")
+        self.rows_per_tile = int(rows_per_tile)
 
     @cute.jit
     def __call__(
@@ -129,7 +136,11 @@ class SmallNGemvKernel:
             weight_column_stride,
             vector_loads,
         ).launch(
-            grid=(self.n, (rows + Int32(SMALL_M_MAX - 1)) // Int32(SMALL_M_MAX), 1),
+            grid=(
+                self.n,
+                (rows + Int32(self.rows_per_tile - 1)) // Int32(self.rows_per_tile),
+                1,
+            ),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
@@ -152,10 +163,10 @@ class SmallNGemvKernel:
         thread, _, _ = cute.arch.thread_idx()
         column, row_tile, _ = cute.arch.block_idx()
         tid = Int32(thread)
-        first_row = Int64(row_tile) * Int64(SMALL_M_MAX)
+        first_row = Int64(row_tile) * Int64(self.rows_per_tile)
         w_base = Int64(column) * weight_stride
-        acc = cute.make_rmem_tensor((SMALL_M_MAX,), Float32)
-        for r in cutlass.range_constexpr(SMALL_M_MAX):
+        acc = cute.make_rmem_tensor((self.rows_per_tile,), Float32)
+        for r in cutlass.range_constexpr(self.rows_per_tile):
             acc[r] = Float32(0.0)
         if cutlass.const_expr(self.bf16_operands and self.k % 8 == 0):
             if vector_loads != Int32(0):
@@ -165,7 +176,7 @@ class SmallNGemvKernel:
                     w0, w1, w2, w3 = ld_global_v4_u32(
                         get_ptr_as_int64(weight, w_base + offset)
                     )
-                    for r in cutlass.range_constexpr(SMALL_M_MAX):
+                    for r in cutlass.range_constexpr(self.rows_per_tile):
                         row = first_row + Int64(r)
                         if row < Int64(rows):
                             acc[r] = _dot_bf16x8(
@@ -202,7 +213,7 @@ class SmallNGemvKernel:
         reduction = allocator.allocate_tensor(
             Float32, cute.make_layout((1, _THREADS // 32)), byte_alignment=16
         )
-        for r in cutlass.range_constexpr(SMALL_M_MAX):
+        for r in cutlass.range_constexpr(self.rows_per_tile):
             row = first_row + Int64(r)
             if row < Int64(rows):
                 _reduce_store(
@@ -232,7 +243,7 @@ class SmallNGemvKernel:
         index = tid
         while index < Int32(self.k):
             value = Float32(weight[w_base + Int64(index) * weight_column_stride])
-            for r in cutlass.range_constexpr(SMALL_M_MAX):
+            for r in cutlass.range_constexpr(self.rows_per_tile):
                 row = first_row + Int64(r)
                 if row < Int64(rows):
                     acc[r] += (
@@ -475,61 +486,6 @@ class Bf16GemmKernel:
                 )
 
 
-class ProjectionKernel:
-    """One geometry-specialized callable for every live row count."""
-
-    def __init__(self, n: int, k: int, bf16_operands: bool, has_bias: bool):
-        self.simt = SmallNGemvKernel(n, k, bf16_operands, has_bias)
-        self.mma = Bf16GemmKernel(n, k, has_bias)
-        self.has_mma = bf16_operands and n >= 256 and k >= 16
-        n_tiles = (n + 63) // 64
-        self.minimum_mma_rows = (
-            24 if n_tiles >= 64 else ((64 + n_tiles - 1) // n_tiles) * 32
-        )
-
-    @cute.jit
-    def __call__(
-        self,
-        x: cute.Pointer,
-        weight: cute.Pointer,
-        bias: cute.Pointer,
-        output: cute.Pointer,
-        rows: Int32,
-        x_stride: Int64,
-        weight_stride: Int64,
-        output_stride: Int64,
-        x_column_stride: Int64,
-        weight_column_stride: Int64,
-        vector_loads: Int32,
-        warm_all: Int32,
-        stream: cuda.CUstream,
-    ):
-        arguments = (
-            x,
-            weight,
-            bias,
-            output,
-            rows,
-            x_stride,
-            weight_stride,
-            output_stride,
-            x_column_stride,
-            weight_column_stride,
-            vector_loads,
-            stream,
-        )
-        if cutlass.const_expr(self.has_mma):
-            if warm_all == Int32(2):
-                self.simt(*arguments)
-            elif warm_all != Int32(0):
-                self.mma(*arguments)
-                self.simt(*arguments)
-            elif rows >= Int32(self.minimum_mma_rows):
-                self.mma(*arguments)
-            else:
-                self.simt(*arguments)
-        else:
-            self.simt(*arguments)
 
 
 def _pointer(tensor: torch.Tensor):
@@ -541,66 +497,8 @@ def _pointer(tensor: torch.Tensor):
     )
 
 
-def _key(x, weight, out, bias):
-    device = x.device.index
-    if device is None:
-        device = torch.cuda.current_device()
-    return (
-        int(device),
-        int(weight.shape[0]),
-        int(weight.shape[1]),
-        _NAMES[x.dtype],
-        _NAMES[weight.dtype],
-        _NAMES[out.dtype],
-        None if bias is None else _NAMES[bias.dtype],
-    )
 
 
-def _compile(key, x_dtype, weight_dtype, out_dtype, bias_dtype, device):
-    with _LOCK:
-        cached = _KERNEL_CACHE.get(key)
-        if cached is not None:
-            return cached
-        kernel = ProjectionKernel(
-            key[1],
-            key[2],
-            x_dtype == weight_dtype == torch.bfloat16,
-            bias_dtype is not None,
-        )
-        raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
-        types = (
-            x_dtype,
-            weight_dtype,
-            x_dtype if bias_dtype is None else bias_dtype,
-            out_dtype,
-        )
-        pointers = [
-            make_ptr(
-                _DTYPES[dtype], 16, cute.AddressSpace.gmem, assumed_align=dtype.itemsize
-            )
-            for dtype in types
-        ]
-        with torch.cuda.device(device):
-            compiled = b12x_compile(
-                kernel,
-                *pointers,
-                Int32(1),
-                Int64(key[2]),
-                Int64(key[2]),
-                Int64(key[1]),
-                Int64(1),
-                Int64(1),
-                Int32(0),
-                Int32(0),
-                current_cuda_stream(),
-                compile_spec=KernelCompileSpec.from_key(
-                    "gemm.bf16_projection",
-                    1,
-                    key,
-                ),
-            )
-        _KERNEL_CACHE[key] = compiled
-        return compiled
 
 
 def _validate(x, weight, out, bias):
@@ -646,152 +544,47 @@ def _validate(x, weight, out, bias):
             raise ValueError("projection output must not overlap its inputs")
 
 
-def _launch(x, weight, out, bias=None):
-    # The 1024-column projection reaches the general MMA crossover at 128
-    # rows. Keep its qualified FP32 accumulation accuracy through that range.
-    prefill_min_rows = 128 if weight.ndim == 2 and weight.shape[0] == 1024 else 256
-    if (
-        x.ndim == weight.ndim == 2
-        and x.shape[0] >= prefill_min_rows
-        and supports_prefill(x, weight, out, bias)
-    ):
-        _validate(x, weight, out, bias)
-        prefill_mm(x, weight, out)
-        return
-    _launch_projection(x, weight, out, bias)
-
-
-def _launch_scalar(x, weight, out, bias=None):
-    """Invoke the SIMT reference explicitly, regardless of the MMA crossover."""
-    _launch_projection(x, weight, out, bias, force_simt=True)
-
-
-def _launch_projection(x, weight, out, bias=None, *, force_simt=False):
-    _validate(x, weight, out, bias)
-    if x.shape[0] == 0:
-        return
-    key = _key(x, weight, out, bias)
-    with torch.cuda.device(x.device):
-        capturing = torch.cuda.is_current_stream_capturing()
-        with _LOCK:
-            compiled = _KERNEL_CACHE.get(key)
-            warmed = key in _WARMED
-        if capturing and not warmed:
-            raise RuntimeError(
-                "native unquantized projection must be warm-run before CUDA graph capture"
-            )
-        if compiled is None:
-            compiled = _compile(
-                key,
-                x.dtype,
-                weight.dtype,
-                out.dtype,
-                None if bias is None else bias.dtype,
-                x.device,
-            )
-        vector_loads = int(
-            x.data_ptr() % 16 == 0
-            and weight.data_ptr() % 16 == 0
-            and x.stride(0) % 8 == 0
-            and weight.stride(0) % 8 == 0
-            and x.stride(1) == 1
-            and weight.stride(1) == 1
-            and weight.shape[1] % 8 == 0
-        )
-        arguments = (
-            _pointer(x),
-            _pointer(weight),
-            _pointer(x if bias is None else bias),
-            _pointer(out),
-            int(x.shape[0]),
-            int(x.stride(0)),
-            int(weight.stride(0)),
-            int(out.stride(0)),
-            int(x.stride(1)),
-            int(weight.stride(1)),
-            vector_loads,
-            2 if force_simt else 0,
-            current_cuda_stream(),
-        )
-        # The same compiled host program owns both GPU entrypoints. Its row
-        # scalar controls execution without resolving a different callable.
-        if not warmed:
-            warm_arguments = (*arguments[:4], 1, *arguments[5:-2], 1, arguments[-1])
-            run_compiled(compiled, warm_arguments)
-        run_compiled(compiled, arguments)
-        if not capturing:
-            with _LOCK:
-                _WARMED.add(key)
-
-
-@torch.library.custom_op("b12x::bf16_gemv_small_n", mutates_args=())
-def bf16_gemv_small_n(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    dtype = x.dtype if output_dtype is None else output_dtype
-    out = torch.empty((x.shape[0], weight.shape[0]), dtype=dtype, device=x.device)
-    _launch(x, weight, out, bias)
-    return out
-
-
-@bf16_gemv_small_n.register_fake
-def _bf16_gemv_small_n_fake(x, weight, bias=None, output_dtype=None):
-    return x.new_empty(
-        (x.shape[0], weight.shape[0]),
-        dtype=x.dtype if output_dtype is None else output_dtype,
+@program_cache
+def compile_projection(
+    ordinal: int, backend: str, rows_per_tile: int, n: int, k: int,
+    source_dtype: str, weight_dtype: str, output_dtype: str, bias_dtype: str | None,
+):
+    """Compile one selected concrete kernel from immutable operand metadata."""
+    x_type, w_type, y_type = (getattr(torch, name) for name in (
+        source_dtype, weight_dtype, output_dtype,
+    ))
+    kernel = (
+        SmallNGemvKernel(n, k, x_type == w_type == torch.bfloat16,
+                        bias_dtype is not None, rows_per_tile)
+        if backend == "simt" else Bf16GemmKernel(n, k, bias_dtype is not None)
     )
-
-
-@torch.library.custom_op("b12x::bf16_gemv_small_n_out", mutates_args=("out",))
-def bf16_gemv_small_n_out(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> None:
-    _launch(x, weight, out, bias)
-
-
-@bf16_gemv_small_n_out.register_fake
-def _bf16_gemv_small_n_out_fake(x, weight, out, bias=None):
-    return None
-
-
-def precompile_bf16_gemv_small_n(
-    weight: torch.Tensor,
-    log=None,
-    *,
-    input_dtype: torch.dtype = torch.bfloat16,
-    output_dtype: torch.dtype = torch.bfloat16,
-    bias: torch.Tensor | None = None,
-) -> None:
-    """Compile and warm every eligible implementation, independent of live M."""
-    if weight.ndim != 2 or not weight.is_cuda or weight.dtype not in _DTYPES:
-        raise ValueError("precompile requires a CUDA BF16/FP32 weight matrix")
-    if input_dtype not in _DTYPES or output_dtype not in _DTYPES:
-        raise TypeError("projection input/output dtype must be BF16 or FP32")
-    with torch.cuda.device(weight.device):
-        x = torch.zeros((1, weight.shape[1]), dtype=input_dtype, device=weight.device)
-        out = torch.empty(
-            (1, weight.shape[0]), dtype=output_dtype, device=weight.device
+    if backend not in ("simt", "mma"):
+        raise ValueError("projection compiler requires a selected SIMT or MMA backend")
+    types = (x_type, w_type, x_type if bias_dtype is None else getattr(torch, bias_dtype), y_type)
+    key = (ordinal, backend, rows_per_tile if backend == "simt" else None,
+           n, k, source_dtype, weight_dtype, output_dtype, bias_dtype)
+    fake = tuple(make_ptr(_DTYPES[dtype], 16, cute.AddressSpace.gmem,
+                          assumed_align=dtype.itemsize) for dtype in types)
+    with torch.cuda.device(ordinal):
+        raw = b12x_compile(
+            kernel, *fake, Int32(1), Int64(k), Int64(k), Int64(n),
+            Int64(1), Int64(1), Int32(0), current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key("gemm.bf16_projection.selected", 1, key),
         )
-        key = _key(x, weight, out, bias)
-        with _LOCK:
-            scalar_warm = key in _WARMED
-        if not scalar_warm:
-            _launch(x, weight, out, bias)
-        if supports_prefill(x, weight, out, bias):
-            prefill_mm(x, weight, out)
-        torch.cuda.current_stream(weight.device).synchronize()
-    if log is not None:
-        log.debug(
-            "native projection warm: N=%d K=%d %s/%s -> %s",
-            weight.shape[0],
-            weight.shape[1],
-            input_dtype,
-            weight.dtype,
-            output_dtype,
+
+    def run(x, weight, out, bias=None):
+        vector_loads = int(
+            x.data_ptr() % 16 == 0 and weight.data_ptr() % 16 == 0
+            and x.stride(0) % 8 == 0 and weight.stride(0) % 8 == 0
+            and x.stride(1) == 1 and weight.stride(1) == 1 and k % 8 == 0
         )
+        with torch.cuda.device(ordinal):
+            run_compiled(raw, (
+                _pointer(x), _pointer(weight), _pointer(x if bias is None else bias),
+                _pointer(out), Int32(x.shape[0]), Int64(x.stride(0)),
+                Int64(weight.stride(0)), Int64(out.stride(0)),
+                Int64(x.stride(1)), Int64(weight.stride(1)), Int32(vector_loads),
+                current_cuda_stream(),
+            ))
+
+    return attach_programs(run, raw)

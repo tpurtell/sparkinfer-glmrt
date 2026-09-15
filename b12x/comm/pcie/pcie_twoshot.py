@@ -18,8 +18,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation.types import Plan, require_prepared
+
 from ._cuda_ipc import CudaRTLibrary
-from ._twoshot_cute import get_twoshot_launcher, is_twoshot_launcher_prepared
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     IPC_SLAB_ALIGNMENT,
@@ -323,167 +324,52 @@ class PCIeTwoShotSP:
             else torch.cuda.current_device()
         )
 
-    def prepare_graph(
-        self,
-        *,
-        operations: Sequence[str] = ("reduce_scatter", "all_gather"),
-        threads: int = 512,
-    ) -> None:
-        """Compile all requested graph specializations before capture."""
-        if self._closed:
-            raise RuntimeError("PCIeTwoShotSP is closed")
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError("prepare_graph() must be called before CUDA graph capture")
-        threads = int(threads)
-        if threads <= 0 or threads > 512 or threads % 32 != 0:
-            raise ValueError("threads must be a warp-aligned value in [32, 512]")
-        requested = tuple(str(operation) for operation in operations)
-        if not requested or any(
-            operation not in ("reduce_scatter", "all_gather")
-            for operation in requested
-        ):
-            raise ValueError(
-                "operations must contain reduce_scatter and/or all_gather"
-            )
-        device_index = self._device_index()
-        with torch.cuda.device(self.device):
-            for operation in dict.fromkeys(requested):
-                for slot_bias in (0, 1):
-                    get_twoshot_launcher(
-                        operation,
-                        self.world_size,
-                        self.rank,
-                        True,
-                        slot_bias,
-                        threads,
-                        self.row_elems,
-                        device_index,
-                    )
-
     @contextmanager
-    def capture(
-        self,
-        *,
-        operations: Sequence[str] = ("reduce_scatter", "all_gather"),
-        threads: int = 512,
-    ):
-        """Own one serialized capture without changing graph topology."""
+    def capture(self, *, plan: Plan):
+        """Serialize capture; launchers are already resolved by preparation."""
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
         if self._capture_context_depth:
             raise RuntimeError("overlapping PCIe twoshot capture contexts are not allowed")
-        self.prepare_graph(operations=operations, threads=threads)
         self._capture_context_depth = 1
         try:
             yield self
         finally:
             self._capture_context_depth = 0
 
-    def _launch(
-        self,
-        operation: str,
-        payload: torch.Tensor,
-        scale: torch.Tensor,
-        out: torch.Tensor,
-        *,
-        rows_per_rank: int,
-        threads: int,
-        block_limit: int,
+    def _launch_prepared(
+        self, payload: torch.Tensor, scale: torch.Tensor, out: torch.Tensor, *,
+        state, threads: int, block_limit: int,
     ) -> None:
-        threads = int(threads)
-        if threads <= 0 or threads > 512 or threads % 32 != 0:
-            raise ValueError("threads must be a warp-aligned value in [32, 512]")
-        shard_packs = rows_per_rank * (self.row_elems // 16)
-        if shard_packs > self._pack_stride:
-            raise ValueError("pcie_twoshot staging capacity exceeded")
-        if rows_per_rank > self._scale_stride:
-            raise ValueError("pcie_twoshot scale capacity exceeded")
-        if block_limit <= 0 or block_limit > _MAX_BLOCKS:
-            raise ValueError(
-                f"block_limit must be in [1, {_MAX_BLOCKS}]"
-            )
-        blocks = max(
-            1,
-            min(int(block_limit), (shard_packs + threads - 1) // threads),
+        operation = state.query.call["operation"]
+        rows_per_rank = (
+            payload.shape[0] // self.world_size
+            if operation == "reduce_scatter" else payload.shape[0]
         )
+        if int(threads) != state.query.call["threads"] or int(block_limit) != state.query.call["block_limit"]:
+            raise ValueError("two-shot launch controls differ from the prepared plan")
+        shard_packs = rows_per_rank * (self.row_elems // 16)
+        if shard_packs > self._pack_stride or rows_per_rank > self._scale_stride:
+            raise ValueError("pcie_twoshot staging capacity exceeded")
+        blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
-        device_index = self._device_index()
-        if capturing:
-            if self._capture_context_depth <= 0:
-                raise RuntimeError(
-                    "PCIe twoshot CUDA graph capture requires an active "
-                    "runtime.capture() context"
-                )
-            graph_slot_bias = (
-                self._device_slot_bias
-                if self._device_slot_selection
-                else self._slot & 1
-            )
-            if not is_twoshot_launcher_prepared(
-                operation,
-                self.world_size,
-                self.rank,
-                True,
-                graph_slot_bias,
-                threads,
-                self.row_elems,
-                device_index,
-            ):
-                raise RuntimeError(
-                    "cold PCIe twoshot CUDA graph capture is not allowed; "
-                    "enter runtime.capture() before torch.cuda.graph()"
-                )
+        if capturing and self._capture_context_depth <= 0:
+            raise RuntimeError("PCIe twoshot CUDA graph capture requires runtime.capture(plan=...)")
         if capturing and not self._device_slot_selection:
-            # Seed the device epoch with the exact next host-side slot. This
-            # is sticky across all graphs and later eager launches.
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
         if self._device_slot_selection:
-            # The graph specialization derives slot parity from channel-local
-            # device state and always receives the stable slot-zero table.
             slot = 0
         else:
             slot = self._slot % 2
             self._slot += 1
-        assert len(self._signal_ptrs) == 8
-        with torch.cuda.device(self.device):
-            launcher = get_twoshot_launcher(
-                operation,
-                self.world_size,
-                self.rank,
-                self._device_slot_selection,
-                self._device_slot_bias,
-                threads,
-                self.row_elems,
-                device_index,
-            )
-            if not self._device_slot_selection:
-                # Precompile the graph specialization before capture. Kernel
-                # geometry and tensor addresses remain runtime launch values.
-                for slot_bias in (0, 1):
-                    get_twoshot_launcher(
-                        operation,
-                        self.world_size,
-                        self.rank,
-                        True,
-                        slot_bias,
-                        threads,
-                        self.row_elems,
-                        device_index,
-                    )
-            launcher(
-                payload.data_ptr(),
-                scale.data_ptr(),
-                self._staging_ptrs[slot],
-                self._signal_ptrs,
-                out.data_ptr(),
-                self.rank,
-                self._pack_stride,
-                self._scale_offset,
-                self._scale_stride,
-                self._slot_bytes,
-                rows_per_rank,
-                self.row_elems,
-                blocks,
-            )
+        launcher = state.launcher(self._device_slot_selection, self._device_slot_bias)
+        launcher(
+            payload.data_ptr(), scale.data_ptr(), self._staging_ptrs[slot],
+            self._signal_ptrs, out.data_ptr(), self.rank, self._pack_stride,
+            self._scale_offset, self._scale_stride, self._slot_bytes,
+            rows_per_rank, self.row_elems, blocks,
+        )
 
     def reduce_scatter_fp8(
         self,
@@ -491,17 +377,18 @@ class PCIeTwoShotSP:
         scale: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         *,
+        plan: Plan,
         threads: int = 512,
         block_limit: int = 64,
     ) -> torch.Tensor:
-        """Sum per-token-quantized partials; return the local row shard."""
+        """Sum per-token-quantized partials with a prepared native launcher."""
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        if state.query.surface != "TwoShotReduceScatter.reduce_scatter_fp8":
+            raise ValueError("plan does not prepare FP8 reduce-scatter")
         with _device_guard(self.device):
             return self._reduce_scatter_fp8_on_device(
-                payload,
-                scale,
-                out,
-                threads=threads,
-                block_limit=block_limit,
+                payload, scale, out, state=state, threads=threads, block_limit=block_limit,
             )
 
     def _reduce_scatter_fp8_on_device(
@@ -510,6 +397,7 @@ class PCIeTwoShotSP:
         scale: torch.Tensor,
         out: Optional[torch.Tensor],
         *,
+        state,
         threads: int,
         block_limit: int,
     ) -> torch.Tensor:
@@ -531,14 +419,8 @@ class PCIeTwoShotSP:
             or not out.is_contiguous()
         ):
             raise ValueError("output must be contiguous BF16 with the local shard shape")
-        self._launch(
-            "reduce_scatter",
-            payload,
-            scale,
-            out,
-            rows_per_rank=rows // self.world_size,
-            threads=threads,
-            block_limit=block_limit,
+        self._launch_prepared(
+            payload, scale, out, state=state, threads=threads, block_limit=block_limit,
         )
         return out
 
@@ -548,17 +430,18 @@ class PCIeTwoShotSP:
         scale: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         *,
+        plan: Plan,
         threads: int = 512,
         block_limit: int = 64,
     ) -> torch.Tensor:
-        """Gather per-token-quantized shards; return bf16 full width."""
+        """Gather per-token-quantized shards with a prepared native launcher."""
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        if state.query.surface != "TwoShotReduceScatter.all_gather_fp8":
+            raise ValueError("plan does not prepare FP8 all-gather")
         with _device_guard(self.device):
             return self._all_gather_fp8_on_device(
-                payload,
-                scale,
-                out,
-                threads=threads,
-                block_limit=block_limit,
+                payload, scale, out, state=state, threads=threads, block_limit=block_limit,
             )
 
     def _all_gather_fp8_on_device(
@@ -567,6 +450,7 @@ class PCIeTwoShotSP:
         scale: torch.Tensor,
         out: Optional[torch.Tensor],
         *,
+        state,
         threads: int,
         block_limit: int,
     ) -> torch.Tensor:
@@ -586,14 +470,8 @@ class PCIeTwoShotSP:
             or not out.is_contiguous()
         ):
             raise ValueError("output must be contiguous BF16 with the gathered shape")
-        self._launch(
-            "all_gather",
-            payload,
-            scale,
-            out,
-            rows_per_rank=rows,
-            threads=threads,
-            block_limit=block_limit,
+        self._launch_prepared(
+            payload, scale, out, state=state, threads=threads, block_limit=block_limit,
         )
         return out
 

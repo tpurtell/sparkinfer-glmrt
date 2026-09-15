@@ -248,7 +248,10 @@ def _split_output_buffer_from_tmp(
 ) -> torch.Tensor:
     if tmp_output.ndim != 4:
         raise ValueError(f"tmp_output must be rank 4, got {tmp_output.ndim}")
-    output = tmp_output[:, :, 0, :]
+    output = tmp_output.as_strided(
+        (tmp_output.shape[0], tmp_output.shape[1], tmp_output.shape[3]),
+        (tmp_output.stride(0), tmp_output.stride(1), tmp_output.stride(3)),
+    )
     if head_major_output:
         expected_stride = (
             int(output.shape[2]),

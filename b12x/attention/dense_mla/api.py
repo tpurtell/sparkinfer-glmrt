@@ -1,94 +1,76 @@
-"""Public planned API for paged dense MLA."""
-
+"""Prepared public API for paged dense MLA."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass
 
 import torch
 
-from ..._lib.gating import default_is_supported
-from ...policy import NO_POLICY_OVERRIDE, PolicyContext, get_auto_policy
+from b12x._lib.gating import default_is_supported
+from b12x.preparation import FrozenMapping, Plan
+
 from . import META
-from ._kernel import (
-    clear_dense_mla_kernel_caches,
-    compile_dense_mla,
-    run_dense_mla,
-)
-from ._scratch import Binding, Caps, Plan, Scratch
-from ._scratch import (
-    plan_dense_mla_scratch,
-)
-from .planner import Budget
-from ._policy import DENSE_MLA_POLICY, DenseMlaConfig, DenseMlaQuery
-from .planner import (
-    infer_dense_mla_mode,
+from ._kernel import clear_dense_mla_kernel_caches
+from ._preparation import (
+    invocation_from_descriptors,
+    invocation_from_tensors,
+    plan as _plan,
+    state as _state,
 )
 from ._reference import dense_mla_reference
+from ._scratch import Binding as _RuntimeBinding, Caps, Scratch
+from ._tuning import DenseMlaConfig, DenseMlaQuery
+from .planner import Budget, infer_dense_mla_mode
 
 
-def _dtype_name(dtype: torch.dtype) -> str:
-    return str(dtype).removeprefix("torch.")
+@dataclass(frozen=True, kw_only=True)
+class Binding:
+    """Live caller-owned tensors bound to one prepared dense-MLA plan."""
+
+    plan: Plan
+    runtime: _RuntimeBinding
+
+    def __getattr__(self, name):
+        return getattr(self.runtime, name)
 
 
-def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
-    """Size fixed caller-owned storage and select shape-only kernel policy."""
+def plan(
+    caps: Caps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: DenseMlaConfig | None = None,
+) -> Plan:
+    """Declare a dense-MLA route for ``PreparationSession``."""
+    return _plan(caps, invocation=invocation, override=override)
 
-    if not isinstance(caps, Caps):
-        raise TypeError("caps must be dense_mla.Caps")
-    policy = policy or get_auto_policy(caps.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(caps.device)
-    query = DenseMlaQuery(
-        mode=caps.mode,
-        q_dtype=_dtype_name(caps.q_dtype),
-        kv_dtype=_dtype_name(caps.kv_dtype),
-        num_q_heads=caps.num_q_heads,
-        qk_head_dim=caps.head_dim,
-        v_head_dim=caps.v_head_dim,
-        page_size=caps.page_size,
-        query_rows=caps.max_total_q,
-        max_batch=caps.max_batch,
-        cache_tokens=caps.max_cache_tokens,
-        physical_record_width=caps.physical_record_width,
-        window_size=caps.window_size,
-        use_cuda_graph=caps.use_cuda_graph,
-    )
-    existing_budget = caps.budget or Budget()
-    override = NO_POLICY_OVERRIDE
-    if existing_budget.max_splits is not None:
-        override = DenseMlaConfig(max_splits=existing_budget.max_splits)
-    resolution = policy.resolve(DENSE_MLA_POLICY, query, override=override)
-    effective_caps = replace(
-        caps,
-        budget=Budget(
-            max_splits=resolution.config.max_splits,
-            max_partial_rows=existing_budget.max_partial_rows,
-        ),
-    )
-    return replace(
-        plan_dense_mla_scratch(effective_caps),
-        policy_resolution=resolution,
+
+def bind(
+    plan: Plan,
+    **kwargs,
+) -> Binding:
+    """Bind caller-owned views to an already prepared dense-MLA plan."""
+    if not isinstance(plan, Plan):
+        raise TypeError("bind requires a session-prepared Plan")
+    device = kwargs.get("q").device if isinstance(kwargs.get("q"), torch.Tensor) else None
+    return Binding(
+        plan=plan,
+        runtime=_state(plan, device=device).bind(**kwargs),
     )
 
 
-def bind(plan: Plan, **kwargs) -> Binding:
-    """Bind runtime tensors using views only; this function never allocates."""
-    return plan.bind(**kwargs)
-
-
-def compile(*, binding: Binding) -> None:
-    """Compile every entry selected by ``binding`` without launching it."""
-    compile_dense_mla(binding=binding)
-
-
-def run(*, binding: Binding) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run dense MLA and return BF16 output plus FP32 natural-log LSE."""
-    return run_dense_mla(binding=binding)
+def run(
+    *, plan: Plan | None = None, binding: Binding
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run only native entries retained by the prepared plan."""
+    if not isinstance(binding, Binding):
+        raise TypeError("binding must be dense_mla.Binding")
+    if plan is None:
+        plan = binding.plan
+    if plan is not binding.plan:
+        raise ValueError("plan must match binding.plan")
+    return _state(plan, device=binding.runtime.q.device).run(binding.runtime)
 
 
 def reference(*args, **kwargs):
-    """Run the FP32 paged dense-MLA oracle."""
     return dense_mla_reference(*args, **kwargs)
 
 
@@ -97,7 +79,6 @@ def infer_mode(cu_seqlens_q):
 
 
 def is_supported(device=None) -> bool:
-    """True only for the fail-closed SM120/SM121 production envelope."""
     if not default_is_supported(device, requires=META.requires):
         return False
     if device is None:
@@ -112,19 +93,7 @@ def clear_caches() -> None:
 
 
 __all__ = [
-    "Binding",
-    "Budget",
-    "DenseMlaConfig",
-    "DenseMlaQuery",
-    "Caps",
-    "Plan",
-    "Scratch",
-    "bind",
-    "clear_caches",
-    "compile",
-    "infer_mode",
-    "is_supported",
-    "plan",
-    "reference",
-    "run",
+    "Binding", "Budget", "DenseMlaConfig", "DenseMlaQuery", "Caps", "Plan",
+    "Scratch", "bind", "clear_caches", "infer_mode", "invocation_from_descriptors",
+    "invocation_from_tensors", "is_supported", "plan", "reference", "run",
 ]

@@ -1,21 +1,10 @@
-"""Native unquantized tensor-core/SIMT projections with BF16/FP32 operands.
+"""Prepared CuTe small-N BF16 GEMV for exact decode-sized projections.
 
-``mm`` runs ``y = x @ weight.T + bias`` through opaque torch custom ops.
-FP32 accumulation and bias addition happen before the final BF16/FP32 cast.
-Caller-owned row-strided ``out`` avoids allocation. BF16/BF16 projections
-use tiled tensor-core GEMM when their row/output geometry provides sufficient
-parallelism; small-row/skinny projections and any FP32 operand retain SIMT.
-BF16 [M,5120] projections to 384/512/1024 outputs with M >= 256 use a
-specialized TMA path with compensated FP32 carry. Other eligible broad shapes
-use the general tensor-core/SIMT dispatcher.
-Live rows and input strides are runtime arguments. ``precompile`` warm-runs
-all eligible entrypoints before capture. There is no quantization or cuBLAS fallback.
-
-Example:
-    from b12x.gemm import bf16_gemv
-
-    bf16_gemv.precompile(layer.weight)        # one-time, at weight load
-    out = bf16_gemv.mm(x, layer.weight)
+Declare an exact source/weight specialization with ``query_from_call`` and
+``plan``, prepare it through ``PreparationSession``, then pass the returned
+``Plan`` to ``mm``.  Unsupported dtype, layout, alignment, K, or
+M inputs fail during declaration admission; this component has no runtime
+fallback or standalone precompile path.
 """
 
 from __future__ import annotations
@@ -27,18 +16,21 @@ from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 META = OpMeta(
     name="bf16_gemv",
     group="gemm",
-    api_style="oneshot",
+    api_style="prepared",
     entry_points=(
+        "Plan",
+        "GemvQuery",
+        "GemvConfig",
+        "plan",
+        "query_from_call",
         "mm",
-        "bf16_gemv_small_n",
-        "precompile",
         "is_supported",
         "is_disabled",
         "SMALL_M_MAX",
         "SMALL_N_GEMV_MAX_OUT",
         "SMALL_N_GEMV_MIN_IN",
     ),
-    dtypes=("bf16", "fp32"),
+    dtypes=("bf16",),
     provenance=Provenance(
         repo="https://github.com/phaelon74/b12x",
         commit="9c78d553",
@@ -54,14 +46,17 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        Plan,
         SMALL_M_MAX,
+        GemvConfig,
+        GemvQuery,
         SMALL_N_GEMV_MAX_OUT,
         SMALL_N_GEMV_MIN_IN,
-        bf16_gemv_small_n,
         is_disabled,
         is_supported,
         mm,
-        precompile,
+        plan,
+        query_from_call,
     )
 
 install_lazy_api(globals(), META)

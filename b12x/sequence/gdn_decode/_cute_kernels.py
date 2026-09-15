@@ -1,8 +1,8 @@
 """CuTeDSL launches for Qwen GDN decode stages.
 
-The public Qwen transaction uses the CuTe recurrent stage. CuTe validation and
-gated RMSNorm variants remain available for direct testing while the
-corresponding minor public stages use Triton.
+The public Qwen decode uses the CuTe recurrent stage. A CuTe gated RMSNorm
+variant remains available for direct testing while the public output norm uses
+Triton.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ from cutlass import BFloat16, Float32, Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import register_program_cache
 from b12x._lib.intrinsics import warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
@@ -38,12 +40,12 @@ _NORM_WARPS_PER_CTA = _NORM_THREADS // 32
 _NORM_MAX_CTAS = 192
 _GROUPED_VALUE_HEADS = 2
 
-_KERNEL_CACHE: dict[tuple[object, ...], Callable[[Binding, float], None]] = {}
+_KERNEL_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: set[tuple[object, ...]] = set()
-_VALIDATION_CACHE: dict[tuple[object, ...], Callable[[Binding], None]] = {}
 _NORM_CACHE: dict[tuple[object, ...], Callable[[Binding, float], None]] = {}
-_VALIDATION_WARMED: set[tuple[object, ...]] = set()
 _NORM_WARMED: set[tuple[object, ...]] = set()
+register_program_cache(_KERNEL_CACHE)
+register_program_cache(_NORM_CACHE)
 
 
 def _add(left: Float32, right: Float32) -> Float32:
@@ -82,172 +84,6 @@ def _pointer(
     )
 
 
-class _ValidateQwenMetadataKernel:
-    def __init__(
-        self,
-        *,
-        max_tokens: int,
-        max_seqs: int,
-        max_state_slots: int,
-        state_index_columns: int,
-        duplicate_table_size: int,
-        has_null_state_index: bool,
-        null_state_index: int,
-        index_type: type[cutlass.Numeric],
-    ) -> None:
-        self.max_tokens = int(max_tokens)
-        self.max_seqs = int(max_seqs)
-        self.max_state_slots = int(max_state_slots)
-        self.state_index_columns = int(state_index_columns)
-        self.duplicate_table_size = int(duplicate_table_size)
-        self.has_null_state_index = bool(has_null_state_index)
-        self.null_state_index = int(null_state_index)
-        self.index_type = index_type
-
-    @cute.jit
-    def __call__(
-        self,
-        query_start_loc: cute.Pointer,
-        num_accepted_tokens: cute.Pointer,
-        state_indices: cute.Pointer,
-        num_seqs: cute.Pointer,
-        num_tokens: cute.Pointer,
-        duplicate_slots: cute.Pointer,
-        error_code: cute.Pointer,
-        stream: cuda.CUstream,
-    ):
-        self.kernel(
-            query_start_loc,
-            num_accepted_tokens,
-            state_indices,
-            num_seqs,
-            num_tokens,
-            duplicate_slots,
-            error_code,
-        ).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
-
-    @cute.kernel
-    def kernel(
-        self,
-        query_start_loc: cute.Pointer,
-        num_accepted_tokens: cute.Pointer,
-        state_indices: cute.Pointer,
-        num_seqs: cute.Pointer,
-        num_tokens: cute.Pointer,
-        duplicate_slots: cute.Pointer,
-        error_code: cute.Pointer,
-    ):
-        error = Int32(0)
-        for slot in cutlass.range(
-            Int32(self.duplicate_table_size), unroll=1
-        ):
-            duplicate_slots[slot] = Int64(-1)
-
-        live_seqs = num_seqs[Int32(0)].to(Int32)
-        live_tokens = num_tokens[Int32(0)].to(Int32)
-        bounded_seqs = cutlass.max(
-            Int32(0), cutlass.min(live_seqs, Int32(self.max_seqs))
-        )
-        counts_invalid = (
-            (live_seqs < Int32(0))
-            | (live_seqs > Int32(self.max_seqs))
-            | (live_tokens < Int32(0))
-            | (live_tokens > Int32(self.max_tokens))
-        )
-        if counts_invalid:
-            error = error | Int32(2)
-        if (query_start_loc[Int32(0)].to(Int32) != Int32(0)) | (
-            query_start_loc[bounded_seqs].to(Int32) != live_tokens
-        ):
-            error = error | Int32(2)
-
-        for request in cutlass.range(Int32(self.max_seqs), unroll=1):
-            if request < bounded_seqs:
-                start = query_start_loc[request].to(Int32)
-                end = query_start_loc[request + Int32(1)].to(Int32)
-                accepted = num_accepted_tokens[request].to(Int32)
-                length = end - start
-                invalid = (
-                    (start < Int32(0))
-                    | (end < start)
-                    | (end > live_tokens)
-                    | (length > Int32(self.state_index_columns))
-                    | (accepted < Int32(1))
-                    | (accepted > Int32(self.state_index_columns))
-                )
-                if invalid:
-                    error = error | Int32(2)
-
-                safe_accepted = cutlass.max(
-                    Int32(0),
-                    cutlass.min(
-                        accepted - Int32(1),
-                        Int32(self.state_index_columns - 1),
-                    ),
-                )
-                source_offset = (
-                    request.to(Int64) * Int64(self.state_index_columns)
-                    + safe_accepted.to(Int64)
-                )
-                source_index = state_indices[source_offset].to(Int64)
-                null_request = source_index != source_index
-                if cutlass.const_expr(self.has_null_state_index):
-                    null_request = source_index == Int64(self.null_state_index)
-
-                for column in cutlass.range_constexpr(
-                    self.state_index_columns
-                ):
-                    active = (end > start) & (
-                        (Int32(column) < length)
-                        | (Int32(column) == accepted - Int32(1))
-                    )
-                    if active & ~null_request:
-                        index_offset = (
-                            request.to(Int64)
-                            * Int64(self.state_index_columns)
-                            + Int64(column)
-                        )
-                        state_index = state_indices[index_offset].to(Int64)
-                        null_cell = state_index != state_index
-                        if cutlass.const_expr(self.has_null_state_index):
-                            null_cell = state_index == Int64(
-                                self.null_state_index
-                            )
-                        if ~null_cell:
-                            if (state_index < Int64(0)) | (
-                                state_index >= Int64(self.max_state_slots)
-                            ):
-                                error = error | Int32(4)
-                            else:
-                                hash_slot = state_index % Int64(
-                                    self.duplicate_table_size
-                                )
-                                done = False
-                                duplicate = False
-                                for _ in cutlass.range(
-                                    Int32(self.duplicate_table_size), unroll=1
-                                ):
-                                    if ~done:
-                                        previous = duplicate_slots[
-                                            hash_slot
-                                        ].to(Int64)
-                                        if previous == Int64(-1):
-                                            duplicate_slots[hash_slot] = state_index
-                                            done = True
-                                        elif previous == state_index:
-                                            duplicate = True
-                                            done = True
-                                        else:
-                                            hash_slot = (
-                                                hash_slot + Int64(1)
-                                            ) % Int64(
-                                                self.duplicate_table_size
-                                            )
-                                if duplicate | ~done:
-                                    error = error | Int32(1)
-        error_code[Int32(0)] = error
-
-
 class _GatedRmsNormKernel:
     def __init__(
         self,
@@ -276,7 +112,6 @@ class _GatedRmsNormKernel:
         z: cute.Pointer,
         norm_weight: cute.Pointer,
         num_tokens: cute.Pointer,
-        error_code: cute.Pointer,
         eps: Float32,
         stream: cuda.CUstream,
     ):
@@ -285,7 +120,6 @@ class _GatedRmsNormKernel:
             z,
             norm_weight,
             num_tokens,
-            error_code,
             eps,
         ).launch(
             grid=(self.grid_ctas, 1, 1),
@@ -300,7 +134,6 @@ class _GatedRmsNormKernel:
         z: cute.Pointer,
         norm_weight: cute.Pointer,
         num_tokens: cute.Pointer,
-        error_code: cute.Pointer,
         eps: Float32,
     ):
         block, _, _ = cute.arch.block_idx()
@@ -313,7 +146,6 @@ class _GatedRmsNormKernel:
         )
         row_stride = Int32(grid) * Int32(_NORM_WARPS_PER_CTA)
         total_rows = Int32(self.max_tokens * self.value_heads)
-        error = error_code[Int32(0)].to(Int32)
         live_tokens = num_tokens[Int32(0)].to(Int32)
         bounded_tokens = cutlass.max(
             Int32(0), cutlass.min(live_tokens, Int32(self.max_tokens))
@@ -325,13 +157,7 @@ class _GatedRmsNormKernel:
                 token.to(Int64) * Int64(self.value_heads * _VALUE_DIM)
                 + value_head.to(Int64) * Int64(_VALUE_DIM)
             )
-            if error != Int32(0):
-                for lane_element in cutlass.range_constexpr(
-                    _VALUE_DIM // 32
-                ):
-                    column = lane + Int32(lane_element * 32)
-                    output[base + column.to(Int64)] = BFloat16(float("nan"))
-            elif token >= bounded_tokens:
+            if token >= bounded_tokens:
                 for lane_element in cutlass.range_constexpr(
                     _VALUE_DIM // 32
                 ):
@@ -435,7 +261,6 @@ class _PackedRecurrentQwenKernel:
         state_indices: cute.Pointer,
         num_seqs: cute.Pointer,
         output: cute.Pointer,
-        error_code: cute.Pointer,
         state_slot_stride: Int64,
         mixed_token_stride: Int64,
         a_token_stride: Int64,
@@ -458,7 +283,6 @@ class _PackedRecurrentQwenKernel:
             state_indices,
             num_seqs,
             output,
-            error_code,
             state_slot_stride,
             mixed_token_stride,
             a_token_stride,
@@ -988,7 +812,6 @@ class _PackedRecurrentQwenKernel:
         state_indices: cute.Pointer,
         num_seqs: cute.Pointer,
         output: cute.Pointer,
-        error_code: cute.Pointer,
         state_slot_stride: Int64,
         mixed_token_stride: Int64,
         a_token_stride: Int64,
@@ -1002,70 +825,59 @@ class _PackedRecurrentQwenKernel:
         lane, _, _ = cute.arch.thread_idx()
         work_block = Int32(work_block)
 
-        # Failed metadata transactions must not read or mutate recurrent state.
-        if error_code[Int32(0)].to(Int32) == Int32(0):
-            live_seqs = num_seqs[Int32(0)].to(Int32)
-            bounded_seqs = cutlass.max(
-                Int32(0), cutlass.min(live_seqs, Int32(self.max_seqs))
-            )
-            value_tiles = Int32(_VALUE_DIM // _VALUE_ROWS_PER_CTA)
-            total_work = bounded_seqs * Int32(self.value_heads) * value_tiles
-            work_iterations = cutlass.max(
-                Int32(0),
-                (total_work - work_block + Int32(self.work_ctas - 1))
-                // Int32(self.work_ctas),
-            )
-            for work_iteration in cutlass.range(work_iterations, unroll=1):
-                work = work_block + work_iteration * Int32(self.work_ctas)
-                value_tile = work % value_tiles
-                request_value_head = work // value_tiles
-                value_head = request_value_head % Int32(self.value_heads)
-                request = request_value_head // Int32(self.value_heads)
-                key_head = value_head // Int32(self.head_ratio)
-                value_row = value_tile * Int32(_VALUE_ROWS_PER_CTA) + Int32(
-                    lane
-                ) // Int32(_KEY_LANES_PER_ROW)
-                start = query_start_loc[request].to(Int32)
-                end = query_start_loc[request + Int32(1)].to(Int32)
-                if end > start:
-                    accepted_column = num_accepted_tokens[request].to(Int32) - Int32(1)
-                    source_index_offset = (
-                        request.to(Int64) * state_index_request_stride
-                        + accepted_column.to(Int64) * state_index_column_stride
-                    )
-                    source_index = state_indices[source_index_offset].to(Int64)
-                    grouped_heads = (end - start > Int32(1)) & (bounded_seqs > Int32(1))
-                    value_head_in_group = value_head % Int32(self.head_ratio)
-                    group_leader = value_head_in_group == Int32(0)
-                    ungrouped_tail = value_head_in_group == Int32(_GROUPED_VALUE_HEADS)
-                    if cutlass.const_expr(self.has_null_state_index):
-                        if source_index == Int64(self.null_state_index):
-                            if Int32(lane) % Int32(_KEY_LANES_PER_ROW) == Int32(0):
-                                if grouped_heads:
-                                    if group_leader:
-                                        for (
-                                            value_head_offset
-                                        ) in cutlass.range_constexpr(
-                                            _GROUPED_VALUE_HEADS
-                                        ):
-                                            self._zero_request(
-                                                output,
-                                                start,
-                                                end,
-                                                value_head + Int32(value_head_offset),
-                                                value_row,
-                                                output_token_stride,
-                                            )
-                                    elif ungrouped_tail:
+        live_seqs = num_seqs[Int32(0)].to(Int32)
+        bounded_seqs = cutlass.max(
+            Int32(0), cutlass.min(live_seqs, Int32(self.max_seqs))
+        )
+        value_tiles = Int32(_VALUE_DIM // _VALUE_ROWS_PER_CTA)
+        total_work = bounded_seqs * Int32(self.value_heads) * value_tiles
+        work_iterations = cutlass.max(
+            Int32(0),
+            (total_work - work_block + Int32(self.work_ctas - 1))
+            // Int32(self.work_ctas),
+        )
+        for work_iteration in cutlass.range(work_iterations, unroll=1):
+            work = work_block + work_iteration * Int32(self.work_ctas)
+            value_tile = work % value_tiles
+            request_value_head = work // value_tiles
+            value_head = request_value_head % Int32(self.value_heads)
+            request = request_value_head // Int32(self.value_heads)
+            key_head = value_head // Int32(self.head_ratio)
+            value_row = value_tile * Int32(_VALUE_ROWS_PER_CTA) + Int32(
+                lane
+            ) // Int32(_KEY_LANES_PER_ROW)
+            start = query_start_loc[request].to(Int32)
+            end = query_start_loc[request + Int32(1)].to(Int32)
+            if end > start:
+                accepted_column = num_accepted_tokens[request].to(Int32) - Int32(1)
+                source_index_offset = (
+                    request.to(Int64) * state_index_request_stride
+                    + accepted_column.to(Int64) * state_index_column_stride
+                )
+                source_index = state_indices[source_index_offset].to(Int64)
+                grouped_heads = (end - start > Int32(1)) & (bounded_seqs > Int32(1))
+                value_head_in_group = value_head % Int32(self.head_ratio)
+                group_leader = value_head_in_group == Int32(0)
+                ungrouped_tail = value_head_in_group == Int32(_GROUPED_VALUE_HEADS)
+                if cutlass.const_expr(self.has_null_state_index):
+                    if source_index == Int64(self.null_state_index):
+                        if Int32(lane) % Int32(_KEY_LANES_PER_ROW) == Int32(0):
+                            if grouped_heads:
+                                if group_leader:
+                                    for (
+                                        value_head_offset
+                                    ) in cutlass.range_constexpr(
+                                        _GROUPED_VALUE_HEADS
+                                    ):
                                         self._zero_request(
                                             output,
                                             start,
                                             end,
-                                            value_head,
+                                            value_head + Int32(value_head_offset),
                                             value_row,
                                             output_token_stride,
                                         )
-                                else:
+                                elif ungrouped_tail:
                                     self._zero_request(
                                         output,
                                         start,
@@ -1074,84 +886,14 @@ class _PackedRecurrentQwenKernel:
                                         value_row,
                                         output_token_stride,
                                     )
-                        else:
-                            if grouped_heads:
-                                if group_leader:
-                                    self._run_grouped_request(
-                                        mixed_qkv,
-                                        a,
-                                        b,
-                                        A_log,
-                                        dt_bias,
-                                        recurrent_state,
-                                        state_indices,
-                                        output,
-                                        request,
-                                        key_head,
-                                        value_row,
-                                        start,
-                                        end,
-                                        source_index,
-                                        state_slot_stride,
-                                        mixed_token_stride,
-                                        a_token_stride,
-                                        b_token_stride,
-                                        output_token_stride,
-                                        state_index_request_stride,
-                                        state_index_column_stride,
-                                        scale,
-                                    )
-                                elif ungrouped_tail:
-                                    self._run_request(
-                                        mixed_qkv,
-                                        a,
-                                        b,
-                                        A_log,
-                                        dt_bias,
-                                        recurrent_state,
-                                        state_indices,
-                                        output,
-                                        request,
-                                        value_head,
-                                        key_head,
-                                        value_row,
-                                        start,
-                                        end,
-                                        source_index,
-                                        state_slot_stride,
-                                        mixed_token_stride,
-                                        a_token_stride,
-                                        b_token_stride,
-                                        output_token_stride,
-                                        state_index_request_stride,
-                                        state_index_column_stride,
-                                        scale,
-                                    )
                             else:
-                                self._run_request(
-                                    mixed_qkv,
-                                    a,
-                                    b,
-                                    A_log,
-                                    dt_bias,
-                                    recurrent_state,
-                                    state_indices,
+                                self._zero_request(
                                     output,
-                                    request,
-                                    value_head,
-                                    key_head,
-                                    value_row,
                                     start,
                                     end,
-                                    source_index,
-                                    state_slot_stride,
-                                    mixed_token_stride,
-                                    a_token_stride,
-                                    b_token_stride,
+                                    value_head,
+                                    value_row,
                                     output_token_stride,
-                                    state_index_request_stride,
-                                    state_index_column_stride,
-                                    scale,
                                 )
                     else:
                         if grouped_heads:
@@ -1232,12 +974,91 @@ class _PackedRecurrentQwenKernel:
                                 state_index_column_stride,
                                 scale,
                             )
+                else:
+                    if grouped_heads:
+                        if group_leader:
+                            self._run_grouped_request(
+                                mixed_qkv,
+                                a,
+                                b,
+                                A_log,
+                                dt_bias,
+                                recurrent_state,
+                                state_indices,
+                                output,
+                                request,
+                                key_head,
+                                value_row,
+                                start,
+                                end,
+                                source_index,
+                                state_slot_stride,
+                                mixed_token_stride,
+                                a_token_stride,
+                                b_token_stride,
+                                output_token_stride,
+                                state_index_request_stride,
+                                state_index_column_stride,
+                                scale,
+                            )
+                        elif ungrouped_tail:
+                            self._run_request(
+                                mixed_qkv,
+                                a,
+                                b,
+                                A_log,
+                                dt_bias,
+                                recurrent_state,
+                                state_indices,
+                                output,
+                                request,
+                                value_head,
+                                key_head,
+                                value_row,
+                                start,
+                                end,
+                                source_index,
+                                state_slot_stride,
+                                mixed_token_stride,
+                                a_token_stride,
+                                b_token_stride,
+                                output_token_stride,
+                                state_index_request_stride,
+                                state_index_column_stride,
+                                scale,
+                            )
+                    else:
+                        self._run_request(
+                            mixed_qkv,
+                            a,
+                            b,
+                            A_log,
+                            dt_bias,
+                            recurrent_state,
+                            state_indices,
+                            output,
+                            request,
+                            value_head,
+                            key_head,
+                            value_row,
+                            start,
+                            end,
+                            source_index,
+                            state_slot_stride,
+                            mixed_token_stride,
+                            a_token_stride,
+                            b_token_stride,
+                            output_token_stride,
+                            state_index_request_stride,
+                            state_index_column_stride,
+                            scale,
+                        )
 
 
 def _binding_key(binding: Binding) -> tuple[object, ...]:
     if not isinstance(binding, Binding):
         raise TypeError(f"binding must be GDN Binding, got {type(binding)!r}")
-    caps = binding.plan.caps
+    caps = binding._state.caps
     if caps.key_head_dim != _KEY_DIM or caps.value_head_dim != _VALUE_DIM:
         raise ValueError("CuTe Qwen GDN requires key/value head dimensions of 128")
     if tuple(binding.recurrent_state.stride()[1:]) != (
@@ -1261,13 +1082,13 @@ def _binding_key(binding: Binding) -> tuple[object, ...]:
     )
 
 
-def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[[Binding, float], None]]:
+def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[..., None]]:
     key = _binding_key(binding)
     cached = _KERNEL_CACHE.get(key)
     if cached is not None:
         return key, cached
 
-    caps = binding.plan.caps
+    caps = binding._state.caps
     state_type = _numeric_type(binding.recurrent_state.dtype)
     index_type = _numeric_type(binding.state_indices.dtype)
     a_log_type = _numeric_type(binding.A_log.dtype)
@@ -1308,7 +1129,6 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[[Binding, f
         fake_pointer(index_type),
         fake_pointer(Int32),
         fake_pointer(BFloat16),
-        fake_pointer(Int32),
         Int64(1),
         Int64(1),
         Int64(1),
@@ -1320,7 +1140,7 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[[Binding, f
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "sequence.gdn_decode.packed_recurrent_qwen",
-            2,
+            3,
             key,
         ),
     )
@@ -1333,36 +1153,35 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[[Binding, f
             assumed_align=max(1, dtype.width // 8),
         )
 
-    def launch(active_binding: Binding, scale: float) -> None:
-        active_key = _binding_key(active_binding)
-        if active_key != key:
-            raise ValueError(
-                "compiled CuTe GDN launcher does not match the supplied binding"
-            )
+    def launch(
+        mixed_qkv, a, b, A_log, dt_bias, recurrent_state,
+        query_start_loc, num_accepted_tokens, state_indices, num_seqs,
+        output, scale,
+    ) -> None:
         raw(
-            pointer(active_binding.mixed_qkv, BFloat16),
-            pointer(active_binding.a, BFloat16),
-            pointer(active_binding.b, BFloat16),
-            pointer(active_binding.A_log, a_log_type),
-            pointer(active_binding.dt_bias, dt_bias_type),
-            pointer(active_binding.recurrent_state, state_type),
-            pointer(active_binding.query_start_loc, Int32),
-            pointer(active_binding.num_accepted_tokens, Int32),
-            pointer(active_binding.state_indices, index_type),
-            pointer(active_binding.num_seqs, Int32),
-            pointer(active_binding.output, BFloat16),
-            pointer(active_binding.error_code, Int32),
-            int(active_binding.recurrent_state.stride(0)),
-            int(active_binding.mixed_qkv.stride(0)),
-            int(active_binding.a.stride(0)),
-            int(active_binding.b.stride(0)),
-            int(active_binding.output.stride(0)),
-            int(active_binding.state_indices.stride(0)),
-            int(active_binding.state_indices.stride(1)),
+            pointer(mixed_qkv, BFloat16),
+            pointer(a, BFloat16),
+            pointer(b, BFloat16),
+            pointer(A_log, a_log_type),
+            pointer(dt_bias, dt_bias_type),
+            pointer(recurrent_state, state_type),
+            pointer(query_start_loc, Int32),
+            pointer(num_accepted_tokens, Int32),
+            pointer(state_indices, index_type),
+            pointer(num_seqs, Int32),
+            pointer(output, BFloat16),
+            int(recurrent_state.stride(0)),
+            int(mixed_qkv.stride(0)),
+            int(a.stride(0)),
+            int(b.stride(0)),
+            int(output.stride(0)),
+            int(state_indices.stride(0)),
+            int(state_indices.stride(1)),
             float(scale),
             current_cuda_stream(),
         )
 
+    attach_programs(launch, raw)
     _KERNEL_CACHE[key] = launch
     return key, launch
 
@@ -1382,12 +1201,12 @@ def run_packed_recurrent_qwen(
     *,
     scale: float | None = None,
 ) -> None:
-    """Launch the Qwen recurrent stage without validation or output norm.
+    """Launch the Qwen recurrent stage without the output norm.
 
     A normal-stream launch is required before capture so both compilation and
     CUDA module loading have completed. This function has no fallback path.
     """
-    caps = binding.plan.caps
+    caps = binding._state.caps
     scale_value = caps.key_head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(scale_value) or scale_value <= 0.0:
         raise ValueError(f"scale must be finite and positive, got {scale_value}")
@@ -1402,105 +1221,19 @@ def run_packed_recurrent_qwen(
             )
         if launch is None:
             key, launch = _compile(binding)
-        launch(binding, scale_value)
+        launch(
+            binding.mixed_qkv, binding.a, binding.b, binding.A_log, binding.dt_bias,
+            binding.recurrent_state, binding.query_start_loc, binding.num_accepted_tokens,
+            binding.state_indices, binding.num_seqs, binding.output, scale_value,
+        )
         if not capturing:
             _WARMED.add(key)
-
-
-def _validation_key(binding: Binding) -> tuple[object, ...]:
-    caps = binding.plan.caps
-    return (
-        binding.output.device.index,
-        caps.max_tokens,
-        caps.max_seqs,
-        caps.max_state_slots,
-        caps.state_index_columns,
-        binding.plan.duplicate_table_size,
-        caps.null_state_index,
-        binding.state_indices.dtype,
-    )
-
-
-def _compile_validation(
-    binding: Binding,
-) -> tuple[tuple[object, ...], Callable[[Binding], None]]:
-    key = _validation_key(binding)
-    cached = _VALIDATION_CACHE.get(key)
-    if cached is not None:
-        return key, cached
-    caps = binding.plan.caps
-    index_type = _numeric_type(binding.state_indices.dtype)
-    kernel = _ValidateQwenMetadataKernel(
-        max_tokens=caps.max_tokens,
-        max_seqs=caps.max_seqs,
-        max_state_slots=caps.max_state_slots,
-        state_index_columns=caps.state_index_columns,
-        duplicate_table_size=binding.plan.duplicate_table_size,
-        has_null_state_index=caps.null_state_index is not None,
-        null_state_index=(
-            0 if caps.null_state_index is None else caps.null_state_index
-        ),
-        index_type=index_type,
-    )
-    raise_if_kernel_resolution_frozen(
-        "cute.compile", target=kernel, cache_key=key
-    )
-    raw = b12x_compile(
-        kernel,
-        _fake_pointer(Int32),
-        _fake_pointer(Int32),
-        _fake_pointer(index_type),
-        _fake_pointer(Int32),
-        _fake_pointer(Int32),
-        _fake_pointer(Int64),
-        _fake_pointer(Int32),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "sequence.gdn_decode.validate_qwen", 1, key
-        ),
-    )
-
-    def launch(active_binding: Binding) -> None:
-        if _validation_key(active_binding) != key:
-            raise ValueError(
-                "compiled CuTe GDN validator does not match the binding"
-            )
-        raw(
-            _pointer(active_binding.query_start_loc, Int32),
-            _pointer(active_binding.num_accepted_tokens, Int32),
-            _pointer(active_binding.state_indices, index_type),
-            _pointer(active_binding.num_seqs, Int32),
-            _pointer(active_binding.num_tokens, Int32),
-            _pointer(active_binding.duplicate_slots, Int64),
-            _pointer(active_binding.error_code, Int32),
-            current_cuda_stream(),
-        )
-
-    _VALIDATION_CACHE[key] = launch
-    return key, launch
-
-
-def run_qwen_validation(binding: Binding) -> None:
-    """Validate device metadata and initialize the transaction error code."""
-    with torch.cuda.device(binding.output.device):
-        key = _validation_key(binding)
-        capturing = torch.cuda.is_current_stream_capturing()
-        launch = _VALIDATION_CACHE.get(key)
-        if capturing and (launch is None or key not in _VALIDATION_WARMED):
-            raise RuntimeError(
-                "CuTe GDN validator must be compiled and warm-run before capture"
-            )
-        if launch is None:
-            key, launch = _compile_validation(binding)
-        launch(binding)
-        if not capturing:
-            _VALIDATION_WARMED.add(key)
 
 
 def _norm_key(
     binding: Binding, *, norm_fp32: bool
 ) -> tuple[object, ...]:
-    caps = binding.plan.caps
+    caps = binding._state.caps
     return (
         binding.output.device.index,
         caps.max_tokens,
@@ -1518,7 +1251,7 @@ def _compile_norm(
     cached = _NORM_CACHE.get(key)
     if cached is not None:
         return key, cached
-    caps = binding.plan.caps
+    caps = binding._state.caps
     norm_weight_type = _numeric_type(binding.norm_weight.dtype)
     kernel = _GatedRmsNormKernel(
         max_tokens=caps.max_tokens,
@@ -1536,11 +1269,10 @@ def _compile_norm(
         _fake_pointer(BFloat16),
         _fake_pointer(norm_weight_type),
         _fake_pointer(Int32),
-        _fake_pointer(Int32),
         Float32(1.0e-6),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "sequence.gdn_decode.gated_rmsnorm", 1, key
+            "sequence.gdn_decode.gated_rmsnorm", 2, key
         ),
     )
 
@@ -1554,11 +1286,11 @@ def _compile_norm(
             _pointer(active_binding.z, BFloat16),
             _pointer(active_binding.norm_weight, norm_weight_type),
             _pointer(active_binding.num_tokens, Int32),
-            _pointer(active_binding.error_code, Int32),
             float(eps),
             current_cuda_stream(),
         )
 
+    attach_programs(launch, raw)
     _NORM_CACHE[key] = launch
     return key, launch
 
@@ -1566,7 +1298,7 @@ def _compile_norm(
 def run_gated_rmsnorm(
     binding: Binding, *, eps: float, norm_fp32: bool = False
 ) -> None:
-    """Apply the graph-safe gated RMSNorm and poison invalid transactions."""
+    """Apply the graph-safe gated RMSNorm to the bound output rows."""
     with torch.cuda.device(binding.output.device):
         key = _norm_key(binding, norm_fp32=norm_fp32)
         capturing = torch.cuda.is_current_stream_capturing()
@@ -1586,9 +1318,7 @@ def clear_packed_recurrent_qwen_cache() -> None:
     """Clear process-local launcher state for focused tests."""
     _KERNEL_CACHE.clear()
     _WARMED.clear()
-    _VALIDATION_CACHE.clear()
     _NORM_CACHE.clear()
-    _VALIDATION_WARMED.clear()
     _NORM_WARMED.clear()
 
 
@@ -1597,5 +1327,4 @@ __all__ = [
     "precompile_packed_recurrent_qwen",
     "run_gated_rmsnorm",
     "run_packed_recurrent_qwen",
-    "run_qwen_validation",
 ]

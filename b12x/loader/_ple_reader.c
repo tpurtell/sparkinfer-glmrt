@@ -5,36 +5,8 @@
 #include <liburing.h>
 #endif
 
-#define PLE_BLOCK 4096u
-#define PLE_READ_MAX 65536u
+#include "_row_plan.h"
 #define PLE_CAPSULE "b12x.ple_reader"
-
-typedef struct {
-    int fd;
-    dev_t device;
-    ino_t inode;
-    int64_t bytes;
-} ple_file_t;
-
-typedef struct {
-    int64_t shard;
-    int64_t offset;
-    size_t file;
-    bool scale;
-} ple_source_t;
-
-typedef struct {
-    size_t file;
-    int64_t offset;
-    unsigned length;
-    char *destination;
-} ple_fragment_t;
-
-typedef struct {
-    size_t file, begin, end;
-    int64_t offset;
-    unsigned length, expected;
-} ple_job_t;
 
 typedef struct ple_reader ple_reader_t;
 typedef struct {
@@ -43,26 +15,18 @@ typedef struct {
 } ple_slot_t;
 
 struct ple_reader {
-    int64_t shard_rows, padded_rows, tp_start, tp_end;
-    size_t weight_bytes, scale_bytes, max_lookups, capacity;
+    ple_plan_t plan;
     bool poisoned;
     pthread_mutex_t api_mutex;
     unsigned slots_count;
     ple_slot_t *slots;
     char *buffers;
-    ple_fragment_t *fragments;
-    ple_job_t *jobs;
-    size_t fragment_count, job_count;
-    ple_file_t *files;
-    ple_source_t *sources;
-    size_t file_count, source_count;
-    failure_t failure;
-    uint64_t lookups, requested_bytes, read_bytes, read_calls;
-    uint64_t unique_blocks, coalesced_reads, submit_calls;
-    double execution_seconds;
+    char *weights, *scales;
 #ifdef B12X_HAVE_LIBURING
     struct io_uring ring;
     bool ring_ready;
+    bool files_registered;
+    int *registered_fds;
     struct iovec *iovecs;
     unsigned *free_slots;
 #endif
@@ -70,29 +34,29 @@ struct ple_reader {
 
 #ifdef B12X_HAVE_LIBURING
 static void ple_error(ple_reader_t *reader, const char *operation, int error) {
-    if (!reader->failure.message[0])
-        snprintf(reader->failure.message, sizeof(reader->failure.message), "%s: %s",
+    if (!reader->plan.failure.message[0])
+        snprintf(reader->plan.failure.message, sizeof(reader->plan.failure.message), "%s: %s",
                  operation, strerror(error));
 }
 
 static bool ple_scatter(ple_reader_t *reader, size_t index, char *buffer, int result) {
-    ple_job_t *job = &reader->jobs[index];
-    reader->read_calls++;
-    if (result > 0) reader->read_bytes += (unsigned)result;
+    ple_job_t *job = &reader->plan.jobs[index];
+    reader->plan.read_calls++;
+    if (result > 0) reader->plan.read_bytes += (unsigned)result;
     if (result < 0) {
         ple_error(reader, "io_uring READ_FIXED", -result);
         return false;
     }
     if ((unsigned)result != job->expected) {
-        if (!reader->failure.message[0])
-            snprintf(reader->failure.message, sizeof(reader->failure.message),
+        if (!reader->plan.failure.message[0])
+            snprintf(reader->plan.failure.message, sizeof(reader->plan.failure.message),
                      "short PLE read at offset %lld: expected %u bytes, received %d; source changed or was truncated",
                      (long long)job->offset, job->expected, result);
         return false;
     }
     for (size_t i = job->begin; i < job->end; i++) {
-        ple_fragment_t *fragment = &reader->fragments[i];
-        memcpy(fragment->destination, buffer + (fragment->offset - job->offset),
+        ple_fragment_t *fragment = &reader->plan.fragments[i];
+        memcpy((fragment->scale ? reader->scales : reader->weights) + fragment->destination, buffer + (fragment->offset - job->offset),
                fragment->length);
     }
     return true;
@@ -103,13 +67,14 @@ static void ple_release(ple_reader_t *reader) {
     if (reader->ring_ready) io_uring_queue_exit(&reader->ring);
     free(reader->iovecs);
     free(reader->free_slots);
-    for (size_t i = 0; i < reader->file_count; i++) close(reader->files[i].fd);
-    free(reader->files);
-    free(reader->sources);
+    free(reader->registered_fds);
+    for (size_t i = 0; i < reader->plan.file_count; i++) close(reader->plan.files[i].fd);
+    free(reader->plan.files);
+    free(reader->plan.sources);
     free(reader->buffers);
     free(reader->slots);
-    free(reader->fragments);
-    free(reader->jobs);
+    free(reader->plan.fragments);
+    free(reader->plan.jobs);
     pthread_mutex_destroy(&reader->api_mutex);
     free(reader);
 }
@@ -153,21 +118,21 @@ static PyObject *py_ple_reader(PyObject *self, PyObject *args) {
     /* Only an initialized API mutex reaches ple_release. */
     int error = pthread_mutex_init(&reader->api_mutex, NULL);
     if (error) { free(reader); return PyErr_Format(PyExc_RuntimeError, "PLE mutex: %s", strerror(error)); }
-    reader->shard_rows = shard_rows;
-    reader->padded_rows = padded_rows;
-    reader->tp_start = tp_start;
-    reader->tp_end = tp_end;
-    reader->weight_bytes = weight_bytes;
-    reader->scale_bytes = scale_bytes;
-    reader->max_lookups = max_lookups;
-    reader->capacity = (size_t)max_lookups * per_row;
+    reader->plan.shard_rows = shard_rows;
+    reader->plan.padded_rows = padded_rows;
+    reader->plan.tp_start = tp_start;
+    reader->plan.tp_end = tp_end;
+    reader->plan.weight_bytes = weight_bytes;
+    reader->plan.scale_bytes = scale_bytes;
+    reader->plan.max_lookups = max_lookups;
+    reader->plan.capacity = (size_t)max_lookups * per_row;
     reader->slots_count = (unsigned)depth;
     reader->slots = calloc(reader->slots_count, sizeof(*reader->slots));
-    reader->fragments = calloc(reader->capacity, sizeof(*reader->fragments));
-    reader->jobs = calloc(reader->capacity, sizeof(*reader->jobs));
+    reader->plan.fragments = calloc(reader->plan.capacity, sizeof(*reader->plan.fragments));
+    reader->plan.jobs = calloc(reader->plan.capacity, sizeof(*reader->plan.jobs));
     error = posix_memalign((void **)&reader->buffers, PLE_BLOCK,
                           (size_t)reader->slots_count * PLE_READ_MAX);
-    if (!reader->slots || !reader->fragments || !reader->jobs || error) {
+    if (!reader->slots || !reader->plan.fragments || !reader->plan.jobs || error) {
         ple_release(reader);
         return PyErr_NoMemory();
     }
@@ -202,10 +167,27 @@ static PyObject *py_ple_reader(PyObject *self, PyObject *args) {
 #endif
 }
 
-static int ple_source_compare(const void *left, const void *right) {
-    const ple_source_t *a = left, *b = right;
-    if (a->shard != b->shard) return a->shard < b->shard ? -1 : 1;
-    return (int)a->scale - (int)b->scale;
+static int ple_register_files(ple_plan_t *plan, void *owner) {
+    (void)plan;
+    ple_reader_t *reader = owner;
+#ifdef B12X_HAVE_LIBURING
+    int *fds = realloc(reader->registered_fds, reader->plan.file_count * sizeof(*fds));
+    if (!fds) return -ENOMEM;
+    reader->registered_fds = fds;
+    for (size_t i = 0; i < reader->plan.file_count; i++) fds[i] = reader->plan.files[i].fd;
+    if (reader->files_registered) {
+        int error = io_uring_unregister_files(&reader->ring);
+        if (error < 0) { reader->poisoned = true; return error; }
+        reader->files_registered = false;
+    }
+    int error = io_uring_register_files(&reader->ring, fds, (unsigned)reader->plan.file_count);
+    if (!error) reader->files_registered = true;
+    else reader->poisoned = true;
+    return error;
+#else
+    (void)reader;
+    return 0;
+#endif
 }
 
 static PyObject *py_ple_reader_add(PyObject *self, PyObject *args) {
@@ -217,155 +199,21 @@ static PyObject *py_ple_reader_add(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "OLsLp", &capsule, &shard, &path, &offset, &scale)) return NULL;
     ple_reader_t *reader = PyCapsule_GetPointer(capsule, PLE_CAPSULE);
     if (!reader) return NULL;
-    if (shard < 0 || shard > (reader->padded_rows - 1) / reader->shard_rows || offset < 0 ||
-        (scale && !reader->scale_bytes))
-        return PyErr_Format(PyExc_ValueError, "invalid PLE source shard, offset, or scale plane");
-    int64_t first = shard * reader->shard_rows;
-    int64_t rows = reader->padded_rows - first;
-    if (rows > reader->shard_rows) rows = reader->shard_rows;
-    size_t row_bytes = scale ? reader->scale_bytes : reader->weight_bytes;
-    if ((uint64_t)rows > (uint64_t)(INT64_MAX - offset) / row_bytes)
-        return PyErr_Format(PyExc_OverflowError, "PLE source byte range overflows int64");
-    if (first >= reader->tp_end || first + rows <= reader->tp_start) Py_RETURN_NONE;
     failure_t failure = {{0}};
+    int error;
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&reader->api_mutex);
-    ple_source_t key = {.shard = shard, .scale = scale != 0};
-    if (reader->source_count && bsearch(&key, reader->sources, reader->source_count,
-                                        sizeof(key), ple_source_compare)) {
-        snprintf(failure.message, sizeof(failure.message), "PLE source shard/plane is already registered");
-    } else {
-        /* Reject FIFOs via fstat without blocking waiting for a writer. */
-        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_DIRECT);
-        struct stat status;
-        if (fd < 0) system_error(&failure, "open PLE source");
-        else if (fstat(fd, &status) != 0) system_error(&failure, "fstat PLE source");
-        else if (!S_ISREG(status.st_mode) || offset + rows * (int64_t)row_bytes > status.st_size)
-            snprintf(failure.message, sizeof(failure.message), "PLE source range exceeds a regular file's size");
-        else {
-            size_t file = 0;
-            while (file < reader->file_count &&
-                   (reader->files[file].device != status.st_dev || reader->files[file].inode != status.st_ino)) file++;
-            ple_source_t *sources = realloc(reader->sources, (reader->source_count + 1) * sizeof(*sources));
-            if (!sources) snprintf(failure.message, sizeof(failure.message), "could not allocate PLE source descriptor");
-            else {
-                reader->sources = sources;
-                if (file == reader->file_count) {
-                    ple_file_t *files = realloc(reader->files, (file + 1) * sizeof(*files));
-                    if (!files) snprintf(failure.message, sizeof(failure.message), "could not allocate PLE file descriptor");
-                    else {
-                        reader->files = files;
-                        reader->files[file] = (ple_file_t){fd, status.st_dev, status.st_ino, status.st_size};
-                        reader->file_count++;
-                        fd = -1;
-                    }
-                } else if (reader->files[file].bytes != status.st_size) {
-                    snprintf(failure.message, sizeof(failure.message), "PLE source file size changed during registration");
-                }
-                if (!failure.message[0]) {
-                    reader->sources[reader->source_count++] = (ple_source_t){shard, offset, file, scale != 0};
-                    qsort(reader->sources, reader->source_count, sizeof(*sources), ple_source_compare);
-                }
-            }
-        }
-        if (fd >= 0) close(fd);
-    }
+    reader->plan.failure.message[0] = 0;
+    error = ple_add_source(&reader->plan, shard, path, offset, scale != 0,
+                           ple_register_files, reader);
+    failure = reader->plan.failure;
     pthread_mutex_unlock(&reader->api_mutex);
     Py_END_ALLOW_THREADS
-    if (failure.message[0]) return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
+    if (error == EINVAL) return PyErr_Format(PyExc_ValueError, "invalid PLE source shard, offset, or scale plane");
+    if (error == EOVERFLOW) return PyErr_Format(PyExc_OverflowError, "PLE source byte range overflows int64");
+    if (error) return PyErr_Format(PyExc_RuntimeError, "%s",
+                                   failure.message[0] ? failure.message : "invalid PLE source geometry or byte range");
     Py_RETURN_NONE;
-}
-
-static int ple_fragment_compare(const void *left, const void *right) {
-    const ple_fragment_t *a = left, *b = right;
-    if (a->file != b->file) return a->file < b->file ? -1 : 1;
-    return a->offset < b->offset ? -1 : a->offset > b->offset;
-}
-
-/* libc qsort may allocate a merge buffer on every run. Heap-sort in place to
- * keep all batch metadata persistent, including for duplicate-heavy batches. */
-static void ple_sift(ple_fragment_t *items, size_t root, size_t count) {
-    ple_fragment_t value = items[root];
-    while (root < count / 2) {
-        size_t child = root * 2 + 1;
-        if (child + 1 < count && ple_fragment_compare(&items[child], &items[child + 1]) < 0)
-            child++;
-        if (ple_fragment_compare(&value, &items[child]) >= 0) break;
-        items[root] = items[child];
-        root = child;
-    }
-    items[root] = value;
-}
-
-static void ple_sort(ple_fragment_t *items, size_t count) {
-    for (size_t i = count / 2; i > 0; i--) ple_sift(items, i - 1, count);
-    for (size_t end = count; end > 1; end--) {
-        ple_fragment_t value = items[end - 1];
-        items[end - 1] = items[0];
-        items[0] = value;
-        ple_sift(items, 0, end - 1);
-    }
-}
-
-static bool ple_plan(ple_reader_t *reader, const char *ids, char *weights, char *scales, size_t count) {
-    reader->fragment_count = reader->job_count = 0;
-    for (size_t i = 0; i < count; i++) {
-        int64_t id;
-        memcpy(&id, ids + i * sizeof(id), sizeof(id));
-        if (id < reader->tp_start || id >= reader->tp_end) {
-            memset(weights + i * reader->weight_bytes, 0, reader->weight_bytes);
-            if (reader->scale_bytes) memset(scales + i * reader->scale_bytes, 0, reader->scale_bytes);
-            continue;
-        }
-        for (int plane = 0; plane < (reader->scale_bytes ? 2 : 1); plane++) {
-            ple_source_t key = {.shard = id / reader->shard_rows, .scale = plane != 0};
-            ple_source_t *source = reader->source_count ? bsearch(&key, reader->sources,
-                reader->source_count, sizeof(key), ple_source_compare) : NULL;
-            if (!source) {
-                snprintf(reader->failure.message, sizeof(reader->failure.message),
-                         "missing PLE %s source for shard %lld", plane ? "scale" : "weight", (long long)key.shard);
-                return false;
-            }
-            size_t bytes = plane ? reader->scale_bytes : reader->weight_bytes;
-            char *destination = (plane ? scales : weights) + i * bytes;
-            int64_t offset = source->offset + (id % reader->shard_rows) * (int64_t)bytes;
-            reader->requested_bytes += bytes;
-            while (bytes) {
-                unsigned length = PLE_BLOCK - (uint64_t)offset % PLE_BLOCK;
-                if (bytes < length) length = (unsigned)bytes;
-                reader->fragments[reader->fragment_count++] =
-                    (ple_fragment_t){source->file, offset, length, destination};
-                offset += length;
-                destination += length;
-                bytes -= length;
-            }
-        }
-    }
-    ple_sort(reader->fragments, reader->fragment_count);
-    size_t cursor = 0;
-    while (cursor < reader->fragment_count) {
-        size_t begin = cursor;
-        ple_fragment_t *fragment = &reader->fragments[cursor];
-        size_t file = fragment->file;
-        int64_t first = fragment->offset & ~(int64_t)(PLE_BLOCK - 1);
-        int64_t last = first;
-        reader->unique_blocks++;
-        cursor++;
-        while (cursor < reader->fragment_count) {
-            fragment = &reader->fragments[cursor];
-            int64_t block = fragment->offset & ~(int64_t)(PLE_BLOCK - 1);
-            if (fragment->file != file || (block != last &&
-                (block - last != PLE_BLOCK || block - first >= PLE_READ_MAX))) break;
-            if (block != last) { reader->unique_blocks++; last = block; }
-            cursor++;
-        }
-        unsigned aligned = (unsigned)(last - first) + PLE_BLOCK;
-        int64_t available = reader->files[file].bytes - first;
-        unsigned expected = available < aligned ? (unsigned)available : aligned;
-        reader->jobs[reader->job_count++] = (ple_job_t){file, begin, cursor, first, aligned, expected};
-        if (last != first) reader->coalesced_reads++;
-    }
-    return true;
 }
 
 #ifdef B12X_HAVE_LIBURING
@@ -375,7 +223,7 @@ static bool ple_plan(ple_reader_t *reader, const char *ids, char *weights, char 
  * CQE, and retire the ring without submitting those pending entries. */
 static void ple_submit_wave(ple_reader_t *reader, unsigned free_count,
                             size_t *next, unsigned *outstanding) {
-    size_t remaining = reader->job_count - *next;
+    size_t remaining = reader->plan.job_count - *next;
     unsigned count = remaining < free_count ? (unsigned)remaining : free_count;
     for (unsigned i = 0; i < count; i++) {
         unsigned slot = reader->free_slots[i];
@@ -385,16 +233,17 @@ static void ple_submit_wave(ple_reader_t *reader, unsigned free_count,
             reader->poisoned = true;
             return;
         }
-        ple_job_t *job = &reader->jobs[*next];
+        ple_job_t *job = &reader->plan.jobs[*next];
         reader->slots[slot].job = (*next)++;
-        io_uring_prep_read_fixed(sqe, reader->files[job->file].fd,
+        io_uring_prep_read_fixed(sqe, (int)job->file,
                                 reader->slots[slot].buffer, job->length,
                                 job->offset, (int)slot);
+        sqe->flags |= IOSQE_FIXED_FILE;
         io_uring_sqe_set_data64(sqe, slot);
     }
     unsigned pending = count;
     while (pending) {
-        reader->submit_calls++;
+        reader->plan.submit_calls++;
         int result = io_uring_submit(&reader->ring);
         if (result == -EINTR) continue;
         if (result <= 0) {
@@ -423,27 +272,19 @@ static void ple_uring_run(ple_reader_t *reader) {
             }
             continue;
         }
-        unsigned free_count = 0;
-        for (;;) {
+        unsigned free_count = 0, head;
+        io_uring_for_each_cqe(&reader->ring, head, cqe) {
             unsigned slot = (unsigned)io_uring_cqe_get_data64(cqe);
             int status = cqe->res;
-            io_uring_cqe_seen(&reader->ring, cqe);
             outstanding--;
             ple_scatter(reader, reader->slots[slot].job, reader->slots[slot].buffer, status);
             reader->free_slots[free_count++] = slot;
             if (!outstanding) break;
-            result = io_uring_peek_cqe(&reader->ring, &cqe);
-            if (result < 0) {
-                if (result != -EAGAIN && result != -EINTR) {
-                    ple_error(reader, "io_uring completion peek", -result);
-                    reader->poisoned = true;
-                }
-                break;
-            }
         }
+        io_uring_cq_advance(&reader->ring, free_count);
         /* Do not prepare refill SQEs until every collected completion has been
          * checked. An I/O error therefore leaves no speculative refill entries. */
-        if (!reader->failure.message[0] && next < reader->job_count)
+        if (!reader->plan.failure.message[0] && next < reader->plan.job_count)
             ple_submit_wave(reader, free_count, &next, &outstanding);
     }
     if (reader->poisoned) {
@@ -465,22 +306,22 @@ static PyObject *py_ple_reader_run(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "OOOOL", &capsule, &ids_object, &weights_object, &scales_object, &count)) return NULL;
     ple_reader_t *reader = PyCapsule_GetPointer(capsule, PLE_CAPSULE);
     if (!reader) return NULL;
-    if (count < 0 || (uint64_t)count > reader->max_lookups)
+    if (count < 0 || (uint64_t)count > reader->plan.max_lookups)
         return PyErr_Format(PyExc_ValueError, "PLE lookup count exceeds batch capacity");
     Py_buffer ids = {0}, weights = {0}, scales = {0};
     if (PyObject_GetBuffer(ids_object, &ids, PyBUF_CONTIG_RO) < 0) return NULL;
     if (PyObject_GetBuffer(weights_object, &weights, PyBUF_CONTIG) < 0) goto failed;
-    if (reader->scale_bytes && PyObject_GetBuffer(scales_object, &scales, PyBUF_CONTIG) < 0) goto failed;
-    if (!reader->scale_bytes && scales_object != Py_None) {
+    if (reader->plan.scale_bytes && PyObject_GetBuffer(scales_object, &scales, PyBUF_CONTIG) < 0) goto failed;
+    if (!reader->plan.scale_bytes && scales_object != Py_None) {
         PyErr_SetString(PyExc_ValueError, "PLE reader has no scale plane; pass None");
         goto failed;
     }
     size_t id_bytes = (size_t)count * 8;
-    size_t weight_bytes = (size_t)count * reader->weight_bytes;
-    size_t scale_bytes = (size_t)count * reader->scale_bytes;
+    size_t weight_bytes = (size_t)count * reader->plan.weight_bytes;
+    size_t scale_bytes = (size_t)count * reader->plan.scale_bytes;
     if ((size_t)ids.len < id_bytes || (size_t)weights.len < weight_bytes || (size_t)scales.len < scale_bytes ||
         !PyBuffer_IsContiguous(&ids, 'C') || !PyBuffer_IsContiguous(&weights, 'C') ||
-        (reader->scale_bytes && !PyBuffer_IsContiguous(&scales, 'C'))) {
+        (reader->plan.scale_bytes && !PyBuffer_IsContiguous(&scales, 'C'))) {
         PyErr_SetString(PyExc_ValueError, "PLE buffers must be C-contiguous and cover count rows (IDs are native signed int64 bytes)");
         goto failed;
     }
@@ -493,22 +334,31 @@ static PyObject *py_ple_reader_run(PyObject *self, PyObject *args) {
     failure_t failure = {{0}};
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&reader->api_mutex);
-    struct timespec start, end;
+    struct timespec start, planned_at, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    reader->failure.message[0] = 0;
-    reader->lookups = count;
-    reader->requested_bytes = reader->read_bytes = reader->read_calls = 0;
-    reader->unique_blocks = reader->coalesced_reads = reader->submit_calls = 0;
+    reader->plan.failure.message[0] = 0;
+    reader->plan.lookups = count;
+    reader->plan.requested_bytes = reader->plan.read_bytes = reader->plan.read_calls = 0;
+    reader->plan.unique_blocks = reader->plan.coalesced_reads = reader->plan.submit_calls = 0;
+    reader->plan.planning_seconds = 0;
     if (reader->poisoned)
-        snprintf(reader->failure.message, sizeof(reader->failure.message), "PLE io_uring reader is unusable after a submission/completion failure; create a new reader");
-    else if (ple_plan(reader, ids.buf, weights.buf, scales.buf, count) && reader->job_count) {
+        snprintf(reader->plan.failure.message, sizeof(reader->plan.failure.message), "PLE io_uring reader is unusable after a submission/completion failure; create a new reader");
+    else {
+        bool planned = ple_plan(&reader->plan, ids.buf, weights.buf, scales.buf, count);
+        clock_gettime(CLOCK_MONOTONIC, &planned_at);
+        reader->plan.planning_seconds = (double)(planned_at.tv_sec - start.tv_sec) +
+            (double)(planned_at.tv_nsec - start.tv_nsec) * 1e-9;
 #ifdef B12X_HAVE_LIBURING
-        ple_uring_run(reader);
+        reader->weights = weights.buf;
+        reader->scales = scales.buf;
+        if (planned && reader->plan.job_count) ple_uring_run(reader);
+#else
+        (void)planned;
 #endif
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
-    reader->execution_seconds = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) * 1e-9;
-    failure = reader->failure;
+    reader->plan.execution_seconds = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) * 1e-9;
+    failure = reader->plan.failure;
     pthread_mutex_unlock(&reader->api_mutex);
     Py_END_ALLOW_THREADS
     PyBuffer_Release(&ids);
@@ -528,23 +378,25 @@ static PyObject *py_ple_reader_stats(PyObject *self, PyObject *capsule) {
     ple_reader_t *reader = PyCapsule_GetPointer(capsule, PLE_CAPSULE);
     if (!reader) return NULL;
     uint64_t lookups, requested, bytes, calls, blocks, coalesced, submits, staging, metadata;
-    double seconds;
+    double seconds, planning;
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&reader->api_mutex);
-    lookups = reader->lookups;
-    requested = reader->requested_bytes;
-    bytes = reader->read_bytes;
-    calls = reader->read_calls;
-    blocks = reader->unique_blocks;
-    coalesced = reader->coalesced_reads;
-    submits = reader->submit_calls;
-    seconds = reader->execution_seconds;
+    lookups = reader->plan.lookups;
+    requested = reader->plan.requested_bytes;
+    bytes = reader->plan.read_bytes;
+    calls = reader->plan.read_calls;
+    blocks = reader->plan.unique_blocks;
+    coalesced = reader->plan.coalesced_reads;
+    submits = reader->plan.submit_calls;
+    seconds = reader->plan.execution_seconds;
+    planning = reader->plan.planning_seconds;
     staging = (uint64_t)reader->slots_count * PLE_READ_MAX;
-    metadata = sizeof(*reader) + reader->capacity * (sizeof(*reader->fragments) + sizeof(*reader->jobs)) +
-        reader->slots_count * sizeof(*reader->slots) + reader->source_count * sizeof(*reader->sources) +
-        reader->file_count * sizeof(*reader->files);
+    metadata = sizeof(*reader) + reader->plan.capacity * (sizeof(*reader->plan.fragments) + sizeof(*reader->plan.jobs)) +
+        reader->slots_count * sizeof(*reader->slots) + reader->plan.source_count * sizeof(*reader->plan.sources) +
+        reader->plan.file_count * sizeof(*reader->plan.files);
 #ifdef B12X_HAVE_LIBURING
     metadata += reader->slots_count * (sizeof(*reader->iovecs) + sizeof(*reader->free_slots));
+    metadata += reader->plan.file_count * sizeof(*reader->registered_fds);
     if (reader->ring_ready) {
         metadata += reader->ring.sq.ring_sz;
         if (reader->ring.cq.ring_ptr != reader->ring.sq.ring_ptr) metadata += reader->ring.cq.ring_sz;
@@ -553,11 +405,11 @@ static PyObject *py_ple_reader_stats(PyObject *self, PyObject *capsule) {
 #endif
     pthread_mutex_unlock(&reader->api_mutex);
     Py_END_ALLOW_THREADS
-    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d}",
+    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d,s:d}",
         "lookups", (unsigned long long)lookups, "requested_bytes", (unsigned long long)requested,
         "read_bytes", (unsigned long long)bytes, "read_calls", (unsigned long long)calls,
         "unique_blocks", (unsigned long long)blocks, "coalesced_reads", (unsigned long long)coalesced,
         "submit_calls", (unsigned long long)submits,
         "staging_bytes", (unsigned long long)staging, "metadata_bytes", (unsigned long long)metadata,
-        "execution_seconds", seconds);
+        "execution_seconds", seconds, "planning_seconds", planning);
 }

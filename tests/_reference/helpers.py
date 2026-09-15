@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Tuple
+from contextlib import contextmanager
+from typing import Iterator
 
 import pytest
 import torch
@@ -136,49 +137,69 @@ def prepare_tp_moe_fp4_experts(
     quant_mode: str = "nvfp4",
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
-    """Prepare an expert owner, retaining NVFP4 oracle inputs via shared recipes."""
-    from b12x.moe.fused_moe._impl import (
-        plan_b12x_fp4_moe_weights,
-        prepare_b12x_fp4_moe_weights,
-    )
+    """Prepare canonical expert weights while retaining the source-scale recipe."""
+    from b12x.moe import fused_moe
 
     normalized_mode = quant_mode.lower()
-    weight_E = int(w1_fp4.shape[0])
-    n = int(w2_fp4.shape[2]) * 2
-    weight_plan = plan_b12x_fp4_moe_weights(
-        quant_modes=(
-            ("nvfp4", "w4a16")
-            if normalized_mode == "w4a16" and source_format == "modelopt_nvfp4"
-            else normalized_mode
+    activation_mode = {
+        "nvfp4": fused_moe.ActivationMode.A4,
+        "w4a16": fused_moe.ActivationMode.A16,
+        "w4a8_nvfp4": fused_moe.ActivationMode.A8,
+        "w4a8_mx": fused_moe.ActivationMode.A8,
+    }.get(normalized_mode)
+    if activation_mode is None:
+        raise ValueError(f"unsupported TP MoE fixture recipe {quant_mode!r}")
+    if normalized_mode == "w4a8_mx":
+        source_format = "fp4_e8m0_k32"
+    elif normalized_mode in {"nvfp4", "w4a16", "w4a8_nvfp4"}:
+        source_format = "modelopt_nvfp4"
+
+    weight_plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat(source_format),
+            w13_layout=fused_moe.W13Layout(w13_layout),
         ),
-        source_format=source_format,
-        activation=activation,
-        params_dtype=a.dtype,
-        num_experts=weight_E,
-        hidden_size=int(a.shape[1]),
-        intermediate_size=n,
-        w13_layout=w13_layout,
+        activation=fused_moe.ActivationSpec(
+            mode=activation_mode,
+            nonlinearity=activation,
+            io_dtype=a.dtype,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=int(w1_fp4.shape[0]),
+            hidden_size=int(a.shape[1]),
+            intermediate_size=int(w2_fp4.shape[2]) * 2,
+        ),
     )
-    w1_global_scale = w1_alphas
-    w2_global_scale = w2_alphas
-    if normalized_mode in {"nvfp4", "w4a8_nvfp4"}:
+    if activation_mode is fused_moe.ActivationMode.A16:
+        w1_global_scale, w2_global_scale = w1_alphas, w2_alphas
+        input_scale = intermediate_scale = None
+    else:
         w1_global_scale = (w1_alphas.float() * a1_gscale.float()).contiguous()
         w2_global_scale = (w2_alphas.float() * a2_gscale.float()).contiguous()
-    return prepare_b12x_fp4_moe_weights(
+        input_scale, intermediate_scale = a1_gscale, a2_gscale
+    return fused_moe.prepare_weights(
         plan=weight_plan,
-        w1_fp4=w1_fp4,
-        w1_blockscale=w1_blockscale,
-        w1_global_scale=w1_global_scale,
-        a1_gscale=a1_gscale,
-        w2_fp4=w2_fp4,
-        w2_blockscale=w2_blockscale,
-        w2_global_scale=w2_global_scale,
-        a2_gscale=a2_gscale,
-        params_dtype=a.dtype,
+        weights=fused_moe.PackedWeights(
+            w13=w1_fp4,
+            w2=w2_fp4,
+            w13_block_scales=w1_blockscale,
+            w2_block_scales=w2_blockscale,
+            w13_global_scales=w1_global_scale,
+            w2_global_scales=w2_global_scale,
+            input_scale=input_scale,
+            intermediate_scale=intermediate_scale,
+        ),
     )
 
 
+@contextmanager
 def make_tp_moe_fp4_binding(
     *,
     a: torch.Tensor,
@@ -193,55 +214,104 @@ def make_tp_moe_fp4_binding(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
-):
+) -> Iterator[object]:
+    """Prepare one exact-M execution and yield its real caller-owned binding."""
     from b12x.moe import fused_moe
+    from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
+    from b12x.preparation.types import require_prepared
 
-    modes = experts.plan.quant_modes
-    planned_mode = (
-        quant_mode.lower() if quant_mode is not None
-        else "w4a16" if modes == {"nvfp4", "w4a16"}
-        else next(iter(modes))
-    )
-    if planned_mode not in modes:
+    if not isinstance(experts, fused_moe.PreparedExperts):
+        raise TypeError("experts must be canonical fused_moe.PreparedExperts")
+    activation = experts.plan.activation
+    requested_mode = quant_mode.lower() if quant_mode is not None else None
+    expected_mode = {
+        fused_moe.ActivationMode.A4: "nvfp4",
+        fused_moe.ActivationMode.A16: "w4a16",
+        fused_moe.ActivationMode.A8: (
+            "w4a8_mx"
+            if experts.plan.source.format is fused_moe.PackedSourceFormat.MXFP4_E8M0_K32
+            else "w4a8_nvfp4"
+        ),
+    }.get(activation.mode)
+    if requested_mode is not None and requested_mode != expected_mode:
         raise ValueError(
-            f"requested test recipe {planned_mode!r} is not prepared: {sorted(modes)}"
+            f"requested test recipe {requested_mode!r} does not match "
+            f"canonical prepared recipe {expected_mode!r}"
         )
-    plan = fused_moe.plan(
-        fused_moe.Caps(
-            max_tokens=int(a.shape[0]),
-            num_topk=int(topk_ids.shape[1]),
-            device=a.device,
-            weight_plan=experts.plan,
-            quant_mode=planned_mode,
-            core_token_counts=(int(a.shape[0]),),
-            route_num_experts=0,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-        )
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[idx].device)
-        for idx, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
-    )
-    return fused_moe.bind(
-        plan,
-        scratch=scratch,
-        a=a,
+    for name, requested, prepared in (
+        ("swiglu_limit", swiglu_limit, activation.swiglu_limit),
+        ("swiglu_alpha", swiglu_alpha, activation.swiglu_alpha),
+        ("swiglu_beta", swiglu_beta, activation.swiglu_beta),
+    ):
+        if requested is not None and requested != prepared:
+            raise ValueError(f"{name} must be declared while preparing expert weights")
+
+    declaration = fused_moe.plan_execution(
         experts=experts,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        output=output,
-        input_scales_static=input_scales_static,
-        fast_math=fast_math,
+        capacity=fused_moe.ExecutionCapacity(
+            max_tokens=int(a.shape[0]), top_k=int(topk_ids.shape[1]),
+        ),
+        routing=fused_moe.RoutingSpec(
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        ),
+        invocation=FrozenMapping({
+            "fast_math": True if fast_math is None else bool(fast_math),
+        }),
     )
+
+    def bind_with_state(state, scratch):
+        return state.bind(
+            scratch=scratch,
+            a=a,
+            experts=experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            input_scales_static=input_scales_static,
+            fast_math=fast_math,
+        )
+
+    def prepare_call(state):
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            for spec in state.scratch.scratch_specs()
+        )
+        binding = bind_with_state(state, scratch)
+        return PreparedCall(run=lambda: state.run(binding), owners=scratch)
+
+    request = declaration.request(
+        name="tp-moe-fixture",
+        prepare_call=prepare_call,
+    )
+    session = PreparationSession(device=a.device, autotune=False, compile_workers=2)
+    result = session.prepare((request,))
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in require_prepared(request.plan, "moe.decode").scratch.scratch_specs()
+    )
+    try:
+        yield fused_moe.bind(
+            request.plan,
+            scratch=scratch,
+            a=a,
+            experts=experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            input_scales_static=input_scales_static,
+            fast_math=fast_math,
+        )
+    finally:
+        torch.cuda.synchronize(a.device)
+        result.close()
+        session.close()
 
 
 def run_tp_moe_fp4(**kwargs) -> torch.Tensor:
     from b12x.moe import fused_moe
 
-    return fused_moe.run(binding=make_tp_moe_fp4_binding(**kwargs))
+    with make_tp_moe_fp4_binding(**kwargs) as binding:
+        return fused_moe.run(binding=binding)
 
 
 def _align_up(value: int, alignment: int) -> int:

@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.attention import dsa_indexer
 from b12x.attention.dsa_indexer import tiled_topk as tiled_topk_module
 from b12x.attention.dsa_indexer.kernel import (
@@ -50,45 +50,36 @@ from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 
-def test_public_plan_bind_run_contract_is_complete_and_bind_only_views(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("B12X_INDEXER_STREAM_SCORER", "0")
-    plan = dsa_indexer.plan(
-        dsa_indexer.Caps(
-            device="cpu",
-            num_q_heads=4,
-            max_q_rows=2,
-            max_page_table_width=4,
-            topk=2,
-        )
-    )
-    monkeypatch.setenv("B12X_INDEXER_STREAM_SCORER", "1")
-    (spec,) = plan.scratch_specs()
-    scratch = torch.full(spec.shape, 0xA5, dtype=spec.dtype)
-    before = scratch.clone()
-    binding = dsa_indexer.bind(
-        plan,
-        scratch=scratch,
-        q_fp8=torch.empty((2, 4, 128), dtype=torch.float8_e4m3fn),
-        query_weights=torch.empty((2, 4), dtype=torch.bfloat16),
+def _public_dsa_inputs(rows=2, heads=4, topk=2):
+    return dict(
+        q_fp8=torch.empty((rows, heads, 128), dtype=torch.float8_e4m3fn),
+        query_weights=torch.empty((rows, heads), dtype=torch.bfloat16),
         index_k_cache=torch.empty((8, 64 * (128 + 4)), dtype=torch.uint8),
-        page_table=torch.zeros((2, 4), dtype=torch.int32),
-        cache_lengths=torch.full((2,), 64, dtype=torch.int32),
+        page_table=torch.zeros((rows, 4), dtype=torch.int32),
+        cache_lengths=torch.full((rows,), 64, dtype=torch.int32),
         active_width=torch.full((1,), 256, dtype=torch.int32),
-        output_indices=torch.empty((2, 2), dtype=torch.int32),
-        output_scores=torch.empty((2, 2), dtype=torch.float32),
+        output_indices=torch.empty((rows, topk), dtype=torch.int32),
+        output_scores=torch.empty((rows, topk), dtype=torch.float32),
     )
 
-    assert isinstance(binding, dsa_indexer.Binding)
-    assert plan.layout.stream_scorer is False
-    assert binding.runtime.scratch.stream_scorer is False
-    assert binding.runtime.scratch.persistent_scorer_ctas > 0
-    assert binding.runtime.scratch.stream_scorer_ctas > 0
-    torch.testing.assert_close(scratch, before)
+
+def test_public_plan_is_declarative_and_frozen_bind_rejects_it() -> None:
+    caps = dsa_indexer.Caps(
+        device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4, topk=2
+    )
+    inputs = _public_dsa_inputs()
+    declaration = dsa_indexer.plan(
+        caps, invocation=dsa_indexer.invocation_from_tensors(caps, **inputs)
+    )
+    from b12x.preparation import Plan
+
+    assert isinstance(declaration, Plan)
+    assert declaration.prepared is None
+    assert declaration.selection is None
+    with kernel_resolution_guard("frozen"), pytest.raises(RuntimeError, match="not prepared"):
+        dsa_indexer.bind(declaration, scratch=torch.empty(1, dtype=torch.uint8), **inputs)
     assert tuple(inspect.signature(dsa_indexer.run).parameters) == ("binding",)
     assert "index_topk_fp8" not in dsa_indexer.__all__
-    assert "route" not in inspect.signature(dsa_indexer.Caps).parameters
     assert "source_layout" not in inspect.signature(dsa_indexer.Caps).parameters
     assert "resolve_paged_prefill_k_rows" not in dsa_indexer.__all__
 
@@ -97,45 +88,24 @@ def test_public_plan_bind_run_contract_is_complete_and_bind_only_views(
     ("output_index_space", "output_physical_slots"),
     [("logical", False), ("physical", True)],
 )
-def test_public_output_index_space_is_fixed_during_planning(
-    output_index_space: str,
-    output_physical_slots: bool,
+def test_public_output_index_space_is_frozen_in_declaration(
+    output_index_space: str, output_physical_slots: bool
 ) -> None:
-    plan = dsa_indexer.plan(
-        dsa_indexer.Caps(
-            device="cpu",
-            num_q_heads=4,
-            max_q_rows=2,
-            max_page_table_width=4,
-            topk=2,
-            output_index_space=output_index_space,
-        )
+    caps = dsa_indexer.Caps(
+        device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4,
+        topk=2, output_index_space=output_index_space,
     )
-    binding = dsa_indexer.bind(
-        plan,
-        scratch=_one_scratch(plan),
-        q_fp8=torch.empty((2, 4, 128), dtype=torch.float8_e4m3fn),
-        query_weights=torch.empty((2, 4), dtype=torch.bfloat16),
-        index_k_cache=torch.empty((8, 64 * (128 + 4)), dtype=torch.uint8),
-        page_table=torch.zeros((2, 4), dtype=torch.int32),
-        cache_lengths=torch.full((2,), 64, dtype=torch.int32),
-        active_width=torch.full((1,), 256, dtype=torch.int32),
-        output_indices=torch.empty((2, 2), dtype=torch.int32),
+    declaration = dsa_indexer.plan(
+        caps, invocation=dsa_indexer.invocation_from_tensors(caps, **_public_dsa_inputs())
     )
-
-    assert plan.caps.output_physical_slots is output_physical_slots
-    assert binding.runtime.output_physical_slots is output_physical_slots
+    assert declaration.query.output_physical_slots is output_physical_slots
 
 
 def test_public_output_index_space_rejects_unknown_semantics() -> None:
     with pytest.raises(ValueError, match="output_index_space"):
         dsa_indexer.Caps(
-            device="cpu",
-            num_q_heads=4,
-            max_q_rows=2,
-            max_page_table_width=4,
-            topk=2,
-            output_index_space="request_relative",
+            device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4,
+            topk=2, output_index_space="request_relative",
         )
 
 
@@ -950,8 +920,7 @@ def test_contiguous_logits_staged_binding_graph_replay_tracks_live_weights(
             )
         return real_empty(*args, **kwargs)
 
-    freeze_kernel_resolution("staged contiguous graph replay must use warmed kernels")
-    try:
+    with kernel_resolution_guard('staged contiguous graph replay must use warmed kernels'):
         with monkeypatch.context() as patch:
             patch.setattr(torch, "empty", reject_cuda_dummy_empty)
             guarded_out = binding.run()
@@ -960,8 +929,6 @@ def test_contiguous_logits_staged_binding_graph_replay_tracks_live_weights(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured_out = binding.run()
-    finally:
-        unfreeze_kernel_resolution()
 
     assert guarded_out.data_ptr() == out.data_ptr()
     assert captured_out.data_ptr() == out.data_ptr()
@@ -1278,8 +1245,7 @@ def test_contiguous_tiled_topk_graph_replay_tracks_live_weights(monkeypatch) -> 
             )
         return real_empty(*args, **kwargs)
 
-    freeze_kernel_resolution("staged tiled top-k graph replay must use warmed kernels")
-    try:
+    with kernel_resolution_guard('staged tiled top-k graph replay must use warmed kernels'):
         with monkeypatch.context() as patch:
             patch.setattr(torch, "empty", reject_cuda_dummy_empty)
             guarded_out = contiguous_tiled_topk(
@@ -1298,8 +1264,6 @@ def test_contiguous_tiled_topk_graph_replay_tracks_live_weights(monkeypatch) -> 
                 kv_fp8=bound_kv_fp8,
                 binding=binding,
             )
-    finally:
-        unfreeze_kernel_resolution()
 
     assert binding.output_indices is not None
     assert binding.output_values is not None
@@ -1535,10 +1499,7 @@ def test_contiguous_tiled_topk_live_rows_do_not_resolve_new_kernel(
     warm_misses = compile_cache_info()["compile_misses"]
 
     live_q, live_weights, live_kv, live_binding, _ = make_inputs(1536, 5001)
-    freeze_kernel_resolution(
-        "indexer contiguous live rows and padded K rows should be runtime"
-    )
-    try:
+    with kernel_resolution_guard('indexer contiguous live rows and padded K rows should be runtime'):
         actual = contiguous_tiled_topk(
             q_fp8=live_q,
             weights=live_weights,
@@ -1546,8 +1507,6 @@ def test_contiguous_tiled_topk_live_rows_do_not_resolve_new_kernel(
             binding=live_binding,
         )
         torch.cuda.synchronize(device)
-    finally:
-        unfreeze_kernel_resolution()
 
     assert actual.shape == (1536, topk)
     assert compile_cache_info()["compile_misses"] == warm_misses
@@ -1629,8 +1588,7 @@ def test_row_topk_padded_overflow_is_unique_and_graph_safe() -> None:
     )
     torch.cuda.synchronize(device)
 
-    freeze_kernel_resolution("padded row top-k graph replay must use the warmed kernel")
-    try:
+    with kernel_resolution_guard('padded row top-k graph replay must use the warmed kernel'):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run_row_topk(
@@ -1642,8 +1600,6 @@ def test_row_topk_padded_overflow_is_unique_and_graph_safe() -> None:
                 output_gather_table=gather_table,
                 write_values=False,
             )
-    finally:
-        unfreeze_kernel_resolution()
     pointers = (
         row_logits.data_ptr(), output_values.data_ptr(), output_indices.data_ptr(),
     )
@@ -1724,8 +1680,7 @@ def test_row_topk_graph_replay_tracks_live_logits_and_lengths() -> None:
     torch.cuda.synchronize(device)
     warm_compile_misses = compile_cache_info()["compile_misses"]
 
-    freeze_kernel_resolution("row top-k graph replay must use the warmed kernel")
-    try:
+    with kernel_resolution_guard('row top-k graph replay must use the warmed kernel'):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured_values, captured_indices = run_row_topk(
@@ -1735,8 +1690,6 @@ def test_row_topk_graph_replay_tracks_live_logits_and_lengths() -> None:
                 output_values=output_values,
                 output_indices=output_indices,
             )
-    finally:
-        unfreeze_kernel_resolution()
 
     assert captured_values.data_ptr() == output_values.data_ptr()
     assert captured_indices.data_ptr() == output_indices.data_ptr()
@@ -1803,16 +1756,13 @@ def test_row_topk_live_rows_do_not_resolve_new_kernel(
     warm_misses = compile_cache_info()["compile_misses"]
 
     live_logits, live_lengths = make_inputs(113)
-    freeze_kernel_resolution("row topk live rows should be runtime")
-    try:
+    with kernel_resolution_guard('row topk live rows should be runtime'):
         values, indices = run_row_topk(
             row_logits=live_logits,
             lengths=live_lengths,
             topk=topk,
         )
         torch.cuda.synchronize(device)
-    finally:
-        unfreeze_kernel_resolution()
 
     expected = torch.topk(live_logits, k=topk, dim=1, largest=True, sorted=False)
     assert compile_cache_info()["compile_misses"] == warm_misses

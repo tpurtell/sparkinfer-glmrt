@@ -516,6 +516,60 @@ class _TensorCorePagedScore(_PagedScore):
     ):
         tx, _, _ = cute.arch.thread_idx()
         bx, row, _ = cute.arch.block_idx()
+        extent = cutlass.min(width, cutlass.min(lengths[row], active[0]))
+        if cutlass.const_expr(self.candidates):
+            extent = cutlass.min(width, candidate_lengths[row])
+            if lengths[row] <= Int32(0) or active[0] <= Int32(0):
+                extent = Int32(0)
+        if Int32(bx) * Int32(64) < extent:
+            self._score_tile(
+                q,
+                qs,
+                weights,
+                pool,
+                pages,
+                lengths,
+                active,
+                candidates,
+                candidate_lengths,
+                scores,
+                rows,
+                width,
+                page_width,
+                page_row_stride,
+                pool_stride,
+                pool_pages,
+            )
+        else:
+            # Public scores require a -inf tail, but invisible tiles need no MMA.
+            column = Int32(bx) * Int32(64) + Int32(tx)
+            if Int32(tx) < Int32(64) and column < width:
+                scores[Int64(row) * Int64(width) + Int64(column)] = BFloat16(
+                    -float("inf")
+                )
+
+    @cute.jit
+    def _score_tile(
+        self,
+        q: cute.Tensor,
+        qs: cute.Tensor,
+        weights: cute.Tensor,
+        pool: cute.Tensor,
+        pages: cute.Tensor,
+        lengths: cute.Tensor,
+        active: cute.Tensor,
+        candidates: cute.Tensor,
+        candidate_lengths: cute.Tensor,
+        scores: cute.Tensor,
+        rows: Int32,
+        width: Int32,
+        page_width: Int32,
+        page_row_stride: Int64,
+        pool_stride: Int64,
+        pool_pages: Int64,
+    ):
+        tx, _, _ = cute.arch.thread_idx()
+        bx, row, _ = cute.arch.block_idx()
         lane = Int32(tx) % Int32(32)
         col = (
             Int32(bx) * Int32(64)
@@ -754,12 +808,18 @@ class _SortPositions:
         tx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
+        # Each of the eight warps owns one element from every 256-slot stripe.
+        # The first five bitonic levels are therefore warp-local; retain them in
+        # registers and publish only the completed 32-element runs.  Higher
+        # levels retain shared storage only for compare-exchanges that actually
+        # cross a warp boundary.
         si = smem.allocate_tensor(
             Int32, cute.make_layout((self.topk,)), byte_alignment=16
         )
-        sv = smem.allocate_tensor(
-            Float32, cute.make_layout((self.topk,)), byte_alignment=16
-        )
+        if cutlass.const_expr(not self.expand_blocks):
+            sv = smem.allocate_tensor(
+                Float32, cute.make_layout((self.topk,)), byte_alignment=16
+            )
         visible = cutlass.min(
             cutlass.max(lengths[row], Int32(0)), cutlass.max(active[0], Int32(0))
         )
@@ -772,23 +832,75 @@ class _SortPositions:
                 valid = valid and idx * Int32(8) < visible
             else:
                 valid = valid and idx < visible
-            si[slot] = Int32(2147483647)
-            if valid:
-                si[slot] = idx
-            sv[slot] = value
+            if not valid:
+                idx = Int32(2147483647)
+
+            for level in cutlass.range_constexpr(1, 6):
+                for step in cutlass.range_constexpr(level - 1, -1, -1):
+                    other_idx = cute.arch.shuffle_sync_bfly(idx, offset=1 << step)
+                    ascending = ((slot & Int32(1 << level)) == Int32(0)) == (
+                        (slot & Int32(1 << step)) == Int32(0)
+                    )
+                    swap = (ascending and idx > other_idx) or (
+                        not ascending and idx < other_idx
+                    )
+                    if cutlass.const_expr(not self.expand_blocks):
+                        other_value = cute.arch.shuffle_sync_bfly(
+                            value, offset=1 << step
+                        )
+                    if swap:
+                        idx = other_idx
+                        if cutlass.const_expr(not self.expand_blocks):
+                            value = other_value
+            si[slot] = idx
+            if cutlass.const_expr(not self.expand_blocks):
+                sv[slot] = value
         cute.arch.sync_threads()
-        for level in cutlass.range_constexpr(1, self.topk.bit_length()):
-            for step in cutlass.range_constexpr(level - 1, -1, -1):
+
+        for level in cutlass.range_constexpr(6, self.topk.bit_length()):
+            # Steps >= 5 pair lanes from distinct warps, so shared storage and a
+            # CTA fence are required only for these exchanges.
+            for step in cutlass.range_constexpr(level - 1, 4, -1):
                 for slot in cutlass.range(Int32(tx), self.topk, 256):
                     other = slot ^ Int32(1 << step)
                     if other > slot:
-                        a, b = si[slot], si[other]
+                        idx, other_idx = si[slot], si[other]
                         ascending = (slot & Int32(1 << level)) == Int32(0)
-                        if (ascending and a > b) or (not ascending and a < b):
-                            va, vb = sv[slot], sv[other]
-                            si[slot], si[other] = b, a
-                            sv[slot], sv[other] = vb, va
+                        if (ascending and idx > other_idx) or (
+                            not ascending and idx < other_idx
+                        ):
+                            si[slot], si[other] = other_idx, idx
+                            if cutlass.const_expr(not self.expand_blocks):
+                                value, other_value = sv[slot], sv[other]
+                                sv[slot], sv[other] = other_value, value
                 cute.arch.sync_threads()
+
+            # The remaining low-bit stages are again confined to each warp.
+            for slot in cutlass.range(Int32(tx), self.topk, 256):
+                idx = si[slot]
+                if cutlass.const_expr(not self.expand_blocks):
+                    value = sv[slot]
+                for step in cutlass.range_constexpr(4, -1, -1):
+                    other_idx = cute.arch.shuffle_sync_bfly(idx, offset=1 << step)
+                    ascending = ((slot & Int32(1 << level)) == Int32(0)) == (
+                        (slot & Int32(1 << step)) == Int32(0)
+                    )
+                    swap = (ascending and idx > other_idx) or (
+                        not ascending and idx < other_idx
+                    )
+                    if cutlass.const_expr(not self.expand_blocks):
+                        other_value = cute.arch.shuffle_sync_bfly(
+                            value, offset=1 << step
+                        )
+                    if swap:
+                        idx = other_idx
+                        if cutlass.const_expr(not self.expand_blocks):
+                            value = other_value
+                si[slot] = idx
+                if cutlass.const_expr(not self.expand_blocks):
+                    sv[slot] = value
+            cute.arch.sync_threads()
+
         for slot in cutlass.range(Int32(tx), self.topk, 256):
             idx = si[slot]
             valid = idx != Int32(2147483647)
@@ -808,14 +920,32 @@ class _SortPositions:
                 if valid:
                     out[out_pos] = idx
                     out_values[out_pos] = sv[slot]
+
         if cutlass.const_expr(self.expand_blocks):
-            if Int32(tx) == Int32(0):
+            # Reuse the now-dead first eight index slots for a two-stage CTA
+            # reduction; this counts only selected, visible (including partial)
+            # blocks and avoids a serial thread-0 scan.
+            count = Int32(0)
+            for slot in cutlass.range(Int32(tx), self.topk, 256):
+                idx = si[slot]
+                if idx != Int32(2147483647):
+                    count += cutlass.min(Int32(8), visible - idx * Int32(8))
+            lane = Int32(tx) & Int32(31)
+            warp = Int32(tx) >> Int32(5)
+            for offset in cutlass.range_constexpr(5):
+                count += cute.arch.shuffle_sync_bfly(count, offset=1 << offset)
+            cute.arch.sync_threads()
+            if lane == Int32(0):
+                si[warp] = count
+            cute.arch.sync_threads()
+            if warp == Int32(0):
                 count = Int32(0)
-                for slot in cutlass.range(self.topk):
-                    idx = si[slot]
-                    if idx != Int32(2147483647):
-                        count += cutlass.min(Int32(8), visible - idx * Int32(8))
-                out_lengths[row] = count
+                if lane < Int32(8):
+                    count = si[lane]
+                for offset in cutlass.range_constexpr(5):
+                    count += cute.arch.shuffle_sync_bfly(count, offset=1 << offset)
+                if lane == Int32(0):
+                    out_lengths[row] = count
 
 
 @cache
@@ -861,16 +991,16 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         *pointers,
         *scalars,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 7, key),
+        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 9, key),
     )
     return raw, dtypes
 
 
-def _launch(kind, recipe, tensors, scalars):
+def _launch(kind, recipe, tensors, scalars, *, launcher=None):
     if tensors[0].device.type != "cuda":
         raise ValueError("native MXFP4 indexer requires CUDA tensors")
     with torch.cuda.device(tensors[0].device):
-        raw, dtypes = _compile(kind, recipe, tensors[0].device.index)
+        raw, dtypes = _compile(kind, recipe, tensors[0].device.index) if launcher is None else launcher
         raw(
             *(_ptr(t, dtype) for t, dtype in zip(tensors, dtypes, strict=True)),
             *scalars,
@@ -887,15 +1017,11 @@ def _check(tensor, name, shape, dtype, device):
         raise ValueError(f"{name} must be contiguous on {device}")
 
 
-def quantize_q_mxfp4(
-    query: torch.Tensor, *, q_mxfp4: torch.Tensor, q_scales: torch.Tensor
+def _quantize_q_mxfp4(
+    query: torch.Tensor, *, q_mxfp4: torch.Tensor, q_scales: torch.Tensor,
+    launcher,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize already-RoPE'd BF16 ``[...,128]`` queries into caller buffers.
-
-    Per-32 amax is floored at ``6*2**-126``; scale is ceil-pow2(amax/6),
-    stored as a UE8M0 byte, and E2M1 conversion is nearest-even saturated.
-    No rotation or query-weight scale folding is performed here.
-    """
+    """Run the prepared query-quantizer launcher into caller-owned buffers."""
     if query.ndim < 2 or query.shape[-1] != 128:
         raise ValueError("query must have shape (...,128)")
     _check(query, "query", query.shape, torch.bfloat16, query.device)
@@ -904,23 +1030,21 @@ def quantize_q_mxfp4(
     rows = query.numel() // 128
     if rows:
         _launch(
-            "quantize", (False, 64), (query, q_mxfp4, q_scales, query), (rows, 0, 0)
+            "quantize", (False, 64), (query, q_mxfp4, q_scales, query),
+            (rows, 0, 0), launcher=launcher,
         )
     return q_mxfp4, q_scales
 
 
-def quantize_write_index_k_mxfp4(
+def _quantize_write_index_k_mxfp4(
     keys: torch.Tensor,
     *,
     index_k_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     page_size: int = 64,
+    launcher,
 ) -> torch.Tensor:
-    """Quantize BF16 ``[rows,128]`` post-RoPE keys directly into paged storage.
-
-    ``slot_mapping`` is caller-owned int64 physical token slots; negative slots
-    are ignored. Pool offsets are widened before every stride multiplication.
-    """
+    """Run the prepared paged-key writer against caller-owned physical slots."""
     page_bytes = index_mxfp4_page_bytes(page_size)
     if keys.ndim != 2 or keys.shape[1] != 128:
         raise ValueError("keys must have shape (rows,128)")
@@ -933,6 +1057,7 @@ def quantize_write_index_k_mxfp4(
             (True, page_size),
             (keys, index_k_cache, index_k_cache, slot_mapping),
             (keys.shape[0], index_k_cache.shape[0], index_k_cache.stride(0)),
+            launcher=launcher,
         )
     return index_k_cache
 
@@ -957,6 +1082,7 @@ class MXFP4PagedPlan:
     caps: object
     views: tuple
     nbytes: int
+    score_kind: str
 
     @property
     def layout(self):
@@ -989,7 +1115,7 @@ class MXFP4PagedPlan:
         return MXFP4Runtime(scratch=views, **kwargs)
 
 
-def plan_mxfp4(caps):
+def plan_mxfp4(caps, *, score_kind=None):
     width = caps.max_candidates or caps.max_page_table_width * caps.page_size
     rows = caps.max_q_rows
     index_mxfp4_page_bytes(caps.page_size)
@@ -1022,7 +1148,11 @@ def plan_mxfp4(caps):
         nbytes = numel * dtype_nbytes(dtype)
         views.append((name, shape, dtype, offset, nbytes))
         offset += nbytes
-    return MXFP4PagedPlan(caps, tuple(views), offset)
+    if score_kind is None:
+        score_kind = "score_tensorcore" if caps.mode == "prefill" or caps.num_q_heads == 32 else "score"
+    if score_kind not in ("score", "score_tensorcore"):
+        raise ValueError("unsupported MXFP4 score kind")
+    return MXFP4PagedPlan(caps, tuple(views), offset, score_kind)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1152,136 +1282,178 @@ def bind_mxfp4(
         candidate_output=candidate_output,
         candidate_output_lengths=candidate_output_lengths,
     )
-    return Binding(
-        plan=plan,
-        runtime=runtime,
-        q_fp8=None,
-        q_mxfp4=q_mxfp4,
-        q_scales=q_scales,
-        query_weights=query_weights,
-        index_k_cache=index_k_cache,
-        output_indices=output_indices,
-        output_scores=output_scores,
-    )
+    return runtime
 
 
-def score_mxfp4(binding):
+def score_mxfp4(binding, *, launchers=None):
     caps, rt = binding.plan.caps, binding.runtime
     rows = binding.q_mxfp4.shape[0]
     scores = rt.scratch["scores"][:rows]
     candidates = rt.candidate_indices if caps.max_candidates else rt.cache_lengths
-    candidate_lengths = (
-        rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
-    )
+    candidate_lengths = rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
     page_stride = 0 if rt.page_table.shape[0] == 1 else rt.page_table.stride(0)
-    kind = "score_tensorcore" if caps.mode == "prefill" else "score"
+    kind = binding.plan.inner.score_kind
+    recipe = (caps.num_q_heads, bool(caps.max_candidates), caps.page_size)
     _launch(
-        kind,
-        (caps.num_q_heads, bool(caps.max_candidates), caps.page_size),
-        (
-            binding.q_mxfp4,
-            binding.q_scales,
-            binding.query_weights,
-            binding.index_k_cache,
-            rt.page_table,
-            rt.cache_lengths,
-            rt.active_width,
-            candidates,
-            candidate_lengths,
-            scores,
-        ),
-        (
-            rows,
-            scores.shape[1],
-            rt.page_table.shape[1],
-            page_stride,
-            binding.index_k_cache.stride(0),
-            binding.index_k_cache.shape[0],
-        ),
+        kind, recipe,
+        (binding.q_mxfp4, binding.q_scales, binding.query_weights,
+         binding.index_k_cache, rt.page_table, rt.cache_lengths, rt.active_width,
+         candidates, candidate_lengths, scores),
+        (rows, scores.shape[1], rt.page_table.shape[1], page_stride,
+         binding.index_k_cache.stride(0), binding.index_k_cache.shape[0]),
+        launcher=None if launchers is None else launchers[(kind, recipe)],
     )
     return scores
 
 
-def select_mxfp4(binding):
+def select_mxfp4(binding, *, launchers=None):
     caps, rt = binding.plan.caps, binding.runtime
     rows = binding.q_mxfp4.shape[0]
     s = {name: view[:rows] for name, view in rt.scratch.items()}
-    candidate_lengths = (
-        rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
-    )
-    _launch(
-        "prepare",
-        (bool(caps.max_candidates), False),
-        (
-            s["scores"],
-            s["logits"],
-            rt.cache_lengths,
-            rt.active_width,
-            candidate_lengths,
-            s["lengths"],
-        ),
-        (rows, s["scores"].shape[1], s["logits"].shape[1]),
-    )
-    run_row_topk(
-        row_logits=s["logits"],
-        lengths=s["lengths"],
-        topk=caps.topk,
-        output_values=s["values"],
-        output_indices=s["indices"],
-        output_gather_table=rt.candidate_indices,
-    )
-    out_values = (
-        binding.output_scores
-        if binding.output_scores is not None
-        else s["sorted_values"]
-    )
-    _launch(
-        "sort",
-        (caps.topk, False),
-        (
-            s["indices"],
-            s["values"],
-            binding.output_indices,
-            out_values,
-            rt.cache_lengths,
-            rt.active_width,
-            s["lengths"],
-        ),
-        (rows,),
-    )
+    candidate_lengths = rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
+    def launch(kind, recipe, tensors, scalars):
+        _launch(kind, recipe, tensors, scalars,
+                launcher=None if launchers is None else launchers[(kind, recipe)])
+    launch("prepare", (bool(caps.max_candidates), False),
+           (s["scores"], s["logits"], rt.cache_lengths, rt.active_width,
+            candidate_lengths, s["lengths"]),
+           (rows, s["scores"].shape[1], s["logits"].shape[1]))
+    run_row_topk(row_logits=s["logits"], lengths=s["lengths"], topk=caps.topk,
+                 output_values=s["values"], output_indices=s["indices"],
+                 output_gather_table=rt.candidate_indices,
+                 launcher=None if launchers is None else launchers[("topk", caps.topk)][0])
+    out_values = binding.output_scores if binding.output_scores is not None else s["sorted_values"]
+    launch("sort", (caps.topk, False),
+           (s["indices"], s["values"], binding.output_indices, out_values,
+            rt.cache_lengths, rt.active_width, s["lengths"]), (rows,))
     if caps.candidate_topk_blocks:
-        _launch(
-            "prepare",
-            (False, True),
-            (
-                s["scores"],
-                s["block_logits"],
-                rt.cache_lengths,
-                rt.active_width,
-                rt.cache_lengths,
-                s["block_lengths"],
-            ),
-            (rows, s["scores"].shape[1], s["block_logits"].shape[1]),
-        )
-        run_row_topk(
-            row_logits=s["block_logits"],
-            lengths=s["block_lengths"],
-            topk=caps.candidate_topk_blocks,
-            output_values=s["block_values"],
-            output_indices=s["block_indices"],
-        )
-        _launch(
-            "sort",
-            (caps.candidate_topk_blocks, True),
-            (
-                s["block_indices"],
-                s["block_values"],
-                rt.candidate_output,
-                s["block_values"],
-                rt.cache_lengths,
-                rt.active_width,
-                rt.candidate_output_lengths,
-            ),
-            (rows,),
-        )
+        launch("prepare", (False, True),
+               (s["scores"], s["block_logits"], rt.cache_lengths, rt.active_width,
+                rt.cache_lengths, s["block_lengths"]),
+               (rows, s["scores"].shape[1], s["block_logits"].shape[1]))
+        run_row_topk(row_logits=s["block_logits"], lengths=s["block_lengths"],
+                     topk=caps.candidate_topk_blocks,
+                     output_values=s["block_values"], output_indices=s["block_indices"],
+                     launcher=None if launchers is None else launchers[("topk", caps.candidate_topk_blocks)][0])
+        launch("sort", (caps.candidate_topk_blocks, True),
+               (s["block_indices"], s["block_values"], rt.candidate_output,
+                s["block_values"], rt.cache_lengths, rt.active_width,
+                rt.candidate_output_lengths), (rows,))
     return binding.output_indices
+
+
+@dataclass(frozen=True, kw_only=True)
+class MXFP4Binding:
+    """Private binding carrier; public callers receive dsa_indexer.Binding."""
+    plan: object
+    runtime: MXFP4Runtime
+    q_mxfp4: torch.Tensor
+    q_scales: torch.Tensor
+    query_weights: torch.Tensor
+    index_k_cache: torch.Tensor
+    output_indices: torch.Tensor
+    output_scores: torch.Tensor | None
+
+
+class MXFP4PreparedState:
+    """Materialized MXFP4 indexer retaining every callable used at runtime."""
+    def __init__(self, layout, launchers):
+        from types import MappingProxyType
+        self.layout = layout
+        self.caps = layout.caps
+        self._launchers = MappingProxyType(dict(launchers))
+
+    @property
+    def __b12x_programs__(self):
+        """Expose the retained concrete carriers to compile-pool accounting."""
+        from b12x._lib.compile_plan import program_keys
+        return program_keys(self.__b12x_dependencies__)
+
+    @property
+    def __b12x_dependencies__(self):
+        return tuple(launcher[0] for launcher in self._launchers.values())
+
+    def bind(self, *, scratch, q_mxfp4, q_scales, query_weights, index_k_cache,
+             page_table, cache_lengths, active_width, output_indices,
+             output_scores=None, candidate_indices=None, candidate_lengths=None,
+             candidate_output=None, candidate_output_lengths=None, score_width=None,
+             **_ignored):
+        runtime = bind_mxfp4(
+            self, scratch=scratch, q_mxfp4=q_mxfp4, q_scales=q_scales,
+            query_weights=query_weights, index_k_cache=index_k_cache,
+            page_table=page_table, cache_lengths=cache_lengths,
+            active_width=active_width, output_indices=output_indices,
+            output_scores=output_scores, candidate_indices=candidate_indices,
+            candidate_lengths=candidate_lengths, candidate_output=candidate_output,
+            candidate_output_lengths=candidate_output_lengths, score_width=score_width,
+        )
+        return MXFP4Binding(plan=self, runtime=runtime, q_mxfp4=q_mxfp4,
+                            q_scales=q_scales, query_weights=query_weights,
+                            index_k_cache=index_k_cache, output_indices=output_indices,
+                            output_scores=output_scores)
+
+    @property
+    def inner(self):
+        return self.layout
+
+    def quantize_query(self, query, *, q_mxfp4, q_scales):
+        return _quantize_q_mxfp4(
+            query, q_mxfp4=q_mxfp4, q_scales=q_scales,
+            launcher=self._launchers[("quantize", (False, 64))],
+        )
+
+    def write_index_keys(self, keys, *, index_k_cache, slot_mapping):
+        return _quantize_write_index_k_mxfp4(
+            keys, index_k_cache=index_k_cache, slot_mapping=slot_mapping,
+            page_size=self.caps.page_size,
+            launcher=self._launchers[("quantize", (True, self.caps.page_size))],
+        )
+
+    def run(self, binding):
+        score_mxfp4(binding, launchers=self._launchers)
+        return select_mxfp4(binding, launchers=self._launchers)
+
+
+def materialize_mxfp4(caps, *, device_index, score_kind=None):
+    """Create durable layout and launchers; execution never consults compiler caches."""
+    layout = plan_mxfp4(caps, score_kind=score_kind)
+    recipes = [
+        ("quantize", (False, 64)),
+        ("quantize", (True, caps.page_size)),
+        (layout.score_kind,
+         (caps.num_q_heads, bool(caps.max_candidates), caps.page_size)),
+        ("prepare", (bool(caps.max_candidates), False)),
+        ("sort", (caps.topk, False)),
+    ]
+    if caps.candidate_topk_blocks:
+        recipes.extend((
+            ("prepare", (False, True)),
+            ("sort", (caps.candidate_topk_blocks, True)),
+        ))
+    launchers = {
+        (kind, recipe): _compile(kind, recipe, device_index)
+        for kind, recipe in recipes
+    }
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from b12x._lib.compile_plan import compile_only_launches
+
+    width = caps.max_candidates or caps.max_page_table_width * caps.page_size
+    selectors = [(caps.topk, width, bool(caps.max_candidates))]
+    if caps.candidate_topk_blocks:
+        selectors.append((caps.candidate_topk_blocks, (width + 7) // 8, False))
+    with FakeTensorMode(), compile_only_launches():
+        for topk, columns, gather in selectors:
+            def empty(shape, dtype):
+                return torch.empty(shape, dtype=dtype, device=caps.device)
+            resolved = {}
+            run_row_topk(
+                row_logits=empty((caps.max_q_rows, columns), torch.float32),
+                lengths=empty((caps.max_q_rows,), torch.int32),
+                topk=topk,
+                output_values=empty((caps.max_q_rows, topk), torch.float32),
+                output_indices=empty((caps.max_q_rows, topk), torch.int32),
+                output_gather_table=empty((caps.max_q_rows, columns), torch.int32) if gather else None,
+                launcher_sink=resolved,
+            )
+            launchers[("topk", topk)] = (resolved[("row", gather, True)], ())
+    return MXFP4PreparedState(layout, launchers)

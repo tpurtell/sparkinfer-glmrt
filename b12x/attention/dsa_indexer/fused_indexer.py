@@ -30,7 +30,6 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 from cutlass import Float32, Int32, Int64, Uint32
-from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.compiler import (
     KernelCompileSpec,
@@ -46,7 +45,7 @@ from b12x._lib.scratch import (
 from b12x._lib.utils import current_cuda_stream
 
 # Kept in lock-step with the source kernels we fuse.
-from b12x.attention.dsa_indexer._policy import (
+from b12x.attention.dsa_indexer._tuning import (
     FUSED_MERGE_AUTO,
     FUSED_MERGE_CHOICES,
     FUSED_MERGE_COOPERATIVE,
@@ -70,6 +69,7 @@ from b12x.attention.dsa_indexer.tiled_topk import (
 )
 from b12x._lib.intrinsics import ld_shared_f32
 from b12x.attention.dsa_indexer.kernel import (
+    _to_kernel_tensor,
     _stream_issue_k_page_cp_async,
     _INDEX_HEAD_DIM,
     _PAGE_SIZE,
@@ -2880,12 +2880,14 @@ def _fused_indexer_tensor_key(name: str, tensor: torch.Tensor) -> tuple[object, 
     return tensor_compile_fact(name, tensor, dynamic_dims=dynamic_dims)
 
 
-def _launch_fused(kernel, cute_args, key_tensors, policy):
+def _launch_fused(kernel, cute_args, key_tensors, policy, *, launcher=None):
     """Graph-safe launch via b12x_launch (compile-once + replayable run_compiled).
 
     Unlike a bare cute.compile()+call, the b12x_launch path is CUDA-graph-capturable
     (the existing indexer kernels rely on it). Row-bearing key tensors use dynamic
-    row dimensions; policy distinguishes the constexpr variant.
+    row dimensions; policy distinguishes the constexpr variant.  A prepared owner
+    supplies the already-resolved launcher; this branch must never consult the
+    compiler cache during serving replay.
     """
     # The variant string names the traced kernel body: the direct-K score
     # path and the cross-CTA merge arm (cooperative grid barrier, or the
@@ -2913,7 +2915,11 @@ def _launch_fused(kernel, cute_args, key_tensors, policy):
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.fused_indexer", 1, cache_key, labels=labels
     )
-    b12x_launch(
+    if launcher is not None:
+        from b12x._lib.compiler import run_compiled
+
+        return run_compiled(launcher, cute_args)
+    return b12x_launch(
         kernel,
         compile_spec=compile_spec,
         compile_args=cute_args,
@@ -2966,13 +2972,6 @@ def fused_indexer_scratch_capacity(
     return pack_elems, state_words
 
 
-def _to_kernel_tensor(tensor: torch.Tensor, dtype, *, assumed_align: int = 16):
-    cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
-    cute_tensor.element_type = dtype
-    leading_dim = next((i for i, s in enumerate(tensor.stride()) if s == 1), None)
-    if leading_dim is not None and tensor.ndim >= 2:
-        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
-    return cute_tensor
 
 
 def run_fused_paged_indexer(
@@ -2994,6 +2993,7 @@ def run_fused_paged_indexer(
     merge_state: torch.Tensor | None = None,
     merge_state_preinitialized: bool = False,
     output_physical_slots: bool = False,
+    launcher=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Paged fused indexer. ctas_per_group>1 splits the row's K across cooperating CTAs.
     Returns (indices, values).
@@ -3056,9 +3056,9 @@ def run_fused_paged_indexer(
                 f"fused indexer merge_state too small: need {state_need}, have "
                 f"{merge_state.numel()} (size via fused_indexer_scratch_capacity)"
             )
-        pack_v = pack_values[:pack_need]
-        pack_i = pack_indices[:pack_need]
-        state = merge_state[:state_need]
+        pack_v = pack_values.narrow(0, 0, pack_need)
+        pack_i = pack_indices.narrow(0, 0, pack_need)
+        state = merge_state.narrow(0, 0, state_need)
         if not bool(merge_state_preinitialized):
             state.zero_()
     else:
@@ -3141,6 +3141,7 @@ def run_fused_paged_indexer(
             bool(vectorized_q_load),
             q_row_stride_bytes,
         ),
+        launcher=launcher,
     )
     return out_i, out_v
 

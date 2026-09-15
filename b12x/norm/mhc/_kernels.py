@@ -29,6 +29,8 @@ from b12x._lib.compiler import (
 from b12x._lib.compiler import (
     launch as b12x_launch,
 )
+from b12x._lib.compiler import run_compiled
+from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32,
     bfloat2_to_float2_scaled,
@@ -43,7 +45,12 @@ from b12x._lib.intrinsics import (
     tf32_mma_m16n8k8_f32,
 )
 from b12x._lib.utils import current_cuda_stream
-from b12x.norm.mhc._policy import MhcConfig
+
+
+def _compile_mhc_entry(*args, **kwargs):
+    if not compile_only_launches_enabled():
+        raise RuntimeError("MHC launchers must be resolved by preparation")
+    return b12x_launch(*args, **kwargs)
 
 @cute.jit
 def _contract_four(
@@ -98,10 +105,10 @@ def _collapse_kernel(hidden_size: int, weighted: bool) -> _MhcCollapse:
     return _MhcCollapse(hidden_size, weighted)
 
 
-@torch.library.custom_op("b12x::mhc_collapse", mutates_args=("out",))
-def _mhc_collapse_op(
+def _run_mhc_collapse_launch(
     state: torch.Tensor, pre_mix: torch.Tensor | None, out: torch.Tensor,
-) -> None:
+    *, _prepared=None,
+):
     if torch._C._overlaps(state, out) or (
         pre_mix is not None and torch._C._overlaps(pre_mix, out)
     ):
@@ -120,6 +127,8 @@ def _mhc_collapse_op(
         _to_kernel_tensor(out, cutlass.BFloat16, assumed_align=2, dynamic_layout=True),
         Int32(tokens), current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     key = (
         hidden, weighted,
         tensor_key(
@@ -128,18 +137,13 @@ def _mhc_collapse_op(
         ),
         tensor_key("out", out, dims=(DimKey.dynamic(), DimKey.exact(hidden))),
     )
-    b12x_launch(
+    return _compile_mhc_entry(
         _collapse_kernel(hidden, weighted),
         compile_spec=KernelCompileSpec.from_key("norm.mhc.collapse", 1, key),
         compile_args=args, runtime_args=args,
     )
 
 
-@_mhc_collapse_op.register_fake
-def _mhc_collapse_fake(
-    state: torch.Tensor, pre_mix: torch.Tensor | None, out: torch.Tensor,
-) -> None:
-    del state, pre_mix, out
 
 
 _MHC_MULT = 4
@@ -279,11 +283,14 @@ _PREFILL_TF32_TMA_CHUNK_4096_STAGES = int(
         os.getenv("B12X_MHC_PREFILL_TF32_TMA_STAGES", "2"),
     )
 )
+# At 8192+ tokens, four K splits give the same 256-CTA launch while doubling
+# useful work per CTA relative to the 4096-token specialization.
 _PREFILL_TF32_TMA_CHUNK_4096_K_SPLITS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_K_SPLITS", "8")
 )
-# At 8192+ tokens, four K splits give the same 256-CTA launch while doubling
-# useful work per CTA relative to the 4096-token specialization.
+_PREFILL_TF32_TMA_LONG_4096_K_SPLITS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
+)
 _PREFILL_TF32_TMA_LONG_4096_M_WARPS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_M_WARPS", "8")
 )
@@ -301,9 +308,6 @@ _PREFILL_TF32_TMA_LONG_4096_TILE_K = int(
 )
 _PREFILL_TF32_TMA_LONG_4096_STAGES = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_STAGES", "2")
-)
-_PREFILL_TF32_TMA_LONG_4096_K_SPLITS = int(
-    os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
 )
 _PREFILL_FINALIZE_THREADS = int(
     os.getenv("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
@@ -440,24 +444,6 @@ def _materialize_residual_gram_f32(value, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _tf32_residual_bits(value: Float32, high: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Round the FP32 remainder after the first TF32 term."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(value).ir_value(loc=loc, ip=ip), Uint32(high).ir_value(loc=loc, ip=ip)],
-            "{ .reg .f32 hi, lo; mov.b32 hi, $2; sub.rn.f32 lo, $1, hi; cvt.rna.tf32.f32 $0, lo; }",
-            "=r,f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
 def _source_tiles_for_hidden(hidden_size: int) -> int:
     hidden_size = int(hidden_size)
     if hidden_size <= 0:
@@ -544,6 +530,15 @@ def _to_kernel_tensor(
     assumed_align: int = 16,
     dynamic_layout: bool = False,
 ) -> cutlass.cute.Tensor:
+    if compile_only_launches_enabled() and hasattr(tensor, "fake_mode"):
+        from cutlass.cute.runtime import make_fake_tensor
+        leading_dim = next((i for i, stride in enumerate(tensor.stride()) if stride == 1), None)
+        if dynamic_layout and tensor.ndim >= 1 and leading_dim is not None:
+            shape = tuple(cute.sym_int(32) for _ in tensor.shape)
+            strides = tuple(1 if i == leading_dim else cute.sym_int(64) for i in range(tensor.ndim))
+        else:
+            shape, strides = tuple(tensor.shape), tuple(tensor.stride())
+        return make_fake_tensor(dtype, shape, strides, assumed_align=assumed_align)
     tensor = tensor.detach()
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
@@ -648,120 +643,20 @@ def _validate_post_pre_partials_per_cta(partials_per_cta: int) -> int:
     return partials_per_cta
 
 
-def _selected_post_pre_decode_split_n(
-    *,
-    num_tokens: int,
-    hidden_size: int,
-    compute_capability: tuple[int, int] | None = None,
-) -> tuple[int, int]:
-    raw_splits = os.environ.get("B12X_MHC_DECODE_SPLITS")
-    if raw_splits is not None and raw_splits != "":
-        try:
-            splits = int(raw_splits)
-            tile_n = int(os.environ.get("B12X_MHC_DECODE_TILE_N", "3"))
-        except ValueError as exc:
-            raise ValueError(
-                "B12X_MHC_DECODE_SPLITS and B12X_MHC_DECODE_TILE_N must be integers"
-            ) from exc
-        if splits == 0:
-            return 0, 0
-    else:
-        if compute_capability is None and torch.cuda.is_available():
-            compute_capability = tuple(torch.cuda.get_device_capability())
-        if compute_capability != (12, 1) or int(hidden_size) != _HIDDEN:
-            return 0, 0
-        if int(num_tokens) >= 10:
-            splits, tile_n = 8, 6
-        elif int(num_tokens) >= 8:
-            splits, tile_n = 4, 6
-        else:
-            return 0, 0
-    if splits <= 0 or splits > _SOURCE_TILES or int(hidden_size) % splits != 0:
-        raise ValueError(
-            "B12X_MHC_DECODE_SPLITS must be a positive divisor of hidden_size "
-            f"no larger than {_SOURCE_TILES}, got {splits}"
-        )
-    if tile_n <= 0 or _MIXES % tile_n != 0:
-        raise ValueError(
-            f"B12X_MHC_DECODE_TILE_N must divide {_MIXES}, got {tile_n}"
-        )
-    return splits, tile_n
 
 
-def _selected_mhc_decode_finalize_threads(
-    *,
-    num_tokens: int,
-    hidden_size: int,
-    compute_capability: tuple[int, int] | None = None,
-) -> int:
-    raw = os.environ.get("B12X_MHC_DECODE_FINALIZE_THREADS")
-    if raw is not None and raw != "":
-        try:
-            threads = int(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"invalid B12X_MHC_DECODE_FINALIZE_THREADS={raw!r}"
-            ) from exc
-    else:
-        if compute_capability is None and torch.cuda.is_available():
-            compute_capability = tuple(torch.cuda.get_device_capability())
-        if compute_capability != (12, 1) or int(hidden_size) != _HIDDEN:
-            return 0
-        if int(num_tokens) >= 16:
-            threads = 128
-        elif int(num_tokens) >= 13:
-            threads = 512
-        elif int(num_tokens) >= 10:
-            threads = 128
-        elif int(num_tokens) >= 8:
-            threads = 512
-        else:
-            return 0
-    if threads == 0:
-        return 0
-    if (
-        threads <= 0
-        or threads > 1024
-        or threads % 32 != 0
-        or int(hidden_size) % (2 * threads) != 0
-    ):
-        raise ValueError(
-            "B12X_MHC_DECODE_FINALIZE_THREADS must be a positive multiple of "
-            "32 that evenly vectorizes hidden_size, got "
-            f"threads={threads}, hidden_size={hidden_size}"
-        )
-    return threads
 
 
-def _selected_post_pre_partials_per_cta(
-    *,
-    num_tokens: int,
-    hidden_size: int,
-    compute_capability: tuple[int, int] | None = None,
-) -> int:
-    raw = os.environ.get("B12X_MHC_PARTIALS_PER_CTA")
-    if raw is not None and raw != "":
-        try:
-            return _validate_post_pre_partials_per_cta(int(raw))
-        except ValueError as exc:
-            raise ValueError(
-                f"invalid B12X_MHC_PARTIALS_PER_CTA={raw!r}"
-            ) from exc
-
-    if compute_capability is None and torch.cuda.is_available():
-        compute_capability = tuple(torch.cuda.get_device_capability())
-    if compute_capability == (12, 1) and int(hidden_size) == _HIDDEN:
-        if int(num_tokens) >= 8:
-            return 25
-        if int(num_tokens) >= 4:
-            return 9
-    return _POST_PRE_PARTIALS_PER_CTA
 
 
-@lru_cache(maxsize=16)
+
+
+
+@lru_cache(maxsize=32)
 def _post_pre_partial_group_storage_cls(
     partials_per_cta: int,
     compute_gram: bool = False,
+    lagged_mix: bool = False,
 ):
     partials_per_cta = _validate_post_pre_partials_per_cta(partials_per_cta)
 
@@ -777,6 +672,11 @@ def _post_pre_partial_group_storage_cls(
     if compute_gram:
         annotations["gram_sums"] = cute.struct.Align[
             cute.struct.MemRange[cutlass.Float32, _GRAM_PAIRS * (_THREADS // 32)],
+            16,
+        ]
+    if lagged_mix:
+        annotations["lagged_sums"] = cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, _THREADS // 32],
             16,
         ]
     PostPrePartialGroupStorage.__annotations__ = annotations
@@ -957,8 +857,13 @@ class MHCPostPrePartialKernel:
         compute_gram: bool = False,
         pre_only: bool = False,
         post_only: bool = False,
+        lagged_mix: bool = False,
         partials_per_cta: int = _POST_PRE_PARTIALS_PER_CTA,
     ):
+        if compute_gram and lagged_mix:
+            raise ValueError("compute_gram and lagged_mix cannot both be enabled")
+        if post_only and lagged_mix:
+            raise ValueError("post_only and lagged_mix cannot both be enabled")
         self.hidden_size = int(hidden_size)
         self.total_k = _MHC_MULT * self.hidden_size
         self.source_tiles = _source_tiles_for_hidden(self.hidden_size)
@@ -979,6 +884,7 @@ class MHCPostPrePartialKernel:
         # When True, this is the standalone post path: materialize residual_out
         # and skip the fn/residual partial reductions.
         self.post_only = bool(post_only)
+        self.lagged_mix = bool(lagged_mix)
 
     @cute.jit
     def __call__(
@@ -990,6 +896,8 @@ class MHCPostPrePartialKernel:
         fn: cute.Tensor,
         partials: cute.Tensor,
         out: cute.Tensor,
+        pre_mix: cute.Tensor,
+        y: cute.Tensor,
         num_tokens: Int32,
         stream: cuda.CUstream,
     ):
@@ -1013,12 +921,18 @@ class MHCPostPrePartialKernel:
             raise TypeError("partials must be Float32")
         if const_expr(out.element_type != cutlass.BFloat16):
             raise TypeError("out must be BFloat16")
+        if const_expr(self.lagged_mix and pre_mix.element_type != cutlass.Float32):
+            raise TypeError("pre_mix must be Float32")
+        if const_expr(self.lagged_mix and y.element_type != cutlass.BFloat16):
+            raise TypeError("y must be BFloat16")
         partial_groups = (
             1
             if self.post_only
             else (self.partials + self.partials_per_cta - 1) // self.partials_per_cta
         )
-        self.kernel(x, residual, prev_post, prev_comb, fn, partials, out).launch(
+        self.kernel(
+            x, residual, prev_post, prev_comb, fn, partials, out, pre_mix, y
+        ).launch(
             grid=(
                 self.source_tiles,
                 partial_groups,
@@ -1038,6 +952,8 @@ class MHCPostPrePartialKernel:
         fn: cute.Tensor,
         partials: cute.Tensor,
         out: cute.Tensor,
+        pre_mix: cute.Tensor,
+        y: cute.Tensor,
     ):
         hidden_tile, partial_group, token = cute.arch.block_idx()
         token = Int64(token)
@@ -1050,6 +966,7 @@ class MHCPostPrePartialKernel:
             _post_pre_partial_group_storage_cls(
                 self.partials_per_cta,
                 self.compute_gram,
+                self.lagged_mix,
             )
         )
         warp_sums = storage.warp_sums.get_tensor(
@@ -1062,9 +979,13 @@ class MHCPostPrePartialKernel:
             gram_sums = storage.gram_sums.get_tensor(
                 cute.make_layout((_GRAM_PAIRS, nwarps), stride=(nwarps, 1))
             )
+        if const_expr(self.lagged_mix):
+            lagged_sums = storage.lagged_sums.get_tensor(
+                cute.make_layout((nwarps,), stride=(1,))
+            )
 
         partial0 = partial_group * Int32(self.partials_per_cta)
-        h = hidden_tile * Int32(self.source_tile_h) + tidx
+        h = Int64(hidden_tile) * Int64(self.source_tile_h) + Int64(tidx)
         if const_expr(self.pre_only):
             if const_expr(cute.rank(residual) == 2):
                 r0 = Float32(residual[token, h])
@@ -1072,10 +993,10 @@ class MHCPostPrePartialKernel:
                 r2 = r0
                 r3 = r0
             else:
-                r0 = Float32(residual[token, 0, h])
-                r1 = Float32(residual[token, 1, h])
-                r2 = Float32(residual[token, 2, h])
-                r3 = Float32(residual[token, 3, h])
+                r0 = Float32(residual[token, Int32(0), h])
+                r1 = Float32(residual[token, Int32(1), h])
+                r2 = Float32(residual[token, Int32(2), h])
+                r3 = Float32(residual[token, Int32(3), h])
             if partial_group == Int32(0):
                 out[token, Int32(0), h] = r0.to(cutlass.BFloat16)
                 out[token, Int32(1), h] = r1.to(cutlass.BFloat16)
@@ -1117,20 +1038,33 @@ class MHCPostPrePartialKernel:
                 + Float32(prev_comb[token, Int32(2), Int32(3)]) * r2
                 + Float32(prev_comb[token, Int32(3), Int32(3)]) * r3
             ).to(cutlass.BFloat16)
-
             if partial_group == Int32(0):
                 out[token, Int32(0), h] = o0
                 out[token, Int32(1), h] = o1
                 out[token, Int32(2), h] = o2
                 out[token, Int32(3), h] = o3
-
             r0 = Float32(o0)
             r1 = Float32(o1)
             r2 = Float32(o2)
             r3 = Float32(o3)
 
+        if const_expr(self.lagged_mix):
+            if partial_group == Int32(0):
+                p0 = Float32(pre_mix[token, Int32(0)])
+                p1 = Float32(pre_mix[token, Int32(1)])
+                p2 = Float32(pre_mix[token, Int32(2)])
+                p3 = Float32(pre_mix[token, Int32(3)])
+                y_bf16 = _contract_four(p0, p1, p2, p3, r0, r1, r2, r3).to(
+                    cutlass.BFloat16
+                )
+                y[token, h] = y_bf16
+                lagged_sum = _warp_allreduce_sum(
+                    Float32(y_bf16) * Float32(y_bf16)
+                )
+                if lane == Int32(0):
+                    lagged_sums[warp] = lagged_sum
+
         if const_expr(not self.post_only):
-            # Optional 4x4 Gram of residual_out (only the residual_out-owning group).
             if const_expr(self.compute_gram):
                 if partial_group == Int32(0):
                     gvals = cute.make_rmem_tensor(
@@ -1170,9 +1104,9 @@ class MHCPostPrePartialKernel:
                     mix = partial - Int32(1)
                     value = (
                         Float32(fn[mix, h]) * r0
-                        + Float32(fn[mix, Int32(self.hidden_size) + h]) * r1
-                        + Float32(fn[mix, Int32(2 * self.hidden_size) + h]) * r2
-                        + Float32(fn[mix, Int32(3 * self.hidden_size) + h]) * r3
+                        + Float32(fn[mix, Int64(self.hidden_size) + h]) * r1
+                        + Float32(fn[mix, Int64(2 * self.hidden_size) + h]) * r2
+                        + Float32(fn[mix, Int64(3 * self.hidden_size) + h]) * r3
                     )
                 values[slot] = _warp_allreduce_sum(value)
             if lane == Int32(0):
@@ -1184,12 +1118,22 @@ class MHCPostPrePartialKernel:
                 for slot in cutlass.range_constexpr(self.partials_per_cta):
                     total = Float32(0.0)
                     src_warp = Int32(0)
-                    while src_warp < Int32(self.num_threads // 32):
+                    while src_warp < Int32(nwarps):
                         total += Float32(warp_sums[slot, src_warp])
                         src_warp += Int32(1)
                     partial = partial0 + Int32(slot)
                     if partial < Int32(self.partials):
                         partials[token, hidden_tile, partial] = total
+                if const_expr(self.lagged_mix):
+                    if partial_group == Int32(0):
+                        lagged_total = Float32(0.0)
+                        src_warp = Int32(0)
+                        while src_warp < Int32(nwarps):
+                            lagged_total += Float32(lagged_sums[src_warp])
+                            src_warp += Int32(1)
+                        partials[
+                            token, Int32(self.gram_row0) + hidden_tile, Int32(0)
+                        ] = lagged_total
 
             if const_expr(self.compute_gram):
                 if partial_group == Int32(0):
@@ -2819,6 +2763,8 @@ class MHCPrefillTf32ProjectTmaKernel:
             )
         if self.tile_k % 8 != 0:
             raise ValueError(f"TF32 TMA tile_k={self.tile_k} must be divisible by 8")
+        if self.tile_k < 32:
+            raise ValueError("TF32 TMA projection requires at least 32 FP32 weights per row")
         if self.tile_n <= 0 or self.tile_n % 8 != 0:
             raise ValueError(
                 f"TF32 TMA tile_n={self.tile_n} must be a positive multiple of 8 "
@@ -3381,7 +3327,13 @@ class MHCFinalizeGramKernel:
         single_cta_groups: int = 1,
         active_source_splits: int = 0,
         lagged_mix: bool = False,
+        lagged_prepared: bool = False,
     ):
+        self.lagged_prepared = bool(lagged_prepared)
+        if self.lagged_prepared and (
+            not lagged_mix or compact_partials or single_cta or active_source_splits not in (0, _source_tiles_for_hidden(hidden_size))
+        ):
+            raise ValueError("prepared lagged finalize requires standard full-source partials")
         self.hidden_size = int(hidden_size)
         self.single_cta = bool(single_cta)
         self.single_cta_threads = int(single_cta_threads)
@@ -3391,7 +3343,9 @@ class MHCFinalizeGramKernel:
         if not self.single_cta and self.single_cta_groups != 1:
             raise ValueError("single_cta_groups requires single_cta=True")
         self.num_threads = (
-            _PREFILL_FINALIZE_THREADS
+            _GRAM_BLOCK_H
+            if self.lagged_prepared
+            else _PREFILL_FINALIZE_THREADS
             if lagged_mix
             else self.single_cta_threads
             if self.single_cta
@@ -3460,7 +3414,9 @@ class MHCFinalizeGramKernel:
                 "compact_projection_splits must be less than partials split_k"
             )
         self.tiles_per_cta = (
-            self.hidden_tiles
+            1
+            if self.lagged_prepared and self.lagged_norm
+            else self.hidden_tiles
             if self.lagged_mix
             else self.hidden_tiles // self.single_cta_groups
             if self.single_cta
@@ -3684,6 +3640,28 @@ class MHCFinalizeGramKernel:
                             src_warp += Int32(1)
                         gram[gp] = gtotal
                     cute.arch.sync_threads()
+
+        if const_expr(self.lagged_prepared and self.lagged_norm):
+            # The producer owns the BF16 rounding boundary. Reduce only its
+            # H128 squared-sum partials, using shared slots disjoint from the
+            # projection reduction so its last reader cannot race these writes.
+            norm_partials = storage.partials.get_tensor(
+                cute.make_layout((self.num_threads,), stride=(1,))
+            )
+            norm_base = Int32(self.num_threads - self.source_warps)
+            lagged_norm_value = Float32(0.0)
+            if tidx < Int32(self.source_warps * 32):
+                if tidx < Int32(self.source_tiles):
+                    lagged_norm_value = Float32(partials[token, Int32(self.gram_row0) + tidx, 0])
+                lagged_norm_value = _warp_allreduce_sum(lagged_norm_value)
+                if tidx % Int32(32) == Int32(0):
+                    norm_partials[norm_base + tidx // Int32(32)] = lagged_norm_value
+            cute.arch.sync_threads()
+            lagged_norm_total = Float32(0.0)
+            if tidx == Int32(0):
+                for warp_idx in cutlass.range_constexpr(self.source_warps):
+                    lagged_norm_total += Float32(norm_partials[norm_base + Int32(warp_idx)])
+                gram[0] = lagged_norm_total
 
         if const_expr(self.single_cta):
             lane = tidx % Int32(32)
@@ -4077,6 +4055,11 @@ class MHCFinalizeGramKernel:
                     sy2 / Float32(self.hidden_size) + Float32(self.norm_eps),
                     fastmath=True,
                 )
+            elif const_expr(self.lagged_prepared and self.lagged_norm):
+                s_post[0] = cute.math.rsqrt(
+                    Float32(gram[0]) / Float32(self.hidden_size) + Float32(self.norm_eps),
+                    fastmath=True,
+                )
 
         cute.arch.sync_threads()
 
@@ -4085,50 +4068,57 @@ class MHCFinalizeGramKernel:
         p2 = Float32(s_pre[2])
         p3 = Float32(s_pre[3])
         if const_expr(self.lagged_mix):
-            if tidx < Int32(_MHC_MULT):
+            if tile_group == Int32(0) and tidx < Int32(_MHC_MULT):
                 pre_out[token, tidx] = Float32(s_pre[tidx])
-            p0 = Float32(pre_mix[token, 0])
-            p1 = Float32(pre_mix[token, 1])
-            p2 = Float32(pre_mix[token, 2])
-            p3 = Float32(pre_mix[token, 3])
-            # V4.1 normalizes the rounded BF16 contraction, not pre^T G pre.
-            values = cute.make_rmem_tensor(
-                cute.make_layout((self.hidden_tiles,), stride=(1,)), Float32
-            )
-            square_sum = Float32(0.0)
-            for tile in cutlass.range_constexpr(self.hidden_tiles):
-                h = Int32(tile * self.num_threads) + tidx
-                value = _contract_four(
-                    p0, p1, p2, p3,
-                    Float32(residual[token, 0, h]), Float32(residual[token, 1, h]),
-                    Float32(residual[token, 2, h]), Float32(residual[token, 3, h]),
-                ).to(cutlass.BFloat16)
-                values[tile] = Float32(value)
-                square_sum += Float32(value) * Float32(value)
-            if const_expr(self.lagged_norm):
-                reductions = storage.partials.get_tensor(
-                    cute.make_layout((self.num_threads,), stride=(1,))
-                )
-                square_sum = _warp_allreduce_sum(square_sum)
-                if tidx % Int32(32) == Int32(0):
-                    reductions[tidx // Int32(32)] = square_sum
-                cute.arch.sync_threads()
-                total = Float32(0.0)
-                if tidx < Int32(self.num_threads // 32):
-                    total = Float32(reductions[tidx])
-                total = _warp_allreduce_sum(total)
-                if tidx == Int32(0):
-                    s_post[0] = cute.math.rsqrt(
-                        total / Float32(self.hidden_size) + Float32(self.norm_eps),
-                        fastmath=True,
-                    )
-                cute.arch.sync_threads()
-            for tile in cutlass.range_constexpr(self.hidden_tiles):
-                h = Int32(tile * self.num_threads) + tidx
-                value = Float32(values[tile])
+            if const_expr(self.lagged_prepared):
                 if const_expr(self.lagged_norm):
+                    h = Int64(tile_group) * Int64(self.num_threads) + Int64(tidx)
+                    value = Float32(y[token, h])
                     value = value * Float32(s_post[0]) * Float32(norm_weight[h])
-                y[token, h] = value.to(cutlass.BFloat16)
+                    y[token, h] = value.to(cutlass.BFloat16)
+            else:
+                p0 = Float32(pre_mix[token, 0])
+                p1 = Float32(pre_mix[token, 1])
+                p2 = Float32(pre_mix[token, 2])
+                p3 = Float32(pre_mix[token, 3])
+                # Compact prefill retains the single-CTA rounded contraction.
+                values = cute.make_rmem_tensor(
+                    cute.make_layout((self.hidden_tiles,), stride=(1,)), Float32
+                )
+                square_sum = Float32(0.0)
+                for tile in cutlass.range_constexpr(self.hidden_tiles):
+                    h = Int32(tile * self.num_threads) + tidx
+                    value = _contract_four(
+                        p0, p1, p2, p3,
+                        Float32(residual[token, 0, h]), Float32(residual[token, 1, h]),
+                        Float32(residual[token, 2, h]), Float32(residual[token, 3, h]),
+                    ).to(cutlass.BFloat16)
+                    values[tile] = Float32(value)
+                    square_sum += Float32(value) * Float32(value)
+                if const_expr(self.lagged_norm):
+                    reductions = storage.partials.get_tensor(
+                        cute.make_layout((self.num_threads,), stride=(1,))
+                    )
+                    square_sum = _warp_allreduce_sum(square_sum)
+                    if tidx % Int32(32) == Int32(0):
+                        reductions[tidx // Int32(32)] = square_sum
+                    cute.arch.sync_threads()
+                    total = Float32(0.0)
+                    if tidx < Int32(self.num_threads // 32):
+                        total = Float32(reductions[tidx])
+                    total = _warp_allreduce_sum(total)
+                    if tidx == Int32(0):
+                        s_post[0] = cute.math.rsqrt(
+                            total / Float32(self.hidden_size) + Float32(self.norm_eps),
+                            fastmath=True,
+                        )
+                    cute.arch.sync_threads()
+                for tile in cutlass.range_constexpr(self.hidden_tiles):
+                    h = Int32(tile * self.num_threads) + tidx
+                    value = Float32(values[tile])
+                    if const_expr(self.lagged_norm):
+                        value = value * Float32(s_post[0]) * Float32(norm_weight[h])
+                    y[token, h] = value.to(cutlass.BFloat16)
         elif const_expr(self.compact_partials or self.single_cta):
             y_u32 = cute.recast_tensor(y, Uint32)
             first_pair = Int32(0)
@@ -4217,6 +4207,7 @@ def _post_pre_partial_kernel(
     compute_gram: bool = False,
     pre_only: bool = False,
     post_only: bool = False,
+    lagged_mix: bool = False,
     partials_per_cta: int = _POST_PRE_PARTIALS_PER_CTA,
 ) -> MHCPostPrePartialKernel:
     return MHCPostPrePartialKernel(
@@ -4225,6 +4216,7 @@ def _post_pre_partial_kernel(
         compute_gram=compute_gram,
         pre_only=pre_only,
         post_only=post_only,
+        lagged_mix=lagged_mix,
         partials_per_cta=partials_per_cta,
     )
 
@@ -4354,6 +4346,7 @@ def _finalize_gram_kernel(
     single_cta_groups: int = 1,
     active_source_splits: int = 0,
     lagged_mix: bool = False,
+    lagged_prepared: bool = False,
 ) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
         hidden_size=hidden_size,
@@ -4370,6 +4363,7 @@ def _finalize_gram_kernel(
         single_cta_groups=single_cta_groups,
         active_source_splits=active_source_splits,
         lagged_mix=lagged_mix,
+        lagged_prepared=lagged_prepared,
     )
 
 
@@ -4383,25 +4377,23 @@ def _run_mhc_post_pre_partial_launch(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    pre_mix: torch.Tensor | None = None,
+    y: torch.Tensor | None = None,
+    native,
+    _prepared=None,
 ) -> None:
+    if (pre_mix is None) != (y is None):
+        raise ValueError("pre_mix and y must be supplied together")
+    lagged_mix = pre_mix is not None
+    if lagged_mix and compute_gram:
+        raise ValueError("compute_gram and lagged_mix cannot both be enabled")
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
-    decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
-        num_tokens=tokens,
-        hidden_size=hidden_size,
-    )
-    raw_bf16x2 = os.environ.get("B12X_MHC_DECODE_BF16X2")
-    decode_bf16x2 = (
-        raw_bf16x2 != "0"
-        if raw_bf16x2 is not None
-        else tokens == 16 and hidden_size == _HIDDEN and decode_source_splits > 0
-    )
-    partials_per_cta = _selected_post_pre_partials_per_cta(
-        num_tokens=tokens,
-        hidden_size=hidden_size,
-    )
+    decode_source_splits, decode_tile_n = native.source_splits, native.decode_tile_n
+    decode_bf16x2 = native.decode_bf16x2
+    partials_per_cta = native.partials_per_cta
     _validate_tensor_shape("x", x, (tokens, hidden_size))
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
     _validate_tensor_shape("prev_post", prev_post, (tokens, _MHC_MULT))
@@ -4409,43 +4401,58 @@ def _run_mhc_post_pre_partial_launch(
     _validate_tensor_shape("fn", fn, (_MIXES, _MHC_MULT * hidden_size))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     _validate_tensor_shape("out", out, (tokens, _MHC_MULT, hidden_size))
-    decode_bf16x2 = decode_bf16x2 and all(
+    if lagged_mix:
+        assert pre_mix is not None and y is not None
+        _validate_tensor_shape("pre_mix", pre_mix, (tokens, _MHC_MULT))
+        _validate_tensor_shape("y", y, (tokens, hidden_size))
+        if pre_mix.dtype != torch.float32:
+            raise ValueError(f"pre_mix must be torch.float32, got {pre_mix.dtype}")
+        if y.dtype != torch.bfloat16:
+            raise ValueError(f"y must be torch.bfloat16, got {y.dtype}")
+        if (
+            pre_mix.device != residual.device
+            or y.device != residual.device
+            or not pre_mix.is_cuda
+            or not y.is_cuda
+        ):
+            raise ValueError("pre_mix and y must be CUDA tensors on residual's device")
+        if not pre_mix.is_contiguous() or not y.is_contiguous():
+            raise ValueError("pre_mix and y must be contiguous")
+    pre_mix_arg = pre_mix if lagged_mix else prev_post
+    y_arg = y if lagged_mix else out
+    decode_bf16x2 = (not lagged_mix) and decode_bf16x2 and all(
         tensor.is_contiguous() and tensor.data_ptr() % 4 == 0
         for tensor in (x, residual, out)
     )
     compute_gram = bool(compute_gram)
+    split_n_abi = decode_source_splits > 0 and not lagged_mix
     args = (
         _to_kernel_tensor(x, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(
-            prev_post,
-            cutlass.Float32,
-            assumed_align=4,
-            dynamic_layout=True,
+            prev_post, cutlass.Float32, assumed_align=4, dynamic_layout=True
         ),
         _to_kernel_tensor(
-            prev_comb,
-            cutlass.Float32,
-            assumed_align=4,
-            dynamic_layout=True,
+            prev_comb, cutlass.Float32, assumed_align=4, dynamic_layout=True
         ),
         _to_kernel_tensor(fn, cutlass.Float32),
         _to_kernel_tensor(
-            partials,
-            cutlass.Float32,
-            assumed_align=4,
-            dynamic_layout=True,
+            partials, cutlass.Float32, assumed_align=4, dynamic_layout=True
         ),
         _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
-        Int32(tokens),
-        current_cuda_stream(),
     )
+    if not split_n_abi:
+        args += (
+            _to_kernel_tensor(
+                pre_mix_arg, cutlass.Float32, assumed_align=4, dynamic_layout=True
+            ),
+            _to_kernel_tensor(y_arg, cutlass.BFloat16, dynamic_layout=True),
+        )
+    args += (Int32(tokens), current_cuda_stream())
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     cache_key = (
-        tensor_key(
-            "x",
-            x,
-            dims=(DimKey.dynamic(), DimKey.exact(hidden_size)),
-        ),
+        tensor_key("x", x, dims=(DimKey.dynamic(), DimKey.exact(hidden_size))),
         tensor_key(
             "residual",
             residual,
@@ -4456,9 +4463,7 @@ def _run_mhc_post_pre_partial_launch(
             ),
         ),
         tensor_key(
-            "prev_post",
-            prev_post,
-            dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT)),
+            "prev_post", prev_post, dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT))
         ),
         tensor_key(
             "prev_comb",
@@ -4493,8 +4498,18 @@ def _run_mhc_post_pre_partial_launch(
             ),
         ),
     )
+    if lagged_mix:
+        assert pre_mix is not None and y is not None
+        cache_key += (
+            tensor_key(
+                "pre_mix",
+                pre_mix,
+                dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT)),
+            ),
+            tensor_key("y", y, dims=(DimKey.dynamic(), DimKey.exact(hidden_size))),
+        )
     hidden_specialization = _hidden_specialization_name(hidden_size)
-    if decode_source_splits > 0:
+    if decode_source_splits > 0 and not lagged_mix:
         compile_name = (
             "integration.residual.mhc_post_pre_decode_split_n_"
             f"{hidden_specialization}_s{decode_source_splits}n{decode_tile_n}"
@@ -4525,7 +4540,9 @@ def _run_mhc_post_pre_partial_launch(
         )
         compile_key = (
             ("partials_per_cta", partials_per_cta),
+            ("threads", _THREADS),
             ("compute_gram", compute_gram),
+            ("lagged_mix", lagged_mix),
             ("pdl", _MHC_PDL),
             cache_key,
         )
@@ -4535,6 +4552,7 @@ def _run_mhc_post_pre_partial_launch(
             compute_gram,
             False,
             False,
+            lagged_mix,
             partials_per_cta,
         )
     else:
@@ -4547,7 +4565,9 @@ def _run_mhc_post_pre_partial_launch(
             ("split_k", split_k),
             ("source_tiles", hidden_size // _SOURCE_TILE_H),
             ("partials_per_cta", partials_per_cta),
+            ("threads", _THREADS),
             ("compute_gram", compute_gram),
+            ("lagged_mix", lagged_mix),
             ("pdl", _MHC_PDL),
             cache_key,
         )
@@ -4557,77 +4577,26 @@ def _run_mhc_post_pre_partial_launch(
             compute_gram,
             False,
             False,
+            lagged_mix,
             partials_per_cta,
         )
-    b12x_launch(
+    return _compile_mhc_entry(
         kernel,
-        compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
+        compile_spec=KernelCompileSpec.from_key(
+            compile_name, 4 if split_n_abi else 5, compile_key
+        ),
         compile_args=args,
         runtime_args=args,
     )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_post_pre_partial_launch",
-    mutates_args=("partials", "out"),
-)
-def _mhc_post_pre_partial_launch_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool,
-) -> None:
-    _run_mhc_post_pre_partial_launch(
-        x=x,
-        residual=residual,
-        prev_post=prev_post,
-        prev_comb=prev_comb,
-        fn=fn,
-        partials=partials,
-        out=out,
-        compute_gram=compute_gram,
-    )
 
 
-@_mhc_post_pre_partial_launch_op.register_fake
-def _mhc_post_pre_partial_launch_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool,
-) -> None:
-    return None
 
 
-def run_mhc_post_pre_partial(
-    *,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool = False,
-) -> None:
-    torch.ops.b12x.mhc_post_pre_partial_launch(
-        x,
-        residual,
-        prev_post,
-        prev_comb,
-        fn,
-        partials,
-        out,
-        bool(compute_gram),
-    )
+
+
+
 
 
 def _run_mhc_post_pre_prefill_partial_launch(
@@ -4640,6 +4609,7 @@ def _run_mhc_post_pre_prefill_partial_launch(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = True,
+    _prepared=None,
 ) -> None:
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
@@ -4679,6 +4649,8 @@ def _run_mhc_post_pre_prefill_partial_launch(
         Int32(tokens),
         current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     cache_key = (
         tensor_key(
             "x",
@@ -4744,79 +4716,21 @@ def _run_mhc_post_pre_prefill_partial_launch(
         ("compute_gram", compute_gram),
         cache_key,
     )
-    b12x_launch(
-        _post_pre_prefill_partial_kernel(
-            hidden_size,
-            split_k,
-            compute_gram,
-        ),
+    return _compile_mhc_entry(
+        _post_pre_prefill_partial_kernel(hidden_size, split_k, compute_gram),
         compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
         compile_args=args,
         runtime_args=args,
     )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_post_pre_prefill_partial_launch",
-    mutates_args=("partials", "out"),
-)
-def _mhc_post_pre_prefill_partial_launch_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool,
-) -> None:
-    _run_mhc_post_pre_prefill_partial_launch(
-        x=x,
-        residual=residual,
-        prev_post=prev_post,
-        prev_comb=prev_comb,
-        fn=fn,
-        partials=partials,
-        out=out,
-        compute_gram=compute_gram,
-    )
 
 
-@_mhc_post_pre_prefill_partial_launch_op.register_fake
-def _mhc_post_pre_prefill_partial_launch_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool,
-) -> None:
-    return None
 
 
-def run_mhc_post_pre_prefill_partial(
-    *,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool = True,
-) -> None:
-    torch.ops.b12x.mhc_post_pre_prefill_partial_launch(
-        x,
-        residual,
-        prev_post,
-        prev_comb,
-        fn,
-        partials,
-        out,
-        bool(compute_gram),
-    )
+
+
+
 
 
 def _run_mhc_post_pre_prefill_block_m_partial_launch(
@@ -4831,6 +4745,7 @@ def _run_mhc_post_pre_prefill_block_m_partial_launch(
     compute_gram: bool = True,
     block_m: int = _PREFILL_BLOCK_M,
     tile_n: int = _PREFILL_BLOCK_TILE_N,
+    _prepared=None,
 ) -> None:
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
@@ -4876,6 +4791,8 @@ def _run_mhc_post_pre_prefill_block_m_partial_launch(
         Int32(tokens),
         current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     cache_key = (
         tensor_key(
             "x",
@@ -4943,91 +4860,21 @@ def _run_mhc_post_pre_prefill_block_m_partial_launch(
         ("compute_gram", compute_gram),
         cache_key,
     )
-    b12x_launch(
-        _post_pre_prefill_block_m_partial_kernel(
-            hidden_size,
-            split_k,
-            block_m,
-            tile_n,
-            compute_gram,
-        ),
+    return _compile_mhc_entry(
+        _post_pre_prefill_block_m_partial_kernel(hidden_size, split_k, block_m, tile_n, compute_gram),
         compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
         compile_args=args,
         runtime_args=args,
     )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_post_pre_prefill_block_m_partial_launch",
-    mutates_args=("partials", "out"),
-)
-def _mhc_post_pre_prefill_block_m_partial_launch_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool,
-    block_m: int,
-    tile_n: int,
-) -> None:
-    _run_mhc_post_pre_prefill_block_m_partial_launch(
-        x=x,
-        residual=residual,
-        prev_post=prev_post,
-        prev_comb=prev_comb,
-        fn=fn,
-        partials=partials,
-        out=out,
-        compute_gram=compute_gram,
-        block_m=block_m,
-        tile_n=tile_n,
-    )
 
 
-@_mhc_post_pre_prefill_block_m_partial_launch_op.register_fake
-def _mhc_post_pre_prefill_block_m_partial_launch_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool,
-    block_m: int,
-    tile_n: int,
-) -> None:
-    return None
 
 
-def run_mhc_post_pre_prefill_block_m_partial(
-    *,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool = True,
-    block_m: int = _PREFILL_BLOCK_M,
-    tile_n: int = _PREFILL_BLOCK_TILE_N,
-) -> None:
-    torch.ops.b12x.mhc_post_pre_prefill_block_m_partial_launch(
-        x,
-        residual,
-        prev_post,
-        prev_comb,
-        fn,
-        partials,
-        out,
-        bool(compute_gram),
-        int(block_m),
-        int(tile_n),
-    )
+
+
+
 
 
 def _run_mhc_post_pre_prefill_gram_launch(
@@ -5038,6 +4885,7 @@ def _run_mhc_post_pre_prefill_gram_launch(
     prev_comb: torch.Tensor,
     partials: torch.Tensor,
     out: torch.Tensor,
+    _prepared=None,
 ) -> None:
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
@@ -5074,6 +4922,8 @@ def _run_mhc_post_pre_prefill_gram_launch(
         Int32(tokens),
         current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     cache_key = (
         tensor_key(
             "x",
@@ -5135,7 +4985,7 @@ def _run_mhc_post_pre_prefill_gram_launch(
         ("pdl", _MHC_PDL),
         cache_key,
     )
-    b12x_launch(
+    return _compile_mhc_entry(
         _post_pre_prefill_gram_kernel(hidden_size, split_k),
         compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
         compile_args=args,
@@ -5143,57 +4993,13 @@ def _run_mhc_post_pre_prefill_gram_launch(
     )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_post_pre_prefill_gram_launch",
-    mutates_args=("partials", "out"),
-)
-def _mhc_post_pre_prefill_gram_launch_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    _run_mhc_post_pre_prefill_gram_launch(
-        x=x,
-        residual=residual,
-        prev_post=prev_post,
-        prev_comb=prev_comb,
-        partials=partials,
-        out=out,
-    )
 
 
-@_mhc_post_pre_prefill_gram_launch_op.register_fake
-def _mhc_post_pre_prefill_gram_launch_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    return None
 
 
-def run_mhc_post_pre_prefill_gram(
-    *,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    torch.ops.b12x.mhc_post_pre_prefill_gram_launch(
-        x,
-        residual,
-        prev_post,
-        prev_comb,
-        partials,
-        out,
-    )
+
+
+
 
 
 def _run_mhc_prefill_bf16_project_launch(
@@ -5201,6 +5007,8 @@ def _run_mhc_prefill_bf16_project_launch(
     out: torch.Tensor,
     fn_bf16: torch.Tensor,
     partials: torch.Tensor,
+    use_tma: bool,
+    _prepared=None,
 ) -> None:
     tokens = int(out.shape[0])
     hidden_size = int(out.shape[2])
@@ -5217,7 +5025,7 @@ def _run_mhc_prefill_bf16_project_launch(
         raise ValueError("fn_bf16 must be CUDA")
     if not fn_bf16.is_contiguous():
         raise ValueError("fn_bf16 must be contiguous")
-    if os.getenv("B12X_MHC_PREFILL_BF16_TMA", "1") != "0":
+    if use_tma:
         if not out.is_contiguous():
             raise ValueError("out must be contiguous for TMA BF16 prefill projection")
         out_flat = out.view(tokens, _MHC_MULT * hidden_size)
@@ -5233,6 +5041,8 @@ def _run_mhc_prefill_bf16_project_launch(
             Int32(tokens),
             current_cuda_stream(),
         )
+        if _prepared is not None:
+            return run_compiled(_prepared, args)
         cache_key = (
             tensor_key(
                 "out_flat",
@@ -5270,13 +5080,12 @@ def _run_mhc_prefill_bf16_project_launch(
             ("threads", _PREFILL_TMA_THREADS),
             cache_key,
         )
-        b12x_launch(
+        return _compile_mhc_entry(
             _prefill_bf16_project_tma_kernel(hidden_size, split_k),
             compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
             compile_args=args,
             runtime_args=args,
         )
-        return
     args = (
         _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(fn_bf16, cutlass.BFloat16),
@@ -5289,6 +5098,8 @@ def _run_mhc_prefill_bf16_project_launch(
         Int32(tokens),
         current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     cache_key = (
         tensor_key(
             "out",
@@ -5328,7 +5139,7 @@ def _run_mhc_prefill_bf16_project_launch(
         ("sync", "warp_v2"),
         cache_key,
     )
-    b12x_launch(
+    return _compile_mhc_entry(
         _prefill_bf16_project_kernel(hidden_size, split_k),
         compile_spec=KernelCompileSpec.from_key(compile_name, 1, compile_key),
         compile_args=args,
@@ -5336,42 +5147,13 @@ def _run_mhc_prefill_bf16_project_launch(
     )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_prefill_bf16_project_launch",
-    mutates_args=("partials",),
-)
-def _mhc_prefill_bf16_project_launch_op(
-    out: torch.Tensor,
-    fn_bf16: torch.Tensor,
-    partials: torch.Tensor,
-) -> None:
-    _run_mhc_prefill_bf16_project_launch(
-        out=out,
-        fn_bf16=fn_bf16,
-        partials=partials,
-    )
 
 
-@_mhc_prefill_bf16_project_launch_op.register_fake
-def _mhc_prefill_bf16_project_launch_fake(
-    out: torch.Tensor,
-    fn_bf16: torch.Tensor,
-    partials: torch.Tensor,
-) -> None:
-    return None
 
 
-def run_mhc_prefill_bf16_project(
-    *,
-    out: torch.Tensor,
-    fn_bf16: torch.Tensor,
-    partials: torch.Tensor,
-) -> None:
-    torch.ops.b12x.mhc_prefill_bf16_project_launch(
-        out,
-        fn_bf16,
-        partials,
-    )
+
+
+
 
 
 def _run_mhc_prefill_tf32_project_launch(
@@ -5387,6 +5169,7 @@ def _run_mhc_prefill_tf32_project_launch(
     num_n_warps: int,
     k_splits: int,
     split_fp32_fn: bool = False,
+    _prepared=None,
 ) -> None:
     tokens = int(out.shape[0])
     hidden_size = int(out.shape[2])
@@ -5406,18 +5189,6 @@ def _run_mhc_prefill_tf32_project_launch(
     if not fn.is_contiguous():
         raise ValueError("fn must be contiguous")
     out_flat = out.view(tokens, _MHC_MULT * hidden_size)
-    kernel = _prefill_tf32_project_kernel(
-        hidden_size,
-        split_k,
-        int(tile_m),
-        int(tile_n),
-        int(tile_k),
-        int(num_stages),
-        int(num_m_warps),
-        int(num_n_warps),
-        int(k_splits),
-        bool(split_fp32_fn),
-    )
     args = (
         _to_kernel_tensor(out_flat, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(fn, cutlass.Float32),
@@ -5429,6 +5200,20 @@ def _run_mhc_prefill_tf32_project_launch(
         ),
         Int32(tokens),
         current_cuda_stream(),
+    )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
+    kernel = _prefill_tf32_project_kernel(
+        hidden_size,
+        split_k,
+        int(tile_m),
+        int(tile_n),
+        int(tile_k),
+        int(num_stages),
+        int(num_m_warps),
+        int(num_n_warps),
+        int(k_splits),
+        bool(split_fp32_fn),
     )
     cache_key = (
         tensor_key(
@@ -5477,7 +5262,7 @@ def _run_mhc_prefill_tf32_project_launch(
         ),
         cache_key,
     )
-    b12x_launch(
+    return _compile_mhc_entry(
         kernel,
         compile_spec=KernelCompileSpec.from_key(compile_name, 8, compile_key),
         compile_args=args,
@@ -5485,204 +5270,28 @@ def _run_mhc_prefill_tf32_project_launch(
     )
 
 
-def _legacy_mhc_prefill_tf32_config(
-    *,
-    tokens: int,
-    hidden_size: int,
-) -> MhcConfig:
-    if hidden_size == _HIDDEN and tokens >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS:
-        geometry = (128, 24, 64, 2, 8, 1, 4)
-    elif hidden_size == _HIDDEN and tokens >= 3_584:
-        geometry = (192, 24, 64, 2, 12, 1, 8)
-    elif hidden_size == _HIDDEN and tokens >= 2_304:
-        geometry = (64, 24, 64, 2 if tokens >= 3_072 else 3, 4, 1, 8)
-    elif tokens >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS:
-        geometry = (32, 8, 256, 1, 2, 1, 1)
-    else:
-        geometry = (16, 8, 256, 1, 1, 1, 1)
-    return MhcConfig(
-        backend="tf32_tma",
-        projection_tile_m=geometry[0],
-        projection_tile_n=geometry[1],
-        projection_tile_k=geometry[2],
-        projection_num_stages=geometry[3],
-        projection_num_m_warps=geometry[4],
-        projection_num_n_warps=geometry[5],
-        projection_k_splits=geometry[6],
-    )
 
 
-def mhc_prefill_tf32_project_splits(
-    *,
-    tokens: int,
-    hidden_size: int,
-    config: MhcConfig | None = None,
-) -> int:
-    """Return the projection split count selected by the TF32 prefill kernel."""
-    selected = config or _legacy_mhc_prefill_tf32_config(
-        tokens=int(tokens),
-        hidden_size=int(hidden_size),
-    )
-    return selected.projection_k_splits
 
 
-@torch.library.custom_op(
-    "b12x::mhc_prefill_tf32_project_launch",
-    mutates_args=("partials",),
-)
-def _mhc_prefill_tf32_project_launch_op(
-    out: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    num_stages: int,
-    num_m_warps: int,
-    num_n_warps: int,
-    k_splits: int,
-    split_fp32_fn: bool = False,
-) -> None:
-    _run_mhc_prefill_tf32_project_launch(
-        out=out,
-        fn=fn,
-        partials=partials,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        num_stages=num_stages,
-        num_m_warps=num_m_warps,
-        num_n_warps=num_n_warps,
-        k_splits=k_splits,
-        split_fp32_fn=split_fp32_fn,
-    )
 
 
-@_mhc_prefill_tf32_project_launch_op.register_fake
-def _mhc_prefill_tf32_project_launch_fake(
-    out: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    num_stages: int,
-    num_m_warps: int,
-    num_n_warps: int,
-    k_splits: int,
-    split_fp32_fn: bool = False,
-) -> None:
-    del (
-        out,
-        fn,
-        partials,
-        tile_m,
-        tile_n,
-        tile_k,
-        num_stages,
-        num_m_warps,
-        num_n_warps,
-        k_splits,
-    )
-    return None
 
 
-def run_mhc_prefill_tf32_project(
-    *,
-    out: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    config: MhcConfig | None = None,
-    split_fp32_fn: bool = False,
-) -> None:
-    selected = config or _legacy_mhc_prefill_tf32_config(
-        tokens=int(out.shape[0]),
-        hidden_size=int(out.shape[2]),
-    )
-    torch.ops.b12x.mhc_prefill_tf32_project_launch(
-        out,
-        fn,
-        partials,
-        selected.projection_tile_m,
-        selected.projection_tile_n,
-        selected.projection_tile_k,
-        selected.projection_num_stages,
-        selected.projection_num_m_warps,
-        selected.projection_num_n_warps,
-        selected.projection_k_splits,
-        bool(split_fp32_fn),
-    )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_post_pre_partial_alloc",
-    mutates_args=(),
-)
-def _mhc_post_pre_partial_alloc_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    compute_gram: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Functional (allocate + return) post-pre partial. Allocating BOTH partials
-    # and residual_out internally and returning them gives this op ZERO mutated
-    # args, so it is never auto_functionalized. That avoids the
-    # decompose_auto_functionalized node-count assertion that fires for an
-    # auto_functionalized op carrying TWO mutated args sharing a symbolic dim
-    # (the second clone's as_strided sym_size gets CSE-collapsed on re-trace).
-    # residual_out is allocated contiguous.
-    tokens = int(residual.shape[0])
-    hidden_size = int(residual.shape[2])
-    split_k = _split_k_for_hidden(hidden_size)
-    partials = torch.empty(
-        (tokens, split_k, _PARTIALS), dtype=torch.float32, device=residual.device
-    )
-    out = torch.empty(residual.shape, dtype=residual.dtype, device=residual.device)
-    _run_mhc_post_pre_partial_launch(
-        x=x,
-        residual=residual,
-        prev_post=prev_post,
-        prev_comb=prev_comb,
-        fn=fn,
-        partials=partials,
-        out=out,
-        compute_gram=compute_gram,
-    )
-    return partials, out
 
 
-@_mhc_post_pre_partial_alloc_op.register_fake
-def _mhc_post_pre_partial_alloc_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    compute_gram: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    tokens = residual.shape[0]
-    split_k = residual.shape[2] // (_SOURCE_TILE_H // 2)
-    partials = torch.empty(
-        (tokens, split_k, _PARTIALS), dtype=torch.float32, device=residual.device
-    )
-    out = torch.empty(residual.shape, dtype=residual.dtype, device=residual.device)
-    return partials, out
 
 
-def run_mhc_post_pre_partial_alloc(
-    *,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    compute_gram: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.b12x.mhc_post_pre_partial_alloc(
-        x, residual, prev_post, prev_comb, fn, bool(compute_gram)
-    )
+
+
+
+
+
+
+
+
 
 
 def _run_mhc_post_launch(
@@ -5692,6 +5301,7 @@ def _run_mhc_post_launch(
     prev_post: torch.Tensor,
     prev_comb: torch.Tensor,
     out: torch.Tensor,
+    _prepared=None,
 ) -> None:
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
@@ -5729,9 +5339,18 @@ def _run_mhc_post_launch(
             dynamic_layout=True,
         ),
         _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(
+            prev_post,
+            cutlass.Float32,
+            assumed_align=4,
+            dynamic_layout=True,
+        ),
+        _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
         Int32(tokens),
         current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     cache_key = (
         tensor_key(
             "x",
@@ -5775,6 +5394,7 @@ def _run_mhc_post_launch(
     if hidden_size == _HIDDEN:
         compile_name = "integration.residual.mhc_post_hidden4096_hctile128_all4"
         compile_key = (
+            ("threads", _THREADS),
             ("post_only", True),
             cache_key,
         )
@@ -5784,63 +5404,29 @@ def _run_mhc_post_launch(
         )
         compile_key = (
             ("hidden_size", hidden_size),
+            ("threads", _THREADS),
             ("post_only", True),
             cache_key,
         )
-    b12x_launch(
-        _post_pre_partial_kernel(hidden_size, split_k, False, False, True),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
+    return _compile_mhc_entry(
+        _post_pre_partial_kernel(
+            hidden_size=hidden_size,
+            split_k=split_k,
+            post_only=True,
+        ),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
         compile_args=args,
         runtime_args=args,
     )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_post_launch",
-    mutates_args=("out",),
-)
-def _mhc_post_launch_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    _run_mhc_post_launch(
-        x=x,
-        residual=residual,
-        prev_post=prev_post,
-        prev_comb=prev_comb,
-        out=out,
-    )
 
 
-@_mhc_post_launch_op.register_fake
-def _mhc_post_launch_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    return None
 
 
-def run_mhc_post(
-    *,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    torch.ops.b12x.mhc_post_launch(
-        x,
-        residual,
-        prev_post,
-        prev_comb,
-        out,
-    )
+
+
+
 
 
 def _run_mhc_pre_partial_launch(
@@ -5850,15 +5436,20 @@ def _run_mhc_pre_partial_launch(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    pre_mix: torch.Tensor | None = None,
+    y: torch.Tensor | None = None,
+    partials_per_cta: int,
+    _prepared=None,
 ) -> None:
+    if (pre_mix is None) != (y is None):
+        raise ValueError("pre_mix and y must be supplied together")
+    lagged_mix = pre_mix is not None
+    if lagged_mix and compute_gram:
+        raise ValueError("compute_gram and lagged_mix cannot both be enabled")
     tokens = int(residual.shape[0])
     hidden_size = int(residual.shape[-1])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
-    partials_per_cta = _selected_post_pre_partials_per_cta(
-        num_tokens=tokens,
-        hidden_size=hidden_size,
-    )
     expanded = residual.ndim == 3
     residual_shape = (tokens, _MHC_MULT, hidden_size) if expanded else (tokens, hidden_size)
     fn_width = _MHC_MULT * hidden_size if expanded else hidden_size
@@ -5866,44 +5457,57 @@ def _run_mhc_pre_partial_launch(
     _validate_tensor_shape("fn", fn, (_MIXES, fn_width))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     _validate_tensor_shape("out", out, (tokens, _MHC_MULT, hidden_size))
+    if lagged_mix:
+        assert pre_mix is not None and y is not None
+        _validate_tensor_shape("pre_mix", pre_mix, (tokens, _MHC_MULT))
+        _validate_tensor_shape("y", y, (tokens, hidden_size))
+        if pre_mix.dtype != torch.float32:
+            raise ValueError(f"pre_mix must be torch.float32, got {pre_mix.dtype}")
+        if y.dtype != torch.bfloat16:
+            raise ValueError(f"y must be torch.bfloat16, got {y.dtype}")
+        if (
+            pre_mix.device != residual.device
+            or y.device != residual.device
+            or not pre_mix.is_cuda
+            or not y.is_cuda
+        ):
+            raise ValueError("pre_mix and y must be CUDA tensors on residual's device")
+        if not pre_mix.is_contiguous() or not y.is_contiguous():
+            raise ValueError("pre_mix and y must be contiguous")
+    pre_mix_arg = pre_mix if lagged_mix else partials
+    y_arg = y if lagged_mix else out
     compute_gram = bool(compute_gram)
     args = (
         _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(residual, cutlass.BFloat16, dynamic_layout=True),
         _to_kernel_tensor(
-            partials,
-            cutlass.Float32,
-            assumed_align=4,
-            dynamic_layout=True,
+            partials, cutlass.Float32, assumed_align=4, dynamic_layout=True
         ),
         _to_kernel_tensor(
-            partials,
-            cutlass.Float32,
-            assumed_align=4,
-            dynamic_layout=True,
+            partials, cutlass.Float32, assumed_align=4, dynamic_layout=True
         ),
         _to_kernel_tensor(fn, cutlass.Float32),
         _to_kernel_tensor(
-            partials,
-            cutlass.Float32,
-            assumed_align=4,
-            dynamic_layout=True,
+            partials, cutlass.Float32, assumed_align=4, dynamic_layout=True
         ),
         _to_kernel_tensor(out, cutlass.BFloat16, dynamic_layout=True),
+        _to_kernel_tensor(
+            pre_mix_arg, cutlass.Float32, assumed_align=4, dynamic_layout=True
+        ),
+        _to_kernel_tensor(y_arg, cutlass.BFloat16, dynamic_layout=True),
         Int32(tokens),
         current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     cache_key = (
         tensor_key(
             "residual",
             residual,
-            dims=(DimKey.dynamic(),) + tuple(DimKey.exact(dim) for dim in residual_shape[1:]),
+            dims=(DimKey.dynamic(),)
+            + tuple(DimKey.exact(dim) for dim in residual_shape[1:]),
         ),
-        tensor_key(
-            "fn",
-            fn,
-            dims=(DimKey.exact(_MIXES), DimKey.exact(fn_width)),
-        ),
+        tensor_key("fn", fn, dims=(DimKey.exact(_MIXES), DimKey.exact(fn_width))),
         tensor_key(
             "partials",
             partials,
@@ -5923,6 +5527,16 @@ def _run_mhc_pre_partial_launch(
             ),
         ),
     )
+    if lagged_mix:
+        assert pre_mix is not None and y is not None
+        cache_key += (
+            tensor_key(
+                "pre_mix",
+                pre_mix,
+                dims=(DimKey.dynamic(), DimKey.exact(_MHC_MULT)),
+            ),
+            tensor_key("y", y, dims=(DimKey.dynamic(), DimKey.exact(hidden_size))),
+        )
     hidden_specialization = _hidden_specialization_name(hidden_size)
     if hidden_size == _HIDDEN and split_k == _SPLIT_K:
         compile_name = (
@@ -5931,8 +5545,10 @@ def _run_mhc_pre_partial_launch(
         )
         compile_key = (
             ("partials_per_cta", partials_per_cta),
+            ("threads", _THREADS),
             ("compute_gram", compute_gram),
             ("pre_only", True),
+            ("lagged_mix", lagged_mix),
             cache_key,
         )
     else:
@@ -5945,71 +5561,34 @@ def _run_mhc_pre_partial_launch(
             ("split_k", split_k),
             ("source_tiles", hidden_size // _SOURCE_TILE_H),
             ("partials_per_cta", partials_per_cta),
+            ("threads", _THREADS),
             ("compute_gram", compute_gram),
             ("pre_only", True),
+            ("lagged_mix", lagged_mix),
             cache_key,
         )
-    b12x_launch(
+    return _compile_mhc_entry(
         _post_pre_partial_kernel(
-            hidden_size,
-            split_k,
-            compute_gram,
-            True,
-            False,
-            partials_per_cta,
+            hidden_size=hidden_size,
+            split_k=split_k,
+            compute_gram=compute_gram,
+            pre_only=True,
+            lagged_mix=lagged_mix,
+            partials_per_cta=partials_per_cta,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 2, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
         compile_args=args,
         runtime_args=args,
     )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_pre_partial_launch",
-    mutates_args=("partials", "out"),
-)
-def _mhc_pre_partial_launch_op(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool,
-) -> None:
-    _run_mhc_pre_partial_launch(
-        residual=residual,
-        fn=fn,
-        partials=partials,
-        out=out,
-        compute_gram=compute_gram,
-    )
 
 
-@_mhc_pre_partial_launch_op.register_fake
-def _mhc_pre_partial_launch_fake(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool,
-) -> None:
-    return None
 
 
-def run_mhc_pre_partial(
-    *,
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    partials: torch.Tensor,
-    out: torch.Tensor,
-    compute_gram: bool = False,
-) -> None:
-    torch.ops.b12x.mhc_pre_partial_launch(
-        residual,
-        fn,
-        partials,
-        out,
-        bool(compute_gram),
-    )
+
+
+
 
 
 def _run_mhc_finalize_gram_launch(
@@ -6032,6 +5611,10 @@ def _run_mhc_finalize_gram_launch(
     active_source_splits: int = 0,
     pre_mix: torch.Tensor | None = None,
     pre_out: torch.Tensor | None = None,
+    lagged_prepared: bool = False,
+    single_cta_threads: int = 0,
+    single_cta_groups: int = 1,
+    _prepared=None,
 ) -> None:
     rms_eps = float(rms_eps)
     hc_eps = float(hc_eps)
@@ -6050,27 +5633,9 @@ def _run_mhc_finalize_gram_launch(
     split_k = int(partials.shape[1])
     lagged_mix = pre_mix is not None
     _validate_split_k(hidden_size, split_k)
-    single_cta_threads = (
-        0
-        if compact_partials or lagged_mix
-        else _selected_mhc_decode_finalize_threads(
-            num_tokens=tokens,
-            hidden_size=hidden_size,
-        )
-    )
+    if compact_partials or lagged_mix:
+        single_cta_threads = 0
     single_cta = single_cta_threads > 0
-    raw_single_cta_groups = os.environ.get(
-        "B12X_MHC_DECODE_FINALIZE_CTAS"
-    )
-    single_cta_groups = 1
-    if single_cta:
-        single_cta_groups = (
-            int(raw_single_cta_groups)
-            if raw_single_cta_groups is not None
-            else 8
-            if single_cta_threads == 128 and tokens >= 10
-            else 1
-        )
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     _validate_tensor_shape("scale", scale, (3,))
@@ -6109,6 +5674,8 @@ def _run_mhc_finalize_gram_launch(
         Int32(tokens),
         current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     norm_weight_key = (
         tensor_key(
             "norm_weight",
@@ -6117,6 +5684,12 @@ def _run_mhc_finalize_gram_launch(
         )
         if fuse_norm
         else ("norm_weight", None)
+    )
+    kernel = _finalize_gram_kernel(
+        hidden_size, split_k, rms_eps, hc_eps, sinkhorn_iters, norm_eps,
+        fuse_norm, compact_partials, compact_projection_splits, single_cta,
+        single_cta_threads if single_cta else _PREFILL_FINALIZE_THREADS,
+        single_cta_groups, active_source_splits, lagged_mix, bool(lagged_prepared),
     )
     common_key_tail = (
         (
@@ -6132,6 +5705,7 @@ def _run_mhc_finalize_gram_launch(
         ("math", "fast_exp_exact_sigmoid_rcp_approx_sinkhorn"),
         ("fuse_norm", fuse_norm),
         ("lagged_mix", lagged_mix),
+        ("lagged_prepared", bool(lagged_prepared)),
         ("compact_partials", compact_partials),
         ("compact_projection_splits", compact_projection_splits),
         ("single_cta", single_cta),
@@ -6191,12 +5765,7 @@ def _run_mhc_finalize_gram_launch(
             suffix = f"_single_cta_t{single_cta_threads}g{single_cta_groups}"
         compile_name = f"integration.residual.mhc_finalize_gram_hidden4096{suffix}"
         compile_key = (
-            (
-                "block_h",
-                single_cta_threads
-                if single_cta
-                else (_PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H),
-            ),
+            ("block_h", kernel.block_h),
             ("source_tiles", _SOURCE_TILES),
             ("gram_row0", _GRAM_ROW0),
             *common_key_tail,
@@ -6211,482 +5780,73 @@ def _run_mhc_finalize_gram_launch(
         compile_key = (
             ("hidden_size", hidden_size),
             ("split_k", split_k),
-            (
-                "block_h",
-                single_cta_threads
-                if single_cta
-                else (_PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H),
-            ),
+            ("block_h", kernel.block_h),
             ("source_tiles", hidden_size // _SOURCE_TILE_H),
             ("gram_row0", hidden_size // _SOURCE_TILE_H),
             *common_key_tail,
         )
-    b12x_launch(
-        _finalize_gram_kernel(
-            hidden_size,
-            split_k,
-            rms_eps,
-            hc_eps,
-            sinkhorn_iters,
-            norm_eps,
-            fuse_norm,
-            compact_partials,
-            compact_projection_splits,
-            single_cta,
-            single_cta_threads if single_cta else _PREFILL_FINALIZE_THREADS,
-            single_cta_groups,
-            active_source_splits,
-            lagged_mix,
-        ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
+    return _compile_mhc_entry(
+        kernel,
+        compile_spec=KernelCompileSpec.from_key(compile_name, 5, compile_key),
         compile_args=args,
         runtime_args=args,
     )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_finalize_gram_launch",
-    mutates_args=("y", "post", "comb", "pre_out"),
-)
-def _mhc_finalize_gram_launch_op(
-    residual: torch.Tensor,
-    partials: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    y: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    norm_weight: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-    fuse_norm: bool,
-    compact_partials: bool,
-    compact_projection_splits: int,
-    active_source_splits: int,
-    pre_mix: torch.Tensor | None,
-    pre_out: torch.Tensor | None,
-) -> None:
-    _run_mhc_finalize_gram_launch(
-        residual=residual,
-        partials=partials,
-        scale=scale,
-        bias=bias,
-        y=y,
-        post=post,
-        comb=comb,
-        rms_eps=rms_eps,
-        hc_eps=hc_eps,
-        sinkhorn_iters=sinkhorn_iters,
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-        fuse_norm=fuse_norm,
-        compact_partials=compact_partials,
-        compact_projection_splits=compact_projection_splits,
-        active_source_splits=active_source_splits,
-        pre_mix=pre_mix,
-        pre_out=pre_out,
-    )
 
 
-@_mhc_finalize_gram_launch_op.register_fake
-def _mhc_finalize_gram_launch_fake(
-    residual: torch.Tensor,
-    partials: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    y: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    norm_weight: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-    fuse_norm: bool,
-    compact_partials: bool,
-    compact_projection_splits: int,
-    active_source_splits: int,
-    pre_mix: torch.Tensor | None,
-    pre_out: torch.Tensor | None,
-) -> None:
-    return None
 
 
-def run_mhc_finalize_gram(
-    *,
-    residual: torch.Tensor,
-    partials: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    y: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_weight: torch.Tensor | None,
-    norm_eps: float,
-    compact_partials: bool = False,
-    compact_projection_splits: int = 1,
-    active_source_splits: int = 0,
-    pre_mix: torch.Tensor | None = None,
-    pre_out: torch.Tensor | None = None,
-) -> None:
-    # Use an existing read-only tensor for the unused norm argument: serving
-    # calls without RMSNorm must not allocate a placeholder during capture.
-    norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
-    torch.ops.b12x.mhc_finalize_gram_launch(
-        residual,
-        partials,
-        scale,
-        bias,
-        y,
-        post,
-        comb,
-        norm_weight_for_kernel,
-        float(rms_eps),
-        float(hc_eps),
-        int(sinkhorn_iters),
-        float(norm_eps),
-        norm_weight is not None,
-        bool(compact_partials),
-        int(compact_projection_splits),
-        int(active_source_splits),
-        pre_mix,
-        pre_out,
-    )
 
 
-@torch.library.custom_op(
-    "b12x::mhc_post_launch_functional",
-    mutates_args=(),
-)
-def _mhc_post_launch_functional_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-) -> torch.Tensor:
-    out = torch.empty_like(residual)
-    if int(x.shape[0]) != 0:
-        _run_mhc_post_launch(
-            x=x,
-            residual=residual,
-            prev_post=prev_post,
-            prev_comb=prev_comb,
-            out=out,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@dsl_user_op
+def _tf32_residual_bits(value: Float32, high: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Round the FP32 remainder after the first TF32 term."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(value).ir_value(loc=loc, ip=ip), Uint32(high).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 hi, lo; mov.b32 hi, $2; sub.rn.f32 lo, $1, hi; cvt.rna.tf32.f32 $0, lo; }",
+            "=r,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
-    return out
-
-
-@_mhc_post_launch_functional_op.register_fake
-def _mhc_post_launch_functional_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(residual)
-
-
-def run_mhc_post_functional(
-    *,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-) -> torch.Tensor:
-    return torch.ops.b12x.mhc_post_launch_functional(
-        x,
-        residual,
-        prev_post,
-        prev_comb,
     )
-
-
-@torch.library.custom_op(
-    "b12x::mhc_pre_launch_functional",
-    mutates_args=(),
-)
-def _mhc_pre_launch_functional_op(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-    fuse_norm: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens = int(residual.shape[0])
-    hidden_size = int(residual.shape[-1])
-    split_k = _split_k_for_hidden(hidden_size)
-    partials = torch.empty(
-        (tokens, split_k, _PARTIALS),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    y = torch.empty(
-        (tokens, hidden_size),
-        dtype=residual.dtype,
-        device=residual.device,
-    )
-    post = torch.empty(
-        (tokens, _MHC_MULT),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    comb = torch.empty(
-        (tokens, _MHC_MULT, _MHC_MULT),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    out = torch.empty(
-        (tokens, _MHC_MULT, hidden_size),
-        dtype=residual.dtype,
-        device=residual.device,
-    )
-    if tokens != 0:
-        _run_mhc_pre_partial_launch(
-            residual=residual,
-            fn=fn,
-            partials=partials,
-            out=out,
-            compute_gram=fuse_norm,
-        )
-        _run_mhc_finalize_gram_launch(
-            residual=out,
-            partials=partials,
-            scale=scale,
-            bias=bias,
-            y=y,
-            post=post,
-            comb=comb,
-            rms_eps=rms_eps,
-            hc_eps=hc_eps,
-            sinkhorn_iters=sinkhorn_iters,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-            fuse_norm=fuse_norm,
-        )
-    return out, post, comb, y
-
-
-@_mhc_pre_launch_functional_op.register_fake
-def _mhc_pre_launch_functional_fake(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-    fuse_norm: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens = residual.shape[0]
-    hidden_size = residual.shape[-1]
-    y = torch.empty(
-        (tokens, hidden_size),
-        dtype=residual.dtype,
-        device=residual.device,
-    )
-    post = torch.empty(
-        (tokens, _MHC_MULT),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    comb = torch.empty(
-        (tokens, _MHC_MULT, _MHC_MULT),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    out = torch.empty(
-        (tokens, _MHC_MULT, hidden_size),
-        dtype=residual.dtype,
-        device=residual.device,
-    )
-    return out, post, comb, y
-
-
-def run_mhc_pre_functional(
-    *,
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_weight: torch.Tensor | None,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
-    return torch.ops.b12x.mhc_pre_launch_functional(
-        residual,
-        fn,
-        scale,
-        bias,
-        norm_weight_for_kernel,
-        float(rms_eps),
-        float(hc_eps),
-        int(sinkhorn_iters),
-        float(norm_eps),
-        norm_weight is not None,
-    )
-
-
-@torch.library.custom_op(
-    "b12x::mhc_post_pre_launch_functional",
-    mutates_args=(),
-)
-def _mhc_post_pre_launch_functional_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-    fuse_norm: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens = int(residual.shape[0])
-    hidden_size = int(residual.shape[2])
-    split_k = _split_k_for_hidden(hidden_size)
-    partials = torch.empty(
-        (tokens, split_k, _PARTIALS),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    residual_out = torch.empty_like(residual)
-    y = torch.empty(
-        (tokens, hidden_size),
-        dtype=residual.dtype,
-        device=residual.device,
-    )
-    post = torch.empty(
-        (tokens, _MHC_MULT),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    comb = torch.empty(
-        (tokens, _MHC_MULT, _MHC_MULT),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    if tokens != 0:
-        _run_mhc_post_pre_partial_launch(
-            x=x,
-            residual=residual,
-            prev_post=prev_post,
-            prev_comb=prev_comb,
-            fn=fn,
-            partials=partials,
-            out=residual_out,
-            compute_gram=fuse_norm,
-        )
-        decode_source_splits, _ = _selected_post_pre_decode_split_n(
-            num_tokens=tokens,
-            hidden_size=hidden_size,
-        )
-        _run_mhc_finalize_gram_launch(
-            residual=residual_out,
-            partials=partials,
-            scale=scale,
-            bias=bias,
-            y=y,
-            post=post,
-            comb=comb,
-            rms_eps=rms_eps,
-            hc_eps=hc_eps,
-            sinkhorn_iters=sinkhorn_iters,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-            fuse_norm=fuse_norm,
-            active_source_splits=decode_source_splits,
-        )
-    return residual_out, post, comb, y
-
-
-@_mhc_post_pre_launch_functional_op.register_fake
-def _mhc_post_pre_launch_functional_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-    fuse_norm: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens = residual.shape[0]
-    hidden_size = residual.shape[2]
-    residual_out = torch.empty_like(residual)
-    y = torch.empty(
-        (tokens, hidden_size),
-        dtype=residual.dtype,
-        device=residual.device,
-    )
-    post = torch.empty(
-        (tokens, _MHC_MULT),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    comb = torch.empty(
-        (tokens, _MHC_MULT, _MHC_MULT),
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    return residual_out, post, comb, y
-
-
-def run_mhc_post_pre_functional(
-    *,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    prev_post: torch.Tensor,
-    prev_comb: torch.Tensor,
-    fn: torch.Tensor,
-    scale: torch.Tensor,
-    bias: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_weight: torch.Tensor | None,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
-    return torch.ops.b12x.mhc_post_pre_launch_functional(
-        x,
-        residual,
-        prev_post,
-        prev_comb,
-        fn,
-        scale,
-        bias,
-        norm_weight_for_kernel,
-        float(rms_eps),
-        float(hc_eps),
-        int(sinkhorn_iters),
-        float(norm_eps),
-        norm_weight is not None,
-    )
-
 
 def _run_mhc_head_launch(
     *,
@@ -6869,16 +6029,3 @@ def run_mhc_head(
             float(hc_eps),
             float(norm_eps),
         )
-
-
-__all__ = [
-    "run_mhc_finalize_gram",
-    "run_mhc_head",
-    "run_mhc_post",
-    "run_mhc_post_functional",
-    "run_mhc_pre_functional",
-    "run_mhc_post_pre_functional",
-    "run_mhc_pre_partial",
-    "run_mhc_post_pre_partial",
-    "run_mhc_post_pre_partial_alloc",
-]

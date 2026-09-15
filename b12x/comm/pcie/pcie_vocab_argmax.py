@@ -11,8 +11,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation.types import Plan, require_prepared
+
 from ._cuda_ipc import CudaRTLibrary
-from ._vocab_argmax_cute import SLAB_BYTES, get_vocab_argmax_launcher
+from ._vocab_argmax_cute import SLAB_BYTES
 from .pcie_oneshot import (
     PCIeOneshotAllReduce,
     _broadcast_gather_object,
@@ -168,27 +170,19 @@ class PCIeVocabParallelArgmax:
             exchange_group,
         )
         self._slab_ptrs: tuple[int, ...] = ()
-        self._launcher = None
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
         self._closed = True
 
         def prepare_runtime():
-            self._ipc = CudaRTLibrary()
-            with self._cuda_runtime_device():
-                launcher = get_vocab_argmax_launcher(
-                    self.world_size,
-                    self.rank,
-                    self.device.index or 0,
-                    wait_nanosleep_cycles=wait_nanosleep_cycles,
-                )
-            return self._ipc, launcher
+            return CudaRTLibrary()
 
-        self._ipc, self._launcher = _run_collective_preallocation_setup(
+        self._ipc = _run_collective_preallocation_setup(
             owner="PCIe vocabulary argmax runtime preparation",
             exchange_group=exchange_group,
             setup=prepare_runtime,
         )
+        self.wait_nanosleep_cycles = wait_nanosleep_cycles
         with self._cuda_runtime_device():
             shared = PCIeOneshotAllReduce._allocate_shared_buffer(
                 exchange_group,
@@ -261,9 +255,13 @@ class PCIeVocabParallelArgmax:
         base: torch.Tensor,
         bias: torch.Tensor,
         out: Optional[torch.Tensor] = None,
+        *,
+        plan: Plan,
     ) -> torch.Tensor:
         """Return exact global argmax of the BF16-rounded local sum."""
 
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
         if self._closed:
             raise RuntimeError("vocabulary argmax runtime is closed")
         if base.device != self.device or bias.device != self.device:
@@ -273,6 +271,8 @@ class PCIeVocabParallelArgmax:
         if base.ndim != 2 or base.shape != bias.shape:
             raise ValueError("inputs must have matching [batch, local_vocab] shapes")
         batch, local_vocab = (int(value) for value in base.shape)
+        if batch != int(state.query.call["batch"]):
+            raise ValueError("batch differs from the prepared vocabulary plan")
         if not 0 < batch <= self.max_batch_size:
             raise ValueError(
                 f"batch size {batch} exceeds capacity {self.max_batch_size}"
@@ -294,10 +294,18 @@ class PCIeVocabParallelArgmax:
             or not out.is_contiguous()
         ):
             raise ValueError("output must be contiguous int64 [batch] on the device")
-        if self._launcher is None:
-            raise RuntimeError("vocabulary argmax launcher is unavailable")
+        return self._run_prepared(
+            state.launcher(),
+            base,
+            bias,
+            out,
+        )
+        return out
+
+    def _run_prepared(self, launcher, base, bias, out):
+        """Invoke an already-prepared native launcher after caller validation."""
         with self._cuda_runtime_device():
-            self._launcher(
+            launcher(
                 self._slab_ptrs,
                 base.data_ptr(),
                 bias.data_ptr(),
@@ -305,7 +313,7 @@ class PCIeVocabParallelArgmax:
                 self.local_vocab_size,
                 base.stride(0),
                 bias.stride(0),
-                batch,
+                int(base.shape[0]),
             )
         return out
 
@@ -329,21 +337,18 @@ class PCIeVocabParallelArgmax:
             torch.cuda.synchronize(self.device)
             dist.barrier(group=self.group)
             try:
-                self._launcher = None
                 self._slab_ptrs = ()
+                for ptr in self._remote_ptrs:
+                    self._ipc.cudaIpcCloseMemHandle(ptr)
             finally:
+                self._remote_ptrs.clear()
+                dist.barrier(group=self.group)
                 try:
-                    for ptr in self._remote_ptrs:
-                        self._ipc.cudaIpcCloseMemHandle(ptr)
+                    if self._local_ptr:
+                        self._ipc.cudaFree(self._local_ptr)
                 finally:
-                    self._remote_ptrs.clear()
+                    self._local_ptr = 0
                     dist.barrier(group=self.group)
-                    try:
-                        if self._local_ptr:
-                            self._ipc.cudaFree(self._local_ptr)
-                    finally:
-                        self._local_ptr = 0
-                        dist.barrier(group=self.group)
 
     def __enter__(self) -> "PCIeVocabParallelArgmax":
         return self
@@ -369,7 +374,6 @@ class PCIeVocabParallelArgmax:
             )
 
         with suppress(Exception), self._cuda_runtime_device():
-            self._launcher = None
             self._slab_ptrs = ()
 
             remote_ptrs = list(getattr(self, "_remote_ptrs", ()))

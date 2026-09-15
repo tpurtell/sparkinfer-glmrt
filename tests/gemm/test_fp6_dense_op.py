@@ -6,6 +6,8 @@ op without graph breaks — the property vLLM's VLLM_COMPILE mode relies on.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 
@@ -22,7 +24,7 @@ def _make_weight(n: int = 256, k: int = 256):
     return quantize_dense_weight_to_fp6(w_bf16)
 
 
-def _op_args(w):
+def _op_args(w, plan):
     return (
         w.expanded_weight(),
         w.scale_storage,
@@ -30,8 +32,38 @@ def _op_args(w):
         w.fmt,
         w.out_features,
         w.in_features,
+        plan.handle,
         w.act_fmt,
     )
+
+
+@contextmanager
+def _prepared_execution(w, m: int):
+    from b12x.preparation import PreparedCall, PreparationSession
+    from b12x.quantization.mxfp6 import Mxfp6DenseQuery, plan
+    from b12x.quantization.mxfp6.fp6_dense_weights import _DENSE_PER_ROW_GS
+
+    declaration = plan(Mxfp6DenseQuery(
+        max_tokens=m, in_features=w.in_features, out_features=w.out_features,
+        weight_format=w.fmt, activation_format=w.act_fmt,
+        weight_storage="expanded", global_scale_kind="multiplier",
+        output_mode="functional", per_row_global_scale=_DENSE_PER_ROW_GS,
+    ))
+    source = torch.zeros((m, w.in_features), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty((m, w.out_features), dtype=torch.bfloat16, device="cuda")
+    request = declaration.request(
+        name=f"fp6-op-{m}",
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: state.run(
+                source, w.expanded_weight(), w.scale_storage, w.global_scale,
+                out=output.unsqueeze(-1),
+            ),
+            output=output, owners=(source, output),
+        ),
+    )
+    with PreparationSession(device=source.device, autotune=False) as session:
+        session.prepare((request,))
+        yield declaration
 
 
 @cuda_required
@@ -43,10 +75,11 @@ def test_custom_op_matches_eager():
     for m in (1, 3, 128):
         x = torch.randn(m, w.in_features, dtype=torch.bfloat16, device="cuda")
         ref = dense_fp6_linear(x, w)
-        got = torch.ops.b12x.fp6_dense_linear(x, *_op_args(w))
-        assert got.shape == (m, w.out_features)
-        assert got.dtype == torch.bfloat16
-        torch.testing.assert_close(got, ref, rtol=0.0, atol=0.0)
+        with _prepared_execution(w, m) as plan:
+            got = torch.ops.b12x.fp6_dense_linear(x, *_op_args(w, plan))
+            assert got.shape == (m, w.out_features)
+            assert got.dtype == torch.bfloat16
+            torch.testing.assert_close(got, ref, rtol=0.0, atol=0.0)
 
 
 @cuda_required
@@ -103,18 +136,17 @@ def test_custom_op_compile_fullgraph():
     import b12x.quantization.mxfp6.fp6_dense_op  # noqa: F401
 
     w = _make_weight()
-    args = _op_args(w)
+    with _prepared_execution(w, 1) as plan:
+        args = _op_args(w, plan)
 
-    def fn(x: torch.Tensor) -> torch.Tensor:
-        return torch.ops.b12x.fp6_dense_linear(x, *args)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            return torch.ops.b12x.fp6_dense_linear(x, *args)
 
-    x = torch.randn(1, w.in_features, dtype=torch.bfloat16, device="cuda")
-    eager = fn(x)
-    # Warm the CUTE JIT outside of tracing, mirroring vLLM's warmup-then-compile
-    # order; fullgraph=True asserts no graph break around the opaque op.
-    compiled = torch.compile(fn, fullgraph=True)
-    got = compiled(x)
-    torch.testing.assert_close(got, eager, rtol=0.0, atol=0.0)
+        x = torch.randn(1, w.in_features, dtype=torch.bfloat16, device="cuda")
+        eager = fn(x)
+        compiled = torch.compile(fn, fullgraph=True)
+        got = compiled(x)
+        torch.testing.assert_close(got, eager, rtol=0.0, atol=0.0)
 
 
 @cuda_required
@@ -123,10 +155,16 @@ def test_custom_op_fake_tensor_shape():
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     w = _make_weight()
-    args = _op_args(w)
-    with FakeTensorMode() as mode:
-        fx = mode.from_tensor(torch.empty(7, w.in_features, dtype=torch.bfloat16))
-        fargs = [mode.from_tensor(a) if isinstance(a, torch.Tensor) else a for a in args]
-        out = torch.ops.b12x.fp6_dense_linear(fx, *fargs)
-        assert tuple(out.shape) == (7, w.out_features)
-        assert out.dtype == torch.bfloat16
+    with _prepared_execution(w, 7) as plan:
+        args = _op_args(w, plan)
+        with FakeTensorMode() as mode:
+            fx = mode.from_tensor(
+                torch.empty(7, w.in_features, dtype=torch.bfloat16),
+            )
+            fargs = [
+                mode.from_tensor(arg) if isinstance(arg, torch.Tensor) else arg
+                for arg in args
+            ]
+            out = torch.ops.b12x.fp6_dense_linear(fx, *fargs)
+            assert tuple(out.shape) == (7, w.out_features)
+            assert out.dtype == torch.bfloat16

@@ -1,24 +1,9 @@
-"""Fused MLA WO-A / WO-B projections as native MXFP8 GEMMs.
+"""Fused MLA WO-A / WO-B projections as prepared native MXFP8 GEMMs.
 
-Grouped ``[tokens, groups, group_width]`` input, quantized to MXFP8 inline;
-the ``run_inv_rope`` variant fuses inverse-RoPE into the input quantization.
-Planned lifecycle: ``pack_weights`` (host-side, one-time) -> ``plan(Caps)``
--> ``bind``/``bind_inv_rope`` (views only) -> ``run``/``run_inv_rope``
-(capture-safe).  Standalone quantizers (``quantize_input*``) expose the
-input-quant stage for split pipelines.
-
-Example:
-    from b12x.gemm import wo_projection as wo
-
-    weights = wo.pack_weights(wa_fp8, wa_scale, wb_fp8, wb_scale,   # one-time
-                              groups=G, group_width=D, rank=R, hidden=H)
-    plan    = wo.plan(wo.Caps(device="cuda", max_tokens=M, groups=G,
-                              group_width=D, rank=R, hidden=H))
-    spec    = plan.scratch_specs()[0]
-    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    binding = wo.bind(plan, scratch=scratch, source_tgd=x_tgd,
-                      weights=weights, expected_m=M)
-    out     = wo.run(binding=binding)
+Declare ``plan(Caps(...))``, prepare it through ``PreparationSession``, then
+bind caller-owned tensors/scratch and run with the returned prepared
+``Plan``.  Quantizer entry points follow the same ready-plan boundary.
+Packing remains a one-time caller-owned weight operation.
 """
 
 from __future__ import annotations

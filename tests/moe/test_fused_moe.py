@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 
 import b12x
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x._lib.compiler import compile_cache_info
 from b12x._lib.intrinsics import swizzle_block_scale
 
@@ -98,38 +99,35 @@ def test_run_w4a16_replays_under_cuda_graph_with_frozen_resolution() -> None:
     topk_ids = torch.randint(0, global_e, (m, topk), dtype=torch.int32, device="cuda")
     topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
 
-    binding = make_tp_moe_fp4_binding(
+    with make_tp_moe_fp4_binding(
         a=a,
         experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         output=torch.empty_like(a),
         quant_mode="w4a16",
-    )
-
-    eager = fused_moe.run(binding=binding).clone()
-    torch.cuda.synchronize()
-    assert int(torch.count_nonzero(eager).item()) > 0
-
-    fused_moe.run(binding=binding)  # resolve every kernel variant pre-capture
-    torch.cuda.synchronize()
-
-    misses_before = compile_cache_info()["compile_misses"]
-    b12x.freeze_kernel_resolution("fused-moe graph capture test")
-    try:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = fused_moe.run(binding=binding)
-        for _ in range(3):
-            graph.replay()
+    ) as binding:
+        eager = fused_moe.run(binding=binding).clone()
         torch.cuda.synchronize()
-    finally:
-        b12x.unfreeze_kernel_resolution()
+        assert int(torch.count_nonzero(eager).item()) > 0
 
-    assert compile_cache_info()["compile_misses"] == misses_before, (
-        "no kernel may compile during or after warm capture"
-    )
-    torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+        fused_moe.run(binding=binding)  # resolve every kernel variant pre-capture
+        torch.cuda.synchronize()
+
+        misses_before = compile_cache_info()["compile_misses"]
+        with kernel_resolution_guard('fused-moe graph capture test'):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = fused_moe.run(binding=binding)
+            for _ in range(3):
+                graph.replay()
+            torch.cuda.synchronize()
+
+        assert compile_cache_info()["compile_misses"] == misses_before, (
+            "no kernel may compile during or after warm capture"
+        )
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+        del graph
 
 
 def test_run_w4a16_m9_graph_replay_with_prequeued_aux_work() -> None:
@@ -160,39 +158,39 @@ def test_run_w4a16_m9_graph_replay_with_prequeued_aux_work() -> None:
     )
     topk_weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1)
     output = torch.empty_like(a)
-    binding = make_tp_moe_fp4_binding(
+    with make_tp_moe_fp4_binding(
         a=a,
         experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         output=output,
         quant_mode="w4a16",
-    )
-
-    fused_moe.run(binding=binding)
-    torch.cuda.synchronize()
-    expected = output.clone()
-
-    graph = torch.cuda.CUDAGraph()
-    capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+    ) as binding:
         fused_moe.run(binding=binding)
-    torch.cuda.current_stream().wait_stream(capture_stream)
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        expected = output.clone()
 
-    aux_stream = torch.cuda.Stream()
-    aux_a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
-    aux_b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
-    aux_out = torch.empty_like(aux_a)
-    output.zero_()
-    with torch.cuda.stream(aux_stream):
-        for _ in range(16):
-            torch.mm(aux_a, aux_b, out=aux_out)
-    graph.replay()
-    torch.cuda.current_stream().wait_stream(aux_stream)
-    torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+            fused_moe.run(binding=binding)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
 
-    assert output.isfinite().all()
-    assert output.abs().sum().item() > 0
-    torch.testing.assert_close(output, expected, atol=2e-3, rtol=0.0)
+        aux_stream = torch.cuda.Stream()
+        aux_a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+        aux_b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+        aux_out = torch.empty_like(aux_a)
+        output.zero_()
+        with torch.cuda.stream(aux_stream):
+            for _ in range(16):
+                torch.mm(aux_a, aux_b, out=aux_out)
+        graph.replay()
+        torch.cuda.current_stream().wait_stream(aux_stream)
+        torch.cuda.synchronize()
+
+        assert output.isfinite().all()
+        assert output.abs().sum().item() > 0
+        torch.testing.assert_close(output, expected, atol=2e-3, rtol=0.0)
+        del graph

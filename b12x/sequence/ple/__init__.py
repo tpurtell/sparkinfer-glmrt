@@ -5,8 +5,10 @@ already-projected PLE keys and values, compute the gated residual contribution,
 and update the caller-owned dilated-convolution state. PLE token hashing is the
 separate :mod:`b12x.sequence.ple_hash` op.
 
-Plans own capacity policy. Bindings contain only caller-owned runtime tensors
-and scratch views. Exact PyTorch oracles are available from
+``plan`` declares capacity and invocation metadata without preparation.
+``PreparationSession`` resolves and primes the native pipeline before ``bind``
+may consume its prepared ``Plan``. Bindings retain that plan alongside
+caller-owned tensors and scratch views. Exact PyTorch oracles are available from
 :mod:`b12x.sequence.ple.reference` and are not used as runtime fallbacks.
 """
 
@@ -27,6 +29,7 @@ META = OpMeta(
         "PleConfig",
         "PleQuery",
         "plan",
+        "invocation_from_tensors",
         "bind",
         "run_decode",
         "run_mixed",
@@ -64,6 +67,7 @@ if TYPE_CHECKING:
         bind,
         is_supported,
         plan,
+        invocation_from_tensors,
         run_decode,
         run_mixed,
         run_prefill,

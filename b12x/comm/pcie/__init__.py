@@ -1,16 +1,17 @@
 """PCIe collectives for SM12x multi-GPU boxes (no NVLink).
 
-Stateful class API (collectives own CUDA-IPC handles, mapped peer buffers,
-and stable CuTe launch plans): kwargs-only constructors with the shared
-vocabulary (rank / world_size / device / ...), CUDA-graph-capturable methods,
-pools via ``<Class>Pool``.
+Caller-owned runtimes retain CUDA-IPC handles and mapped peer buffers.
+``query_from_runtime`` and ``plan`` declare work for an established channel;
+``PreparationSession`` prepares the plan required by mathematical methods.
+``AllReduce.plan`` performs its existing world/message routing during planning.
+Pools select only channels provisioned before preparation.
 
 - ``AllReduce``: peer-safe world-size dispatch. TP2-TP8 use the all-peer
   oneshot path; TP12/TP16 use bounded-degree four-GPU islands.
 - ``OneshotAllReduce``: low-level one-shot all-reduce
   (+ ``all_reduce_fused_add_rms_norm``).
 - ``DmaAllReduce``: CE-copy ring reduce-scatter + all-gather for prefill
-  sizes, with a runtime crossover autotuner (``autotune_dma_crossovers``).
+  sizes, preserving explicitly configured transport crossovers.
 - ``PCIeTwoShotBF16``: single-rounding BF16 reduce-scatter, all-gather, and
   all-reduce with FP32 accumulation followed by one BF16 rounding.
 - ``TwoShotReduceScatter``: two-shot sequence-parallel collectives with
@@ -34,8 +35,13 @@ from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 META = OpMeta(
     name="pcie",
     group="comm",
-    api_style="stateful",
+    api_style="planned",
     entry_points=(
+        "Plan",
+        "PcieConfig",
+        "PcieQuery",
+        "plan",
+        "query_from_runtime",
         "AllReduce",
         "OneshotAllReduce",
         "OneshotAllReducePool",
@@ -47,8 +53,6 @@ META = OpMeta(
         "DcpTopKOwnerExchange",
         "VocabParallelArgmax",
         "kimi_topk16",
-        "prepare_kimi_topk16",
-        "autotune_dma_crossovers",
         "parse_oneshot_max_size",
         "lse_reduce_scatter_reference",
         "owner_stage_reference",
@@ -68,6 +72,11 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        Plan,
+        PcieConfig,
+        PcieQuery,
+        plan,
+        query_from_runtime,
         AllReduce,
         DcpAllToAll,
         DcpAllToAllPool,
@@ -78,13 +87,11 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         PCIeTwoShotBF16,
         TwoShotReduceScatter,
         VocabParallelArgmax,
-        autotune_dma_crossovers,
         is_supported,
         kimi_topk16,
         lse_reduce_scatter_reference,
         owner_stage_reference,
         parse_oneshot_max_size,
-        prepare_kimi_topk16,
     )
 
 install_lazy_api(globals(), META)

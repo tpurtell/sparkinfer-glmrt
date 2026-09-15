@@ -6,6 +6,7 @@ plan -> bind -> run lifecycle, including -1-padded selections.
 from __future__ import annotations
 
 import torch
+from b12x.preparation import PreparedCall, PreparationSession
 
 from b12x.attention import compressed_sparse_mla as compressed_mla
 from b12x.attention import sparse_mla
@@ -51,21 +52,44 @@ def _make_case(*, rows: int, heads: int, cache_tokens: int, width: int):
 def _run_public_decode(q_all, kv_cache, selected, cache_seqlens, active, *, width):
     rows, heads, _ = q_all.shape
     sm_scale = HEAD_DIM**-0.5
-    plan = sparse_mla.plan(
+    declaration = sparse_mla.plan(
         sparse_mla.Caps(
             device=q_all.device,
             num_q_heads=heads,
             max_q_rows=rows,
             max_width=width,
             softmax_scale=sm_scale,
-            kv_dtype=torch.uint8,  # packed NSA byte cache (fp8+scale+rope)
+            kv_dtype=torch.uint8,
         )
     )
-    spec = plan.scratch_specs()[0]
-    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q_all.device)
+    owned = {}
+
+    def prepare_call(state):
+        spec = state.scratch_specs()[0]
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q_all.device)
+        runtime = state.bind(
+            scratch=scratch,
+            q=q_all,
+            kv_cache=kv_cache,
+            selected_indices=selected,
+            cache_seqlens_int32=cache_seqlens,
+            nsa_cache_seqlens_int32=active,
+        )
+        owned["scratch"] = scratch
+        state.prime(runtime, kv_cache=kv_cache)
+        return PreparedCall(run=lambda: state.run(runtime, kv_cache=kv_cache))
+
+    session = PreparationSession(device=q_all.device)
+    result = session.prepare((
+        declaration.request(
+            name="sparse-mla-test",
+            prepare_call=prepare_call,
+        ),
+    ))
+    plan = result.plans["sparse-mla-test"]
     binding = sparse_mla.bind(
         plan,
-        scratch=scratch,
+        scratch=owned["scratch"],
         q=q_all,
         kv_cache=kv_cache,
         selected_indices=selected,

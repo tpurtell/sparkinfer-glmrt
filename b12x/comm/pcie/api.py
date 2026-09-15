@@ -15,7 +15,6 @@ from .pcie_dcp_a2a import (
 from .pcie_dcp_a2a import (
     kimi_topk16,
     lse_reduce_scatter_reference,
-    prepare_kimi_topk16,
 )
 from .pcie_dcp_topk import (
     PCIeDCPTopKOwnerExchange as DcpTopKOwnerExchange,
@@ -23,9 +22,6 @@ from .pcie_dcp_topk import (
 )
 from .pcie_dma import (
     PCIeDmaAllReduce as DmaAllReduce,
-)
-from .pcie_dma import (
-    autotune_crossovers as autotune_dma_crossovers,
 )
 from .pcie_oneshot import (
     PCIeOneshotAllReduce as OneshotAllReduce,
@@ -43,12 +39,15 @@ from .pcie_twoshot import (
 from .pcie_vocab_argmax import (
     PCIeVocabParallelArgmax as VocabParallelArgmax,
 )
+from ._preparation import plan, query_from_runtime
+from ._tuning import PcieConfig, PcieQuery
+from b12x.preparation import Plan
 
 
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with >= 2 visible CUDA devices.
 
-    Device kernels are compiled from the Python CuTe DSL sources on first use;
+    Device programs are compiled and primed by PreparationSession before use;
     no repo-authored C++/CUDA extension or runtime nvcc build is involved.
     """
     import torch
@@ -57,6 +56,11 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "Plan",
+    "PcieConfig",
+    "PcieQuery",
+    "plan",
+    "query_from_runtime",
     "AllReduce",
     "OneshotAllReduce",
     "OneshotAllReducePool",
@@ -68,8 +72,6 @@ __all__ = [
     "DcpTopKOwnerExchange",
     "VocabParallelArgmax",
     "kimi_topk16",
-    "prepare_kimi_topk16",
-    "autotune_dma_crossovers",
     "parse_oneshot_max_size",
     "lse_reduce_scatter_reference",
     "owner_stage_reference",

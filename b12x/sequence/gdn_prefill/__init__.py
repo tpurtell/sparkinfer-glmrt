@@ -17,11 +17,13 @@ an initial and final state slot and optionally a checkpoint at a multiple of
 sentinel in gdn_decode; null destinations are not written. Requests spanning
 pipeline windows require a non-null final slot for their running state.
 
-Use plan(Caps(...)), allocate scratch/output, bind, prewarm, warm-run, then
-capture or run. Replay allocates no tensor storage. Transactional validation
-reports duplicate/conflicting writes (bit 0), malformed metadata (bit 1),
-invalid slots (bit 2), or invalid checkpoints (bit 3), poisons live output,
-and preserves the state pool. Padded output rows are left untouched.
+Use ``plan(Caps(...), invocation=invocation_from_tensors(...))`` to declare
+geometry and parameter dtypes. ``PreparationSession`` selects and primes the
+native plan; ``bind`` requires the resulting prepared ``Plan``.
+Capture or run only after preparation. Replay allocates no tensor storage.
+Packed metadata is not checked on the device: the caller supplies in-range
+slots, one writer per slot, and chunk-aligned checkpoint offsets. Padded
+output rows are left untouched.
 """
 
 from __future__ import annotations
@@ -31,18 +33,20 @@ from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 META = OpMeta(
     name="gdn_prefill", group="sequence", api_style="planned",
     entry_points=("Binding", "Caps", "GdnPrefillConfig", "GdnPrefillQuery", "Plan",
-                  "bind", "clear_caches", "is_supported", "plan", "prewarm", "reference", "run"),
+                  "bind", "clear_caches", "is_supported", "plan", "invocation_from_tensors",
+                  "reference", "run", "staging_memory"),
     dtypes=("bf16", "fp32", "int32", "int64"), recipes=("scalar_gdn",),
     provenance=Provenance(repo="https://github.com/lukealonso/b12x", commit="79e228ec6",
                           paths=("b12x/sequence/kda_prefill/_cute_kernels.py",
                                  "b12x/sequence/gdn_decode/_cute_kernels.py")),
-    test_path="tests/sequence/test_gdn_prefill.py", since="1.4.0",
-    notes=("Research-only pending GPU qualification and measured profiles. BF16 activations, FP32 state, "
+    test_path="tests/preparation/test_delta_prefill.py", since="1.4.0",
+    notes=("BF16 activations, FP32 state, "
            "head dim 128, three value heads per Q/K head, 16-token chunks."),
 )
 
 if TYPE_CHECKING:
     from .api import (Binding, Caps, GdnPrefillConfig, GdnPrefillQuery, Plan, bind,
-                      clear_caches, is_supported, plan, prewarm, reference, run)
+                      clear_caches, is_supported, plan, invocation_from_tensors, reference,
+                      run, staging_memory)
 
 install_lazy_api(globals(), META)

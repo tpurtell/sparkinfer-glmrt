@@ -36,12 +36,11 @@ from b12x._lib.compiler import (
     compile as compile_native,
     run_compiled,
 )
-from b12x._lib.runtime_control import (
-    freeze_kernel_resolution,
-    unfreeze_kernel_resolution,
-)
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x._lib.utils import current_cuda_stream
 from b12x.gemm.bf16_gemv import _kernel as native
+from b12x.gemm.bf16_gemv import query_from_call
+from b12x.gemm.bf16_gemv._tuning import TUNING
 from benchmarks.common import (
     bench_cuda_graph,
     capture_cuda_graph,
@@ -274,8 +273,8 @@ def run_case(args, name, rows, dtype_name, layout, case_index, flush):
         :, :n
     ]
     native._validate(x, weight, out, None)
-    key = native._key(x, weight, out, None)
-    policy = native.ProjectionKernel(n, k, True, False)
+    key = (n, k, str(x.dtype), str(weight.dtype), str(out.dtype), 8)
+    default = TUNING.configure(query_from_call(x, weight, out=out), device=None).default
     pointer_types = (x.dtype, weight.dtype, x.dtype, out.dtype)
     pointers = tuple(
         native.make_ptr(
@@ -286,8 +285,7 @@ def run_case(args, name, rows, dtype_name, layout, case_index, flush):
         )
         for dtype in pointer_types
     )
-    # Compile the production GPU entrypoints directly for the diagnostic race;
-    # the public API caches one adaptive host callable, not a pair selected by M.
+    # Compile the native entrypoints directly to compare both implementations.
     compiled = tuple(
         compile_native(
             kernel,
@@ -359,10 +357,7 @@ def run_case(args, name, rows, dtype_name, layout, case_index, flush):
     graphs = {}
     blocks = []
     samples = {arm: [] for arm in ARMS}
-    freeze_kernel_resolution(
-        "BF16 projection native SIMT/MMA graph capture and paired replay"
-    )
-    try:
+    with kernel_resolution_guard("BF16 projection native SIMT/MMA graph capture and paired replay"):
         for arm in initial_order:
 
             def repeated(launch=launches[arm]):
@@ -396,8 +391,8 @@ def run_case(args, name, rows, dtype_name, layout, case_index, flush):
             graphs[arm].replay()
             torch.cuda.synchronize()
             correctness[arm]["graph_after_timing"] = check_output(out, expected, arm)
-    finally:
-        unfreeze_kernel_resolution()
+    for graph in graphs.values():
+        graph.reset()
     medians = {arm: statistics.median(values) for arm, values in samples.items()}
     ratio = medians["simt"] / medians["mma"]
     return {
@@ -422,12 +417,11 @@ def run_case(args, name, rows, dtype_name, layout, case_index, flush):
             "simt": "SmallNGemvKernel",
             "mma": "Bf16GemmKernel(32,64,64)",
         },
-        "production_policy_arm": "mma"
-        if policy.has_mma and rows >= policy.minimum_mma_rows
-        else "simt",
-        "production_policy_regresses_vs_simt": policy.has_mma
-        and rows >= policy.minimum_mma_rows
-        and ratio < 1,
+        "production_policy_arm": default.backend,
+        "production_policy_regresses_vs_simt": (
+            ratio < 1 if default.backend == "mma" else
+            False if default.backend == "simt" else None
+        ),
         "correctness": correctness,
         "median_us_per_projection": medians,
         "simt_over_mma_ratio": ratio,

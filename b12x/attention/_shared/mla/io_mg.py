@@ -19,7 +19,7 @@ from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
     st_shared_u32,
 )
-
+from .io import stage_dsv41_fp8_scales
 
 _DSV4_IO_STRIDE = 576
 _DSV4_NOPE_BYTES = 448
@@ -163,6 +163,9 @@ def io_issue_gather_glm_mg(
     kv_sc_dst_addr: Int32 = Int32(0),
     dsv41: cutlass.Constexpr = False,
     dsv41_swa: cutlass.Constexpr = True,
+    dsv41_fp8: cutlass.Constexpr = False,
+    ratio_dst_addr: Int32 = Int32(0),
+    ratio_stride: cutlass.Constexpr = 0,
 ):
     """Gather one BI=64 GLM prefill tile into MG smem.
 
@@ -183,15 +186,31 @@ def io_issue_gather_glm_mg(
         for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
             entry = eo + io_lane
             if entry < Int32(bi):
-                source_tag = Uint32(2)
+                idx_raw = Int32(-1)
                 if g_start + entry < g_end:
-                    if Int32(topk_indices[g_start + entry]) >= Int32(0):
-                        source_tag = Uint32(1 if dsv41_swa else 0)
+                    idx_raw = Int32(topk_indices[g_start + entry])
+                source_tag = Uint32(2)
+                if idx_raw >= Int32(0):
+                    source_tag = Uint32(1 if dsv41_swa else 0)
                 st_shared_u32(
                     kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(528),
                     source_tag,
                 )
-            eo += Int32(io_threads)
+                if cutlass.const_expr(dsv41_fp8):
+                    metadata_idx = idx_raw
+                    if metadata_idx < Int32(0):
+                        metadata_idx = Int32(0)
+                    metadata_block = metadata_idx // page_block_size
+                    metadata_local = metadata_idx - metadata_block * page_block_size
+                    stage_dsv41_fp8_scales(
+                        kv_cache_u8,
+                        Int64(metadata_block) * stride_kv_block
+                        + Int64(metadata_local) * _ios,
+                        ratio_dst_addr + entry * Int32(ratio_stride),
+                        kv_sc_dst_addr + entry * Int32(8),
+                        idx_raw >= Int32(0),
+                        swa=dsv41_swa,
+                    )
         cute.arch.fence_acq_rel_cta()
     elif cutlass.const_expr(scale_format == 2):
         if cutlass.const_expr(fp8_rope):

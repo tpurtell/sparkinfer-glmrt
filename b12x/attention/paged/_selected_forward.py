@@ -40,6 +40,7 @@ from b12x.attention._shared.cute.ops import fmax
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compiler import run_compiled
+from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
 from b12x._lib.intrinsics import (
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
     ld_global_nc_v4_u32,
@@ -1213,7 +1214,7 @@ def _compile(
             value_strides=value_strides,
             selection_width=selection_width,
         )
-        with torch.cuda.device(query.device):
+        with torch.cuda.device(key[0]):
             raise_if_kernel_resolution_frozen(
                 "cute.compile",
                 target=kernel,
@@ -1476,7 +1477,7 @@ def launch_sparse_gqa_merge(
         device_index = torch.cuda.current_device()
     q_heads = int(partial_output.shape[2])
     key = (int(device_index), q_heads, _HEAD_DIM, _MERGE_KERNEL.__name__)
-    with torch.cuda.device(partial_output.device):
+    with torch.cuda.device(device_index):
         capturing = torch.cuda.is_current_stream_capturing()
         with _LOCK:
             raw = _MERGE_CACHE.get(key)
@@ -1509,6 +1510,10 @@ def launch_sparse_gqa_merge(
             )
             with _LOCK:
                 _MERGE_CACHE[key] = raw
+        if compile_only_launches_enabled():
+            for program in program_keys(raw):
+                record_program(program)
+            return raw
         run_compiled(
             raw,
             (

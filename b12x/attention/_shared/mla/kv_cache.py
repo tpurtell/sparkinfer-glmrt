@@ -84,6 +84,7 @@ from b12x._lib.compiler import (
     run_compiled,
     tensor_compile_fact,
 )
+from b12x._lib.program_cache import register_program_cache
 from b12x._lib.intrinsics import (
     cvt_e4m3_to_f32_via_f16,
     cvt_f32_to_e4m3,
@@ -142,7 +143,8 @@ _GLM_NEXT_WRITER_COMPILED: dict[tuple[int, int, torch.dtype], object] = {}
 _NVFP4_WRITER_COMPILED: dict[
     tuple[int, int, torch.dtype, torch.dtype, bool, bool], object
 ] = {}
-_COMPRESSED_WRITER_COMPILED: dict[tuple[int, int, str, torch.dtype], object] = {}
+register_program_cache(_GLM_NEXT_WRITER_COMPILED, lock=_GLM_NEXT_WRITER_LOCK)
+register_program_cache(_NVFP4_WRITER_COMPILED, lock=_GLM_NEXT_WRITER_LOCK)
 
 
 @dsl_user_op
@@ -600,7 +602,6 @@ def clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache() -> None:
     _build_compressed_cache_writer.cache_clear()
     with _GLM_NEXT_WRITER_LOCK:
         _NVFP4_WRITER_COMPILED.clear()
-        _COMPRESSED_WRITER_COMPILED.clear()
 
 
 @lru_cache(maxsize=None)
@@ -617,7 +618,6 @@ def clear_glm_next_mla_kv_cache_kernel_cache() -> None:
     with _GLM_NEXT_WRITER_LOCK:
         _GLM_NEXT_WRITER_COMPILED.clear()
         _NVFP4_WRITER_COMPILED.clear()
-        _COMPRESSED_WRITER_COMPILED.clear()
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -640,6 +640,15 @@ def _to_kernel_tensor(
     assumed_align: int,
     leading_dim: int,
 ) -> cute.Tensor:
+    if hasattr(tensor, "fake_mode"):
+        from cutlass.cute.runtime import make_fake_tensor
+        return make_fake_tensor(
+            _torch_to_cutlass_dtype(tensor.dtype),
+            tuple(cute.sym_int(32) for _ in tensor.shape),
+            tuple(1 if index == leading_dim else cute.sym_int(64)
+                  for index in range(tensor.ndim)),
+            assumed_align=assumed_align,
+        )
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = _torch_to_cutlass_dtype(tensor.dtype)
     return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
@@ -746,7 +755,7 @@ def _concat_and_cache_glm_next_mla_flat_launch(
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "GLM_NEXT cache-writer compile miss during CUDA graph capture; "
-                "call compile_glm_next_mla_cache_writer before capture"
+                "prepare its exact writer specialization before capture"
             )
         compiled = _compile_glm_next_mla_cache_writer(kv_c, kv_cache, slot_mapping)
     _, args, _ = _glm_next_cache_writer_launch(kv_c, kv_cache, slot_mapping)
@@ -848,93 +857,50 @@ def _validate_glm_next_mla_cache_writer_args(
         raise ValueError("all tensors must be on the same device")
 
 
-def compile_glm_next_mla_cache_writer(
-    kv_c: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    """Compile the exact GLM_NEXT page-size/slot-dtype writer specialization.
-
-    This does not mutate any tensor.  Call it before CUDA graph capture when a
-    normal eager warmup write is undesirable.  Token count, page count, source
-    row stride, and padded page stride remain runtime-dynamic.
-    """
-    _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
-    if int(slot_mapping.shape[0]) == 0:
-        raise ValueError("cache-writer compilation requires at least one token")
-    if int(kv_cache.shape[-1]) == _GLM_NEXT_NVFP4_RECORD_BYTES:
-        _compile_nvfp4_mla_writer(
-            kv_c,
-            kv_c,
-            kv_cache,
-            slot_mapping,
-            per_token_scale=True,
-            has_rope=False,
-        )
-    else:
-        _compile_glm_next_mla_cache_writer(kv_c, kv_cache, slot_mapping)
 
 
 def concat_and_cache_glm_next_mla(
     kv_c: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    *,
+    plan,
 ) -> None:
-    """Quantize BF16 absorbed MLA latents into GLM_NEXT cache slots.
-
-    ``kv_cache`` is a semantic ``(num_pages, page_size, record_bytes)`` uint8
-    view, where ``record_bytes`` is 528 for FP8 or 304 for NVFP4. Its page
-    stride may exceed ``page_size * record_bytes`` so additional page-local
-    storage can follow the MLA records.  The writer never touches that tail.
-    Negative and out-of-capacity slot ids are skipped, as required by padded
-    CUDA-graph batches.
-
-    Warm the exact page-size/slot-dtype specialization once before CUDA graph
-    capture, or prepare either record format with
-    ``compile_glm_next_mla_cache_writer``. Subsequent calls launch using only
-    caller-owned fixed buffers and are capture safe.
-
-    :param kv_c: absorbed latent rows, ``(>= num_tokens, 512)`` BF16.
-    :param kv_cache: strided paged cache view with packed 528-byte FP8 or
-        304-byte NVFP4 rows; mutated in place.
-    :param slot_mapping: contiguous ``(num_tokens,)`` int32/int64 flat slot ids;
-        ids are promoted to Int64 before address arithmetic.
-    """
-    _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
-    if int(kv_cache.shape[-1]) == _GLM_NEXT_NVFP4_RECORD_BYTES:
-        concat_and_cache_glm_next_mla_nvfp4(kv_c, kv_cache, slot_mapping)
-    else:
-        concat_and_cache_glm_next_mla_fp8(kv_c, kv_cache, slot_mapping)
+    """Write GLM_NEXT cache records through a prepared plan."""
+    from b12x.attention.sparse_mla._preparation import writer_state
+    writer_state(plan, device=kv_cache.device).run(kv_c, kv_cache, slot_mapping)
 
 
 def concat_and_cache_glm_next_mla_fp8(
     kv_c: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    *,
+    plan,
 ) -> None:
-    """Write the fixed 528-byte GLM_NEXT FP8 cache recipe."""
-    _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
+    """Write the fixed 528-byte GLM_NEXT FP8 recipe through preparation."""
     if int(kv_cache.shape[-1]) != _GLM_NEXT_RECORD_BYTES:
         raise ValueError(
             "GLM_NEXT FP8 writer requires 528-byte records, got "
             f"{int(kv_cache.shape[-1])}"
         )
-    torch.ops.b12x.concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping)
+    concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
 
 
 def concat_and_cache_glm_next_mla_nvfp4(
     kv_c: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    *,
+    plan,
 ) -> None:
-    """Write the fixed 304-byte GLM_NEXT NVFP4 cache recipe."""
-    _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
+    """Write the fixed 304-byte GLM_NEXT NVFP4 recipe through preparation."""
     if int(kv_cache.shape[-1]) != _GLM_NEXT_NVFP4_RECORD_BYTES:
         raise ValueError(
             "GLM_NEXT NVFP4 writer requires 304-byte records, got "
             f"{int(kv_cache.shape[-1])}"
         )
-    torch.ops.b12x.concat_and_cache_glm_next_nvfp4_mla(kv_c, kv_cache, slot_mapping)
+    concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
 
 
 def _nvfp4_mla_writer_signature(
@@ -1239,7 +1205,6 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
         kv_c, k_pe, kv_cache, slot_mapping, per_token_scale
     )
 
-
 def page_nbytes(
     page_size: int,
     *,
@@ -1326,12 +1291,9 @@ def _validate_compressed_cache_writer(
         raise ValueError("all tensors must be on the same device")
 
 
-def _compressed_cache_writer_signature(kv, slot_mapping, page_size, cache_kind):
-    return int(kv.device.index), page_size, cache_kind, slot_mapping.dtype
 
 
-def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_kind):
-    kernel = _build_compressed_cache_writer(page_size, cache_kind)
+def _compressed_cache_writer_args(kv, cache, slot_mapping, page_size, cache_kind):
     kv_arg = _to_kernel_tensor(kv, assumed_align=4, leading_dim=1)
     cache_arg = _to_kernel_tensor(cache, assumed_align=16, leading_dim=1)
     slots_arg = _to_kernel_tensor(
@@ -1359,6 +1321,12 @@ def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_ki
             Int64(int(kv.stride(0))),
             *tail_args,
         )
+    return args
+
+
+def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_kind):
+    kernel = _build_compressed_cache_writer(page_size, cache_kind)
+    args = _compressed_cache_writer_args(kv, cache, slot_mapping, page_size, cache_kind)
     spec = KernelCompileSpec.from_key(
         "attention.compressed_sparse_mla.kv_cache",
         1,
@@ -1375,109 +1343,3 @@ def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_ki
         labels=("kv", "cache", "slot_mapping", "page_size", "cache_kind", "cache_format"),
     )
     return kernel, args, spec
-
-
-def _compile_compressed_cache_writer(kv, cache, slot_mapping, page_size, cache_kind):
-    signature = _compressed_cache_writer_signature(kv, slot_mapping, page_size, cache_kind)
-    with _GLM_NEXT_WRITER_LOCK:
-        compiled = _COMPRESSED_WRITER_COMPILED.get(signature)
-    if compiled is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "compressed cache-writer compile miss during CUDA graph capture; "
-                "call compile_cache_writer before capture"
-            )
-        kernel, args, spec = _compressed_cache_writer_launch(
-            kv, cache, slot_mapping, page_size, cache_kind
-        )
-        compiled = compile_cute(kernel, *args, compile_spec=spec)
-        with _GLM_NEXT_WRITER_LOCK:
-            _COMPRESSED_WRITER_COMPILED[signature] = compiled
-    return compiled
-
-
-@torch.library.custom_op(
-    "b12x::write_compressed_mla_cache",
-    mutates_args=("cache",),
-)
-def _write_compressed_mla_cache_op(
-    kv: torch.Tensor,
-    cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    page_size: int,
-    cache_kind: str,
-) -> None:
-    if int(slot_mapping.shape[0]) == 0:
-        return
-    with torch.cuda.device(kv.device):
-        compiled = _compile_compressed_cache_writer(
-            kv, cache, slot_mapping, page_size, cache_kind
-        )
-        _, args, _ = _compressed_cache_writer_launch(
-            kv, cache, slot_mapping, page_size, cache_kind
-        )
-        run_compiled(compiled, args)
-
-
-@_write_compressed_mla_cache_op.register_fake
-def _write_compressed_mla_cache_fake(
-    kv: torch.Tensor,
-    cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    page_size: int,
-    cache_kind: str,
-) -> None:
-    return None
-
-
-def compile_cache_writer(
-    kv: torch.Tensor,
-    cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    *,
-    page_size: int,
-    cache_kind: str,
-    cache_format: str = "deepseek_v41",
-) -> None:
-    """Precompile without writing; live row/page counts and strides are dynamic.
-
-    Prepare a nonempty representative input before frozen kernel resolution or
-    CUDA graph capture. Subsequent writes may use zero or different live rows.
-    """
-    _validate_compressed_cache_writer(
-        kv, cache, slot_mapping, page_size, cache_kind, cache_format
-    )
-    if int(slot_mapping.shape[0]) == 0:
-        raise ValueError("cache-writer compilation requires at least one row")
-    with torch.cuda.device(kv.device):
-        _compile_compressed_cache_writer(kv, cache, slot_mapping, page_size, cache_kind)
-
-
-def write_cache(
-    kv: torch.Tensor,
-    cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    *,
-    page_size: int,
-    cache_kind: str,
-    cache_format: str = "deepseek_v41",
-) -> None:
-    """Write BF16 post-RoPE ``[rows, 512]`` latents to paged byte storage.
-
-    Each nonnegative in-capacity slot selects ``(slot // page_size,
-    slot % page_size)``. Negative and out-of-capacity slots are ignored; zero
-    live rows are a no-op. Pages may have a caller-owned 16-byte-aligned stride
-    larger than their payload; padding is untouched.
-
-    SWA quantizes all 512 values in groups of 32 to E4M3 with
-    ``pow2ceil(max(amax, 1e-4) / 448)`` UE8M0 scales. Indexed quantizes groups
-    of 16 to saturated E2M1 using the inverse of
-    ``E4M3(max(amax, 6 * 2**-9) / 6)``. Neither recipe has a separate RoPE tail
-    or a second-level scale.
-    """
-    _validate_compressed_cache_writer(
-        kv, cache, slot_mapping, page_size, cache_kind, cache_format
-    )
-    torch.ops.b12x.write_compressed_mla_cache(
-        kv, cache, slot_mapping, page_size, cache_kind
-    )

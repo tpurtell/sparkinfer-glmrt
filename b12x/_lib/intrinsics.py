@@ -6857,40 +6857,10 @@ def packed_decode_trellis_sqg_cheb_normal_e4m3_rank_lut_to_e4m3x8(
     if k2_q8h4 and bits != 2:
         raise ValueError("the virtual-octile graph is valid only for K2")
     if not global_lut:
-        # The packed form uses a 64-bit global pointer.  Keep the scalar shared
-        # implementation available for the later staging experiment rather
-        # than mixing generic and shared address spaces in one PTX template.
-        mask = Uint32(0xFFFF)
-        source_a = Uint32(win_a)
-        source_b = Uint32(win_b)
-        windows = [
-            (source_b >> Uint32(3 * bits)) & mask,
-            (source_b >> Uint32(2 * bits)) & mask,
-            (source_b >> Uint32(bits)) & mask,
-            source_b & mask,
-            (source_a >> Uint32(3 * bits)) & mask,
-            (source_a >> Uint32(2 * bits)) & mask,
-            (source_a >> Uint32(bits)) & mask,
-            source_a & mask,
-        ]
-        decoded = [
-            decode_trellis_sqg_cheb_normal_e4m3_rank_lut(
-                window,
-                rank_lut_addr,
-                bits,
-                k2_q8h4=k2_q8h4,
-                global_lut=False,
-                loc=loc,
-                ip=ip,
-            )
-            for window in windows
-        ]
-        lo = decoded[0]
-        hi = decoded[4]
-        for index in range(1, 4):
-            lo = lo | (decoded[index] << Uint32(8 * index))
-            hi = hi | (decoded[index + 4] << Uint32(8 * index))
-        return Uint32(lo), Uint32(hi)
+        raise NotImplementedError(
+            "packed SQG-Cheb rank-LUT decoding requires a global table; "
+            "the shared-table scalar decoder is not implemented"
+        )
 
     graph_bits = 3 if k2_q8h4 else bits
     width = 16 - graph_bits

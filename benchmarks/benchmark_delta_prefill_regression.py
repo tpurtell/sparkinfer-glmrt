@@ -61,7 +61,7 @@ def main(argv=None):
     import b12x
     if not pathlib.Path(b12x.__file__).resolve().is_relative_to(source):
         raise RuntimeError(f"loaded b12x from {b12x.__file__}, expected {source}")
-    contract = pathlib.Path(__file__).resolve().parents[1]/"b12x/policy/generation/delta_prefill_cases.py"
+    contract = pathlib.Path(__file__).resolve().parents[1]/"b12x/testing/delta_prefill_cases.py"
     spec = importlib.util.spec_from_file_location("delta_prefill_regression_cases", contract)
     cases_module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = cases_module
@@ -96,32 +96,32 @@ def main(argv=None):
             data = cases_module.make_inputs(case, device=device, seed=args.seed+all_cases.index(case))
             initial = data["recurrent_state"].clone()
             expected, state = cases_module.oracle(case, data)
-            binding = cases_module.make_binding(case, data)
-            for _ in range(args.warmup):
+            with cases_module.prepared_binding(case, data) as binding:
+                for _ in range(args.warmup):
+                    binding.recurrent_state.copy_(initial)
+                    cases_module.run_binding("kda", binding)
+                graph = torch.cuda.CUDAGraph()
                 binding.recurrent_state.copy_(initial)
-                cases_module.run_binding("kda", binding)
-            graph = torch.cuda.CUDAGraph()
-            binding.recurrent_state.copy_(initial)
-            with torch.cuda.graph(graph):
-                cases_module.run_binding("kda", binding)
-            binding.recurrent_state.copy_(initial)
-            binding.output.fill_(float("nan"))
-            binding.scratch.fill_(0xFF)
-            graph.replay()
-            torch.cuda.synchronize(device)
-            correctness = cases_module.check_binding(case, binding, expected, state, initial)
-            samples = []
-            for _ in range(args.iterations):
+                with torch.cuda.graph(graph):
+                    cases_module.run_binding("kda", binding)
                 binding.recurrent_state.copy_(initial)
-                start.record()
+                binding.output.fill_(float("nan"))
+                binding.scratch.fill_(0xFF)
                 graph.replay()
-                end.record()
-                end.synchronize()
-                samples.append(start.elapsed_time(end)*1000)
-            row = {"case": name, "correctness": correctness, "samples_us": samples,
-                   "median_us": statistics.median(samples)}
-            payload["reports"].append(row)
-            print(json.dumps(row), flush=True)
+                torch.cuda.synchronize(device)
+                correctness = cases_module.check_binding(case, binding, expected, state, initial)
+                samples = []
+                for _ in range(args.iterations):
+                    binding.recurrent_state.copy_(initial)
+                    start.record()
+                    graph.replay()
+                    end.record()
+                    end.synchronize()
+                    samples.append(start.elapsed_time(end)*1000)
+                row = {"case": name, "correctness": correctness, "samples_us": samples,
+                       "median_us": statistics.median(samples)}
+                payload["reports"].append(row)
+                print(json.dumps(row), flush=True)
     except BaseException as exc:
         payload["error"] = f"{type(exc).__name__}: {exc}"
         raise

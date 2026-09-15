@@ -1,20 +1,20 @@
 """Opaque ``torch.custom_op`` wrapper for the FP6 dense linear.
 
 Registers ``b12x::fp6_dense_linear`` so vLLM's ``torch.compile`` path
-(Dynamo fullgraph tracing + CUDA-graph capture) treats the whole FP6 linear —
-activation quantization, CUTE kernel JIT lookup, and the block-scaled GEMM
-launch — as a single opaque node instead of tracing into the JIT machinery
-(tempfile / os.getpid), which previously forced ``--enforce-eager``.
+(Dynamo fullgraph tracing + CUDA-graph capture) treats the already-prepared
+native quantize/GEMM launch sequence as one opaque node.  The caller supplies
+the session-owned prepared plan; this operation never selects,
+compiles, allocates quantizer scratch, or resolves a launcher.
 
-Importing this module performs the registration; ``vllm_plugin`` imports it in
-``process_weights_after_loading`` so the op exists in every worker before the
-model is compiled.
+Importing this module performs the registration; the vLLM plugin imports it
+while publishing loaded FP6 weights, before model compilation.
 """
 from __future__ import annotations
 
 import torch
 
-from .fp6_dense_weights import dense_fp6_linear_expanded
+from b12x.preparation.types import plan_from_handle, require_prepared
+
 
 
 @torch.library.custom_op("b12x::fp6_dense_linear", mutates_args=())
@@ -26,6 +26,7 @@ def fp6_dense_linear(
     fmt: str,
     out_features: int,
     in_features: int,
+    plan_handle: int,
     act_fmt: str = "",
 ) -> torch.Tensor:
     """``y = x @ W.T`` in MX-FP6; ``x`` is ``(M, in_features)`` bf16.
@@ -38,16 +39,13 @@ def fp6_dense_linear(
     activation sub-format (empty string -> same as ``fmt``; ``"e4m3"`` for W6A8).
     Returns ``(M, out_features)`` bf16.
     """
-    return dense_fp6_linear_expanded(
-        x,
-        weight,
-        scale_storage,
-        global_scale,
-        fmt,
-        out_features,
-        in_features,
-        act_fmt=act_fmt if act_fmt else None,
-    )
+    state = require_prepared(plan_from_handle(plan_handle), "quantization.mxfp6", x.device)
+    if (state.query.weight_format != fmt
+            or state.query.activation_format != (act_fmt or fmt)
+            or state.query.out_features != out_features
+            or state.query.in_features != in_features):
+        raise ValueError("FP6 dense arguments differ from prepared plan")
+    return state.run(x.to(torch.bfloat16), weight, scale_storage, global_scale)
 
 
 @fp6_dense_linear.register_fake
@@ -59,6 +57,8 @@ def _fp6_dense_linear_fake(
     fmt: str,
     out_features: int,
     in_features: int,
+    plan_handle: int,
     act_fmt: str = "",
 ) -> torch.Tensor:
+    del weight, scale_storage, global_scale, fmt, in_features, act_fmt, plan_handle
     return x.new_empty((x.shape[0], out_features), dtype=torch.bfloat16)

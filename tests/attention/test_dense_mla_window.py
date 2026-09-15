@@ -7,6 +7,7 @@ import torch
 
 from b12x.attention import dense_mla
 
+from .test_dense_mla import _bind, _prepared_scope
 from ..conftest import require_b12x
 
 FP8 = torch.float8_e4m3fn
@@ -14,10 +15,12 @@ WINDOW_SIZE = 513
 SM_SCALE = 1.0 / (256**0.5)
 
 
-def _scratch(plan: dense_mla.Plan) -> torch.Tensor:
-    (spec,) = plan.scratch_specs()
-    return torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
 
+
+@pytest.fixture(autouse=True)
+def _prepared_dense_mla_window():
+    with _prepared_scope():
+        yield
 
 @pytest.mark.parametrize(
     "cache_lens,query_lens",
@@ -74,9 +77,8 @@ def test_fp8_ragged_window_matches_reference(
         device=device,
     )
     output = torch.empty(total_q, 8, 1024, dtype=torch.bfloat16, device=device)
-    binding = dense_mla.bind(
+    binding = _bind(
         plan,
-        scratch=_scratch(plan),
         q=q,
         kv_cache=cache,
         output=output,
@@ -140,9 +142,8 @@ def test_fp8_decode_replays_on_non_default_stream_without_allocation() -> None:
     cache_seqlens = torch.tensor([514], dtype=torch.int32, device=device)
     cu_seqlens_q = torch.tensor([0, 4], dtype=torch.int32, device=device)
     output = torch.empty(4, 8, 1024, dtype=torch.bfloat16, device=device)
-    binding = dense_mla.bind(
+    binding = _bind(
         plan,
-        scratch=_scratch(plan),
         q=q,
         kv_cache=cache,
         output=output,
@@ -155,7 +156,6 @@ def test_fp8_decode_replays_on_non_default_stream_without_allocation() -> None:
     )
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
-        dense_mla.compile(binding=binding)
         dense_mla.run(binding=binding)
     stream.synchronize()
 
@@ -201,25 +201,23 @@ def test_fp8_page_offset_exceeds_signed_int32() -> None:
     int32_max = torch.iinfo(torch.int32).max
     high_page_id = int32_max // page_stride_bytes + 2
     num_pages = high_page_id + 1
-    plan = dense_mla.plan(
-        dense_mla.Caps(
-            device=device,
-            mode="decode",
-            dtype=torch.bfloat16,
-            q_dtype=torch.bfloat16,
-            kv_dtype=FP8,
-            num_q_heads=8,
-            page_size=64,
-            max_total_q=1,
-            max_batch=1,
-            max_cache_tokens=64,
-            max_page_table_width=1,
-            num_cache_pages=num_pages,
-            head_dim=1088,
-            v_head_dim=1024,
-            physical_record_width=1088,
-            window_size=WINDOW_SIZE,
-        )
+    caps = dense_mla.Caps(
+        device=device,
+        mode="decode",
+        dtype=torch.bfloat16,
+        q_dtype=torch.bfloat16,
+        kv_dtype=FP8,
+        num_q_heads=8,
+        page_size=64,
+        max_total_q=1,
+        max_batch=1,
+        max_cache_tokens=64,
+        max_page_table_width=1,
+        num_cache_pages=num_pages,
+        head_dim=1088,
+        v_head_dim=1024,
+        physical_record_width=1088,
+        window_size=WINDOW_SIZE,
     )
     cache = torch.empty(num_pages, 64, 1088, dtype=FP8, device=device)
     assert high_page_id * cache.stride(0) * cache.element_size() > int32_max
@@ -231,9 +229,22 @@ def test_fp8_page_offset_exceeds_signed_int32() -> None:
     q_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     kv_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     output = torch.empty(1, 8, 1024, dtype=torch.bfloat16, device=device)
-    binding = dense_mla.bind(
+    plan = dense_mla.plan(
+        caps,
+        invocation=dense_mla.invocation_from_tensors(
+            caps,
+            q=q,
+            kv_cache=cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            kv_scale=kv_scale,
+            q_scale=q_scale,
+        ),
+    )
+    binding = _bind(
         plan,
-        scratch=_scratch(plan),
         q=q,
         kv_cache=cache,
         output=output,

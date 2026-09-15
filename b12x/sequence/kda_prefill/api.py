@@ -6,8 +6,9 @@ from ..._lib.gating import default_is_supported
 
 from . import reference
 from .._shared.delta_prefill._cute_kernels import clear_caches
-from ._impl import Binding, Caps, Plan, bind, plan, prewarm, run
-from ._policy import KdaPrefillConfig, KdaPrefillQuery
+from ._impl import Binding, Caps, Plan, bind, plan, run
+from ._preparation import invocation_from_tensors
+from ._tuning import KdaPrefillConfig, KdaPrefillQuery
 
 
 def is_supported(device=None) -> bool:
@@ -25,7 +26,7 @@ __all__ = [
     "clear_caches",
     "is_supported",
     "plan",
-    "prewarm",
+    "invocation_from_tensors",
     "reference",
     "run",
 ]

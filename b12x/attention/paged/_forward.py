@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
+from dataclasses import dataclass
+from functools import lru_cache
+from types import MappingProxyType
+from typing import Any, Mapping
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -15,8 +18,11 @@ from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
     launch as b12x_launch,
+    run_compiled,
 )
 from b12x._lib.utils import current_cuda_stream
+from b12x._lib.compile_plan import attach_programs, compile_only_launches_enabled
+from ._controls import paged_control, paged_controls, snapshot_paged_controls
 
 from .forward_paged import (
     PagedFp8ExtendRawForwardKernel,
@@ -30,14 +36,45 @@ from .merge import (
     default_paged_persistent_ctas,
 )
 from .planner import use_paged_extend_fp8_pv_repack
-from .traits import PagedForwardTraits, select_paged_forward_traits_from_plan
+from .traits import (
+    PagedForwardTraits,
+    select_paged_forward_traits_from_plan,
+)
 
+
+
+
+@dataclass
+class _PagedLaunchers:
+    """Resident native programs and the static route chosen during preparation."""
+    controls: Mapping[str, str | None]
+    traits: PagedForwardTraits | None = None
+    route: tuple[bool | int, ...] | None = None
+    forward_kernel: Any | None = None
+    metadata: Mapping[str, Any] | None = None
+    forward: Any | None = None
+    merge_kernel: Any | None = None
+    merge: Any | None = None
+    merge_regular_decode_graph: bool = False
+
+
+def _attach_paged_programs(launchers: _PagedLaunchers) -> _PagedLaunchers:
+    dependencies = tuple(
+        program
+        for program in (
+            launchers.forward,
+            launchers.merge,
+            *(launchers.metadata or {}).values(),
+        )
+        if program is not None
+    )
+    return attach_programs(launchers, *dependencies)
 _DECODE_NATIVE_FP8_QKV_MAX_SMALL_BATCH = 2
 _DECODE_NATIVE_FP8_QKV_MIN_LONG_CHUNK_PAGES = 11
 
 
 def _turbo_attention_enabled() -> bool:
-    return os.environ.get("B12X_TURBO_ATTN") == "1"
+    return paged_control("B12X_TURBO_ATTN") == "1"
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -50,7 +87,6 @@ def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
     if dtype == torch.float32:
         return cutlass.Float32
     raise TypeError(f"unsupported dtype {dtype}")
-
 
 def _torch_to_cutlass_storage_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
     if dtype == torch.float8_e4m3fn:
@@ -65,6 +101,36 @@ def _to_kernel_tensor(
     assumed_align: int = 16,
     dynamic_rank1: bool = False,
 ) -> torch.Tensor | cutlass.cute.Tensor | None:
+    if compile_only_launches_enabled() and hasattr(tensor, "fake_mode"):
+        from cutlass.cute.runtime import make_fake_tensor
+
+        leading_dim = next(
+            (idx for idx, stride in enumerate(tensor.stride()) if stride == 1),
+            None,
+        )
+        if tensor.numel() == 0:
+            # DLPack preserves the native empty optional-tensor ABI, which the
+            # CuTe fake-layout constructor cannot represent (positive extents only).
+            from torch._subclasses.fake_tensor import unset_fake_temporarily
+            with unset_fake_temporarily():
+                empty = torch.empty_strided(
+                    tuple(tensor.shape), tuple(tensor.stride()),
+                    dtype=tensor.dtype, device="cpu",
+                )
+            converted = from_dlpack(empty, assumed_align=assumed_align)
+            converted.element_type = dtype
+            return converted
+        if tensor.ndim >= 2 and leading_dim is not None:
+            shape = tuple(cutlass.cute.sym_int(32) for _ in tensor.shape)
+            strides = tuple(
+                1 if idx == leading_dim else cutlass.cute.sym_int(64)
+                for idx in range(tensor.ndim)
+            )
+        elif dynamic_rank1 and tensor.ndim == 1:
+            shape, strides = (cutlass.cute.sym_int(32),), (1,)
+        else:
+            shape, strides = tuple(tensor.shape), tuple(tensor.stride())
+        return make_fake_tensor(dtype, shape, strides, assumed_align=assumed_align)
     if tensor is None:
         return None
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
@@ -376,6 +442,7 @@ def _build_forward_kernel(
     msa_block_sparse: bool,
     page_size: int,
     page_tiles_per_entry: int,
+    controls_key: tuple = (),
 ) -> PagedForwardKernel:
     return PagedForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),
@@ -411,6 +478,7 @@ def _build_laguna_verify_forward_kernel(
     max_chunks_per_request: int,
     two_wave_b1: bool,
     use_tma_kv_load: bool,
+    controls_key: tuple = (),
 ) -> PagedFp8ExtendRawForwardKernel:
     return PagedFp8ExtendRawForwardKernel(
         split_kv=True,
@@ -514,6 +582,7 @@ def _build_extend_forward_kernel(
     msa_union_tile: bool,
     page_size: int,
     use_fp8_pv_repack: bool,
+    controls_key: tuple = (),
 ) -> object:
     return build_extend_forward_kernel(
         traits,
@@ -728,6 +797,8 @@ def paged_attention_forward(
     relative_attention_bias: torch.Tensor | None = None,
     binding=None,
     _compile_only: bool = False,
+    _launchers: _PagedLaunchers | None = None,
+    _collect_launchers: _PagedLaunchers | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     (
         q,
@@ -785,9 +856,19 @@ def paged_attention_forward(
             f"got {int(q.shape[0])}, capacity {int(plan.total_q)}"
         )
     if k_descale is not None and k_descale.ndim == 2 and int(k_descale.shape[1]) == 1:
-        k_descale = k_descale[:, 0].contiguous()
+        source = k_descale[:, 0]
+        if _launchers is not None and not source.is_contiguous():
+            k_descale = workspace._prepared_optional_buffers["k_descale"]
+            k_descale.copy_(source)
+        else:
+            k_descale = source.contiguous()
     if v_descale is not None and v_descale.ndim == 2 and int(v_descale.shape[1]) == 1:
-        v_descale = v_descale[:, 0].contiguous()
+        source = v_descale[:, 0]
+        if _launchers is not None and not source.is_contiguous():
+            v_descale = workspace._prepared_optional_buffers["v_descale"]
+            v_descale.copy_(source)
+        else:
+            v_descale = source.contiguous()
     # A one-request descale is semantically scalar.  Normalize its otherwise
     # incidental singleton stride so engine warmup and the first live request
     # share one compiled ABI.  ``as_strided`` is an allocation-free view and
@@ -863,7 +944,11 @@ def paged_attention_forward(
         raise ValueError("q2k_indices can only be supplied for MSA block-sparse plans")
     has_attention_sink_bias = attention_sink_bias is not None
     if attention_sink_bias is None:
-        attention_sink_bias = torch.empty(0, dtype=torch.float32, device=q.device)
+        attention_sink_bias = (
+            workspace._prepared_optional_buffers["attention_sink_bias"]
+            if _launchers is not None
+            else torch.empty(0, dtype=torch.float32, device=q.device)
+        )
     else:
         if attention_sink_bias.ndim != 1:
             raise ValueError(
@@ -875,10 +960,17 @@ def paged_attention_forward(
             )
         if attention_sink_bias.device != q.device:
             raise ValueError("attention_sink_bias must be on the same CUDA device as q")
-        if attention_sink_bias.dtype != torch.float32:
-            attention_sink_bias = attention_sink_bias.to(torch.float32)
-        if not attention_sink_bias.is_contiguous():
-            attention_sink_bias = attention_sink_bias.contiguous()
+        if _launchers is not None and (
+            attention_sink_bias.dtype != torch.float32 or not attention_sink_bias.is_contiguous()
+        ):
+            source = attention_sink_bias
+            attention_sink_bias = workspace._prepared_optional_buffers["attention_sink_bias"]
+            attention_sink_bias.copy_(source)
+        else:
+            if attention_sink_bias.dtype != torch.float32:
+                attention_sink_bias = attention_sink_bias.to(torch.float32)
+            if not attention_sink_bias.is_contiguous():
+                attention_sink_bias = attention_sink_bias.contiguous()
 
     has_relative_attention_bias = relative_attention_bias is not None
     if relative_attention_bias is not None:
@@ -914,158 +1006,145 @@ def paged_attention_forward(
         if not relative_attention_bias.is_contiguous():
             raise ValueError("relative_attention_bias must be contiguous")
 
-    traits = select_paged_forward_traits_from_plan(plan)
-    use_native_fp8_qk, use_native_fp8_pv, decode_native_fp8_runtime_chunk_guard = (
-        _resolve_native_fp8_attention_mma_flags(plan=plan)
-    )
     page_size = int(plan.page_size)
-    page_tiles_per_entry = 1
-    if page_size == 128:
-        if (
-            k_cache.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-            or v_cache.dtype != k_cache.dtype
-        ):
-            raise ValueError(
-                "page_size=128 paged attention requires matching fp16, bf16, or fp8 e4m3 K/V caches"
-            )
-        k_tiles_per_entry = _paged_kv_tiles_per_table_entry(
-            k_cache,
-            page_size=page_size,
-            tile_rows=traits.cta_tile_kv,
-            name="k_cache",
-        )
-        v_tiles_per_entry = _paged_kv_tiles_per_table_entry(
-            v_cache,
-            page_size=page_size,
-            tile_rows=traits.cta_tile_kv,
-            name="v_cache",
-        )
-        if k_tiles_per_entry != v_tiles_per_entry:
-            raise ValueError(
-                "page_size=128 paged attention requires K and V caches with equal "
-                f"page-stride tile counts, got {k_tiles_per_entry} vs {v_tiles_per_entry}"
-            )
-        page_tiles_per_entry = k_tiles_per_entry
-    single_request_decode_graph = False
-    single_qtile_decode_graph = False
-    regularized_decode_graph = False
-    use_laguna_verify_kernel = _use_laguna_verify_forward_kernel(
-        plan=plan,
-        traits=traits,
-        use_native_fp8_qk=use_native_fp8_qk,
-        has_attention_sink_bias=has_attention_sink_bias,
-        has_relative_attention_bias=has_relative_attention_bias,
-    )
-    use_laguna_decode_analytic_kernel = _use_laguna_decode_analytic_kernel(
-        plan=plan,
-        traits=traits,
-        use_native_fp8_qk=use_native_fp8_qk,
-        has_attention_sink_bias=has_attention_sink_bias,
-        has_relative_attention_bias=has_relative_attention_bias,
-    )
-    _capture_decode_graph_replay_metadata_if_needed(
-        workspace,
-        analytic_device_schedule=use_laguna_decode_analytic_kernel,
-    )
-    laguna_verify_use_tma = bool(use_laguna_verify_kernel)
-    laguna_verify_two_wave_b1 = bool(
-        use_laguna_verify_kernel
-        and int(plan.page_table_shape[0]) == 1
-        and int(plan.graph_ctas_per_sm) >= 2
-    )
-    laguna_verify_max_chunks = (
-        int(plan.total_num_partial_rows) // int(plan.total_q)
-        if use_laguna_verify_kernel
-        else 0
-    )
-    if plan.mode == "extend":
-        if plan.split_kv:
-            raise ValueError("extend plans no longer support split-kv")
-        use_fp8_pv_repack = use_paged_extend_fp8_pv_repack(
-            plan,
-            resident_ctas_per_sm=int(traits.num_ctas_per_sm),
-        )
-        forward_kernel = _build_extend_forward_kernel(
-            traits,
+    if _launchers is not None:
+        if _launchers.traits is None or _launchers.route is None:
+            raise RuntimeError("unprepared paged launchers are missing static routing")
+        traits = _launchers.traits
+        (
             use_native_fp8_qk,
             use_native_fp8_pv,
-            plan.window_left,
-            has_attention_sink_bias,
-            has_relative_attention_bias,
-            bool(plan.msa_block_sparse),
-            bool(getattr(plan, "msa_union_tile", False)),
-            page_size,
-            use_fp8_pv_repack,
-        )
-    elif use_laguna_verify_kernel:
-        forward_kernel = _build_laguna_verify_forward_kernel(
+            decode_native_fp8_runtime_chunk_guard,
             page_tiles_per_entry,
-            int(plan.page_table_shape[0]),
-            laguna_verify_max_chunks,
-            laguna_verify_two_wave_b1,
-            laguna_verify_use_tma,
-        )
-    else:
-        single_request_decode_graph = (
-            plan.mode == "decode"
-            and plan.enable_cuda_graph
-            and plan.split_kv
-            and not bool(plan.msa_block_sparse)
-            and plan.gqa_group_size <= plan.cta_tile_q
-            and workspace._decode_graph_chunk_pages_lut is not None
-            and plan.num_qo_tiles == 1
-            and plan.page_table_shape[0] == 1
-        )
-        single_qtile_decode_graph = (
-            plan.mode == "decode"
-            and plan.enable_cuda_graph
-            and plan.split_kv
-            and not bool(plan.msa_block_sparse)
-            and plan.gqa_group_size <= plan.cta_tile_q
-            and workspace._decode_graph_chunk_pages_lut is not None
-            and plan.page_table_shape[0] > 1
-            and max(plan.qo_tile_indices, default=0) == 0
-        )
-        regularized_decode_graph = (
-            single_qtile_decode_graph and workspace._use_regular_decode_graph_replay
-        )
-        forward_kernel = _build_forward_kernel(
-            traits,
-            plan.gqa_group_size,
-            plan.split_kv,
             single_request_decode_graph,
             single_qtile_decode_graph,
             regularized_decode_graph,
+            use_laguna_verify_kernel,
             use_laguna_decode_analytic_kernel,
-            (
-                int(plan.page_table_shape[0])
-                if use_laguna_decode_analytic_kernel
-                else 1
-            ),
-            (
-                int(plan.total_num_partial_rows)
-                if use_laguna_decode_analytic_kernel
-                else 1
-            ),
-            use_native_fp8_qk,
-            use_native_fp8_pv,
-            plan.mode == "decode",
-            decode_native_fp8_runtime_chunk_guard,
-            plan.window_left,
-            has_attention_sink_bias,
-            has_relative_attention_bias,
-            bool(plan.msa_block_sparse),
-            page_size,
-            page_tiles_per_entry,
+            laguna_verify_use_tma,
+            laguna_verify_two_wave_b1,
+            laguna_verify_max_chunks,
+        ) = _launchers.route
+        forward_kernel = _launchers.forward_kernel
+    else:
+        controls_key = tuple(
+            (_collect_launchers.controls if _collect_launchers is not None else snapshot_paged_controls()).items()
         )
+        traits = select_paged_forward_traits_from_plan(plan)
+        use_native_fp8_qk, use_native_fp8_pv, decode_native_fp8_runtime_chunk_guard = (
+            _resolve_native_fp8_attention_mma_flags(plan=plan)
+        )
+        page_tiles_per_entry = 1
+        if int(plan.page_size) == 128:
+            if (
+                k_cache.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+                or v_cache.dtype != k_cache.dtype
+            ):
+                raise ValueError(
+                    "page_size=128 paged attention requires matching fp16, bf16, or fp8 e4m3 K/V caches"
+                )
+            k_tiles_per_entry = _paged_kv_tiles_per_table_entry(
+                k_cache, page_size=128, tile_rows=traits.cta_tile_kv, name="k_cache"
+            )
+            v_tiles_per_entry = _paged_kv_tiles_per_table_entry(
+                v_cache, page_size=128, tile_rows=traits.cta_tile_kv, name="v_cache"
+            )
+            if k_tiles_per_entry != v_tiles_per_entry:
+                raise ValueError("page_size=128 paged attention requires equal K/V page-stride tile counts")
+            page_tiles_per_entry = k_tiles_per_entry
+        single_request_decode_graph = False
+        single_qtile_decode_graph = False
+        regularized_decode_graph = False
+        use_laguna_verify_kernel = _use_laguna_verify_forward_kernel(
+            plan=plan, traits=traits, use_native_fp8_qk=use_native_fp8_qk,
+            has_attention_sink_bias=has_attention_sink_bias,
+            has_relative_attention_bias=has_relative_attention_bias,
+        )
+        use_laguna_decode_analytic_kernel = _use_laguna_decode_analytic_kernel(
+            plan=plan, traits=traits, use_native_fp8_qk=use_native_fp8_qk,
+            has_attention_sink_bias=has_attention_sink_bias,
+            has_relative_attention_bias=has_relative_attention_bias,
+        )
+        laguna_verify_use_tma = bool(use_laguna_verify_kernel)
+        laguna_verify_two_wave_b1 = bool(
+            use_laguna_verify_kernel and int(plan.page_table_shape[0]) == 1
+            and int(plan.graph_ctas_per_sm) >= 2
+        )
+        laguna_verify_max_chunks = (
+            int(plan.total_num_partial_rows) // int(plan.total_q)
+            if use_laguna_verify_kernel else 0
+        )
+        if plan.mode == "extend":
+            if plan.split_kv:
+                raise ValueError("extend plans no longer support split-kv")
+            forward_kernel = _build_extend_forward_kernel(
+                traits, use_native_fp8_qk, use_native_fp8_pv, plan.window_left,
+                has_attention_sink_bias, has_relative_attention_bias,
+                bool(plan.msa_block_sparse), bool(getattr(plan, "msa_union_tile", False)),
+                int(plan.page_size),
+                use_paged_extend_fp8_pv_repack(
+                    plan, resident_ctas_per_sm=int(traits.num_ctas_per_sm)
+                ),
+                controls_key=controls_key,
+            )
+        elif use_laguna_verify_kernel:
+            forward_kernel = _build_laguna_verify_forward_kernel(
+                page_tiles_per_entry, int(plan.page_table_shape[0]),
+                laguna_verify_max_chunks, laguna_verify_two_wave_b1,
+                laguna_verify_use_tma,
+                controls_key=controls_key,
+            )
+        else:
+            single_request_decode_graph = (
+                plan.mode == "decode" and plan.enable_cuda_graph and plan.split_kv
+                and not bool(plan.msa_block_sparse) and plan.gqa_group_size <= plan.cta_tile_q
+                and workspace._decode_graph_chunk_pages_lut is not None
+                and plan.num_qo_tiles == 1 and plan.page_table_shape[0] == 1
+            )
+            single_qtile_decode_graph = (
+                plan.mode == "decode" and plan.enable_cuda_graph and plan.split_kv
+                and not bool(plan.msa_block_sparse) and plan.gqa_group_size <= plan.cta_tile_q
+                and workspace._decode_graph_chunk_pages_lut is not None
+                and plan.page_table_shape[0] > 1
+                and max(plan.qo_tile_indices, default=0) == 0
+            )
+            regularized_decode_graph = (
+                single_qtile_decode_graph and workspace._use_regular_decode_graph_replay
+            )
+            forward_kernel = _build_forward_kernel(
+                traits, plan.gqa_group_size, plan.split_kv, single_request_decode_graph,
+                single_qtile_decode_graph, regularized_decode_graph,
+                use_laguna_decode_analytic_kernel,
+                int(plan.page_table_shape[0]) if use_laguna_decode_analytic_kernel else 1,
+                int(plan.total_num_partial_rows) if use_laguna_decode_analytic_kernel else 1,
+                use_native_fp8_qk, use_native_fp8_pv, plan.mode == "decode",
+                decode_native_fp8_runtime_chunk_guard, plan.window_left,
+                has_attention_sink_bias, has_relative_attention_bias,
+                bool(plan.msa_block_sparse), int(plan.page_size), page_tiles_per_entry,
+                controls_key=controls_key,
+            )
+        _launchers = None
+    _capture_decode_graph_replay_metadata_if_needed(
+        workspace, analytic_device_schedule=use_laguna_decode_analytic_kernel
+    )
+    if _collect_launchers is not None:
+        _collect_launchers.traits = traits
+        _collect_launchers.route = (
+            use_native_fp8_qk, use_native_fp8_pv, decode_native_fp8_runtime_chunk_guard,
+            page_tiles_per_entry, single_request_decode_graph, single_qtile_decode_graph,
+            regularized_decode_graph, use_laguna_verify_kernel,
+            use_laguna_decode_analytic_kernel, laguna_verify_use_tma,
+            laguna_verify_two_wave_b1, laguna_verify_max_chunks,
+        )
+        _collect_launchers.forward_kernel = forward_kernel
     forward_output = workspace.tmp_output if plan.split_kv else output
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse
     assert forward_output is not None
     assert forward_lse is not None
     if use_laguna_verify_kernel or use_laguna_decode_analytic_kernel:
         partial_rows = int(plan.total_num_partial_rows)
-        forward_output = forward_output[:partial_rows]
-        forward_lse = forward_lse[:partial_rows]
+        forward_output = forward_output.narrow(0, 0, partial_rows)
+        forward_lse = forward_lse.narrow(0, 0, partial_rows)
     msa_union_blocks = None
     msa_union_masks = None
     msa_union_counts = None
@@ -1082,18 +1161,19 @@ def paged_attention_forward(
                 "MSA union-tile prefill requires union metadata scratch buffers"
             )
         assert q2k_indices is not None
-        build_msa_prefill_union_metadata(
-            q2k_indices=q2k_indices,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            request_indices=workspace.request_indices,
-            qo_tile_indices=workspace.qo_tile_indices,
-            block_valid_mask=workspace.block_valid_mask,
-            union_blocks=msa_union_blocks,
-            union_masks=msa_union_masks,
-            union_counts=msa_union_counts,
-        )
-
+        if not _compile_only:
+            build_msa_prefill_union_metadata(
+                q2k_indices=q2k_indices,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                request_indices=workspace.request_indices,
+                qo_tile_indices=workspace.qo_tile_indices,
+                block_valid_mask=workspace.block_valid_mask,
+                union_blocks=msa_union_blocks,
+                union_masks=msa_union_masks,
+                union_counts=msa_union_counts,
+                _prepared=None if _launchers is None else _launchers.metadata,
+            )
     q_arg = _to_kernel_tensor(q, _torch_to_cutlass_dtype(q.dtype))
     k_cache_arg = (
         _to_kernel_tensor(k_cache.view(torch.uint8), cutlass.Uint8)
@@ -1175,7 +1255,7 @@ def paged_attention_forward(
     if plan.mode == "extend" and (
         getattr(forward_kernel, "use_paged_kv_tma_raw_desc_issue", False)
         or getattr(forward_kernel, "use_paged_kv_tma_fp8_raw_issue", False)
-    ):
+    ) and not _compile_only and _launchers is None:
         cached_descs = _get_cached_plane_tma_descs(
             workspace,
             k_cache=k_cache,
@@ -1187,44 +1267,44 @@ def paged_attention_forward(
             k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs = cached_descs
         else:
             k_tma_desc = _encode_plane_tma_descriptors(
-                k_cache,
-                plane_cols=forward_kernel.kv_tma_plane_head_dim,
+                k_cache, plane_cols=forward_kernel.kv_tma_plane_head_dim,
                 tile_rows=forward_kernel.stage_tile_rows,
             )
             v_tma_desc = _encode_plane_tma_descriptors(
-                v_cache,
-                plane_cols=forward_kernel.kv_tma_plane_head_dim,
+                v_cache, plane_cols=forward_kernel.kv_tma_plane_head_dim,
                 tile_rows=forward_kernel.stage_tile_rows,
             )
             k_tma_desc_ptrs = _descriptor_row_ptrs(k_tma_desc)
             v_tma_desc_ptrs = _descriptor_row_ptrs(v_tma_desc)
             workspace._live_plane_tma_desc_cache[
                 (
-                    int(k_cache.data_ptr()),
-                    int(v_cache.data_ptr()),
-                    tuple(k_cache.shape),
-                    tuple(v_cache.shape),
-                    forward_kernel.kv_tma_plane_head_dim,
-                    forward_kernel.stage_tile_rows,
+                    int(k_cache.data_ptr()), int(v_cache.data_ptr()),
+                    tuple(k_cache.shape), tuple(v_cache.shape),
+                    forward_kernel.kv_tma_plane_head_dim, forward_kernel.stage_tile_rows,
                 )
-            ] = (
-                k_tma_desc,
-                v_tma_desc,
-                k_tma_desc_ptrs,
-                v_tma_desc_ptrs,
-            )
+            ] = (k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs)
     if k_tma_desc_ptrs is None or v_tma_desc_ptrs is None:
-        dummy_desc_ptrs = _dummy_plane_tma_desc_ptrs(
-            torch.cuda.current_device(),
-            plan.num_kv_heads,
-        )
-        k_tma_desc_ptrs = dummy_desc_ptrs
-        v_tma_desc_ptrs = dummy_desc_ptrs
+        if _launchers is not None:
+            prepared_descs = getattr(workspace, "_prepared_plane_tma_descs", None)
+            if prepared_descs is None:
+                raise RuntimeError(
+                    "prepared paged TMA launch requires persistent descriptor pointers"
+                )
+            k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs = prepared_descs
+        elif _compile_only:
+            dummy_desc_ptrs = torch.empty(
+                (plan.num_kv_heads,), dtype=torch.int64, device=k_cache.device
+            )
+            k_tma_desc_ptrs = dummy_desc_ptrs
+            v_tma_desc_ptrs = dummy_desc_ptrs
+        else:
+            dummy_desc_ptrs = _dummy_plane_tma_desc_ptrs(
+                torch.cuda.current_device(), plan.num_kv_heads
+            )
+            k_tma_desc_ptrs = dummy_desc_ptrs
+            v_tma_desc_ptrs = dummy_desc_ptrs
     workspace._live_plane_tma_descs = (
-        k_tma_desc,
-        v_tma_desc,
-        k_tma_desc_ptrs,
-        v_tma_desc_ptrs,
+        k_tma_desc, v_tma_desc, k_tma_desc_ptrs, v_tma_desc_ptrs
     )
 
     stream = current_cuda_stream()
@@ -1451,11 +1531,15 @@ def paged_attention_forward(
         labels=tuple(cache_key_labels),
     )
     if _compile_only:
-        b12x_compile(
-            forward_kernel,
-            *forward_args,
-            compile_spec=forward_spec,
+        compiled_forward = b12x_compile(
+            forward_kernel, *forward_args, compile_spec=forward_spec
         )
+        if _collect_launchers is not None:
+            _collect_launchers.forward = compiled_forward
+    elif _launchers is not None:
+        if _launchers.forward is None:
+            raise RuntimeError("unprepared paged forward launcher")
+        run_compiled(_launchers.forward, tuple(forward_args))
     else:
         b12x_launch(
             forward_kernel,
@@ -1465,6 +1549,32 @@ def paged_attention_forward(
         )
 
     if plan.split_kv:
+        if _launchers is not None:
+            if _launchers.merge is None:
+                raise RuntimeError("prepared split attention has no merge program")
+            tmp_output_arg = _to_kernel_tensor(
+                forward_output, _torch_to_cutlass_dtype(forward_output.dtype)
+            )
+            tmp_lse_arg = _to_kernel_tensor(forward_lse, cutlass.Float32)
+            merge_cache_seqlens_arg = _to_kernel_tensor(
+                _as_int32_tensor(cache_seqlens), cutlass.Int32, assumed_align=4
+            )
+            output_arg = _to_kernel_tensor(output, _torch_to_cutlass_dtype(output.dtype))
+            lse_arg = _to_kernel_tensor(workspace.lse, cutlass.Float32)
+            if use_laguna_verify_kernel:
+                merge_args = (tmp_output_arg, tmp_lse_arg, merge_cache_seqlens_arg, output_arg, lse_arg)
+            else:
+                merge_args = (
+                    tmp_output_arg, tmp_lse_arg,
+                    _to_kernel_tensor(workspace.merge_indptr, cutlass.Int32, assumed_align=4),
+                    merge_cache_seqlens_arg, kv_chunk_size_arg, output_arg, lse_arg,
+                    None if _launchers.merge_regular_decode_graph else _to_kernel_tensor(
+                        workspace.total_num_rows_ptr, cutlass.Int32, assumed_align=4
+                    ),
+                )
+            run_compiled(_launchers.merge, (*merge_args, stream))
+            rows = int(q.shape[0]) if capacity_extend_graph else plan.total_q
+            return output.narrow(0, 0, rows), workspace.lse.narrow(1, 0, rows).transpose(0, 1)
         persistent_ctas = default_paged_persistent_ctas(
             total_rows=plan.total_q,
             num_heads=plan.num_q_heads,
@@ -1478,6 +1588,8 @@ def paged_attention_forward(
             and workspace._use_regular_decode_graph_replay
             and max(plan.qo_tile_indices, default=0) == 0
         )
+        if _collect_launchers is not None:
+            _collect_launchers.merge_regular_decode_graph = merge_regular_decode_graph
         merge_direct_grid = merge_regular_decode_graph
         merge_analytic_laguna_verify_graph = bool(use_laguna_verify_kernel)
         merge_analytic_laguna_decode_graph = bool(
@@ -1636,12 +1748,16 @@ def paged_attention_forward(
                 ),
             )
         if _compile_only:
-            b12x_compile(
-                merge_kernel,
-                *merge_args,
-                stream,
-                compile_spec=merge_spec,
+            compiled_merge = b12x_compile(
+                merge_kernel, *merge_args, stream, compile_spec=merge_spec
             )
+            if _collect_launchers is not None:
+                _collect_launchers.merge_kernel = merge_kernel
+                _collect_launchers.merge = compiled_merge
+        elif _launchers is not None:
+            if _launchers.merge is None:
+                raise RuntimeError("unprepared paged merge launcher")
+            run_compiled(_launchers.merge, (*merge_args, stream))
         else:
             b12x_launch(
                 merge_kernel,
@@ -1653,15 +1769,108 @@ def paged_attention_forward(
     if capacity_extend_graph:
         active_rows = int(q.shape[0])
         return (
-            output[:active_rows],
-            workspace.lse[:, :active_rows].transpose(0, 1),
+            output.narrow(0, 0, active_rows),
+            workspace.lse.narrow(1, 0, active_rows).transpose(0, 1),
         )
-    return output[: plan.total_q], workspace.current_lse_view()
+    return output.narrow(0, 0, plan.total_q), workspace.current_lse_view()
 
 
-def compile_paged_attention(*, binding) -> None:
-    """Compile the exact paged entries selected by ``binding`` without launching."""
-    paged_attention_forward(binding=binding, _compile_only=True)
+def materialize_paged_resources(
+    *,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    plan: object,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    attention_sink_bias: torch.Tensor | None = None,
+    launchers: _PagedLaunchers,
+) -> Mapping[str, object]:
+    """Materialize durable resources from raw K/V storage before scratch binds."""
+    kernel = launchers.forward_kernel
+    plane_tma_descs: tuple[torch.Tensor | None, ...]
+    if kernel is not None and (
+        getattr(kernel, "use_paged_kv_tma_raw_desc_issue", False)
+        or getattr(kernel, "use_paged_kv_tma_fp8_raw_issue", False)
+    ):
+        k_desc = _encode_plane_tma_descriptors(
+            k_cache,
+            plane_cols=kernel.kv_tma_plane_head_dim,
+            tile_rows=kernel.stage_tile_rows,
+        )
+        v_desc = _encode_plane_tma_descriptors(
+            v_cache,
+            plane_cols=kernel.kv_tma_plane_head_dim,
+            tile_rows=kernel.stage_tile_rows,
+        )
+        plane_tma_descs = (
+            k_desc,
+            v_desc,
+            _descriptor_row_ptrs(k_desc),
+            _descriptor_row_ptrs(v_desc),
+        )
+    else:
+        ptrs = torch.zeros(int(plan.num_kv_heads), dtype=torch.int64, device=k_cache.device)
+        plane_tma_descs = (None, None, ptrs, ptrs)
+    optional = {}
+    for name, source in (("k_descale", k_descale), ("v_descale", v_descale)):
+        if source is not None and source.ndim == 2 and source.shape[1] == 1 and not source[:, 0].is_contiguous():
+            optional[name] = torch.empty(source.shape[0], dtype=source.dtype, device=source.device)
+    if attention_sink_bias is None:
+        optional["attention_sink_bias"] = torch.empty(0, dtype=torch.float32, device=k_cache.device)
+    elif attention_sink_bias.dtype != torch.float32 or not attention_sink_bias.is_contiguous():
+        optional["attention_sink_bias"] = torch.empty(attention_sink_bias.shape, dtype=torch.float32, device=k_cache.device)
+    return MappingProxyType({"plane_tma_descs": plane_tma_descs, "optional_buffers": optional})
+
+
+def install_paged_resources(
+    binding: object, resources: Mapping[str, object]
+) -> None:
+    """Install durable resources before scratch binding/scheduler preparation."""
+    workspace = getattr(binding, "scratch", None)
+    if workspace is None:
+        raise TypeError("paged attention binding must expose scratch")
+    plane_tma_descs = resources.get("plane_tma_descs")
+    if plane_tma_descs is None:
+        raise ValueError("paged resources are missing plane_tma_descs")
+    install = getattr(workspace, "install_prepared_resources", None)
+    if install is None:
+        workspace._prepared_plane_tma_descs = plane_tma_descs
+    else:
+        install(plane_tma_descs=plane_tma_descs)
+    workspace._prepared_optional_buffers = resources["optional_buffers"]
+
+
+def compile_paged_launchers(
+    binding: object, *, controls: Mapping[str, str]
+) -> _PagedLaunchers:
+    """Compile and retain the exact native paged programs for ``binding``."""
+    from b12x._lib.compile_plan import compile_only_launches
+    from .graph_replay import compile_graph_replay
+    launchers = _PagedLaunchers(controls=MappingProxyType(dict(controls)))
+    with paged_controls(launchers.controls), binding.q.fake_mode, compile_only_launches():
+        paged_attention_forward(
+            binding=binding,
+            _compile_only=True,
+            _collect_launchers=launchers,
+        )
+        launchers.metadata = compile_graph_replay(binding)
+    if launchers.forward is None:
+        raise RuntimeError("paged launch compilation produced no forward program")
+    return _attach_paged_programs(launchers)
+
+
+def run_paged_prepared(
+    binding: object, launchers: _PagedLaunchers
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run only resident programs retained by ``compile_paged_launchers``."""
+    if not isinstance(launchers, _PagedLaunchers):
+        raise TypeError("run_paged_prepared requires compiled paged launchers")
+    return paged_attention_forward(binding=binding, _launchers=launchers)
+
+
+def _compile_paged_attention(*, binding) -> None:
+    """Private priming primitive used only by preparation providers."""
+    compile_paged_launchers(binding, controls=snapshot_paged_controls())
 
 
 def clear_paged_caches() -> None:

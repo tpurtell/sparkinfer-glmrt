@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import importlib.metadata
 import json
@@ -11,12 +10,13 @@ import pathlib
 import statistics
 import sys
 import time
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 
 import torch
 
-from b12x.policy.generation.delta_prefill_cases import (
-    GDN_PREFILL_CASES, assert_close, check_binding, make_binding, make_inputs, oracle, run_binding,
+from b12x.testing.delta_prefill_cases import (
+    GDN_PREFILL_CASES, assert_close, check_binding, make_inputs, oracle, prepared_binding, run_binding,
 )
 from benchmarks.common import make_l2_flush_fn, nvidia_smi_gpu_mode_snapshot, require_sm120
 
@@ -39,21 +39,6 @@ def balanced_order(arms, iteration):
     return arms if iteration % 2 == 0 else tuple(reversed(arms))
 
 
-def policy_context_from_file(path, identity):
-    """Require an explicit profile to cover the measured device and each plan query."""
-    from b12x.policy import PolicyContext, PolicyMode, ProfileRegistry
-    from b12x.policy.serialization import profile_from_dict
-
-    path = pathlib.Path(path)
-    raw = path.read_bytes()
-    payload = json.loads(gzip.decompress(raw) if path.suffix == ".gz" else raw)
-    profile = profile_from_dict(payload.get("profile", payload))
-    registry = ProfileRegistry()
-    registry.register(profile)
-    registry.freeze()
-    if registry.find(identity) is None:
-        raise ValueError(f"profile {profile.profile_id!r} does not match device {identity!r}")
-    return PolicyContext.for_identity(identity, mode=PolicyMode.PREPLANNED_ONLY, registry=registry)
 
 
 def _summary(samples):
@@ -93,13 +78,14 @@ def _trace_flashinfer(fn):
 
 
 def benchmark_case(case, *, device, seed, warmup, iterations, mode, race, flush,
-                   max_tokens=None, max_seqs=None, policy=None, profile_replays=0):
+                   max_tokens=None, max_seqs=None, profile_replays=0):
     tensors = make_inputs(case, device=device, seed=seed, max_tokens=max_tokens, max_seqs=max_seqs)
     initial = tensors["recurrent_state"].clone()
     expected, expected_pool = oracle(case, tensors)
     immutable = {k: v.clone() for k, v in tensors.items() if k not in ("recurrent_state", "output")}
     arms, reports = [], {}
     factories = [("b12x", None)]
+    prepared_scopes = ExitStack()
     if race == "flashinfer":
         factories += [("flashinfer_auto", "auto"), ("flashinfer_no_cp", False)]
     for name, cp in factories:
@@ -107,14 +93,13 @@ def benchmark_case(case, *, device, seed, warmup, iterations, mode, race, flush,
         reports[name] = report
         try:
             if name == "b12x":
-                from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
-                binding = make_binding(case, tensors, policy=policy)
+                binding = prepared_scopes.enter_context(
+                    prepared_binding(case, tensors, max_tokens=max_tokens, max_seqs=max_seqs)
+                )
                 fn = lambda: run_binding("gdn", binding)
                 buffers = (binding.scratch,)
                 poison = lambda: binding.scratch.fill_(0xFF)
-                report["policy"] = repr(binding.plan.policy_resolution)
-                report["config"] = asdict(binding.plan.policy_resolution.config)
-                report["metadata_validation"] = binding.plan.caps.metadata_validation
+                report["config"] = asdict(binding.execution.selection.config)
             else:
                 from benchmarks._gdn_prefill_flashinfer import FlashInferArm
                 adapter = FlashInferArm(case, tensors, use_cp=cp)
@@ -130,14 +115,16 @@ def benchmark_case(case, *, device, seed, warmup, iterations, mode, race, flush,
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
             tensors["recurrent_state"].copy_(initial)
-            if name == "b12x":
-                freeze_kernel_resolution("GDN prefill race capture")
-            try:
+            from b12x._lib.runtime_control import kernel_resolution_guard
+
+            guard = (
+                kernel_resolution_guard("GDN prefill race capture")
+                if name == "b12x"
+                else nullcontext()
+            )
+            with guard:
                 with torch.cuda.graph(graph):
                     fn()
-            finally:
-                if name == "b12x":
-                    unfreeze_kernel_resolution()
             tensors["recurrent_state"].copy_(initial)
             tensors["output"].fill_(float("nan"))
             poison()
@@ -169,8 +156,8 @@ def benchmark_case(case, *, device, seed, warmup, iterations, mode, race, flush,
             arms.append((name, fn, graph, buffers))
         except Exception as exc:
             report["error"] = f"{type(exc).__name__}: {exc}"
-            print(f"{case.name} {name}: {report['error']}", flush=True)
             if "illegal memory access" in str(exc).lower() or "device-side assert" in str(exc).lower():
+                prepared_scopes.close()
                 return {"case": asdict(case), "arms": reports, "fatal_cuda_error": True}
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     modes = ("eager", "graph") if mode == "both" else (mode,)
@@ -221,6 +208,7 @@ def benchmark_case(case, *, device, seed, warmup, iterations, mode, race, flush,
             if name != "b12x" and report["status"] == "qualified":
                 ratios[name] = {label: timing["median_us"] / reports["b12x"]["timings"][label]["median_us"]
                                 for label, timing in report["timings"].items()}
+    prepared_scopes.close()
     return {"case": asdict(case), "arms": reports, "flashinfer_over_b12x": ratios}
 
 
@@ -242,16 +230,12 @@ def main(args, argv, parser):
     device = require_sm120()
     if torch.cuda.get_device_capability(device)[0] != 12:
         parser.error("the FlashInfer SM120 race requires a compute-capability 12.x GPU")
-    policy = None
-    if args.policy_profile is not None:
-        from b12x.policy.device import detect_device
-        policy = policy_context_from_file(args.policy_profile, detect_device(device).identity)
     flush = make_l2_flush_fn(True, args.l2_flush_bytes)
     root = pathlib.Path(__file__).resolve().parents[1]
     sources = [p for directory in (root/"b12x/sequence/_shared/delta_prefill", root/"b12x/sequence/gdn_prefill")
                for p in directory.glob("*.py")]
     sources += [pathlib.Path(__file__), root/"benchmarks/_gdn_prefill_flashinfer.py",
-                root/"b12x/policy/generation/delta_prefill_cases.py"]
+                root/"b12x/testing/delta_prefill_cases.py"]
     provenance = {
         "command": [sys.executable, str(root/"benchmarks/benchmark_gdn_decode.py"), *argv],
         "cwd": os.getcwd(), "git": _git_provenance(), "device": _device_provenance(device),
@@ -259,14 +243,13 @@ def main(args, argv, parser):
         "gpu_mode_before": nvidia_smi_gpu_mode_snapshot(), "timestamp_unix": time.time(),
         "seed": args.seed, "warmup": args.warmup, "iterations": args.iterations,
         "timed_path": "raw Q/K/V, a/b, pooled initial state to recurrence output and pooled final state",
-        "checkpoint_export": False, "b12x_metadata_validation": "transactional",
+        "checkpoint_export": False,
         "restoration": "identical full pool before every invocation; measured separately; L2 flush precedes restore",
         "metric_direction": "FlashInfer_us / b12x_us; larger than one favors b12x",
         "sampling": "alternating complete arm order and reverse; CUDA events per invocation",
         "reference_timed": False,
         "profile_replays": args.profile_replays,
         "profile_capture": "qualified graph replays after timing; state restored outside each NVTX range",
-        "policy_profile": None if args.policy_profile is None else _source(args.policy_profile),
     }
     reports = []
     print(json.dumps(provenance, sort_keys=True), flush=True)
@@ -274,7 +257,7 @@ def main(args, argv, parser):
         for case in cases:
             report = benchmark_case(case, device=device, seed=args.seed+GDN_PREFILL_CASES.index(case), warmup=args.warmup,
                                     iterations=args.iterations, mode=args.mode, race=args.race, flush=flush,
-                                    max_tokens=args.capacity_tokens, max_seqs=args.capacity_seqs, policy=policy,
+                                    max_tokens=args.capacity_tokens, max_seqs=args.capacity_seqs,
                                     profile_replays=args.profile_replays)
             reports.append(report)
             print(json.dumps(report, sort_keys=True), flush=True)

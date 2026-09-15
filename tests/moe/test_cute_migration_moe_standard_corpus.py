@@ -1075,10 +1075,7 @@ def test_standard_moe_glm53_tp4_nvfp4_live_graph_replay(
     share scratch and run sequentially in one captured graph.
     """
 
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution,
-        unfreeze_kernel_resolution,
-    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe.fused_moe._impl import b12x_moe_fp4
 
     num_experts = 288
@@ -1164,8 +1161,9 @@ def test_standard_moe_glm53_tp4_nvfp4_live_graph_replay(
     assert all(
         bool(binding.output.float().isfinite().all().item()) for binding in bindings
     )
-    request.addfinalizer(unfreeze_kernel_resolution)
-    freeze_kernel_resolution("GLM-shaped MoE capture and live replay")
+    guard = kernel_resolution_guard("GLM-shaped MoE capture and live replay")
+    guard.__enter__()
+    request.addfinalizer(lambda: guard.__exit__(None, None, None))
 
     graph = torch.cuda.CUDAGraph()
     capture_stream = torch.cuda.Stream()
@@ -1255,10 +1253,7 @@ def test_standard_moe_glm53_tp4_nvfp4_multishape_graph_replay(
     resolution frozen.
     """
 
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution,
-        unfreeze_kernel_resolution,
-    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe.fused_moe._impl import (
         TPMoEScratchCaps,
         b12x_moe_fp4,
@@ -1397,8 +1392,9 @@ def test_standard_moe_glm53_tp4_nvfp4_multishape_graph_replay(
             (inputs.a, inputs.topk_ids, inputs.topk_weights, output, scratch)
         )
     live_addresses = tuple(tensor.data_ptr() for tensor in live_tensors)
-    request.addfinalizer(unfreeze_kernel_resolution)
-    freeze_kernel_resolution("GLM-shaped MoE replay with full and inactive routes")
+    guard = kernel_resolution_guard("GLM-shaped MoE replay with full and inactive routes")
+    guard.__enter__()
+    request.addfinalizer(lambda: guard.__exit__(None, None, None))
 
     for replay_idx in range(3):
         graph_order = (

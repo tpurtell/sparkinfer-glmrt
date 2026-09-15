@@ -1,4 +1,5 @@
 /* Included by _storage.c. PyTorch owns suballocation and stream bookkeeping. */
+#include "_pool_api.h"
 typedef struct pool_segment {
     storage_t *storage;
     struct pool_segment *next;
@@ -23,17 +24,17 @@ static void *pool_allocate(size_t bytes, int device, const char *kind) {
     failure_t failure = {{0}};
     storage_t *storage = read_storage(-1, 0, (int64_t)bytes, kind, device, &failure);
     if (!storage) {
-        fprintf(stderr, "b12x shared allocation failed: %s\n", failure.message);
+        fprintf(stderr, "b12x weight allocation failed: %s\n", failure.message);
         return NULL;
     }
     /* Host registration on ATS platforms need not page-lock system memory.
        Serving weights must stay resident even while file readahead competes. */
-    if (mlock(storage->base, (size_t)storage->bytes) != 0) {
+    if (storage->kind != DEVICE && mlock(storage->base, (size_t)storage->bytes) != 0) {
         fprintf(stderr, "b12x could not lock final weight storage: %s\n", strerror(errno));
         release_storage(storage);
         return NULL;
     }
-    storage->locked = true;
+    storage->locked = storage->kind != DEVICE;
     pool_segment_t *segment = malloc(sizeof(*segment));
     if (!segment) {
         release_storage(storage);
@@ -65,6 +66,11 @@ void *b12x_pinned_wc_alloc(size_t bytes, int device, cudaStream_t stream) {
 void *b12x_managed_alloc(size_t bytes, int device, cudaStream_t stream) {
     (void)stream;
     return pool_allocate(bytes, device, "managed");
+}
+
+void *b12x_device_alloc(size_t bytes, int device, cudaStream_t stream) {
+    (void)stream;
+    return pool_allocate(bytes, device, "device");
 }
 
 void b12x_pool_free(void *pointer, size_t bytes, int device, cudaStream_t stream) {
@@ -115,6 +121,20 @@ static PyObject *py_pool_contains(PyObject *self, PyObject *args) {
     return PyBool_FromLong(found);
 }
 
+static bool pool_device_range(uintptr_t pointer, uint64_t bytes, int device) {
+    pthread_mutex_lock(&pool_mutex);
+    storage_t *storage = find_segment(pointer, bytes);
+    bool found = storage && storage->kind == DEVICE && storage->device == device;
+    pthread_mutex_unlock(&pool_mutex);
+    return found;
+}
+
+static PyObject *py_pool_api(PyObject *self, PyObject *args) {
+    (void)self; (void)args;
+    static const b12x_pool_api_t api = {.device_range = pool_device_range};
+    return PyCapsule_New((void *)&api, B12X_POOL_API_CAPSULE, NULL);
+}
+
 /* Inputs are validated Tensor pointers, kept alive by the Python caller. */
 static PyObject *py_pool_copy(PyObject *self, PyObject *args) {
     (void)self;
@@ -125,7 +145,7 @@ static PyObject *py_pool_copy(PyObject *self, PyObject *args) {
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&pool_mutex);
     storage_t *storage = find_segment(destination, bytes);
-    if (storage) {
+    if (storage && storage->kind != DEVICE) {
         found = true;
         success = cuda_ok(cudaStreamSynchronize((cudaStream_t)(uintptr_t)stream),
                           "synchronize before host weight write", &failure);

@@ -9,7 +9,7 @@ import torch
 from .._shared.disk_table import MappedHostAllocation
 
 if TYPE_CHECKING:
-    from ._contracts import Plan
+    from ._contracts import TableLayout
 
 
 @dataclass(kw_only=True)
@@ -42,15 +42,15 @@ def _device_tensor(
     return torch.empty(shape, dtype=dtype, device=device)
 
 
-def allocate_storage(plan: Plan) -> TableStorage:
-    """Allocate persistent table storage according to the planned policy."""
-    from ._contracts import Plan
+def allocate_storage(layout: TableLayout) -> TableStorage:
+    """Allocate checkpoint-owned tensors from a host-only storage layout."""
+    from ._contracts import TableLayout
 
-    if not isinstance(plan, Plan):
-        raise TypeError(f"plan must be Plan, got {type(plan)!r}")
-    caps = plan.caps
+    if not isinstance(layout, TableLayout):
+        raise TypeError(f"layout must be TableLayout, got {type(layout)!r}")
+    caps = layout.caps
     if caps.table_memory == "io_uring":
-        raise ValueError("disk tables must be loaded with DiskTable(plan, shard_rows)")
+        raise ValueError("disk tables must be loaded with DiskTable(layout, shard_rows)")
 
     allocations: list[MappedHostAllocation] = []
 
@@ -64,28 +64,28 @@ def allocate_storage(plan: Plan) -> TableStorage:
         allocations.append(allocation)
         return allocation.device_view, allocation.host_view
 
-    weight, weight_load_view = table_tensor(plan.weight_shape, plan.weight_dtype)
+    weight, weight_load_view = table_tensor(layout.weight_shape, layout.weight_dtype)
 
     weight_scale: torch.Tensor | None = None
     weight_scale_load_view: torch.Tensor | None = None
-    if plan.weight_scale_shape is not None:
-        assert plan.weight_scale_dtype is not None
+    if layout.weight_scale_shape is not None:
+        assert layout.weight_scale_dtype is not None
         if caps.quant_mode == "nvfp4_group16":
             weight_scale, weight_scale_load_view = table_tensor(
-                plan.weight_scale_shape, plan.weight_scale_dtype
+                layout.weight_scale_shape, layout.weight_scale_dtype
             )
         else:
             weight_scale = _device_tensor(
-                plan.weight_scale_shape, plan.weight_scale_dtype, caps.device
+                layout.weight_scale_shape, layout.weight_scale_dtype, caps.device
             )
             weight_scale_load_view = weight_scale
 
     weight_scale_2: torch.Tensor | None = None
     weight_scale_2_load_view: torch.Tensor | None = None
-    if plan.weight_scale_2_shape is not None:
-        assert plan.weight_scale_2_dtype is not None
+    if layout.weight_scale_2_shape is not None:
+        assert layout.weight_scale_2_dtype is not None
         weight_scale_2 = _device_tensor(
-            plan.weight_scale_2_shape, plan.weight_scale_2_dtype, caps.device
+            layout.weight_scale_2_shape, layout.weight_scale_2_dtype, caps.device
         )
         weight_scale_2_load_view = weight_scale_2
 

@@ -8,6 +8,8 @@ than using another kernel implementation as the correctness oracle.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import argparse
 import pathlib
 import sys
@@ -240,6 +242,7 @@ def _moe_reference_nvfp4(
     return output
 
 
+@contextmanager
 def _make_b12x_moe_binding(
     x: torch.Tensor,
     weights,
@@ -262,14 +265,14 @@ def _make_b12x_moe_binding(
         source_format=weights.source_format,
         w13_layout=weights.w13_layout,
     )
-
-    return make_tp_moe_fp4_binding(
+    with make_tp_moe_fp4_binding(
         a=x,
         experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         input_scales_static=True,
-    )
+    ) as binding:
+        yield binding
 
 
 def _run_impl(
@@ -293,16 +296,16 @@ def _run_impl(
     if clear_state:
         clear_tp_moe_caches()
     scale_params = get_scale_contract_params(weights, scale_contract)
-    binding = _make_b12x_moe_binding(
+    with _make_b12x_moe_binding(
         x,
         weights,
         scale_params,
         topk_weights,
         topk_ids,
-    )
-    out = b12x_moe_fp4(binding=binding)
-    torch.cuda.synchronize()
-    return out.detach().clone()
+    ) as binding:
+        out = b12x_moe_fp4(binding=binding)
+        torch.cuda.synchronize()
+        return out.detach().clone()
 
 
 def _run_impl_sequence(

@@ -6,14 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
-from ._cute_prefill import (
-    get_cached_mtp_prefill_bf16_gemm,
-    is_mtp_prefill_bf16_gemm_warmed,
-)
-from ._cute_prefill_config import (
-    projection_capacity_rows,
-    require_qwen_cute_tensors,
-)
+from b12x.preparation.types import plan_from_handle, require_prepared
+from ._cute_prefill_config import require_qwen_cute_tensors
 
 
 @triton.jit
@@ -119,204 +113,70 @@ def _capacity_matrix(tensor: torch.Tensor, rows: int, columns: int) -> torch.Ten
 
 
 def _qwen_cute_projections(
-    token_normalized: torch.Tensor,
-    state_normalized: torch.Tensor,
-    embedding_fc_weight: torch.Tensor,
-    hidden_fc_weight: torch.Tensor,
-    token_path: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    tokens: int,
-    token_rows: int,
-    state_rows: int,
-    streams: int,
-    hidden_size: int,
+    token_normalized: torch.Tensor, state_normalized: torch.Tensor,
+    embedding_fc_weight: torch.Tensor, hidden_fc_weight: torch.Tensor,
+    token_path: torch.Tensor, output: torch.Tensor, *,
+    projections: tuple, tokens: int, token_rows: int, state_rows: int,
+    streams: int, hidden_size: int,
 ) -> None:
-    state_live_rows = tokens * streams
     token_input = _capacity_matrix(token_normalized, token_rows, hidden_size)
     token_output = _capacity_matrix(token_path, token_rows, hidden_size)
     state_input = _capacity_matrix(state_normalized, state_rows, hidden_size)
-    state_output = output.reshape(-1)
-
+    token_projection, state_projection = projections
     with torch.cuda.device(token_normalized.device):
-        token_projection = get_cached_mtp_prefill_bf16_gemm(
-            token_rows,
-            hidden_size,
-            hidden_size,
-            device=token_normalized.device,
-            streams=streams,
-            add_token_path=False,
-        )
-        state_projection = get_cached_mtp_prefill_bf16_gemm(
-            state_rows,
-            hidden_size,
-            hidden_size,
-            device=token_normalized.device,
-            streams=streams,
-            add_token_path=True,
-        )
-        if token_projection is None or state_projection is None:
-            raise RuntimeError(
-                "MTP CuTe capacity kernels were not compiled by plan(); "
-                "request-time projection compilation is disabled"
-            )
-        if torch.cuda.is_current_stream_capturing():
-            token_warmed = token_projection is not None and (
-                is_mtp_prefill_bf16_gemm_warmed(
-                    token_rows,
-                    hidden_size,
-                    hidden_size,
-                    device=token_normalized.device,
-                    streams=streams,
-                    add_token_path=False,
-                )
-            )
-            state_warmed = state_projection is not None and (
-                is_mtp_prefill_bf16_gemm_warmed(
-                    state_rows,
-                    hidden_size,
-                    hidden_size,
-                    device=token_normalized.device,
-                    streams=streams,
-                    add_token_path=True,
-                )
-            )
-            if not token_warmed or not state_warmed:
-                raise RuntimeError(
-                    "MTP CuTe kernels must be warm-run before CUDA graph capture"
-                )
-        assert token_projection is not None
-        assert state_projection is not None
-        token_projection(
-            token_input,
-            embedding_fc_weight,
-            token_output,
-            live_rows=tokens,
-        )
+        token_projection(token_input, embedding_fc_weight, token_output, live_rows=tokens)
         state_projection(
-            state_input,
-            hidden_fc_weight,
-            state_output,
-            token_path=token_output,
-            live_rows=state_live_rows,
+            state_input, hidden_fc_weight, output.reshape(-1),
+            token_path=token_output, live_rows=tokens * streams,
         )
 
 
 def _launch_mtp_feedback(
-    token_embedding: torch.Tensor,
-    multi_state: torch.Tensor,
-    token_norm_weight: torch.Tensor,
-    state_norm_weight: torch.Tensor,
-    embedding_fc_weight: torch.Tensor,
-    hidden_fc_weight: torch.Tensor,
-    scratch: torch.Tensor,
-    output: torch.Tensor,
-    eps: float,
-    max_tokens: int,
-    streams: int,
-    hidden_size: int,
-    token_normalized_offset_bytes: int,
-    state_partial_sums_offset_bytes: int,
-    state_normalized_offset_bytes: int,
-    token_path_offset_bytes: int,
-    token_projection_rows: int,
-    state_projection_rows: int,
-    norm_block_h: int,
-    norm_block_s: int,
-    norm_num_warps: int,
+    token_embedding, multi_state, token_norm_weight, state_norm_weight,
+    embedding_fc_weight, hidden_fc_weight, scratch, output, eps, state,
 ) -> None:
     tokens = int(token_embedding.shape[0])
+    if tokens == 0:
+        return
+    layout, programs = state.layout, state.programs
+    caps = layout.caps
+    h, s = caps.hidden_size, caps.streams
     token_normalized = _scratch_view(
-        scratch,
-        offset_bytes=token_normalized_offset_bytes,
-        shape=(token_projection_rows, hidden_size),
-        dtype=torch.bfloat16,
+        scratch, offset_bytes=layout.token_normalized_offset_bytes,
+        shape=(layout.token_projection_rows, h), dtype=torch.bfloat16,
     )[:tokens]
     state_partial_sums = _scratch_view(
-        scratch,
-        offset_bytes=state_partial_sums_offset_bytes,
-        shape=(max_tokens, streams),
-        dtype=torch.float32,
+        scratch, offset_bytes=layout.state_partial_sums_offset_bytes,
+        shape=(caps.max_tokens, s), dtype=torch.float32,
     )[:tokens]
     state_normalized = _scratch_view(
-        scratch,
-        offset_bytes=state_normalized_offset_bytes,
-        shape=(state_projection_rows // streams, streams, hidden_size),
-        dtype=torch.bfloat16,
+        scratch, offset_bytes=layout.state_normalized_offset_bytes,
+        shape=(layout.state_projection_rows // s, s, h), dtype=torch.bfloat16,
     )[:tokens]
     token_path = _scratch_view(
-        scratch,
-        offset_bytes=token_path_offset_bytes,
-        shape=(token_projection_rows, hidden_size),
-        dtype=torch.bfloat16,
+        scratch, offset_bytes=layout.token_path_offset_bytes,
+        shape=(layout.token_projection_rows, h), dtype=torch.bfloat16,
     )[:tokens]
-
-    expected_token_rows, expected_state_rows = projection_capacity_rows(
-        max_tokens=max_tokens,
-        streams=streams,
-        hidden_size=hidden_size,
+    require_qwen_cute_tensors(
+        token_normalized=token_normalized, state_normalized=state_normalized,
+        embedding_fc_weight=embedding_fc_weight, hidden_fc_weight=hidden_fc_weight,
+        token_path=token_path, output=output,
     )
-    if (token_projection_rows, state_projection_rows) != (
-        expected_token_rows,
-        expected_state_rows,
-    ):
-        raise ValueError(
-            "MTP projection capacity does not match the planned CuTe "
-            f"specialization: got {token_projection_rows}/{state_projection_rows}, "
-            f"expected {expected_token_rows}/{expected_state_rows}"
-        )
-    projection_tensors = {
-        "token_normalized": token_normalized,
-        "state_normalized": state_normalized,
-        "embedding_fc_weight": embedding_fc_weight,
-        "hidden_fc_weight": hidden_fc_weight,
-        "token_path": token_path,
-        "output": output,
-    }
-    require_qwen_cute_tensors(**projection_tensors)
-    _token_norm_kernel[(tokens,)](
-        token_embedding,
-        token_norm_weight,
-        token_normalized,
-        float(eps),
-        HIDDEN_SIZE=int(hidden_size),
-        BLOCK_H=int(norm_block_h),
-        num_warps=int(norm_num_warps),
-        num_stages=1,
+    programs["token_norm"][(tokens, 1, 1)](
+        token_embedding, token_norm_weight, token_normalized, float(eps), h, layout.norm_block_h,
     )
-    _state_partial_sum_kernel[(tokens * streams,)](
-        multi_state,
-        state_partial_sums,
-        HIDDEN_SIZE=int(hidden_size),
-        BLOCK_H=int(norm_block_h),
-        num_warps=int(norm_num_warps),
-        num_stages=1,
+    programs["partial"][(tokens * s, 1, 1)](
+        multi_state, state_partial_sums, h, layout.norm_block_h,
     )
-    _state_norm_kernel[(tokens, streams)](
-        multi_state,
-        state_partial_sums,
-        state_norm_weight,
-        state_normalized,
-        float(eps),
-        STREAMS=int(streams),
-        HIDDEN_SIZE=int(hidden_size),
-        BLOCK_S=int(norm_block_s),
-        BLOCK_H=int(norm_block_h),
-        num_warps=int(norm_num_warps),
-        num_stages=1,
+    programs["state_norm"][(tokens, s, 1)](
+        multi_state, state_partial_sums, state_norm_weight, state_normalized,
+        float(eps), s, h, layout.norm_block_s, layout.norm_block_h,
     )
     _qwen_cute_projections(
-        token_normalized,
-        state_normalized,
-        embedding_fc_weight,
-        hidden_fc_weight,
-        token_path,
-        output,
-        tokens=tokens,
-        token_rows=token_projection_rows,
-        state_rows=state_projection_rows,
-        streams=streams,
-        hidden_size=hidden_size,
+        token_normalized, state_normalized, embedding_fc_weight, hidden_fc_weight,
+        token_path, output, projections=programs["projections"], tokens=tokens,
+        token_rows=layout.token_projection_rows, state_rows=layout.state_projection_rows,
+        streams=s, hidden_size=h,
     )
 
 
@@ -325,133 +185,31 @@ def _launch_mtp_feedback(
     mutates_args=("scratch", "output"),
 )
 def _mtp_feedback_op(
-    token_embedding: torch.Tensor,
-    multi_state: torch.Tensor,
-    token_norm_weight: torch.Tensor,
-    state_norm_weight: torch.Tensor,
-    embedding_fc_weight: torch.Tensor,
-    hidden_fc_weight: torch.Tensor,
-    scratch: torch.Tensor,
-    output: torch.Tensor,
-    eps: float,
-    max_tokens: int,
-    streams: int,
-    hidden_size: int,
-    token_normalized_offset_bytes: int,
-    state_partial_sums_offset_bytes: int,
-    state_normalized_offset_bytes: int,
-    token_path_offset_bytes: int,
-    token_projection_rows: int,
-    state_projection_rows: int,
-    norm_block_h: int,
-    norm_block_s: int,
-    norm_num_warps: int,
+    token_embedding: torch.Tensor, multi_state: torch.Tensor,
+    token_norm_weight: torch.Tensor, state_norm_weight: torch.Tensor,
+    embedding_fc_weight: torch.Tensor, hidden_fc_weight: torch.Tensor,
+    scratch: torch.Tensor, output: torch.Tensor, eps: float, plan_handle: int,
 ) -> None:
-    _launch_mtp_feedback(
-        token_embedding,
-        multi_state,
-        token_norm_weight,
-        state_norm_weight,
-        embedding_fc_weight,
-        hidden_fc_weight,
-        scratch,
-        output,
-        eps,
-        max_tokens,
-        streams,
-        hidden_size,
-        token_normalized_offset_bytes,
-        state_partial_sums_offset_bytes,
-        state_normalized_offset_bytes,
-        token_path_offset_bytes,
-        token_projection_rows,
-        state_projection_rows,
-        norm_block_h,
-        norm_block_s,
-        norm_num_warps,
+    state = require_prepared(plan_from_handle(plan_handle), "sequence.mtp_feedback", token_embedding.device)
+    state.run_tensors(
+        token_embedding, multi_state, token_norm_weight, state_norm_weight,
+        embedding_fc_weight, hidden_fc_weight, scratch, output, eps=eps,
     )
 
 
 @_mtp_feedback_op.register_fake
 def _mtp_feedback_fake(
-    token_embedding: torch.Tensor,
-    multi_state: torch.Tensor,
-    token_norm_weight: torch.Tensor,
-    state_norm_weight: torch.Tensor,
-    embedding_fc_weight: torch.Tensor,
-    hidden_fc_weight: torch.Tensor,
-    scratch: torch.Tensor,
-    output: torch.Tensor,
-    eps: float,
-    max_tokens: int,
-    streams: int,
-    hidden_size: int,
-    token_normalized_offset_bytes: int,
-    state_partial_sums_offset_bytes: int,
-    state_normalized_offset_bytes: int,
-    token_path_offset_bytes: int,
-    token_projection_rows: int,
-    state_projection_rows: int,
-    norm_block_h: int,
-    norm_block_s: int,
-    norm_num_warps: int,
+    token_embedding: torch.Tensor, multi_state: torch.Tensor,
+    token_norm_weight: torch.Tensor, state_norm_weight: torch.Tensor,
+    embedding_fc_weight: torch.Tensor, hidden_fc_weight: torch.Tensor,
+    scratch: torch.Tensor, output: torch.Tensor, eps: float, plan_handle: int,
 ) -> None:
     del token_embedding, multi_state, token_norm_weight, state_norm_weight
-    del embedding_fc_weight, hidden_fc_weight, scratch, output, eps
-    del max_tokens, streams, hidden_size
-    del token_normalized_offset_bytes, state_partial_sums_offset_bytes
-    del state_normalized_offset_bytes, token_path_offset_bytes
-    del token_projection_rows, state_projection_rows
-    del norm_block_h, norm_block_s, norm_num_warps
+    del embedding_fc_weight, hidden_fc_weight, scratch, output, eps, plan_handle
 
 
-def run_mtp_feedback(
-    token_embedding: torch.Tensor,
-    multi_state: torch.Tensor,
-    token_norm_weight: torch.Tensor,
-    state_norm_weight: torch.Tensor,
-    embedding_fc_weight: torch.Tensor,
-    hidden_fc_weight: torch.Tensor,
-    scratch: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    eps: float,
-    max_tokens: int,
-    streams: int,
-    hidden_size: int,
-    token_normalized_offset_bytes: int,
-    state_partial_sums_offset_bytes: int,
-    state_normalized_offset_bytes: int,
-    token_path_offset_bytes: int,
-    token_projection_rows: int,
-    state_projection_rows: int,
-    norm_block_h: int,
-    norm_block_s: int,
-    norm_num_warps: int,
-) -> None:
-    torch.ops.b12x.mtp_feedback(
-        token_embedding,
-        multi_state,
-        token_norm_weight,
-        state_norm_weight,
-        embedding_fc_weight,
-        hidden_fc_weight,
-        scratch,
-        output,
-        float(eps),
-        int(max_tokens),
-        int(streams),
-        int(hidden_size),
-        int(token_normalized_offset_bytes),
-        int(state_partial_sums_offset_bytes),
-        int(state_normalized_offset_bytes),
-        int(token_path_offset_bytes),
-        int(token_projection_rows),
-        int(state_projection_rows),
-        int(norm_block_h),
-        int(norm_block_s),
-        int(norm_num_warps),
-    )
+def run_mtp_feedback(*tensors, eps, plan):
+    torch.ops.b12x.mtp_feedback(*tensors, float(eps), plan.handle)
 
 
 __all__ = ["run_mtp_feedback"]

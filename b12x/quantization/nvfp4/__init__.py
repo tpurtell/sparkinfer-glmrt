@@ -2,17 +2,13 @@
 
 Quantizes a [M, K] BF16 tensor (M, K multiples of 128) into packed FP4
 values plus e4m3 scales in the dense-GEMM MMA layout (sf vec 16), using a
-128x128 TMA tile kernel. ``plan(m, k)`` compiles the shape (host-side,
-cached); ``allocate_outputs`` sizes the output pair; ``run`` launches into
-the caller's outputs (allocation-free, capture safe). There is no bind step:
-the outputs container is the binding.
-
-Example:
-    from b12x.quantization import nvfp4
-
-    plan = nvfp4.plan(m=256, k=512)
-    outs = nvfp4.allocate_outputs(plan)
-    nvfp4.run(plan=plan, x=x_bf16, global_scale=gs, outputs=outs)
+128x128 TMA tile kernel. ``plan(m, k)`` returns a metadata-only declaration;
+``allocate_outputs`` provisions its output pair before preparation.
+``PreparationSession`` selects, compiles, and primes the quantizer with a
+``PreparedCall`` over the caller's real activation/scale/output tensors.
+``run(plan=..., x=..., global_scale=..., outputs=...)`` consumes the
+resulting prepared plan without lookup or compilation. There is no
+separate bind step: the outputs container owns the explicit output buffers.
 """
 
 from __future__ import annotations

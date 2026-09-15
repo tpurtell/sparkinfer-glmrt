@@ -1,16 +1,15 @@
-"""attention.paged: decode and extend parity vs the in-tree reference through
-the eager public lifecycle (plan -> bind -> run), BF16 and FP8 KV — the same
-call sequence vLLM's integration uses.
+"""Paged-attention parity through the public preparation lifecycle.
 
-Note: b12x's paged CUDA-graph replay tests are stale against the current
-decode-graph planner heuristics (they fail upstream too), so they were not
-ported; graph coverage for the attention family comes from
-test_compressed_sparse_mla.py until they are refreshed.
+The eager cases below exercise the same declaration, materialization, binding,
+and execution boundary consumed by vLLM.  Graph replay coverage belongs to the
+paged backend itself: compressed MLA has a different cache ABI and cannot
+substitute for paged graph coverage.
 """
 
 from __future__ import annotations
 
 import torch
+from b12x.preparation import PreparationSession, PreparedCall
 
 from b12x.attention import paged
 from b12x.attention.paged.reference import (
@@ -36,46 +35,73 @@ def _run_eager(
     k_descale=None,
     v_descale=None,
 ):
-    plan = paged.plan(
-        paged.Caps(
-            device=q.device,
-            mode=mode,
-            dtype=q.dtype,
-            kv_dtype=k_cache.dtype,
-            num_q_heads=q.shape[1],
-            num_kv_heads=k_cache.shape[2],
-            head_dim_qk=q.shape[2],
-            head_dim_vo=v_cache.shape[3],
-            page_size=k_cache.shape[1],
-            max_total_q=q.shape[0],
-            max_batch=page_table.shape[0],
-            max_page_table_width=page_table.shape[1],
-            max_work_items=1024,
-            max_partial_rows=16384,
-            num_cache_pages=k_cache.shape[0],
-            use_cuda_graph=False,
-        )
+    caps = paged.Caps(
+        device=q.device,
+        mode=mode,
+        dtype=q.dtype,
+        kv_dtype=k_cache.dtype,
+        num_q_heads=q.shape[1],
+        num_kv_heads=k_cache.shape[2],
+        head_dim_qk=q.shape[2],
+        head_dim_vo=v_cache.shape[3],
+        page_size=k_cache.shape[1],
+        max_total_q=q.shape[0],
+        max_batch=page_table.shape[0],
+        max_page_table_width=page_table.shape[1],
+        max_work_items=1024,
+        max_partial_rows=16384,
+        num_cache_pages=k_cache.shape[0],
+        use_cuda_graph=False,
     )
-    spec = plan.scratch_specs()[0]
-    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q.device)
-    output = torch.empty(
+    metadata_output = torch.empty(
         (q.shape[0], q.shape[1], v_cache.shape[3]), dtype=q.dtype, device=q.device
     )
-    binding = paged.bind(
-        plan,
-        scratch=scratch,
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        output=output,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        active_total_q=int(q.shape[0]),
-        k_descale=k_descale,
-        v_descale=v_descale,
+    declaration = paged.plan(
+        caps,
+        invocation=paged.invocation_from_tensors(
+            caps, q=q, k_cache=k_cache, v_cache=v_cache, output=metadata_output,
+            page_table=page_table, cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q, k_descale=k_descale, v_descale=v_descale,
+        ),
     )
-    out, lse = paged.run(binding=binding)
+
+    prepared = {}
+
+    def prepare_call(state):
+        spec = state.scratch_plan.scratch_specs()[0]
+        prepared["spec"] = spec
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q.device)
+        output = torch.empty(
+            (q.shape[0], q.shape[1], v_cache.shape[3]), dtype=q.dtype, device=q.device
+        )
+        binding = state.bind(
+            scratch=scratch, q=q, k_cache=k_cache, v_cache=v_cache, output=output,
+            page_table=page_table, cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q, active_total_q=int(q.shape[0]),
+            k_descale=k_descale, v_descale=v_descale,
+        )
+        return PreparedCall(run=lambda: state.run(binding), output=output)
+
+    with PreparationSession(device=q.device, autotune=False) as session:
+        result = session.prepare((
+            declaration.request(
+                name="paged", prepare_call=prepare_call
+            ),
+        ))
+        plan = result.plans["paged"]
+        spec = prepared["spec"]
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q.device)
+        output = torch.empty(
+            (q.shape[0], q.shape[1], v_cache.shape[3]), dtype=q.dtype, device=q.device
+        )
+        binding = paged.bind(
+            plan, scratch=scratch, q=q, k_cache=k_cache, v_cache=v_cache,
+            output=output, page_table=page_table, cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q, active_total_q=int(q.shape[0]),
+            k_descale=k_descale, v_descale=v_descale,
+        )
+        out, lse = paged.run(binding=binding, plan=plan)
+        result.close()
     return out, lse
 
 

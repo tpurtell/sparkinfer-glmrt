@@ -53,6 +53,9 @@ from b12x._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from tests._reference.w4a16_reference import moe_reference_w4a16
 
+from b12x.moe import fused_moe
+from b12x.preparation import PreparationSession
+from benchmarks.moe_preparation import prepared_call, request_for_capacity, scratch_for
 
 LEGACY_BATCH_SIZES = [1, 2, 4, 8]
 NANO35_MTP_BATCH_SIZES = [1, 4, 9]
@@ -271,10 +274,21 @@ class ModelSpec:
     top_k: int
     tp_size: int
     tp_rank: int
+    logical_intermediate_size: int | None = None
 
     @property
     def I_tp(self) -> int:
+        if self.logical_intermediate_size is not None:
+            return self.intermediate_size
         return self.intermediate_size // self.tp_size
+
+    @property
+    def logical_I_tp(self) -> int:
+        return self.logical_intermediate_size or self.I_tp
+
+    @property
+    def global_intermediate_size(self) -> int:
+        return self.logical_I_tp * self.tp_size
 
 
 @dataclass(frozen=True)
@@ -446,6 +460,18 @@ MODEL_PROFILES = {
         hf_repo_id="deepseek-ai/DeepSeek-V4-Flash",
         default_activation="silu",
         default_quant_mode="w4a16",
+        default_validate="oracle",
+        default_swiglu_limit=10.0,
+        default_routing="model",
+    ),
+    "deepseek-v4.1-flash": ModelProfile(
+        label="DeepSeek V4.1 Flash",
+        checkpoint_family="deepseek_v41_flash",
+        default_layer_idx=0,
+        tp_size=4,
+        hf_repo_id="deepseek-ai/DeepSeek-V4.1-Flash",
+        default_activation="silu",
+        default_quant_mode="w4a8_mx",
         default_validate="oracle",
         default_swiglu_limit=10.0,
         default_routing="model",
@@ -648,6 +674,25 @@ def _fp4_checkpoint_bytes(tensor: torch.Tensor) -> torch.Tensor:
         raise TypeError(f"expected one-byte packed FP4 tensor, got {tensor.dtype}")
     return tensor.view(torch.uint8)
 
+def _slice_v41_tp_shard(
+    source: torch.Tensor,
+    *,
+    dimension: int,
+    intermediate_size_per_partition: int,
+    tp_rank: int,
+    packing: int = 1,
+) -> torch.Tensor:
+    """Slice one exact, MX-block-aligned TP shard."""
+    if (
+        intermediate_size_per_partition <= 0
+        or intermediate_size_per_partition % 32
+        or intermediate_size_per_partition % packing
+    ):
+        raise ValueError("invalid V4.1 TP shard geometry")
+    shard_width = intermediate_size_per_partition // packing
+    offset = tp_rank * shard_width
+    return source.narrow(dimension, offset, shard_width).contiguous()
+
 
 def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size_override: int | None = None, tp_rank: int = 0) -> ModelSpec:
     tp = tp_size_override if tp_size_override is not None else profile.tp_size
@@ -662,6 +707,23 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
         )
 
     cfg = _load_config(model_path)
+    if profile.checkpoint_family == "deepseek_v41_flash":
+        if cfg.get("model_type") != "deepseek_v41_text":
+            raise ValueError("DeepSeek V4.1 Flash requires its V4.1 text config, not V4.0")
+        if tp <= 0 or not 0 <= tp_rank < tp:
+            raise ValueError("V4.1 requires a valid TP rank")
+        logical_I_tp, remainder = divmod(cfg["moe_intermediate_size"], tp)
+        if remainder:
+            raise ValueError("V4.1 requires an evenly divisible intermediate size")
+        return ModelSpec(
+            hidden_size=cfg["hidden_size"],
+            intermediate_size=logical_I_tp,
+            logical_intermediate_size=logical_I_tp,
+            num_experts=cfg["n_routed_experts"],
+            top_k=cfg["num_experts_per_tok"],
+            tp_size=tp,
+            tp_rank=tp_rank,
+        )
     if profile.checkpoint_family == "qwen":
         return ModelSpec(
             hidden_size=cfg["hidden_size"],
@@ -1126,16 +1188,27 @@ def load_expert_weights(
         g1_alphas = ones
         g2_alphas = ones
         g1_alphas_per_expert = ones
-    elif checkpoint_family == "deepseek_v4_flash":
+    elif checkpoint_family in {"deepseek_v4_flash", "deepseek_v41_flash"}:
+        uses_v41_checkpoint_layout = checkpoint_family == "deepseek_v41_flash"
+        family_label = "DeepSeek V4.1 Flash" if uses_v41_checkpoint_layout else "DeepSeek V4 Flash"
+        if uses_v41_checkpoint_layout:
+            if cfg.get("model_type") != "deepseek_v41_text":
+                raise ValueError("V4.1 requires a V4.1 checkpoint")
+            if not 0 <= layer_idx < cfg["num_hidden_layers"]:
+                raise ValueError("V4.1 Flash profile requires a target-model layer, not DSpark")
         if activation != "silu":
-            raise ValueError("DeepSeek V4 Flash FP4 benchmark expects silu experts")
+            raise ValueError(f"{family_label} FP4 benchmark expects silu experts")
         if spec.hidden_size % 32 != 0 or spec.I_tp % 32 != 0:
             raise ValueError(
-                f"DeepSeek V4 Flash W4A16 requires K and I_tp divisible by 32, "
+                f"{family_label} requires K and local intermediate size divisible by 32, "
                 f"got K={spec.hidden_size}, I_tp={spec.I_tp}"
             )
         assert cfg["n_routed_experts"] == spec.num_experts
-        assert cfg["moe_intermediate_size"] == spec.intermediate_size
+        assert cfg["moe_intermediate_size"] == (
+            spec.global_intermediate_size
+            if uses_v41_checkpoint_layout
+            else spec.intermediate_size
+        )
         assert cfg["hidden_size"] == spec.hidden_size
 
         source_format = "fp4_e8m0_k32"
@@ -1146,7 +1219,7 @@ def load_expert_weights(
         down_proj = "w2"
         e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
         if e8m0_dtype is None:
-            raise RuntimeError("DeepSeek V4 Flash FP4 scales require torch.float8_e8m0fnu")
+            raise RuntimeError(f"{family_label} FP4 scales require torch.float8_e8m0fnu")
 
         gate_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
         up_w = torch.empty(E, I_tp, K // 2, dtype=torch.uint8, device=device)
@@ -1155,29 +1228,72 @@ def load_expert_weights(
         gate_sf = torch.empty(E, I_tp, K // 32, dtype=e8m0_dtype, device=device)
         up_sf = torch.empty(E, I_tp, K // 32, dtype=e8m0_dtype, device=device)
         down_sf = torch.empty(E, K, I_tp // 32, dtype=e8m0_dtype, device=device)
+        if uses_v41_checkpoint_layout:
+            def shard(
+                tensor: torch.Tensor,
+                dimension: int,
+                packing: int = 1,
+            ) -> torch.Tensor:
+                return _slice_v41_tp_shard(
+                    tensor,
+                    dimension=dimension,
+                    intermediate_size_per_partition=spec.logical_I_tp,
+                    tp_rank=spec.tp_rank,
+                    packing=packing,
+                )
 
-        print(f"  Loading {E} DeepSeek V4 Flash FP4 experts...", end="", flush=True)
+
+        print(f"  Loading {E} {family_label} FP4 experts...", end="", flush=True)
         for eid in range(E):
             ep = f"{prefix}.{eid}"
-            tp_off = spec.tp_rank * I_tp
-            tp_off_packed = spec.tp_rank * (I_tp // 2)
-            tp_sf_cols = I_tp // 32
-            tp_sf_off = spec.tp_rank * tp_sf_cols
-
-            gate_w[eid] = _fp4_checkpoint_bytes(
-                loader.get_tensor(f"{ep}.{gate_proj}.weight")
-            ).narrow(0, tp_off, I_tp).to(device)
-            gate_sf[eid] = loader.get_tensor(f"{ep}.{gate_proj}.scale").narrow(0, tp_off, I_tp).to(device)
-
-            up_w[eid] = _fp4_checkpoint_bytes(
-                loader.get_tensor(f"{ep}.{up_proj}.weight")
-            ).narrow(0, tp_off, I_tp).to(device)
-            up_sf[eid] = loader.get_tensor(f"{ep}.{up_proj}.scale").narrow(0, tp_off, I_tp).to(device)
-
-            down_w[eid] = _fp4_checkpoint_bytes(
-                loader.get_tensor(f"{ep}.{down_proj}.weight")
-            ).narrow(1, tp_off_packed, I_tp // 2).to(device)
-            down_sf[eid] = loader.get_tensor(f"{ep}.{down_proj}.scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
+            if uses_v41_checkpoint_layout:
+                gate_w[eid] = shard(
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{gate_proj}.weight")),
+                    0,
+                ).to(device)
+                gate_sf[eid] = shard(
+                    loader.get_tensor(f"{ep}.{gate_proj}.scale"), 0,
+                ).to(device)
+                up_w[eid] = shard(
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{up_proj}.weight")),
+                    0,
+                ).to(device)
+                up_sf[eid] = shard(
+                    loader.get_tensor(f"{ep}.{up_proj}.scale"), 0,
+                ).to(device)
+                down_w[eid] = shard(
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{down_proj}.weight")),
+                    1,
+                    packing=2,
+                ).to(device)
+                down_sf[eid] = shard(
+                    loader.get_tensor(f"{ep}.{down_proj}.scale"),
+                    1,
+                    packing=32,
+                ).to(device)
+            else:
+                tp_off = spec.tp_rank * I_tp
+                tp_off_packed = tp_off // 2
+                tp_sf_cols = I_tp // 32
+                tp_sf_off = tp_off // 32
+                gate_w[eid] = _fp4_checkpoint_bytes(
+                    loader.get_tensor(f"{ep}.{gate_proj}.weight")
+                ).narrow(0, tp_off, I_tp).to(device)
+                gate_sf[eid] = loader.get_tensor(
+                    f"{ep}.{gate_proj}.scale"
+                ).narrow(0, tp_off, I_tp).to(device)
+                up_w[eid] = _fp4_checkpoint_bytes(
+                    loader.get_tensor(f"{ep}.{up_proj}.weight")
+                ).narrow(0, tp_off, I_tp).to(device)
+                up_sf[eid] = loader.get_tensor(
+                    f"{ep}.{up_proj}.scale"
+                ).narrow(0, tp_off, I_tp).to(device)
+                down_w[eid] = _fp4_checkpoint_bytes(
+                    loader.get_tensor(f"{ep}.{down_proj}.weight")
+                ).narrow(1, tp_off_packed, I_tp // 2).to(device)
+                down_sf[eid] = loader.get_tensor(
+                    f"{ep}.{down_proj}.scale"
+                ).narrow(1, tp_sf_off, tp_sf_cols).to(device)
         print(" done.")
 
         # Match vLLM FusedMoE loading for the B12X backend: native DeepSeek V4
@@ -1413,7 +1529,9 @@ def compute_model_gate_routing(
 
     topk_weights = original_scores.gather(1, topk_ids)
     if score_func != "softmax" and weights.gate_norm_topk_prob:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        topk_weights = topk_weights / topk_weights.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-20)
     topk_weights = topk_weights * weights.gate_route_scale
     return normalize_kernel_routing(topk_ids, topk_weights)
 
@@ -1636,28 +1754,43 @@ def plan_b12x_benchmark_weights(
     quant_mode: str,
     activation: str,
     w4a16_native: bool = False,
+    activation_params: ActivationParams | None = None,
 ):
-    """Choose the benchmark's sole authoritative weight layout."""
-    from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights
-    from b12x.moe._shared.execution import PreparedWeightLayout
-
-    quant_mode = quant_mode.lower()
-    return plan_b12x_fp4_moe_weights(
-        quant_modes=quant_mode,
-        source_format=weights.source_format,
-        activation=activation,
-        params_dtype=torch.bfloat16,
-        num_experts=weights.spec.num_experts,
-        hidden_size=weights.spec.hidden_size,
-        intermediate_size=weights.spec.I_tp,
-        w13_layout=weights.w13_layout,
-        w4a16_layout=(
-            PreparedWeightLayout.SOURCE_NATIVE
-            if quant_mode == "w4a16" and w4a16_native
-            else None
+    """Declare the benchmark's canonical checkpoint representation."""
+    activation_params = activation_params or ActivationParams()
+    modes = {
+        "nvfp4": fused_moe.ActivationMode.A4,
+        "w4a16": fused_moe.ActivationMode.A16,
+        "w4a8_mx": fused_moe.ActivationMode.A8,
+        "w4a8_nvfp4": fused_moe.ActivationMode.A8,
+    }
+    try:
+        mode = modes[quant_mode.lower()]
+    except KeyError as exc:
+        raise ValueError(f"unsupported benchmark quant mode {quant_mode!r}") from exc
+    return fused_moe.plan_weights(
+        source=fused_moe.PackedSource(
+            format=weights.source_format, w13_layout=weights.w13_layout,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=weights.spec.num_experts,
+            hidden_size=weights.spec.hidden_size,
+            intermediate_size=weights.spec.I_tp,
+        ),
+        activation=fused_moe.ActivationSpec(
+            mode=mode,
+            nonlinearity=activation,
+            io_dtype=torch.bfloat16,
+            **activation_params.kwargs(),
+        ),
+        constraints=fused_moe.WeightPlanConstraints(
+            required_packing=(
+                fused_moe.WeightPacking.SOURCE_NATIVE
+                if quant_mode.lower() == "w4a16" and w4a16_native
+                else None
+            ),
         ),
     )
-
 
 def prepare_b12x_benchmark_weights(
     weights: ExpertWeights,
@@ -1667,10 +1800,9 @@ def prepare_b12x_benchmark_weights(
     activation: str,
     w4a16_native: bool = False,
     plan=None,
+    activation_params: ActivationParams | None = None,
 ):
-    """Execute the benchmark's planner-selected authoritative layout."""
-    from b12x.moe.fused_moe._impl import prepare_b12x_fp4_moe_weights
-
+    """Prepare canonical weights for a declaration, never an executable plan."""
     quant_mode = quant_mode.lower()
     if plan is None:
         plan = plan_b12x_benchmark_weights(
@@ -1678,39 +1810,35 @@ def prepare_b12x_benchmark_weights(
             quant_mode=quant_mode,
             activation=activation,
             w4a16_native=w4a16_native,
+            activation_params=activation_params,
         )
     if quant_mode == "w4a16":
-        w1_global_scale, w2_global_scale, _ = get_w4a16_prepare_scales(
-            weights,
-            params,
-        )
+        w1_global_scale, w2_global_scale, _ = get_w4a16_prepare_scales(weights, params)
     elif quant_mode == "w4a8_mx":
         w1_global_scale = torch.ones_like(params.g1_alphas)
         w2_global_scale = torch.ones_like(params.g2_alphas)
     else:
-        # NVFP4 runtime alpha = input_scale * weight_global_scale, while the
-        # public activation scale is reciprocal input_scale.
         w1_global_scale = params.g1_alphas * params.a1_gscale
         w2_global_scale = params.g2_alphas * params.a2_gscale
-
-    experts = prepare_b12x_fp4_moe_weights(
+    experts = fused_moe.prepare_weights(
         plan=plan,
-        w1_global_scale=w1_global_scale,
-        w2_global_scale=w2_global_scale,
-        w1_fp4=weights.w13_weight,
-        w1_blockscale=weights.w13_blockscale_swizzled,
-        w2_fp4=weights.w2_weight,
-        w2_blockscale=weights.w2_blockscale_swizzled,
-        a1_gscale=params.a1_gscale,
-        a2_gscale=params.a2_gscale,
-        params_dtype=torch.bfloat16,
+        weights=fused_moe.PackedWeights(
+            w13=weights.w13_weight,
+            w2=weights.w2_weight,
+            w13_block_scales=weights.w13_blockscale_swizzled,
+            w2_block_scales=weights.w2_blockscale_swizzled,
+            w13_global_scales=w1_global_scale,
+            w2_global_scales=w2_global_scale,
+            input_scale=params.a1_gscale,
+            intermediate_scale=params.a2_gscale,
+        ),
     )
-    if experts.plan.prepares_runtime_alphas:
+    if experts._impl.plan.prepares_runtime_alphas:
         params = ScaleContractParams(
-            a1_gscale=experts.a1_gscale,
-            a2_gscale=experts.a2_gscale,
-            g1_alphas=experts.w1_alphas,
-            g2_alphas=experts.w2_alphas,
+            a1_gscale=experts._impl.a1_gscale,
+            a2_gscale=experts._impl.a2_gscale,
+            g1_alphas=experts._impl.w1_alphas,
+            g2_alphas=experts._impl.w2_alphas,
         )
     return experts, params
 
@@ -1731,16 +1859,6 @@ def get_w4a16_oracle_params(
     )
 
 
-def uses_unit_scale_contract(
-    profile: ModelProfile,
-    quant_mode: str,
-    activation: str,
-) -> bool:
-    return (
-        quant_mode.lower() == "w4a16"
-        and activation == "relu2"
-        and profile.checkpoint_family in {"nano35_w4a16", "nano35_w4a16_shape"}
-    )
 
 
 def _dequant_mxfp4_expert(
@@ -2584,87 +2702,140 @@ def compare_graph_replay_outputs(
     return metrics
 
 
-def allocate_layer_chain_workspace():
-    from b12x.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
+def prepare_moe_execution(
+    *,
+    session: PreparationSession,
+    name: str,
+    experts: object,
+    top_k: int,
+    inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    outputs: dict[int, torch.Tensor],
+) -> object:
+    """Prepare each exact benchmark M before binding its real caller buffers."""
+    capacity = fused_moe.ExecutionCapacity(
+        max_tokens=max(inputs),
+        top_k=top_k,
+        warmup_token_counts=tuple(inputs),
+    )
+    declaration = fused_moe.plan_execution(experts=experts, capacity=capacity)
+    calls = {
+        m: prepared_call(
+            output=outputs[m],
+            bind=lambda state, scratch, m=m: state.bind(
+                scratch=scratch,
+                a=inputs[m][0],
+                experts=experts,
+                topk_ids=inputs[m][1],
+                topk_weights=inputs[m][2],
+                output=outputs[m],
+                input_scales_static=True,
+            ),
+        )
+        for m in getattr(declaration, "token_counts", (capacity.max_tokens,))
+    }
+    session.prepare((
+        request_for_capacity(
+            declaration,
+            name=name,
+            calls=calls,
+        ),
+    ))
+    execution = declaration
+    selection = execution.selection
+    if selection is None:
+        variants = execution.variants
+        print(
+            f"  preparation {name}: "
+            + ", ".join(
+                f"M={m} {variant.selection.source}"
+                for m, variant in variants.items()
+                if variant.selection is not None
+            )
+        )
+    else:
+        print(f"  preparation {name}: {selection.source} {selection.config}")
+    return execution
 
-    return allocate_tp_moe_workspace_pool()
+
+def bind_prepared_moe(
+    execution: object,
+    *,
+    a: torch.Tensor,
+    experts: object,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+):
+    """Bind a ready exact-M execution; no raw scratch plan or JIT route exists."""
+    exact_execution = getattr(execution, "variants", {}).get(int(a.shape[0]), execution)
+    return fused_moe.bind(
+        exact_execution,
+        scratch=scratch_for(exact_execution),
+        a=a,
+        experts=experts,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        output=output,
+        input_scales_static=True,
+    )
 
 
 def run_moe_layer_chain(
+    executions: Sequence[object],
     experts_stack: Sequence[object],
     x: torch.Tensor,
     topk_ids_per_layer: Sequence[torch.Tensor],
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
-    activation_params: ActivationParams | None = None,
-    fast_math: bool,
-    quant_mode: str = "nvfp4",
     output_buffers: Sequence[torch.Tensor] | None = None,
-    workspace,
 ) -> list[torch.Tensor]:
-    from b12x.moe.fused_moe._impl import b12x_moe_fp4, build_tp_moe_fp4_binding
-
     if not (
-        len(experts_stack) == len(topk_ids_per_layer)
+        len(executions) == len(experts_stack) == len(topk_ids_per_layer)
         == len(topk_weights_per_layer)
     ):
         raise ValueError("layer-chain inputs must all have the same length")
     if output_buffers is not None and len(output_buffers) != len(experts_stack):
         raise ValueError("output_buffers must match the number of layers")
-    activation_params = activation_params or ActivationParams()
 
     layer_outputs: list[torch.Tensor] = []
     current = x
-    for layer_idx, (experts, topk_ids, topk_weights) in enumerate(
-        zip(
-            experts_stack,
-            topk_ids_per_layer,
-            topk_weights_per_layer,
-            strict=True,
-        )
+    for layer_idx, (execution, experts, topk_ids, topk_weights) in enumerate(
+        zip(executions, experts_stack, topk_ids_per_layer, topk_weights_per_layer, strict=True)
     ):
         output = None if output_buffers is None else output_buffers[layer_idx]
-        binding = build_tp_moe_fp4_binding(
-            scratch=workspace,
+        if output is None:
+            output = torch.empty_like(current)
+        binding = bind_prepared_moe(
+            execution,
             a=current,
             experts=experts,
-            topk_weights=topk_weights,
             topk_ids=topk_ids,
-            fast_math=fast_math,
+            topk_weights=topk_weights,
             output=output,
-            input_scales_static=True,
-            quant_mode=quant_mode,
-            **activation_params.kwargs(),
         )
-        current = b12x_moe_fp4(binding=binding)
+        current = fused_moe.run(binding=binding)
         layer_outputs.append(current)
     return layer_outputs
 
 
 def capture_moe_layer_chain(
+    executions: Sequence[object],
     experts_stack: Sequence[object],
     x: torch.Tensor,
     topk_ids_per_layer: Sequence[torch.Tensor],
     topk_weights_per_layer: Sequence[torch.Tensor],
     *,
-    activation_params: ActivationParams | None = None,
-    fast_math: bool,
-    quant_mode: str = "nvfp4",
     output_buffers: Sequence[torch.Tensor],
-    workspace,
 ) -> torch.cuda.CUDAGraph:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run_moe_layer_chain(
+            executions,
             experts_stack,
             x,
             topk_ids_per_layer,
             topk_weights_per_layer,
-            activation_params=activation_params,
-            fast_math=fast_math,
-            quant_mode=quant_mode,
             output_buffers=output_buffers,
-            workspace=workspace,
         )
     return graph
 
@@ -2746,6 +2917,7 @@ def bench_multilayer_graph_mode(
             quant_mode=args.quant_mode,
             activation=args.activation,
             w4a16_native=args.w4a16_native,
+            activation_params=activation_params,
         )
         experts_stack.append(experts)
 
@@ -2778,43 +2950,45 @@ def bench_multilayer_graph_mode(
         topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
         graph_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
         eager_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
-        shared_workspace = allocate_layer_chain_workspace()
+        session = PreparationSession(device=device)
+        layer_executions = [
+            prepare_moe_execution(
+                session=session,
+                name=f"layer-chain-{batch_size}-{layer_idx}",
+                experts=experts,
+                top_k=spec.top_k,
+                inputs={batch_size: (x_buf, topk_ids_bufs[layer_idx], topk_weights_bufs[layer_idx])},
+                outputs={batch_size: graph_output_bufs[layer_idx]},
+            )
+            for layer_idx, experts in enumerate(experts_stack)
+        ]
 
         run_moe_layer_chain(
+            layer_executions,
             experts_stack,
             x_buf,
             topk_ids_bufs,
             topk_weights_bufs,
-            activation_params=activation_params,
-            fast_math=args.fast_math,
-            quant_mode=args.quant_mode,
             output_buffers=graph_output_bufs,
-            workspace=shared_workspace,
         )
         torch.cuda.synchronize()
         graph = capture_moe_layer_chain(
+            layer_executions,
             experts_stack,
             x_buf,
             topk_ids_bufs,
             topk_weights_bufs,
-            activation_params=activation_params,
-            fast_math=args.fast_math,
-            quant_mode=args.quant_mode,
             output_buffers=graph_output_bufs,
-            workspace=shared_workspace,
         )
 
         def eager_chain() -> None:
             run_moe_layer_chain(
+                layer_executions,
                 experts_stack,
                 x_buf,
                 topk_ids_bufs,
                 topk_weights_bufs,
-                activation_params=activation_params,
-                fast_math=args.fast_math,
-                quant_mode=args.quant_mode,
                 output_buffers=eager_output_bufs,
-                workspace=shared_workspace,
             )
 
         for scenario_name, pattern, seed in scenario_specs:
@@ -2895,6 +3069,10 @@ def bench_multilayer_graph_mode(
                 )
             )
 
+        del graph
+        torch.cuda.synchronize()
+        session.close()
+
     if validation_failures:
         print(f"\n\033[1;31m{'=' * 70}")
         print("  MULTI-LAYER GRAPH VALIDATION FAILED")
@@ -2938,6 +3116,7 @@ def bench_e2e() -> None:
         help="Override top-k for a synthetic shape-only model profile.",
     )
     parser.add_argument("--tp-size", type=int, default=None, help="Override TP size from model profile")
+    parser.add_argument("--tp-rank", type=int, default=0, help="Rank slice to benchmark (default: 0)")
     parser.add_argument("--tp-parallel", action="store_true", help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams")
     parser.add_argument("--model-path", type=pathlib.Path, default=None)
     parser.add_argument("--layer-idx", type=int, default=None)
@@ -3048,12 +3227,6 @@ def bench_e2e() -> None:
         default=None,
         help="Override only the oracle cosine gate; other tolerances are unchanged.",
     )
-    parser.add_argument(
-        "--policy-mode",
-        choices=("auto", "heuristic-only", "preplanned-only"),
-        default="auto",
-        help="Select AUTO, heuristic-only, or fail-closed preplanned policy.",
-    )
     parser.add_argument("--include-routing", action="store_true")
     parser.set_defaults(cuda_graph=True)
     parser.add_argument(
@@ -3102,7 +3275,6 @@ def bench_e2e() -> None:
         help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
     )
     args = parser.parse_args()
-    os.environ["B12X_POLICY_MODE"] = args.policy_mode
     model_profile = MODEL_PROFILES[args.model_profile]
     if args.activation is None:
         args.activation = model_profile.default_activation
@@ -3194,10 +3366,9 @@ def bench_e2e() -> None:
         raise ValueError(
             "--routing-repeat-period cannot exceed any requested batch size"
         )
-
     require_sm120()
     torch.empty(1, device="cuda")
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     if (
         args.w4a16_route_policy != "auto"
         or args.w4a16_tile_config is not None
@@ -3224,7 +3395,9 @@ def bench_e2e() -> None:
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes) if args.flush_l2 else 0
 
-    spec = build_model_spec(model_path, model_profile, tp_size_override=args.tp_size)
+    spec = build_model_spec(
+        model_path, model_profile, tp_size_override=args.tp_size, tp_rank=args.tp_rank,
+    )
     if args.top_k is not None:
         if model_profile.shape is None:
             raise ValueError("--top-k is limited to synthetic shape-only profiles")
@@ -3248,6 +3421,12 @@ def bench_e2e() -> None:
         f"{model_profile.label}  TP={spec.tp_size}, K={spec.hidden_size}, I_tp={spec.I_tp}, "
         f"E={spec.num_experts}, top_k={spec.top_k}"
     )
+    if model_profile.checkpoint_family == "deepseek_v41_flash":
+        print(
+            f"Intermediate TP shard: rank {spec.tp_rank}, all {spec.num_experts} experts, "
+            f"logical I_tp={spec.logical_I_tp}, physical I_tp={spec.I_tp}. "
+            "Excludes the TP all-reduce and shared expert."
+        )
     print(f"Model path: {model_path}")
     if model_profile.shape is not None:
         print("Weights: synthetic shape-only")
@@ -3260,7 +3439,6 @@ def bench_e2e() -> None:
     print(f"Batch-size profile: {args.batch_size_profile} -> {batch_sizes}")
     backend_label = "b12x"
     print(f"Backend: {backend_label}")
-    print(f"B12X policy mode: {args.policy_mode}")
     print(f"Reference: {args.reference}")
     print(f"Scale contract: {args.scale_contract}")
     print(f"Validation: {args.validate}")
@@ -3321,10 +3499,10 @@ def bench_e2e() -> None:
         weights,
         quant_mode=args.quant_mode,
         activation=args.activation,
+        activation_params=activation_params,
         w4a16_native=args.w4a16_native,
     )
-    precomputed_oracles: dict[int, torch.Tensor] = {}
-    if args.validate == "oracle" and weight_plan.reuses_source_storage:
+    if args.validate == "oracle" and getattr(weight_plan, "reuses_source_storage", False):
         print(
             "  Precomputing oracle outputs before destructive weight "
             "preparation...",
@@ -3391,105 +3569,38 @@ def bench_e2e() -> None:
         quant_mode=args.quant_mode,
         activation=args.activation,
         w4a16_native=args.w4a16_native,
+        activation_params=activation_params,
         plan=weight_plan,
     )
-    backend_w4a16_weights = None
-    make_backend_w4a16_buffers = None
-    if use_w4a16:
-        from b12x.moe._shared.kernels.w4a16.prepare import (
-            make_w4a16_packed_buffers as make_w4a16_buffers,
-        )
-
-        backend_w4a16_weights = experts.representation_for("w4a16")
-        assert backend_w4a16_weights is not None
-        print(
-            "W4A16 preparation: "
-            f"{experts.plan.storage_policy.value}, "
-            f"layout={experts.plan.required_weight_layout('w4a16').value}"
-        )
-        print(
-            "W4A16 scale format: "
-            f"{getattr(backend_w4a16_weights, 'scale_format', weights.source_format)}"
-        )
-        make_backend_w4a16_buffers = make_w4a16_buffers
-
-    unit_scale_contract = uses_unit_scale_contract(
-        model_profile,
-        args.quant_mode,
-        args.activation,
-    )
-
-    from b12x.moe.fused_moe._impl import (
-        allocate_tp_moe_workspace_pool,
-        b12x_moe_fp4,
-        build_tp_moe_fp4_binding,
-    )
-    w4a16_moe = None
-    if use_w4a16:
-        from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
-
-        w4a16_moe = run_w4a16_moe
-
     _clear_b12x_caches()
-
-    print("  Warming up b12x (compilation)...", end="", flush=True)
+    b12x_session = PreparationSession(device=device)
+    print("  Preparing b12x declarations...", end="", flush=True)
     x_warm, topk_ids_w, topk_weights_w = make_profile_routed_inputs(
-        model_profile,
-        weights,
-        spec,
-        1,
-        42,
-        device,
+        model_profile, weights, spec, 1, 42, device,
     )
-    if use_w4a16:
-        assert w4a16_moe is not None
-        assert backend_w4a16_weights is not None
-        assert make_backend_w4a16_buffers is not None
-        warmup_buffers = make_backend_w4a16_buffers(
-            backend_w4a16_weights,
-            m=x_warm.shape[0],
-            topk=spec.top_k,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        w4a16_moe(
-            x_warm,
-            backend_w4a16_weights,
-            topk_weights_w,
-            topk_ids_w,
-            activation=args.activation,
-            fast_math=args.fast_math,
-            intermediate_cache13=warmup_buffers.intermediate_cache13,
-            intermediate_cache2=warmup_buffers.intermediate_cache2,
-            output=warmup_buffers.output,
-            fc1_c_tmp=warmup_buffers.fc1_c_tmp,
-            fc2_c_tmp=warmup_buffers.fc2_c_tmp,
-            packed_route_indices=warmup_buffers.packed_route_indices,
-            block_expert_ids=warmup_buffers.block_expert_ids,
-            packed_route_count=warmup_buffers.packed_route_count,
-            expert_offsets=warmup_buffers.expert_offsets,
-            **activation_params.kwargs(),
-        )
-    else:
-        warmup_workspace = allocate_tp_moe_workspace_pool()
-        warmup_binding = build_tp_moe_fp4_binding(
-            scratch=warmup_workspace,
-            a=x_warm,
-            experts=experts,
-            topk_weights=topk_weights_w,
-            topk_ids=topk_ids_w,
-            output=torch.empty_like(x_warm),
-            fast_math=args.fast_math,
-            quant_mode=args.quant_mode,
-            unit_scale_contract=unit_scale_contract,
-            **activation_params.kwargs(),
-        )
-        b12x_moe_fp4(binding=warmup_binding)
+    warmup_output = torch.empty_like(x_warm)
+    warmup_execution = prepare_moe_execution(
+        session=b12x_session,
+        name="benchmark-moe-warmup",
+        experts=experts,
+        top_k=spec.top_k,
+        inputs={1: (x_warm, topk_ids_w, topk_weights_w)},
+        outputs={1: warmup_output},
+    )
+    warmup_binding = bind_prepared_moe(
+        warmup_execution,
+        a=x_warm,
+        experts=experts,
+        topk_ids=topk_ids_w,
+        topk_weights=topk_weights_w,
+        output=warmup_output,
+    )
+    fused_moe.run(binding=warmup_binding)
     torch.cuda.synchronize()
     print(" done.")
 
     # ---- TP-parallel setup ----
-    tp_parallel_ranks: list[tuple[ModelSpec, object]] = []
+    tp_parallel_ranks: list[tuple[ModelSpec, object, object]] = []
     if args.tp_parallel and spec.tp_size > 1:
         print("  Loading TP-parallel ranks...", end="", flush=True)
         for r in range(spec.tp_size):
@@ -3504,29 +3615,28 @@ def bench_e2e() -> None:
                 rp,
                 quant_mode=args.quant_mode,
                 activation=args.activation,
+                activation_params=activation_params,
             )
-            tp_parallel_ranks.append((rspec, rexperts))
-        # Warm up each rank's kernel
-        for rspec, rexperts in tp_parallel_ranks:
             x_r = torch.randn(1, rspec.hidden_size, dtype=torch.bfloat16, device=device)
             rk_warm = torch.randn(1, rspec.num_experts, dtype=torch.float32, device=device)
             rk_logits, rk_ids = torch.topk(rk_warm, rspec.top_k, dim=-1)
             rk_weights = torch.softmax(rk_logits, dim=-1)
             rk_ids, rk_weights = normalize_kernel_routing(rk_ids, rk_weights)
-            ws_r = allocate_tp_moe_workspace_pool()
-            binding_r = build_tp_moe_fp4_binding(
-                scratch=ws_r,
-                a=x_r,
+            output_r = torch.empty_like(x_r)
+            execution_r = prepare_moe_execution(
+                session=b12x_session,
+                name=f"benchmark-moe-tp-{r}",
                 experts=rexperts,
-                topk_weights=rk_weights,
-                topk_ids=rk_ids,
-                output=torch.empty_like(x_r),
-                fast_math=args.fast_math,
-                quant_mode=args.quant_mode,
-                unit_scale_contract=unit_scale_contract,
-                **activation_params.kwargs(),
+                top_k=rspec.top_k,
+                inputs={1: (x_r, rk_ids, rk_weights)},
+                outputs={1: output_r},
             )
-            b12x_moe_fp4(binding=binding_r)
+            binding_r = bind_prepared_moe(
+                execution_r, a=x_r, experts=rexperts, topk_ids=rk_ids,
+                topk_weights=rk_weights, output=output_r,
+            )
+            fused_moe.run(binding=binding_r)
+            tp_parallel_ranks.append((rspec, rexperts, execution_r))
         torch.cuda.synchronize()
         print(f" {spec.tp_size} ranks done.")
 
@@ -3551,33 +3661,12 @@ def bench_e2e() -> None:
             topk_weights,
             args.routing_repeat_period,
         )
-        active_experts = int(torch.unique(topk_ids).numel())
-        active_density = batch_size * spec.top_k / max(active_experts, 1)
-        from b12x.moe.fused_moe import _impl as fused_moe_impl
-
-        policy_resolution = fused_moe_impl._resolve_moe_decode_policy(
-            num_tokens=batch_size,
-            num_topk=spec.top_k,
-            num_experts=spec.num_experts,
-            k=spec.hidden_size,
-            n=spec.I_tp,
-            activation=args.activation,
-            quant_mode=args.quant_mode,
-            source_format=weights.source_format,
-        )
+        local_routes = topk_ids >= 0
+        active_experts = int(torch.unique(topk_ids[local_routes]).numel())
+        active_density = int(local_routes.sum().item()) / max(active_experts, 1)
         print(
             f"  routing: {active_experts} active experts, "
             f"{active_density:.1f} routed rows/active expert"
-        )
-        print(
-            "  policy: "
-            f"source={policy_resolution.source.value}, "
-            f"backend={policy_resolution.config.backend}, "
-            f"route_planner={policy_resolution.config.route_planner}, "
-            "max_active_clusters="
-            f"{policy_resolution.config.max_active_clusters}, "
-            f"profile={policy_resolution.profile_id}, "
-            f"rule={policy_resolution.rule_name}"
         )
 
         def compute_timed_routing() -> tuple[torch.Tensor, torch.Tensor]:
@@ -3595,75 +3684,36 @@ def bench_e2e() -> None:
                     timed_topk_ids, timed_topk_weights
                 )
             return repeat_routing_pattern(
-                timed_topk_ids,
-                timed_topk_weights,
-                args.routing_repeat_period,
+                timed_topk_ids, timed_topk_weights, args.routing_repeat_period,
             )
 
         backend_output = torch.empty_like(x)
-        backend_workspace = (
-            None
-            if use_w4a16
-            else allocate_tp_moe_workspace_pool()
+        backend_execution = prepare_moe_execution(
+            session=b12x_session,
+            name=f"benchmark-moe-m{batch_size}",
+            experts=experts,
+            top_k=spec.top_k,
+            inputs={batch_size: (x, topk_ids, topk_weights)},
+            outputs={batch_size: backend_output},
         )
-        backend_w4a16_buffers = (
-            make_backend_w4a16_buffers(
-                backend_w4a16_weights,
-                m=batch_size,
-                topk=spec.top_k,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            if use_w4a16
-            else None
+        backend_binding = bind_prepared_moe(
+            backend_execution,
+            a=x,
+            experts=experts,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=backend_output,
         )
-        backend_binding = None
-        if not use_w4a16:
-            assert backend_workspace is not None
-            backend_binding = build_tp_moe_fp4_binding(
-                scratch=backend_workspace,
-                a=x,
-                experts=experts,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                fast_math=args.fast_math,
-                output=backend_output,
-                quant_mode=args.quant_mode,
-                unit_scale_contract=unit_scale_contract,
-                **activation_params.kwargs(),
-            )
 
         def make_backend_e2e() -> Callable[[], torch.Tensor]:
-
-            def impl_launch(topk_ids_local: torch.Tensor, topk_weights_local: torch.Tensor) -> torch.Tensor:
-                if use_w4a16:
-                    assert w4a16_moe is not None
-                    assert backend_w4a16_weights is not None
-                    assert backend_w4a16_buffers is not None
-                    return w4a16_moe(
-                        x,
-                        backend_w4a16_weights,
-                        topk_weights_local,
-                        topk_ids_local,
-                        activation=args.activation,
-                        fast_math=args.fast_math,
-                        intermediate_cache13=backend_w4a16_buffers.intermediate_cache13,
-                        intermediate_cache2=backend_w4a16_buffers.intermediate_cache2,
-                        output=backend_output,
-                        fc1_c_tmp=backend_w4a16_buffers.fc1_c_tmp,
-                        fc2_c_tmp=backend_w4a16_buffers.fc2_c_tmp,
-                        packed_route_indices=backend_w4a16_buffers.packed_route_indices,
-                        block_expert_ids=backend_w4a16_buffers.block_expert_ids,
-                        packed_route_count=backend_w4a16_buffers.packed_route_count,
-                        expert_offsets=backend_w4a16_buffers.expert_offsets,
-                        **activation_params.kwargs(),
-                    )
-                assert backend_binding is not None
+            def impl_launch(
+                topk_ids_local: torch.Tensor, topk_weights_local: torch.Tensor,
+            ) -> torch.Tensor:
                 if topk_ids_local is not backend_binding.topk_ids:
                     backend_binding.topk_ids.copy_(topk_ids_local)
                 if topk_weights_local is not backend_binding.topk_weights:
                     backend_binding.topk_weights.copy_(topk_weights_local)
-                return b12x_moe_fp4(binding=backend_binding)
+                return fused_moe.run(binding=backend_binding)
 
             def impl_e2e() -> torch.Tensor:
                 if args.include_routing:
@@ -3983,35 +4033,43 @@ def bench_e2e() -> None:
             print(f"  {label} (CUDA graph):".ljust(28), end="", flush=True)
             try:
                 # Per-rank inputs, outputs, workspaces
-                tp_x = [torch.randn(batch_size, rs.hidden_size, dtype=torch.bfloat16, device=device) for rs, _ in tp_parallel_ranks]
-                tp_routing = [torch.randn(batch_size, rs.num_experts, dtype=torch.float32, device=device) for rs, _ in tp_parallel_ranks]
+                tp_x = [
+                    torch.randn(batch_size, rs.hidden_size, dtype=torch.bfloat16, device=device)
+                    for rs, _, _ in tp_parallel_ranks
+                ]
+                tp_routing = [
+                    torch.randn(batch_size, rs.num_experts, dtype=torch.float32, device=device)
+                    for rs, _, _ in tp_parallel_ranks
+                ]
                 tp_topk_ids: list[torch.Tensor] = []
                 tp_topk_weights: list[torch.Tensor] = []
-                for r_routing, (rspec, _) in zip(tp_routing, tp_parallel_ranks, strict=True):
+                for r_routing, (rspec, _, _) in zip(tp_routing, tp_parallel_ranks, strict=True):
                     r_logits, r_ids = torch.topk(r_routing, rspec.top_k, dim=-1)
                     tp_topk_ids.append(r_ids)
                     tp_topk_weights.append(torch.softmax(r_logits, dim=-1))
                 tp_outputs = [torch.empty_like(tp_x[r]) for r in range(tp_n)]
-                tp_workspaces = [allocate_tp_moe_workspace_pool() for _ in range(tp_n)]
                 tp_streams = [torch.cuda.Stream() for _ in range(tp_n)]
-                tp_bindings = [
-                    build_tp_moe_fp4_binding(
-                        scratch=tp_workspaces[r],
+                tp_bindings = []
+                for r, (rspec, rexperts, _) in enumerate(tp_parallel_ranks):
+                    execution = prepare_moe_execution(
+                        session=b12x_session,
+                        name=f"benchmark-moe-tp-{r}-m{batch_size}",
+                        experts=rexperts,
+                        top_k=rspec.top_k,
+                        inputs={batch_size: (tp_x[r], tp_topk_ids[r], tp_topk_weights[r])},
+                        outputs={batch_size: tp_outputs[r]},
+                    )
+                    tp_bindings.append(bind_prepared_moe(
+                        execution,
                         a=tp_x[r],
                         experts=rexperts,
-                        topk_weights=tp_topk_weights[r],
                         topk_ids=tp_topk_ids[r],
+                        topk_weights=tp_topk_weights[r],
                         output=tp_outputs[r],
-                        fast_math=args.fast_math,
-                        quant_mode=args.quant_mode,
-                        unit_scale_contract=unit_scale_contract,
-                        **activation_params.kwargs(),
-                    )
-                    for r, (_rspec, rexperts) in enumerate(tp_parallel_ranks)
-                ]
+                    ))
 
                 def launch_tp_rank(r: int) -> None:
-                    b12x_moe_fp4(binding=tp_bindings[r])
+                    fused_moe.run(binding=tp_bindings[r])
 
                 # Warm eager launches
                 for r, stream in enumerate(tp_streams):
@@ -4048,6 +4106,15 @@ def bench_e2e() -> None:
                 print(f" {fmt_us(tp_times)}")
             except Exception as exc:
                 print(f" FAILED ({type(exc).__name__}: {exc})")
+
+    # Captured graphs hold references into the prepared plans they replay.
+    # Drop the final diagnostic graph before closing this benchmark's session.
+    if "tp_graphs" in locals():
+        del tp_graphs
+    if "graph" in locals():
+        del graph
+    torch.cuda.synchronize()
+    b12x_session.close()
 
     ratio_results = {
         batch_size: result.ratio_stats.median

@@ -233,23 +233,28 @@ with those arithmetic choices.
 
 ## Native W4A8 convergence
 
-Native W4A8 now uses one dynamic-kernel family across the full routed range.
-Its dense specialization combines:
+Native W4A8 uses one dynamic-kernel family across the larger routed range and a
+dedicated direct-route micro pipeline for eligible decode capacities through
+eight tokens. The dynamic dense specialization combines:
 
 - token-major input quantization with expert-major route metadata;
-- N256/K128 lane-major prepared weights;
+- N256/K128 lane-major prepared weights for N128-aligned geometry, or an exact
+  N128-bulk/N64-tail representation when the intermediate width ends in 64;
 - M32 FC1 work with queue or persistent-grid acquisition;
 - a materialized E4M3 intermediate with transposed scale planes;
 - flattened grid-stride full-K FC2 work;
 - register-resident work metadata and compile-time-specialized control flow.
 
-At M=1, the same prepared-layout kernel traces a smaller fixed-domain regime:
-it quantizes the single input once across the resident grid, derives FC1 work
-directly from `(route, K128 slice)`, materializes the MXFP8 intermediate, and
-assigns FC2 work by `(route, N256 tile)`.  It has no route histogram or task
-queue and retains the same N256/K128 prepared weights and public API.  On the
-DSV4F TP2 shape this reduced cold-L2 CUDA-graph time from 95.7 to 88.1 us while
-preserving a 0.999936 cosine match to the reference.
+The DeepSeek V4.1 micro pipeline consumes the same planner-owned representation.
+Its FC1 projection zero-fills the unused half of an N64 boundary tile, activation
+materialization publishes a padded N128 operand with zero values and scale bytes,
+and FC2 reads only the exact K32 extent. Live route counts remain runtime launch
+arguments, so one prewarmed capacity plan serves multiple counts and CUDA graph
+replays without resolving another kernel.
+
+The earlier M=1 dynamic regime on the DSV4F TP2 shape reduced cold-L2
+CUDA-graph time from 95.7 to 88.1 us while preserving a 0.999936 cosine match
+to the reference.
 
 The standalone staged pipeline was removed after the unified kernel won every
 tested common DSV4 point on GPU 9 with `benchmark_moe.py`, CUDA graph replay,
@@ -306,7 +311,7 @@ the owner—not raw weight tensors—and execution takes only the completed bind
 | NVFP4 or W4A8-on-NVFP4 | source-native bytes with MMA views | keep the source allocation; derive runtime alphas |
 | W4A16 source-native | source-native bytes | transfer the source allocation into the expert owner |
 | W4A16 MMA-packed | packed MMA layout | repack the source allocation in place |
-| native W4A8-MX | N256/K128 QMMA weights plus SFB scales | repack weights and scales in place |
+| native W4A8-MX | N256/K128 QMMA weights, or exact N128-bulk/N64-tail weights, plus SFB scales | repack weights and scales in place |
 | source-native plus an incompatible model-sized repack, or two incompatible repacks | none | reject during planning |
 
 There is no runtime raw-weight overload, prepared-payload override, old cache-key
@@ -320,7 +325,7 @@ The code now has:
 1. one semantic/execution vocabulary;
 2. one rmem work-item interface in the dynamic kernel;
 3. compile-time queue, persistent-grid, and ready-queue acquisition policies;
-4. one native-W4A8 prepared representation consumed by unified dynamic;
+4. one native-W4A8 prepared representation consumed by dynamic and direct micro execution;
 5. phase-local scheduling where rectangular work justifies it;
 6. one planner-owned preparation and execution API with one weight owner.
 

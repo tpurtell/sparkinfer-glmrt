@@ -13,16 +13,16 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from contextlib import suppress
-from functools import lru_cache
-from statistics import median
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation.types import Plan, require_prepared
+
+from ._dma_kernels import DmaKernels
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
 
@@ -152,17 +152,10 @@ def _normalize_fp8_mode(value: str | None) -> str:
     raise ValueError(f"unrecognized PCIe DMA wire mode: {value!r}")
 
 
-@lru_cache(maxsize=1)
-def _load_kernels():
-    """Return the CuTe/Python transport primitives.
+def _load_kernels(ipc: CudaRTLibrary) -> DmaKernels:
+    """Construct an unprepared transport façade for this IPC channel."""
 
-    Importing the CuTe module stays lazy so the public comm package remains
-    importable in CPU-only tooling.
-    """
-
-    from ._dma_kernels import DmaKernels
-
-    return DmaKernels(CudaRTLibrary())
+    return DmaKernels(ipc)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -201,9 +194,9 @@ class PCIeDmaAllReduce:
         if self.device.type != "cuda":
             raise ValueError("PCIe ring allreduce requires a CUDA device")
         self.max_bytes = int(max_bytes)
-        self._kernels = _load_kernels()
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
+        self._kernels = _load_kernels(self._ipc)
         self._closed = False
         self._eager_replays: dict[
             torch.dtype,
@@ -261,6 +254,8 @@ class PCIeDmaAllReduce:
                 self.world_size * stride, dtype=torch.uint8, device=self.device
             )
             self._fp8_stage_stride = stride
+        self._pieces_override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
+        self._a2a_chunks_override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
         self.min_bytes = 0
         wire_modes = {
             "i8": "int8-ag",
@@ -274,67 +269,6 @@ class PCIeDmaAllReduce:
             self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
         )
         logger.debug("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
-        prepare = getattr(self._kernels, "prepare", None)
-        if prepare is not None:
-            prepare(world_size=self.world_size, wire_mode=self._fp8)
-        if logger.isEnabledFor(logging.DEBUG):
-            self._log_peer_copy_bandwidth()
-
-    def _log_peer_copy_bandwidth(self, iters: int = 20) -> None:
-        """One-time raw cudaMemcpyAsync bandwidth check, bypassing the ring
-        schedule and flag sync entirely, so a slow deployment environment
-        shows up here (bandwidth) rather than only in the full ring's
-        latency (which would also be sensitive to sync/launch overhead).
-
-        Every rank concurrently writes step 1 of its successor's scratch
-        from step 0 of its own; no rank's step 0 (read) or step 1 (write)
-        is touched by anyone else, so this measures true full-ring-style
-        concurrent peer bandwidth with no self-inflicted read/write race.
-        """
-
-        if self.world_size < 2 or 2 * (self.world_size - 1) < 2:
-            return
-        nxt = (self.rank + 1) % self.world_size
-        probe_bytes = min(self.shard_capacity, 4 << 20)
-        probe_bytes -= probe_bytes % 16
-        if probe_bytes <= 0:
-            return
-        stream = torch.cuda.Stream(device=self.device)
-        device_index = (
-            self.device.index
-            if self.device.index is not None
-            else torch.cuda.current_device()
-        )
-        dist.barrier(group=self.group, device_ids=[device_index])
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                self._kernels.dma_copy(
-                    self._scratch_ptr(nxt, 1),
-                    self._scratch_ptr(self.rank, 0),
-                    probe_bytes,
-                )
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record(stream)
-            for _ in range(iters):
-                self._kernels.dma_copy(
-                    self._scratch_ptr(nxt, 1),
-                    self._scratch_ptr(self.rank, 0),
-                    probe_bytes,
-                )
-            end.record(stream)
-        stream.synchronize()
-        ms = start.elapsed_time(end)
-        gbps = probe_bytes * iters / (ms * 1e-3) / 1e9
-        logger.debug(
-            "[PCIe DMA allreduce] rank %d -> %d raw peer copy: %.1f GB/s "
-            "(%d bytes x %d iters)",
-            self.rank,
-            nxt,
-            gbps,
-            probe_bytes,
-            iters,
-        )
 
     def _flag_ptr(self, rank: int, slot: int) -> int:
         return self._flags_base[rank] + slot * FLAG_STRIDE
@@ -345,9 +279,8 @@ class PCIeDmaAllReduce:
     def _scratch_ptr(self, rank: int, step: int) -> int:
         return self._scratch_base[rank] + step * self.shard_capacity
 
-    @staticmethod
-    def _pick_pieces(shard_elems: int, shard_bytes: int) -> int:
-        override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
+    def _pick_pieces(self, shard_elems: int, shard_bytes: int) -> int:
+        override = self._pieces_override
         # pieces=2 measured best at every size (deeper chunking pays an
         # extra wait+add launch chain per piece on the main stream).
         candidates = (override,) if 1 <= override <= MAX_PIECES else (2,)
@@ -432,24 +365,34 @@ class PCIeDmaAllReduce:
         self._eager_replays[dtype] = tuple(replays)
 
     def all_reduce(
-        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        with torch.cuda.device(self.device):
-            return self._all_reduce_on_device(inp, out=out)
+        """Run only the already-prepared fixed DMA channel."""
 
-    def _all_reduce_on_device(
-        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
+        state = require_prepared(plan, "comm.pcie", self.device)
+        if not hasattr(state, "require_runtime") or not hasattr(state, "run"):
+            raise TypeError("plan does not contain a prepared DMA channel")
+        state.require_runtime(self)
+        if out is None:
+            out = torch.empty_like(inp)
+        return state.run(inp, out=out)
+    def _run_prepared(
+        self, inp: torch.Tensor, *, out: Optional[torch.Tensor], state
     ) -> torch.Tensor:
+        state.require_runtime(self)
+        torch.cuda.set_device(self.device)
         if not self.should_allreduce(inp):
             raise ValueError(
                 "input does not satisfy ring allreduce requirements "
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
         if out is None:
-            # Preserve normal out-of-place collective semantics. Callers can
-            # retain this result while a later collective is in flight.
-            out = torch.empty_like(inp)
-        elif (
+            raise ValueError("prepared DMA all_reduce requires a caller-owned output tensor")
+        if (
             out.shape != inp.shape
             or out.dtype != inp.dtype
             or out.device != self.device
@@ -724,8 +667,51 @@ class PCIeDmaAllReduce:
         )
         return out
 
+    def _prime_prepared(self, state) -> None:
+        """Prime selected code using this channel's fixed IPC buffers only."""
+
+        state.require_runtime(self)
+        self._kernels.install(state.launchers)
+        with torch.cuda.device(self.device):
+            # Local probes must not overwrite an arriving peer flag or payload.
+            # The final slot is beyond both transport layouts for supported worlds.
+            slot = FLAG_SLOTS - 1
+            flag = self._flag_ptr(self.rank, slot)
+            self._kernels.dma_set_flag(flag, self._counter_ptr(self._send_counters, slot))
+            self._kernels.dma_wait_flag(flag, self._counter_ptr(self._wait_counters, slot))
+            scratch = flag + 16
+            self._kernels.dma_copy(scratch, scratch, 16)
+            for dtype_code, elems in ((0, 8), (1, 8), (2, 4)):
+                self._kernels.dma_add(scratch, scratch, scratch, elems, dtype_code)
+            if self._fp8:
+                if self._fp8_stage is None or self._fp8_stage.numel() < 512:
+                    raise RuntimeError("compressed DMA stage buffer is too small to prime")
+                codec = (
+                    "i8" if self._fp8.startswith("i8")
+                    else "mx" if self._fp8.startswith("mx") else "e4m3"
+                )
+                stage = self._fp8_stage.data_ptr()
+                source, payload, scales = stage, stage + 256, stage + 384
+                self._kernels._quant(codec, source, payload, scales, FP8_QUANT_BLOCK)
+                self._kernels._dequant_store(codec, source, payload, scales, FP8_QUANT_BLOCK)
+                self._kernels._dequant_add_quant(
+                    codec, source, source, payload, scales, payload, scales,
+                    FP8_QUANT_BLOCK, False,
+                )
+                self._kernels._dequant_add_quant(
+                    codec, source, source, payload, scales, payload, scales,
+                    FP8_QUANT_BLOCK, True,
+                )
+                if self._fp8 == "a2a" or self._fp8.endswith("a2a"):
+                    sources = [payload] * (self.world_size - 1)
+                    self._kernels._dequant_accum(
+                        codec, source, source, sources, [scales] * len(sources),
+                        FP8_QUANT_BLOCK,
+                    )
+            torch.cuda.current_stream(self.device).synchronize()
+
     def _pick_a2a_chunks(self, shard_elems: int) -> int:
-        override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
+        override = self._a2a_chunks_override
         candidates = (override,) if 1 <= override <= MAX_PIECES else (4, 3, 2)
         for chunks in candidates:
             if (
@@ -938,204 +924,4 @@ class PCIeDmaAllReduce:
         # teardown. Explicit/context-manager close owns coordinated release.
         return None
 
-
-def autotune_crossovers(
-    oneshot,
-    dma: Optional[PCIeDmaAllReduce],
-    nccl_group: ProcessGroup,
-    *,
-    hidden_size: int,
-    max_rows: int,
-    rms_norm_op=None,
-    epsilon: float = 1e-6,
-    warmup: int = 5,
-    iters: int = 50,
-    samples: int = 5,
-    win_margin: float = 0.02,
-) -> tuple[int, int]:
-    """Single sweep from 1 row to the prefill chunk size with the real
-    kernels: the oneshot channel (fused AR+RMSNorm when ``rms_norm_op`` is
-    given, plain otherwise), the CE ring, and NCCL (plus ``rms_norm_op``)
-    as the fallback. Returns (oneshot_max_bytes, dma_min_bytes) and sets
-    ``dma.min_bytes``. Each timing is the median of multiple CUDA-event
-    samples after MAX-reducing every sample across ranks. A backend must win
-    by ``win_margin`` and DMA must do so at two consecutive sizes before its
-    crossover is committed.
-    """
-
-    device = oneshot.device if oneshot is not None else dma.device
-    stream = torch.cuda.Stream(device=device)
-    dtype = torch.bfloat16
-    weight = torch.ones(hidden_size, dtype=dtype, device=device)
-    inf = float("inf")
-    oneshot_max = 0
-    dma_min = 0
-    if dma is not None:
-        original_dma_min = dma.min_bytes
-        dma.min_bytes = 0
-    wire = "bf16" if dma is None else dma.wire_mode
-    lines = [
-        f"[PCIe allreduce] Crossover sweep (dma wire={wire}, "
-        f"hidden={hidden_size}, fused={rms_norm_op is not None}):"
-    ]
-
-    def bench(build) -> float:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.stream(stream):
-            replay = build()
-        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
-            replay()
-        device_index = (
-            device.index if device.index is not None else torch.cuda.current_device()
-        )
-        dist.barrier(group=nccl_group, device_ids=[device_index])
-        with torch.cuda.stream(stream):
-            for _ in range(warmup):
-                graph.replay()
-        stream.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        rank_max = torch.empty((), dtype=torch.float64, device=device)
-        timings = []
-        for _ in range(samples):
-            dist.barrier(group=nccl_group, device_ids=[device_index])
-            with torch.cuda.stream(stream):
-                start.record(stream)
-                for _ in range(iters):
-                    graph.replay()
-                end.record(stream)
-            end.synchronize()
-            rank_max.fill_(start.elapsed_time(end) * 1e3 / iters)
-            dist.all_reduce(rank_max, op=dist.ReduceOp.MAX, group=nccl_group)
-            timings.append(float(rank_max.item()))
-        return float(median(timings))
-
-    try:
-        # Fully dense through 8 rows (the decode regime, where every row
-        # count occurs), quarter steps through 32-128 rows (where the
-        # NCCL/DMA boundary lives), and powers of two with midpoints
-        # elsewhere. The sweep stops once the DMA allreduce has won twice
-        # in a row: the curves are monotone above the boundary and the
-        # large probes are the expensive ones.
-        ladder = list(range(1, min(8, max_rows) + 1))
-        step = 8
-        while step <= max_rows:
-            if step not in ladder:
-                ladder.append(step)
-            if 32 <= step <= 64:
-                extra = (step + step // 4, step + step // 2, step + 3 * step // 4)
-            else:
-                extra = (step + step // 2,)
-            ladder.extend(rows for rows in extra if rows <= max_rows)
-            step *= 2
-        oneshot_losses = 0
-        dma_wins = 0
-        dma_candidate = 0
-        rank0 = dist.get_rank(group=nccl_group) == 0
-        if rank0:
-            logger.debug(lines[0])
-        for rows in ladder:
-            point_start = time.perf_counter()
-            shape = (rows, hidden_size)
-            size_bytes = rows * hidden_size * dtype.itemsize
-
-            def build_nccl():
-                inp = torch.randn(shape, dtype=dtype, device=device) * 0.01
-                residual = torch.randn(shape, dtype=dtype, device=device)
-                if rms_norm_op is None:
-                    return lambda: dist.all_reduce(inp, group=nccl_group)
-                return lambda: (
-                    dist.all_reduce(inp, group=nccl_group),
-                    rms_norm_op(inp, residual, weight, epsilon),
-                )
-
-            nccl_us = bench(build_nccl)
-
-            # Stop probing the oneshot after it has clearly lost (its curve
-            # is monotone against NCCL); a probe the kernel refuses (row or
-            # capacity limits) counts as a loss. Every rank takes the same
-            # branch because verdicts come from MAX-reduced timings.
-            oneshot_us = inf
-            if (
-                oneshot is not None
-                and oneshot_losses < 2
-                and size_bytes <= oneshot.max_size
-            ):
-
-                def build_oneshot():
-                    inp = torch.randn(shape, dtype=dtype, device=device) * 0.01
-                    residual = torch.randn(shape, dtype=dtype, device=device)
-                    out = torch.empty_like(inp)
-                    residual_out = torch.empty_like(inp)
-                    if rms_norm_op is None:
-                        return lambda: oneshot.all_reduce(inp, out=out)
-                    return lambda: oneshot.all_reduce_fused_add_rms_norm(
-                        inp,
-                        residual,
-                        weight,
-                        epsilon,
-                        out=out,
-                        residual_out=residual_out,
-                    )
-
-                try:
-                    oneshot_us = bench(build_oneshot)
-                except Exception:
-                    oneshot_us = inf
-
-            dma_us = inf
-            probe = torch.empty(shape, dtype=dtype, device=device)
-            if dma is not None and dma.should_allreduce(probe):
-
-                def build_dma():
-                    inp = torch.randn(shape, dtype=dtype, device=device) * 0.01
-                    out = torch.empty_like(inp)
-                    return lambda: dma.all_reduce(inp, out=out)
-
-                dma_us = bench(build_dma)
-            del probe
-
-            stats = torch.tensor(
-                [nccl_us, oneshot_us, dma_us], dtype=torch.float64, device=device
-            )
-            dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=nccl_group)
-            nccl_us, oneshot_us, dma_us = (float(v) for v in stats.tolist())
-            oneshot_limit = (1.0 + win_margin) * min(nccl_us, dma_us)
-            if oneshot_us < oneshot_limit:
-                oneshot_max = size_bytes
-                oneshot_losses = 0
-            else:
-                oneshot_losses += 1
-            dma_limit = (1.0 - win_margin) * min(nccl_us, oneshot_us)
-            if dma_us < dma_limit:
-                if dma_wins == 0:
-                    dma_candidate = size_bytes
-                dma_wins += 1
-            else:
-                dma_wins = 0
-                dma_candidate = 0
-            line = (
-                f"  rows={rows:5d} ({size_bytes >> 10:6d}KB): "
-                f"oneshot {oneshot_us:9.1f}  dma {dma_us:9.1f}  "
-                f"nccl {nccl_us:9.1f} us"
-                f"  [{time.perf_counter() - point_start:.2f}s]"
-            )
-            lines.append(line)
-            if rank0:
-                logger.debug(line)
-            if dma_wins >= 2:
-                dma_min = dma_candidate
-                break
-    except Exception:
-        if dma is not None:
-            dma.min_bytes = original_dma_min
-        raise
-
-    if dma is not None:
-        dma.min_bytes = dma_min if dma_min > 0 else dma.max_bytes + 1
-    if dist.get_rank(group=nccl_group) == 0:
-        logger.debug("  oneshot_max_bytes=%d dma_min_bytes=%d", oneshot_max, dma_min)
-    return oneshot_max, dma_min
-
-
-__all__ = ["PCIeDmaAllReduce", "autotune_crossovers"]
+__all__ = ["PCIeDmaAllReduce"]

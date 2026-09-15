@@ -84,6 +84,8 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         separate_w13_halves: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
+        w4a8_n64_repacked: bool = False,
+        w4a8_n64_tail: bool = False,
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         direct_routing: bool = False,
@@ -95,7 +97,6 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         swiglu_beta: float | None = None,
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
-        numerical_recipe: str = "default",
     ):
         super().__init__(
             sf_vec_size,
@@ -110,6 +111,8 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             separate_w13_halves=separate_w13_halves,
             quant_recipe=quant_recipe,
             w4a8_repacked=w4a8_repacked,
+            w4a8_n64_repacked=w4a8_n64_repacked,
+            w4a8_n64_tail=w4a8_n64_tail,
             trellis_bits=trellis_bits,
             trellis_coupled=trellis_coupled,
             direct_routing=direct_routing,
@@ -121,7 +124,6 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             swiglu_beta=swiglu_beta,
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
-            numerical_recipe=numerical_recipe,
         )
 
 

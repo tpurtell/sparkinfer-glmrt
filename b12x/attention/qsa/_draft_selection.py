@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from b12x._lib.compile_plan import launch_triton as _launch_triton
 import triton
 import triton.language as tl
 
@@ -23,16 +24,14 @@ def validate_buffers(mutable: list[torch.Tensor], inputs: list[torch.Tensor]) ->
 
 
 @validate_buffers.register_fake
-def _validate_fake(mutable, inputs) -> None:
+def _validate_fake(mutable: list[torch.Tensor], inputs: list[torch.Tensor]) -> None:
     return None
 
 
 @triton.jit(do_not_specialize=["rows", "enabled"])
 def _record_kernel(
     positions,
-    errors,
     saved_positions,
-    saved_errors,
     saved_rows,
     selection,
     saved_selection,
@@ -45,7 +44,6 @@ def _record_kernel(
     column = tl.arange(0, BLOCK)
     active = (row < rows) & (enabled != 0)
     tl.store(saved_positions + row, tl.load(positions + row, active, other=-1), active)
-    tl.store(saved_errors + row, tl.load(errors + row, active, other=0), active)
     offset = row * tl.full((), WIDTH, tl.int64) + column
     value = tl.load(selection + offset, active & (column < WIDTH), other=-1)
     tl.store(saved_selection + offset, value, active & (column < WIDTH))
@@ -63,7 +61,7 @@ def reset_anchors(storage: torch.Tensor, count_offset: int) -> None:
 
 
 @reset_anchors.register_fake
-def _reset_fake(storage, count_offset) -> None:
+def _reset_fake(storage: torch.Tensor, count_offset: int) -> None:
     return None
 
 
@@ -73,28 +71,23 @@ def _reset_fake(storage, count_offset) -> None:
 )
 def record_anchors(
     positions: torch.Tensor,
-    scratch: torch.Tensor,
-    errors_offset: int,
     selection: torch.Tensor,
     storage: torch.Tensor,
     source_capacity: int,
     width: int,
     enabled: bool,
 ) -> None:
-    from ._contract import DraftSelectionPlan, _scratch_view
+    from ._contract import DraftSelectionPlan
 
     state = DraftSelectionPlan(storage.device, source_capacity, width).bind(
         storage=storage
     )
     rows = int(positions.shape[0])
-    errors = _scratch_view(
-        scratch, offset_bytes=errors_offset, shape=(rows,), dtype=torch.int32
-    )
-    _record_kernel[(rows,)](
+    _launch_triton(
+        _record_kernel,
+        (rows,),
         positions,
-        errors,
         state.logical_positions,
-        state.errors,
         state.num_source_rows,
         selection,
         state.selected_positions,
@@ -107,14 +100,12 @@ def record_anchors(
 
 @record_anchors.register_fake
 def _record_fake(
-    positions,
-    scratch,
-    errors_offset,
-    selection,
-    storage,
-    source_capacity,
-    width,
-    enabled,
+    positions: torch.Tensor,
+    selection: torch.Tensor,
+    storage: torch.Tensor,
+    source_capacity: int,
+    width: int,
+    enabled: bool,
 ) -> None:
     return None
 
@@ -122,14 +113,12 @@ def _record_fake(
 @triton.jit(do_not_specialize=["rows", "source_capacity", "max_requests"])
 def _prepare_kernel(
     source_positions,
-    source_errors,
     source_selection,
     source_rows,
     num_source_rows,
     request_ids,
     query_positions,
     selected,
-    errors,
     rows,
     source_capacity,
     max_requests,
@@ -140,8 +129,7 @@ def _prepare_kernel(
     row = tl.program_id(0).to(tl.int64)
     column = tl.arange(0, BLOCK)
     request = tl.load(request_ids + row, row < rows, other=-1).to(tl.int64)
-    active = request >= 0
-    mapped = active & (request < max_requests)
+    mapped = (request >= 0) & (request < max_requests)
     source = tl.load(source_rows + request, mapped, other=-1).to(tl.int64)
     source_valid = (
         mapped
@@ -150,7 +138,6 @@ def _prepare_kernel(
         & (source < tl.load(num_source_rows))
     )
     anchor = tl.load(source_positions + source, source_valid, other=-1)
-    source_error = tl.load(source_errors + source, source_valid, other=1)
     position = tl.load(query_positions + row, row < rows, other=-1)
     start = anchor + 1
     valid = (
@@ -170,7 +157,6 @@ def _prepare_kernel(
         value,
         column < WIDTH + TAIL,
     )
-    tl.store(errors + row, tl.where(active, source_error | tl.where(valid, 0, 1), 0))
 
 
 @torch.library.custom_op("b12x::qsa_prepare_draft_selection", mutates_args=("scratch",))
@@ -183,7 +169,6 @@ def prepare_selection(
     query_positions: torch.Tensor,
     scratch: torch.Tensor,
     selected_offset: int,
-    errors_offset: int,
     max_requests: int,
     tail: int,
 ) -> None:
@@ -198,23 +183,17 @@ def prepare_selection(
         shape=(max_requests, width + tail),
         dtype=torch.int32,
     )
-    errors = _scratch_view(
-        scratch,
-        offset_bytes=errors_offset,
-        shape=(max_requests,),
-        dtype=torch.int32,
-    )
     rows = int(query_positions.shape[0])
-    _prepare_kernel[(rows,)](
+    _launch_triton(
+        _prepare_kernel,
+        (rows,),
         state.logical_positions,
-        state.errors,
         state.selected_positions,
         source_rows,
         state.num_source_rows,
         request_ids,
         query_positions,
         selected,
-        errors,
         rows,
         source_capacity,
         max_requests,
@@ -227,16 +206,15 @@ def prepare_selection(
 
 @prepare_selection.register_fake
 def _prepare_fake(
-    storage,
-    source_capacity,
-    width,
-    source_rows,
-    request_ids,
-    query_positions,
-    scratch,
-    selected_offset,
-    errors_offset,
-    max_requests,
-    tail,
+    storage: torch.Tensor,
+    source_capacity: int,
+    width: int,
+    source_rows: torch.Tensor,
+    request_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    scratch: torch.Tensor,
+    selected_offset: int,
+    max_requests: int,
+    tail: int,
 ) -> None:
     return None

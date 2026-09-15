@@ -11,14 +11,14 @@ from b12x._lib.scratch import scratch_buffer_spec
 from b12x._lib.scratch_layout import SCRATCH_ALIGN_BYTES, align_up, materialize_scratch_view
 
 if TYPE_CHECKING:
-    from ._impl import Binding, Plan
+    from ._impl import Binding, _Layout
 
 
 @dataclass(frozen=True)
 class ParallelPlan:
     """All segment summaries and incoming states are capacity-sized scratch."""
 
-    segment_plan: Plan
+    segment_plan: _Layout
     segment_tokens: int
     max_segments: int
     reuse_outputs: bool
@@ -27,7 +27,7 @@ class ParallelPlan:
 
 @dataclass(frozen=True)
 class ParallelBinding:
-    plan: ParallelPlan
+    _state: ParallelPlan
     transfer: Binding
     local_state: Binding
     output: Binding
@@ -37,18 +37,17 @@ class ParallelBinding:
     transfer_flags: torch.Tensor
 
 
-def materialize(plan: Plan, *, segment_tokens: int) -> Plan:
-    from ._impl import _materialize_plan
+def materialize(plan: _Layout, *, segment_tokens: int) -> _Layout:
+    from .._shared.delta_prefill.contract import materialize_layout
 
     caps = plan.caps
     segments = (caps.max_tokens + segment_tokens - 1) // segment_tokens + caps.max_seqs
     reuse_outputs = plan.k_split == 1
     slots = 2 + (4 if reuse_outputs else 3) * segments + caps.max_seqs
-    inner_caps = replace(caps, max_seqs=segments, max_state_slots=slots,
-                         null_state_index=0, metadata_validation="trusted")
-    inner = _materialize_plan(
-        inner_caps, v_split=plan.v_split, k_split=plan.k_split, stages=plan.stages,
-        window_tiles=inner_caps.tiles_capacity, policy_resolution=None, workspace_windows=1,
+    inner_caps = replace(caps, max_seqs=segments, max_state_slots=slots, null_state_index=0)
+    inner = materialize_layout(
+        inner_caps, layout_type=type(plan), v_split=plan.v_split, k_split=plan.k_split, stages=plan.stages,
+        window_tiles=inner_caps.tiles_capacity, workspace_windows=1,
         max_sequence_tiles=segment_tokens // 16,
     )
     regions = {}
@@ -84,9 +83,9 @@ def materialize(plan: Plan, *, segment_tokens: int) -> Plan:
 
 
 def bind(binding: Binding) -> ParallelBinding:
-    from ._impl import bind as bind_segment
+    from ._impl import _bind as bind_segment
 
-    plan = binding.plan.parallel
+    plan = binding._state.parallel
     assert plan is not None
     views = {name: materialize_scratch_view(binding.scratch, offset_bytes=offset,
                                            shape=shape, dtype=dtype)[0]
@@ -116,7 +115,7 @@ def bind(binding: Binding) -> ParallelBinding:
                            views["packed_transfer"], views["transfer_flags"])
 
 
-def prewarm(binding: Binding) -> None:
+def compile_binding(binding: Binding) -> tuple:
     from .._shared.delta_prefill._cute_kernels import (
         _compile_prepare, _compile_prologue, _compile_recurrence,
     )
@@ -124,31 +123,28 @@ def prewarm(binding: Binding) -> None:
 
     parallel = binding.parallel
     assert parallel is not None
-    _compile_prologue(binding)
-    _compile_prologue(parallel.output)
-    _compile_prepare(parallel.output)
-    _compile_recurrence(parallel.transfer, 2)
-    _compile_recurrence(parallel.local_state, 4 if parallel.plan.reuse_outputs else 1)
-    _compile_recurrence(parallel.output, 5 if parallel.plan.reuse_outputs else 0)
-    compile_auxiliary(binding)
-
-
-def run(binding: Binding, *, scale: float, eps: float) -> None:
-    from .._shared.delta_prefill._cute_kernels import (
-        _compile_recurrence, run_prepare, run_prologue,
+    return (
+        _compile_prologue(binding)[1],
+        _compile_prologue(parallel.output)[1],
+        _compile_prepare(parallel.output)[1],
+        _compile_recurrence(parallel.transfer, 2)[1],
+        _compile_recurrence(parallel.local_state, 4 if parallel._state.reuse_outputs else 1)[1],
+        _compile_recurrence(parallel.output, 5 if parallel._state.reuse_outputs else 0)[1],
+        compile_auxiliary(binding),
     )
-    from ._parallel_kernels import compile_auxiliary
 
+
+
+
+def run(binding: Binding, *, programs: tuple, scale: float, eps: float) -> None:
     parallel = binding.parallel
-    assert parallel is not None
-    auxiliary = compile_auxiliary(binding)
-    transfer = _compile_recurrence(parallel.transfer, 2)[1]
-    local = _compile_recurrence(parallel.local_state, 4 if parallel.plan.reuse_outputs else 1)[1]
-    output = _compile_recurrence(parallel.output, 5 if parallel.plan.reuse_outputs else 0)[1]
-    run_prologue(binding)
+    if parallel is None:
+        raise TypeError("parallel prefill requires a segment binding")
+    prologue, segment_prologue, prepare, transfer, local, output, auxiliary = programs
+    prologue(binding)
     auxiliary.partition(binding)
-    run_prologue(parallel.output)
-    run_prepare(parallel.output, lower_bound=0.0, scale=scale, eps=eps)
+    segment_prologue(parallel.output)
+    prepare(parallel.output, scale, 0.0, eps, 0)
     transfer(parallel.transfer, 0)
     local(parallel.local_state, 0)
     auxiliary.pack_transfer(binding)

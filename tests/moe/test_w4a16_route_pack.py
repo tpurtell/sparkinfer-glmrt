@@ -171,6 +171,36 @@ def test_route_pack_reuses_provided_fixed_capacity_for_prefill_tail() -> None:
             assert bool(torch.all(expected_ids[block_payload] == expert).item())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("capacity", (128, 8192))
+@pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
+def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(capacity, ids_dtype):
+    launches = route_pack_module.compile_w4a16_route_pack_launches(
+        tokens=capacity, topk=2, block_size=8, num_experts=32,
+        ordinal=torch.cuda.current_device(),
+    )
+    buffers = dict(
+        packed_route_indices=torch.empty(launches.max_packed_routes, dtype=torch.int32, device="cuda"),
+        block_expert_ids=torch.empty(launches.max_route_blocks, dtype=torch.int32, device="cuda"),
+        packed_route_count=torch.empty(1, dtype=torch.int32, device="cuda"),
+        expert_offsets=torch.empty(33, dtype=torch.int32, device="cuda"),
+        expert_counts=torch.empty(32, dtype=torch.int32, device="cuda"),
+    )
+    ids = torch.arange(capacity * 2, dtype=ids_dtype, device="cuda").remainder_(32).reshape(capacity, 2)
+    for rows in (1, 3, 17, capacity):
+        routes, blocks, count = route_pack_module.pack_topk_routes_by_expert(
+            ids[:rows], 8, 32, launches=launches, **buffers,
+        )
+        _, valid, expected_count, expected_blocks = _expected_route_pack(ids[:rows], 8, 32)
+        torch.testing.assert_close(count.cpu(), expected_count, rtol=0, atol=0)
+        torch.testing.assert_close(blocks[:len(expected_blocks)].cpu(), expected_blocks, rtol=0, atol=0)
+        assert (blocks[len(expected_blocks):] == -1).all()
+        payload = routes[routes < rows * 2].cpu().to(torch.int64)
+        torch.testing.assert_close(payload.sort().values, torch.arange(int(valid.sum())), rtol=0, atol=0)
+        assert routes.data_ptr() == buffers["packed_route_indices"].data_ptr()
+        assert routes.numel() == launches.max_packed_routes
+
+
 def test_small_prefix_reuses_fixed_arena_numel_capacity(monkeypatch) -> None:
     """Fixed small-prefix arenas must not specialize on each live tail."""
 

@@ -104,11 +104,10 @@ token offset. A null initial slot means zero state. Null output slots suppress
 stores; a sequence spanning workspace windows requires a non-null final slot
 to retain intermediate state. Empty sequences copy initial to final state.
 
-Transactional metadata validation detects conflicting slot ownership,
-malformed sequence intervals/counts, invalid slots, and invalid checkpoints.
-An invalid invocation poisons live output and preserves the state pool; callers
-inspect `binding.error_code`. Trusted validation mode requires valid metadata.
-Mutable output, scratch, and state must not overlap each other or read-only
+Packed metadata is not checked on the device. The caller supplies in-range
+sequence intervals and counts, slots inside the pool with one writer per slot,
+and chunk-aligned checkpoint offsets; the kernels only skip null slots and
+rows beyond the live counts. Mutable output, scratch, and state must not overlap each other or read-only
 inputs. Pooled offsets multiply slot indices in int64.
 
 ## Qualification and performance evidence
@@ -116,7 +115,7 @@ inputs. Pooled offsets multiply slot indices in int64.
 `tests/sequence/test_gdn_prefill.py` covers the sequential oracle, strong decay
 without cumulative-subtraction cancellation, chunk boundaries, 32K-token
 sequences, packed views, checkpoint/null/in-place slots, device metadata replay,
-frozen kernel resolution, poisoning, input immutability, decode continuation,
+frozen kernel resolution, input immutability, decode continuation,
 and state offsets beyond the signed int32 boundary. CPU checks alone do not
 qualify the production GPU path. The large-slot test needs slightly more than
 8 GiB of free device memory for a mostly uninitialized FP32 pool.

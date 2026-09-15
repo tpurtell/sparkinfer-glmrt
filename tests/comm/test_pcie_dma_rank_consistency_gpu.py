@@ -22,7 +22,13 @@ import socket
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
+
+from b12x.comm.pcie._dma_preparation import (
+    plan as dma_plan,
+    prepared_call,
+    query_from_runtime,
+)
+from b12x.preparation import PreparationSession
 
 
 def free_port() -> int:
@@ -77,31 +83,36 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
     from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
 
     ring = PCIeDmaAllReduce(
-        exchange_group=dist.group.WORLD,
-        device=device,
-        max_bytes=512 * 6144 * 2,
-        fp8=mode,
+        exchange_group=dist.group.WORLD, device=device, max_bytes=512 * 6144 * 2, fp8=mode
     )
+    session = PreparationSession(device=device, autotune=False)
+    result = None
     try:
+        query = query_from_runtime(ring, surface="DmaAllReduce.all_reduce", call={})
+        prime_inp = torch.zeros(world * 128, dtype=torch.bfloat16, device=device)
+        prime_out = torch.empty_like(prime_inp)
+        declaration = dma_plan(query, runtime=ring)
+        request = declaration.request(
+            name="dma",
+            prepare_call=lambda state: prepared_call(
+                state, inp=prime_inp, out=prime_out
+            ),
+        )
+        result = session.prepare((request,))
+        plan = declaration
         inp = make_input(rank, device)
         reference = inp.float()
         dist.all_reduce(reference)
-        output = ring.all_reduce(inp)
+        output = torch.empty_like(inp)
+        ring.all_reduce(inp, plan=plan, out=output)
         torch.cuda.synchronize(device)
-        assert_output(
-            output,
-            reference,
-            rank=rank,
-            world=world,
-            mode=mode,
-            label="eager",
-        )
+        assert_output(output, reference, rank=rank, world=world, mode=mode, label="eager")
 
         graph_input = make_input(rank, device, 1)
         graph_output = torch.empty_like(graph_input)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            ring.all_reduce(graph_input, out=graph_output)
+        with session.capture(), torch.cuda.graph(graph):
+            ring.all_reduce(graph_input, plan=plan, out=graph_output)
         for iteration in range(2, 5):
             graph_input.copy_(make_input(rank, device, iteration))
             graph_reference = graph_input.float()
@@ -109,21 +120,14 @@ def worker(rank: int, world: int, port: int, mode: str) -> None:
             graph.replay()
             torch.cuda.synchronize(device)
             assert_output(
-                graph_output,
-                graph_reference,
-                rank=rank,
-                world=world,
-                mode=mode,
+                graph_output, graph_reference, rank=rank, world=world, mode=mode,
                 label=f"graph-replay-{iteration}",
             )
-
         dist.barrier()
-        if rank == 0:
-            print(
-                f"PASS mode={mode} world={world}: eager and graph-replay "
-                "outputs bit-identical"
-            )
     finally:
+        if result is not None:
+            result.close()
+        session.close()
         ring.close()
         dist.destroy_process_group()
 

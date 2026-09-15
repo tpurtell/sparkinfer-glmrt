@@ -9,17 +9,17 @@ from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
     name="embedding", group="sequence", api_style="oneshot",
-    entry_points=("run", "precompile", "is_supported", "clear_caches"),
+    entry_points=("plan", "query_from_call", "run", "is_supported", "clear_caches", "EmbeddingQuery"),
     dtypes=("bfloat16", "float32", "int32", "int64"),
     provenance=Provenance(
         repo="https://github.com/phaelon74/b12x",
         commit="75ffee6375b0577ce2c8d6931ffacefda3ecbdd6",
         paths=("b12x/_lib/compiler.py", "b12x/_lib/utils.py")),
-    notes="New unquantized gather; provenance names the reused compiler/runtime scaffold.",
+    notes="Prepared unquantized gather with runtime row IDs and optional device live count.",
     test_path="tests/sequence/test_embedding.py",
 )
 
 if TYPE_CHECKING:
-    from .api import clear_caches, is_supported, precompile, run
+    from .api import EmbeddingQuery, clear_caches, is_supported, plan, query_from_call, run
 
 install_lazy_api(globals(), META)

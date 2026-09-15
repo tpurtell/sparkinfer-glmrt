@@ -80,7 +80,7 @@ def main():
         table = table.expand(rows, -1).contiguous()
         output = torch.empty((rows, groups), device="cuda")
         metadata = [
-            torch.zeros(rows, device="cuda", dtype=torch.int32) for _ in range(3)
+            torch.zeros(rows, device="cuda", dtype=torch.int32) for _ in range(2)
         ]
         kwargs = dict(
             prepared_query=query,
@@ -89,10 +89,9 @@ def main():
             sequence_lengths=lengths,
             compressed_cache=cache,
             compressed_block_table=table,
-            state_errors=metadata[0],
             scores=output,
-            eligible_counts=metadata[1],
-            merge_lengths=metadata[2],
+            eligible_counts=metadata[0],
+            merge_lengths=metadata[1],
             group_offset=0,
             group_count=groups,
             caps=caps,
@@ -103,7 +102,6 @@ def main():
             expected = output.clone()
             cute_score(**kwargs)
             torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-            assert not metadata[0].any()
             graphs = {}
             for name, launch in (("triton", triton_score), ("cute", cute_score)):
 

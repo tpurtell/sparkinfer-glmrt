@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.attention.dsa_indexer._impl import (
     IndexerContiguousMetadata,
     IndexerPagedDecodeMetadata,
@@ -647,13 +647,10 @@ def test_msa_contiguous_block_scores_graph_replay_tracks_live_weights() -> None:
     torch.cuda.synchronize(device)
     warm_compile_misses = compile_cache_info()["compile_misses"]
 
-    freeze_kernel_resolution("MSA contiguous graph replay must use the warmed kernel")
-    try:
+    with kernel_resolution_guard('MSA contiguous graph replay must use the warmed kernel'):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured_out = run_staged()
-    finally:
-        unfreeze_kernel_resolution()
 
     assert captured_out.data_ptr() == block_scores.data_ptr()
     graph.replay()

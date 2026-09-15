@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Production-plan NVFP4 split/monolithic CUDA-graph A/B receipt.
 
-Each arm plans, prewarms, binds caller-owned fixed scratch and captures one
-fused_moe.run under its explicit split setting. Only graph.replay is timed;
+Each arm declares and prepares a plan, binds caller-owned fixed scratch and
+captures one fused_moe.run with its explicit materialization configuration. Only graph.replay is timed;
 production chooses the backend, tile and active-cluster count. Unengaged or
 incorrect cases have no qualified timing. Synthetic data is not serving evidence.
 """
@@ -10,8 +10,8 @@ incorrect cases have no qualified timing. Synthetic data is not serving evidence
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-from dataclasses import asdict, fields
+from contextlib import ExitStack
+from dataclasses import asdict, fields, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -30,7 +30,9 @@ import torch
 
 from benchmarks.common import nvidia_smi_gpu_mode_snapshot
 from b12x.moe import fused_moe
-from b12x.moe.fused_moe import _impl
+from b12x.moe.fused_moe._tuning import TUNING, _nvfp4_materialization_eligible
+from b12x.preparation import PreparationSession, PreparedCall
+from b12x.preparation.types import require_prepared
 from b12x.moe._shared.kernels.reference import compare_to_reference, moe_reference_nvfp4
 from tests.moe.test_nvfp4_phase_kernels import (
     _bf16_output_bound,
@@ -38,7 +40,6 @@ from tests.moe.test_nvfp4_phase_kernels import (
     _swizzle_scale_plane,
 )
 
-SPLIT_ENV = "B12X_NVFP4_DYNAMIC_MATERIALIZED"
 RATIO_DIRECTION = "monolithic_us / split_us (>1.0 means split is faster)"
 
 
@@ -71,80 +72,6 @@ def _package_versions() -> dict[str, str | None]:
         "cuda": torch.version.cuda,
         "nvidia-cutlass-dsl": getattr(cutlass, "__version__", None),
     }
-
-
-@contextmanager
-def _split_setting(enabled: bool):
-    """Scope both the environment and its import-time cache to one arm."""
-    previous = os.environ.get(SPLIT_ENV)
-    cache_names = (
-        "_NVFP4_MATERIALIZED_ENV_RAW",
-        "_NVFP4_MATERIALIZED_ENV_EXPLICIT",
-        "_NVFP4_MATERIALIZED_ENV_IS_TRUE",
-    )
-    cached = {name: getattr(_impl, name) for name in cache_names}
-    try:
-        os.environ[SPLIT_ENV] = "1" if enabled else "0"
-        _impl._nvfp4_materialized_env_refresh()
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(SPLIT_ENV, None)
-        else:
-            os.environ[SPLIT_ENV] = previous
-        for name, value in cached.items():
-            setattr(_impl, name, value)
-
-
-@contextmanager
-def _observe_production_launches(compiled_identities):
-    """Observe, never replace, production compilation and launch resolution.
-
-    Associate the actual compiler result with its actual backend object. At
-    capture, record the same compiled object returned to the real launch site.
-    A cache entry whose construction was not observed cannot qualify a case.
-    Neither wrapper changes arguments, results, policy or launch geometry.
-    """
-    compile_original = _impl.b12x_compile
-    resolve_original = _impl._get_dynamic_kernel
-    calls = []
-
-    def observe_compile(launch, *args, **kwargs):
-        compiled = compile_original(launch, *args, **kwargs)
-        kernel = getattr(launch, "_kernel", None)
-        if kernel is not None and hasattr(kernel, "nvfp4_split_materialized"):
-            identity = {
-                "adapter": type(launch).__name__,
-                "backend_class": type(kernel).__name__,
-                "nvfp4_split_materialized": bool(kernel.nvfp4_split_materialized),
-                "mma_tiler_mn": list(kernel.tile_shape_mnk[:2]),
-                "share_input_across_experts": bool(kernel.share_input_across_experts),
-                "dynamic_down_scale": bool(kernel.dynamic_down_scale),
-                "swap_ab": bool(kernel.swap_ab),
-                "deterministic_output": bool(kernel.deterministic_output),
-                "compile_spec": repr(kwargs.get("compile_spec")),
-            }
-            compiled_identities[id(compiled)] = (compiled, identity)
-        return compiled
-
-    def observe_resolve(*args, **kwargs):
-        compiled, mac = resolve_original(*args, **kwargs)
-        observed = compiled_identities.get(id(compiled))
-        calls.append({
-            "compiled_identity_observed": observed is not None,
-            "compiled_object_id": id(compiled),
-            "max_active_clusters": int(mac),
-            **(observed[1] if observed is not None else {}),
-        })
-        return compiled, mac
-
-    _impl.b12x_compile = observe_compile
-    _impl._get_dynamic_kernel = observe_resolve
-    try:
-        yield calls
-    finally:
-        _impl.b12x_compile = compile_original
-        _impl._get_dynamic_kernel = resolve_original
 
 
 def _build_inputs(*, E: int, K: int, n: int, M: int, top_k: int, seed: int):
@@ -197,58 +124,49 @@ def _build_inputs(*, E: int, K: int, n: int, M: int, top_k: int, seed: int):
     return x, ids, route_weights, experts, oracle
 
 
-def _build_arm(*, name, x, ids, route_weights, experts, calls, fast_math):
-    with _split_setting(name == "split"):
-        plan = fused_moe.plan_execution(
-            experts=experts,
-            capacity=fused_moe.ExecutionCapacity(
-                max_tokens=x.shape[0], top_k=ids.shape[1],
-                warmup_token_counts=(x.shape[0],),
-            ),
-        )
-        fused_moe.prewarm(plan)
-        scratch = {
-            spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-            for spec in plan.scratch_specs()
-        }
+def _build_arm(*, session, name, x, ids, route_weights, experts, fast_math):
+    capacity = fused_moe.ExecutionCapacity(max_tokens=x.shape[0], top_k=ids.shape[1])
+    declaration = fused_moe.plan_execution(
+        experts=experts, capacity=capacity, invocation={"fast_math": fast_math},
+    )
+    config = TUNING.configure(declaration.query, device=session.device.identity).default
+    config = replace(config, nvfp4_materialize_intermediate=(
+        name == "split" and _nvfp4_materialization_eligible(declaration.query, config)
+    ))
+    plan = fused_moe.plan_execution(
+        experts=experts, capacity=capacity, invocation={"fast_math": fast_math}, override=config,
+    )
+
+    def prime(state):
+        scratch = {spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=x.device)
+                   for spec in state.scratch.scratch_specs()}
         output = torch.empty_like(x)
-        binding = fused_moe.bind(
-            plan, scratch=scratch, a=x, experts=experts,
-            topk_ids=ids, topk_weights=route_weights, output=output,
-            input_scales_static=True, fast_math=fast_math,
-        )
-        # Warm lazy launch state on a side stream before capture.
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                fused_moe.run(binding=binding)
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-        capture_begin = len(calls)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            fused_moe.run(binding=binding)
-        torch.cuda.synchronize()
-        captured = calls[capture_begin:]
-        identity = {
-            "name": name,
-            "split_environment": {SPLIT_ENV: os.environ[SPLIT_ENV]},
-            "path": "fused_moe.plan_execution/prewarm/bind/run -> CUDA graph replay",
-            "activation_mode": "a4", "quant_mode": binding.quant_mode,
-            "input_scale": "shared scalar 1.0", "input_scales_static": True,
-            "fast_math": fast_math,
-            "capacity": asdict(plan.capacity),
-            "bound_policy": asdict(binding.execution_plan.policy_resolution.config),
-            "scratch_bytes": sum(t.numel() * t.element_size() for t in scratch.values()),
-            "capture_dynamic_launches": captured,
-            "split_engaged": bool(captured) and all(
-                c.get("compiled_identity_observed") and c.get("nvfp4_split_materialized")
-                for c in captured
-            ),
-        }
-    return {"graph": graph, "output": output, "binding": binding,
-            "plan": plan, "scratch": scratch, "identity": identity}
+        binding = state.bind(scratch=scratch, a=x, topk_ids=ids,
+                             topk_weights=route_weights, output=output, input_scales_static=True)
+        return PreparedCall(run=lambda: state.run(binding), output=output, owners=(scratch, binding))
+
+    session.prepare((plan.request(name=name, prepare_call=prime),))
+    scratch = {spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+               for spec in plan.scratch_specs()}
+    output = torch.empty_like(x)
+    binding = fused_moe.bind(
+        plan, scratch=scratch, a=x, experts=experts, topk_ids=ids,
+        topk_weights=route_weights, output=output, input_scales_static=True,
+    )
+    state = require_prepared(plan, "moe.decode")
+    identity = {
+        "name": name,
+        "path": "fused_moe.plan_execution -> PreparationSession.prepare -> bind/run -> CUDA graph replay",
+        "activation_mode": "a4", "quant_mode": binding.quant_mode,
+        "input_scale": "shared scalar 1.0", "input_scales_static": True,
+        "fast_math": fast_math, "capacity": asdict(capacity),
+        "prepared_config": asdict(state.config),
+        "execution": asdict(state.scratch.launch_plan.execution),
+        "scratch_bytes": sum(t.numel() * t.element_size() for t in scratch.values()),
+        "split_engaged": state.config.nvfp4_materialize_intermediate,
+    }
+    return {"output": output, "binding": binding, "plan": plan,
+            "scratch": scratch, "identity": identity}
 
 
 def _addresses(arms):
@@ -256,7 +174,7 @@ def _addresses(arms):
     for name, arm in arms.items():
         tensors = {f"scratch.{key}": value for key, value in arm["scratch"].items()}
         for owner_name, owner in (("binding", arm["binding"]),
-                                  ("experts", arm["plan"].experts._impl)):
+                                  ("experts", arm["binding"].experts)):
             tensors.update({
                 f"{owner_name}.{field.name}": value
                 for field in fields(owner)
@@ -443,82 +361,95 @@ def _gpu_mode_check(
     return result
 
 
-def _run_case(case, args, compiled_identities, initial_snapshot):
+def _run_case(case, args, initial_snapshot):
     x, ids, route_weights, experts, oracle = _build_inputs(**case["shape"], seed=args.seed)
-    with _observe_production_launches(compiled_identities) as calls:
+    with ExitStack() as stack:
+        session = stack.enter_context(PreparationSession(device=x.device, autotune=False, compile_workers=2))
         arms = {
-            name: _build_arm(name=name, x=x, ids=ids, route_weights=route_weights,
-                             experts=experts, calls=calls, fast_math=args.fast_math)
+            name: _build_arm(session=session, name=name, x=x, ids=ids, route_weights=route_weights,
+                             experts=experts, fast_math=args.fast_math)
             for name in ("monolithic", "split")
         }
-    case["arms"] = {name: arm["identity"] for name, arm in arms.items()}
-    case["split_engaged"] = arms["split"]["identity"]["split_engaged"]
-    mono_calls = arms["monolithic"]["identity"]["capture_dynamic_launches"]
-    case["arm_identity_passed"] = bool(
-        case["split_engaged"] and mono_calls
-        and all(c.get("compiled_identity_observed")
-                and c.get("nvfp4_split_materialized") is False for c in mono_calls)
-    )
-    # Even unengaged shapes retain correctness diagnostics, never an A/B ratio.
-    for arm in arms.values():
-        arm["graph"].replay()
-    torch.cuda.synchronize()
-    case["correctness"] = _correctness(arms, oracle)
-    case["graph_check"] = _graph_check(arms, oracle)
-    if not (case["arm_identity_passed"] and case["correctness"]["passed"]
-            and case["graph_check"]["passed"]):
-        case["status"] = "failed_correctness_or_graph" if not (
-            case["correctness"]["passed"] and case["graph_check"]["passed"]
-        ) else "split_not_engaged_or_unverified"
-        return
-
-    addresses = _addresses(arms)
-    allocated = torch.cuda.memory_allocated()
-    allocation_count = torch.cuda.memory_stats()["allocation.all.allocated"]
-    for round_idx in range(args.rounds):
-        order = ("monolithic", "split") if round_idx % 2 == 0 else ("split", "monolithic")
-        case["round_order"].append(list(order))
-        for name in order:
-            samples = _time_launch(arms[name]["graph"].replay,
-                                   warmup=args.warmup, iterations=args.iters)
-            case["samples_us"][name].append(samples)
-    case["gpu_mode_active"] = {
-        name: _sample_under_load(arm["graph"].replay) for name, arm in arms.items()
-    }
-    case["timing_allocation_count_before"] = allocation_count
-    case["timing_allocation_count_after"] = torch.cuda.memory_stats()["allocation.all.allocated"]
-    case["timing_allocation_stable"] = (
-        torch.cuda.memory_allocated() == allocated
-        and case["timing_allocation_count_after"] == allocation_count
-    )
-    case["post_timing_correctness"] = _correctness(arms, oracle)
-    case["timing_addresses_stable"] = _addresses(arms) == addresses
-    case["gpu_mode_check"] = _gpu_mode_check(
-        case["gpu_mode_active"],
-        initial_snapshot=initial_snapshot,
-        expected_uuid=str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
-        allow_software_power_cap=args.allow_software_power_cap,
-        max_sm_clock_delta_percent=args.max_sm_clock_delta_percent,
-    )
-    case["qualified"] = bool(
-        case["post_timing_correctness"]["passed"] and case["timing_allocation_stable"]
-        and case["timing_addresses_stable"]
-        and case["gpu_mode_check"]["passed"]
-    )
-    if not case["qualified"]:
-        case["status"] = (
-            "failed_gpu_mode_check"
-            if not case["gpu_mode_check"]["passed"] else "failed_post_timing_check"
+        session.freeze()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for arm in arms.values():
+                for _ in range(3):
+                    fused_moe.run(binding=arm["binding"])
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        for arm in arms.values():
+            graph = torch.cuda.CUDAGraph()
+            stack.callback(graph.reset)
+            with torch.cuda.graph(graph, stream=stream):
+                fused_moe.run(binding=arm["binding"])
+            arm["graph"] = graph
+        case["arms"] = {name: arm["identity"] for name, arm in arms.items()}
+        case["split_engaged"] = arms["split"]["identity"]["split_engaged"]
+        case["arm_identity_passed"] = bool(
+            case["split_engaged"] and not arms["monolithic"]["identity"]["split_engaged"]
         )
-        return
-    case["status"] = "diagnostic_qualified"
-    case["median_us"] = {
-        name: statistics.median(statistics.median(s) for s in rounds)
-        for name, rounds in case["samples_us"].items()
-    }
-    case["speedup_split_over_mono"] = (
-        case["median_us"]["monolithic"] / case["median_us"]["split"]
-    )
+        # Even unengaged shapes retain correctness diagnostics, never an A/B ratio.
+        for arm in arms.values():
+            arm["graph"].replay()
+        torch.cuda.synchronize()
+        case["correctness"] = _correctness(arms, oracle)
+        case["graph_check"] = _graph_check(arms, oracle)
+        if not (case["arm_identity_passed"] and case["correctness"]["passed"]
+                and case["graph_check"]["passed"]):
+            case["status"] = "failed_correctness_or_graph" if not (
+                case["correctness"]["passed"] and case["graph_check"]["passed"]
+            ) else "split_not_engaged_or_unverified"
+            return
+
+        addresses = _addresses(arms)
+        allocated = torch.cuda.memory_allocated()
+        allocation_count = torch.cuda.memory_stats()["allocation.all.allocated"]
+        for round_idx in range(args.rounds):
+            order = ("monolithic", "split") if round_idx % 2 == 0 else ("split", "monolithic")
+            case["round_order"].append(list(order))
+            for name in order:
+                samples = _time_launch(arms[name]["graph"].replay,
+                                       warmup=args.warmup, iterations=args.iters)
+                case["samples_us"][name].append(samples)
+        case["gpu_mode_active"] = {
+            name: _sample_under_load(arm["graph"].replay) for name, arm in arms.items()
+        }
+        case["timing_allocation_count_before"] = allocation_count
+        case["timing_allocation_count_after"] = torch.cuda.memory_stats()["allocation.all.allocated"]
+        case["timing_allocation_stable"] = (
+            torch.cuda.memory_allocated() == allocated
+            and case["timing_allocation_count_after"] == allocation_count
+        )
+        case["post_timing_correctness"] = _correctness(arms, oracle)
+        case["timing_addresses_stable"] = _addresses(arms) == addresses
+        case["gpu_mode_check"] = _gpu_mode_check(
+            case["gpu_mode_active"],
+            initial_snapshot=initial_snapshot,
+            expected_uuid=str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
+            allow_software_power_cap=args.allow_software_power_cap,
+            max_sm_clock_delta_percent=args.max_sm_clock_delta_percent,
+        )
+        case["qualified"] = bool(
+            case["post_timing_correctness"]["passed"] and case["timing_allocation_stable"]
+            and case["timing_addresses_stable"]
+            and case["gpu_mode_check"]["passed"]
+        )
+        if not case["qualified"]:
+            case["status"] = (
+                "failed_gpu_mode_check"
+                if not case["gpu_mode_check"]["passed"] else "failed_post_timing_check"
+            )
+            return
+        case["status"] = "diagnostic_qualified"
+        case["median_us"] = {
+            name: statistics.median(statistics.median(s) for s in rounds)
+            for name, rounds in case["samples_us"].items()
+        }
+        case["speedup_split_over_mono"] = (
+            case["median_us"]["monolithic"] / case["median_us"]["split"]
+        )
 
 
 def main() -> None:
@@ -555,7 +486,7 @@ def main() -> None:
     argv = [sys.executable, os.path.relpath(Path(sys.argv[0]).resolve(), ROOT), *sys.argv[1:]]
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     report = {
-        "schema": "b12x.moe.nvfp4_split_materialized.benchmark", "version": 4,
+        "schema": "b12x.moe.nvfp4_split_materialized.benchmark", "version": 5,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "argv": argv, "command": shlex.join(argv),
         "command_cwd": str(ROOT), "invocation_cwd": str(Path.cwd().resolve()),
@@ -575,7 +506,8 @@ def main() -> None:
         "package_versions": _package_versions(),
         "env": {key: value for key, value in os.environ.items()
                 if key.startswith(("B12X_", "CUDA_", "NVIDIA_"))},
-        "arm_settings": {"monolithic": {SPLIT_ENV: "0"}, "split": {SPLIT_ENV: "1"}},
+        "arm_settings": {"monolithic": {"nvfp4_materialize_intermediate": False},
+                         "split": {"nvfp4_materialize_intermediate": True}},
         "timed_path": "one captured production fused_moe.run per graph.replay",
         "gpu_mode_policy": {
             "qualification": "diagnostic only; not formal release evidence",
@@ -611,7 +543,6 @@ def main() -> None:
         tmp.write_text(json.dumps(report, indent=2) + "\n")
         os.replace(tmp, args.output)
 
-    compiled_identities = {}
     save()
     for spec in shapes:
         E, K, n, top_k, M = (int(value) for value in spec.split(":"))
@@ -626,7 +557,7 @@ def main() -> None:
         }
         report["cases"].append(case)
         try:
-            _run_case(case, args, compiled_identities, report["gpu_snapshot"])
+            _run_case(case, args, report["gpu_snapshot"])
         except Exception as error:
             case["status"] = "error"
             case["error"] = f"{type(error).__name__}: {error}"

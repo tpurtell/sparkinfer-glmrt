@@ -21,6 +21,8 @@ import statistics
 import torch
 
 from b12x.moe import fused_moe
+from b12x.preparation import PreparationSession
+from benchmarks.moe_preparation import prepared_call, request_for_capacity, scratch_for
 
 
 def _parse_args() -> argparse.Namespace:
@@ -34,13 +36,14 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _capture(fn, *, warmup: int) -> torch.cuda.CUDAGraph:
+def _capture(fn, *, warmup: int, session: PreparationSession) -> torch.cuda.CUDAGraph:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        fn()
+    with session.capture():
+        with torch.cuda.graph(graph):
+            fn()
     graph.replay()
     torch.cuda.synchronize()
     return graph
@@ -183,7 +186,7 @@ def main() -> None:
         ),
     )
 
-    plan = fused_moe.plan_execution(
+    declaration = fused_moe.plan_execution(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(
             max_tokens=8,
@@ -191,13 +194,6 @@ def main() -> None:
             warmup_token_counts=(1, 8),
             route_num_experts=global_experts,
         ),
-    )
-    fused_moe.prewarm(plan)
-    scratch_spec = plan.scratch_specs()[0]
-    scratch = torch.empty(
-        scratch_spec.shape,
-        dtype=scratch_spec.dtype,
-        device=scratch_spec.device,
     )
     x = (torch.randn((1, hidden_size), device=device) * 0.01).to(torch.bfloat16)
     topk_ids = torch.arange(topk, dtype=torch.int32, device=device).view(1, topk)
@@ -213,11 +209,44 @@ def main() -> None:
             dtype=torch.int32,
             device=device,
         )
+    prepared_inputs = {
+        1: (x, topk_ids, topk_weights, torch.empty_like(x)),
+        8: (
+            (torch.randn((8, hidden_size), device=device) * 0.01).to(torch.bfloat16),
+            topk_ids.expand(8, -1).contiguous(),
+            topk_weights.expand(8, -1).contiguous(),
+            torch.empty((8, hidden_size), device=device, dtype=torch.bfloat16),
+        ),
+    }
+    request = request_for_capacity(
+        declaration,
+        name="w4a16-global-map",
+        calls={
+            count: prepared_call(
+                output=prepared_inputs[count][3],
+                bind=lambda state, scratch, count=count: state.bind(
+                    scratch=scratch,
+                    a=prepared_inputs[count][0],
+                    experts=experts,
+                    topk_weights=prepared_inputs[count][2],
+                    topk_ids=prepared_inputs[count][1],
+                    output=prepared_inputs[count][3],
+                    input_scales_static=True,
+                    route_expert_map=expert_map,
+                ),
+            )
+            for count in getattr(declaration, "token_counts", (1,))
+        },
+    )
+    session = PreparationSession(device=device)
+    result = session.prepare((request,))
+    variants = getattr(declaration, "variants", None)
+    plan = declaration if variants is None else variants.get(1, declaration)
+    mapped_output = prepared_inputs[1][3]
 
-    mapped_output = torch.empty_like(x)
     mapped_binding = fused_moe.bind(
         plan,
-        scratch=scratch,
+        scratch=scratch_for(plan),
         a=x,
         experts=experts,
         topk_weights=topk_weights,
@@ -226,7 +255,6 @@ def main() -> None:
         input_scales_static=True,
         route_expert_map=expert_map,
     )
-
     local_ids = expert_map[topk_ids.long()]
     active = local_ids >= 0
     local_weights = topk_weights.masked_fill(~active, 0.0).contiguous()
@@ -234,7 +262,7 @@ def main() -> None:
     legacy_kernel_output = torch.empty_like(x)
     legacy_kernel_binding = fused_moe.bind(
         plan,
-        scratch=scratch,
+        scratch=scratch_for(plan),
         a=x,
         experts=experts,
         topk_weights=local_weights,
@@ -255,8 +283,9 @@ def main() -> None:
         kept_active = kept_ids >= 0
         kept_weights = topk_weights.masked_fill(~kept_active, 0.0).contiguous()
         kept_ids = kept_ids.clamp_min(0).to(torch.int32).contiguous()
-        binding = plan.bind(
-            scratch=scratch,
+        binding = fused_moe.bind(
+            plan,
+            scratch=scratch_for(plan),
             a=x,
             experts=experts,
             topk_weights=kept_weights,
@@ -287,9 +316,15 @@ def main() -> None:
             )
 
     graphs = {
-        "legacy_kernel": _capture(legacy_kernel_run, warmup=args.warmup),
-        "legacy_total": _capture(legacy_total_run, warmup=args.warmup),
-        "mapped_kernel": _capture(mapped_run, warmup=args.warmup),
+        "legacy_kernel": _capture(
+            legacy_kernel_run, warmup=args.warmup, session=session
+        ),
+        "legacy_total": _capture(
+            legacy_total_run, warmup=args.warmup, session=session
+        ),
+        "mapped_kernel": _capture(
+            mapped_run, warmup=args.warmup, session=session
+        ),
     }
     timings = {
         name: _time_graph(
@@ -328,6 +363,10 @@ def main() -> None:
         f"relative_l2:{legacy_total_error[1]:.6g},"
         f"cosine:{legacy_total_error[2]:.9f}"
     )
+    for graph in graphs.values():
+        graph.reset()
+    result.close()
+    session.close()
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ Three oracles share one contract:
 
 ``recurrent_kda`` runs the fp32 token recurrence for one packed sequence and is
 the ground truth. ``prefill_kda`` applies it to a packed batch over a
-recurrent-state pool, honouring the same metadata the kernel validates.
+recurrent-state pool, honouring the same packed-metadata contract as the kernel.
 ``prefill_kda_chunk_mirror`` implements the kernel's chunked algorithm with its
 exact rounding points so kernel stages can be compared tensor by tensor; a
 ``MirrorPolicy`` selects alternative precisions for offline studies and a

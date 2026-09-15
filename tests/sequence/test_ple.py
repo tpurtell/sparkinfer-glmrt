@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
+from contextvars import ContextVar
+from dataclasses import replace
 import pytest
 import torch
 
 from b12x.sequence import ple, ple_hash
+from b12x.preparation import PreparationSession, PreparedCall
 from b12x.sequence.ple.reference import (
     ple_projected_packed_reference,
     ple_projected_sequence_reference,
@@ -20,9 +24,31 @@ from b12x.sequence.ple_hash.reference import (
 from ..conftest import require_b12x
 
 
-def _scratch(plan) -> torch.Tensor:
-    spec = plan.scratch_specs()[0]
-    return torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+_case_resources = ContextVar("ple_case_resources")
+
+
+@pytest.fixture(autouse=True)
+def _prepared_case_lifetime():
+    with ExitStack() as resources:
+        token = _case_resources.set(resources)
+        try:
+            yield
+        finally:
+            _case_resources.reset(token)
+
+
+def _hash_caps(*, device) -> ple_hash.Caps:
+    return ple_hash.Caps(
+        device=device,
+        max_tokens=2,
+        max_seqs=1,
+        vocab_size=100,
+        eos_token_id=99,
+        max_order=3,
+        heads_per_order=2,
+        dense_layer_ordinal=0,
+        base_table_size=101,
+    )
 
 
 def test_ple_hash_geometry_is_distinct_deterministic_and_aligned() -> None:
@@ -38,27 +64,27 @@ def test_ple_hash_geometry_is_distinct_deterministic_and_aligned() -> None:
         base_table_size=100,
         table_alignment=128,
     )
-    plan = ple_hash.plan(caps)
+    geometry = ple_hash.compute_geometry(caps)
 
-    assert plan.prime_sizes.tolist() == [101, 103, 107, 109]
-    assert plan.table_offsets.tolist() == [0, 101, 204, 311]
-    assert plan.padded_vocab_size == 512
-    expected_multipliers = [
+    assert geometry.prime_sizes == (101, 103, 107, 109)
+    assert geometry.table_offsets == (0, 101, 204, 311)
+    assert geometry.padded_vocab_size == 512
+    expected_multipliers = (
         5159850018220775,
         4902196785138501,
         6891410296393783,
-    ]
-    assert plan.multipliers.tolist() == expected_multipliers
+    )
+    assert geometry.multipliers == expected_multipliers
     assert (
         ple_multipliers(
             vocab_size=1000,
             max_order=3,
             dense_layer_ordinal=0,
         ).tolist()
-        == expected_multipliers
+        == list(expected_multipliers)
     )
-    assert all(value & 1 for value in plan.multipliers.tolist())
-    assert max(plan.multipliers.tolist()) <= ((1 << 63) - 1) // 1000
+    assert all(value & 1 for value in geometry.multipliers)
+    assert max(geometry.multipliers) <= ((1 << 63) - 1) // 1000
 
     next_sizes, _ = ple_table_geometry(
         base_size=100,
@@ -75,23 +101,10 @@ def test_ple_hash_geometry_is_distinct_deterministic_and_aligned() -> None:
     assert minimum_offsets.tolist() == [0, 2, 5, 10]
 
 
-def test_ple_hash_plan_rejects_cumulative_table_extent_beyond_int64() -> None:
-    caps = ple_hash.Caps(
-        device="cpu",
-        max_tokens=1,
-        max_seqs=1,
-        vocab_size=100,
-        eos_token_id=99,
-        max_order=2,
-        heads_per_order=2,
-        dense_layer_ordinal=0,
-        base_table_size=101,
-    )
-
-    with pytest.raises(
-        ValueError, match="cumulative table extent must fit signed int64"
-    ):
-        ple_hash.plan(
+def test_ple_hash_geometry_rejects_cumulative_table_extent_beyond_int64() -> None:
+    caps = replace(_hash_caps(device="cpu"), max_order=2, heads_per_order=2)
+    with pytest.raises(ValueError):
+        ple_hash.compute_geometry(
             caps,
             prime_sizes=torch.tensor([101, 9223372036854775783], dtype=torch.int64),
             table_offsets=torch.tensor([0, 101], dtype=torch.int64),
@@ -99,22 +112,10 @@ def test_ple_hash_plan_rejects_cumulative_table_extent_beyond_int64() -> None:
         )
 
 
-def test_ple_hash_plan_rejects_padded_table_extent_beyond_int64() -> None:
-    caps = ple_hash.Caps(
-        device="cpu",
-        max_tokens=1,
-        max_seqs=1,
-        vocab_size=100,
-        eos_token_id=99,
-        max_order=2,
-        heads_per_order=1,
-        dense_layer_ordinal=0,
-        base_table_size=101,
-        table_alignment=128,
-    )
-
-    with pytest.raises(ValueError, match="padded table extent must fit signed int64"):
-        ple_hash.plan(
+def test_ple_hash_geometry_rejects_padded_table_extent_beyond_int64() -> None:
+    caps = replace(_hash_caps(device="cpu"), max_order=2, heads_per_order=1)
+    with pytest.raises(ValueError):
+        ple_hash.compute_geometry(
             caps,
             prime_sizes=torch.tensor([9223372036854775783], dtype=torch.int64),
             table_offsets=torch.tensor([0], dtype=torch.int64),
@@ -175,99 +176,47 @@ def test_ple_packed_hash_matches_per_request_complete_history() -> None:
     torch.testing.assert_close(actual, torch.cat(expected_parts))
 
 
-def test_ple_hash_plan_binds_fixed_capacity_and_fails_closed() -> None:
-    caps = ple_hash.Caps(
-        device="cpu",
-        max_tokens=5,
-        max_seqs=2,
-        vocab_size=100,
-        eos_token_id=99,
-        max_order=3,
-        heads_per_order=2,
-        dense_layer_ordinal=0,
-        base_table_size=101,
+
+
+@pytest.mark.parametrize("alias_kind", ["out_input", "scratch_input"])
+@torch.inference_mode()
+def test_ple_hash_prepared_bind_rejects_read_only_aliases(alias_kind: str) -> None:
+    device = require_b12x()
+    caps = _hash_caps(device=device)
+    inputs = dict(
+        token_ids=torch.tensor([1, 2], dtype=torch.int64, device=device),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        committed_history=torch.tensor([[99, 99]], dtype=torch.int64, device=device),
+        num_seqs=torch.tensor([1], dtype=torch.int32, device=device),
+        num_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+        out=torch.empty((2, 4), dtype=torch.int64, device=device),
     )
-    plan = ple_hash.plan(caps)
-    binding = ple_hash.bind(
-        plan,
-        scratch=_scratch(plan),
-        token_ids=torch.zeros(5, dtype=torch.int64),
-        query_start_loc=torch.zeros(3, dtype=torch.int32),
-        committed_history=torch.full((2, 2), 99, dtype=torch.int64),
-        num_seqs=torch.tensor([0], dtype=torch.int32),
-        num_tokens=torch.tensor([0], dtype=torch.int32),
-        out=torch.empty((5, 4), dtype=torch.int64),
-    )
-    assert binding.scratch.untyped_storage().data_ptr() != 0
-    assert not ple_hash.is_supported("cpu")
-    with pytest.raises(ValueError, match="GPU run requires CUDA"):
-        ple_hash.run(binding)
+    _, binding = _bind_cuda_hash(caps, **inputs)
+    if alias_kind == "out_input":
+        shared = torch.empty(8, dtype=torch.int64, device=device)
+        inputs["token_ids"] = shared[:2]
+        inputs["out"] = shared.view(2, 4)
+        match = "out.*read-only tensor token_ids"
+    else:
+        # The hash scratch may be smaller than two int64 token IDs; a larger
+        # scratch buffer is accepted, so size it to hold the aliased input.
+        shared = torch.empty(
+            max(binding.scratch.numel(), 16), dtype=torch.uint8, device=device
+        )
+        inputs["scratch"] = shared
+        inputs["token_ids"] = shared[:16].view(torch.int64)
+        match = "scratch.*read-only tensor token_ids"
+
+    inputs.setdefault("scratch", binding.scratch)
+    with pytest.raises(ValueError, match=match):
+        ple_hash.bind(binding.plan, **inputs)
 
 
-def _cpu_hash_bind_inputs(plan: ple_hash.Plan) -> dict[str, torch.Tensor]:
-    caps = plan.caps
-    return {
-        "scratch": _scratch(plan),
-        "token_ids": torch.zeros(caps.max_tokens, dtype=torch.int64),
-        "query_start_loc": torch.zeros(caps.max_seqs + 1, dtype=torch.int32),
-        "committed_history": torch.full(
-            (caps.max_seqs, caps.max_order - 1),
-            caps.eos_token_id,
-            dtype=torch.int64,
-        ),
-        "num_seqs": torch.tensor([0], dtype=torch.int32),
-        "num_tokens": torch.tensor([0], dtype=torch.int32),
-        "out": torch.empty((caps.max_tokens, caps.head_count), dtype=torch.int64),
-    }
-
-
-def test_ple_hash_bind_rejects_output_aliasing_read_only_input() -> None:
+@torch.inference_mode()
+def test_ple_hash_prepared_bind_rejects_geometry_alias() -> None:
+    device = require_b12x()
     caps = ple_hash.Caps(
-        device="cpu",
-        max_tokens=2,
-        max_seqs=1,
-        vocab_size=100,
-        eos_token_id=99,
-        max_order=3,
-        heads_per_order=2,
-        dense_layer_ordinal=0,
-        base_table_size=101,
-    )
-    plan = ple_hash.plan(caps)
-    inputs = _cpu_hash_bind_inputs(plan)
-    shared = torch.empty(caps.max_tokens * caps.head_count, dtype=torch.int64)
-    inputs["token_ids"] = shared[: caps.max_tokens]
-    inputs["out"] = shared.view(caps.max_tokens, caps.head_count)
-
-    with pytest.raises(ValueError, match="out.*read-only tensor token_ids"):
-        ple_hash.bind(plan, **inputs)
-
-
-def test_ple_hash_bind_rejects_scratch_aliasing_read_only_input() -> None:
-    caps = ple_hash.Caps(
-        device="cpu",
-        max_tokens=2,
-        max_seqs=1,
-        vocab_size=100,
-        eos_token_id=99,
-        max_order=3,
-        heads_per_order=2,
-        dense_layer_ordinal=0,
-        base_table_size=101,
-    )
-    plan = ple_hash.plan(caps)
-    inputs = _cpu_hash_bind_inputs(plan)
-    shared = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8)
-    inputs["scratch"] = shared
-    inputs["token_ids"] = shared[: caps.max_tokens * 8].view(torch.int64)
-
-    with pytest.raises(ValueError, match="scratch.*read-only tensor token_ids"):
-        ple_hash.bind(plan, **inputs)
-
-
-def test_ple_hash_bind_rejects_output_aliasing_plan_geometry() -> None:
-    caps = ple_hash.Caps(
-        device="cpu",
+        device=device,
         max_tokens=1,
         max_seqs=1,
         vocab_size=100,
@@ -277,19 +226,20 @@ def test_ple_hash_bind_rejects_output_aliasing_plan_geometry() -> None:
         dense_layer_ordinal=0,
         base_table_size=101,
     )
-    shared = torch.tensor([101, 103, 107, 109], dtype=torch.int64)
-    plan = ple_hash.plan(
-        caps,
-        prime_sizes=shared,
-        table_offsets=torch.tensor([0, 101, 204, 311], dtype=torch.int64),
-        multipliers=torch.tensor([11, 13, 17], dtype=torch.int64),
+    inputs = dict(
+        token_ids=torch.tensor([1], dtype=torch.int64, device=device),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        committed_history=torch.tensor([[99, 99]], dtype=torch.int64, device=device),
+        num_seqs=torch.tensor([1], dtype=torch.int32, device=device),
+        num_tokens=torch.tensor([1], dtype=torch.int32, device=device),
+        out=torch.empty((1, 4), dtype=torch.int64, device=device),
     )
-    inputs = _cpu_hash_bind_inputs(plan)
-    inputs["out"] = shared.view(1, caps.head_count)
+    _, binding = _bind_cuda_hash(caps, **inputs)
+    inputs["out"] = binding.geometry.prime_sizes.view(1, 4)
 
+    inputs["scratch"] = binding.scratch
     with pytest.raises(ValueError, match="out.*read-only tensor prime_sizes"):
-        ple_hash.bind(plan, **inputs)
-
+        ple_hash.bind(binding.plan, **inputs)
 
 def _projected_inputs(tokens: int, streams: int, hidden: int):
     generator = torch.Generator().manual_seed(4107)
@@ -342,6 +292,40 @@ def _cuda_projected_inputs(
     return residual, key, value, weights, generator
 
 
+def _bind_cuda_hash(
+    caps: ple_hash.Caps, **tensors: torch.Tensor
+) -> tuple[ple_hash.GeometryTensors, ple_hash.Binding]:
+    geometry = ple_hash.compute_geometry(caps)
+    geometry_tensors = ple_hash.allocate_geometry(geometry, device=caps.device)
+    declaration = ple_hash.plan(
+        caps,
+        geometry=geometry,
+        prime_sizes=geometry_tensors.prime_sizes,
+        table_offsets=geometry_tensors.table_offsets,
+        multipliers=geometry_tensors.multipliers,
+        invocation=ple_hash.invocation_from_tensors(**tensors),
+    )
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        tensors["scratch"] = torch.empty(
+            spec.shape, dtype=spec.dtype, device=spec.device
+        )
+        trial = state.bind(**tensors)
+        return PreparedCall(run=lambda: state.run(trial))
+
+    resources = _case_resources.get()
+    session = resources.enter_context(
+        PreparationSession(device=caps.device, autotune=False, compile_workers=2)
+    )
+    request = declaration.request(
+        name="ple_hash",
+        prepare_call=prepare_call,
+    )
+    session.prepare((request,))
+    return geometry_tensors, ple_hash.bind(declaration, **tensors)
+
+
 def _bind_cuda_layer(
     *,
     mode: str,
@@ -363,24 +347,13 @@ def _bind_cuda_layer(
 ):
     max_tokens, streams, hidden = residual.shape
     max_seqs = int(state_slot_ids.numel())
-    plan = ple.plan(
-        ple.Caps(
-            device=residual.device,
-            mode=mode,
-            max_tokens=max_tokens,
-            max_seqs=max_seqs,
-            max_state_slots=conv_state.shape[0],
-            max_speculative_tokens=max_speculative_tokens,
-            streams=streams,
-            hidden_size=hidden,
-            kernel_size=conv_weight.shape[-1],
-            dilation=dilation,
-        )
+    caps = ple.Caps(
+        device=residual.device, mode=mode, max_tokens=max_tokens, max_seqs=max_seqs,
+        max_state_slots=conv_state.shape[0], max_speculative_tokens=max_speculative_tokens,
+        streams=streams, hidden_size=hidden, kernel_size=conv_weight.shape[-1], dilation=dilation,
     )
     out = torch.full_like(residual, 91)
-    binding = ple.bind(
-        plan,
-        scratch=_scratch(plan),
+    tensors = dict(
         residual=residual,
         key=key,
         value=value,
@@ -400,7 +373,28 @@ def _bind_cuda_layer(
         out=out,
         request_is_prefill=request_is_prefill,
     )
-    return plan, binding
+    declaration = ple.plan(caps, invocation=ple.invocation_from_tensors(**tensors))
+    slots = sorted({int(slot) for slot in state_slot_ids.tolist() if 0 <= int(slot) < conv_state.shape[0]})
+    indices = torch.tensor(slots, dtype=torch.int64, device=residual.device)
+    original_state = conv_state.index_select(0, indices)
+    original_output = out.clone()
+
+    def restore():
+        conv_state.index_copy_(0, indices, original_state)
+        out.copy_(original_output)
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        tensors["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        trial = state.bind(**tensors)
+        return PreparedCall(run=lambda: state.run(trial, eps=1e-6), restore=restore)
+
+    resources = _case_resources.get()
+    session = resources.enter_context(PreparationSession(device=residual.device, autotune=False, compile_workers=2))
+    request = declaration.request(name="ple", prepare_call=prepare_call)
+    session.prepare((request,))
+    binding = ple.bind(declaration, **tensors)
+    return binding._state, binding
 
 
 def _mixed_layer_reference(
@@ -579,227 +573,6 @@ def test_ple_packed_oracle_is_request_local() -> None:
         torch.testing.assert_close(states[request], expected_state, rtol=0, atol=0)
 
 
-def test_ple_layer_plan_exposes_state_capacity_and_fails_closed() -> None:
-    caps = ple.Caps(
-        device="cpu",
-        mode="decode",
-        max_tokens=2,
-        max_seqs=2,
-        max_state_slots=3,
-        max_speculative_tokens=4,
-        streams=2,
-        hidden_size=4,
-        kernel_size=4,
-        dilation=3,
-    )
-    plan = ple.plan(caps)
-    assert plan.state_length == 9
-    assert plan.state_capacity == 13
-    common = torch.empty((2, 2, 4), dtype=torch.bfloat16)
-    binding = ple.bind(
-        plan,
-        scratch=_scratch(plan),
-        residual=common,
-        key=torch.empty_like(common),
-        value=torch.empty((2, 4), dtype=torch.bfloat16),
-        k_norm_weight=torch.empty((8,), dtype=torch.bfloat16),
-        q_norm_weight=torch.empty((8,), dtype=torch.bfloat16),
-        u_norm_weight=torch.empty((8,), dtype=torch.bfloat16),
-        conv_weight=torch.empty((8, 4), dtype=torch.bfloat16),
-        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
-        state_slot_ids=torch.tensor([0, -1], dtype=torch.int64),
-        state_is_fresh=torch.tensor([True, False], dtype=torch.bool),
-        num_accepted_tokens=torch.tensor([1, 0], dtype=torch.int32),
-        num_seqs=torch.tensor([2], dtype=torch.int32),
-        num_tokens=torch.tensor([2], dtype=torch.int32),
-        conv_state=torch.empty((3, 8, 13), dtype=torch.bfloat16),
-        out=torch.empty_like(common),
-    )
-    with pytest.raises(ValueError, match="GPU run requires CUDA"):
-        ple.run_decode(binding, eps=1e-6)
-    with pytest.raises(ValueError, match="prefill LayerPlan"):
-        ple.run_prefill(binding, eps=1e-6)
-
-
-def _cpu_layer_plan(mode: str = "decode") -> ple.Plan:
-    return ple.plan(
-        ple.Caps(
-            device="cpu",
-            mode=mode,
-            max_tokens=2,
-            max_seqs=2,
-            max_state_slots=3,
-            max_speculative_tokens=4,
-            streams=2,
-            hidden_size=4,
-            kernel_size=4,
-            dilation=3,
-        )
-    )
-
-
-def _cpu_layer_bind_inputs(plan: ple.Plan) -> dict[str, torch.Tensor]:
-    caps = plan.caps
-    inputs = {
-        "scratch": _scratch(plan),
-        "residual": torch.empty(
-            (caps.max_tokens, caps.streams, caps.hidden_size), dtype=caps.dtype
-        ),
-        "key": torch.empty(
-            (caps.max_tokens, caps.streams, caps.hidden_size), dtype=caps.dtype
-        ),
-        "value": torch.empty((caps.max_tokens, caps.hidden_size), dtype=caps.dtype),
-        "k_norm_weight": torch.empty(caps.channels, dtype=caps.dtype),
-        "q_norm_weight": torch.empty(caps.channels, dtype=caps.dtype),
-        "u_norm_weight": torch.empty(caps.channels, dtype=caps.dtype),
-        "conv_weight": torch.empty((caps.channels, caps.kernel_size), dtype=caps.dtype),
-        "query_start_loc": torch.tensor([0, 1, 2], dtype=torch.int32),
-        "state_slot_ids": torch.tensor([0, 1], dtype=torch.int64),
-        "state_is_fresh": torch.tensor([False, False], dtype=torch.bool),
-        "num_accepted_tokens": torch.tensor([1, 1], dtype=torch.int32),
-        "num_seqs": torch.tensor([2], dtype=torch.int32),
-        "num_tokens": torch.tensor([2], dtype=torch.int32),
-        "conv_state": torch.empty(
-            (caps.max_state_slots, caps.channels, caps.state_capacity),
-            dtype=caps.dtype,
-        ),
-        "out": torch.empty(
-            (caps.max_tokens, caps.streams, caps.hidden_size), dtype=caps.dtype
-        ),
-    }
-    if caps.mode == "mixed":
-        inputs["request_is_prefill"] = torch.tensor([True, False])
-    return inputs
-
-
-def test_ple_mixed_plan_requires_fixed_request_modes() -> None:
-    plan = _cpu_layer_plan("mixed")
-    inputs = _cpu_layer_bind_inputs(plan)
-    request_is_prefill = inputs.pop("request_is_prefill")
-    with pytest.raises(ValueError, match="required for a mixed"):
-        ple.bind(plan, **inputs)
-
-    inputs["request_is_prefill"] = request_is_prefill.to(torch.int32)
-    with pytest.raises(TypeError, match="request_is_prefill.*torch.bool"):
-        ple.bind(plan, **inputs)
-
-    inputs["request_is_prefill"] = request_is_prefill[:1]
-    with pytest.raises(ValueError, match="request_is_prefill.*shape"):
-        ple.bind(plan, **inputs)
-
-    inputs["request_is_prefill"] = request_is_prefill
-    binding = ple.bind(plan, **inputs)
-    with pytest.raises(ValueError, match="GPU run requires CUDA"):
-        ple.run_mixed(binding, eps=1e-6)
-    with pytest.raises(ValueError, match="decode LayerPlan"):
-        ple.run_decode(binding, eps=1e-6)
-
-
-def test_ple_homogeneous_plan_rejects_request_modes() -> None:
-    plan = _cpu_layer_plan()
-    inputs = _cpu_layer_bind_inputs(plan)
-    inputs["request_is_prefill"] = torch.tensor([True, False])
-
-    with pytest.raises(ValueError, match="only valid for a mixed"):
-        ple.bind(plan, **inputs)
-
-
-def test_ple_mixed_request_modes_must_not_alias_mutable_scratch() -> None:
-    plan = _cpu_layer_plan("mixed")
-    inputs = _cpu_layer_bind_inputs(plan)
-    shared = _scratch(plan)
-    inputs["scratch"] = shared
-    inputs["request_is_prefill"] = shared[: plan.caps.max_seqs].view(torch.bool)
-
-    with pytest.raises(ValueError, match="scratch.*request_is_prefill"):
-        ple.bind(plan, **inputs)
-
-
-@pytest.mark.parametrize("alias_kind", ["out_input", "scratch_input", "state_output"])
-def test_ple_bind_rejects_mutation_schema_aliases(alias_kind: str) -> None:
-    plan = _cpu_layer_plan()
-    caps = plan.caps
-    inputs = _cpu_layer_bind_inputs(plan)
-    if alias_kind == "out_input":
-        inputs["out"] = inputs["residual"]
-    elif alias_kind == "scratch_input":
-        shared = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8)
-        inputs["scratch"] = shared
-        inputs["residual"] = (
-            shared[: caps.max_tokens * caps.channels * 2]
-            .view(torch.bfloat16)
-            .view(caps.max_tokens, caps.streams, caps.hidden_size)
-        )
-    else:
-        state_elements = caps.max_state_slots * caps.channels * caps.state_capacity
-        shared = torch.empty(state_elements, dtype=caps.dtype)
-        inputs["conv_state"] = shared.view(
-            caps.max_state_slots, caps.channels, caps.state_capacity
-        )
-        inputs["out"] = shared[: caps.max_tokens * caps.channels].view(
-            caps.max_tokens, caps.streams, caps.hidden_size
-        )
-
-    with pytest.raises(ValueError, match="must not overlap"):
-        ple.bind(plan, **inputs)
-
-
-def test_ple_bind_allows_read_only_aliases() -> None:
-    plan = _cpu_layer_plan()
-    inputs = _cpu_layer_bind_inputs(plan)
-    inputs["key"] = inputs["residual"]
-
-    binding = ple.bind(plan, **inputs)
-
-    assert binding.key is binding.residual
-
-
-def test_ple_bind_accepts_padded_state_slot_stride_without_copy() -> None:
-    plan = _cpu_layer_plan()
-    inputs = _cpu_layer_bind_inputs(plan)
-    caps = plan.caps
-    slot_elements = caps.channels * caps.state_capacity
-    padded_slot_elements = slot_elements + 17
-    storage = torch.empty(
-        (caps.max_state_slots - 1) * padded_slot_elements + slot_elements,
-        dtype=caps.dtype,
-    )
-    conv_state = torch.as_strided(
-        storage,
-        (caps.max_state_slots, caps.channels, caps.state_capacity),
-        (padded_slot_elements, caps.state_capacity, 1),
-    )
-    inputs["conv_state"] = conv_state
-
-    binding = ple.bind(plan, **inputs)
-
-    assert binding.conv_state is conv_state
-    assert binding.conv_state.stride(0) == padded_slot_elements
-    assert not binding.conv_state.is_contiguous()
-
-
-@pytest.mark.parametrize(
-    "strides",
-    [
-        (8 * 13, 1, 8),
-        (8 * 13 - 1, 13, 1),
-    ],
-)
-def test_ple_bind_rejects_unsupported_or_overlapping_state_strides(
-    strides: tuple[int, int, int],
-) -> None:
-    plan = _cpu_layer_plan()
-    inputs = _cpu_layer_bind_inputs(plan)
-    caps = plan.caps
-    storage = torch.empty(4096, dtype=caps.dtype)
-    inputs["conv_state"] = torch.as_strided(
-        storage,
-        (caps.max_state_slots, caps.channels, caps.state_capacity),
-        strides,
-    )
-
-    with pytest.raises(ValueError, match="conv_state"):
-        ple.bind(plan, **inputs)
 
 
 @torch.inference_mode()
@@ -869,7 +642,6 @@ def test_ple_padded_state_stride_reaches_past_int32_offset_boundary() -> None:
     ple.run_decode(binding, eps=1e-6)
     torch.cuda.synchronize(device)
 
-    assert binding.error_code.item() == 0
     torch.testing.assert_close(binding.out, expected, rtol=0.02, atol=0.0078125)
     torch.testing.assert_close(
         conv_state[tail_slot], expected_state, rtol=0.02, atol=0.0078125
@@ -891,7 +663,6 @@ def test_ple_hash_target_shape_matches_oracle_and_pads_output() -> None:
         dense_layer_ordinal=0,
         base_table_size=20000000,
     )
-    plan = ple_hash.plan(caps)
     token_ids = torch.tensor(
         [7, caps.eos_token_id, 8, 9, 10, 0, 0],
         dtype=torch.int64,
@@ -910,9 +681,8 @@ def test_ple_hash_target_shape_matches_oracle_and_pads_output() -> None:
     out = torch.empty(
         (caps.max_tokens, caps.head_count), dtype=torch.int64, device=device
     )
-    binding = ple_hash.bind(
-        plan,
-        scratch=_scratch(plan),
+    geometry, binding = _bind_cuda_hash(
+        caps,
         token_ids=token_ids,
         query_start_loc=query_start_loc,
         committed_history=committed_history,
@@ -928,108 +698,14 @@ def test_ple_hash_target_shape_matches_oracle_and_pads_output() -> None:
         query_start_loc[:3],
         committed_history[:2],
         eos_token_id=caps.eos_token_id,
-        multipliers=plan.multipliers,
-        prime_sizes=plan.prime_sizes,
-        table_offsets=plan.table_offsets,
+        multipliers=geometry.multipliers,
+        prime_sizes=geometry.prime_sizes,
+        table_offsets=geometry.table_offsets,
         heads_per_order=caps.heads_per_order,
     )
 
-    assert binding.error_code.item() == 0
     torch.testing.assert_close(out[:5], expected, rtol=0, atol=0)
     assert bool((out[5:] == -1).all().item())
-
-
-@pytest.mark.parametrize(
-    ("invalid_field", "error_mask"),
-    [("query_start", 2), ("token_id", 4), ("history", 4)],
-)
-@torch.inference_mode()
-def test_ple_hash_invalid_metadata_fails_closed(
-    invalid_field: str, error_mask: int
-) -> None:
-    device = require_b12x()
-    caps = ple_hash.Caps(
-        device=device,
-        max_tokens=2,
-        max_seqs=1,
-        vocab_size=100,
-        eos_token_id=99,
-        max_order=3,
-        heads_per_order=2,
-        dense_layer_ordinal=0,
-        base_table_size=101,
-    )
-    plan = ple_hash.plan(caps)
-    token_ids = torch.tensor([1, 0], dtype=torch.int64, device=device)
-    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    committed_history = torch.tensor([[99, 99]], dtype=torch.int64, device=device)
-    if invalid_field == "query_start":
-        query_start_loc.copy_(torch.tensor([1, 1], dtype=torch.int32, device=device))
-    elif invalid_field == "token_id":
-        token_ids[0] = caps.vocab_size
-    else:
-        committed_history[0, 0] = -1
-    history_before = committed_history.clone()
-    binding = ple_hash.bind(
-        plan,
-        scratch=_scratch(plan),
-        token_ids=token_ids,
-        query_start_loc=query_start_loc,
-        committed_history=committed_history,
-        num_seqs=torch.tensor([1], dtype=torch.int32, device=device),
-        num_tokens=torch.tensor([1], dtype=torch.int32, device=device),
-        out=torch.full(
-            (caps.max_tokens, caps.head_count),
-            91,
-            dtype=torch.int64,
-            device=device,
-        ),
-    )
-
-    ple_hash.run(binding)
-    torch.cuda.synchronize()
-
-    assert binding.error_code.item() & error_mask
-    assert bool((binding.out == -1).all().item())
-    torch.testing.assert_close(committed_history, history_before, rtol=0, atol=0)
-
-
-@torch.inference_mode()
-def test_ple_hash_zero_sequences_with_tokens_fails_closed() -> None:
-    device = require_b12x()
-    caps = ple_hash.Caps(
-        device=device,
-        max_tokens=2,
-        max_seqs=1,
-        vocab_size=100,
-        eos_token_id=99,
-        max_order=3,
-        heads_per_order=2,
-        dense_layer_ordinal=0,
-        base_table_size=101,
-    )
-    plan = ple_hash.plan(caps)
-    binding = ple_hash.bind(
-        plan,
-        scratch=_scratch(plan),
-        token_ids=torch.tensor([1, 0], dtype=torch.int64, device=device),
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
-        committed_history=torch.tensor([[99, 99]], dtype=torch.int64, device=device),
-        num_seqs=torch.tensor([0], dtype=torch.int32, device=device),
-        num_tokens=torch.tensor([1], dtype=torch.int32, device=device),
-        out=torch.full(
-            (caps.max_tokens, caps.head_count),
-            91,
-            dtype=torch.int64,
-            device=device,
-        ),
-    )
-
-    ple_hash.run(binding)
-    torch.cuda.synchronize()
-
-    assert binding.error_code.item() & 1
-    assert bool((binding.out == -1).all().item())
 
 
 @torch.inference_mode()
@@ -1046,13 +722,11 @@ def test_ple_hash_cuda_graph_replay_is_allocation_free() -> None:
         dense_layer_ordinal=0,
         base_table_size=101,
     )
-    plan = ple_hash.plan(caps)
     token_ids = torch.tensor([1, 2], dtype=torch.int64, device=device)
     query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
     committed_history = torch.tensor([[99, 99]], dtype=torch.int64, device=device)
-    binding = ple_hash.bind(
-        plan,
-        scratch=_scratch(plan),
+    geometry, binding = _bind_cuda_hash(
+        caps,
         token_ids=token_ids,
         query_start_loc=query_start_loc,
         committed_history=committed_history,
@@ -1078,13 +752,12 @@ def test_ple_hash_cuda_graph_replay_is_allocation_free() -> None:
         query_start_loc,
         committed_history,
         eos_token_id=caps.eos_token_id,
-        multipliers=plan.multipliers,
-        prime_sizes=plan.prime_sizes,
-        table_offsets=plan.table_offsets,
+        multipliers=geometry.multipliers,
+        prime_sizes=geometry.prime_sizes,
+        table_offsets=geometry.table_offsets,
         heads_per_order=caps.heads_per_order,
     )
 
-    assert binding.error_code.item() == 0
     assert captured_out.data_ptr() == output_address == binding.out.data_ptr()
     assert allocated_after_replay == allocated_before_replay
     torch.testing.assert_close(captured_out, expected, rtol=0, atol=0)
@@ -1104,8 +777,9 @@ def test_ple_hash_target_cuda_graph_replays_dynamic_packed_metadata() -> None:
         dense_layer_ordinal=0,
         base_table_size=20000000,
     )
-    plan = ple_hash.plan(caps)
-    token_ids = torch.tensor([1, 2, 0, 0, 0, 0, 0, 0], dtype=torch.int64, device=device)
+    token_ids = torch.tensor(
+        [1, 2, 0, 0, 0, 0, 0, 0], dtype=torch.int64, device=device
+    )
     query_start_loc = torch.tensor([0, 2, 2, 2], dtype=torch.int32, device=device)
     committed_history = torch.full(
         (caps.max_seqs, caps.max_order - 1),
@@ -1115,9 +789,8 @@ def test_ple_hash_target_cuda_graph_replays_dynamic_packed_metadata() -> None:
     )
     num_seqs = torch.tensor([1], dtype=torch.int32, device=device)
     num_tokens = torch.tensor([2], dtype=torch.int32, device=device)
-    binding = ple_hash.bind(
-        plan,
-        scratch=_scratch(plan),
+    geometry, binding = _bind_cuda_hash(
+        caps,
         token_ids=token_ids,
         query_start_loc=query_start_loc,
         committed_history=committed_history,
@@ -1160,9 +833,9 @@ def test_ple_hash_target_cuda_graph_replays_dynamic_packed_metadata() -> None:
         query_start_loc[:4],
         committed_history[:3],
         eos_token_id=caps.eos_token_id,
-        multipliers=plan.multipliers,
-        prime_sizes=plan.prime_sizes,
-        table_offsets=plan.table_offsets,
+        multipliers=geometry.multipliers,
+        prime_sizes=geometry.prime_sizes,
+        table_offsets=geometry.table_offsets,
         heads_per_order=caps.heads_per_order,
     )
     allocated_before_replay = torch.cuda.memory_allocated(device)
@@ -1170,7 +843,6 @@ def test_ple_hash_target_cuda_graph_replays_dynamic_packed_metadata() -> None:
     torch.cuda.synchronize(device)
     allocated_after_replay = torch.cuda.memory_allocated(device)
 
-    assert binding.error_code.item() == 0
     assert captured_out.data_ptr() == output_address == binding.out.data_ptr()
     assert allocated_after_replay == allocated_before_replay
     torch.testing.assert_close(captured_out[:6], expected, rtol=0, atol=0)
@@ -1235,7 +907,6 @@ def test_ple_target_shape_prefill_matches_oracle_and_recycles_dirty_slots() -> N
         dilation=dilation,
     )
 
-    assert binding.error_code.item() == 0
     torch.testing.assert_close(binding.out, expected, rtol=0.02, atol=0.0078125)
     torch.testing.assert_close(
         conv_state[:2, :, : plan.state_length],
@@ -1324,7 +995,6 @@ def test_ple_mixed_packed_order_matches_request_local_oracles() -> None:
     ple.run_mixed(binding, eps=1e-6)
     torch.cuda.synchronize()
 
-    assert binding.error_code.item() == 0
     torch.testing.assert_close(binding.out, expected_out, rtol=0.02, atol=0.0078125)
     torch.testing.assert_close(conv_state, expected_state, rtol=0, atol=0)
 
@@ -1421,7 +1091,6 @@ def test_ple_decode_rolls_back_and_retains_candidates(accepted: int) -> None:
     ple.run_decode(binding, eps=1e-6)
     torch.cuda.synchronize()
 
-    assert binding.error_code.item() == 0
     torch.testing.assert_close(binding.out, expected, rtol=0, atol=0)
     torch.testing.assert_close(
         conv_state[0, :, : plan.state_length], expected_base, rtol=0, atol=0
@@ -1504,7 +1173,6 @@ def test_ple_decode_fresh_flag_ignores_dirty_recycled_state() -> None:
     expected_base = torch.cat(
         (zero_history[:, 1:], normalized_u[0].unsqueeze(1)), dim=1
     )
-    assert binding.error_code.item() == 0
     torch.testing.assert_close(binding.out, expected, rtol=0, atol=0)
     torch.testing.assert_close(
         conv_state[0, :, : plan.state_length], expected_base, rtol=0, atol=0
@@ -1513,238 +1181,6 @@ def test_ple_decode_fresh_flag_ignores_dirty_recycled_state() -> None:
         conv_state[0, :, plan.state_length], normalized_u[1], rtol=0, atol=0
     )
     assert bool((conv_state[0, :, plan.state_length + 1 :] == 0).all().item())
-
-
-@pytest.mark.parametrize(
-    ("query_length", "accepted", "error_mask"),
-    [(6, 1, 4), (1, 0, 8), (1, 6, 8)],
-)
-@torch.inference_mode()
-def test_ple_decode_invalid_speculative_metadata_fails_without_mutation(
-    query_length: int,
-    accepted: int,
-    error_mask: int,
-) -> None:
-    device = require_b12x()
-    max_tokens, streams, hidden = 6, 2, 32
-    kernel_size, dilation, max_speculative = 4, 3, 4
-    residual, key, value, weights, generator = _cuda_projected_inputs(
-        max_tokens, streams, hidden, device=device, seed=1202
-    )
-    conv_weight = (
-        torch.randn(
-            (streams * hidden, kernel_size),
-            generator=generator,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        / 32
-    ).contiguous()
-    state_length = dilation * (kernel_size - 1)
-    conv_state = torch.randn(
-        (1, streams * hidden, state_length + max_speculative),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    state_before = conv_state.clone()
-    _, binding = _bind_cuda_layer(
-        mode="decode",
-        residual=residual,
-        key=key,
-        value=value,
-        weights=weights,
-        conv_weight=conv_weight,
-        query_start_loc=torch.tensor(
-            [0, query_length], dtype=torch.int32, device=device
-        ),
-        state_slot_ids=torch.tensor([0], dtype=torch.int64, device=device),
-        state_is_fresh=torch.tensor([False], dtype=torch.bool, device=device),
-        num_accepted_tokens=torch.tensor([accepted], dtype=torch.int32, device=device),
-        num_seqs=1,
-        num_tokens=query_length,
-        conv_state=conv_state,
-        max_speculative_tokens=max_speculative,
-        dilation=dilation,
-    )
-
-    ple.run_decode(binding, eps=1e-6)
-    torch.cuda.synchronize()
-
-    assert binding.error_code.item() & error_mask
-    assert bool((binding.out == 0).all().item())
-    torch.testing.assert_close(conv_state, state_before, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    ("query_start_loc", "num_accepted_tokens", "error_mask", "token_count"),
-    [
-        ([0, 1, 6], [99, 1], 4, None),
-        ([0, 1, 2], [0, 0], 8, None),
-        ([0, 1, 2], [99, 6], 8, None),
-        ([0, 1, 2], [99, 1], 1, 1),
-        ([0, 1, 2], [99, 1], 1, 0),
-    ],
-)
-@torch.inference_mode()
-def test_ple_mixed_invalid_decode_metadata_fails_without_mutation(
-    query_start_loc: list[int],
-    num_accepted_tokens: list[int],
-    error_mask: int,
-    token_count: int | None,
-) -> None:
-    device = require_b12x()
-    max_tokens, streams, hidden = 6, 2, 32
-    kernel_size, dilation, max_speculative = 4, 3, 3
-    residual, key, value, weights, generator = _cuda_projected_inputs(
-        max_tokens, streams, hidden, device=device, seed=1211
-    )
-    conv_weight = torch.randn(
-        (streams * hidden, kernel_size),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    ).contiguous()
-    state_length = dilation * (kernel_size - 1)
-    conv_state = torch.randn(
-        (2, streams * hidden, state_length + max_speculative),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    state_before = conv_state.clone()
-    _, binding = _bind_cuda_layer(
-        mode="mixed",
-        residual=residual,
-        key=key,
-        value=value,
-        weights=weights,
-        conv_weight=conv_weight,
-        query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32, device=device),
-        state_slot_ids=torch.tensor([0, 1], dtype=torch.int64, device=device),
-        state_is_fresh=torch.zeros(2, dtype=torch.bool, device=device),
-        num_accepted_tokens=torch.tensor(
-            num_accepted_tokens, dtype=torch.int32, device=device
-        ),
-        num_seqs=2,
-        num_tokens=query_start_loc[-1],
-        conv_state=conv_state,
-        max_speculative_tokens=max_speculative,
-        dilation=dilation,
-        request_is_prefill=torch.tensor([True, False], dtype=torch.bool, device=device),
-    )
-
-    out = ple.run_mixed(binding, eps=1e-6, token_count=token_count)
-    torch.cuda.synchronize()
-
-    assert binding.error_code.item() & error_mask
-    assert bool((out == 0).all().item())
-    assert bool((binding.out[out.shape[0] :] == 91).all().item())
-    torch.testing.assert_close(conv_state, state_before, rtol=0, atol=0)
-
-
-@torch.inference_mode()
-def test_ple_mixed_duplicate_live_state_slots_fail_without_mutation() -> None:
-    device = require_b12x()
-    tokens, streams, hidden = 2, 2, 32
-    kernel_size, dilation, max_speculative = 4, 3, 4
-    residual, key, value, weights, generator = _cuda_projected_inputs(
-        tokens, streams, hidden, device=device, seed=1212
-    )
-    conv_weight = torch.randn(
-        (streams * hidden, kernel_size),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    ).contiguous()
-    state_length = dilation * (kernel_size - 1)
-    conv_state = torch.randn(
-        (1, streams * hidden, state_length + max_speculative),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    state_before = conv_state.clone()
-    _, binding = _bind_cuda_layer(
-        mode="mixed",
-        residual=residual,
-        key=key,
-        value=value,
-        weights=weights,
-        conv_weight=conv_weight,
-        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
-        state_slot_ids=torch.tensor([0, 0], dtype=torch.int64, device=device),
-        state_is_fresh=torch.zeros(2, dtype=torch.bool, device=device),
-        num_accepted_tokens=torch.ones(2, dtype=torch.int32, device=device),
-        num_seqs=2,
-        num_tokens=tokens,
-        conv_state=conv_state,
-        max_speculative_tokens=max_speculative,
-        dilation=dilation,
-        request_is_prefill=torch.tensor([True, False], dtype=torch.bool, device=device),
-    )
-
-    ple.run_mixed(binding, eps=1e-6)
-    torch.cuda.synchronize()
-
-    assert binding.error_code.item() & 32
-    assert bool((binding.out == 0).all().item())
-    torch.testing.assert_close(conv_state, state_before, rtol=0, atol=0)
-
-
-@torch.inference_mode()
-def test_ple_duplicate_live_state_slots_fail_without_mutation() -> None:
-    device = require_b12x()
-    tokens, streams, hidden = 2, 2, 32
-    max_seqs = 130
-    kernel_size, dilation, max_speculative = 4, 3, 4
-    residual, key, value, weights, generator = _cuda_projected_inputs(
-        tokens, streams, hidden, device=device, seed=1206
-    )
-    conv_weight = torch.randn(
-        (streams * hidden, kernel_size),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    ).contiguous()
-    state_length = dilation * (kernel_size - 1)
-    conv_state = torch.randn(
-        (1, streams * hidden, state_length + max_speculative),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    state_before = conv_state.clone()
-    query_start_loc = torch.ones(max_seqs + 1, dtype=torch.int32, device=device)
-    query_start_loc[0] = 0
-    query_start_loc[-1] = tokens
-    state_slot_ids = torch.full((max_seqs,), -1, dtype=torch.int64, device=device)
-    state_slot_ids[0] = 0
-    state_slot_ids[-1] = 0
-    _, binding = _bind_cuda_layer(
-        mode="decode",
-        residual=residual,
-        key=key,
-        value=value,
-        weights=weights,
-        conv_weight=conv_weight,
-        query_start_loc=query_start_loc,
-        state_slot_ids=state_slot_ids,
-        state_is_fresh=torch.zeros(max_seqs, dtype=torch.bool, device=device),
-        num_accepted_tokens=torch.ones(max_seqs, dtype=torch.int32, device=device),
-        num_seqs=max_seqs,
-        num_tokens=2,
-        conv_state=conv_state,
-        max_speculative_tokens=max_speculative,
-        dilation=dilation,
-    )
-
-    ple.run_decode(binding, eps=1e-6)
-    torch.cuda.synchronize()
-
-    assert binding.error_code.item() & 32
-    assert bool((binding.out == 0).all().item())
-    torch.testing.assert_close(conv_state, state_before, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
@@ -1794,56 +1230,7 @@ def test_ple_zero_token_live_request_preserves_entire_state(mode: str) -> None:
         ple.run_prefill(binding, eps=1e-6)
     torch.cuda.synchronize()
 
-    assert binding.error_code.item() == 0
     torch.testing.assert_close(conv_state[0], empty_state_before, rtol=0, atol=0)
-
-
-@torch.inference_mode()
-def test_ple_layer_zero_sequences_with_tokens_fails_without_mutation() -> None:
-    device = require_b12x()
-    tokens, streams, hidden = 1, 2, 32
-    kernel_size, dilation, max_speculative = 4, 3, 4
-    residual, key, value, weights, generator = _cuda_projected_inputs(
-        tokens, streams, hidden, device=device, seed=1208
-    )
-    conv_weight = torch.randn(
-        (streams * hidden, kernel_size),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    ).contiguous()
-    state_length = dilation * (kernel_size - 1)
-    conv_state = torch.randn(
-        (1, streams * hidden, state_length + max_speculative),
-        generator=generator,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    state_before = conv_state.clone()
-    _, binding = _bind_cuda_layer(
-        mode="decode",
-        residual=residual,
-        key=key,
-        value=value,
-        weights=weights,
-        conv_weight=conv_weight,
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
-        state_slot_ids=torch.tensor([0], dtype=torch.int64, device=device),
-        state_is_fresh=torch.tensor([False], dtype=torch.bool, device=device),
-        num_accepted_tokens=torch.tensor([1], dtype=torch.int32, device=device),
-        num_seqs=0,
-        num_tokens=1,
-        conv_state=conv_state,
-        max_speculative_tokens=max_speculative,
-        dilation=dilation,
-    )
-
-    ple.run_decode(binding, eps=1e-6)
-    torch.cuda.synchronize()
-
-    assert binding.error_code.item() & 1
-    assert bool((binding.out == 0).all().item())
-    torch.testing.assert_close(conv_state, state_before, rtol=0, atol=0)
 
 
 @torch.inference_mode()
@@ -1901,7 +1288,6 @@ def test_ple_dummy_slots_replay_under_cuda_graph_without_state_mutation() -> Non
     torch.cuda.synchronize()
     allocated_after_replay = torch.cuda.memory_allocated(device)
 
-    assert binding.error_code.item() == 0
     assert bool((binding.out == 0).all().item())
     torch.testing.assert_close(conv_state, state_before, rtol=0, atol=0)
     assert allocated_after_replay == allocated_before_replay
@@ -1983,7 +1369,6 @@ def test_ple_prefill_replays_under_cuda_graph_without_allocation() -> None:
         dilation=dilation,
     )
 
-    assert binding.error_code.item() == 0
     assert captured_out.data_ptr() == output_address == binding.out.data_ptr()
     assert allocated_after_replay == allocated_before_replay
     torch.testing.assert_close(captured_out, expected, rtol=0.02, atol=0.0078125)
@@ -2077,7 +1462,6 @@ def test_ple_mixed_replays_runtime_request_modes_without_allocation() -> None:
     torch.cuda.synchronize()
     allocated_after_replay = torch.cuda.memory_allocated(device)
 
-    assert binding.error_code.item() == 0
     assert captured_out.data_ptr() == output_address == binding.out.data_ptr()
     assert allocated_after_replay == allocated_before_replay
     torch.testing.assert_close(captured_out, expected_out, rtol=0.02, atol=0.0078125)
@@ -2215,7 +1599,6 @@ def test_ple_target_mixed_graph_replays_dynamic_packed_metadata(
     torch.cuda.synchronize(device)
     allocated_after_replay = torch.cuda.memory_allocated(device)
 
-    assert binding.error_code.item() == 0
     assert captured_out.data_ptr() == output_address == binding.out.data_ptr()
     assert allocated_after_replay == allocated_before_replay
     torch.testing.assert_close(
@@ -2227,30 +1610,18 @@ def test_ple_target_mixed_graph_replays_dynamic_packed_metadata(
     assert bool((binding.out[captured_out.shape[0] :] == 91).all().item())
     torch.testing.assert_close(live_state, expected_state, rtol=0, atol=0)
     torch.testing.assert_close(live_state, full_state, rtol=0, atol=0)
-
-
 @torch.inference_mode()
-def test_ple_public_runs_export_as_opaque_mutating_custom_ops() -> None:
+def test_ple_prepared_runs_compile_and_capture_mutating_outputs() -> None:
     device = require_b12x()
-    hash_plan = ple_hash.plan(
-        ple_hash.Caps(
-            device=device,
-            max_tokens=2,
-            max_seqs=1,
-            vocab_size=100,
-            eos_token_id=99,
-            max_order=3,
-            heads_per_order=2,
-            dense_layer_ordinal=0,
-            base_table_size=101,
-        )
-    )
-    hash_binding = ple_hash.bind(
-        hash_plan,
-        scratch=_scratch(hash_plan),
-        token_ids=torch.tensor([1, 2], dtype=torch.int64, device=device),
-        query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device=device),
-        committed_history=torch.tensor([[99, 99]], dtype=torch.int64, device=device),
+    hash_caps = _hash_caps(device=device)
+    hash_tokens = torch.tensor([1, 2], dtype=torch.int64, device=device)
+    hash_starts = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    hash_history = torch.tensor([[99, 99]], dtype=torch.int64, device=device)
+    hash_geometry, hash_binding = _bind_cuda_hash(
+        hash_caps,
+        token_ids=hash_tokens,
+        query_start_loc=hash_starts,
+        committed_history=hash_history,
         num_seqs=torch.tensor([1], dtype=torch.int32, device=device),
         num_tokens=torch.tensor([2], dtype=torch.int32, device=device),
         out=torch.empty((2, 4), dtype=torch.int64, device=device),
@@ -2310,19 +1681,16 @@ def test_ple_public_runs_export_as_opaque_mutating_custom_ops() -> None:
         request_is_prefill=torch.tensor([True], dtype=torch.bool, device=device),
     )
 
-    hash_graph, _ = torch._dynamo.export(lambda: ple_hash.run(hash_binding))()
-    layer_graph, _ = torch._dynamo.export(
-        lambda: ple.run_decode(layer_binding, eps=1e-6)
-    )()
-    mixed_graph, _ = torch._dynamo.export(
-        lambda: ple.run_mixed(mixed_binding, eps=1e-6)
-    )()
-    assert "torch.ops.b12x.ple_hash_pipeline" in hash_graph.code
-    assert "torch.ops.b12x.ple_layer_pipeline" in layer_graph.code
-    assert "torch.ops.b12x.ple_layer_mixed_pipeline" in mixed_graph.code
-    assert "triton" not in hash_graph.code
-    assert "triton" not in layer_graph.code
-    assert "triton" not in mixed_graph.code
+    expected_hash = ple_hash_packed_reference(
+        hash_tokens,
+        hash_starts,
+        hash_history,
+        eos_token_id=hash_caps.eos_token_id,
+        multipliers=hash_geometry.multipliers,
+        prime_sizes=hash_geometry.prime_sizes,
+        table_offsets=hash_geometry.table_offsets,
+        heads_per_order=hash_caps.heads_per_order,
+    )
 
     compiled_hash = torch.compile(
         lambda: ple_hash.run(hash_binding), backend="eager", fullgraph=True
@@ -2340,12 +1708,22 @@ def test_ple_public_runs_export_as_opaque_mutating_custom_ops() -> None:
     compiled_hash()
     compiled_layer()
     compiled_mixed()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_hash = compiled_hash()
+        captured_layer = compiled_layer()
+        captured_mixed = compiled_mixed()
+    hash_address = captured_hash.data_ptr()
+    layer_address = captured_layer.data_ptr()
+    mixed_address = captured_mixed.data_ptr()
+    graph.replay()
     torch.cuda.synchronize()
-    assert hash_binding.error_code.item() == 0
-    assert layer_binding.error_code.item() == 0
-    assert mixed_binding.error_code.item() == 0
-    assert bool((layer_binding.out == 0).all().item())
-    assert bool((mixed_binding.out == 0).all().item())
+    assert captured_hash.data_ptr() == hash_address == hash_binding.out.data_ptr()
+    assert captured_layer.data_ptr() == layer_address == layer_binding.out.data_ptr()
+    assert captured_mixed.data_ptr() == mixed_address == mixed_binding.out.data_ptr()
+    torch.testing.assert_close(captured_hash, expected_hash, rtol=0, atol=0)
+    assert bool((captured_layer == 0).all().item())
+    assert bool((captured_mixed == 0).all().item())
 
 
 @torch.inference_mode()
@@ -2441,7 +1819,6 @@ def test_ple_state_slot_past_int32_element_offset_matches_oracle() -> None:
         ple.run_decode(binding, eps=1e-6)
         torch.cuda.synchronize()
 
-        assert binding.error_code.item() == 0
         torch.testing.assert_close(binding.out, expected, rtol=0.02, atol=0.0078125)
         torch.testing.assert_close(
             conv_state[high_slot, :, : plan.state_length],

@@ -122,4 +122,3 @@ def test_checkpoint_hash_gpu_and_graph_replay_use_lag_order():
             tokens, [0, 3], [[99, 99]], 99, [3, 5, 7], [101, 103], [0, 101], 1
         )
         torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
-        assert int(binding.error_code) == 0

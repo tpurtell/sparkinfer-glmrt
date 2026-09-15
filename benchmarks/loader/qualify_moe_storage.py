@@ -12,11 +12,13 @@ import tempfile
 import torch
 
 from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.loader import capabilities
 from b12x.moe import fused_moe
-from b12x.policy import MOE_DECODE, get_auto_policy
+from b12x.preparation import PreparationSession
 from benchmarks.loader._utils import WeightFiles, paired_times, source_identity
 from benchmarks.loader.qualify_storage import snapshot
+from benchmarks.moe_preparation import prepared_call, request_for_capacity, scratch_for
 
 
 def main():
@@ -107,48 +109,53 @@ def main():
             ("a4", "micro", None),
             ("a16", "w4a16", "direct"),
         ):
-            bindings = []
             outputs = [torch.empty_like(source), torch.empty_like(source)]
+            requests = []
             for index, experts in enumerate(prepared):
                 config = fused_moe.MoeDecodeConfig(
-                    backend=backend,
-                    route_planner="internal",
-                    max_active_clusters=None,
+                    backend=backend, route_planner="internal", max_active_clusters=None,
                     w4a16_route_mode=route_mode,
                 )
-                plan = fused_moe.plan_execution(
+                declaration = fused_moe.plan_execution(
                     experts=experts,
                     capacity=fused_moe.ExecutionCapacity(
-                        max_tokens=args.m,
-                        top_k=args.top_k,
+                        max_tokens=args.m, top_k=args.top_k,
                         warmup_token_counts=(args.m,),
                     ),
-                    policy=get_auto_policy(device).with_override(MOE_DECODE, config),
+                    override=config,
                 )
-                fused_moe.prewarm(plan)
-                (spec,) = plan.scratch_specs()
-                scratch = torch.empty(spec.shape, device=device, dtype=spec.dtype)
-                bindings.append(
-                    fused_moe.bind(
-                        plan,
-                        scratch=scratch,
-                        a=source,
-                        experts=experts,
-                        topk_ids=ids,
-                        topk_weights=routes,
-                        output=outputs[index],
+                call = prepared_call(
+                    output=outputs[index],
+                    bind=lambda state, scratch, index=index, experts=experts: state.bind(
+                        scratch=scratch, a=source, experts=experts, topk_ids=ids,
+                        topk_weights=routes, output=outputs[index],
                         input_scales_static=True,
-                    )
+                    ),
                 )
+                requests.append(request_for_capacity(
+                    declaration, name=f"storage-{mode}-{index}", calls={args.m: call},
+                ))
+            session = PreparationSession(device=device)
+            result = session.prepare(requests)
+            bindings = [
+                fused_moe.bind(
+                    requests[index].plan,
+                    scratch=scratch_for(requests[index].plan),
+                    a=source, experts=experts, topk_ids=ids, topk_weights=routes,
+                    output=outputs[index], input_scales_static=True,
+                )
+                for index, experts in enumerate(prepared)
+            ]
 
             def run(index):
                 fused_moe.run(binding=bindings[index])
 
             graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
-            for index in range(2):
-                run(index)
-                with torch.cuda.graph(graphs[index]):
+            with kernel_resolution_guard("MoE shared-storage graph qualification"):
+                for index in range(2):
                     run(index)
+                    with torch.cuda.graph(graphs[index]):
+                        run(index)
             for _ in range(3):
                 for output in outputs:
                     output.fill_(float("nan"))
@@ -169,6 +176,10 @@ def main():
             report["cases"].append(case)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, indent=2) + "\n")
+            for graph in graphs:
+                graph.reset()
+            result.close()
+            session.close()
         report["persistent_shared_bytes"] = files.storage_bytes
         report["after"] = snapshot()
         args.output.write_text(json.dumps(report, indent=2) + "\n")

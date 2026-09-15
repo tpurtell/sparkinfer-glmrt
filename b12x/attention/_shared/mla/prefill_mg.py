@@ -10,6 +10,7 @@ from global/L2.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -26,7 +27,8 @@ from b12x._lib.compiler import (
     key_field,
     tensor_key,
 )
-from b12x._lib.compiler import launch as b12x_launch
+from b12x._lib.compiler import launch as b12x_launch, run_compiled
+from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import (
     atomic_max_shared_f32_offset,
     byte_perm,
@@ -66,6 +68,7 @@ from .decode_math import (
     _ue8m0_zext_byte_to_fp32,
     ld_shared_f32,
     s0_quantize_q_to_smem,
+    s0_normalize_dsv41_kv_to_fp8,
     s1_qk_nope_block_scaled,
     s6_xv_nope,
     st_shared_f32,
@@ -174,6 +177,39 @@ def _wfp8_row_xor(row: Int32) -> Int32:
 
 
 def _to_cute(x, dtype, align=16, dynamic_layout=False):
+    if x.device.type == "meta" and compile_only_launches_enabled():
+        if dynamic_layout:
+            raise ValueError("metadata cache descriptors require the production static layout")
+        from cutlass.cute.runtime import make_fake_tensor
+
+        return make_fake_tensor(dtype, tuple(x.shape), tuple(x.stride()), assumed_align=align)
+    if compile_only_launches_enabled() and hasattr(x, "fake_mode"):
+        from cutlass.cute.runtime import make_fake_tensor
+
+        leading_dim = next(
+            (idx for idx, stride in enumerate(x.stride()) if stride == 1), None
+        )
+        if dynamic_layout and x.ndim >= 1 and leading_dim is not None:
+            shape = tuple(cute.sym_int(32) for _ in x.shape)
+            strides = tuple(
+                1 if idx == leading_dim else cute.sym_int(64)
+                for idx in range(x.ndim)
+            )
+        else:
+            if x.numel() == 0:
+                # Preserve empty optional arguments; CuTe fake layouts require
+                # positive extents, while an empty CPU tensor owns no storage.
+                from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+                with unset_fake_temporarily():
+                    empty = torch.empty_strided(
+                        tuple(x.shape), tuple(x.stride()), dtype=x.dtype, device="cpu",
+                    )
+                converted = from_dlpack(empty, assumed_align=align)
+                converted.element_type = dtype
+                return converted
+            shape, strides = tuple(x.shape), tuple(x.stride())
+        return make_fake_tensor(dtype, shape, strides, assumed_align=align)
     c = from_dlpack(x, assumed_align=align)
     c.element_type = dtype
     if dynamic_layout and x.ndim >= 1:
@@ -861,9 +897,6 @@ def _nvfp4_pair_bfloat2_mg(
     outer = latent_scale
     if cutlass.const_expr(latent_scale_per_token):
         outer = ld_shared_f32(kv_sc_base_addr + entry * Int32(4))
-    # Prefill QK has its own MG B-operand loader.  Restore the outer scale
-    # here, before BF16 packing/MMA, to match decode QK and the shared decode
-    # P.V helper.
     return pack_f32x2_to_bfloat2(
         (v0 * scale_f) * outer,
         (v1 * scale_f) * outer,
@@ -2387,12 +2420,16 @@ class UnifiedPrefillMGKernel:
         is_glm = cutlass.const_expr(
             t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT, ModelType.DSV41)
         )
+        is_dsv41 = cutlass.const_expr(t.model_type == ModelType.DSV41)
         has_rope = cutlass.const_expr(t.d_rope > 0)
         # NVFP4 (E2M1 + E4M3 group-16) GLM-family arm: BF16-QK with native
         # in-register dequant, BF16 P.V staged in the dead W_FP8 region, and
         # the 432B/288B record geometry. is_glm stays true for NVFP4 so the
         # shared GLM staging (io gather / kv_sc absence / q_rope alias) applies.
         is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
+        dsv41_fp8_pv = cutlass.const_expr(
+            t.model_type == ModelType.DSV41 and t.fp8_internal
+        )
         q_head_dim = cutlass.const_expr(t.d_nope + t.d_rope)
         # Compile-time head-group count: 1 (heads==16) or 2 (heads % 32 == 0). All
         # group-1 work below const_expr-elides when n_hg==1 (single-group MG).
@@ -2406,13 +2443,18 @@ class UnifiedPrefillMGKernel:
         reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
         w_fp8_addr = shared_ptr_to_u32(st.w_fp8.data_ptr())
         # GLM has no kv_sc footer (its fp32 scales are inline), EXCEPT the
-        # NVFP4 per-token latent-scale mode, which stages one fp32 per
-        # candidate.  DSV4 stages XV-RoPE weights into the W_FP8 region after
-        # XV-NoPE consumes it.
-        if cutlass.const_expr((is_nvfp4 or is_glm) and not t.latent_scale_per_token):
+        # NVFP4 per-token latent-scale mode and V4.1 FP8 PV, which stage the
+        # post-normalization DSV4-compatible UE8M0 scales.
+        if cutlass.const_expr(
+            (is_glm or is_nvfp4) and not t.latent_scale_per_token and not dsv41_fp8_pv
+        ):
             kv_sc_addr = Int32(0)
         else:
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+        if cutlass.const_expr(dsv41_fp8_pv):
+            kv_ratio_addr = shared_ptr_to_u32(st.kv_ratio.data_ptr())
+        else:
+            kv_ratio_addr = Int32(0)
 
         if cutlass.const_expr(bf16_qk):
             # BF16 Q-RoPE scratch aliases W_FP8 and is reloaded between tiles.
@@ -2442,6 +2484,7 @@ class UnifiedPrefillMGKernel:
 
         kv_fp8_buf = Int32(L.kv_fp8_buf_bytes)
         kv_sc_buf = Int32(L.kv_sc_buf_bytes)
+        kv_ratio_buf = Int32(L.kv_ratio_buf_bytes)
 
         q_fp8_g0 = q_fp8_addr
         q_fp8_g1 = q_fp8_addr + Int32(L.q_fp8_group_bytes)
@@ -2563,7 +2606,7 @@ class UnifiedPrefillMGKernel:
                 g_end0 = Int32(_CAND_WINDOW)
                 if g_end0 > section_len:
                     g_end0 = section_len
-                if cutlass.const_expr(is_glm or is_nvfp4):
+                if cutlass.const_expr(is_glm or is_nvfp4 or is_dsv41):
                     io_issue_gather_glm_mg(
                         kv_cache_u8,
                         topk_row,
@@ -2584,6 +2627,9 @@ class UnifiedPrefillMGKernel:
                         per_token_latent_scale=t.latent_scale_per_token,
                         kv_sc_dst_addr=kv_sc_addr,
                         dsv41=t.model_type == ModelType.DSV41,
+                        dsv41_fp8=dsv41_fp8_pv,
+                        ratio_dst_addr=kv_ratio_addr,
+                        ratio_stride=L.kv_ratio_stride,
                     )
                 else:
                     io_issue_gather_dsv4_nope(
@@ -2641,23 +2687,31 @@ class UnifiedPrefillMGKernel:
                                     scale_format=t.scale_format,
                                     fp8_rope=t.fp8_rope,
                                 )
+                            elif cutlass.const_expr(is_dsv41):
+                                io_issue_gather_glm_mg(
+                                    extra_kv_cache_u8, extra_row,
+                                    kv_fp8_addr + buf * kv_fp8_buf, mbar_base + buf,
+                                    g_start, g_end, Int32(self.pbs_extra),
+                                    stride_extra_kv_block, io_lane, kv_l2_policy,
+                                    bi=t.bi, kv_smem_stride=L.kv_smem_stride,
+                                    io_threads=_PREFILL_IO_THREADS,
+                                    scale_format=t.scale_format, fp8_rope=t.fp8_rope,
+                                    has_rope=has_rope,
+                                    kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
+                                    dsv41=True, dsv41_swa=False,
+                                    dsv41_fp8=dsv41_fp8_pv,
+                                    ratio_dst_addr=kv_ratio_addr + buf * kv_ratio_buf,
+                                    ratio_stride=L.kv_ratio_stride,
+                                )
                             else:
                                 io_issue_gather_dsv4_nope(
-                                    extra_kv_cache_u8,
-                                    extra_row,
+                                    extra_kv_cache_u8, extra_row,
                                     kv_fp8_addr + buf * kv_fp8_buf,
-                                    kv_sc_addr + buf * kv_sc_buf,
-                                    mbar_base + buf,
-                                    g_start,
-                                    g_end,
-                                    Int32(self.pbs_extra),
-                                    stride_extra_kv_block,
-                                    io_lane,
-                                    kv_l2_policy,
-                                    bi=t.bi,
-                                    kv_smem_stride=L.kv_smem_stride,
+                                    kv_sc_addr + buf * kv_sc_buf, mbar_base + buf,
+                                    g_start, g_end, Int32(self.pbs_extra),
+                                    stride_extra_kv_block, io_lane, kv_l2_policy,
+                                    bi=t.bi, kv_smem_stride=L.kv_smem_stride,
                                     io_threads=_PREFILL_IO_THREADS,
-                                    dsv41_swa=False,
                                 )
                         else:
                             g_start = next_lc * Int32(_CAND_WINDOW)
@@ -2682,21 +2736,30 @@ class UnifiedPrefillMGKernel:
                                     scale_format=t.scale_format,
                                     fp8_rope=t.fp8_rope,
                                 )
+                            elif cutlass.const_expr(is_dsv41):
+                                io_issue_gather_glm_mg(
+                                    kv_cache_u8, topk_row,
+                                    kv_fp8_addr + buf * kv_fp8_buf, mbar_base + buf,
+                                    g_start, g_end, Int32(self.page_block_size),
+                                    stride_kv_block, io_lane, kv_l2_policy,
+                                    bi=t.bi, kv_smem_stride=L.kv_smem_stride,
+                                    io_threads=_PREFILL_IO_THREADS,
+                                    scale_format=t.scale_format, fp8_rope=t.fp8_rope,
+                                    has_rope=has_rope,
+                                    kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
+                                    dsv41=True, dsv41_swa=True,
+                                    dsv41_fp8=dsv41_fp8_pv,
+                                    ratio_dst_addr=kv_ratio_addr + buf * kv_ratio_buf,
+                                    ratio_stride=L.kv_ratio_stride,
+                                )
                             else:
                                 io_issue_gather_dsv4_nope(
-                                    kv_cache_u8,
-                                    topk_row,
+                                    kv_cache_u8, topk_row,
                                     kv_fp8_addr + buf * kv_fp8_buf,
-                                    kv_sc_addr + buf * kv_sc_buf,
-                                    mbar_base + buf,
-                                    g_start,
-                                    g_end,
-                                    Int32(self.page_block_size),
-                                    stride_kv_block,
-                                    io_lane,
-                                    kv_l2_policy,
-                                    bi=t.bi,
-                                    kv_smem_stride=L.kv_smem_stride,
+                                    kv_sc_addr + buf * kv_sc_buf, mbar_base + buf,
+                                    g_start, g_end, Int32(self.page_block_size),
+                                    stride_kv_block, io_lane, kv_l2_policy,
+                                    bi=t.bi, kv_smem_stride=L.kv_smem_stride,
                                     io_threads=_PREFILL_IO_THREADS,
                                 )
                     else:
@@ -2725,6 +2788,9 @@ class UnifiedPrefillMGKernel:
                                 per_token_latent_scale=t.latent_scale_per_token,
                                 kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
                                 dsv41=t.model_type == ModelType.DSV41,
+                                dsv41_fp8=dsv41_fp8_pv,
+                                ratio_dst_addr=kv_ratio_addr + buf * kv_ratio_buf,
+                                ratio_stride=L.kv_ratio_stride,
                             )
                         else:
                             io_issue_gather_dsv4_nope(
@@ -3015,7 +3081,22 @@ class UnifiedPrefillMGKernel:
                 gs1 = [gsum1_frag[0], gsum1_frag[1]]
                 qk1 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
 
-                if cutlass.const_expr(is_nvfp4):
+                if cutlass.const_expr(dsv41_fp8_pv):
+                    s0_normalize_dsv41_kv_to_fp8(
+                        kv_fp8_b, kv_ratio_addr + buf * kv_ratio_buf,
+                        warp_id, lane, bi=t.bi, kv_smem_stride=L.kv_smem_stride,
+                        ratio_smem_stride=L.kv_ratio_stride, math_warps=8,
+                    )
+                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                    qk0, qk1 = s1_qk_nope_bf16_mg2(
+                        qk0, qk1, q_nope_bf16_g0, q_nope_bf16_g1,
+                        kv_fp8_b, kv_sc_b, warp_first_cand, lane,
+                        num_scales=t.num_scales, quant_tile=t.quant_tile,
+                        q_nope_bf16_stride=L.q_nope_bf16_stride,
+                        kv_smem_stride=L.kv_smem_stride, scale_bytes_per_token=8,
+                        n_hg=n_hg,
+                    )
+                elif cutlass.const_expr(is_nvfp4):
                     # NVFP4 QK: native E2M1+E4M3 in-register dequant feeding the
                     # BF16 MMA -- the same math path as the validated NVFP4
                     # decode. QK-RoPE reads the record's BF16 rope from global
@@ -3304,7 +3385,39 @@ class UnifiedPrefillMGKernel:
                 w_pre0 = [p0[0] * wr00, p0[1] * wr00, p0[2] * wr01, p0[3] * wr01]
                 w_pre1 = [p1[0] * wr10, p1[1] * wr10, p1[2] * wr11, p1[3] * wr11]
 
-                if cutlass.const_expr(is_nvfp4):
+                if cutlass.const_expr(dsv41_fp8_pv):
+                    # QK and PV share the same canonical FP8 tile.
+                    acc0, acc1 = s6_xv_nope_mg_dsv4(
+                        w_pre0,
+                        w_pre1,
+                        acc0,
+                        acc1,
+                        kv_fp8_b,
+                        kv_sc_b,
+                        w_head_sc_view_all,
+                        w_fp8_addr,
+                        warp_id,
+                        lane,
+                        tid,
+                        index_base_ptr,
+                        split_cand_end - split_cand_start,
+                        n_v_chunks=t.n_v_chunks,
+                        v_chunk=t.quant_tile,
+                        hpb=t.hpb,
+                        bi=t.bi,
+                        kv_smem_stride=L.kv_smem_stride,
+                        w_fp8_stride=t.bi + 16,
+                        w_fp8_group_stride=L.w_fp8_group_bytes,
+                        w_fp8_parity_stride=L.w_fp8_parity_bytes,
+                        n_warps=8,
+                        scale_bytes_per_token=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        num_threads=self.math_threads,
+                        barrier_id=3,
+                        n_hg=n_hg,
+                        row_xor=False,
+                    )
+                elif cutlass.const_expr(is_nvfp4):
                     # NVFP4 XV-NoPE: BF16 P.V with native E2M1+E4M3 V dequant
                     # (decode s6_xv_nope scale_format==2 branch). The BF16 P
                     # tiles are staged into the dead W_FP8 region (per-group
@@ -3809,6 +3922,8 @@ def _sparse_mla_prefill_mg_flat_launch(
     active_heads: int | None = None,
     head_offset: int = 0,
     latent_scale_per_token: bool = False,
+    fp8_internal: bool = False,
+    prepared: object | None = None,
 ) -> None:
     traits = make_unified_traits(
         int(model_type),
@@ -3817,6 +3932,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         fp8_rope=bool(fp8_rope),
         latent_scale_per_token=bool(latent_scale_per_token),
     )
+    traits = replace(traits, fp8_internal=bool(fp8_internal))
     layout = make_smem_layout_mg(traits, int(mg_n_hg))
     q_head_dim = int(q.shape[2])
     total_heads = int(q.shape[1])
@@ -3917,6 +4033,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         key_field("scale_format", int(scale_format)),
         key_field("fp8_rope", int(traits.fp8_rope)),
         key_field("latent_scale_per_token", int(traits.latent_scale_per_token)),
+        key_field("fp8_internal", int(traits.fp8_internal)),
         key_field("num_heads", total_heads),
         key_field("heads_per_cta", heads_per_cta),
         key_field("mg_n_hg", int(mg_n_hg)),
@@ -3980,10 +4097,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         # v5: latent_scale_per_token joins the key (per-candidate fp32 scale
         # read from kv_sc smem). In that mode the launch scalar is dead, so the
         # identity fold is forced ON -- no per-scalar variants get compiled.
-        # v6: paired-lane NVFP4/V4.1 PV dequantization.
-        # v7: one packed load/conversion per V4.1 SWA pair.
-        # v8: native shared byte loads for packed dequantization.
-        8,
+        5,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),
@@ -3991,7 +4105,9 @@ def _sparse_mla_prefill_mg_flat_launch(
         *spec_fields,
     )
     entry = kernel.call_dual if has_extra else kernel
-    b12x_launch(entry, compile_spec=compile_spec, compile_args=args, runtime_args=args)
+    if prepared is not None:
+        return run_compiled(prepared, args)
+    return b12x_launch(entry, compile_spec=compile_spec, compile_args=args, runtime_args=args)
 
 
 @torch.library.custom_op(
@@ -4208,6 +4324,7 @@ def run_unified_prefill_mg(
     active_heads: int | None = None,
     head_offset: int = 0,
     traits_override: UnifiedMLATraits | None = None,
+    prepared: object | None = None,
 ):
     if traits_override is not None:
         model_type = int(traits_override.model_type)
@@ -4313,7 +4430,7 @@ def run_unified_prefill_mg(
         # argument. Reuse one caller-owned int32 length word as an f32-typed
         # placeholder instead of allocating a CUDA tensor on every serving
         # launch (including during graph capture).
-        attn_sink_t = topk_length.view(torch.float32)[:1]
+        attn_sink_t = topk_length.view(torch.float32).as_strided((1,), (1,))
 
     if stride_kv_block is None:
         if model_type == ModelType.DSV41:
@@ -4370,71 +4487,48 @@ def run_unified_prefill_mg(
             extra_len_t = extra_topk_length.to(
                 device=device, dtype=torch.int32
             ).contiguous()
-        if full_head_tile and active_heads == total_heads and head_offset == 0:
+        if (
+            full_head_tile
+            and active_heads == total_heads
+            and head_offset == 0
+            and not traits.fp8_internal
+            and prepared is None
+            and not compile_only_launches_enabled()
+        ):
             torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
-                q,
-                _cache_base_tensor(kv_cache),
-                topk_indices,
-                topk_length,
-                attn_sink_t,
-                output,
-                lse_out,
-                _cache_base_tensor(extra_kv_cache),
-                extra_indices_t,
-                extra_len_t,
-                float(sm_scale),
-                float(latent_scale),
-                int(page_block_size),
-                int(topk),
-                int(num_tiles),
-                int(stride_kv_block),
-                bool(has_sink),
-                int(compute_mode),
-                int(mg_n_hg),
-                model_type,
-                scale_format,
-                int(extra_topk),
-                int(num_main_tiles),
-                int(pbs_extra),
-                int(stride_extra_kv_block),
-                bool(row_xor),
+                q, _cache_base_tensor(kv_cache), topk_indices, topk_length,
+                attn_sink_t, output, lse_out, _cache_base_tensor(extra_kv_cache),
+                extra_indices_t, extra_len_t, float(sm_scale), float(latent_scale),
+                int(page_block_size), int(topk), int(num_tiles), int(stride_kv_block),
+                bool(has_sink), int(compute_mode), int(mg_n_hg), model_type,
+                scale_format, int(extra_topk), int(num_main_tiles), int(pbs_extra),
+                int(stride_extra_kv_block), bool(row_xor),
             )
         else:
-            _sparse_mla_prefill_mg_flat_launch(
-                q,
-                _cache_base_tensor(kv_cache),
-                topk_indices,
-                topk_length,
-                attn_sink_t,
-                output,
-                lse_out,
-                _cache_base_tensor(extra_kv_cache),
-                extra_indices_t,
-                extra_len_t,
-                float(sm_scale),
-                float(latent_scale),
-                int(page_block_size),
-                int(topk),
-                int(num_tiles),
-                int(stride_kv_block),
-                bool(has_sink),
-                int(compute_mode),
-                int(mg_n_hg),
-                model_type,
-                scale_format,
-                False,  # fp8_rope (dual cache is DSV4-only)
-                True,  # has_extra
-                int(extra_topk),
-                int(num_main_tiles),
-                int(pbs_extra),
-                int(stride_extra_kv_block),
-                bool(row_xor),
-                active_heads=active_heads,
-                head_offset=head_offset,
+            result = _sparse_mla_prefill_mg_flat_launch(
+                q, _cache_base_tensor(kv_cache), topk_indices, topk_length,
+                attn_sink_t, output, lse_out, _cache_base_tensor(extra_kv_cache),
+                extra_indices_t, extra_len_t, float(sm_scale), float(latent_scale),
+                int(page_block_size), int(topk), int(num_tiles), int(stride_kv_block),
+                bool(has_sink), int(compute_mode), int(mg_n_hg), model_type,
+                scale_format, False, True, int(extra_topk), int(num_main_tiles),
+                int(pbs_extra), int(stride_extra_kv_block), bool(row_xor),
+                active_heads=active_heads, head_offset=head_offset,
+                fp8_internal=bool(traits.fp8_internal),
+                prepared=prepared,
             )
+            if compile_only_launches_enabled():
+                return result
         return output, lse_out
 
-    if full_head_tile and active_heads == total_heads and head_offset == 0:
+    if (
+        full_head_tile
+        and active_heads == total_heads
+        and head_offset == 0
+        and not traits.fp8_internal
+        and prepared is None
+        and not compile_only_launches_enabled()
+    ):
         torch.ops.b12x.sparse_mla_sm120_prefill_mg(
             q,
             _cache_base_tensor(kv_cache),
@@ -4458,7 +4552,7 @@ def run_unified_prefill_mg(
             bool(latent_scale_per_token),
         )
     else:
-        _sparse_mla_prefill_mg_flat_launch(
+        result = _sparse_mla_prefill_mg_flat_launch(
             q,
             _cache_base_tensor(kv_cache),
             topk_indices,
@@ -4490,5 +4584,9 @@ def run_unified_prefill_mg(
             active_heads=active_heads,
             head_offset=head_offset,
             latent_scale_per_token=bool(latent_scale_per_token),
+            fp8_internal=bool(traits.fp8_internal),
+            prepared=prepared,
         )
+        if compile_only_launches_enabled():
+            return result
     return output, lse_out

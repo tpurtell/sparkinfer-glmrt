@@ -1,11 +1,12 @@
 """Public surface for :mod:`b12x.gemm.bf16_vocab_projection`."""
-
 from __future__ import annotations
+
+from b12x.preparation import Plan
 
 from ..._lib.gating import default_is_supported
 from . import META
-from ._contracts import Binding, Caps, Plan, bind, plan, run
-from ._policy import Bf16VocabProjectionConfig, Bf16VocabProjectionQuery
+from ._contracts import Binding, Caps, bind, plan, run
+from ._tuning import Bf16VocabProjectionConfig, Bf16VocabProjectionQuery
 
 
 def is_supported(device=None) -> bool:

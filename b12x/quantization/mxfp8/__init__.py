@@ -1,16 +1,9 @@
-"""BF16/FP16 row quantization into the dense-GEMM MXFP8 layout (one-shot).
+"""Prepared BF16/FP16 row quantization into dense-GEMM MXFP8 storage.
 
-Writes packed e4m3 values plus both scale layouts (row-major e8m0 and the
-MMA-swizzled physical layout) into caller-provided output tensors — no
-allocation, CUDA-graph safe.
-
-Pass a fixed ``expected_m`` row bound to retain the quantizer specialization
-when live row counts vary. Omitting it preserves shape-based selection.
-
-Example:
-    from b12x.quantization import mxfp8
-
-    mxfp8.quantize_rows(x, values, scale_rows, scale_mma)
+``query_from_call`` records the source and output-scale layouts, then
+``plan`` declares the fixed CuTe specialization.  A ``PreparationSession``
+compiles and primes it; ``quantize_rows(..., plan=plan)`` writes the
+caller-owned values and scale buffers without selection or JIT at run time.
 """
 
 from __future__ import annotations
@@ -22,8 +15,15 @@ from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 META = OpMeta(
     name="mxfp8",
     group="quantization",
-    api_style="oneshot",
-    entry_points=("quantize_rows", "is_supported"),
+    api_style="planned",
+    entry_points=(
+        "Mxfp8Config",
+        "Mxfp8Query",
+        "plan",
+        "query_from_call",
+        "quantize_rows",
+        "is_supported",
+    ),
     dtypes=("bf16", "fp16"),
     recipes=("mxfp8",),
     provenance=Provenance(
@@ -36,6 +36,13 @@ META = OpMeta(
 )
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
-    from .api import is_supported, quantize_rows  # noqa: F401
+    from .api import (  # noqa: F401
+        Mxfp8Config,
+        Mxfp8Query,
+        is_supported,
+        plan,
+        query_from_call,
+        quantize_rows,
+    )
 
 install_lazy_api(globals(), META)

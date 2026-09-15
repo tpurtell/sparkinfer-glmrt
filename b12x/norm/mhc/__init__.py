@@ -1,42 +1,26 @@
 """mHC residual for SM12x: fused RMSNorm + hyper-connection mixing +
 projection (DeepSeek-style), BF16 with TF32 projection paths.
 
-Three phases share one plan/binding; the phase is the verb because the
-signatures differ: ``run_pre`` broadcasts a rank-2 residual into the four
-lanes at model entry, ``run_post_pre`` is the steady-state fused post+pre
-boundary between sublayers/layers, and ``run_post`` is the terminal mix-back.
-``run_head`` performs the checkpoint's terminal four-lane sigmoid collapse and
-RMSNorm, and can retain the pre-norm collapse in a second caller-owned output.
-Sinkhorn-normalized mix matrices; hidden sizes 4096/5120/7168; mix
-constants exposed as ``MIXES`` / ``MULT`` / ``PARTIALS``. A bound lifecycle
-uses only caller-owned scratch and outputs.
+Each declaration owns one operation and exact planned nonempty M:
+``run_pre`` (residual -> mixed input + carry), ``run_post`` (output mix-back),
+``run_post_pre`` (fused post+pre), or ``run_collapse`` (weighted/uniform stream
+contraction). Sinkhorn-normalized mix matrices; mix constants are exposed as
+``MIXES`` / ``MULT`` / ``PARTIALS``.
+The fork also retains ``run_head`` for terminal sigmoid collapse and RMSNorm,
+including an optional caller-owned pre-normalization collapse output.
 
-V4.1 lagged input mixing: pass incoming FP32 ``pre_mix[tokens, 4]`` to
-``run_pre`` or ``run_post_pre`` and a disjoint caller-owned FP32 ``pre_out``
-(directly or at bind time). The incoming coefficients collapse this residual;
-newly predicted coefficients are written to ``pre_out`` for the next sublayer.
-The four returned tensors remain ``residual, post, comb, y``. Initialize the
-first incoming mix to one-hot. With ``norm_weight`` and ``norm_eps=1e-20``,
-RMSNorm follows the BF16-rounded collapse. Omitting both mix arguments keeps
-the original current-mix behavior. ``run_pre`` accepts either an expanded
-``[tokens, 4, hidden]`` residual with full ``fn[24, 4 * hidden]`` or the older
-broadcast ``[tokens, hidden]`` residual with pre-summed ``fn[24, hidden]``.
-Scratch ``split_k`` defaults to ``4 * hidden / 256`` (80 for hidden 5120).
-Lagged mixing specializes the existing finalize; projection remains a separate
-pass, not a single Mega-mHC kernel. Caller-owned paths support CUDA graphs,
-not Dynamo tracing.
+V4.1 lagged mixing is a paired prepared invocation: pass incoming FP32
+``pre_mix[tokens,4]`` and a disjoint caller-owned FP32 ``pre_out[tokens,4]``
+to ``run_pre`` or ``run_post_pre``. The retained native producer performs the
+BF16 collapse and the finalizer then applies optional RMSNorm; each call still
+returns exactly ``residual, post, comb, y`` while writing next-layer
+coefficients to ``pre_out``.
 
-Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) ->
-``run_*`` (capture safe; torch.compile-safe via opaque custom ops).
-
-Example:
-    from b12x.norm import mhc
-
-    plan    = mhc.plan(mhc.Caps(...))
-    spec    = plan.scratch_specs()[0]
-    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    binding = mhc.bind(plan, scratch=scratch, ...)
-    residual, post, comb, y = mhc.run_post_pre(..., binding=binding)
+``plan(Caps(...), invocation=...)`` is allocation-free. ``PreparationSession``
+selects and primes the complete plan before ``bind`` builds scratch views.
+Functional operations carry the same opaque prepared reference through eager,
+torch.compile and graph capture. Bindings carry their own prepared plan;
+there is no implicit runtime configuration path.
 """
 
 from __future__ import annotations

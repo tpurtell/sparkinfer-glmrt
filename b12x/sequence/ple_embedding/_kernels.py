@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from b12x.sequence.ple_hash._kernels import _launch_hash_pipeline
+from b12x.preparation.types import plan_from_handle, require_prepared
 
 if TYPE_CHECKING:
     from ._contracts import Binding
@@ -38,8 +38,7 @@ def _pipeline_scratch_views(
     head_count: int,
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
-    error_code_offset_bytes: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     ids = _scratch_view(
         scratch,
         offset_bytes=ids_offset_bytes,
@@ -52,13 +51,7 @@ def _pipeline_scratch_views(
         shape=(max_tokens,),
         dtype=torch.int32,
     )
-    error_code = _scratch_view(
-        scratch,
-        offset_bytes=error_code_offset_bytes,
-        shape=(1,),
-        dtype=torch.int32,
-    )
-    return ids, request_ids, error_code
+    return ids, request_ids
 
 
 @triton.jit
@@ -272,274 +265,14 @@ def _nvfp4_lookup_kernel(
     )
 
 
-def _launch_bf16_lookup(
-    weight: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    compact_rows: bool = False,
-) -> None:
-    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
-    _bf16_lookup_kernel[grid](
-        weight,
-        ids,
-        num_tokens,
-        out,
-        MAX_TOKENS=max_tokens,
-        HEAD_COUNT=head_count,
-        HEAD_DIM=head_dim,
-        EMBEDDING_DIM=embedding_dim,
-        TABLE_VOCAB_SIZE=table_vocab_size,
-        SHARD_START=shard_start,
-        SHARD_END=shard_end,
-        BLOCK_D=_BLOCK_D,
-        COMPACT_ROWS=compact_rows,
-        num_warps=4,
-    )
-
-
-def _launch_fp8_lookup(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    compact_rows: bool = False,
-) -> None:
-    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
-    _fp8_lookup_kernel[grid](
-        weight,
-        weight_scale,
-        ids,
-        num_tokens,
-        out,
-        MAX_TOKENS=max_tokens,
-        HEAD_COUNT=head_count,
-        HEAD_DIM=head_dim,
-        EMBEDDING_DIM=embedding_dim,
-        TABLE_VOCAB_SIZE=table_vocab_size,
-        SHARD_START=shard_start,
-        SHARD_END=shard_end,
-        BLOCK_D=_BLOCK_D,
-        COMPACT_ROWS=compact_rows,
-        num_warps=4,
-    )
-
-
-def _launch_nvfp4_lookup(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_scale_2: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    compact_rows: bool = False,
-) -> None:
-    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
-    _nvfp4_lookup_kernel[grid](
-        weight,
-        weight_scale,
-        weight_scale_2,
-        ids,
-        num_tokens,
-        out,
-        MAX_TOKENS=max_tokens,
-        HEAD_COUNT=head_count,
-        HEAD_DIM=head_dim,
-        EMBEDDING_DIM=embedding_dim,
-        TABLE_VOCAB_SIZE=table_vocab_size,
-        SHARD_START=shard_start,
-        SHARD_END=shard_end,
-        BLOCK_D=_BLOCK_D,
-        COMPACT_ROWS=compact_rows,
-        num_warps=4,
-    )
-
-
 @torch.library.custom_op(
-    "b12x::ple_embedding_bf16_lookup",
-    mutates_args=("out",),
+    "b12x::ple_embedding_pipeline",
+    mutates_args=("scratch", "out"),
 )
-def _bf16_lookup_op(
+def _pipeline_op(
     weight: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-) -> None:
-    _launch_bf16_lookup(
-        weight,
-        ids,
-        num_tokens,
-        out,
-        max_tokens,
-        head_count,
-        head_dim,
-        embedding_dim,
-        table_vocab_size,
-        shard_start,
-        shard_end,
-    )
-
-
-@_bf16_lookup_op.register_fake
-def _bf16_lookup_fake(
-    weight: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-) -> None:
-    del weight, ids, num_tokens, out
-    del max_tokens, head_count, head_dim, embedding_dim
-    del table_vocab_size, shard_start, shard_end
-
-
-@torch.library.custom_op(
-    "b12x::ple_embedding_fp8_lookup",
-    mutates_args=("out",),
-)
-def _fp8_lookup_op(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-) -> None:
-    _launch_fp8_lookup(
-        weight,
-        weight_scale,
-        ids,
-        num_tokens,
-        out,
-        max_tokens,
-        head_count,
-        head_dim,
-        embedding_dim,
-        table_vocab_size,
-        shard_start,
-        shard_end,
-    )
-
-
-@_fp8_lookup_op.register_fake
-def _fp8_lookup_fake(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-) -> None:
-    del weight, weight_scale, ids, num_tokens, out
-    del max_tokens, head_count, head_dim, embedding_dim
-    del table_vocab_size, shard_start, shard_end
-
-
-@torch.library.custom_op(
-    "b12x::ple_embedding_nvfp4_lookup",
-    mutates_args=("out",),
-)
-def _nvfp4_lookup_op(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_scale_2: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-) -> None:
-    _launch_nvfp4_lookup(
-        weight,
-        weight_scale,
-        weight_scale_2,
-        ids,
-        num_tokens,
-        out,
-        max_tokens,
-        head_count,
-        head_dim,
-        embedding_dim,
-        table_vocab_size,
-        shard_start,
-        shard_end,
-    )
-
-
-@_nvfp4_lookup_op.register_fake
-def _nvfp4_lookup_fake(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_scale_2: torch.Tensor,
-    ids: torch.Tensor,
-    num_tokens: torch.Tensor,
-    out: torch.Tensor,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-) -> None:
-    del weight, weight_scale, weight_scale_2, ids, num_tokens, out
-    del max_tokens, head_count, head_dim, embedding_dim
-    del table_vocab_size, shard_start, shard_end
-
-
-def _launch_hash(
+    weight_scale: torch.Tensor | None,
+    weight_scale_2: torch.Tensor | None,
     token_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
     committed_history: torch.Tensor,
@@ -548,46 +281,24 @@ def _launch_hash(
     multipliers: torch.Tensor,
     prime_sizes: torch.Tensor,
     table_offsets: torch.Tensor,
-    ids: torch.Tensor,
-    request_ids: torch.Tensor,
-    error_code: torch.Tensor,
-    eos_token_id: int,
-    vocab_size: int,
-    max_order: int,
-    heads_per_order: int,
-    max_seqs: int,
-    max_tokens: int,
+    scratch: torch.Tensor,
+    out: torch.Tensor,
     token_count: int,
+    plan_handle: int,
 ) -> None:
-    _launch_hash_pipeline(
-        token_ids,
-        query_start_loc,
-        committed_history,
-        num_seqs,
-        num_tokens,
-        multipliers,
-        prime_sizes,
-        table_offsets,
-        ids,
-        request_ids,
-        error_code,
-        eos_token_id,
-        vocab_size,
-        max_order,
-        heads_per_order,
-        max_seqs,
-        max_tokens,
-        token_count=token_count,
+    state = require_prepared(plan_from_handle(plan_handle), "sequence.ple_embedding", out.device)
+    state.run_tensors(
+        weight, weight_scale, weight_scale_2, token_ids, query_start_loc,
+        committed_history, num_seqs, num_tokens, multipliers, prime_sizes,
+        table_offsets, scratch, out, token_count=token_count,
     )
 
 
-# Schema-specific names prevent reuse of incompatible Inductor artifacts.
-@torch.library.custom_op(
-    "b12x::ple_embedding_bf16_gather_pipeline",
-    mutates_args=("scratch", "out"),
-)
-def _bf16_pipeline_op(
+@_pipeline_op.register_fake
+def _pipeline_fake(
     weight: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    weight_scale_2: torch.Tensor | None,
     token_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
     committed_history: torch.Tensor,
@@ -598,390 +309,23 @@ def _bf16_pipeline_op(
     table_offsets: torch.Tensor,
     scratch: torch.Tensor,
     out: torch.Tensor,
-    eos_token_id: int,
-    vocab_size: int,
-    max_order: int,
-    heads_per_order: int,
-    max_seqs: int,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    ids_offset_bytes: int,
-    request_ids_offset_bytes: int,
-    error_code_offset_bytes: int,
+    token_count: int,
+    plan_handle: int,
 ) -> None:
-    ids, request_ids, error_code = _pipeline_scratch_views(
-        scratch,
-        max_tokens=max_tokens,
-        head_count=head_count,
-        ids_offset_bytes=ids_offset_bytes,
-        request_ids_offset_bytes=request_ids_offset_bytes,
-        error_code_offset_bytes=error_code_offset_bytes,
-    )
-    _launch_hash(
-        token_ids,
-        query_start_loc,
-        committed_history,
-        num_seqs,
-        num_tokens,
-        multipliers,
-        prime_sizes,
-        table_offsets,
-        ids,
-        request_ids,
-        error_code,
-        eos_token_id,
-        vocab_size,
-        max_order,
-        heads_per_order,
-        max_seqs,
-        max_tokens,
-        out.shape[0],
-    )
-    _launch_bf16_lookup(
-        weight,
-        ids,
-        num_tokens,
-        out,
-        max_tokens,
-        head_count,
-        head_dim,
-        embedding_dim,
-        table_vocab_size,
-        shard_start,
-        shard_end,
-    )
-
-
-@_bf16_pipeline_op.register_fake
-def _bf16_pipeline_fake(
-    weight: torch.Tensor,
-    token_ids: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    committed_history: torch.Tensor,
-    num_seqs: torch.Tensor,
-    num_tokens: torch.Tensor,
-    multipliers: torch.Tensor,
-    prime_sizes: torch.Tensor,
-    table_offsets: torch.Tensor,
-    scratch: torch.Tensor,
-    out: torch.Tensor,
-    eos_token_id: int,
-    vocab_size: int,
-    max_order: int,
-    heads_per_order: int,
-    max_seqs: int,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    ids_offset_bytes: int,
-    request_ids_offset_bytes: int,
-    error_code_offset_bytes: int,
-) -> None:
-    del weight, token_ids, query_start_loc, committed_history
-    del num_seqs, num_tokens, multipliers, prime_sizes, table_offsets
-    del scratch, out, eos_token_id, vocab_size, max_order, heads_per_order
-    del max_seqs, max_tokens, head_count, head_dim, embedding_dim
-    del table_vocab_size, shard_start, shard_end
-    del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
-
-
-@torch.library.custom_op(
-    "b12x::ple_embedding_fp8_gather_pipeline",
-    mutates_args=("scratch", "out"),
-)
-def _fp8_pipeline_op(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    token_ids: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    committed_history: torch.Tensor,
-    num_seqs: torch.Tensor,
-    num_tokens: torch.Tensor,
-    multipliers: torch.Tensor,
-    prime_sizes: torch.Tensor,
-    table_offsets: torch.Tensor,
-    scratch: torch.Tensor,
-    out: torch.Tensor,
-    eos_token_id: int,
-    vocab_size: int,
-    max_order: int,
-    heads_per_order: int,
-    max_seqs: int,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    ids_offset_bytes: int,
-    request_ids_offset_bytes: int,
-    error_code_offset_bytes: int,
-) -> None:
-    ids, request_ids, error_code = _pipeline_scratch_views(
-        scratch,
-        max_tokens=max_tokens,
-        head_count=head_count,
-        ids_offset_bytes=ids_offset_bytes,
-        request_ids_offset_bytes=request_ids_offset_bytes,
-        error_code_offset_bytes=error_code_offset_bytes,
-    )
-    _launch_hash(
-        token_ids,
-        query_start_loc,
-        committed_history,
-        num_seqs,
-        num_tokens,
-        multipliers,
-        prime_sizes,
-        table_offsets,
-        ids,
-        request_ids,
-        error_code,
-        eos_token_id,
-        vocab_size,
-        max_order,
-        heads_per_order,
-        max_seqs,
-        max_tokens,
-        out.shape[0],
-    )
-    _launch_fp8_lookup(
-        weight,
-        weight_scale,
-        ids,
-        num_tokens,
-        out,
-        max_tokens,
-        head_count,
-        head_dim,
-        embedding_dim,
-        table_vocab_size,
-        shard_start,
-        shard_end,
-    )
-
-
-@_fp8_pipeline_op.register_fake
-def _fp8_pipeline_fake(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    token_ids: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    committed_history: torch.Tensor,
-    num_seqs: torch.Tensor,
-    num_tokens: torch.Tensor,
-    multipliers: torch.Tensor,
-    prime_sizes: torch.Tensor,
-    table_offsets: torch.Tensor,
-    scratch: torch.Tensor,
-    out: torch.Tensor,
-    eos_token_id: int,
-    vocab_size: int,
-    max_order: int,
-    heads_per_order: int,
-    max_seqs: int,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    ids_offset_bytes: int,
-    request_ids_offset_bytes: int,
-    error_code_offset_bytes: int,
-) -> None:
-    del weight, weight_scale, token_ids, query_start_loc, committed_history
-    del num_seqs, num_tokens, multipliers, prime_sizes, table_offsets
-    del scratch, out, eos_token_id, vocab_size, max_order, heads_per_order
-    del max_seqs, max_tokens, head_count, head_dim, embedding_dim
-    del table_vocab_size, shard_start, shard_end
-    del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
-
-
-@torch.library.custom_op(
-    "b12x::ple_embedding_nvfp4_gather_pipeline",
-    mutates_args=("scratch", "out"),
-)
-def _nvfp4_pipeline_op(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_scale_2: torch.Tensor,
-    token_ids: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    committed_history: torch.Tensor,
-    num_seqs: torch.Tensor,
-    num_tokens: torch.Tensor,
-    multipliers: torch.Tensor,
-    prime_sizes: torch.Tensor,
-    table_offsets: torch.Tensor,
-    scratch: torch.Tensor,
-    out: torch.Tensor,
-    eos_token_id: int,
-    vocab_size: int,
-    max_order: int,
-    heads_per_order: int,
-    max_seqs: int,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    ids_offset_bytes: int,
-    request_ids_offset_bytes: int,
-    error_code_offset_bytes: int,
-) -> None:
-    ids, request_ids, error_code = _pipeline_scratch_views(
-        scratch,
-        max_tokens=max_tokens,
-        head_count=head_count,
-        ids_offset_bytes=ids_offset_bytes,
-        request_ids_offset_bytes=request_ids_offset_bytes,
-        error_code_offset_bytes=error_code_offset_bytes,
-    )
-    _launch_hash(
-        token_ids,
-        query_start_loc,
-        committed_history,
-        num_seqs,
-        num_tokens,
-        multipliers,
-        prime_sizes,
-        table_offsets,
-        ids,
-        request_ids,
-        error_code,
-        eos_token_id,
-        vocab_size,
-        max_order,
-        heads_per_order,
-        max_seqs,
-        max_tokens,
-        out.shape[0],
-    )
-    _launch_nvfp4_lookup(
-        weight,
-        weight_scale,
-        weight_scale_2,
-        ids,
-        num_tokens,
-        out,
-        max_tokens,
-        head_count,
-        head_dim,
-        embedding_dim,
-        table_vocab_size,
-        shard_start,
-        shard_end,
-    )
-
-
-@_nvfp4_pipeline_op.register_fake
-def _nvfp4_pipeline_fake(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_scale_2: torch.Tensor,
-    token_ids: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    committed_history: torch.Tensor,
-    num_seqs: torch.Tensor,
-    num_tokens: torch.Tensor,
-    multipliers: torch.Tensor,
-    prime_sizes: torch.Tensor,
-    table_offsets: torch.Tensor,
-    scratch: torch.Tensor,
-    out: torch.Tensor,
-    eos_token_id: int,
-    vocab_size: int,
-    max_order: int,
-    heads_per_order: int,
-    max_seqs: int,
-    max_tokens: int,
-    head_count: int,
-    head_dim: int,
-    embedding_dim: int,
-    table_vocab_size: int,
-    shard_start: int,
-    shard_end: int,
-    ids_offset_bytes: int,
-    request_ids_offset_bytes: int,
-    error_code_offset_bytes: int,
-) -> None:
-    del weight, weight_scale, weight_scale_2
-    del token_ids, query_start_loc, committed_history
-    del num_seqs, num_tokens, multipliers, prime_sizes, table_offsets
-    del scratch, out, eos_token_id, vocab_size, max_order, heads_per_order
-    del max_seqs, max_tokens, head_count, head_dim, embedding_dim
-    del table_vocab_size, shard_start, shard_end
-    del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
+    del weight, weight_scale, weight_scale_2, token_ids, query_start_loc
+    del committed_history, num_seqs, num_tokens, multipliers, prime_sizes
+    del table_offsets, scratch, out, token_count, plan_handle
 
 
 def run_pipeline(binding: Binding, *, token_count: int) -> None:
-    """Launch one opaque hash, local gather, and inline dequantization op."""
-    plan = binding.plan
-    caps = plan.caps
-    hash_args = (
-        binding.token_ids,
-        binding.query_start_loc,
-        binding.committed_history,
-        binding.num_seqs,
-        binding.num_tokens,
-        plan.multipliers,
-        plan.prime_sizes,
-        plan.table_offsets,
-        binding.scratch,
-        binding.out[:token_count],
-        caps.eos_token_id,
-        caps.vocab_size,
-        caps.max_order,
-        caps.heads_per_order,
-        caps.max_seqs,
-        caps.max_tokens,
-        plan.head_count,
-        plan.head_dim,
-        caps.embedding_dim,
-        plan.table_vocab_size,
-        plan.shard_start,
-        plan.shard_end,
-        plan._layout.ids_offset_bytes,
-        plan._layout.hash_scratch_offset_bytes
-        + plan._hash_plan.layout.request_ids_offset_bytes,
-        plan._layout.hash_scratch_offset_bytes
-        + plan._hash_plan.layout.error_code_offset_bytes,
+    geometry = binding._hash_binding.geometry
+    torch.ops.b12x.ple_embedding_pipeline(
+        binding.weight, binding.weight_scale, binding.weight_scale_2,
+        binding.token_ids, binding.query_start_loc, binding.committed_history,
+        binding.num_seqs, binding.num_tokens, geometry.multipliers,
+        geometry.prime_sizes, geometry.table_offsets, binding.scratch,
+        binding.out, token_count, binding.plan.handle,
     )
-    weight = binding.weight
-    weight_scale = binding.weight_scale
-    assert weight is not None
-    if caps.quant_mode == "bf16":
-        torch.ops.b12x.ple_embedding_bf16_gather_pipeline(weight, *hash_args)
-    elif caps.quant_mode == "fp8_e4m3_per_tensor":
-        assert weight_scale is not None
-        torch.ops.b12x.ple_embedding_fp8_gather_pipeline(
-            weight, weight_scale, *hash_args
-        )
-    elif caps.quant_mode == "nvfp4_group16":
-        assert weight_scale is not None
-        assert binding.weight_scale_2 is not None
-        torch.ops.b12x.ple_embedding_nvfp4_gather_pipeline(
-            weight,
-            weight_scale,
-            binding.weight_scale_2,
-            *hash_args,
-        )
-    else:
-        raise AssertionError(f"unplanned PLE storage mode {caps.quant_mode!r}")
 
 
 __all__ = ["run_pipeline"]

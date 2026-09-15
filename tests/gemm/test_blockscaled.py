@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x._lib import dense_gemm as dense_module
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x._lib.intrinsics import (
     fp4_quantize_values_torch,
     quantize_grouped_nvfp4_torch,
@@ -24,7 +24,27 @@ from b12x.gemm._shared.wo_mxfp8 import (
     quantize_mxfp8_rows_torch,
 )
 
+from ._blockscaled import prepared
 from ..conftest import require_b12x
+
+
+def test_regime_plan_combines_static_shapes_with_dynamic_capacity() -> None:
+    query = blockscaled.BlockscaledQuery(
+        recipe="mxfp8",
+        num_tokens=128,
+        in_features=128,
+        padded_in_features=128,
+        out_features=64,
+        expected_m=None,
+    )
+
+    plan = blockscaled.plan_regimes(query, exact_m=(1, 2, 4, 8))
+
+    assert plan.token_counts == (1, 2, 4, 8, 128)
+    assert dict(plan.capacity_metadata) == {
+        "max_rows": 128,
+        "exact_m": (1, 2, 4, 8),
+    }
 
 
 def _quantize_mxfp4_rows(
@@ -114,70 +134,6 @@ def _require_cudnn_fp4_oracle():
     return mm_fp4
 
 
-def test_serialized_mm_keeps_planning_opaque_to_dynamo() -> None:
-    lhs_values = torch.empty((6, 64), dtype=torch.uint8)
-    lhs_scale = torch.empty((128, 4), dtype=torch.uint8)
-    rhs_values = torch.empty((48, 64), dtype=torch.uint8)
-    rhs_scale = torch.empty((128, 4), dtype=torch.uint8)
-
-    def run(lhs_values, lhs_scale, rhs_values, rhs_scale):
-        return blockscaled.mm(
-            (lhs_values, lhs_scale),
-            (rhs_values, rhs_scale),
-            ab_dtype="float4_e2m1fn",
-            sf_dtype="float8_e8m0fnu",
-            c_dtype="bfloat16",
-            sf_vec_size=32,
-        )
-
-    graph, _ = torch._dynamo.export(run)(
-        lhs_values,
-        lhs_scale,
-        rhs_values,
-        rhs_scale,
-    )
-    targets = {node.target for node in graph.graph.nodes if node.op == "call_function"}
-
-    assert torch.ops.b12x.blockscaled_serialized in targets
-    assert torch.ops.b12x.dense_gemm_launch not in targets
-
-
-def test_recipe_wrappers_keep_planning_opaque_to_dynamo() -> None:
-    lhs_values = torch.empty((6, 64), dtype=torch.uint8)
-    lhs_scale = torch.empty((128, 4), dtype=torch.uint8)
-    rhs_values = torch.empty((48, 64), dtype=torch.uint8)
-    rhs_scale = torch.empty((128, 4), dtype=torch.uint8)
-    alpha = torch.ones(1, dtype=torch.float32)
-
-    def run_mxfp4(lhs_values, lhs_scale, rhs_values, rhs_scale):
-        return blockscaled.mm_mxfp4(
-            lhs_values,
-            lhs_scale,
-            rhs_values,
-            rhs_scale,
-        )
-
-    def run_nvfp4(lhs_values, lhs_scale, rhs_values, rhs_scale, alpha):
-        return blockscaled.mm_nvfp4(
-            lhs_values,
-            lhs_scale,
-            rhs_values,
-            rhs_scale,
-            alpha,
-        )
-
-    for run, args in (
-        (run_mxfp4, (lhs_values, lhs_scale, rhs_values, rhs_scale)),
-        (run_nvfp4, (lhs_values, lhs_scale, rhs_values, rhs_scale, alpha)),
-    ):
-        graph, _ = torch._dynamo.export(run)(*args)
-        targets = {
-            node.target for node in graph.graph.nodes if node.op == "call_function"
-        }
-        assert torch.ops.b12x.blockscaled_serialized in targets
-        assert torch.ops.b12x.dense_gemm_launch not in targets
-
-
 def _make_quantized_operand(
     shape: tuple[int, int, int],
     *,
@@ -197,25 +153,18 @@ def _make_quantized_operand(
     return (packed, scales), global_scale
 
 
-def _mm_nvfp4(
-    lhs: tuple[torch.Tensor, torch.Tensor],
-    rhs: tuple[torch.Tensor, torch.Tensor],
-    lhs_scale: torch.Tensor,
-    rhs_scale: torch.Tensor,
-    *,
-    c_dtype: str = "bfloat16",
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
+def _prepared_nvfp4(lhs, rhs, lhs_scale, rhs_scale, *, c_dtype="bfloat16", **options):
+    alpha = (1.0 / (lhs_scale[0] * rhs_scale[0])).view(1)
+    return prepared(
+        lhs, rhs, alpha=alpha, ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype, sf_vec_size=16, **options,
+    )
+
+
+def _mm_nvfp4(lhs, rhs, lhs_scale, rhs_scale, *, plan, c_dtype="bfloat16", out=None):
     alpha = (1.0 / (lhs_scale[0] * rhs_scale[0])).view(1)
     return blockscaled.mm(
-        lhs,
-        rhs,
-        out=out,
-        alpha=alpha,
-        ab_dtype="float4_e2m1fn",
-        sf_dtype="float8_e4m3fn",
-        c_dtype=c_dtype,
-        sf_vec_size=16,
+        lhs, rhs, plan=plan, out=out, alpha=alpha, out_dtype=getattr(torch, c_dtype),
     )
 
 
@@ -237,7 +186,8 @@ def test_mm_nvfp4_matches_flashinfer_cudnn(m, n, k, c_dtype) -> None:
     rhs, rhs_scale = _make_quantized_operand((1, n, k), dtype=torch.bfloat16)
     alpha = (1.0 / (lhs_scale[0] * rhs_scale[0])).view(1)
 
-    actual = _mm_nvfp4(lhs, rhs, lhs_scale, rhs_scale, c_dtype=c_dtype)
+    with _prepared_nvfp4(lhs, rhs, lhs_scale, rhs_scale, c_dtype=c_dtype) as plan:
+        actual = _mm_nvfp4(lhs, rhs, lhs_scale, rhs_scale, c_dtype=c_dtype, plan=plan)
 
     packed_a, sfa = lhs
     packed_b, sfb = rhs
@@ -257,14 +207,11 @@ def test_mm_nvfp4_matches_flashinfer_cudnn(m, n, k, c_dtype) -> None:
     torch.testing.assert_close(actual[:, :, 0], oracle, rtol=0, atol=0)
 
 
-def test_mm_mxfp8_grouped_batches_use_their_own_scales(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_mm_mxfp8_grouped_batches_use_their_own_scales() -> None:
     require_b12x()
     torch.manual_seed(29)
 
-    # Real grouped WO-A geometry; force the shape-gated BK64 specialization so
-    # this compact test covers its packed-scale address arithmetic for L>1.
+    # Pin BK64 to exercise packed-scale addressing across grouped WO-A batches.
     m, n, k = 64, 1024, 512
     groups = 4
     group_multipliers = torch.tensor(
@@ -288,18 +235,14 @@ def test_mm_mxfp8_grouped_batches_use_their_own_scales(
     assert not torch.equal(a_q.scale_rows[0], a_q.scale_rows[1])
     assert not torch.equal(b_q.scale_rows[0], b_q.scale_rows[1])
 
-    monkeypatch.setattr(dense_module, "_select_mxfp8_tile_k", lambda *_: 64)
-    out = blockscaled.mm(
-        (a_q.values, a_q.scale_mma),
-        (b_q.values, b_q.scale_mma),
-        ab_dtype="float8_e4m3fn",
-        sf_dtype="float8_e8m0fnu",
-        c_dtype="bfloat16",
-        sf_vec_size=32,
-        mma_tiler_mn=(128, 128),
-        expected_m=2048,
-        sfb_k_replicated=True,
-    )
+    lhs = (a_q.values, a_q.scale_mma)
+    rhs = (b_q.values, b_q.scale_mma)
+    with prepared(
+        lhs, rhs, ab_dtype="float8_e4m3fn", sf_dtype="float8_e8m0fnu",
+        c_dtype="bfloat16", sf_vec_size=32, mma_tiler_mn=(128, 128),
+        expected_m=2048, sfb_k_replicated=True, _tile_k_override=64,
+    ) as plan:
+        out = blockscaled.mm(lhs, rhs, plan=plan)
     a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).to(torch.bfloat16)
     b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.bfloat16)
     ref = torch.einsum("mkl,nkl->mnl", a_deq, b_deq).to(torch.bfloat16)
@@ -327,29 +270,38 @@ def test_mm_pair_replays_under_cuda_graph() -> None:
         (1, down_n, down_k), dtype=torch.bfloat16
     )
 
-    eager_gate = _mm_nvfp4(gate_lhs, gate_rhs, gate_ls, gate_rs)
-    eager_down = _mm_nvfp4(down_lhs, down_rhs, down_ls, down_rs)
-    torch.cuda.synchronize()
-
-    graph_gate = torch.empty_like(eager_gate)
-    graph_down = torch.empty_like(eager_down)
-
-    # Prime compiled kernels before capture, matching the serving warmup path.
-    _mm_nvfp4(gate_lhs, gate_rhs, gate_ls, gate_rs)
-    _mm_nvfp4(down_lhs, down_rhs, down_ls, down_rs)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        _mm_nvfp4(gate_lhs, gate_rhs, gate_ls, gate_rs, out=graph_gate)
-        _mm_nvfp4(down_lhs, down_rhs, down_ls, down_rs, out=graph_down)
-
-    for _ in range(3):
-        graph.replay()
-    torch.cuda.synchronize()
-
-    torch.testing.assert_close(graph_gate, eager_gate, rtol=0, atol=0)
-    torch.testing.assert_close(graph_down, eager_down, rtol=0, atol=0)
+    graph_gate = torch.empty((gate_m, gate_n, 1), device="cuda", dtype=torch.bfloat16)
+    graph_down = torch.empty((down_m, down_n, 1), device="cuda", dtype=torch.bfloat16)
+    with (
+        _prepared_nvfp4(
+            gate_lhs, gate_rhs, gate_ls, gate_rs, out=graph_gate, freeze=False,
+        ) as gate_plan,
+        _prepared_nvfp4(
+            down_lhs, down_rhs, down_ls, down_rs, out=graph_down, freeze=False,
+        ) as down_plan,
+        kernel_resolution_guard("prepared NVFP4 pair"),
+    ):
+        _mm_nvfp4(gate_lhs, gate_rhs, gate_ls, gate_rs, plan=gate_plan, out=graph_gate)
+        _mm_nvfp4(down_lhs, down_rhs, down_ls, down_rs, plan=down_plan, out=graph_down)
+        eager_gate, eager_down = graph_gate.clone(), graph_down.clone()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                _mm_nvfp4(gate_lhs, gate_rhs, gate_ls, gate_rs, plan=gate_plan, out=graph_gate)
+                _mm_nvfp4(down_lhs, down_rhs, down_ls, down_rs, plan=down_plan, out=graph_down)
+            pointers = (graph_gate.data_ptr(), graph_down.data_ptr())
+            allocated = torch.cuda.memory_allocated()
+            for _ in range(3):
+                graph_gate.fill_(float("nan"))
+                graph_down.fill_(float("nan"))
+                graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            assert (graph_gate.data_ptr(), graph_down.data_ptr()) == pointers
+            torch.testing.assert_close(graph_gate, eager_gate, rtol=0, atol=0)
+            torch.testing.assert_close(graph_down, eager_down, rtol=0, atol=0)
+        finally:
+            graph.reset()
 
 
 def test_mm_serialized_mxfp4_matches_independent_dequantized_reference() -> None:
@@ -365,58 +317,44 @@ def test_mm_serialized_mxfp4_matches_independent_dequantized_reference() -> None
     lhs_scale_storage = swizzle_block_scale(lhs_scale_rows)
     rhs_scale_storage = swizzle_block_scale(rhs_scale_rows)
 
-    actual = blockscaled.mm(
-        (lhs_values, lhs_scale_storage),
-        (rhs_values, rhs_scale_storage),
-        ab_dtype="float4_e2m1fn",
-        sf_dtype="float8_e8m0fnu",
-        c_dtype="bfloat16",
-        sf_vec_size=32,
-        expected_m=m,
-    )
-    compatibility = blockscaled.mm_mxfp4(
-        lhs_values,
-        lhs_scale_storage,
-        rhs_values,
-        rhs_scale_storage,
-        expected_m=m,
-    )
     lhs_dequant = _dequantize_mxfp4_rows(lhs_values, lhs_scale_rows)
     rhs_dequant = _dequantize_mxfp4_rows(rhs_values, rhs_scale_rows)
     expected = (lhs_dequant.to(torch.bfloat16) @ rhs_dequant.to(torch.bfloat16).T).to(
         torch.bfloat16
     )
-
-    assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(compatibility, actual, rtol=0, atol=0)
-
-    # Serving qualification: compile first, then capture/replay without a
-    # workspace or output-address change.
-    blockscaled.prewarm(
-        (rhs_values, rhs_scale_storage),
-        [m],
-        ab_dtype="float4_e2m1fn",
-        sf_dtype="float8_e8m0fnu",
-        c_dtype="bfloat16",
-        sf_vec_size=32,
-    )
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_output = blockscaled.mm_mxfp4(
-            lhs_values,
-            lhs_scale_storage,
-            rhs_values,
-            rhs_scale_storage,
-            expected_m=m,
+    with prepared(
+        (lhs_values, lhs_scale_storage), (rhs_values, rhs_scale_storage),
+        ab_dtype="float4_e2m1fn", sf_dtype="float8_e8m0fnu", c_dtype="bfloat16",
+        sf_vec_size=32, expected_m=m,
+    ) as plan:
+        actual = blockscaled.mm(
+            (lhs_values, lhs_scale_storage), (rhs_values, rhs_scale_storage),
+            plan=plan, ab_dtype="float4_e2m1fn", sf_dtype="float8_e8m0fnu",
+            c_dtype="bfloat16", sf_vec_size=32,
         )
-    output_ptr = graph_output.data_ptr()
-    for _ in range(3):
-        graph.replay()
-    torch.cuda.synchronize()
-
-    assert graph_output.data_ptr() == output_ptr
-    torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
+        launch = torch.compile(
+            lambda a, sa, b, sb: blockscaled.mm_mxfp4(a, sa, b, sb, plan=plan),
+            fullgraph=True,
+        )
+        wrapped = launch(lhs_values, lhs_scale_storage, rhs_values, rhs_scale_storage)
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(wrapped, actual, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                graph_output = launch(lhs_values, lhs_scale_storage, rhs_values, rhs_scale_storage)
+            output_ptr = graph_output.data_ptr()
+            allocated = torch.cuda.memory_allocated()
+            for _ in range(3):
+                graph_output.fill_(float("nan"))
+                graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            assert graph_output.data_ptr() == output_ptr
+            torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
+        finally:
+            graph.reset()
 
 
 def test_mm_serialized_nvfp4_and_block_fp8_match_native_views() -> None:
@@ -427,98 +365,84 @@ def test_mm_serialized_nvfp4_and_block_fp8_match_native_views() -> None:
     lhs, lhs_global_scale = _make_quantized_operand((1, m, k), dtype=torch.bfloat16)
     rhs, rhs_global_scale = _make_quantized_operand((1, n, k), dtype=torch.bfloat16)
     alpha = (1.0 / (lhs_global_scale[0] * rhs_global_scale[0])).view(1)
-    native_nvfp4 = _mm_nvfp4(lhs, rhs, lhs_global_scale, rhs_global_scale)[:, :, 0]
-    serialized_nvfp4 = blockscaled.mm(
-        (
-            lhs[0][:, :, 0],
-            convert_sf_from_mma_layout(lhs[1], m=m, k=k, num_groups=1),
-        ),
-        (
-            rhs[0][:, :, 0],
-            convert_sf_from_mma_layout(rhs[1], m=n, k=k, num_groups=1),
-        ),
-        alpha=alpha,
-        ab_dtype="float4_e2m1fn",
-        sf_dtype="float8_e4m3fn",
-        c_dtype="bfloat16",
-        sf_vec_size=16,
-        expected_m=m,
+    with _prepared_nvfp4(lhs, rhs, lhs_global_scale, rhs_global_scale) as plan:
+        native_nvfp4 = _mm_nvfp4(lhs, rhs, lhs_global_scale, rhs_global_scale, plan=plan)[:, :, 0]
+    serialized_lhs = (
+        lhs[0][:, :, 0], convert_sf_from_mma_layout(lhs[1], m=m, k=k, num_groups=1),
     )
-    torch.testing.assert_close(serialized_nvfp4, native_nvfp4, rtol=0, atol=0)
-    compatibility_nvfp4 = blockscaled.mm_nvfp4(
-        lhs[0][:, :, 0],
-        convert_sf_from_mma_layout(lhs[1], m=m, k=k, num_groups=1),
-        rhs[0][:, :, 0],
-        convert_sf_from_mma_layout(rhs[1], m=n, k=k, num_groups=1),
-        alpha,
-        expected_m=m,
+    serialized_rhs = (
+        rhs[0][:, :, 0], convert_sf_from_mma_layout(rhs[1], m=n, k=k, num_groups=1),
     )
-    torch.testing.assert_close(compatibility_nvfp4, serialized_nvfp4, rtol=0, atol=0)
+    with _prepared_nvfp4(serialized_lhs, serialized_rhs, lhs_global_scale, rhs_global_scale) as plan:
+        serialized_nvfp4 = blockscaled.mm(
+            serialized_lhs, serialized_rhs, plan=plan, alpha=alpha,
+            ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16", sf_vec_size=16,
+        )
+        launch = torch.compile(
+            lambda a, sa, b, sb, gain: blockscaled.mm_nvfp4(a, sa, b, sb, gain, plan=plan),
+            fullgraph=True,
+        )
+        wrapped_nvfp4 = launch(*serialized_lhs, *serialized_rhs, alpha)
+        torch.testing.assert_close(serialized_nvfp4, native_nvfp4, rtol=0, atol=0)
+        torch.testing.assert_close(wrapped_nvfp4, serialized_nvfp4, rtol=0, atol=0)
 
-    lhs_fp8 = torch.randn((m, k), device="cuda", dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    )
-    rhs_fp8 = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    )
+    lhs_fp8 = torch.randn((m, k), device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    rhs_fp8 = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
     lhs_scale = torch.rand((m, k // 128), device="cuda", dtype=torch.float32)
     rhs_scale = torch.rand((n // 128, k // 128), device="cuda", dtype=torch.float32)
-    native_block_fp8 = blockscaled.mm(
-        (lhs_fp8.unsqueeze(-1), lhs_scale),
-        (rhs_fp8.unsqueeze(-1), rhs_scale),
-        ab_dtype="float8_e4m3fn",
-        sf_dtype="float32",
-        c_dtype="bfloat16",
-        sf_vec_size=128,
-        block_fp8=True,
-        expected_m=m,
-    )[:, :, 0]
-    serialized_block_fp8 = blockscaled.mm(
-        (lhs_fp8, lhs_scale),
-        (rhs_fp8, rhs_scale),
-        ab_dtype="float8_e4m3fn",
-        sf_dtype="float32",
-        c_dtype="bfloat16",
-        sf_vec_size=128,
-        block_fp8=True,
-        expected_m=m,
+    native_lhs = (lhs_fp8.unsqueeze(-1), lhs_scale)
+    native_rhs = (rhs_fp8.unsqueeze(-1), rhs_scale)
+    options = dict(
+        ab_dtype="float8_e4m3fn", sf_dtype="float32", c_dtype="bfloat16",
+        sf_vec_size=128, block_fp8=True,
     )
-    torch.testing.assert_close(serialized_block_fp8, native_block_fp8, rtol=0, atol=0)
-
-    compatibility_block_fp8 = blockscaled.mm_block_fp8(
-        lhs_fp8,
-        lhs_scale,
-        rhs_fp8,
-        rhs_scale,
-        out_dtype=torch.bfloat16,
-        expected_m=m,
-    )
-    torch.testing.assert_close(
-        compatibility_block_fp8, native_block_fp8, rtol=0, atol=0
-    )
+    with prepared(native_lhs, native_rhs, expected_m=m, **options) as plan:
+        native_block_fp8 = blockscaled.mm(native_lhs, native_rhs, plan=plan)[:, :, 0]
+    with prepared((lhs_fp8, lhs_scale), (rhs_fp8, rhs_scale), expected_m=m, **options) as plan:
+        serialized_block_fp8 = blockscaled.mm(
+            (lhs_fp8, lhs_scale), (rhs_fp8, rhs_scale), plan=plan, **options,
+        )
+        wrapped_block_fp8 = blockscaled.mm_block_fp8(
+            lhs_fp8, lhs_scale, rhs_fp8, rhs_scale, plan=plan, out_dtype=torch.bfloat16,
+        )
+        torch.testing.assert_close(serialized_block_fp8, native_block_fp8, rtol=0, atol=0)
+        torch.testing.assert_close(wrapped_block_fp8, native_block_fp8, rtol=0, atol=0)
 
 
-def test_blockscaled_public_surface_and_compatibility_aliases() -> None:
-    from b12x.gemm import mxfp8_linear, tensor_fp8_linear
+def test_nvfp4_a16_preserves_logical_k_inside_padded_weight() -> None:
+    from dataclasses import replace
 
-    assert blockscaled.META.entry_points == (
-        "Weight",
-        "NVFP4LinearWeight",
-        "mm",
-        "mm_mxfp4",
-        "mm_nvfp4",
-        "mm_block_fp8",
-        "pack_weight",
-        "prewarm",
-        "is_supported",
-        "w4a16",
-        "w8a16",
-        "workspace_size",
+    device = require_b12x()
+    m, n, logical_k, stored_k = 4, 128, 136, 256
+    source = torch.randn((m, logical_k), dtype=torch.bfloat16, device=device)
+    codes = torch.randint(0, 256, (n, stored_k // 2), dtype=torch.uint8, device=device)
+    scales = torch.full(
+        (n, stored_k // 16), 0.5, dtype=torch.float8_e4m3fn, device=device
     )
-    assert mxfp8_linear.mm is blockscaled.mm
-    assert mxfp8_linear.pack_weight is blockscaled.pack_weight
-    assert tensor_fp8_linear.mm is blockscaled.mm
-    assert tensor_fp8_linear.pack_weight is blockscaled.pack_weight
-    assert tensor_fp8_linear.prewarm is blockscaled.prewarm
-    assert not hasattr(blockscaled, "mm_fused_quant_a")
-    assert not hasattr(blockscaled, "mm_fused_quant_a_grouped")
+    gain = torch.tensor([0.03125], dtype=torch.float32, device=device)
+    weight = blockscaled.pack_weight(
+        codes,
+        swizzle_block_scale(scales),
+        recipe="nvfp4",
+        global_scale=gain,
+    )
+    weight = replace(weight, in_features=logical_k)
+    with prepared(
+        source, weight, activation_mode="a16",
+        override=blockscaled.BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=2),
+    ) as plan:
+        output = blockscaled.mm(source, weight, plan=plan)
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=device,
+    )
+    decoded = torch.stack(
+        (lut[(codes & 15).long()], lut[(codes >> 4).long()]), -1
+    ).flatten(-2)
+    expected = source.float() @ (decoded[:, :logical_k] * 0.5 * gain).T
+    cosine = torch.nn.functional.cosine_similarity(
+        output.float().flatten(), expected.flatten(), dim=0
+    )
+    assert cosine.item() >= 0.999

@@ -1,4 +1,4 @@
-"""Experimental checkpoint loading into CPU-addressable CUDA storage.
+"""Checkpoint loading into owned managed or device CUDA weight storage.
 
 Importing this namespace does not initialize CUDA or build the native helper.
 """

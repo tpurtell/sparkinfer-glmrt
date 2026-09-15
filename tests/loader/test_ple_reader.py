@@ -44,6 +44,45 @@ def reader_factory():
     return native, create
 
 
+def _touched_blocks(block_bytes, spans):
+    blocks = set()
+    for offset, size in spans:
+        blocks.update(
+            range(
+                offset // block_bytes,
+                (offset + size - 1) // block_bytes + 1,
+            )
+        )
+    return blocks
+
+
+def _coalesced_read_counts(blocks, block_bytes):
+    """Count bounded contiguous runs without treating unrequested gaps as reads."""
+    max_blocks = 65536 // block_bytes
+    calls = coalesced = 0
+    previous = None
+    run_blocks = 0
+    for block in [*sorted(blocks), None]:
+        if block is None or (previous is not None and block != previous + 1):
+            full_reads, remainder = divmod(run_blocks, max_blocks)
+            calls += full_reads + bool(remainder)
+            coalesced += full_reads + (remainder > 1)
+            run_blocks = 0
+        if block is not None:
+            run_blocks += 1
+            previous = block
+    return calls, coalesced
+
+
+def _expected_rows(payloads, ids, shard_rows, width):
+    return b"".join(
+        payloads[row // shard_rows][
+            (row % shard_rows) * width : (row % shard_rows + 1) * width
+        ]
+        for row in ids
+    )
+
+
 def test_cross_block_rows_deduplicate_planes_and_preserve_compact_order(
     tmp_path, reader_factory
 ):
@@ -80,23 +119,28 @@ def test_cross_block_rows_deduplicate_planes_and_preserve_compact_order(
             else bytes(scale_bytes)
         )
     assert output[-7:] == output_scales[-7:] == b"z" * 7
-    blocks = set()
-    for row in ids:
-        if 2 <= row < 8:
-            for offset, size in [
+    stats = native.ple_reader_stats(reader)
+    block_bytes = 4096
+    blocks = _touched_blocks(
+        block_bytes,
+        (
+            (offset + row * size, size)
+            for row in ids
+            if 2 <= row < 8
+            for offset, size in (
                 (weight_offset, row_bytes),
                 (scale_offset, scale_bytes),
-            ]:
-                begin = offset + row * size
-                blocks.update(range(begin // 4096, (begin + size - 1) // 4096 + 1))
-    stats = native.ple_reader_stats(reader)
+            )
+        ),
+    )
     assert stats["unique_blocks"] == len(blocks)
     assert stats["requested_bytes"] == 5 * (row_bytes + scale_bytes)
     assert stats["read_bytes"] == sum(
-        min(4096, path.stat().st_size - block * 4096) for block in blocks
+        min(block_bytes, path.stat().st_size - block * block_bytes) for block in blocks
     )
-    assert stats["read_calls"] < stats["unique_blocks"]
-    assert stats["coalesced_reads"] > 0
+    expected_calls, expected_coalesced = _coalesced_read_counts(blocks, block_bytes)
+    assert stats["read_calls"] == expected_calls
+    assert stats["coalesced_reads"] == expected_coalesced
     assert stats["staging_bytes"] == allocation["staging_bytes"]
     assert stats["metadata_bytes"] == allocation["metadata_bytes"]
 
@@ -128,10 +172,13 @@ def test_sparse_requests_never_read_gaps_and_cap_coalescing(tmp_path, reader_fac
     native.ple_reader_run(reader, ids, output, None, len(ids))
     assert output == b"".join(payload[row * 4096 : (row + 1) * 4096] for row in ids)
     stats = native.ple_reader_stats(reader)
-    assert stats["unique_blocks"] == 21
-    assert stats["read_bytes"] == 21 * 4096
-    assert stats["read_calls"] == 3  # 16 adjacent pages, four adjacent pages, page 39.
-    assert stats["coalesced_reads"] == 2
+    block_bytes = 4096
+    blocks = _touched_blocks(block_bytes, ((row * 4096, 4096) for row in set(ids)))
+    assert stats["unique_blocks"] == len(blocks)
+    assert stats["read_bytes"] == len(blocks) * block_bytes
+    expected_calls, expected_coalesced = _coalesced_read_counts(blocks, block_bytes)
+    assert stats["read_calls"] == expected_calls
+    assert stats["coalesced_reads"] == expected_coalesced
 
 
 def test_partial_final_block_and_truncation_drain_before_reuse(
@@ -202,3 +249,68 @@ def test_sources_and_destinations_fail_before_unsafe_reads(tmp_path, reader_fact
         native.ple_reader_run(reader, memoryview(shared)[:32], shared, None, 4)
     native.ple_reader_run(reader, ids, output, None, 4)
     assert output == bytes(range(64))
+
+
+def test_large_mixed_file_batches_preserve_order_and_reuse_allocations(
+    tmp_path, reader_factory
+):
+    native, create = reader_factory
+    shard_rows, shards = 2048, 2
+    row_bytes, scale_bytes, count = 37, 11, 2080
+    weight_payloads = {}
+    scale_payloads = {}
+    reader = create(
+        shard_rows,
+        shard_rows * shards,
+        0,
+        shard_rows * shards,
+        row_bytes,
+        scale_bytes,
+        count,
+    )
+    for shard in range(shards):
+        weights = bytes(
+            (shard * 43 + index * 17 + index // 29) % 256
+            for index in range(shard_rows * row_bytes)
+        )
+        scales = bytes(
+            (shard * 71 + index * 13 + index // 7) % 256
+            for index in range(shard_rows * scale_bytes)
+        )
+        weight_payloads[shard] = weights
+        scale_payloads[shard] = scales
+        weight_path = tmp_path / f"weights-{shard}"
+        scale_path = tmp_path / f"scales-{shard}"
+        weight_offset = 137 + shard * 19
+        scale_offset = 281 + shard * 23
+        weight_path.write_bytes(b"w" * weight_offset + weights)
+        scale_path.write_bytes(b"s" * scale_offset + scales)
+        native.ple_reader_add(reader, shard, str(weight_path), weight_offset, False)
+        native.ple_reader_add(reader, shard, str(scale_path), scale_offset, True)
+
+    ids = array(
+        "q",
+        ((index * 1543 + 97) % (shard_rows * shards) for index in range(count - 32)),
+    )
+    ids.extend(ids[:32])
+    output = bytearray(count * row_bytes)
+    output_scales = bytearray(count * scale_bytes)
+    allocation = native.ple_reader_stats(reader)
+    native.ple_reader_run(reader, ids, output, output_scales, count)
+    assert output == _expected_rows(weight_payloads, ids, shard_rows, row_bytes)
+    assert output_scales == _expected_rows(scale_payloads, ids, shard_rows, scale_bytes)
+    after_large = native.ple_reader_stats(reader)
+    assert after_large["staging_bytes"] == allocation["staging_bytes"]
+    assert after_large["metadata_bytes"] == allocation["metadata_bytes"]
+
+    short_ids = array("q", [4095, 0, 2048, 97, 4095, 2048, 1])
+    native.ple_reader_run(reader, short_ids, output, output_scales, len(short_ids))
+    assert output[: len(short_ids) * row_bytes] == _expected_rows(
+        weight_payloads, short_ids, shard_rows, row_bytes
+    )
+    assert output_scales[: len(short_ids) * scale_bytes] == _expected_rows(
+        scale_payloads, short_ids, shard_rows, scale_bytes
+    )
+    after_short = native.ple_reader_stats(reader)
+    assert after_short["staging_bytes"] == allocation["staging_bytes"]
+    assert after_short["metadata_bytes"] == allocation["metadata_bytes"]

@@ -8,7 +8,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.attention import compressed_sparse_mla as mla
 from tests._reference.helpers import require_b12x
 from tests.attention.test_attention_mla_unified_corpus import (
@@ -96,8 +96,7 @@ def test_dual_cache_high_pages_public_graph(
 
     _install_scenario(inputs, 0)
     run()
-    freeze_kernel_resolution("DSV4 dual-cache high-page prefill")
-    try:
+    with kernel_resolution_guard('DSV4 dual-cache high-page prefill'):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured, lse = run()
@@ -119,5 +118,3 @@ def test_dual_cache_high_pages_public_graph(
                 lse, expected[scenario][1] / math.log(2.0),
                 atol=6.0e-2, rtol=2.0e-2,
             )
-    finally:
-        unfreeze_kernel_resolution()

@@ -222,9 +222,15 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     q_rope_bytes = hpb * q_rope_stride * 2
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
-    # --- Q-NoPE staging. FP8 normally; BF16 for native NVFP4 cache math. ---
+    # V4.1's fast arm normalizes its gathered mixed source rows in place to
+    # E4M3+UE8M0, so it uses the ordinary FP8 Q stage.  The reference arm
+    # retains its BF16 Q staging.
     q_fp8_off = off
-    q_element_bytes = 2 if traits.scale_format == ScaleFormat.NVFP4_E4M3 else 1
+    q_element_bytes = (
+        1
+        if traits.fp8_internal or traits.scale_format != ScaleFormat.NVFP4_E4M3
+        else 2
+    )
     q_fp8_bytes = hpb * q_nope_stride * q_element_bytes
     off = q_fp8_off + q_fp8_bytes
 
@@ -244,7 +250,10 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
 
     # --- Double-buffered KV footer scales (DSV4 UE8M0; inline -> 0 for GLM). ---
     kv_sc_off = off
-    has_kv_footer = traits.scale_format == ScaleFormat.UE8M0_BYTE
+    has_kv_footer = (
+        traits.scale_format == ScaleFormat.UE8M0_BYTE
+        or traits.model_type == ModelType.DSV41
+    )
     if has_kv_footer:
         # DSV4: 8 footer bytes/token (7 UE8M0 + 1 pad). Separately gathered.
         kv_sc_stride = 8  # SCALE_BYTES_PER_TOKEN
@@ -316,18 +325,14 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     sm_p_full_bytes = hpb * sm_p_full_stride * 2
     off = sm_p_full_off + sm_p_full_bytes
 
-    # --- native H16 group-1 w_head_sc (tail region; base offsets unchanged).
-    #     DSV4-only: GLM has no two-group H16 mode and sits near the carveout.
-    #     The extra 8*BI bf16 rows keep group 1's S6b ldmatrix.x4 A-loads (which
-    #     always touch 16 sm_p rows from the group base at +8 rows) inside the
-    #     allocation; those rows are read-garbage/compute-discarded, exactly
-    #     like the H8 kernel's rows 8-15. ---
+    # --- native H16 group-1 tail. DSV4 and V4.1 both use two H8 groups.
+    # Group 1's V4 rope load reaches 16 rows; V4.1 has no rope but reuses this
+    # disjoint tail for its W-scale staging, keeping both groups private. ---
     off = _align_up(off, 16)
     w_head_sc2_off = off
     w_head_sc2_bytes = (
         n_v_chunks * hpb * 4 + 8 * sm_p_full_stride * 2
-        if traits.scale_format == ScaleFormat.UE8M0_BYTE
-        and traits.scale_format != ScaleFormat.NVFP4_E4M3
+        if has_kv_footer
         else 0
     )
     off = w_head_sc2_off + w_head_sc2_bytes
@@ -409,7 +414,7 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
                 int(layout.kv_sc_buf_bytes * layout.kv_bufs),
             ]
         }
-        if (traits.scale_format == ScaleFormat.UE8M0_BYTE or traits.latent_scale_per_token)
+        if (layout.kv_sc_buf_bytes > 0)
         else {}
     )
     w_head_sc2_field = (
@@ -421,7 +426,7 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
                 16,
             ]
         }
-        if traits.scale_format == ScaleFormat.UE8M0_BYTE
+        if layout.w_head_sc2_bytes > 0
         else {}
     )
     SharedStorage.__annotations__ = {
@@ -495,9 +500,9 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
         "token_idx": layout.token_idx_off,
         "sm_p_full": layout.sm_p_full_off,
     }
-    if traits.scale_format == ScaleFormat.UE8M0_BYTE or traits.latent_scale_per_token:
+    if layout.kv_sc_buf_bytes > 0:
         expected_offsets["kv_sc"] = layout.kv_sc_off
-    if traits.scale_format == ScaleFormat.UE8M0_BYTE:
+    if layout.w_head_sc2_bytes > 0:
         expected_offsets["w_head_sc2"] = layout.w_head_sc2_off
     actual_offsets = dict(storage_cls._offsets)
     if actual_offsets != expected_offsets:
@@ -551,7 +556,7 @@ def _assert_model(
         f"traits={traits.q_nope_stride}"
     )
     # DSV4 has the separate UE8M0 footer buffer; GLM keeps scales inline.
-    if traits.scale_format == ScaleFormat.UE8M0_BYTE:
+    if traits.scale_format == ScaleFormat.UE8M0_BYTE or traits.model_type == ModelType.DSV41:
         assert layout.kv_sc_buf_bytes == traits.bi * 8, (
             f"DSV4 kv_sc footer buf must be BI*8; got {layout.kv_sc_buf_bytes}"
         )
@@ -577,6 +582,8 @@ def _run_module_asserts() -> None:
     dsv4 = _assert_model(ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
     _assert_model(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.UE8M0_BYTE)
     _assert_model(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
+    _assert_model(ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
+    _assert_model(ModelType.DSV41, ComputeMode.FP8, ScaleFormat.NVFP4_E4M3)
     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)

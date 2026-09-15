@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import replace
 
 import pytest
@@ -235,7 +236,8 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     )
     prepared = _prepare(weights)
     output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
-    binding = make_tp_moe_fp4_binding(
+    bindings = ExitStack()
+    binding = bindings.enter_context(make_tp_moe_fp4_binding(
         a=x,
         experts=prepared,
         topk_weights=topk_weights.contiguous(),
@@ -243,7 +245,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
         output=output,
         input_scales_static=True,
         quant_mode="w4a8_mx",
-    )
+    ))
     assert binding.deterministic_output
     assert binding.route_output is not None
     assert tuple(binding.route_output.shape) == (m * topk_ids.shape[1], _K)
@@ -331,7 +333,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "0")
     clear_tp_moe_caches()
     atomic_output = torch.full_like(output, float("nan"))
-    atomic_binding = make_tp_moe_fp4_binding(
+    atomic_binding = bindings.enter_context(make_tp_moe_fp4_binding(
         a=live_x,
         experts=prepared,
         topk_weights=live_topk_weights,
@@ -339,7 +341,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
         output=atomic_output,
         input_scales_static=True,
         quant_mode="w4a8_mx",
-    )
+    ))
     assert not atomic_binding.deterministic_output
     assert atomic_binding.route_output is not None
     assert tuple(atomic_binding.route_output.shape) == (1, _K)
@@ -383,3 +385,5 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
         match="deterministic route-output capacity mismatch",
     ):
         b12x_moe_fp4(binding=replace(atomic_binding, deterministic_output=True))
+    del atomic_graph, graph
+    bindings.close()

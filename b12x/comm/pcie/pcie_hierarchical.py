@@ -19,8 +19,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation.types import Plan, require_prepared
+
 from ._cuda_ipc import CudaRTLibrary
-from ._hierarchical_cute import get_hierarchical_launcher
 from .pcie_oneshot import _broadcast_gather_object, _normalize_device
 
 
@@ -214,7 +215,6 @@ class PCIeHierarchicalAllReduce:
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
         self._slab_ptrs: tuple[int, ...] = ()
-        self._launchers: dict[bool, object] = {}
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
         self._closed = False
@@ -236,21 +236,8 @@ class PCIeHierarchicalAllReduce:
             # this rank's mapped peers, so unmapped entries remain zero and
             # are dead at compile time.
             self._slab_ptrs = tuple(peer_ptrs)
-            # Resolve and load the only reachable specialization before the
-            # channel is exposed.  A first call made under CUDA graph capture
-            # must never compile or load a module.
-            with torch.cuda.device(self.device):
-                for vectorized in ({False, True} if self.vectorized_bf16x2 else {False}):
-                    self._launchers[vectorized] = get_hierarchical_launcher(
-                        self.world_size,
-                        self.rank,
-                        self.device.index or 0,
-                        threads=(112 if vectorized else self.threads),
-                        wait_nanosleep_cycles=self.wait_nanosleep_cycles,
-                        double_buffered=self.double_buffered,
-                        deferred_consumption=self.deferred_consumption,
-                        vectorized_bf16x2=vectorized,
-                    )
+            # Launchers are session-owned prepared executable objects.  This
+            # runtime owns only the caller-established IPC slabs.
         except Exception:
             for ptr in self._remote_ptrs:
                 with suppress(Exception):
@@ -279,23 +266,26 @@ class PCIeHierarchicalAllReduce:
         self,
         inp: torch.Tensor,
         *,
+        plan: Plan,
         out: Optional[torch.Tensor] = None,
         blocks: Optional[int] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
     ) -> torch.Tensor:
         del stream, channel_id
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
         if not self.should_allreduce(inp):
             raise ValueError(
                 "input does not satisfy hierarchical all-reduce requirements "
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, device={inp.device})"
             )
-        if blocks is not None:
-            selected_blocks = int(blocks)
-        elif self.blocks is not None:
-            selected_blocks = self.blocks
-        else:
-            selected_blocks = _pick_blocks(inp.numel())
+        if tuple(inp.shape) != tuple(state.query.call["inp"]["shape"]):
+            raise ValueError("input shape differs from the prepared hierarchical plan")
+        prepared = state.query.call
+        selected_blocks = int(prepared["blocks"])
+        if blocks is not None and int(blocks) != selected_blocks:
+            raise ValueError("blocks differs from the prepared hierarchical plan")
         if selected_blocks not in SUPPORTED_BLOCKS:
             raise ValueError(f"blocks must be one of {SUPPORTED_BLOCKS}")
         if self.double_buffered and selected_blocks != _pick_blocks(inp.numel()):
@@ -314,14 +304,18 @@ class PCIeHierarchicalAllReduce:
             raise ValueError(
                 "output must match input shape/dtype/device and be contiguous"
             )
-        assert len(self._slab_ptrs) == self.world_size
-        vectorized = (
-            self.vectorized_bf16x2
-            and inp.numel() <= self.vectorized_bf16x2_max_elements
-            and inp.data_ptr() % 4 == 0
-            and out.data_ptr() % 4 == 0
+        vectorized = bool(prepared["vectorized"])
+        if vectorized and (inp.data_ptr() % 4 or out.data_ptr() % 4):
+            raise ValueError("prepared BF16x2 plan requires 4-byte aligned tensors")
+        return self._run_prepared(
+            state.launcher(vectorized=vectorized),
+            inp,
+            out,
+            selected_blocks,
         )
-        launcher = self._launchers[vectorized]
+
+    def _run_prepared(self, launcher, inp, out, blocks):
+        """Invoke an already-prepared native launcher after caller validation."""
         with torch.cuda.device(self.device):
             launcher(
                 self._slab_ptrs,
@@ -334,7 +328,7 @@ class PCIeHierarchicalAllReduce:
                 self._layout.partial[1],
                 self._layout.final[1],
                 inp.numel(),
-                selected_blocks,
+                blocks,
             )
         return out
 
@@ -385,7 +379,6 @@ class PCIeHierarchicalAllReduce:
             torch.cuda.synchronize(self.device)
         dist.barrier(group=self.group)
         self._slab_ptrs = ()
-        self._launchers.clear()
         for ptr in self._remote_ptrs:
             self._ipc.cudaIpcCloseMemHandle(ptr)
         self._remote_ptrs.clear()

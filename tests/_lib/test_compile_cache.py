@@ -303,8 +303,7 @@ def test_explicit_memory_cache_hit_skips_freeze_and_disk_payload(monkeypatch):
     )
     runtime_control = importlib.import_module("b12x._lib.runtime_control")
 
-    runtime_control.freeze_kernel_resolution("cached compile remains launchable")
-    try:
+    with runtime_control.kernel_resolution_guard("cached compile remains launchable"):
         assert (
             compiler.compile(
                 test_explicit_memory_cache_hit_skips_freeze_and_disk_payload,
@@ -312,8 +311,6 @@ def test_explicit_memory_cache_hit_skips_freeze_and_disk_payload(monkeypatch):
             )
             is compiled
         )
-    finally:
-        runtime_control.unfreeze_kernel_resolution()
 
 
 def test_frozen_memory_miss_rejects_before_disk_cache_load(monkeypatch):
@@ -341,15 +338,12 @@ def test_frozen_memory_miss_rejects_before_disk_cache_load(monkeypatch):
         ),
     )
 
-    runtime_control.freeze_kernel_resolution("disk hits must not bypass freeze")
-    try:
+    with runtime_control.kernel_resolution_guard("disk hits must not bypass freeze"):
         with pytest.raises(runtime_control.KernelResolutionFrozenError):
             compiler.compile(
                 test_frozen_memory_miss_rejects_before_disk_cache_load,
                 compile_spec=compile_spec,
             )
-    finally:
-        runtime_control.unfreeze_kernel_resolution()
 
 
 def test_v6_semantic_payload_matches_independent_validators(monkeypatch):

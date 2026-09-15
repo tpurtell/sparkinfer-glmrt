@@ -10,6 +10,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation.types import Plan, require_prepared
+
 from ._cuda_ipc import CudaRTLibrary
 from ._dcp_cute_common import signal_bytes
 from .pcie_oneshot import (
@@ -384,60 +386,38 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         local_indices: torch.Tensor,
         local_scores: torch.Tensor,
         *,
-        threads: int = 512,
-        block_limit: int = 128,
+        plan: Plan,
+        threads: int | None = None,
+        block_limit: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stage exact candidates and return channel-owned owner views.
-
-        Consumers must be enqueued on this channel's stream before another
-        stage call or graph replay; the returned tensors are aliasing views,
-        not snapshots. Capture must run inside :meth:`capture`. On first CUDA
-        graph capture the channel permanently pins one staging slot. Every
-        later launch begins with the native peer barrier, so no rank can
-        overwrite that slot until every rank's prior same-stream consumer has
-        retired. The barrier stays inside the one transport kernel and
-        therefore adds no CUDA graph node.
-        """
+        """Stage candidates through the session-prepared native launcher."""
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        call = state.query.call
+        prepared_threads = int(call["threads"])
+        prepared_limit = int(call["block_limit"])
+        if int(local_indices.shape[0]) != int(call["rows"]):
+            raise ValueError("rows differs from the prepared DCP top-k plan")
+        if threads is not None and int(threads) != prepared_threads:
+            raise ValueError("threads differs from the prepared DCP top-k plan")
+        if block_limit is not None and int(block_limit) != prepared_limit:
+            raise ValueError("block_limit differs from the prepared DCP top-k plan")
         with _device_guard(self.device):
             return self._stage_candidates_on_device(
                 local_indices,
                 local_scores,
-                threads=threads,
-                block_limit=block_limit,
-            )
-
-    def prepare_graph(self, *, threads: int = 512) -> None:
-        """Compile the exact graph launcher before capture begins."""
-        if self._closed:
-            raise RuntimeError("PCIeDCPTopKOwnerExchange is closed")
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError("prepare_graph() must be called before CUDA graph capture")
-        _validate_launch_config(
-            threads=int(threads),
-            block_limit=1,
-            world_size=self.world_size,
-        )
-        with _device_guard(self.device):
-            self._bind_stream()
-            from ._dcp_topk_cute import prepare_topk_stage
-
-            prepare_topk_stage(
-                self.world_size,
-                self.rank,
-                self.topk,
-                int(threads),
+                launcher=state.launcher(),
+                threads=prepared_threads,
+                block_limit=prepared_limit,
             )
 
     @contextmanager
-    def capture(self, *, threads: int = 512):
-        """Own one serialized graph capture without adding graph nodes.
-
-        Enter this context before ``torch.cuda.graph``. Graphs captured from
-        this instance share one epoch and must never replay concurrently.
-        """
+    def capture(self, *, plan: Plan):
+        """Serialize capture for an already-prepared owner exchange."""
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
         if self._capture_context_depth:
             raise RuntimeError("overlapping DCP top-k capture contexts are not allowed")
-        self.prepare_graph(threads=threads)
         self._capture_context_depth = 1
         try:
             yield self
@@ -449,6 +429,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         local_indices: torch.Tensor,
         local_scores: torch.Tensor,
         *,
+        launcher,
         threads: int,
         block_limit: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -486,18 +467,6 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
                     "DCP top-k CUDA graph capture requires an active "
                     "owner.capture() context"
                 )
-            from ._dcp_topk_cute import is_topk_stage_prepared
-
-            if not is_topk_stage_prepared(
-                self.world_size,
-                self.rank,
-                self.topk,
-                int(threads),
-            ):
-                raise RuntimeError(
-                    "cold DCP top-k CUDA graph capture is not allowed; "
-                    "enter owner.capture() before torch.cuda.graph()"
-                )
         if capturing and self._graph_slot is None:
             self._graph_slot = self._next_slot
         if self._graph_slot is not None:
@@ -508,6 +477,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             self._next_slot ^= 1
             wait_for_prior_consumer = False
         self._launch_stage(
+            launcher,
             local_indices,
             local_scores,
             slot=slot,
@@ -541,6 +511,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
 
     def _launch_stage(
         self,
+        launcher,
         local_indices: torch.Tensor,
         local_scores: torch.Tensor,
         *,
@@ -550,22 +521,16 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         blocks: int,
         wait_for_prior_consumer: bool,
     ) -> None:
-        from ._dcp_topk_cute import stage_owner_candidates
-
         with torch.cuda.device(self.device):
-            stage_owner_candidates(
-                world_size=self.world_size,
-                rank=self.rank,
-                topk=self.topk,
-                threads=threads,
-                local_indices_ptr=local_indices.data_ptr(),
-                local_scores_ptr=local_scores.data_ptr(),
-                candidate_ptrs=self._staging_ptrs[slot],
-                signal_ptrs=self._signal_ptrs,
-                rows=rows,
-                candidate_plane_elems=self._candidate_plane_elems,
-                blocks=blocks,
-                wait_for_prior_consumer=wait_for_prior_consumer,
+            launcher(
+                local_indices.data_ptr(),
+                local_scores.data_ptr(),
+                self._staging_ptrs[slot],
+                self._signal_ptrs,
+                rows,
+                self._candidate_plane_elems,
+                blocks,
+                wait_for_prior_consumer,
             )
 
 

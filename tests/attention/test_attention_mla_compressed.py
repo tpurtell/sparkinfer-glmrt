@@ -8,7 +8,7 @@ import torch
 
 import b12x.attention._shared.mla.compressed_api as compressed_api_impl
 import b12x.attention._shared.mla.merge as mla_split_impl
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.attention._shared.workspace import (
     B12XAttentionArena,
     B12XAttentionArenaCaps,
@@ -228,10 +228,7 @@ def test_split_sink_merge_live_rows_do_not_resolve_new_kernel() -> None:
         device=device,
         seed=6121,
     )
-    freeze_kernel_resolution(
-        "split sink merge live rows and chunks should reuse padded capture"
-    )
-    try:
+    with kernel_resolution_guard('split sink merge live rows and chunks should reuse padded capture'):
         mla_split_impl.run_sparse_mla_split_decode_merge(
             tmp_output=live_args[0],
             tmp_lse=live_args[1],
@@ -240,8 +237,6 @@ def test_split_sink_merge_live_rows_do_not_resolve_new_kernel() -> None:
             output=live_args[4],
         )
         torch.cuda.synchronize(device)
-    finally:
-        unfreeze_kernel_resolution()
 
     assert compile_cache_info()["compile_misses"] == warm_misses
     assert torch.isfinite(live_args[4].float()).all()

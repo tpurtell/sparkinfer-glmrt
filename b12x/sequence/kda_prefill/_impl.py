@@ -5,20 +5,18 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
 
 import torch
 
 from b12x._lib.scratch import ScratchBufferSpec
-from b12x.policy import PolicyContext, get_auto_policy
+from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
+from b12x.preparation.types import require_prepared
 from .._shared.kda_math import KDA_HEAD_DIM
 from .._shared.tensors import canonical_device, positive
 from .._shared.delta_prefill.contract import (
-    Binding as _SharedBinding, Plan as _SharedPlan, bind_tensors, materialize_plan,
+    Binding as _SharedBinding, Layout as _SharedLayout, bind_tensors, materialize_layout,
 )
-from ._policy import CHUNK_TOKENS, KDA_PREFILL_POLICY, KdaPrefillQuery, tiles_capacity
-
-MetadataValidation = Literal["transactional", "trusted"]
+from ._tuning import CHUNK_TOKENS, KdaPrefillConfig, KdaPrefillQuery, tiles_capacity
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -36,7 +34,6 @@ class Caps:
     qk_l2norm: bool = True
     checkpoint_export: bool = False
     null_state_index: int | None = None
-    metadata_validation: MetadataValidation = "transactional"
     chunk_tokens: int = 16
 
     def __post_init__(self) -> None:
@@ -57,8 +54,6 @@ class Caps:
             raise ValueError("state_dtype must be torch.float32")
         if self.chunk_tokens != CHUNK_TOKENS:
             raise ValueError(f"chunk_tokens must be {CHUNK_TOKENS}")
-        if self.metadata_validation not in ("transactional", "trusted"):
-            raise ValueError("metadata_validation must be 'transactional' or 'trusted'")
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
         object.__setattr__(self, "checkpoint_export", bool(self.checkpoint_export))
         if self.null_state_index is not None:
@@ -86,24 +81,28 @@ class Caps:
 
 
 @dataclass(frozen=True)
-class Plan(_SharedPlan):
-    """Fixed KDA launch policy and caller-owned workspace contract."""
+class _Layout(_SharedLayout):
+    """Fixed KDA launch geometry and caller-owned workspace contract."""
 
     caps: Caps
     _scratch_specs: tuple[ScratchBufferSpec, ...]
 
-    def bind(self, **kwargs) -> "Binding":
-        return bind(self, **kwargs)
 
 
 @dataclass(frozen=True)
 class Binding(_SharedBinding):
     """Caller-owned tensors for lower-bounded KDA prefill."""
 
-    plan: Plan
+    _state: _Layout
 
 
-def _query(caps: Caps) -> KdaPrefillQuery:
+def staging_memory(caps: Caps) -> MemoryRequirements:
+    """KDA prefill binds its existing caller-owned capacity buffers directly."""
+    del caps
+    return MemoryRequirements()
+
+
+def _query(caps: Caps, invocation: FrozenMapping) -> KdaPrefillQuery:
     return KdaPrefillQuery(
         heads=caps.heads,
         head_dim=caps.head_dim,
@@ -113,35 +112,35 @@ def _query(caps: Caps) -> KdaPrefillQuery:
         checkpoint_export=caps.checkpoint_export,
         max_tokens=caps.max_tokens,
         max_seqs=caps.max_seqs,
+        max_state_slots=caps.max_state_slots, null_state_index=caps.null_state_index,
+        **dict(invocation),
     )
 
 
-def _materialize_plan(caps: Caps, **kwargs) -> Plan:
-    return materialize_plan(caps, plan_type=Plan, **kwargs)
+def _materialize_layout(caps: Caps, config: KdaPrefillConfig) -> _Layout:
+    return materialize_layout(
+        caps, layout_type=_Layout, v_split=config.v_split, k_split=config.k_split,
+        stages=config.stages, window_tiles=config.window_tiles,
+    )
 
 
-def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
-    """Resolve the policy once and lay out the scratch for ``caps``."""
+def plan(caps: Caps, *, invocation: FrozenMapping = FrozenMapping(), override: KdaPrefillConfig | None = None) -> Plan:
+    """Declare KDA prefill without compiling or allocating resources."""
+    from ._preparation import make_plan
     if not isinstance(caps, Caps):
         raise TypeError("caps must be kda_prefill.Caps")
-    policy = policy or get_auto_policy(caps.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(caps.device)
-    resolution = policy.resolve(KDA_PREFILL_POLICY, _query(caps))
-    return _materialize_plan(
-        caps,
-        v_split=int(resolution.config.v_split),
-        k_split=int(resolution.config.k_split),
-        stages=int(resolution.config.stages),
-        window_tiles=int(resolution.config.window_tiles),
-        policy_resolution=resolution,
-    )
+    return make_plan(caps, invocation=invocation, override=override)
 
 
-def bind(
-    plan: Plan,
+def bind(plan: Plan, **kwargs) -> Binding:
+    state = require_prepared(plan, "sequence.kda_prefill")
+    return state.bind(_plan=plan, **kwargs)
+
+
+def _bind(
+    plan: _Layout,
     *,
+    _plan: Plan | None = None,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     q: torch.Tensor,
     k: torch.Tensor,
@@ -165,10 +164,10 @@ def bind(
     Live capacities come from the bound tensors: ``q.shape[0]`` tokens and
     ``cu_seqlens.numel() - 1`` sequences, each at most the planned capacity.
     """
-    if not isinstance(plan, Plan):
-        raise TypeError("plan must be kda_prefill.Plan")
+    if not isinstance(plan, _Layout):
+        raise TypeError("binding requires a KDA prefill layout")
     return bind_tensors(
-        plan, binding_type=Binding, scratch=scratch, q=q, k=k, v=v,
+        plan, binding_type=Binding, _plan=_plan, scratch=scratch, q=q, k=k, v=v,
         raw_g=raw_g, raw_beta=raw_beta, A_log=A_log, dt_bias=dt_bias,
         recurrent_state=recurrent_state, cu_seqlens=cu_seqlens,
         initial_state_indices=initial_state_indices, final_state_indices=final_state_indices,
@@ -203,34 +202,21 @@ def run(
 
     ``max_live_tokens`` and ``max_live_seqs`` are optional host-side upper
     bounds on the device counts; they only limit how many pipeline windows are
-    launched. Under transactional validation a run whose live tiles exceed the
-    launched windows fails closed like any other malformed metadata; under
-    trusted validation the bounds are part of the caller's contract.
+    launched, so the bounds are part of the caller's contract: live tiles
+    beyond the launched windows are not processed.
 
     A sequence whose tiles span more than one pipeline window keeps its
     running state in its final state slot between windows, so such a
-    sequence must have a non-null final slot (transactional validation flags
-    a null one as an invalid slot).
+    sequence must have a non-null final slot. Packed metadata is not checked
+    on the device; the caller supplies in-range, conflict-free slots.
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be kda_prefill.Binding")
-    lower_bound_value, scale_value, eps_value = _check_run_scalars(lower_bound, scale, eps)
-    windows = binding.plan.launched_windows(max_live_tokens, max_live_seqs)
-    from .._shared.delta_prefill._cute_kernels import run_prefill
-
-    run_prefill(
-        binding, lower_bound=lower_bound_value, scale=scale_value, eps=eps_value, windows=windows
-    )
-    return binding.output
+    state = require_prepared(binding.plan, "sequence.kda_prefill", binding.output.device)
+    return state.run(binding, lower_bound=lower_bound, scale=scale, eps=eps,
+                     max_live_tokens=max_live_tokens, max_live_seqs=max_live_seqs)
 
 
-def prewarm(binding: Binding) -> None:
-    """Compile every kernel specialization of ``binding`` without launching."""
-    if not isinstance(binding, Binding):
-        raise TypeError("binding must be kda_prefill.Binding")
-    from .._shared.delta_prefill._cute_kernels import prewarm_binding
-
-    prewarm_binding(binding)
 
 
 __all__ = [
@@ -239,6 +225,5 @@ __all__ = [
     "Plan",
     "bind",
     "plan",
-    "prewarm",
     "run",
 ]

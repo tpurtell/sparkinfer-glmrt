@@ -12,19 +12,10 @@ A three-stage pipeline whose outputs feed ``attention.sparse_mla`` /
    ``q2k_indices_decode`` / ``q2k_indices_prefill`` (+ query-position
    helpers).
 
-The production paged DSA lifecycle is ``plan(Caps(...))`` -> ``bind`` ->
-``run(binding)``. Planning owns route and scratch selection, binding captures
-all live tensors without allocating, and execution launches the selected route.
-For ``cache_format="mxfp4"``, ``score`` exposes the BF16 rank-local head sum;
-the integrator all-reduces that buffer in place before ``select``. The source
-recipe emits sorted block8 candidates; later indexers score only those bounded
-logical positions. ``quantize_q_mxfp4`` and ``quantize_write_index_k_mxfp4``
-consume BF16 vectors with their last 64 dimensions already RoPE-rotated.
-MXFP4 ``Caps.page_size`` counts stored index states, not uncompressed input
-tokens, and must match the cache writer's ``page_size``. This lets a serving
-allocator pack main KV and index K for the same logical token block without
-turning the indexer's former 64-state default into a separate allocation unit.
-The FP8 recipe continues to require 64-state pages.
+The production paged DSA lifecycle is ``plan(Caps(...), invocation=...)`` →
+``PreparationSession.prepare`` → ``bind(Plan, ...)`` → ``run``.
+Declarations carry no executable layout, CUDA allocation, or policy result.
+Lower-level scorer and selector stages are private implementation facets.
 
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
 """
@@ -50,6 +41,9 @@ META = OpMeta(
         "select",
         "quantize_q_mxfp4",
         "quantize_write_index_k_mxfp4",
+        "scratch_specs",
+        "invocation_from_descriptors",
+        "invocation_from_tensors",
         "index_mxfp4_page_bytes",
         "MXFP4_INDEX_PAGE_BYTES",
         "INDEX_HEAD_DIM",
@@ -57,8 +51,8 @@ META = OpMeta(
         "is_supported",
         "clear_caches",
     ),
-    dtypes=("bf16", "fp8_e4m3", "mxfp4"),
-    recipes=("dsv4", "dsv4.1", "glm_nsa", "msa"),
+    dtypes=("bf16", "fp8_e4m3"),
+    recipes=("dsv4", "glm_nsa", "msa"),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",

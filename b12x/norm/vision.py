@@ -85,7 +85,6 @@ class _Vision:
                 if col < self.width:
                     index = Int64(row) * Int64(self.width) + Int64(col)
                     value = Float32(x[index])
-                    # Default GELU is erf-based, not the tanh approximation.
                     out[index] = BFloat16(Float32(0.5) * value * (
                         Float32(1.0) + cute.math.erf(value * Float32(0.7071067811865476))))
 
@@ -96,12 +95,9 @@ def _compile(operation, width, heads, ratio, device):
     entry = _Vision(operation, width, heads, ratio)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
     types = (BFloat16, BFloat16, BFloat16, BFloat16, Float32, Int32)
-    pointers = tuple(make_ptr(t, 16, cute.AddressSpace.gmem,
-                              assumed_align=t.width // 8) for t in types)
+    pointers = tuple(make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8) for t in types)
     with torch.cuda.device(device):
-        compiled = compile_cute(entry, *pointers, Int32(1), Int32(1), Int32(1),
-                                current_cuda_stream(), compile_spec=KernelCompileSpec.from_key(
-                                    "norm.vision." + operation, 1, key))
+        compiled = compile_cute(entry, *pointers, Int32(1), Int32(1), Int32(1), current_cuda_stream(), compile_spec=KernelCompileSpec.from_key("norm.vision." + operation, 1, key))
     return compiled, types
 
 
@@ -112,33 +108,34 @@ def _check(x, out):
         raise ValueError("vision input/output must be contiguous on the same device")
 
 
-def _run(operation, x, out, rows, height=1, width=1, heads=1, ratio=1,
-         k=None, v=None, inv=None, cu=None):
+def _run_state(state, x, out, rows, height=1, width=1, k=None, v=None, inv=None, cu=None):
+    """Launch an already-resolved vision specialization."""
     if rows == 0:
         return out
-    channels = x.shape[-1] // 3 if operation == "rope" else x.shape[-1]
-    compiled, types = _compile(operation, channels, heads, ratio, x.device.index)
+    query = state.query
+    channels = x.shape[-1] // 3 if query.operation == "rope" else x.shape[-1]
+    if query.channels != channels:
+        raise ValueError("prepared vision plan has incompatible channel geometry")
     tensors = (x, out, k, v, inv, cu)
-    # Unused pointer arguments are never dereferenced by the static operation.
-    pointers = tuple(make_ptr(t, (tensor if tensor is not None else x).data_ptr(),
-                              cute.AddressSpace.gmem, assumed_align=t.width // 8)
-                     for t, tensor in zip(types, tensors, strict=True))
+    pointers = tuple(make_ptr(t, (tensor if tensor is not None else x).data_ptr(), cute.AddressSpace.gmem, assumed_align=t.width // 8) for t, tensor in zip(state.types, tensors, strict=True))
     with torch.cuda.device(x.device):
-        run_compiled(compiled, (*pointers, Int32(rows), Int32(height), Int32(width),
-                                current_cuda_stream()))
+        run_compiled(state.compiled, (*pointers, Int32(rows), Int32(height), Int32(width), current_cuda_stream()))
     return out
 
 
-def run_gelu(x, *, out):
-    """BF16 default (erf) GELU, with FP32 intermediate arithmetic."""
+def run_gelu(x, *, out, plan):
+    from b12x.preparation.types import require_prepared
     _check(x, out)
     if x.ndim != 2 or out.shape != x.shape:
         raise ValueError("GELU requires matching [rows, channels] tensors")
-    return _run("gelu", x, out, x.shape[0])
+    state = require_prepared(plan, "norm.vision", x.device)
+    if state.query.operation != "gelu":
+        raise ValueError("prepared plan is not a GELU operation")
+    return _run_state(state, x, out, x.shape[0])
 
 
-def run_spatial_merge(x, height, width, *, ratio=3, out):
-    """Right/bottom zero-padding then channel-major r-by-r unfold."""
+def run_spatial_merge(x, height, width, *, ratio=3, out, plan):
+    from b12x.preparation.types import require_prepared
     _check(x, out)
     if height <= 0 or width <= 0 or ratio <= 0 or x.ndim != 2:
         raise ValueError("spatial merge requires positive image dimensions and ratio")
@@ -147,16 +144,14 @@ def run_spatial_merge(x, height, width, *, ratio=3, out):
         raise ValueError("spatial merge input/output shape mismatch")
     if x.data_ptr() == out.data_ptr():
         raise ValueError("spatial merge must not be in-place")
-    return _run("merge", x, out, rows, height, width, ratio=ratio)
+    state = require_prepared(plan, "norm.vision", x.device)
+    if state.query.operation != "merge" or state.query.ratio != ratio:
+        raise ValueError("prepared spatial merge has incompatible geometry")
+    return _run_state(state, x, out, rows, height, width)
 
 
-def run_rope_qkv(qkv, height, width, inv_freq, *, q, k, v, cu_seqlens):
-    """Split QKV and rotate split halves with height then width frequencies.
-
-    q/k/v are [planned_capacity, heads, dim]; only height*width rows are
-    written. cu_seqlens becomes [0, height*width], isolating this image even
-    when the capacity buffers contain stale rows from an earlier image.
-    """
+def run_rope_qkv(qkv, height, width, inv_freq, *, q, k, v, cu_seqlens, plan):
+    from b12x.preparation.types import require_prepared
     _check(qkv, q)
     for tensor in (k, v):
         _check(qkv, tensor)
@@ -174,5 +169,17 @@ def run_rope_qkv(qkv, height, width, inv_freq, *, q, k, v, cu_seqlens):
         raise ValueError("vision metadata must share the QKV device")
     if len({t.data_ptr() for t in (qkv, q, k, v)}) != 4:
         raise ValueError("QKV input and split outputs must not alias")
-    return _run("rope", qkv, q, rows, height, width, heads=heads,
-                k=k, v=v, inv=inv_freq, cu=cu_seqlens)
+    state = require_prepared(plan, "norm.vision", qkv.device)
+    if state.query.operation != "rope" or state.query.heads != heads:
+        raise ValueError("prepared rotary plan has incompatible geometry")
+    return _run_state(state, qkv, q, rows, height, width, k=k, v=v, inv=inv_freq, cu=cu_seqlens)
+
+
+# Declarations stay separate from this kernel implementation so constructing a
+# plan cannot allocate, load, or compile a native executable.
+from ._vision_preparation import TUNING, VisionQuery, VisionState, plan
+
+__all__ = [
+    "VisionQuery", "VisionState", "TUNING", "plan", "run_gelu",
+    "run_spatial_merge", "run_rope_qkv",
+]

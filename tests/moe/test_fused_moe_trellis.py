@@ -10,7 +10,13 @@ import torch
 
 pytest.importorskip("cutlass")
 
-from b12x.moe import fused_moe
+from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+from b12x.moe._shared.execution import MoEWeightPreparationPlan
+from b12x.moe.fused_moe._impl import TPMoEScratchCaps, TPMoEScratchPlan, plan_tp_moe_scratch
+
+# Full-rotation Trellis is ineligible for the W4A16 direct-route backend.
+_TRELLIS_CONFIG = MoeDecodeConfig(backend="w4a16", route_planner="internal",
+    max_active_clusters=None, w4a16_route_mode="packed")
 from b12x.moe.fused_moe import META as FUSED_MOE_META
 from b12x.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
 from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
@@ -53,7 +59,7 @@ def _weight_plan(
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
     codebook: str = "mcg",
     coupled_hadamard: bool | None = None,
-) -> fused_moe.WeightsPlan:
+) -> MoEWeightPreparationPlan:
     # These tests deliberately exercise private historical kernel recipes that
     # are not representable by the canonical checkpoint schema.
     plan = plan_b12x_fp4_moe_weights(
@@ -73,7 +79,7 @@ def _weight_plan(
     return plan
 
 
-def _caps(**overrides) -> fused_moe.Caps:
+def _caps(**overrides) -> TPMoEScratchCaps:
     values = {
         "max_tokens": 32,
         "num_topk": 8,
@@ -92,7 +98,8 @@ def _caps(**overrides) -> fused_moe.Caps:
         intermediate_size=values.pop("intermediate_size"),
         input_dtype=values.pop("input_dtype"),
     )
-    return fused_moe.Caps(
+    return TPMoEScratchCaps(
+        decode_config=_TRELLIS_CONFIG,
         weight_plan=weight_plan,
         quant_mode="w4a16",
         **values,
@@ -210,7 +217,7 @@ def _prepare_weights(
     activation: str = "silu",
     codebook: str = "mcg",
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
-) -> fused_moe.ExpertWeights:
+) -> B12XFP4ExpertWeights:
     bits = int(w13.shape[-1]) // 16
     plan = _weight_plan(
         num_experts=int(w13.shape[1]),
@@ -261,7 +268,7 @@ def _prepare_weights(
 
 
 def _plan(
-    weights: fused_moe.ExpertWeights,
+    weights: B12XFP4ExpertWeights,
     *,
     max_tokens: int,
     num_topk: int,
@@ -270,9 +277,10 @@ def _plan(
     device: torch.device | str,
     swiglu_limit: float | None = None,
     full_rotation_output_dtype: torch.dtype = torch.float32,
-) -> fused_moe.Plan:
-    return fused_moe.plan(
-        fused_moe.Caps(
+) -> TPMoEScratchPlan:
+    return plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+        decode_config=_TRELLIS_CONFIG,
             max_tokens=max_tokens,
             num_topk=num_topk,
             route_num_experts=route_num_experts,
@@ -1140,8 +1148,7 @@ def test_full_rotation_topk16_route_parallel_sum_matches_reference(bits: int) ->
     router_weights = torch.rand((1, topk), dtype=torch.float32, device=device)
     router_weights /= router_weights.sum(dim=1, keepdim=True)
 
-    binding = fused_moe.bind(
-        plan,
+    binding = plan.bind(
         scratch=scratch,
         a=x,
         experts=weights,
@@ -1268,8 +1275,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
     output_map = torch.tensor([-1, 0, -1, 1], dtype=torch.int32, device=device)
     external_output = torch.empty((2, hidden), dtype=output_dtype, device=device)
 
-    mapped = fused_moe.bind(
-        plan,
+    mapped = plan.bind(
         scratch=scratch,
         a=x,
         experts=weights,
@@ -1279,7 +1285,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         output_expert_map=output_map,
         output=external_output,
     )
-    mapped_output = fused_moe.run(binding=mapped)
+    mapped_output = mapped.run()
     torch.cuda.synchronize(device)
     assert mapped_output.data_ptr() == external_output.data_ptr()
     mapped_eager = mapped_output.clone()
@@ -1302,8 +1308,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         fp32_external = torch.empty(
             (2, hidden), dtype=torch.float32, device=device
         )
-        fp32_mapped = fused_moe.bind(
-            fp32_plan,
+        fp32_mapped = fp32_plan.bind(
             scratch=fp32_scratch,
             a=x,
             experts=weights,
@@ -1313,12 +1318,11 @@ def test_planned_full_rotation_matches_reference_and_captures(
             output_expert_map=output_map,
             output=fp32_external,
         )
-        fp32_result = fused_moe.run(binding=fp32_mapped)
+        fp32_result = fp32_mapped.run()
         torch.cuda.synchronize(device)
         assert torch.equal(mapped_eager, fp32_result.to(torch.bfloat16))
 
-    identity = fused_moe.bind(
-        plan,
+    identity = plan.bind(
         scratch=scratch,
         a=x,
         experts=weights,
@@ -1351,8 +1355,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
     assert float(relative_error) <= 2.0e-2
     assert float(cosine) >= 0.999
 
-    mapped = fused_moe.bind(
-        plan,
+    mapped = plan.bind(
         scratch=scratch,
         a=x,
         experts=weights,
@@ -1454,8 +1457,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
         router_weights = torch.tensor(
             [[0.65, 0.35], [0.2, 0.8]], dtype=torch.float32, device=device
         )
-        binding = fused_moe.bind(
-            plan,
+        binding = plan.bind(
             scratch=scratch,
             a=x,
             experts=weights,
@@ -1477,7 +1479,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
                 "pack_topk_routes_by_expert",
                 _route_pack_must_not_run,
             )
-            actual = fused_moe.run(binding=binding).clone()
+            actual = binding.run().clone()
         torch.cuda.synchronize(device)
         reference = _reference_full_rotation(
             x,
@@ -1514,8 +1516,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
             masked_router_weights = router_weights.clone()
             masked_router_weights[0, 1] = 0.0
             masked_router_weights[1].zero_()
-            invalid_binding = fused_moe.bind(
-                plan,
+            invalid_binding = plan.bind(
                 scratch=scratch,
                 a=x,
                 experts=weights,
@@ -1738,8 +1739,7 @@ def test_planned_full_rotation_small_m_partial_blocks(m: int) -> None:
     def _run(rows: slice) -> torch.Tensor:
         # NaN-poison the arena so a padding-slot read cannot pass silently.
         scratch.fill_(0xFF)
-        binding = fused_moe.bind(
-            plan,
+        binding = plan.bind(
             scratch=scratch,
             a=x[rows].contiguous(),
             experts=weights,
@@ -1747,7 +1747,7 @@ def test_planned_full_rotation_small_m_partial_blocks(m: int) -> None:
             topk_ids=ids[rows].contiguous(),
         )
         assert binding.route_block_size_m == plan.caps.w4a16_block_size_m
-        out = fused_moe.run(binding=binding)
+        out = binding.run()
         torch.cuda.synchronize(device)
         return out.clone()
 
@@ -1835,8 +1835,7 @@ def test_planned_full_rotation_capture_below_capacity(m: int) -> None:
     router_weights = torch.rand((m, topk), dtype=torch.float32, device=device)
     router_weights /= router_weights.sum(dim=1, keepdim=True)
 
-    eager_binding = fused_moe.bind(
-        plan,
+    eager_binding = plan.bind(
         scratch=scratch,
         a=x,
         experts=weights,
@@ -1850,8 +1849,7 @@ def test_planned_full_rotation_capture_below_capacity(m: int) -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        binding = fused_moe.bind(
-            plan,
+        binding = plan.bind(
             scratch=scratch,
             a=x,
             experts=weights,

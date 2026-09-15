@@ -10,6 +10,7 @@ initialization before use.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import lru_cache
 import os
 
@@ -27,6 +28,7 @@ from b12x._lib.compiler import (
     launch as b12x_launch,
     tensor_compile_fact,
 )
+from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import (
     atomic_add_shared_i32,
     ld_shared_i32,
@@ -480,6 +482,26 @@ def _exact_overflow_fallback(
 
 
 def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
+    if compile_only_launches_enabled() and (
+        hasattr(tensor, "fake_mode") or tensor.device.type == "meta"
+    ):
+        from cutlass.cute.runtime import make_fake_tensor
+
+        leading_dim = next(
+            (idx for idx, stride in enumerate(tensor.stride()) if stride == 1),
+            None,
+        )
+        shape = tuple(cute.sym_int(32) for _ in tensor.shape)
+        strides = tuple(
+            1 if idx == leading_dim else cute.sym_int(64)
+            for idx in range(tensor.ndim)
+        )
+        return make_fake_tensor(
+            dtype,
+            shape,
+            strides,
+            assumed_align=assumed_align,
+        )
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
     if tensor.ndim >= 1:
@@ -1356,6 +1378,8 @@ def run_tiled_topk(
     output_row_stride: int | None = None,
     output_row_base: int = 0,
     write_values: bool = True,
+    launcher=None,
+    launcher_sink: dict[tuple[object, ...], object] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select tiled row top-k indices and optionally materialize their scores.
 
@@ -1636,12 +1660,25 @@ def run_tiled_topk(
             "policy",
         ),
     )
-    b12x_launch(
-        kernel,
-        compile_spec=compile_spec,
-        compile_args=args,
-        runtime_args=args,
+    launcher_key = (
+        "tiled", bool(is_first), bool(output_physical_slots),
+        int(extent_splits), bool(write_values),
     )
+    if isinstance(launcher, Mapping):
+        launcher = launcher[launcher_key]
+    if launcher is not None:
+        from b12x._lib.compiler import run_compiled
+
+        run_compiled(launcher, args)
+    else:
+        resolved = b12x_launch(
+            kernel,
+            compile_spec=compile_spec,
+            compile_args=args,
+            runtime_args=args,
+        )
+        if launcher_sink is not None:
+            launcher_sink[launcher_key] = resolved
     return topk_values, topk_indices
 
 
@@ -1655,6 +1692,8 @@ def run_row_topk(
     output_index_offset: int = 0,
     output_gather_table: torch.Tensor | None = None,
     write_values: bool = True,
+    launcher=None,
+    launcher_sink: dict[tuple[object, ...], object] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact row-wise topk over a dense row-major logits tile.
 
@@ -1742,19 +1781,6 @@ def run_row_topk(
     carry_indices = topk_indices
     flat_carry_values = carry_values.reshape(-1)
     flat_carry_indices = carry_indices.reshape(-1)
-    smem_candidate_capacity = _resolve_smem_candidate_capacity(topk=topk)
-    kernel = _build_row_topk_kernel(
-        topk,
-        output_gather_table is not None,
-        smem_candidate_capacity,
-        bool(write_values),
-    )
-    input_key_tensor = row_logits
-    lengths_key_tensor = lengths
-    values_key_tensor = topk_values
-    indices_key_tensor = topk_indices
-    carry_values_key_tensor = carry_values
-    carry_indices_key_tensor = carry_indices
     args = (
         _to_kernel_tensor(flat_input, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(lengths, cutlass.Int32, assumed_align=4),
@@ -1784,6 +1810,27 @@ def run_row_topk(
         Int32(0),
         current_cuda_stream(),
     )
+    launcher_key = ("row", bool(output_gather_table is not None), bool(write_values))
+    if isinstance(launcher, Mapping):
+        launcher = launcher[launcher_key]
+    if launcher is not None:
+        from b12x._lib.compiler import run_compiled
+
+        run_compiled(launcher, args)
+        return topk_values, topk_indices
+    smem_candidate_capacity = _resolve_smem_candidate_capacity(topk=topk)
+    kernel = _build_row_topk_kernel(
+        topk,
+        output_gather_table is not None,
+        smem_candidate_capacity,
+        bool(write_values),
+    )
+    input_key_tensor = row_logits
+    lengths_key_tensor = lengths
+    values_key_tensor = topk_values
+    indices_key_tensor = topk_indices
+    carry_values_key_tensor = carry_values
+    carry_indices_key_tensor = carry_indices
     cache_key = (
         _flat_tensor_compile_key("logits", input_key_tensor, dynamic=True),
         _tensor_compile_key("lengths", lengths_key_tensor, dynamic_dims=(0,)),
@@ -1819,12 +1866,14 @@ def run_row_topk(
             "policy",
         ),
     )
-    b12x_launch(
+    resolved = b12x_launch(
         kernel,
         compile_spec=compile_spec,
         compile_args=args,
         runtime_args=args,
     )
+    if launcher_sink is not None:
+        launcher_sink[launcher_key] = resolved
     return topk_values, topk_indices
 
 
@@ -1897,7 +1946,7 @@ def merge_tiled_topk_candidates(
             )
         if output_values.device != candidate_values.device:
             raise ValueError("output_values device must match candidate_values")
-        topk_values = output_values[:num_q_rows, :topk]
+        topk_values = output_values.narrow(0, 0, num_q_rows).narrow(1, 0, topk)
 
     if merge_positions is None:
         merge_pos = torch.empty(
@@ -1923,7 +1972,7 @@ def merge_tiled_topk_candidates(
             raise ValueError("merge_positions device must match candidate_values")
         if not merge_positions.is_contiguous():
             raise ValueError("merge_positions must be contiguous")
-        merge_pos = merge_positions[:num_q_rows, :topk]
+        merge_pos = merge_positions.narrow(0, 0, num_q_rows).narrow(1, 0, topk)
 
     torch.topk(
         candidate_values_2d,
@@ -1952,7 +2001,7 @@ def merge_tiled_topk_candidates(
             )
         if output_indices.device != candidate_indices.device:
             raise ValueError("output_indices device must match candidate_indices")
-        topk_indices = output_indices[:num_q_rows, :topk]
+        topk_indices = output_indices.narrow(0, 0, num_q_rows).narrow(1, 0, topk)
         torch.gather(candidate_indices_2d, 1, merge_pos, out=topk_indices)
     return topk_values, topk_indices
 

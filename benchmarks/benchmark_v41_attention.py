@@ -18,7 +18,8 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession
+from benchmarks.attention_preparation import prepare_compressed
 from b12x.attention import compressed_sparse_mla as mla
 from b12x.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference,
@@ -128,39 +129,24 @@ def run_case(args, rows):
         )
 
     expected, expected_lse = oracle()
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
     arms = {}
     for mode in args.modes:
         for chunks in [1] if mode == "extend" else args.decode_chunks:
-            plan = mla.plan(
-                mla.Caps(
-                    device=device,
-                    num_q_heads=args.heads,
-                    max_q_rows=rows,
-                    max_width=640,
-                    swa_width=128,
-                    indexed_width=512,
-                    max_page_table_width=indexed_pages,
-                    swa_page_size=swa_page,
-                    indexed_page_size=indexed_page,
-                    cache_format="deepseek_v41",
-                    mode=mode,
-                    max_chunks_per_row=chunks,
-                    use_cuda_graph=True,
-                )
-            )
-            (spec,) = plan.scratch_specs()
-            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-            binding = mla.bind(
-                plan,
-                scratch=scratch,
-                q=q,
-                swa_indices=swa_indices,
-                swa_lengths=swa_lengths,
-                indexed_indices=logical,
-                indexed_lengths=indexed_lengths,
-                indexed_page_table=table,
-            )
             out = torch.empty_like(q)
+            caps = mla.Caps(
+                device=device, num_q_heads=args.heads, max_q_rows=rows, max_width=640,
+                swa_width=128, indexed_width=512, max_page_table_width=indexed_pages,
+                swa_page_size=swa_page, indexed_page_size=indexed_page,
+                cache_format="deepseek_v41", mode=mode,
+                max_chunks_per_row=chunks, use_cuda_graph=True,
+            )
+            plan, binding = prepare_compressed(session, caps,
+                bind_args=dict(q=q, swa_indices=swa_indices, swa_lengths=swa_lengths,
+                               indexed_indices=logical, indexed_lengths=indexed_lengths, indexed_page_table=table),
+                run_args=dict(swa_k_cache=swa, indexed_k_cache=indexed, sm_scale=1 / math.sqrt(512),
+                              attn_sink=sink, return_lse=True, lse_scale="natural", out=out))
+            scratch = binding.scratch.shared_scratch
 
             def execute(binding=binding, out=out):
                 return mla.run(
@@ -220,7 +206,7 @@ def run_case(args, rows):
                 "plan": plan,
                 "num_chunks": binding.scratch.num_chunks_value,
             }
-    freeze_kernel_resolution("V4.1 attention backend race")
+    session.freeze()
     try:
         for arm in arms.values():
             for _ in range(3):
@@ -280,7 +266,10 @@ def run_case(args, rows):
             "correctness": "V4.1 source-specific oracle on boundary/interior/tail rows, finite/nonzero full output, mutated-query graph replay, frozen resolution, shared strided pool beyond2^31-byte offsets.",
         }
     finally:
-        unfreeze_kernel_resolution()
+        for arm in arms.values():
+            if "graph" in arm:
+                arm["graph"].reset()
+        session.close()
 
 
 def main():

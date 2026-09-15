@@ -1,5 +1,4 @@
-"""Public API for :mod:`b12x.gemm.trellis_linear`."""
-
+"""Public prepared API for :mod:`b12x.gemm.trellis_linear`."""
 from __future__ import annotations
 
 from typing import Optional
@@ -7,16 +6,17 @@ from typing import Optional
 import torch
 
 from ..._lib.gating import default_is_supported
-from ...moe._shared.kernels.w4a16.kernel import (
-    clear_w4a16_kernel_cache,
-    run_trellis256_dense,
-)
+from ...moe._shared.kernels.w4a16.kernel import clear_w4a16_kernel_cache
 from ...moe._shared.kernels.w4a16.prepare import (
     PreparedTrellis256DenseWeight,
     prepare_trellis256_dense_weight,
     prepare_trellis256_pair_dense_weight,
 )
+from ...preparation import Plan
+from ...preparation.types import require_prepared
 from . import META
+from ._preparation import plan, query_from_weight
+from ._tuning import TrellisQuery
 
 PreparedWeight = PreparedTrellis256DenseWeight
 
@@ -34,14 +34,8 @@ def prepare_weight(
 ) -> PreparedWeight:
     """Validate one native EXL3 dense weight and retain zero-copy views."""
     return prepare_trellis256_dense_weight(
-        trellis,
-        suh,
-        svh,
-        mcg=mcg,
-        mul1_e4m3=mul1_e4m3,
-        codebook=codebook,
-        params_dtype=params_dtype,
-        dummy_scale=dummy_scale,
+        trellis, suh, svh, mcg=mcg, mul1_e4m3=mul1_e4m3, codebook=codebook,
+        params_dtype=params_dtype, dummy_scale=dummy_scale,
     )
 
 
@@ -60,50 +54,30 @@ def prepare_pair_weight(
 ) -> PreparedWeight:
     """Prepare one compact TP12 P24/P33 pair for the SM12x decoder."""
     return prepare_trellis256_pair_dense_weight(
-        payload,
-        suh,
-        svh,
-        pair_kind=pair_kind,
-        rate_axis=rate_axis,
-        mcg=mcg,
-        mul1_e4m3=mul1_e4m3,
-        codebook=codebook,
-        params_dtype=params_dtype,
+        payload, suh, svh, pair_kind=pair_kind, rate_axis=rate_axis, mcg=mcg,
+        mul1_e4m3=mul1_e4m3, codebook=codebook, params_dtype=params_dtype,
         dummy_scale=dummy_scale,
     )
 
 
 def run(
     x: torch.Tensor,
-    weight: PreparedWeight,
     *,
+    plan: Plan,
     output: Optional[torch.Tensor] = None,
     gemm_output: Optional[torch.Tensor] = None,
-    c_tmp: Optional[torch.Tensor] = None,
     input_f16: Optional[torch.Tensor] = None,
     rotated_f16: Optional[torch.Tensor] = None,
     rotated_compute: Optional[torch.Tensor] = None,
     gemm_output_f16: Optional[torch.Tensor] = None,
     output_f16: Optional[torch.Tensor] = None,
-    hadamard_128=None,
-    _moe_block_size: int = 64,
-    _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """Execute Trellis GEMM, optionally reusing all capture-time storage."""
-    return run_trellis256_dense(
-        x,
-        weight,
-        output=output,
-        gemm_output=gemm_output,
-        c_tmp=c_tmp,
-        input_f16=input_f16,
-        rotated_f16=rotated_f16,
-        rotated_compute=rotated_compute,
-        gemm_output_f16=gemm_output_f16,
-        output_f16=output_f16,
-        hadamard_128=hadamard_128,
-        _moe_block_size=_moe_block_size,
-        _force_tile_config=_force_tile_config,
+    """Run a session-prepared exact-M Trellis declaration."""
+    state = require_prepared(plan, "gemm.trellis_linear", x.device)
+    return state.run(
+        x, output=output, gemm_output=gemm_output, input_f16=input_f16,
+        rotated_f16=rotated_f16, rotated_compute=rotated_compute,
+        gemm_output_f16=gemm_output_f16, output_f16=output_f16,
     )
 
 
@@ -113,7 +87,7 @@ def is_supported(device=None) -> bool:
 
 
 def clear_caches() -> None:
-    """Clear compiled W4A16 specializations."""
+    """Clear unretained compiled W4A16 specializations."""
     clear_w4a16_kernel_cache()
 
 

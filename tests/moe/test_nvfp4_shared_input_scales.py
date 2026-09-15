@@ -13,17 +13,12 @@ from b12x.moe.fused_moe._impl import B12XFP4ExpertWeights
 def _owner(scales: torch.Tensor, *, immutable=True) -> B12XFP4ExpertWeights:
     experts = 4
     plan = fused_moe.plan_weights(
-        quant_modes="nvfp4",
-        source_format="modelopt_nvfp4",
-        activation="silu",
-        params_dtype=torch.bfloat16,
-        num_experts=experts,
-        hidden_size=128,
-        intermediate_size=128,
-        w13_layout="w13",
+        source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=fused_moe.ActivationSpec(mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16),
+        geometry=fused_moe.MoEGeometry(num_experts=experts, hidden_size=128, intermediate_size=128),
     )
     return B12XFP4ExpertWeights(
-        plan=plan,
+        plan=plan._impl,
         a1_gscale=scales,
         a2_gscale=torch.ones(experts),
         w1_fp4=torch.empty(experts, 256, 64, dtype=torch.uint8),

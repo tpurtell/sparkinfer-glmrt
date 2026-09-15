@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.attention.dsa_indexer._impl import (
     build_paged_mqa_schedule_metadata,
     clear_indexer_caches,
@@ -136,13 +136,10 @@ def _capture_once(
     warm_compile_misses = int(compile_cache_info()["compile_misses"])
     del warm_output
 
-    freeze_kernel_resolution(reason)
-    try:
+    with kernel_resolution_guard(reason):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured_output = run()
-    finally:
-        unfreeze_kernel_resolution()
     torch.cuda.synchronize(device)
     assert int(compile_cache_info()["compile_misses"]) == warm_compile_misses
     return graph, captured_output

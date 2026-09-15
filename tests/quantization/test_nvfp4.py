@@ -12,6 +12,7 @@ import torch
 
 from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
 from b12x.quantization import nvfp4
+from b12x.preparation import PreparationSession, PreparedCall
 
 from ..conftest import require_b12x
 
@@ -34,10 +35,19 @@ def test_run_matches_torch_grouped_quantizer() -> None:
     # (mirrors b12x tests/test_bf16_to_fp4_tma.py).
     ref_scales = ref_scale_view.permute(5, 2, 4, 0, 1, 3).contiguous().view(torch.uint8)
 
-    plan = nvfp4.plan(m, k)
-    outputs = nvfp4.allocate_outputs(plan)
-    nvfp4.run(plan=plan, x=source, global_scale=global_scale, outputs=outputs)
-    torch.cuda.synchronize()
+    declaration = nvfp4.plan(m, k)
+    outputs = nvfp4.allocate_outputs(declaration)
+    request = declaration.request(
+        name="quantize",
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: state.run(source, global_scale, outputs),
+        ),
+    )
+    with PreparationSession(device=source.device, autotune=False) as session:
+        session.prepare((request,))
+        nvfp4.run(plan=declaration, x=source,
+                  global_scale=global_scale, outputs=outputs)
+        torch.cuda.synchronize()
 
     actual_packed = outputs.packed_a_storage.view(-1)
     expected_packed = ref_packed.contiguous().view(torch.uint8).view(-1)

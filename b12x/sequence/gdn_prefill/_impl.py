@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal
 
 import torch
 
 from b12x._lib.scratch import ScratchBufferSpec
-from b12x.policy import PolicyContext, get_auto_policy
+from b12x.preparation import (
+    FrozenMapping,
+    MemoryRequirements,
+    PersistentMemory,
+    Plan,
+)
+from b12x.preparation.types import require_prepared
 from .._shared.tensors import canonical_device, positive
 from .._shared.delta_prefill.contract import (
-    HEAD_DIM, Binding as _SharedBinding, Plan as _SharedPlan, bind_tensors, materialize_plan,
+    HEAD_DIM, Binding as _SharedBinding, Layout as _SharedLayout, bind_tensors, materialize_layout,
 )
-from ._policy import CHUNK_TOKENS, GDN_PREFILL_POLICY, GdnPrefillQuery, tiles_capacity
+from ._tuning import CHUNK_TOKENS, GdnPrefillConfig, GdnPrefillQuery, tiles_capacity
 from ._parallel import ParallelBinding, ParallelPlan
 
-MetadataValidation = Literal["transactional", "trusted"]
 
 @dataclass(frozen=True, kw_only=True)
 class Caps:
@@ -36,8 +40,9 @@ class Caps:
     qk_l2norm: bool = True
     checkpoint_export: bool = False
     null_state_index: int | None = None
-    metadata_validation: MetadataValidation = "transactional"
     chunk_tokens: int = 16
+    staging_key: Hashable | None = None
+    staging_resident_nbytes: int = 0
 
     def __post_init__(self) -> None:
         device = canonical_device(self.device)
@@ -59,8 +64,6 @@ class Caps:
             raise ValueError("state_dtype must be torch.float32")
         if self.chunk_tokens != CHUNK_TOKENS:
             raise ValueError(f"chunk_tokens must be {CHUNK_TOKENS}")
-        if self.metadata_validation not in ("transactional", "trusted"):
-            raise ValueError("metadata_validation must be 'transactional' or 'trusted'")
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
         object.__setattr__(self, "checkpoint_export", bool(self.checkpoint_export))
         if self.null_state_index is not None:
@@ -68,6 +71,10 @@ class Caps:
             if null < 0 or null >= self.max_state_slots:
                 raise ValueError("null_state_index must be a valid slot index")
             object.__setattr__(self, "null_state_index", null)
+        if self.staging_key is not None:
+            hash(self.staging_key)
+        if type(self.staging_resident_nbytes) is not int or self.staging_resident_nbytes < 0:
+            raise ValueError("staging_resident_nbytes must be a nonnegative integer")
 
     @property
     def heads(self) -> int:
@@ -88,22 +95,20 @@ class Caps:
 
 
 @dataclass(frozen=True)
-class Plan(_SharedPlan):
-    """Fixed GDN launch policy and caller-owned workspace contract."""
+class _Layout(_SharedLayout):
+    """Fixed GDN launch geometry and caller-owned workspace contract."""
 
     caps: Caps
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     parallel: ParallelPlan | None = None
 
-    def bind(self, **kwargs) -> "Binding":
-        return bind(self, **kwargs)
 
 
 @dataclass(frozen=True)
 class Binding(_SharedBinding):
     """Caller-owned GDN tensors; a and b are the raw scalar projections."""
 
-    plan: Plan
+    _state: _Layout
     parallel: ParallelBinding | None = None
 
     @property
@@ -115,7 +120,36 @@ class Binding(_SharedBinding):
         return self.raw_beta
 
 
-def _query(caps: Caps) -> GdnPrefillQuery:
+def staging_memory(caps: Caps) -> MemoryRequirements:
+    """Return the reusable V-side capacity staging envelope for ``caps``.
+
+    Callers that own those buffers provide a stable allocation key and their
+    current resident size.  This keeps the native declaration metadata-only
+    while allowing session reservation before the owner publishes buffers.
+    """
+    if caps.staging_key is None:
+        return MemoryRequirements()
+    element_size = torch.empty((), dtype=caps.model_dtype).element_size()
+    int32_size = torch.empty((), dtype=torch.int32).element_size()
+    required = (
+        caps.max_tokens
+        * (2 * caps.key_heads + caps.value_heads)
+        * caps.head_dim
+        * element_size
+        + 2 * caps.max_tokens * caps.value_heads * element_size
+        + caps.max_tokens * caps.value_heads * caps.head_dim * element_size
+        + ((caps.max_seqs + 1) + 4 * caps.max_seqs + 2) * int32_size
+    )
+    return MemoryRequirements(persistent=(
+        PersistentMemory(
+            caps.staging_key,
+            required,
+            caps.staging_resident_nbytes,
+        ),
+    ))
+
+
+def _query(caps: Caps, invocation: FrozenMapping) -> GdnPrefillQuery:
     return GdnPrefillQuery(
         key_heads=caps.key_heads,
         value_heads=caps.value_heads,
@@ -126,41 +160,40 @@ def _query(caps: Caps) -> GdnPrefillQuery:
         checkpoint_export=caps.checkpoint_export,
         max_tokens=caps.max_tokens,
         max_seqs=caps.max_seqs,
+        max_state_slots=caps.max_state_slots, null_state_index=caps.null_state_index,
+        **dict(invocation),
     )
 
 
-def _materialize_plan(caps: Caps, **kwargs) -> Plan:
-    return materialize_plan(caps, plan_type=Plan, **kwargs)
-
-
-def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
-    """Resolve the policy once and lay out the scratch for ``caps``."""
-    if not isinstance(caps, Caps):
-        raise TypeError("caps must be gdn_prefill.Caps")
-    policy = policy or get_auto_policy(caps.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(caps.device)
-    resolution = policy.resolve(GDN_PREFILL_POLICY, _query(caps))
-    result = _materialize_plan(
-        caps,
-        v_split=int(resolution.config.v_split),
-        k_split=int(resolution.config.k_split),
-        stages=int(resolution.config.stages),
-        window_tiles=int(resolution.config.window_tiles),
-        policy_resolution=resolution,
-        workspace_windows=0 if resolution.config.algorithm == "chunk_parallel" else 2,
+def _materialize_layout(caps: Caps, config: GdnPrefillConfig) -> _Layout:
+    result = materialize_layout(
+        caps, layout_type=_Layout, v_split=config.v_split, k_split=config.k_split,
+        stages=config.stages, window_tiles=config.window_tiles,
+        workspace_windows=0 if config.algorithm == "chunk_parallel" else 2,
     )
-    if resolution.config.algorithm == "chunk_parallel":
+    if config.algorithm == "chunk_parallel":
         from ._parallel import materialize
-
-        result = materialize(result, segment_tokens=resolution.config.segment_tokens)
+        result = materialize(result, segment_tokens=config.segment_tokens)
     return result
 
 
-def bind(
-    plan: Plan,
+def plan(caps: Caps, *, invocation: FrozenMapping = FrozenMapping(), override: GdnPrefillConfig | None = None) -> Plan:
+    """Declare GDN prefill without compiling or allocating resources."""
+    from ._preparation import make_plan
+    if not isinstance(caps, Caps):
+        raise TypeError("caps must be gdn_prefill.Caps")
+    return make_plan(caps, invocation=invocation, override=override)
+
+
+def bind(plan: Plan, **kwargs) -> Binding:
+    state = require_prepared(plan, "sequence.gdn_prefill")
+    return state.bind(_plan=plan, **kwargs)
+
+
+def _bind(
+    plan: _Layout,
     *,
+    _plan: Plan | None = None,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     q: torch.Tensor,
     k: torch.Tensor,
@@ -184,10 +217,10 @@ def bind(
     Live capacities come from the bound tensors: ``q.shape[0]`` tokens and
     ``cu_seqlens.numel() - 1`` sequences, each at most the planned capacity.
     """
-    if not isinstance(plan, Plan):
-        raise TypeError("plan must be gdn_prefill.Plan")
+    if not isinstance(plan, _Layout):
+        raise TypeError("binding requires a GDN prefill layout")
     result = bind_tensors(
-        plan, binding_type=Binding, scratch=scratch, q=q, k=k, v=v,
+        plan, binding_type=Binding, _plan=_plan, scratch=scratch, q=q, k=k, v=v,
         raw_g=a, raw_beta=b, A_log=A_log, dt_bias=dt_bias,
         recurrent_state=recurrent_state, cu_seqlens=cu_seqlens,
         initial_state_indices=initial_state_indices, final_state_indices=final_state_indices,
@@ -223,44 +256,21 @@ def run(
 
     ``max_live_tokens`` and ``max_live_seqs`` are optional host-side upper
     bounds on the device counts; they only limit how many pipeline windows are
-    launched. Under transactional validation a run whose live tiles exceed the
-    launched windows fails closed like any other malformed metadata; under
-    trusted validation the bounds are part of the caller's contract.
+    launched, so the bounds are part of the caller's contract: live tiles
+    beyond the launched windows are not processed.
 
     A sequence whose tiles span more than one pipeline window keeps its
     running state in its final state slot between windows, so such a
-    sequence must have a non-null final slot (transactional validation flags
-    a null one as an invalid slot).
+    sequence must have a non-null final slot. Packed metadata is not checked
+    on the device; the caller supplies in-range, conflict-free slots.
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be gdn_prefill.Binding")
-    scale_value, eps_value = _check_run_scalars(scale, eps)
-    windows = binding.plan.launched_windows(max_live_tokens, max_live_seqs)
-    if binding.parallel is not None:
-        from ._parallel import run as run_parallel
-
-        run_parallel(binding, scale=scale_value, eps=eps_value)
-        return binding.output
-    from .._shared.delta_prefill._cute_kernels import run_prefill
-
-    run_prefill(
-        binding, lower_bound=0.0, scale=scale_value, eps=eps_value, windows=windows
-    )
-    return binding.output
+    state = require_prepared(binding.plan, "sequence.gdn_prefill", binding.output.device)
+    return state.run(binding, scale=scale, eps=eps,
+                     max_live_tokens=max_live_tokens, max_live_seqs=max_live_seqs)
 
 
-def prewarm(binding: Binding) -> None:
-    """Compile every kernel specialization of ``binding`` without launching."""
-    if not isinstance(binding, Binding):
-        raise TypeError("binding must be gdn_prefill.Binding")
-    if binding.parallel is not None:
-        from ._parallel import prewarm as prewarm_parallel
-
-        prewarm_parallel(binding)
-        return
-    from .._shared.delta_prefill._cute_kernels import prewarm_binding
-
-    prewarm_binding(binding)
 
 
 __all__ = [
@@ -269,6 +279,5 @@ __all__ = [
     "Plan",
     "bind",
     "plan",
-    "prewarm",
     "run",
 ]

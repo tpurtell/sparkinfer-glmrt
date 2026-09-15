@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import functools
-from collections.abc import Iterable
+from b12x.preparation import Plan
+from b12x.preparation.types import plan_from_handle, require_prepared
+
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
@@ -22,7 +23,7 @@ from b12x.gemm._shared.wo_mxfp8 import (
     _check_gpu_tensor,
     pack_mxfp8_scales_for_dense_gemm,
 )
-from ._a16 import NVFP4LinearWeight, pack_nvfp4_weight, workspace_size
+from ._a16 import NVFP4LinearWeight, pack_nvfp4_weight
 
 
 @dataclass(frozen=True)
@@ -187,14 +188,22 @@ def _unit_block_scale(rows: int, width: int, device: torch.device) -> torch.Tens
     )
 
 
-@functools.cache
+_UNIT_SCALE_MMA_CACHE: dict[tuple, torch.Tensor] = {}
+_UNIT_BLOCK_SCALE_CACHE: dict[tuple, torch.Tensor] = {}
+
+
 def _cached_unit_scale_mma(
     device_type: str,
     device_index: int | None,
     rows: int,
     width: int,
 ) -> torch.Tensor:
-    return _unit_scale_mma(rows, width, torch.device(device_type, device_index))
+    key = (device_type, device_index, rows, width)
+    value = _UNIT_SCALE_MMA_CACHE.get(key)
+    if value is None:
+        value = _unit_scale_mma(rows, width, torch.device(device_type, device_index))
+        _UNIT_SCALE_MMA_CACHE[key] = value
+    return value
 
 
 def _activation_scale_mma(
@@ -213,18 +222,19 @@ def _activation_scale_mma(
     )
 
 
-@functools.cache
 def _cached_unit_activation_block_scale(
     device_type: str,
     device_index: int | None,
     rows: int,
     width: int,
 ) -> torch.Tensor:
-    return torch.ones(
-        (rows, width // 128),
-        dtype=torch.float32,
-        device=torch.device(device_type, device_index),
-    )
+    key = (device_type, device_index, rows, width)
+    value = _UNIT_BLOCK_SCALE_CACHE.get(key)
+    if value is None:
+        value = torch.ones((rows, width // 128), dtype=torch.float32,
+                           device=torch.device(device_type, device_index))
+        _UNIT_BLOCK_SCALE_CACHE[key] = value
+    return value
 
 
 def _activation_block_scale(
@@ -440,72 +450,25 @@ def _blockscaled_serialized_op(
     c_dtype: str,
     sf_vec_size: int,
     block_fp8: bool,
-    expected_m: int,
+    plan_handle: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    """Opaque adapter from checkpoint/quantizer storage to dense-GEMM views."""
-
-    if lhs_values.ndim != 2 or rhs_values.ndim != 2:
-        raise ValueError("serialized blockscaled operands must both be 2D")
-    m, lhs_storage_k = map(int, lhs_values.shape)
-    n, rhs_storage_k = map(int, rhs_values.shape)
-    if rhs_storage_k != lhs_storage_k:
-        raise ValueError(
-            "blockscaled operands must have the same storage K extent, got "
-            f"{lhs_storage_k} and {rhs_storage_k}"
-        )
-
-    if ab_dtype == "float4_e2m1fn":
-        k = lhs_storage_k * 2
-        if block_fp8:
-            raise ValueError("block_fp8 is valid only for E4M3 operands")
-        if sf_dtype == "float8_e4m3fn" and sf_vec_size == 16:
-            lhs_scale = as_grouped_scale_view(
-                lhs_scale_storage.view(torch.uint8).unsqueeze(0), m, k
-            )
-            rhs_scale = as_grouped_scale_view(
-                rhs_scale_storage.view(torch.uint8).unsqueeze(0), n, k
-            )
-        elif sf_dtype == "float8_e8m0fnu" and sf_vec_size == 32:
-            lhs_scale = as_grouped_scale_view_mx(
-                lhs_scale_storage.view(torch.uint8).unsqueeze(0), m, k
-            )
-            rhs_scale = as_grouped_scale_view_mx(
-                rhs_scale_storage.view(torch.uint8).unsqueeze(0), n, k
-            )
-        else:
-            raise ValueError(
-                "serialized FP4 requires NVFP4 E4M3/vec16 or MXFP4 "
-                f"E8M0/vec32 scales, got {sf_dtype}/vec{sf_vec_size}"
-            )
-    elif (
-        ab_dtype == "float8_e4m3fn"
-        and sf_dtype == "float32"
-        and sf_vec_size == 128
-        and block_fp8
-    ):
-        k = lhs_storage_k
-        lhs_scale = lhs_scale_storage
-        rhs_scale = rhs_scale_storage
-    else:
-        raise ValueError(
-            "unsupported serialized blockscaled recipe: "
-            f"ab_dtype={ab_dtype}, sf_dtype={sf_dtype}, "
-            f"sf_vec_size={sf_vec_size}, block_fp8={block_fp8}"
-        )
-
-    return dense_gemm(
-        (lhs_values.reshape(m, lhs_storage_k, 1), lhs_scale),
-        (rhs_values.reshape(n, rhs_storage_k, 1), rhs_scale),
-        alpha=alpha,
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", lhs_values.device
+    )
+    return state.run_serialized(
+        lhs_values,
+        lhs_scale_storage,
+        rhs_values,
+        rhs_scale_storage,
+        alpha,
         ab_dtype=ab_dtype,
         sf_dtype=sf_dtype,
         c_dtype=c_dtype,
         sf_vec_size=sf_vec_size,
         block_fp8=block_fp8,
-        expected_m=expected_m,
         stream=stream_int,
-    )[:, :, 0]
+    )
 
 
 @_blockscaled_serialized_op.register_fake
@@ -520,11 +483,11 @@ def _blockscaled_serialized_fake(
     c_dtype: str,
     sf_vec_size: int,
     block_fp8: bool,
-    expected_m: int,
+    plan_handle: int,
     stream_int: int | None,
 ) -> torch.Tensor:
     del lhs_scale_storage, rhs_scale_storage, alpha
-    del ab_dtype, sf_dtype, sf_vec_size, block_fp8, expected_m, stream_int
+    del ab_dtype, sf_dtype, sf_vec_size, block_fp8, plan_handle, stream_int
     return torch.empty(
         (lhs_values.shape[0], rhs_values.shape[0]),
         dtype=_output_dtype(c_dtype),
@@ -539,60 +502,33 @@ def _blockscaled_serialized_fake(
 def _packed_mxfp8_op(
     source_2d: torch.Tensor,
     weight_values: torch.Tensor,
-    weight_scale_rows: torch.Tensor,
     weight_scale_mma: torch.Tensor,
-    in_features: int,
-    padded_in_features: int,
-    out_features: int,
-    expected_m: int,
+    plan_handle: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    del weight_scale_rows, in_features
-    tokens = int(source_2d.shape[0])
-    source_for_quant = _pad_k(source_2d, int(padded_in_features))
-    from b12x.gemm._shared.block_fp8 import (
-        _quantize_block_fp8_linear_input_for_immediate_gemm,
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source_2d.device
     )
-
-    # This opaque op consumes the quantized rows immediately. The quantizer
-    # overwrites every logical row scale and every physical scale entry read by
-    # the GEMM, so initializing fresh scale storage first only adds two CUDA
-    # fills per projection. Keep the public allocating quantizer's initialized
-    # padding contract unchanged; use the private immediate-consumer path here.
-    x_q = _quantize_block_fp8_linear_input_for_immediate_gemm(
-        source_for_quant, expected_m=expected_m,
-    )
-    return dense_gemm(
-        (x_q.values.reshape(tokens, padded_in_features, 1), x_q.scale_mma),
-        (
-            weight_values.reshape(out_features, padded_in_features, 1),
-            weight_scale_mma,
-        ),
-        ab_dtype="float8_e4m3fn",
-        sf_dtype="float8_e8m0fnu",
-        c_dtype=_output_dtype_name(source_2d.dtype),
-        sf_vec_size=MXFP8_SCALE_VEC_SIZE,
-        expected_m=expected_m,
+    return state.run_mxfp8(
+        source_2d,
+        weight_values,
+        weight_scale_mma,
+        out_dtype=source_2d.dtype,
         stream=stream_int,
-    )[:, :, 0]
+    )
 
 
 @_packed_mxfp8_op.register_fake
 def _packed_mxfp8_fake(
     source_2d: torch.Tensor,
     weight_values: torch.Tensor,
-    weight_scale_rows: torch.Tensor,
     weight_scale_mma: torch.Tensor,
-    in_features: int,
-    padded_in_features: int,
-    out_features: int,
-    expected_m: int,
+    plan_handle: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    del weight_values, weight_scale_rows, weight_scale_mma
-    del in_features, padded_in_features, expected_m, stream_int
+    del weight_scale_mma, plan_handle, stream_int
     return torch.empty(
-        (source_2d.shape[0], out_features),
+        (source_2d.shape[0], weight_values.shape[0]),
         dtype=source_2d.dtype,
         device=source_2d.device,
     )
@@ -608,36 +544,21 @@ def _packed_mxfp8_prequantized_op(
     source_scale_storage: torch.Tensor,
     weight_values: torch.Tensor,
     weight_scale_mma: torch.Tensor,
-    padded_in_features: int,
-    out_features: int,
+    plan_handle: int,
     out_dtype: torch.dtype,
-    expected_m: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    tokens = int(source_values.shape[0])
-    source_padded = _pad_k(source_values, int(padded_in_features))
-    source_scale_mma = _mxfp8_scale_mma_from_input(
-        source_scale_storage,
-        rows=tokens,
-        width=int(padded_in_features),
-        logical_width=int(source_values.shape[1]),
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source_values.device
     )
-    return dense_gemm(
-        (
-            source_padded.reshape(tokens, padded_in_features, 1),
-            source_scale_mma,
-        ),
-        (
-            weight_values.reshape(out_features, padded_in_features, 1),
-            weight_scale_mma,
-        ),
-        ab_dtype="float8_e4m3fn",
-        sf_dtype="float8_e8m0fnu",
-        c_dtype=_output_dtype_name(out_dtype),
-        sf_vec_size=MXFP8_SCALE_VEC_SIZE,
-        expected_m=expected_m,
+    return state.run_mxfp8(
+        source_values,
+        weight_values,
+        weight_scale_mma,
+        source_scale=source_scale_storage,
+        out_dtype=out_dtype,
         stream=stream_int,
-    )[:, :, 0]
+    )
 
 
 @_packed_mxfp8_prequantized_op.register_fake
@@ -646,16 +567,13 @@ def _packed_mxfp8_prequantized_fake(
     source_scale_storage: torch.Tensor,
     weight_values: torch.Tensor,
     weight_scale_mma: torch.Tensor,
-    padded_in_features: int,
-    out_features: int,
+    plan_handle: int,
     out_dtype: torch.dtype,
-    expected_m: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    del source_scale_storage, weight_values, weight_scale_mma
-    del padded_in_features, expected_m, stream_int
+    del source_scale_storage, weight_scale_mma, plan_handle, stream_int
     return torch.empty(
-        (source_values.shape[0], out_features),
+        (source_values.shape[0], weight_values.shape[0]),
         dtype=out_dtype,
         device=source_values.device,
     )
@@ -684,9 +602,9 @@ def mxfp8_linear(
     source: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     packed_weight: MXFP8LinearWeight,
     *,
+    plan: Plan,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
-    expected_m: int | None = None,
     stream: object = None,
 ) -> torch.Tensor:
     """Run plain or prequantized activations through MXFP8 ``blockscaled.mm``."""
@@ -712,8 +630,6 @@ def mxfp8_linear(
         )
     if packed_weight.weight.values.device != source_2d.device:
         raise ValueError("source and packed weight must be on the same device")
-    if expected_m is not None and int(expected_m) <= 0:
-        raise ValueError("expected_m must be positive when provided")
 
     if prequantized:
         if source_2d.dtype != torch.float8_e4m3fn:
@@ -735,6 +651,16 @@ def mxfp8_linear(
             )
     _output_dtype_name(resolved_out_dtype)
 
+    if not prequantized and source_2d.dtype == torch.bfloat16:
+        return blockscaled_mm(
+            source_values,
+            packed_weight,
+            plan=plan,
+            bias=bias,
+            out_dtype=resolved_out_dtype,
+            stream=stream,
+        )
+
     out_features = int(packed_weight.out_features)
     _validate_bias(
         bias,
@@ -750,28 +676,21 @@ def mxfp8_linear(
         )
     elif prequantized:
         assert source_scale is not None
-        padded_k = int(packed_weight.padded_in_features)
         output = torch.ops.b12x.blockscaled_packed_mxfp8_prequantized(
             source_2d,
             source_scale,
             packed_weight.weight.values,
             packed_weight.weight.scale_mma,
-            padded_k,
-            out_features,
+            plan.handle,
             resolved_out_dtype,
-            int(expected_m) if expected_m is not None else tokens,
             cuda_stream_to_int(stream),
         )
     else:
         output = torch.ops.b12x.blockscaled_packed_mxfp8(
             source_2d,
             packed_weight.weight.values,
-            packed_weight.weight.scale_rows if packed_weight.weight.scale_rows is not None else packed_weight.weight.scale_mma,
             packed_weight.weight.scale_mma,
-            packed_weight.in_features,
-            packed_weight.padded_in_features,
-            packed_weight.out_features,
-            int(expected_m) if expected_m is not None else tokens,
+            plan.handle,
             cuda_stream_to_int(stream),
         )
     if bias is not None:
@@ -789,68 +708,22 @@ def _packed_tensor_fp8_op(
     weight_scale_mma: torch.Tensor,
     weight_block_scale: torch.Tensor,
     output_scale: torch.Tensor,
-    padded_in_features: int,
-    out_features: int,
-    expected_m: int,
+    plan_handle: int,
     out_dtype: torch.dtype,
     stream_int: int | None,
 ) -> torch.Tensor:
-    tokens = int(source_2d.shape[0])
-    source_padded = _pad_k(source_2d, int(padded_in_features))
-    if _use_block_fp8_recipe(
-        live_m=tokens,
-        expected_m=int(expected_m),
-        out_features=int(out_features),
-        padded_in_features=int(padded_in_features),
-        sm_count=get_num_sm(source_2d.device),
-    ):
-        source_block_scale = _activation_block_scale(
-            source_padded,
-            tokens,
-            int(padded_in_features),
-        )
-        return dense_gemm(
-            (
-                source_padded.reshape(tokens, padded_in_features, 1),
-                source_block_scale,
-            ),
-            (
-                weight_values.reshape(out_features, padded_in_features, 1),
-                weight_block_scale,
-            ),
-            alpha=output_scale,
-            ab_dtype="float8_e4m3fn",
-            sf_dtype="float32",
-            c_dtype=_output_dtype_name(out_dtype),
-            sf_vec_size=128,
-            expected_m=expected_m,
-            stream=stream_int,
-            block_fp8=True,
-        )[:, :, 0]
-
-    source_scale_mma = _activation_scale_mma(
-        source_padded,
-        tokens,
-        int(padded_in_features),
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source_2d.device
     )
-    return dense_gemm(
-        (
-            source_padded.reshape(tokens, padded_in_features, 1),
-            source_scale_mma,
-        ),
-        (
-            weight_values.reshape(out_features, padded_in_features, 1),
-            weight_scale_mma,
-        ),
-        alpha=output_scale,
-        ab_dtype="float8_e4m3fn",
-        sf_dtype="float8_e8m0fnu",
-        c_dtype=_output_dtype_name(out_dtype),
-        sf_vec_size=MXFP8_SCALE_VEC_SIZE,
-        expected_m=expected_m,
+    return state.run_tensor_fp8(
+        source_2d,
+        weight_values,
+        weight_scale_mma,
+        weight_block_scale,
+        output_scale,
+        out_dtype=out_dtype,
         stream=stream_int,
-        plain_fp8=True,
-    )[:, :, 0]
+    )
 
 
 @_packed_tensor_fp8_op.register_fake
@@ -860,16 +733,13 @@ def _packed_tensor_fp8_fake(
     weight_scale_mma: torch.Tensor,
     weight_block_scale: torch.Tensor,
     output_scale: torch.Tensor,
-    padded_in_features: int,
-    out_features: int,
-    expected_m: int,
+    plan_handle: int,
     out_dtype: torch.dtype,
     stream_int: int | None,
 ) -> torch.Tensor:
-    del weight_values, weight_scale_mma, weight_block_scale, output_scale
-    del padded_in_features, expected_m, stream_int
+    del weight_scale_mma, weight_block_scale, output_scale, plan_handle, stream_int
     return torch.empty(
-        (source_2d.shape[0], out_features),
+        (source_2d.shape[0], weight_values.shape[0]),
         dtype=out_dtype,
         device=source_2d.device,
     )
@@ -879,12 +749,12 @@ def tensor_fp8_linear(
     source: torch.Tensor,
     packed_weight: TensorFP8LinearWeight,
     *,
+    plan: Plan,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    expected_m: int | None = None,
     stream: object = None,
 ) -> torch.Tensor:
-    """Run static per-tensor E4M3 operands through the SM12x dense GEMM."""
+    """Run static per-tensor E4M3 operands through the prepared fixed route."""
 
     _check_gpu_tensor("source", source)
     if not isinstance(packed_weight, TensorFP8LinearWeight):
@@ -900,8 +770,6 @@ def tensor_fp8_linear(
         )
     if packed_weight.values.device != source_2d.device:
         raise ValueError("source and packed weight must be on the same device")
-    if expected_m is not None and int(expected_m) <= 0:
-        raise ValueError("expected_m must be positive when provided")
     _output_dtype_name(out_dtype)
 
     out_features = int(packed_weight.out_features)
@@ -924,9 +792,7 @@ def tensor_fp8_linear(
             packed_weight.scale_mma,
             packed_weight.block_scale,
             packed_weight.output_scale,
-            packed_weight.padded_in_features,
-            packed_weight.out_features,
-            int(expected_m) if expected_m is not None else tokens,
+            plan.handle,
             out_dtype,
             cuda_stream_to_int(stream),
         )
@@ -939,9 +805,13 @@ def blockscaled_mm(
     lhs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     rhs: Weight | tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor | None = None,
+    *,
+    plan: Plan,
     **kwargs: Any,
 ) -> torch.Tensor:
     """Dispatch packed linear weights or preserve the raw ``dense_gemm`` API."""
+    if plan is None:
+        raise TypeError("blockscaled.mm requires a prepared Plan")
 
     if isinstance(rhs, NVFP4LinearWeight) or (
         isinstance(rhs, MXFP8LinearWeight) and isinstance(lhs, torch.Tensor)
@@ -960,13 +830,17 @@ def blockscaled_mm(
             from ._a16 import _overlap
             if _overlap(out, bias):
                 raise ValueError("out must not overlap bias")
+        if lhs.shape[-1] != rhs.in_features:
+            raise ValueError("source logical K does not match the packed weight")
         from ._ops import linear
         fp4 = isinstance(rhs, NVFP4LinearWeight)
-        result = linear(lhs, rhs.values if fp4 else rhs.weight.values,
-                        rhs.scale_mma if fp4 else rhs.weight.scale_mma,
-                        rhs.global_scale if fp4 else None, fp4=fp4,
-                        reciprocal=fp4 and rhs.global_scale_kind == "reciprocal",
-                        input_k=rhs.in_features, out=out, **options)
+        result = linear(
+            lhs, rhs.values if fp4 else rhs.weight.values,
+            rhs.scale_mma if fp4 else rhs.weight.scale_mma,
+            rhs.global_scale if fp4 else None, plan=plan,
+            global_scale_kind=rhs.global_scale_kind if fp4 else "none",
+            out=out, **options,
+        )
         if bias is not None:
             from ._a16 import _stream_context
             with torch.cuda.device(lhs.device), _stream_context(options.get("stream"), lhs.device):
@@ -975,7 +849,7 @@ def blockscaled_mm(
     if isinstance(rhs, MXFP8LinearWeight):
         if out is not None:
             raise ValueError("packed MXFP8 blockscaled.mm does not accept out")
-        return mxfp8_linear(lhs, rhs, **kwargs)
+        return mxfp8_linear(lhs, rhs, plan=plan, **kwargs)
     if isinstance(rhs, TensorFP8LinearWeight):
         if out is not None:
             raise ValueError("packed tensor-FP8 blockscaled.mm does not accept out")
@@ -985,7 +859,7 @@ def blockscaled_mm(
                 "values tensor directly; its static scale is already folded "
                 "into the packed weight"
             )
-        return tensor_fp8_linear(lhs, rhs, **kwargs)
+        return tensor_fp8_linear(lhs, rhs, plan=plan, **kwargs)
     if not isinstance(lhs, tuple) or not isinstance(rhs, tuple):
         raise TypeError(
             "raw blockscaled.mm operands must be (values, scale) pairs, or rhs "
@@ -1012,7 +886,6 @@ def blockscaled_mm(
                 f"serialized blockscaled.mm requires {exc.args[0]}"
             ) from None
         alpha = recipe.pop("alpha", None)
-        expected_m = recipe.pop("expected_m", None)
         stream = recipe.pop("stream", None)
         block_fp8 = bool(recipe.pop("block_fp8", False))
         if recipe:
@@ -1032,214 +905,15 @@ def blockscaled_mm(
             str(c_dtype),
             int(sf_vec_size),
             block_fp8,
-            (int(expected_m) if expected_m is not None else int(lhs_values.shape[0])),
+            plan.handle,
             cuda_stream_to_int(stream),
         )
-    return dense_gemm(lhs, rhs, out, **kwargs)
+    from b12x.gemm._preparation import mm as prepared_mm
+    return prepared_mm(lhs, rhs, out, plan=plan, **kwargs)
 
 
-def prewarm(
-    rhs: Weight | tuple[torch.Tensor, torch.Tensor],
-    token_counts: Iterable[int],
-    *,
-    input_dtype: torch.dtype | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    stream: object = None,
-    **mm_kwargs: Any,
-) -> int:
-    """Compile ``blockscaled.mm`` calls for serving token counts.
-
-    Packed weights infer their recipe.  For a raw serialized ``(values,
-    scales)`` RHS, pass the same recipe keywords used by :func:`mm`.
-    ``input_dtype=torch.float8_e4m3fn`` selects the prequantized-input path
-    for an MXFP8 packed weight; BF16/FP16 selects its inline-quantized path.
-    """
-
-    counts = sorted({int(value) for value in token_counts if int(value) > 0})
-
-    if isinstance(rhs, NVFP4LinearWeight) or (
-        isinstance(rhs, MXFP8LinearWeight) and rhs.out_features % 8 == 0
-        and (input_dtype if input_dtype is not None else out_dtype) == torch.bfloat16
-        and torch.cuda.get_device_capability(rhs.weight.values.device) in ((12, 0), (12, 1))
-    ):
-        if input_dtype not in (None, torch.bfloat16) or out_dtype != torch.bfloat16:
-            raise ValueError("NVFP4/MXFP8 BF16 warmup requires BF16 input/output")
-        if not counts:
-            return 0
-        options = dict(mm_kwargs)
-        mode = options.pop("mode", "auto")
-        if mode not in ("auto", "a16", "quantized"):
-            raise ValueError("mode must be 'auto', 'a16', or 'quantized'")
-        device = rhs.values.device if isinstance(rhs, NVFP4LinearWeight) else rhs.weight.values.device
-        workspace = options.pop("workspace", None)
-        from ._a16 import _stream_context
-        with torch.inference_mode(), torch.cuda.device(device), _stream_context(stream, device):
-            if workspace is None:
-                workspace = torch.empty(workspace_size(rhs, max(counts), _config=options.get("_config")),
-                                        dtype=torch.uint8, device=device)
-            for tokens in counts:
-                source = torch.zeros((tokens, rhs.in_features), dtype=torch.bfloat16, device=device)
-                output = torch.empty((tokens, rhs.out_features), dtype=torch.bfloat16, device=device)
-                blockscaled_mm(source, rhs, out=output, workspace=workspace,
-                               mode=mode, stream=stream, **options)
-                if isinstance(rhs, MXFP8LinearWeight) and mode == "auto":
-                    blockscaled_mm(source, rhs, mode=mode, stream=stream, **options)
-        return len(counts)
-
-    if isinstance(rhs, tuple):
-        if len(rhs) != 2:
-            raise ValueError("raw blockscaled RHS must be a (values, scale) pair")
-        rhs_values, _ = rhs
-        _check_gpu_tensor("rhs_values", rhs_values)
-        if rhs_values.ndim != 2:
-            raise ValueError("raw serialized blockscaled RHS values must be 2D")
-        recipe = dict(mm_kwargs)
-        try:
-            ab_dtype = str(recipe["ab_dtype"])
-            sf_dtype = str(recipe["sf_dtype"])
-            sf_vec_size = int(recipe["sf_vec_size"])
-        except KeyError as exc:
-            raise TypeError(f"raw blockscaled prewarm requires {exc.args[0]}") from None
-
-        storage_k = int(rhs_values.shape[1])
-        if ab_dtype == "float4_e2m1fn":
-            logical_k = storage_k * 2
-            values_dtype = torch.uint8
-            scale_cols = _align_up(logical_k // sf_vec_size, 4)
-            if sf_dtype == "float8_e4m3fn" and sf_vec_size == 16:
-                scale_dtype = torch.float8_e4m3fn
-                scale_fill = 1.0
-            elif sf_dtype == "float8_e8m0fnu" and sf_vec_size == 32:
-                scale_dtype = torch.uint8
-                scale_fill = 127
-            else:
-                raise ValueError(
-                    "raw FP4 prewarm requires E4M3/vec16 or E8M0/vec32 scales"
-                )
-        elif (
-            ab_dtype == "float8_e4m3fn"
-            and sf_dtype == "float32"
-            and sf_vec_size == 128
-            and bool(recipe.get("block_fp8", False))
-        ):
-            logical_k = storage_k
-            values_dtype = torch.float8_e4m3fn
-            scale_cols = logical_k // 128
-            scale_dtype = torch.float32
-            scale_fill = 1.0
-        else:
-            raise ValueError(
-                "unsupported raw blockscaled prewarm recipe: "
-                f"ab_dtype={ab_dtype}, sf_dtype={sf_dtype}, "
-                f"sf_vec_size={sf_vec_size}"
-            )
-        if input_dtype is not None and input_dtype != values_dtype:
-            raise ValueError(
-                f"raw recipe input dtype is {values_dtype}, got {input_dtype}"
-            )
-
-        warmed = 0
-        with torch.inference_mode():
-            for tokens in counts:
-                lhs_values = torch.zeros(
-                    (tokens, storage_k),
-                    dtype=values_dtype,
-                    device=rhs_values.device,
-                )
-                scale_rows = (
-                    _align_up(tokens, 128) if ab_dtype == "float4_e2m1fn" else tokens
-                )
-                lhs_scale = torch.full(
-                    (scale_rows, scale_cols),
-                    scale_fill,
-                    dtype=scale_dtype,
-                    device=rhs_values.device,
-                )
-                blockscaled_mm(
-                    (lhs_values, lhs_scale),
-                    rhs,
-                    stream=stream,
-                    **recipe,
-                )
-                warmed += 1
-        return warmed
-
-    if isinstance(rhs, TensorFP8LinearWeight):
-        source_dtype = torch.float8_e4m3fn
-        if input_dtype is not None and input_dtype != source_dtype:
-            raise ValueError("tensor-FP8 warmup input_dtype must be float8_e4m3fn")
-    elif isinstance(rhs, MXFP8LinearWeight):
-        source_dtype = out_dtype if input_dtype is None else input_dtype
-        if source_dtype not in (
-            torch.bfloat16,
-            torch.float16,
-            torch.float8_e4m3fn,
-        ):
-            raise ValueError("MXFP8 warmup input_dtype must be bf16/fp16/fp8_e4m3")
-        if source_dtype != torch.float8_e4m3fn and source_dtype != out_dtype:
-            raise ValueError("MXFP8 warmup input_dtype and out_dtype must match")
-    else:
-        raise TypeError("rhs must be a raw pair or returned by blockscaled.pack_weight")
-    if mm_kwargs:
-        names = ", ".join(sorted(mm_kwargs))
-        raise TypeError(
-            f"packed-weight prewarm does not accept recipe options: {names}"
-        )
-
-    warmed = 0
-    with torch.inference_mode():
-        for tokens in counts:
-            source_values = torch.zeros(
-                (tokens, rhs.in_features),
-                dtype=source_dtype,
-                device=(
-                    rhs.values.device
-                    if isinstance(rhs, TensorFP8LinearWeight)
-                    else rhs.weight.values.device
-                ),
-            )
-            source: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-            if (
-                isinstance(rhs, MXFP8LinearWeight)
-                and source_dtype == torch.float8_e4m3fn
-            ):
-                scale_rows = _align_up(tokens, 128)
-                scale_cols = _align_up(rhs.padded_in_features // 32, 4)
-                source_scale = torch.full(
-                    (scale_rows * scale_cols,),
-                    127,
-                    dtype=torch.uint8,
-                    device=source_values.device,
-                )
-                source = (source_values, source_scale)
-            else:
-                source = source_values
-            blockscaled_mm(
-                source,
-                rhs,
-                out_dtype=out_dtype,
-                expected_m=tokens,
-                stream=stream,
-            )
-            warmed += 1
-    return warmed
 
 
-def prewarm_tensor_fp8_linear(
-    packed_weight: TensorFP8LinearWeight,
-    token_counts: Iterable[int],
-    *,
-    out_dtype: torch.dtype = torch.bfloat16,
-    stream: object = None,
-) -> int:
-    """Compatibility alias for :func:`prewarm`."""
-
-    return prewarm(
-        packed_weight,
-        token_counts,
-        out_dtype=out_dtype,
-        stream=stream,
-    )
 
 
 __all__ = [
@@ -1253,7 +927,5 @@ __all__ = [
     "pack_mxfp8_linear_weight",
     "pack_weight",
     "pack_tensor_fp8_linear_weight",
-    "prewarm",
-    "prewarm_tensor_fp8_linear",
     "tensor_fp8_linear",
 ]

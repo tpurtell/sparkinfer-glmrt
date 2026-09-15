@@ -18,10 +18,12 @@ from cutlass.utils import LayoutEnum
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream
 
 from ._cute_prefill_config import supports_prefill, tensors_support_prefill
+from b12x._lib.program_cache import register_program_cache
 
 
 _TILE_N = 16
@@ -30,7 +32,7 @@ _STAGES = 3
 _BUFFER_ALIGN_BYTES = 1_024
 _CACHE_LOCK = RLock()
 _KERNEL_CACHE: Dict[Tuple[int, int, int, int, int, bool], object] = {}
-_WARMED: Dict[Tuple[int, int, int, int, int, bool], object] = {}
+register_program_cache(_KERNEL_CACHE, lock=_CACHE_LOCK)
 
 
 def _cutlass_runtime_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -557,9 +559,7 @@ def compile_mtp_prefill_bf16_gemm(
             runtime_output = _cutlass_runtime_tensor(output)
             with torch.cuda.device(runtime_inputs.device):
                 capturing = torch.cuda.is_current_stream_capturing()
-                with _CACHE_LOCK:
-                    warmed = _WARMED.get(cache_key) is launch
-                if capturing and not warmed:
+                if capturing and not launch.__b12x_warmed__:
                     raise RuntimeError(
                         "MTP CuTe prefill kernels must be warm-run before CUDA graph "
                         "capture"
@@ -573,12 +573,40 @@ def compile_mtp_prefill_bf16_gemm(
                     current_cuda_stream(),
                 )
             if not capturing:
-                with _CACHE_LOCK:
-                    if _KERNEL_CACHE.get(cache_key) is launch:
-                        _WARMED[cache_key] = launch
+                launch.__b12x_warmed__ = True
 
+        attach_programs(launch, raw)
+        launch.__b12x_warmed__ = False
         _KERNEL_CACHE[cache_key] = launch
         return launch
+
+
+def compile_mtp_prefill_capacity(
+    token_rows: int,
+    state_rows: int,
+    hidden_size: int,
+    *,
+    device: torch.device,
+    streams: int,
+) -> tuple:
+    """Return both capacity-specialized Qwen projection entry points."""
+    token = compile_mtp_prefill_bf16_gemm(
+        token_rows,
+        hidden_size,
+        hidden_size,
+        device=device,
+        streams=streams,
+        add_token_path=False,
+    )
+    state = compile_mtp_prefill_bf16_gemm(
+        state_rows,
+        hidden_size,
+        hidden_size,
+        device=device,
+        streams=streams,
+        add_token_path=True,
+    )
+    return token, state
 
 
 def precompile_mtp_prefill_capacity(
@@ -589,22 +617,8 @@ def precompile_mtp_prefill_capacity(
     device: torch.device,
     streams: int,
 ) -> None:
-    """Compile both capacity-specialized Qwen projection entry points."""
-    compile_mtp_prefill_bf16_gemm(
-        token_rows,
-        hidden_size,
-        hidden_size,
-        device=device,
-        streams=streams,
-        add_token_path=False,
-    )
-    compile_mtp_prefill_bf16_gemm(
-        state_rows,
-        hidden_size,
-        hidden_size,
-        device=device,
-        streams=streams,
-        add_token_path=True,
+    compile_mtp_prefill_capacity(
+        token_rows, state_rows, hidden_size, device=device, streams=streams
     )
 
 
@@ -650,7 +664,7 @@ def is_mtp_prefill_bf16_gemm_warmed(
     )
     with _CACHE_LOCK:
         cached = _KERNEL_CACHE.get(cache_key)
-        return cached is not None and _WARMED.get(cache_key) is cached
+        return cached is not None and cached.__b12x_warmed__
 
 
 __all__ = [

@@ -7,6 +7,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import register_program_cache
 from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
@@ -27,6 +29,7 @@ _TILE_M = 128
 _TILE_K = 128
 _SF_VEC_SIZE = 16
 _KERNEL_CACHE: Dict[Tuple, object] = {}
+register_program_cache(_KERNEL_CACHE)
 
 
 def _validate_tiled_shape(M: int, K: int) -> None:
@@ -118,7 +121,7 @@ def compile_bf16_to_fp4_tma(
     M: int,
     K: int,
     *,
-    liveness_strategy: str | None = None,
+    liveness_strategy: str,
 ):
     """Compile the BF16→FP4 TMA kernel for (M, K). Returns a launch callable.
 
@@ -143,15 +146,6 @@ def compile_bf16_to_fp4_tma(
         assumed_align=16,
     )
     mac = min(get_max_active_clusters(1), get_num_sm(torch.device("cuda")))
-    if liveness_strategy is None and M == _TILE_M:
-        # CUTLASS DSL 4.6 already lowers the register count for these shapes;
-        # retain their original instruction schedule.
-        liveness_strategy = "retain"
-    elif liveness_strategy is None:
-        # CUTLASS DSL 4.6 otherwise keeps two BF16-derived FP32 values live
-        # across exact scale division.  Preserve the pair losslessly in one
-        # raw register to shorten that live range without adding memory work.
-        liveness_strategy = "packed"
     if liveness_strategy not in {"retain", "packed"}:
         raise ValueError(
             "liveness_strategy must be 'retain' or 'packed', got "
@@ -230,5 +224,6 @@ def compile_bf16_to_fp4_tma(
         )
         raw(bf16_input, global_scale, pa_view, scale_flat, current_cuda_stream())
 
+    attach_programs(launch, raw)
     _KERNEL_CACHE[cache_key] = launch
     return launch

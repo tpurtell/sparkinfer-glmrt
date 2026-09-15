@@ -5,7 +5,10 @@ pre-final multi-stream residual state.  State normalization intentionally uses
 one flattened ``S*H`` variance group; the hidden projection is shared across
 streams.  The result is a caller-owned BF16 ``[T, S, H]`` draft-layer input.
 
-Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) -> ``run``.
+``plan(Caps(...), invocation=invocation_from_tensors(...))`` declares capacity
+and input alignment. ``PreparationSession`` compiles and primes the complete
+projection/normalization route. ``bind`` consumes its prepared ``Plan``;
+``run`` uses only the stored launchers, with live rows remaining dynamic.
 The explicitly named ``reference`` module is a PyTorch correctness oracle and
 is never a runtime fallback for the public GPU entry point.
 """
@@ -27,6 +30,7 @@ META = OpMeta(
         "MtpFeedbackConfig",
         "MtpFeedbackQuery",
         "plan",
+        "invocation_from_tensors",
         "bind",
         "run",
         "reference",
@@ -59,6 +63,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         bind,
         is_supported,
         plan,
+        invocation_from_tensors,
         reference,
         run,
     )

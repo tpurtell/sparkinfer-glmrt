@@ -28,6 +28,7 @@ from b12x.attention.dsa_indexer.tiled_topk import (
     run_row_topk,
     run_tiled_topk,
 )
+from b12x._lib.compile_plan import launch_triton
 
 # Two-level fold: target slice width for level-1 pseudo-row parallelism and the
 # cap that keeps the candidate buffers capacity-independent (~topk*8B*cap per
@@ -603,6 +604,8 @@ def _prepare_shared_paged_supertile(
     page_table_width: int,
     page_begin: int,
     supertile_tokens: int,
+    launcher=None,
+    launcher_sink: dict[object, object] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if index_k_cache.ndim != 2 or index_k_cache.dtype != torch.uint8:
         raise ValueError(
@@ -632,7 +635,7 @@ def _prepare_shared_paged_supertile(
     block_tokens = 128
     grid_elems = max(int(supertile_tokens), int(q_rows))
     grid = (triton.cdiv(grid_elems, block_tokens),)
-    _gather_shared_paged_supertile_kernel[grid](
+    args = (
         index_k_cache,
         real_page_table,
         seqlens_per_query,
@@ -649,8 +652,15 @@ def _prepare_shared_paged_supertile(
         INDEX_HEAD_DIM,
         int(index_k_cache.stride(0)),
         _PAGED_INDEX_CACHE_DATA_BYTES,
-        num_warps=4,
     )
+    if launcher is not None:
+        launcher[(grid[0], 1, 1)](*args)
+    else:
+        resolved = launch_triton(
+            _gather_shared_paged_supertile_kernel, grid, *args, num_warps=4
+        )
+        if launcher_sink is not None:
+            launcher_sink["gather"] = resolved
 
     fp8_dtype = getattr(torch, "float8_e4m3fn", None)
     if fp8_dtype is None:
@@ -766,6 +776,8 @@ def index_topk_fp8(
     out_scores: torch.Tensor | None = None,
     supertile_k: int | None = None,
     allow_transient_fold_buffers: bool = True,
+    launchers: dict[str, object] | None = None,
+    launcher_sink: dict[object, object] | None = None,
 ) -> torch.Tensor:
     """Indexer top-k selection over the paged FP8 index cache.
 
@@ -882,6 +894,7 @@ def index_topk_fp8(
             ctas_per_group=int(scratch.fused_ctas_per_group),
             merge_threshold=int(scratch.fused_merge_threshold),
             output_physical_slots=output_physical_slots,
+            launcher=None if launchers is None else launchers["fused"],
         )
         return idx
 
@@ -928,9 +941,9 @@ def index_topk_fp8(
         row_count=q_rows,
     )
     write_final_values = out_scores is not None
-    final_values = out_scores if out_scores is not None else scratch_values[:, :topk]
+    final_values = out_scores if out_scores is not None else scratch_values.narrow(1, 0, topk)
     final_raw_indices = (
-        out_indices if out_indices is not None else scratch_raw_indices[:, :topk]
+        out_indices if out_indices is not None else scratch_raw_indices.narrow(1, 0, topk)
     )
     if final_values.shape != (q_rows, topk) or final_raw_indices.shape != (
         q_rows,
@@ -1010,8 +1023,8 @@ def index_topk_fp8(
                 f"shape (2, {q_rows}, {topk}): values={carry_buf_values.shape}, "
                 f"indices={carry_buf_indices.shape}"
             )
-        carry_buf_values = carry_buf_values[:2]
-        carry_buf_indices = carry_buf_indices[:2]
+        carry_buf_values = carry_buf_values.narrow(0, 0, 2)
+        carry_buf_indices = carry_buf_indices.narrow(0, 0, 2)
         if (
             carry_buf_values.dtype != torch.float32
             or carry_buf_values.device != q_fp8.device
@@ -1090,6 +1103,8 @@ def index_topk_fp8(
                 page_table_width=page_table_width,
                 page_begin=page_begin,
                 supertile_tokens=supertile_tokens,
+                launcher=None if launchers is None else launchers["gather"],
+                launcher_sink=launcher_sink,
             )
             logits = run_contiguous_logits_kernel(
                 q_fp8=q_fp8,
@@ -1102,6 +1117,7 @@ def index_topk_fp8(
                 tile_k_offset=0,
                 tile_num_k_tiles=supertile_k_tiles,
                 prefill_block_k=topk_block_k,
+                launcher=None if launchers is None else launchers["contiguous"],
             )
             # The shared scorer consumes local supertile K bounds, but tiled
             # top-k clips against global raw-token offsets below.
@@ -1124,6 +1140,7 @@ def index_topk_fp8(
                 stream_scorer=stream_scorer,
                 persistent_ctas=int(scratch.persistent_scorer_ctas),
                 stream_ctas=int(scratch.stream_scorer_ctas),
+                launcher=None if launchers is None else launchers["paged"],
             )
             topk_lengths = lengths_for_kernel
         if not logits.is_contiguous():
@@ -1174,6 +1191,8 @@ def index_topk_fp8(
                 extent_splits=chunk_splits,
                 output_row_stride=total_slices,
                 output_row_base=chunk_slice_base,
+                launcher=None if launchers is None else launchers["tiled"],
+                launcher_sink=launcher_sink,
             )
             if is_last:
                 run_row_topk(
@@ -1184,6 +1203,8 @@ def index_topk_fp8(
                     output_indices=final_raw_indices,
                     output_gather_table=fold_indices.view(q_rows, total_slices * topk),
                     write_values=write_final_values,
+                    launcher=None if launchers is None else launchers["tiled"],
+                    launcher_sink=launcher_sink,
                 )
         else:
             run_tiled_topk(
@@ -1210,6 +1231,8 @@ def index_topk_fp8(
                 ),
                 output_page_size=page_size,
                 write_values=not is_last or write_final_values,
+                launcher=None if launchers is None else launchers["tiled"],
+                launcher_sink=launcher_sink,
             )
 
     return final_raw_indices

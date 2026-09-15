@@ -28,6 +28,7 @@ from b12x._lib.compiler import (
     KernelCompileSpec,
     launch as b12x_launch,
 )
+from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import (
     frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
@@ -2778,6 +2779,7 @@ def run_contiguous_logits_kernel(
     tile_num_k_tiles: int | None = None,
     prefill_block_k: int | None = None,
     score_mode: int | None = None,
+    launcher=None,
     binding: IndexerContiguousLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
     staged_binding = binding
@@ -3017,7 +3019,11 @@ def run_contiguous_logits_kernel(
         else (
             staged_binding.k_tma_desc_ptrs
             if staged_binding is not None and staged_binding.k_tma_desc_ptrs is not None
-            else _dummy_contiguous_k_tma_desc_ptrs(device_index)
+            else (
+                torch.empty((1,), dtype=torch.int64, device=q_fp8.device)
+                if compile_only_launches_enabled()
+                else _dummy_contiguous_k_tma_desc_ptrs(device_index)
+            )
         )
     )
 
@@ -3175,22 +3181,27 @@ def run_contiguous_logits_kernel(
         3,
         *facts,
     )
-    b12x_launch(
-        kernel,
-        compile_spec=compile_spec,
-        compile_args=args,
-        runtime_args=args,
-        compile_kwargs=(
-            {
-                "dsl_compile_options": (
-                    OptLevel(2),
-                    PtxasOptions("--register-usage-level=4"),
-                )
-            }
-            if not _use_prefill
-            else None
-        ),
-    )
+    if launcher is not None:
+        from b12x._lib.compiler import run_compiled
+
+        run_compiled(launcher, args)
+    else:
+        b12x_launch(
+            kernel,
+            compile_spec=compile_spec,
+            compile_args=args,
+            runtime_args=args,
+            compile_kwargs=(
+                {
+                    "dsl_compile_options": (
+                        OptLevel(2),
+                        PtxasOptions("--register-usage-level=4"),
+                    )
+                }
+                if not _use_prefill
+                else None
+            ),
+        )
     if _tiled_output and _use_prefill:
         return tile_logits
     return out_view

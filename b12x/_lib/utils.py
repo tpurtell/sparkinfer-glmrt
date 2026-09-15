@@ -232,6 +232,11 @@ def get_max_active_clusters(cluster_size: int) -> int:
     Returns:
         Maximum number of active clusters supported by hardware.
     """
+    if cluster_size == 1:
+        # A one-CTA cluster is bounded exactly by the SM count. Avoid the
+        # CUTLASS occupancy probe, which requires a live CUDA context only to
+        # recover that same value.
+        return get_num_sm(torch.device("cuda"))
     return get_hardware_info().get_max_active_clusters(cluster_size)
 
 

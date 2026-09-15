@@ -85,6 +85,10 @@ class UnifiedMLATraits:
     # [292, 296) of the 368-byte fp8-rope record). False keeps every existing
     # specialization (and its smem layout / PTX) byte-identical.
     latent_scale_per_token: bool = False
+    # Decode-local canonical FP8 stage for V4.1's heterogeneous source rows.
+    # This is not a cache ABI change: it exists only after the gathered row is
+    # owned by the math CTA.
+    fp8_internal: bool = False
 
 
 def make_unified_traits(

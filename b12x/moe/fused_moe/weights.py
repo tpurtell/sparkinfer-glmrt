@@ -116,6 +116,8 @@ class PackedWeights:
 
     Activation scales are optional source metadata. A16 preparation uses unit
     scales; ModelOpt NVFP4 A4/A8 preparation requires both scale tensors.
+    ``immutable_input_scales`` promises that input scale values remain unchanged
+    throughout prepared bindings and graph replay; reprepare after mutation.
     """
 
     w13: torch.Tensor
@@ -126,8 +128,11 @@ class PackedWeights:
     w2_global_scales: torch.Tensor
     input_scale: torch.Tensor | None = None
     intermediate_scale: torch.Tensor | None = None
+    immutable_input_scales: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.immutable_input_scales) is not bool:
+            raise TypeError("immutable_input_scales must be boolean")
         for name in (
             "w13",
             "w2",

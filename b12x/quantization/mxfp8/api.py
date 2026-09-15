@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from ..._lib.gating import default_is_supported
-from ..._lib.quant.mxfp8_rows import (
-    quantize_mxfp8_rows_cute as quantize_rows,
-)
 from . import META
+from ._preparation import Mxfp8Config, Mxfp8Query, plan, query_from_call, quantize_rows
 
 
 def is_supported(device=None) -> bool:
@@ -14,4 +12,12 @@ def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 
 
-__all__ = ["quantize_rows", "is_supported"]
+
+__all__ = [
+    "Mxfp8Config",
+    "Mxfp8Query",
+    "plan",
+    "query_from_call",
+    "quantize_rows",
+    "is_supported",
+]

@@ -2277,23 +2277,25 @@ def lse_reduce_scatter(
     device_slot_selection: bool,
     slot_delta_bytes: int,
     blocks: int,
+    launcher: Callable | None = None,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
-    launcher = _get_compiled_lse_reduce_scatter(
-        world_size,
-        rank,
-        dtype_name,
-        threads,
-        device_slot_selection,
-    )
-    if not device_slot_selection:
-        _get_compiled_lse_reduce_scatter(
+    if launcher is None:
+        launcher = _get_compiled_lse_reduce_scatter(
             world_size,
             rank,
             dtype_name,
             threads,
-            True,
+            device_slot_selection,
         )
+        if not device_slot_selection:
+            _get_compiled_lse_reduce_scatter(
+                world_size,
+                rank,
+                dtype_name,
+                threads,
+                True,
+            )
     launcher(
         local_output_ptr,
         local_lse_ptr,
@@ -2330,21 +2332,23 @@ def all_gather_heads(
     device_slot_selection: bool,
     slot_delta_bytes: int,
     blocks: int,
+    launcher: Callable | None = None,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
-    launcher = _get_compiled_all_gather_heads(
-        world_size,
-        rank,
-        threads,
-        device_slot_selection,
-    )
-    if not device_slot_selection:
-        _get_compiled_all_gather_heads(
+    if launcher is None:
+        launcher = _get_compiled_all_gather_heads(
             world_size,
             rank,
             threads,
-            True,
+            device_slot_selection,
         )
+        if not device_slot_selection:
+            _get_compiled_all_gather_heads(
+                world_size,
+                rank,
+                threads,
+                True,
+            )
     launcher(
         local_input_ptr,
         output_ptr,
@@ -2375,19 +2379,21 @@ def all_gather_pair(
     second_row_bytes: int,
     device_slot_selection: bool,
     slot_delta_bytes: int,
+    launcher: Callable | None = None,
 ) -> None:
     if first_row_bytes % 16 or second_row_bytes % 16:
         raise ValueError("paired DCP rows must be multiples of 16 bytes")
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
-    launcher = _get_compiled_all_gather_pair(
-        world_size,
-        rank,
-        threads,
-        device_slot_selection,
-        False,
-    )
-    if not device_slot_selection:
-        _get_compiled_all_gather_pair(world_size, rank, threads, True, False)
+    if launcher is None:
+        launcher = _get_compiled_all_gather_pair(
+            world_size,
+            rank,
+            threads,
+            device_slot_selection,
+            False,
+        )
+        if not device_slot_selection:
+            _get_compiled_all_gather_pair(world_size, rank, threads, True, False)
     launcher(
         local_first_ptr,
         local_second_ptr,
@@ -2418,19 +2424,21 @@ def all_gather_pair_kimi_topk(
     signal_ptrs: Sequence[int],
     device_slot_selection: bool,
     slot_delta_bytes: int,
+    launcher: Callable | None = None,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
-    launcher = _get_compiled_all_gather_pair(
-        world_size,
-        rank,
-        512,
-        device_slot_selection,
-        True,
-    )
-    if not device_slot_selection:
-        _get_compiled_all_gather_pair(
-            world_size, rank, 512, True, True
+    if launcher is None:
+        launcher = _get_compiled_all_gather_pair(
+            world_size,
+            rank,
+            512,
+            device_slot_selection,
+            True,
         )
+        if not device_slot_selection:
+            _get_compiled_all_gather_pair(
+                world_size, rank, 512, True, True
+            )
     launcher(
         local_down_ptr,
         local_router_ptr,
@@ -2455,8 +2463,11 @@ def kimi_topk16(
     output_ids_ptr: int,
     rows: int,
     threads: int = 256,
+    launcher: Callable | None = None,
 ) -> None:
-    _get_compiled_kimi_topk16(threads)(
+    if launcher is None:
+        launcher = _get_compiled_kimi_topk16(threads)
+    launcher(
         router_logits_ptr,
         correction_bias_ptr,
         output_weights_ptr,

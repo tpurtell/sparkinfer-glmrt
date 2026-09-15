@@ -26,6 +26,9 @@ import torch
 
 from b12x import gemm
 from b12x.gemm import mla_query_projection
+from b12x.gemm._bmm._tuning import BmmQuery
+from b12x.gemm.mla_query_projection._tuning import ProjectionQuery
+from b12x.preparation import PreparedCall, PreparationSession
 
 
 PACK_ROWS = 448
@@ -220,10 +223,15 @@ def main() -> None:
     q_pe = q_full[..., LATENT_DIM:]
     q_scale = torch.tensor([0.037], device=device, dtype=torch.float32)
 
-    if args.weight_format == "mxfp8":
-        assert isinstance(weight, tuple)
-        gemm.prewarm_bmm(weight, [args.m], **BMM_SPEC)
-    mla_query_projection.prewarm(weight, [args.m], output_dtype=output_dtype)
+    projection_query = ProjectionQuery(
+        heads=args.heads,
+        max_rows=args.m,
+        weight_format=args.weight_format,
+        output_dtype=str(output_dtype).removeprefix("torch."),
+        b_major="n",
+        sf_axis="n",
+    )
+    projection = mla_query_projection.plan(projection_query)
 
     projected = torch.empty(
         args.heads,
@@ -247,12 +255,53 @@ def main() -> None:
     )
     fused_out = torch.empty_like(assembled_bf16, dtype=output_dtype)
     inv_scale = torch.reciprocal(q_scale)
+    requests = []
+    if args.weight_format == "mxfp8":
+        bmm = gemm.plan_bmm(BmmQuery(
+            batch=args.heads,
+            max_rows=args.m,
+            in_features=NOPE_DIM,
+            out_features=LATENT_DIM,
+            b_major="n",
+            sf_axis="n",
+        ))
+
+        def prepare_bmm(state):
+            return PreparedCall(
+                run=lambda: state.run(
+                    q_nope, weight, projected, b_major="n", sf_axis="n"
+                ),
+                output=projected,
+            )
+
+        requests.append(bmm.request(
+            name="baseline-bmm",
+            prepare_call=prepare_bmm,
+        ))
+
+    def prepare_projection(state):
+        return PreparedCall(
+            run=lambda: state.run(
+                q_nope, weight, q_pe, fused_out,
+                q_scale=q_scale if output_dtype == torch.float8_e4m3fn else None,
+            ),
+            output=fused_out,
+        )
+
+    requests.append(projection.request(
+        name="fused-projection",
+        prepare_call=prepare_projection,
+    ))
+    session = PreparationSession(device=device, autotune=False)
+    session.prepare(tuple(requests))
+    bmm_plan = bmm if args.weight_format == "mxfp8" else None
+    projection_plan = projection
 
     def baseline() -> None:
         if isinstance(weight, torch.Tensor):
             torch.bmm(q_nope, weight, out=projected)
         else:
-            gemm.bmm(q_nope, weight, projected, **BMM_SPEC)
+            gemm.bmm(q_nope, weight, projected, plan=bmm_plan, **BMM_SPEC)
         torch.cat((projected.transpose(0, 1), q_pe), dim=-1, out=assembled_bf16)
         if output_dtype == torch.float8_e4m3fn:
             scaled_fp32.copy_(assembled_bf16)
@@ -266,6 +315,7 @@ def main() -> None:
             weight,
             q_pe,
             fused_out,
+            plan=projection_plan,
             q_scale=q_scale if output_dtype == torch.float8_e4m3fn else None,
         )
 
@@ -306,8 +356,9 @@ def main() -> None:
             f"max_abs={max_abs}, mean_abs={mean_abs}"
         )
 
-    baseline_graph = capture_graph(baseline)
-    fused_graph = capture_graph(fused)
+    with session.capture(result):
+        baseline_graph = capture_graph(baseline)
+        fused_graph = capture_graph(fused)
     baseline_us, fused_us = balanced_samples_us(
         baseline_graph,
         fused_graph,
@@ -317,7 +368,7 @@ def main() -> None:
     baseline_median = statistics.median(baseline_us)
     fused_median = statistics.median(fused_us)
     repo = pathlib.Path(__file__).resolve().parents[1]
-    result = {
+    report = {
         "command": shlex.join([sys.executable, *sys.argv]),
         "commit": git_revision(repo),
         "worktree": str(repo),
@@ -356,7 +407,12 @@ def main() -> None:
         "staged_raw_us": baseline_us,
         "fused_raw_us": fused_us,
     }
-    print(json.dumps(result, indent=2))
+    del baseline_graph, fused_graph
+    torch.cuda.synchronize(device)
+    result.close()
+    session.close()
+    print(json.dumps(report, indent=2))
+
 
 
 if __name__ == "__main__":

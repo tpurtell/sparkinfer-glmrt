@@ -4,9 +4,9 @@
 multiplies BF16 activations by a rowwise-MXFP8 right-hand side and writes BF16
 output.  It supports K-major and N-major zero-copy views.
 
-The launch path is workspace- and allocation-free.  Call ``prewarm_bmm`` with
-every M that can appear inside a CUDA graph; a compile miss during capture
-raises rather than recording an invalid graph.
+The launch path is workspace- and allocation-free.  ``plan(BmmQuery(...))``
+declares each exact graph-visible M; ``PreparationSession`` resolves and primes
+the specialization before ``bmm(..., plan=...)``.
 
 Example::
 
@@ -21,8 +21,10 @@ Example::
         b_major="k",
         sf_axis="k",
     )
-    gemm.prewarm_bmm((b_values, b_scales), (1, 4, 8), **spec)
-    gemm.bmm(lhs, (b_values, b_scales), out, **spec)
+    # Declare and prepare the exact graph-visible M before executing it.
+    bmm_plan = plan(query)
+    session.prepare((bmm_plan.request(name="bmm", prepare_call=prepare_call),))
+    gemm.bmm(lhs, (b_values, b_scales), out, plan=bmm_plan, **spec)
 """
 
 from __future__ import annotations
@@ -36,8 +38,8 @@ META = OpMeta(
     group="gemm",
     api_style="oneshot",
     entry_points=(
+        "plan",
         "bmm",
-        "prewarm_bmm",
         "can_implement_bmm",
         "is_bmm_supported",
     ),
@@ -58,7 +60,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         bmm,
         can_implement_bmm,
         is_bmm_supported,
-        prewarm_bmm,
+        plan,
     )
 
 install_lazy_api(globals(), META)

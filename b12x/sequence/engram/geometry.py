@@ -1,9 +1,4 @@
-"""DeepSeek V4.1 Engram tokenizer and immutable hash geometry.
-
-Equations and normalization follow DeepSeek-V4.1-Flash inference/engram.py
-17-153, snapshot fb2764a5cf321eaa5070ca8f9e892818f477c16d (DeepSeek AI).
-This is new hosted implementation, not a synchronization of upstream b12x.
-"""
+"""DeepSeek V4.1 Engram tokenizer and immutable hash geometry."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -50,11 +45,7 @@ class Geometry:
 
 def build_geometry(*, layer_ids=(1, 14), base_table_size=16_000_000,
                    compressed_vocab_size=99_092) -> Geometry:
-    """Generate 2/3/4-gram, eight-head geometry with globally unreused primes.
-
-    PCG64 is explicit: seeds are actual transformer layer IDs, never ordinals.
-    Defaults have exactly (384006168, 384016682) global table rows.
-    """
+    """Generate 2/3/4-gram, eight-head geometry with globally unreused primes."""
     layer_ids = tuple(layer_ids)
     if (not layer_ids or len(set(layer_ids)) != len(layer_ids)
             or any(i < 0 for i in layer_ids)):

@@ -35,7 +35,7 @@ def _validate_packed(
     chunk: int,
     null_state_index: int | None,
 ) -> list[tuple[int, int]]:
-    """Raise on every condition the device validator flags; return spans."""
+    """Raise on packed metadata outside the kernels' contract; return spans."""
     if num_seqs < 0 or num_seqs > seq_capacity:
         raise ValueError(f"num_seqs={num_seqs} exceeds capacity {seq_capacity}")
     if num_tokens < 0 or num_tokens > token_capacity:

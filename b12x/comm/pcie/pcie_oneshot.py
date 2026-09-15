@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation.types import Plan, require_prepared
 from ._cuda_ipc import CudaRTLibrary
 
 
@@ -1728,17 +1729,22 @@ class _CuTeOneshotBackend:
     def _device_index(device: torch.device) -> int:
         return device.index if device.index is not None else torch.cuda.current_device()
 
-    def prepare_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
-        """Compile/load every graph slot variant without launching a kernel."""
+    def _prepare_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
+        """Compile/load the eager and every graph slot variant without launching."""
 
         state = self._state(handle)
         stage_input = state.eager_tables is not None
         if not stage_input and int(inp.data_ptr()) not in state.registered_tables:
             raise RuntimeError("input buffer is not registered")
         plan = self._plain_graph_plan(state, inp)
+        eager_transport, eager_threads, _ = self._plain_launch_config(state, inp)
         from ._oneshot_cute import get_oneshot_launcher
 
-        variants = ((True, 0), (True, 1)) if stage_input else ((False, 0),)
+        variants = (
+            ((False, 0), (True, 0), (True, 1))
+            if stage_input
+            else ((False, 0),)
+        )
         for device_slot_selection, slot_bias in variants:
             get_oneshot_launcher(
                 _dtype_name(inp.dtype),
@@ -1747,14 +1753,14 @@ class _CuTeOneshotBackend:
                 stage_input,
                 device_slot_selection,
                 slot_bias,
-                plan.transport,
-                plan.threads,
+                plan.transport if device_slot_selection else eager_transport,
+                plan.threads if device_slot_selection else eager_threads,
                 plan.device_index,
             )
         state.plain_graph_plans[self._plain_graph_plan_key(inp)] = plan
 
-    def prepare_fused_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
-        """Compile/load fused graph variants without launching a kernel."""
+    def _prepare_fused_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
+        """Compile/load the eager and every fused graph variant without launching."""
 
         state = self._state(handle)
         if (
@@ -1769,7 +1775,9 @@ class _CuTeOneshotBackend:
 
         device_index = self._device_index(inp.device)
         variants = (
-            ((True, 0), (True, 1)) if state.eager_tables is not None else ((False, 0),)
+            ((False, 0), (True, 0), (True, 1))
+            if state.eager_tables is not None
+            else ((False, 0),)
         )
         for device_slot_selection, slot_bias in variants:
             get_fused_oneshot_launcher(
@@ -1827,7 +1835,7 @@ class _CuTeOneshotBackend:
                 plan = self._plain_graph_plan(state, inp)
                 bind_plan_after_launcher_check = True
             else:
-                self.prepare_all_reduce(handle, inp)
+                self._prepare_all_reduce(handle, inp)
                 plan = state.plain_graph_plans[plan_key]
         if plan is None:
             transport, threads, blocks = self._plain_launch_config(
@@ -2941,45 +2949,104 @@ class PCIeOneshotAllReduce:
         self._ext.register_buffer(self._ptr, list(ptrs))
         self._registered_input_ptrs[local_ptr] = ptrs
 
-    def prepare_graph_all_reduce(
-        self,
-        inp: torch.Tensor,
-        *,
-        peer_input_ptrs: Optional[Sequence[int]] = None,
-    ) -> None:
-        """Compile and load plain all-reduce graph variants before capture."""
+    def _prepare_prepared_metadata(self, query) -> None:
+        """Install a direct graph plan before its producer publishes pointers."""
+        class _MetadataInput:
+            def __init__(self, setup):
+                self.shape = tuple(setup["shape"])
+                self.dtype = getattr(torch, setup["dtype"])
+                self.device = self_device
+                self._stride = tuple(setup["stride"])
+
+            @property
+            def ndim(self):
+                return len(self.shape)
+
+            def numel(self):
+                total = 1
+                for extent in self.shape:
+                    total *= extent
+                return total
+
+            def element_size(self):
+                return self.dtype.itemsize
+
+            def stride(self):
+                return self._stride
 
         if _is_current_stream_capturing(self.device):
-            raise RuntimeError(
-                "prepare_graph_all_reduce() must be called before CUDA graph capture"
-            )
-        if not self.should_allreduce(inp):
-            raise ValueError("input does not satisfy PCIe oneshot requirements")
+            raise RuntimeError("oneshot preparation must complete before CUDA graph capture")
         self._check_stream()
-        self._prepare_input(inp, peer_input_ptrs)
-        self._ext.prepare_all_reduce(self._ptr, inp)
+        setup = query.setup
+        self_device = self.device
+        state = self._ext._state(self._ptr)
+        if query.surface.endswith(".all_reduce"):
+            metadata = _MetadataInput(setup)
+            state.plain_graph_plans[
+                self._ext._plain_graph_plan_key(metadata)
+            ] = self._ext._plain_graph_plan(state, metadata)
 
-    def prepare_graph_fused_add_rms_norm(
-        self,
-        inp: torch.Tensor,
-        *,
-        peer_input_ptrs: Optional[Sequence[int]] = None,
-    ) -> None:
-        """Compile and load fused graph variants before capture."""
+    def _prepare_prepared_surface(self, query, inp: torch.Tensor) -> None:
+        """Install graph metadata during session materialization, never at run."""
 
         if _is_current_stream_capturing(self.device):
-            raise RuntimeError(
-                "prepare_graph_fused_add_rms_norm() must be called before CUDA graph capture"
-            )
-        if not self.should_allreduce(inp) or inp.ndim == 0:
-            raise ValueError("input does not satisfy fused PCIe oneshot requirements")
-        if inp.shape[-1] * inp.element_size() % 16 != 0:
-            raise ValueError(
-                "the last input dimension must occupy a multiple of 16 bytes"
-            )
+            raise RuntimeError("oneshot preparation must complete before CUDA graph capture")
         self._check_stream()
-        self._prepare_input(inp, peer_input_ptrs)
-        self._ext.prepare_fused_all_reduce(self._ptr, inp)
+        setup = query.setup
+        if (tuple(inp.shape), tuple(inp.stride()), _dtype_name(inp.dtype), inp.device.index) != (
+            tuple(setup["shape"]), tuple(setup["stride"]), setup["dtype"], setup["device_index"],
+        ):
+            raise ValueError("oneshot input metadata differs from the declaration")
+        state = self._ext._state(self._ptr)
+        if state.eager_tables is None and int(inp.data_ptr()) not in self._registered_input_ptrs:
+            raise ValueError("registered graph input is absent from the native runtime")
+        if query.surface.endswith(".all_reduce"):
+            state.plain_graph_plans[self._ext._plain_graph_plan_key(inp)] = (
+                self._ext._plain_graph_plan(state, inp)
+            )
+
+    def _prepared_launcher(self, launchers, inp: torch.Tensor):
+        state = self._ext._state(self._ptr)
+        capturing = _is_current_stream_capturing(inp.device)
+        _enable_device_slot_selection(state, capturing=capturing)
+        key = (bool(state.device_slot_selection), int(state.slot_bias) & 1 if state.device_slot_selection else 0)
+        try:
+            return launchers[key], state
+        except KeyError as exc:
+            raise RuntimeError("oneshot slot variant was not prepared") from exc
+
+    def _run_prepared_plain(self, inp: torch.Tensor, out: torch.Tensor, query, launchers) -> None:
+        launcher, state = self._prepared_launcher(launchers, inp)
+        call = query.call
+        plan = state.plain_graph_plans.get(self._ext._plain_graph_plan_key(inp))
+        if plan is None:
+            raise RuntimeError("oneshot graph resources were not bound during preparation")
+        table_address, _ = self._ext._select_table(state, inp.data_ptr())
+        with torch.cuda.device(inp.device):
+            launcher(
+                table_address, state.signal_table_address, inp.data_ptr(), out.data_ptr(),
+                call["size_packs"], call["remote_push_region_packs"],
+                int(state.eager_buffer_bytes or 0) // 16,
+                *plan.remote_push_slot_ptrs,
+                call["blocks"] if state.device_slot_selection else call["eager_blocks"],
+            )
+
+    def _run_prepared_fused(
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+        out: torch.Tensor, residual_out: torch.Tensor, epsilon: float, query, launchers,
+    ) -> None:
+        launcher, state = self._prepared_launcher(launchers, inp)
+        call = query.call
+        table_address, _ = self._ext._select_table(state, inp.data_ptr())
+        with torch.cuda.device(inp.device):
+            launcher(
+                table_address, state.signal_table_address, inp.data_ptr(), residual.data_ptr(),
+                weight.data_ptr(), out.data_ptr(), residual_out.data_ptr(),
+                call["hidden_packs"], call["rows"], call["ctas_per_row"],
+                int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
+                float(epsilon), call["blocks"],
+            )
+
 
     def _prepare_input(
         self,
@@ -3022,25 +3089,24 @@ class PCIeOneshotAllReduce:
             [list(map(int, handle)) for handle in handles],
             [list(map(int, rank_offsets)) for rank_offsets in offsets],
         )
-
     def all_reduce(
         self,
         inp: torch.Tensor,
         *,
+        plan: Plan,
         out: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         with _device_guard(self.device):
             return self._all_reduce_on_device(
-                inp,
-                out=out,
-                peer_input_ptrs=peer_input_ptrs,
+                inp, plan=plan, out=out, peer_input_ptrs=peer_input_ptrs,
             )
 
     def _all_reduce_on_device(
         self,
         inp: torch.Tensor,
         *,
+        plan: Plan,
         out: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
@@ -3056,7 +3122,8 @@ class PCIeOneshotAllReduce:
                 "input does not satisfy device/dtype/size/alignment/contiguity requirements "
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
-
+        if peer_input_ptrs is not None:
+            raise ValueError("peer input registration belongs to oneshot preparation")
         if out is None:
             out = torch.empty_like(inp)
         if out.device != inp.device:
@@ -3065,10 +3132,9 @@ class PCIeOneshotAllReduce:
             raise ValueError("output tensor must match input shape and dtype")
         if not _is_weak_contiguous(out):
             raise ValueError("output tensor must be weak-contiguous")
-
-        self._prepare_input(inp, peer_input_ptrs)
-
-        self._ext.all_reduce(self._ptr, inp, out, 0, 0)
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        state.run_plain(inp, out)
         return out
 
     def all_reduce_fused_add_rms_norm(
@@ -3078,23 +3144,17 @@ class PCIeOneshotAllReduce:
         weight: torch.Tensor,
         epsilon: float,
         *,
+        plan: Plan,
         out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """All-reduce ``inp``, add ``residual``, and apply RMSNorm."""
-
         with _device_guard(self.device):
             return self._all_reduce_fused_on_device(
-                inp,
-                residual,
-                weight,
-                epsilon,
-                out=out,
-                residual_out=residual_out,
-                peer_input_ptrs=peer_input_ptrs,
+                inp, residual, weight, epsilon, plan=plan, out=out,
+                residual_out=residual_out, peer_input_ptrs=peer_input_ptrs,
             )
-
     def _all_reduce_fused_on_device(
         self,
         inp: torch.Tensor,
@@ -3102,6 +3162,7 @@ class PCIeOneshotAllReduce:
         weight: torch.Tensor,
         epsilon: float,
         *,
+        plan: Plan,
         out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
@@ -3160,18 +3221,11 @@ class PCIeOneshotAllReduce:
         if out.data_ptr() == residual_out.data_ptr():
             raise ValueError("output and residual output must not alias")
 
-        self._prepare_input(inp, peer_input_ptrs)
-        self._ext.all_reduce_fused_add_rms_norm(
-            self._ptr,
-            inp,
-            residual,
-            weight,
-            out,
-            residual_out,
-            float(epsilon),
-            0,
-            0,
-        )
+        if peer_input_ptrs is not None:
+            raise ValueError("peer input registration belongs to oneshot preparation")
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        state.run_fused(inp, residual, weight, out, residual_out, float(epsilon))
         return out, residual_out
 
     @contextmanager
@@ -3204,121 +3258,6 @@ class PCIeOneshotAllReduce:
             [entry[1] for entry in all_meta],
         )
 
-    def _bench_graph_latency(
-        self,
-        size_bytes: int,
-        nccl_group: ProcessGroup,
-        stream: torch.cuda.Stream,
-        warmup: int,
-        iters: int,
-    ) -> tuple[float, float]:
-        if self.exchange_group is None:
-            raise ValueError("exchange_group is required for graph-based autotuning")
-        self._check_stream(stream)
-
-        numel = size_bytes // torch.tensor([], dtype=torch.bfloat16).element_size()
-        device = self.device
-
-        def run_custom() -> float:
-            with torch.cuda.stream(stream):
-                graph_inp = torch.ones(numel, dtype=torch.bfloat16, device=device)
-                graph_out = torch.zeros_like(graph_inp)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                self._ext.all_reduce(self._ptr, graph_inp, graph_out, 0, 0)
-            self.register_graph_buffers()
-            dist.barrier(group=nccl_group)
-            with torch.cuda.stream(stream):
-                for _ in range(warmup):
-                    graph.replay()
-            stream.synchronize()
-            start = time.perf_counter()
-            with torch.cuda.stream(stream):
-                for _ in range(iters):
-                    graph.replay()
-            stream.synchronize()
-            return (time.perf_counter() - start) / iters * 1e6
-
-        def run_nccl() -> float:
-            with torch.cuda.stream(stream):
-                graph_inp = torch.ones(numel, dtype=torch.bfloat16, device=device)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                dist.all_reduce(graph_inp, group=nccl_group)
-            with torch.cuda.stream(stream):
-                for _ in range(warmup):
-                    graph.replay()
-            stream.synchronize()
-            start = time.perf_counter()
-            with torch.cuda.stream(stream):
-                for _ in range(iters):
-                    graph.replay()
-            stream.synchronize()
-            return (time.perf_counter() - start) / iters * 1e6
-
-        custom_runs = sorted(run_custom() for _ in range(3))
-        nccl_runs = sorted(run_nccl() for _ in range(3))
-        # Reduce timings across ranks so every rank reaches the same
-        # crossover verdicts; divergent local verdicts would desynchronize
-        # the sweep's collective sequence and deadlock.
-        stats = torch.tensor(
-            [custom_runs[1], nccl_runs[1]], dtype=torch.float64, device=device
-        )
-        dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=nccl_group)
-        return float(stats[0].item()), float(stats[1].item())
-
-    def find_crossover_size(
-        self,
-        nccl_group: ProcessGroup,
-        *,
-        ceiling_bytes: int = AUTOTUNE_CEILING,
-        fine_step_bytes: int = AUTOTUNE_FINE_STEP,
-        warmup: int = 100,
-        iters: int = 1000,
-    ) -> int:
-        if self.device.type != "cuda":
-            raise ValueError("autotune requires a CUDA device")
-        bench_stream = torch.cuda.Stream(device=self.device)
-        effective_ceiling = int(ceiling_bytes)
-        if self.eager_buffer_bytes is not None:
-            effective_ceiling = min(effective_ceiling, self.eager_buffer_bytes)
-        crossover, results = _compute_crossover_size(
-            lambda size_bytes: self._bench_graph_latency(
-                size_bytes,
-                nccl_group,
-                bench_stream,
-                warmup,
-                iters,
-            ),
-            ceiling_bytes=effective_ceiling,
-            fine_step_bytes=fine_step_bytes,
-        )
-        if self.eager_buffer_bytes is not None:
-            crossover = min(crossover, self.eager_buffer_bytes)
-        self.max_size = crossover
-
-        if self.rank == 0:
-
-            def fmt_size(size_bytes: int) -> str:
-                if size_bytes >= 1024 * 1024:
-                    return f"{size_bytes // (1024 * 1024)}MB"
-                if size_bytes >= 1024:
-                    return f"{size_bytes // 1024}KB"
-                return f"{size_bytes}B"
-
-            lines = [
-                f"[PCIe oneshot allreduce] Crossover benchmark ({self.world_size} GPUs, bf16):"
-            ]
-            for result in results:
-                lines.append(
-                    f"  {fmt_size(result.size_bytes):>6s}:  custom {result.custom_us:6.1f} us  "
-                    f"vs  NCCL {result.nccl_us:6.1f} us  -> {result.winner} wins"
-                )
-            lines.append(
-                f"  Setting max_size = {fmt_size(crossover)} (last size where custom AR wins)"
-            )
-            logger.info("\n".join(lines))
-        return crossover
 
     def _closed_import_indices(self) -> set[tuple[int, int]]:
         closed = getattr(self, "_closed_ipc_import_indices", None)
@@ -3934,130 +3873,90 @@ class PCIeOneshotAllReducePool:
         channel = self._new_channel(stream_key)
         self._channels[channel_key] = channel
         return channel
-
-    def prepare_graph_all_reduce(
-        self,
-        inp: torch.Tensor,
-        *,
-        peer_input_ptrs: Optional[Sequence[int]] = None,
-        stream: object = None,
-    ) -> None:
-        """Prepare the plain graph specialization on an eager channel."""
-
-        with _device_guard(self.device):
-            channel = self.for_stream(stream)
-            if stream is not None and self.device.type == "cuda":
-                with torch.cuda.stream(stream):
-                    channel.prepare_graph_all_reduce(
-                        inp, peer_input_ptrs=peer_input_ptrs
-                    )
-            else:
-                channel.prepare_graph_all_reduce(inp, peer_input_ptrs=peer_input_ptrs)
-
-    def prepare_graph_fused_add_rms_norm(
-        self,
-        inp: torch.Tensor,
-        *,
-        peer_input_ptrs: Optional[Sequence[int]] = None,
-        stream: object = None,
-    ) -> None:
-        """Prepare the fused graph specialization on an eager channel."""
-
-        with _device_guard(self.device):
-            channel = self.for_stream(stream)
-            if stream is not None and self.device.type == "cuda":
-                with torch.cuda.stream(stream):
-                    channel.prepare_graph_fused_add_rms_norm(
-                        inp, peer_input_ptrs=peer_input_ptrs
-                    )
-            else:
-                channel.prepare_graph_fused_add_rms_norm(
-                    inp, peer_input_ptrs=peer_input_ptrs
-                )
+    def _prepared_channel_for_stream(
+        self, stream: object, channel_id: Optional[str],
+    ) -> PCIeOneshotAllReduce:
+        """Select an extant channel only; replay must never allocate one."""
+        if self._capture_channel_stack:
+            return self._capture_channel_stack[-1]
+        if self.single_channel:
+            channel = self._channels.get(0)
+            if channel is None and self._channel_factory is None:
+                channel = self._logical_channels.get(_SINGLE_CHANNEL_ID)
+            if channel is None:
+                raise RuntimeError("PCIe oneshot channel was not prepared")
+            return channel
+        stream_key = _current_stream_key(self.device, stream)
+        channel_key = 0 if stream_key is None else int(stream_key)
+        channel = self._channels.get(channel_key)
+        if channel is not None:
+            return channel
+        if self._channel_factory is not None:
+            raise RuntimeError("PCIe oneshot stream channel was not prepared")
+        if channel_id is None:
+            raise RuntimeError("prepared PCIe oneshot use requires its semantic channel_id")
+        channel = self._logical_channels.get(_normalize_logical_channel_id(channel_id))
+        if channel is None:
+            raise RuntimeError("PCIe oneshot logical channel was not prepared")
+        channel._bind_stream_key(stream_key)
+        self._channels[channel_key] = channel
+        return channel
 
     def all_reduce(
-        self,
-        inp: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-        peer_input_ptrs: Optional[Sequence[int]] = None,
-        stream: object = None,
+        self, inp: torch.Tensor, *, plan: Plan, out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None, stream: object = None,
         channel_id: Optional[str] = None,
     ) -> torch.Tensor:
         with _device_guard(self.device):
             return self._all_reduce_on_device(
-                inp,
-                out=out,
-                peer_input_ptrs=peer_input_ptrs,
-                stream=stream,
-                channel_id=channel_id,
+                inp, plan=plan, out=out, peer_input_ptrs=peer_input_ptrs,
+                stream=stream, channel_id=channel_id,
             )
 
     def _all_reduce_on_device(
-        self,
-        inp: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-        peer_input_ptrs: Optional[Sequence[int]] = None,
-        stream: object = None,
+        self, inp: torch.Tensor, *, plan: Plan, out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None, stream: object = None,
         channel_id: Optional[str] = None,
     ) -> torch.Tensor:
-        channel = self.for_stream(stream, channel_id=channel_id)
+        state = require_prepared(plan, "comm.pcie", self.device)
+        channel = self._prepared_channel_for_stream(stream, channel_id)
+        state.require_runtime(channel)
         if stream is not None and self.device.type == "cuda":
             with torch.cuda.stream(stream):
-                return channel.all_reduce(inp, out=out, peer_input_ptrs=peer_input_ptrs)
-        return channel.all_reduce(inp, out=out, peer_input_ptrs=peer_input_ptrs)
+                return channel.all_reduce(
+                    inp, plan=plan, out=out, peer_input_ptrs=peer_input_ptrs
+                )
+        return channel.all_reduce(inp, plan=plan, out=out, peer_input_ptrs=peer_input_ptrs)
 
     def all_reduce_fused_add_rms_norm(
-        self,
-        inp: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-        *,
-        out: Optional[torch.Tensor] = None,
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float,
+        *, plan: Plan, out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
-        peer_input_ptrs: Optional[Sequence[int]] = None,
-        stream: object = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None, stream: object = None,
         channel_id: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with _device_guard(self.device):
             return self._all_reduce_fused_on_device(
-                inp,
-                residual,
-                weight,
-                epsilon,
-                out=out,
-                residual_out=residual_out,
-                peer_input_ptrs=peer_input_ptrs,
-                stream=stream,
-                channel_id=channel_id,
+                inp, residual, weight, epsilon, plan=plan, out=out,
+                residual_out=residual_out, peer_input_ptrs=peer_input_ptrs,
+                stream=stream, channel_id=channel_id,
             )
 
     def _all_reduce_fused_on_device(
-        self,
-        inp: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-        *,
-        out: Optional[torch.Tensor] = None,
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float,
+        *, plan: Plan, out: Optional[torch.Tensor] = None,
         residual_out: Optional[torch.Tensor] = None,
-        peer_input_ptrs: Optional[Sequence[int]] = None,
-        stream: object = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None, stream: object = None,
         channel_id: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        channel = self.for_stream(stream, channel_id=channel_id)
+        state = require_prepared(plan, "comm.pcie", self.device)
+        channel = self._prepared_channel_for_stream(stream, channel_id)
+        state.require_runtime(channel)
 
         def run() -> tuple[torch.Tensor, torch.Tensor]:
             return channel.all_reduce_fused_add_rms_norm(
-                inp,
-                residual,
-                weight,
-                epsilon,
-                out=out,
-                residual_out=residual_out,
-                peer_input_ptrs=peer_input_ptrs,
+                inp, residual, weight, epsilon, plan=plan, out=out,
+                residual_out=residual_out, peer_input_ptrs=peer_input_ptrs,
             )
 
         if stream is not None and self.device.type == "cuda":

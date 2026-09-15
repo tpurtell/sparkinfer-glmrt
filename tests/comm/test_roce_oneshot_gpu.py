@@ -20,11 +20,27 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+from b12x.preparation import PreparationSession, PreparedCall
 
 pytestmark = pytest.mark.skipif(
     "WORLD_SIZE" not in os.environ or int(os.environ.get("WORLD_SIZE", "1")) < 2,
     reason="requires a torchrun launch with WORLD_SIZE >= 2",
 )
+
+
+class _PreparedRuntime:
+    def __init__(self, runtime, plan):
+        self._runtime = runtime
+        self._plan = plan
+
+    def all_reduce(self, inp, **kwargs):
+        return self._runtime.all_reduce(inp, plan=self._plan, **kwargs)
+
+    def all_gather(self, inp, **kwargs):
+        return self._runtime.all_gather(inp, plan=self._plan, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._runtime, name)
 
 
 @pytest.fixture(scope="module")
@@ -48,8 +64,22 @@ def runtime():
         max_size=1 << 20,
         max_gather_bytes=4 << 20,
     )
-    rt.prepare((torch.bfloat16, torch.float32, torch.float16))
-    yield rt
+    query = roce.query_from_runtime(
+        rt,
+        surface="AllReduce.all_reduce",
+        call={"dtypes": ("bfloat16", "float32", "float16")},
+        topology="roce_rdma",
+        peer_hosts=tuple(f"rank-{rank}" for rank in range(rt.world_size)),
+    )
+    declaration = roce.plan(query, runtime=rt)
+    seed = torch.zeros(4, dtype=torch.bfloat16, device=device)
+    request = declaration.request(
+        name="roce",
+        prepare_call=lambda state: PreparedCall(run=lambda: rt.prepare((seed.dtype,))),
+    )
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare((request,))
+        yield _PreparedRuntime(rt, declaration)
     rt.close()
     dist.barrier()
 

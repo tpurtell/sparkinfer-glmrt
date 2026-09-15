@@ -10,15 +10,17 @@ through shared numerical scratch on every replay.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 import os
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from torch.profiler import record_function
 
-from b12x.policy import PolicyContext
+if TYPE_CHECKING:
+    from b12x.preparation.types import Plan
+
 
 from b12x.attention.paged.planner import (
     PagedPlan,
@@ -27,6 +29,7 @@ from b12x.attention.paged.planner import (
     infer_paged_mode,
     plan_decode_graph_capacity,
 )
+from ._tuning import GqaConfig
 from b12x._lib.scratch import (
     ScratchBufferSpec,
     scratch_buffer_spec,
@@ -115,7 +118,7 @@ class B12XPagedAttentionScratchCaps:
     copy_runtime_metadata: bool = True
     msa_block_sparse: bool = False
     msa_union_tile: bool | None = None
-    policy_context: PolicyContext | None = None
+    config: GqaConfig | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "msa_block_sparse", bool(self.msa_block_sparse))
@@ -165,11 +168,8 @@ class B12XPagedAttentionScratchCaps:
             "max_page_table_width",
             _page_table_width_for_scratch(self),
         )
-        if self.policy_context is not None:
-            if not isinstance(self.policy_context, PolicyContext):
-                raise TypeError("policy_context must be a PolicyContext")
-            self.policy_context.require_device(self.device)
-
+        if self.config is not None and not isinstance(self.config, GqaConfig):
+            raise TypeError("config must be a prepared paged GQA config")
 
 @dataclass(frozen=True)
 class _B12XPagedAttentionScratchLayout:
@@ -311,7 +311,6 @@ def plan_decode_graph_scratch_envelope(
     force_split_kv: bool | None = None,
     copy_runtime_metadata: bool = True,
     kv_cache_layout: str = "separate",
-    policy: PolicyContext | None = None,
 ) -> B12XPagedDecodeGraphScratchEnvelope:
     """Return the exact maximum scratch layout for decode batches ``1..N``.
 
@@ -363,8 +362,6 @@ def plan_decode_graph_scratch_envelope(
             max_work_items=max_work_items,
             max_partial_rows=max_partial_rows,
             force_split_kv=force_split_kv,
-            kv_cache_layout=kv_cache_layout,
-            policy=policy,
         )
         bucket_caps = B12XPagedAttentionScratchCaps(
             device=device,
@@ -489,7 +486,6 @@ class B12XPagedAttentionScratch:
     _plan: PagedPlan | None = None
     _plan_metadata_cache: _B12XPagedPlanMetadataCache | None = None
     _planner_budget: PagedPlanBudget | None = None
-    _policy_context: PolicyContext | None = None
     _decode_graph_chunk_pages_lut: torch.Tensor | None = None
     _decode_graph_max_chunks_per_req: int | None = None
     _use_regular_decode_graph_replay: bool = False
@@ -507,6 +503,10 @@ class B12XPagedAttentionScratch:
     )
     _prefill_graph_max_q_tiles_per_req: int | None = None
     _prefill_graph_max_chunks_per_q_tile: int | None = None
+    _prepared_metadata_launchers: object | None = None
+    _prepared_plane_tma_descs: object | None = None
+
+
     _prefill_graph_max_q_rows_per_req: int | None = None
     msa_block_sparse: bool = False
     msa_union_tile: bool = False
@@ -515,6 +515,19 @@ class B12XPagedAttentionScratch:
         tuple[int, int, tuple[int, ...], tuple[int, ...], int, int],
         tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor],
     ] = field(default_factory=dict)
+    def install_prepared_resources(
+        self,
+        *,
+        metadata_launchers: object | None = None,
+        plane_tma_descs: object | None = None,
+    ) -> None:
+        """Install preparation-owned metadata launchers before live scheduling."""
+
+        if metadata_launchers is not None:
+            self._prepared_metadata_launchers = metadata_launchers
+        if plane_tma_descs is not None:
+            self._prepared_plane_tma_descs = plane_tma_descs
+
 
     @property
     def prepared(self) -> bool:
@@ -543,7 +556,7 @@ class B12XPagedAttentionScratch:
     def current_lse_view(self) -> torch.Tensor:
         if self.lse is None:
             raise RuntimeError("paged scratch has not been prepared")
-        return self.lse[:, : self.active_total_q].transpose(0, 1)
+        return self.lse.narrow(1, 0, self.active_total_q).transpose(0, 1)
 
     def bind(
         self,
@@ -752,6 +765,11 @@ class B12XPagedAttentionScratch:
                 window_left=int(window_left),
                 enable_cuda_graph=self.use_cuda_graph,
                 graph_chunk_policy=self.use_cuda_graph,
+                # A captured grid is padded to the declared work-item
+                # capacity, never to the device-wide CTA bound.
+                max_batch_size_if_split=(
+                    int(self.max_work_items) if self.use_cuda_graph else None
+                ),
                 plan_budget=(
                     self.planner_budget
                     if self.mode in ("extend", "verify") and not self.use_cuda_graph
@@ -1144,6 +1162,7 @@ class B12XPagedAttentionScratch:
         from .graph_replay import update_prefill_graph_chunk_metadata
 
         update_prefill_graph_chunk_metadata(
+            _prepared=self._prepared_metadata_launchers,
             cache_seqlens=self.cache_seqlens,
             cu_seqlens_q=self.cu_seqlens_q,
             request_indices=self.request_indices,
@@ -1260,6 +1279,7 @@ class B12XPagedAttentionScratch:
             )
 
             update_decode_graph_window_start_tokens(
+                _prepared=self._prepared_metadata_launchers,
                 cache_seqlens=self.cache_seqlens,
                 kv_window_start_tokens=self.kv_window_start_tokens,
                 page_size=self.page_size,
@@ -1271,6 +1291,7 @@ class B12XPagedAttentionScratch:
             )
 
             update_msa_decode_graph_chunk_metadata(
+                _prepared=self._prepared_metadata_launchers,
                 cache_seqlens=self.cache_seqlens,
                 request_indices=self.request_indices,
                 qo_tile_indices=self.qo_tile_indices,
@@ -1295,6 +1316,7 @@ class B12XPagedAttentionScratch:
             )
 
             update_regular_decode_graph_chunk_metadata_from_lut(
+                _prepared=self._prepared_metadata_launchers,
                 cache_seqlens=self.cache_seqlens,
                 merge_indptr=self.merge_indptr,
                 o_indptr=self.o_indptr,
@@ -1320,6 +1342,7 @@ class B12XPagedAttentionScratch:
                 1,
             )
             update_decode_graph_chunk_metadata(
+                _prepared=self._prepared_metadata_launchers,
                 cache_seqlens=self.cache_seqlens,
                 request_indices=self.request_indices,
                 qo_tile_indices=self.qo_tile_indices,
@@ -1463,6 +1486,7 @@ class B12XPagedAttentionBinding:
     v_descale: torch.Tensor | None = None
     attention_sink_bias: torch.Tensor | None = None
     relative_attention_bias: torch.Tensor | None = None
+    plan: "Plan | None" = None
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
         from b12x.attention.paged._forward import (
@@ -1808,8 +1832,8 @@ def _materialize_paged_attention_scratch(
             # Compact decode has multiple work items writing disjoint head
             # tiles into each partial row, so its partial capacity is smaller
             # than the work-item grid by the query-tile factor.
-            tmp_output = tmp_output[:partial_rows_capacity]
-            tmp_lse = tmp_lse[:partial_rows_capacity]
+            tmp_output = tmp_output.narrow(0, 0, partial_rows_capacity)
+            tmp_lse = tmp_lse.narrow(0, 0, partial_rows_capacity)
 
     return B12XPagedAttentionScratch(
         shared_scratch=scratch_storage,
@@ -1857,7 +1881,6 @@ def _materialize_paged_attention_scratch(
         _plan=plan,
         _plan_metadata_cache=plan_metadata_cache,
         _planner_budget=planner_budget,
-        _policy_context=caps.policy_context,
         _decode_graph_chunk_pages_lut=decode_graph_chunk_pages_lut,
         _decode_graph_max_chunks_per_req=decode_graph_max_chunks_per_req,
         _use_regular_decode_graph_replay=use_regular_decode_graph_replay,
@@ -2060,7 +2083,18 @@ class B12XPagedAttentionScratchPlan:
             window_left=int(window_left),
             enable_cuda_graph=True,
             graph_chunk_policy=True,
-            plan_budget=None,
+            graph_ctas_per_sm=(
+                self.caps.config.graph_ctas_per_sm
+                if self.caps.config is not None else None
+            ),
+            # The schedule a capture binds must fit the same work-item bound
+            # and workspace budget the selected programs were built for.
+            max_batch_size_if_split=(
+                int(self.caps.config.max_work_items)
+                if self.caps.config is not None
+                else int(self.caps.max_work_items) or None
+            ),
+            plan_budget=self._planner_budget,
             msa_block_sparse=self.caps.msa_block_sparse,
             msa_union_tile=bool(self.caps.msa_union_tile),
         )
@@ -2231,7 +2265,7 @@ class B12XPagedAttentionScratchPlan:
             max_work_items=self.caps.max_work_items,
             max_partial_rows=self.caps.max_partial_rows,
             force_split_kv=force_split_kv,
-            policy=self.caps.policy_context,
+            config=self.caps.config,
         )
         decode_chunk_pages_lut = capacity.chunk_pages_lut
         max_chunks_per_req = capacity.max_chunks_per_request
@@ -2272,10 +2306,11 @@ class B12XPagedAttentionScratchPlan:
             max_cu_seqlens_q,
             mode="decode",
             fixed_split_size=-1,
-            disable_split_kv=force_split_kv is False,
-            force_split_kv=force_split_kv,
+            disable_split_kv=(self.caps.config.max_partial_rows == 0) if self.caps.config is not None else force_split_kv is False,
+            force_split_kv=(self.caps.config.max_partial_rows > 0) if self.caps.config is not None else force_split_kv,
             window_left=int(window_left),
             enable_cuda_graph=True,
+            graph_ctas_per_sm=self.caps.config.graph_ctas_per_sm if self.caps.config is not None else None,
             graph_chunk_policy=True,
             # The device LUT can never select more than this many chunks.
             # Keep the capture grid at that fixed worst-case capacity rather
@@ -2318,6 +2353,7 @@ class B12XPagedAttentionScratchPlan:
         attention_sink_bias: torch.Tensor | None = None,
         relative_attention_bias: torch.Tensor | None = None,
         q2k_indices: torch.Tensor | None = None,
+        metadata_launchers: object | None = None,
     ) -> B12XPagedAttentionBinding:
         scratch_storage = scratch_tensor(
             scratch,
@@ -2339,6 +2375,9 @@ class B12XPagedAttentionScratchPlan:
             decode_graph_max_chunks_per_req=self._decode_graph_max_chunks_per_req,
             use_regular_decode_graph_replay=self._use_regular_decode_graph_replay,
             owner_scratch_plan=self,
+        )
+        scratch_views.install_prepared_resources(
+            metadata_launchers=metadata_launchers
         )
         scratch_views._q2k_indices_data_ptr = self._q2k_indices_data_ptr
         binding = build_paged_attention_binding(
@@ -2378,6 +2417,330 @@ class B12XPagedAttentionScratchPlan:
         return binding
 
 
+@dataclass(frozen=True)
+class _CompileTensor:
+    """Host-only tensor metadata accepted by the shared paged planner."""
+
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+
+def _dtype_from_descriptor(value: object, *, name: str) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        return value
+    if not isinstance(value, str) or not hasattr(torch, value):
+        raise TypeError(f"paged {name} descriptor has an invalid dtype {value!r}")
+    dtype = getattr(torch, value)
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"paged {name} descriptor has an invalid dtype {value!r}")
+    return dtype
+
+
+def _compile_tensor(
+    descriptor: Mapping[str, object], *, name: str, device: torch.device
+) -> _CompileTensor:
+    try:
+        shape = tuple(int(value) for value in descriptor["shape"])
+        strides = tuple(int(value) for value in descriptor["strides"])
+        dtype = _dtype_from_descriptor(descriptor["dtype"], name=name)
+        int(descriptor["alignment"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"paged {name} descriptor is malformed") from exc
+    if len(shape) != len(strides) or any(value < 0 for value in shape):
+        raise ValueError(f"paged {name} descriptor has invalid shape/strides")
+    return _CompileTensor(shape=shape, strides=strides, dtype=dtype, device=device)
+
+
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    stride = 1
+    strides: list[int] = []
+    for dimension in reversed(shape):
+        strides.append(stride)
+        stride *= max(int(dimension), 1)
+    return tuple(reversed(strides))
+
+
+def _fake_compile_view(tensor: _CompileTensor, *, fake_mode=None) -> torch.Tensor:
+    """Create a CUDA-labelled FakeTensor without allocating CUDA storage."""
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    fake_mode = FakeTensorMode() if fake_mode is None else fake_mode
+    meta = torch.empty_strided(
+        tensor.shape, tensor.strides, dtype=tensor.dtype, device="meta"
+    )
+    return fake_mode.fake_tensor_converter.from_meta_and_device(
+        fake_mode, meta, tensor.device
+    )
+
+
+def _compile_lengths(
+    *,
+    caps: B12XPagedAttentionScratchCaps,
+    total_q: int,
+    batch: int,
+    invocation: Mapping[str, object],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    if batch <= 0 or total_q <= 0:
+        raise ValueError("paged compile metadata requires positive batch and total_q")
+    if caps.mode == "decode":
+        if total_q != batch:
+            raise ValueError("decode compile metadata requires one query per request")
+        q_lengths = (1,) * batch
+    else:
+        requested = int(invocation.get("query_len", 0))
+        if requested > 0 and requested * batch == total_q:
+            q_lengths = (requested,) * batch
+        else:
+            base, remainder = divmod(total_q, batch)
+            if base <= 0:
+                raise ValueError("paged compile total_q must cover every request")
+            q_lengths = tuple(base + (index < remainder) for index in range(batch))
+    cache_tokens = int(
+        invocation.get(
+            "cache_tokens", caps.max_page_table_width * caps.page_size
+        )
+    )
+    if cache_tokens <= 0:
+        raise ValueError("paged compile cache_tokens must be positive")
+    return q_lengths, (cache_tokens,) * batch
+
+
+def make_compile_bindings(
+    caps: B12XPagedAttentionScratchCaps,
+    config: GqaConfig,
+    invocation: Mapping[str, object],
+    device: object,
+) -> Mapping[Hashable, B12XPagedAttentionBinding]:
+    """Build the real host plan and FakeTensor bindings used for compilation.
+
+    This intentionally never calls ``ScratchPlan.prepare``: live metadata
+    schedules are dynamic, while compiler admission needs only the finite,
+    shape-specialized host plan selected by the declaration.
+    """
+
+    del device
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    fake_mode = FakeTensorMode()
+
+    def fake_view(tensor: _CompileTensor) -> torch.Tensor:
+        return _fake_compile_view(tensor, fake_mode=fake_mode)
+    if not isinstance(caps, B12XPagedAttentionScratchCaps):
+        raise TypeError("caps must be B12XPagedAttentionScratchCaps")
+    if not isinstance(config, GqaConfig):
+        raise TypeError("config must be a prepared paged GQA config")
+    operands = invocation.get("operands")
+    if not isinstance(operands, Mapping):
+        raise ValueError("paged compile invocation requires operand descriptors")
+    required = (
+        "q", "k_cache", "v_cache", "output", "page_table", "cache_seqlens",
+        "cu_seqlens_q",
+    )
+    if any(not isinstance(operands.get(name), Mapping) for name in required):
+        raise ValueError("paged compile invocation is missing required operands")
+    tensors = {
+        name: _compile_tensor(operands[name], name=name, device=caps.device)
+        for name in required
+    }
+    q = tensors["q"]
+    page_table = tensors["page_table"]
+    if len(q.shape) != 3 or len(page_table.shape) != 2:
+        raise ValueError("paged compile operand ranks do not match the native ABI")
+    q_lengths, cache_lengths = _compile_lengths(
+        caps=caps,
+        total_q=int(q.shape[0]),
+        batch=int(page_table.shape[0]),
+        invocation=invocation,
+    )
+    force_split = invocation.get("force_split_kv")
+    graph_chunk_policy = bool(invocation.get("graph_chunk_policy", caps.use_cuda_graph))
+    if caps.use_cuda_graph and caps.mode == "decode":
+        if caps.msa_block_sparse:
+            force_split, graph_chunk_policy = True, False
+        else:
+            force_split = config.max_partial_rows > 0
+            cache_lengths = (
+                (config.worst_page_count - 1) * caps.page_size + 1,
+            ) * len(q_lengths)
+    plan = create_paged_plan(
+        q,
+        tensors["k_cache"],
+        tensors["v_cache"],
+        page_table,
+        tensors["cache_seqlens"],
+        tensors["cu_seqlens_q"],
+        mode=caps.mode,
+        fixed_split_size=int(invocation.get("fixed_split_size", -1)),
+        disable_split_kv=bool(invocation.get("disable_split_kv", False)),
+        force_split_kv=force_split,
+        enable_cuda_graph=caps.use_cuda_graph,
+        graph_chunk_policy=graph_chunk_policy,
+        max_batch_size_if_split=int(config.max_work_items),
+        graph_ctas_per_sm=int(config.graph_ctas_per_sm),
+        plan_budget=PagedPlanBudget(
+            max_total_q=caps.max_total_q,
+            max_batch=caps.max_batch,
+            max_page_table_width=caps.max_page_table_width,
+            max_work_items=caps.max_work_items,
+            max_partial_rows=caps.max_partial_rows,
+        ),
+        window_left=int(invocation.get("window_left", -1)),
+        msa_block_sparse=caps.msa_block_sparse,
+        msa_union_tile=caps.msa_union_tile,
+        host_q_lengths=q_lengths,
+        host_cache_lengths=cache_lengths,
+    )
+    def fake(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        return fake_view(
+            _CompileTensor(
+                shape=shape,
+                strides=_contiguous_strides(shape),
+                dtype=dtype,
+                device=caps.device,
+            )
+        )
+    regular_decode = (
+        not caps.msa_block_sparse
+        and plan.gqa_group_size <= plan.cta_tile_q
+        and B12XPagedAttentionScratchPlan._plan_has_regular_decode_graph_grid(plan)
+    )
+    metadata_cache = _B12XPagedPlanMetadataCache(
+        **{
+            name: fake((len(getattr(plan, name)),), torch.int32)
+            for name in (
+                "request_indices", "qo_tile_indices", "kv_tile_indices",
+                "merge_indptr", "o_indptr", "block_valid_mask",
+                "kv_window_start_tokens",
+            )
+        },
+        kv_chunk_size_ptr=fake((1,), torch.int32),
+        total_num_rows_ptr=fake((1,), torch.int32),
+        kv_chunk_size=plan.kv_chunk_size,
+        total_q=plan.total_q,
+    )
+    layout = _paged_attention_scratch_layout(caps)
+    with fake_mode:
+        scratch = _materialize_paged_attention_scratch(
+            caps, fake((layout.nbytes,), torch.uint8), layout,
+            plan=plan, plan_q=fake_view(q), plan_output=fake_view(tensors["output"]),
+            plan_k_cache=fake_view(tensors["k_cache"]), plan_v_cache=fake_view(tensors["v_cache"]),
+            planner_budget=PagedPlanBudget(
+                max_total_q=caps.max_total_q, max_batch=caps.max_batch,
+                max_page_table_width=caps.max_page_table_width,
+                max_work_items=caps.max_work_items, max_partial_rows=caps.max_partial_rows,
+            ),
+            plan_metadata_cache=metadata_cache,
+            decode_graph_chunk_pages_lut=(
+                fake((1 if caps.msa_block_sparse else config.max_effective_kv_pages + 1,), torch.int32)
+                if caps.use_cuda_graph and caps.mode == "decode" else None
+            ),
+            decode_graph_max_chunks_per_req=config.max_chunks_per_request,
+            use_regular_decode_graph_replay=regular_decode,
+            owner_scratch_plan=None,
+        )
+    # These views bind the declared input ABI when runtime metadata is borrowed.
+    if scratch.page_table is None:
+        scratch.page_table = fake_view(tensors["page_table"])
+        scratch.cache_seqlens = fake_view(tensors["cache_seqlens"])
+        scratch.cu_seqlens_q = fake_view(tensors["cu_seqlens_q"])
+    object.__setattr__(scratch, "_compile_operand_descriptors", operands)
+    object.__setattr__(scratch, "_compile_config", config)
+    binding = B12XPagedAttentionBinding(
+        scratch=scratch,
+        q=fake_view(q),
+        k_cache=fake_view(tensors["k_cache"]),
+        v_cache=fake_view(tensors["v_cache"]),
+        output=fake_view(tensors["output"]),
+        **{
+            name: (
+                fake_view(
+                    _compile_tensor(value, name=name, device=caps.device)
+                )
+                if isinstance(value, Mapping)
+                else None
+            )
+            for name, value in operands.items()
+            if name
+            in (
+                "q2k_indices",
+                "k_descale",
+                "v_descale",
+                "attention_sink_bias",
+                "relative_attention_bias",
+            )
+        },
+    )
+    return {variant_key(binding): binding}
+
+
+def variant_key(binding: B12XPagedAttentionBinding) -> Hashable:
+    """Return the static native codegen route for real or fake bindings."""
+
+    if not isinstance(binding, B12XPagedAttentionBinding):
+        raise TypeError("variant_key requires B12XPagedAttentionBinding")
+    scratch = binding.scratch
+    plan = scratch.plan
+    config = getattr(scratch, "_compile_config", None)
+    if config is None:
+        owner_plan = getattr(scratch, "_owner_scratch_plan", None)
+        config = getattr(getattr(owner_plan, "caps", None), "config", None)
+    if config is None and binding.plan is not None:
+        config = getattr(getattr(binding.plan, "selection", None), "config", None)
+    optional = (
+        binding.q2k_indices is not None,
+        binding.k_descale is not None,
+        binding.v_descale is not None,
+        binding.attention_sink_bias is not None,
+        binding.relative_attention_bias is not None,
+    )
+    layout = (
+        tuple(binding.q.stride()),
+        tuple(binding.k_cache.stride()),
+        tuple(binding.v_cache.stride()),
+        tuple(binding.output.stride()),
+    )
+    return (
+        "paged-native-route-v1",
+        plan.mode,
+        plan.dtype,
+        plan.kv_dtype,
+        plan.num_q_heads,
+        plan.num_kv_heads,
+        plan.head_dim_qk,
+        plan.head_dim_vo,
+        plan.page_size,
+        plan.gqa_group_size,
+        bool(plan.enable_cuda_graph),
+        bool(plan.graph_chunk_policy),
+        bool(plan.split_kv),
+        int(plan.fixed_split_size),
+        int(plan.window_left),
+        bool(plan.msa_block_sparse),
+        bool(plan.msa_union_tile),
+        config,
+        optional,
+        layout,
+    )
+
+
+def paged_attention_scratch_specs(
+    caps: B12XPagedAttentionScratchCaps,
+) -> tuple[ScratchBufferSpec, ...]:
+    """Return the exact caller-owned arena requirement without CUDA allocation."""
+    layout = _paged_attention_scratch_layout(caps)
+    return (
+        scratch_buffer_spec(
+            "paged_attention.scratch", nbytes=int(layout.nbytes), device=caps.device
+        ),
+    )
+
+
 def plan_paged_attention_scratch(
     caps: B12XPagedAttentionScratchCaps,
 ) -> B12XPagedAttentionScratchPlan:
@@ -2385,6 +2748,7 @@ def plan_paged_attention_scratch(
     plan_q = _shape_only_cuda_tensor(
         (caps.max_total_q, caps.num_q_heads, caps.head_dim_qk),
         dtype=caps.dtype,
+
         device=caps.device,
     )
     plan_output = _shape_only_cuda_tensor(
@@ -2412,13 +2776,7 @@ def plan_paged_attention_scratch(
     return B12XPagedAttentionScratchPlan(
         caps=caps,
         layout=layout,
-        _scratch_specs=(
-            scratch_buffer_spec(
-                "paged_attention.scratch",
-                nbytes=int(layout.nbytes),
-                device=caps.device,
-            ),
-        ),
+        _scratch_specs=paged_attention_scratch_specs(caps),
         _plan_q=plan_q,
         _plan_output=plan_output,
         _plan_k_cache=plan_k_cache,
@@ -2434,6 +2792,9 @@ __all__ = [
     "B12XPagedAttentionScratchCaps",
     "B12XPagedAttentionScratchPlan",
     "build_paged_attention_binding",
+    "make_compile_bindings",
     "plan_decode_graph_scratch_envelope",
     "plan_paged_attention_scratch",
+    "paged_attention_scratch_specs",
+    "variant_key",
 ]

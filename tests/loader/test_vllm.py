@@ -14,7 +14,8 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 from b12x.integration.vllm.loader import B12xModelLoader
 from b12x.loader._checkpoint import DirectWeightSession
-from b12x.loader._pool import owns_tensor, shared_pool, weight_pool
+from b12x.loader._pool import owns_tensor, shared_pool, weight_allocation, weight_pool
+from b12x.loader._progress import CheckpointDisplay
 
 
 @pytest.mark.parametrize("show_progress", [True, False])
@@ -44,8 +45,12 @@ def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
     source = DefaultModelLoader.Source(
         str(tmp_path), revision=None, prefix="draft.", weight_name_prefixes=("mtp.",)
     )
-    with shared_pool(allocation="pinned_wc"), DirectWeightSession() as session:
+    with (
+        shared_pool(allocation=weight_allocation()), DirectWeightSession() as session,
+        CheckpointDisplay(enabled=show_progress) as display,
+    ):
         loader._session = session
+        loader._progress = display
         retained = dict(loader._get_weights_iterator(source))
         assert set(retained) == {"draft.mtp.weight", "draft.mtp.bias"}
         values = {}
@@ -53,16 +58,19 @@ def test_draft_iterator_uses_index_and_retained_tensors_keep_their_bytes(
             values[name] = torch.empty_like(descriptor, device="cuda")
             assert session(values[name], descriptor)
         loader._session = None
+        loader._progress = None
     torch.testing.assert_close(values["draft.mtp.weight"].cpu(), torch.arange(16))
     torch.testing.assert_close(values["draft.mtp.bias"].cpu(), torch.arange(4) + 100)
     assert config.load_format == "b12x"
     assert config.model_loader_extra_config == {}
     progress = capsys.readouterr().err
     if show_progress:
-        assert "Loading safetensors checkpoint shards (b12x)" in progress
-        assert "100% Completed | 2/2" in progress
+        assert "b12x routing checkpoint shards" in progress
+        assert "2/2 shards routed" in progress
+        assert "0.00 GB selected on rank 0" in progress
+        assert "it/s" not in progress
     else:
-        assert "Completed" not in progress
+        assert "shards routed" not in progress
 
 
 def test_gdn_convolution_shards_read_into_final_parameter_slices(tmp_path):
@@ -77,7 +85,11 @@ def test_gdn_convolution_shards_read_into_final_parameter_slices(tmp_path):
     loader = mamba_v2_sharded_weight_loader(
         [(8, 0, 0), (4, 2, 1)], tp_size=2, tp_rank=1
     )
-    with shared_pool(), DirectWeightSession() as session, weight_transfer(session):
+    with (
+        shared_pool(allocation=weight_allocation()),
+        DirectWeightSession() as session,
+        weight_transfer(session),
+    ):
         source = dict(session.weights([path]))["conv.weight"]
         target = torch.full((6, 2), -1.0, device="cuda")
         loader(target, source)
@@ -97,7 +109,7 @@ def test_loader_policy_keeps_hyperconnection_workspaces_out_of_shared_weights(tm
     path = tmp_path / "norm.safetensors"
     save_file({"weight": expected}, path)
     with (
-        weight_pool(allocation="pinned_wc") as allocator,
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
         weight_transfer(session, allocator=allocator),
         torch.device("cuda"),
@@ -157,7 +169,7 @@ def test_glm_attention_dequantization_reads_owned_checkpoint_inputs(
             return iter([(parameter_name, param)])
 
     with (
-        weight_pool(allocation="pinned_wc") as allocator,
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession(allocation_scope=allocator) as session,
         weight_transfer(session, allocator=allocator),
     ):
@@ -191,7 +203,7 @@ def test_kda_convolution_loads_each_tp_shard_into_fused_wc_weights(tmp_path, ran
     }
     save_file(weights, path)
     with (
-        weight_pool(allocation="pinned_wc") as allocator,
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
         weight_transfer(session, allocator=allocator),
     ):
@@ -250,7 +262,7 @@ def test_deepseek_sink_shards_are_flushed_before_derived_weights(
             pass
 
     with (
-        weight_pool(allocation="pinned_wc") as allocator,
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
         weight_transfer(session, allocator=allocator),
     ):
@@ -288,7 +300,7 @@ def test_dsa_indexer_dequantization_owns_inputs_across_checkpoint_shards(
     if scale_first:
         paths.reverse()
     with (
-        weight_pool(allocation="pinned_wc") as allocator,
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession(allocation_scope=allocator) as session,
         weight_transfer(session, allocator=allocator),
     ):
@@ -328,7 +340,7 @@ def test_dspark_markov_embedding_reads_checkpoint_into_weight_storage(
     path = tmp_path / "markov.safetensors"
     save_file({"markov_w1.weight": expected}, path)
     with (
-        weight_pool(allocation="pinned_wc") as allocator,
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
         weight_transfer(session, allocator=allocator),
         torch.device("cuda"),
@@ -378,7 +390,7 @@ def test_glm_mtp_projection_loads_from_main_shard_without_sharing_runtime_buffer
     )
     with (
         set_current_vllm_config(VllmConfig()),
-        weight_pool(allocation="pinned_wc") as allocator,
+        weight_pool(allocation=weight_allocation()) as allocator,
         DirectWeightSession() as session,
         weight_transfer(session, allocator=allocator),
         torch.device("cuda"),

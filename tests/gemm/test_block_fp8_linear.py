@@ -1,114 +1,74 @@
-"""gemm.block_fp8_linear: quantized-reference parity + the planned lifecycle
-(plan -> bind -> run) replaying under CUDA-graph capture.
-
-Curated from b12x tests/test_gemm_block_fp8_linear.py; kernel-reuse and
-regime-policy tests stay in the b12x repo.
-"""
-
+"""Prepared block-FP8 linear respects source precision and rewrites scratch."""
 from __future__ import annotations
 
+import pytest
 import torch
 
+from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
 from b12x.gemm import block_fp8_linear as bfl
-from b12x.gemm._shared.wo_mxfp8 import (
-    dequantize_mxfp8_rows_torch,
-)
-
+from b12x.gemm._shared.wo_mxfp8 import empty_dense_gemm_mnl_view
+from b12x.preparation import PreparationSession, PreparedCall
 from ..conftest import require_b12x
 
 
-def _make_block_fp8_weight(
-    out_features: int, in_features: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    weight = (
-        torch.randn((out_features, in_features), device="cuda", dtype=torch.bfloat16)
-        / 8
-    ).to(torch.float8_e4m3fn)
-    scale_u8 = (
-        torch.arange(
-            (out_features // 128) * (in_features // 128),
-            device="cuda",
-            dtype=torch.int32,
-        )
-        % 3
-        + 126
-    ).to(torch.uint8)
-    scale = scale_u8.view(torch.float8_e8m0fnu).reshape(
-        out_features // 128, in_features // 128
-    )
-    return weight, scale
+def test_block_fp8_functional_quantization_requires_prepared_plan():
+    source = torch.empty((1, 128), dtype=torch.bfloat16)
+    with pytest.raises(TypeError):
+        bfl.quantize_input(source, plan=object())
 
 
-def _reference(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor):
-    x_q = bfl.quantize_input(x)
-    w_q = bfl.pack_weight(weight, scale)
-    x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
-    w_deq = dequantize_mxfp8_rows_torch(w_q.weight.values, w_q.weight.scale_rows)
-    return x_deq @ w_deq.T
+@pytest.mark.parametrize("rows,source_dtype,output_dtype", [
+    (17, torch.bfloat16, torch.float16),
+    (3, torch.float16, torch.bfloat16),
+    (3, torch.bfloat16, torch.bfloat16),
+])
+@torch.inference_mode()
+def test_prepared_block_fp8_rewrites_poisoned_scratch_on_graph_replay(rows, source_dtype, output_dtype):
+    device = require_b12x()
+    torch.manual_seed(7214)
+    k, n = 256, 256
+    source = (torch.randn((rows, k), device=device) / 4).to(source_dtype)
+    weight = (torch.randn((n, k), device=device) / 4).to(torch.float8_e4m3fn)
+    weight_scale = torch.full((n // 128, k // 128), .125, device=device)
+    packed = bfl.pack_weight(weight, weight_scale)
+    output = empty_dense_gemm_mnl_view(rows, n, 1, device=source.device, dtype=output_dtype)
+    bias = torch.randn(n, device=device, dtype=output_dtype) / 8
+    caps = bfl.Caps(device=source.device, max_tokens=rows, in_features=k,
+                    out_features=n, source_dtype=source_dtype, output_dtype=output_dtype)
+    declaration = bfl.plan(caps)
+    owned = {}
 
+    def prepare(state):
+        (spec,) = state.scratch.scratch_specs()
+        owned["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        binding = state.bind(scratch=owned["scratch"], source=source,
+                             packed_weight=packed, output=output, bias=bias)
+        return PreparedCall(run=lambda: state.run_binding(binding), output=output)
 
-def test_run_matches_quantized_reference() -> None:
-    require_b12x()
-    torch.manual_seed(20260523)
+    def reference():
+        activation = quant_dequant_mxfp8_torch(source).float()
+        dequantized_weight = weight.float() * .125
+        return (activation @ dequantized_weight.T).to(output_dtype) + bias
 
-    tokens, in_features, out_features = 7, 256, 384
-    x = (
-        torch.randn((tokens, in_features), device="cuda", dtype=torch.bfloat16) / 4
-    ).contiguous()
-    weight, scale = _make_block_fp8_weight(out_features, in_features)
-    packed = bfl.pack_weight(weight, scale)
-
-    actual = bfl.run(x, packed)
-    expected = _reference(x, weight, scale)
-    torch.cuda.synchronize()
-
-    torch.testing.assert_close(
-        actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
-    )
-
-
-def test_plan_bind_run_replays_under_cuda_graph() -> None:
-    require_b12x()
-    torch.manual_seed(20260526)
-
-    tokens, in_features, out_features = 1, 128, 256
-    x = (
-        torch.randn((tokens, in_features), device="cuda", dtype=torch.bfloat16) / 4
-    ).contiguous()
-    weight, scale = _make_block_fp8_weight(out_features, in_features)
-    packed = bfl.pack_weight(weight, scale)
-
-    plan = bfl.plan(
-        bfl.Caps(
-            device=x.device,
-            max_tokens=tokens,
-            in_features=in_features,
-            out_features=out_features,
-            output_dtype=x.dtype,
-        )
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=x.device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    )
-    output = torch.empty((tokens, out_features, 1), dtype=x.dtype, device=x.device)
-    binding = bfl.bind(
-        plan, scratch=scratch, source=x, packed_weight=packed, output=output
-    )
-
-    def run_once() -> torch.Tensor:
-        return bfl.run(binding=binding)
-
-    eager = run_once().clone()
-    torch.cuda.synchronize()
-
-    run_once()  # warm before capture
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = run_once()
-    for _ in range(3):
-        graph.replay()
-    torch.cuda.synchronize()
-
-    torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+    request = declaration.request(name="linear", prepare_call=prepare)
+    with PreparationSession(device=source.device, autotune=False, compile_workers=2) as session:
+        session.prepare((request,))
+        binding = bfl.bind(declaration, scratch=owned["scratch"],
+                           source=source, packed_weight=packed, output=output, bias=bias)
+        owned["scratch"].fill_(255)
+        output.fill_(float("nan"))
+        actual = bfl.run(binding=binding)
+        torch.testing.assert_close(actual, reference(), rtol=2e-2, atol=2e-2)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with session.capture(), torch.cuda.graph(graph):
+                replay_output = bfl.run(binding=binding)
+            source.copy_((torch.randn_like(source.float()) / 4).to(source_dtype))
+            owned["scratch"].fill_(255)
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(source.device)
+            assert torch.isfinite(replay_output).all()
+            torch.testing.assert_close(replay_output, reference(), rtol=2e-2, atol=2e-2)
+        finally:
+            graph.reset()

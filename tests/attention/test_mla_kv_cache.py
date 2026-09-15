@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession, PreparedCall
+from b12x.attention.compressed_sparse_mla import cache_writer
 from b12x.attention import compressed_sparse_mla
 from b12x.attention._shared.mla.compressed_reference import (
     pack_deepseek_v41_cache_reference,
@@ -592,9 +593,22 @@ def test_v41_writer_recipes_odd_pages_and_int64_pool_offsets(
         expected_tail[page, offset * record_bytes:(offset + 1) * record_bytes] = (
             expected_records[source_row]
         )
-    compressed_sparse_mla.write_cache(
-        kv, cache, slots, page_size=page_size, cache_kind=cache_kind
-    )
+    plan = cache_writer.plan(cache_writer.CacheWriterQuery(
+        max_rows=5, page_size=page_size, cache_kind=cache_kind,
+        slot_dtype=str(slot_dtype).removeprefix("torch.")), device=kv.device)
+    def prepare(state):
+        saved = storage[first_page:].clone()
+        return PreparedCall(run=lambda: state.run(kv, cache, slots),
+                            restore=lambda: storage[first_page:].copy_(saved), owners=(saved,))
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare((plan.request(name="cache-writer", prepare_call=prepare),))
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compressed_sparse_mla.write_cache(kv, cache, slots, plan=plan)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        graph.reset()
     torch.testing.assert_close(storage[first_page:], expected_tail, rtol=0, atol=0)
     torch.testing.assert_close(
         storage[0], torch.full_like(storage[0], _SENTINEL), rtol=0, atol=0
@@ -614,7 +628,7 @@ def test_v41_writer_recipes_odd_pages_and_int64_pool_offsets(
 
 @pytest.mark.parametrize("cache_kind", ["swa", "indexed"])
 @torch.inference_mode()
-def test_v41_writer_precompile_dynamic_rows_and_graph_replay(cache_kind: str) -> None:
+def test_v41_writer_prepared_dynamic_rows_and_graph_replay(cache_kind: str) -> None:
     device = require_sm120()
     page_size = 3
     page_bytes = compressed_sparse_mla.page_nbytes(
@@ -623,19 +637,21 @@ def test_v41_writer_precompile_dynamic_rows_and_graph_replay(cache_kind: str) ->
     kv = _v41_writer_inputs(5, device)
     slots = torch.arange(5, dtype=torch.int64, device=device)
     cache = torch.full((2, page_bytes), _SENTINEL, dtype=torch.uint8, device=device)
-    compressed_sparse_mla.compile_cache_writer(
-        kv[:3], cache[:1], slots[:3], page_size=page_size, cache_kind=cache_kind
-    )
-    torch.testing.assert_close(
-        cache, torch.full_like(cache, _SENTINEL), rtol=0, atol=0
-    )
-    freeze_kernel_resolution("V4.1 cache writers must reuse dynamic row/page counts")
-    try:
+    plan = cache_writer.plan(cache_writer.CacheWriterQuery(
+        max_rows=5, page_size=page_size, cache_kind=cache_kind), device=kv.device)
+    def prepare(state):
+        saved = cache.clone()
+        return PreparedCall(run=lambda: state.run(kv, cache, slots),
+                            restore=lambda: cache.copy_(saved), owners=(saved,))
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare((plan.request(name="cache-writer", prepare_call=prepare),))
+        torch.testing.assert_close(cache, torch.full_like(cache, _SENTINEL), rtol=0, atol=0)
+        session.freeze()
         for rows in (0, 1, 5):
             cache.fill_(_SENTINEL)
             compressed_sparse_mla.write_cache(
                 kv[:rows], cache, slots[:rows],
-                page_size=page_size, cache_kind=cache_kind,
+                page_size=page_size, cache_kind=cache_kind, plan=plan,
             )
             expected = torch.full_like(cache, _SENTINEL)
             if rows:
@@ -647,7 +663,7 @@ def test_v41_writer_precompile_dynamic_rows_and_graph_replay(cache_kind: str) ->
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             compressed_sparse_mla.write_cache(
-                kv, cache, slots, page_size=page_size, cache_kind=cache_kind
+                kv, cache, slots, page_size=page_size, cache_kind=cache_kind, plan=plan
             )
         kv.neg_()
         cache.fill_(_SENTINEL)
@@ -658,5 +674,4 @@ def test_v41_writer_precompile_dynamic_rows_and_graph_replay(cache_kind: str) ->
         expected = torch.full_like(cache, _SENTINEL)
         expected.view(-1, records.shape[1])[:5].copy_(records)
         torch.testing.assert_close(cache, expected, rtol=0, atol=0)
-    finally:
-        unfreeze_kernel_resolution()
+        graph.reset()

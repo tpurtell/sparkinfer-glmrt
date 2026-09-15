@@ -204,5 +204,4 @@ def compile_compress(ratio, max_tokens, max_requests, max_states, device_index):
 
 
 def launch(binding):
-    with torch.cuda.device(binding.plan.caps.device):
-        run_compiled(binding.plan._compiled, (*binding._pointers, current_cuda_stream()))
+ with torch.cuda.device(binding._state.caps.device): run_compiled(binding._state.compiled,(*binding._pointers,current_cuda_stream()))

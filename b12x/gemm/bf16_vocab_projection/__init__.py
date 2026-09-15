@@ -1,10 +1,8 @@
-"""Planned BF16 decode-time vocabulary projection.
+"""Prepared BF16 decode-time vocabulary projection.
 
-``plan`` resolves the device profile once for immutable projection geometry;
-``bind`` validates the live tensors without allocating; and ``run`` launches
-the selected Triton GEMV or cuBLAS fallback under CUDA graph capture.
+``plan`` declares immutable projection geometry, ``PreparationSession`` selects and
+primes one backend, and ``bind``/``run`` consume only its prepared ``Plan``.
 """
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -14,7 +12,7 @@ from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 META = OpMeta(
     name="bf16_vocab_projection",
     group="gemm",
-    api_style="planned",
+    api_style="prepared",
     entry_points=(
         "Caps",
         "Plan",

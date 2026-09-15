@@ -11,6 +11,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
+from b12x.comm.pcie._oneshot_preparation import (
+    _prepare_fused_call, plan as oneshot_plan, query_from_runtime,
+)
+from b12x.preparation import CollectiveRequirement, PreparationSession
 
 from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReducePool,
@@ -139,6 +143,33 @@ def _cuda_graph_kernel_chain(
     assert worker[1][0] >= 64
     return worker
 
+def _prepare_fused_execution(channel, inp, residual, weight, epsilon, *, name):
+    """Build the real collective preparation request used by oneshot tests."""
+    query = query_from_runtime(
+        channel, surface="OneshotAllReducePool.all_reduce_fused_add_rms_norm",
+        call={"inp": inp},
+    )
+    declaration = oneshot_plan(query, runtime=channel)
+    out = torch.empty_like(inp)
+    ranks = tuple(range(dist.get_world_size()))
+    collective = CollectiveRequirement(key=name, ranks=ranks)
+    original_residual = residual.clone()
+    request = declaration.request(
+        name=name,
+        collective=collective,
+        prepare_call=lambda state: _prepare_fused_call(
+            state, inp=inp, residual=residual, weight=weight, out=out,
+            residual_out=residual, epsilon=epsilon,
+        ),
+    )
+    session = PreparationSession(device=channel.device, autotune=False)
+    result = session.prepare(
+        (request,),
+        coordinator=lambda progress: collective.key if progress.ready_collectives else None,
+    )
+    residual.copy_(original_residual)
+    return session, result, declaration, out
+
 
 def _run_eager(
     pool: PCIeOneshotAllReducePool,
@@ -190,13 +221,18 @@ def _run_eager(
         )
         if exercise_device_guard:
             torch.cuda.set_device(wrong_device)
-        out, residual_out = pool.all_reduce_fused_add_rms_norm(
-            inp,
-            residual,
-            weight,
-            epsilon,
-            channel_id="eager:fused-rmsnorm",
+        channel = pool.for_stream(channel_id="eager:fused-rmsnorm")
+        session, result, plan, out = _prepare_fused_execution(
+            channel, inp, residual, weight, epsilon,
+            name=f"eager:fused-rmsnorm:{dtype}:{rows}:{hidden_size}",
         )
+        residual_out = residual
+        out, residual_out = pool.all_reduce_fused_add_rms_norm(
+            inp, residual, weight, epsilon, plan=plan, out=out,
+            residual_out=residual_out, channel_id="eager:fused-rmsnorm",
+        )
+        result.close()
+        session.close()
         if exercise_device_guard:
             assert torch.cuda.current_device() == wrong_device
             torch.cuda.set_device(rank)
@@ -223,19 +259,15 @@ def _run_graph(
     )
     out = torch.empty_like(inp)
     graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with (
-        pool.capture(channel_id="graph:fused-rmsnorm") as channel,
-        torch.cuda.graph(graph),
-    ):
-        pool.all_reduce_fused_add_rms_norm(
-            inp,
-            residual,
-            weight,
-            epsilon,
-            out=out,
-            residual_out=residual,
-            channel_id="graph:fused-rmsnorm",
+    with pool.capture(channel_id="graph:fused-rmsnorm") as channel:
+        session, result, plan, out = _prepare_fused_execution(
+            channel, inp, residual, weight, epsilon, name="graph:fused-rmsnorm",
         )
+        with torch.cuda.graph(graph):
+            pool.all_reduce_fused_add_rms_norm(
+                inp, residual, weight, epsilon, plan=plan, out=out,
+                residual_out=residual, channel_id="graph:fused-rmsnorm",
+            )
     # CuTe folds device-side slot selection into the worker, so staged capture
     # preserves the one-kernel production topology.
     _cuda_graph_kernel_chain(graph)
@@ -304,6 +336,8 @@ def _run_graph(
         changed_slots[index] != changed_slots[index + 1]
         for index in range(len(changed_slots) - 1)
     )
+    result.close()
+    session.close()
 
 
 def _run_tp8_graph_mode_transition(

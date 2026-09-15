@@ -20,20 +20,22 @@ from b12x._lib.compiler import (
     run_compiled,
     tensor_key,
 )
+from b12x._lib.compile_plan import compile_only_launches_enabled
 
 from .._shared import static_fp8_quant
 from ._forward import DenseMlaForwardKernel
 from ._layout import make_smem_layout
 from ._merge import DenseMlaMergeKernel
 from ._scratch import Binding
+from b12x._lib.program_cache import register_program_cache
 
 _FP8 = torch.float8_e4m3fn
 _LOG2_E = math.log2(math.e)
 _LOCK = RLock()
 _FORWARD_CACHE: dict[tuple[object, ...], object] = {}
 _MERGE_CACHE: dict[tuple[object, ...], object] = {}
-
-
+register_program_cache(_FORWARD_CACHE, lock=_LOCK)
+register_program_cache(_MERGE_CACHE, lock=_LOCK)
 def _to_cute(
     tensor: torch.Tensor,
     dtype,
@@ -41,6 +43,21 @@ def _to_cute(
     align: int,
     dynamic_layout: bool = False,
 ):
+    if compile_only_launches_enabled() and hasattr(tensor, "fake_mode"):
+        from cutlass.cute.runtime import make_fake_tensor
+        leading_dim = next(
+            (index for index, stride in enumerate(tensor.stride()) if int(stride) == 1),
+            None,
+        )
+        if dynamic_layout and tensor.ndim and leading_dim is not None:
+            shape = tuple(cutlass.cute.sym_int(32) for _ in tensor.shape)
+            strides = tuple(
+                1 if index == leading_dim else cutlass.cute.sym_int(64)
+                for index in range(tensor.ndim)
+            )
+        else:
+            shape, strides = tuple(tensor.shape), tuple(tensor.stride())
+        return make_fake_tensor(dtype, shape, strides, assumed_align=align)
     converted = from_dlpack(tensor, assumed_align=align)
     converted.element_type = dtype
     if dynamic_layout and tensor.ndim:
@@ -328,6 +345,36 @@ def _compile_entries(binding: Binding) -> tuple[object, object | None]:
             _MERGE_CACHE[signature] = compiled_merge
     return compiled_forward, compiled_merge
 
+@dataclass(frozen=True)
+class DenseMlaLaunchers:
+    """Resolved native entries retained by a prepared sparse-MLA state."""
+
+    signature: tuple[object, ...]
+    forward: object
+    merge: object | None
+
+    def run(self, binding: Binding) -> tuple[torch.Tensor, torch.Tensor]:
+        if _signature(binding) != self.signature:
+            raise ValueError("dense MLA binding differs from its prepared launcher")
+        forward = _forward_launch(binding)
+        run_compiled(self.forward, forward.args)
+        if binding.scratch.num_splits > 1 and binding.active_splits > 1:
+            if self.merge is None:
+                raise RuntimeError("prepared dense MLA binding is missing its merge launcher")
+            merge = _merge_launch(binding)
+            assert merge is not None
+            run_compiled(self.merge, merge.args)
+        rows = int(binding.q.shape[0])
+        return binding.output, binding.scratch.final_lse[:rows]
+
+
+def resolve_dense_mla_launchers(*, binding: Binding) -> DenseMlaLaunchers:
+    """Resolve and retain the existing exact forward/merge native entries."""
+    if not binding.q.is_cuda:
+        raise ValueError("dense MLA native compilation requires CUDA tensors")
+    forward, merge = _compile_entries(binding)
+    return DenseMlaLaunchers(_signature(binding), forward, merge)
+
 
 def compile_dense_mla(*, binding: Binding) -> None:
     """Compile the exact native forward/merge entries without launching."""
@@ -342,7 +389,7 @@ def run_dense_mla(
     *,
     binding: Binding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch only previously planned storage; no device allocation occurs."""
+    """Launch only entries resolved during preparation."""
     if not binding.q.is_cuda:
         raise ValueError("dense MLA native execution requires CUDA tensors")
     if binding.query_quant is not None:
@@ -351,16 +398,12 @@ def run_dense_mla(
     with _LOCK:
         compiled_forward = _FORWARD_CACHE.get(signature)
         compiled_merge = _MERGE_CACHE.get(signature)
-    capturing = torch.cuda.is_current_stream_capturing()
     if compiled_forward is None or (
         binding.scratch.num_splits > 1 and compiled_merge is None
     ):
-        if capturing:
-            raise RuntimeError(
-                "dense MLA compile miss during CUDA graph capture; call "
-                "dense_mla.compile(binding=...) before capture"
-            )
-        compiled_forward, compiled_merge = _compile_entries(binding)
+        raise RuntimeError(
+            "dense MLA execution is not prepared; resolve launchers before run"
+        )
 
     forward = _forward_launch(binding)
     run_compiled(compiled_forward, forward.args)
@@ -381,7 +424,9 @@ def clear_dense_mla_kernel_caches() -> None:
 
 
 __all__ = [
+    "DenseMlaLaunchers",
     "clear_dense_mla_kernel_caches",
     "compile_dense_mla",
+    "resolve_dense_mla_launchers",
     "run_dense_mla",
 ]

@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from b12x.preparation.types import plan_from_handle, require_prepared
+
 from ._cute_config import require_cute_combine_norm
 
 
@@ -212,428 +214,160 @@ def _combine_launch(
 
 @torch.library.custom_op("b12x::hyperconnection_grouped_rmsnorm", mutates_args=("out",))
 def _grouped_rmsnorm_op(
-    state: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor,
-    eps: float,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
-    zero_centered: bool = True,
+    state: torch.Tensor, weight: torch.Tensor, out: torch.Tensor,
+    eps: float, plan_handle: int, zero_centered: bool = True,
 ) -> None:
-    _require_disjoint("normalized", out, (("state", state), ("weight", weight)))
-    if zero_centered:
-        _norm_launch(
-            state,
-            weight,
-            out,
-            eps,
-            streams,
-            hidden_size,
-            block_h,
-            num_warps,
-        )
-    else:
-        from ._cute import grouped_rmsnorm
-
-        grouped_rmsnorm(
-            state,
-            weight,
-            out,
-            eps=eps,
-            streams=streams,
-            hidden_size=hidden_size,
-            zero_centered=False,
-        )
+    from ._impl import run_grouped_rmsnorm_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", state.device)
+    run_grouped_rmsnorm_impl(state, weight, eps=eps, plan=prepared, out=out, zero_centered=zero_centered)
 
 
 @_grouped_rmsnorm_op.register_fake
 def _grouped_rmsnorm_fake(
-    state: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor,
-    eps: float,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
-    zero_centered: bool = True,
+    state: torch.Tensor, weight: torch.Tensor, out: torch.Tensor,
+    eps: float, plan_handle: int, zero_centered: bool = True,
 ) -> None:
-    del state, weight, out, eps, streams, hidden_size, block_h, num_warps
+    del state, weight, out, eps, plan_handle
 
 
 @torch.library.custom_op("b12x::hyperconnection_scaled_silu", mutates_args=("out",))
 def _scaled_silu_op(
-    projected_down: torch.Tensor,
-    out: torch.Tensor,
-    streams: int,
-    block: int,
+    projected_down: torch.Tensor, out: torch.Tensor, plan_handle: int,
 ) -> None:
-    _require_disjoint("bottleneck", out, (("projected_down", projected_down),))
-    from ._cute import scaled_silu
-
-    scaled_silu(projected_down, out, streams=streams)
+    from ._impl import run_scaled_silu_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", projected_down.device)
+    run_scaled_silu_impl(projected_down, plan=prepared, out=out)
 
 
 @_scaled_silu_op.register_fake
 def _scaled_silu_fake(
-    projected_down: torch.Tensor,
-    out: torch.Tensor,
-    streams: int,
-    block: int,
+    projected_down: torch.Tensor, out: torch.Tensor, plan_handle: int,
 ) -> None:
-    del projected_down, out, streams, block
+    del projected_down, out, plan_handle
 
 
 @torch.library.custom_op("b12x::hyperconnection_gate_mean", mutates_args=("out",))
 def _gate_mean_op(
-    normalized: torch.Tensor,
-    gate_logits: torch.Tensor,
-    out: torch.Tensor,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
+    normalized: torch.Tensor, gate_logits: torch.Tensor, out: torch.Tensor,
+    plan_handle: int,
 ) -> None:
-    _require_disjoint(
-        "block_input",
-        out,
-        (("normalized", normalized), ("gate_logits", gate_logits)),
-    )
-    _gate_mean_launch(normalized, gate_logits, out, streams, hidden_size, block_h)
+    from ._impl import run_gate_mean_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", normalized.device)
+    run_gate_mean_impl(normalized, gate_logits, plan=prepared, out=out)
 
 
 @_gate_mean_op.register_fake
 def _gate_mean_fake(
-    normalized: torch.Tensor,
-    gate_logits: torch.Tensor,
-    out: torch.Tensor,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
+    normalized: torch.Tensor, gate_logits: torch.Tensor, out: torch.Tensor,
+    plan_handle: int,
 ) -> None:
-    del normalized, gate_logits, out, streams, hidden_size, block_h
+    del normalized, gate_logits, out, plan_handle
 
 
-@torch.library.custom_op(
-    "b12x::hyperconnection_combine",
-    mutates_args=(),
-)
+@torch.library.custom_op("b12x::hyperconnection_combine", mutates_args=())
 def _combine_op(
-    state: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
+    state: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+    plan_handle: int,
 ) -> torch.Tensor:
-    combined = torch.empty_like(state)
-    if int(state.shape[0]) != 0:
-        from ._cute import combine
-
-        combine(
-            state,
-            block_output,
-            injection_logits,
-            combined,
-            streams=streams,
-            hidden_size=hidden_size,
-        )
-    return combined
+    from ._impl import run_combine_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", state.device)
+    return run_combine_impl(state, block_output, injection_logits, plan=prepared)
 
 
 @_combine_op.register_fake
 def _combine_fake(
-    state: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
+    state: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+    plan_handle: int,
 ) -> torch.Tensor:
-    del block_output, injection_logits, streams, hidden_size, block_h, num_warps
+    del block_output, injection_logits, plan_handle
     return torch.empty_like(state)
 
 
-@torch.library.custom_op(
-    "b12x::hyperconnection_combine_norm",
-    mutates_args=(),
-)
+@torch.library.custom_op("b12x::hyperconnection_combine_norm", mutates_args=())
 def _combine_norm_op(
-    state: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
-    next_norm_weight: torch.Tensor,
-    eps: float,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
+    state: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+    next_norm_weight: torch.Tensor, eps: float, plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    combined = torch.empty_like(state)
-    normalized = torch.empty_like(state)
-    require_cute_combine_norm(
-        state=state,
-        block_output=block_output,
-        injection_logits=injection_logits,
-        next_norm_weight=next_norm_weight,
-        combined=combined,
-        normalized=normalized,
-        streams=streams,
-        hidden_size=hidden_size,
+    from ._impl import run_combine_norm_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", state.device)
+    return run_combine_norm_impl(
+        state, block_output, injection_logits, next_norm_weight, eps=eps, plan=prepared,
     )
-    if int(state.shape[0]) != 0:
-        from ._cute import combine_norm as combine_norm_cute
-
-        combine_norm_cute(
-            state,
-            block_output,
-            injection_logits,
-            next_norm_weight,
-            combined,
-            normalized,
-            eps=eps,
-            streams=streams,
-            hidden_size=hidden_size,
-        )
-    return combined, normalized
 
 
 @_combine_norm_op.register_fake
 def _combine_norm_fake(
-    state: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
-    next_norm_weight: torch.Tensor,
-    eps: float,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
+    state: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+    next_norm_weight: torch.Tensor, eps: float, plan_handle: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del block_output, injection_logits, next_norm_weight, eps
-    del streams, hidden_size, block_h, num_warps
+    del block_output, injection_logits, next_norm_weight, eps, plan_handle
     return torch.empty_like(state), torch.empty_like(state)
-
-
-def run_grouped_rmsnorm(
-    state: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    eps: float,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
-    zero_centered: bool = True,
-) -> None:
-    torch.ops.b12x.hyperconnection_grouped_rmsnorm(
-        state,
-        weight,
-        out,
-        float(eps),
-        int(streams),
-        int(hidden_size),
-        int(block_h),
-        int(num_warps),
-        bool(zero_centered),
-    )
-
-
-def run_scaled_silu(
-    projected_down: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    streams: int,
-    block: int,
-) -> None:
-    torch.ops.b12x.hyperconnection_scaled_silu(
-        projected_down, out, int(streams), int(block)
-    )
-
-
-def run_gate_mean(
-    normalized: torch.Tensor,
-    gate_logits: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-) -> None:
-    torch.ops.b12x.hyperconnection_gate_mean(
-        normalized,
-        gate_logits,
-        out,
-        int(streams),
-        int(hidden_size),
-        int(block_h),
-    )
-
-
-def run_combine(
-    state: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
-    *,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
-) -> torch.Tensor:
-    return torch.ops.b12x.hyperconnection_combine(
-        state,
-        block_output,
-        injection_logits,
-        int(streams),
-        int(hidden_size),
-        int(block_h),
-        int(num_warps),
-    )
-
-
-def run_combine_norm(
-    state: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor,
-    next_norm_weight: torch.Tensor,
-    *,
-    eps: float,
-    streams: int,
-    hidden_size: int,
-    block_h: int,
-    num_warps: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.b12x.hyperconnection_combine_norm(
-        state,
-        block_output,
-        injection_logits,
-        next_norm_weight,
-        float(eps),
-        int(streams),
-        int(hidden_size),
-        int(block_h),
-        int(num_warps),
-    )
 
 
 @torch.library.custom_op("b12x::hyperconnection_engram_mix", mutates_args=("out",))
 def _engram_mix_op(
-    state: torch.Tensor,
-    projected_kv: torch.Tensor,
-    norm_weights: torch.Tensor,
-    token_mask: torch.Tensor | None,
-    out: torch.Tensor,
-    eps: float,
-    streams: int,
-    hidden_size: int,
+    state: torch.Tensor, projected_kv: torch.Tensor, norm_weights: torch.Tensor,
+    token_mask: torch.Tensor | None, out: torch.Tensor, eps: float,
+    plan_handle: int,
 ) -> None:
-    from ._cute import engram_mix
-
-    _require_disjoint(
-        "out",
-        out,
-        (("state", state), ("projected_kv", projected_kv), ("norm_weights", norm_weights)),
-    )
-    engram_mix(
-        state,
-        projected_kv,
-        norm_weights,
-        token_mask,
-        out,
-        eps=eps,
-        streams=streams,
-        hidden_size=hidden_size,
-    )
+    from ._impl import run_engram_mix_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", state.device)
+    run_engram_mix_impl(state, projected_kv, norm_weights, eps=eps, plan=prepared,
+                        out=out, token_mask=token_mask)
 
 
 @_engram_mix_op.register_fake
 def _engram_mix_fake(
-    state: torch.Tensor,
-    projected_kv: torch.Tensor,
-    norm_weights: torch.Tensor,
-    token_mask: torch.Tensor | None,
-    out: torch.Tensor,
-    eps: float,
-    streams: int,
-    hidden_size: int,
+    state: torch.Tensor, projected_kv: torch.Tensor, norm_weights: torch.Tensor,
+    token_mask: torch.Tensor | None, out: torch.Tensor, eps: float,
+    plan_handle: int,
 ) -> None:
-    del state, projected_kv, norm_weights, token_mask, out, eps, streams, hidden_size
-
-
-def run_engram_mix(
-    state: torch.Tensor,
-    projected_kv: torch.Tensor,
-    norm_weights: torch.Tensor,
-    token_mask: torch.Tensor | None,
-    out: torch.Tensor,
-    *,
-    eps: float,
-    streams: int,
-    hidden_size: int,
-) -> None:
-    torch.ops.b12x.hyperconnection_engram_mix(
-        state, projected_kv, norm_weights, token_mask, out, eps, streams, hidden_size
-    )
+    del state, projected_kv, norm_weights, token_mask, out, eps, plan_handle
 
 
 @torch.library.custom_op("b12x::hyperconnection_swiglu", mutates_args=("out",))
 def _swiglu_op(
     gate_up: torch.Tensor, out: torch.Tensor, limit: float, round_silu: bool,
+    plan_handle: int,
 ) -> None:
-    _require_disjoint("out", out, (("gate_up", gate_up),))
-    from ._cute import pointwise
-
-    if out.numel():
-        pointwise(
-            "swiglu", gate_up, gate_up, out, width=int(out.shape[1]),
-            limit=limit, round_silu=round_silu,
-        )
+    from ._impl import run_swiglu_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", gate_up.device)
+    run_swiglu_impl(gate_up, out=out, limit=limit, round_silu=round_silu, plan=prepared)
 
 
 @_swiglu_op.register_fake
 def _swiglu_fake(
     gate_up: torch.Tensor, out: torch.Tensor, limit: float, round_silu: bool,
+    plan_handle: int,
 ) -> None:
-    del gate_up, out, limit, round_silu
+    del gate_up, out, limit, round_silu, plan_handle
 
 
 @torch.library.custom_op("b12x::hyperconnection_add", mutates_args=("out",))
-def _add_op(left: torch.Tensor, right: torch.Tensor, out: torch.Tensor) -> None:
-    _require_disjoint("out", out, (("left", left), ("right", right)))
-    from ._cute import pointwise
-
-    if out.numel():
-        pointwise("add", left, right, out)
+def _add_op(
+    left: torch.Tensor, right: torch.Tensor, out: torch.Tensor,
+    plan_handle: int,
+) -> None:
+    from ._impl import run_add_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", left.device)
+    run_add_impl(left, right, out=out, plan=prepared)
 
 
 @_add_op.register_fake
-def _add_fake(left: torch.Tensor, right: torch.Tensor, out: torch.Tensor) -> None:
-    del left, right, out
+def _add_fake(
+    left: torch.Tensor, right: torch.Tensor, out: torch.Tensor,
+    plan_handle: int,
+) -> None:
+    del left, right, out, plan_handle
 
 
 @torch.library.custom_op("b12x::hyperconnection_sigmoid", mutates_args=("out",))
-def _sigmoid_op(input: torch.Tensor, out: torch.Tensor) -> None:
-    _require_disjoint("out", out, (("input", input),))
-    from ._cute import pointwise
-
-    if out.numel():
-        pointwise("sigmoid", input, input, out)
+def _sigmoid_op(source: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
+    from ._impl import run_sigmoid_impl
+    prepared = require_prepared(plan_from_handle(plan_handle), "norm.hyperconnection", source.device)
+    run_sigmoid_impl(source, out=out, plan=prepared)
 
 
 @_sigmoid_op.register_fake
-def _sigmoid_fake(input: torch.Tensor, out: torch.Tensor) -> None:
-    del input, out
-
-
-__all__ = [
-    "run_grouped_rmsnorm",
-    "run_scaled_silu",
-    "run_gate_mean",
-    "run_combine",
-    "run_combine_norm",
-    "run_engram_mix",
-]
+def _sigmoid_fake(source: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
+    return None

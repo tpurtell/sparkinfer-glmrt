@@ -1,13 +1,17 @@
 """Tiny-M BF16 absorbed-query GEMM with fused MLA query assembly."""
 
 from __future__ import annotations
-
 from collections.abc import Iterable
+
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from b12x.preparation import Plan
+from b12x.preparation.types import plan_from_handle, require_prepared
 
 from .._shared.mxfp8_bmm import _overlaps, _torch_stream
 
@@ -262,6 +266,39 @@ def _launch_validated(
     _COMPILED_SIGNATURES.add(signature)
 
 
+
+def _run_prepared(
+    q_nope: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+    out: torch.Tensor,
+    *,
+    launcher: object,
+    block_m: int,
+    output_fp8: bool,
+    stream: Optional[object] = None,
+) -> torch.Tensor:
+    heads, m, actual_output_fp8 = _validate(q_nope, weight, q_pe, q_scale, out)
+    if actual_output_fp8 != output_fp8 or block_m != (16 if m <= 16 else 32):
+        raise ValueError("MLA query plan differs from its prepared specialization")
+    target = _torch_stream(stream, q_nope.device) if stream is not None else None
+    context = torch.cuda.stream(target) if target is not None else nullcontext()
+    with context:
+        launcher[(_LATENT_DIM // _BLOCK_N, heads, 1)](
+            q_nope, weight, q_pe, q_scale if q_scale is not None else out, out, m,
+            q_nope.stride(0), q_nope.stride(1), weight.stride(0), weight.stride(1),
+            q_pe.stride(0), q_pe.stride(1), out.stride(0), out.stride(1),
+            output_fp8, False, _NOPE_DIM, _LATENT_DIM, _ROPE_DIM, block_m, _BLOCK_N, _BLOCK_K,
+        )
+        if target is not None:
+            for tensor in (q_nope, weight, q_pe, out):
+                tensor.record_stream(target)
+            if q_scale is not None:
+                q_scale.record_stream(target)
+    return out
+
+
 def _launch(
     q_nope: torch.Tensor,
     weight: torch.Tensor,
@@ -323,8 +360,10 @@ def _op(
     q_pe: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
+    plan_handle: int,
 ) -> None:
-    _launch(q_nope, weight, q_pe, q_scale, out)
+    state = require_prepared(plan_from_handle(plan_handle), "gemm.mla_query_projection", q_nope.device)
+    state.run(q_nope, weight, q_pe, out, q_scale=q_scale)
 
 
 @_op.register_fake
@@ -334,8 +373,9 @@ def _fake(
     q_pe: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
+    plan_handle: int,
 ) -> None:
-    del q_nope, weight, q_pe, q_scale, out
+    del q_nope, weight, q_pe, q_scale, out, plan_handle
 
 
 @torch.library.custom_op(
@@ -366,19 +406,20 @@ def run(
     q_pe: torch.Tensor,
     out: torch.Tensor,
     *,
+    plan: Plan,
     q_scale: Optional[torch.Tensor] = None,
     stream: Optional[object] = None,
 ) -> torch.Tensor:
     """Run the BF16 absorbed projection and query-assembly epilogue."""
     if stream is None:
         torch.ops.b12x.mla_query_projection_bf16(
-            q_nope, weight, q_pe, q_scale, out
+            q_nope, weight, q_pe, q_scale, out, plan.handle
         )
         return out
     target = _torch_stream(stream, q_nope.device)
     with torch.cuda.stream(target):
         torch.ops.b12x.mla_query_projection_bf16(
-            q_nope, weight, q_pe, q_scale, out
+            q_nope, weight, q_pe, q_scale, out, plan.handle
         )
         tensors = [q_nope, weight, q_pe, out]
         if q_scale is not None:
@@ -410,71 +451,6 @@ def run_glm_h64_bf16(
         for tensor in (q_nope, weight, q_pe, out):
             tensor.record_stream(target)
     return out
-
-
-def prewarm(
-    weight: torch.Tensor,
-    m_values: Iterable[int],
-    *,
-    output_dtype: torch.dtype,
-    stream: Optional[object] = None,
-    synchronize: bool = True,
-) -> int:
-    """Compile and first-launch every required BF16 fused-query regime."""
-    if output_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-        raise ValueError(
-            f"output_dtype must be bfloat16 or float8_e4m3fn, got {output_dtype}"
-        )
-    if weight.ndim != 3:
-        raise ValueError(f"weight must have shape [H,192,512], got {weight.shape}")
-    heads = int(weight.shape[0])
-    values = tuple(dict.fromkeys(int(value) for value in m_values if int(value) > 0))
-    for m in values:
-        if not can_implement(
-            num_heads=heads,
-            max_m=m,
-            nope_dim=int(weight.shape[1]),
-            latent_dim=int(weight.shape[2]),
-            output_dtype=output_dtype,
-            device=weight.device,
-        ):
-            raise NotImplementedError(
-                "the BF16 fused MLA query specialization cannot prewarm "
-                f"H={heads}, M={m}, weight={tuple(weight.shape)}, "
-                f"output_dtype={output_dtype}"
-            )
-    target = _torch_stream(stream, weight.device)
-    q_scale = (
-        torch.ones(1, dtype=torch.float32, device=weight.device)
-        if output_dtype == torch.float8_e4m3fn
-        else None
-    )
-    warmed_regimes: set[int] = set()
-    with torch.cuda.stream(target):
-        for m in values:
-            block_m = 16 if m <= 16 else 32
-            if block_m in warmed_regimes:
-                continue
-            warmed_regimes.add(block_m)
-            q_nope = torch.zeros(
-                (heads, m, _NOPE_DIM), dtype=torch.bfloat16, device=weight.device
-            )
-            q_pe = torch.zeros(
-                (m, heads, _ROPE_DIM), dtype=torch.bfloat16, device=weight.device
-            )
-            out = torch.empty(
-                (m, heads, _QUERY_DIM), dtype=output_dtype, device=weight.device
-            )
-            torch.ops.b12x.mla_query_projection_bf16(
-                q_nope, weight, q_pe, q_scale, out
-            )
-            for tensor in (q_nope, q_pe, out):
-                tensor.record_stream(target)
-        if q_scale is not None:
-            q_scale.record_stream(target)
-    if synchronize:
-        target.synchronize()
-    return len(warmed_regimes)
 
 
 def prewarm_glm_h64_bf16(
@@ -594,7 +570,6 @@ __all__ = [
     "can_implement",
     "can_implement_glm_h64_bf16",
     "clear_caches",
-    "prewarm",
     "prewarm_glm_h64_bf16",
     "run",
     "run_glm_h64_bf16",

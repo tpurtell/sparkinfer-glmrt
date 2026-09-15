@@ -1,20 +1,20 @@
-"""GB10 checkpoint loading into persistent CPU-addressable CUDA allocations."""
+"""Direct checkpoint loading into managed or device CUDA weight allocations."""
 
 from __future__ import annotations
 
 import dataclasses
+from contextlib import ExitStack
 import heapq
 import json
 import math
+import sys
 import time
 from pathlib import Path
 
 import torch
-from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
-    _BAR_FORMAT,
     enable_tqdm,
     file_source_tensor,
     safetensors_file_sources,
@@ -22,13 +22,14 @@ from vllm.model_executor.model_loader.weight_utils import (
 
 from b12x.loader import storage_stats
 from b12x.loader._checkpoint import DirectWeightSession
-from b12x.loader._pool import owns_storage, owns_tensor, weight_pool
+from b12x.loader._pool import owns_storage, owns_tensor, weight_allocation, weight_pool
+from b12x.loader._progress import CheckpointDisplay
 
 logger = init_logger("vllm.model_executor.model_loader.b12x")
 
 
 class B12xModelLoader(DefaultModelLoader):
-    """Route checkpoint metadata, then O_DIRECT-read into final managed storage."""
+    """Route checkpoint views into owned weights through CPU direct I/O or GDS."""
 
     def __init__(self, load_config):
         options = dict(load_config.model_loader_extra_config)
@@ -47,22 +48,31 @@ class B12xModelLoader(DefaultModelLoader):
             )
         )
         self._session = None
+        self._progress = None
 
     def load_model(self, vllm_config, model_config, prefix=""):
         from vllm.model_executor.weight_transfer import weight_transfer
 
         if model_config.enable_sleep_mode:
-            raise ValueError("b12x shared allocations do not support vLLM sleep mode")
+            raise ValueError("b12x weight allocations do not support vLLM sleep mode")
         device = torch.device(
             self.load_config.device or vllm_config.device_config.device
         )
         if device.type != "cuda":
-            raise ValueError("the initial b12x loader requires a CUDA device")
+            raise ValueError("the b12x loader requires a CUDA device")
         index = torch.cuda.current_device() if device.index is None else device.index
+        allocation = weight_allocation(index)
+        shared_read_group = None
+        if allocation == "device":
+            from vllm.distributed.parallel_state import get_tp_group
+            from b12x.loader._shared_checkpoint import SharedReadGroup
+
+            shared_read_group = SharedReadGroup(get_tp_group().cpu_group, index)
         with (
-            weight_pool(allocation="managed", device=index) as allocator,
+            weight_pool(allocation=allocation, device=index) as allocator,
             DirectWeightSession(
-                index, io_threads=self.io_threads, allocation_scope=allocator
+                index, io_threads=self.io_threads, allocation_scope=allocator,
+                shared_read_group=shared_read_group,
             ) as session,
             weight_transfer(session, allocator=allocator),
         ):
@@ -89,28 +99,88 @@ class B12xModelLoader(DefaultModelLoader):
         parameter_bytes = sum(p.nbytes for p in model.parameters())
         shared_bytes = sum(p.nbytes for p in model.parameters() if owns_tensor(p))
         model._b12x_loader_storage = {
-            "allocation": "managed",
+            "allocation": allocation,
             "parameter_bytes": parameter_bytes,
             "shared_parameter_bytes": shared_bytes,
             "shared_runtime_buffers": shared_runtime_buffers,
             **storage_stats(),
             "io": io_stats,
         }
-        logger.info("b12x O_DIRECT I/O counters: %s", io_stats)
-        logger.info("b12x allocation audit: no shared non-persistent runtime buffers")
-        logger.info(
-            "b12x final parameters: %.3f / %.3f GiB in managed shared storage; "
+        logger.debug("b12x O_DIRECT I/O counters: %s", io_stats)
+        logger.debug("b12x allocation audit: no shared non-persistent runtime buffers")
+        logger.debug(
+            "b12x final parameters: %.3f / %.3f GiB in %s weight storage; "
             "pool backing %.3f GiB",
             shared_bytes / 2**30,
             parameter_bytes / 2**30,
+            allocation,
             storage_stats()["live_bytes"] / 2**30,
+        )
+        load_seconds = (
+            self.counter_after_loading_weights - self.counter_before_loading_weights
+        )
+        payload_gb = io_stats["payload_bytes"] / 1e9
+        logger.debug(
+            "b12x effective weight loading: %.2f GB in %.2f s = %.2f GB/s "
+            "(selected checkpoint payload, per rank)",
+            payload_gb,
+            load_seconds,
+            payload_gb / load_seconds,
         )
         return model
 
     def load_weights(self, model, model_config):
-        super().load_weights(model, model_config)
-        if self._session is not None:
-            self._session.flush()
+        from vllm.utils.system_utils import undecorated_log_stream
+        from vllm.v1.executor._b12x_output import PreparationOutput
+
+        session = self._session
+        group = session.shared_read_group if session is not None else None
+        if group is not None:
+            group.start(session)
+            # Construction-time rank output must precede the live panel.
+            group._gather(None)
+        progress = CheckpointDisplay(
+            enabled=enable_tqdm(self.load_config.use_tqdm_on_load),
+            stream=undecorated_log_stream(sys.stderr),
+        )
+        with ExitStack() as stack:
+            output = stack.enter_context(PreparationOutput(
+                progress.write_output, enabled=progress._enabled and progress._stream.isatty(),
+            ))
+            if output.stream is not None:
+                progress._stream = output.stream
+            stack.enter_context(progress)
+            stack.callback(output.stop)
+            self._progress = progress
+            if session is not None:
+                session.progress = progress.phase
+            if group is not None:
+                group.progress = progress.phase
+            try:
+                super().load_weights(model, model_config)
+            finally:
+                self._progress = None
+                if session is not None:
+                    session.progress = None
+                if group is not None:
+                    group.progress = None
+
+    def _log_loading_time(self):
+        session, progress = self._session, self._progress
+        if session is not None and progress is not None:
+            group = session.shared_read_group
+            if group is not None and not group.epoch:
+                raise RuntimeError("device checkpoint loading requires vLLM's finish_weight_transfers routing hook")
+            session.flush()
+            stats = session.stats(flush=False)
+            summary = dict(group.summary) if group is not None else dict(
+                ranks=1, payload_bytes=stats["payload_bytes"],
+                physical_bytes=stats["physical_bytes"],
+            )
+            summary["load_seconds"] = self.counter_after_loading_weights - self.counter_before_loading_weights
+            progress.complete(summary)
+            progress.stop()
+        super()._log_loading_time()
 
     @staticmethod
     def _needs_values(entry):
@@ -163,8 +233,10 @@ class B12xModelLoader(DefaultModelLoader):
                     prefix=source.prefix,
                     index_path=index_path,
                     needs_values=self._needs_values,
-                    skip=lambda name: name in file_names
-                    or should_skip_weight(name, self.local_expert_ids),
+                    skip=lambda name: (
+                        name in file_names
+                        or should_skip_weight(name, self.local_expert_ids)
+                    ),
                 )
                 if any(name not in file_names for name in selected)
                 else ()
@@ -186,28 +258,32 @@ class B12xModelLoader(DefaultModelLoader):
         )
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
-        logger.info("b12x O_DIRECT input: %d safetensors shards", len(files))
-        with tqdm(
-            files,
-            desc="Loading safetensors checkpoint shards (b12x)",
-            disable=not enable_tqdm(self.load_config.use_tqdm_on_load),
-            bar_format=_BAR_FORMAT,
-        ) as shards:
-            if source.file_weight_filter is not None:
-                yield from self._file_backed_weights_iterator(
-                    shards,
-                    source,
-                    Path(folder) / "model.safetensors.index.json",
-                )
-                return
-            yield from self._session.weights(
-                shards,
-                prefixes=source.weight_name_prefixes,
-                prefix=source.prefix,
-                index_path=Path(folder) / "model.safetensors.index.json",
-                needs_values=self._needs_values,
-                skip=lambda name: should_skip_weight(name, self.local_expert_ids),
+        if self._progress is not None:
+            self._progress.source(len(files))
+
+        def progress_files():
+            for path in files:
+                if self._progress is not None:
+                    self._progress.file(Path(path).name)
+                yield path
+                if self._progress is not None:
+                    self._progress.advance(self._session.payload_bytes)
+
+        if source.file_weight_filter is not None:
+            yield from self._file_backed_weights_iterator(
+                progress_files(),
+                source,
+                Path(folder) / "model.safetensors.index.json",
             )
+            return
+        yield from self._session.weights(
+            progress_files(),
+            prefixes=source.weight_name_prefixes,
+            prefix=source.prefix,
+            index_path=Path(folder) / "model.safetensors.index.json",
+            needs_values=self._needs_values,
+            skip=lambda name: should_skip_weight(name, self.local_expert_ids),
+        )
 
 
 def register_b12x_loader():

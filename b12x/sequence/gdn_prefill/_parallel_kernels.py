@@ -12,6 +12,8 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import register_program_cache
 from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32, cp_async_bulk_g2s_mbar,
     ldmatrix_m8n8x4_trans_b16, shared_ptr_to_u32, st_global_v2_f32,
@@ -44,7 +46,7 @@ class _PartitionKernel:
         block, _, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
         thread, block = Int32(thread), Int32(block)
-        cu, _, _, _, checkpoint_offsets, num_seqs, num_tokens, error = original
+        cu, _, _, _, checkpoint_offsets, num_seqs, num_tokens = original
         seq_segments, seg_cu, zero, identity, transfer, local, output, checkpoint, offsets, no_checkpoint, seg_count, token_count = segments
         item = thread
         if block == Int32(0):
@@ -69,11 +71,8 @@ class _PartitionKernel:
             pool[Int64(self.heads * 128 * 128) + element.to(Int64)] = value
         cute.arch.sync_threads()
         if (thread == Int32(0)) & (block == Int32(0)):
-            live = Int32(0)
-            tokens = Int32(0)
-            if error[Int32(0)] == Int32(0):
-                live = num_seqs[Int32(0)].to(Int32)
-                tokens = num_tokens[Int32(0)].to(Int32)
+            live = num_seqs[Int32(0)].to(Int32)
+            tokens = num_tokens[Int32(0)].to(Int32)
             count = Int32(0)
             for seq in cutlass.range(self.max_seqs, unroll=1):
                 seq_segments[seq] = count
@@ -126,8 +125,7 @@ class _PackTransferKernel:
         head, segment, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
         head, segment, thread = Int32(head), Int32(segment), Int32(thread)
-        if ((original[7][Int32(0)] == Int32(0)) & (segment < segments[10][Int32(0)])
-                & (segments[4][segment] != Int32(0))):
+        if (segment < segments[10][Int32(0)]) & (segments[4][segment] != Int32(0)):
             stride = Int64(self.heads * 128 * 128)
             source_base = (Int64(2) + segment.to(Int64)) * stride + head.to(Int64) * Int64(128 * 128)
             target_base = segment.to(Int64) * stride + head.to(Int64) * Int64(128 * 128)
@@ -208,9 +206,9 @@ class _BoundaryKernel(_RecurrenceKernel):
         row0 = split * Int32(self.v_split) + warp * Int32(16) + gid
         row1 = row0 + Int32(8)
         matrix, matrix_row = lane >> Int32(3), lane & Int32(7)
-        _, initial, _, _, _, num_seqs, _, error = original
+        _, initial, _, _, _, num_seqs, _ = original
         seq_segments = segments[0]
-        if ((error[Int32(0)] == Int32(0)) & (target_segment < segments[10][Int32(0)])):
+        if target_segment < segments[10][Int32(0)]:
             seq = Int32(0)
             high = num_seqs[Int32(0)].to(Int32)
             while high > seq + Int32(1):
@@ -361,29 +359,20 @@ class _CommitKernel:
     @cute.jit
     def __call__(self, original: tuple, segments: tuple, pool: cute.Pointer,
                  state: cute.Pointer, output: cute.Pointer, state_stride: Int64,
-                 final_stride: Int64, output_stride: Int64, tokens: Int32,
-                 stream: cuda.CUstream):
+                 final_stride: Int64, output_stride: Int64, stream: cuda.CUstream):
         self.kernel(original, segments, pool, state, output, state_stride,
-                    final_stride, output_stride, tokens).launch(
+                    final_stride, output_stride).launch(
             grid=(self.heads, self.max_seqs, 16), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, original: tuple, segments: tuple, pool: cute.Pointer,
                state: cute.Pointer, output: cute.Pointer, state_stride: Int64,
-               final_stride: Int64, output_stride: Int64, tokens: Int32):
+               final_stride: Int64, output_stride: Int64):
         head, seq, tile = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
         head, seq, tile, thread = Int32(head), Int32(seq), Int32(tile), Int32(thread)
-        _, initial, final, checkpoint, offsets, num_seqs, _, error = original
-        if error[Int32(0)] != Int32(0):
-            if seq == Int32(0):
-                item = tile.to(Int64) * Int64(256) + thread.to(Int64)
-                while item < tokens.to(Int64) * Int64(128):
-                    token = item // Int64(128)
-                    column = item % Int64(128)
-                    output[token.to(Int64) * output_stride + head.to(Int64) * Int64(128) + column.to(Int64)] = Float32(float("nan")).to(BFloat16)
-                    item += Int64(16 * 256)
-        elif seq < num_seqs[Int32(0)]:
+        _, initial, final, checkpoint, offsets, num_seqs, _ = original
+        if seq < num_seqs[Int32(0)]:
             seq_segments = segments[0]
             begin, end = seq_segments[seq].to(Int32), seq_segments[seq + Int32(1)].to(Int32)
             target = Int64(final[seq.to(Int64) * final_stride])
@@ -417,6 +406,7 @@ class Auxiliary:
 
 
 _CACHE: dict[tuple, Auxiliary] = {}
+register_program_cache(_CACHE)
 
 
 def _metadata(binding, *, fake=False):
@@ -425,7 +415,7 @@ def _metadata(binding, *, fake=False):
     inner = parallel.output
     original = (binding.cu_seqlens, binding.initial_state_indices, binding.final_state_indices,
                 binding.checkpoint_state_indices, binding.checkpoint_offsets,
-                binding.num_seqs, binding.num_tokens, binding.error_code)
+                binding.num_seqs, binding.num_tokens)
     segments = (parallel.seq_segments, inner.cu_seqlens, parallel.local_state.initial_state_indices,
                 parallel.transfer.initial_state_indices, parallel.transfer.final_state_indices,
                 parallel.local_state.final_state_indices, inner.final_state_indices,
@@ -442,22 +432,22 @@ def _metadata(binding, *, fake=False):
 def compile_auxiliary(binding) -> Auxiliary:
     parallel = binding.parallel
     assert parallel is not None
-    caps = binding.plan.caps
+    caps = binding._state.caps
     key = (binding.output.device.index, caps.heads, caps.max_seqs,
-           parallel.plan.max_segments, parallel.plan.segment_tokens,
-           binding.plan.v_split, caps.null_state_index, binding.initial_state_indices.dtype,
-           parallel.plan.reuse_outputs)
+           parallel._state.max_segments, parallel._state.segment_tokens,
+           binding._state.v_split, caps.null_state_index, binding.initial_state_indices.dtype,
+           parallel._state.reuse_outputs)
     if key in _CACHE:
         return _CACHE[key]
     geometry = dict(heads=caps.heads, max_seqs=caps.max_seqs,
-                    max_segments=parallel.plan.max_segments)
+                    max_segments=parallel._state.max_segments)
     kernels = (
-        _PartitionKernel(**geometry, segment_tokens=parallel.plan.segment_tokens,
-                         reuse_outputs=parallel.plan.reuse_outputs),
+        _PartitionKernel(**geometry, segment_tokens=parallel._state.segment_tokens,
+                         reuse_outputs=parallel._state.reuse_outputs),
         _PackTransferKernel(**geometry),
-        _BoundaryKernel(**geometry, v_split=binding.plan.v_split, null_state_index=caps.null_state_index),
+        _BoundaryKernel(**geometry, v_split=binding._state.v_split, null_state_index=caps.null_state_index),
         _CommitKernel(**geometry, null_state_index=caps.null_state_index,
-                      reuse_outputs=parallel.plan.reuse_outputs),
+                      reuse_outputs=parallel._state.reuse_outputs),
     )
     original, segments = _metadata(binding, fake=True)
     common = (original, segments, _fake_pointer(Float32))
@@ -465,13 +455,13 @@ def compile_auxiliary(binding) -> Auxiliary:
         common,
         (*common, _fake_pointer(BFloat16), _fake_pointer(Int32)),
         (*common, _fake_pointer(BFloat16), _fake_pointer(Int32), _fake_pointer(Float32), Int64(1)),
-        (*common, _fake_pointer(Float32), _fake_pointer(BFloat16), Int64(1), Int64(1), Int64(1), Int32(1)),
+        (*common, _fake_pointer(Float32), _fake_pointer(BFloat16), Int64(1), Int64(1), Int64(1)),
     )
     compiled = []
     for name, kernel, args in zip(("partition", "pack_transfer", "boundaries", "commit"), kernels, arguments):
         raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
         compiled.append(b12x_compile(kernel, *args, current_cuda_stream(),
-                        compile_spec=KernelCompileSpec.from_key(f"sequence.gdn_prefill.{name}", 1, key)))
+                        compile_spec=KernelCompileSpec.from_key(f"sequence.gdn_prefill.{name}", 2, key)))
 
     def args(active):
         metadata = _metadata(active)
@@ -494,8 +484,9 @@ def compile_auxiliary(binding) -> Auxiliary:
         compiled[3](*args(active), _pointer(active.recurrent_state, Float32),
                     _pointer(active.output, BFloat16), int(active.recurrent_state.stride(0)),
                     int(active.final_state_indices.stride(0)), int(active.output.stride(0)),
-                    active.token_capacity, current_cuda_stream())
+                    current_cuda_stream())
 
     result = Auxiliary(partition, pack_transfer, boundaries, commit)
+    attach_programs(result, *compiled)
     _CACHE[key] = result
     return result

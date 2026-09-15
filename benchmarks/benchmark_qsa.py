@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark public Qwen3.8 Flash Next QSA decode and prefill transactions.
+"""Benchmark prepared Qwen3.8 Flash Next QSA decode and prefill transactions.
 
-The harness constructs every case through ``Caps -> plan -> bind -> run``. The
-timed operation is the bound ``qsa.run`` transaction: selector query
+The harness declares each static Caps case, prepares it through the shared
+session, then binds caller-owned cache/state tensors to its prepared plan.
+The timed operation is the bound ``qsa.run`` transaction: selector query
 preparation, streaming representative compression, stable top-k selection,
 position expansion, and sparse paged GQA. Each request owns disjoint main K/V
 pages plus independent selector and recurrent state, as it does in serving.
@@ -29,7 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from b12x.attention import qsa
-from b12x.policy import PolicyContext
+from b12x.preparation import PreparedCall, PreparationResult, PreparationSession
+from b12x.preparation.types import require_prepared
 from b12x.attention.qsa.reference import (
     gemma_rmsnorm_reference,
     packed_stream_compress_reference,
@@ -41,7 +43,6 @@ from benchmarks.common import (
     bench_cuda_graph,
     capture_cuda_graph,
     make_l2_flush_fn,
-    nvidia_smi_gpu_mode_snapshot,
     require_sm120,
     resolve_l2_flush_bytes,
 )
@@ -351,6 +352,12 @@ class PreparedCase:
     dynamic: dict[str, torch.Tensor]
     state_restore: MutableStateRestore
     setup_metadata: dict[str, object]
+    session: PreparationSession
+    result: PreparationResult
+
+    def close(self) -> None:
+        self.result.close()
+        self.session.close()
 
     def run(self) -> torch.Tensor:
         return qsa.run(self.binding, **self.dynamic)
@@ -847,17 +854,10 @@ def _prepare_case(
     seed: int,
     main_cache_layout: str,
     kv_cache_dtype: str,
-    policy: PolicyContext | None = None,
 ) -> PreparedCase:
     kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else torch.bfloat16
     caps = _make_caps(case, device, kv_dtype=kv_dtype)
-    plan = qsa.plan(caps, policy=policy)
-    (scratch_spec,) = plan.scratch_specs()
-    scratch = torch.empty(
-        scratch_spec.shape,
-        dtype=scratch_spec.dtype,
-        device=scratch_spec.device,
-    )
+    declaration = qsa.plan(caps)
     generator = torch.Generator(device=device).manual_seed(seed)
 
     main_cache_shape = (
@@ -978,9 +978,7 @@ def _prepare_case(
         device=device,
     )
 
-    binding = qsa.bind(
-        plan,
-        scratch=scratch,
+    binding_args = dict(
         main_k_cache=main_k,
         main_v_cache=main_v,
         k_descale=k_descale,
@@ -1106,6 +1104,46 @@ def _prepare_case(
             slot = prior % caps.raw_ring_capacity
             raw_tags[request, slot] = prior
             raw_rope[request, slot, :] = prior
+    def prepare_call(state):
+        (spec,) = state.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        binding = state.bind_for_preparation(scratch=scratch, **binding_args)
+        mutable = (
+            compressed,
+            raw_ring,
+            raw_tags,
+            raw_rope,
+            interval_starts,
+            output,
+            selected,
+        )
+        initial = tuple(value.clone() for value in mutable)
+
+        def restore():
+            for value, original in zip(mutable, initial, strict=True):
+                value.copy_(original)
+
+        return PreparedCall(
+            run=lambda: qsa.run(binding, **dynamic),
+            reset=restore,
+            restore=restore,
+            owners=(binding,),
+        )
+
+    session = PreparationSession(device=device)
+    request = declaration.request(
+        name=case.name,
+        prepare_call=prepare_call,
+    )
+    result = session.prepare((request,))
+    plan = declaration
+    (scratch_spec,) = require_prepared(plan, "attention.qsa").scratch_specs()
+    scratch = torch.empty(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
+    )
+    binding = qsa.bind(plan, scratch=scratch, **binding_args)
 
     setup_metadata: dict[str, object] = {
         "transaction": (
@@ -1197,10 +1235,6 @@ def _prepare_case(
         )
         qsa.run(binding, **setup_dynamic)
         torch.cuda.synchronize(device)
-        if bool(torch.any(binding.state_errors[: case.rows] != 0)):
-            raise BenchmarkFailure(
-                f"{case.name}: setup transaction reported state errors"
-            )
         if int(interval_starts[0]) != expected_anchor:
             raise BenchmarkFailure(
                 f"{case.name}: setup committed anchor {int(interval_starts[0])}, "
@@ -1268,6 +1302,8 @@ def _prepare_case(
         dynamic=dynamic,
         state_restore=state_restore,
         setup_metadata=setup_metadata,
+        session=session,
+        result=result,
     )
 
 
@@ -1338,9 +1374,6 @@ def _validate_correctness(
     nonzero = int(torch.count_nonzero(actual).item())
     if nonzero == 0:
         raise BenchmarkFailure(f"{case.name}: eager output is all zero")
-    if bool(torch.any(binding.state_errors[: case.rows] != 0)):
-        errors = binding.state_errors[: case.rows].tolist()
-        raise BenchmarkFailure(f"{case.name}: device state errors {errors}")
     if not torch.equal(binding.main_k_cache, main_k_before) or not torch.equal(
         binding.main_v_cache, main_v_before
     ):
@@ -1497,7 +1530,6 @@ def _validate_correctness(
             "sparse_gqa_max_abs": max_abs,
             "finite": True,
             "nonzero_elements": nonzero,
-            "state_errors_zero": True,
             "state_restore_exact": True,
             "main_kv_read_only": True,
             "main_page_tables_disjoint": int(
@@ -1585,7 +1617,6 @@ def _run_case(
     device: torch.device,
     l2_flush: Callable[[], None] | None,
     case_index: int,
-    policy: PolicyContext | None = None,
 ) -> dict[str, object]:
     prepared = _prepare_case(
         case,
@@ -1593,16 +1624,16 @@ def _run_case(
         seed=args.seed + 1009 * case_index,
         main_cache_layout=args.main_cache_layout,
         kv_cache_dtype=args.kv_cache_dtype,
-        policy=policy,
     )
     eager_output, correctness, eager_persistent_state = _validate_correctness(prepared)
     eager_selected = prepared.binding.selected_positions[: case.rows].clone()
 
-    graph = capture_cuda_graph(
-        prepared.run,
-        warmup=args.warmup,
-        prepare=prepared.state_restore.restore,
-    )
+    with prepared.session.capture():
+        graph = capture_cuda_graph(
+            prepared.run,
+            warmup=args.warmup,
+            prepare=prepared.state_restore.restore,
+        )
     graph_addresses = {
         "output": prepared.binding.output.data_ptr(),
         "selected_positions": prepared.binding.selected_positions.data_ptr(),
@@ -1639,8 +1670,6 @@ def _run_case(
         raise BenchmarkFailure(
             f"{case.name}: CUDA graph selector result differs from eager"
         )
-    if bool(torch.any(prepared.binding.state_errors[: case.rows] != 0)):
-        raise BenchmarkFailure(f"{case.name}: CUDA graph replay reported state errors")
     eager_persistent_state.assert_matches(
         prepared.state_restore,
         main_k_cache=prepared.binding.main_k_cache,
@@ -1674,7 +1703,7 @@ def _run_case(
     torch.cuda.synchronize(device)
     prepared.state_restore.assert_restored()
 
-    return {
+    record = {
         "name": case.name,
         "profile": {
             "name": case.profile.name,
@@ -1748,6 +1777,8 @@ def _run_case(
             "main_kv_read_only": True,
         },
     }
+    prepared.close()
+    return record
 
 
 def _git_value(*args: str) -> str:
@@ -1831,17 +1862,14 @@ def main(argv: list[str] | None = None) -> int:
             },
             "hardware": {
                 "device": str(device),
-                "name": properties.name,
-                "uuid": str(getattr(properties, "uuid", "")),
                 "sm": f"{capability[0]}{capability[1]}",
                 "total_memory_bytes": properties.total_memory,
-                "gpu_mode_before": nvidia_smi_gpu_mode_snapshot(),
             },
             "contract": {
                 "model": "Qwen3.8 Flash Next",
-                "api": ["Caps", "plan", "bind", "run"],
+                "api": ["Caps", "declaration", "PreparationSession", "Plan", "bind", "run"],
                 "timed_operation": "bound qsa.run transaction",
-                "setup_operation": "Caps -> plan -> bind",
+                "setup_operation": "Caps -> declaration -> prepare -> bind",
                 "main_kv_pool": (
                     "disjoint read-only physical pages per request with "
                     f"{args.main_cache_layout} K/V storage"
@@ -1905,7 +1933,6 @@ def main(argv: list[str] | None = None) -> int:
             gc.collect()
             torch.cuda.empty_cache()
 
-        result["hardware"]["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
         result["complete"] = True
         if args.output is not None:
             _write_new_result(args.output, result)

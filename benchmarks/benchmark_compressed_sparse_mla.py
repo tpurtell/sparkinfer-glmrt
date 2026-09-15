@@ -31,17 +31,14 @@ from b12x.attention._shared.mla.compressed_reference import (
     pack_compressed_sparse_mla_kv_cache_reference,
 )
 from b12x.attention._shared.mla.api import clear_mla_caches
-from b12x.attention._shared.mla.compressed_api import (
-    compressed_sparse_mla_decode_forward,
-)
+from b12x.attention import compressed_sparse_mla as mla
+from b12x.preparation import PreparationSession
+from benchmarks.attention_preparation import prepare_compressed
 from b12x.attention._shared.mla.compressed_config import (
     compressed_sparse_mla_split_chunks_for_contract,
 )
 from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLAScratchCaps,
-)
-from b12x.attention.compressed_sparse_mla import (
-    plan as plan_compressed_sparse_mla_scratch,
 )
 
 from benchmarks.common import (
@@ -662,54 +659,6 @@ def _benchmark_workspace_mode(*, shared_indexed_cache: bool) -> str:
     return "extend" if shared_indexed_cache else "decode"
 
 
-def _make_binding(
-    *,
-    case: BenchmarkCase,
-    num_q_heads: int,
-    device: torch.device,
-    q: torch.Tensor,
-    swa_indices: torch.Tensor,
-    swa_lengths: torch.Tensor,
-    indexed_indices: torch.Tensor | None,
-    indexed_lengths: torch.Tensor | None,
-    swa_page_size: int,
-    production_decode_cap: bool,
-    mode: str,
-):
-    split_chunks = _planned_split_chunks(
-        case,
-        production_decode_cap=production_decode_cap,
-    )
-    plan = plan_compressed_sparse_mla_scratch(
-        B12XCompressedSparseMLAScratchCaps(
-            device=device,
-            num_q_heads=num_q_heads,
-            max_q_rows=case.rows,
-            max_width=max(1, case.topk),
-            head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
-            v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
-            max_batch=case.rows,
-            page_size=swa_page_size,
-            max_chunks_per_row=split_chunks,
-            mode=mode,
-            use_cuda_graph=True,
-        )
-    )
-    scratch = [
-        torch.empty(shape, dtype=dtype, device=device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    ]
-    binding = plan.bind(
-        scratch=scratch,
-        q=q,
-        swa_indices=swa_indices,
-        swa_lengths=swa_lengths,
-        indexed_indices=indexed_indices,
-        indexed_lengths=indexed_lengths,
-    )
-    return binding, split_chunks
-
-
 def _sanity(actual: torch.Tensor, expected: torch.Tensor) -> Sanity:
     diff = actual.float() - expected.float()
     flat_actual = actual.float().reshape(-1)
@@ -894,37 +843,34 @@ def _benchmark_case(
             (case.rows,), indexed_valid, dtype=torch.int32, device=device
         )
 
-    binding, split_chunks = _make_binding(
-        case=case,
-        num_q_heads=num_q_heads,
-        device=device,
-        q=q,
-        swa_indices=swa_indices,
-        swa_lengths=swa_lengths,
-        indexed_indices=indexed_indices,
-        indexed_lengths=indexed_lengths,
-        swa_page_size=swa_page_size,
-        production_decode_cap=production_decode_cap,
-        mode=_benchmark_workspace_mode(
-            shared_indexed_cache=shared_indexed_cache,
+    split_chunks = _planned_split_chunks(case, production_decode_cap=production_decode_cap)
+    output = torch.empty_like(q)
+    run_args = dict(
+        swa_k_cache=swa_cache.b12x, swa_page_size=swa_page_size,
+        indexed_k_cache=indexed_cache.b12x if indexed_cache is not None else None,
+        indexed_page_size=case.indexed_page_size, attn_sink=attn_sink,
+        sm_scale=_SM_SCALE, expected_num_q_heads=num_q_heads, out=output,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    plan, binding = prepare_compressed(
+        session,
+        B12XCompressedSparseMLAScratchCaps(
+            device=device, num_q_heads=num_q_heads, max_q_rows=case.rows,
+            max_width=max(1, case.topk), head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
+            v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM, max_batch=case.rows,
+            page_size=swa_page_size, swa_width=case.swa_width,
+            indexed_width=case.indexed_width, indexed_page_size=case.indexed_page_size,
+            max_chunks_per_row=split_chunks,
+            mode=_benchmark_workspace_mode(shared_indexed_cache=shared_indexed_cache),
+            use_cuda_graph=True,
         ),
+        bind_args=dict(q=q, swa_indices=swa_indices, swa_lengths=swa_lengths,
+                       indexed_indices=indexed_indices, indexed_lengths=indexed_lengths),
+        run_args=run_args,
     )
 
-    output: torch.Tensor | None = None
-
     def run() -> torch.Tensor:
-        nonlocal output
-        output = compressed_sparse_mla_decode_forward(
-            binding=binding,
-            swa_k_cache=swa_cache.b12x,
-            swa_page_size=swa_page_size,
-            indexed_k_cache=indexed_cache.b12x if indexed_cache is not None else None,
-            indexed_page_size=case.indexed_page_size,
-            attn_sink=attn_sink,
-            sm_scale=_SM_SCALE,
-            expected_num_q_heads=num_q_heads,
-        )
-        return output
+        return mla.run(binding=binding, **run_args)
 
     expected_algorithm: torch.Tensor | None = None
     if verify:
@@ -942,14 +888,17 @@ def _benchmark_case(
             extra_page_size=case.indexed_page_size,
         )
 
-    graph = capture_cuda_graph(run, warmup=warmup)
+    session.freeze()
+    graph = torch.cuda.CUDAGraph()
     try:
+        graph = capture_cuda_graph(run, warmup=warmup)
         stats = bench_cuda_graph(graph, replays=replays, l2_flush=l2_flush)
         if output is None:
             raise RuntimeError("benchmark graph did not produce an output tensor")
     finally:
         torch.cuda.synchronize(device)
-        del graph
+        graph.reset()
+        session.close()
 
     replay_us = stats["replay_us"]
     sanity_algorithm: Sanity | None = None
@@ -1002,7 +951,7 @@ def _benchmark_case(
             )
         finally:
             torch.cuda.synchronize(device)
-            del flashinfer_graph
+            flashinfer_graph.reset()
         flashinfer_replay_us = flashinfer_stats["replay_us"]
         if expected_algorithm is not None:
             flashinfer_sanity = _sanity(flashinfer_output, expected_algorithm)

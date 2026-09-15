@@ -21,13 +21,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation.types import Plan, require_prepared
+
 from ._cuda_ipc import CudaRTLibrary
-from ._twoshot_bf16_cute import (
-    get_twoshot_bf16_allreduce_launcher,
-    get_twoshot_bf16_launcher,
-    is_twoshot_bf16_allreduce_launcher_prepared,
-    is_twoshot_bf16_launcher_prepared,
-)
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     IPC_SLAB_ALIGNMENT,
@@ -338,344 +334,117 @@ class PCIeTwoShotBF16:
 
     # ---- graph plumbing ---------------------------------------------------
 
-    def prepare_graph(
-        self,
-        *,
-        operations: Sequence[str] = ("reduce_scatter", "all_gather"),
-        threads: int = 512,
-    ) -> None:
-        if self._closed:
-            raise RuntimeError("PCIeTwoShotBF16 is closed")
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError(
-                "prepare_graph() must be called before CUDA graph capture"
-            )
-        threads = int(threads)
-        if threads <= 0 or threads > 512 or threads % 32 != 0:
-            raise ValueError("threads must be a warp-aligned value in [32, 512]")
-        requested = tuple(str(operation) for operation in operations)
-        device_index = self._device_index()
-        with torch.cuda.device(self.device):
-            for operation in dict.fromkeys(requested):
-                for slot_bias in (0, 1):
-                    get_twoshot_bf16_launcher(
-                        operation,
-                        self.world_size,
-                        self.rank,
-                        True,
-                        slot_bias,
-                        threads,
-                        self.row_elems,
-                        device_index,
-                    )
-            for slot_bias in (0, 1):
-                get_twoshot_bf16_allreduce_launcher(
-                    self.world_size,
-                    self.rank,
-                    True,
-                    slot_bias,
-                    threads,
-                    self.row_elems,
-                    device_index,
-                )
-
     @contextmanager
-    def capture(
-        self,
-        *,
-        operations: Sequence[str] = ("reduce_scatter", "all_gather"),
-        threads: int = 512,
-    ):
+    def capture(self, *, plan: Plan):
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
         if self._capture_context_depth:
-            raise RuntimeError(
-                "overlapping PCIe twoshot-bf16 capture contexts are not allowed"
-            )
-        requested = tuple(dict.fromkeys(str(operation) for operation in operations))
-        threads = int(threads)
-        self.prepare_graph(operations=requested, threads=threads)
-        pending_slot_bias = (
-            self._device_slot_bias if self._device_slot_selection else self._slot & 1
-        )
-        _require_collective_contract(
-            owner="PCIe twoshot-bf16 graph slot selection",
-            exchange_group=self.exchange_group,
-            contract=(
-                requested,
-                threads,
-                self._device_slot_selection,
-                pending_slot_bias,
-            ),
-        )
-        if not self._device_slot_selection:
-            self._device_slot_bias = pending_slot_bias
-            self._device_slot_selection = True
+            raise RuntimeError("overlapping PCIe twoshot-bf16 capture contexts are not allowed")
         self._capture_context_depth = 1
         try:
             yield self
         finally:
             self._capture_context_depth = 0
 
-    # ---- launch -----------------------------------------------------------
-
-    def _resolve_launch_parameters(
-        self,
-        operation: str,
-        *,
-        rows_per_rank: int,
-        threads: int,
-        block_limit: int,
-    ) -> tuple[int, int, int]:
-        threads = int(threads)
-        if threads <= 0 or threads > 512 or threads % 32 != 0:
-            raise ValueError("threads must be a warp-aligned value in [32, 512]")
+    def _launch_prepared(self, payload, scale, out, *, state, threads, block_limit):
+        del scale
+        operation = state.query.call["operation"]
+        rows_per_rank = (
+            payload.shape[0] // self.world_size
+            if operation in ("reduce_scatter", "all_reduce") else payload.shape[0]
+        )
+        if int(threads) != state.query.call["threads"] or int(block_limit) != state.query.call["block_limit"]:
+            raise ValueError("two-shot launch controls differ from the prepared plan")
         shard_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
         if shard_packs > self._pack_stride:
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
-        if block_limit <= 0 or block_limit > _MAX_BLOCKS:
-            raise ValueError(f"block_limit must be in [1, {_MAX_BLOCKS}]")
-        blocks = max(
-            1,
-            min(int(block_limit), (shard_packs + threads - 1) // threads),
-        )
+        blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
-        device_index = self._device_index()
-        if capturing:
-            if self._capture_context_depth <= 0:
-                raise RuntimeError(
-                    "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
-                    "enter runtime.capture() before torch.cuda.graph()"
-                )
-            if not self._device_slot_selection:
-                raise RuntimeError(
-                    "PCIe twoshot-bf16 graph capture has no rank-synchronized "
-                    "slot selection; enter runtime.capture() on every rank"
-                )
-            if operation == "all_reduce":
-                prepared = is_twoshot_bf16_allreduce_launcher_prepared(
-                    self.world_size,
-                    self.rank,
-                    True,
-                    self._device_slot_bias,
-                    threads,
-                    self.row_elems,
-                    device_index,
-                )
-            else:
-                prepared = is_twoshot_bf16_launcher_prepared(
-                    operation,
-                    self.world_size,
-                    self.rank,
-                    True,
-                    self._device_slot_bias,
-                    threads,
-                    self.row_elems,
-                    device_index,
-                )
-            if not prepared:
-                raise RuntimeError(
-                    "cold PCIe twoshot-bf16 CUDA graph capture is not allowed; "
-                    "enter runtime.capture() before torch.cuda.graph()"
-                )
+        if capturing and self._capture_context_depth <= 0:
+            raise RuntimeError("PCIe twoshot-bf16 capture requires runtime.capture(plan=...)")
+        if capturing and not self._device_slot_selection:
+            self._device_slot_bias = self._slot & 1
+            self._device_slot_selection = True
         if self._device_slot_selection:
             slot = 0
         else:
             slot = self._slot % 2
             self._slot += 1
-        return blocks, slot, device_index
-
-    def _launch(
-        self,
-        operation: str,
-        payload: torch.Tensor,
-        out: torch.Tensor,
-        *,
-        rows_per_rank: int,
-        threads: int,
-        block_limit: int,
-    ) -> None:
-        blocks, slot, device_index = self._resolve_launch_parameters(
-            operation,
-            rows_per_rank=rows_per_rank,
-            threads=threads,
-            block_limit=block_limit,
-        )
-        with torch.cuda.device(self.device):
-            launcher = get_twoshot_bf16_launcher(
-                operation,
-                self.world_size,
-                self.rank,
-                self._device_slot_selection,
-                self._device_slot_bias,
-                threads,
-                self.row_elems,
-                device_index,
-            )
-            launcher(
-                payload.data_ptr(),
-                self._staging_ptrs[slot],
-                self._signal_ptrs,
-                out.data_ptr(),
-                self.rank,
-                self._pack_stride,
-                self._slot_bytes,
-                rows_per_rank,
-                blocks,
-            )
+        launcher = state.launcher(self._device_slot_selection, self._device_slot_bias)
+        if operation == "all_reduce":
+            launcher(payload.data_ptr(), self._staging_ptrs[slot], self._signal_ptrs,
+                     out.data_ptr(), self.rank, self._reduced_offset, self._slot_bytes,
+                     rows_per_rank, blocks)
+        else:
+            launcher(payload.data_ptr(), self._staging_ptrs[slot], self._signal_ptrs,
+                     out.data_ptr(), self.rank, self._pack_stride, self._slot_bytes,
+                     rows_per_rank, blocks)
 
     # ---- public collectives ---------------------------------------------
 
     def reduce_scatter(
-        self,
-        payload: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        *,
-        threads: int = 512,
-        block_limit: int = 64,
+        self, payload: torch.Tensor, out: Optional[torch.Tensor] = None, *,
+        plan: Plan, threads: int = 512, block_limit: int = 64,
     ) -> torch.Tensor:
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        if state.query.surface != "PCIeTwoShotBF16.reduce_scatter":
+            raise ValueError("plan does not prepare BF16 reduce-scatter")
         with _device_guard(self.device):
             rows = payload.shape[0]
             self._check(payload, rows)
-            if rows % self.world_size != 0:
+            if rows % self.world_size:
                 raise ValueError("rows must be divisible by world size")
             if out is None:
                 if _is_current_stream_capturing(self.device):
-                    raise RuntimeError(
-                        "PCIeTwoShotBF16.reduce_scatter CUDA graph capture "
-                        "requires a caller-owned preallocated output"
-                    )
-                out = torch.empty(
-                    rows // self.world_size,
-                    self.row_elems,
-                    dtype=torch.bfloat16,
-                    device=self.device,
-                )
-            self._check_tensor(
-                out,
-                shape=(rows // self.world_size, self.row_elems),
-                name="output",
-            )
+                    raise RuntimeError("PCIeTwoShotBF16.reduce_scatter capture requires caller-owned output")
+                out = torch.empty(rows // self.world_size, self.row_elems, dtype=torch.bfloat16, device=self.device)
+            self._check_tensor(out, shape=(rows // self.world_size, self.row_elems), name="output")
             _require_disjoint(out, payload, source_name="payload")
-            self._launch(
-                "reduce_scatter",
-                payload,
-                out,
-                rows_per_rank=rows // self.world_size,
-                threads=threads,
-                block_limit=block_limit,
-            )
+            self._launch_prepared(payload, None, out, state=state, threads=threads, block_limit=block_limit)
             return out
 
     def all_gather(
-        self,
-        payload: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        *,
-        threads: int = 512,
-        block_limit: int = 64,
+        self, payload: torch.Tensor, out: Optional[torch.Tensor] = None, *,
+        plan: Plan, threads: int = 512, block_limit: int = 64,
     ) -> torch.Tensor:
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        if state.query.surface != "PCIeTwoShotBF16.all_gather":
+            raise ValueError("plan does not prepare BF16 all-gather")
         with _device_guard(self.device):
             rows = payload.shape[0]
             self._check(payload, rows)
             if out is None:
                 if _is_current_stream_capturing(self.device):
-                    raise RuntimeError(
-                        "PCIeTwoShotBF16.all_gather CUDA graph capture requires "
-                        "a caller-owned preallocated output"
-                    )
-                out = torch.empty(
-                    rows * self.world_size,
-                    self.row_elems,
-                    dtype=torch.bfloat16,
-                    device=self.device,
-                )
-            self._check_tensor(
-                out,
-                shape=(rows * self.world_size, self.row_elems),
-                name="output",
-            )
+                    raise RuntimeError("PCIeTwoShotBF16.all_gather capture requires caller-owned output")
+                out = torch.empty(rows * self.world_size, self.row_elems, dtype=torch.bfloat16, device=self.device)
+            self._check_tensor(out, shape=(rows * self.world_size, self.row_elems), name="output")
             _require_disjoint(out, payload, source_name="payload")
-            self._launch(
-                "all_gather",
-                payload,
-                out,
-                rows_per_rank=rows,
-                threads=threads,
-                block_limit=block_limit,
-            )
+            self._launch_prepared(payload, None, out, state=state, threads=threads, block_limit=block_limit)
             return out
 
-    def _launch_pull_all_reduce(
-        self,
-        payload: torch.Tensor,
-        out: torch.Tensor,
-        *,
-        rows_per_rank: int,
-        threads: int,
-        block_limit: int,
-    ) -> None:
-        blocks, slot, device_index = self._resolve_launch_parameters(
-            "all_reduce",
-            rows_per_rank=rows_per_rank,
-            threads=threads,
-            block_limit=block_limit,
-        )
-        with torch.cuda.device(self.device):
-            launcher = get_twoshot_bf16_allreduce_launcher(
-                self.world_size,
-                self.rank,
-                self._device_slot_selection,
-                self._device_slot_bias,
-                threads,
-                self.row_elems,
-                device_index,
-            )
-            launcher(
-                payload.data_ptr(),
-                self._staging_ptrs[slot],
-                self._signal_ptrs,
-                out.data_ptr(),
-                self.rank,
-                self._reduced_offset,
-                self._slot_bytes,
-                rows_per_rank,
-                blocks,
-            )
-
     def all_reduce(
-        self,
-        inp: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        *,
-        threads: int = 512,
-        block_limit: int = 64,
+        self, inp: torch.Tensor, out: Optional[torch.Tensor] = None, *,
+        plan: Plan, threads: int = 512, block_limit: int = 64,
     ) -> torch.Tensor:
         """FP32-accumulating BF16 all-reduce with one BF16 rounding."""
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        if state.query.surface != "PCIeTwoShotBF16.all_reduce":
+            raise ValueError("plan does not prepare BF16 all-reduce")
         if not self.accepts(inp):
             raise ValueError("input not accepted by PCIeTwoShotBF16.all_reduce")
         rows = inp.numel() // self.row_elems
-        payload = inp.view(rows, self.row_elems)
         with _device_guard(self.device):
             if out is None:
                 if _is_current_stream_capturing(self.device):
-                    raise RuntimeError(
-                        "PCIeTwoShotBF16.all_reduce CUDA graph capture requires "
-                        "a caller-owned preallocated output"
-                    )
+                    raise RuntimeError("PCIeTwoShotBF16.all_reduce capture requires caller-owned output")
                 out = torch.empty_like(inp)
-            self._check_tensor(
-                out,
-                shape=tuple(inp.shape),
-                name="output",
-            )
+            self._check_tensor(out, shape=tuple(inp.shape), name="output")
             _require_disjoint(out, inp, source_name="input")
-            out_view = out.view(rows, self.row_elems)
-            self._launch_pull_all_reduce(
-                payload,
-                out_view,
-                rows_per_rank=rows // self.world_size,
-                threads=threads,
-                block_limit=block_limit,
-            )
+            self._launch_prepared(inp.view(rows, self.row_elems), None, out.view(rows, self.row_elems),
+                                  state=state, threads=threads, block_limit=block_limit)
         return out
 
     # ---- teardown (mirrors pcie_twoshot) -----------------------------------

@@ -10,6 +10,7 @@ from typing import Callable, Optional, Sequence
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from b12x.preparation.types import Plan, require_prepared
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
@@ -75,22 +76,6 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
     return packed_token_major or capacity_strided_head_major
 
 
-def prepare_kimi_topk16(
-    *,
-    device: torch.device | int | str,
-    threads: int = 256,
-) -> None:
-    """Compile the stateless Kimi-K3 top-16 launcher before graph capture."""
-
-    device_obj = _normalize_device(device)
-    if device_obj.type != "cuda":
-        raise ValueError("Kimi top-16 requires a CUDA device")
-    if _is_current_stream_capturing(device_obj):
-        raise RuntimeError("prepare_kimi_topk16() must run before capture")
-    from ._dcp_a2a_cute import _get_compiled_kimi_topk16
-
-    with torch.cuda.device(device_obj):
-        _get_compiled_kimi_topk16(threads)
 
 
 def kimi_topk16(
@@ -99,13 +84,13 @@ def kimi_topk16(
     output_weights: Optional[torch.Tensor] = None,
     output_ids: Optional[torch.Tensor] = None,
     *,
+    plan: Plan,
     threads: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select Kimi-K3's 16 routed experts without communication state.
+    """Select Kimi-K3's 16 routed experts with prepared native code.
 
     The operation accepts one to eight assembled FP32 router rows. It launches
-    on the current CUDA stream and is CUDA-graph safe after an eager launch or
-    :func:`prepare_kimi_topk16`. Graph capture requires caller-owned outputs.
+    on the current CUDA stream and is CUDA-graph safe with caller-owned outputs.
     """
 
     if router_logits.ndim != 2:
@@ -153,25 +138,17 @@ def kimi_topk16(
             raise ValueError(
                 f"{name} must be contiguous {(rows, 16)} {dtype} on {device}"
             )
-    if capturing:
-        from ._dcp_a2a_cute import is_kimi_topk16_prepared
-
-        if not is_kimi_topk16_prepared(threads):
-            raise RuntimeError(
-                "cold Kimi top-16 CUDA graph capture is not allowed; call "
-                "prepare_kimi_topk16() before capture"
-            )
-
-    from ._dcp_a2a_cute import kimi_topk16 as launch_kimi_topk16
-
+    state = require_prepared(plan, "comm.pcie", device)
+    if not hasattr(state, "launcher"):
+        raise TypeError("plan does not contain prepared Kimi top-k code")
     with torch.cuda.device(device):
+        from ._dcp_a2a_cute import kimi_topk16 as launch_kimi_topk16
         launch_kimi_topk16(
             router_logits_ptr=router_logits.data_ptr(),
             correction_bias_ptr=correction_bias.data_ptr(),
             output_weights_ptr=output_weights.data_ptr(),
             output_ids_ptr=output_ids.data_ptr(),
-            rows=rows,
-            threads=threads,
+            rows=rows, threads=threads, launcher=state.launcher(False),
         )
     return output_weights, output_ids
 
@@ -789,104 +766,16 @@ class PCIeDCPA2A:
             raise ValueError(f"block_limit must be in [1, {_MAX_BLOCKS}]")
         return threads, block_limit
 
-    def prepare_graph_lse_reduce_scatter(
-        self,
-        *,
-        dtype: torch.dtype = torch.bfloat16,
-        threads: int = 256,
-    ) -> None:
-        """Compile/load the LSE graph launcher before CUDA graph capture."""
+    def _prepared_state(self, plan: Plan):
+        state = require_prepared(
+            plan, "comm.pcie",
+            self.device if self.device.type == "cuda" else None,
+        )
+        if not hasattr(state, "require_runtime") or not hasattr(state, "launcher"):
+            raise TypeError("plan does not contain a prepared DCP channel")
+        state.require_runtime(self)
+        return state
 
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError(
-                "prepare_graph_lse_reduce_scatter() must run before capture"
-            )
-        if dtype not in SUPPORTED_DTYPES:
-            raise ValueError(f"unsupported output dtype {dtype}")
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
-        dtype_name = "fp16" if dtype == torch.float16 else "bf16"
-        from ._dcp_a2a_cute import _get_compiled_lse_reduce_scatter
-
-        with torch.cuda.device(self.device):
-            _get_compiled_lse_reduce_scatter(
-                self.world_size,
-                self.rank,
-                dtype_name,
-                threads,
-                True,
-            )
-
-    def prepare_graph_all_gather_heads(self, *, threads: int = 256) -> None:
-        """Compile/load the gather graph launcher before CUDA graph capture."""
-
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError(
-                "prepare_graph_all_gather_heads() must run before capture"
-            )
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
-        from ._dcp_a2a_cute import _get_compiled_all_gather_heads
-
-        with torch.cuda.device(self.device):
-            _get_compiled_all_gather_heads(
-                self.world_size,
-                self.rank,
-                threads,
-                True,
-            )
-
-    def prepare_graph_all_gather_pair(self, *, threads: int = 512) -> None:
-        """Compile/load the paired gather launcher before graph capture."""
-
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError(
-                "prepare_graph_all_gather_pair() must run before capture"
-            )
-        threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
-        from ._dcp_a2a_cute import _get_compiled_all_gather_pair
-
-        with torch.cuda.device(self.device):
-            _get_compiled_all_gather_pair(
-                self.world_size,
-                self.rank,
-                threads,
-                True,
-                False,
-            )
-
-    def prepare_graph_all_gather_pair_kimi_topk(self) -> None:
-        """Compile/load the Kimi fused launcher before graph capture."""
-
-        if self.world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(
-                "Kimi paired gather+top-k requires a supported PCIe DCP "
-                f"world size, got {self.world_size}"
-            )
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError(
-                "prepare_graph_all_gather_pair_kimi_topk() must run before capture"
-            )
-        from ._dcp_a2a_cute import _get_compiled_all_gather_pair
-
-        with torch.cuda.device(self.device):
-            _get_compiled_all_gather_pair(
-                self.world_size,
-                self.rank,
-                512,
-                True,
-                True,
-            )
-
-    def prepare_graph_kimi_topk16(self, *, threads: int = 256) -> None:
-        """Compile/load batched Kimi expert selection before graph capture."""
-
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError(
-                "prepare_graph_kimi_topk16() must run before capture"
-            )
-        from ._dcp_a2a_cute import _get_compiled_kimi_topk16
-
-        with torch.cuda.device(self.device):
-            _get_compiled_kimi_topk16(threads)
 
     def _validate(
         self,
@@ -937,132 +826,71 @@ class PCIeDCPA2A:
             raise ValueError("output must be packed token-major or head-major")
 
     def lse_reduce_scatter(
-        self,
-        partial_output: torch.Tensor,
-        partial_lse: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        *,
-        is_lse_base_on_e: bool = True,
-        threads: int = 256,
+        self, partial_output: torch.Tensor, partial_lse: torch.Tensor,
+        out: Optional[torch.Tensor] = None, *, plan: Plan,
+        is_lse_base_on_e: bool = True, threads: int = 256,
         block_limit: int = 16,
     ) -> torch.Tensor:
-        """Exchange rank contributions and return this rank's reduced heads."""
         with _device_guard(self.device):
+            state = self._prepared_state(plan)
             return self._lse_reduce_scatter_on_device(
-                partial_output,
-                partial_lse,
-                out,
-                is_lse_base_on_e=is_lse_base_on_e,
-                threads=threads,
+                partial_output, partial_lse, out, state=state,
+                is_lse_base_on_e=is_lse_base_on_e, threads=threads,
                 block_limit=block_limit,
             )
 
     def _lse_reduce_scatter_on_device(
-        self,
-        partial_output: torch.Tensor,
-        partial_lse: torch.Tensor,
-        out: Optional[torch.Tensor],
-        *,
-        is_lse_base_on_e: bool,
-        threads: int,
-        block_limit: int,
+        self, partial_output: torch.Tensor, partial_lse: torch.Tensor,
+        out: Optional[torch.Tensor], *, state, is_lse_base_on_e: bool,
+        threads: int, block_limit: int,
     ) -> torch.Tensor:
         self._check_stream()
         if out is None:
-            out = torch.empty(
-                partial_output.shape[0],
-                self.heads_per_rank,
-                self.head_dim,
-                device=partial_output.device,
-                dtype=partial_output.dtype,
-            )
+            out = torch.empty(partial_output.shape[0], self.heads_per_rank,
+                              self.head_dim, device=partial_output.device,
+                              dtype=partial_output.dtype)
         self._validate(partial_output, partial_lse, out)
         threads, block_limit = self._resolve_launch_config(
-            threads=threads,
-            block_limit=block_limit,
-        )
+            threads=threads, block_limit=block_limit)
         rows = int(partial_output.shape[0]) * self.heads_per_rank
-        warps_per_block = threads // 32
-        blocks = max(
-            1,
-            min(block_limit, (rows + warps_per_block - 1) // warps_per_block),
-        )
+        blocks = max(1, min(block_limit, (rows + threads // 32 - 1) // (threads // 32)))
         capturing = _is_current_stream_capturing(self.device)
-        dtype_name = "fp16" if partial_output.dtype == torch.float16 else "bf16"
-        if capturing:
-            from ._dcp_a2a_cute import is_lse_reduce_scatter_prepared
-
-            if not is_lse_reduce_scatter_prepared(
-                self.world_size,
-                self.rank,
-                dtype_name,
-                threads,
-                True,
-            ):
-                raise RuntimeError(
-                    "cold PCIe DCP LSE CUDA graph capture is not allowed; "
-                    "call prepare_graph_lse_reduce_scatter() before capture"
-                )
         if capturing and not self._device_slot_selection:
             self._graph_base_slot = self._next_slot & 1
             self._device_slot_selection = True
-        if self._device_slot_selection:
-            slot = self._graph_base_slot
-        else:
-            slot = self._next_slot
+        slot = self._graph_base_slot if self._device_slot_selection else self._next_slot
+        if not self._device_slot_selection:
             self._next_slot ^= 1
         self._launch_lse_reduce_scatter(
-            partial_output,
-            partial_lse,
-            out,
-            slot=slot,
-            natural_log=bool(is_lse_base_on_e),
-            threads=threads,
-            blocks=blocks,
+            partial_output, partial_lse, out, slot=slot,
+            natural_log=bool(is_lse_base_on_e), threads=threads, blocks=blocks,
             device_slot_selection=self._device_slot_selection,
+            launcher=state.launcher(self._device_slot_selection),
         )
         return out
 
     def _launch_lse_reduce_scatter(
-        self,
-        partial_output: torch.Tensor,
-        partial_lse: torch.Tensor,
-        out: torch.Tensor,
-        *,
-        slot: int,
-        natural_log: bool,
-        threads: int,
-        blocks: int,
-        device_slot_selection: bool,
+        self, partial_output: torch.Tensor, partial_lse: torch.Tensor,
+        out: torch.Tensor, *, slot: int, natural_log: bool, threads: int,
+        blocks: int, device_slot_selection: bool, launcher,
     ) -> None:
         from ._dcp_a2a_cute import lse_reduce_scatter
-
         dtype_name = "fp16" if partial_output.dtype == torch.float16 else "bf16"
         with torch.cuda.device(self.device):
             lse_reduce_scatter(
-                world_size=self.world_size,
-                rank=self.rank,
-                dtype_name=dtype_name,
-                threads=threads,
-                local_output_ptr=partial_output.data_ptr(),
-                local_lse_ptr=partial_lse.data_ptr(),
-                output_ptr=out.data_ptr(),
-                staging_ptrs=self._staging_ptrs[slot],
-                signal_ptrs=self._signal_ptrs,
-                lse_offset=self._lse_offset,
-                batch=int(partial_output.shape[0]),
-                total_heads=self.total_heads,
-                head_dim=self.head_dim,
+                world_size=self.world_size, rank=self.rank, dtype_name=dtype_name,
+                threads=threads, local_output_ptr=partial_output.data_ptr(),
+                local_lse_ptr=partial_lse.data_ptr(), output_ptr=out.data_ptr(),
+                staging_ptrs=self._staging_ptrs[slot], signal_ptrs=self._signal_ptrs,
+                lse_offset=self._lse_offset, batch=int(partial_output.shape[0]),
+                total_heads=self.total_heads, head_dim=self.head_dim,
                 input_stride_batch=int(partial_output.stride(0)) // 8,
                 input_stride_head=int(partial_output.stride(1)) // 8,
                 output_stride_batch=int(out.stride(0)) // 8,
-                output_stride_head=int(out.stride(1)) // 8,
-                natural_log=natural_log,
+                output_stride_head=int(out.stride(1)) // 8, natural_log=natural_log,
                 device_slot_selection=device_slot_selection,
-                slot_delta_bytes=(
-                    self._slot_bytes if slot == 0 else -self._slot_bytes
-                ),
-                blocks=blocks,
+                slot_delta_bytes=self._slot_bytes if slot == 0 else -self._slot_bytes,
+                blocks=blocks, launcher=launcher,
             )
 
     def all_gather_heads(
@@ -1070,16 +898,15 @@ class PCIeDCPA2A:
         local_input: torch.Tensor,
         out: Optional[torch.Tensor] = None,
         *,
+        plan: Plan,
         threads: int = 256,
         block_limit: int = 16,
     ) -> torch.Tensor:
         """Gather rank-local heads into a rank-major head dimension."""
         with _device_guard(self.device):
             return self._all_gather_heads_on_device(
-                local_input,
-                out,
-                threads=threads,
-                block_limit=block_limit,
+                local_input, out, state=self._prepared_state(plan),
+                threads=threads, block_limit=block_limit,
             )
 
     def _all_gather_heads_on_device(
@@ -1087,6 +914,7 @@ class PCIeDCPA2A:
         local_input: torch.Tensor,
         out: Optional[torch.Tensor],
         *,
+        state,
         threads: int,
         block_limit: int,
     ) -> torch.Tensor:
@@ -1161,12 +989,9 @@ class PCIeDCPA2A:
             slot = self._next_slot
             self._next_slot ^= 1
         self._launch_all_gather_heads(
-            local_input,
-            out,
-            slot=slot,
-            threads=threads,
-            blocks=blocks,
+            local_input, out, slot=slot, threads=threads, blocks=blocks,
             device_slot_selection=self._device_slot_selection,
+            launcher=state.launcher(self._device_slot_selection),
         )
         return out
 
@@ -1179,6 +1004,7 @@ class PCIeDCPA2A:
         threads: int,
         blocks: int,
         device_slot_selection: bool,
+        launcher,
     ) -> None:
         from ._dcp_a2a_cute import all_gather_heads
 
@@ -1200,6 +1026,7 @@ class PCIeDCPA2A:
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
                 blocks=blocks,
+                launcher=launcher,
             )
 
     def all_gather_pair(
@@ -1209,15 +1036,13 @@ class PCIeDCPA2A:
         out_first: Optional[torch.Tensor] = None,
         out_second: Optional[torch.Tensor] = None,
         *,
+        plan: Plan,
         threads: int = 512,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with _device_guard(self.device):
             return self._all_gather_pair_on_device(
-                local_first,
-                local_second,
-                out_first,
-                out_second,
-                threads=threads,
+                local_first, local_second, out_first, out_second,
+                state=self._prepared_state(plan), threads=threads,
             )
 
     def _all_gather_pair_on_device(
@@ -1227,6 +1052,7 @@ class PCIeDCPA2A:
         out_first: Optional[torch.Tensor] = None,
         out_second: Optional[torch.Tensor] = None,
         *,
+        state,
         threads: int = 512,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather two raw projection rows behind one IPC barrier.
@@ -1319,13 +1145,9 @@ class PCIeDCPA2A:
             slot = self._next_slot
             self._next_slot ^= 1
         self._launch_all_gather_pair(
-            local_first,
-            local_second,
-            out_first,
-            out_second,
-            slot=slot,
-            threads=threads,
-            device_slot_selection=self._device_slot_selection,
+            local_first, local_second, out_first, out_second, slot=slot,
+            threads=threads, device_slot_selection=self._device_slot_selection,
+            launcher=state.launcher(self._device_slot_selection),
         )
         return out_first, out_second
 
@@ -1339,6 +1161,7 @@ class PCIeDCPA2A:
         slot: int,
         threads: int,
         device_slot_selection: bool,
+        launcher,
     ) -> None:
         from ._dcp_a2a_cute import all_gather_pair
 
@@ -1362,278 +1185,111 @@ class PCIeDCPA2A:
                 slot_delta_bytes=(
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
+                launcher=launcher,
             )
 
     def all_gather_pair_kimi_topk(
-        self,
-        local_down: torch.Tensor,
-        local_router: torch.Tensor,
-        correction_bias: torch.Tensor,
-        out_down: Optional[torch.Tensor] = None,
+        self, local_down: torch.Tensor, local_router: torch.Tensor,
+        correction_bias: torch.Tensor, out_down: Optional[torch.Tensor] = None,
         topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None, *, plan: Plan,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with _device_guard(self.device):
             return self._all_gather_pair_kimi_topk_on_device(
-                local_down,
-                local_router,
-                correction_bias,
-                out_down,
-                topk_weights,
-                topk_ids,
-            )
+                local_down, local_router, correction_bias, out_down, topk_weights,
+                topk_ids, state=self._prepared_state(plan))
 
     def _all_gather_pair_kimi_topk_on_device(
-        self,
-        local_down: torch.Tensor,
-        local_router: torch.Tensor,
-        correction_bias: torch.Tensor,
-        out_down: Optional[torch.Tensor] = None,
-        topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather Kimi-K3's sharded latent row and select its 16 experts."""
+        self, local_down, local_router, correction_bias, out_down, topk_weights,
+        topk_ids, *, state,
+    ):
         self._check_stream()
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
-        if self.world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(
-                "Kimi paired gather+top-k requires a supported PCIe DCP "
-                f"world size, got TP{self.world_size}"
-            )
-        local_down_width = 3584 // self.world_size
-        local_router_width = 896 // self.world_size
-        expected = (
-            (
-                local_down,
-                (1, local_down_width),
-                torch.bfloat16,
-                "local_down",
-            ),
-            (
-                local_router,
-                (1, local_router_width),
-                torch.float32,
-                "local_router",
-            ),
-            (correction_bias, (896,), torch.float32, "correction_bias"),
-        )
+        down_width, router_width = 3584 // self.world_size, 896 // self.world_size
+        expected = ((local_down, (1, down_width), torch.bfloat16, "local_down"),
+                    (local_router, (1, router_width), torch.float32, "local_router"),
+                    (correction_bias, (896,), torch.float32, "correction_bias"))
         for value, shape, dtype, name in expected:
-            if (
-                value.device != self.device
-                or value.shape != shape
-                or value.dtype != dtype
-                or not value.is_contiguous()
-            ):
-                raise ValueError(
-                    f"{name} must be contiguous {shape} {dtype} on {self.device}"
-                )
-        if out_down is None:
-            out_down = torch.empty((1, 3584), device=self.device, dtype=torch.bfloat16)
-        if topk_weights is None:
-            topk_weights = torch.empty((1, 16), device=self.device, dtype=torch.float32)
-        if topk_ids is None:
-            topk_ids = torch.empty((1, 16), device=self.device, dtype=torch.int32)
-        outputs = (
-            (out_down, (1, 3584), torch.bfloat16, "out_down"),
-            (topk_weights, (1, 16), torch.float32, "topk_weights"),
-            (topk_ids, (1, 16), torch.int32, "topk_ids"),
-        )
-        for value, shape, dtype, name in outputs:
-            if (
-                value.device != self.device
-                or value.shape != shape
-                or value.dtype != dtype
-                or not value.is_contiguous()
-            ):
-                raise ValueError(
-                    f"{name} must be contiguous {shape} {dtype} on {self.device}"
-                )
-        capturing = _is_current_stream_capturing(self.device)
-        if capturing:
-            from ._dcp_a2a_cute import is_all_gather_pair_prepared
-
-            if not is_all_gather_pair_prepared(
-                self.world_size,
-                self.rank,
-                512,
-                True,
-                True,
-            ):
-                raise RuntimeError(
-                    "cold PCIe DCP Kimi CUDA graph capture is not allowed; "
-                    "call prepare_graph_all_gather_pair_kimi_topk() before capture"
-                )
-        if capturing and not self._device_slot_selection:
+            if value.device != self.device or value.shape != shape or value.dtype != dtype or not value.is_contiguous():
+                raise ValueError(f"{name} must be contiguous {shape} {dtype} on {self.device}")
+        out_down = torch.empty((1, 3584), device=self.device, dtype=torch.bfloat16) if out_down is None else out_down
+        topk_weights = torch.empty((1, 16), device=self.device, dtype=torch.float32) if topk_weights is None else topk_weights
+        topk_ids = torch.empty((1, 16), device=self.device, dtype=torch.int32) if topk_ids is None else topk_ids
+        for value, shape, dtype, name in ((out_down, (1, 3584), torch.bfloat16, "out_down"), (topk_weights, (1, 16), torch.float32, "topk_weights"), (topk_ids, (1, 16), torch.int32, "topk_ids")):
+            if value.device != self.device or value.shape != shape or value.dtype != dtype or not value.is_contiguous():
+                raise ValueError(f"{name} must be contiguous {shape} {dtype} on {self.device}")
+        if _is_current_stream_capturing(self.device) and not self._device_slot_selection:
             self._graph_base_slot = self._next_slot & 1
             self._device_slot_selection = True
-        if self._device_slot_selection:
-            slot = self._graph_base_slot
-        else:
-            slot = self._next_slot
+        slot = self._graph_base_slot if self._device_slot_selection else self._next_slot
+        if not self._device_slot_selection:
             self._next_slot ^= 1
         self._launch_all_gather_pair_kimi_topk(
-            local_down,
-            local_router,
-            correction_bias,
-            out_down,
-            topk_weights,
-            topk_ids,
-            slot=slot,
-            device_slot_selection=self._device_slot_selection,
-        )
+            local_down, local_router, correction_bias, out_down, topk_weights, topk_ids,
+            slot=slot, device_slot_selection=self._device_slot_selection,
+            launcher=state.launcher(self._device_slot_selection))
         return out_down, topk_weights, topk_ids
 
     def _launch_all_gather_pair_kimi_topk(
-        self,
-        local_down: torch.Tensor,
-        local_router: torch.Tensor,
-        correction_bias: torch.Tensor,
-        out_down: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        *,
-        slot: int,
-        device_slot_selection: bool,
+        self, local_down, local_router, correction_bias, out_down, topk_weights,
+        topk_ids, *, slot: int, device_slot_selection: bool, launcher,
     ) -> None:
         from ._dcp_a2a_cute import all_gather_pair_kimi_topk
-
         with torch.cuda.device(self.device):
             all_gather_pair_kimi_topk(
-                world_size=self.world_size,
-                rank=self.rank,
-                local_down_ptr=local_down.data_ptr(),
-                local_router_ptr=local_router.data_ptr(),
-                correction_bias_ptr=correction_bias.data_ptr(),
-                output_down_ptr=out_down.data_ptr(),
-                topk_weights_ptr=topk_weights.data_ptr(),
-                topk_ids_ptr=topk_ids.data_ptr(),
-                staging_ptrs=self._staging_ptrs[slot],
-                signal_ptrs=self._signal_ptrs,
+                world_size=self.world_size, rank=self.rank,
+                local_down_ptr=local_down.data_ptr(), local_router_ptr=local_router.data_ptr(),
+                correction_bias_ptr=correction_bias.data_ptr(), output_down_ptr=out_down.data_ptr(),
+                topk_weights_ptr=topk_weights.data_ptr(), topk_ids_ptr=topk_ids.data_ptr(),
+                staging_ptrs=self._staging_ptrs[slot], signal_ptrs=self._signal_ptrs,
                 device_slot_selection=device_slot_selection,
-                slot_delta_bytes=(
-                    self._slot_bytes if slot == 0 else -self._slot_bytes
-                ),
-            )
-
+                slot_delta_bytes=self._slot_bytes if slot == 0 else -self._slot_bytes,
+                launcher=launcher)
     def kimi_topk16(
-        self,
-        router_logits: torch.Tensor,
-        correction_bias: torch.Tensor,
+        self, router_logits: torch.Tensor, correction_bias: torch.Tensor,
         output_weights: Optional[torch.Tensor] = None,
-        output_ids: Optional[torch.Tensor] = None,
-        *,
+        output_ids: Optional[torch.Tensor] = None, *, plan: Plan,
         threads: int = 256,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select Kimi-K3's 16 routed experts for one to eight tokens."""
-
         with _device_guard(self.device):
-            self._check_stream()
-            if self._closed:
-                raise RuntimeError("PCIeDCPA2A is closed")
-            if router_logits.ndim != 2:
-                raise ValueError(
-                    "router_logits must be a contiguous rank-2 tensor"
-                )
-            rows = int(router_logits.shape[0])
-            capacity = min(self.max_batch_size, 8)
-            if rows <= 0 or rows > capacity:
-                raise ValueError(
-                    f"Kimi top-16 rows {rows} must be between 1 and the "
-                    f"supported capacity {capacity}"
-                )
-            expected = (
-                (
-                    router_logits,
-                    (rows, 896),
-                    torch.float32,
-                    "router_logits",
-                ),
-                (
-                    correction_bias,
-                    (896,),
-                    torch.float32,
-                    "correction_bias",
-                ),
-            )
-            for value, shape, dtype, name in expected:
-                if (
-                    value.device != self.device
-                    or value.shape != shape
-                    or value.dtype != dtype
-                    or not value.is_contiguous()
-                ):
-                    raise ValueError(
-                        f"{name} must be contiguous {shape} {dtype} on "
-                        f"{self.device}"
-                    )
-            capturing = _is_current_stream_capturing(self.device)
-            if capturing and (output_weights is None or output_ids is None):
-                raise RuntimeError(
-                    "Kimi top-16 CUDA graph capture requires caller-owned "
-                    "output_weights and output_ids"
-                )
-            if output_weights is None:
-                output_weights = torch.empty(
-                    (rows, 16), device=self.device, dtype=torch.float32
-                )
-            if output_ids is None:
-                output_ids = torch.empty(
-                    (rows, 16), device=self.device, dtype=torch.int32
-                )
-            outputs = (
-                (output_weights, torch.float32, "output_weights"),
-                (output_ids, torch.int32, "output_ids"),
-            )
-            for value, dtype, name in outputs:
-                if (
-                    value.device != self.device
-                    or value.shape != (rows, 16)
-                    or value.dtype != dtype
-                    or not value.is_contiguous()
-                ):
-                    raise ValueError(
-                        f"{name} must be contiguous {(rows, 16)} {dtype} on "
-                        f"{self.device}"
-                    )
-            if capturing:
-                from ._dcp_a2a_cute import is_kimi_topk16_prepared
+            return self._kimi_topk16_on_device(
+                router_logits, correction_bias, output_weights, output_ids,
+                state=self._prepared_state(plan), threads=threads)
 
-                if not is_kimi_topk16_prepared(threads):
-                    raise RuntimeError(
-                        "cold PCIe DCP Kimi top-16 CUDA graph capture is not "
-                        "allowed; call prepare_graph_kimi_topk16() before "
-                        "capture"
-                    )
-            self._launch_kimi_topk16(
-                router_logits,
-                correction_bias,
-                output_weights,
-                output_ids,
-                threads=threads,
-            )
-            return output_weights, output_ids
+    def _kimi_topk16_on_device(
+        self, router_logits, correction_bias, output_weights, output_ids, *,
+        state, threads,
+    ):
+        self._check_stream()
+        rows = int(router_logits.shape[0]) if router_logits.ndim == 2 else 0
+        if self._closed or rows <= 0 or rows > min(self.max_batch_size, 8):
+            raise ValueError("Kimi top-16 rows exceed prepared channel capacity")
+        for value, shape, dtype, name in ((router_logits, (rows, 896), torch.float32, "router_logits"), (correction_bias, (896,), torch.float32, "correction_bias")):
+            if value.device != self.device or value.shape != shape or value.dtype != dtype or not value.is_contiguous():
+                raise ValueError(f"{name} must be contiguous {shape} {dtype} on {self.device}")
+        if _is_current_stream_capturing(self.device) and (output_weights is None or output_ids is None):
+            raise RuntimeError("Kimi top-16 CUDA graph capture requires caller-owned outputs")
+        output_weights = torch.empty((rows, 16), device=self.device, dtype=torch.float32) if output_weights is None else output_weights
+        output_ids = torch.empty((rows, 16), device=self.device, dtype=torch.int32) if output_ids is None else output_ids
+        for value, dtype, name in ((output_weights, torch.float32, "output_weights"), (output_ids, torch.int32, "output_ids")):
+            if value.device != self.device or value.shape != (rows, 16) or value.dtype != dtype or not value.is_contiguous():
+                raise ValueError(f"{name} must be contiguous {(rows, 16)} {dtype} on {self.device}")
+        self._launch_kimi_topk16(router_logits, correction_bias, output_weights, output_ids, threads=threads, launcher=state.launcher(False))
+        return output_weights, output_ids
 
     def _launch_kimi_topk16(
-        self,
-        router_logits: torch.Tensor,
-        correction_bias: torch.Tensor,
-        output_weights: torch.Tensor,
-        output_ids: torch.Tensor,
-        *,
-        threads: int,
+        self, router_logits, correction_bias, output_weights, output_ids, *,
+        threads: int, launcher,
     ) -> None:
         from ._dcp_a2a_cute import kimi_topk16
-
         with torch.cuda.device(self.device):
             kimi_topk16(
                 router_logits_ptr=router_logits.data_ptr(),
                 correction_bias_ptr=correction_bias.data_ptr(),
                 output_weights_ptr=output_weights.data_ptr(),
-                output_ids_ptr=output_ids.data_ptr(),
-                rows=int(router_logits.shape[0]),
-                threads=threads,
-            )
+                output_ids_ptr=output_ids.data_ptr(), rows=int(router_logits.shape[0]),
+                threads=threads, launcher=launcher)
 
     def _closed_import_indices(self) -> set[tuple[int, int]]:
         closed = getattr(self, "_closed_ipc_import_indices", None)
@@ -2123,267 +1779,59 @@ class PCIeDCPA2APool:
         self._channels[key] = channel
         return channel
 
-    def prepare_graph_lse_reduce_scatter(
-        self,
-        *,
-        dtype: torch.dtype = torch.bfloat16,
-        threads: int = 256,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> None:
-        """Prepare LSE graph code on an eager channel before capture."""
 
-        with _device_guard(self.device):
-            self.for_stream(stream, channel_id=channel_id).prepare_graph_lse_reduce_scatter(
-                dtype=dtype, threads=threads
-            )
-
-    def prepare_graph_all_gather_heads(
-        self,
-        *,
-        threads: int = 256,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> None:
-        """Prepare gather graph code on an eager channel before capture."""
-
-        with _device_guard(self.device):
-            self.for_stream(
-                stream, channel_id=channel_id
-            ).prepare_graph_all_gather_heads(threads=threads)
-
-    def prepare_graph_all_gather_pair(
-        self,
-        *,
-        threads: int = 512,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> None:
-        """Prepare paired-gather graph code on an eager channel before capture."""
-
-        with _device_guard(self.device):
-            self.for_stream(
-                stream, channel_id=channel_id
-            ).prepare_graph_all_gather_pair(threads=threads)
-
-    def prepare_graph_all_gather_pair_kimi_topk(
-        self,
-        *,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> None:
-        """Prepare TP16 Kimi paired-gather graph code before capture."""
-
-        with _device_guard(self.device):
-            self.for_stream(
-                stream, channel_id=channel_id
-            ).prepare_graph_all_gather_pair_kimi_topk()
-
-    def prepare_graph_kimi_topk16(
-        self,
-        *,
-        threads: int = 256,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> None:
-        """Prepare batched Kimi expert selection before graph capture."""
-
-        with _device_guard(self.device):
-            self.for_stream(
-                stream, channel_id=channel_id
-            ).prepare_graph_kimi_topk16(threads=threads)
-
-    def lse_reduce_scatter(
-        self,
-        partial_output: torch.Tensor,
-        partial_lse: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        *,
-        is_lse_base_on_e: bool = True,
-        threads: int = 256,
-        block_limit: int = 16,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> torch.Tensor:
-        with _device_guard(self.device):
-            return self._lse_reduce_scatter_on_device(
-                partial_output,
-                partial_lse,
-                out,
-                is_lse_base_on_e=is_lse_base_on_e,
-                threads=threads,
-                block_limit=block_limit,
-                stream=stream,
-                channel_id=channel_id,
-            )
-
-    def _lse_reduce_scatter_on_device(
-        self,
-        partial_output: torch.Tensor,
-        partial_lse: torch.Tensor,
-        out: Optional[torch.Tensor],
-        *,
-        is_lse_base_on_e: bool,
-        threads: int,
-        block_limit: int,
-        stream: object,
-        channel_id: Optional[str],
-    ) -> torch.Tensor:
+    def lse_reduce_scatter(self, partial_output, partial_lse, out=None, *, plan: Plan,
+                           is_lse_base_on_e=True, threads=256, block_limit=16,
+                           stream=None, channel_id=None):
         channel = self.for_stream(stream, channel_id=channel_id)
-        if stream is not None and self.device.type == "cuda":
-            with torch.cuda.stream(stream):
-                return channel.lse_reduce_scatter(
-                    partial_output,
-                    partial_lse,
-                    out,
-                    is_lse_base_on_e=is_lse_base_on_e,
-                    threads=threads,
-                    block_limit=block_limit,
-                )
-        return channel.lse_reduce_scatter(
-            partial_output,
-            partial_lse,
-            out,
-            is_lse_base_on_e=is_lse_base_on_e,
-            threads=threads,
-            block_limit=block_limit,
-        )
-
-    def all_gather_heads(
-        self,
-        local_input: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        *,
-        threads: int = 256,
-        block_limit: int = 16,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> torch.Tensor:
+        channel._prepared_state(plan)
         with _device_guard(self.device):
-            return self._all_gather_heads_on_device(
-                local_input,
-                out,
-                threads=threads,
-                block_limit=block_limit,
-                stream=stream,
-                channel_id=channel_id,
-            )
+            if stream is not None and self.device.type == "cuda":
+                with torch.cuda.stream(stream):
+                    return channel.lse_reduce_scatter(partial_output, partial_lse, out, plan=plan, is_lse_base_on_e=is_lse_base_on_e, threads=threads, block_limit=block_limit)
+            return channel.lse_reduce_scatter(partial_output, partial_lse, out, plan=plan, is_lse_base_on_e=is_lse_base_on_e, threads=threads, block_limit=block_limit)
 
-    def _all_gather_heads_on_device(
-        self,
-        local_input: torch.Tensor,
-        out: Optional[torch.Tensor],
-        *,
-        threads: int,
-        block_limit: int,
-        stream: object,
-        channel_id: Optional[str],
-    ) -> torch.Tensor:
+    def all_gather_heads(self, local_input, out=None, *, plan: Plan, threads=256,
+                         block_limit=16, stream=None, channel_id=None):
         channel = self.for_stream(stream, channel_id=channel_id)
-        if stream is not None and self.device.type == "cuda":
-            with torch.cuda.stream(stream):
-                return channel.all_gather_heads(
-                    local_input,
-                    out,
-                    threads=threads,
-                    block_limit=block_limit,
-                )
-        return channel.all_gather_heads(
-            local_input,
-            out,
-            threads=threads,
-            block_limit=block_limit,
-        )
+        channel._prepared_state(plan)
+        with _device_guard(self.device):
+            if stream is not None and self.device.type == "cuda":
+                with torch.cuda.stream(stream):
+                    return channel.all_gather_heads(local_input, out, plan=plan, threads=threads, block_limit=block_limit)
+            return channel.all_gather_heads(local_input, out, plan=plan, threads=threads, block_limit=block_limit)
 
-    def all_gather_pair(
-        self,
-        local_first: torch.Tensor,
-        local_second: torch.Tensor,
-        out_first: Optional[torch.Tensor] = None,
-        out_second: Optional[torch.Tensor] = None,
-        *,
-        threads: int = 512,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def all_gather_pair(self, local_first, local_second, out_first=None, out_second=None,
+                        *, plan: Plan, threads=512, stream=None, channel_id=None):
         channel = self.for_stream(stream, channel_id=channel_id)
-        if stream is not None and self.device.type == "cuda":
-            with torch.cuda.stream(stream):
-                return channel.all_gather_pair(
-                    local_first,
-                    local_second,
-                    out_first,
-                    out_second,
-                    threads=threads,
-                )
-        return channel.all_gather_pair(
-            local_first,
-            local_second,
-            out_first,
-            out_second,
-            threads=threads,
-        )
+        channel._prepared_state(plan)
+        with _device_guard(self.device):
+            if stream is not None and self.device.type == "cuda":
+                with torch.cuda.stream(stream):
+                    return channel.all_gather_pair(local_first, local_second, out_first, out_second, plan=plan, threads=threads)
+            return channel.all_gather_pair(local_first, local_second, out_first, out_second, plan=plan, threads=threads)
 
-    def all_gather_pair_kimi_topk(
-        self,
-        local_down: torch.Tensor,
-        local_router: torch.Tensor,
-        correction_bias: torch.Tensor,
-        out_down: Optional[torch.Tensor] = None,
-        topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None,
-        *,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def all_gather_pair_kimi_topk(self, local_down, local_router, correction_bias,
+                                  out_down=None, topk_weights=None, topk_ids=None,
+                                  *, plan: Plan, stream=None, channel_id=None):
         channel = self.for_stream(stream, channel_id=channel_id)
-        if stream is not None and self.device.type == "cuda":
-            with torch.cuda.stream(stream):
-                return channel.all_gather_pair_kimi_topk(
-                    local_down,
-                    local_router,
-                    correction_bias,
-                    out_down,
-                    topk_weights,
-                    topk_ids,
-                )
-        return channel.all_gather_pair_kimi_topk(
-            local_down,
-            local_router,
-            correction_bias,
-            out_down,
-            topk_weights,
-            topk_ids,
-        )
+        channel._prepared_state(plan)
+        with _device_guard(self.device):
+            if stream is not None and self.device.type == "cuda":
+                with torch.cuda.stream(stream):
+                    return channel.all_gather_pair_kimi_topk(local_down, local_router, correction_bias, out_down, topk_weights, topk_ids, plan=plan)
+            return channel.all_gather_pair_kimi_topk(local_down, local_router, correction_bias, out_down, topk_weights, topk_ids, plan=plan)
 
-    def kimi_topk16(
-        self,
-        router_logits: torch.Tensor,
-        correction_bias: torch.Tensor,
-        output_weights: Optional[torch.Tensor] = None,
-        output_ids: Optional[torch.Tensor] = None,
-        *,
-        threads: int = 256,
-        stream: object = None,
-        channel_id: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def kimi_topk16(self, router_logits, correction_bias, output_weights=None,
+                    output_ids=None, *, plan: Plan, threads=256, stream=None,
+                    channel_id=None):
         channel = self.for_stream(stream, channel_id=channel_id)
-        if stream is not None and self.device.type == "cuda":
-            with torch.cuda.stream(stream):
-                return channel.kimi_topk16(
-                    router_logits,
-                    correction_bias,
-                    output_weights,
-                    output_ids,
-                    threads=threads,
-                )
-        return channel.kimi_topk16(
-            router_logits,
-            correction_bias,
-            output_weights,
-            output_ids,
-            threads=threads,
-        )
+        channel._prepared_state(plan)
+        with _device_guard(self.device):
+            if stream is not None and self.device.type == "cuda":
+                with torch.cuda.stream(stream):
+                    return channel.kimi_topk16(router_logits, correction_bias, output_weights, output_ids, plan=plan, threads=threads)
+            return channel.kimi_topk16(router_logits, correction_bias, output_weights, output_ids, plan=plan, threads=threads)
 
     @contextmanager
     def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
@@ -2513,5 +1961,4 @@ __all__ = [
     "SUPPORTED_WORLD_SIZES",
     "kimi_topk16",
     "lse_reduce_scatter_reference",
-    "prepare_kimi_topk16",
 ]

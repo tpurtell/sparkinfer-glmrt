@@ -65,6 +65,7 @@ from b12x._lib.intrinsics import (
     fp8_e4m3_to_f32,
     fp4_decode_2,
     get_ptr_as_int64,
+    half2_mul,
     ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
     ld_shared_v2_u32,
@@ -402,8 +403,13 @@ def s0_quantize_q_to_smem(
             rounded, _ue8m0 = pow2_ceil_ue8m0(raw)
             if lane8 == Int32(0):
                 q_sc_view[fused_slot] = rounded
+                if cutlass.const_expr(packed_q_scale_words):
+                    st_shared_u8(
+                        q_fp8_base_addr + h * Int32(q_nope_stride) + Int32(d_nope) + blk,
+                        (_ue8m0 & Uint32(255)).to(cutlass.Uint8),
+                    )
 
-            inv_scale = Float32(1.0) / rounded
+            inv_scale = _ue8m0_zext_byte_to_fp32(Uint32(254) - _ue8m0)
             for k in cutlass.range_constexpr(quant_tile // 8):
                 d = blk * Int32(quant_tile) + lane8 + Int32(k * 8)
                 v = values[k] * inv_scale
@@ -940,7 +946,6 @@ def s1_qk_nope_nvfp4_bf16(
                 b1,
             )
     return qk
-
 
 @cute.jit
 def s1_qk_nope_block_scaled_glm_h8_swap_ab(
@@ -1527,6 +1532,92 @@ def _nvfp4_pair_bfloat2(
 
 
 @cute.jit
+def s0_normalize_dsv41_kv_to_fp8(
+    kv_base_addr: Int32,
+    ratio_base_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    bi: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    ratio_smem_stride: cutlass.Constexpr,
+    math_warps: cutlass.Constexpr = 8,
+):
+    """Expand producer-normalized DSV41 records to canonical E4M3 in place.
+
+    The IO producer owns the native-scale reduction and publishes one FP16
+    native-to-canonical ratio for every original 16-dimensional group in the
+    row sidecar.  This consumer only applies those already-rounded ratios.
+    """
+    for row_iter in cutlass.range(bi // math_warps, unroll=1):
+        entry = warp_id + Int32(row_iter * math_warps)
+        row = kv_base_addr + entry * Int32(kv_smem_stride)
+        ratio_row = ratio_base_addr + entry * Int32(ratio_smem_stride)
+        tag = ld_shared_u32(row + Int32(528)).to(Int32)
+        if tag == Int32(1):
+            for blk in cutlass.range_constexpr(8):
+                dim = Int32(blk * 64) + lane * Int32(2)
+                ratio = _ld_u16_zext(
+                    ratio_row, (dim // Int32(16)) * Int32(2)
+                )
+                if ratio != Uint32(0x3C00):
+                    native_h2 = _cvt_e4m3x2_to_f16x2(_ld_u16_zext(row, dim))
+                    ratio_h2 = ratio | (ratio << Uint32(16))
+                    scaled_h2 = half2_mul(native_h2, ratio_h2)
+                    encoded = Uint32(
+                        llvm.inline_asm(
+                            T.i32(),
+                            [scaled_h2.ir_value()],
+                            """
+                            {
+                                .reg .b16 out;
+                                cvt.rn.satfinite.e4m3x2.f16x2 out, $1;
+                                cvt.u32.u16 $0, out;
+                            }
+                            """,
+                            "=r,r",
+                            has_side_effects=False,
+                            is_align_stack=False,
+                            asm_dialect=llvm.AsmDialect.AD_ATT,
+                        )
+                    )
+                    _st_shared_u16(row + dim, encoded)
+        elif tag == Int32(0):
+            # Descending expansion cannot clobber a later FP4 source block.
+            for rev in cutlass.range_constexpr(8):
+                blk = 7 - rev
+                dim = Int32(blk * 64) + lane * Int32(2)
+                ratio = _ld_u16_zext(
+                    ratio_row, (dim // Int32(16)) * Int32(2)
+                )
+                native_h2 = fp4_decode_2(_ld_u8_zext(row, dim // Int32(2)))
+                ratio_h2 = ratio | (ratio << Uint32(16))
+                scaled_h2 = half2_mul(native_h2, ratio_h2)
+                encoded = Uint32(
+                    llvm.inline_asm(
+                        T.i32(),
+                        [scaled_h2.ir_value()],
+                        """
+                        {
+                            .reg .b16 out;
+                            cvt.rn.satfinite.e4m3x2.f16x2 out, $1;
+                            cvt.u32.u16 $0, out;
+                        }
+                        """,
+                        "=r,r",
+                        has_side_effects=False,
+                        is_align_stack=False,
+                        asm_dialect=llvm.AsmDialect.AD_ATT,
+                    )
+                )
+                cute.arch.sync_warp()
+                _st_shared_u16(row + dim, encoded)
+                cute.arch.sync_warp()
+        else:
+            for blk in cutlass.range_constexpr(8):
+                _st_shared_u16(row + Int32(blk * 64) + lane * Int32(2), Uint32(0))
+
+@cute.jit
 def _nvfp4_scalar_bf16_u16(
     kv_fp4_base_addr: Int32,
     entry: Int32,
@@ -1538,10 +1629,7 @@ def _nvfp4_scalar_bf16_u16(
     kv_sc_base_addr: Int32 = Int32(0),
 ) -> Uint32:
     pair = _nvfp4_pair_bfloat2(
-        kv_fp4_base_addr,
-        entry,
-        dim & ~Int32(1),
-        latent_scale,
+        kv_fp4_base_addr, entry, dim & ~Int32(1), latent_scale,
         kv_smem_stride=kv_smem_stride,
         latent_scale_per_token=latent_scale_per_token,
         kv_sc_base_addr=kv_sc_base_addr,
@@ -2365,7 +2453,6 @@ def s6_xv_nope_nvfp4_bf16(
     pair_selector = Int32(0x5410 if entry_parity == Int32(0) else 0x3276)
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
-
     for vc in cutlass.range_constexpr(n_v_chunks):
         for nt in cutlass.range_constexpr(nt_per_warp_xv):
             dim_base = Int32(vc) * Int32(v_chunk) + (
@@ -2380,14 +2467,10 @@ def s6_xv_nope_nvfp4_bf16(
                 k_base = Int32(ks) * Int32(16)
                 a_byte = (a_row * Int32(p_stride) + (k_base + a_col)) * Int32(2)
                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
-
                 ent0 = k_base + tid * Int32(2)
                 pair0 = _nvfp4_pair_bfloat2(
-                    kv_fp4_base_addr,
-                    ent0 + entry_parity,
-                    col & ~Int32(1),
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
+                    kv_fp4_base_addr, ent0 + entry_parity, col & ~Int32(1),
+                    latent_scale, kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
                 )
@@ -3302,8 +3385,6 @@ def _d2_load_b_fp8_perm(
     t23 = byte_perm(r2, r3, sel)
     b1 = byte_perm(t01, t23, Int32(0x5410))
     return b0, b1
-
-
 @cute.jit
 def _w_perm_col(cand: Int32) -> Int32:
     """W column (MMA K index) holding ``cand`` under the permuted K axis.

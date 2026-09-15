@@ -20,12 +20,11 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import Literal
+from ._controls import paged_control
 
 import torch
 
-from b12x.policy import NO_POLICY_OVERRIDE, PolicyContext, get_auto_policy
-
-from ._policy import GQA_POLICY, GqaConfig, GqaQuery
+from ._tuning import GqaConfig
 
 _FP8_KV_DTYPE = torch.float8_e4m3fn
 _PAGED_EXTEND_FP8_CHUNK_TABLE_PAGES = (
@@ -153,7 +152,7 @@ def _previous_power_of_two(x: int) -> int:
 
 
 def _decode_graph_chunk_pages_env(name: str) -> int | None:
-    raw = os.environ.get(name)
+    raw = paged_control(name)
     if raw is None or raw.strip() == "":
         return None
     value = int(raw)
@@ -969,7 +968,6 @@ class PagedDecodeGraphCapacity:
     max_effective_kv_pages: int
     worst_page_count: int
     chunk_pages_lut: tuple[int, ...]
-    policy_resolution: object | None = None
 
 
 @dataclass(frozen=True)
@@ -1453,70 +1451,45 @@ def plan_decode_graph_capacity(
     max_work_items: int | None = None,
     max_partial_rows: int | None = None,
     force_split_kv: bool | None = None,
-    kv_cache_layout: str = "separate",
-    policy: PolicyContext | None = None,
     config: GqaConfig | None = None,
 ) -> PagedDecodeGraphCapacity:
-    """Resolve preplanned or heuristic decode-graph capacity policy."""
+    """Build a decode capacity from a prepared config or established heuristic."""
 
     resolved_device = torch.device(device)
     if resolved_device.type == "cuda" and resolved_device.index is None:
         resolved_device = torch.device("cuda", torch.cuda.current_device())
-    policy = policy or get_auto_policy(resolved_device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(resolved_device)
     page_size = int(page_size)
     max_cache_page_count = int(max_cache_page_count)
-    query = GqaQuery(
-        device=resolved_device,
-        mode="decode",
-        q_dtype=str(q_dtype).removeprefix("torch."),
-        kv_dtype=str(kv_dtype).removeprefix("torch."),
-        q_heads=int(num_q_heads),
-        kv_heads=int(num_kv_heads),
-        head_dim_qk=int(head_dim_qk),
-        head_dim_vo=int(head_dim_vo),
-        page_size=page_size,
-        kv_cache_layout=kv_cache_layout,
-        batch_size=int(batch),
-        query_len=1,
-        cache_tokens=max_cache_page_count * page_size,
-        window_left=int(window_left),
-        requested_graph_ctas_per_sm=(
-            None if graph_ctas_per_sm is None else int(graph_ctas_per_sm)
-        ),
-        requested_max_work_items=(
-            None if max_work_items is None else int(max_work_items)
-        ),
-        requested_max_partial_rows=(
-            None if max_partial_rows is None else int(max_partial_rows)
-        ),
-        force_split_kv=force_split_kv,
-    )
-    resolution = policy.resolve(
-        GQA_POLICY,
-        query,
-        override=NO_POLICY_OVERRIDE if config is None else config,
-    )
-    selected = resolution.config
+    if config is None:
+        return _plan_decode_graph_capacity_heuristic(
+            device=resolved_device,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=int(num_q_heads),
+            num_kv_heads=int(num_kv_heads),
+            head_dim_qk=int(head_dim_qk),
+            head_dim_vo=int(head_dim_vo),
+            page_size=page_size,
+            batch=int(batch),
+            max_cache_page_count=max_cache_page_count,
+            window_left=int(window_left),
+            graph_ctas_per_sm=graph_ctas_per_sm,
+            max_work_items=max_work_items,
+            max_partial_rows=max_partial_rows,
+            force_split_kv=force_split_kv,
+        )
     return PagedDecodeGraphCapacity(
-        graph_ctas_per_sm=selected.graph_ctas_per_sm,
-        cta_tile_q=selected.cta_tile_q,
-        query_tiles_per_request=selected.query_tiles_per_request,
-        architecture_max_chunks_per_request=(
-            selected.architecture_max_chunks_per_request
-        ),
-        max_chunks_per_request=selected.max_chunks_per_request,
-        max_work_items=selected.max_work_items,
-        max_partial_rows=selected.max_partial_rows,
-        max_effective_kv_pages=selected.max_effective_kv_pages,
-        worst_page_count=selected.worst_page_count,
-        chunk_pages_lut=selected.chunk_pages_lut(),
-        policy_resolution=resolution,
+        graph_ctas_per_sm=config.graph_ctas_per_sm,
+        cta_tile_q=config.cta_tile_q,
+        query_tiles_per_request=config.query_tiles_per_request,
+        architecture_max_chunks_per_request=config.architecture_max_chunks_per_request,
+        max_chunks_per_request=config.max_chunks_per_request,
+        max_work_items=config.max_work_items,
+        max_partial_rows=config.max_partial_rows,
+        max_effective_kv_pages=config.max_effective_kv_pages,
+        worst_page_count=config.worst_page_count,
+        chunk_pages_lut=config.chunk_pages_lut(),
     )
-
-
 def plan_extend_graph_capacity(
     *,
     device: torch.device | str,
@@ -1918,6 +1891,8 @@ def create_paged_plan(
     window_left: int = -1,
     msa_block_sparse: bool = False,
     msa_union_tile: bool | None = None,
+    host_q_lengths: tuple[int, ...] | None = None,
+    host_cache_lengths: tuple[int, ...] | None = None,
 ) -> PagedPlan:
     if q.ndim != 3:
         raise ValueError(
@@ -1943,9 +1918,9 @@ def create_paged_plan(
         raise ValueError(
             f"cu_seqlens_q must be rank-1 [batch+1], got {tuple(cu_seqlens_q.shape)}"
         )
-    if q.device.type != "cuda":
+    if host_q_lengths is None and q.device.type != "cuda":
         raise ValueError("q must be on CUDA")
-    if not (
+    if host_q_lengths is None and not (
         k_cache.device
         == v_cache.device
         == page_table.device
@@ -2000,21 +1975,40 @@ def create_paged_plan(
     if tuple(cu_seqlens_q.shape) != (batch + 1,):
         raise ValueError("cu_seqlens_q shape must be [batch + 1]")
 
-    q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
-    cache_lengths = _metadata_to_cpu_int_list(cache_seqlens, name="cache_seqlens")
+    if (host_q_lengths is None) != (host_cache_lengths is None):
+        raise ValueError(
+            "host_q_lengths and host_cache_lengths must be supplied together"
+        )
+    if host_q_lengths is None:
+        q_lengths = _q_lengths_from_cu_seqlens(cu_seqlens_q)
+        cache_lengths = _metadata_to_cpu_int_list(
+            cache_seqlens, name="cache_seqlens"
+        )
+        inferred_mode = infer_paged_mode(cu_seqlens_q)
+    else:
+        q_lengths = [int(length) for length in host_q_lengths]
+        cache_lengths = [int(length) for length in host_cache_lengths]
+        if len(q_lengths) != batch or len(cache_lengths) != batch:
+            raise ValueError("host length metadata must match page_table batch")
+        if any(length <= 0 for length in q_lengths):
+            raise ValueError("host query lengths must be positive")
+        if sum(q_lengths) != total_q:
+            raise ValueError("host query lengths must sum to q total_q")
+        inferred_mode = (
+            "decode" if batch > 0 and all(length == 1 for length in q_lengths)
+            else "extend"
+        )
     if any(cache_len <= 0 for cache_len in cache_lengths):
         raise ValueError("primary paged backend requires cache_seqlens > 0")
     cache_pages_arr = [_ceil_div(cache_len, page_size) for cache_len in cache_lengths]
     if any(cache_pages > max_pages_per_request for cache_pages in cache_pages_arr):
         raise ValueError("page_table width is smaller than required by cache_seqlens")
-
-    inferred_mode = infer_paged_mode(cu_seqlens_q)
     mode = inferred_mode if mode is None else mode
     if msa_union_tile is None:
         msa_union_tile = (
             msa_block_sparse
             and mode == "extend"
-            and os.environ.get("B12X_PAGED_MSA_UNION_PREFILL", "1")
+            and paged_control("B12X_PAGED_MSA_UNION_PREFILL", "1")
             != "0"
         )
     else:
@@ -2572,7 +2566,7 @@ def create_paged_plan(
     kv_chunk_size = kv_chunk_size_pages * page_size
 
     if (
-        os.environ.get("B12X_DEBUG_PAGED_POLICY") == "1"
+        paged_control("B12X_DEBUG_PAGED_POLICY") == "1"
         and enable_cuda_graph
         and graph_chunk_policy
         and mode == "decode"

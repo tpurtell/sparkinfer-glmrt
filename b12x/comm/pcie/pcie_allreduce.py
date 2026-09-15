@@ -12,6 +12,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation import FrozenMapping, Plan
+from b12x.preparation.types import require_prepared
+from ._tuning import PcieConfig
+
 from .pcie_hierarchical import (
     SUPPORTED_WORLD_SIZES as HIERARCHICAL_WORLD_SIZES,
 )
@@ -311,44 +315,70 @@ class PCIeAllReduce:
             return True
         return self._use_island_rs(inp)
 
+    def plan(
+        self, inp: torch.Tensor, *, operation: str = "all_reduce",
+        stream: object = None, channel_id: Optional[str] = None,
+        invocation: FrozenMapping = FrozenMapping(), override: PcieConfig | None = None,
+        **call,
+    ) -> Plan:
+        """Select an existing native channel once, then declare its plan.
+
+        Semantic channels must already exist. This does not construct transports,
+        register inputs, allocate workspace, or compile any program.
+        """
+        from ._preparation import plan, query_from_runtime
+
+        if operation not in ("all_reduce", "all_reduce_fused_add_rms_norm"):
+            raise ValueError(f"unsupported all-reduce operation {operation!r}")
+        if self.algorithm == "oneshot":
+            target = self._runtime._prepared_channel_for_stream(stream, channel_id)
+            surface = f"OneshotAllReduce.{operation}"
+        else:
+            if operation != "all_reduce":
+                raise ValueError("fused RMSNorm requires an all-peer oneshot runtime")
+            target = self._island_rs if self._use_island_rs(inp) else self._runtime
+            surface = f"{type(target).__name__}.all_reduce"
+        query = query_from_runtime(target, surface=surface, call={"inp": inp, **call})
+        return plan(query, runtime=target, invocation=invocation, override=override)
+
     def all_reduce(
-        self,
-        inp: torch.Tensor,
-        *,
+        self, inp: torch.Tensor, *, plan: Plan,
         out: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
-        blocks: Optional[int] = None,
-        stream: object = None,
+        blocks: Optional[int] = None, stream: object = None,
         channel_id: Optional[str] = None,
     ) -> torch.Tensor:
+        state = require_prepared(plan, "comm.pcie", inp.device)
         if self.algorithm == "hierarchical":
             if peer_input_ptrs is not None:
-                raise ValueError(
-                    "peer_input_ptrs are unavailable for hierarchical all-reduce"
-                )
-            if self._use_island_rs(inp):
-                return self._island_rs.all_reduce(
-                    inp,
-                    out=out,
-                    blocks=blocks,
-                    stream=stream,
-                    channel_id=channel_id,
-                )
-            return self._runtime.all_reduce(
-                inp,
-                out=out,
-                blocks=blocks,
-                stream=stream,
-                channel_id=channel_id,
+                raise ValueError("peer_input_ptrs are unavailable for hierarchical all-reduce")
+            target = state.runtime
+            if target is not self._runtime and target is not self._island_rs:
+                raise ValueError("plan belongs to another all-reduce manager")
+            return target.all_reduce(
+                inp, plan=plan, out=out, blocks=blocks,
+                stream=stream, channel_id=channel_id,
             )
         if blocks is not None:
             raise ValueError("blocks is only available for hierarchical all-reduce")
         return self._runtime.all_reduce(
-            inp,
-            out=out,
-            peer_input_ptrs=peer_input_ptrs,
-            stream=stream,
-            channel_id=channel_id,
+            inp, plan=plan, out=out, peer_input_ptrs=peer_input_ptrs,
+            stream=stream, channel_id=channel_id,
+        )
+
+    def all_reduce_fused_add_rms_norm(
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+        epsilon: float, *, plan: Plan,
+        out: Optional[torch.Tensor] = None, residual_out: Optional[torch.Tensor] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None, stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.algorithm != "oneshot":
+            raise ValueError("fused RMSNorm requires an all-peer oneshot runtime")
+        return self._runtime.all_reduce_fused_add_rms_norm(
+            inp, residual, weight, epsilon, plan=plan, out=out,
+            residual_out=residual_out, peer_input_ptrs=peer_input_ptrs,
+            stream=stream, channel_id=channel_id,
         )
 
     @contextmanager

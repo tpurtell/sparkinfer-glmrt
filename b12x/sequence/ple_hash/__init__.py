@@ -1,9 +1,13 @@
 """Prime-hashed learned n-gram embedding IDs.
 
-``plan`` owns the immutable signed-int64 multiplier and per-head table
-geometry together with serving capacity. ``bind`` maps caller-owned runtime
-tensors and scratch without allocation. ``run`` will write logical embedding
-IDs while leaving committed history immutable.
+``compute_geometry`` calculates and validates host metadata separately from
+execution; ``allocate_geometry`` explicitly allocates checkpoint-owned tensors.
+Loaders register those exact tensors before checkpoint load. ``plan`` declares
+geometry and capacity without device allocation, and ``PreparationSession``
+produces the prepared plan required by ``bind``. Device checkpoint tensors passed
+to a declaration require their host ``geometry`` metadata; preparation borrows
+them without replacing their storage. ``run`` writes logical embedding IDs
+while leaving committed history immutable.
 
 Checkpoint multiplier indices denote token lag: the hash of an order-``n``
 window is ``xor(token[t-i] * multipliers[i] for i in range(n))``. Predecessors
@@ -30,6 +34,11 @@ META = OpMeta(
         "Binding",
         "PleHashConfig",
         "PleHashQuery",
+        "Geometry",
+        "GeometryTensors",
+        "compute_geometry",
+        "allocate_geometry",
+        "invocation_from_tensors",
         "plan",
         "bind",
         "run",
@@ -49,8 +58,7 @@ META = OpMeta(
     test_path="tests/sequence/test_ple.py",
     since="1.3.0",
     notes=(
-        "Packed hashing uses fixed-capacity caller-owned scratch and exposes "
-        "a device error code for graph-safe metadata validation. The Triton "
+        "Packed hashing uses fixed-capacity caller-owned scratch. The Triton "
         "implementation is a correctness reference and is not "
         "throughput-qualified."
     ),
@@ -63,6 +71,11 @@ if TYPE_CHECKING:
         Plan,
         PleHashConfig,
         PleHashQuery,
+        Geometry,
+        GeometryTensors,
+        compute_geometry,
+        allocate_geometry,
+        invocation_from_tensors,
         bind,
         is_supported,
         plan,

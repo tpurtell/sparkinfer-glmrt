@@ -19,6 +19,8 @@ from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
 )
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import register_program_cache
 from b12x._lib.intrinsics import (
     atomic_add_global_i32,
     bf16_mma_m16n8k16_f32,
@@ -737,6 +739,7 @@ class W4A16TopKSumCompileResult:
     route_ids_dtype: torch.dtype = torch.int32
     use_expert_map: bool = False
     full_rotation_output_dtype: str = "fp32"
+    broadcast_svh: bool = False
 
 
 @dataclass(frozen=True)
@@ -781,6 +784,7 @@ class W4A16FusedMoeCompileResult:
     rotation_input_dtype: str = "fp16"
     cta_threads: int = -1
     shared_memory_bytes: int = -1
+    broadcast_suh: bool = False
 
 
 @dataclass(frozen=True)
@@ -8955,6 +8959,12 @@ _ACTIVATION_CACHE: dict[tuple, W4A16ActivationCompileResult] = {}
 _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
 _SMALL_M_DIRECT_CACHE: dict[tuple, _W4A16SmallMDirectLaunch] = {}
 _FC2_DIRECT_CACHE: dict[tuple, _W4A16FC2DirectLaunch] = {}
+register_program_cache(_CACHE)
+register_program_cache(_FUSED_CACHE)
+register_program_cache(_ACTIVATION_CACHE)
+register_program_cache(_SUM_CACHE)
+register_program_cache(_SMALL_M_DIRECT_CACHE)
+register_program_cache(_FC2_DIRECT_CACHE)
 
 
 def _normalize_element_dtype(dtype: torch.dtype) -> str:
@@ -9396,10 +9406,9 @@ def compile_w4a16_gemm(
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
-        return replace(
-            cached,
-            max_m_blocks=max_m_blocks,
-            blocks_per_sm=kernel.blocks_per_sm,
+        return attach_programs(
+            replace(cached, max_m_blocks=max_m_blocks, blocks_per_sm=kernel.blocks_per_sm),
+            cached.compiled,
         )
 
     compile_size_m = _fake_m_for_specialization(size_m)
@@ -9519,6 +9528,7 @@ def compile_w4a16_gemm(
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
     )
+    attach_programs(result, compiled)
     _CACHE[cache_key] = result
     return result
 
@@ -9950,12 +9960,15 @@ def compile_w4a16_fused_moe(
     )
     cached = _FUSED_CACHE.get(cache_key)
     if cached is not None:
-        return replace(
+        return attach_programs(
+            replace(
+                cached,
+                size_m=size_m,
+                num_experts=num_experts,
+                max_m_blocks=max_m_blocks,
+                blocks_per_sm=kernel.blocks_per_sm,
+            ),
             cached,
-            size_m=size_m,
-            num_experts=num_experts,
-            max_m_blocks=max_m_blocks,
-            blocks_per_sm=kernel.blocks_per_sm,
         )
     if _require_cached:
         raise RuntimeError(
@@ -9965,6 +9978,7 @@ def compile_w4a16_fused_moe(
             "count before capturing"
         )
 
+    compiled_dependencies = []
     if (not collect_activation_amax) and _small_m_direct_supported(
         m=size_m,
         hidden_size=hidden_size,
@@ -9982,7 +9996,7 @@ def compile_w4a16_fused_moe(
         scale_format=scale_format,
     ):
         for ids_dtype in (torch.int32, torch.int64):
-            _compile_w4a16_small_m_direct(
+            direct = _compile_w4a16_small_m_direct(
                 m=size_m,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
@@ -9998,6 +10012,7 @@ def compile_w4a16_fused_moe(
                 w13_layout=w13_layout,
                 device=torch.device("cuda", device) if device is not None else None,
             )
+            compiled_dependencies.append(direct.compiled)
 
     compile_size_m = _fake_m_for_specialization(size_m)
     compile_routed_rows = int(compile_size_m) * int(top_k)
@@ -10207,7 +10222,9 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         cta_threads=kernel.cta_threads,
         shared_memory_bytes=kernel.shared_words * 4,
+        broadcast_suh=bool(broadcast_suh),
     )
+    attach_programs(result, compiled, *compiled_dependencies)
     _FUSED_CACHE[cache_key] = result
     return result
 
@@ -10354,10 +10371,13 @@ def compile_w4a16_topk_sum(
     )
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
-        return replace(
+        return attach_programs(
+            replace(
+                cached,
+                num_experts=int(num_experts),
+                route_num_experts=int(route_num_experts),
+            ),
             cached,
-            num_experts=int(num_experts),
-            route_num_experts=int(route_num_experts),
         )
 
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -10437,7 +10457,9 @@ def compile_w4a16_topk_sum(
         route_ids_dtype=route_ids_dtype,
         use_expert_map=bool(use_expert_map),
         full_rotation_output_dtype=str(full_rotation_output_dtype),
+        broadcast_svh=bool(broadcast_svh),
     )
+    attach_programs(result, compiled)
     _SUM_CACHE[cache_key] = result
     return result
 
@@ -10628,8 +10650,10 @@ def _w4a16_fc2_direct_launch_flat(
     intermediate_size: int,
     num_experts: int,
     stream_int: int,
+    *,
+    launcher=None,
 ) -> None:
-    launch = _compile_w4a16_fc2_direct(
+    launch = launcher if launcher is not None else _compile_w4a16_fc2_direct(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -10804,6 +10828,7 @@ def _w4a16_fused_moe_launch_flat(
     rotation_input: torch.Tensor | None = None,
     suh_gate_table: torch.Tensor | None = None,
     suh_up_table: torch.Tensor | None = None,
+    launcher: W4A16FusedMoeCompileResult | None = None,
 ) -> None:
     swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
     collect_activation_amax = bool(collect_activation_amax)
@@ -10867,7 +10892,9 @@ def _w4a16_fused_moe_launch_flat(
         suh_gate_arg = _rot_scales_dummy(w13_global_scale.device)
         suh_up_arg = suh_gate_arg
         rotation_input_dtype = element_dtype
-    fused = compile_w4a16_fused_moe(
+    if launcher is not None and launcher.broadcast_suh != broadcast_suh:
+        raise ValueError("prepared W4A16 input rotation layout differs from the bound tables")
+    fused = launcher or compile_w4a16_fused_moe(
         size_m=size_m,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -11457,6 +11484,7 @@ def _w4a16_topk_sum_launch_flat(
     route_expert_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     svh_table: torch.Tensor | None = None,
+    launcher: W4A16TopKSumCompileResult | None = None,
 ) -> None:
     full_rotation = bool(full_rotation)
     full_rotation_output_dtype = (
@@ -11472,7 +11500,9 @@ def _w4a16_topk_sum_launch_flat(
         and svh_table is not None
         and svh_table.numel() == hidden_size
     )
-    sum_kernel = compile_w4a16_topk_sum(
+    if launcher is not None and launcher.broadcast_svh != broadcast_svh:
+        raise ValueError("prepared W4A16 output rotation layout differs from the bound table")
+    sum_kernel = launcher or compile_w4a16_topk_sum(
         m=m,
         topk=topk,
         hidden_size=hidden_size,
@@ -11800,6 +11830,7 @@ def pack_topk_routes_by_expert(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_counts: torch.Tensor | None = None,
+    launches=None,
     stream: cuda.CUstream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Group top-k routes by expert and pad each group to the GEMM M-block size."""
@@ -11820,6 +11851,7 @@ def pack_topk_routes_by_expert(
         packed_route_count=packed_route_count,
         expert_offsets=expert_offsets,
         expert_counts=expert_counts,
+        launches=launches,
     )
 
 
@@ -11928,18 +11960,18 @@ def _run_trellis256_dense_current_device(
     x: torch.Tensor,
     prepared_dense,
     *,
+    launch: _W4A16GemmLaunch,
+    execution_lut: torch.Tensor | None,
+    grid_cap: int,
     output: torch.Tensor | None = None,
     gemm_output: torch.Tensor | None = None,
-    c_tmp: torch.Tensor | None = None,
     input_f16: torch.Tensor | None = None,
     rotated_f16: torch.Tensor | None = None,
     rotated_compute: torch.Tensor | None = None,
     gemm_output_f16: torch.Tensor | None = None,
     output_f16: torch.Tensor | None = None,
-    hadamard_128=None,
+    hadamard_128,
     stream: cuda.CUstream | None = None,
-    _moe_block_size: int = 64,
-    _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Run one native EXL3 linear on the already-selected CUDA device.
 
@@ -11975,7 +12007,6 @@ def _run_trellis256_dense_current_device(
             "prepared dense weight must select fp16 or bf16 compute, got "
             f"{compute_dtype}"
         )
-    element_dtype = "fp16" if compute_dtype == torch.float16 else "bf16"
     cutlass_dtype = (
         cutlass.Float16 if compute_dtype == torch.float16 else cutlass.BFloat16
     )
@@ -12000,10 +12031,8 @@ def _run_trellis256_dense_current_device(
         dtype=x.dtype,
         device=x.device,
     )
-    if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
-        raise ValueError("c_tmp must be at least 16-byte aligned")
-
-    hadamard_128 = _resolve_exl3_hadamard_128(hadamard_128)
+    if not callable(hadamard_128):
+        raise TypeError("prepared Trellis transform must be callable")
 
     gemm_output = _trellis_dense_buffer(
         "gemm_output",
@@ -12044,62 +12073,31 @@ def _run_trellis256_dense_current_device(
         )
         rotated_compute.copy_(rotated_f16)
 
-    props = torch.cuda.get_device_properties(x.device)
-    sms = int(props.multi_processor_count)
-    max_shared_mem = int(
-        getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
-    )
-    moe_block_size = int(_moe_block_size)
-    if _force_tile_config is None and moe_block_size == 64:
-        moe_block_size, (tile_k, tile_n) = _trellis256_dense_launch_geometry(
-            size_m=m,
-            size_k=size_k,
-            size_n=size_n,
-            sms=sms,
-        )
-    else:
-        tile_k, tile_n = (
-            _trellis256_dense_tile_config(size_k, size_n)
-            if _force_tile_config is None
-            else (int(_force_tile_config[0]), int(_force_tile_config[1]))
-        )
-    if moe_block_size not in _ALLOWED_ROUTED_SIZES:
-        raise ValueError(f"unsupported Trellis dense moe_block_size={moe_block_size}")
+    if int(launch.kernel.moe_block_size) <= 0:
+        raise ValueError("prepared Trellis launch has invalid block-row geometry")
+    moe_block_size = int(launch.kernel.moe_block_size)
     route_blocks = (m + moe_block_size - 1) // moe_block_size
-    route_slots = route_blocks * moe_block_size
-    launch = _compile_w4a16_gemm_launch(
-        size_m=m,
-        size_n=size_n,
-        size_k=size_k,
-        num_experts=1,
-        top_k=1,
-        mul_topk_weights=False,
-        moe_block_size=moe_block_size,
-        max_m_blocks=route_blocks,
-        element_dtype=element_dtype,
-        packed_route_indices=None,
-        sms=sms,
-        max_shared_mem=max_shared_mem,
-        device=x.device,
-        c_tmp=c_tmp,
-        weight_layout="trellis_t256",
-        scale_format="e4m3_k32",
-        w13_layout="packed",
-        trellis_bits=trellis_bits,
-        trellis_codebook=trellis_codebook,
-        trellis_pair_kind=trellis_pair_kind,
-        trellis_rate_axis=trellis_rate_axis,
-        dense_route_fast_path=True,
-        route_slots=route_slots,
-        force_tile_config=(tile_k, tile_n),
-    )
-    dummy_i32 = prepared_dense.workspace[:1]
-    stream = current_cuda_stream() if stream is None else stream
+    if int(launch.kernel.max_m_blocks) < route_blocks:
+        raise ValueError("prepared Trellis launch cannot cover the requested rows")
+    if (
+        launch.kernel.trellis_bits,
+        launch.kernel.trellis_codebook,
+        launch.kernel.trellis_pair_kind,
+        launch.kernel.trellis_rate_axis,
+    ) != (
+        trellis_bits,
+        trellis_codebook,
+        trellis_pair_kind,
+        trellis_rate_axis,
+    ):
+        raise ValueError("prepared Trellis launcher metadata differs from the weight")
+    tile_n = int(launch.kernel.tile_n)
     n_tiles = size_n // tile_n
-    grid_x = min(
-        sms * int(launch.kernel.blocks_per_sm),
-        max(route_blocks * n_tiles, 1),
-    )
+    grid_x = min(int(grid_cap), max(route_blocks * n_tiles, 1))
+    if trellis_codebook != "mcg" and execution_lut is None:
+        raise ValueError("prepared Trellis decoder is missing its execution LUT")
+    stream = current_cuda_stream() if stream is None else stream
+    dummy_i32 = prepared_dense.workspace[:1]
     launch.kernel.compiled(
         make_ptr(
             cutlass_dtype,
@@ -12129,9 +12127,7 @@ def _run_trellis256_dense_current_device(
         launch.c_tmp,
         prepared_dense.workspace,
         # MCG kernels never dereference the LUT ABI slot.
-        dummy_i32
-        if trellis_codebook == "mcg"
-        else _trellis256_execution_lut(x.device, trellis_codebook),
+        dummy_i32 if trellis_codebook == "mcg" else execution_lut,
         m,
         grid_x,
         stream,
@@ -12168,41 +12164,30 @@ def run_trellis256_dense(
     x: torch.Tensor,
     prepared_dense,
     *,
+    launch: _W4A16GemmLaunch,
+    execution_lut: torch.Tensor | None,
+    grid_cap: int,
     output: torch.Tensor | None = None,
     gemm_output: torch.Tensor | None = None,
-    c_tmp: torch.Tensor | None = None,
     input_f16: torch.Tensor | None = None,
     rotated_f16: torch.Tensor | None = None,
     rotated_compute: torch.Tensor | None = None,
     gemm_output_f16: torch.Tensor | None = None,
     output_f16: torch.Tensor | None = None,
-    hadamard_128=None,
-    stream: cuda.CUstream | None = None,
-    _moe_block_size: int = 64,
-    _force_tile_config: tuple[int, int] | None = None,
+    hadamard_128,
 ) -> torch.Tensor:
-    """Run one native or compact P24/P33 EXL3 linear through the t256 GEMM.
-
-    The whole input-rotation -> GEMM -> output-rotation chain is device-guarded
-    and runs on the current Torch stream for ``x.device``.  To use a non-default
-    stream, enter ``torch.cuda.stream(...)`` around this call; accepting a raw
-    driver stream here would leave the surrounding Torch/EXL3 rotations on a
-    different stream and create an unsynchronized race.
-    """
+    """Run a session-materialized native or compact P24/P33 EXL3 linear."""
     if not isinstance(x, torch.Tensor) or not x.is_cuda:
         raise ValueError("x must be a CUDA tensor")
-    if stream is not None:
-        raise ValueError(
-            "run_trellis256_dense does not accept a raw CUDA stream; select a "
-            "Torch stream with torch.cuda.stream(...) around the call"
-        )
     with torch.cuda.device(x.device):
         return _run_trellis256_dense_current_device(
             x,
             prepared_dense,
+            launch=launch,
+            execution_lut=execution_lut,
+            grid_cap=grid_cap,
             output=output,
             gemm_output=gemm_output,
-            c_tmp=c_tmp,
             input_f16=input_f16,
             rotated_f16=rotated_f16,
             rotated_compute=rotated_compute,
@@ -12210,8 +12195,6 @@ def run_trellis256_dense(
             output_f16=output_f16,
             hadamard_128=hadamard_128,
             stream=None,
-            _moe_block_size=_moe_block_size,
-            _force_tile_config=_force_tile_config,
         )
 
 
@@ -12294,6 +12277,7 @@ def run_w4a16_moe(
     rotation_a_gate: torch.Tensor | None = None,
     rotation_a_up: torch.Tensor | None = None,
     route_mode: str = "auto",
+    route_pack_launches=None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
@@ -12816,6 +12800,10 @@ def run_w4a16_moe(
         if packed_route_count is None:
             packed_route_count = packed_route_indices
     else:
+        if fused_launch is not None and not full_rotation and route_pack_launches is None:
+            raise RuntimeError(
+                "prepared W4A16 packed route execution is missing route-pack programs"
+            )
         packed_route_indices, block_expert_ids, packed_route_count = (
             pack_topk_routes_by_expert(
                 topk_ids,
@@ -12827,6 +12815,7 @@ def run_w4a16_moe(
                 packed_route_count=packed_route_count,
                 expert_offsets=expert_offsets,
                 expert_counts=expert_counts,
+                launches=route_pack_launches,
                 stream=stream,
             )
         )
@@ -12941,6 +12930,7 @@ def run_w4a16_moe(
             full_rotation=full_rotation,
             coupled_hadamard=coupled_hadamard,
             rotation_input_dtype=rotation_input_dtype,
+            broadcast_suh=full_rotation and suh_gate_table.numel() == hidden_size,
             force_tile_config=prepared_tile_config,
             _require_cached=_w4a16_stream_is_capturing(
                 stream,
@@ -13191,7 +13181,8 @@ def run_w4a16_moe(
             int(stream),
         )
     elif (
-        _intermediate_rotation
+        fused_launch is not None
+        or _intermediate_rotation
         or weight_layout == "trellis_t256"
         or (mapped_direct and use_direct_topk_routes)
     ):
@@ -13315,6 +13306,7 @@ def run_w4a16_moe(
             rotation_input=_rc_a,
             suh_gate_table=suh_gate_table,
             suh_up_table=suh_up_table,
+            launcher=fused,
         )
     else:
         torch.ops.b12x.w4a16_fused_moe_launch(
@@ -13364,7 +13356,7 @@ def run_w4a16_moe(
                 "preplanned W4A16 top-k sum launch does not match requested contract: "
                 f"requested={expected_sum}, planned={actual_sum}"
             )
-    if full_rotation or sum_uses_map:
+    if topk_sum_launch is not None or full_rotation or sum_uses_map:
         if full_rotation:
             assert svh_table is not None
         _w4a16_topk_sum_launch_flat(
@@ -13382,6 +13374,7 @@ def run_w4a16_moe(
             route_expert_ids=topk_ids,
             expert_map=sum_expert_map if sum_uses_map else None,
             svh_table=svh_table if full_rotation else None,
+            launcher=topk_sum_launch,
         )
     else:
         torch.ops.b12x.w4a16_topk_sum_launch(

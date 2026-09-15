@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Benchmark the fused b12x mHC residual post_pre (Gram) kernel vs vLLM."""
+"""Benchmark native mHC post_pre, including the V4/V4.1 vLLM adapters."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import pathlib
 import statistics
 import sys
+import subprocess
+from contextlib import ExitStack
+from dataclasses import asdict
 
 import torch
 import torch.nn.functional as F
@@ -20,8 +25,13 @@ from benchmarks.common import (
     capture_cuda_graph,
     make_l2_flush_fn,
     require_sm120,
+    nvidia_smi_gpu_mode_snapshot,
 )
-from b12x.norm.mhc._impl import B12XMHCScratchCaps, plan_mhc_scratch, b12x_mhc_post_pre
+from b12x.norm import mhc
+from b12x.norm.mhc._impl import _b12x_mhc_post_pre_impl, b12x_mhc_post_pre
+from b12x.preparation import PreparationSession, PreparedCall, FrozenMapping
+from benchmarks.mhc_profiles import MODEL_PROFILES, load_mhc_profile
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 
 def _mhc_pre_reference(
@@ -34,6 +44,8 @@ def _mhc_pre_reference(
     hc_eps: float,
     sinkhorn_iters: int,
     y_dtype: torch.dtype | None = None,
+    pre_mix: torch.Tensor | None = None,
+    pre_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     flat = residual.flatten(1).float()
     mixes = F.linear(flat, fn) * torch.rsqrt(
@@ -47,7 +59,10 @@ def _mhc_pre_reference(
     for _ in range(sinkhorn_iters - 1):
         comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
-    y = (pre.unsqueeze(-1) * residual.float()).sum(dim=1)
+    if pre_out is not None:
+        pre_out.copy_(pre)
+    collapse_mix = pre if pre_mix is None else pre_mix
+    y = (collapse_mix.unsqueeze(-1) * residual.float()).sum(dim=1)
     y = y.to(residual.dtype if y_dtype is None else y_dtype)
     return y, post, comb
 
@@ -78,10 +93,11 @@ def _post_pre_reference(
     sinkhorn_iters: int,
     norm_weight: torch.Tensor | None,
     norm_eps: float,
+    pre_mix: torch.Tensor | None = None,
+    pre_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference for the fused post_pre. RMSNorm variance is taken in fp32 from
-    the collapsed activation (matching the Gram kernel and vLLM, which both
-    compute the norm in fp32 rather than from the bf16-rounded activation)."""
+    """V4 uses Gram variance before BF16 collapse rounding; V4.1's lagged
+    input mix is independent of this projection and RMSNorm follows rounding."""
     residual_out = _mhc_post_reference(x, residual, prev_post, prev_comb)
     y_raw_fp32, post, comb = _mhc_pre_reference(
         residual_out,
@@ -92,7 +108,11 @@ def _post_pre_reference(
         hc_eps=hc_eps,
         sinkhorn_iters=sinkhorn_iters,
         y_dtype=torch.float32,
+        pre_mix=pre_mix,
+        pre_out=pre_out,
     )
+    if pre_mix is not None:
+        y_raw_fp32 = y_raw_fp32.bfloat16().float()
     if norm_weight is not None:
         rms = torch.rsqrt(y_raw_fp32.square().mean(dim=-1, keepdim=True) + norm_eps)
         y = (
@@ -109,6 +129,7 @@ def _make_inputs(
     hidden_size: int,
     seed: int,
     device: torch.device,
+    weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
@@ -120,9 +141,12 @@ def _make_inputs(
         torch.randn((tokens, hidden_size), generator=gen, dtype=torch.float32).to(device)
         / 4
     ).to(torch.bfloat16)
-    fn = torch.randn((24, 4 * hidden_size), generator=gen, dtype=torch.float32).to(device) / 64
-    scale = torch.randn((3,), generator=gen, dtype=torch.float32).to(device) / 3
-    bias = torch.randn((24,), generator=gen, dtype=torch.float32).to(device) / 5
+    if weights is None:
+        fn = torch.randn((24, 4 * hidden_size), generator=gen, dtype=torch.float32).to(device) / 64
+        scale = torch.randn((3,), generator=gen, dtype=torch.float32).to(device) / 3
+        bias = torch.randn((24,), generator=gen, dtype=torch.float32).to(device) / 5
+    else:
+        fn, scale, bias = weights
     return residual.contiguous(), x.contiguous(), fn.contiguous(), scale.contiguous(), bias.contiguous()
 
 
@@ -131,14 +155,25 @@ def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, f
     return float(diff.abs().max().item()), float(torch.sqrt(torch.mean(diff * diff)).item())
 
 
-def _bench_graph(fn, *, warmup: int, iters: int, l2_flush) -> tuple[float, float]:
+def _bench_graph(fn, *, warmup: int, iters: int, l2_flush, samples_out=None, check=None) -> tuple[float, float]:
     graph = capture_cuda_graph(fn, warmup=warmup)
-    stats = bench_cuda_graph(graph, replays=iters, l2_flush=l2_flush)
-    samples = stats["replay_us"]
-    return statistics.median(samples), min(samples)
+    try:
+        graph.replay()
+        if check is not None:
+            check()
+        stats = bench_cuda_graph(graph, replays=iters, l2_flush=l2_flush)
+        samples = stats["replay_us"]
+        if check is not None:
+            check()
+        if samples_out is not None:
+            samples_out.extend(samples)
+        return statistics.median(samples), min(samples)
+
+    finally:
+        graph.reset()
 
 
-def _bench_eager(fn, *, warmup: int, iters: int, l2_flush) -> tuple[float, float]:
+def _bench_eager(fn, *, warmup: int, iters: int, l2_flush, samples_out=None, check=None) -> tuple[float, float]:
     samples = []
     for _ in range(warmup):
         if l2_flush is not None:
@@ -147,6 +182,10 @@ def _bench_eager(fn, *, warmup: int, iters: int, l2_flush) -> tuple[float, float
     torch.cuda.synchronize()
     for _ in range(iters):
         samples.append(bench_gpu_ms(fn, warmup=0, iters=1, l2_flush=l2_flush) * 1000.0)
+    if check is not None:
+        check()
+    if samples_out is not None:
+        samples_out.extend(samples)
     return statistics.median(samples), min(samples)
 
 
@@ -179,64 +218,76 @@ def _register_vllm_mhc_tilelang(vllm_path: pathlib.Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-profile", choices=["custom", *MODEL_PROFILES], default="custom")
+    parser.add_argument("--model-path", type=pathlib.Path)
+    parser.add_argument("--layer-idx", type=int, default=3)
     parser.add_argument("--tokens", type=int, default=1)
-    parser.add_argument("--hidden-size", type=int, default=4096)
-    parser.add_argument("--split-k", type=int, default=64)
+    parser.add_argument("--hidden-size", type=int)
+    parser.add_argument("--split-k", type=int)
     parser.add_argument("--block-k", type=int, default=256)
     parser.add_argument("--block-h", type=int, default=512)
-    parser.add_argument("--sinkhorn-iters", type=int, default=20)
-    parser.add_argument("--rms-eps", type=float, default=1e-6)
-    parser.add_argument("--hc-eps", type=float, default=1e-6)
+    parser.add_argument("--sinkhorn-iters", type=int)
+    parser.add_argument("--rms-eps", type=float)
+    parser.add_argument("--hc-eps", type=float)
+    parser.add_argument("--norm-eps", type=float)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--skip-check", action="store_true")
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
-    parser.add_argument("--fuse-rmsnorm", action="store_true")
-    parser.add_argument(
-        "--expected-m",
-        type=int,
-        default=None,
-        help=(
-            "Expected/capture M used for mHC dispatch policy. Live --tokens may "
-            "be smaller; scratch is sized for max(tokens, expected_m)."
-        ),
-    )
-    parser.add_argument(
-        "--prefill-bf16-mma",
-        action="store_true",
-        help="Enable native BF16 tensor-core prefill projection when TF32 is disabled.",
-    )
-    parser.add_argument(
-        "--prefill-tf32-mma",
-        action="store_true",
-        help="Enable native TF32 tensor-core prefill projection path.",
-    )
+    parser.add_argument("--fuse-rmsnorm", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--expected-m", type=int, help="Planned capture capacity; defaults to the live row count.")
+    parser.add_argument("--prefill-bf16-mma", action="store_true")
+    parser.add_argument("--prefill-tf32-mma", action="store_true")
     parser.add_argument("--no-prefill-tf32-mma", action="store_true")
-    parser.add_argument(
-        "--prefill-block-m",
-        action="store_true",
-        help="Enable the block-M scalar prefill projection path explicitly.",
-    )
+    parser.add_argument("--prefill-block-m", action="store_true")
     parser.add_argument("--no-prefill-block-m", action="store_true")
     parser.add_argument("--prefill-block-m-size", type=int, default=2)
     parser.add_argument("--prefill-tile-n", type=int, default=24)
-    parser.add_argument("--norm-eps", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=91_500)
-    parser.add_argument(
-        "--compare-vllm",
-        action="store_true",
-        help="Also benchmark vLLM's DeepSeek TileLang fused post_pre op.",
-    )
-    parser.add_argument(
-        "--vllm-path",
-        type=pathlib.Path,
-        default=pathlib.Path("~/projects/vllm"),
-        help="Path to the vLLM checkout used for --compare-vllm.",
-    )
+    parser.add_argument("--compare-vllm", action="store_true", help="Custom mode only: compare the TileLang implementation.")
+    parser.add_argument("--vllm-path", type=pathlib.Path, help="Checkout for the production adapters or TileLang comparison.")
+    parser.add_argument("--output", type=pathlib.Path, help="Write raw timing, correctness and source provenance JSON.")
     args = parser.parse_args()
+    with ExitStack() as stack:
+        _run_benchmark(args, stack)
+
+
+def _run_benchmark(args, stack: ExitStack) -> None:
+    bundle = None
+    if args.model_profile != "custom":
+        bundle = load_mhc_profile(args.model_profile, args.model_path, args.layer_idx)
+        if args.compare_vllm:
+            raise ValueError("Named profiles already run the production vLLM adapter; --compare-vllm is custom-only")
+        if args.fuse_rmsnorm is False:
+            raise ValueError("The vLLM mHC profiles include fused RMSNorm")
+        if args.prefill_bf16_mma and bundle.profile.lagged:
+            raise ValueError("V4.1's adapter retains native FP32 projection weights")
+    cfg = bundle.config if bundle is not None else {}
+    defaults = {
+        "hidden_size": cfg.get("hidden_size", 4096),
+        "sinkhorn_iters": cfg.get("hc_sinkhorn_iters", 20),
+        "rms_eps": cfg.get("rms_norm_eps", 1e-6),
+        "hc_eps": cfg.get("hc_eps", 1e-6),
+        "norm_eps": cfg.get("rms_norm_eps", 1e-6),
+        "fuse_rmsnorm": bundle is not None,
+    }
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+        elif bundle is not None and getattr(args, name) != value:
+            raise ValueError(f"--{name.replace('_', '-')} contradicts the checkpoint integration contract")
+    if args.tokens < 1 or args.iters < 1 or args.warmup < 1:
+        raise ValueError("tokens, iters, and warmup must be positive")
+    if args.expected_m is not None and args.expected_m < args.tokens:
+        raise ValueError("--expected-m must cover --tokens")
+    if bundle is not None and not bundle.profile.lagged and args.expected_m not in (None, args.tokens):
+        raise ValueError("The V4.0 adapter sets expected_m from its live tensor shape")
+    if args.vllm_path is None:
+        args.vllm_path = pathlib.Path("~/projects/vllm-hh-rebase" if bundle is not None else "~/projects/vllm")
+    args.vllm_path = args.vllm_path.expanduser().resolve()
     if args.no_prefill_tf32_mma:
         os.environ["B12X_MHC_PREFILL_TF32_MMA"] = "0"
     elif args.prefill_tf32_mma:
@@ -247,405 +298,233 @@ def main() -> None:
         os.environ["B12X_MHC_PREFILL_BLOCK_M"] = "0"
     elif args.prefill_block_m:
         os.environ["B12X_MHC_PREFILL_BLOCK_M"] = "1"
-    if args.prefill_block_m or not args.no_prefill_block_m:
+    if args.prefill_block_m or (bundle is None and not args.no_prefill_block_m):
         os.environ["B12X_MHC_PREFILL_BLOCK_M_SIZE"] = str(args.prefill_block_m_size)
         os.environ["B12X_MHC_PREFILL_TILE_N"] = str(args.prefill_tile_n)
-    prefill_tf32_enabled = (
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_MMA",
-            os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1"),
-        )
-        != "0"
-    )
-    prefill_policy_m = args.expected_m or args.tokens
-    prefill_tf32_min_tokens = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_MIN_TOKENS",
-            os.environ.get("B12X_MHC_PREFILL_BF16_MIN_TOKENS", "384"),
-        )
-    )
-    prefill_tf32_selected = (
-        args.fuse_rmsnorm
-        and prefill_policy_m >= prefill_tf32_min_tokens
-        and prefill_tf32_enabled
-    )
-    prefill_bf16_enabled = os.environ.get("B12X_MHC_PREFILL_BF16_MMA", "1") != "0"
-    prefill_block_m_enabled = os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
-    prefill_gram_threads = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_GRAM_THREADS",
-            os.environ.get("B12X_MHC_PREFILL_THREADS", "1024"),
-        )
-    )
-    prefill_finalize_threads = int(
-        os.environ.get("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
-    )
-    prefill_tf32_tma_m_warps = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_M_WARPS",
-            os.environ.get(
-                "B12X_MHC_PREFILL_TF32_TMA_WARPS",
-                os.environ.get("B12X_MHC_PREFILL_TMA_WARPS", "1"),
-            ),
-        )
-    )
-    prefill_tf32_tma_n_warps = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1")
-    )
-    prefill_tf32_tma_m = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_TILE_M",
-            os.environ.get("B12X_MHC_PREFILL_TMA_TILE_M", "16"),
-        )
-    )
-    prefill_tf32_tma_n = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8")
-    )
-    prefill_tf32_tma_k = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_TILE_K",
-            os.environ.get("B12X_MHC_PREFILL_TMA_TILE_K", "256"),
-        )
-    )
-    prefill_tf32_tma_stages = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_STAGES",
-            os.environ.get("B12X_MHC_PREFILL_TMA_STAGES", "1"),
-        )
-    )
-    prefill_tf32_tma_chunk_min_tokens = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
-    )
-    prefill_tf32_tma_chunk_geometry = (
-        args.tokens >= prefill_tf32_tma_chunk_min_tokens
-    )
-    prefill_tf32_tma_long_min_tokens = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_MIN_TOKENS", "8192")
-    )
-    prefill_tf32_tma_long_geometry = (
-        args.hidden_size == 4096
-        and args.tokens >= prefill_tf32_tma_long_min_tokens
-    )
-    prefill_tf32_tma_k_splits = 1
-    if prefill_tf32_tma_chunk_geometry:
-        if args.hidden_size == 4096:
-            prefill_tf32_tma_m_warps = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "12")
-            )
-            prefill_tf32_tma_n_warps = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
-                )
-            )
-            prefill_tf32_tma_m = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "192")
-            )
-            prefill_tf32_tma_n = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "24"),
-                )
-            )
-            prefill_tf32_tma_k_splits = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_K_SPLITS", "8"
-                )
-            )
-            prefill_tf32_tma_k = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_K",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_K", "64"),
-                )
-            )
-            prefill_tf32_tma_stages = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_STAGES",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_STAGES", "2"),
-                )
-            )
-        else:
-            prefill_tf32_tma_m_warps = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
-            )
-            prefill_tf32_tma_n_warps = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
-                )
-            )
-            prefill_tf32_tma_m = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
-            )
-            prefill_tf32_tma_n = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"),
-                )
-            )
-    if prefill_tf32_tma_long_geometry:
-        prefill_tf32_tma_m_warps = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_M_WARPS", "8")
-        )
-        prefill_tf32_tma_n_warps = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_N_WARPS", "1")
-        )
-        prefill_tf32_tma_m = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_M", "128")
-        )
-        prefill_tf32_tma_n = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_N", "24")
-        )
-        prefill_tf32_tma_k = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_K", "64")
-        )
-        prefill_tf32_tma_stages = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_STAGES", "2")
-        )
-        prefill_tf32_tma_k_splits = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
-        )
 
     device = require_sm120()
-    if args.compare_vllm:
-        _register_vllm_mhc_tilelang(args.vllm_path)
-
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    stack.callback(setattr, torch.backends.cuda.matmul, "allow_tf32", previous_tf32)
+    tensors = (
+        {name: tensor.to(device=device).contiguous() for name, tensor in bundle.tensors.items()}
+        if bundle is not None else {}
+    )
     residual, x, fn, scale, bias = _make_inputs(
-        tokens=args.tokens,
-        hidden_size=args.hidden_size,
-        seed=args.seed,
-        device=device,
+        tokens=args.tokens, hidden_size=args.hidden_size, seed=args.seed, device=device,
+        weights=(tensors["fn"], tensors["scale"], tensors["bias"]) if tensors else None,
     )
-    fn_bf16 = fn.to(torch.bfloat16).contiguous() if args.prefill_bf16_mma else None
-    scratch_tokens = max(args.tokens, args.expected_m or args.tokens)
-    fused_plan = plan_mhc_scratch(
-        B12XMHCScratchCaps(
-            device=device,
-            max_tokens=scratch_tokens,
-            hidden_size=args.hidden_size,
-            split_k=args.split_k,
-        )
-    )
-    planned_config = fused_plan.config
-    prefill_tf32_selected = (
-        args.fuse_rmsnorm and planned_config.backend == "tf32_tma"
-    )
-    prefill_tf32_tma_m = planned_config.projection_tile_m
-    prefill_tf32_tma_n = planned_config.projection_tile_n
-    prefill_tf32_tma_k = planned_config.projection_tile_k
-    prefill_tf32_tma_stages = planned_config.projection_num_stages
-    prefill_tf32_tma_m_warps = planned_config.projection_num_m_warps
-    prefill_tf32_tma_n_warps = planned_config.projection_num_n_warps
-    prefill_tf32_tma_k_splits = planned_config.projection_k_splits
-    prefill_tf32_tma_chunk_geometry = (
-        prefill_tf32_tma_m == 192 and prefill_tf32_tma_k_splits == 8
-    )
-    prefill_tf32_tma_long_geometry = (
-        prefill_tf32_tma_m == 128 and prefill_tf32_tma_k_splits == 4
-    )
-    fused_scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=device)
-        for shape, dtype in fused_plan.shapes_and_dtypes()
-    )
-    fused_y = torch.empty((args.tokens, args.hidden_size), dtype=torch.bfloat16, device=device)
-    fused_post = torch.empty((args.tokens, 4), dtype=torch.float32, device=device)
-    fused_comb = torch.empty((args.tokens, 4, 4), dtype=torch.float32, device=device)
-    fused_out = torch.empty((args.tokens, 4, args.hidden_size), dtype=torch.bfloat16, device=device)
-    fused_binding = fused_plan.bind(
-        scratch=fused_scratch,
-        tokens=args.tokens,
-        expected_m=args.expected_m,
-        y=fused_y,
-        post=fused_post,
-        comb=fused_comb,
-        out=fused_out,
-    )
+    lagged = bundle is not None and bundle.profile.lagged
+    pre_mix = torch.empty((args.tokens, 4), dtype=torch.float32, device=device) if lagged else None
     _, prev_post, prev_comb = _mhc_pre_reference(
-        residual,
-        fn,
-        scale,
-        bias,
-        rms_eps=args.rms_eps,
-        hc_eps=args.hc_eps,
-        sinkhorn_iters=args.sinkhorn_iters,
+        residual, tensors.get("prev_fn", fn), tensors.get("prev_scale", scale),
+        tensors.get("prev_bias", bias), rms_eps=args.rms_eps, hc_eps=args.hc_eps,
+        sinkhorn_iters=args.sinkhorn_iters, pre_out=pre_mix,
     )
-    prev_post = prev_post.contiguous()
-    prev_comb = prev_comb.contiguous()
-    norm_weight = None
-    if args.fuse_rmsnorm:
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(args.seed + 17)
-        norm_weight = (
-            torch.randn((args.hidden_size,), generator=gen, dtype=torch.float32)
-            .to(device)
-            .to(torch.bfloat16)
-            .contiguous()
+    prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
+    norm_weight = tensors.get("norm_weight")
+    if args.fuse_rmsnorm and norm_weight is None:
+        generator = torch.Generator(device="cpu").manual_seed(args.seed + 17)
+        norm_weight = torch.randn(args.hidden_size, generator=generator).to(device=device, dtype=torch.bfloat16)
+    fn_bf16 = (
+        fn.bfloat16().contiguous()
+        if args.prefill_bf16_mma or (bundle is not None and not lagged) else None
+    )
+    fused_out = fused_post = fused_comb = fused_y = fused_pre = None
+    runner = None
+    planned_config = None
+    session = None
+    if bundle is not None:
+        from benchmarks.vllm_mhc import vllm_mhc_runner
+
+        capture_sizes = (
+            (args.expected_m,) if args.expected_m is not None
+            else tuple(sorted({1, 2, 4, 8, args.tokens}))
+        )
+        runner = stack.enter_context(vllm_mhc_runner(
+            args.vllm_path, profile_name=args.model_profile, model_config=cfg,
+            capture_sizes=capture_sizes,
+        ))
+        # The integration owns the split and capture-capacity decisions.
+        required_split = 4 * args.hidden_size // args.block_k
+        if args.split_k is not None and args.split_k != required_split:
+            raise ValueError("--split-k contradicts the vLLM mHC integration")
+        if args.block_k != 256 or args.block_h != 512:
+            raise ValueError("Named profiles use the integration's block_k=256/block_h=512")
+        args.split_k = required_split
+    else:
+        if args.compare_vllm:
+            _register_vllm_mhc_tilelang(args.vllm_path)
+        caps = mhc.Caps(
+            device=device, max_tokens=max(args.tokens, args.expected_m or args.tokens),
+            hidden_size=args.hidden_size, split_k=args.split_k,
+        )
+        fused_plan = mhc.plan(caps, invocation=FrozenMapping({
+            "operation": "post_pre", "output_mode": "provided",
+            "has_norm_weight": norm_weight is not None,
+            "norm_weight_dtype": "bfloat16" if norm_weight is None else str(norm_weight.dtype).removeprefix("torch."),
+            "has_fn_bf16": fn_bf16 is not None, "rms_eps": args.rms_eps,
+            "hc_eps": args.hc_eps, "sinkhorn_iters": args.sinkhorn_iters, "norm_eps": args.norm_eps,
+            "block_k": args.block_k, "block_h": args.block_h,
+        }))
+        args.split_k = caps.split_k
+        session = stack.enter_context(PreparationSession(device=device, autotune=False, compile_workers=2))
+
+        def prime(state):
+            (spec,) = state.scratch_specs()
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            binding = state.bind(
+                scratch=scratch, tokens=args.tokens, expected_m=args.expected_m,
+                y=torch.empty_like(x), post=torch.empty_like(prev_post),
+                comb=torch.empty_like(prev_comb), out=torch.empty_like(residual),
+            )
+            return PreparedCall(run=lambda: _b12x_mhc_post_pre_impl(
+                x, residual, prev_post, prev_comb, fn, scale, bias,
+                rms_eps=args.rms_eps, hc_eps=args.hc_eps, sinkhorn_iters=args.sinkhorn_iters,
+                norm_weight=norm_weight, norm_eps=args.norm_eps, fn_bf16=fn_bf16,
+                binding=binding, _state=state,
+            ), owners=(scratch, binding))
+
+        session.prepare((fused_plan.request(name="residual-mhc", prepare_call=prime),))
+        planned_config = fused_plan.prepared.state.config
+        fused_scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                              for spec in fused_plan.scratch_specs())
+        fused_y = torch.empty((args.tokens, args.hidden_size), dtype=torch.bfloat16, device=device)
+        fused_post = torch.empty((args.tokens, 4), dtype=torch.float32, device=device)
+        fused_comb = torch.empty((args.tokens, 4, 4), dtype=torch.float32, device=device)
+        fused_out = torch.empty((args.tokens, 4, args.hidden_size), dtype=torch.bfloat16, device=device)
+        fused_binding = mhc.bind(fused_plan,
+            scratch=fused_scratch, tokens=args.tokens, expected_m=args.expected_m,
+            y=fused_y, post=fused_post, comb=fused_comb, out=fused_out,
         )
 
-    def run_fused() -> None:
-        b12x_mhc_post_pre(
-            x,
-            residual,
-            prev_post,
-            prev_comb,
-            fn,
-            scale,
-            bias,
-            rms_eps=args.rms_eps,
-            hc_eps=args.hc_eps,
-            sinkhorn_iters=args.sinkhorn_iters,
-            norm_weight=norm_weight,
-            norm_eps=args.norm_eps,
-            fn_bf16=fn_bf16,
-            binding=fused_binding,
-            split_k=args.split_k,
-            block_k=args.block_k,
-            block_h=args.block_h,
-        )
+    def run_fused():
+        nonlocal fused_out, fused_post, fused_comb, fused_y, fused_pre
+        if runner is not None:
+            fused_out, fused_post, fused_comb, fused_y, fused_pre = runner.run(
+                x, residual, prev_post, prev_comb, fn, scale, bias, norm_weight,
+                pre_mix=pre_mix, fn_bf16=fn_bf16,
+            )
+        else:
+            b12x_mhc_post_pre(
+                x, residual, prev_post, prev_comb, fn, scale, bias,
+                rms_eps=args.rms_eps, hc_eps=args.hc_eps, sinkhorn_iters=args.sinkhorn_iters,
+                norm_weight=norm_weight, norm_eps=args.norm_eps, fn_bf16=fn_bf16,
+                binding=fused_binding,
+            )
 
     vllm_out = vllm_post = vllm_comb = vllm_y = None
 
-    def run_vllm_fused() -> None:
+    def run_vllm_fused():
         nonlocal vllm_out, vllm_post, vllm_comb, vllm_y
         vllm_out, vllm_post, vllm_comb, vllm_y = torch.ops.vllm.mhc_fused_post_pre_tilelang(
-            x,
-            residual,
-            prev_post,
-            prev_comb,
-            fn,
-            scale,
-            bias,
-            args.rms_eps,
-            args.hc_eps,
-            args.hc_eps,
-            2.0,
-            args.sinkhorn_iters,
-            1,
-            1,
-            norm_weight,
-            args.norm_eps if norm_weight is not None else 0.0,
+            x, residual, prev_post, prev_comb, fn, scale, bias,
+            args.rms_eps, args.hc_eps, args.hc_eps, 2.0, args.sinkhorn_iters, 1, 1,
+            norm_weight, args.norm_eps if norm_weight is not None else 0.0,
         )
 
     run_fused()
     if args.compare_vllm:
         run_vllm_fused()
     torch.cuda.synchronize()
-
+    errors = {}
+    expected_pre = torch.empty_like(pre_mix) if pre_mix is not None else None
+    expected = None
     if not args.skip_check:
-        out_ref, y_ref, post_ref, comb_ref = _post_pre_reference(
-            x,
-            residual,
-            prev_post,
-            prev_comb,
-            fn,
-            scale,
-            bias,
-            rms_eps=args.rms_eps,
-            hc_eps=args.hc_eps,
-            sinkhorn_iters=args.sinkhorn_iters,
-            norm_weight=norm_weight,
-            norm_eps=args.norm_eps,
+        expected = _post_pre_reference(
+            x, residual, prev_post, prev_comb, fn, scale, bias,
+            rms_eps=args.rms_eps, hc_eps=args.hc_eps, sinkhorn_iters=args.sinkhorn_iters,
+            norm_weight=norm_weight, norm_eps=args.norm_eps, pre_mix=pre_mix, pre_out=expected_pre,
         )
-        fused_y_max, fused_y_rmse = _error_stats(fused_y, y_ref)
-        fused_post_max, _ = _error_stats(fused_post, post_ref)
-        fused_comb_max, _ = _error_stats(fused_comb, comb_ref)
-        fused_out_max, fused_out_rmse = _error_stats(fused_out, out_ref)
-        if args.prefill_bf16_mma:
-            assert fn_bf16 is not None
-            _, y_ref_bf16, post_ref_bf16, comb_ref_bf16 = _post_pre_reference(
-                x,
-                residual,
-                prev_post,
-                prev_comb,
-                fn_bf16.float(),
-                scale,
-                bias,
-                rms_eps=args.rms_eps,
-                hc_eps=args.hc_eps,
-                sinkhorn_iters=args.sinkhorn_iters,
-                norm_weight=norm_weight,
-                norm_eps=args.norm_eps,
-            )
-            bf16ref_y_max, bf16ref_y_rmse = _error_stats(fused_y, y_ref_bf16)
-            bf16ref_post_max, _ = _error_stats(fused_post, post_ref_bf16)
-            bf16ref_comb_max, _ = _error_stats(fused_comb, comb_ref_bf16)
-        else:
-            bf16ref_y_max = bf16ref_y_rmse = float("nan")
-            bf16ref_post_max = bf16ref_comb_max = float("nan")
-        if args.compare_vllm:
-            assert vllm_out is not None and vllm_post is not None
-            assert vllm_comb is not None and vllm_y is not None
-            vllm_y_max, vllm_y_rmse = _error_stats(vllm_y, y_ref)
-            vllm_post_max, _ = _error_stats(vllm_post.squeeze(-1), post_ref)
-            vllm_comb_max, _ = _error_stats(vllm_comb, comb_ref)
-            vllm_out_max, vllm_out_rmse = _error_stats(vllm_out, out_ref)
-        else:
-            vllm_y_max = vllm_y_rmse = vllm_post_max = vllm_comb_max = float("nan")
-            vllm_out_max = vllm_out_rmse = float("nan")
-    else:
-        fused_y_max = fused_y_rmse = fused_post_max = fused_comb_max = float("nan")
-        fused_out_max = fused_out_rmse = float("nan")
-        bf16ref_y_max = bf16ref_y_rmse = float("nan")
-        bf16ref_post_max = bf16ref_comb_max = float("nan")
-        vllm_y_max = vllm_y_rmse = vllm_post_max = vllm_comb_max = float("nan")
-        vllm_out_max = vllm_out_rmse = float("nan")
 
+    def check():
+        if expected is None:
+            return
+        out_ref, y_ref, post_ref, comb_ref = expected
+        pairs = {
+            "out": (fused_out, out_ref), "y": (fused_y, y_ref),
+            "post": (fused_post, post_ref), "comb": (fused_comb, comb_ref),
+        }
+        if expected_pre is not None:
+            pairs["pre"] = (fused_pre, expected_pre)
+        for name, (actual, reference) in pairs.items():
+            errors[name] = dict(zip(("max_abs", "rmse"), _error_stats(actual, reference), strict=True))
+            if bundle is not None:
+                torch.testing.assert_close(
+                    actual, reference, rtol=.01 if actual.dtype == torch.bfloat16 else 2e-5,
+                    atol=.008 if actual.dtype == torch.bfloat16 else 4e-5,
+                )
+                if not torch.isfinite(actual).all():
+                    raise AssertionError(f"nonfinite mHC {name}")
+                if reference.count_nonzero() and not actual.count_nonzero():
+                    raise AssertionError(f"zero mHC {name} for nonzero reference")
+
+    check()
+    if runner is not None:
+        runner.lock_workspace()
+    if session is not None:
+        session.freeze()
+    else:
+        stack.enter_context(kernel_resolution_guard("mHC benchmark capture and replay"))
     l2_flush = make_l2_flush_fn(args.l2_flush, args.l2_flush_bytes)
+    samples = []
+    gpu_before = nvidia_smi_gpu_mode_snapshot() if args.output else None
     bench = _bench_eager if args.eager else _bench_graph
     fused_median, fused_min = bench(
-        run_fused, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush
+        run_fused, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush,
+        samples_out=samples, check=check,
     )
+    vllm_median = vllm_min = None
     if args.compare_vllm:
         vllm_median, vllm_min = bench(
-            run_vllm_fused, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush
+            run_vllm_fused, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush,
         )
-    else:
-        vllm_median = vllm_min = float("nan")
     mode = "eager" if args.eager else "graph"
-
-    line = (
-        "residual_mhc "
-        f"mode={mode} tokens={args.tokens} expected_m={args.expected_m} "
-        f"hidden={args.hidden_size} "
-        f"split_k={args.split_k} block_k={args.block_k} block_h={args.block_h} "
-        f"fused_rmsnorm={args.fuse_rmsnorm} "
-        f"prefill_tf32_mma={prefill_tf32_enabled} "
-        f"prefill_tf32_selected={prefill_tf32_selected} "
-        f"prefill_backend={planned_config.backend} "
-        f"prefill_tf32_tma=m{prefill_tf32_tma_m}n{prefill_tf32_tma_n}"
-        f"k{prefill_tf32_tma_k}s{prefill_tf32_tma_stages}"
-        f"wm{prefill_tf32_tma_m_warps}wn{prefill_tf32_tma_n_warps} "
-        f"prefill_tf32_m192_geometry={prefill_tf32_tma_chunk_geometry} "
-        f"prefill_tf32_m128_geometry={prefill_tf32_tma_long_geometry} "
-        f"prefill_tf32_k_splits={prefill_tf32_tma_k_splits} "
-        f"prefill_gram_threads={prefill_gram_threads} "
-        f"prefill_finalize_threads={prefill_finalize_threads} "
-        f"prefill_bf16_mma={prefill_bf16_enabled} "
-        f"prefill_block_m={prefill_block_m_enabled} "
-        f"prefill_block_m_size={args.prefill_block_m_size} "
-        f"prefill_tile_n={args.prefill_tile_n} "
-        f"post_pre_us={fused_median:.2f}/{fused_min:.2f} "
-        f"fused_y_max={fused_y_max:.3g} fused_y_rmse={fused_y_rmse:.3g} "
-        f"fused_post_max={fused_post_max:.3g} fused_comb_max={fused_comb_max:.3g} "
-        f"fused_out_max={fused_out_max:.3g} fused_out_rmse={fused_out_rmse:.3g}"
+    print(
+        f"residual_mhc profile={args.model_profile} mode={mode} tokens={args.tokens} "
+        f"hidden={args.hidden_size} split_k={args.split_k} fused_rmsnorm={args.fuse_rmsnorm} "
+        f"lagged={lagged} "
+        f"layer={args.layer_idx} boundary=attn_post_ffn_pre "
+        f"post_pre_us={fused_median:.2f}/{fused_min:.2f} errors={json.dumps(errors, sort_keys=True)}"
     )
-    if args.prefill_bf16_mma:
-        line += (
-            f" bf16ref_y_max={bf16ref_y_max:.3g} "
-            f"bf16ref_y_rmse={bf16ref_y_rmse:.3g} "
-            f"bf16ref_post_max={bf16ref_post_max:.3g} "
-            f"bf16ref_comb_max={bf16ref_comb_max:.3g}"
-        )
-    if args.compare_vllm:
-        line += (
-            " vllm_deep_gemm=True"
-            f" vllm_post_pre_us={vllm_median:.2f}/{vllm_min:.2f} "
-            f"b12x_vs_vllm={vllm_median / fused_median:.3f}x "
-            f"vllm_y_max={vllm_y_max:.3g} vllm_y_rmse={vllm_y_rmse:.3g} "
-            f"vllm_post_max={vllm_post_max:.3g} vllm_comb_max={vllm_comb_max:.3g} "
-            f"vllm_out_max={vllm_out_max:.3g} vllm_out_rmse={vllm_out_rmse:.3g}"
-        )
-    print(line)
+    if vllm_median is not None:
+        print(f"vllm_post_pre_us={vllm_median:.2f}/{vllm_min:.2f} b12x_vs_vllm={vllm_median/fused_median:.3f}x")
+    if args.output:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        source_paths = [
+            pathlib.Path(__file__), root / "benchmarks/mhc_profiles.py",
+            root / "benchmarks/vllm_mhc.py", root / "benchmarks/common.py",
+            *(root / "b12x/norm/mhc").glob("*.py"),
+        ]
+        if runner is not None:
+            source_paths.extend(runner.integration_files)
+        result = {
+            "command": [sys.executable, *sys.argv], "worktree": str(root),
+            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+            "profile": args.model_profile, "model_path": str(bundle.model_path) if bundle else None,
+            "layer_idx": args.layer_idx, "boundary": "attention post + FFN pre + RMSNorm",
+            "tokens": args.tokens, "hidden_size": args.hidden_size, "lagged": lagged,
+            "input_dtype": str(residual.dtype), "fn_dtype": str(fn.dtype),
+            "fused_rmsnorm": args.fuse_rmsnorm,
+            "rms_eps": args.rms_eps, "norm_eps": args.norm_eps, "hc_eps": args.hc_eps,
+            "sinkhorn_iters": args.sinkhorn_iters, "split_k": args.split_k,
+            "timing_mode": mode, "l2_flush": args.l2_flush, "warmup": args.warmup,
+            "samples_us": samples, "median_us": fused_median, "min_us": fused_min,
+            "correctness": (
+                "unchecked" if args.skip_check else
+                "oracle and replay checked" if bundle is not None else "oracle metrics only"
+            ),
+            "errors": errors, "gpu_before": gpu_before, "gpu_after": nvidia_smi_gpu_mode_snapshot(),
+            "config": asdict(planned_config) if planned_config is not None else None,
+            "integration": runner.provenance if runner is not None else None,
+            "weight_sha256": {
+                name: hashlib.sha256(tensor.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+                for name, tensor in bundle.tensors.items()
+            } if bundle is not None else None,
+            "source_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths},
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 
 if __name__ == "__main__":

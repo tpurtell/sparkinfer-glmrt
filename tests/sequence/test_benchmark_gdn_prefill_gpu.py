@@ -1,14 +1,34 @@
 """GPU checks for the FlashInfer race's raw-projection preparation boundary."""
 
+import importlib.util
+import subprocess
+import sys
+
 import pytest
 import torch
 
-from b12x.policy.generation.delta_prefill_cases import PrefillCase, assert_close, make_inputs, oracle
+from b12x.testing.delta_prefill_cases import PrefillCase, assert_close, make_inputs, oracle
 from ..conftest import require_b12x
 
 
 @pytest.mark.parametrize("use_cp", ["auto", False])
 def test_scalar_gate_preparation_retains_small_softplus(use_cp):
+    require_b12x()
+    if importlib.util.find_spec("flashinfer") is None:
+        pytest.skip("FlashInfer is not installed")
+    # FlashInfer imports retarget Triton's assembler without invalidating its
+    # cached version. Keep that process-global compiler state out of this runner.
+    result = subprocess.run(
+        [sys.executable, "-c", (
+            "from tests.sequence.test_benchmark_gdn_prefill_gpu import _check_scalar_gate_preparation; "
+            f"_check_scalar_gate_preparation({use_cp!r})"
+        )],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, f"FlashInfer GPU check failed\n{result.stdout}\n{result.stderr}"
+
+
+def _check_scalar_gate_preparation(use_cp):
     pytest.importorskip("flashinfer")
     from benchmarks._gdn_prefill_flashinfer import FlashInferArm
 

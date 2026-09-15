@@ -1,4 +1,4 @@
-"""Shared final tensor allocations using PyTorch's CUDA caching allocator."""
+"""Owned final weight allocations using PyTorch's CUDA caching allocator."""
 
 from __future__ import annotations
 
@@ -11,8 +11,18 @@ _allocators = {}
 _lock = threading.RLock()
 
 
+def weight_allocation(device=0):
+    """Use coherent managed weights when CPU I/O can access GPU host page tables."""
+    caps = load().capabilities(device)
+    return (
+        "managed"
+        if caps["pageable_memory_access"] and caps["host_page_tables"]
+        else "device"
+    )
+
+
 class WeightPool:
-    """Activate shared storage only around an explicit weight factory."""
+    """Activate owned storage only around an explicit weight factory."""
 
     def __init__(self, pool, device):
         self.pool = pool
@@ -41,7 +51,7 @@ class WeightPool:
 
 @contextlib.contextmanager
 def weight_pool(*, allocation="registered", device=0):
-    """Own a shared pool without changing the default CUDA allocation policy.
+    """Own a weight pool without changing the default CUDA allocation policy.
 
     PyTorch retains its normal tensor types, suballocator and stream tracking.
     Only use during exclusive model construction/loading, before graph capture.
@@ -51,17 +61,21 @@ def weight_pool(*, allocation="registered", device=0):
     """
     import torch
 
-    if allocation not in ("registered", "pinned", "pinned_wc", "managed"):
+    if allocation not in ("registered", "pinned", "pinned_wc", "managed", "device"):
         raise ValueError(
-            "shared pools support registered, pinned, pinned_wc or managed storage"
+            "weight pools support registered, pinned, pinned_wc, managed or device storage"
         )
     torch.cuda.init()
     native = load()
     caps = native.capabilities(device)
-    if not (caps["pageable_memory_access"] and caps["host_page_tables"]):
-        raise RuntimeError("the initial b12x loader requires GPU host page tables")
+    if allocation != "device" and not (
+        caps["pageable_memory_access"] and caps["host_page_tables"]
+    ):
+        raise RuntimeError(
+            "shared weight storage requires GPU host page tables; use device storage with GDS"
+        )
     if torch.cuda.get_allocator_backend() != "native":
-        raise RuntimeError("b12x shared pools require PyTorch's native CUDA allocator")
+        raise RuntimeError("b12x weight pools require PyTorch's native CUDA allocator")
     with _lock:
         key = (device, allocation)
         if key not in _allocators:
@@ -101,7 +115,7 @@ def owns_tensor(tensor):
 
 
 def owns_storage(tensor):
-    """Whether a tensor's backing storage belongs to the shared weight pool."""
+    """Whether a tensor's backing storage belongs to an owned weight pool."""
     if not tensor.is_cuda:
         return False
     storage = tensor.untyped_storage()

@@ -10,13 +10,17 @@ from ._contracts import (
     Plan,
     QuantMode,
     TableMemory,
+    TableLayout,
+    storage_layout,
     bind,
     plan,
     run,
 )
 from ._disk import DiskTable
 from ._storage import TableStorage, allocate_storage
-from ._policy import PleEmbeddingConfig, PleEmbeddingQuery
+from ._tuning import PleEmbeddingConfig, PleEmbeddingQuery
+from ._preparation import invocation_from_tensors
+from b12x.sequence.ple_hash.geometry import Geometry, GeometryTensors, compute_geometry, allocate_geometry
 
 
 def is_supported(device=None) -> bool:
@@ -31,6 +35,13 @@ __all__ = [
     "DiskTable",
     "Caps",
     "Plan",
+    "TableLayout",
+    "storage_layout",
+    "Geometry",
+    "GeometryTensors",
+    "compute_geometry",
+    "allocate_geometry",
+    "invocation_from_tensors",
     "Binding",
     "PleEmbeddingConfig",
     "PleEmbeddingQuery",

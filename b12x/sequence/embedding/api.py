@@ -3,7 +3,10 @@ import torch
 
 from ..._lib.gating import default_is_supported
 from . import META
-from ._kernel import _compile, launch
+from b12x.preparation import Plan
+from b12x.preparation.types import plan_from_handle, require_prepared
+from ._preparation import plan, query_from_call
+from ._tuning import EmbeddingQuery
 
 
 def _check_weight(weight):
@@ -15,8 +18,7 @@ def _check_weight(weight):
         raise ValueError("embedding weight must have contiguous nonoverlapping rows")
 
 
-@torch.library.custom_op("b12x::embedding_out", mutates_args=("out",))
-def _embedding_out(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor,
+def _check_tensors(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor,
                    num_rows: torch.Tensor | None = None) -> None:
     _check_weight(weight)
     if ids.dtype not in (torch.int32, torch.int64) or not ids.is_contiguous():
@@ -37,42 +39,30 @@ def _embedding_out(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor,
             raise ValueError("device-count lookup requires positive output capacity")
         if torch._C._overlaps(out, num_rows):
             raise ValueError("embedding output must not alias num_rows")
-    launch(weight, ids, out, num_rows)
+
+
+@torch.library.custom_op("b12x::embedding_out", mutates_args=("out",))
+def _embedding_out(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor,
+                   plan_handle: int, num_rows: torch.Tensor | None = None) -> None:
+    require_prepared(plan_from_handle(plan_handle), "sequence.embedding", weight.device).run(
+        weight, ids, out=out, num_rows=num_rows,
+    )
 
 
 @_embedding_out.register_fake
-def _embedding_out_fake(weight, ids, out, num_rows=None):
+def _embedding_out_fake(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor,
+                        plan_handle: int, num_rows: torch.Tensor | None = None) -> None:
     return None
 
 
-def run(weight, ids, *, out, num_rows=None):
-    """Copy exact rows into caller-owned ``out``; preserve the weight dtype.
+def run(weight, ids, *, out, plan: Plan, num_rows=None):
+    """Copy exact rows into caller storage through the prepared embedding kernel.
 
-    IDs may have any contiguous shape (including a scalar). The output shape
-    is ``(*ids.shape, weight.shape[1])``. A strided table is allowed when each
-    row is contiguous. ``num_rows`` optionally supplies a device Int32 live
-    count bounded by ``ids.numel()``; only that flattened prefix is written,
-    leaving inactive output/IDs untouched. IDs and counts can change in graph
-    replay. Invalid live IDs or counts trap on the device, never read outside
-    the table or silently return zeros. CUDA errors surface asynchronously.
+    IDs and the optional device live count remain dynamic during graph replay.
+    Only live rows are written. Invalid live IDs or counts trap on the device.
     """
-    _embedding_out(weight, ids, out, num_rows)
+    _embedding_out(weight, ids, out, plan.handle, num_rows)
     return out
-
-
-def precompile(weight, *, id_dtype=torch.int64):
-    """Compile and warm one width/type specialization after loading, before capture."""
-    _check_weight(weight)
-    if id_dtype not in (torch.int32, torch.int64):
-        raise TypeError("embedding IDs must be Int32 or Int64")
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("embedding precompile must run before CUDA graph capture")
-    _compile(weight.shape[1], weight.dtype, id_dtype, weight.device.index)
-    ids = torch.zeros(1, dtype=id_dtype, device=weight.device)
-    out = torch.empty((1, weight.shape[1]), dtype=weight.dtype, device=weight.device)
-    # A zero live count warms the module without reading an empty/unloaded row.
-    count = torch.zeros((), dtype=torch.int32, device=weight.device)
-    run(weight, ids, out=out, num_rows=count)
 
 
 def is_supported(device=None):
@@ -80,4 +70,5 @@ def is_supported(device=None):
 
 
 def clear_caches():
-    _compile.cache_clear()
+    from ._kernel import compile_embedding
+    compile_embedding.cache_clear()

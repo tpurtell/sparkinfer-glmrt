@@ -16,7 +16,8 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession
+from benchmarks.attention_preparation import prepare_mxfp4
 from b12x.attention import dsa_indexer as indexer
 from benchmarks.common import nvidia_smi_gpu_mode_snapshot
 from benchmarks.benchmark_v41_serving import repository_state
@@ -97,9 +98,6 @@ def run_mode(args, candidates_mode):
     _, _, decoded_k = quantized_reference(keys)
     packed = torch.empty_like(q_reference)
     scales = torch.empty_like(sf_reference)
-    indexer.quantize_q_mxfp4(q, q_mxfp4=packed, q_scales=scales)
-    torch.testing.assert_close(packed, q_reference, rtol=0, atol=0)
-    torch.testing.assert_close(scales, sf_reference, rtol=0, atol=0)
     page_bytes = indexer.index_mxfp4_page_bytes(args.page_size)
     if args.page_stride < page_bytes or args.page_stride % 16:
         raise ValueError(
@@ -120,9 +118,6 @@ def run_mode(args, candidates_mode):
     slots = (
         physical_pages[positions // args.page_size].long() * args.page_size
         + positions % args.page_size
-    )
-    indexer.quantize_write_index_k_mxfp4(
-        keys, index_k_cache=pool, slot_mapping=slots, page_size=args.page_size
     )
     planned_pages = (args.capacity + args.page_size - 1) // args.page_size
     table = torch.full((1, planned_pages), -1, dtype=torch.int32, device=device)
@@ -164,6 +159,16 @@ def run_mode(args, candidates_mode):
     output_scores = torch.empty(
         (rows_capacity, 512), dtype=torch.float32, device=device
     )
+
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    prepare_mxfp4(session, plan, q=q, keys=keys, slots=slots, arguments=dict(
+        q_mxfp4=packed, q_scales=scales, query_weights=weights,
+        index_k_cache=pool, page_table=table, cache_lengths=lengths, active_width=active,
+        output_indices=output_indices, output_scores=output_scores,
+        candidate_indices=candidate_ids, candidate_lengths=candidate_lengths,
+    ))
+    torch.testing.assert_close(packed, q_reference, rtol=0, atol=0)
+    torch.testing.assert_close(scales, sf_reference, rtol=0, atol=0)
 
     def bind(rows, visible):
         score_width = candidate_capacity if candidates_mode else visible
@@ -219,9 +224,8 @@ def run_mode(args, candidates_mode):
     indexer.select(warm_binding)
     torch.cuda.synchronize(device)
     records = []
-    freeze_kernel_resolution(
-        "MXFP4 benchmark reuses one planned geometry across live counts"
-    )
+    session.freeze()
+    graphs = {}
     try:
         for visible in args.widths:
             active.fill_(visible)
@@ -335,8 +339,12 @@ def run_mode(args, candidates_mode):
                     ),
                     flush=True,
                 )
+                for graph in graphs.values():
+                    graph.reset()
     finally:
-        unfreeze_kernel_resolution()
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
     return records
 
 

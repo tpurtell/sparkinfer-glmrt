@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import functools
+from b12x._lib.program_cache import program_cache
 from collections.abc import Callable, Sequence
 
 import cuda.bindings.driver as cuda
@@ -20,7 +20,6 @@ from ._dcp_cute_common import block_pair_barrier
 
 _MAX_BLOCKS = 128
 _MAX_PEERS = 8
-_PREPARED_TOPK_LAUNCHERS: set[tuple[int, int, int, int]] = set()
 
 
 @cute.jit
@@ -266,7 +265,7 @@ def _pad_ptrs(values: Sequence[int], world_size: int) -> tuple[int, ...]:
     return tuple(padded)
 
 
-@functools.cache
+@program_cache
 def _get_compiled_topk_stage(
     world_size: int,
     rank: int,
@@ -354,62 +353,4 @@ def _get_compiled_topk_stage(
             current_cuda_stream(),
         )
 
-    _PREPARED_TOPK_LAUNCHERS.add(key)
     return run
-
-
-def is_topk_stage_prepared(
-    world_size: int,
-    rank: int,
-    topk: int,
-    threads: int,
-) -> bool:
-    return (
-        int(world_size),
-        int(rank),
-        int(topk),
-        int(threads),
-    ) in _PREPARED_TOPK_LAUNCHERS
-
-
-def prepare_topk_stage(
-    world_size: int,
-    rank: int,
-    topk: int,
-    threads: int,
-) -> None:
-    _get_compiled_topk_stage(world_size, rank, topk, threads)
-
-
-def stage_owner_candidates(
-    *,
-    world_size: int,
-    rank: int,
-    topk: int,
-    threads: int,
-    local_indices_ptr: int,
-    local_scores_ptr: int,
-    candidate_ptrs: Sequence[int],
-    signal_ptrs: Sequence[int],
-    rows: int,
-    candidate_plane_elems: int,
-    blocks: int,
-    wait_for_prior_consumer: bool,
-) -> None:
-    _get_compiled_topk_stage(world_size, rank, topk, threads)(
-        local_indices_ptr,
-        local_scores_ptr,
-        candidate_ptrs,
-        signal_ptrs,
-        rows,
-        candidate_plane_elems,
-        blocks,
-        wait_for_prior_consumer,
-    )
-
-
-__all__ = [
-    "is_topk_stage_prepared",
-    "prepare_topk_stage",
-    "stage_owner_candidates",
-]

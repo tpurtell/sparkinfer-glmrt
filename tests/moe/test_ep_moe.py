@@ -7,10 +7,10 @@ validation unit tests stay in the b12x repo.
 """
 
 from __future__ import annotations
-
 import torch
 
 from b12x.moe import ep_moe
+from b12x.preparation import PreparedCall, PreparationSession
 
 from .._reference.helpers import run_tp_moe_fp4
 from ..conftest import require_b12x
@@ -26,33 +26,44 @@ def _run_ep_rank(
     expert_map: torch.Tensor,
 ):
     prepared_map = ep_moe.prepare_expert_map(
-        expert_map,
-        local_num_experts=experts.num_experts,
-        global_num_experts=int(expert_map.numel()),
-        device=a.device,
-    )
-    plan = ep_moe.plan(
-        ep_moe.Caps(
-            max_tokens=int(a.shape[0]),
-            num_topk=int(topk_ids.shape[1]),
-            global_num_experts=int(expert_map.numel()),
-            device=a.device,
-            weight_plan=experts.plan,
-        )
-    )
-    scratch = torch.empty(
-        plan.scratch_specs()[0].shape, dtype=torch.uint8, device=a.device
+        expert_map, local_num_experts=experts.num_experts,
+        global_num_experts=int(expert_map.numel()), device=a.device,
     )
     output = torch.empty_like(a)
+    caps = ep_moe.Caps(
+        max_tokens=int(a.shape[0]), num_topk=int(topk_ids.shape[1]),
+        global_num_experts=int(expert_map.numel()), device=a.device,
+        weight_plan=experts.plan,
+    )
+    declaration = ep_moe.plan(
+        caps, expert_map=prepared_map,
+        invocation=ep_moe.invocation_from_tensors(
+            a=a, topk_ids=topk_ids, topk_weights=topk_weights, output=output,
+            expert_map=prepared_map,
+        ),
+    )
+    scratch = {}
+
+    def prepare_call(state):
+        spec = state.layout.scratch_specs()[0]
+        scratch["value"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        bound = state.bind(
+            scratch=scratch["value"], a=a, experts=experts,
+            topk_weights=topk_weights, topk_ids=topk_ids, output=output,
+        )
+        return PreparedCall(run=lambda: state.run(bound))
+
+    session = PreparationSession(device=a.device, autotune=False, compile_workers=2)
+    session.prepare((
+        declaration.request(
+            name=f"ep-{prepared_map.tensor.data_ptr()}",
+            prepare_call=prepare_call,
+        ),
+    ))
+    plan = declaration
     binding = ep_moe.bind(
-        plan,
-        scratch=scratch,
-        a=a,
-        experts=experts,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        expert_map=prepared_map,
-        output=output,
+        plan, scratch=scratch["value"], a=a, experts=experts,
+        topk_weights=topk_weights, topk_ids=topk_ids, output=output,
     )
     return ep_moe.run(binding=binding), binding
 
@@ -122,7 +133,7 @@ def test_binding_replays_with_changed_routes_under_cuda_graph() -> None:
     experts = prepare_experts(a, weights, global_ids)
     expert_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32, device="cuda")
     topk_ids = (
-        torch.tensor([[1, 3]], dtype=torch.int32, device="cuda")
+        torch.tensor([[1, 3]], dtype=torch.int64, device="cuda")
         .expand(m, -1)
         .contiguous()
     )
@@ -140,7 +151,7 @@ def test_binding_replays_with_changed_routes_under_cuda_graph() -> None:
     assert int(torch.count_nonzero(nonlocal_output).item()) == 0
 
     topk_ids.copy_(
-        torch.tensor([[0, 1]], dtype=torch.int32, device="cuda").expand(m, -1)
+        torch.tensor([[0, 1]], dtype=torch.int64, device="cuda").expand(m, -1)
     )
     binding.run()  # resolve all route-pack/GEMM variants before capture
     graph = torch.cuda.CUDAGraph()
@@ -150,7 +161,7 @@ def test_binding_replays_with_changed_routes_under_cuda_graph() -> None:
 
     # Replay must observe route changes staged after capture.
     topk_ids.copy_(
-        torch.tensor([[2, 3]], dtype=torch.int32, device="cuda").expand(m, -1)
+        torch.tensor([[2, 3]], dtype=torch.int64, device="cuda").expand(m, -1)
     )
     graph.replay()
     torch.cuda.synchronize()

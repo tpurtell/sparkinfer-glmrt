@@ -16,7 +16,8 @@ from cutlass import Float32, Int32, Int64, Uint32
 from b12x._lib.compiler import DimKey, KernelCompileSpec, launch, tensor_key
 from b12x._lib.intrinsics import bfloat2_to_float2_scaled
 from b12x._lib.utils import current_cuda_stream
-from ._kernels import _to_kernel_tensor, _warp_allreduce_sum
+from ._kernels import _to_kernel_tensor, _warp_allreduce_sum, _compile_mhc_entry
+from b12x._lib.compiler import run_compiled
 
 
 class _PrepareLaggedPrefill:
@@ -72,12 +73,9 @@ def _kernel(hidden):
     return _PrepareLaggedPrefill(hidden)
 
 
-@torch.library.custom_op(
-    "b12x::mhc_prepare_lagged_prefill", mutates_args=("output", "partials")
-)
 def prepare_lagged_prefill(
-    residual: torch.Tensor, output: torch.Tensor, partials: torch.Tensor
-) -> None:
+    residual: torch.Tensor, output: torch.Tensor, partials: torch.Tensor, *, _prepared=None,
+):
     if (
         residual.ndim != 3
         or residual.shape[1] != 4
@@ -120,6 +118,8 @@ def prepare_lagged_prefill(
         Int32(tokens),
         current_cuda_stream(),
     )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
     key = tuple(
         tensor_key(
             name,
@@ -132,7 +132,7 @@ def prepare_lagged_prefill(
             ("partials", partials),
         )
     )
-    launch(
+    return _compile_mhc_entry(
         _kernel(hidden),
         compile_spec=KernelCompileSpec.from_key(
             "norm.mhc.lagged_prefill_prepare", 1, key
@@ -140,8 +140,3 @@ def prepare_lagged_prefill(
         compile_args=args,
         runtime_args=args,
     )
-
-
-@prepare_lagged_prefill.register_fake
-def _fake(residual, output, partials):
-    return None

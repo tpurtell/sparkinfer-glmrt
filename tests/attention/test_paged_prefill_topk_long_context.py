@@ -165,10 +165,9 @@ def _run_indexer(
     device = scene["q_fp8"].device
     torch.cuda.synchronize(device)
     if graph_replay:
-        from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+        from b12x._lib.runtime_control import kernel_resolution_guard
 
-        freeze_kernel_resolution("paged top-k high-page-ID replay")
-        try:
+        with kernel_resolution_guard('paged top-k high-page-ID replay'):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 run()
@@ -191,8 +190,6 @@ def _run_indexer(
                 _assert_selects_true_topk(
                     scene, selected, output_physical_slots=output_physical_slots,
                 )
-        finally:
-            unfreeze_kernel_resolution()
     return selected
 
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import pathlib
 import statistics
 import sys
@@ -14,8 +15,9 @@ import torch
 
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from b12x.attention._shared.contiguous.api import clear_attention_caches
-from b12x.attention.paged._forward import paged_attention_forward
-from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
+from b12x.attention import paged
+from b12x.preparation import PreparedCall, PreparationResult, PreparationSession
+from b12x.preparation.types import require_prepared
 
 
 MSA_TOPK = 16
@@ -148,7 +150,7 @@ def _bench_graph(
     return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends, strict=True)]
 
 
-def _make_scratch_plan(
+def _make_caps(
     *,
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -157,28 +159,109 @@ def _make_scratch_plan(
     max_work_items: int,
     max_partial_rows: int,
     msa_block_sparse: bool,
-) -> object:
-    return plan_paged_attention_scratch(
-        B12XPagedAttentionScratchCaps(
-            device=q.device,
-            mode="decode",
-            dtype=q.dtype,
-            kv_dtype=k_cache.dtype,
-            num_q_heads=q.shape[1],
-            num_kv_heads=k_cache.shape[2],
-            head_dim_qk=q.shape[2],
-            head_dim_vo=v_cache.shape[3],
-            page_size=k_cache.shape[1],
-            max_total_q=q.shape[0],
-            max_batch=page_table.shape[0],
-            max_page_table_width=page_table.shape[1],
-            max_work_items=max(int(max_work_items), 1),
-            max_partial_rows=max(int(max_partial_rows), 0),
-            num_cache_pages=k_cache.shape[0],
-            use_cuda_graph=True,
-            msa_block_sparse=msa_block_sparse,
-        )
+) -> paged.Caps:
+    return paged.Caps(
+        device=q.device,
+        mode="decode",
+        dtype=q.dtype,
+        kv_dtype=k_cache.dtype,
+        num_q_heads=q.shape[1],
+        num_kv_heads=k_cache.shape[2],
+        head_dim_qk=q.shape[2],
+        head_dim_vo=v_cache.shape[3],
+        page_size=k_cache.shape[1],
+        max_total_q=q.shape[0],
+        max_batch=page_table.shape[0],
+        max_page_table_width=page_table.shape[1],
+        max_work_items=max(int(max_work_items), 1),
+        max_partial_rows=max(int(max_partial_rows), 0),
+        num_cache_pages=k_cache.shape[0],
+        use_cuda_graph=True,
+        msa_block_sparse=msa_block_sparse,
     )
+
+
+@dataclass
+class _CapturedCase:
+    graph: torch.cuda.CUDAGraph
+    launch_ctas: int
+    bytes_read: int
+    binding: object
+    result: PreparationResult
+    session: PreparationSession
+
+    def close(self) -> None:
+        del self.graph
+        torch.cuda.synchronize()
+        self.result.close()
+        self.session.close()
+
+
+def _prepare_capture(
+    *,
+    name: str,
+    caps: paged.Caps,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    output: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    q2k_indices: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    warmup: int,
+    graph_metadata: dict[str, int],
+) -> tuple[torch.cuda.CUDAGraph, object, PreparationResult, PreparationSession]:
+    binding_args = {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "output": output,
+        "page_table": page_table,
+        "cache_seqlens": cache_seqlens,
+        "cu_seqlens_q": cu_seqlens_q,
+        "active_total_q": int(q.shape[0]),
+        "q2k_indices": q2k_indices,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+    }
+    declaration = paged.plan(
+        caps,
+        invocation=paged.invocation_from_tensors(caps, **binding_args),
+    )
+
+    def prepare_call(state):
+        state.prepare_decode_graph_replay_state(**graph_metadata)
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            for spec in state.scratch_plan.scratch_specs()
+        )
+        binding = state.bind(scratch=scratch, **binding_args)
+        return PreparedCall(
+            run=lambda: state.run(binding),
+            output=output,
+            owners=(binding, scratch),
+        )
+
+    session = PreparationSession(device=q.device, autotune=False)
+    result = session.prepare((declaration.request(
+        name=name,
+        prepare_call=prepare_call,
+    ),))
+    plan = declaration
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in require_prepared(plan, "attention.gqa").scratch_plan.scratch_specs()
+    )
+    binding = paged.bind(plan, scratch=scratch, **binding_args)
+    with session.capture():
+        graph = _capture_graph(
+            lambda: paged.run(binding=binding, plan=plan),
+            warmup=warmup,
+        )
+    return graph, binding, result, session
 
 
 def _capture_msa_case(
@@ -190,7 +273,7 @@ def _capture_msa_case(
     warmup: int,
     page_size: int = 64,
     kv_dtype: str = "bf16",
-) -> tuple[torch.cuda.CUDAGraph, int, int, object]:
+) -> _CapturedCase:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_inputs(
         batch=batch,
         cache_len=cache_len,
@@ -220,7 +303,7 @@ def _capture_msa_case(
     # the worst-case 64-token chunk fanout so all chunk policies share a stable
     # metadata shape.
     max_chunks_per_req = max(active_chunks_per_req, 32)
-    scratch_plan = _make_scratch_plan(
+    caps = _make_caps(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -229,19 +312,10 @@ def _capture_msa_case(
         max_partial_rows=batch * max(max_chunks_per_req, 1),
         msa_block_sparse=True,
     )
-    scratch_plan.prepare_decode_graph_replay_state(
-        batch=batch,
-        max_page_table_width=page_table.shape[1],
-        max_cache_page_count=page_table.shape[1],
-        fixed_split_size=int(chunk_pages),
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=q.device)
-        for shape, dtype in scratch_plan.shapes_and_dtypes()
-    )
     output = torch.empty_like(q)
-    binding = scratch_plan.bind(
-        scratch=scratch,
+    graph, binding, result, session = _prepare_capture(
+        name=f"msa-b{batch}-n{cache_len}-p{chunk_pages}-{kv_dtype}",
+        caps=caps,
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -252,17 +326,20 @@ def _capture_msa_case(
         q2k_indices=q2k_indices,
         k_descale=k_descale,
         v_descale=v_descale,
+        warmup=warmup,
+        graph_metadata={
+            "batch": batch,
+            "max_page_table_width": page_table.shape[1],
+            "max_cache_page_count": page_table.shape[1],
+            "fixed_split_size": int(chunk_pages),
+        },
     )
-    graph = _capture_graph(lambda: paged_attention_forward(binding=binding), warmup=warmup)
     selected_tokens = _msa_effective_selected_tokens(cache_len, page_size=page_size)
     active_chunks_per_req = (selected_tokens + chunk_tokens - 1) // chunk_tokens
     launch_ctas = batch * 4 * active_chunks_per_req
     elem_bytes = 1 if kv_dtype == "fp8" else 2
     bytes_read = batch * 4 * selected_tokens * 128 * elem_bytes * 2
-    # The graph records raw addresses but does not retain the eager tensors
-    # backing them. Keep the binding alive through replay so the allocator
-    # cannot recycle its inputs or scratch between sweep cases.
-    return graph, launch_ctas, bytes_read, binding
+    return _CapturedCase(graph, launch_ctas, bytes_read, binding, result, session)
 
 
 def _capture_dense_case(
@@ -272,7 +349,7 @@ def _capture_dense_case(
     seed: int,
     warmup: int,
     kv_dtype: str = "bf16",
-) -> tuple[torch.cuda.CUDAGraph, int, int, object]:
+) -> _CapturedCase:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_uniform_inputs(
         batch=batch,
         cache_len=cache_len,
@@ -291,7 +368,7 @@ def _capture_dense_case(
         k_descale = torch.ones((batch, 4), dtype=torch.float32, device=q.device)
         v_descale = torch.ones((batch, 4), dtype=torch.float32, device=q.device)
     pages = int(page_table.shape[1])
-    scratch_plan = _make_scratch_plan(
+    caps = _make_caps(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -300,18 +377,10 @@ def _capture_dense_case(
         max_partial_rows=0,
         msa_block_sparse=False,
     )
-    scratch_plan.prepare_decode_graph_replay_state(
-        batch=batch,
-        max_page_table_width=pages,
-        max_cache_page_count=pages,
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=q.device)
-        for shape, dtype in scratch_plan.shapes_and_dtypes()
-    )
     output = torch.empty_like(q)
-    binding = scratch_plan.bind(
-        scratch=scratch,
+    graph, binding, result, session = _prepare_capture(
+        name=f"dense-b{batch}-n{cache_len}-{kv_dtype}",
+        caps=caps,
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -319,14 +388,20 @@ def _capture_dense_case(
         page_table=page_table,
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
+        q2k_indices=None,
         k_descale=k_descale,
         v_descale=v_descale,
+        warmup=warmup,
+        graph_metadata={
+            "batch": batch,
+            "max_page_table_width": pages,
+            "max_cache_page_count": pages,
+        },
     )
-    graph = _capture_graph(lambda: paged_attention_forward(binding=binding), warmup=warmup)
     launch_ctas = batch * 4
     elem_bytes = 1 if kv_dtype == "fp8" else 2
     bytes_read = batch * 4 * int(cache_len) * 128 * elem_bytes * 2
-    return graph, launch_ctas, bytes_read, binding
+    return _CapturedCase(graph, launch_ctas, bytes_read, binding, result, session)
 
 
 def _summarize(samples_us: list[float]) -> tuple[float, float, float]:
@@ -371,25 +446,30 @@ def main(argv: list[str] | None = None) -> int:
     for batch in args.batches:
         for context in args.contexts:
             if not args.skip_dense:
-                graph, launch_ctas, bytes_read, binding = _capture_dense_case(
+                case = _capture_dense_case(
                     kv_dtype=args.kv_dtype,
                     batch=batch,
                     cache_len=context,
                     seed=args.seed + batch * 17 + context,
                     warmup=args.warmup,
                 )
-                samples = _bench_graph(graph, replays=args.replays, l2_flush=l2_flush)
-                mean_us, median_us, min_us = _summarize(samples)
-                gbs = bytes_read / (mean_us * 1e-6) / 1e9
-                rows.append(
-                    f"dense\t64\t{args.kv_dtype}\t{batch}\t{context}\t0\t{mean_us:.3f}\t{median_us:.3f}\t"
-                    f"{min_us:.3f}\t{gbs:.3f}\t{launch_ctas}\t{bytes_read}"
-                )
-                print(rows[-1])
+                try:
+                    samples = _bench_graph(
+                        case.graph, replays=args.replays, l2_flush=l2_flush
+                    )
+                    mean_us, median_us, min_us = _summarize(samples)
+                    gbs = case.bytes_read / (mean_us * 1e-6) / 1e9
+                    rows.append(
+                        f"dense\t64\t{args.kv_dtype}\t{batch}\t{context}\t0\t{mean_us:.3f}\t{median_us:.3f}\t"
+                        f"{min_us:.3f}\t{gbs:.3f}\t{case.launch_ctas}\t{case.bytes_read}"
+                    )
+                    print(rows[-1])
+                finally:
+                    case.close()
             for chunk_tokens in args.chunks:
                 if chunk_tokens % args.page_size != 0:
                     continue
-                graph, launch_ctas, bytes_read, binding = _capture_msa_case(
+                case = _capture_msa_case(
                     page_size=args.page_size,
                     kv_dtype=args.kv_dtype,
                     batch=batch,
@@ -398,14 +478,19 @@ def main(argv: list[str] | None = None) -> int:
                     seed=args.seed + batch * 31 + context + chunk_tokens,
                     warmup=args.warmup,
                 )
-                samples = _bench_graph(graph, replays=args.replays, l2_flush=l2_flush)
-                mean_us, median_us, min_us = _summarize(samples)
-                gbs = bytes_read / (mean_us * 1e-6) / 1e9
-                rows.append(
-                    f"msa\t{args.page_size}\t{args.kv_dtype}\t{batch}\t{context}\t{chunk_tokens}\t{mean_us:.3f}\t{median_us:.3f}\t"
-                    f"{min_us:.3f}\t{gbs:.3f}\t{launch_ctas}\t{bytes_read}"
-                )
-                print(rows[-1])
+                try:
+                    samples = _bench_graph(
+                        case.graph, replays=args.replays, l2_flush=l2_flush
+                    )
+                    mean_us, median_us, min_us = _summarize(samples)
+                    gbs = case.bytes_read / (mean_us * 1e-6) / 1e9
+                    rows.append(
+                        f"msa\t{args.page_size}\t{args.kv_dtype}\t{batch}\t{context}\t{chunk_tokens}\t{mean_us:.3f}\t{median_us:.3f}\t"
+                        f"{min_us:.3f}\t{gbs:.3f}\t{case.launch_ctas}\t{case.bytes_read}"
+                    )
+                    print(rows[-1])
+                finally:
+                    case.close()
             args.output.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
     return 0

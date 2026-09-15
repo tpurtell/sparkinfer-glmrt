@@ -68,17 +68,29 @@ def test_dequant_accum_dispatch_preserves_legacy_padding_and_accepts_nine(
 ) -> None:
     launches: list[tuple[str, int, tuple[object, ...]]] = []
 
-    def fake_compiled(codec: str, nsrc: int):
-        return lambda *args: launches.append((codec, nsrc, args))
+    def fake_legacy(*args):
+        launches.append(("e4m3", 7, args))
 
-    monkeypatch.setattr(dma_kernels, "_compiled_dequant_accum", fake_compiled)
+    def fake_tp10(*args):
+        launches.append(("mx", 9, args))
+
     monkeypatch.setattr(
         dma_kernels, "_ptr", lambda _dtype, address, _align: int(address)
     )
     monkeypatch.setattr(dma_kernels, "current_cuda_stream", lambda: 99)
-    kernels = dma_kernels.DmaKernels(ipc=None)
-
-    kernels._dequant_accum(
+    legacy = dma_kernels.DmaKernels(ipc=None)
+    legacy.install(
+        dma_kernels.DmaLaunchers(
+            set_flag=object(), wait_flag=object(), add=(), dequant_accum=fake_legacy
+        )
+    )
+    tp10 = dma_kernels.DmaKernels(ipc=None)
+    tp10.install(
+        dma_kernels.DmaLaunchers(
+            set_flag=object(), wait_flag=object(), add=(), dequant_accum=fake_tp10
+        )
+    )
+    legacy._dequant_accum(
         "e4m3",
         1,
         2,
@@ -86,7 +98,7 @@ def test_dequant_accum_dispatch_preserves_legacy_padding_and_accepts_nine(
         list(range(200, 207)),
         256,
     )
-    kernels._dequant_accum(
+    tp10._dequant_accum(
         "mx",
         3,
         4,

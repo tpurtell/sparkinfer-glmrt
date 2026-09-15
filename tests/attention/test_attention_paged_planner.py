@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from b12x.attention.paged._policy import GqaConfig
+from b12x.attention.paged._tuning import GqaConfig
 from b12x.attention.paged.planner import (
     PagedPlanBudget,
     build_decode_chunk_pages_lut,
@@ -18,7 +18,7 @@ from b12x.attention.paged.planner import (
     resolve_decode_graph_ctas_per_sm,
     use_paged_extend_fp8_pv_repack,
 )
-from b12x.policy import FrozenMapping
+from b12x.preparation import FrozenMapping
 from b12x.attention.paged._scratch import (
     B12XPagedAttentionScratchCaps,
     _paged_attention_scratch_layout,
@@ -1543,7 +1543,6 @@ def test_sm12x_h256_decode_uses_one_wave_only_when_it_fills_most_sms(
     sm_count: int,
     expected_chunks: dict[int, int],
 ) -> None:
-    monkeypatch.setenv("B12X_POLICY_MODE", "heuristic-only")
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
@@ -1608,7 +1607,7 @@ def test_build_decode_chunk_pages_lut_uses_heuristic() -> None:
     assert lut[8:] == (2, 2, 2, 2, 2, 2, 2, 2)
 
 
-def test_gqa_profile_factors_chunk_lut_losslessly() -> None:
+def test_gqa_config_factors_chunk_lut_losslessly() -> None:
     max_pages = 2_048
     max_chunks = 24
     base_lut = tuple(
@@ -1633,7 +1632,7 @@ def test_gqa_profile_factors_chunk_lut_losslessly() -> None:
     )
 
     config = GqaConfig.from_capacity(capacity)
-    round_trip = GqaConfig.from_profile(FrozenMapping(config.profile_dict()))
+    round_trip = GqaConfig.from_config(FrozenMapping(config.to_dict()))
 
     assert config.chunk_pages_lut() == chunk_pages_lut
     assert round_trip == config

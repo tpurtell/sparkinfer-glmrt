@@ -55,12 +55,9 @@ ENABLE_ENV = "B12X_ENABLE_FP6"
 QUANT_METHOD = "modelopt"
 QUANT_ALGO = "W6A6"
 
-# Process-wide scratch/plan cache shared across ALL MoE layers of a model.
-# Layers run sequentially on one stream — eager and inside CUDA graphs alike —
-# so scratch reuse is safe, and every layer of a model has identical
-# (E, K, N, topk) geometry.  Per-layer caching multiplies the footprint by
-# the layer count (~40x): fatal under vLLM's CUDA-graph memory estimator.
-_SCRATCH_CACHE: dict[tuple, tuple[Any, tuple[torch.Tensor, ...]]] = {}
+# Weight planning is shared because these immutable checkpoint geometry records
+# are identical across layers. Each registered layer generation holds its own
+# exact-M plans and runtime scratch, filled in place by preparation.
 
 # Deduped fused_moe weight plans, keyed by geometry.  Every MoE layer of a
 # model shares one plan object, which is what makes the scratch cache above
@@ -165,10 +162,12 @@ def kernel_source_format_for_moe(_checkpoint_source_format: str) -> str:
 
 
 class B12XFP6MoEMethod:
-    """Reference routed-MoE method backed by :mod:`b12x.moe.fused_moe`.
+    """FP6 routed-MoE owner holding exact-M plans for its lifetime.
 
-    Holds one layer's prepared experts and weight plan; scratch/plan tensors come
-    from the process-wide shared cache (see ``_SCRATCH_CACHE``).
+    Plans are declared once, on the first :meth:`get_b12x_preparation_units`
+    call, and cached on this instance; later calls reuse them. ``apply`` runs
+    inside vLLM's own MoE custom op, so it may read the cached plans and
+    scratch directly instead of resolving them through a custom op body.
     """
 
     def __init__(
@@ -183,45 +182,161 @@ class B12XFP6MoEMethod:
         self.weight_plan = weight_plan
         self.input_scales_static = input_scales_static
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        self._declaration: Any = None
+        self._topk: Optional[int] = None
+        self._plans: dict[int, Any] = {}
+        self._scratch: dict[int, tuple[torch.Tensor, ...]] = {}
+        self._request_name = f"fp6_moe:{id(self)}"
 
-    def _plan_and_scratch(
-        self, m: int, topk: int, device: torch.device
-    ) -> tuple[Any, tuple[torch.Tensor, ...]]:
+    def get_b12x_preparation_units(self, layer, workload):
+        """Declare this MoE layer's exact-M plans for the weights stage."""
+        del layer
+        if workload.stage != "weights":
+            return ()
         from b12x.moe import fused_moe
+        from b12x.preparation import PreparedCall
+        from vllm.utils.b12x import B12xPreparationUnit
 
-        key = (
-            int(m),
-            int(topk),
-            device,
-            id(self.weight_plan),
-            bool(self.apply_router_weight_on_input),
-        )
-        cached = _SCRATCH_CACHE.get(key)
-        if cached is None:
-            plan = fused_moe.plan_execution(
+        if workload.output_dtype != self.weight_plan.activation.io_dtype:
+            raise ValueError("FP6 MoE output dtype differs from its loaded contract")
+        if self._declaration is None:
+            counts = tuple(sorted({int(count) for count in workload.token_counts}))
+            if not counts or counts[0] <= 0:
+                raise ValueError("FP6 MoE preparation requires positive token counts")
+            self._topk = int(getattr(self.weight_plan.geometry, "top_k", 0) or 8)
+            self._declaration = fused_moe.plan_execution(
                 experts=self.experts_prepared,
                 capacity=fused_moe.ExecutionCapacity(
-                    max_tokens=m,
-                    top_k=topk,
-                    warmup_token_counts=(m,),
+                    max_tokens=counts[-1], top_k=self._topk, warmup_token_counts=counts,
                     route_num_experts=0,
                 ),
                 routing=fused_moe.RoutingSpec(
                     apply_router_weight_on_input=self.apply_router_weight_on_input,
                 ),
             )
-            fused_moe.prewarm(plan)
-            scratch = tuple(
-                torch.empty(
-                    shape,
-                    dtype=dtype,
-                    device=plan.scratch_specs()[i].device,
-                )
-                for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
+            variants = getattr(self._declaration, "variants", None)
+            self._plans = (
+                {int(count): child for count, child in variants.items()}
+                if variants is not None
+                else {counts[-1]: self._declaration}
             )
-            cached = (plan, scratch)
-            _SCRATCH_CACHE[key] = cached
-        return cached
+        declaration = self._declaration
+        topk = self._topk
+
+        def call(tokens):
+            def prepare(state):
+                device = self.experts_prepared.device
+                scratch = tuple(
+                    torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                    for spec in state.scratch.scratch_specs()
+                )
+                hidden = torch.empty(
+                    (tokens, self.experts_prepared.hidden_size),
+                    dtype=self.weight_plan.activation.io_dtype,
+                    device=device,
+                )
+                activation_source = torch.empty_like(hidden).normal_(mean=0.0, std=0.125)
+                output = torch.empty_like(hidden)
+                route_rows = torch.arange(
+                    tokens, dtype=torch.int32, device=device
+                ).unsqueeze(1)
+                route_columns = torch.arange(
+                    topk, dtype=torch.int32, device=device
+                ).unsqueeze(0)
+                route_ids = (route_rows + route_columns).remainder_(
+                    self.experts_prepared.num_experts
+                ).contiguous()
+                route_logits = (
+                    route_rows.to(dtype=torch.float32) * 0.03125
+                    + route_columns.to(dtype=torch.float32) * 0.125
+                )
+                route_weights = torch.softmax(route_logits, dim=-1).contiguous()
+                ids = torch.empty_like(route_ids)
+                weights = torch.empty_like(route_weights)
+
+                def reset() -> None:
+                    output.zero_()
+                    for buffer in scratch:
+                        buffer.zero_()
+
+                def produce() -> None:
+                    hidden.copy_(activation_source)
+                    ids.copy_(route_ids)
+                    weights.copy_(route_weights)
+
+                def restore() -> None:
+                    reset()
+                    produce()
+
+                binding = state.bind(
+                    scratch=scratch,
+                    a=hidden,
+                    experts=self.experts_prepared,
+                    topk_weights=weights,
+                    topk_ids=ids,
+                    output=output,
+                    input_scales_static=self.input_scales_static,
+                )
+                return PreparedCall(
+                    run=binding.run,
+                    output=output,
+                    produce=produce,
+                    reset=reset,
+                    restore=restore,
+                    owners=(
+                        scratch,
+                        hidden,
+                        activation_source,
+                        output,
+                        route_ids,
+                        route_weights,
+                        ids,
+                        weights,
+                        binding,
+                    ),
+                )
+            return prepare
+
+        if hasattr(declaration, "token_counts"):
+            calls = {count: call(count) for count in declaration.token_counts}
+            benchmark_calls = {
+                count: call(count) for count in declaration.token_counts
+            }
+            request = declaration.request(
+                name=self._request_name,
+                prepare_calls=calls,
+                benchmark_calls=benchmark_calls,
+            )
+        else:
+            (tokens,) = self._plans
+            request = declaration.request(
+                name=self._request_name,
+                prepare_call=call(tokens),
+                benchmark_call=call(tokens),
+            )
+        return (B12xPreparationUnit(
+            name="FP6_MOE", key=(self._request_name, tuple(sorted(self._plans))),
+            requests=(request,), stage="weights",
+            autotune=not workload.eager_only,
+        ),)
+
+    def _scratch_for(self, tokens: int, plan: Any) -> tuple[torch.Tensor, ...]:
+        """Runtime scratch for an exact-M plan; allocated once and reused.
+
+        Called only from :meth:`apply`, after the plan has been prepared, so
+        ``require_prepared`` always resolves a live state here.
+        """
+        scratch = self._scratch.get(tokens)
+        if scratch is None:
+            from b12x.preparation import require_prepared
+
+            state = require_prepared(plan, "moe.decode", self.experts_prepared.device)
+            scratch = tuple(
+                torch.empty(spec.shape, dtype=spec.dtype, device=self.experts_prepared.device)
+                for spec in state.scratch.scratch_specs()
+            )
+            self._scratch[tokens] = scratch
+        return scratch
 
     def apply(
         self,
@@ -232,48 +347,36 @@ class B12XFP6MoEMethod:
         apply_router_weight_on_input: bool = False,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run the FP6 fused MoE for one layer; returns ``(M, K)`` bf16.
-
-        ``output`` (zeroed, ``(M, K)`` bf16) is required under CUDA-graph
-        capture: the kernel scatter-accumulates into it and refuses to
-        allocate internally while a capture is active.
-        """
+        """Run only an exact-M plan prepared before eager/capture work."""
         from b12x.moe import fused_moe
 
         m = int(hidden_states.shape[0])
-        topk = int(topk_ids.shape[1])
-        device = hidden_states.device
-        router_on_input = bool(apply_router_weight_on_input)
-        if router_on_input != self.apply_router_weight_on_input:
-            raise ValueError(
-                "apply_router_weight_on_input mismatch: method was constructed "
-                f"with {self.apply_router_weight_on_input}, apply() got "
-                f"{router_on_input}"
-            )
+        if bool(apply_router_weight_on_input) != self.apply_router_weight_on_input:
+            raise ValueError("apply_router_weight_on_input differs from prepared FP6 MoE")
+        try:
+            plan = self._plans[m]
+        except KeyError:
+            raise RuntimeError(f"FP6 MoE exact-M={m} was not prepared") from None
+        scratch = self._scratch_for(m, plan)
         if output is None:
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "B12X FP6 MoE requires a caller-owned output buffer "
-                    "during CUDA graph capture"
-                )
+                raise RuntimeError("B12X FP6 MoE requires caller output during CUDA capture")
             output = torch.zeros(
-                m,
-                hidden_states.shape[1],
-                dtype=hidden_states.dtype,
-                device=device,
+                m, hidden_states.shape[1], dtype=hidden_states.dtype,
+                device=hidden_states.device,
             )
-        plan, scratch = self._plan_and_scratch(m, topk, device)
+        if topk_ids.dtype not in (torch.int32, torch.int64) or not topk_ids.is_contiguous():
+            raise TypeError("B12X FP6 MoE requires contiguous int32 or int64 topk_ids")
+        if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
+            raise TypeError("B12X FP6 MoE requires contiguous float32 topk_weights")
         binding = fused_moe.bind(
-            plan,
-            scratch=scratch,
-            a=hidden_states,
-            experts=self.experts_prepared,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids.to(torch.int32),
-            output=output,
+            plan, scratch=scratch, a=hidden_states,
+            experts=self.experts_prepared, topk_weights=topk_weights,
+            topk_ids=topk_ids, output=output,
             input_scales_static=self.input_scales_static,
         )
         return fused_moe.run(binding=binding)
+
 
 
 class B12XFP6LinearMethod:
@@ -343,8 +446,10 @@ def load_b12x_fp6_moe_methods(
                 intermediate_scale=weights.a2_gscale,
             ),
         )
-        out[layer_idx] = B12XFP6MoEMethod(prepared, weight_plan)
-    return out
+        method = B12XFP6MoEMethod(prepared, weight_plan)
+        from vllm.utils.b12x import register_b12x_unit_provider
+        register_b12x_unit_provider(method)
+        out[layer_idx] = method
 
 
 def load_b12x_fp6_linear_methods(

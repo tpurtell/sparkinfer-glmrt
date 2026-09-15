@@ -54,7 +54,14 @@ def main() -> None:
     a("")
     a("## Measured path and scope")
     a("")
-    if r.get("version", 0) >= 2:
+    if r.get("version", 0) >= 5:
+        a("Both arms prepare typed `fused_moe.plan_execution` declarations through "
+          "`PreparationSession`, then bind fixed scratch and capture `fused_moe.run`. "
+          "The materialization flag is pinned per plan; tile, route and active-cluster "
+          "defaults come from the component heuristic. The retained configuration and "
+          "execution metadata identify each arm. Both graphs are destroyed before "
+          "the session releases their programs. Only graph replay is timed.")
+    elif r.get("version", 0) >= 2:
         a("Both arms use canonical `fused_moe.plan_weights/prepare_weights` and "
           "`plan_execution/prewarm/bind/run`, with shared synthetic NVFP4 weights, "
           "input, routing and scalar input scale. Each arm owns fixed-capacity "
@@ -167,7 +174,14 @@ def main() -> None:
     a("## Source artifact hashes (SHA-256)")
     a("")
     a(r.get("source_hash_scope", "Legacy source list is incomplete for imported input/oracle helpers."))
-    if r.get("version", 0) >= 2:
+    if r.get("version", 0) >= 5:
+        a("Both arms prepare typed `fused_moe.plan_execution` declarations through "
+          "`PreparationSession`, then bind fixed scratch and capture `fused_moe.run`. "
+          "The materialization flag is pinned per plan; tile, route and active-cluster "
+          "defaults come from the component heuristic. The retained configuration and "
+          "execution metadata identify each arm. Both graphs are destroyed before "
+          "the session releases their programs. Only graph replay is timed.")
+    elif r.get("version", 0) >= 2:
         a("Hashes are collected again when saving, after lazy imports, so local input, "
           "oracle, preparation, planning, launch and compiler helpers are included.")
     a("")

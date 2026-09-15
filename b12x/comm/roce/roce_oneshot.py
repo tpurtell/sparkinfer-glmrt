@@ -468,7 +468,7 @@ class RoceOneshotAllReduce:
         tail = self._epoch_address + 4 * (1 + self._counter_classes + counter_class)
         return stage, tail
 
-    def prepare(
+    def _prepare_resources(
         self,
         dtypes: Sequence[torch.dtype] = (torch.bfloat16,),
         *,
@@ -491,11 +491,6 @@ class RoceOneshotAllReduce:
             if padded_gather:
                 self._gather_scratch(PACK_BYTES)
 
-    def prepare_graph_all_reduce(
-        self, inp: torch.Tensor, *, stream: object = None
-    ) -> None:
-        """Compile the launcher for ``inp.dtype`` ahead of CUDA graph capture."""
-        self.prepare((inp.dtype,))
 
     # -- execution ----------------------------------------------------------------
 
@@ -507,22 +502,26 @@ class RoceOneshotAllReduce:
         stream: object = None,
         channel_id: Optional[str] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
+        plan,
     ) -> torch.Tensor:
-        """Sum ``inp`` across ranks into ``out`` (allocated like ``inp`` when omitted).
+        """Run a published prepared RoCE all-reduce."""
+        del channel_id, peer_input_ptrs
+        from b12x.preparation.types import require_prepared
 
-        Eligibility (``should_allreduce``) depends only on dtype, shape and size,
-        so every tensor-parallel rank takes the same decision; a pointer that is
-        not 16-byte aligned is staged through runtime scratch instead of being
-        rejected.  A poisoned runtime (a previous wait timed out) raises here
-        before anything is launched: a failed collective is fatal, never a
-        fallback.  Admission through kernel enqueue holds the lifecycle lock so
-        ``close`` cannot release the proxy meanwhile.  Launches on different
-        streams are ordered with an event; under CUDA graph capture every
-        collective must be captured on one stream.  Without ``out`` the output
-        comes from the caller's allocator; under capture that is the graph's
-        private pool, which replays at a fixed address.
-        """
+        prepared = require_prepared(plan, "comm.roce", self.device)
+        if prepared.runtime is not self:
+            raise ValueError("RoCE plan belongs to another runtime")
+        return self._run_prepared_all_reduce(inp, prepared=prepared, out=out, stream=stream)
 
+    def _run_prepared_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        prepared: object,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        """Run a materialized launcher during priming or once the plan is published."""
         with self._lock:
             self.check_health()
             if not self.should_allreduce(inp):
@@ -546,11 +545,14 @@ class RoceOneshotAllReduce:
             with torch.cuda.device(self.device), context:
                 # Capture state belongs to the target stream, so query it here.
                 capturing = torch.cuda.is_current_stream_capturing()
-                if capturing and not is_launcher_prepared(*key):
+                if capturing and inp.dtype not in prepared.reduce_launchers:
                     raise RuntimeError(
-                        "RoCE all-reduce launcher must be prepared before CUDA graph capture"
+                        "RoCE all-reduce dtype was not prepared for CUDA graph capture"
                     )
-                launcher = get_launcher(*key)
+                try:
+                    launcher = prepared.reduce_launchers[inp.dtype]
+                except KeyError as exc:
+                    raise ValueError("RoCE all-reduce dtype differs from preparation") from exc
                 if out is None:
                     out = torch.empty_like(inp)
                 src = inp
@@ -717,15 +719,28 @@ class RoceOneshotAllReduce:
         dim: int = -1,
         out: Optional[torch.Tensor] = None,
         stream: object = None,
+        plan,
     ) -> torch.Tensor:
-        """Concatenate every rank's ``inp`` along ``dim`` (0 or the last dim).
+        """Run a published prepared RoCE all-gather."""
+        from b12x.preparation.types import require_prepared
 
-        With 16-byte-aligned rows the kernel writes the concatenated layout
-        directly (no reshape or copy afterwards).  Otherwise the shards are
-        gathered contiguously with 16-byte padding and finished with a torch
-        reshape, which still keeps the collective on RDMA.
-        """
+        prepared = require_prepared(plan, "comm.roce", self.device)
+        if prepared.runtime is not self:
+            raise ValueError("RoCE plan belongs to another runtime")
+        return self._run_prepared_all_gather(
+            inp, prepared=prepared, dim=dim, out=out, stream=stream
+        )
 
+    def _run_prepared_all_gather(
+        self,
+        inp: torch.Tensor,
+        *,
+        prepared: object,
+        dim: int = -1,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        """Run a materialized gather launcher during priming or once the plan is published."""
         with self._lock:
             self.check_health()
             if not self.should_all_gather(inp, dim):
@@ -763,7 +778,8 @@ class RoceOneshotAllReduce:
                     )
                     self._order_stream(capturing)
                     self._launch_gather(
-                        inp.data_ptr(), out.data_ptr(), nbytes, row_packs
+                        prepared.gather_launcher, inp.data_ptr(), out.data_ptr(),
+                        nbytes, row_packs,
                     )
                     self._mark_stream(capturing)
                     return out
@@ -776,7 +792,8 @@ class RoceOneshotAllReduce:
                 staged[:nbytes].copy_(inp.reshape(-1).view(torch.uint8))
                 self._order_stream(capturing)
                 self._launch_gather(
-                    staged.data_ptr(), gathered.data_ptr(), padded, padded // PACK_BYTES
+                    prepared.gather_launcher, staged.data_ptr(), gathered.data_ptr(),
+                    padded, padded // PACK_BYTES,
                 )
                 self._mark_stream(capturing)
                 stacked = (
@@ -816,16 +833,10 @@ class RoceOneshotAllReduce:
         return staged[:padded], gathered[: self.world_size * padded]
 
     def _launch_gather(
-        self, input_address: int, output_address: int, nbytes: int, row_packs: int
+        self, launcher, input_address: int, output_address: int, nbytes: int,
+        row_packs: int,
     ) -> None:
-        """Launch the all-gather kernel for ``nbytes`` per rank with ``row_packs`` 16-byte packs per row."""
-        key = self._gather_launcher_key()
-        capturing = torch.cuda.is_current_stream_capturing()
-        if capturing and not _allgather_cute.is_launcher_prepared(*key):
-            raise RuntimeError(
-                "RoCE all-gather launcher must be prepared before CUDA graph capture"
-            )
-        launcher = _allgather_cute.get_launcher(*key)
+        """Launch an already prepared all-gather kernel."""
         # Same size-aware geometry as the all-reduce: a small shard (top-k
         # values and ids, MTP logits) launches a few blocks instead of the
         # full grid, and each power-of-two grid has its own arrival counters
@@ -850,7 +861,7 @@ class RoceOneshotAllReduce:
             self.spin_limit,
             grid_blocks,
         )
-        if not capturing:
+        if not torch.cuda.is_current_stream_capturing():
             self.check_health()
 
     @contextmanager

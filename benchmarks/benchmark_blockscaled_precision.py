@@ -24,7 +24,7 @@ from b12x.gemm import blockscaled
 from b12x.gemm.blockscaled import _a16
 from b12x._lib.dense_gemm import dense_gemm, dense_gemm_fused_quant_a
 from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm._shared.wo_mxfp8 import quantize_mxfp8_rows_torch, dequantize_mxfp8_rows_torch
 from benchmarks.common import make_l2_flush_fn
 
@@ -88,12 +88,9 @@ def _capture(fn):
         fn()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    freeze_kernel_resolution("precision benchmark capture")
-    try:
+    with kernel_resolution_guard('precision benchmark capture'):
         with torch.cuda.graph(graph):
             fn()
-    finally:
-        unfreeze_kernel_resolution()
     return graph
 
 

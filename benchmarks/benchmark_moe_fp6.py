@@ -22,13 +22,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from benchmarks.fp6_common import (
     bf16_grouped_moe,
-    capture_graph_replay,
     check_outputs,
     fmt_us,
     make_l2_flush_fn,
     resolve_l2_flush_bytes,  # noqa: F401  (re-exported CLI helper)
     unswizzled_ue8m0_grid,
 )
+from b12x.preparation import PreparationSession
+from benchmarks.moe_preparation import prepared_call, request_for_capacity, scratch_for
 
 
 def main() -> None:
@@ -103,7 +104,7 @@ def main() -> None:
             intermediate_scale=w.a2_gscale,
         ),
     )
-    plan = fused_moe.plan_execution(
+    declaration = fused_moe.plan_execution(
         experts=prepared,
         capacity=fused_moe.ExecutionCapacity(
             max_tokens=m,
@@ -112,15 +113,33 @@ def main() -> None:
             route_num_experts=0,
         ),
     )
-    fused_moe.prewarm(plan)
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[i].device)
-        for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
-    )
     out = torch.empty(m, k, device=device, dtype=torch.bfloat16)
+    request = request_for_capacity(
+        declaration,
+        name="fp6-moe",
+        calls={
+            count: prepared_call(
+                output=out,
+                bind=lambda state, scratch: state.bind(
+                    scratch=scratch,
+                    a=x,
+                    experts=prepared,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    output=out,
+                    input_scales_static=True,
+                ),
+            )
+            for count in getattr(declaration, "token_counts", (m,))
+        },
+    )
+    session = PreparationSession(device=device)
+    result = session.prepare((request,))
+    variants = getattr(declaration, "variants", None)
+    plan = declaration if variants is None else variants.get(m, declaration)
     binding = fused_moe.bind(
         plan,
-        scratch=scratch,
+        scratch=scratch_for(plan),
         a=x,
         experts=prepared,
         topk_weights=topk_weights,
@@ -142,7 +161,17 @@ def main() -> None:
     check_outputs(out, ref, label="bf16 grouped MoE", cosine_threshold=0.99)
     del w1_bf, w2_bf
 
-    replay = capture_graph_replay(launch)
+    graph = torch.cuda.CUDAGraph()
+    for _ in range(3):
+        launch()
+    torch.cuda.synchronize()
+    with session.capture():
+        with torch.cuda.graph(graph):
+            launch()
+
+    def replay() -> None:
+        graph.replay()
+
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     for _ in range(args.warmup):
         if l2_flush is not None:
@@ -164,6 +193,9 @@ def main() -> None:
         f"W6A8 MX-FP6 MoE synthetic m={m} k={k} n={n} E={e} topk={topk}: "
         f"{fmt_us(times)}  (median {med:.3f} ms)"
     )
+    graph.reset()
+    result.close()
+    session.close()
 
 
 if __name__ == "__main__":

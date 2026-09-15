@@ -1,42 +1,28 @@
-"""Serving freeze guards (ported semantics from b12x runtime_control)."""
-
-from __future__ import annotations
-
-import importlib
-
+"""Independent capture/session scopes may not unfreeze one another."""
 import pytest
 
-rc = importlib.import_module("b12x._lib.runtime_control")
+from b12x._lib import runtime_control as rc
 
 
-def test_freeze_blocks_kernel_resolution_with_context():
-    assert not rc.kernel_resolution_frozen()
-    rc.freeze_kernel_resolution("unit-test")
+def test_outer_guard_survives_inner_scope_and_exception():
+    with rc.kernel_resolution_guard("serving"):
+        with pytest.raises(ValueError):
+            with rc.kernel_resolution_guard("temporary capture"):
+                raise ValueError("capture failed")
+        with pytest.raises(rc.KernelResolutionFrozenError):
+            rc.raise_if_kernel_resolution_frozen("uncached launch")
+    rc.raise_if_kernel_resolution_frozen("new preparation")
+
+
+def test_independent_guards_can_exit_out_of_order():
+    first = rc.kernel_resolution_guard("first session")
+    second = rc.kernel_resolution_guard("second session")
+    first.__enter__()
+    second.__enter__()
     try:
-        assert rc.kernel_resolution_frozen()
-        with pytest.raises(rc.KernelResolutionFrozenError) as excinfo:
-            rc.raise_if_kernel_resolution_frozen(
-                "compile",
-                target=test_freeze_blocks_kernel_resolution_with_context,
-                cache_key=("shape", 128),
-            )
-        message = str(excinfo.value)
-        assert "unit-test" in message
-        assert "compile" in message
-        assert "freeze_kernel_resolution" in message
+        first.__exit__(None, None, None)
+        with pytest.raises(rc.KernelResolutionFrozenError):
+            rc.raise_if_kernel_resolution_frozen("uncached launch")
     finally:
-        rc.unfreeze_kernel_resolution()
-    assert not rc.kernel_resolution_frozen()
-    rc.raise_if_kernel_resolution_frozen("compile")  # no-op when unfrozen
-
-
-def test_compilation_aliases_are_the_same_functions():
-    assert rc.freeze_compilation is rc.freeze_kernel_resolution
-    assert rc.unfreeze_compilation is rc.unfreeze_kernel_resolution
-    assert rc.compilation_frozen is rc.kernel_resolution_frozen
-
-
-def test_namespace_root_reexports():
-    b12x = importlib.import_module("b12x")
-    assert b12x.freeze_kernel_resolution is rc.freeze_kernel_resolution
-    assert b12x.KernelResolutionFrozenError is rc.KernelResolutionFrozenError
+        second.__exit__(None, None, None)
+    rc.raise_if_kernel_resolution_frozen("new preparation")

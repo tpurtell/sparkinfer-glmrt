@@ -17,9 +17,9 @@ BF16 and E4M3 records are supported. For E4M3 cache with BF16 query input,
 ``q_dtype=torch.bfloat16`` plans fixed query-quantization storage in the same
 caller-owned scratch buffer.
 
-Planned lifecycle: ``plan(Caps(...))`` -> caller allocates ``scratch_specs`` ->
-``bind`` (views and validation only) -> ``compile``/``run``. Decode and extend
-share the same graph-safe dense core. No selected-index array is materialized.
+Planned lifecycle: ``plan(Caps(...))`` -> ``PreparationSession.prepare`` ->
+``bind(plan, ...)`` -> ``run(plan=..., binding=...)``. Scratch is
+caller-owned; preparation resolves and primes every native entry.
 """
 
 from __future__ import annotations
@@ -41,8 +41,9 @@ META = OpMeta(
         "Binding",
         "Scratch",
         "plan",
+        "invocation_from_descriptors",
+        "invocation_from_tensors",
         "bind",
-        "compile",
         "run",
         "reference",
         "infer_mode",
@@ -80,8 +81,9 @@ if TYPE_CHECKING:
         Scratch,
         bind,
         clear_caches,
-        compile,
         infer_mode,
+        invocation_from_descriptors,
+        invocation_from_tensors,
         is_supported,
         plan,
         reference,

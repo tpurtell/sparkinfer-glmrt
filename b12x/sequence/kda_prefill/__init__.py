@@ -21,12 +21,13 @@ scalars, so one plan serves every batch shape within its capacity. Tokens are
 processed in sixteen-token chunks, ordered so that one pipeline window advances
 every live request, which keeps the prepare and recurrence kernels overlapped.
 
-Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` -> ``run``. Runtime launches
-use caller-owned scratch, allocate no tensor storage, and are capture safe.
-Device-side validation is transactional: bit 0 reports a duplicate or
-conflicting write slot, bit 1 malformed packed metadata, bit 2 an invalid state
-slot, and bit 3 an unusable checkpoint offset. Any error poisons the live
-output rows without mutating recurrent state.
+Declare geometry and parameter dtypes with ``plan(Caps(...), invocation=...)``;
+``invocation_from_tensors`` supplies the immutable dtype coordinates.
+``PreparationSession`` selects and primes the plan before ``bind`` may
+consume it. Runtime launches use caller-owned scratch, allocate no tensor
+storage, and are capture safe. Packed metadata is not checked on the device:
+the caller supplies in-range slots, one writer per slot, and chunk-aligned
+checkpoint offsets.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ META = OpMeta(
         "clear_caches",
         "is_supported",
         "plan",
-        "prewarm",
+        "invocation_from_tensors",
         "reference",
         "run",
     ),
@@ -82,7 +83,7 @@ if TYPE_CHECKING:
         clear_caches,
         is_supported,
         plan,
-        prewarm,
+        invocation_from_tensors,
         reference,
         run,
     )

@@ -5,7 +5,7 @@ import gc
 import pytest
 import torch
 
-from b12x.policy import GDN_ATTENTION, PolicyContext, PolicyMode
+from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 from b12x.sequence import gdn_decode as gdn
 
 from ..conftest import require_b12x as require_sm120
@@ -26,30 +26,19 @@ def _randn(
     )
 
 
-def test_kda_plan_materializes_typed_recurrent_block_v() -> None:
-    from b12x.sequence.gdn_decode._impl import Caps, _materialize_plan
+_PREPARATIONS: list[tuple[object, PreparationSession]] = []
 
-    caps = Caps(
-        device="cuda:0",
-        max_tokens=128,
-        max_seqs=32,
-        max_state_slots=129,
-        key_heads=16,
-        value_heads=16,
-        state_index_columns=4,
-        state_dtype=torch.float32,
-        gate_activation="sigmoid",
-    )
-    config = gdn.GdnConfig(backend="triton", recurrent_block_v=16)
 
-    planned = _materialize_plan(
-        caps,
-        config=config,
-        policy_resolution=None,
-    )
-
-    assert planned.config is config
-    assert planned.recurrent_block_v == 16
+@pytest.fixture(autouse=True)
+def _prepared_scopes():
+    try:
+        yield
+    finally:
+        gc.collect()
+        while _PREPARATIONS:
+            result, session = _PREPARATIONS.pop()
+            result.close()
+            session.close()
 
 
 def _make_case(
@@ -63,144 +52,142 @@ def _make_case(
     tensor_columns: int | None = None,
     state_dtype: torch.dtype = torch.float32,
     null_state_index: int | None = None,
-    metadata_validation: str = "transactional",
     noncontiguous_beta: bool = False,
     recurrent_block_v: int | None = None,
 ) -> gdn.KdaBinding:
-    max_seqs = len(query_lengths)
-    live_tokens = sum(query_lengths)
+    max_seqs, live_tokens = len(query_lengths), sum(query_lengths)
     token_capacity = max_tokens if tensor_tokens is None else tensor_tokens
     column_capacity = columns if tensor_columns is None else tensor_columns
-    state_slots = max_seqs * columns + 1
     caps = gdn.Caps(
-        device=device,
-        max_tokens=max_tokens,
-        max_seqs=max_seqs,
-        max_state_slots=state_slots,
-        key_heads=heads,
-        value_heads=heads,
-        state_index_columns=columns,
-        state_dtype=state_dtype,
-        gate_activation="sigmoid",
+        device=device, max_tokens=max_tokens, max_seqs=max_seqs,
+        max_state_slots=max_seqs * columns + 1, key_heads=heads, value_heads=heads,
+        state_index_columns=columns, state_dtype=state_dtype, gate_activation="sigmoid",
         null_state_index=null_state_index,
-        kda_metadata_validation=metadata_validation,
     )
-    policy = None
-    if recurrent_block_v is not None:
-        policy = PolicyContext.for_device(
-            device,
-            mode=PolicyMode.HEURISTIC_ONLY,
-        ).with_override(
-            GDN_ATTENTION,
-            gdn.GdnConfig(
-                backend="triton",
-                recurrent_block_v=recurrent_block_v,
-            ),
-        )
-    plan = gdn.plan(caps, policy=policy)
-    (scratch_spec,) = plan.scratch_specs()
     query_start_loc = torch.tensor(
-        [0, *torch.tensor(query_lengths).cumsum(0).tolist()],
-        dtype=torch.int32,
-        device=device,
+        [0, *torch.tensor(query_lengths).cumsum(0).tolist()], dtype=torch.int32, device=device,
     )
-    state_indices = torch.arange(
-        max_seqs * column_capacity, dtype=torch.int64, device=device
-    ).view(max_seqs, column_capacity)
     raw_beta = _randn((token_capacity, heads), device=device)
     if noncontiguous_beta:
-        raw_beta_storage = torch.empty(
-            (token_capacity, heads + 3), dtype=raw_beta.dtype, device=device
+        storage = torch.empty((token_capacity, heads + 3), dtype=raw_beta.dtype, device=device)
+        storage[:, :heads].copy_(raw_beta)
+        raw_beta = storage[:, :heads]
+    args = {
+        "mixed_qkv": _randn((token_capacity, caps.packed_qkv_width), device=device),
+        "raw_g": _randn((token_capacity, heads, 128), device=device),
+        "raw_beta": raw_beta, "z": _randn((token_capacity, heads, 128), device=device),
+        "A_log": _randn((heads,), device=device, dtype=torch.float32, scale=0.1),
+        "dt_bias": _randn((heads, 128), device=device, dtype=torch.float32, scale=0.1),
+        "norm_weight": (1.0 + _randn((128,), device=device, dtype=torch.float32, scale=0.05)).contiguous(),
+        "recurrent_state": _randn(
+            (max_seqs * columns + 1, heads, 128, 128), device=device, dtype=state_dtype, scale=0.1,
+        ),
+        "query_start_loc": query_start_loc,
+        "num_accepted_tokens": torch.tensor(
+            [min(2, length, column_capacity) for length in query_lengths], dtype=torch.int32, device=device,
+        ),
+        "state_indices": torch.arange(
+            max_seqs * column_capacity, dtype=torch.int64, device=device
+        ).view(max_seqs, column_capacity),
+        "num_seqs": torch.tensor([max_seqs], dtype=torch.int32, device=device),
+        "num_tokens": torch.tensor([live_tokens], dtype=torch.int32, device=device),
+        "output": torch.empty((token_capacity, heads, 128), dtype=torch.bfloat16, device=device),
+    }
+    override = gdn.GdnConfig(backend="triton", recurrent_block_v=recurrent_block_v) if recurrent_block_v else None
+    plan = gdn.plan(caps, invocation=gdn.invocation_from_tensors(caps, **args), override=override)
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        binding = state.bind_kda(
+            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **args
         )
-        raw_beta_storage[:, :heads].copy_(raw_beta)
-        raw_beta = raw_beta_storage[:, :heads]
+        original_state, original_output = binding.recurrent_state.clone(), binding.output.clone()
+
+        def reset():
+            binding.recurrent_state.copy_(original_state)
+            binding.output.copy_(original_output)
+
+        return PreparedCall(
+            run=lambda: state.run(binding, lower_bound=-5.0),
+            output=binding.output, reset=reset, restore=reset,
+        )
+
+    request = plan.request(
+        name=f"kda-{id(args)}", prepare_call=prepare_call,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    result = session.prepare((request,))
+    state = require_prepared(plan, "attention.gdn")
+    (spec,) = state.layout.scratch_specs()
+    _PREPARATIONS.append((result, session))
     return gdn.bind_kda(
-        plan,
-        scratch=torch.empty(
-            scratch_spec.shape, dtype=scratch_spec.dtype, device=device
-        ),
-        mixed_qkv=_randn((token_capacity, caps.packed_qkv_width), device=device),
-        raw_g=_randn((token_capacity, heads, 128), device=device),
-        raw_beta=raw_beta,
-        z=_randn((token_capacity, heads, 128), device=device),
-        A_log=_randn((heads,), device=device, dtype=torch.float32, scale=0.1),
-        dt_bias=_randn((heads, 128), device=device, dtype=torch.float32, scale=0.1),
-        norm_weight=(
-            1.0 + _randn((128,), device=device, dtype=torch.float32, scale=0.05)
-        ).contiguous(),
-        recurrent_state=_randn(
-            (state_slots, heads, 128, 128),
-            device=device,
-            dtype=state_dtype,
-            scale=0.1,
-        ),
-        query_start_loc=query_start_loc,
-        num_accepted_tokens=torch.tensor(
-            [min(2, length, column_capacity) for length in query_lengths],
-            dtype=torch.int32,
-            device=device,
-        ),
-        state_indices=state_indices,
-        num_seqs=torch.tensor([max_seqs], dtype=torch.int32, device=device),
-        num_tokens=torch.tensor([live_tokens], dtype=torch.int32, device=device),
-        output=torch.empty(
-            (token_capacity, heads, 128), dtype=torch.bfloat16, device=device
-        ),
+        plan, scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **args
+    )
+
+
+def _prepare_binding(
+    caps: gdn.Caps, args: dict[str, torch.Tensor], *, override: gdn.GdnConfig | None = None
+) -> gdn.KdaBinding:
+    device = caps.device
+    plan = gdn.plan(caps, invocation=gdn.invocation_from_tensors(caps, **args), override=override)
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        binding = state.bind_kda(
+            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **args
+        )
+        original_state, original_output = binding.recurrent_state.clone(), binding.output.clone()
+
+        def reset():
+            binding.recurrent_state.copy_(original_state)
+            binding.output.copy_(original_output)
+
+        return PreparedCall(
+            run=lambda: state.run(binding, lower_bound=-5.0),
+            output=binding.output, reset=reset, restore=reset,
+        )
+
+    request = plan.request(
+        name=f"kda-{id(args)}", prepare_call=prepare_call,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    result = session.prepare((request,))
+    state = require_prepared(plan, "attention.gdn")
+    (spec,) = state.layout.scratch_specs()
+    _PREPARATIONS.append((result, session))
+    return gdn.bind_kda(
+        plan, scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **args
     )
 
 
 def _rebind(binding: gdn.KdaBinding, **overrides: torch.Tensor) -> gdn.KdaBinding:
     arguments = {
-        "scratch": binding.scratch,
-        "mixed_qkv": binding.mixed_qkv,
-        "raw_g": binding.raw_g,
-        "raw_beta": binding.raw_beta,
-        "z": binding.z,
-        "A_log": binding.A_log,
-        "dt_bias": binding.dt_bias,
-        "norm_weight": binding.norm_weight,
-        "recurrent_state": binding.recurrent_state,
-        "query_start_loc": binding.query_start_loc,
-        "num_accepted_tokens": binding.num_accepted_tokens,
-        "state_indices": binding.state_indices,
-        "num_seqs": binding.num_seqs,
-        "num_tokens": binding.num_tokens,
-        "output": binding.output,
+        "scratch": binding.scratch, "mixed_qkv": binding.mixed_qkv, "raw_g": binding.raw_g,
+        "raw_beta": binding.raw_beta, "z": binding.z, "A_log": binding.A_log,
+        "dt_bias": binding.dt_bias, "norm_weight": binding.norm_weight,
+        "recurrent_state": binding.recurrent_state, "query_start_loc": binding.query_start_loc,
+        "num_accepted_tokens": binding.num_accepted_tokens, "state_indices": binding.state_indices,
+        "num_seqs": binding.num_seqs, "num_tokens": binding.num_tokens, "output": binding.output,
     }
     arguments.update(overrides)
     return gdn.bind_kda(binding.plan, **arguments)
 
 
 def _row_padded(tensor: torch.Tensor, padding: int = 3) -> torch.Tensor:
-    rows = tensor.shape[0]
-    row_elements = tensor[0].numel()
-    storage = torch.empty(
-        (rows, row_elements + padding), dtype=tensor.dtype, device=tensor.device
-    )
+    rows, row_elements = tensor.shape[0], tensor[0].numel()
+    storage = torch.empty((rows, row_elements + padding), dtype=tensor.dtype, device=tensor.device)
     result = storage[:, :row_elements].view(tensor.shape)
     result.copy_(tensor)
     return result
 
 
 def _reference(binding: gdn.KdaBinding, state: torch.Tensor) -> torch.Tensor:
-    caps = binding.plan.caps
+    caps = binding._state.caps
     return gdn.reference.decode_kda(
-        binding.mixed_qkv,
-        binding.raw_g,
-        binding.raw_beta,
-        binding.z,
-        binding.A_log,
-        binding.dt_bias,
-        binding.norm_weight,
-        state,
-        binding.query_start_loc,
-        binding.num_accepted_tokens,
-        binding.state_indices,
-        binding.num_seqs,
-        binding.num_tokens,
-        heads=caps.value_heads,
-        qk_l2norm=caps.qk_l2norm,
-        null_state_index=caps.null_state_index,
+        binding.mixed_qkv, binding.raw_g, binding.raw_beta, binding.z, binding.A_log,
+        binding.dt_bias, binding.norm_weight, state, binding.query_start_loc,
+        binding.num_accepted_tokens, binding.state_indices, binding.num_seqs, binding.num_tokens,
+        heads=caps.value_heads, qk_l2norm=caps.qk_l2norm, null_state_index=caps.null_state_index,
     )
 
 
@@ -379,14 +366,12 @@ def test_kda_rmsnorm_kernel_avoids_intermediate_bf16_rounding() -> None:
         torch.bfloat16
     )
     num_tokens = torch.ones(1, dtype=torch.int32, device=device)
-    error_code = torch.zeros(1, dtype=torch.int32, device=device)
 
     _gated_rmsnorm_kernel[(1,)](
         output,
         z,
         norm_weight,
         num_tokens,
-        error_code,
         eps,
         1,
         stride_output_token=output.stride(0),
@@ -435,7 +420,7 @@ def test_packed_kda_matches_reference(
     torch.cuda.synchronize(device)
 
     assert actual.data_ptr() == binding.output.data_ptr()
-    assert binding.plan.recurrent_block_v == recurrent_block_v
+    assert binding._state.recurrent_block_v == recurrent_block_v
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(
         binding.recurrent_state,
@@ -446,7 +431,7 @@ def test_packed_kda_matches_reference(
     assert torch.count_nonzero(actual[4:]) == 0
 
 
-def test_kda_binds_live_tensors_without_device_validation() -> None:
+def test_kda_binds_live_tensors_within_planned_capacity() -> None:
     device = require_sm120()
     binding = _make_case(
         device=device,
@@ -455,7 +440,6 @@ def test_kda_binds_live_tensors_without_device_validation() -> None:
         max_tokens=6,
         tensor_tokens=2,
         tensor_columns=1,
-        metadata_validation="trusted",
         noncontiguous_beta=True,
     )
     binding = _rebind(
@@ -467,7 +451,6 @@ def test_kda_binds_live_tensors_without_device_validation() -> None:
     )
     state_reference = binding.recurrent_state.clone()
     expected = _reference(binding, state_reference)
-    binding.error_code.fill_(7)
 
     actual = gdn.run_kda(binding)
     torch.cuda.synchronize(device)
@@ -478,31 +461,10 @@ def test_kda_binds_live_tensors_without_device_validation() -> None:
     assert not binding.z.is_contiguous()
     assert not binding.output.is_contiguous()
     assert actual.data_ptr() == binding.output.data_ptr()
-    assert binding.error_code.item() == 7
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(
         binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
     )
-
-
-def test_kda_validation_uses_bound_tensor_capacity() -> None:
-    device = require_sm120()
-    binding = _make_case(
-        device=device,
-        query_lengths=(1, 1),
-        columns=3,
-        max_tokens=6,
-        tensor_tokens=2,
-        tensor_columns=1,
-    )
-    state_before = binding.recurrent_state.clone()
-    binding.num_tokens.fill_(3)
-
-    actual = gdn.run_kda(binding)
-    torch.cuda.synchronize(device)
-
-    assert torch.isnan(actual).all()
-    torch.testing.assert_close(binding.recurrent_state, state_before, rtol=0, atol=0)
 
 
 def test_kda_binding_rejects_invalid_live_contract() -> None:
@@ -513,8 +475,8 @@ def test_kda_binding_rejects_invalid_live_contract() -> None:
         _rebind(
             binding,
             mixed_qkv=torch.empty(
-                binding.plan.caps.max_tokens + 1,
-                binding.plan.caps.packed_qkv_width,
+                binding._state.caps.max_tokens + 1,
+                binding._state.caps.packed_qkv_width,
                 dtype=torch.bfloat16,
                 device=device,
             ),
@@ -527,7 +489,7 @@ def test_kda_binding_rejects_invalid_live_contract() -> None:
         )
 
 
-def test_live_kda_cuda_graph_replays_without_validation() -> None:
+def test_live_kda_cuda_graph_replays_bound_capacity() -> None:
     device = require_sm120()
     binding = _make_case(
         device=device,
@@ -536,13 +498,11 @@ def test_live_kda_cuda_graph_replays_without_validation() -> None:
         max_tokens=6,
         tensor_tokens=2,
         tensor_columns=1,
-        metadata_validation="trusted",
     )
 
     def launch() -> torch.Tensor:
         return gdn.run_kda(_rebind(binding))
 
-    binding.error_code.fill_(11)
     launch()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -558,11 +518,11 @@ def test_live_kda_cuda_graph_replays_without_validation() -> None:
     torch.cuda.synchronize(device)
 
     assert captured_output.data_ptr() == output_ptr
-    assert binding.error_code.item() == 11
     torch.testing.assert_close(captured_output, expected, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(
         binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
     )
+    graph.reset()
 
 
 def test_glm53_tp8_head_geometry_matches_reference() -> None:
@@ -609,20 +569,6 @@ def test_kda_rejected_draft_restarts_from_accepted_checkpoint() -> None:
     )
 
 
-def test_kda_duplicate_state_slot_is_transactional() -> None:
-    device = require_sm120()
-    binding = _make_case(device=device)
-    binding.state_indices[0, :3].fill_(1)
-    before = binding.recurrent_state.clone()
-
-    actual = gdn.run_kda(binding)
-    torch.cuda.synchronize(device)
-
-    assert binding.error_code.item() & 1
-    assert torch.isnan(actual).all()
-    torch.testing.assert_close(binding.recurrent_state, before, rtol=0, atol=0)
-
-
 def test_kda_null_state_sentinel_is_graph_safe_and_immutable() -> None:
     device = require_sm120()
     binding = _make_case(device=device, null_state_index=0)
@@ -647,11 +593,11 @@ def test_kda_null_state_sentinel_is_graph_safe_and_immutable() -> None:
     graph.replay()
     torch.cuda.synchronize(device)
 
-    assert binding.error_code.item() == 0
     assert captured_output.data_ptr() == output_ptr
     assert binding.recurrent_state.data_ptr() == state_ptr
     assert torch.count_nonzero(captured_output) == 0
     torch.testing.assert_close(binding.recurrent_state, before, rtol=0, atol=0)
+    graph.reset()
 
 
 def test_kda_cuda_graph_replay_preserves_addresses() -> None:
@@ -679,6 +625,7 @@ def test_kda_cuda_graph_replay_preserves_addresses() -> None:
     torch.testing.assert_close(
         binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
     )
+    graph.reset()
 
 
 @pytest.mark.parametrize("recurrent_block_v", [16, 32])
@@ -688,10 +635,7 @@ def test_kda_tiles_reuse_compiled_kernels_with_mutable_live_counts(
     state_dtype: torch.dtype,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution,
-        unfreeze_kernel_resolution,
-    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.sequence.gdn_decode import _kernels
 
     device = require_sm120()
@@ -722,8 +666,7 @@ def test_kda_tiles_reuse_compiled_kernels_with_mutable_live_counts(
             binding.output,
         )
     )
-    freeze_kernel_resolution("KDA tile policy live-count qualification")
-    try:
+    with kernel_resolution_guard("KDA tile live-count qualification"):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             gdn.run_kda(binding)
@@ -751,7 +694,6 @@ def test_kda_tiles_reuse_compiled_kernels_with_mutable_live_counts(
             after = torch.cuda.memory_stats(device)
             for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
                 assert before[key] == after[key]
-            assert binding.error_code.item() == 0
             assert bool(torch.isfinite(binding.output).all())
             assert int(torch.count_nonzero(binding.output[:tokens])) > 0
             torch.testing.assert_close(binding.output, expected, rtol=1e-2, atol=2e-2)
@@ -772,8 +714,7 @@ def test_kda_tiles_reuse_compiled_kernels_with_mutable_live_counts(
                 binding.output,
             )
         ) == addresses
-    finally:
-        unfreeze_kernel_resolution()
+    graph.reset()
 
 
 def test_kda_torch_compile_fullgraph_keeps_outer_op_opaque() -> None:
@@ -848,28 +789,13 @@ def test_kda_padded_state_slot_past_int32_element_boundary() -> None:
     num_seqs = torch.ones(1, dtype=torch.int32, device=device)
     num_tokens = torch.ones(1, dtype=torch.int32, device=device)
     output = torch.empty((1, heads, 128), dtype=torch.bfloat16, device=device)
-    planned = gdn.plan(caps)
-    (scratch_spec,) = planned.scratch_specs()
-    binding = gdn.bind_kda(
-        planned,
-        scratch=torch.empty(
-            scratch_spec.shape, dtype=scratch_spec.dtype, device=device
-        ),
-        mixed_qkv=mixed_qkv,
-        raw_g=raw_g,
-        raw_beta=raw_beta,
-        z=z,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        norm_weight=norm_weight,
-        recurrent_state=recurrent_state,
-        query_start_loc=query_start_loc,
-        num_accepted_tokens=accepted,
-        state_indices=state_indices,
-        num_seqs=num_seqs,
-        num_tokens=num_tokens,
-        output=output,
-    )
+    binding = _prepare_binding(caps, {
+        "mixed_qkv": mixed_qkv, "raw_g": raw_g, "raw_beta": raw_beta, "z": z,
+        "A_log": A_log, "dt_bias": dt_bias, "norm_weight": norm_weight,
+        "recurrent_state": recurrent_state, "query_start_loc": query_start_loc,
+        "num_accepted_tokens": accepted, "state_indices": state_indices,
+        "num_seqs": num_seqs, "num_tokens": num_tokens, "output": output,
+    })
     expected = gdn.reference.decode_kda(
         mixed_qkv,
         raw_g,

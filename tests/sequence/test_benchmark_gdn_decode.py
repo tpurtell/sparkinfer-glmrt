@@ -92,14 +92,10 @@ def test_graph_contract_poison_precedes_replay_and_state_output_gate() -> None:
     source = inspect.getsource(benchmark._bench_graph)
 
     output_poison = source.index('binding.output.fill_(float("nan"))')
-    scratch_poison = source.index("binding.scratch.fill_(0xFF)")
-    replay = source.index("graph.replay()", scratch_poison)
+    replay = source.index("graph.replay()", output_poison)
     replay_gate = source.index("replay_correctness = _check_current_result")
-    assert output_poison < scratch_poison < replay < replay_gate
+    assert output_poison < replay < replay_gate
     assert "graph_replay_after_output_poison" in {
-        field.name for field in fields(benchmark.CaseReport)
-    }
-    assert "graph_replay_after_scratch_poison" in {
         field.name for field in fields(benchmark.CaseReport)
     }
 

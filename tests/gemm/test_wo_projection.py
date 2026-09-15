@@ -1,143 +1,186 @@
-"""gemm.wo_projection: planned lifecycle parity (plan -> bind -> run) against
-a quantized torch reference, plus the fused inverse-RoPE variant replaying
-under CUDA-graph capture with poisoned scale padding.
-
-Curated from b12x tests/test_gemm_wo_projection.py (1.2k lines upstream);
-split-GEMM leaves, packing round-trips, and byte-identity policy tests stay
-in the b12x repo.
-"""
-
+"""Prepared WO projection numerical behavior."""
 from __future__ import annotations
 
+from contextlib import ExitStack
+
+import pytest
 import torch
 
 from b12x.gemm import wo_projection as wo
-from b12x.gemm._shared.wo_mxfp8 import (
-    dequantize_mxfp8_rows_torch,
-    quantize_wo_projection_weights_mxfp8_torch,
-)
-
+from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch, quantize_wo_projection_weights_mxfp8_torch
+from b12x.preparation import PreparedCall, PreparationSession
 from ..conftest import require_b12x
 
 
+def _prepared(caps, source, weights):
+    resources = ExitStack()
+    specs = ()
+    declaration = wo.plan(caps)
+
+    def prepare(state):
+        nonlocal specs
+        specs = state._scratch_state.scratch_specs()
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=caps.device) for spec in specs)
+        binding = state.bind(scratch=scratch, source_tgd=source, weights=weights)
+        return PreparedCall(run=lambda: state.run(binding))
+
+    session = resources.enter_context(PreparationSession(device=caps.device, autotune=False, compile_workers=2))
+    resources.enter_context(session.prepare((declaration.request(
+        name="wo", prepare_call=prepare,
+    ),)))
+    plan = declaration
+    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=caps.device) for spec in specs)
+    return resources, plan, wo.bind(plan, scratch=scratch, source_tgd=source, weights=weights)
+
+
 def test_plan_bind_run_singleton_group_matches_quantized_reference() -> None:
-    """TP8 collapses DSV4's eight output groups to one local WO group."""
     require_b12x()
     torch.manual_seed(31005)
-
     tokens, groups, group_width, rank, hidden = 3, 1, 512, 128, 128
-    x_tgd = (
-        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
-        / 4
-    )
-    wo_a_grd = (
-        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
-        / group_width**0.5
-    )
-    wo_b_hgr = (
-        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
-        / (groups * rank) ** 0.5
-    )
-
-    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
-    plan = wo.plan(
-        wo.Caps(
-            device=x_tgd.device,
-            max_tokens=tokens,
-            groups=groups,
-            group_width=group_width,
-            rank=rank,
-            hidden=hidden,
-            dtype=x_tgd.dtype,
-        )
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=x_tgd.device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    )
-    binding = wo.bind(
-        plan, scratch=scratch, source_tgd=x_tgd, weights=weights, expected_m=tokens
-    )
-    actual = wo.run(binding=binding)
-    torch.cuda.synchronize()
-
-    x_q = wo.quantize_input(x_tgd)
-    x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
-    wo_a_deq = dequantize_mxfp8_rows_torch(weights.wo_a.values, weights.wo_a.scale_rows)
-    tmp = (x_deq @ wo_a_deq.T).to(torch.bfloat16).unsqueeze(-1)
-    tmp_q = wo.quantize_input_b(tmp)
-    tmp_deq = dequantize_mxfp8_rows_torch(tmp_q.values, tmp_q.scale_rows)
-    wo_b_deq = dequantize_mxfp8_rows_torch(weights.wo_b.values, weights.wo_b.scale_rows)
-    expected = tmp_deq @ wo_b_deq.T
-
-    torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
-
-
-def test_run_inv_rope_replays_under_graph_with_uninitialized_scale_padding() -> None:
-    require_b12x()
-    torch.manual_seed(31007)
-
-    tokens = 1
-    groups = 2
-    heads_per_group = 4
-    nope_dim = 96
-    rope_dim = 32
-    head_dim = nope_dim + rope_dim
-    group_width = heads_per_group * head_dim
-    rank, hidden = 64, 128
-    o = (
-        torch.randn(
-            (tokens, groups * heads_per_group, head_dim),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        / 4
-    ).contiguous()
-    positions = torch.zeros((tokens,), device="cuda", dtype=torch.long)
-    cos_sin_cache = torch.zeros((4, rope_dim), device="cuda", dtype=torch.float32)
-    cos_sin_cache[:, : rope_dim // 2] = 1
-    wo_a = (
-        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
-        / group_width**0.5
-    )
-    wo_b = (
-        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
-        / (groups * rank) ** 0.5
-    )
+    source = torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16) / 4
+    wo_a = torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16) / group_width**0.5
+    wo_b = torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16) / (groups * rank) ** 0.5
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a, wo_b)
+    caps = wo.Caps(device=source.device, max_tokens=tokens, groups=groups, group_width=group_width, rank=rank, hidden=hidden)
+    resources, plan, binding = _prepared(caps, source, weights)
+    with resources:
+        actual = wo.run(binding=binding, plan=plan)
+        x = wo.quantize_input(source, plan=plan)
+        tmp = (dequantize_mxfp8_rows_torch(x.values, x.scale_rows) @ dequantize_mxfp8_rows_torch(weights.wo_a.values, weights.wo_a.scale_rows).T).to(torch.bfloat16).unsqueeze(-1)
+        tmp_q = wo.quantize_input_b(tmp, plan=plan)
+        expected = dequantize_mxfp8_rows_torch(tmp_q.values, tmp_q.scale_rows) @ dequantize_mxfp8_rows_torch(weights.wo_b.values, weights.wo_b.scale_rows).T
+        torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
 
-    def run_once() -> torch.Tensor:
-        return wo.run_inv_rope(
-            o,
-            positions,
-            cos_sin_cache,
-            weights,
-            heads_per_group=heads_per_group,
-            nope_dim=nope_dim,
-            rope_dim=rope_dim,
-            expected_m=1,
+def test_inverse_rope_prepared_execution_rejects_mismatched_runtime_pointer_dtype() -> None:
+    require_b12x()
+    tokens, groups, heads_per_group, nope_dim, rope_dim, rank, hidden = 1, 1, 1, 96, 32, 128, 128
+    o = torch.randn((tokens, groups * heads_per_group, nope_dim + rope_dim), device="cuda", dtype=torch.bfloat16)
+    positions = torch.zeros((tokens,), device="cuda", dtype=torch.int64)
+    cos_sin_cache = torch.randn((4, rope_dim), device="cuda", dtype=torch.bfloat16)
+    weights = quantize_wo_projection_weights_mxfp8_torch(
+        torch.randn((groups, rank, heads_per_group * (nope_dim + rope_dim)), device="cuda", dtype=torch.bfloat16),
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16),
+    )
+    caps = wo.Caps(
+        device=o.device, max_tokens=tokens, groups=groups, group_width=heads_per_group * (nope_dim + rope_dim),
+        rank=rank, hidden=hidden,
+    )
+    declaration = wo.plan(
+        caps,
+        invocation={"operation": "inv_rope", "heads_per_group": heads_per_group,
+                    "nope_dim": nope_dim, "rope_dim": rope_dim},
+    )
+    resources = ExitStack()
+    specs = ()
+
+    def prepare(state):
+        nonlocal specs
+        specs = state._scratch_state.scratch_specs()
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=o.device) for spec in specs)
+        binding = state.bind_inv_rope(
+            scratch=scratch, o=o, positions=positions, cos_sin_cache=cos_sin_cache, weights=weights,
+            heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim,
+        )
+        return PreparedCall(run=lambda: state.run_inv_rope(binding))
+
+    session = resources.enter_context(PreparationSession(device=o.device, autotune=False, compile_workers=2))
+    resources.enter_context(session.prepare((declaration.request(
+        name="wo-inv", prepare_call=prepare,
+    ),)))
+    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=o.device) for spec in specs)
+    with resources:
+        plan = declaration
+        with pytest.raises(ValueError, match="dtypes differ"):
+            wo.bind_inv_rope(
+                plan, scratch=scratch, o=o, positions=positions.to(torch.int32),
+                cos_sin_cache=cos_sin_cache, weights=weights, heads_per_group=heads_per_group,
+                nope_dim=nope_dim, rope_dim=rope_dim,
+            )
+
+
+
+
+@torch.no_grad()
+def test_prefill_chunk_remainders_reuse_launchers_and_replay():
+    require_b12x()
+    from dataclasses import replace
+    from b12x.preparation._measurement import no_compilation
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity, groups, width, rank, hidden = 4096, 2, 4096, 1024, 5120
+    counts = (1, 129, 3575, 3582, capacity)
+    source = torch.randn(capacity, 16, 512, dtype=torch.bfloat16, device=device) / 8
+    positions = torch.arange(capacity, device=device).remainder_(64)
+    angles = torch.randn(64, 32, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1).bfloat16()
+    weights = quantize_wo_projection_weights_mxfp8_torch(
+        torch.randn(groups, rank, width, device=device, dtype=torch.bfloat16) / width**0.5,
+        torch.randn(hidden, groups * rank, device=device, dtype=torch.bfloat16) / (groups * rank)**0.5,
+    )
+    caps = wo.Caps(device=device, max_tokens=capacity, groups=groups, group_width=width, rank=rank, hidden=hidden)
+    invocation = dict(operation="inv_rope", heads_per_group=8, nope_dim=448, rope_dim=64)
+    prefill = wo.plan(caps, invocation={**invocation, "dynamic_tokens": True})
+    exact = {rows: wo.plan(replace(caps, max_tokens=rows), invocation=invocation) for rows in counts}
+
+    def bind(state, scratch, rows):
+        return state.bind_inv_rope(
+            scratch=scratch, o=source[:rows], positions=positions[:rows], cos_sin_cache=table,
+            weights=weights, heads_per_group=8, nope_dim=448, rope_dim=64,
         )
 
-    # Warm all compilation/allocation before capture, then verify replay
-    # observes changed inputs without allocating or depending on stale scale
-    # padding.
-    run_once()
-    run_once()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = run_once()
-    for _ in range(3):
-        graph.replay()
-    torch.cuda.synchronize()
+    def prepare(state):
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                        for spec in state._scratch_state.scratch_specs())
+        binding = bind(state, scratch, state.query.max_tokens)
+        return PreparedCall(run=lambda: state.run_inv_rope(binding))
 
-    o.copy_(torch.randn_like(o) / 4)
-    graph.replay()
-    torch.cuda.synchronize()
-    replayed = captured.clone()
-    expected = run_once().clone()
-    torch.cuda.synchronize()
-
-    assert bool(torch.isfinite(replayed).all().item())
-    assert bool((replayed != 0).any().item())
-    torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare(tuple(plan.request(name=f"wo.{index}", prepare_call=prepare)
+                              for index, plan in enumerate((prefill, *exact.values()))))
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in prefill.scratch_specs())
+        reference_scratch = tuple(torch.empty_like(tensor) for tensor in scratch)
+        state = prefill.prepared.state
+        launchers = (state.ordinary_a.gemm, state.ordinary_b.gemm,
+                     state.quantizers.inv_rope, state.quantizers.group_major)
+        session.freeze()
+        for rows in counts:
+            reference_state = exact[rows].prepared.state
+            reference = bind(reference_state, reference_scratch, rows)
+            binding = bind(state, scratch, rows)
+            with no_compilation():
+                expected = reference_state.run_inv_rope(reference).clone()
+                actual = state.run_inv_rope(binding)
+            torch.cuda.synchronize(device)
+            assert actual.shape == (rows, hidden)
+            assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+            torch.testing.assert_close(binding.x_q.values.view(torch.uint8), reference.x_q.values.view(torch.uint8), rtol=0, atol=0)
+            torch.testing.assert_close(binding.x_q.scale_rows.view(torch.uint8), reference.x_q.scale_rows.view(torch.uint8), rtol=0, atol=0)
+            torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
+            assert torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0) > 0.99999
+            assert launchers == (state.ordinary_a.gemm, state.ordinary_b.gemm,
+                                 state.quantizers.inv_rope, state.quantizers.group_major)
+            if rows != 3575:
+                continue
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with session.capture(), torch.cuda.graph(graph):
+                    replayed = state.run_inv_rope(binding)
+                source[:rows].neg_()
+                positions[:rows].add_(1).remainder_(table.shape[0])
+                replayed.fill_(float("nan"))
+                pointers = tuple(tensor.data_ptr() for tensor in (*scratch, replayed))
+                allocated = torch.cuda.memory_allocated(device)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                assert torch.cuda.memory_allocated(device) == allocated
+                assert tuple(tensor.data_ptr() for tensor in (*scratch, replayed)) == pointers
+                with no_compilation():
+                    expected = reference_state.run_inv_rope(reference)
+                torch.testing.assert_close(replayed, expected, rtol=0.01, atol=0.002)
+                assert torch.isfinite(replayed).all() and torch.count_nonzero(replayed) > 0
+            finally:
+                graph.reset()
+        with pytest.raises(ValueError, match="exact prepared token count"):
+            bind(exact[capacity].prepared.state, reference_scratch, 3575)
+        with pytest.raises(ValueError, match="planned token capacity"):
+            state._check_tokens(capacity + 1)

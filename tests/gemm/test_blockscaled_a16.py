@@ -1,40 +1,81 @@
-"""Shared-storage A16 correctness, one-shot dispatch, and graph contracts."""
+"""Prepared shared-storage A16 correctness, dispatch, and graph contracts."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
+from dataclasses import replace
 import pytest
 import torch
 import cutlass.cute as cute
 
 from b12x.gemm import blockscaled
 from b12x.gemm.blockscaled import _a16, _quantize
+from b12x.preparation import PreparationSession, PreparedCall
+from b12x.preparation.device import detect_device
+from b12x.gemm.blockscaled import _preparation
+from b12x.gemm.blockscaled._tuning import BlockscaledConfig
 from b12x._lib.intrinsics import swizzle_block_scale
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from tests._reference.helpers import require_b12x
 
 
-def test_a16_functional_and_out_export_are_opaque():
-    from b12x.gemm.blockscaled import _ops  # noqa: F401
-    source = torch.empty(8, 128, dtype=torch.bfloat16)
-    values = torch.empty(64, 64, dtype=torch.uint8)
-    scales = torch.empty(128, 8, dtype=torch.uint8)
-    global_scale = torch.ones(1)
-    output = torch.empty(8, 64, dtype=torch.bfloat16)
-    workspace = torch.empty(4096, dtype=torch.uint8)
+@contextmanager
+def prepared_execution(
+    source,
+    weight,
+    *,
+    activation_mode,
+    activation_global_scale=None,
+    out=None,
+    workspace=None,
+    expected_m=None,
+    config=None,
+    name="blockscaled",
+):
+    query = blockscaled.query_from_call(
+        source,
+        weight,
+        activation_mode=activation_mode,
+        activation_global_scale=activation_global_scale,
+        out=out,
+        workspace=workspace,
+        expected_m=expected_m,
+    )
+    declaration = blockscaled.plan(query, override=config)
+    values, scales, global_scale, _ = _a16._weight_parts(weight)
+    request = declaration.request(
+        name=name,
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: state.run(
+                source,
+                values,
+                scales,
+                global_scale,
+                activation_scale=activation_global_scale,
+                out=out,
+                workspace=workspace,
+            )
+        ),
+    )
+    with PreparationSession(device=source.device, autotune=False, compile_workers=2) as session:
+        session.prepare((request,))
+        yield query, declaration
 
-    def functional(x, w, s, g):
-        return blockscaled.w4a16(x, w, s, g)
 
-    def allocated(x, w, s, g, out, scratch):
-        return blockscaled.w4a16(x, w, s, g, out=out, workspace=scratch)
+def make_workspace(source, weight, *, activation_mode, out=None, config=None,
+                   activation_global_scale=None, expected_m=None):
+    query = blockscaled.query_from_call(
+        source, weight, activation_mode=activation_mode, out=out,
+        activation_global_scale=activation_global_scale, expected_m=expected_m,
+    )
+    query = replace(query, workspace_form="provided")
+    if config is None:
+        config = _preparation.TUNING.default_config(query, detect_device(source.device).identity)
+    return torch.empty(
+        _preparation._workspace_bytes(query, config), device=source.device, dtype=torch.uint8
+    )
 
-    for fn, args, target in [
-        (functional, (source, values, scales, global_scale), torch.ops.b12x.blockscaled_bf16.default),
-        (allocated, (source, values, scales, global_scale, output, workspace), torch.ops.b12x.blockscaled_bf16_out.default),
-    ]:
-        graph, _ = torch._dynamo.export(fn)(*args)
-        targets = {node.target for node in graph.graph.nodes if node.op == "call_function"}
-        assert target in targets
+
 
 
 @pytest.mark.parametrize("n,k,group", [(37, 80, 16), (129, 160, 32)])
@@ -91,71 +132,76 @@ def test_shared_checkpoint_storage_matches_cuda_weights_in_graphs(tmp_path, allo
     loaded = WeightFiles(tmp_path, allocation).load(weight)
     source = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(m, 128, device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(blockscaled.workspace_size(weight, m), device="cuda", dtype=torch.uint8)
     options = {"activation_global_scale": torch.tensor([128.], device="cuda")} if recipe == "nvfp4" else {}
     for mode in ("a16", "quantized"):
-        expected = blockscaled.mm(source, weight, mode=mode, **options)
+        workspace = make_workspace(source, weight, activation_mode=mode, out=output, **options)
+        with prepared_execution(
+            source, weight, activation_mode=mode, out=output, workspace=workspace, **options,
+        ) as (_, plan):
+            expected = blockscaled.mm(
+                source, weight, out=output, workspace=workspace, plan=plan, **options,
+            ).clone()
         if mode == "a16":
             assert_close(expected, source.float() @ decoded.T)
-        def run():
-            blockscaled.mm(source, loaded, mode=mode, out=output, workspace=workspace, **options)
         if recipe == "nvfp4" and mode == "quantized" and allocation in ("system", "file"):
             # Triton's launcher rejects the unregistered global-scale pointer.
-            with pytest.raises(ValueError, match="Pointer argument cannot be accessed"):
-                run()
+            with pytest.raises(ValueError):
+                with prepared_execution(
+                    source, loaded, activation_mode=mode, out=output, workspace=workspace, **options,
+                ):
+                    pytest.fail("an unregistered global-scale pointer was accepted")
             continue
-        run()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
-        for _ in range(3):
-            output.fill_(float("nan"))
-            graph.replay()
-        torch.testing.assert_close(output, expected, rtol=0, atol=0)
-        graph.reset()
+        with prepared_execution(
+            source, loaded, activation_mode=mode, out=output, workspace=workspace, **options,
+        ) as (_, plan):
+            with kernel_resolution_guard("shared weight capture"):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    blockscaled.mm(
+                        source, loaded, out=output, workspace=workspace, plan=plan, **options,
+                    )
+                for _ in range(3):
+                    output.fill_(float("nan"))
+                    graph.replay()
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                graph.reset()
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
 @pytest.mark.parametrize("use_out", [False, True])
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
-def test_aot_functionalization_preserves_precision_and_output(recipe, mode, use_out, backend, monkeypatch):
+def test_aot_functionalization_preserves_precision_and_output(recipe, mode, use_out, backend):
     require_b12x()
     import torch._inductor.config as inductor_config
-    from b12x.gemm.blockscaled import _ops
-
     torch._dynamo.reset()
     weight, _, storage = make_weight(recipe, 128, 256)
     saved_scales = storage.view(torch.uint8).clone()
-    execute = _ops._execute_impl
+    options = {"activation_global_scale": torch.tensor([128.], device="cuda")} if recipe == "nvfp4" else {}
 
-    def check_storage(source, values, scales, *args):
-        assert scales.data_ptr() == storage.data_ptr()
-        if recipe == "mxfp8":
-            assert scales.dtype == torch.uint8
-            assert scales.shape == storage.shape
-            assert scales.stride() == storage.stride()
-        return execute(source, values, scales, *args)
-
-    monkeypatch.setattr(_ops, "_execute_impl", check_storage)
-    workspace = torch.empty(blockscaled.workspace_size(weight, 8), device="cuda", dtype=torch.uint8)
-    options = dict(activation_global_scale=torch.tensor([128.], device="cuda")) if recipe == "nvfp4" else {}
-
-    def run(source, output):
-        return blockscaled.mm(source, weight, mode=mode, expected_m=source.shape[0],
-                              out=output if use_out else None,
-                              workspace=workspace if use_out else None, **options)
+    def run(source, output, workspace, plan):
+        return blockscaled.mm(
+            source, weight, out=output if use_out else None,
+            workspace=workspace, plan=plan, **options,
+        )
 
     with inductor_config.patch(enable_auto_functionalized_v2=False):
         compiled = torch.compile(run, backend=backend, fullgraph=True, dynamic=True)
         for m in (2, 8):
             source = torch.randn(m, 256, device="cuda", dtype=torch.bfloat16)
             output = torch.full((m, 128), float("nan"), device="cuda", dtype=torch.bfloat16)
-            expected = blockscaled.mm(source, weight, mode=mode, **options)
-            actual = compiled(source, output)
-            if use_out:
-                assert actual is output
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            workspace = make_workspace(
+                source, weight, activation_mode=mode, out=output, expected_m=m, **options,
+            ) if use_out else None
+            with prepared_execution(
+                source, weight, activation_mode=mode, out=output if use_out else None,
+                workspace=workspace, expected_m=m, **options,
+            ) as (_, plan):
+                expected = run(source, output, workspace, plan).clone()
+                actual = compiled(source, output, workspace, plan)
+                if use_out:
+                    assert actual is output
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(storage.view(torch.uint8), saved_scales, atol=0, rtol=0)
     torch._dynamo.reset()
 
@@ -167,21 +213,22 @@ def test_a16_aot_compile_functionalizes_workspace(recipe, allocated, functionali
     require_b12x()
     weight, decoded, _ = make_weight(recipe, 128, 256)
     source = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
-    scratch = torch.empty(blockscaled.workspace_size(weight, 4, _config=(64, 128, 2)),
-                          device="cuda", dtype=torch.uint8)
     out = torch.empty(4, 128, device="cuda", dtype=torch.bfloat16) if allocated else None
-
-    def project(x):
-        return blockscaled.mm(x, weight, mode="a16", out=out,
-                              workspace=scratch, _config=(64, 128, 2))
-
-    project(source)
-    compiled = torch.compile(project, fullgraph=True, options={
-        "enable_auto_functionalized_v2": functionalize_v2,
-    }).aot_compile(((source,), {}))
-    for _ in range(2):
-        source.normal_()
-        assert_close(compiled(source), source.float() @ decoded.T)
+    config = BlockscaledConfig(mode="a16", tile_n=64, tile_k=128, split_k=2)
+    scratch = make_workspace(
+        source, weight, activation_mode="a16", out=out, config=config,
+    )
+    with prepared_execution(
+        source, weight, activation_mode="a16", out=out, workspace=scratch, config=config,
+    ) as (_, plan):
+        def project(x):
+            return blockscaled.mm(x, weight, out=out, workspace=scratch, plan=plan)
+        compiled = torch.compile(project, fullgraph=True, options={
+            "enable_auto_functionalized_v2": functionalize_v2,
+        }).aot_compile(((source,), {}))
+        for _ in range(2):
+            source.normal_()
+            assert_close(compiled(source), source.float() @ decoded.T)
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
@@ -192,13 +239,32 @@ def test_a16_reference(recipe, m, n, k, split):
     weight, decoded, _ = make_weight(recipe, n, k)
     source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     output = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
-    scratch = torch.full((blockscaled.workspace_size(weight, m, _config=(64, 64, split)),), 255,
-                         device="cuda", dtype=torch.uint8)
-    actual = blockscaled.mm(source, weight, mode="a16", out=output,
-                            workspace=scratch, _config=(64, 64, split))
-    assert actual.data_ptr() == output.data_ptr()
-    assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
-    assert_close(actual, source.float() @ decoded.T)
+    config = BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=split)
+    provisional = blockscaled.query_from_call(
+        source, weight, activation_mode="a16", out=output, expected_m=m
+    )
+    scratch = torch.full(
+        (_preparation._workspace_bytes(provisional, config),),
+        255,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    with prepared_execution(
+        source,
+        weight,
+        activation_mode="a16",
+        out=output,
+        workspace=scratch,
+        expected_m=m,
+        config=config,
+        name="a16-reference",
+    ) as (_, plan):
+        actual = blockscaled.mm(
+            source, weight, out=output, workspace=scratch, plan=plan
+        )
+        assert actual.data_ptr() == output.data_ptr()
+        assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
+        assert_close(actual, source.float() @ decoded.T)
 
 
 @pytest.mark.parametrize("kind", ["multiplier", "reciprocal"])
@@ -209,9 +275,17 @@ def test_w4a16_raw_scale_identity_and_rounding(kind):
     original = storage.view(torch.uint8).clone()
     source = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
     global_scale = weight.global_scale if kind == "multiplier" else weight.global_scale.reciprocal()
-    actual = blockscaled.w4a16(source, weight.values, storage, global_scale,
-                               global_scale_kind=kind)
-    expected = blockscaled.mm(source, weight, mode="a16")
+    raw_weight = blockscaled.pack_weight(
+        weight.values, storage, recipe="nvfp4",
+        global_scale=global_scale, global_scale_kind=kind,
+    )
+    with prepared_execution(source, weight, activation_mode="a16") as (_, plan):
+        expected = blockscaled.mm(source, weight, plan=plan)
+    with prepared_execution(source, raw_weight, activation_mode="a16") as (_, plan):
+        actual = blockscaled.w4a16(
+            source, weight.values, storage, global_scale,
+            global_scale_kind=kind, plan=plan,
+        )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert _a16.scale_storage(weight.scale_mma, n, k, 16).data_ptr() == storage.data_ptr()
     torch.testing.assert_close(storage.view(torch.uint8), original, atol=0, rtol=0)
@@ -222,39 +296,44 @@ def test_a16_frozen_callable_and_graph_replay(recipe, monkeypatch):
     require_b12x()
     weight, decoded, storage = make_weight(recipe, 136, 256)
     saved = storage.view(torch.uint8).clone()
-    config = (64, 128, 4)
-    workspace = torch.empty(blockscaled.workspace_size(weight, 32, _config=config), device="cuda", dtype=torch.uint8)
+    config = BlockscaledConfig(mode="a16", tile_n=64, tile_k=128, split_k=4)
     source = torch.randn(32, 256, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(32, 136, device="cuda", dtype=torch.bfloat16)
-    blockscaled.mm(source[:1], weight, out=output[:1], workspace=workspace, mode="a16", _config=config)
-    from b12x._lib.dense_gemm import _get_compiled_dense_gemm
-    compiled = _get_compiled_dense_gemm.cache_info()
-    freeze_kernel_resolution("A16 live-M reuse test")
-    try:
-        for m in [2, 4, 8, 16, 19, 32]:
-            result = blockscaled.mm(source[:m], weight, out=output[:m], workspace=workspace,
-                                    mode="a16", _config=config)
-            assert_close(result, source[:m].float() @ decoded.T)
-        assert compiled.misses == _get_compiled_dense_gemm.cache_info().misses
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            blockscaled.mm(source, weight, out=output, workspace=workspace,
-                            mode="a16", _config=config)
-        pointers = (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
-        for _ in range(3):
-            source.normal_()
-            workspace.fill_(255)
-            output.fill_(float("nan"))
-            graph.replay()
-            assert_close(output, source.float() @ decoded.T)
-        assert pointers == (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
-        torch.testing.assert_close(storage.view(torch.uint8), saved, atol=0, rtol=0)
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("unexpected device allocation"))
-            blockscaled.mm(source, weight, out=output, workspace=workspace,
-                            mode="a16", _config=config)
-    finally:
-        unfreeze_kernel_resolution()
+    workspace = make_workspace(
+        source, weight, activation_mode="a16", out=output, config=config
+    )
+    with ExitStack() as stack:
+        plans = {}
+        for m in (1, 2, 4, 8, 16, 19, 32):
+            _, plans[m] = stack.enter_context(prepared_execution(
+                source[:m], weight, activation_mode="a16", out=output[:m],
+                workspace=workspace, config=config, expected_m=m,
+            ))
+        with kernel_resolution_guard("prepared exact-M graph"):
+            for m in plans:
+                result = blockscaled.mm(
+                    source[:m], weight, out=output[:m], workspace=workspace,
+                    plan=plans[m],
+                )
+                assert_close(result, source[:m].float() @ decoded.T)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                blockscaled.mm(source, weight, out=output, workspace=workspace,
+                               plan=plans[32])
+            pointers = (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
+            for _ in range(3):
+                source.normal_()
+                workspace.fill_(255)
+                output.fill_(float("nan"))
+                graph.replay()
+                assert_close(output, source.float() @ decoded.T)
+            assert pointers == (source.data_ptr(), output.data_ptr(), workspace.data_ptr())
+            torch.testing.assert_close(storage.view(torch.uint8), saved, atol=0, rtol=0)
+            with monkeypatch.context() as patch:
+                patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("unexpected device allocation"))
+                blockscaled.mm(source, weight, out=output, workspace=workspace,
+                               plan=plans[32])
+            graph.reset()
 
 
 def test_quantized_nvfp4_activation_contract():
@@ -270,9 +349,21 @@ def test_quantized_nvfp4_activation_contract():
                           ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn",
                           c_dtype="bfloat16", sf_vec_size=16,
                           alpha=weight.global_scale / ag)[:, :, 0]
-    scratch = torch.full((blockscaled.workspace_size(weight, 16),), 255, device="cuda", dtype=torch.uint8)
-    actual = blockscaled.mm(source, weight, mode="quantized", activation_global_scale=ag, workspace=scratch)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    config = BlockscaledConfig(mode="quantized")
+    scratch = make_workspace(
+        source, weight, activation_mode="quantized",
+        activation_global_scale=ag, config=config,
+    )
+    scratch.fill_(255)
+    with prepared_execution(
+        source, weight, activation_mode="quantized", activation_global_scale=ag,
+        workspace=scratch, config=config,
+    ) as (_, plan):
+        actual = blockscaled.mm(
+            source, weight, activation_global_scale=ag,
+            workspace=scratch, plan=plan,
+        )
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     _, _, _, total = _a16._layout(8, 128, 256, True)
     sf_start, alpha_start, _, _ = _a16._layout(8, 128, 256, True)
     assert total <= scratch.numel()
@@ -288,121 +379,121 @@ def test_quantized_graph_and_dispatch(recipe):
     weight, _, _ = make_weight(recipe, 128, 256)
     source = torch.randn(9, 256, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(9, 128, device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(blockscaled.workspace_size(weight, 16), device="cuda", dtype=torch.uint8)
     options = {"activation_global_scale": torch.tensor([128.], device="cuda")} if recipe == "nvfp4" else {}
-    blockscaled.prewarm(weight, [1, 2, 8, 9, 16], workspace=workspace, **options)
-    expected = blockscaled.mm(source, weight, mode="quantized", **options)
-    actual = blockscaled.mm(source, weight, mode="auto", **options)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    freeze_kernel_resolution()
-    try:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            blockscaled.mm(source, weight, mode="auto", out=output, workspace=workspace, **options)
-        source.normal_()
-        expected = blockscaled.mm(source, weight, mode="quantized", **options)
-        workspace.fill_(255)
-        graph.replay()
-        torch.testing.assert_close(output, expected, atol=0, rtol=0)
-    finally:
-        unfreeze_kernel_resolution()
+    workspace = make_workspace(source, weight, activation_mode="auto", out=output, **options)
+    with ExitStack() as stack:
+        _, quantized = stack.enter_context(prepared_execution(
+            source, weight, activation_mode="quantized", **options,
+        ))
+        _, automatic = stack.enter_context(prepared_execution(
+            source, weight, activation_mode="auto", **options,
+        ))
+        _, provided = stack.enter_context(prepared_execution(
+            source, weight, activation_mode="auto", out=output, workspace=workspace, **options,
+        ))
+        expected = blockscaled.mm(source, weight, plan=quantized, **options)
+        actual = blockscaled.mm(source, weight, plan=automatic, **options)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        with kernel_resolution_guard("prepared quantized capture"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                blockscaled.mm(
+                    source, weight, out=output, workspace=workspace, plan=provided, **options,
+                )
+            source.normal_()
+            expected = blockscaled.mm(source, weight, plan=quantized, **options)
+            workspace.fill_(255)
+            graph.replay()
+            torch.testing.assert_close(output, expected, atol=0, rtol=0)
+            graph.reset()
 
 
 def test_invalid_mode_and_aliasing():
     require_b12x()
     weight, _, _ = make_weight("nvfp4", 128, 128)
     source = torch.randn(4, 128, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="mode"):
-        blockscaled.mm(source, weight, mode="typo")
-    with pytest.raises(ValueError, match="activation_global_scale"):
-        blockscaled.mm(source, weight, mode="quantized")
-    with pytest.raises(ValueError, match="overlap"):
-        blockscaled.mm(source, weight, out=source, mode="a16")
-    with pytest.raises(ValueError, match="workspace requires"):
-        blockscaled.mm(source, weight, mode="a16", workspace=torch.empty(1, dtype=torch.uint8, device="cuda"),
-                       _config=(64, 64, 4))
+    with pytest.raises(ValueError):
+        with prepared_execution(source, weight, activation_mode="typo"):
+            pytest.fail("unknown activation precision was accepted")
+    with pytest.raises(ValueError):
+        with prepared_execution(source, weight, activation_mode="quantized"):
+            pytest.fail("missing NVFP4 activation scale was accepted")
+    with pytest.raises(ValueError):
+        with prepared_execution(source, weight, activation_mode="a16", out=source):
+            pytest.fail("source/output overlap was accepted")
+    with pytest.raises(ValueError):
+        with prepared_execution(
+            source, weight, activation_mode="a16",
+            workspace=torch.empty(1, dtype=torch.uint8, device="cuda"),
+            config=BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=4),
+        ):
+            pytest.fail("insufficient caller workspace was accepted")
 
 
-def test_mxfp8_prewarm_covers_functional_and_out_under_frozen_resolution():
+def test_mxfp8_prepared_functional_and_provided_forms_match():
     require_b12x()
     weight, _, _ = make_weight("mxfp8", 152, 384)
     source = torch.randn(7, 384, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(7, 152, device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(blockscaled.workspace_size(weight, 7), device="cuda", dtype=torch.uint8)
-    blockscaled.prewarm(weight, [7], workspace=workspace)
-    freeze_kernel_resolution("blockscaled prewarm covers both output forms")
-    try:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            functional = blockscaled.mm(source, weight)
-            blockscaled.mm(source, weight, out=output, workspace=workspace)
+    config = BlockscaledConfig(mode="quantized")
+    functional_query = blockscaled.query_from_call(
+        source, weight, activation_mode="quantized", expected_m=7
+    )
+    provisional_provided = blockscaled.query_from_call(
+        source, weight, activation_mode="quantized", out=output, expected_m=7
+    )
+    workspace = torch.empty(
+        _preparation._workspace_bytes(provisional_provided, config),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    provided_query = blockscaled.query_from_call(
+        source,
+        weight,
+        activation_mode="quantized",
+        out=output,
+        workspace=workspace,
+        expected_m=7,
+    )
+    values, scales, global_scale, _ = _a16._weight_parts(weight)
+    functional = blockscaled.plan(functional_query, override=config)
+    provided = blockscaled.plan(provided_query, override=config)
+    requests = (
+        functional.request(
+            name="mxfp8-functional",
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: state.run(source, values, scales, global_scale)
+            ),
+        ),
+        provided.request(
+            name="mxfp8-provided",
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: state.run(
+                    source, values, scales, global_scale, out=output, workspace=workspace
+                )
+            ),
+        ),
+    )
+    with PreparationSession(device=source.device, autotune=False, compile_workers=2) as session:
+        session.prepare(requests)
+        with session.capture():
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                functional_output = blockscaled.mm(
+                    source, weight, plan=functional
+                )
+                blockscaled.mm(
+                    source,
+                    weight,
+                    out=output,
+                    workspace=workspace,
+                    plan=provided,
+                )
         graph.replay()
-        torch.testing.assert_close(functional, output, atol=0, rtol=0)
-    finally:
-        unfreeze_kernel_resolution()
+        torch.testing.assert_close(functional_output, output, atol=0, rtol=0)
+        graph.reset()
 
 
-def test_heuristic_promotes_inside_bf16_api_before_activation_quantization(monkeypatch):
-    require_b12x()
-    if torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("the geometry promotion heuristic is qualified on SM120")
-    from b12x.gemm.blockscaled import _policy
-    from b12x.policy import PolicyContext, PolicyMode, PolicySource
-
-    policy = PolicyContext.for_device("cuda", mode=PolicyMode.HEURISTIC_ONLY)
-    monkeypatch.setattr(_policy, "get_auto_policy", lambda device: policy)
-    _policy.resolve_precision.cache_clear()
-    weight, decoded, _ = make_weight("nvfp4", 4096, 5376)
-    source = torch.randn(8, 5376, device="cuda", dtype=torch.bfloat16)
-    output = torch.empty(8, 4096, device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(blockscaled.workspace_size(weight, 8), device="cuda", dtype=torch.uint8)
-    blockscaled.prewarm(weight, [1], workspace=workspace)
-    resolution = _policy.resolve_precision(source.device, "nvfp4", 5376, 4096)
-    assert resolution.source is PolicySource.HEURISTIC
-    monkeypatch.setattr(_quantize, "launch", lambda *args, **kwargs: pytest.fail("A16 quantized an activation"))
-    freeze_kernel_resolution("heuristic promotion reuses one dense specialization")
-    try:
-        for m in (1, 4, 8):
-            blockscaled.mm(source[:m], weight, out=output[:m], workspace=workspace)
-            assert_close(output[:m], source[:m].float() @ decoded.T)
-    finally:
-        unfreeze_kernel_resolution()
-        _policy.resolve_precision.cache_clear()
-
-
-@pytest.mark.parametrize("recipe,n,k,m", [("nvfp4", 4096, 5376, 8), ("mxfp8", 5120, 17408, 16)])
-def test_embedded_precision_promotion_captures_the_real_one_shot_path(recipe, n, k, m, monkeypatch):
-    require_b12x()
-    from b12x.gemm.blockscaled import _policy
-    from b12x.policy import PolicyContext, PolicyMode, PolicySource
-
-    policy = PolicyContext.for_device("cuda", mode=PolicyMode.PREPLANNED_ONLY)
-    if policy.device.product_name != "nvidia rtx pro 6000 blackwell max-q workstation edition":
-        pytest.skip("precision profile is qualified for the RTX PRO 6000 Max-Q")
-    monkeypatch.setattr(_policy, "get_auto_policy", lambda device: policy)
-    _policy.resolve_precision.cache_clear()
-    weight, decoded, _ = make_weight(recipe, n, k)
-    source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    output = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(blockscaled.workspace_size(weight, m), device="cuda", dtype=torch.uint8)
-    blockscaled.prewarm(weight, [m], workspace=workspace)
-    resolution = _policy.resolve_precision(source.device, recipe, k, n)
-    assert resolution.source is PolicySource.PREPLANNED
-    assert resolution.config.select(m) is not None
-    monkeypatch.setattr(_quantize, "launch", lambda *args, **kwargs: pytest.fail("promoted GEMM quantized its activation"))
-    freeze_kernel_resolution("embedded precision promotion")
-    try:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            blockscaled.mm(source, weight, out=output, workspace=workspace)
-        source.normal_()
-        workspace.fill_(255)
-        output.fill_(float("nan"))
-        graph.replay()
-        assert_close(output, source.float() @ decoded.T)
-    finally:
-        unfreeze_kernel_resolution()
-        _policy.resolve_precision.cache_clear()
 
 
 @pytest.mark.parametrize("fp4", [True, False])
@@ -453,49 +544,6 @@ def test_native_weight_pairs_exhaustive(fp4):
     torch.testing.assert_close(out, expected, atol=0, rtol=0, equal_nan=True)
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
-@pytest.mark.parametrize("m", [8, 2048])
-def test_gb10_embedded_precision_captures_selected_route(recipe, m, monkeypatch):
-    require_b12x()
-    from b12x.gemm.blockscaled import _policy
-    from b12x.policy import PolicyContext, PolicyMode, PolicySource
-
-    policy = PolicyContext.for_device("cuda", mode=PolicyMode.PREPLANNED_ONLY)
-    if policy.device.product_name != "nvidia gb10":
-        pytest.skip("GB10 precision profile qualification")
-    monkeypatch.setattr(_policy, "get_auto_policy", lambda device: policy)
-    _policy.resolve_precision.cache_clear()
-    weight, decoded, _ = make_weight(recipe, 4096, 5376)
-    source = torch.randn(m, 5376, device="cuda", dtype=torch.bfloat16)
-    output = torch.empty(m, 4096, device="cuda", dtype=torch.bfloat16)
-    workspace = torch.empty(blockscaled.workspace_size(weight, m), device="cuda", dtype=torch.uint8)
-    options = dict(activation_global_scale=torch.tensor([128.], device="cuda")) if recipe == "nvfp4" else {}
-    blockscaled.prewarm(weight, [1, m], workspace=workspace, **options)
-    resolution = _policy.resolve_precision(source.device, recipe, 5376, 4096)
-    assert resolution.source is PolicySource.PREPLANNED
-    promoted = resolution.config.select(m) is not None
-    assert promoted == (m == 8)
-    if promoted:
-        monkeypatch.setattr(_quantize, "launch", lambda *a, **kw: pytest.fail("GB10 promoted GEMM quantized an activation"))
-    else:
-        monkeypatch.setattr(_a16, "_a16", lambda *a, **kw: pytest.fail("GB10 quantized route executed A16"))
-    freeze_kernel_resolution("GB10 embedded precision dispatch")
-    try:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            blockscaled.mm(source, weight, out=output, workspace=workspace, **options)
-        source.normal_()
-        expected = (source.float() @ decoded.T) if promoted else blockscaled.mm(source, weight, mode="quantized", **options)
-        workspace.fill_(255)
-        output.fill_(float("nan"))
-        graph.replay()
-        if promoted:
-            assert_close(output, expected)
-        else:
-            torch.testing.assert_close(output, expected, atol=0, rtol=0)
-    finally:
-        unfreeze_kernel_resolution()
-        _policy.resolve_precision.cache_clear()
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
@@ -504,13 +552,18 @@ def test_a16_short_scale_tile_tail(recipe, k):
     require_b12x()
     weight, decoded, _ = make_weight(recipe, 40, k)
     source = torch.randn(3, k, device="cuda", dtype=torch.bfloat16)
-    actual = blockscaled.mm(source, weight, mode="a16", _config=(128, 128, 4))
-    assert_close(actual, source.float() @ decoded.T)
+    config = BlockscaledConfig(mode="a16", tile_n=128, tile_k=128, split_k=4)
+    with prepared_execution(
+        source, weight, activation_mode="a16", config=config,
+    ) as (_, plan):
+        actual = blockscaled.mm(source, weight, plan=plan)
+        assert_close(actual, source.float() @ decoded.T)
 
 
 def test_a16_rejects_tma_misalignment():
     require_b12x()
     weight, _, _ = make_weight("nvfp4", 37, 80)
     source = torch.randn(2, 80, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="A16 TMA"):
-        blockscaled.mm(source, weight, mode="a16")
+    with pytest.raises(ValueError):
+        with prepared_execution(source, weight, activation_mode="a16"):
+            pytest.fail("misaligned A16 geometry was admitted")

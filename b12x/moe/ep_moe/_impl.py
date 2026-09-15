@@ -39,7 +39,6 @@ from b12x.moe._shared.kernels.w4a16.host import (
     route_pack_token_capacity,
     select_route_block_size_m,
 )
-from b12x.policy import PolicyContext, get_auto_policy
 
 # NOTE(one-time port): upstream, ep_moe and tp_moe were siblings in
 # b12x/integration/. The prepared-weights payload plumbing they share should
@@ -51,7 +50,6 @@ from ..fused_moe._impl import (
     _prepared_dtype_for_runtime,
     _prepared_payload_for_runtime,
 )
-from ._policy import EP_MOE_POLICY, EpMoeQuery
 
 
 def _tensor_version(tensor: torch.Tensor) -> int | None:
@@ -265,12 +263,11 @@ def _map_scratch_views(
 
 
 @dataclass(frozen=True)
-class EPMoEScratchPlan:
+class _EPMoELayout:
     caps: EPMoEScratchCaps
     _layout: tuple[_EPBufferSpec, ...]
     _nbytes: int
     _scratch_specs: tuple[ScratchBufferSpec, ...]
-    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -289,6 +286,9 @@ class EPMoEScratchPlan:
         expert_map: EPExpertMap,
         output: torch.Tensor,
         fast_math: bool = True,
+        _launch=None,
+        _route_ids_workspace: bool = False,
+        _plan=None,
     ) -> "EPMoEFP4Binding":
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -380,33 +380,18 @@ class EPMoEScratchPlan:
             rotation_a_gate=views.get("rotation_a_gate"),
             rotation_a_up=views.get("rotation_a_up"),
             kernel_workspace=kernel_workspace,
+            fused_launch=_launch,
+            route_ids_i32=(
+                views["route_ids_i32"] if _route_ids_workspace else None
+            ),
+            plan=_plan,
         )
 
 
-def plan_ep_moe_scratch(
-    caps: EPMoEScratchCaps,
-    *,
-    policy: PolicyContext | None = None,
-) -> EPMoEScratchPlan:
-    """Plan fixed-capacity scratch for replicated-input W4A16 EP."""
-
-    if not isinstance(caps, EPMoEScratchCaps):
-        raise TypeError("caps must be an EPMoEScratchCaps")
-    policy = policy or get_auto_policy(caps.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(caps.device)
-    resolution = policy.resolve(
-        EP_MOE_POLICY,
-        EpMoeQuery(
-            max_tokens=caps.max_tokens,
-            top_k=caps.num_topk,
-            num_experts=caps.global_num_experts,
-            hidden_size=caps.weight_plan.hidden_size,
-            intermediate_size=caps.weight_plan.intermediate_size,
-            activation=caps.weight_plan.activation,
-        ),
-    )
+def _materialize_layout(
+    caps: EPMoEScratchCaps, *, route_ids_workspace: bool = False,
+) -> _EPMoELayout:
+    """Materialize native scratch views from immutable capacity metadata."""
     routed_rows = int(caps.max_tokens) * int(caps.num_topk)
     route_capacity_rows = (
         route_pack_token_capacity(caps.max_tokens, caps.num_topk) * caps.num_topk
@@ -498,6 +483,8 @@ def plan_ep_moe_scratch(
         ("packed_route_count", 1, torch.int32),
         ("expert_offsets", caps.global_num_experts + 1, torch.int32),
         ("expert_counts", caps.global_num_experts, torch.int32),
+        *((("route_ids_i32", caps.max_tokens * caps.num_topk, torch.int32),)
+          if route_ids_workspace else ()),
     )
     if caps.full_rotation:
         layout_specs += (
@@ -513,12 +500,11 @@ def plan_ep_moe_scratch(
             device=caps.device,
         ),
     )
-    return EPMoEScratchPlan(
+    return _EPMoELayout(
         caps=caps,
         _layout=layout,
         _nbytes=nbytes,
         _scratch_specs=scratch_specs,
-        policy_resolution=resolution,
     )
 
 
@@ -552,16 +538,22 @@ class EPMoEFP4Binding:
     rotation_a_gate: torch.Tensor | None
     rotation_a_up: torch.Tensor | None
     kernel_workspace: torch.Tensor | None
+    route_ids_i32: torch.Tensor | None = None
+    fused_launch: object | None = None
+    plan: object | None = None
 
     def run(self) -> torch.Tensor:
-        return b12x_ep_moe_fp4(binding=self)
+        if self.plan is None:
+            raise RuntimeError("EP binding requires a session-prepared plan")
+        return _run_bound_ep_moe(self)
 
 
-def b12x_ep_moe_fp4(*, binding: EPMoEFP4Binding) -> torch.Tensor:
-    """Execute one replicated-input EP rank and return its local partial."""
-
+def _run_bound_ep_moe(binding: EPMoEFP4Binding) -> torch.Tensor:
+    """Run an already-bound EP partial with the session-retained W4A16 launcher."""
     if not isinstance(binding, EPMoEFP4Binding):
         raise TypeError("binding must be an EPMoEFP4Binding")
+    if binding.fused_launch is None:
+        raise RuntimeError("EP binding requires a session-prepared W4A16 execution")
     binding.expert_map.validate_static()
     prepared = _prepared_payload_for_runtime(
         binding.experts,
@@ -592,26 +584,26 @@ def b12x_ep_moe_fp4(*, binding: EPMoEFP4Binding) -> torch.Tensor:
         # live barrier/counter storage must come from the graph-stable EP arena.
         prepared = replace(prepared, workspace=binding.kernel_workspace)
 
-    from b12x.moe._shared.kernels.w4a16.kernel import (
-        run_w4a16_moe,
-    )
-
+    topk_ids = binding.topk_ids
+    if binding.route_ids_i32 is not None:
+        if topk_ids.dtype != torch.int64:
+            raise RuntimeError("prepared EP route-id workspace requires int64 topk_ids")
+        route_count = topk_ids.numel()
+        if binding.route_ids_i32.numel() < route_count:
+            raise RuntimeError("prepared EP route-id workspace is smaller than live routes")
+        topk_ids = binding.route_ids_i32[:route_count].view_as(topk_ids)
+        topk_ids.copy_(binding.topk_ids)
+    from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
     return run_w4a16_moe(
-        binding.a,
-        prepared,
-        binding.topk_weights,
-        binding.topk_ids,
+        binding.a, prepared, binding.topk_weights, topk_ids,
         activation=binding.experts.activation,
         intermediate_cache13=binding.intermediate_cache13,
-        intermediate_cache2=binding.intermediate_cache2,
-        output=binding.output,
-        fc1_c_tmp=binding.fc1_c_tmp,
-        fc2_c_tmp=binding.fc2_c_tmp,
+        intermediate_cache2=binding.intermediate_cache2, output=binding.output,
+        fc1_c_tmp=binding.fc1_c_tmp, fc2_c_tmp=binding.fc2_c_tmp,
         packed_route_indices=binding.packed_route_indices,
         block_expert_ids=binding.block_expert_ids,
         packed_route_count=binding.packed_route_count,
-        expert_offsets=binding.expert_offsets,
-        expert_counts=binding.expert_counts,
+        expert_offsets=binding.expert_offsets, expert_counts=binding.expert_counts,
         expert_map=binding.expert_map.tensor,
         apply_router_weight_on_input=binding.apply_router_weight_on_input,
         fast_math=binding.fast_math,
@@ -631,15 +623,12 @@ def b12x_ep_moe_fp4(*, binding: EPMoEFP4Binding) -> torch.Tensor:
             if binding.full_rotation and binding.experts.plan.coupled_hadamard
             else binding.rotation_a_up
         ),
+        fused_launch=binding.fused_launch,
     )
 
 
 __all__ = [
-    "EPExpertMap",
-    "EPMoEFP4Binding",
-    "EPMoEScratchCaps",
-    "EPMoEScratchPlan",
-    "b12x_ep_moe_fp4",
-    "plan_ep_moe_scratch",
+    "EPExpertMap", "EPMoEFP4Binding", "EPMoEScratchCaps",
+    "_EPMoELayout", "_materialize_layout", "_run_bound_ep_moe",
     "prepare_ep_expert_map",
 ]

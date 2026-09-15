@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ..._lib.gating import default_is_supported
-from ...policy import PolicyContext
+from b12x._lib.gating import default_is_supported
+from b12x.preparation import FrozenMapping, Plan
 from .._shared.mla.traits import ModelType
 from .._shared.mla.api import (
     MLASparseDecodeMetadata as DecodeMetadata,
@@ -19,36 +19,21 @@ from .._shared.mla.api import (
 from .._shared.mla.api import (
     clear_mla_caches as clear_caches,
 )
-from .._shared.mla.api import (
-    sparse_mla_decode_forward as _run_decode,
-)
-from .._shared.mla.api import (
-    sparse_mla_extend_forward as _run_extend,
-)
-from .._shared.mla.kv_cache import (
-    compile_glm_next_mla_cache_writer,
-    concat_and_cache_glm_next_mla,
-    concat_and_cache_glm_next_mla_fp8,
-    concat_and_cache_glm_next_mla_nvfp4,
-    concat_and_cache_nvfp4_mla_fp8_rope,
-)
 from .pooled_selection import expand_pooled_topk_to_physical_slots
 from ._scratch import (
     B12XSparseMLABinding as _RuntimeBinding,
 )
-from ._policy import SparseMlaConfig, SparseMlaQuery
+from ._tuning import SparseMlaConfig, SparseMlaQuery
 from ._scratch import (
     B12XSparseMLAScratch as Scratch,
 )
 from ._scratch import (
     B12XSparseMLAScratchCaps as Caps,
 )
-from ._scratch import (
-    B12XSparseMLAScratchPlan as Plan,
-)
-from ._scratch import (
-    plan_sparse_mla_scratch,
-)
+from ._preparation import plan as _plan
+from ._preparation import state as _state
+from ._preparation import plan_cache_writer
+from ._preparation import writer_state as _writer_state
 from . import META
 
 
@@ -62,10 +47,15 @@ class Binding:
     attention_sink: torch.Tensor | None = None
 
 
-def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
-    """Resolve policy and scratch layout once for a fixed capacity."""
+def plan(
+    caps: Caps,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: SparseMlaConfig | None = None,
+) -> Plan:
+    """Declare a sparse-MLA route for PreparationSession."""
+    return _plan(caps, invocation=invocation, override=override)
 
-    return plan_sparse_mla_scratch(caps, policy=policy)
 
 
 def bind(
@@ -79,15 +69,10 @@ def bind(
     selected_lengths: torch.Tensor,
     attention_sink: torch.Tensor | None = None,
 ) -> Binding:
-    """Bind every live tensor to a plan without allocating or launching work.
+    """Bind live tensors to an already prepared sparse-MLA plan."""
 
-    Static execution semantics come from ``plan.caps``. The returned binding is
-    the complete input to :func:`run`.
-    """
-
-    if not isinstance(plan, Plan):
-        raise TypeError("plan must be sparse_mla.Plan")
-    caps = plan.caps
+    state = _state(plan, device=kv_cache.device)
+    caps = state.caps
     if kv_cache.ndim != 3:
         raise ValueError(f"kv_cache must be rank-3, got {tuple(kv_cache.shape)}")
     if kv_cache.device != caps.device:
@@ -115,7 +100,7 @@ def bind(
             )
         if attention_sink.device != caps.device or not attention_sink.is_contiguous():
             raise ValueError(f"attention_sink must be contiguous on {caps.device}")
-    runtime = plan.bind(
+    runtime = state.bind(
         scratch=scratch,
         q=q,
         selected_indices=selected_indices,
@@ -136,19 +121,44 @@ def run(binding: Binding) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
     if not isinstance(binding, Binding):
         raise TypeError("binding must be sparse_mla.Binding")
-    caps = binding.plan.caps
-    kwargs = dict(
-        binding=binding.runtime,
-        sm_scale=caps.softmax_scale,
-        latent_scale=caps.latent_scale,
-        v_head_dim=caps.v_head_dim,
-        return_lse=caps.return_lse,
-        lse_scale=caps.lse_scale,
+    state = _state(binding.plan, device=binding.kv_cache.device)
+    return state.run(
+        binding.runtime,
+        kv_cache=binding.kv_cache,
+        attention_sink=binding.attention_sink,
     )
-    if caps.mode == "decode":
-        return _run_decode(attn_sink=binding.attention_sink, **kwargs)
-    return _run_extend(**kwargs)
 
+
+
+def concat_and_cache_glm_next_mla(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    plan: Plan,
+) -> None:
+    """Write GLM_NEXT cache records through a prepared native writer."""
+    _writer_state(plan, device=kv_cache.device).run(kv_c, kv_cache, slot_mapping)
+
+
+def concat_and_cache_glm_next_mla_fp8(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    plan: Plan,
+) -> None:
+    concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
+
+
+def concat_and_cache_glm_next_mla_nvfp4(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    plan: Plan,
+) -> None:
+    concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
 
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0 and triton."""
@@ -158,7 +168,6 @@ def is_supported(device=None) -> bool:
 __all__ = [
     "ModelType",
     "Caps",
-    "Plan",
     "Binding",
     "Scratch",
     "DecodeMetadata",
@@ -168,11 +177,10 @@ __all__ = [
     "plan",
     "bind",
     "run",
-    "compile_glm_next_mla_cache_writer",
+    "plan_cache_writer",
     "concat_and_cache_glm_next_mla",
     "concat_and_cache_glm_next_mla_fp8",
     "concat_and_cache_glm_next_mla_nvfp4",
-    "concat_and_cache_nvfp4_mla_fp8_rope",
     "expand_pooled_topk_to_physical_slots",
     "is_supported",
     "clear_caches",

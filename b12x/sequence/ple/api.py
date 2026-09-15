@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 from ..._lib.gating import default_is_supported
+from b12x.preparation import Plan
 from ._contracts import (
     LayerBinding as Binding,
     LayerCaps as Caps,
-    LayerPlan as Plan,
     bind_layer as bind,
     plan_layer as plan,
     run_decode,
     run_mixed,
     run_prefill,
 )
-from ._policy import PleConfig, PleQuery
+from ._preparation import invocation_from_tensors
+from ._tuning import PleConfig, PleQuery
 
 
 def is_supported(device=None) -> bool:
@@ -28,6 +29,7 @@ __all__ = [
     "PleConfig",
     "PleQuery",
     "plan",
+    "invocation_from_tensors",
     "bind",
     "run_decode",
     "run_mixed",

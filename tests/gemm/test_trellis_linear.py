@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import lru_cache
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import torch
 
 from b12x.gemm import trellis_linear
 from b12x.gemm.trellis_linear import api
+from b12x.preparation import PreparedCall, PreparationSession
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x._lib.quant.sqg_e4m3 import (
     sqg_cheb_normal_e4m3_direct_lut_cpu,
@@ -201,56 +201,33 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
         .reshape(m, k)
     )
 
-def test_prepare_weight_delegates_without_copy(monkeypatch) -> None:
-    tensors = tuple(torch.empty(0) for _ in range(3))
-    expected = SimpleNamespace()
-    seen = {}
-
-    def fake_prepare(*args, **kwargs):
-        seen["args"] = args
-        seen["kwargs"] = kwargs
-        return expected
-
-    monkeypatch.setattr(api, "prepare_trellis256_dense_weight", fake_prepare)
-    actual = trellis_linear.prepare_weight(
-        *tensors,
-        codebook="mcg",
-        params_dtype=torch.bfloat16,
+@contextmanager
+def _prepared_trellis(x, weight, *, c_tmp, hadamard_128=None, **run_kwargs):
+    query = trellis_linear.query_from_weight(
+        weight,
+        max_rows=x.shape[0],
+        input_dtype=x.dtype,
+        output_mode="provided" if run_kwargs.get("output") is not None else "functional",
+        c_tmp_mode="provided",
+        hadamard_128=hadamard_128,
+        **{
+            f"{name}_provided": run_kwargs.get(name) is not None
+            for name in (
+                "gemm_output", "input_f16", "rotated_f16", "rotated_compute",
+                "gemm_output_f16", "output_f16",
+            )
+        },
     )
-
-    assert actual is expected
-    assert all(
-        seen_arg is arg for seen_arg, arg in zip(seen["args"], tensors, strict=True)
+    declaration = trellis_linear.plan(
+        query, weight=weight, c_tmp=c_tmp, hadamard_128=hadamard_128,
     )
-    assert seen["kwargs"]["codebook"] == "mcg"
-    assert seen["kwargs"]["params_dtype"] == torch.bfloat16
-
-
-def test_prepare_pair_weight_delegates_format_metadata(monkeypatch) -> None:
-    tensors = tuple(torch.empty(0) for _ in range(3))
-    expected = SimpleNamespace()
-    seen = {}
-
-    def fake_prepare(*args, **kwargs):
-        seen["args"] = args
-        seen["kwargs"] = kwargs
-        return expected
-
-    monkeypatch.setattr(api, "prepare_trellis256_pair_dense_weight", fake_prepare)
-    actual = trellis_linear.prepare_pair_weight(
-        *tensors,
-        pair_kind="P24",
-        rate_axis="n",
-        codebook="mcg",
+    request = declaration.request(
+        name="trellis",
+        prepare_call=lambda state: PreparedCall(run=lambda: state.run(x, **run_kwargs)),
     )
-
-    assert actual is expected
-    assert all(
-        seen_arg is arg for seen_arg, arg in zip(seen["args"], tensors, strict=True)
-    )
-    assert seen["kwargs"]["pair_kind"] == "P24"
-    assert seen["kwargs"]["rate_axis"] == "n"
-    assert seen["kwargs"]["codebook"] == "mcg"
+    with PreparationSession(device=x.device, autotune=False, compile_workers=2) as session:
+        result = session.prepare((request,))
+        yield declaration, session, result
 
 
 @pytest.mark.parametrize(
@@ -278,51 +255,6 @@ def test_prepare_pair_weight_rejects_malformed_descriptor_before_cuda(
         )
 
 
-def test_run_delegates_caller_owned_capture_storage(monkeypatch) -> None:
-    x = torch.empty(0)
-    weight = SimpleNamespace()
-    buffers = tuple(torch.empty(0) for _ in range(8))
-    (
-        output,
-        gemm_output,
-        c_tmp,
-        input_f16,
-        rotated_f16,
-        rotated_compute,
-        gemm_output_f16,
-        output_f16,
-    ) = buffers
-    seen = {}
-
-    def fake_run(*args, **kwargs):
-        seen["args"] = args
-        seen["kwargs"] = kwargs
-        return output
-
-    monkeypatch.setattr(api, "run_trellis256_dense", fake_run)
-    actual = trellis_linear.run(
-        x,
-        weight,
-        output=output,
-        gemm_output=gemm_output,
-        c_tmp=c_tmp,
-        input_f16=input_f16,
-        rotated_f16=rotated_f16,
-        rotated_compute=rotated_compute,
-        gemm_output_f16=gemm_output_f16,
-        output_f16=output_f16,
-    )
-
-    assert actual is output
-    assert seen["args"] == (x, weight)
-    assert seen["kwargs"]["output"] is output
-    assert seen["kwargs"]["gemm_output"] is gemm_output
-    assert seen["kwargs"]["c_tmp"] is c_tmp
-    assert seen["kwargs"]["input_f16"] is input_f16
-    assert seen["kwargs"]["rotated_f16"] is rotated_f16
-    assert seen["kwargs"]["rotated_compute"] is rotated_compute
-    assert seen["kwargs"]["gemm_output_f16"] is gemm_output_f16
-    assert seen["kwargs"]["output_f16"] is output_f16
 
 
 def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
@@ -399,19 +331,17 @@ def test_trellis_dense_cuda_graph_replay_is_stable() -> None:
         "output": output,
         "gemm_output": gemm_output,
         "rotated_f16": rotated_f16,
-        "c_tmp": c_tmp,
     }
-
-    expected = trellis_linear.run(x, weight, **kwargs).clone()
-    torch.cuda.synchronize(device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = trellis_linear.run(x, weight, **kwargs)
-    output.fill_(float("nan"))
-    graph.replay()
-    torch.cuda.synchronize(device)
-
-    assert torch.equal(captured, expected)
+    with _prepared_trellis(x, weight, c_tmp=c_tmp, **kwargs) as (plan, session, result):
+        expected = trellis_linear.run(x, plan=plan, **kwargs).clone()
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured = trellis_linear.run(x, plan=plan, **kwargs)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.equal(captured, expected)
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
@@ -457,24 +387,23 @@ def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> N
     kwargs = {
         "output": output,
         "gemm_output": gemm_output,
-        "c_tmp": c_tmp,
         "input_f16": input_f16,
         "rotated_f16": rotated_f16,
         "rotated_compute": rotated_compute,
         "gemm_output_f16": gemm_output_f16,
         "output_f16": output_f16,
-        "hadamard_128": hadamard_128,
     }
-    expected = trellis_linear.run(x, weight, **kwargs).clone()
-    torch.cuda.synchronize(device)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = trellis_linear.run(x, weight, **kwargs)
-    graph.replay()
-    torch.cuda.synchronize(device)
-
-    assert torch.equal(captured, expected)
+    with _prepared_trellis(
+        x, weight, c_tmp=c_tmp, hadamard_128=hadamard_128, **kwargs,
+    ) as (plan, session, result):
+        expected = trellis_linear.run(x, plan=plan, **kwargs).clone()
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured = trellis_linear.run(x, plan=plan, **kwargs)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.equal(captured, expected)
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
@@ -520,24 +449,23 @@ def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
     gemm_output = torch.empty_like(x)
     rotated_f16 = torch.empty_like(x)
     c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
-    actual = trellis_linear.run(
-        x,
-        weight,
-        output=output,
-        gemm_output=gemm_output,
-        rotated_f16=rotated_f16,
-        c_tmp=c_tmp,
-        hadamard_128=identity_hadamard,
-    ).clone()
-    torch.cuda.synchronize(device)
-
-    expected = (x.float() @ reference_weight.float()).to(torch.float16)
-    relative_error = (actual - expected).float().norm() / expected.float().norm()
-    cosine = torch.nn.functional.cosine_similarity(
-        actual.float().flatten(), expected.float().flatten(), dim=0
-    )
-    assert float(relative_error) <= 2.0e-2
-    assert float(cosine) >= 0.999
+    kwargs = {
+        "output": output,
+        "gemm_output": gemm_output,
+        "rotated_f16": rotated_f16,
+    }
+    with _prepared_trellis(
+        x, weight, c_tmp=c_tmp, hadamard_128=identity_hadamard, **kwargs,
+    ) as (plan, _, _):
+        actual = trellis_linear.run(x, plan=plan, **kwargs).clone()
+        torch.cuda.synchronize(device)
+        expected = (x.float() @ reference_weight.float()).to(torch.float16)
+        relative_error = (actual - expected).float().norm() / expected.float().norm()
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        )
+        assert float(relative_error) <= 2.0e-2
+        assert float(cosine) >= 0.999
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
@@ -654,38 +582,29 @@ def test_dense_pair_matches_independent_reference_and_captures(
     gemm_output = torch.empty_like(output)
     rotated_f16 = torch.empty_like(x)
     c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
-    actual = trellis_linear.run(
-        x,
-        weight,
-        output=output,
-        gemm_output=gemm_output,
-        rotated_f16=rotated_f16,
-        c_tmp=c_tmp,
-        hadamard_128=identity_hadamard,
-    ).clone()
-    torch.cuda.synchronize(device)
-    expected = (x.float() @ reference_weight.float()).to(torch.float16)
-    relative_error = (actual - expected).float().norm() / expected.float().norm()
-    cosine = torch.nn.functional.cosine_similarity(
-        actual.float().flatten(), expected.float().flatten(), dim=0
-    )
-    assert float(relative_error) <= 2.0e-2
-    assert float(cosine) >= 0.999
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = trellis_linear.run(
-            x,
-            weight,
-            output=output,
-            gemm_output=gemm_output,
-            rotated_f16=rotated_f16,
-            c_tmp=c_tmp,
-            hadamard_128=identity_hadamard,
+    kwargs = {
+        "output": output,
+        "gemm_output": gemm_output,
+        "rotated_f16": rotated_f16,
+    }
+    with _prepared_trellis(
+        x, weight, c_tmp=c_tmp, hadamard_128=identity_hadamard, **kwargs,
+    ) as (plan, session, result):
+        actual = trellis_linear.run(x, plan=plan, **kwargs).clone()
+        torch.cuda.synchronize(device)
+        expected = (x.float() @ reference_weight.float()).to(torch.float16)
+        relative_error = (actual - expected).float().norm() / expected.float().norm()
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
         )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    assert torch.equal(captured, actual)
+        assert float(relative_error) <= 2.0e-2
+        assert float(cosine) >= 0.999
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured = trellis_linear.run(x, plan=plan, **kwargs)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.equal(captured, actual)
 
 
 

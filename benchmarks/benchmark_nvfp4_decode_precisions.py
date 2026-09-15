@@ -19,16 +19,16 @@ from pathlib import Path
 import statistics
 import subprocess
 import sys
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import torch
 
-import b12x
 from b12x.moe import fused_moe
-from b12x.policy import MOE_DECODE, get_auto_policy
 from b12x.moe._shared.kernels.reference import moe_reference_nvfp4
+from b12x.preparation.types import require_prepared
 from benchmarks.benchmark_moe import (
     MODEL_PROFILES,
     bench_events,
@@ -47,6 +47,7 @@ from benchmarks.benchmark_w4a16_nvfp4_layouts import (
 )
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from benchmarks.moe_checkpoint_snapshot import load_snapshot, save_snapshot, tensor_digest
+from benchmarks.moe_preparation import prepared_call, request_for_capacity, scratch_for
 
 
 def main() -> None:
@@ -172,6 +173,12 @@ def main() -> None:
     if weights.source_format != "modelopt_nvfp4":
         raise ValueError(f"expected ModelOpt NVFP4, got {weights.source_format}")
     raw_params = get_quant_mode_params(weights, "shared", "w4a16")
+    # Capacity is an independently specialized prepared variant even when it
+    # is not one of the reported exact-M oracle cases.
+    if args.capacity not in inputs:
+        inputs[args.capacity] = make_profile_routed_inputs(
+            profile, weights, spec, args.capacity, 42, device,
+        )
     a4_params = get_quant_mode_params(weights, "shared", "nvfp4")
     # Public preparation accepts raw weight globals for both precisions.
     bundle = fused_moe.PackedWeights(
@@ -191,6 +198,7 @@ def main() -> None:
         intermediate_size=spec.I_tp,
     )
     arms = {}
+    requests = []
     for name, mode in (("a4", fused_moe.ActivationMode.A4), ("a16", fused_moe.ActivationMode.AUTO)):
         weight_plan = fused_moe.plan_weights(
             source=source, geometry=geometry,
@@ -202,24 +210,42 @@ def main() -> None:
             ),
         )
         experts = fused_moe.prepare_weights(plan=weight_plan, weights=bundle)
-        plan = fused_moe.plan_execution(
+        declaration = fused_moe.plan_execution(
             experts=experts,
-            policy=(get_auto_policy(device).with_override(MOE_DECODE, fused_moe.MoeDecodeConfig(
-                backend="w4a16", route_planner="internal", max_active_clusters=None,
-                w4a16_route_mode="direct",
-            )) if name == "a16" else None),
             capacity=fused_moe.ExecutionCapacity(
                 max_tokens=args.capacity, top_k=spec.top_k,
                 warmup_token_counts=tuple(args.batch_sizes),
             ),
+            override=(
+                fused_moe.MoeDecodeConfig(
+                    backend="w4a16", route_planner="internal",
+                    max_active_clusters=None, w4a16_route_mode="direct",
+                ) if name == "a16" else None
+            ),
         )
-        print(f"Prewarming {name}", flush=True)
-        fused_moe.prewarm(plan)
-        scratch_spec, = plan.scratch_specs()
-        scratch = torch.empty(scratch_spec.shape, device=device, dtype=scratch_spec.dtype)
-        arms[name] = {"experts": experts, "plan": plan, "scratch": scratch}
+        outputs = {m: torch.empty_like(inputs[m][0]) for m in sorted({
+            args.capacity, *args.batch_sizes,
+        })}
+        calls = {
+            m: prepared_call(
+                output=outputs[m],
+                bind=lambda state, scratch, m=m: state.bind(
+                    scratch=scratch, a=inputs[m][0], experts=experts,
+                    topk_weights=inputs[m][2], topk_ids=inputs[m][1],
+                    output=outputs[m], input_scales_static=True,
+                ),
+            )
+            for m in getattr(declaration, "token_counts", (args.capacity,))
+        }
+        requests.append(request_for_capacity(
+            declaration, name=f"nvfp4-decode-{name}",
+            calls=calls,
+        ))
+        arms[name] = {"experts": experts, "outputs": outputs, "plan": declaration}
         for attr, original in (("w1_fp4", bundle.w13), ("w2_fp4", bundle.w2)):
             assert getattr(experts._impl, attr).data_ptr() == original.data_ptr()
+    session = PreparationSession(device=device)
+    result = session.prepare(requests)
     native = arms["a16"]["experts"]._impl.representation_for("w4a16")
     for micro_attr, a4_attr, original in (
         ("micro_w13_scale", "w1_blockscale", bundle.w13_block_scales),
@@ -248,18 +274,23 @@ def main() -> None:
         report["cases"].append(case)
         replays = {}
         for name, arm in arms.items():
-            out = torch.empty_like(x)
+            out = arm["outputs"][m]
+            variants = getattr(arm["plan"], "variants", None)
+            plan = arm["plan"] if variants is None else variants.get(m, arm["plan"])
             binding = fused_moe.bind(
-                arm["plan"], scratch=arm["scratch"], a=x, experts=arm["experts"],
+                plan, scratch=scratch_for(plan), a=x, experts=arm["experts"],
                 topk_weights=route_weights, topk_ids=ids, output=out,
                 input_scales_static=True,
             )
-            config = binding.execution_plan.policy_resolution.config
+            config = plan.selection.config
             case["plans"][name] = {
-                "variant": asdict(arm["plan"].variant_for(m)._impl.policy_resolution.config),
+                "variant": asdict(config),
                 "bound": asdict(config),
-                "bound_capacity": binding.execution_plan.routed_rows // spec.top_k,
-                "scratch_bytes": arm["scratch"].numel() * arm["scratch"].element_size(),
+                "bound_capacity": m,
+                "scratch_bytes": sum(
+                    spec.nbytes
+                    for spec in require_prepared(plan, plan.component_id).scratch.scratch_specs()
+                ),
             }
             if name == "a4":
                 scale_math = {
@@ -300,8 +331,7 @@ def main() -> None:
     if failures:
         raise AssertionError("\n".join(failures))
 
-    b12x.freeze_kernel_resolution("NVFP4 A4/A16 decode graph qualification")
-    try:
+    with kernel_resolution_guard('NVFP4 A4/A16 decode graph qualification'):
         for case, replays in replay_cases:
             for arm in replays.values():
                 graph = torch.cuda.CUDAGraph()
@@ -369,13 +399,16 @@ def main() -> None:
                     f"A16={medians['a16']:.2f} us, A16/A4={timing['a16_over_a4']:.3f}",
                     flush=True,
                 )
-    finally:
-        b12x.unfreeze_kernel_resolution()
     assert _weight_hashes(bundle) == report["native_weight_sha256"]
     report["native_weights_unchanged"] = True
     report["replay_allocation_stable"] = True
     report["qualified"] = True
     save()
+    for _, replays in replay_cases:
+        for arm in replays.values():
+            arm["graph"].reset()
+    result.close()
+    session.close()
 
 
 if __name__ == "__main__":

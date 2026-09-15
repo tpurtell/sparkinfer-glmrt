@@ -12,6 +12,7 @@ import torch
 from cutlass.cute.typing import AddressSpace
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics import align_up
 from b12x._lib.utils import (
     MXFP6_SF_VEC_SIZE,
@@ -209,6 +210,7 @@ def compile_bf16_to_fp6_tma(
         )
         raw(bf16_input, global_scale, pa_storage, sfa_p, current_cuda_stream())
 
+    launch = attach_programs(launch, raw)
     _KERNEL_CACHE_FP6[cache_key] = launch
     return launch
 
@@ -267,10 +269,15 @@ from b12x.quantization.mxfp6.fp6_safetensors_load import (  # noqa: E402
     load_fp6_dense_checkpoint,
 )
 
+from b12x.quantization.mxfp6._preparation import (  # noqa: E402
+    Mxfp6DenseConfig,
+    Mxfp6DenseQuery,
+    plan,
+)
+
 __all__ = [
     "BF16ToFP6TMAOutputs",
     "allocate_bf16_to_fp6_tma_outputs",
-    "compile_bf16_to_fp6_tma",
     "FP6MoEWeights",
     "quantize_moe_weights_to_fp6",
     "save_fp6_moe_weights",
@@ -310,4 +317,7 @@ __all__ = [
     "load_fp6_moe_checkpoint",
     "load_fp6_dense_weight_from_safetensors",
     "load_fp6_dense_checkpoint",
+    "Mxfp6DenseConfig",
+    "Mxfp6DenseQuery",
+    "plan",
 ]

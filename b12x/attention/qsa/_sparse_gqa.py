@@ -13,6 +13,8 @@ import math
 
 import torch
 
+from b12x._lib.compile_plan import compile_only_launches_enabled, program_keys, record_program
+
 from ._sparse_gqa_cute_config import (
     MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS,
     _is_page_token_head_layout,
@@ -187,6 +189,43 @@ def _validate_launch(
     return rows, q_heads, head_dim
 
 
+def compile_sparse_paged_gqa(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    request_ids: torch.Tensor,
+    selected_positions: torch.Tensor,
+    direct_kv_warps: int,
+) -> dict[str, object]:
+    """Compile both legal QSA sparse-GQA ABIs and retain their raw carriers."""
+    from ..paged._selected_forward import _compile, launch_sparse_gqa_merge
+
+    result: dict[str, object] = {}
+    for direct in (False, True):
+        _, result["direct" if direct else "split"] = _compile(
+            query=query, key_cache=key_cache, value_cache=value_cache,
+            request_ids=request_ids, direct_output=direct,
+            kv_warps=int(direct_kv_warps) if direct else 2,
+            selection_width=int(selected_positions.shape[1]),
+        )
+    # Split merge is a distinct CuTe ABI; compile-only returns its carrier.
+    partial_output = torch.empty(
+        (int(query.shape[0]), 1, int(query.shape[1]), int(query.shape[2])),
+        dtype=torch.float32, device=query.device,
+    )
+    partial_lse = torch.empty(
+        (int(query.shape[0]), 1, int(query.shape[1])),
+        dtype=torch.float32, device=query.device,
+    )
+    output = torch.empty_like(query)
+    result["merge"] = launch_sparse_gqa_merge(
+        partial_output=partial_output, partial_lse=partial_lse, output=output,
+        rows=int(query.shape[0]), splits=1,
+    )
+    return result
+
+
 def launch_sparse_paged_gqa(
     *,
     query: torch.Tensor,
@@ -205,8 +244,33 @@ def launch_sparse_paged_gqa(
     block_n: int,
     splits: int,
     direct_kv_warps: int = 2,
+    _prepared: dict[str, object] | None = None,
 ) -> torch.Tensor:
     """Launch the allocation-free CuTe Qwen sparse GQA into ``output``."""
+    if compile_only_launches_enabled():
+        from ..paged._selected_forward import _compile, launch_sparse_gqa_merge
+
+        direct = int(query.shape[0]) > _MAX_SPLIT_ROWS
+        _, raw = _compile(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            request_ids=request_ids,
+            direct_output=direct,
+            kv_warps=int(direct_kv_warps) if direct else 2,
+            selection_width=int(selected_positions.shape[1]),
+        )
+        for program in program_keys(raw):
+            record_program(program)
+        if not direct:
+            launch_sparse_gqa_merge(
+                partial_output=partial_output,
+                partial_lse=partial_lse,
+                output=output,
+                rows=int(query.shape[0]),
+                splits=splits,
+            )
+        return
     rows, _, _ = _validate_launch(
         query=query,
         key_cache=key_cache,
@@ -239,6 +303,40 @@ def launch_sparse_paged_gqa(
             f"selection_width={int(selected_positions.shape[1])}, "
             f"block_n={int(block_n)}, splits={int(splits)}"
         )
+    if _prepared is not None:
+        from ..paged._selected_forward import (
+            BFloat16, Float8E4M3FN, Float32, Int32, Int64, _fake_pointer,
+            _pointer, current_cuda_stream, run_compiled,
+        )
+        direct = rows > _MAX_SPLIT_ROWS
+        raw = _prepared["direct" if direct else "split"]
+        request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
+        kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
+        run_compiled(raw, (
+            _pointer(query, BFloat16), _pointer(key_cache, kv_type),
+            _pointer(value_cache, kv_type),
+            _pointer(k_descale, Float32) if k_descale is not None else _fake_pointer(Float32),
+            _pointer(v_descale, Float32) if v_descale is not None else _fake_pointer(Float32),
+            _pointer(block_table, Int32), _pointer(request_ids, request_id_type),
+            _pointer(selected_positions, Int32), _pointer(query_positions, Int64),
+            _fake_pointer(Float32) if direct else _pointer(partial_output, Float32),
+            _fake_pointer(Float32) if direct else _pointer(partial_lse, Float32),
+            _pointer(output, BFloat16), int(key_cache.shape[0]),
+            int(block_table.shape[0]), int(block_table.shape[1]), float(softmax_scale),
+            int(rows), 1 if direct else int(splits), current_cuda_stream(),
+        ))
+        if not direct:
+            from ..paged._selected_forward import launch_sparse_gqa_merge
+            # The merge helper has no runtime resolver here: its exact carrier
+            # was retained in the QSA program map during preparation.
+            merge = _prepared["merge"]
+            from ..paged._selected_forward import run_compiled as run_merge
+            run_merge(merge, (
+                _pointer(partial_output, Float32), _pointer(partial_lse, Float32),
+                _pointer(output, BFloat16), int(rows), int(splits),
+                current_cuda_stream(),
+            ))
+        return output[:rows]
     if rows > _MAX_SPLIT_ROWS:
         from ..paged._selected_forward import launch_selected_paged_gqa_direct
 

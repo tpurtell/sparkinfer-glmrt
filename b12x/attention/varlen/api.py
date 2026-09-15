@@ -1,49 +1,12 @@
-"""Public surface for attention.varlen (docs in the op ``__init__``)."""
-
+"""Prepared batched and packed-varlen contiguous attention."""
 from __future__ import annotations
 
+from b12x.preparation import Plan
+
 from ..._lib.gating import default_is_supported
-from .._shared.contiguous.api import (
-    AttentionBinding as BatchedBinding,
-)
-from ._policy import VarlenAttentionConfig, VarlenAttentionQuery
-from .._shared.contiguous.api import (
-    AttentionPlan as BatchedPlan,
-)
-from .._shared.contiguous.api import (
-    AttentionScratchPlan as BatchedScratchPlan,
-)
-from .._shared.contiguous.api import (
-    VarlenAttentionBinding as VarlenBinding,
-)
-from .._shared.contiguous.api import (
-    VarlenAttentionPlan as VarlenPlan,
-)
-from .._shared.contiguous.api import (
-    VarlenAttentionScratchPlan as VarlenScratchPlan,
-)
-from .._shared.contiguous.api import (
-    clear_attention_caches as clear_caches,
-)
-from .._shared.contiguous.api import (
-    create_attention_plan as create_plan_batched,
-)
-from .._shared.contiguous.api import (
-    create_varlen_attention_plan as create_plan,
-)
-from .._shared.contiguous.api import (
-    plan_attention_scratch as plan_batched,
-)
-from .._shared.contiguous.api import (
-    plan_varlen_attention_scratch as plan,
-)
-from .._shared.contiguous.api import (
-    b12x_attention_forward as run_batched,
-)
-from .._shared.contiguous.api import (
-    b12x_varlen_attention_forward as run,
-)
 from . import META
+from ._preparation import BatchedBinding, VarlenBinding, bind, bind_batched, plan, plan_batched, run, run_batched
+from ._tuning import VarlenAttentionConfig, VarlenAttentionQuery
 
 
 def is_supported(device=None) -> bool:
@@ -51,4 +14,8 @@ def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 
 
-__all__ = list(META.entry_points)
+__all__ = [
+    "BatchedBinding", "Plan", "VarlenAttentionConfig",
+    "VarlenAttentionQuery", "VarlenBinding", "bind", "bind_batched", "is_supported",
+    "plan", "plan_batched", "run", "run_batched",
+]

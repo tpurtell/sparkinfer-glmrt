@@ -16,6 +16,8 @@ except ImportError:  # Keep the pure-PyTorch fallback usable outside vLLM images
     triton = None
     tl = None
 
+from b12x._lib.compile_plan import launch_triton
+
 from .merge import clear_sparse_mla_merge_kernel_cache
 from .reference import sparse_mla_reference
 from .traits import ModelType, kv_fp8_rope_enabled, resolve_unplanned_traits
@@ -431,6 +433,7 @@ def sparse_mla_decode_forward(
     model_type: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool | None = None,
+    prepared: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     (
         q_all,
@@ -477,9 +480,7 @@ def sparse_mla_decode_forward(
         model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
-        planned_cache_traits=(
-            binding.cache_traits if bound_kv_cache is not None else None
-        ),
+        prepared=prepared,
     )
 
 
@@ -501,6 +502,7 @@ def sparse_mla_extend_forward(
     model_type: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool | None = None,
+    prepared: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     (
         q_all,
@@ -544,9 +546,7 @@ def sparse_mla_extend_forward(
         model_type=model_type,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
-        planned_cache_traits=(
-            binding.cache_traits if bound_kv_cache is not None else None
-        ),
+        prepared=prepared,
     )
 
 
@@ -572,6 +572,7 @@ def _run_sparse_mla(
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool | None = None,
     planned_cache_traits: object | None = None,
+    prepared: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -829,6 +830,11 @@ def _run_sparse_mla(
             latent_scale_per_token=latent_scale_per_token_for_call,
             traits_override=cache_traits,
         )
+    if prepared:
+        raise RuntimeError(
+            "prepared sparse MLA requires the native SM120 route; "
+            "a prepared execution cannot fall back to the reference implementation"
+        )
     if _is_cuda_graph_capture_active(q_all.device):
         raise RuntimeError(
             "b12x MLA would use the PyTorch reference during CUDA graph capture; "
@@ -853,7 +859,6 @@ def _run_sparse_mla(
         output, lse = output
         if lse_scale == "natural":
             lse = lse * _LN2
-    if return_lse:
         return output, lse
     return output
 
@@ -920,6 +925,8 @@ def _final_lse_from_split_workspace(
     num_heads: int,
     launch_num_chunks: int,
     scale: Literal["base2", "natural"] = "base2",
+    _prepared: object | None = None,
+    resolved_programs: list[object] | None = None,
 ) -> torch.Tensor:
     if workspace.tmp_lse is None:
         raise RuntimeError("workspace is missing split MLA LSE buffer")
@@ -961,12 +968,16 @@ def _final_lse_from_split_workspace(
             "workspace final MLA LSE buffer is too small: "
             f"buffer={tuple(workspace.final_lse.shape)} required>=({q_rows}, {num_heads})"
         )
-    final_lse = workspace.final_lse[:q_rows, :num_heads]
+    final_lse = workspace.final_lse.as_strided(
+        (q_rows, num_heads), workspace.final_lse.stride()
+    )
     if final_lse.dtype != torch.float32:
         raise TypeError(
             f"workspace final MLA LSE buffer must be FP32, got {final_lse.dtype}"
         )
-    chunk_lse = workspace.tmp_lse[:q_rows, :num_heads, :chunk_count]
+    chunk_lse = workspace.tmp_lse.as_strided(
+        (q_rows, num_heads, chunk_count), workspace.tmp_lse.stride()
+    )
     if chunk_lse.dtype != torch.float32:
         raise TypeError(
             f"workspace split MLA LSE buffer must be FP32, got {chunk_lse.dtype}"
@@ -977,7 +988,7 @@ def _final_lse_from_split_workspace(
         and final_lse.device == chunk_lse.device
     ):
         block_c = triton.next_power_of_2(chunk_count)
-        _split_decode_final_lse_kernel[(q_rows, num_heads)](
+        args = (
             chunk_lse,
             final_lse,
             chunk_lse.stride(0),
@@ -989,6 +1000,13 @@ def _final_lse_from_split_workspace(
             block_c,
             scale == "natural",
         )
+        grid = (q_rows, num_heads)
+        if _prepared is not None:
+            _prepared[(q_rows, num_heads, 1)](*args)
+        else:
+            launched = launch_triton(_split_decode_final_lse_kernel, grid, *args)
+            if resolved_programs is not None:
+                resolved_programs.append(launched)
         return final_lse
     chunk_lse.mul_(_LN2)
     torch.logsumexp(chunk_lse, dim=-1, out=final_lse)

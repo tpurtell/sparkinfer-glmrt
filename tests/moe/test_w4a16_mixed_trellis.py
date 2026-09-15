@@ -1831,3 +1831,84 @@ def test_qwen_k4_k5_geometry_matches_serial_and_graph(direct):
         torch.int32, "mcg", (4, 5), direct, "bf16",
         geometry=(2560, 640), tile_config=tiles,
     )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("route_ids_dtype,broadcast,coupled", [
+    (torch.int32, False, False),
+    (torch.int64, True, False),
+    (torch.int64, False, True),
+    (torch.int32, True, True),
+])
+def test_full_rotation_prefill_capacity_reuses_native_launchers(tmp_path, route_ids_dtype, broadcast, coupled):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.moe.fused_moe import _impl as impl
+    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
+    from b12x.moe._shared.kernels.w4a16.btx_synth import BtxSynthConfig, write_btx_checkpoint
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    hidden, intermediate, experts, capacity, topk = 512 if coupled else 256, 256, 3, 128, 2
+    codebook = "sqg_e4m3" if coupled else "mcg"
+    manifest = write_btx_checkpoint(tmp_path, BtxSynthConfig(
+        codebook=codebook, num_experts=experts, hidden_size=hidden,
+        intermediate_size=intermediate, moe_layer_indices=(0,), bits=3,
+        per_expert_input_rotations=not broadcast, coupled=coupled,
+        pre_block=512 if coupled else None, post_block=128 if coupled else None,
+        extent_alignment_slots=4, seed=5,
+    ))
+    layer = read_btx_layer(tmp_path, manifest, 0, first_slot=0, slot_count=intermediate // 32)
+    weight_plan = impl.plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16", source_format="btx", trellis_codebook=codebook,
+        activation="silu", params_dtype=torch.float16, num_experts=experts,
+        hidden_size=hidden, intermediate_size=intermediate, trellis_bits=3,
+        trellis_tile_config=(64, 256, 64, 256), coupled_hadamard=coupled,
+    )
+    weights = impl.prepare_b12x_fp4_moe_weights(
+        plan=weight_plan, params_dtype=torch.float16, btx_layer=layer, btx_device=device,
+    )
+    plan = impl.plan_tp_moe_scratch(impl.TPMoEScratchCaps(
+        max_tokens=capacity, core_token_counts=(capacity,), num_topk=topk,
+        route_num_experts=experts, device=device, weight_plan=weight_plan,
+        quant_mode="w4a16", w4a16_block_size_m=64,
+        decode_config=impl.MoeDecodeConfig(backend="w4a16", route_planner="internal", max_active_clusters=None, w4a16_route_mode="packed"),
+    ))
+    assert {rows for rows, _ in plan._prewarmed_fused_launches} == {capacity}
+    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in plan.scratch_specs())
+    torch.manual_seed(614)
+    source = (torch.randn(capacity, hidden, device=device) * 0.125).half()
+    route_weights = torch.softmax(torch.randn(capacity, topk, device=device), dim=1)
+    route_ids = torch.randint(experts, (capacity, topk), device=device, dtype=route_ids_dtype)
+    expert_map = torch.arange(experts, device=device, dtype=torch.int32)
+    output = torch.empty_like(source)
+    def bind(rows):
+        return plan.bind(
+            scratch=scratch, a=source[:rows], experts=weights,
+            topk_weights=route_weights[:rows], topk_ids=route_ids[:rows],
+            output=output[:rows], route_expert_map=expert_map, output_expert_map=expert_map,
+        )
+    def reference(rows):
+        return _serial_tier(source[:rows], weights.representation.value, route_weights[:rows], route_ids[:rows], expert_map, block_size_m=64).to(output.dtype)
+    bind(capacity).run()
+    addresses = tuple(tensor.data_ptr() for tensor in (*scratch, output))
+    for rows in (3, 11, 125, capacity):
+        with kernel_resolution_guard("Trellis prefill capacity"):
+            binding = bind(rows)
+            assert any(binding.fused_launch is launch for _, launch in plan._prewarmed_fused_launches)
+            assert binding.fused_launch.broadcast_suh == broadcast
+            assert binding.topk_sum_launch.broadcast_svh == broadcast
+            actual = binding.run().clone()
+        expected = reference(rows)
+        assert torch.isfinite(actual).all() and torch.count_nonzero(actual)
+        torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+    binding = bind(11)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with kernel_resolution_guard("Trellis capacity replay"), torch.cuda.graph(graph):
+            binding.run()
+        source.mul_(-0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output[:11], reference(11), rtol=2e-3, atol=2e-3)
+        assert tuple(tensor.data_ptr() for tensor in (*scratch, output)) == addresses
+    finally:
+        graph.reset()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from b12x.preparation import FrozenMapping
 
 from b12x.attention.dsa_indexer.fused_indexer import (
     KV_LAYOUT_CONTIGUOUS_MLA,
@@ -720,51 +721,13 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
 # --- fused_merge policy knob -------------------------------------------------
 
 
-def test_dsa_indexer_config_decodes_legacy_and_knob_profiles() -> None:
-    from b12x.attention.dsa_indexer._policy import (
-        DSA_INDEXER_POLICY,
-        FUSED_MERGE_AUTO,
-        FUSED_MERGE_SERIAL,
+def test_dsa_indexer_config_and_merge_thresholds() -> None:
+    from b12x.attention.dsa_indexer._tuning import (
         DsaIndexerConfig,
-        DsaIndexerQuery,
-    )
-    from b12x.policy.types import FrozenMapping
-
-    legacy = DsaIndexerConfig.from_profile(FrozenMapping({"backend": "native"}))
-    assert legacy.fused_merge == FUSED_MERGE_AUTO
-    pinned = DsaIndexerConfig.from_profile(
-        FrozenMapping({"backend": "native", "fused_merge": FUSED_MERGE_SERIAL})
-    )
-    assert pinned.to_dict() == {"backend": "native", "fused_merge": FUSED_MERGE_SERIAL}
-    with pytest.raises(ValueError):
-        DsaIndexerConfig.from_profile(FrozenMapping({"backend": "native", "x": 1}))
-    query = DsaIndexerQuery(
-        source_layout="paged",
-        mode="decode",
-        dtype="bfloat16",
-        kv_dtype="uint8",
-        num_q_heads=32,
-        num_idx_heads=1,
-        max_q_rows=4,
-        max_k_rows=0,
-        top_k=2048,
-        page_size=64,
-        score_mode="dsa",
-        shared_page_table=False,
-    )
-    DSA_INDEXER_POLICY.validate_config(query, pinned, None)
-    with pytest.raises(ValueError):
-        DSA_INDEXER_POLICY.validate_config(
-            query, DsaIndexerConfig(backend="native", fused_merge="fastest"), None
-        )
-    assert DSA_INDEXER_POLICY.heuristic(query, None).fused_merge == FUSED_MERGE_AUTO
-
-
-def test_resolve_fused_merge_threshold_maps_each_choice() -> None:
-    from b12x.attention.dsa_indexer._policy import (
         FUSED_MERGE_AUTO,
         FUSED_MERGE_COOPERATIVE,
         FUSED_MERGE_SERIAL,
+        TUNING,
     )
     from b12x.attention.dsa_indexer.fused_indexer import (
         _FORCE_LAST_CTA,
@@ -772,31 +735,26 @@ def test_resolve_fused_merge_threshold_maps_each_choice() -> None:
         resolve_fused_merge_threshold,
     )
 
+    config = DsaIndexerConfig.from_config(
+        FrozenMapping({"backend": "native", "fused_merge": FUSED_MERGE_AUTO})
+    )
+    assert TUNING.encode_config(config) == config.to_dict()
     common = dict(ctas_per_group=47, num_heads=32, topk=2048)
     assert resolve_fused_merge_threshold(FUSED_MERGE_COOPERATIVE, **common) == 0
     assert resolve_fused_merge_threshold(FUSED_MERGE_SERIAL, **common) == _FORCE_LAST_CTA
     assert resolve_fused_merge_threshold(
         FUSED_MERGE_AUTO, **common
     ) == _resolve_default_merge_threshold(**common)
-    assert (
-        resolve_fused_merge_threshold(
-            FUSED_MERGE_COOPERATIVE, ctas_per_group=1, num_heads=32, topk=2048
-        )
-        == _FORCE_LAST_CTA
-    )
-    with pytest.raises(ValueError):
-        resolve_fused_merge_threshold("fastest", **common)
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for indexer planning"
 )
-def test_plan_indexer_scratch_applies_policy_fused_merge() -> None:
-    from b12x.attention.dsa_indexer._policy import (
-        DSA_INDEXER,
+def test_plan_indexer_scratch_applies_prepared_fused_merge() -> None:
+    from b12x.attention.dsa_indexer._tuning import (
+        FUSED_MERGE_AUTO,
         FUSED_MERGE_COOPERATIVE,
         FUSED_MERGE_SERIAL,
-        DsaIndexerConfig,
     )
     from b12x.attention.dsa_indexer.fused_indexer import _FORCE_LAST_CTA
     from b12x.attention.dsa_indexer.scratch import (
@@ -804,54 +762,19 @@ def test_plan_indexer_scratch_applies_policy_fused_merge() -> None:
         B12XIndexerScratchCaps,
         plan_indexer_scratch,
     )
-    from b12x.policy import PolicyContext, PolicyMode
 
-    device = torch.device("cuda")
     caps = B12XIndexerScratchCaps(
-        device=device,
-        source_layout="paged",
-        num_q_heads=32,
-        max_q_rows=4,
-        topk=2048,
-        max_page_table_width=512,
+        device=torch.device("cuda"), source_layout="paged", num_q_heads=32,
+        max_q_rows=4, topk=2048, max_page_table_width=512,
         route=INDEXER_PAGED_ROUTE_FUSED,
     )
-    base = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
-    thresholds = {}
-    for choice in (FUSED_MERGE_COOPERATIVE, FUSED_MERGE_SERIAL):
-        policy = base.with_override(
-            DSA_INDEXER, DsaIndexerConfig(backend="native", fused_merge=choice)
-        )
-        plan = plan_indexer_scratch(caps, policy=policy)
-        thresholds[choice] = int(plan.inner.layout.fused_merge_threshold)
+    thresholds = {
+        choice: int(plan_indexer_scratch(caps, fused_merge=choice).inner.layout.fused_merge_threshold)
+        for choice in (FUSED_MERGE_COOPERATIVE, FUSED_MERGE_SERIAL)
+    }
     assert thresholds[FUSED_MERGE_COOPERATIVE] == 0
     assert thresholds[FUSED_MERGE_SERIAL] == _FORCE_LAST_CTA
-    auto_plan = plan_indexer_scratch(caps, policy=base)
-    assert int(auto_plan.inner.layout.fused_merge_threshold) == 0
-
-
-def test_dsa_indexer_merge_generator_races_both_arms() -> None:
-    from b12x.policy.generation.providers.tunable import (
-        DsaIndexerMergeGenerator,
-        DsaIndexerProfileGenerator,
-        _DsaIndexerMergeSession,
-    )
-
-    generator = DsaIndexerMergeGenerator()
-    cases = generator._cases
-    assert cases and len({case.case_id for case in cases}) == len(cases)
-    scenarios = {case.scenario for case in cases}
-    assert scenarios == {"ctx4k", "ctx32k"}
-    session = _DsaIndexerMergeSession(context=None)
-    candidates = session.candidates(cases[0])
-    assert sorted(dict(c.config)["fused_merge"] for c in candidates) == [
-        "cooperative",
-        "serial",
-    ]
-    composite = DsaIndexerProfileGenerator()
-    assert composite.component_id == generator.component_id
-    assert composite.reviewed_queries()
-
+    assert int(plan_indexer_scratch(caps, fused_merge=FUSED_MERGE_AUTO).inner.layout.fused_merge_threshold) == 0
 
 # --- cooperative merge across repeated launches ------------------------------
 
@@ -957,57 +880,3 @@ def test_fused_indexer_cooperative_pack_path_pads_absent_slots_across_launches()
             assert int((out_indices[row] == -1).sum()) == topk - live
             assert torch.isinf(out_values[row][out_indices[row] == -1]).all()
         assert int(merge_state.abs().sum()) == 0
-
-
-def test_dsa_indexer_profile_generator_merges_qualification_and_race(monkeypatch) -> None:
-    """The composite pins raced winners and keeps the qualified config elsewhere."""
-    from types import SimpleNamespace
-
-    from b12x.attention.dsa_indexer._policy import DSA_INDEXER_POLICY
-    from b12x.policy.generation.reducer import DecisionRecord
-    from b12x.policy.generation.providers.tunable import DsaIndexerProfileGenerator
-    from b12x.policy.serialization import _planner_node
-    from b12x.policy.types import FrozenMapping
-
-    generator = DsaIndexerProfileGenerator()
-    queries = generator.reviewed_queries()
-    raced_query = DSA_INDEXER_POLICY.encode_query(queries[0])
-    race_config = FrozenMapping({"backend": "native", "fused_merge": "serial"})
-    qualified = FrozenMapping({"backend": "native", "fused_merge": "auto"})
-    monkeypatch.setattr(
-        generator._qualification,
-        "qualify",
-        lambda context, *, progress, checkpoints: SimpleNamespace(
-            encoded_config=qualified,
-            evidence={"gpu_measurement_cases": 3},
-            completed_work_units=5,
-        ),
-    )
-    monkeypatch.setattr(
-        generator._race,
-        "race",
-        lambda context, *, progress, checkpoints: SimpleNamespace(
-            records=(DecisionRecord.create(query=raced_query, config=race_config),),
-            coverage={"fused_merge_candidates": ["cooperative", "serial"]},
-            evidence={"gpu_measurement_cases": 2},
-            completed_work_units=7,
-        ),
-    )
-    result = generator.generate(context=None, progress=None, checkpoints=None)
-    assert result.evidence["gpu_measurement_cases"] == 5
-    assert result.completed_work_units == 12
-    coverage = result.component["coverage"]
-    assert coverage["qualified_runtime_queries"] == len(queries)
-    assert coverage["raced_query_points"] == 1
-    planner = _planner_node(result.component["planner"], name="planner")
-    assert planner.lookup(raced_query).config.to_dict() == dict(race_config)
-    # Row counts between raced anchors and unraced layouts take the default
-    # leaf at whichever depth the lookup misses.
-    unraced_rows = dict(raced_query)
-    unraced_rows["max_q_rows"] = int(raced_query["max_q_rows"]) + 1
-    contiguous = dict(raced_query)
-    contiguous["source_layout"] = "contiguous"
-    for query in (unraced_rows, contiguous):
-        leaf = planner.lookup(query)
-        assert leaf is not None and leaf.name == "measured-production-implementation"
-        assert leaf.config.to_dict() == dict(qualified)

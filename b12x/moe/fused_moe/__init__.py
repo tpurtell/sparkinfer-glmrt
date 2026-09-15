@@ -26,15 +26,17 @@ activation precision independent:
         geometry=geometry,
     )
     experts = fused_moe.prepare_weights(plan=weight_plan, weights=weights)
-    execution = fused_moe.plan_execution(
+    declaration = fused_moe.plan_execution(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=4096, top_k=8),
     )
-    fused_moe.prewarm(execution)
-    spec = execution.scratch_specs()[0]
-    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    request = declaration.request(
+        name="layer.moe",
+        prepare_calls={count: make_call for count in declaration.token_counts},
+    )
+    result = session.prepare((request,))
     binding = fused_moe.bind(
-        execution,
+        declaration,
         scratch=scratch,
         a=x,
         experts=experts,
@@ -43,9 +45,9 @@ activation precision independent:
     )
     output = fused_moe.run(binding=binding)
 
-``quant_modes`` planning, flat tensor preparation, ``Caps``/``plan``, and the
-lightweight ``plan_execution`` call remain available as the compatibility
-contract consumed by official vLLM releases.
+Primary capacity preparation is declarative. Runtime binding requires the
+session-prepared ``Plan``; route and FC2 work are materialized as part of
+that prepared plan rather than public alternate launch paths.
 """
 
 from __future__ import annotations
@@ -62,27 +64,22 @@ META = OpMeta(
         "ActivationMode",
         "ActivationSpec",
         "Binding",
-        "Caps",
+        "RouteBinding",
+        "SparseBinding",
+        "RouteTopKInvocation",
+        "FC2Invocation",
         "ExecutionCapacity",
-        "ExecutionPlan",
-        "ExecutionVariant",
-        "ExpertWeights",
         "MoEGeometry",
         "MoeDecodeConfig",
         "MoeDecodeQuery",
         "PackedSource",
         "PackedSourceFormat",
         "PackedWeights",
-        "Plan",
         "PreparedExperts",
         "PreparedWeightFormat",
-        "RouteBinding",
-        "Routing",
         "RoutingSpec",
         "ScaleEncoding",
         "ScaleFactors",
-        "ScratchRequirement",
-        "SparseBinding",
         "TrellisConfig",
         "TrellisWeights",
         "W13Layout",
@@ -91,26 +88,22 @@ META = OpMeta(
         "WeightPlan",
         "WeightPlanConstraints",
         "WeightSource",
-        "WeightsPlan",
         "bind",
         "bind_route",
         "bind_sparse",
         "clear_caches",
         "is_supported",
-        "plan",
         "plan_execution",
+        "plan_route_topk",
+        "plan_fc2",
         "plan_weights",
-        "prepare_fc2_weights",
         "prepare_weights",
-        "prewarm",
-        "prewarm_fc2",
-        "required_nbytes",
-        "route",
         "route_topk",
-        "run",
+        "route",
         "run_fc2",
         "reduce_v41_tp4_routes",
         "run_sparse",
+        "run",
     ),
     dtypes=("bf16", "fp16"),
     recipes=(
@@ -136,27 +129,22 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         ActivationMode,
         ActivationSpec,
         Binding,
-        Caps,
+        RouteBinding,
+        SparseBinding,
+        RouteTopKInvocation,
+        FC2Invocation,
         ExecutionCapacity,
-        ExecutionPlan,
-        ExecutionVariant,
-        ExpertWeights,
         MoEGeometry,
         MoeDecodeConfig,
         MoeDecodeQuery,
         PackedSource,
         PackedSourceFormat,
         PackedWeights,
-        Plan,
         PreparedExperts,
         PreparedWeightFormat,
-        RouteBinding,
-        Routing,
         RoutingSpec,
         ScaleEncoding,
         ScaleFactors,
-        ScratchRequirement,
-        SparseBinding,
         TrellisConfig,
         TrellisWeights,
         W13Layout,
@@ -165,25 +153,21 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         WeightPlan,
         WeightPlanConstraints,
         WeightSource,
-        WeightsPlan,
         bind,
         bind_route,
         bind_sparse,
         clear_caches,
         is_supported,
-        plan,
         plan_execution,
+        plan_route_topk,
+        plan_fc2,
         plan_weights,
-        prepare_fc2_weights,
         prepare_weights,
-        prewarm,
-        prewarm_fc2,
-        required_nbytes,
-        route,
         route_topk,
-        run,
+        route,
         run_fc2,
         run_sparse,
+        run,
     )
 
 install_lazy_api(globals(), META)

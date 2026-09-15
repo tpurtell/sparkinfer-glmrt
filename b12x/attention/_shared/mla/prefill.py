@@ -27,6 +27,7 @@ import os
 from dataclasses import replace
 
 import torch
+from b12x._lib.compile_plan import compile_only_launches_enabled
 
 from .traits import (
     ComputeMode,
@@ -151,6 +152,8 @@ def run_unified_prefill(
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
     traits_override: UnifiedMLATraits | None = None,
+    prepared: object | None = None,
+    mg_enabled: bool | None = None,
 ):
     """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + base-2 LSE.
 
@@ -309,14 +312,24 @@ def run_unified_prefill(
 
         partitions = _mg_head_partitions(heads, hpb)
         if model_type == ModelType.DSV41:
-            # The heterogeneous double-buffered 544-byte records leave room
-            # for one BF16 query group, not two, in the SM120 shared carveout.
-            partitions = ((1, heads, 0),)
+            # DSV4.1's 544-byte records permit one 16-head group per CTA.
+            # One launch covers the full 16-aligned prefix; only an 8-head
+            # remainder needs a separate valid-HPB launch.
+            prefix_heads = heads - heads % hpb
+            partitions = ((1, prefix_heads, 0),) if prefix_heads else ()
+            if prefix_heads != heads:
+                partitions += ((1, heads - prefix_heads, prefix_heads),)
         if not partitions:
             raise ValueError(
                 f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
             )
-        for mg_n_hg, active_heads, head_offset in partitions:
+        if model_type == ModelType.DSV41:
+            # Heterogeneous 544-byte staging permits only one head group.
+            partitions = ((1, heads, 0),)
+        launches = []
+        for partition_index, (mg_n_hg, active_heads, head_offset) in enumerate(
+            partitions
+        ):
             kwargs = dict(
                 q=q,
                 kv_cache=kv_cache,
@@ -337,6 +350,11 @@ def run_unified_prefill(
                 latent_scale_per_token=bool(traits.latent_scale_per_token),
                 traits_override=replace(traits, compute_mode=compute_mode),
             )
+            if prepared is not None:
+                kwargs["prepared"] = (
+                    prepared[partition_index]
+                    if isinstance(prepared, tuple) else prepared
+                )
             if extra_kv_cache is not None:
                 kwargs.update(
                     extra_kv_cache=extra_kv_cache,
@@ -347,7 +365,11 @@ def run_unified_prefill(
                 )
             if len(partitions) > 1 or active_heads != heads or head_offset != 0:
                 kwargs.update(active_heads=active_heads, head_offset=head_offset)
-            run_unified_prefill_mg(**kwargs)
+            launch = run_unified_prefill_mg(**kwargs)
+            if launch is not None:
+                launches.append(launch)
+        if compile_only_launches_enabled():
+            return tuple(launches)
         return output, lse_out
 
     if model_type == ModelType.DSV41:
@@ -377,11 +399,14 @@ def run_unified_prefill(
     #     XV stays FP8). FlashInfer routes topk==128 to this BF16-QK kernel (the
     #     small K-loop where the Q-quant prologue would dominate); it lands a
     #     TIGHTER numeric (no Q-quant loss) than FP8.
-    _mg_enabled = os.environ.get("B12X_MLA_SM120_PREFILL_MG", "1") not in (
-        "0",
-        "false",
-        "False",
-        "off",
+    _mg_enabled = (
+        os.environ.get("B12X_MLA_SM120_PREFILL_MG", "1") not in (
+            "0",
+            "false",
+            "False",
+            "off",
+        )
+        if mg_enabled is None else bool(mg_enabled)
     )
     # ── GLM (ARBITRARY_FP32, q=576, v_has_rope=False) MG gate ──────────────────
     # GLM has the SAME FlashInfer MG head-group structure as DSV4 (one CTA fuses
@@ -425,6 +450,17 @@ def run_unified_prefill(
         model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
     )
     if _mg_nvfp4 and nvfp4_topk_supported:
+        return _run_partitioned_mg(
+            compute_mode=ComputeMode.BF16,
+            model_type=model_type,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+        )
+    if (
+        _mg_enabled
+        and model_type == ModelType.DSV41
+        and scale_format == ScaleFormat.NVFP4_E4M3
+        and topk in (128, 512, 1024, 2048)
+    ):
         return _run_partitioned_mg(
             compute_mode=ComputeMode.BF16,
             model_type=model_type,

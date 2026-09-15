@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import functools
+from b12x._lib.program_cache import program_cache
 from collections.abc import Callable, Sequence
 
 import cuda.bindings.driver as cuda
@@ -538,7 +538,7 @@ class _VocabArgmaxLaunch:
             output[Int64(row)] = _key_index(global_key)
 
 
-@functools.cache
+@program_cache
 def get_vocab_argmax_launcher(
     world_size: int,
     rank: int,

@@ -19,14 +19,15 @@ from b12x._lib.scratch_layout import (
     dtype_nbytes,
     materialize_scratch_view,
 )
-from b12x.policy import PolicyContext, get_auto_policy
+from b12x.preparation import FrozenMapping, Plan
+from b12x.preparation.types import require_prepared
 
 from ._cute_prefill_config import (
     QWEN_HIDDEN_SIZE,
     QWEN_STREAMS,
     projection_capacity_rows,
 )
-from ._policy import MTP_FEEDBACK_POLICY, MtpFeedbackQuery
+from ._tuning import MtpFeedbackConfig, MtpFeedbackQuery
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -75,8 +76,8 @@ class Caps:
 
 
 @dataclass(frozen=True)
-class Plan:
-    """Fixed MTP feedback launch policy and scratch-buffer contract."""
+class _Layout:
+    """Fixed MTP feedback launch geometry and scratch-buffer contract."""
 
     caps: Caps
     token_normalized_offset_bytes: int
@@ -89,7 +90,6 @@ class Plan:
     norm_block_h: int
     norm_block_s: int
     norm_num_warps: int
-    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -113,8 +113,6 @@ class Plan:
             )
         return live_tokens
 
-    def bind(self, **kwargs) -> "Binding":
-        return bind(self, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -125,7 +123,7 @@ class Binding:
     buffer and all intermediate tensors are views of ``scratch``.
     """
 
-    plan: Plan
+    _state: _Layout
     tokens: int
     scratch: torch.Tensor
     token_normalized: torch.Tensor
@@ -139,26 +137,10 @@ class Binding:
     embedding_fc_weight: torch.Tensor
     hidden_fc_weight: torch.Tensor
     output: torch.Tensor
+    plan: Plan | None = None
 
 
-def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
-    """Plan MTP feedback fusion for a fixed token capacity."""
-
-    if not isinstance(caps, Caps):
-        raise TypeError(f"caps must be Caps, got {type(caps)!r}")
-    policy = policy or get_auto_policy(caps.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(caps.device)
-    resolution = policy.resolve(
-        MTP_FEEDBACK_POLICY,
-        MtpFeedbackQuery(
-            dtype=str(caps.dtype).removeprefix("torch."),
-            max_tokens=caps.max_tokens,
-            hidden_size=caps.hidden_size,
-            streams=caps.streams,
-        ),
-    )
+def _materialize_layout(caps: Caps, config: MtpFeedbackConfig) -> _Layout:
     token_projection_rows, state_projection_rows = projection_capacity_rows(
         max_tokens=caps.max_tokens,
         streams=caps.streams,
@@ -183,8 +165,7 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
         token_projection_rows * h * dtype_nbytes(caps.dtype)
     )
     spec = scratch_buffer_spec("mtp_feedback", nbytes=cursor, device=caps.device)
-    config = resolution.config
-    result = Plan(
+    result = _Layout(
         caps=caps,
         token_normalized_offset_bytes=token_normalized_offset_bytes,
         state_partial_sums_offset_bytes=state_partial_sums_offset_bytes,
@@ -196,18 +177,21 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
         norm_block_h=config.norm_block_h,
         norm_block_s=config.norm_block_s,
         norm_num_warps=config.norm_num_warps,
-        policy_resolution=resolution,
-    )
-    from ._cute_prefill import precompile_mtp_prefill_capacity
-
-    precompile_mtp_prefill_capacity(
-        token_projection_rows,
-        state_projection_rows,
-        h,
-        device=caps.device,
-        streams=s,
     )
     return result
+
+
+def plan(caps: Caps, *, invocation: FrozenMapping = FrozenMapping(), override: MtpFeedbackConfig | None = None) -> Plan:
+    """Declare the exact MTP capacity without compiling projections."""
+    from ._preparation import make_plan
+    if not isinstance(caps, Caps):
+        raise TypeError("plan requires MTP Caps")
+    return make_plan(caps, invocation=invocation, override=override)
+
+
+def bind(plan: Plan, **kwargs) -> Binding:
+    state = require_prepared(plan, "sequence.mtp_feedback")
+    return state.bind(_plan=plan, **kwargs)
 
 
 def _require_tensor(
@@ -240,9 +224,10 @@ def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
     return left_start < right_end and right_start < left_end
 
 
-def bind(
-    plan: Plan,
+def _bind(
+    plan: _Layout,
     *,
+    _plan: Plan | None = None,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     token_embedding: torch.Tensor,
     multi_state: torch.Tensor,
@@ -254,8 +239,8 @@ def bind(
     tokens: int | None = None,
 ) -> Binding:
     """Bind fixed-capacity tensors without allocating runtime storage."""
-    if not isinstance(plan, Plan):
-        raise TypeError(f"plan must be Plan, got {type(plan)!r}")
+    if not isinstance(plan, _Layout):
+        raise TypeError("MTP binding requires a materialized layout")
     caps = plan.caps
     live_tokens = plan._live_tokens(tokens)
     scratch_storage = scratch_tensor(
@@ -330,7 +315,8 @@ def bind(
                 )
 
     return Binding(
-        plan=plan,
+        _state=plan,
+        plan=_plan,
         tokens=live_tokens,
         scratch=scratch_storage,
         token_normalized=token_normalized[:live_tokens],
@@ -354,12 +340,10 @@ def run(binding: Binding, *, eps: float = 1e-6) -> torch.Tensor:
     eps_value = float(eps)
     if not math.isfinite(eps_value) or eps_value <= 0.0:
         raise ValueError(f"eps must be finite and positive, got {eps_value}")
-    if binding.tokens == 0:
-        return binding.output
+    if binding.plan is None:
+        raise TypeError("MTP run requires a session-prepared binding")
     from ._kernels import run_mtp_feedback
 
-    plan_value = binding.plan
-    caps = plan_value.caps
     run_mtp_feedback(
         binding.token_embedding,
         binding.multi_state,
@@ -370,18 +354,7 @@ def run(binding: Binding, *, eps: float = 1e-6) -> torch.Tensor:
         binding.scratch,
         binding.output,
         eps=eps_value,
-        max_tokens=caps.max_tokens,
-        streams=caps.streams,
-        hidden_size=caps.hidden_size,
-        token_normalized_offset_bytes=plan_value.token_normalized_offset_bytes,
-        state_partial_sums_offset_bytes=plan_value.state_partial_sums_offset_bytes,
-        state_normalized_offset_bytes=plan_value.state_normalized_offset_bytes,
-        token_path_offset_bytes=plan_value.token_path_offset_bytes,
-        token_projection_rows=plan_value.token_projection_rows,
-        state_projection_rows=plan_value.state_projection_rows,
-        norm_block_h=plan_value.norm_block_h,
-        norm_block_s=plan_value.norm_block_s,
-        norm_num_warps=plan_value.norm_num_warps,
+        plan=binding.plan,
     )
     return binding.output
 

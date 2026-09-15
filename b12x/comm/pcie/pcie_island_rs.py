@@ -10,10 +10,11 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from b12x.preparation.types import Plan, require_prepared
+
 from ._island_rs_cute import (
     HEADER_BYTES,
     MAX_BLOCKS,
-    get_island_rs_launcher,
     island_rs_peers,
 )
 from ._cuda_ipc import CudaRTLibrary
@@ -124,7 +125,6 @@ class PCIeIslandRSAllReduce:
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
         self._closed = False
-        self._launcher = None
         self._mapped_peers = island_rs_peers(self.rank, self.world_size)
 
         shared = PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -138,18 +138,9 @@ class PCIeIslandRSAllReduce:
         self._remote_ptrs = list(shared.remote_ptrs)
         self._slab_ptrs = shared.peer_ptrs
 
+        # The native launcher is resolved and retained by the prepared plan;
+        # construction allocates only the actual communicator-owned slabs.
         init_error: BaseException | None = None
-        try:
-            with torch.cuda.device(self.device):
-                self._launcher = get_island_rs_launcher(
-                    self.world_size,
-                    self.rank,
-                    self.device.index or 0,
-                    threads=self.threads,
-                    wait_nanosleep_cycles=self.wait_nanosleep_cycles,
-                )
-        except Exception as exc:
-            init_error = exc
 
         def detach_shared_ownership() -> None:
             self._slab_ptrs = ()
@@ -190,21 +181,23 @@ class PCIeIslandRSAllReduce:
         self,
         inp: torch.Tensor,
         *,
+        plan: Plan,
         out: Optional[torch.Tensor] = None,
         blocks: Optional[int] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
     ) -> torch.Tensor:
-        del channel_id  # The runtime exposes one ordered collective channel.
+        del channel_id
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
         if not self.should_allreduce(inp):
             raise ValueError(
                 "input does not satisfy island reduce-scatter requirements "
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
+        if tuple(inp.shape) != tuple(state.query.call["inp"]["shape"]):
+            raise ValueError("input shape differs from the prepared island plan")
         if out is None:
-            # During CUDA graph capture, PyTorch allocates this tensor from the
-            # graph-private pool. The captured graph retains a fixed address
-            # and replays without allocator activity.
             out = torch.empty_like(inp)
         if (
             out.dtype != inp.dtype
@@ -214,16 +207,17 @@ class PCIeIslandRSAllReduce:
             or out.data_ptr() % 4 != 0
         ):
             raise ValueError("output must match input and be 4-byte aligned")
-        if blocks is not None:
-            selected = int(blocks)
-        elif self.blocks is not None:
-            selected = self.blocks
-        else:
-            selected = _pick_blocks(inp.numel())
+        selected = int(state.query.call["blocks"])
+        if blocks is not None and int(blocks) != selected:
+            raise ValueError("blocks differs from the prepared island plan")
         if selected not in SUPPORTED_BLOCKS or selected > MAX_BLOCKS:
             raise ValueError(f"blocks must be one of {SUPPORTED_BLOCKS}")
+        return self._run_prepared(state.launcher(), inp, out, selected, stream)
+
+    def _run_prepared(self, launcher, inp, out, blocks, stream):
+        """Invoke an already-prepared native launcher after caller validation."""
         with torch.cuda.device(self.device):
-            self._launcher(
+            launcher(
                 self._slab_ptrs,
                 inp.data_ptr(),
                 out.data_ptr(),
@@ -232,7 +226,7 @@ class PCIeIslandRSAllReduce:
                 self.final_offset,
                 self.quarter_capacity,
                 inp.numel(),
-                selected,
+                blocks,
                 stream,
             )
         return out

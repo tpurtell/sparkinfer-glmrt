@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 import functools
 import pathlib
 import sys
@@ -62,6 +63,7 @@ def _load_multilayer_weights() -> tuple:
     )
 
 
+@contextmanager
 def _make_layer_chain_bindings(
     experts_stack,
     x: torch.Tensor,
@@ -78,28 +80,28 @@ def _make_layer_chain_bindings(
     ):
         raise ValueError("layer-chain inputs must all have the same length")
 
-    bindings = []
-    current = x
-    for experts, topk_ids, topk_weights, output in zip(
-        experts_stack,
-        topk_ids_per_layer,
-        topk_weights_per_layer,
-        output_buffers,
-        strict=True,
-    ):
-        binding = make_tp_moe_fp4_binding(
-            a=current,
-            experts=experts,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            fast_math=fast_math,
-            output=output,
-            input_scales_static=True,
-            quant_mode="nvfp4",
-        )
-        bindings.append(binding)
-        current = output
-    return bindings
+    with ExitStack() as stack:
+        bindings = []
+        current = x
+        for experts, topk_ids, topk_weights, output in zip(
+            experts_stack,
+            topk_ids_per_layer,
+            topk_weights_per_layer,
+            output_buffers,
+            strict=True,
+        ):
+            bindings.append(stack.enter_context(make_tp_moe_fp4_binding(
+                a=current,
+                experts=experts,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                fast_math=fast_math,
+                output=output,
+                input_scales_static=True,
+                quant_mode="nvfp4",
+            )))
+            current = output
+        yield bindings
 
 
 def _run_layer_chain_bindings(bindings) -> list[torch.Tensor]:
@@ -177,48 +179,48 @@ def test_moe_cuda_graph_replay_tracks_routing_updates(m):
         w2_blockscale=weights.w2_blockscale_swizzled,
         w2_alphas=weights.g2_alphas_per_expert,
     )
-    graph_binding = make_tp_moe_fp4_binding(
+    with make_tp_moe_fp4_binding(
         a=x_buf,
         experts=experts,
         topk_weights=topk_weights_buf,
         topk_ids=topk_ids_buf,
         output=graph_output,
         input_scales_static=True,
-    )
-
-    # Compile once before capture; the replay check below is about routing safety.
-    b12x_moe_fp4(binding=graph_binding)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    ) as graph_binding:
+        # Compile once before capture; the replay check below is about routing safety.
         b12x_moe_fp4(binding=graph_binding)
-
-    for seed in (123, 456):
-        x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
-        x_buf.copy_(x)
-        topk_ids_buf.copy_(topk_ids)
-        topk_weights_buf.copy_(topk_weights)
-
-        graph.replay()
-        torch.cuda.synchronize()
-        replay_out = graph_output.clone()
-
-        eager_out = run_tp_moe_fp4(
-            a=x,
-            experts=experts,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            input_scales_static=True,
-        )
         torch.cuda.synchronize()
 
-        metrics = compare_graph_replay_outputs(replay_out, eager_out)
-        max_abs = metrics.max_abs
-        cos = metrics.cos
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            b12x_moe_fp4(binding=graph_binding)
 
-        assert max_abs < 5e-4, f"m={m} seed={seed}: max_abs={max_abs:.6f}"
-        assert cos > 0.9999, f"m={m} seed={seed}: cos={cos:.6f}"
+        for seed in (123, 456):
+            x, topk_ids, topk_weights = make_routed_inputs(spec, m, seed=seed, device=device)
+            x_buf.copy_(x)
+            topk_ids_buf.copy_(topk_ids)
+            topk_weights_buf.copy_(topk_weights)
+
+            graph.replay()
+            torch.cuda.synchronize()
+            replay_out = graph_output.clone()
+
+            eager_out = run_tp_moe_fp4(
+                a=x,
+                experts=experts,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                input_scales_static=True,
+            )
+            torch.cuda.synchronize()
+
+            metrics = compare_graph_replay_outputs(replay_out, eager_out)
+            max_abs = metrics.max_abs
+            cos = metrics.cos
+
+            assert max_abs < 5e-4, f"m={m} seed={seed}: max_abs={max_abs:.6f}"
+            assert cos > 0.9999, f"m={m} seed={seed}: cos={cos:.6f}"
+        del graph
 
 
 @pytest.mark.parametrize("m", [1, 2, 4])
@@ -266,75 +268,59 @@ def test_moe_cuda_graph_replay_multilayer_tracks_routing_updates(m):
     topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
     graph_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
     eager_output_bufs = [torch.empty_like(x_buf) for _ in range(num_layers)]
-    graph_bindings = _make_layer_chain_bindings(
-        experts_stack,
-        x_buf,
-        topk_ids_bufs,
-        topk_weights_bufs,
-        fast_math=True,
-        output_buffers=graph_output_bufs,
-    )
-    eager_bindings = _make_layer_chain_bindings(
-        experts_stack,
-        x_buf,
-        topk_ids_bufs,
-        topk_weights_bufs,
-        fast_math=True,
-        output_buffers=eager_output_bufs,
-    )
-
-    _run_layer_chain_bindings(graph_bindings)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with (
+        _make_layer_chain_bindings(
+            experts_stack, x_buf, topk_ids_bufs, topk_weights_bufs,
+            fast_math=True, output_buffers=graph_output_bufs,
+        ) as graph_bindings,
+        _make_layer_chain_bindings(
+            experts_stack, x_buf, topk_ids_bufs, topk_weights_bufs,
+            fast_math=True, output_buffers=eager_output_bufs,
+        ) as eager_bindings,
+    ):
         _run_layer_chain_bindings(graph_bindings)
-
-    scenario_specs = [
-        ("disjoint", "disjoint", 1100),
-        ("overlap", "overlap", 2200),
-        ("random-a", "random", 3300),
-        ("random-b", "random", 4400),
-    ]
-    max_abs_tol = GRAPH_REPLAY_TOLERANCES["max_abs"]
-    cos_tol = GRAPH_REPLAY_TOLERANCES["cos_min"]
-
-    for scenario_name, pattern, seed in scenario_specs:
-        x_case = make_input_activations(
-            spec,
-            m,
-            seed=30_000 + m + seed,
-            device=device,
-        )
-        routing_case = make_multilayer_routing_case(
-            spec,
-            m,
-            num_layers,
-            device,
-            pattern=pattern,
-            seed=40_000 + m + seed,
-        )
-
-        x_buf.copy_(x_case)
-        for layer_idx, (topk_ids, topk_weights) in enumerate(routing_case):
-            topk_ids_bufs[layer_idx].copy_(topk_ids)
-            topk_weights_bufs[layer_idx].copy_(topk_weights)
-
-        graph.replay()
         torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _run_layer_chain_bindings(graph_bindings)
 
-        _run_layer_chain_bindings(eager_bindings)
-        torch.cuda.synchronize()
+        scenario_specs = [
+            ("disjoint", "disjoint", 1100),
+            ("overlap", "overlap", 2200),
+            ("random-a", "random", 3300),
+            ("random-b", "random", 4400),
+        ]
+        max_abs_tol = GRAPH_REPLAY_TOLERANCES["max_abs"]
+        cos_tol = GRAPH_REPLAY_TOLERANCES["cos_min"]
 
-        for layer_idx, (replay_out, eager_out) in enumerate(
-            zip(graph_output_bufs, eager_output_bufs, strict=True)
-        ):
-            metrics = compare_graph_replay_outputs(replay_out, eager_out)
-            max_abs = metrics.max_abs
-            cos = metrics.cos
+        for scenario_name, pattern, seed in scenario_specs:
+            x_case = make_input_activations(
+                spec, m, seed=30_000 + m + seed, device=device,
+            )
+            routing_case = make_multilayer_routing_case(
+                spec, m, num_layers, device, pattern=pattern, seed=40_000 + m + seed,
+            )
 
-            assert (
-                max_abs < max_abs_tol
-            ), f"m={m} scenario={scenario_name} layer={layer_idx}: max_abs={max_abs:.6f}"
-            assert (
-                cos > cos_tol
-            ), f"m={m} scenario={scenario_name} layer={layer_idx}: cos={cos:.6f}"
+            x_buf.copy_(x_case)
+            for layer_idx, (topk_ids, topk_weights) in enumerate(routing_case):
+                topk_ids_bufs[layer_idx].copy_(topk_ids)
+                topk_weights_bufs[layer_idx].copy_(topk_weights)
+
+            graph.replay()
+            torch.cuda.synchronize()
+            _run_layer_chain_bindings(eager_bindings)
+            torch.cuda.synchronize()
+
+            for layer_idx, (replay_out, eager_out) in enumerate(
+                zip(graph_output_bufs, eager_output_bufs, strict=True)
+            ):
+                metrics = compare_graph_replay_outputs(replay_out, eager_out)
+                max_abs = metrics.max_abs
+                cos = metrics.cos
+                assert (
+                    max_abs < max_abs_tol
+                ), f"m={m} scenario={scenario_name} layer={layer_idx}: max_abs={max_abs:.6f}"
+                assert (
+                    cos > cos_tol
+                ), f"m={m} scenario={scenario_name} layer={layer_idx}: cos={cos:.6f}"
+        del graph

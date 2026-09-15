@@ -12,15 +12,18 @@ import tempfile
 import time
 import traceback
 from collections import OrderedDict
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, fields, is_dataclass
 from functools import lru_cache
 from pathlib import Path
+from contextvars import ContextVar
 from threading import RLock
 from types import SimpleNamespace
 from typing import Any
 
+from .compile_plan import _RETAINED_PROGRAMS
 from .runtime_patches import apply_cutlass_runtime_patches
+from .program_cache import register_program_cache
 
 apply_cutlass_runtime_patches()
 
@@ -29,6 +32,7 @@ apply_cutlass_runtime_patches()
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _MEMORY_CACHE: OrderedDict[object, Any] = OrderedDict()
 _MEMORY_CACHE_LOCK = RLock()
+register_program_cache(_MEMORY_CACHE, lock=_MEMORY_CACHE_LOCK)
 _SPEC_MEMO: OrderedDict[tuple[object, ...], Any] = OrderedDict()
 _SPEC_MEMO_LOCK = RLock()
 _SPEC_MEMO_MAX = 8192
@@ -46,8 +50,10 @@ _EXECUTOR_CACHE_ATTR = "_b12x_cached_default_executor"
 _VLLM_ENGINE_STARTED_ENV = "B12X_ENGINE_STARTED"
 _POST_ENGINE_START_LOG_ENV = "B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START"
 _PRINT_COMPILE_PROGRESS_ENV = "B12X_PRINT_COMPILE_PROGRESS"
+_OFFLINE_COMPILE_DEVICE_ORDINAL: int | None = None
+_OFFLINE_CUTE_NO_JIT = False
 
-
+_LAUNCHER_OBSERVERS = ContextVar("b12x_launcher_observers", default=())
 @dataclass(frozen=True)
 class DimKey:
     kind: str
@@ -381,28 +387,34 @@ def tensor_compile_fact(
     shape = tuple(int(dim) for dim in tensor.shape)
     if dims is None:
         dynamic_dim_set = set(dynamic_dims)
-        dims = tuple(
-            DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(dim)
+        dim_facts = tuple(
+            ("dim", "dynamic", None)
+            if idx in dynamic_dim_set else ("dim", "exact", dim)
             for idx, dim in enumerate(shape)
         )
-    if len(dims) != len(shape):
-        raise ValueError(
-            f"tensor key {name!r} dim policy rank {len(dims)} "
-            f"does not match tensor rank {len(shape)}"
-        )
+    else:
+        if len(dims) != len(shape):
+            raise ValueError(
+                f"tensor key {name!r} dim policy rank {len(dims)} "
+                f"does not match tensor rank {len(shape)}"
+            )
+        dim_facts = tuple(_dim_policy_fact(dim) for dim in dims)
 
     raw_strides = tuple(int(stride) for stride in tensor.stride())
     if strides is None:
         dynamic_stride_set = set(dynamic_strides)
-        strides = tuple(
-            DimKey.dynamic() if idx in dynamic_stride_set else DimKey.exact(stride)
+        stride_facts = tuple(
+            ("dim", "dynamic", None)
+            if idx in dynamic_stride_set else ("dim", "exact", stride)
             for idx, stride in enumerate(raw_strides)
         )
-    if len(strides) != len(raw_strides):
-        raise ValueError(
-            f"tensor key {name!r} stride policy rank {len(strides)} "
-            f"does not match tensor rank {len(raw_strides)}"
-        )
+    else:
+        if len(strides) != len(raw_strides):
+            raise ValueError(
+                f"tensor key {name!r} stride policy rank {len(strides)} "
+                f"does not match tensor rank {len(raw_strides)}"
+            )
+        stride_facts = tuple(_dim_policy_fact(stride) for stride in strides)
 
     device = tensor.device
     layout_fact = None if layout is None else _json_pod(layout, path="layout")
@@ -411,8 +423,8 @@ def tensor_compile_fact(
         str(name),
         str(tensor.dtype),
         len(shape),
-        tuple(_dim_policy_fact(dim) for dim in dims),
-        tuple(_dim_policy_fact(stride) for stride in strides),
+        dim_facts,
+        stride_facts,
         (str(device.type), device.index),
         None if align is None else int(align),
         layout_fact,
@@ -1359,6 +1371,8 @@ def _call_cute_compile(
     compile_spec: KernelCompileSpec | None,
     cache_key: str,
 ) -> Any:
+    if _OFFLINE_CUTE_NO_JIT:
+        kwargs = {**kwargs, "no_jit_engine": True}
     if not _cute_compile_progress_enabled():
         return compile_callable(func, *args, **kwargs)
 
@@ -1461,6 +1475,8 @@ _DEVICE_COMPILE_CACHE_CONTEXTS: dict[tuple[Any, int], tuple[object, ...]] = {}
 
 def _current_device_ordinal() -> int | None:
     """Ordinal of the device this process is currently compiling for."""
+    if _OFFLINE_COMPILE_DEVICE_ORDINAL is not None:
+        return _OFFLINE_COMPILE_DEVICE_ORDINAL
     try:
         import torch
 
@@ -1469,6 +1485,28 @@ def _current_device_ordinal() -> int | None:
         return int(torch.cuda.current_device())
     except Exception:  # noqa: BLE001 - cache identity probing must fail closed
         return None
+
+
+def _configure_offline_compile_target(
+    device_ordinal: int, device_uuid: str
+) -> None:
+    """Bind cache identity without initializing CUDA in a compiler child."""
+    global _OFFLINE_COMPILE_DEVICE_ORDINAL
+    global _OFFLINE_CUTE_NO_JIT
+
+    if type(device_ordinal) is not int or device_ordinal < 0:
+        raise ValueError("offline compile target requires a nonnegative ordinal")
+    device_uuid = str(device_uuid).strip()
+    if not device_uuid:
+        raise ValueError("offline compile target requires a device UUID")
+    if (
+        _OFFLINE_COMPILE_DEVICE_ORDINAL is not None
+        and _OFFLINE_COMPILE_DEVICE_ORDINAL != device_ordinal
+    ):
+        raise RuntimeError("compiler process cannot change its offline device target")
+    _OFFLINE_COMPILE_DEVICE_ORDINAL = device_ordinal
+    _OFFLINE_CUTE_NO_JIT = True
+    _DEVICE_UUID_KEYS[device_ordinal] = ("device_uuid", device_uuid)
 
 
 def _device_uuid_key(device_ordinal: int | None = None) -> tuple[str, str] | None:
@@ -1575,6 +1613,9 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "NVCC_PREPEND_FLAGS",
     }
     operational_env_vars = {
+        "B12X_AUTOTUNE",
+        "B12X_AUTOTUNE_EXHAUSTIVE",
+        "B12X_TUNING_CACHE_VERSION",
         "B12X_COMPILE_CACHE_DIR",
         "B12X_COMPILE_DISK_CACHE",
         "B12X_COMPILE_MEMORY_CACHE",
@@ -1586,6 +1627,7 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "B12X_LOG_CUTE_COMPILE_STACK",
         "B12X_LOG_CUTE_COMPILE_STACK_DEPTH",
         "B12X_PRINT_COMPILE_PROGRESS",
+        "B12X_PREPARATION_TRACE_DIR",
         "B12X_TIMING",
         "B12X_TIMING_THRESHOLD_MS",
         "CUTE_DSL_CACHE_DIR",
@@ -2582,19 +2624,32 @@ def _store_cute_compile_to_disk(
 def _memory_cache_get(cache_key: object) -> Any | None:
     global _MEMORY_CACHE_HITS
     global _MEMORY_CACHE_MISSES
-    if not _cute_compile_memory_cache_enabled():
-        return None
+    retained = _RETAINED_PROGRAMS.get()
     with _MEMORY_CACHE_LOCK:
+        compiled = None if retained is None else retained.cache.get(cache_key)
+        if compiled is not None:
+            _MEMORY_CACHE_HITS += 1
+            # A selected program remains recently used after its race releases
+            # the temporary ownership scope.
+            _memory_cache_put(cache_key, compiled)
+            return compiled
+        if not _cute_compile_memory_cache_enabled():
+            return None
         compiled = _MEMORY_CACHE.get(cache_key)
         if compiled is None:
             _MEMORY_CACHE_MISSES += 1
             return None
         _MEMORY_CACHE_HITS += 1
         _MEMORY_CACHE.move_to_end(cache_key)
+        if retained is not None:
+            retained.cache[cache_key] = compiled
         return compiled
 
 
 def _memory_cache_put(cache_key: object, compiled: Any) -> None:
+    retained = _RETAINED_PROGRAMS.get()
+    if retained is not None:
+        retained.cache[cache_key] = compiled
     if not _cute_compile_memory_cache_enabled():
         return
     with _MEMORY_CACHE_LOCK:
@@ -2660,6 +2715,13 @@ def compile(
     **kwargs: Any,
 ) -> Any:
     import cutlass.cute as cute
+    from .compile_plan import (
+        DeferredCuTeKernel,
+        ProgramKey,
+        planning,
+        record_program,
+        tag_compiled,
+    )
 
     global _DISK_CACHE_HITS
     global _COMPILE_MISSES
@@ -2686,8 +2748,26 @@ def compile(
     memory_cache_key = _compile_memory_cache_key(
         compile_callable, func, args, kwargs, compile_spec
     )
+    if planning():
+        from .runtime_control import raise_if_kernel_resolution_frozen
+
+        raise_if_kernel_resolution_frozen("CuTe compilation planning", target=func)
+        payload = _compile_disk_cache_payload(
+            compile_callable, func, args, kwargs, compile_spec
+        )
+        if not _cute_compile_disk_cache_enabled_for_payload(payload):
+            raise RuntimeError("compilation planning requires the normal device-bound object cache")
+        cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+        program = ProgramKey(
+            "cute", cache_key,
+            compile_spec.kernel_id if compile_spec is not None else _compile_target_name(func),
+        )
+        record_program(program)
+        return DeferredCuTeKernel(program, memory_cache_key)
     compiled = _memory_cache_get(memory_cache_key)
     if compiled is not None:
+        for program in getattr(compiled, "__b12x_programs__", ()):
+            record_program(program)
         return compiled
     from b12x._lib.runtime_control import (
         raise_if_kernel_resolution_frozen,
@@ -2704,11 +2784,16 @@ def compile(
         compile_callable, func, args, kwargs, compile_spec
     )
     cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+    program = ProgramKey(
+        "cute", cache_key,
+        compile_spec.kernel_id if compile_spec is not None else _compile_target_name(func),
+    )
     disk_cache_enabled = _cute_compile_disk_cache_enabled_for_payload(payload)
 
     if disk_cache_enabled:
         compiled = _load_cute_compile_from_disk(cache_key, payload)
         if compiled is not None:
+            compiled = tag_compiled(compiled, program)
             with suppress(Exception):
                 _ensure_cute_compile_manifest(cache_key, payload, func)
             with _MEMORY_CACHE_LOCK:
@@ -2731,10 +2816,13 @@ def compile(
         with _disk_cache_key_lock(cache_key):
             compiled = _memory_cache_get(memory_cache_key)
             if compiled is not None:
+                for existing_program in getattr(compiled, "__b12x_programs__", ()):
+                    record_program(existing_program)
                 return compiled
 
             compiled = _load_cute_compile_from_disk(cache_key, payload)
             if compiled is not None:
+                compiled = tag_compiled(compiled, program)
                 with suppress(Exception):
                     _ensure_cute_compile_manifest(cache_key, payload, func)
                 with _MEMORY_CACHE_LOCK:
@@ -2781,13 +2869,15 @@ def compile(
                 compile_spec=compile_spec,
                 cache_key=cache_key,
             )
-            with suppress(Exception):
+            store_context = nullcontext() if _OFFLINE_CUTE_NO_JIT else suppress(Exception)
+            with store_context:
                 _store_cute_compile_to_disk(
                     cache_key,
                     compiled,
                     cache_payload=payload,
                     func=func,
                 )
+            compiled = tag_compiled(compiled, program)
             _memory_cache_put(memory_cache_key, compiled)
             return compiled
     else:
@@ -2821,13 +2911,15 @@ def compile(
         cache_key=cache_key,
     )
     if disk_cache_enabled:
-        with suppress(Exception):
+        store_context = nullcontext() if _OFFLINE_CUTE_NO_JIT else suppress(Exception)
+        with store_context:
             _store_cute_compile_to_disk(
                 cache_key,
                 compiled,
                 cache_payload=payload,
                 func=func,
             )
+    compiled = tag_compiled(compiled, program)
     _memory_cache_put(memory_cache_key, compiled)
     return compiled
 
@@ -2858,6 +2950,11 @@ def _cached_default_executor(compiled: Any) -> Any | None:
 
 
 def run_compiled(compiled: Any, args: tuple[Any, ...]) -> Any:
+    from .compile_plan import compile_only_launches_enabled, program_keys, record_program
+    if compile_only_launches_enabled():
+        for program in program_keys(compiled):
+            record_program(program, compiled)
+        return compiled
     if hasattr(compiled, "generate_execution_args") and hasattr(
         compiled, "run_compiled_program"
     ):
@@ -2867,6 +2964,20 @@ def run_compiled(compiled: Any, args: tuple[Any, ...]) -> Any:
             return executor.run_compiled_program(execution_args)
         return compiled.run_compiled_program(execution_args)
     return compiled(*args)
+
+@contextmanager
+def observe_launchers():
+    """Collect concrete launchers resolved by one metadata-only host factory."""
+    from .compile_plan import compile_only_launches_enabled
+    if not compile_only_launches_enabled():
+        raise RuntimeError("launcher extraction requires a compile-only preparation scope")
+    observed = []
+    token = _LAUNCHER_OBSERVERS.set((*_LAUNCHER_OBSERVERS.get(), observed))
+    try:
+        yield observed
+    finally:
+        _LAUNCHER_OBSERVERS.reset(token)
+
 
 
 def launch(
@@ -2883,4 +2994,9 @@ def launch(
         compile_spec=compile_spec,
         **(compile_kwargs or {}),
     )
+    for observed in _LAUNCHER_OBSERVERS.get():
+        observed.append(compiled)
+    from .compile_plan import compile_only_launches_enabled
+    if compile_only_launches_enabled():
+        return compiled
     return run_compiled(compiled, runtime_args)

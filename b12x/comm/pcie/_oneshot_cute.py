@@ -18,6 +18,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics import (
     ld_global_v4_u32,
     st_global_v4_f32,
@@ -1318,7 +1319,7 @@ def get_oneshot_launcher(
         )
 
     _PREPARED_ONESHOT_LAUNCHERS.add(process_key)
-    return run
+    return attach_programs(run, raw)
 
 
 def _fused_oneshot_process_key(
@@ -1510,7 +1511,7 @@ def get_fused_oneshot_launcher(
         )
 
     _PREPARED_FUSED_ONESHOT_LAUNCHERS.add(process_key)
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = [

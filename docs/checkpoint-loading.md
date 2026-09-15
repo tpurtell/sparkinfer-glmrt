@@ -1,271 +1,301 @@
 # Checkpoint loader
 
-Status: C99 O_DIRECT transport and initial vLLM integration, September 6, 2026.
-The `--load-format b12x` adapter allocates checkpoint destination weights through
-a CPU-addressable CUDA pool. It parses safetensors headers, routes metadata-only
-tensor views through model sharding, and reads selected file ranges into owned
-destinations. Payload reads require `O_DIRECT`; there is no buffered retry or
-file-mapping input path. The native helper uses CPython/DLPack and PyTorch's
-pluggable allocator C interface without the PyTorch C++ ABI.
+Status: implemented. The `--load-format b12x` vLLM adapter loads selected
+safetensors ranges into persistent CUDA weight allocations. It selects the
+allocation and transport from device capabilities:
 
-The loader owns allocation policy. vLLM's `allocate_weights(factory, ...)` marks
-weight creation; the active loader supplies its allocator through `weight_transfer`.
-The default allocator remains CUDA during construction, loading and preparation.
-Runtime outputs, workspaces and mutable state never enter the shared weight pool.
-Preparation may reuse weight storage in place, but shared weights are read-only
-during inference. New preparation outputs use ordinary CUDA storage. A final
-allocation audit rejects shared non-persistent buffers before serving starts.
+| Device capability | Final weight allocation | Checkpoint payload transport |
+| --- | --- | --- |
+| Pageable memory access using GPU host page tables, including GB10 | `cudaMallocManaged`, locked against paging | CPU `O_DIRECT` reads into coherent managed storage |
+| Devices without those capabilities | `cudaMalloc` | Shared cuFile reads with CUDA IPC scatter across host-local TP ranks; GDS with CPU compatibility fallback |
 
-Serving checks cover Qwen 3.8 Flash Next with TP=1, GLM 5.3 Flash with TP=2,
-full GLM 5.3 with TP=4, and DeepSeek V4 Flash with TP=2. The full GLM and
-DeepSeek checks include short and medium prompts, prefix-cache hits, and CUDA
-graph replay with speculation disabled. DeepSeek TP=2 also passes with DSpark's
-seven-token draft, including a response spanning multiple verification iterations.
-Install the matching vLLM weight-transfer hooks:
+Allocation and CPU/GDS transport are selected from device capabilities. Device
+weight storage always uses coordinated shared reads; no loader option is needed
+to enable them. The disk embedding setting
+`B12X_DISK_BACKEND` controls Engram/PLE row fetching and does not select the
+checkpoint transport. The managed path does not load cuFile.
+
+## Integration and ownership
+
+Install b12x and a vLLM checkout containing its weight-transfer hooks, then enable
+the loader plugin:
 
 ```sh
 VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
 ```
 
-The adapter uses vLLM's standard checkpoint-shard progress format and honors
-`use_tqdm_on_load` and rank-zero output. The loader always uses CUDA managed
-storage for weights; no `allocation` option is needed or accepted. Managed
-storage changes CUDA residency and coherence handling, not the ownership or
-direct-I/O contract.
+The loader supplies its allocator through `weight_transfer`; vLLM's
+`allocate_weights(factory, ...)` marks weight creation. The default CUDA allocator
+continues to own runtime outputs, workspaces and mutable state. Preparation may
+reuse loaded weights in place or produce ordinary CUDA allocations. A final audit
+rejects non-persistent runtime buffers allocated in the weight pool. The audit's
+`shared_parameter_bytes` field counts loader-owned parameters for both allocation
+types; `allocation` identifies `managed` or `device` storage.
 
-The adapter records destination views and submits packed native descriptors
-`(fd, offset, row_bytes, destination, operation, rows, source_stride, destination_stride)`
-in batches. Strides are measured in bytes; contiguous ranges have one row. Operations
-cover direct file reads, in-place BF16 expansion, and copies of owned CPU control
-metadata. For the latter, the offset field contains the source address. C validates
-ownership and non-overlap, orders jobs by file offset, splits large ranges, and
-distributes reads across a persistent pthread pool. `io_threads` defaults to 8
-and accepts 1–16. Each worker owns 8 MiB of locked alignment scratch; header and
-metadata reads use a separate 8 MiB reader. No Python callback runs per read.
-The same descriptor contract can support another native I/O backend.
+The adapter preserves index, prefix, expert and file-backed-weight filtering,
+including draft-model loading. File-backed embedding tables retain their separate
+storage contract. The rank-zero `b12x / weight loading` panel shares the kernel
+autotuning display's palette and stage rail. It honors `use_tqdm_on_load`, uses
+plain milestones for redirected output, and remains active through read completion.
+Terminal output from existing log handlers, native code and child processes is
+serialized above the panel through the vLLM startup-output capture.
+TP ranks finish model construction before the panel starts. The panel completes
+and stops before vLLM emits its weight-loading timing log.
+The bar measures shards routed, with selected payload bytes on rank zero;
+completing routing does not imply completed I/O. Progress reporting never forces
+a flush at shard boundaries. Setup, planning, reading and synchronization use an
+animated activity bar with elapsed phase time; they do not show a shard percentage.
 
-Python retains tensor owners and file descriptors until the batch completes.
-Explicit fences precede online quantization, composed weight transforms, PLE
-scale validation, and final weight preparation. A failed batch drains all workers
-before reporting failure. Arbitrary consumers of queued parameter values require
-an explicit completion fence; this is an initial-load integration contract.
-Numerical loading callbacks use `materialize_weight` to read owned inputs before
-operating on them, including GLM's paired selector weights and scales and full
-GLM's fused FP8 indexer projection. DeepSeek V4's model, MTP, and DSpark post-load
-hooks flush queued reads before deriving packed weights and mHC broadcasts.
+After completion, shared loading reports selected payload and physical reads
+summed across the TP group. Total loading time includes routing, planning, reads,
+scatter and synchronization. The phase breakdown reports routing, shared-reader
+setup, planning, reads and synchronization, including collective waits in the
+reporting rank's wall time. Shared read-and-scatter time is reported separately
+using the slowest reader's native interval in each epoch. Neither interval includes
+subsequent weight preparation or kernel compilation. The estimated transfer rate
+divides physical bytes read by the shared readers across all TP ranks by that
+shared read-and-scatter interval, using decimal GB/s. It includes GPU scatter and
+excludes header reads and rank-local numerical dependency reads.
+Detailed per-rank I/O and
+allocation counters are logged at debug level and retained on the model.
 
-Weight destinations use `cudaMallocManaged` and are explicitly `mlock`ed.
-Failure to lock final storage fails the allocation. Alternative mappings remain
-available to the allocation-qualification tools, outside the serving
-configuration. The initial adapter
-requires GPU host page tables and PyTorch's native CUDA allocator, and does
-not support vLLM sleep mode. It preserves index/prefix filtering, including
-MTP. Byte-preserving contiguous routes read into the CPU alias after synchronizing
-the loading stream. BF16-to-FP32 reads occupy the first half of the final FP32
-allocation, then C99 expands backwards in place, preserving all BF16 bits.
-DeepSeek's signed FP4 payloads and E8M0 scale views preserve their raw bytes,
-including strided TP slices; these routes do not numerically cast FP8 values.
-Other contiguous casts use one reusable 8 MiB input allocation. Arbitrary
-arithmetic on source descriptors and unsupported layouts fail explicitly.
+Weights are ordinary Torch tensors using its suballocator and stream bookkeeping.
+The pool is scoped around explicit weight factories, and live tensors retain their
+storage after the loader closes. Graph inputs must retain their tensor owners.
+Allocator backends remain process-owned because Torch retains their native
+function pointers. PyTorch's native CUDA allocator is required; vLLM sleep mode is
+unsupported. The pool temporarily disables expandable segments while active and
+restores the caller's setting at scope exit.
 
-Aligned file/address ranges read straight into the destination. Large misaligned
-ranges also read into the destination, then realign in place with `memmove`.
-Each aligned read window fits within the remaining destination bytes. Only
-small edges need a worker's fixed, locked 8 MiB alignment buffer and a CPU copy.
-For TP slices with rows smaller than 4 KiB, C reads adjacent rows together into
-that same fixed scratch buffer and scatters selected bytes into the destination.
-Larger rows use the direct range path. In-place moves, edge copies and strided
-copies are counted separately. This path bypasses the
-page cache but does not promise zero copying for every safetensors layout.
-Scalar and explicitly declared control metadata are coalesced into owned CPU
-spans, with a 64 MiB aggregate span limit per session, including intervening bytes.
+## Routing and completion
 
-Logs distinguish physical reads, bytes read into destinations, in-place alignment,
-edge and strided copies, in-place conversions, other casts, and final parameter ownership. Existing b12x
-weight-preparation policies retain or reuse source storage; the loader does not
-make a second packed-weight copy. Existing quantization callbacks can still
-allocate full tensors, so these counters do not establish an aggregate transform
-memory bound. A shared target/draft transform budget remains design work.
-Final allocations use ordinary Torch tensors and its stream bookkeeping;
-there is no Tensor subclass or global Torch monkeypatch.
+`b12x/loader/_checkpoint.py` parses headers and routes metadata-only tensor views
+through model sharding. A meta view carries a source range, shape, dtype and
+strides; unregistered arithmetic on that view fails explicitly. Numerical callbacks
+use `materialize_weight` to load owned values before computing with them.
 
-`b12x.loader.read_tensor` is the earlier allocation-qualification primitive.
-Its buffered raw-file reader is separate from the adapter's O_DIRECT transport.
-
-Add bounded checkpoint loading to b12x. The component owns checkpoint manifests,
-I/O scheduling, buffer capacity, CUDA completion, and generic weight transforms.
-Serving integrations supply model mappings, source/destination slices,
-dependencies, required numerical semantics, and capacity limits. This follows
-the existing rule that b12x owns planning and policy.
-
-## GB10 destination storage
-
-Choose the allocation type before choosing the transport. The first candidate
-for unchanged checkpoint bytes is final, GPU-mapped host storage. Ordinary
-PyTorch CUDA allocations are not interchangeable with CPU-addressable buffers:
-[NVIDIA's GB10 porting guide](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html)
-states that CPU and I/O devices cannot coherently access `cudaMalloc` memory.
-This restricts that allocation type, not every possible final destination.
-
-The prototype supports anonymous system mappings, `cudaHostAlloc` (cached and
-write-combined), anonymous mappings registered with `cudaHostRegister`, managed
-memory, and private file mappings. System/file mappings require pageable-memory
-access through GPU host page tables. The GB10 reports these capabilities and
-support for registration and concurrent managed access.
-
-DLPack wraps the GPU address without copying. Its storage deleter retains the
-allocation through tensor aliases and synchronizes the consuming device before
-final release. Keep model tensors alive while replaying graphs referencing
-them; graph capture does not acquire an ownership reference to external inputs.
-Reads complete before publishing a tensor. File mappings are lazy and require
-an immutable backing file for the entire tensor lifetime.
-
-| Weight operation | Candidate GB10 path |
-| --- | --- |
-| Checkpoint bytes already match the runtime layout | Read selected ranges into final mapped storage; inference kernels read that storage. |
-| Expand BF16 to FP32 | Read into the final allocation and expand backwards in place. |
-| Repack | Reuse source storage through b12x preparation when the layout permits it; bound any workspace. |
-| Quantize or other cast | Use the destination allocation when safely possible, otherwise bounded mapped input tiles. |
-| A consumer cannot use mapped storage efficiently or correctly | Select ordinary CUDA destinations and bounded host-to-device transfers during planning. |
-
-Aligned direct reads into mapped final storage need no loader payload ring or
-separate host-to-device copy. Misaligned ranges use in-place realignment or the
-bounded edge buffer described above. Header and payload reads both require
-O_DIRECT.
-
-Mapped final weights are persistent model storage, counted once in the total
-capacity check. Mapped conversion input is temporary storage and counts against
-the aggregate staging cap until its last GPU reader completes. CPU writers and
-GPU readers never overlap on the same range. Use supported CUDA ordering and
-completion mechanisms to publish reads and retire input tiles.
-
-First qualify allocation and execution with exact byte comparisons, the actual
-b12x TMA and ordinary-load kernels, quantized MoE/dense layouts, scale tensors,
-embeddings, and graph capture/replay. Measure repeated decode reads against
-ordinary CUDA allocations; a faster load cannot justify slower inference.
-Also qualify large allocations, pin/registration failures, alignment, and
-pointer arithmetic beyond 4 GiB. General mapped-memory support alone does not
-prove that every current b12x kernel supports these buffers.
-
-This qualification precedes implementing a large I/O scheduler. The initial
-library still needs a bounded copy route, but mapped final storage and direct
-GPU consumption of mapped conversion input are primary GB10 candidates.
-Allocation selection is a plan decision, never an oversized-tensor fallback.
-CUDA documents the general integrated-GPU mapped-memory approach in its
-[programming guide](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#data-transfer-between-host-and-device).
-
-## Package boundary
-
-Proposed layout:
+Each queued transfer has eight unsigned 64-bit fields:
 
 ```text
-b12x/loader/
-    __init__.py         lazy public exports
-    api.py              manifest, plan, and session interface
-    _contract.py        references, ranges, destinations, capabilities
-    _manifest.py        indexed safetensors discovery and validation
-    _planner.py         dependency scheduling, coalescing, budget admission
-    _session.py         ownership, submission, retirement, error handling
-    _native.py          build/cache and C ABI bindings
-    _storage.c         implemented C99 allocation, positional reads, DLPack ownership
-    _transport.c       planned batched positional I/O and CUDA transfers
-    _transforms.py      bounded quantization/packing using existing b12x ops
-b12x/integration/vllm/
-    loader.py           public vLLM loader registration and adapters
+(fd, offset, row_bytes, destination, operation, rows, source_stride, destination_stride)
 ```
 
-The loader imports without vLLM. Importing `b12x` or `b12x.loader` must not build
-native code, initialize CUDA, or import the kernel compiler. An explicit
-session/preparation operation loads required dependencies before serving.
+Strides are bytes. Operations are unchanged-byte reads, BF16-to-FP32 expansion,
+and owned CPU control-metadata copies. The metadata operation uses `offset` as a
+source address. Native validation checks file bounds, destination ownership,
+device identity and disjoint destination extents before issuing reads. File,
+row, stride and pointer arithmetic uses 64-bit values. Source files must remain
+immutable until the session closes.
 
-This is host-side startup infrastructure, with a session lifecycle rather than
-an inference kernel's graph-replay lifecycle. Do not put disk I/O or blocking
-waits in CUDA graph capture. GPU transforms use existing b12x component plans
-and policy; any new planned GPU op must satisfy catalog/profile registration
-and frozen-resolution requirements. Keep normal namespace/registry imports
-lightweight and extend their existing tests.
+The executor sorts jobs by file position, divides large transfers into 64 MiB jobs,
+and distributes them across persistent pthread workers. `io_threads` defaults to
+8 and accepts 1–16 through vLLM's model-loader extra configuration. Python retains
+source descriptors and destination owners until completion; no Python callback
+runs per read.
 
-## Ownership and memory
+`flush()` waits for all queued writes. The caller's loading stream is synchronized
+before native writes, and GPU copy streams complete before their scratch can be
+reused. Numerical consumers and weight preparation require a completion fence.
+Errors drain worker activity before being reported. Validation errors leave
+weights untouched; an execution failure can leave partial destinations and poisons
+the GDS executor, so model startup must fail.
 
-`WeightRef` keeps immutable source metadata, not a transient tensor. A planned
-operation names its source ranges and final owned destinations. Its temporary
-storage is reserved before scheduling. Arbitrary model callbacks never receive
-a reusable staging view.
+`finish()` marks an explicit model-routing boundary. vLLM calls
+`finish_weight_transfers()` once after `model.load_weights` and before numerical
+weight preparation. Every rank in a shared read group must enter the same boundary,
+including ranks with no queued destinations. Ordinary `flush()` and materialization
+remain rank-local and complete all accepted writes. An eager flush may therefore
+read a source range independently before the remaining ranks share their reads.
 
-Host slots remain live through reads and transfers; GPU workspace remains live
-through its last transform consumer. Requests hold strong references to storage
-owners and file handles until completion. Retirement uses explicit CUDA events,
-including all participating streams. Error/cancellation handling drains users
-before unregistering or freeing memory and never publishes partial weights.
+The device loader initializes its rank-local shared reader on a background thread
+after model construction, while checkpoint routing continues. The completion boundary
+waits for initialization and reports failures collectively before any shared read.
+Session cleanup joins initialization and releases its resources even if routing
+fails before reaching that boundary. Reported setup time includes only work and
+waits remaining at completion; initialization overlapped with routing is not added
+again to the wall-time breakdown.
 
-One session cap includes pinned host buffers, GPU staging, retained source
-materializations, transform workspace, and alignment overhead. Target and draft
-share that cap. On GB10, charge host and CUDA staging together because they
-consume the same physical memory pool. Final model storage, metadata, CUDA
-overhead, and external memory use are separately included in capacity checks.
-Do not describe the staging cap as a bound on total system memory or page cache.
+## Managed-memory transport
 
-Start qualification with 256 MiB aggregate staging and 8 MiB read chunks; tune
-only from measured loading results. Large tensors stream into final storage or
-through bounded transform tiles. Tensor size must not trigger a full CPU tensor
-fallback or silently enlarge the cap. Reserve progress workspace before
-prefetching to prevent capacity deadlock.
+`b12x/loader/_batch.c` reads through the CPU alias of locked managed storage.
+Aligned file/address ranges enter final storage directly. Large misaligned ranges
+can read within the destination allocation and realign in place with `memmove`.
+Small edges and coalesced TP rows use each worker's fixed 8 MiB locked scratch.
+BF16 expansion reads into the first half of the final FP32 allocation and expands
+backwards in place, preserving every BF16 bit pattern.
 
-## Native helper and integration
+This path requires coherent GPU host-page-table access. Locking failures fail
+allocation. Mapped, registered and pinned allocation variants remain available to
+internal allocation-qualification tools.
 
-Use packaged C99 source and a cached host C-compiler build, following the native
-helper approach in `comm.roce`. The allocation helper uses the CPython C API to
-create owned DLPack capsules directly, without ctypes callbacks, pybind11, or
-the PyTorch C++ ABI. Keep future batches inside native code to avoid Python
-calls per small tensor. Use positional I/O and CUDA completion APIs, adding
-liburing only if measurements justify it. Future asynchronous requests must
-retain storage owners until native completion.
+## GPUDirect Storage transport
 
-Include source, ABI version, CPU architecture, compiler identity, flags, and
-relevant dependency identity in the build-cache key. Build atomically and
-validate the ABI on load. Build/probe failures must be clear, and preparation
-must finish before inference warmup/frozen kernel resolution. Validate both
-aarch64 and x86_64 builds and include native source in package data.
+Bulk loading uses the shared reader described below. Rank-local numerical
+consumers still require immediate completion; `b12x/loader/_gds_checkpoint.c`
+serves those dependency boundaries with synchronous `cuFileRead` calls from native
+worker threads. Payloads enter GPU memory without a CPU payload buffer. Each
+worker owns an 8 MiB registered device scratch buffer, up to 64 KiB of allocation
+alignment padding, and a CUDA stream. Header reads use a separate 8 MiB CPU
+`O_DIRECT` reader. At the default eight workers, reserved native GPU scratch is
+64.5 MiB if a rank-local consumer needs this executor. It is allocated lazily and
+released at session close. Ordinary bulk completion uses the shared reader's
+17.8125 MiB allocation instead.
 
-The first transport supports local reads into declared CPU-addressable ranges,
-including mapped final storage and bounded mapped conversion input. Start
-qualification with batched positional reads; select a small native reader pool
-or io_uring from measurements. Keep the C ABI independent of that choice.
-CUDA copies and bounded transforms serve consumers that require them. Direct
-I/O and alternate transports preserve the same ownership/capacity contract.
+A file range aligned to 4 KiB with a 64 KiB-aligned destination and at least
+64 KiB of payload can read directly into a registered final-weight range. Final
+registrations cover disjoint 64 KiB GPU pages. Other layouts read aligned file
+windows into registered GPU scratch, then copy the selected bytes to final
+storage. Small strided TP rows are coalesced and scattered on the GPU. Final EOF
+reads require the exact available byte count. Alignment and TP layout can therefore
+cause GPU copies and extra physical reads, but never a full host payload copy.
 
-Register `--load-format b12x` through vLLM's public `register_model_loader`
-interface using a dedicated general-plugin registration function. Keep plugin
-registration cheap and idempotent in spawned workers; initialize transport only
-on an actual load. The existing FP6 plugin remains independently selectable.
-Model-specific Qwen/GLM descriptions may require vLLM changes; the plugin does
-not eliminate that integration work. Integrations describe numerical recipes
-and slices, while b12x selects chunking, batching, workspace, and execution order.
+`b12x/loader/_gds_kernels.py` compiles byte-copy and BF16-expansion kernels before
+loading. Expansion writes the exact FP32 representation `bf16_bits << 16`, including
+signed zeros, subnormals and NaN payloads. Kernel arguments use 64-bit runtime
+counts and strides; live tensor sizes do not enter compile keys. Native launch
+validation requires the compiled parameter ABI and a scratch-free ordinary CUDA
+launch. The Python session retains compiled module owners throughout execution.
 
-Reuse existing MXFP8/NVFP4 quantizers and packing implementations where their
-output, rounding, scale domain, and layout match. Add bounded output interfaces
-where necessary rather than duplicating quantization math in the integration.
-The NVFP4 head needs a first pass over its existing global-scale domain before
-chunk quantization. Shared target/draft source reads must preserve their
-different final precision requirements.
+The optional C extension requires cuFile >= 1.14 development files, CUDA runtime
+and driver libraries, and a C compiler. `CUDA_HOME` or cuFile's `pkg-config` entry
+selects build files. Build caching includes C/header source, compiler flags and
+library identity. Importing `b12x.loader` neither builds the helper nor initializes
+CUDA.
+
+Before loading cuFile, b12x derives configuration from the caller's
+`CUFILE_ENV_PATH_JSON`, `/etc/cufile.json`, or cuFile defaults. It defaults
+`properties.allow_compat_mode` to `true`, preserves explicit settings, and selects
+a cached private JSON file in the process environment when a change is needed.
+Source configuration files are not modified. cuFile uses GDS when available and
+CPU compatibility reads otherwise; destination allocations and GPU scatter retain
+the same contracts in either mode.
+
+Explicit cuFile settings remain authoritative, including a driver initialized by
+another library. `CUFILE_FORCE_COMPAT_MODE=true` forces CPU compatibility, while
+`CUFILE_ALLOW_COMPAT_MODE=false` disables fallback. Missing cuFile development
+files, registration failures and failed reads remain fatal. The `gds_enabled`
+counter identifies the cuFile backend, not the transport used by an individual
+read; cuFile's transport statistics distinguish direct GPU and CPU operations.
+
+## Shared checkpoint reads
+
+Status: implemented for host-local groups using device weight allocations. The
+vLLM adapter always uses this backend on those devices, including TP1. Selecting
+the b12x load format is sufficient:
+
+```sh
+VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x \
+  --tensor-parallel-size 4
+```
+
+The vLLM adapter supplies its TP CPU process group. b12x validates host identity
+and distinct physical device UUIDs, gathers routed descriptors, and partitions the
+aligned union of their source envelopes among ranks. File identity includes the
+resolved pathname, device/inode, size, and modification/change timestamps. Strided
+gaps can contribute physical reads; only routed rows are written. Source identity
+is retained when metadata is opened and checked before completion and after
+execution. File descriptors and virtual addresses are never
+used as cross-process identities.
+
+Each allocation is exported only after validating its complete CUDA extent against
+the b12x weight pool. Peers import handles on the GPU that launches the scatter.
+All ranks finish descriptor, file-handle and mapping validation before shared
+payload writes start. Earlier rank-local metadata copies and eager transformations
+are already complete and are not rolled back on failure. The native executor in
+`b12x/loader/_gds_owner.c` uses four registered 4,653,056-byte slots and reserves
+18,677,760 bytes (17.8125 MiB) including alignment padding. The default eight
+workers issue two synchronous reads per slot. `io_threads` must be 4, 8, 12, or 16.
+Completed reads feed byte-copy or BF16-expansion kernels; CUDA events gate slot
+reuse. Registered staging, streams, workers and file handles persist until the
+loading session closes. Python performs planning and control collectives, without
+per-read polling or per-fragment launches during execution.
+
+Completion compares aggregate written bytes with the routed destination count.
+Every rank drains its reads and scatter streams before acknowledging completion.
+Peers close IPC mappings and acknowledge retirement before destination references
+can be released or replaced by quantization preparation. A failed rank or control
+collective fails the load. If peer retirement cannot be proven, destination owners
+are retained until process exit. The supplied process group controls communication
+timeout; no rank-local fallback is attempted after a shared-read failure.
+
+Managed allocations, multi-host groups, absent CUDA peer access, and overlapping
+destination envelopes are unsupported by this backend. Disjoint views whose
+bounding envelopes overlap require rank-local completion before bulk routing
+finishes. Small loads can cost more because metadata exchange and IPC mapping add
+fixed work. Offloaded embedding tables continue to use their separate storage path.
+
+`io.shared_reads` records preparation, planning, execution, mapping retirement,
+physical reads, destination and peer bytes, and reserved staging. Read-task seconds
+sum concurrent calls and are not wall time; native idle seconds measure waits for
+read or scatter completion. The enclosing completion time includes collective
+waits. Destination and peer counters describe writes issued by that reader rank
+across all destinations. These startup costs do not enter graph capture or replay.
+
+## Metadata, conversions and accounting
+
+Scalar and explicitly declared control values are coalesced into owned CPU spans,
+with a 64 MiB aggregate span limit per session, including intervening bytes. These
+values may be copied to GPU parameters. Signed FP4 payloads and E8M0 scale views
+preserve their raw bytes, including TP slices; they do not undergo numeric FP8
+conversion. Other supported contiguous casts reuse one 8 MiB input allocation
+and execute their numerical conversion on the GPU. Unsupported strided casts
+fail explicitly.
+
+Logs separate physical input bytes, selected payload bytes, direct destination
+bytes, alignment/strided copies, BF16 expansion, other casts, metadata copies,
+reserved scratch and final parameter ownership. `gds_physical_bytes` excludes CPU
+header/metadata reads; `physical_bytes` includes both. `gds_version` records the
+runtime cuFile version. Optional cuFile statistics expose NVFS, P2P, POSIX and
+error counters for transport qualification.
+
+These bounds cover loader scratch and explicitly declared metadata. Existing
+quantization/model callbacks can allocate full materialized tensors, so loader
+counters do not establish a bound on aggregate transform memory. A shared
+target/draft transform budget is unsupported. Disk I/O and blocking waits belong
+to startup, outside CUDA graph capture and replay.
+
+`b12x.loader.read_tensor` remains an allocation-qualification primitive with a
+buffered raw-file reader. It is separate from checkpoint loading and does not
+support the device/GDS allocation route.
 
 ## Qualification
 
-Add behavior tests under `tests/loader/` and startup/transport benchmarks under
-`benchmarks/loader/`. The existing `benchmarks/checkpoint_loader.py` is a small
-indexed safetensors helper, not the streaming implementation.
+`tests/loader/test_gds_checkpoint.py` exercises exact bytes, all BF16 bit patterns,
+strided TP rows and destination padding, aligned final reads, unaligned EOF,
+file and device-storage offsets beyond 4 GiB, bounded casts, metadata copies,
+invalid destination ownership, overlaps, truncation, transport counters, and graph
+replay after session close. Run it on a GDS filesystem with the assigned GPU:
 
-Test ownership under repeated slot reuse, delayed and multi-stream consumers,
-partial reads, cancellation, allocation failures, aliases, and paired scales
-in either order. Include tensors larger than the cap, 64-bit offsets above
-4 GiB, packed dtypes, TP slices, and checkpoint index overlays. Check actual
-host/device high-water marks and memory release at session close.
+```sh
+CUDA_VISIBLE_DEVICES=GPU_UUID CUDA_HOME=/path/to/cuda \
+python -m pytest tests/loader/test_gds_checkpoint.py \
+  --basetemp=/gds-filesystem/checkpoint-tests
+```
 
-Compare loaded bytes and transformed weights with trusted safetensors and the
-existing quantizers before measuring speed. Initially qualify Qwen TP1 on GB10
-with MTP off/on and cold/warm cache. Extend to GLM TP2 and RTX after the GB10
-allocation and loading contracts pass. Record command, revision, physical GPU, memory
-budget, correctness state, physical/selected bytes, raw timings, and comparison
-direction. Do not switch the serving default until correctness, bounded memory,
-and startup performance pass. The full model integration and acceptance plan
-is in the companion vLLM checkout's `docs/design/streaming_weight_loading.md`.
+`tests/loader/test_shared_read_plan.py` compares the collective planner with an
+independent byte oracle. `tests/loader/test_shared_checkpoint.py` uses four owner
+processes and covers delayed and empty ranks, rank-local completion, repeated
+epochs, offsets beyond 4 GiB, BF16 expansion, poisoned padding, validation failure
+propagation, source identity changes, truncation after preflight, and graph replay
+after IPC and reader cleanup. Select exactly four assigned GPUs:
+
+```sh
+CUDA_VISIBLE_DEVICES=GPU_UUID_0,GPU_UUID_1,GPU_UUID_2,GPU_UUID_3 \
+CUDA_HOME=/path/to/cuda python -m pytest \
+  tests/loader/test_shared_read_plan.py tests/loader/test_shared_checkpoint.py \
+  --basetemp=/gds-filesystem/shared-checkpoint-tests
+```
+
+`benchmarks/gds_layer_exchange.py --methods shared_native` exercises the production
+collective reader on original routed-expert checkpoint slices. Add
+`--all-expert-layers` for the complete expert corpus. Its timed boundary includes
+reader initialization, collective planning, IPC mapping, reading, scattering and
+cleanup. Destination allocation, source routing, process setup and the byte oracle
+are outside that interval; the command records source and native-library hashes.
+
+`tests/loader/test_vllm.py` qualifies model routing using the same automatic
+allocation selection. `tests/loader/test_direct.py` covers the coherent-memory
+transport on a device with GPU host page tables. Full serving qualification must
+also exercise the selected model's actual launch script, preparation, CUDA graph
+capture/replay, repeated requests and cache hits. Transport unit tests alone do
+not qualify a model for serving or establish startup performance.

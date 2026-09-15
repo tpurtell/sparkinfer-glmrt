@@ -7,9 +7,15 @@ from math import gcd
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-
-from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce, _load_kernels
+from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
+from b12x.comm.pcie._dma_kernels import DmaKernels, compile_launchers
+from b12x.comm.pcie._dma_preparation import (
+    plan as dma_plan,
+    prepared_call,
+    query_from_runtime,
+)
+from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce
+from b12x.preparation import PreparationSession
 
 
 pytestmark = pytest.mark.skipif(
@@ -60,48 +66,61 @@ def _assert_close(actual: torch.Tensor, ref: torch.Tensor, world_size: int) -> N
         )
 
 
+
+def _prepare_dma(ring: PCIeDmaAllReduce):
+    session = PreparationSession(device=ring.device, autotune=False)
+    query = query_from_runtime(ring, surface="DmaAllReduce.all_reduce", call={})
+    prime_inp = torch.zeros(
+        ring.world_size * 128, dtype=torch.bfloat16, device=ring.device
+    )
+    prime_out = torch.empty_like(prime_inp)
+    declaration = dma_plan(query, runtime=ring)
+    request = declaration.request(
+        name="dma",
+        prepare_call=lambda state: prepared_call(state, inp=prime_inp, out=prime_out),
+    )
+    result = session.prepare((request,))
+    return session, result, declaration
+
+
+def _prepared_mx_kernels() -> DmaKernels:
+    kernels = DmaKernels(CudaRTLibrary())
+    kernels.install(compile_launchers(world_size=2, wire_mode="mx"))
+    return kernels
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
-        "nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
-        rank=rank,
-        world_size=world_size,
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
     )
-    hidden = 6144
-    max_rows = 512
+    hidden, max_rows = 6144, 512
     row_multiple = (world_size * 8) // gcd(hidden, world_size * 8)
-    max_rows -= max_rows % row_multiple
 
     def valid_rows(rows: int) -> int:
         return ((rows + row_multiple - 1) // row_multiple) * row_multiple
 
     ring = PCIeDmaAllReduce(
-        exchange_group=dist.group.WORLD,
-        device=device,
-        max_bytes=max_rows * hidden * 4,
+        exchange_group=dist.group.WORLD, device=device, max_bytes=max_rows * hidden * 4
     )
+    session, result, plan = _prepare_dma(ring)
     try:
-        explicit_inp = _make_input(
-            valid_rows(8), hidden, torch.bfloat16, device, rank, 0
-        )
+        explicit_inp = _make_input(valid_rows(8), hidden, torch.bfloat16, device, rank, 0)
         explicit_ref = _reference(explicit_inp)
         explicit_out = torch.empty_like(explicit_inp)
         with pytest.raises(ValueError, match="device"):
             ring.all_reduce(
-                explicit_inp, out=torch.empty_like(explicit_inp, device="cpu")
+                explicit_inp, plan=plan,
+                out=torch.empty_like(explicit_inp, device="cpu"),
             )
         with pytest.raises(ValueError, match="device"):
             ring.all_reduce(
-                explicit_inp,
+                explicit_inp, plan=plan,
                 out=torch.empty_like(explicit_inp, device=(rank + 1) % world_size),
             )
         wrong_device = (rank + 1) % world_size
         torch.cuda.set_device(wrong_device)
-        ring.all_reduce(explicit_inp, out=explicit_out)
-        assert torch.cuda.current_device() == wrong_device
-        torch.cuda.set_device(rank)
+        ring.all_reduce(explicit_inp, plan=plan, out=explicit_out)
+        assert torch.cuda.current_device() == rank
         torch.cuda.synchronize(device)
         _assert_close(explicit_out, explicit_ref, world_size)
 
@@ -112,123 +131,34 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 rows = valid_rows(requested_rows)
                 inp = _make_input(rows, hidden, dtype, device, rank, 0)
                 ref = _reference(inp)
-                out = ring.all_reduce(inp)
+                if requested_rows == 8:
+                    out = ring.all_reduce(inp, plan=plan)
+                else:
+                    out = torch.empty_like(inp)
+                    ring.all_reduce(inp, plan=plan, out=out)
                 torch.cuda.synchronize(device)
                 _assert_close(out, ref, world_size)
-                assert all(
-                    out.data_ptr() != prior.data_ptr() for prior in retained_outputs
-                )
                 retained_outputs.append(out)
                 retained_refs.append(ref)
-                for retained, retained_ref in zip(
-                    retained_outputs, retained_refs, strict=True
-                ):
+                for retained, retained_ref in zip(retained_outputs, retained_refs, strict=True):
                     _assert_close(retained, retained_ref, world_size)
 
-        if ring.wire_mode == "bf16":
-            alignment = world_size * 8
-            planned_rows = valid_rows(256)
-            planned_elements = planned_rows * hidden
-            with pytest.raises(TypeError):
-                ring.prepare_eager_replay(torch.int32)
-            with pytest.raises(TypeError):
-                ring.prepare_eager_replay(torch.bfloat16, max_elements=1.5)
-            for dtype in (torch.bfloat16, torch.float32):
-                for invalid_bound in (
-                    -1,
-                    0,
-                    alignment - 1,
-                    ring.max_bytes // dtype.itemsize + 1,
-                ):
-                    with pytest.raises(ValueError):
-                        ring.prepare_eager_replay(dtype, max_elements=invalid_bound)
-                # Equivalent rounded bounds are idempotent. Overflow is rejected
-                # above even when rounding down would have made it fit.
-                ring.prepare_eager_replay(
-                    dtype, max_elements=planned_elements + alignment - 1
-                )
-                ring.prepare_eager_replay(dtype, max_elements=planned_elements)
-                ring.prepare_eager_replay(dtype, max_elements=planned_elements)
-                replays = ring._eager_replays[dtype]
-                assert replays[-1][0].numel() == planned_elements
-                assert (
-                    len({item[0].untyped_storage().data_ptr() for item in replays}) == 1
-                )
-                capacities = [item[0].numel() * dtype.itemsize for item in replays]
-                assert capacities == (
-                    [1 << 20, 2 << 20, 3 << 20]
-                    if dtype.itemsize == 2
-                    else [1 << 20, 2 << 20, 4 << 20, 6 << 20]
-                )
-                with pytest.raises(ValueError):
-                    ring.prepare_eager_replay(
-                        dtype, max_elements=planned_elements + alignment
-                    )
-                with pytest.raises(ValueError):
-                    ring.prepare_eager_replay(dtype)
-
-            # Legacy None still prepares the dtype's entire byte capacity.
-            ring.prepare_eager_replay(torch.float16)
-            ring.prepare_eager_replay(
-                torch.float16, max_elements=ring.max_bytes // torch.float16.itemsize
-            )
-            inp = _make_input(max_rows * 2, hidden, torch.float16, device, rank, 1)
-            ref = _reference(inp)
-            retained_outputs.append(ring.all_reduce(inp))
-            retained_refs.append(ref)
-
-            # Both dtypes share an element cap, not a byte cap. Interleave
-            # shrinking/growing prefixes with raw calls above that cap, keeping
-            # every result alive across both replay buffers and shared epochs.
-            for iteration, requested_rows in enumerate(
-                (planned_rows, 8, 128, max_rows, 64), 1
-            ):
-                rows = valid_rows(requested_rows)
-                for dtype in (torch.bfloat16, torch.float32):
-                    inp = _make_input(rows, hidden, dtype, device, rank, iteration)
-                    ref = _reference(inp)
-                    retained_outputs.append(ring.all_reduce(inp))
-                    retained_refs.append(ref)
-
-        # Captured callers bypass private eager graphs and use stable outputs.
-        # Their graphs still share the channel's stream/flag epochs with eager
-        # graph replays and raw calls, including a different piece count.
         rows = valid_rows(256)
-        capture_dtypes = (
-            (torch.bfloat16, torch.float32)
-            if ring.wire_mode == "bf16"
-            else (torch.bfloat16,)
-        )
-        captured = []
-        for dtype in capture_dtypes:
-            inp = _make_input(rows, hidden, dtype, device, rank, 0)
-            out = torch.empty_like(inp)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                ring.all_reduce(inp, out=out)
-            captured.append((inp, out, graph))
+        inp = _make_input(rows, hidden, torch.bfloat16, device, rank, 0)
+        out = torch.empty_like(inp)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            ring.all_reduce(inp, plan=plan, out=out)
         for iteration in range(1, 4):
-            for inp, out, graph in captured:
-                inp.copy_(_make_input(rows, hidden, inp.dtype, device, rank, iteration))
-                ref = _reference(inp)
-                graph.replay()
-                retained_outputs.append(out.clone())
-                retained_refs.append(ref)
-
-                eager_rows = max_rows if iteration == 2 else valid_rows(8)
-                eager_inp = _make_input(
-                    eager_rows, hidden, inp.dtype, device, rank, iteration + 3
-                )
-                eager_ref = _reference(eager_inp)
-                retained_outputs.append(ring.all_reduce(eager_inp))
-                retained_refs.append(eager_ref)
-
-        torch.cuda.synchronize(device)
-        for retained, retained_ref in zip(retained_outputs, retained_refs, strict=True):
-            _assert_close(retained, retained_ref, world_size)
-
+            inp.copy_(_make_input(rows, hidden, torch.bfloat16, device, rank, iteration))
+            ref = _reference(inp)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            _assert_close(out, ref, world_size)
         dist.barrier()
     finally:
+        result.close()
+        session.close()
         ring.close()
         dist.destroy_process_group()
 
@@ -241,7 +171,6 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    _load_kernels()
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
 
@@ -272,7 +201,6 @@ def test_pcie_dma_all_reduce_compressed_wire(mode: str) -> None:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    _load_kernels()
     mp.spawn(
         _fp8_worker,
         args=(world_size, _free_port(), mode),
@@ -296,7 +224,7 @@ def test_pcie_dma_mxfp8_codec_matches_cpu_reference() -> None:
     storage = torch.empty(elems + elems // 32, dtype=torch.uint8, device=device)
     output = torch.empty_like(source)
 
-    kernels = _load_kernels()
+    kernels = _prepared_mx_kernels()
     kernels.dma_quant_mx(
         source.data_ptr(), storage.data_ptr(), storage.data_ptr() + elems, elems
     )
@@ -337,7 +265,7 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     payload = torch.empty(source.numel(), dtype=torch.uint8, device=device)
     scales = torch.empty(1 << 16, dtype=torch.uint8, device=device)
 
-    kernels = _load_kernels()
+    kernels = _prepared_mx_kernels()
     kernels.dma_quant_mx(
         source.data_ptr(), payload.data_ptr(), scales.data_ptr(), source.numel()
     )
@@ -350,7 +278,9 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     absolute_bits = bit_patterns.to(torch.int32) & 0x7FFF
     exponent = absolute_bits >> 7
     fraction = absolute_bits & 0x7F
-    expected_scales = torch.clamp(exponent - 8 + (fraction > 96).to(torch.int32), min=0)
+    expected_scales = torch.clamp(
+        exponent - 8 + (fraction > 96).to(torch.int32), min=0
+    )
     expected_scales = torch.where(
         absolute_bits == 0, torch.full_like(expected_scales, 127), expected_scales
     )
@@ -373,8 +303,8 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
         expected_scales == 255, torch.tensor(float("nan")), scale_values
     )
     expected_payload = (
-        (source_values.float() / scale_values).to(torch.float8_e4m3fn).view(torch.uint8)
-    )
+        source_values.float() / scale_values
+    ).to(torch.float8_e4m3fn).view(torch.uint8)
     is_inf = (exponent == 255) & (fraction == 0)
     is_nan = (exponent == 255) & (fraction != 0)
     expected_payload = torch.where(
@@ -391,4 +321,96 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     )
 
     assert torch.equal(scales.cpu(), expected_scales)
-    assert torch.equal(payload.cpu(), expected_payload.repeat_interleave(32))
+    assert torch.equal(
+        payload.cpu(), expected_payload.repeat_interleave(32)
+    )
+
+
+def _preparation_skew_worker(rank: int, world_size: int, port: int) -> None:
+    import time
+    from datetime import timedelta
+    from b12x.comm.pcie._dma_preparation import query_from_metadata
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
+        world_size=world_size, timeout=timedelta(seconds=45),
+    )
+    ring = PCIeDmaAllReduce(
+        exchange_group=dist.group.WORLD, device=device, max_bytes=80 << 20,
+        fp8="",
+    )
+    session = PreparationSession(device=device, autotune=False)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        cases = []
+        for index, rows in enumerate((4089, 4096)):
+            source = torch.full(
+                (rows, 5120), rank + 1, device=device, dtype=torch.bfloat16,
+            )
+            output = torch.empty_like(source)
+            declaration = dma_plan(
+                query_from_metadata(ring, shape=tuple(source.shape), dtype=source.dtype),
+                runtime=ring,
+            )
+
+            def call(state):
+                if rank == index + 1:
+                    time.sleep(0.3)
+                return prepared_call(state, inp=source, out=output)
+
+            session.prepare((declaration.request(name=f"dma.m{rows}", prepare_call=call),))
+            torch.testing.assert_close(output, torch.full_like(output, 10), rtol=0, atol=0)
+            cases.append((declaration, source, output))
+            dist.barrier()
+        session.freeze()
+        for declaration, source, output in cases:
+            with session.capture(), torch.cuda.graph(graph):
+                ring.all_reduce(source, plan=declaration, out=output)
+            address = output.data_ptr()
+            for iteration in (1, 2):
+                source.fill_(rank + 1 + iteration)
+                output.fill_(float("nan"))
+                allocated = torch.cuda.memory_allocated(device)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                assert output.data_ptr() == address
+                assert torch.cuda.memory_allocated(device) == allocated
+                torch.testing.assert_close(
+                    output, torch.full_like(output, 10 + world_size * iteration),
+                    rtol=0, atol=0,
+                )
+            graph.reset()
+        dist.barrier()
+    finally:
+        graph.reset()
+        session.close()
+        ring.close()
+        dist.destroy_process_group()
+
+
+def test_pcie_dma_preparation_tolerates_rank_skew_and_replays() -> None:
+    import time
+    import torch.multiprocessing as mp
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 4:
+        pytest.skip("requires four CUDA devices")
+    workers = mp.spawn(
+        _preparation_skew_worker, args=(4, _free_port()), nprocs=4, join=False,
+    )
+    finished = False
+    deadline = time.monotonic() + 60
+    try:
+        while time.monotonic() < deadline:
+            if workers.join(timeout=1):
+                finished = True
+                return
+        raise TimeoutError("DMA preparation or replay stalled with delayed ranks")
+    finally:
+        if not finished:
+            for process in workers.processes:
+                if process.is_alive():
+                    process.kill()
+            for process in workers.processes:
+                process.join(timeout=5)

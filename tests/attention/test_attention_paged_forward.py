@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from benchmarks.benchmark_paged_attention import (
     _capture_backend_graph,
     _capture_flashinfer_fa2_graph,
@@ -965,15 +965,10 @@ def test_paged_forward_bf16_extend_dual_tma_tail_matches_reference() -> None:
     assert warm_output.data_ptr() == output.data_ptr()
     assert bool(torch.isfinite(warm_lse).all().item())
 
-    freeze_kernel_resolution(
-        "BF16 paged dual-TMA serving replay must use the warmed specialization"
-    )
-    try:
+    with kernel_resolution_guard('BF16 paged dual-TMA serving replay must use the warmed specialization'):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured_output, captured_lse = run_bound()
-    finally:
-        unfreeze_kernel_resolution()
 
     assert captured_output.data_ptr() == output.data_ptr()
     assert captured_lse.data_ptr() == warm_lse.data_ptr()

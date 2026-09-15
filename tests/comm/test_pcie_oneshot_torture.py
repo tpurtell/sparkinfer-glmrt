@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 from b12x.comm.pcie.pcie_oneshot import (
     TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
@@ -667,8 +668,7 @@ def _shape_growth_wrap_worker(
         )
         stream.synchronize()
         dist.barrier()
-        b12x.freeze_kernel_resolution("TP2 shape growth across epoch rollover")
-        try:
+        with kernel_resolution_guard('TP2 shape growth across epoch rollover'):
             with torch.cuda.stream(stream):
                 graphs[0].replay()
                 graphs[0].replay()
@@ -693,8 +693,6 @@ def _shape_growth_wrap_worker(
             results = [None] * world_size
             dist.all_gather_object(results, mismatches)
             assert results == [0, 0], results
-        finally:
-            b12x.unfreeze_kernel_resolution()
     finally:
         for graph in graphs:
             graph.reset()

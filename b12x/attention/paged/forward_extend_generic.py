@@ -65,6 +65,7 @@ from b12x._lib.intrinsics import (
 
 from ._selected_forward_config import SELECTION_WIDTH
 from .traits import PagedForwardTraits
+from ._controls import paged_control
 
 
 def _assume_strides_aligned(t: cute.Tensor):
@@ -322,7 +323,7 @@ def _issue_paged_kv_tma_copy_2planes_fp8_raw_impl(
     page_id = (
         Int32(0)
         if const_expr(
-            os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
     )
@@ -3315,7 +3316,7 @@ class PagedForwardKernel:
         # gets the decode kernel's page-entry flattening.
         base_use_paged_kv_tma_extend = (
             enable_paged_kv_tma
-            and os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
+            and paged_control("B12X_PAGED_KV_TMA", "1") != "0"
             and dtype_q == cutlass.BFloat16
             and dtype_o == cutlass.BFloat16
             and traits.head_dim_qk == 256
@@ -3373,12 +3374,8 @@ class PagedForwardKernel:
             and not self.use_paged_kv_tma
         )
         self.use_kv_repack = self.use_kv_repack_fp16 or self.use_kv_repack_bf16
-        tma_debug_dump = os.environ.get(
-            "B12X_PAGED_KV_TMA_DEBUG_DUMP", ""
-        )
-        paged_debug_dump = os.environ.get(
-            "B12X_PAGED_KV_DEBUG_DUMP", ""
-        )
+        tma_debug_dump = paged_control("B12X_PAGED_KV_TMA_DEBUG_DUMP", "")
+        paged_debug_dump = paged_control("B12X_PAGED_KV_DEBUG_DUMP", "")
         self.debug_dump_paged_kv_tma_k = self.use_paged_kv_tma and tma_debug_dump == "K"
         self.debug_dump_paged_kv_tma_s = self.use_paged_kv_tma and tma_debug_dump == "S"
         self.debug_dump_paged_kv_tma_v = self.use_paged_kv_tma and tma_debug_dump == "V"
@@ -3507,7 +3504,7 @@ class PagedForwardKernel:
             and not self.use_paged_v_tma
         )
         self.use_qwen_fp8_qk_quarter_repack = (
-            os.environ.get("B12X_PAGED_EXTEND_QWEN_FP8_QK_QUARTER_REPACK", "1")
+            paged_control("B12X_PAGED_EXTEND_QWEN_FP8_QK_QUARTER_REPACK", "1")
             != "0"
             and self.kv_is_fp8
             and dtype_q == cutlass.BFloat16
@@ -3634,9 +3631,7 @@ class PagedForwardKernel:
         return cute.struct(SharedStorage)
 
     def _get_paged_kv_tma_plane_layout(self):
-        plane_swizzle = os.environ.get(
-            "B12X_PAGED_KV_TMA_PLANE_SWIZZLE", ""
-        )
+        plane_swizzle = paged_control("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "")
         if plane_swizzle == "none":
             return cute.make_layout(
                 (self.stage_tile_rows, self.kv_tma_plane_head_dim),
@@ -3940,7 +3935,7 @@ class PagedForwardKernel:
         page_id = (
             Int32(0)
             if const_expr(
-                os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
@@ -3967,7 +3962,7 @@ class PagedForwardKernel:
         page_id = (
             Int32(0)
             if const_expr(
-                os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
@@ -5247,7 +5242,7 @@ class PagedForwardKernel:
             and not self.msa_block_sparse
             and self.window_left < 0
             and self.traits.num_warps_kv == 1
-            and os.environ.get("B12X_PAGED_EXTEND_COMPACT_MASK", "1") != "0"
+            and paged_control("B12X_PAGED_EXTEND_COMPACT_MASK", "1") != "0"
         )
         warp_row_base = warp_q_idx * num_mma_q * 16
         warp_kv_base = warp_kv_idx * num_mma_kv * 16
@@ -7671,7 +7666,7 @@ def build_extend_forward_kernel(
     use_fp8_pv_repack: bool = False,
 ):
     enable_paged_kv_tma = (
-        os.environ.get("B12X_PAGED_KV_TMA", "1") != "0"
+        paged_control("B12X_PAGED_KV_TMA", "1") != "0"
     )
     return PagedExtendForwardKernel(
         _torch_to_cutlass_dtype(traits.q_dtype),

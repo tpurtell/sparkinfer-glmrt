@@ -13,7 +13,8 @@ import statistics
 
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession
+from benchmarks.attention_preparation import prepare_mxfp4
 from b12x.attention import dsa_indexer as api
 
 
@@ -28,10 +29,8 @@ def measure(rows: int, width: int, heads: int, repeats: int) -> dict:
     pool = torch.empty((pages + 7, api.index_mxfp4_page_bytes()), device=device, dtype=torch.uint8)
     positions = torch.arange(width, device=device)
     slots = physical[positions // 64].long() * 64 + positions % 64
-    api.quantize_write_index_k_mxfp4(keys, index_k_cache=pool, slot_mapping=slots)
     packed = torch.empty((rows, heads, 64), device=device, dtype=torch.uint8)
     scales = torch.empty((rows, heads, 4), device=device, dtype=torch.uint8)
-    api.quantize_q_mxfp4(q, q_mxfp4=packed, q_scales=scales)
     shared = dict(
         q_mxfp4=packed, q_scales=scales, query_weights=weights,
         index_k_cache=pool, page_table=physical[None],
@@ -39,12 +38,14 @@ def measure(rows: int, width: int, heads: int, repeats: int) -> dict:
         active_width=torch.tensor([width], device=device, dtype=torch.int32),
         output_indices=torch.empty((rows, 512), device=device, dtype=torch.int32),
     )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
     bindings = {}
     for mode in ("decode", "prefill"):
         plan = api.plan(api.Caps(
             device=device, num_q_heads=heads, max_q_rows=max(256, rows),
             max_page_table_width=pages, topk=512, cache_format="mxfp4", mode=mode,
         ))
+        prepare_mxfp4(session, plan, q=q, keys=keys, slots=slots, arguments=shared)
         (spec,) = plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
         bindings[mode] = api.bind(plan, scratch=scratch, **shared)
@@ -52,7 +53,7 @@ def measure(rows: int, width: int, heads: int, repeats: int) -> dict:
     actual = api.score(bindings["prefill"])
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     graphs = {}
-    freeze_kernel_resolution("MXFP4 score benchmark fixed-capacity replay")
+    session.freeze()
     try:
         for mode, binding in bindings.items():
             graph = torch.cuda.CUDAGraph()
@@ -81,7 +82,9 @@ def measure(rows: int, width: int, heads: int, repeats: int) -> dict:
             "scalar_over_tensorcore": statistics.median(samples["decode"]) / statistics.median(samples["prefill"]),
         }
     finally:
-        unfreeze_kernel_resolution()
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
 
 
 def main() -> None:

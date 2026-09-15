@@ -30,9 +30,10 @@ class OpMeta:
 
     ``api_style`` declares the op's lifecycle contract:
 
-    - ``planned``:  ``Caps -> plan() -> bind() -> run*()``; ``plan`` is
-      host-side and may allocate, ``bind`` only creates views (allocation
-      free), ``run*`` is CUDA-graph-capture safe.
+    - ``planned``: ``Plan -> PreparationSession -> prepared Plan -> bind/run``.
+      Declarations are metadata-only; preparation owns compilation, priming and
+      resource admission, then installs prepared state and a stable integer
+      handle onto the same ``Plan``. Execution is CUDA-graph-capture safe.
     - ``oneshot``:  plain functions with domain verbs (``mm``, ``quantize``).
     - ``stateful``: long-lived class instances (comm collectives).
     """

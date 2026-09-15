@@ -1,13 +1,9 @@
 """Compatibility alias for ModelOpt MXFP8 ``blockscaled`` calls.
 
-New code should use ``b12x.gemm.blockscaled.pack_weight``, ``.mm``, and
-``.prewarm``. This module retains its original names for compatibility.
-
-Example:
-    from b12x.gemm import blockscaled
-
-    weight = blockscaled.pack_weight(w_mxfp8, w_scale)   # one-time
-    out = blockscaled.mm(x, weight, expected_m=x.shape[0])
+This mathematical alias uses the same ``query_from_call`` / ``plan`` /
+``PreparationSession`` lifecycle as ``blockscaled``. BF16 precision queries
+and fixed FP16/prequantized queries retain distinct contracts; both execute
+through a prepared ``Plan``.
 """
 
 from __future__ import annotations
@@ -19,8 +15,8 @@ from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 META = OpMeta(
     name="mxfp8_linear",
     group="gemm",
-    api_style="oneshot",
-    entry_points=("Weight", "mm", "pack_weight", "is_supported"),
+    api_style="planned",
+    entry_points=("Weight", "BlockscaledQuery", "FixedBlockscaledQuery", "plan", "query_from_call", "mm", "pack_weight", "is_supported"),
     dtypes=("bf16", "fp16"),
     recipes=("mxfp8",),
     requires=("triton",),
@@ -34,6 +30,6 @@ META = OpMeta(
 )
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
-    from .api import Weight, is_supported, mm, pack_weight  # noqa: F401
+    from .api import BlockscaledQuery, FixedBlockscaledQuery, Weight, is_supported, mm, pack_weight, plan, query_from_call  # noqa: F401
 
 install_lazy_api(globals(), META)

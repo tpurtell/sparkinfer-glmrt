@@ -29,12 +29,14 @@ from b12x._lib.intrinsics import (
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.program_cache import register_program_cache
 
 _THREADS = 256
 _WARPS = _THREADS // 32
 _LOCK = RLock()
 _CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: dict[tuple[object, ...], Callable[..., None]] = {}
+register_program_cache(_CACHE, mirrors=(_WARMED,), lock=_LOCK)
 _POINTER_DTYPES = {
     torch.bfloat16: BFloat16,
     torch.float32: Float32,

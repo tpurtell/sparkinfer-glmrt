@@ -409,10 +409,9 @@ def test_single_active_split_reuses_different_capacity_strides() -> None:
             problem.output.float(), expected, rtol=0.01, atol=0.01
         )
         problems.append((problem, partials, lse, binding))
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
 
-    freeze_kernel_resolution("single active split across padded capacity strides")
-    try:
+    with kernel_resolution_guard("single active split across padded capacity strides"):
         for problem, partials, lse, binding in reversed(problems):
             _install_scenario(
                 problem, partials=partials, lse=lse, live_sink=None, source_sink=None
@@ -430,5 +429,4 @@ def test_single_active_split_reuses_different_capacity_strides() -> None:
             torch.testing.assert_close(
                 problem.output.float(), expected, rtol=0.01, atol=0.01
             )
-    finally:
-        unfreeze_kernel_resolution()
+            graph.reset()

@@ -15,6 +15,7 @@ from b12x.quantization.nvfp4._impl import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,
 )
+from b12x.quantization.nvfp4._tuning import TUNING, Nvfp4QuantizationQuery
 
 from tests._reference.helpers import dequantize_grouped_nvfp4, require_b12x
 
@@ -113,6 +114,7 @@ from b12x.quantization.nvfp4._impl import (
     allocate_bf16_to_fp4_tma_outputs,
     compile_bf16_to_fp4_tma,
 )
+from b12x.quantization.nvfp4._tuning import TUNING, Nvfp4QuantizationQuery
 
 result = {}
 for level in (1, 2):
@@ -134,7 +136,9 @@ device = torch.device("cuda")
 source = torch.ones((128, 128), dtype=torch.bfloat16, device=device)
 global_scale = torch.ones((1,), dtype=torch.float32, device=device)
 outputs = allocate_bf16_to_fp4_tma_outputs(128, 128, device=device)
-launch = compile_bf16_to_fp4_tma(128, 128)
+launch = compile_bf16_to_fp4_tma(128, 128, liveness_strategy=TUNING.default_config(
+    Nvfp4QuantizationQuery(dtype="bfloat16", rows=128, columns=128), None,
+).liveness_strategy)
 launch(source, global_scale, outputs.packed_a_flat, outputs.scale_flat)
 torch.cuda.synchronize(device)
 result["gpu_execution"] = {
@@ -262,6 +266,7 @@ import torch
 
 import b12x.quantization.nvfp4._impl as quantization
 from b12x._lib.compiler import clear_compile_cache, compile_cache_info
+from b12x.quantization.nvfp4._tuning import TUNING, Nvfp4QuantizationQuery
 
 clear_compile_cache()
 quantization._KERNEL_CACHE.clear()
@@ -275,7 +280,9 @@ for M, K, mac, expected_strategy in (
     source = torch.ones((M, K), dtype=torch.bfloat16, device="cuda")
     global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
     outputs = quantization.allocate_bf16_to_fp4_tma_outputs(M, K)
-    launch = quantization.compile_bf16_to_fp4_tma(M, K)
+    launch = quantization.compile_bf16_to_fp4_tma(M, K, liveness_strategy=TUNING.default_config(
+        Nvfp4QuantizationQuery(dtype="bfloat16", rows=M, columns=K), None,
+    ).liveness_strategy)
     launch(source, global_scale, outputs.packed_a_flat, outputs.scale_flat)
     torch.cuda.synchronize()
     assert int(torch.count_nonzero(outputs.packed_a_flat).item()) > 0
@@ -362,7 +369,7 @@ def test_bf16_to_fp4_tma_eager_exact(
         device=device,
     )
     outputs = allocate_bf16_to_fp4_tma_outputs(M, K, device=device)
-    launch = compile_bf16_to_fp4_tma(M, K)
+    launch = compile_bf16_to_fp4_tma(M, K, liveness_strategy=TUNING.default_config(Nvfp4QuantizationQuery(dtype="bfloat16", rows=M, columns=K), None).liveness_strategy)
 
     assert outputs.packed_a_flat.numel() == M * K // 2
     assert outputs.scale_flat.numel() == M * K // 16
@@ -417,7 +424,7 @@ def test_bf16_to_fp4_tma_graph_replay_exact(
     packed_flat = packed_backing[guard_bytes : guard_bytes + packed_bytes]
     scale_flat = scale_backing[guard_bytes : guard_bytes + scale_bytes]
     packed_storage = packed_flat.view(1, M, K // 2)
-    launch = compile_bf16_to_fp4_tma(M, K)
+    launch = compile_bf16_to_fp4_tma(M, K, liveness_strategy=TUNING.default_config(Nvfp4QuantizationQuery(dtype="bfloat16", rows=M, columns=K), None).liveness_strategy)
     packed_ptr = packed_flat.data_ptr()
     scale_ptr = scale_flat.data_ptr()
     initial_source = source.clone()
@@ -508,7 +515,7 @@ def test_bf16_to_fp4_tma_fp8_scale_boundaries_graph_exact() -> None:
     source[1, :16] = 0.001953125
     global_scale = torch.ones((1,), dtype=torch.float32, device=device)
     outputs = allocate_bf16_to_fp4_tma_outputs(M, K, device=device)
-    launch = compile_bf16_to_fp4_tma(M, K)
+    launch = compile_bf16_to_fp4_tma(M, K, liveness_strategy=TUNING.default_config(Nvfp4QuantizationQuery(dtype="bfloat16", rows=M, columns=K), None).liveness_strategy)
     packed_ptr = outputs.packed_a_flat.data_ptr()
     scale_ptr = outputs.scale_flat.data_ptr()
     initial_source = source.clone()
@@ -625,14 +632,14 @@ def test_bf16_to_fp4_tma_fp8_scale_boundaries_graph_exact() -> None:
 def test_bf16_to_fp4_tma_rejects_invalid_capacity_and_aliasing() -> None:
     device = require_b12x()
     with pytest.raises(ValueError, match="multiples"):
-        compile_bf16_to_fp4_tma(127, 128)
+        compile_bf16_to_fp4_tma(127, 128, liveness_strategy=TUNING.default_config(Nvfp4QuantizationQuery(dtype="bfloat16", rows=127, columns=128), None).liveness_strategy)
     with pytest.raises(ValueError, match="multiples"):
         allocate_bf16_to_fp4_tma_outputs(128, 192, device=device)
 
     M = K = 128
     source = torch.ones((M, K), dtype=torch.bfloat16, device=device)
     global_scale = torch.ones((1,), dtype=torch.float32, device=device)
-    launch = compile_bf16_to_fp4_tma(M, K)
+    launch = compile_bf16_to_fp4_tma(M, K, liveness_strategy=TUNING.default_config(Nvfp4QuantizationQuery(dtype="bfloat16", rows=M, columns=K), None).liveness_strategy)
     packed_bytes = M * K // 2
     scale_bytes = M * K // 16
     backing = torch.empty(packed_bytes + scale_bytes, dtype=torch.uint8, device=device)

@@ -14,6 +14,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute
 from b12x._lib.compiler import key_field, run_compiled
+from b12x._lib.program_cache import register_program_cache
 from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
     cvt_f32x4_to_e4m3x4,
@@ -27,6 +28,7 @@ _THREADS = 128
 _VALUES_PER_THREAD = 4
 _LOCK = RLock()
 _CACHE: dict[tuple[int, int], object] = {}
+register_program_cache(_CACHE, lock=_LOCK)
 
 
 def _byte_base_pointer(tensor: torch.Tensor) -> torch.Tensor:
@@ -35,6 +37,11 @@ def _byte_base_pointer(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _to_cute(tensor: torch.Tensor, dtype, *, align: int):
+    if hasattr(tensor, "fake_mode"):
+        from cutlass.cute.runtime import make_fake_tensor
+        return make_fake_tensor(
+            dtype, (cute.sym_int(32),), (1,), assumed_align=align
+        )
     converted = from_dlpack(tensor, assumed_align=align)
     converted.element_type = dtype
     return converted.mark_layout_dynamic(leading_dim=0)
@@ -162,19 +169,37 @@ def compile(*, binding: Binding) -> None:
         with _LOCK:
             _CACHE[signature] = compiled
 
+@dataclass(frozen=True)
+class StaticFp8QuantLauncher:
+    signature: tuple[int, int]
+    compiled: object
+
+    def run(self, binding: Binding) -> torch.Tensor:
+        if _signature(binding) != self.signature:
+            raise ValueError("static FP8 quant binding differs from its prepared launcher")
+        _, args, _ = _launch(binding)
+        run_compiled(self.compiled, args)
+        return binding.output
+
+
+def resolve_static_fp8_quant_launcher(*, binding: Binding) -> StaticFp8QuantLauncher:
+    """Resolve the exact native quantizer and retain it for prepared execution."""
+    compile(binding=binding)
+    signature = _signature(binding)
+    with _LOCK:
+        compiled = _CACHE[signature]
+    return StaticFp8QuantLauncher(signature, compiled)
+
 
 def run(*, binding: Binding) -> torch.Tensor:
+    """Run a launcher resolved during preparation; never compile at execution."""
     signature = _signature(binding)
     with _LOCK:
         compiled = _CACHE.get(signature)
     if compiled is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "query quant compile miss during CUDA graph capture; call compile first"
-            )
-        compile(binding=binding)
-        with _LOCK:
-            compiled = _CACHE[signature]
+        raise RuntimeError(
+            "static FP8 quantizer is not prepared; prepare its execution before run"
+        )
     _, args, _ = _launch(binding)
     run_compiled(compiled, args)
     return binding.output
@@ -185,4 +210,12 @@ def clear_caches() -> None:
         _CACHE.clear()
 
 
-__all__ = ["Binding", "bind", "clear_caches", "compile", "run"]
+__all__ = [
+    "Binding",
+    "StaticFp8QuantLauncher",
+    "bind",
+    "clear_caches",
+    "compile",
+    "resolve_static_fp8_quant_launcher",
+    "run",
+]

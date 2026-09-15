@@ -155,7 +155,7 @@ def test_plan_bind_uses_live_views_and_no_scratch() -> None:
 
 def test_projection_slices_match_packed_inputs_under_frozen_replay() -> None:
     """Merged projection views retain values, padding and live row strides."""
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.norm.hyperconnection import _cute, _kernels
 
     device = require_sm120()
@@ -221,13 +221,10 @@ def test_projection_slices_match_packed_inputs_under_frozen_replay() -> None:
             torch.testing.assert_close(merged, before, rtol=0, atol=0)
 
     check(1, 12)
-    freeze_kernel_resolution()
-    try:
+    with kernel_resolution_guard():
         for rows in (4, 16):
             for padding in (3, 12, 28):
                 check(rows, padding)
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def test_projection_stride_alias_checks_cover_last_live_row() -> None:
@@ -679,7 +676,7 @@ def test_cute_backend_is_callable_alongside_triton_and_graph_stable() -> None:
 def test_cute_reference_helpers_reuse_binaries_across_live_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.norm.hyperconnection import _cute
 
     device = require_sm120()
@@ -806,13 +803,8 @@ def test_cute_reference_helpers_reuse_binaries_across_live_counts(
     monkeypatch.setattr(_cute, "_compile", traced_compile)
     try:
         launch(1)
-        freeze_kernel_resolution(
-            "HyperConnection live counts must reuse warmed CuTe binaries"
-        )
-        try:
+        with kernel_resolution_guard('HyperConnection live counts must reuse warmed CuTe binaries'):
             launch(17)
-        finally:
-            unfreeze_kernel_resolution()
     finally:
         _cute.clear_caches()
 

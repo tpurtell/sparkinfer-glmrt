@@ -15,14 +15,37 @@ cuda_required = pytest.mark.skipif(
 )
 
 
+from b12x.preparation import PreparationSession, PreparedCall
+from b12x.gemm import bf16_gemv
+
+
+@pytest.fixture
+def projection_session():
+    with PreparationSession(device="cuda", autotune=False, compile_workers=2) as session:
+        yield session
+
+
+def _prepare_projection(session, x, weight, *, out=None, bias=None, output_dtype=None, override=None):
+    declaration = bf16_gemv.plan(bf16_gemv.query_from_call(
+        x, weight, out=out, bias=bias, output_dtype=output_dtype,
+    ), override=override)
+    session.prepare((declaration.request(
+        name="projection", prepare_call=lambda state: PreparedCall(
+            run=lambda: state.run(x, weight, out=out, bias=bias),
+        ),
+    ),))
+    return declaration
+
+
+def _mm(x, weight, *, out=None, bias=None, output_dtype=None, override=None):
+    with PreparationSession(device=x.device, autotune=False, compile_workers=2) as session:
+        plan = _prepare_projection(session, x, weight, out=out, bias=bias,
+                                   output_dtype=output_dtype, override=override)
+        return bf16_gemv.mm(x, weight, out=out, bias=bias, output_dtype=output_dtype, plan=plan)
+
+
 def _op():
-    from b12x.gemm import bf16_gemv
-
-    # The package API is lazy (install_lazy_api); touching the attribute
-    # imports _kernel, which registers the torch custom op.
-    bf16_gemv.bf16_gemv_small_n  # noqa: B018
-
-    return torch.ops.b12x.bf16_gemv_small_n
+    return _mm
 
 
 def _assert_matches_f32_ref(y: torch.Tensor, x: torch.Tensor, w: torch.Tensor):
@@ -65,6 +88,45 @@ def test_last_element_contributes():
 
 
 @cuda_required
+@pytest.mark.parametrize("n", [32, 384, 512])
+def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(n, projection_session):
+    """Prepared long-K projections retain FP32 output with runtime row counts."""
+    from b12x.gemm import bf16_gemv
+
+    torch.manual_seed(419132)
+    source = torch.randn(17, 5120, device="cuda").bfloat16() * 0.125
+    weight = torch.randn(n, 5120, device="cuda").bfloat16() * 0.125
+    bias = torch.linspace(-0.25, 0.25, n, device="cuda")
+    storage = torch.full((18, n + 8), 123.0, device="cuda")
+    output = storage[:17, :n]
+    plan = _prepare_projection(projection_session, source, weight, out=output, bias=bias)
+    projection_session.freeze()
+    try:
+        for rows in (1, 3, 7, 8, 9, 17):
+            storage.fill_(123)
+            bf16_gemv.mm(source[:rows], weight, out=output[:rows], bias=bias, plan=plan)
+            oracle = source[:rows].double() @ weight.double().T + bias.double()
+            torch.testing.assert_close(
+                output[:rows].double(), oracle, rtol=2e-5, atol=2e-5
+            )
+            assert (storage[rows:] == 123).all()
+            assert (storage[:, n:] == 123).all()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            bf16_gemv.mm(source[:8], weight, out=output[:8], bias=bias, plan=plan)
+        source.neg_()
+        bias.add_(0.03125)
+        storage.fill_(123)
+        graph.replay()
+        oracle = source[:8].double() @ weight.double().T + bias.double()
+        torch.testing.assert_close(output[:8].double(), oracle, rtol=2e-5, atol=2e-5)
+        assert (storage[8:] == 123).all()
+        assert (storage[:, n:] == 123).all()
+    finally:
+        graph.reset()
+
+
+@cuda_required
 def test_noncontiguous_x():
     """The native scalar path must read a strided column view correctly."""
     op = _op()
@@ -90,8 +152,8 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
     input_dtype,
     weight_dtype,
     output_dtype,
+    projection_session,
 ):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
     from b12x.gemm import bf16_gemv
 
     device = torch.device("cuda")
@@ -103,12 +165,14 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
     bias = torch.linspace(-0.03, 0.04, n, device=device, dtype=torch.float32)
     output = torch.empty(capacity, n + 3, device=device, dtype=output_dtype)
 
+    plan = _prepare_projection(projection_session, source, weight, bias=bias, out=output[:, :n])
+
     def launch(rows):
-        return bf16_gemv.mm(source[:rows], weight, bias=bias, out=output[:rows, :n])
+        return bf16_gemv.mm(source[:rows], weight, bias=bias, out=output[:rows, :n], plan=plan)
 
     launch(1)
     torch.cuda.synchronize()
-    freeze_kernel_resolution("native unquantized projection live-row reuse")
+    projection_session.freeze()
     try:
         for rows in (0, 1, 7, capacity):
             output.fill_(123)
@@ -147,7 +211,7 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
             atol=2e-5 if output_dtype == torch.float32 else 1e-2,
         )
     finally:
-        unfreeze_kernel_resolution()
+        graph.reset()
 
 
 @cuda_required
@@ -156,9 +220,9 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
 def test_prefill_projection_reuses_warm_kernel_and_preserves_live_graph_inputs(
     n,
     output_dtype,
+    projection_session,
 ):
     """Both dispatch regimes share an unquantized contract and caller ownership."""
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
     from b12x.gemm import bf16_gemv
 
     torch.manual_seed(415122)
@@ -167,12 +231,12 @@ def test_prefill_projection_reuses_warm_kernel_and_preserves_live_graph_inputs(
     weight = (torch.randn(n, k, device="cuda") / k**0.5).bfloat16()
     output = torch.empty(capacity, n, device="cuda", dtype=output_dtype)
     source_copy, weight_copy = source.clone(), weight.clone()
-    bf16_gemv.precompile(weight, output_dtype=output_dtype)
-    freeze_kernel_resolution("BF16 prefill and scalar projection row coverage")
+    plan = _prepare_projection(projection_session, source, weight, out=output)
+    projection_session.freeze()
     try:
         for rows in (1, 17, 255, 256, 513, capacity):
             output.fill_(float("nan"))
-            bf16_gemv.mm(source[:rows], weight, out=output[:rows])
+            bf16_gemv.mm(source[:rows], weight, out=output[:rows], plan=plan)
             expected = source[:rows].double() @ weight.double().T
             if output_dtype == torch.float32:
                 torch.testing.assert_close(
@@ -188,7 +252,7 @@ def test_prefill_projection_reuses_warm_kernel_and_preserves_live_graph_inputs(
         output.fill_(float("nan"))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            bf16_gemv.mm(source[:513], weight, out=output[:513])
+            bf16_gemv.mm(source[:513], weight, out=output[:513], plan=plan)
         source.mul_(0.5)
         weight.mul_(0.25)
         graph.replay()
@@ -202,7 +266,7 @@ def test_prefill_projection_reuses_warm_kernel_and_preserves_live_graph_inputs(
         )
         assert torch.isnan(output[513:]).all()
     finally:
-        unfreeze_kernel_resolution()
+        graph.reset()
 
 
 @cuda_required
@@ -215,7 +279,7 @@ def test_broad_bf16_projection(output_dtype, m, n, k):
     torch.manual_seed(41092)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.125
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.125
-    actual = bf16_gemv.mm(x, weight, output_dtype=output_dtype)
+    actual = _mm(x, weight, output_dtype=output_dtype)
     expected = (x.double() @ weight.double().T).to(output_dtype)
     torch.testing.assert_close(
         actual,
@@ -238,7 +302,7 @@ def test_bf16_bias_is_added_before_output_rounding(output_dtype):
     # The last eight-element vector lies in a partial K64 tile.
     weight[:, -1] = 2**-8
     bias = torch.full((n,), -1.0, device="cuda", dtype=torch.float32)
-    actual = bf16_gemv.mm(x, weight, bias=bias, output_dtype=output_dtype)
+    actual = _mm(x, weight, bias=bias, output_dtype=output_dtype)
     torch.testing.assert_close(actual, torch.full_like(actual, 2**-8), rtol=0, atol=0)
 
 
@@ -257,14 +321,13 @@ def test_fp32_operand_is_not_rounded_for_tensor_cores(input_dtype, weight_dtype)
     x[:, -1] = 1.0 + (2**-12 if input_dtype == torch.float32 else 0)
     weight[:, -1] = 1.0 + (2**-12 if weight_dtype == torch.float32 else 0)
     bias = torch.full((n,), -1.0, device="cuda", dtype=torch.float32)
-    actual = bf16_gemv.mm(x, weight, bias=bias, output_dtype=torch.float32)
+    actual = _mm(x, weight, bias=bias, output_dtype=torch.float32)
     torch.testing.assert_close(actual, torch.full_like(actual, 2**-12), rtol=0, atol=0)
 
 
 @cuda_required
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
-def test_precompile_covers_live_rows_and_strides_under_freeze(output_dtype):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+def test_prepared_layouts_cover_live_rows_under_freeze(output_dtype, projection_session):
     from b12x.gemm import bf16_gemv
 
     torch.manual_seed(41093)
@@ -282,20 +345,14 @@ def test_precompile_covers_live_rows_and_strides_under_freeze(output_dtype):
     bias = torch.linspace(-0.25, 0.25, n, device="cuda", dtype=torch.float32)
     storage = torch.empty(capacity + 1, n + 3, device="cuda", dtype=output_dtype)
     output = storage[:capacity, 1 : n + 1]
-    # One-row precompile must ready tensor cores as well as SIMT, including
-    # scalar and vector loads, before the first large/strided request.
-    bf16_gemv.precompile(weights[0], output_dtype=output_dtype, bias=bias)
-    from b12x.gemm.bf16_gemv import _kernel as native
-
-    key = native._key(sources[0], weights[0], output, bias)
-    compiled = native._KERNEL_CACHE[key]
-    freeze_kernel_resolution("BF16 projection precompile covers live M and strides")
+    plans = [_prepare_projection(projection_session, x, weight, out=output, bias=bias)
+             for x, weight in zip(sources, weights, strict=True)]
+    projection_session.freeze()
     try:
-        for x, weight in zip(sources, weights, strict=True):
+        for x, weight, plan in zip(sources, weights, plans, strict=True):
             for rows in (0, 1, 8, 9, 127, 128, 129, capacity):
                 storage.fill_(123)
-                actual = bf16_gemv.mm(x[:rows], weight, bias=bias, out=output[:rows])
-                assert native._KERNEL_CACHE[key] is compiled
+                actual = bf16_gemv.mm(x[:rows], weight, bias=bias, out=output[:rows], plan=plan)
                 expected = (x[:rows].double() @ weight.double().T + bias.double()).to(
                     output_dtype
                 )
@@ -316,7 +373,7 @@ def test_precompile_covers_live_rows_and_strides_under_freeze(output_dtype):
                 )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            actual = bf16_gemv.mm(sources[1], weights[1], bias=bias, out=output)
+            actual = bf16_gemv.mm(sources[1], weights[1], bias=bias, out=output, plan=plans[1])
         sources[1].mul_(0.5)
         bias.add_(0.03125)
         graph.replay()
@@ -335,21 +392,21 @@ def test_precompile_covers_live_rows_and_strides_under_freeze(output_dtype):
             storage[capacity:], torch.full_like(storage[capacity:], 123)
         )
     finally:
-        unfreeze_kernel_resolution()
+        graph.reset()
 
 
 @cuda_required
 def test_prefill_router_topk_agrees_with_fp64_and_scalar_projection():
     """A 384-expert router keeps the same six selected expert identifiers."""
     from b12x.gemm import bf16_gemv
-    from b12x.gemm.bf16_gemv._kernel import _launch_scalar
+    from b12x.gemm.bf16_gemv._tuning import GemvConfig
 
     torch.manual_seed(415123)
     source = torch.randn(4096, 5120, device="cuda").bfloat16()
     weight = (torch.randn(384, 5120, device="cuda") / 5120**0.5).bfloat16()
     scalar = torch.empty(4096, 384, device="cuda")
-    _launch_scalar(source, weight, scalar)
-    result = bf16_gemv.mm(source, weight, output_dtype=torch.float32)
+    _mm(source, weight, out=scalar, override=GemvConfig(backend="simt"))
+    result = _mm(source, weight, output_dtype=torch.float32)
     oracle = source.double() @ weight.double().T
     for value in (scalar, result):
         torch.testing.assert_close(value.double(), oracle, rtol=1e-6, atol=1e-6)
@@ -359,16 +416,17 @@ def test_prefill_router_topk_agrees_with_fp64_and_scalar_projection():
 
 
 @cuda_required
-def test_prefill_projection_retains_small_terms_between_cancelling_large_terms():
+@pytest.mark.parametrize("n", [384, 512])
+def test_prefill_projection_retains_small_terms_between_cancelling_large_terms(n):
     """Compensated carry preserves exact representable BF16 products in FP32."""
     from b12x.gemm import bf16_gemv
 
     source = torch.ones(256, 5120, device="cuda", dtype=torch.bfloat16)
-    weight = torch.zeros(512, 5120, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(n, 5120, device="cuda", dtype=torch.bfloat16)
     weight[:, ::32] = 1024
     weight[:, 1::32] = 0.015625
     weight[:, 31::32] = -1024
-    result = bf16_gemv.mm(source, weight, output_dtype=torch.float32)
+    result = _mm(source, weight, output_dtype=torch.float32)
     expected = source.double() @ weight.double().T
     torch.testing.assert_close(result.double(), expected, atol=0, rtol=0)
 
@@ -391,32 +449,37 @@ def test_installed_plugins_preserve_strided_projection_contract(
     code = """
 import importlib.metadata
 import torch
-from b12x import KernelResolutionFrozenError, freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession, PreparedCall
 from b12x.gemm import bf16_gemv
 
 base_x = torch.arange(3 * 256, dtype=torch.float32, device="cuda").view(3, 256) / 1024
 base_w = torch.arange(256 * 256, dtype=torch.float32, device="cuda").view(256, 256) / 65536
 x, weight = base_x[:, ::2], base_w[:, ::2]
-bf16_gemv.precompile(weight, input_dtype=x.dtype, output_dtype=torch.float32)
+plan = bf16_gemv.plan(bf16_gemv.query_from_call(x, weight, output_dtype=torch.float32))
+session = PreparationSession(device=x.device, autotune=False, compile_workers=2)
+session.prepare((plan.request(name="plugin-projection", prepare_call=lambda state:
+    PreparedCall(run=lambda: state.run(x, weight))),))
+missing = bf16_gemv.plan(bf16_gemv.query_from_call(x, weight[:128], output_dtype=torch.float32))
+session.freeze()
 expected = (x.double() @ weight.double().T).float()
 plugins = [entry for entry in importlib.metadata.entry_points(group="vllm.general_plugins")
            if entry.name in ("b12x_fp6", "b12x_loader")]
 for entry in sorted(plugins, key=lambda entry: (entry.dist.name, entry.name), reverse=REVERSE):
     entry.load()
-    actual = bf16_gemv.mm(x, weight, output_dtype=torch.float32)
+    actual = bf16_gemv.mm(x, weight, output_dtype=torch.float32, plan=plan)
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
-    freeze_kernel_resolution("plugin discovery must preserve the selected runtime")
     try:
         # A foreign operator can return correct arithmetic while ignoring this
         # runtime's graph-safety boundary. Unprepared geometry must still fail.
         try:
-            bf16_gemv.mm(x, weight[:128], output_dtype=torch.float32)
-        except KernelResolutionFrozenError:
-            pass
+            bf16_gemv.mm(x, weight[:128], output_dtype=torch.float32, plan=missing)
+        except RuntimeError as error:
+            assert "plan is not prepared and kernel resolution is frozen" in str(error)
         else:
             raise AssertionError(f"{entry} bypassed frozen kernel resolution")
     finally:
-        unfreeze_kernel_resolution()
+        pass
+session.close()
 """.replace("REVERSE", repr(reverse_plugins))
     result = subprocess.run(
         [sys.executable, "-c", code],

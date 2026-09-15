@@ -44,14 +44,19 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Uint32
+from cutlass import Boolean, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
     cp_async_bulk_g2s_mbar,
+    cvt_e4m3_to_f32_via_f16,
     get_ptr_as_int64,
+    ld_global_nc_v4_u32,
     ld_global_nc_v2_u32,
+    pack_f32x2_to_f16x2,
+    pow2_ceil_ue8m0,
     shared_ptr_to_u32,
     st_shared_u32,
+    ue8m0_to_output_scale,
 )
 
 # DSV4 KV gmem IO stride: DATA portion only (448 nope + 64 rope * 2B = 576),
@@ -90,6 +95,119 @@ _IO_THREADS = 32
 
 
 @cute.jit
+def stage_dsv41_fp8_scales(
+    source: cute.Tensor,
+    record_offset: Int64,
+    ratio_addr: Int32,
+    scales_addr: Int32,
+    valid: Boolean,
+    *,
+    swa: cutlass.Constexpr,
+) -> None:
+    """Stage DSV4.1's canonical FP8 metadata before publishing a KV stage.
+
+    ``ratio_addr`` names the 64-byte FP16 sidecar at row byte 544 and
+    ``scales_addr`` names its eight canonical UE8M0 bytes in ``kv_sc``.  Invalid
+    entries deliberately issue no global load and publish a zero conversion
+    sidecar with unit (byte 127) canonical scales.
+    """
+    if valid:
+        if cutlass.const_expr(swa):
+            # The 16 source bytes are two UE8M0 scales per 64-dimensional group.
+            # A single aligned vector load avoids scalar metadata traffic.
+            m0, m1, m2, m3 = ld_global_nc_v4_u32(
+                get_ptr_as_int64(source, record_offset + Int64(512))
+            )
+            metadata = [m0, m1, m2, m3]
+            scale_word_lo = Uint32(0)
+            scale_word_hi = Uint32(0)
+            for group in cutlass.range_constexpr(8):
+                packed = metadata[group // 2]
+                pair = (packed >> Uint32((group & 1) * 16)) & Uint32(0xFFFF)
+                lo = pair & Uint32(0xFF)
+                hi = pair >> Uint32(8)
+                canonical = cutlass.max(cutlass.max(lo, hi), Uint32(1))
+                ratio_lo = cutlass.Float32(0.0)
+                ratio_hi = cutlass.Float32(0.0)
+                # UE8M0 exponents make source/canonical an exact power of two;
+                # avoid a general floating-point divide on the producer path.
+                if canonical - lo <= Uint32(18):
+                    ratio_lo = ue8m0_to_output_scale(
+                        Uint32(127) + canonical - lo
+                    )
+                if canonical - hi <= Uint32(18):
+                    ratio_hi = ue8m0_to_output_scale(
+                        Uint32(127) + canonical - hi
+                    )
+                ratio_pair = pack_f32x2_to_f16x2(ratio_lo, ratio_lo)
+                st_shared_u32(ratio_addr + Int32(group * 8), ratio_pair)
+                ratio_pair = pack_f32x2_to_f16x2(ratio_hi, ratio_hi)
+                st_shared_u32(ratio_addr + Int32(group * 8 + 4), ratio_pair)
+                # The consumer's four original 16-wide groups consist of the
+                # two native 32-wide scale regions, duplicated into each half.
+                if group < 4:
+                    scale_word_lo |= canonical << Uint32(group * 8)
+                else:
+                    scale_word_hi |= canonical << Uint32((group - 4) * 8)
+            st_shared_u32(scales_addr, scale_word_lo)
+            st_shared_u32(scales_addr + Int32(4), scale_word_hi)
+        else:
+            # Indexed records have 32 E4M3 scales at byte 256: four native
+            # 16-wide scales per output 64-wide group.
+            m0, m1, m2, m3 = ld_global_nc_v4_u32(
+                get_ptr_as_int64(source, record_offset + Int64(256))
+            )
+            m4, m5, m6, m7 = ld_global_nc_v4_u32(
+                get_ptr_as_int64(source, record_offset + Int64(272))
+            )
+            metadata = [m0, m1, m2, m3, m4, m5, m6, m7]
+            scale_word_lo = Uint32(0)
+            scale_word_hi = Uint32(0)
+            for group in cutlass.range_constexpr(8):
+                packed = metadata[group]
+                s0 = cvt_e4m3_to_f32_via_f16(packed & Uint32(0xFF))
+                s1 = cvt_e4m3_to_f32_via_f16((packed >> Uint32(8)) & Uint32(0xFF))
+                s2 = cvt_e4m3_to_f32_via_f16((packed >> Uint32(16)) & Uint32(0xFF))
+                s3 = cvt_e4m3_to_f32_via_f16(packed >> Uint32(24))
+                # Metadata is a positive scale format; treat zero/non-positive
+                # encodings as zero when deriving the canonical containment bound.
+                s0 = cutlass.max(s0, cutlass.Float32(0.0))
+                s1 = cutlass.max(s1, cutlass.Float32(0.0))
+                s2 = cutlass.max(s2, cutlass.Float32(0.0))
+                s3 = cutlass.max(s3, cutlass.Float32(0.0))
+                largest = cutlass.max(cutlass.max(s0, s1), cutlass.max(s2, s3))
+                _, canonical = pow2_ceil_ue8m0(
+                    cutlass.max(
+                        largest * cutlass.Float32(6.0 / 448.0),
+                        cutlass.Float32(2.0**-126),
+                    )
+                )
+                inv_canonical = ue8m0_to_output_scale(canonical)
+                st_shared_u32(
+                    ratio_addr + Int32(group * 8),
+                    pack_f32x2_to_f16x2(s0 * inv_canonical, s1 * inv_canonical),
+                )
+                st_shared_u32(
+                    ratio_addr + Int32(group * 8 + 4),
+                    pack_f32x2_to_f16x2(s2 * inv_canonical, s3 * inv_canonical),
+                )
+                if group < 4:
+                    scale_word_lo |= canonical << Uint32(group * 8)
+                else:
+                    scale_word_hi |= canonical << Uint32((group - 4) * 8)
+            st_shared_u32(scales_addr, scale_word_lo)
+            st_shared_u32(scales_addr + Int32(4), scale_word_hi)
+    else:
+        # Invalid tags must not read their clamped row-0 source.  Zero sidecar
+        # ratios convert every payload lane to zero; byte 127 denotes unit scale.
+        for group in cutlass.range_constexpr(8):
+            st_shared_u32(ratio_addr + Int32(group * 8), Uint32(0))
+            st_shared_u32(ratio_addr + Int32(group * 8 + 4), Uint32(0))
+        st_shared_u32(scales_addr, Uint32(0x7F7F7F7F))
+        st_shared_u32(scales_addr + Int32(4), Uint32(0x7F7F7F7F))
+
+
+@cute.jit
 def io_issue_gather(
     kv_cache_u8: cute.Tensor,  # flat 1-D u8 view of the paged DSV4 KV cache
     topk_indices: cute.Tensor,  # 1-D int32 topk slice for this query token
@@ -119,6 +237,9 @@ def io_issue_gather(
     per_token_latent_scale: cutlass.Constexpr = False,
     dsv41: cutlass.Constexpr = False,
     dsv41_swa: cutlass.Constexpr = True,
+    dsv41_fp8: cutlass.Constexpr = False,
+    ratio_base_addr: Int32 = Int32(0),
+    ratio_stride: cutlass.Constexpr = 0,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -343,7 +464,31 @@ def io_issue_gather(
                     kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(528),
                     source_tag,
                 )
-            if cutlass.const_expr(scale_format == 0):
+            if cutlass.const_expr(dsv41_fp8):
+                # DSV4.1 records are truly 528B (SWA) or 288B (indexed), not
+                # the padded shared-row stride.  Keep every pool product Int64.
+                metadata_idx = idx_raw
+                if metadata_idx < Int32(0):
+                    metadata_idx = Int32(0)
+                metadata_block = metadata_idx // _section_pbs
+                metadata_local = metadata_idx - metadata_block * _section_pbs
+                metadata_record_offset = (
+                    Int64(metadata_block) * _section_stride
+                    + Int64(metadata_local)
+                    * Int64(528 if dsv41_swa else 288)
+                )
+                ratio_addr = kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(544)
+                if cutlass.const_expr(ratio_stride):
+                    ratio_addr = ratio_base_addr + entry * Int32(ratio_stride)
+                stage_dsv41_fp8_scales(
+                    _section_kv,
+                    metadata_record_offset,
+                    ratio_addr,
+                    kv_sc_dst_addr + entry * Int32(8),
+                    idx_raw >= Int32(0),
+                    swa=dsv41_swa,
+                )
+            elif cutlass.const_expr(scale_format == 0):
                 # DSV4 grouped UE8M0 footer -> contiguous smem kv_sc. GLM has no
                 # footer (inline scales travel in the kv_fp8 nope bulk).
                 f0 = Uint32(0)
@@ -397,7 +542,10 @@ def io_issue_gather(
             # 64 packed rows. Each leader contributes half the transaction bytes.
             if (io_lane & Int32(31)) == Int32(0):
                 cute.arch.mbarrier_arrive_and_expect_tx(
-                    full_mbar_ptr, Int32(bulk_tx_bytes // 2)
+                    full_mbar_ptr,
+                    Int32(bi // 2) * _NOPE
+                    if cutlass.const_expr(dsv41)
+                    else Int32(bulk_tx_bytes // 2),
                 )
         else:
             if io_lane == Int32(0):

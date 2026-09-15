@@ -10,6 +10,7 @@ import torch
 
 from b12x._lib.scratch import ScratchBufferSpec, scratch_buffer_spec, scratch_tensor
 from b12x._lib.scratch_layout import SCRATCH_ALIGN_BYTES, align_up, dtype_nbytes, materialize_scratch_view
+from b12x.preparation import Plan
 from ..tensors import overlaps, positive, require_paged_recurrent_state, require_row_contiguous, require_tensor
 from .workspace import V_SPLIT_CHOICES, WorkspaceRecord, tiles_capacity
 
@@ -27,7 +28,6 @@ class PrefillCaps(Protocol):
     qk_l2norm: bool
     checkpoint_export: bool
     null_state_index: int | None
-    metadata_validation: str
     is_gdn: bool
     op_name: str
 
@@ -36,8 +36,8 @@ class PrefillCaps(Protocol):
 
 
 @dataclass(frozen=True)
-class Plan:
-    """Fixed launch policy and caller-allocated scratch layout for one Caps.
+class Layout:
+    """Fixed launch geometry and caller-allocated scratch layout for one Caps.
 
     Chunk tiles are ordered in bands (local tile index major, sequence rank
     minor, longest sequences first) and processed in windows of
@@ -56,10 +56,8 @@ class Plan:
     stages: int
     window_tiles: int
     max_windows: int
-    duplicate_table_size: int
     offsets: Mapping[str, int]
     _scratch_specs: tuple[ScratchBufferSpec, ...]
-    policy_resolution: object | None = None
     workspace_windows: int = 2
     max_sequence_tiles: int = 0
 
@@ -93,18 +91,14 @@ class Plan:
             raise ValueError(f"tokens={live_tokens} exceeds capacity {self.caps.max_tokens}")
         return (live_tokens, self.caps.heads, HEAD_DIM)
 
-    def bind(self, **kwargs) -> "Binding":
-        raise NotImplementedError("public prefill plans implement bind")
 
 
 @dataclass(frozen=True)
 class Binding:
     """Caller-owned tensors and scratch views for one prefill invocation."""
 
-    plan: Plan
+    _state: Layout
     scratch: torch.Tensor
-    error_code: torch.Tensor
-    duplicate_slots: torch.Tensor
     band_base: torch.Tensor
     sorted_seq: torch.Tensor
     rank_of: torch.Tensor
@@ -131,24 +125,20 @@ class Binding:
     output: torch.Tensor
     token_capacity: int
     seq_capacity: int
+    plan: Plan | None = None
 
 
-def _next_power_of_two(value: int) -> int:
-    return 1 << max(0, int(value) - 1).bit_length()
-
-
-def materialize_plan(
+def materialize_layout(
     caps: PrefillCaps,
     *,
-    plan_type: type[Plan],
+    layout_type: type[Layout],
     v_split: int,
     k_split: int,
     stages: int,
     window_tiles: int,
-    policy_resolution: object | None,
     workspace_windows: int = 2,
     max_sequence_tiles: int = 0,
-) -> Plan:
+) -> Layout:
     if v_split not in V_SPLIT_CHOICES:
         raise ValueError(f"v_split must be one of {V_SPLIT_CHOICES}, got {v_split}")
     tiles = caps.tiles_capacity
@@ -160,10 +150,7 @@ def materialize_plan(
     if workspace_windows == 1 and max_windows != 1:
         raise ValueError("one workspace window requires a single-window plan")
     ring_records = workspace_windows * window_tiles * heads
-    duplicate_table_size = _next_power_of_two(4 * caps.max_seqs)
     regions = (
-        ("error_code", 1, torch.int32),
-        ("duplicate_slots", duplicate_table_size, torch.int32),
         ("band_base", tiles + 2, torch.int32),
         ("sorted_seq", caps.max_seqs, torch.int32),
         ("rank_of", caps.max_seqs, torch.int32),
@@ -180,24 +167,22 @@ def materialize_plan(
         offsets[name] = cursor
         cursor += elements * dtype_nbytes(dtype)
     spec = scratch_buffer_spec(caps.op_name, nbytes=cursor, device=caps.device)
-    return plan_type(
+    return layout_type(
         caps=caps,
         v_split=int(v_split),
         k_split=int(k_split),
         stages=int(stages),
         window_tiles=window_tiles,
         max_windows=max_windows,
-        duplicate_table_size=duplicate_table_size,
         offsets=offsets,
         _scratch_specs=(spec,),
-        policy_resolution=policy_resolution,
         workspace_windows=workspace_windows,
         max_sequence_tiles=max_sequence_tiles,
     )
 
 
 def _record_view(
-    storage: torch.Tensor, plan: Plan, name: str, shape: tuple[int, ...], dtype: torch.dtype
+    storage: torch.Tensor, plan: Layout, name: str, shape: tuple[int, ...], dtype: torch.dtype
 ) -> torch.Tensor:
     view, _ = materialize_scratch_view(
         storage, offset_bytes=plan.offsets[name], shape=shape, dtype=dtype
@@ -206,9 +191,10 @@ def _record_view(
 
 
 def bind_tensors(
-    plan: Plan,
+    plan: Layout,
     *,
     binding_type: type[Binding],
+    _plan: Plan | None = None,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
     q: torch.Tensor,
     k: torch.Tensor,
@@ -232,8 +218,8 @@ def bind_tensors(
     Live capacities come from the bound tensors: ``q.shape[0]`` tokens and
     ``cu_seqlens.numel() - 1`` sequences, each at most the planned capacity.
     """
-    if not isinstance(plan, Plan):
-        raise TypeError("plan must be a delta-rule prefill Plan")
+    if not isinstance(plan, Layout):
+        raise TypeError("binding requires a delta-rule prefill layout")
     caps = plan.caps
     device = caps.device
     heads = caps.heads
@@ -298,8 +284,6 @@ def bind_tensors(
     storage = scratch_tensor(scratch, plan.scratch_specs(), owner=caps.op_name)
     ring = plan.workspace_windows * plan.window_tiles
     views = {
-        "error_code": _record_view(storage, plan, "error_code", (1,), torch.int32),
-        "duplicate_slots": _record_view(storage, plan, "duplicate_slots", (plan.duplicate_table_size,), torch.int32),
         "band_base": _record_view(storage, plan, "band_base", (tiles + 2,), torch.int32),
         "sorted_seq": _record_view(storage, plan, "sorted_seq", (caps.max_seqs,), torch.int32),
         "rank_of": _record_view(storage, plan, "rank_of", (caps.max_seqs,), torch.int32),
@@ -328,7 +312,8 @@ def bind_tensors(
             if overlaps(tensor, candidate):
                 raise ValueError(f"{name} must not overlap read-only tensor {other}")
     return binding_type(
-        plan=plan,
+        _state=plan,
+        plan=_plan,
         scratch=storage,
         **views,
         q=q, k=k, v=v, raw_g=raw_g, raw_beta=raw_beta, A_log=A_log, dt_bias=dt_bias,

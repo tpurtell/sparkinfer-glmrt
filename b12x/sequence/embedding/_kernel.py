@@ -1,5 +1,7 @@
 """CuTe row copy; model width/types are static, all row quantities are runtime."""
-from functools import cache
+from b12x._lib.program_cache import program_cache
+from b12x._lib.compile_plan import attach_programs
+from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -58,8 +60,14 @@ class _Embedding:
                             out[dst + Int64(col)] = weight[src + Int64(col)]
 
 
-@cache
-def _compile(width, weight_dtype, id_dtype, device):
+@dataclass(frozen=True)
+class _EmbeddingProgram:
+    raw: object
+    types: tuple
+
+
+@program_cache
+def compile_embedding(width, weight_dtype, id_dtype, device):
     key = (width, str(weight_dtype), str(id_dtype), device)
     entry = _Embedding(width)
     raise_if_kernel_resolution_frozen("cute.compile", target=entry, cache_key=key)
@@ -73,14 +81,13 @@ def _compile(width, weight_dtype, id_dtype, device):
                                 Int64(width), Int32(0), current_cuda_stream(),
                                 compile_spec=KernelCompileSpec.from_key(
                                     "sequence.embedding", 1, key))
-    return compiled, types
+    return attach_programs(_EmbeddingProgram(compiled, types), compiled)
 
 
-def launch(weight, ids, out, num_rows):
+def launch(weight, ids, out, num_rows, *, prepared):
     if ids.numel() == 0:
         return
-    compiled, types = _compile(weight.shape[1], weight.dtype, ids.dtype,
-                               weight.device.index)
+    compiled, types = prepared
     tensors = (weight, ids, out, ids if num_rows is None else num_rows)
     pointers = tuple(make_ptr(t, tensor.data_ptr(), cute.AddressSpace.gmem,
                               assumed_align=t.width // 8)

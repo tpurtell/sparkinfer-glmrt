@@ -27,8 +27,8 @@ before committing the current first input.
 
 Every live decode query length must be at most
 `max_speculative_tokens + 1`, and every accepted count must be in
-`[1, max_speculative_tokens + 1]`. The runtime kernels validate these bounds on
-the device; they do not clamp them.
+`[1, max_speculative_tokens + 1]`. The kernels neither check nor clamp these
+bounds; the integration must satisfy them.
 
 Prefill consumes the caller-provided base window, or zeros for a fresh slot,
 persists the newest `state_length` normalized inputs, and clears the speculative
@@ -38,27 +38,23 @@ requiring the integration to clear recycled storage first.
 A mixed plan binds a fixed-capacity device boolean `request_is_prefill` with one
 entry per request row. `run_mixed` applies prefill semantics to true live rows
 and decode semantics to false live rows without partitioning or reordering the
-packed token tensor. Decode query-length and accepted-token validation applies
+packed token tensor. The decode query-length and accepted-token bounds apply
 only to false live rows; prefill and inactive rows ignore
 `num_accepted_tokens`.
 
 A live request with zero query tokens leaves its entire physical state slot
 unchanged in both decode and prefill, including the speculative tail. Distinct
-live requests must use distinct nonnegative state-slot IDs; duplicate real slots
-fail closed before any state mutation.
+live requests must use distinct nonnegative state-slot IDs.
 
 A `state_slot_ids[r]` value of `-1` is a dummy sink for CUDA-graph padding. Its
 tokens produce zero output and no state mutation. Other negative values and
 values at or above `max_state_slots` are invalid.
 
-`run_decode`, `run_prefill`, and `run_mixed` reset and then populate
-`binding.error_code`, a one-element device `int32` scratch view. A nonzero code
-means the entire launch wrote zero output and did not mutate state. The masks
-are `1` for capacity metadata, `2` for packed-query boundaries, `4` for decode
-query length, `8` for accepted-token count, and `16` for state-slot ID. Serving
-integrations must inspect this value after stream or graph completion and treat
-any nonzero value as fatal.
-The additional mask `32` reports duplicate nonnegative live state-slot IDs.
+The kernels read `num_seqs`, `num_tokens`, `query_start_loc`,
+`state_slot_ids`, and `num_accepted_tokens` from the device without checking
+them against the planned capacities or against each other; the only runtime
+masks are the live token count, the live request count, and the `-1` slot
+sink. Metadata outside the contract above reads or writes out of bounds.
 
 Norm weights bind as flat `[streams * hidden_size]` tensors. A checkpoint
 depthwise-convolution weight shaped

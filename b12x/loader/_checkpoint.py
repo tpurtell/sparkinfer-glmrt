@@ -12,7 +12,7 @@ from itertools import product
 from pathlib import Path
 
 from ._native import load
-from ._pool import HostWeightWriter, owns_storage, owns_tensor
+from ._pool import HostWeightWriter, owns_storage, owns_tensor, weight_allocation
 
 
 def _unique_object(pairs):
@@ -43,7 +43,8 @@ class DirectWeightSession:
     No checkpoint payload is mapped or read through the page cache.
     """
 
-    def __init__(self, device=0, io_threads=8, *, allocation_scope=nullcontext):
+    def __init__(self, device=0, io_threads=8, *, allocation_scope=nullcontext,
+                 shared_read_group=None):
         import torch
 
         torch.cuda.init()
@@ -53,11 +54,22 @@ class DirectWeightSession:
             raise ValueError("io_threads must be between 1 and 16")
         self.device = device
         self.io_threads = io_threads
+        self.shared_read_group = shared_read_group
+        self.progress = None
+        self._gds = None
+        self._copy_programs = None
+        if weight_allocation(device) == "device":
+            from ._gds_native import load as load_gds
+            from ._gds_kernels import compile_copies
+
+            self._gds = load_gds()
+            self._copy_programs = compile_copies(device)
         self.allocation_scope = allocation_scope
         self.executor = None
         self.records = array("Q")
         self.destinations = []
         self.files = []
+        self.file_identities = {}
         self.sources = {}
         self.host_writer = HostWeightWriter()
         self.payload_bytes = 0
@@ -73,12 +85,16 @@ class DirectWeightSession:
 
     def __exit__(self, *exc):
         try:
-            if exc[0] is None:
+            if exc[0] is None and not (
+                self.shared_read_group is not None and self.shared_read_group.failed
+            ):
                 self.flush()
         finally:
             self._close()
 
     def _close(self):
+        if self.shared_read_group is not None:
+            self.shared_read_group.close()
         self.records = array("Q")
         self.destinations.clear()
         self.executor = None
@@ -87,26 +103,68 @@ class DirectWeightSession:
         for fd in self.files:
             os.close(fd)
         self.files.clear()
+        self.file_identities.clear()
         self.reader = None
+
+    @staticmethod
+    def _file_identity(fd):
+        stat = os.fstat(fd)
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    def _validate_source_identities(self):
+        for fd, identity in self.file_identities.items():
+            if self._file_identity(fd) != identity:
+                raise RuntimeError("checkpoint source changed after metadata was opened")
 
     def flush(self):
         """Complete accepted destinations before a numerical consumer runs."""
-        import torch
-
+        if self.shared_read_group is not None and self.shared_read_group.failed:
+            raise RuntimeError("shared checkpoint group failed; the load cannot continue")
         if not self.records:
             return
+        try:
+            self._execute(self.records)
+        finally:
+            self.records = array("Q")
+            self.destinations.clear()
+
+    def finish(self):
+        """Complete a routing epoch, collectively when a read group is supplied."""
+        if self.shared_read_group is None:
+            if self.progress is not None:
+                self.progress("execute")
+            self.flush()
+        else:
+            self.shared_read_group.finish(self)
+
+    def _execute(self, records):
+        import torch
+
+        if self.shared_read_group is not None:
+            self._validate_source_identities()
         with torch.cuda.device(self.device):
             if self.executor is None:
-                self.executor = self.native.batch_executor(self.device, self.io_threads)
-            try:
-                self.native.batch_execute(
-                    self.executor,
-                    self.records,
-                    torch.cuda.current_stream(self.device).cuda_stream,
-                )
-            finally:
-                self.records = array("Q")
-                self.destinations.clear()
+                if self._gds is not None:
+                    self.executor = self._gds.checkpoint_create(
+                        self.device,
+                        self.io_threads,
+                        self.native.pool_api(),
+                        *(program.function for program in self._copy_programs),
+                    )
+                else:
+                    self.executor = self.native.batch_executor(
+                        self.device, self.io_threads
+                    )
+            execute = (
+                self._gds.checkpoint_execute
+                if self._gds is not None
+                else self.native.batch_execute
+            )
+            execute(
+                self.executor,
+                records,
+                torch.cuda.current_stream(self.device).cuda_stream,
+            )
 
     def materialize(self, source):
         """Read owned transform inputs without routing arithmetic through metadata."""
@@ -171,6 +229,8 @@ class DirectWeightSession:
 
         fd = os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
         self.files.append(fd)
+        if self.shared_read_group is not None:
+            self.file_identities[fd] = self._file_identity(fd)
         size = os.fstat(fd).st_size
         length = int.from_bytes(
             self.native.direct_bytes(self.reader, fd, 0, 8), "little"
@@ -422,7 +482,7 @@ class DirectWeightSession:
                         )
                     )
                 self.destinations.append(destination)
-                if expand:
+                if expand and self._gds is None:
                     self.inplace_transform_bytes += source.nbytes
             else:
                 if not source.is_contiguous() or not destination.is_contiguous():
@@ -437,14 +497,33 @@ class DirectWeightSession:
                 flat = destination.view(-1)
                 for start in range(0, source.numel(), scratch.numel()):
                     count = min(scratch.numel(), source.numel() - start)
-                    self.native.direct_into(
-                        self.reader,
-                        entry.fd,
-                        entry.offset + offset + start * source.element_size(),
-                        count * source.element_size(),
-                        scratch.data_ptr(),
-                        stream,
-                    )
+                    if self._gds is not None:
+                        self._execute(
+                            array(
+                                "Q",
+                                (
+                                    entry.fd,
+                                    entry.offset
+                                    + offset
+                                    + start * source.element_size(),
+                                    count * source.element_size(),
+                                    scratch.data_ptr(),
+                                    0,
+                                    1,
+                                    0,
+                                    0,
+                                ),
+                            )
+                        )
+                    else:
+                        self.native.direct_into(
+                            self.reader,
+                            entry.fd,
+                            entry.offset + offset + start * source.element_size(),
+                            count * source.element_size(),
+                            scratch.data_ptr(),
+                            stream,
+                        )
                     flat[start : start + count].copy_(scratch[:count])
                 self.transform_bytes += source.nbytes
         torch.autograd.graph.increment_version(destination)
@@ -452,12 +531,28 @@ class DirectWeightSession:
         self.loaded_tensors += 1
         return True
 
-    def stats(self):
-        self.flush()
+    def stats(self, *, flush=True):
+        if flush:
+            self.flush()
         io = self.native.direct_stats(self.reader)
         if self.executor is not None:
-            for name, value in self.native.batch_stats(self.executor).items():
+            stats = (
+                self._gds.checkpoint_stats
+                if self._gds is not None
+                else self.native.batch_stats
+            )
+            for name, value in stats(self.executor).items():
                 io[name] = io.get(name, 0) + value
+        if self.shared_read_group is not None:
+            totals = self.shared_read_group.totals
+            io["physical_bytes"] = io.get("physical_bytes", 0) + totals.get("physical_bytes", 0)
+            io["gds_physical_bytes"] = io.get("gds_physical_bytes", 0) + totals.get("physical_bytes", 0)
+            io["reads"] = io.get("reads", 0) + totals.get("reads", 0)
+            io["gpu_scratch_bytes"] = io.get("gpu_scratch_bytes", 0) + totals.get("staging_bytes", 0)
+            if totals.get("epochs", 0):
+                io["gds_enabled"] = 1
+                io["gds_version"] = totals["gds_version"]
+            io["shared_reads"] = dict(totals)
         return {
             **io,
             "payload_bytes": self.payload_bytes,

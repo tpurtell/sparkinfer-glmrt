@@ -6,10 +6,13 @@ GPU tests (added with the kernels) compare the CuTe DSL op against them.
 
 from __future__ import annotations
 
+import gc
 import math
 
 import pytest
 import torch
+
+from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 
 from b12x.sequence._shared.kda_math import kda_beta, kda_log_decay, l2_normalize
 from b12x.sequence.kda_prefill.reference import (
@@ -312,7 +315,19 @@ def test_run_rejects_lower_bound_outside_range() -> None:
 
 # ---------------------------------------------------------------------------
 # GPU: prologue and prepare kernels against the chunk mirror trace.
-# ---------------------------------------------------------------------------
+_PREPARATIONS: list[tuple[object, PreparationSession]] = []
+
+
+@pytest.fixture(autouse=True)
+def _prepared_scopes():
+    try:
+        yield
+    finally:
+        gc.collect()
+        while _PREPARATIONS:
+            result, session = _PREPARATIONS.pop()
+            result.close()
+            session.close()
 
 
 def make_binding(
@@ -321,29 +336,21 @@ def make_binding(
     max_tokens: int,
     max_seqs: int,
     final_stride: int = 1,
-    metadata_validation: str = "transactional",
-    policy=None,
     recurrent_state: torch.Tensor | None = None,
+    config=None,
     **caps_extra,
 ):
-    """Bind ``inputs`` (from make_inputs on a CUDA device) at planned capacity."""
-    from b12x.policy import PolicyContext, PolicyMode
-    from b12x.sequence.kda_prefill import _impl as impl
+    """Prepare a real KDA plan and bind caller-owned serving tensors."""
+    from b12x.sequence.kda_prefill import _impl as impl, invocation_from_tensors
 
     device = inputs["q"].device
     heads = int(inputs["q"].shape[1])
-    if recurrent_state is None:
-        recurrent_state = inputs["pool"].clone()
+    recurrent_state = inputs["pool"].clone() if recurrent_state is None else recurrent_state
     caps = impl.Caps(
         device=device, max_tokens=max_tokens, max_seqs=max_seqs,
         max_state_slots=int(recurrent_state.shape[0]), heads=heads,
-        null_state_index=inputs["null_state_index"], metadata_validation=metadata_validation,
-        **caps_extra,
+        null_state_index=inputs["null_state_index"], **caps_extra,
     )
-    if policy is None:
-        policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
-    plan = impl.plan(caps, policy=policy)
-    scratch = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device)
 
     def pad_rows(t: torch.Tensor) -> torch.Tensor:
         out = torch.zeros((max_tokens,) + tuple(t.shape[1:]), dtype=t.dtype, device=device)
@@ -355,17 +362,13 @@ def make_binding(
         out[: t.shape[0]] = t
         return out
 
-    final_storage = torch.zeros(
-        (max_seqs, final_stride), dtype=inputs["final"].dtype, device=device
-    )
+    final_storage = torch.zeros((max_seqs, final_stride), dtype=inputs["final"].dtype, device=device)
     final_state_indices = final_storage[:, 0]
     final_state_indices[: inputs["final"].shape[0]] = inputs["final"]
-
     tensors = {
         "q": pad_rows(inputs["q"]), "k": pad_rows(inputs["k"]), "v": pad_rows(inputs["v"]),
         "raw_g": pad_rows(inputs["raw_g"]), "raw_beta": pad_rows(inputs["raw_beta"]),
-        "A_log": inputs["A_log"], "dt_bias": inputs["dt_bias"],
-        "recurrent_state": recurrent_state,
+        "A_log": inputs["A_log"], "dt_bias": inputs["dt_bias"], "recurrent_state": recurrent_state,
         "cu_seqlens": pad_seqs(inputs["cu_seqlens"], extra=1),
         "initial_state_indices": pad_seqs(inputs["initial"]),
         "final_state_indices": final_state_indices,
@@ -375,7 +378,75 @@ def make_binding(
         "num_tokens": torch.tensor([inputs["num_tokens"]], dtype=torch.int32, device=device),
         "output": torch.zeros(max_tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
     }
-    return impl.bind(plan, scratch=scratch, **tensors), tensors
+    override = config
+    plan = impl.plan(
+        caps, invocation=invocation_from_tensors(**tensors), override=override,
+    )
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        binding = state.bind(
+            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **tensors
+        )
+        original_state, original_output = binding.recurrent_state.clone(), binding.output.clone()
+
+        def reset():
+            binding.recurrent_state.copy_(original_state)
+            binding.output.copy_(original_output)
+
+        return PreparedCall(
+            run=lambda: state.run(binding, lower_bound=inputs["lower_bound"]),
+            output=binding.output, reset=reset, restore=reset,
+        )
+
+    request = plan.request(
+        name=f"kda-prefill-{id(tensors)}", prepare_call=prepare_call,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    result = session.prepare((request,))
+    state = require_prepared(plan, "sequence.kda_prefill")
+    (spec,) = state.layout.scratch_specs()
+    _PREPARATIONS.append((result, session))
+    return impl.bind(
+        plan, scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device), **tensors
+    ), tensors
+
+def _prepare_tensors(caps, tensors: dict[str, torch.Tensor], *, lower_bound: float):
+    """Session-prepare an already-shaped binding without replacing its views."""
+    from b12x.sequence.kda_prefill import _impl as impl, invocation_from_tensors
+
+    plan = impl.plan(caps, invocation=invocation_from_tensors(**tensors))
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        binding = state.bind(
+            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=caps.device), **tensors
+        )
+        original_state, original_output = binding.recurrent_state.clone(), binding.output.clone()
+
+        def reset():
+            binding.recurrent_state.copy_(original_state)
+            binding.output.copy_(original_output)
+
+        return PreparedCall(
+            run=lambda: state.run(binding, lower_bound=lower_bound),
+            output=binding.output, reset=reset, restore=reset,
+        )
+
+    request = plan.request(
+        name=f"kda-prefill-{id(tensors)}", prepare_call=prepare_call,
+    )
+    session = PreparationSession(device=caps.device, autotune=False)
+    result = session.prepare((request,))
+    state = require_prepared(plan, "sequence.kda_prefill")
+    (spec,) = state.layout.scratch_specs()
+    _PREPARATIONS.append((result, session))
+    return impl.bind(
+        plan,
+        scratch=torch.empty(spec.shape, dtype=spec.dtype, device=caps.device),
+        **tensors,
+    )
+
 
 
 def _mirror_trace(inputs: dict):
@@ -411,7 +482,6 @@ def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
     run_prologue(binding)
     run_prepare(binding, lower_bound=lower_bound, scale=HEAD_DIM**-0.5, eps=1e-6)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0
     trace = _mirror_trace(inputs)
     counts = [(length + 15) // 16 for length in lengths]
     order = sorted(range(len(lengths)), key=lambda seq: (-counts[seq], seq))
@@ -426,7 +496,7 @@ def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
         expected_band.append(expected_band[-1] + sum(1 for c in counts if c > local))
     assert band_base[: len(expected_band)] == expected_band
     total = sum(counts)
-    assert band_base[binding.plan.caps.tiles_capacity + 1] == total
+    assert band_base[binding._state.caps.tiles_capacity + 1] == total
     pos_seq = binding.pos_seq.tolist()
     pos_local = binding.pos_local.tolist()
     for seq in range(len(lengths)):
@@ -454,48 +524,6 @@ def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
         rows = min(16, lengths[seq] - 16 * local)
         assert torch.count_nonzero(tiles["k_tilde"][tile, :, rows:]) == 0
         assert torch.count_nonzero(tiles["k_r"][tile, :, rows:]) == 0
-
-
-@pytest.mark.parametrize(
-    "mutate,bit",
-    [
-        (lambda t: t["final_state_indices"].__setitem__(1, int(t["final_state_indices"][0])), 1),
-        (lambda t: t["final_state_indices"].__setitem__(1, int(t["initial_state_indices"][0])), 1),
-        (lambda t: t["cu_seqlens"].__setitem__(2, 30), 2),
-        (lambda t: t["cu_seqlens"].__setitem__(1, 45), 2),
-        (lambda t: t["num_tokens"].fill_(10_000), 2),
-        (lambda t: t["num_seqs"].fill_(9), 2),
-        (lambda t: t["final_state_indices"].__setitem__(0, 99), 4),
-        (lambda t: t["initial_state_indices"].__setitem__(0, -1), 4),
-        (lambda t: t["checkpoint_offsets"].__setitem__(0, 17), 8),
-        (lambda t: t["checkpoint_offsets"].__setitem__(0, 64), 8),
-    ],
-    ids=[
-        "dup-final", "final-is-other-initial", "cu-end-mismatch", "cu-nonmonotonic",
-        "num-tokens-over", "num-seqs-over", "final-out-of-range", "initial-negative",
-        "ckpt-unaligned", "ckpt-past-length",
-    ],
-)
-def test_prologue_reports_malformed_metadata(mutate, bit) -> None:
-    from ..conftest import require_b12x
-    from b12x.sequence._shared.delta_prefill._cute_kernels import run_prepare, run_prologue
-
-    device = require_b12x()
-    inputs = make_inputs(lengths=[20, 20], heads=2, seed=43, device=device, checkpoint=[(16, 6), (0, 0)])
-    binding, tensors = make_binding(inputs, max_tokens=64, max_seqs=8)
-    mutate(tensors)
-    binding.ws.fill_(0xFF)
-    run_prologue(binding)
-    run_prepare(binding, lower_bound=-5.0, scale=HEAD_DIM**-0.5, eps=1e-6)
-    torch.cuda.synchronize(device)
-    assert binding.error_code.item() & bit
-    assert (binding.ws == 0xFF).all(), "prepare must not run after a metadata error"
-    trusted, trusted_tensors = make_binding(inputs, max_tokens=64, max_seqs=8, metadata_validation="trusted")
-    mutate(trusted_tensors)
-    trusted.error_code.fill_(0)
-    run_prologue(trusted)
-    torch.cuda.synchronize(device)
-    assert trusted.error_code.item() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +563,6 @@ def test_op_matches_reference_single_sequence(tokens) -> None:
     binding, tensors = make_binding(inputs, max_tokens=4096, max_seqs=4)
     _run(binding, inputs)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0
     _assert_op_matches_oracle(binding, tensors, inputs)
 
 
@@ -548,7 +575,6 @@ def test_op_serving_head_geometries(heads) -> None:
     binding, tensors = make_binding(inputs, max_tokens=1024, max_seqs=4)
     _run(binding, inputs)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0
     _assert_op_matches_oracle(binding, tensors, inputs)
 
 
@@ -576,7 +602,6 @@ def test_op_varlen_packed_with_null_and_inplace_slots(lengths) -> None:
     binding, tensors = make_binding(inputs, max_tokens=1024, max_seqs=16)
     _run(binding, inputs)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0
     tokens = inputs["num_tokens"]
     expected_out, expected_pool = run_oracle(inputs)
     if tokens:
@@ -706,11 +731,9 @@ def test_op_near_collinear_long_sequence_remains_finite(high_state_slots) -> Non
     final_slot = int(inputs["final"][0])
     binding.output.fill_(float("nan"))
     tensors["recurrent_state"][final_slot].fill_(float("nan"))
-    binding.error_code.fill_(-1)
     _run(binding, inputs)
     torch.cuda.synchronize(device)
 
-    assert binding.error_code.item() == 0
     output_nonfinite = (~torch.isfinite(binding.output[:tokens])).sum().item()
     state_nonfinite = (
         ~torch.isfinite(tensors["recurrent_state"][final_slot])
@@ -786,28 +809,22 @@ def test_op_cuda_graph_replay_is_allocation_free_with_poison() -> None:
     torch.cuda.synchronize(device)
     assert torch.cuda.memory_allocated(device) == allocated_before
     assert addresses == (tensors["recurrent_state"].data_ptr(), binding.output.data_ptr(), binding.scratch.data_ptr())
-    assert binding.error_code.item() == 0
     _assert_op_matches_oracle(binding, tensors, inputs)
     assert torch.isnan(binding.output[inputs["num_tokens"] :].float()).all()
-
+    graph.reset()
 
 def test_op_three_window_ring_reuse_is_capture_safe() -> None:
     """Three populated windows preserve results and fixed storage on replay."""
     from ..conftest import require_b12x
-    from b12x.policy import PolicyContext, PolicyMode
-    from b12x.policy.components import KDA_PREFILL
     from b12x.sequence.kda_prefill import KdaPrefillConfig
 
     device = require_b12x()
     inputs = make_inputs(lengths=[160], heads=2, seed=74, device=device, state_slots=4)
-    policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY).with_override(
-        KDA_PREFILL,
-        KdaPrefillConfig(v_split=64, k_split=1, stages=3, window_tiles=4),
-    )
-    binding, tensors = make_binding(inputs, max_tokens=160, max_seqs=1, policy=policy)
+    config = KdaPrefillConfig(v_split=64, k_split=1, stages=3, window_tiles=4)
+    binding, tensors = make_binding(inputs, max_tokens=160, max_seqs=1, config=config)
 
-    assert binding.plan.window_tiles == 4
-    assert binding.plan.launched_windows(inputs["num_tokens"], inputs["num_seqs"]) == 3
+    assert binding._state.window_tiles == 4
+    assert binding._state.launched_windows(inputs["num_tokens"], inputs["num_seqs"]) == 3
     scratch_capacity = binding.scratch.numel()
     addresses = (
         tensors["recurrent_state"].data_ptr(),
@@ -818,7 +835,6 @@ def test_op_three_window_ring_reuse_is_capture_safe() -> None:
 
     _run(binding, inputs)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0
     _assert_op_matches_oracle(binding, tensors, inputs)
 
     tensors["recurrent_state"].copy_(inputs["pool"])
@@ -843,8 +859,8 @@ def test_op_three_window_ring_reuse_is_capture_safe() -> None:
         binding.scratch.data_ptr(),
         binding.ws.data_ptr(),
     )
-    assert binding.error_code.item() == 0
     _assert_op_matches_oracle(binding, tensors, inputs)
+    graph.reset()
 
 
 def test_op_cuda_graph_replay_uses_device_metadata() -> None:
@@ -873,23 +889,8 @@ def test_op_cuda_graph_replay_uses_device_metadata() -> None:
     tensors["dt_bias"].copy_(second["dt_bias"])
     graph.replay()
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0
     _assert_op_matches_oracle(binding, tensors, second)
-
-
-def test_op_invalid_metadata_poisons_output_and_preserves_state() -> None:
-    from ..conftest import require_b12x
-
-    device = require_b12x()
-    inputs = make_inputs(lengths=[20, 20], heads=2, seed=72, device=device)
-    binding, tensors = make_binding(inputs, max_tokens=64, max_seqs=8)
-    tensors["final_state_indices"][1] = int(tensors["final_state_indices"][0])
-    binding.output.zero_()
-    _run(binding, inputs)
-    torch.cuda.synchronize(device)
-    assert binding.error_code.item() & 1
-    assert torch.isnan(binding.output.float()).all()
-    torch.testing.assert_close(tensors["recurrent_state"], inputs["pool"], rtol=0, atol=0)
+    graph.reset()
 
 
 def test_op_read_only_inputs_are_immutable() -> None:
@@ -912,9 +913,8 @@ def test_op_read_only_inputs_are_immutable() -> None:
         torch.testing.assert_close(tensors[name], before, rtol=0, atol=0)
 
 
-def test_op_trusted_mode_accepts_strided_views() -> None:
+def test_op_accepts_strided_views() -> None:
     from ..conftest import require_b12x
-    from b12x.policy import PolicyContext, PolicyMode
     from b12x.sequence.kda_prefill import _impl as impl
 
     device = require_b12x()
@@ -938,27 +938,21 @@ def test_op_trusted_mode_accepts_strided_views() -> None:
         and not raw_beta.is_contiguous()
         and not final_state_indices.is_contiguous()
     )
-    caps = impl.Caps(device=device, max_tokens=tokens, max_seqs=2, max_state_slots=8, heads=heads, metadata_validation="trusted")
-    plan = impl.plan(caps, policy=PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY))
-    scratch = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device)
+    caps = impl.Caps(device=device, max_tokens=tokens, max_seqs=2, max_state_slots=8, heads=heads)
     pool = inputs["pool"].clone()
-    binding = impl.bind(
-        plan, scratch=scratch, q=q, k=k, v=v, raw_g=inputs["raw_g"], raw_beta=raw_beta,
-        A_log=inputs["A_log"], dt_bias=inputs["dt_bias"], recurrent_state=pool,
-        cu_seqlens=inputs["cu_seqlens"], initial_state_indices=inputs["initial"],
-        final_state_indices=final_state_indices,
-        checkpoint_state_indices=inputs["checkpoint_slots"],
-        checkpoint_offsets=inputs["checkpoint_offsets"],
-        num_seqs=torch.tensor([2], dtype=torch.int32, device=device),
-        num_tokens=torch.tensor([tokens], dtype=torch.int32, device=device),
-        output=torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
-    )
-    # A run owns the error word: trusted mode clears it, so scratch that was
-    # never zeroed cannot poison the output.
-    binding.error_code.fill_(7)
+    binding = _prepare_tensors(caps, {
+        "q": q, "k": k, "v": v, "raw_g": inputs["raw_g"], "raw_beta": raw_beta,
+        "A_log": inputs["A_log"], "dt_bias": inputs["dt_bias"], "recurrent_state": pool,
+        "cu_seqlens": inputs["cu_seqlens"], "initial_state_indices": inputs["initial"],
+        "final_state_indices": final_state_indices,
+        "checkpoint_state_indices": inputs["checkpoint_slots"],
+        "checkpoint_offsets": inputs["checkpoint_offsets"],
+        "num_seqs": torch.tensor([2], dtype=torch.int32, device=device),
+        "num_tokens": torch.tensor([tokens], dtype=torch.int32, device=device),
+        "output": torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
+    }, lower_bound=-5.0)
     impl.run(binding, lower_bound=-5.0)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0, "trusted mode must clear the error code"
     expected_out, expected_pool = run_oracle(inputs)
     assert_kda_close("out", expected_out, binding.output, ratio=1e-2)
     for slot in inputs["final"].tolist():
@@ -967,7 +961,7 @@ def test_op_trusted_mode_accepts_strided_views() -> None:
 
 def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
     from ..conftest import require_b12x
-    from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.sequence._shared.delta_prefill import _cute_kernels as kernels
 
     device = require_b12x()
@@ -980,8 +974,7 @@ def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
         kernels._PREPARE_CACHE[kernels._prepare_key(binding)],
         kernels._RECURRENCE_CACHE[kernels._recurrence_key(binding)],
     )
-    freeze_kernel_resolution("kda prefill reuse test")
-    try:
+    with kernel_resolution_guard('kda prefill reuse test'):
         for lengths in ([128], [40, 41, 47]):
             live = make_inputs(lengths=lengths, heads=2, seed=76, device=device, state_slots=8)
             for name in ("q", "k", "v", "raw_g", "raw_beta"):
@@ -999,8 +992,6 @@ def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
             _run(binding, live)
             torch.cuda.synchronize(device)
             _assert_op_matches_oracle(binding, tensors, live)
-    finally:
-        unfreeze_kernel_resolution()
     assert launchers == (
         kernels._PROLOGUE_CACHE[kernels._prologue_key(binding)],
         kernels._PREPARE_CACHE[kernels._prepare_key(binding)],
@@ -1010,7 +1001,6 @@ def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
 
 def test_op_state_slot_offset_past_int32_boundary() -> None:
     from ..conftest import require_b12x
-    from b12x.policy import PolicyContext, PolicyMode
     from b12x.sequence.kda_prefill import _impl as impl
 
     device = require_b12x()
@@ -1025,23 +1015,20 @@ def test_op_state_slot_offset_past_int32_boundary() -> None:
     pool[tail_slot - 2].copy_(inputs["pool"][2])
     tokens = inputs["num_tokens"]
     caps = impl.Caps(device=device, max_tokens=tokens, max_seqs=1, max_state_slots=tail_slot + 1, heads=heads, checkpoint_export=True)
-    plan = impl.plan(caps, policy=PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY))
-    scratch = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device)
-    binding = impl.bind(
-        plan, scratch=scratch, q=inputs["q"], k=inputs["k"], v=inputs["v"], raw_g=inputs["raw_g"],
-        raw_beta=inputs["raw_beta"], A_log=inputs["A_log"], dt_bias=inputs["dt_bias"], recurrent_state=pool,
-        cu_seqlens=inputs["cu_seqlens"],
-        initial_state_indices=torch.tensor([tail_slot], dtype=torch.int64, device=device),
-        final_state_indices=torch.tensor([tail_slot - 1], dtype=torch.int64, device=device),
-        checkpoint_state_indices=torch.tensor([tail_slot - 2], dtype=torch.int64, device=device),
-        checkpoint_offsets=torch.tensor([16], dtype=torch.int32, device=device),
-        num_seqs=torch.tensor([1], dtype=torch.int32, device=device),
-        num_tokens=torch.tensor([tokens], dtype=torch.int32, device=device),
-        output=torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
-    )
+    binding = _prepare_tensors(caps, {
+        "q": inputs["q"], "k": inputs["k"], "v": inputs["v"], "raw_g": inputs["raw_g"],
+        "raw_beta": inputs["raw_beta"], "A_log": inputs["A_log"], "dt_bias": inputs["dt_bias"],
+        "recurrent_state": pool, "cu_seqlens": inputs["cu_seqlens"],
+        "initial_state_indices": torch.tensor([tail_slot], dtype=torch.int64, device=device),
+        "final_state_indices": torch.tensor([tail_slot - 1], dtype=torch.int64, device=device),
+        "checkpoint_state_indices": torch.tensor([tail_slot - 2], dtype=torch.int64, device=device),
+        "checkpoint_offsets": torch.tensor([16], dtype=torch.int32, device=device),
+        "num_seqs": torch.tensor([1], dtype=torch.int32, device=device),
+        "num_tokens": torch.tensor([tokens], dtype=torch.int32, device=device),
+        "output": torch.zeros(tokens, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
+    }, lower_bound=-5.0)
     impl.run(binding, lower_bound=-5.0)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0
     compact = make_inputs(lengths=[40], heads=heads, seed=77, device=device, state_slots=3, checkpoint=[(16, 2)])
     compact_binding, compact_tensors = make_binding(compact, max_tokens=tokens, max_seqs=1, checkpoint_export=True)
     _run(compact_binding, compact)
@@ -1062,7 +1049,6 @@ def test_op_zero_tokens_copies_states_only() -> None:
     binding.output.fill_(float("nan"))
     _run(binding, inputs)
     torch.cuda.synchronize(device)
-    assert binding.error_code.item() == 0
     assert torch.isnan(binding.output.float()).all()
     for request in range(2):
         torch.testing.assert_close(

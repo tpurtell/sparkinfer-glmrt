@@ -56,21 +56,15 @@ QUANT_NAME = "b12x_fp6"
 # Unquantized bf16 linears with N <= MAX_OUT and K >= MIN_IN route through the
 # b12x small-N GEMV.  See b12x.gemm.bf16_gemv for the thresholds.
 from b12x.gemm.bf16_gemv import (  # noqa: E402
+    SMALL_M_MAX,
     SMALL_N_GEMV_MAX_OUT,
     SMALL_N_GEMV_MIN_IN,
     is_disabled as _bf16_gemv_disabled,
-    precompile as precompile_bf16_gemv_small_n,
 )
+_registered = False
+_CONFIG_CLS: type | None = None
+logger = logging.getLogger("vllm.b12x_fp6")
 
-# Fallback decode token counts warm-run per MoE layer at load time.
-_MOE_WARM_DECODE_MS = (1, 2, 3, 4, 5, 8)
-_MOE_WARM_MAX_M = 64
-
-# Dense decode/verify token counts warm-run at load time.
-_DENSE_WARM_DECODE_MS = (1, 2, 4, 5, 8, 16)
-_DENSE_WARMED_SHAPES: set[tuple] = set()
-
-# Fused vLLM module suffix -> ordered HF constituent projection names.
 _FUSED_PARTS: dict[str, tuple[str, ...]] = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
@@ -78,32 +72,6 @@ _FUSED_PARTS: dict[str, tuple[str, ...]] = {
     "in_proj_ba": ("in_proj_b", "in_proj_a"),
 }
 
-_registered = False
-_CONFIG_CLS: Optional[type] = None
-logger = logging.getLogger("b12x.vllm_fp6")
-
-
-def _moe_warm_decode_ms() -> tuple[int, ...]:
-    """Decode Ms to warm-run per MoE layer before CUDA-graph capture."""
-    env = os.environ.get("B12X_MOE_WARM_MS", "")
-    env = env.strip()
-    if env:
-        try:
-            ms = {int(v) for v in env.replace(",", " ").split()}
-            return tuple(sorted(m for m in ms if 1 <= m <= _MOE_WARM_MAX_M))
-        except ValueError:
-            logger.warning("Ignoring malformed B12X_MOE_WARM_MS=%r", env)
-    sizes = set(_MOE_WARM_DECODE_MS)
-    try:
-        from vllm.config import get_current_vllm_config
-
-        cfg = get_current_vllm_config()
-        cap = getattr(cfg.compilation_config, "cudagraph_capture_sizes", None)
-        if cap:
-            sizes.update(int(s) for s in cap)
-    except Exception:
-        logger.debug("vLLM config unavailable for MoE warm sizes", exc_info=True)
-    return tuple(sorted(s for s in sizes if 1 <= s <= _MOE_WARM_MAX_M))
 
 
 def _rebuild_b12x_fp6_config(model_dir: Optional[str]) -> Any:
@@ -154,6 +122,217 @@ def register_b12x_fp6() -> None:
         ModelWeightParameter,
         PerTensorScaleParameter,
     )
+    from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+        B12xPreparationUnit,
+        b12x_layer,
+        b12x_layer_prefix,
+        register_b12x_layer,
+    )
+    from vllm.utils.torch_utils import (
+        LayerNameType,
+        _encode_layer_name,
+        _resolve_layer_name,
+        direct_register_custom_op,
+    )
+
+    # ``LayerNameType`` is only a local import here (this module stays vLLM-free
+    # at plain import time), but ``infer_schema`` resolves string annotations
+    # against ``op_func.__globals__`` (the module's globals, not this closure).
+    # Assign real annotation objects after ``def`` so it never needs to eval a
+    # name it cannot see; ``from __future__ import annotations`` only affects
+    # the ``def`` statement's own syntax, not a later ``__annotations__`` write.
+    _op_annotations = {
+        "x": torch.Tensor, "out_features": int,
+        "layer_name": LayerNameType, "return": torch.Tensor,
+    }
+
+    def _b12x_fp6_linear(x, out_features, layer_name):
+        layer = b12x_layer(_resolve_layer_name(layer_name))
+        plan = layer.b12x_fp6_provider.plan_for(int(x.shape[0]))
+        return torch.ops.b12x.fp6_dense_linear(
+            x, layer.b12x_fp6_gemm_weight, layer.b12x_fp6_scales,
+            layer.b12x_fp6_gscale, layer.b12x_fp6_fmt, out_features,
+            layer.b12x_fp6_in_features, plan.handle, layer.b12x_fp6_act_fmt,
+        )
+    _b12x_fp6_linear.__annotations__ = dict(_op_annotations)
+
+    def _b12x_fp6_linear_fake(x, out_features, layer_name):
+        del layer_name
+        return x.new_empty((x.shape[0], out_features), dtype=torch.bfloat16)
+
+    direct_register_custom_op(
+        op_name="b12x_fp6_linear",
+        op_func=_b12x_fp6_linear,
+        fake_impl=_b12x_fp6_linear_fake,
+    )
+
+    def _b12x_small_n_bf16_linear(x, out_features, layer_name):
+        from b12x.gemm.bf16_gemv import mm
+
+        del out_features
+        layer = b12x_layer(_resolve_layer_name(layer_name))
+        plan = layer.b12x_gemv_provider.plan_for(int(x.shape[0]))
+        return mm(x, layer.b12x_gemv_weight, plan=plan)
+    _b12x_small_n_bf16_linear.__annotations__ = dict(_op_annotations)
+
+    def _b12x_small_n_bf16_linear_fake(x, out_features, layer_name):
+        del layer_name
+        return x.new_empty((x.shape[0], out_features), dtype=torch.bfloat16)
+
+    direct_register_custom_op(
+        op_name="b12x_small_n_bf16_linear",
+        op_func=_b12x_small_n_bf16_linear,
+        fake_impl=_b12x_small_n_bf16_linear_fake,
+    )
+
+    class _FP6DenseProvider:
+        """One loaded FP6 linear owner holding exact-M plans for its lifetime."""
+
+        def __init__(self, layer: Any) -> None:
+            self.layer = layer
+            self.plans: dict[int, Any] = {}
+            self.prefix = str(getattr(layer, "prefix", "") or "fp6_linear")
+
+        def get_b12x_preparation_units(self, layer: Any, workload: Any):
+            """Declare this linear's exact-M plans for the weights stage."""
+            del layer
+            if workload.stage != "weights":
+                return ()
+            from b12x.preparation import PreparedCall
+            from b12x.quantization.mxfp6._preparation import Mxfp6DenseQuery, plan as plan_query
+            from b12x.quantization.mxfp6.fp6_dense_weights import _DENSE_PER_ROW_GS
+
+            target = self.layer
+            weight = target.b12x_fp6_gemm_weight
+            if not self.plans:
+                storage = (
+                    "packed" if weight.shape[1] * 4 == target.b12x_fp6_in_features * 3
+                    else "expanded"
+                )
+                for m in workload.token_counts:
+                    m = int(m)
+                    query = Mxfp6DenseQuery(
+                        max_tokens=m, in_features=target.b12x_fp6_in_features,
+                        out_features=target.b12x_fp6_out_features,
+                        weight_format=target.b12x_fp6_fmt,
+                        activation_format=target.b12x_fp6_act_fmt,
+                        weight_storage=storage, global_scale_kind="multiplier",
+                        output_mode="functional", per_row_global_scale=_DENSE_PER_ROW_GS,
+                    )
+                    self.plans[m] = plan_query(query)
+            requests = []
+            for m, declaration in self.plans.items():
+                name = f"fp6-dense:{self.prefix}:m{m}:lane{workload.lane}"
+                def prepare(state, *, rows=m):
+                    source = torch.zeros(
+                        (rows, state.query.in_features), dtype=torch.bfloat16,
+                        device=weight.device,
+                    )
+                    output = torch.empty(
+                        (rows, state.query.out_features), dtype=torch.bfloat16,
+                        device=weight.device,
+                    )
+                    return PreparedCall(
+                        run=lambda: state.run(
+                            source, weight, target.b12x_fp6_scales,
+                            target.b12x_fp6_gscale, out=output.unsqueeze(-1),
+                        ),
+                        output=output, owners=(source, output),
+                    )
+                requests.append(declaration.request(
+                    name=name,
+                    prepare_call=prepare,
+                ))
+            if not requests:
+                return ()
+            return (B12xPreparationUnit(
+                name="FP6_DENSE", key=(self.prefix, tuple(sorted(self.plans))),
+                requests=tuple(requests), stage="weights",
+                autotune=not workload.eager_only,
+            ),)
+
+        def plan_for(self, tokens: int):
+            try:
+                return self.plans[tokens]
+            except KeyError:
+                raise RuntimeError(
+                    f"FP6 dense M={tokens} was not prepared for {self.prefix}"
+                ) from None
+
+
+    class _BF16GemvProvider:
+        """One loaded BF16 small-N linear owner holding exact-M plans for its lifetime."""
+
+        def __init__(self, layer: Any, weight: torch.Tensor) -> None:
+            self.layer = layer
+            self.weight = weight
+            self.plans: dict[int, Any] = {}
+            self.prefix = str(getattr(layer, "prefix", "") or "bf16_gemv")
+
+        def get_b12x_preparation_units(self, layer: Any, workload: Any):
+            """Declare this linear's exact-M plans for the weights stage."""
+            del layer
+            if workload.stage != "weights":
+                return ()
+            from b12x.gemm.bf16_gemv import GemvQuery, plan as plan_query
+            from b12x.preparation import PreparedCall
+
+            if not self.plans:
+                for m in sorted({int(count) for count in workload.token_counts}):
+                    if not 1 <= m <= SMALL_M_MAX:
+                        continue
+                    query = GemvQuery(
+                        source_dtype="bfloat16",
+                        weight_dtype="bfloat16",
+                        max_rows=m,
+                        in_features=int(self.weight.shape[1]),
+                        out_features=int(self.weight.shape[0]),
+                        source_contiguous=True,
+                        source_aligned=True,
+                        weight_contiguous=True,
+                        weight_aligned=True,
+                    )
+                    self.plans[m] = plan_query(query)
+            if not self.plans:
+                return ()
+            requests = []
+            for m, declaration in self.plans.items():
+                name = (
+                    f"bf16-gemv:{self.prefix}:{id(self.layer)}:"
+                    f"m{m}:lane{workload.lane}"
+                )
+
+                def prepare(state, *, rows=m):
+                    source = torch.randn(
+                        (rows, state.query.in_features),
+                        dtype=torch.bfloat16,
+                        device=self.weight.device,
+                        generator=torch.Generator(device=self.weight.device).manual_seed(17),
+                    )
+                    return PreparedCall(
+                        run=lambda: state.run(source, self.weight),
+                        owners=(source,),
+                    )
+
+                requests.append(declaration.request(
+                    name=name,
+                    prepare_call=prepare,
+                ))
+            return (B12xPreparationUnit(
+                name="BF16_GEMV", key=(self.prefix, id(self.layer), tuple(sorted(self.plans))),
+                requests=tuple(requests), stage="weights",
+                autotune=not workload.eager_only,
+            ),)
+
+        def plan_for(self, tokens: int):
+            try:
+                return self.plans[tokens]
+            except KeyError:
+                raise RuntimeError(
+                    f"BF16 GEMV M={tokens} was not prepared for {self.prefix}"
+                ) from None
+
 
     class _VllmLinearMethod(LinearMethodBase):  # type: ignore[misc]
         def __init__(
@@ -270,6 +449,13 @@ def register_b12x_fp6() -> None:
             layer.b12x_fp6_act_fmt = w.act_fmt
             layer.b12x_fp6_out_features = w.out_features
             layer.b12x_fp6_in_features = w.in_features
+            provider = _FP6DenseProvider(layer)
+            layer.b12x_fp6_provider = provider
+            name = b12x_layer_prefix(layer)
+            layer.b12x_layer_name = _encode_layer_name(name)
+            register_b12x_layer(name, layer)
+            if not getattr(layer, "b12x_preparation_suppressed", False):
+                set_b12x_preparation_provider(layer, provider)
             if self.act_fmt_overrides and act_fmt != self.default_act_fmt:
                 logger.info(
                     "B12X FP6: act_fmt override %s -> %s (default %s)",
@@ -277,46 +463,13 @@ def register_b12x_fp6() -> None:
                     act_fmt,
                     self.default_act_fmt,
                 )
-            self._warm_dense_decode(layer)
-
-        def _warm_dense_decode(self, layer: Any) -> None:
-            gemm_w = layer.b12x_fp6_gemm_weight
-            if not gemm_w.is_cuda:
-                return
-            key = (
-                layer.b12x_fp6_out_features,
-                layer.b12x_fp6_in_features,
-                layer.b12x_fp6_fmt,
-                layer.b12x_fp6_act_fmt,
-                tuple(gemm_w.shape),
-            )
-            if key in _DENSE_WARMED_SHAPES:
-                return
-            _DENSE_WARMED_SHAPES.add(key)
-            for m in _DENSE_WARM_DECODE_MS:
-                x = torch.zeros(
-                    m,
-                    layer.b12x_fp6_in_features,
-                    dtype=torch.bfloat16,
-                    device=gemm_w.device,
-                )
-                self.apply(layer, x)
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
 
         def apply(
             self, layer: Any, x: torch.Tensor, bias: Optional[torch.Tensor] = None
         ) -> torch.Tensor:
             x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
-            y = torch.ops.b12x.fp6_dense_linear(
-                x2d.to(torch.bfloat16),
-                layer.b12x_fp6_gemm_weight,
-                layer.b12x_fp6_scales,
-                layer.b12x_fp6_gscale,
-                layer.b12x_fp6_fmt,
-                layer.b12x_fp6_out_features,
-                layer.b12x_fp6_in_features,
-                layer.b12x_fp6_act_fmt,
+            y = torch.ops.vllm.b12x_fp6_linear(
+                x2d.to(torch.bfloat16), layer.b12x_fp6_out_features, layer.b12x_layer_name,
             )
             if x.dim() > 2:
                 y = y.reshape(*x.shape[:-1], y.shape[-1])
@@ -335,26 +488,50 @@ def register_b12x_fp6() -> None:
     class _VllmSmallNBF16Method(UnquantizedLinearMethod):  # type: ignore[misc]
         def process_weights_after_loading(self, layer: Any) -> None:
             super().process_weights_after_loading(layer)
-            import b12x.gemm.bf16_gemv  # noqa: F401
 
-            w = layer.weight
-            if w.dim() == 2 and w.is_cuda:
-                layer.b12x_gemv_weight = w.data.detach().clone().contiguous()
-                precompile_bf16_gemv_small_n(layer.b12x_gemv_weight, log=logger)
-
+            weight = layer.weight
+            if (
+                weight.dim() != 2
+                or not weight.is_cuda
+                or weight.dtype != torch.bfloat16
+                or weight.shape[1] % 8
+            ):
+                return
+            # Retain the existing contiguous small-N GEMV weight representation.
+            gemv_weight = weight.data.detach().clone().contiguous()
+            if gemv_weight.data_ptr() % 16:
+                return
+            provider = _BF16GemvProvider(layer, gemv_weight)
+            layer.b12x_gemv_weight = gemv_weight
+            layer.b12x_gemv_provider = provider
+            name = b12x_layer_prefix(layer)
+            layer.b12x_layer_name = _encode_layer_name(name)
+            register_b12x_layer(name, layer)
+            if not getattr(layer, "b12x_preparation_suppressed", False):
+                set_b12x_preparation_provider(layer, provider)
         def apply(
             self, layer: Any, x: torch.Tensor, bias: Optional[torch.Tensor] = None
         ) -> torch.Tensor:
-            w = getattr(layer, "b12x_gemv_weight", None)
+            provider = getattr(layer, "b12x_gemv_provider", None)
+            weight = getattr(layer, "b12x_gemv_weight", None)
             if (
-                w is not None
+                provider is not None
                 and bias is None
                 and x.dtype == torch.bfloat16
-                and w.dtype == torch.bfloat16
+                and x.is_contiguous()
+                and weight.dtype == torch.bfloat16
             ):
                 x2d = x.reshape(-1, x.shape[-1])
-                y = torch.ops.b12x.bf16_gemv_small_n(x2d, w)
-                return y.reshape(*x.shape[:-1], w.shape[0])
+                rows = int(x2d.shape[0])
+                if (
+                    1 <= rows <= SMALL_M_MAX
+                    and x2d.is_contiguous()
+                    and x2d.data_ptr() % 16 == 0
+                ):
+                    y = torch.ops.vllm.b12x_small_n_bf16_linear(
+                        x2d, weight.shape[0], layer.b12x_layer_name,
+                    )
+                    return y.reshape(*x.shape[:-1], weight.shape[0])
             return super().apply(layer, x, bias)
 
     try:
@@ -532,30 +709,6 @@ def register_b12x_fp6() -> None:
                     getattr(layer, "apply_router_weight_on_input", False)
                 ),
             )
-            if dev.type == "cuda":
-                topk = int(getattr(self.moe, "experts_per_token", 0) or 8)
-                router_on_input = bool(
-                    getattr(layer, "apply_router_weight_on_input", False)
-                )
-                for m in _moe_warm_decode_ms():
-                    x = torch.zeros(m, k, dtype=torch.bfloat16, device=dev)
-                    ids = (
-                        torch.arange(m * topk, dtype=torch.int32, device=dev)
-                        .remainder(e)
-                        .reshape(m, topk)
-                    )
-                    w = torch.full(
-                        (m, topk), 1.0 / topk, dtype=torch.float32, device=dev
-                    )
-                    self.core.apply(
-                        x,
-                        w,
-                        ids,
-                        apply_router_weight_on_input=router_on_input,
-                        output=self._output_for(x),
-                    )
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
 
         def apply(
             self,

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the b12x project
-"""Benchmark complete io_uring + O_DIRECT PLE transactions on changing queries.
+"""Benchmark complete disk PLE transactions with balanced transport ordering.
 
 Uses physical temporary files, not sparse files. The default NVFP4 geometry
 creates a 26.82 GiB table. Only the fixture's write cache is dropped; no global
@@ -13,7 +13,9 @@ compilation before measurement; there is no whole-table prewarm.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import json
+import hashlib
 import os
 import pathlib
 import statistics
@@ -30,6 +32,7 @@ from cuda.bindings import runtime as cudart
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from b12x.sequence import ple_embedding
+from b12x.preparation import PreparedCall, PreparationSession
 
 
 @dataclass
@@ -82,8 +85,7 @@ class Files:
 
 
 def make_plan(args: argparse.Namespace) -> Any:
-    return ple_embedding.plan(
-        ple_embedding.Caps(
+    caps = ple_embedding.Caps(
             device=torch.device("cuda", args.device),
             max_tokens=max(args.tokens),
             max_seqs=1,
@@ -99,11 +101,11 @@ def make_plan(args: argparse.Namespace) -> Any:
             table_alignment=128,
             quant_mode="nvfp4_group16",
             table_memory="io_uring",
-        )
     )
+    return ple_embedding.storage_layout(caps, geometry=ple_embedding.compute_geometry(caps))
 
 
-def make_case(args: argparse.Namespace, plan: Any, table: Any, files: Files) -> Case:
+def make_case(args: argparse.Namespace, plan: Any, table: Any, files: Files, resources: ExitStack) -> Case:
     for index, scale, path, offset in files.sources:
         table.add_shard(index, str(path), offset, scale=scale)
     device = plan.caps.device
@@ -117,7 +119,7 @@ def make_case(args: argparse.Namespace, plan: Any, table: Any, files: Files) -> 
         generator=generator,
     )
     spec = plan.scratch_specs()[0]
-    binding = plan.bind(
+    tensors = dict(
         scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device),
         weight=None,
         weight_scale=None,
@@ -136,18 +138,38 @@ def make_case(args: argparse.Namespace, plan: Any, table: Any, files: Files) -> 
         ),
         out=torch.empty(plan.output_shape, dtype=plan.output_dtype, device=device),
     )
+    geometry = ple_embedding.allocate_geometry(plan._hash_layout.geometry, device=device)
+    declaration = ple_embedding.plan(
+        plan.caps, geometry=geometry.geometry, prime_sizes=geometry.prime_sizes,
+        table_offsets=geometry.table_offsets, multipliers=geometry.multipliers,
+        invocation=ple_embedding.invocation_from_tensors(**{k: v for k, v in tensors.items() if k != "scratch"}),
+    )
+    def prepare_call(state):
+        trial = state.bind(**tensors)
+        return PreparedCall(run=lambda: state.run(trial))
+    session = resources.enter_context(PreparationSession(device=device, autotune=False, compile_workers=2))
+    resources.enter_context(session.prepare((declaration.request(name="ple-disk", prepare_call=prepare_call),)))
+    binding = ple_embedding.bind(declaration, **tensors)
     return Case(plan, table, binding)
 
 
 def measure(case: Case, tokens: int, l2_flush: torch.Tensor) -> dict[str, Any]:
     l2_flush.zero_()
     torch.cuda.synchronize()
+    gds = case.table._cache._gds
+    before = gds.native.transport_stats() if gds else None
     start = time.perf_counter_ns()
     case.run(tokens)
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter_ns() - start) / 1e6
     case.check(tokens)
-    return {"wall_ms": elapsed_ms, "io": case.table.stats()}
+    result = {"wall_ms": elapsed_ms, "io": case.table.stats()}
+    if gds:
+        after = gds.native.transport_stats()
+        result["transport"] = {key: after[key] - before[key] for key in after}
+        if any(result["transport"][key] for key in ("posix_ops", "aio_ops", "iouring_ops", "read_errors")):
+            raise RuntimeError(f"GDS direct-path qualification failed: {result['transport']}")
+    return result
 
 
 def query_stream(args: argparse.Namespace, tokens: int) -> list[torch.Tensor]:
@@ -184,6 +206,7 @@ def query_stream(args: argparse.Namespace, tokens: int) -> list[torch.Tensor]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backends", default=os.environ.get("B12X_DISK_BACKEND", "io_uring"))
     parser.add_argument("--base-rows", type=int, default=20_000_000)
     parser.add_argument("--tokens", default="4096")
     parser.add_argument("--repeats", type=int, default=3)
@@ -200,6 +223,9 @@ def main() -> None:
     parser.add_argument("--stream-queries", type=int, default=8)
     parser.add_argument("--query-file", type=pathlib.Path)
     args = parser.parse_args()
+    args.backends = args.backends.split(",")
+    if not args.backends or len(set(args.backends)) != len(args.backends) or set(args.backends) - {"io_uring", "gds"}:
+        parser.error("backends must be io_uring, gds, or io_uring,gds")
     args.tokens = [int(value) for value in args.tokens.split(",")]
     if not args.tokens or min(args.tokens) <= 0 or args.repeats <= 0:
         parser.error("tokens and repeats must be positive")
@@ -226,8 +252,17 @@ def main() -> None:
         "torch": torch.__version__,
         "b12x_revision": revision,
         "source_tree_dirty": dirty,
+        "worktree": str(root),
+        "command": sys.argv,
+        "gpu_uuid": str(torch.cuda.get_device_properties(args.device).uuid),
+        "source_hashes": {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                          for pattern in ("b12x/loader/*", "b12x/sequence/_shared/*", "b12x/sequence/ple_embedding/*")
+                          for p in root.glob(pattern) if p.is_file()},
+        "cufile_config": os.environ.get("CUFILE_ENV_PATH_JSON"),
+        "ratio_direction": "io_uring latency / GDS latency; greater than one favors GDS",
+        "ordering": "reverse backend order on alternate query/repeat pairs",
         "page_size": os.sysconf("SC_PAGESIZE"),
-        "mode": "io_uring",
+        "backends": args.backends,
         "direct": True,
         "cold_l2_cache": True,
         "tp_size": args.tp_size,
@@ -241,60 +276,57 @@ def main() -> None:
     results: list[dict[str, Any]] = []
     with (
         torch.inference_mode(),
+        ExitStack() as resources,
         tempfile.TemporaryDirectory(
             prefix="ple-disk-benchmark-", dir=args.directory
         ) as directory,
     ):
         plan = make_plan(args)
         shard_rows = (plan.padded_vocab_size + args.shards - 1) // args.shards
-        table = ple_embedding.DiskTable(plan, shard_rows, queue_depth=args.queue_depth)
         metadata["table_bytes"] = plan.padded_vocab_size * 90
-        print(
-            json.dumps({"phase": "writing physical temporary files", **metadata}),
-            flush=True,
-        )
+        print(json.dumps({"phase": "writing physical temporary files", **metadata}), flush=True)
         files = Files(pathlib.Path(directory), plan, shard_rows)
-        case = make_case(args, plan, table, files)
+        cases = {}
+        selected_backend = os.environ.get("B12X_DISK_BACKEND")
+        try:
+            for backend in args.backends:
+                os.environ["B12X_DISK_BACKEND"] = backend
+                table = ple_embedding.DiskTable(plan, shard_rows, queue_depth=args.queue_depth)
+                resources.callback(table._cache.close)
+                cases[backend] = make_case(args, plan, table, files, resources)
+                if table._cache._gds:
+                    table._cache._gds.native.start_stats()
+        finally:
+            if selected_backend is None:
+                os.environ.pop("B12X_DISK_BACKEND", None)
+            else:
+                os.environ["B12X_DISK_BACKEND"] = selected_backend
+        metadata["loaded_cufile"] = sorted({line.split()[-1] for line in pathlib.Path("/proc/self/maps").read_text().splitlines() if "libcufile" in line})
         for tokens in args.tokens:
-            case.prepare(tokens)
+            for case in cases.values():
+                case.prepare(tokens)
             queries = query_stream(args, tokens)
             for repeat in range(args.repeats):
                 for index, query in enumerate(queries):
-                    case.binding.token_ids[:tokens].copy_(query)
-                    row = {
-                        "mode": "io_uring",
-                        "tokens": tokens,
-                        "repeat": repeat,
-                        "query_index": index,
-                        **measure(case, tokens, l2_flush),
-                    }
-                    results.append(row)
-                    print(json.dumps(row), flush=True)
+                    order = args.backends if (repeat + index) % 2 == 0 else args.backends[::-1]
+                    for backend in order:
+                        case = cases[backend]
+                        case.binding.token_ids[:tokens].copy_(query)
+                        row = {
+                            "mode": backend, "tokens": tokens, "repeat": repeat,
+                            "query_index": index, **measure(case, tokens, l2_flush),
+                        }
+                        results.append(row)
+                        print(json.dumps(row), flush=True)
                 if args.output is not None:
-                    args.output.write_text(
-                        json.dumps({"metadata": metadata, "results": results}, indent=2)
-                    )
-            selected = [row for row in results if row["tokens"] == tokens]
-            first = [row["wall_ms"] for row in selected if row["query_index"] == 0]
-            later = [row["wall_ms"] for row in selected if row["query_index"] > 0]
-            print(
-                json.dumps(
-                    {
-                        "summary": "io_uring",
-                        "tokens": tokens,
-                        "first_median_ms": statistics.median(first),
-                        "subsequent_median_ms": statistics.median(later)
-                        if later
-                        else None,
-                        "max_ms": max(row["wall_ms"] for row in selected),
-                        "mean_stream_ms": sum(row["wall_ms"] for row in selected)
-                        / args.repeats,
-                    }
-                ),
-                flush=True,
-            )
+                    args.output.write_text(json.dumps({"metadata": metadata, "results": results}, indent=2))
+            medians = {backend: statistics.median(row["wall_ms"] for row in results
+                       if row["tokens"] == tokens and row["mode"] == backend) for backend in args.backends}
+            summary = {"tokens": tokens, "median_ms": medians}
+            if len(medians) == 2:
+                summary["io_uring_over_gds"] = medians["io_uring"] / medians["gds"]
+            print(json.dumps(summary), flush=True)
         torch.cuda.synchronize()
-        del case, table
 
 
 if __name__ == "__main__":

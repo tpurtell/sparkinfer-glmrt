@@ -21,7 +21,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.comm.pcie import PCIeTwoShotBF16
 from b12x.comm.pcie._twoshot_bf16_cute import (
     get_twoshot_bf16_allreduce_launcher,
@@ -282,10 +282,7 @@ def _check_live_rows_reuse_prepared_launchers(
     torch.cuda.synchronize()
     dist.barrier()
 
-    freeze_kernel_resolution(
-        "PCIeTwoShotBF16 live rows must reuse warmed launcher geometry"
-    )
-    try:
+    with kernel_resolution_guard('PCIeTwoShotBF16 live rows must reuse warmed launcher geometry'):
         for payload, exact, all_reduce_out, shard, gathered in cases:
             local_rows = payload.shape[0] // world
             pool.all_reduce(payload, out=all_reduce_out)
@@ -299,8 +296,6 @@ def _check_live_rows_reuse_prepared_launchers(
             reference_shards = [torch.empty_like(shard) for _ in range(world)]
             dist.all_gather(reference_shards, shard)
             assert torch.equal(gathered, torch.cat(reference_shards, dim=0))
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def _check_rejects_divergent_graph_slot_bias(pool: PCIeTwoShotBF16, rank: int) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import pytest
 import torch
 
@@ -9,6 +10,7 @@ from b12x._lib.intrinsics import (
     pack_grouped_fp4_values,
     swizzle_block_scale,
 )
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.moe.fused_moe._impl import (
     plan_b12x_fp4_moe_weights,
     prewarm_w4a16_fc2_e8m0,
@@ -108,7 +110,7 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
         activation=activation,
         quant_mode="w4a16",
     )
-    prepared = expert_weights.representation_for("w4a16")
+    prepared = expert_weights._impl.representation_for("w4a16")
     assert prepared.weight_layout == "modelopt"
     assert _small_m_direct_supported(
         m=m,
@@ -140,13 +142,15 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
         "_w4a16_small_m_direct_launch_flat",
         spy_direct_launch,
     )
-    binding = make_tp_moe_fp4_binding(
+    bindings = ExitStack()
+    binding = bindings.enter_context(make_tp_moe_fp4_binding(
         a=x,
         experts=expert_weights,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         quant_mode="w4a16",
-    )
+        output=torch.empty_like(x),
+    ))
     expected = _reference_w4a16(
         x,
         *weights,
@@ -171,6 +175,8 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
     _assert_matches_oracle(graph_output, expected, activation=activation)
     assert int(barrier_count.item()) == 0
     assert direct_launches == 2
+    del graph
+    bindings.close()
 
 
 def test_w4a16_fused_compile_rejects_unresolved_capture_launch(
@@ -1754,7 +1760,7 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
         activation=activation,
         quant_mode="w4a16",
     )
-    prepared_w4a16 = w4a16_experts.representation_for("w4a16")
+    prepared_w4a16 = w4a16_experts._impl.representation_for("w4a16")
     assert prepared_w4a16.weight_layout == "modelopt"
     micro_w13_scale = prepared_w4a16.micro_w13_scale
     assert micro_w13_scale is not None
@@ -1776,7 +1782,8 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
         w13_layout="w13",
         scale_format="e4m3_k16",
     )
-    binding = make_tp_moe_fp4_binding(
+    bindings = ExitStack()
+    binding = bindings.enter_context(make_tp_moe_fp4_binding(
         a=x,
         experts=w4a16_experts,
         topk_weights=topk_weights,
@@ -1787,7 +1794,7 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
             device=x.device,
         ),
         quant_mode="w4a16",
-    )
+    ))
     expected = moe_reference_w4a16_f32(
         x,
         w13,
@@ -1837,6 +1844,8 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     assert graph_metrics.cos > 0.999, graph_metrics
     torch.testing.assert_close(graph_output, first, atol=0.0, rtol=0.0)
     assert direct_launches == [(m, intermediate_size)] * 3
+    del graph
+    bindings.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1931,7 +1940,7 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
         activation=activation,
         quant_mode="w4a16",
     )
-    prepared = experts_w4a16.representation_for("w4a16")
+    prepared = experts_w4a16._impl.representation_for("w4a16")
     assert prepared.weight_layout == "modelopt"
     assert _small_m_direct_supported(
         m=m,
@@ -1950,13 +1959,14 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
         scale_format="e4m3_k16",
     )
 
-    binding = make_tp_moe_fp4_binding(
+    bindings = ExitStack()
+    binding = bindings.enter_context(make_tp_moe_fp4_binding(
         a=x,
         experts=experts_w4a16,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         quant_mode="w4a16",
-    )
+    ))
     expected = moe_reference_w4a16_f32(
         x,
         w13,
@@ -1983,6 +1993,7 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
         assert metrics.cos > 0.999, metrics
     assert direct_launches == [(m, intermediate_size), (m, intermediate_size)]
     torch.testing.assert_close(first, replay, rtol=0, atol=0)
+    bindings.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -2323,151 +2334,6 @@ def test_w4a16_mapped_decode_consumes_global_map_without_route_pack(
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from b12x.moe import fused_moe
-    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
-
-    torch.manual_seed(20260731)
-    global_experts, local_experts = 12, 8
-    hidden_size, intermediate_size = 128, 128
-    topk, activation = 2, "silu"
-    device = torch.device("cuda", torch.cuda.current_device())
-    w1 = torch.randint(
-        0,
-        256,
-        (local_experts, 2 * intermediate_size, hidden_size // 2),
-        dtype=torch.uint8,
-        device=device,
-    )
-    w2 = torch.randint(
-        0,
-        256,
-        (local_experts, hidden_size, intermediate_size // 2),
-        dtype=torch.uint8,
-        device=device,
-    )
-    w1_scale = _pattern_e8m0((local_experts, 2 * intermediate_size, hidden_size // 32))
-    w2_scale = _pattern_e8m0(
-        (local_experts, hidden_size, intermediate_size // 32),
-        offset=1,
-    )
-    w1_global = torch.ones(local_experts, dtype=torch.float32, device=device)
-    w2_global = torch.ones(local_experts, dtype=torch.float32, device=device)
-    source = fused_moe.PackedSource(
-        format=fused_moe.PackedSourceFormat.MXFP4_E8M0_K32,
-        w13_layout=fused_moe.W13Layout.W13,
-    )
-    weight_plan = fused_moe.plan_weights(
-        source=source,
-        activation=fused_moe.ActivationSpec(
-            mode=fused_moe.ActivationMode.A16,
-            nonlinearity=activation,
-            io_dtype=torch.bfloat16,
-        ),
-        geometry=fused_moe.MoEGeometry(
-            num_experts=local_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-        ),
-    )
-    prepared = fused_moe.prepare_weights(
-        plan=weight_plan,
-        weights=fused_moe.PackedWeights(
-            w13=w1,
-            w2=w2,
-            w13_block_scales=w1_scale,
-            w2_block_scales=w2_scale,
-            w13_global_scales=w1_global,
-            w2_global_scales=w2_global,
-        ),
-    )
-    plan = fused_moe.plan_execution(
-        experts=prepared,
-        capacity=fused_moe.ExecutionCapacity(
-            max_tokens=8,
-            top_k=topk,
-            warmup_token_counts=(1, 8),
-            route_num_experts=global_experts,
-        ),
-    )
-    fused_moe.prewarm(plan)
-    scratch_spec = plan.scratch_specs()[0]
-    scratch = torch.empty(
-        scratch_spec.shape,
-        dtype=scratch_spec.dtype,
-        device=scratch_spec.device,
-    )
-    x = (torch.randn(1, hidden_size, device=device) * 0.25).to(torch.bfloat16)
-    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
-    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32, device=device)
-    expert_map = torch.full((global_experts,), -1, dtype=torch.int32, device=device)
-    expert_map[::2] = torch.arange(local_experts - 2, dtype=torch.int32, device=device)
-    output = torch.empty_like(x)
-    binding = fused_moe.bind(
-        plan,
-        scratch=scratch,
-        a=x,
-        experts=prepared,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        output=output,
-        input_scales_static=True,
-        route_expert_map=expert_map,
-    )
-    assert binding.unit_scale_contract
-    legacy_ids = torch.zeros_like(topk_ids)
-    legacy_weights = torch.zeros_like(topk_weights)
-    legacy_weights[0, 0] = topk_weights[0, 0]
-    legacy_output = torch.empty_like(x)
-    legacy_binding = fused_moe.bind(
-        plan,
-        scratch=scratch,
-        a=x,
-        experts=prepared,
-        topk_weights=legacy_weights,
-        topk_ids=legacy_ids,
-        output=legacy_output,
-        input_scales_static=True,
-    )
-
-    def route_pack_must_not_run(*args, **kwargs):
-        raise AssertionError("mapped scratch-plan decode invoked route packing")
-
-    compiled_launches = []
-    compile_fused = w4a16_kernel.compile_w4a16_fused_moe
-
-    def record_compile(*args, **kwargs):
-        launch = compile_fused(*args, **kwargs)
-        if kwargs.get("use_expert_map"):
-            compiled_launches.append(launch)
-        return launch
-
-    expected = fused_moe.run(binding=legacy_binding).clone()
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            w4a16_kernel,
-            "pack_topk_routes_by_expert",
-            route_pack_must_not_run,
-        )
-        patch.setattr(w4a16_kernel, "compile_w4a16_fused_moe", record_compile)
-        eager = fused_moe.run(binding=binding).clone()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = fused_moe.run(binding=binding)
-        graph.replay()
-    torch.cuda.synchronize()
-
-    assert torch.equal(eager, expected)
-    assert torch.equal(captured, eager)
-    assert any(
-        launch.use_expert_map
-        and launch.direct_topk_routes
-        and launch.tc_decode_fused_sum
-        for launch in compiled_launches
-    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -3529,8 +3395,7 @@ def test_w4a16_fc2_resident_bounds_reuse_frozen_kernel(
         (item.workspace.data_ptr(), item.workspace.numel()) for item in prepared
     ]
 
-    b12x.freeze_kernel_resolution("FC2 resident bounds and live row reuse")
-    try:
+    with kernel_resolution_guard('FC2 resident bounds and live row reuse'):
         for experts in prepared:
             prewarm_w4a16_fc2_e8m0(experts, route_ids_dtype=route_ids_dtype)
             for m in (1, 3, capacity_m):
@@ -3575,8 +3440,6 @@ def test_w4a16_fc2_resident_bounds_reuse_frozen_kernel(
         assert [
             (item.workspace.data_ptr(), item.workspace.numel()) for item in prepared
         ] == workspace_contracts
-    finally:
-        b12x.unfreeze_kernel_resolution()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

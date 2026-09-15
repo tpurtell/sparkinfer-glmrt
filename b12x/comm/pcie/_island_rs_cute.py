@@ -9,7 +9,7 @@ move 2.25 times the BF16 payload per rank.
 
 from __future__ import annotations
 
-import functools
+from b12x._lib.program_cache import program_cache
 from collections.abc import Callable, Sequence
 from typing import Tuple
 
@@ -570,7 +570,7 @@ class _IslandRSLaunch:
                     index += stride
 
 
-@functools.lru_cache(maxsize=None)
+@program_cache
 def get_island_rs_launcher(
     world_size: int,
     rank: int,

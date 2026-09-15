@@ -117,7 +117,6 @@ class CaseReport:
     graph: Timing | None
     graph_correctness: Correctness | None
     graph_replay_after_output_poison: bool
-    graph_replay_after_scratch_poison: bool
     stable_addresses: bool
     replay_allocation_bytes: int
 
@@ -392,7 +391,6 @@ def _bench_graph(
     )
     restore()
     binding.output.fill_(float("nan"))
-    binding.scratch.fill_(0xFF)
     torch.cuda.synchronize(binding.output.device)
     allocated_before = torch.cuda.memory_allocated(binding.output.device)
     graph.replay()
@@ -476,7 +474,6 @@ def benchmark_case(
         graph=graph,
         graph_correctness=graph_correctness,
         graph_replay_after_output_poison=graph_correctness is not None,
-        graph_replay_after_scratch_poison=graph_correctness is not None,
         stable_addresses=stable_addresses,
         replay_allocation_bytes=replay_allocation_bytes,
     )
@@ -619,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
         "torch_cuda_version": torch.version.cuda,
         "timed_path": "b12x.sequence.gdn_decode public Qwen decode transaction",
         "recurrence_backend": "cutedsl",
-        "triton_role": "metadata_validation_and_gated_rmsnorm_auxiliaries",
+        "triton_role": "gated_rmsnorm_auxiliary",
         "reference_timed": False,
         "metric_direction": "lower_is_better",
         "mode": args.mode,

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from types import MappingProxyType
+
 import triton
 import triton.language as tl
 import torch
+
+from b12x._lib.compile_plan import launch_triton
 
 from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
 
@@ -364,6 +369,118 @@ def _pack_topk_routes_sort_kernel(
     tl.store(packed_route_indices + ranks, offsets, mask=valid)
 
 
+@dataclass(frozen=True)
+class W4A16RoutePackLaunches:
+    """Exact prepared Triton objects for one W4A16 packed-route geometry."""
+
+    numel_capacity: int
+    block_size: int
+    num_experts: int
+    max_packed_routes: int
+    max_route_blocks: int
+    use_small_prefix: bool
+    programs: MappingProxyType
+
+    def program(self, name: str, topk_ids: torch.Tensor, has_expert_map: bool):
+        try:
+            return self.programs[(name, topk_ids.dtype, bool(has_expert_map))]
+        except KeyError:
+            raise RuntimeError(
+                "prepared W4A16 route programs are missing the runtime "
+                f"{name}/{topk_ids.dtype}/mapped={bool(has_expert_map)} variant"
+            ) from None
+
+    def carriers(self) -> tuple[object, ...]:
+        return tuple(self.programs.values())
+
+
+def compile_w4a16_route_pack_launches(
+    *,
+    tokens: int,
+    topk: int,
+    block_size: int,
+    num_experts: int,
+    ordinal: int,
+) -> W4A16RoutePackLaunches:
+    """Compile every legal route-pack helper for one planned W4A16 capacity."""
+    numel_capacity, max_packed_routes, max_route_blocks = route_pack_capacity(
+        int(tokens) * int(topk), int(block_size), int(num_experts), topk=int(topk)
+    )
+    max_packed_routes = max(int(max_packed_routes), 1)
+    max_route_blocks = max(int(max_route_blocks), 1)
+    block_e = _next_power_of_2(int(num_experts))
+    block_route_init = _next_power_of_2(max_packed_routes)
+    block_m = _next_power_of_2(max_route_blocks)
+    use_small_prefix = (
+        block_route_init <= _SMALL_PREFIX_MAX_PACKED_ROUTES
+        and block_m <= _SMALL_PREFIX_MAX_ROUTE_BLOCKS
+    )
+    programs = {}
+    # Avoid Triton's divisibility and value-one specialization of the live bound.
+    live_numel = 3
+    with torch.cuda.device(int(ordinal)):
+        for ids_dtype in (torch.int32, torch.int64):
+            for has_expert_map in (False, True):
+                key = (ids_dtype, has_expert_map)
+                expert_map_dtype = torch.int32 if has_expert_map else ids_dtype
+                if use_small_prefix:
+                    programs[("small_prefix", *key)] = _pack_topk_routes_small_prefix_kernel.warmup(
+                        ids_dtype, expert_map_dtype, torch.int32, torch.int32,
+                        torch.int32, torch.int32, torch.int32, live_numel,
+                        NUMEL_CAPACITY=int(numel_capacity), BLOCK_SIZE=int(block_size),
+                        NUM_EXPERTS=int(num_experts), MAX_PACKED_ROUTES=max_packed_routes,
+                        MAX_ROUTE_BLOCKS=max_route_blocks, HAS_EXPERT_MAP=has_expert_map,
+                        BLOCK_E=block_e, BLOCK_T=_COUNT_BLOCK_T,
+                        BLOCK_ROUTE_INIT=block_route_init, BLOCK_M=block_m,
+                        SEARCH_STEPS=block_e.bit_length(), COUNTS_ALIAS_PACKED=False,
+                        num_warps=8, grid=(1, 1, 1),
+                    )
+                if not use_small_prefix:
+                    programs[("count", *key)] = _w4a16_route_count_kernel.warmup(
+                        ids_dtype, expert_map_dtype, torch.int32, live_numel,
+                        NUM_EXPERTS=int(num_experts), HAS_EXPERT_MAP=has_expert_map,
+                        BLOCK_T=_FAST_COUNT_BLOCK_T, num_warps=4,
+                        grid=(triton.cdiv(int(tokens) * int(topk), _FAST_COUNT_BLOCK_T), 1, 1),
+                    )
+                programs[("sort", *key)] = _pack_topk_routes_sort_kernel.warmup(
+                    ids_dtype, expert_map_dtype, torch.int32, torch.int32, live_numel,
+                    NUM_EXPERTS=int(num_experts), HAS_EXPERT_MAP=has_expert_map,
+                    BLOCK_T=_SORT_BLOCK_T, num_warps=4,
+                    grid=(triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T), 1, 1),
+                )
+        if not use_small_prefix:
+            programs[("prefix", torch.int32, False)] = _w4a16_route_prefix_from_counts_kernel.warmup(
+                torch.int32, torch.int32, torch.int32, BLOCK_SIZE=int(block_size),
+                NUM_EXPERTS=int(num_experts), BLOCK_E=block_e, num_warps=4,
+                grid=(1, 1, 1),
+            )
+            programs[("post_prefix", torch.int32, False)] = _pack_topk_routes_post_prefix_kernel.warmup(
+                torch.int32, torch.int32, torch.int32, live_numel,
+                BLOCK_SIZE=int(block_size), NUM_EXPERTS=int(num_experts),
+                MAX_PACKED_ROUTES=max_packed_routes, MAX_ROUTE_BLOCKS=max_route_blocks,
+                BLOCK_T=_POST_PREFIX_BLOCK_T, SEARCH_STEPS=block_e.bit_length(),
+                num_warps=4,
+                grid=(
+                    max(
+                        triton.cdiv(max_packed_routes, _POST_PREFIX_BLOCK_T),
+                        triton.cdiv(max_route_blocks, _POST_PREFIX_BLOCK_T),
+                    ),
+                    1,
+                    1,
+                ),
+            )
+    return W4A16RoutePackLaunches(
+        numel_capacity=int(numel_capacity), block_size=int(block_size),
+        num_experts=int(num_experts), max_packed_routes=max_packed_routes,
+        max_route_blocks=max_route_blocks, use_small_prefix=use_small_prefix,
+        programs=MappingProxyType(programs),
+    )
+
+
+def _launch_prepared(program: object, grid: tuple[int, ...], *args: object) -> object:
+    return program[tuple((*grid, 1, 1)[:3])](*args)
+
+
 def pack_topk_routes_by_expert(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -375,6 +492,7 @@ def pack_topk_routes_by_expert(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_counts: torch.Tensor | None = None,
+    launches: W4A16RoutePackLaunches | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = int(topk_ids.numel())
     topk = int(topk_ids.shape[-1]) if topk_ids.ndim >= 2 else 1
@@ -436,6 +554,20 @@ def pack_topk_routes_by_expert(
     max_route_blocks = capacity_route_blocks
     max_packed_routes = max(max_packed_routes, 1)
     max_route_blocks = max(max_route_blocks, 1)
+    if launches is not None:
+        if (
+            numel > launches.numel_capacity
+            or int(block_size) != launches.block_size
+            or int(num_experts) != launches.num_experts
+        ):
+            raise RuntimeError(
+                "W4A16 live routes exceed or differ from the prepared geometry: "
+                f"requested={(numel, block_size, num_experts)}, "
+                f"prepared={(launches.numel_capacity, launches.block_size, launches.num_experts)}"
+            )
+        numel_capacity = launches.numel_capacity
+        max_packed_routes = launches.max_packed_routes
+        max_route_blocks = launches.max_route_blocks
 
     provided_routes = (
         None if packed_route_indices is None else int(packed_route_indices.numel())
@@ -502,11 +634,12 @@ def pack_topk_routes_by_expert(
         block_route_init <= _SMALL_PREFIX_MAX_PACKED_ROUTES
         and block_m <= _SMALL_PREFIX_MAX_ROUTE_BLOCKS
     )
+    if launches is not None and launches.use_small_prefix != use_small_prefix:
+        raise RuntimeError("prepared W4A16 route-pack path does not match bound geometry")
     if use_small_prefix:
-        # Decode-sized W4A16 MoE calls are launch-overhead sensitive. Keep the
-        # large-shape split kernel below, but fold prefix/post-prefix work into
-        # one launch when the vector sizes are safely bounded.
-        counts_alias_packed = (
+        # Prepared small-prefix objects fix COUNTS_ALIAS_PACKED=False so their
+        # storage ABI is stable. Serving scratch already owns expert_counts.
+        counts_alias_packed = launches is None and (
             expert_counts is None
             and int(packed_route_indices.numel()) >= int(num_experts)
         )
@@ -520,29 +653,37 @@ def pack_topk_routes_by_expert(
                 dtype=torch.int32,
                 device=topk_ids.device,
             )
-        _pack_topk_routes_small_prefix_kernel[(1,)](
-            topk_ids,
-            expert_map_tensor,
-            packed_route_indices,
-            block_expert_ids,
-            packed_route_count,
-            expert_offsets,
-            expert_counts,
-            numel,
-            NUMEL_CAPACITY=numel_capacity,
-            BLOCK_SIZE=int(block_size),
-            NUM_EXPERTS=int(num_experts),
-            MAX_PACKED_ROUTES=max_packed_routes,
-            MAX_ROUTE_BLOCKS=max_route_blocks,
-            HAS_EXPERT_MAP=expert_map is not None,
-            BLOCK_E=block_e,
-            BLOCK_T=_COUNT_BLOCK_T,
-            BLOCK_ROUTE_INIT=block_route_init,
-            BLOCK_M=block_m,
-            SEARCH_STEPS=block_e.bit_length(),
-            COUNTS_ALIAS_PACKED=counts_alias_packed,
-            num_warps=8,
-        )
+        if launches is None:
+            launch_triton(_pack_topk_routes_small_prefix_kernel, (1,),
+                topk_ids,
+                expert_map_tensor,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                expert_offsets,
+                expert_counts,
+                numel,
+                NUMEL_CAPACITY=numel_capacity,
+                BLOCK_SIZE=int(block_size),
+                NUM_EXPERTS=int(num_experts),
+                MAX_PACKED_ROUTES=max_packed_routes,
+                MAX_ROUTE_BLOCKS=max_route_blocks,
+                HAS_EXPERT_MAP=expert_map is not None,
+                BLOCK_E=block_e,
+                BLOCK_T=_COUNT_BLOCK_T,
+                BLOCK_ROUTE_INIT=block_route_init,
+                BLOCK_M=block_m,
+                SEARCH_STEPS=block_e.bit_length(),
+                COUNTS_ALIAS_PACKED=counts_alias_packed,
+                num_warps=8,
+            )
+        else:
+            _launch_prepared(
+                launches.program("small_prefix", topk_ids, expert_map is not None),
+                (1,), topk_ids, expert_map_tensor, packed_route_indices,
+                block_expert_ids, packed_route_count, expert_offsets,
+                expert_counts, numel,
+            )
     else:
         # Parallel path for shapes above the single-launch caps: atomic
         # histogram over routed rows, one tiny 1-D prefix, and binary-search
@@ -558,56 +699,64 @@ def pack_topk_routes_by_expert(
             device=topk_ids.device,
         )
         expert_counts.zero_()
-        _w4a16_route_count_kernel[(triton.cdiv(numel, _FAST_COUNT_BLOCK_T),)](
-            topk_ids,
-            expert_map_tensor,
-            expert_counts,
-            numel,
-            NUM_EXPERTS=int(num_experts),
-            HAS_EXPERT_MAP=expert_map is not None,
-            BLOCK_T=_FAST_COUNT_BLOCK_T,
-            num_warps=4,
-        )
-        _w4a16_route_prefix_from_counts_kernel[(1,)](
-            expert_counts,
-            packed_route_count,
-            expert_offsets,
-            BLOCK_SIZE=int(block_size),
-            NUM_EXPERTS=int(num_experts),
-            BLOCK_E=block_e,
-            num_warps=4,
-        )
+        if launches is None:
+            launch_triton(_w4a16_route_count_kernel, (triton.cdiv(numel, _FAST_COUNT_BLOCK_T),),
+                topk_ids, expert_map_tensor, expert_counts, numel,
+                NUM_EXPERTS=int(num_experts), HAS_EXPERT_MAP=expert_map is not None,
+                BLOCK_T=_FAST_COUNT_BLOCK_T, num_warps=4,
+            )
+            launch_triton(_w4a16_route_prefix_from_counts_kernel, (1,),
+                expert_counts, packed_route_count, expert_offsets,
+                BLOCK_SIZE=int(block_size), NUM_EXPERTS=int(num_experts),
+                BLOCK_E=block_e, num_warps=4,
+            )
+        else:
+            _launch_prepared(
+                launches.program("count", topk_ids, expert_map is not None),
+                (triton.cdiv(numel, _FAST_COUNT_BLOCK_T),),
+                topk_ids, expert_map_tensor, expert_counts, numel,
+            )
+            _launch_prepared(
+                launches.programs[("prefix", torch.int32, False)], (1,),
+                expert_counts, packed_route_count, expert_offsets,
+            )
         post_prefix_grid = (
             max(
                 triton.cdiv(max_packed_routes, _POST_PREFIX_BLOCK_T),
                 triton.cdiv(max_route_blocks, _POST_PREFIX_BLOCK_T),
             ),
         )
-        _pack_topk_routes_post_prefix_kernel[post_prefix_grid](
-            packed_route_indices,
-            block_expert_ids,
-            expert_offsets,
-            numel,
-            BLOCK_SIZE=int(block_size),
-            NUM_EXPERTS=int(num_experts),
-            MAX_PACKED_ROUTES=max_packed_routes,
-            MAX_ROUTE_BLOCKS=max_route_blocks,
-            BLOCK_T=_POST_PREFIX_BLOCK_T,
-            SEARCH_STEPS=block_e.bit_length(),
-            num_warps=4,
+        if launches is None:
+            launch_triton(_pack_topk_routes_post_prefix_kernel, post_prefix_grid,
+                packed_route_indices, block_expert_ids, expert_offsets, numel,
+                BLOCK_SIZE=int(block_size), NUM_EXPERTS=int(num_experts),
+                MAX_PACKED_ROUTES=max_packed_routes, MAX_ROUTE_BLOCKS=max_route_blocks,
+                BLOCK_T=_POST_PREFIX_BLOCK_T, SEARCH_STEPS=block_e.bit_length(),
+                num_warps=4,
+            )
+        else:
+            _launch_prepared(
+                launches.programs[("post_prefix", torch.int32, False)],
+                post_prefix_grid, packed_route_indices, block_expert_ids,
+                expert_offsets, numel,
+            )
+    if launches is None:
+        launch_triton(_pack_topk_routes_sort_kernel, sort_grid,
+            topk_ids, expert_map_tensor, packed_route_indices, expert_offsets, numel,
+            NUM_EXPERTS=int(num_experts), HAS_EXPERT_MAP=expert_map is not None,
+            BLOCK_T=_SORT_BLOCK_T, num_warps=4,
         )
-    _pack_topk_routes_sort_kernel[sort_grid](
-        topk_ids,
-        expert_map_tensor,
-        packed_route_indices,
-        expert_offsets,
-        numel,
-        NUM_EXPERTS=int(num_experts),
-        HAS_EXPERT_MAP=expert_map is not None,
-        BLOCK_T=_SORT_BLOCK_T,
-        num_warps=4,
-    )
+    else:
+        _launch_prepared(
+            launches.program("sort", topk_ids, expert_map is not None), sort_grid,
+            topk_ids, expert_map_tensor, packed_route_indices, expert_offsets, numel,
+        )
     return packed_route_indices, block_expert_ids, packed_route_count
 
 
-__all__ = ["map_topk_routes", "pack_topk_routes_by_expert"]
+__all__ = [
+    "map_topk_routes",
+    "W4A16RoutePackLaunches",
+    "compile_w4a16_route_pack_launches",
+    "pack_topk_routes_by_expert",
+]

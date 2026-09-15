@@ -47,7 +47,6 @@ _SELF_COUNTER_BYTES = _MAX_BLOCKS * _MAX_RANKS * 4
 # the first record hold channel-local graph state and cannot alias peer flags.
 _GRAPH_EPOCH_OFFSET = _SELF_COUNTER_BYTES + 4
 _GRAPH_BLOCKS_ARRIVED_OFFSET = _SELF_COUNTER_BYTES + 8
-_PREPARED_TWOSHOT_LAUNCHERS: set[tuple[object, ...]] = set()
 
 
 @dsl_user_op
@@ -734,26 +733,6 @@ def _twoshot_process_key(
     )
 
 
-def is_twoshot_launcher_prepared(
-    operation: str,
-    world_size: int,
-    rank: int,
-    device_slot_selection: bool,
-    slot_bias: int,
-    threads: int,
-    row_elems: int,
-    device_index: int,
-) -> bool:
-    return _twoshot_process_key(
-        operation,
-        world_size,
-        rank,
-        device_slot_selection,
-        slot_bias,
-        threads,
-        row_elems,
-        device_index,
-    ) in _PREPARED_TWOSHOT_LAUNCHERS
 
 
 @functools.cache
@@ -916,8 +895,6 @@ def get_twoshot_launcher(
         )
         raw(*raw_args)
 
-    _PREPARED_TWOSHOT_LAUNCHERS.add(process_key)
     return run
 
-
-__all__ = ["get_twoshot_launcher", "is_twoshot_launcher_prepared"]
+__all__ = ["get_twoshot_launcher"]

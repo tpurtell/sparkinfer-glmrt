@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -1326,114 +1327,77 @@ def _ptr(dtype: type[cutlass.Numeric], address: int, align: int) -> cute.Pointer
     return make_ptr(dtype, int(address), cute.AddressSpace.gmem, assumed_align=align)
 
 
+@dataclass(frozen=True)
+class DmaLaunchers:
+    """Resolved CuTe entry points required by one fixed DMA wire protocol."""
+
+    set_flag: Callable
+    wait_flag: Callable
+    add: tuple[Callable, ...]
+    quant: Callable | None = None
+    dequant_store: Callable | None = None
+    dequant_accum: Callable | None = None
+    dequant_add_quant_false: Callable | None = None
+    dequant_add_quant_true: Callable | None = None
+
+    @property
+    def __b12x_dependencies__(self):
+        return (
+            self.set_flag, self.wait_flag, self.add, self.quant,
+            self.dequant_store, self.dequant_accum,
+            self.dequant_add_quant_false, self.dequant_add_quant_true,
+        )
+
+    @property
+    def __b12x_programs__(self):
+        from b12x._lib.compile_plan import program_keys
+        return program_keys(self.__b12x_dependencies__)
+
+
+def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
+    """Resolve the primitive programs reachable by declaration metadata."""
+
+    if int(world_size) not in (2, 4, 6, 8, 10):
+        raise ValueError(f"unsupported DMA world size {world_size}")
+    mode = str(wire_mode)
+    codec = "i8" if mode.startswith("i8") else "mx" if mode.startswith("mx") else "e4m3"
+    compressed = bool(mode)
+    a2a = mode == "a2a" or mode.endswith("a2a")
+    return DmaLaunchers(
+        set_flag=_compiled_flag(False),
+        wait_flag=_compiled_flag(True),
+        add=tuple(_compiled_add(dtype) for dtype in _DTYPES),
+        quant=_compiled_quant(codec) if compressed else None,
+        dequant_store=_compiled_dequant_store(codec) if compressed else None,
+        dequant_accum=_compiled_dequant_accum(codec, int(world_size) - 1) if a2a else None,
+        dequant_add_quant_false=_compiled_dequant_add_quant(codec, False) if compressed else None,
+        dequant_add_quant_true=_compiled_dequant_add_quant(codec, True) if compressed else None,
+    )
+
+
 class DmaKernels:
-    """Python-callable façade matching the former native extension methods."""
+    """Python-callable façade bound to preparation-resolved launchers."""
 
     def __init__(self, ipc) -> None:
         self._ipc = ipc
-        self._prepared: set[tuple[int, int, str]] = set()
+        self._launchers: DmaLaunchers | None = None
 
-    def prepare(self, *, world_size: int, wire_mode: str) -> None:
-        """Compile every specialization reachable by this channel.
+    def install(self, launchers: DmaLaunchers) -> None:
+        if not isinstance(launchers, DmaLaunchers):
+            raise TypeError("DMA kernels require preparation-resolved launchers")
+        self._launchers = launchers
 
-        This is called during channel construction, before CUDA graph capture.
-        A warm eager collective remains responsible for loading modules and
-        establishing the multi-stream event graph, as it was for the native
-        extension.
-        """
-
-        import torch
-
-        key = (torch.cuda.current_device(), int(world_size), str(wire_mode))
-        if key in self._prepared:
-            return
-
-        _compiled_flag(False)
-        _compiled_flag(True)
-        for dtype_name in _DTYPES:
-            _compiled_add(dtype_name)
-        if wire_mode:
-            codec = "i8" if wire_mode.startswith("i8") else "mx" if wire_mode.startswith("mx") else "e4m3"
-            _compiled_quant(codec)
-            _compiled_dequant_store(codec)
-            _compiled_dequant_add_quant(codec, False)
-            _compiled_dequant_add_quant(codec, True)
-            if wire_mode.endswith("a2a") or wire_mode == "a2a":
-                _compiled_dequant_accum(codec, int(world_size) - 1)
-
-        # Force module loading and the complete first-launch path before a
-        # caller can enter CUDA graph capture.  All allocations below are
-        # construction-time temporaries and are gone before the channel is
-        # exposed.
-        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
-        send_counter = torch.zeros_like(flag)
-        wait_counter = torch.zeros_like(flag)
-        self.dma_set_flag(flag.data_ptr(), send_counter.data_ptr())
-        self.dma_wait_flag(flag.data_ptr(), wait_counter.data_ptr())
-        copy_src = torch.zeros(16, dtype=torch.uint8, device="cuda")
-        copy_dst = torch.empty_like(copy_src)
-        self.dma_copy(copy_dst.data_ptr(), copy_src.data_ptr(), copy_src.numel())
-        for dtype_code, dtype in enumerate(
-            (torch.bfloat16, torch.float16, torch.float32)
-        ):
-            a = torch.zeros(8, dtype=dtype, device="cuda")
-            b = torch.zeros_like(a)
-            out = torch.empty_like(a)
-            self.dma_add(
-                out.data_ptr(), a.data_ptr(), b.data_ptr(), a.numel(), dtype_code
-            )
-        if wire_mode:
-            elems = _QUANT_BLOCK
-            source = torch.zeros(elems, dtype=torch.bfloat16, device="cuda")
-            output = torch.empty_like(source)
-            scale_bytes = elems // 32 if codec == "mx" else elems // 128 * 4
-            wire = torch.empty(elems + scale_bytes, dtype=torch.uint8, device="cuda")
-            next_wire = torch.empty_like(wire)
-            self._quant(
-                codec,
-                source.data_ptr(),
-                wire.data_ptr(),
-                wire.data_ptr() + elems,
-                elems,
-            )
-            self._dequant_store(
-                codec,
-                output.data_ptr(),
-                wire.data_ptr(),
-                wire.data_ptr() + elems,
-                elems,
-            )
-            for store_bf16 in (False, True):
-                self._dequant_add_quant(
-                    codec,
-                    output.data_ptr(),
-                    source.data_ptr(),
-                    wire.data_ptr(),
-                    wire.data_ptr() + elems,
-                    next_wire.data_ptr(),
-                    next_wire.data_ptr() + elems,
-                    elems,
-                    store_bf16,
-                )
-            if wire_mode.endswith("a2a") or wire_mode == "a2a":
-                nsrc = int(world_size) - 1
-                self._dequant_accum(
-                    codec,
-                    output.data_ptr(),
-                    source.data_ptr(),
-                    [wire.data_ptr()] * nsrc,
-                    [wire.data_ptr() + elems] * nsrc,
-                    elems,
-                )
-        torch.cuda.synchronize()
-        self._prepared.add(key)
+    def _require_launchers(self) -> DmaLaunchers:
+        if self._launchers is None:
+            raise RuntimeError("DMA kernels have not been prepared")
+        return self._launchers
 
     def dma_copy(self, dst_ptr: int, src_ptr: int, bytes_: int) -> None:
         stream = int(current_cuda_stream())
         self._ipc.cudaMemcpyAsync(int(dst_ptr), int(src_ptr), int(bytes_), stream)
 
     def dma_set_flag(self, peer_flag_ptr: int, counter_ptr: int) -> None:
-        raw = _compiled_flag(False)
+        raw = self._require_launchers().set_flag
         raw(
             _ptr(Uint32, peer_flag_ptr, 4),
             _ptr(Uint32, counter_ptr, 4),
@@ -1441,7 +1405,7 @@ class DmaKernels:
         )
 
     def dma_wait_flag(self, flag_ptr: int, counter_ptr: int) -> None:
-        raw = _compiled_flag(True)
+        raw = self._require_launchers().wait_flag
         raw(
             _ptr(Uint32, flag_ptr, 4),
             _ptr(Uint32, counter_ptr, 4),
@@ -1455,7 +1419,7 @@ class DmaKernels:
         dtype = _dtype_type(dtype_name)
         elems_per_pack = 4 if dtype_name == "fp32" else 8
         packs = int(elems) // elems_per_pack
-        raw = _compiled_add(dtype_name)
+        raw = self._require_launchers().add[int(dtype_code)]
         raw(
             _ptr(dtype, dst_ptr, 16),
             _ptr(dtype, a_ptr, 16),
@@ -1469,7 +1433,10 @@ class DmaKernels:
         self, codec: str, src_ptr: int, payload_ptr: int, scales_ptr: int, elems: int
     ) -> None:
         blocks = int(elems) // _QUANT_BLOCK
-        _compiled_quant(codec)(
+        raw = self._require_launchers().quant
+        if raw is None:
+            raise RuntimeError("DMA quantization launcher was not prepared")
+        raw(
             _ptr(cutlass.BFloat16, src_ptr, 8),
             _ptr(_payload_type(codec), payload_ptr, 4),
             _ptr(_scale_type(codec), scales_ptr, 4),
@@ -1482,7 +1449,10 @@ class DmaKernels:
         self, codec: str, out_ptr: int, payload_ptr: int, scales_ptr: int, elems: int
     ) -> None:
         blocks = int(elems) // _QUANT_BLOCK
-        _compiled_dequant_store(codec)(
+        raw = self._require_launchers().dequant_store
+        if raw is None:
+            raise RuntimeError("DMA dequantization launcher was not prepared")
+        raw(
             _ptr(cutlass.BFloat16, out_ptr, 8),
             _ptr(_payload_type(codec), payload_ptr, 4),
             _ptr(_scale_type(codec), scales_ptr, 4),
@@ -1512,7 +1482,10 @@ class DmaKernels:
         payloads.extend([payloads[0]] * (abi_sources - len(payloads)))
         scales.extend([scales[0]] * (abi_sources - len(scales)))
         blocks = int(elems) // _QUANT_BLOCK
-        _compiled_dequant_accum(codec, len(payload_ptrs))(
+        raw = self._require_launchers().dequant_accum
+        if raw is None:
+            raise RuntimeError("DMA all-to-all accumulation launcher was not prepared")
+        raw(
             _ptr(cutlass.BFloat16, out_ptr, 8),
             _ptr(cutlass.BFloat16, inp_ptr, 8),
             *(_ptr(_payload_type(codec), address, 4) for address in payloads),
@@ -1535,7 +1508,15 @@ class DmaKernels:
         store_bf16: bool,
     ) -> None:
         blocks = int(elems) // _QUANT_BLOCK
-        _compiled_dequant_add_quant(codec, bool(store_bf16))(
+        launchers = self._require_launchers()
+        raw = (
+            launchers.dequant_add_quant_true
+            if store_bf16
+            else launchers.dequant_add_quant_false
+        )
+        if raw is None:
+            raise RuntimeError("DMA quantized reduction launcher was not prepared")
+        raw(
             _ptr(cutlass.BFloat16, out_ptr, 8),
             _ptr(cutlass.BFloat16, local_ptr, 8),
             _ptr(_payload_type(codec), payload_in_ptr, 4),
@@ -1596,8 +1577,7 @@ def _install_codec_methods() -> None:
             ),
         )
 
-
 _install_codec_methods()
 
 
-__all__ = ["DmaKernels"]
+__all__ = ["DmaKernels", "DmaLaunchers", "compile_launchers"]

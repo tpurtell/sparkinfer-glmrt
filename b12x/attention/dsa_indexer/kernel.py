@@ -24,6 +24,7 @@ from b12x._lib.compiler import (
     launch as b12x_launch,
     tensor_compile_fact,
 )
+from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import get_sm_version
 from b12x._lib.intrinsics import (
     cp_async4_shared_global,
@@ -313,6 +314,21 @@ def _to_kernel_tensor(
     *,
     assumed_align: int = 16,
 ) -> cutlass.cute.Tensor:
+    if compile_only_launches_enabled() and hasattr(tensor, "fake_mode"):
+        # Shape-faithful CUDA FakeTensor inputs retain the exact production key
+        # facts. Recreate only the descriptor's existing dynamic-layout ABI.
+        from cutlass.cute.runtime import make_fake_tensor
+
+        leading_dim = next((i for i, s in enumerate(tensor.stride()) if s == 1), None)
+        if leading_dim is not None and tensor.ndim >= 2:
+            shape = tuple(cute.sym_int(32) for _ in tensor.shape)
+            strides = tuple(
+                1 if i == leading_dim else cute.sym_int(64)
+                for i in range(tensor.ndim)
+            )
+        else:
+            shape, strides = tuple(tensor.shape), tuple(tensor.stride())
+        return make_fake_tensor(dtype, shape, strides, assumed_align=assumed_align)
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
     leading_dim = next(
@@ -2069,11 +2085,11 @@ def _split_index_k_cache_runtime_views(
         )
     num_pages = index_k_cache.shape[0]
     data_bytes = _PAGE_SIZE * _INDEX_HEAD_DIM
-    k_quant_bytes = index_k_cache[:, :data_bytes].view(
+    k_quant_bytes = index_k_cache.narrow(1, 0, data_bytes).view(
         num_pages, _PAGE_SIZE, _INDEX_HEAD_DIM
     )
     k_scales = (
-        index_k_cache[:, data_bytes : data_bytes + _PAGE_SIZE * _SCALE_BYTES]
+        index_k_cache.narrow(1, data_bytes, _PAGE_SIZE * _SCALE_BYTES)
         .view(num_pages, _PAGE_SIZE, _SCALE_BYTES)
         .view(torch.float32)
         .squeeze(-1)
@@ -2615,6 +2631,7 @@ def run_paged_supertile_logits_kernel(
     stream_scorer: bool | None = None,
     persistent_ctas: int | None = None,
     stream_ctas: int | None = None,
+    launcher=None,
     binding: IndexerPagedSupertileLogitsKernelBinding | None = None,
 ) -> torch.Tensor:
     if binding is not None:
@@ -2733,6 +2750,7 @@ def run_paged_supertile_logits_kernel(
         stream_scorer=stream_scorer,
         persistent_ctas=persistent_ctas,
         stream_ctas=stream_ctas,
+        launcher=launcher,
     )
 
 
@@ -2755,6 +2773,7 @@ def _run_paged_tiled_logits_kernel_common(
     stream_scorer: bool = False,
     persistent_ctas: int | None = None,
     stream_ctas: int | None = None,
+    launcher=None,
 ) -> torch.Tensor:
     if page_size != _PAGE_SIZE:
         raise ValueError(
@@ -2838,11 +2857,15 @@ def _run_paged_tiled_logits_kernel_common(
         k_quant_bytes,
     )
     device_index = q_fp8.device.index or 0
-    k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
-    use_scalar_k_load_tensor = _cached_int32_scalar(
-        int(use_scalar_k_load),
-        device_index,
-    )
+    if compile_only_launches_enabled():
+        k_tma_desc_ptrs = torch.empty((1,), dtype=torch.int64, device=q_fp8.device)
+        use_scalar_k_load_tensor = torch.empty((1,), dtype=torch.int32, device=q_fp8.device)
+    else:
+        k_tma_desc_ptrs = _dummy_paged_index_k_tma_desc_ptrs(device_index)
+        use_scalar_k_load_tensor = _cached_int32_scalar(
+            int(use_scalar_k_load),
+            device_index,
+        )
     if not q_fp8.is_contiguous():
         raise ValueError("paged tiled logits requires contiguous q_fp8")
     if not weights.is_contiguous():
@@ -2991,12 +3014,17 @@ def _run_paged_tiled_logits_kernel_common(
         2,
         cache_key,
     )
-    b12x_launch(
-        kernel,
-        compile_spec=compile_spec,
-        compile_args=args,
-        runtime_args=args,
-    )
+    if launcher is not None:
+        from b12x._lib.compiler import run_compiled
+
+        run_compiled(launcher, args)
+    else:
+        b12x_launch(
+            kernel,
+            compile_spec=compile_spec,
+            compile_args=args,
+            runtime_args=args,
+        )
     logits_view._b12x_num_q_tiles = num_q_tiles
     logits_view._b12x_num_k_tiles = num_k_tiles
     logits_view._b12x_block_q = int(tile_block_q)

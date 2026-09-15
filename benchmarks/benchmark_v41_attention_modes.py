@@ -11,7 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession
+from benchmarks.attention_preparation import prepare_compressed
 from b12x.attention import compressed_sparse_mla as mla
 from b12x.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference,
@@ -71,29 +72,25 @@ def main():
         capacity, 1
     )
     for indexed in (False, True):
+        session = PreparationSession(device=device, autotune=False, compile_workers=2)
         plans = {}
         for mode in ("decode", "extend"):
-            plan = mla.plan(
-                mla.Caps(
-                    device=device,
-                    num_q_heads=heads,
-                    max_q_rows=capacity,
-                    max_width=128 + (512 if indexed else 0),
-                    swa_width=128,
-                    indexed_width=512 if indexed else 0,
-                    swa_page_size=32,
-                    indexed_page_size=128,
-                    max_page_table_width=4,
-                    mode=mode,
-                    cache_format="deepseek_v41",
-                    use_cuda_graph=True,
-                )
+            caps = mla.Caps(
+                device=device, num_q_heads=heads, max_q_rows=capacity,
+                max_width=128 + (512 if indexed else 0), swa_width=128,
+                indexed_width=512 if indexed else 0, swa_page_size=32,
+                indexed_page_size=128, max_page_table_width=4, mode=mode,
+                cache_format="deepseek_v41", use_cuda_graph=True,
             )
-            (spec,) = plan.scratch_specs()
-            plans[mode] = (
-                plan,
-                torch.empty(spec.shape, dtype=spec.dtype, device=device),
-            )
+            plan, binding = prepare_compressed(session, caps,
+                bind_args=dict(q=q, swa_indices=swa_ids, swa_lengths=swa_lengths,
+                               indexed_indices=extra_ids if indexed else None,
+                               indexed_lengths=extra_lengths if indexed else None,
+                               indexed_page_table=table if indexed else None),
+                run_args=dict(swa_k_cache=swa, indexed_k_cache=extra if indexed else None,
+                              sm_scale=scale, attn_sink=sink, out=torch.empty_like(q)))
+            plans[mode] = (plan, binding.scratch.shared_scratch)
+        session.freeze()
         for rows in [int(value) for value in args.rows.split(",")]:
             if not 0 < rows <= capacity:
                 raise ValueError("rows must fit the serving chunk capacity64")
@@ -147,24 +144,24 @@ def main():
 
                 run()
                 torch.testing.assert_close(out, expected, rtol=0.035, atol=0.035)
-                freeze_kernel_resolution("V4.1 attention mode benchmark")
                 try:
                     graph = capture_cuda_graph(run, warmup=5)
                     times_us = bench_cuda_graph(
                         graph, replays=30, l2_flush=l2_flush
                     )["replay_us"]
                 finally:
-                    unfreeze_kernel_resolution()
+                    graph.reset()
                 row = {
                     "rows": rows,
                     "indexed": indexed,
                     "mode": mode,
                     "median_us": statistics.median(times_us),
-                    "planned_max_chunks_per_row": plan.caps.max_chunks_per_row,
+                    "planned_max_chunks_per_row": plan.prepared.state.config.max_chunks_per_row,
                     "samples_us": times_us,
                 }
                 records.append(row)
                 print(json.dumps(row), flush=True)
+        session.close()
     result = {
         "schema_version": 1,
         "device": torch.cuda.get_device_name(device),

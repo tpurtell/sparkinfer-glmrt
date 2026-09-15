@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.attention.dsa_indexer._impl import clear_indexer_caches
 from b12x.attention.dsa_indexer.persistent_topk import (
     persistent_topk2048_scratch_nbytes,
@@ -137,13 +137,10 @@ def test_persistent_topk_multirow_eager_and_changed_graph_gpu(rows: int) -> None
     _assert_exact(output, logits, lengths, page_table)
     warm_compile_misses = int(compile_cache_info()["compile_misses"])
 
-    freeze_kernel_resolution("persistent top-k graph must reuse the eager kernel")
-    try:
+    with kernel_resolution_guard('persistent top-k graph must reuse the eager kernel'):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = run()
-    finally:
-        unfreeze_kernel_resolution()
     assert captured.data_ptr() == output.data_ptr()
     assert int(compile_cache_info()["compile_misses"]) == warm_compile_misses
 
