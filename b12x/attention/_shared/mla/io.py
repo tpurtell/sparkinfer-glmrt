@@ -103,6 +103,7 @@ def stage_dsv41_fp8_scales(
     valid: Boolean,
     *,
     swa: cutlass.Constexpr,
+    scale_address=None,
 ) -> None:
     """Stage DSV4.1's canonical FP8 metadata before publishing a KV stage.
 
@@ -111,12 +112,14 @@ def stage_dsv41_fp8_scales(
     entries deliberately issue no global load and publish a zero conversion
     sidecar with unit (byte 127) canonical scales.
     """
+    if cutlass.const_expr(scale_address is None):
+        scale_address = get_ptr_as_int64(source, record_offset + Int64(512 if swa else 256))
     if valid:
         if cutlass.const_expr(swa):
             # The 16 source bytes are two UE8M0 scales per 64-dimensional group.
             # A single aligned vector load avoids scalar metadata traffic.
             m0, m1, m2, m3 = ld_global_nc_v4_u32(
-                get_ptr_as_int64(source, record_offset + Int64(512))
+                scale_address
             )
             metadata = [m0, m1, m2, m3]
             scale_word_lo = Uint32(0)
@@ -155,10 +158,10 @@ def stage_dsv41_fp8_scales(
             # Indexed records have 32 E4M3 scales at byte 256: four native
             # 16-wide scales per output 64-wide group.
             m0, m1, m2, m3 = ld_global_nc_v4_u32(
-                get_ptr_as_int64(source, record_offset + Int64(256))
+                scale_address
             )
             m4, m5, m6, m7 = ld_global_nc_v4_u32(
-                get_ptr_as_int64(source, record_offset + Int64(272))
+                scale_address + Int64(16)
             )
             metadata = [m0, m1, m2, m3, m4, m5, m6, m7]
             scale_word_lo = Uint32(0)

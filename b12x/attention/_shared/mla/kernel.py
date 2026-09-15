@@ -59,6 +59,7 @@ from .decode_math import (
     s7_epilogue,
 )
 from .io import io_issue_gather, io_issue_gather_packed, io_issue_packed_payload
+from .native_v41_records import issue_native_v41_gather, native_v41_metadata_valid
 from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import (
     ComputeMode,
@@ -728,6 +729,32 @@ class UnifiedDecodeKernel:
             per_token_len=False,
         )
 
+    @cute.jit
+    def call_native_v41(self, q: cute.Tensor, descriptors: cute.Tensor,
+                        metadata: cute.Tensor, selected: cute.Tensor,
+                        bounds: cute.Tensor, mid_out: cute.Tensor, mid_lse: cute.Tensor,
+                        sm_scale_log2: Float32, rows: Int32, stream: cuda.CUstream):
+        # Internal native entry: host binding must validate FP4 descriptors,
+        # aligned planes, live-row bounds and disjoint caller-owned scratch.
+        assert self.native_dsv41_fp8 and self.valid_hpb == 16
+        assert self.topk == 128 and self.extra_topk == 512
+        assert self.swa_indices_stride_row == self.extra_indices_stride_row
+        self.kernel_native_v41(q, descriptors, metadata, selected, bounds,
+                               mid_out, mid_lse, sm_scale_log2).launch(
+            grid=(rows, self.h_blocks, self.num_splits),
+            block=(self.block_threads, 1, 1), min_blocks_per_mp=1, stream=stream)
+
+    @cute.kernel
+    def kernel_native_v41(self, q: cute.Tensor, descriptors: cute.Tensor,
+                          metadata: cute.Tensor, selected: cute.Tensor,
+                          bounds: cute.Tensor, mid_out: cute.Tensor, mid_lse: cute.Tensor,
+                          sm_scale_log2: Float32):
+        self._kernel_body(q, descriptors, selected, mid_out, mid_lse,
+            sm_scale_log2, Float32(1), Int32(128), Int64(0), descriptors,
+            selected, Int32(512), Int32(2), Int64(0), selected, selected,
+            has_extra=True, per_token_len=False, native_descriptors=descriptors,
+            native_metadata=metadata, native_bounds=bounds)
+
     @cute.kernel
     def kernel_extra(
         self,
@@ -874,6 +901,9 @@ class UnifiedDecodeKernel:
         *,
         has_extra: cutlass.Constexpr,
         per_token_len: cutlass.Constexpr,
+        native_descriptors=None,
+        native_metadata=None,
+        native_bounds=None,
     ):
         t = self.traits
         L = self.layout
@@ -890,6 +920,17 @@ class UnifiedDecodeKernel:
         if cutlass.const_expr(self.head_block_offset != 0):
             head_block = head_block + Int32(self.head_block_offset)
         head_base = head_block * Int32(8 if self.native_h8 else t.hpb)
+
+        if cutlass.const_expr(native_descriptors is not None):
+            valid_request = native_v41_metadata_valid(
+                native_descriptors[token_idx, None], native_metadata[token_idx, None],
+                native_bounds[token_idx])
+            if not valid_request:
+                if tid < Int32(self.valid_hpb):
+                    mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
+                for index in cutlass.range(tid, self.valid_hpb * 512, self.block_threads):
+                    mid_out[token_idx, head_base + index // Int32(512), split_idx, index % Int32(512)] = cutlass.BFloat16(0)
+                _exit_thread()
 
         # Load and clamp replay-time lengths before touching the shared KV
         # pipeline. Capacity planning, launch geometry, and workspace addresses
@@ -1241,7 +1282,22 @@ class UnifiedDecodeKernel:
                 # uniform across the IO warp (derived from the chunk index) so the
                 # runtime branch is divergence-free. When has_extra=False this is
                 # const_expr-pinned to the main gather -> byte-identical PTX.
-                if cutlass.const_expr(has_extra):
+                if cutlass.const_expr(native_descriptors is not None):
+                    if ci >= num_main_chunks:
+                        issue_native_v41_gather(
+                            native_descriptors[token_idx, None], native_metadata[token_idx, None],
+                            extra_row, native_bounds[token_idx],
+                            kv_fp8_addr + buf * kv_fp8_buf, kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view, mbar_base + buf, (ci - num_main_chunks) * Int32(64), io_lane,
+                            swa=False, kv_stride=staged_kv_stride, io_threads=self.io_threads)
+                    else:
+                        issue_native_v41_gather(
+                            native_descriptors[token_idx, None], native_metadata[token_idx, None],
+                            extra_row, native_bounds[token_idx],
+                            kv_fp8_addr + buf * kv_fp8_buf, kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view, mbar_base + buf, ci * Int32(64), io_lane,
+                            swa=True, kv_stride=staged_kv_stride, io_threads=self.io_threads)
+                elif cutlass.const_expr(has_extra):
                     if ci >= num_main_chunks:
                         cis = ci - num_main_chunks
                         g_start = cis * Int32(_CAND_WINDOW)
