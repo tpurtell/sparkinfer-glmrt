@@ -101,9 +101,9 @@ def _check_v41_native_expert_routing_and_graph(m, n, experts, after_graph_check=
         w2_alphas=ones,
         quant_mode="w4a8_mx",
         source_format="fp4_e8m0_k32",
-        activation="silu_v41",
+        activation="silu_v41", swiglu_limit=10,
     )
-    binding = make_tp_moe_fp4_binding(
+    with make_tp_moe_fp4_binding(
         a=x,
         experts=prepared,
         topk_weights=routing,
@@ -111,45 +111,45 @@ def _check_v41_native_expert_routing_and_graph(m, n, experts, after_graph_check=
         quant_mode="w4a8_mx",
         swiglu_limit=10,
         output=torch.empty_like(x),
-    )
+    ) as binding:
 
-    def check(actual, wanted):
-        actual = actual.float()
-        assert torch.isfinite(actual).all() and actual.norm() > 0
-        rel_l2 = (actual - wanted).norm() / wanted.norm()
-        cosine = torch.nn.functional.cosine_similarity(
-            actual.flatten(), wanted.flatten(), dim=0
-        )
-        assert rel_l2 < 0.01, rel_l2.item()
-        assert cosine > 0.9999, cosine.item()
+        def check(actual, wanted):
+            actual = actual.float()
+            assert torch.isfinite(actual).all() and actual.norm() > 0
+            rel_l2 = (actual - wanted).norm() / wanted.norm()
+            cosine = torch.nn.functional.cosine_similarity(
+                actual.flatten(), wanted.flatten(), dim=0
+            )
+            assert rel_l2 < 0.01, rel_l2.item()
+            assert cosine > 0.9999, cosine.item()
 
-    for _ in range(3):
-        result = binding.run()
-    check(result, expected)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        result = binding.run()
-    x.mul_(-0.5)
-    ids.copy_(changed_ids)
-    before = torch.cuda.memory_allocated()
-    graph.replay()
-    assert torch.cuda.memory_allocated() == before
-    check(result, expected_changed)
-    if m == 1 and n == 576 and experts == 384:
-        config = binding.execution_plan.policy_resolution.config
-        expected_mode = "direct" if torch.cuda.get_device_capability() == (12, 1) else "grouped"
-        assert config.dynamic_route_mode == expected_mode
-        saved_ids = ids.clone()
-        ids.fill_(-1)
+        for _ in range(3):
+            result = binding.run()
+        check(result, expected)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = binding.run()
+        x.mul_(-0.5)
+        ids.copy_(changed_ids)
+        before = torch.cuda.memory_allocated()
         graph.replay()
-        assert torch.count_nonzero(result) == 0
-        ids.copy_(saved_ids)
-        graph.replay()
+        assert torch.cuda.memory_allocated() == before
         check(result, expected_changed)
+        if m == 1 and n == 576 and experts == 384:
+            config = binding.execution_plan.policy_resolution.config
+            expected_mode = "direct" if torch.cuda.get_device_capability() == (12, 1) else "grouped"
+            assert config.dynamic_route_mode == expected_mode
+            saved_ids = ids.clone()
+            ids.fill_(-1)
+            graph.replay()
+            assert torch.count_nonzero(result) == 0
+            ids.copy_(saved_ids)
+            graph.replay()
+            check(result, expected_changed)
 
-    if after_graph_check is not None:
-        after_graph_check(binding, x, ids, routing)
+        if after_graph_check is not None:
+            after_graph_check(binding, x, ids, routing)
 
 
 @pytest.mark.parametrize("m,n", [(1,576),(16,576),(80,576),(1,2304),(16,2304),(80,2304)])
@@ -171,23 +171,23 @@ def test_v41_expert_tiny_activation_floor_and_graph(m,n):
         a=x,a1_gscale=ones,w1_fp4=torch.cat((weights["w3"],weights["w1"]),1),
         w1_blockscale=torch.cat((scales["w3"],scales["w1"]),1),w1_alphas=ones,
         a2_gscale=ones,w2_fp4=weights["w2"],w2_blockscale=scales["w2"],
-        w2_alphas=ones,quant_mode="w4a8_mx",source_format="fp4_e8m0_k32",activation="silu_v41")
-    binding = make_tp_moe_fp4_binding(a=x,experts=prepared,topk_weights=routing,topk_ids=ids,
-        quant_mode="w4a8_mx",swiglu_limit=10,output=torch.empty_like(x))
-    result = binding.run()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+        w2_alphas=ones,quant_mode="w4a8_mx",source_format="fp4_e8m0_k32",activation="silu_v41",swiglu_limit=10)
+    with make_tp_moe_fp4_binding(a=x,experts=prepared,topk_weights=routing,topk_ids=ids,
+        quant_mode="w4a8_mx",swiglu_limit=10,output=torch.empty_like(x)) as binding:
         result = binding.run()
-    # Tiny input below E4M3's minimum after the floor; tiny routed intermediate;
-    # nonzero tiny input amplified by weights; nonzero tiny routed intermediate.
-    for value,route,zero in [(1e-10,1.0,True),(.0002,1e-12,True),(1e-8,1.0,False),(.0002,1e-7,False)]:
-        x.fill_(value)
-        routing.fill_(route)
-        ids.add_(1).remainder_(experts)
-        expected = reference(x,ids,routing,weights,scales).bfloat16()
-        assert bool((expected == 0).all()) == zero
-        graph.replay()
-        assert torch.equal(result,expected), (m,n,value,route,(result.float()-expected.float()).abs().max().item())
-    torch.cuda.synchronize()
-    graph.reset()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = binding.run()
+        # Tiny input below E4M3's minimum after the floor; tiny routed intermediate;
+        # nonzero tiny input amplified by weights; nonzero tiny routed intermediate.
+        for value,route,zero in [(1e-10,1.0,True),(.0002,1e-12,True),(1e-8,1.0,False),(.0002,1e-7,False)]:
+            x.fill_(value)
+            routing.fill_(route)
+            ids.add_(1).remainder_(experts)
+            expected = reference(x,ids,routing,weights,scales).bfloat16()
+            assert bool((expected == 0).all()) == zero
+            graph.replay()
+            assert torch.equal(result,expected), (m,n,value,route,(result.float()-expected.float()).abs().max().item())
+        torch.cuda.synchronize()
+        graph.reset()
