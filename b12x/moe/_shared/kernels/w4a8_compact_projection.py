@@ -31,7 +31,7 @@ class W4A8CompactMicroProjectionKernel:
     num_warps = 4
     threads_per_cta = 128
 
-    def __init__(self, k: int, n: int, num_topk: int):
+    def __init__(self, k: int, n: int, num_topk: int, *, wire_rows: bool = False):
         if k <= 0 or n < 64 or k % 128 or n % 64:
             raise ValueError(
                 "compact W4A8 projection requires K divisible by 128 and "
@@ -39,6 +39,9 @@ class W4A8CompactMicroProjectionKernel:
             )
         if num_topk <= 0:
             raise ValueError("num_topk must be positive")
+        self.wire_rows = bool(wire_rows)
+        self.input_row_words = (k + k // 32) // 4 if wire_rows else k // 4
+        self.scale_row_bytes = k + k // 32 if wire_rows else k // 32
         self.k = int(k)
         self.n = int(n)
         self.num_topk = int(num_topk)
@@ -227,7 +230,7 @@ class W4A8CompactMicroProjectionKernel:
         token = pair // Int32(self.num_topk)
         if tid < Int32(4):
             src_word = (
-                Int64(token) * Int64(self.k // 4)
+                Int64(token) * Int64(self.input_row_words)
                 + Int64(k64_slice) * Int64(16)
                 + Int64(tid * 4)
             )
@@ -236,7 +239,7 @@ class W4A8CompactMicroProjectionKernel:
                 get_ptr_as_int64(a_words, src_word),
             )
         if tid == Int32(0):
-            sf_src = Int64(token) * Int64(self.k // 32) + Int64(k64_slice >> 1) * Int64(
+            sf_src = Int64(token) * Int64(self.scale_row_bytes) + Int64(k64_slice >> 1) * Int64(
                 4
             )
             cp_async_u32_shared_global(

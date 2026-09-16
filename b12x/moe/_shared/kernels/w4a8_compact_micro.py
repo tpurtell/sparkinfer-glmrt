@@ -93,7 +93,9 @@ class _DirectW4A8CompactLaunch:
         swiglu_limit: float | None,
         fast_math: bool,
         native_v41: bool = False,
+        wire_rows: bool = False,
     ):
+        self.wire_rows = bool(wire_rows)
         self.native_v41 = bool(native_v41)
         self.capacity = max_tokens
         self.topk = num_topk
@@ -102,7 +104,7 @@ class _DirectW4A8CompactLaunch:
         self.experts = experts
         self.input_scale_count = input_scale_count
         self.down_scale_count = down_scale_count
-        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk)
+        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk, wire_rows=wire_rows)
         self.activation = W4A8CompactMicroActivationKernel(
             n,
             experts,
@@ -144,10 +146,10 @@ class _DirectW4A8CompactLaunch:
         pairs = self.capacity * self.topk
         rows = pairs
         packed_a = cute.make_tensor(
-            packed_a_ptr, cute.make_layout((self.capacity * self.k,))
+            packed_a_ptr, cute.make_layout((self.capacity * (self.k + self.k // 32 if self.wire_rows else self.k),))
         )
         a_scales = cute.make_tensor(
-            a_scales_ptr, cute.make_layout((self.capacity * self.k // 32,))
+            a_scales_ptr, cute.make_layout((self.capacity * (self.k + self.k // 32 if self.wire_rows else self.k // 32),))
         )
         n_tiles = (self.n + 127) // 128
         n_padded = n_tiles * 128
