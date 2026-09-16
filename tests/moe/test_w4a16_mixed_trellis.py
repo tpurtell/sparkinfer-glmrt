@@ -61,6 +61,32 @@ def test_projection_tier_rate_family_validation() -> None:
             _projection_tier_bits(tiers(*bits))  # type: ignore[arg-type]
 
 
+def test_explicit_mixed_residency_limits_and_cache_identity() -> None:
+    apply = mixed_trellis_module._apply_mixed_residency
+    kernel = object.__new__(W4A16MixedTrellisKernel)
+    kernel.driver = SimpleNamespace(__cache_key__=("driver",))
+    kernel.tier0 = SimpleNamespace(__cache_key__=("k3",))
+    kernel.tier1 = SimpleNamespace(__cache_key__=("k4",))
+    kernel.blocks_per_sm = 1
+    kernel.cta_threads = 128
+    kernel.shared_words = 8192
+    before = kernel.__cache_key__
+    apply(kernel, None, 101376)
+    assert kernel.__cache_key__ == before
+    apply(kernel, 2, 101376)
+    assert kernel.blocks_per_sm == 2 and kernel.__cache_key__ != before
+    for invalid in (0, 3, True, 1.5):
+        with pytest.raises(ValueError):
+            apply(kernel, invalid, 101376)
+    kernel.cta_threads = 256
+    with pytest.raises(ValueError, match="register"):
+        apply(kernel, 2, 101376)
+    kernel.cta_threads = 128
+    kernel.shared_words = 13056
+    with pytest.raises(ValueError, match="shared-memory"):
+        apply(kernel, 2, 101376)
+
+
 def _mixed_cache_key(tier0_experts: int, tier1_experts: int) -> tuple[object, ...]:
     """Build the key without constructing CUDA-backed kernels.
 
