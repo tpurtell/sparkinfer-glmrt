@@ -64,6 +64,7 @@ def test_projection_tier_rate_family_validation() -> None:
 def test_explicit_mixed_residency_limits_and_cache_identity() -> None:
     apply = mixed_trellis_module._apply_mixed_residency
     kernel = object.__new__(W4A16MixedTrellisKernel)
+    kernel.paired_boundary = None
     kernel.driver = SimpleNamespace(__cache_key__=("driver",))
     kernel.tier0 = SimpleNamespace(__cache_key__=("k3",))
     kernel.tier1 = SimpleNamespace(__cache_key__=("k4",))
@@ -71,6 +72,11 @@ def test_explicit_mixed_residency_limits_and_cache_identity() -> None:
     kernel.cta_threads = 128
     kernel.shared_words = 8192
     before = kernel.__cache_key__
+    kernel.paired_boundary = "first"
+    first = kernel.__cache_key__
+    kernel.paired_boundary = "last"
+    assert kernel.__cache_key__ != first and first != before
+    kernel.paired_boundary = None
     apply(kernel, None, 101376)
     assert kernel.__cache_key__ == before
     apply(kernel, 2, 101376)
@@ -96,6 +102,7 @@ def _mixed_cache_key(tier0_experts: int, tier1_experts: int) -> tuple[object, ..
     """
 
     kernel = object.__new__(W4A16MixedTrellisKernel)
+    kernel.paired_boundary = None
     kernel.driver = SimpleNamespace(__cache_key__=("driver",))
     kernel.tier0 = SimpleNamespace(
         __cache_key__=("dynamic-k3",), num_experts=tier0_experts
