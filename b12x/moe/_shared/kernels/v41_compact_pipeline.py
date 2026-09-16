@@ -1,8 +1,9 @@
 """Native TP2 compact pipeline consuming the existing FP8 K32 wire rows.
 
 The signature matches V41SlicePipeline so the native expert ABI is unchanged.
-Only intermediate, projections and FP32 route output require scratch. Counts
-is bound to the native initialized unit-scale vector by the AOT bridge.
+Only intermediate, projections and FP32 route output require scratch. Native
+outer scales are compile-time ones: capacity variants share and overwrite the
+same arena, so no persistent initialized constant may be read from scratch.
 """
 
 import cuda.bindings.driver as cuda
@@ -17,7 +18,7 @@ class V41CompactPipeline:
         self.compact = _DirectW4A8CompactLaunch(
             max_tokens=capacity, num_topk=6, k=5120, n=1152, experts=384,
             input_scale_count=384, down_scale_count=384, swiglu_limit=10,
-            fast_math=False, native_v41=True, wire_rows=True)
+            fast_math=False, native_v41=True, wire_rows=True, unit_scales=True)
 
     @cute.jit
     def __call__(

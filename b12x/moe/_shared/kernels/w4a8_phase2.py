@@ -79,10 +79,12 @@ class W4A8MaterializedPhase2Kernel:
         n64_tail: bool = False,
         direct_routes: bool = False,
         native_v41: bool = False,
+        unit_scales: bool = False,
     ):
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
         self.direct_routes = bool(direct_routes)
+        self.unit_scales = bool(unit_scales)
         self.native_v41 = bool(native_v41)
         if self.native_v41 and not (direct_routes and deterministic_output):
             raise ValueError("native V4.1 phase 2 requires deterministic direct routes")
@@ -703,9 +705,11 @@ class W4A8MaterializedPhase2Kernel:
         physical_row_base = source_m_tile * Int32(self.source_tile_m) + m_half * Int32(
             self.tile_m
         )
-        down_scale = down_alpha[expert_idx].to(cutlass.Float32) * global_scale[
-            0 if cutlass.const_expr(global_scale.shape[0] == 1) else expert_idx
-        ].to(cutlass.Float32)
+        down_scale = cutlass.Float32(1.0)
+        if cutlass.const_expr(not self.unit_scales):
+            down_scale = down_alpha[expert_idx].to(cutlass.Float32) * global_scale[
+                0 if cutlass.const_expr(global_scale.shape[0] == 1) else expert_idx
+            ].to(cutlass.Float32)
         col_base = (
             output_tile * Int32(self.tile_n)
             + warp_idx * Int32(self.tile_n // 4)

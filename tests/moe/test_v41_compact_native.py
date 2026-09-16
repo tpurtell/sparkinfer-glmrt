@@ -104,7 +104,7 @@ def test_compact_wire_pipeline_live_rows():
     output = torch.empty(cap*topk,h,device='cuda')
     tensors = [wire[:,:h].view(torch.uint32),wire[:,h:],
         *[t.view(torch.uint32).flatten() for t in (rt.w13_rp,rt.w13_sfb,rt.w2_rp,rt.w2_sfb)],
-        ids,routing,dummy,mid,ones,dummy,dummy,dummy,dummy,projected,output]
+        ids,routing,dummy,mid,torch.zeros_like(ones),dummy,dummy,dummy,dummy,projected,output]
     args = [from_dlpack(t,assumed_align=16) for t in tensors]
     compiled = cute.compile(V41CompactPipeline(cap,torch.cuda.get_device_properties(0).multi_processor_count),
                             *args,cutlass.Int32(1),current_cuda_stream())

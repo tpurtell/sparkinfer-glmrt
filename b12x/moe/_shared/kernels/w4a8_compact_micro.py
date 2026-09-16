@@ -94,6 +94,7 @@ class _DirectW4A8CompactLaunch:
         fast_math: bool,
         native_v41: bool = False,
         wire_rows: bool = False,
+        unit_scales: bool = False,
     ):
         self.wire_rows = bool(wire_rows)
         self.native_v41 = bool(native_v41)
@@ -104,7 +105,7 @@ class _DirectW4A8CompactLaunch:
         self.experts = experts
         self.input_scale_count = input_scale_count
         self.down_scale_count = down_scale_count
-        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk, wire_rows=wire_rows)
+        self.projection = W4A8CompactMicroProjectionKernel(k, n, num_topk, wire_rows=wire_rows, unit_scales=unit_scales)
         self.activation = W4A8CompactMicroActivationKernel(
             n,
             experts,
@@ -116,6 +117,7 @@ class _DirectW4A8CompactLaunch:
             source_tile_m=1,
             deterministic_output=True,
             direct_routes=True,
+            unit_scales=unit_scales,
             native_v41=native_v41,
             n64_repacked=self.n % 128 == 64,
             n64_tail=self.n % 128 == 64,

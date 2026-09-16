@@ -31,7 +31,7 @@ class W4A8CompactMicroProjectionKernel:
     num_warps = 4
     threads_per_cta = 128
 
-    def __init__(self, k: int, n: int, num_topk: int, *, wire_rows: bool = False):
+    def __init__(self, k: int, n: int, num_topk: int, *, wire_rows: bool = False, unit_scales: bool = False):
         if k <= 0 or n < 64 or k % 128 or n % 64:
             raise ValueError(
                 "compact W4A8 projection requires K divisible by 128 and "
@@ -39,6 +39,7 @@ class W4A8CompactMicroProjectionKernel:
             )
         if num_topk <= 0:
             raise ValueError("num_topk must be positive")
+        self.unit_scales = bool(unit_scales)
         self.wire_rows = bool(wire_rows)
         self.input_row_words = (k + k // 32) // 4 if wire_rows else k // 4
         self.scale_row_bytes = k + k // 32 if wire_rows else k // 32
@@ -412,9 +413,11 @@ class W4A8CompactMicroProjectionKernel:
         scale_expert = expert
         if cutlass.const_expr(input_scale.shape[0] == 1):
             scale_expert = Int32(0)
-        value_scale = alpha[expert].to(cutlass.Float32) * input_scale[
-            Int64(scale_expert)
-        ].to(cutlass.Float32)
+        value_scale = cutlass.Float32(1.0)
+        if cutlass.const_expr(not self.unit_scales):
+            value_scale = alpha[expert].to(cutlass.Float32) * input_scale[
+                Int64(scale_expert)
+            ].to(cutlass.Float32)
         # The prepared RP stores up first.  The seam is canonical gate then up.
         source_tile = projection_tile % Int32(self.n_tiles)
         dst_base = source_tile * Int32(self.tile_n)
