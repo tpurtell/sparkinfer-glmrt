@@ -9836,3 +9836,21 @@ def _materialize_dense_fused_quant(lowering, device):
     return _DenseFusedQuantState(
         lowering, device, programs["gemm"], programs.get("reduce"), _cached_alpha_one(device),
     )
+
+
+def v41_fp8_aot_expected_m(*, capacity: int, input_dim: int, output_dim: int,
+                          sm_count: int, num_groups: int = 1) -> int:
+    """Plan native V4.1 quantization/GEMM scheduling independently of storage.
+
+    On the 188-SM RTX, narrow split-K Q-A/KV are faster with the general TMA
+    scheduler and subgroup row quantizer than the special M1 paths. A declared
+    scheduling regime of 16 selects both without changing the runtime row bound,
+    one-row scratch layout, K32 quantization, or four-partial FP32 reduction.
+    Other geometries keep their measured recipes; notably index-Q prefers M1.
+    """
+    if capacity <= 0:
+        raise ValueError('native FP8 capacity must be positive')
+    if (capacity == 1 and sm_count == 188 and num_groups == 1
+            and input_dim == 5120 and output_dim in (512, 1280)):
+        return 16
+    return capacity
