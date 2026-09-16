@@ -13,7 +13,7 @@ belong to the serving framework; B12X owns only the prepared kernel path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Protocol, Sequence
 
@@ -87,6 +87,7 @@ class MixedTrellisCompileResult:
     direct_topk_routes: bool
     broadcast_suh: bool
     broadcast_svh: bool
+    paired_boundary: str | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -218,7 +219,7 @@ class W4A16MixedTrellisKernel:
 
     # Persistent compile keys do not include launch source text. Change this
     # version whenever the compiled argument or tensor-layout contract changes.
-    ABI_VERSION = 17
+    ABI_VERSION = 18
 
     def __init__(
         self,
@@ -226,6 +227,7 @@ class W4A16MixedTrellisKernel:
         driver: W4A16FusedMoeKernel,
         tier0: W4A16FusedMoeKernel,
         tier1: W4A16FusedMoeKernel,
+        paired_boundary: str | None = None,
     ):
         for name, moe in (("driver", driver), ("tier0", tier0), ("tier1", tier1)):
             if not moe.full_rotation or not moe.intermediate_rotation:
@@ -283,6 +285,17 @@ class W4A16MixedTrellisKernel:
             raise ValueError("tier-local expert ids must fit in nine bits")
         if driver.num_experts != tier0.num_experts + tier1.num_experts:
             raise ValueError("driver expert count must equal the sum of both tiers")
+        if paired_boundary not in (None, "first", "last"):
+            raise ValueError("paired boundary must be first, last, or None")
+        if paired_boundary is not None:
+            if driver.intermediate_size != 640:
+                raise ValueError("paired boundary requires five resident H128 blocks")
+            for moe in (driver, tier0, tier1):
+                if not moe.fc1.schedule_whole_tiles or not moe.fc2.schedule_whole_tiles:
+                    raise ValueError("paired boundary requires whole-tile scheduling")
+                if 128 % moe.fc1.tile_n or 128 % moe.fc2.tile_k:
+                    raise ValueError("paired boundary must align to FC1 N and FC2 K tiles")
+        self.paired_boundary = paired_boundary
         self.driver = driver
         self.tier0 = tier0
         self.tier1 = tier1
@@ -319,6 +332,7 @@ class W4A16MixedTrellisKernel:
             # dispatch bounds are reconstructed from the launch scalars.
             self.blocks_per_sm,
             self.shared_words,
+            self.paired_boundary,
         )
 
     @cute.jit
@@ -444,6 +458,29 @@ class W4A16MixedTrellisKernel:
             descriptor = descriptor_map[
                 descriptor_row * total_experts + combined_expert
             ].to(Int32)
+            if cutlass.const_expr(self.paired_boundary is not None):
+                # The fourth descriptor row is mutable batch metadata: one
+                # means compute the boundary block, zero means omit it. The
+                # first three rows and all physical tensor strides stay fixed.
+                owns_boundary = descriptor_map[
+                    Int64(3) * total_experts.to(Int64) + combined_expert.to(Int64)
+                ].to(Int32)
+                if owns_boundary == Int32(0):
+                    if cutlass.const_expr(is_fc1):
+                        local_n = output_n_tile % fc1_half_tiles
+                        if cutlass.const_expr(self.paired_boundary == "first"):
+                            if local_n < Int32(128 // self.driver.fc1.tile_n):
+                                descriptor = Int32(-1)
+                        else:
+                            if local_n >= Int32(512 // self.driver.fc1.tile_n):
+                                descriptor = Int32(-1)
+                    else:
+                        # Whole-tile scheduling assigns the full reduction to
+                        # this CTA. Trim actual K reads, retaining 640-channel
+                        # physical A/B strides and the ordinary output store.
+                        reduce_tile_count = Int32(512 // self.driver.fc2.tile_k)
+                        if cutlass.const_expr(self.paired_boundary == "first"):
+                            reduce_k_tile = Int32(128 // self.driver.fc2.tile_k)
             if descriptor >= Int32(0):
                 tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
                 local_expert = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
@@ -699,7 +736,7 @@ class W4A16MixedTrellisKernel:
         # partition is represented by three identical rows.
         descriptor_map = cute.make_tensor(
             descriptor_map_ptr,
-            layout=cute.make_layout((cutlass.Int64(3) * total_experts,), stride=(1,)),
+            layout=cute.make_layout((cutlass.Int64(4 if self.paired_boundary is not None else 3) * total_experts,), stride=(1,)),
         )
         global_to_combined = cute.make_tensor(
             global_to_combined_ptr,
@@ -1868,6 +1905,7 @@ def compile_mixed_trellis(
     broadcast_svh: bool = False,
     route_num_experts: int | None = None,
     force_blocks_per_sm: int | None = None,
+    paired_boundary: str | None = None,
 ) -> MixedTrellisCompileResult:
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -1941,6 +1979,7 @@ def compile_mixed_trellis(
             driver=make_kernel(total_experts, tier0_bits, **common),
             tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
             tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+            paired_boundary=paired_boundary,
         )
 
     kernel = _select_mixed_fc2_kernel(
@@ -2110,6 +2149,7 @@ def compile_mixed_trellis(
         direct_topk_routes=direct_topk_routes,
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
+        paired_boundary=paired_boundary,
     )
     _CACHE[cache_key] = result
     return result
@@ -2679,7 +2719,7 @@ def _check_descriptor_projection_counts(
 
     encoded = getattr(descriptor_map, "_mt_projection_counts", None)
     if encoded is None:
-        rows = descriptor_map.detach().cpu().view(3, total_experts)
+        rows = descriptor_map.detach().cpu().reshape(-1)[:3 * total_experts].view(3, total_experts)
         derived = []
         tier_count = len(gate_counts)
         for row in rows[:2]:
@@ -2977,7 +3017,7 @@ def bind_mixed_trellis(
     )
     for name, mapping, expected_entries in (
         ("global_to_combined", global_to_combined, route_num_experts),
-        ("descriptor_map", descriptor_map, 3 * total_experts),
+        ("descriptor_map", descriptor_map, (4 if launch.paired_boundary is not None else 3) * total_experts),
     ):
         if (
             mapping.dtype != torch.int32
