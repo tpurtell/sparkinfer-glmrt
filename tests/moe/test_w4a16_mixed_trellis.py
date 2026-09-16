@@ -372,6 +372,7 @@ def _serial_tier(
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor,
     block_size_m: int = 8,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     m, topk = int(topk_ids.shape[0]), int(topk_ids.shape[1])
     buffers = make_w4a16_packed_buffers(
@@ -392,6 +393,7 @@ def _serial_tier(
         topk_weights,
         topk_ids,
         activation="silu",
+        swiglu_limit=swiglu_limit,
         intermediate_cache13=buffers.intermediate_cache13,
         intermediate_cache2=buffers.intermediate_cache2,
         output=buffers.output,
@@ -430,6 +432,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
     full_rotation_output_dtype: str,
     geometry: tuple[int, int] = (128, 128),
     tile_config: tuple[int, int, int, int] | None = None,
+    swiglu_limit: float | None = None,
 ) -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -453,7 +456,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
         device=device,
         codebook=codebook,
     )
-    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    x = (torch.randn((m, hidden), device=device) * (0.1 if swiglu_limit is not None else 1.0e-3)).to(torch.bfloat16)
     # Global expert ids deliberately interleave the two bitrate tiers. The combined
     # namespace remains tier ordered so weight and rotation tables stay dense.
     # The final route uses vLLM's padding sentinel. Both packed and direct
@@ -464,9 +467,14 @@ def test_mixed_two_tier_matches_serial_and_captures(
     )
     map0 = torch.tensor([1, -1, 0, -1], dtype=torch.int32, device=device)
     map1 = torch.tensor([-1, 1, -1, 0], dtype=torch.int32, device=device)
-    serial = _serial_tier(x, tier0, topk_weights, topk_ids, map0)
-    serial = serial + _serial_tier(x, tier1, topk_weights, topk_ids, map1)
+    serial = _serial_tier(x, tier0, topk_weights, topk_ids, map0, swiglu_limit=swiglu_limit)
+    serial = serial + _serial_tier(x, tier1, topk_weights, topk_ids, map1, swiglu_limit=swiglu_limit)
     torch.cuda.synchronize(device)
+
+    if swiglu_limit is not None:
+        unclipped = _serial_tier(x, tier0, topk_weights, topk_ids, map0) + _serial_tier(x, tier1, topk_weights, topk_ids, map1)
+        assert torch.isfinite(serial).all() and torch.isfinite(unclipped).all()
+        assert float((serial - unclipped).norm() / unclipped.norm().clamp_min(1e-12)) > 0.01
 
     props = torch.cuda.get_device_properties(device)
     # Compile a larger capacity and hand execution the live vLLM-style output
@@ -489,6 +497,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
         ),
         route_ids_dtype=route_ids_dtype,
         trellis_codebook=codebook,
+        swiglu_limit=swiglu_limit,
         tier0_bits=bits[0],
         tier1_bits=bits[1],
         direct_topk_routes=direct_topk_routes,
@@ -592,8 +601,8 @@ def test_mixed_two_tier_matches_serial_and_captures(
     skipped_map1 = map1.clone()
     skipped_map1[3] = -1
     skipped_serial = _serial_tier(
-        x, tier0, topk_weights, topk_ids, map0
-    ) + _serial_tier(x, tier1, topk_weights, topk_ids, skipped_map1)
+        x, tier0, topk_weights, topk_ids, map0, swiglu_limit=swiglu_limit
+    ) + _serial_tier(x, tier1, topk_weights, topk_ids, skipped_map1, swiglu_limit=swiglu_limit)
     skipped_global_to_combined = global_to_combined.clone()
     skipped_global_to_combined[3] = -1
     skipped_binding = bind_mixed_trellis(
@@ -650,6 +659,7 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
     experts_per_tier: int,
     route_num_experts: int,
     monkeypatch: pytest.MonkeyPatch,
+    swiglu_limit: float | None = None,
 ) -> None:
     """Validate MCG K5 dispatch, multi-K FC2, and graph replay."""
 
@@ -668,7 +678,7 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
         for bits in (3, 4, 5)
     )
     total_experts = 3 * experts_per_tier
-    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    x = (torch.randn((m, hidden), device=device) * (0.1 if swiglu_limit is not None else 1.0e-3)).to(torch.bfloat16)
     topk_ids = (
         torch.arange(m * topk, dtype=torch.int32, device=device)
         .remainder(total_experts)
@@ -701,11 +711,16 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
     )
     serial = sum(
         (
-            _serial_tier(x, tier, topk_weights, topk_ids, expert_map)
+            _serial_tier(x, tier, topk_weights, topk_ids, expert_map, swiglu_limit=swiglu_limit)
             for tier, expert_map in zip(tiers, tier_maps, strict=True)
         ),
         torch.zeros((m, hidden), dtype=torch.float32, device=device),
     )
+    if swiglu_limit is not None:
+        unclipped = sum((_serial_tier(x, tier, topk_weights, topk_ids, expert_map)
+            for tier, expert_map in zip(tiers, tier_maps, strict=True)), torch.zeros_like(serial))
+        assert torch.isfinite(serial).all() and torch.isfinite(unclipped).all()
+        assert float((serial - unclipped).norm() / unclipped.norm().clamp_min(1e-12)) > 0.01
     props = torch.cuda.get_device_properties(device)
     route_slots = max_packed_route_slots((m + 1) * topk, 8, route_num_experts)
     launch = compile_mixed_trellis3(
@@ -722,6 +737,7 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(
         max_shared_mem=int(props.shared_memory_per_block_optin),
         force_tile_config=(128, 128, 128, 128),
         trellis_codebook="mcg",
+        swiglu_limit=swiglu_limit,
     )
     projection_tiers = tuple(
         tier for tier in range(3) for _ in range(experts_per_tier)
@@ -1912,3 +1928,18 @@ def test_full_rotation_prefill_capacity_reuses_native_launchers(tmp_path, route_
         assert tuple(tensor.data_ptr() for tensor in (*scratch, output)) == addresses
     finally:
         graph.reset()
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires SM120/SM121")
+@pytest.mark.parametrize("direct", [False, True])
+def test_mixed_trellis_swiglu_limit_matches_clipped_serial(direct):
+    test_mixed_two_tier_matches_serial_and_captures(
+        torch.int32, "mcg", (3, 4), direct, "bf16", geometry=(5120, 640), swiglu_limit=10.0,
+    )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires SM120/SM121")
+def test_mixed_three_tier_swiglu_limit_matches_clipped_serial(monkeypatch):
+    test_mixed_k3_k4_k5_matches_serial_and_captures(
+        5120, 640, 4, 6, 2, 6, monkeypatch, swiglu_limit=10.0,
+    )

@@ -8652,6 +8652,7 @@ def _plan_projection_mixed_trellis_launches(
                     direct_topk_routes=direct_topk_routes,
                 ),
                 trellis_codebook="mcg",
+                swiglu_limit=core_plan.swiglu_limit,
                 tier0_bits=tier_bits[0],
                 tier1_bits=tier_bits[1],
                 moe_block_size=block_size_m,
