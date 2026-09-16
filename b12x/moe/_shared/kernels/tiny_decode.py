@@ -34,6 +34,7 @@ from cutlass import Float32
 from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x.moe._shared.kernels.activations import normalize_swiglu_limit_for_activation
 from b12x._lib.intrinsics import (
     cvt_bf16x2_to_f16x2,
     cvt_e8m0x4_to_f32x4,
@@ -61,12 +62,14 @@ class MoETinyDecodeKernelBackend:
         activation: str = "silu",
         w13_layout: str = "w31",
         compile_time_phase: int = 1,
+        swiglu_limit: float | None = None,
     ):
         if activation != "silu":
             raise ValueError(f"tiny_decode supports silu only, got {activation!r}")
         if int(compile_time_phase) not in (1, 2):
             raise ValueError(f"unsupported tiny_decode phase {compile_time_phase!r}")
         self.compile_time_phase = int(compile_time_phase)
+        self.swiglu_limit = normalize_swiglu_limit_for_activation(activation, swiglu_limit)
         self.activation = activation
         self.w13_layout = w13_layout
         self._cfg_key = None
@@ -144,6 +147,7 @@ class MoETinyDecodeKernelBackend:
             self.activation,
             self.w13_layout,
             self.compile_time_phase,
+            self.swiglu_limit,
             self._cfg_key,
             self.grid_x,
         )
@@ -377,6 +381,11 @@ class MoETinyDecodeKernelBackend:
                                 u1 = Float32(
                                     inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)]
                                 )
+                                if cutlass.const_expr(self.swiglu_limit is not None):
+                                    g0 = cutlass.min(g0, Float32(self.swiglu_limit))
+                                    g1 = cutlass.min(g1, Float32(self.swiglu_limit))
+                                    u0 = cutlass.max(Float32(-self.swiglu_limit), cutlass.min(u0, Float32(self.swiglu_limit)))
+                                    u1 = cutlass.max(Float32(-self.swiglu_limit), cutlass.min(u1, Float32(self.swiglu_limit)))
                                 s0 = Float32(1.0) / (
                                     Float32(1.0) + cute.math.exp(-g0, fastmath=False)
                                 )
@@ -398,6 +407,11 @@ class MoETinyDecodeKernelBackend:
                             g1 = Float32(inter[ich + Int32(2 * jp + 1)])
                             u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
                             u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)])
+                            if cutlass.const_expr(self.swiglu_limit is not None):
+                                g0 = cutlass.min(g0, Float32(self.swiglu_limit))
+                                g1 = cutlass.min(g1, Float32(self.swiglu_limit))
+                                u0 = cutlass.max(Float32(-self.swiglu_limit), cutlass.min(u0, Float32(self.swiglu_limit)))
+                                u1 = cutlass.max(Float32(-self.swiglu_limit), cutlass.min(u1, Float32(self.swiglu_limit)))
                             s0 = Float32(1.0) / (
                                 Float32(1.0) + cute.math.exp(-g0, fastmath=False)
                             )
@@ -548,10 +562,11 @@ class MoETinyDecodeKernelBackend:
 class MoETinyDecodeKernelBackendPhase1(MoETinyDecodeKernelBackend):
     """Phase-1 compile identity for exact launch/resource attribution."""
 
-    def __init__(self, *, activation: str = "silu", w13_layout: str = "w31"):
+    def __init__(self, *, activation: str = "silu", w13_layout: str = "w31", swiglu_limit: float | None = None):
         super().__init__(
             activation=activation,
             w13_layout=w13_layout,
+            swiglu_limit=swiglu_limit,
             compile_time_phase=1,
         )
 
@@ -559,9 +574,10 @@ class MoETinyDecodeKernelBackendPhase1(MoETinyDecodeKernelBackend):
 class MoETinyDecodeKernelBackendPhase2(MoETinyDecodeKernelBackend):
     """Phase-2 compile identity for exact launch/resource attribution."""
 
-    def __init__(self, *, activation: str = "silu", w13_layout: str = "w31"):
+    def __init__(self, *, activation: str = "silu", w13_layout: str = "w31", swiglu_limit: float | None = None):
         super().__init__(
             activation=activation,
             w13_layout=w13_layout,
+            swiglu_limit=swiglu_limit,
             compile_time_phase=2,
         )

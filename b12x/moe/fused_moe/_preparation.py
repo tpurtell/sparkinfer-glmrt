@@ -572,7 +572,7 @@ def _program_carriers(
         ):
             launches.extend(_impl._get_tiny_decode_kernel(
                 plan.weight_E, plan.max_tokens_per_launch, plan.k, plan.n,
-                plan.num_topk, device=plan.device,
+                plan.num_topk, device=plan.device, swiglu_limit=plan.swiglu_limit,
             ))
         else:
             weight_layout = (

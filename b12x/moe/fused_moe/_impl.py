@@ -12856,6 +12856,7 @@ def _get_tiny_decode_kernel(
     num_topk: int,
     *,
     device: torch.device | None = None,
+    swiglu_limit: float | None = None,
 ):
     from b12x.moe._shared.kernels.tiny_decode import (
         MoETinyDecodeKernelBackendPhase1,
@@ -12867,7 +12868,7 @@ def _get_tiny_decode_kernel(
         MoETinyDecodeKernelBackendPhase1,
         MoETinyDecodeKernelBackendPhase2,
     ):
-        kernel = kernel_cls()
+        kernel = kernel_cls(swiglu_limit=swiglu_limit)
         kernel.configure(m, k, n, num_topk, weight_E, device=device)
         cache_key = ("tiny_decode",) + kernel.__cache_key__
         cached = None if planning() else _TINY_DECODE_KERNEL_CACHE.get(cache_key)
@@ -12895,7 +12896,7 @@ def _get_tiny_decode_kernel(
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
                 "integration.tp_moe.tiny_decode",
-                1,
+                2,
                 cache_key,
             ),
         )
@@ -12923,6 +12924,7 @@ def _launch_tiny_decode_flat(
     k: int,
     n: int,
     num_topk: int,
+    swiglu_limit: float | None = None,
 ) -> None:
     from b12x.moe._shared.kernels.tiny_decode import (
         MoETinyDecodeKernelBackend,
@@ -12930,7 +12932,7 @@ def _launch_tiny_decode_flat(
 
     del barrier_count, barrier_epoch
     compiled_fc1, compiled_fc2 = _get_tiny_decode_kernel(
-        weight_E, m, k, n, num_topk, device=a.device
+        weight_E, m, k, n, num_topk, device=a.device, swiglu_limit=swiglu_limit
     )
     rt = m * num_topk
     inter = micro_intermediate.view(torch.float32).reshape(-1)[: rt * 2 * n]
@@ -12971,6 +12973,7 @@ def _tp_moe_tiny_decode_launch_op(
     n: int,
     num_topk: int,
     volatile_launch_state: bool,
+    swiglu_limit: float | None = None,
 ) -> None:
     del volatile_launch_state
     _launch_tiny_decode_flat(
@@ -12990,6 +12993,7 @@ def _tp_moe_tiny_decode_launch_op(
         k=k,
         n=n,
         num_topk=num_topk,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -13012,6 +13016,7 @@ def _tp_moe_tiny_decode_launch_fake(
     n: int,
     num_topk: int,
     volatile_launch_state: bool,
+    swiglu_limit: float | None = None,
 ) -> None:
     return None
 
@@ -13183,6 +13188,7 @@ def _launch_micro(
             n,
             num_topk,
             workspace.volatile_launch_state,
+            swiglu_limit,
         )
         return
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
