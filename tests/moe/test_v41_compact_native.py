@@ -73,14 +73,15 @@ def test_native_compact_boundaries_and_live_rows(n):
             graph.reset()
 
 
-def test_compact_wire_pipeline_live_rows():
+@pytest.mark.parametrize('n,hybrid', [(1152,False),(1152,True),(576,True)])
+def test_compact_wire_pipeline_live_rows(n, hybrid):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
     from b12x._lib.utils import current_cuda_stream
-    from b12x.moe._shared.kernels.v41_compact_pipeline import V41CompactPipeline
+    from b12x.moe._shared.kernels.v41_compact_pipeline import V41CompactPipeline, V41HybridPipeline
 
-    cap, h, n, e, topk = 4, 5120, 1152, 384, 6
+    cap, h, e, topk = 16 if hybrid else 4, 5120, 384, 6
     ones = torch.ones(e, device='cuda')
     # Only six experts are addressed; unused pool contents cannot affect output.
     w13 = torch.empty((e, 2*n, h//2), device='cuda', dtype=torch.uint8)
@@ -93,8 +94,11 @@ def test_compact_wire_pipeline_live_rows():
         a=torch.empty(cap,h,device='cuda',dtype=torch.bfloat16),
         a1_gscale=ones, w1_fp4=w13, w1_blockscale=s13, w1_alphas=ones,
         a2_gscale=ones, w2_fp4=w2, w2_blockscale=s2, w2_alphas=ones,
-        activation='silu', quant_mode='w4a8_mx', source_format='fp4_e8m0_k32', swiglu_limit=10)
+        activation='silu_v41' if hybrid else 'silu', quant_mode='w4a8_mx', source_format='fp4_e8m0_k32', swiglu_limit=10)
     rt = experts._impl.representation_for('w4a8_mx')
+    padded_n = (n+127)//128*128
+    assert rt.w13_rp.numel()*rt.w13_rp.element_size() == e*padded_n*h
+    assert rt.w2_rp.numel()*rt.w2_rp.element_size() == e*padded_n*h//2
     wire = torch.empty(cap,5280,device='cuda',dtype=torch.uint8)
     ids = torch.arange(6,device='cuda',dtype=torch.int32).repeat(cap)
     routing = torch.full((cap*topk,),.25,device='cuda')
@@ -105,20 +109,35 @@ def test_compact_wire_pipeline_live_rows():
     tensors = [wire[:,:h].view(torch.uint32),wire[:,h:],
         *[t.view(torch.uint32).flatten() for t in (rt.w13_rp,rt.w13_sfb,rt.w2_rp,rt.w2_sfb)],
         ids,routing,dummy,mid,torch.zeros_like(ones),dummy,dummy,dummy,dummy,projected,output]
+    if hybrid:
+        planes = (n+191)//192
+        tensors[9] = torch.empty(e*cap*topk, device='cuda', dtype=torch.int32)
+        tensors[10] = torch.empty(e, device='cuda', dtype=torch.int32)
+        tensors[11] = torch.empty(e,2, device='cuda', dtype=torch.int32)
+        tensors[12] = torch.empty(cap*topk,19, device='cuda', dtype=torch.int32)
+        tensors[13] = torch.empty(cap*topk, device='cuda')
+        tensors[14] = torch.empty(cap*topk, device='cuda', dtype=torch.int32)
+        tensors[15] = torch.empty(planes,cap*topk,h, device='cuda')
     args = [from_dlpack(t,assumed_align=16) for t in tensors]
-    compiled = cute.compile(V41CompactPipeline(cap,torch.cuda.get_device_properties(0).multi_processor_count),
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    pipeline = (V41HybridPipeline(cap,192,sms,intermediate=n,cutoff=8 if n==1152 else 2)
+                if hybrid else V41CompactPipeline(cap,sms))
+    compiled = cute.compile(pipeline,
                             *args,cutlass.Int32(1),current_cuda_stream())
-    for rows in (1,3,4):
+    for rows in ((1,2,4,8,16,1,16,2) if hybrid else (1,3,4)):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph): compiled(*args,rows,current_cuda_stream())
         for value, invalid in [(256.,False),(128.,False),(0.,False),(256.,True)]:
             code = torch.tensor(value,device='cuda',dtype=torch.float8_e4m3fn).view(torch.uint8)
             wire[:,:h].fill_(int(code.item()));wire[:,h:].fill_(118)
             ids.fill_(-1 if invalid else 2)
+            tensors[8].fill_(777)
             output.fill_(float('nan'))
             allocations = torch.cuda.memory_stats()['allocation.all.allocated']
             graph.replay();torch.cuda.synchronize()
             assert torch.cuda.memory_stats()['allocation.all.allocated']==allocations
+            grouped_expected = hybrid and rows > (8 if n==1152 else 2)
+            assert int(tensors[8][0]) == (rows if grouped_expected else 777)
             gate = min(value*2**-9*h/64,10.)
             activated = torch.nn.functional.silu(torch.tensor(gate,device='cuda'))*gate*.25
             mid_ref = activated.bfloat16().expand(rows,n).contiguous()
