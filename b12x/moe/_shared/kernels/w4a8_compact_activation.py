@@ -32,12 +32,14 @@ class W4A8CompactMicroActivationKernel:
         *,
         swiglu_limit: float | None,
         fast_math: bool,
+        native_v41: bool = False,
     ):
         self.n = int(n)
         self.num_experts = int(num_experts)
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.fast_math = bool(fast_math)
+        self.native_v41 = bool(native_v41)
         if self.n < 64 or self.n % 64:
             raise ValueError(
                 "compact W4A8 micro activation requires N divisible by 64"
@@ -57,8 +59,9 @@ class W4A8CompactMicroActivationKernel:
         topk_ids: cute.Tensor,
         num_pairs: Int32,
         stream: cuda.CUstream,
+        token_weights: cute.Tensor | None = None,
     ) -> None:
-        self.kernel(projections, intermediate, topk_ids, num_pairs).launch(
+        self.kernel(projections, intermediate, topk_ids, num_pairs, token_weights).launch(
             grid=(num_pairs * Int32(self.n_tiles), 1, 1),
             block=[32, 1, 1],
             stream=stream,
@@ -71,6 +74,7 @@ class W4A8CompactMicroActivationKernel:
         intermediate: cute.Tensor,
         topk_ids: cute.Tensor,
         num_pairs: Int32,
+        token_weights: cute.Tensor | None,
     ) -> None:
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -108,11 +112,12 @@ class W4A8CompactMicroActivationKernel:
                             cutlass.Float32(1.0)
                             + cute.math.exp(-gate[i], fastmath=self.fast_math)
                         )
-                        # Preserve the common W4A8 contract: BF16 activation
-                        # boundary first; route weights are applied after FC2.
-                        value[i] = cutlass.BFloat16(
-                            gate[i] * sigmoid * up[i]
-                        ).to(cutlass.Float32)
+                        # Generic W4A8 routes after FC2. Native V4.1 applies
+                        # routing before the BF16/FP8 intermediate boundary.
+                        activated = gate[i] * sigmoid * up[i]
+                        if cutlass.const_expr(self.native_v41):
+                            activated = activated * token_weights[pair].to(cutlass.Float32)
+                        value[i] = cutlass.BFloat16(activated).to(cutlass.Float32)
 
                     amax = fabs_f32(value[0])
                     for i in cutlass.range_constexpr(1, 4):
@@ -122,6 +127,8 @@ class W4A8CompactMicroActivationKernel:
                             amax,
                             cute.arch.shuffle_sync_bfly(amax, offset=1 << shift),
                         )
+                    if cutlass.const_expr(self.native_v41):
+                        amax = fmax_f32(amax, cutlass.Float32(1e-4))
                     _, scale_byte = pow2_ceil_ue8m0(
                         amax * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )

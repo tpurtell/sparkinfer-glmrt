@@ -36,7 +36,7 @@ def _align_up(x: int, alignment: int = _ALIGN) -> int:
 
 @program_cache
 def _layout(
-    max_tokens: int, num_topk: int, k: int, n: int
+    max_tokens: int, num_topk: int, k: int, n: int, native_v41: bool = False
 ) -> dict[str, tuple[int, int]]:
     """Return aligned byte ranges for the caller-owned micro workspace."""
     cap = int(max_tokens)
@@ -56,7 +56,7 @@ def _layout(
         ("a_mma_scales", _ceil_div(cap, 128) * _ceil_div(k, 128) * 512),
         ("projections", cap * topk * 2 * n * 2),
         ("intermediate", rows * n_padded + rows * n_tiles * 4),
-        ("route_output", cap * topk * k * 2),
+        ("route_output", cap * topk * k * (4 if native_v41 else 2)),
     )
     offset = 0
     result: dict[str, tuple[int, int]] = {}
@@ -68,9 +68,9 @@ def _layout(
     return result
 
 
-def micro_scratch_nbytes(max_tokens: int, k: int, n: int, num_topk: int) -> int:
+def micro_scratch_nbytes(max_tokens: int, k: int, n: int, num_topk: int, native_v41: bool = False) -> int:
     """Exact 256-byte-aligned workspace requirement for the compact micro path."""
-    return _layout(max_tokens, num_topk, k, n)["total"][1]
+    return _layout(max_tokens, num_topk, k, n, native_v41)["total"][1]
 
 
 def _ptr(dtype: object, tensor: torch.Tensor, *, align: int = 16):
@@ -92,7 +92,9 @@ class _DirectW4A8CompactLaunch:
         down_scale_count: int,
         swiglu_limit: float | None,
         fast_math: bool,
+        native_v41: bool = False,
     ):
+        self.native_v41 = bool(native_v41)
         self.capacity = max_tokens
         self.topk = num_topk
         self.k = k
@@ -106,11 +108,13 @@ class _DirectW4A8CompactLaunch:
             experts,
             swiglu_limit=swiglu_limit,
             fast_math=fast_math,
+            native_v41=native_v41,
         )
         self.phase2 = W4A8MaterializedPhase2Kernel(
             source_tile_m=1,
             deterministic_output=True,
             direct_routes=True,
+            native_v41=native_v41,
             n64_repacked=self.n % 128 == 64,
             n64_tail=self.n % 128 == 64,
         )
@@ -206,6 +210,7 @@ class _DirectW4A8CompactLaunch:
             topk_ids,
             num_pairs,
             stream,
+            token_weights,
         )
         self.phase2(
             intermediate,
@@ -241,6 +246,7 @@ def _compiled_direct_w4a8_compact(
     down_scale_count: int,
     swiglu_limit: float | None,
     fast_math: bool,
+    native_v41: bool = False,
 ):
     launch = _DirectW4A8CompactLaunch(
         max_tokens=max_tokens,
@@ -252,6 +258,7 @@ def _compiled_direct_w4a8_compact(
         down_scale_count=down_scale_count,
         swiglu_limit=swiglu_limit,
         fast_math=fast_math,
+        native_v41=native_v41,
     )
     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
 
@@ -273,6 +280,7 @@ def _compiled_direct_w4a8_compact(
             down_scale_count,
             swiglu_limit,
             fast_math,
+            native_v41,
         ),
     )
     return b12x_compile(
@@ -289,7 +297,7 @@ def _compiled_direct_w4a8_compact(
         dummy(cutlass.Float32),
         dummy(cutlass.Uint32),
         dummy(cutlass.Uint32),
-        dummy(cutlass.BFloat16),
+        dummy(cutlass.Float32 if native_v41 else cutlass.BFloat16),
         dummy(cutlass.Float32),
         dummy(cutlass.Float32),
         Int32(1),
@@ -297,7 +305,7 @@ def _compiled_direct_w4a8_compact(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a8.compact_micro",
-            1,
+            2,
             (
                 device_index,
                 max_tokens,
@@ -310,6 +318,7 @@ def _compiled_direct_w4a8_compact(
                 down_scale_count,
                 swiglu_limit,
                 fast_math,
+                native_v41,
             ),
         ),
     )
@@ -341,11 +350,17 @@ def launch_w4a8_compact_micro(
     num_topk: int,
     swiglu_limit: float | None,
     fast_math: bool,
+    native_v41: bool = False,
     _prepared_kernel=None,
     _prepared_quantize=None,
     _sm_count: int | None = None,
 ) -> torch.Tensor:
-    """Run quantized projections, routed activation, and direct FC2 from fixed scratch."""
+    """Run quantized projections, routed activation, and direct FC2.
+
+    native_v41 applies routing before intermediate quantization, uses the
+    native 1e-4 activation floor, and returns FP32 routes for TP reduction.
+    Generic calls retain their BF16 route output and post-FC2 routing.
+    """
     if a.dtype != torch.bfloat16 or a.ndim != 2 or not a.is_contiguous():
         raise ValueError("a must be a contiguous BF16 [tokens, K] CUDA tensor")
     if topk_ids.dtype not in (torch.int32, torch.int64):
@@ -368,7 +383,7 @@ def launch_w4a8_compact_micro(
     if k % 256 or denom == 0 or (2 * w2_bytes) % denom:
         raise ValueError("w2 storage does not encode an exact prepared W4A8 layout")
     n = (2 * w2_bytes) // denom
-    layout = _layout(cap, num_topk, k, n)
+    layout = _layout(cap, num_topk, k, n, native_v41)
     storage = _as_bytes(scratch)
     if storage.numel() < layout["total"][1]:
         raise ValueError("scratch is smaller than micro_scratch_nbytes")
@@ -382,7 +397,7 @@ def launch_w4a8_compact_micro(
     scale_mma = region("a_mma_scales")
     intermediate = region("intermediate")
     projections = region("projections")
-    route = region("route_output").view(torch.bfloat16).view(cap * num_topk, k)
+    route = region("route_output").view(torch.float32 if native_v41 else torch.bfloat16).view(cap * num_topk, k)
     if _prepared_quantize is None:
         quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap)
     else:
@@ -400,6 +415,7 @@ def launch_w4a8_compact_micro(
         down_scale.numel(),
         swiglu_limit,
         fast_math,
+        native_v41,
     )
     ids = topk_ids.reshape(-1)
     weights = topk_weights.reshape(-1)
@@ -420,7 +436,7 @@ def launch_w4a8_compact_micro(
         _ptr(cutlass.Float32, input_scale),
         _ptr(cutlass.Uint32, w2),
         _ptr(cutlass.Uint32, w2_scales),
-        _ptr(cutlass.BFloat16, route),
+        _ptr(cutlass.Float32 if native_v41 else cutlass.BFloat16, route),
         _ptr(cutlass.Float32, alpha2),
         _ptr(cutlass.Float32, down_scale),
         num_tokens * int(num_topk),

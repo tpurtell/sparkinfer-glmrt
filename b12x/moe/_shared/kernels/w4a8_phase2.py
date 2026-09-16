@@ -78,10 +78,14 @@ class W4A8MaterializedPhase2Kernel:
         n64_repacked: bool = False,
         n64_tail: bool = False,
         direct_routes: bool = False,
+        native_v41: bool = False,
     ):
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
         self.direct_routes = bool(direct_routes)
+        self.native_v41 = bool(native_v41)
+        if self.native_v41 and not (direct_routes and deterministic_output):
+            raise ValueError("native V4.1 phase 2 requires deterministic direct routes")
         if self.direct_routes:
             if source_tile_m != 1:
                 raise ValueError(
@@ -720,8 +724,13 @@ class W4A8MaterializedPhase2Kernel:
                         if cutlass.const_expr(self.direct_routes)
                         else token_map[physical_row].to(Int32)
                     )
-                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
-                    if cutlass.const_expr(self.deterministic_output):
+                    scale = down_scale
+                    if cutlass.const_expr(not self.native_v41):
+                        scale = scale * token_weights[physical_row].to(cutlass.Float32)
+                    if cutlass.const_expr(self.native_v41):
+                        scatter_output[tok, col] = scale * fragment[0]
+                        scatter_output[tok, col + Int32(1)] = scale * fragment[1]
+                    elif cutlass.const_expr(self.deterministic_output):
                         # The routing front-end stores the token-major pair
                         # index in token_map for deterministic specializations.
                         # Each pair/output-column location has one producer, so
@@ -746,8 +755,13 @@ class W4A8MaterializedPhase2Kernel:
                         if cutlass.const_expr(self.direct_routes)
                         else token_map[physical_row].to(Int32)
                     )
-                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
-                    if cutlass.const_expr(self.deterministic_output):
+                    scale = down_scale
+                    if cutlass.const_expr(not self.native_v41):
+                        scale = scale * token_weights[physical_row].to(cutlass.Float32)
+                    if cutlass.const_expr(self.native_v41):
+                        scatter_output[tok, col] = scale * fragment[2]
+                        scatter_output[tok, col + Int32(1)] = scale * fragment[3]
+                    elif cutlass.const_expr(self.deterministic_output):
                         st_global_u32(
                             get_ptr_as_int64(scatter_output, Int64(tok) * Int64(scatter_n) + Int64(col)),
                             pack_f32x2_to_bfloat2(
