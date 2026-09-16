@@ -856,6 +856,7 @@ class MHCPostPrePartialKernel:
         split_k: int | None = None,
         compute_gram: bool = False,
         pre_only: bool = False,
+        materialize_pre: bool = True,
         post_only: bool = False,
         lagged_mix: bool = False,
         partials_per_cta: int = _POST_PRE_PARTIALS_PER_CTA,
@@ -881,6 +882,7 @@ class MHCPostPrePartialKernel:
         # partials directly from residual and do not materialize post_pre's
         # residual_out side.
         self.pre_only = bool(pre_only)
+        self.materialize_pre = bool(materialize_pre)
         # When True, this is the standalone post path: materialize residual_out
         # and skip the fn/residual partial reductions.
         self.post_only = bool(post_only)
@@ -997,7 +999,7 @@ class MHCPostPrePartialKernel:
                 r1 = Float32(residual[token, Int32(1), h])
                 r2 = Float32(residual[token, Int32(2), h])
                 r3 = Float32(residual[token, Int32(3), h])
-            if partial_group == Int32(0):
+            if const_expr(self.materialize_pre) and partial_group == Int32(0):
                 out[token, Int32(0), h] = r0.to(cutlass.BFloat16)
                 out[token, Int32(1), h] = r1.to(cutlass.BFloat16)
                 out[token, Int32(2), h] = r2.to(cutlass.BFloat16)
