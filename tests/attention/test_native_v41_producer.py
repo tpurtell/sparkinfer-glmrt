@@ -107,3 +107,58 @@ def test_native_producer_all_sources_and_graph_replay():
     check(invalid_row=True)
     assert torch.isneginf(lses[0][1]).all()
     assert torch.equal(partials[0][1], torch.zeros_like(partials[0][1]))
+
+    # Static 32-head TP2 AOT geometry must preserve the 64-head producer and
+    # sink merge, including invalid requests and live row-count transitions.
+    from cutlass import BFloat16, Float32, Int32, Uint64
+    from b12x._lib.utils import make_ptr, current_cuda_stream
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.attention._shared.mla.native_v41_aot import compile_native_v41_attention_aot
+
+    full = compile_native_v41_attention_aot()
+    half = compile_native_v41_attention_aot(32)
+    sink = torch.linspace(-2, 2, 64, device="cuda")
+    full_out = torch.empty_like(q)
+    half_q = [q[:, rank*32:(rank+1)*32].contiguous() for rank in range(2)]
+    half_p = [torch.empty(rows, 32, 10, 512, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    half_lse = [torch.empty(rows, 32, 10, device="cuda") for _ in range(2)]
+    half_out = [torch.empty_like(x) for x in half_q]
+    types = (BFloat16, Uint64, Uint64, Int32, Uint64, Float32, BFloat16, Float32, BFloat16)
+    alignments = (16, 8, 8, 4, 8, 4, 16, 4, 16)
+
+    def run_aot(kernel, query, sinks, partial, lse, output, count):
+        tensors = (query, descriptors, metadata, selected, bounds, sinks, partial, lse, output)
+        pointers = [make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+                    for tensor, dtype, align in zip(tensors, types, alignments)]
+        kernel(*pointers, Int32(count), current_cuda_stream())
+
+    def run_split(count):
+        run_aot(full, q, sink, partials[0], lses[0], full_out, count)
+        for rank in range(2):
+            run_aot(half, half_q[rank], sink[rank*32:(rank+1)*32],
+                    half_p[rank], half_lse[rank], half_out[rank], count)
+
+    def check_split(count):
+        joined = torch.cat([x[:count] for x in half_out], dim=1)
+        torch.testing.assert_close(joined, full_out[:count], atol=0, rtol=0)
+        assert torch.isfinite(joined).all()
+        assert joined.abs().max() > 0
+        torch.testing.assert_close(torch.cat([x[:count] for x in half_lse], dim=1),
+                                   lses[0][:count], atol=0, rtol=0)
+
+    # Warm each compiled pointer ABI before freezing resolution and capture.
+    run_split(rows)
+    check_split(rows)
+    with kernel_resolution_guard("native TP2 local heads prepared"):
+        for count in (1, rows, 2, rows):
+            run_split(count)
+            check_split(count)
+        compact_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(compact_graph):
+            run_split(rows)
+        q.mul_(.6)
+        for rank in range(2):
+            half_q[rank].copy_(q[:, rank*32:(rank+1)*32])
+        sink.add_(.25)
+        compact_graph.replay()
+        check_split(rows)
