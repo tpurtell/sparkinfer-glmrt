@@ -83,6 +83,23 @@ oracle in ``tests/moe/test_v41_nvfp4_numerics.py``. Power-of-two block scales
 make the decomposition exact and isolate kernel arithmetic; real checkpoints
 should be measured against the recorded decomposition envelope. A negative
 control must confirm the K/32 path is unchanged after the port.
+
+Testing strategy, in dependency order. ``tests/moe/test_v41_fused_slice.py``
+already drives this kernel directly through ``cute.compile`` with a real oracle
+and graph replay, so the port is testable without the AOT pipeline. Its fixture
+builds K/32 grids with ``_e8m0_scale_to_w4a8_sfb_inplace``; the K/16 residual
+grid needs the same 128-channel atom with twice the columns, which is the same
+staging change step 4 makes, so the fixture and the kernel must agree by
+construction rather than by assumption.
+
+The cheapest decisive check does not need an NVFP4 oracle at all. Encode every
+residual byte as E4M3 ``1.0``: the NVFP4 path then multiplies each nibble by one,
+so feeding it the same UE8M0 K/32 grid the existing fixture already produces must
+reproduce the current K/32 output *exactly*, not approximately. That isolates
+staging, indexing and MMA operand form from the decomposition. Vary the residual
+to ``2.0`` and the output must scale by two. Only after those two pass is it
+worth building the K/16 E4M3 fixture and comparing against an NVFP4 oracle that
+dequantizes ``E2M1 * E4M3(K/16) * FP32(global)``.
 """
 
 import cutlass
