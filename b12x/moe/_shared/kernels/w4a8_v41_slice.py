@@ -19,6 +19,41 @@ flat FP32 [token_capacity * 5120] output. Metadata input row IDs also select out
 tokens. This removes route/slice planes but changes FP32 addition order and flushes
 subnormal atomic operands/results; callers must qualify that numerical contract.
 The caller owns output clearing and stream ordering.
+
+NVFP4 W4A8 operand contract (port plan, not yet implemented)
+------------------------------------------------------------
+This kernel currently consumes only the native FP4/K32 storage: ``s13``/``s2``
+carry E8M0 K/32 grids, ``stage_repacked_sfb_*`` stages them, and every MMA uses
+``mxfp8_mma_m16n8k32_f32_e2m1`` with operands from ``e2m1x8_to_qmma_e2m1x8``,
+the residual-free six-instruction nibble spread.
+
+ModelOpt NVFP4 keeps the same packed E2M1 payload but replaces the scale grid:
+per-K/16 E4M3 block scales, decomposed for the hardware block-scale MMA into a
+shared UE8M0 K/32 exponent per adjacent pair plus per-K/16 E4M3 residual
+multipliers applied in-register during nibble expansion. Three things change,
+and all three are per-recipe compile-time branches rather than new arithmetic:
+
+1. Two more staged tensors per projection hold the K/16 residual grids, with
+   divisor 16 instead of 32 (``w13_residual`` ``[w1_n, K//16, E]`` and
+   ``down_residual`` ``[K, I_tp//16, E]``). ``stage_repacked_sfb_*`` already
+   parameterizes the divisor; call it with 16 and size the shared slot from
+   ``max(self.width * 2, 256)`` to the K/16 extent.
+2. Operand construction switches from ``e2m1x8_to_qmma_e2m1x8`` to the E4M3
+   relabeling form and multiplies each operand by its K/16 residual before the
+   MMA, then issues ``mxfp8_mma_m16n8k32_f32_e4m3``. The high-level dynamic
+   kernel is the reference implementation: see ``self.w4a8_residual`` in
+   ``b12x/moe/_shared/kernels/dynamic.py`` (residual word selection, the
+   ``(byte * 2) % 4 * 8`` shift, and the ``mxfp8_mma_m16n8k32_f32_e4m3`` call).
+3. The residual index tracks the K/16 block for the current ``kb``, which is
+   ``2 * kb`` for the low nibble and ``2 * kb + 1`` for the high nibble of each
+   K/32 pair; the shared UE8M0 exponent stays indexed as today.
+
+Validation must cover the RTX TP1 (2304) and TP2 (1152) geometries and the
+Spark TP4 (576, kernel width 640) geometry, against the FP32 V4.1 oracle in
+``tests/moe/test_v41_nvfp4_numerics.py``, before any NVFP4 throughput number is
+published. Power-of-two block scales make the decomposition exact and isolate
+kernel arithmetic; real checkpoints should be measured against the recorded
+decomposition envelope.
 """
 
 import cutlass
