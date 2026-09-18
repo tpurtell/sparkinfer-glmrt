@@ -30,30 +30,47 @@ the residual-free six-instruction nibble spread.
 ModelOpt NVFP4 keeps the same packed E2M1 payload but replaces the scale grid:
 per-K/16 E4M3 block scales, decomposed for the hardware block-scale MMA into a
 shared UE8M0 K/32 exponent per adjacent pair plus per-K/16 E4M3 residual
-multipliers applied in-register during nibble expansion. Three things change,
-and all three are per-recipe compile-time branches rather than new arithmetic:
+multipliers applied in-register during nibble expansion. Verified prerequisites:
 
-1. Two more staged tensors per projection hold the K/16 residual grids, with
-   divisor 16 instead of 32 (``w13_residual`` ``[w1_n, K//16, E]`` and
-   ``down_residual`` ``[K, I_tp//16, E]``). ``stage_repacked_sfb_*`` already
-   parameterizes the divisor; call it with 16 and size the shared slot from
-   ``max(self.width * 2, 256)`` to the K/16 extent.
-2. Operand construction switches from ``e2m1x8_to_qmma_e2m1x8`` to the E4M3
-   relabeling form and multiplies each operand by its K/16 residual before the
-   MMA, then issues ``mxfp8_mma_m16n8k32_f32_e4m3``. The high-level dynamic
-   kernel is the reference implementation: see ``self.w4a8_residual`` in
-   ``b12x/moe/_shared/kernels/dynamic.py`` (residual word selection, the
-   ``(byte * 2) % 4 * 8`` shift, and the ``mxfp8_mma_m16n8k32_f32_e4m3`` call).
-3. The residual index tracks the K/16 block for the current ``kb``, which is
-   ``2 * kb`` for the low nibble and ``2 * kb + 1`` for the high nibble of each
-   K/32 pair; the shared UE8M0 exponent stays indexed as today.
+* the native packer emits both grids at the extents this layout needs (see
+  ``native/cuda/kernels/v41_expert_pack.cu``; K/16 doubles only the scale planes);
+* the NVFP4 ``silu_v41`` weight plan resolves on SM120 and on real SM121 GB10 for
+  576/top-6/384, 1152/top-6/384 and 2304/top-3/128.
 
-Validation must cover the RTX TP1 (2304) and TP2 (1152) geometries and the
-Spark TP4 (576, kernel width 640) geometry, against the FP32 V4.1 oracle in
-``tests/moe/test_v41_nvfp4_numerics.py``, before any NVFP4 throughput number is
-published. Power-of-two block scales make the decomposition exact and isolate
-kernel arithmetic; real checkpoints should be measured against the recorded
-decomposition envelope.
+Exact change set, by site in this file:
+
+1. Constructor: add ``nvfp4: bool = False`` and keep the existing K/32 path as
+   the default so the exported MXFP4 modules are byte-identical.
+2. Signatures: thread two residual tensors, ``w13_residual`` (``[w1_n, K//16, E]``
+   uint8) and ``down_residual`` (``[K, I_tp//16, E]`` uint8), through both
+   ``V41FusedSliceKernel.__call__``/``kernel`` and ``V41SlicePipeline.__call__``.
+   They mirror ``w13``/``w2`` exactly, so stage them next to the scale staging.
+3. SMEM: ``sf`` is sized ``max(self.width * 2, 256)`` u32 and holds the K/32
+   grid; the residual grids are twice as wide per row, so give them their own
+   slot sized from the K/16 extent rather than aliasing ``sf``.
+4. Staging: reuse ``stage_repacked_sfb_slice`` and ``stage_repacked_sfb_k_slice``
+   with divisor 16 instead of 32 (both already take the divisor).
+5. FC1 MMA (four sites: two operand builds at the ``b[index]`` reads and the
+   ``gate``/``up`` MMA calls): replace ``e2m1x8_to_qmma_e2m1x8`` with
+   ``e2m1x8_mul_residual_to_e4m3x8`` and switch the MMA to
+   ``mxfp8_mma_m16n8k32_f32_e4m3``. The residual for the current ``kb`` is the
+   K/16 block ``2*kb`` for the low nibble and ``2*kb + 1`` for the high nibble;
+   ``b[index]`` packs both nibble halves, so derive the two residual words the
+   way ``dynamic.py`` does around its ``res_w0_u``/``res_w1_u`` selection.
+6. FC2 MMA: same two substitutions at ``b0, b1 = e2m1x8_to_qmma_e2m1x8(b[index])``
+   and its ``mxfp8_mma_m16n8k32_f32_e2m1`` call, using the down residual.
+7. Export/ABI: ``python/tools/export_b12x_v41_slices_aot.py`` and
+   ``export_b12x_v41_experts_aot.py`` pass the recipe through
+   ``--expert-storage`` (already added for the non-slice path), and
+   ``native/include/ds41rt_v41_experts.h`` gains the residual slots it already
+   reserves room for in ``DS41RT_V41_EXPERT_POINTERS``.
+
+Validation must cover the RTX TP1 (2304) and TP2 (1152) geometries on SM120 and
+the Spark TP4 (576, kernel width 640) geometry on SM121, against the FP32 V4.1
+oracle in ``tests/moe/test_v41_nvfp4_numerics.py``. Power-of-two block scales
+make the decomposition exact and isolate kernel arithmetic; real checkpoints
+should be measured against the recorded decomposition envelope. A negative
+control must confirm the K/32 path is unchanged after the port.
 """
 
 import cutlass
