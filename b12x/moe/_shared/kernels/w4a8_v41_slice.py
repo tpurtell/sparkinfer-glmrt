@@ -39,31 +39,43 @@ multipliers applied in-register during nibble expansion. Verified prerequisites:
 
 Exact change set, by site in this file:
 
-1. Constructor: add ``nvfp4: bool = False`` and keep the existing K/32 path as
-   the default so the exported MXFP4 modules are byte-identical.
-2. Signatures: thread two residual tensors, ``w13_residual`` (``[w1_n, K//16, E]``
-   uint8) and ``down_residual`` (``[K, I_tp//16, E]`` uint8), through both
-   ``V41FusedSliceKernel.__call__``/``kernel`` and ``V41SlicePipeline.__call__``.
-   They mirror ``w13``/``w2`` exactly, so stage them next to the scale staging.
-3. SMEM: ``sf`` is sized ``max(self.width * 2, 256)`` u32 and holds the K/32
-   grid; the residual grids are twice as wide per row, so give them their own
-   slot sized from the K/16 extent rather than aliasing ``sf``.
-4. Staging: reuse ``stage_repacked_sfb_slice`` and ``stage_repacked_sfb_k_slice``
-   with divisor 16 instead of 32 (both already take the divisor).
-5. FC1 MMA (four sites: two operand builds at the ``b[index]`` reads and the
-   ``gate``/``up`` MMA calls): replace ``e2m1x8_to_qmma_e2m1x8`` with
-   ``e2m1x8_mul_residual_to_e4m3x8`` and switch the MMA to
-   ``mxfp8_mma_m16n8k32_f32_e4m3``. The residual for the current ``kb`` is the
-   K/16 block ``2*kb`` for the low nibble and ``2*kb + 1`` for the high nibble;
-   ``b[index]`` packs both nibble halves, so derive the two residual words the
-   way ``dynamic.py`` does around its ``res_w0_u``/``res_w1_u`` selection.
-6. FC2 MMA: same two substitutions at ``b0, b1 = e2m1x8_to_qmma_e2m1x8(b[index])``
-   and its ``mxfp8_mma_m16n8k32_f32_e2m1`` call, using the down residual.
+1. Constructor: ``nvfp4`` flag added; the False path must stay byte-identical.
+2. Signatures: thread two residual tensors, ``w13_residual`` and
+   ``down_residual`` (uint8, same logical shape as ``s13``/``s2`` but with K/16
+   columns), through ``V41FusedSliceKernel.__call__``/``kernel`` and
+   ``V41SlicePipeline.__call__``.
+3. SMEM: the existing ``sf`` slot cannot hold the residual grids. They are twice
+   as wide per row, so allocate a separate slot sized from the K/16 extent.
+4. Staging needs a new helper, not a divisor argument.
+   ``stage_repacked_sfb_slice`` moves four packed scale words per row with one
+   ``cp_async4`` (16 bytes), which is exactly the four K/32 columns a 128-channel
+   tile holds. A K/16 tile needs eight columns, i.e. two 16-byte transfers per
+   row at +0 and +16, so port a ``stage_repacked_sfb_k16_slice`` that issues two
+   ``cp_async4`` calls and derives its word base from the K/16 stride
+   (``kernel_intermediate * 5120 // 16`` for W13, ``... // 8`` for W2, against the
+   K/32 base of ``// 64`` and ``// 128``). The same applies to
+   ``stage_repacked_sfb_k_slice`` for FC2.
+5. FC1 MMA (the ``b[index]`` operand builds and the gate/up MMA calls): replace
+   ``e2m1x8_to_qmma_e2m1x8`` with ``e2m1x8_mul_residual_to_e4m3x8`` and switch
+   ``mxfp8_mma_m16n8k32_f32_e2m1`` to ``mxfp8_mma_m16n8k32_f32_e4m3``. The two
+   have identical signatures, so only the call name changes. The residual operand
+   is ``broadcast_f32_to_half2(fp8_e4m3_to_f32(byte))``; the byte is the K/16
+   block of the current nibble, i.e. ``2*kb`` for the low nibble and ``2*kb + 1``
+   for the high nibble of each K/32 pair, read at the same in-atom offset the
+   scale read uses (``nf*32 + warp*8 + g``, with the up half offset by
+   ``self.width`` words).
+6. FC2 MMA: the same two substitutions at the FC2 operand build and its MMA,
+   using the down residual at ``(kb // 4) * 128 + nf*32 + warp*8 + g`` for the
+   shared K/32 exponent and the matching K/16 residual byte.
 7. Export/ABI: ``python/tools/export_b12x_v41_slices_aot.py`` and
    ``export_b12x_v41_experts_aot.py`` pass the recipe through
    ``--expert-storage`` (already added for the non-slice path), and
-   ``native/include/ds41rt_v41_experts.h`` gains the residual slots it already
-   reserves room for in ``DS41RT_V41_EXPERT_POINTERS``.
+   ``native/include/ds41rt_v41_experts.h`` gains the residual slots; the launch
+   struct already reserves ``DS41RT_V41_EXPERT_POINTERS`` room.
+
+The scale and residual reads share one index shape, so the safest first step is
+to stage only the residual into the new slot and leave the scale reads untouched,
+then verify against the oracle before touching FC2.
 
 Validation must cover the RTX TP1 (2304) and TP2 (1152) geometries on SM120 and
 the Spark TP4 (576, kernel width 640) geometry on SM121, against the FP32 V4.1
@@ -98,12 +110,17 @@ from b12x.moe._shared.kernels.w4a8_staging import (
 
 
 class V41FusedSliceKernel:
-    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576):
+    def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576,
+                 nvfp4=False):
         assert width in (64, 128, 192)
         assert not atomic_tokens or grouped
         self.atomic_tokens = atomic_tokens
         self.grouped = grouped
         self.width = width
+        # False keeps the qualified native FP4/K32 behaviour byte for byte;
+        # True enables the ModelOpt NVFP4 operand contract (per-K/16 E4M3
+        # residuals applied during nibble expansion, e4m3 MMA operand form).
+        self.nvfp4 = bool(nvfp4)
         assert intermediate > 0 and intermediate % 32 == 0
         self.intermediate = intermediate
         self.kernel_intermediate = (intermediate + 127) // 128 * 128
