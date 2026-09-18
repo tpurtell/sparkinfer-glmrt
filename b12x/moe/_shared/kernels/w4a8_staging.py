@@ -11,52 +11,6 @@ from b12x._lib.intrinsics import cp_async4_shared_global, get_ptr_as_int64
 
 
 @cute.jit
-def stage_repacked_sfb_k16_slice(
-    source: cute.Tensor,
-    shared_base: Int32,
-    word_stride: Int32,
-    k_tile: Int32,
-    n_start: Int32,
-    thread: Int32,
-    threads: cutlass.Constexpr,
-    width: cutlass.Constexpr,
-):
-    """Stage the K/16 residual rows of one slice as 64 contiguous bytes per row.
-
-    The residual grid reuses the same 128-channel tile atom as the scale grid,
-    but a tile carries eight K/16 columns instead of four K/32 columns, so each
-    row needs 64 bytes where the K/32 helper needs 16. ``cp_async4`` moves 16
-    bytes, so one row takes four transfers; the destination is written
-    contiguously and the caller indexes it as ``row * 64 + block`` for row
-    ``n - n_start``. ``word_stride`` is the caller's K/16 row stride in u32 words
-    and ``k_tile`` selects the 128-channel tile within the row.
-
-    Status: not yet integrated or validated. Nothing calls this helper, so it
-    cannot change existing behaviour -- the K/32 slice tests still pass with it
-    present. Before use it needs its CuTe DSL codegen exercised through the same
-    call shape as ``stage_repacked_sfb_slice``, and its source addressing
-    confirmed against the packed K/16 atom layout.
-    """
-    assert width in (64, 128, 192)
-    rows = width // 4
-    for iteration in cutlass.range_constexpr((rows + threads - 1) // threads):
-        index = thread + Int32(iteration * threads)
-        if index < Int32(rows):
-            row = Int64(index) * Int64(4)
-            word = (
-                (Int64(n_start) + row) * Int64(word_stride)
-                + Int64(k_tile) * Int64(8)
-                + row
-            )
-            destination = shared_base + Int32(index) * Int32(64)
-            for part in cutlass.range_constexpr(4):
-                cp_async4_shared_global(
-                    destination + Int32(part * 16),
-                    get_ptr_as_int64(source, word + Int64(part * 4)),
-                )
-
-
-@cute.jit
 def stage_repacked_b_slice(
     source: cute.Tensor,
     shared_base: Int32,
