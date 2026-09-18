@@ -11456,7 +11456,8 @@ def _get_dynamic_kernel(
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
     kernel_kwargs["direct_routing"] = bool(direct_routing)
-    kernel_kwargs["nvfp4_output_shards"] = nvfp4_output_shards
+    if nvfp4_output_shards != 1:
+        kernel_kwargs["nvfp4_output_shards"] = nvfp4_output_shards
     kernel_kwargs["prequantized_input"] = bool(prequantized_input)
     if external_route_plan:
         kernel_kwargs["external_route_plan"] = True
