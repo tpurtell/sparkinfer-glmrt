@@ -823,6 +823,8 @@ class MoEDynamicKernelBackend:
             activation == "silu_v41" and quant_recipe == "w4a8_mx"
             and w4a8_repacked and not share_input_across_experts
         ):
+            # The prequantized path consumes the native FP4/K32 repacked A
+            # staging; ModelOpt NVFP4 supplies its own activation staging.
             raise ValueError("prequantized input requires V4.1 repacked W4A8")
         activation = normalize_moe_activation(activation)
         if quant_recipe not in {
@@ -856,13 +858,14 @@ class MoEDynamicKernelBackend:
         # repeated FC1 stays local to the CTA (no global intermediate).
         self.v41_output_shards = 5 if self.is_v41 and direct_routing else 1
         if self.is_v41 and (
-            quant_recipe != "w4a8_mx"
+            quant_recipe not in ("w4a8_mx", "w4a8_nvfp4")
             or swap_ab
             or materialize_intermediate
             or not deterministic_output
         ):
             raise ValueError(
-                "V4.1 requires native unswapped W4A8 fused execution with per-route reduction"
+                "V4.1 requires unswapped W4A8 fused execution with per-route "
+                "reduction (w4a8_mx on native FP4/K32, w4a8_nvfp4 on ModelOpt NVFP4)"
             )
         self.is_gated = is_gated_moe_activation(activation)
         self.is_situ = activation == SITU

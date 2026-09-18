@@ -1974,9 +1974,11 @@ def _w4a8_dynamic_direct_candidate(
 
     # V4.1 keeps deterministic FP32 route planes and a fused intermediate.
     # Do not broaden the generic materialized/shared-input decode predicate.
+    # ModelOpt NVFP4 keeps the same qualified shape as the native FP4/K32
+    # recipe; wider A4 request-shape decode uses grouped route compaction.
     if activation == "silu_v41":
         return bool(
-            _normalize_quant_mode(quant_mode) == "w4a8_mx"
+            _normalize_quant_mode(quant_mode) in ("w4a8_mx", "w4a8_nvfp4")
             and num_experts == 384
             and n == 640
             and 0 < routed_rows <= 6
@@ -7263,6 +7265,10 @@ def _band_runs_direct_micro(
     micro_cls = _get_activation_kernel_spec(
         activation, quant_mode=quant_mode
     ).micro_kernel_cls
+    if micro_cls is None:
+        # An activation without a direct-micro consumer (V4.1 fused
+        # intermediate) always uses the dynamic kernel.
+        return False
     return micro_cls.is_supported(
         m=num_tokens, k=k, n=n, num_topk=num_topk, weight_E=weight_E
     )

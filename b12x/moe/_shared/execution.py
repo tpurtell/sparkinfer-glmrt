@@ -168,6 +168,20 @@ _SOURCE_FORMATS = {
 _TRELLIS_SOURCE_FORMATS = frozenset(
     {"exl3_trellis_mcg", "b12x_trellis", "btx"}
 )
+# The V4.1 fused intermediate boundary is arithmetic, not a storage format: it
+# rides every W4A8 FP4 recipe whose activation is block-FP8. Native FP4/K32 uses
+# the w4a8_mx recipe; ModelOpt NVFP4 uses w4a8_nvfp4, which keeps the K/16 E4M3
+# residual multipliers while sharing the same W4A8 control, epilogue and
+# scatter. Plain A4 (quant_mode "nvfp4") computes the intermediate in FP4, so it
+# cannot carry the trained FP8/BF16 boundary.
+_V41_QUANT_MODES = frozenset({"w4a8_mx", "w4a8_nvfp4"})
+_V41_SOURCE_FORMATS = frozenset({"fp4_e8m0_k32", "modelopt_nvfp4"})
+# The fused V4.1 boundary is defined per (recipe, storage) pair, so a matching
+# recipe and a known storage format are not sufficient on their own.
+_V41_SOURCE_FOR_QUANT_MODE = {
+    "w4a8_mx": "fp4_e8m0_k32",
+    "w4a8_nvfp4": "modelopt_nvfp4",
+}
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
@@ -261,13 +275,14 @@ class MoESpec:
         if self.source_format not in _SOURCE_FORMATS:
             raise ValueError(f"unsupported source_format {self.source_format!r}")
         if self.activation == "silu_v41" and (
-            self.quant_mode != "w4a8_mx"
-            or self.source_format != "fp4_e8m0_k32"
+            self.quant_mode not in _V41_QUANT_MODES
+            or _V41_SOURCE_FOR_QUANT_MODE.get(self.quant_mode) != self.source_format
             or self.apply_router_weight_on_input
             or self.io_dtype != "bfloat16"
         ):
             raise ValueError(
-                "silu_v41 requires BF16 I/O, native FP4/K32 weights and intermediate router weighting"
+                "silu_v41 requires BF16 I/O, W4A8 routed weights (native FP4/K32 "
+                "or ModelOpt NVFP4) and intermediate router weighting"
             )
         validate_moe_source_quant(
             source_format=self.source_format,
