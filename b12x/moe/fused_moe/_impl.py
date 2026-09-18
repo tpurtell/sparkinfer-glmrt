@@ -11256,6 +11256,7 @@ def _get_dynamic_kernel(
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
     direct_routing: bool = False,
+    nvfp4_output_shards: int = 1,
     external_route_plan: bool = False,
     prequantized_input: bool = False,
     share_input_across_experts: bool = False,
@@ -11274,6 +11275,25 @@ def _get_dynamic_kernel(
     ):
         raise ValueError("prequantized input requires native Spark geometry")
     quant_mode = _normalize_quant_mode(quant_mode)
+    if (
+        type(nvfp4_output_shards) is not int
+        or nvfp4_output_shards <= 0
+        or 40 % nvfp4_output_shards != 0
+    ):
+        raise ValueError("nvfp4_output_shards must be a positive integer divisor of 40")
+    if nvfp4_output_shards != 1 and not (
+        quant_mode == "nvfp4"
+        and direct_routing
+        and deterministic_output
+        and not nvfp4_materialize_intermediate
+        and not external_route_plan
+        and activation == "silu"
+        and k == 5120
+    ):
+        raise ValueError(
+            "NVFP4 output sharding requires direct deterministic fused SiLU "
+            "NVFP4 with K=5120"
+        )
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
     # with quant_recipe="w6a8_mx": Float8E4M3FN views of the 3:4-packed FP6
     # code bytes (gmem K extent 3K/4), MXFP8-E4M3 byte-container activation
@@ -11389,6 +11409,8 @@ def _get_dynamic_kernel(
         int(trellis_bits),
         bool(trellis_coupled),
     )
+    if nvfp4_output_shards != 1:
+        cache_key += ("nvfp4_output_shards", nvfp4_output_shards)
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED",
         "B12X_LEVEL10_REUSE_COMPILED",
@@ -11434,6 +11456,7 @@ def _get_dynamic_kernel(
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
     kernel_kwargs["direct_routing"] = bool(direct_routing)
+    kernel_kwargs["nvfp4_output_shards"] = nvfp4_output_shards
     kernel_kwargs["prequantized_input"] = bool(prequantized_input)
     if external_route_plan:
         kernel_kwargs["external_route_plan"] = True

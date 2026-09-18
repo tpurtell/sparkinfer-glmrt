@@ -805,6 +805,7 @@ class MoEDynamicKernelBackend:
         w4a8_n64_repacked: bool = False,
         w4a8_n64_tail: bool = False,
         direct_routing: bool = False,
+        nvfp4_output_shards: int = 1,
         external_route_plan: bool = False,
         prequantized_input: bool = False,
         materialize_intermediate: bool = False,
@@ -851,10 +852,34 @@ class MoEDynamicKernelBackend:
         self.fast_math = fast_math
         self.activation = activation
         self.is_v41 = activation == "silu_v41"
-        # Direct V4.1 decode assigns disjoint N1024 ranges to five tasks per
-        # route. Each retains all K slices and the original accumulation order;
+        if (
+            type(nvfp4_output_shards) is not int
+            or nvfp4_output_shards <= 0
+            or 40 % nvfp4_output_shards != 0
+        ):
+            raise ValueError("nvfp4_output_shards must be a positive integer divisor of 40")
+        if nvfp4_output_shards != 1 and not (
+            quant_recipe == "nvfp4"
+            and direct_routing
+            and deterministic_output
+            and not materialize_intermediate
+            and not external_route_plan
+            and activation == "silu"
+            and mma_tiler_mn[1] == 128
+            and sf_vec_size == 16
+            and work_source != _WORK_SOURCE_READY_QUEUE
+        ):
+            raise ValueError(
+                "NVFP4 output sharding requires direct deterministic fused SiLU "
+                "NVFP4 with N128 tiles and non-streaming work"
+            )
+        self.nvfp4_output_shards = nvfp4_output_shards
+        # Expand only the consumer domain into disjoint output-column ranges.
+        # Each task retains all K slices and their original accumulation order;
         # repeated FC1 stays local to the CTA (no global intermediate).
-        self.v41_output_shards = 5 if self.is_v41 and direct_routing else 1
+        self.v41_output_shards = (
+            5 if self.is_v41 and direct_routing else self.nvfp4_output_shards
+        )
         if self.is_v41 and (
             quant_recipe != "w4a8_mx"
             or swap_ab
@@ -2503,6 +2528,10 @@ class MoEDynamicKernelBackend:
         trellis_lut: cute.Tensor | None = None,  # 4 KiB T12 staircase (u8)
         trellis_rotations: cute.Tensor | None = None,  # [E*3I] fp16
     ):
+        if cutlass.const_expr(self.nvfp4_output_shards != 1):
+            assert cute.size(b_down.shape[0]) == 5120, (
+                "experimental NVFP4 output sharding requires 40 N128 output tiles"
+            )
         self.a_dtype = packed_a.element_type
         self.b_dtype = b_w13.element_type
         if cutlass.const_expr(self.is_w6a8):
@@ -9820,7 +9849,7 @@ class MoEDynamicKernelBackend:
                             tBgB_down[
                                 (
                                     None,
-                                    output_tile_idx,
+                                    output_tile_base + output_tile_idx,
                                     intermediate_slice,
                                     task_expert_idx,
                                 )
@@ -9835,7 +9864,7 @@ class MoEDynamicKernelBackend:
                             tBgSFB_down[
                                 (
                                     None,
-                                    output_tile_idx,
+                                    output_tile_base + output_tile_idx,
                                     intermediate_slice,
                                     task_expert_idx,
                                 )
