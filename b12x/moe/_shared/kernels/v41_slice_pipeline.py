@@ -14,13 +14,19 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 
 
 class V41SlicePipeline:
-    def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576):
+    def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6,
+                 intermediate=576, nvfp4=False):
         self.capacity = capacity
         self.atomic_tokens = atomic_tokens
         self.experts = experts
         self.topk = topk
+        # Routed-expert storage selects the operand contract. False is the
+        # qualified native FP4/K32 path; True is ModelOpt NVFP4.
+        self.nvfp4 = bool(nvfp4)
         self.plan = V41RoutePlan(capacity, experts, topk)
-        self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=atomic_tokens, intermediate=intermediate)
+        self.compute = V41FusedSliceKernel(width, grouped=True,
+                                           atomic_tokens=atomic_tokens,
+                                           intermediate=intermediate, nvfp4=nvfp4)
         self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate)
 
     @cute.jit
