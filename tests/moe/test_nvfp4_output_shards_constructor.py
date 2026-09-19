@@ -21,13 +21,14 @@ def test_dynamic_factory_default_output_shards(activation):
     assert kernel.nvfp4_output_shards == 1
 
 
-@pytest.mark.parametrize("shards", (1, 2, 4, 5, 8, 10, 20, 40))
+@pytest.mark.parametrize("shards", (0, 1, 2, 4, 5, 8, 10, 20, 40))
 @pytest.mark.parametrize("swap_ab", (False, True))
-def test_silu_factory_forwards_nvfp4_output_shards(shards, swap_ab):
+@pytest.mark.parametrize("direct_routing", (False, True))
+def test_silu_factory_forwards_nvfp4_output_shards(shards, swap_ab, direct_routing):
     kernel = _ACTIVATION_KERNEL_SPECS["silu"].make_dynamic_kernel(
         sf_vec_size=16,
         mma_tiler_mn=(16, 128),
-        direct_routing=True,
+        direct_routing=direct_routing,
         deterministic_output=True,
         swap_ab=swap_ab,
         nvfp4_output_shards=shards,
@@ -37,7 +38,7 @@ def test_silu_factory_forwards_nvfp4_output_shards(shards, swap_ab):
     assert kernel.swap_ab == swap_ab
 
 
-@pytest.mark.parametrize("shards", (0, -1, 3, 6, True, 5.0, "5", None))
+@pytest.mark.parametrize("shards", (-1, 3, 6, True, 5.0, "5", None))
 def test_silu_factory_rejects_invalid_nvfp4_output_shards(shards):
     with pytest.raises(ValueError, match="positive integer divisor of 40"):
         _ACTIVATION_KERNEL_SPECS["silu"].make_dynamic_kernel(
@@ -52,7 +53,6 @@ def test_silu_factory_rejects_invalid_nvfp4_output_shards(shards):
 @pytest.mark.parametrize(
     "override",
     (
-        {"direct_routing": False},
         {"deterministic_output": False},
         {"materialize_intermediate": True},
         {"external_route_plan": True},

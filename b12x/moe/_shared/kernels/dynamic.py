@@ -854,13 +854,12 @@ class MoEDynamicKernelBackend:
         self.is_v41 = activation == "silu_v41"
         if (
             type(nvfp4_output_shards) is not int
-            or nvfp4_output_shards <= 0
-            or 40 % nvfp4_output_shards != 0
+            or nvfp4_output_shards < 0
+            or (nvfp4_output_shards != 0 and 40 % nvfp4_output_shards != 0)
         ):
-            raise ValueError("nvfp4_output_shards must be a positive integer divisor of 40")
+            raise ValueError("nvfp4_output_shards must be 0 (adaptive) or a positive integer divisor of 40")
         if nvfp4_output_shards != 1 and not (
             quant_recipe == "nvfp4"
-            and direct_routing
             and deterministic_output
             and not materialize_intermediate
             and not external_route_plan
@@ -870,7 +869,7 @@ class MoEDynamicKernelBackend:
             and work_source != _WORK_SOURCE_READY_QUEUE
         ):
             raise ValueError(
-                "NVFP4 output sharding requires direct deterministic fused SiLU "
+                "NVFP4 output sharding requires deterministic fused SiLU "
                 "NVFP4 with N128 tiles and non-streaming work"
             )
         self.nvfp4_output_shards = nvfp4_output_shards
@@ -2404,6 +2403,7 @@ class MoEDynamicKernelBackend:
         num_groups: Int32,
         slice_chunk: Int32,
         gate_tile_cnt: Int32,
+        output_shards: Int32,
     ):
         """Decode the deterministic deferred-task layout arithmetically.
 
@@ -2414,8 +2414,8 @@ class MoEDynamicKernelBackend:
 
         # Expand only the consumer domain; producer metadata and its capacity
         # remain one record per physical M tile / intermediate group.
-        output_shard = slot % Int32(self.v41_output_shards)
-        slot = slot // Int32(self.v41_output_shards)
+        output_shard = slot % output_shards
+        slot = slot // output_shards
         m_tile = slot // num_groups
         group = slot - m_tile * num_groups
         slice_begin = group * slice_chunk
@@ -4736,7 +4736,18 @@ class MoEDynamicKernelBackend:
         if self.is_gated and not self.separate_w13_halves:
             gate_tile_cnt = intermediate_tile_cnt // Int32(2)
         output_tile_cnt = cute.size(gB_down, mode=[2])
-        phase1_output_tile_cnt = output_tile_cnt // Int32(self.v41_output_shards)
+        output_shards = Int32(max(1, self.v41_output_shards))
+        if cutlass.const_expr(self.nvfp4_output_shards == 0):
+            # Non-streaming routing has published every task before its resident
+            # grid barrier above. All CTAs read the same immutable count, including
+            # during graph replay with different routes. Split only the consumer
+            # domain; keep enough FC2 work per task to amortize repeated FC1.
+            published_tasks = _ld_global_acquire_i32(get_ptr_as_int64(task_tail, Int32(0)))
+            for factor in cutlass.range_constexpr(2, 9):
+                if cutlass.const_expr(40 % factor == 0):
+                    if published_tasks > Int32(0) and published_tasks * Int32(factor) <= Int32(gdim_z):
+                        output_shards = Int32(factor)
+        phase1_output_tile_cnt = output_tile_cnt // output_shards
         if cutlass.const_expr(self.materialize_intermediate):
             # Phase A stops after activation quantization.  Phase B below owns
             # the full-K FC2 contraction with a finer (M, N256) work domain.
@@ -5085,7 +5096,7 @@ class MoEDynamicKernelBackend:
             materialized_tail = _ld_global_acquire_i32(
                 get_ptr_as_int64(task_tail, Int32(0))
             )
-        materialized_tail *= Int32(self.v41_output_shards)
+        materialized_tail *= output_shards
         consumer_live = (
             Int32(0) if cutlass.const_expr(self.external_materialized_fc1) else Int32(1)
         )
@@ -5127,6 +5138,7 @@ class MoEDynamicKernelBackend:
                         materialized_num_groups,
                         task_slice_chunk,
                         route_gate_tile_cnt,
+                        output_shards,
                     )
                     has_task = Int32(1)
                 else:
@@ -5189,7 +5201,7 @@ class MoEDynamicKernelBackend:
                         tail = _ld_global_acquire_i32(
                             get_ptr_as_int64(task_tail, Int32(0))
                         )
-                        tail *= Int32(self.v41_output_shards)
+                        tail *= output_shards
                         if slot < tail:
                             self._decode_materialized_work_item(
                                 work_item,
@@ -5199,6 +5211,7 @@ class MoEDynamicKernelBackend:
                                 materialized_num_groups,
                                 task_slice_chunk,
                                 route_gate_tile_cnt,
+                                output_shards,
                             )
                             self._store_shared_work_item(ctrl_base_addr, work_item)
                             _st_shared_i32(

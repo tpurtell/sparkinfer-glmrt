@@ -11277,13 +11277,12 @@ def _get_dynamic_kernel(
     quant_mode = _normalize_quant_mode(quant_mode)
     if (
         type(nvfp4_output_shards) is not int
-        or nvfp4_output_shards <= 0
-        or 40 % nvfp4_output_shards != 0
+        or nvfp4_output_shards < 0
+        or (nvfp4_output_shards != 0 and 40 % nvfp4_output_shards != 0)
     ):
-        raise ValueError("nvfp4_output_shards must be a positive integer divisor of 40")
+        raise ValueError("nvfp4_output_shards must be 0 (adaptive) or a positive integer divisor of 40")
     if nvfp4_output_shards != 1 and not (
         quant_mode == "nvfp4"
-        and direct_routing
         and deterministic_output
         and not nvfp4_materialize_intermediate
         and not external_route_plan
@@ -11291,7 +11290,7 @@ def _get_dynamic_kernel(
         and k == 5120
     ):
         raise ValueError(
-            "NVFP4 output sharding requires direct deterministic fused SiLU "
+            "NVFP4 output sharding requires deterministic fused SiLU "
             "NVFP4 with K=5120"
         )
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
