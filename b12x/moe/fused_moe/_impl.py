@@ -6743,7 +6743,9 @@ def prepare_b12x_fp4_moe_weights(
             intermediate_size=plan.intermediate_size,
             num_experts=plan.num_experts,
             activation=plan.activation,
-            params_dtype=params_dtype,
+            # EXL3 full rotations use FP16 operands internally even when the
+            # model's public activation and output contract is BF16.
+            params_dtype=torch.float16,
             fc1_tile_n=tile_config[1],
             fc2_tile_n=tile_config[3],
             w13_layout="trellis_t256_proj",

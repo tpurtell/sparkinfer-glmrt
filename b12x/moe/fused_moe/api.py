@@ -39,8 +39,9 @@ from .planning import (
     plan_weights as _plan_weights,
     prepare_weights as _prepare_weights,
 )
-from .source import PackedSource, PackedSourceFormat, W13Layout, WeightSource
+from .source import Exl3TrellisSource, PackedSource, PackedSourceFormat, W13Layout, WeightSource
 from .weights import (
+    Exl3TrellisWeights,
     PackedWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -70,7 +71,7 @@ def plan_weights(
 
 
 def prepare_weights(
-    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights
+    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | Exl3TrellisWeights
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
     return _prepare_weights(plan=plan, weights=weights)
@@ -190,6 +191,8 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "Exl3TrellisSource",
+    "Exl3TrellisWeights",
     "ActivationMode",
     "ActivationSpec",
     "Binding",

@@ -110,6 +110,28 @@ class TrellisWeights:
             )
 
 
+@dataclass(frozen=True, kw_only=True)
+class Exl3TrellisWeights:
+    """Projection-major uniform EXL3 MCG tiles and rotation vectors."""
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+    gate_suh: torch.Tensor
+    up_suh: torch.Tensor
+    intermediate_rotations: torch.Tensor
+    down_svh: torch.Tensor
+    mcg: torch.Tensor | int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "w13", "w2", "gate_suh", "up_suh", "intermediate_rotations", "down_svh"
+        ):
+            if not isinstance(getattr(self, name), torch.Tensor):
+                raise TypeError(f"Exl3TrellisWeights.{name} must be a tensor")
+        if not isinstance(self.mcg, (torch.Tensor, int)):
+            raise TypeError("Exl3TrellisWeights.mcg must be a tensor or integer")
+
+
 @dataclass(frozen=True)
 class PackedWeights:
     """Ordinary packed MoE checkpoint tensors, without runtime policy fields.
@@ -185,6 +207,7 @@ class PreparedExperts:
 
 
 __all__ = [
+    "Exl3TrellisWeights",
     "PackedWeights",
     "PreparedExperts",
     "PreparedWeightFormat",

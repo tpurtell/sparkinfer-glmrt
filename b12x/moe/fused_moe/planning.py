@@ -14,8 +14,9 @@ from ._impl import (
     prepare_b12x_trellis_v2_weights,
 )
 from .config import TrellisConfig
-from .source import PackedSource, WeightSource
+from .source import Exl3TrellisSource, PackedSource, WeightSource
 from .weights import (
+    Exl3TrellisWeights,
     PackedWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -172,7 +173,7 @@ def _prepared_format(
             f"required packing {packing.value!r} is not available; "
             f"planner produced {sorted(value.value for value in available)}"
         )
-    if isinstance(source, TrellisConfig):
+    if isinstance(source, (TrellisConfig, Exl3TrellisSource)):
         weights = WeightEncoding.TRELLIS
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
@@ -243,6 +244,29 @@ def plan_weights(
             w13_layout=source.w13_layout.value,
             w4a16_layout=requested_layout,
         )
+    elif isinstance(source, Exl3TrellisSource):
+        if activation.mode is not ActivationMode.A16:
+            raise ValueError("EXL3 Trellis fused MoE requires A16 activations")
+        if activation.nonlinearity != "silu":
+            raise ValueError("EXL3 routed experts require SiLU")
+        if constraints.required_packing not in {None, WeightPacking.TRELLIS_NATIVE}:
+            raise ValueError("EXL3 Trellis requires trellis_native packing")
+        recipe = "w4a16"
+        raw_plan = plan_b12x_fp4_moe_weights(
+            quant_modes=recipe,
+            source_format="exl3_trellis_mcg",
+            activation=activation.nonlinearity,
+            params_dtype=activation.io_dtype,
+            num_experts=geometry.num_experts,
+            hidden_size=geometry.hidden_size,
+            intermediate_size=geometry.intermediate_size,
+            w13_layout="w13",
+            w4a16_layout="trellis_native",
+            trellis_bits=source.bits,
+            trellis_tile_config=source.tile_config,
+            trellis_codebook="mcg",
+            trellis_rate_granularity="uniform",
+        )
     elif isinstance(source, TrellisConfig):
         if activation.mode is not ActivationMode.A16:
             raise ValueError("Trellis fused MoE currently requires A16 activations")
@@ -280,7 +304,7 @@ def plan_weights(
             ),
         )
     else:
-        raise TypeError("source must be a PackedSource or TrellisConfig")
+        raise TypeError("source must be a PackedSource, Exl3TrellisSource, or TrellisConfig")
 
     return WeightPlan(
         source=source,
@@ -299,13 +323,27 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights,
+    weights: PackedWeights | TrellisWeights | Exl3TrellisWeights,
 ) -> PreparedExperts:
     """Materialize the in-memory representation selected by ``plan_weights``."""
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
-    if isinstance(plan.source, TrellisConfig):
+    if isinstance(plan.source, Exl3TrellisSource):
+        if not isinstance(weights, Exl3TrellisWeights):
+            raise TypeError("EXL3 Trellis preparation requires Exl3TrellisWeights")
+        prepared = prepare_b12x_fp4_moe_weights(
+            plan=plan._impl,
+            params_dtype=plan.activation.io_dtype,
+            w1_fp4=weights.w13,
+            w2_fp4=weights.w2,
+            gate_suh=weights.gate_suh,
+            up_suh=weights.up_suh,
+            intermediate_rotations=weights.intermediate_rotations,
+            down_svh=weights.down_svh,
+            trellis_mcg=weights.mcg,
+        )
+    elif isinstance(plan.source, TrellisConfig):
         if not isinstance(weights, TrellisWeights):
             raise TypeError("Trellis preparation requires TrellisWeights")
         prepared = prepare_b12x_trellis_v2_weights(

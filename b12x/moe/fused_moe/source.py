@@ -37,12 +37,30 @@ class PackedSource:
         object.__setattr__(self, "w13_layout", W13Layout(self.w13_layout))
 
 
-WeightSource: TypeAlias = PackedSource | TrellisConfig
+@dataclass(frozen=True, kw_only=True)
+class Exl3TrellisSource:
+    """Uniform EXL3 MCG projection tiles with independent Hadamard vectors."""
+
+    bits: int
+    tile_config: tuple[int, int, int, int] = (64, 256, 64, 256)
+
+    def __post_init__(self) -> None:
+        if type(self.bits) is not int or self.bits not in (3, 4, 5, 6):
+            raise ValueError("uniform EXL3 MCG rate must be K3, K4, K5, or K6")
+        if (
+            len(self.tile_config) != 4
+            or any(type(value) is not int or value <= 0 for value in self.tile_config)
+        ):
+            raise ValueError("EXL3 tile_config must contain four positive integers")
+
+
+WeightSource: TypeAlias = PackedSource | TrellisConfig | Exl3TrellisSource
 
 
 __all__ = [
     "PackedSource",
     "PackedSourceFormat",
+    "Exl3TrellisSource",
     "W13Layout",
     "WeightSource",
 ]
