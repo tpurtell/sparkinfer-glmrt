@@ -6,7 +6,9 @@ capacity * topk (the worst case of one group per route). Invalid expert IDs
 produce inverse=-1. Duplicate IDs are retained as separate routes.
 """
 
+import cutlass
 import cutlass.cute as cute
+import cutlass.utils
 import cuda.bindings.driver as cuda
 from cutlass import Int32, Int64, Uint32, Float32, range_constexpr
 
@@ -19,8 +21,109 @@ class V41RoutePlan:
         self.topk = topk
         self.routes = capacity * topk
 
+    # Decode capacities plan in one CTA: every live route has its own thread,
+    # and each expert/route reads the (broadcast) shared route table instead
+    # of three grid launches. Grouping, order and outputs are identical.
+    SMALL_THREADS = 512
+
+    def small(self):
+        return self.routes <= self.SMALL_THREADS and self.experts <= self.SMALL_THREADS
+
     @cute.jit
     def __call__(
+        self,
+        ids: cute.Tensor,
+        weights: cute.Tensor,
+        live_rows: cute.Tensor,
+        packed: cute.Tensor,
+        counts: cute.Tensor,
+        prefixes: cute.Tensor,
+        metadata: cute.Tensor,
+        grouped_weights: cute.Tensor,
+        inverse: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        if cutlass.const_expr(self.small()):
+            self.plan_small(ids, weights, live_rows, metadata, grouped_weights, inverse).launch(
+                grid=(1, 1, 1), block=(self.SMALL_THREADS, 1, 1), stream=stream
+            )
+        else:
+            self.plan_grid(ids, weights, live_rows, packed, counts, prefixes, metadata,
+                grouped_weights, inverse, stream)
+
+    @cute.kernel
+    def plan_small(
+        self,
+        ids: cute.Tensor,
+        weights: cute.Tensor,
+        live_rows: cute.Tensor,
+        metadata: cute.Tensor,
+        grouped_weights: cute.Tensor,
+        inverse: cute.Tensor,
+    ):
+        tid = cute.arch.thread_idx()[0]
+        smem = cutlass.utils.SmemAllocator()
+        route_expert = smem.allocate_tensor(Int32, cute.make_layout(self.SMALL_THREADS), byte_alignment=16)
+        route_rank = smem.allocate_tensor(Int32, cute.make_layout(self.SMALL_THREADS), byte_alignment=16)
+        expert_count = smem.allocate_tensor(Int32, cute.make_layout(self.SMALL_THREADS), byte_alignment=16)
+        route_prefix = smem.allocate_tensor(Int32, cute.make_layout(self.SMALL_THREADS), byte_alignment=16)
+        group_prefix = smem.allocate_tensor(Int32, cute.make_layout(self.SMALL_THREADS), byte_alignment=16)
+        rows = max(Int32(0), min(live_rows[0], Int32(self.capacity)))
+        live = rows * self.topk
+        if tid < self.routes:
+            metadata[tid, 1] = Int32(0)
+            inverse[tid] = Int32(-1)
+        expert = Int32(-1)
+        if tid < live:
+            candidate = Int32(ids[tid])
+            if candidate >= 0 and candidate < self.experts:
+                expert = candidate
+        route_expert[tid] = expert
+        cute.arch.sync_threads()
+        # A route's rank is the number of earlier routes to its expert: the
+        # stable ballot order the grid planner packs.
+        rank = Int32(-1)
+        if expert >= 0:
+            rank = Int32(0)
+            for q in range(tid):
+                rank += Int32(route_expert[q] == expert)
+        route_rank[tid] = rank
+        cute.arch.sync_threads()
+        # Per expert: its route count, the routes of smaller experts, and the
+        # groups (runs of 16) that start at smaller experts. All loops cover
+        # live routes only, never the 384-expert table.
+        if tid < self.experts:
+            count = Int32(0)
+            routes = Int32(0)
+            groups = Int32(0)
+            for q in range(live):
+                other = route_expert[q]
+                if other >= 0:
+                    count += Int32(other == tid)
+                    if other < tid:
+                        routes += 1
+                        groups += Int32(route_rank[q] % 16 == 0)
+            expert_count[tid] = count
+            route_prefix[tid] = routes
+            group_prefix[tid] = groups
+        cute.arch.sync_threads()
+        if expert >= 0:
+            count = expert_count[expert]
+            base = route_prefix[expert]
+            group = group_prefix[expert] + rank // 16
+            local = rank % 16
+            if local == 0:
+                metadata[group, 0] = expert
+                metadata[group, 1] = min(Int32(16), count - rank)
+                metadata[group, 2] = base + rank
+                for pad in range(min(Int32(16), count - rank), 16):
+                    metadata[group, 3 + pad] = Int32(-1)
+            metadata[group, 3 + local] = tid // self.topk
+            grouped_weights[base + rank] = weights[tid]
+            inverse[tid] = base + rank
+
+    @cute.jit
+    def plan_grid(
         self,
         ids: cute.Tensor,
         weights: cute.Tensor,
