@@ -41,9 +41,10 @@ def _prepared_binding(declaration, *, name: str, device, make_binding):
 
 
 def _interleaved_cache(blocks, width, device, layout_kind):
-    # The compact vLLM mixed pool has a 634752-byte block at width576:
-    # 1102 physical records; DSA layer7 starts448 records into each block.
-    stride_records, offset_records = (1102, 448) if layout_kind == "mixed" else (192, 64)
+    # Actual MTP-SWA layout:589248-byte blocks at width576,1023 records.
+    # Keep the earlier1102-record pool as a separate stride stress case.
+    stride_records = {"layers": 192, "mixed": 1102, "actual": 1023}[layout_kind]
+    offset_records = 64 if layout_kind == "layers" else 448
     owner = torch.empty((blocks * stride_records, width), dtype=FP8, device=device)
     cache = torch.as_strided(owner, (blocks,64,width),
         (stride_records*width,width,1), storage_offset=offset_records*width)
@@ -190,7 +191,7 @@ def test_request_relative_indices_are_stably_compacted_and_remapped(tp_size: int
     torch.testing.assert_close(actual_lse, expected_lse, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("layout_kind", ["layers", "mixed"])
+@pytest.mark.parametrize("layout_kind", ["layers", "mixed", "actual"])
 @pytest.mark.parametrize("record_width", [576, 1088])
 @pytest.mark.parametrize("tp_size", [2, 8])
 @torch.inference_mode()
@@ -200,7 +201,7 @@ def test_request_relative_indices_address_layer_interleaved_records(tp_size: int
     rows = 1
     blocks = 12
     layers = 3
-    stride_records = 1102 if layout_kind == "mixed" else layers * 64
+    stride_records = {"layers": layers * 64, "mixed": 1102, "actual": 1023}[layout_kind]
     plan = sparse_mla_strided.plan(
         sparse_mla_strided.Caps(
             device=device,
@@ -256,7 +257,7 @@ def test_request_relative_indices_address_layer_interleaved_records(tp_size: int
     torch.testing.assert_close(actual_lse, expected_lse, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("layout_kind", ["layers", "mixed"])
+@pytest.mark.parametrize("layout_kind", ["layers", "mixed", "actual"])
 @pytest.mark.parametrize("record_width", [576, 1088])
 @pytest.mark.parametrize("tp_size", [2, 8])
 @torch.inference_mode()
@@ -266,7 +267,7 @@ def test_fp8_sparse_replays_on_non_default_stream_without_allocation(tp_size: in
     rows = 2
     blocks = 32
     layers = 3
-    stride_records = 1102 if layout_kind == "mixed" else layers * 64
+    stride_records = {"layers": layers * 64, "mixed": 1102, "actual": 1023}[layout_kind]
     plan = sparse_mla_strided.plan(
         sparse_mla_strided.Caps(
             device=device,
@@ -341,15 +342,15 @@ def test_fp8_sparse_replays_on_non_default_stream_without_allocation(tp_size: in
         torch.testing.assert_close(captured_lse, expected_lse, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("layout_kind", ["layers", "mixed"])
+@pytest.mark.parametrize("layout_kind", ["layers", "mixed", "actual"])
 @pytest.mark.parametrize("record_width", [576, 1088])
 @pytest.mark.parametrize("tp_size", [2, 8])
 @torch.inference_mode()
 def test_fp8_physical_slot_offset_exceeds_signed_int32(tp_size: int, record_width: int, layout_kind: str) -> None:
     device = require_b12x()
     torch.manual_seed(20260817)
-    stride_records = 1102 if layout_kind == "mixed" else 64
-    offset_records = 448 if layout_kind == "mixed" else 0
+    stride_records = {"layers": 64, "mixed": 1102, "actual": 1023}[layout_kind]
+    offset_records = 0 if layout_kind == "layers" else 448
     int32_max = torch.iinfo(torch.int32).max
     high_block = int32_max // (stride_records * record_width) + 1
     high_slot = high_block * 64
