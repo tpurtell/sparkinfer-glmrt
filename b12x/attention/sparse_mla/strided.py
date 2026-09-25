@@ -56,6 +56,7 @@ class Caps:
     block_size: int = BLOCK_SIZE
     topk: int = TOPK
     kv_dtype: torch.dtype = FP8
+    physical_record_width: int = PHYSICAL_RECORD_WIDTH
     use_cuda_graph: bool = False
     budget: Budget | None = None
 
@@ -72,6 +73,8 @@ class Caps:
             raise ValueError(f"strided sparse MLA block_size must be {BLOCK_SIZE}")
         if int(self.topk) != TOPK:
             raise ValueError(f"strided sparse MLA topk must be {TOPK}")
+        if self.physical_record_width not in (QK_DIM, PHYSICAL_RECORD_WIDTH):
+            raise ValueError("physical_record_width must be 576 (compact) or 1088 (legacy padded)")
         if self.kv_dtype != FP8:
             raise TypeError("strided sparse MLA requires E4M3 KV cache")
         if int(self.max_q_rows) <= 0:
@@ -138,7 +141,7 @@ def _materialize_layout(caps: Caps) -> _StridedLayout:
         num_cache_pages=int(caps.max_physical_records),
         head_dim=QK_DIM,
         v_head_dim=VALUE_DIM,
-        physical_record_width=PHYSICAL_RECORD_WIDTH,
+        physical_record_width=int(caps.physical_record_width),
         use_cuda_graph=bool(caps.use_cuda_graph),
         budget=caps.budget,
     )
@@ -194,6 +197,7 @@ def compile_strided_sparse_mla(caps: Caps, ordinal: int):
         block_size=caps.block_size,
         topk=caps.topk,
         kv_dtype=caps.kv_dtype,
+        physical_record_width=caps.physical_record_width,
         use_cuda_graph=caps.use_cuda_graph,
         budget=caps.budget,
     )
@@ -207,7 +211,7 @@ def compile_strided_sparse_mla(caps: Caps, ordinal: int):
         rows = caps.max_q_rows
         q = empty((rows, caps.num_q_heads, QK_DIM), torch.bfloat16)
         cache = empty(
-            (caps.num_cache_blocks, BLOCK_SIZE, PHYSICAL_RECORD_WIDTH), FP8
+            (caps.num_cache_blocks, BLOCK_SIZE, int(caps.physical_record_width)), FP8
         )
         output = empty((rows, caps.num_q_heads, VALUE_DIM), torch.bfloat16)
         indices = empty((rows, TOPK), torch.int32)
@@ -326,14 +330,14 @@ def plan(
         num_q_heads=int(caps.num_q_heads), qk_head_dim=QK_DIM, v_head_dim=VALUE_DIM,
         max_q_rows=int(caps.max_q_rows), max_width=TOPK, page_size=BLOCK_SIZE,
         model_type=None, head_major_output=False, scale_format=0,
-        cache_record_bytes=PHYSICAL_RECORD_WIDTH, fp8_rope=False,
+        cache_record_bytes=int(caps.physical_record_width), fp8_rope=False,
         latent_scale_per_token=False, has_attention_sink=False,
         cache_layout="strided_physical", operation="strided_attention", slot_dtype="int32",
         prefill_mg_enabled=False,
         max_batch=int(caps.max_q_rows),
         max_page_table_width=TOPK,
         physical_block_size=BLOCK_SIZE,
-        physical_record_width=PHYSICAL_RECORD_WIDTH,
+        physical_record_width=int(caps.physical_record_width),
         num_cache_blocks=int(caps.num_cache_blocks),
         max_physical_records=int(caps.max_physical_records),
         tp_size=int(caps.tp_size),
@@ -365,7 +369,8 @@ def _physical_record_view(
     layout: _StridedLayout,
     kv_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, int, int]:
-    expected_record_shape = (BLOCK_SIZE, PHYSICAL_RECORD_WIDTH)
+    record_width = int(layout.caps.physical_record_width)
+    expected_record_shape = (BLOCK_SIZE, record_width)
     if (
         kv_cache.dtype != FP8
         or kv_cache.ndim != 3
@@ -375,23 +380,23 @@ def _physical_record_view(
         raise ValueError(
             "kv_cache must be E4M3 with shape "
             f"[1..{layout.caps.num_cache_blocks}, {BLOCK_SIZE}, "
-            f"{PHYSICAL_RECORD_WIDTH}], got "
+            f"{record_width}], got "
             f"dtype={kv_cache.dtype}, shape={tuple(kv_cache.shape)}"
         )
     block_stride, token_stride, element_stride = map(int, kv_cache.stride())
     if (
         element_stride != 1
-        or token_stride < PHYSICAL_RECORD_WIDTH
+        or token_stride < record_width
         or block_stride < BLOCK_SIZE * token_stride
-        or token_stride % PHYSICAL_RECORD_WIDTH
-        or block_stride % PHYSICAL_RECORD_WIDTH
+        or token_stride % record_width
+        or block_stride % record_width
     ):
         raise ValueError(
-            "kv_cache must use non-overlapping, whole 1088-element physical "
+            f"kv_cache must use non-overlapping, whole {record_width}-element physical "
             f"record strides, got stride={tuple(kv_cache.stride())}"
         )
-    block_stride_records = block_stride // PHYSICAL_RECORD_WIDTH
-    token_stride_records = token_stride // PHYSICAL_RECORD_WIDTH
+    block_stride_records = block_stride // record_width
+    token_stride_records = token_stride // record_width
     physical_records = (
         (int(kv_cache.shape[0]) - 1) * block_stride_records
         + (BLOCK_SIZE - 1) * token_stride_records
@@ -404,8 +409,8 @@ def _physical_record_view(
         )
     flat_cache = torch.as_strided(
         kv_cache,
-        size=(physical_records, 1, PHYSICAL_RECORD_WIDTH),
-        stride=(PHYSICAL_RECORD_WIDTH, PHYSICAL_RECORD_WIDTH, 1),
+        size=(physical_records, 1, record_width),
+        stride=(record_width, record_width, 1),
     )
     return flat_cache, block_stride_records, token_stride_records
 
