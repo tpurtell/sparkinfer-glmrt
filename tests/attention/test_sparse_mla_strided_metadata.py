@@ -57,3 +57,14 @@ def test_interleaved_record_view_and_capacity(width):
     misaligned = torch.empty_strided((12,64,width), (64*width+16,width,1), dtype=strided.FP8)
     with pytest.raises(ValueError, match='whole'):
         strided._physical_record_view(layout, misaligned)
+
+
+@pytest.mark.parametrize('tp_size,heads', [(1,128), (2,64), (8,16)])
+def test_owner_and_sharded_head_geometry(tp_size, heads):
+    metadata = strided.Caps(device='cpu', num_q_heads=heads, tp_size=tp_size,
+        max_q_rows=4, num_cache_blocks=12, physical_record_width=576)
+    layout = strided._materialize_layout(metadata)
+    assert layout.native.caps.num_q_heads == heads
+    with pytest.raises(ValueError, match='num_q_heads'):
+        strided.Caps(device='cpu', num_q_heads=heads+1, tp_size=tp_size,
+            max_q_rows=4, num_cache_blocks=12)

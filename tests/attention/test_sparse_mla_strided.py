@@ -58,7 +58,7 @@ def test_is_supported_accepts_implicit_current_device() -> None:
 
 
 @pytest.mark.parametrize("record_width", [576, 1088])
-@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
 @torch.inference_mode()
 def test_fp8_physical_slots_ignore_padding_and_mask_invalid_tail(tp_size: int, record_width: int) -> None:
     device = require_b12x()
@@ -119,7 +119,7 @@ def test_fp8_physical_slots_ignore_padding_and_mask_invalid_tail(tp_size: int, r
 
 
 @pytest.mark.parametrize("record_width", [576, 1088])
-@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
 @torch.inference_mode()
 def test_request_relative_indices_are_stably_compacted_and_remapped(tp_size: int, record_width: int) -> None:
     device = require_b12x()
@@ -193,7 +193,7 @@ def test_request_relative_indices_are_stably_compacted_and_remapped(tp_size: int
 
 @pytest.mark.parametrize("layout_kind", ["layers", "mixed", "actual"])
 @pytest.mark.parametrize("record_width", [576, 1088])
-@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
 @torch.inference_mode()
 def test_request_relative_indices_address_layer_interleaved_records(tp_size: int, record_width: int, layout_kind: str) -> None:
     device = require_b12x()
@@ -259,7 +259,7 @@ def test_request_relative_indices_address_layer_interleaved_records(tp_size: int
 
 @pytest.mark.parametrize("layout_kind", ["layers", "mixed", "actual"])
 @pytest.mark.parametrize("record_width", [576, 1088])
-@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
 @torch.inference_mode()
 def test_fp8_sparse_replays_on_non_default_stream_without_allocation(tp_size: int, record_width: int, layout_kind: str) -> None:
     device = require_b12x()
@@ -344,7 +344,7 @@ def test_fp8_sparse_replays_on_non_default_stream_without_allocation(tp_size: in
 
 @pytest.mark.parametrize("layout_kind", ["layers", "mixed", "actual"])
 @pytest.mark.parametrize("record_width", [576, 1088])
-@pytest.mark.parametrize("tp_size", [2, 8])
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
 @torch.inference_mode()
 def test_fp8_physical_slot_offset_exceeds_signed_int32(tp_size: int, record_width: int, layout_kind: str) -> None:
     device = require_b12x()

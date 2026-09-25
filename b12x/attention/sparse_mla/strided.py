@@ -65,8 +65,8 @@ class Caps:
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         object.__setattr__(self, "device", device)
-        if int(self.tp_size) not in (2, 8):
-            raise ValueError("strided sparse MLA supports TP2 and TP8")
+        if int(self.tp_size) not in (1, 2, 8):
+            raise ValueError("strided sparse MLA supports TP1, TP2 and TP8")
         if int(self.num_q_heads) != TOTAL_HEADS // int(self.tp_size):
             raise ValueError("num_q_heads must equal total_heads / tp_size")
         if int(self.block_size) != BLOCK_SIZE:
