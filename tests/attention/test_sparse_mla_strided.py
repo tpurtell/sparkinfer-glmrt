@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
 import torch
 
 from b12x.attention.sparse_mla import strided as sparse_mla_strided
@@ -44,8 +45,9 @@ def test_is_supported_accepts_implicit_current_device() -> None:
     assert sparse_mla_strided.is_supported()
 
 
+@pytest.mark.parametrize("tp_size", [2, 8])
 @torch.inference_mode()
-def test_fp8_physical_slots_ignore_padding_and_mask_invalid_tail() -> None:
+def test_fp8_physical_slots_ignore_padding_and_mask_invalid_tail(tp_size: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260813)
     rows = 4
@@ -53,15 +55,15 @@ def test_fp8_physical_slots_ignore_padding_and_mask_invalid_tail() -> None:
     plan = sparse_mla_strided.plan(
         sparse_mla_strided.Caps(
             device=device,
-            num_q_heads=16,
-            tp_size=8,
+            num_q_heads=128 // tp_size,
+            tp_size=tp_size,
             max_q_rows=rows,
             num_cache_blocks=blocks,
         )
     )
     q_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     kv_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
-    q = (torch.randn(rows, 16, 576, device=device) * 0.1).to(torch.bfloat16)
+    q = (torch.randn(rows, 128 // tp_size, 576, device=device) * 0.1).to(torch.bfloat16)
     cache = torch.empty(blocks, 64, 1088, dtype=FP8, device=device)
     cache[..., :576] = (torch.randn(blocks, 64, 576, device=device) * 10).to(FP8)
     cache[..., 576:] = (
@@ -74,7 +76,7 @@ def test_fp8_physical_slots_ignore_padding_and_mask_invalid_tail() -> None:
             blocks * 64, dtype=torch.int32, device=device
         )[:count]
     cu_seqlens_q = torch.arange(rows + 1, dtype=torch.int32, device=device)
-    output = torch.empty(rows, 16, 512, dtype=torch.bfloat16, device=device)
+    output = torch.empty(rows, 128 // tp_size, 512, dtype=torch.bfloat16, device=device)
     block_table = torch.arange(blocks, dtype=torch.int32, device=device).repeat(rows, 1)
     request_ids = torch.arange(rows, dtype=torch.int32, device=device)
     result, binding = _prepared_binding(
@@ -101,8 +103,9 @@ def test_fp8_physical_slots_ignore_padding_and_mask_invalid_tail() -> None:
     torch.testing.assert_close(actual_lse, expected_lse, rtol=2e-5, atol=2e-5)
 
 
+@pytest.mark.parametrize("tp_size", [2, 8])
 @torch.inference_mode()
-def test_request_relative_indices_are_stably_compacted_and_remapped() -> None:
+def test_request_relative_indices_are_stably_compacted_and_remapped(tp_size: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260818)
     rows = 2
@@ -110,15 +113,15 @@ def test_request_relative_indices_are_stably_compacted_and_remapped() -> None:
     plan = sparse_mla_strided.plan(
         sparse_mla_strided.Caps(
             device=device,
-            num_q_heads=16,
-            tp_size=8,
+            num_q_heads=128 // tp_size,
+            tp_size=tp_size,
             max_q_rows=rows,
             num_cache_blocks=blocks,
         )
     )
     q_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     kv_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
-    q = (torch.randn(rows, 16, 576, device=device) * 0.1).to(torch.bfloat16)
+    q = (torch.randn(rows, 128 // tp_size, 576, device=device) * 0.1).to(torch.bfloat16)
     cache = (torch.randn(blocks, 64, 1088, device=device) * 10).to(FP8)
     block_table = torch.tensor(
         [[7, 2, 10, -1], [4, 11, 1, 8]], dtype=torch.int32, device=device
@@ -143,7 +146,7 @@ def test_request_relative_indices_are_stably_compacted_and_remapped() -> None:
         device=device,
     )
     expected_counts = torch.tensor([5, 5], dtype=torch.int32, device=device)
-    output = torch.empty(rows, 16, 512, dtype=torch.bfloat16, device=device)
+    output = torch.empty(rows, 128 // tp_size, 512, dtype=torch.bfloat16, device=device)
     result, binding = _prepared_binding(
         plan, name="request-relative", device=device,
         make_binding=lambda state, scratch: state.bind_indexed(
@@ -171,8 +174,9 @@ def test_request_relative_indices_are_stably_compacted_and_remapped() -> None:
     torch.testing.assert_close(actual_lse, expected_lse, rtol=2e-5, atol=2e-5)
 
 
+@pytest.mark.parametrize("tp_size", [2, 8])
 @torch.inference_mode()
-def test_request_relative_indices_address_layer_interleaved_records() -> None:
+def test_request_relative_indices_address_layer_interleaved_records(tp_size: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260819)
     rows = 1
@@ -182,8 +186,8 @@ def test_request_relative_indices_address_layer_interleaved_records() -> None:
     plan = sparse_mla_strided.plan(
         sparse_mla_strided.Caps(
             device=device,
-            num_q_heads=16,
-            tp_size=8,
+            num_q_heads=128 // tp_size,
+            tp_size=tp_size,
             max_q_rows=rows,
             num_cache_blocks=blocks,
             max_physical_records=blocks * layers * 64,
@@ -191,7 +195,7 @@ def test_request_relative_indices_address_layer_interleaved_records() -> None:
     )
     q_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     kv_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
-    q = (torch.randn(rows, 16, 576, device=device) * 0.1).to(torch.bfloat16)
+    q = (torch.randn(rows, 128 // tp_size, 576, device=device) * 0.1).to(torch.bfloat16)
     backing = (torch.randn(blocks, layers, 64, 1088, device=device) * 10).to(FP8)
     cache = backing[:, layer]
     assert cache.stride() == (layers * 64 * 1088, 1088, 1)
@@ -201,7 +205,7 @@ def test_request_relative_indices_address_layer_interleaved_records() -> None:
     )
     logical[0, : selected.numel()] = selected
     counts = torch.tensor([selected.numel()], dtype=torch.int32, device=device)
-    output = torch.empty(rows, 16, 512, dtype=torch.bfloat16, device=device)
+    output = torch.empty(rows, 128 // tp_size, 512, dtype=torch.bfloat16, device=device)
     result, binding = _prepared_binding(
         plan, name="interleaved", device=device,
         make_binding=lambda state, scratch: state.bind_indexed(
@@ -234,8 +238,9 @@ def test_request_relative_indices_address_layer_interleaved_records() -> None:
     torch.testing.assert_close(actual_lse, expected_lse, rtol=2e-5, atol=2e-5)
 
 
+@pytest.mark.parametrize("tp_size", [2, 8])
 @torch.inference_mode()
-def test_fp8_sparse_replays_on_non_default_stream_without_allocation() -> None:
+def test_fp8_sparse_replays_on_non_default_stream_without_allocation(tp_size: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260814)
     rows = 2
@@ -244,8 +249,8 @@ def test_fp8_sparse_replays_on_non_default_stream_without_allocation() -> None:
     plan = sparse_mla_strided.plan(
         sparse_mla_strided.Caps(
             device=device,
-            num_q_heads=16,
-            tp_size=8,
+            num_q_heads=128 // tp_size,
+            tp_size=tp_size,
             max_q_rows=rows,
             num_cache_blocks=blocks,
             max_physical_records=blocks * layers * 64,
@@ -254,7 +259,7 @@ def test_fp8_sparse_replays_on_non_default_stream_without_allocation() -> None:
     )
     q_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     kv_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
-    q = (torch.randn(rows, 16, 576, device=device) * 0.1).to(torch.bfloat16)
+    q = (torch.randn(rows, 128 // tp_size, 576, device=device) * 0.1).to(torch.bfloat16)
     backing = (torch.randn(blocks, layers, 64, 1088, device=device) * 10).to(FP8)
     cache = backing[:, 1]
     selected = torch.full((rows, 2048), -1, dtype=torch.int32, device=device)
@@ -262,7 +267,7 @@ def test_fp8_sparse_replays_on_non_default_stream_without_allocation() -> None:
     selected[0, :64] = torch.randperm(blocks * 64, device=device)[:64].to(torch.int32)
     selected[1, :513] = torch.randperm(blocks * 64, device=device)[:513].to(torch.int32)
     cu_seqlens_q = torch.arange(rows + 1, dtype=torch.int32, device=device)
-    output = torch.empty(rows, 16, 512, dtype=torch.bfloat16, device=device)
+    output = torch.empty(rows, 128 // tp_size, 512, dtype=torch.bfloat16, device=device)
     block_table = torch.arange(blocks, dtype=torch.int32, device=device).repeat(rows, 1)
     request_ids = torch.arange(rows, dtype=torch.int32, device=device)
     result, binding = _prepared_binding(
@@ -308,8 +313,9 @@ def test_fp8_sparse_replays_on_non_default_stream_without_allocation() -> None:
         torch.testing.assert_close(captured_lse, expected_lse, rtol=2e-5, atol=2e-5)
 
 
+@pytest.mark.parametrize("tp_size", [2, 8])
 @torch.inference_mode()
-def test_fp8_physical_slot_offset_exceeds_signed_int32() -> None:
+def test_fp8_physical_slot_offset_exceeds_signed_int32(tp_size: int) -> None:
     device = require_b12x()
     torch.manual_seed(20260817)
     record_stride_bytes = 1088
@@ -319,8 +325,8 @@ def test_fp8_physical_slot_offset_exceeds_signed_int32() -> None:
     plan = sparse_mla_strided.plan(
         sparse_mla_strided.Caps(
             device=device,
-            num_q_heads=16,
-            tp_size=8,
+            num_q_heads=128 // tp_size,
+            tp_size=tp_size,
             max_q_rows=1,
             num_cache_blocks=blocks,
         )
@@ -329,14 +335,14 @@ def test_fp8_physical_slot_offset_exceeds_signed_int32() -> None:
     assert high_slot * cache.stride(1) * cache.element_size() > int32_max
     flat_cache = cache.view(-1, 1088)
     flat_cache[high_slot].copy_((torch.randn(1088, device=device) * 10).to(FP8))
-    q = (torch.randn(1, 16, 576, device=device) * 0.1).to(torch.bfloat16)
+    q = (torch.randn(1, 128 // tp_size, 576, device=device) * 0.1).to(torch.bfloat16)
     selected = torch.full((1, 2048), -1, dtype=torch.int32, device=device)
     selected[0, 0] = high_slot
     counts = torch.tensor([1], dtype=torch.int32, device=device)
     cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
     q_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     kv_scale = torch.tensor(0.01, dtype=torch.float32, device=device)
-    output = torch.empty(1, 16, 512, dtype=torch.bfloat16, device=device)
+    output = torch.empty(1, 128 // tp_size, 512, dtype=torch.bfloat16, device=device)
     result, binding = _prepared_binding(
         plan, name="high-pid", device=device,
         make_binding=lambda state, scratch: state.bind(
