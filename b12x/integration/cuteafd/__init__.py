@@ -29,6 +29,8 @@ GLM 5.x (``glm_moe_dsa``, geometry :data:`GLM53`), programs named ``glm_*``:
                        ``compile_glm_o_aot`` (W_UV then o_proj)
 * ``glm_indexer``      ``compile_glm_index_topk_aot`` (causal top-2048)
 * ``glm_sparse_mla``   ``compile_glm_sparse_mla_aot`` (latent attention)
+* ``context_split``    scored logical top-k, candidate merge, sink-free
+                       sparse MLA partial + LSE, combine2 and staging gather
 * ``glm_ffn``          ``compile_glm_norm_aot`` (residual add + RMSNorm),
                        ``compile_glm_ffn_aot`` (SwiGLU), ``compile_glm_router_scores_aot``,
                        ``compile_glm_expert_input_quant_aot``

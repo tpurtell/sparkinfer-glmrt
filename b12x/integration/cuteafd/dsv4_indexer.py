@@ -71,7 +71,7 @@ def _descriptor(shape, dtype, strides=None):
 
 
 def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode: str,
-                     heads: int = _HEADS):
+                     heads: int = _HEADS, route: str = "auto"):
     """The scratch layout (and route) of the prepared plan for this capacity."""
     from b12x.attention import dsa_indexer
     from b12x.attention.dsa_indexer import _preparation as prep
@@ -83,7 +83,7 @@ def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode
     rows, pages, topk = int(max_rows), int(max_pages), int(geometry.index_topk)
     caps = dsa_indexer.Caps(device=device, num_q_heads=heads, max_q_rows=rows,
                             max_page_table_width=pages, topk=topk, mode=mode,
-                            output_index_space="physical")
+                            output_index_space="physical", route=route)
     operands = dict(
         q_fp8=_descriptor((rows, heads, _HEAD_DIM), "float8_e4m3fn"),
         query_weights=_descriptor((rows, heads), "float32"),
@@ -125,7 +125,7 @@ class _TopK:
     """``heads`` index heads (64 for DeepSeek V4, 32 for GLM 5.x)."""
 
     def __init__(self, geometry: DSV4Geometry, max_rows: int, max_pages: int, mode: str,
-                 heads: int = _HEADS):
+                 heads: int = _HEADS, *, scored_logical: bool = False):
         from b12x.attention.dsa_indexer.tiled_topk import (
             _build_tiled_topk_kernel,
             _resolve_smem_candidate_capacity,
@@ -133,7 +133,11 @@ class _TopK:
         )
 
         self.heads = int(heads)
-        layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads)
+        self.scored_logical = bool(scored_logical)
+        # The tiled selector has the total logical-index tie order. The fused
+        # arrival-order selector cannot provide this context-split contract.
+        route = "paged_tiled" if scored_logical and mode == "decode" else "auto"
+        layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route)
         self.layout = layout
         self.route = layout.route
         self.mode = mode
@@ -185,11 +189,12 @@ class _TopK:
         # (is_first, physical output); non-final chunks keep values for the carry.
         # Deterministic select (index tie-break, canonical ascending output) unless
         # B12X_DSA_TOPK_DETERMINISTIC=0 (A/B builds).
-        self.deterministic = deterministic_topk()
+        self.deterministic = True if scored_logical else deterministic_topk()
         self.topk_kernels = {
             (first, phys): _build_tiled_topk_kernel(
-                _TILE_BLOCK_Q, self.block_k, self.topk, True, first, phys, 1, capacity, not phys,
-                self.deterministic)
+                _TILE_BLOCK_Q, self.block_k, self.topk, True, first,
+                phys and not self.scored_logical, 1, capacity,
+                self.scored_logical or not phys, self.deterministic)
             for first in (True, False) for phys in (True, False)
         }
 
@@ -199,6 +204,7 @@ class _TopK:
                L.prefill_block_k, L.fused_ctas_per_group, L.fused_merge_threshold,
                L.stream_scorer_ctas, L.max_chunks, L.nbytes, self.num_sms)
         key = key if self.heads == _HEADS else key + (self.heads,)
+        key = key + ("scored-logical",) if self.scored_logical else key
         return key if getattr(self, "deterministic", True) else key + ("arrival-order",)
 
     # -- helpers ------------------------------------------------------------
