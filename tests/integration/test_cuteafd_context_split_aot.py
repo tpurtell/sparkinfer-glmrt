@@ -47,7 +47,7 @@ def pair_order(scores, indices, k):
 
 
 @pytest.mark.parametrize("k", [512, 1024, 2048])
-@pytest.mark.parametrize("ties", [False, True])
+@pytest.mark.parametrize("ties", [False, True, "mixed"])
 def test_candidate_merge(k, ties):
     p = program("dsa_candidate_merge", topk=k)
     rows = 7
@@ -55,6 +55,11 @@ def test_candidate_merge(k, ties):
     indices[0].fill_(-1)
     indices[1, 3:] = -1
     scores = torch.zeros((rows, 2*k)) if ties else torch.randn((rows, 2*k))
+    if ties == "mixed":
+        scores = torch.randint(-2, 3, (rows, 2*k)).float()
+        scores[:, ::11] = -float("inf")
+        scores[:, ::17] = float("inf")
+        scores[:, ::19] = -0.0
     scores[indices < 0] = -float("inf")
     expected_v, expected_i = pair_order(scores, indices, k)
     runs = [pair_order(scores[:,s*k:(s+1)*k], indices[:,s*k:(s+1)*k], k) for s in (0,1)]
@@ -69,7 +74,10 @@ def test_candidate_merge(k, ties):
         p.launch(scores, indices, ov, oi, table, slots, lens, scalars=(rows,table.shape[1],rank))
         torch.cuda.synchronize()
         assert torch.equal(oi.cpu(), expected_i)
-        assert torch.equal(ov.cpu(), expected_v)
+        assert torch.equal(ov.cpu().view(torch.int32), expected_v.view(torch.int32))
+        repeated = tuple(t.clone() for t in (ov, oi, slots, lens))
+        p.launch(scores, indices, ov, oi, table, slots, lens, scalars=(rows,table.shape[1],rank))
+        assert all(torch.equal(a, b) for a, b in zip(repeated, (ov, oi, slots, lens)))
         for r in range(rows):
             selected = sorted(int(i) for i in expected_i[r] if i >= 0 and (i//64)%2 == rank)
             expected = [int(table[r,i//128])*64 + i%64 for i in selected]

@@ -34,86 +34,69 @@ def _pair_before(av: Float32, a: Int32, bv: Float32, b: Int32):
 
 @cute.jit
 def _sort_pairs(values: cute.Tensor, indices: cute.Tensor,
-                size: cutlass.Constexpr, by_score: cutlass.Constexpr):
-    """Bitonic order: warp shuffles for low strides, shared exchange otherwise."""
+                size: cutlass.Constexpr, by_score: cutlass.Constexpr,
+                merge_only: cutlass.Constexpr = False):
+    """Warp-contiguous bitonic order; only the three warp bits use shared memory."""
     tid = Int32(cute.arch.thread_idx()[0])
+    base = (tid // Int32(32)) * Int32(size // 8) + tid % Int32(32)
+    warp_bits = size.bit_length() - 4
     rv = cute.make_rmem_tensor((size // 256,), Float32)
     ri = cute.make_rmem_tensor((size // 256,), Int32)
     nv = cute.make_rmem_tensor((size // 256,), Float32)
     ni = cute.make_rmem_tensor((size // 256,), Int32)
     for slot in cutlass.range_constexpr(size // 256):
-        rv[slot], ri[slot] = values[tid + Int32(slot * 256)], indices[tid + Int32(slot * 256)]
+        ri[slot] = indices[base + Int32(slot * 32)]
+        if cutlass.const_expr(by_score):
+            rv[slot] = values[base + Int32(slot * 32)]
+        else:
+            rv[slot] = Float32(0)
+            if ri[slot] < Int32(0):
+                ri[slot] = Int32(2147483647)
     for level in cutlass.range_constexpr(1, size.bit_length()):
-        for step in cutlass.range_constexpr(level - 1, -1, -1):
-            if cutlass.const_expr(5 <= step < 8):
+        if cutlass.const_expr(not merge_only or level == size.bit_length() - 1):
+            for step in cutlass.range_constexpr(level - 1, -1, -1):
+                if cutlass.const_expr(step >= warp_bits):
+                    for slot in cutlass.range_constexpr(size // 256):
+                        indices[base + Int32(slot * 32)] = ri[slot]
+                        if cutlass.const_expr(by_score):
+                            values[base + Int32(slot * 32)] = rv[slot]
+                    cute.arch.sync_threads()
                 for slot in cutlass.range_constexpr(size // 256):
-                    values[tid + Int32(slot * 256)], indices[tid + Int32(slot * 256)] = rv[slot], ri[slot]
-                cute.arch.sync_threads()
-            for slot in cutlass.range_constexpr(size // 256):
-                i = tid + Int32(slot * 256)
-                a, av = ri[slot], rv[slot]
-                if cutlass.const_expr(step < 5):
-                    b = cute.arch.shuffle_sync_bfly(a, offset=1 << step)
-                    bv = cute.arch.shuffle_sync_bfly(av, offset=1 << step)
-                elif cutlass.const_expr(step >= 8):
-                    partner = slot ^ (1 << (step - 8))
-                    b, bv = ri[partner], rv[partner]
-                else:
-                    j = i ^ Int32(1 << step)
-                    b, bv = Int32(indices[j]), Float32(values[j])
-                before = (a >= Int32(0)) and ((b < Int32(0)) or (a < b))
-                if cutlass.const_expr(by_score):
-                    before = (a >= Int32(0)) and ((b < Int32(0)) or
-                             (av > bv) or ((av == bv) and (a < b)))
-                take_first = ((i & Int32(1 << level)) == Int32(0)) == ((i & Int32(1 << step)) == Int32(0))
-                ni[slot], nv[slot] = a, av
-                if before != take_first:
-                    ni[slot], nv[slot] = b, bv
-            for slot in cutlass.range_constexpr(size // 256):
-                ri[slot], rv[slot] = ni[slot], nv[slot]
-            if cutlass.const_expr(5 <= step < 8):
-                cute.arch.sync_threads()
-    for slot in cutlass.range_constexpr(size // 256):
-        values[tid + Int32(slot * 256)], indices[tid + Int32(slot * 256)] = rv[slot], ri[slot]
-    cute.arch.sync_threads()
-
-
-@cute.jit
-def _sort_indices(indices: cute.Tensor, size: cutlass.Constexpr):
-    """Ascending valid indices; high strides exchange thread-local registers."""
-    tid = Int32(cute.arch.thread_idx()[0])
-    ri = cute.make_rmem_tensor((size // 256,), Int32)
-    ni = cute.make_rmem_tensor((size // 256,), Int32)
-    for slot in cutlass.range_constexpr(size // 256):
-        idx = Int32(indices[tid + Int32(slot * 256)])
-        ri[slot] = idx if idx >= Int32(0) else Int32(2147483647)
-    for level in cutlass.range_constexpr(1, size.bit_length()):
-        for step in cutlass.range_constexpr(level - 1, -1, -1):
-            if cutlass.const_expr(5 <= step < 8):
+                    i = base + Int32(slot * 32)
+                    a, av = ri[slot], rv[slot]
+                    bv = Float32(0)
+                    if cutlass.const_expr(step < 5):
+                        b = cute.arch.shuffle_sync_bfly(a, offset=1 << step)
+                        if cutlass.const_expr(by_score):
+                            bv = cute.arch.shuffle_sync_bfly(av, offset=1 << step)
+                    elif cutlass.const_expr(step < warp_bits):
+                        b = ri[slot ^ (1 << (step - 5))]
+                        if cutlass.const_expr(by_score):
+                            bv = rv[slot ^ (1 << (step - 5))]
+                    else:
+                        b = Int32(indices[i ^ Int32(1 << step)])
+                        if cutlass.const_expr(by_score):
+                            bv = Float32(values[i ^ Int32(1 << step)])
+                    take_first = ((i & Int32(1 << level)) == Int32(0)) == ((i & Int32(1 << step)) == Int32(0))
+                    if cutlass.const_expr(by_score):
+                        ni[slot], nv[slot] = a, av
+                        if _pair_before(av, a, bv, b) != take_first:
+                            ni[slot], nv[slot] = b, bv
+                    else:
+                        ni[slot] = min(a, b) if take_first else max(a, b)
                 for slot in cutlass.range_constexpr(size // 256):
-                    indices[tid + Int32(slot * 256)] = ri[slot]
-                cute.arch.sync_threads()
-            for slot in cutlass.range_constexpr(size // 256):
-                i = tid + Int32(slot * 256)
-                a = ri[slot]
-                if cutlass.const_expr(step < 5):
-                    b = cute.arch.shuffle_sync_bfly(a, offset=1 << step)
-                elif cutlass.const_expr(step >= 8):
-                    b = ri[slot ^ (1 << (step - 8))]
-                else:
-                    b = Int32(indices[i ^ Int32(1 << step)])
-                take_first = ((i & Int32(1 << level)) == Int32(0)) == ((i & Int32(1 << step)) == Int32(0))
-                if take_first:
-                    ni[slot] = min(a, b)
-                else:
-                    ni[slot] = max(a, b)
-            for slot in cutlass.range_constexpr(size // 256):
-                ri[slot] = ni[slot]
-            if cutlass.const_expr(5 <= step < 8):
-                cute.arch.sync_threads()
+                    ri[slot] = ni[slot]
+                    if cutlass.const_expr(by_score):
+                        rv[slot] = nv[slot]
+                if cutlass.const_expr(step >= warp_bits):
+                    cute.arch.sync_threads()
     for slot in cutlass.range_constexpr(size // 256):
         idx = ri[slot]
-        indices[tid + Int32(slot * 256)] = idx if idx != Int32(2147483647) else Int32(-1)
+        if cutlass.const_expr(not by_score):
+            idx = idx if idx != Int32(2147483647) else Int32(-1)
+        indices[base + Int32(slot * 32)] = idx
+        if cutlass.const_expr(by_score):
+            values[base + Int32(slot * 32)] = rv[slot]
     cute.arch.sync_threads()
 
 
@@ -249,50 +232,35 @@ class _CandidateMerge:
                table_stride: Int32, rank: Int32):
         tid, row = Int32(cute.arch.thread_idx()[0]), Int64(cute.arch.block_idx()[0])
         smem = utils.SmemAllocator()
-        sv = smem.allocate_tensor(Float32, cute.make_layout((2*self.k,)), 16)
-        si = smem.allocate_tensor(Int32, cute.make_layout((2*self.k,)), 16)
-        for slot in cutlass.range_constexpr(2*self.k//256):
-            i = tid + Int32(slot*256)
-            si[i], sv[i] = indices[row*Int64(2*self.k)+Int64(i)], scores[row*Int64(2*self.k)+Int64(i)]
-        cute.arch.sync_threads()
-        picked = cute.make_rmem_tensor((self.k//256,), Int32)
-        # One co-rank search per thread, then a contiguous register-sized run.
-        start = tid * Int32(self.k//256)
-        lo, hi = Int32(0), start
-        while lo < hi:
-            a = (lo+hi)//Int32(2)
-            b = start-a
-            advance = False
-            if (b > Int32(0)) and (a < Int32(self.k)):
-                advance = _pair_before(sv[a], si[a], sv[Int32(self.k)+b-Int32(1)], si[Int32(self.k)+b-Int32(1)])
-            if advance:
-                lo = a+Int32(1)
-            else:
-                hi = a
-        a, b = lo, start-lo
+        sv = smem.allocate_tensor(Float32, cute.make_layout((self.k,)), 16)
+        si = smem.allocate_tensor(Int32, cute.make_layout((self.k,)), 16)
+        # A + reverse(B) is bitonic in the full (score, logical index) order.
+        # Its first compare-exchange retains exactly the global best K pairs.
         for slot in cutlass.range_constexpr(self.k//256):
-            pos = start + Int32(slot)
-            src = a
-            if a >= Int32(self.k):
-                src = Int32(self.k)+b
-            elif b < Int32(self.k):
-                if not _pair_before(sv[a], si[a], sv[Int32(self.k)+b], si[Int32(self.k)+b]):
-                    src = Int32(self.k)+b
-            idx, val = si[src], sv[src]
-            if src < Int32(self.k):
-                a += Int32(1)
-            else:
-                b += Int32(1)
-            out_indices[row*Int64(self.k)+Int64(pos)] = idx
-            out_scores[row*Int64(self.k)+Int64(pos)] = val if idx >= Int32(0) else Float32(float("-inf"))
+            i = tid + Int32(slot*256)
+            a = row*Int64(2*self.k) + Int64(i)
+            b = row*Int64(2*self.k) + Int64(2*self.k-1) - Int64(i)
+            ai, av = Int32(indices[a]), Float32(scores[a])
+            bi, bv = Int32(indices[b]), Float32(scores[b])
+            si[i], sv[i] = bi, bv
+            if _pair_before(av, ai, bv, bi):
+                si[i], sv[i] = ai, av
+        cute.arch.sync_threads()
+        _sort_pairs(sv, si, self.k, True, True)
+        picked = cute.make_rmem_tensor((self.k//256,), Int32)
+        for slot in cutlass.range_constexpr(self.k//256):
+            i = tid + Int32(slot*256)
+            idx, val = Int32(si[i]), Float32(sv[i])
+            out_indices[row*Int64(self.k)+Int64(i)] = idx
+            out_scores[row*Int64(self.k)+Int64(i)] = val if idx >= Int32(0) else Float32(float("-inf"))
             if (idx < Int32(0)) or ((idx//Int32(self.unit_rows))%Int32(2) != rank):
                 idx = Int32(-1)
             picked[slot] = idx
         cute.arch.sync_threads()
         for slot in cutlass.range_constexpr(self.k//256):
-            si[start+Int32(slot)] = picked[slot]
+            si[tid+Int32(slot*256)] = picked[slot]
         cute.arch.sync_threads()
-        _sort_indices(si, self.k)
+        _sort_pairs(sv, si, self.k, False)
         for slot in cutlass.range_constexpr(self.k//256):
             i = tid+Int32(slot*256)
             idx = Int32(si[i])
@@ -399,31 +367,50 @@ class _Gather:
                 i += Int32(256)
 
 
-class _PartialLSE:
+class _PartialMerge:
     def __init__(self, heads: int, splits: int):
         self.heads, self.splits = heads, splits
 
     @cute.jit
-    def __call__(self, partial_lse: cute.Tensor, out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.kernel(partial_lse, out, rows).launch(
-            grid=((rows * Int32(self.heads) + Int32(255)) // Int32(256), 1, 1),
-            block=(256, 1, 1), stream=stream)
+    def __call__(self, partial: cute.Tensor, partial_lse: cute.Tensor,
+                 out: cute.Pointer, lse: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(partial, partial_lse, out, lse).launch(
+            grid=(rows, self.heads, 1), block=(128, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, partial_lse: cute.Tensor, out: cute.Pointer, rows: Int32):
-        i = Int32(cute.arch.block_idx()[0]) * Int32(256) + Int32(cute.arch.thread_idx()[0])
-        if i < rows * Int32(self.heads):
-            row, head = i // Int32(self.heads), i % Int32(self.heads)
-            m = Float32(float("-inf"))
+    def kernel(self, partial: cute.Tensor, partial_lse: cute.Tensor,
+               out: cute.Pointer, lse: cute.Pointer):
+        row, head, _ = cute.arch.block_idx()
+        tid = Int32(cute.arch.thread_idx()[0])
+        weights = cute.make_rmem_tensor((self.splits,), Float32)
+        m = Float32(float("-inf"))
+        for s in cutlass.range_constexpr(self.splits):
+            weights[s] = Float32(partial_lse[row, head, s])
+            m = cute.math.max(m, weights[s])
+        d = Float32(0)
+        for s in cutlass.range_constexpr(self.splits):
+            w = Float32(0)
+            if weights[s] > Float32(float("-inf")):
+                w = cute.math.exp2(weights[s] - m, fastmath=True)
+            weights[s] = w
+            d += w
+        inv = Float32(0)
+        if d > Float32(0):
+            inv = cute.arch.rcp_approx(d)
+        for s in cutlass.range_constexpr(self.splits):
+            weights[s] *= inv
+        for part in cutlass.range_constexpr(4):
+            dim = tid + Int32(part * 128)
+            value = Float32(0)
             for s in cutlass.range_constexpr(self.splits):
-                m = cute.math.max(m, Float32(partial_lse[row, head, s]))
-            d = Float32(0)
-            if m > Float32(float("-inf")):
-                for s in cutlass.range_constexpr(self.splits):
-                    d += cute.math.exp2(Float32(partial_lse[row, head, s]) - m, fastmath=True)
+                # An empty split may leave its output storage poisoned.
+                if weights[s] > Float32(0):
+                    value += weights[s] * Float32(partial[row, head, s, dim])
+            out[(Int64(row) * Int64(self.heads) + Int64(head)) * Int64(512) + Int64(dim)] = value.to(cutlass.BFloat16)
+        if tid == Int32(0):
+            if d > Float32(0):
                 m += cute.math.log2(d, fastmath=True)
-            out[Int64(i)] = m
-
+            lse[Int64(row) * Int64(self.heads) + Int64(head)] = m
 
 def sparse_mla_partial_split_plan(g=GLM53, *, max_rows: int, head_count: int, sm_count: int) -> int:
     """Load-time per-device numerics/launch choice; never a live-request policy."""
@@ -439,7 +426,6 @@ def sparse_mla_partial_split_plan(g=GLM53, *, max_rows: int, head_count: int, sm
 class _Partial:
     def __init__(self, g, max_rows: int, begin: int, heads: int, num_splits: int | None):
         from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel, plan_unified_decode_splits
-        from b12x.attention._shared.mla.merge import SparseMLASplitDecodeMergeKernel
         from b12x.attention._shared.mla.smem import make_smem_layout
         from ._common import DSV4Geometry
         from .glm_sparse_mla import _traits, _topk
@@ -475,8 +461,7 @@ class _Partial:
             valid_hpb=hpb, head_block_offset=0, per_token_len=True,
             native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
             native_dsv41_fp8=False, vector_q=True)
-        self.merge = SparseMLASplitDecodeMergeKernel(static_num_chunks=s)
-        self.lse = _PartialLSE(n, s)
+        self.merge = _PartialMerge(n, s)
 
     def scratch_bytes(self, rows):
         size = max(rows, 1) * self.heads * self.splits
@@ -510,9 +495,7 @@ class _Partial:
         else:
             self.decode.call_pertok(qt, kv, ix, po, pl, scale, Float32(1), ln,
                                    Int64(self.page_bytes), rows, stream)
-        self.merge(po, pl, ln,
-                   cute.make_tensor(out, cute.make_layout((m,n,512), stride=(n*512,512,1))), stream)
-        self.lse(pl, lse, rows, stream)
+        self.merge(po, pl, out, lse, rows, stream)
 
 
 def compile_sparse_mla_partial_aot(g=GLM53, *, max_rows: int, head_begin: int = 0,
