@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import statistics
 import subprocess
+import sys
 
 import torch
 import cutlass
@@ -174,6 +175,29 @@ def reference_routes_fp64(x, ids, routing, weights, scales):
     return result.reshape(-1, x.shape[1])
 
 
+def source_hashes():
+    return {name: hashlib.sha256(Path(inspect.getsourcefile(obj)).read_bytes()).hexdigest()
+            for name, obj in [("kernel", V41FusedSliceKernel),
+                              ("fixture", _check_grouped_slices), ("benchmark", main)]}
+
+
+def write_pipeline_results(path, props, records):
+    root = Path(__file__).resolve().parents[1]
+    try:
+        revision = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+            stderr=subprocess.PIPE, timeout=10,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        # Read-only worktree mounts may not include their host Git metadata.
+        revision = None
+        print("WARNING: Git revision unavailable; preserving results with source hashes", file=sys.stderr)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dict(source=revision, source_hashes=source_hashes(),
+                                   device=str(props), torch=torch.__version__, results=records),
+                               indent=2) + "\n")
+
+
 def benchmark_pipeline(options):
     """The exporter ABI's real RTX wire-input route/compute/reduce pipeline."""
     from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
@@ -321,11 +345,7 @@ def benchmark_pipeline(options):
                 print("TIMING " + json.dumps(record), flush=True)
                 graph.reset()
     if options.output:
-        options.output.parent.mkdir(parents=True, exist_ok=True)
-        root = Path(__file__).resolve().parents[1]
-        revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-        options.output.write_text(json.dumps(dict(source=revision, device=str(props), torch=torch.__version__,
-                                                results=records), indent=2) + "\n")
+        write_pipeline_results(options.output, props, records)
 
 
 def main():
@@ -342,9 +362,7 @@ def main():
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--output", type=Path)
     options = parser.parse_args()
-    print("SOURCE " + json.dumps({name: hashlib.sha256(Path(inspect.getsourcefile(obj)).read_bytes()).hexdigest()
-                                 for name, obj in [("kernel", V41FusedSliceKernel),
-                                                   ("fixture", _check_grouped_slices), ("benchmark", main)]}), flush=True)
+    print("SOURCE " + json.dumps(source_hashes()), flush=True)
     if options.role == "legacy":
         _check_grouped_slices(128, measure)
     else:
