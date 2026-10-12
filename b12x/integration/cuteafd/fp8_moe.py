@@ -66,6 +66,8 @@ is unchanged. Scratch must be sized with the same form.
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
@@ -87,6 +89,7 @@ from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
 from ._mxfp4_moe_a8 import StreamMxfp4DownA8
 from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
+from ._nvfp4_moe_gemv_a4 import ChunkNvfp4GemvA4, ChunkNvfp4GateUpGemvA4
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
@@ -331,7 +334,7 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
     if route == "stream" and g.activations == "a4":
         pairs = rows * g.top_k
         padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
-        split = 0 if nvfp4_a4_fused() else pairs * g.slice * 2
+        split = 0 if nvfp4_a4_fused() and not os.environ.get("B12X_NVFP4_A4_GEMV") else pairs * g.slice * 2
         return [
             meta_words(g.experts, stream_max_tiles(g.experts, pairs)) * 4,
             pairs * 4,                                 # pair_row
@@ -576,7 +579,8 @@ class _StreamNvfp4A4Route:
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
         self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i)
-        self.fused = nvfp4_a4_fused()
+        self.gemv = bool(os.environ.get("B12X_NVFP4_A4_GEMV"))
+        self.fused = nvfp4_a4_fused() and not self.gemv
         if self.fused:
             self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
             self.swiglu = None
@@ -584,6 +588,11 @@ class _StreamNvfp4A4Route:
             self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e)
             self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit)
         self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e)
+        if self.gemv:
+            self.gate_up = ChunkNvfp4GemvA4(n=i, k=h, experts=e, warps=8, groups=1)
+            self.down = ChunkNvfp4GemvA4(n=h, k=i, experts=e,
+                warps=int(os.environ.get("B12X_GEMV_DOWN_WARPS", "2")),
+                groups=int(os.environ.get("B12X_GEMV_DOWN_GROUPS", "4")))
         self.combine = MoeCombine(hidden=h, top_k=k)
 
     def key(self) -> tuple:
