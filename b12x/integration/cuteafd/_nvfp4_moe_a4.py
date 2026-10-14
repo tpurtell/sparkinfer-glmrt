@@ -444,6 +444,14 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.half_n = self.tile_n // 2
         self.x_stride = 2 * self.tile_n + 16
         self.inter, self.limit = int(inter), float(limit)
+        if self.tile_m == 16:
+            # Split output columns, not K: every accumulator keeps master's
+            # ordered K64 MMA chain while more threads issue independent reads.
+            self.compute_warps = min(4, self.tile_n // 16)
+            self.threads = 256
+            self.warp_cols = self.tile_n // self.compute_warps
+            self.n_tiles = self.warp_cols // 8
+            self.frags = 4 * self.m_tiles * self.n_tiles
         import os
 
         if k_block is None:
@@ -477,7 +485,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_a4", 3, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_a4", 4, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max)
 
     def _storage(self):
@@ -540,13 +548,18 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                         self._load2(pre, ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up, tidx)
                     else:
                         cute.arch.cp_async_commit_group()
-                warp_m = warp_id // Int32(2)
-                warp_n = warp_id % Int32(2)
-                # warp_n 0: gate columns (w1 / s1); 1: up columns (w3 / s3).
-                sp = cutlass.select_(warp_n == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
+                if const_expr(self.tile_m == 16):
+                    warp_m = Int32(0)
+                    warp_n = warp_id
+                    active = warp_id < Int32(self.compute_warps)
+                else:
+                    warp_m = warp_id // Int32(2)
+                    warp_n = warp_id % Int32(2)
+                    active = warp_m * Int32(self.warp_rows) < live
+                sp = cutlass.select_(warp_n < Int32(self.half_n // self.warp_cols),
+                                     Int64(s1.toint()), Int64(s3.toint()))
                 factor = _ld_f32(sp + Int64(self.alpha_offset) + Int64(e) * Int64(4)) \
                     * _ld_f32(sp + Int64(self.in_offset) + Int64(e) * Int64(4))
-                active = warp_m * Int32(self.warp_rows) < live
                 q = lane // Int32(4)
                 c = lane % Int32(4)
                 mat = lane // Int32(8)
