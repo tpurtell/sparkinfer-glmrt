@@ -638,9 +638,10 @@ class _StreamNvfp4A4Route:
         self.rows_in(x, pair_row, meta, s1, xq, xs, pairs, stream)
         if cutlass.const_expr(self.fused):
             sms = runtime_num_sm()
-            # The sparsest valid routing has top_k experts. Narrow N until its
-            # grid fills the queried device; sparse M keeps CTA SMEM small.
-            if Int32(g.top_k * (g.slice // 32)) >= sms * Int32(2):
+            # Bound active sparse expert chunks by groups = min(rows * top_k, experts).
+            # Keep narrow N (tile_n=32, 3 stages, 4 CTAs/SM) until wider N (tile_n=64)
+            # has enough CTAs to hide LPDDR5X/GDDR7 latency across waves.
+            if groups * Int32(g.slice // 32) >= sms * Int32(6):
                 self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
             else:
                 self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)

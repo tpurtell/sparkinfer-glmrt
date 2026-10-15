@@ -441,6 +441,14 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                  live_min: int = 1, live_max: int = 128):
         super().__init__(n=2 * int(inter), k=hidden, experts=experts, tile_m=tile_m, tile_n=tile_n,
                          live_min=live_min, live_max=live_max)
+        if self.tile_m == 16:
+            self.threads = 128
+            self.n_warps = 4
+            self.warp_cols = self.tile_n // 4
+            self.n_tiles = self.warp_cols // 8
+            self.frags = 4 * self.m_tiles * self.n_tiles
+        else:
+            self.n_warps = 2
         self.half_n = self.tile_n // 2
         self.x_stride = 2 * self.tile_n + 16
         self.inter, self.limit = int(inter), float(limit)
@@ -451,8 +459,9 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         if self.k % k_block or k_block % 64:
             raise ValueError(f"K {self.k} is not a multiple of the {k_block}-wide K block")
         self._set_k_block(k_block)
+        default_stages = 3 if (self.tile_m == 16 and self.tile_n == 32) else 2
         if stages is None:
-            stages = int(os.environ.get("B12X_NVFP4_A4_STAGES", "0")) or 2
+            stages = int(os.environ.get("B12X_NVFP4_A4_STAGES", "0")) or default_stages
         self.stages = int(stages)
         if self.inter % self.half_n:
             raise ValueError("the fused NVFP4 A4 gate/up needs I % 64 == 0")
@@ -477,8 +486,8 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_a4", 3, self.inter, self.k, self.experts, self.k_block, self.stages,
-                self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max)
+        return ("stream_gate_up_nvfp4_a4", 4, self.inter, self.k, self.experts, self.k_block, self.stages,
+                self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.threads, self.live_min, self.live_max)
 
     def _storage(self):
         class Storage:
@@ -499,16 +508,123 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
 
     @cute.jit
     def _load2(self, block, ring, a_rows: Int64, as_rows: Int64, w_rows: Int64, w_up: Int64, s_rows: Int64,
-               s_up: Int64, tidx):
+               s_up: Int64, live: Int32, tidx):
         stage = ring + (Int32(block) % Int32(self.stages)) * Int32(self.stage_bytes)
-        self._load_operand(stage, a_rows, as_rows, block, tidx, self.tile_m, 0,
-                           self.tile_bytes + self.weight_bytes)
-        self._load_operand(stage, w_rows, s_rows, block, tidx, self.half_n, self.tile_bytes,
-                           self.tile_bytes + self.weight_bytes + self.sc_bytes)
-        self._load_operand(stage, w_up, s_up, block, tidx, self.half_n,
-                           self.tile_bytes + self.half_n * self.stride,
-                           self.tile_bytes + self.weight_bytes + self.sc_bytes + self.half_n * self.s_stride)
+        chunks = self.row_bytes // 16
+        a_limit = live * Int32(chunks)
+        for q in cutlass.range_constexpr(_ceil(self.tile_m * chunks, self.threads)):
+            c = tidx + Int32(q * self.threads)
+            if c < a_limit:
+                row = c // Int32(chunks)
+                piece = c % Int32(chunks)
+                cp_async4_shared_global(stage + row * Int32(self.stride) + piece * Int32(16),
+                                        a_rows + Int64(row) * Int64(self.k // 2) + Int64(block) * Int64(self.row_bytes)
+                                        + Int64(piece) * Int64(16))
+        words = self.s_bytes // 4
+        as_limit = live * Int32(words)
+        scale_a_off = self.tile_bytes + self.weight_bytes
+        for q in cutlass.range_constexpr(_ceil(self.tile_m * words, self.threads)):
+            c = tidx + Int32(q * self.threads)
+            if c < as_limit:
+                row = c // Int32(words)
+                word = c % Int32(words)
+                cp_async_u32_shared_global(stage + Int32(scale_a_off) + row * Int32(self.s_stride) + word * Int32(4),
+                                           as_rows + Int64(row) * Int64(self.k // 16) + Int64(block) * Int64(self.s_bytes)
+                                           + Int64(word) * Int64(4))
+        for q in cutlass.range_constexpr(_ceil(self.tile_n * chunks, self.threads)):
+            c = tidx + Int32(q * self.threads)
+            if const_expr((q + 1) * self.threads <= self.tile_n * chunks):
+                row = c // Int32(chunks)
+                piece = c % Int32(chunks)
+                w_base = cutlass.select_(row < Int32(self.half_n), w_rows, w_up)
+                w_row = cutlass.select_(row < Int32(self.half_n), row, row - Int32(self.half_n))
+                cp_async4_shared_global(stage + Int32(self.tile_bytes) + row * Int32(self.stride) + piece * Int32(16),
+                                        w_base + Int64(w_row) * Int64(self.k // 2) + Int64(block) * Int64(self.row_bytes)
+                                        + Int64(piece) * Int64(16))
+            elif c < Int32(self.tile_n * chunks):
+                row = c // Int32(chunks)
+                piece = c % Int32(chunks)
+                w_base = cutlass.select_(row < Int32(self.half_n), w_rows, w_up)
+                w_row = cutlass.select_(row < Int32(self.half_n), row, row - Int32(self.half_n))
+                cp_async4_shared_global(stage + Int32(self.tile_bytes) + row * Int32(self.stride) + piece * Int32(16),
+                                        w_base + Int64(w_row) * Int64(self.k // 2) + Int64(block) * Int64(self.row_bytes)
+                                        + Int64(piece) * Int64(16))
+        scale_w_off = self.tile_bytes + self.weight_bytes + self.sc_bytes
+        for q in cutlass.range_constexpr(_ceil(self.tile_n * words, self.threads)):
+            c = tidx + Int32(q * self.threads)
+            if const_expr((q + 1) * self.threads <= self.tile_n * words):
+                row = c // Int32(words)
+                word = c % Int32(words)
+                s_base = cutlass.select_(row < Int32(self.half_n), s_rows, s_up)
+                s_row = cutlass.select_(row < Int32(self.half_n), row, row - Int32(self.half_n))
+                cp_async_u32_shared_global(stage + Int32(scale_w_off) + row * Int32(self.s_stride) + word * Int32(4),
+                                           s_base + Int64(s_row) * Int64(self.k // 16) + Int64(block) * Int64(self.s_bytes)
+                                           + Int64(word) * Int64(4))
+            elif c < Int32(self.tile_n * words):
+                row = c // Int32(words)
+                word = c % Int32(words)
+                s_base = cutlass.select_(row < Int32(self.half_n), s_rows, s_up)
+                s_row = cutlass.select_(row < Int32(self.half_n), row, row - Int32(self.half_n))
+                cp_async_u32_shared_global(stage + Int32(scale_w_off) + row * Int32(self.s_stride) + word * Int32(4),
+                                           s_base + Int64(s_row) * Int64(self.k // 16) + Int64(block) * Int64(self.s_bytes)
+                                           + Int64(word) * Int64(4))
         cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def _mma_stage(self, stage, acc: cute.Tensor, warp_m, warp_n, q, c, mat, mrow):
+        sa = stage
+        sw = stage + Int32(self.tile_bytes)
+        ssa = stage + Int32(self.tile_bytes + self.weight_bytes)
+        ssb = ssa + Int32(self.sc_bytes)
+        bw = cute.make_rmem_tensor(cute.make_layout((max(4, 2 * self.n_tiles),), stride=(1,)), Uint32)
+        for step in cutlass.range_constexpr(self.k_block // 64):
+            k_byte = 32 * step
+            sfa = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Uint32)
+            a = cute.make_rmem_tensor(cute.make_layout((4 * self.m_tiles,), stride=(1,)), Uint32)
+            for mt in cutlass.range_constexpr(self.m_tiles):
+                r0 = warp_m * Int32(self.warp_rows) + Int32(16 * mt) + q
+                sfa[mt] = ld_shared_u32(ssa + (r0 + Int32(8) * (c & Int32(1))) * Int32(self.s_stride)
+                                        + Int32(4 * step))
+                arow = warp_m * Int32(self.warp_rows) + Int32(16 * mt) + Int32(8) * (mat & Int32(1)) + mrow
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sa + arow * Int32(self.stride) + Int32(k_byte)
+                                                     + Int32(16) * (mat >> Int32(1)))
+                a[4 * mt] = a0
+                a[4 * mt + 1] = a1
+                a[4 * mt + 2] = a2
+                a[4 * mt + 3] = a3
+            if const_expr(self.n_tiles == 1):
+                if const_expr(step % 2 == 0):
+                    bcol = warp_n * Int32(self.warp_cols) + mrow
+                    b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(sw + bcol * Int32(self.stride) + Int32(k_byte)
+                                                         + Int32(16) * mat)
+                    bw[0] = b0
+                    bw[1] = b1
+                    bw[2] = b2
+                    bw[3] = b3
+            else:
+                for pair in cutlass.range_constexpr(self.n_tiles // 2):
+                    bcol = warp_n * Int32(self.warp_cols) + Int32(16 * pair) + Int32(8) * (mat >> Int32(1)) + mrow
+                    b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(sw + bcol * Int32(self.stride) + Int32(k_byte)
+                                                         + Int32(16) * (mat & Int32(1)))
+                    bw[4 * pair] = b0
+                    bw[4 * pair + 1] = b1
+                    bw[4 * pair + 2] = b2
+                    bw[4 * pair + 3] = b3
+            for nt in cutlass.range_constexpr(self.n_tiles):
+                col = warp_n * Int32(self.warp_cols) + Int32(8 * nt) + q
+                sfb = ld_shared_u32(ssb + col * Int32(self.s_stride) + Int32(4 * step))
+                b_idx = 2 * (step % 2) if self.n_tiles == 1 else 2 * nt
+                b0 = bw[b_idx]
+                b1 = bw[b_idx + 1]
+                for mt in cutlass.range_constexpr(self.m_tiles):
+                    f = 4 * (self.n_tiles * mt + nt)
+                    d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                        a[4 * mt], a[4 * mt + 1], a[4 * mt + 2], a[4 * mt + 3], b0, b1, sfa[mt], sfb)
+                    acc[f] = d0
+                    acc[f + 1] = d1
+                    acc[f + 2] = d2
+                    acc[f + 3] = d3
 
     @cute.kernel
     def fused(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,
@@ -532,18 +648,13 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                 w_up = Int64(w3.toint()) + w_off * Int64(self.k // 2)
                 s_rows = Int64(s1.toint()) + w_off * Int64(self.k // 16)
                 s_up = Int64(s3.toint()) + w_off * Int64(self.k // 16)
-                # ``stages``-deep cp.async ring, one group per K block (empty past the end): block b
-                # waits for its group, the barrier frees stage (b - 1) % stages, which takes block
-                # b + stages - 1.
-                for pre in cutlass.range_constexpr(self.stages - 1):
+                for pre in cutlass.range_constexpr(self.stages):
                     if const_expr(pre < self.blocks):
-                        self._load2(pre, ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up, tidx)
-                    else:
-                        cute.arch.cp_async_commit_group()
-                warp_m = warp_id // Int32(2)
-                warp_n = warp_id % Int32(2)
-                # warp_n 0: gate columns (w1 / s1); 1: up columns (w3 / s3).
-                sp = cutlass.select_(warp_n == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
+                        self._load2(pre, ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up, live, tidx)
+                warp_m = warp_id // Int32(self.n_warps)
+                warp_n = warp_id % Int32(self.n_warps)
+                # First half of N warps: gate columns (w1 / s1); second half: up columns (w3 / s3).
+                sp = cutlass.select_(warp_n < Int32(self.n_warps // 2), Int64(s1.toint()), Int64(s3.toint()))
                 factor = _ld_f32(sp + Int64(self.alpha_offset) + Int64(e) * Int64(4)) \
                     * _ld_f32(sp + Int64(self.in_offset) + Int64(e) * Int64(4))
                 active = warp_m * Int32(self.warp_rows) < live
@@ -555,29 +666,38 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                 for v in cutlass.range_constexpr(self.frags):
                     acc[v] = Float32(0.0)
                 for block in cutlass.range(self.blocks, unroll=1):
-                    cute.arch.cp_async_wait_group(self.stages - 2)
-                    cute.arch.sync_threads()
-                    if block + Int32(self.stages - 1) < Int32(self.blocks):
-                        self._load2(block + Int32(self.stages - 1), ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up,
-                                    tidx)
+                    if const_expr(self.stages >= 3):
+                        if block + Int32(2) < Int32(self.blocks):
+                            cute.arch.cp_async_wait_group(2)
+                        elif block + Int32(1) < Int32(self.blocks):
+                            cute.arch.cp_async_wait_group(1)
+                        else:
+                            cute.arch.cp_async_wait_group(0)
                     else:
-                        cute.arch.cp_async_commit_group()
+                        if block + Int32(1) < Int32(self.blocks):
+                            cute.arch.cp_async_wait_group(1)
+                        else:
+                            cute.arch.cp_async_wait_group(0)
+                    cute.arch.sync_threads()
                     if active:
                         stage = ring + (block % Int32(self.stages)) * Int32(self.stage_bytes)
                         self._mma_stage(stage, acc, warp_m, warp_n, q, c, mat, mrow)
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.sync_threads()
+                    cute.arch.sync_threads()
+                    if block + Int32(self.stages) < Int32(self.blocks):
+                        self._load2(block + Int32(self.stages), ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up,
+                                    live, tidx)
                 # The ring is free (every K block consumed, last barrier passed): exchange the
-                # BF16-rounded gate / up tiles, row r at ring + r * x_stride (gate 0..127 B, up 128..255 B).
+                # BF16-rounded gate / up tiles, row r at ring + r * x_stride (gate 0..half_n*2-1 B, up half_n*2..).
                 if active:
                     for mt in cutlass.range_constexpr(self.m_tiles):
                         for half in cutlass.range_constexpr(2):
                             row = warp_m * Int32(self.warp_rows) + Int32(16 * mt + 8 * half) + q
-                            for nt in cutlass.range_constexpr(self.n_tiles):
-                                f = 4 * (self.n_tiles * mt + nt) + 2 * half
-                                col = warp_n * Int32(self.warp_cols) + Int32(8 * nt) + Int32(2) * c
-                                st_shared_u32(ring + row * Int32(self.x_stride) + col * Int32(2),
-                                              pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
+                            if row < live:
+                                for nt in cutlass.range_constexpr(self.n_tiles):
+                                    f = 4 * (self.n_tiles * mt + nt) + 2 * half
+                                    col = warp_n * Int32(self.warp_cols) + Int32(8 * nt) + Int32(2) * c
+                                    st_shared_u32(ring + row * Int32(self.x_stride) + col * Int32(2),
+                                                  pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
                 cute.arch.sync_threads()
                 gs = Float32(1.0) / _ld_f32(Int64(s2.toint()) + Int64(self.down_in_offset) + Int64(e) * Int64(4))
                 groups = self.half_n // 16
