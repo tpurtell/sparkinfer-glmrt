@@ -67,8 +67,8 @@ from cutlass import Float32, Int32, Int64
 from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
     w8_scalars
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
-from ._glm_kernels import glm_projection
 from ._glmf_kernels import GlmfKdaConvState
+from .qwen4_tiles import qwen4_decode_tiles, qwen4_projection
 from ._qwen4_gdn_kernels import (
     REPLAY_ROWS,
     Qwen4GdnCommit,
@@ -208,7 +208,8 @@ def gdn_scratch_bytes(g: Qwen4Geometry, rows: int, chunked: int = 0) -> int:
 
 
 class _Gdn:
-    def __init__(self, g: Qwen4Geometry, max_rows: int = 64, fp8: bool = False, w8: str | None = None):
+    def __init__(self, g: Qwen4Geometry, max_rows: int = 64, fp8: bool = False, w8: str | None = None,
+                 decode_tiles: bool = False):
         self.g = g
         self.chunked = _GdnChunked(g, max_rows) if int(max_rows) > CHUNKED_MIN_ROWS else None
         c, v, p = g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width
@@ -216,9 +217,16 @@ class _Gdn:
         self.fp8 = bool(fp8)
         # w8 ("decode" / "prefill"): FP8-only projections (no BF16 weight operands).
         self.w8 = w8
+        if decode_tiles and (self.fp8 or w8 is not None):
+            raise ValueError("decode_tiles is the BF16 projections' (the FP8 and FP8-only routes keep "
+                             "their own decode schedules)")
+        # decode_tiles: the BF16 projections whose shape has a table pick their TMA tiles by live
+        # rows; a table extends that projection's key and the geometry records it.
+        self.decode_tiles = ({name: tiles for name, shape in (("in", (p, g.hidden)), ("out", (g.hidden, v)))
+                              if (tiles := qwen4_decode_tiles(shape))} if decode_tiles else {})
         if w8 is None:
-            self.in_proj = projection(p, g.hidden, self.fp8)
-            self.o_proj = projection(g.hidden, v, self.fp8)
+            self.in_proj = qwen4_projection(p, g.hidden, self.fp8, self.decode_tiles.get("in", ()))
+            self.o_proj = qwen4_projection(g.hidden, v, self.fp8, self.decode_tiles.get("out", ()))
         else:
             rows = int(max_rows) if check_w8_mode(w8) == "prefill" else None
             # The block-FP8 (W8A8) GEMM wants whole 128-row blocks; P = 16480 is not.
@@ -427,22 +435,31 @@ def _compile_gdn_w8(g: Qwen4Geometry, max_rows: int, mode: str) -> AotProgram:
 
 
 def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int, fp8: bool = False,
-                          fp8_only: str | None = None) -> AotProgram:
+                          fp8_only: str | None = None, decode_tiles: bool = False) -> AotProgram:
     """One GDN layer for ``rows <= max_rows``; see the module docstring. ``fp8``
     adds ``w_in_fp8``/``w_in_scale`` and ``w_out_fp8``/``w_out_scale`` (E4M3 with
     FP32 128x128 block scales) after each BF16 weight for rows up to the program's
     decode capacity (``FP8_DECODE_ROWS``). ``fp8_only``
     (``"decode"`` for capacities <= 64, ``"prefill"`` above) takes those E4M3
-    weights and scales in place of the BF16 ones (no BF16 weight operand)."""
+    weights and scales in place of the BF16 ones (no BF16 weight operand).
+
+    ``decode_tiles`` (BF16 programs): the in- and out-projections pick their TMA
+    tiles by live rows from ``qwen4_tiles.QWEN4_DECODE_TILES`` (the same MMA
+    accumulation retiled, so byte-identical outputs), for the serial decode GEMVs
+    the tile grid starves. Prefill capacities keep ``prefill_config``."""
     max_rows = int(max_rows)
     if max_rows <= 0:
         raise ValueError("max_rows must be positive")
+    if decode_tiles and (fp8 or fp8_only is not None):
+        raise ValueError("decode_tiles is the BF16 projections' (the FP8 and FP8-only routes keep "
+                         "their own decode schedules)")
     if fp8_only is not None:
         if fp8:
             raise ValueError("fp8 and fp8_only are exclusive")
         return _compile_gdn_w8(g, max_rows, fp8_only)
     spec = max_rows <= CHUNKED_MIN_ROWS
-    launch = (_GdnFp8 if fp8 else _GdnSpec if spec else _Gdn)(g, max_rows)
+    launch = _GdnFp8(g, max_rows) if fp8 else (_GdnSpec if spec else _Gdn)(g, max_rows,
+                                                                          decode_tiles=decode_tiles)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     record = launch.replay["bytes"]
     h, c, v, p, heads = g.hidden, g.gdn_conv_width, g.gdn_value_width, g.gdn_in_width, g.gdn_value_heads
@@ -473,7 +490,8 @@ def compile_qwen4_gdn_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int
         geometry={"hidden": h, "key_heads": g.gdn_key_heads, "value_heads": heads, "head_dim": g.gdn_head_dim,
                   "max_rows": max_rows, "in_width": p, "eps": g.norm_eps, "fp8_weights": fp8,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
-                  "replay_rows": REPLAY_ROWS if spec else None, "replay_bytes": record if spec else None},
+                  "replay_rows": REPLAY_ROWS if spec else None, "replay_bytes": record if spec else None,
+                  **({"decode_tiles": launch.decode_tiles} if launch.decode_tiles else {})},
         scratch={"scratch": lambda rows: gdn_scratch_bytes(g, rows, chunked)},
         doc=__doc__,
     )

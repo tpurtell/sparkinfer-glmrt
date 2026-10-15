@@ -121,7 +121,7 @@ from cutlass import Float32, Int32, Int64
 from ._fp8_weights import FP8_DECODE_ROWS, Fp8Projection, check_w8_mode, fp8_only_operands, fp8_operands, projection, \
     w8_scalars
 from ._common import QWEN38_FLASH_NEXT, AotProgram, Operand, Qwen4Geometry, Scalar, compile_program
-from ._glm_kernels import glm_projection
+from .qwen4_tiles import qwen4_decode_tiles, qwen4_projection
 from ._qwen4_attention_kernels import (
     Qwen4AttnPost,
     Qwen4BlockTopK,
@@ -184,9 +184,14 @@ def attn_producer_scratch_bytes(g: Qwen4Geometry, rows: int) -> int:
 
 
 class _Producer:
-    def __init__(self, g: Qwen4Geometry, fp8: bool = False, kv_format: str = "bf16"):
+    def __init__(self, g: Qwen4Geometry, fp8: bool = False, kv_format: str = "bf16", decode_tiles: bool = False):
         self.g, self.fp8, self.kv_format = g, bool(fp8), kv_format
-        self.proj = projection(g.attn_in_width, g.hidden, self.fp8)
+        if decode_tiles and self.fp8:
+            raise ValueError("decode_tiles is the BF16 projection's (the FP8 route keeps its own decode schedule)")
+        # decode_tiles: the BF16 projection picks its TMA tiles by live rows (qwen4_tiles).
+        self.decode_tiles = ({"in": tiles} if decode_tiles and (tiles := qwen4_decode_tiles(
+            (g.attn_in_width, g.hidden))) else {})
+        self.proj = qwen4_projection(g.attn_in_width, g.hidden, self.fp8, self.decode_tiles.get("in", ()))
         self.post = Qwen4AttnPost(g, kv_format)
         self.pool = Qwen4PoolKeys(g)
 
@@ -294,19 +299,27 @@ class _ProducerW8Prefill(_ProducerW8):
 
 def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
                                     fp8: bool = False, fp8_only: str | None = None,
-                                    kv_format: str = "bf16") -> AotProgram:
+                                    kv_format: str = "bf16", decode_tiles: bool = False) -> AotProgram:
     """Full-attention producer for ``rows <= max_rows``; see the module docstring.
     ``fp8`` adds ``w_in_fp8``/``w_in_scale`` (E4M3, FP32 128x128 block scales) for rows up to
     the program's decode capacity (``FP8_DECODE_ROWS``); ``fp8_only`` (``"decode"`` /
-    ``"prefill"``) takes them in place of ``w_in``."""
+    ``"prefill"``) takes them in place of ``w_in``.
+
+    ``decode_tiles`` (BF16 programs): ``w_in``'s TMA tiles follow the live rows
+    (``qwen4_tiles.QWEN4_DECODE_TILES``) so the serial decode GEMV fills the SMs
+    (bit-identical outputs: one MMA accumulation retiled)."""
     max_rows = _check_rows(max_rows)
     if fp8_only is not None and fp8:
         raise ValueError("fp8 and fp8_only are exclusive")
+    if decode_tiles and (fp8 or fp8_only is not None):
+        raise ValueError("decode_tiles is the BF16 projection's (the FP8 and FP8-only routes keep "
+                         "their own decode schedules)")
     prefill = fp8_only is not None and check_w8_mode(fp8_only) == "prefill"
     if fp8_only is not None:
         launch = (_ProducerW8Prefill if prefill else _ProducerW8Decode)(g, max_rows, prefill, kv_format)
     else:
-        launch = (_ProducerFp8 if fp8 else _Producer)(g, kv_format=kv_format)
+        launch = (_ProducerFp8(g, kv_format=kv_format) if fp8
+                  else _Producer(g, kv_format=kv_format, decode_tiles=decode_tiles))
     h, n, d, ih = g.hidden, g.heads, g.head_dim, g.index_heads
     weights = (fp8_only_operands("w_in", g.attn_in_width, h, prefill=prefill) if fp8_only is not None else
                (Operand("w_in", torch.bfloat16, f"[{g.attn_in_width},{h}]"),
@@ -347,7 +360,8 @@ def compile_qwen4_attn_producer_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max
         key=("mrope-v1", max_rows, launch.key()),
         geometry={"hidden": h, "heads": n, "kv_heads": g.kv_heads, "head_dim": d, "index_heads": ih,
                   "rope_dim": g.rope_dim, "rope_theta": g.rope_theta, "mrope_section": [11, 11, 10], "record_bytes": g.kv_record_bytes(kv_format), "kv_format": kv_format,
-                  "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows, "fp8_weights": fp8},
+                  "page_rows": g.page_rows, "eps": g.norm_eps, "max_rows": max_rows, "fp8_weights": fp8,
+                  **({"decode_tiles": launch.decode_tiles} if launch.decode_tiles else {})},
         scratch={"scratch": lambda rows: attn_producer_scratch_bytes(g, rows)},
         doc=__doc__,
     )
@@ -622,10 +636,16 @@ def attn_o_scratch_bytes(g: Qwen4Geometry, rows: int) -> int:
 
 
 class _AttnO:
-    def __init__(self, g: Qwen4Geometry, fp8: bool = False):
+    def __init__(self, g: Qwen4Geometry, fp8: bool = False, decode_tiles: bool = False):
         self.g, self.fp8 = g, bool(fp8)
+        if decode_tiles and self.fp8:
+            raise ValueError("decode_tiles is the BF16 projection's (the FP8 route keeps its own decode schedule)")
+        # decode_tiles: the BF16 o_proj picks its TMA tiles by live rows (qwen4_tiles).
+        self.decode_tiles = ({"out": tiles} if decode_tiles and (tiles := qwen4_decode_tiles(
+            (g.hidden, g.heads * g.head_dim))) else {})
         self.gate = Qwen4GateMul(g.heads * g.head_dim)
-        self.o_proj = projection(g.hidden, g.heads * g.head_dim, self.fp8)
+        self.o_proj = qwen4_projection(g.hidden, g.heads * g.head_dim, self.fp8,
+                                       self.decode_tiles.get("out", ()))
 
     def key(self) -> tuple:
         return (self.o_proj.key(), self.g, self.fp8)
@@ -693,12 +713,20 @@ class _AttnOW8Prefill(_AttnOW8):
 
 
 def compile_qwen4_attn_o_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int,
-                             fp8: bool = False, fp8_only: str | None = None) -> AotProgram:
+                             fp8: bool = False, fp8_only: str | None = None,
+                             decode_tiles: bool = False) -> AotProgram:
     """``o_proj(attn * sigmoid(gate))``; see the module docstring. ``fp8`` adds
     ``w_o_fp8``/``w_o_scale`` for rows up to the program's decode capacity;
     ``fp8_only`` (``"decode"`` /
-    ``"prefill"``) takes them in place of ``w_o``."""
+    ``"prefill"``) takes them in place of ``w_o``.
+
+    ``decode_tiles`` (BF16 programs): ``w_o``'s TMA tiles follow the live rows
+    (``qwen4_tiles.QWEN4_DECODE_TILES``), the one input 2560 x 8192-ish projection
+    whose 128-wide tile starves the SMs at decode rows; bits unchanged."""
     max_rows = _check_rows(max_rows)
+    if decode_tiles and (fp8 or fp8_only is not None):
+        raise ValueError("decode_tiles is the BF16 projection's (the FP8 and FP8-only routes keep "
+                         "their own decode schedules)")
     if fp8_only is not None:
         if fp8:
             raise ValueError("fp8 and fp8_only are exclusive")
@@ -717,7 +745,7 @@ def compile_qwen4_attn_o_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: 
             scratch={"scratch": launch.scratch_bytes},
             doc=__doc__,
         )
-    launch = (_AttnOFp8 if fp8 else _AttnO)(g)
+    launch = _AttnOFp8(g) if fp8 else _AttnO(g, decode_tiles=decode_tiles)
     h, w = g.hidden, g.heads * g.head_dim
     operands = (
         Operand("attn", torch.bfloat16, f"[rows,{w}]"),
@@ -729,7 +757,8 @@ def compile_qwen4_attn_o_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: 
     )
     return compile_program(
         launch, name="qwen4_attn_o", operands=operands, scalars=(Scalar("rows"),), key=(max_rows, launch.key()),
-        geometry={"hidden": h, "width": w, "max_rows": max_rows, "fp8_weights": fp8},
+        geometry={"hidden": h, "width": w, "max_rows": max_rows, "fp8_weights": fp8,
+                  **({"decode_tiles": launch.decode_tiles} if launch.decode_tiles else {})},
         scratch={"scratch": lambda rows: attn_o_scratch_bytes(g, rows)},
         doc=__doc__,
     )
