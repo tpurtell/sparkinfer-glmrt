@@ -71,6 +71,28 @@ def nvfp4_input_scale_offset(experts: int, rows: int, k: int) -> int:
     return nvfp4_alpha_offset(experts, rows, k) + 4 * int(experts)
 
 
+def _piece_swizzle(row, pieces: int):
+    """XOR swizzle of a row's 16-byte piece index (``pieces`` per row, a power of 2).
+
+    ``slot = piece ^ _piece_swizzle(row, pieces)``: rows stay unpadded (``k_block``
+    is a multiple of 64, so ``row_bytes`` is a multiple of 32) while keeping the
+    bank spread the ``+16`` byte pad used to provide. XOR preserves ``slot >> 1``,
+    so the two 16-byte halves of one 32-byte global sector always share one
+    32-byte shared-memory line -- an L1-bypassing ``cp.async`` copy then requests
+    one L2 sector per sector instead of 1.5 (the pad started every odd row 16 B
+    into a line and split its destination sectors).
+
+    ``LDSM.16.M88.4`` addresses rows ``0..7`` at one piece, so the swizzle has to
+    visit every bank quad (``(byte >> 4) & 7``) across those rows: with 8 pieces a
+    row is a whole 128-byte bank period and any bijection of ``0..7`` does it;
+    with 4 pieces (a 128-wide K block) a row is 64 B, bit 2 of the bank quad comes
+    from ``row & 1``, and the swizzle must be a bijection of ``0..3`` separately
+    on the even and the odd rows. ``((row & 1) << 2) | ((row >> 1) & 3)`` is both.
+    """
+    swz = ((row & Int32(1)) << Int32(2)) | ((row >> Int32(1)) & Int32(3))
+    return swz & Int32(pieces - 1)
+
+
 @cute.jit
 def _quantize_row16(values: cute.Tensor, gs: Float32, packed_at: Int64, scale_at: Int64):
     packed, scale = quantize_block_fp4(values, max_abs_16(values), gs)
@@ -234,8 +256,13 @@ class StreamNvfp4LinearA4:
         self.k_block = 256 if self.k % 256 == 0 else 128
         self.blocks = self.k // self.k_block
         self.row_bytes = self.k_block // 2
-        # Padded rows (bytes): fragment loads of 8 rows x 4 lanes hit distinct banks.
-        self.stride = self.row_bytes + 16
+        # Rows are unpadded (``k_block % 64 == 0`` makes every stride a multiple of
+        # 32) and the 16-byte piece index is XOR-swizzled per row (``_piece_swizzle``).
+        # A ``+16`` pad puts odd rows 16 (mod 32) into shared memory, so the two
+        # 16-byte halves of a 32-byte global sector land in two different 32-byte
+        # SMEM lines and the cp.async coalescer asks L2 for 1.5 sectors per sector.
+        self.stride = self.row_bytes
+        self.pieces = self.row_bytes // 16
         self.s_bytes = self.k_block // 16
         self.s_stride = self.s_bytes + 4
         self.tile_bytes = self.tile_m * self.stride
@@ -293,7 +320,8 @@ class StreamNvfp4LinearA4:
             if c < rows * Int32(chunks):
                 row = c // Int32(chunks)
                 piece = c % Int32(chunks)
-                cp_async4_shared_global(stage + Int32(packed_offset) + row * Int32(self.stride) + piece * Int32(16),
+                slot = piece ^ _piece_swizzle(row, chunks)
+                cp_async4_shared_global(stage + Int32(packed_offset) + row * Int32(self.stride) + slot * Int32(16),
                                         rows_at + Int64(row) * Int64(self.k // 2) + Int64(block) * Int64(self.row_bytes)
                                         + Int64(piece) * Int64(16))
         words = self.s_bytes // 4
@@ -316,17 +344,18 @@ class StreamNvfp4LinearA4:
         ssa = stage + Int32(self.tile_bytes + self.weight_bytes)
         ssb = ssa + Int32(self.sc_bytes)
         for step in cutlass.range_constexpr(self.k_block // 64):
-            k_byte = 32 * step
             sfa = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Uint32)
             a = cute.make_rmem_tensor(cute.make_layout((4 * self.m_tiles,), stride=(1,)), Uint32)
             for mt in cutlass.range_constexpr(self.m_tiles):
                 r0 = warp_m * Int32(self.warp_rows) + Int32(16 * mt) + q
                 sfa[mt] = ld_shared_u32(ssa + (r0 + Int32(8) * (c & Int32(1))) * Int32(self.s_stride)
                                         + Int32(4 * step))
-                # ldmatrix x4: lane t addresses row t % 8 of matrix t / 8 (rows +8, then K +16 B).
+                # ldmatrix x4: lane t addresses row t % 8 of matrix t / 8 (rows +8, then K +16 B);
+                # the 16-byte piece is the row's swizzled slot, as ``_load_operand`` staged it.
                 arow = warp_m * Int32(self.warp_rows) + Int32(16 * mt) + Int32(8) * (mat & Int32(1)) + mrow
-                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sa + arow * Int32(self.stride) + Int32(k_byte)
-                                                     + Int32(16) * (mat >> Int32(1)))
+                apiece = Int32(2 * step) + (mat >> Int32(1))
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                    sa + arow * Int32(self.stride) + (apiece ^ _piece_swizzle(arow, self.pieces)) * Int32(16))
                 a[4 * mt] = a0
                 a[4 * mt + 1] = a1
                 a[4 * mt + 2] = a2
@@ -335,8 +364,9 @@ class StreamNvfp4LinearA4:
             for pair in cutlass.range_constexpr(self.n_tiles // 2):
                 # Matrices: b0, b1 of column block 2 * pair, then of 2 * pair + 1.
                 bcol = warp_n * Int32(self.warp_cols) + Int32(16 * pair) + Int32(8) * (mat >> Int32(1)) + mrow
-                b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(sw + bcol * Int32(self.stride) + Int32(k_byte)
-                                                     + Int32(16) * (mat & Int32(1)))
+                bpiece = Int32(2 * step) + (mat & Int32(1))
+                b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(
+                    sw + bcol * Int32(self.stride) + (bpiece ^ _piece_swizzle(bcol, self.pieces)) * Int32(16))
                 bw[4 * pair] = b0
                 bw[4 * pair + 1] = b1
                 bw[4 * pair + 2] = b2
@@ -473,7 +503,9 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.k_block = int(k_block)
         self.blocks = self.k // self.k_block
         self.row_bytes = self.k_block // 2
-        self.stride = self.row_bytes + 16
+        # Unpadded rows plus the per-row piece swizzle, as in ``StreamNvfp4LinearA4``.
+        self.stride = self.row_bytes
+        self.pieces = self.row_bytes // 16
         self.s_bytes = self.k_block // 16
         self.s_stride = self.s_bytes + 4
         self.tile_bytes = self.tile_m * self.stride
