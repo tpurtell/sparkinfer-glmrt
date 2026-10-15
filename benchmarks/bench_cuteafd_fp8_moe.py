@@ -80,6 +80,23 @@ def main() -> None:
         from tests.integration.test_cuteafd_nvfp4_moe_aot import _weights, reference
 
         w = _weights(g, i)
+        canonical = w
+        # Bounded per-expert repack; both returned views share exactly the
+        # canonical allocation size. A loader can emit these records directly.
+        def repack(wt, sc):
+            rows, kk = wt.shape[1], wt.shape[2] * 2
+            total = wt.numel() + sc.numel()
+            storage = torch.empty(total, dtype=torch.uint8, device=dev)
+            records = storage[:e * rows * kk * 9 // 16].view(e, rows // 8, kk // 256, 1152)
+            for expert in range(e):
+                words = wt[expert].contiguous().view(torch.int32).view(rows // 8, 8, kk // 256, 4, 2, 4)
+                records[expert, :, :, :1024].copy_(words.permute(0, 2, 1, 5, 3, 4).contiguous().view(torch.uint8).reshape(rows // 8, kk // 256, 1024))
+                scales_at = sc[expert * rows * kk // 16:(expert + 1) * rows * kk // 16]
+                records[expert, :, :, 1024:].copy_(scales_at.view(rows // 8, 8, kk // 256, 16).permute(0, 2, 1, 3).reshape(rows // 8, kk // 256, 128))
+            storage[-8 * e:].copy_(sc[-8 * e:])
+            return storage[:wt.numel()], storage[wt.numel():]
+        w = (*repack(w[0], w[1]), w[2], w[3], w[4], w[5])
+        w = (w[0], w[1], *repack(w[2], w[3]), w[4], w[5])
         per_expert = 3 * i * h * 9 // 16 + 24
     elif g.weights == "fp8":
         w = (fp8((e, i, h)), scales((e, i // 128, h // 128)), fp8((e, i, h)), scales((e, i // 128, h // 128)),
@@ -125,7 +142,7 @@ def main() -> None:
         if args.check:
             assert torch.isfinite(out).all() and out.count_nonzero() > 0
             if g.weights == "nvfp4":
-                ref = reference(g, x_exact, ids, weights, *w, a4=g.activations == "a4")
+                ref = reference(g, x_exact, ids, weights, *canonical, a4=g.activations == "a4")
             else:
                 def dequant(wt, s):
                     return (wt.float() * s.repeat_interleave(128, 0).repeat_interleave(128, 1)).bfloat16()

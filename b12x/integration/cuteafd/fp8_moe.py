@@ -90,6 +90,7 @@ from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
 from ._mxfp4_moe_a8 import StreamMxfp4DownA8
 from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
+from ._nvfp4_decode import DecodeNvfp4GateUp
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
@@ -596,10 +597,11 @@ class _StreamNvfp4A4Route:
                                                         tile_m=16, tile_n=n, live_max=16) for n in (32, 64, 128))
             self.small_down = tuple(StreamNvfp4LinearA4(n=h, k=i, experts=e, tile_m=16, tile_n=n,
                                                         live_max=16) for n in (32, 64, 128))
+        self.decode_gate = DecodeNvfp4GateUp(i, h, e, g.swiglu_limit)
         self.combine = MoeCombine(hidden=h, top_k=k)
 
     def key(self) -> tuple:
-        return ("stream_nvfp4_a4", self.max_tiles, self.rows_in.key(), self.gate_up.key(),
+        return ("stream_nvfp4_a4_repacked", self.decode_gate.key(), self.max_tiles, self.rows_in.key(), self.gate_up.key(),
                 None if self.swiglu is None else self.swiglu.key(), self.down.key(), self.combine.key(),
                 tuple(p.key() for p in self.small_gate), tuple(p.key() for p in self.small_down))
 
@@ -640,10 +642,7 @@ class _StreamNvfp4A4Route:
             sms = runtime_num_sm()
             # The sparsest valid routing has top_k experts. Narrow N until its
             # grid fills the queried device; sparse M keeps CTA SMEM small.
-            if Int32(g.top_k * (g.slice // 32)) >= sms * Int32(2):
-                self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
-            else:
-                self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
+            self.decode_gate(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
             # Bound by pairs, so duplicate expert ids cannot bypass the wide path.
             if pairs > Int32(16):
                 self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream)
