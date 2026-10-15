@@ -71,6 +71,13 @@ def nvfp4_input_scale_offset(experts: int, rows: int, k: int) -> int:
     return nvfp4_alpha_offset(experts, rows, k) + 4 * int(experts)
 
 
+# Dynamic shared memory a sparse A4 CTA may reserve per block (the SM121 carveout
+# the route plans its kernels against).
+CTA_SMEM_BYTES = 101_376
+# Deepest cp.async ring planned for a sparse tile (``fp8_moe.SMALL_GATE_STAGES``).
+SPARSE_RING_STAGES = 3
+
+
 @cute.jit
 def _quantize_row16(values: cute.Tensor, gs: Float32, packed_at: Int64, scale_at: Int64):
     packed, scale = quantize_block_fp4(values, max_abs_16(values), gs)
@@ -231,20 +238,56 @@ class StreamNvfp4LinearA4:
         self.frags = 4 * self.m_tiles * self.n_tiles
         if self.n % self.tile_n or self.k % 128:
             raise ValueError("NVFP4 A4 linear needs N % tile_n == 0 and K % 128 == 0")
-        self.k_block = 256 if self.k % 256 == 0 else 128
+        self._set_k_block(self._plan_k_block())
+        self.alpha_offset = nvfp4_alpha_offset(experts, self.n, self.k)
+        self.in_offset = nvfp4_input_scale_offset(experts, self.n, self.k)
+
+    @staticmethod
+    def _scale_stride(s_bytes: int) -> int:
+        """Bytes reserved per scale row in a ring stage.
+
+        A scale row is read as 16-byte vectors when it holds a whole multiple of
+        32 bytes, which needs 16-byte-aligned rows (the 4-byte pad a narrower row
+        uses would misalign them). Whole 32-byte sectors are what make the loads
+        sector-dense; the pad only trades a two-way bank conflict in the two
+        scale fragment loads of the K step for that."""
+        return s_bytes + (16 if s_bytes % 32 == 0 else 4)
+
+    def _stage_bytes_for(self, k_block: int) -> int:
+        """Ring stage bytes a K block would reserve (operand and scale tiles)."""
+        row_bytes = k_block // 2
+        stride = row_bytes + 16
+        s_stride = self._scale_stride(k_block // 16)
+        return (self.tile_m + self.tile_n) * (stride + s_stride)
+
+    def _plan_k_block(self) -> int:
+        """Widest K block whose ring fits the CTA's shared-memory ceiling.
+
+        Sparse tiles stage K in 512-wide pairs when K allows it: a row's E4M3
+        scale records then cover whole 32-byte sectors, so a warp's scale
+        request is sector-dense instead of fetching the used half of each
+        sector separately. Wide tiles keep the 256-wide block, whose ring
+        already fills the ceiling. Only staging changes: the K order every
+        output accumulates in, and the MMA sequence, are the same."""
+        k_block = 256 if self.k % 256 == 0 else 128
+        if (self.tile_m == 16 and self.k % 512 == 0
+                and SPARSE_RING_STAGES * self._stage_bytes_for(512) <= CTA_SMEM_BYTES):
+            k_block = 512
+        return k_block
+
+    def _set_k_block(self, k_block: int):
+        self.k_block = int(k_block)
         self.blocks = self.k // self.k_block
         self.row_bytes = self.k_block // 2
-        # Padded rows (bytes): fragment loads of 8 rows x 4 lanes hit distinct banks.
         self.stride = self.row_bytes + 16
         self.s_bytes = self.k_block // 16
-        self.s_stride = self.s_bytes + 4
+        self.s_stride = self._scale_stride(self.s_bytes)
+        self.s_vec = self.s_bytes % 32 == 0
         self.tile_bytes = self.tile_m * self.stride
         self.weight_bytes = self.tile_n * self.stride
         self.sc_bytes = self.tile_m * self.s_stride
         self.weight_sc_bytes = self.tile_n * self.s_stride
         self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
-        self.alpha_offset = nvfp4_alpha_offset(experts, self.n, self.k)
-        self.in_offset = nvfp4_input_scale_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
         return ("stream_linear_nvfp4_a4", 3, self.n, self.k, self.experts, self.k_block,
@@ -286,15 +329,30 @@ class StreamNvfp4LinearA4:
                 cp_async4_shared_global(stage + Int32(packed_offset) + row * Int32(self.stride) + piece * Int32(16),
                                         rows_at + Int64(row) * Int64(self.k // 2) + Int64(block) * Int64(self.row_bytes)
                                         + Int64(piece) * Int64(16))
-        words = self.s_bytes // 4
-        for q in cutlass.range_constexpr(_ceil(count * words, self.threads)):
-            c = tidx + Int32(q * self.threads)
-            if c < Int32(count * words):
-                row = c // Int32(words)
-                word = c % Int32(words)
-                cp_async_u32_shared_global(stage + Int32(scale_offset) + row * Int32(self.s_stride) + word * Int32(4),
-                                           scales_at + Int64(row) * Int64(self.k // 16) + Int64(block) * Int64(self.s_bytes)
-                                           + Int64(word) * Int64(4))
+        if const_expr(self.s_vec):
+            # 16 bytes per lane, two lanes per row: a pair of adjacent lanes covers
+            # one whole 32-byte sector of a row's scale records.
+            halves = self.s_bytes // 16
+            for q in cutlass.range_constexpr(_ceil(count * halves, self.threads)):
+                c = tidx + Int32(q * self.threads)
+                if c < Int32(count * halves):
+                    row = c // Int32(halves)
+                    half = c % Int32(halves)
+                    cp_async4_shared_global(
+                        stage + Int32(scale_offset) + row * Int32(self.s_stride) + half * Int32(16),
+                        scales_at + Int64(row) * Int64(self.k // 16) + Int64(block) * Int64(self.s_bytes)
+                        + Int64(half) * Int64(16))
+        else:
+            words = self.s_bytes // 4
+            for q in cutlass.range_constexpr(_ceil(count * words, self.threads)):
+                c = tidx + Int32(q * self.threads)
+                if c < Int32(count * words):
+                    row = c // Int32(words)
+                    word = c % Int32(words)
+                    cp_async_u32_shared_global(
+                        stage + Int32(scale_offset) + row * Int32(self.s_stride) + word * Int32(4),
+                        scales_at + Int64(row) * Int64(self.k // 16) + Int64(block) * Int64(self.s_bytes)
+                        + Int64(word) * Int64(4))
 
     @cute.jit
     def _mma_stage(self, stage, acc: cute.Tensor, warp_m, warp_n, q, c, mat, mrow):
@@ -458,19 +516,6 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.down_in_offset = nvfp4_input_scale_offset(experts, hidden, self.inter)
         if self.tile_m * self.x_stride > self.stages * self.stage_bytes:
             raise ValueError("the gate/up exchange does not fit the ring")
-
-    def _set_k_block(self, k_block: int):
-        self.k_block = int(k_block)
-        self.blocks = self.k // self.k_block
-        self.row_bytes = self.k_block // 2
-        self.stride = self.row_bytes + 16
-        self.s_bytes = self.k_block // 16
-        self.s_stride = self.s_bytes + 4
-        self.tile_bytes = self.tile_m * self.stride
-        self.weight_bytes = self.tile_n * self.stride
-        self.sc_bytes = self.tile_m * self.s_stride
-        self.weight_sc_bytes = self.tile_n * self.s_stride
-        self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
 
     def key(self) -> tuple:
         return ("stream_gate_up_nvfp4_a4", 3, self.inter, self.k, self.experts, self.k_block, self.stages,
