@@ -1230,6 +1230,22 @@ def st_shared_v4_u32(
 
 
 @dsl_user_op
+def cp_async_mbarrier_arrive_noinc(smem_bar_u32: Int32, *, loc=None, ip=None) -> None:
+    """Complete one pre-counted barrier arrival after this thread's cp.async copies."""
+    llvm.inline_asm(
+        None,
+        [Int32(smem_bar_u32).ir_value(loc=loc, ip=ip)],
+        "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [$0];",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cp_async_bulk_g2s_mbar(
     smem_dst_u32: Int32,
     gmem_src_i64: Int64,
