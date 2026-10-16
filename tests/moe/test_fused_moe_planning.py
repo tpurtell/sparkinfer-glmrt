@@ -306,13 +306,21 @@ def test_projection_mixed_tile_config_preserves_whole_tile_geometry() -> None:
         intermediate_size=2048,
         token_count=10,
         direct_topk_routes=False,
-    ) == (64, 256, 64, 256)
+    ) == (128, 128, 128, 128)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
         hidden_size=4096,
         intermediate_size=2048,
         token_count=32,
         direct_topk_routes=False,
+    ) == (128, 128, 128, 128)
+    assert fused_moe_impl._projection_mixed_tile_config(
+        None,
+        hidden_size=5120,
+        intermediate_size=2304,
+        token_count=16,
+        direct_topk_routes=False,
+        canonical_k=True,
     ) == (64, 256, 64, 256)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,
@@ -320,6 +328,7 @@ def test_projection_mixed_tile_config_preserves_whole_tile_geometry() -> None:
         intermediate_size=1152,
         token_count=16,
         direct_topk_routes=False,
+        canonical_k=True,
     ) == (64, 128, 64, 128)
     assert fused_moe_impl._projection_mixed_tile_config(
         None,

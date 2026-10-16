@@ -8315,15 +8315,20 @@ def _projection_mixed_tile_config(
     intermediate_size: int,
     token_count: int,
     direct_topk_routes: bool,
+    canonical_k: bool = False,
 ) -> tuple[int, int, int, int]:
     """Resolve a mixed-Trellis tile geometry for the whole-tile scheduler."""
 
-    del token_count, direct_topk_routes
     if configured is None:
+        # SM120 CUDA-graph sweeps on GLM H4096/I2048 show that the wider K128
+        # tile removes one packed-route wave at M10..M32.  Tiny speculative
+        # batches, canonical-K decode exports, and the block-64 prefill plan
+        # remain on K64/N256 (or K64/N128 where N256 is not a whole tile).
+        if not canonical_k and not direct_topk_routes and 10 <= int(token_count) <= 32:
+            return (128, 128, 128, 128)
         # Each gate/up projection must contain whole CTA N tiles. Qwen
         # has I=640, so GLM's N256 default is not legal for FC1.
-        # Both stages must also use the same CTA thread count, and m16 must
-        # preserve the canonical m1/m80 K64 reduction order.
+        # Both stages must also use the same CTA thread count.
         tile_n = 256 if intermediate_size % 256 == 0 and hidden_size % 256 == 0 else 128
         return (64, tile_n, 64, tile_n)
     return tuple(int(value) for value in configured)
