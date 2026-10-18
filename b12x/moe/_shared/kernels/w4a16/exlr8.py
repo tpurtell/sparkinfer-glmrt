@@ -18,6 +18,7 @@ from cutlass._mlir.dialects import llvm
 
 from b12x._lib.intrinsics import (
     cp_async4_shared_global,
+    cp_async4_shared_global_pred,
     f16_mma_m16n8k16_f32,
     half2_to_float2_scaled,
     ld_global_b16,
@@ -73,7 +74,7 @@ def _side_value(address: Int64, index: Int32):
 
 class Exlr8A16Kernel:
     ABI_VERSION = 1
-    CODE_VERSION = 3
+    CODE_VERSION = 4
 
     def __init__(self, hidden_size: int, units_per_expert: int, top_k: int,
                  max_groups: int, fast_math: bool = True):
@@ -98,6 +99,7 @@ class Exlr8A16Kernel:
         self.stage_units = min(self.units, 8)
         self.stage_chunks = (self.units + self.stage_units - 1) // self.stage_units
         self.smem_words = self.stage_units * self.stage_unit_bytes // 4
+        self.fc1_smem_words = 8 * self.stage_unit_bytes // 4
 
     @property
     def __cache_key__(self):
@@ -131,31 +133,24 @@ class Exlr8A16Kernel:
                 block=(128, 1, 1), stream=stream)
 
     @cute.jit
-    def _mma_block(self, payload: Int64, a_address: Int64,
-                   row0: Int32, row1: Int32, a_stride: cutlass.Constexpr,
-                   input_block: Int32, output_block: Int32, lane: Int32,
-                   warp: Int32, width: cutlass.Constexpr, down: cutlass.Constexpr):
-        """One K128 block, four N8 fragments per lane, FP32 accumulation."""
+    def _accumulate_shared(self, total: cute.Tensor, payload: Int64, abase: Int32,
+                           input_block: Int32, lane: Int32, warp: Int32,
+                           width: cutlass.Constexpr, scale: Float32):
+        """One K128 block against x staged in shared memory."""
         acc = cute.make_rmem_tensor((4, 4), Float32)
         acc.fill(Float32(0.0))
+        r = lane // Int32(4)
+        row0 = abase + r * Int32(self.smem_row_bytes)
+        row1 = row0 + Int32(8 * self.smem_row_bytes)
         for k16 in cutlass.range_constexpr(8):
-            k = input_block * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
-            a0 = Uint32(0)
-            a1 = Uint32(0)
-            a2 = Uint32(0)
-            a3 = Uint32(0)
-            if row0 >= Int32(0):
-                addr0 = a_address + (row0.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
-                a0 = ld_global_nc_u32(addr0)
-                a2 = ld_global_nc_u32(addr0 + Int64(16))
-            if row1 >= Int32(0):
-                addr1 = a_address + (row1.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
-                a1 = ld_global_nc_u32(addr1)
-                a3 = ld_global_nc_u32(addr1 + Int64(16))
+            ka = row0 + Int32(k16 * 32) + (lane & Int32(3)) * Int32(4)
+            kb = row1 + Int32(k16 * 32) + (lane & Int32(3)) * Int32(4)
+            a0 = ld_shared_u32(ka)
+            a1 = ld_shared_u32(kb)
+            a2 = ld_shared_u32(ka + Int32(16))
+            a3 = ld_shared_u32(kb + Int32(16))
             for n16 in cutlass.range_constexpr(2):
                 tile = (input_block * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
-                if cutlass.const_expr(down):
-                    tile = output_block * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
                 b0, b1, b2, b3 = exlr8_decode_tile(payload, tile, lane, width)
                 d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                     acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
@@ -167,16 +162,6 @@ class Exlr8A16Kernel:
                     a0, a1, a2, a3, b2, b3)
                 acc[2*n16+1, 0], acc[2*n16+1, 1] = d0, d1
                 acc[2*n16+1, 2], acc[2*n16+1, 3] = d2, d3
-        return acc
-
-    @cute.jit
-    def _accumulate_block(self, total: cute.Tensor, payload: Int64, a_address: Int64,
-                          row0: Int32, row1: Int32, a_stride: cutlass.Constexpr,
-                          input_block: Int32, output_block: Int32, lane: Int32,
-                          warp: Int32, width: cutlass.Constexpr,
-                          down: cutlass.Constexpr, scale: Float32):
-        acc = self._mma_block(payload, a_address, row0, row1, a_stride,
-                              input_block, output_block, lane, warp, width, down)
         for n in cutlass.range_constexpr(4):
             for v in cutlass.range_constexpr(4):
                 total[n, v] = total[n, v] + acc[n, v] * scale
@@ -189,6 +174,17 @@ class Exlr8A16Kernel:
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.fc1_smem_words], 1024
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        xbase = x.iterator.toint()
         while task < groups * Int32(self.units * 2 * self.splits):
             split = task % Int32(self.splits)
             proj = (task // Int32(self.splits)) % Int32(2)
@@ -210,19 +206,49 @@ class Exlr8A16Kernel:
             if width != Int32(0):
                 payload = pointers[desc * Int64(3)]
                 scales = pointers[desc * Int64(3) + Int64(2)]
+                # Stage this split's x rows once; every warp then reads the
+                # same fragments from shared memory instead of global.
+                for c in cutlass.range_constexpr(16):
+                    piece = Int32(tid) + Int32(c * 128)
+                    block = piece // Int32(256)
+                    rem = piece % Int32(256)
+                    rr = rem // Int32(16)
+                    xx = rem % Int32(16)
+                    kb = split * Int32(8) + block
+                    slot = route_slots[group.to(Int64) * Int64(16) + rr.to(Int64)]
+                    pred = Int32(0)
+                    live = Int32(0)
+                    if slot >= Int32(0) and slot < rows * Int32(self.top_k):
+                        pred = Int32(1)
+                        if kb < Int32(self.blocks):
+                            live = slot // Int32(self.top_k)
+                        else:
+                            pred = Int32(0)
+                    src = (xbase + (live.to(Int64) * Int64(self.hidden_size)
+                           + (kb * Int32(128) + xx * Int32(8)).to(Int64)) * Int64(2))
+                    dst = (smem_base + block * Int32(self.stage_unit_bytes)
+                           + rr * Int32(self.smem_row_bytes) + xx * Int32(16))
+                    cp_async4_shared_global_pred(dst, src, pred)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
                 for block in cutlass.range(8):
                     kb = split * Int32(8) + block
                     if kb < Int32(self.blocks):
                         scale = _side_value(scales, kb)
                         if width == Int32(2):
-                            self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 2, False, scale)
+                            self._accumulate_shared(total, payload,
+                                smem_base + block * Int32(self.stage_unit_bytes), kb,
+                                lane, warp, 2, scale)
                         elif width == Int32(3):
-                            self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 3, False, scale)
+                            self._accumulate_shared(total, payload,
+                                smem_base + block * Int32(self.stage_unit_bytes), kb,
+                                lane, warp, 3, scale)
                         elif width == Int32(4):
-                            self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 4, False, scale)
+                            self._accumulate_shared(total, payload,
+                                smem_base + block * Int32(self.stage_unit_bytes), kb,
+                                lane, warp, 4, scale)
+                cute.arch.sync_threads()
             for n in cutlass.range_constexpr(4):
                 col = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
                 base = task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)
