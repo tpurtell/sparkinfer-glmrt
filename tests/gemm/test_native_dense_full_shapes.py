@@ -21,6 +21,8 @@ def case_module(name):
 ])
 def test_scaled_full_checkpoint_shape(encoding, side, k, n, rows):
     c = case_module("test_native_scaled_linear").Case(encoding, side, k=k, n=n, rows=rows)
+    c.partial.fill_(float("nan"))
+    c.output.fill_(float("nan"))
     c.launch(rows, torch.cuda.get_device_properties(0).multi_processor_count*4)
     reference = c.x.double() @ c.weight.double().T
     baseline = (c.x @ c.weight.bfloat16().T).double()
@@ -30,20 +32,28 @@ def test_scaled_full_checkpoint_shape(encoding, side, k, n, rows):
     if rows > 1:
         expected = c.output.clone()
         for width in (1, 4, 16):
+            c.partial.fill_(float("nan"))
+            c.output.fill_(float("nan"))
             c.launch(width, 48)
             assert torch.equal(c.output[:width].view(torch.int32), expected[:width].view(torch.int32))
+            assert torch.isnan(c.output[width:]).all()
 
 
 def test_trellis_full_checkpoint_shape():
     c = case_module("test_native_trellis_linear").Case(k=2048, n=16384, rows=16)
+    c.partial.fill_(float("nan"))
+    c.output.fill_(float("nan"))
     c.launch(16, torch.cuda.get_device_properties(0).multi_processor_count*4)
     expected = c.output.clone()
     reference = c.x.double() @ c.weight.double()
     baseline = (c.x.bfloat16() @ c.weight.bfloat16()).double()
     assert torch.linalg.vector_norm(c.output.double()-reference) <= 1.01*torch.linalg.vector_norm(baseline-reference)
     for width in (1, 4, 16):
+        c.partial.fill_(float("nan"))
+        c.output.fill_(float("nan"))
         c.launch(width, 48)
         assert torch.equal(c.output[:width].view(torch.int32), expected[:width].view(torch.int32))
+        assert torch.isnan(c.output[width:]).all()
 
 
 def test_embedding_full_checkpoint_shape():

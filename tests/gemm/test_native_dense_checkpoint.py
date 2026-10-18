@@ -50,11 +50,16 @@ def test_real_dense_unit(stem):
     program = compile_trellis_linear_aot(input_features=k, output_features=n,
                                         bits=bits, sharded_side=side, max_rows=64)
     for selected in range(4):
+        partial.fill_(float("nan"))
+        output.fill_(float("nan"))
         program.launch(ptrs, payload, scale, partial, output, scalars=(64, selected, 752))
         expected = output.clone()
         target = x[selected].double() @ weight.double()
         baseline = (x[selected].bfloat16() @ weight.bfloat16()).double()
         assert torch.linalg.vector_norm(output.double()-target) <= 1.01*torch.linalg.vector_norm(baseline-target)
         for rows in (1, 4, 16, 64):
+            partial.fill_(float("nan"))
+            output.fill_(float("nan"))
             program.launch(ptrs, payload, scale, partial, output, scalars=(rows, selected, 48))
             assert torch.equal(output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
+            assert torch.isnan(output[rows:]).all()
