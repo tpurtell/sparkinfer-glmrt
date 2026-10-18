@@ -163,6 +163,7 @@ def main():
     parser.add_argument("--shapes", help="comma-separated projection names")
     parser.add_argument("--rows", default="1,4,16,64,4096")
     parser.add_argument("--replays", type=int, default=20)
+    parser.add_argument("--resume", action="store_true", help="retain completed measurements and run only missing rows")
     args = parser.parse_args()
     rows_list = [int(v) for v in args.rows.split(",")]
     if any(r < 1 or r > 4096 for r in rows_list) or args.replays < 1:
@@ -183,13 +184,30 @@ def main():
                   throughput="stored weight+scale bytes read once; not DRAM traffic counters",
                   fp8_comparison="same shape/rows, synthetic FP8 weights, not quality equivalence",
                   source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    session = {key: value for key, value in report.items() if key != "measurements"}
+    if args.resume:
+        previous = json.loads(args.output.read_text())
+        if (previous["device"], previous["sms"]) != (report["device"], report["sms"]):
+            raise RuntimeError("resume requires the same GPU model and SM count")
+        previous.setdefault("sessions", [{key: value for key, value in previous.items()
+                                          if key not in ("measurements", "sessions")}])
+        report = previous
+    else:
+        report["sessions"] = []
+    session_id = len(report["sessions"])
+    report["sessions"].append(session)
+    ceiling = session["read_ceiling"]["gbps"]
+    complete = {(m["format"], m["projection"], m["rows"]) for m in report["measurements"]}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for fmt, name, k, n, side in shapes:
+        missing = [rows for rows in rows_list if (fmt, name, rows) not in complete]
+        if not missing:
+            continue
         with exportable_compilation():
             program = compile_native(fmt, k, n, side)
         spill = spill_check(program, args.output.parent / "cubins" / f"{fmt}-{name}")
         control = compile_native(fmt, k, n, side, control=True)
-        for rows in rows_list:
+        for rows in missing:
             storage, read_bytes = native_tensors(fmt, k, n, rows)
             tensors = storage if fmt == "embedding" else storage[:5]
             scalars = (rows, 2, cta_limit) if fmt == "trellis" else (rows, cta_limit)
@@ -206,16 +224,26 @@ def main():
             native_us = timing(graph, replays)
             control_us = timing(control_graph, replays)
             fp8_us = None
+            fp8_status = "not_applicable" if fmt == "embedding" else "ok"
+            fp8_error = None
             if fmt != "embedding":
-                fp8_graph, fp8_storage = baseline(k, n, rows)
-                fp8_us = timing(fp8_graph, replays)
-                del fp8_graph, fp8_storage
+                try:
+                    fp8_graph, fp8_storage = baseline(k, n, rows)
+                except TypeError as error:
+                    if "dense_gemm launch is unsupported" not in str(error):
+                        raise
+                    fp8_status, fp8_error = "unsupported", str(error)
+                else:
+                    fp8_us = timing(fp8_graph, replays)
+                    del fp8_graph, fp8_storage
             gbps = read_bytes/native_us/1000
             row = dict(format=fmt, projection=name, k=k, n=n, sharded_side=side,
                        rows=rows, read_bytes=read_bytes, native_us=native_us,
-                       gbps=gbps, read_ceiling_percent=100*gbps/report["read_ceiling"]["gbps"],
-                       target_met=gbps >= .95*report["read_ceiling"]["gbps"],
+                       gbps=gbps, read_ceiling_percent=100*gbps/ceiling,
+                       target_met=gbps >= .95*ceiling,
+                       session_id=session_id, read_ceiling_gbps=ceiling,
                        control_us=control_us, control_bitwise_equal=True, cubin_spill_check=spill,
+                       block_fp8_status=fp8_status, block_fp8_error=fp8_error,
                        block_fp8_us=fp8_us, speedup_vs_block_fp8=fp8_us/native_us if fp8_us else None)
             report["measurements"].append(row)
             args.output.write_text(json.dumps(report, indent=2)+"\n")
