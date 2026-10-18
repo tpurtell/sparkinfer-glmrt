@@ -88,12 +88,14 @@ class Exlr8A16Kernel:
     # mechanics, natural order, so a static-vs-identity delta is the sorted
     # table's whole effect. The table path is used only at >=
     # balanced_min_groups; every path runs identical per-element arithmetic,
-    # so results are bitwise unchanged.
+    # so results are bitwise unchanged. Static stays the default: the identity
+    # control (the same table, unsorted) never beat it on the round-2 bench, so
+    # the table path itself costs time and sorting is opt-in until measured clean.
     SCHEDULES = ("static", "balanced", "identity")
 
     def __init__(self, hidden_size: int, units_per_expert: int, top_k: int,
                  max_groups: int, fast_math: bool = True,
-                 schedule: str = "balanced", balanced_min_groups: int = 24):
+                 schedule: str = "static", balanced_min_groups: int = 24):
         if hidden_size <= 0 or hidden_size % 128:
             raise ValueError("EXLR8 hidden_size must be a positive multiple of 128")
         if min(units_per_expert, top_k, max_groups) < 1:

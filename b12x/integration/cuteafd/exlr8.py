@@ -17,7 +17,7 @@ POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
 
 
 def geometry(hidden=6144, units=16, top_k=8, max_groups=512,
-             schedule="balanced", balanced_min_groups=24):
+             schedule="static", balanced_min_groups=24):
     values = (hidden, units, top_k, max_groups)
     if any(type(v) is not int or v <= 0 or v > 2**31 - 1 for v in values) or hidden % 128:
         raise ValueError("EXLR8 requires positive int32 geometry and hidden % 128 == 0")
@@ -73,7 +73,7 @@ class _Exlr8Pointers:
 
 
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
-                          schedule="balanced", balanced_min_groups=24):
+                          schedule="static", balanced_min_groups=24):
     g = geometry(hidden, units, top_k, max_groups, schedule, balanced_min_groups)
     h, u, t, m, s = (g[k] for k in ("hidden", "units", "top_k", "max_groups", "fc1_splits"))
     operands = (
