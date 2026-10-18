@@ -10,7 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int32
+from cutlass import const_expr, Int32
 
 from b12x._lib.program_cache import program_cache
 from b12x._lib.compile_plan import attach_programs
@@ -384,7 +384,11 @@ def _validate_varlen_inputs_against_plan(
         device,
         dtype,
     )
-    if expected != actual:
+    shapes_fit = all(
+        0 < shape[0] <= capacity[0] and shape[1:] == capacity[1:]
+        for shape, capacity in zip(actual[:5], expected[:5])
+    )
+    if not shapes_fit or actual[5:] != expected[5:]:
         raise ValueError(
             "varlen attention plan mismatch: "
             "expected q/k/v/cu_q/cu_k/device/dtype="
@@ -438,6 +442,10 @@ class VarlenAttentionPlanKey:
     qhead_per_kvhead: int
     logical_q_rows_static: int
     logical_total_q_rows: int
+    block_sparse: bool = False
+    per_segment_tiles: bool = False
+    num_q_tiles: int = 0
+    total_blocks_cap: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -458,7 +466,11 @@ class AttentionPlan:
 
 @dataclass(frozen=True, kw_only=True)
 class VarlenAttentionPlan:
-    """Exact-shape launch contract for one packed varlen contiguous attention shape."""
+    """Capacity-bounded launch contract for packed varlen attention.
+
+    Leading row and segment dimensions are maxima. Live tensors supply their
+    actual dimensions to the retained program; head geometry remains fixed.
+    """
 
     key: VarlenAttentionPlanKey
     compiled: object = field(repr=False, compare=False)
@@ -889,7 +901,15 @@ class _VarlenAttentionForwardLaunch:
         max_seqlen_k: int,
         tile_m: int,
         tile_n: int,
+        block_sparse: bool = False,
+        num_q_tiles: int = 0,
+        total_blocks_cap: int = 0,
+        per_segment_tiles: bool = False,
     ):
+        self._block_sparse = bool(block_sparse)
+        self._per_segment_tiles = bool(per_segment_tiles)
+        self._num_q_tiles = int(num_q_tiles)
+        self._total_blocks_cap = int(total_blocks_cap)
         self._q_shape = q_shape
         self._k_shape = k_shape
         self._v_shape = v_shape
@@ -953,17 +973,19 @@ class _VarlenAttentionForwardLaunch:
             head_dim,
             head_dim_v=head_dim_v,
             qhead_per_kvhead=qhead_per_kvhead,
-            is_causal=causal,
-            is_local=is_local,
+            is_causal=causal and not block_sparse,
+            is_local=is_local and not block_sparse,
             # Packed GQA folds the group dimension into M.  The resulting
             # layout can only compose with the fixed TMA tile when the group
             # divides tile_m (Laguna uses group=9 with tile_m=128).  Keep the
             # existing unpacked-head kernel as the static fallback for those
             # shapes; this choice depends only on plan geometry and is graph
             # capture safe.
-            pack_gqa=(qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0),
+            pack_gqa=(not block_sparse and qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0),
             tile_m=tile_m,
             tile_n=tile_n,
+            is_block_sparse=block_sparse,
+            per_segment_tiles=per_segment_tiles,
         )
         assert head_dim == head_dim_k
 
@@ -977,18 +999,26 @@ class _VarlenAttentionForwardLaunch:
         lse_ptr: cute.Pointer,
         cu_seqlens_q_ptr: cute.Pointer,
         cu_seqlens_k_ptr: cute.Pointer,
+        block_indices_ptr: cute.Pointer,
+        block_offsets_ptr: cute.Pointer,
         attention_sink_bias_ptr: cute.Pointer,
         softmax_scale: float,
+        q_rows: Int32,
+        kv_rows: Int32,
+        segment_count: Int32,
         current_stream: cuda.CUstream,
     ):
         q_tensor = cute.make_tensor(
-            q_ptr, layout=cute.make_layout(self._q_shape, stride=self._q_stride)
+            q_ptr, layout=cute.make_layout(
+                (q_rows, *self._q_shape[1:]), stride=self._q_stride)
         )
         k_tensor = cute.make_tensor(
-            k_ptr, layout=cute.make_layout(self._k_shape, stride=self._k_stride)
+            k_ptr, layout=cute.make_layout(
+                (kv_rows, *self._k_shape[1:]), stride=self._k_stride)
         )
         v_tensor = cute.make_tensor(
-            v_ptr, layout=cute.make_layout(self._v_shape, stride=self._v_stride)
+            v_ptr, layout=cute.make_layout(
+                (kv_rows, *self._v_shape[1:]), stride=self._v_stride)
         )
         o_tensor = cute.make_tensor(
             o_ptr, layout=cute.make_layout(self._o_shape, stride=self._o_stride)
@@ -1000,17 +1030,30 @@ class _VarlenAttentionForwardLaunch:
         cu_seqlens_q_tensor = cute.make_tensor(
             cu_seqlens_q_ptr,
             layout=cute.make_layout(
-                self._cu_seqlens_q_shape,
+                (segment_count + 1,),
                 stride=self._cu_seqlens_q_stride,
             ),
         )
         cu_seqlens_k_tensor = cute.make_tensor(
             cu_seqlens_k_ptr,
             layout=cute.make_layout(
-                self._cu_seqlens_k_shape,
+                (segment_count + 1,),
                 stride=self._cu_seqlens_k_stride,
             ),
         )
+        if const_expr(self._block_sparse):
+            mBlockIndices = cute.make_tensor(
+                block_indices_ptr,
+                layout=cute.make_layout((max(1, self._total_blocks_cap),), stride=(1,)),
+            )
+            mBlockOffsets = cute.make_tensor(
+                block_offsets_ptr,
+                layout=cute.make_layout((self._num_q_tiles + 1,), stride=(1,)),
+            )
+            blocksparse_tensors = (mBlockIndices, mBlockOffsets)
+        else:
+            blocksparse_tensors = None
+
         attention_sink_bias_tensor = cute.make_tensor(
             attention_sink_bias_ptr,
             layout=cute.make_layout(
@@ -1027,6 +1070,7 @@ class _VarlenAttentionForwardLaunch:
             softmax_scale,
             mCuSeqlensQ=cu_seqlens_q_tensor,
             mCuSeqlensK=cu_seqlens_k_tensor,
+            blocksparse_tensors=blocksparse_tensors,
             learnable_sink=attention_sink_bias_tensor,
             has_attention_sink_bias=self._has_attention_sink_bias,
             logical_num_batch_static=self._num_batch,
@@ -1115,6 +1159,10 @@ def _compile_varlen_attention(
     max_seqlen_k: int,
     tile_m: int,
     tile_n: int,
+    block_sparse: bool = False,
+    num_q_tiles: int = 0,
+    total_blocks_cap: int = 0,
+    per_segment_tiles: bool = False,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _VarlenAttentionForwardLaunch(
@@ -1132,6 +1180,10 @@ def _compile_varlen_attention(
         max_seqlen_k=max_seqlen_k,
         tile_m=tile_m,
         tile_n=tile_n,
+        block_sparse=block_sparse,
+        num_q_tiles=num_q_tiles,
+        total_blocks_cap=total_blocks_cap,
+        per_segment_tiles=per_segment_tiles,
     )
     return b12x_compile(
         launch,
@@ -1142,12 +1194,17 @@ def _compile_varlen_attention(
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         1.0,
+        Int32(q_shape[0]),
+        Int32(k_shape[0]),
+        Int32(cu_seqlens_q_shape[0] - 1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "attention.contiguous.varlen_forward",
-            1,
+            2,
             (
                 q_shape,
                 k_shape,
@@ -1163,6 +1220,10 @@ def _compile_varlen_attention(
                 max_seqlen_k,
                 tile_m,
                 tile_n,
+                block_sparse,
+                num_q_tiles,
+                total_blocks_cap,
+                per_segment_tiles,
             ),
         ),
     )
@@ -1248,6 +1309,10 @@ def _get_varlen_attention_plan(
     max_seqlen_k: int,
     tile_m: int,
     tile_n: int,
+    block_sparse: bool = False,
+    num_q_tiles: int = 0,
+    total_blocks_cap: int = 0,
+    per_segment_tiles: bool = False,
 ) -> VarlenAttentionPlan:
     (
         num_batch,
@@ -1280,6 +1345,10 @@ def _get_varlen_attention_plan(
             tile_n=tile_n,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            block_sparse=block_sparse,
+            num_q_tiles=num_q_tiles,
+            total_blocks_cap=total_blocks_cap,
+            per_segment_tiles=per_segment_tiles,
             num_batch=num_batch,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
@@ -1302,6 +1371,10 @@ def _get_varlen_attention_plan(
             max_seqlen_k,
             tile_m,
             tile_n,
+            block_sparse,
+            num_q_tiles,
+            total_blocks_cap,
+            per_segment_tiles,
         ),
         cutlass_dtype=_torch_to_cutlass_dtype(dtype),
     )
@@ -1840,11 +1913,11 @@ def build_varlen_attention_binding(
             "attention_sink_bias mismatch: "
             f"plan expects {plan.has_attention_sink_bias}, got {has_attention_sink_bias}"
         )
-    if max_seqlen_q is not None and int(max_seqlen_q) != plan.max_seqlen_q:
+    if max_seqlen_q is not None and not 0 <= int(max_seqlen_q) <= plan.max_seqlen_q:
         raise ValueError(
             f"max_seqlen_q mismatch: plan has {plan.max_seqlen_q}, got {max_seqlen_q}"
         )
-    if max_seqlen_k is not None and int(max_seqlen_k) != plan.max_seqlen_k:
+    if max_seqlen_k is not None and not 0 <= int(max_seqlen_k) <= plan.max_seqlen_k:
         raise ValueError(
             f"max_seqlen_k mismatch: plan has {plan.max_seqlen_k}, got {max_seqlen_k}"
         )
@@ -1932,11 +2005,11 @@ def _build_varlen_attention_binding_from_views(
             "attention_sink_bias mismatch: "
             f"plan expects {plan.has_attention_sink_bias}, got {has_attention_sink_bias}"
         )
-    if max_seqlen_q is not None and int(max_seqlen_q) != plan.max_seqlen_q:
+    if max_seqlen_q is not None and not 0 <= int(max_seqlen_q) <= plan.max_seqlen_q:
         raise ValueError(
             f"max_seqlen_q mismatch: plan has {plan.max_seqlen_q}, got {max_seqlen_q}"
         )
-    if max_seqlen_k is not None and int(max_seqlen_k) != plan.max_seqlen_k:
+    if max_seqlen_k is not None and not 0 <= int(max_seqlen_k) <= plan.max_seqlen_k:
         raise ValueError(
             f"max_seqlen_k mismatch: plan has {plan.max_seqlen_k}, got {max_seqlen_k}"
         )
@@ -2182,6 +2255,8 @@ def b12x_varlen_attention_forward(
     causal: bool | None = None,
     window_size: int | tuple[int, int] | None = None,
     attention_sink_bias: torch.Tensor | None = None,
+    block_indices: torch.Tensor | None = None,
+    block_offsets: torch.Tensor | None = None,
     binding: VarlenAttentionBinding | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute packed varlen attention from a bound, stored native program."""
@@ -2204,6 +2279,8 @@ def b12x_varlen_attention_forward(
     q, k, v = binding.q, binding.k, binding.v
     cu_seqlens_q, cu_seqlens_k = binding.cu_seqlens_q, binding.cu_seqlens_k
     output, lse, plan = binding.output, binding.lse, binding.plan
+    if plan is not None and plan.block_sparse and (block_indices is None or block_offsets is None):
+        raise ValueError("Sparse attention requires block_indices and block_offsets")
     max_seqlen_q, max_seqlen_k = binding.max_seqlen_q, binding.max_seqlen_k
     softmax_scale, causal, window_size = binding.softmax_scale, binding.causal, binding.window_size
     attention_sink_bias = binding.attention_sink_bias
@@ -2223,9 +2300,9 @@ def b12x_varlen_attention_forward(
             raise ValueError("attention_sink_bias is required by this plan")
     elif attention_sink_bias is None:
         attention_sink_bias = _attention_sink_placeholder(resolved_plan.device_index)
-    if max_seqlen_q is not None and int(max_seqlen_q) != resolved_plan.max_seqlen_q:
+    if max_seqlen_q is not None and not 0 <= int(max_seqlen_q) <= resolved_plan.max_seqlen_q:
         raise ValueError(f"max_seqlen_q mismatch: plan has {resolved_plan.max_seqlen_q}, got {max_seqlen_q}")
-    if max_seqlen_k is not None and int(max_seqlen_k) != resolved_plan.max_seqlen_k:
+    if max_seqlen_k is not None and not 0 <= int(max_seqlen_k) <= resolved_plan.max_seqlen_k:
         raise ValueError(f"max_seqlen_k mismatch: plan has {resolved_plan.max_seqlen_k}, got {max_seqlen_k}")
     if causal is not None and bool(causal) != resolved_plan.causal:
         raise ValueError(f"causal mismatch: plan has {resolved_plan.causal}, got {causal}")
@@ -2253,10 +2330,23 @@ def b12x_varlen_attention_forward(
         make_ptr(cutlass.Float32, lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_k.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(
+            cutlass.Int32,
+            (cu_seqlens_k if block_indices is None else block_indices).data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            (cu_seqlens_k if block_offsets is None else block_offsets).data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
         make_ptr(cutlass.Float32, attention_sink_bias.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
-        float(softmax_scale), current_cuda_stream(),
+        float(softmax_scale), Int32(q_shape[0]), Int32(k_shape[0]),
+        Int32(cu_q_shape[0] - 1), current_cuda_stream(),
     )
-    return output, lse
+    return output[:q_shape[0]], lse[:, :q_shape[0]]
 
 
 __all__ = [

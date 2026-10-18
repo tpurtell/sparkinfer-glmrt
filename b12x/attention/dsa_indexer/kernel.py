@@ -2884,7 +2884,7 @@ def _run_paged_tiled_logits_kernel_common(
     seqlens_per_query_kernel = seqlens_per_query
     active_width_kernel = active_width
     logits = tile_logits
-    logits_view = tile_logits[:required_elements]
+    logits_view = tile_logits.narrow(0, 0, required_elements)
     if preinitialize_tile_logits:
         logits_view.fill_(float("-inf"))
 

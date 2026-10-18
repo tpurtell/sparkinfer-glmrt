@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import functools
 import gc
+import time
 import weakref
 from collections import namedtuple
 from threading import RLock
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
+from enum import Enum
 
 from .compile_plan import (
     CompiledCuTeProgram, _RESIDENT_PROGRAMS, evict_unretained_triton, program_keys,
@@ -15,6 +20,67 @@ from .compile_plan import (
 
 _CACHES = weakref.WeakSet()
 _MAPPING_CACHES = []
+_PREPARATION_CACHE = ContextVar("b12x_preparation_program_cache", default=None)
+
+
+def _metadata_key(value):
+    if isinstance(value, Mapping):
+        return frozenset((_metadata_key(k), _metadata_key(v)) for k, v in value.items())
+    if isinstance(value, (tuple, list)):
+        return (type(value), tuple(_metadata_key(item) for item in value))
+    if is_dataclass(value) and not isinstance(value, type):
+        return (type(value), tuple((item.name, _metadata_key(getattr(value, item.name)))
+                                  for item in fields(value)))
+    if value is None or isinstance(value, (str, int, float, bool, Enum)):
+        return (type(value), value)
+    import torch
+    if isinstance(value, (torch.dtype, torch.device)):
+        return (type(value), value)
+    raise TypeError(f"program factory cache requires metadata, not {type(value).__name__}")
+
+
+class PreparationProgramCache:
+    """Factory results owned by one job, never by the process-wide registry."""
+
+    def __init__(self, timing=None):
+        self._caches = {}
+        self._timing = timing
+
+    @contextmanager
+    def activate(self):
+        token = _PREPARATION_CACHE.set(self)
+        try:
+            yield
+        finally:
+            _PREPARATION_CACHE.reset(token)
+
+    def call(self, factory, args, kwargs):
+        memo = self._caches.get(factory)
+        if memo is None:
+            memo = program_cache(factory._function)
+            memo._metadata = True
+            self._caches[factory] = memo
+        before = memo._misses
+        timing = self._timing
+        if timing is None or timing.path is None:
+            return memo(*args, **kwargs)
+        label = f"factory.{factory.__module__}.{factory.__name__}"
+        started = time.perf_counter()
+        try:
+            with timing.span(label):
+                return memo(*args, **kwargs)
+        finally:
+            timing.add(label + (".miss" if memo._misses != before else ".hit"),
+                       time.perf_counter() - started)
+
+    def clear(self):
+        count = sum(len(cache._values) for cache in self._caches.values())
+        for cache in self._caches.values():
+            cache.cache_clear()
+        self._caches.clear()
+        if count and self._timing is not None:
+            self._timing.record("factory_cache_clear", entries=count)
+        return count
 
 
 def register_program_cache(cache, *, mirrors=(), lock=None):
@@ -24,16 +90,29 @@ _CacheInfo = namedtuple("CacheInfo", "hits misses maxsize currsize")
 
 
 class program_cache:
-    def __init__(self, function):
-        functools.update_wrapper(self, function)
+    def __init__(self, function=None, *, scope="process"):
+        if scope not in ("process", "preparation"):
+            raise ValueError("program cache scope must be process or preparation")
+        if function is not None:
+            functools.update_wrapper(self, function)
         self._function = function
+        self._scope = scope
+        self._metadata = False
         self._values = {}
         self._lock = RLock()
         self._hits = self._misses = 0
         _CACHES.add(self)
 
     def __call__(self, *args, **kwargs):
-        key = functools._make_key(args, kwargs, typed=False)
+        if self._function is None:
+            return type(self)(args[0], scope=self._scope)
+        if self._scope == "preparation":
+            scope = _PREPARATION_CACHE.get()
+            if scope is None:
+                return self._function(*args, **kwargs)
+            return scope.call(self, args, kwargs)
+        key = (_metadata_key((args, kwargs)) if self._metadata else
+               functools._make_key(args, kwargs, typed=False))
         with self._lock:
             if key in self._values:
                 self._hits += 1

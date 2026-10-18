@@ -16,6 +16,7 @@ from ._linear import (
 )
 from . import META
 from ._a16 import NVFP4LinearWeight, w4a16, w8a16
+from ._iq2_xs import IQ2XSLinearWeight, BlockQuantLinearWeight
 
 
 def workspace_size(plan: Plan) -> int:
@@ -41,7 +42,7 @@ def mm_mxfp4(
     rhs_values: torch.Tensor,
     rhs_scale_storage: torch.Tensor,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
 ) -> torch.Tensor:
@@ -65,7 +66,7 @@ def mm_nvfp4(
     rhs_scale_storage: torch.Tensor,
     alpha: torch.Tensor,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
 ) -> torch.Tensor:
@@ -89,7 +90,7 @@ def mm_block_fp8(
     rhs_values: torch.Tensor,
     rhs_scale: torch.Tensor,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
 ) -> torch.Tensor:
@@ -116,6 +117,8 @@ __all__ = [
     "query_from_call",
     "Weight",
     "NVFP4LinearWeight",
+    "IQ2XSLinearWeight",
+    "BlockQuantLinearWeight",
     "is_supported",
     "mm",
     "mm_block_fp8",

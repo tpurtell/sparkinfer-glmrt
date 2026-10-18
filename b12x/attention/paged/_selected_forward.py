@@ -64,8 +64,8 @@ _LOG2_E = 1.4426950408889634
 _LOCK = RLock()
 _KERNEL_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
 _WARMED: dict[tuple[object, ...], Callable[..., None]] = {}
-_MERGE_CACHE: dict[tuple[int, int, int, str], Callable[..., None]] = {}
-_MERGE_WARMED: dict[tuple[int, int, int, str], Callable[..., None]] = {}
+_MERGE_CACHE: dict[tuple[object, ...], Callable[..., None]] = {}
+_MERGE_WARMED: dict[tuple[object, ...], Callable[..., None]] = {}
 
 
 def _add(left: Float32, right: Float32) -> Float32:
@@ -131,6 +131,7 @@ class _SelectedPositionPagedForwardKernel:
         kv_heads: int,
         kv_is_fp8: bool,
         direct_output: bool,
+        return_lse: bool,
         kv_warps: int,
         page_size: int,
         key_strides: tuple[int, int, int],
@@ -149,6 +150,7 @@ class _SelectedPositionPagedForwardKernel:
         if inline_scale_offsets is not None and not self.kv_is_fp8:
             raise ValueError("inline descales require FP8 KV")
         self.direct_output = bool(direct_output)
+        self.return_lse = bool(return_lse)
         self.kv_warps = int(kv_warps)
         if self.kv_warps not in (1, 2, 4):
             raise ValueError(
@@ -851,9 +853,9 @@ class _SelectedPositionPagedForwardKernel:
                     if const_expr(self.kv_is_fp8):
                         scale *= v_scale
                     shared_row_scale[local_head] = scale
-                    if const_expr(not self.direct_output) and local_head < Int32(
-                        self.heads_per_kv
-                    ):
+                    if const_expr(
+                        not self.direct_output or self.return_lse
+                    ) and local_head < Int32(self.heads_per_kv):
                         query_head = first_query_head + local_head
                         lse_offset = (
                             row.to(Int64) * splits.to(Int64) + split.to(Int64)
@@ -894,8 +896,9 @@ class _SelectedPositionPagedForwardKernel:
 class _SparseGqaMergeKernel:
     """Merge FP32 split-softmax partials into caller-owned BF16 output."""
 
-    def __init__(self, *, q_heads: int) -> None:
+    def __init__(self, *, q_heads: int, return_lse: bool) -> None:
         self.q_heads = int(q_heads)
+        self.return_lse = bool(return_lse)
 
     @cute.jit
     def __call__(
@@ -903,11 +906,12 @@ class _SparseGqaMergeKernel:
         partial_output: cute.Pointer,
         partial_lse: cute.Pointer,
         output: cute.Pointer,
+        output_lse: cute.Pointer,
         rows: Int32,
         splits: Int32,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(partial_output, partial_lse, output, splits).launch(
+        self.kernel(partial_output, partial_lse, output, output_lse, splits).launch(
             grid=(self.q_heads, rows, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -919,6 +923,7 @@ class _SparseGqaMergeKernel:
         partial_output: cute.Pointer,
         partial_lse: cute.Pointer,
         output: cute.Pointer,
+        output_lse: cute.Pointer,
         splits: Int32,
     ) -> None:
         query_head, row, _ = cute.arch.block_idx()
@@ -955,6 +960,13 @@ class _SparseGqaMergeKernel:
         inverse = Float32(0.0)
         if denominator > Float32(0.0):
             inverse = Float32(1.0) / denominator
+        if const_expr(self.return_lse) and thread_i == Int32(0):
+            merged_lse = Float32(-Float32.inf)
+            if denominator > Float32(0.0):
+                merged_lse = maximum + cute.math.log2(
+                    denominator, fastmath=True
+                ) * Float32(0.6931471805599453)
+            output_lse[row_i * Int64(self.q_heads) + head_i] = merged_lse
 
         allocator = cutlass.utils.SmemAllocator()
         shared_weights = allocator.allocate_tensor(
@@ -1006,11 +1018,12 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
         partial_output: cute.Pointer,
         partial_lse: cute.Pointer,
         output: cute.Pointer,
+        output_lse: cute.Pointer,
         rows: Int32,
         splits: Int32,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(partial_output, partial_lse, output, splits).launch(
+        self.kernel(partial_output, partial_lse, output, output_lse, splits).launch(
             grid=(self.q_heads, rows, _HEAD_DIM // 32),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -1022,6 +1035,7 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
         partial_output: cute.Pointer,
         partial_lse: cute.Pointer,
         output: cute.Pointer,
+        output_lse: cute.Pointer,
         splits: Int32,
     ) -> None:
         query_head, row, tile = cute.arch.block_idx()
@@ -1055,6 +1069,15 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
         inverse = Float32(0.0)
         if denominator > Float32(0.0):
             inverse = Float32(1.0) / denominator
+        if const_expr(self.return_lse) and (warp == Int32(0)) & (
+            lane == Int32(0)
+        ):
+            merged_lse = Float32(-Float32.inf)
+            if denominator > Float32(0.0):
+                merged_lse = maximum + cute.math.log2(
+                    denominator, fastmath=True
+                ) * Float32(0.6931471805599453)
+            output_lse[row_i * Int64(self.q_heads) + head_i] = merged_lse
 
         allocator = cutlass.utils.SmemAllocator()
         shared_weights = allocator.allocate_tensor(
@@ -1116,10 +1139,15 @@ class _CooperativeSparseGqaMergeKernel(_SparseGqaMergeKernel):
 class _ShapeAdaptiveSparseGqaMergeKernel:
     """Trade split parallelism for independent query rows in one compiled callable."""
 
-    def __init__(self, *, q_heads: int) -> None:
+    def __init__(self, *, q_heads: int, return_lse: bool) -> None:
         self.q_heads = q_heads
-        self.serial = _SparseGqaMergeKernel(q_heads=q_heads)
-        self.cooperative = _CooperativeSparseGqaMergeKernel(q_heads=q_heads)
+        self.return_lse = bool(return_lse)
+        self.serial = _SparseGqaMergeKernel(
+            q_heads=q_heads, return_lse=return_lse
+        )
+        self.cooperative = _CooperativeSparseGqaMergeKernel(
+            q_heads=q_heads, return_lse=return_lse
+        )
 
     @cute.jit
     def __call__(
@@ -1127,6 +1155,7 @@ class _ShapeAdaptiveSparseGqaMergeKernel:
         partial_output: cute.Pointer,
         partial_lse: cute.Pointer,
         output: cute.Pointer,
+        output_lse: cute.Pointer,
         rows: Int32,
         splits: Int32,
         stream: cuda.CUstream,
@@ -1134,13 +1163,17 @@ class _ShapeAdaptiveSparseGqaMergeKernel:
         # Independent query rows supply parallelism without multiplying CTAs
         # across head dimensions. Both branches preserve the same reduction tree.
         if rows > splits:
-            self.serial.kernel(partial_output, partial_lse, output, splits).launch(
+            self.serial.kernel(
+                partial_output, partial_lse, output, output_lse, splits
+            ).launch(
                 grid=(self.q_heads, rows, 1),
                 block=(_THREADS, 1, 1),
                 stream=stream,
             )
         else:
-            self.cooperative.kernel(partial_output, partial_lse, output, splits).launch(
+            self.cooperative.kernel(
+                partial_output, partial_lse, output, output_lse, splits
+            ).launch(
                 grid=(self.q_heads, rows, _HEAD_DIM // 32),
                 block=(_THREADS, 1, 1),
                 stream=stream,
@@ -1157,6 +1190,7 @@ def _cache_key(
     request_ids: torch.Tensor,
     *,
     direct_output: bool,
+    return_lse: bool,
     kv_warps: int,
     selection_width: int = _SELECTION_WIDTH,
 ) -> tuple[object, ...]:
@@ -1173,6 +1207,7 @@ def _cache_key(
         tuple(map(int, key_cache.stride()[:3])),
         tuple(map(int, value_cache.stride()[:3])),
         bool(direct_output),
+        bool(return_lse) if direct_output else True,
         int(kv_warps),
         int(selection_width),
     )
@@ -1206,6 +1241,7 @@ def _compile(
     value_cache: torch.Tensor,
     request_ids: torch.Tensor,
     direct_output: bool,
+    return_lse: bool,
     kv_warps: int,
     selection_width: int = _SELECTION_WIDTH,
 ) -> tuple[tuple[object, ...], Callable[..., None]]:
@@ -1215,6 +1251,7 @@ def _compile(
         value_cache,
         request_ids,
         direct_output=direct_output,
+        return_lse=return_lse,
         kv_warps=kv_warps,
         selection_width=selection_width,
     )
@@ -1232,18 +1269,18 @@ def _compile(
             key_strides,
             value_strides,
             direct_output,
+            return_lse,
             kv_warps,
             selection_width,
         ) = key
         request_id_type = Int32 if request_id_bits == 32 else Int64
         kv_type = Float8E4M3FN if kv_dtype == torch.float8_e4m3fn else BFloat16
-        from .forward_extend_generic import PagedForwardKernel
-
-        kernel = PagedForwardKernel.selected_positions(
+        kernel = _SelectedPositionPagedForwardKernel(
             q_heads=q_heads,
             kv_heads=kv_heads,
             kv_is_fp8=kv_dtype == torch.float8_e4m3fn,
             direct_output=direct_output,
+            return_lse=return_lse,
             kv_warps=kv_warps,
             page_size=page_size,
             key_strides=key_strides,
@@ -1279,7 +1316,7 @@ def _compile(
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.paged.selected_forward",
-                    3,
+                    4,
                     (
                         q_heads,
                         kv_heads,
@@ -1289,6 +1326,7 @@ def _compile(
                         key_strides,
                         value_strides,
                         direct_output,
+                        return_lse,
                         kv_warps,
                         selection_width,
                     ),
@@ -1301,6 +1339,7 @@ def _compile(
                         "key_strides",
                         "value_strides",
                         "direct_output",
+                        "return_lse",
                         "kv_warps",
                         "selection_width",
                     ),
@@ -1330,6 +1369,7 @@ def precompile_sparse_gqa_split(
             value_cache=value_cache,
             request_ids=request_ids,
             direct_output=False,
+            return_lse=True,
             kv_warps=2,
             selection_width=selection_width,
         )
@@ -1358,6 +1398,7 @@ def launch_sparse_gqa_split(
         value_cache,
         request_ids,
         direct_output=False,
+        return_lse=True,
         kv_warps=2,
         selection_width=int(selected_positions.shape[1]),
     )
@@ -1378,6 +1419,7 @@ def launch_sparse_gqa_split(
                 value_cache=value_cache,
                 request_ids=request_ids,
                 direct_output=False,
+                return_lse=True,
                 kv_warps=2,
                 selection_width=int(selected_positions.shape[1]),
             )
@@ -1429,6 +1471,7 @@ def launch_selected_paged_gqa_direct(
     selected_positions: torch.Tensor,
     query_positions: torch.Tensor,
     output: torch.Tensor,
+    output_lse: torch.Tensor | None,
     softmax_scale: float,
     kv_warps: int,
 ) -> None:
@@ -1440,6 +1483,7 @@ def launch_selected_paged_gqa_direct(
         value_cache,
         request_ids,
         direct_output=True,
+        return_lse=output_lse is not None,
         kv_warps=kv_warps,
         selection_width=int(selected_positions.shape[1]),
     )
@@ -1460,6 +1504,7 @@ def launch_selected_paged_gqa_direct(
                 value_cache=value_cache,
                 request_ids=request_ids,
                 direct_output=True,
+                return_lse=output_lse is not None,
                 kv_warps=kv_warps,
                 selection_width=int(selected_positions.shape[1]),
             )
@@ -1482,7 +1527,9 @@ def launch_selected_paged_gqa_direct(
                 _pointer(selected_positions, Int32),
                 _pointer(query_positions, Int64),
                 _fake_pointer(Float32),
-                _fake_pointer(Float32),
+                _pointer(output_lse, Float32)
+                if output_lse is not None
+                else _fake_pointer(Float32),
                 _pointer(output, BFloat16),
                 int(key_cache.shape[0]),
                 int(block_table.shape[0]),
@@ -1504,6 +1551,7 @@ def launch_sparse_gqa_merge(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
     output: torch.Tensor,
+    output_lse: torch.Tensor | None,
     rows: int,
     splits: int,
 ) -> None:
@@ -1512,7 +1560,14 @@ def launch_sparse_gqa_merge(
     if device_index is None:
         device_index = torch.cuda.current_device()
     q_heads = int(partial_output.shape[2])
-    key = (int(device_index), q_heads, _HEAD_DIM, _MERGE_KERNEL.__name__)
+    return_lse = output_lse is not None
+    key = (
+        int(device_index),
+        q_heads,
+        _HEAD_DIM,
+        _MERGE_KERNEL.__name__,
+        return_lse,
+    )
     with torch.cuda.device(device_index):
         capturing = torch.cuda.is_current_stream_capturing()
         with _LOCK:
@@ -1524,7 +1579,7 @@ def launch_sparse_gqa_merge(
                 "CUDA graph capture"
             )
         if raw is None:
-            kernel = _MERGE_KERNEL(q_heads=q_heads)
+            kernel = _MERGE_KERNEL(q_heads=q_heads, return_lse=return_lse)
             raise_if_kernel_resolution_frozen(
                 "cute.compile",
                 target=kernel,
@@ -1535,12 +1590,13 @@ def launch_sparse_gqa_merge(
                 _fake_pointer(Float32),
                 _fake_pointer(Float32),
                 _fake_pointer(BFloat16),
+                _fake_pointer(Float32),
                 Int32(1),
                 Int32(1),
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "attention.qsa.sparse_gqa_merge",
-                    9,
+                    11,
                     key[1:],
                 ),
             )
@@ -1556,6 +1612,9 @@ def launch_sparse_gqa_merge(
                 _pointer(partial_output, Float32),
                 _pointer(partial_lse, Float32),
                 _pointer(output, BFloat16),
+                _pointer(output_lse, Float32)
+                if output_lse is not None
+                else _fake_pointer(Float32),
                 int(rows),
                 int(splits),
                 current_cuda_stream(),

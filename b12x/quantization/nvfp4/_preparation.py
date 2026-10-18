@@ -6,11 +6,13 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._impl import compile_bf16_to_fp4_tma
 from ._tuning import TUNING, Nvfp4QuantizationConfig, Nvfp4QuantizationQuery
 
 
+@program_cache(scope="preparation")
 def compile_quantizer(query_payload, config_payload, ordinal):
     query = Nvfp4QuantizationQuery(**dict(query_payload))
     config = Nvfp4QuantizationConfig.from_config(config_payload)

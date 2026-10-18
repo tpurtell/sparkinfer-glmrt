@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 
 
@@ -79,6 +80,7 @@ def _metadata_binding(layout, query):
     return binding
 
 
+@program_cache(scope="preparation")
 def compile_prefill(component, query_payload, config_payload, ordinal):
     impl, tuning = _modules(component)
     query_type = tuning.GdnPrefillQuery if component == "gdn_prefill" else tuning.KdaPrefillQuery

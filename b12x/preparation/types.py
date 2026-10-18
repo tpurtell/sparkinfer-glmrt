@@ -204,11 +204,14 @@ class MemoryRequirements:
     @classmethod
     def sequential(cls, requirements):
         """Calls reuse scratch sequentially; persistent allocation keys are shared."""
-        scratch, size, persistent = (), 0, []
+        scratch, size, persistent = (), (0, 0), []
         for requirement in requirements:
             if not isinstance(requirement, cls):
                 raise TypeError("memory callback must return MemoryRequirements")
-            candidate_size = requirement.scratch_nbytes
+            candidate_size = (
+                requirement.scratch_nbytes,
+                sum(spec.nbytes for spec in requirement.scratch),
+            )
             if candidate_size > size:
                 scratch, size = requirement.scratch, candidate_size
             persistent.extend(requirement.persistent)
@@ -240,6 +243,25 @@ class CollectiveRequirement:
 
 
 @dataclass(frozen=True)
+class TuningCacheRequirement:
+    """Rank-local completed selections to reconcile before sharding candidates."""
+
+    ranks: tuple[int, ...]
+    identity: FrozenMapping
+    records: FrozenMapping
+
+    def __post_init__(self):
+        ranks = tuple(self.ranks)
+        if not ranks or any(type(rank) is not int or rank < 0 for rank in ranks):
+            raise ValueError("tuning cache agreement requires nonnegative ranks")
+        if ranks != tuple(sorted(set(ranks))):
+            raise ValueError("tuning cache ranks must be sorted and unique")
+        object.__setattr__(self, "ranks", ranks)
+        object.__setattr__(self, "identity", FrozenMapping(self.identity))
+        object.__setattr__(self, "records", FrozenMapping(self.records))
+
+
+@dataclass(frozen=True)
 class TuningRequirement:
     """One rank's winner from its disjoint share of a tuning race."""
 
@@ -248,6 +270,8 @@ class TuningRequirement:
     assignment: FrozenMapping | None
     latency_us: float | None
     candidate_index: int | None
+    rejected_count: int = 0
+    cute_programs: tuple[str, ...] = ()
 
     def __post_init__(self):
         ranks = tuple(self.ranks)
@@ -257,7 +281,17 @@ class TuningRequirement:
             raise ValueError("tuning requirements need a key and nonnegative ranks")
         if ranks != tuple(sorted(set(ranks))):
             raise ValueError("tuning ranks must be sorted and unique")
+        if type(self.rejected_count) is not int or self.rejected_count < 0:
+            raise ValueError("rejected candidate count must be a nonnegative integer")
         empty = self.assignment is None
+        programs = tuple(self.cute_programs)
+        if (empty and programs) or any(
+            not isinstance(key, str) or len(key) != 64
+            or any(char not in "0123456789abcdef" for char in key)
+            for key in programs
+        ):
+            raise ValueError("winner programs must be CuTe cache keys")
+        object.__setattr__(self, "cute_programs", tuple(sorted(set(programs))))
         if empty != (self.latency_us is None) or empty != (self.candidate_index is None):
             raise ValueError("a tuning contribution must be either complete or empty")
         if not empty:
@@ -304,10 +338,18 @@ class PreparationProgress:
     total_candidates: int | None = None
     global_candidate_count: int = 0
     selection_counts: tuple[tuple[str, int], ...] = ()
+    ready_cache: TuningCacheRequirement | None = None
 
 
 @dataclass(kw_only=True)
 class PreparedCall:
+    """Prepared operation; timed calls enqueue work on the current CUDA stream.
+
+    A benchmark call must return without waiting for device work or using
+    unjoined side streams. Reset and activation production run before its gate.
+    ``capture_safe`` describes caller capture support, not the timing method.
+    """
+
     run: Callable[[], object]
     output: object = None
     produce: Callable[[], None] | None = None
@@ -316,6 +358,7 @@ class PreparedCall:
     owners: tuple[object, ...] = ()
     close: Callable[[], None] | None = None
     capture_safe: bool = True
+    benchmark_producers: tuple[Callable[[], None], ...] = ()
 
     def invoke(self):
         result = self.run()

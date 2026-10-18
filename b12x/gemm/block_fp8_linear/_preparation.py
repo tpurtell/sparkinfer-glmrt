@@ -7,6 +7,7 @@ import torch
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import require_prepared
 from .._tuning import DenseGemmConfig
@@ -52,6 +53,7 @@ class _BlockFP8Compiled:
     dense: object | None = None
 
 
+@program_cache(scope="preparation")
 def compile_block_fp8(query_payload, config_payload, ordinal, sm_count):
     """Compile the exact selected native branch from metadata."""
     from b12x._lib import dense_gemm as dense

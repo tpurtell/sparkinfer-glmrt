@@ -7,6 +7,7 @@ import torch
 
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.preparation.types import plan_from_handle, require_prepared
 
@@ -44,12 +45,15 @@ def query_from_call(x, weight, *, bias=None, out=None, output_dtype=None):
     return query
 
 
+@program_cache(scope="preparation")
 def compile_gemv(query_payload, config_payload, ordinal):
     """Compile only the selected kernel and retain its runtime launcher."""
     query = GemvQuery(**dict(query_payload))
     config = GemvConfig(**dict(config_payload))
     TUNING.validate_query(query, None)
     TUNING.validate_config(query, config, None)
+    if config.backend == "torch":
+        return {}
     if config.backend == "prefill":
         from ._prefill import compile_prefill
         launcher = compile_prefill(ordinal, query.max_rows, query.out_features,
@@ -62,6 +66,13 @@ def compile_gemv(query_payload, config_payload, ordinal):
             query.output_dtype, query.bias_dtype,
         )
     return {"gemv": launcher}
+
+
+def _torch_projection(x, weight, out, bias):
+    if bias is None:
+        torch.mm(x, weight.T, out=out)
+    else:
+        torch.addmm(bias, x, weight.T, out=out)
 
 
 @dataclass(frozen=True)
@@ -108,6 +119,8 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
         raise ValueError("projection invocation semantics belong in GemvQuery")
 
     def compile_jobs(config, device):
+        if config.backend == "torch":
+            return ()
         return (CompileJob.create(
             "b12x.gemm.bf16_gemv._preparation:compile_gemv",
             TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal,
@@ -118,6 +131,8 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
         return MemoryRequirements()
 
     def materialize(selection, device):
+        if selection.config.backend == "torch":
+            return _GemvExecutionState(query, torch.device("cuda", device.ordinal), _torch_projection)
         programs = compile_gemv(
             TUNING.encode_query(query), TUNING.encode_config(selection.config), device.ordinal,
         )

@@ -6,6 +6,8 @@ shape-only CUDA views and fixed-address graph metadata are owned by that
 plan rather than by a public declaration.
 """
 from __future__ import annotations
+
+from b12x._lib.program_cache import program_cache
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields, replace
 
@@ -154,6 +156,7 @@ def _restore_caps(payload, config, ordinal):
     return caps
 
 
+@program_cache(scope="preparation")
 def compile_paged(caps_payload, config_payload, invocation, ordinal, identity_payload):
     """Describe and retain every native program for one immutable declaration."""
     config = GqaConfig.from_config(FrozenMapping(config_payload))

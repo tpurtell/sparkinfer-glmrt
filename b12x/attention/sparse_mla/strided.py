@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation.types import (
     FrozenMapping,
     MemoryRequirements,
@@ -175,6 +176,7 @@ def _materialize_layout(caps: Caps) -> _StridedLayout:
         ),
     )
 
+@program_cache(scope="preparation")
 def compile_strided_sparse_mla(caps: Caps, ordinal: int):
     """Compile the real quantize/remap/decode/merge program set from metadata."""
     from torch._subclasses.fake_tensor import FakeTensorMode

@@ -1,5 +1,7 @@
 """Declarative MLA query-projection preparation."""
 from __future__ import annotations
+
+from b12x._lib.program_cache import program_cache
 from dataclasses import dataclass
 import torch
 from b12x._lib.compile_pool import CompileJob
@@ -7,6 +9,7 @@ from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._tuning import ProjectionQuery, TUNING
 
 
+@program_cache(scope="preparation")
 def compile_bf16(query_payload, device_ordinal):
     from . import _bf16
     query = ProjectionQuery(**query_payload)
@@ -24,6 +27,7 @@ def compile_bf16(query_payload, device_ordinal):
         )
 
 
+@program_cache(scope="preparation")
 def compile_mxfp8(query_payload, device_ordinal):
     from b12x.gemm._shared import mxfp8_bmm as kernels
     query = ProjectionQuery(**query_payload)

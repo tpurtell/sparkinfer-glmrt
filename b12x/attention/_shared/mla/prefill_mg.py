@@ -122,6 +122,16 @@ def _ld_global_index_i32(index_base_ptr: Int64, entry: Int32) -> Int32:
 
 
 @cute.jit
+def _ld_valid_global_index_i32(
+    index_base_ptr: Int64, entry: Int32, valid_count: Int32
+) -> Int32:
+    index = Int32(-1)
+    if entry < valid_count:
+        index = _ld_global_index_i32(index_base_ptr, entry)
+    return index
+
+
+@cute.jit
 def s3_mask_and_scale_global(
     qk,
     index_base_ptr: Int64,
@@ -372,6 +382,7 @@ def s2_qk_rope_global_mg_dsv4(
     page_block_size: Int32,
     stride_kv_block: Int64,
     base_delta: Int64,
+    valid_count: Int32,
     *,
     d_rope: cutlass.Constexpr,
     q_rope_stride: cutlass.Constexpr,
@@ -394,7 +405,7 @@ def s2_qk_rope_global_mg_dsv4(
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     entry = warp_first_cand + gid
-    idx = _ld_global_index_i32(index_base_ptr, entry)
+    idx = _ld_valid_global_index_i32(index_base_ptr, entry, valid_count)
     rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block) + base_delta
 
     for ks in cutlass.range_constexpr(d_rope // 16):
@@ -1394,6 +1405,7 @@ def s6b_xv_rope_global_mg_dsv4(
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    valid_count: Int32,
     *,
     bi: cutlass.Constexpr,
     sm_p_stride: cutlass.Constexpr,
@@ -1463,10 +1475,10 @@ def s6b_xv_rope_global_mg_dsv4(
     for ks in cutlass.range_constexpr(bi // 16):
         k_base = Int32(ks) * Int32(16)
         ent0 = k_base + tid * Int32(2)
-        idx0 = _ld_global_index_i32(index_base_ptr, ent0)
-        idx1 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(1))
-        idx8 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(8))
-        idx9 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(9))
+        idx0 = _ld_valid_global_index_i32(index_base_ptr, ent0, valid_count)
+        idx1 = _ld_valid_global_index_i32(index_base_ptr, ent0 + Int32(1), valid_count)
+        idx8 = _ld_valid_global_index_i32(index_base_ptr, ent0 + Int32(8), valid_count)
+        idx9 = _ld_valid_global_index_i32(index_base_ptr, ent0 + Int32(9), valid_count)
         v0 = _ld_global_dsv4_rope_b16(
             rope_dim_ptr, idx0, page_block_size, stride_kv_block
         )
@@ -3177,7 +3189,9 @@ class UnifiedPrefillMGKernel:
                     # consume the prefetched B operands in S2. The selected raw
                     # pointer also lets the dual-cache path share one S2 body.
                     rope_entry = warp_first_cand + (lane >> Int32(2))
-                    rope_idx = _ld_global_index_i32(index_base_ptr, rope_entry)
+                    rope_idx = _ld_valid_global_index_i32(
+                        index_base_ptr, rope_entry, split_cand_end - split_cand_start
+                    )
                     rope_base = _dsv4_rope_base_off(
                         rope_idx, Int32(self.page_block_size), stride_kv_block
                     )
@@ -3337,6 +3351,7 @@ class UnifiedPrefillMGKernel:
                             rope_pbs,
                             rope_stride,
                             rope_delta,
+                            split_cand_end - split_cand_start,
                             d_rope=t.d_rope,
                             q_rope_stride=L.q_rope_stride,
                             n_hg=n_hg,
@@ -3662,6 +3677,7 @@ class UnifiedPrefillMGKernel:
                                 lane,
                                 Int32(self.pbs_extra),
                                 stride_extra_kv_block,
+                                split_cand_end - split_cand_start,
                                 bi=t.bi,
                                 sm_p_stride=L.sm_p_full_stride,
                                 hpb=t.hpb,
@@ -3684,6 +3700,7 @@ class UnifiedPrefillMGKernel:
                                 lane,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
+                                split_cand_end - split_cand_start,
                                 bi=t.bi,
                                 sm_p_stride=L.sm_p_full_stride,
                                 hpb=t.hpb,
@@ -3706,6 +3723,7 @@ class UnifiedPrefillMGKernel:
                             lane,
                             rope_pbs,
                             rope_stride,
+                            split_cand_end - split_cand_start,
                             bi=t.bi,
                             sm_p_stride=L.sm_p_full_stride,
                             hpb=t.hpb,

@@ -8,12 +8,14 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 
 from ._contracts import Caps, Binding, _bind
 from ._tuning import Bf16VocabProjectionConfig, Bf16VocabProjectionQuery, TUNING
 
 
+@program_cache(scope="preparation")
 def compile_vocab_projection(query_payload, config_payload, ordinal):
     """Compile exactly the selected native vocabulary launcher."""
     from . import _kernel

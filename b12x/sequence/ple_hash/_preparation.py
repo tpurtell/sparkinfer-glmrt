@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._contracts import Caps, _bind, _materialize_layout
 from ._tuning import OPERANDS, PleHashConfig, PleHashQuery, TUNING
@@ -45,6 +46,7 @@ class _CompilePointer:
         return self.alignment
 
 
+@program_cache(scope="preparation")
 def compile_hash(query_payload, config_payload, ordinal):
     from . import _kernels as kernels
     query = PleHashQuery(**dict(query_payload))

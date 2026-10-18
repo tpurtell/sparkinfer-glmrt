@@ -18,6 +18,7 @@ from b12x.preparation import (
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.compile_plan import load_programs
 
 from .pcie_oneshot import IPC_SLAB_ALIGNMENT, _align_up, _eager_storage_shards
@@ -266,6 +267,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     )
 
 
+@program_cache(scope="preparation")
 def compile_oneshot_surface(query_payload, ordinal):
     """Compile all fixed slot variants represented by metadata only."""
     payload = dict(query_payload)

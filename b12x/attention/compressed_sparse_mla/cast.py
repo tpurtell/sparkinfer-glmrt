@@ -81,6 +81,7 @@ def _compile_cast(input_dtype, output_dtype, device):
 
 
 
+@program_cache(scope="preparation")
 def compile_cast(payload, ordinal):
     query = Query(**dict(payload))
     compiled = _compile_cast(getattr(torch, query.input_dtype), getattr(torch, query.output_dtype), ordinal)

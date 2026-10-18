@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     CollectiveRequirement,
     FrozenMapping,
@@ -70,10 +71,12 @@ def _alignment(tensor):
 
 def _tensor_call(tensor):
     return FrozenMapping(
-        dtype=str(tensor.dtype),
-        shape=tuple(int(size) for size in tensor.shape),
-        stride=tuple(int(stride) for stride in tensor.stride()),
-        alignment=_alignment(tensor),
+        {
+            "dtype": str(tensor.dtype),
+            "shape": tuple(int(size) for size in tensor.shape),
+            "stride": tuple(int(stride) for stride in tensor.stride()),
+            "alignment": _alignment(tensor),
+        }
     )
 def query_from_runtime(runtime, *, surface: str | None = None, call=FrozenMapping()) -> PcieQuery:
     """Snapshot an existing runtime's immutable native specialization."""
@@ -131,6 +134,7 @@ def _selected_peers(runtime):
     return _selected_peers(runtime.rank, runtime.world_size)
 
 
+@program_cache(scope="preparation")
 def compile_owner_surface(query_payload, ordinal):
     """Resolve the exact existing CuTe getter from metadata-only query data."""
     import torch

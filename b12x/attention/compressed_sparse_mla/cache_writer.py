@@ -9,6 +9,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     FrozenMapping,
     MemoryRequirements,
@@ -51,7 +52,7 @@ TUNING = replace(
         query_type=CacheWriterQuery,
         backend="cute",
     ),
-    query_schema_version=2,
+    query_schema_version=22,
     validate_query=_validate_query,
 )
 
@@ -86,6 +87,7 @@ def _representative(query: CacheWriterQuery, ordinal: int):
     )
 
 
+@program_cache(scope="preparation")
 def compile_cache_writer(query_payload, ordinal):
     """Compiler-pool factory; intentionally private to the public API."""
     query = CacheWriterQuery(**dict(query_payload))

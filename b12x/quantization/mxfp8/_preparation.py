@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.quant.mxfp8_rows import (
     _get_compiled_mxfp8_rows_quant,
     mxfp8_rows_quant_launch_options,
@@ -114,6 +115,7 @@ def query_from_call(
     )
 
 
+@program_cache(scope="preparation")
 def compile_mxfp8_rows(query_payload, ordinal, sm_count):
     """Compile the actual fixed CuTe quantizer from metadata only."""
     query = Mxfp8Query(**dict(query_payload))

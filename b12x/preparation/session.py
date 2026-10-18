@@ -8,10 +8,11 @@ later batch so each candidate is compared head to head with it.
 from __future__ import annotations
 
 import logging
+import gc
+import math
 import os
 import threading
 import time
-from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -21,6 +22,7 @@ from b12x._lib.compile_plan import (
     compiled_program_available, observe_programs, retain_compiled_programs,
 )
 from b12x._lib.compile_pool import CompilePool, describe_compilation, compile_in_process
+from b12x._lib.program_cache import PreparationProgramCache, evict_unretained
 from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
 from ._cache import SelectionCache, cache_identity, digest
 from ._measurement import DEFAULT_SAMPLES, SURVIVOR_ROUNDS
@@ -29,11 +31,21 @@ from .device import DetectedDevice, detect_device
 from .types import (
     CollectiveRequirement, FrozenMapping, MemoryRequirements, Plan,
     PreparationProgress, PreparationRequest, PreparationResult, PreparedCall,
-    Selection, TuningRequirement, _CompositePlan, _Prepared, _close_all,
+    Selection, TuningCacheRequirement, TuningRequirement, _CompositePlan, _Prepared, _close_all,
     _plan_scope, _prime, _set_lazy_preparer, call_scope,
 )
 
 logger = logging.getLogger("b12x.preparation")
+
+
+class _CandidateLaunchRejected(Exception):
+    """A trial could not launch, but its resources were safely released."""
+
+
+def _cooperative_launch_rejected(error):
+    from cutlass.base_dsl.common import DSLCudaRuntimeError
+
+    return isinstance(error, DSLCudaRuntimeError) and error.error_code == 720
 
 
 @dataclass
@@ -110,8 +122,45 @@ class _Trial:
 # pending compilation always return control before more work is admitted.
 _ADVANCE_SECONDS = 0.1
 
+# Cross-rank priming assumes co-scheduled ranks: a collective authorization is
+# consumed in the round after the exchange, and the local work before the launch
+# (autotune rounds) is unbounded, so the barrier converts the shared
+# authorization into a launch lockstep. Generous by default: it only ever waits
+# during preparation, and must cover the slowest rank's pre-launch round.
+def _barrier_timeout_seconds():
+    """Return the finite positive collective-barrier deadline from the environment."""
+    try:
+        timeout = float(os.environ.get("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120"))
+    except ValueError as error:
+        raise ValueError("B12X_COLLECTIVE_BARRIER_TIMEOUT must be a finite positive number of seconds") from error
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("B12X_COLLECTIVE_BARRIER_TIMEOUT must be a finite positive number of seconds")
+    return timeout
+
+
+class CollectiveBarrierTimeout(RuntimeError):
+    """A collective barrier callback exceeded its deadline."""
+
+    def __init__(self, key: str, ranks: tuple[int, ...], arrived: tuple[int, ...] | None = None, *, timeout: float = 120.0):
+        """Record verified arrivals when the barrier backend supplies them."""
+        if arrived is None:
+            message = f"collective barrier callback timed out for {key!r} after {timeout:g}s"
+        else:
+            waiting = tuple(sorted(set(ranks) - set(arrived)))
+            message = (
+                f"collective barrier timed out for {key!r} after "
+                f"{timeout:g}s: ranks {waiting} never entered "
+                f"(arrived: {tuple(sorted(arrived))})"
+            )
+        super().__init__(message)
+        self.key = key
+        self.ranks = ranks
+        self.arrived = None if arrived is None else tuple(sorted(arrived))
+        self.timeout = timeout
+
 
 def _declaration_key(plan):
+    """Return the immutable declaration identity used to coalesce requests."""
     if isinstance(plan, _CompositePlan):
         return (
             plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
@@ -213,18 +262,38 @@ def _coalesce_requests(requests):
 
 
 def _plans_of(request):
+    """Return a request plan and every child plan of a composite request."""
     plan = request.plan
     if isinstance(plan, _CompositePlan):
         return (plan, *plan.variants.values())
     return (plan,)
 
 
+def _default_compile_workers(device):
+    identity = device.identity
+    spark = (
+        identity is not None
+        and identity.vendor == "nvidia"
+        and identity.product_name in {"gb10", "nvidia gb10"}
+    )
+    return int(os.environ.get("B12X_COMPILE_WORKERS", "4" if spark else "8"))
+
+
 class PreparationSession:
     def __init__(
         self, *, device=None, autotune=True, cache_dir=None, namespace=None,
-        compile_workers=8, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
-        race_batch=32, race_budget=None,
+        compile_workers=None, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
+        race_batch=32, race_budget=None, collective_barrier=None,
     ):
+        """Initialize planning resources and an optional collective entry barrier.
+
+        ``collective_barrier(key, ranks)`` runs in a daemon thread and must be
+        safe to call there. A timeout does not cancel that callback; another
+        preparation job cannot begin until the callback exits.
+        """
+        self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
+        if compile_workers is None:
+            compile_workers = _default_compile_workers(self.device)
         for name, value in (
             ("compile_workers", compile_workers), ("rounds", rounds), ("samples", samples),
             ("race_batch", race_batch),
@@ -236,11 +305,16 @@ class PreparationSession:
             raise ValueError("race_budget must be a positive byte count or None")
         if type(autotune) is not bool or type(cache_only) is not bool:
             raise TypeError("autotune and cache_only must be boolean")
-        self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
         self.autotune, self.cache_only = autotune, cache_only
         self.compile_workers, self.rounds, self.samples = compile_workers, rounds, samples
         self.race_batch, self.race_budget = race_batch, race_budget
         self.namespace = FrozenMapping(namespace or {})
+        if collective_barrier is not None and not callable(collective_barrier):
+            raise TypeError("collective_barrier must be callable")
+        self.collective_barrier = collective_barrier
+        self._barrier_timeout = (
+            _barrier_timeout_seconds() if collective_barrier is not None else 120.0
+        )
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self._cache = None
         self._stop = threading.Event()
@@ -249,12 +323,25 @@ class PreparationSession:
         self._thread = threading.get_ident()
         self._pool = None
         self._job = None
+        self._pending_collective_barrier = None
         self._plans = []
         self._shared = {}
         self._guard = None
         self._tuning_rank = 0
         self._tuning_ranks = (0,)
+        self._tuning_cache_synchronized = False
         self.state = "OPEN"
+
+    def configure_compile_workers(self, workers: int | None = None) -> None:
+        """Change compiler concurrency between preparation jobs."""
+        self._check_thread()
+        if self._job is not None or self._pool is not None:
+            raise RuntimeError("compiler concurrency can only change between jobs")
+        if workers is None:
+            workers = _default_compile_workers(self.device)
+        if type(workers) is not int or workers < 0:
+            raise ValueError("compile_workers must be an integer of at least 0")
+        self.compile_workers = workers
 
     def configure_tuning_shard(self, rank: int, ranks: tuple[int, ...]) -> None:
         """Assign this process a disjoint share of non-collective candidates."""
@@ -275,14 +362,17 @@ class PreparationSession:
             )
         self._tuning_rank = rank
         self._tuning_ranks = ranks
+        self._tuning_cache_synchronized = False
 
     def _check_thread(self):
+        """Reject use from another thread or after the session closes."""
         if threading.get_ident() != self._thread:
             raise RuntimeError("only cancel_tuning may run on another thread")
         if self.state == "CLOSED":
             raise RuntimeError("preparation session is closed")
 
     def _selection_cache(self):
+        """Return the session selection cache, creating it for CUDA devices."""
         if self._cache is None:
             if self.device.ordinal is None:
                 raise RuntimeError("selection caching requires a CUDA device")
@@ -294,23 +384,27 @@ class PreparationSession:
         return self._cache
 
     def _gpu_scope(self):
+        """Return the CUDA device context for preparation operations."""
         if self.device.ordinal is None:
             return nullcontext()
         import torch
         return torch.cuda.device(self.device.ordinal)
 
     def _synchronize(self):
+        """Synchronize the preparation device when it is CUDA-backed."""
         if self.device.ordinal is not None:
             import torch
             torch.cuda.synchronize(self.device.ordinal)
 
     def _allocated(self):
+        """Return bytes currently allocated on the preparation device."""
         if self.device.ordinal is None:
             return 0
         from ._memory import allocated_bytes
         return allocated_bytes(self.device.ordinal)
 
     def _race_budget(self):
+        """Return the configured or device-derived autotuning memory budget."""
         if self.race_budget is not None:
             return self.race_budget
         if self.device.ordinal is None:
@@ -320,9 +414,15 @@ class PreparationSession:
         return max(int(free) // 2, 1)
 
     def begin(self, requests, *, autotune=None):
+        """Start one preparation job after the prior collective barrier drains."""
         self._check_thread()
         if self._job is not None:
             raise RuntimeError("one preparation job may be active")
+        pending = self._pending_collective_barrier
+        if pending is not None:
+            if not pending.is_set():
+                raise RuntimeError("previous collective barrier is still running")
+            self._pending_collective_barrier = None
         if autotune is not None and type(autotune) is not bool:
             raise TypeError("job autotune override must be boolean or None")
         requests = tuple(requests)
@@ -348,14 +448,20 @@ class PreparationSession:
         if coordinator is None and any(request.collective is not None for request in requests):
             raise ValueError("collective preparation requires a coordinator")
         job = self.begin(requests, autotune=autotune)
-        authorization = None
+        authorization = {}
         while True:
-            state = job.advance(collective_key=authorization)
+            state = job.advance(**authorization)
             if progress is not None:
                 progress(state)
             if state.done:
                 return job.result()
-            authorization = coordinator(state) if coordinator is not None else None
+            if state.ready_cache is not None or state.ready_tuning:
+                if coordinator is None:
+                    raise ValueError("sharded preparation requires a coordinator")
+                key = "cache" if state.ready_cache is not None else "tuning"
+                authorization = {key: coordinator(state)}
+            else:
+                authorization = {"collective_key": coordinator(state) if coordinator is not None else None}
             if state.pending_compilation and self._pool is not None:
                 self._pool.wait_for_progress()
 
@@ -467,18 +573,42 @@ class PreparationSession:
 
     def release(self, plan):
         """Drop a plan's prepared state; destroy graphs that replay it first."""
+        self.release_many((plan,))
+
+    def release_many(self, plans) -> None:
+        """Release a batch after graph teardown, then reclaim unused programs once."""
         self._check_thread()
         if self._job is not None:
             raise RuntimeError("cannot release resources during preparation")
-        prepared = plan._prepared
-        if prepared is None:
+        pending = {}
+
+        def collect(plan):
+            if plan in pending:
+                return
+            pending[plan] = plan._prepared
+            if isinstance(plan, _CompositePlan):
+                for child in plan.variants.values():
+                    collect(child)
+
+        for plan in plans:
+            collect(plan)
+        closers = [lambda plan=plan, prepared=prepared: self._release_payload(plan, prepared)
+                   for plan, prepared in pending.items() if prepared is not None]
+        if not closers:
             return
-        if isinstance(plan, _CompositePlan):
-            self._release_payload(plan, prepared)
-            for child in plan.variants.values():
-                self.release(child)
-        else:
-            self._release_payload(plan, prepared)
+        try:
+            _close_all((self._synchronize, *closers))
+        finally:
+            _close_all((self._reclaim_programs,))
+
+    def _reclaim_programs(self):
+        timing = PreparationTiming("cleanup", rank=self._tuning_rank)
+        keep = frozenset(program for plan in self._plans if plan.prepared is not None
+                         for program in plan.prepared.programs)
+        with timing.span("program_reclamation"):
+            removed = evict_unretained(keep)
+            gc.collect()
+        timing.record("complete", evicted_entries=removed)
 
     @contextmanager
     def capture(self):
@@ -490,6 +620,7 @@ class PreparationSession:
             yield
 
     def freeze(self):
+        """Forbid later kernel resolution after all preparation work drains."""
         self._check_thread()
         if self._job is not None or self._pool is not None:
             raise RuntimeError("freeze requires drained preparation")
@@ -499,9 +630,11 @@ class PreparationSession:
         self.state = "FROZEN"
 
     def close(self):
+        """Release preparation resources and mark the session closed."""
         if self.state == "CLOSED":
             return
         self._check_thread()
+        synchronize = bool(self._plans) or self._job is not None
         closers = []
         if self._job is not None:
             closers.append(self._job.close)
@@ -517,15 +650,20 @@ class PreparationSession:
             guard, self._guard = self._guard, None
             closers.append(lambda: guard.__exit__(None, None, None))
         self.state = "CLOSED"
-        _close_all(closers)
-        self._plans.clear()
-        self._shared.clear()
+        try:
+            _close_all(((self._synchronize,) if synchronize else ()) + tuple(closers))
+        finally:
+            self._plans.clear()
+            self._shared.clear()
+            _close_all((self._reclaim_programs,))
 
     def __enter__(self):
+        """Enter the session after validating the owning thread."""
         self._check_thread()
         return self
 
     def __exit__(self, kind, value, traceback):
+        """Close session resources and preserve a body exception if cleanup fails."""
         try:
             self.close()
         except BaseException as error:
@@ -536,6 +674,7 @@ class PreparationSession:
 
 class PreparationJob:
     def __init__(self, session, requests, *, autotune):
+        """Initialize state for one bounded sequence of preparation requests."""
         self.session, self.requests = session, requests
         self.autotune = autotune
         self._steps = self._run()
@@ -554,6 +693,7 @@ class PreparationJob:
         self._plans_by_name = {}
         self._started = time.monotonic()
         self._timing = PreparationTiming("job", rank=session._tuning_rank)
+        self._program_cache = PreparationProgramCache(self._timing)
         self._last_advance_end = None
         self._phase = "planning"
         self._active_request = None
@@ -567,8 +707,7 @@ class PreparationJob:
         self._batch_index = self._batch_candidates = 0
         self._completed_rounds = self._total_rounds = self._active_count = 0
         self._latest_round_us = ()
-        self._graph_pools = []
-        self._race_stream = self._race_eviction = None
+        self._race_eviction = None
         self._compilations = 0
         self._stack_limit = None
         self._direct_ready = False
@@ -584,14 +723,16 @@ class PreparationJob:
         ready_collectives,
         done,
         ready_tuning=(),
+        ready_cache=None,
     ):
+        """Build a preparation progress snapshot from the live job state."""
         active_compilations = 0
         if self.session._pool is not None:
             summary = self.session._pool.summary()
             self._compilations = summary.cute_compilations + summary.triton_compilations
             active_compilations = self.session._pool.active_compilations
         phase = (
-            "ready" if done else "waiting for ranks" if ready_collectives or ready_tuning
+            "ready" if done else "waiting for ranks" if ready_collectives or ready_tuning or ready_cache
             else "compiling" if pending_compilation else self._phase
         )
         request = self._active_request
@@ -607,22 +748,70 @@ class PreparationJob:
             latest_round_us=self._latest_round_us, cache_hits=self._cache_hits,
             compilations=self._compilations, active_compilations=active_compilations,
             elapsed_seconds=time.monotonic() - self._started,
-            tuning_stopped=self._warmup_only,
+            tuning_stopped=self._warmup_only and self.session._stop.is_set(),
             ready_tuning=tuple(ready_tuning),
             candidate_sharded=self._candidate_sharded,
             batch_index=self._batch_index, batch_candidates=self._batch_candidates,
             tuning_rank=self.session._tuning_rank,
             total_candidates=self._total_candidates, global_candidate_count=self._global_candidate_count,
             selection_counts=tuple(sorted(self._selection_counts.items())),
+            ready_cache=ready_cache,
         )
 
-    def advance(self, *, collective_key=None, tuning=None):
+    def _collective_barrier(self, requirement: CollectiveRequirement) -> None:
+        """Convert a shared collective authorization into a launch lockstep.
+
+        All participant ranks were authorized for the same requirement in the
+        same exchange round, but the local work before any rank launches is
+        unbounded (autotune races). The embedder-supplied barrier waits for
+        every participant rank to enter before this rank proceeds to the
+        launch, so the kernel-side spin window only covers launch jitter.
+        """
+        barrier = self.session.collective_barrier
+        completed = threading.Event()
+        errors = []
+
+        def wait_for_peers():
+            """Run the embedder barrier and publish its terminal state."""
+            try:
+                barrier(requirement.key, requirement.ranks)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                completed.set()
+
+        try:
+            thread = threading.Thread(target=wait_for_peers, daemon=True)
+            self.session._pending_collective_barrier = completed
+            try:
+                thread.start()
+            except BaseException:
+                self.session._pending_collective_barrier = None
+                raise
+            if not completed.wait(self.session._barrier_timeout):
+                raise CollectiveBarrierTimeout(
+                    requirement.key, requirement.ranks, timeout=self.session._barrier_timeout,
+                )
+            if errors:
+                raise errors[0]
+        except CollectiveBarrierTimeout:
+            raise
+        except Exception as error:
+            raise RuntimeError(
+                f"collective barrier for {requirement.key!r} failed: {error}"
+            ) from error
+
+    def advance(self, *, collective_key=None, tuning=None, cache=None):
+        """Advance preparation until work completes or reaches a readiness boundary."""
         started = time.perf_counter()
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)
         try:
-            return self._advance(collective_key=collective_key, tuning=tuning)
+            with self._program_cache.activate():
+                return self._advance(collective_key=collective_key, tuning=tuning, cache=cache)
         finally:
+            if self._result is not None or self._closed:
+                self._program_cache.clear()
             self._timing.add("advance", time.perf_counter() - started)
             self._timing.record(
                 "complete" if self._result is not None else "progress",
@@ -633,7 +822,8 @@ class PreparationJob:
             )
             self._last_advance_end = time.perf_counter()
 
-    def _advance(self, *, collective_key=None, tuning=None):
+    def _advance(self, *, collective_key=None, tuning=None, cache=None):
+        """Run work until it reaches a readiness boundary or time slice."""
         self.session._check_thread()
         if self._error is not None:
             raise self._error
@@ -646,9 +836,34 @@ class PreparationJob:
             pool.cancel_optional()
             pool.close(terminate=True)
         send_value = None
-        if isinstance(self._blocked, CollectiveRequirement):
+        if isinstance(self._blocked, TuningCacheRequirement):
+            if cache is None:
+                return self._progress(False, False, (), False, ready_cache=self._blocked)
+            snapshots = tuple(cache)
+            if not snapshots and self.session._stop.is_set():
+                pass
+            elif len(snapshots) != len(self._blocked.ranks) or any(
+                not isinstance(item, TuningCacheRequirement) or item.ranks != self._blocked.ranks
+                for item in snapshots
+            ):
+                raise ValueError("tuning cache agreement does not match participating ranks")
+            self._blocked = None
+            send_value = snapshots
+        elif cache is not None:
+            raise ValueError("tuning cache agreement does not match ready work")
+        elif isinstance(self._blocked, CollectiveRequirement):
             if collective_key != self._blocked.key:
                 return self._progress(False, False, (self._blocked,), False)
+            if self.session.collective_barrier is not None:
+                try:
+                    self._collective_barrier(self._blocked)
+                except BaseException as error:
+                    self._error = error
+                    try:
+                        self.close()
+                    except BaseException as cleanup:
+                        error.add_note(f"job cleanup failed: {cleanup!r}")
+                    raise
             self._blocked = None
         elif isinstance(self._blocked, _TuningBatch):
             required = self._blocked.contributions
@@ -692,6 +907,9 @@ class PreparationJob:
                 finally:
                     self._timing.add(self._phase, time.perf_counter() - started)
                 send_value = None
+                if isinstance(signal, TuningCacheRequirement):
+                    self._blocked = signal
+                    return self._progress(False, False, (), False, ready_cache=signal)
                 if isinstance(signal, CollectiveRequirement):
                     self._blocked = signal
                     return self._progress(False, False, (signal,), False)
@@ -747,7 +965,12 @@ class PreparationJob:
             pool.cancel_optional()
             closers.append(lambda: pool.close(terminate=self._error is not None))
         self.session._job = None
-        _close_all(closers)
+        try:
+            _close_all(closers)
+        finally:
+            self._program_cache.clear()
+            if self._result is None:
+                _close_all((self.session._reclaim_programs,))
 
     def _choice_key(self, obligation, selections):
         request, configuration = obligation.request, obligation.configuration
@@ -1008,7 +1231,7 @@ class PreparationJob:
             # Surface a factory failure even if another job published shared code.
             self.session._pool.pending
 
-    def _instantiate(self, request, selection, factory, expected, *, synchronize=True, compile_directly=False):
+    def _instantiate(self, request, selection, factory, expected, *, synchronize=True, compile_directly=False, reject_unlaunchable=False):
         import torch
 
         from ._measurement import no_compilation
@@ -1018,13 +1241,33 @@ class PreparationJob:
             # remain mutable during later serving warmup and graph replay.
             try:
                 with torch.inference_mode(False), torch.no_grad():
-                    state = request.plan._materialize(selection, self.session.device)
-                    call = factory(state)
+                    with self._timing.span("materialize"):
+                        state = request.plan._materialize(selection, self.session.device)
+                    with self._timing.span("bind"):
+                        call = factory(state)
                     guard = _CallGuard(call)
                     self._temporaries.append(guard.finish)
-                _prime(call)
+                rejected = None
+                try:
+                    with self._timing.span("prime"):
+                        _prime(call)
+                except Exception as error:
+                    if not reject_unlaunchable or not _cooperative_launch_rejected(error):
+                        raise
+                    rejected = error
+                if rejected is not None:
+                    # Drain preceding launches before restoring scratch. Cleanup
+                    # runs outside the handler so its failures remain fatal.
+                    self.session._synchronize()
+                    guard.finish()
+                    self._temporaries.remove(guard.finish)
+                    raise _CandidateLaunchRejected(
+                        "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"
+                    ) from rejected
                 if synchronize:
                     self.session._synchronize()
+            except _CandidateLaunchRejected:
+                raise
             except Exception as error:
                 message = (
                     f"{request.name} failed to prepare with configuration "
@@ -1041,7 +1284,7 @@ class PreparationJob:
             raise RuntimeError(f"preparation used undeclared programs for {request.name}")
         return state, call, guard, retained
 
-    def _call(self, obligation, selection, factory, *, request=None, synchronize=True):
+    def _call(self, obligation, selection, factory, *, request=None, synchronize=True, reject_unlaunchable=False):
         request = obligation.request if request is None else request
         plan = request.plan
         expected = obligation.programs[plan.contract.config_payload(selection.config)]
@@ -1050,7 +1293,10 @@ class PreparationJob:
             for program in self._dependency_programs[name]
         )
         with self._timing.span("materialize_prime"):
-            return self._instantiate(request, selection, factory, expected, synchronize=synchronize)
+            return self._instantiate(
+                request, selection, factory, expected, synchronize=synchronize,
+                reject_unlaunchable=reject_unlaunchable,
+            )
 
     def _trial(self, obligation, index, assignment, config):
         if self.session._stop.is_set():
@@ -1066,7 +1312,10 @@ class PreparationJob:
         selection = self._selection(obligation, config, "tuned", assignment)
         with self._timing.span("memory_accounting"):
             before = self.session._allocated()
-        state, call, guard, retained = self._call(obligation, selection, request.benchmark_call, synchronize=False)
+        state, call, guard, retained = self._call(
+            obligation, selection, request.benchmark_call, synchronize=False,
+            reject_unlaunchable=True,
+        )
         with self._timing.span("memory_accounting"):
             resident = max(0, self.session._allocated() - before)
         self._candidates_prepared += 1
@@ -1079,12 +1328,8 @@ class PreparationJob:
         self._latest_round_us = race.latest_round_us
         self._active_count = race.active_count
 
-    def _release_graph_pools(self):
-        pools, self._graph_pools = self._graph_pools, []
-        try:
-            _close_all(pool.close for pool in pools)
-        finally:
-            self._race_stream = self._race_eviction = None
+    def _release_race_resources(self):
+        self._race_eviction = None
 
     def _measure(self, trials, *, champion):
         from ._measurement import _l2_flush_fn, prepare_race_steps, measure_race_steps
@@ -1093,17 +1338,15 @@ class PreparationJob:
         steps = measuring = None
         try:
             self._phase = "calibrating"
-            if self._race_stream is None and self.session.device.ordinal is not None:
+            if self._race_eviction is None and self.session.device.ordinal is not None:
                 import torch
                 with self.session._gpu_scope():
-                    self._race_stream = torch.cuda.Stream(device=self.session.device.ordinal)
                     self._race_eviction = _l2_flush_fn(
                         torch.device("cuda", self.session.device.ordinal), enabled=True,
                     )
             steps = prepare_race_steps(
                 calls, device_ordinal=self.session.device.ordinal, samples=self.session.samples,
-                primed=True, graph_pools=self._graph_pools,
-                capture_stream=self._race_stream, eviction=self._race_eviction,
+                primed=True, eviction=self._race_eviction,
             )
             while not self.session._stop.is_set():
                 try:
@@ -1178,6 +1421,7 @@ class PreparationJob:
         pending = list(local_candidates)
         champion = carried = None
         live = []
+        rejected_count = 0
         try:
             while pending or carried is not None:
                 if self.session._stop.is_set():
@@ -1194,7 +1438,19 @@ class PreparationJob:
                     carried = None
                 while pending and len(batch) < self.session.race_batch:
                     index, (assignment, config) = pending.pop(0)
-                    trial = yield from self._trial(obligation, index, assignment, config)
+                    try:
+                        trial = yield from self._trial(obligation, index, assignment, config)
+                    except _CandidateLaunchRejected as error:
+                        rejected_count += 1
+                        logger.warning(
+                            "Skipping %s candidate %d on rank %d: %r: %s",
+                            request.name, index, self.session._tuning_rank, config, error,
+                        )
+                        self._timing.record(
+                            "candidate_rejected", request=request.name,
+                            candidate_index=index, reason=str(error),
+                        )
+                        continue
                     if trial is None:
                         return None
                     live.append(trial)
@@ -1203,6 +1459,8 @@ class PreparationJob:
                     if budget is not None and resident > budget and len(batch) > 1:
                         carried = batch.pop()
                         break
+                if not batch:
+                    continue
                 trials = ([] if champion is None else [champion]) + batch
                 self._batch_candidates = len(trials)
                 self._timing.record(
@@ -1235,23 +1493,40 @@ class PreparationJob:
                     latencies_us=list(measurement.latencies_us),
                     winner=champion.index,
                 )
-            obligation.coverage["measured_count"] = len(local_candidates)
+            obligation.coverage["measured_count"] = len(local_candidates) - rejected_count
+            if champion is None:
+                if rank_count > 1:
+                    return TuningRequirement(
+                        obligation.key, self.session._tuning_ranks, None, None, None,
+                        rejected_count=rejected_count,
+                    )
+                raise RuntimeError(
+                    f"no launchable candidates for {request.name}: "
+                    f"all {rejected_count} candidates rejected with "
+                    "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"
+                )
             assignment, config = champion.assignment, champion.config
             candidate_index, latency_us = champion.index, champion.latency_us
             if rank_count > 1:
                 return TuningRequirement(
                     obligation.key, self.session._tuning_ranks,
                     assignment, latency_us, candidate_index,
+                    rejected_count=rejected_count,
+                    cute_programs=tuple(
+                        program.key for program in obligation.programs[
+                            request.plan.contract.config_payload(config)
+                        ] if program.dialect == "cute"
+                    ),
                 )
             selection = self._selection(obligation, config, "tuned", assignment)
-            obligation.cache_pending = True
+            obligation.cache_pending = rejected_count == 0
             return selection
         finally:
             closers = [self.session._synchronize]
             closers.extend(trial.close for trial in live)
             if carried is not None and carried not in live:
                 closers.append(carried.close)
-            closers.append(self._release_graph_pools)
+            closers.append(self._release_race_resources)
             _close_all(closers)
 
     def _publish(self, request, selection, state, call, retained, programs, variants=None):
@@ -1401,8 +1676,8 @@ class PreparationJob:
                     configuration.query, configuration.device, winner.assignment,
                 )
                 obligation.selection = self._selection(obligation, config, "tuned", winner.assignment)
-                obligation.coverage["measured_count"] = len(obligation.candidates)
-                obligation.cache_pending = True
+                obligation.coverage["measured_count"] = len(obligation.candidates) - winner.rejected_count
+                obligation.cache_pending = winner.rejected_count == 0
             self._timing.record("request_resume", request=obligation.request.name)
             yield from self._install_obligation(obligation, selections)
         pending.clear()
@@ -1410,6 +1685,16 @@ class PreparationJob:
     def _run(self):
         if not self.requests:
             return PreparationResult(plans={})
+        if (self.session.state != "FROZEN" and not self._warmup_only
+                and len(self.session._tuning_ranks) > 1
+                and not self.session._tuning_cache_synchronized):
+            cache = self.session._selection_cache()
+            snapshots = yield TuningCacheRequirement(
+                self.session._tuning_ranks, cache.identity, cache.records,
+            )
+            if snapshots:
+                cache.reconcile(snapshots)
+                self.session._tuning_cache_synchronized = True
         if self.session.state == "FROZEN":
             requests, composites = self._expand()
             groups = _coalesce_requests(requests)
@@ -1528,6 +1813,7 @@ class PreparationJob:
             for program in plan.prepared.programs
         )
         self.session._synchronize()
+        self._program_cache.clear()
         evict_unretained(keep)
         result = PreparationResult(
             plans=self._plans_by_name, coverage=self._coverage,

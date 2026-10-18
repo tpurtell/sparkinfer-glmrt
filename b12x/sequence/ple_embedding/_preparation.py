@@ -6,6 +6,7 @@ from dataclasses import dataclass, fields
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.sequence.ple_hash._preparation import (
     _CompilePointer, _HashState, _alignment, compile_hash, query_from_geometry,
@@ -52,6 +53,7 @@ def _lookup_constants(query):
     )
 
 
+@program_cache(scope="preparation")
 def compile_embedding(query_payload, config_payload, ordinal):
     from . import _kernels as kernels
 

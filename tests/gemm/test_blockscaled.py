@@ -7,6 +7,8 @@ replay. Exhaustive tile/support-matrix sweeps stay in the b12x repo.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -18,6 +20,7 @@ from b12x._lib.intrinsics import (
 )
 from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x.gemm import blockscaled
+from b12x.preparation import DeviceIdentity
 from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
     pack_fp8_block_scaled_weight_mxfp8,
@@ -45,6 +48,78 @@ def test_regime_plan_combines_static_shapes_with_dynamic_capacity() -> None:
         "max_rows": 128,
         "exact_m": (1, 2, 4, 8),
     }
+
+
+@pytest.mark.parametrize("workspace_form", ["provided", "owned"])
+@pytest.mark.parametrize("n,k", [(2560, 2560), (2560, 6144), (6144, 2560)])
+def test_mxfp8_capacity_lowering_keeps_prefill_tile_hint(workspace_form, n, k):
+    """The prepared capacity, not a live row count, selects the native tile."""
+    from b12x.gemm.blockscaled._preparation import _dense_lowering
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+
+    query = blockscaled.BlockscaledQuery(
+        recipe="mxfp8", num_tokens=6019, in_features=k,
+        padded_in_features=k, out_features=n, workspace_form=workspace_form,
+    )
+    device = SimpleNamespace(identity=DeviceIdentity(
+        vendor="nvidia", compute_capability=(12, 0), sm_count=188,
+        product_name="RTX PRO 6000 Blackwell Max-Q",
+    ))
+    lowering = _dense_lowering(query, BlockscaledConfig(mode="quantized"), device)
+
+    assert query.expected_m is None  # The public plan still accepts shorter rows.
+    assert lowering.m == 6019
+    assert lowering.expected_m == 6019
+    assert lowering.mma_tiler_mn == (128, 64)
+    assert not lowering.policy.large_m_unroll
+
+
+@pytest.mark.parametrize("recipe,hint", [("mxfp8", 4), ("nvfp4", None), ("nvfp4", 4)])
+def test_capacity_lowering_preserves_explicit_hints_and_nvfp4(recipe, hint):
+    from b12x.gemm.blockscaled._preparation import _dense_lowering
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+
+    query = blockscaled.BlockscaledQuery(
+        recipe=recipe, num_tokens=6019, in_features=2560,
+        padded_in_features=2560, out_features=2560, expected_m=hint,
+        activation_scale_available=recipe == "nvfp4",
+    )
+    device = SimpleNamespace(identity=DeviceIdentity(
+        vendor="nvidia", compute_capability=(12, 0), sm_count=188,
+        product_name="RTX PRO 6000 Blackwell Max-Q",
+    ))
+    lowering = _dense_lowering(query, BlockscaledConfig(mode="quantized"), device)
+    assert query.expected_m == hint
+    assert lowering.expected_m == hint
+
+
+@pytest.mark.parametrize("capacity", [128, 2047, 2048, 6019])
+def test_mxfp8_capacity_lowering_preserves_short_prefill_program(capacity):
+    """A large prefill specialization does not replace the dynamic short tile."""
+    from b12x.gemm.blockscaled._preparation import (
+        _dense_lowering, _lower_dense_with_hint, _short_dense_lowering,
+    )
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+
+    query = blockscaled.BlockscaledQuery(
+        recipe="mxfp8", num_tokens=capacity, in_features=2560,
+        padded_in_features=2560, out_features=6144, workspace_form="provided",
+    )
+    device = SimpleNamespace(identity=DeviceIdentity(
+        vendor="nvidia", compute_capability=(12, 0), sm_count=188,
+        product_name="RTX PRO 6000 Blackwell Max-Q",
+    ))
+    config = BlockscaledConfig(mode="quantized")
+    dynamic = _lower_dense_with_hint(query, config, device, None)
+    short = _short_dense_lowering(query, config, device)
+    if capacity < 2048:
+        assert short is None
+        assert _dense_lowering(query, config, device) == dynamic
+    else:
+        assert short == dynamic
+        assert short.mma_tiler_mn == (64, 128)
+        assert short.expected_m is None
+        assert _dense_lowering(query, config, device).mma_tiler_mn == (128, 64)
 
 
 def _quantize_mxfp4_rows(
@@ -243,8 +318,9 @@ def test_mm_mxfp8_grouped_batches_use_their_own_scales() -> None:
         expected_m=2048, sfb_k_replicated=True, _tile_k_override=64,
     ) as plan:
         out = blockscaled.mm(lhs, rhs, plan=plan)
-    a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).to(torch.bfloat16)
-    b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.bfloat16)
+    # Accumulate in FP64 so FP32 rounding cannot cross a BF16 midpoint.
+    a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).to(torch.float64)
+    b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.float64)
     ref = torch.einsum("mkl,nkl->mnl", a_deq, b_deq).to(torch.bfloat16)
 
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
@@ -446,3 +522,68 @@ def test_nvfp4_a16_preserves_logical_k_inside_padded_weight() -> None:
         output.float().flatten(), expected.flatten(), dim=0
     )
     assert cosine.item() >= 0.999
+
+
+@pytest.mark.parametrize("recipe", [
+    "mxfp8", "mxfp8_fp16", "mxfp8_prequantized", "tensor_fp8", "block_fp8", "mxfp4", "nvfp4",
+])
+def test_implicit_plan_reuses_capacity_under_compile_and_graph(recipe):
+    """Calls without a plan reuse heuristic programs across row counts and replay."""
+    require_b12x()
+    n, k = 128, 256
+    if recipe in ("mxfp4", "nvfp4"):
+        a = torch.randint(0, 256, (4, k // 2), device="cuda", dtype=torch.uint8)
+        b = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8)
+        lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], device="cuda")
+        def unpack(value):
+            return lut[torch.stack((value & 15, value >> 4), -1).long()].flatten(1)
+        reference = unpack(a) @ unpack(b).T
+        group = 32 if recipe == "mxfp4" else 16
+        dtype = torch.uint8 if recipe == "mxfp4" else torch.float8_e4m3fn
+        scale = 127 if recipe == "mxfp4" else 1
+        sa = swizzle_block_scale(torch.full((4, k // group), scale, device="cuda").to(dtype))
+        sb = swizzle_block_scale(torch.full((n, k // group), scale, device="cuda").to(dtype))
+        alpha = torch.ones(1, device="cuda")
+        def call(x):
+            if recipe == "mxfp4":
+                return blockscaled.mm_mxfp4(x, sa, b, sb)
+            return blockscaled.mm_nvfp4(x, sa, b, sb, alpha)
+    else:
+        a = torch.randn((4, k), device="cuda", dtype=torch.bfloat16)
+        b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        if recipe.startswith("mxfp8"):
+            weight = blockscaled.pack_weight(b, torch.full((n, k // 32), 127, device="cuda", dtype=torch.uint8))
+            if recipe == "mxfp8_fp16":
+                a = torch.randint(-4, 5, (4, k), device="cuda").to(torch.float16)
+            elif recipe == "mxfp8_prequantized":
+                a = a.to(torch.float8_e4m3fn)
+        else:
+            a = a.to(torch.float8_e4m3fn)
+            weight = blockscaled.pack_weight(b, torch.ones(1, device="cuda"))
+        reference = a.float() @ b.float().T
+        if recipe == "block_fp8":
+            sa = torch.ones((4, k // 128), device="cuda")
+            sb = torch.ones((n // 128, k // 128), device="cuda")
+            def call(x):
+                return blockscaled.mm_block_fp8(x, sa[:x.shape[0]], b, sb)
+        else:
+            def call(x):
+                if recipe == "mxfp8_prequantized":
+                    scales = torch.full((x.shape[0], k // 32), 127, device=x.device, dtype=torch.uint8)
+                    return blockscaled.mm((x, scales), weight)
+                return blockscaled.mm(x, weight, expected_m=x.shape[0])
+
+    actual = call(a[:3])
+    torch.testing.assert_close(actual.float(), reference[:3].to(actual.dtype).float(), atol=.125, rtol=.02)
+    launch = torch.compile(call, fullgraph=True)
+    compiled = launch(a)
+    with kernel_resolution_guard("legacy capacity replay"):
+        for rows in (3, 4):
+            actual = call(a[:rows])
+            torch.testing.assert_close(actual.float(), reference[:rows].to(actual.dtype).float(), atol=.125, rtol=.02)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = launch(a)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replayed, compiled, atol=0, rtol=0)

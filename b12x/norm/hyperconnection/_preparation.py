@@ -7,6 +7,7 @@ import torch
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import run_compiled
 from b12x._lib.utils import current_cuda_stream
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
@@ -20,6 +21,7 @@ def _decode_query(payload):
     return HyperConnectionQuery(**values)
 
 
+@program_cache(scope="preparation")
 def compile_hyperconnection(query_payload, config_payload, ordinal):
     """Return the exact production programs without allocating tensor storage."""
     from . import _cute as native

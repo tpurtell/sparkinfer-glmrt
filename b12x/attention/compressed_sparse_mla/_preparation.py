@@ -10,6 +10,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from b12x._lib.compile_plan import attach_programs, compile_only_launches, load_programs, program_keys
 from b12x._lib.compiler import observe_launchers
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.preparation.types import require_prepared
 
@@ -482,6 +483,7 @@ class _CompressedSparseMlaPrograms:
         )
 
 
+@program_cache(scope="preparation")
 def compile_compressed_sparse_mla(query_payload, config_payload, ordinal):
     """Compile and retain the selected native decode or MG prefill launchers."""
     query = SparseMlaQuery(**dict(query_payload))

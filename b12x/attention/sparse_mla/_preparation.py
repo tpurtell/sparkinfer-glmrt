@@ -7,6 +7,7 @@ import os
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, require_prepared
 from b12x._lib.compile_plan import compile_only_launches
 
@@ -19,6 +20,7 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 
 
+@program_cache(scope="preparation")
 def compile_sparse_mla(caps, ordinal, prefill_mg_enabled=True):
     """Extract real decode or prefill native programs from FakeTensor metadata."""
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -80,6 +82,7 @@ def compile_sparse_mla(caps, ordinal, prefill_mg_enabled=True):
     return state.prepared
 
 
+@program_cache(scope="preparation")
 def compile_cache_writer(payload, ordinal):
     """Compile the exact cache writer from shape-faithful FakeTensor metadata."""
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -270,6 +273,7 @@ def plan(
     invocation = FrozenMapping(invocation)
     query = _query_from_caps(caps, invocation)
     layout = plan_sparse_mla_scratch(caps)
+
     return Plan(
         contract=TUNING, query=query, invocation=invocation, override=override,
         _compile_jobs=lambda config, device: (CompileJob.create(

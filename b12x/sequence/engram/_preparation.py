@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
 from b12x._lib.scratch_layout import SCRATCH_ALIGN_BYTES, align_up
 from b12x.preparation import (
@@ -45,6 +46,7 @@ def _pointers():
     }
 
 
+@program_cache(scope="preparation")
 def compile_engram(query_payload, config_payload, ordinal):
     """Compile only the native operation admitted by this declaration."""
     from . import _kernels as kernels

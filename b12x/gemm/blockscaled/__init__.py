@@ -10,9 +10,23 @@ row-major or F8_128x4-swizzled UE8M0 scales. Pass swizzled storage flattened
 (or as its native 6D view); a 2D ``[M,K/32]`` scale is interpreted as compact.
 ``expected_m`` and precision constraints are immutable query coordinates.
 
+IQ2_XS and IQ2_XXS use BF16 activations and inline descriptor decoding in the same dense
+warp-MMA engine. ``pack_weight(blocks, recipe='iq2_xs')`` losslessly rearranges
+CUDA uint8 ``[N,K/256,74]`` safetensors payloads; scales are embedded, so no
+separate scale argument is accepted. K must be divisible by 256 and N by 8.
+``recipe="iq2_xxs"`` accepts 66-byte blocks and retains exactly 66 bytes per
+256 weights in the same compute path. Codec-specific loading specializes at
+compile time. Only A16 activation precision is supported for these recipes.
+``recipe="q8_0"`` takes uint8 ``[N,K/32,34]`` blocks, retains INT8 payloads
+and FP16 scales, and uses the same engines without a codebook.
+
 ``plan(query)`` declares an invocation without compiling or allocating.
 ``PreparationSession`` selects and primes its prepared ``Plan`` before
-``mm`` or the explicit ``w4a16``/``w8a16`` entry points may execute. A16 uses
+execution with an explicit plan. ``mm`` also accepts NVFP4, MXFP8, tensor-FP8,
+and serialized operands without a plan: first use prepares the heuristic
+configuration without autotuning and retains a power-of-two row capacity.
+Warm each required capacity before graph capture or frozen kernel resolution.
+The explicit ``w4a16``/``w8a16`` entry points require a plan. A16 uses
 BF16 activations and inline weight dequantization; it performs no activation
 scaling. ``plan_regimes`` combines exact static-shape variants with one bounded
 dynamic-row execution while keeping runtime dispatch behind the custom-op boundary.
@@ -27,10 +41,13 @@ fit BF16. Quantized activation execution requires K divisible by 128 and N by 8.
 Caller-owned output/workspace buffers are described by the query and reserved
 before durable binding. Concurrent owners use disjoint buffers. Functional
 forms retain their output allocation contract, while graph replay uses fixed
-captured addresses. No standalone warmup or implicit execution path exists.
+captured addresses. Concurrent executions sharing a heuristic plan must be
+serialized; independent owners should prepare separate plans.
 """
 
 from __future__ import annotations
+
+
 
 from typing import TYPE_CHECKING
 
@@ -43,6 +60,8 @@ META = OpMeta(
     entry_points=(
         "Weight",
         "NVFP4LinearWeight",
+        "IQ2XSLinearWeight",
+        "BlockQuantLinearWeight",
         "BlockscaledQuery",
         "BlockscaledConfig",
         "FixedBlockscaledQuery",
@@ -60,7 +79,7 @@ META = OpMeta(
         "workspace_size",
     ),
     dtypes=("bf16", "fp16", "fp32", "fp8_e4m3", "fp4_e2m1"),
-    recipes=("nvfp4", "mxfp4", "mxfp8"),
+    recipes=("nvfp4", "mxfp4", "mxfp8", "iq2_xs", "iq2_xxs", "q8_0"),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
@@ -75,6 +94,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Weight,
         NVFP4LinearWeight,
+        IQ2XSLinearWeight,
+        BlockQuantLinearWeight,
         BlockscaledQuery,
         BlockscaledConfig,
         FixedBlockscaledQuery,

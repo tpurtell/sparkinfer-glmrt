@@ -1,11 +1,14 @@
 """Fixed native compilation and materialization for MLA compression."""
 from __future__ import annotations
+
+from b12x._lib.program_cache import program_cache
 from ._tuning import MlaCompressQuery, TUNING
 from b12x._lib.compile_pool import CompileJob
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._impl import Caps,_State
 
 
+@program_cache(scope="preparation")
 def compile_mla_compress(query_payload,device_ordinal):
  from ._cute import compile_compress
  q=MlaCompressQuery(**dict(query_payload))

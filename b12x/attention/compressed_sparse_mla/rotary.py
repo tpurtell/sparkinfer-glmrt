@@ -11,6 +11,7 @@ from cutlass import BFloat16, Float32, Int32, Int64
 
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute, run_compiled
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan, make_fixed_contract
@@ -84,6 +85,7 @@ class _Rotate:
                 out[(Int64(row) * Int64(self.heads) + Int64(head)) * Int64(self.dim) + Int64(col)] = BFloat16(value)
 
 
+@program_cache(scope="preparation")
 def compile_rotation(payload, ordinal):
     query = Query(**dict(payload))
     cs_dtype = getattr(torch, query.cos_sin_dtype)

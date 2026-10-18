@@ -1,5 +1,10 @@
 # b12x
 
+This standalone fork maintains the CuteAFD SM120/SM121 kernels. Upstream
+`local-inference-lab/b12x` was archived at `2cc7f66a` on 2026-10-06;
+this fork does not track FlashInfer. The final upstream merge retains the
+qualified CUTLASS DSL 4.6.2 toolchain and CuteAFD kernel contracts.
+
 `b12x` is an SM120/SM121 CuTe DSL and Triton kernel library for local LLM inference.
 It specifically targets DGX Spark, RTX Spark and the Blackwell-based RTX
 cards (RTX 6000 Pro, RTX 5090).

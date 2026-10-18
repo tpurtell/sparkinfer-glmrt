@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan, make_fixed_contract
 
 
@@ -28,6 +29,7 @@ class VisionQuery:
 TUNING = make_fixed_contract(component_id="norm.vision", query_type=VisionQuery, backend="cute")
 
 
+@program_cache(scope="preparation")
 def compile_vision(query_payload, ordinal):
     from .vision import _compile
     query = VisionQuery(**dict(query_payload))

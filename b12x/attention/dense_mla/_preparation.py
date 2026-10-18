@@ -7,6 +7,7 @@ from types import MappingProxyType
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, require_prepared
 
 from ._scratch import Binding, Caps, _dense_mla_scratch_layout, _materialize, plan_dense_mla_scratch
@@ -288,6 +289,7 @@ def _query(caps: Caps, abi: FrozenMapping) -> DenseMlaQuery:
         window_size=caps.window_size, use_cuda_graph=caps.use_cuda_graph,
         max_page_table_width=caps.max_page_table_width,
         num_cache_pages=caps.num_cache_pages, abi=abi,
+        partial_dtype=str(caps.partial_dtype).removeprefix("torch."),
     )
 
 
@@ -302,10 +304,12 @@ def _caps(query: DenseMlaQuery, config: DenseMlaConfig, device: torch.device) ->
         head_dim=query.qk_head_dim, v_head_dim=query.v_head_dim,
         physical_record_width=query.physical_record_width,
         window_size=query.window_size, use_cuda_graph=query.use_cuda_graph,
+        partial_dtype=_dtype(query.partial_dtype),
         budget=__import__("b12x.attention.dense_mla.planner", fromlist=["Budget"]).Budget(max_splits=config.max_splits),
     )
 
 
+@program_cache(scope="preparation")
 def compile_dense_mla(query_payload, config_payload, ordinal):
     """Compile selected forward/merge/quantizer entries from FakeTensor metadata."""
     from torch._subclasses.fake_tensor import FakeTensorMode

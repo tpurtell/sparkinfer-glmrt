@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan, PreparedCall
 
 from ._tuning import RoceQuery, TUNING
@@ -18,10 +19,12 @@ def _dtypes(query: RoceQuery) -> tuple[torch.dtype, ...]:
     return tuple(getattr(torch, value) if isinstance(value, str) else value for value in values)
 
 
+@program_cache(scope="preparation")
 def compile_roce(payload, ordinal: int):
     """Resolve exactly the all-reduce/all-gather launchers in a declaration."""
     from . import _allgather_cute
     from ._oneshot_cute import get_launcher
+    from .roce_oneshot import _DTYPE_NAMES
 
     query = RoceQuery(**dict(payload))
     setup = query.setup
@@ -35,7 +38,10 @@ def compile_roce(payload, ordinal: int):
         ordinal,
     )
     with torch.cuda.device(ordinal):
-        programs = {dtype: get_launcher(dtype, *common) for dtype in _dtypes(query)}
+        programs = {
+            dtype: get_launcher(_DTYPE_NAMES[dtype], *common)
+            for dtype in _dtypes(query)
+        }
         programs["gather"] = _allgather_cute.get_launcher(*common)
         return programs
 
@@ -111,9 +117,9 @@ def plan(
 
     def materialize(selection, device):
         programs = compile_roce(payload, device.ordinal)
-        gather = programs.pop("gather")
+        gather = programs["gather"]
         runtime._prepare_resources(_dtypes(query), padded_gather=True)
-        return _PreparedRoce(runtime, programs, gather)
+        return _PreparedRoce(runtime, {key: value for key, value in programs.items() if key != "gather"}, gather)
 
     return Plan(
         contract=TUNING,
@@ -136,6 +142,7 @@ def query_from_runtime(
     peer_hosts,
     hca_names=None,
 ):
+    """Build the RoCE query for an established runtime; ``hca_count`` is the runtime's rail count."""
     return RoceQuery(
         surface=surface,
         world_size=runtime.world_size,
@@ -149,7 +156,7 @@ def query_from_runtime(
                 "threads": runtime._threads,
                 "slots": runtime._layout.slots,
                 "flag_stride": runtime._layout.flag_stride,
-                "hca_count": len(runtime.hca_names),
+                "hca_count": runtime.rail_count,
             }
         ),
     )

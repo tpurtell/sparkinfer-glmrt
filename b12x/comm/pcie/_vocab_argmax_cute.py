@@ -14,6 +14,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
@@ -597,6 +598,7 @@ def get_vocab_argmax_launcher(
         bias_row_stride: int,
         batch: int,
     ) -> None:
+        """Launch the compiled vocabulary argmax kernel with runtime arguments."""
         if len(slab_addresses) != world_size:
             raise ValueError(
                 f"expected {world_size} slab addresses, got {len(slab_addresses)}"
@@ -639,7 +641,7 @@ def get_vocab_argmax_launcher(
             current_cuda_stream(),
         )
 
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["SLAB_BYTES", "get_vocab_argmax_launcher"]

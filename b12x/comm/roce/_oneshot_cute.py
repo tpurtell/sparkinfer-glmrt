@@ -8,8 +8,8 @@ One launch performs a complete all-reduce for one message:
    that the RDMA proxy thread polls.  The doorbell is a level, not a queue:
    a proxy that was descheduled across two doorbells finds ``seq`` two ahead
    and posts both slots, which is why the byte count lives per slot;
-3. wait: spin on ``flag[peer][seq & 1][hca] == seq`` for every peer and HCA
-   (the peer's proxy writes each flag after that HCA's payload stripe on the
+3. wait: spin on ``flag[peer][seq & 1][rail] == seq`` for every peer and rail
+   (the peer's proxy writes each flag after that rail's payload stripe on the
    same reliable QP); a wait that exceeds ``spin_limit`` polls records ``seq``
    in the control record's error word and the host raises instead of hanging;
 4. reduce: sum the local input and every peer slot in fixed rank order, so all
@@ -29,16 +29,18 @@ size and launch grid remain runtime scalars and may vary across graph launches.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32
+import torch
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
@@ -64,6 +66,11 @@ from ._cute_intrinsics import (
 
 PACK_BYTES = 16
 _DTYPE_PACK_ELEMS = {"float32": 4, "float16": 8, "bfloat16": 8}
+_DTYPE_NAMES = {
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float32",
+}
 _PREPARED_LAUNCHERS: set[tuple[object, ...]] = set()
 
 
@@ -347,9 +354,9 @@ def is_launcher_prepared(*key) -> bool:
     return _process_key(*key) in _PREPARED_LAUNCHERS
 
 
-@functools.cache
+@program_cache
 def get_launcher(
-    dtype_name: str,
+    dtype_name: str | torch.dtype,
     world_size: int,
     rank: int,
     threads: int,
@@ -359,6 +366,11 @@ def get_launcher(
     device_index: int,
 ) -> Callable[..., None]:
     """Compile the launcher for ``key`` once and return it."""
+    if isinstance(dtype_name, torch.dtype):
+        try:
+            dtype_name = _DTYPE_NAMES[dtype_name]
+        except KeyError:
+            raise ValueError(f"unsupported RoCE one-shot dtype {dtype_name!r}") from None
     process_key = _process_key(
         dtype_name,
         world_size,
@@ -448,7 +460,7 @@ def get_launcher(
         )
 
     _PREPARED_LAUNCHERS.add(process_key)
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["PACK_BYTES", "get_launcher", "is_launcher_prepared"]

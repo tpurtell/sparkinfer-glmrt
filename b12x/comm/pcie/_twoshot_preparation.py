@@ -14,6 +14,7 @@ import torch
 
 from b12x._lib.compile_plan import load_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     FrozenMapping, MemoryRequirements, PersistentMemory, Plan, PreparedCall,
     current_plan,
@@ -179,6 +180,7 @@ def _query(payload) -> PcieQuery:
                      topology=values["topology"], call=FrozenMapping(values["call"]), setup=FrozenMapping(values["setup"]))
 
 
+@program_cache(scope="preparation")
 def compile_twoshot_surface(query_payload, ordinal: int):
     """Resolve every native slot specialization represented by the declaration."""
     query = _query(query_payload)

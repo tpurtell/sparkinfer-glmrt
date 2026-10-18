@@ -13,6 +13,7 @@ from b12x._lib.program_cache import program_cache
 from collections.abc import Callable, Sequence
 from typing import Tuple
 
+from b12x._lib.compile_plan import attach_programs
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -23,6 +24,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import (
     cuda_stream_from_int_or_current,
@@ -640,6 +642,7 @@ def get_island_rs_launcher(
         blocks: int,
         stream: object = None,
     ) -> None:
+        """Launch the compiled island reduce-scatter with runtime arguments."""
         if len(slab_addresses) != world_size:
             raise ValueError(
                 f"expected {world_size} slab addresses, got {len(slab_addresses)}"
@@ -677,7 +680,7 @@ def get_island_rs_launcher(
             cuda_stream_from_int_or_current(cuda_stream_to_int(stream)),
         )
 
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["HEADER_BYTES", "MAX_BLOCKS", "get_island_rs_launcher", "island_rs_peers"]

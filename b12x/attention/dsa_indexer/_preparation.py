@@ -14,6 +14,7 @@ import torch
 from b12x._lib.compile_plan import attach_programs, compile_only_launches, load_programs
 from b12x._lib.compiler import observe_launchers
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.preparation.types import require_prepared
 
@@ -22,6 +23,20 @@ from .mxfp4 import MXFP4PreparedState, materialize_mxfp4
 from .paged import index_topk_fp8
 from .tiled_topk import run_row_topk
 from .scratch import B12XIndexerScratchCaps, INDEXER_SOURCE_LAYOUT_PAGED, plan_indexer_scratch
+
+
+@dataclass(frozen=True)
+class _Mxfp4Programs:
+    launchers: Mapping
+
+    @property
+    def __b12x_dependencies__(self):
+        return tuple(self.launchers.values())
+
+    @property
+    def __b12x_programs__(self):
+        from b12x._lib.compile_plan import program_keys
+        return program_keys(self.__b12x_dependencies__)
 
 
 class _DsaIndexerState:
@@ -72,6 +87,9 @@ def invocation_from_descriptors(caps, *, operands: Mapping[str, Mapping[str, obj
         required = {"shape", "strides", "dtype", "alignment"}
         if set(fields) != required:
             raise ValueError(f"DSA {name} ABI descriptor fields do not match schema")
+        if name == "index_k_cache":
+            # Physical pool size is a runtime bound, not a kernel specialization.
+            fields = FrozenMapping({**dict(fields), "shape": (1, *fields["shape"][1:])})
         normalized[name] = fields
     return FrozenMapping({
         "operands": FrozenMapping(normalized),
@@ -107,7 +125,21 @@ def invocation_from_tensors(caps, **tensors) -> FrozenMapping:
 def _fake(descriptor, device):
     if descriptor is None:
         return None
-    return torch.empty_strided(tuple(descriptor["shape"]), tuple(descriptor["strides"]), dtype=getattr(torch, descriptor["dtype"]), device=device)
+    shape = tuple(descriptor["shape"])
+    strides = tuple(descriptor["strides"])
+    dtype = getattr(torch, descriptor["dtype"])
+    alignment = int(descriptor["alignment"])
+    if alignment >= 16:
+        return torch.empty_strided(shape, strides, dtype=dtype, device=device)
+    offset = alignment // dtype.itemsize
+    span = (
+        1
+        + sum((size - 1) * stride for size, stride in zip(shape, strides, strict=True))
+        if all(shape)
+        else 0
+    )
+    storage = torch.empty((span + offset,), dtype=dtype, device=device)
+    return storage.as_strided(shape, strides, storage_offset=offset)
 
 
 def _scratch_caps(query, *, device, config):
@@ -125,6 +157,7 @@ def _scratch_caps(query, *, device, config):
     )
 
 
+@program_cache(scope="preparation")
 def compile_indexer(query_payload, config_payload, ordinal):
     """Return retained concrete launchers for one selected native route.
 
@@ -150,7 +183,8 @@ def compile_indexer(query_payload, config_payload, ordinal):
             max_candidates=query.max_candidates,
             candidate_topk_blocks=query.candidate_topk_blocks,
         )
-        return materialize_mxfp4(caps, device_index=ordinal, score_kind=config.mxfp4_score_kind)
+        state = materialize_mxfp4(caps, device_index=ordinal, score_kind=config.mxfp4_score_kind)
+        return _Mxfp4Programs(state._launchers)
 
     descriptors = query.operands
     gathered: dict[object, object] = {}
@@ -182,6 +216,39 @@ def compile_indexer(query_payload, config_payload, ordinal):
             allow_transient_fold_buffers=False, launcher_sink=gathered,
         )
         if binding.route != "paged_fused":
+            # A single live supertile combines the first and final top-k arms.
+            short_width = min(
+                query.max_page_table_width,
+                max(1, int(binding.supertile_k) // query.page_size),
+            )
+            if short_width < query.max_page_table_width:
+                short_binding = layout.bind(
+                    scratch=scratch,
+                    real_page_table=torch.empty(
+                        (values["page_table"].shape[0], short_width),
+                        dtype=values["page_table"].dtype,
+                        device=device,
+                    ),
+                    cache_seqlens_int32=values["cache_lengths"],
+                    active_width=values["active_width"],
+                    expected_num_q_heads=query.num_q_heads,
+                    shared_page_table=query.shared_page_table,
+                    output_physical_slots=query.output_physical_slots,
+                    _initialize=False,
+                )
+                index_topk_fp8(
+                    q_fp8=values["q_fp8"], weights=values["query_weights"],
+                    index_k_cache=values["index_k_cache"], binding=short_binding,
+                    page_size=query.page_size, topk=query.top_k,
+                    expected_num_q_heads=query.num_q_heads,
+                    out_indices=values["output_indices"],
+                    out_scores=values["output_scores"],
+                    launchers=(
+                        {"paged": resolved[0], "tiled": None}
+                        if binding.route == "paged_tiled" else None
+                    ),
+                    allow_transient_fold_buffers=False, launcher_sink=gathered,
+                )
             # The two-stage fold is a declared native family even when this
             # serving state uses its fixed-scratch carry path. Compile its
             # final row fold from the same exact row/top-k ABI; it remains
@@ -273,8 +340,14 @@ def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaInde
                                       fused_merge=config.fused_merge)
         return MemoryRequirements(scratch=layout.scratch_specs())
     def materialize(selection, device):
+        programs = compile_indexer(
+            TUNING.encode_query(replace(query, exhaustive=False)),
+            TUNING.encode_config(selection.config), device.ordinal,
+        )
+        load_programs(programs)
         if query.cache_format == "mxfp4":
             from types import SimpleNamespace
+            from .mxfp4 import plan_mxfp4
             mx_caps = SimpleNamespace(
                 device=caps.device, num_q_heads=query.num_q_heads,
                 max_q_rows=query.max_q_rows,
@@ -283,20 +356,15 @@ def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaInde
                 max_candidates=query.max_candidates,
                 candidate_topk_blocks=query.candidate_topk_blocks,
             )
-            state = materialize_mxfp4(mx_caps, device_index=device.ordinal, score_kind=selection.config.mxfp4_score_kind)
-            load_programs(state)
-            return state
+            layout = plan_mxfp4(mx_caps, score_kind=selection.config.mxfp4_score_kind)
+            return MXFP4PreparedState(layout, programs.launchers)
         layout = plan_indexer_scratch(
             _scratch_caps(query, device=caps.device, config=selection.config),
             fused_merge=selection.config.fused_merge,
         )
-        launchers = compile_indexer(
-            TUNING.encode_query(replace(query, exhaustive=False)), TUNING.encode_config(selection.config),
-            device.ordinal,
-        )
+        launchers = programs
         if not isinstance(launchers, Mapping):
             raise TypeError("FP8 DSA compiler factory did not return launchers")
-        load_programs(launchers)
         return attach_programs(_DsaIndexerState(layout, selection.config, launchers), launchers)
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override, _compile_jobs=compile_jobs, _memory_requirements=memory, _materialize=materialize, _device=caps.device)
 

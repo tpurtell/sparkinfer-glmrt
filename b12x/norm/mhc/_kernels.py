@@ -942,6 +942,7 @@ class MHCPostPrePartialKernel:
             ),
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=_MHC_PDL,
         )
 
     @cute.kernel
@@ -957,6 +958,10 @@ class MHCPostPrePartialKernel:
         pre_mix: cute.Tensor,
         y: cute.Tensor,
     ):
+        # Launched early behind the one-shot all-reduce that produces x; wait
+        # for it to complete before any global read.
+        if const_expr(_MHC_PDL):
+            cute.arch.griddepcontrol_wait()
         hidden_tile, partial_group, token = cute.arch.block_idx()
         token = Int64(token)
         tidx = cute.arch.thread_idx()[0]
@@ -4593,7 +4598,7 @@ def _run_mhc_post_pre_partial_launch(
     return _compile_mhc_entry(
         kernel,
         compile_spec=KernelCompileSpec.from_key(
-            compile_name, 4 if split_n_abi else 5, compile_key
+            compile_name, 4 if split_n_abi else 6, compile_key
         ),
         compile_args=args,
         runtime_args=args,
@@ -5424,7 +5429,7 @@ def _run_mhc_post_launch(
             split_k=split_k,
             post_only=True,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -5586,7 +5591,7 @@ def _run_mhc_pre_partial_launch(
             lagged_mix=lagged_mix,
             partials_per_cta=partials_per_cta,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
         compile_args=args,
         runtime_args=args,
     )

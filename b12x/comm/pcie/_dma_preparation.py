@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     FrozenMapping,
     MemoryRequirements,
@@ -108,6 +109,7 @@ def query_from_metadata(
     )
 
 
+@program_cache(scope="preparation")
 def compile_dma_surface(query_payload, ordinal: int) -> DmaLaunchers:
     """Compiler-pool factory using only query metadata and native factories."""
 

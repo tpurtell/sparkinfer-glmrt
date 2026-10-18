@@ -177,7 +177,9 @@ def _initialize_worker(
     torch.set_num_threads(1)
     if torch.cuda.is_initialized():
         raise RuntimeError("compiler worker inherited an initialized CUDA runtime")
-    compiler._configure_offline_compile_target(device_ordinal, device_uuid)
+    compiler._configure_offline_compile_target(
+        device_ordinal, compute_capability, sm_count,
+    )
 
     def target_ordinal(device=None):
         if device is None:
@@ -252,6 +254,67 @@ def _initialize_worker(
     torch.cuda.synchronize = reject_cuda_initialization
     torch.cuda.init = reject_cuda_initialization
     torch.cuda._lazy_init = reject_cuda_initialization
+
+    from torch._subclasses.fake_tensor import FakeTensor
+    from torch.utils._mode_utils import no_dispatch
+
+    def has_advanced_index(value):
+        if isinstance(value, (FakeTensor, list)):
+            return True
+        if isinstance(value, tuple):
+            return any(has_advanced_index(item) for item in value)
+        return False
+
+    def meta_index(value):
+        if isinstance(value, FakeTensor):
+            return torch.empty_strided(
+                tuple(value.shape), tuple(value.stride()),
+                dtype=value.dtype, device="meta",
+            ).as_strided(
+                tuple(value.shape), tuple(value.stride()), value.storage_offset()
+            )
+        if isinstance(value, tuple):
+            return tuple(meta_index(item) for item in value)
+        if isinstance(value, list):
+            return [meta_index(item) for item in value]
+        return value
+
+    original_getitem = torch.Tensor.__getitem__
+    original_setitem = torch.Tensor.__setitem__
+
+    def fake_geometry(tensor, index):
+        with no_dispatch():
+            return original_getitem(meta_index(tensor), meta_index(index))
+
+    def fake_getitem(tensor, index):
+        if not isinstance(tensor, FakeTensor):
+            return original_getitem(tensor, index)
+        geometry = fake_geometry(tensor, index)
+        if has_advanced_index(index):
+            return torch.empty_strided(
+                tuple(geometry.shape), tuple(geometry.stride()),
+                dtype=tensor.dtype, device=tensor.device,
+            )
+        return tensor.as_strided(
+            tuple(geometry.shape), tuple(geometry.stride()),
+            geometry.storage_offset(),
+        )
+
+    def fake_setitem(tensor, index, value):
+        if not isinstance(tensor, FakeTensor):
+            return original_setitem(tensor, index, value)
+        with no_dispatch():
+            meta = meta_index(tensor)
+            index = meta_index(index)
+            value = meta_index(value)
+            original_setitem(meta, index, value)
+            # Meta index_put_ skips broadcasting checks. Basic assignment to
+            # the selected region validates them, including leading ones.
+            destination = original_getitem(meta, index)
+            original_setitem(destination, Ellipsis, value)
+
+    torch.Tensor.__getitem__ = fake_getitem
+    torch.Tensor.__setitem__ = fake_setitem
 
     # CuTe's PIC object writer resolves the host launch shim while exporting.
     # Loading the shim supplies symbols only; CUDA remains invisible and any

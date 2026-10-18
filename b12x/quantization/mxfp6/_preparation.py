@@ -7,6 +7,7 @@ import torch
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.fp6 import as_grouped_mxfp6_scale_view
 from b12x._lib.intrinsics import align_up
 from b12x.preparation import (
@@ -59,6 +60,7 @@ class _CompiledMxfp6Dense:
     row_gs: object | None
 
 
+@program_cache(scope="preparation")
 def compile_mxfp6_dense(query_payload, config_payload, ordinal, sm_count):
     """Compile every launcher consumed by one exact prepared FP6 invocation."""
     from b12x._lib import dense_gemm as dense

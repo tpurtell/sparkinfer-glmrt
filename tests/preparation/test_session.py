@@ -1,30 +1,138 @@
 """Host state-machine boundaries, without substituting a serving kernel."""
 import gc
 from dataclasses import replace
+import os
+import subprocess
+import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from b12x.preparation import (
-    CollectiveRequirement, DetectedDevice, MemoryRequirements,
+    CollectiveBarrierTimeout, CollectiveRequirement, DetectedDevice, MemoryRequirements,
     PersistentMemory, Plan, PreparationSession, PreparedCall, current_plan,
     current_prepared_state, plan_from_handle, require_prepared,
 )
+from b12x.preparation.session import PreparationJob
 from b12x.preparation._cache import SelectionCache
-from b12x.preparation.types import _CompositePlan
+from b12x.preparation.types import DeviceIdentity, _CompositePlan
 from b12x._lib.scratch import ScratchBufferSpec
 from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
 from .test_defaults import Config, Query, contract
 
 
+def test_collective_barrier_dispatch_contract(tmp_path):
+    """The barrier fires on authorization match only, with uniform error surfaces."""
+    calls = []
+
+    def barrier(key, ranks):
+        """Record each collective barrier invocation."""
+        calls.append((key, ranks))
+
+    barrier_session = session(tmp_path, collective_barrier=barrier)
+    job = PreparationJob.__new__(PreparationJob)
+    job.session = barrier_session
+    job._error = None
+    job._result = None
+    job._closed = False
+    requirement = CollectiveRequirement(key="comm.roce:7", ranks=(0, 1))
+    job._blocked = requirement
+    job._phase = "priming"
+    job._active_request = None
+    job._completed_requests = 0
+
+    def _gen():
+        """Provide an exhausted synthetic job iterator."""
+        return
+        yield
+
+    job._steps = _gen()
+    job._progress = lambda *args, **kwargs: SimpleNamespace()
+    job._timing = SimpleNamespace(add=lambda *a: None, record=lambda *a, **k: None)
+    job._total_requests = 1
+
+    job._advance(collective_key="other")
+    assert calls == [] and job._blocked is requirement
+
+    job._advance(collective_key="comm.roce:7")
+    assert calls == [("comm.roce:7", (0, 1))]
+    assert job._blocked is None
+
+    def barrier_job():
+        """Create a job shell for direct barrier callback checks."""
+        job = PreparationJob.__new__(PreparationJob)
+        job.session = barrier_session
+        return job
+
+    def refusing(key, ranks):
+        """Report a barrier timeout for the authorized collective."""
+        raise CollectiveBarrierTimeout(key, ranks, ())
+
+    barrier_session.collective_barrier = refusing
+    with pytest.raises(CollectiveBarrierTimeout) as info:
+        barrier_job()._collective_barrier(requirement)
+    assert info.value.key == "comm.roce:7"
+
+    def broken(key, ranks):
+        """Simulate a barrier backend store failure."""
+        raise OSError("store down")
+
+    barrier_session.collective_barrier = broken
+    with pytest.raises(RuntimeError, match="collective barrier.*store down"):
+        barrier_job()._collective_barrier(requirement)
+
+
 def session(tmp_path, **kwargs):
+    """Build a CPU preparation session with an isolated selection cache."""
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
-    value._cache = SelectionCache(tmp_path, {"schema_version": 5, "tuning_cache_version": 1})
+    value._cache = SelectionCache(tmp_path, {"schema_version": 22, "tuning_cache_version": 1})
     return value
 
 
+@pytest.mark.parametrize("workers", [0, 1, 4])
+def test_compiler_process_budget_can_be_limited_without_disabling_tuning(
+    tmp_path, monkeypatch, workers
+):
+    monkeypatch.setenv("B12X_COMPILE_WORKERS", str(workers))
+    with session(tmp_path) as engine:
+        assert engine.compile_workers == workers
+        assert engine.autotune
+    with session(tmp_path, compile_workers=2) as engine:
+        assert engine.compile_workers == 2
+
+
+@pytest.mark.parametrize("identity, workers", [
+    (DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10"), 4),
+    (DeviceIdentity("nvidia", (12, 1), 48, "GB10"), 4),
+    (DeviceIdentity("nvidia", (12, 0), 170, "NVIDIA GeForce RTX 5090"), 8),
+    (None, 8),
+])
+def test_compiler_default_limits_spark_memory_across_stages(monkeypatch, identity, workers):
+    monkeypatch.delenv("B12X_COMPILE_WORKERS", raising=False)
+    with PreparationSession(device=DetectedDevice(None, identity)) as engine:
+        assert engine.compile_workers == workers
+        engine.configure_compile_workers(2)
+        engine.configure_compile_workers()
+        assert engine.compile_workers == workers
+
+
+def test_spark_compiler_budget_preserves_explicit_overrides(monkeypatch):
+    monkeypatch.setenv("B12X_COMPILE_WORKERS", "6")
+    device = DetectedDevice(None, DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10"))
+    with PreparationSession(device=device, compile_workers=1) as engine:
+        assert engine.compile_workers == 1
+        engine.configure_compile_workers()
+        assert engine.compile_workers == 6
+        engine.configure_compile_workers(0)
+        assert engine.compile_workers == 0
+    with PreparationSession(device=device) as engine:
+        assert engine.compile_workers == 6
+
+
 def declaration(*, tuning=None, pin=None, shared=False):
+    """Build a minimal arithmetic plan for preparation state-machine tests."""
     tuning = contract(values=(2,)) if tuning is None else tuning
     return Plan(
         contract=tuning, query=Query(3), override=pin, shared=shared,
@@ -32,6 +140,22 @@ def declaration(*, tuning=None, pin=None, shared=False):
         _memory_requirements=lambda config, device: MemoryRequirements(),
         _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width * 3),
     )
+
+
+def test_compiler_budget_changes_between_jobs_preserve_prepared_plans(tmp_path):
+    with session(tmp_path) as engine:
+        first = request(name="weights")
+        engine.configure_compile_workers(16)
+        engine.prepare((first,))
+        prepared = first.plan.prepared
+        engine.configure_compile_workers(4)
+        job = engine.begin((request(name="state"),))
+        with pytest.raises(RuntimeError, match="between jobs"):
+            engine.configure_compile_workers(2)
+        job.close()
+        assert engine.compile_workers == 4
+        assert first.plan.prepared is prepared
+        assert require_prepared(first.plan, "test.arithmetic").value == 6
 
 
 def request(*, name, tuning=None, pin=None, calls=None, close=None, benchmark=None, dependencies=(), collective=None, shared=False):
@@ -66,7 +190,118 @@ def test_prepare_fills_plans_in_place_and_release_runs_closers(tmp_path):
     assert b.plan.prepared is None
 
 
+def test_job_bundle_memo_ends_at_completion_but_plan_programs_survive(tmp_path):
+    import weakref
+    from b12x._lib import compile_plan, program_cache
+
+    built = []
+    key = compile_plan.ProgramKey("cute", "7" * 64, "job-owned")
+
+    @program_cache.program_cache
+    def executable():
+        return compile_plan.CompiledCuTeProgram(lambda: 23, key)
+
+    @program_cache.program_cache(scope="preparation")
+    def factory():
+        built.append(1)
+        return executable()
+
+    def make(name):
+        plan = replace(declaration(), _materialize=lambda *_: compile_plan.load_programs(factory()))
+        return plan.request(name=name, prepare_call=lambda state: PreparedCall(run=state))
+
+    with session(tmp_path, autotune=False) as engine:
+        requests = (make("a"), make("b"))
+        job = engine.begin(requests)
+        while not job.advance().done:
+            pass
+        assert not job._program_cache._caches
+        assert built == [1]
+        owner = weakref.ref(requests[0].plan.prepared.state)
+        assert owner() is requests[1].plan.prepared.state
+        engine.release_many((requests[0].plan,))
+        assert requests[1].plan.prepared.state() == 23
+        assert executable.cache_info().currsize == 1
+        engine.release_many((requests[1].plan,))
+        assert executable.cache_info().currsize == 0
+        assert owner() is None
+        engine.prepare((make("later"),))
+        assert built == [1, 1]
+
+
+def test_bulk_release_attempts_all_closers_and_reclaims_once(tmp_path, monkeypatch):
+    closed, reclaimed = [], []
+
+    def close(name):
+        closed.append(name)
+        if name == "a":
+            raise RuntimeError("closer failed")
+
+    with session(tmp_path) as engine:
+        requests = tuple(request(name=name, close=lambda name=name: close(name)) for name in ("a", "b"))
+        engine.prepare(requests)
+        reclaim = engine._reclaim_programs
+        monkeypatch.setattr(engine, "_reclaim_programs", lambda: (reclaimed.append(1), reclaim()))
+        with pytest.raises(RuntimeError, match="closer failed"):
+            engine.release_many(item.plan for item in requests)
+        assert closed == ["a", "b"]
+        assert reclaimed == [1]
+        assert all(item.plan.prepared is None for item in requests)
+        engine.release_many(item.plan for item in requests)
+        assert reclaimed == [1]
+
+
+def test_closing_one_session_preserves_another_sessions_executable(tmp_path):
+    from b12x._lib import compile_plan, program_cache
+
+    @program_cache.program_cache
+    def executable():
+        return compile_plan.CompiledCuTeProgram(lambda: 41, compile_plan.ProgramKey("cute", "6" * 64))
+
+    def make(name):
+        plan = replace(declaration(), _materialize=lambda *_: compile_plan.load_programs(executable()))
+        return plan.request(name=name, prepare_call=lambda state: PreparedCall(run=state))
+
+    with session(tmp_path, autotune=False) as first, session(tmp_path, autotune=False) as second:
+        a, b = make("a"), make("b")
+        first.prepare((a,))
+        second.prepare((b,))
+        first.close()
+        assert b.plan.prepared.state() == 41
+        assert executable.cache_info().currsize == 1
+        second.close()
+        assert executable.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_job_factory_scope_clears_on_failure_or_early_close(tmp_path, cancel):
+    from b12x._lib.program_cache import PreparationProgramCache, program_cache
+
+    @program_cache(scope="preparation")
+    def factory():
+        return SimpleNamespace(value=3)
+
+    def fail(state):
+        raise RuntimeError("binding failed")
+
+    plan = replace(declaration(), _materialize=lambda *_: factory())
+    with session(tmp_path, autotune=False) as engine:
+        job = engine.begin((plan.request(name="a", prepare_call=fail),))
+        if cancel:
+            with job._program_cache.activate():
+                factory()
+            job.close()
+        else:
+            with pytest.raises(RuntimeError, match="binding failed"):
+                while not job.advance().done:
+                    pass
+        assert not job._program_cache._caches
+        with PreparationProgramCache().activate():
+            assert factory().value == 3
+
+
 def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
+    """Persistent allocations remain separate when their owner includes the plan."""
     buffers = {}
 
     def memory(config, device):
@@ -108,7 +343,9 @@ def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
 
 
 def test_sticky_stop_before_enumeration_prepares_default_without_winner(tmp_path):
+    """Stopped tuning installs defaults without enumerating optional candidates."""
     def no_optional(query, device, assignment):
+        """Reject materialization if stopped tuning enumerates an optional choice."""
         raise AssertionError("stopped session enumerated an optional candidate")
 
     tuning = replace(contract(), materialize=no_optional)
@@ -124,6 +361,7 @@ def test_sticky_stop_before_enumeration_prepares_default_without_winner(tmp_path
 
 
 def test_cache_only_effective_singleton_and_explicit_pin_need_no_selection_record(tmp_path):
+    """Cache-only mode permits fixed and explicit selections without cache records."""
     tuning = replace(contract(), equivalence_key=lambda query, device, config: {"same": True})
     calls = []
     with session(tmp_path, cache_only=True) as engine:
@@ -137,6 +375,7 @@ def test_cache_only_effective_singleton_and_explicit_pin_need_no_selection_recor
 
 
 def test_collective_requires_explicit_matching_authorization(tmp_path):
+    """Collective preparation resumes only after its exact key is authorized."""
     calls = []
     requirement = CollectiveRequirement("group/prime", (0, 1))
     req = request(name="collective", calls=calls, collective=requirement)
@@ -157,7 +396,102 @@ def test_collective_requires_explicit_matching_authorization(tmp_path):
         job.result()
 
 
+def test_collective_barrier_failure_closes_active_job(tmp_path):
+    """Barrier callback failure clears the active job before propagation."""
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def broken(key, ranks):
+        """Simulate a collective backend failure after authorization."""
+        raise OSError("store down")
+
+    with session(tmp_path, collective_barrier=broken) as engine:
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(RuntimeError, match="collective barrier.*store down"):
+            job.advance(collective_key=requirement.key)
+        assert job._closed
+        assert engine._job is None
+        engine.begin(())
+
+
+def test_collective_barrier_timeout_blocks_new_job_until_callback_returns(
+    tmp_path, monkeypatch,
+):
+    """A timed-out callback holds the collective gate until it returns."""
+    started, release = threading.Event(), threading.Event()
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def stalled(key, ranks):
+        """Block the embedder barrier until the test permits completion."""
+        started.set()
+        release.wait()
+
+    monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", "0.01")
+    with session(tmp_path, collective_barrier=stalled) as engine:
+        monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120")
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(CollectiveBarrierTimeout) as error:
+            job.advance(collective_key=requirement.key)
+        assert "callback timed out" in str(error.value)
+        assert "never entered" not in str(error.value)
+        assert error.value.arrived is None
+        assert error.value.timeout == 0.01
+        assert "after 0.01s" in str(error.value)
+        assert started.is_set() and job._closed and engine._job is None
+        pending = engine._pending_collective_barrier
+        with pytest.raises(RuntimeError, match="previous collective barrier"):
+            engine.begin(())
+        release.set()
+        assert pending.wait(1)
+        engine.begin(()).close()
+
+
+def test_collective_barrier_start_failure_clears_pending_marker(tmp_path, monkeypatch):
+    """Thread-start failure does not leave the session's collective gate set."""
+    from b12x.preparation import session as session_module
+
+    requirement = CollectiveRequirement("group/prime", (0, 1))
+
+    def broken_start(self):
+        """Fail the barrier thread before it can run its cleanup."""
+        raise OSError("thread start failed")
+
+    monkeypatch.setattr(session_module.threading.Thread, "start", broken_start)
+    with session(tmp_path, collective_barrier=lambda key, ranks: None) as engine:
+        job = engine.begin((request(name="collective", collective=requirement),))
+        assert job.advance().ready_collectives == (requirement,)
+        with pytest.raises(RuntimeError, match="collective barrier.*thread start failed"):
+            job.advance(collective_key=requirement.key)
+        assert job._closed and engine._job is None
+        assert engine._pending_collective_barrier is None
+        engine.begin(())
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "inf", "nan", "abc"))
+def test_collective_barrier_timeout_rejects_nonpositive_or_nonfinite_values(
+    tmp_path, monkeypatch, value,
+):
+    """Only sessions enabling a barrier must validate its environment setting."""
+    monkeypatch.setenv("B12X_COLLECTIVE_BARRIER_TIMEOUT", value)
+    with session(tmp_path) as engine:
+        engine.prepare((request(name="no-barrier"),))
+    with pytest.raises(ValueError, match="finite positive"):
+        session(tmp_path, collective_barrier=lambda key, ranks: None)
+
+
+def test_preparation_import_ignores_unused_barrier_timeout():
+    """An optional barrier setting cannot prevent unrelated library imports."""
+    result = subprocess.run(
+        [sys.executable, "-c", "import b12x.preparation"],
+        env={**os.environ, "B12X_COLLECTIVE_BARRIER_TIMEOUT": "abc"},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_new_obligation_fails_after_freeze(tmp_path):
+    """Frozen sessions reject declarations that were not prepared beforehand."""
     with session(tmp_path) as engine:
         engine.prepare((request(name="ready"),))
         engine.freeze()
@@ -211,6 +545,20 @@ def test_persistent_memory_counts_shared_keys_once_and_rejects_conflicts():
         MemoryRequirements.sequential((requirements, MemoryRequirements(persistent=(
             PersistentMemory("weights-side-state", 40, 20),
         ))))
+
+
+@pytest.mark.parametrize("sizes", [(257, 321), (321, 257)])
+def test_sequential_scratch_covers_variants_with_equal_aligned_sizes(sizes):
+    requirements = tuple(
+        MemoryRequirements(scratch=(ScratchBufferSpec(
+            name="workspace", shape=(size,), dtype=torch.uint8,
+            device=torch.device("cpu"),
+        ),))
+        for size in sizes
+    )
+    combined = MemoryRequirements.sequential(requirements)
+    assert combined.scratch_nbytes == 512
+    assert sum(spec.nbytes for spec in combined.scratch) >= max(sizes)
 
 
 def _deterministic_timer(monkeypatch, *, stop=None, batches=None):
@@ -283,11 +631,156 @@ def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypat
     assert sorted(trial_closed) == [3, 6, 12, 24]
 
 
-def test_two_ranks_measure_disjoint_candidate_halves_and_install_global_winner(
-    tmp_path, monkeypatch
+def _cuda_error(monkeypatch, code=720):
+    from cutlass.base_dsl import common
+
+    # Construct the actual DSL exception without querying a CUDA context.
+    monkeypatch.setattr(common, "_get_friendly_cuda_error_message",
+                        lambda code, name: (f"{name} ({code})", "", ""))
+    return common.DSLCudaRuntimeError(code, "test CUDA launch error")
+
+
+@pytest.mark.parametrize("rejected", ((3,), (12,), (3, 6)))
+def test_unlaunchable_trials_release_scratch_and_race_survivors(
+    tmp_path, monkeypatch, caplog, rejected,
+):
+    batches, events = [], []
+    _deterministic_timer(monkeypatch, batches=batches)
+    error = _cuda_error(monkeypatch)
+
+    def benchmark(state):
+        def run():
+            events.append(("run", state.value))
+            if state.value in rejected:
+                raise error
+            return state.value
+
+        return PreparedCall(
+            run=run, produce=lambda: None,
+            restore=lambda: events.append(("restore", state.value)),
+            close=lambda: events.append(("close", state.value)),
+        )
+
+    with session(tmp_path, race_batch=1) as engine:
+        monkeypatch.setattr(engine, "_synchronize", lambda: events.append("sync"))
+        result = engine.prepare((request(name="race", tuning=contract(), benchmark=benchmark),))
+        survivors = {3, 6, 12} - set(rejected)
+        assert result.selections["race"].config.width * 3 in survivors
+        assert result.benchmarked_candidates == len(survivors)
+        assert result.coverage["race"]["measured_count"] == len(survivors)
+        assert all(set(batch) <= survivors for batch in batches)
+        # The cache accepts only fully measured races.
+        assert not engine._cache.records
+    for value in rejected:
+        start = events.index(("run", value))
+        assert events[start + 1:start + 4] == ["sync", ("restore", value), ("close", value)]
+        assert events.count(("close", value)) == 1
+    assert caplog.text.count("Skipping race candidate") == len(rejected)
+
+
+def test_all_trials_rejected_fail_without_installing_a_default(tmp_path, monkeypatch):
+    error = _cuda_error(monkeypatch)
+    closed, prepared = [], []
+
+    def benchmark(state):
+        def run():
+            raise error
+        return PreparedCall(run=run, close=lambda: closed.append(state.value))
+
+    req = request(name="race", tuning=contract(), calls=prepared, benchmark=benchmark)
+    with session(tmp_path) as engine:
+        with pytest.raises(RuntimeError, match="no launchable candidates for race: all 3"):
+            engine.prepare((req,))
+        assert req.plan.prepared is None
+        assert not engine._cache.records
+    assert closed == [3, 6, 12]
+    assert not prepared
+
+
+@pytest.mark.parametrize("failure", ("cuda", "text", "factory", "restore", "sync", "selected"))
+def test_candidate_recovery_keeps_other_failures_fatal(tmp_path, monkeypatch, failure):
+    _deterministic_timer(monkeypatch)
+    error = (_cuda_error(monkeypatch, 700 if failure == "cuda" else 720)
+             if failure != "text" else RuntimeError("CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"))
+    attempted = []
+
+    def fail():
+        raise error
+
+    def cleanup_failure():
+        raise RuntimeError("cleanup failed")
+
+    def benchmark(state):
+        attempted.append(state.value)
+        if failure == "factory":
+            fail()
+        return PreparedCall(
+            run=(lambda: state.value) if failure == "selected" else fail,
+            restore=cleanup_failure if failure == "restore" else None,
+        )
+
+    req = request(name="race", tuning=contract(), benchmark=benchmark)
+    if failure == "selected":
+        req = replace(req, prepare_call=lambda state: PreparedCall(run=fail))
+    with session(tmp_path) as engine:
+        if failure == "sync":
+            monkeypatch.setattr(engine, "_synchronize", cleanup_failure)
+        with pytest.raises(RuntimeError, match="cleanup failed" if failure in {"restore", "sync"} else "failed to prepare"):
+            engine.prepare((req,))
+        assert req.plan.prepared is None
+    assert attempted == ([3, 6, 12] if failure == "selected" else [3])
+
+
+def test_rejected_shard_accepts_a_peer_winner_without_claiming_full_measurement(
+    tmp_path, monkeypatch,
+):
+    from b12x.preparation import TuningRequirement
+
+    error = _cuda_error(monkeypatch)
+
+    def benchmark(state):
+        def run():
+            raise error
+        return PreparedCall(run=run)
+
+    with session(tmp_path) as engine:
+        engine.configure_tuning_shard(0, (0, 1))
+        req = request(name="race", tuning=contract(values=(1, 2)), benchmark=benchmark)
+        job = engine.begin((req,))
+        snapshot = job.advance().ready_cache
+        progress = job.advance(cache=(snapshot, snapshot))
+        while not progress.ready_tuning:
+            progress = job.advance()
+        contribution, = progress.ready_tuning
+        assert contribution.assignment is None and contribution.rejected_count == 1
+        winner = TuningRequirement(contribution.key, (0, 1), {"width": 2}, 1.0, 1, 1)
+        progress = job.advance(tuning=(winner,))
+        while not progress.done:
+            progress = job.advance()
+        result = job.result()
+        assert req.plan.selection.config.width == 2
+        assert result.coverage["race"]["measured_count"] == 1
+        assert result.benchmarked_candidates == 0
+        assert not engine._cache.records
+
+
+@pytest.mark.parametrize("cached_ranks", ((), (0,), (1,), (0, 1)))
+def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
+    tmp_path, monkeypatch, cached_ranks,
 ):
     _deterministic_timer(monkeypatch)
     tuning = contract(values=(1, 2, 4, 8))
+    for rank in cached_ranks:
+        with session(tmp_path / f"rank-{rank}") as engine:
+            engine.prepare((request(
+                name="cached", tuning=tuning,
+                benchmark=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+            ),))
+            # Simulate another completed race choosing a different winner.
+            if rank == 1 and len(cached_ranks) == 2:
+                key, record = next(iter(engine._cache.records.items()))
+                engine._cache.save(key, assignment={"width": 4}, config={"width": 4},
+                                   coverage=record["coverage"], programs=())
     engines = [session(tmp_path / f"rank-{rank}") for rank in range(2)]
     requests = []
     jobs = []
@@ -301,17 +794,25 @@ def test_two_ranks_measure_disjoint_candidate_halves_and_install_global_winner(
                 produce=lambda: None,
             ),
         )
-        requests.append(req)
-        jobs.append(engine.begin((req,)))
+        fresh = replace(req, name="fresh", dependencies=("shared",),
+                        plan=replace(req.plan, query=Query(5)))
+        requests.append((req, fresh))
+        jobs.append(engine.begin((req, fresh)))
 
     authorizations = [None, None]
+    caches = [None, None]
     progress = [None, None]
     for _ in range(100):
         progress = [
-            job.advance(tuning=authorization)
-            for job, authorization in zip(jobs, authorizations)
+            job.advance(tuning=authorization, cache=cache)
+            for job, authorization, cache in zip(jobs, authorizations, caches, strict=True)
         ]
         authorizations = [None, None]
+        caches = [None, None]
+        if any(state.ready_cache is not None for state in progress):
+            snapshots = tuple(state.ready_cache for state in progress)
+            assert all(snapshot is not None for snapshot in snapshots)
+            caches = [snapshots, snapshots]
         contributions = [
             item
             for state in progress
@@ -332,10 +833,16 @@ def test_two_ranks_measure_disjoint_candidate_halves_and_install_global_winner(
 
     results = [job.result() for job in jobs]
     try:
-        assert [result.benchmarked_candidates for result in results] == [2, 2]
+        assert [result.benchmarked_candidates for result in results] == ([2, 2] if cached_ranks else [4, 4])
         assert [result.selections["shared"].config.width for result in results] == [2, 2]
+        assert [result.selections["shared"].source for result in results] == (["cached"] * 2 if cached_ranks else ["tuned"] * 2)
+        assert all(result.selections["fresh"].source == "tuned" for result in results)
         assert [result.coverage["shared"]["measured_count"] for result in results] == [4, 4]
-        assert [req.plan.selection.config.width for req in requests] == [2, 2]
+        assert [req[0].plan.selection.config.width for req in requests] == [2, 2]
+        # Saving the fresh choice must not restore a conflicting local winner.
+        for engine in engines:
+            result = engine.prepare((request(name="again", tuning=tuning),))
+            assert result.selections["again"].config.width == 2
     finally:
         for engine in engines:
             engine.close()
@@ -901,14 +1408,36 @@ def test_gpu_steps_share_a_bounded_advance_without_changing_order(tmp_path, monk
         job.result()
 
 
-@pytest.mark.parametrize("boundary", ("compile", "collective", "tuning"))
+def test_tuning_contribution_preserves_rejected_candidate_count():
+    from b12x.preparation import TuningRequirement
+
+    winner = TuningRequirement("query", (0, 1), {"width": 2}, 1.0, 0)
+    empty = TuningRequirement("query", (0, 1), None, None, None, rejected_count=2)
+    consolidated = replace(winner, rejected_count=empty.rejected_count + 1)
+    assert winner.rejected_count == 0
+    assert consolidated.rejected_count == 3
+    assert consolidated.assignment == winner.assignment
+    assert consolidated.latency_us == winner.latency_us
+    assert consolidated.candidate_index == winner.candidate_index
+
+
+@pytest.mark.parametrize("count", (-1, True, 1.5, "2"))
+def test_tuning_contribution_rejects_invalid_rejection_counts(count):
+    from b12x.preparation import TuningRequirement
+
+    with pytest.raises(ValueError, match="rejected candidate count"):
+        TuningRequirement("query", (0, 1), None, None, None, rejected_count=count)
+
+
+@pytest.mark.parametrize("boundary", ("compile", "collective", "tuning", "cache"))
 def test_batched_gpu_steps_stop_before_unready_work(tmp_path, boundary):
-    from b12x.preparation.types import PreparationResult, TuningRequirement
+    from b12x.preparation.types import PreparationResult, TuningCacheRequirement, TuningRequirement
 
     seen = []
     collective = CollectiveRequirement("ready/collective", (0, 1))
     tuning = TuningRequirement("ready/tuning", (0, 1), {"width": 2}, 1.0, 0)
-    signals = {"compile": "compile", "collective": collective, "tuning": tuning}
+    cache = TuningCacheRequirement((0, 1), {}, {})
+    signals = {"compile": "compile", "collective": collective, "tuning": tuning, "cache": cache}
 
     def steps():
         for index in range(2):
@@ -935,11 +1464,33 @@ def test_batched_gpu_steps_stop_before_unready_work(tmp_path, boundary):
             assert job.advance().ready_tuning == (tuning,)
             assert seen == [0, 1]
             progress = job.advance(tuning=tuning)
+        elif boundary == "cache":
+            assert progress.ready_cache == cache
+            assert job.advance().ready_cache == cache
+            assert seen == [0, 1]
+            progress = job.advance(cache=(cache, cache))
         else:
             assert progress.pending_compilation
             progress = job.advance()
         assert progress.done
-        assert seen == [0, 1, tuning if boundary == "tuning" else None]
+        expected = tuning if boundary == "tuning" else (cache, cache) if boundary == "cache" else None
+        assert seen == [0, 1, expected]
+        job.result()
+
+
+def test_cancelled_cache_agreement_continues_with_required_defaults(tmp_path):
+    with session(tmp_path) as engine:
+        engine.configure_tuning_shard(0, (0, 1))
+        req = request(name="cancelled-cache", tuning=contract())
+        job = engine.begin((req,))
+        assert job.advance().ready_cache is not None
+        engine.cancel_tuning()
+        progress = job.advance(cache=())
+        while not progress.done:
+            progress = job.advance()
+        assert req.plan.selection.source == "default"
+        assert req.plan.selection.config.width == 7
+        assert engine._cache.records == {}
         job.result()
 
 
@@ -1087,6 +1638,8 @@ def test_sharded_races_exchange_after_independent_work_and_release_trials(
             req = replace(req, plan=replace(req.plan, query=Query(i + 3)))
             requests.append(req)
         job = engine.begin(requests)
+        snapshot = job.advance().ready_cache
+        job.advance(cache=(snapshot, snapshot))
         exchanges = []
         tuning = None
         for _ in range(100):
@@ -1122,6 +1675,8 @@ def test_cancelled_pending_races_prepare_defaults_without_caching(tmp_path, monk
             for i in range(2)
         )
         job = engine.begin(requests)
+        snapshot = job.advance().ready_cache
+        job.advance(cache=(snapshot, snapshot))
         for _ in range(100):
             progress = job.advance()
             if progress.ready_tuning:
@@ -1153,6 +1708,8 @@ def test_fixed_collective_without_dependents_does_not_split_race_results(tmp_pat
         collective = request(name="comm", collective=CollectiveRequirement("comm", (0, 1)))
         collective = replace(collective, plan=replace(collective.plan, query=Query(99)))
         job = engine.begin((races[0], collective, races[1]))
+        snapshot = job.advance().ready_cache
+        job.advance(cache=(snapshot, snapshot))
         tuning = key = None
         boundaries = []
         for _ in range(100):
@@ -1209,8 +1766,11 @@ def test_first_use_warnings_group_equal_declarations_without_hiding_other_shapes
         details = [r.getMessage() for r in caplog.records if "unprepared plan Query#" in r.getMessage()]
         assert len(details) == 21
     finally:
+        # Lazy sessions are keyed by device ordinal: None without CUDA, else the GPU.
+        from b12x.preparation.device import detect_device
+        session = _LAZY_SESSIONS[detect_device(None).ordinal]
         for plan in plans:
-            _LAZY_SESSIONS[None].release(plan)
+            session.release(plan)
         _warn_unprepared_declaration.cache_clear()
 
 

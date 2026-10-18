@@ -9,6 +9,7 @@ import torch
 import triton
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._contracts import LayerCaps, _bind_layer, _materialize_layout
 from ._tuning import OPERANDS, PleConfig, PleQuery, TUNING
@@ -62,6 +63,7 @@ def _geometry(query):
     return channels, length, length + query.max_speculative_tokens, block_h
 
 
+@program_cache(scope="preparation")
 def compile_layer(query_payload, config_payload, ordinal):
     from . import _kernels as kernels
     query = PleQuery(**dict(query_payload))

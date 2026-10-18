@@ -1151,17 +1151,25 @@ def index_topk_fp8(
         is_first = chunk_idx == 0
         is_last = chunk_idx == num_chunks - 1
         if carry_buf_values is not None:
-            carry_values = carry_buf_values[(chunk_idx - 1) % 2, :q_rows, :topk]
-            carry_indices = carry_buf_indices[(chunk_idx - 1) % 2, :q_rows, :topk]
+            carry_values = (
+                carry_buf_values.select(0, (chunk_idx - 1) % 2)
+                .narrow(0, 0, q_rows).narrow(1, 0, topk)
+            )
+            carry_indices = (
+                carry_buf_indices.select(0, (chunk_idx - 1) % 2)
+                .narrow(0, 0, q_rows).narrow(1, 0, topk)
+            )
             out_values = (
                 final_values
                 if is_last
-                else carry_buf_values[chunk_idx % 2, :q_rows, :topk]
+                else carry_buf_values.select(0, chunk_idx % 2)
+                .narrow(0, 0, q_rows).narrow(1, 0, topk)
             )
             out_indices = (
                 final_raw_indices
                 if is_last
-                else carry_buf_indices[chunk_idx % 2, :q_rows, :topk]
+                else carry_buf_indices.select(0, chunk_idx % 2)
+                .narrow(0, 0, q_rows).narrow(1, 0, topk)
             )
         else:
             # Single chunk: is_first folds nothing and writes straight to the output.

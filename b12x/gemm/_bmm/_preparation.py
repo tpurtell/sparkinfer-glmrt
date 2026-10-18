@@ -6,10 +6,12 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._tuning import BmmQuery, TUNING
 
 
+@program_cache(scope="preparation")
 def compile_bmm(query_payload, device_ordinal):
     """Resolve the exact production launch used by a prepared BMM."""
     from b12x.gemm._shared import mxfp8_bmm as kernels

@@ -8,6 +8,7 @@ from types import MappingProxyType
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._impl import Caps, _bind, _materialize_layout
 from ._tuning import MtpFeedbackConfig, MtpFeedbackQuery, TUNING
@@ -33,6 +34,7 @@ class _CompilePointer:
         return self.alignment
 
 
+@program_cache(scope="preparation")
 def compile_feedback(query_payload, config_payload, ordinal):
     from . import _kernels
     from ._cute_prefill import compile_mtp_prefill_capacity

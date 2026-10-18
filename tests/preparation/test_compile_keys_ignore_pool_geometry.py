@@ -421,6 +421,7 @@ def _probe(case):
     """
     import torch
     from b12x._lib.compile_pool import describe_compilation
+    from b12x._lib.program_cache import PreparationProgramCache
     _record_planned_facts()
     family = FAMILIES[case["family"]]
     pools = {"base": case["pool"], **{
@@ -436,7 +437,15 @@ def _probe(case):
             keys = set()
             for job in plan._compile_jobs(config, DEVICE):
                 try:
-                    keys.update(describe_compilation(job).programs)
+                    scope = PreparationProgramCache()
+                    with scope.activate():
+                        first = describe_compilation(job)
+                        misses = sum(cache._misses for cache in scope._caches.values())
+                        repeated = describe_compilation(job)
+                        assert first.programs == repeated.programs
+                        assert sum(cache._misses for cache in scope._caches.values()) == misses
+                    scope.clear()
+                    keys.update(first.programs)
                 except torch.AcceleratorError as error:
                     frame = error.__traceback__
                     while frame.tb_next is not None:

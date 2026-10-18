@@ -24,6 +24,21 @@ _LIB: ctypes.CDLL | None = None
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 
 
+def _traffic_class() -> int:
+    """IP DSCP/ECN byte for every RoCE queue pair, resolved once at setup."""
+    for name in ("B12X_ROCE_TRAFFIC_CLASS", "NCCL_IB_TC"):
+        raw = os.getenv(name)
+        if raw is not None:
+            try:
+                value = int(raw, 0)
+            except ValueError:
+                raise ValueError(f"{name} must be an integer from 0 to 255") from None
+            if not 0 <= value <= 255:
+                raise ValueError(f"{name} must be an integer from 0 to 255")
+            return value
+    return 0
+
+
 def _cache_dir() -> Path:
     """Directory for the compiled proxy library: ``B12X_ROCE_CACHE_DIR``, else ``<XDG cache>/b12x/roce``."""
     override = os.getenv("B12X_ROCE_CACHE_DIR")
@@ -100,6 +115,7 @@ def load() -> ctypes.CDLL:
             ctypes.POINTER(ctypes.c_char_p),
             ctypes.c_int,
             ctypes.c_int,
+            ctypes.c_int,
             p,
             u64,
             u64,
@@ -109,7 +125,7 @@ def load() -> ctypes.CDLL:
         lib.roce_local_blob.restype = ctypes.c_int
         lib.roce_local_blob.argtypes = [p, p, u64]
         lib.roce_connect.restype = ctypes.c_int
-        lib.roce_connect.argtypes = [p, p, u64]
+        lib.roce_connect.argtypes = [p, p, u64, ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
         lib.roce_start.restype = ctypes.c_int
         lib.roce_start.argtypes = [p]
         lib.roce_stop.restype = None
@@ -124,7 +140,7 @@ def load() -> ctypes.CDLL:
         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
         lib.roce_destroy.restype = None
         lib.roce_destroy.argtypes = [p]
-        if lib.roce_abi_version() != 3:
+        if lib.roce_abi_version() != 5:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
@@ -177,6 +193,7 @@ class Proxy:
         slot_bytes: int,
     ) -> None:
         """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
+        self.traffic_class = _traffic_class()
         self._lib = load()
         names = (ctypes.c_char_p * len(hca_names))(*[n.encode() for n in hca_names])
         err = ctypes.create_string_buffer(512)
@@ -186,6 +203,7 @@ class Proxy:
             names,
             len(hca_names),
             int(gid_index),
+            self.traffic_class,
             ctypes.c_void_p(int(region_ptr)),
             int(region_bytes),
             int(slot_bytes),
@@ -208,14 +226,28 @@ class Proxy:
             raise RuntimeError(BLOB_STRUCT_ERR)
         return buf.raw
 
-    def connect(self, blobs: list[bytes]) -> None:
-        """Connect the queue pairs from every rank's ``local_blob``, in rank order."""
+    def connect(self, blobs: list[bytes], routes: list[list[tuple[int, int]]]) -> None:
+        """Connect the queue pairs from every rank's ``local_blob``, in rank order.
+
+        ``routes[peer]`` lists, per rail, the ``(local HCA index, peer HCA index)`` link that carries
+        it (see ``_routes.plan_routes``); the entry for this rank is ignored.
+        """
         n = int(self._lib.roce_blob_bytes())
         if len(blobs) != self.world_size or any(len(b) != n for b in blobs):
             raise RuntimeError(BLOB_STRUCT_ERR)
+        if len(routes) != self.world_size:
+            raise RuntimeError("RoCE routes must list every rank")
+        rails = max(len(r) for r in routes)
+        flat = []
+        for peer, rail_links in enumerate(routes):
+            if peer != self.rank and len(rail_links) != rails:
+                raise RuntimeError(f"RoCE routes to rank {peer} have {len(rail_links)} rails, expected {rails}")
+            for k in range(rails):
+                flat.extend(rail_links[k] if peer != self.rank else (0, 0))
+        table = (ctypes.c_int32 * len(flat))(*flat)
         joined = b"".join(blobs)
         buf = ctypes.create_string_buffer(joined, len(joined))
-        if self._lib.roce_connect(self._ctx, buf, len(joined)) != 0:
+        if self._lib.roce_connect(self._ctx, buf, len(joined), table, rails) != 0:
             raise RuntimeError(f"RoCE queue-pair connect failed: {self.error()}")
 
     def start(self) -> None:
