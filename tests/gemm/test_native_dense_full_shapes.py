@@ -55,5 +55,6 @@ def test_embedding_full_checkpoint_shape():
     output = torch.empty((4, k), dtype=torch.bfloat16, device="cuda")
     program = compile_fp8_row_embedding_aot(hidden=k, vocabulary=n)
     program.launch(ids, payload.view(torch.uint8), scales, output, scalars=(4, 48))
-    expected = (payload[ids.long()].float()*scales[ids.long(), None]).bfloat16()
+    selected = payload.view(torch.uint8)[ids.long()].view(torch.float8_e4m3fn)
+    expected = (selected.float()*scales[ids.long(), None]).bfloat16()
     assert torch.equal(output, expected)
