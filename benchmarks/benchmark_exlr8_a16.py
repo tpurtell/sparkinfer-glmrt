@@ -218,6 +218,9 @@ def main():
                         help="rows whose arms also get a stage profile; empty disables")
     parser.add_argument("--profile",action="store_true",
                         help="one eager launch per arm inside cudaProfilerStart/Stop (for ncu); no timing")
+    parser.add_argument("--profile-arm",default="",
+                        help="with --profile: only this width-arm label is launched, so one "
+                             "ncu invocation sees one profiled launch (default: every arm)")
     args = parser.parse_args()
     if not args.profile and args.output is None:
         parser.error("--output is required unless --profile")
@@ -253,6 +256,8 @@ def main():
     expert_map = torch.arange(EXPERTS,dtype=torch.int32,device="cuda")
     records = []
     for label, bits in arms:
+        if args.profile and args.profile_arm and label != args.profile_arm:
+            continue
         host_bits = (torch.full((EXPERTS,UNITS,3),4,dtype=torch.int32) if bits is None
                      else torch.from_numpy(bits)).numpy()
         tensors[2].copy_(torch.from_numpy(host_bits).cuda())
