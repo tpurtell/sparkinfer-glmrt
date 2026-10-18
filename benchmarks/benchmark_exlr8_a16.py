@@ -213,7 +213,7 @@ def main():
     parser.add_argument("--ranks",type=int,default=4)
     parser.add_argument("--total-units",type=int,default=16)
     parser.add_argument("--schedules",default="static,balanced",
-                        help="EXLR8 width schedules to measure (static, balanced)")
+                        help="EXLR8 width schedules to measure (static, balanced, identity)")
     parser.add_argument("--stage-rows",default="8,16,64",
                         help="rows whose arms also get a stage profile; empty disables")
     parser.add_argument("--profile",action="store_true",
@@ -231,7 +231,7 @@ def main():
     stage_rows = {int(r) for r in args.stage_rows.split(",") if r} if args.stage_rows else set()
     schedules = [s for s in args.schedules.split(",") if s]
     for schedule in schedules:
-        if schedule not in ("static", "balanced"):
+        if schedule not in ("static", "balanced", "identity"):
             parser.error(f"unknown schedule {schedule}")
     tensors, owners = make_candidate()
     arms = [("k4", None)]
@@ -322,6 +322,10 @@ def main():
                 records.append(record)
     if args.profile:
         return
+    verdict_schedule = "balanced" if "balanced" in schedules else schedules[0]
+    by_schedule = {s: all(r["target_met"] for r in records
+                           if r["widths"] == "k4" and r["schedule"] == s)
+                   for s in schedules}
     result = dict(schema=1,kind="exlr8_widths_roofline",device=props.name,
                   sm_count=props.multi_processor_count,l2_bytes=getattr(props,"L2_cache_size",None),
                   hidden=HIDDEN,units_per_rank=UNITS,top_k=TOPK,experts=EXPERTS,
@@ -331,7 +335,8 @@ def main():
                              "one untimed warm batch per rows; profiler separate; read percentages "
                              "are payload bytes only (scratch traffic is excluded)",
                   rows=records,
-                  target_met=all(r["target_met"] for r in records if r["widths"]=="k4"))
+                  target_met=by_schedule.get(verdict_schedule, False),
+                  target_met_by_schedule=by_schedule)
     with args.output.open("x") as stream:
         json.dump(result,stream,indent=2)
     print(json.dumps(result,indent=2))

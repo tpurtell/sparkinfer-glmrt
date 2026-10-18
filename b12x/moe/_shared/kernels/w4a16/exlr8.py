@@ -80,12 +80,14 @@ class Exlr8A16Kernel:
     # runtime); it never changes results, only how many tasks run at once.
     CTAS_PER_SM = 4
     # Mixed-width schedules. "static" walks tasks in group order; "balanced"
-    # first sorts them by width class in shared memory (heavy first), so the
+    # first sorts groups by width class in shared memory (heavy first), so the
     # grid stride samples every class evenly when a manifest mixes K2/K3/K4
-    # experts. The balanced path is used only at >= balanced_min_groups, where
-    # a grid-stride class can no longer pin one group order; both paths run
-    # identical per-element arithmetic, so results are bitwise unchanged.
-    SCHEDULES = ("static", "balanced")
+    # experts. "identity" runs the same group table unsorted: same kernel
+    # mechanics, natural order, so a static-vs-identity delta is the sorted
+    # table's whole effect. The table path is used only at >=
+    # balanced_min_groups; every path runs identical per-element arithmetic,
+    # so results are bitwise unchanged.
+    SCHEDULES = ("static", "balanced", "identity")
 
     def __init__(self, hidden_size: int, units_per_expert: int, top_k: int,
                  max_groups: int, fast_math: bool = True,
@@ -102,15 +104,19 @@ class Exlr8A16Kernel:
         self.max_groups = int(max_groups)
         self.fast_math = bool(fast_math)
         self.schedule = str(schedule)
-        self.balanced = self.schedule == "balanced"
+        # static=0 keeps the plain group order; 1 sorts the group table by
+        # width class; 2 fills the same table in natural order.
+        self.mode = {"static": 0, "balanced": 1, "identity": 2}[self.schedule]
+        self.balanced = self.mode != 0
         self.balanced_min_groups = int(balanced_min_groups)
         self.blocks = hidden_size // 128
         self.splits = (self.blocks + 7) // 8
-        # Width-class task tables, sized for the capacity the caller compiles:
-        # fc1 sorts (group, unit, projection) pairs over four classes, fc2
-        # sorts groups over nine buckets of summed down-projection width.
-        self.fc1_classes = 4
-        self.fc1_table_words = self.max_groups * self.units * 2
+        # Width-class group tables, sized for the capacity the caller compiles.
+        # fc1 orders groups by summed gate+up width over five coarse classes;
+        # group granularity keeps the table at one word per group, so the
+        # sorted path costs no more shared memory than the unsorted one.
+        self.fc1_classes = 5
+        self.fc1_table_words = self.max_groups
         self.fc1_starts_word = self.fc1_table_words
         self.fc1_totals_word = self.fc1_starts_word + self.fc1_classes * 128
         self.fc1_smem_words = self.fc1_totals_word + self.fc1_classes
@@ -138,13 +144,13 @@ class Exlr8A16Kernel:
                 if cutlass.const_expr(self.balanced):
                     if groups >= Int32(self.balanced_min_groups):
                         self._launch(x, pointers, bits, group_expert, route_slots, fc1,
-                                     intermediate, fc2, rows, groups, cta_limit, stream, True)
+                                     intermediate, fc2, rows, groups, cta_limit, stream, self.mode)
                     else:
                         self._launch(x, pointers, bits, group_expert, route_slots, fc1,
-                                     intermediate, fc2, rows, groups, cta_limit, stream, False)
+                                     intermediate, fc2, rows, groups, cta_limit, stream, 0)
                 else:
                     self._launch(x, pointers, bits, group_expert, route_slots, fc1,
-                                 intermediate, fc2, rows, groups, cta_limit, stream, False)
+                                 intermediate, fc2, rows, groups, cta_limit, stream, 0)
             self.reduce_kernel(route_group_lane, route_weights, fc2, output,
                                rows, groups).launch(
                 grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),
@@ -154,29 +160,29 @@ class Exlr8A16Kernel:
     def _launch(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
                 group_expert: cute.Tensor, route_slots: cute.Tensor, fc1: cute.Tensor,
                 intermediate: cute.Tensor, fc2: cute.Tensor, rows: Int32, groups: Int32,
-                cta_limit: Int32, stream: cuda.CUstream, balanced: cutlass.Constexpr):
-        if cutlass.const_expr(balanced):
-            self.fc1_balanced_kernel(x, pointers, bits, group_expert, route_slots,
-                                     fc1, rows, groups).launch(
+                cta_limit: Int32, stream: cuda.CUstream, mode: cutlass.Constexpr):
+        if cutlass.const_expr(mode == 0):
+            self.fc1_kernel(x, pointers, bits, group_expert, route_slots,
+                            fc1, rows, groups).launch(
                 grid=(min(groups * Int32(self.units * 2 * self.splits), cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
         else:
-            self.fc1_kernel(x, pointers, bits, group_expert, route_slots,
-                            fc1, rows, groups).launch(
+            self.fc1_balanced_kernel(x, pointers, bits, group_expert, route_slots,
+                                     fc1, rows, groups, mode == 1).launch(
                 grid=(min(groups * Int32(self.units * 2 * self.splits), cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
         self.activation_kernel(pointers, bits, group_expert, route_slots,
                                fc1, intermediate, rows, groups).launch(
             grid=(min(groups * Int32(self.units), cta_limit), 1, 1),
             block=(128, 1, 1), stream=stream)
-        if cutlass.const_expr(balanced):
-            self.fc2_balanced_kernel(pointers, bits, group_expert, route_slots, intermediate,
-                                     fc2, rows, groups).launch(
+        if cutlass.const_expr(mode == 0):
+            self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
+                            fc2, rows, groups).launch(
                 grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
         else:
-            self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
-                            fc2, rows, groups).launch(
+            self.fc2_balanced_kernel(pointers, bits, group_expert, route_slots, intermediate,
+                                     fc2, rows, groups, mode == 1).launch(
                 grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
 
@@ -277,85 +283,89 @@ class Exlr8A16Kernel:
     @cute.jit
     def _class_bucket(self, kind: cutlass.Constexpr, index: Int32,
                       group_expert: cute.Tensor, bits: cute.Tensor):
-        """Width class of one task: fc1 pairs by projection width (0 heaviest),
-        fc2 groups by summed down width in two-channel steps (0 heaviest)."""
+        """Width class of one group: fc1 by summed gate+up width in steps of
+        four (0 heaviest), fc2 by summed down width in steps of two."""
+        expert = group_expert[index]
         if cutlass.const_expr(kind == 0):
-            group = index // Int32(self.units * 2)
-            rem = index % Int32(self.units * 2)
-            expert = group_expert[group]
-            width = bits[(expert.to(Int64) * Int64(self.units) + (rem >> Int32(1)).to(Int64))
-                         * Int64(3) + (rem & Int32(1)).to(Int64)]
-            bucket = Int32(3)
-            if width == Int32(4):
-                bucket = Int32(0)
-            elif width == Int32(3):
-                bucket = Int32(1)
-            elif width == Int32(2):
-                bucket = Int32(2)
+            total = Int32(0)
+            for unit in cutlass.range_constexpr(self.units):
+                for proj in cutlass.range_constexpr(2):
+                    total = total + bits[(expert.to(Int64) * Int64(self.units) + Int64(unit))
+                                         * Int64(3) + Int64(proj)]
+            bucket = (Int32(4 * self.units * 2) - total) // Int32(4)
+            if bucket > Int32(self.fc1_classes - 1):
+                bucket = Int32(self.fc1_classes - 1)
         else:
-            expert = group_expert[index]
             weight = Int32(0)
             for unit in cutlass.range_constexpr(self.units):
                 weight = weight + bits[(expert.to(Int64) * Int64(self.units) + Int64(unit))
                                        * Int64(3) + Int64(2)]
             bucket = (Int32(16) - weight) // Int32(2)
+            if bucket > Int32(self.fc2_classes - 1):
+                bucket = Int32(self.fc2_classes - 1)
         return bucket
 
     @cute.jit
     def _fill_class_table(self, kind: cutlass.Constexpr, nclass: cutlass.Constexpr,
                           base: Int32, starts_word: cutlass.Constexpr,
                           totals_word: cutlass.Constexpr, group_expert: cute.Tensor,
-                          bits: cute.Tensor, groups: Int32, tid: Int32):
-        """Sort live task indices into width classes in shared memory, heaviest
-        class first, so a grid stride over the table samples classes evenly.
+                          bits: cute.Tensor, groups: Int32, tid: Int32,
+                          sorted: cutlass.Constexpr):
+        """Build the group table in shared memory.
 
-        The order is a deterministic function of the live group count and the
-        per-task widths alone: each lane's ranks are a stable scan over the
+        Sorted: live groups by width class, heaviest class first, so a grid
+        stride over the table samples classes evenly. Unsorted: identity, the
+        same kernel mechanics and natural group order (a control arm). The
+        order is a deterministic function of the live group count and the
+        per-group widths alone: each lane's ranks are a stable scan over the
         thread-major index order, so it never depends on the grid or on which
         CTA reads them (only per-element arithmetic has to stay fixed).
         """
-        if cutlass.const_expr(kind == 0):
-            entries = groups * Int32(self.units * 2)
+        if cutlass.const_expr(sorted):
+            counts = cute.make_rmem_tensor(nclass, Int32)
+            counts.fill(Int32(0))
+            index = tid
+            while index < groups:
+                bucket = self._class_bucket(kind, index, group_expert, bits)
+                for c in cutlass.range_constexpr(nclass):
+                    if bucket == Int32(c):
+                        counts[c] = counts[c] + Int32(1)
+                index += Int32(128)
+            for c in cutlass.range_constexpr(nclass):
+                st_shared_u32(base + Int32((starts_word + tid * nclass + c) * 4),
+                              counts[c].to(Uint32))
+            cute.arch.sync_threads()
+            # One lane per class turns its per-lane counts into exclusive starts.
+            if tid < Int32(nclass):
+                running = Int32(0)
+                for t in cutlass.range_constexpr(128):
+                    addr = base + Int32((starts_word + t * nclass) * 4) + tid * Int32(4)
+                    value = ld_shared_u32(addr)
+                    st_shared_u32(addr, running.to(Uint32))
+                    running = running + value.to(Int32)
+                st_shared_u32(base + Int32(totals_word * 4) + tid * Int32(4), running.to(Uint32))
+            cute.arch.sync_threads()
+            cursor = cute.make_rmem_tensor(nclass, Int32)
+            offset = Int32(0)
+            for c in cutlass.range_constexpr(nclass):
+                cursor[c] = offset + ld_shared_u32(
+                    base + Int32((starts_word + tid * nclass + c) * 4)).to(Int32)
+                offset = offset + ld_shared_u32(base + Int32((totals_word + c) * 4)).to(Int32)
+            index = tid
+            while index < groups:
+                bucket = self._class_bucket(kind, index, group_expert, bits)
+                for c in cutlass.range_constexpr(nclass):
+                    if bucket == Int32(c):
+                        st_shared_u32(base + cursor[c] * Int32(4), index.to(Uint32))
+                        cursor[c] = cursor[c] + Int32(1)
+                index += Int32(128)
+            cute.arch.sync_threads()
         else:
-            entries = groups
-        counts = cute.make_rmem_tensor(nclass, Int32)
-        counts.fill(Int32(0))
-        index = tid
-        while index < entries:
-            bucket = self._class_bucket(kind, index, group_expert, bits)
-            for c in cutlass.range_constexpr(nclass):
-                if bucket == Int32(c):
-                    counts[c] = counts[c] + Int32(1)
-            index += Int32(128)
-        for c in cutlass.range_constexpr(nclass):
-            st_shared_u32(base + Int32((starts_word + tid * nclass + c) * 4),
-                          counts[c].to(Uint32))
-        cute.arch.sync_threads()
-        # One lane per class turns its per-lane counts into exclusive starts.
-        if tid < Int32(nclass):
-            running = Int32(0)
-            for t in cutlass.range_constexpr(128):
-                addr = base + Int32((starts_word + t * nclass) * 4) + tid * Int32(4)
-                value = ld_shared_u32(addr)
-                st_shared_u32(addr, running.to(Uint32))
-                running = running + value.to(Int32)
-            st_shared_u32(base + Int32(totals_word * 4) + tid * Int32(4), running.to(Uint32))
-        cute.arch.sync_threads()
-        cursor = cute.make_rmem_tensor(nclass, Int32)
-        offset = Int32(0)
-        for c in cutlass.range_constexpr(nclass):
-            cursor[c] = offset + ld_shared_u32(
-                base + Int32((starts_word + tid * nclass + c) * 4)).to(Int32)
-            offset = offset + ld_shared_u32(base + Int32((totals_word + c) * 4)).to(Int32)
-        index = tid
-        while index < entries:
-            bucket = self._class_bucket(kind, index, group_expert, bits)
-            for c in cutlass.range_constexpr(nclass):
-                if bucket == Int32(c):
-                    st_shared_u32(base + cursor[c] * Int32(4), index.to(Uint32))
-                    cursor[c] = cursor[c] + Int32(1)
-            index += Int32(128)
-        cute.arch.sync_threads()
+            index = tid
+            while index < groups:
+                st_shared_u32(base + index * Int32(4), index.to(Uint32))
+                index += Int32(128)
+            cute.arch.sync_threads()
 
     @cute.kernel
     def fc1_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -377,7 +387,8 @@ class Exlr8A16Kernel:
     @cute.kernel
     def fc1_balanced_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
                             group_expert: cute.Tensor, route_slots: cute.Tensor,
-                            fc1: cute.Tensor, rows: Int32, groups: Int32):
+                            fc1: cute.Tensor, rows: Int32, groups: Int32,
+                            sorted: cutlass.Constexpr):
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
@@ -392,14 +403,19 @@ class Exlr8A16Kernel:
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
         self._fill_class_table(0, self.fc1_classes, base, self.fc1_starts_word,
-                               self.fc1_totals_word, group_expert, bits, groups, Int32(tid))
-        # pair ranks, heaviest class first; each pair keeps its own split block
+                               self.fc1_totals_word, group_expert, bits, groups,
+                               Int32(tid), sorted)
+        # group ranks, heaviest gate+up classes first; a group keeps its own
+        # (unit, projection) split block inside the task stream.
         while task < groups * Int32(self.units * 2 * self.splits):
-            pair = Int32(ld_shared_u32(base + (task // Int32(self.splits)) * Int32(4)))
+            position = task // Int32(self.splits)
             split = task % Int32(self.splits)
+            rem = position % Int32(self.units * 2)
+            group = Int32(ld_shared_u32(
+                base + (position // Int32(self.units * 2)) * Int32(4)))
+            pair = group * Int32(self.units * 2) + rem
             proj = pair % Int32(2)
             unit = (pair // Int32(2)) % Int32(self.units)
-            group = pair // Int32(self.units * 2)
             self._fc1_task(pair * Int32(self.splits) + split, group, unit, proj, split,
                            x, pointers, bits, group_expert, route_slots, fc1, rows, lane, warp)
             task += step
@@ -507,7 +523,7 @@ class Exlr8A16Kernel:
     def fc2_balanced_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
                             group_expert: cute.Tensor, route_slots: cute.Tensor,
                             intermediate: cute.Tensor, fc2: cute.Tensor,
-                            rows: Int32, groups: Int32):
+                            rows: Int32, groups: Int32, sorted: cutlass.Constexpr):
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
@@ -522,7 +538,8 @@ class Exlr8A16Kernel:
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
         self._fill_class_table(1, self.fc2_classes, base, self.fc2_starts_word,
-                               self.fc2_totals_word, group_expert, bits, groups, Int32(tid))
+                               self.fc2_totals_word, group_expert, bits, groups,
+                               Int32(tid), sorted)
         # group ranks, heaviest summed down width first
         while task < groups * Int32(self.blocks):
             group = Int32(ld_shared_u32(base + (task // Int32(self.blocks)) * Int32(4)))

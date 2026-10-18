@@ -21,8 +21,8 @@ def geometry(hidden=6144, units=16, top_k=8, max_groups=512,
     values = (hidden, units, top_k, max_groups)
     if any(type(v) is not int or v <= 0 or v > 2**31 - 1 for v in values) or hidden % 128:
         raise ValueError("EXLR8 requires positive int32 geometry and hidden % 128 == 0")
-    if schedule not in ("static", "balanced"):
-        raise ValueError("EXLR8 schedule must be 'static' or 'balanced'")
+    if schedule not in ("static", "balanced", "identity"):
+        raise ValueError("EXLR8 schedule must be 'static', 'balanced' or 'identity'")
     result = dict(abi_version=ABI_VERSION, hidden=hidden, units=units, top_k=top_k,
                   max_groups=max_groups, max_rows=64, split_k_blocks=8,
                   fc1_splits=(hidden + 1023) // 1024, ctas_per_sm=CTAS_PER_SM,
