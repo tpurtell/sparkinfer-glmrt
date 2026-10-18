@@ -16,13 +16,17 @@ POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
             "route_group_lane", "route_weights", "fc1", "intermediate", "fc2", "output")
 
 
-def geometry(hidden=6144, units=16, top_k=8, max_groups=512):
+def geometry(hidden=6144, units=16, top_k=8, max_groups=512,
+             schedule="balanced", balanced_min_groups=24):
     values = (hidden, units, top_k, max_groups)
     if any(type(v) is not int or v <= 0 or v > 2**31 - 1 for v in values) or hidden % 128:
         raise ValueError("EXLR8 requires positive int32 geometry and hidden % 128 == 0")
+    if schedule not in ("static", "balanced"):
+        raise ValueError("EXLR8 schedule must be 'static' or 'balanced'")
     result = dict(abi_version=ABI_VERSION, hidden=hidden, units=units, top_k=top_k,
                   max_groups=max_groups, max_rows=64, split_k_blocks=8,
-                  fc1_splits=(hidden + 1023) // 1024, ctas_per_sm=CTAS_PER_SM)
+                  fc1_splits=(hidden + 1023) // 1024, ctas_per_sm=CTAS_PER_SM,
+                  schedule=str(schedule), balanced_min_groups=int(balanced_min_groups))
     tasks = (max_groups * units * 2 * result["fc1_splits"],
              max_groups * units, max_groups * (hidden // 128), 64 * (hidden // 128))
     # Grid-stride increments may reach almost twice the task count before exiting.
@@ -43,7 +47,9 @@ def scratch_bytes(g):
 class _Exlr8Pointers:
     def __init__(self, g):
         from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
-        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"], g["max_groups"])
+        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"], g["max_groups"],
+                                   schedule=g["schedule"],
+                                   balanced_min_groups=g["balanced_min_groups"])
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -66,8 +72,9 @@ class _Exlr8Pointers:
                   cute.make_tensor(output, cute.make_layout(1, stride=1)), rows, groups, cta_limit, stream)
 
 
-def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512):
-    g = geometry(hidden, units, top_k, max_groups)
+def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
+                          schedule="balanced", balanced_min_groups=24):
+    g = geometry(hidden, units, top_k, max_groups, schedule, balanced_min_groups)
     h, u, t, m, s = (g[k] for k in ("hidden", "units", "top_k", "max_groups", "fc1_splits"))
     operands = (
         Operand("x", torch.float16, f"[rows,{h}]"),
@@ -85,6 +92,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512):
     sizes = scratch_bytes(g)
     return compile_program(_Exlr8Pointers(g), name="exlr8_a16_decode", operands=operands,
                            scalars=tuple(Scalar(n) for n in ("rows", "groups", "cta_limit")),
-                           key=(h, u, t, m, ABI_VERSION), geometry=g,
+                           key=(h, u, t, m, ABI_VERSION, g["schedule"], g["balanced_min_groups"]),
+                           geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)

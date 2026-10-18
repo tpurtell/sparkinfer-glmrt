@@ -75,6 +75,26 @@ def test_rows_groups_packing_cta_invariance(case):
             assert torch.isnan(case.output[rows:]).all(), "writes past live rows"
 
 
+def test_schedule_bitwise_invariance(case):
+    # The width-class table only reorders tasks; per-element math is untouched.
+    # 64 rows at chunk 1 fills the pair table exactly (128 groups * 3 units * 2).
+    from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
+    static = compile_exlr8_a16_aot(hidden=case.h, units=case.u, top_k=case.topk,
+                                   max_groups=case.max_groups, schedule="static")
+    balanced = compile_exlr8_a16_aot(hidden=case.h, units=case.u, top_k=case.topk,
+                                     max_groups=case.max_groups, schedule="balanced",
+                                     balanced_min_groups=1)
+    for rows, chunk in ((16, 16), (64, 16), (64, 1)):
+        case.routing(rows, chunk=chunk)
+        launch(case, static, rows)
+        expected = case.output[:rows].clone()
+        for limit in (1, 48, 188):
+            case.output.fill_(float("nan"))
+            launch(case, balanced, rows, limit)
+            assert torch.equal(case.output[:rows].view(torch.int32),
+                               expected.view(torch.int32)), (rows, chunk, limit)
+
+
 def test_graph_replay_exact(case):
     compiled = program(case)
     case.routing(16)

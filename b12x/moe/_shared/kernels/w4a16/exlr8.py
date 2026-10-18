@@ -11,6 +11,7 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils
 from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -20,7 +21,10 @@ from b12x._lib.intrinsics import (
     half2_to_float2_scaled,
     ld_global_b16,
     ld_global_nc_u32,
+    ld_shared_u32,
     packed_dequant_trellis_to_half2x4,
+    shared_ptr_to_u32,
+    st_shared_u32,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
@@ -75,25 +79,52 @@ class Exlr8A16Kernel:
     # the caller's cta_limit should be sm_count * CTAS_PER_SM (cudaDevAttr at
     # runtime); it never changes results, only how many tasks run at once.
     CTAS_PER_SM = 4
+    # Mixed-width schedules. "static" walks tasks in group order; "balanced"
+    # first sorts them by width class in shared memory (heavy first), so the
+    # grid stride samples every class evenly when a manifest mixes K2/K3/K4
+    # experts. The balanced path is used only at >= balanced_min_groups, where
+    # a grid-stride class can no longer pin one group order; both paths run
+    # identical per-element arithmetic, so results are bitwise unchanged.
+    SCHEDULES = ("static", "balanced")
 
     def __init__(self, hidden_size: int, units_per_expert: int, top_k: int,
-                 max_groups: int, fast_math: bool = True):
+                 max_groups: int, fast_math: bool = True,
+                 schedule: str = "balanced", balanced_min_groups: int = 24):
         if hidden_size <= 0 or hidden_size % 128:
             raise ValueError("EXLR8 hidden_size must be a positive multiple of 128")
         if min(units_per_expert, top_k, max_groups) < 1:
             raise ValueError("EXLR8 units, top_k and group capacity must be positive")
+        if schedule not in self.SCHEDULES:
+            raise ValueError(f"EXLR8 schedule must be one of {self.SCHEDULES}")
         self.hidden_size = int(hidden_size)
         self.units = int(units_per_expert)
         self.top_k = int(top_k)
         self.max_groups = int(max_groups)
         self.fast_math = bool(fast_math)
+        self.schedule = str(schedule)
+        self.balanced = self.schedule == "balanced"
+        self.balanced_min_groups = int(balanced_min_groups)
         self.blocks = hidden_size // 128
         self.splits = (self.blocks + 7) // 8
+        # Width-class task tables, sized for the capacity the caller compiles:
+        # fc1 sorts (group, unit, projection) pairs over four classes, fc2
+        # sorts groups over nine buckets of summed down-projection width.
+        self.fc1_classes = 4
+        self.fc1_table_words = self.max_groups * self.units * 2
+        self.fc1_starts_word = self.fc1_table_words
+        self.fc1_totals_word = self.fc1_starts_word + self.fc1_classes * 128
+        self.fc1_smem_words = self.fc1_totals_word + self.fc1_classes
+        self.fc2_classes = 9
+        self.fc2_table_words = self.max_groups
+        self.fc2_starts_word = self.fc2_table_words
+        self.fc2_totals_word = self.fc2_starts_word + self.fc2_classes * 128
+        self.fc2_smem_words = self.fc2_totals_word + self.fc2_classes
 
     @property
     def __cache_key__(self):
         return ("exlr8_a16", self.ABI_VERSION, self.CODE_VERSION, self.hidden_size, self.units,
-                self.top_k, self.max_groups, self.fast_math)
+                self.top_k, self.max_groups, self.fast_math, self.schedule,
+                self.balanced_min_groups)
 
     @cute.jit
     def __call__(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -104,22 +135,50 @@ class Exlr8A16Kernel:
                  cta_limit: Int32, stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(64) and groups >= Int32(0) and groups <= Int32(self.max_groups) and cta_limit > Int32(0):
             if groups > Int32(0):
-                self.fc1_kernel(x, pointers, bits, group_expert, route_slots,
-                                fc1, rows, groups).launch(
-                    grid=(min(groups * Int32(self.units * 2 * self.splits), cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-                self.activation_kernel(pointers, bits, group_expert, route_slots,
-                                       fc1, intermediate, rows, groups).launch(
-                    grid=(min(groups * Int32(self.units), cta_limit), 1, 1),
-                    block=(128, 1, 1), stream=stream)
-                self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
-                                fc2, rows, groups).launch(
-                    grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+                if cutlass.const_expr(self.balanced):
+                    if groups >= Int32(self.balanced_min_groups):
+                        self._launch(x, pointers, bits, group_expert, route_slots, fc1,
+                                     intermediate, fc2, rows, groups, cta_limit, stream, True)
+                    else:
+                        self._launch(x, pointers, bits, group_expert, route_slots, fc1,
+                                     intermediate, fc2, rows, groups, cta_limit, stream, False)
+                else:
+                    self._launch(x, pointers, bits, group_expert, route_slots, fc1,
+                                 intermediate, fc2, rows, groups, cta_limit, stream, False)
             self.reduce_kernel(route_group_lane, route_weights, fc2, output,
                                rows, groups).launch(
                 grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),
                 block=(128, 1, 1), stream=stream)
+
+    @cute.jit
+    def _launch(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
+                group_expert: cute.Tensor, route_slots: cute.Tensor, fc1: cute.Tensor,
+                intermediate: cute.Tensor, fc2: cute.Tensor, rows: Int32, groups: Int32,
+                cta_limit: Int32, stream: cuda.CUstream, balanced: cutlass.Constexpr):
+        if cutlass.const_expr(balanced):
+            self.fc1_balanced_kernel(x, pointers, bits, group_expert, route_slots,
+                                     fc1, rows, groups).launch(
+                grid=(min(groups * Int32(self.units * 2 * self.splits), cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+        else:
+            self.fc1_kernel(x, pointers, bits, group_expert, route_slots,
+                            fc1, rows, groups).launch(
+                grid=(min(groups * Int32(self.units * 2 * self.splits), cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+        self.activation_kernel(pointers, bits, group_expert, route_slots,
+                               fc1, intermediate, rows, groups).launch(
+            grid=(min(groups * Int32(self.units), cta_limit), 1, 1),
+            block=(128, 1, 1), stream=stream)
+        if cutlass.const_expr(balanced):
+            self.fc2_balanced_kernel(pointers, bits, group_expert, route_slots, intermediate,
+                                     fc2, rows, groups).launch(
+                grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
+        else:
+            self.fc2_kernel(pointers, bits, group_expert, route_slots, intermediate,
+                            fc2, rows, groups).launch(
+                grid=(min(groups * Int32(self.blocks), cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
 
     @cute.jit
     def _mma_block(self, payload: Int64, a_address: Int64,
@@ -172,6 +231,132 @@ class Exlr8A16Kernel:
             for v in cutlass.range_constexpr(4):
                 total[n, v] = total[n, v] + acc[n, v] * scale
 
+    @cute.jit
+    def _fc1_task(self, local: Int32, group: Int32, unit: Int32, proj: Int32,
+                  split: Int32, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
+                  group_expert: cute.Tensor, route_slots: cute.Tensor, fc1: cute.Tensor,
+                  rows: Int32, lane: Int32, warp: Int32):
+        """One fc1 partial sum; local is the caller's scratch task index."""
+        expert = group_expert[group]
+        desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
+        width = bits[desc]
+        total = cute.make_rmem_tensor((4, 4), Float32)
+        total.fill(Float32(0.0))
+        r = lane // Int32(4)
+        slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
+        slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+        row0, row1 = Int32(-1), Int32(-1)
+        if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
+            row0 = slot0 // Int32(self.top_k)
+        if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
+            row1 = slot1 // Int32(self.top_k)
+        if width != Int32(0):
+            payload = pointers[desc * Int64(3)]
+            scales = pointers[desc * Int64(3) + Int64(2)]
+            for block in cutlass.range(8):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.blocks):
+                    scale = _side_value(scales, kb)
+                    if width == Int32(2):
+                        self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
+                            self.hidden_size, kb, Int32(0), lane, warp, 2, False, scale)
+                    elif width == Int32(3):
+                        self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
+                            self.hidden_size, kb, Int32(0), lane, warp, 3, False, scale)
+                    elif width == Int32(4):
+                        self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
+                            self.hidden_size, kb, Int32(0), lane, warp, 4, False, scale)
+        for n in cutlass.range_constexpr(4):
+            col = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
+            base = local.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)
+            if width != Int32(0) and row0 >= Int32(0):
+                fc1[base], fc1[base + Int64(1)] = total[n, 0], total[n, 1]
+            if width != Int32(0) and row1 >= Int32(0):
+                fc1[base + Int64(8 * 128)], fc1[base + Int64(8 * 128 + 1)] = total[n, 2], total[n, 3]
+
+    @cute.jit
+    def _class_bucket(self, kind: cutlass.Constexpr, index: Int32,
+                      group_expert: cute.Tensor, bits: cute.Tensor):
+        """Width class of one task: fc1 pairs by projection width (0 heaviest),
+        fc2 groups by summed down width in two-channel steps (0 heaviest)."""
+        if cutlass.const_expr(kind == 0):
+            group = index // Int32(self.units * 2)
+            rem = index % Int32(self.units * 2)
+            expert = group_expert[group]
+            width = bits[(expert.to(Int64) * Int64(self.units) + (rem >> Int32(1)).to(Int64))
+                         * Int64(3) + (rem & Int32(1)).to(Int64)]
+            bucket = Int32(3)
+            if width == Int32(4):
+                bucket = Int32(0)
+            elif width == Int32(3):
+                bucket = Int32(1)
+            elif width == Int32(2):
+                bucket = Int32(2)
+        else:
+            expert = group_expert[index]
+            weight = Int32(0)
+            for unit in cutlass.range_constexpr(self.units):
+                weight = weight + bits[(expert.to(Int64) * Int64(self.units) + Int64(unit))
+                                       * Int64(3) + Int64(2)]
+            bucket = (Int32(16) - weight) // Int32(2)
+        return bucket
+
+    @cute.jit
+    def _fill_class_table(self, kind: cutlass.Constexpr, nclass: cutlass.Constexpr,
+                          base: Int32, starts_word: cutlass.Constexpr,
+                          totals_word: cutlass.Constexpr, group_expert: cute.Tensor,
+                          bits: cute.Tensor, groups: Int32, tid: Int32):
+        """Sort live task indices into width classes in shared memory, heaviest
+        class first, so a grid stride over the table samples classes evenly.
+
+        The order is a deterministic function of the live group count and the
+        per-task widths alone: each lane's ranks are a stable scan over the
+        thread-major index order, so it never depends on the grid or on which
+        CTA reads them (only per-element arithmetic has to stay fixed).
+        """
+        if cutlass.const_expr(kind == 0):
+            entries = groups * Int32(self.units * 2)
+        else:
+            entries = groups
+        counts = cute.make_rmem_tensor(nclass, Int32)
+        counts.fill(Int32(0))
+        index = tid
+        while index < entries:
+            bucket = self._class_bucket(kind, index, group_expert, bits)
+            for c in cutlass.range_constexpr(nclass):
+                if bucket == Int32(c):
+                    counts[c] = counts[c] + Int32(1)
+            index += Int32(128)
+        for c in cutlass.range_constexpr(nclass):
+            st_shared_u32(base + Int32((starts_word + tid * nclass + c) * 4),
+                          counts[c].to(Uint32))
+        cute.arch.sync_threads()
+        # One lane per class turns its per-lane counts into exclusive starts.
+        if tid < Int32(nclass):
+            running = Int32(0)
+            for t in cutlass.range_constexpr(128):
+                addr = base + Int32((starts_word + t * nclass) * 4) + tid * Int32(4)
+                value = ld_shared_u32(addr)
+                st_shared_u32(addr, running.to(Uint32))
+                running = running + value.to(Int32)
+            st_shared_u32(base + Int32(totals_word * 4) + tid * Int32(4), running.to(Uint32))
+        cute.arch.sync_threads()
+        cursor = cute.make_rmem_tensor(nclass, Int32)
+        offset = Int32(0)
+        for c in cutlass.range_constexpr(nclass):
+            cursor[c] = offset + ld_shared_u32(
+                base + Int32((starts_word + tid * nclass + c) * 4)).to(Int32)
+            offset = offset + ld_shared_u32(base + Int32((totals_word + c) * 4)).to(Int32)
+        index = tid
+        while index < entries:
+            bucket = self._class_bucket(kind, index, group_expert, bits)
+            for c in cutlass.range_constexpr(nclass):
+                if bucket == Int32(c):
+                    st_shared_u32(base + cursor[c] * Int32(4), index.to(Uint32))
+                    cursor[c] = cursor[c] + Int32(1)
+            index += Int32(128)
+        cute.arch.sync_threads()
+
     @cute.kernel
     def fc1_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
                    group_expert: cute.Tensor, route_slots: cute.Tensor,
@@ -185,42 +370,38 @@ class Exlr8A16Kernel:
             proj = (task // Int32(self.splits)) % Int32(2)
             unit = (task // Int32(2 * self.splits)) % Int32(self.units)
             group = task // Int32(self.units * 2 * self.splits)
-            expert = group_expert[group]
-            desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
-            width = bits[desc]
-            total = cute.make_rmem_tensor((4, 4), Float32)
-            total.fill(Float32(0.0))
-            r = lane // Int32(4)
-            slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
-            slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-            row0, row1 = Int32(-1), Int32(-1)
-            if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
-                row0 = slot0 // Int32(self.top_k)
-            if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
-                row1 = slot1 // Int32(self.top_k)
-            if width != Int32(0):
-                payload = pointers[desc * Int64(3)]
-                scales = pointers[desc * Int64(3) + Int64(2)]
-                for block in cutlass.range(8):
-                    kb = split * Int32(8) + block
-                    if kb < Int32(self.blocks):
-                        scale = _side_value(scales, kb)
-                        if width == Int32(2):
-                            self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 2, False, scale)
-                        elif width == Int32(3):
-                            self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 3, False, scale)
-                        elif width == Int32(4):
-                            self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 4, False, scale)
-            for n in cutlass.range_constexpr(4):
-                col = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
-                base = task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)
-                if width != Int32(0) and row0 >= Int32(0):
-                    fc1[base], fc1[base + Int64(1)] = total[n, 0], total[n, 1]
-                if width != Int32(0) and row1 >= Int32(0):
-                    fc1[base + Int64(8 * 128)], fc1[base + Int64(8 * 128 + 1)] = total[n, 2], total[n, 3]
+            self._fc1_task(task, group, unit, proj, split, x, pointers, bits,
+                           group_expert, route_slots, fc1, rows, lane, warp)
+            task += step
+
+    @cute.kernel
+    def fc1_balanced_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
+                            group_expert: cute.Tensor, route_slots: cute.Tensor,
+                            fc1: cute.Tensor, rows: Int32, groups: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.fc1_smem_words], 1024]
+
+        storage = smem.allocate(Storage)
+        base = shared_ptr_to_u32(storage.words.data_ptr())
+        self._fill_class_table(0, self.fc1_classes, base, self.fc1_starts_word,
+                               self.fc1_totals_word, group_expert, bits, groups, Int32(tid))
+        # pair ranks, heaviest class first; each pair keeps its own split block
+        while task < groups * Int32(self.units * 2 * self.splits):
+            pair = Int32(ld_shared_u32(base + (task // Int32(self.splits)) * Int32(4)))
+            split = task % Int32(self.splits)
+            proj = pair % Int32(2)
+            unit = (pair // Int32(2)) % Int32(self.units)
+            group = pair // Int32(self.units * 2)
+            self._fc1_task(pair * Int32(self.splits) + split, group, unit, proj, split,
+                           x, pointers, bits, group_expert, route_slots, fc1, rows, lane, warp)
             task += step
 
     @cute.kernel
@@ -266,6 +447,47 @@ class Exlr8A16Kernel:
                         intermediate[base + Int64(v)] = g[v].to(cutlass.Float16)
             task += step
 
+    @cute.jit
+    def _fc2_task(self, group: Int32, block: Int32, pointers: cute.Tensor,
+                  bits: cute.Tensor, group_expert: cute.Tensor, route_slots: cute.Tensor,
+                  intermediate: cute.Tensor, fc2: cute.Tensor, rows: Int32,
+                  lane: Int32, warp: Int32):
+        """One fc2 output block for one group, summed over every unit."""
+        expert = group_expert[group]
+        total = cute.make_rmem_tensor((4, 4), Float32)
+        total.fill(Float32(0.0))
+        r = lane // Int32(4)
+        slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
+        slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+        row0, row1 = Int32(-1), Int32(-1)
+        if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
+            row0 = r
+        if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
+            row1 = r + Int32(8)
+        for unit in cutlass.range(self.units):
+            desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
+            width = bits[desc]
+            if width != Int32(0):
+                payload = pointers[desc * Int64(3)]
+                scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
+                addr = intermediate.iterator.toint() + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
+                if width == Int32(2):
+                    self._accumulate_block(total, payload, addr, row0, row1, 128,
+                        Int32(0), block, lane, warp, 2, True, scale)
+                elif width == Int32(3):
+                    self._accumulate_block(total, payload, addr, row0, row1, 128,
+                        Int32(0), block, lane, warp, 3, True, scale)
+                elif width == Int32(4):
+                    self._accumulate_block(total, payload, addr, row0, row1, 128,
+                        Int32(0), block, lane, warp, 4, True, scale)
+        for n in cutlass.range_constexpr(4):
+            col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
+            base = (group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
+            if row0 >= Int32(0):
+                fc2[base], fc2[base + Int64(1)] = total[n, 0], total[n, 1]
+            if row1 >= Int32(0):
+                fc2[base + Int64(8 * self.hidden_size)], fc2[base + Int64(8 * self.hidden_size + 1)] = total[n, 2], total[n, 3]
+
     @cute.kernel
     def fc2_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
                    group_expert: cute.Tensor, route_slots: cute.Tensor,
@@ -277,40 +499,36 @@ class Exlr8A16Kernel:
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
         while task < groups * Int32(self.blocks):
             group, block = task // Int32(self.blocks), task % Int32(self.blocks)
-            expert = group_expert[group]
-            total = cute.make_rmem_tensor((4, 4), Float32)
-            total.fill(Float32(0.0))
-            r = lane // Int32(4)
-            slot0 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64)]
-            slot1 = route_slots[group.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-            row0, row1 = Int32(-1), Int32(-1)
-            if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
-                row0 = r
-            if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
-                row1 = r + Int32(8)
-            for unit in cutlass.range(self.units):
-                desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
-                width = bits[desc]
-                if width != Int32(0):
-                    payload = pointers[desc * Int64(3)]
-                    scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
-                    addr = intermediate.iterator.toint() + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
-                    if width == Int32(2):
-                        self._accumulate_block(total, payload, addr, row0, row1, 128,
-                            Int32(0), block, lane, warp, 2, True, scale)
-                    elif width == Int32(3):
-                        self._accumulate_block(total, payload, addr, row0, row1, 128,
-                            Int32(0), block, lane, warp, 3, True, scale)
-                    elif width == Int32(4):
-                        self._accumulate_block(total, payload, addr, row0, row1, 128,
-                            Int32(0), block, lane, warp, 4, True, scale)
-            for n in cutlass.range_constexpr(4):
-                col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
-                base = (group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
-                if row0 >= Int32(0):
-                    fc2[base], fc2[base + Int64(1)] = total[n, 0], total[n, 1]
-                if row1 >= Int32(0):
-                    fc2[base + Int64(8 * self.hidden_size)], fc2[base + Int64(8 * self.hidden_size + 1)] = total[n, 2], total[n, 3]
+            self._fc2_task(group, block, pointers, bits, group_expert, route_slots,
+                           intermediate, fc2, rows, lane, warp)
+            task += step
+
+    @cute.kernel
+    def fc2_balanced_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
+                            group_expert: cute.Tensor, route_slots: cute.Tensor,
+                            intermediate: cute.Tensor, fc2: cute.Tensor,
+                            rows: Int32, groups: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.fc2_smem_words], 1024]
+
+        storage = smem.allocate(Storage)
+        base = shared_ptr_to_u32(storage.words.data_ptr())
+        self._fill_class_table(1, self.fc2_classes, base, self.fc2_starts_word,
+                               self.fc2_totals_word, group_expert, bits, groups, Int32(tid))
+        # group ranks, heaviest summed down width first
+        while task < groups * Int32(self.blocks):
+            group = Int32(ld_shared_u32(base + (task // Int32(self.blocks)) * Int32(4)))
+            block = task % Int32(self.blocks)
+            self._fc2_task(group, block, pointers, bits, group_expert, route_slots,
+                           intermediate, fc2, rows, lane, warp)
             task += step
 
     @cute.kernel
