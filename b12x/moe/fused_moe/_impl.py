@@ -12623,7 +12623,9 @@ def _v41_topk_sum_launch(
 
 
 @_v41_topk_sum_launch.register_fake
-def _v41_topk_sum_fake(routes, output, m, topk, k):
+def _v41_topk_sum_fake(
+    routes: torch.Tensor, output: torch.Tensor, m: int, topk: int, k: int
+) -> None:
     return None
 
 

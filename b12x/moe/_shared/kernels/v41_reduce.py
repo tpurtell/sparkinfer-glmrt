@@ -61,7 +61,10 @@ def _launch(
 
 
 @_launch.register_fake
-def _fake(p0, p1, p2, p3, shared, output):
+def _fake(
+    p0: torch.Tensor, p1: torch.Tensor, p2: torch.Tensor, p3: torch.Tensor,
+    shared: torch.Tensor | None, output: torch.Tensor,
+) -> None:
     return None
 
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation import (
     FrozenMapping, MemoryRequirements, PersistentMemory, Plan,
@@ -71,6 +72,7 @@ def query_from_weight(
     )
 
 
+@program_cache(scope="preparation")
 def _compile_trellis(query_payload, config_payload, ordinal, sm_count):
     """Resolve exactly the native dense GEMM program selected by the session."""
     from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_gemm

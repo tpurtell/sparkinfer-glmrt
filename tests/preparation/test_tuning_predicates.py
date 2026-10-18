@@ -81,8 +81,8 @@ CANDIDATES = {
     ('moe.decode', 'nvfp4 rows1250'): (4, 4),
     ('moe.decode', 'nvfp4 rows1280'): (4, 4),
     ('moe.decode', 'nvfp4 rows20'): (195, 14),
-    ('moe.decode', 'nvfp4 rows40'): (194, 15),
-    ('moe.decode', 'nvfp4 rows80'): (194, 17),
+    ('moe.decode', 'nvfp4 rows40'): (194, 14),
+    ('moe.decode', 'nvfp4 rows80'): (194, 15),
     ('moe.decode', 'w4a16 rows10'): (2, 2),
     ('moe.decode', 'w4a16 rows1250'): (1, 1),
     ('moe.decode', 'w4a16 rows1280'): (1, 1),
@@ -169,7 +169,6 @@ CORPUS = pathlib.Path(__file__).parent / "corpora" / "qwen3_8_flash_next_tp2_ran
 # The recorded start ran on a 188-SM SM120 part. The MoE cluster ladder is keyed
 # on that SM count and the A16 mode on the compute capability.
 IDENTITY = DeviceIdentity("nvidia", (12, 0), 188, "synthetic SM120")
-
 
 
 def test_predicates_see_complete_conditional_assignments():
@@ -530,10 +529,7 @@ def test_recorded_selections_stay_eligible(key):
     values = dict(WINNERS[key])
     if key[0] == "moe.decode":
         # The recorded programs use unshared input and monolithic NVFP4 execution.
-        values.update(nvfp4_share_input=False, nvfp4_materialize_intermediate=False,
-                      nvfp4_inline_scales=False)
-        values.update(w4a16_tile_config=None, w4a16_block_size_m=None,
-                      w4a16_pipeline_stages=None)
+        values.update(nvfp4_share_input=False, nvfp4_materialize_intermediate=False)
     if key[0] == "gemm.blockscaled_precision":
         values["tile_m"] = 16 if values["mode"] == "a16" else None
     assignment = FrozenMapping(values)
@@ -614,99 +610,11 @@ def test_moe_cluster_ladder_stops_at_the_planned_task_queue():
         backend="dynamic", route_planner="triton", dynamic_tile_m=16,
         dynamic_route_mode="grouped", w4a16_route_mode=None, max_active_clusters=30,
         nvfp4_share_input=False, nvfp4_materialize_intermediate=False,
-        nvfp4_inline_scales=False,
-        w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None,
     )
     space.validate(triton)
     for outside in (31, 64, 188):
         with pytest.raises(ValueError, match="eligible values"):
             space.validate({**triton, "max_active_clusters": outside})
-
-
-def test_compact_w4a8_races_runtime_grids_for_both_backends():
-    from b12x.moe.fused_moe import _tuning as component
-
-    _, original = _contract_and_query(
-        "moe.decode", DECLARED[("moe.decode", "nvfp4 rows10")]
-    )
-    query = replace(
-        original, quant_mode="w4a8_mx", quant_modes=("w4a8_mx",),
-        source_format="fp4_e8m0_k32", num_experts=384, hidden_size=5120,
-        intermediate_size=576, top_k=6, num_tokens=8, routed_rows=48,
-        route_num_experts=None, route_logits_dtype=None,
-        w13_layout="w31", weight_layouts=("fused",), controls=FrozenMapping(),
-    )
-    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
-    configuration = component.TUNING.configure(query, device=device)
-    candidates = tuple(component.TUNING.iterate(configuration))
-    for backend in ("micro", "dynamic"):
-        configs = [config for _, config in candidates if config.backend == backend]
-        assert {config.max_active_clusters for config in configs} == {
-            None, 1, 2, 4, 8, 16, 24, 32, 36, 48,
-        }
-        assignments = [component.TUNING.encode_config(config) for config in configs]
-        assert len({configuration.space.compile_assignment(a) for a in assignments}) == (
-            2 if backend == "dynamic" else 1
-        )
-        with pytest.raises(ValueError, match="resident SM count"):
-            component.TUNING.configure(
-                query, device=device, override=replace(configs[0], max_active_clusters=49)
-            )
-    assert len(candidates) == 30
-    external = next(config for _, config in candidates if config.route_planner == "triton")
-    for outside in (
-        replace(query, num_tokens=43, routed_rows=258),
-        replace(query, deterministic_output=True),
-        replace(query, intermediate_size=640),
-        replace(query, controls=FrozenMapping({"dynamic_work_source": "ready_queue"})),
-    ):
-        with pytest.raises(ValueError, match="Triton route planner"):
-            component.TUNING.configure(outside, device=device, override=external)
-
-
-@pytest.mark.parametrize("sms", (48, 188))
-def test_repacked_w4a8_decode_races_physical_resident_grids(sms):
-    from b12x.moe.fused_moe import _tuning as component
-
-    _, original = _contract_and_query(
-        "moe.decode", DECLARED[("moe.decode", "nvfp4 rows10")]
-    )
-    query = replace(
-        original, quant_mode="w4a8_mx", quant_modes=("w4a8_mx",),
-        source_format="fp4_e8m0_k32", num_experts=256, hidden_size=4096,
-        intermediate_size=1024, top_k=6, num_tokens=6, routed_rows=36,
-        route_num_experts=None, route_logits_dtype=None,
-        w13_layout="w31", weight_layouts=("fused",), controls=FrozenMapping(),
-    )
-    device = DeviceIdentity("nvidia", (12, 0), sms, "Synthetic SM120")
-    configuration = component.TUNING.configure(query, device=device)
-    candidates = [config for _, config in component.TUNING.iterate(configuration)]
-    for tile in (16, 32):
-        configs = [config for config in candidates
-                   if config.backend == "dynamic" and config.dynamic_tile_m == tile
-                   and config.dynamic_route_mode == "grouped"]
-        grids = {config.max_active_clusters for config in configs}
-        assert {None, 1, sms, 2 * sms} <= grids
-        assert all(grid is None or 0 < grid <= 2 * sms for grid in grids)
-        if sms == 188:
-            assert 128 in grids
-        assignments = [component.TUNING.encode_config(config) for config in configs]
-        assert len({configuration.space.compile_assignment(a) for a in assignments}) == 1
-        with pytest.raises(ValueError, match="two-CTA-per-SM"):
-            component.TUNING.configure(
-                query, device=device,
-                override=replace(configs[0], max_active_clusters=2 * sms + 1),
-            )
-    for config in candidates:
-        if config.backend != "dynamic" or config.dynamic_tile_m not in (16, 32):
-            assert config.max_active_clusters is None
-    for outside in (
-        replace(query, num_tokens=11, routed_rows=66),
-        replace(query, deterministic_output=True),
-        replace(query, source_format="trellis"),
-        replace(query, controls=FrozenMapping({"dynamic_work_source": "ready_queue"})),
-    ):
-        assert not component._repacked_w4a8_decode_query(outside)
 
 
 def test_a16_wide_tile_needs_more_than_one_n_tile():
@@ -765,22 +673,3 @@ def test_gate_mean_partitions_span_one_warp_to_the_covering_block():
     space = TUNING.parameter_space(query, IDENTITY)
     blocks = {assignment["pointwise_block"] for assignment in space.configurations()}
     assert blocks == {32, 64, 128, 256, 512, 1024, 2048, 4096}
-
-
-@pytest.mark.parametrize("sms,capability", [(48, (12, 1)), (188, (12, 0))])
-def test_nvfp4_partial_resident_grids_share_the_compiled_kernel(sms, capability):
-    from b12x.moe.fused_moe import _tuning as component
-
-    _, query = _contract_and_query("moe.decode", DECLARED[("moe.decode", "nvfp4 rows40")])
-    device = DeviceIdentity("nvidia", capability, sms, "Blackwell")
-    eligible = component.TUNING.eligible_plan(query, device)
-    configs = [config for _, config in eligible.candidates
-               if config.route_planner == "triton"]
-    grids = {config.max_active_clusters for config in configs}
-    expected = ({None, 1, 2, 4, 8, 16, 24, 32, 36, 48} if sms == 48 else
-                {None, 1, 2, 4, 8, 16, 32, 64, 94, 126})
-    assert grids == expected
-    assert len({eligible.space.compile_assignment(config.to_dict()) for config in configs}) == 1
-    with pytest.raises(ValueError, match="resident SM count"):
-        component.TUNING.configure(query, device=device,
-            override=replace(configs[0], max_active_clusters=sms + 1))

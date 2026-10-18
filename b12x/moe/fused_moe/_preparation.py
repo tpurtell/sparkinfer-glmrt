@@ -9,6 +9,7 @@ from types import MappingProxyType
 import torch
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, _CompositePlan
 
 from ._impl import TPMoEScratchCaps, plan_b12x_fp4_moe_weights, plan_tp_moe_scratch
@@ -633,6 +634,7 @@ def _program_carriers(
             launches.append(launch)
     return tuple(launches)
 
+@program_cache(scope="preparation")
 def compile_fused_moe(
     query_payload, config_payload, weight_payload, scale_counts, ordinal
 ):
@@ -895,6 +897,7 @@ def _dynamic_route_plan_payloads(plan, caps):
     )
 
 
+@program_cache(scope="preparation")
 def compile_dynamic_route_plan(payload, ordinal):
     """Compile the Triton route-plan program for one dynamic MoE launch."""
     from triton.runtime.jit import MockTensor
@@ -921,6 +924,7 @@ def compile_dynamic_route_plan(payload, ordinal):
         )
 
 
+@program_cache(scope="preparation")
 def compile_route_topk(query_payload, ordinal):
     """Compile the exact Triton route program from immutable ABI metadata."""
     import triton
@@ -1031,6 +1035,7 @@ def plan_route_topk(invocation: RouteTopKInvocation, *, override=None,
     )
 
 
+@program_cache(scope="preparation")
 def compile_fc2(query_payload, ordinal):
     """Resolve the exact standalone FC2 launcher retained by its prepared plan."""
     from ._tuning import MoeFC2Query

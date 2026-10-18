@@ -7,6 +7,7 @@ from types import MappingProxyType
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
 from b12x.moe._shared.kernels.w4a16.host import select_route_block_size_m
@@ -88,6 +89,7 @@ def _compile_arguments(query: EpMoeQuery, invocation: FrozenMapping, weight_payl
         )
 
 
+@program_cache(scope="preparation")
 def compile_ep_moe(query_payload, invocation_payload, weight_payload, ordinal):
     """Compile the real W4A16 EP route/GEMM/reduction launch from metadata only."""
     return _compile_arguments(EpMoeQuery(**dict(query_payload)), FrozenMapping(invocation_payload), weight_payload, ordinal)

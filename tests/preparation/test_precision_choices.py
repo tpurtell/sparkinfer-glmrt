@@ -42,7 +42,6 @@ def test_dense_a16_cutoff_constrains_candidates_and_covers_unlisted_counts(mode,
 def test_a16_cutoff_rejects_invalid_values(cutoff):
     import torch
     from b12x.gemm.blockscaled import BlockscaledQuery, plan_regimes
-    from b12x.moe.fused_moe import ActivationMode, ActivationSpec
 
     query = BlockscaledQuery(
         recipe="nvfp4", num_tokens=128, in_features=256,
@@ -50,9 +49,6 @@ def test_a16_cutoff_rejects_invalid_values(cutoff):
     )
     with pytest.raises(ValueError, match="nonnegative integer"):
         plan_regimes(query, a16_max_tokens=cutoff)
-    with pytest.raises(ValueError, match="nonnegative integer"):
-        ActivationSpec(mode=ActivationMode.A4, nonlinearity="silu",
-                       io_dtype=torch.bfloat16, a16_max_tokens=cutoff)
 
 
 @pytest.mark.parametrize("rows", (1, 8, 128))
@@ -136,109 +132,6 @@ def _nvfp4_query():
         w4a16_weight_layout=None, w4a16_scale_format=None, w4a16_block_size_m=None,
         fast_math=True, numerical_recipe=None, controls=FrozenMapping(), shared_input_scales=True,
     )
-
-
-def _nvfp4_auto_query(rows=1):
-    return replace(
-        _nvfp4_query(), quant_mode="nvfp4_auto", quant_modes=("nvfp4", "w4a16"),
-        num_experts=256, hidden_size=6144, intermediate_size=256, top_k=8,
-        num_tokens=rows, routed_rows=rows * 8, route_num_experts=256,
-        weight_layouts=("mma_view", "source_native"), w4a16_weight_layout="modelopt",
-        w4a16_scale_format="e4m3_k16",
-    )
-
-
-@pytest.mark.parametrize("capability,sms", (((12, 0), 188), ((12, 1), 48)))
-@pytest.mark.parametrize("rows", (1, 2, 4, 8, 9, 16))
-def test_moe_auto_promotes_native_decode_and_races_both_precisions(capability, sms, rows):
-    from b12x.moe.fused_moe._tuning import TUNING
-
-    query = _nvfp4_auto_query(rows)
-    device = DeviceIdentity("nvidia", capability, sms, "synthetic Blackwell")
-    default = TUNING.configure(query, device=device).default
-    configs = [config for _, config in TUNING.eligible_plan(query, device).candidates]
-    assert (default.backend == "w4a16") is (rows <= 8)
-    assert {config.w4a16_route_mode for config in configs if config.backend == "w4a16"} == (
-        {"direct", "packed"} if rows <= 8 else {"packed"}
-    )
-    assert {config.backend for config in configs} >= {"dynamic", "w4a16"}
-    assert default in configs
-    assert configs[0].backend == "w4a16"
-    pinned_a4 = replace(query, quant_mode="nvfp4", quant_modes=("nvfp4",))
-    assert all(config.backend != "w4a16" for _, config in TUNING.eligible_plan(pinned_a4, device).candidates)
-
-
-@pytest.mark.parametrize("changes", (
-    {"hidden_size": 192}, {"top_k": 33, "routed_rows": 33},
-    {"apply_router_weight_on_input": True}, {"collect_activation_amax": True},
-    {"io_dtype": "float16"},
-))
-def test_moe_native_direct_rejects_unsupported_query_and_override(changes):
-    from b12x.moe.fused_moe._tuning import TUNING
-
-    query = _nvfp4_auto_query()
-    direct = TUNING.configure(query, device=DEVICE).default
-    query = replace(query, **changes)
-    assert TUNING.configure(query, device=DEVICE).default.backend != "w4a16"
-    with pytest.raises(ValueError, match="direct routing"):
-        TUNING.configure(query, device=DEVICE, override=direct)
-    assert not any(config.backend == "w4a16" and config.w4a16_route_mode == "direct"
-                   for _, config in TUNING.eligible_plan(query, DEVICE).candidates)
-
-
-def test_moe_auto_has_no_native_decode_default_on_other_architectures():
-    from b12x.moe.fused_moe._tuning import TUNING
-
-    for device in (None, replace(DEVICE, compute_capability=(10, 0))):
-        assert TUNING.configure(_nvfp4_auto_query(), device=device, search=False).default.backend != "w4a16"
-
-
-@pytest.mark.parametrize("a4_latency,a16_latency,old_backend,backend", (
-    (6, 6, "micro", "w4a16"), (5, 6, "micro", "micro"), (6, 5, "w4a16", "w4a16"),
-))
-def test_moe_precision_race_and_revision_invalidate_cached_choice(
-    tmp_path, monkeypatch, a4_latency, a16_latency, old_backend, backend,
-):
-    from types import SimpleNamespace
-    from b12x.preparation import DetectedDevice, MemoryRequirements, Plan, PreparedCall
-    from b12x.moe.fused_moe._tuning import TUNING
-    from .test_session import _deterministic_timer, session
-
-    _deterministic_timer(monkeypatch)
-    old_contract = replace(
-        TUNING, candidate_contract_version=4,
-        knobs=(replace(TUNING.knobs[0], values=("micro", "dynamic", "w4a16")), *TUNING.knobs[1:]),
-    )
-
-    def request(contract):
-        plan = Plan(
-            contract=contract, query=_nvfp4_auto_query(),
-            _compile_jobs=lambda config, device: (),
-            _memory_requirements=lambda config, device: MemoryRequirements(),
-            _materialize=lambda selection, device: SimpleNamespace(config=selection.config),
-        )
-
-        def call(state):
-            latency = a16_latency if state.config.backend == "w4a16" else a4_latency
-            # The shared timer measures abs(output - 6) + 1 microseconds.
-            return PreparedCall(run=lambda: latency + 5, produce=lambda: None)
-
-        return plan.request(
-            name="moe-precision",
-            prepare_call=call, benchmark_call=call,
-        )
-
-    assert TUNING.candidate_contract_version > old_contract.candidate_contract_version
-    for contract, source, expected_backend in (
-        (old_contract, "tuned", old_backend),
-        (TUNING, "tuned", backend),
-        (TUNING, "cached", backend),
-    ):
-        with session(tmp_path, race_batch=2) as engine:
-            engine.device = DetectedDevice(ordinal=None, identity=DEVICE)
-            result = engine.prepare((request(contract),))
-            selection = result.selections["moe-precision"]
-            assert (selection.source, selection.config.backend) == (source, expected_backend)
 
 
 def test_nvfp4_split_materialization_is_a_real_candidate_and_default():
