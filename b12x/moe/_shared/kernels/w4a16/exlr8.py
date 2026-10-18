@@ -17,7 +17,6 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from b12x._lib.intrinsics import (
-    cp_async4_shared_global_pred,
     f16_mma_m16n8k16_f32,
     half2_to_float2_scaled,
     ld_global_b16,
@@ -66,34 +65,6 @@ def exlr8_decode_tile(payload_address: Int64, tile: Int32, lane: Int32,
 
 
 @cute.jit
-def exlr8_decode_tile_staged(stage_address: Int32, lane: Int32,
-                             bits: cutlass.Constexpr):
-    """Decode one tile already staged in shared memory (32-bit byte address).
-
-    Identical arithmetic to `exlr8_decode_tile`, including the E4M3 rounding,
-    so fragments are bitwise unchanged; only the source differs. The trellis
-    chain runs off short-scoreboard shared reads instead of a global round
-    trip per fragment, and the global traffic moves to a cp.async copy issued
-    a whole K16 step earlier.
-    """
-    if cutlass.const_expr(bits == 4):
-        b = ld_shared_u32(stage_address + lane * Int32(4))
-        a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
-        wa = b
-        wb = (a << Uint32(16)) | (b >> Uint32(16))
-    else:
-        ia, ib, shift, _ = trellis256_lane_geom_bits(lane, 0, 8, bits)
-        a = ld_shared_u32(stage_address + ia * Int32(4))
-        b = ld_shared_u32(stage_address + ib * Int32(4))
-        window = (a.to(Int64) << Int64(32)) | b.to(Int64)
-        wa = (window >> shift.to(Int64)).to(Uint32)
-        wb = (window >> (shift + Int32(4 * bits)).to(Int64)).to(Uint32)
-    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, bits)
-    return (_e4m3_round_half2(b0), _e4m3_round_half2(b1),
-            _e4m3_round_half2(b2), _e4m3_round_half2(b3))
-
-
-@cute.jit
 def _side_value(address: Int64, index: Int32):
     packed = ld_global_b16(address + index.to(Int64) * Int64(2))
     lo, _ = half2_to_float2_scaled(packed, Float32(1.0))
@@ -102,7 +73,7 @@ def _side_value(address: Int64, index: Int32):
 
 class Exlr8A16Kernel:
     ABI_VERSION = 1
-    CODE_VERSION = 4
+    CODE_VERSION = 3
     # Resident CTAs per SM the stream kernels are built for (<=128 registers at
     # 128 threads). GB10 decode is latency-bound on dependent weight loads, so
     # the caller's cta_limit should be sm_count * CTAS_PER_SM (cudaDevAttr at
@@ -154,17 +125,6 @@ class Exlr8A16Kernel:
         self.fc2_starts_word = self.fc2_table_words
         self.fc2_totals_word = self.fc2_starts_word + self.fc2_classes * 128
         self.fc2_smem_words = self.fc2_totals_word + self.fc2_classes
-        # Shared-memory weight staging: one 32-word (128 B) slot per (warp,
-        # double-buffer stage, n16), appended 128-byte aligned after the class
-        # table. cp.async stages the next K16 step while the current one
-        # decodes, so each warp's trellis chain never waits a global round
-        # trip per fragment. Slot geometry is identical for every width; K2
-        # and K3 tiles simply occupy the first 64/96 bytes.
-        self.stage_words = 4 * 2 * 2 * 32
-        self.fc1_stage_word = (self.fc1_smem_words + 31) & ~31
-        self.fc1_smem_words = self.fc1_stage_word + self.stage_words
-        self.fc2_stage_word = (self.fc2_smem_words + 31) & ~31
-        self.fc2_smem_words = self.fc2_stage_word + self.stage_words
 
     @property
     def __cache_key__(self):
@@ -227,39 +187,13 @@ class Exlr8A16Kernel:
                 block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
 
     @cute.jit
-    def _stage_tile(self, stage: Int32, payload: Int64, tile: Int32,
-                    lane: Int32, warp: Int32, stage_id: cutlass.Constexpr,
-                    n16: cutlass.Constexpr, width: cutlass.Constexpr):
-        """cp.async one tile (16 B per lane, lanes < 2*width) into its slot."""
-        slot = stage + (((warp * Int32(2) + Int32(stage_id)) * Int32(2) + Int32(n16))
-                        * Int32(128) + lane * Int32(16))
-        source = payload + tile.to(Int64) * Int64(32 * width) + lane.to(Int64) * Int64(16)
-        cp_async4_shared_global_pred(slot, source, (lane < Int32(2 * width)).to(Int32))
-
-    @cute.jit
     def _mma_block(self, payload: Int64, a_address: Int64,
                    row0: Int32, row1: Int32, a_stride: cutlass.Constexpr,
                    input_block: Int32, output_block: Int32, lane: Int32,
-                   warp: Int32, width: cutlass.Constexpr, down: cutlass.Constexpr,
-                   stage: Int32):
-        """One K128 block, four N8 fragments per lane, FP32 accumulation.
-
-        Weight tiles are staged in shared memory one K16 step ahead with
-        cp.async: the copy carries no destination register (the kernel stays
-        inside its 128-register, 4-CTA/SM budget) and the trellis decode
-        reads short-scoreboard shared words instead of stalling on its own
-        global loads. Words are identical to the direct path, so fragments
-        are bitwise unchanged.
-        """
+                   warp: Int32, width: cutlass.Constexpr, down: cutlass.Constexpr):
+        """One K128 block, four N8 fragments per lane, FP32 accumulation."""
         acc = cute.make_rmem_tensor((4, 4), Float32)
         acc.fill(Float32(0.0))
-        # Prologue: stage K16 step 0 into slot 0.
-        for n16 in cutlass.range_constexpr(2):
-            tile = input_block * Int32(64) + warp * Int32(2) + Int32(n16)
-            if cutlass.const_expr(down):
-                tile = output_block * Int32(64) + warp * Int32(2) + Int32(n16)
-            self._stage_tile(stage, payload, tile, lane, warp, 0, n16, width)
-        cute.arch.cp_async_commit_group()
         for k16 in cutlass.range_constexpr(8):
             k = input_block * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
             a0 = Uint32(0)
@@ -274,24 +208,11 @@ class Exlr8A16Kernel:
                 addr1 = a_address + (row1.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
                 a1 = ld_global_nc_u32(addr1)
                 a3 = ld_global_nc_u32(addr1 + Int64(16))
-            # Issue the next step's copy into the other stage before waiting
-            # on this one, so a whole K16 of mma/decode covers the transfer.
-            if cutlass.const_expr(k16 < 7):
-                for n16 in cutlass.range_constexpr(2):
-                    tile = (input_block * Int32(8) + Int32(k16 + 1)) * Int32(8) + warp * Int32(2) + Int32(n16)
-                    if cutlass.const_expr(down):
-                        tile = output_block * Int32(64) + Int32((k16 + 1) * 8) + warp * Int32(2) + Int32(n16)
-                    self._stage_tile(stage, payload, tile, lane, warp,
-                                     (k16 + 1) % 2, n16, width)
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(1)
-            else:
-                cute.arch.cp_async_wait_group(0)
-            cute.arch.sync_warp()
             for n16 in cutlass.range_constexpr(2):
-                slot = stage + (((warp * Int32(2) + Int32(k16 % 2)) * Int32(2)
-                                 + Int32(n16)) * Int32(128))
-                b0, b1, b2, b3 = exlr8_decode_tile_staged(slot, lane, width)
+                tile = (input_block * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
+                if cutlass.const_expr(down):
+                    tile = output_block * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
+                b0, b1, b2, b3 = exlr8_decode_tile(payload, tile, lane, width)
                 d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                     acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                     a0, a1, a2, a3, b0, b1)
@@ -309,9 +230,9 @@ class Exlr8A16Kernel:
                           row0: Int32, row1: Int32, a_stride: cutlass.Constexpr,
                           input_block: Int32, output_block: Int32, lane: Int32,
                           warp: Int32, width: cutlass.Constexpr,
-                          down: cutlass.Constexpr, scale: Float32, stage: Int32):
+                          down: cutlass.Constexpr, scale: Float32):
         acc = self._mma_block(payload, a_address, row0, row1, a_stride,
-                              input_block, output_block, lane, warp, width, down, stage)
+                              input_block, output_block, lane, warp, width, down)
         for n in cutlass.range_constexpr(4):
             for v in cutlass.range_constexpr(4):
                 total[n, v] = total[n, v] + acc[n, v] * scale
@@ -320,7 +241,7 @@ class Exlr8A16Kernel:
     def _fc1_task(self, local: Int32, group: Int32, unit: Int32, proj: Int32,
                   split: Int32, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
                   group_expert: cute.Tensor, route_slots: cute.Tensor, fc1: cute.Tensor,
-                  rows: Int32, lane: Int32, warp: Int32, stage: Int32):
+                  rows: Int32, lane: Int32, warp: Int32):
         """One fc1 partial sum; local is the caller's scratch task index."""
         expert = group_expert[group]
         desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
@@ -344,13 +265,13 @@ class Exlr8A16Kernel:
                     scale = _side_value(scales, kb)
                     if width == Int32(2):
                         self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                            self.hidden_size, kb, Int32(0), lane, warp, 2, False, scale, stage)
+                            self.hidden_size, kb, Int32(0), lane, warp, 2, False, scale)
                     elif width == Int32(3):
                         self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                            self.hidden_size, kb, Int32(0), lane, warp, 3, False, scale, stage)
+                            self.hidden_size, kb, Int32(0), lane, warp, 3, False, scale)
                     elif width == Int32(4):
                         self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                            self.hidden_size, kb, Int32(0), lane, warp, 4, False, scale, stage)
+                            self.hidden_size, kb, Int32(0), lane, warp, 4, False, scale)
         for n in cutlass.range_constexpr(4):
             col = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
             base = local.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)
@@ -454,22 +375,13 @@ class Exlr8A16Kernel:
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
-        smem = cutlass.utils.SmemAllocator()
-
-        @cute.struct
-        class Storage:
-            stage: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint32, self.stage_words], 1024]
-
-        storage = smem.allocate(Storage)
-        stage = shared_ptr_to_u32(storage.stage.data_ptr())
         while task < groups * Int32(self.units * 2 * self.splits):
             split = task % Int32(self.splits)
             proj = (task // Int32(self.splits)) % Int32(2)
             unit = (task // Int32(2 * self.splits)) % Int32(self.units)
             group = task // Int32(self.units * 2 * self.splits)
             self._fc1_task(task, group, unit, proj, split, x, pointers, bits,
-                           group_expert, route_slots, fc1, rows, lane, warp, stage)
+                           group_expert, route_slots, fc1, rows, lane, warp)
             task += step
 
     @cute.kernel
@@ -490,7 +402,6 @@ class Exlr8A16Kernel:
 
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
-        stage = base + Int32(self.fc1_stage_word * 4)
         self._fill_class_table(0, self.fc1_classes, base, self.fc1_starts_word,
                                self.fc1_totals_word, group_expert, bits, groups,
                                Int32(tid), sorted)
@@ -506,7 +417,7 @@ class Exlr8A16Kernel:
             proj = pair % Int32(2)
             unit = (pair // Int32(2)) % Int32(self.units)
             self._fc1_task(pair * Int32(self.splits) + split, group, unit, proj, split,
-                           x, pointers, bits, group_expert, route_slots, fc1, rows, lane, warp, stage)
+                           x, pointers, bits, group_expert, route_slots, fc1, rows, lane, warp)
             task += step
 
     @cute.kernel
@@ -556,7 +467,7 @@ class Exlr8A16Kernel:
     def _fc2_task(self, group: Int32, block: Int32, pointers: cute.Tensor,
                   bits: cute.Tensor, group_expert: cute.Tensor, route_slots: cute.Tensor,
                   intermediate: cute.Tensor, fc2: cute.Tensor, rows: Int32,
-                  lane: Int32, warp: Int32, stage: Int32):
+                  lane: Int32, warp: Int32):
         """One fc2 output block for one group, summed over every unit."""
         expert = group_expert[group]
         total = cute.make_rmem_tensor((4, 4), Float32)
@@ -578,13 +489,13 @@ class Exlr8A16Kernel:
                 addr = intermediate.iterator.toint() + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
                 if width == Int32(2):
                     self._accumulate_block(total, payload, addr, row0, row1, 128,
-                        Int32(0), block, lane, warp, 2, True, scale, stage)
+                        Int32(0), block, lane, warp, 2, True, scale)
                 elif width == Int32(3):
                     self._accumulate_block(total, payload, addr, row0, row1, 128,
-                        Int32(0), block, lane, warp, 3, True, scale, stage)
+                        Int32(0), block, lane, warp, 3, True, scale)
                 elif width == Int32(4):
                     self._accumulate_block(total, payload, addr, row0, row1, 128,
-                        Int32(0), block, lane, warp, 4, True, scale, stage)
+                        Int32(0), block, lane, warp, 4, True, scale)
         for n in cutlass.range_constexpr(4):
             col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
             base = (group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
@@ -602,19 +513,10 @@ class Exlr8A16Kernel:
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
-        smem = cutlass.utils.SmemAllocator()
-
-        @cute.struct
-        class Storage:
-            stage: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint32, self.stage_words], 1024]
-
-        storage = smem.allocate(Storage)
-        stage = shared_ptr_to_u32(storage.stage.data_ptr())
         while task < groups * Int32(self.blocks):
             group, block = task // Int32(self.blocks), task % Int32(self.blocks)
             self._fc2_task(group, block, pointers, bits, group_expert, route_slots,
-                           intermediate, fc2, rows, lane, warp, stage)
+                           intermediate, fc2, rows, lane, warp)
             task += step
 
     @cute.kernel
@@ -635,7 +537,6 @@ class Exlr8A16Kernel:
 
         storage = smem.allocate(Storage)
         base = shared_ptr_to_u32(storage.words.data_ptr())
-        stage = base + Int32(self.fc2_stage_word * 4)
         self._fill_class_table(1, self.fc2_classes, base, self.fc2_starts_word,
                                self.fc2_totals_word, group_expert, bits, groups,
                                Int32(tid), sorted)
@@ -644,7 +545,7 @@ class Exlr8A16Kernel:
             group = Int32(ld_shared_u32(base + (task // Int32(self.blocks)) * Int32(4)))
             block = task % Int32(self.blocks)
             self._fc2_task(group, block, pointers, bits, group_expert, route_slots,
-                           intermediate, fc2, rows, lane, warp, stage)
+                           intermediate, fc2, rows, lane, warp)
             task += step
 
     @cute.kernel
