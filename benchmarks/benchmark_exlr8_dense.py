@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
+import subprocess
 from pathlib import Path
 import re
 import sys
@@ -22,7 +24,7 @@ from cuda.bindings import driver as cuda
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmarks.benchmark_exlr8_a16 import capture, timing, read_roofline, finite_nonzero
-from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+from b12x.integration.cuteafd._common import Operand, Scalar, compile_program, exportable_compilation
 from b12x.integration.cuteafd import trellis_linear, scaled_linear, fp8_row_embedding
 from b12x.integration.cuteafd._fp8_weights import Fp8Projection
 
@@ -126,6 +128,34 @@ def native_tensors(fmt, k, n, rows):
     return (inputs, payload, scales, partial, output, x), payload.numel()+scales.numel()*scales.element_size()
 
 
+def spill_check(program, directory):
+    """Inspect the exact exported program's embedded cubins, not a profiled run."""
+    directory.mkdir(parents=True, exist_ok=True)
+    program.export_to_c(str(directory), "native", "bench_native")
+    root = Path("/workspace/cuteafd")
+    path = root / "scripts/qualify/deepseek_v41/inspect-cute-object.py"
+    spec = importlib.util.spec_from_file_location("dense_cuda_images", path)
+    inspector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(inspector)
+    images = list(inspector.cuda_images((directory / "native.o").read_bytes()))
+    if not images:
+        raise RuntimeError("native AOT export contains no cubins")
+    records = []
+    for index, (_, blob) in enumerate(images):
+        cubin = directory / f"native-{index}.cubin"
+        cubin.write_bytes(blob)
+        resources = subprocess.check_output(["/usr/local/cuda/bin/cuobjdump",
+                                             "--dump-resource-usage", str(cubin)], text=True)
+        local = re.findall(r"LOCAL:(\d+)", resources)
+        if not local:
+            raise RuntimeError("cuobjdump returned no local-memory records")
+        sass = subprocess.check_output(["/usr/local/cuda/bin/cuobjdump", "--dump-sass", str(cubin)], text=True)
+        records.append(dict(sha256=hashlib.sha256(blob).hexdigest(), resources=resources,
+                            local_bytes=list(map(int, local)),
+                            local_load_store_instructions=len(re.findall(r"\b(?:LDL|STL)(?:\.|\s)", sass))))
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -155,7 +185,9 @@ def main():
                   source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for fmt, name, k, n, side in shapes:
-        program = compile_native(fmt, k, n, side)
+        with exportable_compilation():
+            program = compile_native(fmt, k, n, side)
+        spill = spill_check(program, args.output.parent / "cubins" / f"{fmt}-{name}")
         control = compile_native(fmt, k, n, side, control=True)
         for rows in rows_list:
             storage, read_bytes = native_tensors(fmt, k, n, rows)
@@ -183,7 +215,7 @@ def main():
                        rows=rows, read_bytes=read_bytes, native_us=native_us,
                        gbps=gbps, read_ceiling_percent=100*gbps/report["read_ceiling"]["gbps"],
                        target_met=gbps >= .95*report["read_ceiling"]["gbps"],
-                       control_us=control_us, control_bitwise_equal=True,
+                       control_us=control_us, control_bitwise_equal=True, cubin_spill_check=spill,
                        block_fp8_us=fp8_us, speedup_vs_block_fp8=fp8_us/native_us if fp8_us else None)
             report["measurements"].append(row)
             args.output.write_text(json.dumps(report, indent=2)+"\n")
