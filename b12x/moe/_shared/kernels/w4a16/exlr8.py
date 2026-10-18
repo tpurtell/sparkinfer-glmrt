@@ -73,7 +73,9 @@ def _side_value(address: Int64, index: Int32):
 
 class Exlr8A16Kernel:
     ABI_VERSION = 1
-    CODE_VERSION = 3
+    # 5: activation fragments prefetched one K16 step ahead (4: shared
+    # tile staging, reverted: it moved the stall rather than removing it).
+    CODE_VERSION = 5
     # Resident CTAs per SM the stream kernels are built for (<=128 registers at
     # 128 threads). GB10 decode is latency-bound on dependent weight loads, so
     # the caller's cta_limit should be sm_count * CTAS_PER_SM (cudaDevAttr at
@@ -187,27 +189,49 @@ class Exlr8A16Kernel:
                 block=(128, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
 
     @cute.jit
+    def _x_fragment(self, a_address: Int64, row0: Int32, row1: Int32,
+                    a_stride: cutlass.Constexpr, input_block: Int32,
+                    k16: cutlass.Constexpr, lane: Int32):
+        """The four activation words an mma needs for one K16 step."""
+        k = input_block * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
+        a0 = Uint32(0)
+        a1 = Uint32(0)
+        a2 = Uint32(0)
+        a3 = Uint32(0)
+        if row0 >= Int32(0):
+            addr0 = a_address + (row0.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
+            a0 = ld_global_nc_u32(addr0)
+            a2 = ld_global_nc_u32(addr0 + Int64(16))
+        if row1 >= Int32(0):
+            addr1 = a_address + (row1.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
+            a1 = ld_global_nc_u32(addr1)
+            a3 = ld_global_nc_u32(addr1 + Int64(16))
+        return a0, a1, a2, a3
+
+    @cute.jit
     def _mma_block(self, payload: Int64, a_address: Int64,
                    row0: Int32, row1: Int32, a_stride: cutlass.Constexpr,
                    input_block: Int32, output_block: Int32, lane: Int32,
                    warp: Int32, width: cutlass.Constexpr, down: cutlass.Constexpr):
-        """One K128 block, four N8 fragments per lane, FP32 accumulation."""
+        """One K128 block, four N8 fragments per lane, FP32 accumulation.
+
+        Activation fragments are loaded one K16 step ahead of use. Weight
+        bytes dominate the traffic but the activation loads are what the mma
+        waits on: ncu on the staged-weight variant showed the remaining
+        L1TEX long-scoreboard stall (12.1 of 15.6 cycles per issue) is
+        width-independent, so it is the x/intermediate fragments, not the
+        trellis words. Holding the next step's four words in registers lets
+        a whole decode + mma cover their latency.
+        """
         acc = cute.make_rmem_tensor((4, 4), Float32)
         acc.fill(Float32(0.0))
+        a0, a1, a2, a3 = self._x_fragment(a_address, row0, row1, a_stride,
+                                          input_block, 0, lane)
         for k16 in cutlass.range_constexpr(8):
-            k = input_block * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
-            a0 = Uint32(0)
-            a1 = Uint32(0)
-            a2 = Uint32(0)
-            a3 = Uint32(0)
-            if row0 >= Int32(0):
-                addr0 = a_address + (row0.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
-                a0 = ld_global_nc_u32(addr0)
-                a2 = ld_global_nc_u32(addr0 + Int64(16))
-            if row1 >= Int32(0):
-                addr1 = a_address + (row1.to(Int64) * Int64(a_stride) + k.to(Int64)) * Int64(2)
-                a1 = ld_global_nc_u32(addr1)
-                a3 = ld_global_nc_u32(addr1 + Int64(16))
+            n0, n1, n2, n3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            if cutlass.const_expr(k16 < 7):
+                n0, n1, n2, n3 = self._x_fragment(a_address, row0, row1, a_stride,
+                                                  input_block, k16 + 1, lane)
             for n16 in cutlass.range_constexpr(2):
                 tile = (input_block * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                 if cutlass.const_expr(down):
@@ -223,6 +247,8 @@ class Exlr8A16Kernel:
                     a0, a1, a2, a3, b2, b3)
                 acc[2*n16+1, 0], acc[2*n16+1, 1] = d0, d1
                 acc[2*n16+1, 2], acc[2*n16+1, 3] = d2, d3
+            if cutlass.const_expr(k16 < 7):
+                a0, a1, a2, a3 = n0, n1, n2, n3
         return acc
 
     @cute.jit
