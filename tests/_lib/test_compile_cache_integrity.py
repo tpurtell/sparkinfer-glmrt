@@ -83,6 +83,8 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             _mkdir_durable=integrity._mkdir_durable, valid_object=integrity.valid_object,
             _cute_compile_cache_dir=lambda: self.root,
             _build_compile_manifest=lambda key, payload, func, data, **kw: {
+                "schema": "b12x._lib.compile_manifest.v3",
+                "cache_payload_repr": repr(payload),
                 "cache_key": key, "object_bytes": len(data),
                 "object_sha256": hashlib.sha256(data).hexdigest(),
             },
@@ -101,7 +103,8 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         load_functions(LIB / "compiler.py", (
             "_cache_prefix", "_cache_object_path", "_cache_manifest_path", "_cache_lock_path",
             "_write_compile_manifest", "_valid_cute_compile_cache", "_ensure_cute_compile_manifest",
-            "_disk_cache_key_lock", "_load_cute_compile_from_disk", "_store_cute_compile_to_disk",
+            "_disk_cache_key_lock", "_validated_cute_compile_object_bytes",
+            "_load_cute_compile_from_disk", "_store_cute_compile_to_disk",
             "compile",
         ), self.namespace)
         plan.__dict__.update(__package__="b12x._lib", _RESIDENT_PROGRAMS=set(), Path=Path)
@@ -115,6 +118,8 @@ class CompileCacheIntegrityTests(unittest.TestCase):
     def write_pair(self):
         self.obj.write_bytes(self.data)
         self.manifest.write_text(json.dumps({
+            "schema": "b12x._lib.compile_manifest.v3",
+            "cache_payload_repr": repr(("test-compile-payload",)),
             "cache_key": self.key, "object_bytes": len(self.data),
             "object_sha256": hashlib.sha256(self.data).hexdigest(),
         }))
@@ -182,10 +187,11 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         self.assertIs(self.module._load_cute_compile_from_disk(self.key), self.compiled)
         self.assertEqual(self.obj.read_bytes(), self.data)
         self.assertTrue(self.available(self.program))
-        def corrupt_copy(source, target):
-            Path(target).write_bytes(b"bad staged object")
+        write_bytes = Path.write_bytes
+        def corrupt_copy(target, data):
+            return write_bytes(target, b"bad staged object")
         self.loader.reset_mock()
-        with patch.object(shutil, "copy2", side_effect=corrupt_copy):
+        with patch.object(Path, "write_bytes", corrupt_copy):
             self.assertIsNone(self.module._load_cute_compile_from_disk(self.key))
         self.loader.assert_not_called()
 

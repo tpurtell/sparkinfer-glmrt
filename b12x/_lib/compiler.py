@@ -2581,6 +2581,8 @@ def _load_cute_compile_from_disk(
         ) as raw_stage:
             staged_object = Path(raw_stage) / f"{cache_key}.o"
             staged_object.write_bytes(object_bytes)
+            if not valid_object(staged_object, _cache_manifest_path(cache_key), cache_key):
+                return None
             module = ExternalBinaryModule(str(staged_object))
             return getattr(module, _cache_prefix(cache_key))
     except Exception:
