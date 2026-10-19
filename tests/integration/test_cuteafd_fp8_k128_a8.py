@@ -64,19 +64,23 @@ def test_native_a8(rows):
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
     torch.manual_seed(731)
     torch.backends.cuda.matmul.allow_tf32 = False
-    g = Fp8MoeGeometry("k128_test", 256, 4, 2, 256, activations="a8_k128_f32",
-                       swiglu_limit=7, activation="silu_post_clamp_fp32_product")
-    def weight():
-        return (torch.randn(4, 256, 256, device="cuda") * 30).clamp(-448, 448).to(torch.float8_e4m3fn)
-    def scales():
-        return torch.rand(4, 2, 2, device="cuda") * 0.001 + 0.00031
-    ws = (weight(), scales(), weight(), scales(), weight(), scales())
-    x = torch.randn(rows, 256, device="cuda").bfloat16()
+    tp = int(os.environ.get("CUTEAFD_A8_TP", "0"))
+    g = (Fp8MoeGeometry("k128_test", 4096, 352, 8, 1536, tp=tp, activations="a8_k128_f32",
+                        swiglu_limit=7, activation="silu_post_clamp_fp32_product") if tp else
+         Fp8MoeGeometry("k128_test", 256, 4, 2, 256, activations="a8_k128_f32",
+                        swiglu_limit=7, activation="silu_post_clamp_fp32_product"))
+    h, i, e, topk = g.hidden, g.slice, g.experts, g.top_k
+    def weight(n, k):
+        return (torch.randn(e, n, k, device="cuda") * 30).clamp(-448, 448).to(torch.float8_e4m3fn)
+    def scales(n, k):
+        return torch.rand(e, n // 128, k // 128, device="cuda") * 0.001 + 0.00031
+    ws = (weight(i, h), scales(i, h), weight(i, h), scales(i, h), weight(h, i), scales(h, i))
+    x = torch.randn(rows, h, device="cuda").bfloat16()
     x[0].zero_()
     if rows > 1:
         x[1] *= 1e-12
-    ids = torch.randint(0, 4, (rows, 2), device="cuda", dtype=torch.int32)
-    routes = torch.rand(rows, 2, device="cuda")
+    ids = torch.randint(0, e, (rows, topk), device="cuda", dtype=torch.int32)
+    routes = torch.rand(rows, topk, device="cuda")
     program = compile_fp8_moe_aot(g, route="auto", max_rows=rows, wire=False)
     scratch = torch.empty(fp8_moe_scratch_bytes(g, "auto", rows, False), device="cuda", dtype=torch.uint8)
     out = torch.empty_like(x)
@@ -91,7 +95,7 @@ def test_native_a8(rows):
     over = error > official * 1.01
     ratio = torch.where(official > 0, error / official, torch.where(error == 0, 0., float("inf")))
     ulp = (actual.view(torch.int16).int() - expected.view(torch.int16).int()).abs()
-    print(f"rows={rows} native_error={error.sum().item():.9g} official_error={official.sum().item():.9g} "
+    print(f"tp={tp} rows={rows} native_error={error.sum().item():.9g} official_error={official.sum().item():.9g} "
           f"rows_over={over.sum().item()} worst_ratio={ratio.max().item()} max_ulp={ulp.max().item()}")
     # Report the strict bar after collecting replay/width evidence, including
     # zero-denominator BF16 ties; no exception is silently blessed here.
@@ -110,4 +114,23 @@ def test_native_a8(rows):
         at = min(rows - 1, 5)
         one.launch(x[at:at+1], ids[at:at+1], routes[at:at+1], *ws, one_out, one_scratch, scalars=(1,))
         assert torch.equal(one_out, actual[at:at+1])
+    if rows in (1, 16, 64, 640):
+        legacy = replace(g, activations="a16")
+        old = compile_fp8_moe_aot(legacy, route="auto", max_rows=rows, wire=False)
+        old_scratch = torch.empty(fp8_moe_scratch_bytes(legacy, "auto", rows, False), device="cuda", dtype=torch.uint8)
+        def old_launch():
+            old.launch(x, ids, routes, *ws, out, old_scratch, scalars=(rows,))
+        def elapsed(call):
+            call()
+            torch.cuda.synchronize()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(10):
+                call()
+            end.record()
+            end.synchronize()
+            return start.elapsed_time(end) * 100.0
+        base_us, native_us = elapsed(old_launch), elapsed(launch)
+        print(f"timing tp={tp} rows={rows} w8a16_us={base_us:.3f} native_a8_us={native_us:.3f} speedup={base_us/native_us:.4f}")
+    print(f"replay_width tp={tp} rows={rows} passed")
     assert torch.all(error <= official * 1.01), "strict per-row native/official error bar"
