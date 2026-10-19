@@ -52,10 +52,7 @@ def reference(x, ids, routes, ws, exact=False):
         up = project(x[rows], ws[2][e], ws[3][e], exact).float()
         act = official_module().clamped_swiglu(gate.bfloat16().contiguous(), up.bfloat16().contiguous(), 7.0)
         outputs[rows, slots] = project(act, ws[4][e], ws[5][e], exact).float()
-    result = torch.zeros(x.shape, device=x.device)
-    for slot in range(ids.shape[1]):
-        result = result + outputs[:, slot] * routes[:, slot, None]
-    return result.bfloat16()
+    return official_module().weighted_topk_gather(outputs.bfloat16().contiguous(), routes)
 
 
 @pytest.mark.parametrize("rows", [1, 7, 8, 9, 16, 64, 640, 767, 768, 769, 2048, 2049])
@@ -89,6 +86,20 @@ def test_native_a8(rows):
     launch()
     torch.cuda.synchronize()
     actual = out.clone()
+    if rows == 640:
+        from b12x.integration.cuteafd.fp8_moe import _regions, _align
+        regions = _regions(g, "prefill", rows, False)
+        offsets = [0]
+        for region in regions:
+            offsets.append(offsets[-1] + _align(region))
+        grouped = regions[1] // 4
+        pair_rows = scratch[offsets[1]:offsets[1]+regions[1]].view(torch.int32)
+        live = pair_rows >= 0
+        candidate_q = scratch[offsets[3]:offsets[3]+regions[3]].reshape(grouped, h)[live]
+        candidate_s = scratch[offsets[4]:offsets[4]+regions[4]].view(torch.float32).reshape(grouped, h//128)[live]
+        reference_q, reference_s = official_module().act_quant(x[pair_rows[live].long()])
+        print(f"quant_input mismatched_values={(candidate_q != reference_q.view(torch.uint8)).sum().item()} "
+              f"mismatched_scales={(candidate_s != reference_s).sum().item()}")
     expected, fp64 = reference(x, ids, routes, ws, "official"), reference(x, ids, routes, ws, True)
     error = (actual.float() - fp64.float()).square().sum(1)
     official = (expected.float() - fp64.float()).square().sum(1)
