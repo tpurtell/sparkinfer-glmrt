@@ -57,7 +57,8 @@ def reverse_packing(state, rows):
 @pytest.mark.parametrize("group_rows", [16, 32, 64])
 @pytest.mark.skipif(not os.environ.get("CUTEAFD_EXLR8_SNAPSHOT"), reason="checkpoint fixture required")
 def test_checkpoint_grouped_matches_chunks(group_rows):
-    torch.cuda.set_per_process_memory_fraction(0.25)
+    torch.cuda.set_per_process_memory_fraction(min(
+        0.25, (12 << 30) / torch.cuda.get_device_properties(0).total_memory))
     case = Case(os.environ["CUTEAFD_EXLR8_SNAPSHOT"], layer=40, hidden=1152, units=3)
     rows, hidden, units, topk = 129, case.h, case.u, case.topk
     gen = torch.Generator().manual_seed(408)
@@ -100,7 +101,8 @@ def test_checkpoint_grouped_matches_chunks(group_rows):
 
 
 def test_every_live_row_count_matches_decode():
-    torch.cuda.set_per_process_memory_fraction(0.25)
+    torch.cuda.set_per_process_memory_fraction(min(
+        0.25, (12 << 30) / torch.cuda.get_device_properties(0).total_memory))
     hidden, units, topk, rows = 128, 1, 2, 4096
     gen = torch.Generator(device="cuda").manual_seed(408)
     owners = []
