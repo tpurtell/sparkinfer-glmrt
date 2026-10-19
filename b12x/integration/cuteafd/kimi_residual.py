@@ -76,7 +76,7 @@ def _normalize_bf16(values: cute.Tensor, weight: cute.Pointer, out: cute.Pointer
     for j in cutlass.range_constexpr(hidden // threads):
         square, correction = _accumulate(square, correction, values[j] * values[j])
     total = _accurate_sum(square, correction, sums, slot, threads // 32)
-    inv = _rsqrt(div_rn_f32(total, Float32(hidden)) + eps)
+    inv = cute.math.rsqrt(div_rn_f32(total, Float32(hidden)) + eps, fastmath=False)
     for j in cutlass.range_constexpr(hidden // threads):
         d = tid + Int64(j * threads)
         out[base + d] = (_bf16(values[j] * inv) * Float32(weight[d])).to(BFloat16)
@@ -197,7 +197,7 @@ class KimiAttnResRmsNorm:
                 for j in cutlass.range_constexpr(self.elements):
                     square, correction = _accumulate(square, correction, current[j] * current[j])
                 total = _accurate_sum(square, correction, sums, Int32(2 * c), self.warps)
-                inv = _rsqrt(div_rn_f32(total, Float32(self.hidden)) + eps)
+                inv = cute.math.rsqrt(div_rn_f32(total, Float32(self.hidden)) + eps, fastmath=False)
                 dot, correction = Float32(0), Float32(0)
                 for j in cutlass.range_constexpr(self.elements):
                     dot, correction = _accumulate(dot, correction, (current[j] * inv) * weight[j])
