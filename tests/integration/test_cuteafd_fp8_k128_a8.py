@@ -95,11 +95,37 @@ def test_native_a8(rows):
         grouped = regions[1] // 4
         pair_rows = scratch[offsets[1]:offsets[1]+regions[1]].view(torch.int32)
         live = pair_rows >= 0
-        candidate_q = scratch[offsets[3]:offsets[3]+regions[3]].reshape(grouped, h)[live]
-        candidate_s = scratch[offsets[4]:offsets[4]+regions[4]].view(torch.float32).reshape(grouped, h//128)[live]
+        def region(index, dtype, width):
+            return scratch[offsets[index]:offsets[index]+regions[index]].view(dtype).reshape(grouped, width)
+        candidate_q = region(3, torch.float8_e4m3fn, h)
+        candidate_s = region(4, torch.float32, h//128)
         reference_q, reference_s = official_module().act_quant(x[pair_rows[live].long()])
-        print(f"quant_input mismatched_values={(candidate_q != reference_q.view(torch.uint8)).sum().item()} "
-              f"mismatched_scales={(candidate_s != reference_s).sum().item()}")
+        assert torch.equal(candidate_q[live].view(torch.uint8), reference_q.view(torch.uint8))
+        assert torch.equal(candidate_s[live], reference_s)
+        act = region(6, torch.bfloat16, i)
+        down_q, down_s = region(7, torch.float8_e4m3fn, i), region(8, torch.float32, i//128)
+        rq, rs = official_module().act_quant(act[live].contiguous())
+        assert torch.equal(down_q[live].view(torch.uint8), rq.view(torch.uint8))
+        assert torch.equal(down_s[live], rs)
+        from b12x.integration.cuteafd._fp8_moe_kernels import META_HEAD
+        meta = scratch[:regions[0]].view(torch.int32)
+        tile_count = meta[1].item()
+        experts = meta[META_HEAD+3*e:META_HEAD+3*e+tile_count].repeat_interleave(16)
+        gu, down = region(5, torch.bfloat16, 2*i), region(9, torch.bfloat16, h)
+        differences = [0, 0, 0]
+        for expert in range(e):
+            positions = torch.where((experts == expert) & live[:tile_count*16])[0]
+            if not positions.numel():
+                continue
+            # Quantizer equality above makes these identical official operands.
+            for half, wi in ((0, 0), (1, 2)):
+                want = official_module().fp8_gemm(candidate_q[positions].contiguous(),
+                    candidate_s[positions].contiguous(), ws[wi][expert], ws[wi+1][expert])
+                differences[half] += (gu[positions, half*i:(half+1)*i] != want).sum().item()
+            want = official_module().fp8_gemm(down_q[positions].contiguous(),
+                down_s[positions].contiguous(), ws[4][expert], ws[5][expert])
+            differences[2] += (down[positions] != want).sum().item()
+        print(f"stage quant_input=exact quant_down=exact projection_differences={differences}")
     expected, fp64 = reference(x, ids, routes, ws, "official"), reference(x, ids, routes, ws, True)
     error = (actual.float() - fp64.float()).square().sum(1)
     official = (expected.float() - fp64.float()).square().sum(1)
