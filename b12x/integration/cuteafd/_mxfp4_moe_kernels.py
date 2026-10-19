@@ -101,7 +101,9 @@ class GroupedMxfp4Gemv:
         self.split = self.n if split is None else int(split)
         self.warps, self.groups = int(warps), int(groups)
         self.cols = 8 * self.groups
-        self.m_tiles = _ceil(max_rows, 16)
+        # Sparse routed groups rarely fill a second tile. Stream longer groups
+        # in independent chunks instead of reserving unused accumulators/SMEM.
+        self.m_tiles = _ceil(min(max_rows, 16), 16)
         self.gather = bool(gather)
         if self.n % self.cols or self.split % self.cols or self.k % 32 or self.k <= 0 or self.warps <= 0:
             raise ValueError("grouped MXFP4 GEMV needs N and the gate/up split % (8*groups) == 0 and "
