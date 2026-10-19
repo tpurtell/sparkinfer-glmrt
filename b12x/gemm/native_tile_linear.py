@@ -120,6 +120,14 @@ def _ld_cached_pred(address: Int64, r: Int32, rows: Int32, *, loc=None, ip=None)
 
 
 @dsl_user_op
+def _warp_uniform_i32(val: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(
+        T.i32(), [Int32(val).ir_value(loc=loc, ip=ip)],
+        "redux.sync.or.b32 $0, $1, 0xffffffff;", "=r,r",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+@dsl_user_op
 def _fma(a, b, c, *, loc=None, ip=None):
     """``a * b + c`` as one pinned fma.rn.f32."""
     return Float32(llvm.inline_asm(
@@ -245,7 +253,7 @@ class NativeTileLinear:
                 ctas = (self.n // self.cols + self.slots - 1) // self.slots
                 self.decode(x, payload, scales, output, rows).launch(
                     grid=(min(Int32(ctas), cta_limit), 1, 1), block=(self.d_threads, 1, 1),
-                    stream=stream, min_blocks_per_mp=3 if self.grouped else 2)
+                    stream=stream, min_blocks_per_mp=3 if (self.grouped and self.segments > 1) else 2)
             else:
                 tiles = ((rows + Int32(self.bm - 1)) // Int32(self.bm)) * Int32(self.n_tiles)
                 self.prefill(x, payload, scales, output, rows).launch(
@@ -369,7 +377,8 @@ class NativeTileLinear:
         cta, _, _ = cute.arch.block_idx()
         grid, _, _ = cute.arch.grid_dim()
         tid = Int32(tid)
-        lane, wid = tid & Int32(31), tid >> Int32(5)
+        lane = tid & Int32(31)
+        wid = _warp_uniform_i32(tid >> Int32(5)) if cutlass.const_expr(self.segments == 1) else (tid >> Int32(5))
         slot, seg = wid % Int32(self.slots), wid // Int32(self.slots)
         g, j = lane >> Int32(2), lane & Int32(3)
         smem = cutlass_utils.SmemAllocator()
@@ -584,7 +593,7 @@ class NativeTileLinear:
         l_sh3 = lane >> Int32(3)
         l_sh4 = lane >> Int32(4)
         while tile < tiles:
-            if cutlass.const_expr(self.grouped):
+            if cutlass.const_expr(self.side2):
                 m0 = (tile // Int32(self.n_tiles)) * Int32(self.bm)
                 n0 = (tile % Int32(self.n_tiles)) * Int32(self.bn)
             else:
@@ -611,10 +620,16 @@ class NativeTileLinear:
                     if cutlass.const_expr(self.grouped):
                         self._widen_stage(sw, wide, tid)
                         cute.arch.sync_threads()
-                        # Process K32 groups h = 0, 1 with 8x4 ldmatrix for B and direct scale loads
                         s_base = ss + (wn * Int32(8 * NG) + Int32(2) * j) * Int32(4)
                         b_base = wide + (wn * Int32(8 * NG) + l7) * Int32(128)
                         a_base = sa + (wm * Int32(16 * MT) + l15) * Int32(128)
+                        s_raw = cute.make_rmem_tensor((2 * NG,), Uint32)
+                        for gi in cutlass.range_constexpr(NG):
+                            r0, r1 = ld_shared_v2_u32(s_base + Int32(gi * 32))
+                            if cutlass.const_expr(not self.int4):
+                                sh = ((kc & Int32(1)) * Int32(16)).to(Uint32)
+                                r0, r1 = r0 >> sh, r1 >> sh
+                            s_raw[2 * gi], s_raw[2 * gi + 1] = r0, r1
                         for h in cutlass.range(2, unroll=1):
                             bw_h = cute.make_rmem_tensor((4 * NG,), Uint32)
                             sc_h = cute.make_rmem_tensor((2 * NG,), Float32)
@@ -623,12 +638,8 @@ class NativeTileLinear:
                                 b = ldmatrix_m8n8x4_b16(b_off + Int32(gi * 1024))
                                 for i in cutlass.range_constexpr(4):
                                     bw_h[4 * gi + i] = b[i]
-                                r0, r1 = ld_shared_v2_u32(s_base + Int32(gi * 32))
-                                if cutlass.const_expr(not self.int4):
-                                    sh = ((kc & Int32(1)) * Int32(16)).to(Uint32)
-                                    r0, r1 = r0 >> sh, r1 >> sh
-                                sc_h[2 * gi] = self._scale(r0, h)
-                                sc_h[2 * gi + 1] = self._scale(r1, h)
+                                sc_h[2 * gi] = self._scale(s_raw[2 * gi], h)
+                                sc_h[2 * gi + 1] = self._scale(s_raw[2 * gi + 1], h)
                             for mt in cutlass.range_constexpr(MT):
                                 xa_h = cute.make_rmem_tensor((8,), Uint32)
                                 for tp in cutlass.range_constexpr(2):
