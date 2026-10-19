@@ -81,7 +81,7 @@ def run_pair(args):
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, fp8_moe_scratch_bytes
     from b12x.integration.cuteafd._mxfp4_moe_kernels import GroupedMxfp4Gemv
     from b12x._lib.utils import get_hardware_info
-    from bench_cuteafd_mxfp4_down_a8 import wire_rows
+    from bench_cuteafd_mxfp4_down_a8 import wire_rows, gpu_snapshot
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.cuda.set_per_process_memory_fraction(.10)
@@ -110,7 +110,7 @@ def run_pair(args):
               "experts": g.experts, "top_k": g.top_k}, "capacity": capacity,
               "device": torch.cuda.get_device_name(),
               "sms": torch.cuda.get_device_properties(0).multi_processor_count,
-              "l2_bytes": l2_bytes, "rows": []}
+              "l2_bytes": l2_bytes, "gpu_before": gpu_snapshot(), "rows": []}
     for rows in widths:
         def launch(arm):
             out, scratch = buffers[arm]
@@ -154,6 +154,7 @@ def run_pair(args):
         result["rows"].append(record)
         print(json.dumps(record), flush=True)
         del graphs
+    result["gpu_after"] = gpu_snapshot()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
