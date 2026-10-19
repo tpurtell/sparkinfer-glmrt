@@ -82,8 +82,18 @@ def timing(graph, replays: int) -> float:
     return statistics.median(values)
 
 
+_PROFILER_WARMED = False
+
+
 def stage_profile(graph, directory: Path) -> dict:
+    global _PROFILER_WARMED
     from torch.profiler import ProfilerActivity, profile
+
+    if not _PROFILER_WARMED:
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]):
+            graph.replay()
+            torch.cuda.synchronize()
+        _PROFILER_WARMED = True
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         graph.replay()

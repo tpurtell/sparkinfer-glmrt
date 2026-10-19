@@ -269,7 +269,7 @@ class GroupedMxfp4Gemv:
                             s_hi = row0 + r_hi
                     src_lo[mt] = s_lo
                     src_hi[mt] = s_hi
-                if const_expr(self.blocks == 1 and not self.fuse_swiglu):
+                if const_expr(self.blocks == 1 and not self.fuse_swiglu and self.m_tiles > 1):
                     live_k = Int32(1)
                     if const_expr(self.k % (128 * self.warps) != 0):
                         live_k = (k_begin + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
@@ -351,14 +351,20 @@ class GroupedMxfp4Gemv:
                         live_k = Int32(1)
                         if const_expr(self.k % (128 * self.warps) != 0):
                             live_k = (k_begin + Int64(block) * Int64(128) + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
-                        factors = cute.make_rmem_tensor(cute.make_layout((self.total_groups,), stride=(1,)), Uint32)
-                        for gi in cutlass.range_constexpr(self.total_groups):
-                            factors[gi] = ue8m0_bf16x2(f_cur[gi])
-                        for chunk in cutlass.range_constexpr(2):
-                            k_off = (Int64(block) * Int64(128) + Int64(chunk * 16)) * Int64(2)
-                            if const_expr(self.m_tiles == 1):
-                                s_lo = src_lo[0]
-                                s_hi = src_hi[0]
+                        if const_expr(self.m_tiles == 1):
+                            wide = cute.make_rmem_tensor(cute.make_layout((16 * self.total_groups,), stride=(1,)), Uint32)
+                            for gi in cutlass.range_constexpr(self.total_groups):
+                                factor = ue8m0_bf16x2(f_cur[gi])
+                                for t in cutlass.range_constexpr(4):
+                                    v0, v1, v2, v3 = e2m1x8_scaled_bf16(cur[gi * 4 + t], factor)
+                                    wide[16 * gi + 4 * t] = v0
+                                    wide[16 * gi + 4 * t + 1] = v1
+                                    wide[16 * gi + 4 * t + 2] = v2
+                                    wide[16 * gi + 4 * t + 3] = v3
+                            s_lo = src_lo[0]
+                            s_hi = src_hi[0]
+                            for chunk in cutlass.range_constexpr(2):
+                                k_off = (Int64(block) * Int64(128) + Int64(chunk * 16)) * Int64(2)
                                 xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
                                 for i in cutlass.range_constexpr(16):
                                     xa[i] = Uint32(0)
@@ -377,35 +383,22 @@ class GroupedMxfp4Gemv:
                                         xa[8 + i] = lo[i]
                                         xa[12 + i] = hi[i]
                                 for gi in cutlass.range_constexpr(self.total_groups):
-                                    w0, w1, w2, w3 = e2m1x8_scaled_bf16(cur[gi * 4 + 2 * chunk], factors[gi])
-                                    w4, w5, w6, w7 = e2m1x8_scaled_bf16(cur[gi * 4 + 2 * chunk + 1], factors[gi])
                                     f = 4 * gi
-                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                        xa[0], xa[8], xa[1], xa[9], w0, w1)
-                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                        d0, d1, d2, d3, xa[2], xa[10], xa[3], xa[11], w2, w3)
-                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                        d0, d1, d2, d3, xa[4], xa[12], xa[5], xa[13], w4, w5)
-                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                        d0, d1, d2, d3, xa[6], xa[14], xa[7], xa[15], w6, w7)
-                                    acc[f] = d0
-                                    acc[f + 1] = d1
-                                    acc[f + 2] = d2
-                                    acc[f + 3] = d3
-                            else:
-                                wide = cute.make_rmem_tensor(cute.make_layout((8 * self.total_groups,), stride=(1,)), Uint32)
-                                for gi in cutlass.range_constexpr(self.total_groups):
-                                    w0, w1, w2, w3 = e2m1x8_scaled_bf16(cur[gi * 4 + 2 * chunk], factors[gi])
-                                    w4, w5, w6, w7 = e2m1x8_scaled_bf16(cur[gi * 4 + 2 * chunk + 1], factors[gi])
-                                    wide[8 * gi] = w0
-                                    wide[8 * gi + 1] = w1
-                                    wide[8 * gi + 2] = w2
-                                    wide[8 * gi + 3] = w3
-                                    wide[8 * gi + 4] = w4
-                                    wide[8 * gi + 5] = w5
-                                    wide[8 * gi + 6] = w6
-                                    wide[8 * gi + 7] = w7
+                                    for t in cutlass.range_constexpr(4):
+                                        d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                            acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                            xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
+                                            wide[16 * gi + 8 * chunk + 2 * t], wide[16 * gi + 8 * chunk + 2 * t + 1])
+                                        acc[f] = d0
+                                        acc[f + 1] = d1
+                                        acc[f + 2] = d2
+                                        acc[f + 3] = d3
+                        else:
+                            factors = cute.make_rmem_tensor(cute.make_layout((self.total_groups,), stride=(1,)), Uint32)
+                            for gi in cutlass.range_constexpr(self.total_groups):
+                                factors[gi] = ue8m0_bf16x2(f_cur[gi])
+                            for chunk in cutlass.range_constexpr(2):
+                                k_off = (Int64(block) * Int64(128) + Int64(chunk * 16)) * Int64(2)
                                 for mt in cutlass.range_constexpr(self.m_tiles):
                                     if Int32(mt) < live_tiles:
                                         s_lo = src_lo[mt]
@@ -428,16 +421,22 @@ class GroupedMxfp4Gemv:
                                                 xa[8 + i] = lo[i]
                                                 xa[12 + i] = hi[i]
                                         for gi in cutlass.range_constexpr(self.total_groups):
+                                            w0, w1, w2, w3 = e2m1x8_scaled_bf16(cur[gi * 4 + 2 * chunk], factors[gi])
+                                            w4, w5, w6, w7 = e2m1x8_scaled_bf16(cur[gi * 4 + 2 * chunk + 1], factors[gi])
                                             f = 4 * (mt * self.total_groups + gi)
-                                            for t in cutlass.range_constexpr(4):
-                                                d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                                    xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
-                                                    wide[8 * gi + 2 * t], wide[8 * gi + 2 * t + 1])
-                                                acc[f] = d0
-                                                acc[f + 1] = d1
-                                                acc[f + 2] = d2
-                                                acc[f + 3] = d3
+                                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                                xa[0], xa[8], xa[1], xa[9], w0, w1)
+                                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                d0, d1, d2, d3, xa[2], xa[10], xa[3], xa[11], w2, w3)
+                                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                d0, d1, d2, d3, xa[4], xa[12], xa[5], xa[13], w4, w5)
+                                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                d0, d1, d2, d3, xa[6], xa[14], xa[7], xa[15], w6, w7)
+                                            acc[f] = d0
+                                            acc[f + 1] = d1
+                                            acc[f + 2] = d2
+                                            acc[f + 3] = d3
                         for i in cutlass.range_constexpr(per_block):
                             cur[i] = nxt[i]
                         for i in cutlass.range_constexpr(self.total_groups):

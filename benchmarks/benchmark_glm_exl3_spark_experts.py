@@ -114,9 +114,15 @@ def load_control_modules(control_dir: Path):
     digest_tuple = tuple(digests)
     orig_compile = ctrl_k.b12x_compile
 
-    def _ctrl_compile(spec, *args, **kwargs):
-        spec = dataclasses.replace(spec, cache_key=("ctrl_w4a16", *digest_tuple, *spec.cache_key))
-        return orig_compile(spec, *args, **kwargs)
+    def _ctrl_compile(*args, **kwargs):
+        cs = kwargs.get("compile_spec")
+        if cs is not None:
+            new_json = cs.json_key + f"|ctrl:{digest_tuple}"
+            new_hash = hashlib.sha256(new_json.encode()).hexdigest()
+            kwargs["compile_spec"] = dataclasses.replace(
+                cs, kernel_id=cs.kernel_id + ".ctrl", json_key=new_json, hash_key=new_hash
+            )
+        return orig_compile(*args, **kwargs)
 
     ctrl_k.b12x_compile = _ctrl_compile
     ctrl_mt.b12x_compile = _ctrl_compile
@@ -193,8 +199,18 @@ def timing(graph, replays: int) -> float:
     return statistics.median(values)
 
 
+_PROFILER_WARMED = False
+
+
 def stage_profile(graph, directory: Path) -> dict:
+    global _PROFILER_WARMED
     from torch.profiler import ProfilerActivity, profile
+
+    if not _PROFILER_WARMED:
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]):
+            graph.replay()
+            torch.cuda.synchronize()
+        _PROFILER_WARMED = True
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         graph.replay()
