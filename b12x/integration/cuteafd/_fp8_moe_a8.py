@@ -2,7 +2,7 @@
 
 Every active K128 block on a live row is quantized to E4M3FN with:
   amax = max(|x_i|)
-  scale = max(amax, 1e-10) / 448.0
+  scale = div.rn.f32(max(amax, 1e-10), 448.0)
   inv_scale = div.rn.f32(1.0, scale)
   q_i = cvt.rn.satfinite.e4m3x2.f32(clamp(x_i * inv_scale, -448.0, 448.0))
 
@@ -13,38 +13,41 @@ accumulates 4 K32 MMA steps into a block-local F32 partial, then scales by
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Uint8, Uint32
-from cutlass.cute.runtime import from_dlpack
+import cutlass.utils as cutlass_utils
+from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
+    cp_async4_shared_global,
+    cp_async_u32_shared_global,
     cvt_f32x4_to_e4m3x4,
     div_rn_f32,
-    ld_global_v4_u32,
+    fabs_f32,
+    fmax_f32,
+    fmin_f32,
     ld_shared_f32,
+    ld_shared_u32,
     ldmatrix_m8n8x4_b16,
     mma_m16n8k32_f32_e4m3,
     pack_f32x2_to_bfloat2,
-    smem_ptr_to_u32,
+    shared_ptr_to_u32,
+    st_global_f32,
     st_global_u32,
     st_shared_u32,
-    st_shared_v4_u32,
+    warp_reduce,
 )
-from b12x.integration.cuteafd._fp8_moe_kernels import (
-    _bf16_hi,
-    _bf16_lo,
+from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
+
+from ._fp8_moe_kernels import (
     _ceil,
-    _chunk,
-    _f32_at,
     _i32_at,
     _ld_v2_u32,
     _post_silu_product,
     _round_bf16,
-    _silu,
-    _st_u32,
 )
-from b12x.integration.cuteafd._fp8_moe_stream import _swiglu16
+from ._fp8_moe_stream import STREAM_TILE_M, _chunk
 
 
 @cute.jit
@@ -57,25 +60,20 @@ def _quantize_k128_warp(
     q_at: Int64,
     s_at: Int64,
 ):
-    a0 = cute.arch.fmax(cute.math.abs(v0), cute.math.abs(v1))
-    a1 = cute.arch.fmax(cute.math.abs(v2), cute.math.abs(v3))
-    amax = cute.arch.fmax(a0, a1)
-    for mask in (16, 8, 4, 2, 1):
-        amax = cute.arch.fmax(
-            amax,
-            cute.arch.shuffle_sync_bfly(amax, offset=mask, mask=-1, mask_and_clamp=31),
-        )
-    amax = cutlass.select_(amax > Float32(1e-10), amax, Float32(1e-10))
-    scale = amax * Float32(1.0 / 448.0)
+    a0 = fmax_f32(fabs_f32(v0), fabs_f32(v1))
+    a1 = fmax_f32(fabs_f32(v2), fabs_f32(v3))
+    amax = warp_reduce(fmax_f32(a0, a1), fmax_f32)
+    amax = fmax_f32(amax, Float32(1e-10))
+    scale = div_rn_f32(amax, Float32(448.0))
     inv = div_rn_f32(Float32(1.0), scale)
-    s0 = cute.arch.fmin(cute.arch.fmax(v0 * inv, Float32(-448.0)), Float32(448.0))
-    s1 = cute.arch.fmin(cute.arch.fmax(v1 * inv, Float32(-448.0)), Float32(448.0))
-    s2 = cute.arch.fmin(cute.arch.fmax(v2 * inv, Float32(-448.0)), Float32(448.0))
-    s3 = cute.arch.fmin(cute.arch.fmax(v3 * inv, Float32(-448.0)), Float32(448.0))
+    s0 = fmin_f32(fmax_f32(v0 * inv, Float32(-448.0)), Float32(448.0))
+    s1 = fmin_f32(fmax_f32(v1 * inv, Float32(-448.0)), Float32(448.0))
+    s2 = fmin_f32(fmax_f32(v2 * inv, Float32(-448.0)), Float32(448.0))
+    s3 = fmin_f32(fmax_f32(v3 * inv, Float32(-448.0)), Float32(448.0))
     packed = cvt_f32x4_to_e4m3x4(s0, s1, s2, s3)
     st_global_u32(q_at + Int64(lane) * Int64(4), packed)
     if lane == Int32(0):
-        cute.make_ptr(Float32, s_at, cute.AddressSpace.gmem, assumed_align=4)[0] = scale
+        st_global_f32(s_at, scale)
 
 
 class QuantRowsA8:
@@ -97,10 +95,10 @@ class QuantRowsA8:
         xq: cute.Pointer,
         xs: cute.Pointer,
         rows: Int32,
-        stream,
+        stream: cuda.CUstream,
     ):
         self.kernel(x, xq, xs, rows).launch(
-            grid=(rows, _ceil(Int32(self.blocks), 4), 1),
+            grid=(rows, _ceil(self.blocks, 4), 1),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -113,12 +111,13 @@ class QuantRowsA8:
         xs: cute.Pointer,
         rows: Int32,
     ):
-        row, grp, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()
+        row = Int32(cute.arch.block_idx()[0])
+        grp = Int32(cute.arch.block_idx()[1])
+        tid = Int32(cute.arch.thread_idx()[0])
         warp = tid // Int32(32)
         lane = tid & Int32(31)
         blk = grp * Int32(4) + warp
-        if row < rows and blk < Int32(self.blocks):
+        if (row < rows) & (blk < Int32(self.blocks)):
             col = blk * Int32(128) + lane * Int32(4)
             p0, p1 = _ld_v2_u32(
                 Int64(x.toint()) + (Int64(row) * Int64(self.k) + Int64(col)) * Int64(2)
@@ -155,12 +154,11 @@ class ChunkQuantA8:
         meta: cute.Pointer,
         aq: cute.Pointer,
         a_s: cute.Pointer,
-        stream,
+        pairs: Int32,
+        stream: cuda.CUstream,
     ):
-        tiles = _i32_at(Int64(meta.toint()), self.experts)
-        pairs = _i32_at(Int64(meta.toint()), self.experts + 1)
-        self.kernel(act, meta, aq, a_s, tiles, pairs).launch(
-            grid=(pairs, _ceil(Int32(self.blocks), 4), 1),
+        self.kernel(act, meta, aq, a_s).launch(
+            grid=(pairs, _ceil(self.blocks, 4), 1),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -172,45 +170,49 @@ class ChunkQuantA8:
         meta: cute.Pointer,
         aq: cute.Pointer,
         a_s: cute.Pointer,
-        tiles: Int32,
-        pairs: Int32,
     ):
-        p, grp, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()
+        p = Int32(cute.arch.block_idx()[0])
+        grp = Int32(cute.arch.block_idx()[1])
+        tid = Int32(cute.arch.thread_idx()[0])
         warp = tid // Int32(32)
         lane = tid & Int32(31)
         blk = grp * Int32(4) + warp
-        if p < pairs and blk < Int32(self.blocks):
+        tiles = _i32_at(Int64(meta.toint()), 1)
+        used = _i32_at(Int64(meta.toint()), 2)
+        if (p < used) & (blk < Int32(self.blocks)):
             lo = Int32(0)
             hi = tiles
             while lo + Int32(1) < hi:
                 mid = (lo + hi) // Int32(2)
                 _, first_m, _ = _chunk(meta, self.experts, mid)
-                if p < first_m:
-                    hi = mid
-                else:
+                if first_m <= p:
                     lo = mid
-            _, first, _ = _chunk(meta, self.experts, lo)
-            i = lo * Int32(128) + (p - first)
-            col = blk * Int32(128) + lane * Int32(4)
-            p0, p1 = _ld_v2_u32(
-                Int64(act.toint())
-                + (Int64(p) * Int64(self.inter) + Int64(col)) * Int64(2)
-            )
-            v0 = _bf16_lo(p0)
-            v1 = _bf16_hi(p0)
-            v2 = _bf16_lo(p1)
-            v3 = _bf16_hi(p1)
-            q_at = (
-                Int64(aq.toint())
-                + Int64(i) * Int64(self.inter)
-                + Int64(blk) * Int64(128)
-            )
-            s_at = (
-                Int64(a_s.toint())
-                + (Int64(i) * Int64(self.blocks) + Int64(blk)) * Int64(4)
-            )
-            _quantize_k128_warp(v0, v1, v2, v3, lane, q_at, s_at)
+                else:
+                    hi = mid
+            if lo < tiles:
+                _, first, live = _chunk(meta, self.experts, lo)
+                r = p - first
+                if r < live:
+                    i = Int64(lo) * Int64(STREAM_TILE_M) + Int64(r)
+                    col = blk * Int32(128) + lane * Int32(4)
+                    p0, p1 = _ld_v2_u32(
+                        Int64(act.toint())
+                        + (Int64(p) * Int64(self.inter) + Int64(col)) * Int64(2)
+                    )
+                    v0 = _bf16_lo(p0)
+                    v1 = _bf16_hi(p0)
+                    v2 = _bf16_lo(p1)
+                    v3 = _bf16_hi(p1)
+                    q_at = (
+                        Int64(aq.toint())
+                        + i * Int64(self.inter)
+                        + Int64(blk) * Int64(128)
+                    )
+                    s_at = (
+                        Int64(a_s.toint())
+                        + (i * Int64(self.blocks) + Int64(blk)) * Int64(4)
+                    )
+                    _quantize_k128_warp(v0, v1, v2, v3, lane, q_at, s_at)
 
 
 class ChunkSwiGLUA8:
@@ -244,9 +246,13 @@ class ChunkSwiGLUA8:
         u = up
         if cutlass.const_expr(self.limit > 0.0):
             lim = Float32(self.limit)
-            g = cute.arch.fmin(g, lim)
-            u = cute.arch.fmax(cute.arch.fmin(u, lim), -lim)
-        return _round_bf16(_round_bf16(_silu(g)) * _round_bf16(u))
+            g = cutlass.select_(g > lim, lim, g)
+            u = cutlass.select_(u > lim, lim, u)
+            u = cutlass.select_(u < -lim, -lim, u)
+        silu = _round_bf16(
+            div_rn_f32(g, Float32(1.0) + cute.math.exp(-g, fastmath=False))
+        )
+        return _round_bf16(silu * u)
 
     @cute.jit
     def __call__(
@@ -256,12 +262,11 @@ class ChunkSwiGLUA8:
         meta: cute.Pointer,
         aq: cute.Pointer,
         a_s: cute.Pointer,
-        stream,
+        pairs: Int32,
+        stream: cuda.CUstream,
     ):
-        tiles = _i32_at(Int64(meta.toint()), self.experts)
-        pairs = _i32_at(Int64(meta.toint()), self.experts + 1)
-        self.kernel(g, u, meta, aq, a_s, tiles, pairs).launch(
-            grid=(pairs, _ceil(Int32(self.blocks), 4), 1),
+        self.kernel(g, u, meta, aq, a_s).launch(
+            grid=(pairs, _ceil(self.blocks, 4), 1),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -274,44 +279,48 @@ class ChunkSwiGLUA8:
         meta: cute.Pointer,
         aq: cute.Pointer,
         a_s: cute.Pointer,
-        tiles: Int32,
-        pairs: Int32,
     ):
-        p, grp, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()
+        p = Int32(cute.arch.block_idx()[0])
+        grp = Int32(cute.arch.block_idx()[1])
+        tid = Int32(cute.arch.thread_idx()[0])
         warp = tid // Int32(32)
         lane = tid & Int32(31)
         blk = grp * Int32(4) + warp
-        if p < pairs and blk < Int32(self.blocks):
+        tiles = _i32_at(Int64(meta.toint()), 1)
+        used = _i32_at(Int64(meta.toint()), 2)
+        if (p < used) & (blk < Int32(self.blocks)):
             lo = Int32(0)
             hi = tiles
             while lo + Int32(1) < hi:
                 mid = (lo + hi) // Int32(2)
                 _, first_m, _ = _chunk(meta, self.experts, mid)
-                if p < first_m:
-                    hi = mid
-                else:
+                if first_m <= p:
                     lo = mid
-            _, first, _ = _chunk(meta, self.experts, lo)
-            i = lo * Int32(128) + (p - first)
-            col = blk * Int32(128) + lane * Int32(4)
-            off = (Int64(p) * Int64(self.inter) + Int64(col)) * Int64(2)
-            gp0, gp1 = _ld_v2_u32(Int64(g.toint()) + off)
-            up0, up1 = _ld_v2_u32(Int64(u.toint()) + off)
-            v0 = self._act(_bf16_lo(gp0), _bf16_lo(up0))
-            v1 = self._act(_bf16_hi(gp0), _bf16_hi(up0))
-            v2 = self._act(_bf16_lo(gp1), _bf16_lo(up1))
-            v3 = self._act(_bf16_hi(gp1), _bf16_hi(up1))
-            q_at = (
-                Int64(aq.toint())
-                + Int64(i) * Int64(self.inter)
-                + Int64(blk) * Int64(128)
-            )
-            s_at = (
-                Int64(a_s.toint())
-                + (Int64(i) * Int64(self.blocks) + Int64(blk)) * Int64(4)
-            )
-            _quantize_k128_warp(v0, v1, v2, v3, lane, q_at, s_at)
+                else:
+                    hi = mid
+            if lo < tiles:
+                _, first, live = _chunk(meta, self.experts, lo)
+                r = p - first
+                if r < live:
+                    i = Int64(lo) * Int64(STREAM_TILE_M) + Int64(r)
+                    col = blk * Int32(128) + lane * Int32(4)
+                    off = (Int64(p) * Int64(self.inter) + Int64(col)) * Int64(2)
+                    gp0, gp1 = _ld_v2_u32(Int64(g.toint()) + off)
+                    up0, up1 = _ld_v2_u32(Int64(u.toint()) + off)
+                    v0 = self._act(_bf16_lo(gp0), _bf16_lo(up0))
+                    v1 = self._act(_bf16_hi(gp0), _bf16_hi(up0))
+                    v2 = self._act(_bf16_lo(gp1), _bf16_lo(up1))
+                    v3 = self._act(_bf16_hi(gp1), _bf16_hi(up1))
+                    q_at = (
+                        Int64(aq.toint())
+                        + i * Int64(self.inter)
+                        + Int64(blk) * Int64(128)
+                    )
+                    s_at = (
+                        Int64(a_s.toint())
+                        + (i * Int64(self.blocks) + Int64(blk)) * Int64(4)
+                    )
+                    _quantize_k128_warp(v0, v1, v2, v3, lane, q_at, s_at)
 
 
 class StreamFp8LinearA8:
@@ -350,11 +359,11 @@ class StreamFp8LinearA8:
         self.stages = int(stages)
         self.gather = bool(gather)
 
-        self.m_warps = 2 if self.tile_m >= 64 else 1
+        self.warp_rows = 16 if self.tile_m == 16 else 32
+        self.m_warps = self.tile_m // self.warp_rows
         self.n_warps = 2
         self.warps = self.m_warps * self.n_warps
         self.threads = self.warps * 32
-        self.warp_rows = self.tile_m // self.m_warps
         self.warp_cols = self.tile_n // self.n_warps
         self.m_tiles = self.warp_rows // 16
         self.n_tiles = self.warp_cols // 8
@@ -363,7 +372,7 @@ class StreamFp8LinearA8:
         self.tile_bytes = self.tile_m * self.stride
         self.weight_bytes = self.tile_n * self.stride
         self.sc_bytes = self.tile_m * 4
-        self.weight_sc_bytes = 16
+        self.weight_sc_bytes = 64 if self.tile_m == 16 else 128
         self.stage_bytes = (
             self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
         )
@@ -383,6 +392,18 @@ class StreamFp8LinearA8:
             self.gather,
         )
 
+    def _storage(self):
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "ring": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, self.smem_bytes], 128
+            ],
+        }
+        return cute.struct(Storage)
+
+    @cute.jit
     def _stage_ptrs(self, smem: Int32, stage: Int32):
         base = smem + stage * Int32(self.stage_bytes)
         sa = base
@@ -409,42 +430,39 @@ class StreamFp8LinearA8:
         tile: Int32,
         k_blk: Int32,
     ):
-        idx = tid
-        while idx < Int32(self.tile_m * 8):
-            row = idx >> Int32(3)
-            col_vec = idx & Int32(7)
-            dst_vec = col_vec ^ self._swizzle(row)
-            dst = sa + row * Int32(self.stride) + dst_vec * Int32(16)
-            if row < live:
-                src_row = tile * Int32(128) + row
-                if cutlass.const_expr(self.gather):
-                    src_row = _i32_at(Int64(pair_row.toint()), first + row)
-                src = (
-                    Int64(aq.toint())
-                    + Int64(src_row) * Int64(self.k)
-                    + Int64(k_blk * 128 + col_vec * 16)
-                )
-                v0, v1, v2, v3 = ld_global_v4_u32(src)
-                st_shared_v4_u32(dst, v0, v1, v2, v3)
-            else:
-                z = Uint32(0)
-                st_shared_v4_u32(dst, z, z, z, z)
-            idx = idx + Int32(self.threads)
+        for q in cutlass.range_constexpr(_ceil(self.tile_m * 8, self.threads)):
+            idx = tid + Int32(q * self.threads)
+            if idx < Int32(self.tile_m * 8):
+                row = idx >> Int32(3)
+                col_vec = idx & Int32(7)
+                dst_vec = col_vec ^ self._swizzle(row)
+                dst = sa + row * Int32(self.stride) + dst_vec * Int32(16)
+                if row < live:
+                    src_row = tile * Int32(128) + row
+                    if cutlass.const_expr(self.gather):
+                        src_row = _i32_at(Int64(pair_row.toint()), first + row)
+                    src = (
+                        Int64(aq.toint())
+                        + Int64(src_row) * Int64(self.k)
+                        + Int64(k_blk * 128)
+                        + Int64(col_vec * 16)
+                    )
+                    cp_async4_shared_global(dst, src)
 
-        sidx = tid
-        while sidx < Int32(self.tile_m):
-            if sidx < live:
-                src_row = tile * Int32(128) + sidx
-                if cutlass.const_expr(self.gather):
-                    src_row = _i32_at(Int64(pair_row.toint()), first + sidx)
-                s_addr = (
-                    Int64(a_s.toint())
-                    + (Int64(src_row) * Int64(self.blocks) + Int64(k_blk)) * Int64(4)
-                )
-                st_shared_u32(ssa + sidx * Int32(4), ld_global_u32(s_addr))
-            else:
-                st_shared_u32(ssa + sidx * Int32(4), Uint32(0))
-            sidx = sidx + Int32(self.threads)
+        for q in cutlass.range_constexpr(_ceil(self.tile_m, self.threads)):
+            sidx = tid + Int32(q * self.threads)
+            if sidx < Int32(self.tile_m):
+                if sidx < live:
+                    src_row = tile * Int32(128) + sidx
+                    if cutlass.const_expr(self.gather):
+                        src_row = _i32_at(Int64(pair_row.toint()), first + sidx)
+                    s_addr = (
+                        Int64(a_s.toint())
+                        + (Int64(src_row) * Int64(self.blocks) + Int64(k_blk)) * Int64(4)
+                    )
+                    cp_async_u32_shared_global(ssa + sidx * Int32(4), s_addr)
+                else:
+                    st_shared_u32(ssa + sidx * Int32(4), Uint32(0))
 
     @cute.jit
     def _load_b(
@@ -463,47 +481,46 @@ class StreamFp8LinearA8:
             + (Int64(expert) * Int64(self.n) + Int64(n0)) * Int64(self.k)
             + Int64(k_blk * 128)
         )
-        idx = tid
-        while idx < Int32(self.tile_n * 8):
-            row = idx >> Int32(3)
-            col_vec = idx & Int32(7)
-            dst_vec = col_vec ^ self._swizzle(row)
-            dst = sb + row * Int32(self.stride) + dst_vec * Int32(16)
-            src = w_base + Int64(row) * Int64(self.k) + Int64(col_vec * 16)
-            v0, v1, v2, v3 = ld_global_v4_u32(src)
-            st_shared_v4_u32(dst, v0, v1, v2, v3)
-            idx = idx + Int32(self.threads)
+        for q in cutlass.range_constexpr(_ceil(self.tile_n * 8, self.threads)):
+            idx = tid + Int32(q * self.threads)
+            if idx < Int32(self.tile_n * 8):
+                row = idx >> Int32(3)
+                col_vec = idx & Int32(7)
+                dst_vec = col_vec ^ self._swizzle(row)
+                dst = sb + row * Int32(self.stride) + dst_vec * Int32(16)
+                src = w_base + Int64(row) * Int64(self.k) + Int64(col_vec * 16)
+                cp_async4_shared_global(dst, src)
         if tid == Int32(0):
             s_idx = (
-                Int64(expert) * Int64(self.n // 128) + Int64(n0 // 128)
+                Int64(expert) * Int64(self.n // 128) + Int64(n0 // Int32(128))
             ) * Int64(self.blocks) + Int64(k_blk)
-            st_shared_u32(ssb, ld_global_u32(Int64(w_s.toint()) + s_idx * Int64(4)))
+            cp_async_u32_shared_global(ssb, Int64(w_s.toint()) + s_idx * Int64(4))
 
     @cute.jit
     def _mma_stage(
         self,
         smem: Int32,
         stage: Int32,
-        acc,
+        acc: cute.Tensor,
         warp_m: Int32,
         warp_n: Int32,
         q: Int32,
         c: Int32,
         mat: Int32,
         mrow: Int32,
-        dual_scale: bool = False,
+        dual_scale: cutlass.Constexpr = False,
     ):
         sa, sb, ssa, ssb = self._stage_ptrs(smem, stage)
         w_scale = ld_shared_f32(ssb)
         if cutlass.const_expr(dual_scale):
             w_scale = ld_shared_f32(ssb + warp_n * Int32(4))
 
-        part = cute.make_rmem_tensor((self.frags,), Float32)
+        part = cute.make_rmem_tensor(cute.make_layout((self.frags,), stride=(1,)), Float32)
         for fi in cutlass.range_constexpr(self.frags):
             part[fi] = Float32(0.0)
 
-        a = cute.make_rmem_tensor((self.m_tiles * 4,), Uint32)
-        bw = cute.make_rmem_tensor((self.n_tiles * 2,), Uint32)
+        a = cute.make_rmem_tensor(cute.make_layout((self.m_tiles * 4,), stride=(1,)), Uint32)
+        bw = cute.make_rmem_tensor(cute.make_layout((self.n_tiles * 2,), stride=(1,)), Uint32)
         swz = self._swizzle(mrow)
 
         for ks in cutlass.range_constexpr(4):
@@ -584,13 +601,13 @@ class StreamFp8LinearA8:
         w_s: cute.Pointer,
         out: cute.Pointer,
         max_tiles: Int32,
-        stream,
+        stream: cuda.CUstream,
     ):
         self.kernel(aq, a_s, pair_row, meta, wq, w_s, out).launch(
-            grid=(max_tiles, self.n // self.tile_n, 1),
+            grid=(self.n // self.tile_n, max_tiles, 1),
             block=(self.threads, 1, 1),
-            smem=self.smem_bytes,
             stream=stream,
+            min_blocks_per_mp=1,
         )
 
     @cute.kernel
@@ -604,73 +621,65 @@ class StreamFp8LinearA8:
         w_s: cute.Pointer,
         out: cute.Pointer,
     ):
-        tile, n_blk, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()
-        tiles = _i32_at(Int64(meta.toint()), self.experts)
+        n_blk = Int32(cute.arch.block_idx()[0])
+        tile = Int32(cute.arch.block_idx()[1])
+        tid = Int32(cute.arch.thread_idx()[0])
+        smem_alloc = cutlass_utils.SmemAllocator()
+        storage = smem_alloc.allocate(self._storage())
+        tiles = _i32_at(Int64(meta.toint()), 1)
         if tile < tiles:
             expert, first, count = _chunk(meta, self.experts, tile)
-            live = count
-            if live > Int32(self.tile_m):
-                live = Int32(self.tile_m)
-            if live >= Int32(self.live_min) and count <= Int32(self.live_max):
+            if (count >= Int32(self.live_min)) & (count <= Int32(self.live_max)):
+                live = count
                 n0 = n_blk * Int32(self.tile_n)
                 warp = tid // Int32(32)
                 lane = tid & Int32(31)
                 warp_m = warp // Int32(self.n_warps)
                 warp_n = warp % Int32(self.n_warps)
+                active = warp_m * Int32(self.warp_rows) < live
                 q = lane >> Int32(2)
                 c = lane & Int32(3)
                 mat = lane >> Int32(3)
                 mrow = lane & Int32(7)
 
-                smem = smem_ptr_to_u32(
-                    cute.arch.alloc_smem(Uint8, self.smem_bytes, alignment=128)
+                smem = shared_ptr_to_u32(storage.ring.data_ptr())
+                acc = cute.make_rmem_tensor(
+                    cute.make_layout((self.frags,), stride=(1,)), Float32
                 )
-                acc = cute.make_rmem_tensor((self.frags,), Float32)
                 for fi in cutlass.range_constexpr(self.frags):
                     acc[fi] = Float32(0.0)
 
-                sa0, sb0, ssa0, ssb0 = self._stage_ptrs(smem, Int32(0))
-                self._load_a(aq, a_s, pair_row, sa0, ssa0, tid, first, live, tile, Int32(0))
-                self._load_b(wq, w_s, sb0, ssb0, tid, expert, n0, Int32(0))
-                if cutlass.const_expr(self.stages == 3):
-                    if Int32(1) < Int32(self.blocks):
-                        sa1, sb1, ssa1, ssb1 = self._stage_ptrs(smem, Int32(1))
+                for pre in cutlass.range_constexpr(self.stages - 1):
+                    if cutlass.const_expr(pre < self.blocks):
+                        sap, sbp, ssap, ssbp = self._stage_ptrs(smem, Int32(pre))
                         self._load_a(
-                            aq, a_s, pair_row, sa1, ssa1, tid, first, live, tile, Int32(1)
+                            aq, a_s, pair_row, sap, ssap, tid, first, live, tile, Int32(pre)
                         )
-                        self._load_b(wq, w_s, sb1, ssb1, tid, expert, n0, Int32(1))
-                cute.arch.sync_threads()
+                        self._load_b(wq, w_s, sbp, ssbp, tid, expert, n0, Int32(pre))
+                    cute.arch.cp_async_commit_group()
 
-                k_blk = Int32(0)
-                stage = Int32(0)
-                while k_blk < Int32(self.blocks):
+                for k_blk in cutlass.range(self.blocks, unroll=1):
+                    cute.arch.cp_async_wait_group(self.stages - 2)
+                    cute.arch.sync_threads()
                     prefetch = k_blk + Int32(self.stages - 1)
                     if prefetch < Int32(self.blocks):
-                        next_stage = stage + Int32(self.stages - 1)
-                        if next_stage >= Int32(self.stages):
-                            next_stage = next_stage - Int32(self.stages)
+                        next_stage = prefetch % Int32(self.stages)
                         san, sbn, ssan, ssbn = self._stage_ptrs(smem, next_stage)
                         self._load_a(
                             aq, a_s, pair_row, san, ssan, tid, first, live, tile, prefetch
                         )
                         self._load_b(wq, w_s, sbn, ssbn, tid, expert, n0, prefetch)
-                    self._mma_stage(smem, stage, acc, warp_m, warp_n, q, c, mat, mrow)
-                    cute.arch.sync_threads()
-                    stage = stage + Int32(1)
-                    if stage == Int32(self.stages):
-                        stage = Int32(0)
-                    k_blk = k_blk + Int32(1)
-
-                for mt in cutlass.range_constexpr(self.m_tiles):
-                    for nt in cutlass.range_constexpr(self.n_tiles):
-                        f = 4 * (self.n_tiles * mt + nt)
-                        col = (
-                            n0
-                            + warp_n * Int32(self.warp_cols)
-                            + Int32(8 * nt)
-                            + c * Int32(2)
+                    cute.arch.cp_async_commit_group()
+                    if active:
+                        stage = k_blk % Int32(self.stages)
+                        self._mma_stage(
+                            smem, stage, acc, warp_m, warp_n, q, c, mat, mrow
                         )
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+
+                if active:
+                    for mt in cutlass.range_constexpr(self.m_tiles):
                         for half in cutlass.range_constexpr(2):
                             row = (
                                 warp_m * Int32(self.warp_rows)
@@ -678,18 +687,23 @@ class StreamFp8LinearA8:
                                 + q
                             )
                             if row < live:
-                                dst = (
-                                    Int64(out.toint())
-                                    + (Int64(first + row) * Int64(self.n) + Int64(col))
-                                    * Int64(2)
-                                )
-                                _st_u32(
-                                    dst,
-                                    pack_f32x2_to_bfloat2(
-                                        acc[f + 2 * half],
-                                        acc[f + 2 * half + 1],
-                                    ),
-                                )
+                                for nt in cutlass.range_constexpr(self.n_tiles):
+                                    f = 4 * (self.n_tiles * mt + nt) + 2 * half
+                                    col = (
+                                        n0
+                                        + warp_n * Int32(self.warp_cols)
+                                        + Int32(8 * nt)
+                                        + c * Int32(2)
+                                    )
+                                    dst = (
+                                        Int64(out.toint())
+                                        + (Int64(first + row) * Int64(self.n) + Int64(col))
+                                        * Int64(2)
+                                    )
+                                    st_global_u32(
+                                        dst,
+                                        pack_f32x2_to_bfloat2(acc[f], acc[f + 1]),
+                                    )
 
 
 class StreamFp8GateUpA8(StreamFp8LinearA8):
@@ -747,6 +761,22 @@ class StreamFp8GateUpA8(StreamFp8LinearA8):
         )
 
     @cute.jit
+    def _act(self, gate: Float32, up: Float32) -> Float32:
+        if cutlass.const_expr(self.post_clamp):
+            return _round_bf16(_post_silu_product(gate, up, self.limit))
+        g = gate
+        u = up
+        if cutlass.const_expr(self.limit > 0.0):
+            lim = Float32(self.limit)
+            g = cutlass.select_(g > lim, lim, g)
+            u = cutlass.select_(u > lim, lim, u)
+            u = cutlass.select_(u < -lim, -lim, u)
+        silu = _round_bf16(
+            div_rn_f32(g, Float32(1.0) + cute.math.exp(-g, fastmath=False))
+        )
+        return _round_bf16(silu * u)
+
+    @cute.jit
     def _load_gate_up_b(
         self,
         w1: cute.Pointer,
@@ -765,28 +795,31 @@ class StreamFp8GateUpA8(StreamFp8LinearA8):
         )
         w1_base = Int64(w1.toint()) + w_off
         w3_base = Int64(w3.toint()) + w_off
-        idx = tid
-        while idx < Int32(self.tile_n * 8):
-            row = idx >> Int32(3)
-            col_vec = idx & Int32(7)
-            dst_vec = col_vec ^ self._swizzle(row)
-            dst = sb + row * Int32(self.stride) + dst_vec * Int32(16)
-            src = w1_base + Int64(row) * Int64(self.k) + Int64(col_vec * 16)
-            if row >= Int32(self.half_n):
-                src = (
-                    w3_base
-                    + Int64(row - Int32(self.half_n)) * Int64(self.k)
-                    + Int64(col_vec * 16)
-                )
-            v0, v1, v2, v3 = ld_global_v4_u32(src)
-            st_shared_v4_u32(dst, v0, v1, v2, v3)
-            idx = idx + Int32(self.threads)
+        for q in cutlass.range_constexpr(_ceil(self.tile_n * 8, self.threads)):
+            idx = tid + Int32(q * self.threads)
+            if idx < Int32(self.tile_n * 8):
+                row = idx >> Int32(3)
+                col_vec = idx & Int32(7)
+                dst_vec = col_vec ^ self._swizzle(row)
+                dst = sb + row * Int32(self.stride) + dst_vec * Int32(16)
+                src = w1_base + Int64(row) * Int64(self.k) + Int64(col_vec * 16)
+                if row >= Int32(self.half_n):
+                    src = (
+                        w3_base
+                        + Int64(row - Int32(self.half_n)) * Int64(self.k)
+                        + Int64(col_vec * 16)
+                    )
+                cp_async4_shared_global(dst, src)
         if tid < Int32(2):
             s_idx = (
-                Int64(expert) * Int64(self.inter // 128) + Int64(n0 // 128)
+                Int64(expert) * Int64(self.inter // 128) + Int64(n0 // Int32(128))
             ) * Int64(self.blocks) + Int64(k_blk)
-            s_ptr = Int64(s1.toint()) if tid == Int32(0) else Int64(s3.toint())
-            st_shared_u32(ssb + tid * Int32(4), ld_global_u32(s_ptr + s_idx * Int64(4)))
+            s_ptr = cutlass.select_(
+                tid == Int32(0), Int64(s1.toint()), Int64(s3.toint())
+            )
+            cp_async_u32_shared_global(
+                ssb + tid * Int32(4), s_ptr + s_idx * Int64(4)
+            )
 
     @cute.jit
     def __call__(
@@ -801,13 +834,13 @@ class StreamFp8GateUpA8(StreamFp8LinearA8):
         s3: cute.Pointer,
         act: cute.Pointer,
         max_tiles: Int32,
-        stream,
+        stream: cuda.CUstream,
     ):
         self.kernel(xq, xs, pair_row, meta, w1, s1, w3, s3, act).launch(
-            grid=(max_tiles, self.inter // self.half_n, 1),
+            grid=(self.inter // self.half_n, max_tiles, 1),
             block=(self.threads, 1, 1),
-            smem=self.smem_bytes,
             stream=stream,
+            min_blocks_per_mp=1,
         )
 
     @cute.kernel
@@ -823,54 +856,51 @@ class StreamFp8GateUpA8(StreamFp8LinearA8):
         s3: cute.Pointer,
         act: cute.Pointer,
     ):
-        tile, n_blk, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()
-        tiles = _i32_at(Int64(meta.toint()), self.experts)
+        n_blk = Int32(cute.arch.block_idx()[0])
+        tile = Int32(cute.arch.block_idx()[1])
+        tid = Int32(cute.arch.thread_idx()[0])
+        smem_alloc = cutlass_utils.SmemAllocator()
+        storage = smem_alloc.allocate(self._storage())
+        tiles = _i32_at(Int64(meta.toint()), 1)
         if tile < tiles:
             expert, first, count = _chunk(meta, self.experts, tile)
-            live = count
-            if live > Int32(self.tile_m):
-                live = Int32(self.tile_m)
-            if live >= Int32(self.live_min) and count <= Int32(self.live_max):
+            if (count >= Int32(self.live_min)) & (count <= Int32(self.live_max)):
+                live = count
                 n0 = n_blk * Int32(self.half_n)
                 warp = tid // Int32(32)
                 lane = tid & Int32(31)
                 warp_m = warp // Int32(self.n_warps)
                 warp_n = warp % Int32(self.n_warps)
+                active = warp_m * Int32(self.warp_rows) < live
                 q = lane >> Int32(2)
                 c = lane & Int32(3)
                 mat = lane >> Int32(3)
                 mrow = lane & Int32(7)
 
-                smem = smem_ptr_to_u32(
-                    cute.arch.alloc_smem(Uint8, self.smem_bytes, alignment=128)
+                smem = shared_ptr_to_u32(storage.ring.data_ptr())
+                acc = cute.make_rmem_tensor(
+                    cute.make_layout((self.frags,), stride=(1,)), Float32
                 )
-                acc = cute.make_rmem_tensor((self.frags,), Float32)
                 for fi in cutlass.range_constexpr(self.frags):
                     acc[fi] = Float32(0.0)
 
-                sa0, sb0, ssa0, ssb0 = self._stage_ptrs(smem, Int32(0))
-                self._load_a(xq, xs, pair_row, sa0, ssa0, tid, first, live, tile, Int32(0))
-                self._load_gate_up_b(w1, s1, w3, s3, sb0, ssb0, tid, expert, n0, Int32(0))
-                if cutlass.const_expr(self.stages == 3):
-                    if Int32(1) < Int32(self.blocks):
-                        sa1, sb1, ssa1, ssb1 = self._stage_ptrs(smem, Int32(1))
+                for pre in cutlass.range_constexpr(self.stages - 1):
+                    if cutlass.const_expr(pre < self.blocks):
+                        sap, sbp, ssap, ssbp = self._stage_ptrs(smem, Int32(pre))
                         self._load_a(
-                            xq, xs, pair_row, sa1, ssa1, tid, first, live, tile, Int32(1)
+                            xq, xs, pair_row, sap, ssap, tid, first, live, tile, Int32(pre)
                         )
                         self._load_gate_up_b(
-                            w1, s1, w3, s3, sb1, ssb1, tid, expert, n0, Int32(1)
+                            w1, s1, w3, s3, sbp, ssbp, tid, expert, n0, Int32(pre)
                         )
-                cute.arch.sync_threads()
+                    cute.arch.cp_async_commit_group()
 
-                k_blk = Int32(0)
-                stage = Int32(0)
-                while k_blk < Int32(self.blocks):
+                for k_blk in cutlass.range(self.blocks, unroll=1):
+                    cute.arch.cp_async_wait_group(self.stages - 2)
+                    cute.arch.sync_threads()
                     prefetch = k_blk + Int32(self.stages - 1)
                     if prefetch < Int32(self.blocks):
-                        next_stage = stage + Int32(self.stages - 1)
-                        if next_stage >= Int32(self.stages):
-                            next_stage = next_stage - Int32(self.stages)
+                        next_stage = prefetch % Int32(self.stages)
                         san, sbn, ssan, ssbn = self._stage_ptrs(smem, next_stage)
                         self._load_a(
                             xq, xs, pair_row, san, ssan, tid, first, live, tile, prefetch
@@ -878,100 +908,70 @@ class StreamFp8GateUpA8(StreamFp8LinearA8):
                         self._load_gate_up_b(
                             w1, s1, w3, s3, sbn, ssbn, tid, expert, n0, prefetch
                         )
-                    self._mma_stage(
-                        smem,
-                        stage,
-                        acc,
-                        warp_m,
-                        warp_n,
-                        q,
-                        c,
-                        mat,
-                        mrow,
-                        dual_scale=True,
-                    )
-                    cute.arch.sync_threads()
-                    stage = stage + Int32(1)
-                    if stage == Int32(self.stages):
-                        stage = Int32(0)
-                    k_blk = k_blk + Int32(1)
+                    cute.arch.cp_async_commit_group()
+                    if active:
+                        stage = k_blk % Int32(self.stages)
+                        self._mma_stage(
+                            smem,
+                            stage,
+                            acc,
+                            warp_m,
+                            warp_n,
+                            q,
+                            c,
+                            mat,
+                            mrow,
+                            dual_scale=True,
+                        )
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
 
                 ring = smem
-                for mt in cutlass.range_constexpr(self.m_tiles):
-                    for nt in cutlass.range_constexpr(self.n_tiles):
-                        f = 4 * (self.n_tiles * mt + nt)
-                        col = (
-                            warp_n * Int32(self.warp_cols)
-                            + Int32(8 * nt)
-                            + c * Int32(2)
-                        )
+                if active:
+                    for mt in cutlass.range_constexpr(self.m_tiles):
                         for half in cutlass.range_constexpr(2):
                             row = (
                                 warp_m * Int32(self.warp_rows)
                                 + Int32(16 * mt + 8 * half)
                                 + q
                             )
-                            st_shared_u32(
-                                ring + row * Int32(self.x_stride) + col * Int32(2),
-                                pack_f32x2_to_bfloat2(
-                                    acc[f + 2 * half],
-                                    acc[f + 2 * half + 1],
-                                ),
-                            )
+                            for nt in cutlass.range_constexpr(self.n_tiles):
+                                f = 4 * (self.n_tiles * mt + nt) + 2 * half
+                                col = (
+                                    warp_n * Int32(self.warp_cols)
+                                    + Int32(8 * nt)
+                                    + c * Int32(2)
+                                )
+                                st_shared_u32(
+                                    ring + row * Int32(self.x_stride) + col * Int32(2),
+                                    pack_f32x2_to_bfloat2(acc[f], acc[f + 1]),
+                                )
                 cute.arch.sync_threads()
 
-                half_lane = lane & Int32(15)
-                lane_pair = lane & Int32(3)
-                sub = lane >> Int32(4)
-                idx = warp * Int32(2) + sub
-                while idx < live * Int32(self.half_n // 16):
-                    row = idx // Int32(self.half_n // 16)
-                    grp = idx - row * Int32(self.half_n // 16)
-                    v = _swiglu16(
-                        ring,
-                        row,
-                        grp,
-                        half_lane,
-                        self.x_stride,
-                        self.half_n,
-                        self.limit,
-                        self.post_clamp,
-                    )
-                    lo = cute.arch.shuffle_sync(
-                        v, offset=lane_pair * Int32(2), mask=-1, mask_and_clamp=31
-                    )
-                    hi = cute.arch.shuffle_sync(
-                        v,
-                        offset=lane_pair * Int32(2) + Int32(1),
-                        mask=-1,
-                        mask_and_clamp=31,
-                    )
-                    lo2 = cute.arch.shuffle_sync(
-                        v,
-                        offset=Int32(8) + lane_pair * Int32(2),
-                        mask=-1,
-                        mask_and_clamp=31,
-                    )
-                    hi2 = cute.arch.shuffle_sync(
-                        v,
-                        offset=Int32(8) + lane_pair * Int32(2) + Int32(1),
-                        mask=-1,
-                        mask_and_clamp=31,
-                    )
-                    if lane < Int32(4):
-                        p0 = pack_f32x2_to_bfloat2(lo, hi)
-                        p1 = pack_f32x2_to_bfloat2(lo2, hi2)
-                        base = (
+                pairs_per_row = self.half_n // 2
+                for it in cutlass.range_constexpr(
+                    _ceil(self.tile_m * pairs_per_row, self.threads)
+                ):
+                    idx = tid + Int32(it * self.threads)
+                    row = idx // Int32(pairs_per_row)
+                    col_pair = idx % Int32(pairs_per_row)
+                    if row < live:
+                        row_base = ring + row * Int32(self.x_stride)
+                        gp = ld_shared_u32(row_base + col_pair * Int32(4))
+                        up_p = ld_shared_u32(
+                            row_base + Int32(self.half_n * 2) + col_pair * Int32(4)
+                        )
+                        v0 = self._act(_bf16_lo(gp), _bf16_lo(up_p))
+                        v1 = self._act(_bf16_hi(gp), _bf16_hi(up_p))
+                        dst = (
                             Int64(act.toint())
                             + (
                                 Int64(first + row) * Int64(self.inter)
-                                + Int64(n0 + grp * Int32(16))
+                                + Int64(n0 + col_pair * Int32(2))
                             )
                             * Int64(2)
                         )
-                        _st_u32(base + Int64(lane_pair * Int32(4)), p0)
-                        _st_u32(base + Int64((lane_pair + Int32(4)) * Int32(4)), p1)
-                    idx = idx + Int32(self.warps * 2)
+                        st_global_u32(dst, pack_f32x2_to_bfloat2(v0, v1))
 
 
 __all__ = [

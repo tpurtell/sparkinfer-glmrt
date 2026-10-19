@@ -780,9 +780,9 @@ class _StreamFp8A8Route:
             self.chunk_quant = ChunkQuantA8(inter=i, experts=e)
             self.swiglu = None
             self.down = StreamFp8LinearA8(n=h, k=i, experts=e, live_min=17, gather=False)
-            self.small_gate = StreamFp8GateUpA8(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
-                                                activation=g.activation, tile_m=16, tile_n=128,
-                                                live_max=16, stages=SMALL_GATE_STAGES)
+            self.small_gate = tuple(StreamFp8GateUpA8(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+                                                      activation=g.activation, tile_m=16, tile_n=n,
+                                                      live_max=16, stages=SMALL_GATE_STAGES) for n in (64, 128))
             self.small_down = tuple(StreamFp8LinearA8(n=h, k=i, experts=e, tile_m=16, tile_n=n,
                                                       live_max=16, gather=False) for n in (64, 128))
         else:
@@ -790,7 +790,7 @@ class _StreamFp8A8Route:
             self.chunk_quant = None
             self.swiglu = ChunkSwiGLUA8(inter=i, experts=e, limit=g.swiglu_limit, activation=g.activation)
             self.down = StreamFp8LinearA8(n=h, k=i, experts=e, gather=False)
-            self.small_gate = None
+            self.small_gate = ()
             self.small_down = ()
         self.combine = MoeCombine(hidden=h, top_k=k)
 
@@ -799,7 +799,7 @@ class _StreamFp8A8Route:
                 None if self.chunk_quant is None else self.chunk_quant.key(),
                 None if self.swiglu is None else self.swiglu.key(),
                 self.down.key(), self.combine.key(),
-                None if self.small_gate is None else self.small_gate.key(),
+                tuple(p.key() for p in self.small_gate),
                 tuple(p.key() for p in self.small_down))
 
     @cute.jit
@@ -837,10 +837,13 @@ class _StreamFp8A8Route:
         self.rows_in(x, xq, xs, rows, stream)
         if cutlass.const_expr(self.fused):
             sms = runtime_num_sm()
-            self.small_gate(xq, xs, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
+            if Int32(g.top_k * (g.slice // 64)) >= sms * Int32(SMALL_GATE_CTAS_PER_SM):
+                self.small_gate[1](xq, xs, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
+            else:
+                self.small_gate[0](xq, xs, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
             if pairs > Int32(16):
                 self.gate_up(xq, xs, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
-            self.chunk_quant(act, meta, aq, a_s, stream)
+            self.chunk_quant(act, meta, aq, a_s, pairs, stream)
             if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
                 self.small_down[1](aq, a_s, pair_row, meta, w2, s2, y, max_tiles, stream)
             else:
@@ -850,7 +853,7 @@ class _StreamFp8A8Route:
         else:
             self.gate_up(xq, xs, pair_row, meta, w1, s1, act, max_tiles, stream)
             self.gate_up(xq, xs, pair_row, meta, w3, s3, up, max_tiles, stream)
-            self.swiglu(act, up, meta, aq, a_s, stream)
+            self.swiglu(act, up, meta, aq, a_s, pairs, stream)
             self.down(aq, a_s, pair_row, meta, w2, s2, y, max_tiles, stream)
         self.combine(y, pair_pos, weights, out, rows, stream)
 
