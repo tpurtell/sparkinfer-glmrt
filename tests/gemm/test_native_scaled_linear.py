@@ -46,7 +46,7 @@ def test_accuracy_and_row_invariance(encoding,side):
     err = torch.linalg.vector_norm(c.output.double()-ref)
     bound = torch.linalg.vector_norm(baseline-ref)
     assert err <= 1.01*bound,(err.item(),bound.item())
-    for rows in (1,2,7,8,9,15,16,17,31,32,33,63,64):
+    for rows in range(1, 65):
         for limit in (1,48,680,752):
             c.output.fill_(float("nan"))
             c.partial.fill_(float("nan"))

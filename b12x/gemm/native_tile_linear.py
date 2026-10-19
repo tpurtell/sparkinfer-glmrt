@@ -10,7 +10,7 @@ chain per segment, ascending over 64-wide K chunks; the segments then add in
 ascending order. Inside a chunk, ``fp8_row`` gives quad lane ``j`` the logical
 ``k = 16 j + 4 t + i`` of m16n8k16 step ``t`` (one 16-byte weight run per lane).
 Grouped encodings (``mxfp8``, ``int4_g32``) use a group-pure mapping,
-``k = 32 h + 8 j + 4 t' + i`` for steps ``2h + t'``, so one K32 group is exactly
+``k = 16 t + 2 j + i`` and ``k + 8`` for steps ``t = 2h + t'``, so one K32 group is exactly
 two MMA steps whose FP32 sum is then FMA'd into the chain with the group scale
 (``fma(sum, scale, chain)``, ascending groups). No live row count, tile shape or
 CTA count changes a chain: the decode route (weights streamed into registers,
@@ -34,6 +34,7 @@ from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32, cp_async4_shared_global_pred, cp_async_u32_shared_global,
     ld_global_nc_u32, ld_global_nc_v2_u32, ld_global_v2_u32, ld_shared_u32, ld_shared_v2_u32,
     ld_shared_v4_u32, shared_ptr_to_u32, st_global_v2_f32, u32_as_f32,
+    ldmatrix_m8n8x4_b16, ldmatrix_m8n8x2_b16,
 )
 from b12x.gemm.bf16_gemv._skinny import _ld_cached, _ld_stream
 
@@ -363,6 +364,26 @@ class NativeTileLinear:
                                 else:
                                     b0, b1 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + t])
                                 bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1] = b0, b1
+                        if cutlass.const_expr(self.grouped):
+                            # Packed contiguous K8 runs become standard K16 MMA
+                            # fragments. Shuffle first, then select this lane's pair.
+                            standard = cute.make_rmem_tensor((8 * G,), Uint32)
+                            for gi in cutlass.range_constexpr(G):
+                                for h in cutlass.range_constexpr(2):
+                                    for tp in cutlass.range_constexpr(2):
+                                        for half in cutlass.range_constexpr(2):
+                                            values = cute.make_rmem_tensor((4,), Uint32)
+                                            for i in cutlass.range_constexpr(4):
+                                                values[i] = cute.arch.shuffle_sync(
+                                                    bw[8 * gi + 4 * h + i],
+                                                    g * Int32(4) + Int32(2 * tp + half))
+                                            value = values[0]
+                                            for i in cutlass.range_constexpr(1, 4):
+                                                if j == Int32(i):
+                                                    value = values[i]
+                                            standard[8 * gi + 4 * h + 2 * tp + half] = value
+                            for i in cutlass.range_constexpr(8 * G):
+                                bw[i] = standard[i]
                         sc = cute.make_rmem_tensor((4 * G,), Float32)
                         if cutlass.const_expr(self.grouped):
                             for gi in cutlass.range_constexpr(G):
@@ -380,13 +401,18 @@ class NativeTileLinear:
                                 for hh in cutlass.range_constexpr(2):
                                     r = Int32(16 * mt + 8 * hh) + g
                                     if r < rows:
-                                        at = x_base + (r.to(Int64) * Int64(self.k) + k0.to(Int64)) * Int64(2)
-                                        lo = _ld_cached(at)
-                                        hi = _ld_cached(at + Int64(64 if self.grouped else 16))
-                                        for i in cutlass.range_constexpr(4):
-                                            xa[8 * hh + i], xa[8 * hh + 4 + i] = lo[i], hi[i]
-                                # Grouped: xa[0..3] row lo k 8j.. of group 0, [4..7] group 1;
-                                # step t = 2h + t' reads xa[2t], xa[2t+1] (k 32h + 8j + 4t' ..).
+                                        if cutlass.const_expr(self.grouped):
+                                            at = x.iterator.toint() + (r.to(Int64) * Int64(self.k)
+                                                 + k0.to(Int64) + j.to(Int64) * Int64(2)) * Int64(2)
+                                            for t in cutlass.range_constexpr(4):
+                                                xa[8 * hh + 2 * t] = ld_global_nc_u32(at + Int64(32 * t))
+                                                xa[8 * hh + 2 * t + 1] = ld_global_nc_u32(at + Int64(32 * t + 16))
+                                        else:
+                                            at = x_base + (r.to(Int64) * Int64(self.k) + k0.to(Int64)) * Int64(2)
+                                            lo = _ld_cached(at)
+                                            hi = _ld_cached(at + Int64(16))
+                                            for i in cutlass.range_constexpr(4):
+                                                xa[8 * hh + i], xa[8 * hh + 4 + i] = lo[i], hi[i]
                                 for gi in cutlass.range_constexpr(G):
                                     self._mma_chunk(acc, 4 * (mt * G + gi), xa, bw, gi, sc)
                     for i in cutlass.range_constexpr(self.wpb):
@@ -551,11 +577,12 @@ class NativeTileLinear:
                             b0, b1 = _e4m3x4_bf16(w[t])
                             bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1] = b0, b1
                     else:
-                        # k = 32 h + 8 j + 4 t' + i: BF16 units 4h + j.
-                        for h in cutlass.range_constexpr(2):
-                            w = ld_shared_v4_u32(wide + col * Int32(128) + (((Int32(4 * h) + j) ^ sw7) << Int32(4)))
-                            for i in cutlass.range_constexpr(4):
-                                bw[8 * gi + 4 * h + i] = w[i]
+                        br = wn * Int32(8 * NG) + Int32(8 * gi) + (lane & Int32(7))
+                        for t in cutlass.range_constexpr(4):
+                            unit = Int32(2 * t) + ((lane >> Int32(3)) & Int32(1))
+                            b0, b1 = ldmatrix_m8n8x2_b16(wide + br * Int32(128)
+                                + ((unit ^ (br & Int32(7))) << Int32(4)))
+                            bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1] = b0, b1
                         for e in cutlass.range_constexpr(2):
                             c0 = wn * Int32(8 * NG) + Int32(8 * gi) + Int32(2) * j + Int32(e)
                             for h in cutlass.range_constexpr(2):
@@ -570,12 +597,21 @@ class NativeTileLinear:
                     at_lo = sa + r_lo * Int32(128)
                     at_hi = at_lo + Int32(8 * 128)
                     sw7 = r_lo & Int32(7)
-                    for q in cutlass.range_constexpr(8):
-                        unit = c_lo if q < 4 else c_hi
-                        off = ((unit ^ sw7) << Int32(4)) + Int32(4 * (q % 4))
-                        t, odd = q // 2, q % 2
-                        xa[4 * t + 2 * odd] = ld_shared_u32(at_lo + off)
-                        xa[4 * t + 2 * odd + 1] = ld_shared_u32(at_hi + off)
+                    if cutlass.const_expr(self.grouped):
+                        ar = wm * Int32(16 * MT) + Int32(16 * mt) + (lane & Int32(15))
+                        for t in cutlass.range_constexpr(4):
+                            unit = Int32(2 * t) + (lane >> Int32(4))
+                            a = ldmatrix_m8n8x4_b16(sa + ar * Int32(128)
+                                + ((unit ^ (ar & Int32(7))) << Int32(4)))
+                            for i in cutlass.range_constexpr(4):
+                                xa[4 * t + i] = a[i]
+                    else:
+                        for q in cutlass.range_constexpr(8):
+                            unit = c_lo if q < 4 else c_hi
+                            off = ((unit ^ sw7) << Int32(4)) + Int32(4 * (q % 4))
+                            t, odd = q // 2, q % 2
+                            xa[4 * t + 2 * odd] = ld_shared_u32(at_lo + off)
+                            xa[4 * t + 2 * odd + 1] = ld_shared_u32(at_hi + off)
                     for gi in cutlass.range_constexpr(NG):
                         self._mma_chunk(acc, 4 * (mt * NG + gi), xa, bw, gi, sc, quad=True)
                 if cutlass.const_expr(self.segments > 1):
