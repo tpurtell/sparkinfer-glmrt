@@ -105,7 +105,10 @@ def test_native_a8(rows):
     official = (expected.float() - fp64.float()).square().sum(1)
     over = error > official * 1.01
     ratio = torch.where(official > 0, error / official, torch.where(error == 0, 0., float("inf")))
-    ulp = (actual.view(torch.int16).int() - expected.view(torch.int16).int()).abs()
+    def ordered_bf16(value):
+        bits = value.view(torch.int16).int()
+        return torch.where(bits < 0, -32768 - bits, bits)
+    ulp = (ordered_bf16(actual) - ordered_bf16(expected)).abs()
     print(f"tp={tp} rows={rows} native_error={error.sum().item():.9g} official_error={official.sum().item():.9g} "
           f"rows_over={over.sum().item()} worst_ratio={ratio.max().item()} max_ulp={ulp.max().item()}")
     # Report the strict bar after collecting replay/width evidence, including

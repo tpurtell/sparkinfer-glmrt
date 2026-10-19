@@ -7,8 +7,22 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
-from b12x._lib.intrinsics import div_rn_f32, mma_m16n8k32_f32_e4m3
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
+from b12x._lib.intrinsics import mma_m16n8k32_f32_e4m3
 from ._fp8_moe_kernels import _i32_at, META_HEAD
+
+
+@dsl_user_op
+def _div_full_f32(a: Float32, b: Float32, *, loc=None, ip=None):
+    # Match the checkpoint Triton quantizer, including reciprocal rounding.
+    return Float32(llvm.inline_asm(
+        T.f32(),
+        [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+        "div.full.f32 $0, $1, $2;", "=f,f,f",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    ))
 
 
 class QuantizeK128:
@@ -45,7 +59,7 @@ class QuantizeK128:
             amax = cutlass.select_(other > amax, other, amax)
         scale = amax * Float32(1.0 / 448.0)
         # Official wiring forms an F32 reciprocal then multiplies.
-        inv = div_rn_f32(Float32(1.0), scale)
+        inv = _div_full_f32(Float32(1.0), scale)
         if lane == Int32(0):
             scales[Int64(row) * Int64(self.blocks) + Int64(block)] = scale
         for j in cutlass.range_constexpr(4):
