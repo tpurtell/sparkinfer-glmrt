@@ -74,7 +74,7 @@ def router_rows(snapshot, layer, x):
 def run_pair(args):
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, fp8_moe_scratch_bytes
     from b12x.integration.cuteafd._mxfp4_moe_kernels import GroupedMxfp4Gemv
-    from b12x._lib.hardware_info import get_hardware_info
+    from b12x._lib.utils import get_hardware_info
     from bench_cuteafd_mxfp4_down_a8 import wire_rows
 
     torch.backends.cuda.matmul.allow_tf32 = False
