@@ -356,9 +356,6 @@ class GroupedMxfp4Gemv:
                         for block in cutlass.range(self.blocks, unroll=1):
                             if block + 1 < self.blocks:
                                 self._load_block(nxt, f_nxt, w_row_a, s_row_a, w_row_b, s_row_b, block + 1)
-                            live_k = Int32(1)
-                            if const_expr(self.k % (128 * self.warps) != 0):
-                                live_k = (k_begin + Int64(block) * Int64(128) + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
                             wide = cute.make_rmem_tensor(cute.make_layout((16 * self.total_groups,), stride=(1,)), Uint32)
                             for gi in cutlass.range_constexpr(self.total_groups):
                                 factor = ue8m0_bf16x2(f_cur[gi])
@@ -370,40 +367,62 @@ class GroupedMxfp4Gemv:
                                     wide[16 * gi + 4 * t + 3] = v3
                             for chunk in cutlass.range_constexpr(2):
                                 k_off = (Int64(block) * Int64(128) + Int64(chunk * 16)) * Int64(2)
-                                r_lo = g
-                                r_hi = r_lo + Int32(8)
-                                xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
-                                for i in cutlass.range_constexpr(16):
-                                    xa[i] = Uint32(0)
-                                if (r_lo < n_c) & (live_k != Int32(0)):
-                                    at = self._row_address(a, pair_row, row0 + r_lo) + x_off + k_off
-                                    lo = _ld_cached(at)
-                                    hi = _ld_cached(at + Int64(16))
-                                    for i in cutlass.range_constexpr(4):
-                                        xa[i] = lo[i]
-                                        xa[4 + i] = hi[i]
-                                if (r_hi < n_c) & (live_k != Int32(0)):
-                                    at = self._row_address(a, pair_row, row0 + r_hi) + x_off + k_off
-                                    lo = _ld_cached(at)
-                                    hi = _ld_cached(at + Int64(16))
-                                    for i in cutlass.range_constexpr(4):
-                                        xa[8 + i] = lo[i]
-                                        xa[12 + i] = hi[i]
-                                for gi in cutlass.range_constexpr(self.total_groups):
-                                    f = 4 * gi
-                                    for t in cutlass.range_constexpr(4):
-                                        d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                            acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                            xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
-                                            wide[16 * gi + 8 * chunk + 2 * t], wide[16 * gi + 8 * chunk + 2 * t + 1])
-                                        acc[f] = d0
-                                        acc[f + 1] = d1
-                                        acc[f + 2] = d2
-                                        acc[f + 3] = d3
+                                live_k = Int32(1)
+                                if const_expr(self.k % (128 * self.warps) != 0):
+                                    live_k = (k_begin + Int64(block) * Int64(128) + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
+                                for mt in cutlass.range_constexpr(self.m_tiles):
+                                    if Int32(mt) < live_tiles:
+                                        r_lo = Int32(16 * mt) + g
+                                        r_hi = r_lo + Int32(8)
+                                        xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
+                                        for i in cutlass.range_constexpr(16):
+                                            xa[i] = Uint32(0)
+                                        if (r_lo < n_c) & (live_k != Int32(0)):
+                                            at = self._row_address(a, pair_row, row0 + r_lo) + x_off + k_off
+                                            lo = _ld_cached(at)
+                                            hi = _ld_cached(at + Int64(16))
+                                            for i in cutlass.range_constexpr(4):
+                                                xa[i] = lo[i]
+                                                xa[4 + i] = hi[i]
+                                        if (r_hi < n_c) & (live_k != Int32(0)):
+                                            at = self._row_address(a, pair_row, row0 + r_hi) + x_off + k_off
+                                            lo = _ld_cached(at)
+                                            hi = _ld_cached(at + Int64(16))
+                                            for i in cutlass.range_constexpr(4):
+                                                xa[8 + i] = lo[i]
+                                                xa[12 + i] = hi[i]
+                                        for gi in cutlass.range_constexpr(self.total_groups):
+                                            f = 4 * (mt * self.total_groups + gi)
+                                            for t in cutlass.range_constexpr(4):
+                                                d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                                    xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
+                                                    wide[16 * gi + 8 * chunk + 2 * t], wide[16 * gi + 8 * chunk + 2 * t + 1])
+                                                acc[f] = d0
+                                                acc[f + 1] = d1
+                                                acc[f + 2] = d2
+                                                acc[f + 3] = d3
                             for i in cutlass.range_constexpr(per_block):
                                 cur[i] = nxt[i]
                             for i in cutlass.range_constexpr(self.total_groups):
                                 f_cur[i] = f_nxt[i]
+                        for i in cutlass.range_constexpr(self.frags):
+                            partial[(warp_id * Int32(self.frags) + Int32(i)) * Int32(32) + lane] = acc[i]
+                        cute.arch.sync_threads()
+                        for i in cutlass.range_constexpr(self.frags):
+                            if Int32(i % self.warps) == warp_id:
+                                total = Float32(0.0)
+                                for src in cutlass.range_constexpr(self.warps):
+                                    total = total + partial[(Int32(src * self.frags + i)) * Int32(32) + lane]
+                                mt = i // (4 * self.total_groups)
+                                gi = (i // 4) % self.total_groups
+                                row = Int32(16 * mt) + g + Int32(8 * ((i % 4) // 2))
+                                col = n0 + Int64(8 * gi) + Int64(2) * Int64(j) + Int64(i % 2)
+                                if row < n_c:
+                                    address = Int64(out.toint()) + (Int64(row0 + row) * Int64(self.out_cols) + col) * Int64(2)
+                                    target = cute.make_ptr(BFloat16, address, cute.AddressSpace.gmem, assumed_align=2)
+                                    target[0] = total.to(BFloat16)
+                        cute.arch.sync_threads()
                     else:
                         src_lo = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
                         src_hi = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
@@ -433,27 +452,26 @@ class GroupedMxfp4Gemv:
                             factors = cute.make_rmem_tensor(cute.make_layout((self.total_groups,), stride=(1,)), Uint32)
                             for gi in cutlass.range_constexpr(self.total_groups):
                                 factors[gi] = ue8m0_bf16x2(f_cur[gi])
-                            k_blk = x_off + Int64(block) * Int64(256)
-                            for mt in cutlass.range_constexpr(self.m_tiles):
-                                if Int32(mt) < live_tiles:
-                                    s_lo = src_lo[mt]
-                                    s_hi = src_hi[mt]
-                                    at_lo = Int64(a.toint()) + Int64(s_lo) * Int64(self.k * 2) + k_blk
-                                    at_hi = Int64(a.toint()) + Int64(s_hi) * Int64(self.k * 2) + k_blk
-                                    for chunk in cutlass.range_constexpr(2):
-                                        k_off = Int64(chunk * 32)
+                            for chunk in cutlass.range_constexpr(2):
+                                k_off = (Int64(block) * Int64(128) + Int64(chunk * 16)) * Int64(2)
+                                for mt in cutlass.range_constexpr(self.m_tiles):
+                                    if Int32(mt) < live_tiles:
+                                        s_lo = src_lo[mt]
+                                        s_hi = src_hi[mt]
                                         xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
                                         for i in cutlass.range_constexpr(16):
                                             xa[i] = Uint32(0)
                                         if (s_lo >= Int32(0)) & (live_k != Int32(0)):
-                                            lo = _ld_cached(at_lo + k_off)
-                                            hi = _ld_cached(at_lo + k_off + Int64(16))
+                                            at = Int64(a.toint()) + Int64(s_lo) * Int64(self.k * 2) + x_off + k_off
+                                            lo = _ld_cached(at)
+                                            hi = _ld_cached(at + Int64(16))
                                             for i in cutlass.range_constexpr(4):
                                                 xa[i] = lo[i]
                                                 xa[4 + i] = hi[i]
                                         if (s_hi >= Int32(0)) & (live_k != Int32(0)):
-                                            lo = _ld_cached(at_hi + k_off)
-                                            hi = _ld_cached(at_hi + k_off + Int64(16))
+                                            at = Int64(a.toint()) + Int64(s_hi) * Int64(self.k * 2) + x_off + k_off
+                                            lo = _ld_cached(at)
+                                            hi = _ld_cached(at + Int64(16))
                                             for i in cutlass.range_constexpr(4):
                                                 xa[8 + i] = lo[i]
                                                 xa[12 + i] = hi[i]
@@ -478,51 +496,51 @@ class GroupedMxfp4Gemv:
                                 cur[i] = nxt[i]
                             for i in cutlass.range_constexpr(self.total_groups):
                                 f_cur[i] = f_nxt[i]
-                    for mt in cutlass.range_constexpr(self.m_tiles):
-                        if Int32(mt) < live_tiles:
-                            base_f = 4 * mt * self.total_groups
-                            for i in cutlass.range_constexpr(self.tile_frags):
-                                partial[(warp_id * Int32(self.tile_frags) + Int32(i)) * Int32(32) + lane] = acc[base_f + i]
-                            cute.arch.sync_threads()
-                            if const_expr(self.fuse_swiglu):
-                                for p in cutlass.range_constexpr(2 * self.groups):
-                                    if Int32(p % self.warps) == warp_id:
-                                        gi = p // 2
-                                        half = p % 2
-                                        row = Int32(16 * mt + 8 * half) + g
-                                        if row < n_c:
-                                            fg = 4 * gi + 2 * half
-                                            fu = 4 * (gi + self.groups) + 2 * half
-                                            g0 = Float32(0.0)
-                                            g1 = Float32(0.0)
-                                            u0 = Float32(0.0)
-                                            u1 = Float32(0.0)
-                                            for src in cutlass.range_constexpr(self.warps):
-                                                s_base_idx = Int32(src * self.tile_frags) * Int32(32) + lane
-                                                g0 = g0 + partial[s_base_idx + Int32(fg * 32)]
-                                                g1 = g1 + partial[s_base_idx + Int32((fg + 1) * 32)]
-                                                u0 = u0 + partial[s_base_idx + Int32(fu * 32)]
-                                                u1 = u1 + partial[s_base_idx + Int32((fu + 1) * 32)]
-                                            v0 = _swiglu_epilogue(g0, u0, self.swiglu_limit)
-                                            v1 = _swiglu_epilogue(g1, u1, self.swiglu_limit)
-                                            col = n0 + Int64(8 * gi) + Int64(2) * Int64(j)
-                                            address = Int64(out.toint()) + (Int64(row0 + row) * Int64(self.out_cols) + col) * Int64(2)
-                                            st_global_u32(address, _pack_bf16x2_rn(v0, v1))
-                            else:
-                                for p in cutlass.range_constexpr(2 * self.total_groups):
-                                    if Int32(p % self.warps) == warp_id:
-                                        gi = p // 2
-                                        half = p % 2
-                                        row = Int32(16 * mt + 8 * half) + g
-                                        if row < n_c:
-                                            f0 = 4 * gi + 2 * half
-                                            t0 = Float32(0.0)
-                                            t1 = Float32(0.0)
-                                            for src in cutlass.range_constexpr(self.warps):
-                                                s_base_idx = Int32(src * self.tile_frags) * Int32(32) + lane
-                                                t0 = t0 + partial[s_base_idx + Int32(f0 * 32)]
-                                                t1 = t1 + partial[s_base_idx + Int32((f0 + 1) * 32)]
-                                            col = n0 + Int64(8 * gi) + Int64(2) * Int64(j)
-                                            address = Int64(out.toint()) + (Int64(row0 + row) * Int64(self.out_cols) + col) * Int64(2)
-                                            st_global_u32(address, _pack_bf16x2_rn(t0, t1))
-                            cute.arch.sync_threads()
+                        for mt in cutlass.range_constexpr(self.m_tiles):
+                            if Int32(mt) < live_tiles:
+                                base_f = 4 * mt * self.total_groups
+                                for i in cutlass.range_constexpr(self.tile_frags):
+                                    partial[(warp_id * Int32(self.tile_frags) + Int32(i)) * Int32(32) + lane] = acc[base_f + i]
+                                cute.arch.sync_threads()
+                                if const_expr(self.fuse_swiglu):
+                                    for p in cutlass.range_constexpr(2 * self.groups):
+                                        if Int32(p % self.warps) == warp_id:
+                                            gi = p // 2
+                                            half = p % 2
+                                            row = Int32(16 * mt + 8 * half) + g
+                                            if row < n_c:
+                                                fg = 4 * gi + 2 * half
+                                                fu = 4 * (gi + self.groups) + 2 * half
+                                                g0 = Float32(0.0)
+                                                g1 = Float32(0.0)
+                                                u0 = Float32(0.0)
+                                                u1 = Float32(0.0)
+                                                for src in cutlass.range_constexpr(self.warps):
+                                                    s_base_idx = Int32(src * self.tile_frags) * Int32(32) + lane
+                                                    g0 = g0 + partial[s_base_idx + Int32(fg * 32)]
+                                                    g1 = g1 + partial[s_base_idx + Int32((fg + 1) * 32)]
+                                                    u0 = u0 + partial[s_base_idx + Int32(fu * 32)]
+                                                    u1 = u1 + partial[s_base_idx + Int32((fu + 1) * 32)]
+                                                v0 = _swiglu_epilogue(g0, u0, self.swiglu_limit)
+                                                v1 = _swiglu_epilogue(g1, u1, self.swiglu_limit)
+                                                col = n0 + Int64(8 * gi) + Int64(2) * Int64(j)
+                                                address = Int64(out.toint()) + (Int64(row0 + row) * Int64(self.out_cols) + col) * Int64(2)
+                                                st_global_u32(address, _pack_bf16x2_rn(v0, v1))
+                                else:
+                                    for p in cutlass.range_constexpr(2 * self.total_groups):
+                                        if Int32(p % self.warps) == warp_id:
+                                            gi = p // 2
+                                            half = p % 2
+                                            row = Int32(16 * mt + 8 * half) + g
+                                            if row < n_c:
+                                                f0 = 4 * gi + 2 * half
+                                                t0 = Float32(0.0)
+                                                t1 = Float32(0.0)
+                                                for src in cutlass.range_constexpr(self.warps):
+                                                    s_base_idx = Int32(src * self.tile_frags) * Int32(32) + lane
+                                                    t0 = t0 + partial[s_base_idx + Int32(f0 * 32)]
+                                                    t1 = t1 + partial[s_base_idx + Int32((f0 + 1) * 32)]
+                                                col = n0 + Int64(8 * gi) + Int64(2) * Int64(j)
+                                                address = Int64(out.toint()) + (Int64(row0 + row) * Int64(self.out_cols) + col) * Int64(2)
+                                                st_global_u32(address, _pack_bf16x2_rn(t0, t1))
+                                cute.arch.sync_threads()
