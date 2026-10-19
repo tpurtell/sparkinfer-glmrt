@@ -76,8 +76,8 @@ def decode_tile_half(payload: Int64, tile: Int32, lane: Int32, warp: Int32,
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 7
-    CTAS_PER_SM = 3
+    CODE_VERSION = 4
+    CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True)
@@ -143,7 +143,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                    down: cutlass.Constexpr, scale: Float32, live: cute.Tensor):
         acc = cute.make_rmem_tensor((self.mtiles, 4), Float32)
         acc.fill(Float32(0.0))
-        for k16 in cutlass.range(8, unroll=1):
+        for k16 in cutlass.range_constexpr(8):
             tile = (input_block * Int32(8) + Int32(k16)) * Int32(8) + nquad * Int32(2) + warp // Int32(2)
             if cutlass.const_expr(down):
                 tile = output_block * Int32(64) + Int32(k16 * 8) + nquad * Int32(2) + warp // Int32(2)
@@ -218,6 +218,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             expert = group_expert[group]
             desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
             width = bits[desc]
+            rids = self.row_ids(route_slots, group, rows, lane, False)
             live = self.live_tiles(route_slots, group, rows, lane)
             total = cute.make_rmem_tensor((self.mtiles, 4), Float32)
             total.fill(Float32(0.0))
@@ -239,7 +240,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             self.accumulate(total, payload, shared_a,
                                             kb, Int32(0), nquad, lane, warp, 4, False, scale, live)
                         cute.arch.sync_threads()
-            rids = self.row_ids(route_slots, group, rows, lane, False)
             col = nquad * Int32(32) + warp * Int32(8) + (lane & Int32(3)) * Int32(2)
             for m in cutlass.range_constexpr(self.mtiles):
                 for v in cutlass.range_constexpr(2):
@@ -276,6 +276,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             logical = task // Int32(4)
             group, block = logical // Int32(self.blocks), logical % Int32(self.blocks)
             expert = group_expert[group]
+            rids = self.row_ids(route_slots, group, rows, lane, True)
             live = self.live_tiles(route_slots, group, rows, lane)
             total = cute.make_rmem_tensor((self.mtiles, 4), Float32)
             total.fill(Float32(0.0))
@@ -297,7 +298,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         self.accumulate(total, payload, shared_a, Int32(0), block,
                                         nquad, lane, warp, 4, True, scale, live)
                     cute.arch.sync_threads()
-            rids = self.row_ids(route_slots, group, rows, lane, True)
             col = block * Int32(128) + nquad * Int32(32) + warp * Int32(8) + (lane & Int32(3)) * Int32(2)
             for m in cutlass.range_constexpr(self.mtiles):
                 for v in cutlass.range_constexpr(2):
