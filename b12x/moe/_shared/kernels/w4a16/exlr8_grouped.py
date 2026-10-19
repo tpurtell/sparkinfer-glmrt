@@ -146,7 +146,7 @@ def st_shared_v4_f32(smem_addr: Int32, v0: Float32, v1: Float32, v2: Float32, v3
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 8
+    CODE_VERSION = 9
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -540,8 +540,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         max_slot = rows * Int32(self.top_k)
 
         while task < groups * Int32(self.blocks):
-            g_tile_base = (task // Int32(self.blocks * 2)) * Int32(2)
-            tile_g = min(Int32(2), groups - g_tile_base)
+            g_tile_base = (task // Int32(self.blocks * 4)) * Int32(4)
+            tile_g = min(Int32(4), groups - g_tile_base)
             rem = task - g_tile_base * Int32(self.blocks)
             group = g_tile_base + (rem % tile_g)
             block = rem // tile_g
