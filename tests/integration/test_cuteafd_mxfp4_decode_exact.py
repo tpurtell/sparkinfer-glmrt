@@ -18,6 +18,7 @@ def test_decode_master_rows_packing_graph(routing):
     control = os.environ.get("B12X_MXFP4_CONTROL_CORE")
     if not control:
         pytest.skip("B12X_MXFP4_CONTROL_CORE must name the immutable master snapshot")
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd import fp8_moe
     from b12x.integration.cuteafd._mxfp4_moe_kernels import GroupedMxfp4Gemv
     from .test_cuteafd_fp8_moe_aot import wire_rows
@@ -75,10 +76,16 @@ def test_decode_master_rows_packing_graph(routing):
             replay = torch.cuda.CUDAGraph()
             with torch.cuda.graph(replay):
                 launch()
-            for _ in range(3):
-                out.fill_(float("nan"))
-                replay.replay()
-                assert torch.equal(out[:rows].view(torch.uint8), expected.view(torch.uint8))
+            addresses = tuple(t.data_ptr() for t in (a, selected, factors, *weights, out, scratch))
+            with kernel_resolution_guard("MXFP4 exact graph replay"):
+                for _ in range(3):
+                    out.fill_(float("nan"))
+                    allocated = torch.cuda.memory_stats()["allocated_bytes.all.allocated"]
+                    replay.replay()
+                    torch.cuda.synchronize()
+                    assert torch.cuda.memory_stats()["allocated_bytes.all.allocated"] == allocated
+                    assert addresses == tuple(t.data_ptr() for t in (a, selected, factors, *weights, out, scratch))
+                    assert torch.equal(out[:rows].view(torch.uint8), expected.view(torch.uint8))
         assert torch.isfinite(out[:rows]).all() and out[:rows].count_nonzero()
         return out[:rows].clone().view(torch.uint8)
 
