@@ -258,3 +258,96 @@ def test_ragged_mla_gpu_attention_and_merged_lse(heads, context):
         expected = torch.einsum("hts,sd->thd", scores.softmax(-1), records[:, :512])
         metrics(out[offsets[request]:offsets[request + 1]], expected)
         torch.testing.assert_close(lse[offsets[request]:offsets[request + 1]], expected_lse, atol=2e-4, rtol=2e-5)
+
+
+@pytest.mark.parametrize("context", [65536, 262144])
+@pytest.mark.parametrize("heads", [48, 96])
+def test_verify_mla_request_encoding_bytes_and_timing(heads, context):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_dense_mla_aot
+    rows, page_rows, record_values = 5, 64, 576
+    g = KimiMlaGeometry(heads=heads)
+    program = compile_kimi_dense_mla_aot(g, max_rows=64, max_context=context, mode="verify")
+    width = (context + page_rows - 1) // page_rows
+    splits = program.geometry["num_splits"]
+    gen = torch.Generator(device="cuda").manual_seed(5273)
+    # Park live pages beyond the signed-32-bit element-offset boundary. Only
+    # initialize the live tail; no dense reference or multi-GiB random fill.
+    first_page = (1 << 31) // (page_rows * record_values) + 1
+    cache = torch.empty(first_page + width, page_rows, record_values,
+                        dtype=torch.bfloat16, device="cuda")
+    cache[first_page:].copy_((torch.randn(width, page_rows, record_values,
+        generator=gen, device="cuda") * 0.1).bfloat16())
+    q = (torch.randn(rows, heads, record_values, generator=gen, device="cuda") * 0.1).bfloat16()
+    table = torch.arange(first_page + width - 1, first_page - 1, -1,
+                         dtype=torch.int32, device="cuda")[None]
+    row_table = table.repeat(rows, 1)
+    lengths = torch.tensor([context], dtype=torch.int32, device="cuda")
+    row_lengths = torch.arange(context - rows + 1, context + 1, dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
+    row_offsets = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
+    outputs = [torch.full((rows, heads, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+               for _ in range(2)]
+    lses = [torch.full((rows, heads), float("nan"), device="cuda") for _ in range(2)]
+    scratch = torch.empty(max(1, program.scratch_bytes(rows)["scratch"]), dtype=torch.uint8, device="cuda")
+
+    def launch(arm):
+        pages, lens, cu, requests = ((table, lengths, offsets, 1) if arm == 0 else
+                                    (row_table, row_lengths, row_offsets, rows))
+        program.launch(q, cache, pages, lens, cu, outputs[arm], lses[arm], scratch,
+                       scalars=(rows, requests, width, splits))
+
+    for _ in range(10):
+        launch(0)
+        launch(1)
+    torch.cuda.synchronize()
+    assert all(bool(torch.isfinite(t).all()) for t in outputs + lses)
+    assert all(bool(torch.count_nonzero(t)) for t in outputs)
+    equal = [torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+             for a, b in zip((outputs[0], lses[0]), (outputs[1], lses[1]))]
+    # A row launched alone must preserve its reduction. This also identifies
+    # the batch-independent encoding if the two batched encodings disagree.
+    independent = [[True, True] for _ in range(2)]
+    single_cu = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    single_out, single_lse = torch.empty_like(outputs[0][:1]), torch.empty_like(lses[0][:1])
+    for row in range(rows):
+        program.launch(q[row:row + 1], cache, table, row_lengths[row:row + 1], single_cu,
+                       single_out, single_lse, scratch, scalars=(1, 1, width, splits))
+        for arm in range(2):
+            for kind, (actual, expected) in enumerate(zip((single_out, single_lse),
+                    (outputs[arm][row:row + 1], lses[arm][row:row + 1]))):
+                independent[arm][kind] &= torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    # Capture the attention-only arms so Python dispatch gaps are not charged
+    # to either encoding. All operands and workspace addresses stay fixed.
+    baselines = [(out.clone(), lse.clone()) for out, lse in zip(outputs, lses)]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    for arm, graph in enumerate(graphs):
+        with torch.cuda.graph(graph):
+            launch(arm)
+        for _ in range(10):
+            graph.replay()
+    torch.cuda.synchronize()
+    for arm in range(2):
+        for actual, expected in zip((outputs[arm], lses[arm]), baselines[arm]):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), "MLA graph replay changes bytes"
+    timings = [[], []]
+    repeats = 20
+    for session in range(3):
+        for arm in ((0, 1) if session % 2 == 0 else (1, 0)):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(repeats):
+                graphs[arm].replay()
+            end.record()
+            end.synchronize()
+            timings[arm].append(start.elapsed_time(end) / repeats)
+    mean_ms = [sum(samples) / len(samples) for samples in timings]
+    ratio = mean_ms[1] / mean_ms[0]
+    print(f"MLA encoding heads={heads} context={context} rows={rows} splits={splits} width={width} "
+          f"multi_ms={timings[0]} per_row_ms={timings[1]} per_row_over_multi={ratio:.6f} "
+          f"output_lse_bytes_equal={equal} multi_row_independent={independent[0]} "
+          f"per_row_independent={independent[1]}", flush=True)
+    assert all(equal), "MLA request encoding changes attended output or LSE bytes"
+    assert all(all(kinds) for kinds in independent), "MLA reduction depends on batch encoding"
+    assert ratio <= 1.10, f"one-query-per-row MLA exceeds 1.10x attention time: {ratio:.6f}"
