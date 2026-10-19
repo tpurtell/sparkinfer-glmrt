@@ -176,9 +176,10 @@ class NativeTileLinear:
         self.prefill_threads = 32 * self.wm * self.wn
         self.wpb = 8 * self.groups if not self.int4 else 4 * self.groups   # weight words / lane / 128 K
         self.spb = (2 if self.int4 else 1) * 2 * self.groups if self.grouped else 1
-        # One 16-row, 128-K A tile (swizzled 256-byte rows), double buffered per warp by
-        # the decode ldmatrix route.  Bytes per warp per buffer.
-        self.a_tile = 16 * 256
+        # One 16-row, 64-K A chunk (swizzled 128-byte rows), double buffered per warp
+        # by the decode ldmatrix route.  Bytes per warp per buffer; 32 KiB per CTA
+        # keeps two grouped decode CTAs resident in SM120's 100 KiB of shared memory.
+        self.a_tile = 16 * 128
 
     # ------------------------------------------------------------------ launch
     @cute.jit
@@ -284,23 +285,23 @@ class NativeTileLinear:
 
     @cute.jit
     def _stage_a(self, dst: Int32, x: cute.Tensor, rows: Int32, k0: Int32, lane: Int32):
-        """cp.async this warp's 16-row, 128-K A tile of one block into ``dst``.
+        """cp.async this warp's 16-row, 64-K A chunk into ``dst``.
 
-        Rows lie 256 bytes apart and each 16-byte unit is XOR-swizzled by ``row & 7``,
+        Rows lie 128 bytes apart and each 16-byte unit is XOR-swizzled by ``row & 7``,
         exactly the prefill tile layout, so a single ``ldmatrix.x4`` rebuilds one MMA
-        step's four A operands.  Eight 16-byte copies per lane cover the 4 KiB tile;
+        step's four A operands.  Four 16-byte copies per lane cover the 2 KiB chunk;
         dead rows are left unwritten (cp.async keeps the predicate off), and the lane
         reads they would feed are never stored."""
         for i in cutlass.range_constexpr(self.a_tile // 16 // 32):
             unit = Int32(i * 32) + lane
-            r, c = unit >> Int32(4), unit & Int32(15)
+            r, c = unit >> Int32(3), unit & Int32(7)
             src = x.iterator.toint() + (r.to(Int64) * Int64(self.k) + k0.to(Int64)
                                         + (c * Int32(8)).to(Int64)) * Int64(2)
             pred = Int32(0)
             if r < rows:
                 pred = Int32(1)
             cp_async4_shared_global_pred(
-                dst + r * Int32(256) + ((c ^ (r & Int32(7))) << Int32(4)), src, pred)
+                dst + r * Int32(128) + ((c ^ (r & Int32(7))) << Int32(4)), src, pred)
 
     @cute.jit
     def _decode_load(self, wdst: cute.Tensor, sdst: cute.Tensor, payload: cute.Tensor,
@@ -378,24 +379,26 @@ class NativeTileLinear:
                 snxt = cute.make_rmem_tensor((self.spb,), Uint32)
                 self._decode_load(cur, scur, payload, scales, n0, g, j, kb0)
                 if cutlass.const_expr(self.grouped):
-                    # First A tile of this warp's segment; the loop prefetches one ahead.
+                    # First A chunk of this warp's segment; the loop prefetches one ahead.
                     self._stage_a(abuf, x, rows, kb0 * Int32(128), lane)
                     cute.arch.cp_async_commit_group()
                 for b in cutlass.range(self.seg_blocks, unroll=1):
                     kb = kb0 + b
                     if b + Int32(1) < Int32(self.seg_blocks):
                         self._decode_load(nxt, snxt, payload, scales, n0, g, j, kb + Int32(1))
-                    if cutlass.const_expr(self.grouped):
-                        # All lanes are done reading the buffer about to be overwritten.
-                        cute.arch.sync_warp()
-                        if b + Int32(1) < Int32(self.seg_blocks):
-                            self._stage_a(abuf + ((b + Int32(1)) & Int32(1)) * Int32(self.a_tile),
-                                          x, rows, (kb + Int32(1)) * Int32(128), lane)
-                        cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_wait_group(1)
-                        cute.arch.sync_warp()
                     for c in cutlass.range_constexpr(2):
                         k0 = kb * Int32(128) + Int32(64 * c)
+                        ci = Int32(2) * b + Int32(c)
+                        if cutlass.const_expr(self.grouped):
+                            # Prefetch the next 64-K A chunk; the warp's lanes are all
+                            # done reading the buffer this iteration overwrites.
+                            cute.arch.sync_warp()
+                            if ci + Int32(1) < Int32(2 * self.seg_blocks):
+                                self._stage_a(abuf + ((ci + Int32(1)) & Int32(1)) * Int32(self.a_tile),
+                                              x, rows, kb0 * Int32(128) + (ci + Int32(1)) * Int32(64), lane)
+                            cute.arch.cp_async_commit_group()
+                            cute.arch.cp_async_wait_group(1)
+                            cute.arch.sync_warp()
                         bw = cute.make_rmem_tensor((8 * G,), Uint32)
                         for gi in cutlass.range_constexpr(G):
                             for t in cutlass.range_constexpr(4):
@@ -436,13 +439,13 @@ class NativeTileLinear:
                                     # to the tensor core, no xa round trip.
                                     ar = lane & Int32(15)
                                     sw = ar & Int32(7)
-                                    ab = abuf + (b & Int32(1)) * Int32(self.a_tile) + ar * Int32(256)
+                                    ab = abuf + (ci & Int32(1)) * Int32(self.a_tile) + ar * Int32(128)
                                     for gi in cutlass.range_constexpr(G):
                                         for h in cutlass.range_constexpr(2):
                                             p0, p1, p2, p3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
                                             for tp in cutlass.range_constexpr(2):
                                                 t = 2 * h + tp
-                                                unit = Int32(2 * t + 8 * c) + (lane >> Int32(4))
+                                                unit = Int32(2 * t) + (lane >> Int32(4))
                                                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(ab + ((unit ^ sw) << Int32(4)))
                                                 p0, p1, p2, p3 = bf16_mma_m16n8k16_f32(
                                                     p0, p1, p2, p3, a0, a1, a2, a3,
