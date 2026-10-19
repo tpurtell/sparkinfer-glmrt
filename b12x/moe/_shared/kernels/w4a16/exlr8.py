@@ -528,7 +528,11 @@ class Exlr8A16Kernel:
                                 if g + Int32(3) < groups:
                                     if group_expert[g + Int32(3)] == exp:
                                         gl = Int32(4)
-                smem_sg[nsg] = (g << Int32(8)) | gl
+                val = (g << Int32(3)) | gl
+                if (nsg & Int32(1)) == Int32(0):
+                    smem_sg[nsg >> Int32(1)] = val
+                else:
+                    smem_sg[nsg >> Int32(1)] = smem_sg[nsg >> Int32(1)] | (val << Int32(16))
                 nsg += Int32(1)
                 g += gl
             smem_nsg[0] = nsg
@@ -544,10 +548,13 @@ class Exlr8A16Kernel:
             if groups < Int32(0) or groups > Int32(self.max_groups):
                 groups = Int32(0)
         smem = utils.SmemAllocator()
-        smem_sg = smem.allocate_tensor(Int32, cute.make_layout(self.max_groups), byte_alignment=16)
+        smem_sg = smem.allocate_tensor(Int32, cute.make_layout((self.max_groups + 1) // 2), byte_alignment=16)
         smem_nsg = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=16)
+        smem_a = smem.allocate_tensor(
+            Uint32, cute.make_layout((64, 64), stride=(64, 1)), byte_alignment=16
+        )
         smem_sum = smem.allocate_tensor(
-            Float32, cute.make_layout((16, 256), stride=(256, 1)), byte_alignment=16
+            Float32, cute.make_layout((8, 256), stride=(256, 1)), byte_alignment=16
         )
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
@@ -555,34 +562,31 @@ class Exlr8A16Kernel:
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
         nsg = self._build_super_groups(group_expert, smem_sg, smem_nsg, groups, Int32(tid))
         x_address = x.iterator.toint()
+        load_r = Int32(tid) >> Int32(2)
+        load_c = (Int32(tid) & Int32(3)) * Int32(4)
+        load_m = load_r >> Int32(4)
+        load_row16 = load_r & Int32(15)
+        swz_w = (load_r & Int32(7)) << Int32(2)
+        r = lane // Int32(4)
+        swz_r = r << Int32(2)
         while task < nsg * Int32(self.units * 2):
             proj = task % Int32(2)
             unit = (task // Int32(2)) % Int32(self.units)
             s = task // Int32(self.units * 2)
-            packed_sg = smem_sg[s]
-            g0 = packed_sg >> Int32(8)
-            gl = packed_sg & Int32(0xFF)
+            packed_sg = (smem_sg[s >> Int32(1)] >> ((s & Int32(1)) * Int32(16))) & Int32(0xFFFF)
+            g0 = packed_sg >> Int32(3)
+            gl = packed_sg & Int32(7)
             expert = group_expert[g0]
             desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
             width = bits[desc]
-            r = lane // Int32(4)
-            row0 = cute.make_rmem_tensor(4, Int32)
-            row1 = cute.make_rmem_tensor(4, Int32)
-            for m in cutlass.range_constexpr(4):
-                row0[m] = Int32(-1)
-                row1[m] = Int32(-1)
-                if Int32(m) < gl:
-                    gm = g0 + Int32(m)
-                    slot0 = route_slots[gm.to(Int64) * Int64(16) + r.to(Int64)]
-                    slot1 = route_slots[gm.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-                    if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
-                        row0[m] = slot0 // Int32(self.top_k)
-                    if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
-                        row1[m] = slot1 // Int32(self.top_k)
-            for idx in cutlass.range_constexpr(16):
+            load_row = Int32(-1)
+            if load_m < gl:
+                slot = route_slots[(g0 + load_m).to(Int64) * Int64(16) + load_row16.to(Int64)]
+                if slot >= Int32(0) and slot < rows * Int32(self.top_k):
+                    load_row = slot // Int32(self.top_k)
+            for idx in cutlass.range_constexpr(8):
                 smem_sum[idx, tid] = Float32(0.0)
-            cute.arch.sync_threads()
-            seg_sum = cute.make_rmem_tensor((2, 2, 4), Float32)
+            seg_sum = cute.make_rmem_tensor((3, 2, 4), Float32)
             seg_sum.fill(Float32(0.0))
             total = cute.make_rmem_tensor((4, 2, 4), Float32)
             total.fill(Float32(0.0))
@@ -593,26 +597,33 @@ class Exlr8A16Kernel:
                             for v in cutlass.range_constexpr(4):
                                 total[m, n, v] = Float32(0.0)
                 if width != Int32(0) and kb < Int32(self.blocks):
+                    cute.arch.sync_threads()
+                    row_base = x_address + (load_row.to(Int64) * Int64(self.hidden_size) + (kb * Int32(128)).to(Int64)) * Int64(2)
+                    for c_step in cutlass.range_constexpr(4):
+                        c_u32 = load_c + Int32(c_step * 16)
+                        c_swz = c_u32 ^ swz_w
+                        v0, v1, v2, v3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        if load_row >= Int32(0):
+                            v0, v1, v2, v3 = ld_global_nc_v4_u32(row_base + c_u32.to(Int64) * Int64(4))
+                        smem_a[load_r, c_swz] = v0
+                        smem_a[load_r, c_swz + Int32(1)] = v1
+                        smem_a[load_r, c_swz + Int32(2)] = v2
+                        smem_a[load_r, c_swz + Int32(3)] = v3
+                    cute.arch.sync_threads()
                     payload = pointers[desc * Int64(3)]
                     scale = _side_value(pointers[desc * Int64(3) + Int64(2)], kb)
                     acc = cute.make_rmem_tensor((4, 2, 4), Float32)
                     acc.fill(Float32(0.0))
                     for k16 in cutlass.range_constexpr(8):
-                        k = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
+                        c0 = (Int32(k16 * 8) + (lane & Int32(3))) ^ swz_r
+                        c1 = c0 ^ Int32(4)
                         tile = (kb * Int32(8) + Int32(k16)) * Int32(8) + warp
                         b0, b1, b2, b3 = exlr8_decode_tile_width(payload, tile, lane, width)
                         for m in cutlass.range_constexpr(4):
-                            a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                            r0 = row0[m]
-                            r1 = row1[m]
-                            if r0 >= Int32(0):
-                                addr0 = x_address + (r0.to(Int64) * Int64(self.hidden_size) + k.to(Int64)) * Int64(2)
-                                a0 = ld_global_nc_u32(addr0)
-                                a2 = ld_global_nc_u32(addr0 + Int64(16))
-                            if r1 >= Int32(0):
-                                addr1 = x_address + (r1.to(Int64) * Int64(self.hidden_size) + k.to(Int64)) * Int64(2)
-                                a1 = ld_global_nc_u32(addr1)
-                                a3 = ld_global_nc_u32(addr1 + Int64(16))
+                            a0 = smem_a[r + Int32(m * 16), c0]
+                            a2 = smem_a[r + Int32(m * 16), c1]
+                            a1 = smem_a[r + Int32(m * 16 + 8), c0]
+                            a3 = smem_a[r + Int32(m * 16 + 8), c1]
                             d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                                 acc[m, 0, 0], acc[m, 0, 1], acc[m, 0, 2], acc[m, 0, 3],
                                 a0, a1, a2, a3, b0, b1)
@@ -628,35 +639,35 @@ class Exlr8A16Kernel:
                             for v in cutlass.range_constexpr(4):
                                 total[m, n, v] = total[m, n, v] + acc[m, n, v] * scale
                 if (kb & Int32(7)) == Int32(7):
-                    cute.arch.sync_threads()
-                    for m in cutlass.range_constexpr(2):
+                    for n in cutlass.range_constexpr(2):
+                        for v in cutlass.range_constexpr(4):
+                            idx = n * 4 + v
+                            smem_sum[idx, tid] = smem_sum[idx, tid] + total[0, n, v]
+                    for m in cutlass.range_constexpr(3):
                         for n in cutlass.range_constexpr(2):
                             for v in cutlass.range_constexpr(4):
-                                idx = m * 8 + n * 4 + v
-                                smem_sum[idx, tid] = smem_sum[idx, tid] + total[m, n, v]
-                    for m in cutlass.range_constexpr(2):
-                        for n in cutlass.range_constexpr(2):
-                            for v in cutlass.range_constexpr(4):
-                                seg_sum[m, n, v] = seg_sum[m, n, v] + total[m + 2, n, v]
+                                seg_sum[m, n, v] = seg_sum[m, n, v] + total[m + 1, n, v]
             for m in cutlass.range_constexpr(4):
                 if Int32(m) < gl:
                     gm = g0 + Int32(m)
-                    r0 = row0[m]
-                    r1 = row1[m]
+                    slot0 = route_slots[gm.to(Int64) * Int64(16) + r.to(Int64)]
+                    slot1 = route_slots[gm.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+                    v0_ok = slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k)
+                    v1_ok = slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k)
                     tile_idx = (gm.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(2) + proj.to(Int64)
                     for n in cutlass.range_constexpr(2):
                         col = warp * Int32(16) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
                         base = tile_idx * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)
-                        if cutlass.const_expr(m < 2):
-                            idx0 = m * 8 + n * 4
+                        if cutlass.const_expr(m == 0):
+                            idx0 = n * 4
                             s0, s1 = smem_sum[idx0, tid], smem_sum[idx0 + 1, tid]
                             s2, s3 = smem_sum[idx0 + 2, tid], smem_sum[idx0 + 3, tid]
                         else:
-                            s0, s1 = seg_sum[m - 2, n, 0], seg_sum[m - 2, n, 1]
-                            s2, s3 = seg_sum[m - 2, n, 2], seg_sum[m - 2, n, 3]
-                        if width != Int32(0) and r0 >= Int32(0):
+                            s0, s1 = seg_sum[m - 1, n, 0], seg_sum[m - 1, n, 1]
+                            s2, s3 = seg_sum[m - 1, n, 2], seg_sum[m - 1, n, 3]
+                        if width != Int32(0) and v0_ok:
                             fc1[base], fc1[base + Int64(1)] = s0, s1
-                        if width != Int32(0) and r1 >= Int32(0):
+                        if width != Int32(0) and v1_ok:
                             fc1[base + Int64(8 * 128)], fc1[base + Int64(8 * 128 + 1)] = s2, s3
             task += step
 
@@ -716,61 +727,69 @@ class Exlr8A16Kernel:
             if groups < Int32(0) or groups > Int32(self.max_groups):
                 groups = Int32(0)
         smem = utils.SmemAllocator()
-        smem_sg = smem.allocate_tensor(Int32, cute.make_layout(self.max_groups), byte_alignment=16)
+        smem_sg = smem.allocate_tensor(Int32, cute.make_layout((self.max_groups + 1) // 2), byte_alignment=16)
         smem_nsg = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=16)
+        smem_a = smem.allocate_tensor(
+            Uint32, cute.make_layout((64, 64), stride=(64, 1)), byte_alignment=16
+        )
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
         nsg = self._build_super_groups(group_expert, smem_sg, smem_nsg, groups, Int32(tid))
         inter_address = intermediate.iterator.toint()
+        load_r = Int32(tid) >> Int32(2)
+        load_c = (Int32(tid) & Int32(3)) * Int32(4)
+        load_m = load_r >> Int32(4)
+        load_row16 = load_r & Int32(15)
+        swz_w = (load_r & Int32(7)) << Int32(2)
+        r = lane // Int32(4)
+        swz_r = r << Int32(2)
         while task < nsg * Int32(self.blocks):
             s = task // Int32(self.blocks)
             block = task % Int32(self.blocks)
-            packed_sg = smem_sg[s]
-            g0 = packed_sg >> Int32(8)
-            gl = packed_sg & Int32(0xFF)
+            packed_sg = (smem_sg[s >> Int32(1)] >> ((s & Int32(1)) * Int32(16))) & Int32(0xFFFF)
+            g0 = packed_sg >> Int32(3)
+            gl = packed_sg & Int32(7)
             expert = group_expert[g0]
             total = cute.make_rmem_tensor((4, 2, 4), Float32)
             total.fill(Float32(0.0))
-            r = lane // Int32(4)
-            row0 = cute.make_rmem_tensor(4, Int32)
-            row1 = cute.make_rmem_tensor(4, Int32)
-            for m in cutlass.range_constexpr(4):
-                row0[m] = Int32(-1)
-                row1[m] = Int32(-1)
-                if Int32(m) < gl:
-                    gm = g0 + Int32(m)
-                    slot0 = route_slots[gm.to(Int64) * Int64(16) + r.to(Int64)]
-                    slot1 = route_slots[gm.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
-                    if slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k):
-                        row0[m] = r
-                    if slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k):
-                        row1[m] = r + Int32(8)
+            load_valid = Int32(0)
+            if load_m < gl:
+                slot = route_slots[(g0 + load_m).to(Int64) * Int64(16) + load_row16.to(Int64)]
+                if slot >= Int32(0) and slot < rows * Int32(self.top_k):
+                    load_valid = Int32(1)
             for unit in cutlass.range(self.units):
                 desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + Int64(2)
                 width = bits[desc]
                 if width != Int32(0):
+                    cute.arch.sync_threads()
+                    inter_row_addr = inter_address + (((g0 + load_m).to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16) + load_row16.to(Int64)) * Int64(128 * 2)
+                    for c_step in cutlass.range_constexpr(4):
+                        c_u32 = load_c + Int32(c_step * 16)
+                        c_swz = c_u32 ^ swz_w
+                        v0, v1, v2, v3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        if load_valid != Int32(0):
+                            v0, v1, v2, v3 = ld_global_nc_v4_u32(inter_row_addr + c_u32.to(Int64) * Int64(4))
+                        smem_a[load_r, c_swz] = v0
+                        smem_a[load_r, c_swz + Int32(1)] = v1
+                        smem_a[load_r, c_swz + Int32(2)] = v2
+                        smem_a[load_r, c_swz + Int32(3)] = v3
+                    cute.arch.sync_threads()
                     payload = pointers[desc * Int64(3)]
                     scale = _side_value(pointers[desc * Int64(3) + Int64(2)], block)
                     acc = cute.make_rmem_tensor((4, 2, 4), Float32)
                     acc.fill(Float32(0.0))
                     for k16 in cutlass.range_constexpr(8):
-                        k = Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
+                        c0 = (Int32(k16 * 8) + (lane & Int32(3))) ^ swz_r
+                        c1 = c0 ^ Int32(4)
                         tile = block * Int32(64) + Int32(k16 * 8) + warp
                         b0, b1, b2, b3 = exlr8_decode_tile_width(payload, tile, lane, width)
                         for m in cutlass.range_constexpr(4):
-                            a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                            gm = g0 + Int32(m)
-                            addr_base = inter_address + (gm.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
-                            if row0[m] >= Int32(0):
-                                addr0 = addr_base + (row0[m].to(Int64) * Int64(128) + k.to(Int64)) * Int64(2)
-                                a0 = ld_global_nc_u32(addr0)
-                                a2 = ld_global_nc_u32(addr0 + Int64(16))
-                            if row1[m] >= Int32(0):
-                                addr1 = addr_base + (row1[m].to(Int64) * Int64(128) + k.to(Int64)) * Int64(2)
-                                a1 = ld_global_nc_u32(addr1)
-                                a3 = ld_global_nc_u32(addr1 + Int64(16))
+                            a0 = smem_a[r + Int32(m * 16), c0]
+                            a2 = smem_a[r + Int32(m * 16), c1]
+                            a1 = smem_a[r + Int32(m * 16 + 8), c0]
+                            a3 = smem_a[r + Int32(m * 16 + 8), c1]
                             d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                                 acc[m, 0, 0], acc[m, 0, 1], acc[m, 0, 2], acc[m, 0, 3],
                                 a0, a1, a2, a3, b0, b1)
@@ -788,12 +807,16 @@ class Exlr8A16Kernel:
             for m in cutlass.range_constexpr(4):
                 if Int32(m) < gl:
                     gm = g0 + Int32(m)
+                    slot0 = route_slots[gm.to(Int64) * Int64(16) + r.to(Int64)]
+                    slot1 = route_slots[gm.to(Int64) * Int64(16) + r.to(Int64) + Int64(8)]
+                    v0_ok = slot0 >= Int32(0) and slot0 < rows * Int32(self.top_k)
+                    v1_ok = slot1 >= Int32(0) and slot1 < rows * Int32(self.top_k)
                     for n in cutlass.range_constexpr(2):
                         col = block * Int32(128) + warp * Int32(16) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
                         base = (gm.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
-                        if row0[m] >= Int32(0):
+                        if v0_ok:
                             fc2[base], fc2[base + Int64(1)] = total[m, n, 0], total[m, n, 1]
-                        if row1[m] >= Int32(0):
+                        if v1_ok:
                             fc2[base + Int64(8 * self.hidden_size)], fc2[base + Int64(8 * self.hidden_size + 1)] = total[m, n, 2], total[m, n, 3]
             task += step
 
