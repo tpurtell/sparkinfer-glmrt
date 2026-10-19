@@ -122,8 +122,9 @@ def finite_nonzero(tensor, label):
                            f"({bad} non-finite of {tensor.numel()})")
 
 
-STAGES = {"ingress": ("_Group",), "fc1": ("fc1_kernel",),
-          "activation": ("activation_kernel",), "fc2": ("fc2_kernel",),
+STAGES = {"ingress": ("_Group",), "fc1": ("fc1_kernel", "prefill_fc1_kernel"),
+          "activation": ("activation_kernel", "prefill_activation_kernel"),
+          "fc2": ("fc2_kernel", "prefill_fc2_kernel"),
           "egress": ("reduce_kernel",)}
 
 
@@ -179,6 +180,35 @@ class _ControlPointers:
                           cta_limit, stream)
 
 
+class _ControlPointersV3:
+    """Master's ABI v3 K1 serving: F16 rotated input, BF16 output with signs_out."""
+
+    def __init__(self, core):
+        self.core = core.Exlr8A16Kernel(6144, 4, 8, 512, device_count=True)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, route_weights: cute.Pointer,
+                 fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
+                 signs_out: cute.Pointer, output: cute.Pointer, group_count: cute.Pointer,
+                 rows: cutlass.Int32, cta_limit: cutlass.Int32, stream: cuda.CUstream):
+        self.core.serving(cute.make_tensor(x, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(pointers, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(bits, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(group_expert, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(route_slots, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(route_group_lane, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(route_weights, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(fc1, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(intermediate, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(fc2, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(signs_out, cute.make_layout(1, stride=1)),
+                          cute.make_tensor(output, cute.make_layout(1, stride=1)), rows,
+                          cute.make_tensor(group_count, cute.make_layout(1, stride=1)),
+                          cta_limit, stream)
+
+
 def load_source(label, path, package=None):
     source = path.read_bytes()
     spec = importlib.util.spec_from_file_location(f"exlr8_control_{label}", path)
@@ -191,11 +221,29 @@ def load_source(label, path, package=None):
 
 def compile_control(path, group_path):
     """Compile master's K1 core and its grouping under bench-only, source-keyed
-    names: the K1 reference whose own speed must not drop (no transforms)."""
+    names: the K1 reference whose own speed must not drop (no transforms).
+    Supports both ABI v2 (11 operands) and ABI v3 (12 operands with signs_out)."""
     from b12x.integration.cuteafd import _common
     core, digest = load_source("core", path)
     glue, glue_digest = load_source("glue", group_path, "b12x.integration.cuteafd")
     O, S = _common.Operand, _common.Scalar
+    if "signs_out" in path.read_text():
+        k1 = _common.compile_program(_ControlPointersV3(core), name="exlr8_control_k1_v3", operands=(
+            O("x", torch.float16, ""), O("pointers", torch.int64, ""), O("bits", torch.int32, ""),
+            O("group_expert", torch.int32, ""), O("route_slots", torch.int32, ""),
+            O("route_group_lane", torch.int32, ""), O("route_weights", torch.float32, ""),
+            O("fc1", torch.float32, ""), O("intermediate", torch.float16, ""),
+            O("fc2", torch.float32, ""), O("signs_out", torch.int8, "", align=4),
+            O("output", torch.bfloat16, ""), O("group_count", torch.int32, "")),
+            scalars=(S("rows"), S("cta_limit")), key=(digest,))
+        group = _common.compile_program(glue._Group(256, 8, 512, 6144, "fp8_k32"),
+            name="exlr8_control_group_v3", operands=(
+            O("ids", torch.int32, ""), O("x", torch.uint8, ""),
+            O("signs_in", torch.int8, "", align=4), O("group_expert", torch.int32, ""),
+            O("route_slots", torch.int32, ""), O("route_group_lane", torch.int32, ""),
+            O("group_count", torch.int32, ""), O("activation", torch.float16, "")),
+            scalars=(S("rows"), S("cta_limit")), key=(glue_digest,))
+        return ("v3", k1, group)
     k1 = _common.compile_program(_ControlPointers(core), name="exlr8_control_k1", operands=(
         O("x", torch.float16, ""), O("pointers", torch.int64, ""), O("bits", torch.int32, ""),
         O("group_expert", torch.int32, ""), O("route_slots", torch.int32, ""),
@@ -209,10 +257,12 @@ def compile_control(path, group_path):
                   O("route_slots", torch.int32, ""), O("route_group_lane", torch.int32, ""),
                   O("group_count", torch.int32, "")),
         scalars=(S("rows"),), key=(glue_digest,))
-    return k1, group
+    return ("v2", k1, group)
 
 
 L2_SPAN = 2  # weight copies span at least this many times the device L2
+PREFILL_MAX_ROWS = 4096
+PREFILL_MAX_GROUPS = 2304
 
 
 def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8):
@@ -249,7 +299,16 @@ def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8):
                 fc2=torch.empty((groups,16,hidden),device="cuda"),
                 output=torch.empty((64,hidden),dtype=torch.bfloat16,device="cuda"),
                 control_output=torch.empty((64,hidden),device="cuda"),
-                control_x=torch.empty((64,hidden),dtype=torch.float16,device="cuda"))
+                control_x=torch.empty((64,hidden),dtype=torch.float16,device="cuda"),
+                prefill_group_expert=torch.full((PREFILL_MAX_GROUPS,),-1,dtype=torch.int32,device="cuda"),
+                prefill_route_slots=torch.full((PREFILL_MAX_GROUPS,16),-1,dtype=torch.int32,device="cuda"),
+                prefill_route_group_lane=torch.full((PREFILL_MAX_ROWS,topk),-1,dtype=torch.int32,device="cuda"),
+                prefill_group_count=torch.zeros(1,dtype=torch.int32,device="cuda"),
+                prefill_activation=torch.empty((PREFILL_MAX_ROWS,hidden),dtype=torch.float16,device="cuda"),
+                prefill_fc1=torch.empty((PREFILL_MAX_GROUPS,units,2,1,16,128),device="cuda"),
+                prefill_intermediate=torch.empty((PREFILL_MAX_GROUPS,units,16,128),dtype=torch.float16,device="cuda"),
+                prefill_fc2=torch.empty((PREFILL_MAX_GROUPS,16,hidden),device="cuda"),
+                prefill_output=torch.empty((PREFILL_MAX_ROWS,hidden),dtype=torch.bfloat16,device="cuda"))
 
 
 def exl3_state(rows, tier, expert_map, props):
@@ -263,6 +322,66 @@ def exl3_state(rows, tier, expert_map, props):
         full_rotation_output_dtype="bf16", num_experts=int(tier.num_experts),
         route_num_experts=exl3.TOTAL_EXPERTS, route_ids_dtype=torch.int32, use_expert_map=True)
     return tier, buffers, launch, topk_sum, expert_map
+
+
+def exl3_prefill_states(rows, exl3_copies, props):
+    """EXL3 K4 grouped prefill (warp-specialized m4096 kernel consuming Fp8K32
+    wire rows directly and writing BF16 response rows)."""
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
+        MixedTrellisRotations,
+        bind_mixed_trellis,
+        build_projection_tiered_maps,
+        compile_mixed_trellis,
+        make_mixed_trellis_buffers,
+        warmup_mixed_trellis_route_pack,
+    )
+    device = torch.device("cuda")
+    dummy_tier0 = exl3._pad_exact_tier_storage(exl3._prepared(3, 1, 301, device), 1)
+    dummy_tier0 = dataclasses.replace(
+        dummy_tier0, w13=dummy_tier0.w13[: dummy_tier0.w13.numel() // 2].contiguous()
+    )
+    global_map, descriptor = build_projection_tiered_maps(
+        [1] * 256, [1] * 256, [1] * 256, tier_slots=(1, 256), device=device
+    )
+    route_slots = exl3.max_packed_route_slots(rows * 8, 64, 256)
+    launch = compile_mixed_trellis(
+        size_m=rows,
+        hidden_size=6144,
+        intermediate_size=512,
+        tier0_num_experts=1,
+        tier1_num_experts=256,
+        route_num_experts=256,
+        tier0_bits=3,
+        tier1_bits=4,
+        trellis_codebook=exl3_copies[0].trellis_codebook,
+        top_k=8,
+        max_m_blocks=(route_slots + 63) // 64,
+        moe_block_size=64,
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(props.shared_memory_per_block_optin),
+        force_tile_config=(64, 256, 64, 256),
+        full_rotation_output_dtype="bf16",
+        warp_specialized=True,
+        input_format="e4m3_k32",
+        ws_input_stages=3,
+        ws_dynamic_tiles=True,
+    )
+    buffers = make_mixed_trellis_buffers(launch, device=device, sms=int(props.multi_processor_count))
+    warmup_mixed_trellis_route_pack(launch, buffers, expert_map=global_map)
+    bindings = []
+    for c in exl3_copies:
+        tier1 = exl3._pad_exact_tier_storage(c, 256)
+        rotations = MixedTrellisRotations(
+            intermediate=torch.cat([dummy_tier0.intermediate_rotations, tier1.intermediate_rotations], dim=0),
+            gate_suh=torch.cat([dummy_tier0.gate_suh, tier1.gate_suh], dim=0),
+            up_suh=torch.cat([dummy_tier0.up_suh, tier1.up_suh], dim=0),
+            down_svh=torch.cat([dummy_tier0.down_svh, tier1.down_svh], dim=0),
+        )
+        bindings.append(bind_mixed_trellis(
+            dummy_tier0, tier1, global_map, descriptor, rotations, launch,
+            gate_experts=(0, 256), up_experts=(0, 256),
+        ))
+    return launch, buffers, bindings
 
 
 def main():
@@ -292,8 +411,18 @@ def main():
     read_only = None if args.profile else read_roofline()
     t = make_candidate(l2_bytes)
     copies = len(t["tables"])
-    group = compile_exlr8_group_aot(top_k=8, max_groups=512, hidden=6144, input_format="fp8_k32")
-    k1 = compile_exlr8_a16_aot(units=4, device_count=True)
+    group = compile_exlr8_group_aot(top_k=8, max_groups=512, hidden=6144, input_format="fp8_k32", max_rows=64)
+    k1 = compile_exlr8_a16_aot(units=4, device_count=True, max_rows=64, route="decode")
+    row_list = [int(r) for r in args.rows.split(",")]
+    has_prefill = any(r > 64 for r in row_list)
+    group_prefill = (compile_exlr8_group_aot(top_k=8, max_groups=PREFILL_MAX_GROUPS,
+                                             hidden=6144, input_format="fp8_k32",
+                                             max_rows=PREFILL_MAX_ROWS)
+                     if has_prefill else None)
+    k1_prefill = (compile_exlr8_a16_aot(units=4, max_groups=PREFILL_MAX_GROUPS,
+                                        device_count=True, max_rows=PREFILL_MAX_ROWS,
+                                        route="prefill")
+                  if has_prefill else None)
     control = compile_control(args.control_core, args.control_glue) if args.control_core else None
     # This is the existing EXL3 uniform-K4 implementation, not a proxy GEMM.
     # Each EXL3 K4 layer holds 256 experts x 3 x 6144 x 512 x 4 bits (1.2 GB),
@@ -306,7 +435,7 @@ def main():
     expert_map = torch.arange(256,dtype=torch.int32,device="cuda")
     cta_limit = props.multi_processor_count*k1.geometry["ctas_per_sm"]
     records = []
-    for total in map(int,args.rows.split(",")):
+    for total in row_list:
         gen = torch.Generator().manual_seed(408+total)
         chunks = [min(64, total-first) for first in range(0, total, 64)]
         ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(total)]).cuda().int()
@@ -321,9 +450,9 @@ def main():
         ids_slot = torch.empty((64,8),dtype=torch.int32,device="cuda")
         weights_slot = torch.empty((64,8),device="cuda")
         response = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
-        layers = max(1, min(copies, -(-2*copies // len(chunks))))
+        layers = copies if total > 64 else max(1, min(copies, -(-2*copies // len(chunks))))
 
-        def candidate_chunk(first, rows, layer):
+        def chunked_chunk(first, rows, layer):
             wire_slot[:rows].copy_(wire[first:first+rows])
             ids_slot[:rows].copy_(ids[first:first+rows])
             weights_slot[:rows].copy_(weights[first:first+rows])
@@ -336,18 +465,48 @@ def main():
                       t["group_count"], scalars=(rows, cta_limit))
             response[first:first+rows].copy_(t["output"][:rows])
 
-        def candidate():
+        def chunked_run():
             for layer in range(layers):
                 first = 0
                 for rows in chunks:
-                    candidate_chunk(first, rows, (layer*len(chunks)+first//64) % copies)
+                    chunked_chunk(first, rows, (layer*len(chunks)+first//64) % copies)
                     first += rows
 
+        def prefill_run():
+            for layer in range(layers):
+                group_prefill.launch(
+                    ids, wire, t["signs_in"], t["prefill_group_expert"],
+                    t["prefill_route_slots"], t["prefill_route_group_lane"],
+                    t["prefill_group_count"], t["prefill_activation"],
+                    scalars=(total, cta_limit))
+                k1_prefill.launch(
+                    t["prefill_activation"], t["tables"][layer % copies], t["bits"],
+                    t["prefill_group_expert"], t["prefill_route_slots"],
+                    t["prefill_route_group_lane"], weights, t["prefill_fc1"],
+                    t["prefill_intermediate"], t["prefill_fc2"], t["signs_out"],
+                    response, t["prefill_group_count"],
+                    scalars=(total, cta_limit))
+
+        candidate = prefill_run if total > 64 else chunked_run
+
         def control_chunk(first, rows, layer):
+            abi_ver, k1c, groupc = control
+            if abi_ver == "v3":
+                wire_slot[:rows].copy_(wire[first:first+rows])
+                ids_slot[:rows].copy_(ids[first:first+rows])
+                weights_slot[:rows].copy_(weights[first:first+rows])
+                groupc.launch(ids_slot, wire_slot, t["signs_in"], t["group_expert"], t["route_slots"],
+                              t["route_group_lane"], t["group_count"], t["activation"],
+                              scalars=(rows, cta_limit))
+                k1c.launch(t["activation"], t["tables"][layer], t["bits"], t["group_expert"],
+                           t["route_slots"], t["route_group_lane"], weights_slot, t["fc1"],
+                           t["intermediate"], t["fc2"], t["signs_out"], t["output"],
+                           t["group_count"], scalars=(rows, cta_limit))
+                response[first:first+rows].copy_(t["output"][:rows])
+                return
             ids_slot[:rows].copy_(ids[first:first+rows])
             weights_slot[:rows].copy_(weights[first:first+rows])
             t["control_x"][:rows].copy_(x[first:first+rows])
-            k1c, groupc = control
             groupc.launch(ids_slot, t["group_expert"], t["route_slots"], t["route_group_lane"],
                           t["group_count"], scalars=(rows,))
             k1c.launch(t["control_x"], t["tables"][layer], t["bits"], t["group_expert"],
@@ -362,14 +521,19 @@ def main():
                     control_chunk(first, rows, (layer*len(chunks)+first//64) % copies)
                     first += rows
 
-        # EXL3 K4 at the worker's real decode capacities: one launch per chunk.
-        # EXL3 runs its m4096 warp-specialized export for prefill; only decode
-        # capacities (<= 64 rows) are compared against it.
         states = ({rows: [exl3_state(rows, c, expert_map, props) for c in exl3_copies]
                    for rows in set(chunks)} if total <= 64 else {})
+        ws_state = exl3_prefill_states(total, exl3_copies, props) if total > 64 else None
         decoded = torch.empty((64,6144),dtype=torch.bfloat16,device="cuda")
 
         def baseline():
+            if total > 64:
+                _, ws_buffers, ws_bindings = ws_state
+                for layer in range(layers):
+                    exl3.run_bound_mixed_trellis(
+                        wire, weights, ids, ws_bindings[layer % len(ws_bindings)], ws_buffers
+                    )
+                return
             for layer in range(layers):
                 first = 0
                 for rows in chunks:
@@ -385,11 +549,13 @@ def main():
         if args.profile:
             for _ in range(3):
                 baseline(); candidate()
-                if control: control_run()
+                if total > 64 and not control: chunked_run()
+                elif control: control_run()
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStart()
             baseline(); candidate()
-            if control: control_run()
+            if total > 64 and not control: chunked_run()
+            elif control: control_run()
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStop()
             print(f"profiled rows={total}", flush=True)
@@ -398,12 +564,19 @@ def main():
         candidate_graph.replay()
         finite_nonzero(response.float(), "EXLR8")
         graphs = {"candidate": candidate_graph}
-        if states:
+        if states or ws_state is not None:
             graphs["baseline"] = capture(baseline)
             graphs["baseline"].replay()
-            finite_nonzero(response.float(), "EXL3")
+            finite_nonzero((ws_state[1].output[:total] if total > 64 else response).float(), "EXL3")
+        if total > 64 and not control:
+            graphs["chunked"] = capture(chunked_run)
+            graphs["chunked"].replay()
+            finite_nonzero(response.float(), "EXLR8_chunked")
         if control:
             graphs["control"] = capture(control_run)
+            graphs["control"].replay()
+            if control[0] == "v3":
+                finite_nonzero(response.float(), "EXLR8_control")
         names = list(graphs)
         rounds = {n: [] for n in names}
         for r in range(args.repeats):
@@ -413,30 +586,55 @@ def main():
         med = {n: statistics.median(v) for n, v in rounds.items()}
         baseline_us = med.get("baseline")
         candidate_us = med["candidate"]
-        unique = sum(int(ids[f:f+r].unique().numel()) for f, r in zip(range(0,total,64), chunks))
+        chunked_unique = sum(int(ids[f:f+r].unique().numel()) for f, r in zip(range(0,total,64), chunks))
+        wave_unique = int(ids.unique().numel())
+        unique = wave_unique if total > 64 else chunked_unique
         payload_bytes = unique*3*6144*512*4//8
         stages = stage_profile(candidate_graph,args.output.parent)
         stages = {k: (v/layers if k.endswith("_us") else v) for k, v in stages.items()}
-        record = dict(rows=total, chunks=len(chunks), layer_copies=copies, payload_bytes=payload_bytes,
+        record = dict(rows=total, chunks=1 if total > 64 else len(chunks),
+                      layer_copies=copies, unique_experts=unique, payload_bytes=payload_bytes,
                       exlr8_step_us=candidate_us, exlr8_gbps=payload_bytes/candidate_us/1000,
                       read_roofline_percent=100*payload_bytes/candidate_us/1000/read_only["gbps"],
                       stages=stages,
                       transform_share_percent=100*(stages["ingress_us"]+stages["egress_us"])/candidate_us)
         if baseline_us is not None:
+            row_target = 1.0 if total > 64 else 0.97
             record.update(exl3_k4_us=baseline_us, speedup=baseline_us/candidate_us,
                           exl3_gbps=payload_bytes/baseline_us/1000,
                           exl3_read_roofline_percent=100*payload_bytes/baseline_us/1000/read_only["gbps"],
-                          target=0.97, target_met=baseline_us/candidate_us>=0.97)
+                          target=row_target, target_met=baseline_us/candidate_us>=row_target)
+        if "chunked" in med:
+            chunked_us = med["chunked"]
+            cstages = stage_profile(graphs["chunked"], args.output.parent)
+            record.update(
+                chunked_step_us=chunked_us,
+                speedup_vs_chunked=chunked_us / candidate_us,
+                chunked_unique_experts=chunked_unique,
+                chunked_unique_gbps=payload_bytes / chunked_us / 1000,
+                chunked_read_roofline_percent=100 * payload_bytes / chunked_us / 1000 / read_only["gbps"],
+                chunked_stages={k: (v/layers if k.endswith("_us") else v) for k, v in cstages.items()},
+            )
         record["rounds_us"] = rounds
-        if control:
+        if "control" in med:
             control_graph = graphs["control"]
             control_us = med["control"]
             cstages = stage_profile(control_graph,args.output.parent)
+            cstages_scaled = {k: (v/layers if k.endswith("_us") else v) for k, v in cstages.items()}
             record.update(control_us=control_us, candidate_over_control=control_us/candidate_us,
-                          control_stages={k: (v/layers if k.endswith("_us") else v) for k, v in cstages.items()})
+                          control_stages=cstages_scaled)
+            if total > 64:
+                record.update(
+                    chunked_step_us=control_us,
+                    speedup_vs_chunked=control_us / candidate_us,
+                    chunked_unique_experts=chunked_unique,
+                    chunked_unique_gbps=payload_bytes / control_us / 1000,
+                    chunked_read_roofline_percent=100 * payload_bytes / control_us / 1000 / read_only["gbps"],
+                    chunked_stages=cstages_scaled,
+                )
         records.append(record)
         print(json.dumps(record), flush=True)
-        del states
+        del states, ws_state
     if args.profile:
         return
     result = dict(schema=2,kind="exlr8_spark_step_vs_exl3_k4",device=props.name,
@@ -444,7 +642,7 @@ def main():
                   hidden=6144,units_per_rank=4,top_k=8,experts=256,ingress="fp8_k32",egress="bf16",
                   measured_read_roofline=read_only,
                   conditions=("TP4 synthetic K4 payloads, cold L2 (distinct weight copies >= 2x L2), "
-                              "graph replay, one untimed warm replay; serial 64-row chunks; profiler separate"),
+                              "graph replay, one untimed warm replay; grouped prefill for rows > 64; profiler separate"),
                   rows=records,target_met=all(r.get("target_met", True) for r in records))
     with args.output.open("x") as stream:
         json.dump(result,stream,indent=2)

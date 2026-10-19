@@ -153,3 +153,52 @@ def test_invalid_geometry_rejected_before_compilation(kind, kwargs):
 
     with pytest.raises(ValueError):
         getattr(exlr8_glue, f"compile_exlr8_{kind}_aot")(**kwargs)
+
+
+def test_prefill_grouping_and_ingress_up_to_4096_rows():
+    from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
+
+    experts, topk, capacity, max_rows, hidden = 16, 8, 2304, 4096, 128
+    prefill = compile_exlr8_group_aot(experts=experts, top_k=topk, max_groups=capacity,
+                                      hidden=hidden, input_format="fp8_k32", max_rows=max_rows)
+    decode = compile_exlr8_group_aot(experts=experts, top_k=topk, max_groups=512,
+                                     hidden=hidden, input_format="fp8_k32", max_rows=64)
+    x, _, signs = ingress_buffers(max_rows, hidden, "fp8_k32", seed=4096)
+    generator = torch.Generator().manual_seed(4097)
+    ids = torch.randint(0, experts, (max_rows, topk), generator=generator, dtype=torch.int32).cuda()
+    groups = torch.empty((capacity,), dtype=torch.int32, device="cuda")
+    slots = torch.empty((capacity, 16), dtype=torch.int32, device="cuda")
+    inverse = torch.empty_like(ids)
+    count = torch.empty(1, dtype=torch.int32, device="cuda")
+    activation = torch.empty((max_rows, hidden), dtype=torch.float16, device="cuda")
+
+    # Compute 64-row chunked ingress reference across all 4096 rows.
+    chunk_act = torch.empty_like(activation)
+    d_groups = torch.empty((512,), dtype=torch.int32, device="cuda")
+    d_slots = torch.empty((512, 16), dtype=torch.int32, device="cuda")
+    d_inv = torch.empty((64, topk), dtype=torch.int32, device="cuda")
+    for start in range(0, max_rows, 64):
+        decode.launch(ids[start:start + 64], x[start:start + 64], signs, d_groups, d_slots,
+                      d_inv, count, chunk_act[start:start + 64], scalars=(64, 80))
+
+    for live in (1, 64, 65, 512, 1024, 4096):
+        activation.fill_(float("nan"))
+        inverse.fill_(-99)
+        prefill.launch(ids, x, signs, groups, slots, inverse, count, activation, scalars=(live, 80))
+        assert torch.equal(activation[:live].view(torch.int16), chunk_act[:live].view(torch.int16)), live
+        assert torch.isnan(activation[live:]).all()
+        assert (inverse[live:] == -99).all()
+        flat_ids = ids[:live].flatten()
+        counts = torch.bincount(flat_ids, minlength=experts)
+        expected_n = int(((counts + 15) // 16).sum().item())
+        assert count.item() == expected_n
+        # Verify inverse mapping reconstructs every route slot exactly.
+        inv_cpu = inverse[:live].cpu().flatten()
+        slots_cpu = slots[:expected_n].cpu()
+        groups_cpu = groups[:expected_n].cpu()
+        flat_cpu = flat_ids.cpu()
+        for r in range(live * topk):
+            packed = int(inv_cpu[r])
+            g, lane = divmod(packed, 16)
+            assert int(slots_cpu[g, lane]) == r
+            assert int(groups_cpu[g]) == int(flat_cpu[r])

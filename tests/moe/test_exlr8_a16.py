@@ -465,3 +465,93 @@ def test_fp8_spark_step_chunk_and_cta_invariance(case):
         step.output.fill_(float("nan"))
         graph.replay()
         assert torch.equal(step.output.view(torch.int16), solo[first:first + 64].view(torch.int16))
+
+
+class PrefillSparkStep:
+    """Grouped EXLR8 prefill step: one launch of group/ingress + one launch of
+    grouped K1 across the whole wave (or auto-dispatching <=64 decode vs >64 prefill)."""
+
+    def __init__(self, case, max_rows=4096, max_groups=2304, route="prefill"):
+        from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
+        from b12x.integration.cuteafd.exlr8_glue import compile_exlr8_group_aot
+        self.case = case
+        self.max_rows = max_rows
+        self.max_groups = max_groups
+        self.group = compile_exlr8_group_aot(experts=4, top_k=case.topk, max_groups=max_groups,
+                                             hidden=case.h, input_format="fp8_k32", max_rows=max_rows)
+        self.k1 = compile_exlr8_a16_aot(hidden=case.h, units=case.u, top_k=case.topk,
+                                        max_groups=max_groups, device_count=True,
+                                        max_rows=max_rows, route=route)
+        d = case.device
+        self.count = torch.empty(1, dtype=torch.int32, device=d)
+        self.activation = torch.empty((max_rows, case.h), dtype=torch.float16, device=d)
+        self.group_expert = torch.empty((max_groups,), dtype=torch.int32, device=d)
+        self.route_slots = torch.empty((max_groups, 16), dtype=torch.int32, device=d)
+        self.inverse = torch.empty((max_rows, case.topk), dtype=torch.int32, device=d)
+        fc1_splits = self.k1.geometry["fc1_splits"]
+        self.fc1 = torch.empty((max_groups, case.u, 2, fc1_splits, 16, 128), dtype=torch.float32, device=d)
+        self.intermediate = torch.empty((max_groups, case.u, 16, 128), dtype=torch.float16, device=d)
+        self.fc2 = torch.empty((max_groups, 16, case.h), dtype=torch.float32, device=d)
+        self.output = torch.empty((max_rows, case.h), dtype=torch.bfloat16, device=d)
+
+    def run(self, wire, ids, weights, rows, limit=80):
+        c = self.case
+        self.output[:rows + 1 if rows < self.max_rows else rows].fill_(float("nan"))
+        self.group.launch(ids, wire, c.signs_in, self.group_expert, self.route_slots,
+                          self.inverse, self.count, self.activation, scalars=(rows, limit))
+        self.k1.launch(self.activation, c.pointers, c.bits, self.group_expert, self.route_slots,
+                       self.inverse, weights, self.fc1.view(-1), self.intermediate.view(-1),
+                       self.fc2.view(-1), c.signs_out, self.output, self.count,
+                       scalars=(rows, limit))
+        if rows < self.max_rows:
+            assert torch.isnan(self.output[rows]).all(), "writes past live rows"
+        return self.output[:rows].clone()
+
+
+def test_grouped_prefill_bitwise_matches_chunked_1_to_4096(case):
+    """Grouped prefill route and auto decode/prefill route are bitwise identical
+    to the 64-row chunked route across row counts 1..4096 and across 64 vs 65."""
+    chunked_step = SparkStep(case)
+    prefill_step = PrefillSparkStep(case, max_rows=4096, max_groups=2304, route="prefill")
+    auto_step = PrefillSparkStep(case, max_rows=4096, max_groups=2304, route="auto")
+    wire, _, ids, weights = wave_inputs(case, 4096, seed=4096)
+
+    # Full 4096-row reference via the 64-row chunked route.
+    chunks_4096 = [64] * (4096 // 64)
+    expected_4096 = chunked_step.wave(wire, ids, weights, chunks_4096, limit=80)
+
+    for rows in (1, 2, 7, 16, 63, 64, 65, 127, 128, 257, 512, 1024, 4096):
+        for limit in ((1, 40, 188) if rows <= 128 else (80,)):
+            actual = prefill_step.run(wire[:rows], ids[:rows], weights[:rows], rows, limit=limit)
+            assert torch.equal(actual.view(torch.int16), expected_4096[:rows].view(torch.int16)), (rows, limit)
+
+    # Specifically gate the 64 vs 65 boundary on the auto-dispatching program.
+    for rows in (1, 63, 64, 65, 66, 128, 512):
+        for limit in (1, 40, 188):
+            actual_auto = auto_step.run(wire[:rows], ids[:rows], weights[:rows], rows, limit=limit)
+            assert torch.equal(actual_auto.view(torch.int16), expected_4096[:rows].view(torch.int16)), (rows, limit)
+
+
+def test_prefill_route_packing_and_nonresident_invariance():
+    from b12x.integration.cuteafd.exlr8 import compile_exlr8_a16_aot
+    case = Case(os.environ["CUTEAFD_EXLR8_SNAPSHOT"], units=5, hidden=6016,
+                nonresident=((1, 1), (1, 3), (1, 4)))
+    decode_prog = compile_exlr8_a16_aot(hidden=case.h, units=case.u, top_k=case.topk,
+                                        max_groups=case.max_groups, route="decode")
+    prefill_prog = compile_exlr8_a16_aot(hidden=case.h, units=case.u, top_k=case.topk,
+                                         max_groups=case.max_groups, route="prefill")
+    case.routing(64)
+    launch(case, decode_prog, 64, 80)
+    expected = case.output.clone()
+    for rows in (1, 7, 16, 33, 64):
+        for chunk in (1, 3, 7, 16):
+            case.routing(rows, chunk=chunk, reverse=bool(chunk % 2))
+            for limit in (1, 40, 188):
+                case.fc1.fill_(float("nan"))
+                case.intermediate.fill_(float("nan"))
+                case.fc2.fill_(float("nan"))
+                case.output.fill_(float("nan"))
+                launch(case, prefill_prog, rows, limit)
+                assert torch.equal(case.output[:rows].view(torch.int32),
+                                   expected[:rows].view(torch.int32)), (rows, chunk, limit)
+                assert torch.isnan(case.output[rows:]).all()

@@ -22,17 +22,28 @@ POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
             "signs_out", "output")
 
 
-def geometry(hidden=6144, units=16, top_k=8, max_groups=512):
-    values = (hidden, units, top_k, max_groups)
+PREFILL_CTAS_PER_SM = 2
+PREFILL_MAX_ROWS = 4096
+PREFILL_MAX_GROUPS = 2304
+
+
+def geometry(hidden=6144, units=16, top_k=8, max_groups=512, max_rows=64, route="auto"):
+    values = (hidden, units, top_k, max_groups, max_rows)
     if any(type(v) is not int or v <= 0 or v > 2**31 - 1 for v in values) or hidden % 128:
         raise ValueError("EXLR8 requires positive int32 geometry and hidden % 128 == 0")
+    if route not in ("auto", "decode", "prefill"):
+        raise ValueError(f"unknown EXLR8 route {route!r}")
+    fc1_splits = 1 if route == "prefill" else (hidden + 1023) // 1024
+    ctas_per_sm = 2 if route == "prefill" else CTAS_PER_SM
     result = dict(abi_version=ABI_VERSION, hidden=hidden, units=units, top_k=top_k,
-                  max_groups=max_groups, max_rows=64, split_k_blocks=8,
-                  fc1_splits=(hidden + 1023) // 1024, ctas_per_sm=CTAS_PER_SM)
+                  max_groups=max_groups, max_rows=max_rows, split_k_blocks=8,
+                  fc1_splits=fc1_splits, ctas_per_sm=ctas_per_sm)
+    if route != "auto":
+        result["route"] = route
     tasks = (max_groups * units * 2 * result["fc1_splits"],
-             max_groups * units, max_groups * (hidden // 128), 64 * (hidden // 128))
+             max_groups * units, max_groups * (hidden // 128), max_rows * (hidden // 128))
     # Grid-stride increments may reach almost twice the task count before exiting.
-    if max(tasks) > (2**31 - 1) // 2 or max(64 * top_k, max_groups * 16) > 2**31 - 1:
+    if max(tasks) > (2**31 - 1) // 2 or max(max_rows * top_k, max_groups * 16) > 2**31 - 1:
         raise ValueError("EXLR8 task or route indexing exceeds signed int32")
     if max(scratch_bytes(result).values()) > 2**63 - 1:
         raise ValueError("EXLR8 scratch exceeds signed 64-bit addressing")
@@ -49,7 +60,10 @@ def scratch_bytes(g):
 class _Exlr8Pointers:
     def __init__(self, g):
         from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
-        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"], g["max_groups"])
+        self.core = Exlr8A16Kernel(
+            g["hidden"], g["units"], g["top_k"], g["max_groups"],
+            max_rows=g.get("max_rows", 64), route=g.get("route", "auto"),
+        )
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -77,8 +91,10 @@ class _Exlr8Pointers:
 class _Exlr8ServingPointers:
     def __init__(self, g):
         from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
-        self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"],
-                                  g["max_groups"], device_count=True)
+        self.core = Exlr8A16Kernel(
+            g["hidden"], g["units"], g["top_k"], g["max_groups"],
+            device_count=True, max_rows=g.get("max_rows", 64), route=g.get("route", "auto"),
+        )
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -103,13 +119,14 @@ class _Exlr8ServingPointers:
 
 
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
-                         device_count=False, shared_expert=False):
+                         device_count=False, shared_expert=False, max_rows=64,
+                         route="auto"):
     if shared_expert:
         if not device_count:
             raise ValueError("shared EXLR8 requires device-count serving ABI")
         if top_k != 1 or max_groups != 4:
             raise ValueError("shared EXLR8 requires top_k=1 and max_groups=4")
-    g = geometry(hidden, units, top_k, max_groups)
+    g = geometry(hidden, units, top_k, max_groups, max_rows=max_rows, route=route)
     h, u, t, m, s = (g[k] for k in ("hidden", "units", "top_k", "max_groups", "fc1_splits"))
     operands = (
         Operand("x", torch.float16, f"[rows,{h}]"),
@@ -128,11 +145,27 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
     sizes = scratch_bytes(g)
     if device_count:
         operands += (Operand("group_count", torch.int32, "[1]"),)
+    key = (h, u, t, m, g["abi_version"], shared_expert)
+    if max_rows != 64 or route != "auto":
+        key = key + (max_rows, route)
+    if shared_expert:
+        name = "exlr8_shared_a16_serving"
+    elif route == "prefill":
+        name = "exlr8_a16_prefill_serving" if device_count else "exlr8_a16_prefill"
+    else:
+        name = "exlr8_a16_serving" if device_count else "exlr8_a16_decode"
     return compile_program(_Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g),
-                           name=("exlr8_shared_a16_serving" if shared_expert else
-                                 "exlr8_a16_serving" if device_count else "exlr8_a16_decode"), operands=operands,
+                           name=name, operands=operands,
                            scalars=tuple(Scalar(n) for n in (("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
-                           key=(h, u, t, m, g["abi_version"], shared_expert), geometry=g,
+                           key=key, geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)
+
+
+def compile_exlr8_prefill_aot(*, hidden=6144, units=16, top_k=8,
+                              max_groups=PREFILL_MAX_GROUPS, max_rows=PREFILL_MAX_ROWS,
+                              device_count=True, route="prefill"):
+    return compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+                                 max_groups=max_groups, device_count=device_count,
+                                 max_rows=max_rows, route=route)
