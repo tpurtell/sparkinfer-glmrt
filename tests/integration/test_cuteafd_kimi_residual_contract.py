@@ -28,7 +28,7 @@ def test_residual_abi(capture, candidates, prefix_mode):
     assert "scratch" not in info
     assert kernel.elements * kernel.threads == 7168
     assert kernel.shared_candidates == (candidates - 3 if candidates >= 5 else 0)
-    shared_bytes = kernel.shared_candidates * 7168 * 2 + (2 * candidates + 1) * 16 * 4
+    shared_bytes = kernel.shared_candidates * 7168 * 2 + 2 * (2 * candidates + 1) * 16 * 4
     assert shared_bytes <= 99 * 1024
 
 
