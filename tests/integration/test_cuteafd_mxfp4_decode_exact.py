@@ -27,6 +27,11 @@ def test_decode_master_rows_packing_graph(routing):
     baseline = importlib.util.module_from_spec(spec)
     sys.modules[name] = baseline
     spec.loader.exec_module(baseline)
+
+    class Control(baseline.GroupedMxfp4Gemv):
+        def key(self):
+            return ("exact_control", super().key())
+
     g = fp8_moe.Fp8MoeGeometry("exact_mxfp4", hidden=6144, experts=16, top_k=8,
                               intermediate=384, weights="mxfp4")
     gen = torch.Generator(device="cuda").manual_seed(500)
@@ -45,7 +50,7 @@ def test_decode_master_rows_packing_graph(routing):
         weights.append(torch.randint(118 if scales else 0, 124 if scales else 256, shape,
                                      device="cuda", dtype=torch.uint8, generator=gen))
     programs = {}
-    for arm, core in (("master", baseline.GroupedMxfp4Gemv), ("candidate", GroupedMxfp4Gemv)):
+    for arm, core in (("master", Control), ("candidate", GroupedMxfp4Gemv)):
         try:
             fp8_moe.GroupedMxfp4Gemv = core
             for capacity in (1, 16, 64, 128):

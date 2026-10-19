@@ -24,7 +24,13 @@ def control_class(path):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    return module.GroupedMxfp4Gemv
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    class Control(module.GroupedMxfp4Gemv):
+        def key(self):
+            return ("frozen_control", digest, super().key())
+
+    return Control
 
 
 def compile_arm(g, capacity, core):
@@ -90,7 +96,9 @@ def run_pair(args):
     ids, mix = router_rows(args.snapshot, args.layer, x)
     weights = packed_weights(g, generator)
     cores = {"master": control_class(args.control_core), "candidate": GroupedMxfp4Gemv}
-    programs = {arm: compile_arm(g, capacity, core) for arm, core in cores.items()}
+    capacities = {rows: next(cap for cap in (1, 16, 80, 256) if cap >= rows) for rows in widths}
+    programs = {(arm, cap): compile_arm(g, cap, core)
+                for cap in sorted(set(capacities.values())) for arm, core in cores.items()}
     buffers = {arm: (torch.empty_like(x), torch.empty(fp8_moe_scratch_bytes(g, "decode", capacity),
                                                     device="cuda", dtype=torch.uint8)) for arm in cores}
     l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
@@ -106,7 +114,7 @@ def run_pair(args):
     for rows in widths:
         def launch(arm):
             out, scratch = buffers[arm]
-            programs[arm].launch(source, ids, mix, *weights, out, scratch, scalars=(rows,))
+            programs[arm, capacities[rows]].launch(source, ids, mix, *weights, out, scratch, scalars=(rows,))
 
         graphs = {}
         for arm in cores:
@@ -138,7 +146,7 @@ def run_pair(args):
                 end.record()
                 end.synchronize()
                 times[arm].append(start.elapsed_time(end) * 1000)
-        record = {"rows": rows, "unique_experts": ids[:rows].unique().numel(),
+        record = {"rows": rows, "capacity": capacities[rows], "unique_experts": ids[:rows].unique().numel(),
                   "max_rows_per_expert": int(torch.bincount(ids[:rows].flatten().long()).max()),
                   "exact": True, "samples_us": times}
         record.update({arm + "_us": statistics.median(values) for arm, values in times.items()})
