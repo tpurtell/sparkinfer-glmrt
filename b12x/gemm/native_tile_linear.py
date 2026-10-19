@@ -368,11 +368,11 @@ class NativeTileLinear:
                                             word = cute.arch.shuffle_sync(cur[(c * G + gi) * 2 + t // 2], src)
                                             b0, _ = _int4x4_bf16(word >> (j * Int32(8)).to(Uint32))
                                         else:
-                                            lo = cute.arch.shuffle_sync(cur[(c * G + gi) * 4 + 2 * (t // 2)], src)
-                                            hi = cute.arch.shuffle_sync(cur[(c * G + gi) * 4 + 2 * (t // 2) + 1], src)
-                                            word = lo
+                                            packed_lo = cute.arch.shuffle_sync(cur[(c * G + gi) * 4 + 2 * (t // 2)], src)
+                                            packed_hi = cute.arch.shuffle_sync(cur[(c * G + gi) * 4 + 2 * (t // 2) + 1], src)
+                                            word = packed_lo
                                             if j >= Int32(2):
-                                                word = hi
+                                                word = packed_hi
                                             b0, _ = _e4m3x4_bf16(word >> ((j & Int32(1)) * Int32(16)).to(Uint32))
                                         bw[8 * gi + 2 * t + half] = b0
                                 else:
