@@ -193,6 +193,13 @@ class GroupedMxfp4Gemv:
                         dest[gi * 4 + t] = words[t]
                     factors[gi] = _ld_u8(s_row_a + Int64(gi * 8 * self.scale_bytes) + Int64(block) * Int64(4))
 
+    @cute.jit
+    def _row_address(self, a: cute.Pointer, pair_row: cute.Pointer, grouped: Int32) -> Int64:
+        source = grouped
+        if const_expr(self.gather):
+            source = _i32_at(Int64(pair_row.toint()), grouped)
+        return Int64(a.toint()) + Int64(source) * Int64(self.k * 2)
+
     @cute.kernel
     def kernel(self, a: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, w_a: cute.Pointer,
                s_a: cute.Pointer, w_b: cute.Pointer, s_b: cute.Pointer, out: cute.Pointer):
@@ -250,26 +257,26 @@ class GroupedMxfp4Gemv:
                 cur = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
                 f_cur = cute.make_rmem_tensor(cute.make_layout((self.total_groups,), stride=(1,)), Uint32)
                 self._load_block(cur, f_cur, w_row_a, s_row_a, w_row_b, s_row_b, Int32(0))
-                src_lo = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
-                src_hi = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
-                for mt in cutlass.range_constexpr(self.m_tiles):
-                    r_lo = Int32(16 * mt) + g
-                    r_hi = r_lo + Int32(8)
-                    s_lo = Int32(-1)
-                    s_hi = Int32(-1)
-                    if r_lo < n_c:
-                        if const_expr(self.gather):
-                            s_lo = _i32_at(Int64(pair_row.toint()), row0 + r_lo)
-                        else:
-                            s_lo = row0 + r_lo
-                    if r_hi < n_c:
-                        if const_expr(self.gather):
-                            s_hi = _i32_at(Int64(pair_row.toint()), row0 + r_hi)
-                        else:
-                            s_hi = row0 + r_hi
-                    src_lo[mt] = s_lo
-                    src_hi[mt] = s_hi
                 if const_expr(self.blocks == 1 and not self.fuse_swiglu and self.m_tiles > 1):
+                    src_lo = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
+                    src_hi = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
+                    for mt in cutlass.range_constexpr(self.m_tiles):
+                        r_lo = Int32(16 * mt) + g
+                        r_hi = r_lo + Int32(8)
+                        s_lo = Int32(-1)
+                        s_hi = Int32(-1)
+                        if r_lo < n_c:
+                            if const_expr(self.gather):
+                                s_lo = _i32_at(Int64(pair_row.toint()), row0 + r_lo)
+                            else:
+                                s_lo = row0 + r_lo
+                        if r_hi < n_c:
+                            if const_expr(self.gather):
+                                s_hi = _i32_at(Int64(pair_row.toint()), row0 + r_hi)
+                            else:
+                                s_hi = row0 + r_hi
+                        src_lo[mt] = s_lo
+                        src_hi[mt] = s_hi
                     live_k = Int32(1)
                     if const_expr(self.k % (128 * self.warps) != 0):
                         live_k = (k_begin + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
@@ -345,13 +352,13 @@ class GroupedMxfp4Gemv:
                         acc[i] = Float32(0.0)
                     nxt = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
                     f_nxt = cute.make_rmem_tensor(cute.make_layout((self.total_groups,), stride=(1,)), Uint32)
-                    for block in cutlass.range(self.blocks, unroll=1):
-                        if block + 1 < self.blocks:
-                            self._load_block(nxt, f_nxt, w_row_a, s_row_a, w_row_b, s_row_b, block + 1)
-                        live_k = Int32(1)
-                        if const_expr(self.k % (128 * self.warps) != 0):
-                            live_k = (k_begin + Int64(block) * Int64(128) + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
-                        if const_expr(self.m_tiles == 1):
+                    if const_expr(self.m_tiles == 1):
+                        for block in cutlass.range(self.blocks, unroll=1):
+                            if block + 1 < self.blocks:
+                                self._load_block(nxt, f_nxt, w_row_a, s_row_a, w_row_b, s_row_b, block + 1)
+                            live_k = Int32(1)
+                            if const_expr(self.k % (128 * self.warps) != 0):
+                                live_k = (k_begin + Int64(block) * Int64(128) + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
                             wide = cute.make_rmem_tensor(cute.make_layout((16 * self.total_groups,), stride=(1,)), Uint32)
                             for gi in cutlass.range_constexpr(self.total_groups):
                                 factor = ue8m0_bf16x2(f_cur[gi])
@@ -361,22 +368,22 @@ class GroupedMxfp4Gemv:
                                     wide[16 * gi + 4 * t + 1] = v1
                                     wide[16 * gi + 4 * t + 2] = v2
                                     wide[16 * gi + 4 * t + 3] = v3
-                            s_lo = src_lo[0]
-                            s_hi = src_hi[0]
                             for chunk in cutlass.range_constexpr(2):
                                 k_off = (Int64(block) * Int64(128) + Int64(chunk * 16)) * Int64(2)
+                                r_lo = g
+                                r_hi = r_lo + Int32(8)
                                 xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
                                 for i in cutlass.range_constexpr(16):
                                     xa[i] = Uint32(0)
-                                if (s_lo >= Int32(0)) & (live_k != Int32(0)):
-                                    at = Int64(a.toint()) + Int64(s_lo) * Int64(self.k * 2) + x_off + k_off
+                                if (r_lo < n_c) & (live_k != Int32(0)):
+                                    at = self._row_address(a, pair_row, row0 + r_lo) + x_off + k_off
                                     lo = _ld_cached(at)
                                     hi = _ld_cached(at + Int64(16))
                                     for i in cutlass.range_constexpr(4):
                                         xa[i] = lo[i]
                                         xa[4 + i] = hi[i]
-                                if (s_hi >= Int32(0)) & (live_k != Int32(0)):
-                                    at = Int64(a.toint()) + Int64(s_hi) * Int64(self.k * 2) + x_off + k_off
+                                if (r_hi < n_c) & (live_k != Int32(0)):
+                                    at = self._row_address(a, pair_row, row0 + r_hi) + x_off + k_off
                                     lo = _ld_cached(at)
                                     hi = _ld_cached(at + Int64(16))
                                     for i in cutlass.range_constexpr(4):
@@ -393,30 +400,60 @@ class GroupedMxfp4Gemv:
                                         acc[f + 1] = d1
                                         acc[f + 2] = d2
                                         acc[f + 3] = d3
-                        else:
+                            for i in cutlass.range_constexpr(per_block):
+                                cur[i] = nxt[i]
+                            for i in cutlass.range_constexpr(self.total_groups):
+                                f_cur[i] = f_nxt[i]
+                    else:
+                        src_lo = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
+                        src_hi = cute.make_rmem_tensor(cute.make_layout((self.m_tiles,), stride=(1,)), Int32)
+                        for mt in cutlass.range_constexpr(self.m_tiles):
+                            r_lo = Int32(16 * mt) + g
+                            r_hi = r_lo + Int32(8)
+                            s_lo = Int32(-1)
+                            s_hi = Int32(-1)
+                            if r_lo < n_c:
+                                if const_expr(self.gather):
+                                    s_lo = _i32_at(Int64(pair_row.toint()), row0 + r_lo)
+                                else:
+                                    s_lo = row0 + r_lo
+                            if r_hi < n_c:
+                                if const_expr(self.gather):
+                                    s_hi = _i32_at(Int64(pair_row.toint()), row0 + r_hi)
+                                else:
+                                    s_hi = row0 + r_hi
+                            src_lo[mt] = s_lo
+                            src_hi[mt] = s_hi
+                        for block in cutlass.range(self.blocks, unroll=1):
+                            if block + 1 < self.blocks:
+                                self._load_block(nxt, f_nxt, w_row_a, s_row_a, w_row_b, s_row_b, block + 1)
+                            live_k = Int32(1)
+                            if const_expr(self.k % (128 * self.warps) != 0):
+                                live_k = (k_begin + Int64(block) * Int64(128) + Int64(32) * Int64(j) < Int64(self.k)).to(Int32)
                             factors = cute.make_rmem_tensor(cute.make_layout((self.total_groups,), stride=(1,)), Uint32)
                             for gi in cutlass.range_constexpr(self.total_groups):
                                 factors[gi] = ue8m0_bf16x2(f_cur[gi])
-                            for chunk in cutlass.range_constexpr(2):
-                                k_off = (Int64(block) * Int64(128) + Int64(chunk * 16)) * Int64(2)
-                                for mt in cutlass.range_constexpr(self.m_tiles):
-                                    if Int32(mt) < live_tiles:
-                                        s_lo = src_lo[mt]
-                                        s_hi = src_hi[mt]
+                            k_blk = x_off + Int64(block) * Int64(256)
+                            for mt in cutlass.range_constexpr(self.m_tiles):
+                                if Int32(mt) < live_tiles:
+                                    s_lo = src_lo[mt]
+                                    s_hi = src_hi[mt]
+                                    at_lo = Int64(a.toint()) + Int64(s_lo) * Int64(self.k * 2) + k_blk
+                                    at_hi = Int64(a.toint()) + Int64(s_hi) * Int64(self.k * 2) + k_blk
+                                    for chunk in cutlass.range_constexpr(2):
+                                        k_off = Int64(chunk * 32)
                                         xa = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Uint32)
                                         for i in cutlass.range_constexpr(16):
                                             xa[i] = Uint32(0)
                                         if (s_lo >= Int32(0)) & (live_k != Int32(0)):
-                                            at = Int64(a.toint()) + Int64(s_lo) * Int64(self.k * 2) + x_off + k_off
-                                            lo = _ld_cached(at)
-                                            hi = _ld_cached(at + Int64(16))
+                                            lo = _ld_cached(at_lo + k_off)
+                                            hi = _ld_cached(at_lo + k_off + Int64(16))
                                             for i in cutlass.range_constexpr(4):
                                                 xa[i] = lo[i]
                                                 xa[4 + i] = hi[i]
                                         if (s_hi >= Int32(0)) & (live_k != Int32(0)):
-                                            at = Int64(a.toint()) + Int64(s_hi) * Int64(self.k * 2) + x_off + k_off
-                                            lo = _ld_cached(at)
-                                            hi = _ld_cached(at + Int64(16))
+                                            lo = _ld_cached(at_hi + k_off)
+                                            hi = _ld_cached(at_hi + k_off + Int64(16))
                                             for i in cutlass.range_constexpr(4):
                                                 xa[8 + i] = lo[i]
                                                 xa[12 + i] = hi[i]
@@ -437,10 +474,10 @@ class GroupedMxfp4Gemv:
                                             acc[f + 1] = d1
                                             acc[f + 2] = d2
                                             acc[f + 3] = d3
-                        for i in cutlass.range_constexpr(per_block):
-                            cur[i] = nxt[i]
-                        for i in cutlass.range_constexpr(self.total_groups):
-                            f_cur[i] = f_nxt[i]
+                            for i in cutlass.range_constexpr(per_block):
+                                cur[i] = nxt[i]
+                            for i in cutlass.range_constexpr(self.total_groups):
+                                f_cur[i] = f_nxt[i]
                     for mt in cutlass.range_constexpr(self.m_tiles):
                         if Int32(mt) < live_tiles:
                             base_f = 4 * mt * self.total_groups
