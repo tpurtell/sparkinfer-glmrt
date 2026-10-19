@@ -64,3 +64,42 @@ def test_against_engine_tp_placement():
                 assert owned == [expected.units[e] for e in range(256)]
                 contiguous = engine.rank_units("contiguous", geometry, layer, world, rank)
                 assert width == 128 * len(contiguous.units[0])
+
+
+@pytest.mark.parametrize("width,tile", [(384, (64, 192, 64, 256)),
+                                       (256, (64, 256, 64, 256))])
+def test_serving_k4_ws_tile_contract(width, tile):
+    function = next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "serving_k4_options")
+    scope = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(SOURCE), "exec"), scope)
+    options = scope["serving_k4_options"](width)
+    assert options["force_tile_config"] == tile
+    assert width % tile[1] == 0
+    assert 6144 % tile[3] == 0
+    assert options == dict(force_tile_config=tile, moe_block_size=64,
+                          warp_specialized=True, input_format="e4m3_k32",
+                          ws_input_stages=3, ws_dynamic_tiles=True, force_blocks_per_sm=1)
+    # Unequal N is a WS feature, not a cooperative launch with unequal CTA threads.
+    text = SOURCE.read_text()
+    assert 'grouped_mixed_state(total, ts, props, width, serving=True)' in text
+    assert 'if owned is None else' in text
+
+
+def test_serving_k4_against_sealed_package():
+    import json
+    root = os.environ.get("CUTEAFD_EXL3_PACKAGE")
+    if not root:
+        pytest.skip("set CUTEAFD_EXL3_PACKAGE to sealed GLM K4/K5 package")
+    function = next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "serving_k4_options")
+    scope = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(SOURCE), "exec"), scope)
+    for rank in (0, 4):
+        meta = json.loads((Path(root) / f"tp6-rank{rank}/m4096/v41_exl3.json").read_text())
+        options = scope["serving_k4_options"](meta["intermediate"])
+        assert list(options.pop("force_tile_config")) == meta["tile"]
+        assert options.pop("moe_block_size") == meta["route_block"]
+        assert options.pop("force_blocks_per_sm") == meta["blocks_per_sm"]
+        assert all(value == meta[key] for key, value in options.items())
+        assert (meta["capacity"], meta["experts"], meta["bits"]) == (4096, 256, [4, 5])

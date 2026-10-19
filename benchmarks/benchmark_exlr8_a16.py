@@ -326,20 +326,32 @@ def rank_geometry(world, rank, layer, experts=256, units=16):
     return owned, 128 * (base + (rank < extra))
 
 
+def serving_k4_options(width):
+    # GLM Spark m4096 package policy; WS supports unequal N tiles.
+    tile = ((64, 192, 64, 256) if width % 256 == 128 and width % 192 == 0
+            else (64, 256, 64, 256) if width % 256 == 0
+            else (64, 128, 64, 128))
+    return dict(force_tile_config=tile, moe_block_size=64, warp_specialized=True,
+                input_format="e4m3_k32", ws_input_stages=3, ws_dynamic_tiles=True,
+                force_blocks_per_sm=1)
+
+
 def prepare_uniform(bits, experts, seed, width):
     if width == 512:
         return exl3._prepared(bits, experts, seed, torch.device("cuda"))
     generator = torch.Generator(device="cuda").manual_seed(seed)
     def scales(shape):
         return (0.875 + 0.25 * torch.rand(shape, generator=generator, device="cuda")).half()
+    tile = serving_k4_options(width)["force_tile_config"]
     return exl3.prepare_trellis256_moe_weights(
         hidden_size=6144, intermediate_size=width, num_experts=experts,
-        activation="silu", fc1_tile_n=128, fc2_tile_n=256,
+        activation="silu", fc1_tile_n=tile[1], fc2_tile_n=tile[3],
         device=torch.device("cuda"), seed=seed, params_dtype=torch.float16,
         w13_layout="trellis_t256_proj", trellis_bits=bits,
         gate_suh=scales((experts, 6144)), up_suh=scales((experts, 6144)),
         intermediate_rotations=scales((experts, 3 * width)),
-        down_svh=scales((experts, 6144)), tile_config=(64, 128, 64, 256))
+        down_svh=scales((experts, 6144)),
+        tile_config=tile)
 
 
 def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8, owned=None):
@@ -611,26 +623,29 @@ def main():
         json.dump(result,stream,indent=2)
 
 
-def grouped_mixed_state(rows, tiers, props):
+def grouped_mixed_state(rows, tiers, props, width=512, serving=False):
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     from b12x.moe._shared.kernels.w4a16.host import max_packed_route_slots
     from b12x.moe.fused_moe._impl import _projection_mixed_tile_config
     tile = _projection_mixed_tile_config(None, hidden_size=6144,
-        intermediate_size=512, token_count=4096, direct_topk_routes=False)
+        intermediate_size=width, token_count=4096, direct_topk_routes=False)
+    options = (serving_k4_options(width) if serving else
+               dict(force_tile_config=tile, moe_block_size=32, warp_specialized=True,
+                    input_format="e4m3_k32", ws_input_stages=3, ws_dynamic_tiles=True))
+    block = options["moe_block_size"]
+    tier1_experts = 256 if serving else 1
     launch = mix.compile_mixed_trellis(
-        size_m=4096, hidden_size=6144, intermediate_size=512,
-        tier0_num_experts=256, tier1_num_experts=1, tier0_bits=4, tier1_bits=5,
+        size_m=4096, hidden_size=6144, intermediate_size=width,
+        tier0_num_experts=256, tier1_num_experts=tier1_experts, tier0_bits=4, tier1_bits=5,
         route_num_experts=256,
-        top_k=8, max_m_blocks=(max_packed_route_slots(4096*8, 32, 256)+31)//32,
+        top_k=8, max_m_blocks=(max_packed_route_slots(4096*8, block, 256)+block-1)//block,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
-        force_tile_config=tile, trellis_codebook=tiers[0].trellis_codebook,
-        moe_block_size=32, warp_specialized=True, input_format="e4m3_k32",
-        ws_input_stages=3, ws_dynamic_tiles=True,
+        trellis_codebook=tiers[0].trellis_codebook, **options,
         rotation_input_dtype="bf16", full_rotation_output_dtype="bf16")
     bufs = mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"), sms=props.multi_processor_count)
-    # The production mixed ABI requires distinct tiers. Every routed expert
-    # is K4; one unreachable K5 slot keeps that ABI without changing its kernels.
-    mapping, desc = mix.build_ordered_maps(256, 1, device=torch.device("cuda"))
+    # Every route is K4. Explicit geometry retains the production K5 tier
+    # capacity even though no request in this synthetic K4 arm reaches it.
+    mapping, desc = mix.build_ordered_maps(256, tier1_experts, device=torch.device("cuda"))
     mapping = mapping[:256]
     rotations = mix.MixedTrellisRotations(
         torch.cat([t.intermediate_rotations for t in tiers]),
@@ -710,10 +725,10 @@ def grouped_main(args):
     frozen = {name: compile_grouped_arm(grouped_arm_bundle(revision,
                   args.grouped_arm_source_dir), grouped)
               for name, revision in args.grouped_arm}
-    # Secondary only: mixed K4/K5 with an unreachable K5 slot is not the
-    # uniform K4 serving route used for the primary speed bar.
+    # Legacy keeps the historical uniform baseline. Explicit geometry uses
+    # the sealed GLM serving package ABI, with every synthetic route in K4.
     exl_layers = [(prepare_uniform(4,256,408+2*c,width),
-                   prepare_uniform(5,1,409+2*c,width) if owned is None else None)
+                   prepare_uniform(5,1 if owned is None else 256,409+2*c,width))
                   for c in range(len(t["tables"]))]
     state = buffers(4096, 6144, units, 8, capacity, group_rows)
     mixed_states = ([grouped_mixed_state(4096, ts, props) for ts in exl_layers]
@@ -727,7 +742,9 @@ def grouped_main(args):
         weights = torch.rand((total,8),generator=gen).cuda()/8
         wire = make_wire(torch.randn((total,6144),generator=gen).cuda()*0.02)
         decoded = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
-        uniform_states = [grouped_uniform_state(total, ts[0], props, width) for ts in exl_layers]
+        uniform_states = ([grouped_uniform_state(total, ts[0], props, width) for ts in exl_layers]
+                          if owned is None else
+                          [grouped_mixed_state(total, ts, props, width, serving=True) for ts in exl_layers])
         chunk_response = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
         chunk_wire = torch.empty((64,6336),dtype=torch.uint8,device="cuda")
         chunk_ids = torch.empty((64,8),dtype=torch.int32,device="cuda")
@@ -759,10 +776,11 @@ def grouped_main(args):
 
         def baseline():
             for uniform in uniform_states:
-                # Uniform full_rotation accepts BF16/FP16, not FP8 wire rows.
-                # Charge the worker's FP8-K32 -> BF16 conversion in this arm.
-                wire_decode(wire, decoded, total)
-                run_grouped_uniform(uniform, decoded, weights, ids)
+                if owned is None:
+                    wire_decode(wire, decoded, total)
+                    run_grouped_uniform(uniform, decoded, weights, ids)
+                else:
+                    run_bound_mixed_trellis(wire, weights, ids, *uniform)
 
         def mixed():
             for binding, bufs in mixed_states:
@@ -811,7 +829,8 @@ def grouped_main(args):
              "fc2":("grouped_fc2_kernel",),"egress":("reduce_kernel",)})
         k4_stages = stage_profile(graphs["exl3"], args.output.parent,
             {"wire_decode": ("_wire_decode",), "fc1_fc2_fused": ("W4A16FusedMoeKernel",),
-             "egress": ("W4A16TopKSumKernel",)})
+             "fc1": ("ws_fc1_kernel",), "activation": ("ws_act_kernel",),
+             "fc2": ("ws_fc2_kernel",), "egress": ("W4A16TopKSumKernel",)})
         rec = dict(rows=total, **{n+"_us":v for n,v in med.items()}, rounds_us=rounds,
                    exl3_stages={k:v/copies if k.endswith("_us") else v for k,v in k4_stages.items()},
                    chunked_speedup=med["chunked"]/med["grouped"],
@@ -819,8 +838,10 @@ def grouped_main(args):
                    unique_read_roofline_percent=100*unique/med["grouped"]/1000/roof["gbps"],
                    stages={k:v/copies if k.endswith("_us") else v for k,v in stages.items()},
                    groups=int(state["count"].item()), bitwise_equal=True,
-                   uniform_route_block=uniform_states[0][-1],
-                   uniform_input_conversion="fp8_k32_to_bf16_included")
+                   uniform_route_block=uniform_states[0][-1] if owned is None else 64,
+                   uniform_input_conversion=("fp8_k32_to_bf16_included" if owned is None
+                                             else "serving_ws_direct_fp8_k32"),
+                   k4_options=None if owned is None else serving_k4_options(width))
         records.append(rec)
         print(json.dumps(rec),flush=True)
         del graphs, uniform_states
@@ -831,7 +852,8 @@ def grouped_main(args):
                 descriptor_units=units, owned_units_per_expert=([4]*256 if owned is None else list(map(len, owned))),
                 unit_ids=owned, exl3_width=width,
                 mode="legacy_compact" if owned is None else "serving_sparse"),
-            primary_baseline="uniform K4 full_rotation; wire decode included",
+            primary_baseline=("uniform K4 full_rotation; wire decode included" if owned is None else
+                              "serving GLM K4/K5 WS package geometry; all routes K4"),
             secondary_baseline="mixed K4/K5; K5 descriptor unreachable",
             frozen_grouped_sources={name: manifest for name, (_, _, manifest) in frozen.items()},
             target_met=all(r["exl3_speedup"]>=1.0 for r in records)),indent=2))
