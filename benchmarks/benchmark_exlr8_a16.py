@@ -354,6 +354,21 @@ def prepare_uniform(bits, experts, seed, width):
         tile_config=tile)
 
 
+
+def prepare_comparison_layers(copies, width, serving):
+    # Only tier 0 is routed. Its cold copies stay distinct; unused K5 aliases.
+    unused_k5 = prepare_uniform(5, 256, 409, width) if serving else None
+    return [(prepare_uniform(4, 256, 408 + 2*c, width),
+             unused_k5 if serving else prepare_uniform(5, 1, 409 + 2*c, width))
+            for c in range(copies)]
+
+
+def comparison_route_ids(rows, generator):
+    # Global IDs 0..255 map to tier 0; K5 occupies unreachable IDs 256..511.
+    return torch.stack([torch.randperm(256, generator=generator)[:8]
+                        for _ in range(rows)])
+
+
 def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8, owned=None):
     """Synthetic K4 payloads, replicated into enough distinct layers that a
     replay over them streams every weight from DRAM (cold L2)."""
@@ -482,7 +497,7 @@ def main():
     for total in map(int,args.rows.split(",")):
         gen = torch.Generator().manual_seed(408+total)
         chunks = [min(64, total-first) for first in range(0, total, 64)]
-        ids = torch.stack([torch.randperm(256,generator=gen)[:8] for _ in range(total)]).cuda().int()
+        ids = comparison_route_ids(total, gen).cuda().int()
         weights = torch.rand((total,8),generator=gen).cuda()/8
         # Master's amplitude: EXL3's FP16 intermediates overflow on random K4
         # payloads at unit-scale activations.
@@ -623,7 +638,7 @@ def main():
         json.dump(result,stream,indent=2)
 
 
-def grouped_mixed_state(rows, tiers, props, width=512, serving=False):
+def grouped_mixed_state(rows, tiers, props, width=512, serving=False, workspace=None):
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     from b12x.moe._shared.kernels.w4a16.host import max_packed_route_slots
     from b12x.moe.fused_moe._impl import _projection_mixed_tile_config
@@ -642,7 +657,9 @@ def grouped_mixed_state(rows, tiers, props, width=512, serving=False):
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
         trellis_codebook=tiers[0].trellis_codebook, **options,
         rotation_input_dtype="bf16", full_rotation_output_dtype="bf16")
-    bufs = mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"), sms=props.multi_processor_count)
+    bufs = (mix.make_mixed_trellis_buffers(launch, device=torch.device("cuda"),
+                                         sms=props.multi_processor_count)
+            if workspace is None else workspace)
     # Every route is K4. Explicit geometry retains the production K5 tier
     # capacity even though no request in this synthetic K4 arm reaches it.
     mapping, desc = mix.build_ordered_maps(256, tier1_experts, device=torch.device("cuda"))
@@ -653,6 +670,20 @@ def grouped_mixed_state(rows, tiers, props, width=512, serving=False):
         torch.cat([t.down_svh for t in tiers]))
     binding = mix.bind_mixed_trellis(*tiers, mapping, desc, rotations, launch)
     return binding, bufs
+
+
+
+def serving_k4_states(rows, layers, props, width):
+    # Serial cold layers share one stream workspace, as in serving. Bindings
+    # retain distinct K4 pointers; captured work finishes before scratch reuse.
+    states = []
+    workspace = None
+    for tiers in layers:
+        state = grouped_mixed_state(rows, tiers, props, width, serving=True,
+                                    workspace=workspace)
+        states.append(state)
+        workspace = state[1]
+    return states
 
 
 def grouped_uniform_state(rows, tier, props, width=512):
@@ -727,9 +758,7 @@ def grouped_main(args):
               for name, revision in args.grouped_arm}
     # Legacy keeps the historical uniform baseline. Explicit geometry uses
     # the sealed GLM serving package ABI, with every synthetic route in K4.
-    exl_layers = [(prepare_uniform(4,256,408+2*c,width),
-                   prepare_uniform(5,1 if owned is None else 256,409+2*c,width))
-                  for c in range(len(t["tables"]))]
+    exl_layers = prepare_comparison_layers(len(t["tables"]), width, owned is not None)
     state = buffers(4096, 6144, units, 8, capacity, group_rows)
     mixed_states = ([grouped_mixed_state(4096, ts, props) for ts in exl_layers]
                     if owned is None else [])
@@ -744,7 +773,7 @@ def grouped_main(args):
         decoded = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
         uniform_states = ([grouped_uniform_state(total, ts[0], props, width) for ts in exl_layers]
                           if owned is None else
-                          [grouped_mixed_state(total, ts, props, width, serving=True) for ts in exl_layers])
+                          serving_k4_states(total, exl_layers, props, width))
         chunk_response = torch.empty((total,6144),dtype=torch.bfloat16,device="cuda")
         chunk_wire = torch.empty((64,6336),dtype=torch.uint8,device="cuda")
         chunk_ids = torch.empty((64,8),dtype=torch.int32,device="cuda")

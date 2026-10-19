@@ -82,7 +82,7 @@ def test_serving_k4_ws_tile_contract(width, tile):
                           ws_input_stages=3, ws_dynamic_tiles=True, force_blocks_per_sm=1)
     # Unequal N is a WS feature, not a cooperative launch with unequal CTA threads.
     text = SOURCE.read_text()
-    assert 'grouped_mixed_state(total, ts, props, width, serving=True)' in text
+    assert 'serving_k4_states(total, exl_layers, props, width)' in text
     assert 'if owned is None else' in text
 
 
@@ -103,3 +103,58 @@ def test_serving_k4_against_sealed_package():
         assert options.pop("force_blocks_per_sm") == meta["blocks_per_sm"]
         assert all(value == meta[key] for key, value in options.items())
         assert (meta["capacity"], meta["experts"], meta["bits"]) == (4096, 256, [4, 5])
+
+
+def test_only_unrouted_k5_aliases_across_cold_copies():
+    calls = []
+    def prepared(bits, experts, seed, width):
+        result = object()
+        calls.append((bits, experts, seed, width, result))
+        return result
+    functions = [n for n in TREE.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ("prepare_comparison_layers", "comparison_route_ids")]
+    scope = {"prepare_uniform": prepared}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), scope)
+    layers = scope["prepare_comparison_layers"](3, 384, True)
+    assert len({id(k4) for k4, _ in layers}) == 3
+    assert len({id(k5) for _, k5 in layers}) == 1
+    assert [(b, e, s) for b, e, s, _, _ in calls] == [
+        (5, 256, 409), (4, 256, 408), (4, 256, 410), (4, 256, 412)]
+    import numpy as np
+    class FakeTorch:
+        @staticmethod
+        def randperm(count, generator):
+            assert count == 256
+            return generator.permutation(count)
+        stack = staticmethod(np.stack)
+    scope["torch"] = FakeTorch
+    routes = scope["comparison_route_ids"](4096, np.random.default_rng(408))
+    assert routes.shape == (4096, 8)
+    assert routes.min() == 0 and routes.max() == 255
+    assert all(len(set(row)) == 8 for row in routes)
+    text = SOURCE.read_text()
+    assert "mapping = mapping[:256]" in text
+    assert "ids = comparison_route_ids(total, gen).cuda().int()" in text
+    calls.clear()
+    legacy = scope["prepare_comparison_layers"](3, 512, False)
+    assert len({id(k5) for _, k5 in legacy}) == 3
+    assert [e for b, e, _, _, _ in calls if b == 5] == [1, 1, 1]
+
+
+def test_serial_k4_cold_layers_reuse_one_workspace():
+    function = next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "serving_k4_states")
+    allocated = []
+    def state(rows, tiers, props, width, serving=False, workspace=None):
+        assert serving
+        if workspace is None:
+            workspace = object()
+            allocated.append(workspace)
+        return tiers, workspace
+    scope = {"grouped_mixed_state": state}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(SOURCE), "exec"), scope)
+    layers = [object(), object(), object()]
+    states = scope["serving_k4_states"](4096, layers, None, 384)
+    assert len(allocated) == 1
+    assert all(result[0] is original for result, original in zip(states, layers))
+    assert all(result[1] is allocated[0] for result in states)
