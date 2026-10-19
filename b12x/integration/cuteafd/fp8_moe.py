@@ -462,7 +462,7 @@ class _Route:
             gemv = GroupedMxfp4Gemv if g.weights == "mxfp4" else GroupedFp8Gemv
             native = {"native_bf16": True} if g.weights == "bf16" else {}
             if self.fused_mxfp4_decode:
-                gu_groups = 1 if (tile_rows == 1 or i <= 512) else 2
+                gu_groups = 1 if tile_rows == 1 else 2
                 self.gate_up = GroupedMxfp4Gemv(
                     n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
                     groups=gu_groups, gather=True, fuse_swiglu=True, swiglu_limit=g.swiglu_limit)

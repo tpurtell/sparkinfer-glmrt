@@ -282,7 +282,7 @@ def _pack_topk_routes_small_prefix_kernel(
     tl.debug_barrier()
 
     route_offsets = tl.arange(0, BLOCK_T)
-    for start in tl.range(0, NUMEL_CAPACITY, BLOCK_T):
+    for start in tl.range(0, live_numel, BLOCK_T):
         offsets = start + route_offsets
         raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
             tl.int32

@@ -1003,6 +1003,22 @@ class W4A16MixedTrellisKernel:
             and self.driver.rotation_input_dtype == "bf16"
         )
 
+    @property
+    def _use_direct_input_rotation(self) -> bool:
+        return bool(
+            self.token_major_rotation
+            or (
+                int(getattr(self.driver, "sms", 188)) <= 48
+                and not getattr(self.driver, "phase_l2_prefetch", False)
+                and not getattr(self.driver, "fused_input_rotation", False)
+                and not getattr(self.driver, "direct_topk_routes", False)
+                and self.paired_boundary is None
+                and not getattr(self.driver, "broadcast_suh", False)
+                and not getattr(self.driver, "coupled_hadamard", False)
+                and getattr(self.driver, "rotation_input_dtype", None) == "bf16"
+            )
+        )
+
     @cute.jit
     def _run_input_rotation_token_major(
         self,
@@ -1020,7 +1036,7 @@ class W4A16MixedTrellisKernel:
         grid_x: Int32,
         active_m: Int32,
     ):
-        # One warp owns eight H128 blocks of one token: each BF16 block is read
+        # One warp owns H128 blocks of one token: each BF16 block is read
         # once and rotated for every route of the token. Lane t owns
         # elements 4t..4t+3 of a block; rounding matches the per-route path
         # (x and x*suh to fp16, fp32 butterfly, fp16 store).
@@ -1028,13 +1044,16 @@ class W4A16MixedTrellisKernel:
         warps_per_cta = Int32(self.cta_threads // 32)
         hidden = Int32(self.hidden_size)
         nblk = Int32(self.hidden_size // 128)
-        groups = (nblk + Int32(_ROTATION_BLOCKS_PER_UNIT - 1)) // Int32(_ROTATION_BLOCKS_PER_UNIT)
+        blocks_per_unit = Int32(_ROTATION_BLOCKS_PER_UNIT)
+        if active_m < Int32(_TOKEN_MAJOR_ROTATION_MIN_ROWS):
+            blocks_per_unit = Int32(1)
+        groups = (nblk + blocks_per_unit - Int32(1)) // blocks_per_unit
         unit = cta * warps_per_cta + (tid >> Int32(5))
         unit_stride = grid_x * warps_per_cta
         while unit < active_m * groups:
             token = unit // groups
-            first_blk = (unit - token * groups) * Int32(_ROTATION_BLOCKS_PER_UNIT)
-            last_blk = first_blk + Int32(_ROTATION_BLOCKS_PER_UNIT)
+            first_blk = (unit - token * groups) * blocks_per_unit
+            last_blk = first_blk + blocks_per_unit
             if last_blk > nblk:
                 last_blk = nblk
             experts = []
@@ -1081,6 +1100,78 @@ class W4A16MixedTrellisKernel:
                                 pack_f32x2_to_f16x2(h2, h3),
                             )
                 blk += Int32(1)
+            unit += unit_stride
+
+    @cute.jit
+    def _run_input_rotation_live_routes(
+        self,
+        x_input: cute.Tensor,
+        a_gate: cute.Tensor,
+        a_up: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        raw_topk_ids: cute.Tensor,
+        global_to_combined: cute.Tensor,
+        route_num_experts: Int32,
+        total_experts: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: Int32,
+    ):
+        lane = tid & Int32(31)
+        warps_per_cta = Int32(self.cta_threads // 32)
+        hidden = Int32(self.hidden_size)
+        nblk = Int32(self.hidden_size // 128)
+        live_routes = active_m * Int32(self.top_k)
+        total_units = live_routes * nblk
+        elem = lane * Int32(4)
+        unit = cta * warps_per_cta + (tid >> Int32(5))
+        unit_stride = grid_x * warps_per_cta
+        while unit < total_units:
+            route = unit // nblk
+            blk = unit - route * nblk
+            global_expert = raw_topk_ids[route].to(Int32)
+            expert = Int32(-1)
+            if global_expert >= Int32(0) and global_expert < route_num_experts:
+                expert = global_to_combined[global_expert].to(Int32)
+            if expert >= Int32(0) and expert < total_experts:
+                token = route // Int32(self.top_k)
+                col = blk * Int32(128) + elem
+                xw0, xw1 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(x_input, token * hidden + col)
+                )
+                x0, x1 = bfloat2_to_float2_scaled(xw0, cutlass.Float32(1.0))
+                x2, x3 = bfloat2_to_float2_scaled(xw1, cutlass.Float32(1.0))
+                x0, x1 = half2_to_float2_scaled(
+                    pack_f32x2_to_f16x2(x0, x1), cutlass.Float32(1.0)
+                )
+                x2, x3 = half2_to_float2_scaled(
+                    pack_f32x2_to_f16x2(x2, x3), cutlass.Float32(1.0)
+                )
+                s_off = expert * hidden + col
+                out_off = route * hidden + col
+                for proj in cutlass.range_constexpr(2):
+                    suh = gate_suh
+                    out = a_gate
+                    if cutlass.const_expr(proj == 1):
+                        suh = up_suh
+                        out = a_up
+                    sw0, sw1 = ld_global_nc_v2_u32(get_ptr_as_int64(suh, s_off))
+                    s0, s1 = half2_to_float2_scaled(sw0, cutlass.Float32(1.0))
+                    s2, s3 = half2_to_float2_scaled(sw1, cutlass.Float32(1.0))
+                    v0, v1 = half2_to_float2_scaled(
+                        pack_f32x2_to_f16x2(x0 * s0, x1 * s1), cutlass.Float32(1.0)
+                    )
+                    v2, v3 = half2_to_float2_scaled(
+                        pack_f32x2_to_f16x2(x2 * s2, x3 * s3), cutlass.Float32(1.0)
+                    )
+                    h0, h1, h2, h3 = self.driver._had128_quad(v0, v1, v2, v3, lane)
+                    st_global_v2_u32(
+                        get_ptr_as_int64(out, out_off),
+                        pack_f32x2_to_f16x2(h0, h1),
+                        pack_f32x2_to_f16x2(h2, h3),
+                    )
             unit += unit_stride
 
     @cute.kernel
@@ -1286,8 +1377,8 @@ class W4A16MixedTrellisKernel:
                 tier1_up_experts,
             )
         total_experts = tier0_num_experts + tier1_num_experts
-        if cutlass.const_expr(self.token_major_rotation):
-            if active_m >= Int32(_TOKEN_MAJOR_ROTATION_MIN_ROWS):
+        if cutlass.const_expr(self._use_direct_input_rotation):
+            if active_m >= Int32(8):
                 self._run_input_rotation_token_major(
                     rotation_input,
                     rotation_gate,
@@ -1304,18 +1395,15 @@ class W4A16MixedTrellisKernel:
                     active_m,
                 )
             else:
-                # Few rows: spread (route, block) units over the whole grid.
-                self.driver._run_input_rotation(
+                self._run_input_rotation_live_routes(
                     rotation_input,
                     rotation_gate,
                     rotation_up,
                     gate_suh,
                     up_suh,
-                    packed_route_indices,
-                    block_expert_ids,
-                    packed_route_count,
-                    descriptor_map,
-                    total_experts,
+                    raw_topk_ids,
+                    global_to_combined,
+                    route_num_experts,
                     total_experts,
                     tid,
                     cta,
@@ -1323,6 +1411,11 @@ class W4A16MixedTrellisKernel:
                     active_m,
                 )
             self.driver._grid_barrier(workspace, tid, grid_x)
+            self.driver._direct_routes = (
+                raw_topk_ids,
+                global_to_combined,
+                route_num_experts,
+            )
         self.driver._moe_body(
             rotation_gate,
             rotation_up,
@@ -1360,10 +1453,11 @@ class W4A16MixedTrellisKernel:
             active_m,
             fc1_emit,
             fc2_emit,
-            input_rotated=self.token_major_rotation,
+            input_rotated=self._use_direct_input_rotation,
             fc1_prefetch_tile=fc1_prefetch,
             fc2_prefetch_tile=fc2_prefetch,
         )
+        self.driver._direct_routes = None
 
 
 class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):

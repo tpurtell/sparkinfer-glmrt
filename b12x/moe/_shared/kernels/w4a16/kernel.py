@@ -48,6 +48,7 @@ from b12x._lib.intrinsics import (
     half2_mul,
     ld_global_acquire_i32,
     ld_global_nc_u32,
+    ld_global_v2_u32,
     ld_global_v4_f32,
     ld_shared_f32,
     ld_shared_i32_relaxed,
@@ -80,6 +81,7 @@ from b12x._lib.intrinsics import (
     red_add_global_release_i32,
     red_max_global_f32_nonnegative,
     shared_ptr_to_u32,
+    st_global_v2_u32,
     st_global_v4_u32,
     st_global_i32,
     st_global_f32,
@@ -548,16 +550,16 @@ def _determine_blocks_per_sm(
         int(max_shared_mem) // (smem_bytes + 1536),
     )
     if uses_m_block_8:
-        # Small-M (moe_block_size==8) TC-decode is weight-bandwidth/overhead
-        # bound, not parallelism bound (only m*top_k route-blocks of GEMM work).
-        # The fused FC1->activation->FC2 path crosses several grid barriers whose
-        # tid==0 atomic-counter increment serializes across all grid_x CTAs, so an
-        # oversized grid pays barrier-atomic latency proportional to grid_x for no
-        # extra GEMM throughput. Pin one persistent CTA per SM to minimize the
-        # barrier participant count while still covering the machine for the
-        # I_tp=1024 GEMMs. The split-K persistent loop is grid_x-agnostic, so this
-        # is numerically identical.
-        blocks_per_sm_limit = 1
+        if (
+            int(cta_threads) == 128
+            and int(tile_k) == 64
+            and int(sms) <= 48
+            and weight_layout == "trellis_t256"
+            and int(problem_m) * int(top_k) > 8
+        ):
+            blocks_per_sm_limit = max(min(blocks_per_sm_limit, 2), 1)
+        else:
+            blocks_per_sm_limit = 1
     elif cta_m_blocks == 1:
         blocks_per_sm_limit = max(min(blocks_per_sm_limit, 4), 1)
     else:
@@ -1448,6 +1450,20 @@ class W4A16GemmKernel:
         if not evict_first and not prefetch:
             return ()
         return (("l2_schedule", evict_first, prefetch),)
+
+    @property
+    def _use_l2_evict_first_b(self) -> bool:
+        return bool(
+            self.l2_evict_first_b
+            or (
+                self.sms <= 48
+                and self.weight_layout_trellis256
+                and not self.weight_layout_trellis256_pair
+                and self.schedule_whole_tiles
+                and not self.direct_topk_routes
+                and not self.dense_route_fast_path
+            )
+        )
 
     def _require_wired_l2_prefetch(self) -> None:
         """The next-tile L2 prefetch (l2_prefetch_k_tiles) runs only where an
@@ -5250,7 +5266,7 @@ class W4A16GemmKernel:
                 )
                 t256_chunks_per_kt = self.cta_n_blocks * (2 * self.trellis_bits)
                 t256_total_chunks = self.cta_k_blocks * t256_chunks_per_kt
-                if cutlass.const_expr(self.l2_evict_first_b):
+                if cutlass.const_expr(self._use_l2_evict_first_b):
                     b_l2_policy = create_l2_evict_first_policy()
                 for i in cutlass.range_constexpr(self.b_sh_wr_iters_var):
                     t256_chunk = Int32(i * self.cta_threads) + tid
@@ -5303,7 +5319,7 @@ class W4A16GemmKernel:
                             * Int64(self.cta_n_blocks * t256_tile_u32)
                             + Int64(t256_in_kt) * Int64(4)
                         )
-                    if cutlass.const_expr(self.l2_evict_first_b):
+                    if cutlass.const_expr(self._use_l2_evict_first_b):
                         cp_async4_shared_global_pred_l2hint(
                             b_dst,
                             get_ptr_as_int64(b_i32_flat, b_src_i64),
@@ -7823,45 +7839,41 @@ class W4A16FusedMoeKernel:
                     s_base = expert * Int32(self.hidden_size) + col0
                 out_base = route * Int32(self.hidden_size) + col0
 
-                x0 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(0)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x1 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(1)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x2 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(2)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                x3 = cutlass.Float16(
-                    x_input_flat[x_base + Int32(3)].to(cutlass.Float32)
-                ).to(cutlass.Float32)
-                sg0 = suh_gate_flat[s_base + Int32(0)].to(cutlass.Float32)
-                sg1 = suh_gate_flat[s_base + Int32(1)].to(cutlass.Float32)
-                sg2 = suh_gate_flat[s_base + Int32(2)].to(cutlass.Float32)
-                sg3 = suh_gate_flat[s_base + Int32(3)].to(cutlass.Float32)
-                su0 = suh_up_flat[s_base + Int32(0)].to(cutlass.Float32)
-                su1 = suh_up_flat[s_base + Int32(1)].to(cutlass.Float32)
-                su2 = suh_up_flat[s_base + Int32(2)].to(cutlass.Float32)
-                su3 = suh_up_flat[s_base + Int32(3)].to(cutlass.Float32)
+                xw0, xw1 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(x_input_flat, x_base)
+                )
+                if cutlass.const_expr(self.rotation_input_dtype == "bf16"):
+                    xw0 = cvt_bf16x2_to_f16x2(xw0)
+                    xw1 = cvt_bf16x2_to_f16x2(xw1)
+                x0, x1 = f16x2_to_f32x2(xw0)
+                x2, x3 = f16x2_to_f32x2(xw1)
+                sgw0, sgw1 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(suh_gate_flat, s_base)
+                )
+                sg0, sg1 = f16x2_to_f32x2(sgw0)
+                sg2, sg3 = f16x2_to_f32x2(sgw1)
+                suw0, suw1 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(suh_up_flat, s_base)
+                )
+                su0, su1 = f16x2_to_f32x2(suw0)
+                su2, su3 = f16x2_to_f32x2(suw1)
 
-                g0 = cutlass.Float16(x0 * sg0).to(cutlass.Float32)
-                g1 = cutlass.Float16(x1 * sg1).to(cutlass.Float32)
-                g2 = cutlass.Float16(x2 * sg2).to(cutlass.Float32)
-                g3 = cutlass.Float16(x3 * sg3).to(cutlass.Float32)
-                u0 = cutlass.Float16(x0 * su0).to(cutlass.Float32)
-                u1 = cutlass.Float16(x1 * su1).to(cutlass.Float32)
-                u2 = cutlass.Float16(x2 * su2).to(cutlass.Float32)
-                u3 = cutlass.Float16(x3 * su3).to(cutlass.Float32)
+                g0, g1 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x0 * sg0, x1 * sg1))
+                g2, g3 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x2 * sg2, x3 * sg3))
+                u0, u1 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x0 * su0, x1 * su1))
+                u2, u3 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x2 * su2, x3 * su3))
                 gh0, gh1, gh2, gh3 = self._had128_quad(g0, g1, g2, g3, lane)
                 uh0, uh1, uh2, uh3 = self._had128_quad(u0, u1, u2, u3, lane)
-                a_gate_flat[out_base + Int32(0)] = cutlass.Float16(gh0)
-                a_gate_flat[out_base + Int32(1)] = cutlass.Float16(gh1)
-                a_gate_flat[out_base + Int32(2)] = cutlass.Float16(gh2)
-                a_gate_flat[out_base + Int32(3)] = cutlass.Float16(gh3)
-                a_up_flat[out_base + Int32(0)] = cutlass.Float16(uh0)
-                a_up_flat[out_base + Int32(1)] = cutlass.Float16(uh1)
-                a_up_flat[out_base + Int32(2)] = cutlass.Float16(uh2)
-                a_up_flat[out_base + Int32(3)] = cutlass.Float16(uh3)
+                st_global_v2_u32(
+                    get_ptr_as_int64(a_gate_flat, out_base),
+                    pack_f32x2_to_f16x2(gh0, gh1),
+                    pack_f32x2_to_f16x2(gh2, gh3),
+                )
+                st_global_v2_u32(
+                    get_ptr_as_int64(a_up_flat, out_base),
+                    pack_f32x2_to_f16x2(uh0, uh1),
+                    pack_f32x2_to_f16x2(uh2, uh3),
+                )
             unit += gw_stride
 
     @cute.jit
@@ -8235,9 +8247,11 @@ class W4A16FusedMoeKernel:
         warps_per_cta = Int32(self.cta_threads // 32)
         nblk = Int32(self.intermediate_size // 128)
         live_routes = active_m * Int32(self.top_k)
-        route_count = packed_route_count[Int32(0)].to(Int32)
-        if cutlass.const_expr(self.direct_topk_routes):
+        direct_routes = getattr(self, "_direct_routes", None)
+        if cutlass.const_expr(self.direct_topk_routes or direct_routes is not None):
             route_count = live_routes
+        else:
+            route_count = packed_route_count[Int32(0)].to(Int32)
         fc1_cols = Int32(self.fc1_cols)
         isz = Int32(self.intermediate_size)
         rot_row = Int32(3 * self.intermediate_size)
@@ -8249,9 +8263,19 @@ class W4A16FusedMoeKernel:
         while unit < total_units:
             route_pos = unit // nblk
             blk = unit - route_pos * nblk
-            row = packed_route_indices[route_pos].to(Int32)
-            expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(Int32)
-            if cutlass.const_expr(self.direct_topk_routes):
+            if cutlass.const_expr(direct_routes is not None):
+                raw_topk_ids_flat, global_to_combined_flat, direct_route_num_experts = (
+                    direct_routes
+                )
+                row = route_pos
+                global_expert = raw_topk_ids_flat[route_pos].to(Int32)
+                expert = Int32(-1)
+                if (
+                    global_expert >= Int32(0)
+                    and global_expert < direct_route_num_experts
+                ):
+                    expert = global_to_combined_flat[global_expert].to(Int32)
+            elif cutlass.const_expr(self.direct_topk_routes):
                 row = route_pos
                 expert = packed_route_indices[route_pos].to(Int32)
                 if cutlass.const_expr(self.use_expert_map):
@@ -8259,6 +8283,11 @@ class W4A16FusedMoeKernel:
                     expert = Int32(-1)
                     if global_expert >= Int32(0) and global_expert < route_num_experts:
                         expert = expert_map_flat[global_expert].to(Int32)
+            else:
+                row = packed_route_indices[route_pos].to(Int32)
+                expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(
+                    Int32
+                )
             if (
                 row >= Int32(0)
                 and row < live_routes
@@ -8269,24 +8298,48 @@ class W4A16FusedMoeKernel:
                 g_base = row * fc1_cols + col0
                 u_base = g_base + isz
                 s_base = expert * rot_row + col0
-                g0 = fc1_bf16_flat[g_base + Int32(0)].to(cutlass.Float32)
-                g1 = fc1_bf16_flat[g_base + Int32(1)].to(cutlass.Float32)
-                g2 = fc1_bf16_flat[g_base + Int32(2)].to(cutlass.Float32)
-                g3 = fc1_bf16_flat[g_base + Int32(3)].to(cutlass.Float32)
-                u0 = fc1_bf16_flat[u_base + Int32(0)].to(cutlass.Float32)
-                u1 = fc1_bf16_flat[u_base + Int32(1)].to(cutlass.Float32)
-                u2 = fc1_bf16_flat[u_base + Int32(2)].to(cutlass.Float32)
-                u3 = fc1_bf16_flat[u_base + Int32(3)].to(cutlass.Float32)
+                if cutlass.const_expr(self.is_fp16):
+                    gw0, gw1 = ld_global_v2_u32(
+                        get_ptr_as_int64(fc1_bf16_flat, g_base)
+                    )
+                    g0, g1 = f16x2_to_f32x2(gw0)
+                    g2, g3 = f16x2_to_f32x2(gw1)
+                    uw0, uw1 = ld_global_v2_u32(
+                        get_ptr_as_int64(fc1_bf16_flat, u_base)
+                    )
+                    u0, u1 = f16x2_to_f32x2(uw0)
+                    u2, u3 = f16x2_to_f32x2(uw1)
+                else:
+                    g0 = fc1_bf16_flat[g_base + Int32(0)].to(cutlass.Float32)
+                    g1 = fc1_bf16_flat[g_base + Int32(1)].to(cutlass.Float32)
+                    g2 = fc1_bf16_flat[g_base + Int32(2)].to(cutlass.Float32)
+                    g3 = fc1_bf16_flat[g_base + Int32(3)].to(cutlass.Float32)
+                    u0 = fc1_bf16_flat[u_base + Int32(0)].to(cutlass.Float32)
+                    u1 = fc1_bf16_flat[u_base + Int32(1)].to(cutlass.Float32)
+                    u2 = fc1_bf16_flat[u_base + Int32(2)].to(cutlass.Float32)
+                    u3 = fc1_bf16_flat[u_base + Int32(3)].to(cutlass.Float32)
                 gh0, gh1, gh2, gh3 = self._had128_quad(g0, g1, g2, g3, lane)
                 uh0, uh1, uh2, uh3 = self._had128_quad(u0, u1, u2, u3, lane)
-                svg0 = rot_scales_flat[s_base + Int32(0)].to(cutlass.Float32)
-                svg1 = rot_scales_flat[s_base + Int32(1)].to(cutlass.Float32)
-                svg2 = rot_scales_flat[s_base + Int32(2)].to(cutlass.Float32)
-                svg3 = rot_scales_flat[s_base + Int32(3)].to(cutlass.Float32)
-                svu0 = rot_scales_flat[s_base + isz + Int32(0)].to(cutlass.Float32)
-                svu1 = rot_scales_flat[s_base + isz + Int32(1)].to(cutlass.Float32)
-                svu2 = rot_scales_flat[s_base + isz + Int32(2)].to(cutlass.Float32)
-                svu3 = rot_scales_flat[s_base + isz + Int32(3)].to(cutlass.Float32)
+                if cutlass.const_expr(self.is_fp16):
+                    svgw0, svgw1 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(rot_scales_flat, s_base)
+                    )
+                    svg0, svg1 = f16x2_to_f32x2(svgw0)
+                    svg2, svg3 = f16x2_to_f32x2(svgw1)
+                    svuw0, svuw1 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(rot_scales_flat, s_base + isz)
+                    )
+                    svu0, svu1 = f16x2_to_f32x2(svuw0)
+                    svu2, svu3 = f16x2_to_f32x2(svuw1)
+                else:
+                    svg0 = rot_scales_flat[s_base + Int32(0)].to(cutlass.Float32)
+                    svg1 = rot_scales_flat[s_base + Int32(1)].to(cutlass.Float32)
+                    svg2 = rot_scales_flat[s_base + Int32(2)].to(cutlass.Float32)
+                    svg3 = rot_scales_flat[s_base + Int32(3)].to(cutlass.Float32)
+                    svu0 = rot_scales_flat[s_base + isz + Int32(0)].to(cutlass.Float32)
+                    svu1 = rot_scales_flat[s_base + isz + Int32(1)].to(cutlass.Float32)
+                    svu2 = rot_scales_flat[s_base + isz + Int32(2)].to(cutlass.Float32)
+                    svu3 = rot_scales_flat[s_base + isz + Int32(3)].to(cutlass.Float32)
                 ig0 = gh0 * svg0
                 ig1 = gh1 * svg1
                 ig2 = gh2 * svg2
@@ -8300,10 +8353,17 @@ class W4A16FusedMoeKernel:
                 ig2, iu2 = self._clamp_swiglu_inputs(ig2, iu2)
                 ig3, iu3 = self._clamp_swiglu_inputs(ig3, iu3)
                 down = isz + isz
-                sd0 = rot_scales_flat[s_base + down + Int32(0)].to(cutlass.Float32)
-                sd1 = rot_scales_flat[s_base + down + Int32(1)].to(cutlass.Float32)
-                sd2 = rot_scales_flat[s_base + down + Int32(2)].to(cutlass.Float32)
-                sd3 = rot_scales_flat[s_base + down + Int32(3)].to(cutlass.Float32)
+                if cutlass.const_expr(self.is_fp16):
+                    sdw0, sdw1 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(rot_scales_flat, s_base + down)
+                    )
+                    sd0, sd1 = f16x2_to_f32x2(sdw0)
+                    sd2, sd3 = f16x2_to_f32x2(sdw1)
+                else:
+                    sd0 = rot_scales_flat[s_base + down + Int32(0)].to(cutlass.Float32)
+                    sd1 = rot_scales_flat[s_base + down + Int32(1)].to(cutlass.Float32)
+                    sd2 = rot_scales_flat[s_base + down + Int32(2)].to(cutlass.Float32)
+                    sd3 = rot_scales_flat[s_base + down + Int32(3)].to(cutlass.Float32)
                 if cutlass.const_expr(self.activation_is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
                     linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
@@ -8372,10 +8432,17 @@ class W4A16FusedMoeKernel:
                                       amax * cutlass.Float32(1.0 / 127.0))
                 else:
                     out_base = row * isz + col0
-                    activated_bf16_flat[out_base + Int32(0)] = self._cast_elem(o0)
-                    activated_bf16_flat[out_base + Int32(1)] = self._cast_elem(o1)
-                    activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
-                    activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
+                    if cutlass.const_expr(self.is_fp16):
+                        st_global_v2_u32(
+                            get_ptr_as_int64(activated_bf16_flat, out_base),
+                            pack_f32x2_to_f16x2(o0, o1),
+                            pack_f32x2_to_f16x2(o2, o3),
+                        )
+                    else:
+                        activated_bf16_flat[out_base + Int32(0)] = self._cast_elem(o0)
+                        activated_bf16_flat[out_base + Int32(1)] = self._cast_elem(o1)
+                        activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
+                        activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
             unit += gw_stride
 
     @cute.jit
@@ -9321,10 +9388,11 @@ class W4A16TopKSumKernel:
                             sbase = col0
                         else:
                             sbase = expert * Int32(self.hidden_size) + col0
-                        s0 = svh_flat[sbase + Int32(0)].to(cutlass.Float32)
-                        s1 = svh_flat[sbase + Int32(1)].to(cutlass.Float32)
-                        s2 = svh_flat[sbase + Int32(2)].to(cutlass.Float32)
-                        s3 = svh_flat[sbase + Int32(3)].to(cutlass.Float32)
+                        s01, s23 = ld_global_nc_v2_u32(
+                            get_ptr_as_int64(svh_flat, Int64(sbase))
+                        )
+                        s0, s1 = f16x2_to_f32x2(s01)
+                        s2, s3 = f16x2_to_f32x2(s23)
                         hs0 = h0 * s0
                         hs1 = h1 * s1
                         hs2 = h2 * s2
