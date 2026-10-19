@@ -55,21 +55,23 @@ def test_accuracy_and_row_invariance(encoding,side):
             assert torch.isnan(c.output[rows:]).all()
 
 
-def test_scaled_graph_and_invalid_launch():
-    c = Case("mxfp8",1,k=128,n=32,rows=64)
-    c.launch(17)
-    expected = c.output[:17].clone()
+@pytest.mark.parametrize("encoding,side,live", [("mxfp8",1,17), ("mxfp8",2,65), ("int4_g32",2,129)])
+def test_scaled_graph_and_invalid_launch(encoding,side,live):
+    capacity = max(64, live)
+    c = Case(encoding,side,k=256,n=32,rows=capacity)
+    c.launch(live)
+    expected = c.output[:live].clone()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        c.launch(17)
+        c.launch(live)
     for _ in range(3):
         c.output.fill_(float("nan"))
         c.partial.fill_(float("nan"))
         graph.replay()
-        assert torch.equal(c.output[:17].view(torch.int32),expected.view(torch.int32))
-        assert torch.isnan(c.output[17:]).all()
-    for rows,limit in ((0,1),(65,1),(1,0)):
+        assert torch.equal(c.output[:live].view(torch.int32),expected.view(torch.int32))
+        assert torch.isnan(c.output[live:]).all()
+    for rows,limit in ((0,1),(capacity+1,1),(1,0)):
         c.output.fill_(float("nan"))
         c.launch(rows,limit)
         assert torch.isnan(c.output).all()

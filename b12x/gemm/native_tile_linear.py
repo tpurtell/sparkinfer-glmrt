@@ -359,31 +359,25 @@ class NativeTileLinear:
                         bw = cute.make_rmem_tensor((8 * G,), Uint32)
                         for gi in cutlass.range_constexpr(G):
                             for t in cutlass.range_constexpr(4):
-                                if cutlass.const_expr(self.int4):
-                                    b0, b1 = _int4x4_bf16(cur[(c * G + gi) * 2 + t // 2] >> Uint32(16 * (t % 2)))
+                                if cutlass.const_expr(self.grouped):
+                                    # Transpose packed K8 runs before widening: one
+                                    # byte (int4) or halfword (FP8) per BF16 pair.
+                                    for half in cutlass.range_constexpr(2):
+                                        src = g * Int32(4) + Int32(2 * (t % 2) + half)
+                                        if cutlass.const_expr(self.int4):
+                                            word = cute.arch.shuffle_sync(cur[(c * G + gi) * 2 + t // 2], src)
+                                            b0, _ = _int4x4_bf16(word >> (j * Int32(8)).to(Uint32))
+                                        else:
+                                            lo = cute.arch.shuffle_sync(cur[(c * G + gi) * 4 + 2 * (t // 2)], src)
+                                            hi = cute.arch.shuffle_sync(cur[(c * G + gi) * 4 + 2 * (t // 2) + 1], src)
+                                            word = lo
+                                            if j >= Int32(2):
+                                                word = hi
+                                            b0, _ = _e4m3x4_bf16(word >> ((j & Int32(1)) * Int32(16)).to(Uint32))
+                                        bw[8 * gi + 2 * t + half] = b0
                                 else:
                                     b0, b1 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + t])
-                                bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1] = b0, b1
-                        if cutlass.const_expr(self.grouped):
-                            # Packed contiguous K8 runs become standard K16 MMA
-                            # fragments. Shuffle first, then select this lane's pair.
-                            standard = cute.make_rmem_tensor((8 * G,), Uint32)
-                            for gi in cutlass.range_constexpr(G):
-                                for h in cutlass.range_constexpr(2):
-                                    for tp in cutlass.range_constexpr(2):
-                                        for half in cutlass.range_constexpr(2):
-                                            values = cute.make_rmem_tensor((4,), Uint32)
-                                            for i in cutlass.range_constexpr(4):
-                                                values[i] = cute.arch.shuffle_sync(
-                                                    bw[8 * gi + 4 * h + i],
-                                                    g * Int32(4) + Int32(2 * tp + half))
-                                            value = values[0]
-                                            for i in cutlass.range_constexpr(1, 4):
-                                                if j == Int32(i):
-                                                    value = values[i]
-                                            standard[8 * gi + 4 * h + 2 * tp + half] = value
-                            for i in cutlass.range_constexpr(8 * G):
-                                bw[i] = standard[i]
+                                    bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1] = b0, b1
                         sc = cute.make_rmem_tensor((4 * G,), Float32)
                         if cutlass.const_expr(self.grouped):
                             for gi in cutlass.range_constexpr(G):
