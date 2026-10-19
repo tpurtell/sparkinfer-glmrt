@@ -28,6 +28,13 @@ def _add_rn(a: Float32, b: Float32, *, loc=None, ip=None):
         is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 
+@dsl_user_op
+def _mul_rn(a: Float32, b: Float32, *, loc=None, ip=None):
+    return Float32(llvm.inline_asm(T.f32(), [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+        "mul.rn.f32 $0, $1, $2;", "=f,f,f", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
 @cute.jit
 def _accumulate(hi: Float32, lo: Float32, value: Float32):
     total = _add_rn(hi, value)
@@ -76,7 +83,8 @@ def _normalize_bf16(values: cute.Tensor, weight: cute.Pointer, out: cute.Pointer
     for j in cutlass.range_constexpr(hidden // threads):
         square, correction = _accumulate(square, correction, values[j] * values[j])
     total = _accurate_sum(square, correction, sums, slot, threads // 32)
-    inv = cute.math.rsqrt(div_rn_f32(total, Float32(hidden)) + eps, fastmath=False)
+    # Torch MeanOps rounds reciprocal multiplication before adding epsilon.
+    inv = cute.math.rsqrt(_mul_rn(total, Float32(1.0 / hidden)) + eps, fastmath=False)
     for j in cutlass.range_constexpr(hidden // threads):
         d = tid + Int64(j * threads)
         out[base + d] = (_bf16(values[j] * inv) * Float32(weight[d])).to(BFloat16)
@@ -197,7 +205,7 @@ class KimiAttnResRmsNorm:
                 for j in cutlass.range_constexpr(self.elements):
                     square, correction = _accumulate(square, correction, current[j] * current[j])
                 total = _accurate_sum(square, correction, sums, Int32(2 * c), self.warps)
-                inv = cute.math.rsqrt(div_rn_f32(total, Float32(self.hidden)) + eps, fastmath=False)
+                inv = cute.math.rsqrt(_mul_rn(total, Float32(1.0 / self.hidden)) + eps, fastmath=False)
                 dot, correction = Float32(0), Float32(0)
                 for j in cutlass.range_constexpr(self.elements):
                     dot, correction = _accumulate(dot, correction, (current[j] * inv) * weight[j])
