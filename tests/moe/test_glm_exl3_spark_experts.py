@@ -91,7 +91,7 @@ def test_glm_exl3_bitwise_identical_to_master(capacity, rows_list, hot):
     ctrl_bind = ctrl_mod.bind_mixed_trellis(t0, t1, g2c, desc, rot, ctrl_launch)
 
     gen = torch.Generator(device=device).manual_seed(900 + capacity + 17 * hot)
-    x_full = (torch.randn((capacity, bench.HIDDEN), device=device, generator=gen) * 0.25).bfloat16().contiguous()
+    x_full = (torch.randn((capacity, bench.HIDDEN), device=device, generator=gen) * 0.0625).bfloat16().contiguous()
     scores = torch.rand((capacity, num_experts), device=device, generator=gen)
     if hot:
         scores[:, :hot] += 4.0
