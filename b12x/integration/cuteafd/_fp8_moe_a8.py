@@ -21,7 +21,6 @@ from cutlass.cute.runtime import from_dlpack
 from b12x._lib.intrinsics import (
     cvt_f32x4_to_e4m3x4,
     div_rn_f32,
-    ld_global_u32,
     ld_global_v4_u32,
     ld_shared_f32,
     ldmatrix_m8n8x4_b16,
