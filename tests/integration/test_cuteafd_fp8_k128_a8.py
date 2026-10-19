@@ -181,3 +181,29 @@ def test_native_a8(rows):
     else:
         assert torch.equal(actual, expected), "SM120 official arithmetic must be bitwise"
         assert torch.all(error <= official * 1.01)
+
+
+@pytest.mark.parametrize("k", [1, 127, 128, 129, 255, 384])
+def test_quantizer_live_tail(k):
+    require_b12x()
+    import cutlass
+    from cutlass import cute
+    from cutlass.cute.runtime import from_dlpack
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd._fp8_moe_a8 import QuantizeK128
+    torch.manual_seed(100 + k)
+    x = torch.randn(7, k, device="cuda").bfloat16()
+    x[0].zero_()
+    x[1] *= 1e-12
+    x[2] *= 1e3
+    x[3].fill_(-0.)
+    q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((7, (k+127)//128), device="cuda", dtype=torch.float32)
+    dummy = torch.zeros(7, device="cuda", dtype=torch.int32)
+    xp, qp, sp, dp = [from_dlpack(t).iterator for t in (x, q, scales, dummy)]
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    kernel = cute.compile(QuantizeK128(k), xp, qp, sp, cutlass.Int32(7), dp, stream)
+    kernel(xp, qp, sp, 7, dp, stream)
+    expected, expected_scales = official_module().act_quant(x)
+    assert torch.equal(q.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(scales.view(torch.int32), expected_scales.view(torch.int32))
