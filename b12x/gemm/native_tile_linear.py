@@ -430,20 +430,31 @@ class NativeTileLinear:
                                         sc[(gi * 2 + h) * 2 + e] = self._scale(raw, h)
                         for mt in cutlass.range_constexpr(4):
                             if Int32(mt) < live:
-                                xa = cute.make_rmem_tensor((16,), Uint32)
                                 if cutlass.const_expr(self.grouped and mt == 0):
                                     # Staged tile: one ldmatrix.x4 per m16n8k16 step gives
-                                    # its four A operands (rows g/g+8 at k and k+8).
+                                    # its four A operands (rows g/g+8 at k and k+8) straight
+                                    # to the tensor core, no xa round trip.
                                     ar = lane & Int32(15)
-                                    for t in cutlass.range_constexpr(4):
-                                        unit = Int32(2 * t + 8 * c) + (lane >> Int32(4))
-                                        a = ldmatrix_m8n8x4_b16(
-                                            abuf + (b & Int32(1)) * Int32(self.a_tile) + ar * Int32(256)
-                                            + ((unit ^ (ar & Int32(7))) << Int32(4)))
-                                        xa[4 * t], xa[4 * t + 1], xa[4 * t + 2], xa[4 * t + 3] = a[0], a[1], a[2], a[3]
+                                    sw = ar & Int32(7)
+                                    ab = abuf + (b & Int32(1)) * Int32(self.a_tile) + ar * Int32(256)
                                     for gi in cutlass.range_constexpr(G):
-                                        self._mma_chunk(acc, 4 * (mt * G + gi), xa, bw, gi, sc, quad=True)
+                                        for h in cutlass.range_constexpr(2):
+                                            p0, p1, p2, p3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
+                                            for tp in cutlass.range_constexpr(2):
+                                                t = 2 * h + tp
+                                                unit = Int32(2 * t + 8 * c) + (lane >> Int32(4))
+                                                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(ab + ((unit ^ sw) << Int32(4)))
+                                                p0, p1, p2, p3 = bf16_mma_m16n8k16_f32(
+                                                    p0, p1, p2, p3, a0, a1, a2, a3,
+                                                    bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
+                                            s0, s1 = sc[(gi * 2 + h) * 2], sc[(gi * 2 + h) * 2 + 1]
+                                            f = 4 * (mt * G + gi)
+                                            acc[f] = _fma(p0, s0, acc[f])
+                                            acc[f + 1] = _fma(p1, s1, acc[f + 1])
+                                            acc[f + 2] = _fma(p2, s0, acc[f + 2])
+                                            acc[f + 3] = _fma(p3, s1, acc[f + 3])
                                 else:
+                                    xa = cute.make_rmem_tensor((16,), Uint32)
                                     xa.fill(Uint32(0))
                                     for hh in cutlass.range_constexpr(2):
                                         r = Int32(16 * mt + 8 * hh) + g
