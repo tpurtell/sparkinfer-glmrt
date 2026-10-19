@@ -451,16 +451,24 @@ class _Route:
         self.g, self.route = g, route
         h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
         decode = route == "decode"
+        self.fused_mxfp4_decode = decode and g.weights == "mxfp4"
         self.max_tiles = 1 if decode else _grouped_rows(g, route, max_rows) // TILE_M
-        self.prep = MoePrep(experts=e, top_k=k, pad=1 if decode else TILE_M, max_tiles=self.max_tiles)
+        self.prep = MoePrep(experts=e, top_k=k, pad=1 if decode else TILE_M, max_tiles=self.max_tiles,
+                            gather_k=h if self.fused_mxfp4_decode else 0, wire=wire)
         self.rows_in = GatherRows(k=h, wire=wire, gather=not decode)
         if decode:
             tile_rows = min(int(max_rows), DECODE_MAX_ROWS)
             warps_h = 8 if h >= 6144 else 4
             gemv = GroupedMxfp4Gemv if g.weights == "mxfp4" else GroupedFp8Gemv
             native = {"native_bf16": True} if g.weights == "bf16" else {}
-            self.gate_up = gemv(n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
-                                groups=_gate_up_groups(tile_rows), gather=True, **native)
+            if self.fused_mxfp4_decode:
+                gu_groups = 1 if (tile_rows == 1 or i <= 512) else 2
+                self.gate_up = GroupedMxfp4Gemv(
+                    n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
+                    groups=gu_groups, gather=True, fuse_swiglu=True, swiglu_limit=g.swiglu_limit)
+            else:
+                self.gate_up = gemv(n=2 * i, k=h, experts=e, split=i, max_rows=tile_rows, warps=warps_h,
+                                    groups=_gate_up_groups(tile_rows), gather=True, **native)
             # K split over warps in whole 128 blocks: 4 where they divide evenly,
             # else the largest divisor <= 8 of the blocks (Qwen's 640: 5 warps).
             warps_i = 4 if i % 512 == 0 else max(d for d in range(1, 9) if (i // 128) % d == 0)
@@ -512,9 +520,16 @@ class _Route:
         gu = ptr(cutlass.BFloat16, gu_at)
         act = ptr(cutlass.BFloat16, act_at)
         ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
-        self.prep(ids_i, meta, pair_row, pair_pos, rows, grouped, stream)
-        self.rows_in(x, pair_row, meta, xb, act_rows, stream)
-        if cutlass.const_expr(self.route == "decode"):
+        if cutlass.const_expr(self.fused_mxfp4_decode):
+            self.prep.prep_and_gather(ids_i, meta, pair_row, pair_pos, x, xb, rows, grouped, stream)
+            max_groups = pairs
+            if max_groups > Int32(g.experts):
+                max_groups = Int32(g.experts)
+            self.gate_up(xb, pair_row, meta, w1, s1, w3, s3, act, max_groups, stream)
+            self.down(act, pair_row, meta, w2, s2, w2, s2, xb, max_groups, stream)
+        elif cutlass.const_expr(self.route == "decode"):
+            self.prep(ids_i, meta, pair_row, pair_pos, rows, grouped, stream)
+            self.rows_in(x, pair_row, meta, xb, act_rows, stream)
             max_groups = pairs
             if max_groups > Int32(g.experts):
                 max_groups = Int32(g.experts)
@@ -522,6 +537,8 @@ class _Route:
             self.swiglu(gu, meta, act, grouped, stream)
             self.down(act, pair_row, meta, w2, s2, w2, s2, xb, max_groups, stream)
         else:
+            self.prep(ids_i, meta, pair_row, pair_pos, rows, grouped, stream)
+            self.rows_in(x, pair_row, meta, xb, act_rows, stream)
             self.gate_up(xb, meta, w1, s1, w3, s3, gu, max_tiles, stream)
             self.swiglu(gu, meta, act, grouped, stream)
             self.down(act, meta, w2, s2, w2, s2, xb, max_tiles, stream)

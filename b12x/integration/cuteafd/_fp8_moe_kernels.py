@@ -57,6 +57,7 @@ from b12x._lib.intrinsics import (
     ld_shared_v2_u32,
     pack_f32x2_to_bfloat2,
     shared_ptr_to_u32,
+    st_global_u32,
     st_global_v4_u32,
     st_shared_v4_u32,
 )
@@ -151,14 +152,17 @@ class MoePrep:
     threads = 1024
 
     def __init__(self, *, experts: int, top_k: int, pad: int, max_tiles: int, tile_rows: int | None = None,
-                 chunked: bool = False):
+                 chunked: bool = False, gather_k: int = 0, wire: bool = False):
         self.experts, self.top_k, self.pad, self.max_tiles = int(experts), int(top_k), int(pad), int(max_tiles)
         self.tile_rows = self.pad if tile_rows is None else int(tile_rows)
         self.chunked = bool(chunked)
+        self.gather_k = int(gather_k)
+        self.wire = bool(wire)
         if self.experts > self.threads:
             raise ValueError("MoePrep handles at most 1024 experts")
         if self.tile_rows % self.pad:
             raise ValueError("tile_rows must be a multiple of pad")
+        self.threads = 512 if self.experts <= 512 else 1024
 
     def _storage(self):
         class Storage:
@@ -178,12 +182,17 @@ class MoePrep:
         self.kernel(ids, meta, pair_row, pair_pos, rows, grouped_cap).launch(
             grid=(1, 1, 1), block=(self.threads, 1, 1), stream=stream)
 
-    @cute.kernel
-    def kernel(self, ids: cute.Pointer, meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer,
-               rows: Int32, grouped_cap: Int32):
+    @cute.jit
+    def prep_and_gather(self, ids: cute.Pointer, meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer,
+                        src: cute.Pointer, dst: cute.Pointer, rows: Int32, grouped_cap: Int32,
+                        stream: cuda.CUstream):
+        self.kernel_gather(ids, meta, pair_row, pair_pos, src, dst, rows, grouped_cap).launch(
+            grid=(rows + Int32(1), 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.jit
+    def _prep_body(self, ids: cute.Pointer, meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer,
+                   rows: Int32, grouped_cap: Int32, storage):
         tidx = Int32(cute.arch.thread_idx()[0])
-        smem = cutlass_utils.SmemAllocator()
-        storage = smem.allocate(self._storage())
         counts = storage.counts.get_tensor(cute.make_layout((self.experts,)))
         cursor = storage.cursor.get_tensor(cute.make_layout((self.experts,)))
         scan_flags = storage.flags.get_tensor(cute.make_layout((self.experts,)))
@@ -202,10 +211,11 @@ class MoePrep:
         pairs = rows * Int32(self.top_k)
         if tidx < e_count:
             counts[tidx] = Int32(0)
-        g = tidx
-        while g < grouped_cap:
-            _set_i32(rows_at, g, Int32(-1))
-            g = g + Int32(self.threads)
+        if const_expr(self.pad > 1):
+            g = tidx
+            while g < grouped_cap:
+                _set_i32(rows_at, g, Int32(-1))
+                g = g + Int32(self.threads)
         cute.arch.sync_threads()
         p = tidx
         while p < pairs:
@@ -276,6 +286,41 @@ class MoePrep:
                 _set_i32(rows_at, position, p // Int32(self.top_k))
             _set_i32(pos_at, p, position)
             p = p + Int32(self.threads)
+
+    @cute.kernel
+    def kernel(self, ids: cute.Pointer, meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer,
+               rows: Int32, grouped_cap: Int32):
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        self._prep_body(ids, meta, pair_row, pair_pos, rows, grouped_cap, storage)
+
+    @cute.kernel
+    def kernel_gather(self, ids: cute.Pointer, meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer,
+                      src: cute.Pointer, dst: cute.Pointer, rows: Int32, grouped_cap: Int32):
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        bidx = Int32(cute.arch.block_idx()[0])
+        if bidx == Int32(0):
+            self._prep_body(ids, meta, pair_row, pair_pos, rows, grouped_cap, storage)
+        else:
+            i = bidx - Int32(1)
+            tidx = Int32(cute.arch.thread_idx()[0])
+            out = Int64(dst.toint()) + Int64(i) * Int64(self.gather_k * 2)
+            vectors = self.gather_k // 8
+            for it in cutlass.range_constexpr(_ceil(vectors, self.threads)):
+                v = Int32(it * self.threads) + tidx
+                if v < Int32(vectors):
+                    if const_expr(self.wire):
+                        row = Int64(src.toint()) + Int64(i) * Int64(self.gather_k + self.gather_k // 32)
+                        lo, hi = _ld_v2_u32(row + Int64(v) * Int64(8))
+                        exponent = _ld_u8(row + Int64(self.gather_k) + Int64(v // Int32(4)))
+                        scale = _u32_as_f32(exponent << Uint32(23))
+                        w0, w1, w2, w3 = _e4m3x8_scaled_bf16(lo, hi, scale)
+                        st_global_v4_u32(out + Int64(v) * Int64(16), w0, w1, w2, w3)
+                    else:
+                        w = ld_global_v4_u32(Int64(src.toint()) + (Int64(i) * Int64(self.gather_k)
+                                                                   + Int64(v) * Int64(8)) * Int64(2))
+                        st_global_v4_u32(out + Int64(v) * Int64(16), w[0], w[1], w[2], w[3])
 
 
 # ---------------------------------------------------------------------------
@@ -382,46 +427,48 @@ class MoeSwiGLU:
 
 class MoeCombine:
     """``out[r] = bf16(sum_k weights[r, k] * y[pair_pos[r, k]])`` (FP32, slot
-    order; invalid routes skip). One CTA per row, 8 BF16 per thread-step."""
+    order; invalid routes skip). 2D-tiled across (rows, col_blocks), 8 BF16 per thread."""
 
     def __init__(self, *, hidden: int, top_k: int):
         self.hidden, self.top_k = int(hidden), int(top_k)
         if self.hidden % 8:
             raise ValueError("hidden must be a multiple of 8")
-        self.threads = min(512, self.hidden // 8)
+        self.vectors = self.hidden // 8
+        self.threads = min(128, self.vectors)
+        self.col_blocks = _ceil(self.vectors, self.threads)
 
     def key(self) -> tuple:
-        return (self.hidden, self.top_k)
+        return (self.hidden, self.top_k, self.threads, self.col_blocks)
 
     @cute.jit
     def __call__(self, y: cute.Pointer, pair_pos: cute.Pointer, weights: cute.Pointer, out: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.kernel(y, pair_pos, weights, out).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+        self.kernel(y, pair_pos, weights, out).launch(
+            grid=(rows, self.col_blocks, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, y: cute.Pointer, pair_pos: cute.Pointer, weights: cute.Pointer, out: cute.Pointer):
         row = Int32(cute.arch.block_idx()[0])
-        tidx = Int32(cute.arch.thread_idx()[0])
-        vectors = self.hidden // 8
-        for it in cutlass.range_constexpr(_ceil(vectors, self.threads)):
-            v = Int32(it * self.threads) + tidx
-            if v < Int32(vectors):
-                acc = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
-                for j in cutlass.range_constexpr(8):
-                    acc[j] = Float32(0.0)
-                for k in cutlass.range_constexpr(self.top_k):
-                    p = _i32_at(Int64(pos_base(pair_pos)), row * Int32(self.top_k) + Int32(k))
-                    if p >= Int32(0):
-                        w = _ld_f32(Int64(weights.toint()) + (Int64(row) * Int64(self.top_k) + Int64(k)) * Int64(4))
-                        words = ld_global_v4_u32(Int64(y.toint()) + (Int64(p) * Int64(self.hidden)
-                                                                    + Int64(v) * Int64(8)) * Int64(2))
-                        for j in cutlass.range_constexpr(4):
-                            acc[2 * j] = acc[2 * j] + w * _bf16_lo(words[j])
-                            acc[2 * j + 1] = acc[2 * j + 1] + w * _bf16_hi(words[j])
-                st_global_v4_u32(Int64(out.toint()) + (Int64(row) * Int64(self.hidden) + Int64(v) * Int64(8))
-                                 * Int64(2),
-                                 pack_f32x2_to_bfloat2(acc[0], acc[1]), pack_f32x2_to_bfloat2(acc[2], acc[3]),
-                                 pack_f32x2_to_bfloat2(acc[4], acc[5]), pack_f32x2_to_bfloat2(acc[6], acc[7]))
+        v = Int32(cute.arch.block_idx()[1]) * Int32(self.threads) + Int32(cute.arch.thread_idx()[0])
+        if v < Int32(self.vectors):
+            acc = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
+            for j in cutlass.range_constexpr(8):
+                acc[j] = Float32(0.0)
+            pos_row = Int64(pos_base(pair_pos)) + Int64(row) * Int64(self.top_k * 4)
+            w_row = Int64(weights.toint()) + Int64(row) * Int64(self.top_k * 4)
+            y_col = Int64(y.toint()) + Int64(v) * Int64(16)
+            for k in cutlass.range_constexpr(self.top_k):
+                p = _i32_at(pos_row, k)
+                if p >= Int32(0):
+                    w = _ld_f32(w_row + Int64(k * 4))
+                    words = ld_global_v4_u32(y_col + Int64(p) * Int64(self.hidden * 2))
+                    for j in cutlass.range_constexpr(4):
+                        acc[2 * j] = acc[2 * j] + w * _bf16_lo(words[j])
+                        acc[2 * j + 1] = acc[2 * j + 1] + w * _bf16_hi(words[j])
+            st_global_v4_u32(Int64(out.toint()) + (Int64(row) * Int64(self.hidden) + Int64(v) * Int64(8))
+                             * Int64(2),
+                             pack_f32x2_to_bfloat2(acc[0], acc[1]), pack_f32x2_to_bfloat2(acc[2], acc[3]),
+                             pack_f32x2_to_bfloat2(acc[4], acc[5]), pack_f32x2_to_bfloat2(acc[6], acc[7]))
 
 
 @cute.jit
