@@ -11,12 +11,50 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 import torch
 
 from b12x._lib.intrinsics import div_rn_f32, fmax_f32, pack_f32x2_to_bfloat2
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _bf16, _block_sum, _reduction_storage, _rsqrt
+
+
+@dsl_user_op
+def _add_rn(a: Float32, b: Float32, *, loc=None, ip=None):
+    return Float32(llvm.inline_asm(T.f32(), [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+        "add.rn.f32 $0, $1, $2;", "=f,f,f", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@cute.jit
+def _accumulate(hi: Float32, lo: Float32, value: Float32):
+    total = _add_rn(hi, value)
+    part = _add_rn(total, -hi)
+    error = _add_rn(_add_rn(hi, -_add_rn(total, -part)), _add_rn(value, -part))
+    return total, _add_rn(lo, error)
+
+
+@cute.jit
+def _accurate_sum(hi: Float32, lo: Float32, sums: cute.Tensor, slot: Int32,
+                  warps: cutlass.Constexpr):
+    for shift in cutlass.range_constexpr(5):
+        other_hi = cute.arch.shuffle_sync_bfly(hi, offset=1 << shift)
+        other_lo = cute.arch.shuffle_sync_bfly(lo, offset=1 << shift)
+        hi, lo = _accumulate(hi, lo, other_hi)
+        lo = _add_rn(lo, other_lo)
+    lane = Int32(cute.arch.thread_idx()[0]) % Int32(32)
+    warp = Int32(cute.arch.thread_idx()[0]) // Int32(32)
+    if lane == Int32(0):
+        sums[slot * 2, warp] = hi
+        sums[slot * 2 + 1, warp] = lo
+    cute.arch.sync_threads()
+    total, correction = Float32(0), Float32(0)
+    for w in cutlass.range_constexpr(warps):
+        total, correction = _accumulate(total, correction, sums[slot * 2, w])
+        correction = _add_rn(correction, sums[slot * 2 + 1, w])
+    return _add_rn(total, correction)
 
 
 def _candidate_storage(words):
@@ -34,10 +72,10 @@ def _normalize_bf16(values: cute.Tensor, weight: cute.Pointer, out: cute.Pointer
                     base: Int64, tid: Int64, sums: cute.Tensor, slot: Int32,
                     eps: Float32, hidden: cutlass.Constexpr, threads: cutlass.Constexpr,
                     diagnostic: cutlass.Constexpr, diagnostic_stride: Int64):
-    square = Float32(0)
+    square, correction = Float32(0), Float32(0)
     for j in cutlass.range_constexpr(hidden // threads):
-        square = square + values[j] * values[j]
-    total = _block_sum(square, sums, slot, threads // 32)
+        square, correction = _accumulate(square, correction, values[j] * values[j])
+    total = _accurate_sum(square, correction, sums, slot, threads // 32)
     inv = _rsqrt(div_rn_f32(total, Float32(hidden)) + eps)
     for j in cutlass.range_constexpr(hidden // threads):
         d = tid + Int64(j * threads)
@@ -69,8 +107,8 @@ class KimiRmsNorm:
     def kernel(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer, eps: Float32):
         base = Int64(cute.arch.block_idx()[0]) * Int64(self.hidden)
         tid = Int64(cute.arch.thread_idx()[0])
-        storage = utils.SmemAllocator().allocate(_reduction_storage(1, self.threads // 32))
-        sums = storage.sums.get_tensor(cute.make_layout((1, self.threads // 32)))
+        storage = utils.SmemAllocator().allocate(_reduction_storage(2, self.threads // 32))
+        sums = storage.sums.get_tensor(cute.make_layout((2, self.threads // 32), stride=(self.threads // 32, 1)))
         values = cute.make_rmem_tensor((self.hidden // self.threads,), Float32)
         for j in cutlass.range_constexpr(self.hidden // self.threads):
             values[j] = Float32(x[base + tid + Int64(j * self.threads)])
@@ -115,9 +153,9 @@ class KimiAttnResRmsNorm:
         stride = Int64(arena_rows) * Int64(self.hidden)
         base = row * Int64(self.hidden)
         allocator = utils.SmemAllocator()
-        storage = allocator.allocate(_reduction_storage(2 * self.candidates + 1, self.warps))
+        storage = allocator.allocate(_reduction_storage(2 * (2 * self.candidates + 1), self.warps))
         sums = storage.sums.get_tensor(cute.make_layout(
-            (2 * self.candidates + 1, self.warps), stride=(self.warps, 1)))
+            (2 * (2 * self.candidates + 1), self.warps), stride=(self.warps, 1)))
         # Each lane owns its shared words; the thread-contiguous layout is
         # bank-conflict-free and never changes the FP32 reduction order.
         if cutlass.const_expr(self.shared_candidates > 0):
@@ -155,15 +193,15 @@ class KimiAttnResRmsNorm:
                 else:
                     values[c - self.shared_candidates, j] = packed
             if cutlass.const_expr(self.has_mix):
-                square = Float32(0)
+                square, correction = Float32(0), Float32(0)
                 for j in cutlass.range_constexpr(self.elements):
-                    square = square + current[j] * current[j]
-                total = _block_sum(square, sums, Int32(2 * c), self.warps)
+                    square, correction = _accumulate(square, correction, current[j] * current[j])
+                total = _accurate_sum(square, correction, sums, Int32(2 * c), self.warps)
                 inv = _rsqrt(div_rn_f32(total, Float32(self.hidden)) + eps)
-                dot = Float32(0)
+                dot, correction = Float32(0), Float32(0)
                 for j in cutlass.range_constexpr(self.elements):
-                    dot = dot + (current[j] * inv) * weight[j]
-                scores[c] = _block_sum(dot, sums, Int32(2 * c + 1), self.warps)
+                    dot, correction = _accumulate(dot, correction, (current[j] * inv) * weight[j])
+                scores[c] = _accurate_sum(dot, correction, sums, Int32(2 * c + 1), self.warps)
                 if cutlass.const_expr(self.diagnostic):
                     if tid == Int64(0):
                         out[Int64(4) * stride + base + Int64(2 + c)] = inv
