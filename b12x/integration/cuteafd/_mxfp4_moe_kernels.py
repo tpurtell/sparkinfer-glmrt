@@ -99,7 +99,7 @@ class GroupedMxfp4Gemv:
                  warps: int = 4, groups: int = 4, gather: bool = False):
         self.n, self.k, self.experts = int(n), int(k), int(experts)
         self.split = self.n if split is None else int(split)
-        self.warps, self.groups = int(warps), int(groups)
+        self.warps, self.groups = int(warps), min(int(groups), 2)
         self.cols = 8 * self.groups
         # Sparse routed groups rarely fill a second tile. Stream longer groups
         # in independent chunks instead of reserving unused accumulators/SMEM.

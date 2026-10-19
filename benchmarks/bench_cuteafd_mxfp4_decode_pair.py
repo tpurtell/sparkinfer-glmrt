@@ -99,6 +99,15 @@ def run_pair(args):
     capacities = {rows: next(cap for cap in (1, 16, 80, 256) if cap >= rows) for rows in widths}
     programs = {(arm, cap): compile_arm(g, cap, core)
                 for cap in sorted(set(capacities.values())) for arm, core in cores.items()}
+    if args.export_dir:
+        from b12x.integration.cuteafd import exportable_compilation
+
+        args.export_dir.mkdir(parents=True, exist_ok=True)
+        for (arm, cap) in programs:
+            with exportable_compilation():
+                program = compile_arm(g, cap, cores[arm])
+            stem = f"{arm}_m{cap}"
+            program.export_to_c(str(args.export_dir), stem, stem)
     buffers = {arm: (torch.empty_like(x), torch.empty(fp8_moe_scratch_bytes(g, "decode", capacity),
                                                     device="cuda", dtype=torch.uint8)) for arm in cores}
     l2_bytes = int(get_hardware_info().get_l2_cache_size_in_bytes())
@@ -169,6 +178,7 @@ def main():
     parser.add_argument("--profile-only", action="store_true")
     parser.add_argument("--profile-arm", choices=("master", "candidate"), default="master")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--export-dir", type=Path, help="export actual measured programs for cubin resource audit")
     args = parser.parse_args()
     if not 1 <= args.iters <= 50:
         parser.error("iters must be in 1..50")
