@@ -91,9 +91,10 @@ from ._mxfp4_moe_a8 import StreamMxfp4DownA8
 from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
+from ._fp8_moe_a8 import ChunkQuantA8, ChunkSwiGLUA8, QuantRowsA8, StreamFp8GateUpA8, StreamFp8LinearA8
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
-           "prefill_forms"]
+           "prefill_forms", "fp8_a8_fused"]
 
 _ALIGN = 1024
 TILE_M = 64
@@ -196,11 +197,11 @@ def _mxfp4_down_a8(wire: bool, weights: str, prefill: str, explicit: "bool | Non
 def _streams(wire: bool, weights: str = "fp8", prefill: str = "auto") -> bool:
     """Whether ``auto``'s large route is ``stream``: MXFP4 weights (wire
     or native BF16 input; their only large route), NVFP4 (original BF16 input), W8A8 FP8
-    programs (``_w8a8``), and W8A16 FP8 wire input on GB10 (weight-bandwidth
+    programs (``_w8a8`` or native K128/F32 ``fp8a8``), and W8A16 FP8 wire input on GB10 (weight-bandwidth
     bound); otherwise the grouped GEMM SM120 was measured with."""
     if weights == "mxfp4":
         return True
-    if weights in ("nvfp4", "nvfp4a4"):
+    if weights in ("nvfp4", "nvfp4a4", "fp8a8"):
         return True
     if _w8a8(wire, weights, prefill):
         return True
@@ -209,8 +210,8 @@ def _streams(wire: bool, weights: str = "fp8", prefill: str = "auto") -> bool:
 
 def auto_large_rows(wire: bool, weights: str = "fp8", prefill: str = "auto") -> int:
     """Live-row threshold of ``auto``'s large route (``stream`` or ``prefill``)."""
-    if weights in ("nvfp4", "nvfp4a4"):
-        return 0  # Declared W4A4 arithmetic is independent of the live-row count.
+    if weights in ("nvfp4", "nvfp4a4", "fp8a8"):
+        return 0  # Declared W4A4 / native K128/F32 W8A8 arithmetic is independent of the live-row count.
     if weights == "mxfp4":
         return AUTO_MXFP4_STREAM_ROWS_SM121 if _sm121() else AUTO_MXFP4_STREAM_ROWS
     if _w8a8(wire, weights, prefill):
@@ -249,7 +250,7 @@ class Fp8MoeGeometry:
     # "fp8": E4M3 + FP32 128x128 scales; "mxfp4": packed E2M1 + UE8M0 per 32;
     # "nvfp4": packed E2M1 + E4M3 per 16 + an FP32 alpha per expert.
     weights: str = "fp8"
-    # NVFP4 requires A4 at every row count; a16 remains for other weight formats.
+    # NVFP4 requires A4 at every row count; FP8 W8A8 uses a8; a16 remains for other weight formats.
     activations: str = "a16"
     activation: str = "silu_bf16_product"
     projection: str = "bf16"
@@ -265,8 +266,12 @@ class Fp8MoeGeometry:
             raise ValueError("SwiGLU limit must be finite and nonnegative")
         if self.weights == "mxfp4" and self.activation != "silu_bf16_product":
             raise ValueError("MXFP4 supports only the pre-SiLU BF16 product contract")
-        if self.activations not in ("a16", "a4") or (self.activations == "a4" and self.weights != "nvfp4"):
-            raise ValueError("activations is 'a16', or 'a4' with NVFP4 weights")
+        if (
+            self.activations not in ("a16", "a4", "a8")
+            or (self.activations == "a4" and self.weights != "nvfp4")
+            or (self.activations == "a8" and self.weights != "fp8")
+        ):
+            raise ValueError("activations is 'a16', 'a4' with NVFP4 weights, or 'a8' with FP8 weights")
         if self.weights == "nvfp4" and self.activations != "a4":
             raise ValueError("declared NVFP4 experts require W4A4; W4A16 is not a serving mode")
         if self.weights not in ("fp8", "mxfp4", "nvfp4", "bf16"):
@@ -301,8 +306,12 @@ class Fp8MoeGeometry:
 
     @property
     def kind(self) -> str:
-        """The weight format, ``nvfp4a4`` for NVFP4 with the W4A4 stream route."""
-        return "nvfp4a4" if self.activations == "a4" else self.weights
+        """The weight format, ``nvfp4a4`` for NVFP4 W4A4 and ``fp8a8`` for FP8 W8A8."""
+        if self.activations == "a4":
+            return "nvfp4a4"
+        if self.activations == "a8":
+            return "fp8a8"
+        return self.weights
 
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
         return Fp8MoeGeometry(self.name, self.hidden, self.experts, self.top_k, self.intermediate, int(tp),
@@ -312,7 +321,9 @@ class Fp8MoeGeometry:
 # MiMo V2 Flash (no SwiGLU clamp in its config) and the GLM 5.3 MTP layer.
 GEOMETRIES = {
     "step5": Fp8MoeGeometry("step5", hidden=4096, experts=352, top_k=8, intermediate=1536,
-                              swiglu_limit=7.0, activation="silu_post_clamp_fp32_product"),
+                              swiglu_limit=7.0, activations="a8", activation="silu_post_clamp_fp32_product"),
+    "step5_fp8a8": Fp8MoeGeometry("step5_fp8a8", hidden=4096, experts=352, top_k=8, intermediate=1536,
+                                    swiglu_limit=7.0, activations="a8", activation="silu_post_clamp_fp32_product"),
     "step5_bf16": Fp8MoeGeometry("step5_bf16", hidden=4096, experts=352, top_k=8, intermediate=1536,
                                    swiglu_limit=7.0, weights="bf16", activation="silu_post_clamp_fp32_product"),
     "step5_nvfp4": Fp8MoeGeometry("step5_nvfp4", hidden=4096, experts=352, top_k=8, intermediate=1536,
@@ -324,6 +335,14 @@ GEOMETRIES = {
     "glmf": Fp8MoeGeometry("glmf", hidden=4096, experts=288, top_k=8, intermediate=2048, swiglu_limit=10.0),
     # Qwen 3.8 Flash Next: 512 experts, softmax top-10, unclamped SiLU.
     "qwen4": Fp8MoeGeometry("qwen4", hidden=2560, experts=512, top_k=10, intermediate=640),
+    "mimo_fp8a8": Fp8MoeGeometry("mimo_fp8a8", hidden=4096, experts=256, top_k=8, intermediate=2048,
+                                 activations="a8"),
+    "glm_fp8a8": Fp8MoeGeometry("glm_fp8a8", hidden=6144, experts=256, top_k=8, intermediate=2048,
+                                activations="a8"),
+    "glmf_fp8a8": Fp8MoeGeometry("glmf_fp8a8", hidden=4096, experts=288, top_k=8, intermediate=2048,
+                                 swiglu_limit=10.0, activations="a8"),
+    "qwen4_fp8a8": Fp8MoeGeometry("qwen4_fp8a8", hidden=2560, experts=512, top_k=10, intermediate=640,
+                                  activations="a8"),
     # MiMo V2.6 Pro: MXFP4 experts, 384 of them, top-8, unclamped SiLU.
     "mimop": Fp8MoeGeometry("mimop", hidden=6144, experts=384, top_k=8, intermediate=2048, weights="mxfp4"),
     "mimof": Fp8MoeGeometry("mimof", hidden=4096, experts=256, top_k=8, intermediate=2048, weights="mxfp4"),
@@ -379,6 +398,22 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
             padded * g.slice // 16,                    # their scales
             pairs * g.hidden * 2,                      # down output
         ]
+    if route == "stream" and g.activations == "a8":
+        pairs = rows * g.top_k
+        padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
+        split = 0 if fp8_a8_fused() else pairs * g.slice * 2
+        return [
+            meta_words(g.experts, stream_max_tiles(g.experts, pairs)) * 4,
+            pairs * 4,                                 # pair_row
+            pairs * 4,                                 # pair_pos
+            rows * g.hidden,                           # quantized input rows xq [rows, H]
+            rows * (g.hidden // 128) * 4,              # input row scales xs [rows, H/128]
+            pairs * g.slice * 2,                       # SwiGLU BF16 act (or gate when unfused) [pairs, I]
+            split,                                     # up BF16 (unfused route only) [pairs, I]
+            padded * g.slice,                          # quantized SwiGLU rows aq [padded, I]
+            padded * (g.slice // 128) * 4,             # SwiGLU scales a_s [padded, I/128]
+            pairs * g.hidden * 2,                      # down output y [pairs, H]
+        ]
     if route == "stream":
         pairs = rows * g.top_k
         act_bytes = mxfp8_down_row_bytes(g.slice) if mxfp4_down_a8 else 2 * g.slice
@@ -410,14 +445,28 @@ def nvfp4_a4_fused() -> bool:
     return os.environ.get("B12X_NVFP4_A4_FUSED", "1") != "0"
 
 
+def fp8_a8_fused() -> bool:
+    """The native K128/F32 W8A8 stream route's gate/up: one fused gate/up + SwiGLU
+    launch (``StreamFp8GateUpA8`` + ``ChunkQuantA8``, default), or with
+    ``B12X_FP8_A8_FUSED=0`` at export the separate gate GEMM, up GEMM and
+    ``ChunkSwiGLUA8`` (A/B)."""
+    import os
+
+    return os.environ.get("B12X_FP8_A8_FUSED", "1") != "0"
+
+
 def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8", prefill: str = "auto") -> str:
-    """Select one serving route. NVFP4 always streams calibrated A4 from BF16;
+    """Select one serving route. NVFP4 and FP8A8 always stream from BF16;
     other formats retain their row-count-dependent policies."""
-    # A4 is a numerical contract, not a large-row optimization. Chunk padding
+    # A4 / A8 are numerical contracts, not large-row optimizations. Chunk padding
     # also supports a single live row; never fall back to the A16 GEMV.
     if weights in ("nvfp4", "nvfp4a4"):
         if wire:
             raise ValueError("calibrated NVFP4 A4 requires original BF16 input")
+        return "stream"
+    if weights == "fp8a8":
+        if wire:
+            raise ValueError("native FP8 W8A8 requires original BF16 input")
         return "stream"
     if weights == "bf16":
         if wire or route == "stream":
@@ -708,10 +757,110 @@ class _StreamNvfp4A4Route:
         self.combine(y, pair_pos, weights, out, rows, stream)
 
 
+class _StreamFp8A8Route:
+    """The native K128/F32 W8A8 FP8 ``stream`` route (``_fp8_moe_a8``): input
+    BF16 rows quantized once per row and per K128 block to E4M3 with F32 scales
+    (``QuantRowsA8``), gate/up block-scaled E4M3xE4M3 GEMMs with SwiGLU fused
+    (``StreamFp8GateUpA8`` + ``ChunkQuantA8``; ``fp8_a8_fused``), the down
+    block-scaled E4M3xE4M3 GEMM (``StreamFp8LinearA8``), route combine."""
+
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
+        if wire:
+            raise ValueError("native FP8 W8A8 requires original BF16 input")
+        self.g = g
+        h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
+        self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
+        self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
+                            chunked=True)
+        self.rows_in = QuantRowsA8(k=h)
+        self.fused = fp8_a8_fused()
+        if self.fused:
+            self.gate_up = StreamFp8GateUpA8(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+                                             activation=g.activation, live_min=17)
+            self.chunk_quant = ChunkQuantA8(inter=i, experts=e)
+            self.swiglu = None
+            self.down = StreamFp8LinearA8(n=h, k=i, experts=e, live_min=17, gather=False)
+            self.small_gate = StreamFp8GateUpA8(inter=i, hidden=h, experts=e, limit=g.swiglu_limit,
+                                                activation=g.activation, tile_m=16, tile_n=128,
+                                                live_max=16, stages=SMALL_GATE_STAGES)
+            self.small_down = tuple(StreamFp8LinearA8(n=h, k=i, experts=e, tile_m=16, tile_n=n,
+                                                      live_max=16, gather=False) for n in (64, 128))
+        else:
+            self.gate_up = StreamFp8LinearA8(n=i, k=h, experts=e, gather=True)
+            self.chunk_quant = None
+            self.swiglu = ChunkSwiGLUA8(inter=i, experts=e, limit=g.swiglu_limit, activation=g.activation)
+            self.down = StreamFp8LinearA8(n=h, k=i, experts=e, gather=False)
+            self.small_gate = None
+            self.small_down = ()
+        self.combine = MoeCombine(hidden=h, top_k=k)
+
+    def key(self) -> tuple:
+        return ("stream_fp8_a8", self.max_tiles, self.rows_in.key(), self.gate_up.key(),
+                None if self.chunk_quant is None else self.chunk_quant.key(),
+                None if self.swiglu is None else self.swiglu.key(),
+                self.down.key(), self.combine.key(),
+                None if self.small_gate is None else self.small_gate.key(),
+                tuple(p.key() for p in self.small_down))
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
+                 s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer, w2: cute.Pointer, s2: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        g = self.g
+        pairs = rows * Int32(g.top_k)
+        groups = pairs
+        if groups > Int32(g.experts):
+            groups = Int32(g.experts)
+        max_tiles = (pairs + Int32(STREAM_TILE_M - 1)) // Int32(STREAM_TILE_M) + groups
+        padded = Int64(max_tiles) * Int64(STREAM_TILE_M)
+        base = Int64(scratch.toint())
+        pair_row_at = base + _al(Int64(4 * meta_words(g.experts, self.max_tiles)))
+        pair_pos_at = pair_row_at + _al(Int64(pairs) * Int64(4))
+        xq_at = pair_pos_at + _al(Int64(pairs) * Int64(4))
+        xs_at = xq_at + _al(Int64(rows) * Int64(g.hidden))
+        act_at = xs_at + _al(Int64(rows) * Int64((g.hidden // 128) * 4))
+        split = Int64(0) if self.fused else Int64(pairs) * Int64(g.slice * 2)
+        up_at = act_at + _al(Int64(pairs) * Int64(g.slice * 2))
+        aq_at = up_at + _al(split)
+        as_at = aq_at + _al(padded * Int64(g.slice))
+        y_at = as_at + _al(padded * Int64((g.slice // 128) * 4))
+        ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)  # noqa: E731
+        meta = ptr(cutlass.Int32, base)
+        pair_row = ptr(cutlass.Int32, pair_row_at)
+        pair_pos = ptr(cutlass.Int32, pair_pos_at)
+        xq, xs = ptr(cutlass.Uint8, xq_at), ptr(cutlass.Float32, xs_at)
+        act, up = ptr(cutlass.BFloat16, act_at), ptr(cutlass.BFloat16, up_at)
+        aq, a_s = ptr(cutlass.Uint8, aq_at), ptr(cutlass.Float32, as_at)
+        y = ptr(cutlass.BFloat16, y_at)
+        ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
+        self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
+        self.rows_in(x, xq, xs, rows, stream)
+        if cutlass.const_expr(self.fused):
+            sms = runtime_num_sm()
+            self.small_gate(xq, xs, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
+            if pairs > Int32(16):
+                self.gate_up(xq, xs, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
+            self.chunk_quant(act, meta, aq, a_s, stream)
+            if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
+                self.small_down[1](aq, a_s, pair_row, meta, w2, s2, y, max_tiles, stream)
+            else:
+                self.small_down[0](aq, a_s, pair_row, meta, w2, s2, y, max_tiles, stream)
+            if pairs > Int32(16):
+                self.down(aq, a_s, pair_row, meta, w2, s2, y, max_tiles, stream)
+        else:
+            self.gate_up(xq, xs, pair_row, meta, w1, s1, act, max_tiles, stream)
+            self.gate_up(xq, xs, pair_row, meta, w3, s3, up, max_tiles, stream)
+            self.swiglu(act, up, meta, aq, a_s, stream)
+            self.down(aq, a_s, pair_row, meta, w2, s2, y, max_tiles, stream)
+        self.combine(y, pair_pos, weights, out, rows, stream)
+
+
 def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
                 mxfp4_down_a8: bool = False):
     if route == "stream" and g.activations == "a4":
         return _StreamNvfp4A4Route(g, max_rows, wire)
+    if route == "stream" and g.activations == "a8":
+        return _StreamFp8A8Route(g, max_rows, wire)
     if route == "stream":
         return _StreamRoute(g, max_rows, wire, prefill, mxfp4_down_a8)
     return _Route(g, route, max_rows, wire)
@@ -733,8 +882,8 @@ class _Fp8Moe:
 
     def weight_read_grouping(self, weights: str, max_rows: int) -> dict:
         """Static accounting only; never part of the compiler key or launch."""
-        if weights == "nvfp4":
-            # Sparse/wide W4A4 tiles depend on expert occupancy, not only rows.
+        if weights in ("nvfp4", "nvfp4a4", "fp8a8"):
+            # Sparse/wide W4A4 and W8A8 tiles depend on expert occupancy, not only rows.
             # One full slice per routed occurrence is an explicit traffic bound.
             return {"contract": "conservative_route_upper_bound",
                     "segments": [{"end_rows": int(max_rows), "group_rows": 1}]}
@@ -852,7 +1001,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
                   "wire": bool(wire), "weights": g.weights, "activations": g.activations,
                   "activation": g.activation, "projection": g.projection,
                   "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8),
-                  "weight_read_grouping": launch.weight_read_grouping(g.weights, max_rows)},
+                  "weight_read_grouping": launch.weight_read_grouping(g.kind, max_rows)},
         scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire, prefill, mxfp4_down_a8)},
         doc=__doc__,
     )
