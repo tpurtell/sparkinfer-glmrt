@@ -84,7 +84,7 @@ def _quad_transpose_u8x4(raw, prmt_sel, *, loc=None, ip=None):
         "shfl.sync.idx.b32 s3, $1, 3, 0x1c1f, 0xffffffff; "
         "prmt.b32 lo, s0, s1, $2; "
         "prmt.b32 hi, s2, s3, $2; "
-        "prmt.b32 $0, lo, hi, 0x5410; }",
+        "prmt.b32 $0, lo, hi, 0x6420; }",
         "=r,r,r",
         has_side_effects=False, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
