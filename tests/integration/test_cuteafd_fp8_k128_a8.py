@@ -1,8 +1,24 @@
 """K128/F32 native expert arithmetic: independent block oracle and replay."""
 from dataclasses import replace
+import importlib.util
+import os
+import sys
+from functools import lru_cache
 import pytest
 import torch
 from ..conftest import require_b12x
+
+
+@lru_cache(None)
+def official_module():
+    path = os.environ.get("CUTEAFD_A8_OFFICIAL_KERNEL")
+    if not path:
+        pytest.skip("set CUTEAFD_A8_OFFICIAL_KERNEL to the checkpoint inference/kernel.py")
+    spec = importlib.util.spec_from_file_location("official_a8_kernel", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def quantize(x):
@@ -14,8 +30,10 @@ def quantize(x):
 
 
 def project(x, w, s, exact=False):
-    q, scale = quantize(x)
-    dtype = torch.float64 if exact else torch.float32
+    q, scale = official_module().act_quant(x)
+    if exact == "official":
+        return official_module().fp8_gemm(q, scale, w, s)
+    dtype = torch.float64 if exact is True else torch.float32
     out = torch.zeros((x.shape[0], w.shape[0]), dtype=dtype, device=x.device)
     for kb in range((x.shape[1] + 127) // 128):
         lo, hi = kb * 128, min((kb + 1) * 128, x.shape[1])
@@ -32,7 +50,7 @@ def reference(x, ids, routes, ws, exact=False):
             continue
         gate = project(x[rows], ws[0][e], ws[1][e], exact).float()
         up = project(x[rows], ws[2][e], ws[3][e], exact).float()
-        act = ((gate / (1 + torch.exp(-gate))).clamp(max=7) * up.clamp(-7, 7)).bfloat16()
+        act = official_module().clamped_swiglu(gate.bfloat16().contiguous(), up.bfloat16().contiguous(), 7.0)
         outputs[rows, slots] = project(act, ws[4][e], ws[5][e], exact).float()
     result = torch.zeros(x.shape, device=x.device)
     for slot in range(ids.shape[1]):
@@ -67,11 +85,16 @@ def test_native_a8(rows):
     launch()
     torch.cuda.synchronize()
     actual = out.clone()
-    expected, fp64 = reference(x, ids, routes, ws), reference(x, ids, routes, ws, True)
+    expected, fp64 = reference(x, ids, routes, ws, "official"), reference(x, ids, routes, ws, True)
     error = (actual.float() - fp64.float()).square().sum(1)
     official = (expected.float() - fp64.float()).square().sum(1)
-    print(f"rows={rows} native_error={error.sum().item():.9g} block_mirror_error={official.sum().item():.9g}")
-    assert torch.all(error <= official * 1.01), (error.max(), official.max())
+    over = error > official * 1.01
+    ratio = torch.where(official > 0, error / official, torch.where(error == 0, 0., float("inf")))
+    ulp = (actual.view(torch.int16).int() - expected.view(torch.int16).int()).abs()
+    print(f"rows={rows} native_error={error.sum().item():.9g} official_error={official.sum().item():.9g} "
+          f"rows_over={over.sum().item()} worst_ratio={ratio.max().item()} max_ulp={ulp.max().item()}")
+    # Report the strict bar after collecting replay/width evidence, including
+    # zero-denominator BF16 ties; no exception is silently blessed here.
     launch()
     assert torch.equal(out, actual)
     graph = torch.cuda.CUDAGraph()
@@ -87,3 +110,4 @@ def test_native_a8(rows):
         at = min(rows - 1, 5)
         one.launch(x[at:at+1], ids[at:at+1], routes[at:at+1], *ws, one_out, one_scratch, scalars=(1,))
         assert torch.equal(one_out, actual[at:at+1])
+    assert torch.all(error <= official * 1.01), "strict per-row native/official error bar"
