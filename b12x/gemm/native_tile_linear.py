@@ -388,14 +388,18 @@ class NativeTileLinear:
                         self._decode_load(nxt, snxt, payload, scales, n0, g, j, kb + Int32(1))
                     for c in cutlass.range_constexpr(2):
                         k0 = kb * Int32(128) + Int32(64 * c)
-                        ci = Int32(2) * b + Int32(c)
                         if cutlass.const_expr(self.grouped):
-                            # Prefetch the next 64-K A chunk; the warp's lanes are all
-                            # done reading the buffer this iteration overwrites.
+                            # Prefetch the next 64-K A chunk into the other buffer; the
+                            # warp's lanes are all done reading it (c-1's chunk).  Both
+                            # the buffer and the source are compile-time choices, so the
+                            # loop carries no index arithmetic.
                             cute.arch.sync_warp()
-                            if ci + Int32(1) < Int32(2 * self.seg_blocks):
-                                self._stage_a(abuf + ((ci + Int32(1)) & Int32(1)) * Int32(self.a_tile),
-                                              x, rows, kb0 * Int32(128) + (ci + Int32(1)) * Int32(64), lane)
+                            if cutlass.const_expr(c == 0):
+                                self._stage_a(abuf + Int32(self.a_tile), x, rows,
+                                              kb * Int32(128) + Int32(64), lane)
+                            else:
+                                if b + Int32(1) < Int32(self.seg_blocks):
+                                    self._stage_a(abuf, x, rows, (kb + Int32(1)) * Int32(128), lane)
                             cute.arch.cp_async_commit_group()
                             cute.arch.cp_async_wait_group(1)
                             cute.arch.sync_warp()
@@ -439,7 +443,7 @@ class NativeTileLinear:
                                     # to the tensor core, no xa round trip.
                                     ar = lane & Int32(15)
                                     sw = ar & Int32(7)
-                                    ab = abuf + (ci & Int32(1)) * Int32(self.a_tile) + ar * Int32(128)
+                                    ab = abuf + Int32(c) * Int32(self.a_tile) + ar * Int32(128)
                                     for gi in cutlass.range_constexpr(G):
                                         for h in cutlass.range_constexpr(2):
                                             p0, p1, p2, p3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
