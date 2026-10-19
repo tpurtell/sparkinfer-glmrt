@@ -272,7 +272,7 @@ class NativeTileLinear:
                 ctas = (self.n // self.cols + self.slots - 1) // self.slots
                 self.decode(x, payload, scales, output, rows).launch(
                     grid=(min(Int32(ctas), cta_limit), 1, 1), block=(self.d_threads, 1, 1),
-                    stream=stream, min_blocks_per_mp=3 if self.segments > 1 else 2)
+                    stream=stream, min_blocks_per_mp=3 if self.side2 else 2)
             else:
                 tiles = ((rows + Int32(self.bm - 1)) // Int32(self.bm)) * Int32(self.n_tiles)
                 self.prefill(x, payload, scales, output, rows).launch(
@@ -439,6 +439,10 @@ class NativeTileLinear:
                         if cutlass.const_expr(self.grouped):
                             for h in cutlass.range_constexpr(2):
                                 k32 = k0 + Int32(32 * h)
+                                if cutlass.const_expr(not self.side2):
+                                    at_m0 = x_base + (g.to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
+                                    m0_lo0, m0_lo1, m0_lo2, m0_lo3 = _ld_cached_pred(at_m0, g, rows)
+                                    m0_hi0, m0_hi1, m0_hi2, m0_hi3 = _ld_cached_pred(at_m0 + Int64(16 * self.k), g + Int32(8), rows)
                                 if cutlass.const_expr(self.int4):
                                     t_w = _quad_transpose_u8x4(cur[c * 2 + h], prmt_sel)
                                     b0, b1, b2, b3 = _int4x8_bf16(t_w)
@@ -451,7 +455,14 @@ class NativeTileLinear:
                                     r_s1 = scur[1] >> Uint32(16 * c)
                                 s0 = self._scale(r_s0, h)
                                 s1 = self._scale(r_s1, h)
-                                for mt in cutlass.range_constexpr(4):
+                                if cutlass.const_expr(not self.side2):
+                                    m0_a0, m0_a2, m0_a4, m0_a6 = _quad_transpose_x4(m0_lo0, m0_lo1, m0_lo2, m0_lo3, j)
+                                    m0_a1, m0_a3, m0_a5, m0_a7 = _quad_transpose_x4(m0_hi0, m0_hi1, m0_hi2, m0_hi3, j)
+                                    acc[0], acc[1], acc[2], acc[3] = _mma_k32_scaled(
+                                        acc[0], acc[1], acc[2], acc[3],
+                                        m0_a0, m0_a1, m0_a2, m0_a3, m0_a4, m0_a5, m0_a6, m0_a7,
+                                        b0, b1, b2, b3, s0, s1)
+                                for mt in cutlass.range_constexpr(0 if self.side2 else 1, 4):
                                     if Int32(mt) < live:
                                         r0 = Int32(16 * mt) + g
                                         at0 = x_base + (r0.to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
