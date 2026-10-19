@@ -74,7 +74,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64
 
 from b12x._lib.quant.mxfp8_rows import _THREADS as _QUANT_THREADS
 from b12x._lib.quant.mxfp8_rows import _WARP_SUBGROUP_WIDTH, _MXFP8RowsQuantLaunch
@@ -84,6 +84,7 @@ from ._common import AotProgram, Operand, Scalar, compile_program
 from ._fp8_moe_kernels import (
     GatherRows, GroupedFp8Gemm, GroupedFp8Gemv, MoeCombine, MoePrep, MoeSwiGLU, meta_words,
 )
+from ._fp8_moe_a8 import QuantizeK128, GroupedK128Gemm
 from ._fp8_moe_stream import STREAM_TILE_M, StreamFp8Down, StreamFp8GateUp, stream_max_tiles
 from ._mxfp4_moe_kernels import GroupedMxfp4Gemv
 from ._mxfp4_moe_stream import StreamMxfp4Down, StreamMxfp4GateUp
@@ -229,6 +230,8 @@ def prefill_forms(g: "Fp8MoeGeometry", max_rows: int, wire: bool = True) -> list
         return (_large_route(wire, g.kind, prefill), auto_large_rows(wire, g.kind, prefill),
                 _w8a8(wire, g.kind, prefill), _mxfp4_down_a8(wire, g.kind, prefill))
 
+    if g.activations == "a8_k128_f32":
+        return []
     base = policy("auto")
     return [form for form in PREFILL_FORMS[1:] if policy(form) != base
             and int(max_rows) > min(base[1], policy(form)[1])]
@@ -265,8 +268,10 @@ class Fp8MoeGeometry:
             raise ValueError("SwiGLU limit must be finite and nonnegative")
         if self.weights == "mxfp4" and self.activation != "silu_bf16_product":
             raise ValueError("MXFP4 supports only the pre-SiLU BF16 product contract")
-        if self.activations not in ("a16", "a4") or (self.activations == "a4" and self.weights != "nvfp4"):
+        if self.activations not in ("a16", "a4", "a8_k128_f32") or (self.activations == "a4" and self.weights != "nvfp4"):
             raise ValueError("activations is 'a16', or 'a4' with NVFP4 weights")
+        if self.activations == "a8_k128_f32" and self.weights != "fp8":
+            raise ValueError("K128 F32 A8 requires block128 FP8 weights")
         if self.weights == "nvfp4" and self.activations != "a4":
             raise ValueError("declared NVFP4 experts require W4A4; W4A16 is not a serving mode")
         if self.weights not in ("fp8", "mxfp4", "nvfp4", "bf16"):
@@ -302,7 +307,7 @@ class Fp8MoeGeometry:
     @property
     def kind(self) -> str:
         """The weight format, ``nvfp4a4`` for NVFP4 with the W4A4 stream route."""
-        return "nvfp4a4" if self.activations == "a4" else self.weights
+        return "fp8a8" if self.activations == "a8_k128_f32" else ("nvfp4a4" if self.activations == "a4" else self.weights)
 
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
         return Fp8MoeGeometry(self.name, self.hidden, self.experts, self.top_k, self.intermediate, int(tp),
@@ -363,6 +368,13 @@ def _grouped_rows(g: Fp8MoeGeometry, route: str, rows: int) -> int:
 def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
              mxfp4_down_a8: bool = False) -> list[int]:
     rows = max(int(rows), 1)
+    if g.activations == "a8_k128_f32":
+        tiles = (rows * g.top_k + 15) // 16 + min(g.experts, rows * g.top_k)
+        grouped = tiles * 16
+        return [4 * meta_words(g.experts, tiles), grouped * 4, rows * g.top_k * 4,
+                grouped * g.hidden, grouped * (g.hidden // 128) * 4,
+                grouped * g.slice * 4, grouped * g.slice * 2,
+                grouped * g.slice, grouped * (g.slice // 128) * 4, grouped * g.hidden * 2]
     if route == "stream" and g.activations == "a4":
         pairs = rows * g.top_k
         padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
@@ -413,6 +425,10 @@ def nvfp4_a4_fused() -> bool:
 def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8", prefill: str = "auto") -> str:
     """Select one serving route. NVFP4 always streams calibrated A4 from BF16;
     other formats retain their row-count-dependent policies."""
+    if weights == "fp8a8":
+        if wire or prefill != "auto":
+            raise ValueError("native K128 A8 requires original BF16 input and its fixed arithmetic")
+        return "prefill"
     # A4 is a numerical contract, not a large-row optimization. Chunk padding
     # also supports a single live row; never fall back to the A16 GEMV.
     if weights in ("nvfp4", "nvfp4a4"):
@@ -526,6 +542,54 @@ class _Route:
             self.swiglu(gu, meta, act, grouped, stream)
             self.down(act, meta, w2, s2, w2, s2, xb, max_tiles, stream)
         self.combine(xb, pair_pos, weights, out, rows, stream)
+
+
+class _K128A8Route:
+    def __init__(self, g, max_rows):
+        self.g = g
+        self.max_tiles = (max_rows * g.top_k + 15) // 16 + min(g.experts, max_rows * g.top_k)
+        self.prep = MoePrep(experts=g.experts, top_k=g.top_k, pad=16, max_tiles=self.max_tiles)
+        self.quant_in = QuantizeK128(g.hidden, gather=True)
+        self.quant_down = QuantizeK128(g.slice)
+        self.gate_up = GroupedK128Gemm(g.slice, g.hidden, g.experts, halves=2)
+        self.down = GroupedK128Gemm(g.hidden, g.slice, g.experts)
+        self.swiglu = MoeSwiGLU(inter=g.slice, limit=g.swiglu_limit, activation=g.activation)
+        self.combine = MoeCombine(hidden=g.hidden, top_k=g.top_k)
+
+    def key(self):
+        return ("native_k128_f32", 1, self.g, self.max_tiles)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
+                 s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer, w2: cute.Pointer, s2: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        g = self.g
+        pairs = rows * Int32(g.top_k)
+        groups = cutlass.select_(pairs < Int32(g.experts), pairs, Int32(g.experts))
+        tiles = (pairs + Int32(15)) // Int32(16) + groups
+        grouped = tiles * Int32(16)
+        base = Int64(scratch.toint())
+        pair_row_at = base + _al(Int64(4 * meta_words(g.experts, self.max_tiles)))
+        pair_pos_at = pair_row_at + _al(Int64(grouped) * Int64(4))
+        q_at = pair_pos_at + _al(Int64(pairs) * Int64(4))
+        qs_at = q_at + _al(Int64(grouped) * Int64(g.hidden))
+        gu_at = qs_at + _al(Int64(grouped) * Int64(g.hidden // 128 * 4))
+        act_at = gu_at + _al(Int64(grouped) * Int64(g.slice * 4))
+        aq_at = act_at + _al(Int64(grouped) * Int64(g.slice * 2))
+        as_at = aq_at + _al(Int64(grouped) * Int64(g.slice))
+        y_at = as_at + _al(Int64(grouped) * Int64(g.slice // 128 * 4))
+        ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)
+        meta, pair_row, pair_pos = ptr(Int32, base), ptr(Int32, pair_row_at), ptr(Int32, pair_pos_at)
+        q, qs = ptr(cutlass.Float8E4M3FN, q_at), ptr(Float32, qs_at)
+        gu, act = ptr(BFloat16, gu_at), ptr(BFloat16, act_at)
+        aq, a_s, y = ptr(cutlass.Float8E4M3FN, aq_at), ptr(Float32, as_at), ptr(BFloat16, y_at)
+        self.prep(ids, meta, pair_row, pair_pos, rows, grouped, stream)
+        self.quant_in(x, q, qs, grouped, pair_row, stream)
+        self.gate_up(q, qs, meta, w1, s1, w3, s3, gu, tiles, stream)
+        self.swiglu(gu, meta, act, grouped, stream)
+        self.quant_down(act, aq, a_s, grouped, pair_row, stream)
+        self.down(aq, a_s, meta, w2, s2, w2, s2, y, tiles, stream)
+        self.combine(y, pair_pos, weights, out, rows, stream)
 
 
 class _StreamRoute:
@@ -710,6 +774,8 @@ class _StreamNvfp4A4Route:
 
 def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
                 mxfp4_down_a8: bool = False):
+    if g.activations == "a8_k128_f32":
+        return _K128A8Route(g, max_rows)
     if route == "stream" and g.activations == "a4":
         return _StreamNvfp4A4Route(g, max_rows, wire)
     if route == "stream":
@@ -740,6 +806,8 @@ class _Fp8Moe:
                     "segments": [{"end_rows": int(max_rows), "group_rows": 1}]}
 
         def group(part):
+            if isinstance(part, _K128A8Route):
+                return 16
             if isinstance(part, _Route):
                 gate, down = part.gate_up, part.down
                 values = ((16 * gate.m_tiles, 16 * down.m_tiles) if part.route == "decode"
