@@ -32,7 +32,8 @@ def _candidate_storage(words):
 @cute.jit
 def _normalize_bf16(values: cute.Tensor, weight: cute.Pointer, out: cute.Pointer,
                     base: Int64, tid: Int64, sums: cute.Tensor, slot: Int32,
-                    eps: Float32, hidden: cutlass.Constexpr, threads: cutlass.Constexpr):
+                    eps: Float32, hidden: cutlass.Constexpr, threads: cutlass.Constexpr,
+                    diagnostic: cutlass.Constexpr, diagnostic_stride: Int64):
     square = Float32(0)
     for j in cutlass.range_constexpr(hidden // threads):
         square = square + values[j] * values[j]
@@ -41,6 +42,13 @@ def _normalize_bf16(values: cute.Tensor, weight: cute.Pointer, out: cute.Pointer
     for j in cutlass.range_constexpr(hidden // threads):
         d = tid + Int64(j * threads)
         out[base + d] = (_bf16(values[j] * inv) * Float32(weight[d])).to(BFloat16)
+        if cutlass.const_expr(diagnostic):
+            out[Int64(2) * diagnostic_stride + base + d] = values[j] * inv
+            out[Int64(3) * diagnostic_stride + base + d] = _bf16(values[j] * inv)
+    if cutlass.const_expr(diagnostic):
+        if tid == Int64(0):
+            out[Int64(4) * diagnostic_stride + base] = inv
+            out[Int64(4) * diagnostic_stride + base + Int64(1)] = total
 
 
 class KimiRmsNorm:
@@ -67,13 +75,13 @@ class KimiRmsNorm:
         for j in cutlass.range_constexpr(self.hidden // self.threads):
             values[j] = Float32(x[base + tid + Int64(j * self.threads)])
         _normalize_bf16(values, weight, out, base, tid, sums, Int32(0), eps,
-                        self.hidden, self.threads)
+                        self.hidden, self.threads, False, Int64(0))
 
 
 class KimiAttnResRmsNorm:
     threads = 512
 
-    def __init__(self, hidden, candidates, prefix_mode, append, has_mix):
+    def __init__(self, hidden, candidates, prefix_mode, append, has_mix, diagnostic=False):
         if hidden != 7168 or not 1 <= candidates <= 9:
             raise ValueError("Kimi residual requires H7168 and 1..9 candidates")
         if prefix_mode not in ("keep", "add", "replace"):
@@ -82,6 +90,7 @@ class KimiAttnResRmsNorm:
             raise ValueError("all eight immutable block slots are already occupied")
         if not has_mix and candidates != 1:
             raise ValueError("no-mix is only valid for the initial single prefix")
+        self.diagnostic = diagnostic
         self.hidden, self.candidates = hidden, candidates
         self.prefix_mode, self.append, self.has_mix = prefix_mode, append, has_mix
         self.elements = hidden // self.threads
@@ -155,6 +164,10 @@ class KimiAttnResRmsNorm:
                 for j in cutlass.range_constexpr(self.elements):
                     dot = dot + (current[j] * inv) * weight[j]
                 scores[c] = _block_sum(dot, sums, Int32(2 * c + 1), self.warps)
+                if cutlass.const_expr(self.diagnostic):
+                    if tid == Int64(0):
+                        out[Int64(4) * stride + base + Int64(2 + c)] = inv
+                        out[Int64(4) * stride + base + Int64(2 + self.candidates + c)] = scores[c]
         if cutlass.const_expr(self.has_mix):
             maximum = scores[0]
             for c in cutlass.range_constexpr(1, self.candidates):
@@ -165,6 +178,9 @@ class KimiAttnResRmsNorm:
                 denominator = denominator + scores[c]
             for c in cutlass.range_constexpr(self.candidates):
                 scores[c] = div_rn_f32(scores[c], denominator)
+                if cutlass.const_expr(self.diagnostic):
+                    if tid == Int64(0):
+                        out[Int64(4) * stride + base + Int64(2 + 2 * self.candidates + c)] = scores[c]
         for j in cutlass.range_constexpr(self.elements):
             value = current[j]
             if cutlass.const_expr(self.has_mix):
@@ -179,13 +195,16 @@ class KimiAttnResRmsNorm:
                     else:
                         candidate = _bf16_hi(packed)
                     value = value + candidate * scores[c]
+                if cutlass.const_expr(self.diagnostic):
+                    out[stride + base + tid + Int64(j * self.threads)] = value
                 value = _bf16(value)
             mixed[j] = value
             if cutlass.const_expr(self.append):
                 at = base + tid + Int64(j * self.threads)
                 arena[Int64(self.candidates - 1) * stride + at] = current[j].to(BFloat16)
         _normalize_bf16(mixed, norm_weight, out, base, tid, sums,
-                        Int32(2 * self.candidates), eps, self.hidden, self.threads)
+                        Int32(2 * self.candidates), eps, self.hidden, self.threads,
+                        self.diagnostic, stride)
 
 
 class KimiSitu:
