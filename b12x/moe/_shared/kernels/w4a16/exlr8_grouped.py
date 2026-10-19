@@ -76,7 +76,7 @@ def decode_tile_half(payload: Int64, tile: Int32, lane: Int32, warp: Int32,
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 5
+    CODE_VERSION = 6
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -141,7 +141,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                    down: cutlass.Constexpr, scale: Float32, live: cute.Tensor):
         acc = cute.make_rmem_tensor((self.mtiles, 4), Float32)
         acc.fill(Float32(0.0))
-        for k16 in cutlass.range_constexpr(8):
+        for k16 in cutlass.range(8, unroll=1):
             tile = (input_block * Int32(8) + Int32(k16)) * Int32(8) + nquad * Int32(2) + warp // Int32(2)
             if cutlass.const_expr(down):
                 tile = output_block * Int32(64) + Int32(k16 * 8) + nquad * Int32(2) + warp // Int32(2)
