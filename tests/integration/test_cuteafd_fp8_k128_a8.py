@@ -113,6 +113,7 @@ def test_native_a8(rows):
         experts = meta[META_HEAD+3*e:META_HEAD+3*e+tile_count].repeat_interleave(16)
         gu, down = region(5, torch.bfloat16, 2*i), region(9, torch.bfloat16, h)
         differences = [0, 0, 0]
+        official_gu = gu.clone()
         for expert in range(e):
             positions = torch.where((experts == expert) & live[:tile_count*16])[0]
             if not positions.numel():
@@ -122,11 +123,40 @@ def test_native_a8(rows):
                 want = official_module().fp8_gemm(candidate_q[positions].contiguous(),
                     candidate_s[positions].contiguous(), ws[wi][expert], ws[wi+1][expert])
                 differences[half] += (gu[positions, half*i:(half+1)*i] != want).sum().item()
+                official_gu[positions, half*i:(half+1)*i] = want
             want = official_module().fp8_gemm(down_q[positions].contiguous(),
                 down_s[positions].contiguous(), ws[4][expert], ws[5][expert])
             differences[2] += (down[positions] != want).sum().item()
         print(f"stage quant_input=exact quant_down=exact projection_differences={differences}")
+        import cutlass
+        from cutlass import cute
+        from cutlass.cute.runtime import from_dlpack
+        from cuda.bindings import driver as cuda
+        from b12x.integration.cuteafd._fp8_moe_a8 import QuantizeK128, GroupedK128Gemm
+        from b12x.integration.cuteafd._fp8_moe_kernels import MoeSwiGLU, MoeCombine
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        def run_kernel(kernel, tensors, scalars):
+            args = [from_dlpack(t).iterator for t in tensors]
+            compiled = cute.compile(kernel, *args, *[cutlass.Int32(v) for v in scalars], stream)
+            compiled(*args, *scalars, stream)
+        run_kernel(MoeSwiGLU(inter=i, limit=7, activation=g.activation), [official_gu, meta, act], [grouped])
+        # QuantizeK128 has its row scalar before the unused gather pointer.
+        args = [from_dlpack(t).iterator for t in (act, down_q, down_s)]
+        pp = from_dlpack(pair_rows).iterator
+        quant = cute.compile(QuantizeK128(i), *args, cutlass.Int32(grouped), pp, stream)
+        quant(*args, grouped, pp, stream)
+        run_kernel(GroupedK128Gemm(h, i, e), [down_q, down_s, meta, ws[4], ws[5], ws[4], ws[5], down], [tile_count])
+        injected = torch.empty_like(x)
+        pair_pos = scratch[offsets[2]:offsets[2]+regions[2]].view(torch.int32)
+        run_kernel(MoeCombine(hidden=h, top_k=topk), [down, pair_pos, routes, injected], [rows])
     expected, fp64 = reference(x, ids, routes, ws, "official"), reference(x, ids, routes, ws, True)
+    if rows == 640:
+        injected_error = (injected.float() - fp64.float()).square().sum()
+        positions = (actual.float() - expected.float()).square().sum(1).topk(3).indices
+        print(f"injected_official_gu sse={injected_error.item():.9g} "
+              f"mismatches={(injected != expected).sum().item()} worst_rows={positions.tolist()} "
+              f"native_row_sse={(actual[positions].float()-fp64[positions].float()).square().sum(1).tolist()} "
+              f"official_row_sse={(expected[positions].float()-fp64[positions].float()).square().sum(1).tolist()}")
     error = (actual.float() - fp64.float()).square().sum(1)
     official = (expected.float() - fp64.float()).square().sum(1)
     over = error > official * 1.01
