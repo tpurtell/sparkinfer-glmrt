@@ -444,13 +444,15 @@ class NativeTileLinear:
                             for mt in cutlass.range_constexpr(4):
                                 if Int32(mt) < live:
                                     xa = cute.make_rmem_tensor((16,), Uint32)
+                                    xa.fill(Uint32(0))
                                     for hh in cutlass.range_constexpr(2):
                                         r = Int32(16 * mt + 8 * hh) + g
-                                        at = x_base + (r.to(Int64) * Int64(self.k) + k0.to(Int64)) * Int64(2)
-                                        lo = _ld_cached_pred(at, r, rows)
-                                        hi = _ld_cached_pred(at + Int64(16), r, rows)
-                                        for i in cutlass.range_constexpr(4):
-                                            xa[8 * hh + i], xa[8 * hh + 4 + i] = lo[i], hi[i]
+                                        if r < rows:
+                                            at = x_base + (r.to(Int64) * Int64(self.k) + k0.to(Int64)) * Int64(2)
+                                            lo = _ld_cached(at)
+                                            hi = _ld_cached(at + Int64(16))
+                                            for i in cutlass.range_constexpr(4):
+                                                xa[8 * hh + i], xa[8 * hh + 4 + i] = lo[i], hi[i]
                                     for gi in cutlass.range_constexpr(G):
                                         self._mma_chunk(acc, 4 * (mt * G + gi), xa, bw, gi, sc)
                     for i in cutlass.range_constexpr(self.wpb):
@@ -533,12 +535,13 @@ class NativeTileLinear:
         row0 = m0 + r0
         src0 = x.iterator.toint() + (row0.to(Int64) * Int64(self.k)
                                      + kc.to(Int64) * Int64(64) + (c * Int32(8)).to(Int64)) * Int64(2)
+        r_step = self.prefill_threads // 8
         for i in cutlass.range_constexpr((self.a_bytes // 16 + self.prefill_threads - 1) // self.prefill_threads):
             pred = Int32(0)
-            if row0 + Int32(i * 32) < rows:
+            if row0 + Int32(i * r_step) < rows:
                 pred = Int32(1)
-            cp_async4_shared_global_pred(sa_off + Int32(i * 32 * 128),
-                                         src0 + Int64(i * 32 * self.k * 2), pred)
+            cp_async4_shared_global_pred(sa_off + Int32(i * r_step * 128),
+                                         src0 + Int64(i * r_step * self.k * 2), pred)
         per_col = self.wbytes // 16
         for i in cutlass.range_constexpr((self.w_bytes // 16 + self.prefill_threads - 1) // self.prefill_threads):
             chunk = Int32(i * self.prefill_threads) + tid
