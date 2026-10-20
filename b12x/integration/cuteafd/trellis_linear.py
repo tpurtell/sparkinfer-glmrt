@@ -47,7 +47,11 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
 class _Pointers:
     def __init__(self, g):
         from b12x.gemm.trellis_linear._native import NativeTrellisLinear
-        self.core = NativeTrellisLinear(g)
+        if g.get("wide", False):
+            from b12x.gemm.trellis_linear._wide import WideTrellisLinear
+            self.core = WideTrellisLinear(g)
+        else:
+            self.core = NativeTrellisLinear(g)
 
     @cute.jit
     def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
@@ -65,9 +69,13 @@ class _Pointers:
 
 def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
                                codebook="e4m3", sharded_side=1,
-                               rotation_count=4, max_rows=4096):
+                               rotation_count=4, max_rows=4096, wide=False):
     g = geometry(input_features, output_features, bits=bits, codebook=codebook,
                  sharded_side=sharded_side, rotation_count=rotation_count, max_rows=max_rows)
+    if type(wide) is not bool or (wide and (bits != 6 or codebook not in ("mcg", "mul1"))):
+        raise ValueError("wide trellis requires K6 mcg/mul1 and a boolean selector")
+    if wide:
+        g["wide"] = True
     k, n, s = g["input_features"], g["output_features"], g["splits"]
     operands = (
         Operand("rotated_inputs", torch.int64, f"[{rotation_count}]"),

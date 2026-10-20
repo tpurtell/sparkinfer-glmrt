@@ -52,6 +52,7 @@ def main():
     parser.add_argument("--rows", default="1,64,256")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
+    parser.add_argument("--wide", action="store_true", help="also benchmark cooperative wide native K6")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     import torch
@@ -96,13 +97,15 @@ def main():
                 egress=compile_trellis_output_aot(features=n,output_dtype="f32" if n==163840 else "bf16",max_rows=capacity)
             ingress=exported(ingress,directory,"input_transform")
             egress=exported(egress,directory,"output_transform")
-        for codebook in ("mcg", "mul1", "bf16"):
-            print(f"compiling {shape} {codebook}", flush=True)
+        names = ["mcg", "mul1", "bf16"] + (["wide_mcg", "wide_mul1"] if args.wide else [])
+        for name in names:
+            print(f"compiling {shape} {name}", flush=True)
             with exportable_compilation():
-                program = compile_bf16_projection_aot(width=k, outputs=n) if codebook == "bf16" else \
+                program = compile_bf16_projection_aot(width=k, outputs=n) if name == "bf16" else \
                     compile_trellis_linear_aot(input_features=k, output_features=n, bits=6,
-                        codebook=codebook, sharded_side=side, rotation_count=1, max_rows=capacity)
-            arms[codebook] = exported(program, directory, codebook)
+                        codebook=name.removeprefix("wide_"), sharded_side=side, rotation_count=1,
+                        max_rows=capacity, wide=name.startswith("wide_"))
+            arms[name] = exported(program, directory, name)
         for rows in rows_list:
             graphs = {}
             for name, lib in arms.items():
@@ -148,7 +151,7 @@ def main():
                     samples[name].append(start.elapsed_time(end)*1000)
             medians = {name: statistics.median(values) for name, values in samples.items()}
             record = dict(k=k, n=n, side=side, rows=rows, us=medians, samples_us=samples,
-                          speedup={name: medians["bf16"]/medians[name] for name in ("mcg", "mul1")})
+                          speedup={name: medians["bf16"]/medians[name] for name in arms if name != "bf16"})
             records.append(record)
             print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
             (args.output_dir / "report.json").write_text(json.dumps(dict(metadata=metadata, records=records), indent=2)+"\n")
