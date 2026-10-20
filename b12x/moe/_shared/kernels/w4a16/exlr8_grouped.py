@@ -134,6 +134,17 @@ def bind_loop_i32(val: Int32, dep: Int32, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
+def shfl_sync_idx_i32(val: Int32, src_lane: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(
+        T.i32(),
+        [Int32(val).ir_value(loc=loc, ip=ip), Int32(src_lane).ir_value(loc=loc, ip=ip)],
+        "shfl.sync.idx.b32 $0, $1, $2, 31, -1;",
+        "=r,r,r",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def shfl_sync_idx_i64(val: Int64, src_lane: Int32, *, loc=None, ip=None) -> Int64:
     return Int64(llvm.inline_asm(
         T.i64(),
@@ -338,7 +349,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 20
+    CODE_VERSION = 21
     CTAS_PER_SM = 2
     # Warp-specialized FC1 (deepseek3). One CTA per SM with 384 threads and a
     # setmaxnreg split. Ring depths keep the whole layout inside the 99 KiB
@@ -879,24 +890,29 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             ghdr += Int32(1)
 
             if width != Int32(0):
-                valid = (sr >= Int32(0)).to(Int32)
-                safe = max(sr, Int32(0))
-                row_base = x_addr + safe.to(Int64) * Int64(2 * self.hidden_size)
-                dst_base = (base + Int32(self.ws_a_off) + idx * Int32(4096)
-                            + r * Int32(256))
+                # Coalesced A gather: every lane copies one 16 B chunk of each row in its
+                # own tile, so a half-warp covers one token row's whole 256 B. The row's
+                # stream id is broadcast from the lane that owns it; the shared stores keep
+                # the consumer's 16 B chunk swizzle.
+                tile_dst = base + Int32(self.ws_a_off) + idx * Int32(4096)
+                chunk = ptid & Int32(15)
+                src_lane_off = lane & Int32(16)
                 for b in cutlass.range(Int32(self.blocks)):
                     aslot = apub & Int32(na - 1)
                     _ws_mbar_wait(
                         base + Int32(self.ws_bar_a_empty) + aslot * Int32(WS_BARRIER_BYTES),
                         ((apub >> Int32(na_shift)) & Int32(1)) ^ Int32(1),
                     )
-                    blk_base = row_base + b.to(Int64) * Int64(256)
-                    dst = dst_base + aslot * Int32(self.ws_a_slot)
-                    for c in cutlass.range_constexpr(16):
-                        p = Int32(c) ^ (r & Int32(7))
+                    dst = tile_dst + aslot * Int32(self.ws_a_slot)
+                    for i in cutlass.range_constexpr(16):
+                        sr_i = shfl_sync_idx_i32(sr, Int32(i) + src_lane_off)
+                        valid = (sr_i >= Int32(0)).to(Int32)
+                        safe_i = max(sr_i, Int32(0))
+                        p = chunk ^ (Int32(i) & Int32(7))
                         cp_async4_shared_global_ca_pred(
-                            dst + p * Int32(16),
-                            blk_base + Int64(16 * c),
+                            dst + Int32(i) * Int32(256) + p * Int32(16),
+                            x_addr + safe_i.to(Int64) * Int64(2 * self.hidden_size)
+                            + b.to(Int64) * Int64(256) + Int64(16) * chunk.to(Int64),
                             valid,
                         )
                     _ws_cp_async_mbar_arrive_noinc(
