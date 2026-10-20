@@ -187,7 +187,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 16
+    CODE_VERSION = 17
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -197,7 +197,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         if group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped group_rows must be 16, 32 or 64")
         self.shared_memory_bytes = query_optin_shared_memory()
-        required = group_rows * 256 + 8192 + max(1, self.mtiles - 1) * 8192
+        # 48 KiB of A/B stage ring, so two CTAs stay resident at 128 registers.
+        # The ring depth is per live-M-tile count (see fc1_stage_depths):
+        # A is shared by the group's other units and lands in L2, B is the cold
+        # stream, and the tile-2/tile-3 split planes sit above the B ring.
+        required = 49152
         if self.shared_memory_bytes is not None and required > self.shared_memory_bytes:
             raise ValueError(f"EXLR8 grouped needs {required} B shared memory, above "
                              f"the device's {self.shared_memory_bytes} B opt-in limit")
@@ -239,6 +243,21 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 block=(256, 1, 1), stream=stream)
 
     @cute.jit
+    def fc1_stage_depths(self, num_live_m: Int32):
+        """A/B stage-ring depths that fit 48 KiB for this many live M tiles.
+
+        An A stage is num_live_m * 4096 B of F16 rows, a B stage is 8192 B of
+        packed trellis words (width 4). Both streams are consumed by the same
+        MMA, so they advance on one ring and share a lead:
+        m=1 -> A4+B4 (lead 3), m=2 -> A3+B3 (lead 2), m=3 -> A2+B2 (lead 1,
+        plus the 8 KiB tile-2 split plane), m=4 -> A1+B2 (A single-buffered,
+        plus both split planes).
+        """
+        is4 = (num_live_m == Int32(4)).to(Int32)
+        a_depth = Int32(5) - num_live_m
+        return a_depth, a_depth + is4, num_live_m * Int32(4096)
+
+    @cute.jit
     def prepare_group_tiles(self, route_slots: cute.Tensor, group: Int32, rows: Int32,
                             tid: Int32, lane: Int32, shared_a: Int32,
                             smem_thread_off: Int32, down: cutlass.Constexpr):
@@ -260,6 +279,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         live_m[idx] = Int32(m)
                 num_live_m += Int32(1)
         r_s = tid >> Int32(4)
+        a_depth, _, a_stage_smem = self.fc1_stage_depths(num_live_m)
+        if down:
+            a_depth = Int32(1)
         for idx in cutlass.range_constexpr(self.mtiles):
             if Int32(idx) < num_live_m:
                 m = live_m[idx]
@@ -268,11 +290,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 if slot_s >= Int32(0) and slot_s < max_slot:
                     srow[idx] = local_row if cutlass.const_expr(down) else (slot_s // Int32(self.top_k))
                 else:
-                    st_shared_v4_u32(shared_a + Int32(idx * 4096) + smem_thread_off,
-                                     Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                    if cutlass.const_expr(not down and self.mtiles == 4):
-                        if num_live_m <= Int32(3) and Int32(idx) < Int32(3):
-                            st_shared_v4_u32(shared_a + Int32(12288 + idx * 4096) + smem_thread_off,
+                    for stage in cutlass.range_constexpr(4):
+                        if Int32(stage) < a_depth:
+                            st_shared_v4_u32(shared_a + stage * a_stage_smem + Int32(idx * 4096)
+                                             + smem_thread_off,
                                              Uint32(0), Uint32(0), Uint32(0), Uint32(0))
         return num_live_m, live_m, srow
 
@@ -457,10 +478,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         @cute.struct
         class Storage:
             words: cute.struct.Align[
-                cute.struct.MemRange[
-                    Uint32,
-                    self.group_rows * 64 + 2048 + max(1, self.mtiles - 1) * 2048
-                ], 1024]
+                cute.struct.MemRange[Uint32, 12288], 1024]
 
         storage = smem.allocate(Storage)
         shared_a = shared_ptr_to_u32(storage.words.data_ptr())
@@ -513,20 +531,30 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 if slot_out >= Int32(0) and slot_out < max_slot:
                                     out_meta = out_meta | Int32(1 << (8 + idx * 2 + v))
 
-                    a_ping_pong = (num_live_m <= Int32(3)) if cutlass.const_expr(self.mtiles == 4) else False
-                    a_stride_smem = Int32(12288) if a_ping_pong else Int32(0)
-                    shared_b0 = (
-                        shared_a + (Int32(24576) if a_ping_pong else Int32(16384))
-                        if cutlass.const_expr(self.mtiles == 4)
-                        else shared_a + Int32(self.group_rows * 256)
-                    )
+                    a_depth, b_depth, a_stage_smem = self.fc1_stage_depths(num_live_m)
+                    b_stage_smem = Int32(8192)
+                    shared_b0 = shared_a + a_depth * a_stage_smem
                     shared_c2 = shared_a + Int32(40960)
                     shared_c3 = shared_a + Int32(32768)
+                    single_a = a_depth == Int32(1)
 
-                    self.stage_a_async(shared_a, x_addr, srow, num_live_m, Int32(0),
-                                       smem_thread_off, col_s, self.hidden_size, self.mtiles)
-                    self.stage_b_async_dyn(shared_b0, payload, Int32(0), tid, width)
-                    cute.arch.cp_async_commit_group()
+                    if single_a:
+                        # One A buffer: B leads by b_depth-1 blocks, A is staged
+                        # after this block's MMA so it never races the read.
+                        self.stage_a_async(shared_a, x_addr, srow, num_live_m, Int32(0),
+                                           smem_thread_off, col_s, self.hidden_size, self.mtiles)
+                        self.stage_b_async_dyn(shared_b0, payload, Int32(0), tid, width)
+                        cute.arch.cp_async_commit_group()
+                    else:
+                        # Ring of a_depth stages, blocks 0 .. a_depth-2 in flight.
+                        for stage in cutlass.range_constexpr(3):
+                            if Int32(stage) < a_depth - Int32(1):
+                                self.stage_a_async(shared_a + stage * a_stage_smem, x_addr, srow,
+                                                   num_live_m, Int32(stage), smem_thread_off, col_s,
+                                                   self.hidden_size, 3)
+                                self.stage_b_async_dyn(shared_b0 + stage * b_stage_smem, payload,
+                                                       Int32(stage), tid, width)
+                                cute.arch.cp_async_commit_group()
                     next_scale = ld_global_b16(scales)
 
                     for split in cutlass.range(self.splits):
@@ -535,26 +563,43 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         for block in cutlass.range(8):
                             kb = kb0 + block
                             if kb < Int32(self.blocks):
-                                parity = kb & Int32(1)
-                                next_parity = (kb + Int32(1)) & Int32(1)
-                                cur_a = shared_a + parity * a_stride_smem
-                                next_a = shared_a + next_parity * a_stride_smem
-                                cur_b = shared_b0 + parity * Int32(8192)
-                                next_b = shared_b0 + next_parity * Int32(8192)
-                                has_next = (kb + Int32(1)) < Int32(self.blocks)
+                                cur_a = shared_a + (kb % a_depth) * a_stage_smem
+                                cur_b = shared_b0 + (kb % b_depth) * b_stage_smem
                                 cur_scale = next_scale
 
-                                cute.arch.cp_async_wait_group(0)
+                                if single_a:
+                                    cute.arch.cp_async_wait_group(0)
+                                elif a_depth == Int32(4):
+                                    cute.arch.cp_async_wait_group(2)
+                                elif a_depth == Int32(3):
+                                    cute.arch.cp_async_wait_group(1)
+                                else:
+                                    cute.arch.cp_async_wait_group(0)
                                 cute.arch.sync_threads()
 
-                                if has_next:
-                                    next_scale = ld_global_b16(scales + (kb + Int32(1)).to(Int64) * Int64(2))
-                                    if cutlass.const_expr(self.mtiles == 4):
-                                        if a_ping_pong:
-                                            self.stage_a_async(next_a, x_addr, srow, num_live_m, kb + Int32(1),
-                                                               smem_thread_off, col_s, self.hidden_size, 3)
-                                    self.stage_b_async_dyn(next_b, payload, kb + Int32(1), tid, width)
+                                if single_a:
+                                    ahead_b = kb + b_depth - Int32(1)
+                                    if ahead_b < Int32(self.blocks):
+                                        self.stage_b_async_dyn(
+                                            shared_b0 + (ahead_b % b_depth) * b_stage_smem,
+                                            payload, ahead_b, tid, width)
                                     cute.arch.cp_async_commit_group()
+                                else:
+                                    ahead = kb + a_depth - Int32(1)
+                                    if ahead < Int32(self.blocks):
+                                        self.stage_a_async(
+                                            shared_a + (ahead % a_depth) * a_stage_smem, x_addr, srow,
+                                            num_live_m, ahead, smem_thread_off, col_s,
+                                            self.hidden_size, 3)
+                                        self.stage_b_async_dyn(
+                                            shared_b0 + (ahead % b_depth) * b_stage_smem,
+                                            payload, ahead, tid, width)
+                                    # One commit per block either way, so the wait
+                                    # count above stays exact through the tail.
+                                    cute.arch.cp_async_commit_group()
+
+                                if (kb + Int32(1)) < Int32(self.blocks):
+                                    next_scale = ld_global_b16(scales + (kb + Int32(1)).to(Int64) * Int64(2))
 
                                 if width == Int32(2):
                                     self.accumulate(total, cur_a, cur_b, lane, warp, 2, cur_scale, num_live_m)
@@ -563,10 +608,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 elif width == Int32(4):
                                     self.accumulate(total, cur_a, cur_b, lane, warp, 4, cur_scale, num_live_m)
 
-                                if has_next and not a_ping_pong:
-                                    cute.arch.sync_threads()
-                                    self.stage_a_async(shared_a, x_addr, srow, num_live_m, kb + Int32(1),
-                                                       smem_thread_off, col_s, self.hidden_size, self.mtiles)
+                                if single_a:
+                                    if (kb + Int32(1)) < Int32(self.blocks):
+                                        cute.arch.sync_threads()
+                                        self.stage_a_async(shared_a, x_addr, srow, num_live_m,
+                                                           kb + Int32(1), smem_thread_off, col_s,
+                                                           self.hidden_size, self.mtiles)
                                     cute.arch.cp_async_commit_group()
 
                         for v in cutlass.range_constexpr(8):
