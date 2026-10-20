@@ -379,7 +379,27 @@ def comparison_route_ids(rows, generator):
                         for _ in range(rows)])
 
 
-def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8, owned=None):
+def serial_scratch(hidden, units, groups, shared=None):
+    shapes = {"fc1": ((groups, units, 2, (hidden+1023)//1024, 16, 128), torch.float32),
+              "intermediate": ((groups, units, 16, 128), torch.float16),
+              "fc2": ((groups, 16, hidden), torch.float32)}
+    if shared is None:
+        return {name: torch.empty(shape, dtype=dtype, device="cuda")
+                for name, (shape, dtype) in shapes.items()}
+    for name, (shape, dtype) in shapes.items():
+        count = 1
+        for extent in shape:
+            count *= extent
+        tensor = shared[name]
+        if tensor.dtype != dtype or not tensor.is_contiguous() or tensor.numel() < count:
+            raise ValueError(f"shared {name} scratch cannot hold the serial arm")
+    # Arms and graph replays run sequentially on one stream; only raw pointers
+    # cross the kernel ABI, so the larger grouped shape needs no serial view.
+    return {name: shared[name] for name in shapes}
+
+
+def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8, owned=None,
+                   scratch=None):
     """Synthetic K4 payloads, replicated into enough distinct layers that a
     replay over them streams every weight from DRAM (cold L2)."""
     owners = []
@@ -411,9 +431,7 @@ def make_candidate(l2_bytes, experts=256, hidden=6144, units=4, topk=8, owned=No
                 route_group_lane=torch.full((64,topk),-1,dtype=torch.int32,device="cuda"),
                 group_count=torch.zeros(1,dtype=torch.int32,device="cuda"),
                 activation=torch.empty((64,hidden),dtype=torch.float16,device="cuda"),
-                fc1=torch.empty((groups,units,2,(hidden+1023)//1024,16,128),device="cuda"),
-                intermediate=torch.empty((groups,units,16,128),dtype=torch.float16,device="cuda"),
-                fc2=torch.empty((groups,16,hidden),device="cuda"),
+                **serial_scratch(hidden, units, groups, scratch),
                 output=torch.empty((64,hidden),dtype=torch.bfloat16,device="cuda"),
                 control_output=torch.empty((64,hidden),device="cuda"),
                 control_x=torch.empty((64,hidden),dtype=torch.float16,device="cuda"))
@@ -752,13 +770,14 @@ def grouped_main(args):
     owned, width = (rank_geometry(args.world, args.rank, args.layer)
                     if args.world is not None else (None, 512))
     units = 16 if owned is not None else 4
-    t = make_candidate(l2, units=units, owned=owned)
+    group_rows = args.group_rows
+    capacity = (4096*8 + group_rows-1)//group_rows + 256
+    state = buffers(4096, 6144, units, 8, capacity, group_rows)
+    t = make_candidate(l2, units=units, owned=owned, scratch=state)
     control = ((compile_exlr8_a16_aot(units=units, device_count=True),
                 compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=512))
                if owned is not None else compile_control(args.control_core, args.control_glue))
     limit = int(props.multi_processor_count) * 4
-    group_rows = args.group_rows
-    capacity = (4096*8 + group_rows-1)//group_rows + 256
     group = compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=capacity,
                                     max_rows=4096, group_rows=group_rows)
     grouped = compile_exlr8_a16_aot(units=units, top_k=8, max_groups=capacity,
@@ -769,7 +788,6 @@ def grouped_main(args):
     # Legacy keeps the historical uniform baseline. Explicit geometry uses
     # the sealed GLM serving package ABI, with every synthetic route in K4.
     exl_layers = prepare_comparison_layers(len(t["tables"]), width, owned is not None)
-    state = buffers(4096, 6144, units, 8, capacity, group_rows)
     compact = compact_unit_descriptors(t["bits"])
     mixed_states = ([grouped_mixed_state(4096, ts, props) for ts in exl_layers]
                     if owned is None else [])

@@ -160,6 +160,45 @@ def test_serial_k4_cold_layers_reuse_one_workspace():
     assert all(result[1] is allocated[0] for result in states)
 
 
+def test_sequential_exlr8_arms_alias_grouped_scratch():
+    from types import SimpleNamespace
+    function = next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "serial_scratch")
+    allocations = []
+    class Tensor:
+        def __init__(self, shape, dtype, contiguous=True):
+            self.shape, self.dtype, self.contiguous = shape, dtype, contiguous
+        def numel(self):
+            import math
+            return math.prod(self.shape)
+        def is_contiguous(self):
+            return self.contiguous
+    def empty(shape, dtype, device):
+        assert device == "cuda"
+        result = Tensor(shape, dtype)
+        allocations.append(result)
+        return result
+    scope = {"torch": SimpleNamespace(float32="f32", float16="f16", empty=empty)}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(SOURCE), "exec"), scope)
+    scratch = scope["serial_scratch"]
+    serial = scratch(6144, 16, 512)
+    assert len(allocations) == 3
+    grouped = {"fc1": Tensor((768, 16, 2, 6, 64, 128), "f32"),
+               "intermediate": Tensor((768, 16, 64, 128), "f16"),
+               "fc2": Tensor((768, 64, 6144), "f32")}
+    alias = scratch(6144, 16, 512, grouped)
+    assert len(allocations) == 3
+    assert all(alias[name] is grouped[name] for name in serial)
+    assert sum(t.numel() * (2 if t.dtype == "f16" else 4)
+               for t in serial.values()) == 1040187392
+    for invalid in (Tensor((1,), "f32"), Tensor(grouped["fc1"].shape, "f16"),
+                    Tensor(grouped["fc1"].shape, "f32", contiguous=False)):
+        with pytest.raises(ValueError, match="shared fc1 scratch"):
+            scratch(6144, 16, 512, dict(grouped, fc1=invalid))
+    text = SOURCE.read_text()
+    assert 't = make_candidate(l2, units=units, owned=owned, scratch=state)' in text
+
+
 def test_compact_ownership_cpu():
     torch = pytest.importorskip("torch")
     path = SOURCE.parents[1] / "b12x/integration/cuteafd/exlr8.py"
