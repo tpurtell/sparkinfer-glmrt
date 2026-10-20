@@ -62,10 +62,19 @@ def ld_shared_u32_offset(base_addr: Int32, offset: int, *, loc=None, ip=None) ->
 
 
 @dsl_user_op
+def ld_shared_ring_u32_offset(base_addr: Int32, offset: int, *, loc=None, ip=None) -> Uint32:
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Int32(base_addr).ir_value(loc=loc, ip=ip)],
+        f"ld.shared.b32 $0, [$1 + {int(offset)}];", "=r,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def pipeline_barrier(barrier: int, arrive: bool, *, loc=None, ip=None):
     op = "arrive" if arrive else "sync"
     llvm.inline_asm(
-        None, [], f"bar.{op} {barrier}, 512;", "",
+        None, [], f"bar.{op} {barrier}, 512;", "~{memory}",
         has_side_effects=True, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
@@ -184,7 +193,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 13
+    CODE_VERSION = 14
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -447,10 +456,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             for k16 in cutlass.range_constexpr(8):
                 pipeline_barrier(1 + k16 % 2, False)
                 source = shared_d + Int32((k16 % 2) * 4096) + (warp * Int32(32) + lane) * Int32(16)
-                b0 = ld_shared_u32_offset(source, 0)
-                b1 = ld_shared_u32_offset(source, 4)
-                b2 = ld_shared_u32_offset(source, 8)
-                b3 = ld_shared_u32_offset(source, 12)
+                b0 = ld_shared_ring_u32_offset(source, 0)
+                b1 = ld_shared_ring_u32_offset(source, 4)
+                b2 = ld_shared_ring_u32_offset(source, 8)
+                b3 = ld_shared_ring_u32_offset(source, 12)
                 col = Int32(k16 * 2) + c_half
                 addr_k16 = shared_a + (r_m * Int32(16) + (col ^ (r_m & Int32(7)))) * Int32(16)
                 for idx in cutlass.range_constexpr(m_live):
@@ -614,7 +623,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             c4, c5, c6, c7 = ld_shared_v4_f32(c_addr + Int32(16))
                             total[idx + 1, 0], total[idx + 1, 1], total[idx + 1, 2], total[idx + 1, 3] = c0, c1, c2, c3
                             total[idx + 1, 4], total[idx + 1, 5], total[idx + 1, 6], total[idx + 1, 7] = c4, c5, c6, c7
-    
+
                         col0 = warp * Int32(16) + (lane & Int32(3)) * Int32(2)
                         group_base = group.to(Int64) * Int64(self.group_rows)
                         fc1_addr = fc1.iterator.toint()
