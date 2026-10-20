@@ -228,7 +228,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 28
+    CODE_VERSION = 29
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -276,14 +276,14 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     half_cta_limit if rows <= Int32(2048) else full_cta_limit
                 )
                 slice_blocks = (
-                    Int32(4) if rows <= Int32(384)
-                    else (Int32(2) if rows <= Int32(768)
-                          else (Int32(1) if rows <= Int32(2048) else Int32(48)))
+                    Int32(6) if rows <= Int32(512)
+                    else (Int32(3) if rows <= Int32(1024)
+                          else (Int32(8) if rows <= Int32(2048) else Int32(48)))
                 )
                 slice_shift = (
-                    Int32(2) if rows <= Int32(384)
-                    else (Int32(1) if rows <= Int32(768)
-                          else (Int32(0) if rows <= Int32(2048) else Int32(4)))
+                    Int32(1) if rows <= Int32(512)
+                    else (Int32(0) if rows <= Int32(1024)
+                          else (Int32(3) if rows <= Int32(2048) else Int32(4)))
                 )
                 slice_base = Int32(0)
                 while slice_base < Int32(48):
