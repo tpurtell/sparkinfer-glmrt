@@ -178,8 +178,8 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 16
-    CTAS_PER_SM = 4
+    CODE_VERSION = 17
+    CTAS_PER_SM = 3
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True)
@@ -420,7 +420,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 logical = ((group * unit_limit + k) * Int32(2) + proj) * Int32(self.splits) + split
                 desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
                 width = bits[desc]
-                num_live_m, live_m, srow = self.prepare_group_tiles(
+                num_live_m, _unused_live_m, srow = self.prepare_group_tiles(
                     route_slots, group, rows, tid, lane, shared_a, smem_thread_off, False,
                     half * Int32(self.half_tiles))
                 cute.arch.sync_threads()
@@ -453,6 +453,23 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     group_base = group.to(Int64) * Int64(self.group_rows)
                     fc1_addr = fc1.iterator.toint()
                     max_slot = rows * Int32(self.top_k)
+                    # Rebuild the compact live-tile map in the epilogue: carrying it
+                    # across the K loop held two registers at the resident-CTA limit
+                    # and made ptxas spill the A column base to local memory.
+                    live_m = cute.make_rmem_tensor(self.half_tiles, Int32)
+                    live_m.fill(Int32(0))
+                    live_rank = Int32(0)
+                    half_rank = task % Int32(self.m_halves)
+                    for mi in cutlass.range_constexpr(self.half_tiles):
+                        m_ep = half_rank * Int32(self.half_tiles) + Int32(mi)
+                        local_ep = m_ep * Int32(16) + (lane & Int32(15))
+                        slot_ep = route_slots[group_base + local_ep.to(Int64)]
+                        if cute.arch.vote_ballot_sync(
+                                (slot_ep >= Int32(0)) & (slot_ep < max_slot)) != Uint32(0):
+                            for idx in cutlass.range_constexpr(self.half_tiles):
+                                if live_rank == Int32(idx):
+                                    live_m[idx] = m_ep
+                            live_rank += Int32(1)
                     for idx in cutlass.range_constexpr(self.half_tiles):
                         if Int32(idx) < num_live_m:
                             m = live_m[idx]
