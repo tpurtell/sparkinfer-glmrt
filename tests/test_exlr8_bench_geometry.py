@@ -158,3 +158,28 @@ def test_serial_k4_cold_layers_reuse_one_workspace():
     assert len(allocated) == 1
     assert all(result[0] is original for result, original in zip(states, layers))
     assert all(result[1] is allocated[0] for result in states)
+
+
+def test_compact_ownership_cpu():
+    torch = pytest.importorskip("torch")
+    path = SOURCE.parents[1] / "b12x/integration/cuteafd/exlr8.py"
+    tree = ast.parse(path.read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "compact_unit_descriptors")
+    scope = {"torch": torch}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), scope)
+    build = scope["compact_unit_descriptors"]
+    owned, _ = rank_geometry(6, 0, 3)
+    bits = torch.zeros((256, 16, 3), dtype=torch.int32)
+    for expert, units in enumerate(owned):
+        bits[expert, list(units)] = torch.tensor([2, 3, 4], dtype=torch.int32)
+    counts, mapping, limit = build(bits)
+    assert limit == 3 and int(counts.sum()) == sum(map(len, owned))
+    for expert, units in enumerate(owned):
+        assert mapping[expert, :counts[expert]].tolist() == list(units)
+        assert not bool(mapping[expert, counts[expert]:].any())
+    zero = build(torch.zeros_like(bits))
+    assert zero[2] == 1 and not bool(zero[0].any())
+    bits[0, 0, 0] = 2
+    with pytest.raises(ValueError, match="agree"):
+        build(bits)
