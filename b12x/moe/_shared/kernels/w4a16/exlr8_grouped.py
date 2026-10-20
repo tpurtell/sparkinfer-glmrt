@@ -837,17 +837,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     fc1_addr = fc1.iterator.toint()
                     group_base = group.to(Int64) * Int64(self.group_rows)
                     max_slot = rows * Int32(self.top_k)
-                    out_meta = Int32(0)
-                    if not is_prod:
-                        for idx in cutlass.range_constexpr(self.mtiles):
-                            if Int32(idx) < num_live_m:
-                                m = live_m[idx]
-                                out_meta = out_meta | (m << Int32(idx * 2))
-                                for v in cutlass.range_constexpr(2):
-                                    local_out = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
-                                    slot_out = route_slots[group_base + local_out.to(Int64)]
-                                    if slot_out >= Int32(0) and slot_out < max_slot:
-                                        out_meta = out_meta | Int32(1 << (8 + idx * 2 + v))
 
                     if cutlass.const_expr(self.fc1_producer):
                         a_ping_pong = cutlass.const_expr(ring_only)
@@ -991,6 +980,18 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 if num_live_m >= Int32(4):
                                     self.load_shared_plane(shared_c3, tid, total, 3)
 
+                    # Built after the split loop so it is not live across it.
+                    out_meta = Int32(0)
+                    if not is_prod:
+                        for idx in cutlass.range_constexpr(self.mtiles):
+                            if Int32(idx) < num_live_m:
+                                m = live_m[idx]
+                                out_meta = out_meta | (m << Int32(idx * 2))
+                                for v in cutlass.range_constexpr(2):
+                                    local_out = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                                    slot_out = route_slots[group_base + local_out.to(Int64)]
+                                    if slot_out >= Int32(0) and slot_out < max_slot:
+                                        out_meta = out_meta | Int32(1 << (8 + idx * 2 + v))
                     out_meta_f = bind_loop_i32(out_meta, num_live_m)
                     col0 = warp * Int32(16) + (lane & Int32(3)) * Int32(2)
                     proj_out_base = fc1_addr + (
