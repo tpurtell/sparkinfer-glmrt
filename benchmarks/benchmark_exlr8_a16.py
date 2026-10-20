@@ -300,8 +300,9 @@ def compile_grouped_arm(directory, candidate):
     compact = "unit_count" in (directory / "core.py").read_text()
     g["compact_units"] = compact
     g["compact_scratch"] = compact and "unit_limit * Int32(self.group_rows" in (directory / "core.py").read_text()
-    wrapper_type = getattr(modules["wrapper"], "_Exlr8CompactPointers",
-                           modules["wrapper"]._Exlr8ServingPointers)
+    wrapper_type = (getattr(modules["wrapper"], "_Exlr8CompactPointers", None)
+                    or getattr(modules["wrapper"], "_Exlr8GroupedServingPointers", None)
+                    or modules["wrapper"]._Exlr8ServingPointers)
     wrapper = object.__new__(wrapper_type)
     wrapper.core = core.Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                           g["max_groups"], g["group_rows"])
