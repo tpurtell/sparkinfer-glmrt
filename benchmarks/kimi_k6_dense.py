@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     parser.add_argument("--wide", action="store_true", help="also benchmark cooperative wide native K6")
+    parser.add_argument("--profile-wide", action="store_true", help="capture one warm wide MCG launch with the CUDA profiler API, then exit")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     import torch
@@ -97,7 +98,8 @@ def main():
                 egress=compile_trellis_output_aot(features=n,output_dtype="f32" if n==163840 else "bf16",max_rows=capacity)
             ingress=exported(ingress,directory,"input_transform")
             egress=exported(egress,directory,"output_transform")
-        names = ["mcg", "mul1", "bf16"] + (["wide_mcg", "wide_mul1"] if args.wide else [])
+        names = (["wide_mcg"] if args.profile_wide else
+                 ["mcg", "mul1", "bf16"] + (["wide_mcg", "wide_mul1"] if args.wide else []))
         for name in names:
             print(f"compiling {shape} {name}", flush=True)
             with exportable_compilation():
@@ -126,6 +128,12 @@ def main():
                             raise RuntimeError(f"output transform returned {result}")
                 run()
                 torch.cuda.synchronize()
+                if args.profile_wide:
+                    torch.cuda.cudart().cudaProfilerStart()
+                    run()
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
+                    return
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     run()
