@@ -772,8 +772,7 @@ def grouped_main(args):
     units = 16 if owned is not None else 4
     group_rows = args.group_rows
     capacity = (4096*8 + group_rows-1)//group_rows + 256
-    state = buffers(4096, 6144, units, 8, capacity, group_rows)
-    t = make_candidate(l2, units=units, owned=owned, scratch=state)
+    t = make_candidate(l2, units=units, owned=owned)
     control = ((compile_exlr8_a16_aot(units=units, device_count=True),
                 compile_exlr8_group_aot(hidden=6144, top_k=8, max_groups=512))
                if owned is not None else compile_control(args.control_core, args.control_glue))
@@ -788,6 +787,13 @@ def grouped_main(args):
     # Legacy keeps the historical uniform baseline. Explicit geometry uses
     # the sealed GLM serving package ABI, with every synthetic route in K4.
     exl_layers = prepare_comparison_layers(len(t["tables"]), width, owned is not None)
+    # Weight preparation has large transient integer tensors. Allocate grouped
+    # arenas only afterward, replacing rather than retaining serial scratch.
+    for name in ("fc1", "intermediate", "fc2"):
+        del t[name]
+    torch.cuda.empty_cache()
+    state = buffers(4096, 6144, units, 8, capacity, group_rows)
+    t.update(serial_scratch(6144, units, 512, state))
     compact = compact_unit_descriptors(t["bits"])
     mixed_states = ([grouped_mixed_state(4096, ts, props) for ts in exl_layers]
                     if owned is None else [])

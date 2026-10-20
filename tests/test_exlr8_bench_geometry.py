@@ -196,7 +196,10 @@ def test_sequential_exlr8_arms_alias_grouped_scratch():
         with pytest.raises(ValueError, match="shared fc1 scratch"):
             scratch(6144, 16, 512, dict(grouped, fc1=invalid))
     text = SOURCE.read_text()
-    assert 't = make_candidate(l2, units=units, owned=owned, scratch=state)' in text
+    assert 't.update(serial_scratch(6144, units, 512, state))' in text
+    grouped_source = text[text.index('def grouped_main('):]
+    assert grouped_source.index('exl_layers = prepare_comparison_layers') < grouped_source.index('state = buffers(')
+    assert grouped_source.index('del t[name]') < grouped_source.index('state = buffers(')
 
 
 def test_compact_ownership_cpu():
