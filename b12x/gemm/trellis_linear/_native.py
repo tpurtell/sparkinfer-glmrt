@@ -121,12 +121,14 @@ class NativeTrellisLinear:
                     for k16 in cutlass.range_constexpr(8):
                         k = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
                         a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        addr = x + (row0.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
                         if row0 < rows:
-                            addr = x + (row0.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
                             a0, a2 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
                         if row1 < rows:
-                            addr = x + (row1.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
-                            a1, a3 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
+                            # row1 is eight rows past row0; deriving its address keeps
+                            # the pair within the 128-register cap at four CTAs/SM.
+                            addr1 = addr + Int64(16 * self.k)
+                            a1, a3 = ld_global_nc_u32(addr1), ld_global_nc_u32(addr1 + Int64(16))
                         for n16 in cutlass.range_constexpr(2):
                             tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                             if cutlass.const_expr(self.input_units):
