@@ -8,6 +8,7 @@ import re
 import subprocess
 
 MODULE = "b12x/gemm/native_tile_linear.py"
+TRELLIS_MODULE = "b12x/gemm/trellis_linear/_native.py"
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 
 
@@ -29,7 +30,7 @@ def parse_references(default, values, arms):
     result = {}
     for value in values:
         op, sep, arm = value.partition("=")
-        if not sep or not re.fullmatch(r"(?:mxfp8|int4_g32|fp8_row)/[A-Za-z0-9_]+", op) or arm not in arms or op in result:
+        if not sep or not re.fullmatch(r"(?:trellis|mxfp8|int4_g32|fp8_row)/[A-Za-z0-9_]+", op) or arm not in arms or op in result:
             raise ValueError(f"invalid or duplicate op reference {value!r}")
         result[op] = arm
     return result
@@ -58,7 +59,23 @@ def materialize(repo, bundle, arms):
         target = bundle / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source)
-        manifest["arms"][name] = dict(revision=revision, sha256=digest, path=relative)
+        entry = dict(revision=revision, sha256=digest, path=relative)
+        # Trellis arms are optional so dense-only fixtures (and repositories
+        # predating the native trellis core) keep materializing.
+        try:
+            trellis = subprocess.check_output(
+                ["git", "-C", str(repo), "show", f"{revision}:{TRELLIS_MODULE}"],
+                stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            trellis_relative = f"{name}/{revision}/trellis_native.py"
+            trellis_target = bundle / trellis_relative
+            trellis_target.parent.mkdir(parents=True, exist_ok=True)
+            trellis_target.write_bytes(trellis)
+            entry.update(trellis_path=trellis_relative,
+                         trellis_sha256=hashlib.sha256(trellis).hexdigest())
+        manifest["arms"][name] = entry
     (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest["arms"]
 
@@ -79,6 +96,12 @@ def verify(bundle, arms):
             raise ValueError(f"{name}: use the pinned revision {arm['revision']}")
         if hashlib.sha256(path.read_bytes()).hexdigest() != arm["sha256"]:
             raise ValueError(f"{name}: arm source digest mismatch")
+        if "trellis_path" in arm:
+            trellis_path = (bundle / arm["trellis_path"]).resolve()
+            if not trellis_path.is_relative_to(bundle) or not re.fullmatch(r"[a-f0-9]{64}", arm["trellis_sha256"]):
+                raise ValueError("invalid arm bundle trellis path or digest")
+            if hashlib.sha256(trellis_path.read_bytes()).hexdigest() != arm["trellis_sha256"]:
+                raise ValueError(f"{name}: trellis source digest mismatch")
     return result
 
 
