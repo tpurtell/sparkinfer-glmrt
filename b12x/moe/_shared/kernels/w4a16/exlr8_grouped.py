@@ -1,11 +1,13 @@
 """Expert-major M64 EXLR8 prefill, retaining the K1 reduction tree.
 
-Each 8-warp CTA owns a full N128 unit (N16 per warp) and up to four M16 tiles.
-Each warp decodes its full 16x16 trellis tile once per K16 step and feeds both
-N8 MMA halves from a single ldmatrix of A. Live M16 tiles are compacted per
-group, A and B are staged with cp.async, a K128 accumulator is scaled
-with one pinned FMA. Independent CTAs produce the original K1024 FC1 split
-partials; activation folds them in ascending split order.
+Each 8-warp CTA owns a full N128 unit (N16 per warp) and at most two M16 tiles:
+a group of four tiles runs as two independent M32-half CTA tasks, so the live
+accumulator shape stays two tiles wide (16 F32) instead of four. Each warp
+decodes its full 16x16 trellis tile once per K16 step and feeds both N8 MMA
+halves from a single ldmatrix of A. Live M16 tiles are compacted per group, A
+and B are staged with cp.async, a K128 accumulator is scaled with one pinned
+FMA. Independent CTAs produce the original K1024 FC1 split partials; activation
+folds them in ascending split order.
 """
 from __future__ import annotations
 
@@ -176,13 +178,18 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 14
+    CODE_VERSION = 15
     CTAS_PER_SM = 3
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True)
         self.group_rows = group_rows
         self.mtiles = group_rows // 16
+        # An M32-half owns at most two M16 tiles, so the accumulator shape and
+        # register demand are fixed at two tiles regardless of the runtime
+        # live-tile count.
+        self.half_tiles = min(self.mtiles, 2)
+        self.m_halves = (self.mtiles + 1) // 2
         if group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped group_rows must be 16, 32 or 64")
         self.shared_memory_bytes = query_optin_shared_memory()
@@ -210,7 +217,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             self.grouped_fc1_kernel(x, pointers, bits, unit_count, unit_map,
                                     group_expert, route_slots, fc1, rows,
                                     group_count, unit_limit).launch(
-                grid=(min(Int32(self.max_groups * self.splits) * unit_limit * Int32(2), cta_limit), 1, 1),
+                grid=(min(Int32(self.max_groups * self.splits * self.m_halves) * unit_limit * Int32(2),
+                          cta_limit), 1, 1),
                 block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
             self.activation_kernel(pointers, bits, unit_count, unit_map,
                                    group_expert, route_slots, fc1, intermediate,
@@ -220,7 +228,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             self.grouped_fc2_kernel(pointers, bits, unit_count, unit_map,
                                     group_expert, route_slots, intermediate, fc2,
                                     rows, group_count, unit_limit).launch(
-                grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
+                grid=(min(Int32(self.max_groups * self.blocks * self.m_halves), cta_limit), 1, 1),
                 block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
             self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
                                rows, group_count).launch(
@@ -230,26 +238,28 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     @cute.jit
     def prepare_group_tiles(self, route_slots: cute.Tensor, group: Int32, rows: Int32,
                             tid: Int32, lane: Int32, shared_a: Int32,
-                            smem_thread_off: Int32, down: cutlass.Constexpr):
-        live_m = cute.make_rmem_tensor(self.mtiles, Int32)
-        srow = cute.make_rmem_tensor(self.mtiles, Int32)
+                            smem_thread_off: Int32, down: cutlass.Constexpr,
+                            tile_base: Int32):
+        live_m = cute.make_rmem_tensor(self.half_tiles, Int32)
+        srow = cute.make_rmem_tensor(self.half_tiles, Int32)
         live_m.fill(Int32(0))
         srow.fill(Int32(-1))
         num_live_m = Int32(0)
         max_slot = rows * Int32(self.top_k)
         group_base = group.to(Int64) * Int64(self.group_rows)
-        for m in cutlass.range_constexpr(self.mtiles):
-            local_check = Int32(m * 16) + (lane & Int32(15))
+        for mi in cutlass.range_constexpr(self.half_tiles):
+            m = tile_base + Int32(mi)
+            local_check = m * Int32(16) + (lane & Int32(15))
             slot_check = route_slots[group_base + local_check.to(Int64)]
             is_live = cute.arch.vote_ballot_sync(
                 (slot_check >= Int32(0)) & (slot_check < max_slot)) != Uint32(0)
             if is_live:
-                for idx in cutlass.range_constexpr(self.mtiles):
+                for idx in cutlass.range_constexpr(self.half_tiles):
                     if num_live_m == Int32(idx):
-                        live_m[idx] = Int32(m)
+                        live_m[idx] = m
                 num_live_m += Int32(1)
         r_s = tid >> Int32(4)
-        for idx in cutlass.range_constexpr(self.mtiles):
+        for idx in cutlass.range_constexpr(self.half_tiles):
             if Int32(idx) < num_live_m:
                 m = live_m[idx]
                 local_row = m * Int32(16) + r_s
@@ -268,7 +278,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                  a_stride: cutlass.Constexpr, width: cutlass.Constexpr):
         col_offset_bytes = (input_block.to(Int64) * Int64(128) + col_s.to(Int64) * Int64(8)) * Int64(2)
         base_a = a_address + col_offset_bytes
-        for idx in cutlass.range_constexpr(self.mtiles):
+        for idx in cutlass.range_constexpr(self.half_tiles):
             if Int32(idx) < num_live_m:
                 sr = srow[idx]
                 valid = (sr >= Int32(0)).to(Int32)
@@ -346,30 +356,17 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     def accumulate(self, total: cute.Tensor, shared_a: Int32, shared_b: Int32,
                    lane: Int32, warp: Int32,
                    width: cutlass.Constexpr, scale: Float32, num_live_m: Int32):
-        if cutlass.const_expr(self.mtiles == 1):
+        if cutlass.const_expr(self.half_tiles == 1):
             if num_live_m >= Int32(1):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
                                         width, scale, 1)
-        elif cutlass.const_expr(self.mtiles == 2):
+        else:
             if num_live_m == Int32(1):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
                                         width, scale, 1)
             elif num_live_m >= Int32(2):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
                                         width, scale, 2)
-        else:
-            if num_live_m == Int32(1):
-                self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 1)
-            elif num_live_m == Int32(2):
-                self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 2)
-            elif num_live_m == Int32(3):
-                self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 3)
-            elif num_live_m >= Int32(4):
-                self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
-                                        width, scale, 4)
 
     @cute.kernel
     def grouped_fc1_kernel(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -400,11 +397,13 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         r_s, col_s = tid >> Int32(4), tid & Int32(15)
         smem_thread_off = (r_s * Int32(16) + (col_s ^ (r_s & Int32(7)))) * Int32(16)
         num_up = unit_limit * Int32(2)
-        total = cute.make_rmem_tensor((self.mtiles, 8), Float32)
+        total = cute.make_rmem_tensor((self.half_tiles, 8), Float32)
 
-        while task < groups * num_up * Int32(self.splits):
-            split = task % Int32(self.splits)
-            unit_task = task // Int32(self.splits)
+        while task < groups * num_up * Int32(self.splits * self.m_halves):
+            half = task % Int32(self.m_halves)
+            rest = task // Int32(self.m_halves)
+            split = rest % Int32(self.splits)
+            unit_task = rest // Int32(self.splits)
             g_tile_base = (unit_task // (num_up * Int32(4))) * Int32(4)
             tile_g = min(Int32(4), groups - g_tile_base)
             rem = unit_task - g_tile_base * num_up
@@ -422,7 +421,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
                 width = bits[desc]
                 num_live_m, live_m, srow = self.prepare_group_tiles(
-                    route_slots, group, rows, tid, lane, shared_a, smem_thread_off, False)
+                    route_slots, group, rows, tid, lane, shared_a, smem_thread_off, False,
+                    half * Int32(self.half_tiles))
                 cute.arch.sync_threads()
 
                 if width != Int32(0) and num_live_m > Int32(0):
@@ -453,7 +453,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     group_base = group.to(Int64) * Int64(self.group_rows)
                     fc1_addr = fc1.iterator.toint()
                     max_slot = rows * Int32(self.top_k)
-                    for idx in cutlass.range_constexpr(self.mtiles):
+                    for idx in cutlass.range_constexpr(self.half_tiles):
                         if Int32(idx) < num_live_m:
                             m = live_m[idx]
                             for v in cutlass.range_constexpr(2):
@@ -567,19 +567,22 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         fc2_addr = fc2.iterator.toint()
         max_slot = rows * Int32(self.top_k)
 
-        while task < groups * Int32(self.blocks):
-            g_tile_base = (task // Int32(self.blocks * 4)) * Int32(4)
+        while task < groups * Int32(self.blocks * self.m_halves):
+            half = task % Int32(self.m_halves)
+            rest = task // Int32(self.m_halves)
+            g_tile_base = (rest // Int32(self.blocks * 4)) * Int32(4)
             tile_g = min(Int32(4), groups - g_tile_base)
-            rem = task - g_tile_base * Int32(self.blocks)
+            rem = rest - g_tile_base * Int32(self.blocks)
             group = g_tile_base + (rem % tile_g)
             block = rem // tile_g
             expert = group_expert[group]
             num_live_m, live_m, srow = self.prepare_group_tiles(
-                route_slots, group, rows, tid, lane, shared_a, smem_thread_off, True)
+                route_slots, group, rows, tid, lane, shared_a, smem_thread_off, True,
+                half * Int32(self.half_tiles))
             cute.arch.sync_threads()
 
             if num_live_m > Int32(0):
-                total = cute.make_rmem_tensor((self.mtiles, 8), Float32)
+                total = cute.make_rmem_tensor((self.half_tiles, 8), Float32)
                 total.fill(Float32(0.0))
                 group_inter_base = inter_addr + group.to(Int64) * (
                     unit_limit.to(Int64) * Int64(self.group_rows * 128 * 2))
@@ -611,7 +614,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
 
                 col0 = block * Int32(128) + warp * Int32(16) + (lane & Int32(3)) * Int32(2)
                 group_base = group.to(Int64) * Int64(self.group_rows)
-                for idx in cutlass.range_constexpr(self.mtiles):
+                for idx in cutlass.range_constexpr(self.half_tiles):
                     if Int32(idx) < num_live_m:
                         m = live_m[idx]
                         for v in cutlass.range_constexpr(2):
