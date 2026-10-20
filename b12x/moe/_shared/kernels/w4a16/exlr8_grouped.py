@@ -178,8 +178,8 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 15
-    CTAS_PER_SM = 3
+    CODE_VERSION = 16
+    CTAS_PER_SM = 4
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True)
