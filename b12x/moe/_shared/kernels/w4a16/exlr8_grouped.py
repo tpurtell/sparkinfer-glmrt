@@ -629,6 +629,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                - Int32(self.blocks)) * Int64(4)
 
         while task < groups * Int32(self.blocks):
+            block = Int32(0)
+            group = Int32(0)
             if fuse != Int32(0):
                 block = task // groups
                 group = task - block * groups
