@@ -355,8 +355,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     # setmaxnreg split. Ring depths keep the whole layout inside the 99 KiB
     # opt-in shared budget every SM12x card offers; __init__ re-checks the
     # driver's own per-CTA limit before any launch.
-    WS_A_STAGES = 2
-    WS_B_STAGES = 4
+    WS_A_STAGES = 4
+    WS_B_STAGES = 2
     WS_TILE_STAGES = 4
     WS_PRODUCER_WARPS = 4
     WS_PRODUCER_REGS = 88
