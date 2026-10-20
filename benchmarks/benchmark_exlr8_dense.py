@@ -256,6 +256,8 @@ def main():
     parser.add_argument("--shapes", help="comma-separated projection names")
     parser.add_argument("--rows", default="1,4,16,64,4096")
     parser.add_argument("--replays", type=int, default=20)
+    parser.add_argument("--no-w8a16", action="store_true",
+                        help="skip the dense W8A16 baseline timing; arm-to-arm only")
     parser.add_argument("--cold-l2", action="store_true")
     parser.add_argument("--profile-arm")
     parser.add_argument("--profile-op", help="FORMAT/OP")
@@ -361,7 +363,7 @@ def main():
             copies = copies_for(read_bytes, args.cold_l2 and rows <= 64)
             extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(copies-1)]
             base_us, base_error = None, None
-            if not profile:
+            if not profile and not args.no_w8a16:
                 try:
                     graph, keep, count = baseline(k, n, rows, a16=True, cold_l2=args.cold_l2)
                 except TypeError as error:
