@@ -3,8 +3,12 @@
 Each 8-warp CTA owns a full N128 unit (N16 per warp) and up to four M16 tiles.
 Each warp decodes its full 16x16 trellis tile once per K16 step and feeds both
 N8 MMA halves from a single ldmatrix of A. Live M16 tiles are compacted per
-group, A and B are staged with cp.async, a K128 accumulator is scaled
-with one pinned FMA, and FC1 split partials fold in ascending split order.
+group, A and B are staged with cp.async into one shared buffer, the next
+K128's f16 scale is loaded one block ahead of the pinned FMA that consumes
+it, and FC1 split partials fold in ascending split order through shared
+planes transposed so every 16-byte warp store is bank-conflict-free. One
+A+B buffer plus the partial planes is 48 KiB of dynamic shared memory, so
+two CTAs fit the 102,400 B SM12x carveout.
 """
 from __future__ import annotations
 
@@ -175,7 +179,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 12
+    CODE_VERSION = 13
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -399,7 +403,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         lane, warp = tid & Int32(31), tid >> Int32(5)
         r_s, col_s = tid >> Int32(4), tid & Int32(15)
         smem_thread_off = (r_s * Int32(16) + (col_s ^ (r_s & Int32(7)))) * Int32(16)
-        smem_c_tid = shared_c + tid * Int32(32)
         num_up = unit_limit * Int32(2)
         grand0 = cute.make_rmem_tensor(8, Float32)
         total = cute.make_rmem_tensor((self.mtiles, 8), Float32)
@@ -433,54 +436,61 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     for split in cutlass.range(self.splits):
                         kb0 = split * Int32(8)
                         total.fill(Float32(0.0))
+                        scale = _side_value(scales, kb0)
                         for block in cutlass.range(8):
                             kb = kb0 + block
                             if kb < Int32(self.blocks):
-                                scale = _side_value(scales, kb)
+                                # The next block's f16 scale load issues here,
+                                # ahead of staging and the MMAs, so the pinned
+                                # FMA finds it in a register instead of waiting
+                                # on L1TEX. The clamp keeps the prefetch in
+                                # bounds on the last block; that value is unused.
+                                block_scale = scale
+                                scale = _side_value(scales, min(kb + Int32(1), Int32(self.blocks - 1)))
                                 if width == Int32(2):
                                     self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
                                                   kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 2)
-                                    self.accumulate(total, shared_a, shared_b, lane, warp, 2, scale, num_live_m)
+                                    self.accumulate(total, shared_a, shared_b, lane, warp, 2, block_scale, num_live_m)
                                 elif width == Int32(3):
                                     self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
                                                   kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 3)
-                                    self.accumulate(total, shared_a, shared_b, lane, warp, 3, scale, num_live_m)
+                                    self.accumulate(total, shared_a, shared_b, lane, warp, 3, block_scale, num_live_m)
                                 elif width == Int32(4):
                                     self.stage_ab(shared_a, shared_b, x_addr, payload, srow, num_live_m,
                                                   kb, kb, tid, smem_thread_off, col_s, self.hidden_size, 4)
-                                    self.accumulate(total, shared_a, shared_b, lane, warp, 4, scale, num_live_m)
+                                    self.accumulate(total, shared_a, shared_b, lane, warp, 4, block_scale, num_live_m)
                                 cute.arch.sync_threads()
                         for v in cutlass.range_constexpr(8):
                             grand0[v] = grand0[v] + total[0, v]
                         for idx in cutlass.range_constexpr(self.mtiles - 1):
-                            c_addr = smem_c_tid + Int32(idx * 8192)
+                            c_addr = shared_c + Int32(idx * 8192) + tid * Int32(16)
                             if split == Int32(0):
                                 st_shared_v4_f32(
                                     c_addr,
                                     Float32(0.0) + total[idx + 1, 0], Float32(0.0) + total[idx + 1, 1],
                                     Float32(0.0) + total[idx + 1, 2], Float32(0.0) + total[idx + 1, 3])
                                 st_shared_v4_f32(
-                                    c_addr + Int32(16),
+                                    c_addr + Int32(4096),
                                     Float32(0.0) + total[idx + 1, 4], Float32(0.0) + total[idx + 1, 5],
                                     Float32(0.0) + total[idx + 1, 6], Float32(0.0) + total[idx + 1, 7])
                             else:
                                 c0, c1, c2, c3 = ld_shared_v4_f32(c_addr)
-                                c4, c5, c6, c7 = ld_shared_v4_f32(c_addr + Int32(16))
+                                c4, c5, c6, c7 = ld_shared_v4_f32(c_addr + Int32(4096))
                                 st_shared_v4_f32(
                                     c_addr,
                                     c0 + total[idx + 1, 0], c1 + total[idx + 1, 1],
                                     c2 + total[idx + 1, 2], c3 + total[idx + 1, 3])
                                 st_shared_v4_f32(
-                                    c_addr + Int32(16),
+                                    c_addr + Int32(4096),
                                     c4 + total[idx + 1, 4], c5 + total[idx + 1, 5],
                                     c6 + total[idx + 1, 6], c7 + total[idx + 1, 7])
 
                     for v in cutlass.range_constexpr(8):
                         total[0, v] = grand0[v]
                     for idx in cutlass.range_constexpr(self.mtiles - 1):
-                        c_addr = smem_c_tid + Int32(idx * 8192)
+                        c_addr = shared_c + Int32(idx * 8192) + tid * Int32(16)
                         c0, c1, c2, c3 = ld_shared_v4_f32(c_addr)
-                        c4, c5, c6, c7 = ld_shared_v4_f32(c_addr + Int32(16))
+                        c4, c5, c6, c7 = ld_shared_v4_f32(c_addr + Int32(4096))
                         total[idx + 1, 0], total[idx + 1, 1], total[idx + 1, 2], total[idx + 1, 3] = c0, c1, c2, c3
                         total[idx + 1, 4], total[idx + 1, 5], total[idx + 1, 6], total[idx + 1, 7] = c4, c5, c6, c7
 
