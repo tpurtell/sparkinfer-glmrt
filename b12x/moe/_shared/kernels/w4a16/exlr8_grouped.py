@@ -16,14 +16,20 @@ from cutlass._mlir.dialects import llvm
 from cuda.bindings import driver as cuda
 
 from b12x._lib.intrinsics import (
+    atomic_add_global_i32,
     cp_async4_shared_global,
     f16_mma_m16n8k16_f32,
+    ld_global_cg_v4_u32,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
+    ld_shared_u32,
     packed_dequant_trellis_to_half2x4,
     shared_ptr_to_u32,
+    st_global_i32,
     st_global_v2_u32,
+    st_shared_u32,
     st_shared_v4_u32,
+    threadfence,
     u32_as_f32,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
@@ -175,7 +181,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 12
+    CODE_VERSION = 13
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -216,15 +222,22 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                    rows, group_count, unit_limit).launch(
                 grid=(min(Int32(self.max_groups) * unit_limit, cta_limit), 1, 1),
                 block=(256, 1, 1), stream=stream)
-            self.grouped_fc2_kernel(pointers, bits, unit_count, unit_map,
-                                    group_expert, route_slots, intermediate, fc2,
-                                    rows, group_count, unit_limit).launch(
+            # Fold the top-k routes inside FC2 while one output block's partial
+            # plane, intermediate tile and weight slice fit the smallest L2 the
+            # engine targets; a wider batch keeps the separate reduction.
+            per_slot = Int32(512) + unit_limit * Int32(256)
+            fuse = Int32(1) - min(Int32(1), (rows * Int32(self.top_k) * per_slot) // Int32(16 << 20))
+            self.grouped_fc2_kernel(pointers, bits, unit_count, unit_map, group_expert,
+                                    route_slots, route_group_lane, route_weights,
+                                    intermediate, fc2, signs_out, output, rows,
+                                    group_count, unit_limit, fuse).launch(
                 grid=(min(Int32(self.max_groups * self.blocks), cta_limit), 1, 1),
                 block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
-            self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
-                               rows, group_count).launch(
-                grid=(min((rows * Int32(self.blocks) + Int32(7)) // Int32(8), cta_limit), 1, 1),
-                block=(256, 1, 1), stream=stream)
+            if fuse == Int32(0):
+                self.reduce_kernel(route_group_lane, route_weights, fc2, signs_out, output,
+                                   rows, group_count).launch(
+                    grid=(min((rows * Int32(self.blocks) + Int32(7)) // Int32(8), cta_limit), 1, 1),
+                    block=(256, 1, 1), stream=stream)
 
     @cute.jit
     def prepare_group_tiles(self, route_slots: cute.Tensor, group: Int32, rows: Int32,
@@ -567,8 +580,22 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     def grouped_fc2_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
                            unit_count: cute.Tensor, unit_map: cute.Tensor,
                            group_expert: cute.Tensor, route_slots: cute.Tensor,
+                           route_group_lane: cute.Tensor, route_weights: cute.Tensor,
                            intermediate: cute.Tensor, fc2: cute.Tensor,
-                           rows: Int32, group_count: cute.Tensor, unit_limit: Int32):
+                           signs_out: cute.Tensor, output: cute.Tensor,
+                           rows: Int32, group_count: cute.Tensor, unit_limit: Int32,
+                           fuse: Int32):
+        """FC2 partials, optionally folding each output block as it completes.
+
+        ``fuse`` selects block-major tasks: a block's whole route-partial plane
+        is produced in one contiguous run of tasks, and the CTA that completes
+        the block's last group folds the top-k routes and rotates the result
+        right there.  That keeps the F32 partials in L2 instead of paying a
+        second DRAM pass for them; it is worth it only while the block's
+        intermediate tile, partial plane and weight slice fit the smallest
+        supported L2, so ``serving`` turns it off for wide batches, which keep
+        the group-major order and the separate reduction kernel.
+        """
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
             groups = Int32(0)
@@ -577,11 +604,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         @cute.struct
         class Storage:
             words: cute.struct.Align[
-                cute.struct.MemRange[Uint32, self.group_rows * 64 + 2048], 1024]
+                cute.struct.MemRange[Uint32, self.group_rows * 64 + 2048 + 8], 1024]
 
         storage = smem.allocate(Storage)
         shared_a = shared_ptr_to_u32(storage.words.data_ptr())
         shared_b = shared_a + Int32(self.group_rows * 256)
+        shared_flag = shared_b + Int32(2048)
         tid = Int32(cute.arch.thread_idx()[0])
         task = Int32(cute.arch.block_idx()[0])
         step = Int32(cute.arch.grid_dim()[0])
@@ -590,14 +618,26 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         smem_thread_off = (r_s * Int32(16) + (col_s ^ (r_s & Int32(7)))) * Int32(16)
         inter_addr = intermediate.iterator.toint()
         fc2_addr = fc2.iterator.toint()
+        signs_address = signs_out.iterator.toint()
+        output_address = output.iterator.toint()
         max_slot = rows * Int32(self.top_k)
+        max_packed = groups * Int32(self.group_rows)
+        # Arrival counters live in the tail of the fc2 scratch, past the slots a
+        # legal pack can fill: the pack rejects any packing above max_groups and
+        # the serving capacity reserves hundreds of spare groups.
+        counters = fc2_addr + (Int32(self.max_groups * self.group_rows * self.hidden_size)
+                               - Int32(self.blocks)) * Int64(4)
 
         while task < groups * Int32(self.blocks):
-            g_tile_base = (task // Int32(self.blocks * 4)) * Int32(4)
-            tile_g = min(Int32(4), groups - g_tile_base)
-            rem = task - g_tile_base * Int32(self.blocks)
-            group = g_tile_base + (rem % tile_g)
-            block = rem // tile_g
+            if fuse != Int32(0):
+                block = task // groups
+                group = task - block * groups
+            else:
+                g_tile_base = (task // Int32(self.blocks * 4)) * Int32(4)
+                tile_g = min(Int32(4), groups - g_tile_base)
+                rem = task - g_tile_base * Int32(self.blocks)
+                group = g_tile_base + (rem % tile_g)
+                block = rem // tile_g
             expert = group_expert[group]
             num_live_m, live_m, srow = self.prepare_group_tiles(
                 route_slots, group, rows, tid, lane, shared_a, smem_thread_off, True)
@@ -648,6 +688,50 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
                                 st_global_v2_f32(row_addr + Int64(32), total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
             cute.arch.sync_threads()
+
+            if fuse != Int32(0):
+                # Publish this group's partials, then let the last arrival of the
+                # block fold them while their lines are still in L2.  No CTA ever
+                # waits on a task that has not been claimed, so the fusion needs
+                # no residency guarantee from the launch grid.
+                threadfence()
+                cute.arch.sync_threads()
+                if tid == Int32(0):
+                    st_shared_u32(shared_flag, Uint32(0))
+                    prev = atomic_add_global_i32(counters + block.to(Int64) * Int64(4), Int32(1))
+                    if prev == groups - Int32(1):
+                        threadfence()
+                        st_shared_u32(shared_flag, Uint32(1))
+                cute.arch.sync_threads()
+                if ld_shared_u32(shared_flag) != Uint32(0):
+                    row = warp
+                    while row < rows:
+                        col = block * Int32(128) + lane * Int32(4)
+                        values = cute.make_rmem_tensor(4, Float32)
+                        values.fill(Float32(0.0))
+                        row_route_base = row.to(Int64) * Int64(self.top_k)
+                        for slot in cutlass.range_constexpr(self.top_k):
+                            route = row_route_base + Int64(slot)
+                            packed = route_group_lane[route]
+                            if packed >= Int32(0) and packed < max_packed:
+                                weight = route_weights[route]
+                                w0, w1, w2, w3 = ld_global_cg_v4_u32(
+                                    fc2_addr + (packed.to(Int64) * Int64(self.hidden_size)
+                                                + col.to(Int64)) * Int64(4))
+                                values[0] = values[0] + weight * u32_as_f32(w0)
+                                values[1] = values[1] + weight * u32_as_f32(w1)
+                                values[2] = values[2] + weight * u32_as_f32(w2)
+                                values[3] = values[3] + weight * u32_as_f32(w3)
+                        h0, h1, h2, h3 = _w4a8_had128_quad(
+                            values[0], values[1], values[2], values[3], lane)
+                        signs = ld_global_nc_u32(signs_address + col.to(Int64))
+                        store_bf16x4(output_address + (row.to(Int64) * Int64(self.hidden_size)
+                                     + col.to(Int64)) * Int64(2),
+                                     h0 * signed_byte(signs, 0), h1 * signed_byte(signs, 1),
+                                     h2 * signed_byte(signs, 2), h3 * signed_byte(signs, 3))
+                        row += Int32(8)
+                    if tid == Int32(0):
+                        st_global_i32(counters + block.to(Int64) * Int64(4), Int32(0))
             task += step
 
     @cute.kernel
