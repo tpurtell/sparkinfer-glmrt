@@ -181,7 +181,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 13
+    CODE_VERSION = 14
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -227,6 +227,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             # engine targets; a wider batch keeps the separate reduction.
             per_slot = Int32(512) + unit_limit * Int32(256)
             fuse = Int32(1) - min(Int32(1), (rows * Int32(self.top_k) * per_slot) // Int32(16 << 20))
+            if fuse != Int32(0):
+                self.reset_counters_kernel(fc2).launch(
+                    grid=(1, 1, 1), block=(256, 1, 1), stream=stream)
             self.grouped_fc2_kernel(pointers, bits, unit_count, unit_map, group_expert,
                                     route_slots, route_group_lane, route_weights,
                                     intermediate, fc2, signs_out, output, rows,
@@ -626,7 +629,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         # spare group: the pack admits at most rows*top_k/64 + 256 groups and
         # the exported grouped capacity reserves one further group, so no legal
         # batch's partials reach them. One spare group is 1.5 MB; the counters
-        # need one word per 128-column output block.
+        # need one word per 128-column output block. reset_counters_kernel
+        # zeroes them right before every fused launch.
         counters = fc2_addr + (Int32(self.max_groups * self.group_rows * self.hidden_size)
                                - Int32(self.blocks)) * Int64(4)
 
@@ -737,6 +741,22 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     if tid == Int32(0):
                         st_global_i32(counters + block.to(Int64) * Int64(4), Int32(0))
             task += step
+
+    @cute.kernel
+    def reset_counters_kernel(self, fc2: cute.Tensor):
+        """Zero one fused-egress arrival counter per 128-column output block.
+
+        The scratch arrives uninitialized (torch.empty or reused workspace), so
+        the counting protocol needs a known start: this launch precedes the
+        fused FC2 launch in the same stream.
+        """
+        tid = Int32(cute.arch.thread_idx()[0])
+        counters = fc2.iterator.toint() + (Int32(self.max_groups * self.group_rows * self.hidden_size)
+                                           - Int32(self.blocks)) * Int64(4)
+        index = tid
+        while index < Int32(self.blocks):
+            st_global_i32(counters + index.to(Int64) * Int64(4), Int32(0))
+            index += Int32(256)
 
     @cute.kernel
     def reduce_kernel(self, route_group_lane: cute.Tensor, route_weights: cute.Tensor,
