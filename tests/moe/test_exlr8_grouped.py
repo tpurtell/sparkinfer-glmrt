@@ -1,5 +1,6 @@
 """Bitwise K1 contract for expert-major EXLR8 prefill."""
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -23,12 +24,17 @@ def buffers(rows, hidden, units, topk, capacity, group_rows):
 
 
 def programs(hidden, units, topk, capacity, group_rows, grouped):
+    candidate = compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=topk,
+                                      max_groups=capacity, device_count=True,
+                                      grouped=grouped, group_rows=group_rows)
+    frozen = os.environ.get("EXLR8_FROZEN_GROUPED_ARM")
+    if grouped and frozen:
+        from benchmarks.benchmark_exlr8_a16 import compile_grouped_arm
+        kernel, group, _ = compile_grouped_arm(Path(frozen), candidate)
+        return group, kernel
     return (compile_exlr8_group_aot(experts=4, top_k=topk, max_groups=capacity,
                                    hidden=hidden, max_rows=4096 if grouped else 64,
-                                   group_rows=group_rows),
-            compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=topk,
-                                  max_groups=capacity, device_count=True,
-                                  grouped=grouped, group_rows=group_rows))
+                                   group_rows=group_rows), candidate)
 
 
 def compute(k1, state, weights, pointers, bits, signs, rows, limit):
