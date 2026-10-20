@@ -7,8 +7,8 @@ group and A and B are staged with cp.async into two ping-pong buffers: the
 next K128 block is always in flight while the current one is computed, so the
 staging barrier retires a completed load instead of waiting on one. A K128
 accumulator is scaled with one pinned FMA, and FC1 split partials fold in
-ascending split order in the task's own fp32 fc1 slot (tile 0 stays in
-registers), which is what funds the second staging buffer.
+ascending split order in shared fp32 planes whose thread slots are transposed
+so a warp stores contiguous 16-byte runs (tile 0 stays in registers).
 """
 from __future__ import annotations
 
@@ -426,9 +426,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
 
         storage = smem.allocate(Storage)
         # Two A+B staging buffers ping-pong so the next K128 block is in flight
-        # while the current one computes. Registers cap this kernel at one CTA
-        # per SM, so the extra buffer costs no occupancy; the split-partial
-        # planes stay in shared.
+        # while the current one computes. The cost is shared capacity: two
+        # 74,752 B CTAs need 149,504 B per SM, so residency is one CTA on a
+        # 100 KiB carveout and two where the device offers more. The
+        # split-partial planes stay in shared, transposed for warp-contiguous
+        # 16-byte stores.
         shared_a0 = shared_ptr_to_u32(storage.words.data_ptr())
         shared_b0 = shared_a0 + Int32(self.group_rows * 256)
         shared_a1 = shared_b0 + Int32(8192)
