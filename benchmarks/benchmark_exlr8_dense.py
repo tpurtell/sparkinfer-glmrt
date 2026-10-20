@@ -307,7 +307,9 @@ def main():
             spills[name] = spill_check(programs[name], args.output.parent / "cubins" / name / f"{fmt}-{op}")
         # All widths use exactly the same input prefix and weights. Each arm's
         # own prefill freezes its K order, independently of other arms' ordering.
-        storage, read_bytes = native_tensors(fmt, k, n, 4096, 0)
+        # The scaled tile core takes no split-K partials (0: a 4-byte
+        # placeholder); trellis allocation follows the ABI's ceil(K/1024) splits.
+        storage, read_bytes = native_tensors(fmt, k, n, 4096, None if fmt == "trellis" else 0)
         tensors = storage[:5]
         x = storage[-1]
         # The trellis ABI consumes a rotation slot and packed codes, so there is
