@@ -409,6 +409,21 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
                       ctas_per_sm=4, ingress_warps=INGRESS_WARPS))
 
 
+GROUPED_ROWS = 4096
+
+
+def grouped_capacity(top_k):
+    """Grouped scratch capacity for a full 4096-row batch, with one spare group.
+
+    The pack forms ceil(routes_e / group_rows) groups per expert, so any legal
+    batch has at most 4096*top_k/64 + experts groups (512 + 256 at top_k 8).
+    The fused egress keeps one arrival counter per 128-column output block in
+    the tail of the scratch, and needs that tail to lie beyond every batch's
+    partials, so the capacity reserves one group past the pack bound.
+    """
+    return (GROUPED_ROWS * top_k + 63) // 64 + 256 + 1
+
+
 def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_groups=512):
     """Exporter tuples and role ownership; callers must not duplicate this list."""
     from .exlr8 import compile_exlr8_a16_aot
@@ -432,10 +447,10 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
     grouped = [
         ("a16_grouped", "exlr8_a16", {"max_rows": 4096},
          lambda: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
-             max_groups=(4096 * top_k + 63)//64 + 256, device_count=True, grouped=True)),
+             max_groups=grouped_capacity(top_k), device_count=True, grouped=True)),
         ("grouped_group", "exlr8_group", {"max_rows": 4096},
          lambda: compile_exlr8_group_aot(hidden=hidden, top_k=top_k,
-             max_groups=(4096 * top_k + 63)//64 + 256, max_rows=4096, group_rows=64)),
+             max_groups=grouped_capacity(top_k), max_rows=4096, group_rows=64)),
     ]
     if role == "spark":
         return result[1:3] + grouped

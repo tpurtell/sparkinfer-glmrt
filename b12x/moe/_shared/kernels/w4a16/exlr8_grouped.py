@@ -622,9 +622,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         output_address = output.iterator.toint()
         max_slot = rows * Int32(self.top_k)
         max_packed = groups * Int32(self.group_rows)
-        # Arrival counters live in the tail of the fc2 scratch, past the slots a
-        # legal pack can fill: the pack rejects any packing above max_groups and
-        # the serving capacity reserves hundreds of spare groups.
+        # Arrival counters live in the tail of the fc2 scratch, inside its last
+        # spare group: the pack admits at most rows*top_k/64 + 256 groups and
+        # the exported grouped capacity reserves one further group, so no legal
+        # batch's partials reach them. One spare group is 1.5 MB; the counters
+        # need one word per 128-column output block.
         counters = fc2_addr + (Int32(self.max_groups * self.group_rows * self.hidden_size)
                                - Int32(self.blocks)) * Int64(4)
 
