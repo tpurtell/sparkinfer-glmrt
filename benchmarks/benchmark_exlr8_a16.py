@@ -916,7 +916,8 @@ def grouped_main(args):
         unique = (int(ids.unique().numel()) * 4 if owned is None else
                   sum(len(owned[e]) for e in ids.unique().tolist())) * 3 * 6144 * 128 * 4//8
         stages = stage_profile(graphs["grouped"], args.output.parent,
-            {"ingress":("_Group",),"fc1":("grouped_fc1_kernel",),"activation":("activation_kernel",),
+            {"ingress":("_Group",),"fc1":("grouped_fc1_kernel","grouped_fc1_ring_kernel"),
+             "activation":("activation_kernel",),
              "fc2":("grouped_fc2_kernel",),"egress":("reduce_kernel",)})
         k4_stages = stage_profile(graphs["exl3"], args.output.parent,
             {"wire_decode": ("_wire_decode",), "fc1_fc2_fused": ("W4A16FusedMoeKernel",),
