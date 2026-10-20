@@ -1,10 +1,11 @@
 """Expert-major M64 EXLR8 prefill, retaining the K1 reduction tree.
 
-Each 8-warp CTA owns a full N128 unit (N16 per warp) and up to four M16 tiles.
-Each warp decodes its full 16x16 trellis tile once per K16 step and feeds both
-N8 MMA halves from a single ldmatrix of A. Live M16 tiles are compacted per
-group, A and B are staged with cp.async, a K128 accumulator is scaled
-with one pinned FMA, and FC1 split partials fold in ascending split order.
+FC1 uses eight producer warps and eight consumer warps per N128 unit.
+Producers stage A and packed B with cp.async, then publish exact rounded
+K16 fragments through a two-slot shared ring while consumers perform the
+frozen F16 MMA sequence. FC2 retains its eight-warp inline decode path.
+Live M16 tiles are compacted; K128 accumulators use one pinned scale FMA,
+and FC1 split partials fold in ascending split order.
 """
 from __future__ import annotations
 
@@ -63,6 +64,7 @@ def ld_shared_u32_offset(base_addr: Int32, offset: int, *, loc=None, ip=None) ->
 
 @dsl_user_op
 def ld_shared_ring_u32_offset(base_addr: Int32, offset: int, *, loc=None, ip=None) -> Uint32:
+    # Ring addresses repeat after ownership transfers; these loads must not CSE.
     return Uint32(llvm.inline_asm(
         T.i32(), [Int32(base_addr).ir_value(loc=loc, ip=ip)],
         f"ld.shared.b32 $0, [$1 + {int(offset)}];", "=r,r",
