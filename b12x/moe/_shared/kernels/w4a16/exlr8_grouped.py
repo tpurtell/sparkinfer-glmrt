@@ -3,8 +3,9 @@
 Each 8-warp CTA owns a full N128 unit (N16 per warp) and up to four M16 tiles.
 Each warp decodes its full 16x16 trellis tile once per K16 step and feeds both
 N8 MMA halves from a single ldmatrix of A. Live M16 tiles are compacted per
-group, FC1 stages packed A/B two K128 blocks deep with cp.async, a K128 accumulator is scaled
-with one pinned FMA, and FC1 split partials fold in ascending split order.
+group, FC1 stages packed A/B two K128 blocks deep with cp.async. A K128
+accumulator is scaled with one pinned FMA, and FC1 split partials fold in
+ascending split order.
 """
 from __future__ import annotations
 
