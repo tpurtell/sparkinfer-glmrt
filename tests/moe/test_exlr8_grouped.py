@@ -111,6 +111,88 @@ def test_checkpoint_grouped_matches_chunks(group_rows, units):
                 assert torch.equal(actual[first:first+live].view(torch.int16), base["output"][:live].view(torch.int16))
 
 
+@pytest.mark.skipif(not os.environ.get("CUTEAFD_EXLR8_SNAPSHOT"), reason="checkpoint fixture required")
+def test_checkpoint_every_live_row_count_matches_chunks():
+    import json
+    torch.cuda.set_per_process_memory_fraction(0.25)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    units, group_rows, rows = 3, 64, 4096
+    case = Case(os.environ["CUTEAFD_EXLR8_SNAPSHOT"], layer=40, hidden=1152, units=units)
+    hidden, topk = case.h, case.topk
+    capacity = (rows * topk + group_rows - 1) // group_rows + 4
+    gen = torch.Generator().manual_seed(408)
+    wire, _ = make_wire(torch.randn((rows, hidden), generator=gen).cuda() * 0.02)
+    ids = (torch.arange(rows * topk, device="cuda").reshape(rows, topk) % 4).int()
+    weights = torch.rand((rows, topk), generator=gen).cuda() / topk
+    signs = (case.signs_in, case.signs_out)
+    base = buffers(64, hidden, units, topk, 128, 16)
+    dec = programs(hidden, units, topk, 128, 16, False)
+    expected = torch.empty((rows, hidden), dtype=torch.bfloat16, device="cuda")
+    for first in range(0, rows, 64):
+        live = min(rows - first, 64)
+        run(dec, base, wire[first:], ids[first:], weights[first:], case.pointers, case.bits, signs, live, 48)
+        expected[first:first+live].copy_(base["output"][:live])
+    assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+    state = buffers(rows, hidden, units, topk, capacity, group_rows)
+    grouped = programs(hidden, units, topk, capacity, group_rows, True)
+    state["compact"] = compact_unit_descriptors(case.bits)
+    live_counts = range(1, rows + 1) if os.environ.get("EXLR8_EXHAUSTIVE") else (1, 16, 64, 65, 512, 1024, 4096)
+    with kernel_resolution_guard("EXLR8 grouped checkpoint exhaustive row invariance"):
+        for live in live_counts:
+            for limit in (1, 48, 188):
+                state["output"].fill_(float("nan"))
+                run(grouped, state, wire, ids, weights, case.pointers, case.bits, signs, live, limit)
+                assert torch.equal(state["output"][:live].view(torch.int16), expected[:live].view(torch.int16)), (live, limit)
+                reverse_packing(state, live)
+                compute(grouped[1], state, weights, case.pointers, case.bits, signs, live, limit)
+                assert torch.equal(state["output"][:live].view(torch.int16), expected[:live].view(torch.int16)), (live, limit, "reverse")
+                assert torch.isnan(state["output"][live:]).all()
+    cgroup_cur = Path("/sys/fs/cgroup/memory.current")
+    cgroup_peak = Path("/sys/fs/cgroup/memory.peak")
+    cgroup_max = Path("/sys/fs/cgroup/memory.max")
+    limit_16gb = 16 * (1024 ** 3)
+    cg_cur = int(cgroup_cur.read_text().strip()) if cgroup_cur.exists() else None
+    cg_peak = int(cgroup_peak.read_text().strip()) if cgroup_peak.exists() else None
+    cg_max_raw = cgroup_max.read_text().strip() if cgroup_max.exists() else None
+    cg_limit = int(cg_max_raw) if (cg_max_raw and cg_max_raw.isdigit()) else limit_16gb
+    effective_limit = min(limit_16gb, cg_limit)
+    cuda_alloc = int(torch.cuda.memory_allocated())
+    cuda_max_alloc = int(torch.cuda.max_memory_allocated())
+    cuda_res = int(torch.cuda.memory_reserved())
+    cuda_max_res = int(torch.cuda.max_memory_reserved())
+    observed_cgroup = cg_peak if cg_peak is not None else cg_cur
+    fits_16gb = bool(
+        cuda_max_alloc < effective_limit
+        and cuda_max_res < effective_limit
+        and (observed_cgroup is None or observed_cgroup < effective_limit)
+    )
+    mem_report = {
+        "hidden": hidden,
+        "blocks": hidden // 128,
+        "rows": rows,
+        "topk": topk,
+        "units": units,
+        "capacity": capacity,
+        "group_rows": group_rows,
+        "frozen_arm": os.environ.get("EXLR8_FROZEN_GROUPED_ARM"),
+        "cuda_allocated_bytes": cuda_alloc,
+        "cuda_max_allocated_bytes": cuda_max_alloc,
+        "cuda_reserved_bytes": cuda_res,
+        "cuda_max_reserved_bytes": cuda_max_res,
+        "cgroup_memory_current_bytes": cg_cur,
+        "cgroup_memory_peak_bytes": cg_peak,
+        "cgroup_memory_max": cg_max_raw,
+        "effective_limit_bytes": effective_limit,
+        "fits_16gb_container": fits_16gb,
+    }
+    out_dir = Path("/workspace/cuteafd/results")
+    if out_dir.exists():
+        arm_tag = Path(os.environ.get("EXLR8_FROZEN_GROUPED_ARM", "head")).name[:8]
+        (out_dir / f"argon4-s2.mem1152-{arm_tag}.json").write_text(json.dumps(mem_report, indent=2) + "\n")
+    assert fits_16gb, f"Exhaustive hidden=1152 test exceeded 16 GiB container limit: {mem_report}"
+
+
 @pytest.mark.parametrize("units", [1, 16])
 def test_every_live_row_count_matches_decode(units):
     torch.cuda.set_per_process_memory_fraction(0.25)
@@ -160,3 +242,32 @@ def test_every_live_row_count_matches_decode(units):
                 compute(grouped[1], state, weights, pointers, bits, signs, live, limit)
                 assert torch.equal(state["output"][:live].view(torch.int16), expected[:live].view(torch.int16)), (live, limit, "reverse")
                 assert torch.isnan(state["output"][live:]).all()
+
+
+def test_frozen_candidate_arms():
+    if os.environ.get("EXLR8_FROZEN_GROUPED_ARM") or os.environ.get("EXLR8_RUN_AUTO_ARMS") != "1":
+        return
+    arms_root = Path(os.environ.get("EXLR8_GROUPED_ARMS_DIR", "/workspace/cuteafd/results/arms"))
+    if not arms_root.is_dir():
+        return
+    prefixes = os.environ.get("EXLR8_CANDIDATE_ARM_PREFIXES", "154a80cb,6093aada,7b45d52f,46a3477c").split(",")
+    import subprocess
+    import sys
+    for prefix in (p.strip() for p in prefixes if p.strip()):
+        matches = [d for d in sorted(arms_root.glob(prefix + "*")) if d.is_dir()]
+        if not matches:
+            continue
+        arm_dir = matches[0]
+        env = dict(os.environ)
+        env["EXLR8_FROZEN_GROUPED_ARM"] = str(arm_dir)
+        env["EXLR8_SKIP_AUTO_ARMS"] = "1"
+        cmd = [
+            sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            str(Path(__file__).resolve()),
+            f"--basetemp=/workspace/cuteafd/results/pytest-arm-{prefix}",
+        ]
+        res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        log_path = Path(f"/workspace/cuteafd/results/argon4-s2.arm-{prefix}.tests.log")
+        if log_path.parent.exists():
+            log_path.write_text(f"ARM={arm_dir}\nCMD={' '.join(cmd)}\nRC={res.returncode}\n{res.stdout}\n{res.stderr}\n")
+        assert res.returncode == 0, f"Frozen arm {arm_dir} failed pytest:\n{res.stdout}\n{res.stderr}"
