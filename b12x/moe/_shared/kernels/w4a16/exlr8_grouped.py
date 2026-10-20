@@ -355,14 +355,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     block=(256, 1, 1), stream=stream)
 
     @cute.jit
-    def prepare_group_tiles(self, route_slots: cute.Tensor, group: Int32, rows: Int32,
-                            tid: Int32, lane: Int32, shared_a: Int32,
-                            smem_thread_off: Int32, down: cutlass.Constexpr,
-                            srow_tbl: Int32, publish_rows: cutlass.Constexpr):
+    def count_live_tiles(self, route_slots: cute.Tensor, group: Int32, rows: Int32,
+                         lane: Int32):
+        """Cheap first pass: how many of the four 16-row tiles hold a live slot."""
         live_m = cute.make_rmem_tensor(self.mtiles, Int32)
-        srow = cute.make_rmem_tensor(self.mtiles, Int32)
         live_m.fill(Int32(0))
-        srow.fill(Int32(-1))
         num_live_m = Int32(0)
         max_slot = rows * Int32(self.top_k)
         group_base = group.to(Int64) * Int64(self.group_rows)
@@ -376,6 +373,18 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     if num_live_m == Int32(idx):
                         live_m[idx] = Int32(m)
                 num_live_m += Int32(1)
+        return num_live_m, live_m
+
+    @cute.jit
+    def prepare_group_tiles(self, route_slots: cute.Tensor, group: Int32, rows: Int32,
+                            tid: Int32, lane: Int32, shared_a: Int32,
+                            smem_thread_off: Int32, down: cutlass.Constexpr,
+                            srow_tbl: Int32, publish_rows: cutlass.Constexpr,
+                            num_live_m: Int32, live_m: cute.Tensor):
+        srow = cute.make_rmem_tensor(self.mtiles, Int32)
+        srow.fill(Int32(-1))
+        max_slot = rows * Int32(self.top_k)
+        group_base = group.to(Int64) * Int64(self.group_rows)
         r_s = tid >> Int32(4)
         for idx in cutlass.range_constexpr(self.mtiles):
             if Int32(idx) < num_live_m:
@@ -397,7 +406,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 row_tbl = srow_tbl + r_s * Int32(16)
                 for idx in cutlass.range_constexpr(self.mtiles):
                     st_shared_u32(row_tbl + Int32(idx * 4), as_u32_bits(srow[idx]))
-        return num_live_m, live_m, srow
+        return srow
 
     @cute.jit
     def zero_invalid_a_tiles(self, shared_a_dst: Int32, srow: cute.Tensor,
@@ -808,9 +817,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 logical = (group * unit_limit + k) * Int32(2) + proj
                 desc = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3) + proj.to(Int64)
                 width = bits[desc]
-                num_live_m, live_m, srow = self.prepare_group_tiles(
-                    route_slots, group, rows, tid, lane, shared_a, smem_thread_off, False,
-                    srow_tbl, ring_only)
+                num_live_m, live_m = self.count_live_tiles(route_slots, group, rows, lane)
                 # The two entries partition the task list by live-tile count, so
                 # each is compiled for one register budget and one staging shape.
                 if cutlass.const_expr(self.fc1_producer):
@@ -820,15 +827,21 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         tile_class = num_live_m >= Int32(4)
                 else:
                     tile_class = num_live_m >= Int32(0)
-                if cutlass.const_expr(self.fc1_producer and ring_only):
-                    if tid == Int32(0):
-                        cute.arch.mbarrier_init(full_mbar, Int32(1))
-                        cute.arch.mbarrier_init(full_mbar + 1, Int32(1))
-                        cute.arch.mbarrier_init(free_mbar, Int32(8))
-                        cute.arch.mbarrier_init(free_mbar + 1, Int32(8))
-                cute.arch.sync_threads()
+                # A task this entry does not own costs one count pass: no shared
+                # writes, no staging and no barriers, so an idle entry drains its
+                # task list as fast as it can read it.
+                if tile_class and num_live_m > Int32(0) and width != Int32(0):
+                    srow = self.prepare_group_tiles(
+                        route_slots, group, rows, tid, lane, shared_a, smem_thread_off, False,
+                        srow_tbl, ring_only, num_live_m, live_m)
+                    if cutlass.const_expr(self.fc1_producer and ring_only):
+                        if tid == Int32(0):
+                            cute.arch.mbarrier_init(full_mbar, Int32(1))
+                            cute.arch.mbarrier_init(full_mbar + Int32(1), Int32(1))
+                            cute.arch.mbarrier_init(free_mbar, Int32(8))
+                            cute.arch.mbarrier_init(free_mbar + Int32(1), Int32(8))
+                    cute.arch.sync_threads()
 
-                if width != Int32(0) and num_live_m > Int32(0) and tile_class:
                     grand0.fill(Float32(0.0))
                     if cutlass.const_expr(self.mtiles >= 2):
                         grand1.fill(Float32(0.0))
@@ -837,7 +850,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     fc1_addr = fc1.iterator.toint()
                     group_base = group.to(Int64) * Int64(self.group_rows)
                     max_slot = rows * Int32(self.top_k)
-
                     if cutlass.const_expr(self.fc1_producer):
                         a_ping_pong = cutlass.const_expr(ring_only)
                         use_ring = a_ping_pong
@@ -853,17 +865,20 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     )
                     shared_c2 = shared_a + Int32(40960)
                     shared_c3 = shared_a + Int32(32768)
-                    prod_sr = cute.make_rmem_tensor(4, Int32)
-                    if cutlass.const_expr(self.fc1_producer):
+
+
+                    if cutlass.const_expr(ring_only):
+                        # The producer and the consumers are disjoint warps over
+                        # disjoint state, so each path is written as its own loop:
+                        # the consumer body then carries no divergent branch that
+                        # keeps its accumulators live across a join.
                         if is_prod:
                             row_tbl = srow_tbl + (lane & Int32(15)) * Int32(16)
+                            prod_sr = cute.make_rmem_tensor(4, Int32)
                             for idx in cutlass.range_constexpr(4):
                                 prod_sr[idx] = as_i32_bits(ld_shared_u32_offset(row_tbl, idx * 4))
-
-                    if use_ring:
-                        # Stage 0 is published as soon as it lands; stage 1 is
-                        # issued behind it and covered by block 0.
-                        if is_prod:
+                            # Stage 0 is published as soon as it lands; stage 1 is
+                            # issued behind it and covered by block 0.
                             self.stage_a_ring(shared_a, x_addr, prod_sr, num_live_m,
                                               Int32(0), lane, self.hidden_size)
                             self.stage_b_ring(shared_b0, payload, Int32(0), lane, width)
@@ -875,138 +890,251 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                               Int32(1), lane, self.hidden_size)
                             self.stage_b_ring(shared_b0 + Int32(8192), payload, Int32(1), lane, width)
                             cute.arch.cp_async_commit_group()
-                    else:
-                        if not is_prod:
-                            self.stage_a_async(shared_a, x_addr, srow, num_live_m, Int32(0),
-                                               smem_thread_off, col_s, self.hidden_size, self.mtiles)
-                            self.stage_b_async_dyn(shared_b0, payload, Int32(0), tid, width)
-                            cute.arch.cp_async_commit_group()
-                    next_scale = ld_global_b16(scales)
-
-                    for split in cutlass.range(self.splits):
-                        kb0 = split * Int32(8)
-                        total.fill(Float32(0.0))
-                        for block in cutlass.range(8):
-                            kb = kb0 + block
-                            if kb < Int32(self.blocks):
+                            for kb in cutlass.range(self.blocks):
                                 parity = kb & Int32(1)
                                 next_parity = (kb + Int32(1)) & Int32(1)
-                                cur_a = shared_a + parity * a_stride_smem
-                                next_a = shared_a + next_parity * a_stride_smem
-                                cur_b = shared_b0 + parity * Int32(8192)
-                                next_b = shared_b0 + next_parity * Int32(8192)
-                                has_next = (kb + Int32(1)) < Int32(self.blocks)
-                                cur_scale = next_scale
                                 kb_phase = (kb >> Int32(1)) & Int32(1)
-
-                                if use_ring:
-                                    cute.arch.mbarrier_wait(full_mbar + parity, phase=kb_phase)
-                                else:
-                                    cute.arch.cp_async_wait_group(0)
-                                    cute.arch.sync_threads()
-
-                                if has_next:
-                                    next_scale = ld_global_b16(scales + (kb + Int32(1)).to(Int64) * Int64(2))
-                                    if use_ring:
-                                        if is_prod:
-                                            # Release block kb+1 first so the consumer
-                                            # warps never wait on this warp's schedule,
-                                            # then wait for block kb to retire.
-                                            cute.arch.cp_async_wait_group(0)
-                                            if lane == Int32(0):
-                                                cute.arch.mbarrier_arrive(full_mbar + next_parity)
-                                            cute.arch.mbarrier_wait(free_mbar + parity, phase=kb_phase)
-                                            if (kb + Int32(2)) < Int32(self.blocks):
-                                                self.stage_a_ring(cur_a, x_addr, prod_sr, num_live_m,
-                                                                  kb + Int32(2), lane, self.hidden_size)
-                                                self.stage_b_ring(cur_b, payload, kb + Int32(2),
-                                                                  lane, width)
-                                                cute.arch.cp_async_commit_group()
-                                    else:
-                                        if not is_prod:
-                                            if cutlass.const_expr(self.mtiles == 4):
-                                                if a_ping_pong:
-                                                    self.stage_a_async(next_a, x_addr, srow, num_live_m, kb + Int32(1),
-                                                                       smem_thread_off, col_s, self.hidden_size, 3)
-                                            self.stage_b_async_dyn(next_b, payload, kb + Int32(1), tid, width)
-                                            cute.arch.cp_async_commit_group()
-
-                                if not is_prod:
-                                    if width == Int32(2):
-                                        self.accumulate(total, cur_a, cur_b, lane, warp, 2, cur_scale, num_live_m,
-                                                        ring_only)
-                                    elif width == Int32(3):
-                                        self.accumulate(total, cur_a, cur_b, lane, warp, 3, cur_scale, num_live_m,
-                                                        ring_only)
-                                    elif width == Int32(4):
-                                        self.accumulate(total, cur_a, cur_b, lane, warp, 4, cur_scale, num_live_m,
-                                                        ring_only)
-
-                                if use_ring:
-                                    if not is_prod:
+                                cur_a = shared_a + parity * Int32(12288)
+                                cur_b = shared_b0 + parity * Int32(8192)
+                                # Release the next block before waiting on the slot
+                                # this side is about to overwrite, so the consumers
+                                # never wait on this warp's own schedule.
+                                cute.arch.cp_async_wait_group(0)
+                                if lane == Int32(0):
+                                    if (kb + Int32(1)) < Int32(self.blocks):
+                                        cute.arch.mbarrier_arrive(full_mbar + next_parity)
+                                cute.arch.mbarrier_wait(free_mbar + parity, phase=kb_phase)
+                                if (kb + Int32(2)) < Int32(self.blocks):
+                                    self.stage_a_ring(cur_a, x_addr, prod_sr, num_live_m,
+                                                      kb + Int32(2), lane, self.hidden_size)
+                                    self.stage_b_ring(cur_b, payload, kb + Int32(2), lane, width)
+                                    cute.arch.cp_async_commit_group()
+                        else:
+                            next_scale = ld_global_b16(scales)
+                            for split in cutlass.range(self.splits):
+                                total.fill(Float32(0.0))
+                                for block in cutlass.range(8):
+                                    kb = split * Int32(8) + block
+                                    if kb < Int32(self.blocks):
+                                        parity = kb & Int32(1)
+                                        cur_a = shared_a + parity * Int32(12288)
+                                        cur_b = shared_b0 + parity * Int32(8192)
+                                        cur_scale = next_scale
+                                        cute.arch.mbarrier_wait(full_mbar + parity,
+                                                                phase=(kb >> Int32(1)) & Int32(1))
+                                        if (kb + Int32(1)) < Int32(self.blocks):
+                                            next_scale = ld_global_b16(
+                                                scales + (kb + Int32(1)).to(Int64) * Int64(2))
+                                        if width == Int32(2):
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 2,
+                                                            cur_scale, num_live_m, ring_only)
+                                        elif width == Int32(3):
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 3,
+                                                            cur_scale, num_live_m, ring_only)
+                                        elif width == Int32(4):
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 4,
+                                                            cur_scale, num_live_m, ring_only)
                                         if lane == Int32(0):
                                             cute.arch.mbarrier_arrive(free_mbar + parity)
-                                else:
-                                    if has_next and not a_ping_pong:
+                                for v in cutlass.range_constexpr(8):
+                                    grand0[v] = grand0[v] + total[0, v]
+                                if cutlass.const_expr(self.mtiles >= 2):
+                                    for v in cutlass.range_constexpr(8):
+                                        grand1[v] = grand1[v] + total[1, v]
+                                if cutlass.const_expr(self.mtiles == 4):
+                                    if num_live_m >= Int32(3):
+                                        self.fold_shared_plane(shared_c2, tid, split, total, 2)
+                            for v in cutlass.range_constexpr(8):
+                                total[0, v] = grand0[v]
+                            if cutlass.const_expr(self.mtiles >= 2):
+                                for v in cutlass.range_constexpr(8):
+                                    total[1, v] = grand1[v]
+                            if cutlass.const_expr(self.mtiles == 4):
+                                if num_live_m >= Int32(3):
+                                    self.load_shared_plane(shared_c2, tid, total, 2)
+                            out_meta = Int32(0)
+                            for idx in cutlass.range_constexpr(self.mtiles):
+                                if Int32(idx) < num_live_m:
+                                    m = live_m[idx]
+                                    out_meta = out_meta | (m << Int32(idx * 2))
+                                    for v in cutlass.range_constexpr(2):
+                                        local_out = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                                        slot_out = route_slots[group_base + local_out.to(Int64)]
+                                        if slot_out >= Int32(0) and slot_out < max_slot:
+                                            out_meta = out_meta | Int32(1 << (8 + idx * 2 + v))
+                            out_meta_f = bind_loop_i32(out_meta, num_live_m)
+                            col0 = warp * Int32(16) + (lane & Int32(3)) * Int32(2)
+                            proj_out_base = fc1_addr + (
+                                logical.to(Int64) * Int64(self.group_rows * 128) + col0.to(Int64)
+                            ) * Int64(4)
+                            for idx in cutlass.range_constexpr(mtiles_live):
+                                if Int32(idx) < num_live_m:
+                                    m = (out_meta_f >> Int32(idx * 2)) & Int32(3)
+                                    for v in cutlass.range_constexpr(2):
+                                        if (out_meta_f & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
+                                            local = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                                            row_addr = proj_out_base + local.to(Int64) * Int64(128 * 4)
+                                            st_global_v2_f32(row_addr, total[idx, 2 * v],
+                                                             total[idx, 2 * v + 1])
+                                            st_global_v2_f32(row_addr + Int64(32),
+                                                             total[idx, 4 + 2 * v],
+                                                             total[idx, 4 + 2 * v + 1])
+                    else:
+
+                        prod_sr = cute.make_rmem_tensor(4, Int32)
+                        if cutlass.const_expr(self.fc1_producer):
+                            if is_prod:
+                                row_tbl = srow_tbl + (lane & Int32(15)) * Int32(16)
+                                for idx in cutlass.range_constexpr(4):
+                                    prod_sr[idx] = as_i32_bits(ld_shared_u32_offset(row_tbl, idx * 4))
+
+                        if use_ring:
+                            # Stage 0 is published as soon as it lands; stage 1 is
+                            # issued behind it and covered by block 0.
+                            if is_prod:
+                                self.stage_a_ring(shared_a, x_addr, prod_sr, num_live_m,
+                                                  Int32(0), lane, self.hidden_size)
+                                self.stage_b_ring(shared_b0, payload, Int32(0), lane, width)
+                                cute.arch.cp_async_commit_group()
+                                cute.arch.cp_async_wait_group(0)
+                                if lane == Int32(0):
+                                    cute.arch.mbarrier_arrive(full_mbar)
+                                self.stage_a_ring(shared_a + Int32(12288), x_addr, prod_sr, num_live_m,
+                                                  Int32(1), lane, self.hidden_size)
+                                self.stage_b_ring(shared_b0 + Int32(8192), payload, Int32(1), lane, width)
+                                cute.arch.cp_async_commit_group()
+                        else:
+                            if not is_prod:
+                                self.stage_a_async(shared_a, x_addr, srow, num_live_m, Int32(0),
+                                                   smem_thread_off, col_s, self.hidden_size, self.mtiles)
+                                self.stage_b_async_dyn(shared_b0, payload, Int32(0), tid, width)
+                                cute.arch.cp_async_commit_group()
+                        next_scale = ld_global_b16(scales)
+
+                        for split in cutlass.range(self.splits):
+                            kb0 = split * Int32(8)
+                            total.fill(Float32(0.0))
+                            for block in cutlass.range(8):
+                                kb = kb0 + block
+                                if kb < Int32(self.blocks):
+                                    parity = kb & Int32(1)
+                                    next_parity = (kb + Int32(1)) & Int32(1)
+                                    cur_a = shared_a + parity * a_stride_smem
+                                    next_a = shared_a + next_parity * a_stride_smem
+                                    cur_b = shared_b0 + parity * Int32(8192)
+                                    next_b = shared_b0 + next_parity * Int32(8192)
+                                    has_next = (kb + Int32(1)) < Int32(self.blocks)
+                                    cur_scale = next_scale
+                                    kb_phase = (kb >> Int32(1)) & Int32(1)
+
+                                    if use_ring:
+                                        cute.arch.mbarrier_wait(full_mbar + parity, phase=kb_phase)
+                                    else:
+                                        cute.arch.cp_async_wait_group(0)
                                         cute.arch.sync_threads()
+
+                                    if has_next:
+                                        next_scale = ld_global_b16(scales + (kb + Int32(1)).to(Int64) * Int64(2))
+                                        if use_ring:
+                                            if is_prod:
+                                                # Release block kb+1 first so the consumer
+                                                # warps never wait on this warp's schedule,
+                                                # then wait for block kb to retire.
+                                                cute.arch.cp_async_wait_group(0)
+                                                if lane == Int32(0):
+                                                    cute.arch.mbarrier_arrive(full_mbar + next_parity)
+                                                cute.arch.mbarrier_wait(free_mbar + parity, phase=kb_phase)
+                                                if (kb + Int32(2)) < Int32(self.blocks):
+                                                    self.stage_a_ring(cur_a, x_addr, prod_sr, num_live_m,
+                                                                      kb + Int32(2), lane, self.hidden_size)
+                                                    self.stage_b_ring(cur_b, payload, kb + Int32(2),
+                                                                      lane, width)
+                                                    cute.arch.cp_async_commit_group()
+                                        else:
+                                            if not is_prod:
+                                                if cutlass.const_expr(self.mtiles == 4):
+                                                    if a_ping_pong:
+                                                        self.stage_a_async(next_a, x_addr, srow, num_live_m, kb + Int32(1),
+                                                                           smem_thread_off, col_s, self.hidden_size, 3)
+                                                self.stage_b_async_dyn(next_b, payload, kb + Int32(1), tid, width)
+                                                cute.arch.cp_async_commit_group()
+
+                                    if not is_prod:
+                                        if width == Int32(2):
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 2, cur_scale, num_live_m,
+                                                            ring_only)
+                                        elif width == Int32(3):
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 3, cur_scale, num_live_m,
+                                                            ring_only)
+                                        elif width == Int32(4):
+                                            self.accumulate(total, cur_a, cur_b, lane, warp, 4, cur_scale, num_live_m,
+                                                            ring_only)
+
+                                    if use_ring:
                                         if not is_prod:
-                                            self.stage_a_async(shared_a, x_addr, srow, num_live_m, kb + Int32(1),
-                                                               smem_thread_off, col_s, self.hidden_size, self.mtiles)
-                                            cute.arch.cp_async_commit_group()
+                                            if lane == Int32(0):
+                                                cute.arch.mbarrier_arrive(free_mbar + parity)
+                                    else:
+                                        if has_next and not a_ping_pong:
+                                            cute.arch.sync_threads()
+                                            if not is_prod:
+                                                self.stage_a_async(shared_a, x_addr, srow, num_live_m, kb + Int32(1),
+                                                                   smem_thread_off, col_s, self.hidden_size, self.mtiles)
+                                                cute.arch.cp_async_commit_group()
+
+                            for v in cutlass.range_constexpr(8):
+                                grand0[v] = grand0[v] + total[0, v]
+                            if cutlass.const_expr(self.mtiles >= 2):
+                                for v in cutlass.range_constexpr(8):
+                                    grand1[v] = grand1[v] + total[1, v]
+                            if cutlass.const_expr(self.mtiles == 4):
+                                if not is_prod:
+                                    if num_live_m >= Int32(3):
+                                        self.fold_shared_plane(shared_c2, tid, split, total, 2)
+                                    if cutlass.const_expr(not ring_only):
+                                        if num_live_m >= Int32(4):
+                                            self.fold_shared_plane(shared_c3, tid, split, total, 3)
 
                         for v in cutlass.range_constexpr(8):
-                            grand0[v] = grand0[v] + total[0, v]
+                            total[0, v] = grand0[v]
                         if cutlass.const_expr(self.mtiles >= 2):
                             for v in cutlass.range_constexpr(8):
-                                grand1[v] = grand1[v] + total[1, v]
+                                total[1, v] = grand1[v]
                         if cutlass.const_expr(self.mtiles == 4):
                             if not is_prod:
                                 if num_live_m >= Int32(3):
-                                    self.fold_shared_plane(shared_c2, tid, split, total, 2)
+                                    self.load_shared_plane(shared_c2, tid, total, 2)
                                 if cutlass.const_expr(not ring_only):
                                     if num_live_m >= Int32(4):
-                                        self.fold_shared_plane(shared_c3, tid, split, total, 3)
+                                        self.load_shared_plane(shared_c3, tid, total, 3)
 
-                    for v in cutlass.range_constexpr(8):
-                        total[0, v] = grand0[v]
-                    if cutlass.const_expr(self.mtiles >= 2):
-                        for v in cutlass.range_constexpr(8):
-                            total[1, v] = grand1[v]
-                    if cutlass.const_expr(self.mtiles == 4):
+                        # Built after the split loop so it is not live across it.
+                        out_meta = Int32(0)
                         if not is_prod:
-                            if num_live_m >= Int32(3):
-                                self.load_shared_plane(shared_c2, tid, total, 2)
-                            if cutlass.const_expr(not ring_only):
-                                if num_live_m >= Int32(4):
-                                    self.load_shared_plane(shared_c3, tid, total, 3)
-
-                    # Built after the split loop so it is not live across it.
-                    out_meta = Int32(0)
-                    if not is_prod:
-                        for idx in cutlass.range_constexpr(self.mtiles):
-                            if Int32(idx) < num_live_m:
-                                m = live_m[idx]
-                                out_meta = out_meta | (m << Int32(idx * 2))
-                                for v in cutlass.range_constexpr(2):
-                                    local_out = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
-                                    slot_out = route_slots[group_base + local_out.to(Int64)]
-                                    if slot_out >= Int32(0) and slot_out < max_slot:
-                                        out_meta = out_meta | Int32(1 << (8 + idx * 2 + v))
-                    out_meta_f = bind_loop_i32(out_meta, num_live_m)
-                    col0 = warp * Int32(16) + (lane & Int32(3)) * Int32(2)
-                    proj_out_base = fc1_addr + (
-                        logical.to(Int64) * Int64(self.group_rows * 128) + col0.to(Int64)
-                    ) * Int64(4)
-                    if not is_prod:
-                        for idx in cutlass.range_constexpr(mtiles_live):
-                            if Int32(idx) < num_live_m:
-                                m = (out_meta_f >> Int32(idx * 2)) & Int32(3)
-                                for v in cutlass.range_constexpr(2):
-                                    if (out_meta_f & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
-                                        local = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
-                                        row_addr = proj_out_base + local.to(Int64) * Int64(128 * 4)
-                                        st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
-                                        st_global_v2_f32(row_addr + Int64(32), total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
+                            for idx in cutlass.range_constexpr(self.mtiles):
+                                if Int32(idx) < num_live_m:
+                                    m = live_m[idx]
+                                    out_meta = out_meta | (m << Int32(idx * 2))
+                                    for v in cutlass.range_constexpr(2):
+                                        local_out = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                                        slot_out = route_slots[group_base + local_out.to(Int64)]
+                                        if slot_out >= Int32(0) and slot_out < max_slot:
+                                            out_meta = out_meta | Int32(1 << (8 + idx * 2 + v))
+                        out_meta_f = bind_loop_i32(out_meta, num_live_m)
+                        col0 = warp * Int32(16) + (lane & Int32(3)) * Int32(2)
+                        proj_out_base = fc1_addr + (
+                            logical.to(Int64) * Int64(self.group_rows * 128) + col0.to(Int64)
+                        ) * Int64(4)
+                        if not is_prod:
+                            for idx in cutlass.range_constexpr(mtiles_live):
+                                if Int32(idx) < num_live_m:
+                                    m = (out_meta_f >> Int32(idx * 2)) & Int32(3)
+                                    for v in cutlass.range_constexpr(2):
+                                        if (out_meta_f & Int32(1 << (8 + idx * 2 + v))) != Int32(0):
+                                            local = m * Int32(16) + Int32(v * 8) + (lane >> Int32(2))
+                                            row_addr = proj_out_base + local.to(Int64) * Int64(128 * 4)
+                                            st_global_v2_f32(row_addr, total[idx, 2 * v], total[idx, 2 * v + 1])
+                                            st_global_v2_f32(row_addr + Int64(32), total[idx, 4 + 2 * v], total[idx, 4 + 2 * v + 1])
                 cute.arch.sync_threads()
             task += step
 
