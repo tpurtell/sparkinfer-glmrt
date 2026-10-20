@@ -838,7 +838,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 width = bits[desc]
                 # The ring entry owns every task with three or fewer live tiles;
                 # this one tests for four before it writes any shared memory.
-                if self.has_four_live_tiles(route_slots, group, rows, lane):
+                # Without a ring entry this kernel takes every task, as base did.
+                if cutlass.const_expr(self.fc1_producer):
+                    owns_task = self.has_four_live_tiles(route_slots, group, rows, lane)
+                else:
+                    owns_task = True
+                if owns_task:
                     num_live_m, live_m, srow = self.prepare_group_tiles(
                         route_slots, group, rows, tid, lane, shared_a, smem_thread_off, False)
                     cute.arch.sync_threads()
