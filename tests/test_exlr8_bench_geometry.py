@@ -84,6 +84,7 @@ def test_serving_k4_ws_tile_contract(width, tile):
     text = SOURCE.read_text()
     assert 'serving_k4_states(total, exl_layers, props, width)' in text
     assert 'if owned is None else' in text
+    assert 'finite_nonzero(uniform_states[-1][1].output[:total].float()' in text
 
 
 def test_serving_k4_against_sealed_package():

@@ -859,7 +859,7 @@ def grouped_main(args):
             n = int((chunk_response.view(torch.int16) != state["output"][:total].view(torch.int16)).sum())
             raise RuntimeError(f"grouped result differs from snapshot chunked K1: {n} BF16 words")
         finite_nonzero(state["output"][:total].float(), "grouped EXLR8")
-        finite_nonzero(uniform_states[-1][1].output.float(), "uniform grouped EXL3")
+        finite_nonzero(uniform_states[-1][1].output[:total].float(), "uniform grouped EXL3")
         if mixed_states:
             finite_nonzero(mixed_states[-1][1].output[:total].float(), "mixed grouped EXL3")
         for name, (program, ingress, _) in frozen.items():
