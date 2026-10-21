@@ -27,10 +27,11 @@ DEFAULT_FP8_PREFILL_TILE = (64, 1, 2, 0, 1)
 class _Fp8PrefillAttention:
     def __init__(self, g, tile):
         self.g = g
-        chunk, stages, query_tile, prefetch, min_blocks = tile
+        chunk, stages, query_tile, prefetch, min_blocks = tile[:5]
+        widen = tile[5] if len(tile) > 5 else 0
         self.kernel = DenseMlaFp8PrefillKernel(
             num_heads=g.heads, page_size=64, chunk=chunk, stages=stages,
-            query_tile=query_tile, prefetch=prefetch, min_blocks=min_blocks,
+            query_tile=query_tile, prefetch=prefetch, min_blocks=min_blocks, widen=widen,
         )
 
     @cute.jit

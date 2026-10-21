@@ -36,6 +36,8 @@ from b12x._lib.intrinsics import (
     get_ptr_as_int64,
     ld_global_nc_v4_u32,
     ld_shared_f32,
+    ld_shared_u32,
+    ldmatrix_m8n8x4_trans_b16,
     ld_shared_v4_f32,
     ldmatrix_m16n16x1_trans_b8,
     ldmatrix_m8n8x4_b16,
@@ -85,6 +87,7 @@ class DenseMlaFp8PrefillKernel:
         query_tile: int = 1,
         prefetch: int = 0,
         min_blocks: int = 1,
+        widen: int = 0,
     ):
         if num_heads % HEADS_PER_TILE:
             raise ValueError("FP8 MLA prefill needs a multiple of sixteen heads")
@@ -92,6 +95,8 @@ class DenseMlaFp8PrefillKernel:
             raise ValueError("chunk must be 32 or 64 and divide the page")
         if stages not in (1, 2, 3) or query_tile not in (1, 2):
             raise ValueError("unsupported FP8 MLA prefill ring")
+        self.widen = int(widen)
+        self.record_stride = 1168 if widen else RECORD_BYTES
         self.num_heads = int(num_heads)
         self.page_size = int(page_size)
         self.chunk = int(chunk)
@@ -107,8 +112,8 @@ class DenseMlaFp8PrefillKernel:
         self.block_threads = self.math_threads + 32
         self.p_stride = (self.chunk + 8) * 2
         self.p_group_bytes = HEADS_PER_TILE * self.p_stride
-        self.kv_stage_bytes = self.chunk * RECORD_BYTES
-        total = smem_bytes(chunk=chunk, stages=stages, query_tile=query_tile)
+        self.kv_stage_bytes = self.chunk * self.record_stride
+        total = smem_bytes(chunk=chunk, stages=stages, query_tile=query_tile) + stages * chunk * (self.record_stride - RECORD_BYTES)
         if total > 101376:
             raise ValueError(f"FP8 MLA prefill tile needs {total} bytes of SMEM")
 
@@ -207,7 +212,7 @@ class DenseMlaFp8PrefillKernel:
                 + head * Int32(Q_ROW_BYTES)
                 + block * Int32(32)
             )
-            if block < Int32(LATENT_DIM // 16):
+            if block < Int32(LATENT_DIM // 16) and cutlass.const_expr(not self.widen):
                 st_shared_v4_u32(dst, w0, w2, w4, w6)
                 st_shared_v4_u32(dst + Int32(16), w1, w3, w5, w7)
             else:
@@ -288,6 +293,74 @@ class DenseMlaFp8PrefillKernel:
         return qk
 
     @cute.jit
+    def _widen_chunk(self, kv_addr: Int32, math_tid: Int32):
+        # Snapshot every compact word before any expanding store can overwrite it.
+        slices = 2 if self.widen == 2 else 1
+        slice_words = self.chunk * (RECORD_BYTES // 4) // slices
+        words = (slice_words + self.math_threads - 1) // self.math_threads
+        for part in cutlass.range_constexpr(slices):
+            raw = cute.make_rmem_tensor(words, Uint32)
+            for i in cutlass.range_constexpr(words):
+                local = math_tid + Int32(i * self.math_threads)
+                idx = local + Int32((slices - 1 - part) * slice_words)
+                raw[i] = Uint32(0)
+                if local < Int32(slice_words):
+                    raw[i] = ld_shared_u32(kv_addr + idx * Int32(4))
+            cute.arch.barrier(barrier_id=4, number_of_threads=self.math_threads)
+            for i in cutlass.range_constexpr(words):
+                local = math_tid + Int32(i * self.math_threads)
+                idx = local + Int32((slices - 1 - part) * slice_words)
+                row = idx // Int32(RECORD_BYTES // 4)
+                word = idx % Int32(RECORD_BYTES // 4)
+                if local < Int32(slice_words):
+                    dst = kv_addr + row * Int32(self.record_stride)
+                    if word < Int32(128):
+                        lo, hi = fp8x4_e4m3_to_bfloat2x2_native_sm120(raw[i])
+                        st_shared_u32(dst + word * Int32(8), lo)
+                        st_shared_u32(dst + word * Int32(8) + Int32(4), hi)
+                    else:
+                        st_shared_u32(dst + word * Int32(4) + Int32(512), raw[i])
+            cute.arch.barrier(barrier_id=4, number_of_threads=self.math_threads)
+
+    @cute.jit
+    def _scores_wide(self, q_addr: Int32, kv_addr: Int32, warp: Int32, lane: Int32):
+        a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+        q_lane = q_addr + a_row * Int32(Q_ROW_BYTES) + (lane >> Int32(4)) * Int32(16)
+        first = warp * Int32(self.warp_cands)
+        k_lane = kv_addr + (first + (lane & Int32(7))) * Int32(self.record_stride) + (lane >> Int32(3)) * Int32(16)
+        tid = lane & Int32(3)
+        qk = [Float32(0.0) for _ in range(4 * self.ntiles)]
+        for g in cutlass.range_constexpr(4):
+            part = [Float32(0.0) for _ in range(4 * self.ntiles)]
+            for slab in cutlass.range_constexpr(4):
+                kregs = []
+                for nt in cutlass.range_constexpr(self.ntiles):
+                    kregs.append(ldmatrix_m8n8x4_b16(k_lane + Int32(nt * 8 * self.record_stride + g * 256 + slab * 64)))
+                for half in cutlass.range_constexpr(2):
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(q_lane + Int32(g * 256 + slab * 64 + half * 32))
+                    for nt in cutlass.range_constexpr(self.ntiles):
+                        part[nt*4], part[nt*4+1], part[nt*4+2], part[nt*4+3] = mma_m16n8k16_f32_bf16(
+                            part[nt*4], part[nt*4+1], part[nt*4+2], part[nt*4+3], a0, a1, a2, a3,
+                            kregs[nt][half*2], kregs[nt][half*2+1])
+            for nt in cutlass.range_constexpr(self.ntiles):
+                c = first + Int32(nt*8) + tid * Int32(2)
+                s0 = ld_shared_f32(kv_addr + c * Int32(self.record_stride) + Int32(1024 + g*4))
+                s1 = ld_shared_f32(kv_addr + (c+Int32(1)) * Int32(self.record_stride) + Int32(1024 + g*4))
+                for r in cutlass.range_constexpr(4):
+                    scale = s0 if r % 2 == 0 else s1
+                    qk[nt*4+r] = qk[nt*4+r] + part[nt*4+r] * scale
+        for slab in cutlass.range_constexpr(2):
+            kregs = []
+            for nt in cutlass.range_constexpr(self.ntiles):
+                kregs.append(ldmatrix_m8n8x4_b16(k_lane + Int32(nt * 8 * self.record_stride + 1040 + slab*64)))
+            for half in cutlass.range_constexpr(2):
+                a0,a1,a2,a3 = ldmatrix_m8n8x4_b16(q_lane + Int32(1024 + slab*64 + half*32))
+                for nt in cutlass.range_constexpr(self.ntiles):
+                    qk[nt*4],qk[nt*4+1],qk[nt*4+2],qk[nt*4+3] = mma_m16n8k16_f32_bf16(
+                        qk[nt*4],qk[nt*4+1],qk[nt*4+2],qk[nt*4+3],a0,a1,a2,a3,kregs[nt][half*2],kregs[nt][half*2+1])
+        return qk
+
+    @cute.jit
     def _run_group(
         self, q_addr: Int32, kv_base: Int32, p_base: Int32, red_addr: Int32,
         mbar_base, active_chunks: Int32, first_chunk: Int32, visible_end: Int32,
@@ -326,8 +399,13 @@ class DenseMlaFp8PrefillKernel:
             chunk_begin = chunk * Int32(self.chunk)
             kv_addr = kv_base + stage * Int32(self.kv_stage_bytes)
             cute.arch.mbarrier_wait(mbar_base + stage, phase=phase)
+            if cutlass.const_expr(self.widen):
+                self._widen_chunk(kv_addr, Int32(cute.arch.thread_idx()[0]))
             if query_valid != Int32(0) and chunk_begin < visible_end:
-                qk = self._scores(q_addr, kv_addr, warp, lane)
+                if cutlass.const_expr(self.widen):
+                    qk = self._scores_wide(q_addr, kv_addr, warp, lane)
+                else:
+                    qk = self._scores(q_addr, kv_addr, warp, lane)
                 # causal mask + base-2 scale; local max per head row
                 mx0 = Float32(_MASK)
                 mx1 = Float32(_MASK)
@@ -378,10 +456,10 @@ class DenseMlaFp8PrefillKernel:
                 for nt in cutlass.range_constexpr(self.ntiles):
                     lc = warp * Int32(self.warp_cands) + Int32(nt * 8) + tid * Int32(2)
                     sa0, sa1, sa2, sa3 = ld_shared_v4_f32(
-                        kv_addr + lc * Int32(RECORD_BYTES) + Int32(SCALE_OFFSET)
+                        kv_addr + lc * Int32(self.record_stride) + Int32(1024 if self.widen else SCALE_OFFSET)
                     )
                     sb0, sb1, sb2, sb3 = ld_shared_v4_f32(
-                        kv_addr + (lc + Int32(1)) * Int32(RECORD_BYTES) + Int32(SCALE_OFFSET)
+                        kv_addr + (lc + Int32(1)) * Int32(self.record_stride) + Int32(1024 if self.widen else SCALE_OFFSET)
                     )
                     sa = (sa0, sa1, sa2, sa3)
                     sb = (sb0, sb1, sb2, sb3)
@@ -414,9 +492,13 @@ class DenseMlaFp8PrefillKernel:
                         + warp * Int32(GROUP)
                     )
                     for blk in cutlass.range_constexpr(GROUP // 16):
-                        f0, f1 = ldmatrix_m16n16x1_trans_b8(v_lane + Int32(blk * 16))
-                        b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
-                        b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                        if cutlass.const_expr(self.widen):
+                            wide_v = kv_addr + (Int32(ks*16) + (lane & Int32(15))) * Int32(self.record_stride) + warp * Int32(GROUP*2) + (lane >> Int32(4)) * Int32(16)
+                            b0,b1,b2,b3 = ldmatrix_m8n8x4_trans_b16(wide_v + Int32(blk*32))
+                        else:
+                            f0, f1 = ldmatrix_m16n16x1_trans_b8(v_lane + Int32(blk * 16))
+                            b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                            b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
                         n0 = blk * 2
                         (
                             acc[n0 * 4], acc[n0 * 4 + 1], acc[n0 * 4 + 2], acc[n0 * 4 + 3],
