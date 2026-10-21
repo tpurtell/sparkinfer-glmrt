@@ -244,6 +244,70 @@ def test_every_live_row_count_matches_decode(units):
                 assert torch.isnan(state["output"][live:]).all()
 
 
+def test_schedule_dispatch_and_env_override(monkeypatch):
+    if os.environ.get("EXLR8_FROZEN_GROUPED_ARM"):
+        return
+    from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+    monkeypatch.delenv("EXLR8_GROUPED_SCHEDULE", raising=False)
+    monkeypatch.delenv("EXLR8_GROUPED_BASE_THRESHOLD", raising=False)
+    assert Exlr8GroupedKernel.resolve_base_row_threshold() == 4096
+    monkeypatch.setenv("EXLR8_GROUPED_SCHEDULE", "base")
+    assert Exlr8GroupedKernel.resolve_base_row_threshold() == 1
+    monkeypatch.setenv("EXLR8_GROUPED_SCHEDULE", "v28")
+    assert Exlr8GroupedKernel.resolve_base_row_threshold() == 4097
+    monkeypatch.setenv("EXLR8_GROUPED_SCHEDULE", "auto")
+    monkeypatch.setenv("EXLR8_GROUPED_BASE_THRESHOLD", "2049")
+    assert Exlr8GroupedKernel.resolve_base_row_threshold() == 2049
+    monkeypatch.delenv("EXLR8_GROUPED_BASE_THRESHOLD", raising=False)
+
+    torch.cuda.set_per_process_memory_fraction(0.25)
+    hidden, units, topk, rows = 6144, 1, 2, 4096
+    gen = torch.Generator(device="cuda").manual_seed(408)
+    owners = []
+    pointers = torch.zeros((4, units, 3, 3), dtype=torch.int64)
+    bits = torch.zeros((4, units, 3), dtype=torch.int32)
+    for e in range(4):
+        for u in range(units):
+            for p in range(3):
+                width = 2 + (e + u + p) % 3
+                ts = (
+                    torch.randint(256, (hidden * 16 * width,), generator=gen, dtype=torch.uint8, device="cuda"),
+                    torch.full((128,), 0.1, dtype=torch.float16, device="cuda"),
+                    torch.full((hidden // 128,), 0.1, dtype=torch.float16, device="cuda"),
+                )
+                owners.extend(ts)
+                pointers[e, u, p] = torch.tensor([t.data_ptr() for t in ts])
+                bits[e, u, p] = width
+    pointers, bits = pointers.cuda(), bits.cuda()
+    signs = [torch.ones(hidden, dtype=torch.int8, device="cuda") for _ in range(2)]
+    wire, _ = make_wire(torch.randn((rows, hidden), generator=gen, device="cuda") * 0.02)
+    ids = ((torch.arange(rows * topk, device="cuda") * 3 + 1) % 4).reshape(rows, topk).int()
+    weights = torch.rand((rows, topk), generator=gen, device="cuda") / topk
+    base, state = buffers(64, hidden, units, topk, 128, 16), buffers(rows, hidden, units, topk, 132, 64)
+    dec = programs(hidden, units, topk, 128, 16, False)
+    state["compact"] = compact_unit_descriptors(bits)
+    expected = torch.empty((rows, hidden), dtype=torch.bfloat16, device="cuda")
+    for first in range(0, rows, 64):
+        run(dec, base, wire[first:], ids[first:], weights[first:], pointers, bits, signs, 64, 48)
+        expected[first:first + 64].copy_(base["output"][:64])
+    assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+
+    for schedule in ("auto", "base", "v28"):
+        monkeypatch.setenv("EXLR8_GROUPED_SCHEDULE", schedule)
+        grouped = programs(hidden, units, topk, 132, 64, True)
+        with kernel_resolution_guard(f"EXLR8 grouped schedule={schedule}"):
+            for live in (1, 384, 512, 768, 1024, 1408, 2048, 4096):
+                for limit in (96, 188):
+                    state["output"].fill_(float("nan"))
+                    run(grouped, state, wire, ids, weights, pointers, bits, signs, live, limit)
+                    assert torch.equal(
+                        state["output"][:live].view(torch.int16),
+                        expected[:live].view(torch.int16),
+                    ), (schedule, live, limit)
+                    assert torch.isnan(state["output"][live:]).all()
+    monkeypatch.delenv("EXLR8_GROUPED_SCHEDULE", raising=False)
+
+
 def test_frozen_candidate_arms():
     if os.environ.get("EXLR8_FROZEN_GROUPED_ARM") or os.environ.get("EXLR8_RUN_AUTO_ARMS") != "1":
         return

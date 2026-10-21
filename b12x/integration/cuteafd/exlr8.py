@@ -203,6 +203,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                                             ("rows", "cta_limit") if device_count
                                                             else ("rows", "groups", "cta_limit"))),
                            key=((h, u, t, m, g["abi_version"], shared_expert, grouped, r)
-                                + (("grouped_compact_units",) if grouped else ())), geometry=g,
+                                + (("grouped_compact_units",
+                                    Exlr8GroupedKernel.resolve_base_row_threshold())
+                                   if grouped else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)
