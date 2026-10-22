@@ -279,7 +279,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 105
+    CODE_VERSION = 106
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
@@ -1128,12 +1128,15 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         signs = ld_global_nc_u32(g_base + col.to(Int64))
         chunk = lane >> Int32(1)
         half = (lane & Int32(1)) * Int32(8)
-        for j in cutlass.range_constexpr(16):
-            r = warp + Int32(4 * j)
-            tok = ld_shared_i32_relaxed(tok_base + r * Int32(4))
-            lo = Uint32(0)
-            hi = Uint32(0)
-            if tok >= Int32(0):
+        sgn = (signed_byte(signs, 0), signed_byte(signs, 1), signed_byte(signs, 2), signed_byte(signs, 3))
+        # Two passes of eight independent rows: every load first, then the
+        # eight H128 chains interleaved, one warp sync, then the stores (rows
+        # are read whole before any lane overwrites them in place).
+        for g in cutlass.range_constexpr(2):
+            vals = []
+            for jj in cutlass.range_constexpr(8):
+                r = warp + Int32(4 * (8 * g + jj))
+                tok = ld_shared_i32_relaxed(tok_base + r * Int32(4))
                 packed = ld_shared_u32(stage + r * Int32(256) + lane * Int32(4))
                 scales = ld_shared_u32(sc_slot + r * Int32(4))
                 sc = ((scales >> ((lane >> Int32(3)) * Int32(8)).to(Uint32)) & Uint32(0xFF)).to(Int32)
@@ -1143,12 +1146,20 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 if sc == Int32(255):
                     bits = Uint32(0x7FFFFFFF)
                 v0, v1, v2, v3 = _e4m3x4_scaled(packed, bits)
-                h0, h1, h2, h3 = _w4a8_had128_quad(v0 * signed_byte(signs, 0), v1 * signed_byte(signs, 1),
-                                                   v2 * signed_byte(signs, 2), v3 * signed_byte(signs, 3), lane)
+                vals.append((tok, v0 * sgn[0], v1 * sgn[1], v2 * sgn[2], v3 * sgn[3]))
+            outs = []
+            for jj in cutlass.range_constexpr(8):
+                tok, a0, a1, a2, a3 = vals[jj]
+                h0, h1, h2, h3 = _w4a8_had128_quad(a0, a1, a2, a3, lane)
                 lo = _f32x2_to_f16x2(h0, h1)
                 hi = _f32x2_to_f16x2(h2, h3)
+                valid = tok >= Int32(0)
+                outs.append((cutlass.select_(valid, lo, Uint32(0)), cutlass.select_(valid, hi, Uint32(0))))
             cute.arch.sync_warp()
-            st_shared_v2_b32(stage + r * Int32(256) + (chunk ^ (r & Int32(7))) * Int32(16) + half, lo, hi)
+            for jj in cutlass.range_constexpr(8):
+                r = warp + Int32(4 * (8 * g + jj))
+                st_shared_v2_b32(stage + r * Int32(256) + (chunk ^ (r & Int32(7))) * Int32(16) + half,
+                                 outs[jj][0], outs[jj][1])
 
     @cute.jit
     def fc1_ws_block(self, total: cute.Tensor, a_base: Int32, b_base: Int32,
