@@ -267,19 +267,19 @@ def query_optin_shared_memory() -> int | None:
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
     CODE_VERSION = 103
-    FC2_WS = False
-    REDUCE_MLP = False
-    FC2_HALF = False
+    FC2_WS = True
+    REDUCE_MLP = True
+    FC2_HALF = True
     FC2_STAGES = 4
     # FC1 on K4's warp-specialized structure with EXLR8 decode. Not bitwise to
     # the K1 split fold: each output accumulates its 48 per-K128 scaled
     # blocks in one ascending F32 FMA chain (K4's full-K register chain)
     # instead of folding K1024 split partials.
-    FC1_WS = False
+    FC1_WS = True
     FC1_STAGES = 3
     # Timing probes only (wrong numerics): "a_l2" (every A row is token 0),
     # "w_l2" (every tile streams expert 0 unit 0), "nodecode" (raw words as B).
-    FC1_PROBE = ""
+    FC1_PROBE = "nodecode"
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -1051,7 +1051,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     wa = (window >> shifts[j][0].to(Int64)).to(Uint32)
                     wb = (window >> shifts[j][1].to(Int64)).to(Uint32)
                 if cutlass.const_expr(self.FC1_PROBE == "nodecode"):
-                    frags.append((wa, wb, wa ^ wb, wb >> Uint32(1)))
+                    # Finite small halves (exponent top bits cleared): 1 LOP3 per word.
+                    m = Uint32(0x23FF23FF)
+                    frags.append((wa & m, wb & m, (wa ^ wb) & m, (wb >> Uint32(1)) & m))
                 else:
                     b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
                     frags.append((_e4m3_round_half2(b0), _e4m3_round_half2(b1),
