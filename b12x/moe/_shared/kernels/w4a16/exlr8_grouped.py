@@ -19,6 +19,7 @@ from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_bulk_g2s_mbar,
     ld_shared_i32_relaxed,
+    ld_shared_u32,
     st_shared_i32,
     st_global_u32,
     st_global_v4_u32,
@@ -39,7 +40,8 @@ from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
 from .mixed_trellis_ws import (
     _mbar_init, _fence_mbar_init, _mbar_wait, _mbar_arrive,
-    _mbar_arrive_expect_tx, _cp_async_mbar_arrive_noinc,
+    _mbar_arrive_expect_tx, _cp_async_mbar_arrive_noinc, _producer_bar_sync,
+    _cp_async_u32_pred as cp_async_u32_pred,
 )
 
 # FC1 warp-specialized layout (K4's mixed_trellis_ws shape): 8 consumer warps
@@ -277,7 +279,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 104
+    CODE_VERSION = 105
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
@@ -318,8 +320,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         self.fc1_hdr_words = _FC1_HEADER_WORDS + 2 * self.blocks
         self.fc1_hdr_bytes = (4 * self.fc1_hdr_words + 15) // 16 * 16
         self.fc1_hdr_off = self.FC1_STAGES * self.fc1_stage_bytes
-        self.fc1_bar_off = self.fc1_hdr_off + _FC1_TILE_STAGES * self.fc1_hdr_bytes
-        self.fc1_smem_bytes = self.fc1_bar_off + 8 * 2 * (self.FC1_STAGES + _FC1_TILE_STAGES)
+        # Wire mode: each stage's 64 rows' UE8M0 K128 words (raw E4M3 rows sit
+        # in the A slot itself until the producer rotates them in place).
+        self.fc1_sc_off = self.fc1_hdr_off + _FC1_TILE_STAGES * self.fc1_hdr_bytes
+        self.fc1_tok_off = self.fc1_sc_off + self.FC1_STAGES * 4 * group_rows
+        self.fc1_bar_off = self.fc1_tok_off + 4 * group_rows
+        self.fc1_smem_bytes = self.fc1_bar_off + 8 * (3 * self.FC1_STAGES + 2 * _FC1_TILE_STAGES)
         # The warp-specialized FC1 tile is the 64-row group (four M16 tiles).
         self.fc1_ws = bool(self.FC1_WS) and group_rows == 64
         self.fc1_wire = self.fc1_ws and bool(self.FC1_WIRE)
@@ -910,11 +916,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         bar_empty = bar_full + Int32(8 * stages)
         bar_tfull = bar_empty + Int32(8 * stages)
         bar_tempty = bar_tfull + Int32(8 * _FC1_TILE_STAGES)
+        bar_raw = bar_tempty + Int32(8 * _FC1_TILE_STAGES)
         max_slot = rows * Int32(self.top_k)
         x_addr = x.iterator.toint()
         c = ptid & Int32(15)
         token = cute.make_rmem_tensor(8, Int32)
-        wtok = Int32(-1)
+        tok_base = ring + Int32(self.fc1_tok_off)
         seq = Int32(0)
         ti = Int32(0)
         t = cta
@@ -992,39 +999,58 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 tok = Int32(0)
                     token[i] = tok
                 if cutlass.const_expr(self.fc1_wire):
-                    # Warp w rotates rows w + 4j; lane j holds row w + 4j's token.
-                    wr = (ptid >> Int32(5)) + Int32(4) * (lane & Int32(15))
-                    widx = wr >> Int32(4)
-                    wtok_l = Int32(-1)
-                    if widx < num_live:
-                        m = (live >> (widx * Int32(2))) & Int32(3)
-                        sl = route_slots[gbase + (m * Int32(16) + (wr & Int32(15))).to(Int64)]
-                        if sl >= Int32(0) and sl < max_slot:
-                            wtok_l = sl // Int32(self.top_k)
-                            if cutlass.const_expr(self.FC1_PROBE == "a_l2"):
-                                wtok_l = Int32(0)
-                    wtok = wtok_l
+                    # Tile row tokens for every producer warp (the previous tile's
+                    # rotations, all before this point in program order, are done).
+                    _producer_bar_sync()
+                    if ptid < Int32(self.group_rows):
+                        idx = ptid >> Int32(4)
+                        tk = Int32(-1)
+                        if idx < num_live:
+                            m = (live >> (idx * Int32(2))) & Int32(3)
+                            sl = route_slots[gbase + (m * Int32(16) + (ptid & Int32(15))).to(Int64)]
+                            if sl >= Int32(0) and sl < max_slot:
+                                tk = sl // Int32(self.top_k)
+                                if cutlass.const_expr(self.FC1_PROBE == "a_l2"):
+                                    tk = Int32(0)
+                        st_shared_i32(tok_base + ptid * Int32(4), tk)
+                    _producer_bar_sync()
                 bytes_tx = (w0 + w1) * Int32(2048)
-                for kb in cutlass.range(self.blocks):
-                    slot = seq % Int32(stages)
-                    _mbar_wait(bar_empty + slot * Int32(8),
-                               ((seq // Int32(stages)) & Int32(1)) ^ Int32(1))
-                    stage = ring + slot * Int32(self.fc1_stage_bytes)
-                    full = bar_full + slot * Int32(8)
-                    if ptid == Int32(0):
-                        _mbar_arrive_expect_tx(full, bytes_tx)
-                        if w0 != Int32(0):
-                            n0 = w0 * Int32(2048)
-                            cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes),
-                                                   pay0 + kb.to(Int64) * n0.to(Int64), n0, full)
-                        if w1 != Int32(0):
-                            n1 = w1 * Int32(2048)
-                            cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes + 8192),
-                                                   pay1 + kb.to(Int64) * n1.to(Int64), n1, full)
-                    if cutlass.const_expr(self.fc1_wire):
-                        self.fc1_ws_rotate_block(stage, x_addr, wtok, rows, kb, ptid)
-                        _mbar_arrive(full)
-                    else:
+                if cutlass.const_expr(self.fc1_wire):
+                    # Loads run FC1_STAGES - 1 blocks ahead of the in-place rotation.
+                    ahead = Int32(self.FC1_STAGES - 1)
+                    for kb in cutlass.range(min(ahead, Int32(self.blocks))):
+                        self.fc1_ws_issue_wire(ring, bar_full, bar_empty, bar_raw, seq + kb, kb,
+                                               w0, w1, pay0, pay1, bytes_tx, x_addr, rows, tok_base, ptid)
+                    for kb in cutlass.range(self.blocks):
+                        if kb + ahead < Int32(self.blocks):
+                            self.fc1_ws_issue_wire(ring, bar_full, bar_empty, bar_raw, seq + kb + ahead,
+                                                   kb + ahead, w0, w1, pay0, pay1, bytes_tx, x_addr,
+                                                   rows, tok_base, ptid)
+                        sq = seq + kb
+                        slot = sq % Int32(stages)
+                        _mbar_wait(bar_raw + slot * Int32(8), (sq // Int32(stages)) & Int32(1))
+                        self.fc1_ws_rotate_staged(ring + slot * Int32(self.fc1_stage_bytes),
+                                                  ring + Int32(self.fc1_sc_off) + slot * Int32(4 * self.group_rows),
+                                                  tok_base, x_addr, rows, kb, ptid)
+                        _mbar_arrive(bar_full + slot * Int32(8))
+                    seq += Int32(self.blocks)
+                else:
+                    for kb in cutlass.range(self.blocks):
+                        slot = seq % Int32(stages)
+                        _mbar_wait(bar_empty + slot * Int32(8),
+                                   ((seq // Int32(stages)) & Int32(1)) ^ Int32(1))
+                        stage = ring + slot * Int32(self.fc1_stage_bytes)
+                        full = bar_full + slot * Int32(8)
+                        if ptid == Int32(0):
+                            _mbar_arrive_expect_tx(full, bytes_tx)
+                            if w0 != Int32(0):
+                                n0 = w0 * Int32(2048)
+                                cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes),
+                                                       pay0 + kb.to(Int64) * n0.to(Int64), n0, full)
+                            if w1 != Int32(0):
+                                n1 = w1 * Int32(2048)
+                                cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes + 8192),
+                                                       pay1 + kb.to(Int64) * n1.to(Int64), n1, full)
                         col_bytes = (kb.to(Int64) * Int64(128) + c.to(Int64) * Int64(8)) * Int64(2)
                         for i in cutlass.range_constexpr(8):
                             r = (ptid >> Int32(4)) + Int32(8 * i)
@@ -1034,7 +1060,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             cp_async4_shared_global_cg_pred(
                                 stage + r * Int32(256) + (c ^ (r & Int32(7))) * Int32(16), src, valid)
                         _cp_async_mbar_arrive_noinc(full)
-                    seq += Int32(1)
+                        seq += Int32(1)
             t += grid
         hslot = ti % Int32(_FC1_TILE_STAGES)
         _mbar_wait(bar_tempty + hslot * Int32(8),
@@ -1044,31 +1070,72 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         _mbar_arrive(bar_tfull + hslot * Int32(8))
 
     @cute.jit
-    def fc1_ws_rotate_block(self, stage: Int32, x_addr: Int64, wtok: Int32, rows: Int32,
-                            kb: Int32, ptid: Int32):
-        """One K128 block of A from the staged wire: warp w writes rows w + 4j
-        (j = 0..15; lane j of ``wtok`` holds row w + 4j's token or -1) as
-        F16(H128(dequant(wire) * signs.in)) with exlr8_glue ingress's exact
-        arithmetic and lane mapping (lane l: columns 4l..4l+3), stored at the
-        consumer's swizzled A position. Padding rows are zero."""
+    def fc1_ws_issue_wire(self, ring: Int32, bar_full: Int32, bar_empty: Int32, bar_raw: Int32,
+                          sq: Int32, kb: Int32, w0: Int32, w1: Int32, pay0: Int64, pay1: Int64,
+                          bytes_tx: Int32, x_addr: Int64, rows: Int32, tok_base: Int32,
+                          ptid: Int32):
+        """Ring step sq (block kb): wait for the consumers to free the slot,
+        bulk-copy both projections' compressed blocks (on full), and cp.async
+        the 64 rows' raw E4M3 bytes (row r at r * 256, unswizzled) and UE8M0
+        words (on raw). Producer thread t copies 16-byte chunk t & 7 of rows
+        (t >> 3) + 16 i; threads t < 64 copy row t's scale word."""
+        stages = self.FC1_STAGES
+        slot = sq % Int32(stages)
+        _mbar_wait(bar_empty + slot * Int32(8), ((sq // Int32(stages)) & Int32(1)) ^ Int32(1))
+        stage = ring + slot * Int32(self.fc1_stage_bytes)
+        full = bar_full + slot * Int32(8)
+        if ptid == Int32(0):
+            _mbar_arrive_expect_tx(full, bytes_tx)
+            if w0 != Int32(0):
+                n0 = w0 * Int32(2048)
+                cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes),
+                                       pay0 + kb.to(Int64) * n0.to(Int64), n0, full)
+            if w1 != Int32(0):
+                n1 = w1 * Int32(2048)
+                cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes + 8192),
+                                       pay1 + kb.to(Int64) * n1.to(Int64), n1, full)
+        c = ptid & Int32(7)
+        for i in cutlass.range_constexpr(4):
+            r = (ptid >> Int32(3)) + Int32(16 * i)
+            tok = ld_shared_i32_relaxed(tok_base + r * Int32(4))
+            valid = (tok >= Int32(0)).to(Int32)
+            src = (x_addr + max(tok, Int32(0)).to(Int64) * Int64(self.hidden_size)
+                   + kb.to(Int64) * Int64(128) + c.to(Int64) * Int64(16))
+            cp_async4_shared_global_cg_pred(stage + r * Int32(256) + c * Int32(16), src, valid)
+        if ptid < Int32(self.group_rows):
+            tok = ld_shared_i32_relaxed(tok_base + ptid * Int32(4))
+            s_base = x_addr + rows.to(Int64) * Int64(self.hidden_size)
+            src = s_base + max(tok, Int32(0)).to(Int64) * Int64(self.hidden_size // 32) + (kb * Int32(4)).to(Int64)
+            cp_async_u32_pred(ring + Int32(self.fc1_sc_off) + slot * Int32(4 * self.group_rows) + ptid * Int32(4),
+                              src, (tok >= Int32(0)).to(Int32))
+        _cp_async_mbar_arrive_noinc(bar_raw + slot * Int32(8))
+
+    @cute.jit
+    def fc1_ws_rotate_staged(self, stage: Int32, sc_slot: Int32, tok_base: Int32, x_addr: Int64,
+                             rows: Int32, kb: Int32, ptid: Int32):
+        """In place: warp w turns rows w + 4j (j = 0..15) from raw E4M3 bytes
+        (row r at r * 256) into F16(H128(dequant * signs.in)) at the consumer's
+        swizzled A position, with exlr8_glue ingress's exact arithmetic and
+        lane mapping (lane l: columns 4l..4l+3). The whole row is read before
+        any lane stores (the H128 shuffles join every lane), so the in-place
+        overwrite is safe. Predicated-off copies leave stale bytes, so padding
+        rows store zeros explicitly."""
         lane = ptid & Int32(31)
         warp = ptid >> Int32(5)
-        q_base = x_addr
-        s_base = x_addr + rows.to(Int64) * Int64(self.hidden_size)
-        g_base = s_base + rows.to(Int64) * Int64(self.hidden_size // 32)
+        g_base = (x_addr + rows.to(Int64) * Int64(self.hidden_size)
+                  + rows.to(Int64) * Int64(self.hidden_size // 32))
         col = kb * Int32(128) + lane * Int32(4)
         signs = ld_global_nc_u32(g_base + col.to(Int64))
         chunk = lane >> Int32(1)
         half = (lane & Int32(1)) * Int32(8)
         for j in cutlass.range_constexpr(16):
             r = warp + Int32(4 * j)
-            tok = cute.arch.shuffle_sync(wtok, Int32(j))
+            tok = ld_shared_i32_relaxed(tok_base + r * Int32(4))
             lo = Uint32(0)
             hi = Uint32(0)
             if tok >= Int32(0):
-                packed = ld_global_nc_u32(q_base + tok.to(Int64) * Int64(self.hidden_size) + col.to(Int64))
-                scales = ld_global_nc_u32(s_base + tok.to(Int64) * Int64(self.hidden_size // 32)
-                                          + (kb * Int32(4)).to(Int64))
+                packed = ld_shared_u32(stage + r * Int32(256) + lane * Int32(4))
+                scales = ld_shared_u32(sc_slot + r * Int32(4))
                 sc = ((scales >> ((lane >> Int32(3)) * Int32(8)).to(Uint32)) & Uint32(0xFF)).to(Int32)
                 bits = Uint32(sc) << Uint32(23)
                 if sc == Int32(0):
@@ -1080,6 +1147,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                                    v2 * signed_byte(signs, 2), v3 * signed_byte(signs, 3), lane)
                 lo = _f32x2_to_f16x2(h0, h1)
                 hi = _f32x2_to_f16x2(h2, h3)
+            cute.arch.sync_warp()
             st_shared_v2_b32(stage + r * Int32(256) + (chunk ^ (r & Int32(7))) * Int32(16) + half, lo, hi)
 
     @cute.jit
@@ -1241,6 +1309,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             for s in cutlass.range_constexpr(_FC1_TILE_STAGES):
                 _mbar_init(bar_tfull + Int32(8 * s), Int32(_FC1_PRODUCER_THREADS))
                 _mbar_init(bar_tempty + Int32(8 * s), Int32(_FC1_CONSUMER_THREADS))
+            for s in cutlass.range_constexpr(stages):
+                _mbar_init(bar_tempty + Int32(8 * _FC1_TILE_STAGES + 8 * s), Int32(_FC1_PRODUCER_THREADS))
             _fence_mbar_init()
         cute.arch.sync_threads()
         if tid >= Int32(_FC1_CONSUMER_THREADS):
