@@ -278,9 +278,9 @@ def query_optin_shared_memory() -> int | None:
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
     CODE_VERSION = 104
-    FC2_WS = False
-    REDUCE_MLP = False
-    FC2_HALF = False
+    FC2_WS = True
+    REDUCE_MLP = True
+    FC2_HALF = True
     FC2_STAGES = 4
     # FC1 on K4's warp-specialized structure with EXLR8 decode. Not bitwise to
     # the K1 split fold: each output accumulates its 48 per-K128 scaled
