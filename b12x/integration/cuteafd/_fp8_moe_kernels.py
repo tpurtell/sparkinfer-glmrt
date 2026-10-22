@@ -1,11 +1,13 @@
 """CuTe DSL kernels of the exact FP8 routed-expert program (``fp8_moe``).
 
 Checkpoint experts are E4M3 ``[N, K]`` with one FP32 scale per 128x128
-block (``weight_scale_inv``). The GEMMs widen every weight to ``bf16(w * s)``
-in registers or shared memory (the reference's dequantized BF16 weight) and
-multiply BF16 activations on tensor cores (m16n8k16, FP32 accumulation), so
-results match ``F.linear(x, dequant(w))`` up to FP32 summation order.
-Nothing is re-quantized.
+block (``weight_scale_inv``). The decode GEMV widens every weight to the exact
+E4M3 -> BF16 value and multiplies the FP32 accumulator by the block scale once
+per 128-K block, so the weights carry no rounding beyond the checkpoint's. The
+prefill GEMM widens to ``bf16(w * s)`` in shared memory (the reference's
+dequantized BF16 weight); both multiply BF16 activations on tensor cores
+(m16n8k16, FP32 accumulation), matching ``F.linear(x, dequant(w))`` up to FP32
+summation order. Nothing is re-quantized.
 
 Pipeline over ``rows`` input rows with ``top_k`` routes each (``P = rows *
 top_k`` (row, slot) pairs):
@@ -62,7 +64,7 @@ from b12x._lib.intrinsics import (
 )
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached, _ld_stream
 
-from ._fp8_weights import _e4m3x4_scaled_bf16x2x2, _e4m3x8_scaled_bf16, _ld_f32
+from ._fp8_weights import _e4m3x4_bf16x2x2, _e4m3x8_scaled_bf16, _ld_f32
 
 META_HEAD = 4
 
@@ -435,16 +437,18 @@ def pos_base(pointer: cute.Pointer) -> Int64:
 
 
 class GroupedFp8Gemv:
-    """Per active expert ``e`` (grid y), ``out[off_e + r] = a_r @ bf16(w_e *
-    s_e)^T`` for its ``n_e <= max_rows`` grouped rows; ``a_r`` is
-    ``a[pair_row[off_e + r]]`` (``gather``) or ``a[off_e + r]``; groups larger
-    than ``max_rows`` run in ``max_rows`` chunks. Output
-    columns ``[0, split)`` use ``w_a``/``s_a`` and ``[split, N)`` use
-    ``w_b``/``s_b`` (gate then up), each ``[E, part, K]`` E4M3 with ``[E,
-    part/128, K/128]`` FP32 scales; ``out`` is BF16 ``[grouped, N]``. The
-    ``MmaFp8Gemv`` kernel per expert: a CTA owns ``8 * groups`` columns, its
-    warps split K, the streamed weight is register double-buffered, m16n8k16
-    BF16 MMAs with FP32 accumulation."""
+    """Per active expert ``e`` (grid y), ``out[off_e + r] = a_r @ w_e^T * s_e``
+    for its ``n_e <= max_rows`` grouped rows; ``a_r`` is ``a[pair_row[off_e +
+    r]]`` (``gather``) or ``a[off_e + r]``; groups larger than ``max_rows`` run
+    in ``max_rows`` chunks. Output columns ``[0, split)`` use ``w_a``/``s_a`` and
+    ``[split, N)`` use ``w_b``/``s_b`` (gate then up), each ``[E, part, K]``
+    E4M3 with ``[E, part/128, K/128]`` FP32 scales; ``out`` is BF16 ``[grouped,
+    N]``. The ``MmaFp8Gemv`` kernel per expert: a CTA owns ``8 * groups``
+    columns, its warps split K, the streamed weight is register
+    double-buffered, m16n8k16 BF16 MMAs with FP32 accumulation. Each 128-K
+    block's E4M3 weights are widened exactly to BF16 and its 64-K chunk
+    partials are summed into the accumulator scaled by that block's FP32 scale
+    (``native_bf16`` weights carry no scales and accumulate directly)."""
 
     def __init__(self, *, n: int, k: int, experts: int, split: int | None = None, max_rows: int = 64,
                  warps: int = 4, groups: int = 4, gather: bool = False, native_bf16: bool = False):
@@ -536,6 +540,7 @@ class GroupedFp8Gemv:
                 w_row = w_base + (local + Int64(g)) * Int64(self.k) + k_begin + Int64(16) * Int64(j)
             s_row = s_base + (local // Int64(128)) * Int64(self.k_blocks * 4) + (k_begin // Int64(128)) * Int64(4)
             x_off = (k_begin + Int64(16) * Int64(j)) * Int64(2)
+            part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
             # Groups past the compiled M tiles run in chunks (the weights stream again).
             chunks = (n_e + Int32(16 * self.m_tiles - 1)) // Int32(16 * self.m_tiles)
             for c in cutlass.range(chunks, unroll=1):
@@ -572,8 +577,11 @@ class GroupedFp8Gemv:
                                     bw[8 * gi + t] = bf16_lo[t]
                                     bw[8 * gi + 4 + t] = bf16_hi[t]
                             else:
+                                # Exact E4M3 -> BF16 widening: the block scale
+                                # multiplies the FP32 partial below, once per
+                                # 128-K block, and never rounds the weight.
                                 for t in cutlass.range_constexpr(4):
-                                    b0, b1 = _e4m3x4_scaled_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t], s_cur)
+                                    b0, b1 = _e4m3x4_bf16x2x2(cur[(chunk * self.groups + gi) * 4 + t])
                                     bw[8 * gi + 2 * t] = b0
                                     bw[8 * gi + 2 * t + 1] = b1
                         for mt in cutlass.range_constexpr(self.m_tiles):
@@ -599,15 +607,33 @@ class GroupedFp8Gemv:
                                         xa[12 + i] = hi[i]
                                 for gi in cutlass.range_constexpr(self.groups):
                                     f = 4 * (mt * self.groups + gi)
-                                    for t in cutlass.range_constexpr(4):
-                                        d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                            acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                            xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
-                                            bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
-                                        acc[f] = d0
-                                        acc[f + 1] = d1
-                                        acc[f + 2] = d2
-                                        acc[f + 3] = d3
+                                    if const_expr(self.native_bf16):
+                                        for t in cutlass.range_constexpr(4):
+                                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                                xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
+                                                bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
+                                            acc[f] = d0
+                                            acc[f + 1] = d1
+                                            acc[f + 2] = d2
+                                            acc[f + 3] = d3
+                                    else:
+                                        # The block's 64-K chunk accumulates into a
+                                        # fresh FP32 partial, promoted by its block
+                                        # scale (both chunks share one scale).
+                                        for v in cutlass.range_constexpr(4):
+                                            part[v] = Float32(0.0)
+                                        for t in cutlass.range_constexpr(4):
+                                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                                part[0], part[1], part[2], part[3],
+                                                xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
+                                                bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
+                                            part[0] = d0
+                                            part[1] = d1
+                                            part[2] = d2
+                                            part[3] = d3
+                                        for v in cutlass.range_constexpr(4):
+                                            acc[f + v] = acc[f + v] + part[v] * s_cur
                     if const_expr(not self.native_bf16):
                         for i in cutlass.range_constexpr(per_block):
                             cur[i] = nxt[i]

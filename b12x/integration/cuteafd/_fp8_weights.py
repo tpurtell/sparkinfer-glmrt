@@ -612,6 +612,39 @@ class TmaFp8Gemm:
 
 
 @dsl_user_op
+def _e4m3x4_bf16x2x2(word, *, loc=None, ip=None):
+    """The exact E4M3 -> BF16 widening of four packed E4M3 (byte 0 first) as two
+    bf16x2 words: the block scale stays out of the weight operand, so it costs no
+    weight rounding (the caller scales the FP32 accumulator instead)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Uint32(word).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 e01, e23, h0, h1, h2, h3;
+            .reg .b32 p01, p23;
+            .reg .f32 f0, f1, f2, f3;
+            mov.b32 {e01, e23}, $2;
+            cvt.rn.f16x2.e4m3x2 p01, e01;
+            cvt.rn.f16x2.e4m3x2 p23, e23;
+            mov.b32 {h0, h1}, p01;
+            mov.b32 {h2, h3}, p23;
+            cvt.f32.f16 f0, h0;
+            cvt.f32.f16 f1, h1;
+            cvt.f32.f16 f2, h2;
+            cvt.f32.f16 f3, h3;
+            cvt.rn.bf16x2.f32 $0, f1, f0;
+            cvt.rn.bf16x2.f32 $1, f3, f2;
+        }
+        """,
+        "=r,=r,r",
+        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return (Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+            Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)))
+
+
+@dsl_user_op
 def _e4m3x4_scaled_bf16x2x2(word, s, *, loc=None, ip=None):
     """bf16(e4m3 * s) for four packed E4M3 (byte 0 first) as two bf16x2 words."""
     result = llvm.inline_asm(
