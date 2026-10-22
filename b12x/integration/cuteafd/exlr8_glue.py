@@ -295,9 +295,15 @@ class _GroupPrefill(_Group):
         while task < total:
             if task < q_total:
                 r, c = task // q_row, task % q_row
-                w0, w1, w2, w3 = ld_global_nc_v4_u32(
-                    source + r.to(Int64) * Int64(self.row_bytes) + c.to(Int64) * Int64(16))
-                st_global_v4_u32(out + task.to(Int64) * Int64(16), w0, w1, w2, w3)
+                src = source + r.to(Int64) * Int64(self.row_bytes) + c.to(Int64) * Int64(16)
+                dst = out + task.to(Int64) * Int64(16)
+                if cutlass.const_expr(self.row_bytes % 16 == 0):
+                    w0, w1, w2, w3 = ld_global_nc_v4_u32(src)
+                    st_global_v4_u32(dst, w0, w1, w2, w3)
+                else:
+                    # Wire rows are only 4-byte aligned (hidden/32 % 16 != 0).
+                    for q in cutlass.range_constexpr(4):
+                        st_global_u32(dst + Int64(4 * q), ld_global_nc_u32(src + Int64(4 * q)))
             elif task < q_total + s_total:
                 t = task - q_total
                 r, c = t // s_row, t % s_row
