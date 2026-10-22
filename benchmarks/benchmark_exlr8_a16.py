@@ -15,6 +15,7 @@ import argparse
 import dataclasses
 import functools
 import hashlib
+import inspect
 import importlib.util
 import json
 import re
@@ -355,8 +356,13 @@ def compile_grouped_arm(directory, candidate):
         return _common.compile_program(wrapper, **kwargs)
     glue.compile_program = keyed_group
     try:
+        extra = {}
+        if "stage_wire" in inspect.signature(glue.compile_exlr8_group_aot).parameters:
+            k = core.Exlr8GroupedKernel
+            extra["stage_wire"] = bool(getattr(k, "FC1_WIRE", False) and getattr(k, "FC1_WS", False)
+                                       and g["group_rows"] == 64)
         group = glue.compile_exlr8_group_aot(hidden=g["hidden"], top_k=g["top_k"],
-            max_groups=g["max_groups"], max_rows=4096, group_rows=g["group_rows"])
+            max_groups=g["max_groups"], max_rows=4096, group_rows=g["group_rows"], **extra)
     finally:
         glue.compile_program = compile_program
     return program, group, manifest
