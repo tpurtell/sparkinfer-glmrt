@@ -300,7 +300,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         self.fc1_hdr_off = self.FC1_STAGES * self.fc1_stage_bytes
         self.fc1_bar_off = self.fc1_hdr_off + _FC1_TILE_STAGES * self.fc1_hdr_bytes
         self.fc1_smem_bytes = self.fc1_bar_off + 8 * 2 * (self.FC1_STAGES + _FC1_TILE_STAGES)
-        self.fc1_ws = bool(self.FC1_WS)
+        # The warp-specialized FC1 tile is the 64-row group (four M16 tiles).
+        self.fc1_ws = bool(self.FC1_WS) and group_rows == 64
         if (self.fc1_ws and self.shared_memory_bytes is not None
                 and self.fc1_smem_bytes > self.shared_memory_bytes):
             self.fc1_ws = False
