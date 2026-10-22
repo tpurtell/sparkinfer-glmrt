@@ -234,8 +234,8 @@ def query_optin_shared_memory() -> int | None:
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
     CODE_VERSION = 100
-    FC2_WS = True
-    REDUCE_MLP = False
+    FC2_WS = False
+    REDUCE_MLP = True
     FC2_HALF = False
     FC2_STAGES = 4
     CTAS_PER_SM = 2
