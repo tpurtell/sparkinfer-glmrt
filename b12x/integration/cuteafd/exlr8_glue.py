@@ -22,6 +22,7 @@ from b12x._lib.intrinsics import (
     ld_global_nc_u32,
     ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
+    st_global_u32,
     st_global_v2_u32,
     st_global_v4_u32,
     u32_as_f32,
@@ -103,7 +104,8 @@ class _Group:
         if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
             ingress = (rows * Int32(self.blocks) + Int32(INGRESS_WARPS - 1)) // Int32(INGRESS_WARPS)
             if cutlass.const_expr(self.stage_wire):
-                ingress = (rows * Int32(self.row_bytes // 16) + Int32(self.hidden // 16 + 255)) // Int32(256)
+                ingress = (rows * Int32(self.hidden // 16 + self.hidden // 128)
+                           + Int32(self.hidden // 4 + 255)) // Int32(256)
             self.kernel(ids, x, signs_in, group_expert, route_slots, route_group_lane,
                         group_count, activation, rows).launch(
                 grid=(Int32(1) + min(ingress, cta_limit), 1, 1), block=(256, 1, 1), stream=stream)
@@ -276,35 +278,36 @@ class _GroupPrefill(_Group):
         """Staged wire for the FC1 producer, which applies the ingress transform
         itself (Exlr8GroupedKernel.FC1_WIRE): activation bytes hold the rows'
         E4M3 planes [rows, hidden], then their UE8M0 planes [rows, hidden/32],
-        then signs.in [hidden]. 16-byte copies; the F16 rotation is never
-        materialized in global memory."""
+        then signs.in [hidden]. E4M3 bytes move as 16-byte vectors; scale and
+        sign planes (hidden/32 bytes per row need not be a 16-byte multiple)
+        as 4-byte words. The F16 rotation is never materialized in memory."""
         thread = Int32(cute.arch.thread_idx()[0])
         task = (Int32(cute.arch.block_idx()[0]) - Int32(1)) * Int32(256) + thread
         step = (Int32(cute.arch.grid_dim()[0]) - Int32(1)) * Int32(256)
         source, out = Int64(x.toint()), Int64(activation.toint())
         q_row = Int32(self.hidden // 16)
-        s_row = Int32(self.hidden // 512)
+        s_row = Int32(self.hidden // 128)
         q_total = rows * q_row
         s_total = rows * s_row
-        total = q_total + s_total + Int32(self.hidden // 16)
+        total = q_total + s_total + Int32(self.hidden // 4)
+        s_out = out + rows.to(Int64) * Int64(self.hidden)
+        g_out = s_out + rows.to(Int64) * Int64(self.hidden // 32)
         while task < total:
-            src = Int64(0)
-            dst = Int64(0)
             if task < q_total:
                 r, c = task // q_row, task % q_row
-                src = source + r.to(Int64) * Int64(self.row_bytes) + c.to(Int64) * Int64(16)
-                dst = out + task.to(Int64) * Int64(16)
+                w0, w1, w2, w3 = ld_global_nc_v4_u32(
+                    source + r.to(Int64) * Int64(self.row_bytes) + c.to(Int64) * Int64(16))
+                st_global_v4_u32(out + task.to(Int64) * Int64(16), w0, w1, w2, w3)
             elif task < q_total + s_total:
                 t = task - q_total
                 r, c = t // s_row, t % s_row
-                src = source + r.to(Int64) * Int64(self.row_bytes) + Int64(self.hidden) + c.to(Int64) * Int64(16)
-                dst = out + q_total.to(Int64) * Int64(16) + t.to(Int64) * Int64(16)
+                w = ld_global_nc_u32(source + r.to(Int64) * Int64(self.row_bytes)
+                                     + Int64(self.hidden) + c.to(Int64) * Int64(4))
+                st_global_u32(s_out + t.to(Int64) * Int64(4), w)
             else:
                 t = task - q_total - s_total
-                src = Int64(signs_in.toint()) + t.to(Int64) * Int64(16)
-                dst = out + (q_total + s_total).to(Int64) * Int64(16) + t.to(Int64) * Int64(16)
-            w0, w1, w2, w3 = ld_global_nc_v4_u32(src)
-            st_global_v4_u32(dst, w0, w1, w2, w3)
+                w = ld_global_nc_u32(Int64(signs_in.toint()) + t.to(Int64) * Int64(4))
+                st_global_u32(g_out + t.to(Int64) * Int64(4), w)
             task += step
 
     @cute.jit
