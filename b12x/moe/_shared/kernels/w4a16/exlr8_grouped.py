@@ -277,6 +277,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     # instead of folding K1024 split partials.
     FC1_WS = True
     FC1_STAGES = 3
+    # Timing probes only (wrong numerics): "a_l2" (every A row is token 0),
+    # "w_l2" (every tile streams expert 0 unit 0), "nodecode" (raw words as B).
+    FC1_PROBE = ""
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
@@ -311,7 +314,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         return ("exlr8_a16_grouped", self.CODE_VERSION, self.hidden_size, self.units,
                 self.top_k, self.max_groups, self.group_rows, self.CTAS_PER_SM,
                 self.FC2_WS, self.REDUCE_MLP, self.FC2_HALF, self.FC2_STAGES,
-                self.fc1_ws, self.FC1_STAGES)
+                self.fc1_ws, self.FC1_STAGES, self.FC1_PROBE)
 
     @cute.jit
     def serving(self, x: cute.Tensor, pointers: cute.Tensor, bits: cute.Tensor,
@@ -924,6 +927,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 d0 = (expert.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(3)
                 pay0 = pointers[d0 * Int64(3)]
                 pay1 = pointers[(d0 + Int64(1)) * Int64(3)]
+                if cutlass.const_expr(self.FC1_PROBE == "w_l2"):
+                    e0 = group_expert[0]
+                    dz = (e0.to(Int64) * Int64(self.units)
+                          + unit_map[e0.to(Int64) * Int64(self.units)].to(Int64)) * Int64(3)
+                    pay0 = pointers[dz * Int64(3)]
+                    pay1 = pointers[(dz + Int64(1)) * Int64(3)]
                 hslot = ti % Int32(_FC1_TILE_STAGES)
                 _mbar_wait(bar_tempty + hslot * Int32(8),
                            ((ti // Int32(_FC1_TILE_STAGES)) & Int32(1)) ^ Int32(1))
@@ -960,6 +969,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         sl = route_slots[gbase + (m * Int32(16) + rr).to(Int64)]
                         if sl >= Int32(0) and sl < max_slot:
                             tok = sl // Int32(self.top_k)
+                            if cutlass.const_expr(self.FC1_PROBE == "a_l2"):
+                                tok = Int32(0)
                     token[i] = tok
                 bytes_tx = (w0 + w1) * Int32(2048)
                 for kb in cutlass.range(self.blocks):
@@ -1039,9 +1050,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     window = (a.to(Int64) << Int64(32)) | b.to(Int64)
                     wa = (window >> shifts[j][0].to(Int64)).to(Uint32)
                     wb = (window >> shifts[j][1].to(Int64)).to(Uint32)
-                b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
-                frags.append((_e4m3_round_half2(b0), _e4m3_round_half2(b1),
-                              _e4m3_round_half2(b2), _e4m3_round_half2(b3)))
+                if cutlass.const_expr(self.FC1_PROBE == "nodecode"):
+                    frags.append((wa, wb, wa ^ wb, wb >> Uint32(1)))
+                else:
+                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
+                    frags.append((_e4m3_round_half2(b0), _e4m3_round_half2(b1),
+                                  _e4m3_round_half2(b2), _e4m3_round_half2(b3)))
             col = Int32(k16 * 2) + c_half
             addr_k16 = a_base + (r_m * Int32(16) + (col ^ (r_m & Int32(7)))) * Int32(16)
             for idx in cutlass.range_constexpr(active):
