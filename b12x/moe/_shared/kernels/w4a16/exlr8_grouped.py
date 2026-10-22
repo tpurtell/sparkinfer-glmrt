@@ -279,7 +279,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     FC1_STAGES = 3
     # Timing probes only (wrong numerics): "a_l2" (every A row is token 0),
     # "w_l2" (every tile streams expert 0 unit 0), "nodecode" (raw words as B).
-    FC1_PROBE = "w_l2"
+    FC1_PROBE = "nodecode"
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
