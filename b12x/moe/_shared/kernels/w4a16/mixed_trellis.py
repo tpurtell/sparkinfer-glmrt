@@ -2241,16 +2241,18 @@ def _select_mixed_fc2_kernel(
 def _apply_mixed_residency(kernel, requested: int | None, max_shared_mem: int) -> None:
     """Apply an offline plan override without changing automatic launch policy.
 
-    The conservative register bound assumes the full 256-register allocation
-    quantum per thread. Shared storage includes one driver KiB per block and
-    uses the supplied per-block opt-in limit as a conservative SM budget.
-    Residency already participates in the kernel's immutable compile key.
+    The conservative register bound caps each SM at 512 resident threads so a
+    256-thread block at 2 blocks/SM fits in the 65,536-register SM file at
+    <=128 registers/thread (enforced via min_blocks_per_mp). Shared storage
+    includes one driver KiB per block and uses the supplied per-block opt-in
+    limit as a conservative SM budget. Residency already participates in the
+    kernel's immutable compile key.
     """
     if requested is None:
         return
     if type(requested) is not int or requested not in (1, 2):
         raise ValueError("mixed Trellis residency override must be one or two blocks/SM")
-    if requested * kernel.cta_threads > 256:
+    if requested * kernel.cta_threads > 512:
         raise ValueError("mixed Trellis residency exceeds the conservative register budget")
     if requested * (kernel.shared_words * 4 + 1024) > int(max_shared_mem):
         raise ValueError("mixed Trellis residency exceeds the conservative shared-memory budget")
