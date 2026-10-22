@@ -267,19 +267,19 @@ def query_optin_shared_memory() -> int | None:
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
     CODE_VERSION = 103
-    FC2_WS = True
-    REDUCE_MLP = True
-    FC2_HALF = True
+    FC2_WS = False
+    REDUCE_MLP = False
+    FC2_HALF = False
     FC2_STAGES = 4
     # FC1 on K4's warp-specialized structure with EXLR8 decode. Not bitwise to
     # the K1 split fold: each output accumulates its 48 per-K128 scaled
     # blocks in one ascending F32 FMA chain (K4's full-K register chain)
     # instead of folding K1024 split partials.
-    FC1_WS = True
+    FC1_WS = False
     FC1_STAGES = 3
     # Timing probes only (wrong numerics): "a_l2" (every A row is token 0),
     # "w_l2" (every tile streams expert 0 unit 0), "nodecode" (raw words as B).
-    FC1_PROBE = "nodecode"
+    FC1_PROBE = ""
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64):
