@@ -1051,7 +1051,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     wa = (window >> shifts[j][0].to(Int64)).to(Uint32)
                     wb = (window >> shifts[j][1].to(Int64)).to(Uint32)
                 if cutlass.const_expr(self.FC1_PROBE == "nodecode"):
-                    frags.append((wa, wb, wa ^ wb, wb >> Uint32(1)))
+                    # Finite small halves (exponent top bits cleared): 1 LOP3 per word.
+                    m = Uint32(0x23FF23FF)
+                    frags.append((wa & m, wb & m, (wa ^ wb) & m, (wb >> Uint32(1)) & m))
                 else:
                     b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
                     frags.append((_e4m3_round_half2(b0), _e4m3_round_half2(b1),
