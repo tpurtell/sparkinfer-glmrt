@@ -21,7 +21,9 @@ from ._common import Operand, Scalar, compile_program
 from b12x._lib.intrinsics import (
     ld_global_nc_u32,
     ld_global_nc_v2_u32,
+    ld_global_nc_v4_u32,
     st_global_v2_u32,
+    st_global_v4_u32,
     u32_as_f32,
 )
 from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
@@ -90,6 +92,7 @@ class _Group:
         self.hidden, self.blocks, self.input_format = hidden, hidden // 128, input_format
         # Wire rows: hidden E4M3 bytes, then hidden/32 UE8M0 scale bytes.
         self.row_bytes = hidden + hidden // 32 if input_format == "fp8_k32" else hidden * 2
+        self.stage_wire = False
 
     @cute.jit
     def __call__(self, ids: cute.Pointer, x: cute.Pointer, signs_in: cute.Pointer,
@@ -99,6 +102,8 @@ class _Group:
                  stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
             ingress = (rows * Int32(self.blocks) + Int32(INGRESS_WARPS - 1)) // Int32(INGRESS_WARPS)
+            if cutlass.const_expr(self.stage_wire):
+                ingress = (rows * Int32(self.row_bytes // 16) + Int32(self.hidden // 16 + 255)) // Int32(256)
             self.kernel(ids, x, signs_in, group_expert, route_slots, route_group_lane,
                         group_count, activation, rows).launch(
                 grid=(Int32(1) + min(ingress, cta_limit), 1, 1), block=(256, 1, 1), stream=stream)
@@ -260,8 +265,47 @@ class _GroupPrefill(_Group):
         if Int32(cute.arch.block_idx()[0]) == Int32(0):
             self.pack(ids, group_expert, route_slots, route_group_lane, group_count,
                       prefix, valid, s_counts, rows)
+        elif cutlass.const_expr(self.stage_wire):
+            self.stage(x, signs_in, activation, rows)
         else:
             self.ingress(x, signs_in, activation, rows)
+
+    @cute.jit
+    def stage(self, x: cute.Pointer, signs_in: cute.Pointer, activation: cute.Pointer,
+              rows: Int32):
+        """Staged wire for the FC1 producer, which applies the ingress transform
+        itself (Exlr8GroupedKernel.FC1_WIRE): activation bytes hold the rows'
+        E4M3 planes [rows, hidden], then their UE8M0 planes [rows, hidden/32],
+        then signs.in [hidden]. 16-byte copies; the F16 rotation is never
+        materialized in global memory."""
+        thread = Int32(cute.arch.thread_idx()[0])
+        task = (Int32(cute.arch.block_idx()[0]) - Int32(1)) * Int32(256) + thread
+        step = (Int32(cute.arch.grid_dim()[0]) - Int32(1)) * Int32(256)
+        source, out = Int64(x.toint()), Int64(activation.toint())
+        q_row = Int32(self.hidden // 16)
+        s_row = Int32(self.hidden // 512)
+        q_total = rows * q_row
+        s_total = rows * s_row
+        total = q_total + s_total + Int32(self.hidden // 16)
+        while task < total:
+            src = Int64(0)
+            dst = Int64(0)
+            if task < q_total:
+                r, c = task // q_row, task % q_row
+                src = source + r.to(Int64) * Int64(self.row_bytes) + c.to(Int64) * Int64(16)
+                dst = out + task.to(Int64) * Int64(16)
+            elif task < q_total + s_total:
+                t = task - q_total
+                r, c = t // s_row, t % s_row
+                src = source + r.to(Int64) * Int64(self.row_bytes) + Int64(self.hidden) + c.to(Int64) * Int64(16)
+                dst = out + q_total.to(Int64) * Int64(16) + t.to(Int64) * Int64(16)
+            else:
+                t = task - q_total - s_total
+                src = Int64(signs_in.toint()) + t.to(Int64) * Int64(16)
+                dst = out + (q_total + s_total).to(Int64) * Int64(16) + t.to(Int64) * Int64(16)
+            w0, w1, w2, w3 = ld_global_nc_v4_u32(src)
+            st_global_v4_u32(dst, w0, w1, w2, w3)
+            task += step
 
     @cute.jit
     def pack(self, ids: cute.Pointer, group_expert: cute.Pointer,
@@ -369,7 +413,14 @@ class _GroupPrefill(_Group):
 
 def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144,
                             input_format="fp8_k32", shared_expert=False,
-                            max_rows=64, group_rows=16):
+                            max_rows=64, group_rows=16, stage_wire=None):
+    if stage_wire is None:
+        # Follows the grouped FC1's own selection (Exlr8GroupedKernel.FC1_WIRE).
+        from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
+        stage_wire = bool(Exlr8GroupedKernel.FC1_WIRE and Exlr8GroupedKernel.FC1_WS
+                          and max_rows > 64 and group_rows == 64 and input_format == "fp8_k32")
+    if stage_wire and (max_rows <= 64 or group_rows != 64 or input_format != "fp8_k32"):
+        raise ValueError("EXLR8 staged wire needs grouped prefill, 64-row groups and FP8 K32 rows")
     if max_rows not in (64, 4096) or group_rows not in (16, 32, 64):
         raise ValueError("EXLR8 grouping supports planned rows 64/4096 and group rows 16/32/64")
     if max_rows == 64 and group_rows != 16:
@@ -389,8 +440,12 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
     x = (Operand("x", torch.uint8, row, note="E4M3 bytes then UE8M0 per-32 scales per row")
          if input_format == "fp8_k32" else Operand("x", torch.bfloat16, row))
     metadata = {"group_rows": group_rows} if max_rows > 64 else {}
+    if stage_wire:
+        metadata["activation_format"] = "staged_fp8_k32"
     group_cls = _GroupPrefill if max_rows > 64 else _Group
-    return compile_program(group_cls(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows),
+    group_obj = group_cls(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows)
+    group_obj.stage_wire = bool(stage_wire)
+    return compile_program(group_obj,
         name=("exlr8_grouped_group" if max_rows > 64 else
               "exlr8_shared_group" if shared_expert else "exlr8_group"),
         operands=(Operand("ids", torch.int32, f"[rows,{top_k}]"),
@@ -402,7 +457,8 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
                   Operand("group_count", torch.int32, "[1]", "out"),
                   Operand("activation", torch.float16, f"[rows,{hidden}]", "out")),
         scalars=(Scalar("rows"), Scalar("cta_limit")),
-        key=(experts, top_k, max_groups, hidden, input_format, shared_expert, max_rows, group_rows),
+        key=(experts, top_k, max_groups, hidden, input_format, shared_expert, max_rows, group_rows)
+            + (("staged_wire",) if stage_wire else ()),
         geometry=dict(abi_version=2, experts=experts, top_k=top_k, max_groups=max_groups,
                       max_rows=max_rows, hidden=hidden, input_format=input_format, **metadata,
                       input_row_bytes=_Group(experts, top_k, max_groups, hidden, input_format).row_bytes,
