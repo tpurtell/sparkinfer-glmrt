@@ -359,7 +359,7 @@ def _e4m3x4_scaled_to_f16x4(packed: Uint32, scale_bits: Uint32, *, loc=None, ip=
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
-    WS_ABI_VERSION = 3
+    WS_ABI_VERSION = 4
 
     def __init__(
         self,
@@ -997,6 +997,68 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         return rb, nt, combined, tier, local
 
     @cute.jit
+    def _ws_claim_meta(
+        self,
+        is_fc1: cutlass.Constexpr,
+        t: Int32,
+        total_tiles: Int32,
+        n_tiles: Int32,
+        block_expert_ids: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        tier0_num_experts: Int32,
+        tier1_num_experts: Int32,
+        tier0_lo_experts: Int32,
+        tier1_lo_experts: Int32,
+        tier0_hi_experts: Int32,
+        tier1_hi_experts: Int32,
+    ):
+        """Compact live projection tiles inside a quad, N outer / block inner.
+
+        Quad tails retain claim slots, not compute tasks: the existing claimer
+        skips them. This avoids a metadata pass or a scan of preceding quads.
+        Resolve each projection independently; gate and up may use different
+        tiers or be absent on this rank.
+        """
+        meta = (n_tiles, block_expert_ids, descriptor_map,
+                tier0_num_experts, tier1_num_experts,
+                tier0_lo_experts, tier1_lo_experts,
+                tier0_hi_experts, tier1_hi_experts)
+        first = (t // (Int32(4) * n_tiles)) * Int32(4)
+        blocks = cutlass.min(Int32(4), total_tiles // n_tiles - first)
+        rem = t - first * n_tiles
+        per_projection = n_tiles
+        if cutlass.const_expr(is_fc1):
+            per_projection = n_tiles // Int32(2)
+        chosen = Int32(-1)
+        for projection in cutlass.range_constexpr(2 if is_fc1 else 1):
+            mask = Int32(0)
+            count = Int32(0)
+            for dg in cutlass.range_constexpr(4):
+                if Int32(dg) < blocks:
+                    candidate = (first + Int32(dg)) * n_tiles + Int32(projection) * per_projection
+                    _rb, _nt, _expert, tier, _local = self._ws_tile_meta(is_fc1, candidate, *meta)
+                    if tier >= Int32(0):
+                        mask = mask | Int32(1 << dg)
+                        count += Int32(1)
+            span = count * per_projection
+            if chosen < Int32(0):
+                if rem < span:
+                    nt = Int32(projection) * per_projection + rem // count
+                    ordinal = rem % count
+                    for dg in cutlass.range_constexpr(4):
+                        if (mask & Int32(1 << dg)) != Int32(0):
+                            if ordinal == Int32(0):
+                                chosen = (first + Int32(dg)) * n_tiles + nt
+                            ordinal -= Int32(1)
+                else:
+                    rem -= span
+        rb, nt, combined, tier, local = self._ws_tile_meta(
+            is_fc1, cutlass.max(chosen, Int32(0)), *meta)
+        if chosen < Int32(0):
+            tier = Int32(-1)
+        return rb, nt, combined, tier, local
+
+    @cute.jit
     def _ws_next_claim(
         self,
         is_fc1: cutlass.Constexpr,
@@ -1056,7 +1118,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             c = total_tiles
                             found = Int32(1)
                         else:
-                            _rb, _nt, _comb, c_tier, _local = self._ws_tile_meta(is_fc1, c, *meta)
+                            _rb, _nt, _comb, c_tier, _local = self._ws_claim_meta(is_fc1, c, total_tiles, *meta)
                             if c_tier >= Int32(0):
                                 found = Int32(1)
                             else:
@@ -1067,7 +1129,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             t = ld_shared_i32_relaxed(slot)
             j += Int32(1)
             if t < total_tiles:
-                rb, nt, combined, tier, local = self._ws_tile_meta(is_fc1, t, *meta)
+                rb, nt, combined, tier, local = self._ws_claim_meta(is_fc1, t, total_tiles, *meta)
         else:
             while found == Int32(0):
                 t = cta + j * grid
@@ -1076,7 +1138,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     t = total_tiles
                     found = Int32(1)
                 else:
-                    rb, nt, combined, tier, local = self._ws_tile_meta(is_fc1, t, *meta)
+                    rb, nt, combined, tier, local = self._ws_claim_meta(is_fc1, t, total_tiles, *meta)
                     if tier >= Int32(0):
                         found = Int32(1)
         return j, nclaimed, t, rb, nt, combined, tier, local
