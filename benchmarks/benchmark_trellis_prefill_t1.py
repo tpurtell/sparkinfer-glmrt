@@ -68,11 +68,25 @@ class BlockFp8:
                         qscratch, stream)
 
 
-def trellis_tensors(k, n, rows, splits):
-    x = torch.randn((rows, k), dtype=torch.float16, device="cuda") * .1
+def trellis_weights(k, n, seed):
+    """One synthetic trellis payload plus its K128 scales per shape.
+
+    Shared by every row count of a shape, so a shorter run's rows are a prefix
+    of a longer run's rows (the row-invariance comparison needs that).
+    """
+    g = torch.Generator(device="cuda")
+    g.manual_seed(seed)
+    payload = torch.randint(0, 256, (n * k // 2,), dtype=torch.uint8, device="cuda",
+                            generator=g)
+    scales = (torch.rand((k // 128,), device="cuda", generator=g) * .5 + .25).half()
+    return payload, scales
+
+
+def trellis_tensors(k, n, rows, splits, payload, scales, seed):
+    g = torch.Generator(device="cuda")
+    g.manual_seed(seed)
+    x = (torch.randn((rows, k), dtype=torch.float16, device="cuda", generator=g) * .1)
     inputs = torch.tensor([x.data_ptr()] * 4, dtype=torch.int64, device="cuda")
-    payload = torch.randint(0, 256, (n * k // 2,), dtype=torch.uint8, device="cuda")
-    scales = (torch.rand((k // 128,), device="cuda") * .5 + .25).half()
     partial = torch.empty((rows, splits, n), dtype=torch.float32, device="cuda")
     output = torch.empty((rows, n), dtype=torch.float32, device="cuda")
     return (inputs, payload, scales, partial, output)
@@ -178,7 +192,8 @@ def main():
         k, n, side = s["k"], s["n"], s["side"]
         splits = (k + 1023) // 1024
         flops = lambda rows: 2.0 * rows * k * n
-        tensors = trellis_tensors(k, n, args.check_rows, splits)
+        payload, scales = trellis_weights(k, n, 408 + k)
+        tensors = trellis_tensors(k, n, args.check_rows, splits, payload, scales, 1408 + k)
         with exportable_compilation():
             ref_program = None if args.no_baseline else \
                 trellis_linear.compile_trellis_linear_aot(
@@ -207,7 +222,7 @@ def main():
             stats.update(shape=name, variant=label, rows=args.check_rows,
                          rerun_bitwise=bool(torch.equal(got, tensors[4])))
             if rows_list and max(rows_list) != args.check_rows:
-                big = trellis_tensors(k, n, max(rows_list), splits)
+                big = trellis_tensors(k, n, max(rows_list), splits, payload, scales, 1408 + k)
                 program.launch(*big, scalars=(max(rows_list), 0, limit))
                 torch.cuda.synchronize()
                 stats["sub_rows_bitwise"] = bool(torch.equal(got, big[4][:args.check_rows]))
@@ -223,7 +238,7 @@ def main():
         if args.no_timing:
             continue
         for rows in rows_list:
-            timed = trellis_tensors(k, n, rows, splits)
+            timed = trellis_tensors(k, n, rows, splits, payload, scales, 1408 + k)
             for label, program in programs.items():
                 graph = capture(lambda p=program: p.launch(*timed, scalars=(rows, 0, limit)))
                 finite_nonzero(timed[4], label)
