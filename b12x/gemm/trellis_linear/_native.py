@@ -18,7 +18,7 @@ from cutlass._mlir.dialects import llvm
 
 from b12x._lib.intrinsics import (
     f16_mma_m16n8k16_f32, ld_global_nc_u32, ld_global_nc_v4_u32,
-    ld_shared_u32, packed_dequant_trellis_to_half2x4,
+    ld_shared_u32, mma_m16n8k32_f32_e4m3, packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_half2x4,
     packed_dequant_trellis_mul1_to_half2x4,
     shared_ptr_to_u32, st_shared_v4_u32, trellis_align_stream_u32x2,
@@ -237,6 +237,49 @@ def pack_f16x2_pair_to_e4m3x4(v0: Uint32, v1: Uint32, *, loc=None, ip=None) -> U
 
 
 @dsl_user_op
+def pack_f16x2_pair_to_e4m3x4_scaled(v0: Uint32, v1: Uint32, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(v0).ir_value(loc=loc, ip=ip), Uint32(v1).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b32 s0, s1; .reg .b16 lo, hi; "
+            "mul.rn.f16x2 s0, $1, 0x4c004c00; "
+            "mul.rn.f16x2 s1, $2, 0x4c004c00; "
+            "cvt.rn.satfinite.e4m3x2.f16x2 lo, s0; "
+            "cvt.rn.satfinite.e4m3x2.f16x2 hi, s1; "
+            "mov.b32 $0, {lo, hi}; }",
+            "=r,r,r",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def align_k6_u32x2(
+    z0: Uint32, z1: Uint32, z2: Uint32, shift: Int32, *, loc=None, ip=None
+) -> tuple[Uint32, Uint32]:
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Uint32(z0).ir_value(loc=loc, ip=ip),
+            Uint32(z1).ir_value(loc=loc, ip=ip),
+            Uint32(z2).ir_value(loc=loc, ip=ip),
+            Int32(shift).ir_value(loc=loc, ip=ip),
+        ],
+        "shf.r.wrap.b32 $0, $4, $3, $5;\n"
+        "shf.r.wrap.b32 $1, $3, $2, $5;",
+        "=r,=r,r,r,r,r",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def unpack_e4m3x4_to_f16x2_pair(packed: Uint32, *, loc=None, ip=None) -> tuple[Uint32, Uint32]:
     res = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -364,7 +407,7 @@ class NativeTrellisLinear:
         self.ws_b_stage_bytes = 4096 if self.e4m3 else 8192
         self.ws_stage_bytes = _WS_A_STAGE_BYTES + self.ws_b_stage_bytes
         self.ws_bar_off = _WS_STAGES * self.ws_stage_bytes
-        self.ws_sc_m_start = 4 if self.splits <= 1 else (1 if self.e4m3 else 2)
+        self.ws_sc_m_start = 4 if self.splits <= 1 else 2
         self.ws_sc_off = self.ws_bar_off + 128
         self.ws_smem_bytes = (
             self.ws_bar_off + 2 * _WS_STAGES * 8
@@ -830,7 +873,7 @@ class NativeTrellisLinear:
                         wa = (((cur0[t].to(Int64) << Int64(32)) | cur1[t].to(Int64)) >> shift0.to(Int64)).to(Uint32)
                         wb = (((cur2[t].to(Int64) << Int64(32)) | cur3[t].to(Int64)) >> shift1.to(Int64)).to(Uint32)
                     else:
-                        wa, wb = trellis_align_stream_u32x2(cur0[t], cur1[t], cur2[t], shift0, shift1)
+                        wa, wb = align_k6_u32x2(cur0[t], cur1[t], cur2[t], shift0)
                     if cutlass.const_expr(self.mul1):
                         b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, self.bits)
                     elif cutlass.const_expr(self.bits == 6):
@@ -891,60 +934,161 @@ class NativeTrellisLinear:
             for block in cutlass.range(8, unroll=1):
                 kb = split * Int32(8) + block
                 if kb < Int32(self.k // 128):
-                    scale = _side_value(scales_ptr, kb)
+                    scale = _side_value(scales_ptr, kb) * (
+                        Float32(0.0625) if cutlass.const_expr(self.e4m3) else Float32(1.0)
+                    )
                     acc = cute.make_rmem_tensor((4, 4, 4), Float32)
                     acc.fill(Float32(0.0))
                     cons_parity = step_k128 & Int32(1)
                     a0_frag = cute.make_rmem_tensor((4, 4), Uint32)
                     a1_frag = cute.make_rmem_tensor((4, 4), Uint32)
-                    e0_frag = cute.make_rmem_tensor((2, 2), Uint32)
-                    e1_frag = cute.make_rmem_tensor((2, 2), Uint32)
-                    b0_frag = cute.make_rmem_tensor((2, 4), Uint32)
-                    b1_frag = cute.make_rmem_tensor((2, 4), Uint32)
-                    _mbar_wait(bar_full + Int32(0), cons_parity)
-                    for m_local in cutlass.range_constexpr(4):
-                        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
-                            cons_a_base0, m_local * 1024
-                        )
-                        a0_frag[m_local, 0] = a0
-                        a0_frag[m_local, 1] = a1
-                        a0_frag[m_local, 2] = a2
-                        a0_frag[m_local, 3] = a3
-                    for j in cutlass.range_constexpr(2):
-                        if cutlass.const_expr(self.e4m3):
-                            e01, e23 = ld_shared_v2_u32_offset(
-                                cons_b_base, j * 256
-                            )
-                            e0_frag[j, 0] = e01
-                            e0_frag[j, 1] = e23
-                        else:
-                            b0, b1 = ld_shared_v2_u32_offset(
-                                cons_b_base, j * 512
-                            )
-                            b2, b3 = ld_shared_v2_u32_offset(
-                                cons_b_base, j * 512 + 256
-                            )
-                            b0_frag[j, 0] = b0
-                            b0_frag[j, 1] = b1
-                            b0_frag[j, 2] = b2
-                            b0_frag[j, 3] = b3
-                    for sub in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(self.e4m3):
+                        ra0_frag = cute.make_rmem_tensor((4, 2), Uint32)
+                        ra1_frag = cute.make_rmem_tensor((4, 2), Uint32)
+                        e0_frag = cute.make_rmem_tensor((2, 2), Uint32)
+                        e0_next = cute.make_rmem_tensor((2, 2), Uint32)
+                        e1_frag = cute.make_rmem_tensor((2, 2), Uint32)
+                        _mbar_wait(bar_full + Int32(0), cons_parity)
                         for m_local in cutlass.range_constexpr(4):
                             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
-                                cons_a_base1, sub * self.ws_stage_bytes + m_local * 1024
+                                cons_a_base0, m_local * 1024
                             )
-                            a1_frag[m_local, 0] = a0
-                            a1_frag[m_local, 1] = a1
-                            a1_frag[m_local, 2] = a2
-                            a1_frag[m_local, 3] = a3
+                            a0_frag[m_local, 0] = a0
+                            a0_frag[m_local, 1] = a1
+                            a0_frag[m_local, 2] = a2
+                            a0_frag[m_local, 3] = a3
                         for j in cutlass.range_constexpr(2):
-                            if cutlass.const_expr(self.e4m3):
+                            e01, e23 = ld_shared_v2_u32_offset(cons_b_base, j * 256)
+                            e0_frag[j, 0] = e01
+                            e0_frag[j, 1] = e23
+                        for sub in cutlass.range_constexpr(4):
+                            for m_local in cutlass.range_constexpr(4):
+                                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
+                                    cons_a_base1, sub * self.ws_stage_bytes + m_local * 1024
+                                )
+                                a1_frag[m_local, 0] = a0
+                                a1_frag[m_local, 1] = a1
+                                a1_frag[m_local, 2] = a2
+                                a1_frag[m_local, 3] = a3
+                            for j in cutlass.range_constexpr(2):
                                 e01, e23 = ld_shared_v2_u32_offset(
                                     cons_b_base, sub * self.ws_stage_bytes + 2048 + j * 256
                                 )
                                 e1_frag[j, 0] = e01
                                 e1_frag[j, 1] = e23
-                            else:
+                            for m_local in cutlass.range_constexpr(4):
+                                ra0_frag[m_local, 0] = pack_f16x2_pair_to_e4m3x4_scaled(
+                                    a0_frag[m_local, 0], a0_frag[m_local, 2]
+                                )
+                                ra0_frag[m_local, 1] = pack_f16x2_pair_to_e4m3x4_scaled(
+                                    a0_frag[m_local, 1], a0_frag[m_local, 3]
+                                )
+                            for m_local in cutlass.range_constexpr(4):
+                                ra1_frag[m_local, 0] = pack_f16x2_pair_to_e4m3x4_scaled(
+                                    a1_frag[m_local, 0], a1_frag[m_local, 2]
+                                )
+                                ra1_frag[m_local, 1] = pack_f16x2_pair_to_e4m3x4_scaled(
+                                    a1_frag[m_local, 1], a1_frag[m_local, 3]
+                                )
+                            for m_local in cutlass.range_constexpr(2):
+                                ra0 = ra0_frag[m_local, 0]
+                                ra1 = ra0_frag[m_local, 1]
+                                ra2 = ra1_frag[m_local, 0]
+                                ra3 = ra1_frag[m_local, 1]
+                                for j in cutlass.range_constexpr(2):
+                                    d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
+                                        acc[m_local, 2 * j, 0],
+                                        acc[m_local, 2 * j, 1],
+                                        acc[m_local, 2 * j, 2],
+                                        acc[m_local, 2 * j, 3],
+                                        ra0, ra1, ra2, ra3,
+                                        e0_frag[j, 0], e1_frag[j, 0],
+                                    )
+                                    acc[m_local, 2 * j, 0], acc[m_local, 2 * j, 1], acc[m_local, 2 * j, 2], acc[m_local, 2 * j, 3] = d0, d1, d2, d3
+                                    d4, d5, d6, d7 = mma_m16n8k32_f32_e4m3(
+                                        acc[m_local, 2 * j + 1, 0],
+                                        acc[m_local, 2 * j + 1, 1],
+                                        acc[m_local, 2 * j + 1, 2],
+                                        acc[m_local, 2 * j + 1, 3],
+                                        ra0, ra1, ra2, ra3,
+                                        e0_frag[j, 1], e1_frag[j, 1],
+                                    )
+                                    acc[m_local, 2 * j + 1, 0], acc[m_local, 2 * j + 1, 1], acc[m_local, 2 * j + 1, 2], acc[m_local, 2 * j + 1, 3] = d4, d5, d6, d7
+                            _mbar_arrive(bar_full + Int32(sub * 8 + 8 * _WS_STAGES))
+                            if cutlass.const_expr(sub < 3):
+                                _mbar_wait(bar_full + Int32((sub + 1) * 8), cons_parity)
+                                for m_local in cutlass.range_constexpr(4):
+                                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
+                                        cons_a_base0, (sub + 1) * self.ws_stage_bytes + m_local * 1024
+                                    )
+                                    a0_frag[m_local, 0] = a0
+                                    a0_frag[m_local, 1] = a1
+                                    a0_frag[m_local, 2] = a2
+                                    a0_frag[m_local, 3] = a3
+                                for j in cutlass.range_constexpr(2):
+                                    e01, e23 = ld_shared_v2_u32_offset(
+                                        cons_b_base, (sub + 1) * self.ws_stage_bytes + j * 256
+                                    )
+                                    e0_next[j, 0] = e01
+                                    e0_next[j, 1] = e23
+                            for m_half in cutlass.range_constexpr(2):
+                                m_local = 2 + m_half
+                                ra0 = ra0_frag[m_local, 0]
+                                ra1 = ra0_frag[m_local, 1]
+                                ra2 = ra1_frag[m_local, 0]
+                                ra3 = ra1_frag[m_local, 1]
+                                for j in cutlass.range_constexpr(2):
+                                    d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
+                                        acc[m_local, 2 * j, 0],
+                                        acc[m_local, 2 * j, 1],
+                                        acc[m_local, 2 * j, 2],
+                                        acc[m_local, 2 * j, 3],
+                                        ra0, ra1, ra2, ra3,
+                                        e0_frag[j, 0], e1_frag[j, 0],
+                                    )
+                                    acc[m_local, 2 * j, 0], acc[m_local, 2 * j, 1], acc[m_local, 2 * j, 2], acc[m_local, 2 * j, 3] = d0, d1, d2, d3
+                                    d4, d5, d6, d7 = mma_m16n8k32_f32_e4m3(
+                                        acc[m_local, 2 * j + 1, 0],
+                                        acc[m_local, 2 * j + 1, 1],
+                                        acc[m_local, 2 * j + 1, 2],
+                                        acc[m_local, 2 * j + 1, 3],
+                                        ra0, ra1, ra2, ra3,
+                                        e0_frag[j, 1], e1_frag[j, 1],
+                                    )
+                                    acc[m_local, 2 * j + 1, 0], acc[m_local, 2 * j + 1, 1], acc[m_local, 2 * j + 1, 2], acc[m_local, 2 * j + 1, 3] = d4, d5, d6, d7
+                            if cutlass.const_expr(sub < 3):
+                                for j in cutlass.range_constexpr(2):
+                                    e0_frag[j, 0] = e0_next[j, 0]
+                                    e0_frag[j, 1] = e0_next[j, 1]
+                    else:
+                        b0_frag = cute.make_rmem_tensor((2, 4), Uint32)
+                        b1_frag = cute.make_rmem_tensor((2, 4), Uint32)
+                        _mbar_wait(bar_full + Int32(0), cons_parity)
+                        for m_local in cutlass.range_constexpr(4):
+                            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
+                                cons_a_base0, m_local * 1024
+                            )
+                            a0_frag[m_local, 0] = a0
+                            a0_frag[m_local, 1] = a1
+                            a0_frag[m_local, 2] = a2
+                            a0_frag[m_local, 3] = a3
+                        for j in cutlass.range_constexpr(2):
+                            b0, b1 = ld_shared_v2_u32_offset(cons_b_base, j * 512)
+                            b2, b3 = ld_shared_v2_u32_offset(cons_b_base, j * 512 + 256)
+                            b0_frag[j, 0] = b0
+                            b0_frag[j, 1] = b1
+                            b0_frag[j, 2] = b2
+                            b0_frag[j, 3] = b3
+                        for sub in cutlass.range_constexpr(4):
+                            for m_local in cutlass.range_constexpr(4):
+                                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
+                                    cons_a_base1, sub * self.ws_stage_bytes + m_local * 1024
+                                )
+                                a1_frag[m_local, 0] = a0
+                                a1_frag[m_local, 1] = a1
+                                a1_frag[m_local, 2] = a2
+                                a1_frag[m_local, 3] = a3
+                            for j in cutlass.range_constexpr(2):
                                 b0, b1 = ld_shared_v2_u32_offset(
                                     cons_b_base, sub * self.ws_stage_bytes + 4096 + j * 512
                                 )
@@ -955,53 +1099,42 @@ class NativeTrellisLinear:
                                 b1_frag[j, 1] = b1
                                 b1_frag[j, 2] = b2
                                 b1_frag[j, 3] = b3
-                        for j in cutlass.range_constexpr(2):
-                            if cutlass.const_expr(self.e4m3):
-                                b0, b1 = unpack_e4m3x4_to_f16x2_pair(e0_frag[j, 0])
-                                b2, b3 = unpack_e4m3x4_to_f16x2_pair(e0_frag[j, 1])
-                            else:
+                            for j in cutlass.range_constexpr(2):
                                 b0, b1 = b0_frag[j, 0], b0_frag[j, 1]
                                 b2, b3 = b0_frag[j, 2], b0_frag[j, 3]
-                            for m_local in cutlass.range_constexpr(4):
-                                a0 = a0_frag[m_local, 0]
-                                a1 = a0_frag[m_local, 1]
-                                a2 = a0_frag[m_local, 2]
-                                a3 = a0_frag[m_local, 3]
-                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                    acc[m_local, 2 * j, 0],
-                                    acc[m_local, 2 * j, 1],
-                                    acc[m_local, 2 * j, 2],
-                                    acc[m_local, 2 * j, 3],
-                                    a0, a1, a2, a3, b0, b1,
-                                )
-                                acc[m_local, 2 * j, 0], acc[m_local, 2 * j, 1], acc[m_local, 2 * j, 2], acc[m_local, 2 * j, 3] = d0, d1, d2, d3
-                                d4, d5, d6, d7 = f16_mma_m16n8k16_f32(
-                                    acc[m_local, 2 * j + 1, 0],
-                                    acc[m_local, 2 * j + 1, 1],
-                                    acc[m_local, 2 * j + 1, 2],
-                                    acc[m_local, 2 * j + 1, 3],
-                                    a0, a1, a2, a3, b2, b3,
-                                )
-                                acc[m_local, 2 * j + 1, 0], acc[m_local, 2 * j + 1, 1], acc[m_local, 2 * j + 1, 2], acc[m_local, 2 * j + 1, 3] = d4, d5, d6, d7
-                        _mbar_arrive(bar_full + Int32(sub * 8 + 8 * _WS_STAGES))
-                        if cutlass.const_expr(sub < 3):
-                            _mbar_wait(bar_full + Int32((sub + 1) * 8), cons_parity)
-                            for m_local in cutlass.range_constexpr(4):
-                                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
-                                    cons_a_base0, (sub + 1) * self.ws_stage_bytes + m_local * 1024
-                                )
-                                a0_frag[m_local, 0] = a0
-                                a0_frag[m_local, 1] = a1
-                                a0_frag[m_local, 2] = a2
-                                a0_frag[m_local, 3] = a3
-                            for j in cutlass.range_constexpr(2):
-                                if cutlass.const_expr(self.e4m3):
-                                    e01, e23 = ld_shared_v2_u32_offset(
-                                        cons_b_base, (sub + 1) * self.ws_stage_bytes + j * 256
+                                for m_local in cutlass.range_constexpr(4):
+                                    a0 = a0_frag[m_local, 0]
+                                    a1 = a0_frag[m_local, 1]
+                                    a2 = a0_frag[m_local, 2]
+                                    a3 = a0_frag[m_local, 3]
+                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        acc[m_local, 2 * j, 0],
+                                        acc[m_local, 2 * j, 1],
+                                        acc[m_local, 2 * j, 2],
+                                        acc[m_local, 2 * j, 3],
+                                        a0, a1, a2, a3, b0, b1,
                                     )
-                                    e0_frag[j, 0] = e01
-                                    e0_frag[j, 1] = e23
-                                else:
+                                    acc[m_local, 2 * j, 0], acc[m_local, 2 * j, 1], acc[m_local, 2 * j, 2], acc[m_local, 2 * j, 3] = d0, d1, d2, d3
+                                    d4, d5, d6, d7 = f16_mma_m16n8k16_f32(
+                                        acc[m_local, 2 * j + 1, 0],
+                                        acc[m_local, 2 * j + 1, 1],
+                                        acc[m_local, 2 * j + 1, 2],
+                                        acc[m_local, 2 * j + 1, 3],
+                                        a0, a1, a2, a3, b2, b3,
+                                    )
+                                    acc[m_local, 2 * j + 1, 0], acc[m_local, 2 * j + 1, 1], acc[m_local, 2 * j + 1, 2], acc[m_local, 2 * j + 1, 3] = d4, d5, d6, d7
+                            _mbar_arrive(bar_full + Int32(sub * 8 + 8 * _WS_STAGES))
+                            if cutlass.const_expr(sub < 3):
+                                _mbar_wait(bar_full + Int32((sub + 1) * 8), cons_parity)
+                                for m_local in cutlass.range_constexpr(4):
+                                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
+                                        cons_a_base0, (sub + 1) * self.ws_stage_bytes + m_local * 1024
+                                    )
+                                    a0_frag[m_local, 0] = a0
+                                    a0_frag[m_local, 1] = a1
+                                    a0_frag[m_local, 2] = a2
+                                    a0_frag[m_local, 3] = a3
+                                for j in cutlass.range_constexpr(2):
                                     b0, b1 = ld_shared_v2_u32_offset(
                                         cons_b_base, (sub + 1) * self.ws_stage_bytes + j * 512
                                     )
@@ -1012,34 +1145,30 @@ class NativeTrellisLinear:
                                     b0_frag[j, 1] = b1
                                     b0_frag[j, 2] = b2
                                     b0_frag[j, 3] = b3
-                        for j in cutlass.range_constexpr(2):
-                            if cutlass.const_expr(self.e4m3):
-                                b0, b1 = unpack_e4m3x4_to_f16x2_pair(e1_frag[j, 0])
-                                b2, b3 = unpack_e4m3x4_to_f16x2_pair(e1_frag[j, 1])
-                            else:
+                            for j in cutlass.range_constexpr(2):
                                 b0, b1 = b1_frag[j, 0], b1_frag[j, 1]
                                 b2, b3 = b1_frag[j, 2], b1_frag[j, 3]
-                            for m_local in cutlass.range_constexpr(4):
-                                a0 = a1_frag[m_local, 0]
-                                a1 = a1_frag[m_local, 1]
-                                a2 = a1_frag[m_local, 2]
-                                a3 = a1_frag[m_local, 3]
-                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                    acc[m_local, 2 * j, 0],
-                                    acc[m_local, 2 * j, 1],
-                                    acc[m_local, 2 * j, 2],
-                                    acc[m_local, 2 * j, 3],
-                                    a0, a1, a2, a3, b0, b1,
-                                )
-                                acc[m_local, 2 * j, 0], acc[m_local, 2 * j, 1], acc[m_local, 2 * j, 2], acc[m_local, 2 * j, 3] = d0, d1, d2, d3
-                                d4, d5, d6, d7 = f16_mma_m16n8k16_f32(
-                                    acc[m_local, 2 * j + 1, 0],
-                                    acc[m_local, 2 * j + 1, 1],
-                                    acc[m_local, 2 * j + 1, 2],
-                                    acc[m_local, 2 * j + 1, 3],
-                                    a0, a1, a2, a3, b2, b3,
-                                )
-                                acc[m_local, 2 * j + 1, 0], acc[m_local, 2 * j + 1, 1], acc[m_local, 2 * j + 1, 2], acc[m_local, 2 * j + 1, 3] = d4, d5, d6, d7
+                                for m_local in cutlass.range_constexpr(4):
+                                    a0 = a1_frag[m_local, 0]
+                                    a1 = a1_frag[m_local, 1]
+                                    a2 = a1_frag[m_local, 2]
+                                    a3 = a1_frag[m_local, 3]
+                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        acc[m_local, 2 * j, 0],
+                                        acc[m_local, 2 * j, 1],
+                                        acc[m_local, 2 * j, 2],
+                                        acc[m_local, 2 * j, 3],
+                                        a0, a1, a2, a3, b0, b1,
+                                    )
+                                    acc[m_local, 2 * j, 0], acc[m_local, 2 * j, 1], acc[m_local, 2 * j, 2], acc[m_local, 2 * j, 3] = d0, d1, d2, d3
+                                    d4, d5, d6, d7 = f16_mma_m16n8k16_f32(
+                                        acc[m_local, 2 * j + 1, 0],
+                                        acc[m_local, 2 * j + 1, 1],
+                                        acc[m_local, 2 * j + 1, 2],
+                                        acc[m_local, 2 * j + 1, 3],
+                                        a0, a1, a2, a3, b2, b3,
+                                    )
+                                    acc[m_local, 2 * j + 1, 0], acc[m_local, 2 * j + 1, 1], acc[m_local, 2 * j + 1, 2], acc[m_local, 2 * j + 1, 3] = d4, d5, d6, d7
                     for m_local in cutlass.range_constexpr(4):
                         for n in cutlass.range_constexpr(4):
                             for v in cutlass.range_constexpr(4):
@@ -1224,9 +1353,9 @@ class NativeTrellisLinear:
                 off2 = ib0.to(Int64) * Int64(4)
                 off3 = ib1.to(Int64) * Int64(4)
             else:
-                i0, i2, shift0, shift1 = trellis256_lane_geom_bits(lane, 0, 8, self.bits)
-                i1 = i0 + Int32(1)
-                i1 -= Int32(8 * self.bits) * (i1 >= Int32(8 * self.bits)).to(Int32)
+                _, i2, shift0, _ = trellis256_lane_geom_bits(lane, 0, 8, self.bits)
+                i1 = i2 - Int32(1) + Int32(8 * self.bits) * (i2 < Int32(1)).to(Int32)
+                i0 = i2 - Int32(2) + Int32(8 * self.bits) * (i2 < Int32(2)).to(Int32)
                 off0 = i0.to(Int64) * Int64(4)
                 off1 = i1.to(Int64) * Int64(4)
                 off2 = i2.to(Int64) * Int64(4)
@@ -1389,9 +1518,9 @@ class NativeTrellisLinear:
                 off2 = ib0.to(Int64) * Int64(4)
                 off3 = ib1.to(Int64) * Int64(4)
             else:
-                i0, i2, shift0, shift1 = trellis256_lane_geom_bits(lane, 0, 8, self.bits)
-                i1 = i0 + Int32(1)
-                i1 -= Int32(8 * self.bits) * (i1 >= Int32(8 * self.bits)).to(Int32)
+                _, i2, shift0, _ = trellis256_lane_geom_bits(lane, 0, 8, self.bits)
+                i1 = i2 - Int32(1) + Int32(8 * self.bits) * (i2 < Int32(1)).to(Int32)
+                i0 = i2 - Int32(2) + Int32(8 * self.bits) * (i2 < Int32(2)).to(Int32)
                 off0 = i0.to(Int64) * Int64(4)
                 off1 = i1.to(Int64) * Int64(4)
                 off2 = i2.to(Int64) * Int64(4)
