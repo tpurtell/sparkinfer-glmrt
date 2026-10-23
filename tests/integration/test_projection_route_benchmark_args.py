@@ -104,3 +104,29 @@ def test_invalid_geometry_is_rejected_before_cuda_import(argv):
     with pytest.raises(SystemExit) as error:
         _BENCH.parse_args(argv)
     assert error.value.code == 2
+
+
+def test_kimi_real_checkpoint_bound_is_cpu_only_and_conservative():
+    import numpy as np
+    path = _PATH.with_name("kimi_k6_dense.py")
+    spec = importlib.util.spec_from_file_location("kimi_k6_dense_cpu", path)
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    norm = np.linspace(-2, 3, 256)
+    suh = np.linspace(1, 4, 256)
+    bound = bench.rmsnorm_h128_bound(norm, suh)
+    rng = np.random.default_rng(664)
+    x = rng.normal(size=(17, 256))
+    x /= np.sqrt(np.mean(x*x, axis=1, keepdims=True) + 1e-6)
+    transformed = (x * norm * suh).reshape(17, 2, 128).copy()
+    for stride in (1, 2, 4, 8, 16, 32, 64):
+        view = transformed.reshape(17, 2, -1, 2, stride)
+        lo, hi = view[..., 0, :].copy(), view[..., 1, :].copy()
+        view[..., 0, :], view[..., 1, :] = lo + hi, lo - hi
+    transformed /= np.sqrt(128)
+    assert np.max(np.abs(transformed)) <= bound
+    assert bench.rmsnorm_h128_bound(np.ones(128), np.ones(128)*1e5) > 65504
+    with pytest.raises(ValueError, match="equal H128"):
+        bench.rmsnorm_h128_bound(np.ones(129), np.ones(129))
+    with pytest.raises(ValueError, match="non-finite"):
+        bench.rmsnorm_h128_bound(np.ones(128), np.full(128, np.nan))

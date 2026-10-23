@@ -312,6 +312,82 @@ def benchmark_prefill_route(args):
         torch.cuda.empty_cache()
 
 
+def rmsnorm_h128_bound(norm, suh):
+    """Input-independent conservative bound, including BF16 store rounding."""
+    import numpy as np
+    norm, suh = np.asarray(norm, dtype=np.float64), np.asarray(suh, dtype=np.float64)
+    if norm.shape != suh.shape or norm.ndim != 1 or norm.size % 128:
+        raise ValueError("norm/suh must be equal H128 vectors")
+    if not np.isfinite(norm).all() or not np.isfinite(suh).all():
+        raise ValueError("non-finite norm/suh")
+    # RMSNorm's unweighted vector has L2 <= sqrt(width); normalized H128
+    # is orthogonal. The extra 1% covers BF16 round-to-nearest and F32 math.
+    return float(np.sqrt(norm.size) * np.max(np.abs(norm * suh)) * 1.01)
+
+
+def audit_real_checkpoint(snapshot):
+    """CPU-only bounds; unnormalized sources remain explicitly unqualified."""
+    import numpy as np
+    import struct
+    snapshot = Path(snapshot)
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
+
+    def vector(name):
+        path = snapshot / index[name]
+        with path.open("rb") as stream:
+            size = struct.unpack("<Q", stream.read(8))[0]
+            header = json.loads(stream.read(size))[name]
+            lo, hi = header["data_offsets"]
+            stream.seek(8 + size + lo)
+            raw = stream.read(hi - lo)
+        dtype = header["dtype"]
+        if dtype == "BF16":
+            values = (np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
+        elif dtype in ("F16", "F32"):
+            values = np.frombuffer(raw, dtype={"F16": "<f2", "F32": "<f4"}[dtype])
+        else:
+            raise ValueError(f"unsupported vector dtype: {dtype}")
+        if len(header["shape"]) != 1 or values.size != header["shape"][0]:
+            raise ValueError(f"not a calibration vector: {name}")
+        return values.astype(np.float64)
+
+    records = []
+    for name in sorted(index):
+        if not name.endswith(".suh") or ".experts." in name:
+            continue
+        projection = name[:-4]
+        norm = None
+        if ".layers." in name:
+            root, leaf = projection.split(".self_attn.") if ".self_attn." in projection else (None, None)
+            if leaf in ("q_proj", "k_proj", "v_proj", "g_proj", "q_a_proj", "kv_a_proj_with_mqa"):
+                norm = root + ".input_layernorm.weight"
+            elif leaf == "q_b_proj":
+                norm = root + ".self_attn.q_a_layernorm.weight"
+            elif leaf == "o_proj" and root + ".self_attn.o_norm.weight" in index:
+                norm = root + ".self_attn.o_norm.weight"
+            elif ".block_sparse_moe." in projection:
+                root, leaf = projection.split(".block_sparse_moe.")
+                if leaf in ("shared_experts.gate_proj", "shared_experts.up_proj", "routed_expert_down_proj"):
+                    norm = root + ".post_attention_layernorm.weight"
+                elif leaf == "routed_expert_up_proj":
+                    norm = root + ".block_sparse_moe.routed_expert_norm.weight"
+        entry = dict(projection=projection, norm=norm, status="needs_real_activations")
+        if norm is not None:
+            weights, calibration = vector(norm), vector(name)
+            if norm.endswith(".self_attn.o_norm.weight"):
+                # Per-head RMSNorm followed by sigmoid(gate) <= 1. H128
+                # preserves each head's L2 bound, including either TP2 slice.
+                if weights.size != 128 or calibration.size % 128:
+                    raise ValueError("KDA output norm must match H128 heads")
+                bound = max(rmsnorm_h128_bound(weights, head) for head in calibration.reshape(-1, 128))
+            else:
+                bound = rmsnorm_h128_bound(weights, calibration)
+            entry.update(bound_abs=bound, fp16_limit=65504, status="range_safe" if bound < 65504 else "bound_inconclusive")
+        records.append(entry)
+    return dict(schema="kimi-k6.activation-range/1", method="RMSNorm L2 and orthogonal H128 upper bound; 1% rounding margin",
+                output_dtype="bf16 (F32 for logits); no FP16 egress", records=records)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -320,8 +396,14 @@ def main():
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
+    parser.add_argument("--real-checkpoint", type=Path, help="CPU-only real-calibration activation-range audit")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.real_checkpoint is not None:
+        report = audit_real_checkpoint(args.real_checkpoint)
+        (args.output_dir / "range.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report))
+        return
     if args.prefill_route:
         benchmark_prefill_route(args)
         return
