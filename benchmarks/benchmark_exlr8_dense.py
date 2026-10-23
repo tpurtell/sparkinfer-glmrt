@@ -242,11 +242,16 @@ def benchmark_wide_mx8(args):
         x = x16.bfloat16()
         x16.copy_(x)
         g = trellis_linear.geometry(k, n, sharded_side=side)
-        wide = WideTrellisMxfp8(g)
+        if args.t1_mpw:
+            from b12x.gemm.trellis_linear._prefill import TrellisPrefillMxfp8
+            wide = TrellisPrefillMxfp8(g, n_cta=args.t1_n_cta, mpw=args.t1_mpw)
+        else:
+            wide = WideTrellisMxfp8(g)
         scratch = torch.empty(wide.scratch_bytes, device="cuda", dtype=torch.uint8)
         out = torch.empty_like(native)
         with exportable_compilation():
-            candidate = compile_program(wide, name="trellis_wide_mx8", key=tuple(g.values()),
+            candidate = compile_program(wide, name="trellis_wide_mx8",
+                key=(*g.values(), args.t1_mpw, args.t1_n_cta),
                 operands=(Operand("inputs", torch.int64, "[4]"), Operand("payload", torch.uint8, "[packed]"),
                           Operand("scales", torch.float16, "[K/128]"), Operand("scratch", torch.uint8, "[records]", "scratch"),
                           Operand("output", torch.float32, "[rows,N]", "out")),
@@ -386,7 +391,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--unpacked-trellis", action="store_true", help="measure exact E4M3 unpack plus F32 W8A16 at full/TP2 trellis shapes")
-    parser.add_argument("--wide-mx8", action="store_true", help="measure native 256x128 on-chip trellis prefill")
+    parser.add_argument("--wide-mx8", action="store_true", help="measure on-chip trellis MXFP8 prefill")
+    parser.add_argument("--t1-mpw", type=int, choices=(0, 1, 2), default=0,
+                        help="use T1 shared-tile kernel with this many M16 blocks per warp")
+    parser.add_argument("--t1-n-cta", type=int, choices=(64, 128), default=64)
     parser.add_argument("--arm", action="append", help="NAME=git-rev; repeatable")
     parser.add_argument("--arm-bundle", type=Path)
     parser.add_argument("--materialize-only", action="store_true", help="host-side git show, no CUDA")
