@@ -469,14 +469,7 @@ def test_prefill_ws_bitwise_and_row_invariance(side, bits, codebook):
     c.output.fill_(float("nan"))
     c.launch(512)
     expected_512 = c.output[:512].clone()
-    if codebook == "e4m3":
-        rel_err = (
-            torch.linalg.vector_norm((expected_512[:64] - expected_64).double())
-            / torch.linalg.vector_norm(expected_64.double())
-        )
-        assert rel_err <= 0.05, float(rel_err)
-    else:
-        assert torch.equal(expected_512[:64].view(torch.int32), expected_64.view(torch.int32))
+    assert torch.equal(expected_512[:64].view(torch.int32), expected_64.view(torch.int32))
     with kernel_resolution_guard("prefill_ws uses precompiled kernels"):
         for rows in (130, 191, 192, 193, 255, 256, 257, 384, 512):
             for limit in (48, 170 * 4, 188 * 4):

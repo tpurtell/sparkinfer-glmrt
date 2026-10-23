@@ -380,6 +380,7 @@ class NativeTrellisLinear:
         self.k, self.n = g["input_features"], g["output_features"]
         self.bits, self.e4m3 = g["bits"], g["codebook"] == "e4m3"
         self.mul1 = g["codebook"] == "mul1"
+        self.a8 = bool(g.get("a8", False))
         # High-rate windows need more live registers than the frozen K2--K4 path.
         self.min_blocks_per_mp = 2 if self.bits >= 5 else self.CTAS_PER_SM
         self.input_units = g["sharded_side"] == 2
@@ -921,7 +922,7 @@ class NativeTrellisLinear:
                     cons_parity = step_k128 & Int32(1)
                     a0_frag = cute.make_rmem_tensor((4, 4), Uint32)
                     a1_frag = cute.make_rmem_tensor((4, 4), Uint32)
-                    if cutlass.const_expr(self.e4m3):
+                    if cutlass.const_expr(self.e4m3 and self.a8):
                         ra0_frag = cute.make_rmem_tensor((4, 2), Uint32)
                         ra1_frag = cute.make_rmem_tensor((4, 2), Uint32)
                         e0_frag = cute.make_rmem_tensor((2, 2), Uint32)
@@ -1017,6 +1018,8 @@ class NativeTrellisLinear:
                                         a0_frag[m_local, 1], a0_frag[m_local, 3]
                                     )
                     else:
+                        e0_frag = cute.make_rmem_tensor((2, 2), Uint32)
+                        e1_frag = cute.make_rmem_tensor((2, 2), Uint32)
                         b0_frag = cute.make_rmem_tensor((2, 4), Uint32)
                         b1_frag = cute.make_rmem_tensor((2, 4), Uint32)
                         _mbar_wait(bar_full + Int32(0), cons_parity)
@@ -1029,12 +1032,17 @@ class NativeTrellisLinear:
                             a0_frag[m_local, 2] = a2
                             a0_frag[m_local, 3] = a3
                         for j in cutlass.range_constexpr(2):
-                            b0, b1 = ld_shared_v2_u32_offset(cons_b_base, j * 512)
-                            b2, b3 = ld_shared_v2_u32_offset(cons_b_base, j * 512 + 256)
-                            b0_frag[j, 0] = b0
-                            b0_frag[j, 1] = b1
-                            b0_frag[j, 2] = b2
-                            b0_frag[j, 3] = b3
+                            if cutlass.const_expr(self.e4m3):
+                                e01, e23 = ld_shared_v2_u32_offset(cons_b_base, j * 256)
+                                e0_frag[j, 0] = e01
+                                e0_frag[j, 1] = e23
+                            else:
+                                b0, b1 = ld_shared_v2_u32_offset(cons_b_base, j * 512)
+                                b2, b3 = ld_shared_v2_u32_offset(cons_b_base, j * 512 + 256)
+                                b0_frag[j, 0] = b0
+                                b0_frag[j, 1] = b1
+                                b0_frag[j, 2] = b2
+                                b0_frag[j, 3] = b3
                         for sub in cutlass.range_constexpr(4):
                             for m_local in cutlass.range_constexpr(4):
                                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(
@@ -1045,19 +1053,30 @@ class NativeTrellisLinear:
                                 a1_frag[m_local, 2] = a2
                                 a1_frag[m_local, 3] = a3
                             for j in cutlass.range_constexpr(2):
-                                b0, b1 = ld_shared_v2_u32_offset(
-                                    cons_b_base, sub * self.ws_stage_bytes + 4096 + j * 512
-                                )
-                                b2, b3 = ld_shared_v2_u32_offset(
-                                    cons_b_base, sub * self.ws_stage_bytes + 4096 + j * 512 + 256
-                                )
-                                b1_frag[j, 0] = b0
-                                b1_frag[j, 1] = b1
-                                b1_frag[j, 2] = b2
-                                b1_frag[j, 3] = b3
+                                if cutlass.const_expr(self.e4m3):
+                                    e01, e23 = ld_shared_v2_u32_offset(
+                                        cons_b_base, sub * self.ws_stage_bytes + 2048 + j * 256
+                                    )
+                                    e1_frag[j, 0] = e01
+                                    e1_frag[j, 1] = e23
+                                else:
+                                    b0, b1 = ld_shared_v2_u32_offset(
+                                        cons_b_base, sub * self.ws_stage_bytes + 4096 + j * 512
+                                    )
+                                    b2, b3 = ld_shared_v2_u32_offset(
+                                        cons_b_base, sub * self.ws_stage_bytes + 4096 + j * 512 + 256
+                                    )
+                                    b1_frag[j, 0] = b0
+                                    b1_frag[j, 1] = b1
+                                    b1_frag[j, 2] = b2
+                                    b1_frag[j, 3] = b3
                             for j in cutlass.range_constexpr(2):
-                                b0, b1 = b0_frag[j, 0], b0_frag[j, 1]
-                                b2, b3 = b0_frag[j, 2], b0_frag[j, 3]
+                                if cutlass.const_expr(self.e4m3):
+                                    b0, b1 = unpack_e4m3x4_to_f16x2_pair(e0_frag[j, 0])
+                                    b2, b3 = unpack_e4m3x4_to_f16x2_pair(e0_frag[j, 1])
+                                else:
+                                    b0, b1 = b0_frag[j, 0], b0_frag[j, 1]
+                                    b2, b3 = b0_frag[j, 2], b0_frag[j, 3]
                                 for m_local in cutlass.range_constexpr(4):
                                     a0 = a0_frag[m_local, 0]
                                     a1 = a0_frag[m_local, 1]
@@ -1091,19 +1110,30 @@ class NativeTrellisLinear:
                                     a0_frag[m_local, 2] = a2
                                     a0_frag[m_local, 3] = a3
                                 for j in cutlass.range_constexpr(2):
-                                    b0, b1 = ld_shared_v2_u32_offset(
-                                        cons_b_base, (sub + 1) * self.ws_stage_bytes + j * 512
-                                    )
-                                    b2, b3 = ld_shared_v2_u32_offset(
-                                        cons_b_base, (sub + 1) * self.ws_stage_bytes + j * 512 + 256
-                                    )
-                                    b0_frag[j, 0] = b0
-                                    b0_frag[j, 1] = b1
-                                    b0_frag[j, 2] = b2
-                                    b0_frag[j, 3] = b3
+                                    if cutlass.const_expr(self.e4m3):
+                                        e01, e23 = ld_shared_v2_u32_offset(
+                                            cons_b_base, (sub + 1) * self.ws_stage_bytes + j * 256
+                                        )
+                                        e0_frag[j, 0] = e01
+                                        e0_frag[j, 1] = e23
+                                    else:
+                                        b0, b1 = ld_shared_v2_u32_offset(
+                                            cons_b_base, (sub + 1) * self.ws_stage_bytes + j * 512
+                                        )
+                                        b2, b3 = ld_shared_v2_u32_offset(
+                                            cons_b_base, (sub + 1) * self.ws_stage_bytes + j * 512 + 256
+                                        )
+                                        b0_frag[j, 0] = b0
+                                        b0_frag[j, 1] = b1
+                                        b0_frag[j, 2] = b2
+                                        b0_frag[j, 3] = b3
                             for j in cutlass.range_constexpr(2):
-                                b0, b1 = b1_frag[j, 0], b1_frag[j, 1]
-                                b2, b3 = b1_frag[j, 2], b1_frag[j, 3]
+                                if cutlass.const_expr(self.e4m3):
+                                    b0, b1 = unpack_e4m3x4_to_f16x2_pair(e1_frag[j, 0])
+                                    b2, b3 = unpack_e4m3x4_to_f16x2_pair(e1_frag[j, 1])
+                                else:
+                                    b0, b1 = b1_frag[j, 0], b1_frag[j, 1]
+                                    b2, b3 = b1_frag[j, 2], b1_frag[j, 3]
                                 for m_local in cutlass.range_constexpr(4):
                                     a0 = a1_frag[m_local, 0]
                                     a1 = a1_frag[m_local, 1]
