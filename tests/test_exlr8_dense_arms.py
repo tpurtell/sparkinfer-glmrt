@@ -11,6 +11,19 @@ arms = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(arms)
 
 
+def test_block_fp8_profile_range():
+    import ast
+    source = (PATH.parent / "benchmark_exlr8_dense.py").read_text()
+    tree = ast.parse(source)
+    guards = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+              and ast.unparse(node.test) == "not profile or args.profile_arm == 'block_fp8'"]
+    assert len(guards) == 1
+    block = ast.unparse(guards[0])
+    assert "baseline(k, n, rows" in block
+    assert block.index("cudaProfilerStart()") < block.index("graph.replay()") < block.index("cudaProfilerStop()")
+    assert 'args.profile_arm not in {*arms, \'block_fp8\'}' in ast.unparse(tree)
+
+
 def test_parse_and_key():
     assert arms.parse_arms(["base=HEAD", "candidate=deadbeef"]) == {"base": "HEAD", "candidate": "deadbeef"}
     for values in ([], ["base"], ["base="], ["base=-x"], ["../x=HEAD"], ["base=A", "base=B"]):

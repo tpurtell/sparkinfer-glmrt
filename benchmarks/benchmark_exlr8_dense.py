@@ -339,8 +339,8 @@ def main():
     shapes = [s for s in SHAPES if s[0] in formats and s[1] in names]
     profile = any((args.profile_arm, args.profile_op, args.profile_rows))
     if profile:
-        if args.profile_arm not in arms or not args.profile_op or args.profile_rows not in rows_list:
-            parser.error("profile requires a named arm, FORMAT/OP and one selected row count")
+        if args.profile_arm not in {*arms, "block_fp8"} or not args.profile_op or args.profile_rows not in rows_list:
+            parser.error("profile requires a named arm or block_fp8, FORMAT/OP and one selected row count")
         shapes = [s for s in shapes if f"{s[0]}/{s[1]}" == args.profile_op]
         rows_list = [args.profile_rows]
     if not shapes:
@@ -397,7 +397,7 @@ def main():
             copies = copies_for(read_bytes, args.cold_l2 and rows <= 64)
             extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(copies-1)]
             base_us, base_error = None, None
-            if not profile:
+            if not profile or args.profile_arm == "block_fp8":
                 try:
                     graph, keep, count = baseline(k, n, rows, a16=True, cold_l2=args.cold_l2)
                 except TypeError as error:
@@ -405,7 +405,13 @@ def main():
                         raise
                     base_error = str(error)
                 else:
-                    base_us = timing(graph, 1 if rows > 64 else args.replays)/count
+                    if profile:
+                        torch.cuda.cudart().cudaProfilerStart()
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        torch.cuda.cudart().cudaProfilerStop()
+                    else:
+                        base_us = timing(graph, 1 if rows > 64 else args.replays)/count
                     del graph, keep
             for name, program in programs.items():
                 tensors[-1].fill_(float("nan"))
