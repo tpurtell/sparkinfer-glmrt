@@ -704,9 +704,11 @@ class NativeTrellisLinear:
                 else:
                     stage_raw_tiles(raw, Int32(0), tile_base0, payload_ptr, pwarp, lane, self.bits)
                     cute.arch.cp_async_commit_group()
-                    stage_raw_tiles(raw, Int32(1), tile_base0 + tile_step, payload_ptr, pwarp, lane, self.bits)
+                    if cutlass.const_expr(kblocks > 1):
+                        stage_raw_tiles(raw, Int32(1), tile_base0 + tile_step, payload_ptr, pwarp, lane, self.bits)
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(1)
+                    cute.arch.sync_warp()
                     decode_block_stage(wdec, Int32(0), raw, Int32(0), lane, r8, t4, pwarp,
                                        self.bits, self.w_e4m3, self.mul1)
                 cute.arch.sync_threads()
@@ -719,6 +721,7 @@ class NativeTrellisLinear:
                                             payload_ptr, pwarp, lane, self.bits)
                         cute.arch.cp_async_commit_group()
                         cute.arch.cp_async_wait_group(1)
+                        cute.arch.sync_warp()
                         if kb + Int32(1) < Int32(kblocks):
                             decode_block_stage(wdec, Int32(1) - (kb & Int32(1)),
                                                raw, (kb + Int32(1)) % Int32(raw_stages),
@@ -808,7 +811,7 @@ class NativeTrellisLinear:
                     cute.arch.sync_threads()
                 if warp < Int32(self.fma_warps):
                     for mb in cutlass.range_constexpr(self.nmb):
-                        row0 = row_base + mgrp * Int32(64) + Int32(mb * 16) + r8
+                        row0 = row_base + mgrp * Int32(self.mgrp_step) + Int32(mb * 16) + r8
                         row1 = row0 + Int32(8)
                         for g in cutlass.range_constexpr(4):
                             col = nb * Int32(128) + ngrp * Int32(32) + Int32(g * 8) + t4 * Int32(2)
