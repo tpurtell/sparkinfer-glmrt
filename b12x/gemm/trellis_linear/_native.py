@@ -753,10 +753,12 @@ class NativeTrellisLinear:
                         for g in cutlass.range_constexpr(4):
                             col = nb * Int32(128) + ngrp * Int32(32) + Int32(g * 8) + t4 * Int32(2)
                             if row0 < rows:
-                                st_global_v2_f32(out_ptr + row0.to(Int64) * Int64(self.n) + col.to(Int64),
+                                st_global_v2_f32(out_ptr + (row0.to(Int64) * Int64(self.n)
+                                                            + col.to(Int64)) * Int64(4),
                                                  tot[mb, g, 0], tot[mb, g, 1])
                             if row1 < rows:
-                                st_global_v2_f32(out_ptr + row1.to(Int64) * Int64(self.n) + col.to(Int64),
+                                st_global_v2_f32(out_ptr + (row1.to(Int64) * Int64(self.n)
+                                                            + col.to(Int64)) * Int64(4),
                                                  tot[mb, g, 2], tot[mb, g, 3])
             task += step
 
