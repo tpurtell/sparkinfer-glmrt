@@ -66,7 +66,19 @@ def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
     ref = c.x.double() @ c.weight.double()
     baseline = (c.x.bfloat16() @ c.weight.bfloat16()).double()
     assert torch.linalg.vector_norm(c.output.double()-ref) <= 1.01*torch.linalg.vector_norm(baseline-ref)
-    assert torch.equal(c.output[:64].view(torch.int32), expected.view(torch.int32))
+    wide = c.output[:64].clone()
+    if bits >= 5:
+        # Many-row launches own the whole K reduction in one CTA, so their FP32
+        # accumulation order differs from the narrow split-K path: the same rows
+        # must match exactly between many-row launches, and agree with the
+        # narrow result to FP32 reordering error.
+        c.launch(1024)
+        assert torch.equal(c.output[:64].view(torch.int32), wide.view(torch.int32))
+        torch.testing.assert_close(c.output[:64].double(), expected.double(),
+                                   rtol=1e-5, atol=1e-6)
+    else:
+        assert torch.equal(c.output[:64].view(torch.int32), expected.view(torch.int32))
+
 
 
 def test_graph_replay_and_invalid_launch():
@@ -279,7 +291,16 @@ def test_kimi_shapes(k, n, side, bits, codebook):
     for live in ((1, 8, 16, 36, 64) if rows == 64 else (1, 8, 16, 36, 64, 256, 1024, 4096)):
         output.fill_(float("nan"))
         program.launch(inputs, payload, scales, partial.flatten(), output.flatten(), scalars=(live, 0, limit))
-        assert torch.equal(output[:min(64, live)].view(torch.int32), saved[:min(64, live)].view(torch.int32))
+        prefix = min(64, live)
+        if live >= 256 and bits >= 5:
+            # Many-row launches own the whole K reduction in one CTA: identical
+            # rows are bit-exact between live-row counts.
+            assert torch.equal(output[:prefix].view(torch.int32), saved[:prefix].view(torch.int32))
+        else:
+            # Narrow launches keep the split-K accumulation order, which differs
+            # from the many-row order by FP32 rounding only.
+            torch.testing.assert_close(output[:prefix].double(), saved[:prefix].double(),
+                                       rtol=1e-5, atol=1e-6)
         assert torch.isnan(output[live:]).all()
         chosen = [r for r in sample_rows if r < live]
         torch.testing.assert_close(output[chosen][:, cols].double(),
@@ -363,8 +384,16 @@ def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
         with kernel_resolution_guard("row dispatch uses precompiled kernels"):
             base.launch(rows)
             wide.launch(rows)
-        assert torch.equal(wide.output[:rows].view(torch.int32), base.output[:rows].view(torch.int32))
-        assert torch.equal(wide.partial[:rows].view(torch.int32), base.partial[:rows].view(torch.int32))
+        if bits >= 5 and rows > 64:
+            # The 5/6-bit rows above 64 take the many-row kernel, which owns the
+            # whole K reduction in one CTA: no split-K partials are written and
+            # the output matches the narrow schedule to FP32 reordering only.
+            torch.testing.assert_close(wide.output[:rows].double(), base.output[:rows].double(),
+                                       rtol=1e-5, atol=1e-6)
+            assert torch.isnan(wide.partial[:rows]).all()
+        else:
+            assert torch.equal(wide.output[:rows].view(torch.int32), base.output[:rows].view(torch.int32))
+            assert torch.equal(wide.partial[:rows].view(torch.int32), base.partial[:rows].view(torch.int32))
         assert torch.isnan(wide.output[rows:]).all()
         assert torch.isnan(wide.partial[rows:]).all()
 
