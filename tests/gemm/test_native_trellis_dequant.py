@@ -9,7 +9,8 @@ from tests.gemm.test_native_trellis_transform import hadamard
 
 @pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
-def test_chunked_composed_forward(side, codebook):
+@pytest.mark.parametrize("experiment", ["off", "w8", "w8a8"])
+def test_chunked_composed_forward(side, codebook, experiment):
     from b12x.integration.cuteafd.trellis_dequant import compile_trellis_dequant_aot
     from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
     from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
@@ -20,7 +21,10 @@ def test_chunked_composed_forward(side, codebook):
     data = raw.cpu().numpy().reshape((n if side == 1 else k)//128, -1)
     decoded = np.concatenate([ref.decode_unit(unit.tobytes(), 6, "gate" if side == 1 else "down",
         k if side == 1 else n) for unit in data], axis=1 if side == 1 else 0)
-    weight = torch.tensor(decoded.T.copy(), device="cuda").bfloat16()
+    weight = torch.tensor(decoded.T.copy(), device="cuda").half()
+    if experiment != "off":
+        weight = weight.clamp(-448, 448).to(torch.float8_e4m3fn).half()
+    weight = weight.bfloat16()
     x = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)*.03
     suh = torch.randn(k, device="cuda", dtype=torch.float16)*.2
     svh = torch.randn(n, device="cuda", dtype=torch.float16)*.2
@@ -32,16 +36,27 @@ def test_chunked_composed_forward(side, codebook):
     output = torch.empty_like(accumulator, dtype=torch.bfloat16)
     inp = compile_trellis_input_aot(features=k, max_rows=capacity, output_dtype="bf16")
     dequant = compile_trellis_dequant_aot(input_features=k, output_features=n,
-        chunk_columns=columns, codebook=codebook, sharded_side=side)
+        chunk_columns=columns, codebook=codebook, sharded_side=side, experiment_e4m3=experiment != "off")
+    from b12x.integration.cuteafd.trellis_dequant import compile_experiment_mxfp8_qdq_aot
+    qdq = compile_experiment_mxfp8_qdq_aot(features=k, max_rows=capacity)
     gemm = compile_bf16_projection_aot(width=k, outputs=columns, output_dtype=torch.float32)
     egress = compile_trellis_output_aot(features=n, max_rows=capacity)
     limit = torch.cuda.get_device_properties(0).multi_processor_count*4
     expected_rotated = hadamard(x.float()*suh.float()).bfloat16()
+    if experiment == "w8a8":
+        from b12x._lib.intrinsics import pow2_ceil_ue8m0_torch
+        blocks = expected_rotated.float().reshape(capacity, -1, 32)
+        scale, _ = pow2_ceil_ue8m0_torch(blocks.abs().amax(-1, keepdim=True) / 448.)
+        safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+        expected_rotated = ((blocks / safe).clamp(-448, 448).to(torch.float8_e4m3fn).float()
+                            * scale).reshape(capacity, k).bfloat16()
     expected_acc = expected_rotated.float() @ weight.float().T
     expected = (hadamard(expected_acc)*svh.float()).bfloat16()
     for rows in (1, 64, 256):
         def run():
             inp.launch(x, suh, rotated, scales, scalars=(rows, limit))
+            if experiment == "w8a8":
+                qdq.launch(rotated, scalars=(rows,))
             for first in range(0, n, columns):
                 dequant.launch(raw, scales, scratch, scalars=(first,))
                 gemm.launch(rotated, scratch, chunk, scalars=(rows,))
