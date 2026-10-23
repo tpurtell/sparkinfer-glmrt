@@ -139,6 +139,22 @@ def _ld_cached_pred(address: Int64, r: Int32, rows: Int32, *, loc=None, ip=None)
 
 
 @dsl_user_op
+def _ld_a_fragment(address: Int64, r: Int32, rows: Int32, *, loc=None, ip=None):
+    """Load the four K32 BF16 pairs directly in MMA order, without quad shuffles."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(address).ir_value(loc=loc, ip=ip),
+         Int32(r).ir_value(loc=loc, ip=ip), Int32(rows).ir_value(loc=loc, ip=ip)],
+        "{ .reg .pred p; setp.lt.s32 p, $5, $6; "
+        "mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; mov.b32 $3, 0; "
+        "@p ld.global.nc.u32 $0, [$4]; @p ld.global.nc.u32 $1, [$4+16]; "
+        "@p ld.global.nc.u32 $2, [$4+32]; @p ld.global.nc.u32 $3, [$4+48]; }",
+        "=r,=r,=r,=r,l,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
 def _warp_uniform_i32(val: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.inline_asm(
         T.i32(), [Int32(val).ir_value(loc=loc, ip=ip)],
@@ -446,7 +462,7 @@ class NativeTileLinear:
         else:
             live = (rows + Int32(15)) >> Int32(4)
         kb0 = seg * Int32(self.seg_blocks)
-        lanek = Int32(8) * j if cutlass.const_expr(self.grouped) else Int32(16) * j
+        lanek = Int32(2) * j if cutlass.const_expr(self.grouped) else Int32(16) * j
         prmt_sel = j.to(Uint32) * Uint32(0x0101) + Uint32(0x0400)
         x_base = x.iterator.toint() + lanek.to(Int64) * Int64(2)
         span = end - begin
@@ -475,8 +491,8 @@ class NativeTileLinear:
                                 k32 = k0 + Int32(32 * h)
                                 if cutlass.const_expr(not self.side2):
                                     at_m0 = x_base + ((row0 + g).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                    m0_lo0, m0_lo1, m0_lo2, m0_lo3 = _ld_cached_pred(at_m0, row0 + g, rows)
-                                    m0_hi0, m0_hi1, m0_hi2, m0_hi3 = _ld_cached_pred(at_m0 + Int64(16 * self.k), row0 + g + Int32(8), rows)
+                                    m0_a0, m0_a2, m0_a4, m0_a6 = _ld_a_fragment(at_m0, row0 + g, rows)
+                                    m0_a1, m0_a3, m0_a5, m0_a7 = _ld_a_fragment(at_m0 + Int64(16 * self.k), row0 + g + Int32(8), rows)
                                 if cutlass.const_expr(self.int4):
                                     t_w = _quad_transpose_u8x4(cur[c * 2 + h], prmt_sel)
                                     b0, b1, b2, b3 = _int4x8_bf16(t_w)
@@ -490,8 +506,6 @@ class NativeTileLinear:
                                 s0 = self._scale(r_s0, h)
                                 s1 = self._scale(r_s1, h)
                                 if cutlass.const_expr(not self.side2):
-                                    m0_a0, m0_a2, m0_a4, m0_a6 = _quad_transpose_x4(m0_lo0, m0_lo1, m0_lo2, m0_lo3, j)
-                                    m0_a1, m0_a3, m0_a5, m0_a7 = _quad_transpose_x4(m0_hi0, m0_hi1, m0_hi2, m0_hi3, j)
                                     acc[0], acc[1], acc[2], acc[3] = _mma_k32_scaled(
                                         acc[0], acc[1], acc[2], acc[3],
                                         m0_a0, m0_a1, m0_a2, m0_a3, m0_a4, m0_a5, m0_a6, m0_a7,
@@ -500,10 +514,8 @@ class NativeTileLinear:
                                     if Int32(mt) < live:
                                         r0 = Int32(16 * mt) + g
                                         at0 = x_base + ((row0 + r0).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                        lo0, lo1, lo2, lo3 = _ld_cached_pred(at0, row0 + r0, rows)
-                                        hi0, hi1, hi2, hi3 = _ld_cached_pred(at0 + Int64(16 * self.k), row0 + r0 + Int32(8), rows)
-                                        a0, a2, a4, a6 = _quad_transpose_x4(lo0, lo1, lo2, lo3, j)
-                                        a1, a3, a5, a7 = _quad_transpose_x4(hi0, hi1, hi2, hi3, j)
+                                        a0, a2, a4, a6 = _ld_a_fragment(at0, row0 + r0, rows)
+                                        a1, a3, a5, a7 = _ld_a_fragment(at0 + Int64(16 * self.k), row0 + r0 + Int32(8), rows)
                                         f = 4 * mt
                                         acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
                                             acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
