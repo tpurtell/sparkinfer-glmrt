@@ -19,10 +19,12 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from b12x._lib.intrinsics import (
+    create_l2_evict_first_policy,
     f16_mma_m16n8k16_f32,
     half2_to_float2_scaled,
     ld_global_b16,
     ld_global_nc_u32,
+    ld_global_nc_u32_l2hint,
     ld_global_nc_v4_u32,
     packed_dequant_trellis_to_half2x4,
     u32_as_f32,
@@ -69,18 +71,24 @@ def signed_byte(word: Uint32, index: cutlass.Constexpr):
 
 @cute.jit
 def exlr8_decode_tile(payload_address: Int64, tile: Int32, lane: Int32,
-                      bits: cutlass.Constexpr):
-    """Return native t256 B fragments, with mandatory fp16 -> E4M3 -> fp16."""
+                      bits: cutlass.Constexpr, policy: Uint64):
+    """Return native t256 B fragments, with mandatory fp16 -> E4M3 -> fp16.
+
+    Decode reads each trellis word exactly once, so the words carry an
+    `evict_first` L2 policy: the weight stream then leaves activations, fc1
+    partials and the pointer tables resident instead of displacing them with
+    bytes no CTA re-reads.
+    """
     base = payload_address + tile.to(Int64) * Int64(32 * bits)
     if cutlass.const_expr(bits == 4):
-        b = ld_global_nc_u32(base + lane.to(Int64) * Int64(4))
+        b = ld_global_nc_u32_l2hint(base + lane.to(Int64) * Int64(4), policy)
         a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
         wa = b
         wb = (a << Uint32(16)) | (b >> Uint32(16))
     else:
         ia, ib, shift, _ = trellis256_lane_geom_bits(lane, 0, 8, bits)
-        a = ld_global_nc_u32(base + ia.to(Int64) * Int64(4))
-        b = ld_global_nc_u32(base + ib.to(Int64) * Int64(4))
+        a = ld_global_nc_u32_l2hint(base + ia.to(Int64) * Int64(4), policy)
+        b = ld_global_nc_u32_l2hint(base + ib.to(Int64) * Int64(4), policy)
         window = (a.to(Int64) << Int64(32)) | b.to(Int64)
         wa = (window >> shift.to(Int64)).to(Uint32)
         wb = (window >> (shift + Int32(4 * bits)).to(Int64)).to(Uint32)
@@ -98,7 +106,7 @@ def _side_value(address: Int64, index: Int32):
 
 class Exlr8A16Kernel:
     ABI_VERSION = 3
-    CODE_VERSION = 4
+    CODE_VERSION = 5
     # Resident CTAs per SM the stream kernels are built for (<=128 registers at
     # 128 threads). GB10 decode is latency-bound on dependent weight loads, so
     # the caller's cta_limit should be sm_count * CTAS_PER_SM (cudaDevAttr at
@@ -183,7 +191,8 @@ class Exlr8A16Kernel:
     def _mma_block(self, payload: Int64, a_address: Int64,
                    row0: Int32, row1: Int32, a_stride: cutlass.Constexpr,
                    input_block: Int32, output_block: Int32, lane: Int32,
-                   warp: Int32, width: cutlass.Constexpr, down: cutlass.Constexpr):
+                   warp: Int32, width: cutlass.Constexpr, down: cutlass.Constexpr,
+                   policy: Uint64):
         """One K128 block, four N8 fragments per lane, FP32 accumulation."""
         acc = cute.make_rmem_tensor((4, 4), Float32)
         acc.fill(Float32(0.0))
@@ -205,7 +214,7 @@ class Exlr8A16Kernel:
                 tile = (input_block * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                 if cutlass.const_expr(down):
                     tile = output_block * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
-                b0, b1, b2, b3 = exlr8_decode_tile(payload, tile, lane, width)
+                b0, b1, b2, b3 = exlr8_decode_tile(payload, tile, lane, width, policy)
                 d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                     acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                     a0, a1, a2, a3, b0, b1)
@@ -223,9 +232,10 @@ class Exlr8A16Kernel:
                           row0: Int32, row1: Int32, a_stride: cutlass.Constexpr,
                           input_block: Int32, output_block: Int32, lane: Int32,
                           warp: Int32, width: cutlass.Constexpr,
-                          down: cutlass.Constexpr, scale: Float32):
+                          down: cutlass.Constexpr, scale: Float32, policy: Uint64):
         acc = self._mma_block(payload, a_address, row0, row1, a_stride,
-                              input_block, output_block, lane, warp, width, down)
+                              input_block, output_block, lane, warp, width, down,
+                              policy)
         for n in cutlass.range_constexpr(4):
             for v in cutlass.range_constexpr(4):
                 total[n, v] = total[n, v] + acc[n, v] * scale
@@ -243,6 +253,7 @@ class Exlr8A16Kernel:
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        policy = create_l2_evict_first_policy()
         while task < groups * Int32(self.units * 2 * self.splits):
             split = task % Int32(self.splits)
             proj = (task // Int32(self.splits)) % Int32(2)
@@ -270,13 +281,13 @@ class Exlr8A16Kernel:
                         scale = _side_value(scales, kb)
                         if width == Int32(2):
                             self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 2, False, scale)
+                                self.hidden_size, kb, Int32(0), lane, warp, 2, False, scale, policy)
                         elif width == Int32(3):
                             self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 3, False, scale)
+                                self.hidden_size, kb, Int32(0), lane, warp, 3, False, scale, policy)
                         elif width == Int32(4):
                             self._accumulate_block(total, payload, x.iterator.toint(), row0, row1,
-                                self.hidden_size, kb, Int32(0), lane, warp, 4, False, scale)
+                                self.hidden_size, kb, Int32(0), lane, warp, 4, False, scale, policy)
             for n in cutlass.range_constexpr(4):
                 col = warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
                 base = task.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)
@@ -348,6 +359,7 @@ class Exlr8A16Kernel:
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        policy = create_l2_evict_first_policy()
         while task < groups * Int32(self.blocks):
             group, block = task // Int32(self.blocks), task % Int32(self.blocks)
             expert = group_expert[group]
@@ -370,13 +382,13 @@ class Exlr8A16Kernel:
                     addr = intermediate.iterator.toint() + (group.to(Int64) * Int64(self.units) + unit.to(Int64)) * Int64(16 * 128 * 2)
                     if width == Int32(2):
                         self._accumulate_block(total, payload, addr, row0, row1, 128,
-                            Int32(0), block, lane, warp, 2, True, scale)
+                            Int32(0), block, lane, warp, 2, True, scale, policy)
                     elif width == Int32(3):
                         self._accumulate_block(total, payload, addr, row0, row1, 128,
-                            Int32(0), block, lane, warp, 3, True, scale)
+                            Int32(0), block, lane, warp, 3, True, scale, policy)
                     elif width == Int32(4):
                         self._accumulate_block(total, payload, addr, row0, row1, 128,
-                            Int32(0), block, lane, warp, 4, True, scale)
+                            Int32(0), block, lane, warp, 4, True, scale, policy)
             for n in cutlass.range_constexpr(4):
                 col = block * Int32(128) + warp * Int32(32) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
                 base = (group.to(Int64) * Int64(16) + r.to(Int64)) * Int64(self.hidden_size) + col.to(Int64)
