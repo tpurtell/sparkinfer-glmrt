@@ -24,12 +24,14 @@ from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2, _side_value
 from b12x.gemm.trellis_linear._native_prefill import (
     _add_rn_f32,
+    _ld_global_v2_f32,
     _ld_shared_b32_offset,
     _ldmatrix_m8n8x4_b16_offset,
     _st_global_v2_f32,
-    decode_and_store_b_half,
+     prefetch_b_half,
     prefill_storage,
     stage_a_half,
+    store_decoded_b_half,
 )
 
 
@@ -146,8 +148,8 @@ class NativeTrellisLinear:
                     block=(128, 1, 1), stream=stream)
             else:
                 self.multiply_prefill(inputs, payload, scales, output, rows, rotation_id).launch(
-                    grid=(min(((rows + Int32(127)) // Int32(128)) * Int32(self.n // 128), cta_limit), 1, 1),
-                    block=(256, 1, 1), min_blocks_per_mp=1, stream=stream)
+                    grid=(min(((rows + Int32(127)) // Int32(128)) * Int32(self.n // 64), cta_limit), 1, 1),
+                    block=(256, 1, 1), min_blocks_per_mp=2, stream=stream)
 
     @cute.kernel
     def multiply_prefill(self, inputs: cute.Tensor, payload: cute.Tensor,
@@ -160,125 +162,178 @@ class NativeTrellisLinear:
         lane, warp = tid & Int32(31), tid >> Int32(5)
         wm, wn = warp >> Int32(1), warp & Int32(1)
         c_a, r_a = tid & Int32(7), tid >> Int32(3)
-        a_store_base = (r_a * Int32(8) + (c_a ^ (r_a & Int32(7)))) * Int32(16)
         r_m, c_half = lane & Int32(15), lane >> Int32(4)
-        a_read_row_base = (wm * Int32(32) + r_m) * Int32(128)
-        x = inputs[rotation_id]
+        swiz_m = (r_m & Int32(7)) ^ c_half
+        x_lane_addr = inputs[rotation_id] + c_a.to(Int64) * Int64(16)
         payload_addr = payload.iterator.toint()
-        scales_addr = scales.iterator.toint()
-        out_addr = output.iterator.toint()
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(prefill_storage())
         sa_base = shared_ptr_to_u32(storage.words.data_ptr())
-        sb_base = sa_base + Int32(32768)
-        sb_write_base = sb_base + warp * Int32(512) + lane * Int32(4)
-        sb_read_base = sb_base + wn * Int32(2048) + lane * Int32(4)
+        sa_store_ptr = sa_base + (r_a * Int32(8) + (c_a ^ (r_a & Int32(7)))) * Int32(16)
+        sa_read_ptr = sa_base + (wm * Int32(32) + r_m) * Int32(128)
+        sb_write_base = sa_base + Int32(32768) + (warp >> Int32(2)) * Int32(4096) + (warp & Int32(3)) * Int32(512) + lane * Int32(4)
+        sb_read_base = sa_base + Int32(32768) + wn * Int32(1024) + lane * Int32(4)
         i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, self.bits)
         i1 = i0 + Int32(1)
         i1 -= Int32(8 * self.bits) * (i1 >= Int32(8 * self.bits)).to(Int32)
-        i0_bytes = i0.to(Int64) * Int64(4)
-        i1_bytes = i1.to(Int64) * Int64(4)
-        i2_bytes = i2.to(Int64) * Int64(4)
-        n_blocks = Int32(self.n // 128)
+        payload_i0 = payload_addr + i0.to(Int64) * Int64(4)
+        d1_bytes = (i1 - i0) * Int32(4)
+        d2_bytes = (i2 - i0) * Int32(4)
+        n_blocks = Int32(self.n // 64)
         total_tasks = ((rows + Int32(127)) // Int32(128)) * n_blocks
         while task < total_tasks:
-            nb = task % n_blocks
+            nb64 = task % n_blocks
             group = task // n_blocks
-            grand = cute.make_rmem_tensor((2, 8, 4), Float32)
-            grand.fill(Float32(0.0))
-            stage_a_half(sa_base, x, group, rows, Int32(0), r_a, c_a, a_store_base, self.k)
+            group_r_a = group * Int32(128) + warp * Int32(4) + (lane >> Int32(3))
+            stage_a_half(sa_store_ptr, x_lane_addr, group_r_a, rows, Int32(0), self.k)
             cute.arch.cp_async_commit_group()
+            z0_0, z1_0, z2_0, z0_1, z1_1, z2_1 = prefetch_b_half(
+                payload_i0, nb64, Int32(0), 0, warp,
+                d1_bytes, d2_bytes, self.k, self.n, self.input_units, self.bits,
+            )
             for split in cutlass.range(self.splits, unroll=1):
-                total = cute.make_rmem_tensor((2, 8, 4), Float32)
+                total = cute.make_rmem_tensor((2, 4, 4), Float32)
                 total.fill(Float32(0.0))
                 for block in cutlass.range(8, unroll=1):
                     kb = split * Int32(8) + block
-                    if kb < Int32(self.k // 128):
-                        acc = cute.make_rmem_tensor((2, 8, 4), Float32)
+                    if cutlass.const_expr(self.k % 1024 == 0) or kb < Int32(self.k // 128):
+                        acc = cute.make_rmem_tensor((2, 4, 4), Float32)
                         acc.fill(Float32(0.0))
-                        for half in cutlass.range_constexpr(2):
-                            parity = (kb * Int32(2) + Int32(half)) & Int32(1)
-                            next_parity = parity ^ Int32(1)
-                            cur_sa = sa_base + parity * Int32(16384)
-                            next_sa = sa_base + next_parity * Int32(16384)
-                            if cutlass.const_expr(half == 0):
-                                stage_a_half(
-                                    next_sa, x, group, rows, kb * Int32(128) + Int32(64),
-                                    r_a, c_a, a_store_base, self.k,
-                                )
-                                cute.arch.cp_async_commit_group()
-                            else:
-                                if (kb + Int32(1)) < Int32(self.k // 128):
-                                    stage_a_half(
-                                        next_sa, x, group, rows, (kb + Int32(1)) * Int32(128),
-                                        r_a, c_a, a_store_base, self.k,
-                                    )
-                                    cute.arch.cp_async_commit_group()
-                            decode_and_store_b_half(
-                                sb_write_base, payload_addr, nb, kb, Int32(half), warp, lane,
-                                i0_bytes, i1_bytes, i2_bytes, shift, delta,
-                                self.k, self.n, self.input_units, self.bits, self.e4m3, self.mul1,
+                        # Half 0: stage A for half 1 into stage 1, decode/store B for half 0
+                        stage_a_half(
+                            sa_store_ptr + Int32(16384), x_lane_addr, group_r_a, rows,
+                            kb * Int32(128) + Int32(64), self.k,
+                        )
+                        cute.arch.cp_async_commit_group()
+                        store_decoded_b_half(
+                            sb_write_base, payload_addr, nb64, kb, 0, warp, lane,
+                            z0_0, z1_0, z2_0, z0_1, z1_1, z2_1, shift, delta,
+                            self.k, self.n, self.input_units, self.bits, self.e4m3, self.mul1,
+                        )
+                        cute.arch.cp_async_wait_group(1)
+                        cute.arch.sync_threads()
+                        z0_0, z1_0, z2_0, z0_1, z1_1, z2_1 = prefetch_b_half(
+                            payload_i0, nb64, kb, 1, warp,
+                            d1_bytes, d2_bytes, self.k, self.n, self.input_units, self.bits,
+                        )
+                        scale = _side_value(scales.iterator.toint(), kb)
+                        for ki in cutlass.range_constexpr(4):
+                            addr_ki = sa_read_ptr + (swiz_m ^ Int32(ki * 2)) * Int32(16)
+                            a0_0, a0_1, a0_2, a0_3 = _ldmatrix_m8n8x4_b16_offset(addr_ki, 0)
+                            a1_0, a1_1, a1_2, a1_3 = _ldmatrix_m8n8x4_b16_offset(addr_ki, 2048)
+                            for n16_local in cutlass.range_constexpr(2):
+                                off = ki * 2048 + n16_local * 512
+                                b0 = _ld_shared_b32_offset(sb_read_base, off + 0)
+                                b1 = _ld_shared_b32_offset(sb_read_base, off + 128)
+                                b2 = _ld_shared_b32_offset(sb_read_base, off + 256)
+                                b3 = _ld_shared_b32_offset(sb_read_base, off + 384)
+                                n0 = 2 * n16_local
+                                n1 = 2 * n16_local + 1
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[0, n0, 0], acc[0, n0, 1], acc[0, n0, 2], acc[0, n0, 3],
+                                    a0_0, a0_1, a0_2, a0_3, b0, b1)
+                                acc[0, n0, 0], acc[0, n0, 1], acc[0, n0, 2], acc[0, n0, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[0, n1, 0], acc[0, n1, 1], acc[0, n1, 2], acc[0, n1, 3],
+                                    a0_0, a0_1, a0_2, a0_3, b2, b3)
+                                acc[0, n1, 0], acc[0, n1, 1], acc[0, n1, 2], acc[0, n1, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[1, n0, 0], acc[1, n0, 1], acc[1, n0, 2], acc[1, n0, 3],
+                                    a1_0, a1_1, a1_2, a1_3, b0, b1)
+                                acc[1, n0, 0], acc[1, n0, 1], acc[1, n0, 2], acc[1, n0, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[1, n1, 0], acc[1, n1, 1], acc[1, n1, 2], acc[1, n1, 3],
+                                    a1_0, a1_1, a1_2, a1_3, b2, b3)
+                                acc[1, n1, 0], acc[1, n1, 1], acc[1, n1, 2], acc[1, n1, 3] = d0, d1, d2, d3
+                        cute.arch.sync_threads()
+                        # Half 1: stage A for next kb into stage 0, decode/store B for half 1
+                        has_next_kb = (kb + Int32(1)) < Int32(self.k // 128)
+                        if has_next_kb:
+                            stage_a_half(
+                                sa_store_ptr, x_lane_addr, group_r_a, rows,
+                                (kb + Int32(1)) * Int32(128), self.k,
                             )
-                            if cutlass.const_expr(half == 0):
-                                cute.arch.cp_async_wait_group(1)
-                            else:
-                                if (kb + Int32(1)) < Int32(self.k // 128):
-                                    cute.arch.cp_async_wait_group(1)
-                                else:
-                                    cute.arch.cp_async_wait_group(0)
-                            cute.arch.sync_threads()
-                            for ki in cutlass.range_constexpr(4):
-                                col = Int32(ki * 2) + c_half
-                                addr_ki = cur_sa + a_read_row_base + (col ^ (r_m & Int32(7))) * Int32(16)
-                                a0_0, a0_1, a0_2, a0_3 = _ldmatrix_m8n8x4_b16_offset(addr_ki, 0)
-                                a1_0, a1_1, a1_2, a1_3 = _ldmatrix_m8n8x4_b16_offset(addr_ki, 2048)
-                                for n16_local in cutlass.range_constexpr(4):
-                                    off = ki * 4096 + n16_local * 512
-                                    b0 = _ld_shared_b32_offset(sb_read_base, off + 0)
-                                    b1 = _ld_shared_b32_offset(sb_read_base, off + 128)
-                                    b2 = _ld_shared_b32_offset(sb_read_base, off + 256)
-                                    b3 = _ld_shared_b32_offset(sb_read_base, off + 384)
-                                    n0 = 2 * n16_local
-                                    n1 = 2 * n16_local + 1
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                        acc[0, n0, 0], acc[0, n0, 1], acc[0, n0, 2], acc[0, n0, 3],
-                                        a0_0, a0_1, a0_2, a0_3, b0, b1)
-                                    acc[0, n0, 0], acc[0, n0, 1], acc[0, n0, 2], acc[0, n0, 3] = d0, d1, d2, d3
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                        acc[0, n1, 0], acc[0, n1, 1], acc[0, n1, 2], acc[0, n1, 3],
-                                        a0_0, a0_1, a0_2, a0_3, b2, b3)
-                                    acc[0, n1, 0], acc[0, n1, 1], acc[0, n1, 2], acc[0, n1, 3] = d0, d1, d2, d3
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                        acc[1, n0, 0], acc[1, n0, 1], acc[1, n0, 2], acc[1, n0, 3],
-                                        a1_0, a1_1, a1_2, a1_3, b0, b1)
-                                    acc[1, n0, 0], acc[1, n0, 1], acc[1, n0, 2], acc[1, n0, 3] = d0, d1, d2, d3
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                        acc[1, n1, 0], acc[1, n1, 1], acc[1, n1, 2], acc[1, n1, 3],
-                                        a1_0, a1_1, a1_2, a1_3, b2, b3)
-                                    acc[1, n1, 0], acc[1, n1, 1], acc[1, n1, 2], acc[1, n1, 3] = d0, d1, d2, d3
-                            cute.arch.sync_threads()
-                        scale = _side_value(scales_addr, kb)
+                            cute.arch.cp_async_commit_group()
+                        store_decoded_b_half(
+                            sb_write_base, payload_addr, nb64, kb, 1, warp, lane,
+                            z0_0, z1_0, z2_0, z0_1, z1_1, z2_1, shift, delta,
+                            self.k, self.n, self.input_units, self.bits, self.e4m3, self.mul1,
+                        )
+                        if has_next_kb:
+                            cute.arch.cp_async_wait_group(1)
+                        else:
+                            cute.arch.cp_async_wait_group(0)
+                        cute.arch.sync_threads()
+                        if has_next_kb:
+                            z0_0, z1_0, z2_0, z0_1, z1_1, z2_1 = prefetch_b_half(
+                                payload_i0, nb64, kb + Int32(1), 0, warp,
+                                d1_bytes, d2_bytes, self.k, self.n, self.input_units, self.bits,
+                            )
+                        for ki in cutlass.range_constexpr(4):
+                            addr_ki = sa_read_ptr + Int32(16384) + (swiz_m ^ Int32(ki * 2)) * Int32(16)
+                            a0_0, a0_1, a0_2, a0_3 = _ldmatrix_m8n8x4_b16_offset(addr_ki, 0)
+                            a1_0, a1_1, a1_2, a1_3 = _ldmatrix_m8n8x4_b16_offset(addr_ki, 2048)
+                            for n16_local in cutlass.range_constexpr(2):
+                                off = ki * 2048 + n16_local * 512
+                                b0 = _ld_shared_b32_offset(sb_read_base, off + 0)
+                                b1 = _ld_shared_b32_offset(sb_read_base, off + 128)
+                                b2 = _ld_shared_b32_offset(sb_read_base, off + 256)
+                                b3 = _ld_shared_b32_offset(sb_read_base, off + 384)
+                                n0 = 2 * n16_local
+                                n1 = 2 * n16_local + 1
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[0, n0, 0], acc[0, n0, 1], acc[0, n0, 2], acc[0, n0, 3],
+                                    a0_0, a0_1, a0_2, a0_3, b0, b1)
+                                acc[0, n0, 0], acc[0, n0, 1], acc[0, n0, 2], acc[0, n0, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[0, n1, 0], acc[0, n1, 1], acc[0, n1, 2], acc[0, n1, 3],
+                                    a0_0, a0_1, a0_2, a0_3, b2, b3)
+                                acc[0, n1, 0], acc[0, n1, 1], acc[0, n1, 2], acc[0, n1, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[1, n0, 0], acc[1, n0, 1], acc[1, n0, 2], acc[1, n0, 3],
+                                    a1_0, a1_1, a1_2, a1_3, b0, b1)
+                                acc[1, n0, 0], acc[1, n0, 1], acc[1, n0, 2], acc[1, n0, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[1, n1, 0], acc[1, n1, 1], acc[1, n1, 2], acc[1, n1, 3],
+                                    a1_0, a1_1, a1_2, a1_3, b2, b3)
+                                acc[1, n1, 0], acc[1, n1, 1], acc[1, n1, 2], acc[1, n1, 3] = d0, d1, d2, d3
+                        cute.arch.sync_threads()
                         for mb in cutlass.range_constexpr(2):
-                            for n8 in cutlass.range_constexpr(8):
+                            for n8 in cutlass.range_constexpr(4):
                                 for v in cutlass.range_constexpr(4):
                                     total[mb, n8, v] = total[mb, n8, v] + acc[mb, n8, v] * scale
+                out_addr = output.iterator.toint()
+                row_base = (group_r_a & Int32(-128)) + ((warp >> Int32(1)) * Int32(32)) + (lane >> Int32(2))
+                col_base = nb64 * Int32(64) + ((warp & Int32(1)) * Int32(32)) + (lane & Int32(3)) * Int32(2)
                 for mb in cutlass.range_constexpr(2):
-                    for n8 in cutlass.range_constexpr(8):
-                        for v in cutlass.range_constexpr(4):
-                            grand[mb, n8, v] = _add_rn_f32(grand[mb, n8, v], total[mb, n8, v])
-            row_base = group * Int32(128) + wm * Int32(32) + (lane >> Int32(2))
-            col_base = nb * Int32(128) + wn * Int32(64) + (lane & Int32(3)) * Int32(2)
-            for mb in cutlass.range_constexpr(2):
-                row0 = row_base + Int32(mb * 16)
-                row1 = row0 + Int32(8)
-                if row0 < rows:
-                    r0_ptr = out_addr + (row0.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
-                    for n8 in cutlass.range_constexpr(8):
-                        _st_global_v2_f32(r0_ptr + Int64(n8 * 32), grand[mb, n8, 0], grand[mb, n8, 1])
-                if row1 < rows:
-                    r1_ptr = out_addr + (row1.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
-                    for n8 in cutlass.range_constexpr(8):
-                        _st_global_v2_f32(r1_ptr + Int64(n8 * 32), grand[mb, n8, 2], grand[mb, n8, 3])
+                    row0 = row_base + Int32(mb * 16)
+                    row1 = row0 + Int32(8)
+                    if row0 < rows:
+                        r0_ptr = out_addr + (row0.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+                        for n8 in cutlass.range_constexpr(4):
+                            addr0 = r0_ptr + Int64(n8 * 32)
+                            v0, v1 = total[mb, n8, 0], total[mb, n8, 1]
+                            if split > Int32(0):
+                                p0, p1 = _ld_global_v2_f32(addr0)
+                                v0 = _add_rn_f32(p0, v0)
+                                v1 = _add_rn_f32(p1, v1)
+                            else:
+                                v0 = _add_rn_f32(Float32(0.0), v0)
+                                v1 = _add_rn_f32(Float32(0.0), v1)
+                            _st_global_v2_f32(addr0, v0, v1)
+                    if row1 < rows:
+                        r1_ptr = out_addr + (row1.to(Int64) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
+                        for n8 in cutlass.range_constexpr(4):
+                            addr1 = r1_ptr + Int64(n8 * 32)
+                            v2, v3 = total[mb, n8, 2], total[mb, n8, 3]
+                            if split > Int32(0):
+                                p2, p3 = _ld_global_v2_f32(addr1)
+                                v2 = _add_rn_f32(p2, v2)
+                                v3 = _add_rn_f32(p3, v3)
+                            else:
+                                v2 = _add_rn_f32(Float32(0.0), v2)
+                                v3 = _add_rn_f32(Float32(0.0), v3)
+                            _st_global_v2_f32(addr1, v2, v3)
             task += step
 
     @cute.kernel

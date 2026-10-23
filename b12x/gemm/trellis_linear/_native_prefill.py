@@ -1,9 +1,10 @@
-"""Native many-row trellis dense prefill kernel (M128xN128 decode-once to FP16 SMEM).
+"""Native many-row trellis dense prefill kernel (M128xN64 decode-once to FP16 SMEM, 2 CTAs/SM).
 
 Reads packed trellis words and per-K128 scales directly, decodes each 16x16
 weight tile once per CTA into FP16 shared memory, and reuses the decoded
 fragments across all 128 rows (four 32-row consumer warp groups) with
-ldmatrix-fed HMMA and full-K in-register split folding.
+ldmatrix-fed HMMA, software-pipelined weight/scale loads, and full-K
+in-register split folding.
 """
 from __future__ import annotations
 
@@ -121,6 +122,25 @@ def _ldmatrix_m8n8x4_b16_offset(base_addr: Int32, offset: int, *, loc=None, ip=N
 
 
 @dsl_user_op
+def _ld_global_v2_f32(addr: Int64, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.v2.f32 {$0, $1}, [$2];",
+        "=f,=f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def _st_global_v2_f32(addr: Int64, v0: Float32, v1: Float32, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -160,47 +180,90 @@ def prefill_storage():
     class Storage:
         pass
 
-    # 32 KiB for 2x (128x64 FP16) A stages + 16 KiB for (64x128 FP16) decoded B = 48 KiB
+    # 32 KiB for 2x (128x64 FP16) A stages + 8 KiB for (64x64 FP16) decoded B = 40 KiB
     Storage.__annotations__ = {
-        "words": cute.struct.Align[cute.struct.MemRange[Uint32, 12288], 16],
+        "words": cute.struct.Align[cute.struct.MemRange[Uint32, 10240], 16],
     }
     return cute.struct(Storage)
 
 
 @cute.jit
 def stage_a_half(
-    sa_stage: Int32,
-    x_addr: Int64,
-    group: Int32,
+    sa_store_ptr: Int32,
+    x_lane_addr: Int64,
+    group_r_a: Int32,
     rows: Int32,
     k_col_base: Int32,
-    r_a: Int32,
-    c_a: Int32,
-    a_store_base: Int32,
     k_features: cutlass.Constexpr,
 ):
-    k_col = k_col_base + c_a * Int32(8)
-    row_base = group * Int32(128) + r_a
+    base_gmem = x_lane_addr + (group_r_a.to(Int64) * Int64(k_features) + k_col_base.to(Int64)) * Int64(2)
+    row_stride = 64 * k_features
     for s in cutlass.range_constexpr(4):
-        row = row_base + Int32(s * 32)
+        row = group_r_a + Int32(s * 32)
         valid = (row < rows).to(Int32)
-        safe_row = min(row, rows - Int32(1))
-        gmem = x_addr + (safe_row.to(Int64) * Int64(k_features) + k_col.to(Int64)) * Int64(2)
-        _cp_async4_cg_zfill(sa_stage + a_store_base + Int32(s * 4096), gmem, valid)
+        _cp_async4_cg_zfill(
+            sa_store_ptr + Int32(s * 4096),
+            base_gmem + Int64(s * row_stride),
+            valid,
+        )
 
 
 @cute.jit
-def decode_and_store_b_half(
+def prefetch_b_half(
+    payload_i0: Int64,
+    nb64: Int32,
+    kb: Int32,
+    half: cutlass.Constexpr,
+    warp: Int32,
+    d1_bytes: Int32,
+    d2_bytes: Int32,
+    k_features: cutlass.Constexpr,
+    n_features: cutlass.Constexpr,
+    input_units: cutlass.Constexpr,
+    bits: cutlass.Constexpr,
+):
+    nb128 = nb64 >> Int32(1)
+    n64_half = nb64 & Int32(1)
+    c4 = warp & Int32(3)
+    ki_hi = (warp >> Int32(2)) * Int32(2)
+    k16_base = kb * Int32(8) + Int32(half * 4) + ki_hi
+    c8 = n64_half * Int32(4) + c4
+    tile_base = nb128 * Int32(k_features // 16 * 8) + k16_base * Int32(8) + c8
+    if cutlass.const_expr(input_units):
+        tile_base = (
+            kb * Int32(n_features // 16 * 8)
+            + nb128 * Int32(64)
+            + (Int32(half * 4) + ki_hi) * Int32(8)
+            + c8
+        )
+    p0 = payload_i0 + tile_base.to(Int64) * Int64(32 * bits)
+    p1 = p0 + d1_bytes.to(Int64)
+    p2 = p0 + d2_bytes.to(Int64)
+    step_bytes = 256 * bits
+    z0_0 = _ld_global_nc_u32_offset(p0, 0)
+    z1_0 = _ld_global_nc_u32_offset(p1, 0)
+    z2_0 = _ld_global_nc_u32_offset(p2, 0)
+    z0_1 = _ld_global_nc_u32_offset(p0, step_bytes)
+    z1_1 = _ld_global_nc_u32_offset(p1, step_bytes)
+    z2_1 = _ld_global_nc_u32_offset(p2, step_bytes)
+    return z0_0, z1_0, z2_0, z0_1, z1_1, z2_1
+
+
+@cute.jit
+def store_decoded_b_half(
     sb_write_base: Int32,
     payload_addr: Int64,
-    nb: Int32,
+    nb64: Int32,
     kb: Int32,
-    half: Int32,
+    half: cutlass.Constexpr,
     warp: Int32,
     lane: Int32,
-    i0_bytes: Int64,
-    i1_bytes: Int64,
-    i2_bytes: Int64,
+    z0_0: Uint32,
+    z1_0: Uint32,
+    z2_0: Uint32,
+    z0_1: Uint32,
+    z1_1: Uint32,
+    z2_1: Uint32,
     shift: Int32,
     delta: Int32,
     k_features: cutlass.Constexpr,
@@ -210,34 +273,11 @@ def decode_and_store_b_half(
     e4m3: cutlass.Constexpr,
     mul1: cutlass.Constexpr,
 ):
-    k16_base = kb * Int32(8) + half * Int32(4)
-    tile_base = nb * Int32(k_features // 16 * 8) + k16_base * Int32(8) + warp
-    if cutlass.const_expr(input_units):
-        tile_base = kb * Int32(n_features // 16 * 8) + nb * Int32(64) + (half * Int32(32)) + warp
-    base_addr = payload_addr + tile_base.to(Int64) * Int64(32 * bits)
-    step_bytes = 256 * bits
-
     if cutlass.const_expr(bits >= 6):
-        p0 = base_addr + i0_bytes
-        p1 = base_addr + i1_bytes
-        p2 = base_addr + i2_bytes
-        z0_0 = _ld_global_nc_u32_offset(p0, 0 * step_bytes)
-        z1_0 = _ld_global_nc_u32_offset(p1, 0 * step_bytes)
-        z2_0 = _ld_global_nc_u32_offset(p2, 0 * step_bytes)
-        z0_1 = _ld_global_nc_u32_offset(p0, 1 * step_bytes)
-        z1_1 = _ld_global_nc_u32_offset(p1, 1 * step_bytes)
-        z2_1 = _ld_global_nc_u32_offset(p2, 1 * step_bytes)
-        z0_2 = _ld_global_nc_u32_offset(p0, 2 * step_bytes)
-        z1_2 = _ld_global_nc_u32_offset(p1, 2 * step_bytes)
-        z2_2 = _ld_global_nc_u32_offset(p2, 2 * step_bytes)
-        z0_3 = _ld_global_nc_u32_offset(p0, 3 * step_bytes)
-        z1_3 = _ld_global_nc_u32_offset(p1, 3 * step_bytes)
-        z2_3 = _ld_global_nc_u32_offset(p2, 3 * step_bytes)
-
-        for ki in cutlass.range_constexpr(4):
-            z0 = z0_0 if ki == 0 else (z0_1 if ki == 1 else (z0_2 if ki == 2 else z0_3))
-            z1 = z1_0 if ki == 0 else (z1_1 if ki == 1 else (z1_2 if ki == 2 else z1_3))
-            z2 = z2_0 if ki == 0 else (z2_1 if ki == 1 else (z2_2 if ki == 2 else z2_3))
+        for pair_idx in cutlass.range_constexpr(2):
+            z0 = z0_0 if pair_idx == 0 else z0_1
+            z1 = z1_0 if pair_idx == 0 else z1_1
+            z2 = z2_0 if pair_idx == 0 else z2_1
             wa, wb = trellis_align_stream_u32x2(z0, z1, z2, shift, delta)
             if cutlass.const_expr(mul1):
                 b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, bits)
@@ -248,18 +288,32 @@ def decode_and_store_b_half(
             if cutlass.const_expr(e4m3):
                 b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
                 b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
-            off = ki * 4096
+            off = pair_idx * 2048
             _st_shared_b32_offset(sb_write_base, off + 0, b0)
             _st_shared_b32_offset(sb_write_base, off + 128, b1)
             _st_shared_b32_offset(sb_write_base, off + 256, b2)
             _st_shared_b32_offset(sb_write_base, off + 384, b3)
     else:
         from b12x.gemm.trellis_linear._native import decode_tile
-        for ki in cutlass.range_constexpr(4):
-            b0, b1, b2, b3 = decode_tile(
-                payload_addr, tile_base + Int32(ki * 8), lane, bits, e4m3, mul1
+        nb128 = nb64 >> Int32(1)
+        n64_half = nb64 & Int32(1)
+        c4 = warp & Int32(3)
+        ki_hi = (warp >> Int32(2)) * Int32(2)
+        k16_base = kb * Int32(8) + Int32(half * 4) + ki_hi
+        c8 = n64_half * Int32(4) + c4
+        tile_base = nb128 * Int32(k_features // 16 * 8) + k16_base * Int32(8) + c8
+        if cutlass.const_expr(input_units):
+            tile_base = (
+                kb * Int32(n_features // 16 * 8)
+                + nb128 * Int32(64)
+                + (Int32(half * 4) + ki_hi) * Int32(8)
+                + c8
             )
-            off = ki * 4096
+        for pair_idx in cutlass.range_constexpr(2):
+            b0, b1, b2, b3 = decode_tile(
+                payload_addr, tile_base + Int32(pair_idx * 8), lane, bits, e4m3, mul1
+            )
+            off = pair_idx * 2048
             _st_shared_b32_offset(sb_write_base, off + 0, b0)
             _st_shared_b32_offset(sb_write_base, off + 128, b1)
             _st_shared_b32_offset(sb_write_base, off + 256, b2)
