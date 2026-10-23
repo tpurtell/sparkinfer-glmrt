@@ -263,6 +263,12 @@ def main():
     report = dict(device=props.name, sms=props.multi_processor_count,
                   variants=args.variants, measurements=[], errors=[], census=[])
 
+    def save():
+        """Keep every finished measurement on disk: a later arm can fault."""
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(report, indent=1) + "\n")
+
     for name in shapes:
         s = SHAPES[name]
         k, n, side = s["k"], s["n"], s["side"]
@@ -300,6 +306,7 @@ def main():
                     report["errors"].append(dict(shape=name, variant="native",
                                                  rows=args.check_rows,
                                                  **fp64_stats(ref[:ref64.shape[0]], ref64)))
+                    save()
                 continue
             got = tensors[4].clone()
             finite_nonzero(got, label)
@@ -322,10 +329,12 @@ def main():
                 del big
                 torch.cuda.empty_cache()
             report["errors"].append(stats)
+            save()
         for label, program in variants.items():
             report["census"].append(dict(
                 shape=name, variant=label,
                 **resource_census(program, Path("/tmp") / "t1census" / f"{name}-{label}")))
+        save()
         del tensors
         torch.cuda.empty_cache()
         if args.no_timing:
@@ -339,6 +348,7 @@ def main():
                 report["measurements"].append(
                     dict(shape=name, variant=label, rows=rows, us=round(us, 1),
                          tflops=round(flops(rows) / us / 1e6, 1)))
+                save()
                 del graph
                 torch.cuda.empty_cache()
             del timed
@@ -358,14 +368,13 @@ def main():
                 report["measurements"].append(
                     dict(shape=name, variant=tag, rows=rows, us=round(us, 1),
                          tflops=round(flops(rows) / us / 1e6, 1)))
+                save()
                 del graph, t, scratch
                 torch.cuda.empty_cache()
 
     text = json.dumps(report, indent=1)
     print(text)
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(text + "\n")
+    save()
 
 
 if __name__ == "__main__":

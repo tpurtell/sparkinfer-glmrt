@@ -278,7 +278,7 @@ class TrellisPrefillDense:
                         kcol = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
                         a = []
                         for b in cutlass.range_constexpr(self.mpw):
-                            q = arow[b] + Int64(8 * self.k)
+                            q = arow[b] + Int64(16 * self.k)
                             a.append((self._pair(arow[b], kcol), self._pair(q, kcol),
                                       self._pair(arow[b], kcol + Int32(8)),
                                       self._pair(q, kcol + Int32(8))))
@@ -304,7 +304,7 @@ class TrellisPrefillDense:
                     for k32 in cutlass.range_constexpr(4):
                         kcol = kb * Int32(128) + Int32(k32 * 32) + q4
                         for b in cutlass.range_constexpr(self.mpw):
-                            q = arow[b] + Int64(8 * self.k)
+                            q = arow[b] + Int64(16 * self.k)
                             f0, f1 = self._quad(arow[b], kcol)
                             f2, f3 = self._quad(q, kcol)
                             f4, f5 = self._quad(arow[b], kcol + Int32(16))
@@ -609,7 +609,7 @@ class TrellisPrefillMxfp8:
         # k16 half); every lane addresses column n = (m>>1)*8 + (lane&7).
         blk = Int32((lane >> Int32(3)) & Int32(1))
         bcol = (lane >> Int32(4)) * Int32(8) + (lane & Int32(7))
-        b_row_base = sbase + bcol * Int32(128) + ((blk ^ (lane & Int32(7))) << 4)
+        b_row_base = sbase + bcol * Int32(128)
         # sfa byte: row l/4 for even lanes, row l/4+8 for odd lanes.
         srow = (lane >> Int32(2)) + (lane & Int32(1)) * Int32(8)
         while task < total_tasks:
