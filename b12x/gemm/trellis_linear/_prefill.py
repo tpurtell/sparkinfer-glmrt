@@ -1,0 +1,346 @@
+"""Decode-once shared E4M3 trellis tiles for many-row dense prefill (track T1).
+
+The K4 payload is decoded once per CTA into **exact E4M3** bytes in shared
+memory, laid out in the consumer's MMA B-fragment order, and every warp reads
+the whole tile for its own m16 rows. Two consumers are selectable:
+
+``mode="f16"``
+    widen E4M3 -> F16 in registers (``cvt.rn.f16x2.e4m3x2`` is exact for every
+    E4M3 value) and use ``mma.m16n8k16.f32.f16.f16.f32``; activations stay
+    exactly what the W8A16 / native path feeds.
+``mode="fp8"``
+    feed ``mma.m16n8k32.f32.e4m3.e4m3.f32`` with the same E4M3 weights and
+    E4M3 activations quantized per row and per K128 block, applying the
+    checkpoint's per-K128 weight scale and the row's activation scale to the
+    FP32 accumulator at each K128 boundary, exactly where W8A16 applies it.
+
+Both modes keep one FP32 accumulator per K128 block plus the running FP32
+total, reuse the decoded tile across the CTA's whole M range, and write the
+F32 output directly (no split-K partials, no reduce pass). Only K4 is handled.
+"""
+from __future__ import annotations
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
+from cutlass import Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T
+
+from b12x._lib.intrinsics import (
+    broadcast_f32_to_half2,
+    byte_perm,
+    f16_mma_m16n8k16_f32,
+    fp8x4_e4m3_to_half2x2,
+    habs2,
+    half2_mul,
+    hmax2,
+    hmax_to_f32,
+    ld_global_nc_u32,
+    ld_global_nc_v2_u32,
+    ld_shared_u32,
+    ld_shared_v2_u32,
+    mma_m16n8k32_f32_e4m3,
+    packed_dequant_trellis_to_half2x4,
+    shared_ptr_to_u32,
+    st_global_v2_f32,
+    st_shared_u32,
+)
+from b12x.moe._shared.kernels.w4a16.exlr8 import _side_value
+
+M_CTA = 128
+NWARP = 8
+K16_PER_BLOCK = 8
+E4M3_MAX = 448.0
+
+
+def _e4m3x4_from_half2x2(lo: Uint32, hi: Uint32) -> Uint32:
+    """Round two half2 fragment registers to E4M3 and pack four bytes.
+
+    ``lo`` supplies bytes 0-1 and ``hi`` bytes 2-3, exactly the order
+    ``fp8x4_e4m3_to_half2x2`` reads back. Rounding is what the native kernel
+    already does (``_e4m3_round_half2``); a decoded trellis value is an exact
+    E4M3 number, so this is a no-op on it and bitwise for the F16 consumer.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(lo).ir_value(), Uint32(hi).ir_value()],
+            """
+            {
+                .reg .b16 e0, e1;
+                cvt.rn.satfinite.e4m3x2.f16x2 e0, $1;
+                cvt.rn.satfinite.e4m3x2.f16x2 e1, $2;
+                mov.b32 $0, {e0, e1};
+            }
+            """,
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _load_words4(address: Int64, tile: Int32, lane: Int32):
+    """One K4 payload tile (128 B): the lane word and the rotated neighbour."""
+    base = address + tile.to(Int64) * Int64(128)
+    b = ld_global_nc_u32(base + lane.to(Int64) * Int64(4))
+    a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
+    return b, (a << Uint32(16)) | (b >> Uint32(16))
+
+
+class TrellisPrefillDense:
+    """Many-row native trellis dense linear, decode-once shared E4M3 tile."""
+
+    ABI_VERSION = 1
+
+    def __init__(self, g, *, mode: str = "f16", n_cta: int = 64, stages: int = 2):
+        self.k, self.n = g["input_features"], g["output_features"]
+        self.bits = g["bits"]
+        if self.bits != 4:
+            raise ValueError("the T1 prefill kernel covers K4 trellis only")
+        # The E4M3 shared tile is the native kernel's own weight arithmetic:
+        # ``decode_tile`` rounds the e4m3 codebook through
+        # ``cvt.rn.satfinite.e4m3x2.f16x2``, which is exactly what packing the
+        # bytes does here. Any other codebook keeps wider decoded levels and
+        # would need an FP16 tile instead.
+        if g["codebook"] != "e4m3":
+            raise ValueError("the T1 E4M3 tile covers the e4m3 codebook only")
+        if mode not in ("f16", "fp8"):
+            raise ValueError("mode must be f16 or fp8")
+        if n_cta not in (64, 128) or n_cta > self.n:
+            raise ValueError("n_cta must be 64 or 128")
+        self.e4m3 = g["codebook"] == "e4m3"
+        self.mul1 = g["codebook"] == "mul1"
+        self.input_units = g["sharded_side"] == 2
+        self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
+        self.mode, self.n_cta, self.stages = mode, n_cta, stages
+        self.n8, self.n16 = n_cta // 8, n_cta // 16
+
+    def _storage(self):
+        words = self.stages * 32 * self.n_cta
+
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "w": cute.struct.Align[cute.struct.MemRange[Uint32, words], 16],
+        }
+        return cute.struct(Storage)
+
+    @cute.jit
+    def _tile_index(self, nb: Int32, kb: Int32, k16: Int32, n16_local: Int32) -> Int32:
+        n16g = nb * Int32(self.n_cta // 16) + n16_local
+        group = n16g // Int32(8)
+        slot = n16g % Int32(8)
+        if cutlass.const_expr(self.input_units):
+            return (kb * Int32(self.n // 16 * 8) + group * Int32(64)
+                    + k16 * Int32(8) + slot)
+        return (group * Int32(self.k // 16 * 8)
+                + (kb * Int32(8) + k16) * Int32(8) + slot)
+
+    # ------------------------------------------------------------------ A side
+    @cute.jit
+    def _pair(self, x: Int64, kcol: Int32, row: Int32) -> Uint32:
+        """Two F16 activations: one F16-MMA A fragment register."""
+        return ld_global_nc_u32(x + (row.to(Int64) * Int64(self.k) + kcol.to(Int64)) * Int64(2))
+
+    @cute.jit
+    def _quad(self, x: Int64, kcol: Int32, row: Int32):
+        """Four F16 activations: one E4M3-MMA A fragment register before quantizing."""
+        return ld_global_nc_v2_u32(
+            x + (row.to(Int64) * Int64(self.k) + kcol.to(Int64)) * Int64(2))
+
+    # -------------------------------------------------------------- weight side
+    @cute.jit
+    def _stage(self, sbase: Int32, stage: Int32, k16: Int32, n16: Int32,
+               lane: Int32, wa: Uint32, wb: Uint32, b_sel: Int32,
+               src1: Int32, src2: Int32):
+        """Decode one K16 x N16 tile and store exact E4M3 in fragment order.
+
+        Stage layout, per k16 (F16 consumer) or k32 pair (FP8 consumer) and per
+        n8: 32 lane words. The F16 consumer reads its (b0, b1) pair as one u32;
+        the FP8 consumer reads k=4q..4q+3 (and +16) as a 64-bit pair.
+        """
+        b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, self.bits)
+        for s in cutlass.range_constexpr(2):
+            if cutlass.const_expr(s == 0):
+                e = _e4m3x4_from_half2x2(b0, b1)
+            else:
+                e = _e4m3x4_from_half2x2(b2, b3)
+            n8 = n16 * Int32(2) + Int32(s)
+            if cutlass.const_expr(self.mode == "f16"):
+                # [k16][n8][lane]: the consumer's (b0, b1) pair is one u32.
+                st_shared_u32(
+                    sbase + (stage * Int32(32 * self.n_cta) + k16 * Int32(4 * self.n_cta)
+                             + n8 * Int32(32) + lane) * Int32(4), e)
+            else:
+                # [k32][n8][lane][k16-of-pair]: the consumer's 64-bit k32
+                # fragment; the producer packs k=4q..4q+3 from two lanes.
+                word = byte_perm(cute.arch.shuffle_sync(e, src1),
+                                 cute.arch.shuffle_sync(e, src2), b_sel)
+                st_shared_u32(
+                    sbase + (stage * Int32(32 * self.n_cta)
+                             + (k16 // Int32(2)) * Int32(8 * self.n_cta)
+                             + n8 * Int32(64) + lane * Int32(2)
+                             + k16 % Int32(2)) * Int32(4), word)
+
+    # ------------------------------------------------------------------- kernel
+    @cute.kernel
+    def prefill(self, inputs: cute.Tensor, payload: cute.Tensor,
+                scales: cute.Tensor, output: cute.Tensor,
+                rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        tid = Int32(tid)
+        lane, warp = tid & Int32(31), tid >> Int32(5)
+        x = inputs[rotation_id]
+        wbase = payload.iterator.toint()
+        obase = output.iterator.toint()
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        sbase = shared_ptr_to_u32(storage.x.data_ptr())
+        n_tiles = Int32(self.n // self.n_cta)
+        nkb = self.k // 128
+        total_tasks = ((rows + Int32(M_CTA - 1)) // Int32(M_CTA)) * n_tiles
+        # Rows past the tail re-read the last valid row; the store is predicated.
+        # (Exact in f32 for every row count below 2**24.)
+        row_last = Float32(rows - Int32(1))
+        # FP8 consumer B-fragment gather: lane q reads the khalf word pair of
+        # producer lanes 2*(q%2) and 2*(q%2)+1 and selects the low (q<2) or the
+        # high (q>=2) bytes of each.
+        b_sel = Int32(0x5410) + ((lane >> Int32(1)) & Int32(1)) * Int32(0x2222)
+        src1 = (lane & Int32(28)) + (lane & Int32(1)) * Int32(2)
+        src2 = src1 + Int32(1)
+        while task < total_tasks:
+            nb = task % n_tiles
+            m_base = (task // n_tiles) * Int32(M_CTA)
+            row0 = m_base + warp * Int32(16) + (lane >> Int32(2))
+            row1 = row0 + Int32(8)
+            row0c = Int32(cute.arch.fmin(Float32(row0), row_last))
+            row1c = Int32(cute.arch.fmin(Float32(row1), row_last))
+            total = cute.make_rmem_tensor((self.n8, 4), Float32)
+            total.fill(Float32(0.0))
+            words = cute.make_rmem_tensor((2 * self.n16,), Uint32)
+            for j in cutlass.range_constexpr(self.n16):
+                tile = self._tile_index(nb, Int32(0), warp, Int32(j))
+                wa, wb = _load_words4(wbase, tile, lane)
+                self._stage(sbase, Int32(0), warp, Int32(j), lane, wa, wb, b_sel, src1, src2)
+            cute.arch.sync_threads()
+            for kb in cutlass.range(nkb, unroll=1):
+                if kb + Int32(1) < Int32(nkb):
+                    for j in cutlass.range_constexpr(self.n16):
+                        tile = self._tile_index(nb, kb + Int32(1), warp, Int32(j))
+                        wa, wb = _load_words4(wbase, tile, lane)
+                        words[2 * j], words[2 * j + 1] = wa, wb
+                acc = cute.make_rmem_tensor((self.n8, 4), Float32)
+                acc.fill(Float32(0.0))
+                stage = (kb % Int32(self.stages)) * Int32(32 * self.n_cta)
+                if cutlass.const_expr(self.mode == "f16"):
+                    for k16 in cutlass.range_constexpr(K16_PER_BLOCK):
+                        kcol = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
+                        a0 = self._pair(x, kcol, row0c)
+                        a1 = self._pair(x, kcol, row1c)
+                        a2 = self._pair(x, kcol + Int32(8), row0c)
+                        a3 = self._pair(x, kcol + Int32(8), row1c)
+                        for i in cutlass.range_constexpr(self.n8):
+                            addr = (sbase + (stage + Int32(k16) * Int32(4 * self.n_cta)
+                                             + Int32(i * 32) + lane) * Int32(4))
+                            b0, b1 = fp8x4_e4m3_to_half2x2(ld_shared_u32(addr))
+                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3],
+                                a0, a1, a2, a3, b0, b1)
+                            acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3] = d0, d1, d2, d3
+                    scale = _side_value(scales.iterator.toint(), kb)
+                    for i in cutlass.range_constexpr(self.n8):
+                        for v in cutlass.range_constexpr(4):
+                            total[i, v] = total[i, v] + acc[i, v] * scale
+                else:
+                    q4 = (lane & Int32(3)) * Int32(4)
+                    mx0 = Uint32(0)
+                    mx1 = Uint32(0)
+                    for k32 in cutlass.range_constexpr(4):
+                        kcol = kb * Int32(128) + Int32(k32 * 32) + q4
+                        f0, f1 = self._quad(x, kcol, row0c)
+                        f2, f3 = self._quad(x, kcol, row1c)
+                        f4, f5 = self._quad(x, kcol + Int32(16), row0c)
+                        f6, f7 = self._quad(x, kcol + Int32(16), row1c)
+                        mx0 = hmax2(mx0, hmax2(hmax2(habs2(f0), habs2(f1)),
+                                              hmax2(habs2(f4), habs2(f5))))
+                        mx1 = hmax2(mx1, hmax2(hmax2(habs2(f2), habs2(f3)),
+                                              hmax2(habs2(f6), habs2(f7))))
+                    m0 = hmax_to_f32(mx0)
+                    m1 = hmax_to_f32(mx1)
+                    m0 = cute.arch.fmax(m0, cute.arch.shuffle_sync_bfly(m0, offset=1))
+                    m1 = cute.arch.fmax(m1, cute.arch.shuffle_sync_bfly(m1, offset=1))
+                    m0 = cute.arch.fmax(m0, cute.arch.shuffle_sync_bfly(m0, offset=2))
+                    m1 = cute.arch.fmax(m1, cute.arch.shuffle_sync_bfly(m1, offset=2))
+                    s0 = cute.arch.fmin(Float32(E4M3_MAX) / cute.arch.fmax(m0, Float32(1e-30)),
+                                        Float32(60000.0))
+                    s1 = cute.arch.fmin(Float32(E4M3_MAX) / cute.arch.fmax(m1, Float32(1e-30)),
+                                        Float32(60000.0))
+                    h0 = broadcast_f32_to_half2(s0)
+                    h1 = broadcast_f32_to_half2(s1)
+                    for k32 in cutlass.range_constexpr(4):
+                        kcol = kb * Int32(128) + Int32(k32 * 32) + q4
+                        f0, f1 = self._quad(x, kcol, row0c)
+                        f2, f3 = self._quad(x, kcol, row1c)
+                        f4, f5 = self._quad(x, kcol + Int32(16), row0c)
+                        f6, f7 = self._quad(x, kcol + Int32(16), row1c)
+                        qa0 = _e4m3x4_from_half2x2(half2_mul(f0, h0), half2_mul(f1, h0))
+                        qa1 = _e4m3x4_from_half2x2(half2_mul(f2, h1), half2_mul(f3, h1))
+                        qa2 = _e4m3x4_from_half2x2(half2_mul(f4, h0), half2_mul(f5, h0))
+                        qa3 = _e4m3x4_from_half2x2(half2_mul(f6, h1), half2_mul(f7, h1))
+                        for i in cutlass.range_constexpr(self.n8):
+                            addr = (sbase + (stage + Int32(k32) * Int32(8 * self.n_cta)
+                                             + Int32(i * 64) + lane * Int32(2)) * Int32(4))
+                            b0, b1 = ld_shared_v2_u32(addr)
+                            d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
+                                acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3],
+                                qa0, qa1, qa2, qa3, b0, b1)
+                            acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3] = d0, d1, d2, d3
+                    scale = _side_value(scales.iterator.toint(), kb)
+                    sa0 = scale * (Float32(1.0) / s0)
+                    sa1 = scale * (Float32(1.0) / s1)
+                    for i in cutlass.range_constexpr(self.n8):
+                        total[i, 0] = total[i, 0] + acc[i, 0] * sa0
+                        total[i, 1] = total[i, 1] + acc[i, 1] * sa0
+                        total[i, 2] = total[i, 2] + acc[i, 2] * sa1
+                        total[i, 3] = total[i, 3] + acc[i, 3] * sa1
+                if kb + Int32(1) < Int32(nkb):
+                    for j in cutlass.range_constexpr(self.n16):
+                        self._stage(sbase, (kb + Int32(1)) % Int32(self.stages), warp,
+                                    Int32(j), lane, words[2 * j], words[2 * j + 1],
+                                    b_sel, src1, src2)
+                cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(self.n8):
+                col = nb * Int32(self.n_cta) + Int32(i * 8) + (lane & Int32(3)) * Int32(2)
+                addr = obase + (row0.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
+                if row0 < rows:
+                    st_global_v2_f32(addr, total[i, 0], total[i, 1])
+                if row1 < rows:
+                    st_global_v2_f32(addr + Int64(8 * self.n * 4), total[i, 2], total[i, 3])
+            task += step
+
+    @cute.jit
+    def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
+                 input_block_scales: cute.Pointer, partial: cute.Pointer,
+                 output: cute.Pointer, rows: Int32, rotation_id: Int32,
+                 cta_limit: Int32, stream: cuda.CUstream):
+        # ``partial`` is part of ABI v1 and unused: this kernel writes the F32
+        # output directly, with no split-K partials and no reduce pass.
+        if (rows > Int32(0) and rows <= Int32(self.max_rows)
+                and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations)
+                and cta_limit > Int32(0)):
+            layout = cute.make_layout(1, stride=1)
+            tasks = ((rows + Int32(M_CTA - 1)) // Int32(M_CTA)) * Int32(self.n // self.n_cta)
+            self.prefill(cute.make_tensor(rotated_inputs, layout),
+                         cute.make_tensor(payload, layout),
+                         cute.make_tensor(input_block_scales, layout),
+                         cute.make_tensor(output, layout),
+                         rows, rotation_id).launch(
+                grid=(min(tasks, cta_limit), 1, 1), block=(32 * NWARP, 1, 1),
+                stream=stream)
