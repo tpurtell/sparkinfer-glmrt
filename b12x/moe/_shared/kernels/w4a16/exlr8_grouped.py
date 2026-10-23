@@ -340,10 +340,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     def stage_a_async(self, shared_a: Int32, a_address: Int64, srow: cute.Tensor,
                       num_live_m: Int32, input_block: Int32, smem_thread_off: Int32,
                       col_s: Int32, a_stride: cutlass.Constexpr,
-                      max_tiles: cutlass.Constexpr):
+                      max_tiles: cutlass.Constexpr, tile_lo: cutlass.Constexpr = 0):
         col_offset_bytes = (input_block.to(Int64) * Int64(128) + col_s.to(Int64) * Int64(8)) * Int64(2)
         base_a = a_address + col_offset_bytes
-        for idx in cutlass.range_constexpr(max_tiles):
+        for idx in cutlass.range_constexpr(tile_lo, max_tiles):
             if Int32(idx) < num_live_m:
                 sr = srow[idx]
                 valid = (sr >= Int32(0)).to(Int32)
@@ -433,7 +433,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     @cute.jit
     def accumulate(self, total: cute.Tensor, shared_a: Int32, shared_b: Int32,
                    lane: Int32, warp: Int32,
-                   width: cutlass.Constexpr, packed_scale: Uint32, num_live_m: Int32):
+                   width: cutlass.Constexpr, packed_scale: Uint32, num_live_m: Int32,
+                   next_a: Int32, x_addr: Int64, srow: cute.Tensor, input_block: Int32,
+                   smem_thread_off: Int32, col_s: Int32, has_next: Int32):
         if cutlass.const_expr(self.mtiles == 1):
             if num_live_m >= Int32(1):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
@@ -455,16 +457,44 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             elif num_live_m == Int32(3):
                 # Two m-tile passes keep the live accumulator set at 2 tiles, so
                 # no split partial needs a shared plane and the second activation
-                # buffer fits the 48 KiB budget.
+                # buffer fits the 48 KiB budget. The upper half of that buffer is
+                # staged between the passes: its addresses then never compete with
+                # the first pass's accumulator registers.
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
                                         width, packed_scale, 2, 0)
+                self.stage_a_upper(next_a, x_addr, srow, num_live_m, input_block,
+                                   smem_thread_off, col_s, has_next)
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
                                         width, packed_scale, 1, 2)
             elif num_live_m >= Int32(4):
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
                                         width, packed_scale, 2, 0)
+                self.stage_a_upper(next_a, x_addr, srow, num_live_m, input_block,
+                                   smem_thread_off, col_s, has_next)
                 self.accumulate_fixed_m(total, shared_a, shared_b, lane, warp,
                                         width, packed_scale, 2, 2)
+
+    @cute.jit
+    def stage_a_upper(self, next_a: Int32, x_addr: Int64, srow: cute.Tensor,
+                      num_live_m: Int32, input_block: Int32, smem_thread_off: Int32,
+                      col_s: Int32, has_next: Int32):
+        """Second half of the next block's activation, issued between m passes."""
+        if cutlass.const_expr(self.mtiles == 4):
+            if has_next:
+                self.stage_a_async(next_a, x_addr, srow, num_live_m, input_block,
+                                   smem_thread_off, col_s, self.hidden_size, self.mtiles, 2)
+
+    @cute.jit
+    def stage_a_lower(self, next_a: Int32, x_addr: Int64, srow: cute.Tensor,
+                      num_live_m: Int32, input_block: Int32, smem_thread_off: Int32,
+                      col_s: Int32):
+        """First half of the next block's activation (all tiles below four)."""
+        if cutlass.const_expr(self.mtiles == 4):
+            self.stage_a_async(next_a, x_addr, srow, num_live_m, input_block,
+                               smem_thread_off, col_s, self.hidden_size, 2)
+        else:
+            self.stage_a_async(next_a, x_addr, srow, num_live_m, input_block,
+                               smem_thread_off, col_s, self.hidden_size, self.mtiles)
 
     @cute.jit
     def zero_invalid_fc2_a_tiles(self, shared_a_dst: Int32, out_meta: Int32,
@@ -666,17 +696,24 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
 
                                 if has_next:
                                     next_scale = ld_global_b16(scales + (kb + Int32(1)).to(Int64) * Int64(2))
-                                    self.stage_a_async(next_a, x_addr, srow, num_live_m, kb + Int32(1),
-                                                       smem_thread_off, col_s, self.hidden_size, self.mtiles)
+                                    self.stage_a_lower(next_a, x_addr, srow, num_live_m, kb + Int32(1),
+                                                       smem_thread_off, col_s)
                                     self.stage_b_async_dyn(next_b, payload, kb + Int32(1), tid, width)
-                                    cute.arch.cp_async_commit_group()
 
                                 if width == Int32(2):
-                                    self.accumulate(total, cur_a, cur_b, lane, warp, 2, cur_scale, num_live_m)
+                                    self.accumulate(total, cur_a, cur_b, lane, warp, 2, cur_scale,
+                                                    num_live_m, next_a, x_addr, srow, kb + Int32(1),
+                                                    smem_thread_off, col_s, has_next)
                                 elif width == Int32(3):
-                                    self.accumulate(total, cur_a, cur_b, lane, warp, 3, cur_scale, num_live_m)
+                                    self.accumulate(total, cur_a, cur_b, lane, warp, 3, cur_scale,
+                                                    num_live_m, next_a, x_addr, srow, kb + Int32(1),
+                                                    smem_thread_off, col_s, has_next)
                                 elif width == Int32(4):
-                                    self.accumulate(total, cur_a, cur_b, lane, warp, 4, cur_scale, num_live_m)
+                                    self.accumulate(total, cur_a, cur_b, lane, warp, 4, cur_scale,
+                                                    num_live_m, next_a, x_addr, srow, kb + Int32(1),
+                                                    smem_thread_off, col_s, has_next)
+                                if has_next:
+                                    cute.arch.cp_async_commit_group()
 
                         for idx in cutlass.range_constexpr(self.mtiles):
                             for v in cutlass.range_constexpr(8):
