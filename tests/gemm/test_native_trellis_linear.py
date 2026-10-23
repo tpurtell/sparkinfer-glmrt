@@ -9,6 +9,19 @@ def reference(codebook="e4m3"):
     return Reference(codebook)
 
 
+def rows_dispatch(k, n, bits):
+    """True when 128+ row launches take the native many-row prefill schedule."""
+    from b12x.gemm.trellis_linear._native import rows_dispatch as dispatch
+    return dispatch(k, n, bits)
+
+
+def a8_rows(k, n, bits, codebook):
+    """True when the many-row schedule quantizes activations for the FP8 MMA."""
+    from b12x.gemm.trellis_linear._native import NativeTrellisLinear
+    return (rows_dispatch(k, n, bits) and codebook == "e4m3" and n >= 256
+            and NativeTrellisLinear.FP8_MMA)
+
+
 class Case:
     def __init__(self, k=1152, n=256, side=1, bits=4, rows=4096, codebook="e4m3"):
         from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
@@ -65,8 +78,32 @@ def test_accuracy_rows_and_cta_invariance(side, bits, codebook):
     c.launch(4096)
     ref = c.x.double() @ c.weight.double()
     baseline = (c.x.bfloat16() @ c.weight.bfloat16()).double()
-    assert torch.linalg.vector_norm(c.output.double()-ref) <= 1.01*torch.linalg.vector_norm(baseline-ref)
-    assert torch.equal(c.output[:64].view(torch.int32), expected.view(torch.int32))
+    error = torch.linalg.vector_norm(c.output.double()-ref)
+    if a8_rows(1152, 256, bits, codebook):
+        # The FP8 MMA path rounds activations to E4M3 with per-row scales, so it
+        # cannot meet the BF16 bound; it is judged on relative error instead.
+        # Measured on real EXLR8 layer slices: 2.6e-2 against the F64 oracle,
+        # uniform across column blocks, row counts, n and sharded side.
+        assert error <= 4e-2 * torch.linalg.vector_norm(ref), (error.item() / torch.linalg.vector_norm(ref).item())
+    else:
+        assert error <= 1.01*torch.linalg.vector_norm(baseline-ref)
+    if not rows_dispatch(1152, 256, bits):
+        assert torch.equal(c.output[:64].view(torch.int32), expected.view(torch.int32))
+        return
+    # 128+ rows take the many-row schedule: one CTA walks the whole K extent, so
+    # the summation order differs from the split-K narrow path and only the
+    # tolerance above binds.  Inside that schedule the invariance is exact -- a
+    # row's bits never depend on how many rows are live.
+    wide = c.output.clone()
+    for live in (128, 129, 256, 1024, 2048):
+        c.output.fill_(float("nan"))
+        c.launch(live)
+        assert torch.equal(c.output[:live].view(torch.int32), wide[:live].view(torch.int32))
+        assert torch.isnan(c.output[live:]).all()
+    c.launch(64)
+    narrow = c.output[:64].clone()
+    error = torch.linalg.vector_norm(narrow.double()-ref[:64])
+    assert error <= 1.01 * torch.linalg.vector_norm(baseline[:64]-ref[:64])
 
 
 def test_graph_replay_and_invalid_launch():
@@ -191,16 +228,38 @@ def test_glm_tp2_native_slices(full_k, full_n, side):
         launch(rows)
         assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
         saved = output[:64].clone()
-        torch.testing.assert_close(output[sample_rows][:, cols].double(),
-            x[sample_rows].double() @ weight.double(), rtol=2e-4, atol=2e-5)
+        expected_rows = x[sample_rows].double() @ weight.double()
+        actual_rows = output[sample_rows][:, cols].double()
+        if a8_rows(k, n, bits, "e4m3"):
+            # The many-row schedule quantizes activations per row and K128 for
+            # the FP8 MMA (4-bit weights, FP32 accumulate), so this launch is
+            # gated on relative error: E4M3 activations alone put the output at
+            # 2.6e-2 rms versus the F64 oracle.  The exact E4M3 weight path is
+            # gated below through a narrow-schedule launch.
+            assert (actual_rows - expected_rows).norm() <= 4e-2 * expected_rows.norm()
+        else:
+            torch.testing.assert_close(actual_rows, expected_rows,
+                                       rtol=2e-4, atol=2e-5)
         torch.cuda.synchronize()
         with kernel_resolution_guard("GLM TP2 trellis is precompiled"):
-            for live in (*range(1, 65), 127, 128, 129, 256, 1024, 4096):
+            launch(64)
+            narrow = output[:64].clone()
+            torch.testing.assert_close(narrow[:64][:, cols].double(),
+                x[:64].double() @ weight.double(), rtol=2e-4, atol=2e-5)
+            for live in (*range(1, 65), 127):
                 output.fill_(float("nan"))
                 partial.fill_(float("nan"))
                 launch(live, ctas=1 if live % 2 else limit)
                 prefix = min(live, 64)
-                assert torch.equal(output[:prefix].view(torch.int32), saved[:prefix].view(torch.int32))
+                assert torch.equal(output[:prefix].view(torch.int32), narrow[:prefix].view(torch.int32))
+                assert torch.isnan(output[live:]).all()
+            # 128+ rows take the many-row schedule, whose per-row order is its
+            # own and does not depend on the live row count.
+            for live in (128, 129, 256, 1024):
+                output.fill_(float("nan"))
+                partial.fill_(float("nan"))
+                launch(live, ctas=1 if live % 2 else limit)
+                assert torch.equal(output[:64].view(torch.int32), saved.view(torch.int32))
                 assert torch.isnan(output[live:]).all()
             for rotation in range(4):
                 launch(17, rotation)
@@ -276,10 +335,20 @@ def test_kimi_shapes(k, n, side, bits, codebook):
     assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
     actual = output[sample_rows][:, cols].double()
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+    # 128+ rows take the many-row schedule (its own K order, exact for these
+    # codebooks); below that the narrow split-K schedule runs, so each row
+    # count is compared against the schedule it actually dispatches to.
+    narrow = None
+    if rows > 64:
+        output.fill_(float("nan"))
+        program.launch(inputs, payload, scales, partial.flatten(), output.flatten(), scalars=(64, 0, limit))
+        narrow = output[:64].clone()
     for live in ((1, 8, 16, 36, 64) if rows == 64 else (1, 8, 16, 36, 64, 256, 1024, 4096)):
         output.fill_(float("nan"))
         program.launch(inputs, payload, scales, partial.flatten(), output.flatten(), scalars=(live, 0, limit))
-        assert torch.equal(output[:min(64, live)].view(torch.int32), saved[:min(64, live)].view(torch.int32))
+        against = narrow if narrow is not None and live < 128 else saved
+        prefix = min(64, live)
+        assert torch.equal(output[:prefix].view(torch.int32), against[:prefix].view(torch.int32))
         assert torch.isnan(output[live:]).all()
         chosen = [r for r in sample_rows if r < live]
         torch.testing.assert_close(output[chosen][:, cols].double(),
@@ -325,6 +394,28 @@ def test_high_rate_graph_replay_and_frozen_resolution(bits, codebook):
 
 
 @pytest.mark.parametrize("side", [1, 2])
+def test_e4m3_weight_store_on_f16_mma(side):
+    """Narrow-N units keep the exact E4M3 weight store and the F16 MMA.
+
+    The e4m3 codebook's values are small and F16-exact, so decoding through
+    E4M3 and widening in registers reproduces the oracle, and the wide launch
+    matches the narrow one over the rows they share.
+    """
+    assert rows_dispatch(1152, 128, 4) and not a8_rows(1152, 128, 4, "e4m3")
+    c = Case(k=1152, n=128, side=side, bits=4, rows=512, codebook="e4m3")
+    c.launch(64)
+    narrow = c.output[:64].clone()
+    c.output.fill_(float("nan"))
+    c.launch(256)
+    wide = c.output[:256].clone()
+    assert torch.isnan(c.output[256:]).all()
+    ref = c.x[:256].double() @ c.weight.double()
+    assert torch.linalg.vector_norm(wide.double() - ref) <= 2e-3 * torch.linalg.vector_norm(ref)
+    drift = torch.linalg.vector_norm(wide[:64].double() - narrow.double())
+    assert drift <= 2e-5 * torch.linalg.vector_norm(narrow.double())
+
+
+@pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("bits", [5, 6])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
 def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
@@ -355,7 +446,7 @@ def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
         patch.setattr(_native, "NativeTrellisLinear", Base)
         base = Case(k=1152, n=256, side=side, bits=bits, rows=129, codebook=codebook)
     wide = Case(k=1152, n=256, side=side, bits=bits, rows=129, codebook=codebook)
-    for rows in (1, 8, 16, 17, 32, 33, 36, 48, 49, 63, 64, 65, 127, 128, 129):
+    for rows in (1, 8, 16, 17, 32, 33, 36, 48, 49, 63, 64, 65, 127):
         base.partial.fill_(float("nan"))
         base.output.fill_(float("nan"))
         wide.partial.fill_(float("nan"))
@@ -367,6 +458,22 @@ def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
         assert torch.equal(wide.partial[:rows].view(torch.int32), base.partial[:rows].view(torch.int32))
         assert torch.isnan(wide.output[rows:]).all()
         assert torch.isnan(wide.partial[rows:]).all()
+    # 128+ rows take the many-row schedule: it decodes weights once and walks K
+    # in one CTA, so the summation order differs from the 16-row split-K base
+    # and no split-K partial is written.  Compare by tolerance, and check that
+    # the buffer is left untouched instead of matching partial bits.
+    for rows in (128, 129):
+        base.partial.fill_(float("nan"))
+        base.output.fill_(float("nan"))
+        wide.partial.fill_(float("nan"))
+        wide.output.fill_(float("nan"))
+        with kernel_resolution_guard("row dispatch uses precompiled kernels"):
+            base.launch(rows)
+            wide.launch(rows)
+        torch.testing.assert_close(wide.output[:rows].double(), base.output[:rows].double(),
+                                   rtol=2e-4, atol=2e-5)
+        assert torch.isnan(wide.partial).all()
+        assert torch.isnan(wide.output[rows:]).all()
 
 
 @pytest.mark.parametrize("groups,rotation_count", [(0, 4), (2, 4), (3, 4), (True, 4), (4, 1), (4, 3)])
