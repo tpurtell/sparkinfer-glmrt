@@ -256,6 +256,20 @@ def ld_global_lu_v4_f32_offset(base_addr: Int64, offset: int, *, loc=None, ip=No
 
 
 @dsl_user_op
+def ld_shared_v4_i32(smem_addr: Int32, *, loc=None, ip=None):
+    v = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.s32 {$0, $1, $2, $3}, [$4];", "=r,=r,=r,=r,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return (Int32(llvm.extractvalue(T.i32(), v, [0], loc=loc, ip=ip)),
+            Int32(llvm.extractvalue(T.i32(), v, [1], loc=loc, ip=ip)),
+            Int32(llvm.extractvalue(T.i32(), v, [2], loc=loc, ip=ip)),
+            Int32(llvm.extractvalue(T.i32(), v, [3], loc=loc, ip=ip)))
+
+
+@dsl_user_op
 def ld_shared_v4_f32(smem_addr: Int32, *, loc=None, ip=None):
     v = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
@@ -339,7 +353,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 106
+    CODE_VERSION = 107
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
@@ -995,13 +1009,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 _mbar_wait(bar_t_empty + hslot * Int32(8),
                            ((ti // Int32(_FC1_TILE_STAGES)) & Int32(1)) ^ Int32(1))
                 hdr = hdr_base + hslot * Int32(self.fc1_hdr_bytes)
-                if ptid == Int32(0):
-                    st_shared_i32(hdr, num_live)
-                    st_shared_i32(hdr + Int32(4), live)
-                    st_shared_i32(hdr + Int32(8), v_lo.to(Int32))
-                    st_shared_i32(hdr + Int32(12), v_hi.to(Int32))
-                    st_shared_i32(hdr + Int32(16), group * unit_limit + u_base)
-                    st_shared_i32(hdr + Int32(20), u_cnt)
                 if ptid < Int32(self.group_rows):
                     idx = ptid >> Int32(4)
                     rr = ptid & Int32(15)
@@ -1012,6 +1019,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         if sl >= Int32(0) and sl < max_slot:
                             tok = sl // Int32(self.top_k)
                     st_shared_i32(tok_base + ptid * Int32(4), tok)
+                w_pack0 = (u_cnt << Int32(12)) | (live << Int32(16))
+                w_pack1 = (u_cnt << Int32(12)) | (live << Int32(16))
                 for u in cutlass.range_constexpr(_FC1_U_MAX):
                     w0 = Int32(0)
                     w1 = Int32(0)
@@ -1022,9 +1031,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         d_u = (expert.to(Int64) * Int64(self.units) + unit_u.to(Int64)) * Int64(3)
                         w0 = bits[d_u]
                         w1 = bits[d_u + Int64(1)]
+                    w_pack0 = w_pack0 | (w0 << Int32(4 * u))
+                    w_pack1 = w_pack1 | (w1 << Int32(4 * u))
                     if ptid == Int32(0):
-                        st_shared_i32(hdr + Int32(24 + 8 * u), w0)
-                        st_shared_i32(hdr + Int32(28 + 8 * u), w1)
                         p_off = pay_base + Int32(24 * u)
                         pay0 = pointers[d_u * Int64(3)] if w0 != Int32(0) else Int64(0)
                         pay1 = pointers[(d_u + Int64(1)) * Int64(3)] if w1 != Int32(0) else Int64(0)
@@ -1046,6 +1055,13 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 st_shared_u16(
                                     hdr + Int32(4 * _FC1_HEADER_WORDS + u * 4 * self.blocks) + e * Int32(2),
                                     sc)
+                if ptid == Int32(0):
+                    st_shared_i32(hdr, num_live)
+                    st_shared_i32(hdr + Int32(8), w_pack0)
+                    st_shared_i32(hdr + Int32(12), w_pack1)
+                    st_shared_i32(hdr + Int32(24), v_lo.to(Int32))
+                    st_shared_i32(hdr + Int32(32), v_hi.to(Int32))
+                    st_shared_i32(hdr + Int32(40), group * unit_limit + u_base)
                 _mbar_arrive(bar_t_full + hslot * Int32(8))
                 sync_producer_wg()
                 ti += Int32(1)
@@ -1222,19 +1238,15 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         proj = tid >> Int32(7)
         n16_0 = (cw & Int32(3)) * Int32(2)
         c_base = ring + Int32(self.fc1_c_off)
-        u_cnt = ld_shared_i32_relaxed(hdr + Int32(20))
-        w0 = ld_shared_i32_relaxed(hdr + Int32(24) + proj * Int32(4))
-        w1 = ld_shared_i32_relaxed(hdr + Int32(32) + proj * Int32(4))
-        w2 = ld_shared_i32_relaxed(hdr + Int32(40) + proj * Int32(4))
-        w_pack = w0 | (w1 << Int32(4)) | (w2 << Int32(8)) | (u_cnt << Int32(12))
+        w_pack = ld_shared_i32_relaxed(hdr + Int32(8) + proj * Int32(4))
         for split in cutlass.range(self.splits):
             if (w_pack & Int32(0xF)) != Int32(0):
                 total0_0.fill(Float32(0.0))
                 total0_1.fill(Float32(0.0))
-            if (w_pack >> Int32(12)) >= Int32(2) and ((w_pack >> Int32(4)) & Int32(0xF)) != Int32(0):
+            if ((w_pack >> Int32(12)) & Int32(0xF)) >= Int32(2) and ((w_pack >> Int32(4)) & Int32(0xF)) != Int32(0):
                 total1_0.fill(Float32(0.0))
                 total1_1.fill(Float32(0.0))
-            if (w_pack >> Int32(12)) >= Int32(3) and ((w_pack >> Int32(8)) & Int32(0xF)) != Int32(0):
+            if ((w_pack >> Int32(12)) & Int32(0xF)) >= Int32(3) and ((w_pack >> Int32(8)) & Int32(0xF)) != Int32(0):
                 total2_0.fill(Float32(0.0))
                 for idx in cutlass.range_constexpr(active):
                     c_lo = c_base + Int32(idx * 8192) + tid * Int32(16)
@@ -1263,7 +1275,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     _mbar_arrive(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES + 8 * _FC1_B_STAGES) + b_slot0 * Int32(8))
                     b_seq += Int32(1)
                     # Unit 1
-                    if (w_pack >> Int32(12)) >= Int32(2):
+                    if ((w_pack >> Int32(12)) & Int32(0xF)) >= Int32(2):
                         b_slot1 = b_seq % Int32(_FC1_B_STAGES)
                         _mbar_wait(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES) + b_slot1 * Int32(8),
                                    (b_seq // Int32(_FC1_B_STAGES)) & Int32(1))
@@ -1278,7 +1290,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         _mbar_arrive(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES + 8 * _FC1_B_STAGES) + b_slot1 * Int32(8))
                         b_seq += Int32(1)
                     # Unit 2
-                    if (w_pack >> Int32(12)) >= Int32(3):
+                    if ((w_pack >> Int32(12)) & Int32(0xF)) >= Int32(3):
                         b_slot2 = b_seq % Int32(_FC1_B_STAGES)
                         _mbar_wait(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES) + b_slot2 * Int32(8),
                                    (b_seq // Int32(_FC1_B_STAGES)) & Int32(1))
@@ -1294,10 +1306,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         b_seq += Int32(1)
                     _mbar_arrive(ring + Int32(self.fc1_bar_off + 8 * _FC1_A_STAGES) + a_slot * Int32(8))
                     a_seq += Int32(1)
-            live = ld_shared_i32_relaxed(hdr + Int32(4))
-            v_lo = ld_shared_i32_relaxed(hdr + Int32(8))
-            v_hi = ld_shared_i32_relaxed(hdr + Int32(12))
-            task_base = ld_shared_i32_relaxed(hdr + Int32(16))
+            live = (w_pack >> Int32(16)) & Int32(0xFF)
+            v_lo = ld_shared_i32_relaxed(hdr + Int32(24))
+            v_hi = ld_shared_i32_relaxed(hdr + Int32(32))
+            task_base = ld_shared_i32_relaxed(hdr + Int32(40))
             col = (cw & Int32(3)) * Int32(32) + (lane & Int32(3)) * Int32(2)
             out_base0 = fc1.iterator.toint() + (
                 (task_base * Int32(2) + proj).to(Int64) * Int64(self.group_rows * 128)
@@ -1306,11 +1318,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             if (w_pack & Int32(0xF)) != Int32(0):
                 self.fc1_ws_fold_n16(total0_0, out_base0, live, v_lo, v_hi, lane, split, active)
                 self.fc1_ws_fold_n16(total0_1, out_base0 + Int64(64), live, v_lo, v_hi, lane, split, active)
-            if (w_pack >> Int32(12)) >= Int32(2) and ((w_pack >> Int32(4)) & Int32(0xF)) != Int32(0):
+            if ((w_pack >> Int32(12)) & Int32(0xF)) >= Int32(2) and ((w_pack >> Int32(4)) & Int32(0xF)) != Int32(0):
                 out_base1 = out_base0 + unit_stride
                 self.fc1_ws_fold_n16(total1_0, out_base1, live, v_lo, v_hi, lane, split, active)
                 self.fc1_ws_fold_n16(total1_1, out_base1 + Int64(64), live, v_lo, v_hi, lane, split, active)
-            if (w_pack >> Int32(12)) >= Int32(3) and ((w_pack >> Int32(8)) & Int32(0xF)) != Int32(0):
+            if ((w_pack >> Int32(12)) & Int32(0xF)) >= Int32(3) and ((w_pack >> Int32(8)) & Int32(0xF)) != Int32(0):
                 out_base2 = out_base0 + Int64(2) * unit_stride
                 self.fc1_ws_fold_n16(total2_0, out_base2, live, v_lo, v_hi, lane, split, active)
                 for idx in cutlass.range_constexpr(active):
