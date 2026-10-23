@@ -270,7 +270,7 @@ class NativeTileLinear:
         self.pf_wm, self.pf_wn = 2, 4                # warps down the rows, across the columns
         self.pf_mt = self.pf_bm // self.pf_wm // 16  # m16 row blocks per warp
         self.pf_ng = 4                               # n8 column tiles per warp
-        self.pf_stages = 3
+        self.pf_stages = 2
         self.pf_a8 = self.pf_bm * 128                # E4M3 activations: rows x 128 K
         self.pf_as = self.pf_bm * 4                  # one UE8M0 byte per (row, 32-K group)
         self.pf_w8 = self.pf_bn * 128                # E4M3 weights: columns x 128 K
