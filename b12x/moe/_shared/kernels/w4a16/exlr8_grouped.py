@@ -46,8 +46,8 @@ from .mixed_trellis_ws import (
 
 _FC1_CONSUMER_THREADS = 256
 _FC1_PRODUCER_THREADS = 128
-_FC1_PRODUCER_REGS = 32
-_FC1_CONSUMER_REGS = 232
+_FC1_PRODUCER_REGS = 24
+_FC1_CONSUMER_REGS = 240
 _FC1_A_STAGES = 2
 _FC1_B_STAGES = 2
 _FC1_TILE_STAGES = 2
@@ -295,13 +295,15 @@ def fma_shared_v4_f32(smem_addr: Int32, a0: Float32, a1: Float32, a2: Float32, a
          Float32(a2).ir_value(loc=loc, ip=ip),
          Float32(a3).ir_value(loc=loc, ip=ip),
          Float32(scale).ir_value(loc=loc, ip=ip)],
-        "{ .reg .f32 t0, t1, t2, t3; "
-        "ld.shared.v4.f32 {t0, t1, t2, t3}, [$0]; "
+        "{ .reg .f32 t0, t1; "
+        "ld.shared.v2.f32 {t0, t1}, [$0]; "
         "fma.rn.f32 t0, $1, $5, t0; "
         "fma.rn.f32 t1, $2, $5, t1; "
-        "fma.rn.f32 t2, $3, $5, t2; "
-        "fma.rn.f32 t3, $4, $5, t3; "
-        "st.shared.v4.f32 [$0], {t0, t1, t2, t3}; }",
+        "st.shared.v2.f32 [$0], {t0, t1}; "
+        "ld.shared.v2.f32 {t0, t1}, [$0 + 8]; "
+        "fma.rn.f32 t0, $3, $5, t0; "
+        "fma.rn.f32 t1, $4, $5, t1; "
+        "st.shared.v2.f32 [$0 + 8], {t0, t1}; }",
         "r,f,f,f,f,f",
         has_side_effects=True, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
@@ -337,7 +339,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 105
+    CODE_VERSION = 106
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
