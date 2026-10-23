@@ -139,22 +139,6 @@ def _ld_cached_pred(address: Int64, r: Int32, rows: Int32, *, loc=None, ip=None)
 
 
 @dsl_user_op
-def _ld_a_fragment(address: Int64, r: Int32, rows: Int32, *, loc=None, ip=None):
-    """Load the four K32 BF16 pairs directly in MMA order, without quad shuffles."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
-        [Int64(address).ir_value(loc=loc, ip=ip),
-         Int32(r).ir_value(loc=loc, ip=ip), Int32(rows).ir_value(loc=loc, ip=ip)],
-        "{ .reg .pred p; setp.lt.s32 p, $5, $6; "
-        "mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; mov.b32 $3, 0; "
-        "@p ld.global.nc.u32 $0, [$4]; @p ld.global.nc.u32 $1, [$4+16]; "
-        "@p ld.global.nc.u32 $2, [$4+32]; @p ld.global.nc.u32 $3, [$4+48]; }",
-        "=r,=r,=r,=r,l,r,r", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
-    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
-
-
-@dsl_user_op
 def _warp_uniform_i32(val: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.inline_asm(
         T.i32(), [Int32(val).ir_value(loc=loc, ip=ip)],
@@ -394,6 +378,7 @@ class NativeTileLinear:
         words = max(1, (self.segments - 1) * self.slots * 4 * self.groups * 32)
         Storage.__annotations__ = {
             "fold": cute.struct.Align[cute.struct.MemRange[Float32, words], 16],
+            "activation": cute.struct.Align[cute.struct.MemRange[Uint32, self.d_threads * 8], 128],
         }
         return cute.struct(Storage)
 
@@ -428,6 +413,26 @@ class NativeTileLinear:
                     else:
                         sdst[gi * 2 + e] = ld_global_nc_u32(self._s_addr(scales, col, kb))
 
+    @cute.jit
+    def _decode_a_shared(self, x: cute.Tensor, row0: Int32, k32: Int32,
+                         rows: Int32, base: Int32, lane: Int32):
+        # Each quad reads one contiguous row; ldmatrix supplies the MMA permutation.
+        r, unit = lane >> Int32(2), lane & Int32(3)
+        for h in cutlass.range_constexpr(2):
+            row = row0 + r + Int32(8 * h)
+            address = x.iterator.toint() + (row.to(Int64) * Int64(self.k)
+                       + k32.to(Int64) + unit.to(Int64) * Int64(8)) * Int64(2)
+            a, b, c, d = _ld_cached_pred(address, row, rows)
+            _st_shared_v4(base + (r + Int32(8 * h)) * Int32(64)
+                           + ((unit ^ (r & Int32(3))) << Int32(4)), a, b, c, d)
+        cute.arch.sync_warp()
+        address = base + (lane & Int32(15)) * Int32(64) \
+            + (((lane >> Int32(4)) ^ (lane & Int32(3))) << Int32(4))
+        lo = ldmatrix_m8n8x4_b16(address)
+        hi = ldmatrix_m8n8x4_b16(base + ((address - base) ^ Int32(32)))
+        cute.arch.sync_warp()
+        return lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]
+
     @cute.kernel
     def decode(self, x: cute.Tensor, payload: cute.Tensor, scales: cute.Tensor,
                output: cute.Tensor, rows: Int32, rows_per: Int32, row_tiles: Int32,
@@ -449,6 +454,7 @@ class NativeTileLinear:
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._decode_storage())
         fold = shared_ptr_to_u32(storage.fold.data_ptr())
+        a_shared = shared_ptr_to_u32(storage.activation.data_ptr()) + wid * Int32(1024)
         G = self.groups
         F = 4 * G * row_capacity
         blocks = Int64(self.n // self.cols)
@@ -497,10 +503,6 @@ class NativeTileLinear:
                         if cutlass.const_expr(self.grouped):
                             for h in cutlass.range_constexpr(2):
                                 k32 = k0 + Int32(32 * h)
-                                if cutlass.const_expr(not self.side2):
-                                    at_m0 = x_base + ((row0 + g).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                    m0_a0, m0_a2, m0_a4, m0_a6 = _ld_a_fragment(at_m0, row0 + g, rows)
-                                    m0_a1, m0_a3, m0_a5, m0_a7 = _ld_a_fragment(at_m0 + Int64(16 * self.k), row0 + g + Int32(8), rows)
                                 if cutlass.const_expr(self.int4):
                                     t_w = _quad_transpose_u8x4(cur[c * 2 + h], prmt_sel)
                                     b0, b1, b2, b3 = _int4x8_bf16(t_w)
@@ -514,16 +516,16 @@ class NativeTileLinear:
                                 s0 = self._scale(r_s0, h)
                                 s1 = self._scale(r_s1, h)
                                 if cutlass.const_expr(not self.side2):
+                                    m0_a0, m0_a1, m0_a2, m0_a3, m0_a4, m0_a5, m0_a6, m0_a7 = self._decode_a_shared(
+                                        x, row0, k32, rows, a_shared, lane)
                                     acc[0], acc[1], acc[2], acc[3] = _mma_k32_scaled(
                                         acc[0], acc[1], acc[2], acc[3],
                                         m0_a0, m0_a1, m0_a2, m0_a3, m0_a4, m0_a5, m0_a6, m0_a7,
                                         b0, b1, b2, b3, s0, s1)
                                 for mt in cutlass.range_constexpr(0 if self.side2 else 1, row_capacity):
                                     if Int32(mt) < live:
-                                        r0 = Int32(16 * mt) + g
-                                        at0 = x_base + ((row0 + r0).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                        a0, a2, a4, a6 = _ld_a_fragment(at0, row0 + r0, rows)
-                                        a1, a3, a5, a7 = _ld_a_fragment(at0 + Int64(16 * self.k), row0 + r0 + Int32(8), rows)
+                                        a0, a1, a2, a3, a4, a5, a6, a7 = self._decode_a_shared(
+                                            x, row0 + Int32(16 * mt), k32, rows, a_shared, lane)
                                         f = 4 * mt
                                         acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
                                             acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
