@@ -24,7 +24,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-from cutlass import Float32, Int32, Int64, Uint32
+from cutlass import Float32, Int32, Int64, Uint8, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 
@@ -38,14 +38,23 @@ from b12x._lib.intrinsics import (
     hmax2,
     hmax_to_f32,
     ld_global_nc_u32,
+    ld_global_nc_u8,
     ld_global_nc_v2_u32,
+    ld_global_nc_v4_u32,
     ld_shared_u32,
     ld_shared_v2_u32,
+    ldmatrix_m8n8x4_b16,
     mma_m16n8k32_f32_e4m3,
+    mxfp8_mma_m16n8k32_f32_e4m3,
     packed_dequant_trellis_to_half2x4,
+    pow2_ceil_ue8m0,
     shared_ptr_to_u32,
+    st_global_u8,
     st_global_v2_f32,
+    st_global_v4_u32,
+    st_shared_u16,
     st_shared_u32,
+    ue8m0_to_output_scale,
 )
 from b12x.moe._shared.kernels.w4a16.exlr8 import _side_value
 
@@ -391,3 +400,302 @@ class TrellisPrefillDense:
                          rows, rotation_id).launch(
                 grid=(min(tasks, cta_limit), 1, 1), block=(32 * NWARP, 1, 1),
                 stream=stream)
+
+
+# ---------------------------------------------------------------- MXFP8 records
+# One record per (m16 row block, k32): 32 lanes x 16 fragment bytes plus the 16
+# per-row E8M0 scale bytes. The 16 fragment bytes at lane ``l`` are the A
+# operand of ``mxfp8_mma_m16n8k32_f32_e4m3`` in register order: rows l/4 and
+# l/4+8, k = 4*(l&3)..+3 and 16+4*(l&3)..+3. A record is read back with one
+# 128-bit lane load plus one scale byte, so no activation ever touches smem and
+# every column CTA shares the same quantize pass.
+MX8_REC = 528
+
+
+class TrellisMxfp8Quant:
+    """Quantize F16 activations into MXFP8 records (one pass, all column CTAs).
+
+    Per-32-k block scales are E8M0 (``pow2_ceil_ue8m0`` of the block amax over
+    448, the exact FlashInfer/OCP rule), so the MMA's ``scale_vec::1X`` operand
+    carries them with no in-kernel per-block fold.
+    """
+
+    def __init__(self, g):
+        self.k = g["input_features"]
+        self.bits = g["bits"]
+        if self.k % 128:
+            raise ValueError("MXFP8 records need K a multiple of 128")
+        self.nk32 = self.k // 32
+        self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
+
+    @cute.kernel
+    def quantize(self, inputs: cute.Tensor, records: cute.Tensor,
+                 rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        tid = Int32(tid)
+        lane, warp = tid & Int32(31), tid >> Int32(5)
+        x = inputs[rotation_id]
+        rbase = records.iterator.toint()
+        n_rb = (rows + Int32(15)) // Int32(16)
+        total = n_rb * Int32(self.nk32)
+        task = task * Int32(NWARP) + warp
+        stride = step * Int32(NWARP)
+        row_last = Float32(rows - Int32(1))
+        while task < total:
+            rb = task // Int32(self.nk32)
+            s = task % Int32(self.nk32)
+            r0 = rb * Int32(16) + (lane >> Int32(2))
+            c = (lane & Int32(3)) * Int32(4)
+            klo = s * Int32(32) + c
+            khi = klo + Int32(16)
+            r0c = Int32(cute.arch.fmin(Float32(r0), row_last))
+            r1c = Int32(cute.arch.fmin(Float32(r0 + Int32(8)), row_last))
+            x0 = x + r0c.to(Int64) * Int64(2 * self.k)
+            x1 = x + r1c.to(Int64) * Int64(2 * self.k)
+            # Two rows x two 4-value groups each: a lane holds 16 values.
+            f00, f01 = ld_global_nc_v2_u32(x0 + klo.to(Int64) * Int64(2))
+            f10, f11 = ld_global_nc_v2_u32(x1 + klo.to(Int64) * Int64(2))
+            f20, f21 = ld_global_nc_v2_u32(x0 + khi.to(Int64) * Int64(2))
+            f30, f31 = ld_global_nc_v2_u32(x1 + khi.to(Int64) * Int64(2))
+            m0 = hmax_to_f32(hmax2(hmax2(habs2(f00), habs2(f01)),
+                                   hmax2(habs2(f20), habs2(f21))))
+            m1 = hmax_to_f32(hmax2(hmax2(habs2(f10), habs2(f11)),
+                                   hmax2(habs2(f30), habs2(f31))))
+            # The 32-k block lives in the four lanes of this quad.
+            m0 = cute.arch.fmax(m0, cute.arch.shuffle_sync_bfly(m0, offset=1))
+            m1 = cute.arch.fmax(m1, cute.arch.shuffle_sync_bfly(m1, offset=1))
+            m0 = cute.arch.fmax(m0, cute.arch.shuffle_sync_bfly(m0, offset=2))
+            m1 = cute.arch.fmax(m1, cute.arch.shuffle_sync_bfly(m1, offset=2))
+            _, code0 = pow2_ceil_ue8m0(m0 * Float32(1.0 / E4M3_MAX))
+            _, code1 = pow2_ceil_ue8m0(m1 * Float32(1.0 / E4M3_MAX))
+            h0 = broadcast_f32_to_half2(ue8m0_to_output_scale(code0))
+            h1 = broadcast_f32_to_half2(ue8m0_to_output_scale(code1))
+            w0 = _e4m3x4_from_half2x2(half2_mul(f00, h0), half2_mul(f01, h0))
+            w1 = _e4m3x4_from_half2x2(half2_mul(f10, h1), half2_mul(f11, h1))
+            w2 = _e4m3x4_from_half2x2(half2_mul(f20, h0), half2_mul(f21, h0))
+            w3 = _e4m3x4_from_half2x2(half2_mul(f30, h1), half2_mul(f31, h1))
+            rec = rbase + (rb * Int32(self.nk32) + s).to(Int64) * Int64(MX8_REC)
+            st_global_v4_u32(rec + lane.to(Int64) * Int64(16), w0, w1, w2, w3)
+            row_lo = (lane >> Int32(2)).to(Int64)
+            st_global_u8(rec + Int64(512) + row_lo, Uint8(code0))
+            st_global_u8(rec + Int64(520) + row_lo, Uint8(code1))
+            task += stride
+
+    @cute.jit
+    def __call__(self, rotated_inputs: cute.Pointer, records: cute.Pointer,
+                 rows: Int32, rotation_id: Int32, cta_limit: Int32,
+                 stream: cuda.CUstream):
+        if (rows > Int32(0) and rows <= Int32(self.max_rows)
+                and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations)
+                and cta_limit > Int32(0)):
+            layout = cute.make_layout(1, stride=1)
+            tasks = ((rows + Int32(15)) // Int32(16)) * Int32(self.nk32)
+            warps = (tasks + Int32(NWARP - 1)) // Int32(NWARP)
+            self.quantize(cute.make_tensor(rotated_inputs, layout),
+                          cute.make_tensor(records, layout),
+                          rows, rotation_id).launch(
+                grid=(min(warps, cta_limit), 1, 1), block=(32 * NWARP, 1, 1),
+                stream=stream)
+
+
+class TrellisPrefillMxfp8:
+    """Many-row trellis dense linear on MXFP8 records.
+
+    ``TrellisMxfp8Quant`` writes the records into the ABI's ``partial`` scratch
+    (``rows*K`` bytes of the 4-byte-per-element split-K scratch, so no new
+    allocation); this kernel then runs the decode-once E4M3 tile in smem in
+    ``ldmatrix`` order -- ``[n][k128]`` bytes with the k16 group XOR-swizzled by
+    ``n & 7`` -- and feeds ``mma.kind::mxf8f6f4.block_scale.scale_vec::1X``
+    m16n8k32 with the activation's E8M0 scale byte and B at E8M0 127.
+
+    ``part`` selects the pass to launch: ``both`` (the whole route), ``quant``
+    or ``gemm`` (the two halves, for separate timing).
+    """
+
+    ABI_VERSION = 1
+
+    def __init__(self, g, *, n_cta: int = 64, stages: int = 2,
+                 part: str = "both"):
+        self.k, self.n = g["input_features"], g["output_features"]
+        self.bits = g["bits"]
+        if self.bits != 4:
+            raise ValueError("the T1 prefill kernel covers K4 trellis only")
+        if g["codebook"] != "e4m3":
+            raise ValueError("the T1 E4M3 tile covers the e4m3 codebook only")
+        if n_cta not in (64, 128) or n_cta > self.n:
+            raise ValueError("n_cta must be 64 or 128")
+        if n_cta % 16 or (n_cta // 8) % 2:
+            raise ValueError("n_cta must cover whole pairs of n8 tiles")
+        if part not in ("both", "quant", "gemm"):
+            raise ValueError("part must be both, quant or gemm")
+        self.input_units = g["sharded_side"] == 2
+        self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
+        self.n_cta, self.stages, self.part = n_cta, stages, part
+        self.nk32 = self.k // 32
+        self.n16 = n_cta // 16
+        self.n8w = n_cta // 8
+        self.quant = TrellisMxfp8Quant(g)
+
+    def _storage(self):
+        # E4M3 B tile: stages x n_cta rows of 128 k-bytes.
+        words = self.stages * 32 * self.n_cta
+
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "w": cute.struct.Align[cute.struct.MemRange[Uint32, words], 16],
+        }
+        return cute.struct(Storage)
+
+    @cute.jit
+    def _tile_index(self, nb: Int32, kb: Int32, k16: Int32, n16_local: Int32) -> Int32:
+        n16g = nb * Int32(self.n_cta // 16) + n16_local
+        group = n16g // Int32(8)
+        slot = n16g % Int32(8)
+        if cutlass.const_expr(self.input_units):
+            return (kb * Int32(self.n // 16 * 8) + group * Int32(64)
+                    + k16 * Int32(8) + slot)
+        return (group * Int32(self.k // 16 * 8)
+                + (kb * Int32(8) + k16) * Int32(8) + slot)
+
+    @cute.jit
+    def _stage(self, sbase: Int32, stage: Int32, k16: Int32, n16: Int32,
+               lane: Int32, wa: Uint32, wb: Uint32):
+        """Decode one K16 x N16 tile into the ldmatrix-order byte tile.
+
+        Byte address of (n, k) inside a stage: ``n*128 + ((k>>4) ^ (n&7))*16 +
+        (k&15)``. Every lane of an ``ldmatrix.x4`` reads one 16-byte group, and
+        the 8 rows it reads (n = lane&7) land on 8 different bank quads.
+        """
+        b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, self.bits)
+        n0 = n16 * Int32(16) + (lane >> Int32(2))
+        kb_off = stage * Int32(128 * self.n_cta) + (lane & Int32(3)) * Int32(2)
+        g = k16 ^ ((lane >> Int32(2)) & Int32(7))
+        for s in cutlass.range_constexpr(2):
+            if cutlass.const_expr(s == 0):
+                e = _e4m3x4_from_half2x2(b0, b1)
+                n = n0
+            else:
+                e = _e4m3x4_from_half2x2(b2, b3)
+                n = n0 + Int32(8)
+            base = sbase + n * Int32(128) + (g << 4) + kb_off
+            st_shared_u16(base, e)
+            st_shared_u16(base + Int32(8), e >> 16)
+
+    @cute.kernel
+    def prefill(self, inputs: cute.Tensor, payload: cute.Tensor,
+                scales: cute.Tensor, records: cute.Tensor, output: cute.Tensor,
+                rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        tid = Int32(tid)
+        lane, warp = tid & Int32(31), tid >> Int32(5)
+        x = inputs[rotation_id]
+        wbase = payload.iterator.toint()
+        abase = records.iterator.toint()
+        obase = output.iterator.toint()
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        sbase = shared_ptr_to_u32(storage.w.data_ptr())
+        n_tiles = Int32(self.n // self.n_cta)
+        nkb = self.k // 128
+        total_tasks = ((rows + Int32(M_CTA - 1)) // Int32(M_CTA)) * n_tiles
+        row_last = Float32(rows - Int32(1))
+        # B-fragment ldmatrix rows: matrix m = lane>>3 selects (n8 of the pair,
+        # k16 half); every lane addresses column n = (m>>1)*8 + (lane&7).
+        blk = Int32((lane >> Int32(3)) & Int32(1))
+        bcol = (lane >> Int32(4)) * Int32(8) + (lane & Int32(7))
+        b_row_base = sbase + bcol * Int32(128) + ((blk ^ (lane & Int32(7))) << 4)
+        # sfa byte: row l/4 for even lanes, row l/4+8 for odd lanes.
+        srow = (lane >> Int32(2)) + (lane & Int32(1)) * Int32(8)
+        while task < total_tasks:
+            nb = task % n_tiles
+            m_base = (task // n_tiles) * Int32(M_CTA)
+            row = m_base + warp * Int32(16) + (lane >> Int32(2))
+            rc = Int32(cute.arch.fmin(Float32(row), row_last))
+            total = cute.make_rmem_tensor((self.n8w, 4), Float32)
+            total.fill(Float32(0.0))
+            mb = (task // n_tiles) * Int32(NWARP) + warp
+            arec = abase + (mb * Int32(self.nk32)).to(Int64) * Int64(MX8_REC)
+            krec = Int64(4 * MX8_REC)
+            words = cute.make_rmem_tensor((2 * self.n16,), Uint32)
+            for j in cutlass.range_constexpr(self.n16):
+                tile = self._tile_index(nb, Int32(0), warp, Int32(j))
+                wa, wb = _load_words4(wbase, tile, lane)
+                self._stage(sbase, Int32(0), warp, Int32(j), lane, wa, wb)
+            cute.arch.sync_threads()
+            for kb in cutlass.range(nkb, unroll=1):
+                if kb + Int32(1) < Int32(nkb):
+                    for j in cutlass.range_constexpr(self.n16):
+                        tile = self._tile_index(nb, kb + Int32(1), warp, Int32(j))
+                        wa, wb = _load_words4(wbase, tile, lane)
+                        words[2 * j], words[2 * j + 1] = wa, wb
+                acc = cute.make_rmem_tensor((self.n8w, 4), Float32)
+                acc.fill(Float32(0.0))
+                stage = (kb % Int32(self.stages)) * Int32(128 * self.n_cta)
+                rec_kb = arec + kb.to(Int64) * krec
+                for k32 in cutlass.range_constexpr(4):
+                    rec = rec_kb + Int64(k32 * MX8_REC)
+                    a0, a1, a2, a3 = ld_global_nc_v4_u32(rec + lane.to(Int64) * Int64(16))
+                    sfa = ld_global_nc_u8(rec + Int64(512) + srow.to(Int64))
+                    for p in cutlass.range_constexpr(self.n8w // 2):
+                        b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(
+                            b_row_base + stage + Int32(2048 * p)
+                            + (((Int32(2 * k32) + blk) ^ (lane & Int32(7))) << 4))
+                        i = 2 * p
+                        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                            acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3],
+                            a0, a1, a2, a3, b0, b1, sfa, Uint32(0x7F))
+                        acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3] = d0, d1, d2, d3
+                        i = 2 * p + 1
+                        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                            acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3],
+                            a0, a1, a2, a3, b2, b3, sfa, Uint32(0x7F))
+                        acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3] = d0, d1, d2, d3
+                scale = _side_value(scales.iterator.toint(), kb)
+                for r in cutlass.range_constexpr(self.n8w):
+                    for v in cutlass.range_constexpr(4):
+                        total[r, v] = total[r, v] + acc[r, v] * scale
+                if kb + Int32(1) < Int32(nkb):
+                    for j in cutlass.range_constexpr(self.n16):
+                        self._stage(sbase, (kb + Int32(1)) % Int32(self.stages), warp,
+                                    Int32(j), lane, words[2 * j], words[2 * j + 1])
+                cute.arch.sync_threads()
+            for i in cutlass.range_constexpr(self.n8w):
+                col = nb * Int32(self.n_cta) + i * Int32(8) + (lane & Int32(3)) * Int32(2)
+                addr = obase + (row.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
+                if row < rows:
+                    st_global_v2_f32(addr, total[i, 0], total[i, 1])
+                if row + Int32(8) < rows:
+                    st_global_v2_f32(addr + Int64(8 * self.n * 4), total[i, 2], total[i, 3])
+            task += step
+
+    @cute.jit
+    def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
+                 input_block_scales: cute.Pointer, partial: cute.Pointer,
+                 output: cute.Pointer, rows: Int32, rotation_id: Int32,
+                 cta_limit: Int32, stream: cuda.CUstream):
+        # ``partial`` (the ABI's split-K scratch, 4 B/element) carries the MXFP8
+        # records (K*rows bytes) for every column CTA: it is at least
+        # ceil(rows/16)*(K/32)*528 B whenever N >= 264.
+        if (rows > Int32(0) and rows <= Int32(self.max_rows)
+                and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations)
+                and cta_limit > Int32(0)):
+            if self.part in ("both", "quant"):
+                self.quant(rotated_inputs, partial, rows, rotation_id,
+                           cta_limit, stream)
+            if self.part in ("both", "gemm"):
+                layout = cute.make_layout(1, stride=1)
+                tasks = ((rows + Int32(M_CTA - 1)) // Int32(M_CTA)) * Int32(self.n // self.n_cta)
+                self.prefill(cute.make_tensor(rotated_inputs, layout),
+                             cute.make_tensor(payload, layout),
+                             cute.make_tensor(input_block_scales, layout),
+                             cute.make_tensor(partial, layout),
+                             cute.make_tensor(output, layout),
+                             rows, rotation_id).launch(
+                    grid=(min(tasks, cta_limit), 1, 1), block=(32 * NWARP, 1, 1),
+                    stream=stream)

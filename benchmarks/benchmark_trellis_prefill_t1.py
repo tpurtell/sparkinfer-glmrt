@@ -13,6 +13,14 @@ activations are F16 randn (the trellis ABI input) for the trellis arms.
 ``--variants`` takes ``f16-64``, ``f16-128``, ``fp8-64``, ``fp8-128``, a
 ``m<mpw>`` warp-tile suffix (``f16-64m2``: two m16 row blocks per warp) and an
 optional ``_<stages>`` suffix (``fp8-128_3``).
+
+``mx8-64`` is the MXFP8 arm: one shared quantize pass writes per-32 E8M0
+records, then the block-scaled ``mxf8f6f4`` m16n8k32 MMA consumes them against
+the decoded E4M3 tile at E8M0 127. ``mx8q-64`` runs only the quantize pass and
+``mx8g-64`` only the GEMM (timing split; a ``g`` arm must follow a ``q`` arm on
+the same buffers). Only ``mx8-*`` and the exact arms take part in the error
+comparison; ``--fp64-rows R`` adds the FP64 reference, ``x[:R] @ W`` with W read
+back from the frozen native kernel through a one-hot activation.
 """
 from __future__ import annotations
 
@@ -34,7 +42,7 @@ from b12x.integration.cuteafd._common import (
     Operand, Scalar, compile_program, exportable_compilation)
 from b12x.integration.cuteafd import trellis_linear
 from b12x.integration.cuteafd._fp8_weights import Fp8Projection
-from b12x.gemm.trellis_linear._prefill import TrellisPrefillDense
+from b12x.gemm.trellis_linear._prefill import TrellisPrefillDense, TrellisPrefillMxfp8
 
 SHAPES = {
     "q_b": dict(k=2048, n=16384, side=1),
@@ -83,10 +91,14 @@ def trellis_weights(k, n, seed):
     return payload, scales
 
 
-def trellis_tensors(k, n, rows, splits, payload, scales, seed):
+def trellis_activation(k, rows, seed):
     g = torch.Generator(device="cuda")
     g.manual_seed(seed)
-    x = (torch.randn((rows, k), dtype=torch.float16, device="cuda", generator=g) * .1)
+    return torch.randn((rows, k), dtype=torch.float16, device="cuda", generator=g) * .1
+
+
+def trellis_tensors(k, n, rows, splits, payload, scales, seed):
+    x = trellis_activation(k, rows, seed)
     inputs = torch.tensor([x.data_ptr()] * 4, dtype=torch.int64, device="cuda")
     partial = torch.empty((rows, splits, n), dtype=torch.float32, device="cuda")
     output = torch.empty((rows, n), dtype=torch.float32, device="cuda")
@@ -115,9 +127,16 @@ def parse_label(label):
     return mode, int(width), int(stages), int(mpw)
 
 
+MX8_PARTS = {"mx8": "both", "mx8q": "quant", "mx8g": "gemm"}
+
+
 def compile_variant(label, k, n, side, mode, n_cta, stages, mpw=1):
     g = trellis_linear.geometry(k, n, sharded_side=side, max_rows=MAX_ROWS)
-    core = TrellisPrefillDense(g, mode=mode, n_cta=n_cta, stages=stages, mpw=mpw)
+    if mode in MX8_PARTS:
+        core = TrellisPrefillMxfp8(g, n_cta=n_cta, stages=stages,
+                                   part=MX8_PARTS[mode])
+    else:
+        core = TrellisPrefillDense(g, mode=mode, n_cta=n_cta, stages=stages, mpw=mpw)
     return compile_program(core, name=f"trellis_prefill_{label}",
                            operands=trellis_operands(k, n, g["splits"]),
                            scalars=TRELLIS_SCALARS,
@@ -172,6 +191,46 @@ def error_stats(got, ref):
                 rms_rel=float((rel ** 2).mean().sqrt()))
 
 
+def fp64_reference(k, n, side, x, payload, scales, limit, chunk=4096):
+    """``x @ W`` in FP64, with W read back out of the frozen native kernel.
+
+    A one-hot activation over one K-chunk at a time makes every native output
+    ``out[c, n] = W[n][c] * scale[c//128]`` (one F16 product, exact in F32), so
+    an FP64 matmul against the chunk's output is the exact value of the same
+    weight arithmetic the kernels approximate.
+    """
+    R = x.shape[0]
+    acc = torch.zeros((R, n), dtype=torch.float64, device="cuda")
+    with exportable_compilation():
+        program = trellis_linear.compile_trellis_linear_aot(
+            input_features=k, output_features=n, sharded_side=side, max_rows=chunk)
+    splits = (chunk + 1023) // 1024
+    a = torch.zeros((chunk, k), dtype=torch.float16, device="cuda")
+    out = torch.empty((chunk, n), dtype=torch.float32, device="cuda")
+    partial = torch.empty((chunk, splits, n), dtype=torch.float32, device="cuda")
+    inputs = torch.empty(4, dtype=torch.int64, device="cuda")
+    for c0 in range(0, k, chunk):
+        width = min(chunk, k - c0)
+        a.zero_()
+        idx = torch.arange(width, device="cuda")
+        a[idx, idx + c0] = 1.0
+        inputs.fill_(a.data_ptr())
+        program.launch(inputs, payload, scales, partial, out, scalars=(chunk, 0, limit))
+        acc += x[:, c0:c0 + width].double() @ out[:width].double()
+    del a, out, partial, inputs
+    torch.cuda.empty_cache()
+    return acc
+
+
+def fp64_stats(got, ref64):
+    d = got.double() - ref64
+    rel = d.abs() / ref64.abs().clamp_min(1e-12)
+    return dict(fp64_rows=int(ref64.shape[0]),
+                fp64_max_rel=float(rel.max()), fp64_mean_rel=float(rel.mean()),
+                fp64_rms_rel=float((rel ** 2).mean().sqrt()),
+                fp64_fro_rel=float(d.norm() / ref64.norm()))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--variants", default="f16-64,fp8-64")
@@ -181,12 +240,20 @@ def main():
     ap.add_argument("--replays", type=int, default=10)
     ap.add_argument("--no-timing", action="store_true")
     ap.add_argument("--no-baseline", action="store_true")
+    ap.add_argument("--fp64-rows", type=int, default=64,
+                    help="rows of the FP64 reference (0 disables it)")
     ap.add_argument("--output", type=Path)
     args = ap.parse_args()
 
     spec = []
     for label in args.variants.split(","):
         spec.append((label, *parse_label(label)))
+    modes = {label: mode for label, mode, *_ in spec}
+    labels = [label for label, *_ in spec]
+    for i, label in enumerate(labels):
+        if modes[label] == "mx8g":
+            assert any(modes[l] == "mx8q" for l in labels[:i]), \
+                "a mx8g arm reads the records of an earlier mx8q arm"
     shapes = [name for name in args.shapes.split(",") if name]
     rows_list = [int(v) for v in args.rows.split(",")]
 
@@ -211,17 +278,34 @@ def main():
             variants = {label: compile_variant(label, k, n, side, mode, n_cta, stages, mpw)
                         for label, mode, n_cta, stages, mpw in spec}
         ref = torch.empty_like(tensors[4])
+        ref64 = None
+        if args.fp64_rows and ref_program:
+            xa = trellis_activation(k, args.check_rows, 1408 + k)
+            ref64 = fp64_reference(k, n, side, xa[:args.fp64_rows], payload, scales, limit)
+            del xa
+            torch.cuda.empty_cache()
         programs = {"native": ref_program, **variants} if ref_program else dict(variants)
         for label, program in programs.items():
+            if modes.get(label) in ("mx8q", "mx8g"):
+                # Half-route timing arms: no independent numeric result.
+                program.launch(*tensors, scalars=(args.check_rows, 0, limit))
+                torch.cuda.synchronize()
+                continue
             program.launch(*tensors, scalars=(args.check_rows, 0, limit))
             torch.cuda.synchronize()
             if label == "native":
                 ref.copy_(tensors[4])
                 finite_nonzero(ref, "native")
+                if ref64 is not None:
+                    report["errors"].append(dict(shape=name, variant="native",
+                                                 rows=args.check_rows,
+                                                 **fp64_stats(ref[:ref64.shape[0]], ref64)))
                 continue
             got = tensors[4].clone()
             finite_nonzero(got, label)
             stats = error_stats(got, ref) if ref_program else {}
+            if ref64 is not None:
+                stats.update(fp64_stats(got[:ref64.shape[0]], ref64))
             # Row invariance: a row's result cannot depend on which M block it
             # lands in or on the live row count (identical K128 order, no
             # row-dependent tile choice), and every row of the CTA is computed
