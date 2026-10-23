@@ -96,7 +96,8 @@ class TrellisPrefillDense:
 
     ABI_VERSION = 1
 
-    def __init__(self, g, *, mode: str = "f16", n_cta: int = 64, stages: int = 2):
+    def __init__(self, g, *, mode: str = "f16", n_cta: int = 64, stages: int = 2,
+                 mpw: int = 1):
         self.k, self.n = g["input_features"], g["output_features"]
         self.bits = g["bits"]
         if self.bits != 4:
@@ -112,12 +113,19 @@ class TrellisPrefillDense:
             raise ValueError("mode must be f16 or fp8")
         if n_cta not in (64, 128) or n_cta > self.n:
             raise ValueError("n_cta must be 64 or 128")
+        if mpw not in (1, 2) or n_cta % (8 * mpw):
+            raise ValueError("mpw must be 1 or 2 and divide the CTA width")
         self.e4m3 = g["codebook"] == "e4m3"
         self.mul1 = g["codebook"] == "mul1"
         self.input_units = g["sharded_side"] == 2
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         self.mode, self.n_cta, self.stages = mode, n_cta, stages
-        self.n8, self.n16 = n_cta // 8, n_cta // 16
+        # mpw = m16 fragments per warp. One warp covers mpw row groups over
+        # n_cta/mpw columns, so the B-fragment widen and the shared load are
+        # reused across mpw MMAs and the running accumulators halve.
+        self.mpw = mpw
+        self.n16 = n_cta // 16
+        self.n8w = n_cta // (8 * mpw)
 
     def _storage(self):
         words = self.stages * 32 * self.n_cta
@@ -221,16 +229,25 @@ class TrellisPrefillDense:
         while task < total_tasks:
             nb = task % n_tiles
             m_base = (task // n_tiles) * Int32(M_CTA)
-            row0 = m_base + warp * Int32(16) + (lane >> Int32(2))
-            row1 = row0 + Int32(8)
-            row0c = Int32(cute.arch.fmin(Float32(row0), row_last))
-            row1c = Int32(cute.arch.fmin(Float32(row1), row_last))
-            # Per-row A bases: one row-stride multiply per task, not per load.
-            arow0 = x + row0c.to(Int64) * Int64(2 * self.k)
-            arow1 = x + row1c.to(Int64) * Int64(2 * self.k)
+            # This warp's row blocks: mpw m16 fragments. mpw = 1 is one row
+            # group across the whole CTA width; mpw = 2 is two row groups over
+            # half the width, so one shared load and one widen feed two MMAs.
+            row_grp = warp // Int32(self.mpw)
+            col_grp = warp % Int32(self.mpw)
+            row = []
+            arow = []
+            for b in cutlass.range_constexpr(self.mpw):
+                r = (m_base + (row_grp * Int32(self.mpw) + Int32(b)) * Int32(16)
+                     + (lane >> Int32(2)))
+                # Rows past the tail re-read the last valid row; the store is
+                # predicated. (Exact in f32 for every row count below 2**24.)
+                row.append(r)
+                c = Int32(cute.arch.fmin(Float32(r), row_last))
+                # Per-row A bases: one row-stride multiply per task, not per load.
+                arow.append(x + c.to(Int64) * Int64(2 * self.k))
             slane = sbase + lane * Int32(4)
             slane2 = sbase + lane * Int32(8)
-            total = cute.make_rmem_tensor((self.n8, 4), Float32)
+            total = cute.make_rmem_tensor((self.n8w * self.mpw, 4), Float32)
             total.fill(Float32(0.0))
             words = cute.make_rmem_tensor((2 * self.n16,), Uint32)
             for j in cutlass.range_constexpr(self.n16):
@@ -244,93 +261,115 @@ class TrellisPrefillDense:
                         tile = self._tile_index(nb, kb + Int32(1), warp, Int32(j))
                         wa, wb = _load_words4(wbase, tile, lane)
                         words[2 * j], words[2 * j + 1] = wa, wb
-                acc = cute.make_rmem_tensor((self.n8, 4), Float32)
+                acc = cute.make_rmem_tensor((self.n8w * self.mpw, 4), Float32)
                 acc.fill(Float32(0.0))
                 stage = (kb % Int32(self.stages)) * Int32(32 * self.n_cta)
                 if cutlass.const_expr(self.mode == "f16"):
                     for k16 in cutlass.range_constexpr(K16_PER_BLOCK):
                         kcol = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
-                        a0 = self._pair(arow0, kcol)
-                        a1 = self._pair(arow1, kcol)
-                        a2 = self._pair(arow0, kcol + Int32(8))
-                        a3 = self._pair(arow1, kcol + Int32(8))
-                        for i in cutlass.range_constexpr(self.n8):
+                        a = []
+                        for b in cutlass.range_constexpr(self.mpw):
+                            q = arow[b] + Int64(8 * self.k)
+                            a.append((self._pair(arow[b], kcol), self._pair(q, kcol),
+                                      self._pair(arow[b], kcol + Int32(8)),
+                                      self._pair(q, kcol + Int32(8))))
+                        for i in cutlass.range_constexpr(self.n8w):
+                            gi = col_grp * Int32(self.n8w) + Int32(i)
                             addr = slane + (stage + Int32(k16) * Int32(4 * self.n_cta)
-                                            + Int32(i * 32)) * Int32(4)
+                                            + gi * Int32(32)) * Int32(4)
                             b0, b1 = fp8x4_e4m3_to_half2x2(ld_shared_u32(addr))
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3],
-                                a0, a1, a2, a3, b0, b1)
-                            acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3] = d0, d1, d2, d3
+                            for b in cutlass.range_constexpr(self.mpw):
+                                r = i * self.mpw + b
+                                d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    acc[r, 0], acc[r, 1], acc[r, 2], acc[r, 3],
+                                    a[b][0], a[b][1], a[b][2], a[b][3], b0, b1)
+                                acc[r, 0], acc[r, 1], acc[r, 2], acc[r, 3] = d0, d1, d2, d3
                     scale = _side_value(scales.iterator.toint(), kb)
-                    for i in cutlass.range_constexpr(self.n8):
+                    for r in cutlass.range_constexpr(self.n8w * self.mpw):
                         for v in cutlass.range_constexpr(4):
-                            total[i, v] = total[i, v] + acc[i, v] * scale
+                            total[r, v] = total[r, v] + acc[r, v] * scale
                 else:
                     q4 = (lane & Int32(3)) * Int32(4)
-                    mx0 = Uint32(0)
-                    mx1 = Uint32(0)
+                    nrow = 2 * self.mpw
+                    mx = [Uint32(0) for _ in range(nrow)]
                     for k32 in cutlass.range_constexpr(4):
                         kcol = kb * Int32(128) + Int32(k32 * 32) + q4
-                        f0, f1 = self._quad(arow0, kcol)
-                        f2, f3 = self._quad(arow1, kcol)
-                        f4, f5 = self._quad(arow0, kcol + Int32(16))
-                        f6, f7 = self._quad(arow1, kcol + Int32(16))
-                        mx0 = hmax2(mx0, hmax2(hmax2(habs2(f0), habs2(f1)),
-                                              hmax2(habs2(f4), habs2(f5))))
-                        mx1 = hmax2(mx1, hmax2(hmax2(habs2(f2), habs2(f3)),
-                                              hmax2(habs2(f6), habs2(f7))))
-                    m0 = hmax_to_f32(mx0)
-                    m1 = hmax_to_f32(mx1)
-                    m0 = cute.arch.fmax(m0, cute.arch.shuffle_sync_bfly(m0, offset=1))
-                    m1 = cute.arch.fmax(m1, cute.arch.shuffle_sync_bfly(m1, offset=1))
-                    m0 = cute.arch.fmax(m0, cute.arch.shuffle_sync_bfly(m0, offset=2))
-                    m1 = cute.arch.fmax(m1, cute.arch.shuffle_sync_bfly(m1, offset=2))
-                    s0 = cute.arch.fmin(Float32(E4M3_MAX) / cute.arch.fmax(m0, Float32(1e-30)),
-                                        Float32(60000.0))
-                    s1 = cute.arch.fmin(Float32(E4M3_MAX) / cute.arch.fmax(m1, Float32(1e-30)),
-                                        Float32(60000.0))
-                    h0 = broadcast_f32_to_half2(s0)
-                    h1 = broadcast_f32_to_half2(s1)
+                        for b in cutlass.range_constexpr(self.mpw):
+                            q = arow[b] + Int64(8 * self.k)
+                            f0, f1 = self._quad(arow[b], kcol)
+                            f2, f3 = self._quad(q, kcol)
+                            f4, f5 = self._quad(arow[b], kcol + Int32(16))
+                            f6, f7 = self._quad(q, kcol + Int32(16))
+                            mx[2 * b] = hmax2(mx[2 * b],
+                                              hmax2(hmax2(habs2(f0), habs2(f1)),
+                                                    hmax2(habs2(f4), habs2(f5))))
+                            mx[2 * b + 1] = hmax2(mx[2 * b + 1],
+                                                  hmax2(hmax2(habs2(f2), habs2(f3)),
+                                                        hmax2(habs2(f6), habs2(f7))))
+                    s = []
+                    hsc = []
+                    for t in cutlass.range_constexpr(nrow):
+                        m = hmax_to_f32(mx[t])
+                        m = cute.arch.fmax(m, cute.arch.shuffle_sync_bfly(m, offset=1))
+                        m = cute.arch.fmax(m, cute.arch.shuffle_sync_bfly(m, offset=2))
+                        v = cute.arch.fmin(Float32(E4M3_MAX) / cute.arch.fmax(m, Float32(1e-30)),
+                                           Float32(60000.0))
+                        s.append(v)
+                        hsc.append(broadcast_f32_to_half2(v))
                     for k32 in cutlass.range_constexpr(4):
                         kcol = kb * Int32(128) + Int32(k32 * 32) + q4
-                        f0, f1 = self._quad(arow0, kcol)
-                        f2, f3 = self._quad(arow1, kcol)
-                        f4, f5 = self._quad(arow0, kcol + Int32(16))
-                        f6, f7 = self._quad(arow1, kcol + Int32(16))
-                        qa0 = _e4m3x4_from_half2x2(half2_mul(f0, h0), half2_mul(f1, h0))
-                        qa1 = _e4m3x4_from_half2x2(half2_mul(f2, h1), half2_mul(f3, h1))
-                        qa2 = _e4m3x4_from_half2x2(half2_mul(f4, h0), half2_mul(f5, h0))
-                        qa3 = _e4m3x4_from_half2x2(half2_mul(f6, h1), half2_mul(f7, h1))
-                        for i in cutlass.range_constexpr(self.n8):
+                        qa = []
+                        for b in cutlass.range_constexpr(self.mpw):
+                            q = arow[b] + Int64(8 * self.k)
+                            hl = hsc[2 * b]
+                            hh = hsc[2 * b + 1]
+                            f0, f1 = self._quad(arow[b], kcol)
+                            f2, f3 = self._quad(q, kcol)
+                            f4, f5 = self._quad(arow[b], kcol + Int32(16))
+                            f6, f7 = self._quad(q, kcol + Int32(16))
+                            qa.append((_e4m3x4_from_half2x2(half2_mul(f0, hl),
+                                                            half2_mul(f1, hl)),
+                                       _e4m3x4_from_half2x2(half2_mul(f2, hh),
+                                                            half2_mul(f3, hh)),
+                                       _e4m3x4_from_half2x2(half2_mul(f4, hl),
+                                                            half2_mul(f5, hl)),
+                                       _e4m3x4_from_half2x2(half2_mul(f6, hh),
+                                                            half2_mul(f7, hh))))
+                        for i in cutlass.range_constexpr(self.n8w):
+                            gi = col_grp * Int32(self.n8w) + Int32(i)
                             addr = slane2 + (stage + Int32(k32) * Int32(8 * self.n_cta)
-                                             + Int32(i * 64)) * Int32(4)
+                                             + gi * Int32(64)) * Int32(4)
                             b0, b1 = ld_shared_v2_u32(addr)
-                            d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
-                                acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3],
-                                qa0, qa1, qa2, qa3, b0, b1)
-                            acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3] = d0, d1, d2, d3
+                            for b in cutlass.range_constexpr(self.mpw):
+                                r = i * self.mpw + b
+                                d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
+                                    acc[r, 0], acc[r, 1], acc[r, 2], acc[r, 3],
+                                    qa[b][0], qa[b][1], qa[b][2], qa[b][3], b0, b1)
+                                acc[r, 0], acc[r, 1], acc[r, 2], acc[r, 3] = d0, d1, d2, d3
                     scale = _side_value(scales.iterator.toint(), kb)
-                    sa0 = scale * (Float32(1.0) / s0)
-                    sa1 = scale * (Float32(1.0) / s1)
-                    for i in cutlass.range_constexpr(self.n8):
-                        total[i, 0] = total[i, 0] + acc[i, 0] * sa0
-                        total[i, 1] = total[i, 1] + acc[i, 1] * sa0
-                        total[i, 2] = total[i, 2] + acc[i, 2] * sa1
-                        total[i, 3] = total[i, 3] + acc[i, 3] * sa1
+                    sa = [scale * (Float32(1.0) / s[t]) for t in range(nrow)]
+                    for r in cutlass.range_constexpr(self.n8w * self.mpw):
+                        b = r % self.mpw
+                        total[r, 0] = total[r, 0] + acc[r, 0] * sa[2 * b]
+                        total[r, 1] = total[r, 1] + acc[r, 1] * sa[2 * b]
+                        total[r, 2] = total[r, 2] + acc[r, 2] * sa[2 * b + 1]
+                        total[r, 3] = total[r, 3] + acc[r, 3] * sa[2 * b + 1]
                 if kb + Int32(1) < Int32(nkb):
                     for j in cutlass.range_constexpr(self.n16):
                         self._stage(sbase, (kb + Int32(1)) % Int32(self.stages), warp,
                                     Int32(j), lane, words[2 * j], words[2 * j + 1],
                                     b_sel, src1, src2)
                 cute.arch.sync_threads()
-            for i in cutlass.range_constexpr(self.n8):
-                col = nb * Int32(self.n_cta) + Int32(i * 8) + (lane & Int32(3)) * Int32(2)
-                addr = obase + (row0.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
-                if row0 < rows:
-                    st_global_v2_f32(addr, total[i, 0], total[i, 1])
-                if row1 < rows:
-                    st_global_v2_f32(addr + Int64(8 * self.n * 4), total[i, 2], total[i, 3])
+            for i in cutlass.range_constexpr(self.n8w):
+                gi = col_grp * Int32(self.n8w) + Int32(i)
+                col = nb * Int32(self.n_cta) + gi * Int32(8) + (lane & Int32(3)) * Int32(2)
+                for b in cutlass.range_constexpr(self.mpw):
+                    r = i * self.mpw + b
+                    addr = obase + (row[b].to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
+                    if row[b] < rows:
+                        st_global_v2_f32(addr, total[r, 0], total[r, 1])
+                    if row[b] + Int32(8) < rows:
+                        st_global_v2_f32(addr + Int64(8 * self.n * 4), total[r, 2], total[r, 3])
             task += step
 
     @cute.jit

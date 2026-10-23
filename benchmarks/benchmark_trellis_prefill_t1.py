@@ -10,7 +10,8 @@ block-FP8 prefill projection in both its W8A16 and W8A8 modes.
 Weights are the same synthetic trellis payload the frozen kernel consumes;
 activations are F16 randn (the trellis ABI input) for the trellis arms.
 
-``--variants`` takes ``f16-64``, ``f16-128``, ``fp8-64``, ``fp8-128`` and an
+``--variants`` takes ``f16-64``, ``f16-128``, ``fp8-64``, ``fp8-128``, a
+``m<mpw>`` warp-tile suffix (``f16-64m2``: two m16 row blocks per warp) and an
 optional ``_<stages>`` suffix (``fp8-128_3``).
 """
 from __future__ import annotations
@@ -102,13 +103,25 @@ def blockfp8_tensors(k, n, rows, core):
     return (x, w, sc, out), scratch
 
 
-def compile_variant(label, k, n, side, mode, n_cta, stages):
+def parse_label(label):
+    """``mode-width[.m<mpw>][_<stages>]`` -> (mode, n_cta, stages, mpw)."""
+    mode, width = label.split("-")
+    stages = 2
+    if "_" in width:
+        width, stages = width.split("_")
+    mpw = 1
+    if "m" in width:
+        width, mpw = width.split("m")
+    return mode, int(width), int(stages), int(mpw)
+
+
+def compile_variant(label, k, n, side, mode, n_cta, stages, mpw=1):
     g = trellis_linear.geometry(k, n, sharded_side=side, max_rows=MAX_ROWS)
-    core = TrellisPrefillDense(g, mode=mode, n_cta=n_cta, stages=stages)
+    core = TrellisPrefillDense(g, mode=mode, n_cta=n_cta, stages=stages, mpw=mpw)
     return compile_program(core, name=f"trellis_prefill_{label}",
                            operands=trellis_operands(k, n, g["splits"]),
                            scalars=TRELLIS_SCALARS,
-                           key=(k, n, side, mode, n_cta, stages), version=1,
+                           key=(k, n, side, mode, n_cta, stages, mpw), version=1,
                            geometry=g)
 
 
@@ -173,11 +186,7 @@ def main():
 
     spec = []
     for label in args.variants.split(","):
-        mode, width = label.split("-")
-        stages = 2
-        if "_" in width:
-            width, stages = width.split("_")
-        spec.append((label, mode, int(width), int(stages)))
+        spec.append((label, *parse_label(label)))
     shapes = [name for name in args.shapes.split(",") if name]
     rows_list = [int(v) for v in args.rows.split(",")]
 
@@ -199,8 +208,8 @@ def main():
                 trellis_linear.compile_trellis_linear_aot(
                     input_features=k, output_features=n, sharded_side=side,
                     max_rows=MAX_ROWS)
-            variants = {label: compile_variant(label, k, n, side, mode, n_cta, stages)
-                        for label, mode, n_cta, stages in spec}
+            variants = {label: compile_variant(label, k, n, side, mode, n_cta, stages, mpw)
+                        for label, mode, n_cta, stages, mpw in spec}
         ref = torch.empty_like(tensors[4])
         programs = {"native": ref_program, **variants} if ref_program else dict(variants)
         for label, program in programs.items():
