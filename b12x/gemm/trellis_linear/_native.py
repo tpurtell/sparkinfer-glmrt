@@ -237,25 +237,6 @@ def pack_f16x2_pair_to_e4m3x4(v0: Uint32, v1: Uint32, *, loc=None, ip=None) -> U
 
 
 @dsl_user_op
-def pack_f16x2_pair_to_e4m3x4_scaled(v0: Uint32, v1: Uint32, *, loc=None, ip=None) -> Uint32:
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(v0).ir_value(loc=loc, ip=ip), Uint32(v1).ir_value(loc=loc, ip=ip)],
-            "{ .reg .b32 s0, s1; .reg .b16 lo, hi; "
-            "mul.rn.f16x2 s0, $1, 0x4c004c00; "
-            "mul.rn.f16x2 s1, $2, 0x4c004c00; "
-            "cvt.rn.satfinite.e4m3x2.f16x2 lo, s0; "
-            "cvt.rn.satfinite.e4m3x2.f16x2 hi, s1; "
-            "mov.b32 $0, {lo, hi}; }",
-            "=r,r,r",
-            has_side_effects=False, is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
-        )
-    )
-
-
-@dsl_user_op
 def align_k6_u32x2(
     z0: Uint32, z1: Uint32, z2: Uint32, shift: Int32, *, loc=None, ip=None
 ) -> tuple[Uint32, Uint32]:
@@ -934,9 +915,7 @@ class NativeTrellisLinear:
             for block in cutlass.range(8, unroll=1):
                 kb = split * Int32(8) + block
                 if kb < Int32(self.k // 128):
-                    scale = _side_value(scales_ptr, kb) * (
-                        Float32(0.0625) if cutlass.const_expr(self.e4m3) else Float32(1.0)
-                    )
+                    scale = _side_value(scales_ptr, kb)
                     acc = cute.make_rmem_tensor((4, 4, 4), Float32)
                     acc.fill(Float32(0.0))
                     cons_parity = step_k128 & Int32(1)
@@ -977,17 +956,17 @@ class NativeTrellisLinear:
                                 e1_frag[j, 0] = e01
                                 e1_frag[j, 1] = e23
                             for m_local in cutlass.range_constexpr(4):
-                                ra0_frag[m_local, 0] = pack_f16x2_pair_to_e4m3x4_scaled(
+                                ra0_frag[m_local, 0] = pack_f16x2_pair_to_e4m3x4(
                                     a0_frag[m_local, 0], a0_frag[m_local, 2]
                                 )
-                                ra0_frag[m_local, 1] = pack_f16x2_pair_to_e4m3x4_scaled(
+                                ra0_frag[m_local, 1] = pack_f16x2_pair_to_e4m3x4(
                                     a0_frag[m_local, 1], a0_frag[m_local, 3]
                                 )
                             for m_local in cutlass.range_constexpr(4):
-                                ra1_frag[m_local, 0] = pack_f16x2_pair_to_e4m3x4_scaled(
+                                ra1_frag[m_local, 0] = pack_f16x2_pair_to_e4m3x4(
                                     a1_frag[m_local, 0], a1_frag[m_local, 2]
                                 )
-                                ra1_frag[m_local, 1] = pack_f16x2_pair_to_e4m3x4_scaled(
+                                ra1_frag[m_local, 1] = pack_f16x2_pair_to_e4m3x4(
                                     a1_frag[m_local, 1], a1_frag[m_local, 3]
                                 )
                             for m_local in cutlass.range_constexpr(2):
