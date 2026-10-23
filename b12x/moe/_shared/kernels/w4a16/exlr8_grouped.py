@@ -46,7 +46,7 @@ from .mixed_trellis_ws import (
 
 _FC1_CONSUMER_THREADS = 256
 _FC1_PRODUCER_THREADS = 128
-_FC1_PRODUCER_REGS = 40
+_FC1_PRODUCER_REGS = 32
 _FC1_CONSUMER_REGS = 232
 _FC1_A_STAGES = 2
 _FC1_B_STAGES = 2
@@ -337,7 +337,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 104
+    CODE_VERSION = 105
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
