@@ -350,7 +350,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 112
+    CODE_VERSION = 113
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
@@ -376,7 +376,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         self.fc1_hdr_bytes = (4 * self.fc1_hdr_words + 15) // 16 * 16
         self.fc1_hdr_off = self.FC1_STAGES * self.fc1_stage_bytes
         self.fc1_udesc_off = self.fc1_hdr_off + _FC1_TILE_STAGES * self.fc1_hdr_bytes
-        self.fc1_bar_off = self.fc1_udesc_off + self.units * 40
+        self.fc1_bar_off = self.fc1_udesc_off + self.units * 40 + 512
         self.fc1_smem_bytes = self.fc1_bar_off + 8 * 2 * (self.FC1_STAGES + _FC1_TILE_STAGES)
         self.fc1_ws = bool(self.FC1_WS) and group_rows == 64
         if (self.fc1_ws and self.shared_memory_bytes is not None
@@ -1114,15 +1114,17 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         _mbar_arrive(bar_tfull + hslot * Int32(8))
 
     @cute.jit
-    def fc1_ws_block_n16(self, total: cute.Tensor, a_base: Int32, b_base: Int32,
+    def fc1_ws_block_n16(self, total: cute.Tensor, acc: cute.Tensor,
+                         a_base: Int32, b_base: Int32,
                          lane: Int32, n16_0: Int32, width: cutlass.Constexpr,
                          packed_scale: Uint32, active: cutlass.Constexpr):
         r_m = lane & Int32(15)
         c_half = lane >> Int32(4)
         scale, _ = half2_to_float2_scaled(packed_scale, Float32(1.0))
         for j in cutlass.range_constexpr(2):
-            acc = cute.make_rmem_tensor((active, 8), Float32)
-            acc.fill(Float32(0.0))
+            for idx in cutlass.range_constexpr(active):
+                for v in cutlass.range_constexpr(8):
+                    acc[idx, v] = Float32(0.0)
             n16 = n16_0 + Int32(j)
             rec_a = Int32(0)
             rec_b = Int32(0)
@@ -1192,7 +1194,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 st_global_v2_f32(addr, g0 + e0, g1 + e1)
 
     @cute.jit
-    def fc1_ws_tile(self, total0: cute.Tensor, total1: cute.Tensor,
+    def fc1_ws_tile(self, total0: cute.Tensor, total1: cute.Tensor, acc: cute.Tensor,
                     ring: Int32, hdr: Int32, seq: Int32,
                     lane: Int32, cw: Int32, out_base: Int64, live: Int32,
                     v_lo: Int32, v_hi: Int32, split: Int32, width: cutlass.Constexpr,
@@ -1218,11 +1220,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     stage = ring + slot * Int32(self.fc1_stage_bytes)
                     sc0 = ld_shared_i32_relaxed(scale_base0 + block * Int32(4)).to(Uint32)
                     b0_base = stage + Int32(self.fc1_a_bytes) + proj * Int32(8192)
-                    self.fc1_ws_block_n16(total0, stage, b0_base, lane, n16_0, width, sc0, active)
+                    self.fc1_ws_block_n16(total0, acc, stage, b0_base, lane, n16_0, width, sc0, active)
                     if cutlass.const_expr(has_b):
                         sc1 = ld_shared_i32_relaxed(scale_base1 + block * Int32(4)).to(Uint32)
                         b1_base = b0_base + Int32(16384)
-                        self.fc1_ws_block_n16(total1, stage, b1_base, lane, n16_0, width, sc1, active)
+                        self.fc1_ws_block_n16(total1, acc, stage, b1_base, lane, n16_0, width, sc1, active)
                 _mbar_arrive(bar_empty + slot * Int32(8))
                 seq += Int32(1)
         if cutlass.const_expr(width != 0):
@@ -1279,6 +1281,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             hdr_base = ring + Int32(self.fc1_hdr_off)
             total0 = cute.make_rmem_tensor((4, 2, 8), Float32)
             total1 = cute.make_rmem_tensor((4, 2, 8), Float32)
+            acc = cute.make_rmem_tensor((4, 8), Float32)
             seq = Int32(0)
             ti = Int32(0)
             done = Int32(0)
@@ -1307,29 +1310,29 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         if num_live == Int32(active):
                             if has_b != Int32(0):
                                 if width == Int32(4):
-                                    seq = self.fc1_ws_tile(total0, total1, ring, hdr, seq, lane, cw, out_base,
+                                    seq = self.fc1_ws_tile(total0, total1, acc, ring, hdr, seq, lane, cw, out_base,
                                                            live, v_lo, v_hi, split, 4, active, True)
                                 elif width == Int32(3):
-                                    seq = self.fc1_ws_tile(total0, total1, ring, hdr, seq, lane, cw, out_base,
+                                    seq = self.fc1_ws_tile(total0, total1, acc, ring, hdr, seq, lane, cw, out_base,
                                                            live, v_lo, v_hi, split, 3, active, True)
                                 elif width == Int32(2):
-                                    seq = self.fc1_ws_tile(total0, total1, ring, hdr, seq, lane, cw, out_base,
+                                    seq = self.fc1_ws_tile(total0, total1, acc, ring, hdr, seq, lane, cw, out_base,
                                                            live, v_lo, v_hi, split, 2, active, True)
                                 else:
-                                    seq = self.fc1_ws_tile(total0, total1, ring, hdr, seq, lane, cw, out_base,
+                                    seq = self.fc1_ws_tile(total0, total1, acc, ring, hdr, seq, lane, cw, out_base,
                                                            live, v_lo, v_hi, split, 0, active, True)
                             else:
                                 if width == Int32(4):
-                                    seq = self.fc1_ws_tile(total0, total1, ring, hdr, seq, lane, cw, out_base,
+                                    seq = self.fc1_ws_tile(total0, total1, acc, ring, hdr, seq, lane, cw, out_base,
                                                            live, v_lo, v_hi, split, 4, active, False)
                                 elif width == Int32(3):
-                                    seq = self.fc1_ws_tile(total0, total1, ring, hdr, seq, lane, cw, out_base,
+                                    seq = self.fc1_ws_tile(total0, total1, acc, ring, hdr, seq, lane, cw, out_base,
                                                            live, v_lo, v_hi, split, 3, active, False)
                                 elif width == Int32(2):
-                                    seq = self.fc1_ws_tile(total0, total1, ring, hdr, seq, lane, cw, out_base,
+                                    seq = self.fc1_ws_tile(total0, total1, acc, ring, hdr, seq, lane, cw, out_base,
                                                            live, v_lo, v_hi, split, 2, active, False)
                                 else:
-                                    seq = self.fc1_ws_tile(total0, total1, ring, hdr, seq, lane, cw, out_base,
+                                    seq = self.fc1_ws_tile(total0, total1, acc, ring, hdr, seq, lane, cw, out_base,
                                                            live, v_lo, v_hi, split, 0, active, False)
                     _mbar_arrive(bar_tempty + hslot * Int32(8))
                     ti += Int32(1)
