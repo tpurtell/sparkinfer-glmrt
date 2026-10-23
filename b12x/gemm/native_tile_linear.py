@@ -275,6 +275,7 @@ class NativeTileLinear:
         self.pf_as = self.pf_bm * 4                  # one UE8M0 byte per (row, 32-K group)
         self.pf_w8 = self.pf_bn * 128                # E4M3 weights: columns x 128 K
         self.pf_ws = self.pf_bn * (8 if self.int4 else 4)
+        self.pf_wcol = (self.pf_bn * 4) // (32 * self.pf_wm * self.pf_wn)  # int4 columns per thread
         self.pf_stage = self.pf_a8 + self.pf_as + self.pf_w8 + self.pf_ws
         self.pf_tiles = (self.n + self.pf_bn - 1) // self.pf_bn
         if self.grouped:
@@ -679,32 +680,35 @@ class NativeTileLinear:
     @cute.jit
     def _load_w_raw(self, wraw: cute.Tensor, payload: cute.Tensor, n0: Int32, kc: Int32,
                     tid: Int32):
-        """int4: this thread's 32 codes of one 128-wide K chunk (16 bytes = 8 units)."""
-        col = tid >> Int32(2)
+        """int4: the 32 codes of this thread's 128-wide K chunk column (16 bytes = 8 units);
+        ``self.pf_wcol`` columns per thread when the tile is wider than 4 threads per column."""
         unit = tid & Int32(3)
-        if cutlass.const_expr(self.n % self.pf_bn == 0):
-            gcol = n0 + col
-        else:
-            gcol = Int32(0)
-            if n0 + col < Int32(self.n):
+        for c in cutlass.range_constexpr(self.pf_wcol):
+            col = (tid >> Int32(2)) + Int32(32 * self.pf_wm * self.pf_wn // 4 * c)
+            if cutlass.const_expr(self.n % self.pf_bn == 0):
                 gcol = n0 + col
-        src = self._w_addr(payload, gcol, kc * Int32(128) + unit * Int32(32))
-        wraw[0], wraw[1], wraw[2], wraw[3] = ld_global_v4_u32(src)
+            else:
+                gcol = Int32(0)
+                if n0 + col < Int32(self.n):
+                    gcol = n0 + col
+            src = self._w_addr(payload, gcol, kc * Int32(128) + unit * Int32(32))
+            wraw[4 * c], wraw[4 * c + 1], wraw[4 * c + 2], wraw[4 * c + 3] = ld_global_v4_u32(src)
 
     @cute.jit
     def _store_w8(self, base: Int32, wraw: cute.Tensor, stage: Int32, tid: Int32):
         """int4: widen the 4-bit codes to E4M3 in registers (code - 8 is exact in E4M3)
         and stage 32 bytes as two swizzled 16-byte units; never a global buffer."""
         sw = base + stage * Int32(self.pf_stage) + Int32(self.pf_a8 + self.pf_as)
-        col = tid >> Int32(2)
         unit = tid & Int32(3)
-        for h in cutlass.range_constexpr(2):
-            b0, b1, b2, b3 = _int4x8_bf16(wraw[2 * h])
-            b4, b5, b6, b7 = _int4x8_bf16(wraw[2 * h + 1])
-            u = unit * Int32(2) + Int32(h)
-            _st_shared_v4(sw + col * Int32(128) + ((u ^ (col & Int32(7))) << Int32(4)),
-                          cvt_bf16x2x2_to_e4m3x4(b0, b1), cvt_bf16x2x2_to_e4m3x4(b2, b3),
-                          cvt_bf16x2x2_to_e4m3x4(b4, b5), cvt_bf16x2x2_to_e4m3x4(b6, b7))
+        for c in cutlass.range_constexpr(self.pf_wcol):
+            col = (tid >> Int32(2)) + Int32(32 * self.pf_wm * self.pf_wn // 4 * c)
+            for h in cutlass.range_constexpr(2):
+                b0, b1, b2, b3 = _int4x8_bf16(wraw[4 * c + 2 * h])
+                b4, b5, b6, b7 = _int4x8_bf16(wraw[4 * c + 2 * h + 1])
+                u = unit * Int32(2) + Int32(h)
+                _st_shared_v4(sw + col * Int32(128) + ((u ^ (col & Int32(7))) << Int32(4)),
+                              cvt_bf16x2x2_to_e4m3x4(b0, b1), cvt_bf16x2x2_to_e4m3x4(b2, b3),
+                              cvt_bf16x2x2_to_e4m3x4(b4, b5), cvt_bf16x2x2_to_e4m3x4(b6, b7))
 
     @cute.jit
     def _issue_w(self, base: Int32, payload: cute.Tensor, scales: cute.Tensor, n0: Int32,
@@ -768,7 +772,7 @@ class NativeTileLinear:
         sfa_row = g + (lane & Int32(1)) * Int32(8)
         unit_scale = Uint32(0x7F7F7F7F)             # four UE8M0 2^0 bytes: int4 scales come next
         raw = cute.make_rmem_tensor((16,), Uint32)
-        wraw = cute.make_rmem_tensor((4,), Uint32)
+        wraw = cute.make_rmem_tensor((4 * self.pf_wcol,), Uint32)
         part = cute.make_rmem_tensor((MT * 4,), Float32)
         while tile < tiles:
             if cutlass.const_expr(self.side2):
