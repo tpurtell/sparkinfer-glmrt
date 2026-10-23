@@ -202,7 +202,7 @@ class TrellisPrefillDense:
         obase = output.iterator.toint()
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
-        sbase = shared_ptr_to_u32(storage.x.data_ptr())
+        sbase = shared_ptr_to_u32(storage.w.data_ptr())
         n_tiles = Int32(self.n // self.n_cta)
         nkb = self.k // 128
         total_tasks = ((rows + Int32(M_CTA - 1)) // Int32(M_CTA)) * n_tiles
