@@ -191,7 +191,7 @@ def error_stats(got, ref):
                 rms_rel=float((rel ** 2).mean().sqrt()))
 
 
-def fp64_reference(k, n, side, x, payload, scales, limit, chunk=4096):
+def fp64_reference(k, n, side, x, payload, scales, limit, chunk=1024):
     """``x @ W`` in FP64, with W read back out of the frozen native kernel.
 
     A one-hot activation over one K-chunk at a time makes every native output
@@ -204,7 +204,7 @@ def fp64_reference(k, n, side, x, payload, scales, limit, chunk=4096):
     with exportable_compilation():
         program = trellis_linear.compile_trellis_linear_aot(
             input_features=k, output_features=n, sharded_side=side, max_rows=chunk)
-    splits = (chunk + 1023) // 1024
+    splits = k // 1024
     a = torch.zeros((chunk, k), dtype=torch.float16, device="cuda")
     out = torch.empty((chunk, n), dtype=torch.float32, device="cuda")
     partial = torch.empty((chunk, splits, n), dtype=torch.float32, device="cuda")
@@ -290,6 +290,8 @@ def main():
             ref64 = fp64_reference(k, n, side, xa[:args.fp64_rows], payload, scales, limit)
             del xa
             torch.cuda.empty_cache()
+            report["errors"].append(dict(shape=name, variant="fp64", rows=int(ref64.shape[0])))
+            save()
         programs = {"native": ref_program, **variants} if ref_program else dict(variants)
         for label, program in programs.items():
             if modes.get(label) in ("mx8q", "mx8g"):
