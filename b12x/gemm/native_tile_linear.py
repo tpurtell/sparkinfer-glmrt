@@ -266,18 +266,19 @@ class NativeTileLinear:
         # chip, so neither format needs an unpack buffer. One warp owns 32 columns and
         # MT m16 row blocks; one thread quantizes one activation 32-group per K chunk.
         self.pf_bn = 128                             # output columns of one FP8 tile
-        self.pf_wm, self.pf_wn = 4, 4                # warps down the rows, across the columns
-        self.pf_mt = self.bm // self.pf_wm // 16     # m16 row blocks per warp
+        self.pf_bm = 64                              # rows of one FP8 tile (99 KB smem per block)
+        self.pf_wm, self.pf_wn = 2, 4                # warps down the rows, across the columns
+        self.pf_mt = self.pf_bm // self.pf_wm // 16  # m16 row blocks per warp
         self.pf_ng = 4                               # n8 column tiles per warp
-        self.pf_stages = 4
-        self.pf_a8 = self.bm * 128                   # E4M3 activations: rows x 128 K
-        self.pf_as = self.bm * 4                     # one UE8M0 byte per (row, 32-K group)
+        self.pf_stages = 3
+        self.pf_a8 = self.pf_bm * 128                # E4M3 activations: rows x 128 K
+        self.pf_as = self.pf_bm * 4                  # one UE8M0 byte per (row, 32-K group)
         self.pf_w8 = self.pf_bn * 128                # E4M3 weights: columns x 128 K
         self.pf_ws = self.pf_bn * (8 if self.int4 else 4)
         self.pf_stage = self.pf_a8 + self.pf_as + self.pf_w8 + self.pf_ws
         self.pf_tiles = (self.n + self.pf_bn - 1) // self.pf_bn
         if self.grouped:
-            if 32 * self.pf_wm * self.pf_wn != self.bm * 4:
+            if 32 * self.pf_wm * self.pf_wn != self.pf_bm * 4:
                 raise ValueError("FP8 tile needs one activation 32-group per thread")
             self.prefill_threads = 32 * self.pf_wm * self.pf_wn
             self.n_tiles = self.pf_tiles
@@ -306,12 +307,13 @@ class NativeTileLinear:
                     block=(self.d_threads, 1, 1),
                     stream=stream, min_blocks_per_mp=3 if self.side2 else 2)
             else:
-                tiles = ((rows + Int32(self.bm - 1)) // Int32(self.bm)) * Int32(self.n_tiles)
                 if cutlass.const_expr(self.grouped):
+                    tiles = ((rows + Int32(self.pf_bm - 1)) // Int32(self.pf_bm)) * Int32(self.n_tiles)
                     self.prefill(x, payload, scales, output, rows).launch(
                         grid=(min(tiles, cta_limit), 1, 1), block=(self.prefill_threads, 1, 1),
                         stream=stream, min_blocks_per_mp=2 if self.prefill_threads <= 256 else 1)
                 else:
+                    tiles = ((rows + Int32(self.bm - 1)) // Int32(self.bm)) * Int32(self.n_tiles)
                     self.prefill_row(x, payload, scales, output, rows).launch(
                         grid=(min(tiles, cta_limit), 1, 1), block=(self.prefill_threads, 1, 1),
                         stream=stream, min_blocks_per_mp=1)
@@ -757,7 +759,7 @@ class NativeTileLinear:
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
         base = shared_ptr_to_u32(storage.buf.data_ptr())
-        m_tiles = (rows + Int32(self.bm - 1)) // Int32(self.bm)
+        m_tiles = (rows + Int32(self.pf_bm - 1)) // Int32(self.pf_bm)
         tiles = m_tiles * Int32(self.pf_tiles)
         kcs = Int32(self.k // 128)
         MT, NG, S = self.pf_mt, self.pf_ng, self.pf_stages
@@ -770,10 +772,10 @@ class NativeTileLinear:
         part = cute.make_rmem_tensor((MT * 4,), Float32)
         while tile < tiles:
             if cutlass.const_expr(self.side2):
-                m0 = (tile // Int32(self.pf_tiles)) * Int32(self.bm)
+                m0 = (tile // Int32(self.pf_tiles)) * Int32(self.pf_bm)
                 n0 = (tile % Int32(self.pf_tiles)) * Int32(self.pf_bn)
             else:
-                m0 = (tile % m_tiles) * Int32(self.bm)
+                m0 = (tile % m_tiles) * Int32(self.pf_bm)
                 n0 = (tile // m_tiles) * Int32(self.pf_bn)
             acc = cute.make_rmem_tensor((MT * NG * 4,), Float32)
             acc.fill(Float32(0.0))
