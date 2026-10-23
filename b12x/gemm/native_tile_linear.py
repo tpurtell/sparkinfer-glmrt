@@ -806,18 +806,18 @@ class NativeTileLinear:
                 cute.arch.sync_threads()
                 nk = kc + Int32(S - 1)
                 if nk < kcs:
-                    self._store_a8(base, raw, nk & Int32(S - 1), tid)
+                    self._store_a8(base, raw, nk % S, tid)
                     if cutlass.const_expr(self.int4):
-                        self._store_w8(base, wraw, nk & Int32(S - 1), tid)
-                        self._issue_ws(base, scales, n0, nk, nk & Int32(S - 1), tid)
+                        self._store_w8(base, wraw, nk % S, tid)
+                        self._issue_ws(base, scales, n0, nk, nk % S, tid)
                     else:
-                        self._issue_w(base, payload, scales, n0, nk, nk & Int32(S - 1), tid)
+                        self._issue_w(base, payload, scales, n0, nk, nk % S, tid)
                 cute.arch.cp_async_commit_group()
                 if nk + Int32(1) < kcs:
                     self._load_a_raw(raw, x, rows, m0, nk + Int32(1), tid)
                     if cutlass.const_expr(self.int4):
                         self._load_w_raw(wraw, payload, n0, nk + Int32(1), tid)
-                sa = base + (kc & Int32(S - 1)) * Int32(self.pf_stage)
+                sa = base + (kc % S) * Int32(self.pf_stage)
                 ss = sa + Int32(self.pf_a8)
                 sw = ss + Int32(self.pf_as)
                 ws = sw + Int32(self.pf_w8)
