@@ -242,7 +242,14 @@ def benchmark_wide_mx8(args):
         x = x16.bfloat16()
         x16.copy_(x)
         g = trellis_linear.geometry(k, n, sharded_side=side)
-        if args.t1_mpw:
+        if args.t1_baseline:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("frozen_t1_prefill", args.t1_baseline)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            wide = module.TrellisPrefillMxfp8(g, n_cta=128)
+            wide.scratch_bytes = ((g["max_rows"] + 15) // 16) * (k // 32) * 528
+        elif args.t1_mpw:
             from b12x.gemm.trellis_linear._prefill import TrellisPrefillMxfp8
             wide = TrellisPrefillMxfp8(g, n_cta=args.t1_n_cta, mpw=args.t1_mpw)
         else:
@@ -251,7 +258,8 @@ def benchmark_wide_mx8(args):
         out = torch.empty_like(native)
         with exportable_compilation():
             candidate = compile_program(wide, name="trellis_wide_mx8",
-                key=(*g.values(), args.t1_mpw, args.t1_n_cta),
+                key=(*g.values(), args.t1_mpw, args.t1_n_cta,
+                     hashlib.sha256(args.t1_baseline.read_bytes()).hexdigest() if args.t1_baseline else ""),
                 operands=(Operand("inputs", torch.int64, "[4]"), Operand("payload", torch.uint8, "[packed]"),
                           Operand("scales", torch.float16, "[K/128]"), Operand("scratch", torch.uint8, "[records]", "scratch"),
                           Operand("output", torch.float32, "[rows,N]", "out")),
@@ -395,6 +403,7 @@ def main():
     parser.add_argument("--t1-mpw", type=int, choices=(0, 1, 2), default=0,
                         help="use T1 shared-tile kernel with this many M16 blocks per warp")
     parser.add_argument("--t1-n-cta", type=int, choices=(64, 128), default=64)
+    parser.add_argument("--t1-baseline", type=Path, help="frozen pristine T1 module for matched comparison")
     parser.add_argument("--arm", action="append", help="NAME=git-rev; repeatable")
     parser.add_argument("--arm-bundle", type=Path)
     parser.add_argument("--materialize-only", action="store_true", help="host-side git show, no CUDA")
