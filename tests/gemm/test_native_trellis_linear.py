@@ -458,3 +458,33 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
                 assert torch.isnan(out).all()
 
 
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("bits,codebook", [(4, "e4m3"), (6, "mcg"), (6, "mul1")])
+def test_prefill_ws_bitwise_and_row_invariance(side, bits, codebook):
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    c = Case(k=1152, n=256, side=side, bits=bits, rows=512, codebook=codebook)
+    c.output.fill_(float("nan"))
+    c.launch(64)
+    expected_64 = c.output[:64].clone()
+    c.output.fill_(float("nan"))
+    c.launch(512)
+    expected_512 = c.output[:512].clone()
+    assert torch.equal(expected_512[:64].view(torch.int32), expected_64.view(torch.int32))
+    with kernel_resolution_guard("prefill_ws uses precompiled kernels"):
+        for rows in (130, 191, 192, 193, 255, 256, 257, 384, 512):
+            for limit in (48, 170 * 4, 188 * 4):
+                c.output.fill_(float("nan"))
+                c.launch(rows, limit)
+                assert torch.equal(c.output[:rows].view(torch.int32), expected_512[:rows].view(torch.int32))
+                assert torch.isnan(c.output[rows:]).all()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            c.launch(256)
+        for _ in range(3):
+            c.output.fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(c.output[:256].view(torch.int32), expected_512[:256].view(torch.int32))
+            assert torch.isnan(c.output[256:]).all()
+
+
+
