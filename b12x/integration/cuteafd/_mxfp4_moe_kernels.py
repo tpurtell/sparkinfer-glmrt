@@ -24,12 +24,12 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32, const_expr
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32, Uint64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from b12x._lib.intrinsics import bf16_mma_m16n8k16_f32
-from b12x.gemm.bf16_gemv._skinny import _ld_cached, _ld_stream
+from b12x._lib.intrinsics import bf16_mma_m16n8k16_f32, ld_global_nc_v4_u32_l2hint, weight_stream_policy
+from b12x.gemm.bf16_gemv._skinny import _ld_cached
 
 from ._fp8_moe_kernels import META_HEAD, _ceil, _i32_at, _ld_u8
 from ._mxfp4_down_a8_plan import mxfp4_scale_row_bytes
@@ -133,7 +133,8 @@ class GroupedMxfp4Gemv:
             grid=(self.n // self.cols, max_groups, 1), block=(32 * self.warps, 1, 1), stream=stream)
 
     @cute.jit
-    def _load_block(self, dest: cute.Tensor, factors: cute.Tensor, w_row: Int64, s_row: Int64, block):
+    def _load_block(self, dest: cute.Tensor, factors: cute.Tensor, w_row: Int64, s_row: Int64, block,
+                    policy: Uint64):
         for gi in cutlass.range_constexpr(self.groups):
             for t in cutlass.range_constexpr(4):
                 dest[gi * 4 + t] = Uint32(0)
@@ -144,7 +145,8 @@ class GroupedMxfp4Gemv:
                 live = (tidx // Int32(32) * Int32(self.k_per_warp) + Int32(block) * Int32(128)
                         + tidx % Int32(4) * Int32(32) < Int32(self.k)).to(Int32)
             if live != Int32(0):
-                words = _ld_stream(w_row + Int64(gi * 8 * self.row_bytes) + Int64(block) * Int64(64))
+                words = ld_global_nc_v4_u32_l2hint(
+                    w_row + Int64(gi * 8 * self.row_bytes) + Int64(block) * Int64(64), policy, no_allocate=True)
                 for t in cutlass.range_constexpr(4):
                     dest[gi * 4 + t] = words[t]
                 factors[gi] = _ld_u8(s_row + Int64(gi * 8 * self.scale_bytes) + Int64(block) * Int64(4))
@@ -195,6 +197,8 @@ class GroupedMxfp4Gemv:
                 n_c = n_e - c * Int32(16 * self.m_tiles)
                 if n_c > Int32(16 * self.m_tiles):
                     n_c = Int32(16 * self.m_tiles)
+                # The last chunk is the final read of this expert's weights.
+                policy = weight_stream_policy((c + Int32(1) == chunks).to(Int32))
                 acc = cute.make_rmem_tensor(cute.make_layout((self.frags,), stride=(1,)), Float32)
                 for i in cutlass.range_constexpr(self.frags):
                     acc[i] = Float32(0.0)
@@ -204,10 +208,10 @@ class GroupedMxfp4Gemv:
                 nxt = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
                 f_cur = cute.make_rmem_tensor(cute.make_layout((self.groups,), stride=(1,)), Uint32)
                 f_nxt = cute.make_rmem_tensor(cute.make_layout((self.groups,), stride=(1,)), Uint32)
-                self._load_block(cur, f_cur, w_row, s_row, Int32(0))
+                self._load_block(cur, f_cur, w_row, s_row, Int32(0), policy)
                 for block in cutlass.range(self.blocks, unroll=1):
                     if block + 1 < self.blocks:
-                        self._load_block(nxt, f_nxt, w_row, s_row, block + 1)
+                        self._load_block(nxt, f_nxt, w_row, s_row, block + 1, policy)
                     # Widen the block: 16 bf16x2 words per group (K 32j .. 32j + 32).
                     wide = cute.make_rmem_tensor(cute.make_layout((16 * self.groups,), stride=(1,)), Uint32)
                     for gi in cutlass.range_constexpr(self.groups):

@@ -42,15 +42,18 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as cutlass_utils
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from cutlass import Float32, Int32, Int64, Uint32, const_expr
+from cutlass import Float32, Int32, Int64, Uint32, Uint64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 
-from b12x._lib.intrinsics import bf16_mma_m16n8k16_f32, ld_shared_v2_u32, shared_ptr_to_u32, st_shared_v4_u32
+from b12x._lib.intrinsics import (
+    bf16_mma_m16n8k16_f32, ld_global_nc_v4_u32_l2hint, ld_shared_v2_u32, shared_ptr_to_u32, st_shared_v4_u32,
+    weight_stream_policy,
+)
 
-from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
+from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached
 
 __all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_ROWS", "Fp8Projection", "decode_tile_n", "MmaFp8Gemv", "RoutedFp8Projection",
            "TmaFp8Gemm", "check_w8_mode", "fp8_only_operands", "fp8_operands", "fp8_scale_shape", "gemv_warps",
@@ -728,10 +731,11 @@ class MmaFp8Gemv:
                 grid=(self.n // self.cols, 1, 1), block=(32 * self.warps, 1, 1), stream=stream)
 
     @cute.jit
-    def _load_block(self, dest: cute.Tensor, w_row: Int64, k_off: Int64):
+    def _load_block(self, dest: cute.Tensor, w_row: Int64, k_off: Int64, policy: Uint64):
         for chunk in cutlass.range_constexpr(2):
             for gi in cutlass.range_constexpr(self.groups):
-                words = _ld_stream(w_row + Int64(gi * 8 * self.k) + k_off + Int64(chunk * 64))
+                words = ld_global_nc_v4_u32_l2hint(
+                    w_row + Int64(gi * 8 * self.k) + k_off + Int64(chunk * 64), policy, no_allocate=True)
                 for t in cutlass.range_constexpr(4):
                     dest[(chunk * self.groups + gi) * 4 + t] = words[t]
 
@@ -765,19 +769,24 @@ class MmaFp8Gemv:
         live_tiles = ((rows - m0 + Int32(15)) // Int32(16)
                       if const_expr(self.multi_m_grid) else (rows + Int32(15)) // Int32(16))
         per_block = 2 * self.groups * 4
+        # The last row-tile CTA of a column block is the final reader of its weights.
+        last_reader = Int32(1)
+        if const_expr(self.multi_m_grid):
+            last_reader = (Int32(cute.arch.block_idx()[1]) + Int32(1) == Int32(cute.arch.grid_dim()[1])).to(Int32)
+        policy = weight_stream_policy(last_reader)
         # Register double buffer: block b+1's weights and scales load while b computes.
         cur = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
         nxt = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
         s_cur = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
         s_nxt = cute.make_rmem_tensor(cute.make_layout((s_rows,), stride=(1,)), Float32)
-        self._load_block(cur, w_row, Int64(0))
+        self._load_block(cur, w_row, Int64(0), policy)
         for si in cutlass.range_constexpr(s_rows):
             s_cur[si] = _ld_f32(s_row + Int64(si) * s_gi)
         for block in cutlass.range(self.blocks, unroll=1):
             for si in cutlass.range_constexpr(s_rows):
                 s_nxt[si] = s_cur[si]
             if block + 1 < self.blocks:
-                self._load_block(nxt, w_row, Int64(block + 1) * Int64(128))
+                self._load_block(nxt, w_row, Int64(block + 1) * Int64(128), policy)
                 for si in cutlass.range_constexpr(s_rows):
                     s_nxt[si] = _ld_f32(s_row + Int64(si) * s_gi + Int64(block + 1) * s_kb)
             for chunk in cutlass.range_constexpr(2):

@@ -17,9 +17,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-from cutlass import Float32, Int32, Int64, Uint32, const_expr
+from cutlass import Float32, Int32, Int64, Uint32, Uint64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from b12x._lib.intrinsics import ld_global_nc_v4_u32_l2hint, weight_stream_policy
 
 __all__ = [
     "DECODE_TMA_TILES",
@@ -119,28 +121,32 @@ class SkinnyBf16Gemv:
             acc[i] = Float32(0.0)
         w_base = Int64(w.toint()) + col0 * Int64(self.k * 2) + Int64(tidx) * Int64(16)
         x_base = Int64(x.toint()) + Int64(row0) * Int64(self.k * 2) + Int64(tidx) * Int64(16)
+        # The last row tile of a column block is the final reader of its weights.
+        policy = weight_stream_policy(
+            (Int32(cute.arch.block_idx()[1]) + Int32(1) == Int32(cute.arch.grid_dim()[1])).to(Int32))
         if live >= Int32(self.rows_per_tile):
-            self._loop_fixed(acc, w_base, x_base, self.rows_per_tile)
+            self._loop_fixed(acc, w_base, x_base, self.rows_per_tile, policy)
         else:
             handled = Int32(0)
             if cutlass.const_expr(self.rows_per_tile > 4):
                 if live == Int32(4):
-                    self._loop_fixed(acc, w_base, x_base, 4)
+                    self._loop_fixed(acc, w_base, x_base, 4, policy)
                     handled = Int32(1)
             if cutlass.const_expr(self.rows_per_tile > 2):
                 if live == Int32(2):
-                    self._loop_fixed(acc, w_base, x_base, 2)
+                    self._loop_fixed(acc, w_base, x_base, 2, policy)
                     handled = Int32(1)
             if cutlass.const_expr(self.rows_per_tile > 1):
                 if live == Int32(1):
-                    self._loop_fixed(acc, w_base, x_base, 1)
+                    self._loop_fixed(acc, w_base, x_base, 1, policy)
                     handled = Int32(1)
             if handled == Int32(0):
                 for step in cutlass.range_constexpr(self.steps):
                     offset = step * self.threads * 16
                     wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
                     for c in cutlass.range_constexpr(self.cols):
-                        words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
+                        words = ld_global_nc_v4_u32_l2hint(
+                            w_base + Int64(c * self.k * 2 + offset), policy, no_allocate=True)
                         for j in cutlass.range_constexpr(4):
                             wv[8 * c + 2 * j] = _bf16_lo(words[j])
                             wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
@@ -161,12 +167,13 @@ class SkinnyBf16Gemv:
 
     @cute.jit
     def _loop_fixed(self, acc: cute.Tensor, w_base: Int64, x_base: Int64,
-                    live_rows: cutlass.Constexpr):
+                    live_rows: cutlass.Constexpr, policy: Uint64):
         for step in cutlass.range_constexpr(self.steps):
             offset = step * self.threads * 16
             wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
             for c in cutlass.range_constexpr(self.cols):
-                words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
+                words = ld_global_nc_v4_u32_l2hint(
+                    w_base + Int64(c * self.k * 2 + offset), policy, no_allocate=True)
                 for j in cutlass.range_constexpr(4):
                     wv[8 * c + 2 * j] = _bf16_lo(words[j])
                     wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])

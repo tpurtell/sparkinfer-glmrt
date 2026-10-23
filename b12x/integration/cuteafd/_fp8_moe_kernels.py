@@ -44,7 +44,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as cutlass_utils
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32, const_expr
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32, Uint64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -53,14 +53,16 @@ from cutlass.utils import LayoutEnum
 from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32,
     div_rn_f32,
+    ld_global_nc_v4_u32_l2hint,
     ld_global_v4_u32,
     ld_shared_v2_u32,
     pack_f32x2_to_bfloat2,
     shared_ptr_to_u32,
     st_global_v4_u32,
     st_shared_v4_u32,
+    weight_stream_policy,
 )
-from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached, _ld_stream
+from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached
 
 from ._fp8_weights import _e4m3x4_scaled_bf16x2x2, _e4m3x8_scaled_bf16, _ld_f32
 
@@ -484,10 +486,11 @@ class GroupedFp8Gemv:
             grid=(self.n // self.cols, max_groups, 1), block=(32 * self.warps, 1, 1), stream=stream)
 
     @cute.jit
-    def _load_block(self, dest: cute.Tensor, w_row: Int64, k_off: Int64):
+    def _load_block(self, dest: cute.Tensor, w_row: Int64, k_off: Int64, policy: Uint64):
         for chunk in cutlass.range_constexpr(2):
             for gi in cutlass.range_constexpr(self.groups):
-                words = _ld_stream(w_row + Int64(gi * 8 * self.k) + k_off + Int64(chunk * 64))
+                words = ld_global_nc_v4_u32_l2hint(
+                    w_row + Int64(gi * 8 * self.k) + k_off + Int64(chunk * 64), policy, no_allocate=True)
                 for t in cutlass.range_constexpr(4):
                     dest[(chunk * self.groups + gi) * 4 + t] = words[t]
 
@@ -543,6 +546,8 @@ class GroupedFp8Gemv:
                 n_c = n_e - c * Int32(16 * self.m_tiles)
                 if n_c > Int32(16 * self.m_tiles):
                     n_c = Int32(16 * self.m_tiles)
+                # The last chunk is the final read of this expert's weights.
+                policy = weight_stream_policy((c + Int32(1) == chunks).to(Int32))
                 acc = cute.make_rmem_tensor(cute.make_layout((self.frags,), stride=(1,)), Float32)
                 for i in cutlass.range_constexpr(self.frags):
                     acc[i] = Float32(0.0)
@@ -552,13 +557,13 @@ class GroupedFp8Gemv:
                 nxt = cute.make_rmem_tensor(cute.make_layout((per_block,), stride=(1,)), Uint32)
                 s_cur = Float32(1.0)
                 if const_expr(not self.native_bf16):
-                    self._load_block(cur, w_row, Int64(0))
+                    self._load_block(cur, w_row, Int64(0), policy)
                     s_cur = _ld_f32(s_row)
                 for block in cutlass.range(self.blocks, unroll=1):
                     s_nxt = s_cur
                     if const_expr(not self.native_bf16):
                         if block + 1 < self.blocks:
-                            self._load_block(nxt, w_row, Int64(block + 1) * Int64(128))
+                            self._load_block(nxt, w_row, Int64(block + 1) * Int64(128), policy)
                             s_nxt = _ld_f32(s_row + Int64(block + 1) * Int64(4))
                     for chunk in cutlass.range_constexpr(2):
                         k_off = (Int64(block) * Int64(128) + Int64(chunk * 64)) * Int64(2)
@@ -566,8 +571,8 @@ class GroupedFp8Gemv:
                         for gi in cutlass.range_constexpr(self.groups):
                             if const_expr(self.native_bf16):
                                 weight_at = w_row + Int64(gi * 8 * self.k * 2) + k_off
-                                bf16_lo = _ld_stream(weight_at)
-                                bf16_hi = _ld_stream(weight_at + Int64(16))
+                                bf16_lo = ld_global_nc_v4_u32_l2hint(weight_at, policy, no_allocate=True)
+                                bf16_hi = ld_global_nc_v4_u32_l2hint(weight_at + Int64(16), policy, no_allocate=True)
                                 for t in cutlass.range_constexpr(4):
                                     bw[8 * gi + t] = bf16_lo[t]
                                     bw[8 * gi + 4 + t] = bf16_hi[t]
