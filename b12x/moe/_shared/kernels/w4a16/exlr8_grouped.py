@@ -268,7 +268,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 121
+    CODE_VERSION = 122
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
@@ -980,6 +980,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                 tok = sl // Int32(self.top_k)
                         token[i] = tok
                     bytes_tx = (w0 + w1) * Int32(2048)
+                    last_reader = Int32(1)
+                    if group + Int32(1) < groups:
+                        if group_expert[group + Int32(1)] == expert:
+                            last_reader = Int32(0)
                     for kb in cutlass.range(self.blocks):
                         slot = seq % Int32(stages)
                         _mbar_wait(bar_empty + slot * Int32(8),
@@ -988,14 +992,27 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         full = bar_full + slot * Int32(8)
                         if ptid == Int32(0):
                             _mbar_arrive_expect_tx(full, bytes_tx)
-                            if w0 != Int32(0):
-                                n0 = w0 * Int32(2048)
-                                cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes),
-                                                       pay0 + kb.to(Int64) * n0.to(Int64), n0, full)
-                            if w1 != Int32(0):
-                                n1 = w1 * Int32(2048)
-                                cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes + 8192),
-                                                       pay1 + kb.to(Int64) * n1.to(Int64), n1, full)
+                            if last_reader != Int32(0):
+                                policy = create_l2_evict_first_policy()
+                                if w0 != Int32(0):
+                                    n0 = w0 * Int32(2048)
+                                    cp_async_bulk_g2s_mbar_l2hint(
+                                        stage + Int32(self.fc1_a_bytes),
+                                        pay0 + kb.to(Int64) * n0.to(Int64), n0, full, policy)
+                                if w1 != Int32(0):
+                                    n1 = w1 * Int32(2048)
+                                    cp_async_bulk_g2s_mbar_l2hint(
+                                        stage + Int32(self.fc1_a_bytes + 8192),
+                                        pay1 + kb.to(Int64) * n1.to(Int64), n1, full, policy)
+                            else:
+                                if w0 != Int32(0):
+                                    n0 = w0 * Int32(2048)
+                                    cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes),
+                                                           pay0 + kb.to(Int64) * n0.to(Int64), n0, full)
+                                if w1 != Int32(0):
+                                    n1 = w1 * Int32(2048)
+                                    cp_async_bulk_g2s_mbar(stage + Int32(self.fc1_a_bytes + 8192),
+                                                           pay1 + kb.to(Int64) * n1.to(Int64), n1, full)
                         col_bytes = (kb.to(Int64) * Int64(128) + c.to(Int64) * Int64(8)) * Int64(2)
                         for i in cutlass.range_constexpr(8):
                             r = (ptid >> Int32(4)) + Int32(8 * i)
