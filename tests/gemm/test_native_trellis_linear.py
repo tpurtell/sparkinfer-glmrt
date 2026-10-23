@@ -385,6 +385,28 @@ def test_high_rate_graph_replay_and_frozen_resolution(bits, codebook):
 
 
 @pytest.mark.parametrize("side", [1, 2])
+def test_e4m3_weight_store_on_f16_mma(side):
+    """Narrow-N units keep the exact E4M3 weight store and the F16 MMA.
+
+    The e4m3 codebook's values are small and F16-exact, so decoding through
+    E4M3 and widening in registers reproduces the oracle, and the wide launch
+    matches the narrow one over the rows they share.
+    """
+    assert rows_dispatch(1152, 128, 4) and not a8_rows(1152, 128, 4, "e4m3")
+    c = Case(k=1152, n=128, side=side, bits=4, rows=512, codebook="e4m3")
+    c.launch(64)
+    narrow = c.output[:64].clone()
+    c.output.fill_(float("nan"))
+    c.launch(256)
+    wide = c.output[:256].clone()
+    assert torch.isnan(c.output[256:]).all()
+    ref = c.x[:256].double() @ c.weight.double()
+    assert torch.linalg.vector_norm(wide.double() - ref) <= 2e-3 * torch.linalg.vector_norm(ref)
+    drift = torch.linalg.vector_norm(wide[:64].double() - narrow.double())
+    assert drift <= 2e-5 * torch.linalg.vector_norm(narrow.double())
+
+
+@pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("bits", [5, 6])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
 def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
