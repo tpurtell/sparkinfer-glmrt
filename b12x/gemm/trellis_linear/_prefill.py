@@ -143,15 +143,18 @@ class TrellisPrefillDense:
 
     # ------------------------------------------------------------------ A side
     @cute.jit
-    def _pair(self, x: Int64, kcol: Int32, row: Int32) -> Uint32:
-        """Two F16 activations: one F16-MMA A fragment register."""
-        return ld_global_nc_u32(x + (row.to(Int64) * Int64(self.k) + kcol.to(Int64)) * Int64(2))
+    def _pair(self, xrow: Int64, kcol: Int32) -> Uint32:
+        """Two F16 activations: one F16-MMA A fragment register.
+
+        ``xrow`` is the row's own base address (``x + row*K*2``), hoisted out of
+        the K loop, so each load is one address add plus the load itself.
+        """
+        return ld_global_nc_u32(xrow + kcol.to(Int64) * Int64(2))
 
     @cute.jit
-    def _quad(self, x: Int64, kcol: Int32, row: Int32):
+    def _quad(self, xrow: Int64, kcol: Int32):
         """Four F16 activations: one E4M3-MMA A fragment register before quantizing."""
-        return ld_global_nc_v2_u32(
-            x + (row.to(Int64) * Int64(self.k) + kcol.to(Int64)) * Int64(2))
+        return ld_global_nc_v2_u32(xrow + kcol.to(Int64) * Int64(2))
 
     # -------------------------------------------------------------- weight side
     @cute.jit
@@ -222,6 +225,11 @@ class TrellisPrefillDense:
             row1 = row0 + Int32(8)
             row0c = Int32(cute.arch.fmin(Float32(row0), row_last))
             row1c = Int32(cute.arch.fmin(Float32(row1), row_last))
+            # Per-row A bases: one row-stride multiply per task, not per load.
+            arow0 = x + row0c.to(Int64) * Int64(2 * self.k)
+            arow1 = x + row1c.to(Int64) * Int64(2 * self.k)
+            slane = sbase + lane * Int32(4)
+            slane2 = sbase + lane * Int32(8)
             total = cute.make_rmem_tensor((self.n8, 4), Float32)
             total.fill(Float32(0.0))
             words = cute.make_rmem_tensor((2 * self.n16,), Uint32)
@@ -242,13 +250,13 @@ class TrellisPrefillDense:
                 if cutlass.const_expr(self.mode == "f16"):
                     for k16 in cutlass.range_constexpr(K16_PER_BLOCK):
                         kcol = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
-                        a0 = self._pair(x, kcol, row0c)
-                        a1 = self._pair(x, kcol, row1c)
-                        a2 = self._pair(x, kcol + Int32(8), row0c)
-                        a3 = self._pair(x, kcol + Int32(8), row1c)
+                        a0 = self._pair(arow0, kcol)
+                        a1 = self._pair(arow1, kcol)
+                        a2 = self._pair(arow0, kcol + Int32(8))
+                        a3 = self._pair(arow1, kcol + Int32(8))
                         for i in cutlass.range_constexpr(self.n8):
-                            addr = (sbase + (stage + Int32(k16) * Int32(4 * self.n_cta)
-                                             + Int32(i * 32) + lane) * Int32(4))
+                            addr = slane + (stage + Int32(k16) * Int32(4 * self.n_cta)
+                                            + Int32(i * 32)) * Int32(4)
                             b0, b1 = fp8x4_e4m3_to_half2x2(ld_shared_u32(addr))
                             d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                                 acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3],
@@ -264,10 +272,10 @@ class TrellisPrefillDense:
                     mx1 = Uint32(0)
                     for k32 in cutlass.range_constexpr(4):
                         kcol = kb * Int32(128) + Int32(k32 * 32) + q4
-                        f0, f1 = self._quad(x, kcol, row0c)
-                        f2, f3 = self._quad(x, kcol, row1c)
-                        f4, f5 = self._quad(x, kcol + Int32(16), row0c)
-                        f6, f7 = self._quad(x, kcol + Int32(16), row1c)
+                        f0, f1 = self._quad(arow0, kcol)
+                        f2, f3 = self._quad(arow1, kcol)
+                        f4, f5 = self._quad(arow0, kcol + Int32(16))
+                        f6, f7 = self._quad(arow1, kcol + Int32(16))
                         mx0 = hmax2(mx0, hmax2(hmax2(habs2(f0), habs2(f1)),
                                               hmax2(habs2(f4), habs2(f5))))
                         mx1 = hmax2(mx1, hmax2(hmax2(habs2(f2), habs2(f3)),
@@ -286,17 +294,17 @@ class TrellisPrefillDense:
                     h1 = broadcast_f32_to_half2(s1)
                     for k32 in cutlass.range_constexpr(4):
                         kcol = kb * Int32(128) + Int32(k32 * 32) + q4
-                        f0, f1 = self._quad(x, kcol, row0c)
-                        f2, f3 = self._quad(x, kcol, row1c)
-                        f4, f5 = self._quad(x, kcol + Int32(16), row0c)
-                        f6, f7 = self._quad(x, kcol + Int32(16), row1c)
+                        f0, f1 = self._quad(arow0, kcol)
+                        f2, f3 = self._quad(arow1, kcol)
+                        f4, f5 = self._quad(arow0, kcol + Int32(16))
+                        f6, f7 = self._quad(arow1, kcol + Int32(16))
                         qa0 = _e4m3x4_from_half2x2(half2_mul(f0, h0), half2_mul(f1, h0))
                         qa1 = _e4m3x4_from_half2x2(half2_mul(f2, h1), half2_mul(f3, h1))
                         qa2 = _e4m3x4_from_half2x2(half2_mul(f4, h0), half2_mul(f5, h0))
                         qa3 = _e4m3x4_from_half2x2(half2_mul(f6, h1), half2_mul(f7, h1))
                         for i in cutlass.range_constexpr(self.n8):
-                            addr = (sbase + (stage + Int32(k32) * Int32(8 * self.n_cta)
-                                             + Int32(i * 64) + lane * Int32(2)) * Int32(4))
+                            addr = slane2 + (stage + Int32(k32) * Int32(8 * self.n_cta)
+                                             + Int32(i * 64)) * Int32(4)
                             b0, b1 = ld_shared_v2_u32(addr)
                             d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
                                 acc[i, 0], acc[i, 1], acc[i, 2], acc[i, 3],
