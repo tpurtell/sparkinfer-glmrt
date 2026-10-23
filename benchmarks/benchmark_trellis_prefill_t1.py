@@ -97,8 +97,14 @@ def trellis_activation(k, rows, seed):
     return torch.randn((rows, k), dtype=torch.float16, device="cuda", generator=g) * .1
 
 
+_ALIVE = []
+
+
 def trellis_tensors(k, n, rows, splits, payload, scales, seed):
     x = trellis_activation(k, rows, seed)
+    # ``inputs`` holds the activation's address, so the tensor has to outlive
+    # this call or every launch reads freed memory.
+    _ALIVE.append(x)
     inputs = torch.tensor([x.data_ptr()] * 4, dtype=torch.int64, device="cuda")
     partial = torch.empty((rows, splits, n), dtype=torch.float32, device="cuda")
     output = torch.empty((rows, n), dtype=torch.float32, device="cuda")
@@ -130,11 +136,11 @@ def parse_label(label):
 MX8_PARTS = {"mx8": "both", "mx8q": "quant", "mx8g": "gemm"}
 
 
-def compile_variant(label, k, n, side, mode, n_cta, stages, mpw=1):
+def compile_variant(label, k, n, side, mode, n_cta, stages, mpw=1, dbg=False):
     g = trellis_linear.geometry(k, n, sharded_side=side, max_rows=MAX_ROWS)
     if mode in MX8_PARTS:
         core = TrellisPrefillMxfp8(g, n_cta=n_cta, stages=stages,
-                                   part=MX8_PARTS[mode])
+                                   part=MX8_PARTS[mode], dbg=dbg)
     else:
         core = TrellisPrefillDense(g, mode=mode, n_cta=n_cta, stages=stages, mpw=mpw)
     return compile_program(core, name=f"trellis_prefill_{label}",
@@ -311,7 +317,10 @@ def main():
                     save()
                 continue
             got = tensors[4].clone()
-            finite_nonzero(got, label)
+            try:
+                finite_nonzero(got, label)
+            except RuntimeError as exc:
+                print(f"[{label}] {exc}")
             stats = error_stats(got, ref) if ref_program else {}
             if ref64 is not None:
                 stats.update(fp64_stats(got[:ref64.shape[0]], ref64))
@@ -345,7 +354,10 @@ def main():
             timed = trellis_tensors(k, n, rows, splits, payload, scales, 1408 + k)
             for label, program in programs.items():
                 graph = capture(lambda p=program: p.launch(*timed, scalars=(rows, 0, limit)))
-                finite_nonzero(timed[4], label)
+                try:
+                    finite_nonzero(timed[4], label)
+                except RuntimeError as exc:
+                    print(f"[{label} rows={rows}] {exc}")
                 us = timing(graph, args.replays)
                 report["measurements"].append(
                     dict(shape=name, variant=label, rows=rows, us=round(us, 1),

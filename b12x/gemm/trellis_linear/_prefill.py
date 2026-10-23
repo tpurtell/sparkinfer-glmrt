@@ -329,7 +329,7 @@ class TrellisPrefillDense:
                         kcol = kb * Int32(128) + Int32(k32 * 32) + q4
                         qa = []
                         for b in cutlass.range_constexpr(self.mpw):
-                            q = arow[b] + Int64(8 * self.k)
+                            q = arow[b] + Int64(16 * self.k)
                             hl = hsc[2 * b]
                             hh = hsc[2 * b + 1]
                             f0, f1 = self._quad(arow[b], kcol)
@@ -420,13 +420,14 @@ class TrellisMxfp8Quant:
     carries them with no in-kernel per-block fold.
     """
 
-    def __init__(self, g):
+    def __init__(self, g, *, dbg: bool = False):
         self.k = g["input_features"]
         self.bits = g["bits"]
         if self.k % 128:
             raise ValueError("MXFP8 records need K a multiple of 128")
         self.nk32 = self.k // 32
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
+        self.dbg = dbg
 
     @cute.kernel
     def quantize(self, inputs: cute.Tensor, records: cute.Tensor,
@@ -481,6 +482,11 @@ class TrellisMxfp8Quant:
             row_lo = (lane >> Int32(2)).to(Int64)
             st_global_u8(rec + Int64(512) + row_lo, Uint8(code0))
             st_global_u8(rec + Int64(520) + row_lo, Uint8(code1))
+            if cutlass.const_expr(self.dbg):
+                if (lane & Int32(3)) == Int32(0):
+                    dbase = (rbase + total.to(Int64) * Int64(MX8_REC)
+                             + (rb * Int32(self.nk32) + s).to(Int64) * Int64(64))
+                    st_global_v2_f32(dbase + row_lo * Int64(8), m0, m1)
             task += stride
 
     @cute.jit
@@ -517,7 +523,7 @@ class TrellisPrefillMxfp8:
     ABI_VERSION = 1
 
     def __init__(self, g, *, n_cta: int = 64, stages: int = 2,
-                 part: str = "both"):
+                 part: str = "both", dbg: bool = False):
         self.k, self.n = g["input_features"], g["output_features"]
         self.bits = g["bits"]
         if self.bits != 4:
@@ -536,7 +542,7 @@ class TrellisPrefillMxfp8:
         self.nk32 = self.k // 32
         self.n16 = n_cta // 16
         self.n8w = n_cta // 8
-        self.quant = TrellisMxfp8Quant(g)
+        self.quant = TrellisMxfp8Quant(g, dbg=dbg)
 
     def _storage(self):
         # E4M3 B tile: stages x n_cta rows of 128 k-bytes.
