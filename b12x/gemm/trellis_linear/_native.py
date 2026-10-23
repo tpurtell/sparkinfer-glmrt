@@ -108,6 +108,11 @@ ROWS_PRODUCER_REGS = 88
 ROWS_CONSUMER_REGS = 208
 
 
+def rows_dispatch(k: int, n: int, bits: int) -> bool:
+    """True when 128+ row launches take the many-row prefill schedule."""
+    return k % 128 == 0 and n % 128 == 0 and bits in (4, 5, 6)
+
+
 @dsl_user_op
 def e4m3_pair_bytes(value: Uint32, *, loc=None, ip=None) -> Uint32:
     """Round one f16x2 pair to two E4M3 bytes in the low half of a u32."""
@@ -233,8 +238,7 @@ class NativeTrellisLinear:
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         self.splits = g["splits"]
         # Many-row path: full-K 128-row CTA tiles with decode-once weights.
-        self.rows_ok = (self.k % 128 == 0 and self.n % 128 == 0
-                        and self.bits in (4, 5, 6))
+        self.rows_ok = rows_dispatch(self.k, self.n, self.bits)
         self.w_e4m3 = bool(self.e4m3)
         self.rows_fp8 = bool(self.e4m3 and self.FP8_MMA and self.n >= 256)
         self.rows_setmaxnreg = bool(self.ROWS_SETMAXNREG)
