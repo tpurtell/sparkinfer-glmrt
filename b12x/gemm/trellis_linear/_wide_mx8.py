@@ -40,6 +40,24 @@ def _pack_half2(lo: Uint32, hi: Uint32, *, loc=None, ip=None):
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 
+@dsl_user_op
+def _mma_scaled(a0, a1, a2, a3, b0, b1, sa, scale, c0, c1, c2, c3, *, loc=None, ip=None):
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Uint32(v).ir_value(loc=loc, ip=ip) for v in (a0, a1, a2, a3, b0, b1, sa)]
+        + [Float32(v).ir_value(loc=loc, ip=ip) for v in (scale, c0, c1, c2, c3)],
+        "{ .reg .f32 p0,p1,p2,p3; .reg .b32 unit; .reg .b16 zero; "
+        "mov.b32 unit,127; mov.b16 zero,0; "
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+        "{p0,p1,p2,p3}, {$4,$5,$6,$7}, {$8,$9}, {0f00000000,0f00000000,0f00000000,0f00000000}, "
+        "{$10}, {zero,zero}, {unit}, {zero,zero}; "
+        "fma.rn.f32 $0,p0,$11,$0; fma.rn.f32 $1,p1,$11,$1; "
+        "fma.rn.f32 $2,p2,$11,$2; fma.rn.f32 $3,p3,$11,$3; }",
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,f,0,1,2,3",
+        has_side_effects=False,is_align_stack=False,asm_dialect=llvm.AsmDialect.AD_ATT,loc=loc,ip=ip)
+    return tuple(Float32(llvm.extractvalue(T.f32(),result,[i],loc=loc,ip=ip)) for i in range(4))
+
+
 class WideTrellisMxfp8:
     """Two launches, fixed geometry, no materialized weight copy or live-row key."""
 
@@ -212,13 +230,9 @@ class WideTrellisMxfp8:
                         a0, a1, a2, a3 = ld_shared_v4_u32(rec + lane * Int32(16))
                         sfa = Uint32(ld_shared_u8(rec + Int32(512) + (lane >> Int32(2)) + (lane & Int32(1)) * Int32(8)))
                         for n in cutlass.range_constexpr(4):
-                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                                Float32(0), Float32(0), Float32(0), Float32(0),
-                                a0, a1, a2, a3, bf[n * 2], bf[n * 2 + 1], sfa, Uint32(127))
-                            acc[m, n, 0] = _fma(d0, scale, acc[m, n, 0])
-                            acc[m, n, 1] = _fma(d1, scale, acc[m, n, 1])
-                            acc[m, n, 2] = _fma(d2, scale, acc[m, n, 2])
-                            acc[m, n, 3] = _fma(d3, scale, acc[m, n, 3])
+                            acc[m,n,0], acc[m,n,1], acc[m,n,2], acc[m,n,3] = _mma_scaled(
+                                a0,a1,a2,a3,bf[n*2],bf[n*2+1],sfa,scale,
+                                acc[m,n,0],acc[m,n,1],acc[m,n,2],acc[m,n,3])
             cute.arch.cp_async_wait_group(0)
             for m in cutlass.range_constexpr(4):
                 row = (rb0 + wm * Int32(4) + Int32(m)) * Int32(16) + (lane >> Int32(2))

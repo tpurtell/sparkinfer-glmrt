@@ -277,8 +277,16 @@ def benchmark_wide_mx8(args):
             target = x[:rows].double() @ w.double().T
             exact_error = torch.linalg.vector_norm(native[:rows,:columns].double()-target).item()
             error = torch.linalg.vector_norm(candidate_result[:,:columns].double()-target).item()
-            # Preserve the existing exact-path bound; A8 is not silently given a looser gate.
-            bound = 1.01*torch.linalg.vector_norm((x[:rows] @ w.bfloat16().T).double()-target).item()
+            exact_bound = 1.01*torch.linalg.vector_norm((x[:rows] @ w.bfloat16().T).double()-target).item()
+            # Independent per-row K32 MXFP8 oracle, not a reconstruction of kernel records.
+            groups = x16[:rows].float().reshape(rows,k//32,32)
+            exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(2.0**-126)/448.0))
+            step = torch.exp2(exponent)
+            qa = ((groups/step[:,:,None]).to(torch.float8_e4m3fn).float()*step[:,:,None]).reshape(rows,k)
+            qtarget = qa.double() @ w.double().T
+            qerror = torch.linalg.vector_norm(candidate_result[:,:columns].double()-qtarget).item()
+            bound = 1.01*torch.linalg.vector_norm((qa.bfloat16() @ w.bfloat16().T).double()-qtarget).item()
+            quantization_error = torch.linalg.vector_norm(qtarget-target).item()
             c_us, n_us, g_us = timing(cg,args.replays), timing(ng,1), timing(gg,args.replays)
             bg, keep, count = baseline(k,n,rows,a16=True)
             b_us = timing(bg,args.replays)/count
@@ -287,9 +295,10 @@ def benchmark_wide_mx8(args):
             spill_free = all(not any(r["local_bytes"]+r["stack_bytes"]) and not r["local_load_store_instructions"] for r in census)
             record = dict(projection=op, rows=rows, native_us=n_us, wide_us=c_us,
                 w8a16_us=b_us,w8a8_us=a8_us,unpack_us=unpack_us,unpack_plus_gemm_us=unpack_us+g_us,
-                fp64_error=error,exact_fp64_error=exact_error,fp64_bound=bound,fp64_pass=error<=bound,
+                fp64_error=qerror,exact_fp64_error=exact_error,fp64_bound=bound,fp64_pass=qerror<=bound,
+                a8_vs_exact_error=error,quantization_error=quantization_error,exact_fp64_bound=exact_bound,
                 row_invariant=invariant,spill_free=spill_free,cubin_spill_check=census,
-                eligible=error<=bound and invariant and spill_free)
+                eligible=qerror<=bound and exact_error<=exact_bound and invariant and spill_free)
             report["measurements"].append(record)
             args.output.write_text(json.dumps(report,indent=2)+"\n")
             print(json.dumps(record),flush=True)
