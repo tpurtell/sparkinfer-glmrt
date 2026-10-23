@@ -46,8 +46,8 @@ from .mixed_trellis_ws import (
 
 _FC1_CONSUMER_THREADS = 256
 _FC1_PRODUCER_THREADS = 128
-_FC1_PRODUCER_REGS = 88
-_FC1_CONSUMER_REGS = 208
+_FC1_PRODUCER_REGS = 72
+_FC1_CONSUMER_REGS = 216
 _FC1_A_STAGES = 2
 _FC1_B_STAGES = 2
 _FC1_TILE_STAGES = 2
@@ -1087,9 +1087,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         _mbar_arrive(bar_t_full + hslot * Int32(8))
 
     @cute.jit
-    def fc1_ws_n16_width(self, acc: cute.Tensor, a_base: Int32, b_base: Int32,
-                         lane: Int32, n16: Int32, width: cutlass.Constexpr,
-                         active: cutlass.Constexpr):
+    def fc1_ws_n16_width(self, plane: cute.Tensor, a_base: Int32, b_base: Int32,
+                         c_base: Int32, tid: Int32, lane: Int32, n16: Int32,
+                         width: cutlass.Constexpr, packed_scale: Uint32,
+                         active: cutlass.Constexpr, to_smem: cutlass.Constexpr):
+        acc = cute.make_rmem_tensor((active, 8), Float32)
+        acc.fill(Float32(0.0))
         r_m = lane & Int32(15)
         c_half = lane >> Int32(4)
         smem_b_a = Int32(0)
@@ -1132,18 +1135,44 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     acc[idx, 4], acc[idx, 5], acc[idx, 6], acc[idx, 7],
                     a0, a1, a2, a3, b2, b3)
                 acc[idx, 4], acc[idx, 5], acc[idx, 6], acc[idx, 7] = d4, d5, d6, d7
+        scale, _ = half2_to_float2_scaled(packed_scale, Float32(1.0))
+        if cutlass.const_expr(not to_smem):
+            for idx in cutlass.range_constexpr(active):
+                for v in cutlass.range_constexpr(8):
+                    plane[idx, v] = fma_rn_f32(acc[idx, v], scale, plane[idx, v])
+        else:
+            for idx in cutlass.range_constexpr(active):
+                c_lo = c_base + Int32(idx * 8192) + tid * Int32(16)
+                c_hi = c_lo + Int32(4096)
+                t0, t1, t2, t3 = ld_shared_v4_f32(c_lo)
+                t4, t5, t6, t7 = ld_shared_v4_f32(c_hi)
+                st_shared_v4_f32(
+                    c_lo,
+                    fma_rn_f32(acc[idx, 0], scale, t0),
+                    fma_rn_f32(acc[idx, 1], scale, t1),
+                    fma_rn_f32(acc[idx, 2], scale, t2),
+                    fma_rn_f32(acc[idx, 3], scale, t3))
+                st_shared_v4_f32(
+                    c_hi,
+                    fma_rn_f32(acc[idx, 4], scale, t4),
+                    fma_rn_f32(acc[idx, 5], scale, t5),
+                    fma_rn_f32(acc[idx, 6], scale, t6),
+                    fma_rn_f32(acc[idx, 7], scale, t7))
 
     @cute.jit
-    def fc1_ws_n16_dot(self, acc: cute.Tensor, a_base: Int32, b_base: Int32,
-                       lane: Int32, n16: Int32, width: Int32,
-                       active: cutlass.Constexpr):
-        acc.fill(Float32(0.0))
+    def fc1_ws_n16_dot(self, plane: cute.Tensor, a_base: Int32, b_base: Int32,
+                       c_base: Int32, tid: Int32, lane: Int32, n16: Int32,
+                       width: Int32, packed_scale: Uint32,
+                       active: cutlass.Constexpr, to_smem: cutlass.Constexpr):
         if width == Int32(4):
-            self.fc1_ws_n16_width(acc, a_base, b_base, lane, n16, 4, active)
+            self.fc1_ws_n16_width(plane, a_base, b_base, c_base, tid, lane, n16, 4,
+                                  packed_scale, active, to_smem)
         elif width == Int32(3):
-            self.fc1_ws_n16_width(acc, a_base, b_base, lane, n16, 3, active)
+            self.fc1_ws_n16_width(plane, a_base, b_base, c_base, tid, lane, n16, 3,
+                                  packed_scale, active, to_smem)
         elif width == Int32(2):
-            self.fc1_ws_n16_width(acc, a_base, b_base, lane, n16, 2, active)
+            self.fc1_ws_n16_width(plane, a_base, b_base, c_base, tid, lane, n16, 2,
+                                  packed_scale, active, to_smem)
 
     @cute.jit
     def fc1_ws_fold_n16(self, plane: cute.Tensor, out_base_j: Int64, live: Int32,
@@ -1167,9 +1196,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             st_global_v2_f32(addr, g0 + e0, g1 + e1)
 
     @cute.jit
-    def fc1_ws_tile(self, ring: Int32, hdr: Int32, a_seq: Int32, b_seq: Int32,
-                    tid: Int32, lane: Int32, cw: Int32, fc1_addr: Int64,
-                    active: cutlass.Constexpr):
+    def fc1_ws_tile(self, total0_0: cute.Tensor, total0_1: cute.Tensor,
+                    total1_0: cute.Tensor, total1_1: cute.Tensor,
+                    total2_0: cute.Tensor, ring: Int32, hdr: Int32,
+                    a_seq: Int32, b_seq: Int32, tid: Int32, lane: Int32,
+                    cw: Int32, fc1_addr: Int64, active: cutlass.Constexpr):
         ring_a = ring
         ring_b = ring + Int32(self.fc1_b_off)
         c_base = ring + Int32(self.fc1_c_off)
@@ -1184,12 +1215,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         w1 = ld_shared_i32_relaxed(hdr + Int32(32) + proj * Int32(4))
         w2 = ld_shared_i32_relaxed(hdr + Int32(40) + proj * Int32(4))
         scale_base0 = hdr + Int32(4 * _FC1_HEADER_WORDS) + proj * Int32(2 * self.blocks)
-        total0_0 = cute.make_rmem_tensor((active, 8), Float32)
-        total0_1 = cute.make_rmem_tensor((active, 8), Float32)
-        total1_0 = cute.make_rmem_tensor((active, 8), Float32)
-        total1_1 = cute.make_rmem_tensor((active, 8), Float32)
-        total2_0 = cute.make_rmem_tensor((active, 8), Float32)
-        acc = cute.make_rmem_tensor((active, 8), Float32)
         for split in cutlass.range(self.splits):
             if w0 != Int32(0):
                 total0_0.fill(Float32(0.0))
@@ -1199,6 +1224,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 total1_1.fill(Float32(0.0))
             if u_cnt >= Int32(3) and w2 != Int32(0):
                 total2_0.fill(Float32(0.0))
+                for idx in cutlass.range_constexpr(active):
+                    c_lo = c_base + Int32(idx * 8192) + tid * Int32(16)
+                    st_shared_v4_f32(c_lo, Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0))
+                    st_shared_v4_f32(c_lo + Int32(4096), Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0))
             for block in cutlass.range(8):
                 kb = split * Int32(8) + block
                 if kb < Int32(self.blocks):
@@ -1213,15 +1242,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     if w0 != Int32(0):
                         b_stage0 = ring_b + b_slot0 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
                         sc0 = ld_shared_u16_relaxed(scale_base0 + kb * Int32(2))
-                        scale0, _ = half2_to_float2_scaled(sc0, Float32(1.0))
-                        self.fc1_ws_n16_dot(acc, a_stage, b_stage0, lane, n16_0, w0, active)
-                        for idx in cutlass.range_constexpr(active):
-                            for v in cutlass.range_constexpr(8):
-                                total0_0[idx, v] = fma_rn_f32(acc[idx, v], scale0, total0_0[idx, v])
-                        self.fc1_ws_n16_dot(acc, a_stage, b_stage0, lane, n16_0 + Int32(1), w0, active)
-                        for idx in cutlass.range_constexpr(active):
-                            for v in cutlass.range_constexpr(8):
-                                total0_1[idx, v] = fma_rn_f32(acc[idx, v], scale0, total0_1[idx, v])
+                        self.fc1_ws_n16_dot(total0_0, a_stage, b_stage0, c_base, tid, lane,
+                                            n16_0, w0, sc0, active, False)
+                        self.fc1_ws_n16_dot(total0_1, a_stage, b_stage0, c_base, tid, lane,
+                                            n16_0 + Int32(1), w0, sc0, active, False)
                     _mbar_arrive(bar_b_empty + b_slot0 * Int32(8))
                     b_seq += Int32(1)
                     # Unit 1
@@ -1232,15 +1256,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         if w1 != Int32(0):
                             b_stage1 = ring_b + b_slot1 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
                             sc1 = ld_shared_u16_relaxed(scale_base0 + Int32(4 * self.blocks) + kb * Int32(2))
-                            scale1, _ = half2_to_float2_scaled(sc1, Float32(1.0))
-                            self.fc1_ws_n16_dot(acc, a_stage, b_stage1, lane, n16_0, w1, active)
-                            for idx in cutlass.range_constexpr(active):
-                                for v in cutlass.range_constexpr(8):
-                                    total1_0[idx, v] = fma_rn_f32(acc[idx, v], scale1, total1_0[idx, v])
-                            self.fc1_ws_n16_dot(acc, a_stage, b_stage1, lane, n16_0 + Int32(1), w1, active)
-                            for idx in cutlass.range_constexpr(active):
-                                for v in cutlass.range_constexpr(8):
-                                    total1_1[idx, v] = fma_rn_f32(acc[idx, v], scale1, total1_1[idx, v])
+                            self.fc1_ws_n16_dot(total1_0, a_stage, b_stage1, c_base, tid, lane,
+                                                n16_0, w1, sc1, active, False)
+                            self.fc1_ws_n16_dot(total1_1, a_stage, b_stage1, c_base, tid, lane,
+                                                n16_0 + Int32(1), w1, sc1, active, False)
                         _mbar_arrive(bar_b_empty + b_slot1 * Int32(8))
                         b_seq += Int32(1)
                     # Unit 2
@@ -1251,43 +1270,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         if w2 != Int32(0):
                             b_stage2 = ring_b + b_slot2 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
                             sc2 = ld_shared_u16_relaxed(scale_base0 + Int32(8 * self.blocks) + kb * Int32(2))
-                            scale2, _ = half2_to_float2_scaled(sc2, Float32(1.0))
-                            self.fc1_ws_n16_dot(acc, a_stage, b_stage2, lane, n16_0, w2, active)
-                            for idx in cutlass.range_constexpr(active):
-                                for v in cutlass.range_constexpr(8):
-                                    total2_0[idx, v] = fma_rn_f32(acc[idx, v], scale2, total2_0[idx, v])
-                            self.fc1_ws_n16_dot(acc, a_stage, b_stage2, lane, n16_0 + Int32(1), w2, active)
-                            for idx in cutlass.range_constexpr(active):
-                                c_lo = c_base + Int32(idx * 8192) + tid * Int32(16)
-                                c_hi = c_lo + Int32(4096)
-                                if block == Int32(0):
-                                    st_shared_v4_f32(
-                                        c_lo,
-                                        fma_rn_f32(acc[idx, 0], scale2, Float32(0.0)),
-                                        fma_rn_f32(acc[idx, 1], scale2, Float32(0.0)),
-                                        fma_rn_f32(acc[idx, 2], scale2, Float32(0.0)),
-                                        fma_rn_f32(acc[idx, 3], scale2, Float32(0.0)))
-                                    st_shared_v4_f32(
-                                        c_hi,
-                                        fma_rn_f32(acc[idx, 4], scale2, Float32(0.0)),
-                                        fma_rn_f32(acc[idx, 5], scale2, Float32(0.0)),
-                                        fma_rn_f32(acc[idx, 6], scale2, Float32(0.0)),
-                                        fma_rn_f32(acc[idx, 7], scale2, Float32(0.0)))
-                                else:
-                                    t0, t1, t2, t3 = ld_shared_v4_f32(c_lo)
-                                    t4, t5, t6, t7 = ld_shared_v4_f32(c_hi)
-                                    st_shared_v4_f32(
-                                        c_lo,
-                                        fma_rn_f32(acc[idx, 0], scale2, t0),
-                                        fma_rn_f32(acc[idx, 1], scale2, t1),
-                                        fma_rn_f32(acc[idx, 2], scale2, t2),
-                                        fma_rn_f32(acc[idx, 3], scale2, t3))
-                                    st_shared_v4_f32(
-                                        c_hi,
-                                        fma_rn_f32(acc[idx, 4], scale2, t4),
-                                        fma_rn_f32(acc[idx, 5], scale2, t5),
-                                        fma_rn_f32(acc[idx, 6], scale2, t6),
-                                        fma_rn_f32(acc[idx, 7], scale2, t7))
+                            self.fc1_ws_n16_dot(total2_0, a_stage, b_stage2, c_base, tid, lane,
+                                                n16_0, w2, sc2, active, False)
+                            self.fc1_ws_n16_dot(total2_0, a_stage, b_stage2, c_base, tid, lane,
+                                                n16_0 + Int32(1), w2, sc2, active, True)
                         _mbar_arrive(bar_b_empty + b_slot2 * Int32(8))
                         b_seq += Int32(1)
                     _mbar_arrive(bar_a_empty + a_slot * Int32(8))
@@ -1316,9 +1302,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     c_hi = c_lo + Int32(4096)
                     t0, t1, t2, t3 = ld_shared_v4_f32(c_lo)
                     t4, t5, t6, t7 = ld_shared_v4_f32(c_hi)
-                    acc[idx, 0], acc[idx, 1], acc[idx, 2], acc[idx, 3] = t0, t1, t2, t3
-                    acc[idx, 4], acc[idx, 5], acc[idx, 6], acc[idx, 7] = t4, t5, t6, t7
-                self.fc1_ws_fold_n16(acc, out_base2 + Int64(64), live, v_lo, v_hi, lane, split, active)
+                    total2_0[idx, 0], total2_0[idx, 1], total2_0[idx, 2], total2_0[idx, 3] = t0, t1, t2, t3
+                    total2_0[idx, 4], total2_0[idx, 5], total2_0[idx, 6], total2_0[idx, 7] = t4, t5, t6, t7
+                self.fc1_ws_fold_n16(total2_0, out_base2 + Int64(64), live, v_lo, v_hi, lane, split, active)
         return a_seq, b_seq
 
     @cute.kernel
@@ -1370,6 +1356,11 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             lane, cw = tid & Int32(31), tid >> Int32(5)
             fc1_addr = fc1.iterator.toint()
             hdr_base = ring + Int32(self.fc1_hdr_off)
+            total0_0 = cute.make_rmem_tensor((4, 8), Float32)
+            total0_1 = cute.make_rmem_tensor((4, 8), Float32)
+            total1_0 = cute.make_rmem_tensor((4, 8), Float32)
+            total1_1 = cute.make_rmem_tensor((4, 8), Float32)
+            total2_0 = cute.make_rmem_tensor((4, 8), Float32)
             a_seq = Int32(0)
             b_seq = Int32(0)
             ti = Int32(0)
@@ -1385,6 +1376,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     for active in cutlass.range_constexpr(1, self.mtiles + 1):
                         if num_live == Int32(active):
                             a_seq, b_seq = self.fc1_ws_tile(
+                                total0_0, total0_1, total1_0, total1_1, total2_0,
                                 ring, hdr, a_seq, b_seq, tid, lane, cw, fc1_addr, active)
                     _mbar_arrive(bar_t_empty + hslot * Int32(8))
                     ti += Int32(1)
