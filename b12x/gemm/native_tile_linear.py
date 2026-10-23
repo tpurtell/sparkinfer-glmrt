@@ -11,9 +11,10 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32, cp_async4_shared_global_pred, cp_async_u32_shared_global,
-    ld_global_nc_u32, ld_global_nc_v2_u32, ld_global_v2_u32, ld_shared_u32, ld_shared_v2_u32,
-    ld_shared_v4_u32, shared_ptr_to_u32, st_global_v2_f32, u32_as_f32,
-    ldmatrix_m8n8x4_b16, ldmatrix_m8n8x2_b16,
+    cvt_bf16x2x2_to_e4m3x4, ld_global_nc_u32, ld_global_nc_v2_u32, ld_global_v2_u32,
+    ld_global_v4_u32, ld_shared_u32, ld_shared_v2_u32, ld_shared_v4_u32, max_abs_32,
+    mxfp8_mma_m16n8k32_f32_e4m3, quantize_block_fp8_mx, shared_ptr_to_u32, st_global_v2_f32,
+    st_shared_u8, u32_as_f32, ldmatrix_m8n8x4_b16, ldmatrix_m8n8x2_b16,
 )
 from b12x.gemm.bf16_gemv._skinny import _ld_cached, _ld_stream
 
@@ -260,6 +261,26 @@ class NativeTileLinear:
         self.s_bytes = self.bn * 4 if self.grouped else 0
         self.stage_bytes = self.a_bytes + self.w_bytes + self.s_bytes
         self.prefill_threads = 32 * self.wm * self.wn
+        # FP8 prefill core (grouped encodings): E4M3 weights feed the block-scaled MMA
+        # with their own per-32 scales and the BF16 activations quantize to E4M3 on
+        # chip, so neither format needs an unpack buffer. One warp owns 32 columns and
+        # MT m16 row blocks; one thread quantizes one activation 32-group per K chunk.
+        self.pf_bn = 128                             # output columns of one FP8 tile
+        self.pf_wm, self.pf_wn = 4, 4                # warps down the rows, across the columns
+        self.pf_mt = self.bm // self.pf_wm // 16     # m16 row blocks per warp
+        self.pf_ng = 4                               # n8 column tiles per warp
+        self.pf_stages = 4
+        self.pf_a8 = self.bm * 128                   # E4M3 activations: rows x 128 K
+        self.pf_as = self.bm * 4                     # one UE8M0 byte per (row, 32-K group)
+        self.pf_w8 = self.pf_bn * 128                # E4M3 weights: columns x 128 K
+        self.pf_ws = self.pf_bn * (8 if self.int4 else 4)
+        self.pf_stage = self.pf_a8 + self.pf_as + self.pf_w8 + self.pf_ws
+        self.pf_tiles = (self.n + self.pf_bn - 1) // self.pf_bn
+        if self.grouped:
+            if 32 * self.pf_wm * self.pf_wn != self.bm * 4:
+                raise ValueError("FP8 tile needs one activation 32-group per thread")
+            self.prefill_threads = 32 * self.pf_wm * self.pf_wn
+            self.n_tiles = self.pf_tiles
         self.wpb = 8 * self.groups if not self.int4 else 4 * self.groups
         self.spb = (2 if self.int4 else 1) * 2 * self.groups if self.grouped else 1
         self.decode_ctas = (self.n // self.cols + self.slots - 1) // self.slots
@@ -289,7 +310,7 @@ class NativeTileLinear:
                 if cutlass.const_expr(self.grouped):
                     self.prefill(x, payload, scales, output, rows).launch(
                         grid=(min(tiles, cta_limit), 1, 1), block=(self.prefill_threads, 1, 1),
-                        stream=stream, min_blocks_per_mp=2)
+                        stream=stream, min_blocks_per_mp=2 if self.prefill_threads <= 256 else 1)
                 else:
                     self.prefill_row(x, payload, scales, output, rows).launch(
                         grid=(min(tiles, cta_limit), 1, 1), block=(self.prefill_threads, 1, 1),
@@ -565,37 +586,10 @@ class NativeTileLinear:
         class Storage:
             pass
         Storage.__annotations__ = {
-            "buf": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, self.stages * self.stage_bytes], 128],
-            "wide": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, self.bn * 128 if self.grouped else 16], 128],
+            "buf": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, self.pf_stages * self.pf_stage], 128],
         }
         return cute.struct(Storage)
-
-    @cute.jit
-    def _widen_stage(self, sw: Int32, wide: Int32, tid: Int32):
-        """Widen the staged W tile once per CTA into BF16 ``wide`` ([col][64 k], 16-byte
-        units XOR-swizzled by col & 7)."""
-        units = self.bn * 8                        # 16-byte BF16 units (8 k each)
-        n_iter = (units + self.prefill_threads - 1) // self.prefill_threads
-        col0 = tid >> Int32(3)
-        c = tid & Int32(7)
-        sw_off = col0 * Int32(32 if self.int4 else 64) + c * Int32(4 if self.int4 else 8)
-        wide_off = col0 * Int32(128) + ((c ^ (col0 & Int32(7))) << Int32(4))
-        if cutlass.const_expr(self.int4):
-            words = cute.make_rmem_tensor((n_iter,), Uint32)
-            for i in cutlass.range_constexpr(n_iter):
-                words[i] = ld_shared_u32(sw + sw_off + Int32(i * 32 * 32))
-            for i in cutlass.range_constexpr(n_iter):
-                b0, b1, b2, b3 = _int4x8_bf16(words[i])
-                _st_shared_v4(wide + wide_off + Int32(i * 32 * 128), b0, b1, b2, b3)
-        else:
-            w0s = cute.make_rmem_tensor((n_iter,), Uint32)
-            w1s = cute.make_rmem_tensor((n_iter,), Uint32)
-            for i in cutlass.range_constexpr(n_iter):
-                w0s[i], w1s[i] = ld_shared_v2_u32(sw + sw_off + Int32(i * 32 * 64))
-            for i in cutlass.range_constexpr(n_iter):
-                b0, b1 = _e4m3x4_bf16(w0s[i])
-                b2, b3 = _e4m3x4_bf16(w1s[i])
-                _st_shared_v4(wide + wide_off + Int32(i * 32 * 128), b0, b1, b2, b3)
 
     @cute.jit
     def _issue(self, base: Int32, x: cute.Tensor, payload: cute.Tensor, scales: cute.Tensor,
@@ -644,6 +638,112 @@ class NativeTileLinear:
                         src = src + (kc & Int32(1)).to(Int64) * Int64(4)
                     cp_async_u32_shared_global(ss + tid * Int32(4), src)
 
+    @cute.jit
+    def _load_a_raw(self, raw: cute.Tensor, x: cute.Tensor, rows: Int32, m0: Int32,
+                    kc: Int32, tid: Int32):
+        """This thread's 32-value activation group of a 128-wide K chunk as BF16 pairs:
+        thread -> (row tid >> 2, 32-K group tid & 3), one row per four threads."""
+        r = tid >> Int32(2)
+        gq = tid & Int32(3)
+        if m0 + r < rows:
+            src = x.iterator.toint() + (
+                (m0 + r).to(Int64) * Int64(self.k)
+                + (kc.to(Int64) * Int64(128) + (gq * Int32(32)).to(Int64))) * Int64(2)
+            for q in cutlass.range_constexpr(4):
+                raw[4 * q], raw[4 * q + 1], raw[4 * q + 2], raw[4 * q + 3] = ld_global_v4_u32(src + Int64(q * 16))
+        else:
+            for q in cutlass.range_constexpr(16):
+                raw[q] = Uint32(0)
+
+    @cute.jit
+    def _store_a8(self, base: Int32, raw: cute.Tensor, stage: Int32, tid: Int32):
+        """Quantize that group to E4M3 with a UE8M0 per-32 scale (``quantize_block_fp8_mx``)
+        and stage it: 32 payload bytes as two 16-byte units XOR-swizzled by row & 7, then
+        the scale byte.  Only the range is scaled, so the payload keeps its own exponent."""
+        sa = base + stage * Int32(self.pf_stage)
+        r = tid >> Int32(2)
+        gq = tid & Int32(3)
+        values = cute.make_rmem_tensor((32,), Float32)
+        for q in cutlass.range_constexpr(16):
+            values[2 * q] = u32_as_f32(raw[q] << Int32(16))
+            values[2 * q + 1] = u32_as_f32(raw[q] & Uint32(0xFFFF0000))
+        payload, scale_byte = quantize_block_fp8_mx(values, max_abs_32(values))
+        for h in cutlass.range_constexpr(2):
+            unit = gq * Int32(2) + Int32(h)
+            _st_shared_v4(sa + r * Int32(128) + ((unit ^ (r & Int32(7))) << Int32(4)),
+                          payload[4 * h], payload[4 * h + 1], payload[4 * h + 2], payload[4 * h + 3])
+        st_shared_u8(sa + Int32(self.pf_a8) + r * Int32(4) + gq, cutlass.Uint8(scale_byte & Uint32(0xFF)))
+
+    @cute.jit
+    def _load_w_raw(self, wraw: cute.Tensor, payload: cute.Tensor, n0: Int32, kc: Int32,
+                    tid: Int32):
+        """int4: this thread's 32 codes of one 128-wide K chunk (16 bytes = 8 units)."""
+        col = tid >> Int32(2)
+        unit = tid & Int32(3)
+        if cutlass.const_expr(self.n % self.pf_bn == 0):
+            gcol = n0 + col
+        else:
+            gcol = Int32(0)
+            if n0 + col < Int32(self.n):
+                gcol = n0 + col
+        src = self._w_addr(payload, gcol, kc * Int32(128) + unit * Int32(32))
+        wraw[0], wraw[1], wraw[2], wraw[3] = ld_global_v4_u32(src)
+
+    @cute.jit
+    def _store_w8(self, base: Int32, wraw: cute.Tensor, stage: Int32, tid: Int32):
+        """int4: widen the 4-bit codes to E4M3 in registers (code - 8 is exact in E4M3)
+        and stage 32 bytes as two swizzled 16-byte units; never a global buffer."""
+        sw = base + stage * Int32(self.pf_stage) + Int32(self.pf_a8 + self.pf_as)
+        col = tid >> Int32(2)
+        unit = tid & Int32(3)
+        for h in cutlass.range_constexpr(2):
+            b0, b1, b2, b3 = _int4x8_bf16(wraw[2 * h])
+            b4, b5, b6, b7 = _int4x8_bf16(wraw[2 * h + 1])
+            u = unit * Int32(2) + Int32(h)
+            _st_shared_v4(sw + col * Int32(128) + ((u ^ (col & Int32(7))) << Int32(4)),
+                          cvt_bf16x2x2_to_e4m3x4(b0, b1), cvt_bf16x2x2_to_e4m3x4(b2, b3),
+                          cvt_bf16x2x2_to_e4m3x4(b4, b5), cvt_bf16x2x2_to_e4m3x4(b6, b7))
+
+    @cute.jit
+    def _issue_w(self, base: Int32, payload: cute.Tensor, scales: cute.Tensor, n0: Int32,
+                 kc: Int32, stage: Int32, tid: Int32):
+        """MXFP8: cp.async the E4M3 W tile of one 128-wide K chunk (16-byte units XOR-swizzled
+        by column & 7) plus its per-column, per-32 E8M0 scale word."""
+        sw = base + stage * Int32(self.pf_stage) + Int32(self.pf_a8 + self.pf_as)
+        ws = sw + Int32(self.pf_w8)
+        for i in cutlass.range_constexpr((self.pf_bn * 8 + self.prefill_threads - 1) // self.prefill_threads):
+            u = Int32(i * self.prefill_threads) + tid
+            col, chunk = u >> Int32(3), u & Int32(7)
+            src = self._w_addr(payload, n0 + col, kc * Int32(128) + chunk * Int32(16))
+            if cutlass.const_expr(self.n % self.pf_bn == 0):
+                cp_async4_shared_global_pred(sw + col * Int32(128) + ((chunk ^ (col & Int32(7))) << Int32(4)),
+                                             src, Int32(1))
+            else:
+                pred = Int32(0)
+                if n0 + col < Int32(self.n):
+                    pred = Int32(1)
+                cp_async4_shared_global_pred(sw + col * Int32(128) + ((chunk ^ (col & Int32(7))) << Int32(4)),
+                                             src, pred)
+        if tid < Int32(self.pf_bn):
+            if cutlass.const_expr(self.n % self.pf_bn == 0):
+                cp_async_u32_shared_global(ws + tid * Int32(4), self._s_addr(scales, n0 + tid, kc))
+            elif n0 + tid < Int32(self.n):
+                cp_async_u32_shared_global(ws + tid * Int32(4), self._s_addr(scales, n0 + tid, kc))
+
+    @cute.jit
+    def _issue_ws(self, base: Int32, scales: cute.Tensor, n0: Int32, kc: Int32, stage: Int32,
+                  tid: Int32):
+        """int4: cp.async the eight F16 group-scale bytes of two columns per 128-wide chunk."""
+        ws = base + stage * Int32(self.pf_stage) + Int32(self.pf_a8 + self.pf_as + self.pf_w8)
+        if tid < Int32(2 * self.pf_bn):
+            col = tid % Int32(self.pf_bn)
+            half = tid // Int32(self.pf_bn)
+            src = self._s_addr(scales, n0 + col, kc) + half.to(Int64) * Int64(4)
+            if cutlass.const_expr(self.n % self.pf_bn == 0):
+                cp_async_u32_shared_global(ws + col * Int32(8) + half * Int32(4), src)
+            elif n0 + col < Int32(self.n):
+                cp_async_u32_shared_global(ws + col * Int32(8) + half * Int32(4), src)
+
     @cute.kernel
     def prefill(self, x: cute.Tensor, payload: cute.Tensor, scales: cute.Tensor,
                 output: cute.Tensor, rows: Int32):
@@ -653,148 +753,131 @@ class NativeTileLinear:
         tid = Int32(tid)
         lane, warp = tid & Int32(31), tid >> Int32(5)
         g, j = lane >> Int32(2), lane & Int32(3)
-        wm, wn = warp // Int32(self.wn), warp % Int32(self.wn)
+        wm, wn = warp // Int32(self.pf_wn), warp % Int32(self.pf_wn)
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
         base = shared_ptr_to_u32(storage.buf.data_ptr())
-        wide = shared_ptr_to_u32(storage.wide.data_ptr())
         m_tiles = (rows + Int32(self.bm - 1)) // Int32(self.bm)
-        tiles = m_tiles * Int32(self.n_tiles)
-        kcs = Int32(self.k // 64)
-        seg_chunks = self.seg_blocks * 2
-        MT, NG, S = self.mt, self.ng, self.stages
-        l7 = lane & Int32(7)
-        l15 = lane & Int32(15)
-        l_sh3 = lane >> Int32(3)
-        l_sh4 = lane >> Int32(4)
-        s_lane_off = (wn * Int32(8 * NG) + Int32(2) * j) * Int32(4)
-        b_lane_off = (wn * Int32(8 * NG) + l7) * Int32(128) + ((l_sh3 ^ l7) << Int32(4))
-        a_lane_off = (wm * Int32(16 * MT) + l15) * Int32(128) + ((l_sh4 ^ l7) << Int32(4))
+        tiles = m_tiles * Int32(self.pf_tiles)
+        kcs = Int32(self.k // 128)
+        MT, NG, S = self.pf_mt, self.pf_ng, self.pf_stages
+        l7, l15, l_sh3, l_sh4 = lane & Int32(7), lane & Int32(15), lane >> Int32(3), lane >> Int32(4)
+        colw = wn * Int32(8 * NG)
+        sfa_row = g + (lane & Int32(1)) * Int32(8)
+        unit_scale = Uint32(0x7F7F7F7F)             # four UE8M0 2^0 bytes: int4 scales come next
+        raw = cute.make_rmem_tensor((16,), Uint32)
+        wraw = cute.make_rmem_tensor((4,), Uint32)
+        part = cute.make_rmem_tensor((MT * 4,), Float32)
         while tile < tiles:
             if cutlass.const_expr(self.side2):
-                m0 = (tile // Int32(self.n_tiles)) * Int32(self.bm)
-                n0 = (tile % Int32(self.n_tiles)) * Int32(self.bn)
+                m0 = (tile // Int32(self.pf_tiles)) * Int32(self.bm)
+                n0 = (tile % Int32(self.pf_tiles)) * Int32(self.pf_bn)
             else:
                 m0 = (tile % m_tiles) * Int32(self.bm)
-                n0 = (tile // m_tiles) * Int32(self.bn)
+                n0 = (tile // m_tiles) * Int32(self.pf_bn)
             acc = cute.make_rmem_tensor((MT * NG * 4,), Float32)
             acc.fill(Float32(0.0))
-            for s in cutlass.range_constexpr(S - 1):
-                if Int32(s) < kcs:
-                    self._issue(base, x, payload, scales, rows, m0, n0, Int32(s), Int32(s), tid)
-                cute.arch.cp_async_commit_group()
-            for seg in cutlass.range(self.segments, unroll=1):
-                for sc_it in cutlass.range(seg_chunks, unroll=1):
-                    kc = seg * Int32(seg_chunks) + sc_it
-                    cute.arch.cp_async_wait_group(S - 2)
-                    cute.arch.sync_threads()
-                    sa = base + (kc & Int32(S - 1)) * Int32(self.stage_bytes)
-                    sw = sa + Int32(self.a_bytes)
-                    ss = sw + Int32(self.w_bytes)
-                    nk = kc + Int32(S - 1)
-                    if nk < kcs:
-                        self._issue(base, x, payload, scales, rows, m0, n0, nk, nk & Int32(S - 1), tid)
-                    cute.arch.cp_async_commit_group()
-                    if cutlass.const_expr(self.grouped):
-                        self._widen_stage(sw, wide, tid)
-                        cute.arch.sync_threads()
-                        s_base = ss + s_lane_off
-                        s_raw = cute.make_rmem_tensor((2 * NG,), Uint32)
-                        for gi in cutlass.range_constexpr(NG):
-                            r0, r1 = ld_shared_v2_u32(s_base + Int32(gi * 32))
-                            if cutlass.const_expr(not self.int4):
-                                sh = ((kc & Int32(1)) * Int32(16)).to(Uint32)
-                                r0, r1 = r0 >> sh, r1 >> sh
-                            s_raw[2 * gi], s_raw[2 * gi + 1] = r0, r1
-                        for h in cutlass.range(2, unroll=1):
-                            h_xor = h << Int32(6)
-                            bw_h = cute.make_rmem_tensor((4 * NG,), Uint32)
-                            sc_h = cute.make_rmem_tensor((2 * NG,), Float32)
-                            b_off = wide + (b_lane_off ^ h_xor)
-                            for gi in cutlass.range_constexpr(NG):
-                                b = ldmatrix_m8n8x4_b16(b_off + Int32(gi * 1024))
-                                for i in cutlass.range_constexpr(4):
-                                    bw_h[4 * gi + i] = b[i]
-                                sc_h[2 * gi] = self._scale(s_raw[2 * gi], h)
-                                sc_h[2 * gi + 1] = self._scale(s_raw[2 * gi + 1], h)
-                            a_off0 = sa + (a_lane_off ^ h_xor)
-                            a_off1 = sa + (a_lane_off ^ (h_xor ^ Int32(32)))
-                            for mt in cutlass.range_constexpr(MT):
-                                xa_h = cute.make_rmem_tensor((8,), Uint32)
-                                a0 = ldmatrix_m8n8x4_b16(a_off0 + Int32(mt * 2048))
-                                a1 = ldmatrix_m8n8x4_b16(a_off1 + Int32(mt * 2048))
-                                for i in cutlass.range_constexpr(4):
-                                    xa_h[i] = a0[i]
-                                    xa_h[4 + i] = a1[i]
-                                for gi in cutlass.range_constexpr(NG):
-                                    f = 4 * (mt * NG + gi)
-                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
-                                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                        xa_h[0], xa_h[1], xa_h[2], xa_h[3],
-                                        xa_h[4], xa_h[5], xa_h[6], xa_h[7],
-                                        bw_h[4 * gi], bw_h[4 * gi + 1], bw_h[4 * gi + 2], bw_h[4 * gi + 3],
-                                        sc_h[2 * gi], sc_h[2 * gi + 1])
+            for p in cutlass.range_constexpr(S - 1):
+                if Int32(p) < kcs:
+                    self._load_a_raw(raw, x, rows, m0, Int32(p), tid)
+                    self._store_a8(base, raw, Int32(p), tid)
+                    if cutlass.const_expr(self.int4):
+                        self._load_w_raw(wraw, payload, n0, Int32(p), tid)
+                        self._store_w8(base, wraw, Int32(p), tid)
+                        self._issue_ws(base, scales, n0, Int32(p), Int32(p), tid)
                     else:
-                        bw = cute.make_rmem_tensor((8 * NG,), Uint32)
-                        sc = cute.make_rmem_tensor((4 * NG,), Float32)
-                        for gi in cutlass.range_constexpr(NG):
-                            col = wn * Int32(8 * NG) + Int32(8 * gi) + g
-                            w = ld_shared_v4_u32(sw + col * Int32(64) + (j << Int32(4)))
-                            for t in cutlass.range_constexpr(4):
-                                b0, b1 = _e4m3x4_bf16(w[t])
-                                bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1] = b0, b1
-                        for mt in cutlass.range_constexpr(MT):
-                            r_lo = wm * Int32(16 * MT) + Int32(16 * mt) + g
-                            xa = cute.make_rmem_tensor((16,), Uint32)
-                            c_lo = Int32(2) * j
-                            c_hi = Int32(2) * j + Int32(1)
-                            at_lo = sa + r_lo * Int32(128)
-                            at_hi = at_lo + Int32(8 * 128)
-                            sw7 = r_lo & Int32(7)
-                            for q in cutlass.range_constexpr(8):
-                                unit = c_lo if q < 4 else c_hi
-                                off = ((unit ^ sw7) << Int32(4)) + Int32(4 * (q % 4))
-                                t, odd = q // 2, q % 2
-                                xa[4 * t + 2 * odd] = ld_shared_u32(at_lo + off)
-                                xa[4 * t + 2 * odd + 1] = ld_shared_u32(at_hi + off)
-                            for gi in cutlass.range_constexpr(NG):
-                                self._mma_chunk(acc, 4 * (mt * NG + gi), xa, bw, gi, sc, quad=True)
-                if cutlass.const_expr(self.segments > 1):
-                    first = seg == Int32(0)
-                    last = seg == Int32(self.segments - 1)
-                    row0 = m0 + wm * Int32(16 * MT) + g
-                    col0 = n0 + wn * Int32(8 * NG) + Int32(2) * j
+                        self._issue_w(base, payload, scales, n0, Int32(p), Int32(p), tid)
+                cute.arch.cp_async_commit_group()
+            if Int32(S - 1) < kcs:
+                self._load_a_raw(raw, x, rows, m0, Int32(S - 1), tid)
+                if cutlass.const_expr(self.int4):
+                    self._load_w_raw(wraw, payload, n0, Int32(S - 1), tid)
+            else:
+                for q in cutlass.range_constexpr(16):
+                    raw[q] = Uint32(0)
+            for kc in cutlass.range(kcs, unroll=1):
+                cute.arch.cp_async_wait_group(S - 2)
+                cute.arch.sync_threads()
+                nk = kc + Int32(S - 1)
+                if nk < kcs:
+                    self._store_a8(base, raw, nk & Int32(S - 1), tid)
+                    if cutlass.const_expr(self.int4):
+                        self._store_w8(base, wraw, nk & Int32(S - 1), tid)
+                        self._issue_ws(base, scales, n0, nk, nk & Int32(S - 1), tid)
+                    else:
+                        self._issue_w(base, payload, scales, n0, nk, nk & Int32(S - 1), tid)
+                cute.arch.cp_async_commit_group()
+                if nk + Int32(1) < kcs:
+                    self._load_a_raw(raw, x, rows, m0, nk + Int32(1), tid)
+                    if cutlass.const_expr(self.int4):
+                        self._load_w_raw(wraw, payload, n0, nk + Int32(1), tid)
+                sa = base + (kc & Int32(S - 1)) * Int32(self.pf_stage)
+                ss = sa + Int32(self.pf_a8)
+                sw = ss + Int32(self.pf_as)
+                ws = sw + Int32(self.pf_w8)
+                asc = cute.make_rmem_tensor((MT,), Uint32)
+                for mt in cutlass.range_constexpr(MT):
+                    asc[mt] = ld_shared_u32(ss + (wm * Int32(16 * MT) + Int32(16 * mt) + sfa_row) * Int32(4))
+                sfb = cute.make_rmem_tensor((NG,), Uint32)
+                if cutlass.const_expr(not self.int4):
+                    for nt in cutlass.range_constexpr(NG):
+                        sfb[nt] = ld_shared_u32(ws + (colw + Int32(8 * nt) + g) * Int32(4))
+                for ks in cutlass.range_constexpr(4):
+                    a = cute.make_rmem_tensor((4 * MT,), Uint32)
                     for mt in cutlass.range_constexpr(MT):
-                        for hh in cutlass.range_constexpr(2):
-                            r = row0 + Int32(16 * mt + 8 * hh)
-                            if r < rows:
-                                base_at = output.iterator.toint() + (r.to(Int64) * Int64(self.n) + col0.to(Int64)) * Int64(4)
-                                for gi in cutlass.range_constexpr(NG):
-                                    col = col0 + Int32(8 * gi)
-                                    if col < Int32(self.n):
-                                        at = base_at + Int64(gi * 32)
-                                        f = 4 * (mt * NG + gi) + 2 * hh
-                                        v0, v1 = acc[f], acc[f + 1]
-                                        if not first:
-                                            o0, o1 = ld_global_v2_u32(at)
-                                            v0 = _add(u32_as_f32(o0), v0)
-                                            v1 = _add(u32_as_f32(o1), v1)
-                                        if cutlass.const_expr(not self.grouped):
-                                            if last:
-                                                s0, s1 = ld_global_nc_v2_u32(scales.iterator.toint() + col.to(Int64) * Int64(4))
-                                                v0, v1 = v0 * u32_as_f32(s0), v1 * u32_as_f32(s1)
-                                        st_global_v2_f32(at, v0, v1)
-                    acc.fill(Float32(0.0))
+                        arow = wm * Int32(16 * MT) + Int32(16 * mt) + l15
+                        chunk = Int32(2 * ks) + l_sh4
+                        q0, q1, q2, q3 = ldmatrix_m8n8x4_b16(
+                            sa + arow * Int32(128) + ((chunk ^ (arow & Int32(7))) << Int32(4)))
+                        a[4 * mt], a[4 * mt + 1], a[4 * mt + 2], a[4 * mt + 3] = q0, q1, q2, q3
+                    b = cute.make_rmem_tensor((2 * NG,), Uint32)
+                    for pr in cutlass.range_constexpr(NG // 2):
+                        nrow = colw + Int32(16 * pr) + l7 + l_sh4 * Int32(8)
+                        chunkb = Int32(2 * ks) + l_sh3
+                        r0, r1, r2, r3 = ldmatrix_m8n8x4_b16(
+                            sw + nrow * Int32(128) + ((chunkb ^ (nrow & Int32(7))) << Int32(4)))
+                        b[4 * pr], b[4 * pr + 1], b[4 * pr + 2], b[4 * pr + 3] = r0, r1, r2, r3
+                    if cutlass.const_expr(self.int4):
+                        for nt in cutlass.range_constexpr(NG):
+                            part.fill(Float32(0.0))
+                            for mt in cutlass.range_constexpr(MT):
+                                f = 4 * mt
+                                p0, p1, p2, p3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                                    part[f], part[f + 1], part[f + 2], part[f + 3],
+                                    a[4 * mt], a[4 * mt + 1], a[4 * mt + 2], a[4 * mt + 3],
+                                    b[2 * nt], b[2 * nt + 1], asc[mt], unit_scale,
+                                    bid_a=ks, bid_b=0)
+                                part[f], part[f + 1], part[f + 2], part[f + 3] = p0, p1, p2, p3
+                            c0 = colw + Int32(8 * nt) + Int32(2) * j
+                            g0 = ld_shared_u32(ws + c0 * Int32(8) + Int32(4 * (ks >> 1)))
+                            g1 = ld_shared_u32(ws + (c0 + Int32(1)) * Int32(8) + Int32(4 * (ks >> 1)))
+                            sh = Int32(16 * (ks & 1)).to(Uint32)
+                            s0 = _f16_to_f32((g0 >> sh) & Uint32(0xFFFF))
+                            s1 = _f16_to_f32((g1 >> sh) & Uint32(0xFFFF))
+                            for mt in cutlass.range_constexpr(MT):
+                                f = 4 * (mt * NG + nt)
+                                acc[f] = _fma(part[4 * mt], s0, acc[f])
+                                acc[f + 1] = _fma(part[4 * mt + 1], s1, acc[f + 1])
+                                acc[f + 2] = _fma(part[4 * mt + 2], s0, acc[f + 2])
+                                acc[f + 3] = _fma(part[4 * mt + 3], s1, acc[f + 3])
+                    else:
+                        for mt in cutlass.range_constexpr(MT):
+                            for nt in cutlass.range_constexpr(NG):
+                                f = 4 * (mt * NG + nt)
+                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = mxfp8_mma_m16n8k32_f32_e4m3(
+                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                    a[4 * mt], a[4 * mt + 1], a[4 * mt + 2], a[4 * mt + 3],
+                                    b[2 * nt], b[2 * nt + 1], asc[mt], sfb[nt],
+                                    bid_a=ks, bid_b=ks)
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
-            if cutlass.const_expr(self.segments == 1):
-                for mt in cutlass.range_constexpr(MT):
-                    for gi in cutlass.range_constexpr(NG):
-                        f = 4 * (mt * NG + gi)
-                        row = m0 + wm * Int32(16 * MT) + Int32(16 * mt) + g
-                        col = n0 + wn * Int32(8 * NG) + Int32(8 * gi) + Int32(2) * j
-                        self._store(output, scales, acc[f], acc[f + 1], row, col, rows)
-                        self._store(output, scales, acc[f + 2], acc[f + 3], row + Int32(8), col, rows)
+            for mt in cutlass.range_constexpr(MT):
+                for nt in cutlass.range_constexpr(NG):
+                    f = 4 * (mt * NG + nt)
+                    row = m0 + wm * Int32(16 * MT) + Int32(16 * mt) + g
+                    col = n0 + colw + Int32(8 * nt) + Int32(2) * j
+                    self._store(output, scales, acc[f], acc[f + 1], row, col, rows)
+                    self._store(output, scales, acc[f + 2], acc[f + 3], row + Int32(8), col, rows)
             tile += grid
 
     def _storage_row(self):
