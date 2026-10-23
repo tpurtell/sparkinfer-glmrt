@@ -14,11 +14,12 @@ import cutlass.utils as cutlass_utils
 from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
-    f16_mma_m16n8k16_f32, ld_global_nc_u32, ld_global_nc_v4_u32,
-    ld_shared_u32, packed_dequant_trellis_to_half2x4,
-    packed_dequant_trellis_stream_to_half2x4,
+    f16_mma_m16n8k16_f32, ld_global_nc_u32,
+    ld_global_nc_v4_u32, ld_shared_u32, ldmatrix_m8n8x4_b16,
+    packed_dequant_trellis_to_half2x4, packed_dequant_trellis_stream_to_half2x4,
     packed_dequant_trellis_mul1_to_half2x4,
-    shared_ptr_to_u32, st_shared_v4_u32, trellis_align_stream_u32x2,
+    shared_ptr_to_u32, st_global_v2_f32, st_shared_v4_u32,
+    trellis_align_stream_u32x2,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2, _side_value
@@ -71,6 +72,13 @@ def decode_tile(address: Int64, tile: Int32, lane: Int32,
     return b0, b1, b2, b3
 
 
+# Many-row prefill: one CTA owns 16*PREFILL_DEPTH rows x 128 columns over the
+# whole K, so each weight tile is decoded once per k16 and reused across that
+# CTA's row blocks, and every row keeps one ascending K128 accumulation chain.
+# K2--K4 keep the split-K path whose register budget the narrow kernel owns.
+PREFILL_DEPTH = 8
+
+
 class NativeTrellisLinear:
     ABI_VERSION = 1
     CTAS_PER_SM = 4
@@ -84,6 +92,7 @@ class NativeTrellisLinear:
         self.input_units = g["sharded_side"] == 2
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         self.splits = g["splits"]
+        self.prefill = self.bits >= 5
 
     def _storage(self, active: int):
         class Storage:
@@ -93,36 +102,64 @@ class NativeTrellisLinear:
         }
         return cute.struct(Storage)
 
+    def _deep_storage(self, depth: int):
+        # One 16-chunk row stage of (16*depth + 1) rows, 16 bytes each.
+        class Storage:
+            pass
+        Storage.__annotations__ = {
+            "x": cute.struct.Align[cute.struct.MemRange[Uint32, 64 * (16 * depth + 1)], 16],
+        }
+        return cute.struct(Storage)
+
     @cute.jit
     def __call__(self, inputs: cute.Tensor, payload: cute.Tensor,
                  scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                  rows: Int32, rotation_id: Int32, cta_limit: Int32,
                  stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations) and cta_limit > Int32(0):
-            tiles = Int32(self.n // 128 * self.splits)
-            if cutlass.const_expr(self.bits < 5):
-                self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
-                    grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(16):
-                self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
-                    grid=(min(tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(32):
-                self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 2, 8).launch(
-                    grid=(min(tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(48):
-                self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 3, 8).launch(
-                    grid=(min(tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+            if cutlass.const_expr(self.prefill):
+                if rows > Int32(64):
+                    self.multiply_deep(inputs, (payload,) * 4, (scales,) * 4, (output,) * 4,
+                                       rows, rotation_id, PREFILL_DEPTH, 1).launch(
+                        grid=(min(((rows + Int32(16 * PREFILL_DEPTH - 1)) // Int32(16 * PREFILL_DEPTH)) * Int32(self.n // 128), cta_limit), 1, 1),
+                        block=(256, 1, 1), min_blocks_per_mp=1, stream=stream)
+                else:
+                    self._split_k(inputs, payload, scales, partial, output, rows, rotation_id,
+                                  cta_limit, stream)
             else:
-                self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
-                    grid=(min(((rows + Int32(63)) // Int32(64)) * tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            self.reduce(partial, output, rows).launch(
-                grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
+                self._split_k(inputs, payload, scales, partial, output, rows, rotation_id,
+                              cta_limit, stream)
+
+    @cute.jit
+    def _split_k(self, inputs: cute.Tensor, payload: cute.Tensor,
+                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                 rows: Int32, rotation_id: Int32, cta_limit: Int32,
+                 stream: cuda.CUstream):
+        """The narrow-row split-K path: 16-row tiles, then the reduce pass."""
+        tiles = Int32(self.n // 128 * self.splits)
+        if cutlass.const_expr(self.bits < 5):
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        elif rows <= Int32(16):
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+                grid=(min(tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        elif rows <= Int32(32):
+            self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 2, 8).launch(
+                grid=(min(tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        elif rows <= Int32(48):
+            self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 3, 8).launch(
+                grid=(min(tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        else:
+            self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
+                grid=(min(((rows + Int32(63)) // Int32(64)) * tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        self.reduce(partial, output, rows).launch(
+            grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+            block=(128, 1, 1), stream=stream)
 
     @cute.kernel
     def multiply(self, inputs: cute.Tensor, payload: cute.Tensor,
@@ -332,6 +369,122 @@ class NativeTrellisLinear:
                             partial[base], partial[base + Int64(1)] = t2, t3
             task += step
 
+    @cute.jit
+    def _deep_stage(self, x: Int64, sx: Int32, rows: Int32, row_base: Int32,
+                    kb: Int32, c: Int32, r_grp: Int32, depth: cutlass.Constexpr):
+        """Stage one K128 row block of ``16*depth`` input rows as 16-byte K8 chunks.
+
+        Each thread owns one K8 chunk of ``depth`` rows a quarter-CTA apart, so
+        the whole block lands in one round of 16-byte copies.
+        """
+        k_col = kb * Int32(128) + c * Int32(8)
+        for s in cutlass.range_constexpr(depth):
+            row = row_base + r_grp + Int32(s * 16)
+            dst = sx + Int32(c * (16 * depth + 1) + r_grp + s * 16) * Int32(16)
+            src = x + (row.to(Int64) * Int64(self.k) + k_col.to(Int64)) * Int64(2)
+            v0, v1, v2, v3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            if row < rows:
+                v0, v1, v2, v3 = ld_global_nc_v4_u32(src)
+            st_shared_v4_u32(dst, v0, v1, v2, v3)
+
+    @cute.jit
+    def _deep_a(self, sx: Int32, m_pad: Int32, k16: Int32, mb: Int32, lane: Int32):
+        """One K16 x M16 input fragment: rows mb*16..mb*16+15, K 16*k16..+15."""
+        grp = lane >> Int32(3)
+        chunk = Int32(2) * k16 + (grp >> Int32(1))
+        row = mb * Int32(16) + (grp & Int32(1)) * Int32(8) + (lane & Int32(7))
+        return ldmatrix_m8n8x4_b16(sx + (chunk * m_pad + row) * Int32(16))
+
+    @cute.kernel
+    def multiply_deep(self, inputs: cute.Tensor,
+                      payloads: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                      scales: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                      outputs: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                      rows: Int32, rotation_id: Int32,
+                      depth: cutlass.Constexpr, groups: cutlass.Constexpr):
+        """Many-row prefill: one CTA owns ``16*depth`` rows x 128 columns for all K.
+
+        A weight tile is decoded once per k16 and reused across every row block
+        of the CTA, and the CTA reduces over the full K in one FP32 chain, so no
+        split-K partials or reduce launch are needed. Every row's K reduction is
+        the same ascending K128 chain, so the result is row-invariant.
+        """
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        tid = Int32(tid)
+        lane, warp = tid & Int32(31), tid >> Int32(5)
+        c, r_grp = tid & Int32(15), tid >> Int32(4)
+        M = Int32(16 * depth)
+        m_pad = Int32(16 * depth + 1)
+        nblocks = Int32(self.n // 128)
+        k_blocks = Int32(self.k // 128)
+        heads = Int32(4) if cutlass.const_expr(groups == 4) else Int32(1)
+        limit = ((rows + M - Int32(1)) // M) * (nblocks * heads)
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._deep_storage(depth))
+        sx = shared_ptr_to_u32(storage.x.data_ptr())
+        while task < limit:
+            block = task // (nblocks * heads)
+            rem = task % (nblocks * heads)
+            if cutlass.const_expr(groups == 4):
+                proj = rem // nblocks
+                nb = rem % nblocks
+                payload_ptr = select4(proj, payloads[0].iterator.toint(), payloads[1].iterator.toint(),
+                                      payloads[2].iterator.toint(), payloads[3].iterator.toint())
+                scale_ptr = select4(proj, scales[0].iterator.toint(), scales[1].iterator.toint(),
+                                    scales[2].iterator.toint(), scales[3].iterator.toint())
+                out_ptr = select4(proj, outputs[0].iterator.toint(), outputs[1].iterator.toint(),
+                                  outputs[2].iterator.toint(), outputs[3].iterator.toint())
+            else:
+                proj = Int32(0)
+                nb = rem
+                payload_ptr = payloads[0].iterator.toint()
+                scale_ptr = scales[0].iterator.toint()
+                out_ptr = outputs[0].iterator.toint()
+            x = inputs[rotation_id + proj]
+            row_base = block * M
+            total = cute.make_rmem_tensor((depth, 2, 4), Float32)
+            total.fill(Float32(0.0))
+            for kb in cutlass.range(k_blocks, unroll=1):
+                self._deep_stage(x, sx, rows, row_base, kb, c, r_grp, depth)
+                cute.arch.sync_threads()
+                acc = cute.make_rmem_tensor((depth, 2, 4), Float32)
+                acc.fill(Float32(0.0))
+                for k16 in cutlass.range_constexpr(8):
+                    tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp
+                    if cutlass.const_expr(self.input_units):
+                        tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp
+                    b0, b1, b2, b3 = decode_tile(payload_ptr, tile, lane, self.bits, self.e4m3, self.mul1)
+                    for mb in cutlass.range_constexpr(depth):
+                        a0, a1, a2, a3 = self._deep_a(sx, m_pad, Int32(k16), Int32(mb), lane)
+                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
+                            a0, a1, a2, a3, b0, b1)
+                        acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
+                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                            acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
+                            a0, a1, a2, a3, b2, b3)
+                        acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
+                scale = _side_value(scale_ptr, kb)
+                for mb in cutlass.range_constexpr(depth):
+                    for n in cutlass.range_constexpr(2):
+                        for v in cutlass.range_constexpr(4):
+                            total[mb, n, v] = total[mb, n, v] + acc[mb, n, v] * scale
+                cute.arch.sync_threads()
+            for mb in cutlass.range_constexpr(depth):
+                row0 = row_base + Int32(mb * 16) + lane // Int32(4)
+                row1 = row0 + Int32(8)
+                for n in cutlass.range_constexpr(2):
+                    col = nb * Int32(128) + warp * Int32(16) + Int32(n * 8) + (lane & Int32(3)) * Int32(2)
+                    if row0 < rows:
+                        st_global_v2_f32(out_ptr + (row0.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4),
+                                         total[mb, n, 0], total[mb, n, 1])
+                    if row1 < rows:
+                        st_global_v2_f32(out_ptr + (row1.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4),
+                                         total[mb, n, 2], total[mb, n, 3])
+            task += step
+
     @cute.kernel
     def reduce(self, partial: cute.Tensor, output: cute.Tensor, rows: Int32):
         tid, _, _ = cute.arch.thread_idx()
@@ -354,30 +507,52 @@ class NativeTrellisLinear:
                      rows: Int32, rotation_id: Int32, cta_limit: Int32,
                      stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id + Int32(3) < Int32(self.rotations) and cta_limit > Int32(0):
-            group_tiles = Int32(4 * (self.n // 128) * self.splits)
-            if cutlass.const_expr(self.bits < 5):
-                self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
-                    grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            elif rows <= Int32(16):
-                self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
-                    grid=(min(group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
-            elif rows <= Int32(32):
-                self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
-                    grid=(min(group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
-            elif rows <= Int32(48):
-                self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 3, 8 if self.mul1 else 4).launch(
-                    grid=(min(group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=2 if self.mul1 else 3, stream=stream)
+            if cutlass.const_expr(self.prefill):
+                if rows > Int32(64):
+                    self.multiply_deep(inputs, payloads, scales, outputs, rows, rotation_id,
+                                       PREFILL_DEPTH, 4).launch(
+                        grid=(min(((rows + Int32(16 * PREFILL_DEPTH - 1)) // Int32(16 * PREFILL_DEPTH)) * Int32(4 * (self.n // 128)), cta_limit), 1, 1),
+                        block=(256, 1, 1), min_blocks_per_mp=1, stream=stream)
+                else:
+                    self._split_k_grouped(inputs, payloads, scales, partial, outputs, rows,
+                                          rotation_id, cta_limit, stream)
             else:
-                self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 4, 4).launch(
-                    grid=(min(((rows + Int32(63)) // Int32(64)) * group_tiles, cta_limit), 1, 1),
-                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            self.reduce_grouped(partial, outputs, rows).launch(
-                grid=(min(rows * Int32(4 * (self.n // 128)), cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
+                self._split_k_grouped(inputs, payloads, scales, partial, outputs, rows,
+                                      rotation_id, cta_limit, stream)
+
+    @cute.jit
+    def _split_k_grouped(self, inputs: cute.Tensor,
+                         payloads: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                         scales: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                         partial: cute.Tensor,
+                         outputs: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+                         rows: Int32, rotation_id: Int32, cta_limit: Int32,
+                         stream: cuda.CUstream):
+        """The narrow-row grouped split-K path, then the reduce pass."""
+        group_tiles = Int32(4 * (self.n // 128) * self.splits)
+        if cutlass.const_expr(self.bits < 5):
+            self.multiply_grouped(inputs, payloads, scales, partial, rows, rotation_id).launch(
+                grid=(min(((rows + Int32(15)) // Int32(16)) * group_tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        elif rows <= Int32(16):
+            self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 1, 8).launch(
+                grid=(min(group_tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
+        elif rows <= Int32(32):
+            self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 2, 4).launch(
+                grid=(min(group_tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=4, stream=stream)
+        elif rows <= Int32(48):
+            self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 3, 8 if self.mul1 else 4).launch(
+                grid=(min(group_tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=2 if self.mul1 else 3, stream=stream)
+        else:
+            self.multiply_wide_grouped(inputs, payloads, scales, partial, rows, rotation_id, 4, 4).launch(
+                grid=(min(((rows + Int32(63)) // Int32(64)) * group_tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        self.reduce_grouped(partial, outputs, rows).launch(
+            grid=(min(rows * Int32(4 * (self.n // 128)), cta_limit), 1, 1),
+            block=(128, 1, 1), stream=stream)
 
     @cute.kernel
     def multiply_grouped(self, inputs: cute.Tensor,
