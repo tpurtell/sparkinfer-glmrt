@@ -280,10 +280,17 @@ class NativeTileLinear:
                     row_tiles = Int32(1)
                 chunks = (rows + Int32(15)) >> Int32(4)
                 rows_per = ((chunks + row_tiles - Int32(1)) // row_tiles) * Int32(16)
-                self.decode(x, payload, scales, output, rows, rows_per, row_tiles).launch(
-                    grid=(min(Int32(self.decode_ctas) * row_tiles, cta_limit), 1, 1),
-                    block=(self.d_threads, 1, 1),
-                    stream=stream, min_blocks_per_mp=3 if self.side2 else 2)
+                # Both capacity variants are compiled before replay; rows only dispatches.
+                if rows <= Int32(16):
+                    self.decode(x, payload, scales, output, rows, rows_per, row_tiles, 1).launch(
+                        grid=(min(Int32(self.decode_ctas) * row_tiles, cta_limit), 1, 1),
+                        block=(self.d_threads, 1, 1),
+                        stream=stream, min_blocks_per_mp=3 if self.side2 else 2)
+                else:
+                    self.decode(x, payload, scales, output, rows, rows_per, row_tiles, 4).launch(
+                        grid=(min(Int32(self.decode_ctas) * row_tiles, cta_limit), 1, 1),
+                        block=(self.d_threads, 1, 1),
+                        stream=stream, min_blocks_per_mp=3 if self.side2 else 2)
             else:
                 tiles = ((rows + Int32(self.bm - 1)) // Int32(self.bm)) * Int32(self.n_tiles)
                 if cutlass.const_expr(self.grouped):
@@ -371,6 +378,7 @@ class NativeTileLinear:
         words = max(1, (self.segments - 1) * self.slots * 4 * self.groups * 32)
         Storage.__annotations__ = {
             "fold": cute.struct.Align[cute.struct.MemRange[Float32, words], 16],
+            "activation": cute.struct.Align[cute.struct.MemRange[Uint32, self.d_threads * 8], 128],
         }
         return cute.struct(Storage)
 
@@ -405,9 +413,30 @@ class NativeTileLinear:
                     else:
                         sdst[gi * 2 + e] = ld_global_nc_u32(self._s_addr(scales, col, kb))
 
+    @cute.jit
+    def _decode_a_shared(self, x: cute.Tensor, row0: Int32, k32: Int32,
+                         rows: Int32, base: Int32, lane: Int32):
+        # Each quad reads one contiguous row; ldmatrix supplies the MMA permutation.
+        r, unit = lane >> Int32(2), lane & Int32(3)
+        for h in cutlass.range_constexpr(2):
+            row = row0 + r + Int32(8 * h)
+            address = x.iterator.toint() + (row.to(Int64) * Int64(self.k)
+                       + k32.to(Int64) + unit.to(Int64) * Int64(8)) * Int64(2)
+            a, b, c, d = _ld_cached_pred(address, row, rows)
+            _st_shared_v4(base + (r + Int32(8 * h)) * Int32(64)
+                           + ((unit ^ (r & Int32(3))) << Int32(4)), a, b, c, d)
+        cute.arch.sync_warp()
+        address = base + (lane & Int32(15)) * Int32(64) \
+            + (((lane >> Int32(4)) ^ (lane & Int32(3))) << Int32(4))
+        lo = ldmatrix_m8n8x4_b16(address)
+        hi = ldmatrix_m8n8x4_b16(base + ((address - base) ^ Int32(32)))
+        cute.arch.sync_warp()
+        return lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]
+
     @cute.kernel
     def decode(self, x: cute.Tensor, payload: cute.Tensor, scales: cute.Tensor,
-               output: cute.Tensor, rows: Int32, rows_per: Int32, row_tiles: Int32):
+               output: cute.Tensor, rows: Int32, rows_per: Int32, row_tiles: Int32,
+               row_capacity: cutlass.Constexpr):
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         tid = Int32(tid)
@@ -425,8 +454,9 @@ class NativeTileLinear:
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._decode_storage())
         fold = shared_ptr_to_u32(storage.fold.data_ptr())
+        a_shared = shared_ptr_to_u32(storage.activation.data_ptr()) + wid * Int32(1024)
         G = self.groups
-        F = 4 * G * 4
+        F = 4 * G * row_capacity
         blocks = Int64(self.n // self.cols)
         # One group per (block CTA, slot); rows split across CTAs, never columns.
         if cutlass.const_expr(self.decode_tiles > 1):
@@ -446,7 +476,7 @@ class NativeTileLinear:
         else:
             live = (rows + Int32(15)) >> Int32(4)
         kb0 = seg * Int32(self.seg_blocks)
-        lanek = Int32(8) * j if cutlass.const_expr(self.grouped) else Int32(16) * j
+        lanek = Int32(2) * j if cutlass.const_expr(self.grouped) else Int32(16) * j
         prmt_sel = j.to(Uint32) * Uint32(0x0101) + Uint32(0x0400)
         x_base = x.iterator.toint() + lanek.to(Int64) * Int64(2)
         span = end - begin
@@ -473,10 +503,6 @@ class NativeTileLinear:
                         if cutlass.const_expr(self.grouped):
                             for h in cutlass.range_constexpr(2):
                                 k32 = k0 + Int32(32 * h)
-                                if cutlass.const_expr(not self.side2):
-                                    at_m0 = x_base + ((row0 + g).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                    m0_lo0, m0_lo1, m0_lo2, m0_lo3 = _ld_cached_pred(at_m0, row0 + g, rows)
-                                    m0_hi0, m0_hi1, m0_hi2, m0_hi3 = _ld_cached_pred(at_m0 + Int64(16 * self.k), row0 + g + Int32(8), rows)
                                 if cutlass.const_expr(self.int4):
                                     t_w = _quad_transpose_u8x4(cur[c * 2 + h], prmt_sel)
                                     b0, b1, b2, b3 = _int4x8_bf16(t_w)
@@ -490,20 +516,16 @@ class NativeTileLinear:
                                 s0 = self._scale(r_s0, h)
                                 s1 = self._scale(r_s1, h)
                                 if cutlass.const_expr(not self.side2):
-                                    m0_a0, m0_a2, m0_a4, m0_a6 = _quad_transpose_x4(m0_lo0, m0_lo1, m0_lo2, m0_lo3, j)
-                                    m0_a1, m0_a3, m0_a5, m0_a7 = _quad_transpose_x4(m0_hi0, m0_hi1, m0_hi2, m0_hi3, j)
+                                    m0_a0, m0_a1, m0_a2, m0_a3, m0_a4, m0_a5, m0_a6, m0_a7 = self._decode_a_shared(
+                                        x, row0, k32, rows, a_shared, lane)
                                     acc[0], acc[1], acc[2], acc[3] = _mma_k32_scaled(
                                         acc[0], acc[1], acc[2], acc[3],
                                         m0_a0, m0_a1, m0_a2, m0_a3, m0_a4, m0_a5, m0_a6, m0_a7,
                                         b0, b1, b2, b3, s0, s1)
-                                for mt in cutlass.range_constexpr(0 if self.side2 else 1, 4):
+                                for mt in cutlass.range_constexpr(0 if self.side2 else 1, row_capacity):
                                     if Int32(mt) < live:
-                                        r0 = Int32(16 * mt) + g
-                                        at0 = x_base + ((row0 + r0).to(Int64) * Int64(self.k) + k32.to(Int64)) * Int64(2)
-                                        lo0, lo1, lo2, lo3 = _ld_cached_pred(at0, row0 + r0, rows)
-                                        hi0, hi1, hi2, hi3 = _ld_cached_pred(at0 + Int64(16 * self.k), row0 + r0 + Int32(8), rows)
-                                        a0, a2, a4, a6 = _quad_transpose_x4(lo0, lo1, lo2, lo3, j)
-                                        a1, a3, a5, a7 = _quad_transpose_x4(hi0, hi1, hi2, hi3, j)
+                                        a0, a1, a2, a3, a4, a5, a6, a7 = self._decode_a_shared(
+                                            x, row0 + Int32(16 * mt), k32, rows, a_shared, lane)
                                         f = 4 * mt
                                         acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = _mma_k32_scaled(
                                             acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
@@ -516,7 +538,7 @@ class NativeTileLinear:
                                 for t in cutlass.range_constexpr(4):
                                     b0, b1 = _e4m3x4_bf16(cur[(c * G + gi) * 4 + t])
                                     bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1] = b0, b1
-                            for mt in cutlass.range_constexpr(4):
+                            for mt in cutlass.range_constexpr(row_capacity):
                                 if Int32(mt) < live:
                                     xa = cute.make_rmem_tensor((16,), Uint32)
                                     xa.fill(Uint32(0))
@@ -536,7 +558,7 @@ class NativeTileLinear:
                         for i in cutlass.range_constexpr(self.spb):
                             scur[i] = snxt[i]
             if cutlass.const_expr(self.segments > 1):
-                for mt in cutlass.range_constexpr(4):
+                for mt in cutlass.range_constexpr(row_capacity):
                     if Int32(mt) < live:
                         if seg > Int32(0):
                             base = fold + (((seg - Int32(1)) * Int32(self.slots) + slot)
@@ -552,7 +574,7 @@ class NativeTileLinear:
                                         ld_shared_u32(base + Int32(i * 128) + lane * Int32(4))))
                         cute.arch.sync_threads()
             if seg == Int32(0) and active:
-                for mt in cutlass.range_constexpr(4):
+                for mt in cutlass.range_constexpr(row_capacity):
                     if Int32(mt) < live:
                         for gi in cutlass.range_constexpr(G):
                             f = 4 * (mt * G + gi)

@@ -216,6 +216,110 @@ def spill_check(program, directory):
     return records
 
 
+def benchmark_wide_mx8(args):
+    """On-chip native K4 prefill, including the shared activation quantization pass."""
+    from b12x.gemm.trellis_linear._wide_mx8 import WideTrellisMxfp8
+    from b12x.integration.cuteafd.trellis_unpack import compile_trellis_unpack_e4m3_aot
+    from b12x.integration.cuteafd.native_dense import compile_trellis_fp8_prefill_aot
+    rows_list = [int(v) for v in args.rows.split(",")]
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.output is None:
+        raise ValueError("wide MXFP8 requires output and rows in 1..4096")
+    shapes = [s for s in SHAPES if s[0] == "trellis"]
+    shapes += [(fmt, op + "_tp2", k if side == 1 else k//2,
+                n//2 if side == 1 else n, side) for fmt, op, k, n, side in shapes]
+    if args.shapes:
+        shapes = [s for s in shapes if s[1] in args.shapes.split(",")]
+    if not shapes:
+        raise ValueError("empty shape selection")
+    torch.manual_seed(408)
+    props = torch.cuda.get_device_properties(0)
+    report = dict(device=props.name, sms=props.multi_processor_count, measurements=[],
+                  scope="synthetic K4/E4M3; quantization included, transforms excluded")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    for _, op, k, n, side in shapes:
+        storage, _ = native_tensors("trellis", k, n, max(rows_list))
+        inputs, payload, scales, partial, native, x16 = storage
+        x = x16.bfloat16()
+        x16.copy_(x)
+        g = trellis_linear.geometry(k, n, sharded_side=side)
+        if args.t1_baseline:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("frozen_t1_prefill", args.t1_baseline)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            wide = module.TrellisPrefillMxfp8(g, n_cta=128)
+            wide.scratch_bytes = ((g["max_rows"] + 15) // 16) * (k // 32) * 528
+        elif args.t1_mpw:
+            from b12x.gemm.trellis_linear._prefill import TrellisPrefillMxfp8
+            wide = TrellisPrefillMxfp8(g, n_cta=args.t1_n_cta, mpw=args.t1_mpw)
+        else:
+            wide = WideTrellisMxfp8(g)
+        scratch = torch.empty(wide.scratch_bytes, device="cuda", dtype=torch.uint8)
+        out = torch.empty_like(native)
+        with exportable_compilation():
+            candidate = compile_program(wide, name="trellis_wide_mx8",
+                key=(*g.values(), args.t1_mpw, args.t1_n_cta,
+                     hashlib.sha256(args.t1_baseline.read_bytes()).hexdigest() if args.t1_baseline else ""),
+                operands=(Operand("inputs", torch.int64, "[4]"), Operand("payload", torch.uint8, "[packed]"),
+                          Operand("scales", torch.float16, "[K/128]"), Operand("scratch", torch.uint8, "[records]", "scratch"),
+                          Operand("output", torch.float32, "[rows,N]", "out")),
+                scalars=(Scalar("rows"), Scalar("rotation"), Scalar("cta_limit")))
+        census = spill_check(candidate, args.output.parent / "cubins" / "wide" / op)
+        weight = torch.empty((n, k), dtype=torch.uint8, device="cuda")
+        unit = torch.ones((n//128, k//128), device="cuda")
+        unpack = compile_trellis_unpack_e4m3_aot(input_features=k, output_features=n, sharded_side=side)
+        gemm = compile_trellis_fp8_prefill_aot(input_features=k, output_features=n)
+        core = compile_native("trellis", k, n, side)
+        unpack_graph = capture(lambda: unpack.launch(payload, weight, scalars=()))
+        unpack_us = timing(unpack_graph, args.replays)
+        prefix = None
+        for rows in sorted(rows_list, reverse=True):
+            scalars = (rows, 0, props.multi_processor_count*4)
+            cg = capture(lambda: candidate.launch(inputs, payload, scales, scratch, out, scalars=scalars))
+            candidate_result = out[:rows].clone()
+            if prefix is None:
+                prefix = candidate_result[:64].clone()
+            invariant = torch.equal(prefix[:min(rows,64)].view(torch.int32), candidate_result[:min(rows,64)].view(torch.int32))
+            candidate.launch(inputs, payload, scales, scratch, out, scalars=(min(rows, 63), 0, scalars[2]))
+            torch.cuda.synchronize()
+            invariant = invariant and torch.equal(prefix[:min(rows,63)].view(torch.int32), out[:min(rows,63)].view(torch.int32))
+            ng = capture(lambda: core.launch(inputs, payload, scales, partial, native, scalars=scalars))
+            gg = capture(lambda: gemm.launch(x, weight, unit, out, scalars=(rows,)))
+            columns = min(n, 128)
+            w = weight[:columns].view(torch.float8_e4m3fn).float()
+            target = x[:rows].double() @ w.double().T
+            exact_error = torch.linalg.vector_norm(native[:rows,:columns].double()-target).item()
+            error = torch.linalg.vector_norm(candidate_result[:,:columns].double()-target).item()
+            exact_bound = 1.01*torch.linalg.vector_norm((x[:rows] @ w.bfloat16().T).double()-target).item()
+            # Independent per-row K32 MXFP8 oracle, not a reconstruction of kernel records.
+            groups = x16[:rows].float().reshape(rows,k//32,32)
+            exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(2.0**-126)/448.0))
+            step = torch.exp2(exponent)
+            qa = ((groups/step[:,:,None]).to(torch.float8_e4m3fn).float()*step[:,:,None]).reshape(rows,k)
+            qtarget = qa.double() @ w.double().T
+            qerror = torch.linalg.vector_norm(candidate_result[:,:columns].double()-qtarget).item()
+            bound = 1.01*torch.linalg.vector_norm((qa.bfloat16() @ w.bfloat16().T).double()-qtarget).item()
+            quantization_error = torch.linalg.vector_norm(qtarget-target).item()
+            c_us, n_us, g_us = timing(cg,args.replays), timing(ng,1), timing(gg,args.replays)
+            bg, keep, count = baseline(k,n,rows,a16=True)
+            b_us = timing(bg,args.replays)/count
+            a8g, keep8, count8 = baseline(k,n,rows,a16=False)
+            a8_us = timing(a8g,args.replays)/count8
+            spill_free = all(not any(r["local_bytes"]+r["stack_bytes"]) and not r["local_load_store_instructions"] for r in census)
+            record = dict(projection=op, rows=rows, native_us=n_us, wide_us=c_us,
+                w8a16_us=b_us,w8a8_us=a8_us,unpack_us=unpack_us,unpack_plus_gemm_us=unpack_us+g_us,
+                fp64_error=qerror,exact_fp64_error=exact_error,fp64_bound=bound,fp64_pass=qerror<=bound,
+                a8_vs_exact_error=error,quantization_error=quantization_error,exact_fp64_bound=exact_bound,
+                row_invariant=invariant,spill_free=spill_free,cubin_spill_check=census,
+                eligible=qerror<=bound and exact_error<=exact_bound and invariant and spill_free)
+            report["measurements"].append(record)
+            args.output.write_text(json.dumps(report,indent=2)+"\n")
+            print(json.dumps(record),flush=True)
+            del cg,ng,gg,bg,a8g,keep,keep8,candidate_result
+        del storage,inputs,payload,scales,partial,native,x16,x,scratch,out,weight,unit,prefix,unpack_graph
+    return any(not r["eligible"] for r in report["measurements"])
+
+
 def benchmark_unpacked(args):
     """Sanctioned trellis-only FP8 unpack arm, sharing the existing graph timer."""
     from b12x.integration.cuteafd.trellis_unpack import compile_trellis_unpack_e4m3_aot
@@ -295,6 +399,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--unpacked-trellis", action="store_true", help="measure exact E4M3 unpack plus F32 W8A16 at full/TP2 trellis shapes")
+    parser.add_argument("--wide-mx8", action="store_true", help="measure on-chip trellis MXFP8 prefill")
+    parser.add_argument("--t1-mpw", type=int, choices=(0, 1, 2), default=0,
+                        help="use T1 shared-tile kernel with this many M16 blocks per warp")
+    parser.add_argument("--t1-n-cta", type=int, choices=(64, 128), default=64)
+    parser.add_argument("--t1-baseline", type=Path, help="frozen pristine T1 module for matched comparison")
     parser.add_argument("--arm", action="append", help="NAME=git-rev; repeatable")
     parser.add_argument("--arm-bundle", type=Path)
     parser.add_argument("--materialize-only", action="store_true", help="host-side git show, no CUDA")
@@ -311,6 +420,8 @@ def main():
     parser.add_argument("--profile-op", help="FORMAT/OP")
     parser.add_argument("--profile-rows", type=int)
     args = parser.parse_args()
+    if args.wide_mx8:
+        return benchmark_wide_mx8(args)
     if args.unpacked_trellis:
         return benchmark_unpacked(args)
     if not args.arm or args.arm_bundle is None or args.reference is None:
@@ -339,8 +450,8 @@ def main():
     shapes = [s for s in SHAPES if s[0] in formats and s[1] in names]
     profile = any((args.profile_arm, args.profile_op, args.profile_rows))
     if profile:
-        if args.profile_arm not in arms or not args.profile_op or args.profile_rows not in rows_list:
-            parser.error("profile requires a named arm, FORMAT/OP and one selected row count")
+        if args.profile_arm not in {*arms, "block_fp8"} or not args.profile_op or args.profile_rows not in rows_list:
+            parser.error("profile requires a named arm or block_fp8, FORMAT/OP and one selected row count")
         shapes = [s for s in shapes if f"{s[0]}/{s[1]}" == args.profile_op]
         rows_list = [args.profile_rows]
     if not shapes:
@@ -397,7 +508,7 @@ def main():
             copies = copies_for(read_bytes, args.cold_l2 and rows <= 64)
             extra = [(tensors[1].clone(), tensors[2].clone()) for _ in range(copies-1)]
             base_us, base_error = None, None
-            if not profile:
+            if not profile or args.profile_arm == "block_fp8":
                 try:
                     graph, keep, count = baseline(k, n, rows, a16=True, cold_l2=args.cold_l2)
                 except TypeError as error:
@@ -405,7 +516,13 @@ def main():
                         raise
                     base_error = str(error)
                 else:
-                    base_us = timing(graph, 1 if rows > 64 else args.replays)/count
+                    if profile:
+                        torch.cuda.cudart().cudaProfilerStart()
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        torch.cuda.cudart().cudaProfilerStop()
+                    else:
+                        base_us = timing(graph, 1 if rows > 64 else args.replays)/count
                     del graph, keep
             for name, program in programs.items():
                 tensors[-1].fill_(float("nan"))
