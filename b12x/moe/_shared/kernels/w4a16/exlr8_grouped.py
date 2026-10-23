@@ -284,6 +284,29 @@ def st_shared_v4_f32(smem_addr: Int32, v0: Float32, v1: Float32, v2: Float32, v3
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
 
+@dsl_user_op
+def fma_shared_v4_f32(smem_addr: Int32, a0: Float32, a1: Float32, a2: Float32, a3: Float32,
+                      scale: Float32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip),
+         Float32(a0).ir_value(loc=loc, ip=ip),
+         Float32(a1).ir_value(loc=loc, ip=ip),
+         Float32(a2).ir_value(loc=loc, ip=ip),
+         Float32(a3).ir_value(loc=loc, ip=ip),
+         Float32(scale).ir_value(loc=loc, ip=ip)],
+        "{ .reg .f32 t0, t1, t2, t3; "
+        "ld.shared.v4.f32 {t0, t1, t2, t3}, [$0]; "
+        "fma.rn.f32 t0, $1, $5, t0; "
+        "fma.rn.f32 t1, $2, $5, t1; "
+        "fma.rn.f32 t2, $3, $5, t2; "
+        "fma.rn.f32 t3, $4, $5, t3; "
+        "st.shared.v4.f32 [$0], {t0, t1, t2, t3}; }",
+        "r,f,f,f,f,f",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
 def query_optin_shared_memory() -> int | None:
     """This host's per-CTA opt-in shared memory, or None without a device.
 
@@ -1143,21 +1166,12 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         else:
             for idx in cutlass.range_constexpr(active):
                 c_lo = c_base + Int32(idx * 8192) + tid * Int32(16)
-                c_hi = c_lo + Int32(4096)
-                t0, t1, t2, t3 = ld_shared_v4_f32(c_lo)
-                t4, t5, t6, t7 = ld_shared_v4_f32(c_hi)
-                st_shared_v4_f32(
+                fma_shared_v4_f32(
                     c_lo,
-                    fma_rn_f32(acc[idx, 0], scale, t0),
-                    fma_rn_f32(acc[idx, 1], scale, t1),
-                    fma_rn_f32(acc[idx, 2], scale, t2),
-                    fma_rn_f32(acc[idx, 3], scale, t3))
-                st_shared_v4_f32(
-                    c_hi,
-                    fma_rn_f32(acc[idx, 4], scale, t4),
-                    fma_rn_f32(acc[idx, 5], scale, t5),
-                    fma_rn_f32(acc[idx, 6], scale, t6),
-                    fma_rn_f32(acc[idx, 7], scale, t7))
+                    acc[idx, 0], acc[idx, 1], acc[idx, 2], acc[idx, 3], scale)
+                fma_shared_v4_f32(
+                    c_lo + Int32(4096),
+                    acc[idx, 4], acc[idx, 5], acc[idx, 6], acc[idx, 7], scale)
 
     @cute.jit
     def fc1_ws_n16_dot(self, plane: cute.Tensor, a_base: Int32, b_base: Int32,
