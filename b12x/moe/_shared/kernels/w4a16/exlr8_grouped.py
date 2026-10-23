@@ -46,8 +46,8 @@ from .mixed_trellis_ws import (
 
 _FC1_CONSUMER_THREADS = 256
 _FC1_PRODUCER_THREADS = 128
-_FC1_PRODUCER_REGS = 72
-_FC1_CONSUMER_REGS = 216
+_FC1_PRODUCER_REGS = 40
+_FC1_CONSUMER_REGS = 232
 _FC1_A_STAGES = 2
 _FC1_B_STAGES = 2
 _FC1_TILE_STAGES = 2
@@ -1199,30 +1199,26 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     def fc1_ws_tile(self, total0_0: cute.Tensor, total0_1: cute.Tensor,
                     total1_0: cute.Tensor, total1_1: cute.Tensor,
                     total2_0: cute.Tensor, ring: Int32, hdr: Int32,
-                    a_seq: Int32, b_seq: Int32, tid: Int32, lane: Int32,
-                    cw: Int32, fc1_addr: Int64, active: cutlass.Constexpr):
-        ring_a = ring
-        ring_b = ring + Int32(self.fc1_b_off)
-        c_base = ring + Int32(self.fc1_c_off)
-        bar_a_full = ring + Int32(self.fc1_bar_off)
-        bar_a_empty = bar_a_full + Int32(8 * _FC1_A_STAGES)
-        bar_b_full = bar_a_empty + Int32(8 * _FC1_A_STAGES)
-        bar_b_empty = bar_b_full + Int32(8 * _FC1_B_STAGES)
-        proj = cw >> Int32(2)
+                    a_seq: Int32, b_seq: Int32, tid: Int32,
+                    fc1: cute.Tensor, active: cutlass.Constexpr):
+        lane = tid & Int32(31)
+        cw = tid >> Int32(5)
+        proj = tid >> Int32(7)
         n16_0 = (cw & Int32(3)) * Int32(2)
+        c_base = ring + Int32(self.fc1_c_off)
         u_cnt = ld_shared_i32_relaxed(hdr + Int32(20))
         w0 = ld_shared_i32_relaxed(hdr + Int32(24) + proj * Int32(4))
         w1 = ld_shared_i32_relaxed(hdr + Int32(32) + proj * Int32(4))
         w2 = ld_shared_i32_relaxed(hdr + Int32(40) + proj * Int32(4))
-        scale_base0 = hdr + Int32(4 * _FC1_HEADER_WORDS) + proj * Int32(2 * self.blocks)
+        w_pack = w0 | (w1 << Int32(4)) | (w2 << Int32(8)) | (u_cnt << Int32(12))
         for split in cutlass.range(self.splits):
-            if w0 != Int32(0):
+            if (w_pack & Int32(0xF)) != Int32(0):
                 total0_0.fill(Float32(0.0))
                 total0_1.fill(Float32(0.0))
-            if u_cnt >= Int32(2) and w1 != Int32(0):
+            if (w_pack >> Int32(12)) >= Int32(2) and ((w_pack >> Int32(4)) & Int32(0xF)) != Int32(0):
                 total1_0.fill(Float32(0.0))
                 total1_1.fill(Float32(0.0))
-            if u_cnt >= Int32(3) and w2 != Int32(0):
+            if (w_pack >> Int32(12)) >= Int32(3) and ((w_pack >> Int32(8)) & Int32(0xF)) != Int32(0):
                 total2_0.fill(Float32(0.0))
                 for idx in cutlass.range_constexpr(active):
                     c_lo = c_base + Int32(idx * 8192) + tid * Int32(16)
@@ -1232,69 +1228,73 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 kb = split * Int32(8) + block
                 if kb < Int32(self.blocks):
                     a_slot = a_seq % Int32(_FC1_A_STAGES)
-                    _mbar_wait(bar_a_full + a_slot * Int32(8),
+                    _mbar_wait(ring + Int32(self.fc1_bar_off) + a_slot * Int32(8),
                                (a_seq // Int32(_FC1_A_STAGES)) & Int32(1))
-                    a_stage = ring_a + a_slot * Int32(self.fc1_a_bytes)
+                    a_stage = ring + a_slot * Int32(self.fc1_a_bytes)
+                    scale_kb = hdr + Int32(4 * _FC1_HEADER_WORDS) + proj * Int32(2 * self.blocks) + kb * Int32(2)
                     # Unit 0
                     b_slot0 = b_seq % Int32(_FC1_B_STAGES)
-                    _mbar_wait(bar_b_full + b_slot0 * Int32(8),
+                    _mbar_wait(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES) + b_slot0 * Int32(8),
                                (b_seq // Int32(_FC1_B_STAGES)) & Int32(1))
-                    if w0 != Int32(0):
-                        b_stage0 = ring_b + b_slot0 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
-                        sc0 = ld_shared_u16_relaxed(scale_base0 + kb * Int32(2))
+                    w0_cur = w_pack & Int32(0xF)
+                    if w0_cur != Int32(0):
+                        b_stage0 = ring + Int32(self.fc1_b_off) + b_slot0 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
+                        sc0 = ld_shared_u16_relaxed(scale_kb)
                         self.fc1_ws_n16_dot(total0_0, a_stage, b_stage0, c_base, tid, lane,
-                                            n16_0, w0, sc0, active, False)
+                                            n16_0, w0_cur, sc0, active, False)
                         self.fc1_ws_n16_dot(total0_1, a_stage, b_stage0, c_base, tid, lane,
-                                            n16_0 + Int32(1), w0, sc0, active, False)
-                    _mbar_arrive(bar_b_empty + b_slot0 * Int32(8))
+                                            n16_0 + Int32(1), w0_cur, sc0, active, False)
+                    _mbar_arrive(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES + 8 * _FC1_B_STAGES) + b_slot0 * Int32(8))
                     b_seq += Int32(1)
                     # Unit 1
-                    if u_cnt >= Int32(2):
+                    if (w_pack >> Int32(12)) >= Int32(2):
                         b_slot1 = b_seq % Int32(_FC1_B_STAGES)
-                        _mbar_wait(bar_b_full + b_slot1 * Int32(8),
+                        _mbar_wait(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES) + b_slot1 * Int32(8),
                                    (b_seq // Int32(_FC1_B_STAGES)) & Int32(1))
-                        if w1 != Int32(0):
-                            b_stage1 = ring_b + b_slot1 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
-                            sc1 = ld_shared_u16_relaxed(scale_base0 + Int32(4 * self.blocks) + kb * Int32(2))
+                        w1_cur = (w_pack >> Int32(4)) & Int32(0xF)
+                        if w1_cur != Int32(0):
+                            b_stage1 = ring + Int32(self.fc1_b_off) + b_slot1 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
+                            sc1 = ld_shared_u16_relaxed(scale_kb + Int32(4 * self.blocks))
                             self.fc1_ws_n16_dot(total1_0, a_stage, b_stage1, c_base, tid, lane,
-                                                n16_0, w1, sc1, active, False)
+                                                n16_0, w1_cur, sc1, active, False)
                             self.fc1_ws_n16_dot(total1_1, a_stage, b_stage1, c_base, tid, lane,
-                                                n16_0 + Int32(1), w1, sc1, active, False)
-                        _mbar_arrive(bar_b_empty + b_slot1 * Int32(8))
+                                                n16_0 + Int32(1), w1_cur, sc1, active, False)
+                        _mbar_arrive(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES + 8 * _FC1_B_STAGES) + b_slot1 * Int32(8))
                         b_seq += Int32(1)
                     # Unit 2
-                    if u_cnt >= Int32(3):
+                    if (w_pack >> Int32(12)) >= Int32(3):
                         b_slot2 = b_seq % Int32(_FC1_B_STAGES)
-                        _mbar_wait(bar_b_full + b_slot2 * Int32(8),
+                        _mbar_wait(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES) + b_slot2 * Int32(8),
                                    (b_seq // Int32(_FC1_B_STAGES)) & Int32(1))
-                        if w2 != Int32(0):
-                            b_stage2 = ring_b + b_slot2 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
-                            sc2 = ld_shared_u16_relaxed(scale_base0 + Int32(8 * self.blocks) + kb * Int32(2))
+                        w2_cur = (w_pack >> Int32(8)) & Int32(0xF)
+                        if w2_cur != Int32(0):
+                            b_stage2 = ring + Int32(self.fc1_b_off) + b_slot2 * Int32(self.fc1_b_bytes) + proj * Int32(8192)
+                            sc2 = ld_shared_u16_relaxed(scale_kb + Int32(8 * self.blocks))
                             self.fc1_ws_n16_dot(total2_0, a_stage, b_stage2, c_base, tid, lane,
-                                                n16_0, w2, sc2, active, False)
+                                                n16_0, w2_cur, sc2, active, False)
                             self.fc1_ws_n16_dot(total2_0, a_stage, b_stage2, c_base, tid, lane,
-                                                n16_0 + Int32(1), w2, sc2, active, True)
-                        _mbar_arrive(bar_b_empty + b_slot2 * Int32(8))
+                                                n16_0 + Int32(1), w2_cur, sc2, active, True)
+                        _mbar_arrive(ring + Int32(self.fc1_bar_off + 16 * _FC1_A_STAGES + 8 * _FC1_B_STAGES) + b_slot2 * Int32(8))
                         b_seq += Int32(1)
-                    _mbar_arrive(bar_a_empty + a_slot * Int32(8))
+                    _mbar_arrive(ring + Int32(self.fc1_bar_off + 8 * _FC1_A_STAGES) + a_slot * Int32(8))
                     a_seq += Int32(1)
             live = ld_shared_i32_relaxed(hdr + Int32(4))
             v_lo = ld_shared_i32_relaxed(hdr + Int32(8))
             v_hi = ld_shared_i32_relaxed(hdr + Int32(12))
             task_base = ld_shared_i32_relaxed(hdr + Int32(16))
             col = (cw & Int32(3)) * Int32(32) + (lane & Int32(3)) * Int32(2)
-            out_base0 = fc1_addr + (
+            out_base0 = fc1.iterator.toint() + (
                 (task_base * Int32(2) + proj).to(Int64) * Int64(self.group_rows * 128)
                 + col.to(Int64)) * Int64(4)
             unit_stride = Int64(2 * self.group_rows * 128 * 4)
-            if w0 != Int32(0):
+            if (w_pack & Int32(0xF)) != Int32(0):
                 self.fc1_ws_fold_n16(total0_0, out_base0, live, v_lo, v_hi, lane, split, active)
                 self.fc1_ws_fold_n16(total0_1, out_base0 + Int64(64), live, v_lo, v_hi, lane, split, active)
-            if u_cnt >= Int32(2) and w1 != Int32(0):
+            if (w_pack >> Int32(12)) >= Int32(2) and ((w_pack >> Int32(4)) & Int32(0xF)) != Int32(0):
                 out_base1 = out_base0 + unit_stride
                 self.fc1_ws_fold_n16(total1_0, out_base1, live, v_lo, v_hi, lane, split, active)
                 self.fc1_ws_fold_n16(total1_1, out_base1 + Int64(64), live, v_lo, v_hi, lane, split, active)
-            if u_cnt >= Int32(3) and w2 != Int32(0):
+            if (w_pack >> Int32(12)) >= Int32(3) and ((w_pack >> Int32(8)) & Int32(0xF)) != Int32(0):
                 out_base2 = out_base0 + Int64(2) * unit_stride
                 self.fc1_ws_fold_n16(total2_0, out_base2, live, v_lo, v_hi, lane, split, active)
                 for idx in cutlass.range_constexpr(active):
@@ -1353,8 +1353,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                  route_slots, rows, groups, unit_limit)
         else:
             cute.arch.warpgroup_reg_alloc(_FC1_CONSUMER_REGS)
-            lane, cw = tid & Int32(31), tid >> Int32(5)
-            fc1_addr = fc1.iterator.toint()
             hdr_base = ring + Int32(self.fc1_hdr_off)
             total0_0 = cute.make_rmem_tensor((4, 8), Float32)
             total0_1 = cute.make_rmem_tensor((4, 8), Float32)
@@ -1377,7 +1375,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         if num_live == Int32(active):
                             a_seq, b_seq = self.fc1_ws_tile(
                                 total0_0, total0_1, total1_0, total1_1, total2_0,
-                                ring, hdr, a_seq, b_seq, tid, lane, cw, fc1_addr, active)
+                                ring, hdr, a_seq, b_seq, tid, fc1, active)
                     _mbar_arrive(bar_t_empty + hslot * Int32(8))
                     ti += Int32(1)
 
