@@ -89,3 +89,20 @@ def test_grouped_trellis_transform_export(kind, tmp_path):
     checked = validate_exported_header(program, destination / f"{stem}.h", "cuteafd_" + stem)
     assert checked["argument_count"] == (15 if kind.startswith("output") else 16)
     assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+@pytest.mark.parametrize("side,groups", [(1, 1), (2, 1), (1, 4)])
+def test_bf16_t2_native_export(codebook, side, groups, tmp_path):
+    import torch
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    stem = f"trellis_bf16_k6_{codebook}_s{side}_g{groups}"
+    with exportable_compilation():
+        program = compile_trellis_linear_aot(input_features=1152, output_features=256,
+            bits=6, codebook=codebook, sharded_side=side, rotation_count=groups,
+            max_rows=257, groups=groups, input_dtype="bf16")
+    program.export_to_c(str(tmp_path), stem, "cuteafd_" + stem)
+    checked = validate_exported_header(program, tmp_path / f"{stem}.h", "cuteafd_" + stem)
+    assert checked["argument_count"] == (18 if groups == 4 else 9)
+    assert not torch.cuda.is_initialized()

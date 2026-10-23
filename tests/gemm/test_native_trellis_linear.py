@@ -27,7 +27,8 @@ class Case:
         self.inputs = torch.tensor([self.other_x.data_ptr(), self.x.data_ptr()], dtype=torch.int64, device="cuda")
         self.payload = torch.tensor(raw, dtype=torch.uint8, device="cuda")
         self.scales = torch.tensor(rng.uniform(.5, 2, k//128), dtype=torch.float16, device="cuda")
-        self.weight = torch.tensor(weight, device="cuda") * self.scales.float().repeat_interleave(128)[:, None]
+        self.decoded = torch.tensor(weight, device="cuda")
+        self.weight = self.decoded * self.scales.float().repeat_interleave(128)[:, None]
         self.partial = torch.empty((rows, (k+1023)//1024, n), dtype=torch.float32, device="cuda")
         self.output = torch.empty((rows, n), dtype=torch.float32, device="cuda")
         self.program = compile_trellis_linear_aot(input_features=k, output_features=n,
@@ -392,17 +393,19 @@ def test_grouped_geometry_fails_closed(groups, rotation_count):
         geometry(7168, 6144, bits=6, codebook="mcg", rotation_count=rotation_count, groups=groups)
 
 
+@pytest.mark.parametrize("input_dtype", ["f16", "bf16"])
 @pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("bits", [5, 6])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
-def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
+def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook, input_dtype):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
 
     rng = np.random.default_rng(273)
     k, n, max_rows = 1152, 256, 512
     splits = (k + 1023) // 1024
-    rotations = [torch.tensor(rng.normal(0, 0.1, (max_rows, k)), device="cuda", dtype=torch.float16) for _ in range(4)]
+    dtype = torch.bfloat16 if input_dtype == "bf16" else torch.float16
+    rotations = [torch.tensor(rng.normal(0, 0.1, (max_rows, k)), device="cuda", dtype=dtype) for _ in range(4)]
     inputs = torch.tensor([t.data_ptr() for t in rotations], device="cuda", dtype=torch.int64)
     payloads = [torch.tensor(rng.integers(0, 256, k * n * bits // 8, dtype=np.uint8), device="cuda") for _ in range(4)]
     scales = [torch.tensor(rng.uniform(0.5, 2.0, k // 128), device="cuda", dtype=torch.float16) for _ in range(4)]
@@ -413,11 +416,11 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
 
     standalone = compile_trellis_linear_aot(
         input_features=k, output_features=n, bits=bits, codebook=codebook,
-        sharded_side=side, rotation_count=4, max_rows=max_rows, groups=1,
+        sharded_side=side, rotation_count=4, max_rows=max_rows, groups=1, input_dtype=input_dtype,
     )
     grouped = compile_trellis_linear_aot(
         input_features=k, output_features=n, bits=bits, codebook=codebook,
-        sharded_side=side, rotation_count=4, max_rows=max_rows, groups=4,
+        sharded_side=side, rotation_count=4, max_rows=max_rows, groups=4, input_dtype=input_dtype,
     )
 
     def run_standalone(rows, limit):
@@ -569,3 +572,59 @@ def test_bf16_input_fp64_oracle_and_range(side, codebook, bits):
         c.launch(rows)
         assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
         assert torch.isnan(c.output[rows:]).all()
+
+
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+def test_k6_bf16_t2_errors_against_true_weight_f64(side, codebook):
+    """Report old scaled-BF16, BF16 T2, and FP16 T2 against one true oracle."""
+    import json
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    c = Case(k=3072, n=256, side=side, bits=6, rows=257,
+             codebook=codebook, input_dtype="bf16")
+    limit = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count * 4
+    c.launch(257, limit=limit)
+    bf16_result = c.output.clone()
+    factor = c.scales.double().repeat_interleave(128)[:, None]
+    true_weight = c.decoded.double() * factor
+    exact = c.x.double() @ true_weight
+    from b12x.integration.cuteafd.trellis_dequant import compile_trellis_dequant_aot
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+    dequant = compile_trellis_dequant_aot(input_features=3072, output_features=256,
+        chunk_columns=256, codebook=codebook, sharded_side=side)
+    gemm = compile_bf16_projection_aot(width=3072, outputs=256, output_dtype=torch.float32)
+    scaled_bf16 = torch.empty((256, 3072), device="cuda", dtype=torch.bfloat16)
+    dequant.launch(c.payload, c.scales, scaled_bf16, scalars=(0,))
+    assert torch.equal(scaled_bf16.T, true_weight.bfloat16())
+    old_result = torch.empty_like(c.output)
+    gemm.launch(c.x, scaled_bf16, old_result, scalars=(257,))
+    bf16_oracle = c.x.double() @ (c.decoded.bfloat16().double() * factor)
+    torch.testing.assert_close(bf16_result.double(), bf16_oracle, rtol=2e-4, atol=2e-5)
+    x_f16 = c.x.half()
+    table_f16 = torch.tensor([x_f16.data_ptr()], device="cuda", dtype=torch.int64)
+    fp16_program = compile_trellis_linear_aot(input_features=3072, output_features=256,
+        sharded_side=side, bits=6, codebook=codebook, rotation_count=1, max_rows=257)
+    fp16_program.launch(table_f16, c.payload, c.scales, c.partial.flatten(),
+        c.output.flatten(), scalars=(257, 0, limit))
+    fp16_result = c.output.clone()
+    errors = {name: torch.linalg.vector_norm(value.double() - exact).item()
+              for name, value in (("old_route", old_result),
+                                  ("bf16_t2", bf16_result), ("fp16_t2", fp16_result))}
+    print(json.dumps(dict(side=side, codebook=codebook, rows=257, errors_l2=errors)), flush=True)
+    # Nonunit scales round before GEMM only on the old route; its error is
+    # not a bound for BF16 T2. Production ingress emits unit block scales.
+    assert np.isfinite(errors["bf16_t2"])
+    assert errors["fp16_t2"] <= 1.01 * errors["old_route"], errors
+    for live in (1, 16, 64, 128, 129, 130, 131, 255, 256, 257):
+        c.output.fill_(float("nan"))
+        c.partial.fill_(float("nan"))
+        c.launch(live, limit=1 if live < 130 else limit)
+        assert torch.equal(c.output[:live].view(torch.int32), bf16_result[:live].view(torch.int32))
+        assert torch.isnan(c.output[live:]).all()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        c.launch(257, limit=limit)
+    c.output.fill_(float("nan"))
+    graph.replay()
+    assert torch.equal(c.output.view(torch.int32), bf16_result.view(torch.int32))
