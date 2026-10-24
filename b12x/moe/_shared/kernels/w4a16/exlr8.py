@@ -1705,6 +1705,10 @@ class Exlr8RoutedServingKernel:
                                     x_row1_g1 = x_addr + row1_g1.to(Int64) * Int64(self.hidden_size * 2)
                                     fc1_task0 = u_idx * Int32(2) + proj
                                     fc1_task1 = (u_idx + owned_cnt) * Int32(2) + proj
+                                    grand0 = cute.make_rmem_tensor((4, 4), Float32)
+                                    grand1 = cute.make_rmem_tensor((4, 4), Float32)
+                                    grand0.fill(Float32(0.0))
+                                    grand1.fill(Float32(0.0))
                                     if width != Int32(0):
                                         payload = pointers[desc * Int64(3)]
                                         scales = pointers[desc * Int64(3) + Int64(2)]
@@ -1721,31 +1725,21 @@ class Exlr8RoutedServingKernel:
                                                 ia2, ib2, shift2_lo, shift2_hi, ia3, ib3, shift3_lo, shift3_hi, policy,
                                             )
                                             for n in cutlass.range_constexpr(4):
-                                                col = col_in_warp + Int32(n * 8)
-                                                base0 = fc1_addr + (fc1_task0.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                                                base1 = fc1_addr + (fc1_task1.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                                                if split == Int32(0):
-                                                    if valid0 != Int32(0):
-                                                        st_global_v2_f32(base0, Float32(0.0) + total0[n, 0], Float32(0.0) + total0[n, 1])
-                                                    if valid1 != Int32(0):
-                                                        st_global_v2_f32(base0 + Int64(8 * 128 * 4), Float32(0.0) + total0[n, 2], Float32(0.0) + total0[n, 3])
-                                                    if valid0_g1 != Int32(0):
-                                                        st_global_v2_f32(base1, Float32(0.0) + total1[n, 0], Float32(0.0) + total1[n, 1])
-                                                    if valid1_g1 != Int32(0):
-                                                        st_global_v2_f32(base1 + Int64(8 * 128 * 4), Float32(0.0) + total1[n, 2], Float32(0.0) + total1[n, 3])
-                                                else:
-                                                    if valid0 != Int32(0):
-                                                        p0, p1 = _ld_global_v2_f32(base0)
-                                                        st_global_v2_f32(base0, p0 + total0[n, 0], p1 + total0[n, 1])
-                                                    if valid1 != Int32(0):
-                                                        p2, p3 = _ld_global_v2_f32(base0 + Int64(8 * 128 * 4))
-                                                        st_global_v2_f32(base0 + Int64(8 * 128 * 4), p2 + total0[n, 2], p3 + total0[n, 3])
-                                                    if valid0_g1 != Int32(0):
-                                                        q0, q1 = _ld_global_v2_f32(base1)
-                                                        st_global_v2_f32(base1, q0 + total1[n, 0], q1 + total1[n, 1])
-                                                    if valid1_g1 != Int32(0):
-                                                        q2, q3 = _ld_global_v2_f32(base1 + Int64(8 * 128 * 4))
-                                                        st_global_v2_f32(base1 + Int64(8 * 128 * 4), q2 + total1[n, 2], q3 + total1[n, 3])
+                                                for v in cutlass.range_constexpr(4):
+                                                    grand0[n, v] = grand0[n, v] + total0[n, v]
+                                                    grand1[n, v] = grand1[n, v] + total1[n, v]
+                                    for n in cutlass.range_constexpr(4):
+                                        col = col_in_warp + Int32(n * 8)
+                                        base0 = fc1_addr + (fc1_task0.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
+                                        base1 = fc1_addr + (fc1_task1.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
+                                        if width != Int32(0) and valid0 != Int32(0):
+                                            st_global_v2_f32(base0, grand0[n, 0], grand0[n, 1])
+                                        if width != Int32(0) and valid1 != Int32(0):
+                                            st_global_v2_f32(base0 + Int64(8 * 128 * 4), grand0[n, 2], grand0[n, 3])
+                                        if width != Int32(0) and valid0_g1 != Int32(0):
+                                            st_global_v2_f32(base1, grand1[n, 0], grand1[n, 1])
+                                        if width != Int32(0) and valid1_g1 != Int32(0):
+                                            st_global_v2_f32(base1 + Int64(8 * 128 * 4), grand1[n, 2], grand1[n, 3])
                                 else:
                                     grand = cute.make_rmem_tensor((4, 4), Float32)
                                     grand.fill(Float32(0.0))
