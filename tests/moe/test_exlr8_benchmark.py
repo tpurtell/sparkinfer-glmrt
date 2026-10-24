@@ -231,6 +231,7 @@ def test_routed_serving_variant_keys_keep_unrelated_programs_unchanged(monkeypat
     decode = compile_exlr8_a16_aot(device_count=False)
     shared = compile_exlr8_a16_aot(top_k=1, max_groups=4, device_count=True, shared_expert=True)
     grouped = compile_exlr8_a16_aot(device_count=True, grouped=True, group_rows=64)
+    default_srv = compile_exlr8_a16_aot(device_count=True)
     base_srv = compile_exlr8_a16_aot(device_count=True, serving_variant="baseline")
     v1 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_compact_prefetch")
     v2 = compile_exlr8_a16_aot(device_count=True, serving_variant="k1_paired_fc1")
@@ -238,6 +239,7 @@ def test_routed_serving_variant_keys_keep_unrelated_programs_unchanged(monkeypat
     assert decode.key[-1] == "decode_l2_fc2_prefetch_v9"
     assert shared.key[-1] == "decode_l2_fc2_prefetch_v9"
     assert grouped.key[-1] == "grouped_compact_units"
+    assert default_srv.key == base_srv.key
     assert base_srv.key[-1] == "decode_l2_fc2_prefetch_v9"
     assert len({base_srv.key, v1.key, v2.key, v3.key}) == 4
 

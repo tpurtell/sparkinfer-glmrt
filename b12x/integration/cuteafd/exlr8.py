@@ -17,7 +17,7 @@ ABI_VERSION = 3
 # Launch hint, not math: callers pass cta_limit = cudaDevAttr SM count * this.
 # Mirrors Exlr8A16Kernel.CTAS_PER_SM (kept literal so the contract stays CUDA-free).
 CTAS_PER_SM = 4
-DEFAULT_SERVING_VARIANT = "k1_reg_pair_b2"
+DEFAULT_SERVING_VARIANT = "baseline"
 POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
             "route_group_lane", "route_weights", "fc1", "intermediate", "fc2",
             "signs_out", "output")
