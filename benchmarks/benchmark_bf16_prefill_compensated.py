@@ -233,69 +233,39 @@ def _build_screening_candidates(
         ("auto_default", Bf16PrefillKernel(n, k), m_list),
     ]
     if (n, k) == (6144, 4096):
-        small_ms = (1, 2, 4, 8, 16)
-        short_ms = (59, 64)
-        chunk_ms = (128, 192, 256, 257, 300, 320, 383)
-        large_ms = (256, 512, 1024, 2048, 4096, 8192)
-        candidates.extend([
-            ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, k_unroll=1, buffer_align_bytes=128, group_m=1), small_ms),
-            ("s_16x64_s6_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, k_unroll=1, buffer_align_bytes=128, group_m=1), small_ms),
-            ("sh_w4x2_64x32_s4_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=1), short_ms),
-            ("ch_w4x2_64x64_s3_gm0", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, k_unroll=1, buffer_align_bytes=128, group_m=0), chunk_ms),
-            ("ch_w4x4_64x128_s4_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=1), chunk_ms),
-            ("ch_split256_16x64", Bf16PrefillKernel(
-                n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, k_unroll=1, buffer_align_bytes=128, group_m=0,
-                chunk256_tail=(
-                    256, 300,
-                    dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, k_unroll=1, buffer_align_bytes=128, group_m=1),
-                    dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, k_unroll=1, buffer_align_bytes=128, group_m=1),
-                ),
-            ), (257, 300)),
-            ("lg_w4x2_64x64_s4_gm8_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=8), large_ms),
-            ("lg_w4x4_64x128_s4_gm8_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=8), large_ms),
-        ])
+        for s in (3, 4):
+            for gm in (1, 8, 16):
+                candidates.append((
+                    f"r4_q_w4x4_64x128_s{s}_gm{gm}",
+                    Bf16PrefillKernel(
+                        n, k,
+                        warp_layout=(4, 4),
+                        tile_m=64,
+                        tile_n=128,
+                        num_stages=s,
+                        k_unroll=1,
+                        buffer_align_bytes=128,
+                        group_m=gm,
+                    ),
+                    (2048,),
+                ))
     elif (n, k) == (24752, 7168):
-        kimi_sweep_ms = (256, 512, 1024, 2048, 8192)
-        for tm, wls in ((128, ((4, 4), (2, 8), (8, 2))), (256, ((4, 4),))):
-            for wl in wls:
-                for tn in (64, 128):
-                    for s in (2, 3, 4):
-                        smem_bytes = (tm + tn) * 64 * 2 * s + 256
-                        if smem_bytes > 101376:
-                            continue
-                        for gm in (1, 8):
-                            for ku in (1, 2):
-                                name = f"tm{tm}_w{wl[0]}x{wl[1]}_tn{tn}_s{s}_gm{gm}_u{ku}"
-                                candidates.append((
-                                    name,
-                                    Bf16PrefillKernel(
-                                        n, k,
-                                        warp_layout=wl,
-                                        tile_m=tm,
-                                        tile_n=tn,
-                                        num_stages=s,
-                                        k_unroll=ku,
-                                        buffer_align_bytes=128,
-                                        group_m=gm,
-                                    ),
-                                    kimi_sweep_ms,
-                                ))
-                        if tn == 64 and wl in ((4, 4), (8, 2)):
-                            name0 = f"tm{tm}_w{wl[0]}x{wl[1]}_tn{tn}_s{s}_gm0_u1"
-                            candidates.append((
-                                name0,
-                                Bf16PrefillKernel(
-                                    n, k,
-                                    warp_layout=wl,
-                                    tile_m=tm,
-                                    tile_n=tn,
-                                    num_stages=s,
-                                    k_unroll=1,
-                                    buffer_align_bytes=128,
-                                    group_m=0,
-                                ),
-                                kimi_sweep_ms,
-                            ))
+        for s in (3, 4):
+            for gm in (1, 8, 16):
+                candidates.append((
+                    f"r4_kimi_w4x4_128x64_s{s}_gm{gm}",
+                    Bf16PrefillKernel(
+                        n, k,
+                        warp_layout=(4, 4),
+                        tile_m=128,
+                        tile_n=64,
+                        num_stages=s,
+                        k_unroll=1,
+                        buffer_align_bytes=128,
+                        group_m=gm,
+                    ),
+                    (2048,),
+                ))
     else:
         candidates.extend([
             ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, k_unroll=1, buffer_align_bytes=128, group_m=1), (1, 8, 64)),
