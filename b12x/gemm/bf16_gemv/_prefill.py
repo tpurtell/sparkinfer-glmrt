@@ -76,6 +76,105 @@ def _warp_gemm(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, sha
 
 
 @cute.jit
+def _warp_gemm_unroll1(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, shared_b,
+                       copy_a, copy_b):
+    target_a = copy_a.retile(fragment_a)
+    target_b = copy_b.retile(fragment_b)
+    segment = cute.make_rmem_tensor((acc.shape[0], 1, 1), Float32)
+    for k in cutlass.range(cute.size(shared_a.shape[2]), unroll=1):
+        cute.copy(copy_a, shared_a[None, None, k], target_a[None, None, 0])
+        cute.copy(copy_b, shared_b[None, None, k], target_b[None, None, 0])
+        for m in cutlass.range_constexpr(cute.size(acc.shape[1])):
+            frag_a_m = cute.make_tensor(
+                fragment_a[None, m, 0].iterator,
+                cute.make_layout((fragment_a.shape[0], 1)),
+            )
+            for n in cutlass.range_constexpr(cute.size(acc.shape[2])):
+                frag_b_n = cute.make_tensor(
+                    fragment_b[None, n, 0].iterator,
+                    cute.make_layout((fragment_b.shape[0], 1)),
+                )
+                segment.fill(0.0)
+                cute.gemm(tiled_mma, segment, frag_a_m, frag_b_n, segment)
+                acc_mn = acc[None, m, n]
+                corr_mn = correction[None, m, n]
+                seg_mn = segment[None, 0, 0]
+                addend = seg_mn.load() - corr_mn.load()
+                total = acc_mn.load() + addend
+                corr_mn.store((total - acc_mn.load()) - addend)
+                acc_mn.store(total)
+
+
+@cute.jit
+def _warp_gemm_unroll2(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, shared_b,
+                       copy_a, copy_b):
+    target_a = copy_a.retile(fragment_a)
+    target_b = copy_b.retile(fragment_b)
+    segment = cute.make_rmem_tensor((acc.shape[0], 1, 1), Float32)
+    for k_pair in cutlass.range(cute.size(shared_a.shape[2]) // 2, unroll=1):
+        k0 = k_pair * Int32(2)
+        k1 = k0 + Int32(1)
+        cute.copy(copy_a, shared_a[None, None, k0], target_a[None, None, 0])
+        cute.copy(copy_b, shared_b[None, None, k0], target_b[None, None, 0])
+        cute.copy(copy_a, shared_a[None, None, k1], target_a[None, None, 1])
+        cute.copy(copy_b, shared_b[None, None, k1], target_b[None, None, 1])
+        for s in cutlass.range_constexpr(2):
+            for m in cutlass.range_constexpr(cute.size(acc.shape[1])):
+                frag_a_m = cute.make_tensor(
+                    fragment_a[None, m, s].iterator,
+                    cute.make_layout((fragment_a.shape[0], 1)),
+                )
+                for n in cutlass.range_constexpr(cute.size(acc.shape[2])):
+                    frag_b_n = cute.make_tensor(
+                        fragment_b[None, n, s].iterator,
+                        cute.make_layout((fragment_b.shape[0], 1)),
+                    )
+                    segment.fill(0.0)
+                    cute.gemm(tiled_mma, segment, frag_a_m, frag_b_n, segment)
+                    acc_mn = acc[None, m, n]
+                    corr_mn = correction[None, m, n]
+                    seg_mn = segment[None, 0, 0]
+                    addend = seg_mn.load() - corr_mn.load()
+                    total = acc_mn.load() + addend
+                    corr_mn.store((total - acc_mn.load()) - addend)
+                    acc_mn.store(total)
+
+
+@cute.jit
+def _warp_gemm_seg1(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, shared_b,
+                    copy_a, copy_b):
+    target_a = copy_a.retile(fragment_a)
+    target_b = copy_b.retile(fragment_b)
+    segment = cute.make_rmem_tensor((acc.shape[0], 1, 1), Float32)
+    cute.copy(copy_a, shared_a[None, None, 0], target_a[None, None, 0])
+    cute.copy(copy_b, shared_b[None, None, 0], target_b[None, None, 0])
+    for k in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
+        if k < cute.size(shared_a.shape[2]) - 1:
+            cute.copy(copy_a, shared_a[None, None, k + 1], target_a[None, None, (k + 1) % 2])
+            cute.copy(copy_b, shared_b[None, None, k + 1], target_b[None, None, (k + 1) % 2])
+        s = k % 2
+        for m in cutlass.range_constexpr(cute.size(acc.shape[1])):
+            frag_a_m = cute.make_tensor(
+                fragment_a[None, m, s].iterator,
+                cute.make_layout((fragment_a.shape[0], 1)),
+            )
+            for n in cutlass.range_constexpr(cute.size(acc.shape[2])):
+                frag_b_n = cute.make_tensor(
+                    fragment_b[None, n, s].iterator,
+                    cute.make_layout((fragment_b.shape[0], 1)),
+                )
+                segment.fill(0.0)
+                cute.gemm(tiled_mma, segment, frag_a_m, frag_b_n, segment)
+                acc_mn = acc[None, m, n]
+                corr_mn = correction[None, m, n]
+                seg_mn = segment[None, 0, 0]
+                addend = seg_mn.load() - corr_mn.load()
+                total = acc_mn.load() + addend
+                corr_mn.store((total - acc_mn.load()) - addend)
+                acc_mn.store(total)
+
+
+@cute.jit
 def _warp_gemm_direct(tiled_mma, acc, fragment_a, fragment_b, shared_a, shared_b, copy_a, copy_b):
     target_a = copy_a.retile(fragment_a)
     target_b = copy_b.retile(fragment_b)
@@ -86,6 +185,77 @@ def _warp_gemm_direct(tiled_mma, acc, fragment_a, fragment_b, shared_a, shared_b
             cute.copy(copy_a, shared_a[None, None, k + 1], target_a[None, None, k + 1])
             cute.copy(copy_b, shared_b[None, None, k + 1], target_b[None, None, k + 1])
         cute.gemm(tiled_mma, acc, fragment_a[None, None, k], fragment_b[None, None, k], acc)
+
+
+COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
+    (6144, 4096): dict(
+        warp_layout=(4, 4),
+        tile_m=64,
+        tile_n=128,
+        num_stages=4,
+        unroll_k_inner=1,
+        buffer_align_bytes=128,
+        group_m=8,
+        tiles_by_rows=(
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (384, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+        ),
+    ),
+    (24752, 7168): dict(
+        warp_layout=(4, 4),
+        tile_m=64,
+        tile_n=128,
+        num_stages=4,
+        unroll_k_inner=1,
+        buffer_align_bytes=128,
+        group_m=8,
+        tiles_by_rows=(
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (256, dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+        ),
+    ),
+    (384, 5120): dict(
+        warp_layout=(4, 2),
+        tile_m=64,
+        tile_n=32,
+        num_stages=4,
+        unroll_k_inner=1,
+        buffer_align_bytes=128,
+        group_m=1,
+        tiles_by_rows=(
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+        ),
+    ),
+    (512, 5120): dict(
+        warp_layout=(4, 2),
+        tile_m=64,
+        tile_n=32,
+        num_stages=4,
+        unroll_k_inner=1,
+        buffer_align_bytes=128,
+        group_m=1,
+        tiles_by_rows=(
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+        ),
+    ),
+    (1024, 5120): dict(
+        warp_layout=(4, 2),
+        tile_m=64,
+        tile_n=32,
+        num_stages=4,
+        unroll_k_inner=1,
+        buffer_align_bytes=128,
+        group_m=1,
+        tiles_by_rows=(
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+        ),
+    ),
+}
 
 
 class Bf16PrefillKernel:
@@ -106,8 +276,12 @@ class Bf16PrefillKernel:
     def __init__(self, n: int, k: int, *, compute_warps: int | None = None,
                  tile_n: int | None = None, num_stages: int | None = None,
                  compensated: bool = True, warp_layout: tuple[int, int] | None = None,
-                 tile_m: int | None = None):
-        """Defaults keep the original 64x64x64, two-stage, compensated kernel.
+                 tile_m: int | None = None, unroll_k_inner: int | None = None,
+                 buffer_align_bytes: int | None = None, group_m: int | None = None,
+                 tiles_by_rows: tuple | None = None,
+                 chunk256_tail: tuple | None = None,
+                 legacy: bool = False):
+        """Defaults keep the compensated BF16 prefill kernel contract.
 
         ``compensated=False`` accumulates directly in the tensor-core FP32
         accumulators (cuBLAS-style). ``compute_warps`` sets tile_m = 16 x warps.
@@ -115,6 +289,34 @@ class Bf16PrefillKernel:
         a grid (each owns a ``tile_m / wm`` x ``tile_n / wn`` block): the same
         per-element K order, fewer shared-memory fragment reads per MMA.
         """
+        self.n, self.k = int(n), int(k)
+        self.legacy = bool(legacy)
+        if (
+            not self.legacy
+            and compensated
+            and compute_warps is None
+            and tile_n is None
+            and num_stages is None
+            and warp_layout is None
+            and tile_m is None
+            and unroll_k_inner is None
+            and buffer_align_bytes is None
+            and group_m is None
+            and tiles_by_rows is None
+            and chunk256_tail is None
+        ):
+            auto_cfg = COMPENSATED_PREFILL_CONFIGS.get((self.n, self.k))
+            if auto_cfg is not None:
+                warp_layout = auto_cfg.get("warp_layout")
+                tile_m = auto_cfg.get("tile_m")
+                tile_n = auto_cfg.get("tile_n")
+                num_stages = auto_cfg.get("num_stages")
+                unroll_k_inner = auto_cfg.get("unroll_k_inner")
+                buffer_align_bytes = auto_cfg.get("buffer_align_bytes")
+                group_m = auto_cfg.get("group_m")
+                tiles_by_rows = auto_cfg.get("tiles_by_rows")
+                chunk256_tail = auto_cfg.get("chunk256_tail")
+
         self.warp_layout = None
         if compute_warps is not None:
             self.num_compute_warps = int(compute_warps)
@@ -132,11 +334,55 @@ class Bf16PrefillKernel:
         if num_stages is not None:
             self.num_stages = int(num_stages)
         self.compensated = bool(compensated)
-        self.n, self.k = int(n), int(k)
+        if self.legacy:
+            self.unroll_k_inner = 4
+            self.buffer_align_bytes = 1024
+            self.group_m = 0
+        else:
+            self.unroll_k_inner = int(unroll_k_inner) if unroll_k_inner is not None else (1 if self.compensated else 4)
+            if buffer_align_bytes is not None:
+                self.buffer_align_bytes = int(buffer_align_bytes)
+            self.group_m = int(group_m) if group_m is not None else 0
+
         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k:
             raise ValueError("BF16 prefill needs positive N and K divisible by 64")
         self.k_tiles = self.k // self.tile_k
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
+
+        self._row_kernels = None
+        self._row_floors = ()
+        self._row_limits = ()
+        self._top_floor = 0
+        if tiles_by_rows:
+            limits = tuple(int(entry[0]) for entry in tiles_by_rows)
+            self._row_limits = limits
+            self._row_floors = (0,) + limits[:-1]
+            self._top_floor = limits[-1]
+            self._row_kernels = [
+                Bf16PrefillKernel(
+                    self.n,
+                    self.k,
+                    compensated=self.compensated,
+                    tiles_by_rows=(),
+                    **entry[1],
+                )
+                for entry in tiles_by_rows
+            ]
+
+        self._chunk256_tail = None
+        if chunk256_tail is not None:
+            t_floor, t_limit, chunk_cfg, tail_cfg = chunk256_tail
+            self._tail_floor = int(t_floor)
+            self._tail_limit = int(t_limit)
+            if self._tail_limit > self._top_floor:
+                self._top_floor = self._tail_limit
+            self._chunk256_kernel = Bf16PrefillKernel(
+                self.n, self.k, compensated=self.compensated, tiles_by_rows=(), **chunk_cfg
+            )
+            self._tail_kernel = Bf16PrefillKernel(
+                self.n, self.k, compensated=self.compensated, tiles_by_rows=(), **tail_cfg
+            )
+            self._chunk256_tail = True
 
     def _get_tiled_mma(self) -> cute.TiledMma:
         if self.warp_layout is not None:
@@ -198,21 +444,15 @@ class Bf16PrefillKernel:
         return cute.struct(SharedStorage)
 
     @cute.jit
-    def __call__(
+    def _launch_single(
         self,
         source: cute.Tensor,
         weight: cute.Tensor,
         output: cute.Tensor,
         num_tokens: Int32,
         stream: cuda.CUstream,
+        m_tile_offset: cutlass.Constexpr = 0,
     ):
-        if const_expr(source.element_type != cutlass.BFloat16):
-            raise TypeError("source must be BFloat16")
-        if const_expr(weight.element_type != cutlass.BFloat16):
-            raise TypeError("weight must be BFloat16")
-        if const_expr(output.element_type not in (cutlass.Float32, cutlass.BFloat16)):
-            raise TypeError("output must be Float32 or BFloat16")
-
         sA_layout, sB_layout = self._get_smem_layouts()
         tiled_mma = self._get_tiled_mma()
         SharedStorage = self._get_shared_storage_cls(sA_layout, sB_layout)
@@ -234,7 +474,15 @@ class Bf16PrefillKernel:
             (self.tile_n, self.tile_k),
             num_multicast=1,
         )
-        grid_m = (num_tokens + Int32(self.tile_m - 1)) // Int32(self.tile_m)
+        if const_expr(m_tile_offset > 0):
+            active_rows = num_tokens - Int32(m_tile_offset * self.tile_m)
+        else:
+            active_rows = num_tokens
+        grid_m = (active_rows + Int32(self.tile_m - 1)) // Int32(self.tile_m)
+        if const_expr(self.group_m > 0):
+            grid_dims = (self.n_tiles, grid_m, 1)
+        else:
+            grid_dims = (grid_m, self.n_tiles, 1)
         self.kernel(
             tma_tensor_A,
             tma_tensor_B,
@@ -246,12 +494,91 @@ class Bf16PrefillKernel:
             tiled_mma,
             SharedStorage,
             num_tokens,
+            m_tile_offset,
         ).launch(
-            grid=(grid_m, self.n_tiles, 1),
+            grid=grid_dims,
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
         )
+
+    @cute.jit
+    def __call__(
+        self,
+        source: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        if const_expr(source.element_type != cutlass.BFloat16):
+            raise TypeError("source must be BFloat16")
+        if const_expr(weight.element_type != cutlass.BFloat16):
+            raise TypeError("weight must be BFloat16")
+        if const_expr(output.element_type not in (cutlass.Float32, cutlass.BFloat16)):
+            raise TypeError("output must be Float32 or BFloat16")
+
+        if const_expr(self._row_kernels is not None or self._chunk256_tail is not None):
+            if const_expr(self._row_kernels is not None):
+                for i in cutlass.range_constexpr(len(self._row_kernels)):
+                    if num_tokens > Int32(self._row_floors[i]):
+                        if num_tokens <= Int32(self._row_limits[i]):
+                            self._row_kernels[i]._launch_single(
+                                source, weight, output, num_tokens, stream, 0
+                            )
+            if const_expr(self._chunk256_tail is not None):
+                if num_tokens > Int32(self._tail_floor):
+                    if num_tokens <= Int32(self._tail_limit):
+                        self._chunk256_kernel._launch_single(
+                            source, weight, output, Int32(256), stream, 0
+                        )
+                        self._tail_kernel._launch_single(
+                            source,
+                            weight,
+                            output,
+                            num_tokens,
+                            stream,
+                            256 // self._tail_kernel.tile_m,
+                        )
+            if num_tokens > Int32(self._top_floor):
+                self._launch_single(source, weight, output, num_tokens, stream, 0)
+        else:
+            self._launch_single(source, weight, output, num_tokens, stream, 0)
+
+    @cute.jit
+    def _resolve_tile_coords(
+        self,
+        num_tokens: Int32,
+        m_tile_offset: cutlass.Constexpr = 0,
+    ):
+        if const_expr(self.group_m > 0):
+            raw_n, raw_m, _ = cute.arch.block_idx()
+            local_m = raw_m
+            n_tile = raw_n
+            if const_expr(self.group_m > 1):
+                if const_expr(m_tile_offset > 0):
+                    active_rows = num_tokens - Int32(m_tile_offset * self.tile_m)
+                else:
+                    active_rows = num_tokens
+                grid_m = (active_rows + Int32(self.tile_m - 1)) // Int32(self.tile_m)
+                group_id = raw_m // Int32(self.group_m)
+                first_pid_m = group_id * Int32(self.group_m)
+                in_group = (raw_m % Int32(self.group_m)) * Int32(self.n_tiles) + raw_n
+                rem_m = grid_m - first_pid_m
+                if rem_m >= Int32(self.group_m):
+                    local_m = first_pid_m + (in_group % Int32(self.group_m))
+                    n_tile = in_group // Int32(self.group_m)
+                else:
+                    local_m = first_pid_m + (in_group % rem_m)
+                    n_tile = in_group // rem_m
+        else:
+            local_m, n_tile, _ = cute.arch.block_idx()
+
+        if const_expr(m_tile_offset > 0):
+            m_tile = local_m + Int32(m_tile_offset)
+        else:
+            m_tile = local_m
+        return m_tile, n_tile
 
     @cute.kernel
     def kernel(
@@ -266,9 +593,20 @@ class Bf16PrefillKernel:
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
         num_tokens: Int32,
+        m_tile_offset: cutlass.Constexpr = 0,
     ):
+        # Termination invariants (verified offline on SM120 cubins):
+        # 1. No setmaxnreg / USETMAXREG.TRY_ALLOC.CTAPOOL path is used; all tile
+        #    specializations fit naturally in <=68 GPRs with 0 stack frame.
+        # 2. Both consumer warps (0..num_compute_warps-1) and the single producer
+        #    warp (producer_warp == num_compute_warps) iterate over the same
+        #    compile-time positive bound k_tiles = K // 64 >= 1 with no early
+        #    exit or row-masking inside the PipelineTmaAsync loop. Every
+        #    consumer_wait has a matching producer_commit (including partial
+        #    boundary M/N tiles where TMA zero-fills out-of-bounds elements and
+        #    still delivers tx_count = tma_copy_bytes).
+        # 3. Runtime num_tokens only guards the final epilogue global stores.
         tidx, _, _ = cute.arch.thread_idx()
-        m_tile, n_tile, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if warp_idx == 0:
@@ -359,17 +697,54 @@ class Bf16PrefillKernel:
             for _k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
                 load_pipeline.consumer_wait(consumer_state)
                 if const_expr(self.compensated):
-                    _warp_gemm(
-                        thr_mma,
-                        acc,
-                        correction,
-                        tCrA,
-                        tCrB,
-                        tSsA[None, None, None, consumer_state.index],
-                        tSsB[None, None, None, consumer_state.index],
-                        smem_thr_copy_A,
-                        smem_thr_copy_B,
-                    )
+                    if const_expr(self.unroll_k_inner == 1):
+                        _warp_gemm_unroll1(
+                            thr_mma,
+                            acc,
+                            correction,
+                            tCrA,
+                            tCrB,
+                            tSsA[None, None, None, consumer_state.index],
+                            tSsB[None, None, None, consumer_state.index],
+                            smem_thr_copy_A,
+                            smem_thr_copy_B,
+                        )
+                    elif const_expr(self.unroll_k_inner == 2):
+                        _warp_gemm_unroll2(
+                            thr_mma,
+                            acc,
+                            correction,
+                            tCrA,
+                            tCrB,
+                            tSsA[None, None, None, consumer_state.index],
+                            tSsB[None, None, None, consumer_state.index],
+                            smem_thr_copy_A,
+                            smem_thr_copy_B,
+                        )
+                    elif const_expr(self.unroll_k_inner == 3):
+                        _warp_gemm_seg1(
+                            thr_mma,
+                            acc,
+                            correction,
+                            tCrA,
+                            tCrB,
+                            tSsA[None, None, None, consumer_state.index],
+                            tSsB[None, None, None, consumer_state.index],
+                            smem_thr_copy_A,
+                            smem_thr_copy_B,
+                        )
+                    else:
+                        _warp_gemm(
+                            thr_mma,
+                            acc,
+                            correction,
+                            tCrA,
+                            tCrB,
+                            tSsA[None, None, None, consumer_state.index],
+                            tSsB[None, None, None, consumer_state.index],
+                            smem_thr_copy_A,
+                            smem_thr_copy_B,
+                        )
                 else:
                     _warp_gemm_direct(
                         thr_mma,
@@ -385,6 +760,7 @@ class Bf16PrefillKernel:
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
+            m_tile, n_tile = self._resolve_tile_coords(num_tokens, m_tile_offset)
             coordinates = thr_mma.partition_C(
                 cute.make_identity_tensor((self.tile_m, self.tile_n))
             )
@@ -409,6 +785,7 @@ class Bf16PrefillKernel:
                             output.element_type)
 
         elif warp_idx == Int32(self.producer_warp):
+            m_tile, n_tile = self._resolve_tile_coords(num_tokens, m_tile_offset)
             producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.num_stages,
