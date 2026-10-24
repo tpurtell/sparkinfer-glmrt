@@ -101,6 +101,7 @@ def _reference(packed, width):
     return b.cuda()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("scaled", [False, True], ids=["unit", "e8m0"])
 def test_exlr8_a8_fragment(width, scaled):
