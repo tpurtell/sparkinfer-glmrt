@@ -1020,10 +1020,14 @@ GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024,
                 "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512}
 GLM_ROUTES = Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
 COORDINATOR_FAMILIES = {
-    "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
-                model="zai-org/GLM-5.3", profiles=tuple(GLM_PROFILES), routes=GLM_ROUTES),
-    "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), swiglu_limit=10.0,
-                 model="zai-org/GLM-5.3-Flash", profiles=("rtx-tp1", "rtx-tp2"), routes=None),
+    "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), activation="silu", swiglu_limit=None,
+                model="zai-org/GLM-5.3", profiles=dict(GLM_PROFILES), capacities=GLM_CAPACITIES, routes=GLM_ROUTES),
+    "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), activation="silu", swiglu_limit=10.0,
+                 model="zai-org/GLM-5.3-Flash", profiles={"rtx-tp1": 2048, "rtx-tp2": 1024},
+                 capacities=GLM_CAPACITIES, routes=None),
+    "kimik3": dict(hidden=3584, experts=896, top_k=16, bits=(2, 3), activation="situ", swiglu_limit=None,
+                   model="moonshotai/Kimi-K3", profiles={"rtx-tp1": 3072, "rtx-tp2": 1536},
+                   capacities=(256, 1024, 4096), routes=None),
 }
 
 
@@ -1060,18 +1064,19 @@ def parse_coordinator_arm(text):
 
 
 def coordinator_compile_options(profile, capacity, arm, props, family="glm"):
-    """Mirror GLM/GLMF's cooperative coordinator export, with explicit experimental overrides."""
+    """Mirror the family's cooperative coordinator export, with explicit experimental overrides."""
     spec = COORDINATOR_FAMILIES.get(family)
-    if spec is None or profile not in spec["profiles"] or capacity not in GLM_CAPACITIES:
-        raise ValueError("GLM requires a supported RTX/Spark profile and capacity 256/1024/2752/4096")
+    if spec is None or profile not in spec["profiles"] or capacity not in spec["capacities"]:
+        raise ValueError("coordinator requires a supported family profile and legal prefill capacity")
     hidden, experts, topk = spec["hidden"], spec["experts"], spec["top_k"]
     tier0_bits, tier1_bits = spec["bits"]
-    width = GLM_PROFILES[profile]
+    width = spec["profiles"][profile]
     spark = profile.startswith("spark-")
     ws = arm.get("mode", "cooperative") == "ws"
-    block = arm.get("route_block", 64 if ws or capacity > 256 else 8)
+    served_wide = family in ("glm", "glmf") and capacity > 256
+    block = arm.get("route_block", 64 if ws or served_wide else 8)
     rotation = arm.get("rotation", "route" if ws else "served")
-    token = rotation == "token" or (rotation == "served" and capacity > 256)
+    token = rotation == "token" or (rotation == "served" and served_wide)
     fused = rotation == "fused"
     if ((ws and (block < 16 or token or fused)) or (fused and block < 16)
             or (not ws and any(arm.get(k) for k in ("wire", "stages", "dynamic")))):
@@ -1086,7 +1091,8 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm"):
         tier0_num_experts=experts, tier1_num_experts=experts, tier0_bits=tier0_bits, tier1_bits=tier1_bits,
         route_num_experts=experts, top_k=topk, max_m_blocks=(slots + block - 1) // block,
         sms=int(props.multi_processor_count), max_shared_mem=int(props.shared_memory_per_block_optin),
-        force_tile_config=tile, trellis_codebook="mcg", swiglu_limit=spec["swiglu_limit"],
+        force_tile_config=tile, trellis_codebook="mcg", activation=spec["activation"],
+        swiglu_limit=spec["swiglu_limit"],
         moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="bf16" if spark else "fp32",
         direct_topk_routes=False, token_major_rotation=token, fused_input_rotation=fused,
         warp_specialized=ws, input_format="e4m3_k32" if arm.get("wire") else "bf16",
@@ -1122,19 +1128,20 @@ def coordinator_preflight(args):
     family = args.prefill_family
     spec = COORDINATOR_FAMILIES.get(family)
     if spec is None or args.output is None:
-        raise ValueError("GLM requires --prefill-family glm|glmf --output")
+        raise ValueError("coordinator requires a supported --prefill-family and --output")
     if (args.role == "spark") != args.profile.startswith("spark-") or args.profile not in spec["profiles"]:
-        raise ValueError("GLM --role must match the RTX or Spark --profile")
+        raise ValueError("coordinator --role must match the family's RTX or Spark --profile")
     if (args.kimi or args.compact_fixture or args.prefill_arm or args.prefill_source_dir
             or args.rows or args.intermediate or args.prefill_exhaustive):
         raise ValueError("coordinator uses --profile/--capacities/--coordinator-arm, not Spark/decode controls")
-    capacities = [int(v) for v in args.capacities.split(",")]
+    raw_capacities = args.capacities or ",".join(map(str, spec["capacities"]))
+    capacities = [int(v) for v in raw_capacities.split(",")]
     if not capacities or len(capacities) != len(set(capacities)):
         raise ValueError("capacities must be nonempty and unique")
     specs = [("coop", {})]
     if args.role == "spark":
         specs.append(("served", dict(mode="ws", wire=1, stages=3, dynamic=1, ctas=1,
-                                    tile=(64, 192, 64, 256) if GLM_PROFILES[args.profile] == 384 else (64, 256, 64, 256))))
+                                    tile=(64, 192, 64, 256) if spec["profiles"][args.profile] == 384 else (64, 256, 64, 256))))
     specs.extend(args.coordinator_arm)
     if len({name for name, _ in specs}) != len(specs):
         raise ValueError("coordinator arm names must be unique")
@@ -1164,7 +1171,7 @@ def _make_coordinator_layer(width, k5_experts, seed, device, family="glm"):
     for tier, (bits, count) in enumerate(zip((tier0_bits, tier1_bits), (experts - k5_experts, k5_experts))):
         prepared = prepare_trellis256_moe_weights(
             hidden_size=hidden, intermediate_size=width, num_experts=max(count, 1),
-            activation="silu", fc1_tile_n=128, fc2_tile_n=128, device=device,
+            activation=spec["activation"], fc1_tile_n=128, fc2_tile_n=128, device=device,
             seed=seed + tier, params_dtype=torch.float16, w13_layout="trellis_t256_proj",
             trellis_bits=bits, codebook="mcg", tile_config=(64, 128, 64, 128))
         w13 = prepared.w13 if count else prepared.w13[:prepared.w13.numel() // 2]
@@ -1195,7 +1202,7 @@ def _run_coordinator_benchmark(args, device, props):
     if (props.major, props.minor) != target:
         raise ValueError(f"GLM {args.role} benchmark requires SM{target[0]}{target[1]}")
     torch.cuda.set_per_process_memory_fraction(min(0.9, (args.memory_cap_gib << 30) / props.total_memory), device)
-    width = GLM_PROFILES[args.profile]
+    width = spec["profiles"][args.profile]
     output_dtype = torch.bfloat16 if args.role == "spark" else torch.float32
     bit_dtype = torch.int16 if args.role == "spark" else torch.int32
     layers = [_make_coordinator_layer(width, args.k5_experts, args.seed + 2*i, device, args.prefill_family)
@@ -1328,10 +1335,10 @@ def benchmark_parser():
     parser.add_argument("--calls-per-graph", type=int, default=8)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
-    parser.add_argument("--prefill-family", choices=(*PREFILL_FAMILIES, *COORDINATOR_FAMILIES))
+    parser.add_argument("--prefill-family", choices=tuple(dict.fromkeys((*PREFILL_FAMILIES, *COORDINATOR_FAMILIES))))
     parser.add_argument("--role", choices=("spark", "coordinator"), default="spark")
     parser.add_argument("--profile", choices=tuple(GLM_PROFILES), default="rtx-tp2")
-    parser.add_argument("--capacities", default="256,1024,2752,4096", help="GLM coordinator compile capacities")
+    parser.add_argument("--capacities", default=None, help="coordinator compile capacities")
     parser.add_argument("--coordinator-arm", action="append", type=parse_coordinator_arm, default=[],
                         help="NAME:mode=cooperative|ws,rotation=served|route|token|fused,tile=64/256/64/256,"
                              "route_block=64,ctas=1,stages=3,wire=1,dynamic=1; coop baseline is automatic")
@@ -1359,7 +1366,13 @@ def main() -> None:
     args = parser.parse_args()
     if args.prefill_family and (args.kimi or args.output is None or args.memory_cap_gib <= 0):
         parser.error("--prefill-family requires --output, positive memory cap, and no --kimi")
-    if args.prefill_family in COORDINATOR_FAMILIES or args.role == "coordinator" or args.preflight_only:
+    is_coordinator = (
+        args.role == "coordinator"
+        or args.preflight_only
+        or bool(args.coordinator_arm)
+        or (args.prefill_family in COORDINATOR_FAMILIES and args.prefill_family not in PREFILL_FAMILIES)
+    )
+    if is_coordinator:
         try:
             capacities, specs, distributions, waves = coordinator_preflight(args)
         except ValueError as exc:
@@ -1368,11 +1381,9 @@ def main() -> None:
             print(json.dumps(dict(preflight=True, profile=args.profile, capacities=capacities,
                                   arms=specs, distributions=distributions, histogram_waves=len(waves))))
             return
-    elif args.coordinator_arm:
-        parser.error("--coordinator-arm requires GLM coordinator mode")
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
-    if args.prefill_family in COORDINATOR_FAMILIES:
+    if is_coordinator:
         _run_coordinator_benchmark(args, device, props)
         return
     if args.prefill_family:
