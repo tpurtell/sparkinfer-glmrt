@@ -1,4 +1,4 @@
-"""One-warp native MCG decode into MXFP8 FC1 fragments, before the full port."""
+"""One-warp native MCG decode into scaled and plain E4M3 FC1 fragments."""
 from __future__ import annotations
 
 import cuda.bindings.driver as cuda
@@ -13,6 +13,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.intrinsics import (
     mxfp8_mma_m16n8k32_f32_e4m3,
+    mma_m16n8k32_f32_e4m3,
+    u32_as_f32,
     packed_dequant_trellis_to_half2x4,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
@@ -29,8 +31,9 @@ def _f16x2_to_e4m3x2(value: Uint32, *, loc=None, ip=None):
 
 
 class _Fragment:
-    def __init__(self, width):
+    def __init__(self, width, plain):
         self.width = width
+        self.plain = plain
 
     @cute.jit
     def __call__(self, a: cute.Tensor, packed: cute.Tensor, scales: cute.Tensor,
@@ -63,11 +66,22 @@ class _Fragment:
             if c >= Int32(2):
                 own, send = frags[1][half], frags[0][half]
             peer = Uint32(cute.arch.shuffle_sync_bfly(send, offset=2))
-            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                Float32(0), Float32(0), Float32(0), Float32(0),
-                Uint32(a[r, 2 * c]), Uint32(a[r + Int32(8), 2 * c]),
-                Uint32(a[r, 2 * c + Int32(1)]), Uint32(a[r + Int32(8), 2 * c + Int32(1)]),
-                own, peer, sfa, Uint32(0x7F))
+            d0, d1, d2, d3 = Float32(0), Float32(0), Float32(0), Float32(0)
+            if cutlass.const_expr(self.plain):
+                d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
+                    d0, d1, d2, d3,
+                    Uint32(a[r, 2 * c]), Uint32(a[r + Int32(8), 2 * c]),
+                    Uint32(a[r, 2 * c + Int32(1)]), Uint32(a[r + Int32(8), 2 * c + Int32(1)]),
+                    own, peer)
+                scale0 = u32_as_f32(Uint32(scales[r]) << Uint32(23))
+                scale1 = u32_as_f32(Uint32(scales[r + Int32(8)]) << Uint32(23))
+                d0, d1, d2, d3 = d0 * scale0, d1 * scale0, d2 * scale1, d3 * scale1
+            else:
+                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    d0, d1, d2, d3,
+                    Uint32(a[r, 2 * c]), Uint32(a[r + Int32(8), 2 * c]),
+                    Uint32(a[r, 2 * c + Int32(1)]), Uint32(a[r + Int32(8), 2 * c + Int32(1)]),
+                    own, peer, sfa, Uint32(0x7F))
             out[r, 2 * c + Int32(8 * half)] = d0
             out[r, 2 * c + Int32(8 * half + 1)] = d1
             out[r + Int32(8), 2 * c + Int32(8 * half)] = d2
@@ -104,14 +118,17 @@ def _reference(packed, width):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("scaled", [False, True], ids=["unit", "e8m0"])
-def test_exlr8_a8_fragment(width, scaled):
+@pytest.mark.parametrize("plain", [False, True], ids=["mx", "plain"])
+def test_exlr8_a8_fragment(width, scaled, plain):
     gen = torch.Generator().manual_seed(408 + width)
     packed = torch.randint(0, 2**32, (2, 8 * width), generator=gen, dtype=torch.int64).to(torch.uint32).cuda()
     a = (torch.randint(-8, 9, (16, 32), generator=gen).float() / 4).cuda()
     scale = torch.ones(16, device="cuda")
     if scaled:
-        a = (torch.randn((16, 32), generator=gen) * torch.exp2(torch.arange(16)[:, None].float() / 2 - 8)).half().cuda().float()
-        scale = torch.exp2(torch.ceil(torch.log2(a.abs().amax(1) / 448)))
+        block_k = 128 if plain else 32
+        block = (torch.randn((16, block_k), generator=gen) * torch.exp2(torch.arange(16)[:, None].float() / 2 - 8)).half().cuda().float()
+        a = block[:, :32].contiguous()
+        scale = torch.exp2(torch.ceil(torch.log2(block.abs().amax(1) / 448)))
     aq = (a / scale[:, None]).to(torch.float8_e4m3fn)
     perm = torch.tensor(_W4A8_TRELLIS_A_K32_PERM, device="cuda")
     ap = aq.view(torch.uint8)[:, perm].contiguous().view(torch.int32)
@@ -120,7 +137,7 @@ def test_exlr8_a8_fragment(width, scaled):
     tensors = [from_dlpack(t, assumed_align=16) for t in (ap, packed, codes, out)]
     tensors[0].element_type = Uint32
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled = cute.compile(_Fragment(width), *tensors, stream)
+    compiled = cute.compile(_Fragment(width, plain), *tensors, stream)
     compiled(*tensors, stream)
     torch.cuda.synchronize()
     # FP64 accumulation followed by FP32 avoids TF32 and tests the exact dot.
