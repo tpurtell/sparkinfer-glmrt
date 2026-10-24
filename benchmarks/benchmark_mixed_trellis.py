@@ -850,7 +850,7 @@ def _make_compact_prefill_layer(fixture, width, seed, device, mix):
     return (*tiers, torch.tensor(mapping, dtype=torch.int32, device=device), descriptor, rotations)
 
 
-def prefill_compile_options(family, width, block, mode, props):
+def prefill_compile_options(family, width, block, mode, props, output_dtype="bf16"):
     hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
     if width <= 0 or width % 128 or (family == "kimik3" and width != 512):
         raise ValueError("prefill width must follow an H128-aligned family package")
@@ -863,7 +863,7 @@ def prefill_compile_options(family, width, block, mode, props):
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=(64, tile_n, 64, tile_n), tier0_bits=bits[0], tier1_bits=bits[1],
         trellis_codebook="mcg", activation=activation, swiglu_limit=None,
-        moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="bf16",
+        moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype=output_dtype,
         warp_specialized=mode == "ws",
         token_major_rotation=family == "qwen4" and mode == "cooperative")
 
@@ -873,8 +873,8 @@ def _run_prefill_benchmark(args, device, props):
         materialize_k4_arm, load_k4_arm, k4_noise_summary, real_route_ids,
     )
     from b12x._lib.runtime_control import kernel_resolution_guard
-    if (props.major, props.minor) != (12, 1):
-        raise ValueError("prefill policy gate requires SM121")
+    if (props.major, props.minor) not in ((12, 0), (12, 1)):
+        raise ValueError("prefill policy gate requires SM120 or SM121")
     if args.rounds < 3 or args.layers < 2 or args.replays < 1:
         raise ValueError("prefill gate requires >=3 rounds, >=2 cold layers and positive replays")
     specs = args.prefill_arm or [parse_prefill_arm(v) for v in (
@@ -883,12 +883,30 @@ def _run_prefill_benchmark(args, device, props):
     names = [name for name, _, _ in specs]
     if len(names) < 2 or len(names) != len(set(names)):
         raise ValueError("prefill needs at least two uniquely named arms")
-    rows_list = list(map(int, (args.rows or "1408,2688,4096").split(",")))
+    default_rows = "1024,2048,4096" if args.prefill_family == "kimik3" else "1408,2688,4096"
+    rows_list = list(map(int, (args.rows or default_rows).split(",")))
     if not rows_list or any(not 1 <= rows <= 4096 for rows in rows_list):
         raise ValueError("prefill rows must be 1..4096")
     family = args.prefill_family
     hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
     width = args.intermediate or (256 if family == "qwen4" else 512)
+    output_dtype = "bf16"
+    package_policy = None
+    if args.package_policy:
+        import runpy
+        policy = runpy.run_path(str(args.package_policy))
+        matches = [p for p in policy["profiles_for_role"](args.package_role, family)
+                   if p[0] == args.package_profile and p[1] == width]
+        if len(matches) != 1:
+            raise ValueError("package profile must match the measured family and width")
+        output_dtype = matches[0][4]
+        package_policy = dict(role=args.package_role, profile=args.package_profile,
+                              sha256=hashlib.sha256(args.package_policy.read_bytes()).hexdigest())
+    elif (props.major, props.minor) == (12, 0):
+        raise ValueError("SM120 measurement requires an explicit shipping package policy")
+    if output_dtype not in ("bf16", "fp32"):
+        raise ValueError("unsupported package output dtype")
+    exact_dtype = torch.int32 if output_dtype == "fp32" else torch.int16
     waves = prefill_route_waves(args.routes, family, args.route_layer) if args.routes else None
     # No recorded family routes means correctness only, never a timing claim.
     torch.cuda.set_per_process_memory_fraction(min(
@@ -905,7 +923,7 @@ def _run_prefill_benchmark(args, device, props):
               for i in range(args.layers)]
     states = {}
     for name, block, mode in specs:
-        options = prefill_compile_options(family, width, block, mode, props)
+        options = prefill_compile_options(family, width, block, mode, props, output_dtype)
         if compact:
             options.update(tier0_num_experts=experts, tier1_num_experts=experts,
                            force_tile_config=(64, 128, 64, 128), compact_weights=True)
@@ -946,10 +964,10 @@ def _run_prefill_benchmark(args, device, props):
                 raise RuntimeError("reference output is not finite and nonzero")
             for rows in checked:
                 expected = run(names[0], rows, layer).clone()
-                if not torch.equal(expected.view(torch.int16), full[:rows].view(torch.int16)):
+                if not torch.equal(expected.view(exact_dtype), full[:rows].view(exact_dtype)):
                     raise RuntimeError(f"reference prefix invariance failed at {rows}, layer {layer}")
                 for name in names[1:]:
-                    if not torch.equal(run(name, rows, layer).view(torch.int16), expected.view(torch.int16)):
+                    if not torch.equal(run(name, rows, layer).view(exact_dtype), expected.view(exact_dtype)):
                         raise RuntimeError(f"prefill arm {name} differs at {rows}, layer {layer}")
         if compact:
             original_x = x.clone()
@@ -970,14 +988,14 @@ def _run_prefill_benchmark(args, device, props):
                         if not bool(torch.isfinite(reference).all()):
                             raise RuntimeError("compact poisoned reference is nonfinite")
                         for name in names[1:]:
-                            if not torch.equal(reference.view(torch.int16), outputs[name].view(torch.int16)):
+                            if not torch.equal(reference.view(exact_dtype), outputs[name].view(exact_dtype)):
                                 raise RuntimeError(f"compact poisoned graph differs: {name}, rows {rows}, layer {layer}")
             x.copy_(original_x)
         for rows in rows_list:
             for layer in range(args.layers):
                 expected = run(names[0], rows, layer).clone()
                 for name in names[1:]:
-                    if not torch.equal(run(name, rows, layer).view(torch.int16), expected.view(torch.int16)):
+                    if not torch.equal(run(name, rows, layer).view(exact_dtype), expected.view(exact_dtype)):
                         raise RuntimeError(f"prefill arm {name} differs on layer {layer}, rows {rows}")
             if waves is None or args.correctness_only:
                 continue
@@ -994,10 +1012,21 @@ def _run_prefill_benchmark(args, device, props):
                     rotated.reverse()
                 for name in rotated:
                     samples[name].append(statistics.median(_times(graphs[name], args.replays)) / args.layers)
+            if args.profile_arm and rows == args.profile_rows:
+                if args.profile_arm not in names:
+                    raise ValueError("profile arm must name a benchmark arm")
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStart()
+                run(args.profile_arm, rows, 0)
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
             record = dict(rows=rows, samples_us=samples, **k4_noise_summary(samples, names[0]))
             records.append(record)
             print(json.dumps(record), flush=True)
     result = dict(schema=1, family=family, intermediate=width, arms=specs, source=provenance,
+        device_target=dict(name=props.name, compute=[props.major, props.minor],
+                           sms=props.multi_processor_count),
+        output_dtype=output_dtype, package_policy=package_policy,
         fixture=("synthetic weights; actual compact ownership" if compact else
                  "synthetic weights; K4/K5 expert split 384/128" if family == "qwen4"
                  else "synthetic uniform K2 with dormant K3"),
@@ -1050,6 +1079,9 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--prefill-family", choices=tuple(PREFILL_FAMILIES))
+    parser.add_argument("--package-policy", type=Path, help="shipping package_exl3_aot.py policy")
+    parser.add_argument("--package-role", choices=("coordinator", "spark"), default="spark")
+    parser.add_argument("--package-profile", help="shipping profile name, e.g. rtx-tp1")
     parser.add_argument("--compact-fixture", type=Path, help="planner-replayed compact ownership JSON")
     parser.add_argument("--compact-rank", type=int, default=0)
     parser.add_argument("--prefill-arm", action="append", type=parse_prefill_arm, default=[])
@@ -1058,6 +1090,8 @@ def main() -> None:
     parser.add_argument("--route-layer", type=int, default=23)
     parser.add_argument("--prefill-exhaustive", action="store_true", help="check every prefix row count 1..4096")
     parser.add_argument("--correctness-only", action="store_true")
+    parser.add_argument("--profile-arm", help="one untimed profiler API window after graph timing")
+    parser.add_argument("--profile-rows", type=int, default=2048)
     parser.add_argument("--prefill-revision", default="HEAD", help="freeze implementation from this git revision")
     parser.add_argument("--prefill-source-dir", type=Path, help="pre-materialized K4 sibling-module bundle")
     parser.add_argument("--memory-cap-gib", type=int, default=24)
