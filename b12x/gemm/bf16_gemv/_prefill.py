@@ -76,105 +76,6 @@ def _warp_gemm(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, sha
 
 
 @cute.jit
-def _warp_gemm_unroll1(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, shared_b,
-                       copy_a, copy_b):
-    target_a = copy_a.retile(fragment_a)
-    target_b = copy_b.retile(fragment_b)
-    segment = cute.make_rmem_tensor((acc.shape[0], 1, 1), Float32)
-    for k in cutlass.range(cute.size(shared_a.shape[2]), unroll=1):
-        cute.copy(copy_a, shared_a[None, None, k], target_a[None, None, 0])
-        cute.copy(copy_b, shared_b[None, None, k], target_b[None, None, 0])
-        for m in cutlass.range_constexpr(cute.size(acc.shape[1])):
-            frag_a_m = cute.make_tensor(
-                fragment_a[None, m, 0].iterator,
-                cute.make_layout((fragment_a.shape[0], 1)),
-            )
-            for n in cutlass.range_constexpr(cute.size(acc.shape[2])):
-                frag_b_n = cute.make_tensor(
-                    fragment_b[None, n, 0].iterator,
-                    cute.make_layout((fragment_b.shape[0], 1)),
-                )
-                segment.fill(0.0)
-                cute.gemm(tiled_mma, segment, frag_a_m, frag_b_n, segment)
-                acc_mn = acc[None, m, n]
-                corr_mn = correction[None, m, n]
-                seg_mn = segment[None, 0, 0]
-                addend = seg_mn.load() - corr_mn.load()
-                total = acc_mn.load() + addend
-                corr_mn.store((total - acc_mn.load()) - addend)
-                acc_mn.store(total)
-
-
-@cute.jit
-def _warp_gemm_unroll2(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, shared_b,
-                       copy_a, copy_b):
-    target_a = copy_a.retile(fragment_a)
-    target_b = copy_b.retile(fragment_b)
-    segment = cute.make_rmem_tensor((acc.shape[0], 1, 1), Float32)
-    for k_pair in cutlass.range(cute.size(shared_a.shape[2]) // 2, unroll=1):
-        k0 = k_pair * Int32(2)
-        k1 = k0 + Int32(1)
-        cute.copy(copy_a, shared_a[None, None, k0], target_a[None, None, 0])
-        cute.copy(copy_b, shared_b[None, None, k0], target_b[None, None, 0])
-        cute.copy(copy_a, shared_a[None, None, k1], target_a[None, None, 1])
-        cute.copy(copy_b, shared_b[None, None, k1], target_b[None, None, 1])
-        for s in cutlass.range_constexpr(2):
-            for m in cutlass.range_constexpr(cute.size(acc.shape[1])):
-                frag_a_m = cute.make_tensor(
-                    fragment_a[None, m, s].iterator,
-                    cute.make_layout((fragment_a.shape[0], 1)),
-                )
-                for n in cutlass.range_constexpr(cute.size(acc.shape[2])):
-                    frag_b_n = cute.make_tensor(
-                        fragment_b[None, n, s].iterator,
-                        cute.make_layout((fragment_b.shape[0], 1)),
-                    )
-                    segment.fill(0.0)
-                    cute.gemm(tiled_mma, segment, frag_a_m, frag_b_n, segment)
-                    acc_mn = acc[None, m, n]
-                    corr_mn = correction[None, m, n]
-                    seg_mn = segment[None, 0, 0]
-                    addend = seg_mn.load() - corr_mn.load()
-                    total = acc_mn.load() + addend
-                    corr_mn.store((total - acc_mn.load()) - addend)
-                    acc_mn.store(total)
-
-
-@cute.jit
-def _warp_gemm_seg1(tiled_mma, acc, correction, fragment_a, fragment_b, shared_a, shared_b,
-                    copy_a, copy_b):
-    target_a = copy_a.retile(fragment_a)
-    target_b = copy_b.retile(fragment_b)
-    segment = cute.make_rmem_tensor((acc.shape[0], 1, 1), Float32)
-    cute.copy(copy_a, shared_a[None, None, 0], target_a[None, None, 0])
-    cute.copy(copy_b, shared_b[None, None, 0], target_b[None, None, 0])
-    for k in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
-        if k < cute.size(shared_a.shape[2]) - 1:
-            cute.copy(copy_a, shared_a[None, None, k + 1], target_a[None, None, (k + 1) % 2])
-            cute.copy(copy_b, shared_b[None, None, k + 1], target_b[None, None, (k + 1) % 2])
-        s = k % 2
-        for m in cutlass.range_constexpr(cute.size(acc.shape[1])):
-            frag_a_m = cute.make_tensor(
-                fragment_a[None, m, s].iterator,
-                cute.make_layout((fragment_a.shape[0], 1)),
-            )
-            for n in cutlass.range_constexpr(cute.size(acc.shape[2])):
-                frag_b_n = cute.make_tensor(
-                    fragment_b[None, n, s].iterator,
-                    cute.make_layout((fragment_b.shape[0], 1)),
-                )
-                segment.fill(0.0)
-                cute.gemm(tiled_mma, segment, frag_a_m, frag_b_n, segment)
-                acc_mn = acc[None, m, n]
-                corr_mn = correction[None, m, n]
-                seg_mn = segment[None, 0, 0]
-                addend = seg_mn.load() - corr_mn.load()
-                total = acc_mn.load() + addend
-                corr_mn.store((total - acc_mn.load()) - addend)
-                acc_mn.store(total)
-
-
-@cute.jit
 def _warp_gemm_direct(tiled_mma, acc, fragment_a, fragment_b, shared_a, shared_b, copy_a, copy_b):
     target_a = copy_a.retile(fragment_a)
     target_b = copy_b.retile(fragment_b)
@@ -193,17 +94,18 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=64,
         tile_n=128,
         num_stages=4,
-        unroll_k_inner=4,
+        k_unroll=1,
         buffer_align_bytes=128,
         group_m=8,
         tiles_by_rows=(
-            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
-            (64, dict(warp_layout=(4, 1), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=4, buffer_align_bytes=1024, group_m=0)),
-            (192, dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
-            (256, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
-            (320, dict(warp_layout=(4, 1), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=2, buffer_align_bytes=128, group_m=1)),
-            (384, dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
-            (1024, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8)),
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, k_unroll=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(4, 1), tile_m=64, tile_n=64, num_stages=2, k_unroll=1, buffer_align_bytes=1024, group_m=0)),
+            (192, dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=1)),
+            (256, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, k_unroll=1, buffer_align_bytes=128, group_m=1)),
+            (300, dict(warp_layout=(4, 1), tile_m=64, tile_n=64, num_stages=2, k_unroll=1, buffer_align_bytes=1024, group_m=0)),
+            (320, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, k_unroll=1, buffer_align_bytes=128, group_m=0)),
+            (384, dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=1)),
+            (1024, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=8)),
         ),
     ),
     (24752, 7168): dict(
@@ -211,12 +113,12 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=128,
         tile_n=64,
         num_stages=4,
-        unroll_k_inner=4,
+        k_unroll=1,
         buffer_align_bytes=128,
         group_m=8,
         tiles_by_rows=(
-            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
-            (64, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, k_unroll=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=1)),
         ),
     ),
     (384, 5120): dict(
@@ -224,12 +126,12 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=64,
         tile_n=32,
         num_stages=4,
-        unroll_k_inner=4,
+        k_unroll=1,
         buffer_align_bytes=128,
         group_m=1,
         tiles_by_rows=(
-            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
-            (256, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, k_unroll=1, buffer_align_bytes=128, group_m=1)),
+            (256, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, k_unroll=1, buffer_align_bytes=128, group_m=1)),
         ),
     ),
     (512, 5120): dict(
@@ -237,12 +139,12 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=64,
         tile_n=32,
         num_stages=4,
-        unroll_k_inner=4,
+        k_unroll=1,
         buffer_align_bytes=128,
         group_m=1,
         tiles_by_rows=(
-            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
-            (256, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, k_unroll=1, buffer_align_bytes=128, group_m=1)),
+            (256, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, k_unroll=1, buffer_align_bytes=128, group_m=1)),
         ),
     ),
     (1024, 5120): dict(
@@ -250,11 +152,11 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=64,
         tile_n=32,
         num_stages=4,
-        unroll_k_inner=4,
+        k_unroll=1,
         buffer_align_bytes=128,
         group_m=1,
         tiles_by_rows=(
-            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, k_unroll=1, buffer_align_bytes=128, group_m=1)),
         ),
     ),
 }
@@ -290,12 +192,14 @@ class Bf16PrefillKernel:
     # Keep the long K pipeline compact. Full unrolling increases register live
     # ranges without changing the ordered compensated accumulation contract.
     unroll_k = False
+    k_unroll = 1
     buffer_align_bytes = 1024
 
     def __init__(self, n: int, k: int, *, compute_warps: int | None = None,
                  tile_n: int | None = None, num_stages: int | None = None,
                  compensated: bool = True, warp_layout: tuple[int, int] | None = None,
                  tile_m: int | None = None, unroll_k_inner: int | None = None,
+                 k_unroll: int | None = None,
                  buffer_align_bytes: int | None = None, group_m: int | None = None,
                  tiles_by_rows: tuple | None = None,
                  chunk256_tail: tuple | None = None,
@@ -319,6 +223,7 @@ class Bf16PrefillKernel:
             and warp_layout is None
             and tile_m is None
             and unroll_k_inner is None
+            and k_unroll is None
             and buffer_align_bytes is None
             and group_m is None
             and tiles_by_rows is None
@@ -331,6 +236,7 @@ class Bf16PrefillKernel:
                 tile_n = auto_cfg.get("tile_n")
                 num_stages = auto_cfg.get("num_stages")
                 unroll_k_inner = auto_cfg.get("unroll_k_inner")
+                k_unroll = auto_cfg.get("k_unroll")
                 buffer_align_bytes = auto_cfg.get("buffer_align_bytes")
                 group_m = auto_cfg.get("group_m")
                 tiles_by_rows = auto_cfg.get("tiles_by_rows")
@@ -355,10 +261,17 @@ class Bf16PrefillKernel:
         self.compensated = bool(compensated)
         if self.legacy:
             self.unroll_k_inner = 4
+            self.k_unroll = 1
             self.buffer_align_bytes = 1024
             self.group_m = 0
         else:
-            self.unroll_k_inner = int(unroll_k_inner) if unroll_k_inner is not None else (1 if self.compensated else 4)
+            self.unroll_k_inner = int(unroll_k_inner) if unroll_k_inner is not None else 4
+            if k_unroll is not None:
+                self.k_unroll = int(k_unroll)
+            elif unroll_k_inner in (1, 2):
+                self.k_unroll = int(unroll_k_inner)
+            else:
+                self.k_unroll = 1
             if buffer_align_bytes is not None:
                 self.buffer_align_bytes = int(buffer_align_bytes)
             self.group_m = int(group_m) if group_m is not None else 0
@@ -655,32 +568,6 @@ class Bf16PrefillKernel:
         )
         cute.arch.sync_threads()
 
-        gA = cute.local_tile(
-            source,
-            (self.tile_m, self.tile_k),
-            (None, None),
-        )
-        gB = cute.local_tile(
-            weight,
-            (self.tile_n, self.tile_k),
-            (None, None),
-        )
-        cta_layout = cute.make_layout(1)
-        tAsA, tAgA = cpasync.tma_partition(
-            tma_atom_A,
-            0,
-            cta_layout,
-            cute.group_modes(sA, 0, 2),
-            cute.group_modes(gA, 0, 2),
-        )
-        tBsB, tBgB = cpasync.tma_partition(
-            tma_atom_B,
-            0,
-            cta_layout,
-            cute.group_modes(sB, 0, 2),
-            cute.group_modes(gB, 0, 2),
-        )
-
         if warp_idx < Int32(self.num_compute_warps):
             consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
@@ -715,57 +602,20 @@ class Bf16PrefillKernel:
             tSsA = smem_thr_copy_A.partition_S(sA)
             tSsB = smem_thr_copy_B.partition_S(sB)
 
-            for _k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
+            for _k_tile in cutlass.range(self.k_tiles, unroll=self.k_unroll, unroll_full=self.unroll_k):
                 load_pipeline.consumer_wait(consumer_state)
                 if const_expr(self.compensated):
-                    if const_expr(self.unroll_k_inner == 1):
-                        _warp_gemm_unroll1(
-                            thr_mma,
-                            acc,
-                            correction,
-                            tCrA,
-                            tCrB,
-                            tSsA[None, None, None, consumer_state.index],
-                            tSsB[None, None, None, consumer_state.index],
-                            smem_thr_copy_A,
-                            smem_thr_copy_B,
-                        )
-                    elif const_expr(self.unroll_k_inner == 2):
-                        _warp_gemm_unroll2(
-                            thr_mma,
-                            acc,
-                            correction,
-                            tCrA,
-                            tCrB,
-                            tSsA[None, None, None, consumer_state.index],
-                            tSsB[None, None, None, consumer_state.index],
-                            smem_thr_copy_A,
-                            smem_thr_copy_B,
-                        )
-                    elif const_expr(self.unroll_k_inner == 3):
-                        _warp_gemm_seg1(
-                            thr_mma,
-                            acc,
-                            correction,
-                            tCrA,
-                            tCrB,
-                            tSsA[None, None, None, consumer_state.index],
-                            tSsB[None, None, None, consumer_state.index],
-                            smem_thr_copy_A,
-                            smem_thr_copy_B,
-                        )
-                    else:
-                        _warp_gemm(
-                            thr_mma,
-                            acc,
-                            correction,
-                            tCrA,
-                            tCrB,
-                            tSsA[None, None, None, consumer_state.index],
-                            tSsB[None, None, None, consumer_state.index],
-                            smem_thr_copy_A,
-                            smem_thr_copy_B,
-                        )
+                    _warp_gemm(
+                        thr_mma,
+                        acc,
+                        correction,
+                        tCrA,
+                        tCrB,
+                        tSsA[None, None, None, consumer_state.index],
+                        tSsB[None, None, None, consumer_state.index],
+                        smem_thr_copy_A,
+                        smem_thr_copy_B,
+                    )
                 else:
                     _warp_gemm_direct(
                         thr_mma,
@@ -806,12 +656,37 @@ class Bf16PrefillKernel:
                             output.element_type)
 
         elif warp_idx == Int32(self.producer_warp):
+            gA = cute.local_tile(
+                source,
+                (self.tile_m, self.tile_k),
+                (None, None),
+            )
+            gB = cute.local_tile(
+                weight,
+                (self.tile_n, self.tile_k),
+                (None, None),
+            )
+            cta_layout = cute.make_layout(1)
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_A,
+                0,
+                cta_layout,
+                cute.group_modes(sA, 0, 2),
+                cute.group_modes(gA, 0, 2),
+            )
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_atom_B,
+                0,
+                cta_layout,
+                cute.group_modes(sB, 0, 2),
+                cute.group_modes(gB, 0, 2),
+            )
             m_tile, n_tile = self._resolve_tile_coords(num_tokens, m_tile_offset)
             producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.num_stages,
             )
-            for k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
+            for k_tile in cutlass.range(self.k_tiles, unroll=self.k_unroll, unroll_full=self.unroll_k):
                 load_pipeline.producer_acquire(producer_state)
                 cute.copy(
                     tma_atom_A,

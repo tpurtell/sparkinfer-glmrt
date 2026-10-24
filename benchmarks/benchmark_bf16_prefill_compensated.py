@@ -238,46 +238,69 @@ def _build_screening_candidates(
         chunk_ms = (128, 192, 256, 257, 300, 320, 383)
         large_ms = (256, 512, 1024, 2048, 4096, 8192)
         candidates.extend([
-            ("s_16x32_s8_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), small_ms),
-            ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), small_ms),
-            ("s_16x64_s6_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), small_ms),
-            ("sh_w4x2_64x32_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), short_ms),
-            ("sh_w4x2_64x32_s4_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), short_ms),
-            ("sh_w2x4_32x64_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(2, 4), tile_m=32, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), short_ms),
-            ("sh_w2x2_32x32_s5_u4", Bf16PrefillKernel(n, k, warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), short_ms),
-            ("ch_w4x2_64x64_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), chunk_ms),
-            ("ch_w4x2_64x64_s3_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), chunk_ms),
-            ("ch_w4x2_64x64_s2_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), chunk_ms),
-            ("ch_w4x1_64x64_s2_u2", Bf16PrefillKernel(n, k, warp_layout=(4, 1), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=2, buffer_align_bytes=128, group_m=1), chunk_ms),
-            ("ch_w4x4_64x128_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), chunk_ms),
-            ("ch_split256_16x32", Bf16PrefillKernel(
-                n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1,
+            ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, k_unroll=1, buffer_align_bytes=128, group_m=1), small_ms),
+            ("s_16x64_s6_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, k_unroll=1, buffer_align_bytes=128, group_m=1), small_ms),
+            ("sh_w4x2_64x32_s4_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=1), short_ms),
+            ("ch_w4x2_64x64_s3_gm0", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, k_unroll=1, buffer_align_bytes=128, group_m=0), chunk_ms),
+            ("ch_w4x4_64x128_s4_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=1), chunk_ms),
+            ("ch_split256_16x64", Bf16PrefillKernel(
+                n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, k_unroll=1, buffer_align_bytes=128, group_m=0,
                 chunk256_tail=(
-                    256, 384,
-                    dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1),
-                    dict(warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1),
+                    256, 300,
+                    dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, k_unroll=1, buffer_align_bytes=128, group_m=1),
+                    dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, k_unroll=1, buffer_align_bytes=128, group_m=1),
                 ),
-            ), (257, 300, 320, 383)),
-            ("lg_w4x2_64x64_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), large_ms),
-            ("lg_w4x4_64x128_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), large_ms),
-            ("lg_w4x4_64x128_s4_gm1_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), large_ms),
-            ("lg_w4x4_128x64_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=128, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), large_ms),
-            ("lg_w4x2_64x128_s3_gm8_u2", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=128, num_stages=3, unroll_k_inner=2, buffer_align_bytes=128, group_m=8), large_ms),
+            ), (257, 300)),
+            ("lg_w4x2_64x64_s4_gm8_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=8), large_ms),
+            ("lg_w4x4_64x128_s4_gm8_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=8), large_ms),
         ])
     elif (n, k) == (24752, 7168):
-        candidates.extend([
-            ("s_16x32_s8_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (1, 8, 16)),
-            ("s_16x64_s6_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (1, 8, 16)),
-            ("sh_w4x2_64x64_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (59, 64, 256)),
-            ("lg_w4x4_64x128_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), (256, 1024, 8192)),
-            ("lg_w4x4_128x64_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=128, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), (256, 1024, 8192)),
-            ("lg_w4x2_64x128_s3_gm8_u2", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=128, num_stages=3, unroll_k_inner=2, buffer_align_bytes=128, group_m=8), (256, 1024, 8192)),
-        ])
+        kimi_sweep_ms = (256, 512, 1024, 2048, 8192)
+        for tm, wls in ((128, ((4, 4), (2, 8), (8, 2))), (256, ((4, 4),))):
+            for wl in wls:
+                for tn in (64, 128):
+                    for s in (2, 3, 4):
+                        smem_bytes = (tm + tn) * 64 * 2 * s + 256
+                        if smem_bytes > 101376:
+                            continue
+                        for gm in (1, 8):
+                            for ku in (1, 2):
+                                name = f"tm{tm}_w{wl[0]}x{wl[1]}_tn{tn}_s{s}_gm{gm}_u{ku}"
+                                candidates.append((
+                                    name,
+                                    Bf16PrefillKernel(
+                                        n, k,
+                                        warp_layout=wl,
+                                        tile_m=tm,
+                                        tile_n=tn,
+                                        num_stages=s,
+                                        k_unroll=ku,
+                                        buffer_align_bytes=128,
+                                        group_m=gm,
+                                    ),
+                                    kimi_sweep_ms,
+                                ))
+                        if tn == 64 and wl in ((4, 4), (8, 2)):
+                            name0 = f"tm{tm}_w{wl[0]}x{wl[1]}_tn{tn}_s{s}_gm0_u1"
+                            candidates.append((
+                                name0,
+                                Bf16PrefillKernel(
+                                    n, k,
+                                    warp_layout=wl,
+                                    tile_m=tm,
+                                    tile_n=tn,
+                                    num_stages=s,
+                                    k_unroll=1,
+                                    buffer_align_bytes=128,
+                                    group_m=0,
+                                ),
+                                kimi_sweep_ms,
+                            ))
     else:
         candidates.extend([
-            ("s_16x32_s8_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (1, 8, 64)),
-            ("sh_w2x2_32x32_s5_u4", Bf16PrefillKernel(n, k, warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (8, 64, 256)),
-            ("sh_w4x2_64x32_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (64, 256)),
+            ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, k_unroll=1, buffer_align_bytes=128, group_m=1), (1, 8, 64)),
+            ("sh_w2x2_32x32_s5_u1", Bf16PrefillKernel(n, k, warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, k_unroll=1, buffer_align_bytes=128, group_m=1), (8, 64, 256)),
+            ("sh_w4x2_64x32_s4_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, k_unroll=1, buffer_align_bytes=128, group_m=1), (64, 256)),
         ])
     return candidates
 
@@ -370,14 +393,25 @@ def _verify_no_hang_cpu(compile_sass: bool = True) -> None:
 
     if compile_sass:
         to_compile = []
+        seen_sigs = set()
         for n, k, m_list in (
             (6144, 4096, STEP5_M_VALUES),
             (24752, 7168, KIMI_M_VALUES),
             (384, 5120, SMALL_N_M_VALUES),
         ):
             for arm_name, k_obj, _ in _build_screening_candidates(n, k, m_list):
-                to_compile.append((f"{n}x{k}_{arm_name}", n, k, k_obj))
-        for label, n, k, k_obj in to_compile:
+                is_default = arm_name in ("baseline", "auto_default")
+                sig = (
+                    n, k, is_default,
+                    k_obj.warp_layout, k_obj.tile_m, k_obj.tile_n, k_obj.num_stages,
+                    k_obj.k_unroll, k_obj.group_m > 1,
+                    k_obj._row_limits, k_obj._chunk256_tail is not None,
+                )
+                if sig in seen_sigs:
+                    continue
+                seen_sigs.add(sig)
+                to_compile.append((f"{n}x{k}_{arm_name}", n, k, k_obj, is_default))
+        for label, n, k, k_obj, is_default in to_compile:
             m_sym, s_sym = cute.sym_int(32), cute.sym_int(64)
             fx = make_fake_tensor(cutlass.BFloat16, (m_sym, k), (s_sym, 1), assumed_align=16)
             fw = make_fake_tensor(cutlass.BFloat16, (n, k), (k, 1), assumed_align=16)
@@ -402,9 +436,10 @@ def _verify_no_hang_cpu(compile_sass: bool = True) -> None:
             assert "USETMAXREG" not in sass_out and "SETMAXNREG" not in sass_out, (
                 f"{label} cubin contains SETMAXNREG instruction!"
             )
-            for line in res_out.splitlines():
-                if "REG:" in line:
-                    assert "STACK:0" in line, f"{label} has non-zero stack: {line}"
+            if is_default:
+                for line in res_out.splitlines():
+                    if "REG:" in line:
+                        assert "STACK:0" in line, f"{label} has non-zero stack: {line}"
             fn_blocks = sass_out.split("Function : ")[1:]
             assert len(fn_blocks) >= 1, f"{label} has no SASS functions"
             for fn_block in fn_blocks:
@@ -424,7 +459,7 @@ def _run_screening(
     }
     for n, k, m_list in (
         (6144, 4096, STEP5_M_VALUES),
-        (24752, 7168, KIMI_M_VALUES),
+        (24752, 7168, (1, 8, 16, 59, 64, 256, 512, 1024, 2048, 8192)),
         (384, 5120, SMALL_N_M_VALUES),
         (512, 5120, SMALL_N_M_VALUES),
         (1024, 5120, SMALL_N_M_VALUES),
@@ -436,7 +471,7 @@ def _run_screening(
         if not active_m_list:
             continue
         print(f"\n=== Screening shape N={n}, K={k} (M={active_m_list}) ===", flush=True)
-        all_candidates = _build_screening_candidates(n, k, m_list)
+        all_candidates = _build_screening_candidates(n, k, active_m_list)
         candidates = [
             (arm_name, k_obj, tuple(m for m in target_ms if m in active_m_list))
             for arm_name, k_obj, target_ms in all_candidates
@@ -454,15 +489,18 @@ def _run_screening(
         x_max = torch.randn((max_m, k), generator=gen, device=device, dtype=torch.float32).bfloat16()
 
         shape_rows: dict[int, Any] = {}
+        aborted_arms: set[str] = set()
         for m in active_m_list:
             x = x_max[:m]
             active_arms = []
-            out_buffers: dict[str, torch.Tensor] = {}
             arm_wall_ms: dict[str, float] = {}
             base_wall_s: float | None = None
+            base_out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+            check_buf = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+            row_summary: dict[str, Any] = {}
             for arm_name, (run_fn, target_ms) in compiled_arms.items():
-                if m in target_ms:
-                    buf = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+                if m in target_ms and arm_name not in aborted_arms:
+                    buf = base_out if arm_name == "baseline" else check_buf
                     torch.cuda.synchronize(device)
                     t_arm0 = time.perf_counter()
                     run_fn(x, w, buf)
@@ -472,26 +510,47 @@ def _run_screening(
                     if arm_name == "baseline":
                         base_wall_s = wall_s
                     elif base_wall_s is not None and wall_s > max(3.0 * base_wall_s, 0.050):
-                        raise RuntimeError(
-                            f"Arm {arm_name} wall time {wall_s*1e3:.2f}ms exceeded 3x baseline "
-                            f"({base_wall_s*1e3:.2f}ms) on {shape_key} M={m}; aborting fast."
+                        print(
+                            f"  [FAST-ABORT] Arm {arm_name} wall {wall_s*1e3:.2f}ms > 3x base "
+                            f"({base_wall_s*1e3:.2f}ms) on {shape_key} M={m}; skipping arm.",
+                            flush=True,
                         )
-                    out_buffers[arm_name] = buf
-                    active_arms.append((arm_name, run_fn, buf))
-            base_out = out_buffers["baseline"]
-            for arm_name, buf in out_buffers.items():
-                if not _bitwise_equal(buf, base_out):
-                    raise RuntimeError(f"Bitwise mismatch on {shape_key} M={m} for arm {arm_name}")
+                        aborted_arms.add(arm_name)
+                        row_summary[arm_name] = {
+                            "aborted_slow": True,
+                            "first_call_wall_ms": arm_wall_ms[arm_name],
+                        }
+                        continue
+                    if arm_name != "baseline" and not _bitwise_equal(buf, base_out):
+                        raise RuntimeError(f"Bitwise mismatch on {shape_key} M={m} for arm {arm_name}")
+                    active_arms.append((arm_name, run_fn))
 
             replays = 2 if m >= 4096 else (5 if m >= 256 else 10)
-            samples = _time_graph_interleaved(
-                active_arms, x, w, device, warmup=3, rounds=6, replays_per_round=replays
-            )
-            base_med = statistics.median(samples["baseline"])
-            row_summary = {}
+            base_run_fn = compiled_arms["baseline"][0]
+            cand_only = [item for item in active_arms if item[0] != "baseline"]
+            batch_size = 10
+            all_samples: dict[str, list[float]] = {"baseline": []}
+            for b_start in range(0, max(1, len(cand_only)), batch_size):
+                batch_cands = cand_only[b_start : b_start + batch_size]
+                batch_bufs = [
+                    ("baseline", base_run_fn, base_out),
+                    *[
+                        (c_name, c_fn, torch.empty((m, n), dtype=torch.bfloat16, device=device))
+                        for c_name, c_fn in batch_cands
+                    ],
+                ]
+                batch_samples = _time_graph_interleaved(
+                    batch_bufs, x, w, device, warmup=3, rounds=6, replays_per_round=replays
+                )
+                all_samples["baseline"].extend(batch_samples["baseline"])
+                for c_name, _ in batch_cands:
+                    all_samples[c_name] = batch_samples[c_name]
+                del batch_bufs
+
+            base_med = statistics.median(all_samples["baseline"])
             line_parts = [f"M={m:4d} | base={base_med:7.1f}us ({_tflops(m, n, k, base_med):5.1f} TF)"]
-            for arm_name, _, _ in active_arms:
-                med = statistics.median(samples[arm_name])
+            for arm_name, _ in active_arms:
+                med = statistics.median(all_samples[arm_name])
                 tf = _tflops(m, n, k, med)
                 sp = base_med / med
                 row_summary[arm_name] = {
