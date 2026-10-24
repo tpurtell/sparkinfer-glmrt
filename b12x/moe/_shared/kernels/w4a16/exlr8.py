@@ -1107,24 +1107,17 @@ class Exlr8RoutedServingKernel:
                     acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
                     acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
         elif cutlass.const_expr(self.k23_coalesced and width == 3):
-            b_ptr = payload + base_tile + lane.to(Int64) * Int64(4)
-            ia_hi = ia + Int32(8)
-            ib_hi = ib + Int32(8)
-            pred_lo = (lane < Int32(24)).to(Int32)
-            pred_hi = (lane >= Int32(8)).to(Int32)
-            w0_buf = cute.make_rmem_tensor(8, Uint32)
-            w1_buf = cute.make_rmem_tensor(8, Uint32)
+            b_ptr = payload + base_tile + min(lane, Int32(23)).to(Int64) * Int64(4)
+            w_buf = cute.make_rmem_tensor((8, 2), Uint32)
             for k16 in cutlass.range_constexpr(8):
-                w0_buf[k16] = _ld_global_nc_u32_pred_l2hint(b_ptr, pred_lo, l2_policy, k16 * 768)
-                w1_buf[k16] = _ld_global_nc_u32_pred_l2hint(b_ptr, pred_hi, l2_policy, k16 * 768 + 64)
+                for n16 in cutlass.range_constexpr(2):
+                    w_buf[k16, n16] = ld_global_nc_u32_l2hint(b_ptr, l2_policy, k16 * 768 + n16 * 96)
             for k16 in cutlass.range_constexpr(8):
                 a0, a1, a2, a3 = a0_buf[k16], a1_buf[k16], a2_buf[k16], a3_buf[k16]
                 for n16 in cutlass.range_constexpr(2):
-                    w = w0_buf[k16] if cutlass.const_expr(n16 == 0) else w1_buf[k16]
-                    src_a = ia if cutlass.const_expr(n16 == 0) else ia_hi
-                    src_b = ib if cutlass.const_expr(n16 == 0) else ib_hi
-                    a = cute.arch.shuffle_sync(w, src_a)
-                    b = cute.arch.shuffle_sync(w, src_b)
+                    w = w_buf[k16, n16]
+                    a = cute.arch.shuffle_sync(w, ia)
+                    b = cute.arch.shuffle_sync(w, ib)
                     window = (a.to(Int64) << Int64(32)) | b.to(Int64)
                     wa = (window >> shift_lo).to(Uint32)
                     wb = (window >> shift_hi).to(Uint32)
@@ -1201,12 +1194,150 @@ class Exlr8RoutedServingKernel:
         scale: Float32,
         l2_policy: Uint64,
     ):
-        a0_b, a1_b, a2_b, a3_b = self._load_a_block(a_base0, a_base1, valid0, valid1)
-        self._mma_with_loaded_a(
-            total, payload, a0_b, a1_b, a2_b, a3_b, input_block,
-            lane, warp, prev_lane, ia, ib, shift_lo, shift_hi,
-            width, scale, l2_policy,
-        )
+        acc = cute.make_rmem_tensor((4, 4), Float32)
+        acc.fill(Float32(0.0))
+        base_tile = (input_block * Int32(64) + warp * Int32(2)).to(Int64) * Int64(32 * width)
+        if cutlass.const_expr(width == 4):
+            b_ptr = payload + base_tile + lane.to(Int64) * Int64(4)
+            wb_buf = cute.make_rmem_tensor((8, 2), Uint32)
+            for k16 in cutlass.range_constexpr(8):
+                for n16 in cutlass.range_constexpr(2):
+                    wb_buf[k16, n16] = ld_global_nc_u32_l2hint(
+                        b_ptr, l2_policy, (k16 * 8 + n16) * 128
+                    )
+            for k16 in cutlass.range_constexpr(8):
+                a0 = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32)
+                a2 = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32 + 16)
+                a1 = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32)
+                a3 = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32 + 16)
+                for n16 in cutlass.range_constexpr(2):
+                    b = wb_buf[k16, n16]
+                    a = cute.arch.shuffle_sync(b, prev_lane)
+                    wa = b
+                    wb = (a << Uint32(16)) | (b >> Uint32(16))
+                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 4)
+                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[2 * n16, 0], acc[2 * n16, 1], acc[2 * n16, 2], acc[2 * n16, 3],
+                        a0, a1, a2, a3, b0, b1,
+                    )
+                    acc[2 * n16, 0], acc[2 * n16, 1] = d0, d1
+                    acc[2 * n16, 2], acc[2 * n16, 3] = d2, d3
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1], acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3],
+                        a0, a1, a2, a3, b2, b3,
+                    )
+                    acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
+                    acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
+        elif cutlass.const_expr(self.k23_coalesced and width == 2):
+            b_ptr = payload + base_tile + lane.to(Int64) * Int64(4)
+            ia_hi = ia + Int32(16)
+            ib_hi = ib + Int32(16)
+            w_buf = cute.make_rmem_tensor(8, Uint32)
+            for k16 in cutlass.range_constexpr(8):
+                w_buf[k16] = ld_global_nc_u32_l2hint(b_ptr, l2_policy, k16 * 512)
+            for k16 in cutlass.range_constexpr(8):
+                a0 = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32)
+                a2 = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32 + 16)
+                a1 = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32)
+                a3 = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32 + 16)
+                w = w_buf[k16]
+                for n16 in cutlass.range_constexpr(2):
+                    src_a = ia if cutlass.const_expr(n16 == 0) else ia_hi
+                    src_b = ib if cutlass.const_expr(n16 == 0) else ib_hi
+                    a = cute.arch.shuffle_sync(w, src_a)
+                    b = cute.arch.shuffle_sync(w, src_b)
+                    window = (a.to(Int64) << Int64(32)) | b.to(Int64)
+                    wa = (window >> shift_lo).to(Uint32)
+                    wb = (window >> shift_hi).to(Uint32)
+                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 2)
+                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[2 * n16, 0], acc[2 * n16, 1], acc[2 * n16, 2], acc[2 * n16, 3],
+                        a0, a1, a2, a3, b0, b1,
+                    )
+                    acc[2 * n16, 0], acc[2 * n16, 1] = d0, d1
+                    acc[2 * n16, 2], acc[2 * n16, 3] = d2, d3
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1], acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3],
+                        a0, a1, a2, a3, b2, b3,
+                    )
+                    acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
+                    acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
+        elif cutlass.const_expr(self.k23_coalesced and width == 3):
+            b_ptr = payload + base_tile + min(lane, Int32(23)).to(Int64) * Int64(4)
+            w_buf = cute.make_rmem_tensor((8, 2), Uint32)
+            for k16 in cutlass.range_constexpr(8):
+                for n16 in cutlass.range_constexpr(2):
+                    w_buf[k16, n16] = ld_global_nc_u32_l2hint(b_ptr, l2_policy, k16 * 768 + n16 * 96)
+            for k16 in cutlass.range_constexpr(8):
+                a0 = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32)
+                a2 = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32 + 16)
+                a1 = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32)
+                a3 = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32 + 16)
+                for n16 in cutlass.range_constexpr(2):
+                    w = w_buf[k16, n16]
+                    a = cute.arch.shuffle_sync(w, ia)
+                    b = cute.arch.shuffle_sync(w, ib)
+                    window = (a.to(Int64) << Int64(32)) | b.to(Int64)
+                    wa = (window >> shift_lo).to(Uint32)
+                    wb = (window >> shift_hi).to(Uint32)
+                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, 3)
+                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[2 * n16, 0], acc[2 * n16, 1], acc[2 * n16, 2], acc[2 * n16, 3],
+                        a0, a1, a2, a3, b0, b1,
+                    )
+                    acc[2 * n16, 0], acc[2 * n16, 1] = d0, d1
+                    acc[2 * n16, 2], acc[2 * n16, 3] = d2, d3
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1], acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3],
+                        a0, a1, a2, a3, b2, b3,
+                    )
+                    acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
+                    acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
+        else:
+            b_ptr_a = payload + base_tile + ia.to(Int64) * Int64(4)
+            b_ptr_b = payload + base_tile + ib.to(Int64) * Int64(4)
+            wa_buf = cute.make_rmem_tensor((8, 2), Uint32)
+            wb_buf = cute.make_rmem_tensor((8, 2), Uint32)
+            for k16 in cutlass.range_constexpr(8):
+                for n16 in cutlass.range_constexpr(2):
+                    off = (k16 * 8 + n16) * 32 * width
+                    wa_buf[k16, n16] = ld_global_nc_u32_l2hint(b_ptr_a, l2_policy, off)
+                    wb_buf[k16, n16] = ld_global_nc_u32_l2hint(b_ptr_b, l2_policy, off)
+            for k16 in cutlass.range_constexpr(8):
+                a0 = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32)
+                a2 = _ld_global_nc_u32_pred_offset(a_base0, valid0, k16 * 32 + 16)
+                a1 = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32)
+                a3 = _ld_global_nc_u32_pred_offset(a_base1, valid1, k16 * 32 + 16)
+                for n16 in cutlass.range_constexpr(2):
+                    a = wa_buf[k16, n16]
+                    b = wb_buf[k16, n16]
+                    window = (a.to(Int64) << Int64(32)) | b.to(Int64)
+                    wa = (window >> shift_lo).to(Uint32)
+                    wb = (window >> shift_hi).to(Uint32)
+                    b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
+                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[2 * n16, 0], acc[2 * n16, 1], acc[2 * n16, 2], acc[2 * n16, 3],
+                        a0, a1, a2, a3, b0, b1,
+                    )
+                    acc[2 * n16, 0], acc[2 * n16, 1] = d0, d1
+                    acc[2 * n16, 2], acc[2 * n16, 3] = d2, d3
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1], acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3],
+                        a0, a1, a2, a3, b2, b3,
+                    )
+                    acc[2 * n16 + 1, 0], acc[2 * n16 + 1, 1] = d0, d1
+                    acc[2 * n16 + 1, 2], acc[2 * n16 + 1, 3] = d2, d3
+        for n in cutlass.range_constexpr(4):
+            for v in cutlass.range_constexpr(4):
+                total[n, v] = total[n, v] + acc[n, v] * scale
 
     @cute.jit
     def _accumulate_pair_groups_block(
@@ -1239,8 +1370,8 @@ class Exlr8RoutedServingKernel:
         acc0.fill(Float32(0.0))
         acc1.fill(Float32(0.0))
         base_tile = (tile_block * Int32(64) + warp * Int32(2)).to(Int64) * Int64(32 * width)
-        b_ptr = payload + base_tile + lane.to(Int64) * Int64(4)
         if cutlass.const_expr(width == 4):
+            b_ptr = payload + base_tile + lane.to(Int64) * Int64(4)
             wb_buf = cute.make_rmem_tensor((8, 2), Uint32)
             for k16 in cutlass.range_constexpr(8):
                 for n16 in cutlass.range_constexpr(2):
@@ -1285,6 +1416,7 @@ class Exlr8RoutedServingKernel:
                     )
                     acc1[2 * n16 + 1, 0], acc1[2 * n16 + 1, 1], acc1[2 * n16 + 1, 2], acc1[2 * n16 + 1, 3] = d0, d1, d2, d3
         elif cutlass.const_expr(width == 2):
+            b_ptr = payload + base_tile + lane.to(Int64) * Int64(4)
             ia_hi = ia + Int32(16)
             ib_hi = ib + Int32(16)
             w_buf = cute.make_rmem_tensor(8, Uint32)
@@ -1332,15 +1464,11 @@ class Exlr8RoutedServingKernel:
                     )
                     acc1[2 * n16 + 1, 0], acc1[2 * n16 + 1, 1], acc1[2 * n16 + 1, 2], acc1[2 * n16 + 1, 3] = d0, d1, d2, d3
         else:
-            ia_hi = ia + Int32(8)
-            ib_hi = ib + Int32(8)
-            pred_lo = (lane < Int32(24)).to(Int32)
-            pred_hi = (lane >= Int32(8)).to(Int32)
-            w0_buf = cute.make_rmem_tensor(8, Uint32)
-            w1_buf = cute.make_rmem_tensor(8, Uint32)
+            b_ptr = payload + base_tile + min(lane, Int32(23)).to(Int64) * Int64(4)
+            w_buf = cute.make_rmem_tensor((8, 2), Uint32)
             for k16 in cutlass.range_constexpr(8):
-                w0_buf[k16] = _ld_global_nc_u32_pred_l2hint(b_ptr, pred_lo, l2_policy, k16 * 768)
-                w1_buf[k16] = _ld_global_nc_u32_pred_l2hint(b_ptr, pred_hi, l2_policy, k16 * 768 + 64)
+                for n16 in cutlass.range_constexpr(2):
+                    w_buf[k16, n16] = ld_global_nc_u32_l2hint(b_ptr, l2_policy, k16 * 768 + n16 * 96)
             for k16 in cutlass.range_constexpr(8):
                 a0_0 = _ld_global_nc_u32_pred_offset(a_base0_g0, valid0_g0, k16 * 32)
                 a2_0 = _ld_global_nc_u32_pred_offset(a_base0_g0, valid0_g0, k16 * 32 + 16)
@@ -1351,11 +1479,9 @@ class Exlr8RoutedServingKernel:
                 a1_1 = _ld_global_nc_u32_pred_offset(a_base1_g1, valid1_g1, k16 * 32)
                 a3_1 = _ld_global_nc_u32_pred_offset(a_base1_g1, valid1_g1, k16 * 32 + 16)
                 for n16 in cutlass.range_constexpr(2):
-                    w = w0_buf[k16] if cutlass.const_expr(n16 == 0) else w1_buf[k16]
-                    src_a = ia if cutlass.const_expr(n16 == 0) else ia_hi
-                    src_b = ib if cutlass.const_expr(n16 == 0) else ib_hi
-                    a = cute.arch.shuffle_sync(w, src_a)
-                    b = cute.arch.shuffle_sync(w, src_b)
+                    w = w_buf[k16, n16]
+                    a = cute.arch.shuffle_sync(w, ia)
+                    b = cute.arch.shuffle_sync(w, ib)
                     window = (a.to(Int64) << Int64(32)) | b.to(Int64)
                     wa = (window >> shift_lo).to(Uint32)
                     wb = (window >> shift_hi).to(Uint32)
@@ -1586,10 +1712,6 @@ class Exlr8RoutedServingKernel:
                                     x_row1_g1 = x_addr + row1_g1.to(Int64) * Int64(self.hidden_size * 2)
                                     fc1_task0 = u_idx * Int32(2) + proj
                                     fc1_task1 = (u_idx + owned_cnt) * Int32(2) + proj
-                                    grand0 = cute.make_rmem_tensor((4, 4), Float32)
-                                    grand1 = cute.make_rmem_tensor((4, 4), Float32)
-                                    grand0.fill(Float32(0.0))
-                                    grand1.fill(Float32(0.0))
                                     if width != Int32(0):
                                         payload = pointers[desc * Int64(3)]
                                         scales = pointers[desc * Int64(3) + Int64(2)]
@@ -1606,21 +1728,31 @@ class Exlr8RoutedServingKernel:
                                                 ia2, ib2, shift2_lo, shift2_hi, ia3, ib3, shift3_lo, shift3_hi, policy,
                                             )
                                             for n in cutlass.range_constexpr(4):
-                                                for v in cutlass.range_constexpr(4):
-                                                    grand0[n, v] = grand0[n, v] + total0[n, v]
-                                                    grand1[n, v] = grand1[n, v] + total1[n, v]
-                                    for n in cutlass.range_constexpr(4):
-                                        col = col_in_warp + Int32(n * 8)
-                                        base0 = fc1_addr + (fc1_task0.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                                        base1 = fc1_addr + (fc1_task1.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
-                                        if width != Int32(0) and valid0 != Int32(0):
-                                            st_global_v2_f32(base0, grand0[n, 0], grand0[n, 1])
-                                        if width != Int32(0) and valid1 != Int32(0):
-                                            st_global_v2_f32(base0 + Int64(8 * 128 * 4), grand0[n, 2], grand0[n, 3])
-                                        if width != Int32(0) and valid0_g1 != Int32(0):
-                                            st_global_v2_f32(base1, grand1[n, 0], grand1[n, 1])
-                                        if width != Int32(0) and valid1_g1 != Int32(0):
-                                            st_global_v2_f32(base1 + Int64(8 * 128 * 4), grand1[n, 2], grand1[n, 3])
+                                                col = col_in_warp + Int32(n * 8)
+                                                base0 = fc1_addr + (fc1_task0.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
+                                                base1 = fc1_addr + (fc1_task1.to(Int64) * Int64(16 * 128) + r.to(Int64) * Int64(128) + col.to(Int64)) * Int64(4)
+                                                if split == Int32(0):
+                                                    if valid0 != Int32(0):
+                                                        st_global_v2_f32(base0, Float32(0.0) + total0[n, 0], Float32(0.0) + total0[n, 1])
+                                                    if valid1 != Int32(0):
+                                                        st_global_v2_f32(base0 + Int64(8 * 128 * 4), Float32(0.0) + total0[n, 2], Float32(0.0) + total0[n, 3])
+                                                    if valid0_g1 != Int32(0):
+                                                        st_global_v2_f32(base1, Float32(0.0) + total1[n, 0], Float32(0.0) + total1[n, 1])
+                                                    if valid1_g1 != Int32(0):
+                                                        st_global_v2_f32(base1 + Int64(8 * 128 * 4), Float32(0.0) + total1[n, 2], Float32(0.0) + total1[n, 3])
+                                                else:
+                                                    if valid0 != Int32(0):
+                                                        p0, p1 = _ld_global_v2_f32(base0)
+                                                        st_global_v2_f32(base0, p0 + total0[n, 0], p1 + total0[n, 1])
+                                                    if valid1 != Int32(0):
+                                                        p2, p3 = _ld_global_v2_f32(base0 + Int64(8 * 128 * 4))
+                                                        st_global_v2_f32(base0 + Int64(8 * 128 * 4), p2 + total0[n, 2], p3 + total0[n, 3])
+                                                    if valid0_g1 != Int32(0):
+                                                        q0, q1 = _ld_global_v2_f32(base1)
+                                                        st_global_v2_f32(base1, q0 + total1[n, 0], q1 + total1[n, 1])
+                                                    if valid1_g1 != Int32(0):
+                                                        q2, q3 = _ld_global_v2_f32(base1 + Int64(8 * 128 * 4))
+                                                        st_global_v2_f32(base1 + Int64(8 * 128 * 4), q2 + total1[n, 2], q3 + total1[n, 3])
                                 else:
                                     grand = cute.make_rmem_tensor((4, 4), Float32)
                                     grand.fill(Float32(0.0))
