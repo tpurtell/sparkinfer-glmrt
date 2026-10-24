@@ -27,12 +27,14 @@ from typing import Any
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import cutlass
+import cutlass.cute as cute
 from cutlass import Int32
 import torch
 
 from benchmarks.common import nvidia_smi_gpu_mode_snapshot
+from benchmarks.duel_b.ds_a86147cc import _prefill as ds_prefill, _skinny as ds_skinny
 from b12x._lib.compiler import DimKey, KernelCompileSpec, compile as b12x_compile, run_compiled, tensor_key
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.gemm.bf16_gemv._prefill import Bf16PrefillKernel, _to_kernel_tensor
 
 STEP5_M_VALUES = (
@@ -46,6 +48,11 @@ STEP5_M_VALUES = (
 KIMI_M_VALUES = (1, 8, 16, 59, 64, 256, 1024, 2048, 4096, 8192)
 SMALL_N_M_VALUES = (1, 8, 64, 256)
 SMALL_N_SHAPES = ((384, 5120), (512, 5120), (1024, 5120))
+HEAD2HEAD_M_VALUES = (1, 16, 59, 64, 256, 1024, 2048)
+HEAD2HEAD_SHAPES = (
+    ("q", 6144, 4096, HEAD2HEAD_M_VALUES),
+    ("kimi", 24752, 7168, HEAD2HEAD_M_VALUES),
+)
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -58,7 +65,7 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 def _compile_kernel_arm(
     arm_name: str,
-    kernel_obj: Bf16PrefillKernel,
+    kernel_obj: Any,
     max_m: int,
     n: int,
     k: int,
@@ -68,6 +75,34 @@ def _compile_kernel_arm(
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     cute_out_dtype = cutlass.Float32 if out_dtype == torch.float32 else cutlass.BFloat16
+    if isinstance(kernel_obj, ds_skinny.RowTiledBf16Projection):
+        with torch.cuda.device(device):
+            compile_args = (
+                make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cute_out_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+                Int32(max_m),
+                current_cuda_stream(),
+            )
+            key = (arm_name, n, k, str(out_dtype), "pointer_abi")
+            compiled = b12x_compile(
+                kernel_obj,
+                *compile_args,
+                compile_spec=KernelCompileSpec.from_key(f"bench.bf16_prefill.{arm_name}", 1, key),
+            )
+
+        def run(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
+            runtime_args = (
+                make_ptr(cutlass.BFloat16, int(x.data_ptr()), cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.BFloat16, int(w.data_ptr()), cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cute_out_dtype, int(out.data_ptr()), cute.AddressSpace.gmem, assumed_align=16),
+                Int32(x.shape[0]),
+                current_cuda_stream(),
+            )
+            run_compiled(compiled, runtime_args)
+
+        return run, compiled
+
     with torch.cuda.device(device), FakeTensorMode():
         fx = torch.empty((max_m, k), dtype=torch.bfloat16, device=device)
         fw = torch.empty((n, k), dtype=torch.bfloat16, device=device)
@@ -232,41 +267,7 @@ def _build_screening_candidates(
         ("baseline", Bf16PrefillKernel(n, k, legacy=True), m_list),
         ("auto_default", Bf16PrefillKernel(n, k), m_list),
     ]
-    if (n, k) == (6144, 4096):
-        for s in (3, 4):
-            for gm in (1, 8, 16):
-                candidates.append((
-                    f"r4_q_w4x4_64x128_s{s}_gm{gm}",
-                    Bf16PrefillKernel(
-                        n, k,
-                        warp_layout=(4, 4),
-                        tile_m=64,
-                        tile_n=128,
-                        num_stages=s,
-                        k_unroll=1,
-                        buffer_align_bytes=128,
-                        group_m=gm,
-                    ),
-                    (2048,),
-                ))
-    elif (n, k) == (24752, 7168):
-        for s in (3, 4):
-            for gm in (1, 8, 16):
-                candidates.append((
-                    f"r4_kimi_w4x4_128x64_s{s}_gm{gm}",
-                    Bf16PrefillKernel(
-                        n, k,
-                        warp_layout=(4, 4),
-                        tile_m=128,
-                        tile_n=64,
-                        num_stages=s,
-                        k_unroll=1,
-                        buffer_align_bytes=128,
-                        group_m=gm,
-                    ),
-                    (2048,),
-                ))
-    else:
+    if (n, k) not in ((6144, 4096), (24752, 7168)):
         candidates.extend([
             ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, k_unroll=1, buffer_align_bytes=128, group_m=1), (1, 8, 64)),
             ("sh_w2x2_32x32_s5_u1", Bf16PrefillKernel(n, k, warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, k_unroll=1, buffer_align_bytes=128, group_m=1), (8, 64, 256)),
@@ -416,6 +417,46 @@ def _verify_no_hang_cpu(compile_sass: bool = True) -> None:
                 assert "SYNCS.PHASECHK.TRANS64.TRYWAIT" in fn_block, f"{label} missing consumer/producer wait"
                 assert "SYNCS.ARRIVE.TRANS64" in fn_block, f"{label} missing barrier commit/release"
                 assert "UTMALDG.2D" in fn_block, f"{label} missing TMA 2D load"
+
+        for shape_label, n, k, _ in HEAD2HEAD_SHAPES:
+            ds_canon = ds_prefill.Bf16PrefillKernel(n, k)
+            ds_rt = ds_skinny.RowTiledBf16Projection(
+                n, k, ds_skinny.COMPENSATED_TILES_BY_ROWS[(n, k)], compensated=True
+            )
+            m_sym, s_sym = cute.sym_int(32), cute.sym_int(64)
+            fx = make_fake_tensor(cutlass.BFloat16, (m_sym, k), (s_sym, 1), assumed_align=16)
+            fw = make_fake_tensor(cutlass.BFloat16, (n, k), (k, 1), assumed_align=16)
+            fout = make_fake_tensor(cutlass.BFloat16, (m_sym, n), (s_sym, 1), assumed_align=16)
+            compiled_canon = cute.compile(
+                ds_canon, fx, fw, fout, Int32(256), make_fake_stream(),
+                options="--gpu-arch=sm_120a", no_jit_engine=True,
+            )
+            compiled_rt = cute.compile(
+                ds_rt,
+                make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+                Int32(256),
+                make_fake_stream(),
+                options="--gpu-arch=sm_120a",
+                no_jit_engine=True,
+            )
+            for tag, comp_mod in ((f"{shape_label}_ds_canon", compiled_canon), (f"{shape_label}_ds_rowtile", compiled_rt)):
+                fatbin = _extract_fatbin_bytes(str(comp_mod.ir_module))
+                cubin = fatbin[fatbin.find(b"\x7fELF") :]
+                with tempfile.NamedTemporaryFile(suffix=".cubin") as f:
+                    f.write(cubin)
+                    f.flush()
+                    sass_out = subprocess.check_output(["cuobjdump", "-sass", f.name], text=True)
+                assert "USETMAXREG" not in sass_out and "SETMAXNREG" not in sass_out, (
+                    f"{tag} cubin contains SETMAXNREG instruction!"
+                )
+                fn_blocks = sass_out.split("Function : ")[1:]
+                assert len(fn_blocks) >= 1, f"{tag} has no SASS functions"
+                for fn_block in fn_blocks:
+                    assert "SYNCS.PHASECHK.TRANS64.TRYWAIT" in fn_block, f"{tag} missing consumer/producer wait"
+                    assert "SYNCS.ARRIVE.TRANS64" in fn_block, f"{tag} missing barrier commit/release"
+                    assert "UTMALDG.2D" in fn_block, f"{tag} missing TMA 2D load"
 
 
 def _run_screening(
@@ -665,9 +706,206 @@ def _run_duel(
     return report
 
 
+def _run_head2head(
+    device: torch.device,
+    output_path: pathlib.Path | None = None,
+    shape_filter: set[str] | None = None,
+    m_filter: set[int] | None = None,
+) -> dict[str, Any]:
+    mode_before = nvidia_smi_gpu_mode_snapshot()
+    report: dict[str, Any] = {
+        "gpu_mode_before": mode_before,
+        "shapes": {},
+    }
+
+    for label, n, k, m_list in HEAD2HEAD_SHAPES:
+        shape_key = f"{n}x{k}"
+        if shape_filter is not None and shape_key not in shape_filter and label not in shape_filter:
+            continue
+        active_m_list = tuple(m for m in m_list if m_filter is None or m in m_filter)
+        if not active_m_list:
+            continue
+        print(f"\n=== Head-to-Head on {label} (N={n}, K={k}, rows={active_m_list}) ===", flush=True)
+        max_m = max(max(active_m_list), 512)
+
+        canon_obj = ds_prefill.Bf16PrefillKernel(n, k)
+        canon_repeat_obj = ds_prefill.Bf16PrefillKernel(n, k)
+        ds_rowtile_obj = ds_skinny.RowTiledBf16Projection(
+            n, k, ds_skinny.COMPENSATED_TILES_BY_ROWS[(n, k)], compensated=True
+        )
+        gemini_obj = Bf16PrefillKernel(n, k)
+
+        canon_run, _ = _compile_kernel_arm(f"h2h_{label}_canon", canon_obj, max_m, n, k, device)
+        canon_repeat_run, _ = _compile_kernel_arm(
+            f"h2h_{label}_canon_repeat", canon_repeat_obj, max_m, n, k, device
+        )
+        ds_rowtile_run, _ = _compile_kernel_arm(
+            f"h2h_{label}_ds_rowtile", ds_rowtile_obj, max_m, n, k, device
+        )
+        gemini_run, _ = _compile_kernel_arm(f"h2h_{label}_gemini", gemini_obj, max_m, n, k, device)
+
+        inv_ds = _verify_cancellation_and_row_invariance(n, k, canon_run, ds_rowtile_run, device)
+        inv_gemini = _verify_cancellation_and_row_invariance(n, k, canon_run, gemini_run, device)
+        invariants = {
+            "ds_rowtile": inv_ds,
+            "gemini": inv_gemini,
+        }
+        print(f"Invariants {label}: {invariants}", flush=True)
+
+        gen = torch.Generator(device=device).manual_seed(4242 + n + k)
+        w = (torch.randn((n, k), generator=gen, device=device, dtype=torch.float32) / math.sqrt(k)).bfloat16()
+        x_max = torch.randn((max_m, k), generator=gen, device=device, dtype=torch.float32).bfloat16()
+
+        cells: list[dict[str, Any]] = []
+        dropped_arms: dict[str, str] = {}
+        print(
+            f"{'shape':>6s} | {'rows':>5s} | {'canon us':>9s} | {'canon2 us':>9s} | "
+            f"{'ds_rowtile us (ratio)':>22s} | {'gemini us (ratio)':>20s} | "
+            f"{'spread':>7s} | {'margin':>7s} | {'winner':>18s}",
+            flush=True,
+        )
+        print("-" * 124, flush=True)
+
+        all_arm_runners = [
+            ("canon", canon_run),
+            ("canon_repeat", canon_repeat_run),
+            ("ds_rowtile", ds_rowtile_run),
+            ("gemini", gemini_run),
+        ]
+
+        for m in active_m_list:
+            x = x_max[:m]
+            arm_bufs: dict[str, torch.Tensor] = {}
+            bitwise_flags: dict[str, bool] = {}
+            active_for_cell: list[tuple[str, Any, torch.Tensor]] = []
+
+            for arm_name, run_fn in all_arm_runners:
+                if arm_name in dropped_arms:
+                    bitwise_flags[arm_name] = False
+                    continue
+                buf = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+                run_fn(x, w, buf)
+                torch.cuda.synchronize(device)
+                arm_bufs[arm_name] = buf
+                if arm_name == "canon":
+                    bitwise_flags[arm_name] = True
+                    active_for_cell.append((arm_name, run_fn, buf))
+                else:
+                    eq = _bitwise_equal(buf, arm_bufs["canon"])
+                    bitwise_flags[arm_name] = eq
+                    if not eq:
+                        if arm_name == "canon_repeat":
+                            raise RuntimeError(f"canon_repeat bitwise mismatch on {label} rows={m}")
+                        dropped_arms[arm_name] = f"bitwise_mismatch_at_rows_{m}"
+                        print(f"  [DROP] {arm_name} failed bitwise equality on {label} rows={m}", flush=True)
+                    else:
+                        active_for_cell.append((arm_name, run_fn, buf))
+
+            replays = 3 if m >= 4096 else (5 if m >= 256 else 10)
+            samples = _time_graph_interleaved(
+                active_for_cell,
+                x,
+                w,
+                device,
+                warmup=5,
+                rounds=10,
+                replays_per_round=replays,
+            )
+
+            canon_med = statistics.median(samples["canon"])
+            canon_repeat_med = statistics.median(samples["canon_repeat"])
+            canon_mean = 0.5 * (canon_med + canon_repeat_med)
+            raw_spread = abs(canon_med - canon_repeat_med) / canon_mean
+            threshold = max(0.015, raw_spread)
+
+            ds_med = statistics.median(samples["ds_rowtile"]) if "ds_rowtile" in samples else float("inf")
+            gem_med = statistics.median(samples["gemini"]) if "gemini" in samples else float("inf")
+            ds_ratio = canon_med / ds_med if math.isfinite(ds_med) else 0.0
+            gem_ratio = canon_med / gem_med if math.isfinite(gem_med) else 0.0
+            ds_ratio_mean = canon_mean / ds_med if math.isfinite(ds_med) else 0.0
+            gem_ratio_mean = canon_mean / gem_med if math.isfinite(gem_med) else 0.0
+
+            if not math.isfinite(ds_med) and math.isfinite(gem_med):
+                faster_arm = "gemini"
+                margin = float("inf")
+                verdict = "WIN"
+                winner = "gemini"
+            elif math.isfinite(ds_med) and not math.isfinite(gem_med):
+                faster_arm = "ds_rowtile"
+                margin = float("inf")
+                verdict = "WIN"
+                winner = "ds_rowtile"
+            else:
+                if gem_med < ds_med:
+                    faster_arm = "gemini"
+                    margin = (ds_med / gem_med) - 1.0
+                else:
+                    faster_arm = "ds_rowtile"
+                    margin = (gem_med / ds_med) - 1.0
+                if margin > threshold:
+                    verdict = "WIN"
+                    winner = faster_arm
+                else:
+                    verdict = "TIE"
+                    winner = "TIE -> ds_rowtile"
+
+            print(
+                f"{label:>6s} | {m:5d} | {canon_med:9.2f} | {canon_repeat_med:9.2f} | "
+                f"{ds_med:9.2f} ({ds_ratio:6.3f}x)    | {gem_med:9.2f} ({gem_ratio:6.3f}x)  | "
+                f"{raw_spread*100:6.2f}% | {margin*100:6.2f}% | {winner:>18s}",
+                flush=True,
+            )
+
+            cells.append({
+                "shape": label,
+                "rows": m,
+                "n": n,
+                "k": k,
+                "baseline_us": canon_med,
+                "canon_median_us": canon_med,
+                "canon_repeat_median_us": canon_repeat_med,
+                "canon_mean_us": canon_mean,
+                "ds_rowtile_median_us": ds_med if math.isfinite(ds_med) else None,
+                "gemini_median_us": gem_med if math.isfinite(gem_med) else None,
+                "ds_rowtile_ratio_vs_canon": ds_ratio,
+                "gemini_ratio_vs_canon": gem_ratio,
+                "ds_rowtile_ratio_vs_canon_mean": ds_ratio_mean,
+                "gemini_ratio_vs_canon_mean": gem_ratio_mean,
+                "canon_tflops": _tflops(m, n, k, canon_med),
+                "canon_repeat_tflops": _tflops(m, n, k, canon_repeat_med),
+                "ds_rowtile_tflops": _tflops(m, n, k, ds_med) if math.isfinite(ds_med) else 0.0,
+                "gemini_tflops": _tflops(m, n, k, gem_med) if math.isfinite(gem_med) else 0.0,
+                "bitwise_flags": bitwise_flags,
+                "raw_spread": raw_spread,
+                "threshold": threshold,
+                "faster_arm": faster_arm,
+                "margin": margin,
+                "verdict": verdict,
+                "winner": winner,
+                "samples_us": samples,
+            })
+
+        report["shapes"][label] = {
+            "n": n,
+            "k": k,
+            "invariants": invariants,
+            "dropped_arms": dropped_arms,
+            "cells": cells,
+        }
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(report, indent=2) + "\n")
+
+    report["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2) + "\n")
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("duel", "screen", "both"), default="duel")
+    parser.add_argument("--mode", choices=("duel", "screen", "both", "head2head"), default="duel")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--include-small-n", action="store_true", default=True)
     parser.add_argument("--no-small-n", action="store_false", dest="include_small_n")
@@ -701,7 +939,12 @@ def main() -> int:
     device = torch.device("cuda", args.device)
     torch.cuda.set_device(device)
     t0 = time.time()
-    if args.mode == "screen":
+    if args.mode == "head2head":
+        data = _run_head2head(
+            device, output_path=args.output_json, shape_filter=shape_filter, m_filter=m_filter
+        )
+        data["elapsed_wall_seconds"] = time.time() - t0
+    elif args.mode == "screen":
         data = _run_screening(
             device, output_path=args.output_json, shape_filter=shape_filter, m_filter=m_filter
         )
