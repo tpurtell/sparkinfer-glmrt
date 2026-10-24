@@ -1016,14 +1016,16 @@ def _run_prefill_benchmark(args, device, props):
 
 
 GLM_CAPACITIES = (256, 1024, 2752, 4096)
-GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024,
+GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp2-width1024": 1024,
                 "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512}
 GLM_ROUTES = Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
 COORDINATOR_FAMILIES = {
     "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
                 model="zai-org/GLM-5.3", profiles=tuple(GLM_PROFILES), routes=GLM_ROUTES),
     "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), swiglu_limit=10.0,
-                 model="zai-org/GLM-5.3-Flash", profiles=("rtx-tp1", "rtx-tp2"), routes=None),
+                 model="zai-org/GLM-5.3-Flash",
+                 profiles=("rtx-tp1", "rtx-tp2", "spark-tp4-width512", "spark-tp2-width1024"),
+                 routes=None),
 }
 
 
@@ -1131,6 +1133,9 @@ def coordinator_preflight(args):
     capacities = [int(v) for v in args.capacities.split(",")]
     if not capacities or len(capacities) != len(set(capacities)):
         raise ValueError("capacities must be nonempty and unique")
+    prefix_rows = [int(v) for v in args.coordinator_rows.split(",")]
+    if not prefix_rows or any(rows < 1 for rows in prefix_rows):
+        raise ValueError("coordinator prefix rows must be positive")
     specs = [("coop", {})]
     if args.role == "spark":
         specs.append(("served", dict(mode="ws", wire=1, stages=3, dynamic=1, ctas=1,
@@ -1227,17 +1232,36 @@ def _run_coordinator_benchmark(args, device, props):
                 ids = (real_route_ids(capacity, wave, generator, experts, topk) if wave else
                        torch.rand((capacity, experts), generator=generator).topk(topk, dim=1).indices).to(device=device, dtype=torch.int32)
                 for layer in range(args.layers):
-                    def run(name):
+                    def run(name, rows=None):
                         workspace, bindings = states[name]
                         x = wire if bindings[layer].launch.input_format == "e4m3_k32" else decoded
-                        return mix.run_bound_mixed_trellis(x, weights, ids, bindings[layer], workspace)
+                        if rows is not None:
+                            x = x[:rows]
+                        return mix.run_bound_mixed_trellis(
+                            x, weights if rows is None else weights[:rows],
+                            ids if rows is None else ids[:rows], bindings[layer], workspace)
                     expected = run("coop").clone()
                     if expected.dtype != output_dtype or not bool(torch.isfinite(expected).all()) or not bool(expected.any()):
                         raise RuntimeError("cooperative oracle must use the role's sum dtype and be finite and nonzero")
-                    graphs, checks = {}, {}
+                    # Row invariance: every arm's prefix of the capacity-length run must
+                    # match the oracle's prefix bit for bit (the kernel is compiled for
+                    # the capacity, so this is the row-state gate).
+                    prefix_rows = sorted({r for r in map(int, args.coordinator_rows.split(","))
+                                          if 0 < r < capacity})
+                    prefix_bitwise = {}
+                    for rows in prefix_rows:
+                        oracle = run("coop", rows).clone()
+                        stable = torch.equal(oracle.view(bit_dtype), expected[:rows].view(bit_dtype))
+                        for name, _ in specs:
+                            stable &= torch.equal(run(name, rows).view(bit_dtype), oracle.view(bit_dtype))
+                        prefix_bitwise[rows] = stable
+                    graphs, checks, vs_base = {}, {}, {}
+                    base_output = None
                     for name, _ in specs:
                         actual = run(name)
                         checks[name] = torch.equal(actual.view(bit_dtype), expected.view(bit_dtype))
+                        if name == "base":
+                            base_output = actual.clone()
                         workspace, bindings = states[name]
                         # Freeze routing outside the graph: time the real bound core + top-k sum
                         # without copying its raw ABI or charging precomputed route-pack work.
@@ -1249,8 +1273,13 @@ def _run_coordinator_benchmark(args, device, props):
                         workspace.output.fill_(float("nan"))
                         graphs[name].replay()
                         checks[name] &= torch.equal(workspace.output.view(bit_dtype), expected.view(bit_dtype))
+                    if base_output is not None:
+                        for name, _ in specs:
+                            workspace, bindings = states[name]
+                            actual = run(name)
+                            vs_base[name] = torch.equal(actual.view(bit_dtype), base_output.view(bit_dtype))
                     samples = {name: [] for name, _ in specs}
-                    if all(checks.values()) and not args.correctness_only:
+                    if all(checks.values()) and all(prefix_bitwise.values()) and not args.correctness_only:
                         names = list(graphs)
                         with kernel_resolution_guard("SM120 coordinator frozen graph timing"):
                             for repeat in range(args.rounds):
@@ -1262,11 +1291,13 @@ def _run_coordinator_benchmark(args, device, props):
                     record = dict(capacity=capacity, distribution=distribution, weight_layer=layer,
                         wave_index=wave_index, route_layer=wave.get("layer") if wave else None,
                         content=wave.get("content") if wave else None, bitwise=checks,
+                        bitwise_vs_base=vs_base, prefix_bitwise=prefix_bitwise,
                         samples_us=samples, median_us={name: statistics.median(v) for name, v in samples.items() if v},
                         output_sha256=hashlib.sha256(expected.view(torch.uint8).cpu().numpy().tobytes()).hexdigest())
                     records.append(record)
-                    if not all(checks.values()):
-                        failures.append({k: record[k] for k in ("capacity", "distribution", "wave_index", "bitwise")})
+                    if not all(checks.values()) or not all(prefix_bitwise.values()):
+                        failures.append({k: record[k] for k in (
+                            "capacity", "distribution", "wave_index", "bitwise", "prefix_bitwise")})
                     print(json.dumps(record), flush=True)
                     del graphs, expected, actual
         del states, workspace, bindings, launch
@@ -1284,7 +1315,9 @@ def _run_coordinator_benchmark(args, device, props):
         conditions="synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); common E4M3/UE8M0 K32-roundtripped BF16 input; "
                    "histogram replay preserves rescaled expert counts, not original token co-occurrence; "
                    "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; "
-                   "median of interleaved round medians, microseconds per layer",
+                   "median of interleaved round medians, microseconds per layer; "
+                   "every arm checked bitwise against the cooperative oracle, the base arm and at each prefix row count",
+        prefix_rows=[int(v) for v in args.coordinator_rows.split(",")],
         exact=not failures, failures=failures, rows=records)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
@@ -1337,6 +1370,8 @@ def benchmark_parser():
                              "route_block=64,ctas=1,stages=3,wire=1,dynamic=1; coop baseline is automatic")
     parser.add_argument("--route-distributions", default="random,realistic", help="GLM random and/or realistic histograms")
     parser.add_argument("--coordinator-route-layer", type=int, help="GLM histogram layer filter; default all 72 waves")
+    parser.add_argument("--coordinator-rows", default="1,17,63,64,65",
+                        help="Comma-separated prefix row counts below the capacity checked for row invariance")
     parser.add_argument("--k5-experts", type=int, default=0, help="synthetic K5 count per projection (0..256); K4 otherwise")
     parser.add_argument("--preflight-only", action="store_true", help="CPU-only GLM coordinator argument/fixture validation")
     parser.add_argument("--compact-fixture", type=Path, help="planner-replayed compact ownership JSON")
