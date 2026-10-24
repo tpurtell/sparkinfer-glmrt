@@ -23,10 +23,15 @@ def benchmark():
                  PREFILL_FAMILIES={"qwen4": (), "kimik3": ()}, GLM_CAPACITIES=(256, 1024, 2752, 4096),
                  GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes,
                  COORDINATOR_FAMILIES={
-                     "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
-                                 model="zai-org/GLM-5.3", profiles=tuple(glm_profiles), routes=glm_routes),
-                     "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), swiglu_limit=10.0,
-                                  model="zai-org/GLM-5.3-Flash", profiles=("rtx-tp1", "rtx-tp2"), routes=None),
+                     "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), activation="silu", swiglu_limit=None,
+                                 model="zai-org/GLM-5.3", profiles=dict(glm_profiles),
+                                 capacities=(256, 1024, 2752, 4096), routes=glm_routes),
+                     "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), activation="silu", swiglu_limit=10.0,
+                                  model="zai-org/GLM-5.3-Flash", profiles={"rtx-tp1": 2048, "rtx-tp2": 1024},
+                                  capacities=(256, 1024, 2752, 4096), routes=None),
+                     "kimik3": dict(hidden=3584, experts=896, top_k=16, bits=(2, 3), activation="situ", swiglu_limit=None,
+                                    model="moonshotai/Kimi-K3", profiles={"rtx-tp1": 3072, "rtx-tp2": 1536},
+                                    capacities=(256, 1024, 4096), routes=None),
                  })
     host_names = {"route_pack_capacity", "route_pack_numel_capacity", "route_pack_token_capacity",
                   "max_packed_route_slots"}
@@ -186,3 +191,62 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
         b.coordinator_preflight(b.benchmark_parser().parse_args([
             "--prefill-family", "glmf", "--role", "coordinator", "--route-distributions", "random",
             "--k5-experts", "289", "--output", "result.json"]))
+
+
+@pytest.mark.parametrize("profile,width", [("rtx-tp1", 3072), ("rtx-tp2", 1536)])
+@pytest.mark.parametrize("capacity", [256, 1024, 4096])
+def test_kimik3_cooperative_matches_export_contract(profile, width, capacity):
+    b = benchmark()
+    for sms in (170, 188):
+        props = SimpleNamespace(multi_processor_count=sms, shared_memory_per_block_optin=101376)
+        opts = b.coordinator_compile_options(profile, capacity, {}, props, "kimik3")
+        assert (opts["hidden_size"], opts["intermediate_size"], opts["top_k"], opts["route_num_experts"]) == (3584, width, 16, 896)
+        assert opts["tier0_num_experts"] == opts["tier1_num_experts"] == 896
+        assert (opts["tier0_bits"], opts["tier1_bits"]) == (2, 3)
+        assert opts["activation"] == "situ" and opts["swiglu_limit"] is None
+        assert opts["sms"] == sms
+        assert opts["full_rotation_output_dtype"] == "fp32"
+        assert opts["moe_block_size"] == 8
+        assert not opts["token_major_rotation"]
+        assert not opts["warp_specialized"] and not opts["fused_input_rotation"]
+        assert opts["max_m_blocks"] >= (capacity * 16 + 896 * (opts["moe_block_size"] - 1) + opts["moe_block_size"] - 1) // opts["moe_block_size"]
+
+
+def test_kimik3_preflight_and_foreign_fixture_refusal():
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", "kimik3", "--role", "coordinator", "--route-distributions", "random",
+        "--k5-experts", "0", "--output", "result.json",
+        "--coordinator-arm", "ws64:mode=ws,stages=3,dynamic=1,ctas=1,route_block=64,tile=64/256/64/256",
+    ])
+    capacities, specs, routes, waves = b.coordinator_preflight(args)
+    assert capacities == [256, 1024, 4096] and routes == ["random"] and waves == []
+    opts = b.coordinator_compile_options(args.profile, 1024, specs[1][1],
+                                         SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376), "kimik3")
+    assert opts["hidden_size"] == 3584 and opts["intermediate_size"] == 1536 and opts["route_num_experts"] == 896
+    assert (opts["tier0_bits"], opts["tier1_bits"]) == (2, 3)
+    assert opts["activation"] == "situ" and opts["swiglu_limit"] is None
+    assert opts["warp_specialized"] and opts["input_format"] == "bf16"
+    assert opts["force_tile_config"] == (64, 256, 64, 256) and opts["moe_block_size"] == 64
+    for bad_cap in ("2048", "2752", "256,2048,4096"):
+        with pytest.raises(ValueError, match="capacity"):
+            b.coordinator_preflight(b.benchmark_parser().parse_args([
+                "--prefill-family", "kimik3", "--role", "coordinator", "--route-distributions", "random",
+                "--capacities", bad_cap, "--output", "result.json"]))
+    with pytest.raises(ValueError, match="no realistic route fixture"):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "kimik3", "--role", "coordinator", "--output", "result.json"]))
+    with pytest.raises(ValueError, match="moonshotai/Kimi-K3"):
+        b.coordinator_route_waves(b.GLM_ROUTES, family="kimik3")
+    with pytest.raises(ValueError, match="moonshotai/Kimi-K3"):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "kimik3", "--role", "coordinator", "--route-distributions", "random",
+            "--routes", str(b.GLM_ROUTES), "--output", "result.json"]))
+    with pytest.raises(ValueError):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "kimik3", "--role", "spark", "--profile", "spark-tp4-width512",
+            "--route-distributions", "random", "--output", "result.json"]))
+    with pytest.raises(ValueError):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "kimik3", "--role", "coordinator", "--route-distributions", "random",
+            "--k5-experts", "897", "--output", "result.json"]))
