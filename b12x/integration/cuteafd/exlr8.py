@@ -17,6 +17,7 @@ ABI_VERSION = 3
 # Launch hint, not math: callers pass cta_limit = cudaDevAttr SM count * this.
 # Mirrors Exlr8A16Kernel.CTAS_PER_SM (kept literal so the contract stays CUDA-free).
 CTAS_PER_SM = 4
+DEFAULT_SERVING_VARIANT = "k1_reg_pair_b2"
 POINTERS = ("x", "pointers", "bits", "group_expert", "route_slots",
             "route_group_lane", "route_weights", "fc1", "intermediate", "fc2",
             "signs_out", "output")
@@ -76,14 +77,19 @@ class _Exlr8Pointers:
 
 class _Exlr8ServingPointers:
     def __init__(self, g):
-        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel
+        from b12x.moe._shared.kernels.w4a16.exlr8 import Exlr8A16Kernel, Exlr8RoutedServingKernel
         if g.get("max_rows", 64) > 64:
             from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
             self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                            g["max_groups"], g["group_rows"])
-        else:
+        elif g.get("shared_expert", False) or g.get("serving_variant") == "baseline" or g["units"] > 16:
             self.core = Exlr8A16Kernel(g["hidden"], g["units"], g["top_k"],
                                       g["max_groups"], device_count=True)
+        else:
+            self.core = Exlr8RoutedServingKernel(
+                g["hidden"], g["units"], g["top_k"], g["max_groups"],
+                variant=g.get("serving_variant") or DEFAULT_SERVING_VARIANT,
+            )
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -151,13 +157,18 @@ class _Exlr8GroupedServingPointers:
 
 
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
-                         device_count=False, shared_expert=False, grouped=False, group_rows=64):
+                         device_count=False, shared_expert=False, grouped=False, group_rows=64,
+                         serving_variant=None):
     if shared_expert:
         if not device_count:
             raise ValueError("shared EXLR8 requires device-count serving ABI")
         if top_k != 1 or max_groups != 4:
             raise ValueError("shared EXLR8 requires top_k=1 and max_groups=4")
     g = geometry(hidden, units, top_k, max_groups)
+    routed_serving = bool(device_count and not shared_expert and not grouped and units <= 16)
+    resolved_variant = (serving_variant or DEFAULT_SERVING_VARIANT) if routed_serving else "baseline"
+    if device_count and not grouped:
+        g = dict(g, shared_expert=bool(shared_expert), serving_variant=resolved_variant)
     if grouped:
         if not device_count or shared_expert or group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped prefill requires device count and group rows 16/32/64")
@@ -207,6 +218,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  # source: bump the tag when decode's weight-load
                                  # cache policy changes.
                                  "decode_l2_fc2_prefetch_v9")
-                                + (("grouped_compact_units",) if grouped else ())), geometry=g,
+                                + (("grouped_compact_units",) if grouped else ())
+                                + ((resolved_variant,) if routed_serving and resolved_variant != "baseline" else ())),
+                           geometry=(geometry(hidden, units, top_k, max_groups) if not grouped else g),
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)
