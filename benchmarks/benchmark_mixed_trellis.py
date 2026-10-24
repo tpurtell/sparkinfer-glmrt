@@ -1336,6 +1336,7 @@ def _run_coordinator_benchmark(args, device, props):
                         packed = (workspace.packed_route_indices[:slots], workspace.block_expert_ids, workspace.packed_route_count)
                         with patch.object(mix, "pack_topk_routes_by_expert", return_value=packed):
                             graphs[name] = _capture(lambda name=name: run(name), args.warmup)
+                        resources[capacity][name] = _kernel_resource_info(launch, props.shared_memory_per_block_optin)
                         for _ in range(3 if compact else 1):
                             workspace.output.fill_(float("nan"))
                             if compact:
