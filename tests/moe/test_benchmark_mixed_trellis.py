@@ -134,7 +134,7 @@ def test_prefill_policy_separates_route_block_from_ws():
     for width in (128, 256, 384, 640):
         opts = bench.prefill_compile_options("qwen4", width, 32, "ws", props)
         assert width % opts["force_tile_config"][1] == 0
-    glm_compact_ws = bench.prefill_compile_options("glm", 384, 32, "ws+n256+dynamic", props, compact=True)
+    glm_compact_ws = bench.prefill_compile_options("glm", 384, 32, "ws+n256+dynamic", props, compact_weights=True)
     assert glm_compact_ws["compact_weights"] and glm_compact_ws["warp_specialized"]
     assert glm_compact_ws["force_tile_config"] == (64, 128, 64, 256)
     assert glm_compact_ws["ws_dynamic_tiles"]
