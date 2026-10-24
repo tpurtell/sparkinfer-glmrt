@@ -749,16 +749,8 @@ class Exlr8RoutedServingKernel:
         self.paired_fc1 = variant in (
             "k1_paired_fc1",
             "k1_reg_pair_b2",
-            "k1_k23_coalesced",
-            "k1_in_cta_fold",
-            "k1_supergroup_fold",
         )
-        self.reg_pair_fc1 = variant in (
-            "k1_reg_pair_b2",
-            "k1_k23_coalesced",
-            "k1_in_cta_fold",
-            "k1_supergroup_fold",
-        )
+        self.reg_pair_fc1 = variant == "k1_reg_pair_b2"
         self.pair_fc2 = variant == "k1_reg_pair_b2" and (hidden_size // 128) % 2 == 0
         self.k23_coalesced = variant in (
             "k1_k23_coalesced",
@@ -772,6 +764,7 @@ class Exlr8RoutedServingKernel:
         )
         self.in_cta_fold = variant in ("k1_in_cta_fold", "k1_supergroup_fold")
         self.supergroup = variant == "k1_supergroup_fold"
+        self.ctas_per_sm = 3 if self.supergroup else self.CTAS_PER_SM
         self.group_rows = 16
         self.blocks = hidden_size // 128
         self.splits = (self.blocks + 7) // 8
@@ -817,7 +810,7 @@ class Exlr8RoutedServingKernel:
             ).launch(
                 grid=(min(max_live_groups * Int32(self.units * 2 * self.splits), cta_limit), 1, 1),
                 block=(128, 1, 1),
-                min_blocks_per_mp=self.CTAS_PER_SM,
+                min_blocks_per_mp=self.ctas_per_sm,
                 stream=stream,
             )
             self.activation_kernel(
@@ -832,7 +825,7 @@ class Exlr8RoutedServingKernel:
             ).launch(
                 grid=(min(max_live_groups * Int32(self.blocks), cta_limit), 1, 1),
                 block=(128, 1, 1),
-                min_blocks_per_mp=self.CTAS_PER_SM,
+                min_blocks_per_mp=self.ctas_per_sm,
                 stream=stream,
             )
             self.reduce_kernel(
