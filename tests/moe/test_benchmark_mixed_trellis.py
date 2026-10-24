@@ -81,14 +81,34 @@ def test_benchmark_kimi_variant_parsing_and_geometry() -> None:
     ]
 
 
-@pytest.mark.parametrize("value", ["ws:32:ws", "coop8:8:cooperative", "coop16:16:cooperative"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ws:32:ws",
+        "ws_n256_dyn:32:ws+n256+dynamic",
+        "coop8:8:cooperative",
+        "coop16:16:cooperative",
+    ],
+)
 def test_prefill_arm(value):
     bench = _load_benchmark_module()
     name, block, mode = value.split(":")
     assert bench.parse_prefill_arm(value) == (name, int(block), mode)
 
 
-@pytest.mark.parametrize("value", ["bad", "ws:8:ws", "a:17:ws", "a_control:32:ws", ":32:ws", "a:32:other"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "bad",
+        "ws:8:ws",
+        "a:17:ws",
+        "a_control:32:ws",
+        ":32:ws",
+        "a:32:other",
+        "a:32:cooperative+dynamic",
+        "a:32:ws+bad",
+    ],
+)
 def test_prefill_arm_rejects_invalid(value):
     bench = _load_benchmark_module()
     with pytest.raises(bench.argparse.ArgumentTypeError):
@@ -114,6 +134,10 @@ def test_prefill_policy_separates_route_block_from_ws():
     for width in (128, 256, 384, 640):
         opts = bench.prefill_compile_options("qwen4", width, 32, "ws", props)
         assert width % opts["force_tile_config"][1] == 0
+    glm_compact_ws = bench.prefill_compile_options("glm", 384, 32, "ws+n256+dynamic", props, compact=True)
+    assert glm_compact_ws["compact_weights"] and glm_compact_ws["warp_specialized"]
+    assert glm_compact_ws["force_tile_config"] == (64, 128, 64, 256)
+    assert glm_compact_ws["ws_dynamic_tiles"]
     with pytest.raises(ValueError):
         bench.prefill_compile_options("kimik3", 384, 16, "ws", props)
 
@@ -156,7 +180,7 @@ def test_compact_prefill_fixture_requires_complete_ownership(tmp_path):
     assert len(bench.compact_prefill_fixture(path, 0, "qwen4", 256)["entries"]) == 512
     with pytest.raises(ValueError, match="requested rank"):
         bench.compact_prefill_fixture(path, 1, "qwen4", 256)
-    with pytest.raises(ValueError, match="requires Qwen"):
+    with pytest.raises(ValueError, match="requires Qwen or GLM"):
         bench.compact_prefill_fixture(path, 0, "kimik3", 256)
     with pytest.raises(ValueError, match="geometry"):
         bench.compact_prefill_fixture(path, 0, "qwen4", 128)
@@ -164,3 +188,12 @@ def test_compact_prefill_fixture_requires_complete_ownership(tmp_path):
     path.write_text(bench.json.dumps(dict(ranks=[rank])))
     with pytest.raises(ValueError, match="live width"):
         bench.compact_prefill_fixture(path, 0, "qwen4", 256)
+    glm_entries = [dict(global_expert=e, combined_local=e, width=384,
+                        projections=[dict(projection=p, tier=0, bits=4,
+                                          tier_local=e, payload_word_offset=0)
+                                     for p in ("gate", "up", "down")]) for e in range(256)]
+    glm_rank = dict(rank=0, compiled_max_intermediate=384, experts=glm_entries,
+                    projection_counts=[[256, 256, 256], [0, 0, 0]], unit_map_fingerprint="test-glm")
+    glm_path = tmp_path / "glm_ownership.json"
+    glm_path.write_text(bench.json.dumps(dict(ranks=[glm_rank])))
+    assert len(bench.compact_prefill_fixture(glm_path, 0, "glm", 384)["entries"]) == 256

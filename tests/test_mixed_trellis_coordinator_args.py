@@ -15,12 +15,16 @@ HOST = SOURCE.parents[1] / "b12x/moe/_shared/kernels/w4a16/host.py"
 
 def benchmark():
     names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
-             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm"}
+             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm", "compact_prefill_fixture"}
     glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
                     "spark-tp6-width256": 256, "spark-tp4-width512": 512}
     glm_routes = SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json"
     scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
-                 PREFILL_FAMILIES={"qwen4": (), "kimik3": ()}, GLM_CAPACITIES=(256, 1024, 2752, 4096),
+                 PREFILL_FAMILIES={
+                     "qwen4": (2560, 512, 10, (4, 5), "silu"),
+                     "kimik3": (3584, 896, 16, (2, 3), "situ"),
+                     "glm": (6144, 256, 8, (4, 5), "silu"),
+                 }, GLM_CAPACITIES=(256, 1024, 2752, 4096),
                  GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes,
                  COORDINATOR_FAMILIES={
                      "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
@@ -186,3 +190,40 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
         b.coordinator_preflight(b.benchmark_parser().parse_args([
             "--prefill-family", "glmf", "--role", "coordinator", "--route-distributions", "random",
             "--k5-experts", "289", "--output", "result.json"]))
+
+
+def test_glm_spark_compact_preflight_and_compile_options(tmp_path):
+    b = benchmark()
+    entries = [dict(global_expert=e, combined_local=e, width=384,
+                    projections=[dict(projection=p, tier=0, bits=4,
+                                      tier_local=e, payload_word_offset=0)
+                                 for p in ("gate", "up", "down")]) for e in range(256)]
+    rank = dict(rank=0, compiled_max_intermediate=384, experts=entries,
+                projection_counts=[[256, 256, 256], [0, 0, 0]], unit_map_fingerprint="test-glm")
+    fixture = tmp_path / "glm_ownership.json"
+    fixture.write_text(json.dumps(dict(ranks=[rank])))
+    args = arguments(
+        b, "--role", "spark", "--profile", "spark-tp6-width384", "--capacities", "4096",
+        "--compact-fixture", str(fixture), "--compact-rank", "0",
+        "--coordinator-arm", "ws_n256_dyn:mode=ws,route_block=32,tile=64/128/64/256,dynamic=1",
+    )
+    capacities, specs, _, _ = b.coordinator_preflight(args)
+    assert capacities == [4096]
+    assert specs[0] == ("coop", {}) and specs[1][0] == "served" and specs[2][0] == "ws_n256_dyn"
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    coop_opts = b.coordinator_compile_options(args.profile, 4096, specs[0][1], props, "glm", compact=True)
+    served_opts = b.coordinator_compile_options(args.profile, 4096, specs[1][1], props, "glm", compact=True)
+    cand_opts = b.coordinator_compile_options(args.profile, 4096, specs[2][1], props, "glm", compact=True)
+    assert coop_opts["compact_weights"] and not coop_opts["warp_specialized"]
+    assert coop_opts["moe_block_size"] == 64 and coop_opts["token_major_rotation"]
+    assert served_opts["compact_weights"] and served_opts["warp_specialized"]
+    assert served_opts["moe_block_size"] == 32 and served_opts["force_tile_config"] == (64, 128, 64, 128)
+    assert cand_opts["compact_weights"] and cand_opts["warp_specialized"]
+    assert cand_opts["force_tile_config"] == (64, 128, 64, 256) and cand_opts["ws_dynamic_tiles"]
+    with pytest.raises(ValueError, match="compact coordinator fixes the H128 K64 geometry"):
+        b.coordinator_preflight(arguments(
+            b, "--role", "spark", "--profile", "spark-tp6-width384", "--capacities", "4096",
+            "--compact-fixture", str(fixture), "--compact-rank", "0",
+            "--coordinator-arm", "bad_fc1:mode=ws,route_block=32,tile=64/192/64/256",
+        ))
+
