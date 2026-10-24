@@ -53,6 +53,24 @@ HEAD2HEAD_SHAPES = (
     ("q", 6144, 4096, HEAD2HEAD_M_VALUES),
     ("kimi", 24752, 7168, HEAD2HEAD_M_VALUES),
 )
+GEMINI_BANDS_ON_DS: dict[tuple[int, int], tuple[tuple[int, ...], ...]] = {
+    (6144, 4096): (
+        (16, 1, 4, 16, 64, 6),
+        (64, 4, 1, 64, 64, 2),
+        (192, 4, 4, 64, 128, 4),
+        (256, 4, 2, 64, 64, 3),
+        (300, 4, 1, 64, 64, 2),
+        (320, 4, 2, 64, 64, 3),
+        (384, 4, 4, 64, 128, 4),
+        (1024, 4, 2, 64, 64, 4),
+        (8192, 4, 4, 64, 128, 4),
+    ),
+    (24752, 7168): (
+        (16, 1, 4, 16, 64, 6),
+        (64, 4, 2, 64, 64, 4),
+        (8192, 4, 4, 128, 64, 4),
+    ),
+}
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -423,6 +441,9 @@ def _verify_no_hang_cpu(compile_sass: bool = True) -> None:
             ds_rt = ds_skinny.RowTiledBf16Projection(
                 n, k, ds_skinny.COMPENSATED_TILES_BY_ROWS[(n, k)], compensated=True
             )
+            ds_gem_bands = ds_skinny.RowTiledBf16Projection(
+                n, k, GEMINI_BANDS_ON_DS[(n, k)], compensated=True
+            )
             m_sym, s_sym = cute.sym_int(32), cute.sym_int(64)
             fx = make_fake_tensor(cutlass.BFloat16, (m_sym, k), (s_sym, 1), assumed_align=16)
             fw = make_fake_tensor(cutlass.BFloat16, (n, k), (k, 1), assumed_align=16)
@@ -441,7 +462,21 @@ def _verify_no_hang_cpu(compile_sass: bool = True) -> None:
                 options="--gpu-arch=sm_120a",
                 no_jit_engine=True,
             )
-            for tag, comp_mod in ((f"{shape_label}_ds_canon", compiled_canon), (f"{shape_label}_ds_rowtile", compiled_rt)):
+            compiled_gem_bands = cute.compile(
+                ds_gem_bands,
+                make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+                Int32(256),
+                make_fake_stream(),
+                options="--gpu-arch=sm_120a",
+                no_jit_engine=True,
+            )
+            for tag, comp_mod in (
+                (f"{shape_label}_ds_canon", compiled_canon),
+                (f"{shape_label}_ds_rowtile", compiled_rt),
+                (f"{shape_label}_gemini_bands_on_ds", compiled_gem_bands),
+            ):
                 fatbin = _extract_fatbin_bytes(str(comp_mod.ir_module))
                 cubin = fatbin[fatbin.find(b"\x7fELF") :]
                 with tempfile.NamedTemporaryFile(suffix=".cubin") as f:
@@ -734,6 +769,9 @@ def _run_head2head(
             n, k, ds_skinny.COMPENSATED_TILES_BY_ROWS[(n, k)], compensated=True
         )
         gemini_obj = Bf16PrefillKernel(n, k)
+        gemini_bands_on_ds_obj = ds_skinny.RowTiledBf16Projection(
+            n, k, GEMINI_BANDS_ON_DS[(n, k)], compensated=True
+        )
 
         canon_run, _ = _compile_kernel_arm(f"h2h_{label}_canon", canon_obj, max_m, n, k, device)
         canon_repeat_run, _ = _compile_kernel_arm(
@@ -743,12 +781,19 @@ def _run_head2head(
             f"h2h_{label}_ds_rowtile", ds_rowtile_obj, max_m, n, k, device
         )
         gemini_run, _ = _compile_kernel_arm(f"h2h_{label}_gemini", gemini_obj, max_m, n, k, device)
+        gemini_bands_on_ds_run, _ = _compile_kernel_arm(
+            f"h2h_{label}_gemini_bands_on_ds", gemini_bands_on_ds_obj, max_m, n, k, device
+        )
 
         inv_ds = _verify_cancellation_and_row_invariance(n, k, canon_run, ds_rowtile_run, device)
         inv_gemini = _verify_cancellation_and_row_invariance(n, k, canon_run, gemini_run, device)
+        inv_gemini_bands_on_ds = _verify_cancellation_and_row_invariance(
+            n, k, canon_run, gemini_bands_on_ds_run, device
+        )
         invariants = {
             "ds_rowtile": inv_ds,
             "gemini": inv_gemini,
+            "gemini_bands_on_ds": inv_gemini_bands_on_ds,
         }
         print(f"Invariants {label}: {invariants}", flush=True)
 
@@ -759,18 +804,19 @@ def _run_head2head(
         cells: list[dict[str, Any]] = []
         dropped_arms: dict[str, str] = {}
         print(
-            f"{'shape':>6s} | {'rows':>5s} | {'canon us':>9s} | {'canon2 us':>9s} | "
-            f"{'ds_rowtile us (ratio)':>22s} | {'gemini us (ratio)':>20s} | "
-            f"{'spread':>7s} | {'margin':>7s} | {'winner':>18s}",
+            f"{'shape':>5s} | {'rows':>4s} | {'canon us':>8s} | {'canon2 us':>9s} | "
+            f"{'ds_rowtile (ratio)':>20s} | {'gemini (ratio)':>19s} | {'gem_on_ds (ratio)':>20s} | "
+            f"{'spread':>6s} | {'winner (gem vs ds)':>21s} | {'winner (gds vs ds)':>21s} | {'case'}",
             flush=True,
         )
-        print("-" * 124, flush=True)
+        print("-" * 165, flush=True)
 
         all_arm_runners = [
             ("canon", canon_run),
             ("canon_repeat", canon_repeat_run),
             ("ds_rowtile", ds_rowtile_run),
             ("gemini", gemini_run),
+            ("gemini_bands_on_ds", gemini_bands_on_ds_run),
         ]
 
         for m in active_m_list:
@@ -820,39 +866,64 @@ def _run_head2head(
 
             ds_med = statistics.median(samples["ds_rowtile"]) if "ds_rowtile" in samples else float("inf")
             gem_med = statistics.median(samples["gemini"]) if "gemini" in samples else float("inf")
+            gds_med = (
+                statistics.median(samples["gemini_bands_on_ds"])
+                if "gemini_bands_on_ds" in samples
+                else float("inf")
+            )
             ds_ratio = canon_med / ds_med if math.isfinite(ds_med) else 0.0
             gem_ratio = canon_med / gem_med if math.isfinite(gem_med) else 0.0
+            gds_ratio = canon_med / gds_med if math.isfinite(gds_med) else 0.0
             ds_ratio_mean = canon_mean / ds_med if math.isfinite(ds_med) else 0.0
             gem_ratio_mean = canon_mean / gem_med if math.isfinite(gem_med) else 0.0
+            gds_ratio_mean = canon_mean / gds_med if math.isfinite(gds_med) else 0.0
 
-            if not math.isfinite(ds_med) and math.isfinite(gem_med):
-                faster_arm = "gemini"
-                margin = float("inf")
-                verdict = "WIN"
-                winner = "gemini"
-            elif math.isfinite(ds_med) and not math.isfinite(gem_med):
-                faster_arm = "ds_rowtile"
-                margin = float("inf")
-                verdict = "WIN"
-                winner = "ds_rowtile"
+            def _pair_winner(a_name: str, a_med: float, b_name: str, b_med: float) -> tuple[str, float, str, str]:
+                if not math.isfinite(a_med) and math.isfinite(b_med):
+                    return b_name, float("inf"), "WIN", b_name
+                if math.isfinite(a_med) and not math.isfinite(b_med):
+                    return a_name, float("inf"), "WIN", a_name
+                if b_med < a_med:
+                    faster = b_name
+                    mrg = (a_med / b_med) - 1.0
+                else:
+                    faster = a_name
+                    mrg = (b_med / a_med) - 1.0
+                if mrg > threshold:
+                    return faster, mrg, "WIN", faster
+                return faster, mrg, "TIE", f"TIE -> {a_name}"
+
+            faster_arm, margin, verdict, winner = _pair_winner("ds_rowtile", ds_med, "gemini", gem_med)
+            faster_gds, margin_gds, verdict_gds, winner_gds = _pair_winner(
+                "ds_rowtile", ds_med, "gemini_bands_on_ds", gds_med
+            )
+            faster_gem_vs_gds, margin_gem_vs_gds, _, _ = _pair_winner(
+                "gemini_bands_on_ds", gds_med, "gemini", gem_med
+            )
+
+            ranked_all = sorted(
+                [("ds_rowtile", ds_med), ("gemini", gem_med), ("gemini_bands_on_ds", gds_med)],
+                key=lambda kv: kv[1],
+            )
+            lowest_3way_arm, lowest_3way_med = ranked_all[0]
+            runner_up_3way_arm, runner_up_3way_med = ranked_all[1]
+            margin_3way = (runner_up_3way_med / lowest_3way_med) - 1.0 if math.isfinite(lowest_3way_med) else 0.0
+            winner_3way = lowest_3way_arm if margin_3way > threshold else "TIE -> ds_rowtile"
+
+            if winner == "gemini" and winner_gds == "gemini_bands_on_ds":
+                transfer_case = "band_transfers"
+            elif winner == "gemini" and winner_gds != "gemini_bands_on_ds":
+                transfer_case = "kernel_knob_dependent"
+            elif winner != "gemini" and winner_gds == "gemini_bands_on_ds":
+                transfer_case = "band_transfers"
             else:
-                if gem_med < ds_med:
-                    faster_arm = "gemini"
-                    margin = (ds_med / gem_med) - 1.0
-                else:
-                    faster_arm = "ds_rowtile"
-                    margin = (gem_med / ds_med) - 1.0
-                if margin > threshold:
-                    verdict = "WIN"
-                    winner = faster_arm
-                else:
-                    verdict = "TIE"
-                    winner = "TIE -> ds_rowtile"
+                transfer_case = "ds_holds"
 
             print(
-                f"{label:>6s} | {m:5d} | {canon_med:9.2f} | {canon_repeat_med:9.2f} | "
-                f"{ds_med:9.2f} ({ds_ratio:6.3f}x)    | {gem_med:9.2f} ({gem_ratio:6.3f}x)  | "
-                f"{raw_spread*100:6.2f}% | {margin*100:6.2f}% | {winner:>18s}",
+                f"{label:>5s} | {m:4d} | {canon_med:8.2f} | {canon_repeat_med:9.2f} | "
+                f"{ds_med:8.2f} ({ds_ratio:5.3f}x)    | {gem_med:8.2f} ({gem_ratio:5.3f}x)   | "
+                f"{gds_med:8.2f} ({gds_ratio:5.3f}x)    | {raw_spread*100:5.2f}% | "
+                f"{winner:>14s} ({margin*100:4.1f}%) | {winner_gds:>14s} ({margin_gds*100:4.1f}%) | {transfer_case}",
                 flush=True,
             )
 
@@ -867,14 +938,18 @@ def _run_head2head(
                 "canon_mean_us": canon_mean,
                 "ds_rowtile_median_us": ds_med if math.isfinite(ds_med) else None,
                 "gemini_median_us": gem_med if math.isfinite(gem_med) else None,
+                "gemini_bands_on_ds_median_us": gds_med if math.isfinite(gds_med) else None,
                 "ds_rowtile_ratio_vs_canon": ds_ratio,
                 "gemini_ratio_vs_canon": gem_ratio,
+                "gemini_bands_on_ds_ratio_vs_canon": gds_ratio,
                 "ds_rowtile_ratio_vs_canon_mean": ds_ratio_mean,
                 "gemini_ratio_vs_canon_mean": gem_ratio_mean,
+                "gemini_bands_on_ds_ratio_vs_canon_mean": gds_ratio_mean,
                 "canon_tflops": _tflops(m, n, k, canon_med),
                 "canon_repeat_tflops": _tflops(m, n, k, canon_repeat_med),
                 "ds_rowtile_tflops": _tflops(m, n, k, ds_med) if math.isfinite(ds_med) else 0.0,
                 "gemini_tflops": _tflops(m, n, k, gem_med) if math.isfinite(gem_med) else 0.0,
+                "gemini_bands_on_ds_tflops": _tflops(m, n, k, gds_med) if math.isfinite(gds_med) else 0.0,
                 "bitwise_flags": bitwise_flags,
                 "raw_spread": raw_spread,
                 "threshold": threshold,
@@ -882,6 +957,17 @@ def _run_head2head(
                 "margin": margin,
                 "verdict": verdict,
                 "winner": winner,
+                "faster_gds_vs_ds": faster_gds,
+                "margin_gds_vs_ds": margin_gds,
+                "verdict_gds_vs_ds": verdict_gds,
+                "winner_gds_vs_ds": winner_gds,
+                "faster_gem_vs_gds": faster_gem_vs_gds,
+                "margin_gem_vs_gds": margin_gem_vs_gds,
+                "lowest_3way_arm": lowest_3way_arm,
+                "runner_up_3way_arm": runner_up_3way_arm,
+                "margin_3way": margin_3way,
+                "winner_3way": winner_3way,
+                "transfer_case": transfer_case,
                 "samples_us": samples,
             })
 
