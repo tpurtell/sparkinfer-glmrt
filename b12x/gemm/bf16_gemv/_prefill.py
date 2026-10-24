@@ -193,27 +193,30 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=64,
         tile_n=128,
         num_stages=4,
-        unroll_k_inner=1,
+        unroll_k_inner=4,
         buffer_align_bytes=128,
         group_m=8,
         tiles_by_rows=(
-            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
-            (64, dict(warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
-            (384, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(4, 1), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=4, buffer_align_bytes=1024, group_m=0)),
+            (192, dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (256, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (320, dict(warp_layout=(4, 1), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=2, buffer_align_bytes=128, group_m=1)),
+            (384, dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (1024, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8)),
         ),
     ),
     (24752, 7168): dict(
         warp_layout=(4, 4),
-        tile_m=64,
-        tile_n=128,
+        tile_m=128,
+        tile_n=64,
         num_stages=4,
-        unroll_k_inner=1,
+        unroll_k_inner=4,
         buffer_align_bytes=128,
         group_m=8,
         tiles_by_rows=(
-            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
-            (64, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
-            (256, dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
         ),
     ),
     (384, 5120): dict(
@@ -221,12 +224,12 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=64,
         tile_n=32,
         num_stages=4,
-        unroll_k_inner=1,
+        unroll_k_inner=4,
         buffer_align_bytes=128,
         group_m=1,
         tiles_by_rows=(
-            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
-            (64, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (256, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
         ),
     ),
     (512, 5120): dict(
@@ -234,12 +237,12 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=64,
         tile_n=32,
         num_stages=4,
-        unroll_k_inner=1,
+        unroll_k_inner=4,
         buffer_align_bytes=128,
         group_m=1,
         tiles_by_rows=(
-            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
-            (64, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
+            (256, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
         ),
     ),
     (1024, 5120): dict(
@@ -247,15 +250,31 @@ COMPENSATED_PREFILL_CONFIGS: dict[tuple[int, int], dict] = {
         tile_m=64,
         tile_n=32,
         num_stages=4,
-        unroll_k_inner=1,
+        unroll_k_inner=4,
         buffer_align_bytes=128,
         group_m=1,
         tiles_by_rows=(
-            (16, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
-            (64, dict(warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=1, buffer_align_bytes=128, group_m=1)),
+            (64, dict(warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1)),
         ),
     ),
 }
+
+
+def _default_compensated_prefill_config(n: int, k: int) -> dict | None:
+    exact = COMPENSATED_PREFILL_CONFIGS.get((n, k))
+    if exact is not None:
+        return exact
+    if n < 256 or k < 1024 or (k % 64) != 0:
+        return None
+    if n <= 512 and (n % 32) == 0:
+        return COMPENSATED_PREFILL_CONFIGS[(512, 5120)]
+    if n <= 1024 and (n % 32) == 0:
+        return COMPENSATED_PREFILL_CONFIGS[(1024, 5120)]
+    if n < 16384 and (n % 128) == 0:
+        return COMPENSATED_PREFILL_CONFIGS[(6144, 4096)]
+    if n >= 16384 and (n % 64) == 0:
+        return COMPENSATED_PREFILL_CONFIGS[(24752, 7168)]
+    return None
 
 
 class Bf16PrefillKernel:
@@ -305,7 +324,7 @@ class Bf16PrefillKernel:
             and tiles_by_rows is None
             and chunk256_tail is None
         ):
-            auto_cfg = COMPENSATED_PREFILL_CONFIGS.get((self.n, self.k))
+            auto_cfg = _default_compensated_prefill_config(self.n, self.k)
             if auto_cfg is not None:
                 warp_layout = auto_cfg.get("warp_layout")
                 tile_m = auto_cfg.get("tile_m")
@@ -346,6 +365,8 @@ class Bf16PrefillKernel:
 
         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k:
             raise ValueError("BF16 prefill needs positive N and K divisible by 64")
+        if self.buffer_align_bytes < 128 or (self.buffer_align_bytes & (self.buffer_align_bytes - 1)) != 0:
+            raise ValueError("BF16 prefill requires power-of-two buffer_align_bytes >= 128 for SW128 TMA")
         self.k_tiles = self.k // self.tile_k
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
 

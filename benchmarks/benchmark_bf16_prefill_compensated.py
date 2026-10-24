@@ -238,46 +238,46 @@ def _build_screening_candidates(
         chunk_ms = (128, 192, 256, 257, 300, 320, 383)
         large_ms = (256, 512, 1024, 2048, 4096, 8192)
         candidates.extend([
+            ("s_16x32_s8_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), small_ms),
             ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), small_ms),
-            ("s_16x32_s6_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=6, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), small_ms),
-            ("s_16x64_s6_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), small_ms),
-            ("sh_w4x2_64x32_s4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), short_ms),
-            ("sh_w4x1_64x32_s4", Bf16PrefillKernel(n, k, warp_layout=(4, 1), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), short_ms),
-            ("sh_w2x4_32x64_s4", Bf16PrefillKernel(n, k, warp_layout=(2, 4), tile_m=32, tile_n=64, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), short_ms),
-            ("sh_w2x2_32x32_s5", Bf16PrefillKernel(n, k, warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), short_ms),
+            ("s_16x64_s6_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), small_ms),
+            ("sh_w4x2_64x32_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), short_ms),
+            ("sh_w4x2_64x32_s4_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), short_ms),
+            ("sh_w2x4_32x64_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(2, 4), tile_m=32, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), short_ms),
+            ("sh_w2x2_32x32_s5_u4", Bf16PrefillKernel(n, k, warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), short_ms),
+            ("ch_w4x2_64x64_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), chunk_ms),
+            ("ch_w4x2_64x64_s3_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), chunk_ms),
             ("ch_w4x2_64x64_s2_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), chunk_ms),
-            ("ch_w4x2_64x64_s3_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), chunk_ms),
             ("ch_w4x1_64x64_s2_u2", Bf16PrefillKernel(n, k, warp_layout=(4, 1), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=2, buffer_align_bytes=128, group_m=1), chunk_ms),
-            ("ch_w4x4_64x128_s4_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), chunk_ms),
+            ("ch_w4x4_64x128_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), chunk_ms),
             ("ch_split256_16x32", Bf16PrefillKernel(
-                n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=1,
+                n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1,
                 chunk256_tail=(
                     256, 384,
-                    dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1),
-                    dict(warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1),
+                    dict(warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1),
+                    dict(warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1),
                 ),
             ), (257, 300, 320, 383)),
-            ("lg_w4x2_64x64_s3_gm1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), large_ms),
-            ("lg_w4x2_64x64_s3_gm8", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=8), large_ms),
-            ("lg_w4x4_64x128_s4_gm8_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=8), large_ms),
-            ("lg_w4x4_64x128_s4_gm1_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), large_ms),
-            ("lg_w4x4_64x128_s4_gm8_u2", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=2, buffer_align_bytes=128, group_m=8), large_ms),
-            ("lg_w4x4_128x64_s4_gm8_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=128, tile_n=64, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=8), large_ms),
+            ("lg_w4x2_64x64_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), large_ms),
+            ("lg_w4x4_64x128_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), large_ms),
+            ("lg_w4x4_64x128_s4_gm1_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), large_ms),
+            ("lg_w4x4_128x64_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=128, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), large_ms),
+            ("lg_w4x2_64x128_s3_gm8_u2", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=128, num_stages=3, unroll_k_inner=2, buffer_align_bytes=128, group_m=8), large_ms),
         ])
     elif (n, k) == (24752, 7168):
         candidates.extend([
-            ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), (1, 8, 16)),
-            ("s_16x64_s6_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), (1, 8, 16)),
-            ("sh_w4x2_64x64_s2_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=2, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), (59, 64, 256)),
-            ("sh_w4x2_64x64_s3_u1", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=3, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), (59, 64, 256)),
-            ("lg_w4x4_64x128_s4_gm8", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=8), (256, 1024, 8192)),
-            ("lg_w4x4_128x64_s4_gm8", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=128, tile_n=64, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=8), (256, 1024, 8192)),
+            ("s_16x32_s8_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (1, 8, 16)),
+            ("s_16x64_s6_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=64, num_stages=6, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (1, 8, 16)),
+            ("sh_w4x2_64x64_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (59, 64, 256)),
+            ("lg_w4x4_64x128_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=64, tile_n=128, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), (256, 1024, 8192)),
+            ("lg_w4x4_128x64_s4_gm8_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 4), tile_m=128, tile_n=64, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=8), (256, 1024, 8192)),
+            ("lg_w4x2_64x128_s3_gm8_u2", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=128, num_stages=3, unroll_k_inner=2, buffer_align_bytes=128, group_m=8), (256, 1024, 8192)),
         ])
     else:
         candidates.extend([
-            ("s_16x32_s8_u1", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), (1, 8, 64)),
-            ("sh_w2x2_32x32_s5", Bf16PrefillKernel(n, k, warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), (8, 64, 256)),
-            ("sh_w4x2_64x32_s4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=1, buffer_align_bytes=128, group_m=1), (64, 256)),
+            ("s_16x32_s8_u4", Bf16PrefillKernel(n, k, warp_layout=(1, 4), tile_m=16, tile_n=32, num_stages=8, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (1, 8, 64)),
+            ("sh_w2x2_32x32_s5_u4", Bf16PrefillKernel(n, k, warp_layout=(2, 2), tile_m=32, tile_n=32, num_stages=5, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (8, 64, 256)),
+            ("sh_w4x2_64x32_s4_u4", Bf16PrefillKernel(n, k, warp_layout=(4, 2), tile_m=64, tile_n=32, num_stages=4, unroll_k_inner=4, buffer_align_bytes=128, group_m=1), (64, 256)),
         ])
     return candidates
 
@@ -310,6 +310,7 @@ def _extract_fatbin_bytes(ir_text: str) -> bytes:
 
 def _verify_single_kernel_invariants(k_obj: Bf16PrefillKernel, m_values: tuple[int, ...], m_tile_offset: int = 0) -> None:
     assert not hasattr(k_obj, "setmaxnreg"), "setmaxnreg path must not exist on Bf16PrefillKernel"
+    assert k_obj.buffer_align_bytes >= 128 and (k_obj.buffer_align_bytes & (k_obj.buffer_align_bytes - 1)) == 0
     assert k_obj.k_tiles == k_obj.k // 64 and k_obj.k_tiles >= 1
     assert k_obj.n_tiles == (k_obj.n + k_obj.tile_n - 1) // k_obj.tile_n and k_obj.n_tiles >= 1
     assert k_obj.producer_warp == k_obj.num_compute_warps
