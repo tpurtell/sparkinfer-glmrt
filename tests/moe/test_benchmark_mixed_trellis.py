@@ -138,6 +138,11 @@ def test_prefill_policy_separates_route_block_from_ws():
     assert glm_compact_ws["warp_specialized"]
     assert glm_compact_ws["force_tile_config"] == (64, 128, 64, 256)
     assert glm_compact_ws["ws_dynamic_tiles"]
+    glm_t384 = bench.prefill_compile_options("glm", 384, 64, "ws+t384+wire+s3+dynamic", props)
+    assert glm_t384["force_tile_config"] == (64, 192, 64, 256)
+    assert glm_t384["input_format"] == "e4m3_k32" and glm_t384["ws_input_stages"] == 3
+    with pytest.raises(ValueError, match="t384"):
+        bench.prefill_compile_options("qwen4", 256, 32, "ws+t384", props)
     with pytest.raises(ValueError):
         bench.prefill_compile_options("kimik3", 384, 16, "ws", props)
 

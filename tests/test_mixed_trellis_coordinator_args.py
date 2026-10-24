@@ -220,10 +220,15 @@ def test_glm_spark_compact_preflight_and_compile_options(tmp_path):
     assert served_opts["moe_block_size"] == 32 and served_opts["force_tile_config"] == (64, 128, 64, 128)
     assert cand_opts["compact_weights"] and cand_opts["warp_specialized"]
     assert cand_opts["force_tile_config"] == (64, 128, 64, 256) and cand_opts["ws_dynamic_tiles"]
+    t384_opts = b.coordinator_compile_options(
+        args.profile, 4096, dict(mode="ws", route_block=64, tile=(64, 192, 64, 256), wire=1, stages=3, dynamic=1),
+        props, "glm", compact=True)
+    assert t384_opts["force_tile_config"] == (64, 192, 64, 256)
+    assert t384_opts["input_format"] == "e4m3_k32" and t384_opts["ws_input_stages"] == 3
     with pytest.raises(ValueError, match="compact coordinator fixes the H128 K64 geometry"):
         b.coordinator_preflight(arguments(
             b, "--role", "spark", "--profile", "spark-tp6-width384", "--capacities", "4096",
             "--compact-fixture", str(fixture), "--compact-rank", "0",
-            "--coordinator-arm", "bad_fc1:mode=ws,route_block=32,tile=64/192/64/256",
+            "--coordinator-arm", "bad_fc1:mode=cooperative,route_block=64,tile=64/192/64/256",
         ))
 

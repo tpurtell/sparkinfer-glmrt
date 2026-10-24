@@ -733,7 +733,7 @@ def parse_prefill_arm(text):
     if mode != "cooperative":
         head, *tokens = mode.split("+")
         if (head != "ws" or parts[1] == "8" or len(tokens) != len(set(tokens))
-                or set(tokens) - {"dynamic", "s2", "s3", "s4", "wire", "n256"}
+                or set(tokens) - {"dynamic", "s2", "s3", "s4", "wire", "n256", "t384"}
                 or len(set(tokens) & {"s2", "s3", "s4"}) > 1):
             raise argparse.ArgumentTypeError("prefill arm must be NAME:BLOCK:cooperative|ws (WS block >=16)")
     return parts[0], int(parts[1]), mode
@@ -893,7 +893,11 @@ def prefill_compile_options(family, width, block, mode, props):
             opts["ws_input_stages"] = s
     if "wire" in tokens:
         opts["input_format"] = "e4m3_k32"
-    if "n256" in tokens:
+    if "t384" in tokens:
+        if width % 192:
+            raise ValueError("t384 requires width divisible by 192")
+        opts["force_tile_config"] = (64, 192, 64, 256)
+    elif "n256" in tokens:
         opts["force_tile_config"] = (64, 128, 64, 256)
     return opts
 
@@ -940,9 +944,11 @@ def _run_prefill_benchmark(args, device, props):
     for name, block, mode in specs:
         options = prefill_compile_options(family, width, block, mode, props)
         if compact:
-            fc2_n = 256 if "n256" in mode.split("+")[1:] else 128
+            tokens = set(mode.split("+")[1:]) if mode != "cooperative" else set()
+            fc1_n = 192 if "t384" in tokens else 128
+            fc2_n = 256 if ("n256" in tokens or "t384" in tokens) else 128
             options.update(tier0_num_experts=experts, tier1_num_experts=experts,
-                           force_tile_config=(64, 128, 64, fc2_n), compact_weights=True)
+                           force_tile_config=(64, fc1_n, 64, fc2_n), compact_weights=True)
         launch = mix.compile_mixed_trellis(**options)
         resources[name] = _kernel_resource_info(launch, props.shared_memory_per_block_optin)
         workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
@@ -1132,7 +1138,7 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
                 or (not ws and any(arm.get(k) for k in ("wire", "stages", "dynamic")))):
             raise ValueError("WS needs block >=16 and its own rotation; wire/stages/dynamic require WS")
         tile = arm.get("tile", (64, 128, 64, 128))
-        if tile[:3] != (64, 128, 64) or tile[3] not in (128, 256):
+        if (tile[0], tile[2]) != (64, 64) or tile[1] not in ((128, 192) if ws else (128,)) or tile[3] not in (128, 256):
             raise ValueError("compact coordinator fixes the H128 K64 geometry and FC2 tile 128/256")
         if width % tile[1] or hidden % tile[3]:
             raise ValueError("coordinator tile must divide both projection geometries")
