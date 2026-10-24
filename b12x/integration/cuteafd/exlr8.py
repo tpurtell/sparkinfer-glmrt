@@ -121,6 +121,9 @@ class _Exlr8GroupedServingPointers:
         from b12x.moe._shared.kernels.w4a16.exlr8_grouped import Exlr8GroupedKernel
         self.core = Exlr8GroupedKernel(g["hidden"], g["units"], g["top_k"],
                                        g["max_groups"], g["group_rows"])
+        self.core.FC1_A8 = g.get("fc1_a8", False)
+        if self.core.FC1_A8 and not self.core.fc1_ws:
+            raise ValueError("FC1 A8 experiment requires warp-specialized FC1")
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -151,13 +154,18 @@ class _Exlr8GroupedServingPointers:
 
 
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
-                         device_count=False, shared_expert=False, grouped=False, group_rows=64):
+                         device_count=False, shared_expert=False, grouped=False, group_rows=64,
+                         fc1_a8=False):
+    if fc1_a8 and (not grouped or group_rows != 64):
+        raise ValueError("FC1 A8 experiment requires grouped prefill with group_rows=64")
     if shared_expert:
         if not device_count:
             raise ValueError("shared EXLR8 requires device-count serving ABI")
         if top_k != 1 or max_groups != 4:
             raise ValueError("shared EXLR8 requires top_k=1 and max_groups=4")
     g = geometry(hidden, units, top_k, max_groups)
+    if fc1_a8:
+        g["fc1_a8"] = True
     if grouped:
         if not device_count or shared_expert or group_rows not in (16, 32, 64):
             raise ValueError("EXLR8 grouped prefill requires device count and group rows 16/32/64")
@@ -207,6 +215,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  # source: bump the tag when decode's weight-load
                                  # cache policy changes.
                                  "decode_l2_fc2_prefetch_v9")
-                                + (("grouped_compact_units",) if grouped else ())), geometry=g,
+                                + (("grouped_compact_units",) if grouped else ())
+                                + (("fc1_a8_v126",) if fc1_a8 else ())), geometry=g,
                            scratch={n: lambda rows, size=size: size for n, size in sizes.items()},
                            doc=__doc__)
