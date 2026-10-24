@@ -53,6 +53,7 @@ HEAD2HEAD_SHAPES = (
     ("q", 6144, 4096, HEAD2HEAD_M_VALUES),
     ("kimi", 24752, 7168, HEAD2HEAD_M_VALUES),
 )
+# Gemini's COMPENSATED_PREFILL_CONFIGS row bands transcribed into RowTiledBf16Projection 6-tuple form.
 GEMINI_BANDS_ON_DS: dict[tuple[int, int], tuple[tuple[int, ...], ...]] = {
     (6144, 4096): (
         (16, 1, 4, 16, 64, 6),
