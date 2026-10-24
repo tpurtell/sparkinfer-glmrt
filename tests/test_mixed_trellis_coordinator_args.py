@@ -16,17 +16,21 @@ HOST = SOURCE.parents[1] / "b12x/moe/_shared/kernels/w4a16/host.py"
 def benchmark():
     names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
              "coordinator_preflight", "benchmark_parser", "parse_prefill_arm"}
-    glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
-                    "spark-tp6-width256": 256, "spark-tp4-width512": 512}
+    glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp2-width1024": 1024,
+                    "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512}
     glm_routes = SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json"
     scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
                  PREFILL_FAMILIES={"qwen4": (), "kimik3": ()}, GLM_CAPACITIES=(256, 1024, 2752, 4096),
                  GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes,
                  COORDINATOR_FAMILIES={
                      "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
-                                 model="zai-org/GLM-5.3", profiles=tuple(glm_profiles), routes=glm_routes),
+                                 model="zai-org/GLM-5.3",
+                                 profiles=("rtx-tp1", "rtx-tp2", "spark-tp6-width384", "spark-tp6-width256", "spark-tp4-width512"),
+                                 routes=glm_routes),
                      "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), swiglu_limit=10.0,
-                                  model="zai-org/GLM-5.3-Flash", profiles=("rtx-tp1", "rtx-tp2"), routes=None),
+                                  model="zai-org/GLM-5.3-Flash",
+                                  profiles=("rtx-tp1", "rtx-tp2", "spark-tp2-width1024", "spark-tp4-width512"),
+                                  routes=None),
                  })
     host_names = {"route_pack_capacity", "route_pack_numel_capacity", "route_pack_token_capacity",
                   "max_packed_route_slots"}
@@ -180,9 +184,45 @@ def test_glmf_preflight_and_foreign_fixture_refusal():
             "--routes", str(b.GLM_ROUTES), "--output", "result.json"]))
     with pytest.raises(ValueError):
         b.coordinator_preflight(b.benchmark_parser().parse_args([
-            "--prefill-family", "glmf", "--role", "spark", "--profile", "spark-tp4-width512",
+            "--prefill-family", "glmf", "--role", "spark", "--profile", "spark-tp6-width384",
             "--route-distributions", "random", "--output", "result.json"]))
     with pytest.raises(ValueError):
         b.coordinator_preflight(b.benchmark_parser().parse_args([
             "--prefill-family", "glmf", "--role", "coordinator", "--route-distributions", "random",
             "--k5-experts", "289", "--output", "result.json"]))
+    with pytest.raises(ValueError, match="conflicting"):
+        b.coordinator_preflight(b.benchmark_parser().parse_args([
+            "--prefill-family", "glmf", "--role", "coordinator", "--route-distributions", "random",
+            "--k5-experts", "64", "--tier1-experts", "72", "--output", "result.json"]))
+
+
+@pytest.mark.parametrize("profile,width", [("spark-tp2-width1024", 1024), ("spark-tp4-width512", 512)])
+def test_glmf_spark_profiles_and_ws_base(profile, width):
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", "glmf", "--role", "spark", "--profile", profile,
+        "--capacities", "1024,2752,4096", "--route-distributions", "random",
+        "--tier1-experts", "72", "--output", "result.json",
+    ])
+    capacities, specs, routes, waves = b.coordinator_preflight(args)
+    assert capacities == [1024, 2752, 4096] and routes == ["random"] and waves == []
+    assert args.k5_experts == 72 and args.tier1_experts == 72
+    assert [name for name, _ in specs] == ["coop", "served", "ws_base"]
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for capacity in capacities:
+        base_opts = b.coordinator_compile_options(profile, capacity, dict(specs)["ws_base"], props, "glmf")
+        assert (base_opts["hidden_size"], base_opts["intermediate_size"], base_opts["route_num_experts"]) == (4096, width, 288)
+        assert (base_opts["tier0_bits"], base_opts["tier1_bits"]) == (3, 4) and base_opts["swiglu_limit"] == 10.0
+        assert base_opts["full_rotation_output_dtype"] == "bf16" and base_opts["sms"] == 48
+        assert base_opts["moe_block_size"] == 64 and base_opts["warp_specialized"]
+        assert base_opts["input_format"] == "bf16" and base_opts["ws_input_stages"] is None
+        assert not base_opts["ws_dynamic_tiles"] and base_opts["force_blocks_per_sm"] is None
+        assert base_opts["force_tile_config"] == (64, 256, 64, 256)
+    # Explicit --coordinator-arm ws_base:mode=ws should not fail with duplicate arm name.
+    explicit = b.benchmark_parser().parse_args([
+        "--prefill-family", "glmf", "--role", "spark", "--profile", profile,
+        "--capacities", "4096", "--route-distributions", "random",
+        "--tier1-experts", "72", "--coordinator-arm", "ws_base:mode=ws", "--output", "result.json",
+    ])
+    _, explicit_specs, _, _ = b.coordinator_preflight(explicit)
+    assert [name for name, _ in explicit_specs] == ["coop", "served", "ws_base"]

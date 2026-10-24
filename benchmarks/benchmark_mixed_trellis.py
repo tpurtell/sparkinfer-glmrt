@@ -1016,14 +1016,18 @@ def _run_prefill_benchmark(args, device, props):
 
 
 GLM_CAPACITIES = (256, 1024, 2752, 4096)
-GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024,
+GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp2-width1024": 1024,
                 "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512}
 GLM_ROUTES = Path(__file__).resolve().parent / "fixtures/glm53_prefill_routes_realistic.json"
 COORDINATOR_FAMILIES = {
     "glm": dict(hidden=6144, experts=256, top_k=8, bits=(4, 5), swiglu_limit=None,
-                model="zai-org/GLM-5.3", profiles=tuple(GLM_PROFILES), routes=GLM_ROUTES),
+                model="zai-org/GLM-5.3",
+                profiles=("rtx-tp1", "rtx-tp2", "spark-tp6-width384", "spark-tp6-width256", "spark-tp4-width512"),
+                routes=GLM_ROUTES),
     "glmf": dict(hidden=4096, experts=288, top_k=8, bits=(3, 4), swiglu_limit=10.0,
-                 model="zai-org/GLM-5.3-Flash", profiles=("rtx-tp1", "rtx-tp2"), routes=None),
+                 model="zai-org/GLM-5.3-Flash",
+                 profiles=("rtx-tp1", "rtx-tp2", "spark-tp2-width1024", "spark-tp4-width512"),
+                 routes=None),
 }
 
 
@@ -1135,11 +1139,19 @@ def coordinator_preflight(args):
     if args.role == "spark":
         specs.append(("served", dict(mode="ws", wire=1, stages=3, dynamic=1, ctas=1,
                                     tile=(64, 192, 64, 256) if GLM_PROFILES[args.profile] == 384 else (64, 256, 64, 256))))
+        if family == "glmf" and all(name != "ws_base" for name, _ in args.coordinator_arm):
+            specs.append(("ws_base", dict(mode="ws")))
     specs.extend(args.coordinator_arm)
     if len({name for name, _ in specs}) != len(specs):
         raise ValueError("coordinator arm names must be unique")
     if min(args.layers, args.rounds, args.replays, args.warmup, args.memory_cap_gib) < 1:
         raise ValueError("layers/rounds/replays/warmup/memory cap must be positive")
+    tier1_arg = getattr(args, "tier1_experts", None)
+    if tier1_arg is not None:
+        if args.k5_experts not in (0, tier1_arg):
+            raise ValueError("cannot specify conflicting --k5-experts and --tier1-experts")
+        args.k5_experts = tier1_arg
+    args.tier1_experts = args.k5_experts
     if not 0 <= args.k5_experts <= spec["experts"]:
         raise ValueError(f"upgraded projection count must be 0..{spec['experts']}")
     routes = args.route_distributions.split(",")
@@ -1188,6 +1200,8 @@ def _run_coordinator_benchmark(args, device, props):
     from benchmarks.benchmark_exlr8_a16 import make_wire, real_route_ids
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis_ws as mix_ws
+    from b12x.moe.fused_moe._impl import _projection_mixed_tile_config
     capacities, specs, distributions, waves = coordinator_preflight(args)
     spec = COORDINATOR_FAMILIES[args.prefill_family]
     hidden, experts, topk = spec["hidden"], spec["experts"], spec["top_k"]
@@ -1201,13 +1215,48 @@ def _run_coordinator_benchmark(args, device, props):
     layers = [_make_coordinator_layer(width, args.k5_experts, args.seed + 2*i, device, args.prefill_family)
               for i in range(args.layers)]
     counts = (experts - args.k5_experts, args.k5_experts)
-    records, failures = [], []
+    records, failures, resolved_arms = [], [], {}
     for capacity in capacities:
         states = {}
+        resolved_arms[str(capacity)] = {}
+        planner_tile = _projection_mixed_tile_config(
+            None, hidden_size=hidden, intermediate_size=width, token_count=capacity, direct_topk_routes=False
+        )
         for name, arm in specs:
             options = coordinator_compile_options(args.profile, capacity, arm, props, args.prefill_family)
-            print(json.dumps(dict(compiling=name, capacity=capacity, options=options)), flush=True)
-            launch = mix.compile_mixed_trellis(**options)
+            captured_kernels = []
+            orig_ws = mix_ws.W4A16MixedTrellisWSKernel
+            orig_coop = mix._select_mixed_fc2_kernel
+            def _wrap_ws(*k_args, **k_kwargs):
+                k = orig_ws(*k_args, **k_kwargs)
+                captured_kernels.append(k)
+                return k
+            def _wrap_coop(*k_args, **k_kwargs):
+                k = orig_coop(*k_args, **k_kwargs)
+                captured_kernels.append(k)
+                return k
+            with patch.object(mix_ws, "W4A16MixedTrellisWSKernel", side_effect=_wrap_ws), \
+                 patch.object(mix, "_select_mixed_fc2_kernel", side_effect=_wrap_coop):
+                launch = mix.compile_mixed_trellis(**options)
+            kernel = captured_kernels[-1]
+            cache_key_repr = repr(kernel.__cache_key__)
+            cache_key_sha256 = hashlib.sha256(cache_key_repr.encode("utf-8")).hexdigest()[:16]
+            resolved = dict(
+                mode="ws" if options["warp_specialized"] else "cooperative",
+                input_format=launch.input_format,
+                ws_a_stages=getattr(kernel, "ws_a_stages", None),
+                ws_bc_stages=getattr(kernel, "ws_bc_stages", None),
+                ws_dynamic_tiles=bool(getattr(kernel, "ws_dynamic", False)),
+                block=int(launch.moe_block_size),
+                tile=[int(launch.fc1_tile_k), int(launch.fc1_tile_n), int(launch.fc2_tile_k), int(launch.fc2_tile_n)],
+                planner_tile=list(planner_tile),
+                planner_tile_matches=tuple(options["force_tile_config"]) == tuple(planner_tile),
+                ctas=int(launch.blocks_per_sm),
+                cache_key=cache_key_repr,
+                cache_key_sha256=cache_key_sha256,
+            )
+            resolved_arms[str(capacity)][name] = resolved
+            print(json.dumps(dict(compiling=name, capacity=capacity, options=options, resolved=resolved)), flush=True)
             workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
             bindings = [mix.bind_mixed_trellis(*layer, launch, gate_experts=counts, up_experts=counts) for layer in layers]
             mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
@@ -1275,7 +1324,11 @@ def _run_coordinator_benchmark(args, device, props):
     result = dict(schema=1, kind="glm_exl3_prefill" if args.prefill_family == "glm" else f"{args.prefill_family}_exl3_prefill",
         role=args.role, profile=args.profile,
         device=props.name, sm_count=props.multi_processor_count, hidden=hidden, intermediate=width,
-        experts=experts, top_k=topk, bits=list(spec["bits"]), k5_experts_per_projection=args.k5_experts, arms=specs,
+        experts=experts, top_k=topk, bits=list(spec["bits"]),
+        tier0_experts_per_projection=experts - args.k5_experts,
+        tier1_experts_per_projection=args.k5_experts,
+        k5_experts_per_projection=args.k5_experts,
+        arms=specs, resolved_arms=resolved_arms,
         source_sha256={p: hashlib.sha256((source / p).read_bytes()).hexdigest() for p in (
             "benchmarks/benchmark_mixed_trellis.py", "b12x/moe/_shared/kernels/w4a16/mixed_trellis.py",
             "b12x/moe/_shared/kernels/w4a16/mixed_trellis_ws.py")},
@@ -1338,6 +1391,7 @@ def benchmark_parser():
     parser.add_argument("--route-distributions", default="random,realistic", help="GLM random and/or realistic histograms")
     parser.add_argument("--coordinator-route-layer", type=int, help="GLM histogram layer filter; default all 72 waves")
     parser.add_argument("--k5-experts", type=int, default=0, help="synthetic K5 count per projection (0..256); K4 otherwise")
+    parser.add_argument("--tier1-experts", type=int, default=None, help="synthetic tier-1 expert count per projection (e.g. 72 K4 for glmf)")
     parser.add_argument("--preflight-only", action="store_true", help="CPU-only GLM coordinator argument/fixture validation")
     parser.add_argument("--compact-fixture", type=Path, help="planner-replayed compact ownership JSON")
     parser.add_argument("--compact-rank", type=int, default=0)
