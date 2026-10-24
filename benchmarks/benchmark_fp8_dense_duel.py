@@ -273,24 +273,24 @@ def main():
             out_base = torch.empty((rows, spec.n), dtype=torch.bfloat16, device="cuda")
             out_cand = torch.empty((rows, spec.n), dtype=torch.bfloat16, device="cuda")
 
-            def step_base_cold(c, _x=x, _o=out_base, _r=rows, _f=fp8_rows_scalar):
-                idx_c = c % n_copies
-                base_prog.launch(_x, w_copies[idx_c], s_copies[idx_c], _o, scalars=(_r, _f))
+            def step_base_cold(_x=x, _o=out_base, _r=rows, _f=fp8_rows_scalar):
+                for c in range(n_copies):
+                    base_prog.launch(_x, w_copies[c], s_copies[c], _o, scalars=(_r, _f))
 
-            def step_cand_cold(c, _x=x, _o=out_cand, _r=rows, _f=fp8_rows_scalar):
-                idx_c = c % n_copies
-                cand_prog.launch(_x, w_copies[idx_c], s_copies[idx_c], _o, scalars=(_r, _f))
+            def step_cand_cold(_x=x, _o=out_cand, _r=rows, _f=fp8_rows_scalar):
+                for c in range(n_copies):
+                    cand_prog.launch(_x, w_copies[c], s_copies[c], _o, scalars=(_r, _f))
 
-            def step_base_warm(c, _x=x, _o=out_base, _r=rows, _f=fp8_rows_scalar):
+            def step_base_warm(_x=x, _o=out_base, _r=rows, _f=fp8_rows_scalar):
                 base_prog.launch(_x, w0, s0, _o, scalars=(_r, _f))
 
-            def step_cand_warm(c, _x=x, _o=out_cand, _r=rows, _f=fp8_rows_scalar):
+            def step_cand_warm(_x=x, _o=out_cand, _r=rows, _f=fp8_rows_scalar):
                 cand_prog.launch(_x, w0, s0, _o, scalars=(_r, _f))
 
-            g_base_cold = capture(step_base_cold, graph_calls, warmup=args.warmup)
-            g_cand_cold = capture(step_cand_cold, graph_calls, warmup=args.warmup)
-            g_base_warm = capture(step_base_warm, graph_calls, warmup=args.warmup)
-            g_cand_warm = capture(step_cand_warm, graph_calls, warmup=args.warmup)
+            g_base_cold = capture(step_base_cold)
+            g_cand_cold = capture(step_cand_cold)
+            g_base_warm = capture(step_base_warm)
+            g_cand_warm = capture(step_cand_warm)
 
             base_cold_samples: list[float] = []
             cand_cold_samples: list[float] = []
@@ -299,15 +299,15 @@ def main():
 
             for r_idx in range(args.interleave_rounds):
                 if r_idx % 2 == 0:
-                    base_cold_samples.append(timing(g_base_cold, graph_calls, warmup=1, replays=args.replays))
-                    cand_cold_samples.append(timing(g_cand_cold, graph_calls, warmup=1, replays=args.replays))
-                    base_warm_samples.append(timing(g_base_warm, graph_calls, warmup=1, replays=args.replays))
-                    cand_warm_samples.append(timing(g_cand_warm, graph_calls, warmup=1, replays=args.replays))
+                    base_cold_samples.append(timing(g_base_cold, args.replays) / n_copies)
+                    cand_cold_samples.append(timing(g_cand_cold, args.replays) / n_copies)
+                    base_warm_samples.append(timing(g_base_warm, args.replays))
+                    cand_warm_samples.append(timing(g_cand_warm, args.replays))
                 else:
-                    cand_cold_samples.append(timing(g_cand_cold, graph_calls, warmup=1, replays=args.replays))
-                    base_cold_samples.append(timing(g_base_cold, graph_calls, warmup=1, replays=args.replays))
-                    cand_warm_samples.append(timing(g_cand_warm, graph_calls, warmup=1, replays=args.replays))
-                    base_warm_samples.append(timing(g_base_warm, graph_calls, warmup=1, replays=args.replays))
+                    cand_cold_samples.append(timing(g_cand_cold, args.replays) / n_copies)
+                    base_cold_samples.append(timing(g_base_cold, args.replays) / n_copies)
+                    cand_warm_samples.append(timing(g_cand_warm, args.replays))
+                    base_warm_samples.append(timing(g_base_warm, args.replays))
 
             base_cold_Samples_sorted = sorted(base_cold_samples)
             cand_cold_Samples_sorted = sorted(cand_cold_samples)
