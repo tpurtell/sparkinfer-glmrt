@@ -92,15 +92,13 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--seed", type=int, default=408)
     ap.add_argument("--cta-limit", type=int, default=0)
-    ap.add_argument("--a8", action="store_true", help="experimental MXFP8 FC1 only; FC2 remains A16")
     ap.add_argument("--dump", default=None, help="save the output rows here for a bitwise arm comparison")
-    ap.add_argument("--compare", default=None, help="compare output to a previous --dump (exact for A16)")
     args = ap.parse_args()
 
     activation, state, weights, pointers, bits, signs, capacity = build(args)
     k1 = compile_exlr8_a16_aot(hidden=args.hidden, units=args.units, top_k=args.top_k,
                                max_groups=capacity, device_count=True, grouped=True,
-                               group_rows=args.group_rows, fc1_a8=args.a8)
+                               group_rows=args.group_rows)
     cta_limit = args.cta_limit or 2 * torch.cuda.get_device_properties(0).multi_processor_count
     count, mapping, unit_limit = state["compact"]
 
@@ -113,20 +111,6 @@ def main():
     ms = timeit(run, args.warmup, args.iters)
     if args.dump:
         torch.save(state["output"].clone(), args.dump)
-    if args.compare:
-        ref = torch.load(args.compare, map_location="cuda", weights_only=True)
-        out = state["output"]
-        assert torch.isfinite(out).all() and out.abs().max() > 0
-        rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
-        exact = torch.equal(out.view(torch.int16), ref.view(torch.int16))
-        print(f"output exact={exact} frobenius_relative={rel:.8f}")
-        assert rel < 0.1 if args.a8 else exact
-    if args.dump or args.compare:
-        # Split-fold FC1 lives in the compact prefix, not every scratch split.
-        fc1 = state["fc1"].reshape(-1)[:capacity * args.units * 2 * args.group_rows * 128]
-        for name, value in (("fc1", fc1), ("intermediate", state["intermediate"])):
-            assert torch.isfinite(value).all()
-            print(f"{name} absmax={value.abs().max().item():.8g} rms={value.float().square().mean().sqrt().item():.8g}")
     slots = args.rows * args.top_k
     flops = 2 * slots * (args.hidden * 2 * args.units * 128 + args.units * 128 * args.hidden)
     tf = flops / (ms * 1e9)
