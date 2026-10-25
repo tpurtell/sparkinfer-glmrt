@@ -63,6 +63,21 @@ def test_benchmark_materializes_full_abi5_tier_storage(monkeypatch) -> None:
     assert torch.equal(padded.w2_global_scale, torch.tensor([4.0, 5.0, 1.0]))
 
 
+def test_wide_m_coordinator_arm_is_explicit_and_geometry_bounded() -> None:
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    props = SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376)
+    name, arm = bench.parse_coordinator_arm("wide:route_block=128,tile=64/128/64/128")
+    assert name == "wide"
+    options = bench.coordinator_compile_options("rtx-tp2", 4096, arm, props)
+    assert options["moe_block_size"] == 128 and options["token_major_rotation"]
+    assert not options["warp_specialized"]
+    assert bench.coordinator_compile_options("rtx-tp2", 4096, {}, props)["moe_block_size"] == 64
+    for override in ({"mode": "ws"}, {"tile": (64, 256, 64, 256)}):
+        with pytest.raises(ValueError, match="wide-M"):
+            bench.coordinator_compile_options("rtx-tp2", 4096, arm | override, props)
+
+
 def test_benchmark_kimi_variant_parsing_and_geometry() -> None:
     benchmark = _load_benchmark_module()
     assert (

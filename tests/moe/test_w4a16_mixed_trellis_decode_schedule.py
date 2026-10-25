@@ -103,6 +103,25 @@ def _fc2_gemm(**options) -> W4A16GemmKernel:
     )
 
 
+@pytest.mark.parametrize("bits,shared_bytes", [(4, 86016), (5, 89088)])
+def test_wide_m_cooperative_resource_geometry(monkeypatch, bits, shared_bytes) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    kernel = W4A16GemmKernel(
+        size_m=4096, size_n=6144, size_k=1024, num_experts=256,
+        top_k=1, mul_topk_weights=False, tile_n=128, tile_k=64,
+        moe_block_size=128, max_m_blocks=512, element_dtype="fp16",
+        weight_layout="trellis_t256", scale_format="e4m3_k32",
+        w13_layout="packed", trellis_bits=bits, trellis_codebook="mcg",
+        schedule_whole_tiles=True,
+    )
+    assert kernel.cta_threads == 256 and kernel.cta_m_blocks == 4
+    assert kernel.b_sh_wr_iters == 2 and kernel.a_sh_wr_iters == 4
+    assert kernel.a_sh_stage * 16 == 16384
+    assert kernel.shared_words * 4 == shared_bytes
+    assert shared_bytes + 1024 <= 101376
+    assert kernel.blocks_per_sm == 1 and not kernel.skip_empty_m_blocks
+
+
 def test_memory_schedule_extends_kernel_keys_only_when_set() -> None:
     default = _fc2_gemm()
     explicit_default = _fc2_gemm(l2_evict_first_b=False, l2_prefetch_k_tiles=0)

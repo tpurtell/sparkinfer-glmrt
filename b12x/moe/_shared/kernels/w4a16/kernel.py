@@ -1069,11 +1069,18 @@ class W4A16GemmKernel:
                 raise ValueError(
                     "E4M3 K/32 W4A16 scales require size_k/tile_k multiples of 32"
                 )
-        if moe_block_size not in _ALLOWED_ROUTED_SIZES:
+        self.wide_m_cooperative = moe_block_size == 128
+        if self.wide_m_cooperative and (
+            weight_layout != "trellis_t256" or trellis_pair_kind is not None
+            or tile_n != 128 or tile_k != 64 or not schedule_whole_tiles
+            or direct_topk_routes or fused_input_rotation or dense_route_fast_path
+        ):
+            raise ValueError("wide-M requires whole-tile single-rate Trellis M128/N128/K64")
+        if moe_block_size not in _ALLOWED_ROUTED_SIZES and not self.wide_m_cooperative:
             raise ValueError(f"unsupported moe_block_size {moe_block_size}")
         if moe_block_size != 8 and moe_block_size % 16 != 0:
             raise ValueError("moe_block_size must be 8 or a multiple of 16")
-        cta_threads = tile_n * tile_k // 64
+        cta_threads = 256 if self.wide_m_cooperative else tile_n * tile_k // 64
         if cta_threads not in (128, 256):
             raise ValueError("W4A16 GEMM expects 128 or 256 CTA threads")
         self.size_m = int(size_m)
@@ -1222,7 +1229,8 @@ class W4A16GemmKernel:
             raise ValueError("fused_topk_sum requires direct_topk_routes")
         if self.fused_topk_sum and self.fused_sum_topk < 1:
             raise ValueError("fused_sum_topk must be >= 1")
-        self.cta_m_blocks = int(_covering_count(moe_block_size, 16))
+        # Four M16 fragments per cohort retain the oracle's two K partials.
+        self.cta_m_blocks = 4 if self.wide_m_cooperative else int(_covering_count(moe_block_size, 16))
         self.uses_m_block_8 = moe_block_size == 8
         # Wide packed-route Trellis blocks (large prefill) specialize the K loop
         # on the block's occupied M16 fragments, so an expert's partial last
@@ -1230,6 +1238,7 @@ class W4A16GemmKernel:
         # weight tiles are still decoded once for all of the block's rows.
         self.skip_empty_m_blocks = bool(
             self.cta_m_blocks == 4
+            and not self.wide_m_cooperative
             and weight_layout == "trellis_t256"
             and not direct_topk_routes
         )
@@ -1255,7 +1264,7 @@ class W4A16GemmKernel:
             problem_m=self.size_m,
             problem_n=self.covered_size_n,
             top_k=self.top_k,
-            cta_threads=self.cta_threads,
+            cta_threads=128 if self.wide_m_cooperative else self.cta_threads,
             cta_m_blocks=self.cta_m_blocks,
             tile_n=self.tile_n,
             tile_k=self.tile_k,
@@ -1271,7 +1280,7 @@ class W4A16GemmKernel:
 
         # W4A16 shared-memory geometry, in int4 units unless noted.
         self.a_sh_stride = 16 * self.cta_k_blocks // 8
-        self.a_sh_stage = self.a_sh_stride * (16 * self.cta_m_blocks)
+        self.a_sh_stage = self.a_sh_stride * (128 if self.wide_m_cooperative else 16 * self.cta_m_blocks)
         self.a_gl_rd_delta_o = 16 * self.cta_k_blocks // 8
         self.a_sh_wr_delta = self.a_sh_stride * (
             self.cta_threads // self.a_gl_rd_delta_o
@@ -1283,7 +1292,7 @@ class W4A16GemmKernel:
         self.b_thread_vecs = 1
         self.b_sh_stride_threads = self.b_sh_stride
         self.b_sh_stage = self.b_sh_stride * self.cta_k_blocks
-        self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
+        self.b_sh_wr_iters = self.b_sh_stage // (128 if self.wide_m_cooperative else self.cta_threads)
         if self.fused_input_rotation and (
             not self.dual_a or self.route_major_a or self.direct_topk_routes
             or not self.schedule_whole_tiles or self.uses_m_block_8
@@ -1384,6 +1393,8 @@ class W4A16GemmKernel:
         self.sh_a_off = self.sh_s_off + _STAGES * self.s_sh_stage
         self.shared_int4 = self.sh_a_off + _STAGES * self.a_sh_stage
         self.shared_words = self.shared_int4 * 4
+        if self.wide_m_cooperative:
+            self.blocks_per_sm = 1
         if self.shared_words * 4 > int(max_shared_mem):
             raise ValueError(
                 "W4A16 shared-memory footprint exceeds device opt-in limit: "
@@ -2467,6 +2478,10 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _a_shared_read_offset(self, tid: Int32, lanes_per_row: cutlass.Constexpr[int]):
+        cohort = Int32(0)
+        if cutlass.const_expr(self.wide_m_cooperative):
+            cohort = tid // Int32(128)
+            tid = tid % Int32(128)
         a_sh_rd = Int32(self.a_sh_stride) * (
             (tid & Int32(31)) % Int32(lanes_per_row)
         ) + (tid & Int32(31)) // Int32(lanes_per_row)
@@ -2475,7 +2490,7 @@ class W4A16GemmKernel:
             * ((tid // Int32(32)) // Int32(self.tb_n_warps))
             * Int32(self.b_sh_wr_iters)
         )
-        return a_sh_rd
+        return a_sh_rd + cohort * Int32(64 * self.a_sh_stride)
 
     @cute.jit
     def _run_tile_m8(
@@ -3209,6 +3224,11 @@ class W4A16GemmKernel:
                                     uses_m_block_8,
                                     0,
                                 )
+                        elif cutlass.const_expr(self.wide_m_cooperative):
+                            self._wide_dequant_and_accumulate(
+                                acc0, acc1, acc2, acc3, b_frag, b_scale_cur,
+                                a_regs_cur, tid, trellis_lut_addr, block_valid_rows,
+                            )
                         else:
                             self._dequant_and_accumulate_bundle(
                                 acc0,
@@ -3578,6 +3598,11 @@ class W4A16GemmKernel:
         lock_slot: Int32,
         uses_m_block_8: cutlass.Constexpr[bool],
     ):
+        if cutlass.const_expr(self.wide_m_cooperative):
+            self._finish_wide_m(acc0, acc1, acc2, acc3, c_bf16_flat,
+                                smem_base, tid, output_n_tile,
+                                block_valid_rows, global_scale_f32)
+            return
         if cutlass.const_expr(uses_m_block_8):
             self._fold_cta_partials_m8(acc0, smem_base, tid)
         else:
@@ -3638,6 +3663,68 @@ class W4A16GemmKernel:
                     block_valid_rows,
                     global_scale_f32,
                 )
+
+    @cute.jit
+    def _wide_dequant_and_accumulate(
+        self, acc0, acc1, acc2, acc3, b_frag: cute.Tensor,
+        b_regs: cute.Tensor, a_regs: cute.Tensor, tid: Int32,
+        trellis_lut_addr: Int64, block_valid_rows: Int32,
+    ):
+        # Warp-uniform predicates; asynchronous staging and CTA barriers stay
+        # outside this branch so the empty cohort cannot deadlock the pipeline.
+        first_row = (tid // Int32(128)) * Int32(64)
+        if first_row < block_valid_rows:
+            for jj in cutlass.range_constexpr(4):
+                self._scaled_dequant_b_fragment_trellis256(
+                    b_frag, b_regs[0, jj], b_regs[1, jj], trellis_lut_addr,
+                )
+                self._mma_accumulate_large_m(acc0, a_regs, 0, jj, b_frag)
+                if first_row + Int32(16) < block_valid_rows:
+                    self._mma_accumulate_large_m(acc1, a_regs, 1, jj, b_frag)
+                if first_row + Int32(32) < block_valid_rows:
+                    self._mma_accumulate_large_m(acc2, a_regs, 2, jj, b_frag)
+                if first_row + Int32(48) < block_valid_rows:
+                    self._mma_accumulate_large_m(acc3, a_regs, 3, jj, b_frag)
+
+    @cute.jit
+    def _finish_wide_m(
+        self, acc0, acc1, acc2, acc3, c_bf16_flat: cute.Tensor,
+        smem_base: Int32, tid: Int32, output_n_tile: Int32,
+        block_valid_rows: Int32, global_scale_f32: cutlass.Float32,
+    ):
+        # Fold/store cohorts in order, aliasing the drained compressed B ring.
+        # Every thread reaches every barrier, including the inactive cohort.
+        local_tid = tid % Int32(128)
+        cohort_id = tid // Int32(128)
+        for cohort in cutlass.range_constexpr(2):
+            red_idx, stride, delta, rd = self._reduction_offsets(local_tid)
+            if cohort_id != Int32(cohort):
+                red_idx = Int32(2)
+            self._fold_cta_partials_large_m_block(acc0, smem_base, 1, red_idx, stride, delta, rd)
+            self._fold_cta_partials_large_m_block(acc1, smem_base, 1, red_idx, stride, delta, rd)
+            self._fold_cta_partials_large_m_block(acc2, smem_base, 1, red_idx, stride, delta, rd)
+            self._fold_cta_partials_large_m_block(acc3, smem_base, 1, red_idx, stride, delta, rd)
+            sh_stride = Int32(2 * self.cta_n_blocks + 1)
+            wr = (Int32(4) * sh_stride * ((local_tid & Int32(31)) // Int32(4))
+                  + (local_tid & Int32(31)) % Int32(4)
+                  + Int32(32) * (local_tid // Int32(32)))
+            if cohort_id == Int32(cohort) and local_tid < Int32(64):
+                warp_n = local_tid // Int32(32)
+                self._store_tile_large_m_block(acc0, smem_base, wr, sh_stride, warp_n, global_scale_f32)
+                wr += Int32(16 * 4 * 17)
+                self._store_tile_large_m_block(acc1, smem_base, wr, sh_stride, warp_n, global_scale_f32)
+                wr += Int32(16 * 4 * 17)
+                self._store_tile_large_m_block(acc2, smem_base, wr, sh_stride, warp_n, global_scale_f32)
+                wr += Int32(16 * 4 * 17)
+                self._store_tile_large_m_block(acc3, smem_base, wr, sh_stride, warp_n, global_scale_f32)
+            cute.arch.sync_threads()
+            (gl_stride, _, gl_delta, sh_delta, gl_wr, sh_rd) = self._output_store_cursor(tid, output_n_tile)
+            gl_wr += Int32(cohort * 64) * gl_stride
+            live_end = block_valid_rows
+            if live_end > Int32((cohort + 1) * 64):
+                live_end = Int32((cohort + 1) * 64)
+            self._drain_output_smem(c_bf16_flat, smem_base, gl_stride,
+                                   gl_wr, gl_delta, sh_rd, sh_delta, live_end, 4)
 
     @cute.jit
     def _wait_for_reduction_turn(
@@ -4032,6 +4119,8 @@ class W4A16GemmKernel:
         tile_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
+        if cutlass.const_expr(self.wide_m_cooperative):
+            tid = tid % Int32(128)
         if cutlass.const_expr(self.weight_layout_trellis256):
             # TRELLIS-256: no per-weight scale; the (2,4) bundle carries the 4
             # jj-tiles' pre-funnelled windows -> regs[0,jj]=win_a, regs[1,jj]=win_b.
@@ -6667,7 +6756,7 @@ class W4A16FusedMoeKernel:
         )
         self.fc2_schedule_route_block_factor = int(fc2_schedule_route_block_factor)
         if (
-            self.fc2_moe_block_size not in _ALLOWED_ROUTED_SIZES
+            self.fc2_moe_block_size not in (*_ALLOWED_ROUTED_SIZES, 128)
             or self.moe_block_size % self.fc2_moe_block_size != 0
         ):
             raise ValueError(

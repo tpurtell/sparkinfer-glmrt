@@ -1233,7 +1233,7 @@ def parse_coordinator_arm(text):
                     raise ValueError("tile needs four positive, 16-aligned dimensions")
             elif key in ("route_block", "ctas", "stages", "wire", "dynamic"):
                 value = int(value)
-                legal = {"route_block": (8, 16, 32, 64), "ctas": (1, 2, 3, 4),
+                legal = {"route_block": (8, 16, 32, 64, 128), "ctas": (1, 2, 3, 4),
                          "stages": range(2, 7), "wire": (0, 1), "dynamic": (0, 1)}
                 if value not in legal[key]:
                     raise ValueError("invalid integer override")
@@ -1293,6 +1293,8 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
             raise ValueError("coordinator tile must divide both projection geometries")
         if not ws and tile[1] != tile[3]:
             raise ValueError("cooperative FC1/FC2 tiles must have equal CTA thread counts")
+    if block == 128 and (ws or spark or compact or fused or tile != (64, 128, 64, 128)):
+        raise ValueError("wide-M needs coordinator cooperative route_block=128,tile=64/128/64/128")
     slots = route_pack_capacity(capacity * topk, block, experts, topk=topk)[1]
     return dict(size_m=capacity, hidden_size=hidden, intermediate_size=width,
         tier0_num_experts=experts, tier1_num_experts=experts, tier0_bits=tier0_bits, tier1_bits=tier1_bits,
