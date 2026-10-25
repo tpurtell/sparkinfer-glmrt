@@ -1212,7 +1212,7 @@ def parse_coordinator_arm(text):
                     raise ValueError("tile needs four positive, 16-aligned dimensions")
             elif key in ("route_block", "ctas", "stages", "wire", "dynamic"):
                 value = int(value)
-                legal = {"route_block": (8, 16, 32, 64), "ctas": (1, 2, 3, 4),
+                legal = {"route_block": (8, 16, 32, 64, 128, 256), "ctas": (1, 2, 3, 4),
                          "stages": range(2, 7), "wire": (0, 1), "dynamic": (0, 1)}
                 if value not in legal[key]:
                     raise ValueError("invalid integer override")
