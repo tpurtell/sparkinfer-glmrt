@@ -382,11 +382,9 @@ V41_ROUTER_SKINNY_MAX_ROWS = 64
 
 class _V41DecodeRouterScores:
     def __init__(self, experts: int, hidden: int):
-        from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+        from b12x.gemm.bf16_gemv._skinny import router_skinny
 
-        self.skinny = SkinnyBf16Gemv(
-            experts, hidden, out_dtype=Float32,
-            **skinny_config(experts, hidden, Float32))
+        self.skinny = router_skinny(experts, hidden)
         self.mma = _V41RouterScores(experts, hidden=hidden)
 
     @cute.jit
@@ -411,7 +409,7 @@ def compile_v41_router_scores_aot(*, experts: int, hidden: int = 5120):
     if hidden == 5120 and experts in (128, 384):
         kernel = _V41DecodeRouterScores(experts, hidden)
         s = kernel.skinny
-        route_key = (V41_ROUTER_SKINNY_MAX_ROWS, s.cols, s.rows_per_tile, s.threads)
+        route_key = (V41_ROUTER_SKINNY_MAX_ROWS, s.tiles_by_rows)
     else:
         kernel = _V41RouterScores(experts, hidden=hidden)
         route_key = ()
