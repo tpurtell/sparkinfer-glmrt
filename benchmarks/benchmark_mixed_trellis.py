@@ -1210,10 +1210,13 @@ def parse_coordinator_arm(text):
                 value = tuple(map(int, value.split("/")))
                 if len(value) != 4 or any(v < 32 or v % 16 for v in value):
                     raise ValueError("tile needs four positive, 16-aligned dimensions")
-            elif key in ("route_block", "ctas", "stages", "wire", "dynamic"):
+            elif key in ("route_block", "ctas", "stages", "wire", "dynamic",
+                         "l2", "pf1", "pf2", "pdl"):
                 value = int(value)
                 legal = {"route_block": (8, 16, 32, 64, 128, 256), "ctas": (1, 2, 3, 4),
-                         "stages": range(2, 7), "wire": (0, 1), "dynamic": (0, 1)}
+                         "stages": range(2, 7), "wire": (0, 1), "dynamic": (0, 1),
+                         "l2": (1, 2), "pf1": range(0, 65), "pf2": range(0, 65),
+                         "pdl": (1, 2)}
                 if value not in legal[key]:
                     raise ValueError("invalid integer override")
             else:
@@ -1269,6 +1272,19 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         if not ws and tile[1] != tile[3]:
             raise ValueError("cooperative FC1/FC2 tiles must have equal CTA thread counts")
     slots = route_pack_capacity(capacity * topk, block, experts, topk=topk)[1]
+    # Cooperative memory schedule (l2/pf1/pf2/pdl): evict-first weight words,
+    # next-tile L2 prefetch depth per projection and the phase-boundary prefetch
+    # across the FC1/FC2 barrier. A schedule changes only cache state, never a
+    # load, product or sum, so every arm stays bit-identical to the cooperative
+    # oracle; the wire/stages/dynamic guard above keeps it cooperative-only.
+    schedule = ""
+    if any(k in arm for k in ("l2", "pf1", "pf2", "pdl")):
+        if ws:
+            raise ValueError("the cooperative memory schedule is not a WS option")
+        schedule = ",".join(f"{k}={arm.get(k, d)}" for k, d in
+                            (("l2", 1), ("pf1", 0), ("pf2", 0), ("pdl", 1)))
+        if "pdl" in arm and arm["pdl"] == 2 and not (arm.get("pf1") and arm.get("pf2")):
+            raise ValueError("pdl=2 needs nonzero pf1 and pf2")
     return dict(size_m=capacity, hidden_size=hidden, intermediate_size=width,
         tier0_num_experts=experts, tier1_num_experts=experts, tier0_bits=tier0_bits, tier1_bits=tier1_bits,
         route_num_experts=experts, top_k=topk, max_m_blocks=(slots + block - 1) // block,
@@ -1280,7 +1296,8 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         warp_specialized=ws, compact_weights=compact,
         input_format="e4m3_k32" if arm.get("wire") else "bf16",
         force_blocks_per_sm=arm.get("ctas"), ws_input_stages=arm.get("stages"),
-        ws_dynamic_tiles=bool(arm.get("dynamic", False)))
+        ws_dynamic_tiles=bool(arm.get("dynamic", False)),
+        decode_schedule=schedule or None)
 
 
 def coordinator_route_waves(path, layer=None, family="glm"):
