@@ -242,6 +242,7 @@ def test_router_scores_rows_match_single_row_decode(programs, name, mode):
         x = (x.float() * scale).bfloat16()
         gate = (gate.float() / scale).bfloat16()
         x[0].zero_()
+        x[7].copy_(x[3])
 
     from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
     from b12x.integration.cuteafd._common import compile_program, Operand, Scalar
@@ -256,10 +257,11 @@ def test_router_scores_rows_match_single_row_decode(programs, name, mode):
         scalars=(Scalar("rows"),))
 
     def run(rows, rows_x, selected=program):
-        logits = torch.full((rows, e), float("nan"), device=device)
+        logits = torch.full((64, e), float("nan"), device=device)
         selected.launch(rows_x.contiguous(), gate, logits, scalars=(rows,))
         torch.cuda.synchronize()
-        return logits
+        assert bool(torch.isnan(logits[rows:]).all()), f"unwritten tail rows modified at rows={rows}"
+        return logits[:rows]
 
     single = torch.cat([run(1, x[r:r + 1], reference) for r in range(64)])
     for rows in range(1, 65):
