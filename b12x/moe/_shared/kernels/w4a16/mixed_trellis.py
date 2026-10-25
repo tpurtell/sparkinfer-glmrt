@@ -47,6 +47,7 @@ from .host import (
     route_pack_warmup_token_counts,
 )
 from .kernel import (
+    _ALLOWED_ROUTED_SIZES,
     _SQG_XOR_CHEB_T12_LUT_ENTRIES,
     _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
     W4A16FusedMoeKernel,
@@ -2458,6 +2459,12 @@ def compile_mixed_trellis(
         *,
         grouped_m8_fc2: bool,
     ) -> W4A16FusedMoeKernel:
+        # A packed route block wider than 64 rows (128/256) cannot be an FC2
+        # route subtile by itself, so FC2 schedules native 64-row subtiles and
+        # keeps the packed block as the route factor. Each FC2 row still owns
+        # its complete K reduction, so the split stays bit-identical.
+        fc2_block = (
+            8 if grouped_m8_fc2 else min(int(moe_block_size), max(_ALLOWED_ROUTED_SIZES)))
         return W4A16FusedMoeKernel(
             size_m=size_m,
             hidden_size=hidden_size,
@@ -2474,8 +2481,9 @@ def compile_mixed_trellis(
             fc2_tile_k=fc2_tile_k,
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
-            fc2_moe_block_size=(8 if grouped_m8_fc2 else moe_block_size),
-            fc2_schedule_route_block_factor=(2 if grouped_m8_fc2 else 1),
+            fc2_moe_block_size=fc2_block,
+            fc2_schedule_route_block_factor=(
+                2 if grouped_m8_fc2 else int(moe_block_size) // fc2_block),
             element_dtype="fp16",
             weight_layout="trellis_t256",
             scale_format="e4m3_k32",
@@ -2797,6 +2805,12 @@ def compile_mixed_trellis3(
         *,
         grouped_m8_fc2: bool,
     ) -> W4A16FusedMoeKernel:
+        # A packed route block wider than 64 rows (128/256) cannot be an FC2
+        # route subtile by itself, so FC2 schedules native 64-row subtiles and
+        # keeps the packed block as the route factor. Each FC2 row still owns
+        # its complete K reduction, so the split stays bit-identical.
+        fc2_block = (
+            8 if grouped_m8_fc2 else min(int(moe_block_size), max(_ALLOWED_ROUTED_SIZES)))
         return W4A16FusedMoeKernel(
             size_m=size_m,
             hidden_size=hidden_size,
@@ -2813,8 +2827,9 @@ def compile_mixed_trellis3(
             fc2_tile_k=fc2_tile_k,
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
-            fc2_moe_block_size=(8 if grouped_m8_fc2 else moe_block_size),
-            fc2_schedule_route_block_factor=(2 if grouped_m8_fc2 else 1),
+            fc2_moe_block_size=fc2_block,
+            fc2_schedule_route_block_factor=(
+                2 if grouped_m8_fc2 else int(moe_block_size) // fc2_block),
             element_dtype="fp16",
             weight_layout="trellis_t256",
             scale_format="e4m3_k32",
