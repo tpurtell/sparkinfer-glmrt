@@ -188,11 +188,19 @@ class _RouterScores:
     """Skinny GEMV (FP32 out) for live_rows <= 64, else the V4.1 TMA MMA kernel."""
 
     def __init__(self, experts: int, hidden: int):
-        from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
+        from b12x.gemm.bf16_gemv._skinny import (
+            SKINNY_TILES_BY_ROWS, RowTiledSkinnyBf16Gemv, SkinnyBf16Gemv, skinny_config,
+        )
         from b12x.moe._shared.v41_router import _V41RouterScores
 
-        self.skinny = SkinnyBf16Gemv(experts, hidden, out_dtype=cutlass.Float32,
-                                     **skinny_config(experts, hidden, cutlass.Float32))
+        tiles_by_rows = SKINNY_TILES_BY_ROWS.get((int(experts), int(hidden)), ())
+        if tiles_by_rows:
+            self.skinny = RowTiledSkinnyBf16Gemv(experts, hidden, tiles_by_rows, out_dtype=cutlass.Float32)
+            self.skinny_tiles_by_rows = self.skinny.tiles_by_rows
+        else:
+            self.skinny = SkinnyBf16Gemv(experts, hidden, out_dtype=cutlass.Float32,
+                                         **skinny_config(experts, hidden, cutlass.Float32))
+            self.skinny_tiles_by_rows = ()
         self.mma = _V41RouterScores(experts, hidden=hidden)
 
     @cute.jit
@@ -212,14 +220,25 @@ def compile_dsv4_router_scores_aot(geometry: DSV4Geometry = FLASH, experts: int 
         raise ValueError("DSV4 router scores support 256/384 experts over hidden 4096/7168")
     launch = _RouterScores(e, h)
     s = launch.skinny
+    cta_rows = getattr(s, "cta_rows", s.rows_per_tile)
+    key = (e, h, ROUTER_SKINNY_MAX_ROWS, s.cols, s.rows_per_tile, s.threads)
+    if cta_rows != s.rows_per_tile:
+        key = key + (("cta_rows", cta_rows),)
+    if launch.skinny_tiles_by_rows:
+        key = key + (("skinny_tiles_by_rows", launch.skinny_tiles_by_rows),)
+    geom = {"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS}
+    if cta_rows != s.rows_per_tile:
+        geom["skinny_cta_rows"] = cta_rows
+    if launch.skinny_tiles_by_rows:
+        geom["skinny_tiles_by_rows"] = launch.skinny_tiles_by_rows
     return compile_program(
         launch, name="dsv4_router_scores",
         operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
                   Operand("w", torch.bfloat16, f"[{e},{h}]", note="ffn.gate.weight"),
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
         scalars=(Scalar("live_rows"),),
-        key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.cols, s.rows_per_tile, s.threads),
-        geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
+        key=key,
+        geometry=geom, doc=__doc__,
     )
 
 

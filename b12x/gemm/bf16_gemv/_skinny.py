@@ -72,14 +72,17 @@ class SkinnyBf16Gemv:
     """Pointer ABI ``(x, w, out, rows, stream)``; x [rows,K], w [N,K], out [rows,N] (dense)."""
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, cols: int = 4,
-                 rows_per_tile: int = 8, threads: int = 256):
+                 rows_per_tile: int = 8, threads: int = 256, cta_rows: int | None = None):
         self.n, self.k = int(n), int(k)
         self.cols, self.rows_per_tile, self.threads = int(cols), int(rows_per_tile), int(threads)
+        self.cta_rows = self.rows_per_tile if cta_rows is None else int(cta_rows)
         self.vectors = self.k // 8
         if self.k % 8 or self.vectors % self.threads:
             raise ValueError("K/8 must be a multiple of the CTA thread count")
         if self.n % self.cols:
             raise ValueError("N must be a multiple of cols")
+        if self.cta_rows < self.rows_per_tile or self.cta_rows % self.rows_per_tile:
+            raise ValueError("cta_rows must be a positive multiple of rows_per_tile")
         self.steps = self.vectors // self.threads
         self.warps = self.threads // 32
         self.out_dtype = out_dtype
@@ -99,7 +102,7 @@ class SkinnyBf16Gemv:
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
                  stream: cuda.CUstream):
-        tiles = (rows + Int32(self.rows_per_tile - 1)) // Int32(self.rows_per_tile)
+        tiles = (rows + Int32(self.cta_rows - 1)) // Int32(self.cta_rows)
         self.kernel(x, w, out, rows).launch(
             grid=(self.n // self.cols, tiles, 1), block=(self.threads, 1, 1), stream=stream)
 
@@ -109,70 +112,177 @@ class SkinnyBf16Gemv:
         warp = tidx // Int32(32)
         lane = tidx % Int32(32)
         col0 = Int64(cute.arch.block_idx()[0]) * Int64(self.cols)
-        row0 = Int32(cute.arch.block_idx()[1]) * Int32(self.rows_per_tile)
-        live = rows - row0
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
         partial = storage.partial.get_tensor(
             cute.make_layout((self.warps, self.outputs), stride=(self.outputs, 1)))
-        acc = cute.make_rmem_tensor(cute.make_layout((self.outputs,), stride=(1,)), Float32)
-        for i in cutlass.range_constexpr(self.outputs):
-            acc[i] = Float32(0.0)
         w_base = Int64(w.toint()) + col0 * Int64(self.k * 2) + Int64(tidx) * Int64(16)
-        x_base = Int64(x.toint()) + Int64(row0) * Int64(self.k * 2) + Int64(tidx) * Int64(16)
-        if live >= Int32(self.rows_per_tile):
-            self._loop_fixed(acc, w_base, x_base, self.rows_per_tile)
+        if cutlass.const_expr(self.cta_rows > self.rows_per_tile):
+            cta_row0 = Int32(cute.arch.block_idx()[1]) * Int32(self.cta_rows)
+            cta_end = cta_row0 + Int32(self.cta_rows)
+            if rows < cta_end:
+                cta_end = rows
+            wv_all = cute.make_rmem_tensor(cute.make_layout((self.steps * self.cols * 8,), stride=(1,)), Float32)
+            for step in cutlass.range_constexpr(self.steps):
+                offset = step * self.threads * 16
+                for c in cutlass.range_constexpr(self.cols):
+                    words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
+                    base_idx = (step * self.cols + c) * 8
+                    for j in cutlass.range_constexpr(4):
+                        wv_all[base_idx + 2 * j] = _bf16_lo(words[j])
+                        wv_all[base_idx + 2 * j + 1] = _bf16_hi(words[j])
+            row0 = cta_row0
+            while row0 < cta_end:
+                live = cta_end - row0
+                acc = cute.make_rmem_tensor(cute.make_layout((self.outputs,), stride=(1,)), Float32)
+                for i in cutlass.range_constexpr(self.outputs):
+                    acc[i] = Float32(0.0)
+                x_base = Int64(x.toint()) + Int64(row0) * Int64(self.k * 2) + Int64(tidx) * Int64(16)
+                if live >= Int32(self.rows_per_tile):
+                    self._loop_resident(acc, wv_all, x_base, self.rows_per_tile)
+                else:
+                    handled = Int32(0)
+                    if cutlass.const_expr(self.rows_per_tile > 4):
+                        if live == Int32(4):
+                            self._loop_resident(acc, wv_all, x_base, 4)
+                            handled = Int32(1)
+                    if cutlass.const_expr(self.rows_per_tile > 2):
+                        if live == Int32(2):
+                            self._loop_resident(acc, wv_all, x_base, 2)
+                            handled = Int32(1)
+                    if cutlass.const_expr(self.rows_per_tile > 1):
+                        if live == Int32(1):
+                            self._loop_resident(acc, wv_all, x_base, 1)
+                            handled = Int32(1)
+                    if handled == Int32(0):
+                        for step in cutlass.range_constexpr(self.steps):
+                            offset = step * self.threads * 16
+                            for m in cutlass.range_constexpr(self.rows_per_tile):
+                                if Int32(m) < live:
+                                    self._accumulate_resident(
+                                        acc, wv_all, x_base + Int64(m * self.k * 2 + offset), step, m)
+                for i in cutlass.range_constexpr(self.outputs):
+                    value = acc[i]
+                    for shift in cutlass.range_constexpr(5):
+                        value = value + cute.arch.shuffle_sync_bfly(value, offset=1 << shift)
+                    acc[i] = value
+                if lane == Int32(0):
+                    for i in cutlass.range_constexpr(self.outputs):
+                        partial[warp, i] = acc[i]
+                cute.arch.sync_threads()
+                if tidx < Int32(self.outputs):
+                    self._store(partial, out, col0, row0, live, tidx)
+                row0 = row0 + Int32(self.rows_per_tile)
+                if row0 < cta_end:
+                    cute.arch.sync_threads()
         else:
-            handled = Int32(0)
-            if cutlass.const_expr(self.rows_per_tile > 4):
-                if live == Int32(4):
-                    self._loop_fixed(acc, w_base, x_base, 4)
-                    handled = Int32(1)
-            if cutlass.const_expr(self.rows_per_tile > 2):
-                if live == Int32(2):
-                    self._loop_fixed(acc, w_base, x_base, 2)
-                    handled = Int32(1)
-            if cutlass.const_expr(self.rows_per_tile > 1):
-                if live == Int32(1):
-                    self._loop_fixed(acc, w_base, x_base, 1)
-                    handled = Int32(1)
-            if handled == Int32(0):
-                for step in cutlass.range_constexpr(self.steps):
-                    offset = step * self.threads * 16
-                    wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
-                    for c in cutlass.range_constexpr(self.cols):
-                        words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
-                        for j in cutlass.range_constexpr(4):
-                            wv[8 * c + 2 * j] = _bf16_lo(words[j])
-                            wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
-                    for m in cutlass.range_constexpr(self.rows_per_tile):
-                        if Int32(m) < live:
-                            self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + offset), m)
-        for i in cutlass.range_constexpr(self.outputs):
-            value = acc[i]
-            for shift in cutlass.range_constexpr(5):
-                value = value + cute.arch.shuffle_sync_bfly(value, offset=1 << shift)
-            acc[i] = value
-        if lane == Int32(0):
+            row0 = Int32(cute.arch.block_idx()[1]) * Int32(self.rows_per_tile)
+            live = rows - row0
+            acc = cute.make_rmem_tensor(cute.make_layout((self.outputs,), stride=(1,)), Float32)
             for i in cutlass.range_constexpr(self.outputs):
-                partial[warp, i] = acc[i]
-        cute.arch.sync_threads()
-        if tidx < Int32(self.outputs):
-            self._store(partial, out, col0, row0, live, tidx)
+                acc[i] = Float32(0.0)
+            x_base = Int64(x.toint()) + Int64(row0) * Int64(self.k * 2) + Int64(tidx) * Int64(16)
+            if live >= Int32(self.rows_per_tile):
+                self._loop_fixed(acc, w_base, x_base, self.rows_per_tile)
+            else:
+                handled = Int32(0)
+                if cutlass.const_expr(self.out_dtype == cutlass.Float32 and self.rows_per_tile > 16):
+                    if live == Int32(16):
+                        self._loop_fixed(acc, w_base, x_base, 16)
+                        handled = Int32(1)
+                if cutlass.const_expr(self.out_dtype == cutlass.Float32 and self.rows_per_tile > 8):
+                    if live == Int32(8):
+                        self._loop_fixed(acc, w_base, x_base, 8)
+                        handled = Int32(1)
+                if cutlass.const_expr(self.rows_per_tile > 4):
+                    if live == Int32(4):
+                        self._loop_fixed(acc, w_base, x_base, 4)
+                        handled = Int32(1)
+                if cutlass.const_expr(self.rows_per_tile > 2):
+                    if live == Int32(2):
+                        self._loop_fixed(acc, w_base, x_base, 2)
+                        handled = Int32(1)
+                if cutlass.const_expr(self.rows_per_tile > 1):
+                    if live == Int32(1):
+                        self._loop_fixed(acc, w_base, x_base, 1)
+                        handled = Int32(1)
+                if handled == Int32(0):
+                    for step in cutlass.range_constexpr(self.steps):
+                        offset = step * self.threads * 16
+                        wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
+                        for c in cutlass.range_constexpr(self.cols):
+                            words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
+                            for j in cutlass.range_constexpr(4):
+                                wv[8 * c + 2 * j] = _bf16_lo(words[j])
+                                wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
+                        for m in cutlass.range_constexpr(self.rows_per_tile):
+                            if Int32(m) < live:
+                                self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + offset), m)
+            for i in cutlass.range_constexpr(self.outputs):
+                value = acc[i]
+                for shift in cutlass.range_constexpr(5):
+                    value = value + cute.arch.shuffle_sync_bfly(value, offset=1 << shift)
+                acc[i] = value
+            if lane == Int32(0):
+                for i in cutlass.range_constexpr(self.outputs):
+                    partial[warp, i] = acc[i]
+            cute.arch.sync_threads()
+            if tidx < Int32(self.outputs):
+                self._store(partial, out, col0, row0, live, tidx)
 
     @cute.jit
     def _loop_fixed(self, acc: cute.Tensor, w_base: Int64, x_base: Int64,
                     live_rows: cutlass.Constexpr):
+        if cutlass.const_expr(
+            self.out_dtype == cutlass.Float32 and self.rows_per_tile > 8
+            and live_rows * self.cols >= 32 and self.steps > 2
+        ):
+            step = Int32(0)
+            while step < Int32(self.steps):
+                offset = Int64(step) * Int64(self.threads * 16)
+                wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
+                for c in cutlass.range_constexpr(self.cols):
+                    words = _ld_stream(w_base + Int64(c * self.k * 2) + offset)
+                    for j in cutlass.range_constexpr(4):
+                        wv[8 * c + 2 * j] = _bf16_lo(words[j])
+                        wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
+                for m in cutlass.range_constexpr(live_rows):
+                    self._accumulate(acc, wv, x_base + Int64(m * self.k * 2) + offset, m)
+                step = step + Int32(1)
+        else:
+            for step in cutlass.range_constexpr(self.steps):
+                offset = step * self.threads * 16
+                wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
+                for c in cutlass.range_constexpr(self.cols):
+                    words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
+                    for j in cutlass.range_constexpr(4):
+                        wv[8 * c + 2 * j] = _bf16_lo(words[j])
+                        wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
+                for m in cutlass.range_constexpr(live_rows):
+                    self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + offset), m)
+
+    @cute.jit
+    def _loop_resident(self, acc: cute.Tensor, wv_all: cute.Tensor, x_base: Int64,
+                       live_rows: cutlass.Constexpr):
         for step in cutlass.range_constexpr(self.steps):
             offset = step * self.threads * 16
-            wv = cute.make_rmem_tensor(cute.make_layout((self.cols * 8,), stride=(1,)), Float32)
-            for c in cutlass.range_constexpr(self.cols):
-                words = _ld_stream(w_base + Int64(c * self.k * 2 + offset))
-                for j in cutlass.range_constexpr(4):
-                    wv[8 * c + 2 * j] = _bf16_lo(words[j])
-                    wv[8 * c + 2 * j + 1] = _bf16_hi(words[j])
             for m in cutlass.range_constexpr(live_rows):
-                self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + offset), m)
+                self._accumulate_resident(acc, wv_all, x_base + Int64(m * self.k * 2 + offset), step, m)
+
+    @cute.jit
+    def _accumulate_resident(self, acc: cute.Tensor, wv_all: cute.Tensor, x_address: Int64,
+                             step: cutlass.Constexpr, m: cutlass.Constexpr):
+        words = _ld_cached(x_address)
+        xs = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
+        for j in cutlass.range_constexpr(4):
+            xs[2 * j] = _bf16_lo(words[j])
+            xs[2 * j + 1] = _bf16_hi(words[j])
+        for c in cutlass.range_constexpr(self.cols):
+            a = acc[m * self.cols + c]
+            base_idx = (step * self.cols + c) * 8
+            for j in cutlass.range_constexpr(8):
+                a = a + wv_all[base_idx + j] * xs[j]
+            acc[m * self.cols + c] = a
 
     @cute.jit
     def _accumulate(self, acc: cute.Tensor, wv: cute.Tensor, x_address: Int64,
@@ -246,7 +356,7 @@ SKINNY_TILES_BY_ROWS = {
 
 
 class RowTiledSkinnyBf16Gemv:
-    """``SkinnyBf16Gemv`` with ``(cols, rows_per_tile)`` picked by live rows.
+    """``SkinnyBf16Gemv`` with ``(cols, rows_per_tile[, cta_rows])`` picked by live rows.
 
     All entries share one ``threads`` count, so the K reduction order is
     invariant across row counts and matches a single-row launch bit for bit.
@@ -255,17 +365,20 @@ class RowTiledSkinnyBf16Gemv:
     def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16):
         self.n, self.k = int(n), int(k)
         self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
-        if not self.tiles_by_rows or any(len(entry) != 4 for entry in self.tiles_by_rows):
-            raise ValueError("skinny_tiles_by_rows entries are (rows, cols, rows_per_tile, threads)")
+        if not self.tiles_by_rows or any(len(entry) not in (4, 5) for entry in self.tiles_by_rows):
+            raise ValueError("skinny_tiles_by_rows entries are (rows, cols, rows_per_tile, threads[, cta_rows])")
         if len({entry[3] for entry in self.tiles_by_rows}) != 1:
             raise ValueError("skinny_tiles_by_rows entries must share one CTA thread count")
         self.limits = tuple(entry[0] for entry in self.tiles_by_rows)
         self.floors = (0,) + self.limits[:-1]
         if any(limit <= floor for floor, limit in zip(self.floors, self.limits)):
             raise ValueError("skinny_tiles_by_rows rows must be positive and ascending")
-        self.cols, self.rows_per_tile, self.threads = self.tiles_by_rows[0][1:]
-        self.tiled = [SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, cols=c, rows_per_tile=r,
-                                     threads=t) for _, c, r, t in self.tiles_by_rows]
+        self.cols, self.rows_per_tile, self.threads = self.tiles_by_rows[0][1:4]
+        self.tiled = [
+            SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, cols=entry[1], rows_per_tile=entry[2],
+                           threads=entry[3], cta_rows=entry[4] if len(entry) == 5 else None)
+            for entry in self.tiles_by_rows
+        ]
         self.default = self.tiled[-1]
 
     @cute.jit

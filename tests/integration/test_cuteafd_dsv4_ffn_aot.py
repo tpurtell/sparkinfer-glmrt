@@ -204,27 +204,50 @@ def test_router_scores_match_fp32_gate(programs, name, rows):
 
 
 
-@pytest.mark.parametrize("name", ["flash", "pro", "glm"])
+@pytest.mark.parametrize("name", ["flash", "pro", "glm", "v41_e384", "v41_e128"])
 def test_router_scores_rows_match_single_row_decode(programs, name):
     """Every decode/verify width 1..64 gives each row its M=1 logits bit for bit
     (#736: the MMA route above 32 rows reordered each logit's FP32 sum, so a
     33-64-row verify routed differently from plain decode)."""
     from b12x.integration.cuteafd import GLM53, glm_ffn
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd.dsv4_ffn import ROUTER_SKINNY_MAX_ROWS, _RouterScores
 
     device = require_b12x()
     if name == "glm":
         program, e, h = glm_ffn.compile_glm_router_scores_aot(GLM53), GLM53.routed_experts, GLM53.hidden
+    elif name in ("v41_e384", "v41_e128"):
+        e, h = (384 if name == "v41_e384" else 128), 5120
+        launch = _RouterScores(e, h)
+        s = launch.skinny
+        program = compile_program(
+            launch, name="v41_router_scores",
+            operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                      Operand("w", torch.bfloat16, f"[{e},{h}]"),
+                      Operand("logits", torch.float32, f"[rows,{e}]", "out")),
+            scalars=(Scalar("live_rows"),),
+            key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.cols, s.rows_per_tile, s.threads,
+                 getattr(s, "cta_rows", s.rows_per_tile), launch.skinny_tiles_by_rows),
+        )
     else:
         geometry = _geometry(name)
         program, e, h = programs[("router", name)], geometry.routed_experts, geometry.hidden
     gate = (torch.randn((e, h), generator=torch.Generator().manual_seed(e + h)) / 64).bfloat16().to(device)
     x = _x(64, h, 736, device)
+    # Include adversarial rows: zero row, repeated rows, scale sweep, and mixed-magnitude cancellation.
+    x[5].zero_()
+    x[11].copy_(x[3])
+    x[19].mul_(1e-3)
+    x[27].mul_(32.0)
+    x[35, :h // 2].mul_(64.0)
+    x[35, h // 2:].mul_(-64.0)
 
     def run(rows, rows_x):
-        logits = torch.full((rows, e), float("nan"), device=device)
-        program.launch(rows_x.contiguous(), gate, logits, scalars=(rows,))
+        buf = torch.full((rows + 2, e), float("nan"), device=device)
+        program.launch(rows_x.contiguous(), gate, buf[:rows], scalars=(rows,))
         torch.cuda.synchronize()
-        return logits
+        assert bool(torch.isnan(buf[rows:]).all()), f"{name} router rows={rows} overwrote tail rows"
+        return buf[:rows]
 
     single = torch.cat([run(1, x[r:r + 1]) for r in range(64)])
     for rows in range(2, 65):
