@@ -737,7 +737,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 partial_budget = max(Int32(0), l2_bytes - l2_bytes // Int32(8)
                                      - intermediate_bytes)
                 slice_blocks = Int32(2)
-                for blocks in cutlass.range_constexpr((4, 6, 8, 12, 16, 24)):
+                for index in cutlass.range_constexpr(6):
+                    blocks = (4, 6, 8, 12, 16, 24)[index]
                     if partial_budget >= block_bytes * Int32(blocks):
                         slice_blocks = Int32(blocks)
                 slice_shift = Int32(0)
@@ -2211,7 +2212,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         sliced = slice_blocks < Int32(self.blocks)
         pair_slices = slice_blocks >> Int32(1)
         b_pairs_sliced = Int32(1)
-        for pairs in cutlass.range_constexpr((2, 3, 4)):
+        for pairs in cutlass.range_constexpr(2, 5):
             if pair_slices % Int32(pairs) == Int32(0):
                 b_pairs_sliced = Int32(pairs)
         slice_chunks = pair_slices // b_pairs_sliced
@@ -2502,7 +2503,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         chunks_per_group = self.blocks // b_chunk_const
         sliced = slice_blocks < Int32(self.blocks)
         b_count_sliced = Int32(2)
-        for blocks in cutlass.range_constexpr((4, 6, 8)):
+        for blocks in cutlass.range_constexpr(4, 9, 2):
             if slice_blocks % Int32(blocks) == Int32(0):
                 b_count_sliced = Int32(blocks)
         slice_chunks = slice_blocks // b_count_sliced
