@@ -398,51 +398,90 @@ class DenseMlaFp8PrefillKernel:
                             row0 + Int32(8 * self.p_stride),
                             pack_f32x2_to_bfloat2(prob[nt * 4 + 2] * sa[g], prob[nt * 4 + 3] * sb[g]),
                         )
-                # Snapshot the packed value operand before releasing this stage.
-                # The producer can overlap the next bulk copy with the PV MMAs.
-                v_regs = cute.make_rmem_tensor(self.chunk, Uint32)
-                for ks in cutlass.range_constexpr(self.chunk // 16):
-                    v_lane = (
-                        kv_addr + (Int32(ks * 16) + v_row) * Int32(RECORD_BYTES)
-                        + warp * Int32(GROUP)
-                    )
-                    for blk in cutlass.range_constexpr(GROUP // 16):
-                        f0, f1 = ldmatrix_m16n16x1_trans_b8(v_lane + Int32(blk * 16))
-                        v_regs[ks * 16 + blk * 2] = f0
-                        v_regs[ks * 16 + blk * 2 + 1] = f1
-                cute.arch.sync_warp()
-                if lane == Int32(0):
-                    cute.arch.mbarrier_arrive(mbar_base + Int32(self.stages) + stage)
-                acc = [acc_frag[i] for i in range(64)]
-                for j in cutlass.range_constexpr(16):
-                    acc[j * 4] = acc[j * 4] * alpha0
-                    acc[j * 4 + 1] = acc[j * 4 + 1] * alpha0
-                    acc[j * 4 + 2] = acc[j * 4 + 2] * alpha1
-                    acc[j * 4 + 3] = acc[j * 4 + 3] * alpha1
-                cute.arch.barrier(barrier_id=barrier_id, number_of_threads=group_threads)
-                # Value MMA: this warp owns latent group ``warp`` (128 dims).
-                p_lane = p_base + warp * Int32(self.p_group_bytes) + p_row * Int32(self.p_stride) + p_col
-                for ks in cutlass.range_constexpr(self.chunk // 16):
-                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(p_lane + Int32(ks * 32))
-                    for blk in cutlass.range_constexpr(GROUP // 16):
-                        f0 = v_regs[ks * 16 + blk * 2]
-                        f1 = v_regs[ks * 16 + blk * 2 + 1]
-                        b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
-                        b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
-                        n0 = blk * 2
-                        (
-                            acc[n0 * 4], acc[n0 * 4 + 1], acc[n0 * 4 + 2], acc[n0 * 4 + 3],
-                        ) = mma_m16n8k16_f32_bf16(
-                            acc[n0 * 4], acc[n0 * 4 + 1], acc[n0 * 4 + 2], acc[n0 * 4 + 3],
-                            a0, a1, a2, a3, b0, b1,
+                # The final chunk has no future copy to hide behind PV.
+                if local + Int32(1) == active_chunks:
+                    acc = [acc_frag[i] for i in range(64)]
+                    for j in cutlass.range_constexpr(16):
+                        acc[j * 4] = acc[j * 4] * alpha0
+                        acc[j * 4 + 1] = acc[j * 4 + 1] * alpha0
+                        acc[j * 4 + 2] = acc[j * 4 + 2] * alpha1
+                        acc[j * 4 + 3] = acc[j * 4 + 3] * alpha1
+                    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=group_threads)
+                    # Value MMA: this warp owns latent group ``warp`` (128 dims).
+                    p_lane = p_base + warp * Int32(self.p_group_bytes) + p_row * Int32(self.p_stride) + p_col
+                    for ks in cutlass.range_constexpr(self.chunk // 16):
+                        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(p_lane + Int32(ks * 32))
+                        v_lane = (
+                            kv_addr + (Int32(ks * 16) + v_row) * Int32(RECORD_BYTES)
+                            + warp * Int32(GROUP)
                         )
-                        n1 = blk * 2 + 1
-                        (
-                            acc[n1 * 4], acc[n1 * 4 + 1], acc[n1 * 4 + 2], acc[n1 * 4 + 3],
-                        ) = mma_m16n8k16_f32_bf16(
-                            acc[n1 * 4], acc[n1 * 4 + 1], acc[n1 * 4 + 2], acc[n1 * 4 + 3],
-                            a0, a1, a2, a3, b2, b3,
+                        for blk in cutlass.range_constexpr(GROUP // 16):
+                            f0, f1 = ldmatrix_m16n16x1_trans_b8(v_lane + Int32(blk * 16))
+                            b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                            b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                            n0 = blk * 2
+                            (
+                                acc[n0 * 4], acc[n0 * 4 + 1], acc[n0 * 4 + 2], acc[n0 * 4 + 3],
+                            ) = mma_m16n8k16_f32_bf16(
+                                acc[n0 * 4], acc[n0 * 4 + 1], acc[n0 * 4 + 2], acc[n0 * 4 + 3],
+                                a0, a1, a2, a3, b0, b1,
+                            )
+                            n1 = blk * 2 + 1
+                            (
+                                acc[n1 * 4], acc[n1 * 4 + 1], acc[n1 * 4 + 2], acc[n1 * 4 + 3],
+                            ) = mma_m16n8k16_f32_bf16(
+                                acc[n1 * 4], acc[n1 * 4 + 1], acc[n1 * 4 + 2], acc[n1 * 4 + 3],
+                                a0, a1, a2, a3, b2, b3,
+                            )
+                    cute.arch.sync_warp()
+                    if lane == Int32(0):
+                        cute.arch.mbarrier_arrive(mbar_base + Int32(self.stages) + stage)
+                else:
+                    # Snapshot the packed value operand before releasing this stage.
+                    # The producer can overlap the next bulk copy with the PV MMAs.
+                    v_regs = cute.make_rmem_tensor(self.chunk, Uint32)
+                    for ks in cutlass.range_constexpr(self.chunk // 16):
+                        v_lane = (
+                            kv_addr + (Int32(ks * 16) + v_row) * Int32(RECORD_BYTES)
+                            + warp * Int32(GROUP)
                         )
+                        for blk in cutlass.range_constexpr(GROUP // 16):
+                            f0, f1 = ldmatrix_m16n16x1_trans_b8(v_lane + Int32(blk * 16))
+                            v_regs[ks * 16 + blk * 2] = f0
+                            v_regs[ks * 16 + blk * 2 + 1] = f1
+                    cute.arch.sync_warp()
+                    if lane == Int32(0):
+                        cute.arch.mbarrier_arrive(mbar_base + Int32(self.stages) + stage)
+                    acc = [acc_frag[i] for i in range(64)]
+                    for j in cutlass.range_constexpr(16):
+                        acc[j * 4] = acc[j * 4] * alpha0
+                        acc[j * 4 + 1] = acc[j * 4 + 1] * alpha0
+                        acc[j * 4 + 2] = acc[j * 4 + 2] * alpha1
+                        acc[j * 4 + 3] = acc[j * 4 + 3] * alpha1
+                    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=group_threads)
+                    # Value MMA: this warp owns latent group ``warp`` (128 dims).
+                    p_lane = p_base + warp * Int32(self.p_group_bytes) + p_row * Int32(self.p_stride) + p_col
+                    for ks in cutlass.range_constexpr(self.chunk // 16):
+                        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(p_lane + Int32(ks * 32))
+                        for blk in cutlass.range_constexpr(GROUP // 16):
+                            f0 = v_regs[ks * 16 + blk * 2]
+                            f1 = v_regs[ks * 16 + blk * 2 + 1]
+                            b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                            b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                            n0 = blk * 2
+                            (
+                                acc[n0 * 4], acc[n0 * 4 + 1], acc[n0 * 4 + 2], acc[n0 * 4 + 3],
+                            ) = mma_m16n8k16_f32_bf16(
+                                acc[n0 * 4], acc[n0 * 4 + 1], acc[n0 * 4 + 2], acc[n0 * 4 + 3],
+                                a0, a1, a2, a3, b0, b1,
+                            )
+                            n1 = blk * 2 + 1
+                            (
+                                acc[n1 * 4], acc[n1 * 4 + 1], acc[n1 * 4 + 2], acc[n1 * 4 + 3],
+                            ) = mma_m16n8k16_f32_bf16(
+                                acc[n1 * 4], acc[n1 * 4 + 1], acc[n1 * 4 + 2], acc[n1 * 4 + 3],
+                                a0, a1, a2, a3, b2, b3,
+                            )
                 for i in cutlass.range_constexpr(64):
                     acc_frag[i] = acc[i]
             else:
