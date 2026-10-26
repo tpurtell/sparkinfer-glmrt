@@ -525,7 +525,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 125
+    CODE_VERSION = 127
     A8_CODE_VERSION = 126
     FC2_WS = True
     REDUCE_MLP = True
@@ -714,8 +714,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 grid=(min(Int32(self.max_groups) * unit_limit, cta_limit), 1, 1),
                 block=(256, 1, 1), stream=stream)
             if cutlass.const_expr(self.blocks == 48):
-                if rows <= Int32(1024):
-                    # Keep the wide-row FC2 specialization unchanged.
+                if rows <= Int32(4096 if self.FC2_HALF and not self.a8 else 1024):
+                    # Reduce each narrow FC2 slice while its F16 partials are hot,
+                    # rather than streaming the whole padded H-wide plane twice.
                     fc2_cta_limit = max(Int32(1), cta_limit >> Int32(1))
                     slice_shift = Int32(1) if rows <= Int32(512) else Int32(0)
                     slice_blocks = Int32(3) << slice_shift
