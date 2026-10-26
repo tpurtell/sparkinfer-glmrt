@@ -2019,6 +2019,7 @@ class DenseMlaFp8PrefillKernel:
         phase = Int32(0)
         for local in cutlass.range(active_chunks, unroll=1):
             chunk_begin = Int32(local) * Int32(64)
+            has_h1 = chunk_begin + Int32(32) < visible_end_1
             s0 = stage
             p0 = phase
             stage += Int32(1)
@@ -2027,39 +2028,43 @@ class DenseMlaFp8PrefillKernel:
                 phase ^= Int32(1)
             s1 = stage
             p1 = phase
-            stage += Int32(1)
-            if stage == Int32(3):
-                stage = Int32(0)
-                phase ^= Int32(1)
+            if has_h1:
+                stage += Int32(1)
+                if stage == Int32(3):
+                    stage = Int32(0)
+                    phase ^= Int32(1)
 
-            kv_addr0 = kv_base + s0 * Int32(32 * RECORD_BYTES)
-            kv_addr1 = kv_base + s1 * Int32(32 * RECORD_BYTES)
             s_wait = s0
             p_wait = p0
-            s_other = s1
-            p_other = p1
-            s_kv_score = kv_addr0
-            if warp_id >= Int32(4):
+            if has_h1 and warp_id >= Int32(4):
                 s_wait = s1
                 p_wait = p1
-                s_other = s0
-                p_other = p0
-                s_kv_score = kv_addr1
             cute.arch.mbarrier_wait(mbar_base + s_wait, phase=p_wait)
+            s_kv_score = kv_base + s_wait * Int32(32 * RECORD_BYTES)
 
             qk0, qk1, sa, sb = self._scores_unified_pair(
                 q_addr, s_kv_score, first_in_half, lane, single_query=single_query
             )
 
-            # Wait on the other half-chunk (already arrived) and preload V(ks=0) from s0[0..15] and V(ks=2) from s1[0..15] before Barrier A!
-            cute.arch.mbarrier_wait(mbar_base + s_other, phase=p_other)
+            kv_addr0 = kv_base + s0 * Int32(32 * RECORD_BYTES)
+            kv_addr1 = kv_base + s1 * Int32(32 * RECORD_BYTES)
+            s_other = s1
+            p_other = p1
+            if warp_id >= Int32(4):
+                s_other = s0
+                p_other = p0
             v_lane0 = kv_addr0 + v_row * Int32(RECORD_BYTES) + v_col_off
             v_lane2 = kv_addr1 + v_row * Int32(RECORD_BYTES) + v_col_off
             v0_regs = []
-            v2_regs = []
             for b in cutlass.range_constexpr(4):
                 v0_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane0 + Int32(b * 16)))
-                v2_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane2 + Int32(b * 16)))
+            v2_frag = cute.make_rmem_tensor(8, Uint32)
+            if has_h1:
+                cute.arch.mbarrier_wait(mbar_base + s_other, phase=p_other)
+                for b in cutlass.range_constexpr(4):
+                    f0, f1 = ldmatrix_m16n16x1_trans_b8(v_lane2 + Int32(b * 16))
+                    v2_frag[b * 2] = f0
+                    v2_frag[b * 2 + 1] = f1
 
             c0 = chunk_begin + warp_id * Int32(8) + tid * Int32(2)
             if c0 >= visible_end_0:
@@ -2170,29 +2175,30 @@ class DenseMlaFp8PrefillKernel:
                     acc1[j * 4 + 3] = acc1[j * 4 + 3] * alpha1_q1
 
             # Stage ALL P(ks=0, 1) into dead s0[0..8192) and P(ks=2, 3) into dead s1[0..8192)!
-            kv_p_dst = kv_addr0
-            if bw >= Int32(2):
-                kv_p_dst = kv_addr1
-            dst_p = kv_p_dst + (bw & Int32(1)) * Int32(4096) + lane * Int32(16) + sub * Int32(8)
-            for g_idx in cutlass.range_constexpr(4):
-                base_g = dst_p + Int32(g_idx * 1024)
-                st_shared_u32(
-                    base_g,
-                    pack_f32x2_to_bfloat2(prob0[0] * sa[g_idx], prob0[1] * sb[g_idx]),
-                )
-                st_shared_u32(
-                    base_g + Int32(4),
-                    pack_f32x2_to_bfloat2(prob0[2] * sa[g_idx], prob0[3] * sb[g_idx]),
-                )
-                if cutlass.const_expr(not single_query):
+            if has_h1 or bw < Int32(2):
+                kv_p_dst = kv_addr0
+                if bw >= Int32(2):
+                    kv_p_dst = kv_addr1
+                dst_p = kv_p_dst + (bw & Int32(1)) * Int32(4096) + lane * Int32(16) + sub * Int32(8)
+                for g_idx in cutlass.range_constexpr(4):
+                    base_g = dst_p + Int32(g_idx * 1024)
                     st_shared_u32(
-                        base_g + Int32(512),
-                        pack_f32x2_to_bfloat2(prob1[0] * sa[g_idx], prob1[1] * sb[g_idx]),
+                        base_g,
+                        pack_f32x2_to_bfloat2(prob0[0] * sa[g_idx], prob0[1] * sb[g_idx]),
                     )
                     st_shared_u32(
-                        base_g + Int32(516),
-                        pack_f32x2_to_bfloat2(prob1[2] * sa[g_idx], prob1[3] * sb[g_idx]),
+                        base_g + Int32(4),
+                        pack_f32x2_to_bfloat2(prob0[2] * sa[g_idx], prob0[3] * sb[g_idx]),
                     )
+                    if cutlass.const_expr(not single_query):
+                        st_shared_u32(
+                            base_g + Int32(512),
+                            pack_f32x2_to_bfloat2(prob1[0] * sa[g_idx], prob1[1] * sb[g_idx]),
+                        )
+                        st_shared_u32(
+                            base_g + Int32(516),
+                            pack_f32x2_to_bfloat2(prob1[2] * sa[g_idx], prob1[3] * sb[g_idx]),
+                        )
 
             # Stage sum_nt0 for all 4 bw groups into dead s0[8192..10240) (2,048 B)!
             if sub == Int32(0):
@@ -2280,78 +2286,87 @@ class DenseMlaFp8PrefillKernel:
                         p1_0_q1, p1_1_q1, p1_2_q1, p1_3_q1, b2, b3,
                     )
 
-            # Load P(ks=2, 3) and V(ks=3) from s1, then release s1 BEFORE PV(ks=2, 3) runs!
-            src_p23 = kv_addr1 + bw * Int32(1024) + lane * Int32(16)
-            a0_q0, a1_q0, a2_q0, a3_q0 = ld_shared_v4_u32(src_p23)
-            if cutlass.const_expr(not single_query):
-                a0_q1, a1_q1, a2_q1, a3_q1 = ld_shared_v4_u32(src_p23 + Int32(512))
-            p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0 = ld_shared_v4_u32(src_p23 + Int32(4096))
-            if cutlass.const_expr(not single_query):
-                p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1 = ld_shared_v4_u32(src_p23 + Int32(4608))
-
-            v_lane3 = v_lane2 + Int32(16 * RECORD_BYTES)
-            v3_regs = []
-            for b in cutlass.range_constexpr(4):
-                v3_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane3 + Int32(b * 16)))
-
-            cute.arch.sync_warp()
-            if lane == Int32(0):
-                cute.arch.mbarrier_arrive(mbar_base + Int32(3) + s1)
-
-            # PV ks = 2 (from preloaded v2_regs).
-            for b in cutlass.range_constexpr(4):
-                f0, f1 = v2_regs[b]
-                b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
-                b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
-                n0 = b * 2
-                n1 = b * 2 + 1
-                acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
-                    acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3],
-                    a0_q0, a1_q0, a2_q0, a3_q0, b0, b1,
-                )
-                acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
-                    acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3],
-                    a0_q0, a1_q0, a2_q0, a3_q0, b2, b3,
-                )
-                if cutlass.const_expr(not single_query):
-                    acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
-                        acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3],
-                        a0_q1, a1_q1, a2_q1, a3_q1, b0, b1,
-                    )
-                    acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
-                        acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3],
-                        a0_q1, a1_q1, a2_q1, a3_q1, b2, b3,
-                    )
-
-            # PV ks = 3 (from preloaded v3_regs).
-            for b in cutlass.range_constexpr(4):
-                f0, f1 = v3_regs[b]
-                b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
-                b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
-                n0 = b * 2
-                n1 = b * 2 + 1
-                acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
-                    acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3],
-                    p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0, b0, b1,
-                )
-                acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
-                    acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3],
-                    p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0, b2, b3,
-                )
-                if cutlass.const_expr(not single_query):
-                    acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
-                        acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3],
-                        p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1, b0, b1,
-                    )
-                    acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
-                        acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3],
-                        p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1, b2, b3,
-                    )
-
             for i in cutlass.range_constexpr(32):
                 acc0_frag[i] = acc0[i]
                 if cutlass.const_expr(not single_query):
                     acc1_frag[i] = acc1[i]
+
+            if has_h1:
+                acc0_h1 = [acc0_frag[i] for i in range(32)]
+                acc1_h1 = [acc1_frag[i] for i in range(32)]
+                # Load P(ks=2, 3) and V(ks=3) from s1, then release s1 BEFORE PV(ks=2, 3) runs!
+                src_p23 = kv_addr1 + bw * Int32(1024) + lane * Int32(16)
+                a0_q0, a1_q0, a2_q0, a3_q0 = ld_shared_v4_u32(src_p23)
+                if cutlass.const_expr(not single_query):
+                    a0_q1, a1_q1, a2_q1, a3_q1 = ld_shared_v4_u32(src_p23 + Int32(512))
+                p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0 = ld_shared_v4_u32(src_p23 + Int32(4096))
+                if cutlass.const_expr(not single_query):
+                    p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1 = ld_shared_v4_u32(src_p23 + Int32(4608))
+
+                v_lane3 = v_lane2 + Int32(16 * RECORD_BYTES)
+                v3_regs = []
+                for b in cutlass.range_constexpr(4):
+                    v3_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane3 + Int32(b * 16)))
+
+                cute.arch.sync_warp()
+                if lane == Int32(0):
+                    cute.arch.mbarrier_arrive(mbar_base + Int32(3) + s1)
+
+                # PV ks = 2 (from preloaded v2_frag).
+                for b in cutlass.range_constexpr(4):
+                    f0 = v2_frag[b * 2]
+                    f1 = v2_frag[b * 2 + 1]
+                    b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                    b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                    n0 = b * 2
+                    n1 = b * 2 + 1
+                    acc0_h1[n0 * 4], acc0_h1[n0 * 4 + 1], acc0_h1[n0 * 4 + 2], acc0_h1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc0_h1[n0 * 4], acc0_h1[n0 * 4 + 1], acc0_h1[n0 * 4 + 2], acc0_h1[n0 * 4 + 3],
+                        a0_q0, a1_q0, a2_q0, a3_q0, b0, b1,
+                    )
+                    acc0_h1[n1 * 4], acc0_h1[n1 * 4 + 1], acc0_h1[n1 * 4 + 2], acc0_h1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc0_h1[n1 * 4], acc0_h1[n1 * 4 + 1], acc0_h1[n1 * 4 + 2], acc0_h1[n1 * 4 + 3],
+                        a0_q0, a1_q0, a2_q0, a3_q0, b2, b3,
+                    )
+                    if cutlass.const_expr(not single_query):
+                        acc1_h1[n0 * 4], acc1_h1[n0 * 4 + 1], acc1_h1[n0 * 4 + 2], acc1_h1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                            acc1_h1[n0 * 4], acc1_h1[n0 * 4 + 1], acc1_h1[n0 * 4 + 2], acc1_h1[n0 * 4 + 3],
+                            a0_q1, a1_q1, a2_q1, a3_q1, b0, b1,
+                        )
+                        acc1_h1[n1 * 4], acc1_h1[n1 * 4 + 1], acc1_h1[n1 * 4 + 2], acc1_h1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                            acc1_h1[n1 * 4], acc1_h1[n1 * 4 + 1], acc1_h1[n1 * 4 + 2], acc1_h1[n1 * 4 + 3],
+                            a0_q1, a1_q1, a2_q1, a3_q1, b2, b3,
+                        )
+
+                # PV ks = 3 (from preloaded v3_regs).
+                for b in cutlass.range_constexpr(4):
+                    f0, f1 = v3_regs[b]
+                    b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                    b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                    n0 = b * 2
+                    n1 = b * 2 + 1
+                    acc0_h1[n0 * 4], acc0_h1[n0 * 4 + 1], acc0_h1[n0 * 4 + 2], acc0_h1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc0_h1[n0 * 4], acc0_h1[n0 * 4 + 1], acc0_h1[n0 * 4 + 2], acc0_h1[n0 * 4 + 3],
+                        p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0, b0, b1,
+                    )
+                    acc0_h1[n1 * 4], acc0_h1[n1 * 4 + 1], acc0_h1[n1 * 4 + 2], acc0_h1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc0_h1[n1 * 4], acc0_h1[n1 * 4 + 1], acc0_h1[n1 * 4 + 2], acc0_h1[n1 * 4 + 3],
+                        p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0, b2, b3,
+                    )
+                    if cutlass.const_expr(not single_query):
+                        acc1_h1[n0 * 4], acc1_h1[n0 * 4 + 1], acc1_h1[n0 * 4 + 2], acc1_h1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                            acc1_h1[n0 * 4], acc1_h1[n0 * 4 + 1], acc1_h1[n0 * 4 + 2], acc1_h1[n0 * 4 + 3],
+                            p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1, b0, b1,
+                        )
+                        acc1_h1[n1 * 4], acc1_h1[n1 * 4 + 1], acc1_h1[n1 * 4 + 2], acc1_h1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                            acc1_h1[n1 * 4], acc1_h1[n1 * 4 + 1], acc1_h1[n1 * 4 + 2], acc1_h1[n1 * 4 + 3],
+                            p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1, b2, b3,
+                        )
+
+                for i in cutlass.range_constexpr(32):
+                    acc0_frag[i] = acc0_h1[i]
+                    if cutlass.const_expr(not single_query):
+                        acc1_frag[i] = acc1_h1[i]
 
         # Epilogue: combine per-lane partial row sums from odd warps (sub == 1), normalize, store.
         l0_q0 = stat_l0_q0
@@ -2477,9 +2492,9 @@ class DenseMlaFp8PrefillKernel:
         raw_tile = Int32(raw_tile)
         tile_index = raw_tile
         if batch == Int32(1):
-            full_two_row_tiles = total_q // Int32(2)
-            if raw_tile < full_two_row_tiles:
-                tile_index = (full_two_row_tiles - Int32(1)) - raw_tile
+            num_tiles = (total_q + Int32(1)) // Int32(2)
+            if raw_tile < num_tiles:
+                tile_index = (num_tiles - Int32(1)) - raw_tile
         head_base = Int32(head_tile) * Int32(HEADS_PER_TILE)
 
         request = Int32(0)
@@ -2533,7 +2548,9 @@ class DenseMlaFp8PrefillKernel:
             producer_phase = Int32(1)
             stage = Int32(0)
             table_base = request.to(Int64) * page_table_stride
-            active_half_chunks = active_chunks * Int32(2)
+            active_half_chunks = (causal_end + Int32(31)) // Int32(32)
+            if tile_valid == Int32(0):
+                active_half_chunks = Int32(0)
             for h in cutlass.range(active_half_chunks, unroll=1):
                 token_begin = Int32(h) * Int32(32)
                 cute.arch.mbarrier_wait(
