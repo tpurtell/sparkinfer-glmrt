@@ -525,7 +525,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 127
+    CODE_VERSION = 128
     A8_CODE_VERSION = 126
     FC2_WS = True
     REDUCE_MLP = True
@@ -714,9 +714,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 grid=(min(Int32(self.max_groups) * unit_limit, cta_limit), 1, 1),
                 block=(256, 1, 1), stream=stream)
             if cutlass.const_expr(self.blocks == 48):
-                if rows <= Int32(4096 if self.FC2_HALF and not self.a8 else 1024):
-                    # Reduce each narrow FC2 slice while its F16 partials are hot,
-                    # rather than streaming the whole padded H-wide plane twice.
+                if rows <= Int32(1024):
+                    # Keep the wide-row FC2 specialization unchanged.
                     fc2_cta_limit = max(Int32(1), cta_limit >> Int32(1))
                     slice_shift = Int32(1) if rows <= Int32(512) else Int32(0)
                     slice_blocks = Int32(3) << slice_shift
@@ -1997,7 +1996,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
 
                 if tid >= Int32(256):
                     producer = tid - Int32(256)
-                    if cutlass.const_expr(self.quantize_pass):
+                    if cutlass.const_expr(self.quantize_pass or not self.a8):
+                        # These row predicates are invariant across units and N blocks.
                         c_prod = producer & Int32(15)
                         r_prod0 = producer >> Int32(4)
                         r_prod1 = r_prod0 + Int32(8)
@@ -2082,13 +2082,10 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                         for idx in cutlass.range_constexpr(self.mtiles):
                                             if Int32(idx) < num_live_m:
                                                 m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                                                raw_slot = route_slots[group_base + (m * Int32(16) + r).to(Int64)]
+                                                valid = (valid_mask >> Int32(idx * 2 + half)) & Int32(1)
                                                 target = stage + Int32(idx * 4096) + offset
-                                                if raw_slot >= Int32(0) and raw_slot < max_slot:
-                                                    source = source_a + ((m * Int32(16) + r).to(Int64) * Int64(128) + c.to(Int64) * Int64(8)) * Int64(2)
-                                                    cp_async4_shared_global(target, source)
-                                                else:
-                                                    st_shared_v4_u32(target, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                                                source = source_a + ((m * Int32(16) + r).to(Int64) * Int64(128) + c.to(Int64) * Int64(8)) * Int64(2)
+                                                cp_async4_shared_global_cg_zfill(target, source, valid, Int32(1))
                             if cutlass.const_expr(self.a8 and not self.quantize_pass):
                                 _mbar_arrive(bar_full + slot * Int32(8))
                             else:
