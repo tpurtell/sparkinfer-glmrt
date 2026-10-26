@@ -51,6 +51,8 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
 )
 
+from b12x._lib.utils import runtime_num_sm
+
 from ._math import exp2_approx, log2_approx
 
 RECORD_BYTES = 656
@@ -197,7 +199,9 @@ class DenseMlaFp8PrefillKernel:
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.unified_pair):
-            if total_q <= Int32(self.page_size):
+            query_tiles_quad = (total_q + batch * Int32(3)) // Int32(4)
+            # Quad reuse pays only once its head/query grid fills the launch device.
+            if query_tiles_quad * Int32(self.head_tiles) < runtime_num_sm():
                 query_tiles_pair = (total_q + Int32(1)) // Int32(2) + (batch // Int32(2))
                 self.kernel_pair(
                     q_bytes, cache_bytes, page_table, cache_seqlens, cu_seqlens_q,
@@ -210,7 +214,6 @@ class DenseMlaFp8PrefillKernel:
                     stream=stream,
                 )
             else:
-                query_tiles_quad = (total_q + batch * Int32(3)) // Int32(4)
                 self.kernel(
                     q_bytes, cache_bytes, page_table, cache_seqlens, cu_seqlens_q,
                     output, final_lse, sm_scale_log2, q_stride_row_bytes,
