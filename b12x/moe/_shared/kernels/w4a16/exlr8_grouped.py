@@ -538,8 +538,8 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 126
-    A8_CODE_VERSION = 127
+    CODE_VERSION = 128
+    A8_CODE_VERSION = 129
     FC2_WS = True
     REDUCE_MLP = True
     FC2_HALF = True
@@ -728,15 +728,19 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 block=(256, 1, 1), stream=stream)
             if cutlass.const_expr(self.blocks == 48):
                 fc2_cta_limit = max(Int32(1), cta_limit // Int32(self.CTAS_PER_SM))
-                slice_shift = (
-                    Int32(1) if rows <= Int32(256)
-                    else (Int32(3) if rows <= Int32(1024)
-                          else (Int32(4) if rows <= Int32(2816) else Int32(2)))
-                )
-                slice_blocks = (
-                    Int32(16) if slice_shift == Int32(4)
-                    else (Int32(3) << slice_shift)
-                )
+                # Only valid route rows are written/read. Reserve 1/8 of L2 for
+                # weights and metadata, then fit live A16 intermediates + F16
+                # partials. Two blocks are the paired kernel's streaming floor.
+                live_slots = rows * Int32(self.top_k)
+                intermediate_bytes = live_slots * unit_limit * Int32(128 * 2)
+                block_bytes = live_slots * Int32(128 * (2 if self.FC2_HALF else 4))
+                partial_budget = max(Int32(0), l2_bytes - l2_bytes // Int32(8)
+                                     - intermediate_bytes)
+                slice_blocks = Int32(2)
+                for blocks in cutlass.range_constexpr((4, 6, 8, 12, 16, 24)):
+                    if partial_budget >= block_bytes * Int32(blocks):
+                        slice_blocks = Int32(blocks)
+                slice_shift = Int32(0)
                 slice_base = Int32(0)
                 while slice_base < Int32(48):
                     self.launch_fc2(
@@ -2205,46 +2209,26 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         )
         chunks_per_group = self.blocks // b_chunk_const
         sliced = slice_blocks < Int32(self.blocks)
-        two_chunks = (slice_shift == Int32(2)) | (slice_shift == Int32(4))
-        slice_chunks = Int32(2) if two_chunks else Int32(3)
+        pair_slices = slice_blocks >> Int32(1)
+        b_pairs_sliced = Int32(1)
+        for pairs in cutlass.range_constexpr((2, 3, 4)):
+            if pair_slices % Int32(pairs) == Int32(0):
+                b_pairs_sliced = Int32(pairs)
+        slice_chunks = pair_slices // b_pairs_sliced
         group_tasks = groups * (slice_chunks if sliced else Int32(chunks_per_group))
         use_chunks = group_tasks >= step
-        pair_slices = slice_blocks >> Int32(1)
         limit_tasks = group_tasks if use_chunks else (groups * pair_slices)
-        b_pairs_sliced = (
-            Int32(1) if slice_shift == Int32(1)
-            else (Int32(3) if slice_shift == Int32(2) else Int32(4))
-        )
-        b_pairs = (
-            (b_pairs_sliced if sliced else Int32(b_chunk_const // 2))
-            if use_chunks else Int32(1)
-        )
+        b_pairs = ((b_pairs_sliced if sliced else Int32(b_chunk_const // 2))
+                   if use_chunks else Int32(1))
         max_slot = rows * Int32(self.top_k)
 
         total = cute.make_rmem_tensor((self.mtiles, 2, 8), Float32)
 
         while task < limit_tasks:
-            group = Int32(0)
-            b_local_base = Int32(0)
-            if cutlass.const_expr(self.blocks == 48):
-                if sliced:
-                    if two_chunks:
-                        if use_chunks:
-                            group = task >> Int32(1)
-                            b_local_base = (task & Int32(1)) * (b_pairs_sliced << Int32(1))
-                        else:
-                            group = (task >> Int32(3)) if slice_shift == Int32(4) else ((task >> Int32(1)) // Int32(3))
-                            b_local_base = (task - group * pair_slices) << Int32(1)
-                    else:
-                        q = task if use_chunks else (task >> (slice_shift - Int32(1)))
-                        group = q // Int32(3)
-                        b_local_base = ((q - group * Int32(3)) << slice_shift) if use_chunks else ((task - group * pair_slices) << Int32(1))
-                else:
-                    group = (task // Int32(chunks_per_group)) if use_chunks else (task // Int32(self.blocks // 2))
-                    b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((task % Int32(self.blocks // 2)) * Int32(2))
-            else:
-                group = (task // Int32(chunks_per_group)) if use_chunks else (task // pair_slices)
-                b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((task - group * pair_slices) << Int32(1))
+            tasks_per_group = ((slice_chunks if sliced else Int32(chunks_per_group))
+                               if use_chunks else pair_slices)
+            group = task // tasks_per_group
+            b_local_base = (task - group * tasks_per_group) * (b_pairs << Int32(1))
             block_base = slice_base + b_local_base
 
             expert = group_expert[group]
@@ -2517,42 +2501,25 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         )
         chunks_per_group = self.blocks // b_chunk_const
         sliced = slice_blocks < Int32(self.blocks)
-        two_chunks = (slice_shift == Int32(2)) | (slice_shift == Int32(4))
-        slice_chunks = Int32(2) if two_chunks else Int32(3)
+        b_count_sliced = Int32(2)
+        for blocks in cutlass.range_constexpr((4, 6, 8)):
+            if slice_blocks % Int32(blocks) == Int32(0):
+                b_count_sliced = Int32(blocks)
+        slice_chunks = slice_blocks // b_count_sliced
         group_tasks = groups * (slice_chunks if sliced else Int32(chunks_per_group))
         use_chunks = group_tasks >= step
         limit_tasks = group_tasks if use_chunks else (groups * slice_blocks)
-        b_count_sliced = (slice_blocks >> Int32(1)) if two_chunks else (Int32(1) << slice_shift)
-        b_count = (
-            (b_count_sliced if sliced else Int32(b_chunk_const))
-            if use_chunks else Int32(1)
-        )
+        b_count = ((b_count_sliced if sliced else Int32(b_chunk_const))
+                   if use_chunks else Int32(1))
         max_slot = rows * Int32(self.top_k)
 
         total = cute.make_rmem_tensor((self.mtiles, 8), Float32)
 
         while task < limit_tasks:
-            group = Int32(0)
-            b_local_base = Int32(0)
-            if cutlass.const_expr(self.blocks == 48):
-                if sliced:
-                    if two_chunks:
-                        if use_chunks:
-                            group = task >> Int32(1)
-                            b_local_base = (task & Int32(1)) * b_count_sliced
-                        else:
-                            group = (task >> Int32(4)) if slice_shift == Int32(4) else ((task >> Int32(2)) // Int32(3))
-                            b_local_base = task - group * slice_blocks
-                    else:
-                        q = task if use_chunks else (task >> slice_shift)
-                        group = q // Int32(3)
-                        b_local_base = ((q - group * Int32(3)) << slice_shift) if use_chunks else (task - group * slice_blocks)
-                else:
-                    group = (task // Int32(chunks_per_group)) if use_chunks else (task // Int32(self.blocks))
-                    b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else (task % Int32(self.blocks))
-            else:
-                group = (task // Int32(chunks_per_group)) if use_chunks else (task // Int32(self.blocks))
-                b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else (task % Int32(self.blocks))
+            tasks_per_group = ((slice_chunks if sliced else Int32(chunks_per_group))
+                               if use_chunks else slice_blocks)
+            group = task // tasks_per_group
+            b_local_base = (task - group * tasks_per_group) * b_count
             block_base = slice_base + b_local_base
 
             expert = group_expert[group]
@@ -2764,22 +2731,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         sliced = slice_blocks < Int32(self.blocks)
 
         while task < rows * slice_blocks:
-            row = Int32(0)
-            b_out = Int32(0)
-            if cutlass.const_expr(self.blocks == 48):
-                if sliced:
-                    if slice_shift == Int32(4):
-                        row = task >> Int32(4)
-                        b_out = task & Int32(15)
-                    else:
-                        row = (task >> slice_shift) // Int32(3)
-                        b_out = task - row * slice_blocks
-                else:
-                    row = task // Int32(48)
-                    b_out = task % Int32(48)
-            else:
-                row = task // Int32(self.blocks)
-                b_out = task % Int32(self.blocks)
+            row = task // slice_blocks
+            b_out = task - row * slice_blocks
             block = slice_base + b_out
             col = block * Int32(128) + lane * Int32(4)
             values = cute.make_rmem_tensor(4, Float32)
