@@ -124,14 +124,14 @@ class DenseMlaFp8PrefillKernel:
 
         if self.unified_pair:
             Storage.__annotations__ = {
-                "kv": cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Uint8, 2 * 16 * RECORD_BYTES], 128
-                ],
                 "q": cute.struct.Align[
                     cute.struct.MemRange[cutlass.Uint8, 4 * HEADS_PER_TILE * Q_ROW_BYTES], 128
                 ],
+                "kv": cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, 2 * 16 * RECORD_BYTES], 128
+                ],
                 "reduce": cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Float32, 384], 16
+                    cute.struct.MemRange[cutlass.Float32, 640], 16
                 ],
                 "mbar": cute.struct.Align[
                     cute.struct.MemRange[cutlass.Uint64, 2], 16
@@ -178,6 +178,8 @@ class DenseMlaFp8PrefillKernel:
     ):
         if cutlass.const_expr(self.unified_pair):
             query_tiles = (total_q + batch * Int32(3)) // Int32(4)
+            if total_q <= Int32(self.page_size):
+                query_tiles = (total_q + batch) // Int32(2)
         else:
             query_tiles = (total_q + Int32(self.query_tile - 1)) // Int32(self.query_tile)
             if self.query_tile > 1:
@@ -198,6 +200,7 @@ class DenseMlaFp8PrefillKernel:
     def _stage_query(
         self, q_bytes: cute.Tensor, q_addr: Int32, query_row: Int32, head_base: Int32,
         total_q: Int32, math_tid: Int32, q_stride_row_bytes: Int64,
+        num_q_rows: Int32 = Int32(4),
     ):
         """Stage sixteen BF16 query heads, permuting each latent 16-dim block.
 
@@ -206,11 +209,11 @@ class DenseMlaFp8PrefillKernel:
         non-transposed ldmatrix delivers for E4M3 keys.  As 32-bit words the
         permutation is [w0, w2, w4, w6, w1, w3, w5, w7].  The tail is natural.
         """
-        group_threads = 32 * MATH_WARPS
+        group_threads = Int32(32 * MATH_WARPS)
         if cutlass.const_expr(self.unified_pair):
-            group_threads = 64
-        group = math_tid // Int32(group_threads)
-        tid = math_tid - group * Int32(group_threads)
+            group_threads = Int32(256) // num_q_rows
+        group = math_tid // group_threads
+        tid = math_tid - group * group_threads
         row = query_row + group
         safe_row = row
         if row >= total_q:
@@ -240,7 +243,7 @@ class DenseMlaFp8PrefillKernel:
             else:
                 st_shared_v4_u32(dst, w0, w1, w2, w3)
                 st_shared_v4_u32(dst + Int32(16), w4, w5, w6, w7)
-            unit += Int32(group_threads)
+            unit += group_threads
 
     @cute.jit
     def _scores(self, q_addr: Int32, kv_addr: Int32, warp: Int32, lane: Int32):
@@ -667,12 +670,6 @@ class DenseMlaFp8PrefillKernel:
         visible_end_2: Int32,
         visible_end_3: Int32,
         query_row_0: Int32,
-        query_row_1: Int32,
-        query_row_2: Int32,
-        query_row_3: Int32,
-        query_valid_0: Int32,
-        query_valid_1: Int32,
-        query_valid_2: Int32,
         query_valid_3: Int32,
         head_base: Int32,
         warp_id: Int32,
@@ -774,8 +771,6 @@ class DenseMlaFp8PrefillKernel:
                 qk_h0_a[3] = Float32(_MASK)
             for r in cutlass.range_constexpr(4):
                 qk_h0_a[r] = qk_h0_a[r] * scale_log2
-            mx0_a = fmax_f32(qk_h0_a[0], qk_h0_a[1])
-            mx1_a = fmax_f32(qk_h0_a[2], qk_h0_a[3])
             if cutlass.const_expr(not single_query):
                 if c0 >= vis_b:
                     qk_h0_b[0] = Float32(_MASK)
@@ -785,11 +780,6 @@ class DenseMlaFp8PrefillKernel:
                     qk_h0_b[3] = Float32(_MASK)
                 for r in cutlass.range_constexpr(4):
                     qk_h0_b[r] = qk_h0_b[r] * scale_log2
-                mx0_b = fmax_f32(qk_h0_b[0], qk_h0_b[1])
-                mx1_b = fmax_f32(qk_h0_b[2], qk_h0_b[3])
-            else:
-                mx0_b = Float32(_MASK)
-                mx1_b = Float32(_MASK)
 
             # --- Half-Chunk 1 (records 32..63) ---
             cute.arch.mbarrier_wait(mbar_base + Int32(1), phase=phase)
@@ -812,8 +802,8 @@ class DenseMlaFp8PrefillKernel:
                 qk_h1_a[3] = Float32(_MASK)
             for r in cutlass.range_constexpr(4):
                 qk_h1_a[r] = qk_h1_a[r] * scale_log2
-            mx0_a = fmax_f32(mx0_a, fmax_f32(qk_h1_a[0], qk_h1_a[1]))
-            mx1_a = fmax_f32(mx1_a, fmax_f32(qk_h1_a[2], qk_h1_a[3]))
+            mx0_a = fmax_f32(fmax_f32(qk_h0_a[0], qk_h0_a[1]), fmax_f32(qk_h1_a[0], qk_h1_a[1]))
+            mx1_a = fmax_f32(fmax_f32(qk_h0_a[2], qk_h0_a[3]), fmax_f32(qk_h1_a[2], qk_h1_a[3]))
             for off in (1, 2):
                 mx0_a = fmax_f32(mx0_a, cute.arch.shuffle_sync_bfly(mx0_a, offset=off))
                 mx1_a = fmax_f32(mx1_a, cute.arch.shuffle_sync_bfly(mx1_a, offset=off))
@@ -826,11 +816,14 @@ class DenseMlaFp8PrefillKernel:
                     qk_h1_b[3] = Float32(_MASK)
                 for r in cutlass.range_constexpr(4):
                     qk_h1_b[r] = qk_h1_b[r] * scale_log2
-                mx0_b = fmax_f32(mx0_b, fmax_f32(qk_h1_b[0], qk_h1_b[1]))
-                mx1_b = fmax_f32(mx1_b, fmax_f32(qk_h1_b[2], qk_h1_b[3]))
+                mx0_b = fmax_f32(fmax_f32(qk_h0_b[0], qk_h0_b[1]), fmax_f32(qk_h1_b[0], qk_h1_b[1]))
+                mx1_b = fmax_f32(fmax_f32(qk_h0_b[2], qk_h0_b[3]), fmax_f32(qk_h1_b[2], qk_h1_b[3]))
                 for off in (1, 2):
                     mx0_b = fmax_f32(mx0_b, cute.arch.shuffle_sync_bfly(mx0_b, offset=off))
                     mx1_b = fmax_f32(mx1_b, cute.arch.shuffle_sync_bfly(mx1_b, offset=off))
+            else:
+                mx0_b = Float32(_MASK)
+                mx1_b = Float32(_MASK)
 
             if tid == Int32(0):
                 dst_red = red_addr + (q_pair * Int32(32) + w_sub * Int32(8) + gid) * Int32(16)
@@ -1326,6 +1319,548 @@ class DenseMlaFp8PrefillKernel:
         h0 = head_base + gid
         h1 = h0 + Int32(8)
         col_off = (v_col_off + tid * Int32(2)).to(Int64)
+        query_row_1 = query_row_0 + Int32(1)
+        query_row_2 = query_row_0 + Int32(2)
+        query_row_3 = query_row_0 + Int32(3)
+
+        inv0_q0 = Float32(0.0)
+        inv1_q0 = Float32(0.0)
+        if t0_q0 > Float32(0.0):
+            inv0_q0 = Float32(1.0) / t0_q0
+        if t1_q0 > Float32(0.0):
+            inv1_q0 = Float32(1.0) / t1_q0
+        out0_q0 = get_ptr_as_int64(
+            output,
+            (query_row_0.to(Int64) * Int64(self.num_heads) + h0.to(Int64)) * Int64(VALUE_DIM)
+            + col_off,
+        )
+        out1_q0 = out0_q0 + Int64(8 * VALUE_DIM * 2)
+        for j in cutlass.range_constexpr(8):
+            st_global_u32(
+                out0_q0 + Int64(j * 16),
+                pack_f32x2_to_bfloat2(acc0_frag[j * 4] * inv0_q0, acc0_frag[j * 4 + 1] * inv0_q0),
+            )
+            st_global_u32(
+                out1_q0 + Int64(j * 16),
+                pack_f32x2_to_bfloat2(acc0_frag[j * 4 + 2] * inv1_q0, acc0_frag[j * 4 + 3] * inv1_q0),
+            )
+        if warp_id == Int32(0) and tid == Int32(0):
+            lse0_q0 = Float32(-Float32.inf)
+            lse1_q0 = Float32(-Float32.inf)
+            if t0_q0 > Float32(0.0):
+                lse0_q0 = (log2_approx(t0_q0) + stat_m0_q0) * Float32(0.6931471805599453)
+            if t1_q0 > Float32(0.0):
+                lse1_q0 = (log2_approx(t1_q0) + stat_m1_q0) * Float32(0.6931471805599453)
+            final_lse[query_row_0, h0] = lse0_q0
+            final_lse[query_row_0, h1] = lse1_q0
+
+        if cutlass.const_expr(not single_query):
+            inv0_q1 = Float32(0.0)
+            inv1_q1 = Float32(0.0)
+            if t0_q1 > Float32(0.0):
+                inv0_q1 = Float32(1.0) / t0_q1
+            if t1_q1 > Float32(0.0):
+                inv1_q1 = Float32(1.0) / t1_q1
+            out0_q1 = get_ptr_as_int64(
+                output,
+                (query_row_1.to(Int64) * Int64(self.num_heads) + h0.to(Int64)) * Int64(VALUE_DIM)
+                + col_off,
+            )
+            out1_q1 = out0_q1 + Int64(8 * VALUE_DIM * 2)
+            for j in cutlass.range_constexpr(8):
+                st_global_u32(
+                    out0_q1 + Int64(j * 16),
+                    pack_f32x2_to_bfloat2(acc1_frag[j * 4] * inv0_q1, acc1_frag[j * 4 + 1] * inv0_q1),
+                )
+                st_global_u32(
+                    out1_q1 + Int64(j * 16),
+                    pack_f32x2_to_bfloat2(acc1_frag[j * 4 + 2] * inv1_q1, acc1_frag[j * 4 + 3] * inv1_q1),
+                )
+            if warp_id == Int32(1) and tid == Int32(0):
+                lse0_q1 = Float32(-Float32.inf)
+                lse1_q1 = Float32(-Float32.inf)
+                if t0_q1 > Float32(0.0):
+                    lse0_q1 = (log2_approx(t0_q1) + stat_m0_q1) * Float32(0.6931471805599453)
+                if t1_q1 > Float32(0.0):
+                    lse1_q1 = (log2_approx(t1_q1) + stat_m1_q1) * Float32(0.6931471805599453)
+                final_lse[query_row_1, h0] = lse0_q1
+                final_lse[query_row_1, h1] = lse1_q1
+
+            inv0_q2 = Float32(0.0)
+            inv1_q2 = Float32(0.0)
+            if t0_q2 > Float32(0.0):
+                inv0_q2 = Float32(1.0) / t0_q2
+            if t1_q2 > Float32(0.0):
+                inv1_q2 = Float32(1.0) / t1_q2
+            out0_q2 = get_ptr_as_int64(
+                output,
+                (query_row_2.to(Int64) * Int64(self.num_heads) + h0.to(Int64)) * Int64(VALUE_DIM)
+                + col_off,
+            )
+            out1_q2 = out0_q2 + Int64(8 * VALUE_DIM * 2)
+            for j in cutlass.range_constexpr(8):
+                st_global_u32(
+                    out0_q2 + Int64(j * 16),
+                    pack_f32x2_to_bfloat2(acc2_frag[j * 4] * inv0_q2, acc2_frag[j * 4 + 1] * inv0_q2),
+                )
+                st_global_u32(
+                    out1_q2 + Int64(j * 16),
+                    pack_f32x2_to_bfloat2(acc2_frag[j * 4 + 2] * inv1_q2, acc2_frag[j * 4 + 3] * inv1_q2),
+                )
+            if warp_id == Int32(2) and tid == Int32(0):
+                lse0_q2 = Float32(-Float32.inf)
+                lse1_q2 = Float32(-Float32.inf)
+                if t0_q2 > Float32(0.0):
+                    lse0_q2 = (log2_approx(t0_q2) + stat_m0_q2) * Float32(0.6931471805599453)
+                if t1_q2 > Float32(0.0):
+                    lse1_q2 = (log2_approx(t1_q2) + stat_m1_q2) * Float32(0.6931471805599453)
+                final_lse[query_row_2, h0] = lse0_q2
+                final_lse[query_row_2, h1] = lse1_q2
+
+            if query_valid_3 != Int32(0):
+                inv0_q3 = Float32(0.0)
+                inv1_q3 = Float32(0.0)
+                if t0_q3 > Float32(0.0):
+                    inv0_q3 = Float32(1.0) / t0_q3
+                if t1_q3 > Float32(0.0):
+                    inv1_q3 = Float32(1.0) / t1_q3
+                out0_q3 = get_ptr_as_int64(
+                    output,
+                    (query_row_3.to(Int64) * Int64(self.num_heads) + h0.to(Int64)) * Int64(VALUE_DIM)
+                    + col_off,
+                )
+                out1_q3 = out0_q3 + Int64(8 * VALUE_DIM * 2)
+                for j in cutlass.range_constexpr(8):
+                    st_global_u32(
+                        out0_q3 + Int64(j * 16),
+                        pack_f32x2_to_bfloat2(acc3_frag[j * 4] * inv0_q3, acc3_frag[j * 4 + 1] * inv0_q3),
+                    )
+                    st_global_u32(
+                        out1_q3 + Int64(j * 16),
+                        pack_f32x2_to_bfloat2(acc3_frag[j * 4 + 2] * inv1_q3, acc3_frag[j * 4 + 3] * inv1_q3),
+                    )
+                if warp_id == Int32(3) and tid == Int32(0):
+                    lse0_q3 = Float32(-Float32.inf)
+                    lse1_q3 = Float32(-Float32.inf)
+                    if t0_q3 > Float32(0.0):
+                        lse0_q3 = (log2_approx(t0_q3) + stat_m0_q3) * Float32(0.6931471805599453)
+                    if t1_q3 > Float32(0.0):
+                        lse1_q3 = (log2_approx(t1_q3) + stat_m1_q3) * Float32(0.6931471805599453)
+                    final_lse[query_row_3, h0] = lse0_q3
+                    final_lse[query_row_3, h1] = lse1_q3
+
+    @cute.jit
+    def _run_unified_pair(
+        self,
+        q_addr: Int32,
+        kv_addr0: Int32,
+        red_addr: Int32,
+        mbar_base,
+        cache_bytes: cute.Tensor,
+        page_table: cute.Tensor,
+        table_base: Int64,
+        page_stride_bytes: Int64,
+        cache_length: Int32,
+        active_chunks: Int32,
+        visible_end_0: Int32,
+        visible_end_1: Int32,
+        query_row_0: Int32,
+        query_row_1: Int32,
+        query_valid_0: Int32,
+        query_valid_1: Int32,
+        head_base: Int32,
+        warp_id: Int32,
+        lane: Int32,
+        scale_log2: Float32,
+        output: cute.Tensor,
+        final_lse: cute.Tensor,
+        *,
+        single_query: cutlass.Constexpr = False,
+    ):
+        gid = lane >> Int32(2)
+        tid = lane & Int32(3)
+        bw = warp_id >> Int32(1)
+        sub = warp_id & Int32(1)
+        first_in_half = (warp_id & Int32(3)) * Int32(8)
+
+        kv_addr1 = q_addr + Int32(2 * HEADS_PER_TILE * Q_ROW_BYTES)
+        p_addr = q_addr + Int32(2 * HEADS_PER_TILE * Q_ROW_BYTES + 32 * RECORD_BYTES)
+        sum_addr = red_addr + Int32(512)
+
+        acc0_frag = cute.make_rmem_tensor(32, Float32)
+        acc1_frag = cute.make_rmem_tensor(32, Float32)
+        for i in cutlass.range_constexpr(32):
+            acc0_frag[i] = Float32(0.0)
+            if cutlass.const_expr(not single_query):
+                acc1_frag[i] = Float32(0.0)
+
+        stat_m0_q0 = Float32(_MASK)
+        stat_m1_q0 = Float32(_MASK)
+        stat_m0_q1 = Float32(_MASK)
+        stat_m1_q1 = Float32(_MASK)
+        stat_l0_q0 = Float32(0.0)
+        stat_l1_q0 = Float32(0.0)
+        stat_l0_q1 = Float32(0.0)
+        stat_l1_q1 = Float32(0.0)
+
+        l16 = lane & Int32(15)
+        v_row = (
+            (l16 & Int32(1))
+            | ((l16 & Int32(4)) >> Int32(1))
+            | ((l16 & Int32(8)) >> Int32(1))
+            | ((l16 & Int32(2)) << Int32(2))
+        )
+        v_col_off = bw * Int32(GROUP) + sub * Int32(64)
+        v_lane0 = kv_addr0 + v_row * Int32(RECORD_BYTES) + v_col_off
+        v_lane1 = v_lane0 + Int32(16 * RECORD_BYTES)
+        v_lane2 = kv_addr1 + v_row * Int32(RECORD_BYTES) + v_col_off
+        v_lane3 = v_lane2 + Int32(16 * RECORD_BYTES)
+
+        q_pad_lane = (
+            q_addr
+            + (gid >> Int32(1)) * Int32(Q_ROW_BYTES)
+            + Int32(QK_DIM * 2)
+            + (gid & Int32(1)) * Int32(8)
+        )
+
+        phase = Int32(0)
+        for local in cutlass.range(active_chunks, unroll=1):
+            chunk_begin = Int32(local) * Int32(64)
+            s_wait = Int32(0)
+            s_other = Int32(1)
+            s_kv_score = kv_addr0
+            if warp_id >= Int32(4):
+                s_wait = Int32(1)
+                s_other = Int32(0)
+                s_kv_score = kv_addr1
+            cute.arch.mbarrier_wait(mbar_base + s_wait, phase=phase)
+
+            qk0, qk1, sa, sb = self._scores_unified_pair(
+                q_addr, s_kv_score, first_in_half, lane, single_query=single_query
+            )
+
+            cute.arch.mbarrier_wait(mbar_base + s_other, phase=phase)
+            phase ^= Int32(1)
+
+            v0_regs = []
+            v1_regs = []
+            v2_regs = []
+            v3_regs = []
+            for b in cutlass.range_constexpr(4):
+                v0_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane0 + Int32(b * 16)))
+                v1_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane1 + Int32(b * 16)))
+                v2_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane2 + Int32(b * 16)))
+                v3_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane3 + Int32(b * 16)))
+
+            c0 = chunk_begin + warp_id * Int32(8) + tid * Int32(2)
+            if c0 >= visible_end_0:
+                qk0[0] = Float32(_MASK)
+                qk0[2] = Float32(_MASK)
+            if c0 + Int32(1) >= visible_end_0:
+                qk0[1] = Float32(_MASK)
+                qk0[3] = Float32(_MASK)
+            for r in cutlass.range_constexpr(4):
+                qk0[r] = qk0[r] * scale_log2
+            mx0_q0 = fmax_f32(qk0[0], qk0[1])
+            mx1_q0 = fmax_f32(qk0[2], qk0[3])
+            for off in (1, 2):
+                mx0_q0 = fmax_f32(mx0_q0, cute.arch.shuffle_sync_bfly(mx0_q0, offset=off))
+                mx1_q0 = fmax_f32(mx1_q0, cute.arch.shuffle_sync_bfly(mx1_q0, offset=off))
+
+            if cutlass.const_expr(not single_query):
+                if c0 >= visible_end_1:
+                    qk1[0] = Float32(_MASK)
+                    qk1[2] = Float32(_MASK)
+                if c0 + Int32(1) >= visible_end_1:
+                    qk1[1] = Float32(_MASK)
+                    qk1[3] = Float32(_MASK)
+                for r in cutlass.range_constexpr(4):
+                    qk1[r] = qk1[r] * scale_log2
+                mx0_q1 = fmax_f32(qk1[0], qk1[1])
+                mx1_q1 = fmax_f32(qk1[2], qk1[3])
+                for off in (1, 2):
+                    mx0_q1 = fmax_f32(mx0_q1, cute.arch.shuffle_sync_bfly(mx0_q1, offset=off))
+                    mx1_q1 = fmax_f32(mx1_q1, cute.arch.shuffle_sync_bfly(mx1_q1, offset=off))
+
+            if tid == Int32(0):
+                st_shared_f32(red_addr + (warp_id * Int32(16) + gid) * Int32(4), mx0_q0)
+                st_shared_f32(red_addr + (warp_id * Int32(16) + gid + Int32(8)) * Int32(4), mx1_q0)
+                if cutlass.const_expr(not single_query):
+                    q_pad_w = q_pad_lane + warp_id * Int32(4 * Q_ROW_BYTES)
+                    st_shared_f32(q_pad_w, mx0_q1)
+                    st_shared_f32(q_pad_w + Int32(4), mx1_q1)
+
+            # Barrier A: _scores and all V(ks=0..3) reads complete across all 8 warps!
+            cute.arch.barrier(barrier_id=2, number_of_threads=256)
+            if local + Int32(1) < active_chunks:
+                if warp_id == Int32(0):
+                    self._issue_kv_half_chunk(
+                        cache_bytes, page_table, table_base, page_stride_bytes,
+                        cache_length, chunk_begin + Int32(64), kv_addr0, mbar_base + Int32(0), lane,
+                    )
+                if warp_id == Int32(1):
+                    self._issue_kv_half_chunk(
+                        cache_bytes, page_table, table_base, page_stride_bytes,
+                        cache_length, chunk_begin + Int32(96), kv_addr1, mbar_base + Int32(1), lane,
+                    )
+
+            bm0_q0 = stat_m0_q0
+            bm1_q0 = stat_m1_q0
+            bm0_q1 = stat_m0_q1
+            bm1_q1 = stat_m1_q1
+            for w in cutlass.range_constexpr(8):
+                bm0_q0 = fmax_f32(bm0_q0, ld_shared_f32(red_addr + Int32((w * 16) * 4) + gid * Int32(4)))
+                bm1_q0 = fmax_f32(bm1_q0, ld_shared_f32(red_addr + Int32((w * 16 + 8) * 4) + gid * Int32(4)))
+                if cutlass.const_expr(not single_query):
+                    bm0_q1 = fmax_f32(bm0_q1, ld_shared_f32(q_pad_lane + Int32(w * 4 * Q_ROW_BYTES)))
+                    bm1_q1 = fmax_f32(bm1_q1, ld_shared_f32(q_pad_lane + Int32(w * 4 * Q_ROW_BYTES + 4)))
+
+            if cutlass.const_expr(not single_query):
+                if chunk_begin >= visible_end_0:
+                    bm0_q0 = stat_m0_q0
+                    bm1_q0 = stat_m1_q0
+
+            alpha0_q0 = exp2_approx(stat_m0_q0 - bm0_q0)
+            alpha1_q0 = exp2_approx(stat_m1_q0 - bm1_q0)
+            stat_m0_q0 = bm0_q0
+            stat_m1_q0 = bm1_q0
+
+            prob0 = [
+                exp2_approx(qk0[0] - bm0_q0),
+                exp2_approx(qk0[1] - bm0_q0),
+                exp2_approx(qk0[2] - bm1_q0),
+                exp2_approx(qk0[3] - bm1_q0),
+            ]
+            if cutlass.const_expr(not single_query):
+                if chunk_begin >= visible_end_0:
+                    prob0[0] = Float32(0.0)
+                    prob0[1] = Float32(0.0)
+                    prob0[2] = Float32(0.0)
+                    prob0[3] = Float32(0.0)
+                alpha0_q1 = exp2_approx(stat_m0_q1 - bm0_q1)
+                alpha1_q1 = exp2_approx(stat_m1_q1 - bm1_q1)
+                stat_m0_q1 = bm0_q1
+                stat_m1_q1 = bm1_q1
+                prob1 = [
+                    exp2_approx(qk1[0] - bm0_q1),
+                    exp2_approx(qk1[1] - bm0_q1),
+                    exp2_approx(qk1[2] - bm1_q1),
+                    exp2_approx(qk1[3] - bm1_q1),
+                ]
+            else:
+                alpha0_q1 = Float32(1.0)
+                alpha1_q1 = Float32(1.0)
+                prob1 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+
+            acc0 = [acc0_frag[i] for i in range(32)]
+            acc1 = [acc1_frag[i] for i in range(32)]
+            for j in cutlass.range_constexpr(8):
+                acc0[j * 4] = acc0[j * 4] * alpha0_q0
+                acc0[j * 4 + 1] = acc0[j * 4 + 1] * alpha0_q0
+                acc0[j * 4 + 2] = acc0[j * 4 + 2] * alpha1_q0
+                acc0[j * 4 + 3] = acc0[j * 4 + 3] * alpha1_q0
+                if cutlass.const_expr(not single_query):
+                    acc1[j * 4] = acc1[j * 4] * alpha0_q1
+                    acc1[j * 4 + 1] = acc1[j * 4 + 1] * alpha0_q1
+                    acc1[j * 4 + 2] = acc1[j * 4 + 2] * alpha1_q1
+                    acc1[j * 4 + 3] = acc1[j * 4 + 3] * alpha1_q1
+
+            # Stage ALL P(ks=0..3) (16,384 B) into p_addr and sum_nt0 (2,048 B) into sum_addr!
+            dst_p = p_addr + bw * Int32(4096) + lane * Int32(16) + sub * Int32(8)
+            for g_idx in cutlass.range_constexpr(4):
+                base_g = dst_p + Int32(g_idx * 1024)
+                st_shared_u32(
+                    base_g,
+                    pack_f32x2_to_bfloat2(prob0[0] * sa[g_idx], prob0[1] * sb[g_idx]),
+                )
+                st_shared_u32(
+                    base_g + Int32(4),
+                    pack_f32x2_to_bfloat2(prob0[2] * sa[g_idx], prob0[3] * sb[g_idx]),
+                )
+                if cutlass.const_expr(not single_query):
+                    st_shared_u32(
+                        base_g + Int32(512),
+                        pack_f32x2_to_bfloat2(prob1[0] * sa[g_idx], prob1[1] * sb[g_idx]),
+                    )
+                    st_shared_u32(
+                        base_g + Int32(516),
+                        pack_f32x2_to_bfloat2(prob1[2] * sa[g_idx], prob1[3] * sb[g_idx]),
+                    )
+
+            if sub == Int32(0):
+                dst_sum = sum_addr + bw * Int32(512) + lane * Int32(16)
+                st_shared_v4_f32(
+                    dst_sum,
+                    prob0[0] + prob0[1],
+                    prob0[2] + prob0[3],
+                    prob1[0] + prob1[1],
+                    prob1[2] + prob1[3],
+                )
+
+            # Barrier B (ONLY 2nd barrier of chunk!): P(ks=0..3) and sum_nt0 ready!
+            cute.arch.barrier(barrier_id=2, number_of_threads=256)
+
+            if sub == Int32(1):
+                src_sum = sum_addr + bw * Int32(512) + lane * Int32(16)
+                s0_q0, s1_q0, s0_q1, s1_q1 = ld_shared_v4_f32(src_sum)
+                stat_l0_q0 = stat_l0_q0 * alpha0_q0 + ((s0_q0 + prob0[0]) + prob0[1])
+                stat_l1_q0 = stat_l1_q0 * alpha1_q0 + ((s1_q0 + prob0[2]) + prob0[3])
+                if cutlass.const_expr(not single_query):
+                    stat_l0_q1 = stat_l0_q1 * alpha0_q1 + ((s0_q1 + prob1[0]) + prob1[1])
+                    stat_l1_q1 = stat_l1_q1 * alpha1_q1 + ((s1_q1 + prob1[2]) + prob1[3])
+
+            src_p = p_addr + bw * Int32(1024) + lane * Int32(16)
+            a0_q0, a1_q0, a2_q0, a3_q0 = ld_shared_v4_u32(src_p)
+            if cutlass.const_expr(not single_query):
+                a0_q1, a1_q1, a2_q1, a3_q1 = ld_shared_v4_u32(src_p + Int32(512))
+            p1_0_q0, p1_1_q0, p1_2_q0, p1_3_q0 = ld_shared_v4_u32(src_p + Int32(4096))
+            if cutlass.const_expr(not single_query):
+                p1_0_q1, p1_1_q1, p1_2_q1, p1_3_q1 = ld_shared_v4_u32(src_p + Int32(4608))
+            p2_0_q0, p2_1_q0, p2_2_q0, p2_3_q0 = ld_shared_v4_u32(src_p + Int32(8192))
+            if cutlass.const_expr(not single_query):
+                p2_0_q1, p2_1_q1, p2_2_q1, p2_3_q1 = ld_shared_v4_u32(src_p + Int32(8704))
+            p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0 = ld_shared_v4_u32(src_p + Int32(12288))
+            if cutlass.const_expr(not single_query):
+                p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1 = ld_shared_v4_u32(src_p + Int32(12800))
+
+            # PV ks = 0 (from preloaded v0_regs).
+            for b in cutlass.range_constexpr(4):
+                f0, f1 = v0_regs[b]
+                b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                n0 = b * 2
+                n1 = b * 2 + 1
+                acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                    acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3],
+                    a0_q0, a1_q0, a2_q0, a3_q0, b0, b1,
+                )
+                acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                    acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3],
+                    a0_q0, a1_q0, a2_q0, a3_q0, b2, b3,
+                )
+                if cutlass.const_expr(not single_query):
+                    acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3],
+                        a0_q1, a1_q1, a2_q1, a3_q1, b0, b1,
+                    )
+                    acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3],
+                        a0_q1, a1_q1, a2_q1, a3_q1, b2, b3,
+                    )
+
+            # PV ks = 1 (from preloaded v1_regs and p1_*).
+            for b in cutlass.range_constexpr(4):
+                f0, f1 = v1_regs[b]
+                b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                n0 = b * 2
+                n1 = b * 2 + 1
+                acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                    acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3],
+                    p1_0_q0, p1_1_q0, p1_2_q0, p1_3_q0, b0, b1,
+                )
+                acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                    acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3],
+                    p1_0_q0, p1_1_q0, p1_2_q0, p1_3_q0, b2, b3,
+                )
+                if cutlass.const_expr(not single_query):
+                    acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3],
+                        p1_0_q1, p1_1_q1, p1_2_q1, p1_3_q1, b0, b1,
+                    )
+                    acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3],
+                        p1_0_q1, p1_1_q1, p1_2_q1, p1_3_q1, b2, b3,
+                    )
+
+            # PV ks = 2 (from preloaded v2_regs and p2_*).
+            for b in cutlass.range_constexpr(4):
+                f0, f1 = v2_regs[b]
+                b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                n0 = b * 2
+                n1 = b * 2 + 1
+                acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                    acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3],
+                    p2_0_q0, p2_1_q0, p2_2_q0, p2_3_q0, b0, b1,
+                )
+                acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                    acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3],
+                    p2_0_q0, p2_1_q0, p2_2_q0, p2_3_q0, b2, b3,
+                )
+                if cutlass.const_expr(not single_query):
+                    acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3],
+                        p2_0_q1, p2_1_q1, p2_2_q1, p2_3_q1, b0, b1,
+                    )
+                    acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3],
+                        p2_0_q1, p2_1_q1, p2_2_q1, p2_3_q1, b2, b3,
+                    )
+
+            # PV ks = 3 (from preloaded v3_regs).
+            for b in cutlass.range_constexpr(4):
+                f0, f1 = v3_regs[b]
+                b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f0)
+                b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(f1)
+                n0 = b * 2
+                n1 = b * 2 + 1
+                acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                    acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3],
+                    p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0, b0, b1,
+                )
+                acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                    acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3],
+                    p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0, b2, b3,
+                )
+                if cutlass.const_expr(not single_query):
+                    acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3],
+                        p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1, b0, b1,
+                    )
+                    acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
+                        acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3],
+                        p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1, b2, b3,
+                    )
+
+            for i in cutlass.range_constexpr(32):
+                acc0_frag[i] = acc0[i]
+                if cutlass.const_expr(not single_query):
+                    acc1_frag[i] = acc1[i]
+
+        # Epilogue: combine per-lane partial row sums from odd warps (sub == 1), normalize, store.
+        l0_q0 = stat_l0_q0
+        l1_q0 = stat_l1_q0
+        l0_q1 = stat_l0_q1
+        l1_q1 = stat_l1_q1
+        for off in (1, 2):
+            l0_q0 = l0_q0 + cute.arch.shuffle_sync_bfly(l0_q0, offset=off)
+            l1_q0 = l1_q0 + cute.arch.shuffle_sync_bfly(l1_q0, offset=off)
+            if cutlass.const_expr(not single_query):
+                l0_q1 = l0_q1 + cute.arch.shuffle_sync_bfly(l0_q1, offset=off)
+                l1_q1 = l1_q1 + cute.arch.shuffle_sync_bfly(l1_q1, offset=off)
+        if sub == Int32(1) and tid == Int32(0):
+            st_shared_f32(red_addr + (bw * Int32(16) + gid) * Int32(4), l0_q0)
+            st_shared_f32(red_addr + (bw * Int32(16) + gid + Int32(8)) * Int32(4), l1_q0)
+            if cutlass.const_expr(not single_query):
+                st_shared_f32(red_addr + Int32(64 * 4) + (bw * Int32(16) + gid) * Int32(4), l0_q1)
+                st_shared_f32(red_addr + Int32(64 * 4) + (bw * Int32(16) + gid + Int32(8)) * Int32(4), l1_q1)
+        cute.arch.barrier(barrier_id=2, number_of_threads=256)
+
+        t0_q0 = Float32(0.0)
+        t1_q0 = Float32(0.0)
+        t0_q1 = Float32(0.0)
+        t1_q1 = Float32(0.0)
+        for w in cutlass.range_constexpr(MATH_WARPS):
+            t0_q0 = t0_q0 + ld_shared_f32(red_addr + Int32((w * 16) * 4) + gid * Int32(4))
+            t1_q0 = t1_q0 + ld_shared_f32(red_addr + Int32((w * 16 + 8) * 4) + gid * Int32(4))
+            if cutlass.const_expr(not single_query):
+                t0_q1 = t0_q1 + ld_shared_f32(red_addr + Int32((64 + w * 16) * 4) + gid * Int32(4))
+                t1_q1 = t1_q1 + ld_shared_f32(red_addr + Int32((64 + w * 16 + 8) * 4) + gid * Int32(4))
+
+        h0 = head_base + gid
+        h1 = h0 + Int32(8)
+        col_off = (v_col_off + tid * Int32(2)).to(Int64)
 
         if query_valid_0 != Int32(0):
             inv0_q0 = Float32(0.0)
@@ -1392,70 +1927,6 @@ class DenseMlaFp8PrefillKernel:
                     final_lse[query_row_1, h0] = lse0_q1
                     final_lse[query_row_1, h1] = lse1_q1
 
-            if query_valid_2 != Int32(0):
-                inv0_q2 = Float32(0.0)
-                inv1_q2 = Float32(0.0)
-                if t0_q2 > Float32(0.0):
-                    inv0_q2 = Float32(1.0) / t0_q2
-                if t1_q2 > Float32(0.0):
-                    inv1_q2 = Float32(1.0) / t1_q2
-                out0_q2 = get_ptr_as_int64(
-                    output,
-                    (query_row_2.to(Int64) * Int64(self.num_heads) + h0.to(Int64)) * Int64(VALUE_DIM)
-                    + col_off,
-                )
-                out1_q2 = out0_q2 + Int64(8 * VALUE_DIM * 2)
-                for j in cutlass.range_constexpr(8):
-                    st_global_u32(
-                        out0_q2 + Int64(j * 16),
-                        pack_f32x2_to_bfloat2(acc2_frag[j * 4] * inv0_q2, acc2_frag[j * 4 + 1] * inv0_q2),
-                    )
-                    st_global_u32(
-                        out1_q2 + Int64(j * 16),
-                        pack_f32x2_to_bfloat2(acc2_frag[j * 4 + 2] * inv1_q2, acc2_frag[j * 4 + 3] * inv1_q2),
-                    )
-                if warp_id == Int32(2) and tid == Int32(0):
-                    lse0_q2 = Float32(-Float32.inf)
-                    lse1_q2 = Float32(-Float32.inf)
-                    if t0_q2 > Float32(0.0):
-                        lse0_q2 = (log2_approx(t0_q2) + stat_m0_q2) * Float32(0.6931471805599453)
-                    if t1_q2 > Float32(0.0):
-                        lse1_q2 = (log2_approx(t1_q2) + stat_m1_q2) * Float32(0.6931471805599453)
-                    final_lse[query_row_2, h0] = lse0_q2
-                    final_lse[query_row_2, h1] = lse1_q2
-
-            if query_valid_3 != Int32(0):
-                inv0_q3 = Float32(0.0)
-                inv1_q3 = Float32(0.0)
-                if t0_q3 > Float32(0.0):
-                    inv0_q3 = Float32(1.0) / t0_q3
-                if t1_q3 > Float32(0.0):
-                    inv1_q3 = Float32(1.0) / t1_q3
-                out0_q3 = get_ptr_as_int64(
-                    output,
-                    (query_row_3.to(Int64) * Int64(self.num_heads) + h0.to(Int64)) * Int64(VALUE_DIM)
-                    + col_off,
-                )
-                out1_q3 = out0_q3 + Int64(8 * VALUE_DIM * 2)
-                for j in cutlass.range_constexpr(8):
-                    st_global_u32(
-                        out0_q3 + Int64(j * 16),
-                        pack_f32x2_to_bfloat2(acc3_frag[j * 4] * inv0_q3, acc3_frag[j * 4 + 1] * inv0_q3),
-                    )
-                    st_global_u32(
-                        out1_q3 + Int64(j * 16),
-                        pack_f32x2_to_bfloat2(acc3_frag[j * 4 + 2] * inv1_q3, acc3_frag[j * 4 + 3] * inv1_q3),
-                    )
-                if warp_id == Int32(3) and tid == Int32(0):
-                    lse0_q3 = Float32(-Float32.inf)
-                    lse1_q3 = Float32(-Float32.inf)
-                    if t0_q3 > Float32(0.0):
-                        lse0_q3 = (log2_approx(t0_q3) + stat_m0_q3) * Float32(0.6931471805599453)
-                    if t1_q3 > Float32(0.0):
-                        lse1_q3 = (log2_approx(t1_q3) + stat_m1_q3) * Float32(0.6931471805599453)
-                    final_lse[query_row_3, h0] = lse0_q3
-                    final_lse[query_row_3, h1] = lse1_q3
-
     # ---------------------------------------------------------------- kernel
     @cute.kernel
     def kernel(
@@ -1480,11 +1951,15 @@ class DenseMlaFp8PrefillKernel:
         head_tile, raw_tile, _ = cute.arch.block_idx()
         raw_tile = Int32(raw_tile)
         tile_index = raw_tile
+        eff_qt = Int32(self.eff_query_tile)
+        if cutlass.const_expr(self.unified_pair):
+            if total_q <= Int32(self.page_size):
+                eff_qt = Int32(2)
         if cutlass.const_expr(self.eff_query_tile > 1):
             if batch == Int32(1):
-                full_tiles = total_q // Int32(self.eff_query_tile)
-                if raw_tile < full_tiles:
-                    tile_index = (full_tiles - Int32(1)) - raw_tile
+                num_tiles = (total_q + eff_qt - Int32(1)) // eff_qt
+                if raw_tile < num_tiles:
+                    tile_index = (num_tiles - Int32(1)) - raw_tile
         head_base = Int32(head_tile) * Int32(HEADS_PER_TILE)
 
         request = Int32(0)
@@ -1510,9 +1985,7 @@ class DenseMlaFp8PrefillKernel:
                 if found == Int32(0):
                     scan_begin = Int32(cu_seqlens_q[scan])
                     scan_end = Int32(cu_seqlens_q[scan + Int32(1)])
-                    scan_tiles = (scan_end - scan_begin + Int32(self.eff_query_tile - 1)) // Int32(
-                        self.eff_query_tile
-                    )
+                    scan_tiles = (scan_end - scan_begin + eff_qt - Int32(1)) // eff_qt
                     if remaining < scan_tiles:
                         request = scan
                         tile_offset = remaining
@@ -1521,14 +1994,12 @@ class DenseMlaFp8PrefillKernel:
                         remaining -= scan_tiles
                 scan += Int32(1)
             tile_valid = found
-            query_start = Int32(cu_seqlens_q[request]) + tile_offset * Int32(self.eff_query_tile)
+            query_start = Int32(cu_seqlens_q[request]) + tile_offset * eff_qt
         query_begin = Int32(cu_seqlens_q[request])
         query_end = Int32(cu_seqlens_q[request + Int32(1)])
         query_length = query_end - query_begin
         cache_length = Int32(cache_seqlens[request])
-        causal_end = cache_length - query_length + (query_start - query_begin) + Int32(
-            self.eff_query_tile
-        )
+        causal_end = cache_length - query_length + (query_start - query_begin) + eff_qt
         if causal_end < Int32(0):
             causal_end = Int32(0)
         if causal_end > cache_length:
@@ -1550,17 +2021,6 @@ class DenseMlaFp8PrefillKernel:
                 cute.arch.mbarrier_init(mbar_base + Int32(1), Int32(1))
             cute.arch.barrier()
 
-            table_base = request.to(Int64) * page_table_stride
-            if active_chunks > Int32(0) and warp_id == Int32(0):
-                self._issue_kv_half_chunk(
-                    cache_bytes, page_table, table_base, page_stride_bytes,
-                    cache_length, Int32(0), kv_addr, mbar_base + Int32(0), lane,
-                )
-
-            self._stage_query(
-                q_bytes, q_addr, query_start, head_base, total_q, tid, q_stride_row_bytes
-            )
-            cute.arch.barrier(barrier_id=1, number_of_threads=256)
             query_row_0 = query_start
             query_row_1 = query_start + Int32(1)
             query_row_2 = query_start + Int32(2)
@@ -1572,11 +2032,46 @@ class DenseMlaFp8PrefillKernel:
             if query_row_1 >= total_q or query_row_1 >= query_end or tile_valid == Int32(0):
                 query_valid_1 = Int32(0)
             query_valid_2 = Int32(1)
-            if query_row_2 >= total_q or query_row_2 >= query_end or tile_valid == Int32(0):
+            if (
+                query_row_2 >= total_q
+                or query_row_2 >= query_end
+                or tile_valid == Int32(0)
+                or eff_qt == Int32(2)
+            ):
                 query_valid_2 = Int32(0)
             query_valid_3 = Int32(1)
-            if query_row_3 >= total_q or query_row_3 >= query_end or tile_valid == Int32(0):
+            if (
+                query_row_3 >= total_q
+                or query_row_3 >= query_end
+                or tile_valid == Int32(0)
+                or eff_qt == Int32(2)
+            ):
                 query_valid_3 = Int32(0)
+            use_pair = query_valid_2 == Int32(0)
+
+            table_base = request.to(Int64) * page_table_stride
+            if active_chunks > Int32(0):
+                if warp_id == Int32(0):
+                    self._issue_kv_half_chunk(
+                        cache_bytes, page_table, table_base, page_stride_bytes,
+                        cache_length, Int32(0), kv_addr, mbar_base + Int32(0), lane,
+                    )
+                if use_pair and warp_id == Int32(1):
+                    self._issue_kv_half_chunk(
+                        cache_bytes, page_table, table_base, page_stride_bytes,
+                        cache_length, Int32(32),
+                        q_addr + Int32(2 * HEADS_PER_TILE * Q_ROW_BYTES),
+                        mbar_base + Int32(1), lane,
+                    )
+
+            num_q_rows = Int32(4)
+            if use_pair:
+                num_q_rows = Int32(2)
+            self._stage_query(
+                q_bytes, q_addr, query_start, head_base, total_q, tid,
+                q_stride_row_bytes, num_q_rows,
+            )
+            cute.arch.barrier(barrier_id=1, number_of_threads=256)
             visible_end_0 = cache_length - query_length + (query_row_0 - query_begin) + Int32(1)
             if visible_end_0 > cache_length:
                 visible_end_0 = cache_length
@@ -1597,26 +2092,37 @@ class DenseMlaFp8PrefillKernel:
                 visible_end_3 = cache_length
             if visible_end_3 < Int32(0):
                 visible_end_3 = Int32(0)
-            if query_valid_1 != Int32(0):
+            if not use_pair:
                 self._run_unified_quad(
                     q_addr, kv_addr, red_addr, mbar_base,
                     cache_bytes, page_table, table_base, page_stride_bytes, cache_length,
                     active_chunks,
                     visible_end_0, visible_end_1, visible_end_2, visible_end_3,
-                    query_row_0, query_row_1, query_row_2, query_row_3,
-                    query_valid_0, query_valid_1, query_valid_2, query_valid_3,
+                    query_row_0, query_valid_3,
+                    head_base, warp_id, lane, sm_scale_log2,
+                    output, final_lse,
+                    single_query=False,
+                )
+            elif query_valid_1 != Int32(0):
+                self._run_unified_pair(
+                    q_addr, kv_addr, red_addr, mbar_base,
+                    cache_bytes, page_table, table_base, page_stride_bytes, cache_length,
+                    active_chunks,
+                    visible_end_0, visible_end_1,
+                    query_row_0, query_row_1,
+                    query_valid_0, query_valid_1,
                     head_base, warp_id, lane, sm_scale_log2,
                     output, final_lse,
                     single_query=False,
                 )
             else:
-                self._run_unified_quad(
+                self._run_unified_pair(
                     q_addr, kv_addr, red_addr, mbar_base,
                     cache_bytes, page_table, table_base, page_stride_bytes, cache_length,
                     active_chunks,
-                    visible_end_0, visible_end_1, visible_end_2, visible_end_3,
-                    query_row_0, query_row_1, query_row_2, query_row_3,
-                    query_valid_0, query_valid_1, query_valid_2, query_valid_3,
+                    visible_end_0, visible_end_1,
+                    query_row_0, query_row_1,
+                    query_valid_0, query_valid_1,
                     head_base, warp_id, lane, sm_scale_log2,
                     output, final_lse,
                     single_query=True,
