@@ -525,7 +525,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 128
+    CODE_VERSION = 125
     A8_CODE_VERSION = 126
     FC2_WS = True
     REDUCE_MLP = True
@@ -1996,8 +1996,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
 
                 if tid >= Int32(256):
                     producer = tid - Int32(256)
-                    if cutlass.const_expr(self.quantize_pass or not self.a8):
-                        # These row predicates are invariant across units and N blocks.
+                    if cutlass.const_expr(self.quantize_pass):
                         c_prod = producer & Int32(15)
                         r_prod0 = producer >> Int32(4)
                         r_prod1 = r_prod0 + Int32(8)
@@ -2082,10 +2081,13 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                         for idx in cutlass.range_constexpr(self.mtiles):
                                             if Int32(idx) < num_live_m:
                                                 m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                                                valid = (valid_mask >> Int32(idx * 2 + half)) & Int32(1)
+                                                raw_slot = route_slots[group_base + (m * Int32(16) + r).to(Int64)]
                                                 target = stage + Int32(idx * 4096) + offset
-                                                source = source_a + ((m * Int32(16) + r).to(Int64) * Int64(128) + c.to(Int64) * Int64(8)) * Int64(2)
-                                                cp_async4_shared_global_cg_zfill(target, source, valid, Int32(1))
+                                                if raw_slot >= Int32(0) and raw_slot < max_slot:
+                                                    source = source_a + ((m * Int32(16) + r).to(Int64) * Int64(128) + c.to(Int64) * Int64(8)) * Int64(2)
+                                                    cp_async4_shared_global(target, source)
+                                                else:
+                                                    st_shared_v4_u32(target, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
                             if cutlass.const_expr(self.a8 and not self.quantize_pass):
                                 _mbar_arrive(bar_full + slot * Int32(8))
                             else:
