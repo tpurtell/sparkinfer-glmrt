@@ -856,24 +856,6 @@ class DenseMlaFp8PrefillKernel:
             if lane == Int32(0):
                 cute.arch.mbarrier_arrive(mbar_base + Int32(3) + s0)
 
-            # Snapshot the remaining P/V operands so both stages refill during PV.
-            src_p23 = kv_addr1 + bw * Int32(1024) + lane * Int32(16)
-            p2_0_q0, p2_1_q0, p2_2_q0, p2_3_q0 = ld_shared_v4_u32(src_p23)
-            if cutlass.const_expr(not single_query):
-                p2_0_q1, p2_1_q1, p2_2_q1, p2_3_q1 = ld_shared_v4_u32(src_p23 + Int32(512))
-            p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0 = ld_shared_v4_u32(src_p23 + Int32(4096))
-            if cutlass.const_expr(not single_query):
-                p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1 = ld_shared_v4_u32(src_p23 + Int32(4608))
-
-            v_lane3 = v_lane2 + Int32(16 * RECORD_BYTES)
-            v3_regs = []
-            for b in cutlass.range_constexpr(4):
-                v3_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane3 + Int32(b * 16)))
-
-            cute.arch.sync_warp()
-            if lane == Int32(0):
-                cute.arch.mbarrier_arrive(mbar_base + Int32(3) + s1)
-
             # PV ks = 0 (from preloaded v0_regs).
             for b in cutlass.range_constexpr(4):
                 f0, f1 = v0_regs[b]
@@ -924,6 +906,24 @@ class DenseMlaFp8PrefillKernel:
                         p1_0_q1, p1_1_q1, p1_2_q1, p1_3_q1, b2, b3,
                     )
 
+            # Load P(ks=2, 3) and V(ks=3) from s1, then release s1 BEFORE PV(ks=2, 3) runs!
+            src_p23 = kv_addr1 + bw * Int32(1024) + lane * Int32(16)
+            a0_q0, a1_q0, a2_q0, a3_q0 = ld_shared_v4_u32(src_p23)
+            if cutlass.const_expr(not single_query):
+                a0_q1, a1_q1, a2_q1, a3_q1 = ld_shared_v4_u32(src_p23 + Int32(512))
+            p3_0_q0, p3_1_q0, p3_2_q0, p3_3_q0 = ld_shared_v4_u32(src_p23 + Int32(4096))
+            if cutlass.const_expr(not single_query):
+                p3_0_q1, p3_1_q1, p3_2_q1, p3_3_q1 = ld_shared_v4_u32(src_p23 + Int32(4608))
+
+            v_lane3 = v_lane2 + Int32(16 * RECORD_BYTES)
+            v3_regs = []
+            for b in cutlass.range_constexpr(4):
+                v3_regs.append(ldmatrix_m16n16x1_trans_b8(v_lane3 + Int32(b * 16)))
+
+            cute.arch.sync_warp()
+            if lane == Int32(0):
+                cute.arch.mbarrier_arrive(mbar_base + Int32(3) + s1)
+
             # PV ks = 2 (from preloaded v2_regs).
             for b in cutlass.range_constexpr(4):
                 f0, f1 = v2_regs[b]
@@ -933,20 +933,20 @@ class DenseMlaFp8PrefillKernel:
                 n1 = b * 2 + 1
                 acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
                     acc0[n0 * 4], acc0[n0 * 4 + 1], acc0[n0 * 4 + 2], acc0[n0 * 4 + 3],
-                    p2_0_q0, p2_1_q0, p2_2_q0, p2_3_q0, b0, b1,
+                    a0_q0, a1_q0, a2_q0, a3_q0, b0, b1,
                 )
                 acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
                     acc0[n1 * 4], acc0[n1 * 4 + 1], acc0[n1 * 4 + 2], acc0[n1 * 4 + 3],
-                    p2_0_q0, p2_1_q0, p2_2_q0, p2_3_q0, b2, b3,
+                    a0_q0, a1_q0, a2_q0, a3_q0, b2, b3,
                 )
                 if cutlass.const_expr(not single_query):
                     acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3] = mma_m16n8k16_f32_bf16(
                         acc1[n0 * 4], acc1[n0 * 4 + 1], acc1[n0 * 4 + 2], acc1[n0 * 4 + 3],
-                        p2_0_q1, p2_1_q1, p2_2_q1, p2_3_q1, b0, b1,
+                        a0_q1, a1_q1, a2_q1, a3_q1, b0, b1,
                     )
                     acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3] = mma_m16n8k16_f32_bf16(
                         acc1[n1 * 4], acc1[n1 * 4 + 1], acc1[n1 * 4 + 2], acc1[n1 * 4 + 3],
-                        p2_0_q1, p2_1_q1, p2_2_q1, p2_3_q1, b2, b3,
+                        a0_q1, a1_q1, a2_q1, a3_q1, b2, b3,
                     )
 
             # PV ks = 3 (from preloaded v3_regs).
