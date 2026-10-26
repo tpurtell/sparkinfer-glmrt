@@ -12,10 +12,12 @@ SOURCE = Path(__file__).resolve().parents[2] / "b12x/integration/cuteafd/fp8_moe
 
 def policy(sm):
     tree = ast.parse(SOURCE.read_text())
-    names = {"_w8a8", "_mxfp4_down_a8", "_streams", "auto_large_rows", "_large_route", "prefill_forms", "_resolve"}
+    names = {"_w8a8", "_mxfp4_down_a8", "_streams", "_bf16_fp8_large_rows", "auto_large_rows",
+             "_large_route", "prefill_forms", "_resolve"}
     nodes = [n for n in tree.body if isinstance(n, ast.Assign)
              and all(isinstance(t, ast.Name) for t in n.targets)
-             and isinstance(n.value, (ast.Constant, ast.Tuple))]
+             and (isinstance(n.value, (ast.Constant, ast.Tuple))
+                  or n.targets[0].id == "_BF16_FP8_GEMM_ROWS")]
     nodes += [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     env = {"_sm121": lambda: sm == 121}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), env)
@@ -27,7 +29,8 @@ def policy(sm):
 def test_coordinator_auto_covers_decode_and_prefill(sm, weights):
     tree, env = policy(sm)
     threshold = env["auto_large_rows"](False, weights)
-    resolved = env["_resolve"]("auto", 4096, False, weights)
+    capacity = max(4096, threshold + 1)
+    resolved = env["_resolve"]("auto", capacity, False, weights)
     if weights == "nvfp4a4":
         assert resolved == "stream"  # W4A4 for every row, never an A16 GEMV.
         assert threshold == 0
@@ -134,3 +137,47 @@ def test_mxfp4_stream_preserves_native_bf16():
     assert env121["auto_large_rows"](True, "mxfp4") == 640
     assert env121["prefill_forms"](g, 640, True) == []
     assert env121["prefill_forms"](g, 1024, True) == ["w8a16"]
+
+
+def fp8_geometry(hidden, intermediate, width, activation="silu_bf16_product", limit=0.0):
+    return SimpleNamespace(hidden=hidden, intermediate=intermediate, slice=width,
+                           weights="fp8", kind="fp8", activations="a16", projection="bf16",
+                           activation=activation, swiglu_limit=limit)
+
+
+@pytest.mark.parametrize("sm,hidden,intermediate,width,activation,limit,threshold", [
+    (120, 4096, 1536, 768, "silu_post_clamp_fp32_product", 7.0, 2304),
+    (120, 6144, 2048, 1024, "silu_bf16_product", 0.0, 2752),
+    (120, 4096, 2048, 1024, "silu_bf16_product", 10.0, 4096),
+    (120, 4096, 2048, 1024, "silu_bf16_product", 0.0, 4096),
+    (121, 4096, 1536, 256, "silu_post_clamp_fp32_product", 7.0, 4096),
+    (121, 4096, 1536, 384, "silu_post_clamp_fp32_product", 7.0, 4096),
+    (121, 6144, 2048, 384, "silu_bf16_product", 0.0, 4096),
+    (121, 4096, 2048, 512, "silu_bf16_product", 10.0, 4096),
+    (121, 4096, 2048, 512, "silu_bf16_product", 0.0, 4096),
+])
+def test_measured_bf16_fp8_cutoffs(sm, hidden, intermediate, width, activation, limit, threshold):
+    _, env = policy(sm)
+    g = fp8_geometry(hidden, intermediate, width, activation, limit)
+    for form in ("auto", "w8a16"):
+        assert env["auto_large_rows"](False, "fp8", form, g) == threshold
+        assert env["_resolve"]("auto", threshold, False, "fp8", form, g) == "decode"
+        assert env["_resolve"]("auto", threshold + 1, False, "fp8", form, g) == "auto"
+        assert env["_resolve"]("prefill", 4096, False, "fp8", form, g) == "prefill"
+    assert env["auto_large_rows"](False, "fp8", "w8a8", g) == (768 if sm == 121 else 512)
+    assert env["auto_large_rows"](True, "fp8", "auto", g) == (768 if sm == 121 else 512)
+    assert env["auto_large_rows"](True, "fp8", "w8a16", g) == (1024 if sm == 121 else 2048)
+    assert env["auto_large_rows"](False, "bf16", "auto", g) == 2048
+
+
+@pytest.mark.parametrize("sm,expected", [(120, 2048), (121, 4096)])
+def test_unmeasured_bf16_fp8_defaults(sm, expected):
+    _, env = policy(sm)
+    # Qwen TP1, unknown TP widths and unknown full widths do not inherit a neighbor.
+    for g in (fp8_geometry(2560, 640, 640), fp8_geometry(4096, 2048, 768),
+              fp8_geometry(4096, 4096, 1024)):
+        assert env["auto_large_rows"](False, "fp8", "auto", g) == expected
+    g = fp8_geometry(4096, 1536, 768)  # Wrong activation contract for Step's entry.
+    assert env["auto_large_rows"](False, "fp8", "auto", g) == expected
+    g.activations = "a4"
+    assert env["auto_large_rows"](False, "fp8", "auto", g) == 2048

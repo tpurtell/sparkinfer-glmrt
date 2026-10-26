@@ -107,11 +107,24 @@ SMALL_GATE_STAGES = 3
 # CTAs per queried SM the sparsest valid routing (top_k experts) must reach for
 # the sparse gate/up N tile to be used; narrower tiles add CTAs, never K order.
 SMALL_GATE_CTAS_PER_SM = 4
-# Live rows above which ``auto`` takes the grouped GEMM (RTX PRO 6000, MiMo
-# TP4 slice, us: 1024 rows GEMV 1753 / GEMM 2059; 4096 rows 5728 / 5374).
-# W8A16 programs (``prefill="w8a16"``, and BF16 input under "auto") keep
-# these routes and thresholds exactly.
-AUTO_PREFILL_ROWS = 2048
+# BF16-input FP8 grouped GEMV -> GEMM cutoffs from cuteafd #762 (m4096,
+# identical inputs/export). Keys are (SM architecture, hidden, full intermediate,
+# stored TP-slice width), not TP count: uneven ranks use padded scale blocks.
+# Values also validate the measured (activation, SwiGLU limit) contract.
+_BF16_FP8_GEMM_ROWS = {
+    (120, 4096, 1536, 768): (2304, (("silu_post_clamp_fp32_product", 7.0),)),
+    (120, 6144, 2048, 1024): (2752, (("silu_bf16_product", 0.0),)),
+    (120, 4096, 2048, 1024): (4096, (("silu_bf16_product", 0.0), ("silu_bf16_product", 10.0))),
+    (121, 4096, 1536, 256): (4096, (("silu_post_clamp_fp32_product", 7.0),)),
+    (121, 4096, 1536, 384): (4096, (("silu_post_clamp_fp32_product", 7.0),)),
+    (121, 6144, 2048, 384): (4096, (("silu_bf16_product", 0.0),)),
+    (121, 4096, 2048, 512): (4096, (("silu_bf16_product", 0.0), ("silu_bf16_product", 10.0))),
+}
+# Unmeasured SM120 shapes keep the old 2048 cutoff (including Qwen TP1).
+# SM121 defaults conservatively to GEMV through the qualified <=4096 band;
+# unknown shapes are unmeasured, and no crossover above 4096 is claimed.
+_BF16_FP8_UNMEASURED_ROWS = 2048
+_BF16_FP8_SM121_ROWS = 4096
 # Live rows above which ``auto`` takes the W8A16 streaming route for wire
 # input (GB10, TP4 slices, us, GEMV / stream: MiMo 1024 rows 8467 / 8263, 2048
 # rows 14109 / 9185; GLM 1024 rows 12932 / 13124, 2048 rows 20433 / 14426).
@@ -236,7 +249,21 @@ def _streams(wire: bool, weights: str = "fp8", prefill: str = "auto") -> bool:
     return bool(wire) and _sm121()
 
 
-def auto_large_rows(wire: bool, weights: str = "fp8", prefill: str = "auto") -> int:
+def _bf16_fp8_large_rows(g: "Fp8MoeGeometry | None") -> int:
+    arch = 121 if _sm121() else 120
+    fallback = _BF16_FP8_SM121_ROWS if arch == 121 else _BF16_FP8_UNMEASURED_ROWS
+    if g is None:
+        return fallback
+    if g.weights != "fp8" or g.activations != "a16" or g.projection != "bf16":
+        return _BF16_FP8_UNMEASURED_ROWS
+    measured = _BF16_FP8_GEMM_ROWS.get((arch, g.hidden, g.intermediate, g.slice))
+    if measured is not None and (g.activation, g.swiglu_limit) in measured[1]:
+        return measured[0]
+    return fallback
+
+
+def auto_large_rows(wire: bool, weights: str = "fp8", prefill: str = "auto",
+                    g: "Fp8MoeGeometry | None" = None) -> int:
     """Live-row threshold of ``auto``'s large route (``stream`` or ``prefill``)."""
     if weights in ("nvfp4", "nvfp4a4"):
         return 0  # Declared W4A4 arithmetic is independent of the live-row count.
@@ -244,7 +271,11 @@ def auto_large_rows(wire: bool, weights: str = "fp8", prefill: str = "auto") -> 
         return AUTO_MXFP4_STREAM_ROWS_SM121 if _sm121() else AUTO_MXFP4_STREAM_ROWS
     if _w8a8(wire, weights, prefill):
         return AUTO_W8A8_STREAM_ROWS_SM121 if _sm121() else AUTO_W8A8_STREAM_ROWS_SM120
-    return AUTO_STREAM_ROWS if _streams(wire, weights, prefill) else AUTO_PREFILL_ROWS
+    if _streams(wire, weights, prefill):
+        return AUTO_STREAM_ROWS
+    if weights == "fp8" and not wire:
+        return _bf16_fp8_large_rows(g)
+    return _BF16_FP8_UNMEASURED_ROWS
 
 
 def _large_route(wire: bool, weights: str = "fp8", prefill: str = "auto") -> str:
@@ -255,7 +286,7 @@ def prefill_forms(g: "Fp8MoeGeometry", max_rows: int, wire: bool = True) -> list
     """The ``prefill`` forms besides "auto" whose program of ``g`` at capacity
     ``max_rows`` differs from the "auto" one (packages carry those too)."""
     def policy(prefill):
-        return (_large_route(wire, g.kind, prefill), auto_large_rows(wire, g.kind, prefill),
+        return (_large_route(wire, g.kind, prefill), auto_large_rows(wire, g.kind, prefill, g),
                 _w8a8(wire, g.kind, prefill), _mxfp4_down_a8(wire, g.kind, prefill))
 
     base = policy("auto")
@@ -439,7 +470,8 @@ def nvfp4_a4_fused() -> bool:
     return os.environ.get("B12X_NVFP4_A4_FUSED", "1") != "0"
 
 
-def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8", prefill: str = "auto") -> str:
+def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8", prefill: str = "auto",
+             g: "Fp8MoeGeometry | None" = None) -> str:
     """Select one serving route. NVFP4 always streams calibrated A4 from BF16;
     other formats retain their row-count-dependent policies."""
     # A4 is a numerical contract, not a large-row optimization. Chunk padding
@@ -454,14 +486,14 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8",
     if weights == "mxfp4":
         if route == "prefill":
             raise ValueError("MXFP4 experts have no prefill route (use stream)")
-    large = auto_large_rows(wire, weights, prefill)
+    large = auto_large_rows(wire, weights, prefill, g)
     return "decode" if route == "auto" and int(max_rows) <= large else route
 
 
 def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
                           prefill: str = "auto", mxfp4_down_a8: "bool | None" = None) -> int:
     mxfp4_down_a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
-    route = _resolve(route, rows, wire, g.kind, prefill)
+    route = _resolve(route, rows, wire, g.kind, prefill, g)
     if route == "auto":
         return max(fp8_moe_scratch_bytes(g, "decode", rows, wire, prefill, mxfp4_down_a8),
                    fp8_moe_scratch_bytes(g, _large_route(wire, g.kind, prefill), rows, wire, prefill, mxfp4_down_a8))
@@ -750,7 +782,7 @@ class _Fp8Moe:
     def __init__(self, g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
                  mxfp4_down_a8: bool = False):
         self.route = route
-        self.threshold = auto_large_rows(wire, g.kind, prefill)
+        self.threshold = auto_large_rows(wire, g.kind, prefill, g)
         self.decode = _Route(g, "decode", max_rows, wire) if route in ("decode", "auto") else None
         large = _large_route(wire, g.kind, prefill) if route == "auto" else route
         self.prefill = (_make_route(g, large, max_rows, wire, prefill, mxfp4_down_a8)
@@ -819,7 +851,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
     mxfp4_down_a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
-    requested, route = route, _resolve(route, max_rows, wire, g.kind, prefill)
+    requested, route = route, _resolve(route, max_rows, wire, g.kind, prefill, g)
     launch = _Fp8Moe(g, route, max_rows, wire, prefill, mxfp4_down_a8)
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
