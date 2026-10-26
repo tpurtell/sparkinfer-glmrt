@@ -538,7 +538,7 @@ def query_optin_shared_memory() -> int | None:
 
 
 class Exlr8GroupedKernel(Exlr8A16Kernel):
-    CODE_VERSION = 128
+    CODE_VERSION = 130
     A8_CODE_VERSION = 129
     FC2_WS = True
     REDUCE_MLP = True
@@ -1813,6 +1813,54 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     total[idx, j, v] = fma_rn_f32(acc[idx, j, v], scale, total[idx, j, v])
 
     @cute.jit
+    def fc1_ws_block_n16(self, total: cute.Tensor, a_base: Int32, b_base: Int32,
+                         lane: Int32, n16_0: Int32, width: cutlass.Constexpr,
+                         scale_addr: Int32):
+        # Serial N16 halves release 32 block accumulators so all four M16
+        # split sums can stay in registers without increasing the register cap.
+        acc = cute.make_rmem_tensor((4, 8), Float32)
+        r_m = lane & Int32(15)
+        c_half = lane >> Int32(4)
+        packed_scale = ld_shared_i32_relaxed(scale_addr).to(Uint32)
+        scale, _ = half2_to_float2_scaled(packed_scale, Float32(1.0))
+        for j in cutlass.range_constexpr(2):
+            acc.fill(Float32(0.0))
+            for k16 in cutlass.range_constexpr(8):
+                if cutlass.const_expr(width == 4):
+                    rec = b_base + (n16_0 * Int32(32) + lane) * Int32(4)
+                    b = ld_ring_u32_offset(rec, k16 * 1024 + j * 128)
+                    a = cute.arch.shuffle_sync(b, (lane + Int32(31)) & Int32(31))
+                    wa = b
+                    wb = (a << Uint32(16)) | (b >> Uint32(16))
+                else:
+                    ia, ib, shift, _ = trellis256_lane_geom_bits(lane, 0, 8, width)
+                    rec_a = b_base + (n16_0 * Int32(8 * width) + ia) * Int32(4)
+                    rec_b = b_base + (n16_0 * Int32(8 * width) + ib) * Int32(4)
+                    a = ld_ring_u32_offset(rec_a, k16 * 256 * width + j * 32 * width)
+                    b = ld_ring_u32_offset(rec_b, k16 * 256 * width + j * 32 * width)
+                    window = (a.to(Int64) << Int64(32)) | b.to(Int64)
+                    wa = (window >> shift.to(Int64)).to(Uint32)
+                    wb = (window >> (shift + Int32(4 * width)).to(Int64)).to(Uint32)
+                b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, width)
+                f0, f1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+                f2, f3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+                col = Int32(k16 * 2) + c_half
+                addr = a_base + (r_m * Int32(16) + (col ^ (r_m & Int32(7)))) * Int32(16)
+                for idx in cutlass.range_constexpr(4):
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(addr, idx * 4096)
+                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                        acc[idx, 0], acc[idx, 1], acc[idx, 2], acc[idx, 3],
+                        a0, a1, a2, a3, f0, f1)
+                    acc[idx, 0], acc[idx, 1], acc[idx, 2], acc[idx, 3] = d0, d1, d2, d3
+                    d4, d5, d6, d7 = f16_mma_m16n8k16_f32(
+                        acc[idx, 4], acc[idx, 5], acc[idx, 6], acc[idx, 7],
+                        a0, a1, a2, a3, f2, f3)
+                    acc[idx, 4], acc[idx, 5], acc[idx, 6], acc[idx, 7] = d4, d5, d6, d7
+            for idx in cutlass.range_constexpr(4):
+                for v in cutlass.range_constexpr(8):
+                    total[idx, j, v] = fma_rn_f32(acc[idx, v], scale, total[idx, j, v])
+
+    @cute.jit
     def fc1_ws_fold(self, total: cute.Tensor, fc1_addr: Int64, hdr: Int32,
                     lane: Int32, cw: Int32, split: Int32, active: cutlass.Constexpr):
         """Base FC1's split fold through the output: split 0 stores 0 + T0,
@@ -1918,7 +1966,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         proj = cw >> Int32(2)
         n16_0 = (cw & Int32(3)) * Int32(2)
         scale_base = hdr + Int32(4 * _FC1_HEADER_WORDS) + proj * Int32(4 * self.blocks)
-        if cutlass.const_expr(active <= 3 and width != 0):
+        if cutlass.const_expr((active <= 3 or not self.a8) and width != 0):
             grand = cute.make_rmem_tensor((active, 2, 8), Float32)
             grand.fill(Float32(0.0))
             for split in cutlass.range(self.splits):
@@ -1929,9 +1977,14 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         slot = seq % Int32(stages)
                         _mbar_wait(bar_full + slot * Int32(8), (seq // Int32(stages)) & Int32(1))
                         stage = ring + slot * Int32(self.fc1_stage_bytes)
-                        self.fc1_ws_block(total, stage,
-                                          stage + Int32(self.fc1_a_bytes) + proj * Int32(8192),
-                                          lane, n16_0, width, scale_base + kb * Int32(4), active)
+                        if cutlass.const_expr(active == 4 and not self.a8):
+                            self.fc1_ws_block_n16(total, stage,
+                                stage + Int32(self.fc1_a_bytes) + proj * Int32(8192),
+                                lane, n16_0, width, scale_base + kb * Int32(4))
+                        else:
+                            self.fc1_ws_block(total, stage,
+                                              stage + Int32(self.fc1_a_bytes) + proj * Int32(8192),
+                                              lane, n16_0, width, scale_base + kb * Int32(4), active)
                         _mbar_arrive(bar_empty + slot * Int32(8))
                         seq += Int32(1)
                 for idx in cutlass.range_constexpr(active):
