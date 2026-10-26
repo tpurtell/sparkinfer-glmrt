@@ -216,7 +216,7 @@ class DenseMlaFp8PrefillKernel:
             unit += Int32(32 * MATH_WARPS)
 
     @cute.jit
-    def _scores(self, q_addr: Int32, kv_addr: Int32, warp: Int32, lane: Int32):
+    def _scores(self, q_addr: Int32, kv_addr: Int32, warp: Int32, lane: Int32, q_regs):
         """Sixteen heads x this warp's candidates; returns 4*ntiles scores."""
         gid = lane >> Int32(2)
         a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
@@ -239,9 +239,13 @@ class DenseMlaFp8PrefillKernel:
                     )
                     kregs.append((k0, k1, k2, k3))
                 for blk in cutlass.range_constexpr(4):
-                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
-                        q_lane + Int32((base + blk * 16) * 2)
-                    )
+                    if cutlass.const_expr(base < 256):
+                        qi = (base // 16 + blk) * 4
+                        a0, a1, a2, a3 = (q_regs[qi], q_regs[qi + 1], q_regs[qi + 2], q_regs[qi + 3])
+                    else:
+                        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                            q_lane + Int32((base + blk * 16) * 2)
+                        )
                     for nt in cutlass.range_constexpr(self.ntiles):
                         b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(kregs[nt][blk])
                         (
@@ -319,6 +323,17 @@ class DenseMlaFp8PrefillKernel:
         )
         p_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
         p_col = (lane >> Int32(4)) * Int32(16)
+        # Reuse half the immutable query in registers across all KV chunks.
+        # Keeping only 256 dimensions leaves room for the 64 PV accumulators.
+        q_regs = cute.make_rmem_tensor(64, Uint32)
+        q_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+        q_lane = q_addr + q_row * Int32(Q_ROW_BYTES) + (lane >> Int32(4)) * Int32(16)
+        for qb in cutlass.range_constexpr(16):
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(q_lane + Int32(qb * 32))
+            q_regs[qb * 4] = a0
+            q_regs[qb * 4 + 1] = a1
+            q_regs[qb * 4 + 2] = a2
+            q_regs[qb * 4 + 3] = a3
         phase = Int32(0)
         stage = Int32(0)
         for local in cutlass.range(active_chunks, unroll=1):
@@ -327,7 +342,7 @@ class DenseMlaFp8PrefillKernel:
             kv_addr = kv_base + stage * Int32(self.kv_stage_bytes)
             cute.arch.mbarrier_wait(mbar_base + stage, phase=phase)
             if query_valid != Int32(0) and chunk_begin < visible_end:
-                qk = self._scores(q_addr, kv_addr, warp, lane)
+                qk = self._scores(q_addr, kv_addr, warp, lane, q_regs)
                 # causal mask + base-2 scale; local max per head row
                 mx0 = Float32(_MASK)
                 mx1 = Float32(_MASK)
