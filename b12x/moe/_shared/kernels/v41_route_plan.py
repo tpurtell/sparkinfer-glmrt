@@ -14,12 +14,13 @@ from cutlass import Int32, Int64, Uint32, Float32, range_constexpr
 
 
 class V41RoutePlan:
-    def __init__(self, capacity, experts=384, topk=6):
+    def __init__(self, capacity, experts=384, topk=6, *, route_metadata=False):
         assert capacity > 0 and experts > 0 and topk > 0
         self.capacity = capacity
         self.experts = experts
         self.topk = topk
         self.routes = capacity * topk
+        self.route_metadata = bool(route_metadata)
 
     # Decode capacities plan in one CTA: every live route has its own thread,
     # and each expert/route reads the (broadcast) shared route table instead
@@ -118,7 +119,7 @@ class V41RoutePlan:
                 metadata[group, 2] = base + rank
                 for pad in range(min(Int32(16), count - rank), 16):
                     metadata[group, 3 + pad] = Int32(-1)
-            metadata[group, 3 + local] = tid // self.topk
+            metadata[group, 3 + local] = tid if cutlass.const_expr(self.route_metadata) else (tid // self.topk)
             grouped_weights[base + rank] = weights[tid]
             inverse[tid] = base + rank
 
@@ -215,7 +216,7 @@ class V41RoutePlan:
             row = Int32(-1)
             if j < count:
                 pair = packed[Int64(expert) * self.routes + j]
-                row = pair // self.topk
+                row = pair if cutlass.const_expr(self.route_metadata) else (pair // self.topk)
                 grouped_weights[base + j] = weights[pair]
                 inverse[pair] = base + j
             metadata[group, 3 + local] = row
