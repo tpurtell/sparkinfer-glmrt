@@ -2670,199 +2670,272 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         )
         max_slot = rows * Int32(self.top_k)
 
-        total = cute.make_rmem_tensor((self.mtiles, 2, 8), Float32)
+        if tid >= Int32(256):
+            cute.arch.warpgroup_reg_dealloc(_FC1_PRODUCER_REGS)
+            producer = tid - Int32(256)
+            c_prod = producer & Int32(15)
+            r_prod0 = producer >> Int32(4)
+            r_prod1 = r_prod0 + Int32(8)
+            off_prod0 = (r_prod0 * Int32(16) + (c_prod ^ (r_prod0 & Int32(7)))) * Int32(16)
+            off_prod1 = (r_prod1 * Int32(16) + (c_prod ^ (r_prod1 & Int32(7)))) * Int32(16)
 
-        while task < limit_tasks:
-            group = Int32(0)
-            b_local_base = Int32(0)
-            if cutlass.const_expr(self.blocks == 48):
-                if sliced:
-                    if slice_shift == Int32(0):
-                        group = task
-                        b_local_base = Int32(0)
-                    elif two_chunks:
-                        if use_chunks:
-                            group = task >> Int32(1)
-                            b_local_base = (task & Int32(1)) * (b_pairs_sliced << Int32(1))
+            while task < limit_tasks:
+                group = Int32(0)
+                b_local_base = Int32(0)
+                if cutlass.const_expr(self.blocks == 48):
+                    if sliced:
+                        if slice_shift == Int32(0):
+                            group = task
+                            b_local_base = Int32(0)
+                        elif two_chunks:
+                            if use_chunks:
+                                group = task >> Int32(1)
+                                b_local_base = (task & Int32(1)) * (b_pairs_sliced << Int32(1))
+                            else:
+                                group = (task >> Int32(3)) if slice_shift == Int32(4) else ((task >> Int32(1)) // Int32(3))
+                                b_local_base = (task - group * pair_slices) << Int32(1)
                         else:
-                            group = (task >> Int32(3)) if slice_shift == Int32(4) else ((task >> Int32(1)) // Int32(3))
-                            b_local_base = (task - group * pair_slices) << Int32(1)
+                            q = task if use_chunks else (task >> (slice_shift - Int32(1)))
+                            group = q // Int32(3)
+                            b_local_base = ((q - group * Int32(3)) << slice_shift) if use_chunks else ((task - group * pair_slices) << Int32(1))
                     else:
-                        q = task if use_chunks else (task >> (slice_shift - Int32(1)))
-                        group = q // Int32(3)
-                        b_local_base = ((q - group * Int32(3)) << slice_shift) if use_chunks else ((task - group * pair_slices) << Int32(1))
+                        group = (task // Int32(chunks_per_group)) if use_chunks else (task // Int32(self.blocks // 2))
+                        b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((task % Int32(self.blocks // 2)) * Int32(2))
                 else:
-                    group = (task // Int32(chunks_per_group)) if use_chunks else (task // Int32(self.blocks // 2))
-                    b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((task % Int32(self.blocks // 2)) * Int32(2))
-            else:
-                group = (task // Int32(chunks_per_group)) if use_chunks else (task // pair_slices)
-                b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((task - group * pair_slices) << Int32(1))
-            block_base = slice_base + b_local_base
+                    group = (task // Int32(chunks_per_group)) if use_chunks else (task // pair_slices)
+                    b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((task - group * pair_slices) << Int32(1))
+                block_base = slice_base + b_local_base
 
-            expert = group_expert[group]
-            group_base = group.to(Int64) * Int64(self.group_rows)
-            slot_lo = route_slots[group_base + (lane & Int32(self.group_rows - 1)).to(Int64)]
-            slot_hi = (
-                route_slots[group_base + Int64(32) + lane.to(Int64)]
-                if cutlass.const_expr(self.mtiles == 4) else Int32(-1)
-            )
+                expert = group_expert[group]
+                group_base = group.to(Int64) * Int64(self.group_rows)
+                slot_lo = route_slots[group_base + (lane & Int32(self.group_rows - 1)).to(Int64)]
+                slot_hi = (
+                    route_slots[group_base + Int64(32) + lane.to(Int64)]
+                    if cutlass.const_expr(self.mtiles == 4) else Int32(-1)
+                )
 
-            out_meta = Int32(0)
-            num_live_m = Int32(0)
-            for m in cutlass.range_constexpr(self.mtiles):
-                src_m = slot_hi if (cutlass.const_expr(self.mtiles == 4) and (m >= 2)) else slot_lo
-                slot_check = cute.arch.shuffle_sync(src_m, Int32((m & 1) * 16) + (lane & Int32(15)))
-                is_live = cute.arch.vote_ballot_sync(
-                    (slot_check >= Int32(0)) & (slot_check < max_slot)) != Uint32(0)
-                if is_live:
-                    out_meta = out_meta | (Int32(m) << (num_live_m * Int32(2)))
-                    num_live_m += Int32(1)
+                out_meta = Int32(0)
+                num_live_m = Int32(0)
+                for m in cutlass.range_constexpr(self.mtiles):
+                    src_m = slot_hi if (cutlass.const_expr(self.mtiles == 4) and (m >= 2)) else slot_lo
+                    slot_check = cute.arch.shuffle_sync(src_m, Int32((m & 1) * 16) + (lane & Int32(15)))
+                    is_live = cute.arch.vote_ballot_sync(
+                        (slot_check >= Int32(0)) & (slot_check < max_slot)) != Uint32(0)
+                    if is_live:
+                        out_meta = out_meta | (Int32(m) << (num_live_m * Int32(2)))
+                        num_live_m += Int32(1)
 
-            if num_live_m > Int32(0):
-                group_inter_base = inter_addr + group.to(Int64) * (
-                    unit_limit.to(Int64) * Int64(self.group_rows * 128 * 2))
-                owned = unit_count[expert]
-
-                if tid >= Int32(256):
-                    producer = tid - Int32(256)
-                    c_prod = producer & Int32(15)
-                    r_prod0 = producer >> Int32(4)
-                    r_prod1 = r_prod0 + Int32(8)
-                    off_prod0 = (r_prod0 * Int32(16) + (c_prod ^ (r_prod0 & Int32(7)))) * Int32(16)
-                    off_prod1 = (r_prod1 * Int32(16) + (c_prod ^ (r_prod1 & Int32(7)))) * Int32(16)
-                    valid_mask = Int32(0)
-                    for idx in cutlass.range_constexpr(self.mtiles):
-                        if Int32(idx) < num_live_m:
-                            m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                            src_word = slot_hi if (cutlass.const_expr(self.mtiles == 4) and (m >= Int32(2))) else slot_lo
-                            m_lane_base = (m & Int32(1)) * Int32(16)
-                            sl0 = cute.arch.shuffle_sync(src_word, m_lane_base + r_prod0)
-                            sl1 = cute.arch.shuffle_sync(src_word, m_lane_base + r_prod1)
-                            if sl0 >= Int32(0) and sl0 < max_slot:
-                                valid_mask = valid_mask | Int32(1 << (idx * 2))
-                            if sl1 >= Int32(0) and sl1 < max_slot:
-                                valid_mask = valid_mask | Int32(1 << (idx * 2 + 1))
-                    if cutlass.const_expr(evict_first):
-                        last_reader = Int32(1)
-                        if group + Int32(1) < groups:
-                            if group_expert[group + Int32(1)] == expert:
-                                last_reader = Int32(0)
-                    if cutlass.const_expr(not self.a8):
+                if num_live_m > Int32(0):
+                    owned = unit_count[expert]
+                    if owned > Int32(0):
+                        group_inter_base = inter_addr + group.to(Int64) * (
+                            unit_limit.to(Int64) * Int64(self.group_rows * 128 * 2))
+                        valid_mask = Int32(0)
                         for idx in cutlass.range_constexpr(self.mtiles):
                             if Int32(idx) < num_live_m:
-                                if (valid_mask & Int32(1 << (idx * 2))) == Int32(0):
-                                    for s in cutlass.range_constexpr(self.FC2_STAGES):
-                                        st_shared_v4_u32(
-                                            ring + Int32(s * (self.group_rows * 256 + 16384) + idx * 4096) + off_prod0,
-                                            Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                                if (valid_mask & Int32(1 << (idx * 2 + 1))) == Int32(0):
-                                    for s in cutlass.range_constexpr(self.FC2_STAGES):
-                                        st_shared_v4_u32(
-                                            ring + Int32(s * (self.group_rows * 256 + 16384) + idx * 4096) + off_prod1,
-                                            Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                    my_w = Int32(0)
-                    my_pay = Int64(0)
-                    my_sc = Int64(0)
-                    if producer < owned:
-                        my_unit = unit_map[expert.to(Int64) * Int64(self.units) + producer.to(Int64)]
-                        my_desc = (expert.to(Int64) * Int64(self.units) + my_unit.to(Int64)) * Int64(3) + Int64(2)
-                        my_w = bits[my_desc]
-                        my_pay = pointers[my_desc * Int64(3)]
-                        my_sc = pointers[my_desc * Int64(3) + Int64(2)]
-                    for bp in cutlass.range(b_pairs):
-                        b0 = block_base + bp * Int32(2)
-                        my_s0 = Uint32(0)
-                        my_s1 = Uint32(0)
-                        if producer < owned and my_w != Int32(0):
-                            my_s0 = ld_global_b16(my_sc + b0.to(Int64) * Int64(2))
-                            my_s1 = ld_global_b16(my_sc + (b0 + Int32(1)).to(Int64) * Int64(2))
-                        for k in cutlass.range(owned):
-                            slot = sequence % Int32(self.FC2_STAGES)
-                            phase = (sequence // Int32(self.FC2_STAGES)) & Int32(1)
-                            _mbar_wait(bar_empty + slot * Int32(8), phase ^ Int32(1))
-                            stage = ring + slot * Int32(self.group_rows * 256 + 16384)
-                            source_a = group_inter_base + k.to(Int64) * Int64(self.group_rows * 128 * 2)
-                            if producer < Int32(32):
-                                width = cute.arch.shuffle_sync(my_w, k)
-                                payload = shfl_sync_idx_i64(my_pay, k)
-                                scale0 = cute.arch.shuffle_sync(my_s0, k)
-                                scale1 = cute.arch.shuffle_sync(my_s1, k)
-                                if producer == Int32(0):
-                                    meta_slot = meta + slot * Int32(16)
-                                    st_shared_i32(meta_slot, width)
-                                    st_shared_i32(meta_slot + Int32(4), scale0.to(Int32))
-                                    st_shared_i32(meta_slot + Int32(8), scale1.to(Int32))
-                                    if width != Int32(0):
-                                        nbytes = width * Int32(2048)
-                                        nbytes2 = width * Int32(4096)
-                                        _mbar_arrive_expect_tx(bar_full + slot * Int32(8), nbytes2)
-                                        if cutlass.const_expr(evict_first):
-                                            if last_reader != Int32(0):
-                                                policy = create_l2_evict_first_policy()
-                                                cp_async_bulk_g2s_mbar_l2hint(
-                                                    stage + Int32(self.group_rows * 256),
-                                                    payload + b0.to(Int64) * nbytes.to(Int64),
-                                                    nbytes2, bar_full + slot * Int32(8), policy)
+                                m = (out_meta >> Int32(idx * 2)) & Int32(3)
+                                src_word = slot_hi if (cutlass.const_expr(self.mtiles == 4) and (m >= Int32(2))) else slot_lo
+                                m_lane_base = (m & Int32(1)) * Int32(16)
+                                sl0 = cute.arch.shuffle_sync(src_word, m_lane_base + r_prod0)
+                                sl1 = cute.arch.shuffle_sync(src_word, m_lane_base + r_prod1)
+                                if sl0 >= Int32(0) and sl0 < max_slot:
+                                    valid_mask = valid_mask | Int32(1 << (idx * 2))
+                                if sl1 >= Int32(0) and sl1 < max_slot:
+                                    valid_mask = valid_mask | Int32(1 << (idx * 2 + 1))
+                        if cutlass.const_expr(evict_first):
+                            last_reader = Int32(1)
+                            if group + Int32(1) < groups:
+                                if group_expert[group + Int32(1)] == expert:
+                                    last_reader = Int32(0)
+                        for d in cutlass.range_constexpr(self.FC2_STAGES):
+                            seq_d = sequence + Int32(d)
+                            slot_d = seq_d % Int32(self.FC2_STAGES)
+                            phase_d = (seq_d // Int32(self.FC2_STAGES)) & Int32(1)
+                            _mbar_wait(bar_empty + slot_d * Int32(8), phase_d ^ Int32(1))
+                        if cutlass.const_expr(not self.a8):
+                            for idx in cutlass.range_constexpr(self.mtiles):
+                                if Int32(idx) < num_live_m:
+                                    if (valid_mask & Int32(1 << (idx * 2))) == Int32(0):
+                                        for s in cutlass.range_constexpr(self.FC2_STAGES):
+                                            st_shared_v4_u32(
+                                                ring + Int32(s * (self.group_rows * 256 + 16384) + idx * 4096) + off_prod0,
+                                                Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                                    if (valid_mask & Int32(1 << (idx * 2 + 1))) == Int32(0):
+                                        for s in cutlass.range_constexpr(self.FC2_STAGES):
+                                            st_shared_v4_u32(
+                                                ring + Int32(s * (self.group_rows * 256 + 16384) + idx * 4096) + off_prod1,
+                                                Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                        my_w = Int32(0)
+                        my_pay = Int64(0)
+                        my_sc = Int64(0)
+                        if producer < owned:
+                            my_unit = unit_map[expert.to(Int64) * Int64(self.units) + producer.to(Int64)]
+                            my_desc = (expert.to(Int64) * Int64(self.units) + my_unit.to(Int64)) * Int64(3) + Int64(2)
+                            my_w = bits[my_desc]
+                            my_pay = pointers[my_desc * Int64(3)]
+                            my_sc = pointers[my_desc * Int64(3) + Int64(2)]
+                        reuse_a = (
+                            (owned <= Int32(self.FC2_STAGES))
+                            if cutlass.const_expr(not (self.a8 and not self.quantize_pass))
+                            else False
+                        )
+                        for bp in cutlass.range(b_pairs):
+                            b0 = block_base + bp * Int32(2)
+                            my_s0 = Uint32(0)
+                            my_s1 = Uint32(0)
+                            if producer < owned and my_w != Int32(0):
+                                my_s0 = ld_global_b16(my_sc + b0.to(Int64) * Int64(2))
+                                my_s1 = ld_global_b16(my_sc + (b0 + Int32(1)).to(Int64) * Int64(2))
+                            stage_a_now = (bp == Int32(0)) if reuse_a else True
+                            for k in cutlass.range(owned):
+                                slot = sequence % Int32(self.FC2_STAGES)
+                                phase = (sequence // Int32(self.FC2_STAGES)) & Int32(1)
+                                if not stage_a_now:
+                                    _mbar_wait(bar_empty + slot * Int32(8), phase ^ Int32(1))
+                                stage_b = ring + slot * Int32(self.group_rows * 256 + 16384) + Int32(self.group_rows * 256)
+                                if producer < Int32(32):
+                                    width = cute.arch.shuffle_sync(my_w, k)
+                                    payload = shfl_sync_idx_i64(my_pay, k)
+                                    scale0 = cute.arch.shuffle_sync(my_s0, k)
+                                    scale1 = cute.arch.shuffle_sync(my_s1, k)
+                                    if producer == Int32(0):
+                                        meta_slot = meta + slot * Int32(16)
+                                        st_shared_i32(meta_slot, width)
+                                        st_shared_i32(meta_slot + Int32(4), scale0.to(Int32))
+                                        st_shared_i32(meta_slot + Int32(8), scale1.to(Int32))
+                                        if width != Int32(0):
+                                            nbytes = width * Int32(2048)
+                                            nbytes2 = width * Int32(4096)
+                                            _mbar_arrive_expect_tx(bar_full + slot * Int32(8), nbytes2)
+                                            if cutlass.const_expr(evict_first):
+                                                if last_reader != Int32(0):
+                                                    policy = create_l2_evict_first_policy()
+                                                    cp_async_bulk_g2s_mbar_l2hint(
+                                                        stage_b,
+                                                        payload + b0.to(Int64) * nbytes.to(Int64),
+                                                        nbytes2, bar_full + slot * Int32(8), policy)
+                                                else:
+                                                    cp_async_bulk_g2s_mbar(
+                                                        stage_b,
+                                                        payload + b0.to(Int64) * nbytes.to(Int64),
+                                                        nbytes2, bar_full + slot * Int32(8))
                                             else:
                                                 cp_async_bulk_g2s_mbar(
-                                                    stage + Int32(self.group_rows * 256),
+                                                    stage_b,
                                                     payload + b0.to(Int64) * nbytes.to(Int64),
                                                     nbytes2, bar_full + slot * Int32(8))
                                         else:
-                                            cp_async_bulk_g2s_mbar(
-                                                stage + Int32(self.group_rows * 256),
-                                                payload + b0.to(Int64) * nbytes.to(Int64),
-                                                nbytes2, bar_full + slot * Int32(8))
+                                            _mbar_arrive(bar_full + slot * Int32(8))
+                                if stage_a_now:
+                                    a_slot = k if reuse_a else slot
+                                    stage_a = ring + a_slot * Int32(self.group_rows * 256 + 16384)
+                                    source_a = group_inter_base + k.to(Int64) * Int64(self.group_rows * 128 * 2)
+                                    if cutlass.const_expr(self.quantize_pass):
+                                        if c_prod <= Int32(8):
+                                            for idx in cutlass.range_constexpr(self.mtiles):
+                                                if Int32(idx) < num_live_m:
+                                                    m = (out_meta >> Int32(idx * 2)) & Int32(3)
+                                                    v0 = (valid_mask >> Int32(idx * 2)) & Int32(1)
+                                                    v1 = (valid_mask >> Int32(idx * 2 + 1)) & Int32(1)
+                                                    self.stage_prequant_a_row_ws(
+                                                        stage_a + Int32(idx * 4096), r_prod0, c_prod,
+                                                        source_a + (m * Int32(16) + r_prod0).to(Int64) * Int64(256), v0)
+                                                    self.stage_prequant_a_row_ws(
+                                                        stage_a + Int32(idx * 4096), r_prod1, c_prod,
+                                                        source_a + (m * Int32(16) + r_prod1).to(Int64) * Int64(256), v1)
+                                    elif cutlass.const_expr(self.a8):
+                                        c_byte_off = c_prod.to(Int64) * Int64(16)
+                                        for idx in cutlass.range_constexpr(self.mtiles):
+                                            if Int32(idx) < num_live_m:
+                                                m = (out_meta >> Int32(idx * 2)) & Int32(3)
+                                                v0 = (valid_mask >> Int32(idx * 2)) & Int32(1)
+                                                v1 = (valid_mask >> Int32(idx * 2 + 1)) & Int32(1)
+                                                m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
+                                                self.quantize_stage_a_row(
+                                                    stage_a + Int32(idx * 4096), r_prod0, c_prod,
+                                                    m_src + r_prod0.to(Int64) * Int64(256), v0)
+                                                self.quantize_stage_a_row(
+                                                    stage_a + Int32(idx * 4096), r_prod1, c_prod,
+                                                    m_src + r_prod1.to(Int64) * Int64(256), v1)
                                     else:
+                                        c_byte_off = c_prod.to(Int64) * Int64(16)
+                                        for idx in cutlass.range_constexpr(self.mtiles):
+                                            if Int32(idx) < num_live_m:
+                                                m = (out_meta >> Int32(idx * 2)) & Int32(3)
+                                                tile_stage = stage_a + Int32(idx * 4096)
+                                                m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
+                                                if (valid_mask & Int32(1 << (idx * 2))) != Int32(0):
+                                                    cp_async4_shared_global(
+                                                        tile_stage + off_prod0,
+                                                        m_src + r_prod0.to(Int64) * Int64(256))
+                                                if (valid_mask & Int32(1 << (idx * 2 + 1))) != Int32(0):
+                                                    cp_async4_shared_global(
+                                                        tile_stage + off_prod1,
+                                                        m_src + r_prod1.to(Int64) * Int64(256))
+                                    if cutlass.const_expr(self.a8 and not self.quantize_pass):
                                         _mbar_arrive(bar_full + slot * Int32(8))
-                            if cutlass.const_expr(self.quantize_pass):
-                                if c_prod <= Int32(8):
-                                    for idx in cutlass.range_constexpr(self.mtiles):
-                                        if Int32(idx) < num_live_m:
-                                            m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                                            v0 = (valid_mask >> Int32(idx * 2)) & Int32(1)
-                                            v1 = (valid_mask >> Int32(idx * 2 + 1)) & Int32(1)
-                                            self.stage_prequant_a_row_ws(
-                                                stage + Int32(idx * 4096), r_prod0, c_prod,
-                                                source_a + (m * Int32(16) + r_prod0).to(Int64) * Int64(256), v0)
-                                            self.stage_prequant_a_row_ws(
-                                                stage + Int32(idx * 4096), r_prod1, c_prod,
-                                                source_a + (m * Int32(16) + r_prod1).to(Int64) * Int64(256), v1)
-                            elif cutlass.const_expr(self.a8):
-                                c_byte_off = c_prod.to(Int64) * Int64(16)
-                                for idx in cutlass.range_constexpr(self.mtiles):
-                                    if Int32(idx) < num_live_m:
-                                        m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                                        v0 = (valid_mask >> Int32(idx * 2)) & Int32(1)
-                                        v1 = (valid_mask >> Int32(idx * 2 + 1)) & Int32(1)
-                                        m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
-                                        self.quantize_stage_a_row(
-                                            stage + Int32(idx * 4096), r_prod0, c_prod,
-                                            m_src + r_prod0.to(Int64) * Int64(256), v0)
-                                        self.quantize_stage_a_row(
-                                            stage + Int32(idx * 4096), r_prod1, c_prod,
-                                            m_src + r_prod1.to(Int64) * Int64(256), v1)
+                                    else:
+                                        _cp_async_mbar_arrive_noinc(bar_full + slot * Int32(8))
+                                else:
+                                    _mbar_arrive(bar_full + slot * Int32(8))
+                                sequence += Int32(1)
+                task += step
+        else:
+            cute.arch.warpgroup_reg_alloc(_FC1_CONSUMER_REGS)
+            total = cute.make_rmem_tensor((self.mtiles, 2, 8), Float32)
+
+            while task < limit_tasks:
+                group = Int32(0)
+                b_local_base = Int32(0)
+                if cutlass.const_expr(self.blocks == 48):
+                    if sliced:
+                        if slice_shift == Int32(0):
+                            group = task
+                            b_local_base = Int32(0)
+                        elif two_chunks:
+                            if use_chunks:
+                                group = task >> Int32(1)
+                                b_local_base = (task & Int32(1)) * (b_pairs_sliced << Int32(1))
                             else:
-                                c_byte_off = c_prod.to(Int64) * Int64(16)
-                                for idx in cutlass.range_constexpr(self.mtiles):
-                                    if Int32(idx) < num_live_m:
-                                        m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                                        tile_stage = stage + Int32(idx * 4096)
-                                        m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
-                                        if (valid_mask & Int32(1 << (idx * 2))) != Int32(0):
-                                            cp_async4_shared_global(
-                                                tile_stage + off_prod0,
-                                                m_src + r_prod0.to(Int64) * Int64(256))
-                                        if (valid_mask & Int32(1 << (idx * 2 + 1))) != Int32(0):
-                                            cp_async4_shared_global(
-                                                tile_stage + off_prod1,
-                                                m_src + r_prod1.to(Int64) * Int64(256))
-                            if cutlass.const_expr(self.a8 and not self.quantize_pass):
-                                _mbar_arrive(bar_full + slot * Int32(8))
-                            else:
-                                _cp_async_mbar_arrive_noinc(bar_full + slot * Int32(8))
-                            sequence += Int32(1)
+                                group = (task >> Int32(3)) if slice_shift == Int32(4) else ((task >> Int32(1)) // Int32(3))
+                                b_local_base = (task - group * pair_slices) << Int32(1)
+                        else:
+                            q = task if use_chunks else (task >> (slice_shift - Int32(1)))
+                            group = q // Int32(3)
+                            b_local_base = ((q - group * Int32(3)) << slice_shift) if use_chunks else ((task - group * pair_slices) << Int32(1))
+                    else:
+                        group = (task // Int32(chunks_per_group)) if use_chunks else (task // Int32(self.blocks // 2))
+                        b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((task % Int32(self.blocks // 2)) * Int32(2))
                 else:
+                    group = (task // Int32(chunks_per_group)) if use_chunks else (task // pair_slices)
+                    b_local_base = ((task % Int32(chunks_per_group)) * Int32(b_chunk_const)) if use_chunks else ((task - group * pair_slices) << Int32(1))
+
+                expert = group_expert[group]
+                group_base = group.to(Int64) * Int64(self.group_rows)
+                slot_lo = route_slots[group_base + (lane & Int32(self.group_rows - 1)).to(Int64)]
+                slot_hi = (
+                    route_slots[group_base + Int64(32) + lane.to(Int64)]
+                    if cutlass.const_expr(self.mtiles == 4) else Int32(-1)
+                )
+
+                out_meta = Int32(0)
+                num_live_m = Int32(0)
+                for m in cutlass.range_constexpr(self.mtiles):
+                    src_m = slot_hi if (cutlass.const_expr(self.mtiles == 4) and (m >= 2)) else slot_lo
+                    slot_check = cute.arch.shuffle_sync(src_m, Int32((m & 1) * 16) + (lane & Int32(15)))
+                    is_live = cute.arch.vote_ballot_sync(
+                        (slot_check >= Int32(0)) & (slot_check < max_slot)) != Uint32(0)
+                    if is_live:
+                        out_meta = out_meta | (Int32(m) << (num_live_m * Int32(2)))
+                        num_live_m += Int32(1)
+
+                if num_live_m > Int32(0):
+                    owned = unit_count[expert]
+                    reuse_a = (
+                        (owned <= Int32(self.FC2_STAGES))
+                        if cutlass.const_expr(not (self.a8 and not self.quantize_pass))
+                        else False
+                    )
                     for idx in cutlass.range_constexpr(self.mtiles):
                         if Int32(idx) < num_live_m:
                             m = (out_meta >> Int32(idx * 2)) & Int32(3)
@@ -2881,18 +2954,71 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             slot = sequence % Int32(self.FC2_STAGES)
                             phase = (sequence // Int32(self.FC2_STAGES)) & Int32(1)
                             _mbar_wait(bar_full + slot * Int32(8), phase)
-                            cur_a = ring + slot * Int32(self.group_rows * 256 + 16384)
-                            cur_b = cur_a + Int32(self.group_rows * 256)
+                            a_slot = k if reuse_a else slot
+                            cur_a = ring + a_slot * Int32(self.group_rows * 256 + 16384)
+                            cur_b = ring + slot * Int32(self.group_rows * 256 + 16384) + Int32(self.group_rows * 256)
                             meta_slot = meta + slot * Int32(16)
                             w_k = ld_shared_i32_relaxed(meta_slot)
                             scale0 = ld_shared_i32_relaxed(meta_slot + Int32(4)).to(Uint32)
                             scale1 = ld_shared_i32_relaxed(meta_slot + Int32(8)).to(Uint32)
-                            if w_k == Int32(2):
-                                self.accumulate_fc2_pair(total, cur_a, cur_b, lane, warp, 2, scale0, scale1, num_live_m)
-                            elif w_k == Int32(3):
-                                self.accumulate_fc2_pair(total, cur_a, cur_b, lane, warp, 3, scale0, scale1, num_live_m)
-                            elif w_k == Int32(4):
-                                self.accumulate_fc2_pair(total, cur_a, cur_b, lane, warp, 4, scale0, scale1, num_live_m)
+                            if cutlass.const_expr(self.mtiles == 1):
+                                if num_live_m >= Int32(1):
+                                    if w_k == Int32(2):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 2, scale0, scale1, 1)
+                                    elif w_k == Int32(3):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 3, scale0, scale1, 1)
+                                    elif w_k == Int32(4):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 4, scale0, scale1, 1)
+                            elif cutlass.const_expr(self.mtiles == 2):
+                                if num_live_m >= Int32(2):
+                                    if w_k == Int32(2):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 2, scale0, scale1, 2)
+                                    elif w_k == Int32(3):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 3, scale0, scale1, 2)
+                                    elif w_k == Int32(4):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 4, scale0, scale1, 2)
+                                else:
+                                    nm1 = bind_loop_i32(num_live_m, w_k)
+                                    if nm1 == Int32(1):
+                                        if w_k == Int32(2):
+                                            self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 2, scale0, scale1, 1)
+                                        elif w_k == Int32(3):
+                                            self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 3, scale0, scale1, 1)
+                                        elif w_k == Int32(4):
+                                            self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 4, scale0, scale1, 1)
+                            else:
+                                if num_live_m >= Int32(4):
+                                    if w_k == Int32(2):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 2, scale0, scale1, 4)
+                                    elif w_k == Int32(3):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 3, scale0, scale1, 4)
+                                    elif w_k == Int32(4):
+                                        self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 4, scale0, scale1, 4)
+                                else:
+                                    nm1 = bind_loop_i32(num_live_m, w_k)
+                                    if nm1 == Int32(1):
+                                        if w_k == Int32(2):
+                                            self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 2, scale0, scale1, 1)
+                                        elif w_k == Int32(3):
+                                            self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 3, scale0, scale1, 1)
+                                        elif w_k == Int32(4):
+                                            self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 4, scale0, scale1, 1)
+                                    else:
+                                        nm2 = bind_loop_i32(nm1, slot)
+                                        if nm2 == Int32(2):
+                                            if w_k == Int32(2):
+                                                self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 2, scale0, scale1, 2)
+                                            elif w_k == Int32(3):
+                                                self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 3, scale0, scale1, 2)
+                                            elif w_k == Int32(4):
+                                                self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 4, scale0, scale1, 2)
+                                        elif nm2 == Int32(3):
+                                            if w_k == Int32(2):
+                                                self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 2, scale0, scale1, 3)
+                                            elif w_k == Int32(3):
+                                                self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 3, scale0, scale1, 3)
+                                            elif w_k == Int32(4):
+                                                self.accumulate_fc2_pair_fixed_m(total, cur_a, cur_b, lane, warp, 4, scale0, scale1, 3)
                             _mbar_arrive(bar_empty + slot * Int32(8))
                             sequence += Int32(1)
 
@@ -2938,8 +3064,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                             if row_valid:
                                                 st_global_v2_f32(row_addr, total[idx, j, 2 * v], total[idx, j, 2 * v + 1])
                                                 st_global_v2_f32(row_addr + Int64(32), total[idx, j, 4 + 2 * v], total[idx, j, 4 + 2 * v + 1])
-            cute.arch.sync_threads()
-            task += step
+                task += step
 
     @cute.kernel
     def grouped_fc2_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
