@@ -15,6 +15,8 @@ _CONST_NAMES = {
     "_FC1_PRODUCER_REGS",
     "_FC1_CONSUMER_REGS",
     "_FC1_CTA_MAX_REGS",
+    "_FC1_FULL_GRAND_PRODUCER_REGS",
+    "_FC1_FULL_GRAND_CONSUMER_REGS",
 }
 _FUNC_NAMES = {
     "slice_blocks_for_shift",
@@ -51,6 +53,26 @@ reduce_slice_task_mapping = HELPERS["reduce_slice_task_mapping"]
 validate_fc2_slice_geometry = HELPERS["validate_fc2_slice_geometry"]
 
 
+def test_fc2_nonreuse_stages_always_wait_for_empty_slot():
+    kernel = next(node for node in ast.walk(TREE)
+                  if isinstance(node, ast.FunctionDef) and node.name == "grouped_fc2_ws_kernel")
+    waits = [node for node in ast.walk(kernel) if isinstance(node, ast.If)
+             and {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+             >= {"reuse_a", "stage_a_now", "slice_blocks"}]
+    assert len(waits) == 1
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "_mbar_wait" for node in ast.walk(waits[0]))
+    condition = compile(ast.Expression(waits[0].test), str(SOURCE), "eval")
+    for owned in (1, 3, 4, 8, 16):
+        for slice_blocks in (2, 6, 12, 16, 24, 48):
+            reuse_a = owned <= 3 and slice_blocks > 2
+            for pair in range(slice_blocks // 2):
+                stage_a_now = pair == 0 if reuse_a else True
+                wait = eval(condition, {"Int32": int, "reuse_a": reuse_a,
+                                       "stage_a_now": stage_a_now, "slice_blocks": slice_blocks})
+                assert bool(wait) == (not reuse_a or pair > 0)
+
+
 def test_fc1_ws_register_budget_within_ctapool():
     producer_regs = HELPERS["_FC1_PRODUCER_REGS"]
     consumer_regs = HELPERS["_FC1_CONSUMER_REGS"]
@@ -59,6 +81,11 @@ def test_fc1_ws_register_budget_within_ctapool():
     assert consumer_regs == 208
     assert cta_max_regs == 3 * 168 == 504
     assert producer_regs + 2 * consumer_regs == cta_max_regs
+    full_producer_regs = HELPERS["_FC1_FULL_GRAND_PRODUCER_REGS"]
+    full_consumer_regs = HELPERS["_FC1_FULL_GRAND_CONSUMER_REGS"]
+    assert full_producer_regs == 40
+    assert full_consumer_regs == 232
+    assert full_producer_regs + 2 * full_consumer_regs == cta_max_regs
 
 
 @pytest.mark.parametrize(
@@ -179,13 +206,13 @@ def test_every_slice_shift_fc2_task_mapping_bijective_and_terminating(
     expected_domain = {(g, b) for g in range(groups) for b in range(slice_blocks)}
 
     # 1. Warp-specialized paired-N256 FC2 kernel (grouped_fc2_ws_kernel)
-    limit_ws, b_pairs, use_chunks_ws, ws_tasks = fc2_ws_slice_task_mapping(
+    limit_ws, use_chunks_ws, ws_tasks = fc2_ws_slice_task_mapping(
         groups, step, slice_blocks, slice_shift, blocks=48
     )
     assert len(ws_tasks) == limit_ws
     covered_ws = [
         (g, b_local_base + 2 * pair_idx + j)
-        for g, b_local_base in ws_tasks
+        for g, b_local_base, b_pairs in ws_tasks
         for pair_idx in range(b_pairs)
         for j in range(2)
     ]
@@ -205,6 +232,32 @@ def test_every_slice_shift_fc2_task_mapping_bijective_and_terminating(
     ]
     assert len(covered_f) == groups * slice_blocks
     assert set(covered_f) == expected_domain
+
+
+@pytest.mark.parametrize("step", [48, 170, 188])
+@pytest.mark.parametrize("slice_shift,slice_blocks", [(0, 48), (0, 2), (1, 6), (2, 12), (3, 24), (4, 16)])
+def test_fc2_ws_bulk_tail_boundaries_and_snake_order(step, slice_shift, slice_blocks):
+    tail_waves = 2 if slice_blocks > 24 else (1 if slice_blocks == 24 else 0)
+    threshold = (tail_waves + 1) * step
+    samples = {0, 1, step - 1, step, step + 1, threshold - 1, threshold,
+               threshold + 1, threshold + step - 1, threshold + step, 512, 768}
+    for groups in sorted(samples):
+        limit, use_chunks, tasks = fc2_ws_slice_task_mapping(
+            groups, step, slice_blocks, slice_shift
+        )
+        expected_bulk = ((groups - tail_waves * step) // step) * step if groups >= threshold else 0
+        assert len(tasks) == limit
+        bulk_tasks = [(g, b, n) for g, b, n in tasks if g < expected_bulk]
+        assert set(bulk_tasks) == {(g, 0, slice_blocks // 2) for g in range(expected_bulk)}
+        coverage = [(g, b + 2 * p + j) for g, b, n in tasks for p in range(n) for j in range(2)]
+        assert len(coverage) == groups * slice_blocks
+        assert set(coverage) == {(g, b) for g in range(groups) for b in range(slice_blocks)}
+        reverse_limit, reverse_chunks, reversed_tasks = fc2_ws_slice_task_mapping(
+            groups, step, slice_blocks, slice_shift, slice_base=slice_blocks
+        )
+        assert (reverse_limit, reverse_chunks) == (limit, use_chunks)
+        assert reversed_tasks == ([(groups - 1 - g, b, n) for g, b, n in tasks]
+                                  if slice_blocks < 48 else tasks)
 
 
 @pytest.mark.parametrize("slice_shift", [0, 1, 2, 3, 4])
