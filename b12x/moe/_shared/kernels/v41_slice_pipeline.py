@@ -54,7 +54,10 @@ class V41SlicePipeline:
         rows: Int32,
         stream: cuda.CUstream,
     ):
-        self.publish(live, rows, partial).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        slots = Int32(0)
+        if cutlass.const_expr(self.ordered_groups):
+            slots = (runtime_num_sm() + self.compute.slices - 1) // self.compute.slices + 1
+        self.publish(live, rows, partial, slots).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
         self.plan(
             ids,
             routing,
@@ -96,11 +99,11 @@ class V41SlicePipeline:
             self.reduce(partial, output, inverse, live, stream, rows)
 
     @cute.kernel
-    def publish(self, live: cute.Tensor, rows: Int32, partial: cute.Tensor):
+    def publish(self, live: cute.Tensor, rows: Int32, partial: cute.Tensor, slots: Int32):
         if cute.arch.thread_idx()[0] == 0:
             live[0] = rows
         if cutlass.const_expr(self.ordered_groups):
-            for i in range(cute.arch.thread_idx()[0], 2 * self.compute.max_slots(), 32):
+            for i in range(cute.arch.thread_idx()[0], 2 * slots, 32):
                 partial[i] = Float32(0)
 
     @cute.kernel

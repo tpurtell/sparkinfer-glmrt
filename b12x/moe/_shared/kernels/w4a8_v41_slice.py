@@ -89,9 +89,6 @@ class V41FusedSliceKernel:
             "slice exceeds packed storage"
         )
 
-    def max_slots(self):
-        return (188 + self.slices - 1) // self.slices + 1
-
     @cute.jit
     def __call__(
         self,
