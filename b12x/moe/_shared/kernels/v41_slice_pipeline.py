@@ -11,7 +11,11 @@ import cuda.bindings.driver as cuda
 from cutlass import Int32, Int64, Float32
 from b12x._lib.utils import runtime_num_sm
 from b12x.moe._shared.kernels.v41_route_plan import V41RoutePlan, V41SliceReduce
-from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
+from b12x.moe._shared.kernels.w4a8_v41_slice import (
+    V41FusedSliceKernel,
+    V41SliceFc1Kernel,
+    V41SliceFc2Kernel,
+)
 
 
 class V41SlicePipeline:
@@ -22,10 +26,20 @@ class V41SlicePipeline:
         self.atomic_tokens = atomic_tokens
         self.experts = experts
         self.topk = topk
-        self.plan = V41RoutePlan(capacity, experts, topk)
-        self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=atomic_tokens,
-                                           intermediate=intermediate, hidden=hidden, exact_storage=exact_storage,
-                                           fc2_n_splits=fc2_n_splits, scale_codes=scale_codes)
+        self.plan = V41RoutePlan(capacity, experts, topk, route_metadata=not atomic_tokens)
+        if atomic_tokens:
+            self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=True,
+                                               intermediate=intermediate, hidden=hidden, exact_storage=exact_storage,
+                                               fc2_n_splits=fc2_n_splits, scale_codes=scale_codes)
+            self.fc1 = None
+            self.fc2 = None
+        else:
+            self.compute = None
+            self.fc1 = V41SliceFc1Kernel(width, capacity, topk=topk, intermediate=intermediate,
+                                         hidden=hidden, exact_storage=exact_storage, scale_codes=scale_codes)
+            self.fc2 = V41SliceFc2Kernel(width, capacity, topk=topk, intermediate=intermediate,
+                                         hidden=hidden, exact_storage=exact_storage, fc2_n_splits=fc2_n_splits,
+                                         scale_codes=scale_codes)
         self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate, hidden=hidden)
 
     @cute.jit
@@ -64,31 +78,29 @@ class V41SlicePipeline:
             inverse,
             stream,
         )
+        groups = max(1, min(rows * self.topk, self.experts + max(rows * self.topk - self.experts, 0) // 16))
         if cutlass.const_expr(self.atomic_tokens):
             self.clear_output(output, rows).launch(
                 grid=(max(1, (rows * self.hidden + 255) // 256), 1, 1),
                 block=(256, 1, 1), stream=stream,
             )
-        if cutlass.const_expr(self.atomic_tokens):
-            destination = output
+            self.compute(
+                x,
+                xs,
+                w13,
+                s13,
+                w2,
+                s2,
+                grouped,
+                output,
+                rows,
+                stream,
+                metadata,
+                groups,
+            )
         else:
-            destination = partial
-        self.compute(
-            x,
-            xs,
-            w13,
-            s13,
-            w2,
-            s2,
-            grouped,
-            destination,
-            rows,
-            stream,
-            metadata,
-            max(1, min(rows * self.topk, self.experts + max(rows * self.topk - self.experts, 0) // 16)),
-        )
-        if cutlass.const_expr(not self.atomic_tokens):
-            self.reduce(partial, output, inverse, live, stream, rows)
+            self.fc1(x, xs, w13, s13, grouped, partial, metadata, groups, stream)
+            self.fc2(w2, s2, partial, output, metadata, inverse, live, groups, stream)
 
     @cute.kernel
     def publish(self, live: cute.Tensor, rows: Int32):

@@ -64,3 +64,56 @@ def test_token_accumulation(width):
         assert (tensors[-1] == 12345).all()
 
     _check_grouped_slices(width, after_case=compare)
+
+
+@pytest.mark.parametrize("width", [64, 128, 192])
+def test_ordered_slice_pipeline_exact(width):
+    state = {}
+
+    def compare(**case):
+        capacity, h, n, routes = 80, 5120, 576, 480
+        planes = (n + width - 1) // width
+        partial_cols = width // 4 + width // 32
+        packed, wire, ids, weights = case["native_inputs"]
+        if not state:
+            tensors = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in [
+                (routes, torch.int32), (routes, torch.float32), (1, torch.int32),
+                (384 * routes, torch.int32), (384, torch.int32), ((384, 2), torch.int32),
+                ((routes, 19), torch.int32), (routes, torch.float32),
+                (routes, torch.int32), ((planes, routes, partial_cols), torch.float32),
+                ((routes, h), torch.float32),
+            ]]
+            args = [from_dlpack(t, assumed_align=16) for t in [
+                wire[:, :h].view(torch.uint32), wire[:, h:], *packed, *tensors,
+            ]]
+            fn = cute.compile(V41SlicePipeline(capacity, width, atomic_tokens=False),
+                              *args, cutlass.Int32(capacity), current_cuda_stream())
+            state.update(tensors=tensors, args=args, fn=fn, addresses=[t.data_ptr() for t in tensors])
+        tensors, args, fn = state["tensors"], state["args"], state["fn"]
+        m = case["rows"]
+        tensors[0].fill_(-1)
+        tensors[0][:m * 6].copy_(ids.flatten())
+        tensors[1].fill_(float("nan"))
+        tensors[1][:m * 6].copy_(weights.flatten())
+        partial = torch.zeros_like(case["out"][0, :m * 6])
+        for plane in case["out"]:
+            partial.add_(plane[:m * 6])
+        ordered = torch.empty(m, 6, h, device="cuda")
+        pair = case["pair_gpu"]
+        ordered[pair[:, 0], pair[:, 1]] = partial
+        fn(*args, m, current_cuda_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn(*args, m, current_cuda_stream())
+        for _ in range(3):
+            tensors[-1].fill_(12345)
+            before = torch.cuda.memory_allocated()
+            graph.replay()
+            assert torch.cuda.memory_allocated() == before
+            actual = tensors[-1][:m * 6].reshape(m, 6, h)
+            assert torch.equal(actual.view(torch.int32), ordered.view(torch.int32))
+            assert (tensors[-1][m * 6:] == 12345).all()
+            assert [t.data_ptr() for t in tensors] == state["addresses"]
+        graph.reset()
+
+    _check_grouped_slices(width, after_case=compare)
