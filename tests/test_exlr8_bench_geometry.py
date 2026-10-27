@@ -302,6 +302,8 @@ def test_audit_existing_arm_inventory_and_balanced_order():
     assert all((knobs.get("FC2_STAGES", 4) & (knobs.get("FC2_STAGES", 4) - 1)) == 0
                for _, _, knobs in prefill)
     decode = scope["audit_specs"](True)
+    assert decode[:3] == [("current", 16, {}), ("current_control", 16, {}),
+                          ("candidate", 16, {})]
     assert {label for label, _, _ in decode} >= {"k1", "k23", "compact", "current"}
     labels = [label for label, _, _ in prefill]
     orders = [scope["audit_order"](labels, r) for r in range(len(labels))]
@@ -405,8 +407,33 @@ def test_grouped_frozen_audit_selects_l2_abi():
     compile_arm = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "audit_compile")
     keyed = next(n for n in compile_arm.body if isinstance(n, ast.FunctionDef) and n.name == "keyed")
     branch = next(n for n in keyed.body if isinstance(n, ast.If))
-    assert "wrapper.runtime_l2 = engine_aot" in ast.unparse(branch)
+    assert "wrapper.runtime_l2 = engine_aot or decode" in ast.unparse(branch)
     assert "wrapper.core = reference_type" in ast.unparse(branch)
+
+
+@pytest.mark.parametrize("audit,engine_aot,rows,allowed", [
+    (True, False, [16, 24, 32, 48, 64], True),
+    (False, False, [16], False),
+    (True, True, [16, 2752, 4096], False),
+    (False, True, [16, 2752, 4096], False),
+    (False, True, [65, 2752, 4096], True),
+])
+def test_frozen_grouped_decode_requires_audit_only(audit, engine_aot, rows, allowed):
+    from types import SimpleNamespace
+    source = SOURCE.with_name("bench_exlr8_grouped_prefill.py")
+    tree = ast.parse(source.read_text())
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "audit_main")
+    guard = next(n for n in main.body if isinstance(n, ast.If)
+                 and ast.unparse(n.test).startswith("reference_core and min(rows_list)"))
+    scope = dict(reference_core=object(), rows_list=rows,
+                 args=SimpleNamespace(audit=audit, engine_aot=engine_aot))
+    code = compile(ast.Module(body=[guard], type_ignores=[]), str(source), "exec")
+    if allowed:
+        exec(code, scope)
+    else:
+        with pytest.raises(ValueError, match="requires --audit without --engine-aot"):
+            exec(code, scope)
+    assert 'if not {2752, 4096} <= set(rows_list):' in source.read_text()
 
 
 @pytest.mark.parametrize("world", [1, 2, 4, 6, 8])

@@ -189,7 +189,8 @@ def load_wave(routes_arg):
 def audit_specs(decode):
     """Existing implementations/knobs only, without changing partial precision."""
     if decode:
-        return [("current", 16, {}), ("k23", 16, {}),
+        return [("current", 16, {}), ("current_control", 16, {}),
+                ("candidate", 16, {}), ("k23", 16, {}),
                 ("k1", 16, {}), ("compact", 16, {}),
                 ("group16", 16, {}), ("group32", 32, {}),
                 ("group64", 64, {})]
@@ -286,7 +287,7 @@ def audit_compile(label, group_rows, knobs, capacity, decode, reference=None, en
             reference_type, identity = reference
             if not grouped or knobs:
                 raise ValueError("frozen reference requires an unmodified grouped arm")
-            wrapper.runtime_l2 = engine_aot
+            wrapper.runtime_l2 = engine_aot or decode
             wrapper.core = reference_type(6144, 16, 8, capacity, group_rows,
                                           fc2_f32=decode)
             arm_source = (identity,)
@@ -373,8 +374,8 @@ def audit_main(args):
         if not {2752, 4096} <= set(rows_list):
             raise ValueError("Spark duel requires shipped rows 2752 and 4096")
         torch.cuda.set_per_process_memory_fraction(0.25)
-    if reference_core and min(rows_list) <= 64:
-        raise ValueError("frozen grouped reference is prefill-only")
+    if reference_core and min(rows_list) <= 64 and (args.engine_aot or not args.audit):
+        raise ValueError("frozen grouped decode reference requires --audit without --engine-aot")
     waves = load_route_waves(args.routes or "realistic")
     indices = [int(i) for i in args.wave_indices.split(",")]
     manifest_path = Path(args.manifest).resolve()
