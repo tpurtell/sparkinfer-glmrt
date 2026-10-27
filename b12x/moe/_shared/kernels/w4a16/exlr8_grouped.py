@@ -2760,6 +2760,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                         st_shared_v4_u32(
                                             ring + Int32(s * (self.group_rows * 256 + 16384) + idx * 4096) + off_prod1,
                                             Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                    a_tag0 = Int32(0)
+                    a_tag1 = Int32(0)
+                    a_tag2 = Int32(0)
                     my_w = Int32(0)
                     my_pay = Int64(0)
                     my_sc = Int64(0)
@@ -2843,20 +2846,32 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                             stage + Int32(idx * 4096), r_prod1, c_prod,
                                             m_src + r_prod1.to(Int64) * Int64(256), v1)
                             else:
-                                c_byte_off = c_prod.to(Int64) * Int64(16)
-                                for idx in cutlass.range_constexpr(self.mtiles):
-                                    if Int32(idx) < num_live_m:
-                                        m = (out_meta >> Int32(idx * 2)) & Int32(3)
-                                        tile_stage = stage + Int32(idx * 4096)
-                                        m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
-                                        if (valid_mask & Int32(1 << (idx * 2))) != Int32(0):
-                                            cp_async4_shared_global(
-                                                tile_stage + off_prod0,
-                                                m_src + r_prod0.to(Int64) * Int64(256))
-                                        if (valid_mask & Int32(1 << (idx * 2 + 1))) != Int32(0):
-                                            cp_async4_shared_global(
-                                                tile_stage + off_prod1,
-                                                m_src + r_prod1.to(Int64) * Int64(256))
+                                a_tag = a_tag2
+                                if slot == Int32(0):
+                                    a_tag = a_tag0
+                                elif slot == Int32(1):
+                                    a_tag = a_tag1
+                                if a_tag != k + Int32(1):
+                                    c_byte_off = c_prod.to(Int64) * Int64(16)
+                                    for idx in cutlass.range_constexpr(self.mtiles):
+                                        if Int32(idx) < num_live_m:
+                                            m = (out_meta >> Int32(idx * 2)) & Int32(3)
+                                            tile_stage = stage + Int32(idx * 4096)
+                                            m_src = source_a + m.to(Int64) * Int64(4096) + c_byte_off
+                                            if (valid_mask & Int32(1 << (idx * 2))) != Int32(0):
+                                                cp_async4_shared_global(
+                                                    tile_stage + off_prod0,
+                                                    m_src + r_prod0.to(Int64) * Int64(256))
+                                            if (valid_mask & Int32(1 << (idx * 2 + 1))) != Int32(0):
+                                                cp_async4_shared_global(
+                                                    tile_stage + off_prod1,
+                                                    m_src + r_prod1.to(Int64) * Int64(256))
+                                    if slot == Int32(0):
+                                        a_tag0 = k + Int32(1)
+                                    elif slot == Int32(1):
+                                        a_tag1 = k + Int32(1)
+                                    else:
+                                        a_tag2 = k + Int32(1)
                             if cutlass.const_expr(self.a8 and not self.quantize_pass):
                                 _mbar_arrive(bar_full + slot * Int32(8))
                             else:
