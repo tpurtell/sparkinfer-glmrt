@@ -16,17 +16,20 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import V41FusedSliceKernel
 
 class V41SlicePipeline:
     def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576,
-                 hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False):
+                 hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False, ordered_groups=False):
         self.capacity = capacity
         self.hidden = hidden
+        self.ordered_groups = ordered_groups
         self.atomic_tokens = atomic_tokens
         self.experts = experts
         self.topk = topk
         self.plan = V41RoutePlan(capacity, experts, topk)
         self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=atomic_tokens,
                                            intermediate=intermediate, hidden=hidden, exact_storage=exact_storage,
-                                           fc2_n_splits=fc2_n_splits, scale_codes=scale_codes)
-        self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate, hidden=hidden)
+                                           fc2_n_splits=fc2_n_splits, scale_codes=scale_codes,
+                                           ordered_groups=self.ordered_groups, topk=topk)
+        self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate, hidden=hidden,
+                                     already_folded=self.ordered_groups)
 
     @cute.jit
     def __call__(
@@ -69,7 +72,7 @@ class V41SlicePipeline:
                 grid=(max(1, (rows * self.hidden + 255) // 256), 1, 1),
                 block=(256, 1, 1), stream=stream,
             )
-        if cutlass.const_expr(self.atomic_tokens):
+        if cutlass.const_expr(self.atomic_tokens or self.ordered_groups):
             destination = output
         else:
             destination = partial
@@ -86,6 +89,7 @@ class V41SlicePipeline:
             stream,
             metadata,
             max(1, min(rows * self.topk, self.experts + max(rows * self.topk - self.experts, 0) // 16)),
+            inverse,
         )
         if cutlass.const_expr(not self.atomic_tokens):
             self.reduce(partial, output, inverse, live, stream, rows)
@@ -112,14 +116,14 @@ class V41DraftSlicePipeline:
     # Qualified model recipe; explicit widths remain available for comparison.
     DEFAULT_WIDTH = 192
 
-    def __init__(self, capacity, width, *, scale_codes=False):
+    def __init__(self, capacity, width, *, scale_codes=False, ordered_groups=False):
         from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
         self.quant = _MXFP8RowsQuantLaunch(
             5120, cutlass.BFloat16, 4, 256, 32, False, 1e-4, wire_rows=True
         )
         self.pipeline = V41SlicePipeline(
             capacity, width, experts=128, topk=3, intermediate=2304,
-            scale_codes=scale_codes
+            scale_codes=scale_codes, ordered_groups=ordered_groups
         )
 
     @cute.jit
