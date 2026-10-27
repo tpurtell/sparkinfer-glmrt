@@ -68,7 +68,7 @@ def test_grouped_exact_slices(routing_case):
 
 def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
                           capacity=80, row_counts=None, experts=None,
-                          exact_storage=False, routing_case="shared"):
+                          exact_storage=False, routing_case="shared", scale_codes=False):
     if -(-n // width) * width > (n + 127) // 128 * 128:
         pytest.skip("slice width does not tile this intermediate within its packed storage")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
@@ -110,6 +110,12 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
         s2 = _e8m0_scale_to_w4a8_sfb_inplace(
             scales["w2"].clone(), weight_E=experts, rows=h, k_dim=n
         )
+        if scale_codes:
+            # The served V4.1 layout: lossless UE8M0 offset codes per N256 tile.
+            from b12x.moe._shared.scale_codes import pack_scale_codes
+            s13 = pack_scale_codes(torch.cat([scales["w3"], scales["w1"]], 1),
+                                   tensor_name="bench.w13.scale", gated_half_rows=n)
+            s2 = pack_scale_codes(scales["w2"], tensor_name="bench.w2.scale")
         packed = [t.view(torch.uint32).flatten() for t in [w13, s13, w2, s2]]
     x = torch.randn(capacity, h, device="cuda").mul_(0.5).bfloat16()
     wire = torch.empty((capacity, h + h // 32), device="cuda", dtype=torch.uint8)
@@ -123,7 +129,7 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
     meta_view = from_dlpack(metadata, assumed_align=16)
     compiled = cute.compile(
         V41FusedSliceKernel(width, grouped=True, intermediate=n, hidden=h,
-                            exact_storage=exact_storage),
+                            exact_storage=exact_storage, scale_codes=scale_codes),
         *args,
         cutlass.Int32(capacity),
         current_cuda_stream(),
@@ -228,6 +234,7 @@ def _check_grouped_slices(width, after_case=None, *, n=576, topk=6, h=5120,
                 intermediate=n,
                 topk=topk,
                 capacity=capacity,
+                scale_codes=scale_codes,
                 experts=experts,
                 group_capacity=group_capacity,
                 groups=groups,

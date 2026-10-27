@@ -68,7 +68,8 @@ def measure_factory(widths, iterations, replays, fc2_n_splits=(1,), *, cache="wa
                 alt_args = [*args[:-1], from_dlpack(out, assumed_align=16)]
                 compiled = cute.compile(
                     V41FusedSliceKernel(width, grouped=True, intermediate=n, hidden=h,
-                                        fc2_n_splits=splits, exact_storage=exact_storage),
+                                        fc2_n_splits=splits, exact_storage=exact_storage,
+                                        scale_codes=case.get("scale_codes", False)),
                     *alt_args, cutlass.Int32(capacity), current_cuda_stream(), meta,
                     cutlass.Int32(launch_groups))
                 reduced = torch.empty((capacity * topk, h), device="cuda")
@@ -170,6 +171,8 @@ def main():
     parser.add_argument("--components", nargs="+", choices=("compute", "reduce", "combined"),
                         default=["compute", "reduce", "combined"])
     parser.add_argument("--capacity", type=int, default=80)
+    parser.add_argument("--scale-codes", choices=("on", "off"), default="off",
+                        help="on: the served V4.1 coded UE8M0 scale layout (lossless offset codes)")
     parser.add_argument("--rows", type=int, nargs="+")
     parser.add_argument("--widths", type=int, nargs="+")
     parser.add_argument("--fc2-n-splits", type=int, nargs="+", default=[1])
@@ -200,7 +203,7 @@ def main():
         geometry=options.geometry, hidden=h, intermediate=n, topk=topk,
         capacity=options.capacity, widths=widths, fc2_n_splits=options.fc2_n_splits,
         exact_storage=options.exact_storage, live_groups=options.live_groups,
-        experts=options.experts, routing_case=options.routing_case,
+        experts=options.experts, routing_case=options.routing_case, scale_codes=options.scale_codes,
         cache=options.cache, l2_flush_bytes=options.l2_flush_bytes,
         device=torch.cuda.get_device_name(),
         capability=torch.cuda.get_device_capability(),
@@ -211,7 +214,8 @@ def main():
         options.fc2_n_splits, cache=options.cache, l2_flush_bytes=options.l2_flush_bytes,
         exact_storage=options.exact_storage, live_groups=options.live_groups, components=options.components),
         n=n, topk=topk, h=h, capacity=options.capacity, row_counts=options.rows,
-        experts=options.experts, exact_storage=options.exact_storage, routing_case=options.routing_case)
+        experts=options.experts, exact_storage=options.exact_storage, routing_case=options.routing_case,
+        scale_codes=options.scale_codes == "on")
 
 
 if __name__ == "__main__":
