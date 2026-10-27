@@ -2380,28 +2380,6 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                         for v in cutlass.range_constexpr(8):
                             grand[idx, j, v] = grand[idx, j, v] + total[idx, j, v]
             self.fc1_ws_fold(grand, fc1_addr, hdr, lane, cw, Int32(0), active)
-        elif cutlass.const_expr(active == 4 and width != 0):
-            grand01 = cute.make_rmem_tensor((2, 2, 8), Float32)
-            grand01.fill(Float32(0.0))
-            for split in cutlass.range(self.splits):
-                total.fill(Float32(0.0))
-                for block in cutlass.range(8):
-                    kb = split * Int32(8) + block
-                    if kb < Int32(self.blocks):
-                        slot = seq % Int32(stages)
-                        _mbar_wait(bar_full + slot * Int32(8), (seq // Int32(stages)) & Int32(1))
-                        stage = ring + slot * Int32(self.fc1_stage_bytes)
-                        self.fc1_ws_block(total, stage,
-                                          stage + Int32(self.fc1_a_bytes) + proj * Int32(8192),
-                                          lane, n16_0, width, scale_base + kb * Int32(4), 4)
-                        _mbar_arrive(bar_empty + slot * Int32(8))
-                        seq += Int32(1)
-                for idx in cutlass.range_constexpr(2):
-                    for j in cutlass.range_constexpr(2):
-                        for v in cutlass.range_constexpr(8):
-                            grand01[idx, j, v] = grand01[idx, j, v] + total[idx, j, v]
-                self.fc1_ws_fold_tail4(total, fc1_addr, hdr, lane, cw, split)
-            self.fc1_ws_store_head4(grand01, fc1_addr, hdr, lane, cw)
         else:
             for split in cutlass.range(self.splits):
                 if cutlass.const_expr(width != 0):
