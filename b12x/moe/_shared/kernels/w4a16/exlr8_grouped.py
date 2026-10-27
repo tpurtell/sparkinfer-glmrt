@@ -1179,14 +1179,46 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 if (slice_shift == Int32(0)
                         and block_fc2_bytes * Int32(2) + inter_bytes > l2_budget):
                     slice_blocks = Int32(self.blocks)
-                if (slice_shift >= Int32(0) and slice_shift <= Int32(4)
+                # Fused pair slices: when the runtime policy leaves FC2
+                # unsliced, each two-block partial slice is written and folded
+                # by the same launch through per-(row, block) arrival counters,
+                # so the partials stay in L2 and the separate ordered reduce
+                # launch disappears. Any other geometry keeps the shipped
+                # slice/reduce sequence, and the workspace guard keeps the
+                # two-block arena plus its counters inside the declared fc2
+                # scratch for every runtime row count.
+                fused = (
+                    (Int32(1) if (self.FC2_WS and self.FC2_HALF) else Int32(0))
+                    * ((slice_shift == Int32(0)) & (slice_blocks == Int32(self.blocks))).to(Int32)
+                    * (
+                        rows.to(Int64)
+                        * Int64(2 * self.top_k * 128 * (2 if self.FC2_HALF else 4) + 2 * 4)
+                        <= Int64(self.max_groups * self.group_rows * self.hidden_size * 4)
+                    ).to(Int32)
+                )
+                if fused != Int32(0):
+                    self.fused_fold_init_kernel(fc2, rows, group_count).launch(
+                        grid=(min(max(Int32(1), (rows * Int32(2) + Int32(255)) // Int32(256)), fc2_cta_limit), 1, 1),
+                        block=(256, 1, 1), stream=stream)
+                    pair_base = Int32(0)
+                    while pair_base < Int32(self.blocks):
+                        self.launch_fc2(
+                            pointers, bits, unit_count, unit_map,
+                            group_expert, route_slots, route_group_lane, route_weights,
+                            intermediate, fc2, signs_out, output,
+                            rows, group_count, unit_limit,
+                            pair_base, Int32(2), Int32(0), fc2_cta_limit, stream, True, True)
+                        pair_base += Int32(2)
+                if (fused == Int32(0)
+                        and slice_shift >= Int32(0) and slice_shift <= Int32(4)
                         and (Int32(48) % slice_blocks) == Int32(0)
                         and fc2_cta_limit > Int32(0)):
                     slice_base = Int32(0)
                     while slice_base < Int32(48):
                         self.launch_fc2(
                             pointers, bits, unit_count, unit_map,
-                            group_expert, route_slots, intermediate, fc2,
+                            group_expert, route_slots, route_group_lane, route_weights,
+                            intermediate, fc2, signs_out, output,
                             rows, group_count, unit_limit, slice_base, slice_blocks, slice_shift, fc2_cta_limit, stream, True)
                         self.reduce_kernel(
                             route_group_lane, route_weights, fc2, signs_out, output,
@@ -1198,7 +1230,8 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             else:
                 self.launch_fc2(
                     pointers, bits, unit_count, unit_map,
-                    group_expert, route_slots, intermediate, fc2,
+                    group_expert, route_slots, route_group_lane, route_weights,
+                    intermediate, fc2, signs_out, output,
                     rows, group_count, unit_limit, Int32(0), Int32(self.blocks), Int32(0), cta_limit, stream)
                 self.reduce_kernel(
                     route_group_lane, route_weights, fc2, signs_out, output,
@@ -2588,16 +2621,20 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     def launch_fc2(self, pointers: cute.Tensor, bits: cute.Tensor,
                    unit_count: cute.Tensor, unit_map: cute.Tensor,
                    group_expert: cute.Tensor, route_slots: cute.Tensor,
+                   route_group_lane: cute.Tensor, route_weights: cute.Tensor,
                    intermediate: cute.Tensor, fc2: cute.Tensor,
+                   signs_out: cute.Tensor, output: cute.Tensor,
                    rows: Int32, group_count: cute.Tensor, unit_limit: Int32,
                    slice_base: Int32, slice_blocks: Int32, slice_shift: Int32,
                    grid_limit: Int32, stream: cuda.CUstream,
-                   evict_first: cutlass.Constexpr = False):
+                   evict_first: cutlass.Constexpr = False,
+                   fused: cutlass.Constexpr = False):
         if cutlass.const_expr(self.FC2_WS):
             self.grouped_fc2_ws_kernel(
                 pointers, bits, unit_count, unit_map, group_expert, route_slots,
-                intermediate, fc2, rows, group_count, unit_limit,
-                slice_base, slice_blocks, slice_shift, evict_first).launch(
+                route_group_lane, route_weights, intermediate, fc2, signs_out, output,
+                rows, group_count, unit_limit,
+                slice_base, slice_blocks, slice_shift, evict_first, fused).launch(
                     grid=(min(Int32(self.max_groups * self.blocks), grid_limit), 1, 1),
                     block=(384, 1, 1), min_blocks_per_mp=1, stream=stream)
         else:
@@ -2609,13 +2646,41 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                     block=(256, 1, 1), min_blocks_per_mp=self.CTAS_PER_SM, stream=stream)
 
     @cute.kernel
+    def fused_fold_init_kernel(self, fc2: cute.Tensor, rows: Int32,
+                               group_count: cute.Tensor):
+        """Zero the fused pair-fold arrival counters.
+
+        The fused FC2 pair kernel keeps one counter per (row, 128-col block)
+        directly after the two-block partial arena in the declared FC2
+        workspace, and every fold resets its own counter, so one pass per call
+        (and nothing when the stage packs no group) leaves the arena ready.
+        """
+        groups = group_count[0]
+        if groups < Int32(0) or groups > Int32(self.max_groups):
+            groups = Int32(0)
+        tid = Int32(cute.arch.thread_idx()[0])
+        cta = Int32(cute.arch.block_idx()[0])
+        grid = max(Int32(1), Int32(cute.arch.grid_dim()[0]))
+        counter_address = fc2.iterator.toint() + rows.to(Int64) * Int64(
+            2 * self.top_k * 128 * (2 if self.FC2_HALF else 4))
+        index = cta * Int32(256) + tid
+        step = grid * Int32(256)
+        limit = rows * Int32(2) if groups > Int32(0) else Int32(0)
+        while index < limit:
+            st_global_u32(counter_address + index.to(Int64) * Int64(4), Uint32(0))
+            index += step
+
+    @cute.kernel
     def grouped_fc2_ws_kernel(self, pointers: cute.Tensor, bits: cute.Tensor,
                            unit_count: cute.Tensor, unit_map: cute.Tensor,
                            group_expert: cute.Tensor, route_slots: cute.Tensor,
+                           route_group_lane: cute.Tensor, route_weights: cute.Tensor,
                            intermediate: cute.Tensor, fc2: cute.Tensor,
+                           signs_out: cute.Tensor, output: cute.Tensor,
                            rows: Int32, group_count: cute.Tensor, unit_limit: Int32,
                            slice_base: Int32, slice_blocks: Int32, slice_shift: Int32,
-                           evict_first: cutlass.Constexpr = False):
+                           evict_first: cutlass.Constexpr = False,
+                           fused: cutlass.Constexpr = False):
         groups = group_count[0]
         if groups < Int32(0) or groups > Int32(self.max_groups):
             groups = Int32(0)
@@ -2624,19 +2689,29 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
         @cute.struct
         class Storage:
             words: cute.struct.Align[cute.struct.MemRange[
-                Uint32, self.FC2_STAGES * (self.group_rows * 64 + 4096 + 8)], 1024]
+                Uint32, self.FC2_STAGES * (self.group_rows * 64 + 4096 + 8) + 160], 1024]
 
         storage = smem.allocate(Storage)
         ring = shared_ptr_to_u32(storage.words.data_ptr())
         bar_full = ring + Int32(self.FC2_STAGES * (self.group_rows * 256 + 16384))
         bar_empty = bar_full + Int32(self.FC2_STAGES * 8)
         meta = bar_empty + Int32(self.FC2_STAGES * 8)
+        # Fused pair folds: warp w list of the (row, block) items that warp w
+        # folds (16 slots each) and one item count per warp.
+        fold_list = meta + Int32(self.FC2_STAGES * 16)
+        fold_count = fold_list + Int32(128 * 4)
         tid = Int32(cute.arch.thread_idx()[0])
         task = Int32(cute.arch.block_idx()[0])
         step = max(Int32(1), Int32(cute.arch.grid_dim()[0]))
         lane, warp = tid & Int32(31), tid >> Int32(5)
         inter_addr = intermediate.iterator.toint()
         fc2_addr = fc2.iterator.toint()
+        signs_address = signs_out.iterator.toint()
+        output_address = output.iterator.toint()
+        # Two-block partial arena first, then one arrival counter per
+        # (row, block) of the pair; both live inside the declared fc2 scratch.
+        counter_address = fc2_addr + rows.to(Int64) * Int64(
+            2 * self.top_k * 128 * (2 if self.FC2_HALF else 4))
         if tid < Int32(self.FC2_STAGES):
             _mbar_init(bar_full + tid * Int32(8), Int32(129))
             _mbar_init(bar_empty + tid * Int32(8), Int32(256))
@@ -2938,6 +3013,101 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                                             if row_valid:
                                                 st_global_v2_f32(row_addr, total[idx, j, 2 * v], total[idx, j, 2 * v + 1])
                                                 st_global_v2_f32(row_addr + Int64(32), total[idx, j, 4 + 2 * v], total[idx, j, 4 + 2 * v + 1])
+            # Partial stores retire at CTA scope, then the arrival warp's
+            # GPU-scope release fence publishes them before its atomics (fence
+            # cumulativity over bar.sync), so no folding CTA observes an
+            # arrival early.
+            cute.arch.sync_threads()
+            if cutlass.const_expr(fused):
+                # Fused exact fold: the warp that observes the eighth arrival
+                # for a (row, block) folds that block in slot order 0..7 with
+                # the reduce kernel's own F32 multiply/add and writes it, so no
+                # launch ever waits on another CTA. Eight arrivals is exact for
+                # every packed stage: the packing maps all top_k routes of every
+                # row into a group, which the shipped sliced reduce already
+                # relies on when it folds all eight slots unchecked.
+                if num_live_m > Int32(0):
+                    if tid < Int32(32):
+                        cute.arch.fence_acq_rel_gpu()
+                        region = lane >> Int32(2)
+                        n_done = Int32(0)
+                        for idx in cutlass.range_constexpr(self.mtiles):
+                            if Int32(idx) < num_live_m:
+                                m = (out_meta >> Int32(idx * 2)) & Int32(3)
+                                src_word = slot_hi if (cutlass.const_expr(self.mtiles == 4) and (m >= Int32(2))) else slot_lo
+                                m_lane_base = (m & Int32(1)) * Int32(16)
+                                for v in cutlass.range_constexpr(2):
+                                    slot_out = cute.arch.shuffle_sync(
+                                        src_word, m_lane_base + Int32(v * 8) + (lane >> Int32(2)))
+                                    row_ok = (out_meta & Int32(1 << (8 + idx * 2 + v))) != Int32(0)
+                                    if row_ok and (lane & Int32(3)) == Int32(0):
+                                        row_idx = slot_out // Int32(self.top_k)
+                                        for j in cutlass.range_constexpr(2):
+                                            arrived = Int32(llvm.inline_asm(
+                                                T.i32(),
+                                                [(counter_address + (row_idx * Int32(2) + Int32(j)).to(Int64) * Int64(4)).ir_value(),
+                                                 Int32(1).ir_value()],
+                                                "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
+                                                "=r,l,r",
+                                                has_side_effects=True, is_align_stack=False,
+                                                asm_dialect=llvm.AsmDialect.AD_ATT, loc=None, ip=None))
+                                            if arrived == Int32(self.top_k - 1):
+                                                st_shared_i32(
+                                                    fold_list + (region * Int32(16) + n_done) * Int32(4),
+                                                    row_idx * Int32(2) + Int32(j))
+                                                n_done += Int32(1)
+                        st_shared_i32(fold_count + region * Int32(4), n_done)
+                cute.arch.sync_threads()
+                if tid < Int32(256):
+                    cute.arch.fence_acq_rel_gpu()
+                    n_fold = ld_shared_i32_relaxed(fold_count + warp * Int32(4))
+                    item_i = Int32(0)
+                    while item_i < n_fold:
+                        item = ld_shared_i32_relaxed(fold_list + (warp * Int32(16) + item_i) * Int32(4))
+                        row_idx = item >> Int32(1)
+                        b_local = item & Int32(1)
+                        col = (slice_base + b_local) * Int32(128) + lane * Int32(4)
+                        row_route_base = row_idx.to(Int64) * Int64(self.top_k)
+                        row_fc2_base = fc2_addr + (
+                            (b_local * max_slot).to(Int64) * Int64(128)
+                            + row_route_base * Int64(128)
+                            + lane.to(Int64) * Int64(4)
+                        ) * Int64(2 if self.FC2_HALF else 4)
+                        values = cute.make_rmem_tensor(4, Float32)
+                        values.fill(Float32(0.0))
+                        weights = cute.make_rmem_tensor(self.top_k, Float32)
+                        for f_slot in cutlass.range_constexpr(self.top_k):
+                            weights[f_slot] = route_weights[row_route_base + Int64(f_slot)]
+                        lo_s = cute.make_rmem_tensor(self.top_k, Uint32)
+                        hi_s = cute.make_rmem_tensor(self.top_k, Uint32)
+                        for f_slot in cutlass.range_constexpr(self.top_k):
+                            packed_v = llvm.inline_asm(
+                                llvm.StructType.get_literal([T.i32(), T.i32()]),
+                                [(row_fc2_base + Int64(f_slot * 256)).ir_value()],
+                                "ld.global.cg.v2.u32 {$0, $1}, [$2];",
+                                "=r,=r,l",
+                                has_side_effects=True, is_align_stack=False,
+                                asm_dialect=llvm.AsmDialect.AD_ATT, loc=None, ip=None)
+                            lo_s[f_slot] = Uint32(llvm.extractvalue(T.i32(), packed_v, [0], loc=None, ip=None))
+                            hi_s[f_slot] = Uint32(llvm.extractvalue(T.i32(), packed_v, [1], loc=None, ip=None))
+                        for f_slot in cutlass.range_constexpr(self.top_k):
+                            w0, w1 = f16x2_to_f32x2(lo_s[f_slot])
+                            w2, w3 = f16x2_to_f32x2(hi_s[f_slot])
+                            weight = weights[f_slot]
+                            values[0] = values[0] + weight * w0
+                            values[1] = values[1] + weight * w1
+                            values[2] = values[2] + weight * w2
+                            values[3] = values[3] + weight * w3
+                        h0, h1, h2, h3 = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
+                        signs = ld_global_nc_u32(signs_address + col.to(Int64))
+                        store_bf16x4(
+                            output_address + (row_idx.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2),
+                            h0 * signed_byte(signs, 0), h1 * signed_byte(signs, 1),
+                            h2 * signed_byte(signs, 2), h3 * signed_byte(signs, 3))
+                        # Stream-ordered launches: the next pair may reuse the
+                        # counter only after this kernel completes.
+                        st_global_u32(counter_address + item.to(Int64) * Int64(4), Uint32(0))
+                        item_i += Int32(1)
             cute.arch.sync_threads()
             task += step
 
