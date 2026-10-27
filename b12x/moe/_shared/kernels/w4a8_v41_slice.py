@@ -29,6 +29,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils
 import cuda.bindings.driver as cuda
+from b12x._lib.utils import runtime_num_sm
 from cutlass import Int32, Int64, Uint32, Float32
 from b12x._lib.intrinsics import (
     shared_ptr_to_u32,
@@ -40,6 +41,11 @@ from b12x._lib.intrinsics import (
     mxfp8_mma_m16n8k32_f32_e2m1,
     quantize_block_fp8_mx,
     max_abs_32,
+    atomic_cas_global_i32,
+    atomic_add_global_i32,
+    ld_global_acquire_i32,
+    st_global_release_i32,
+    threadfence,
 )
 from b12x.moe._shared.kernels.w4a8_staging import (
     stage_repacked_b_slice,
@@ -64,6 +70,7 @@ class V41FusedSliceKernel:
         self.fc2_n_splits = fc2_n_splits
         assert not atomic_tokens or grouped
         assert not ordered_groups or (grouped and not atomic_tokens)
+        assert not ordered_groups or fc2_n_splits == 1
         self.ordered_groups = ordered_groups
         self.topk = topk
         self.atomic_tokens = atomic_tokens
@@ -82,6 +89,9 @@ class V41FusedSliceKernel:
             "slice exceeds packed storage"
         )
 
+    def max_slots(self):
+        return (188 + self.slices - 1) // self.slices + 1
+
     @cute.jit
     def __call__(
         self,
@@ -98,11 +108,16 @@ class V41FusedSliceKernel:
         metadata: cute.Tensor | None = None,
         groups: Int32 = 1,
         inverse: cute.Tensor | None = None,
+        workspace: cute.Tensor | None = None,
     ):
-        self.kernel(x, xs, w13, s13, w2, s2, routing, out, rows, metadata, inverse).launch(
-            grid=(1 if self.ordered_groups else self.slices, groups if self.grouped else 1, self.fc2_n_splits),
-            block=(128, 1, 1),
-            stream=stream,
+        slots = Int32(1)
+        grid = (self.slices, groups if self.grouped else 1, self.fc2_n_splits)
+        if cutlass.const_expr(self.ordered_groups):
+            slots = (runtime_num_sm() + self.slices - 1) // self.slices + 1
+            grid = (slots * self.slices, 1, 1)
+        self.kernel(x, xs, w13, s13, w2, s2, routing, out, rows, metadata,
+                    inverse, workspace, groups, slots).launch(
+            grid=grid, block=(128, 1, 1), stream=stream,
         )
 
     @cute.kernel
@@ -119,397 +134,449 @@ class V41FusedSliceKernel:
         rows: Int32,
         metadata: cute.Tensor | None,
         inverse: cute.Tensor | None,
+        workspace: cute.Tensor | None,
+        groups: Int32,
+        slots: Int32,
     ):
         tid = cute.arch.thread_idx()[0]
         warp = tid // 32
         lane = tid % 32
         c = lane % 4
         g = lane // 4
-        slice_id = cute.arch.block_idx()[0]
-        expert = Int64(0)
-        route_base = Int64(0)
-        group = cute.arch.block_idx()[1]
-        if cutlass.const_expr(self.grouped):
-            expert = Int64(metadata[group, 0])
-            rows = Int32(metadata[group, 1])
-            route_base = Int64(metadata[group, 2])
-        input_lo = g
-        input_hi = g + 8
-        input_scale = g + c * 8
-        if cutlass.const_expr(self.grouped):
-            if g < rows:
-                input_lo = Int32(metadata[group, 3 + g])
-            if g + 8 < rows:
-                input_hi = Int32(metadata[group, 3 + g + 8])
-            if c < 2 and g + c * 8 < rows:
-                input_scale = Int32(metadata[group, 3 + g + c * 8])
-        active = Int32(1)
-        if cutlass.const_expr(self.grouped):
-            active = Int32(rows > 0)
-        if active > 0:
-            smem = cutlass.utils.SmemAllocator()
-            # Shared weight slots also serve FC2 after the fused activation boundary.
-            b = smem.allocate_tensor(
-                Uint32, cute.make_layout(self.width * 32), byte_alignment=16
-            )
-            sf = smem.allocate_tensor(
-                Uint32, cute.make_layout(max(self.width * 2, 256)), byte_alignment=16
-            )
-            mid = smem.allocate_tensor(
-                Float32, cute.make_layout((16, self.width)), byte_alignment=16
-            )
-            qa = smem.allocate_tensor(
-                Uint32, cute.make_layout((16, self.width // 4)), byte_alignment=16
-            )
-            qs = smem.allocate_tensor(
-                Uint32, cute.make_layout((16, self.width // 32)), byte_alignment=16
-            )
-            bb = shared_ptr_to_u32(b.iterator)
-            sb = shared_ptr_to_u32(sf.iterator)
-            original_lo = Int64(0)
-            original_hi = Int64(0)
+        smem = cutlass.utils.SmemAllocator()
+        b = smem.allocate_tensor(Uint32, cute.make_layout(self.width * 32), byte_alignment=16)
+        sf = smem.allocate_tensor(Uint32, cute.make_layout(max(self.width * 2, 256)), byte_alignment=16)
+        mid = smem.allocate_tensor(Float32, cute.make_layout((16, self.width)), byte_alignment=16)
+        qa = smem.allocate_tensor(Uint32, cute.make_layout((16, self.width // 4)), byte_alignment=16)
+        qs = smem.allocate_tensor(Uint32, cute.make_layout((16, self.width // 32)), byte_alignment=16)
+        dispatch = smem.allocate_tensor(Int32, cute.make_layout(4), byte_alignment=16)
+        bb = shared_ptr_to_u32(b.iterator)
+        sb = shared_ptr_to_u32(sf.iterator)
+        slot_id = cute.arch.block_idx()[0] // self.slices
+        again = Int32(1)
+        while again > 0:
+            group = cute.arch.block_idx()[1]
+            slice_id = cute.arch.block_idx()[0]
             if cutlass.const_expr(self.ordered_groups):
-                for slot in cutlass.range_constexpr(self.topk):
+                control = cute.make_tensor(cute.recast_ptr(workspace.iterator, dtype=Int32),
+                                           cute.make_layout(2 * slots))
+                if tid == 0:
+                    dispatch[1] = Int32(0)
+                    dispatch[2] = slot_id
+                    found = Int32(0)
+                    unfinished = Int32(1)
+                    while found == 0 and unfinished > 0:
+                        unfinished = Int32(0)
+                        for probe in range(slots):
+                            candidate_slot = (slot_id + probe) % slots
+                            addr = get_ptr_as_int64(control, candidate_slot * 2)
+                            state = ld_global_acquire_i32(addr)
+                            epoch = state // (self.slices + 1)
+                            claimed = state % (self.slices + 1)
+                            candidate_group = epoch * slots + candidate_slot
+                            if candidate_group < groups:
+                                unfinished = Int32(1)
+                                if found == 0 and claimed < self.slices:
+                                    previous = atomic_cas_global_i32(addr, state, state + 1)
+                                    if previous == state:
+                                        dispatch[0] = candidate_group
+                                        dispatch[1] = claimed
+                                        dispatch[2] = candidate_slot
+                                        found = Int32(1)
+                    if found == 0:
+                        dispatch[0] = Int32(-1)
+                cute.arch.sync_threads()
+                group = dispatch[0]
+                slice_id = dispatch[1]
+                slot_id = dispatch[2]
+            if group < 0:
+                again = Int32(0)
+            else:
+                expert = Int64(0)
+                route_base = Int64(0)
+                if cutlass.const_expr(self.grouped):
+                    expert = Int64(metadata[group, 0])
+                    rows = Int32(metadata[group, 1])
+                    route_base = Int64(metadata[group, 2])
+                input_lo = g
+                input_hi = g + 8
+                input_scale = g + c * 8
+                if cutlass.const_expr(self.grouped):
                     if g < rows:
-                        candidate = Int64(input_lo) * self.topk + slot
-                        if inverse[candidate] == route_base + g:
-                            original_lo = candidate
+                        input_lo = Int32(metadata[group, 3 + g])
                     if g + 8 < rows:
-                        candidate = Int64(input_hi) * self.topk + slot
-                        if inverse[candidate] == route_base + g + 8:
-                            original_hi = candidate
-            # Independent group owners need no inter-CTA flags or residency guarantee.
-            for slice_step in range(self.slices if self.ordered_groups else 1):
-                if cutlass.const_expr(self.ordered_groups):
-                    slice_id = slice_step
-                start = slice_id * Int32(self.width)
-                gate = cute.make_rmem_tensor((self.width // 32, 4), Float32)
-                gate.fill(0)
-                up = cute.make_rmem_tensor((self.width // 32, 4), Float32)
-                up.fill(0)
-                for kt in range(self.hidden_tiles):
-                    if cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_b(
-                            w13,
-                            bb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                            start,
-                            kt,
-                            tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            True,
-                        )
-                    else:
-                        stage_repacked_b_slice(
-                            w13,
-                            bb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                            Int32(self.hidden_tiles),
-                            kt,
-                            start,
-                            tid,
-                            128,
-                            self.width,
-                        )
-                    if cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_b(
-                            w13,
-                            bb + self.width * 64,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                            start,
-                            kt,
-                            tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            True,
-                            1,
-                        )
-                    else:
-                        stage_repacked_b_slice(
-                            w13,
-                            bb + self.width * 64,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                            Int32(self.hidden_tiles),
-                            kt,
-                            start + self.kernel_intermediate,
-                            tid,
-                            128,
-                            self.width,
-                        )
-                    if cutlass.const_expr(self.scale_codes):
-                        stage_scale_codes_slice(s13, sb, expert, kt, start, tid,
-                                                self.width, 2 * self.kernel_intermediate,
-                                                self.hidden // 32)
-                    elif cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_sfb(
-                            s13,
-                            sb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                            start,
-                            kt,
-                            tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            True,
-                        )
-                    else:
-                        stage_repacked_sfb_slice(
-                            s13,
-                            sb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                            Int32(self.hidden_tiles),
-                            kt,
-                            start,
-                            tid,
-                            128,
-                            self.width,
-                        )
-                    if cutlass.const_expr(self.scale_codes):
-                        stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
-                                                start + self.kernel_intermediate, tid,
-                                                self.width, 2 * self.kernel_intermediate,
-                                                self.hidden // 32)
-                    elif cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_sfb(
-                            s13,
-                            sb + self.width * 4,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                            start,
-                            kt,
-                            tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            True,
-                            1,
-                        )
-                    else:
-                        stage_repacked_sfb_slice(
-                            s13,
-                            sb + self.width * 4,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                            Int32(self.hidden_tiles),
-                            kt,
-                            start + self.kernel_intermediate,
-                            tid,
-                            128,
-                            self.width,
-                        )
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.sync_threads()
-                    for kb in cutlass.range_constexpr(4):
-                        a0 = Uint32(0)
-                        a1 = Uint32(0)
-                        a2 = Uint32(0)
-                        a3 = Uint32(0)
-                        if g < rows:
-                            a0 = x[input_lo, kt * 32 + kb * 8 + c * 2]
-                            a2 = x[input_lo, kt * 32 + kb * 8 + c * 2 + 1]
-                        if g + 8 < rows:
-                            a1 = x[input_hi, kt * 32 + kb * 8 + c * 2]
-                            a3 = x[input_hi, kt * 32 + kb * 8 + c * 2 + 1]
-                        scale = Uint32(0)
-                        if c < 2 and g + c * 8 < rows:
-                            scale = Uint32(xs[input_scale, kt * 4 + kb])
-                        for nf in cutlass.range_constexpr(self.width // 32):
-                            index = ((kb * (self.width // 32) + nf) * 32 + lane) * 4 + warp
-                            u0, u1 = e2m1x8_to_qmma_e2m1x8(b[index])
-                            g0, g1 = e2m1x8_to_qmma_e2m1x8(b[index + self.width * 16])
-                            su = sf[nf * 32 + warp * 8 + g]
-                            sg = sf[self.width + nf * 32 + warp * 8 + g]
-                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
-                                gate[nf, 0],
-                                gate[nf, 1],
-                                gate[nf, 2],
-                                gate[nf, 3],
-                                a0,
-                                a1,
-                                a2,
-                                a3,
-                                g0,
-                                g1,
-                                scale,
-                                sg,
-                                bid_b=kb,
+                        input_hi = Int32(metadata[group, 3 + g + 8])
+                    if c < 2 and g + c * 8 < rows:
+                        input_scale = Int32(metadata[group, 3 + g + c * 8])
+                active = Int32(1)
+                if cutlass.const_expr(self.grouped):
+                    active = Int32(rows > 0)
+                if active > 0:
+                    start = slice_id * Int32(self.width)
+                    gate = cute.make_rmem_tensor((self.width // 32, 4), Float32)
+                    gate.fill(0)
+                    up = cute.make_rmem_tensor((self.width // 32, 4), Float32)
+                    up.fill(0)
+                    for kt in range(self.hidden_tiles):
+                        if cutlass.const_expr(self.exact_storage):
+                            stage_v41_exact_b(
+                                w13,
+                                bb,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                                start,
+                                kt,
+                                tid,
+                                self.width,
+                                self.intermediate,
+                                self.hidden,
+                                True,
                             )
-                            gate[nf, 0] = d0
-                            gate[nf, 1] = d1
-                            gate[nf, 2] = d2
-                            gate[nf, 3] = d3
-                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
-                                up[nf, 0],
-                                up[nf, 1],
-                                up[nf, 2],
-                                up[nf, 3],
-                                a0,
-                                a1,
-                                a2,
-                                a3,
-                                u0,
-                                u1,
-                                scale,
-                                su,
-                                bid_b=kb,
+                        else:
+                            stage_repacked_b_slice(
+                                w13,
+                                bb,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                                Int32(self.hidden_tiles),
+                                kt,
+                                start,
+                                tid,
+                                128,
+                                self.width,
                             )
-                            up[nf, 0] = d0
-                            up[nf, 1] = d1
-                            up[nf, 2] = d2
-                            up[nf, 3] = d3
-                    cute.arch.sync_threads()
-                for nf in cutlass.range_constexpr(self.width // 32):
-                    for elem in cutlass.range_constexpr(4):
-                        row = g + (elem // 2) * 8
-                        col = nf * 32 + warp * 8 + c * 2 + elem % 2
-                        gv = gate[nf, elem].to(cutlass.BFloat16).to(Float32)
-                        uv = up[nf, elem].to(cutlass.BFloat16).to(Float32)
-                        gv = fmin_f32(gv, Float32(10))
-                        uv = fmax_f32(Float32(-10), fmin_f32(uv, Float32(10)))
-                        value = Float32(0)
-                        if row < rows and start + col < self.intermediate:
-                            sigmoid = cute.arch.rcp_approx(
-                                Float32(1) + cute.math.exp(-gv, fastmath=True)
+                        if cutlass.const_expr(self.exact_storage):
+                            stage_v41_exact_b(
+                                w13,
+                                bb + self.width * 64,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                                start,
+                                kt,
+                                tid,
+                                self.width,
+                                self.intermediate,
+                                self.hidden,
+                                True,
+                                1,
                             )
-                            value = (
-                                (gv * sigmoid * uv * routing[route_base + Int64(row)])
-                                .to(cutlass.BFloat16)
-                                .to(Float32)
+                        else:
+                            stage_repacked_b_slice(
+                                w13,
+                                bb + self.width * 64,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                                Int32(self.hidden_tiles),
+                                kt,
+                                start + self.kernel_intermediate,
+                                tid,
+                                128,
+                                self.width,
                             )
-                        mid[row, col] = value
-                cute.arch.sync_threads()
-                for task in range(tid, 16 * (self.width // 32), 128):
-                    row = task // (self.width // 32)
-                    block = task % (self.width // 32)
-                    values = cute.make_rmem_tensor((32,), Float32)
-                    for j in cutlass.range_constexpr(32):
-                        values[j] = mid[row, block * 32 + j]
-                    payload, scale = quantize_block_fp8_mx(
-                        values, fmax_f32(max_abs_32(values), Float32(1e-4))
-                    )
-                    for j in cutlass.range_constexpr(8):
-                        qa[row, block * 8 + j] = payload[j]
-                    qs[row, block] = scale
-                cute.arch.sync_threads()
-                # Replicate FC1, but partition disjoint FC2 outputs without regrouping K.
-                output_begin = Int32(0)
-                if cutlass.const_expr(self.fc2_n_splits > 1):
-                    output_begin = cute.arch.block_idx()[2] * (self.hidden_tiles // self.fc2_n_splits)
-                for local_ot in range(self.hidden_tiles // self.fc2_n_splits):
-                    ot = output_begin + local_ot
-                    if cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_b(
-                            w2,
-                            bb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 8),
-                            ot * 128,
-                            start,
-                            tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            False,
-                        )
-                    else:
-                        stage_repacked_b_k_slice(
-                            w2,
-                            bb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 8),
-                            Int32(self.kernel_intermediate // 128),
-                            start,
-                            ot * 128,
-                            tid,
-                            128,
-                            self.width,
-                        )
-                    if cutlass.const_expr(self.scale_codes):
-                        stage_scale_codes_k_slice(s2, sf, expert, start, ot * 128, tid,
-                                                  self.width, self.hidden,
-                                                  self.intermediate // 32)
-                    elif cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_sfb(
-                            s2,
-                            sf,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 128),
-                            ot * 128,
-                            start,
-                            tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            False,
-                        )
-                    else:
-                        stage_repacked_sfb_k_slice(
-                            s2,
-                            sf,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 128),
-                            Int32(self.kernel_intermediate // 128),
-                            start,
-                            ot * 128,
-                            tid,
-                            128,
-                            self.width,
-                        )
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
-                    cute.arch.sync_threads()
-                    acc = cute.make_rmem_tensor((4, 4), Float32)
-                    acc.fill(0)
-                    for kb in cutlass.range_constexpr(self.width // 32):
-                        a0 = qa[g, kb * 8 + c * 2]
-                        a2 = qa[g, kb * 8 + c * 2 + 1]
-                        a1 = qa[g + 8, kb * 8 + c * 2]
-                        a3 = qa[g + 8, kb * 8 + c * 2 + 1]
-                        scale = Uint32(0)
-                        if c < 2:
-                            scale = qs[g + c * 8, kb]
-                        for nf in cutlass.range_constexpr(4):
-                            index = ((kb * 4 + nf) * 32 + lane) * 4 + warp
-                            b0, b1 = e2m1x8_to_qmma_e2m1x8(b[index])
-                            sw = sf[(kb // 4) * 128 + nf * 32 + warp * 8 + g]
-                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
-                                acc[nf, 0],
-                                acc[nf, 1],
-                                acc[nf, 2],
-                                acc[nf, 3],
-                                a0,
-                                a1,
-                                a2,
-                                a3,
-                                b0,
-                                b1,
-                                scale,
-                                sw,
-                                bid_b=kb % 4,
+                        if cutlass.const_expr(self.scale_codes):
+                            stage_scale_codes_slice(s13, sb, expert, kt, start, tid,
+                                                    self.width, 2 * self.kernel_intermediate,
+                                                    self.hidden // 32)
+                        elif cutlass.const_expr(self.exact_storage):
+                            stage_v41_exact_sfb(
+                                s13,
+                                sb,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                                start,
+                                kt,
+                                tid,
+                                self.width,
+                                self.intermediate,
+                                self.hidden,
+                                True,
                             )
-                            acc[nf, 0] = d0
-                            acc[nf, 1] = d1
-                            acc[nf, 2] = d2
-                            acc[nf, 3] = d3
-                    for nf in cutlass.range_constexpr(4):
+                        else:
+                            stage_repacked_sfb_slice(
+                                s13,
+                                sb,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                                Int32(self.hidden_tiles),
+                                kt,
+                                start,
+                                tid,
+                                128,
+                                self.width,
+                            )
+                        if cutlass.const_expr(self.scale_codes):
+                            stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
+                                                    start + self.kernel_intermediate, tid,
+                                                    self.width, 2 * self.kernel_intermediate,
+                                                    self.hidden // 32)
+                        elif cutlass.const_expr(self.exact_storage):
+                            stage_v41_exact_sfb(
+                                s13,
+                                sb + self.width * 4,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                                start,
+                                kt,
+                                tid,
+                                self.width,
+                                self.intermediate,
+                                self.hidden,
+                                True,
+                                1,
+                            )
+                        else:
+                            stage_repacked_sfb_slice(
+                                s13,
+                                sb + self.width * 4,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                                Int32(self.hidden_tiles),
+                                kt,
+                                start + self.kernel_intermediate,
+                                tid,
+                                128,
+                                self.width,
+                            )
+                        cute.arch.cp_async_commit_group()
+                        cute.arch.cp_async_wait_group(0)
+                        cute.arch.sync_threads()
+                        for kb in cutlass.range_constexpr(4):
+                            a0 = Uint32(0)
+                            a1 = Uint32(0)
+                            a2 = Uint32(0)
+                            a3 = Uint32(0)
+                            if g < rows:
+                                a0 = x[input_lo, kt * 32 + kb * 8 + c * 2]
+                                a2 = x[input_lo, kt * 32 + kb * 8 + c * 2 + 1]
+                            if g + 8 < rows:
+                                a1 = x[input_hi, kt * 32 + kb * 8 + c * 2]
+                                a3 = x[input_hi, kt * 32 + kb * 8 + c * 2 + 1]
+                            scale = Uint32(0)
+                            if c < 2 and g + c * 8 < rows:
+                                scale = Uint32(xs[input_scale, kt * 4 + kb])
+                            for nf in cutlass.range_constexpr(self.width // 32):
+                                index = ((kb * (self.width // 32) + nf) * 32 + lane) * 4 + warp
+                                u0, u1 = e2m1x8_to_qmma_e2m1x8(b[index])
+                                g0, g1 = e2m1x8_to_qmma_e2m1x8(b[index + self.width * 16])
+                                su = sf[nf * 32 + warp * 8 + g]
+                                sg = sf[self.width + nf * 32 + warp * 8 + g]
+                                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
+                                    gate[nf, 0],
+                                    gate[nf, 1],
+                                    gate[nf, 2],
+                                    gate[nf, 3],
+                                    a0,
+                                    a1,
+                                    a2,
+                                    a3,
+                                    g0,
+                                    g1,
+                                    scale,
+                                    sg,
+                                    bid_b=kb,
+                                )
+                                gate[nf, 0] = d0
+                                gate[nf, 1] = d1
+                                gate[nf, 2] = d2
+                                gate[nf, 3] = d3
+                                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
+                                    up[nf, 0],
+                                    up[nf, 1],
+                                    up[nf, 2],
+                                    up[nf, 3],
+                                    a0,
+                                    a1,
+                                    a2,
+                                    a3,
+                                    u0,
+                                    u1,
+                                    scale,
+                                    su,
+                                    bid_b=kb,
+                                )
+                                up[nf, 0] = d0
+                                up[nf, 1] = d1
+                                up[nf, 2] = d2
+                                up[nf, 3] = d3
+                        cute.arch.sync_threads()
+                    for nf in cutlass.range_constexpr(self.width // 32):
                         for elem in cutlass.range_constexpr(4):
                             row = g + (elem // 2) * 8
-                            col = ot * 128 + nf * 32 + warp * 8 + c * 2 + elem % 2
-                            if cutlass.const_expr(self.grouped):
-                                if row < rows:
-                                    if cutlass.const_expr(self.atomic_tokens):
-                                        token = Int64(metadata[group, 3 + row])
-                                        red_add_global_f32(
-                                            get_ptr_as_int64(out, token * Int64(self.hidden) + Int64(col)),
-                                            acc[nf, elem],
-                                        )
-                                    elif cutlass.const_expr(self.ordered_groups):
-                                        original = original_lo if elem < 2 else original_hi
-                                        value = Float32(0)
-                                        if slice_id > 0:
-                                            value = out[original, col]
-                                        out[original, col] = value + acc[nf, elem]
-                                    else:
-                                        out[slice_id, route_base + Int64(row), col] = acc[nf, elem]
-                            else:
-                                out[slice_id, row, col] = acc[nf, elem]
+                            col = nf * 32 + warp * 8 + c * 2 + elem % 2
+                            gv = gate[nf, elem].to(cutlass.BFloat16).to(Float32)
+                            uv = up[nf, elem].to(cutlass.BFloat16).to(Float32)
+                            gv = fmin_f32(gv, Float32(10))
+                            uv = fmax_f32(Float32(-10), fmin_f32(uv, Float32(10)))
+                            value = Float32(0)
+                            if row < rows and start + col < self.intermediate:
+                                sigmoid = cute.arch.rcp_approx(
+                                    Float32(1) + cute.math.exp(-gv, fastmath=True)
+                                )
+                                value = (
+                                    (gv * sigmoid * uv * routing[route_base + Int64(row)])
+                                    .to(cutlass.BFloat16)
+                                    .to(Float32)
+                                )
+                            mid[row, col] = value
                     cute.arch.sync_threads()
+                    for task in range(tid, 16 * (self.width // 32), 128):
+                        row = task // (self.width // 32)
+                        block = task % (self.width // 32)
+                        values = cute.make_rmem_tensor((32,), Float32)
+                        for j in cutlass.range_constexpr(32):
+                            values[j] = mid[row, block * 32 + j]
+                        payload, scale = quantize_block_fp8_mx(
+                            values, fmax_f32(max_abs_32(values), Float32(1e-4))
+                        )
+                        for j in cutlass.range_constexpr(8):
+                            qa[row, block * 8 + j] = payload[j]
+                        qs[row, block] = scale
+                    cute.arch.sync_threads()
+                    # Replicate FC1, but partition disjoint FC2 outputs without regrouping K.
+                    output_begin = Int32(0)
+                    if cutlass.const_expr(self.fc2_n_splits > 1):
+                        output_begin = cute.arch.block_idx()[2] * (self.hidden_tiles // self.fc2_n_splits)
+                    for local_ot in range(self.hidden_tiles // self.fc2_n_splits):
+                        ot = output_begin + local_ot
+                        if cutlass.const_expr(self.exact_storage):
+                            stage_v41_exact_b(
+                                w2,
+                                bb,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 8),
+                                ot * 128,
+                                start,
+                                tid,
+                                self.width,
+                                self.intermediate,
+                                self.hidden,
+                                False,
+                            )
+                        else:
+                            stage_repacked_b_k_slice(
+                                w2,
+                                bb,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 8),
+                                Int32(self.kernel_intermediate // 128),
+                                start,
+                                ot * 128,
+                                tid,
+                                128,
+                                self.width,
+                            )
+                        if cutlass.const_expr(self.scale_codes):
+                            stage_scale_codes_k_slice(s2, sf, expert, start, ot * 128, tid,
+                                                      self.width, self.hidden,
+                                                      self.intermediate // 32)
+                        elif cutlass.const_expr(self.exact_storage):
+                            stage_v41_exact_sfb(
+                                s2,
+                                sf,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 128),
+                                ot * 128,
+                                start,
+                                tid,
+                                self.width,
+                                self.intermediate,
+                                self.hidden,
+                                False,
+                            )
+                        else:
+                            stage_repacked_sfb_k_slice(
+                                s2,
+                                sf,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 128),
+                                Int32(self.kernel_intermediate // 128),
+                                start,
+                                ot * 128,
+                                tid,
+                                128,
+                                self.width,
+                            )
+                        cute.arch.cp_async_commit_group()
+                        cute.arch.cp_async_wait_group(0)
+                        cute.arch.sync_threads()
+                        acc = cute.make_rmem_tensor((4, 4), Float32)
+                        acc.fill(0)
+                        for kb in cutlass.range_constexpr(self.width // 32):
+                            a0 = qa[g, kb * 8 + c * 2]
+                            a2 = qa[g, kb * 8 + c * 2 + 1]
+                            a1 = qa[g + 8, kb * 8 + c * 2]
+                            a3 = qa[g + 8, kb * 8 + c * 2 + 1]
+                            scale = Uint32(0)
+                            if c < 2:
+                                scale = qs[g + c * 8, kb]
+                            for nf in cutlass.range_constexpr(4):
+                                index = ((kb * 4 + nf) * 32 + lane) * 4 + warp
+                                b0, b1 = e2m1x8_to_qmma_e2m1x8(b[index])
+                                sw = sf[(kb // 4) * 128 + nf * 32 + warp * 8 + g]
+                                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
+                                    acc[nf, 0],
+                                    acc[nf, 1],
+                                    acc[nf, 2],
+                                    acc[nf, 3],
+                                    a0,
+                                    a1,
+                                    a2,
+                                    a3,
+                                    b0,
+                                    b1,
+                                    scale,
+                                    sw,
+                                    bid_b=kb % 4,
+                                )
+                                acc[nf, 0] = d0
+                                acc[nf, 1] = d1
+                                acc[nf, 2] = d2
+                                acc[nf, 3] = d3
+                        for nf in cutlass.range_constexpr(4):
+                            for elem in cutlass.range_constexpr(4):
+                                row = g + (elem // 2) * 8
+                                col = ot * 128 + nf * 32 + warp * 8 + c * 2 + elem % 2
+                                if cutlass.const_expr(self.grouped):
+                                    if row < rows:
+                                        if cutlass.const_expr(self.atomic_tokens):
+                                            token = Int64(metadata[group, 3 + row])
+                                            red_add_global_f32(
+                                                get_ptr_as_int64(out, token * Int64(self.hidden) + Int64(col)),
+                                                acc[nf, elem],
+                                            )
+                                        elif cutlass.const_expr(self.ordered_groups):
+                                            offset = Int64(2 * slots) + (
+                                                (Int64(slot_id) * self.slices + slice_id) * 16 + row
+                                            ) * self.hidden + col
+                                            workspace[offset] = acc[nf, elem]
+                                        else:
+                                            out[slice_id, route_base + Int64(row), col] = acc[nf, elem]
+                                else:
+                                    out[slice_id, row, col] = acc[nf, elem]
+                        cute.arch.sync_threads()
+                if cutlass.const_expr(self.ordered_groups):
+                    # Every writer publishes its global stores before the completion count.
+                    threadfence()
+                    cute.arch.sync_threads()
+                    if tid == 0:
+                        old = atomic_add_global_i32(get_ptr_as_int64(control, slot_id * 2 + 1), Int32(1))
+                        dispatch[3] = Int32(old == self.slices - 1)
+                    cute.arch.sync_threads()
+                    if dispatch[3] != 0:
+                        # Acquire completed producers before reading their partial planes.
+                        done = ld_global_acquire_i32(get_ptr_as_int64(control, slot_id * 2 + 1))
+                        if done == self.slices:
+                            for index in range(tid, rows * self.hidden, 128):
+                                row = index // self.hidden
+                                col = index % self.hidden
+                                token = Int64(metadata[group, 3 + row])
+                                original = Int64(0)
+                                for route_slot in cutlass.range_constexpr(self.topk):
+                                    candidate = token * self.topk + route_slot
+                                    if inverse[candidate] == route_base + row:
+                                        original = candidate
+                                value = Float32(0)
+                                for plane in cutlass.range_constexpr(self.slices):
+                                    offset = Int64(2 * slots) + (
+                                        (Int64(slot_id) * self.slices + plane) * 16 + row
+                                    ) * self.hidden + col
+                                    value += workspace[offset]
+                                out[original, col] = value
+                        cute.arch.sync_threads()
+                        if tid == 0:
+                            control[slot_id * 2 + 1] = Int32(0)
+                            epoch = group // slots + 1
+                            st_global_release_i32(get_ptr_as_int64(control, slot_id * 2),
+                                                  epoch * (self.slices + 1))
+                    cute.arch.sync_threads()
+                    slot_id = (slot_id + 1) % slots
+                else:
+                    again = Int32(0)
