@@ -145,6 +145,12 @@ from .ws_a8 import f32x4_to_s8x4, prmt_b32
 _ALLOWED_ROUTED_SIZES = _W4A16_ALLOWED_ROUTED_SIZES
 _PACK_FACTOR = 8
 _STAGES = 4
+# int32 words per CTA in the probe phase-stamp region, and the number of
+# block-granular readiness planes after the grid-barrier words (input
+# rotation, FC1, activation). Buffer sizing in mixed_trellis keeps the
+# workspace at least this large; see W4A16FusedMoeKernel's offsets.
+_PHASE_STAMP_STRIDE = 8
+_PHASE_READY_PLANES = 3
 
 
 def _w4a16_small_m_splitk_enabled() -> bool:
@@ -6936,6 +6942,21 @@ class W4A16FusedMoeKernel:
             raise ValueError("W4A16 workspace SM capacity is smaller than the device")
         self.barrier_count_off = self.workspace_sms * 4
         self.barrier_sense_off = self.barrier_count_off + 1
+        # Block-granular phase bookkeeping after the barrier words: a readiness
+        # plane per phase (input rotation, FC1, activation) sized for the
+        # launch's packed-route capacity, then per-CTA phase stamps used only
+        # by the probe build (B12X_MIXED_TRELLIS_PHASE_TIMING=1). The flag
+        # planes are reserved for the pipelined schedule; the timed path never
+        # reads them unless that schedule is selected.
+        self.block_flag_blocks = int(max_m_blocks)
+        self.rot_ready_off = self.barrier_sense_off + 1
+        self.fc1_ready_off = self.rot_ready_off + self.block_flag_blocks
+        self.act_ready_off = self.fc1_ready_off + self.block_flag_blocks
+        self.phase_stamp_off = self.act_ready_off + self.block_flag_blocks
+        self.phase_stamp_stride = _PHASE_STAMP_STRIDE
+        self.debug_phase_timing = (
+            os.environ.get("B12X_MIXED_TRELLIS_PHASE_TIMING", "0") == "1"
+        )
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -7530,6 +7551,7 @@ class W4A16FusedMoeKernel:
             )
             fc1_phase_lut = table_addr
             fc2_phase_lut = table_addr
+        self._phase_stamp(locks_i32_flat, tid, cta, 0)
         if cutlass.const_expr(self.phase_l2_prefetch and fc1_prefetch_tile is not None):
             # The rotation phase moves little memory: stream this CTA's first
             # FC1 tile meanwhile.
@@ -7571,7 +7593,9 @@ class W4A16FusedMoeKernel:
                     grid_x,
                     active_m,
                 )
+            self._phase_stamp(locks_i32_flat, tid, cta, 1)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
+        self._phase_stamp(locks_i32_flat, tid, cta, 2)
         if cutlass.const_expr(self.tc_decode_fused_sum):
             # The TC-decode FC2 epilogue atomically accumulates per-route
             # partials directly into the per-token output, so the output must be
@@ -7629,7 +7653,9 @@ class W4A16FusedMoeKernel:
                 # and then runs the activation: stream its first FC2 tile
                 # meanwhile (the down weights do not depend on FC1's output).
                 self.fc2._prefetch_first_tile(fc2_prefetch_tile, packed_route_count, cta)
+            self._phase_stamp(locks_i32_flat, tid, cta, 3)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
+            self._phase_stamp(locks_i32_flat, tid, cta, 4)
             if cutlass.const_expr(self.full_rotation):
                 if cutlass.const_expr(self.coupled_hadamard):
                     self._run_activation_coupled(
@@ -7695,7 +7721,9 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
+        self._phase_stamp(locks_i32_flat, tid, cta, 5)
         self._grid_barrier(locks_i32_flat, tid, grid_x)
+        self._phase_stamp(locks_i32_flat, tid, cta, 6)
         if cutlass.const_expr(self.collect_activation_amax):
             self._collect_activation_amax_epilogue(
                 a_bf16_flat,
@@ -7736,6 +7764,7 @@ class W4A16FusedMoeKernel:
             fc2_emit_tile,
             fc2_prefetch_tile,
         )
+        self._phase_stamp(locks_i32_flat, tid, cta, 7)
 
     @cute.jit
     def _sqg_smem_copy(
@@ -7751,6 +7780,30 @@ class W4A16FusedMoeKernel:
             v0, v1, v2, v3 = ld_global_nc_v4_u32(src_addr + Int64(i) * Int64(16))
             st_shared_v4_u32(dst_off + i * Int32(16), v0, v1, v2, v3)
             i += Int32(self.cta_threads)
+
+    @cute.jit
+    def _phase_stamp(
+        self,
+        locks_i32_flat: cute.Tensor,
+        tid: Int32,
+        cta: Int32,
+        slot: int,
+    ):
+        # Probe-only phase boundary stamp: thread 0 of each CTA stores the low
+        # 32 bits of the global nanosecond timer (wraps every 4.29 s; the probe
+        # unwraps). Trace-time no-op unless B12X_MIXED_TRELLIS_PHASE_TIMING=1,
+        # so the timed path is unchanged.
+        if self.debug_phase_timing:
+            if tid == Int32(0):
+                st_global_u32(
+                    get_ptr_as_int64(
+                        locks_i32_flat,
+                        Int32(self.phase_stamp_off)
+                        + cta * Int32(self.phase_stamp_stride)
+                        + Int32(int(slot)),
+                    ),
+                    cute.arch.globaltimer_lo(),
+                )
 
     @cute.jit
     def _grid_barrier(

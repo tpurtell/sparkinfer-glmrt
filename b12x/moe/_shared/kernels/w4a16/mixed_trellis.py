@@ -47,6 +47,8 @@ from .host import (
     route_pack_warmup_token_counts,
 )
 from .kernel import (
+    _PHASE_READY_PLANES,
+    _PHASE_STAMP_STRIDE,
     _SQG_XOR_CHEB_T12_LUT_ENTRIES,
     _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
     W4A16FusedMoeKernel,
@@ -3101,7 +3103,10 @@ def _make_mixed_trellis_buffers(
             device=device,
         ),
         workspace=torch.zeros(
-            max(sms * 4, launch.blocks_per_sm * sms) + 2,
+            max(sms * 4, launch.blocks_per_sm * sms)
+            + 2
+            + _PHASE_READY_PLANES * int(launch.max_m_blocks)
+            + sms * _PHASE_STAMP_STRIDE,
             dtype=torch.int32,
             device=device,
         ),
