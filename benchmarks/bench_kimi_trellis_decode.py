@@ -1507,11 +1507,15 @@ class ArmRuntime:
                         graph = None
                         mode = "eager"
                         note = str(error)
+                    # The graph writes to the output tensor that was live at
+                    # capture time; keep that exact tensor alive and read it
+                    # back, because a freed output's storage is reused by the
+                    # next fixture's allocation.
                     self.graphs[(layer, row, variant)] = {
                         "graph": graph, "mode": mode, "error": note,
                         "capacity": capacity, "x": x, "ids": ids,
                         "weights": weights, "binding": binding,
-                        "scalars": scalars,
+                        "scalars": scalars, "output": buffers.output,
                     }
                     if mode == "eager":
                         self.graph_notes.append(
@@ -1527,6 +1531,7 @@ class ArmRuntime:
                 for variant in ("a", "b"):
                     item = self.graphs[(layer, row, variant)]
                     buffers = self.buffer_sets[(capacity, variant)]
+                    buffers.output = item["output"]
                     buffers.output.fill_(float("nan"))
                     if item["graph"] is not None:
                         item["graph"].replay()
@@ -1568,7 +1573,7 @@ class ArmRuntime:
                 for variant, item, sink in (
                         ("a", item_a, samples_a), ("b", item_b, samples_b)):
                     buffers = self.buffer_sets[(capacity, variant)]
-                    capacity_entry_ = capacity_entry(self.capacities, capacity)
+                    buffers.output = item["output"]
                     if item["graph"] is not None:
                         run = item["graph"].replay
                     else:
