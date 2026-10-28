@@ -384,14 +384,15 @@ class MoeCombine:
     """``out[r] = bf16(sum_k weights[r, k] * y[pair_pos[r, k]])`` (FP32, slot
     order; invalid routes skip). One CTA per row, 8 BF16 per thread-step."""
 
-    def __init__(self, *, hidden: int, top_k: int):
+    def __init__(self, *, hidden: int, top_k: int, row_addresses: bool = False):
         self.hidden, self.top_k = int(hidden), int(top_k)
+        self.row_addresses = bool(row_addresses)
         if self.hidden % 8:
             raise ValueError("hidden must be a multiple of 8")
         self.threads = min(512, self.hidden // 8)
 
     def key(self) -> tuple:
-        return (self.hidden, self.top_k)
+        return (self.hidden, self.top_k) + (("row_addresses",) if self.row_addresses else ())
 
     @cute.jit
     def __call__(self, y: cute.Pointer, pair_pos: cute.Pointer, weights: cute.Pointer, out: cute.Pointer,
@@ -402,6 +403,9 @@ class MoeCombine:
     def kernel(self, y: cute.Pointer, pair_pos: cute.Pointer, weights: cute.Pointer, out: cute.Pointer):
         row = Int32(cute.arch.block_idx()[0])
         tidx = Int32(cute.arch.thread_idx()[0])
+        destination = Int64(out.toint()) + Int64(row) * Int64(self.hidden * 2)
+        if const_expr(self.row_addresses):
+            destination = cute.make_ptr(Int64, Int64(out.toint()), cute.AddressSpace.gmem, assumed_align=8)[row]
         vectors = self.hidden // 8
         for it in cutlass.range_constexpr(_ceil(vectors, self.threads)):
             v = Int32(it * self.threads) + tidx
@@ -418,8 +422,7 @@ class MoeCombine:
                         for j in cutlass.range_constexpr(4):
                             acc[2 * j] = acc[2 * j] + w * _bf16_lo(words[j])
                             acc[2 * j + 1] = acc[2 * j + 1] + w * _bf16_hi(words[j])
-                st_global_v4_u32(Int64(out.toint()) + (Int64(row) * Int64(self.hidden) + Int64(v) * Int64(8))
-                                 * Int64(2),
+                st_global_v4_u32(destination + Int64(v) * Int64(16),
                                  pack_f32x2_to_bfloat2(acc[0], acc[1]), pack_f32x2_to_bfloat2(acc[2], acc[3]),
                                  pack_f32x2_to_bfloat2(acc[4], acc[5]), pack_f32x2_to_bfloat2(acc[6], acc[7]))
 

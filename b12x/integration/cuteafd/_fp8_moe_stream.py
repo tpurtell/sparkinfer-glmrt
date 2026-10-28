@@ -138,10 +138,11 @@ class StreamFp8GateUp:
     w_ring = 3
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False,
-                 activation: str = "silu_bf16_product"):
+                 activation: str = "silu_bf16_product", row_addresses: bool = False):
         self.inter, self.hidden, self.experts, self.limit = int(inter), int(hidden), int(experts), float(limit)
         # qmma: W8A8 block-scaled E4M3 x E4M3 MMAs (see the module docstring);
         # else both operands widen to BF16 (the reference's bf16(w * s)).
+        self.row_addresses = bool(row_addresses)
         self.post_silu = activation == "silu_post_clamp_fp32_product"
         self.qmma = bool(qmma)
         if self.inter % self.inter_alignment or self.hidden % 128:
@@ -156,7 +157,14 @@ class StreamFp8GateUp:
 
     def key(self) -> tuple:
         return ("stream_gate_up", 4, self.inter, self.hidden, self.experts, self.limit, self.a_ring, self.w_ring,
-                self.qmma) + (("silu_post_clamp_fp32_product",) if self.post_silu else ())
+                self.qmma) + (("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (("row_addresses",) if self.row_addresses else ())
+
+    @cute.jit
+    def row_address(self, x: cute.Pointer, row: Int32) -> Int64:
+        if cutlass.const_expr(self.row_addresses):
+            return cute.make_ptr(Int64, Int64(x.toint()), cute.AddressSpace.gmem, assumed_align=8)[row]
+        else:
+            return Int64(x.toint()) + Int64(row) * Int64(self.row_bytes)
 
     def _w_layout(self):
         atom = warpgroup.make_smem_layout_atom(
@@ -240,11 +248,11 @@ class StreamFp8GateUp:
                 src[q] = Int64(-1)
                 if row < live:
                     source = _i32_at(Int64(pair_row.toint()), first + row)
-                    src[q] = Int64(x.toint()) + Int64(source) * Int64(self.row_bytes) + Int64(ch) * Int64(16)
+                    src[q] = self.row_address(x, source) + Int64(ch) * Int64(16)
             s_src = Int64(-1)
             if tidx < live:
                 source = _i32_at(Int64(pair_row.toint()), first + tidx)
-                s_src = Int64(x.toint()) + Int64(source) * Int64(self.row_bytes) + Int64(h)
+                s_src = self.row_address(x, source) + Int64(h)
             sc_off = (Int64(e) * Int64(i // 128) + Int64(n0 // Int32(128))) * Int64(self.k_steps * 4)
             if tidx < Int32(self.k_steps):
                 cp_async_u32_shared_global(sf + tidx * Int32(4), Int64(s1.toint()) + sc_off + Int64(tidx) * Int64(4))
