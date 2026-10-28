@@ -173,6 +173,94 @@ def _run(g, route, capacity, rows, wire=True, seed=1, hot=0, prefill="auto", exa
     return c, worst
 
 
+def _assert_segment_row_invariance(g, operands, hot):
+    """Ordinary STREAM bytes must survive mapped gather/scatter and route reordering."""
+    from itertools import permutations
+
+    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_segment_scratch_bytes
+    from b12x.sequence._shared.disk_table import MappedHostAllocation
+
+    rows, maximum = 2752, 16384
+    device = torch.device("cuda", torch.cuda.current_device())
+    gen = torch.Generator(device=device).manual_seed(844)
+    direct = _program(g, "stream", rows, True)
+    indirect = compile_fp8_moe_aot(g, route="stream", max_rows=maximum, row_addresses=True)
+    assert indirect.geometry["row_addresses"] and indirect.geometry["route"] == "stream"
+    direct_scratch = torch.empty(direct.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device=device)
+    scratch = torch.empty(fp8_moe_segment_scratch_bytes(g, 3 * rows, maximum),
+                          dtype=torch.uint8, device=device)
+    allocations, segments = [], []
+    sentinel = 173
+    try:
+        for _ in range(3):
+            x = torch.randn(rows, g.hidden, device=device, generator=gen).bfloat16()
+            source, _ = wire_rows(x)
+            scores = torch.rand(rows, g.experts, device=device, generator=gen)
+            if hot:
+                scores[:, :hot] += 2.0
+            ids = scores.topk(g.top_k, -1).indices.int().contiguous()
+            weights = torch.rand(rows, g.top_k, device=device, generator=gen)
+            baseline = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device=device)
+            direct.launch(source, ids, weights, *operands, baseline, direct_scratch, scalars=(rows,))
+            torch.cuda.synchronize()
+            assert torch.isfinite(baseline).all() and baseline.count_nonzero() > 0
+            source_allocation = MappedHostAllocation((rows + 2, source.shape[1]), torch.uint8, device)
+            allocations.append(source_allocation)
+            response = MappedHostAllocation((rows + 2, g.hidden), torch.bfloat16, device)
+            allocations.append(response)
+            source_allocation.host_view.fill_(sentinel)
+            source_allocation.host_view[1:-1].copy_(source.cpu())
+            input_snapshot = source_allocation.host_view.clone()
+            segments.append((source_allocation, response, ids, weights, baseline.cpu(), input_snapshot))
+
+        for count in (2, 3):
+            for order in permutations(range(3), count):
+                for source_allocation, response, *_ in segments:
+                    response.host_view.view(torch.uint8).fill_(sentinel)
+                input_addresses, output_addresses, routed_ids, routed_weights = [], [], [], []
+                for position, segment in enumerate(order):
+                    source_allocation, response, ids, weights, _, _ = segments[segment]
+                    # Change the global expert-sorted route order without changing a row's slot sum.
+                    permutation = (torch.arange(rows, device=device) if position == 0 else
+                                   torch.arange(rows - 1, -1, -1, device=device) if position == 1 else
+                                   torch.randperm(rows, device=device, generator=gen))
+                    input_addresses.append(source_allocation.device_view.data_ptr()
+                                           + (permutation.long() + 1) * source_allocation.host_view.stride(0))
+                    output_addresses.append(response.device_view.data_ptr()
+                                            + (permutation.long() + 1) * g.hidden * 2)
+                    routed_ids.append(ids[permutation])
+                    routed_weights.append(weights[permutation])
+                x_addresses = torch.cat(input_addresses)
+                y_addresses = torch.cat(output_addresses)
+                ids = torch.cat(routed_ids)
+                weights = torch.cat(routed_weights)
+                indirect.launch(x_addresses, ids, weights, *operands, y_addresses, scratch,
+                                scalars=(count * rows,))
+                torch.cuda.synchronize()
+                for segment, (source_allocation, response, _, _, baseline, snapshot) in enumerate(segments):
+                    assert torch.equal(source_allocation.host_view, snapshot), "input/guards modified"
+                    raw = response.host_view.view(torch.uint8)
+                    assert (raw[0] == sentinel).all() and (raw[-1] == sentinel).all(), "response guard overwritten"
+                    if segment in order:
+                        actual = response.host_view[1:-1]
+                        assert torch.isfinite(actual).all() and actual.count_nonzero() > 0
+                        different = int((actual.view(torch.int16) != baseline.view(torch.int16)).sum())
+                        assert different == 0, (f"{g.name} tp{g.tp} hot={hot} order={order} segment={segment}: "
+                                                f"{different} BF16 words differ")
+                    else:
+                        assert (raw == sentinel).all(), "nonmember response modified"
+                print(f"row_addresses {g.name} tp{g.tp} hot={hot} order={order} rows={count * rows}: byte-identical")
+    finally:
+        for allocation in reversed(allocations):
+            allocation.close()
+
+
+@pytest.mark.parametrize("hot", [0, 8])
+def test_fp8_moe_stream_segment_row_invariance(hot):
+    g = _geometry("mimo", 2)
+    _assert_segment_row_invariance(g, _weights(g), hot)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _setup():
     require_b12x()
