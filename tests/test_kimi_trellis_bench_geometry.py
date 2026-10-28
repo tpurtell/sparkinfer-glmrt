@@ -34,8 +34,10 @@ def _load_harness():
 h = _load_harness()
 
 # Content hash of the generated fixtures; the duel stages this exact manifest
-# on both seeds, and cross-seed digest equality depends on it.
-FIXTURES_SHA256 = "8a73a66bfc8e00aa747ed09c6d5a2d2cc2501c01bd63069809045acc92e6553f"
+# on both seeds, and cross-seed digest equality depends on it. The fixture
+# stream is platform-independent: the x86 coordinator image and the ARM64
+# spark image both produce this hash.
+FIXTURES_SHA256 = "a42073d1e8bafa1c652e25cbb3d66a9589774f46156915fc3e88587914906530"
 
 
 def test_frozen_blobs_are_the_pin_literals():

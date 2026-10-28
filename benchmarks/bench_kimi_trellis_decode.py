@@ -60,6 +60,7 @@ import os
 import select
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import tarfile
@@ -546,8 +547,39 @@ def fixture_layer_seed(layer: int) -> int:
     return 0x4B330000 + int(layer) * 0x100
 
 
-def _normalized_weights(weights):
-    return weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+_MASK64 = (1 << 64) - 1
+
+
+def _uniform_stream(seed: int, count: int):
+    """Uniform [0, 1) values from splitmix64; identical on every platform.
+
+    torch CPU generators are reproducible on one build but not across builds or
+    architectures, and both duel seeds must derive byte-identical fixtures. A
+    counter PRNG defined here is independent of torch, endianness and SIMD.
+    """
+    state = int(seed) & _MASK64
+    values = []
+    for _ in range(int(count)):
+        state = (state + 0x9E3779B97F4A7C15) & _MASK64
+        z = state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+        z ^= z >> 31
+        values.append((z >> 11) * (1.0 / (1 << 53)))
+    return values
+
+
+def _bf16_bits(value: float) -> int:
+    """Round one float64 to bf16 with RNE and return its 16-bit pattern."""
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
+
+
+def _bf16_tensor(values, shape) -> torch.Tensor:
+    patterns = [_bf16_bits(value) for value in values]
+    words = [word if word < 0x8000 else word - 0x10000 for word in patterns]
+    tensor = torch.tensor(words, dtype=torch.int16).view(torch.bfloat16)
+    return tensor.view(*shape)
 
 
 def build_layer_fixtures(layer: int, curve=None, rows=EXACTNESS_ROWS):
@@ -555,31 +587,45 @@ def build_layer_fixtures(layer: int, curve=None, rows=EXACTNESS_ROWS):
 
     Each row r is an independent fixture: exactly curve[r] distinct experts,
     16 distinct experts per row (a router never repeats an expert), and a
-    shared input tensor whose prefix x[:r] is the row-r input.
+    shared input tensor whose prefix x[:r] is the row-r input. Generation uses
+    the platform-independent stream above, so the manifest hash is the same in
+    the x86 coordinator image and the ARM64 spark image.
     """
     curve = curve or derive_distinct_curve()
     rows = [int(row) for row in rows]
-    gen_x = torch.Generator(device="cpu").manual_seed(fixture_layer_seed(layer) ^ 0x58)
-    x = (torch.randn((max(rows), HIDDEN), generator=gen_x, dtype=torch.float32) * 0.25
-         ).to(torch.bfloat16)
-    gen_perm = torch.Generator(device="cpu").manual_seed(fixture_layer_seed(layer) ^ 0xA1)
-    perm = torch.randperm(EXPERTS, generator=gen_perm)
-    gen_w = torch.Generator(device="cpu").manual_seed(fixture_layer_seed(layer) ^ 0x77)
+    seed = fixture_layer_seed(layer)
+    width = max(rows)
+    uniforms = _uniform_stream(seed ^ 0x58, width * HIDDEN)
+    x = _bf16_tensor((0.25 * (2.0 * value - 1.0) for value in uniforms),
+                     (width, HIDDEN))
+    keys = _uniform_stream(seed ^ 0xA1, EXPERTS)
+    perm = sorted(range(EXPERTS), key=lambda expert: (keys[expert], expert))
     fixtures = {}
     for row in rows:
         distinct = int(curve[row])
         if distinct < TOPK or distinct > min(row * TOPK, EXPERTS):
             raise ValueError(f"row {row}: {distinct} distinct experts is not routable")
         active = perm[:distinct]
-        sequence = torch.arange(row * TOPK) % distinct
-        ids = active[sequence].view(row, TOPK).to(torch.int32)
-        weights = _normalized_weights(
-            torch.rand((row, TOPK), generator=gen_w, dtype=torch.float32) * 0.8 + 0.2)
-        order = torch.argsort(weights, dim=1, descending=True, stable=True)
-        ids = torch.gather(ids, 1, order).contiguous()
-        weights = torch.gather(weights, 1, order).contiguous()
-        fixtures[row] = {"ids": ids, "weights": weights,
-                         "distinct": distinct, "active": active.clone()}
+        raw = _uniform_stream(seed ^ 0x77 ^ (row << 32), row * TOPK)
+        ids_flat = []
+        weight_flat = []
+        for index in range(row):
+            span = raw[index * TOPK:(index + 1) * TOPK]
+            weights = [0.2 + 0.8 * value for value in span]
+            total = sum(weights)
+            weights = [value / total for value in weights]
+            order = sorted(range(TOPK), key=lambda item: (-weights[item], item))
+            base = [active[(index * TOPK + item) % distinct]
+                    for item in range(TOPK)]
+            ids_flat.extend(base[item] for item in order)
+            weight_flat.extend(weights[item] for item in order)
+        fixtures[row] = {
+            "ids": torch.tensor(ids_flat, dtype=torch.int32).view(row, TOPK),
+            "weights": torch.tensor(weight_flat,
+                                    dtype=torch.float32).view(row, TOPK),
+            "distinct": distinct,
+            "active": torch.tensor(active, dtype=torch.int32),
+        }
     return {"x": x, "rows": fixtures}
 
 
@@ -1336,7 +1382,7 @@ class ArmRuntime:
                 self.buffer_sets[(capacity, variant)] = make_capacity_buffers(
                     self.mt, launch, self.torch_device, int(props.multi_processor_count))
         self.capacity_meta = self._capacity_meta()
-        self.exactness = {}
+        self.exactness = []
         self.exactness_failures = []
         self._run_exactness()
         self.digests = {"schema": "cuteafd.kimi-k3-trellis-digests.v1",
