@@ -39,9 +39,10 @@ and interleaves one timing round per arm in rotating order, so every entrant
 and the oracle are measured on the same seed, in the same session, against the
 same frozen digests; it then applies the ship bar (share-weighted speedup
 >= 1.10x on both layers, no fixture regressing beyond duplicate-control noise,
-byte-exact first). Workers restart every round, so each arm's per-fixture
-samples re-roll device placement instead of carrying one process's placement
-offset for the whole session.
+byte-exact first). Workers restart every round and both the spawn and timing
+order rotate, so each arm's per-fixture samples cover every process-start slot
+and the median across rounds averages device placement instead of carrying one
+worker's placement offset for the whole session.
 
 The per-fixture noise allowance is max(oracle graph-duplicate spread,
 candidate graph-duplicate spread, 3%). Both parts are measured: a fixed-worker
@@ -1850,12 +1851,11 @@ def validate_session_spec(spec):
     return spec
 
 
-def _spawn_round_workers(spec, common_env, log_dir, round_index, driver_hash,
-                         driver_harness):
-    """Start every arm's worker for one round and collect its ready payload."""
+def _spawn_round_workers(spec, names, common_env, log_dir, round_index,
+                         driver_hash, driver_harness):
+    """Start the named arms' workers in the given order and collect ready."""
     workers = {}
     arms = {arm["name"]: arm for arm in spec["arms"]}
-    names = [arm["name"] for arm in spec["arms"]]
     try:
         for name in names:
             arm = arms[name]
@@ -1951,10 +1951,14 @@ def run_session(args):
         for round_index in range(int(spec["rounds"])):
             # Fresh processes per round: the staged weights' placement and
             # residency are per-process (identical processes measured 1.6-3.7%
-            # apart on one seed), so every round re-rolls that offset instead
-            # of carrying one worker's placement through the whole session.
+            # apart on one seed) and follow spawn order, so both the spawn and
+            # the timing order rotate every round; the per-fixture median
+            # across rounds then averages the placement slots instead of
+            # carrying one worker's away.
+            order = _rotate([arm["name"] for arm in spec["arms"]], round_index)
             workers, ready = _spawn_round_workers(
-                spec, common_env, log_dir, round_index, driver_hash, driver_harness)
+                spec, order, common_env, log_dir, round_index, driver_hash,
+                driver_harness)
             try:
                 oracle_hashes = ready["oracle"]["provenance"]["file_hashes"]
                 if oracle_hashes != FROZEN_BLOBS:
@@ -1972,7 +1976,6 @@ def run_session(args):
                         "ready_rounds": [],
                     })
                     arm_entry["ready_rounds"].append(_round_check(round_index, payload))
-                order = _rotate([arm["name"] for arm in spec["arms"]], round_index)
                 round_entry = {"round": round_index, "order": order, "arms": {}}
                 for name in order:
                     workers[name].send({"cmd": "round", "round": round_index})
@@ -2012,9 +2015,10 @@ def aggregate_session(result, fixtures, spec):
         "rounds": int(spec["rounds"]),
         "replays_per_graph_per_round": int(spec["replays"]),
         "order": "rotating per round; every arm plus the oracle in one session",
-        "worker_restart": "fresh worker processes every round, so each arm's "
-                          "samples re-roll per-process device placement "
-                          "(measured 1.6-3.7% between identical workers)",
+        "worker_restart": "fresh worker processes every round; spawn and "
+                          "timing order rotate together, so each arm's samples "
+                          "re-roll per-process device placement (measured "
+                          "1.6-3.7% between identical workers)",
         "duplicate_control": "two captured graphs per fixture; A/B medians "
                              "measure same-session noise",
         "fixtures": str(Path(spec["fixtures"]).resolve()),
