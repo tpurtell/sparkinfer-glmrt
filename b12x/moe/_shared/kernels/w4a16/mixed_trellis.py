@@ -2241,16 +2241,38 @@ def _select_mixed_fc2_kernel(
 def _apply_mixed_residency(kernel, requested: int | None, max_shared_mem: int) -> None:
     """Apply an offline plan override without changing automatic launch policy.
 
-    The conservative register bound assumes the full 256-register allocation
-    quantum per thread. Shared storage includes one driver KiB per block and
-    uses the supplied per-block opt-in limit as a conservative SM budget.
-    Residency already participates in the kernel's immutable compile key.
+    The default register bound assumes 256 registers per thread. The explicit
+    Kimi m80 K2/K3 override permits two 256-thread CTAs: the kernel's existing
+    min_blocks_per_mp launch bound constrains ptxas to 128 registers/thread.
+    Other geometries retain the conservative bound. Shared storage includes
+    one driver KiB per block and uses the opt-in limit as a conservative SM
+    budget. Residency already participates in the immutable compile key.
     """
     if requested is None:
         return
     if type(requested) is not int or requested not in (1, 2):
         raise ValueError("mixed Trellis residency override must be one or two blocks/SM")
-    if requested * kernel.cta_threads > 256:
+    bounded_kimi_m80 = (
+        requested == 2
+        and getattr(kernel, "size_m", None) == 80
+        and getattr(kernel, "hidden_size", None) == 3584
+        and getattr(kernel, "intermediate_size", None) == 512
+        and getattr(kernel, "top_k", None) == 16
+        and kernel.cta_threads == 256
+        and all(
+            getattr(tier, "num_experts", None) == 896
+            and getattr(tier, "trellis_bits", None) == bits
+            and getattr(tier, "moe_block_size", None) == 8
+            and all(
+                (getattr(getattr(tier, phase, None), "tile_k", None),
+                 getattr(getattr(tier, phase, None), "tile_n", None)) == (64, 256)
+                for phase in ("fc1", "fc2")
+            )
+            for tier, bits in ((kernel.tier0, 2), (kernel.tier1, 3))
+        )
+    )
+    thread_budget = 512 if bounded_kimi_m80 else 256
+    if requested * kernel.cta_threads > thread_budget:
         raise ValueError("mixed Trellis residency exceeds the conservative register budget")
     if requested * (kernel.shared_words * 4 + 1024) > int(max_shared_mem):
         raise ValueError("mixed Trellis residency exceeds the conservative shared-memory budget")
