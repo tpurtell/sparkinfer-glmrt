@@ -34,17 +34,26 @@ Protocol
 the trace fit). `stage` extracts the two layers from the checkpoint. `run`
 loads one arm (oracle or candidate), checks byte exactness on rows 1..80 for
 both layers, then times the full graph on the shared timing set with
-duplicate-control graphs and writes JSON. `session` keeps several arms
-resident in one process per arm and interleaves one timing round per arm in
-rotating order, so every entrant and the oracle are measured on the same seed,
-in the same session, against the same frozen digests; it then applies the ship
-bar (share-weighted speedup >= 1.10x on both layers, no fixture regressing
-beyond duplicate-control noise, byte-exact first). The per-fixture noise
-allowance is max(oracle graph-duplicate spread, candidate graph-duplicate
-spread, 3%): a four-worker control session on one seed showed byte-identical
-sources still differing by up to 1.6% per fixture from per-worker placement,
-plus single-round outliers up to 3.2% that the in-arm graph duplicates expose
-themselves, so the floor is measured rather than assumed.
+duplicate-control graphs and writes JSON. `session` runs one process per arm
+and interleaves one timing round per arm in rotating order, so every entrant
+and the oracle are measured on the same seed, in the same session, against the
+same frozen digests; it then applies the ship bar (share-weighted speedup
+>= 1.10x on both layers, no fixture regressing beyond duplicate-control noise,
+byte-exact first). Workers restart every round, so each arm's per-fixture
+samples re-roll device placement instead of carrying one process's placement
+offset for the whole session.
+
+The per-fixture noise allowance is max(oracle graph-duplicate spread,
+candidate graph-duplicate spread, 3%). Both parts are measured: a fixed-worker
+control session of four byte-identical sources showed per-worker placement
+offsets up to 1.6% on one seed, and a second seed's control session showed
+offsets up to 3.7% per fixture, stable across rounds and concentrated on the
+layer-92 heavy rows (3.1% off in the share-weighted layer ratio for two of the
+three duplicate arms) -- the same weight-placement/L2 locality lead as the
+trace's layer-position spread, not a kernel property. Restarting workers every
+round re-rolls that offset per round, and the per-fixture median across rounds
+averages it; the 3% floor then covers the residual spread plus single-round
+outliers that the in-arm graph duplicates expose themselves.
 
 The timing set is weighted by the trace's own share of kernel busy time:
 rows 72, 41, 33, 31/32 (~70%), plus 5 and 6 for C1 verify and m1 at row 1.
@@ -198,10 +207,11 @@ TIMING_ROWS = (1, 5, 6, 31, 32, 33, 41, 72)
 EXACTNESS_ROWS = tuple(range(1, CAPACITY_ROWS + 1))
 SHIP_BAR = 1.10
 # Arm-level duplicate noise, measured: four byte-identical oracle workers
-# interleaved in one session differed by up to 1.6% per fixture from
-# per-worker placement, and single-round outliers reached 3.2% (that case was
-# already covered by the in-arm A/B graph spread). A fixed 1% floor flagged
-# such identical arms as regressions, so the floor is the measured envelope.
+# interleaved in one session differed by up to 1.6% per fixture on one seed and
+# 3.7% on the other (stable per worker, layer-92 heavy rows), and single-round
+# outliers reached 3.2% (that case was already covered by the in-arm A/B graph
+# spread). The session driver restarts workers every round so the per-fixture
+# median averages independent placements; the floor covers the residual.
 NOISE_FLOOR = 0.03
 
 DEFAULT_CAPACITIES = ({"capacity": CAPACITY_M1}, {"capacity": CAPACITY_ROWS})
@@ -1840,6 +1850,65 @@ def validate_session_spec(spec):
     return spec
 
 
+def _spawn_round_workers(spec, common_env, log_dir, round_index, driver_hash,
+                         driver_harness):
+    """Start every arm's worker for one round and collect its ready payload."""
+    workers = {}
+    arms = {arm["name"]: arm for arm in spec["arms"]}
+    names = [arm["name"] for arm in spec["arms"]]
+    try:
+        for name in names:
+            arm = arms[name]
+            harness = Path(arm["source"]) / "benchmarks" / Path(driver_harness).name
+            if not harness.is_file():
+                raise FileNotFoundError(f"{name}: missing {harness}")
+            if sha256_file(harness) != driver_hash:
+                raise ValueError(
+                    f"{name}: harness differs from the frozen session harness")
+            env = dict(common_env)
+            command = [
+                sys.executable, str(harness), "serve",
+                "--source", str(Path(arm["source"]).resolve()),
+                "--stage", spec["stage"],
+                "--fixtures", spec["fixtures"],
+                "--digests", spec["digests"],
+                "--capacities", json.dumps(arm.get("capacities")
+                                           if arm.get("capacities")
+                                           else list(DEFAULT_CAPACITIES)),
+                "--replays", str(int(spec["replays"])),
+                "--rounds", str(int(spec["rounds"])),
+                "--tag", name,
+            ]
+            workers[name] = WorkerHandle(
+                name, command, log_dir / f"{name}.r{round_index}.log", env)
+        deadline = time.time() + float(spec["startup_timeout"])
+        ready = {}
+        for name in names:
+            remaining = max(1.0, deadline - time.time())
+            payload = workers[name].receive(remaining)
+            if payload.get("event") != "ready":
+                raise RuntimeError(f"{name}: unexpected startup event {payload}")
+            ready[name] = payload
+        return workers, ready
+    except BaseException:
+        for worker in workers.values():
+            worker.kill()
+        raise
+
+
+def _round_check(round_index, payload):
+    """Compact per-round exactness record (full lists stay in the first ready)."""
+    return {
+        "round": round_index,
+        "exactness_ok": payload["exactness_ok"],
+        "exactness_failures": payload["exactness_failures"],
+        "digest_mismatches": payload["digest_mismatches"],
+        "graph_digest_failures": payload["graph_digest_failures"],
+        "graph_notes": payload["graph_notes"],
+        "provenance": payload["provenance"],
+    }
+
+
 def run_session(args):
     spec = validate_session_spec(load_json(Path(args.spec)))
     fixtures = load_json(Path(spec["fixtures"]))
@@ -1855,6 +1924,7 @@ def run_session(args):
     common_env["TRITON_CACHE_DIR"] = str(cache_root / "triton")
     common_env["B12X_COMPILE_DISK_CACHE"] = "0"
     Path(common_env["HOME"]).mkdir(parents=True, exist_ok=True)
+    arms = {arm["name"]: arm for arm in spec["arms"]}
     workers = {}
     log_dir = Path(args.log_dir or (cache_root / "logs"))
     rounds = []
@@ -1870,62 +1940,51 @@ def run_session(args):
         "arms": {},
         "rounds": rounds,
     }
-    try:
-        for arm in spec["arms"]:
-            harness = Path(arm["source"]) / "benchmarks" / Path(driver_harness).name
-            if not harness.is_file():
-                raise FileNotFoundError(f"{arm['name']}: missing {harness}")
-            if sha256_file(harness) != driver_hash:
-                raise ValueError(
-                    f"{arm['name']}: harness differs from the frozen session harness")
-            env = dict(common_env)
-            command = [
-                sys.executable, str(harness), "serve",
-                "--source", str(Path(arm["source"]).resolve()),
-                "--stage", spec["stage"],
-                "--fixtures", spec["fixtures"],
-                "--digests", spec["digests"],
-                "--capacities", json.dumps(arm.get("capacities")
-                                           if arm.get("capacities")
-                                           else list(DEFAULT_CAPACITIES)),
-                "--replays", str(int(spec["replays"])),
-                "--rounds", str(int(spec["rounds"])),
-                "--tag", arm["name"],
-            ]
-            workers[arm["name"]] = WorkerHandle(
-                arm["name"], command, log_dir / f"{arm['name']}.log", env)
-        deadline = time.time() + float(spec["startup_timeout"])
-        for arm in spec["arms"]:
-            name = arm["name"]
-            remaining = max(1.0, deadline - time.time())
-            payload = workers[name].receive(remaining)
-            if payload.get("event") != "ready":
-                raise RuntimeError(f"{name}: unexpected startup event {payload}")
-            result["arms"][name] = {
-                "source": str(Path(arm["source"]).resolve()),
-                "capacities_requested": arm.get("capacities") or list(DEFAULT_CAPACITIES),
-                "ready": payload,
-            }
-        oracle_hashes = result["arms"]["oracle"]["ready"]["provenance"]["file_hashes"]
-        if oracle_hashes != FROZEN_BLOBS:
+    for arm in spec["arms"]:
+        harness = Path(arm["source"]) / "benchmarks" / Path(driver_harness).name
+        if not harness.is_file():
+            raise FileNotFoundError(f"{arm['name']}: missing {harness}")
+        if sha256_file(harness) != driver_hash:
             raise ValueError(
-                "the oracle arm is not the frozen pin tree: "
-                f"{ {k: v for k, v in oracle_hashes.items() if v != FROZEN_BLOBS.get(k)} }")
-        for name, entry in result["arms"].items():
-            if entry["ready"]["provenance"]["fixtures_sha256"] != fixtures["fixtures_sha256"]:
-                raise ValueError(f"{name}: worker loaded different fixtures")
+                f"{arm['name']}: harness differs from the frozen session harness")
+    try:
         for round_index in range(int(spec["rounds"])):
-            order = _rotate([arm["name"] for arm in spec["arms"]], round_index)
-            entry = {"round": round_index, "order": order, "arms": {}}
-            for name in order:
-                workers[name].send({"cmd": "round", "round": round_index})
-                payload = workers[name].receive(float(spec["round_timeout"]))
-                if payload.get("event") != "round":
-                    raise RuntimeError(f"{name}: unexpected round event {payload}")
-                entry["arms"][name] = payload
-            rounds.append(entry)
-        for name in workers:
-            workers[name].close()
+            # Fresh processes per round: the staged weights' placement and
+            # residency are per-process (identical processes measured 1.6-3.7%
+            # apart on one seed), so every round re-rolls that offset instead
+            # of carrying one worker's placement through the whole session.
+            workers, ready = _spawn_round_workers(
+                spec, common_env, log_dir, round_index, driver_hash, driver_harness)
+            try:
+                oracle_hashes = ready["oracle"]["provenance"]["file_hashes"]
+                if oracle_hashes != FROZEN_BLOBS:
+                    raise ValueError(
+                        "the oracle arm is not the frozen pin tree: "
+                        f"{ {k: v for k, v in oracle_hashes.items() if v != FROZEN_BLOBS.get(k)} }")
+                for name, payload in ready.items():
+                    if payload["provenance"]["fixtures_sha256"] != fixtures["fixtures_sha256"]:
+                        raise ValueError(f"{name}: worker loaded different fixtures")
+                    arm_entry = result["arms"].setdefault(name, {
+                        "source": str(Path(arms[name]["source"]).resolve()),
+                        "capacities_requested": arms[name].get("capacities")
+                        or list(DEFAULT_CAPACITIES),
+                        "ready": payload,
+                        "ready_rounds": [],
+                    })
+                    arm_entry["ready_rounds"].append(_round_check(round_index, payload))
+                order = _rotate([arm["name"] for arm in spec["arms"]], round_index)
+                round_entry = {"round": round_index, "order": order, "arms": {}}
+                for name in order:
+                    workers[name].send({"cmd": "round", "round": round_index})
+                    payload = workers[name].receive(float(spec["round_timeout"]))
+                    if payload.get("event") != "round":
+                        raise RuntimeError(f"{name}: unexpected round event {payload}")
+                    round_entry["arms"][name] = payload
+                rounds.append(round_entry)
+            finally:
+                for worker in workers.values():
+                    worker.close()
+                workers = {}
         result["aggregate"] = aggregate_session(result, fixtures, spec)
         write_json(Path(args.out), result)
         return result
@@ -1953,14 +2012,35 @@ def aggregate_session(result, fixtures, spec):
         "rounds": int(spec["rounds"]),
         "replays_per_graph_per_round": int(spec["replays"]),
         "order": "rotating per round; every arm plus the oracle in one session",
+        "worker_restart": "fresh worker processes every round, so each arm's "
+                          "samples re-roll per-process device placement "
+                          "(measured 1.6-3.7% between identical workers)",
         "duplicate_control": "two captured graphs per fixture; A/B medians "
                              "measure same-session noise",
         "fixtures": str(Path(spec["fixtures"]).resolve()),
     }}
     for name, entry in result["arms"].items():
         ready = entry["ready"]
-        exact = bool(ready["exactness_ok"] and not ready["digest_mismatches"]
-                     and not ready["graph_digest_failures"])
+        checks = entry.get("ready_rounds") or [{
+            "exactness_ok": ready["exactness_ok"],
+            "exactness_failures": ready["exactness_failures"],
+            "digest_mismatches": ready["digest_mismatches"],
+            "graph_digest_failures": ready["graph_digest_failures"],
+            "provenance": ready["provenance"],
+        }]
+        # Every round is a fresh process and must re-verify exactness and the
+        # frozen digests on its own.
+        exact = all(bool(check["exactness_ok"] and not check["digest_mismatches"]
+                         and not check["graph_digest_failures"])
+                    for check in checks)
+        exactness_failures = [failure for check in checks
+                              for failure in check["exactness_failures"]]
+        digest_mismatches = [mismatch for check in checks
+                             for mismatch in check["digest_mismatches"]]
+        graph_digest_failures = [failure for check in checks
+                                 for failure in check["graph_digest_failures"]]
+        frozen_pin_match = all(check["provenance"]["frozen_pin_match"]
+                               for check in checks)
         if name == "oracle":
             compare = {"identical": True}
             ship = exact
@@ -1969,10 +2049,10 @@ def aggregate_session(result, fixtures, spec):
             ship = bool(exact and compare["ship_bar_met"])
         aggregate["arms"][name] = {
             "exact": exact,
-            "exactness_failures": ready["exactness_failures"],
-            "digest_mismatches": ready["digest_mismatches"],
-            "graph_digest_failures": ready["graph_digest_failures"],
-            "frozen_pin_match": ready["provenance"]["frozen_pin_match"],
+            "exactness_failures": exactness_failures,
+            "digest_mismatches": digest_mismatches,
+            "graph_digest_failures": graph_digest_failures,
+            "frozen_pin_match": frozen_pin_match,
             "capacities": ready["capacities"],
             "baseline_ms": {fixture: item["median_ms"]
                             for fixture, item in stats[name].items()},
@@ -1980,6 +2060,11 @@ def aggregate_session(result, fixtures, spec):
                                  for fixture, item in stats[name].items()},
             "compare": compare,
             "shippable": ship,
+            "round_checks": [{"round": check.get("round"),
+                              "exactness_ok": check["exactness_ok"],
+                              "digest_mismatches": len(check["digest_mismatches"]),
+                              "graph_digest_failures": len(check["graph_digest_failures"])}
+                             for check in checks],
         }
     # Every arm must have matched the frozen digests; the aggregate says so.
     aggregate["frozen_digests_checked"] = bool(frozen)

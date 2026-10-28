@@ -404,6 +404,74 @@ def test_noise_floor_matches_measured_session_noise():
     assert spot in h.compare_arm(oracle, genuine)["layers"]["13"]["regressions"]
 
 
+def test_aggregate_checks_every_rounds_ready_payload(tmp_path):
+    # The session restarts workers every round, so each round's fresh process
+    # re-verifies exactness and the frozen digests; a failure in any round must
+    # fail the arm, and the protocol must say so.
+    def ready(exactness_ok=True, mismatch=False):
+        return {
+            "exactness_ok": exactness_ok,
+            "exactness_failures": [] if exactness_ok else ["fixture failed"],
+            "digest_mismatches": ["spot"] if mismatch else [],
+            "graph_digest_failures": [],
+            "graph_notes": [],
+            "capacities": {"installed": [1, 80]},
+            "provenance": {"frozen_pin_match": True},
+        }
+
+    def round_check(round_index, payload):
+        return h._round_check(round_index, payload)
+
+    def fixtures_payload():
+        entries = []
+        for layer in h.LAYERS:
+            for row in h.TIMING_ROWS:
+                entries.append({
+                    "id": f"l{layer}/r{row}", "a": [1.0], "b": [1.0],
+                    "capacity": 1 if row == 1 else 80,
+                    "layer": layer, "row": row,
+                })
+        return entries
+
+    def rounds_payload():
+        return [
+            {"round": index, "order": ["oracle", "candidate"],
+             "arms": {
+                 "oracle": {"fixtures": fixtures_payload()},
+                 "candidate": {"fixtures": fixtures_payload()},
+             }}
+            for index in range(2)
+        ]
+
+    digests_path = tmp_path / "digests.json"
+    digests_path.write_text(json.dumps({"digests": {"l13/r1": "deadbeef"}}))
+    spec = {
+        "digests": str(digests_path),
+        "fixtures": str(tmp_path / "fixtures.json"),
+        "rounds": 2, "replays": 1,
+    }
+    result = {
+        "arms": {
+            "oracle": {
+                "ready": ready(), "ready_rounds": [
+                    round_check(0, ready()), round_check(1, ready())],
+            },
+            "candidate": {
+                "ready": ready(), "ready_rounds": [
+                    round_check(0, ready()), round_check(1, ready(mismatch=True))],
+            },
+        },
+        "rounds": rounds_payload(),
+    }
+    aggregate = h.aggregate_session(result, {"fixtures_sha256": "fixture-hash"}, spec)
+    assert aggregate["arms"]["oracle"]["exact"] is True
+    assert aggregate["arms"]["candidate"]["exact"] is False
+    assert aggregate["arms"]["candidate"]["digest_mismatches"] == ["spot"]
+    assert [check["digest_mismatches"] for check in
+            aggregate["arms"]["candidate"]["round_checks"]] == [0, 1]
+    assert "fresh worker processes every round" in aggregate["protocol"]["worker_restart"]
+
+
 def test_file_hashes_reports_missing_files(tmp_path):
     hashes = h.file_hashes(tmp_path)
     assert set(hashes) == set(h.FROZEN_BLOBS)
