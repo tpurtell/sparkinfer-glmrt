@@ -39,7 +39,12 @@ resident in one process per arm and interleaves one timing round per arm in
 rotating order, so every entrant and the oracle are measured on the same seed,
 in the same session, against the same frozen digests; it then applies the ship
 bar (share-weighted speedup >= 1.10x on both layers, no fixture regressing
-beyond duplicate-control noise, byte-exact first).
+beyond duplicate-control noise, byte-exact first). The per-fixture noise
+allowance is max(oracle graph-duplicate spread, candidate graph-duplicate
+spread, 3%): a four-worker control session on one seed showed byte-identical
+sources still differing by up to 1.6% per fixture from per-worker placement,
+plus single-round outliers up to 3.2% that the in-arm graph duplicates expose
+themselves, so the floor is measured rather than assumed.
 
 The timing set is weighted by the trace's own share of kernel busy time:
 rows 72, 41, 33, 31/32 (~70%), plus 5 and 6 for C1 verify and m1 at row 1.
@@ -192,7 +197,12 @@ TIMING_SHARES_PCT = {
 TIMING_ROWS = (1, 5, 6, 31, 32, 33, 41, 72)
 EXACTNESS_ROWS = tuple(range(1, CAPACITY_ROWS + 1))
 SHIP_BAR = 1.10
-NOISE_FLOOR = 0.01
+# Arm-level duplicate noise, measured: four byte-identical oracle workers
+# interleaved in one session differed by up to 1.6% per fixture from
+# per-worker placement, and single-round outliers reached 3.2% (that case was
+# already covered by the in-arm A/B graph spread). A fixed 1% floor flagged
+# such identical arms as regressions, so the floor is the measured envelope.
+NOISE_FLOOR = 0.03
 
 DEFAULT_CAPACITIES = ({"capacity": CAPACITY_M1}, {"capacity": CAPACITY_ROWS})
 

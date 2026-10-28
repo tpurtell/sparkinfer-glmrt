@@ -389,6 +389,21 @@ def test_compare_arm_requires_every_timed_fixture():
         h.compare_arm(oracle, incomplete)
 
 
+def test_noise_floor_matches_measured_session_noise():
+    # Four byte-identical oracle workers in one session measured stable
+    # per-fixture differences up to 1.6%; the floor absorbs those and the
+    # in-arm A/B spread covers wider single-round outliers.
+    assert h.NOISE_FLOOR == 0.03
+    oracle = _uniform_stats()
+    spot = "l13/r72"
+    offset = _uniform_stats(ms=1.0 / 1.2, spread=0.001)
+    offset[spot]["median_ms"] = 1.025   # 2.5% slower than oracle, placement noise
+    assert h.compare_arm(oracle, offset)["layers"]["13"]["regressions"] == []
+    genuine = _uniform_stats(ms=1.0 / 1.2, spread=0.001)
+    genuine[spot]["median_ms"] = 1.05   # 5% slower than oracle, a real regression
+    assert spot in h.compare_arm(oracle, genuine)["layers"]["13"]["regressions"]
+
+
 def test_file_hashes_reports_missing_files(tmp_path):
     hashes = h.file_hashes(tmp_path)
     assert set(hashes) == set(h.FROZEN_BLOBS)
