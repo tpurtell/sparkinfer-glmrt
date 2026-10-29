@@ -71,11 +71,12 @@ GLMF_VERIFY_MIX = {
 
 
 # Per-GPU target projection counts for the qualified TP2 placements. Kimi has
-# 69 KDA blocks, 24 MLA blocks split by owner, and 92 routed/shared blocks.
+# 69 KDA blocks, 24 MLA blocks split by owner, and 92 shared blocks; the
+# routed latent projections alternate owners (46 blocks per GPU).
 KIMI_VERIFY_MIX = {
     (7168, 6144, 1): 69 * 4, (6144, 7168, 2): 69,
     (7168, 3072, 1): 92 * 2, (3072, 7168, 2): 92,
-    (7168, 3584, 1): 92, (3584, 7168, 1): 92,
+    (7168, 3584, 1): 46, (3584, 7168, 1): 46,
     (7168, 1536, 1): 12, (7168, 640, 1): 12,
     (1536, 18432, 1): 12, (7168, 12288, 1): 12,
     (12288, 7168, 1): 12, (7168, 163840, 1): 1,
@@ -574,7 +575,9 @@ def benchmark_native_comparison(args):
     if family and not args.compile_only:
         report["metadata"]["streaming_read"] = streaming_read_bandwidth(l2, args.samples)
         report["metadata"]["mix"] = {":".join(map(str, s)): count for s, count in FAMILY_VERIFY_MIXES[family].items()}
-        report["metadata"]["aggregate_scope"] = ("ingress + multiply/reduce + native egress; one target + one draft head" if args.transforms else "native multiply/reduce only; one target + one draft head")
+        operations = "ingress + multiply/reduce + native egress" if args.transforms else "native multiply/reduce only"
+        heads = "one target + one draft head" if family == "glmf" else "target projections and target head"
+        report["metadata"]["aggregate_scope"] = operations + "; " + heads
     torch.manual_seed(273)
     for k, n, side in shapes:
         directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"

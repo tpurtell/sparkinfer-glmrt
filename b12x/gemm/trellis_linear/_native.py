@@ -3783,11 +3783,24 @@ class NativeTrellisLinear:
                     block=(128, 1, 1), stream=stream)
 
     @cute.jit
+    def _launch_k6_pair(self, inputs: cute.Tensor, payload: cute.Tensor,
+                       scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                       rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        tiles = Int32(self.n // (32 * self.decode_cta_warps) * self.splits)
+        self.multiply_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id).launch(
+            grid=(min(tiles, cta_limit), 1, 1), block=(32 * self.decode_cta_warps, 1, 1),
+            min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        if cutlass.const_expr(self.splits > 1):
+            self.reduce(partial, output, rows).launch(
+                grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
+
+    @cute.jit
     def _decode_k6(self, inputs: cute.Tensor, payload: cute.Tensor,
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows <= Int32(16):
-            if cutlass.const_expr(2 < self.splits <= 8 and (self.k & (self.k - 1)) != 0 and self.n <= 6144):
+            if cutlass.const_expr(2 < self.splits <= 6 and (self.k & (self.k - 1)) != 0 and 1536 < self.n <= 4096):
                 self.multiply_k6_folded(inputs, payload, scales, partial, output, rows, rotation_id).launch(
                     grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
                     block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
@@ -3797,33 +3810,34 @@ class NativeTrellisLinear:
                 self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
             elif cutlass.const_expr(self.n > 65536):
                 self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            # Ragged K keeps the existing route outside measured winning classes.
+            elif cutlass.const_expr((self.k & (self.k - 1)) != 0):
+                if cutlass.const_expr(self.splits == 2 and self.n <= 9216):
+                    self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
+                elif cutlass.const_expr((self.splits == 4 and self.n <= 8192) or (8 < self.splits <= 12 and self.n <= 4096)):
+                    if rows <= Int32(8):
+                        self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2 if self.splits == 4 else 1, 1, True, 1)
+                    else:
+                        self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                else:
+                    self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             elif cutlass.const_expr(self.splits == 2):
-                self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
-            elif cutlass.const_expr(self.splits == 4 and self.n > 4096):
+                if cutlass.const_expr(self.n > 8192):
+                    if rows <= Int32(8):
+                        self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                    else:
+                        self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
+                else:
+                    self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
+            elif cutlass.const_expr(self.splits == 4 and self.n > 1536):
                 if rows <= Int32(8):
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
                 else:
-                    tiles = Int32(self.n // (32 * self.decode_cta_warps) * self.splits)
-                    self.multiply_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id).launch(
-                        grid=(min(tiles, cta_limit), 1, 1),
-                        block=(32 * self.decode_cta_warps, 1, 1),
-                        min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                    self.reduce(partial, output, rows).launch(
-                        grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
-                        block=(128, 1, 1), stream=stream)
+                    self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             elif cutlass.const_expr(self.splits == 4):
                 self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
-            elif cutlass.const_expr(self.splits == 8):
-                tiles = Int32(self.n // (32 * self.decode_cta_warps) * self.splits)
-                self.multiply_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id).launch(
-                    grid=(min(tiles, cta_limit), 1, 1),
-                    block=(32 * self.decode_cta_warps, 1, 1),
-                    min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                self.reduce(partial, output, rows).launch(
-                    grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
-                    block=(128, 1, 1), stream=stream)
             else:
-                self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 1, 1, True, 1)
+                self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
         elif rows <= Int32(32):
             if cutlass.const_expr(self.n > 65536 or self.splits == 1):
                 self._decode_existing(inputs, payload, scales, partial, output,
