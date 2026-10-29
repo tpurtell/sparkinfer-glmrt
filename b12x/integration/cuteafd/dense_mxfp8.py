@@ -44,7 +44,7 @@ def compile_dense_mxfp8_quant_aot(*, input_features, max_rows=4096,
         Operand("rotated_inputs", torch.int64, f"[{rotation_count}]"),
         Operand("records", torch.uint8, "[record_bytes]", "out")),
         scalars=(Scalar("rows"), Scalar("rotation_id"), Scalar("cta_limit")),
-        key=tuple(g.values()), geometry=g)
+        key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1})
 
 
 def compile_dense_mxfp8_aot(*, input_features, output_features, encoding="trellis",
@@ -64,4 +64,4 @@ def compile_dense_mxfp8_aot(*, input_features, output_features, encoding="trelli
         Operand("records", torch.uint8, "[record_bytes]"),
         Operand("output", torch.float32, f"[rows,{n}]", "out")),
         scalars=(Scalar("rows"), Scalar("rotation_id"), Scalar("cta_limit")),
-        key=tuple(g.values()), geometry=g)
+        key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1})

@@ -45,6 +45,9 @@ _WS_STAGES = 4
 _WS_A_STAGE_BYTES = 8192
 _WS_MIN_ROWS = 130
 _PREFILL_MIN_ROWS = 130
+_E4M3_DECODE_ROWS = 64
+_FOLDED_DECODE_ROWS = 16
+_GEMINI_NARROW_ROWS = 8
 _PREFILL_STAGES = 2
 _PREFILL_PRODUCER_REGS = 104
 _PREFILL_CONSUMER_REGS = 192
@@ -571,6 +574,16 @@ class NativeTrellisLinear:
     ABI_VERSION = 1
     CTAS_PER_SM = 4
 
+    @property
+    def exact_row_cap(self):
+        """First arithmetic route; K6 row tiles retain the same K fold."""
+        if self.bits == 4 and self.e4m3:
+            if self.splits <= 2:
+                return _FOLDED_DECODE_ROWS
+            if not self.input_bf16:
+                return _GEMINI_NARROW_ROWS
+        return _E4M3_DECODE_ROWS if self.e4m3 else _PREFILL_MIN_ROWS - 1
+
     def __init__(self, g):
         self.k, self.n = g["input_features"], g["output_features"]
         self.bits, self.e4m3 = g["bits"], g["codebook"] == "e4m3"
@@ -642,8 +655,8 @@ class NativeTrellisLinear:
                  rows: Int32, rotation_id: Int32, cta_limit: Int32,
                  stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations) and cta_limit > Int32(0):
-            if cutlass.const_expr(self.e4m3 and self.max_rows > 64):
-                if rows > Int32(64):
+            if cutlass.const_expr(self.e4m3 and self.max_rows > _E4M3_DECODE_ROWS):
+                if rows > Int32(_E4M3_DECODE_ROWS):
                     tiles = ((rows + Int32(127)) // Int32(128)) * Int32(1 * (self.n // 128))
                     self.multiply_prefill_ws(inputs, payload, scales, output, rows, rotation_id).launch(
                         grid=(min(tiles, max(Int32(1), cta_limit // Int32(self.CTAS_PER_SM))), 1, 1),
@@ -679,7 +692,7 @@ class NativeTrellisLinear:
         if cutlass.const_expr(self.bits == 4 and self.e4m3 and not self.input_bf16):
             # Same-session overlap: folded short-K wins <=16; Gemini wins the rest.
             if cutlass.const_expr(self.splits <= 2):
-                if rows <= Int32(16):
+                if rows <= Int32(_FOLDED_DECODE_ROWS):
                     self.multiply_folded(inputs, payload, scales, output, rows, rotation_id).launch(
                         grid=(min(Int32(self.n // 32), cta_limit), 1, 1),
                         block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
@@ -695,7 +708,7 @@ class NativeTrellisLinear:
                        scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                        rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         tiles = Int32(self.n // 128 * self.splits)
-        if rows <= Int32(8):
+        if rows <= Int32(_GEMINI_NARROW_ROWS):
             self.multiply_narrow(inputs, payload, scales, partial, rows, rotation_id).launch(
                 grid=(min(tiles, cta_limit), 1, 1), block=(128, 1, 1),
                 min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
@@ -757,7 +770,7 @@ class NativeTrellisLinear:
                          scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                          rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if cutlass.const_expr(self.bits == 4 and self.e4m3 and self.splits <= 16):
-            if rows <= Int32(16):
+            if rows <= Int32(_FOLDED_DECODE_ROWS):
                 if cutlass.const_expr(self.splits <= 2):
                     self.multiply_folded(inputs, payload, scales, output, rows, rotation_id).launch(
                         grid=(min(Int32(self.n // 32), cta_limit), 1, 1),
@@ -2468,8 +2481,8 @@ class NativeTrellisLinear:
                      rows: Int32, rotation_id: Int32, cta_limit: Int32,
                      stream: cuda.CUstream):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id + Int32(3) < Int32(self.rotations) and cta_limit > Int32(0):
-            if cutlass.const_expr(self.e4m3 and self.max_rows > 64):
-                if rows > Int32(64):
+            if cutlass.const_expr(self.e4m3 and self.max_rows > _E4M3_DECODE_ROWS):
+                if rows > Int32(_E4M3_DECODE_ROWS):
                     tiles = ((rows + Int32(127)) // Int32(128)) * Int32(4 * (self.n // 128))
                     self.multiply_prefill_ws_grouped(inputs, payloads, scales, outputs, rows, rotation_id).launch(
                         grid=(min(tiles, max(Int32(1), cta_limit // Int32(self.CTAS_PER_SM))), 1, 1),

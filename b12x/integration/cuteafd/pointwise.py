@@ -527,7 +527,7 @@ def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, 
         Operand("w", torch.bfloat16, f"[{outputs},{width}]"),
         Operand("out", output_dtype, f"[rows,{outputs}]", "out")),
         scalars=(Scalar("rows"),), key=(width, outputs, str(output_dtype), launch.key()),
-        geometry=geometry)
+        geometry={**geometry, "exact_row_cap": 2**31 - 1 if compensated else launch.exact_row_cap})
 
 
 def compile_bf16_scaled_projection_aot(*, width, outputs, prescale):
