@@ -349,6 +349,7 @@ def benchmark_glmf_duel(args):
     report = dict(metadata=dict(device=props.name, sms=props.multi_processor_count,
         l2_bytes=l2, argv=sys.argv, snapshot_before=snapshot(), bits=6,
         input_dtype=args.input_dtype, codebook=args.codebook, exact_row_cap=129,
+        seed=273, untimed_warmup_seconds=1.0, cold_intervals_per_sample=32,
         ratio="baseline/candidate", cache="32 in-graph cold units, 2x runtime L2 eviction outside each timed interval"), records=[])
     torch.manual_seed(273)
     for k, n, side in shapes:
