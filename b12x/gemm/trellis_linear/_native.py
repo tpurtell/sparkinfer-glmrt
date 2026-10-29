@@ -3487,23 +3487,9 @@ class GeminiK6NativeTrellisLinear(NativeTrellisLinear):
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows <= Int32(16):
-            if cutlass.const_expr(self.n > 65536):
+            if cutlass.const_expr(self.n > 65536 or (self.input_units and self.splits > 4)):
                 self._decode_existing(inputs, payload, scales, partial, output,
                                       rows, rotation_id, cta_limit, stream)
-            elif Int32(self.n // 128 * self.splits) >= cta_limit:
-                if cutlass.const_expr(self.input_units):
-                    self._decode_existing(inputs, payload, scales, partial, output,
-                                          rows, rotation_id, cta_limit, stream)
-                else:
-                    tiles = Int32(self.n // 128 * self.splits)
-                    self.multiply_pair4(inputs, payload, scales, partial, rows, rotation_id).launch(
-                        grid=(min(tiles, cta_limit), 1, 1),
-                        block=(128, 1, 1),
-                        min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                    if cutlass.const_expr(self.splits > 1):
-                        self.reduce(partial, output, rows).launch(
-                            grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
-                            block=(128, 1, 1), stream=stream)
             else:
                 tiles = Int32(self.n // (32 * self.decode_cta_warps) * self.splits)
                 self.multiply_narrow_imm(inputs, payload, scales, partial, output, rows, rotation_id).launch(
