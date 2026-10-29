@@ -95,6 +95,24 @@ def test_prefill_arm_rejects_invalid(value):
         bench.parse_prefill_arm(value)
 
 
+@pytest.mark.parametrize("correctness_only,layers,accepted", [
+    (False, 1, False), (False, 2, True), (True, 1, True), (True, 0, False),
+])
+def test_prefill_single_layer_is_correctness_only(correctness_only, layers, accepted):
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    args = bench.benchmark_parser().parse_args([
+        "--prefill-family", "dsv4p", "--capacities", "2752", "--layers", str(layers),
+        "--rounds", "3", "--replays", "1",
+        *(["--correctness-only"] if correctness_only else []),
+    ])
+    # Stop immediately after the layer gate; no CUDA work or fixture allocation.
+    args.prefill_arm = [("duplicate", 8, "cooperative")] * 2
+    props = SimpleNamespace(major=12, minor=1)
+    with pytest.raises(ValueError, match="uniquely named arms" if accepted else "cold layers"):
+        bench._run_prefill_benchmark(args, None, props)
+
+
 def test_prefill_policy_separates_route_block_from_ws():
     from types import SimpleNamespace
     bench = _load_benchmark_module()
@@ -116,6 +134,32 @@ def test_prefill_policy_separates_route_block_from_ws():
         assert width % opts["force_tile_config"][1] == 0
     with pytest.raises(ValueError):
         bench.prefill_compile_options("kimik3", 384, 16, "ws", props)
+
+
+@pytest.mark.parametrize("bits", [(2, 3), (3, 4), (4, 5)])
+def test_prefill_bits_override_reaches_compile_and_compact_fixture(tmp_path, bits):
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    args = bench.benchmark_parser().parse_args(
+        ["--prefill-family", "v41", "--bits", *map(str, bits)])
+    assert args.bits == list(bits)
+    ordinary = bench.prefill_compile_options("v41", 640, 64, "ws", props, bits=bits)
+    compact = bench.prefill_compile_options("v41", 640, 64, "ws", props, compact=True, bits=bits)
+    coordinator = bench.coordinator_compile_options("rtx-tp1", 256, {}, props, "v41", bits=bits)
+    for options in (ordinary, compact, coordinator):
+        assert (options["tier0_bits"], options["tier1_bits"]) == bits
+    entries = [dict(combined_local=e, global_expert=e, width=640,
+                    projections=[dict(projection=p, tier=e % 2, bits=bits[e % 2], tier_local=e // 2)
+                                 for p in ("gate", "up", "down")]) for e in range(384)]
+    fixture = tmp_path / "compact.json"
+    fixture.write_text(bench.json.dumps(dict(ranks=[dict(
+        rank=0, compiled_max_intermediate=640, experts=entries,
+        projection_counts=[[192] * 3, [192] * 3], unit_map_fingerprint="override")])))
+    assert bench.compact_prefill_fixture(fixture, 0, "v41", 640, bits=bits)["counts"] == [[192] * 3] * 2
+    if bits != (3, 4):
+        with pytest.raises(ValueError, match="tier/bit mismatch"):
+            bench.compact_prefill_fixture(fixture, 0, "v41", 640)
 
 
 def test_prefill_route_fixture_is_family_specific(tmp_path):
@@ -167,6 +211,31 @@ def test_compact_prefill_fixture_requires_complete_ownership(tmp_path):
     entries[0]["width"] = 128
     with pytest.raises(ValueError, match="geometry"):
         bench.compact_prefill_fixture(path, 0, "qwen4", 256, 256)
+
+
+def test_compact_dsv4p_fixture_validates_tp5_geometry(tmp_path):
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    entries = [dict(global_expert=e, combined_local=e, width=640 if e % 5 else 512,
+                    projections=[dict(projection=p, tier=0, bits=2, tier_local=e,
+                                      payload_word_offset=0)
+                                 for p in ("gate", "up", "down")]) for e in range(384)]
+    rank = dict(rank=0, compiled_max_intermediate=640, experts=entries,
+                projection_counts=[[384] * 3, [0] * 3], unit_map_fingerprint="v4pro-tp5")
+    path = tmp_path / "dsv4p-ownership.json"
+    path.write_text(bench.json.dumps(dict(tiers=[2, 3], ranks=[rank])))
+    fixture = bench.compact_prefill_fixture(path, 0, "dsv4p", 640)
+    assert {e["width"] for e in fixture["entries"]} == {512, 640}
+    assert fixture["fingerprint"] == "v4pro-tp5"
+    with pytest.raises(ValueError, match="geometry"):
+        bench.compact_prefill_fixture(path, 0, "dsv4p", 512)
+    with pytest.raises(ValueError, match="geometry"):
+        bench.compact_prefill_fixture(path, 0, "dsv4p", 640, experts=256)
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    options = bench.prefill_compile_options("dsv4p", 640, 64, "ws", props, compact=True)
+    assert options["compact_weights"] and options["warp_specialized"]
+    assert options["route_num_experts"] == 384 and options["top_k"] == 6
+    assert (options["tier0_bits"], options["tier1_bits"]) == (2, 3)
 
 
 def test_compact_glm_fixture_uses_live_width_ownership(tmp_path):
@@ -294,3 +363,41 @@ def test_compact_prefill_compile_options_match_served_exports(tmp_path):
     v41_path.write_text(bench.json.dumps(dict(synthetic=True, source="synthetic", ranks=[v41_rank])))
     v41_fix = bench.compact_prefill_fixture(v41_path, 0, "v41", 640)
     assert v41_fix["synthetic"] is True and len(v41_fix["entries"]) == 384
+
+
+@pytest.mark.parametrize("bits", [(2, 3), (2, 4), (2, 5), (3, 4), (3, 5), (4, 5)])
+def test_compact_pair_remap_preserves_planner_ownership(tmp_path, bits):
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import _compact_trellis_layout
+    bench = _load_benchmark_module()
+    entries = [dict(global_expert=e, combined_local=e, width=128 if e % 3 else 256,
+                    h128_units=[e % 5], projections=[
+                        dict(projection=p, tier=e % 2, bits=(4, 5)[e % 2],
+                             tier_local=e // 2) for p in ("gate", "up", "down")])
+               for e in range(512)]
+    rows = [[((e % 2) << 9) | (e // 2) for e in range(512)] for _ in range(3)]
+    rows.append([e["width"] for e in entries])
+    canonical, _, counts = _compact_trellis_layout(
+        rows, hidden_size=2560, intermediate_size=256, bits=(4, 5))
+    for e in entries:
+        for p, projection in enumerate(e["projections"]):
+            projection["payload_word_offset"] = canonical[4 + p][e["combined_local"]]
+    rank = dict(rank=0, compiled_max_intermediate=256, experts=entries,
+                projection_counts=[list(c) for c in counts], unit_map_fingerprint="planner-real")
+    data = dict(tiers=[4, 5], ranks=[rank], source="planner")
+    path = tmp_path / "ownership.json"
+    path.write_text(bench.json.dumps(data))
+    original = bench.compact_prefill_fixture(path, 0, "qwen4", 256)
+    assert bench.compact_prefill_fixture(path, 0, "qwen4", 256, bits=(4, 5)) == original
+    remapped = bench.compact_prefill_fixture(path, 0, "qwen4", 256, bits=bits)
+    expected, _, _ = _compact_trellis_layout(rows, hidden_size=2560,
+                                            intermediate_size=256, bits=bits)
+    assert remapped["counts"] == original["counts"]
+    assert remapped["fingerprint"] == original["fingerprint"]
+    assert bench.json.loads(path.read_text()) == data
+    for before, after in zip(original["entries"], remapped["entries"]):
+        assert {k: v for k, v in after.items() if k != "projections"} == {
+            k: v for k, v in before.items() if k != "projections"}
+        for p, (old, new) in enumerate(zip(before["projections"], after["projections"])):
+            assert new["bits"] == bits[new["tier"]]
+            assert new["payload_word_offset"] == expected[4 + p][after["combined_local"]]
+            assert (new["tier"], new["tier_local"]) == (old["tier"], old["tier_local"])
