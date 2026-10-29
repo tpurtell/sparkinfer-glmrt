@@ -128,3 +128,87 @@ def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
                            key=tuple(g.values()), version=4,
                            geometry={**g, "exact_row_cap": pointers.core.exact_row_cap},
                            scratch={"partial": lambda rows: groups*rows*s*n*4}, doc=__doc__)
+
+
+class _EgressPointers:
+    """Keep the core ABI outputs while folding reduction into the H128 output."""
+    def __init__(self, g):
+        from b12x.gemm.trellis_linear._native import NativeTrellisLinear
+        from .trellis_transform import _Output
+        self.core = NativeTrellisLinear(g)
+        self.egress = _Output(g["output_features"], g["max_rows"])
+        self.n, self.splits = g["output_features"], g["splits"]
+
+    @cute.jit
+    def __call__(self, inputs: cute.Pointer, payload: cute.Pointer,
+                 scales: cute.Pointer, partial: cute.Pointer, output: cute.Pointer,
+                 svh: cute.Pointer, final: cute.Pointer, rows: cutlass.Int32,
+                 rotation_id: cutlass.Int32, cta_limit: cutlass.Int32,
+                 stream: cuda.CUstream):
+        layout = cute.make_layout(1, stride=1)
+        if rows > 0 and rows <= self.core.max_rows and rotation_id >= 0 and rotation_id < self.core.rotations and cta_limit > 0:
+            if cutlass.const_expr(self.splits == 8 and self.n <= 65536):
+                if rows <= 16:
+                    self.core.multiply_k6_pair(cute.make_tensor(inputs, layout), cute.make_tensor(payload, layout),
+                        cute.make_tensor(scales, layout), cute.make_tensor(partial, layout), cute.make_tensor(output, layout),
+                        rows, rotation_id).launch(grid=(min(self.n // 64 * self.splits, cta_limit),1,1),
+                        block=(64,1,1), min_blocks_per_mp=self.core.min_blocks_per_mp, stream=stream)
+                    self.reduce_egress(partial, output, svh, final, rows).launch(
+                        grid=(min((rows * (self.n // 128) + 3) // 4, cta_limit),1,1),
+                        block=(128,1,1), stream=stream)
+                else:
+                    self.core(cute.make_tensor(inputs, layout), cute.make_tensor(payload, layout), cute.make_tensor(scales, layout),
+                        cute.make_tensor(partial, layout), cute.make_tensor(output, layout),rows,rotation_id,cta_limit,stream)
+                    self.egress(output,svh,final,rows,cta_limit,stream)
+            else:
+                self.core(cute.make_tensor(inputs, layout), cute.make_tensor(payload, layout), cute.make_tensor(scales, layout),
+                    cute.make_tensor(partial, layout), cute.make_tensor(output, layout),rows,rotation_id,cta_limit,stream)
+                self.egress(output,svh,final,rows,cta_limit,stream)
+
+    @cute.kernel
+    def reduce_egress(self, partial: cute.Pointer, output: cute.Pointer,
+                      svh: cute.Pointer, final: cute.Pointer, rows: cutlass.Int32):
+        from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
+        from cutlass import Float32, Int32, Int64
+        tid = Int32(cute.arch.thread_idx()[0])
+        lane, warp = tid & Int32(31), tid >> Int32(5)
+        task = Int32(cute.arch.block_idx()[0]) * Int32(4) + warp
+        step = Int32(cute.arch.grid_dim()[0]) * Int32(4)
+        layout = cute.make_layout(1, stride=1)
+        p,o,s,y = cute.make_tensor(partial,layout),cute.make_tensor(output,layout),cute.make_tensor(svh,layout),cute.make_tensor(final,layout)
+        while task < rows * Int32(self.n // 128):
+            row,block = task // Int32(self.n // 128), task % Int32(self.n // 128)
+            col = block * Int32(128) + lane * Int32(4)
+            acc = cute.make_rmem_tensor((4,),Float32)
+            acc.fill(Float32(0.0))
+            for split in cutlass.range_constexpr(self.splits):
+                offset = (row.to(Int64)*Int64(self.splits)+Int64(split))*Int64(self.n)+col.to(Int64)
+                for v in cutlass.range_constexpr(4):
+                    acc[v] = acc[v] + p[offset+Int64(v)]
+            out = row.to(Int64)*Int64(self.n)+col.to(Int64)
+            for v in cutlass.range_constexpr(4):
+                o[out+Int64(v)] = acc[v]
+            h0,h1,h2,h3 = _w4a8_had128_quad(acc[0],acc[1],acc[2],acc[3],lane)
+            y[out] = (h0*s[col].to(Float32)).to(y.element_type)
+            y[out+Int64(1)] = (h1*s[col+Int32(1)].to(Float32)).to(y.element_type)
+            y[out+Int64(2)] = (h2*s[col+Int32(2)].to(Float32)).to(y.element_type)
+            y[out+Int64(3)] = (h3*s[col+Int32(3)].to(Float32)).to(y.element_type)
+            task += step
+
+
+def compile_trellis_linear_egress_aot(*, input_features, output_features, bits=6,
+                                     codebook="mcg", sharded_side=1, rotation_count=1,
+                                     max_rows=129, input_dtype="bf16"):
+    if bits != 6:
+        raise ValueError("fused egress requires K6")
+    g=geometry(input_features,output_features,bits=bits,codebook=codebook,sharded_side=sharded_side,
+               rotation_count=rotation_count,max_rows=max_rows,input_dtype=input_dtype)
+    k,n,s=g["input_features"],g["output_features"],g["splits"]
+    pointers=_EgressPointers(g)
+    operands=(Operand("rotated_inputs",torch.int64,f"[{rotation_count}]"),
+        Operand("payload",torch.uint8,f"[{k*n*bits//8}]"),Operand("input_block_scales",torch.float16,f"[{k//128}]"),
+        Operand("partial",torch.float32,f"[rows,{s},{n}]","scratch"),Operand("output",torch.float32,f"[rows,{n}]","out"),
+        Operand("svh",torch.float16,f"[{n}]"),Operand("final",torch.float32 if n>65536 else torch.bfloat16,f"[rows,{n}]","out"))
+    return compile_program(pointers,name="trellis_linear_egress",operands=operands,
+        scalars=tuple(Scalar(name) for name in SCALARS),key=tuple(g.values()),version=1,
+        geometry={**g,"exact_row_cap":pointers.core.exact_row_cap},scratch={"partial":lambda rows:rows*s*n*4})

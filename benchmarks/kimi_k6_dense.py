@@ -148,7 +148,7 @@ def benchmark_layer_replay(args):
             return lib
         for k,n,side in shapes:
             directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
-            libs = {name: load(directory,name,5,3) for name in ("baseline","candidate")}
+            libs = {name: load(directory,name,7 if args.fused_egress and name=="candidate" else 5,3) for name in ("baseline","candidate")}
             ingress,egress = load(directory,"ingress",4,2),load(directory,"egress",3,2)
             source = torch.randn(8,k,device="cuda",dtype=torch.bfloat16)
             x = torch.empty(8,k,device="cuda",dtype=torch.bfloat16 if args.input_dtype=="bf16" else torch.float16)
@@ -163,9 +163,11 @@ def benchmark_layer_replay(args):
             def call(arm,rows, state=owned[-1]):
                 source,x,inputs,payload,scales,suh,svh,parts,outs,finals,libs,ingress,egress=state
                 stream=torch.cuda.current_stream().cuda_stream
-                codes=(ingress.run(source.data_ptr(),suh.data_ptr(),x.data_ptr(),scales.data_ptr(),rows,props.multi_processor_count*4,stream),
-                       libs[arm].run(inputs.data_ptr(),payload.data_ptr(),scales.data_ptr(),parts[arm].data_ptr(),outs[arm].data_ptr(),rows,0,props.multi_processor_count*4,stream),
-                       egress.run(outs[arm].data_ptr(),svh.data_ptr(),finals[arm].data_ptr(),rows,props.multi_processor_count*4,stream))
+                extra=[svh.data_ptr(),finals[arm].data_ptr()] if args.fused_egress and arm=="candidate" else []
+                codes=[ingress.run(source.data_ptr(),suh.data_ptr(),x.data_ptr(),scales.data_ptr(),rows,props.multi_processor_count*4,stream),
+                       libs[arm].run(inputs.data_ptr(),payload.data_ptr(),scales.data_ptr(),parts[arm].data_ptr(),outs[arm].data_ptr(),*extra,rows,0,props.multi_processor_count*4,stream)]
+                if not (args.fused_egress and arm=="candidate"):
+                    codes.append(egress.run(outs[arm].data_ptr(),svh.data_ptr(),finals[arm].data_ptr(),rows,props.multi_processor_count*4,stream))
                 if any(codes):
                     raise RuntimeError(codes)
             runners.append(call)
@@ -556,7 +558,11 @@ def benchmark_native_comparison(args):
                 _native.NativeTrellisLinear = core
                 try:
                     with exportable_compilation():
-                        program = compile_trellis_linear_aot(input_features=k, output_features=n,
+                        compiler = compile_trellis_linear_aot
+                        if args.fused_egress and stem == "candidate":
+                            from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_egress_aot
+                            compiler = compile_trellis_linear_egress_aot
+                        program = compiler(input_features=k, output_features=n,
                             bits=args.bits, codebook=args.codebook, sharded_side=side, rotation_count=1,
                             max_rows=max_rows, input_dtype=args.input_dtype)
                 finally:
@@ -564,7 +570,7 @@ def benchmark_native_comparison(args):
                 exported(program, directory, stem, load_module=False)
                 (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
             else:
-                libs[stem] = load(directory, stem)
+                libs[stem] = load(directory, stem, 7 if args.fused_egress and stem == "candidate" else 5)
         ingress = egress = None
         if args.transforms:
             from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
@@ -620,12 +626,13 @@ def benchmark_native_comparison(args):
                                          count, props.multi_processor_count*4, stream)
                     if result:
                         raise RuntimeError(f"ingress returned {result}")
+                extra = [svh.data_ptr(), finals[name].data_ptr()] if args.fused_egress and name == "candidate" else []
                 result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                    partials[name].data_ptr(), outputs[name].data_ptr(), count, 0,
-                    props.multi_processor_count*4, torch.cuda.current_stream().cuda_stream)
+                    partials[name].data_ptr(), outputs[name].data_ptr(), *extra, count, 0,
+                    props.multi_processor_count*4, stream)
                 if result:
                     raise RuntimeError(f"{name} returned {result}")
-                if args.transforms:
+                if args.transforms and not (args.fused_egress and name == "candidate"):
                     result = egress.run(outputs[name].data_ptr(), svh.data_ptr(), finals[name].data_ptr(),
                                         count, props.multi_processor_count*4, stream)
                     if result:
@@ -737,6 +744,7 @@ def main():
     parser.add_argument("--rows", default="1,64,256")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
+    parser.add_argument("--fused-egress", action="store_true", help="candidate core plus egress export; requires --transforms")
     parser.add_argument("--layer-replay", action="store_true", help="time real seven-projection KDA/MLA graph sequences")
     parser.add_argument("--glmf-verify", action="store_true", help="GLMF verify mix, measured streaming bandwidth and round aggregate")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
@@ -748,6 +756,8 @@ def main():
     parser.add_argument("--codebook", choices=("mcg", "mul1", "f16", "e4m3"), default="mcg")
     parser.add_argument("--bits", type=int, choices=range(2, 7), default=6)
     args = parser.parse_args()
+    if args.fused_egress and not args.transforms:
+        parser.error("--fused-egress requires --transforms")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.baseline_native:
         benchmark_native_comparison(args)
