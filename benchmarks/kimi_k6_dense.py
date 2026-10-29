@@ -425,10 +425,10 @@ def benchmark_native_comparison(args):
         torch.cuda.synchronize()
         del warm_a, warm_b
 
-    def load(directory, stem):
+    def load(directory, stem, pointers=5, scalars=3):
         lib = C.CDLL(str((directory / f"{stem}.so").resolve()))
         lib.load.argtypes, lib.load.restype = [], None
-        lib.run.argtypes = [C.c_void_p] * 5 + [C.c_int32] * 3 + [C.c_void_p]
+        lib.run.argtypes = [C.c_void_p] * pointers + [C.c_int32] * scalars + [C.c_void_p]
         lib.run.restype = C.c_int32
         lib.load()
         return lib
@@ -462,7 +462,7 @@ def benchmark_native_comparison(args):
     if args.glmf_verify and not args.compile_only:
         report["metadata"]["streaming_read"] = streaming_read_bandwidth(l2, args.samples)
         report["metadata"]["mix"] = {":".join(map(str, s)): count for s, count in GLMF_VERIFY_MIX.items()}
-        report["metadata"]["aggregate_scope"] = "native multiply/reduce only; one target + one draft head"
+        report["metadata"]["aggregate_scope"] = ("ingress + multiply/reduce + F32 egress; one target + one draft head" if args.transforms else "native multiply/reduce only; one target + one draft head")
     torch.manual_seed(273)
     for k, n, side in shapes:
         directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
@@ -483,6 +483,17 @@ def benchmark_native_comparison(args):
                 (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
             else:
                 libs[stem] = load(directory, stem)
+        ingress = egress = None
+        if args.transforms:
+            from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+            if args.compile_only:
+                with exportable_compilation():
+                    ip = compile_trellis_input_aot(features=k, max_rows=max_rows, output_dtype=args.input_dtype)
+                    op = compile_trellis_output_aot(features=n, max_rows=max_rows, output_dtype="f32")
+                exported(ip, directory, "ingress", load_module=False)
+                exported(op, directory, "egress", load_module=False)
+            else:
+                ingress, egress = load(directory, "ingress", 4, 2), load(directory, "egress", 3, 2)
         if args.compile_only:
             continue
         capacity = max(rows_list)
@@ -507,6 +518,11 @@ def benchmark_native_comparison(args):
         scales = torch.rand(k//128, device="cuda", dtype=torch.float16) + .125
         partials = {name: torch.empty(decode_cap*splits*n, device="cuda") for name in libs}
         outputs = {name: torch.empty(capacity*n, device="cuda") for name in libs}
+        if args.transforms:
+            source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+            suh = torch.rand(k, device="cuda", dtype=torch.float16) + .125
+            svh = torch.rand(n, device="cuda", dtype=torch.float16) + .125
+            finals = {name: torch.empty_like(outputs[name]) for name in libs}
         # Untimed boost warm-up before row 1 of each shape
         boost_warmup()
         for rows in rows_list:
@@ -514,11 +530,22 @@ def benchmark_native_comparison(args):
             hashes = {}
             events = {}
             def call(name, count=rows):
+                stream = torch.cuda.current_stream().cuda_stream
+                if args.transforms:
+                    result = ingress.run(source.data_ptr(), suh.data_ptr(), x.data_ptr(), scales.data_ptr(),
+                                         count, props.multi_processor_count*4, stream)
+                    if result:
+                        raise RuntimeError(f"ingress returned {result}")
                 result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
                     partials[name].data_ptr(), outputs[name].data_ptr(), count, 0,
                     props.multi_processor_count*4, torch.cuda.current_stream().cuda_stream)
                 if result:
                     raise RuntimeError(f"{name} returned {result}")
+                if args.transforms:
+                    result = egress.run(outputs[name].data_ptr(), svh.data_ptr(), finals[name].data_ptr(),
+                                        count, props.multi_processor_count*4, stream)
+                    if result:
+                        raise RuntimeError(f"egress returned {result}")
             for name in libs:
                 call(name)
                 graph = torch.cuda.CUDAGraph()
@@ -547,6 +574,9 @@ def benchmark_native_comparison(args):
                 part_eq = (torch.equal(partials[name][:rows*splits*n].view(torch.int32),
                                        partials["baseline"][:rows*splits*n].view(torch.int32))
                            if publishes_partials(rows) else None)
+                if args.transforms:
+                    out_eq = out_eq and torch.equal(finals[name][:rows*n].view(torch.int32),
+                                                   finals["baseline"][:rows*n].view(torch.int32))
                 exact[name] = out_eq and part_eq is not False
                 partials_exact[name] = part_eq
                 if not exact[name]:

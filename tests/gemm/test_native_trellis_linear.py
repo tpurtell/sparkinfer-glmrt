@@ -394,7 +394,7 @@ def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
         assert torch.isnan(wide.partial[rows:]).all()
 
 
-@pytest.mark.parametrize("k", [1024, 4096])
+@pytest.mark.parametrize("k", [1024, 1152, 4096, 6144, 8192])
 @pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("input_dtype", ["f16", "bf16"])
 @pytest.mark.parametrize("codebook", ["mcg", "e4m3"])
@@ -409,7 +409,7 @@ def test_k6_pair_vs_base_bitwise_equality(k, side, input_dtype, codebook, monkey
                     codebook=codebook, input_dtype=input_dtype)
     pair = Case(k=k, side=side, bits=6, rows=16,
                 codebook=codebook, input_dtype=input_dtype)
-    for rows in (1, 8, 16):
+    for rows in (1, 2, 3, 4, 5, 6, 7, 8, 16):
         base.partial.fill_(float("nan"))
         base.output.fill_(float("nan"))
         pair.partial.fill_(float("nan"))

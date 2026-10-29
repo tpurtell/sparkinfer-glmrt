@@ -3340,7 +3340,8 @@ class NativeTrellisLinear:
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows <= Int32(16):
-            if cutlass.const_expr(1 < self.splits <= 8 and self.n <= 6144):
+            if cutlass.const_expr(1 < self.splits <= 8 and
+                                  (self.n <= 512 or ((self.k & (self.k - 1)) != 0 and self.n <= 6144))):
                 self.multiply_k6_folded(inputs, payload, scales, partial, output, rows, rotation_id).launch(
                     grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
                     block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
