@@ -59,6 +59,178 @@ PREFILL_TP2_SHAPES = (
 )
 
 
+# Per GPU, one target and one draft head; rotations remain separate and unchanged.
+GLMF_VERIFY_MIX = {
+    (4096, 4096, 1): 34 * 3, (4096, 4096, 2): 34,
+    (4096, 1024, 1): 42 * 2, (1024, 4096, 2): 42,
+    (4096, 6144, 1): 3 * 2, (6144, 4096, 2): 3,
+    (4096, 1536, 1): 11, (4096, 512, 1): 11,
+    (1536, 8192, 1): 11, (8192, 4096, 2): 11,
+    (4096, 154880, 1): 2,
+}
+
+
+# Per-GPU target projection counts for the qualified TP2 placements. Kimi has
+# 69 KDA blocks, 24 MLA blocks split by owner, and 92 routed/shared blocks.
+KIMI_VERIFY_MIX = {
+    (7168, 6144, 1): 69 * 4, (6144, 7168, 2): 69,
+    (7168, 3072, 1): 92 * 2, (3072, 7168, 2): 92,
+    (7168, 3584, 1): 92, (3584, 7168, 1): 92,
+    (7168, 1536, 1): 12, (7168, 640, 1): 12,
+    (1536, 18432, 1): 12, (7168, 12288, 1): 12,
+    (12288, 7168, 1): 12, (7168, 163840, 1): 1,
+}
+GLM5_VERIFY_MIX = {
+    (6144, 2048, 1): 78, (6144, 640, 1): 78,
+    (2048, 8192, 1): 78, (8192, 6144, 2): 78,
+    (6144, 6144, 1): 3 * 2, (6144, 6144, 2): 3,
+    (6144, 1024, 1): 75 * 2, (1024, 6144, 2): 75,
+    (6144, 154880, 1): 1,
+}
+FAMILY_VERIFY_MIXES = {"glmf": GLMF_VERIFY_MIX, "kimik3": KIMI_VERIFY_MIX,
+                       "glm5": GLM5_VERIFY_MIX}
+# Include both owned and split variants, not only the weighted placement above.
+FAMILY_SHAPES = {
+    "kimik3": tuple(KIMI_VERIFY_MIX) + ((1536, 9216, 1),),
+    "glm5": tuple(GLM5_VERIFY_MIX) + (
+        (2048, 16384, 1), (16384, 6144, 1), (6144, 12288, 1),
+        (12288, 6144, 1), (2048, 6144, 1)),
+    "glmf": tuple(GLMF_VERIFY_MIX),
+}
+
+
+def streaming_read_bandwidth(l2_bytes, samples):
+    """Read beyond L2 and reduce to a tiny sink; report measured DRAM GB/s."""
+    import torch
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def read_kernel(source, sink, N: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        values = tl.load(source + offsets, offsets < N, 0)
+        tl.store(sink + tl.program_id(0), tl.sum(values, 0))
+
+    count = max(256 * 1024 * 1024, 4 * l2_bytes) // 4
+    source = torch.ones(count, device="cuda", dtype=torch.float32)
+    sink = torch.empty(triton.cdiv(count, 4096), device="cuda", dtype=torch.float32)
+    def run():
+        read_kernel[(sink.numel(),)](source, sink, count, 4096)
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize()
+    if not torch.equal(sink.sum(), torch.tensor(float(count), device="cuda")):
+        raise RuntimeError("streaming read checksum mismatch")
+    times = []
+    for _ in range(samples):
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        begin.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(begin.elapsed_time(end) * 1000)
+    us = statistics.median(times)
+    return dict(bytes=count * 4, us=us, gbs=count * 4 / (us * 1000), samples_us=times)
+
+
+def projection_aggregate(records, mix):
+    aggregate = []
+    for rows in sorted({r["rows"] for r in records}):
+        cells = {(r["k"], r["n"], r["side"]): r for r in records
+                 if r["rows"] == rows and "baseline_us" in r}
+        if not mix.keys() <= cells.keys():
+            continue
+        base = sum(cells[s]["baseline_us"] * count for s, count in mix.items())
+        cand = sum(cells[s]["candidate_us"] * count for s, count in mix.items())
+        aggregate.append(dict(rows=rows, baseline_us=base, candidate_us=cand, ratio=base/cand))
+    return aggregate
+
+
+def benchmark_layer_replay(args):
+    """Back-to-back projections with distinct weights, no timed cache flush."""
+    import torch
+    from cuda.bindings import driver as cuda
+    props = torch.cuda.get_device_properties(0)
+    status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+    if int(status):
+        raise RuntimeError(status)
+    flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+    max_rows = max(129, max(map(int, args.rows.split(","))))
+    mixes = {
+        "KDA": [(4096,4096,1)]*3 + [(4096,4096,2)],
+        "MLA": [(4096,1536,1), (4096,512,1), (1536,8192,1), (8192,4096,2)],
+    }
+    results = []
+    for layer, shapes in mixes.items():
+        shapes = shapes + [(4096,1024,1)]*2 + [(1024,4096,2)]
+        owned = []
+        runners = []
+        def load(directory, stem, pointers, scalars):
+            lib = C.CDLL(str((directory / f"{stem}.so").resolve()))
+            lib.load.argtypes, lib.load.restype = [], None
+            lib.run.argtypes = [C.c_void_p]*pointers + [C.c_int32]*scalars + [C.c_void_p]
+            lib.run.restype = C.c_int32
+            lib.load()
+            return lib
+        for k,n,side in shapes:
+            directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
+            libs = {name: load(directory,name,5,3) for name in ("baseline","candidate")}
+            ingress,egress = load(directory,"ingress",4,2),load(directory,"egress",3,2)
+            source = torch.randn(8,k,device="cuda",dtype=torch.bfloat16)
+            x = torch.empty(8,k,device="cuda",dtype=torch.bfloat16 if args.input_dtype=="bf16" else torch.float16)
+            inputs = torch.tensor([x.data_ptr()],device="cuda",dtype=torch.int64)
+            payload = torch.randint(256,(k*n*args.bits//8,),device="cuda",dtype=torch.uint8)
+            scales = torch.ones(k//128,device="cuda",dtype=torch.float16)
+            suh,svh = torch.rand(k,device="cuda",dtype=torch.float16),torch.rand(n,device="cuda",dtype=torch.float16)
+            parts = {a:torch.empty(8*((k+1023)//1024)*n,device="cuda") for a in libs}
+            outs = {a:torch.empty(8*n,device="cuda") for a in libs}
+            finals = {a:torch.empty(8*n,device="cuda",dtype=torch.bfloat16) for a in libs}
+            owned.append((source,x,inputs,payload,scales,suh,svh,parts,outs,finals,libs,ingress,egress))
+            def call(arm,rows, state=owned[-1]):
+                source,x,inputs,payload,scales,suh,svh,parts,outs,finals,libs,ingress,egress=state
+                stream=torch.cuda.current_stream().cuda_stream
+                codes=[ingress.run(source.data_ptr(),suh.data_ptr(),x.data_ptr(),scales.data_ptr(),rows,(args.cta_limit or props.multi_processor_count*4),stream),
+                       libs[arm].run(inputs.data_ptr(),payload.data_ptr(),scales.data_ptr(),parts[arm].data_ptr(),outs[arm].data_ptr(),rows,0,(args.cta_limit or props.multi_processor_count*4),stream)]
+                codes.append(egress.run(outs[arm].data_ptr(),svh.data_ptr(),finals[arm].data_ptr(),rows,(args.cta_limit or props.multi_processor_count*4),stream))
+                if any(codes):
+                    raise RuntimeError(codes)
+            runners.append(call)
+        for rows in (4,8):
+            graphs={}
+            for arm in ("baseline","candidate"):
+                for call in runners:
+                    call(arm,rows)
+                graph=torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for call in runners:
+                        call(arm,rows)
+                graphs[arm]=graph
+            torch.cuda.synchronize()
+            for state in owned:
+                finals=state[9]
+                if not torch.equal(finals["baseline"].view(torch.int16),finals["candidate"].view(torch.int16)):
+                    # Only the live rows are initialized for M4.
+                    n=finals["baseline"].numel()//8
+                    if not torch.equal(finals["baseline"][:rows*n].view(torch.int16),finals["candidate"][:rows*n].view(torch.int16)):
+                        raise RuntimeError("layer replay byte mismatch")
+            for mode in ("warm", "cold"):
+                samples={arm:[] for arm in graphs}
+                for repeat in range(args.samples):
+                    for arm in (list(graphs) if repeat%2==0 else list(reversed(graphs))):
+                        if mode=="cold":
+                            flush.zero_()
+                        begin,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+                        begin.record();graphs[arm].replay();end.record();end.synchronize()
+                        samples[arm].append(begin.elapsed_time(end)*1000)
+                base,cand=(statistics.median(samples[a]) for a in ("baseline","candidate"))
+                results.append(dict(layer=layer,rows=rows,cache=mode,baseline_us=base,candidate_us=cand,ratio=base/cand,exact=True,samples_us=samples))
+        del graphs,runners,owned
+    return results
+
+
 def benchmark_prefill_route(args):
     """Exact exported prefill routes; every replay uses preallocated storage."""
     import torch
@@ -364,16 +536,17 @@ def benchmark_native_comparison(args):
         torch.cuda.synchronize()
         del warm_a, warm_b
 
-    def load(directory, stem):
+    def load(directory, stem, pointers=5, scalars=3):
         lib = C.CDLL(str((directory / f"{stem}.so").resolve()))
         lib.load.argtypes, lib.load.restype = [], None
-        lib.run.argtypes = [C.c_void_p] * 5 + [C.c_int32] * 3 + [C.c_void_p]
+        lib.run.argtypes = [C.c_void_p] * pointers + [C.c_int32] * scalars + [C.c_void_p]
         lib.run.restype = C.c_int32
         lib.load()
         return lib
 
     default_shapes = "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,16384:4096:1,4096:154880:1,4096:6144:1,6144:4096:2"
-    shapes = [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
+    family = "glmf" if args.glmf_verify else args.family_verify
+    shapes = list(FAMILY_SHAPES[family]) if family else [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
     rows_list = list(map(int, args.rows.split(",")))
     if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 1:
         raise ValueError("native comparison requires rows 1..4096 and positive samples")
@@ -398,6 +571,10 @@ def benchmark_native_comparison(args):
         l2_bytes=l2, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
         input_dtype=args.input_dtype, codebook=args.codebook,
         ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[])
+    if family and not args.compile_only:
+        report["metadata"]["streaming_read"] = streaming_read_bandwidth(l2, args.samples)
+        report["metadata"]["mix"] = {":".join(map(str, s)): count for s, count in FAMILY_VERIFY_MIXES[family].items()}
+        report["metadata"]["aggregate_scope"] = ("ingress + multiply/reduce + native egress; one target + one draft head" if args.transforms else "native multiply/reduce only; one target + one draft head")
     torch.manual_seed(273)
     for k, n, side in shapes:
         directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
@@ -417,7 +594,19 @@ def benchmark_native_comparison(args):
                 exported(program, directory, stem, load_module=False)
                 (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
             else:
-                libs[stem] = load(directory, stem)
+                libs[stem] = load(directory, stem, 5)
+        ingress = egress = None
+        if args.transforms:
+            from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+            if args.compile_only:
+                with exportable_compilation():
+                    ip = compile_trellis_input_aot(features=k, max_rows=max_rows, output_dtype=args.input_dtype)
+                    op = compile_trellis_output_aot(features=n, max_rows=max_rows,
+                                                    output_dtype="f32" if n > 65536 else "bf16")
+                exported(ip, directory, "ingress", load_module=False)
+                exported(op, directory, "egress", load_module=False)
+            else:
+                ingress, egress = load(directory, "ingress", 4, 2), load(directory, "egress", 3, 2)
         if args.compile_only:
             continue
         capacity = max(rows_list)
@@ -442,6 +631,12 @@ def benchmark_native_comparison(args):
         scales = torch.rand(k//128, device="cuda", dtype=torch.float16) + .125
         partials = {name: torch.empty(decode_cap*splits*n, device="cuda") for name in libs}
         outputs = {name: torch.empty(capacity*n, device="cuda") for name in libs}
+        if args.transforms:
+            source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+            suh = torch.rand(k, device="cuda", dtype=torch.float16) + .125
+            svh = torch.rand(n, device="cuda", dtype=torch.float16) + .125
+            final_dtype = torch.float32 if n > 65536 else torch.bfloat16
+            finals = {name: torch.empty(capacity*n, device="cuda", dtype=final_dtype) for name in libs}
         # Untimed boost warm-up before row 1 of each shape
         boost_warmup()
         for rows in rows_list:
@@ -449,11 +644,22 @@ def benchmark_native_comparison(args):
             hashes = {}
             events = {}
             def call(name, count=rows):
+                stream = torch.cuda.current_stream().cuda_stream
+                if args.transforms:
+                    result = ingress.run(source.data_ptr(), suh.data_ptr(), x.data_ptr(), scales.data_ptr(),
+                                         count, (args.cta_limit or props.multi_processor_count*4), stream)
+                    if result:
+                        raise RuntimeError(f"ingress returned {result}")
                 result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
                     partials[name].data_ptr(), outputs[name].data_ptr(), count, 0,
-                    props.multi_processor_count*4, torch.cuda.current_stream().cuda_stream)
+                    (args.cta_limit or props.multi_processor_count*4), stream)
                 if result:
                     raise RuntimeError(f"{name} returned {result}")
+                if args.transforms:
+                    result = egress.run(outputs[name].data_ptr(), svh.data_ptr(), finals[name].data_ptr(),
+                                        count, (args.cta_limit or props.multi_processor_count*4), stream)
+                    if result:
+                        raise RuntimeError(f"egress returned {result}")
             for name in libs:
                 call(name)
                 graph = torch.cuda.CUDAGraph()
@@ -465,12 +671,16 @@ def benchmark_native_comparison(args):
                     end.record()
                 events[name] = (start, end)
                 outputs[name][:rows*n].fill_(float("nan"))
+                if args.transforms:
+                    finals[name][:rows*n].fill_(float("nan"))
                 if publishes_partials(rows):
                     partials[name][:rows*splits*n].fill_(float("nan"))
                 graph.replay()
                 torch.cuda.synchronize()
                 if not torch.isfinite(outputs[name][:rows*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned output not overwritten")
+                if args.transforms and not torch.isfinite(finals[name][:rows*n]).all().item():
+                    raise RuntimeError(f"{name}: poisoned transformed output not overwritten")
                 if publishes_partials(rows) and not torch.isfinite(partials[name][:rows*splits*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned partial not overwritten")
                 graphs[name] = graph
@@ -482,6 +692,9 @@ def benchmark_native_comparison(args):
                 part_eq = (torch.equal(partials[name][:rows*splits*n].view(torch.int32),
                                        partials["baseline"][:rows*splits*n].view(torch.int32))
                            if publishes_partials(rows) else None)
+                if args.transforms:
+                    out_eq = out_eq and torch.equal(finals[name][:rows*n].view(torch.int32),
+                                                   finals["baseline"][:rows*n].view(torch.int32))
                 exact[name] = out_eq and part_eq is not False
                 partials_exact[name] = part_eq
                 if not exact[name]:
@@ -531,7 +744,11 @@ def benchmark_native_comparison(args):
                 partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
                 weight_gbs=(k*n*args.bits/8)/(times[name]*1000),
                 baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot())
+            if family:
+                record["bandwidth_fraction"] = record["weight_gbs"] / report["metadata"]["streaming_read"]["gbs"]
             report["records"].append(record)
+            if family:
+                report["aggregate"] = projection_aggregate(report["records"], FAMILY_VERIFY_MIXES[family])
             print(json.dumps({key: value for key, value in record.items() if key not in ("samples_us", "baseline_samples_us")}), flush=True)
             (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
         (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
@@ -539,6 +756,8 @@ def benchmark_native_comparison(args):
         if "timing_graphs" in locals():
             del timing_graphs
         torch.cuda.empty_cache()
+    if args.layer_replay and not args.compile_only:
+        report["layer_replay"] = benchmark_layer_replay(args)
     report["metadata"]["snapshot_after"] = snapshot()
     if not args.compile_only:
         (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
@@ -552,6 +771,10 @@ def main():
     parser.add_argument("--rows", default="1,64,256")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
+    parser.add_argument("--cta-limit", type=int, help="override runtime grid budget for exactness checks")
+    parser.add_argument("--layer-replay", action="store_true", help="time real seven-projection KDA/MLA graph sequences")
+    parser.add_argument("--family-verify", choices=tuple(FAMILY_VERIFY_MIXES), help="family TP2 projection shapes and weighted per-round aggregates")
+    parser.add_argument("--glmf-verify", action="store_true", help="GLMF verify mix, measured streaming bandwidth and round aggregate")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
     parser.add_argument("--baseline-native", type=Path, help="compare output and partial bytes against a previous _native.py")
     parser.add_argument("--compile-only", action="store_true", help="CPU-only export of both comparison arms")

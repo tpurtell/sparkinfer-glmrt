@@ -394,7 +394,7 @@ def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
         assert torch.isnan(wide.partial[rows:]).all()
 
 
-@pytest.mark.parametrize("k", [1024, 4096])
+@pytest.mark.parametrize("k", [1024, 1152, 4096, 6144, 8192])
 @pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("input_dtype", ["f16", "bf16"])
 @pytest.mark.parametrize("codebook", ["mcg", "e4m3"])
@@ -409,7 +409,7 @@ def test_k6_pair_vs_base_bitwise_equality(k, side, input_dtype, codebook, monkey
                     codebook=codebook, input_dtype=input_dtype)
     pair = Case(k=k, side=side, bits=6, rows=16,
                 codebook=codebook, input_dtype=input_dtype)
-    for rows in (1, 8, 16):
+    for rows in (1, 2, 3, 4, 5, 6, 7, 8, 16):
         base.partial.fill_(float("nan"))
         base.output.fill_(float("nan"))
         pair.partial.fill_(float("nan"))
@@ -423,7 +423,8 @@ def test_k6_pair_vs_base_bitwise_equality(k, side, input_dtype, codebook, monkey
         assert torch.isnan(pair.partial[rows:]).all()
 
 
-def test_k6_non_power_of_two_uses_baseline(monkeypatch):
+@pytest.mark.parametrize("k", [1152, 6144, 7168])
+def test_k6_ragged_k_avoids_pair_route(k, monkeypatch):
     from b12x.gemm.trellis_linear import _native
     from b12x.integration.cuteafd import exportable_compilation
 
@@ -432,7 +433,7 @@ def test_k6_non_power_of_two_uses_baseline(monkeypatch):
 
     with exportable_compilation(), monkeypatch.context() as patch:
         patch.setattr(_native.NativeTrellisLinear, "multiply_k6_pair", forbidden_pair)
-        c = Case(k=1152, bits=6, rows=16, codebook="mcg", input_dtype="bf16")
+        c = Case(k=k, bits=6, rows=16, codebook="mcg", input_dtype="bf16")
     for rows in (1, 8, 16):
         c.output.fill_(float("nan"))
         c.launch(rows)
