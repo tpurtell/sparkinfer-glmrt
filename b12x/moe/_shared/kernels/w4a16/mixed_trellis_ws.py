@@ -69,6 +69,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 
 from b12x._lib.intrinsics import (
+    cp_async4_shared_global,
     cp_async4_shared_global_pred,
     cp_async_bulk_g2s_mbar,
     cp_async_bulk_g2s_mbar_l2hint,
@@ -359,7 +360,7 @@ def _e4m3x4_scaled_to_f16x4(packed: Uint32, scale_bits: Uint32, *, loc=None, ip=
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
-    WS_ABI_VERSION = 4
+    WS_ABI_VERSION = 8
 
     def __init__(
         self,
@@ -387,6 +388,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         # producers stage the raw bytes in the A slot and widen them to the
         # FP16 the BF16 path gets from decode-then-convert (same values).
         self.ws_wire = input_format == "e4m3_k32"
+        self.ws_prerotate = not self.ws_wire and activations == "a16"
         # Dynamic tile claims (a global counter in the zero-initialized
         # workspace, reset by the last CTA): the route blocks of one expert
         # start together, so the follower's weight reads hit L2 instead of
@@ -521,6 +523,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             self.ws_tiles,
             self.ws_dynamic,
             self.ws_a8,
+            self.ws_prerotate,
 
         )
 
@@ -639,6 +642,20 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             * cutlass.Int64(self.ws_wire_row if self.ws_wire else self.hidden_size),
         )
 
+        if cutlass.const_expr(self.ws_prerotate):
+            global_to_combined = flat(global_to_combined_ptr, route_num_experts.to(Int64))
+            self.ws_rotation_kernel(
+                rotation_input, rotation_gate, rotation_up, gate_suh, up_suh,
+                raw_topk_ids, global_to_combined, route_num_experts,
+                tier0_num_experts + tier1_num_experts, active_m,
+            ).launch(
+                grid=(grid_x * Int32(self.ws_act_ctas_per_sm), 1, 1),
+                block=[self.cta_threads, 1, 1],
+                stream=stream,
+            )
+            rotation_input = rotation_gate
+            gate_suh = rotation_gate
+            up_suh = rotation_up
         self._ws_set_phase(True)
         self.ws_fc1_kernel(
             rotation_input,
@@ -715,6 +732,22 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     # ------------------------------------------------------------------
 
     @cute.kernel
+    def ws_rotation_kernel(
+        self, x: cute.Tensor, gate: cute.Tensor, up: cute.Tensor,
+        gate_suh: cute.Tensor, up_suh: cute.Tensor, ids: cute.Tensor,
+        global_to_combined: cute.Tensor, route_num_experts: Int32,
+        total_experts: Int32, active_m: Int32,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        grid, _, _ = cute.arch.grid_dim()
+        self._run_input_rotation_token_major_ws(
+            x, gate, up, gate_suh, up_suh, ids, global_to_combined,
+            route_num_experts, total_experts, Int32(tid), Int32(cta),
+            Int32(grid), active_m,
+        )
+
+    @cute.kernel
     def ws_act_kernel(
         self,
         fc1: cute.Tensor,
@@ -734,7 +767,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         total = tier0_num_experts + tier1_num_experts
         # The cooperative kernel's activation phase, unchanged (it strides by
         # the driver's 256-thread CTA).
-        self.driver._run_activation_compact(
+        self.driver._run_activation_ws_chunked(
             fc1,
             activated,
             intermediate_rotations,
@@ -1260,26 +1293,29 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     def _ws_load_rows(
         self,
         is_fc1: cutlass.Constexpr,
+        k_size: cutlass.Constexpr,
         rows: cute.Tensor,
         packed_route_indices: cute.Tensor,
         rb: Int32,
         ptid: Int32,
         live: Int32,
     ):
-        """Source row ids of the rows this producer thread copies (rows
-        ptid/16 + 8i): tokens for FC1, routes for FC2, -1 for padding."""
+        """Source row element offsets of the rows this producer thread copies
+        (rows ptid/16 + 8i): tokens for FC1, routes for FC2, -1 for padding."""
         if cutlass.const_expr((is_fc1 and self.ws_wire) or (not is_fc1 and self.ws_a8)):
             self._ws_load_rows_wire(rows, packed_route_indices, rb, ptid, live, is_fc1)
         else:
+            c_off = (ptid & Int32(15)) * Int32(8)
             for i in cutlass.range_constexpr(self.ws_m // 8):
                 r = (ptid >> Int32(4)) + Int32(8 * i)
                 idx = packed_route_indices[rb * Int32(self.ws_m) + r].to(Int32)
-                row_id = Int32(-1)
+                row_off = Int32(-1)
                 if idx < live:
                     row_id = idx
-                    if cutlass.const_expr(is_fc1):
+                    if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
                         row_id = idx // Int32(self.top_k)
-                rows[i] = row_id
+                    row_off = row_id * Int32(k_size) + c_off
+                rows[i] = row_off
 
     @cute.jit
     def _ws_load_rows_wire(
@@ -1302,7 +1338,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 idx = packed_route_indices[rb * Int32(self.ws_m) + r].to(Int32)
                 if idx < live:
                     row_id = idx
-                    if cutlass.const_expr(is_fc1):
+                    if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
                         row_id = idx // Int32(self.top_k)
             rows[i] = row_id
 
@@ -1447,8 +1483,16 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         kblock: Int32,
         ptid: Int32,
         bar: Int32,
+        a_up: cute.Tensor,
+        nt: Int32,
+        n_tiles: Int32,
     ):
-        if cutlass.const_expr(is_fc1 and self.ws_wire):
+        if cutlass.const_expr(is_fc1 and self.ws_prerotate):
+            if nt >= n_tiles // Int32(2):
+                self._ws_issue_a(k_size, a_up, rows, base, slot, kblock, ptid, bar)
+            else:
+                self._ws_issue_a(k_size, a_src, rows, base, slot, kblock, ptid, bar)
+        elif cutlass.const_expr(is_fc1 and self.ws_wire):
             self._ws_issue_a_wire(a_src, rows, base, slot, kblock, ptid, bar)
         # FC1 BF16 rows still need the BF16 gather before rotation/quantization.
         # Only FC2 carries the packed INT8 payload and trailing K128 scales.
@@ -1502,26 +1546,22 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         (row r at r * 256 bytes; 16-byte chunk c at (c & 8) | ((c ^ r) & 7)),
         then arrive on ``bar`` when this thread's copies land."""
         c = ptid & Int32(15)
+        r0 = ptid >> Int32(4)
+        pos = (c & Int32(8)) | ((c & Int32(7)) ^ r0)
         a_slot = base + Int32(self.ws_a_off) + slot * Int32(self.ws_a_slot)
+        dst_base = a_slot + r0 * Int32(256) + pos * Int32(16)
+        a_src_base = get_ptr_as_int64(a_src, Int64(kblock) * Int64(128))
         for i in cutlass.range_constexpr(self.ws_m // 8):
-            r = (ptid >> Int32(4)) + Int32(8 * i)
-            row_id = rows[i]
-            pos = (c & Int32(8)) | ((c & Int32(7)) ^ (r & Int32(7)))
-            dst = a_slot + r * Int32(256) + pos * Int32(16)
-            src_elem = (
-                Int64(row_id) * Int64(k_size)
-                + Int64(kblock) * Int64(128)
-                + Int64(c) * Int64(8)
-            )
-            if row_id < Int32(0):
-                src_elem = Int64(0)
-            if cutlass.const_expr("a_l2" in self.ws_exp):
-                src_elem = Int64(kblock) * Int64(128) + Int64(c) * Int64(8)
-            cp_async4_shared_global_pred(
-                dst,
-                get_ptr_as_int64(a_src, src_elem),
-                (row_id >= Int32(0)).to(Int32),
-            )
+            row_off = rows[i]
+            if row_off >= Int32(0):
+                dst = dst_base + Int32(2048 * i)
+                src_addr = a_src_base + Int64(row_off) * Int64(2)
+                if cutlass.const_expr("a_l2" in self.ws_exp):
+                    src_addr = a_src_base + Int64(c * Int32(16))
+                cp_async4_shared_global(
+                    dst,
+                    src_addr,
+                )
         _cp_async_mbar_arrive_noinc(bar)
 
     @cute.jit
@@ -1534,9 +1574,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         l16 = lane & Int32(15)
         half = lane >> Int32(4)
         warp = ptid >> Int32(5)
+        r0 = ptid >> Int32(4)
         pos_hi = l16 & Int32(8)
         pos_lo = l16 & Int32(7)
         a_slot = base + Int32(self.ws_a_off) + slot * Int32(self.ws_a_slot)
+        addr_base = a_slot + r0 * Int32(256) + (pos_hi | (pos_lo ^ r0)) * Int32(16)
         iters = self.ws_m // (2 * _PRODUCER_WARPS)
         group = min(iters, 2)
         for g in cutlass.range_constexpr(iters // group):
@@ -1545,12 +1587,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 addrs = []
                 loads = []
                 for j in cutlass.range_constexpr(group):
-                    row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
-                    addr = (
-                        a_slot
-                        + row * Int32(256)
-                        + (pos_hi | (pos_lo ^ (row & Int32(7)))) * Int32(16)
-                    )
+                    addr = addr_base + Int32(2048 * (g * group + j))
                     addrs.append(addr)
                     loads.append(ld_shared_v4_u32(addr))
                 for j in cutlass.range_constexpr(group):
@@ -1578,7 +1615,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             v[e] = p + sign * v[e]
                     rs = cutlass.Float32(0.088388347648)
                     if cutlass.const_expr(self.ws_a8):
-                        row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
+                        row = r0 + Int32(8 * (g * group + j))
                         self._ws_a8_store(
                             a_slot, base + Int32(self.ws_s_off) + slot * Int32(self.ws_s_slot),
                             row, l16, [v[e] * rs for e in range(8)],
@@ -1596,7 +1633,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     # Unrotated (padding) rows: zero scales, so their zero int8
                     # rows rescale to zero instead of reading stale words.
                     for j in cutlass.range_constexpr(group):
-                        row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
+                        row = r0 + Int32(8 * (g * group + j))
                         if l16 == Int32(0):
                             st_shared_f32(
                                 base + Int32(self.ws_s_off) + slot * Int32(self.ws_s_slot) + row * Int32(4),
@@ -1653,6 +1690,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         ptid: Int32,
         live_k: Int32,
         live_n: Int32 = Int32(0),
+        is_end: cutlass.Constexpr = False,
     ):
         """Write tile ``ti``'s header (valid rows or -1 for the end, route
         block, N tile, tier, global scale) and route ids into the tile ring."""
@@ -1672,11 +1710,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 st_shared_i32(hdr + Int32(20), live_k)
             if cutlass.const_expr(self.compact_weights and self.ws_n == 192):
                 st_shared_i32(hdr + Int32(24), live_n)
-        if valid >= Int32(0) and ptid < Int32(self.ws_m):
-            idx = packed_route_indices[rb * Int32(self.ws_m) + ptid].to(Int32)
-            if idx >= live:
-                idx = Int32(-1)
-            st_shared_i32(hdr + Int32(4 * _TILE_HEADER_WORDS) + ptid * Int32(4), idx)
+        if cutlass.const_expr(not is_end):
+            if ptid < Int32(self.ws_m):
+                idx = packed_route_indices[rb * Int32(self.ws_m) + ptid].to(Int32)
+                if idx >= live:
+                    idx = Int32(-1)
+                st_shared_i32(hdr + Int32(4 * _TILE_HEADER_WORDS) + ptid * Int32(4), idx)
         _mbar_arrive(base + Int32(self.ws_bar_t_full) + slot * Int32(_BARRIER_BYTES))
 
     @cute.jit
@@ -1739,7 +1778,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             tier1_hi_experts,
         )
         a_bar_base = Int32(self.ws_bar_a_full)
-        if cutlass.const_expr(is_fc1):
+        if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
             a_bar_base = Int32(self.ws_bar_a_raw)
         claim_base = base + Int32(self.ws_claim_off)
         counter_addr = get_ptr_as_int64(workspace, Int32(0))
@@ -1752,12 +1791,15 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         )
         c_units = self._ws_live_k(is_fc1, _ccomb, descriptor_map, total_experts) // Int32(64)
         cu = Int32(0)
-        crow0, cstride, crow_bytes = self._ws_weight_row(
-            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
-            tier0_lo_experts, tier1_lo_experts, _ccomb, descriptor_map, total_experts,
-        )
+        crow0 = Int64(0)
+        cstride = Int64(0)
+        crow_bytes = Int32(0)
         clast = Int32(0)
-        if ct < total_tiles:
+        if ct < total_tiles and ptid == Int32(0):
+            crow0, cstride, crow_bytes = self._ws_weight_row(
+                is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
+                tier0_lo_experts, tier1_lo_experts, _ccomb, descriptor_map, total_experts,
+            )
             clast = self._ws_last_block(block_expert_ids, _crb, route_blocks)
         bc_issued = Int32(0)
         for i in cutlass.range_constexpr(nc):
@@ -1772,12 +1814,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         is_fc1, jc, nclaimed, *claim, *meta
                     )
                     if ct < total_tiles:
-                        crow0, cstride, crow_bytes = self._ws_weight_row(
-                            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
-                            tier0_lo_experts, tier1_lo_experts, _ccomb, descriptor_map, total_experts,
-                        )
                         c_units = self._ws_live_k(is_fc1, _ccomb, descriptor_map, total_experts) // Int32(64)
-                        clast = self._ws_last_block(block_expert_ids, _crb, route_blocks)
+                        if ptid == Int32(0):
+                            crow0, cstride, crow_bytes = self._ws_weight_row(
+                                is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier, t0_w, t1_w,
+                                tier0_lo_experts, tier1_lo_experts, _ccomb, descriptor_map, total_experts,
+                            )
+                            clast = self._ws_last_block(block_expert_ids, _crb, route_blocks)
 
         # Input-row cursor and prologue.
         rows = cute.make_rmem_tensor((self.ws_m // 8,), Int32)
@@ -1786,14 +1829,17 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         )
         a_blocks = self._ws_live_k(is_fc1, _acomb, descriptor_map, total_experts) // Int32(128)
         ab = Int32(0)
+        prev_arb = Int32(-1)
         if at < total_tiles:
-            self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
+            self._ws_load_rows(is_fc1, k_size, rows, packed_route_indices, arb, ptid, live)
+            prev_arb = arb
         a_issued = Int32(0)
         for i in cutlass.range_constexpr(na):
             if at < total_tiles:
                 self._ws_issue_a_any(is_fc1, 
                     k_size, a_src, rows, base, Int32(i), ab, ptid,
                     base + a_bar_base + Int32(i * _BARRIER_BYTES),
+                    up_suh, _ant, n_tiles,
                 )
                 a_issued += Int32(1)
                 ab += Int32(1)
@@ -1804,7 +1850,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     )
                     if at < total_tiles:
                         a_blocks = self._ws_live_k(is_fc1, _acomb, descriptor_map, total_experts) // Int32(128)
-                        self._ws_load_rows(is_fc1, rows, packed_route_indices, arb, ptid, live)
+                        if arb != prev_arb:
+                            self._ws_load_rows(is_fc1, k_size, rows, packed_route_indices, arb, ptid, live)
+                            prev_arb = arb
 
         # Block cursor.
         jd, nclaimed, dt, drb, dnt, dcomb, dtier, dlocal = self._ws_next_claim(
@@ -1816,22 +1864,27 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         while dt < total_tiles:
             live_k = self._ws_live_k(is_fc1, dcomb, descriptor_map, total_experts)
             blocks_per_tile = live_k // Int32(128)
-            dvalid = self._ws_valid_rows(packed_route_indices, drb, live, lane)
+            dvalid = Int32(0)
+            if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
+                dvalid = self._ws_valid_rows(packed_route_indices, drb, live, lane)
+            elif ptid < Int32(32):
+                dvalid = self._ws_valid_rows(packed_route_indices, drb, live, lane)
             scale = cutlass.Float32(0.0)
-            if dtier == Int32(1):
-                scale = t1_global[dlocal].to(cutlass.Float32)
-            else:
-                scale = t0_global[dlocal].to(cutlass.Float32)
+            if ptid == Int32(0):
+                if dtier == Int32(1):
+                    scale = t1_global[dlocal].to(cutlass.Float32)
+                else:
+                    scale = t0_global[dlocal].to(cutlass.Float32)
             live_n = Int32(n_total)
             if cutlass.const_expr(self.compact_weights and is_fc1 and self.ws_n == 192):
-                if dcomb >= Int32(0) and dcomb < total_experts:
+                if ptid == Int32(0) and dcomb >= Int32(0) and dcomb < total_experts:
                     live_n = descriptor_map[Int64(3) * Int64(total_experts) + Int64(dcomb)].to(Int32)
             self._ws_publish_tile(
-                base, ti, dvalid, drb, dnt, dtier, scale, packed_route_indices, live, ptid, live_k, live_n
+                base, ti, dvalid, drb, dnt, dtier, scale, packed_route_indices, live, ptid, live_k, live_n, False
             )
             ti += Int32(1)
             suh_addr = Int64(0)
-            if cutlass.const_expr(is_fc1):
+            if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
                 suh_off = dcomb * Int32(k_size) + l16 * Int32(8)
                 suh_addr = get_ptr_as_int64(gate_suh, suh_off)
                 if dnt >= n_tiles // Int32(2):
@@ -1843,7 +1896,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 suh_next[3] = w3
             b = Int32(0)
             while b < blocks_per_tile:
-                if cutlass.const_expr(is_fc1):
+                if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
                     suh_w = (suh_next[0], suh_next[1], suh_next[2], suh_next[3])
                     if b + Int32(1) < blocks_per_tile:
                         # The next block's SUH words load under this block's
@@ -1866,7 +1919,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         self._ws_rotate_block(base, a_slot, dvalid, suh_w, ptid)
                     _mbar_arrive(base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES))
                 if blk >= Int32(1):
-                    # Consumers finished block blk - 1: its A slot and its two
+                    # Consumers finished block blk - 1: its A slot and two
                     # weight units are free.
                     if at < total_tiles:
                         fill = a_issued % Int32(na)
@@ -1877,6 +1930,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         self._ws_issue_a_any(is_fc1, 
                             k_size, a_src, rows, base, fill, ab, ptid,
                             base + a_bar_base + fill * Int32(_BARRIER_BYTES),
+                            up_suh, _ant, n_tiles,
                         )
                         a_issued += Int32(1)
                         ab += Int32(1)
@@ -1887,9 +1941,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             )
                             if at < total_tiles:
                                 a_blocks = self._ws_live_k(is_fc1, _acomb, descriptor_map, total_experts) // Int32(128)
-                                self._ws_load_rows(
-                                    is_fc1, rows, packed_route_indices, arb, ptid, live
-                                )
+                                if arb != prev_arb:
+                                    self._ws_load_rows(
+                                        is_fc1, k_size, rows, packed_route_indices, arb, ptid, live
+                                    )
+                                    prev_arb = arb
                     for _u in cutlass.range_constexpr(2):
                         if ct < total_tiles:
                             fill = bc_issued % Int32(nc)
@@ -1907,15 +1963,16 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                     self._ws_next_claim(is_fc1, jc, nclaimed, *claim, *meta)
                                 )
                                 if ct < total_tiles:
-                                    crow0, cstride, crow_bytes = self._ws_weight_row(
-                                        is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier,
-                                        t0_w, t1_w, tier0_lo_experts, tier1_lo_experts,
-                                        _ccomb, descriptor_map, total_experts,
-                                    )
                                     c_units = self._ws_live_k(is_fc1, _ccomb, descriptor_map, total_experts) // Int32(64)
-                                    clast = self._ws_last_block(
-                                        block_expert_ids, _crb, route_blocks
-                                    )
+                                    if ptid == Int32(0):
+                                        crow0, cstride, crow_bytes = self._ws_weight_row(
+                                            is_fc1, n_total, k_size, cnt, n_tiles, clocal, ctier,
+                                            t0_w, t1_w, tier0_lo_experts, tier1_lo_experts,
+                                            _ccomb, descriptor_map, total_experts,
+                                        )
+                                        clast = self._ws_last_block(
+                                            block_expert_ids, _crb, route_blocks
+                                        )
                 blk += Int32(1)
                 b += Int32(1)
             jd, nclaimed, dt, drb, dnt, dcomb, dtier, dlocal = self._ws_next_claim(
@@ -1924,7 +1981,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         # End of the CTA's tiles.
         self._ws_publish_tile(
             base, ti, Int32(-1), Int32(0), Int32(0), Int32(0), cutlass.Float32(0.0),
-            packed_route_indices, live, ptid, Int32(0),
+            packed_route_indices, live, ptid, Int32(0), Int32(0), True
         )
         if cutlass.const_expr(self.ws_dynamic):
             # Every CTA's claims precede its arrival (acq_rel); the last CTA
@@ -2006,6 +2063,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         blocks = Int32(k_size // 128)
         row_bytes = self.ws_n16 * 32 * bits
         lrow = lane & Int32(15)
+        lrow7 = lane & Int32(7)
         lchunk = lane >> Int32(4)
         b = Int32(0)
         while b < blocks:
@@ -2052,12 +2110,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             frag, wa, wb, lut_addr, bits
                         )
                     b_regs.append((frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1]))
+                c = Int32(2 * q) + lchunk
+                pos = (c & Int32(8)) | ((c & Int32(7)) ^ lrow7)
+                a_addr_q = a_base + lrow * Int32(256) + pos * Int32(16)
                 a_regs = []
                 for mb in cutlass.range_constexpr(active):
-                    row = Int32(16 * mb) + lrow
-                    c = Int32(2 * q) + lchunk
-                    pos = (c & Int32(8)) | ((c & Int32(7)) ^ (row & Int32(7)))
-                    a_regs.append(ldmatrix_m8n8x4_b16(a_base + row * Int32(256) + pos * Int32(16)))
+                    a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
                 for jj in cutlass.range_constexpr(0 if "nomma" in self.ws_exp else 2):
                     for mb in cutlass.range_constexpr(active):
                         for h in cutlass.range_constexpr(2):
@@ -2251,41 +2309,42 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             col_valid = (local_col < live_n).to(Int32)
         for mb in cutlass.range_constexpr(active):
             for rh in cutlass.range_constexpr(2):
-                row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
-                w = []
-                for jj in cutlass.range_constexpr(2):
-                    for h in cutlass.range_constexpr(2):
-                        o0 = (((0 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
-                        o1 = (((1 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
-                        v0 = acc[o0][0] + acc[o1][0]
-                        v1 = acc[o0 + 1][0] + acc[o1 + 1][0]
-                        w.append(Int32(pack_f32x2_to_f16x2(v0 * scale, v1 * scale)))
-                # Stage 1 (xor 2): words 2,3 of lanes 0,1 <-> words 0,1 of lanes 2,3.
-                t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[0], w[2]), offset=2)
-                t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[1], w[3]), offset=2)
-                w[2] = cutlass.select_(b1 != Int32(0), w[2], t0)
-                w[3] = cutlass.select_(b1 != Int32(0), w[3], t1)
-                w[0] = cutlass.select_(b1 != Int32(0), t0, w[0])
-                w[1] = cutlass.select_(b1 != Int32(0), t1, w[1])
-                # Stage 2 (xor 1): words 1,3 of even lanes <-> words 0,2 of odd lanes.
-                t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[0], w[1]), offset=1)
-                t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[2], w[3]), offset=1)
-                w[1] = cutlass.select_(b0 != Int32(0), w[1], t0)
-                w[3] = cutlass.select_(b0 != Int32(0), w[3], t1)
-                w[0] = cutlass.select_(b0 != Int32(0), t0, w[0])
-                w[2] = cutlass.select_(b0 != Int32(0), t1, w[2])
-                if row < valid and col_valid != Int32(0):
-                    route = ld_shared_i32_relaxed(
-                        hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
-                    )
-                    if cutlass.const_expr("nostore" not in self.ws_exp):
-                        st_global_v4_u32(
-                            get_ptr_as_int64(c_out, Int64(route) * Int64(n_total) + Int64(col)),
-                            Uint32(w[0]),
-                            Uint32(w[1]),
-                            Uint32(w[2]),
-                            Uint32(w[3]),
+                if cutlass.const_expr(rh == 0) or Int32(16 * mb + 8 * rh) < valid:
+                    row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
+                    w = []
+                    for jj in cutlass.range_constexpr(2):
+                        for h in cutlass.range_constexpr(2):
+                            o0 = (((0 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
+                            o1 = (((1 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
+                            v0 = acc[o0][0] + acc[o1][0]
+                            v1 = acc[o0 + 1][0] + acc[o1 + 1][0]
+                            w.append(Int32(pack_f32x2_to_f16x2(v0 * scale, v1 * scale)))
+                    # Stage 1 (xor 2): words 2,3 of lanes 0,1 <-> words 0,1 of lanes 2,3.
+                    t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[0], w[2]), offset=2)
+                    t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[1], w[3]), offset=2)
+                    w[2] = cutlass.select_(b1 != Int32(0), w[2], t0)
+                    w[3] = cutlass.select_(b1 != Int32(0), w[3], t1)
+                    w[0] = cutlass.select_(b1 != Int32(0), t0, w[0])
+                    w[1] = cutlass.select_(b1 != Int32(0), t1, w[1])
+                    # Stage 2 (xor 1): words 1,3 of even lanes <-> words 0,2 of odd lanes.
+                    t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[0], w[1]), offset=1)
+                    t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[2], w[3]), offset=1)
+                    w[1] = cutlass.select_(b0 != Int32(0), w[1], t0)
+                    w[3] = cutlass.select_(b0 != Int32(0), w[3], t1)
+                    w[0] = cutlass.select_(b0 != Int32(0), t0, w[0])
+                    w[2] = cutlass.select_(b0 != Int32(0), t1, w[2])
+                    if row < valid and col_valid != Int32(0):
+                        route = ld_shared_i32_relaxed(
+                            hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
                         )
+                        if cutlass.const_expr("nostore" not in self.ws_exp):
+                            st_global_v4_u32(
+                                get_ptr_as_int64(c_out, Int64(route) * Int64(n_total) + Int64(col)),
+                                Uint32(w[0]),
+                                Uint32(w[1]),
+                                Uint32(w[2]),
+                                Uint32(w[3]),
+                            )
 
     @cute.jit
     def _ws_consumer(

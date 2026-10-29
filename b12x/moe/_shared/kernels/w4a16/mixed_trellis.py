@@ -118,6 +118,7 @@ class MixedTrellisCompileResult:
     # Warp-specialized prefill (mixed_trellis_ws): FC1, SwiGLU and FC2 as three
     # launches of producer/consumer CTAs; FC1 rotates its input rows itself.
     warp_specialized: bool = field(default=False, kw_only=True)
+    ws_prerotate: bool = field(default=False, kw_only=True)
     # FC1 input rows: "bf16" [M, H], or "e4m3_k32" wire rows [M, H + H/32]
     # bytes (E4M3 values, then one UE8M0 scale per 32) that the
     # warp-specialized producers widen in shared memory.
@@ -1124,6 +1125,138 @@ class W4A16MixedTrellisKernel:
                                 pack_f32x2_to_f16x2(h2, h3),
                             )
                 blk += Int32(1)
+            unit += unit_stride
+
+    @cute.jit
+    def _run_input_rotation_token_major_ws(
+        self,
+        x_input: cute.Tensor,
+        a_gate: cute.Tensor,
+        a_up: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        raw_topk_ids: cute.Tensor,
+        global_to_combined: cute.Tensor,
+        route_num_experts: Int32,
+        total_experts: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: Int32,
+    ):
+        lane = tid & Int32(31)
+        warps_per_cta = Int32(self.cta_threads // 32)
+        hidden = Int32(self.hidden_size)
+        nblk = Int32(self.hidden_size // 128)
+        blocks_per_unit = 2 if (self.hidden_size // 128) % 2 == 0 else _ROTATION_BLOCKS_PER_UNIT
+        groups = (nblk + Int32(blocks_per_unit - 1)) // Int32(blocks_per_unit)
+        unit = cta * warps_per_cta + (tid >> Int32(5))
+        unit_stride = grid_x * warps_per_cta
+        while unit < active_m * groups:
+            token = unit // groups
+            first_blk = (unit - token * groups) * Int32(blocks_per_unit)
+            last_blk = first_blk + Int32(blocks_per_unit)
+            if last_blk > nblk:
+                last_blk = nblk
+            if cutlass.const_expr(self.top_k <= 32):
+                my_expert = Int32(-1)
+                if lane < Int32(self.top_k):
+                    global_expert = raw_topk_ids[token * Int32(self.top_k) + lane].to(Int32)
+                    if global_expert >= Int32(0) and global_expert < route_num_experts:
+                        route_expert = global_to_combined[global_expert].to(Int32)
+                        if route_expert < total_experts:
+                            my_expert = route_expert
+                blk = first_blk
+                while blk < last_blk:
+                    col = blk * Int32(128) + lane * Int32(4)
+                    xw0, xw1 = ld_global_nc_v2_u32(get_ptr_as_int64(x_input, token * hidden + col))
+                    x0, x1 = bfloat2_to_float2_scaled(xw0, cutlass.Float32(1.0))
+                    x2, x3 = bfloat2_to_float2_scaled(xw1, cutlass.Float32(1.0))
+                    x0, x1 = half2_to_float2_scaled(pack_f32x2_to_f16x2(x0, x1), cutlass.Float32(1.0))
+                    x2, x3 = half2_to_float2_scaled(pack_f32x2_to_f16x2(x2, x3), cutlass.Float32(1.0))
+                    j = Int32(0)
+                    while j < Int32(self.top_k):
+                        expert_j = cute.arch.shuffle_sync(my_expert, j)
+                        if expert_j >= Int32(0):
+                            s_off = expert_j * hidden + col
+                            out_off = (token * Int32(self.top_k) + j) * hidden + col
+                            gw0, gw1 = ld_global_nc_v2_u32(get_ptr_as_int64(gate_suh, s_off))
+                            uw0, uw1 = ld_global_nc_v2_u32(get_ptr_as_int64(up_suh, s_off))
+                            gs0, gs1 = half2_to_float2_scaled(gw0, cutlass.Float32(1.0))
+                            gs2, gs3 = half2_to_float2_scaled(gw1, cutlass.Float32(1.0))
+                            gv0, gv1 = half2_to_float2_scaled(
+                                pack_f32x2_to_f16x2(x0 * gs0, x1 * gs1), cutlass.Float32(1.0)
+                            )
+                            gv2, gv3 = half2_to_float2_scaled(
+                                pack_f32x2_to_f16x2(x2 * gs2, x3 * gs3), cutlass.Float32(1.0)
+                            )
+                            gh0, gh1, gh2, gh3 = self.driver._had128_quad(gv0, gv1, gv2, gv3, lane)
+                            st_global_v2_u32(
+                                get_ptr_as_int64(a_gate, out_off),
+                                pack_f32x2_to_f16x2(gh0, gh1),
+                                pack_f32x2_to_f16x2(gh2, gh3),
+                            )
+                            us0, us1 = half2_to_float2_scaled(uw0, cutlass.Float32(1.0))
+                            us2, us3 = half2_to_float2_scaled(uw1, cutlass.Float32(1.0))
+                            uv0, uv1 = half2_to_float2_scaled(
+                                pack_f32x2_to_f16x2(x0 * us0, x1 * us1), cutlass.Float32(1.0)
+                            )
+                            uv2, uv3 = half2_to_float2_scaled(
+                                pack_f32x2_to_f16x2(x2 * us2, x3 * us3), cutlass.Float32(1.0)
+                            )
+                            uh0, uh1, uh2, uh3 = self.driver._had128_quad(uv0, uv1, uv2, uv3, lane)
+                            st_global_v2_u32(
+                                get_ptr_as_int64(a_up, out_off),
+                                pack_f32x2_to_f16x2(uh0, uh1),
+                                pack_f32x2_to_f16x2(uh2, uh3),
+                            )
+                        j += Int32(1)
+                    blk += Int32(1)
+            else:
+                experts = []
+                for j in cutlass.range_constexpr(self.top_k):
+                    global_expert = raw_topk_ids[token * Int32(self.top_k) + Int32(j)].to(Int32)
+                    route_expert = Int32(-1)
+                    if global_expert >= Int32(0) and global_expert < route_num_experts:
+                        route_expert = global_to_combined[global_expert].to(Int32)
+                    if route_expert >= total_experts:
+                        route_expert = Int32(-1)
+                    experts.append(route_expert)
+                blk = first_blk
+                while blk < last_blk:
+                    col = blk * Int32(128) + lane * Int32(4)
+                    xw0, xw1 = ld_global_nc_v2_u32(get_ptr_as_int64(x_input, token * hidden + col))
+                    x0, x1 = bfloat2_to_float2_scaled(xw0, cutlass.Float32(1.0))
+                    x2, x3 = bfloat2_to_float2_scaled(xw1, cutlass.Float32(1.0))
+                    x0, x1 = half2_to_float2_scaled(pack_f32x2_to_f16x2(x0, x1), cutlass.Float32(1.0))
+                    x2, x3 = half2_to_float2_scaled(pack_f32x2_to_f16x2(x2, x3), cutlass.Float32(1.0))
+                    for j in cutlass.range_constexpr(self.top_k):
+                        expert_j = experts[j]
+                        if expert_j >= Int32(0):
+                            s_off = expert_j * hidden + col
+                            out_off = (token * Int32(self.top_k) + Int32(j)) * hidden + col
+                            for proj in cutlass.range_constexpr(2):
+                                suh = gate_suh
+                                out = a_gate
+                                if cutlass.const_expr(proj == 1):
+                                    suh = up_suh
+                                    out = a_up
+                                sw0, sw1 = ld_global_nc_v2_u32(get_ptr_as_int64(suh, s_off))
+                                s0, s1 = half2_to_float2_scaled(sw0, cutlass.Float32(1.0))
+                                s2, s3 = half2_to_float2_scaled(sw1, cutlass.Float32(1.0))
+                                v0, v1 = half2_to_float2_scaled(
+                                    pack_f32x2_to_f16x2(x0 * s0, x1 * s1), cutlass.Float32(1.0)
+                                )
+                                v2, v3 = half2_to_float2_scaled(
+                                    pack_f32x2_to_f16x2(x2 * s2, x3 * s3), cutlass.Float32(1.0)
+                                )
+                                h0, h1, h2, h3 = self.driver._had128_quad(v0, v1, v2, v3, lane)
+                                st_global_v2_u32(
+                                    get_ptr_as_int64(out, out_off),
+                                    pack_f32x2_to_f16x2(h0, h1),
+                                    pack_f32x2_to_f16x2(h2, h3),
+                                )
+                    blk += Int32(1)
             unit += unit_stride
 
     @cute.kernel
@@ -2716,6 +2849,7 @@ def compile_mixed_trellis(
         compact_weights=bool(compact_weights),
         fused_input_rotation=bool(fused_input_rotation) and not warp_specialized,
         warp_specialized=bool(warp_specialized),
+        ws_prerotate=bool(getattr(kernel, "ws_prerotate", False)),
         input_format=str(input_format),
         ws_input_stages=ws_input_stages,
         activations=activations,
@@ -3049,7 +3183,8 @@ def _make_mixed_trellis_buffers(
     rotation_up = rotation_gate
     if not (
         getattr(launch, "fused_input_rotation", False)
-        or getattr(launch, "warp_specialized", False)
+        or (getattr(launch, "warp_specialized", False)
+            and not getattr(launch, "ws_prerotate", False))
     ):
         rotation_up = torch.empty(
             (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
