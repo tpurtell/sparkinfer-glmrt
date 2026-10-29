@@ -760,6 +760,30 @@ class _Fp8Moe:
         return (self.threshold,) + tuple(part.key() if part is not None else None
                                          for part in (self.decode, self.prefill))
 
+    def arithmetic_routes(self, weights: str, max_rows: int) -> list[dict]:
+        """Row-only arithmetic intervals, independent of traffic grouping.
+
+        IDs are package ABI metadata: 0 unknown, 1 decode, 2 prefill,
+        3 stream. Occupancy-dependent NVFP4 cannot promise a row-only route.
+        """
+        capacity = int(max_rows)
+        if weights == "nvfp4":
+            return [{"end_rows": capacity, "route_id": 0}]
+        def identity(part):
+            if isinstance(part, _Route):
+                return 1 if part.route == "decode" else 2
+            if isinstance(part, _StreamRoute):
+                return 3
+            return 0
+        if self.route != "auto":
+            part = self.decode if self.route == "decode" else self.prefill
+            return [{"end_rows": capacity, "route_id": identity(part)}]
+        cutoff = min(capacity, int(self.threshold))
+        segments = [{"end_rows": cutoff, "route_id": identity(self.decode)}]
+        if cutoff < capacity:
+            segments.append({"end_rows": capacity, "route_id": identity(self.prefill)})
+        return segments
+
     def weight_read_grouping(self, weights: str, max_rows: int) -> dict:
         """Static accounting only; never part of the compiler key or launch."""
         if weights == "nvfp4":
@@ -881,7 +905,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
                   "wire": bool(wire), "weights": g.weights, "activations": g.activations,
                   "activation": g.activation, "projection": g.projection,
                   "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8),
-                  "weight_read_grouping": launch.weight_read_grouping(g.weights, max_rows)},
+                  "weight_read_grouping": launch.weight_read_grouping(g.weights, max_rows),
+                  "arithmetic_routes": launch.arithmetic_routes(g.weights, max_rows)},
         scratch={"scratch": lambda rows: fp8_moe_scratch_bytes(g, route, rows, wire, prefill, mxfp4_down_a8)},
         doc=__doc__,
     )

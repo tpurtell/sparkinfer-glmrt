@@ -134,3 +134,42 @@ def test_mxfp4_stream_preserves_native_bf16():
     assert env121["auto_large_rows"](True, "mxfp4") == 640
     assert env121["prefill_forms"](g, 640, True) == []
     assert env121["prefill_forms"](g, 1024, True) == ["w8a16"]
+
+
+def arithmetic_method():
+    env = grouping_method()
+    tree = ast.parse(SOURCE.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Fp8Moe")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "arithmetic_routes")
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(SOURCE), "exec"), env)
+    return env
+
+
+@pytest.mark.parametrize("sm,cutoff", [(120, 1000), (121, 640)])
+@pytest.mark.parametrize("weights,wire,prefill", [("mxfp4", True, "auto"),
+    ("mxfp4", False, "auto"), ("fp8", True, "auto"), ("fp8", False, "auto"),
+    ("fp8", False, "w8a16")])
+def test_arithmetic_boundary_survives_identical_traffic_groups(sm, cutoff, weights, wire, prefill):
+    _, authority = policy(sm)
+    threshold = authority["auto_large_rows"](wire, weights, prefill)
+    if weights == "mxfp4":
+        assert threshold == cutoff
+    env = arithmetic_method()
+    decode, large = env["_Route"](), env["_Route"]()
+    decode.route, large.route = "decode", "prefill"
+    decode.gate_up = decode.down = SimpleNamespace(m_tiles=4)
+    large.gate_up = large.down = SimpleNamespace(tile_m=64)
+    launch = SimpleNamespace(route="auto", threshold=threshold, decode=decode, prefill=large)
+    assert env["weight_read_grouping"](launch, weights, 4096)["segments"] == [
+        {"end_rows": 4096, "group_rows": 64}]
+    assert env["arithmetic_routes"](launch, weights, 4096) == [
+        {"end_rows": threshold, "route_id": 1}, {"end_rows": 4096, "route_id": 2}]
+    assert env["arithmetic_routes"](launch, weights, threshold) == [
+        {"end_rows": threshold, "route_id": 1}]
+
+
+def test_unknown_occupancy_route_and_fixed_stream():
+    env = arithmetic_method()
+    launch = SimpleNamespace(route="stream", prefill=env["_StreamRoute"]())
+    assert env["arithmetic_routes"](launch, "nvfp4", 4096) == [{"end_rows": 4096, "route_id": 0}]
+    assert env["arithmetic_routes"](launch, "mxfp4", 4096) == [{"end_rows": 4096, "route_id": 3}]
