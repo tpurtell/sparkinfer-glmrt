@@ -175,5 +175,15 @@ def test_mxfp4_coordinator_native_bf16_auto(family, rows, hot):
     assert c >= COS and worst >= 0.999
 
 
+@pytest.mark.parametrize("ring_frames", [False, True])
+@pytest.mark.parametrize("hot", [0, 8])
+def test_mxfp4_moe_stream_segment_row_invariance(hot, ring_frames):
+    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES
+    from .test_cuteafd_fp8_moe_aot import _assert_segment_row_invariance
+
+    g = GEOMETRIES["mimof"].with_tp(2)
+    _assert_segment_row_invariance(g, _weights(g, g.slice), hot, ring_frames)
+
+
 def test_mxfp4_geometry():
     assert [_geometry(tp).slice for tp in (1, 2, 4, 6)] == [2048, 1024, 512, 384]

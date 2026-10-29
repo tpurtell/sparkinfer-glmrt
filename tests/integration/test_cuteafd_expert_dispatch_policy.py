@@ -173,3 +173,58 @@ def test_unknown_occupancy_route_and_fixed_stream():
     launch = SimpleNamespace(route="stream", prefill=env["_StreamRoute"]())
     assert env["arithmetic_routes"](launch, "nvfp4", 4096) == [{"end_rows": 4096, "route_id": 0}]
     assert env["arithmetic_routes"](launch, "mxfp4", 4096) == [{"end_rows": 4096, "route_id": 3}]
+
+
+@pytest.mark.parametrize("weights,form,act", [("fp8", "auto", 768), ("fp8", "w8a16", 768),
+                                              ("mxfp4", "auto", 400), ("mxfp4", "w8a16", 768)])
+def test_segment_scratch_uses_live_rows_but_compiled_metadata_offset(weights, form, act):
+    tree, env = policy(121)
+    names = {"_regions", "fp8_moe_segment_scratch_bytes"}
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    env.update(Fp8MoeGeometry=object, STREAM_TILE_M=128,
+               stream_max_tiles=lambda experts, pairs: (pairs + 127) // 128 + min(experts, pairs),
+               meta_words=lambda experts, tiles: 4 + 3 * experts + tiles,
+               _align=lambda value: (value + 1023) // 1024 * 1024,
+               mxfp8_down_row_bytes=lambda width: (width + width // 32 + 15) // 16 * 16)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), env)
+    geometry = SimpleNamespace(weights=weights, kind=weights, hidden=4096, experts=256,
+                               top_k=8, slice=384, activations="a16")
+    scratch = env["fp8_moe_segment_scratch_bytes"]
+    align = env["_align"]
+    pairs = 8256 * 8
+    tiles = (pairs + 127) // 128 + 256
+    expected = align(4 * (4 + 3 * 256 + 16384 * 8 // 128 + 256)) + 2 * align(pairs * 4)
+    expected += align(tiles * 128 * act) + align(pairs * 4096 * 2)
+    assert scratch(geometry, 8256, 16384, form) == expected
+    assert expected < scratch(geometry, 16384, 16384, form)
+    # Negative control: sizing the metadata at live rows misses the compiled offset.
+    assert scratch(geometry, 8256, 8256, form) < expected
+    for rows in (0, 16385):
+        with pytest.raises(ValueError):
+            scratch(geometry, rows, 16384, form)
+
+
+def test_indirect_row_address_resolver_and_singleton_key_contract():
+    source = SOURCE.with_name("_fp8_moe_stream.py")
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "StreamFp8GateUp")
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("row_address", "key")]
+    for method in methods:
+        method.decorator_list = []
+        method.returns = None
+        for arg in method.args.args:
+            arg.annotation = None
+    addresses = [0x1000, 0x8000, 0x2000]
+    env = {"cutlass": SimpleNamespace(const_expr=bool), "Int64": int,
+           "cute": SimpleNamespace(make_ptr=lambda *args, **kwargs: addresses,
+                                   AddressSpace=SimpleNamespace(gmem=0))}
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), env)
+    obj = SimpleNamespace(row_addresses=False, row_bytes=4224, inter=384, hidden=4096, experts=256,
+                          limit=0.0, a_ring=3, w_ring=3, qmma=True, post_silu=False)
+    pointer = SimpleNamespace(toint=lambda: 0x100000)
+    old_key = env["key"](obj)
+    assert env["row_address"](obj, pointer, 2) == 0x100000 + 2 * 4224
+    obj.row_addresses = True
+    assert env["row_address"](obj, pointer, 2) == addresses[2]
+    assert env["key"](obj) == old_key + ("row_addresses",)
+    assert env["row_address"](obj, pointer, 2) != 0x100000 + 2 * 4224

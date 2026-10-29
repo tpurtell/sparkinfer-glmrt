@@ -104,8 +104,8 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     w_k = 256
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False,
-                 act_mxfp8: bool = False, wire: bool = True):
-        super().__init__(inter=inter, hidden=hidden, experts=experts, limit=limit)
+                 act_mxfp8: bool = False, wire: bool = True, row_addresses: bool = False):
+        super().__init__(inter=inter, hidden=hidden, experts=experts, limit=limit, row_addresses=row_addresses)
         # qmma: block-scaled E4M3 x E2M1 MMAs (m16n8k32, UE8M0 per 32 on both
         # operands) read the wire rows and the packed weights as they are.
         self.wire = bool(wire)
@@ -132,7 +132,7 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
 
     def key(self) -> tuple:
         key = ("stream_gate_up_mxfp4", 1, self.inter, self.hidden, self.experts, self.limit, self.a_ring,
-               self.w_ring, self.qmma, self.wire)
+               self.w_ring, self.qmma, self.wire) + (("row_addresses",) if self.row_addresses else ())
         return key + (("act_mxfp8", self.act_row_bytes),) if self.act_mxfp8 else key
 
     def _storage(self, w_layout):
@@ -210,12 +210,12 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                 src[q] = Int64(-1)
                 if row < live:
                     source = _i32_at(Int64(pair_row.toint()), first + row)
-                    src[q] = Int64(x.toint()) + Int64(source) * Int64(self.row_bytes) + Int64(ch) * Int64(16)
+                    src[q] = self.row_address(x, source) + Int64(ch) * Int64(16)
             s_src = Int64(-1)
             if cutlass.const_expr(self.wire):
                 if tidx < live:
                     source = _i32_at(Int64(pair_row.toint()), first + tidx)
-                    s_src = Int64(x.toint()) + Int64(source) * Int64(self.row_bytes) + Int64(h)
+                    s_src = self.row_address(x, source) + Int64(h)
             # The CTA's scale rows (32 gate then 32 up columns, H/32 bytes each), once;
             # they join the first cp.async group.
             units = self.scale_cols // 16
