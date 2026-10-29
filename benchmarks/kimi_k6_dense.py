@@ -59,6 +59,67 @@ PREFILL_TP2_SHAPES = (
 )
 
 
+# Per GPU, one target and one draft head; rotations remain separate and unchanged.
+GLMF_VERIFY_MIX = {
+    (4096, 4096, 1): 34 * 3, (4096, 4096, 2): 34,
+    (4096, 1024, 1): 42 * 2, (1024, 4096, 2): 42,
+    (4096, 6144, 1): 3 * 2, (6144, 4096, 2): 3,
+    (4096, 1536, 1): 11, (4096, 512, 1): 11,
+    (1536, 8192, 1): 11, (8192, 4096, 2): 11,
+    (4096, 154880, 1): 2,
+}
+
+
+def streaming_read_bandwidth(l2_bytes, samples):
+    """Read beyond L2 and reduce to a tiny sink; report measured DRAM GB/s."""
+    import torch
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def read_kernel(source, sink, N: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        values = tl.load(source + offsets, offsets < N, 0)
+        tl.store(sink + tl.program_id(0), tl.sum(values, 0))
+
+    count = max(256 * 1024 * 1024, 4 * l2_bytes) // 4
+    source = torch.ones(count, device="cuda", dtype=torch.float32)
+    sink = torch.empty(triton.cdiv(count, 4096), device="cuda", dtype=torch.float32)
+    def run():
+        read_kernel[(sink.numel(),)](source, sink, count, 4096)
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize()
+    if not torch.equal(sink.sum(), torch.tensor(float(count), device="cuda")):
+        raise RuntimeError("streaming read checksum mismatch")
+    times = []
+    for _ in range(samples):
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        begin.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(begin.elapsed_time(end) * 1000)
+    us = statistics.median(times)
+    return dict(bytes=count * 4, us=us, gbs=count * 4 / (us * 1000), samples_us=times)
+
+
+def glmf_aggregate(records):
+    aggregate = []
+    for rows in (2, 4, 8):
+        cells = {(r["k"], r["n"], r["side"]): r for r in records
+                 if r["rows"] == rows and "baseline_us" in r}
+        if not GLMF_VERIFY_MIX.keys() <= cells.keys():
+            continue
+        base = sum(cells[s]["baseline_us"] * count for s, count in GLMF_VERIFY_MIX.items())
+        cand = sum(cells[s]["candidate_us"] * count for s, count in GLMF_VERIFY_MIX.items())
+        aggregate.append(dict(rows=rows, baseline_us=base, candidate_us=cand, ratio=base/cand))
+    return aggregate
+
+
 def benchmark_prefill_route(args):
     """Exact exported prefill routes; every replay uses preallocated storage."""
     import torch
@@ -373,7 +434,7 @@ def benchmark_native_comparison(args):
         return lib
 
     default_shapes = "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,16384:4096:1,4096:154880:1,4096:6144:1,6144:4096:2"
-    shapes = [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
+    shapes = list(GLMF_VERIFY_MIX) if args.glmf_verify else [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
     rows_list = list(map(int, args.rows.split(",")))
     if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 1:
         raise ValueError("native comparison requires rows 1..4096 and positive samples")
@@ -398,6 +459,10 @@ def benchmark_native_comparison(args):
         l2_bytes=l2, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
         input_dtype=args.input_dtype, codebook=args.codebook,
         ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[])
+    if args.glmf_verify and not args.compile_only:
+        report["metadata"]["streaming_read"] = streaming_read_bandwidth(l2, args.samples)
+        report["metadata"]["mix"] = {":".join(map(str, s)): count for s, count in GLMF_VERIFY_MIX.items()}
+        report["metadata"]["aggregate_scope"] = "native multiply/reduce only; one target + one draft head"
     torch.manual_seed(273)
     for k, n, side in shapes:
         directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
@@ -531,7 +596,11 @@ def benchmark_native_comparison(args):
                 partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
                 weight_gbs=(k*n*args.bits/8)/(times[name]*1000),
                 baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot())
+            if args.glmf_verify:
+                record["bandwidth_fraction"] = record["weight_gbs"] / report["metadata"]["streaming_read"]["gbs"]
             report["records"].append(record)
+            if args.glmf_verify:
+                report["aggregate"] = glmf_aggregate(report["records"])
             print(json.dumps({key: value for key, value in record.items() if key not in ("samples_us", "baseline_samples_us")}), flush=True)
             (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
         (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
@@ -552,6 +621,7 @@ def main():
     parser.add_argument("--rows", default="1,64,256")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
+    parser.add_argument("--glmf-verify", action="store_true", help="GLMF verify mix, measured streaming bandwidth and round aggregate")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
     parser.add_argument("--baseline-native", type=Path, help="compare output and partial bytes against a previous _native.py")
     parser.add_argument("--compile-only", action="store_true", help="CPU-only export of both comparison arms")
