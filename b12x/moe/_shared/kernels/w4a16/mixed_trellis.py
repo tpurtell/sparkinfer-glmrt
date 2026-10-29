@@ -118,6 +118,7 @@ class MixedTrellisCompileResult:
     # Warp-specialized prefill (mixed_trellis_ws): FC1, SwiGLU and FC2 as three
     # launches of producer/consumer CTAs; FC1 rotates its input rows itself.
     warp_specialized: bool = field(default=False, kw_only=True)
+    ws_prerotate: bool = field(default=False, kw_only=True)
     # FC1 input rows: "bf16" [M, H], or "e4m3_k32" wire rows [M, H + H/32]
     # bytes (E4M3 values, then one UE8M0 scale per 32) that the
     # warp-specialized producers widen in shared memory.
@@ -2716,6 +2717,7 @@ def compile_mixed_trellis(
         compact_weights=bool(compact_weights),
         fused_input_rotation=bool(fused_input_rotation) and not warp_specialized,
         warp_specialized=bool(warp_specialized),
+        ws_prerotate=bool(getattr(kernel, "ws_prerotate", False)),
         input_format=str(input_format),
         ws_input_stages=ws_input_stages,
         activations=activations,
@@ -3049,7 +3051,8 @@ def _make_mixed_trellis_buffers(
     rotation_up = rotation_gate
     if not (
         getattr(launch, "fused_input_rotation", False)
-        or getattr(launch, "warp_specialized", False)
+        or (getattr(launch, "warp_specialized", False)
+            and not getattr(launch, "ws_prerotate", False))
     ):
         rotation_up = torch.empty(
             (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
