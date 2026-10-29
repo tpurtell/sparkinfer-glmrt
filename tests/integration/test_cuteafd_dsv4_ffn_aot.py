@@ -76,6 +76,8 @@ def programs():
             ("ffn", "pro", 300): dsv4_ffn.compile_dsv4_shared_ffn_aot(PRO, max_rows=300),
             ("router", "flash"): dsv4_ffn.compile_dsv4_router_scores_aot(FLASH),
             ("router", "pro"): dsv4_ffn.compile_dsv4_router_scores_aot(PRO),
+            ("prefill_router", "flash"): dsv4_ffn.compile_dsv4_prefill_router_scores_aot(FLASH),
+            ("prefill_router", "pro"): dsv4_ffn.compile_dsv4_prefill_router_scores_aot(PRO),
             ("quant", "flash"): dsv4_ffn.compile_dsv4_expert_input_quant_aot(FLASH),
             ("quant", "pro"): dsv4_ffn.compile_dsv4_expert_input_quant_aot(PRO),
         }
@@ -306,3 +308,38 @@ def test_export_to_c_signature(programs, key, tmp_path):
     stem = "dsv4_" + "_".join(map(str, key))
     info = check_export(programs[key], tmp_path, stem)
     assert info["argument_count"] == len(programs[key].operands) + len(programs[key].scalars) + 1
+
+
+@pytest.mark.parametrize("name", ["flash", "pro"])
+@pytest.mark.parametrize("mode", ["random", "cancellation", "dynamic"])
+def test_prefill_router_scores_are_row_invariant(programs, name, mode):
+    """Packed row offsets and every skinny/MMA boundary preserve FP32 logits."""
+    device = require_b12x()
+    g = _geometry(name)
+    e, h = g.routed_experts, g.hidden
+    gate = (torch.randn((e, h), generator=torch.Generator().manual_seed(e)) / 64).bfloat16().to(device)
+    x = _x(257, h, 847, device)
+    if mode == "cancellation":
+        gate[:, 1::2] = -gate[:, ::2]
+        x[:, 1::2] = x[:, ::2]
+        x[:, ::257] *= 1.0078125
+    elif mode == "dynamic":
+        scale = torch.pow(2., (torch.arange(h, device=device) % 41 - 20).float())
+        x = (x.float() * scale).bfloat16()
+        gate = (gate.float() / scale).bfloat16()
+    program = programs[("prefill_router", name)]
+
+    def run(value):
+        logits = torch.full((len(value), e), float("nan"), device=device)
+        program.launch(value.contiguous(), gate, logits, scalars=(len(value),))
+        torch.cuda.synchronize()
+        assert torch.isfinite(logits).all()
+        return logits
+
+    single = torch.cat([run(x[r:r + 1]) for r in range(len(x))])
+    for rows in (1, 29, 31, 63, 64, 65, 83, 127, 128, 191, 200, 257):
+        assert_bitwise(run(x[:rows]), single[:rows], f"{name} prefill rows={rows}")
+    full = run(x)
+    for start, end in ((29, 60), (63, 128), (127, 257)):
+        assert_bitwise(run(x[start:end]), full[start:end], f"{name} packed offset={start}")
+    torch.testing.assert_close(full, x.float() @ gate.float().t(), rtol=1e-4, atol=1e-4)
