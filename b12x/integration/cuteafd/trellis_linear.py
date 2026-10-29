@@ -49,8 +49,9 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
 
 class _Pointers:
     def __init__(self, g):
-        from b12x.gemm.trellis_linear._native import NativeTrellisLinear
-        self.core = NativeTrellisLinear(g)
+        from b12x.gemm.trellis_linear._native import NativeTrellisLinear, PartitionedNativeTrellisLinear
+        core = PartitionedNativeTrellisLinear if "decode_cta_warps" in g else NativeTrellisLinear
+        self.core = core(g)
 
     @cute.jit
     def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
@@ -100,10 +101,17 @@ class _GroupedPointers:
 
 def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
                                codebook="e4m3", sharded_side=1,
-                               rotation_count=4, max_rows=4096, groups=1, input_dtype="f16"):
+                               rotation_count=4, max_rows=4096, groups=1, input_dtype="f16",
+                               decode_cta_warps=4):
     g = geometry(input_features, output_features, bits=bits, codebook=codebook,
                  sharded_side=sharded_side, rotation_count=rotation_count,
                  max_rows=max_rows, groups=groups, input_dtype=input_dtype)
+    if decode_cta_warps not in (1, 2, 4):
+        raise ValueError("decode_cta_warps must be 1, 2 or 4")
+    if decode_cta_warps != 4:
+        if bits != 6 or groups != 1:
+            raise ValueError("partitioned decode requires ungrouped K6")
+        g["decode_cta_warps"] = decode_cta_warps
     k, n, s = g["input_features"], g["output_features"], g["splits"]
     if groups == 1:
         operands = (

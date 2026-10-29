@@ -2802,3 +2802,90 @@ def select4(index: Int32, v0: Int64, v1: Int64, v2: Int64, v3: Int64) -> Int64:
     elif index == Int32(2):
         out = v2
     return out
+
+
+class PartitionedNativeTrellisLinear(NativeTrellisLinear):
+    """Experimental CTA partitioning; each original warp keeps its arithmetic."""
+
+    def __init__(self, g):
+        super().__init__(g)
+        self.decode_cta_warps = g["decode_cta_warps"]
+
+    @cute.jit
+    def _decode(self, inputs: cute.Tensor, payload: cute.Tensor,
+                scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        if rows <= Int32(16):
+            tiles = Int32(self.n // (32 * self.decode_cta_warps) * self.splits)
+            self.multiply_partitioned(inputs, payload, scales, partial, rows, rotation_id).launch(
+                grid=(min(tiles, cta_limit), 1, 1),
+                block=(32 * self.decode_cta_warps, 1, 1),
+                min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+            self.reduce(partial, output, rows).launch(
+                grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
+        else:
+            self._decode_existing(inputs, payload, scales, partial, output,
+                                  rows, rotation_id, cta_limit, stream)
+
+    @cute.kernel
+    def multiply_partitioned(self, inputs: cute.Tensor, payload: cute.Tensor,
+                 scales: cute.Tensor, partial: cute.Tensor,
+                 rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        x = inputs[rotation_id]
+        while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // (32 * self.decode_cta_warps) * self.splits):
+            split = task % Int32(self.splits)
+            tile_n = (task // Int32(self.splits)) % Int32(self.n // (32 * self.decode_cta_warps))
+            nb = tile_n // Int32(4 // self.decode_cta_warps)
+            warp_n = warp + (tile_n % Int32(4 // self.decode_cta_warps)) * Int32(self.decode_cta_warps)
+            group = task // Int32(self.splits * (self.n // (32 * self.decode_cta_warps)))
+            # Each 16-row group re-reads the weights; the last one evicts them first.
+            policy = weight_stream_policy((group + Int32(1) == (rows + Int32(15)) // Int32(16)).to(Int32))
+            row0 = group * Int32(16) + lane // Int32(4)
+            row1 = row0 + Int32(8)
+            total = cute.make_rmem_tensor((4, 4), Float32)
+            total.fill(Float32(0.0))
+            for block in cutlass.range(8):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.k // 128):
+                    acc = cute.make_rmem_tensor((4, 4), Float32)
+                    acc.fill(Float32(0.0))
+                    for k16 in cutlass.range_constexpr(8):
+                        k = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
+                        a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        if row0 < rows:
+                            addr = x + (row0.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
+                            a0, a2 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
+                        if row1 < rows:
+                            addr = x + (row1.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
+                            a1, a3 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
+                        for n16 in cutlass.range_constexpr(2):
+                            tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp_n * Int32(2) + Int32(n16)
+                            if cutlass.const_expr(self.input_units):
+                                tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp_n * Int32(2) + Int32(n16)
+                            b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
+                            d0, d1, d2, d3 = self.mma(
+                                acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
+                                a0, a1, a2, a3, b0, b1)
+                            acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
+                            d0, d1, d2, d3 = self.mma(
+                                acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
+                                a0, a1, a2, a3, b2, b3)
+                            acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
+                    scale = _side_value(scales.iterator.toint(), kb)
+                    for n in cutlass.range_constexpr(4):
+                        for v in cutlass.range_constexpr(4):
+                            total[n, v] = total[n, v] + acc[n, v] * scale
+            for n in cutlass.range_constexpr(4):
+                col = nb * Int32(128) + warp_n * Int32(32) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
+                base = (row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)
+                if row0 < rows:
+                    partial[base], partial[base + Int64(1)] = total[n, 0], total[n, 1]
+                if row1 < rows:
+                    base += Int64(8 * self.splits * self.n)
+                    partial[base], partial[base + Int64(1)] = total[n, 2], total[n, 3]
+            task += step

@@ -312,6 +312,132 @@ def benchmark_prefill_route(args):
         torch.cuda.empty_cache()
 
 
+
+def benchmark_glmf_duel(args):
+    """Native baseline versus separately keyed CTA variants, through C exports."""
+    import hashlib
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+
+    def snapshot():
+        return subprocess.check_output([
+            "nvidia-smi", "--query-gpu=name,clocks.sm,clocks.mem,power.draw,power.limit,temperature.gpu",
+            "--format=csv,noheader"], text=True).strip()
+
+    def load(directory, stem):
+        lib = C.CDLL(str((directory / f"{stem}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        lib.run.argtypes = [C.c_void_p] * 5 + [C.c_int32] * 3 + [C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    # GLMF_SHAPES in engine d22459ffb's dense_trellis_k6 exporter, K:N:side.
+    default_shapes = "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,4096:154880:1"
+    shapes = [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
+    rows_list = list(map(int, args.rows.split(",")))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 129 or args.samples < 1:
+        raise ValueError("decode duel requires rows 1..129 and positive samples")
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+    if int(status):
+        raise RuntimeError(status)
+    flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
+    report = dict(metadata=dict(device=props.name, sms=props.multi_processor_count,
+        l2_bytes=l2, argv=sys.argv, snapshot_before=snapshot(), bits=6,
+        input_dtype=args.input_dtype, codebook=args.codebook, exact_row_cap=129,
+        ratio="baseline/candidate", cache="2x runtime L2 eviction, outside timing"), records=[])
+    torch.manual_seed(273)
+    for k, n, side in shapes:
+        directory = args.output_dir / f"k{k}_n{n}_s{side}_{args.codebook}_{args.input_dtype}"
+        directory.mkdir(parents=True, exist_ok=True)
+        libs = {}
+        for warps in (4, 2, 1):
+            stem = f"cta{warps}"
+            if args.compile_only:
+                print(f"compile {k}:{n}:{side} {stem}", flush=True)
+                with exportable_compilation():
+                    program = compile_trellis_linear_aot(input_features=k, output_features=n,
+                        bits=6, codebook=args.codebook, sharded_side=side, rotation_count=1,
+                        max_rows=129, input_dtype=args.input_dtype, decode_cta_warps=warps)
+                exported(program, directory, stem)
+                (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
+            else:
+                libs[stem] = load(directory, stem)
+        if args.compile_only:
+            continue
+        capacity = max(rows_list)
+        splits = (k + 1023) // 1024
+        x = torch.randn(capacity, k, device="cuda", dtype=getattr(torch, {"bf16":"bfloat16", "f16":"float16"}[args.input_dtype]))
+        inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
+        payload = torch.randint(256, (k*n*6//8,), device="cuda", dtype=torch.uint8)
+        scales = torch.rand(k//128, device="cuda", dtype=torch.float16) + .125
+        partials = {name: torch.empty(capacity*splits*n, device="cuda") for name in libs}
+        outputs = {name: torch.empty(capacity*n, device="cuda") for name in libs}
+        for rows in rows_list:
+            graphs = {}
+            hashes = {}
+            def call(name, count=rows):
+                result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
+                    partials[name].data_ptr(), outputs[name].data_ptr(), count, 0,
+                    props.multi_processor_count*4, torch.cuda.current_stream().cuda_stream)
+                if result:
+                    raise RuntimeError(f"{name} returned {result}")
+            for name in libs:
+                call(name)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    call(name)
+                outputs[name].fill_(float("nan"))
+                partials[name].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                if not torch.isfinite(outputs[name][:rows*n]).all().item():
+                    raise RuntimeError(f"{name}: poisoned output not overwritten")
+                if not torch.isfinite(partials[name][:rows*splits*n]).all().item():
+                    raise RuntimeError(f"{name}: poisoned partial not overwritten")
+                graphs[name] = graph
+                hashes[name] = hashlib.sha256(outputs[name][:rows*n].cpu().numpy().tobytes()).hexdigest()
+            exact = {}
+            for name in libs:
+                exact[name] = (torch.equal(outputs[name][:rows*n].view(torch.int32), outputs["cta4"][:rows*n].view(torch.int32))
+                    and torch.equal(partials[name][:rows*splits*n].view(torch.int32), partials["cta4"][:rows*splits*n].view(torch.int32)))
+                if not exact[name]:
+                    raise RuntimeError(f"non-bit-exact {k}:{n}:{side} rows={rows} {name}")
+                saved = outputs[name][:n].clone()
+                call(name, 1)
+                if not torch.equal(saved.view(torch.int32), outputs[name][:n].view(torch.int32)):
+                    raise RuntimeError(f"row invariance failure: {name} rows={rows}")
+                graphs[name].replay()
+            samples = {name: [] for name in libs}
+            for repeat in range(args.samples):
+                order = list(libs) if repeat % 2 == 0 else list(reversed(libs))
+                for name in order:
+                    flush.zero_()
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graphs[name].replay()
+                    end.record()
+                    end.synchronize()
+                    samples[name].append(start.elapsed_time(end)*1000)
+            times = {name: statistics.median(v) for name, v in samples.items()}
+            for name in libs:
+                record = dict(k=k, n=n, side=side, splits=splits, rows=rows, variant=name,
+                    baseline_us=times["cta4"], candidate_us=times[name], ratio=times["cta4"]/times[name],
+                    exact=exact[name], sha256=hashes[name], partials_exact=True,
+                    weight_gbs=(k*n*6/8)/(times[name]*1000), samples_us=samples[name], snapshot=snapshot())
+                report["records"].append(record)
+                print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
+            (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
+        del graphs, partials, outputs, x, inputs, payload, scales
+        torch.cuda.empty_cache()
+    report["metadata"]["snapshot_after"] = snapshot()
+    if not args.compile_only:
+        (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -320,8 +446,15 @@ def main():
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
+    parser.add_argument("--glmf-duel", action="store_true", help="bit-exact native CTA partition screen")
+    parser.add_argument("--compile-only", action="store_true", help="export duel arms without timing")
+    parser.add_argument("--input-dtype", choices=("f16", "bf16"), default="bf16")
+    parser.add_argument("--codebook", choices=("mcg", "mul1"), default="mcg")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.glmf_duel:
+        benchmark_glmf_duel(args)
+        return
     if args.prefill_route:
         benchmark_prefill_route(args)
         return
