@@ -1374,7 +1374,7 @@ def compile_glmf_head_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
         operands=(Operand("streams", torch.bfloat16, f"[rows,{g.hc_mult},{h}]"),
                   Operand("weight", torch.bfloat16, f"[{h}]"),
                   Operand("out", torch.bfloat16, f"[rows,{h}]", "out")),
-        scalars=(Scalar("rows"),), key=(h, g.norm_eps, g.hc_mult), geometry={"hidden": h, "eps": g.norm_eps},
+        scalars=(Scalar("rows"),), key=(h, g.norm_eps, g.hc_mult), geometry={"hidden": h, "eps": g.norm_eps, "exact_row_cap": 2**31 - 1},
         doc=__doc__,
     )
 
