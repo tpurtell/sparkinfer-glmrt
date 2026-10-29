@@ -22,7 +22,7 @@ moe_inter, 2048 Flash / 3072 Pro)::
     scratch    u8   shared_ffn_scratch_bytes(geometry, rows, max_rows)
     rows       int32 (1 <= rows <= max_rows)
 
-``compile_dsv4_router_scores_aot(geometry)``: FP32-accumulated BF16 scores.
+``compile_dsv4_router_scores_aot(geometry)``: FP32-accumulated FP32 scores.
 Live rows <= 64 (every decode and verify width) run a bandwidth-bound skinny
 GEMV (FP32 output) whose per-logit K order does not depend on the row count, so
 each verify row is bitwise its M=1 decode logit; prefill-width launches run the
@@ -68,6 +68,7 @@ from ._linear import Fp8LinearStage, block_fp8_lowering, stage_scratch_bytes
 __all__ = [
     "compile_dsv4_expert_input_quant_aot",
     "compile_dsv4_router_scores_aot",
+    "compile_dsv4_prefill_router_scores_aot",
     "compile_dsv4_shared_ffn_aot",
     "expert_input_quant_grid",
     "shared_ffn_scratch_bytes",
@@ -219,6 +220,28 @@ def compile_dsv4_router_scores_aot(geometry: DSV4Geometry = FLASH, experts: int 
         scalars=(Scalar("live_rows"),),
         key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.tiles_by_rows),
         geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS, "exact_row_cap": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
+    )
+
+
+def compile_dsv4_prefill_router_scores_aot(geometry: DSV4Geometry = FLASH) -> AotProgram:
+    """One BF16-input, FP32-accumulated/output MMA route at every prefill width.
+
+    Decode/verify retains its separate skinny route. Keeping the prefill K
+    reduction fixed prevents a packed partner from changing near-tie expert picks.
+    """
+    from b12x.moe._shared.v41_router import _V41RouterScores
+
+    e, h = geometry.routed_experts, geometry.hidden
+    if e not in (256, 384) or h not in (4096, 7168):
+        raise ValueError("DSV4 router scores support 256/384 experts over hidden 4096/7168")
+    return compile_program(
+        _V41RouterScores(e, hidden=h), name="dsv4_prefill_router_scores",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w", torch.bfloat16, f"[{e},{h}]", note="ffn.gate.weight"),
+                  Operand("logits", torch.float32, f"[rows,{e}]", "out")),
+        scalars=(Scalar("live_rows"),), key=(e, h, "mma_prefill"),
+        geometry={"hidden": h, "experts": e, "route": "mma_prefill",
+                  "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
 
 
