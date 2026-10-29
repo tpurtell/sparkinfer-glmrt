@@ -332,8 +332,22 @@ def benchmark_native_comparison(args):
     if args.compile_only:
         import multiprocessing
         from b12x._lib.compile_pool import _initialize_worker
-        _initialize_worker(0, (12, 0), "native-byte-comparison", "native-byte-comparison",
-                           188, 101376, 102400, multiprocessing.Array("i", [0, 0]))
+        # Driver attributes do not create a CUDA context in this compiler process.
+        status, = cuda.cuInit(0)
+        if int(status):
+            raise RuntimeError(status)
+        def attribute(name):
+            status, value = cuda.cuDeviceGetAttribute(getattr(cuda.CUdevice_attribute, name), 0)
+            if int(status):
+                raise RuntimeError(status)
+            return value
+        capability = tuple(attribute("CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_" + part)
+                           for part in ("MAJOR", "MINOR"))
+        _initialize_worker(0, capability, "native-byte-comparison", "native-byte-comparison",
+                           attribute("CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT"),
+                           attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN"),
+                           attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR"),
+                           multiprocessing.Array("i", [0, 0]))
 
     def snapshot():
         if args.compile_only:
@@ -412,6 +426,10 @@ def benchmark_native_comparison(args):
         core = baseline(dict(input_features=k, output_features=n, bits=args.bits,
             codebook=args.codebook, sharded_side=side, rotation_count=1,
             max_rows=max_rows, splits=splits, input_dtype=args.input_dtype))
+        candidate_core = candidate(dict(input_features=k, output_features=n, bits=args.bits,
+            codebook=args.codebook, sharded_side=side, rotation_count=1,
+            max_rows=max_rows, splits=splits, input_dtype=args.input_dtype))
+        assert candidate_core.exact_row_cap == core.exact_row_cap
         def publishes_partials(rows):
             if rows > (64 if args.codebook == "e4m3" else 129):
                 return False
@@ -461,12 +479,15 @@ def benchmark_native_comparison(args):
             partials_exact = {}
             for name in libs:
                 out_eq = torch.equal(outputs[name][:rows*n].view(torch.int32), outputs["baseline"][:rows*n].view(torch.int32))
-                part_eq = not publishes_partials(rows) or torch.equal(partials[name][:rows*splits*n].view(torch.int32), partials["baseline"][:rows*splits*n].view(torch.int32))
-                exact[name] = out_eq and part_eq
+                part_eq = (torch.equal(partials[name][:rows*splits*n].view(torch.int32),
+                                       partials["baseline"][:rows*splits*n].view(torch.int32))
+                           if publishes_partials(rows) else None)
+                exact[name] = out_eq and part_eq is not False
                 partials_exact[name] = part_eq
                 if not exact[name]:
                     raise RuntimeError(f"non-bit-exact {k}:{n}:{side} rows={rows} {name} (out_eq={out_eq}, part_eq={part_eq})")
                 saved = outputs[name][:n].clone()
+                outputs[name][:n].fill_(float("nan"))
                 call(name, 1)
                 if not torch.equal(saved.view(torch.int32), outputs[name][:n].view(torch.int32)):
                     raise RuntimeError(f"row invariance failure: {name} rows={rows}")
@@ -507,6 +528,7 @@ def benchmark_native_comparison(args):
             record = dict(k=k, n=n, side=side, splits=splits, rows=rows, arm=name,
                 baseline_us=times["baseline"], candidate_us=times[name], ratio=times["baseline"]/times[name],
                 exact=exact[name], sha256=hashes[name], partials_exact=partials_exact[name],
+                partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
                 weight_gbs=(k*n*args.bits/8)/(times[name]*1000),
                 baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot())
             report["records"].append(record)

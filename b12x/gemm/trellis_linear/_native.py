@@ -3050,21 +3050,21 @@ class NativeTrellisLinear:
                     t0, t1, t2, t3 = total[mb, n, 0], total[mb, n, 1], total[mb, n, 2], total[mb, n, 3]
                     if cutlass.const_expr(active < 4 and mb < active - 1):
                         partial[base], partial[base + Int64(1)] = t0, t1
-                        if cutlass.const_expr(self.splits == 1):
+                        if cutlass.const_expr(self.splits == 1 and active != 2):
                             output[base], output[base + Int64(1)] = Float32(0.0) + t0, Float32(0.0) + t1
                         base += Int64(8 * self.splits * self.n)
                         partial[base], partial[base + Int64(1)] = t2, t3
-                        if cutlass.const_expr(self.splits == 1):
+                        if cutlass.const_expr(self.splits == 1 and active != 2):
                             output[base], output[base + Int64(1)] = Float32(0.0) + t2, Float32(0.0) + t3
                     else:
                         if row0 < rows:
                             partial[base], partial[base + Int64(1)] = t0, t1
-                            if cutlass.const_expr(self.splits == 1):
+                            if cutlass.const_expr(self.splits == 1 and active != 2):
                                 output[base], output[base + Int64(1)] = Float32(0.0) + t0, Float32(0.0) + t1
                         if row1 < rows:
                             base += Int64(8 * self.splits * self.n)
                             partial[base], partial[base + Int64(1)] = t2, t3
-                            if cutlass.const_expr(self.splits == 1):
+                            if cutlass.const_expr(self.splits == 1 and active != 2):
                                 output[base], output[base + Int64(1)] = Float32(0.0) + t2, Float32(0.0) + t3
             task += step
 
@@ -3098,10 +3098,10 @@ class NativeTrellisLinear:
         for k16_in_64 in cutlass.range_constexpr(4):
             off0 = k16_in_64 * 1536
             off1 = (4 + k16_in_64) * 1536
-            w_s0[k16_in_64, 0] = _ld_u32_off_pure(p0_cur, off0)
-            w_s0[k16_in_64, 1] = _ld_u32_off_pure(p0_cur, off0 + 4)
-            w_s1[k16_in_64, 0] = _ld_u32_off_pure(p0_cur, off1)
-            w_s1[k16_in_64, 1] = _ld_u32_off_pure(p0_cur, off1 + 4)
+            w_s0[k16_in_64, 0] = _ld_global_nc_u32_offset(p0_cur, off0)
+            w_s0[k16_in_64, 1] = _ld_global_nc_u32_offset(p0_cur, off0 + 4)
+            w_s1[k16_in_64, 0] = _ld_global_nc_u32_offset(p0_cur, off1)
+            w_s1[k16_in_64, 1] = _ld_global_nc_u32_offset(p0_cur, off1 + 4)
         sa_base0 = base + sa_lane_off
         sw_base0 = base + sw_pw_off
         num_kb = Int32(self.k // 128)
@@ -3133,8 +3133,8 @@ class NativeTrellisLinear:
                 p0_cur = p0_cur + kb_w_stride
             for k16_in_64 in cutlass.range_constexpr(4):
                 off0 = k16_in_64 * 1536
-                w_s0[k16_in_64, 0] = _ld_u32_off_pure(p0_cur, off0)
-                w_s0[k16_in_64, 1] = _ld_u32_off_pure(p0_cur, off0 + 4)
+                w_s0[k16_in_64, 0] = _ld_global_nc_u32_offset(p0_cur, off0)
+                w_s0[k16_in_64, 1] = _ld_global_nc_u32_offset(p0_cur, off0 + 4)
 
             _mbar_wait(bar_empty + Int32(8), phase)
             for i in cutlass.range_constexpr(8):
@@ -3161,8 +3161,8 @@ class NativeTrellisLinear:
             _mbar_arrive(bar_full + Int32(8))
             for k16_in_64 in cutlass.range_constexpr(4):
                 off1 = (4 + k16_in_64) * 1536
-                w_s1[k16_in_64, 0] = _ld_u32_off_pure(p0_cur, off1)
-                w_s1[k16_in_64, 1] = _ld_u32_off_pure(p0_cur, off1 + 4)
+                w_s1[k16_in_64, 0] = _ld_global_nc_u32_offset(p0_cur, off1)
+                w_s1[k16_in_64, 1] = _ld_global_nc_u32_offset(p0_cur, off1 + 4)
             stage_cnt = stage_cnt + Int32(1)
         return stage_cnt
 
@@ -3282,10 +3282,9 @@ class NativeTrellisLinear:
                 self.multiply_k6_wide(inputs, payload, scales, partial, output, rows, rotation_id, 2, 8).launch(
                     grid=(min(tiles, cta_limit), 1, 1),
                     block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                if cutlass.const_expr(self.splits > 1):
-                    self.reduce(partial, output, rows).launch(
-                        grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
-                        block=(128, 1, 1), stream=stream)
+                self.reduce(partial, output, rows).launch(
+                    grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
         elif rows <= Int32(48):
             tiles = Int32(self.n // 128 * self.splits)
             self.multiply_k6_wide(inputs, payload, scales, partial, output, rows, rotation_id, 3, 8).launch(
@@ -3324,15 +3323,6 @@ def _ld_l2_off_pure(base_ptr: Int64, offset: int, policy: Int64, *, loc=None, ip
         T.i32(), [Int64(base_ptr).ir_value(loc=loc, ip=ip), Int64(policy).ir_value(loc=loc, ip=ip)],
         f"ld.global.nc.L2::cache_hint.u32 $0, [$1 + {int(offset)}], $2;",
         "=r,l,l", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
-
-
-@dsl_user_op
-def _ld_u32_off_pure(base_ptr: Int64, offset: int, *, loc=None, ip=None) -> Uint32:
-    return Uint32(llvm.inline_asm(
-        T.i32(), [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
-        f"ld.global.nc.u32 $0, [$1 + {int(offset)}];",
-        "=r,l", has_side_effects=False, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 

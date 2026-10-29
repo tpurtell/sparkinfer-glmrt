@@ -340,10 +340,7 @@ def test_high_rate_graph_replay_and_frozen_resolution(bits, codebook):
             assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
 
 
-@pytest.mark.parametrize("side", [1, 2])
-@pytest.mark.parametrize("bits", [5, 6])
-@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
-def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
+def baseline_native_type():
     import cutlass
     import cutlass.cute as cute
     from cutlass import Int32
@@ -366,6 +363,18 @@ def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
                 grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
                 block=(128, 1, 1), stream=stream)
 
+    return Base
+
+
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("codebook", ["mcg", "mul1"])
+def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
+    Base = baseline_native_type()
+    from b12x.gemm.trellis_linear import _native
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
     # Compile the shipping base schedule only as a test oracle, not a runtime toggle.
     with exportable_compilation(), monkeypatch.context() as patch:
         patch.setattr(_native, "NativeTrellisLinear", Base)
@@ -383,6 +392,52 @@ def test_wide_vs_base_bitwise_equality(side, bits, codebook, monkeypatch):
         assert torch.equal(wide.partial[:rows].view(torch.int32), base.partial[:rows].view(torch.int32))
         assert torch.isnan(wide.output[rows:]).all()
         assert torch.isnan(wide.partial[rows:]).all()
+
+
+@pytest.mark.parametrize("k", [1024, 4096])
+@pytest.mark.parametrize("side", [1, 2])
+@pytest.mark.parametrize("input_dtype", ["f16", "bf16"])
+@pytest.mark.parametrize("codebook", ["mcg", "e4m3"])
+def test_k6_pair_vs_base_bitwise_equality(k, side, input_dtype, codebook, monkeypatch):
+    from b12x.gemm.trellis_linear import _native
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    with exportable_compilation(), monkeypatch.context() as patch:
+        patch.setattr(_native, "NativeTrellisLinear", baseline_native_type())
+        base = Case(k=k, side=side, bits=6, rows=16,
+                    codebook=codebook, input_dtype=input_dtype)
+    pair = Case(k=k, side=side, bits=6, rows=16,
+                codebook=codebook, input_dtype=input_dtype)
+    for rows in (1, 8, 16):
+        base.partial.fill_(float("nan"))
+        base.output.fill_(float("nan"))
+        pair.partial.fill_(float("nan"))
+        pair.output.fill_(float("nan"))
+        with kernel_resolution_guard("pair oracle uses precompiled kernels"):
+            base.launch(rows)
+            pair.launch(rows)
+        assert torch.equal(pair.output[:rows].view(torch.int32), base.output[:rows].view(torch.int32))
+        assert torch.equal(pair.partial[:rows].view(torch.int32), base.partial[:rows].view(torch.int32))
+        assert torch.isnan(pair.output[rows:]).all()
+        assert torch.isnan(pair.partial[rows:]).all()
+
+
+def test_k6_non_power_of_two_uses_baseline(monkeypatch):
+    from b12x.gemm.trellis_linear import _native
+    from b12x.integration.cuteafd import exportable_compilation
+
+    def forbidden_pair(*args, **kwargs):
+        raise AssertionError("non-power-of-two K must not compile the pair route")
+
+    with exportable_compilation(), monkeypatch.context() as patch:
+        patch.setattr(_native.NativeTrellisLinear, "multiply_k6_pair", forbidden_pair)
+        c = Case(k=1152, bits=6, rows=16, codebook="mcg", input_dtype="bf16")
+    for rows in (1, 8, 16):
+        c.output.fill_(float("nan"))
+        c.launch(rows)
+        assert torch.isfinite(c.output[:rows]).all()
+        assert torch.isnan(c.output[rows:]).all()
 
 
 @pytest.mark.parametrize("groups,rotation_count", [(0, 4), (2, 4), (3, 4), (True, 4), (4, 1), (4, 3)])
