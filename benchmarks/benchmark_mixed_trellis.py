@@ -981,8 +981,9 @@ def _run_prefill_benchmark(args, device, props):
             _run_prefill_benchmark(child, device, props)
         return
     capacity = capacities[0]
-    if not 1 <= capacity <= 4096:
-        raise ValueError("prefill capacity must be 1..4096")
+    capacity_limit = KIMIK3_CAPACITIES[-1] if args.prefill_family == "kimik3" else 4096
+    if not 1 <= capacity <= capacity_limit:
+        raise ValueError(f"prefill capacity must be 1..{capacity_limit}")
     if (props.major, props.minor) != (12, 1):
         raise ValueError("prefill policy gate requires SM121")
     if args.rounds < 3 or args.layers < 2 or args.replays < 1:
@@ -996,7 +997,7 @@ def _run_prefill_benchmark(args, device, props):
     rows_spec = args.rows or (args.capacities if args.compact_fixture else str(capacity))
     rows_list = list(map(int, rows_spec.split(",")))
     if not rows_list or any(not 1 <= rows <= capacity for rows in rows_list):
-        raise ValueError("prefill rows must be 1..4096")
+        raise ValueError(f"prefill rows must be 1..{capacity}")
     family = args.prefill_family
     hidden, experts, topk, bits, activation = PREFILL_FAMILIES[family]
     width = args.intermediate or (256 if family == "qwen4" else 384 if family in ("glm", "glmf", "dsv4f") else 640 if family == "v41" else 512)
@@ -1153,6 +1154,9 @@ def _run_prefill_benchmark(args, device, props):
 
 
 GLM_CAPACITIES = (256, 1024, 2048, 2752, 4096)
+# Kimi K3 merges up to three 2752-row wave units into one expert unit, so its
+# packed prefill extents reach 2x2752 = 5504 and 3x2752 = 8256 rows.
+KIMIK3_CAPACITIES = GLM_CAPACITIES + (5504, 8256)
 GLM_PROFILES = {"rtx-tp1": 2048, "rtx-tp2": 1024,
                 "spark-tp6-width384": 384, "spark-tp6-width256": 256, "spark-tp4-width512": 512,
                 "spark-tp2-width1024": 1024, "spark-tp3-width768": 768, "spark-tp3-width640": 640,
@@ -1195,12 +1199,13 @@ COORDINATOR_FAMILIES = {
                             "spark-tp4-width768": 768, "spark-tp6-width512": 512,
                             "spark-tp2-width1536": 1536, "spark-tp3-width1024": 1024},
                   capacities=GLM_CAPACITIES, routes=None),
-    # Adaptive prefill adds m2048 and m2752 to Kimi's K64 capacity ladder.
+    # Adaptive prefill adds m2048 and m2752 to Kimi's K64 capacity ladder; wave
+    # merging adds the 2x and 3x merged extents.
     "kimik3": dict(hidden=3584, experts=896, top_k=16, bits=(2, 3), activation="situ",
                    swiglu_limit=None, model="moonshotai/Kimi-K3",
                    profiles={"rtx-tp1": 3072, "rtx-tp2": 1536,
                             "spark-tp4-width768": 768, "spark-tp6-width512": 512},
-                   capacities=GLM_CAPACITIES, routes=None),
+                   capacities=KIMIK3_CAPACITIES, routes=None),
 }
 # Shipped cooperative coordinator policy (`package_exl3_aot.py`): the route
 # block and rotation a family's exports actually use, so `served` arms and the

@@ -8458,11 +8458,11 @@ class W4A16FusedMoeKernel:
                 blk = rem - chunk * nblk
                 base_pos = rb * Int32(self.moe_block_size) + chunk * Int32(rows_per_unit)
                 row0 = packed_route_indices[base_pos].to(Int32)
-                expert = block_expert_ids[rb].to(Int32)
+                expert = Int32(-1)
+                if row0 >= Int32(0) and row0 < live_routes:
+                    expert = block_expert_ids[rb].to(Int32)
                 if (
-                    row0 >= Int32(0)
-                    and row0 < live_routes
-                    and expert >= Int32(0)
+                    expert >= Int32(0)
                     and expert < weight_num_experts
                 ):
                     col0 = blk * Int32(128) + elem
@@ -9500,21 +9500,21 @@ class W4A16TopKSumKernel:
                     hs3 = cutlass.Float32(0.0)
                     if valid_route != Int32(0):
                         base = row * Int32(self.hidden_size) + col0
+                        if cutlass.const_expr(self.broadcast_svh):
+                            sbase = col0
+                        else:
+                            sbase = expert * Int32(self.hidden_size) + col0
                         # One 8-byte load of the lane's four FP16 route values
                         # (exact widening, as the element loads it replaces).
                         p01, p23 = ld_global_nc_v2_u32(
                             get_ptr_as_int64(fc2_flat, Int64(base))
                         )
-                        v0, v1 = f16x2_to_f32x2(p01)
-                        v2, v3 = f16x2_to_f32x2(p23)
-                        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
-                        if cutlass.const_expr(self.broadcast_svh):
-                            sbase = col0
-                        else:
-                            sbase = expert * Int32(self.hidden_size) + col0
                         sp01, sp23 = ld_global_nc_v2_u32(
                             get_ptr_as_int64(svh_flat, Int64(sbase))
                         )
+                        v0, v1 = f16x2_to_f32x2(p01)
+                        v2, v3 = f16x2_to_f32x2(p23)
+                        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
                         s0, s1 = f16x2_to_f32x2(sp01)
                         s2, s3 = f16x2_to_f32x2(sp23)
                         hs0 = h0 * s0
