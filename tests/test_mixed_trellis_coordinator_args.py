@@ -53,7 +53,7 @@ def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
 def benchmark():
     names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
              "coordinator_preflight", "benchmark_parser", "parse_prefill_arm", "compact_prefill_fixture"}
-    tables = {"GLM_CAPACITIES", "GLM_PROFILES", "GLM_ROUTES", "COORDINATOR_FAMILIES",
+    tables = {"GLM_CAPACITIES", "KIMIK3_CAPACITIES", "GLM_PROFILES", "GLM_ROUTES", "COORDINATOR_FAMILIES",
               "COORDINATOR_PROFILES", "SERVED_ROUTE_BLOCKS", "SERVED_TOKEN_ROTATION",
               "PREFILL_FAMILIES"}
     glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
@@ -280,7 +280,8 @@ def test_family_compact_ws_arm_plumbing(family, profile, capacity, width):
 
 
 FAMILY_CAPACITIES = {"qwen4": [256, 1024, 2048, 2752, 4096], "v41": [256, 1024, 2048, 2752, 4096],
-                     "dsv4p": [256, 1024, 2048, 2752, 4096], "kimik3": [256, 1024, 2048, 2752, 4096]}
+                     "dsv4p": [256, 1024, 2048, 2752, 4096],
+                     "kimik3": [256, 1024, 2048, 2752, 4096, 5504, 8256]}
 
 
 @pytest.mark.parametrize("family", sorted(FAMILY_CAPACITIES))

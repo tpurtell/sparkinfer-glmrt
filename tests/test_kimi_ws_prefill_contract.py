@@ -25,21 +25,41 @@ def test_geometry(profile, width):
 
 
 def manifest():
+    # The pinned package exports up to its widest shipped cell; merged wave
+    # extents reuse that cell instead of a new export.
     return dict(sparkinfer_revision=D.PIN, compute=[12, 0], variants=[
         dict(directory=f"{profile}/m{capacity}", capacity=capacity, intermediate=width,
              experts=896, top_k=16, bits=[2, 3], blocks_per_sm=1,
              tile=[64, 128 if capacity == 4096 else 256, 64, 256], route_block=64,
              token_major_rotation=capacity != 4096, warp_specialized=capacity == 4096,
              ws_dynamic_tiles=capacity == 4096)
-        for profile, width in D.PROFILES.items() for capacity in D.CAPACITIES])
+        for profile, width in D.PROFILES.items()
+        for capacity in D.CAPACITIES if capacity <= D.SHIPPED_CAPACITY])
 
 
 def test_manifest_preserves_shipped_recipe():
     cells = D.validate_manifest(manifest())
-    assert len(cells) == 8
+    assert len(cells) == 12
     for name, options in cells.items():
-        assert options["mode"] == ("ws" if name.endswith("m4096") else "cooperative")
-        assert options["rotation"] == ("route" if name.endswith("m4096") else "token")
+        ws = int(name.rsplit("m", 1)[1]) > 2752
+        assert options["mode"] == ("ws" if ws else "cooperative")
+        assert options["rotation"] == ("route" if ws else "token")
+
+
+def test_merged_extents_reuse_the_shipped_ws_cell():
+    cells = D.validate_manifest(manifest())
+    for profile in D.PROFILES:
+        assert cells[f"{profile}/m5504"] == cells[f"{profile}/m4096"]
+        assert cells[f"{profile}/m8256"] == cells[f"{profile}/m4096"]
+
+
+def test_merged_extents_need_the_shipped_ws_cell():
+    data = manifest()
+    for variant in data["variants"]:
+        if variant["capacity"] == 4096:
+            variant["warp_specialized"] = False
+    with pytest.raises(ValueError):
+        D.validate_manifest(data)
 
 
 @pytest.mark.parametrize("field,value", [("sparkinfer_revision", "bad"), ("compute", [12, 1])])
@@ -89,7 +109,7 @@ def test_baseline_cannot_replace_seal_or_use_config(sealed, config):
 def test_cell_keys_are_unique():
     keys = [D.cell_key(p, c, l, d) for p in D.PROFILES for c in D.CAPACITIES
             for l in D.LAYERS for d in ("random", "realistic")]
-    assert len(keys) == len(set(keys)) == 32
+    assert len(keys) == len(set(keys)) == 48
 
 
 @pytest.mark.parametrize("arm", [

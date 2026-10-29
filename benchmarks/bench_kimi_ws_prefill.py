@@ -12,7 +12,10 @@ import subprocess
 import sys
 
 PIN = "26a1e5072fb707864845b88db65ddf1e80c5c872"
-CAPACITIES = (1024, 2048, 2752, 4096)
+# Wave merging hands the RTX expert kernel either one prefill unit (<=2752 rows)
+# or merged waves of 2x2752 = 5504 and 3x2752 = 8256 rows.
+CAPACITIES = (1024, 2048, 2752, 4096, 5504, 8256)
+SHIPPED_CAPACITY = 4096  # frozen pin's widest exportable prefill cell
 PROFILES = {"rtx-tp2": 1536, "rtx-tp1": 3072}
 LAYERS = (13, 92)
 FROZEN_FILES = ("benchmarks/bench_kimi_ws_prefill.py",
@@ -63,9 +66,15 @@ def validate_manifest(manifest):
     for profile, width in PROFILES.items():
         for capacity in CAPACITIES:
             name = f"{profile}/m{capacity}"
-            variant, = [v for v in manifest["variants"] if v["directory"] == name]
+            # The frozen pin's packager stops at its widest shipped export; a
+            # merged wave above it reuses that same cell unchanged, so the
+            # oracle arm for 5504/8256 rows is the m4096 export.
+            exported = f"{profile}/m{min(capacity, SHIPPED_CAPACITY)}"
+            variant, = [v for v in manifest["variants"] if v["directory"] == exported]
             if (variant["intermediate"], variant["experts"], variant["top_k"], variant["bits"]) != (width, 896, 16, [2, 3]):
                 raise ValueError("wrong Kimi geometry")
+            if capacity > SHIPPED_CAPACITY and not variant["warp_specialized"]:
+                raise ValueError("merged wave extents need the shipped warp-specialized cell")
             cells[name] = oracle_arm(variant)
     return cells
 
