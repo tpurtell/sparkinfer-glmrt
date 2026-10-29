@@ -65,6 +65,7 @@ __all__ = [
     "compile_mimo_ffn_aot",
     "compile_mimo_norm_aot",
     "compile_mimo_router_scores_aot",
+    "compile_mimo_prefill_router_scores_aot",
     "ffn_scratch_bytes",
     "router_scratch_bytes",
     "split_router_weight",
@@ -243,6 +244,55 @@ class _RouterBf16:
     def __call__(self, x: cute.Pointer, w_router: cute.Pointer, logits: cute.Pointer, scratch: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
         self.proj(x, w_router, logits, rows, stream)
+
+
+class _PrefillRouterHiLo:
+    def __init__(self, g: MiMoGeometry):
+        from b12x.moe._shared.v41_router import _V41RouterScores
+
+        self.e = g.routed_experts
+        self.proj = _V41RouterScores(2 * self.e, hidden=g.hidden)
+        self.add = RouterHiLoAdd(self.e)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_hilo: cute.Pointer, logits: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        hilo = cute.make_ptr(cutlass.Float32, Int64(scratch.toint()), cute.AddressSpace.gmem, assumed_align=16)
+        self.proj(x, w_hilo, hilo, rows, stream)
+        self.add(hilo, logits, rows, stream)
+
+
+class _PrefillRouterBf16:
+    def __init__(self, g: MiMoGeometry):
+        from b12x.moe._shared.v41_router import _V41RouterScores
+
+        self.proj = _V41RouterScores(g.routed_experts, hidden=g.hidden)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_router: cute.Pointer, logits: cute.Pointer, scratch: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        self.proj(x, w_router, logits, rows, stream)
+
+
+def compile_mimo_prefill_router_scores_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotProgram:
+    """Fixed MMA prefill route, preserving the checkpoint's BF16 hi/lo split."""
+    e, h = g.routed_experts, g.hidden
+    if g.router_fp32:
+        launch = _PrefillRouterHiLo(g)
+        weight = Operand("w_hilo", torch.bfloat16, f"[{2 * e},{h}]", note="split mlp.gate.weight (FP32)")
+    else:
+        launch = _PrefillRouterBf16(g)
+        weight = Operand("w_router", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight (BF16)")
+    return compile_program(
+        launch, name="mimo_prefill_router_scores",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"), weight,
+                  Operand("logits", torch.float32, f"[rows,{e}]", "out"),
+                  Operand("scratch", torch.uint8, "[router_scratch_bytes]", "scratch")),
+        scalars=(Scalar("rows"),), key=(e, h, g.router_fp32, "mma_prefill"),
+        geometry={"hidden": h, "experts": e, "top_k": g.top_k, "router_fp32": g.router_fp32,
+                  "route": "mma_prefill", "exact_row_cap": 2**31 - 1},
+        scratch={"scratch": lambda rows: router_scratch_bytes(g, rows)}, doc=__doc__,
+    )
 
 
 def compile_mimo_router_scores_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotProgram:

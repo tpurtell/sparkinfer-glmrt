@@ -77,6 +77,7 @@ __all__ = [
     "compile_glm_ffn_aot",
     "compile_glm_norm_aot",
     "compile_glm_router_scores_aot",
+    "compile_glm_prefill_router_scores_aot",
     "ffn_scratch_bytes",
 ]
 
@@ -325,6 +326,22 @@ def compile_glm_ffn_aot(g: GLMGeometry = GLM53, *, inter: int, max_rows: int, fp
                   "exact_row_cap": min(launch.gate_up.exact_row_cap, launch.down.exact_row_cap)},
         scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)},
         doc=__doc__,
+    )
+
+
+def compile_glm_prefill_router_scores_aot(g: GLMGeometry = GLM53) -> AotProgram:
+    """One BF16-input/F32-output MMA reduction at every prefill row count."""
+    from b12x.moe._shared.v41_router import _V41RouterScores
+
+    e, h = g.routed_experts, g.hidden
+    return compile_program(
+        _V41RouterScores(e, hidden=h), name="glm_prefill_router_scores",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight"),
+                  Operand("logits", torch.float32, f"[rows,{e}]", "out")),
+        scalars=(Scalar("live_rows"),), key=(e, h, "mma_prefill"),
+        geometry={"hidden": h, "experts": e,
+                  "route": "mma_prefill", "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
 
 

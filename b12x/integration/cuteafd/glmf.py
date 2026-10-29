@@ -122,6 +122,7 @@ __all__ = [
     "compile_glmf_join_mla_heads_aot",
     "compile_glmf_o_aot",
     "compile_glmf_router_scores_aot",
+    "compile_glmf_prefill_router_scores_aot",
     "kda_scratch_bytes",
     "mhc_geometry",
     "mla_producer_scratch_bytes",
@@ -1308,6 +1309,22 @@ class _RouterScores:
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, logits: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         self.proj(x, w, logits, rows, stream)
+
+
+def compile_glmf_prefill_router_scores_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
+    """One BF16-input/F32-output MMA reduction at every prefill row count."""
+    from b12x.moe._shared.v41_router import _V41RouterScores
+
+    e, h = g.routed_experts, g.hidden
+    return compile_program(
+        _V41RouterScores(e, hidden=h), name="glmf_prefill_router_scores",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight"),
+                  Operand("logits", torch.float32, f"[rows,{e}]", "out")),
+        scalars=(Scalar("live_rows"),), key=(e, h, "mma_prefill"),
+        geometry={"hidden": h, "experts": e, "top_k": g.top_k,
+                  "route": "mma_prefill", "exact_row_cap": 2**31 - 1}, doc=__doc__,
+    )
 
 
 def compile_glmf_router_scores_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
