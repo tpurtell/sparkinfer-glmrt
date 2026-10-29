@@ -3260,7 +3260,8 @@ class NativeTrellisLinear:
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows <= Int32(16):
-            if cutlass.const_expr(self.n > 65536 or (self.input_units and self.splits > 4)):
+            if cutlass.const_expr(self.n > 65536 or (self.input_units and self.splits > 4)
+                                  or (self.n < 1024 and self.splits > 4)):
                 self._decode_existing(inputs, payload, scales, partial, output,
                                       rows, rotation_id, cta_limit, stream)
             else:
