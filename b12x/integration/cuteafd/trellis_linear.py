@@ -140,8 +140,8 @@ class _EgressPointers:
         self.n, self.splits = g["output_features"], g["splits"]
 
     @cute.jit
-    def __call__(self, inputs: cute.Pointer, payload: cute.Pointer,
-                 scales: cute.Pointer, partial: cute.Pointer, output: cute.Pointer,
+    def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
+                 input_block_scales: cute.Pointer, partial: cute.Pointer, output: cute.Pointer,
                  svh: cute.Pointer, final: cute.Pointer, rows: cutlass.Int32,
                  rotation_id: cutlass.Int32, cta_limit: cutlass.Int32,
                  stream: cuda.CUstream):
@@ -149,19 +149,19 @@ class _EgressPointers:
         if rows > 0 and rows <= self.core.max_rows and rotation_id >= 0 and rotation_id < self.core.rotations and cta_limit > 0:
             if cutlass.const_expr(self.splits == 8 and self.n <= 65536):
                 if rows <= 16:
-                    self.core.multiply_k6_pair(cute.make_tensor(inputs, layout), cute.make_tensor(payload, layout),
-                        cute.make_tensor(scales, layout), cute.make_tensor(partial, layout), cute.make_tensor(output, layout),
+                    self.core.multiply_k6_pair(cute.make_tensor(rotated_inputs, layout), cute.make_tensor(payload, layout),
+                        cute.make_tensor(input_block_scales, layout), cute.make_tensor(partial, layout), cute.make_tensor(output, layout),
                         rows, rotation_id).launch(grid=(min(self.n // 64 * self.splits, cta_limit),1,1),
                         block=(64,1,1), min_blocks_per_mp=self.core.min_blocks_per_mp, stream=stream)
                     self.reduce_egress(partial, output, svh, final, rows).launch(
                         grid=(min((rows * (self.n // 128) + 3) // 4, cta_limit),1,1),
                         block=(128,1,1), stream=stream)
                 else:
-                    self.core(cute.make_tensor(inputs, layout), cute.make_tensor(payload, layout), cute.make_tensor(scales, layout),
+                    self.core(cute.make_tensor(rotated_inputs, layout), cute.make_tensor(payload, layout), cute.make_tensor(input_block_scales, layout),
                         cute.make_tensor(partial, layout), cute.make_tensor(output, layout),rows,rotation_id,cta_limit,stream)
                     self.egress(output,svh,final,rows,cta_limit,stream)
             else:
-                self.core(cute.make_tensor(inputs, layout), cute.make_tensor(payload, layout), cute.make_tensor(scales, layout),
+                self.core(cute.make_tensor(rotated_inputs, layout), cute.make_tensor(payload, layout), cute.make_tensor(input_block_scales, layout),
                     cute.make_tensor(partial, layout), cute.make_tensor(output, layout),rows,rotation_id,cta_limit,stream)
                 self.egress(output,svh,final,rows,cta_limit,stream)
 
