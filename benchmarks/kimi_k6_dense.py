@@ -379,6 +379,7 @@ def benchmark_glmf_duel(args):
         for rows in rows_list:
             graphs = {}
             hashes = {}
+            events = {}
             def call(name, count=rows):
                 result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
                     partials[name].data_ptr(), outputs[name].data_ptr(), count, 0,
@@ -388,8 +389,13 @@ def benchmark_glmf_duel(args):
             for name in libs:
                 call(name)
                 graph = torch.cuda.CUDAGraph()
+                start = torch.cuda.Event(enable_timing=True, external=True)
+                end = torch.cuda.Event(enable_timing=True, external=True)
                 with torch.cuda.graph(graph):
+                    start.record()
                     call(name)
+                    end.record()
+                events[name] = (start, end)
                 outputs[name].fill_(float("nan"))
                 partials[name].fill_(float("nan"))
                 graph.replay()
@@ -416,10 +422,8 @@ def benchmark_glmf_duel(args):
                 order = list(libs) if repeat % 2 == 0 else list(reversed(libs))
                 for name in order:
                     flush.zero_()
-                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                    start.record()
+                    start, end = events[name]
                     graphs[name].replay()
-                    end.record()
                     end.synchronize()
                     samples[name].append(start.elapsed_time(end)*1000)
             times = {name: statistics.median(v) for name, v in samples.items()}
