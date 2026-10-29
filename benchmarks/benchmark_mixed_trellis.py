@@ -835,8 +835,9 @@ def compact_prefill_fixture(path, rank, family, width, experts=None, bits=None):
         raise ValueError("compact prefill fixture currently requires Qwen, GLM, GLMF, V4.1, or DSV4F")
     if experts is None:
         experts = PREFILL_FAMILIES[family][1]
-    expected_bits = bits or PREFILL_FAMILIES[family][3]
     data = json.loads(Path(path).read_text())
+    source_bits = data.get("tiers", bits or PREFILL_FAMILIES[family][3])
+    expected_bits = bits or PREFILL_FAMILIES[family][3]
     matches = [item for item in data["ranks"] if item["rank"] == rank]
     if len(matches) != 1:
         raise ValueError("compact fixture must contain the requested rank exactly once")
@@ -852,8 +853,24 @@ def compact_prefill_fixture(path, rank, family, width, experts=None, bits=None):
         if [p["projection"] for p in e["projections"]] != ["gate", "up", "down"]:
             raise ValueError("compact fixture requires ordered gate/up/down projections")
         for projection in e["projections"]:
-            if projection["tier"] not in (0, 1) or projection["bits"] != expected_bits[projection["tier"]]:
+            if projection["tier"] not in (0, 1) or projection["bits"] != source_bits[projection["tier"]]:
                 raise ValueError("compact fixture tier/bit mismatch")
+    if tuple(source_bits) != tuple(expected_bits):
+        if bits is None:
+            raise ValueError("compact fixture tier/bit mismatch")
+        from b12x.moe._shared.kernels.w4a16.mixed_trellis import _compact_trellis_layout
+        rows = [[(e["projections"][p]["tier"] << 9) | e["projections"][p]["tier_local"]
+                 for e in entries] for p in range(3)]
+        rows.append([e["width"] for e in entries])
+        canonical, _, counts = _compact_trellis_layout(
+            rows, hidden_size=PREFILL_FAMILIES[family][0], intermediate_size=width,
+            bits=expected_bits)
+        if [list(c) for c in counts] != selected["projection_counts"]:
+            raise ValueError("compact fixture projection counts disagree")
+        for e in entries:
+            for p, projection in enumerate(e["projections"]):
+                projection["bits"] = expected_bits[projection["tier"]]
+                projection["payload_word_offset"] = canonical[4 + p][e["combined_local"]]
     return dict(rank=rank, entries=entries, counts=selected["projection_counts"],
                 fingerprint=selected["unit_map_fingerprint"],
                 synthetic=bool(data.get("synthetic", False)),

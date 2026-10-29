@@ -320,3 +320,41 @@ def test_compact_prefill_compile_options_match_served_exports(tmp_path):
     v41_path.write_text(bench.json.dumps(dict(synthetic=True, source="synthetic", ranks=[v41_rank])))
     v41_fix = bench.compact_prefill_fixture(v41_path, 0, "v41", 640)
     assert v41_fix["synthetic"] is True and len(v41_fix["entries"]) == 384
+
+
+@pytest.mark.parametrize("bits", [(2, 3), (2, 4), (2, 5), (3, 4), (3, 5), (4, 5)])
+def test_compact_pair_remap_preserves_planner_ownership(tmp_path, bits):
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import _compact_trellis_layout
+    bench = _load_benchmark_module()
+    entries = [dict(global_expert=e, combined_local=e, width=128 if e % 3 else 256,
+                    h128_units=[e % 5], projections=[
+                        dict(projection=p, tier=e % 2, bits=(4, 5)[e % 2],
+                             tier_local=e // 2) for p in ("gate", "up", "down")])
+               for e in range(512)]
+    rows = [[((e % 2) << 9) | (e // 2) for e in range(512)] for _ in range(3)]
+    rows.append([e["width"] for e in entries])
+    canonical, _, counts = _compact_trellis_layout(
+        rows, hidden_size=2560, intermediate_size=256, bits=(4, 5))
+    for e in entries:
+        for p, projection in enumerate(e["projections"]):
+            projection["payload_word_offset"] = canonical[4 + p][e["combined_local"]]
+    rank = dict(rank=0, compiled_max_intermediate=256, experts=entries,
+                projection_counts=[list(c) for c in counts], unit_map_fingerprint="planner-real")
+    data = dict(tiers=[4, 5], ranks=[rank], source="planner")
+    path = tmp_path / "ownership.json"
+    path.write_text(bench.json.dumps(data))
+    original = bench.compact_prefill_fixture(path, 0, "qwen4", 256)
+    assert bench.compact_prefill_fixture(path, 0, "qwen4", 256, bits=(4, 5)) == original
+    remapped = bench.compact_prefill_fixture(path, 0, "qwen4", 256, bits=bits)
+    expected, _, _ = _compact_trellis_layout(rows, hidden_size=2560,
+                                            intermediate_size=256, bits=bits)
+    assert remapped["counts"] == original["counts"]
+    assert remapped["fingerprint"] == original["fingerprint"]
+    assert bench.json.loads(path.read_text()) == data
+    for before, after in zip(original["entries"], remapped["entries"]):
+        assert {k: v for k, v in after.items() if k != "projections"} == {
+            k: v for k, v in before.items() if k != "projections"}
+        for p, (old, new) in enumerate(zip(before["projections"], after["projections"])):
+            assert new["bits"] == bits[new["tier"]]
+            assert new["payload_word_offset"] == expected[4 + p][after["combined_local"]]
+            assert (new["tier"], new["tier_local"]) == (old["tier"], old["tier_local"])
