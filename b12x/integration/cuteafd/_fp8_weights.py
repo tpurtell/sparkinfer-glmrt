@@ -116,6 +116,10 @@ class RoutedFp8Projection:
         return (None if self.fp8_wide is None else self.fp8_wide.key(), self.max_fp8_rows,
                 tuple(sorted(self.large.config.items())))
 
+    @property
+    def exact_row_cap(self) -> int:
+        return self.max_fp8_rows
+
     @cute.jit
     def __call__(self, x: cute.Pointer, w_bf16: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer,
                  out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
@@ -138,6 +142,10 @@ class _Bf16Projection:
         from ._glm_kernels import glm_projection
 
         self.inner = glm_projection(n, k)
+
+    @property
+    def exact_row_cap(self) -> int:
+        return self.inner.exact_row_cap
 
     def key(self) -> tuple:
         return self.inner.key()
@@ -237,6 +245,12 @@ class Fp8Projection:
                 None if self.gemv is None else self.gemv.key(),
                 None if self.gemv_wide is None else self.gemv_wide.key(),
                 None if self.w8a8 is None else self.w8a8.key(), self.w8a16.key())
+
+    @property
+    def exact_row_cap(self) -> int:
+        # Prefill selects A8/A16 by a fixed launch flag, not live rows. Decode
+        # fp8_rows is a runtime crossover, so no nonzero cap is unconditional.
+        return 2**31 - 1 if self.prefill else 0
 
     def prefill_scratch_bytes(self, rows: int) -> int:
         from ._glmf_fp8 import quant_scratch_bytes

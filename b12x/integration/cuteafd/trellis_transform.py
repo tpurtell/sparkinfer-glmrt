@@ -273,7 +273,7 @@ def compile_trellis_input_aot(*, features, input_dtype="bf16", max_rows=4096, ou
                     *(Operand(f"{p}_rotated", out_dt, f"[rows,{features}]", "out") for p in GROUP_NAMES),
                     *(Operand(f"{p}_input_block_scales", torch.float16, f"[{features//128}]", "out") for p in GROUP_NAMES))
     return compile_program(launch, name="trellis_input", operands=operands,
-        scalars=(Scalar("rows"), Scalar("cta_limit")), key=tuple(g.values()), geometry=g, doc=__doc__)
+        scalars=(Scalar("rows"), Scalar("cta_limit")), key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1}, doc=__doc__)
 
 
 def compile_trellis_output_aot(*, features, output_dtype="bf16", max_rows=4096, groups=1):
@@ -295,4 +295,4 @@ def compile_trellis_output_aot(*, features, output_dtype="bf16", max_rows=4096, 
                     *(Operand(f"{p}_svh", torch.float16, f"[{features}]") for p in GROUP_NAMES),
                     *(Operand(f"{p}_output", out_dt, f"[rows,{features}]", "out") for p in GROUP_NAMES))
     return compile_program(launch, name="trellis_output", operands=operands,
-        scalars=(Scalar("rows"), Scalar("cta_limit")), key=tuple(g.values()), geometry=g, doc=__doc__)
+        scalars=(Scalar("rows"), Scalar("cta_limit")), key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1}, doc=__doc__)

@@ -67,4 +67,4 @@ def compile_trellis_unpack_e4m3_aot(*, input_features, output_features, sharded_
     return compile_program(_Unpack(k, n, sharded_side), name="trellis_unpack_e4m3",
         operands=(Operand("payload", torch.uint8, f"[{k*n//2}]"),
                   Operand("output", torch.uint8, f"[{n},{k}]", "out")),
-        scalars=(), key=tuple(g.values()), geometry=g, doc=__doc__)
+        scalars=(), key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1}, doc=__doc__)

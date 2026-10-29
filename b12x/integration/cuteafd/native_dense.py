@@ -62,7 +62,7 @@ def compile_swiglu_split_aot(*, inter):
         Operand("gate", torch.bfloat16, f"[rows,{inter}]"),
         Operand("up", torch.bfloat16, f"[rows,{inter}]"),
         Operand("hidden", torch.bfloat16, f"[rows,{inter}]", "out")),
-        scalars=(Scalar("rows"),), key=(inter,), geometry=dict(inter=inter))
+        scalars=(Scalar("rows"),), key=(inter,), geometry=dict(inter=inter, exact_row_cap=2**31 - 1))
 
 
 def compile_f32_narrow_pack_aot(*, width, pitch):
@@ -73,7 +73,7 @@ def compile_f32_narrow_pack_aot(*, width, pitch):
         Operand("input", torch.float32, f"[rows,{width}]"),
         Operand("output", torch.bfloat16, f"[rows,{pitch}]", "out")),
         scalars=(Scalar("rows"), Scalar("c0")), key=(width, pitch),
-        geometry=dict(width=width, pitch=pitch))
+        geometry=dict(width=width, pitch=pitch, exact_row_cap=2**31 - 1))
 
 
 def compile_trellis_fp8_prefill_aot(*, input_features, output_features, max_rows=4096):
@@ -90,4 +90,4 @@ def compile_trellis_fp8_prefill_aot(*, input_features, output_features, max_rows
         Operand("w", torch.uint8, f"[{n},{k}]"),
         Operand("scale", torch.float32, f"[{n//128},{k//128}]"),
         Operand("out", torch.float32, f"[rows,{n}]", "out")),
-        scalars=(Scalar("rows"),), key=(max_rows, launch.key()), geometry=g)
+        scalars=(Scalar("rows"),), key=(max_rows, launch.key()), geometry={**g, "exact_row_cap": 2**31 - 1})

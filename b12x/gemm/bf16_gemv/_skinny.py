@@ -559,6 +559,12 @@ class RoutedBf16Projection:
         self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(), **WIDE_PREFILL_CONFIG) \
             if wide and self.n % 2 == 0 else None
 
+    @property
+    def exact_row_cap(self) -> int:
+        # Skinny row tiles keep the K partition; TMA row/wide tiles also keep
+        # their MMA fold. Only crossing SIMT -> MMA changes row arithmetic.
+        return self.max_skinny_rows if self.max_skinny_rows > 0 else 2**31 - 1
+
     def key(self) -> tuple:
         s = self.skinny
         # tiles_by_rows extends the key; projections without it keep theirs.

@@ -214,6 +214,12 @@ class _Fp8Switch:
                                                    self.activation_quant_row_threshold),
                 None if self.fp8_wide is None else self.fp8_wide.key())
 
+    @property
+    def exact_row_cap(self) -> int:
+        if self.prefill is not None:
+            return min(self.bf16.exact_row_cap, self.activation_quant_row_threshold)
+        return self.bf16.exact_row_cap if self.fp8 is None else 0
+
     @cute.jit
     def run(self, x: cute.Pointer, w: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
             rows: Int32, fp8_rows: Int32, qscratch: Int64, stream: cuda.CUstream):
@@ -1133,7 +1139,7 @@ def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: in
         return compile_program(
             launch, name="glmf_mla_producer", operands=operands, scalars=_fp8_scalars(True, w8_prefill),
             key=(max_rows, "w8", fp8_only, launch.key()),
-            geometry={"hidden": h, "q_lora_rank": q, "heads": n, "max_rows": max_rows, "fp8_weights": "only",
+            geometry={"exact_row_cap": min(launch.qkv_a.exact_row_cap, launch.q_b.exact_row_cap), "hidden": h, "q_lora_rank": q, "heads": n, "max_rows": max_rows, "fp8_weights": "only",
                       "record_bytes": g.record_bytes, "page_rows": g.page_rows, "eps": g.norm_eps},
             scratch={"scratch": lambda rows: mla_producer_scratch_bytes(g, rows, w8_prefill)},
             doc=__doc__,
@@ -1159,7 +1165,7 @@ def compile_glmf_mla_producer_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: in
     return compile_program(
         launch, name="glmf_mla_producer", operands=operands, scalars=_fp8_scalars(fp8_on, prefill),
         key=(max_rows, fp8, launch.key()),
-        geometry={"hidden": h, "q_lora_rank": q, "heads": n, "max_rows": max_rows,
+        geometry={"exact_row_cap": min(launch.qkv_a.exact_row_cap, launch.q_b.exact_row_cap), "hidden": h, "q_lora_rank": q, "heads": n, "max_rows": max_rows,
                   "record_bytes": g.record_bytes, "page_rows": g.page_rows, "eps": g.norm_eps},
         scratch={"scratch": lambda rows: mla_producer_scratch_bytes(g, rows, prefill)},
         doc=__doc__,
@@ -1262,7 +1268,7 @@ def compile_glmf_ffn_aot(g: GLMFGeometry = GLM53_FLASH, *, inter: int, max_rows:
         return compile_program(
             launch, name="glmf_ffn", operands=operands, scalars=_fp8_scalars(True, w8_prefill),
             key=(max_rows, "w8", fp8_only, launch.key()),
-            geometry={"hidden": h, "inter": i, "max_rows": max_rows, "swiglu_limit": g.swiglu_limit,
+            geometry={"exact_row_cap": min(launch.gate_up.exact_row_cap, launch.down.exact_row_cap), "hidden": h, "inter": i, "max_rows": max_rows, "swiglu_limit": g.swiglu_limit,
                       "fp8_weights": "only"},
             scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)
                      + (quant_scratch_bytes(max(h, i), rows) if w8_prefill else 0)},
@@ -1283,7 +1289,7 @@ def compile_glmf_ffn_aot(g: GLMFGeometry = GLM53_FLASH, *, inter: int, max_rows:
     return compile_program(
         launch, name="glmf_ffn", operands=operands, scalars=_fp8_scalars(fp8_on, prefill),
         key=(max_rows, fp8, launch.key()),
-        geometry={"hidden": h, "inter": i, "max_rows": max_rows, "swiglu_limit": g.swiglu_limit},
+        geometry={"exact_row_cap": min(launch.gate_up.exact_row_cap, launch.down.exact_row_cap), "hidden": h, "inter": i, "max_rows": max_rows, "swiglu_limit": g.swiglu_limit},
         scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)
                  + (quant_scratch_bytes(max(h, i), rows) if prefill else 0)},
         doc=__doc__,
@@ -1314,7 +1320,7 @@ def compile_glmf_router_scores_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
                   Operand("w", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight"),
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
         scalars=(Scalar("rows"),), key=(launch.key(),),
-        geometry={"hidden": h, "experts": e, "top_k": g.top_k}, doc=__doc__,
+        geometry={"hidden": h, "experts": e, "top_k": g.top_k, "exact_row_cap": launch.proj.exact_row_cap}, doc=__doc__,
     )
 
 
@@ -1331,7 +1337,7 @@ def compile_glmf_expert_input_quant_aot(g: GLMFGeometry = GLM53_FLASH) -> AotPro
                   Operand("scale_rows_ptr", torch.uint8, "values_ptr + H", "out"),
                   Operand("scale_mma_ptr", torch.uint8, "unused", "in")),
         scalars=(Scalar("m"), Scalar("grid_x")),
-        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4},
+        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4, "exact_row_cap": 2**31 - 1},
         doc=__doc__,
     )
 
@@ -1343,7 +1349,7 @@ def compile_glmf_add_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
         GlmfAdd(h), name="glmf_add",
         operands=(Operand("a", torch.bfloat16, f"[rows,{h}]"), Operand("b", torch.bfloat16, f"[rows,{h}]"),
                   Operand("out", torch.bfloat16, f"[rows,{h}]", "out")),
-        scalars=(Scalar("rows"),), key=(h,), geometry={"hidden": h}, doc=__doc__,
+        scalars=(Scalar("rows"),), key=(h,), geometry={"hidden": h, "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
 
 
@@ -1368,7 +1374,7 @@ def compile_glmf_head_aot(g: GLMFGeometry = GLM53_FLASH) -> AotProgram:
         operands=(Operand("streams", torch.bfloat16, f"[rows,{g.hc_mult},{h}]"),
                   Operand("weight", torch.bfloat16, f"[{h}]"),
                   Operand("out", torch.bfloat16, f"[rows,{h}]", "out")),
-        scalars=(Scalar("rows"),), key=(h, g.norm_eps, g.hc_mult), geometry={"hidden": h, "eps": g.norm_eps},
+        scalars=(Scalar("rows"),), key=(h, g.norm_eps, g.hc_mult), geometry={"hidden": h, "eps": g.norm_eps, "exact_row_cap": 2**31 - 1},
         doc=__doc__,
     )
 
@@ -1615,7 +1621,7 @@ def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fals
         return compile_program(
             launch, name="glmf_o", operands=operands, scalars=_fp8_scalars(True, w8_prefill),
             key=(max_rows, "w8", fp8_only, launch.key()),
-            geometry={"hidden": h, "heads": n, "v_head_dim": v, "max_rows": max_rows, "fp8_weights": "only"},
+            geometry={"exact_row_cap": launch.o.exact_row_cap, "hidden": h, "heads": n, "v_head_dim": v, "max_rows": max_rows, "fp8_weights": "only"},
             scratch={"scratch": lambda rows: o_scratch_bytes(g, rows)
                      + (quant_scratch_bytes(n * v, rows) if w8_prefill else 0)},
             doc=compile_glmf_o_aot.__doc__,
@@ -1634,7 +1640,7 @@ def compile_glmf_o_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fals
     return compile_program(
         launch, name="glmf_o", operands=operands, scalars=_fp8_scalars(fp8_on, prefill),
         key=(max_rows, fp8, launch.key()),
-        geometry={"hidden": h, "heads": n, "v_head_dim": v, "max_rows": max_rows, "fp8_weights": fp8},
+        geometry={"exact_row_cap": launch.o.exact_row_cap, "hidden": h, "heads": n, "v_head_dim": v, "max_rows": max_rows, "fp8_weights": fp8},
         scratch={"scratch": lambda rows: o_scratch_bytes(g, rows)
                  + (quant_scratch_bytes(n * v, rows) if prefill else 0)},
         doc=compile_glmf_o_aot.__doc__,

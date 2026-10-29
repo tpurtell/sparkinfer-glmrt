@@ -65,6 +65,7 @@ class _Pointers:
 
 
 def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp8", sharded_side=1, max_rows=4096):
+    from b12x.gemm.native_tile_linear import DECODE_ROWS
     g = geometry(input_features,output_features,encoding=encoding,sharded_side=sharded_side,max_rows=max_rows)
     k,n = input_features,output_features
     scale_dtype = {"mxfp8":torch.uint8,"int4_g32":torch.float16,"fp8_row":torch.float32}[encoding]
@@ -76,5 +77,5 @@ def compile_scaled_linear_aot(*, input_features, output_features, encoding="mxfp
                 Operand("partial",torch.float32,"[0]","scratch"),
                 Operand("output",torch.float32,f"[rows,{n}]","out"))
     return compile_program(_Pointers(g),name="scaled_linear",operands=operands,
-                           scalars=tuple(Scalar(n) for n in SCALARS),key=tuple(g.values()),geometry=g,
+                           scalars=tuple(Scalar(n) for n in SCALARS),key=tuple(g.values()),geometry={**g, "exact_row_cap": DECODE_ROWS},
                            scratch={"partial":lambda rows:0},doc=__doc__)
