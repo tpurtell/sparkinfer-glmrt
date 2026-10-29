@@ -17,6 +17,39 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
 from tests.moe.test_w4a16_mixed_trellis import _prepared
 
 
+def _fc1_resources(launch):
+    from cuda.bindings import driver, runtime
+
+    def checked(result):
+        assert int(result[0]) == 0, result
+        return result[1]
+
+    executable = getattr(launch.compiled, "_executable", launch.compiled)
+    module = executable.jit_module
+    kernels = [entry.kernel for entry in getattr(module, "cuda_modules", ())]
+    for library in getattr(module, "cuda_library", ()):
+        count = checked(runtime.cudaLibraryGetKernelCount(library))
+        kernels.extend(checked(runtime.cudaLibraryEnumerateKernels(count, library)))
+    records = []
+    for value in kernels:
+        kernel = driver.CUkernel(int(value))
+        name = checked(driver.cuKernelGetName(kernel))
+        name = name.decode() if isinstance(name, bytes) else str(name)
+        if "ws_fc1_kernel" not in name:
+            continue
+        def attribute(attr):
+            return int(checked(driver.cuKernelGetAttribute(attr, kernel, driver.CUdevice(0))))
+        attrs = driver.CUfunction_attribute
+        threads = (256 if launch.fc1_tile_n == 192 else launch.fc1_tile_n) + 128
+        occupancy = checked(runtime.cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            value, threads, launch.shared_memory_bytes))
+        records.append(dict(name=name, registers=attribute(attrs.CU_FUNC_ATTRIBUTE_NUM_REGS),
+            static_smem=attribute(attrs.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
+            dynamic_smem=launch.shared_memory_bytes, threads=threads, ctas_per_sm=int(occupancy)))
+    assert len(records) == 1, records
+    return records[0]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires SM121")
 def test_glmf_two_member_byte_gate_and_ceiling():
     device = torch.device("cuda", 0)
@@ -55,7 +88,7 @@ def test_glmf_two_member_byte_gate_and_ceiling():
     for hot in (False, True):
         ids = torch.randint(experts, (5504, topk), device=device, dtype=torch.int32)
         if hot:
-            ids[:] = torch.tensor([0, 1, 2, 3, 128, 129, 130, 131], device=device)
+            ids[:] = torch.tensor([0, 1, 2, 3, 144, 145, 146, 147], device=device)
         for lengths, order in (((2752, 2752), (0, 1)), ((2752, 2558), (0, 1)),
                                ((2752, 2558), (1, 0)), ((2752, 17), (1, 0))):
             row_inputs, row_outputs, member_ids, member_weights = [], [], [], []
@@ -97,11 +130,6 @@ def test_glmf_two_member_byte_gate_and_ceiling():
                 assert torch.all(outputs[member][rows + 1:] == 123)
             cases += 1
             if not hot and lengths == (2752, 2752):
-                # One warmed call per arm: no repeated sessions or tuning.
-                def singleton():
-                    for member, route_ids, route_weights in zip(order, member_ids, member_weights):
-                        run_bound_mixed_trellis(source[member][1:2753], route_weights, route_ids,
-                                               bindings[0], buffers[0])
                 def merged_call():
                     run_bound_mixed_trellis(addresses, merged_weights, merged_ids, bindings[1], merged)
                 # Retain this warmed random-route case; time it after every byte gate.
@@ -122,12 +150,14 @@ def test_glmf_two_member_byte_gate_and_ceiling():
                                    bindings[0], buffers[0])
     def merged_call():
         run_bound_mixed_trellis(addresses, merged_weights, merged_ids, bindings[1], merged)
+    resources = [_fc1_resources(launch) for launch in launches]
+    assert resources[1]["ctas_per_sm"] >= resources[0]["ctas_per_sm"]
     timings = []
     for call in (singleton, merged_call):
         call()
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record(); call(); end.record(); end.synchronize()
         timings.append(start.elapsed_time(end))
-    ceiling = dict(singleton_x2_ms=timings[0], merged_ms=timings[1], speedup=timings[0] / timings[1])
-    print(json.dumps(dict(byte_cases=cases, ceiling=ceiling, gpu=props.name,
+    ceiling = dict(singleton_x2_us=timings[0] * 1000, merged_us=timings[1] * 1000, speedup=timings[0] / timings[1])
+    print(json.dumps(dict(byte_cases=cases, ceiling=ceiling, fc1_resources=resources, gpu=props.name,
                           sms=props.multi_processor_count, shared_bytes=launches[1].shared_memory_bytes)), flush=True)
