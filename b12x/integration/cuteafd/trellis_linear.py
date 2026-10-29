@@ -125,6 +125,6 @@ def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
         pointers = _GroupedPointers(g)
     return compile_program(pointers, name="trellis_linear", operands=operands,
                            scalars=tuple(Scalar(name) for name in SCALARS),
-                           key=tuple(g.values()), version=3,
+                           key=tuple(g.values()), version=4,
                            geometry={**g, "exact_row_cap": pointers.core.exact_row_cap},
                            scratch={"partial": lambda rows: groups*rows*s*n*4}, doc=__doc__)

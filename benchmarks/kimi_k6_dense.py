@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 
-def exported(program, directory, stem):
+def exported(program, directory, stem, *, load_module=True):
     from b12x.integration.cuteafd import validate_exported_header
     program.export_to_c(str(directory), stem, stem)
     validate_exported_header(program, directory / f"{stem}.h", stem)
@@ -38,6 +38,8 @@ def exported(program, directory, stem):
         str(source), str(directory / f"{stem}.o"), "-L/usr/local/cuda/lib64", "-lcudart",
         f"-L{runtime}", "-lcute_dsl_runtime", f"-Wl,-rpath,{runtime}", "-Wl,-z,defs",
         "-o", str(library)], check=True)
+    if not load_module:
+        return None
     lib = C.CDLL(str(library))
     lib.load.argtypes, lib.load.restype = [], None
     lib.run.argtypes = [C.c_void_p] * len(pointers) + [C.c_int32] * len(scalars) + [C.c_void_p]
@@ -312,6 +314,237 @@ def benchmark_prefill_route(args):
         torch.cuda.empty_cache()
 
 
+def benchmark_native_comparison(args):
+    """Compare a previous native implementation through the same exported ABI."""
+    import importlib.util
+    from b12x.gemm.trellis_linear import _native
+    candidate = _native.NativeTrellisLinear
+    spec = importlib.util.spec_from_file_location("trellis_native_baseline", args.baseline_native)
+    baseline_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(baseline_module)
+    baseline = baseline_module.NativeTrellisLinear
+    import hashlib
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+
+    if args.compile_only:
+        import multiprocessing
+        from b12x._lib.compile_pool import _initialize_worker
+        # Driver attributes do not create a CUDA context in this compiler process.
+        status, = cuda.cuInit(0)
+        if int(status):
+            raise RuntimeError(status)
+        def attribute(name):
+            status, value = cuda.cuDeviceGetAttribute(getattr(cuda.CUdevice_attribute, name), 0)
+            if int(status):
+                raise RuntimeError(status)
+            return value
+        capability = tuple(attribute("CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_" + part)
+                           for part in ("MAJOR", "MINOR"))
+        _initialize_worker(0, capability, "native-byte-comparison", "native-byte-comparison",
+                           attribute("CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT"),
+                           attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN"),
+                           attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR"),
+                           multiprocessing.Array("i", [0, 0]))
+
+    def snapshot():
+        if args.compile_only:
+            return "CPU-only export"
+        return subprocess.check_output([
+            "nvidia-smi", "--query-gpu=name,clocks.sm,clocks.mem,power.draw,power.limit,temperature.gpu",
+            "--format=csv,noheader"], text=True).strip()
+
+    def boost_warmup():
+        warm_a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        warm_b = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm_a, warm_b)
+        torch.cuda.synchronize()
+        del warm_a, warm_b
+
+    def load(directory, stem):
+        lib = C.CDLL(str((directory / f"{stem}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        lib.run.argtypes = [C.c_void_p] * 5 + [C.c_int32] * 3 + [C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    default_shapes = "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,16384:4096:1,4096:154880:1,4096:6144:1,6144:4096:2"
+    shapes = [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
+    rows_list = list(map(int, args.rows.split(",")))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 1:
+        raise ValueError("native comparison requires rows 1..4096 and positive samples")
+    max_rows = max(129, max(rows_list))
+    arms = (("baseline", baseline), ("candidate", candidate))
+    if args.compile_only:
+        props = None
+        l2 = 0
+    else:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if not args.compile_only:
+        status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+        if int(status):
+            raise RuntimeError(status)
+    snapshot_idle = snapshot()
+    if not args.compile_only:
+        boost_warmup()
+        flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
+        flush.zero_()
+        torch.cuda.synchronize()
+    report = dict(metadata=dict(device=props.name if props else "CPU-only", sms=props.multi_processor_count if props else None,
+        l2_bytes=l2, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
+        input_dtype=args.input_dtype, codebook=args.codebook,
+        ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[])
+    torch.manual_seed(273)
+    for k, n, side in shapes:
+        directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
+        directory.mkdir(parents=True, exist_ok=True)
+        libs = {}
+        for stem, core in arms:
+            if args.compile_only:
+                print(f"compile {k}:{n}:{side} {stem} max_rows={max_rows}", flush=True)
+                _native.NativeTrellisLinear = core
+                try:
+                    with exportable_compilation():
+                        program = compile_trellis_linear_aot(input_features=k, output_features=n,
+                            bits=args.bits, codebook=args.codebook, sharded_side=side, rotation_count=1,
+                            max_rows=max_rows, input_dtype=args.input_dtype)
+                finally:
+                    _native.NativeTrellisLinear = candidate
+                exported(program, directory, stem, load_module=False)
+                (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
+            else:
+                libs[stem] = load(directory, stem)
+        if args.compile_only:
+            continue
+        capacity = max(rows_list)
+        decode_cap = min(capacity, 129)
+        splits = (k + 1023) // 1024
+        core = baseline(dict(input_features=k, output_features=n, bits=args.bits,
+            codebook=args.codebook, sharded_side=side, rotation_count=1,
+            max_rows=max_rows, splits=splits, input_dtype=args.input_dtype))
+        candidate_core = candidate(dict(input_features=k, output_features=n, bits=args.bits,
+            codebook=args.codebook, sharded_side=side, rotation_count=1,
+            max_rows=max_rows, splits=splits, input_dtype=args.input_dtype))
+        assert candidate_core.exact_row_cap == core.exact_row_cap
+        def publishes_partials(rows):
+            if rows > (64 if args.codebook == "e4m3" else 129):
+                return False
+            # The pre-existing short-K K4 E4M3 folded route writes output directly.
+            return not (args.bits == 4 and args.codebook == "e4m3"
+                        and splits <= 2 and rows <= 16)
+        x = torch.randn(capacity, k, device="cuda", dtype=getattr(torch, {"bf16":"bfloat16", "f16":"float16"}[args.input_dtype]))
+        inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
+        payload = torch.randint(256, (k*n*args.bits//8,), device="cuda", dtype=torch.uint8)
+        scales = torch.rand(k//128, device="cuda", dtype=torch.float16) + .125
+        partials = {name: torch.empty(decode_cap*splits*n, device="cuda") for name in libs}
+        outputs = {name: torch.empty(capacity*n, device="cuda") for name in libs}
+        # Untimed boost warm-up before row 1 of each shape
+        boost_warmup()
+        for rows in rows_list:
+            graphs = {}
+            hashes = {}
+            events = {}
+            def call(name, count=rows):
+                result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
+                    partials[name].data_ptr(), outputs[name].data_ptr(), count, 0,
+                    props.multi_processor_count*4, torch.cuda.current_stream().cuda_stream)
+                if result:
+                    raise RuntimeError(f"{name} returned {result}")
+            for name in libs:
+                call(name)
+                graph = torch.cuda.CUDAGraph()
+                start = torch.cuda.Event(enable_timing=True, external=True)
+                end = torch.cuda.Event(enable_timing=True, external=True)
+                with torch.cuda.graph(graph):
+                    start.record()
+                    call(name)
+                    end.record()
+                events[name] = (start, end)
+                outputs[name][:rows*n].fill_(float("nan"))
+                if publishes_partials(rows):
+                    partials[name][:rows*splits*n].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                if not torch.isfinite(outputs[name][:rows*n]).all().item():
+                    raise RuntimeError(f"{name}: poisoned output not overwritten")
+                if publishes_partials(rows) and not torch.isfinite(partials[name][:rows*splits*n]).all().item():
+                    raise RuntimeError(f"{name}: poisoned partial not overwritten")
+                graphs[name] = graph
+                hashes[name] = hashlib.sha256(outputs[name][:rows*n].cpu().numpy().tobytes()).hexdigest()
+            exact = {}
+            partials_exact = {}
+            for name in libs:
+                out_eq = torch.equal(outputs[name][:rows*n].view(torch.int32), outputs["baseline"][:rows*n].view(torch.int32))
+                part_eq = (torch.equal(partials[name][:rows*splits*n].view(torch.int32),
+                                       partials["baseline"][:rows*splits*n].view(torch.int32))
+                           if publishes_partials(rows) else None)
+                exact[name] = out_eq and part_eq is not False
+                partials_exact[name] = part_eq
+                if not exact[name]:
+                    raise RuntimeError(f"non-bit-exact {k}:{n}:{side} rows={rows} {name} (out_eq={out_eq}, part_eq={part_eq})")
+                saved = outputs[name][:n].clone()
+                outputs[name][:n].fill_(float("nan"))
+                call(name, 1)
+                if not torch.equal(saved.view(torch.int32), outputs[name][:n].view(torch.int32)):
+                    raise RuntimeError(f"row invariance failure: {name} rows={rows}")
+                graphs[name].replay()
+            if args.check_only or (args.timing_rows and rows not in set(map(int, args.timing_rows.split(",")))):
+                record = dict(k=k, n=n, side=side, splits=splits, rows=rows,
+                    bits=args.bits, codebook=args.codebook, input_dtype=args.input_dtype,
+                    exact=True, partials_exact=partials_exact["candidate"],
+                    partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
+                    sha256=hashes["candidate"])
+                report["records"].append(record)
+                continue
+            intervals = 32 if rows <= (64 if args.codebook == "e4m3" else 129) else (1 if n > 65536 else 4)
+            timing_graphs = {}
+            for name in libs:
+                pairs = [(torch.cuda.Event(enable_timing=True, external=True),
+                          torch.cuda.Event(enable_timing=True, external=True)) for _ in range(intervals)]
+                timed = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(timed):
+                    for start, end in pairs:
+                        flush.zero_()
+                        start.record()
+                        call(name)
+                        end.record()
+                timing_graphs[name] = timed
+                events[name] = pairs
+                timed.replay()
+            torch.cuda.synchronize()
+            samples = {name: [] for name in libs}
+            for repeat in range(args.samples):
+                order = list(libs) if repeat % 2 == 0 else list(reversed(libs))
+                for name in order:
+                    timing_graphs[name].replay()
+                    events[name][-1][1].synchronize()
+                    samples[name].append(statistics.mean(start.elapsed_time(end)*1000 for start, end in events[name]))
+            times = {name: statistics.median(v) for name, v in samples.items()}
+            name = "candidate"
+            record = dict(k=k, n=n, side=side, splits=splits, rows=rows, arm=name,
+                baseline_us=times["baseline"], candidate_us=times[name], ratio=times["baseline"]/times[name],
+                exact=exact[name], sha256=hashes[name], partials_exact=partials_exact[name],
+                partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
+                weight_gbs=(k*n*args.bits/8)/(times[name]*1000),
+                baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot())
+            report["records"].append(record)
+            print(json.dumps({key: value for key, value in record.items() if key not in ("samples_us", "baseline_samples_us")}), flush=True)
+            (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
+        (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
+        del graphs, partials, outputs, x, inputs, payload, scales
+        if "timing_graphs" in locals():
+            del timing_graphs
+        torch.cuda.empty_cache()
+    report["metadata"]["snapshot_after"] = snapshot()
+    if not args.compile_only:
+        (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
+
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -320,8 +553,18 @@ def main():
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
+    parser.add_argument("--baseline-native", type=Path, help="compare output and partial bytes against a previous _native.py")
+    parser.add_argument("--compile-only", action="store_true", help="CPU-only export of both comparison arms")
+    parser.add_argument("--check-only", action="store_true", help="compare every row without collecting timings")
+    parser.add_argument("--timing-rows", help="time only these rows while checking all requested rows")
+    parser.add_argument("--input-dtype", choices=("f16", "bf16"), default="bf16")
+    parser.add_argument("--codebook", choices=("mcg", "mul1", "f16", "e4m3"), default="mcg")
+    parser.add_argument("--bits", type=int, choices=range(2, 7), default=6)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.baseline_native:
+        benchmark_native_comparison(args)
+        return
     if args.prefill_route:
         benchmark_prefill_route(args)
         return
