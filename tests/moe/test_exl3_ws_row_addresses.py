@@ -25,18 +25,18 @@ def test_glmf_two_member_byte_gate_and_ceiling():
         pytest.skip("requires SM121")
     torch.cuda.set_per_process_memory_fraction(min(0.20, (16 << 30) / props.total_memory))
     torch.manual_seed(844)
-    hidden, intermediate, topk, experts, block = 4096, 1024, 8, 256, 64
+    hidden, intermediate, topk, experts, block = 4096, 1024, 8, 288, 64
     # Every expert is materialized: random routing exercises the real weight set.
     tiers = tuple(_prepared(experts=experts // 2, hidden=hidden,
         intermediate=intermediate, bits=bits, seed=bits, device=device,
         tile_config=(64, 256, 64, 256)) for bits in (3, 4))
-    expert_map, descriptor = build_tiered_maps(range(128), range(128, 256), device=device)
+    expert_map, descriptor = build_tiered_maps(range(144), range(144, 288), device=device)
     rotations = combine_trellis_rotations(*tiers)
     launches, buffers, bindings = [], [], []
     for capacity, indirect in ((2752, False), (5504, True)):
         slots = route_pack_capacity(capacity * topk, block, experts, topk=topk)[1]
         launch = compile_mixed_trellis(size_m=capacity, hidden_size=hidden,
-            intermediate_size=intermediate, tier0_num_experts=128, tier1_num_experts=128,
+            intermediate_size=intermediate, tier0_num_experts=144, tier1_num_experts=144,
             top_k=topk, route_num_experts=experts, max_m_blocks=(slots + block - 1) // block,
             sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
             force_tile_config=(64, 256, 64, 256), tier0_bits=3, tier1_bits=4,
@@ -104,13 +104,9 @@ def test_glmf_two_member_byte_gate_and_ceiling():
                                                bindings[0], buffers[0])
                 def merged_call():
                     run_bound_mixed_trellis(addresses, merged_weights, merged_ids, bindings[1], merged)
-                timings = []
-                for call in (singleton, merged_call):
-                    call()
-                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                    start.record(); call(); end.record(); end.synchronize()
-                    timings.append(start.elapsed_time(end))
-                ceiling = dict(singleton_x2_ms=timings[0], merged_ms=timings[1], speedup=timings[0] / timings[1])
+                # Retain this warmed random-route case; time it after every byte gate.
+                timing_args = (addresses, out_addresses, merged_ids, merged_weights,
+                               tuple(member_ids), tuple(member_weights), merged)
                 graph = torch.cuda.CUDAGraph()
                 with kernel_resolution_guard("EXL3 addressed graph capture"), torch.cuda.graph(graph):
                     merged_call()
@@ -119,5 +115,19 @@ def test_glmf_two_member_byte_gate_and_ceiling():
                 for member in order:
                     assert torch.equal(outputs[member][1:2753].view(torch.uint8), refs[member].view(torch.uint8))
                 graph.reset()
+    addresses, out_addresses, merged_ids, merged_weights, member_ids, member_weights, merged = timing_args
+    def singleton():
+        for member in (0, 1):
+            run_bound_mixed_trellis(source[member][1:2753], member_weights[member], member_ids[member],
+                                   bindings[0], buffers[0])
+    def merged_call():
+        run_bound_mixed_trellis(addresses, merged_weights, merged_ids, bindings[1], merged)
+    timings = []
+    for call in (singleton, merged_call):
+        call()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record(); call(); end.record(); end.synchronize()
+        timings.append(start.elapsed_time(end))
+    ceiling = dict(singleton_x2_ms=timings[0], merged_ms=timings[1], speedup=timings[0] / timings[1])
     print(json.dumps(dict(byte_cases=cases, ceiling=ceiling, gpu=props.name,
                           sms=props.multi_processor_count, shared_bytes=launches[1].shared_memory_bytes)), flush=True)

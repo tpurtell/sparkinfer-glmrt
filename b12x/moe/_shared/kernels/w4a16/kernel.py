@@ -10118,20 +10118,19 @@ class W4A16TopKSumKernel:
                     if cutlass.const_expr(self.row_addresses):
                         output_dtype = cutlass.BFloat16 if self.full_rotation_output_bf16 else cutlass.Float32
                         row_ptr = cute.make_ptr(output_dtype, output_flat[token], cute.AddressSpace.gmem, assumed_align=16)
-                        output_flat = cute.make_tensor(row_ptr, cute.make_layout((self.hidden_size,)))
+                        destination = cute.make_tensor(row_ptr, cute.make_layout((self.hidden_size,)))
                         out_base = col0
+                    else:
+                        destination = output_flat
                     if cutlass.const_expr(self.full_rotation_output_bf16):
-                        output_flat[out_base + Int32(0)] = cutlass.BFloat16(acc0)
-                        output_flat[out_base + Int32(1)] = cutlass.BFloat16(acc1)
-                        output_flat[out_base + Int32(2)] = cutlass.BFloat16(acc2)
-                        output_flat[out_base + Int32(3)] = cutlass.BFloat16(acc3)
+                        destination[out_base + Int32(0)] = cutlass.BFloat16(acc0)
+                        destination[out_base + Int32(1)] = cutlass.BFloat16(acc1)
+                        destination[out_base + Int32(2)] = cutlass.BFloat16(acc2)
+                        destination[out_base + Int32(3)] = cutlass.BFloat16(acc3)
                     else:
                         st_global_v4_f32(
-                            get_ptr_as_int64(output_flat, Int64(out_base)),
-                            acc0,
-                            acc1,
-                            acc2,
-                            acc3,
+                            get_ptr_as_int64(destination, Int64(out_base)),
+                            acc0, acc1, acc2, acc3,
                         )
             return
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
