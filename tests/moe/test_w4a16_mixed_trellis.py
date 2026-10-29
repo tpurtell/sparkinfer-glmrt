@@ -122,7 +122,7 @@ def test_mixed_aot_workspace_offsets_and_buffers_ignore_export_sms(monkeypatch, 
     plan = SimpleNamespace(
         workspace_sms=capacity, size_m=4096, top_k=2, hidden_size=128,
         intermediate_size=128, direct_topk_routes=True, moe_block_size=8,
-        max_m_blocks=8192, blocks_per_sm=1,
+        max_m_blocks=8192, blocks_per_sm=1, row_addresses=False,
         topk_sum=SimpleNamespace(full_rotation_output_dtype="bf16"),
     )
     buffers = [mixed_trellis_module._make_mixed_trellis_buffers(

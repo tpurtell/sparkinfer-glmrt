@@ -391,7 +391,7 @@ def ws_prerotate_default(wire: bool, activations: str, capability=None) -> bool:
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
-    WS_ABI_VERSION = 8
+    WS_ABI_VERSION = 9
 
     def __init__(
         self,
@@ -408,6 +408,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         activations: str = "a16",
         compact_weights: bool = False,
         prerotate: bool | None = None,
+        row_addresses: bool = False,
     ):
         super().__init__(driver=driver, tier0=tier0, tier1=tier1,
                          descriptor_bits=descriptor_bits, compact_weights=compact_weights)
@@ -420,6 +421,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         # producers stage the raw bytes in the A slot and widen them to the
         # FP16 the BF16 path gets from decode-then-convert (same values).
         self.ws_wire = input_format == "e4m3_k32"
+        if row_addresses and (activations != "a16" or prerotate):
+            raise ValueError("row-address WS requires A16 and in-tile input rotation")
+        self.row_addresses = bool(row_addresses)
         # Hoisted token-major FC1 input rotation (one launch ahead of FC1)
         # versus in-tile rotation by the FC1 producers. Bit-identical; None
         # resolves the measured hardware-class default (`ws_prerotate_default`).
@@ -427,6 +431,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             raise ValueError("hoisted WS prerotation needs BF16 input rows and A16 activations")
         self.ws_prerotate = (ws_prerotate_default(self.ws_wire, activations)
                              if prerotate is None else bool(prerotate))
+        if self.row_addresses:
+            self.ws_prerotate = False
         # Dynamic tile claims (a global counter in the zero-initialized
         # workspace, reset by the last CTA): the route blocks of one expert
         # start together, so the follower's weight reads hit L2 instead of
@@ -549,7 +555,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
-        return (
+        key = (
             "w4a16_mixed_trellis_ws",
             self.WS_ABI_VERSION,
             super().__cache_key__,
@@ -564,6 +570,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             self.ws_prerotate,
 
         )
+        return key + (("row_addresses",),) if self.row_addresses else key
 
     def _ws_set_phase(self, is_fc1: bool):
         """Trace-time geometry of the FC1 or FC2 launch (set before each is
@@ -679,6 +686,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             active_m.to(cutlass.Int64)
             * cutlass.Int64(self.ws_wire_row if self.ws_wire else self.hidden_size),
         )
+
+        if cutlass.const_expr(self.row_addresses):
+            rotation_input = flat(rotation_input_ptr, active_m.to(Int64))
 
         if cutlass.const_expr(self.ws_prerotate):
             global_to_combined = flat(global_to_combined_ptr, route_num_experts.to(Int64))
@@ -1328,6 +1338,18 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         return last
 
     @cute.jit
+    def _ws_input_row_base(self, a_src: cute.Tensor, row: Int32):
+        """Byte address of a token row; padded routes never dereference the table."""
+        address = Int64(-1)
+        if row >= Int32(0):
+            if cutlass.const_expr(self.row_addresses):
+                address = a_src[row].to(Int64)
+            else:
+                stride = self.ws_wire_row if self.ws_wire else 2 * self.hidden_size
+                address = get_ptr_as_int64(a_src, Int64(0)) + Int64(row) * Int64(stride)
+        return address
+
+    @cute.jit
     def _ws_load_rows(
         self,
         is_fc1: cutlass.Constexpr,
@@ -1337,22 +1359,26 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         rb: Int32,
         ptid: Int32,
         live: Int32,
+        a_src: cute.Tensor,
     ):
         """Source row element offsets of the rows this producer thread copies
         (rows ptid/16 + 8i): tokens for FC1, routes for FC2, -1 for padding."""
         if cutlass.const_expr((is_fc1 and self.ws_wire) or (not is_fc1 and self.ws_a8)):
-            self._ws_load_rows_wire(rows, packed_route_indices, rb, ptid, live, is_fc1)
+            self._ws_load_rows_wire(rows, packed_route_indices, rb, ptid, live, a_src, is_fc1)
         else:
             c_off = (ptid & Int32(15)) * Int32(8)
             for i in cutlass.range_constexpr(self.ws_m // 8):
                 r = (ptid >> Int32(4)) + Int32(8 * i)
                 idx = packed_route_indices[rb * Int32(self.ws_m) + r].to(Int32)
-                row_off = Int32(-1)
+                row_off = Int64(-1) if is_fc1 and self.row_addresses else Int32(-1)
                 if idx < live:
                     row_id = idx
                     if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
                         row_id = idx // Int32(self.top_k)
-                    row_off = row_id * Int32(k_size) + c_off
+                    if cutlass.const_expr(is_fc1 and self.row_addresses):
+                        row_off = self._ws_input_row_base(a_src, row_id) + Int64(c_off) * Int64(2)
+                    else:
+                        row_off = row_id * Int32(k_size) + c_off
                 rows[i] = row_off
 
     @cute.jit
@@ -1363,6 +1389,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         rb: Int32,
         ptid: Int32,
         live: Int32,
+        a_src: cute.Tensor,
         is_fc1: cutlass.Constexpr = True,
     ):
         """FC1 wire rows: token ids of the value rows this thread copies
@@ -1378,7 +1405,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     row_id = idx
                     if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
                         row_id = idx // Int32(self.top_k)
-            rows[i] = row_id
+            if cutlass.const_expr(is_fc1):
+                rows[i] = self._ws_input_row_base(a_src, row_id)
+            else:
+                rows[i] = row_id
 
     @cute.jit
     def _ws_issue_a_wire(
@@ -1400,21 +1430,20 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             r = (ptid >> Int32(3)) + Int32(16 * i)
             row_id = rows[i]
             src = (
-                Int64(row_id) * Int64(self.ws_wire_row)
-                + Int64(kblock) * Int64(128)
+                row_id + Int64(kblock) * Int64(128)
                 + Int64(c) * Int64(16)
             )
             if row_id < Int32(0):
                 src = Int64(0)
             if cutlass.const_expr("a_l2" in self.ws_exp):
-                src = Int64(kblock) * Int64(128) + Int64(c) * Int64(16)
+                src = get_ptr_as_int64(a_src, Int64(0)) + Int64(kblock) * Int64(128) + Int64(c) * Int64(16)
             cp_async4_shared_global_pred(
                 a_slot + r * Int32(256) + Int32(128) + c * Int32(16),
-                get_ptr_as_int64(a_src, src),
-                (row_id >= Int32(0)).to(Int32),
+                src,
+                (row_id >= Int64(0)).to(Int32),
             )
         row_id = rows[self.ws_m // 16]
-        src = Int64(row_id) * Int64(self.ws_wire_row) + Int64(self.hidden_size) + Int64(kblock) * Int64(4)
+        src = row_id + Int64(self.hidden_size) + Int64(kblock) * Int64(4)
         if row_id < Int32(0):
             src = Int64(0)
         if cutlass.const_expr(self.ws_a8):
@@ -1423,13 +1452,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             if ptid < Int32(self.ws_m):
                 _cp_async_u32_pred(
                     a_slot + ptid * Int32(256) + Int32(124),
-                    get_ptr_as_int64(a_src, src),
+                    src,
                     (row_id >= Int32(0)).to(Int32),
                 )
         else:
             _cp_async_u32_pred(
                 a_slot + ptid * Int32(256) + Int32(124),
-                get_ptr_as_int64(a_src, src),
+                src,
                 (row_id >= Int32(0)).to(Int32),
             )
         _cp_async_mbar_arrive_noinc(bar)
@@ -1537,7 +1566,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         elif cutlass.const_expr(not is_fc1 and self.ws_a8):
             self._ws_issue_a8(k_size, a_src, rows, base, slot, kblock, ptid, bar)
         else:
-            self._ws_issue_a(k_size, a_src, rows, base, slot, kblock, ptid, bar)
+            self._ws_issue_a(k_size, a_src, rows, base, slot, kblock, ptid, bar,
+                             is_fc1 and self.row_addresses)
 
     @cute.jit
     def _ws_issue_a8(
@@ -1579,6 +1609,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         kblock: Int32,
         ptid: Int32,
         bar: Int32,
+        row_addresses: cutlass.Constexpr = False,
     ):
         """cp.async one 128-wide K block of the tile's rows into an A slot
         (row r at r * 256 bytes; 16-byte chunk c at (c & 8) | ((c ^ r) & 7)),
@@ -1594,6 +1625,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             if row_off >= Int32(0):
                 dst = dst_base + Int32(2048 * i)
                 src_addr = a_src_base + Int64(row_off) * Int64(2)
+                if cutlass.const_expr(row_addresses):
+                    src_addr = row_off + Int64(kblock) * Int64(256)
                 if cutlass.const_expr("a_l2" in self.ws_exp):
                     src_addr = a_src_base + Int64(c * Int32(16))
                 cp_async4_shared_global(
@@ -1861,7 +1894,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             clast = self._ws_last_block(block_expert_ids, _crb, route_blocks)
 
         # Input-row cursor and prologue.
-        rows = cute.make_rmem_tensor((self.ws_m // 8,), Int32)
+        rows = cute.make_rmem_tensor((self.ws_m // 8,),
+            Int64 if is_fc1 and (self.row_addresses or self.ws_wire) else Int32)
         ja, nclaimed, at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_claim(
             is_fc1, Int32(0), nclaimed, *claim, *meta
         )
@@ -1869,7 +1903,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         ab = Int32(0)
         prev_arb = Int32(-1)
         if at < total_tiles:
-            self._ws_load_rows(is_fc1, k_size, rows, packed_route_indices, arb, ptid, live)
+            self._ws_load_rows(is_fc1, k_size, rows, packed_route_indices, arb, ptid, live, a_src)
             prev_arb = arb
         a_issued = Int32(0)
         for i in cutlass.range_constexpr(na):
@@ -1889,7 +1923,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     if at < total_tiles:
                         a_blocks = self._ws_live_k(is_fc1, _acomb, descriptor_map, total_experts) // Int32(128)
                         if arb != prev_arb:
-                            self._ws_load_rows(is_fc1, k_size, rows, packed_route_indices, arb, ptid, live)
+                            self._ws_load_rows(is_fc1, k_size, rows, packed_route_indices, arb, ptid, live, a_src)
                             prev_arb = arb
 
         # Block cursor.
@@ -1981,7 +2015,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                 a_blocks = self._ws_live_k(is_fc1, _acomb, descriptor_map, total_experts) // Int32(128)
                                 if arb != prev_arb:
                                     self._ws_load_rows(
-                                        is_fc1, k_size, rows, packed_route_indices, arb, ptid, live
+                                        is_fc1, k_size, rows, packed_route_indices, arb, ptid, live, a_src
                                     )
                                     prev_arb = arb
                     for _u in cutlass.range_constexpr(2):
