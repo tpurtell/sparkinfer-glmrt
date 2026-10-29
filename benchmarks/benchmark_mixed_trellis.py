@@ -1004,8 +1004,9 @@ def _run_prefill_benchmark(args, device, props):
         raise ValueError("prefill capacity must be 1..4096")
     if (props.major, props.minor) != (12, 1):
         raise ValueError("prefill policy gate requires SM121")
-    if args.rounds < 3 or args.layers < 2 or args.replays < 1:
-        raise ValueError("prefill gate requires >=3 rounds, >=2 cold layers and positive replays")
+    minimum_layers = 1 if args.correctness_only else 2
+    if args.rounds < 3 or args.layers < minimum_layers or args.replays < 1:
+        raise ValueError(f"prefill gate requires >=3 rounds, >={minimum_layers} cold layers and positive replays")
     specs = args.prefill_arm or [parse_prefill_arm(v) for v in (
         ("coop:32:cooperative", "ws:32:ws") if args.prefill_family == "qwen4"
         else ("coop8:8:cooperative", "coop16:16:cooperative", "ws16:16:ws"))]

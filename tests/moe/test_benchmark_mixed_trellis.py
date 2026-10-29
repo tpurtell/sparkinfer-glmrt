@@ -95,6 +95,24 @@ def test_prefill_arm_rejects_invalid(value):
         bench.parse_prefill_arm(value)
 
 
+@pytest.mark.parametrize("correctness_only,layers,accepted", [
+    (False, 1, False), (False, 2, True), (True, 1, True), (True, 0, False),
+])
+def test_prefill_single_layer_is_correctness_only(correctness_only, layers, accepted):
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    args = bench.benchmark_parser().parse_args([
+        "--prefill-family", "dsv4p", "--capacities", "2752", "--layers", str(layers),
+        "--rounds", "3", "--replays", "1",
+        *(["--correctness-only"] if correctness_only else []),
+    ])
+    # Stop immediately after the layer gate; no CUDA work or fixture allocation.
+    args.prefill_arm = [("duplicate", 8, "cooperative")] * 2
+    props = SimpleNamespace(major=12, minor=1)
+    with pytest.raises(ValueError, match="uniquely named arms" if accepted else "cold layers"):
+        bench._run_prefill_benchmark(args, None, props)
+
+
 def test_prefill_policy_separates_route_block_from_ws():
     from types import SimpleNamespace
     bench = _load_benchmark_module()
