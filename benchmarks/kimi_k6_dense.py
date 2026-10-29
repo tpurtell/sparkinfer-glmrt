@@ -348,7 +348,7 @@ def benchmark_glmf_duel(args):
     report = dict(metadata=dict(device=props.name, sms=props.multi_processor_count,
         l2_bytes=l2, argv=sys.argv, snapshot_before=snapshot(), bits=6,
         input_dtype=args.input_dtype, codebook=args.codebook, exact_row_cap=129,
-        ratio="baseline/candidate", cache="2x runtime L2 eviction, outside timing"), records=[])
+        ratio="baseline/candidate", cache="32 in-graph cold units, 2x runtime L2 eviction outside each timed interval"), records=[])
     torch.manual_seed(273)
     for k, n, side in shapes:
         directory = args.output_dir / f"k{k}_n{n}_s{side}_{args.codebook}_{args.input_dtype}"
@@ -417,15 +417,28 @@ def benchmark_glmf_duel(args):
                 if not torch.equal(saved.view(torch.int32), outputs[name][:n].view(torch.int32)):
                     raise RuntimeError(f"row invariance failure: {name} rows={rows}")
                 graphs[name].replay()
+            timing_graphs = {}
+            for name in libs:
+                pairs = [(torch.cuda.Event(enable_timing=True, external=True),
+                          torch.cuda.Event(enable_timing=True, external=True)) for _ in range(32)]
+                timed = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(timed):
+                    for start, end in pairs:
+                        flush.zero_()
+                        start.record()
+                        call(name)
+                        end.record()
+                timing_graphs[name] = timed
+                events[name] = pairs
+                timed.replay()
+            torch.cuda.synchronize()
             samples = {name: [] for name in libs}
             for repeat in range(args.samples):
                 order = list(libs) if repeat % 2 == 0 else list(reversed(libs))
                 for name in order:
-                    flush.zero_()
-                    start, end = events[name]
-                    graphs[name].replay()
-                    end.synchronize()
-                    samples[name].append(start.elapsed_time(end)*1000)
+                    timing_graphs[name].replay()
+                    events[name][-1][1].synchronize()
+                    samples[name].append(statistics.mean(start.elapsed_time(end)*1000 for start, end in events[name]))
             times = {name: statistics.median(v) for name, v in samples.items()}
             for name in libs:
                 record = dict(k=k, n=n, side=side, splits=splits, rows=rows, variant=name,
