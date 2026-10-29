@@ -420,8 +420,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tile_fc1, tile_fc2 = (int(v) for v in ws_tile_n)
         if compact_weights and (tile_fc1 not in (128, 192) or activations != "a16"):
             raise ValueError("compact WS requires 128/192-wide FC1 N tiles and A16 activations")
-        if tile_fc1 not in (128, 192, 256) or tile_fc2 not in (128, 192, 256):
-            raise ValueError("warp-specialized mixed Trellis needs 128/192/256-wide N tiles")
+        if tile_fc1 not in (128, 192, 256, 512) or tile_fc2 not in (128, 192, 256, 512):
+            raise ValueError("warp-specialized mixed Trellis needs 128/192/256/512-wide N tiles")
         if int(d.fc1.tile_k) != 64 or int(d.fc2.tile_k) != 64:
             # The accumulation chains reproduce the cooperative K64 tile's
             # two K-split warp rows.
@@ -440,22 +440,25 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.ws_m = block
         self.ws_mb = block // 16
         self.ws_tiles = (tile_fc1, tile_fc2)
-        self._ws_set_phase(True)
         self.ws_bits = (int(tier0.trellis_bits), int(tier1.trellis_bits))
         self.ws_max_bits = max(self.ws_bits)
         # Shared layout (bytes): A ring (block rows x 128 K, rows at 256-byte
         # stride), compressed-weight ring (four K16 rows x N at the widest
-        # tier), tile-metadata ring, mbarriers.
+        # tier), tile-metadata ring, mbarriers. FC1 and FC2 are separate
+        # launches with separate N tiles, so each phase sizes its own weight
+        # ring (a 512-wide FC1 tile holds half as many stages as a 256-wide
+        # FC2 tile in the same budget); the kernel allocates the larger.
         self.ws_a_slot = block * 256
-        self.ws_bc_slot = 4 * (max(self.ws_tiles) // 16) * 32 * self.ws_max_bits
         self.ws_tile_slot = 4 * (_TILE_HEADER_WORDS + block)
         self.ws_a8 = activations == "a8"
         self.ws_s_slot = 4 * block if self.ws_a8 else 0
+        if self.ws_a8 and any(tile_n > 256 for tile_n in self.ws_tiles):
+            # The A8 K loop decodes two N16 records per warp (its int8 chains
+            # are indexed by that pair); keep it on tiles of at most 256.
+            raise ValueError("warp-specialized A8 mixed Trellis needs N tiles of at most 256")
 
         fixed = _TILE_STAGES * (self.ws_tile_slot + 2 * _BARRIER_BYTES) + 4 * _CLAIM_SLOTS
         budget = int(max_shared_mem) - 1024 - fixed
-        a_stages = 2
-        bc_stages = 0
         # input_stages forces the input-row ring depth (weight ring >= 2).
         # GB10 gathers input rows from LPDDR at high latency: four stages cut
         # GLM 5.3 TP4 width-512 FC1 at 2752 rows 7.75 -> 6.93 ms (bit-identical).
@@ -463,42 +466,15 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         forced_a = int(os.environ.get("B12X_WS_A_STAGES", "0")) or int(input_stages or 0)
         if forced_a not in (0, 2, 3, 4, 5, 6):
             raise ValueError(f"warp-specialized input stages must be 2..6, got {forced_a}")
-        for candidate_a in ((forced_a,) if forced_a else (3, 2)):
-            rest = budget - candidate_a * (self.ws_a_slot + self.ws_s_slot + 3 * _BARRIER_BYTES)
-
-            candidate_bc = (
-                min(_MAX_BC_STAGES, rest // (self.ws_bc_slot + 2 * _BARRIER_BYTES))
-                if rest > 0
-                else 0
-            )
-            if candidate_bc >= 4 or ((candidate_a == 2 or forced_a) and candidate_bc >= 2):
-                a_stages, bc_stages = candidate_a, candidate_bc
-                break
-        if bc_stages < 2:
-            raise ValueError(
-                "warp-specialized mixed Trellis rings exceed shared memory: "
-                f"block={block} tiles={self.ws_tiles} bits={self.ws_bits}"
-            )
-        self.ws_a_stages = a_stages
-        self.ws_bc_stages = bc_stages
-        self.ws_a_off = 0
-        self.ws_bc_off = self.ws_a_off + a_stages * self.ws_a_slot
-        self.ws_s_off = self.ws_bc_off + bc_stages * self.ws_bc_slot
-        self.ws_tile_off = self.ws_s_off + a_stages * self.ws_s_slot
-        bar = self.ws_tile_off + _TILE_STAGES * self.ws_tile_slot
-        self.ws_bar_a_raw = bar
-        self.ws_bar_a_full = self.ws_bar_a_raw + a_stages * _BARRIER_BYTES
-        self.ws_bar_a_empty = self.ws_bar_a_full + a_stages * _BARRIER_BYTES
-        self.ws_bar_bc_full = self.ws_bar_a_empty + a_stages * _BARRIER_BYTES
-        self.ws_bar_bc_empty = self.ws_bar_bc_full + bc_stages * _BARRIER_BYTES
-        self.ws_bar_t_full = self.ws_bar_bc_empty + bc_stages * _BARRIER_BYTES
-        self.ws_bar_t_empty = self.ws_bar_t_full + _TILE_STAGES * _BARRIER_BYTES
-        self.ws_claim_off = self.ws_bar_t_empty + _TILE_STAGES * _BARRIER_BYTES
-        self.ws_smem_bytes = self.ws_claim_off + 4 * _CLAIM_SLOTS
-        if self.ws_smem_bytes > int(max_shared_mem):
+        self.ws_rings = tuple(
+            self._ws_ring_plan(tile_n, budget, forced_a, block) for tile_n in self.ws_tiles
+        )
+        self.ws_smem_max = max(plan["smem_bytes"] for plan in self.ws_rings)
+        if self.ws_smem_max > int(max_shared_mem):
             raise ValueError("warp-specialized mixed Trellis shared layout exceeds the device limit")
+        self._ws_set_phase(True)
         self.blocks_per_sm = 1
-        self.shared_words = (self.ws_smem_bytes + 3) // 4
+        self.shared_words = (self.ws_smem_max + 3) // 4
         self.ws_act_ctas_per_sm = 8
 
         # Timing probes only (wrong numerics): nodecode, nomma, norot; a_l2
@@ -513,8 +489,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             "w4a16_mixed_trellis_ws",
             self.WS_ABI_VERSION,
             super().__cache_key__,
-            self.ws_a_stages,
-            self.ws_bc_stages,
+            tuple((plan["a_stages"], plan["bc_stages"]) for plan in self.ws_rings),
             tuple(sorted(self.ws_exp)),
 
             self.ws_wire,
@@ -524,19 +499,84 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
 
         )
 
+    def _ws_ring_plan(self, tile_n: int, budget: int, forced_a: int, block: int):
+        """Ring depths and shared offsets for one launch's N tile."""
+        bc_slot = 4 * (tile_n // 16) * 32 * self.ws_max_bits
+        a_stages = 2
+        bc_stages = 0
+        for candidate_a in ((forced_a,) if forced_a else (3, 2)):
+            rest = budget - candidate_a * (self.ws_a_slot + self.ws_s_slot + 3 * _BARRIER_BYTES)
+            candidate_bc = (
+                min(_MAX_BC_STAGES, rest // (bc_slot + 2 * _BARRIER_BYTES))
+                if rest > 0
+                else 0
+            )
+            if candidate_bc >= 4 or ((candidate_a == 2 or forced_a) and candidate_bc >= 2):
+                a_stages, bc_stages = candidate_a, candidate_bc
+                break
+        if bc_stages < 2:
+            raise ValueError(
+                "warp-specialized mixed Trellis rings exceed shared memory: "
+                f"block={block} tile_n={tile_n} bits={self.ws_bits}"
+            )
+        plan = dict(a_stages=a_stages, bc_stages=bc_stages, bc_slot=bc_slot, a_off=0)
+        plan["bc_off"] = plan["a_off"] + a_stages * self.ws_a_slot
+        plan["s_off"] = plan["bc_off"] + bc_stages * bc_slot
+        plan["tile_off"] = plan["s_off"] + a_stages * self.ws_s_slot
+        bar = plan["tile_off"] + _TILE_STAGES * self.ws_tile_slot
+        plan["bar_a_raw"] = bar
+        plan["bar_a_full"] = plan["bar_a_raw"] + a_stages * _BARRIER_BYTES
+        plan["bar_a_empty"] = plan["bar_a_full"] + a_stages * _BARRIER_BYTES
+        plan["bar_bc_full"] = plan["bar_a_empty"] + a_stages * _BARRIER_BYTES
+        plan["bar_bc_empty"] = plan["bar_bc_full"] + bc_stages * _BARRIER_BYTES
+        plan["bar_t_full"] = plan["bar_bc_empty"] + bc_stages * _BARRIER_BYTES
+        plan["bar_t_empty"] = plan["bar_t_full"] + _TILE_STAGES * _BARRIER_BYTES
+        plan["claim_off"] = plan["bar_t_empty"] + _TILE_STAGES * _BARRIER_BYTES
+        plan["smem_bytes"] = plan["claim_off"] + 4 * _CLAIM_SLOTS
+        return plan
+
     def _ws_set_phase(self, is_fc1: bool):
         """Trace-time geometry of the FC1 or FC2 launch (set before each is
         traced): N tile, consumer warps and the CTA thread layout. Producers
         start at a warpgroup boundary, so 192-wide tiles pad the consumers with
-        two idle warps (setmaxnreg is per warpgroup)."""
-        tile_n = self.ws_tiles[0 if is_fc1 else 1]
+        two idle warps (setmaxnreg is per warpgroup).
+
+        A warp owns ``ws_cols`` N16 records: 32 columns on 128/192/256-wide
+        tiles (one thread per column) and 64 columns on 512-wide tiles, where
+        one-thread-per-column would need 512 consumers and exceed the
+        register file. Widening the tile halves the number of tiles -- and so
+        the number of A gathers, input rotations and tile handoffs -- for the
+        same MMA work."""
+        phase = 0 if is_fc1 else 1
+        tile_n = self.ws_tiles[phase]
+        plan = self.ws_rings[phase]
         self.ws_n = tile_n
         self.ws_n16 = tile_n // 16
-        self.ws_consumer_warps = tile_n // 32
-        self.ws_consumer_threads = tile_n
-        self.ws_consumer_slots = 256 if tile_n == 192 else tile_n
+        self.ws_cols = 2 if tile_n <= 256 else 4
+        self.ws_consumer_warps = self.ws_n16 // self.ws_cols
+        self.ws_consumer_threads = self.ws_consumer_warps * 32
+        self.ws_consumer_slots = 256 if tile_n == 192 else self.ws_consumer_threads
         self.ws_threads = self.ws_consumer_slots + _PRODUCER_THREADS
+        if self.ws_threads > 1024:
+            raise ValueError("warp-specialized mixed Trellis CTA exceeds 1024 threads")
         self.ws_setmaxnreg = self.ws_threads > 256
+        self.ws_a_stages = plan["a_stages"]
+        self.ws_bc_stages = plan["bc_stages"]
+        self.ws_bc_slot = plan["bc_slot"]
+        self.ws_a_off = plan["a_off"]
+        self.ws_bc_off = plan["bc_off"]
+        self.ws_s_off = plan["s_off"]
+        self.ws_tile_off = plan["tile_off"]
+        self.ws_bar_a_raw = plan["bar_a_raw"]
+        self.ws_bar_a_full = plan["bar_a_full"]
+        self.ws_bar_a_empty = plan["bar_a_empty"]
+        self.ws_bar_bc_full = plan["bar_bc_full"]
+        self.ws_bar_bc_empty = plan["bar_bc_empty"]
+        self.ws_bar_t_full = plan["bar_t_full"]
+        self.ws_bar_t_empty = plan["bar_t_empty"]
+        self.ws_claim_off = plan["claim_off"]
+        self.ws_smem_bytes = plan["smem_bytes"]
+        self.shared_words = (self.ws_smem_bytes + 3) // 4
 
     # ------------------------------------------------------------------
     # Host entry: same ABI as the cooperative mixed kernel.
@@ -2037,9 +2077,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 if cutlass.const_expr(is_fc1):
                     gemm = (self.tier0, self.tier1)[tier_idx].fc1
                 b_regs = []
-                for jj in cutlass.range_constexpr(2):
+                for jj in cutlass.range_constexpr(self.ws_cols):
                     wa, wb = self._ws_windows(
-                        gemm, row_addr, cw * Int32(2) + Int32(jj), lane, bits
+                        gemm, row_addr, cw * Int32(self.ws_cols) + Int32(jj), lane, bits
                     )
                     frag = cute.make_rmem_tensor((2, 2), Uint32)
                     if cutlass.const_expr("nodecode" in self.ws_exp):
@@ -2058,10 +2098,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     c = Int32(2 * q) + lchunk
                     pos = (c & Int32(8)) | ((c & Int32(7)) ^ (row & Int32(7)))
                     a_regs.append(ldmatrix_m8n8x4_b16(a_base + row * Int32(256) + pos * Int32(16)))
-                for jj in cutlass.range_constexpr(0 if "nomma" in self.ws_exp else 2):
+                for jj in cutlass.range_constexpr(0 if "nomma" in self.ws_exp else self.ws_cols):
                     for mb in cutlass.range_constexpr(active):
                         for h in cutlass.range_constexpr(2):
-                            o = (((chain * mb_count + mb) * 2 + jj) * 2 + h) * 4
+                            o = (((chain * mb_count + mb) * self.ws_cols + jj) * 2 + h) * 4
                             d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
                                 acc[o][0],
                                 acc[o + 1][0],
@@ -2240,52 +2280,55 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         b0 = q & Int32(1)
         b1 = q >> Int32(1)
         mb_count = self.ws_mb
-        col = nt * Int32(self.ws_n) + cw * Int32(32) + Int32(8) * q
-        col_valid = Int32(1)
-        if cutlass.const_expr(self.compact_weights and self.ws_n == 192):
-            half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
-            live_n = ld_shared_i32_relaxed(hdr + Int32(24))
-            local_col = (nt % Int32(half_tiles)) * Int32(self.ws_n) + cw * Int32(32) + Int32(8) * q
-            if cutlass.const_expr(n_total % (2 * self.ws_n) != 0):
-                col = (nt // Int32(half_tiles)) * Int32(n_total // 2) + local_col
-            col_valid = (local_col < live_n).to(Int32)
-        for mb in cutlass.range_constexpr(active):
-            for rh in cutlass.range_constexpr(2):
-                row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
-                w = []
-                for jj in cutlass.range_constexpr(2):
-                    for h in cutlass.range_constexpr(2):
-                        o0 = (((0 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
-                        o1 = (((1 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
-                        v0 = acc[o0][0] + acc[o1][0]
-                        v1 = acc[o0 + 1][0] + acc[o1 + 1][0]
-                        w.append(Int32(pack_f32x2_to_f16x2(v0 * scale, v1 * scale)))
-                # Stage 1 (xor 2): words 2,3 of lanes 0,1 <-> words 0,1 of lanes 2,3.
-                t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[0], w[2]), offset=2)
-                t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[1], w[3]), offset=2)
-                w[2] = cutlass.select_(b1 != Int32(0), w[2], t0)
-                w[3] = cutlass.select_(b1 != Int32(0), w[3], t1)
-                w[0] = cutlass.select_(b1 != Int32(0), t0, w[0])
-                w[1] = cutlass.select_(b1 != Int32(0), t1, w[1])
-                # Stage 2 (xor 1): words 1,3 of even lanes <-> words 0,2 of odd lanes.
-                t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[0], w[1]), offset=1)
-                t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[2], w[3]), offset=1)
-                w[1] = cutlass.select_(b0 != Int32(0), w[1], t0)
-                w[3] = cutlass.select_(b0 != Int32(0), w[3], t1)
-                w[0] = cutlass.select_(b0 != Int32(0), t0, w[0])
-                w[2] = cutlass.select_(b0 != Int32(0), t1, w[2])
-                if row < valid and col_valid != Int32(0):
-                    route = ld_shared_i32_relaxed(
-                        hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
-                    )
-                    if cutlass.const_expr("nostore" not in self.ws_exp):
-                        st_global_v4_u32(
-                            get_ptr_as_int64(c_out, Int64(route) * Int64(n_total) + Int64(col)),
-                            Uint32(w[0]),
-                            Uint32(w[1]),
-                            Uint32(w[2]),
-                            Uint32(w[3]),
+        for jh in cutlass.range_constexpr(self.ws_cols // 2):
+            col = (nt * Int32(self.ws_n) + cw * Int32(16 * self.ws_cols)
+                   + Int32(32 * jh) + Int32(8) * q)
+            col_valid = Int32(1)
+            if cutlass.const_expr(self.compact_weights and self.ws_n == 192):
+                half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
+                live_n = ld_shared_i32_relaxed(hdr + Int32(24))
+                local_col = ((nt % Int32(half_tiles)) * Int32(self.ws_n)
+                             + cw * Int32(16 * self.ws_cols) + Int32(32 * jh) + Int32(8) * q)
+                if cutlass.const_expr(n_total % (2 * self.ws_n) != 0):
+                    col = (nt // Int32(half_tiles)) * Int32(n_total // 2) + local_col
+                col_valid = (local_col < live_n).to(Int32)
+            for mb in cutlass.range_constexpr(active):
+                for rh in cutlass.range_constexpr(2):
+                    row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
+                    w = []
+                    for jj in cutlass.range_constexpr(2):
+                        for h in cutlass.range_constexpr(2):
+                            o0 = (((0 * mb_count + mb) * self.ws_cols + 2 * jh + jj) * 2 + h) * 4 + 2 * rh
+                            o1 = (((1 * mb_count + mb) * self.ws_cols + 2 * jh + jj) * 2 + h) * 4 + 2 * rh
+                            v0 = acc[o0][0] + acc[o1][0]
+                            v1 = acc[o0 + 1][0] + acc[o1 + 1][0]
+                            w.append(Int32(pack_f32x2_to_f16x2(v0 * scale, v1 * scale)))
+                    # Stage 1 (xor 2): words 2,3 of lanes 0,1 <-> words 0,1 of lanes 2,3.
+                    t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[0], w[2]), offset=2)
+                    t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[1], w[3]), offset=2)
+                    w[2] = cutlass.select_(b1 != Int32(0), w[2], t0)
+                    w[3] = cutlass.select_(b1 != Int32(0), w[3], t1)
+                    w[0] = cutlass.select_(b1 != Int32(0), t0, w[0])
+                    w[1] = cutlass.select_(b1 != Int32(0), t1, w[1])
+                    # Stage 2 (xor 1): words 1,3 of even lanes <-> words 0,2 of odd lanes.
+                    t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[0], w[1]), offset=1)
+                    t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[2], w[3]), offset=1)
+                    w[1] = cutlass.select_(b0 != Int32(0), w[1], t0)
+                    w[3] = cutlass.select_(b0 != Int32(0), w[3], t1)
+                    w[0] = cutlass.select_(b0 != Int32(0), t0, w[0])
+                    w[2] = cutlass.select_(b0 != Int32(0), t1, w[2])
+                    if row < valid and col_valid != Int32(0):
+                        route = ld_shared_i32_relaxed(
+                            hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
                         )
+                        if cutlass.const_expr("nostore" not in self.ws_exp):
+                            st_global_v4_u32(
+                                get_ptr_as_int64(c_out, Int64(route) * Int64(n_total) + Int64(col)),
+                                Uint32(w[0]),
+                                Uint32(w[1]),
+                                Uint32(w[2]),
+                                Uint32(w[3]),
+                            )
 
     @cute.jit
     def _ws_consumer(
@@ -2298,7 +2341,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tid: Int32,
         c_out: cute.Tensor,
     ):
-        n_acc = 2 * self.ws_mb * 2 * 2 * 4
+        n_acc = 2 * self.ws_mb * self.ws_cols * 2 * 4
         iacc = []
         if cutlass.const_expr(self.ws_a8):
             n_acc = self.ws_mb * 2 * 2 * 4
