@@ -105,7 +105,7 @@ def compile_glm_norm_aot(g: GLMGeometry = GLM53) -> AotProgram:
     )
     return compile_program(
         launch, name="glm_norm", operands=operands, scalars=(Scalar("rows"), Scalar("deltas")),
-        key=(h, g.norm_eps), geometry={"hidden": h, "eps": g.norm_eps}, doc=__doc__,
+        key=(h, g.norm_eps), geometry={"hidden": h, "eps": g.norm_eps, "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
 
 
@@ -265,7 +265,7 @@ def _compile_glm_ffn_tensor_w8(g: GLMGeometry, inter: int, max_rows: int) -> Aot
     return compile_program(
         launch, name="glm_ffn", operands=operands, scalars=(Scalar("rows"),),
         key=(int(max_rows), "tensor", launch.key()),
-        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": "tensor", "mode": "prefill"},
+        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": "tensor", "mode": "prefill", "exact_row_cap": 2**31 - 1},
         scratch={"scratch": launch.scratch_bytes},
         doc=__doc__,
     )
@@ -359,6 +359,6 @@ def compile_glm_expert_input_quant_aot(g: GLMGeometry = GLM53) -> AotProgram:
                   Operand("scale_rows_ptr", torch.uint8, "values_ptr + H", "out"),
                   Operand("scale_mma_ptr", torch.uint8, "unused", "in")),
         scalars=(Scalar("m"), Scalar("grid_x")),
-        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4},
+        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4, "exact_row_cap": 2**31 - 1},
         doc=__doc__,
     )

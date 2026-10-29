@@ -242,6 +242,6 @@ def compile_dsv4_expert_input_quant_aot(geometry: DSV4Geometry = FLASH) -> AotPr
                   Operand("scale_rows_ptr", torch.uint8, "values_ptr + H", "out"),
                   Operand("scale_mma_ptr", torch.uint8, "unused", "in")),
         scalars=(Scalar("m"), Scalar("grid_x")),
-        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4},
+        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4, "exact_row_cap": 2**31 - 1},
         doc=__doc__,
     )
