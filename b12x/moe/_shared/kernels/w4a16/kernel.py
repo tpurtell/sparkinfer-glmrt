@@ -80,6 +80,7 @@ from b12x._lib.intrinsics import (
     red_add_global_release_i32,
     red_max_global_f32_nonnegative,
     shared_ptr_to_u32,
+    st_global_v2_u32,
     st_global_v4_u32,
     st_global_i32,
     st_global_f32,
@@ -8397,6 +8398,178 @@ class W4A16FusedMoeKernel:
             unit += gw_stride
 
     @cute.jit
+    def _run_activation_ws_chunked(
+        self,
+        fc1_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        rot_scales_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        expert_map_flat: cute.Tensor,
+        weight_num_experts: Int32,
+        route_num_experts: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        if cutlass.const_expr(
+            self.direct_topk_routes or self.activation_output_a8 or not self.is_fp16
+        ):
+            self._run_activation_compact(
+                fc1_bf16_flat,
+                activated_bf16_flat,
+                rot_scales_flat,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                expert_map_flat,
+                weight_num_experts,
+                route_num_experts,
+                tid,
+                cta,
+                grid_x,
+                active_m,
+            )
+        else:
+            lane = tid & Int32(31)
+            warp_in_cta = tid >> Int32(5)
+            warps_per_cta = Int32(self.cta_threads // 32)
+            nblk = Int32(self.intermediate_size // 128)
+            live_routes = active_m * Int32(self.top_k)
+            route_count = packed_route_count[Int32(0)].to(Int32)
+            fc1_cols = Int32(self.fc1_cols)
+            isz = Int32(self.intermediate_size)
+            rot_row = Int32(3 * self.intermediate_size)
+            gwarp = cta * warps_per_cta + warp_in_cta
+            gw_stride = grid_x * warps_per_cta
+            rows_per_unit = 4
+            chunks_per_rb = self.moe_block_size // rows_per_unit
+            rb_count = route_count // Int32(self.moe_block_size)
+            units_per_rb = Int32(chunks_per_rb) * nblk
+            total_units = rb_count * units_per_rb
+            elem = lane * Int32(4)
+            unit = gwarp
+            while unit < total_units:
+                rb = unit // units_per_rb
+                rem = unit - rb * units_per_rb
+                chunk = rem // nblk
+                blk = rem - chunk * nblk
+                base_pos = rb * Int32(self.moe_block_size) + chunk * Int32(rows_per_unit)
+                row0 = packed_route_indices[base_pos].to(Int32)
+                expert = block_expert_ids[rb].to(Int32)
+                if (
+                    row0 >= Int32(0)
+                    and row0 < live_routes
+                    and expert >= Int32(0)
+                    and expert < weight_num_experts
+                ):
+                    col0 = blk * Int32(128) + elem
+                    s_base = expert * rot_row + col0
+                    down = isz + isz
+                    svg_01, svg_23 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(rot_scales_flat, Int64(s_base))
+                    )
+                    svu_01, svu_23 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(rot_scales_flat, Int64(s_base + isz))
+                    )
+                    sd_01, sd_23 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(rot_scales_flat, Int64(s_base + down))
+                    )
+                    svg0, svg1 = f16x2_to_f32x2(svg_01)
+                    svg2, svg3 = f16x2_to_f32x2(svg_23)
+                    svu0, svu1 = f16x2_to_f32x2(svu_01)
+                    svu2, svu3 = f16x2_to_f32x2(svu_23)
+                    sd0, sd1 = f16x2_to_f32x2(sd_01)
+                    sd2, sd3 = f16x2_to_f32x2(sd_23)
+                    for r_idx in cutlass.range_constexpr(rows_per_unit):
+                        row = row0
+                        if cutlass.const_expr(r_idx > 0):
+                            row = packed_route_indices[base_pos + Int32(r_idx)].to(Int32)
+                        if cutlass.const_expr(r_idx == 0) or (
+                            row >= Int32(0) and row < live_routes
+                        ):
+                            g_base = row * fc1_cols + col0
+                            u_base = g_base + isz
+                            gp01, gp23 = ld_global_nc_v2_u32(
+                                get_ptr_as_int64(fc1_bf16_flat, Int64(g_base))
+                            )
+                            up01, up23 = ld_global_nc_v2_u32(
+                                get_ptr_as_int64(fc1_bf16_flat, Int64(u_base))
+                            )
+                            g0, g1 = f16x2_to_f32x2(gp01)
+                            g2, g3 = f16x2_to_f32x2(gp23)
+                            u0, u1 = f16x2_to_f32x2(up01)
+                            u2, u3 = f16x2_to_f32x2(up23)
+                            gh0, gh1, gh2, gh3 = self._had128_quad(
+                                g0, g1, g2, g3, lane
+                            )
+                            uh0, uh1, uh2, uh3 = self._had128_quad(
+                                u0, u1, u2, u3, lane
+                            )
+                            ig0 = gh0 * svg0
+                            ig1 = gh1 * svg1
+                            ig2 = gh2 * svg2
+                            ig3 = gh3 * svg3
+                            iu0 = uh0 * svu0
+                            iu1 = uh1 * svu1
+                            iu2 = uh2 * svu2
+                            iu3 = uh3 * svu3
+                            ig0, iu0 = self._clamp_swiglu_inputs(ig0, iu0)
+                            ig1, iu1 = self._clamp_swiglu_inputs(ig1, iu1)
+                            ig2, iu2 = self._clamp_swiglu_inputs(ig2, iu2)
+                            ig3, iu3 = self._clamp_swiglu_inputs(ig3, iu3)
+                            if cutlass.const_expr(self.activation_is_situ):
+                                beta = cutlass.Float32(SITU_DEFAULT_BETA)
+                                linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+                                a0 = (
+                                    beta
+                                    * cute.math.tanh(ig0 / beta, fastmath=self.fast_math)
+                                    * self._sigmoid_f32(ig0)
+                                    * linear_beta
+                                    * cute.math.tanh(iu0 / linear_beta, fastmath=self.fast_math)
+                                    * sd0
+                                )
+                                a1 = (
+                                    beta
+                                    * cute.math.tanh(ig1 / beta, fastmath=self.fast_math)
+                                    * self._sigmoid_f32(ig1)
+                                    * linear_beta
+                                    * cute.math.tanh(iu1 / linear_beta, fastmath=self.fast_math)
+                                    * sd1
+                                )
+                                a2 = (
+                                    beta
+                                    * cute.math.tanh(ig2 / beta, fastmath=self.fast_math)
+                                    * self._sigmoid_f32(ig2)
+                                    * linear_beta
+                                    * cute.math.tanh(iu2 / linear_beta, fastmath=self.fast_math)
+                                    * sd2
+                                )
+                                a3 = (
+                                    beta
+                                    * cute.math.tanh(ig3 / beta, fastmath=self.fast_math)
+                                    * self._sigmoid_f32(ig3)
+                                    * linear_beta
+                                    * cute.math.tanh(iu3 / linear_beta, fastmath=self.fast_math)
+                                    * sd3
+                                )
+                            else:
+                                a0 = self._silu_f32(ig0) * iu0 * sd0
+                                a1 = self._silu_f32(ig1) * iu1 * sd1
+                                a2 = self._silu_f32(ig2) * iu2 * sd2
+                                a3 = self._silu_f32(ig3) * iu3 * sd3
+                            o0, o1, o2, o3 = self._had128_quad(a0, a1, a2, a3, lane)
+                            out_base = row * isz + col0
+                            st_global_v2_u32(
+                                get_ptr_as_int64(activated_bf16_flat, Int64(out_base)),
+                                pack_f32x2_to_f16x2(o0, o1),
+                                pack_f32x2_to_f16x2(o2, o3),
+                            )
+                unit += gw_stride
+
+    @cute.jit
     def _zero_fc2_output(
         self,
         fc2_bf16_flat: cute.Tensor,
@@ -9339,10 +9512,11 @@ class W4A16TopKSumKernel:
                             sbase = col0
                         else:
                             sbase = expert * Int32(self.hidden_size) + col0
-                        s0 = svh_flat[sbase + Int32(0)].to(cutlass.Float32)
-                        s1 = svh_flat[sbase + Int32(1)].to(cutlass.Float32)
-                        s2 = svh_flat[sbase + Int32(2)].to(cutlass.Float32)
-                        s3 = svh_flat[sbase + Int32(3)].to(cutlass.Float32)
+                        sp01, sp23 = ld_global_nc_v2_u32(
+                            get_ptr_as_int64(svh_flat, Int64(sbase))
+                        )
+                        s0, s1 = f16x2_to_f32x2(sp01)
+                        s2, s3 = f16x2_to_f32x2(sp23)
                         hs0 = h0 * s0
                         hs1 = h1 * s1
                         hs2 = h2 * s2
@@ -9379,10 +9553,13 @@ class W4A16TopKSumKernel:
                         output_flat[out_base + Int32(2)] = cutlass.BFloat16(acc2)
                         output_flat[out_base + Int32(3)] = cutlass.BFloat16(acc3)
                     else:
-                        output_flat[out_base + Int32(0)] = acc0
-                        output_flat[out_base + Int32(1)] = acc1
-                        output_flat[out_base + Int32(2)] = acc2
-                        output_flat[out_base + Int32(3)] = acc3
+                        st_global_v4_f32(
+                            get_ptr_as_int64(output_flat, Int64(out_base)),
+                            acc0,
+                            acc1,
+                            acc2,
+                            acc3,
+                        )
             return
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
         total = active_m * Int32(self.hidden_size)

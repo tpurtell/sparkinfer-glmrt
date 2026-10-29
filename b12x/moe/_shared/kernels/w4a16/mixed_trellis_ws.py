@@ -359,7 +359,7 @@ def _e4m3x4_scaled_to_f16x4(packed: Uint32, scale_bits: Uint32, *, loc=None, ip=
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
-    WS_ABI_VERSION = 4
+    WS_ABI_VERSION = 7
 
     def __init__(
         self,
@@ -734,7 +734,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         total = tier0_num_experts + tier1_num_experts
         # The cooperative kernel's activation phase, unchanged (it strides by
         # the driver's 256-thread CTA).
-        self.driver._run_activation_compact(
+        self.driver._run_activation_ws_chunked(
             fc1,
             activated,
             intermediate_rotations,
@@ -1502,21 +1502,19 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         (row r at r * 256 bytes; 16-byte chunk c at (c & 8) | ((c ^ r) & 7)),
         then arrive on ``bar`` when this thread's copies land."""
         c = ptid & Int32(15)
+        r0 = ptid >> Int32(4)
+        pos = (c & Int32(8)) | ((c & Int32(7)) ^ r0)
         a_slot = base + Int32(self.ws_a_off) + slot * Int32(self.ws_a_slot)
+        dst_base = a_slot + r0 * Int32(256) + pos * Int32(16)
+        k_off = Int64(kblock) * Int64(128) + Int64(c) * Int64(8)
         for i in cutlass.range_constexpr(self.ws_m // 8):
-            r = (ptid >> Int32(4)) + Int32(8 * i)
             row_id = rows[i]
-            pos = (c & Int32(8)) | ((c & Int32(7)) ^ (r & Int32(7)))
-            dst = a_slot + r * Int32(256) + pos * Int32(16)
-            src_elem = (
-                Int64(row_id) * Int64(k_size)
-                + Int64(kblock) * Int64(128)
-                + Int64(c) * Int64(8)
-            )
+            dst = dst_base + Int32(2048 * i)
+            src_elem = Int64(row_id) * Int64(k_size) + k_off
             if row_id < Int32(0):
                 src_elem = Int64(0)
             if cutlass.const_expr("a_l2" in self.ws_exp):
-                src_elem = Int64(kblock) * Int64(128) + Int64(c) * Int64(8)
+                src_elem = k_off
             cp_async4_shared_global_pred(
                 dst,
                 get_ptr_as_int64(a_src, src_elem),
@@ -1534,9 +1532,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         l16 = lane & Int32(15)
         half = lane >> Int32(4)
         warp = ptid >> Int32(5)
+        r0 = ptid >> Int32(4)
         pos_hi = l16 & Int32(8)
         pos_lo = l16 & Int32(7)
         a_slot = base + Int32(self.ws_a_off) + slot * Int32(self.ws_a_slot)
+        addr_base = a_slot + r0 * Int32(256) + (pos_hi | (pos_lo ^ r0)) * Int32(16)
         iters = self.ws_m // (2 * _PRODUCER_WARPS)
         group = min(iters, 2)
         for g in cutlass.range_constexpr(iters // group):
@@ -1545,12 +1545,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 addrs = []
                 loads = []
                 for j in cutlass.range_constexpr(group):
-                    row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
-                    addr = (
-                        a_slot
-                        + row * Int32(256)
-                        + (pos_hi | (pos_lo ^ (row & Int32(7)))) * Int32(16)
-                    )
+                    addr = addr_base + Int32(2048 * (g * group + j))
                     addrs.append(addr)
                     loads.append(ld_shared_v4_u32(addr))
                 for j in cutlass.range_constexpr(group):
@@ -1578,7 +1573,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             v[e] = p + sign * v[e]
                     rs = cutlass.Float32(0.088388347648)
                     if cutlass.const_expr(self.ws_a8):
-                        row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
+                        row = r0 + Int32(8 * (g * group + j))
                         self._ws_a8_store(
                             a_slot, base + Int32(self.ws_s_off) + slot * Int32(self.ws_s_slot),
                             row, l16, [v[e] * rs for e in range(8)],
@@ -1596,7 +1591,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     # Unrotated (padding) rows: zero scales, so their zero int8
                     # rows rescale to zero instead of reading stale words.
                     for j in cutlass.range_constexpr(group):
-                        row = Int32(2) * (warp + Int32(_PRODUCER_WARPS * (g * group + j))) + half
+                        row = r0 + Int32(8 * (g * group + j))
                         if l16 == Int32(0):
                             st_shared_f32(
                                 base + Int32(self.ws_s_off) + slot * Int32(self.ws_s_slot) + row * Int32(4),
@@ -1866,7 +1861,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         self._ws_rotate_block(base, a_slot, dvalid, suh_w, ptid)
                     _mbar_arrive(base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES))
                 if blk >= Int32(1):
-                    # Consumers finished block blk - 1: its A slot and its two
+                    # Consumers finished block blk - 1: its A slot and two
                     # weight units are free.
                     if at < total_tiles:
                         fill = a_issued % Int32(na)
@@ -2006,6 +2001,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         blocks = Int32(k_size // 128)
         row_bytes = self.ws_n16 * 32 * bits
         lrow = lane & Int32(15)
+        lrow7 = lane & Int32(7)
         lchunk = lane >> Int32(4)
         b = Int32(0)
         while b < blocks:
@@ -2052,12 +2048,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             frag, wa, wb, lut_addr, bits
                         )
                     b_regs.append((frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1]))
+                c = Int32(2 * q) + lchunk
+                pos = (c & Int32(8)) | ((c & Int32(7)) ^ lrow7)
+                a_addr_q = a_base + lrow * Int32(256) + pos * Int32(16)
                 a_regs = []
                 for mb in cutlass.range_constexpr(active):
-                    row = Int32(16 * mb) + lrow
-                    c = Int32(2 * q) + lchunk
-                    pos = (c & Int32(8)) | ((c & Int32(7)) ^ (row & Int32(7)))
-                    a_regs.append(ldmatrix_m8n8x4_b16(a_base + row * Int32(256) + pos * Int32(16)))
+                    a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
                 for jj in cutlass.range_constexpr(0 if "nomma" in self.ws_exp else 2):
                     for mb in cutlass.range_constexpr(active):
                         for h in cutlass.range_constexpr(2):
@@ -2251,41 +2247,42 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             col_valid = (local_col < live_n).to(Int32)
         for mb in cutlass.range_constexpr(active):
             for rh in cutlass.range_constexpr(2):
-                row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
-                w = []
-                for jj in cutlass.range_constexpr(2):
-                    for h in cutlass.range_constexpr(2):
-                        o0 = (((0 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
-                        o1 = (((1 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
-                        v0 = acc[o0][0] + acc[o1][0]
-                        v1 = acc[o0 + 1][0] + acc[o1 + 1][0]
-                        w.append(Int32(pack_f32x2_to_f16x2(v0 * scale, v1 * scale)))
-                # Stage 1 (xor 2): words 2,3 of lanes 0,1 <-> words 0,1 of lanes 2,3.
-                t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[0], w[2]), offset=2)
-                t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[1], w[3]), offset=2)
-                w[2] = cutlass.select_(b1 != Int32(0), w[2], t0)
-                w[3] = cutlass.select_(b1 != Int32(0), w[3], t1)
-                w[0] = cutlass.select_(b1 != Int32(0), t0, w[0])
-                w[1] = cutlass.select_(b1 != Int32(0), t1, w[1])
-                # Stage 2 (xor 1): words 1,3 of even lanes <-> words 0,2 of odd lanes.
-                t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[0], w[1]), offset=1)
-                t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[2], w[3]), offset=1)
-                w[1] = cutlass.select_(b0 != Int32(0), w[1], t0)
-                w[3] = cutlass.select_(b0 != Int32(0), w[3], t1)
-                w[0] = cutlass.select_(b0 != Int32(0), t0, w[0])
-                w[2] = cutlass.select_(b0 != Int32(0), t1, w[2])
-                if row < valid and col_valid != Int32(0):
-                    route = ld_shared_i32_relaxed(
-                        hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
-                    )
-                    if cutlass.const_expr("nostore" not in self.ws_exp):
-                        st_global_v4_u32(
-                            get_ptr_as_int64(c_out, Int64(route) * Int64(n_total) + Int64(col)),
-                            Uint32(w[0]),
-                            Uint32(w[1]),
-                            Uint32(w[2]),
-                            Uint32(w[3]),
+                if cutlass.const_expr(rh == 0) or Int32(16 * mb + 8 * rh) < valid:
+                    row = Int32(16 * mb + 8 * rh) + (lane >> Int32(2))
+                    w = []
+                    for jj in cutlass.range_constexpr(2):
+                        for h in cutlass.range_constexpr(2):
+                            o0 = (((0 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
+                            o1 = (((1 * mb_count + mb) * 2 + jj) * 2 + h) * 4 + 2 * rh
+                            v0 = acc[o0][0] + acc[o1][0]
+                            v1 = acc[o0 + 1][0] + acc[o1 + 1][0]
+                            w.append(Int32(pack_f32x2_to_f16x2(v0 * scale, v1 * scale)))
+                    # Stage 1 (xor 2): words 2,3 of lanes 0,1 <-> words 0,1 of lanes 2,3.
+                    t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[0], w[2]), offset=2)
+                    t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b1 != Int32(0), w[1], w[3]), offset=2)
+                    w[2] = cutlass.select_(b1 != Int32(0), w[2], t0)
+                    w[3] = cutlass.select_(b1 != Int32(0), w[3], t1)
+                    w[0] = cutlass.select_(b1 != Int32(0), t0, w[0])
+                    w[1] = cutlass.select_(b1 != Int32(0), t1, w[1])
+                    # Stage 2 (xor 1): words 1,3 of even lanes <-> words 0,2 of odd lanes.
+                    t0 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[0], w[1]), offset=1)
+                    t1 = cute.arch.shuffle_sync_bfly(cutlass.select_(b0 != Int32(0), w[2], w[3]), offset=1)
+                    w[1] = cutlass.select_(b0 != Int32(0), w[1], t0)
+                    w[3] = cutlass.select_(b0 != Int32(0), w[3], t1)
+                    w[0] = cutlass.select_(b0 != Int32(0), t0, w[0])
+                    w[2] = cutlass.select_(b0 != Int32(0), t1, w[2])
+                    if row < valid and col_valid != Int32(0):
+                        route = ld_shared_i32_relaxed(
+                            hdr + Int32(4 * _TILE_HEADER_WORDS) + row * Int32(4)
                         )
+                        if cutlass.const_expr("nostore" not in self.ws_exp):
+                            st_global_v4_u32(
+                                get_ptr_as_int64(c_out, Int64(route) * Int64(n_total) + Int64(col)),
+                                Uint32(w[0]),
+                                Uint32(w[1]),
+                                Uint32(w[2]),
+                                Uint32(w[3]),
+                            )
 
     @cute.jit
     def _ws_consumer(
