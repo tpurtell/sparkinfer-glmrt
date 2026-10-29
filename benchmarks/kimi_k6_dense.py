@@ -648,12 +648,16 @@ def benchmark_native_comparison(args):
                     end.record()
                 events[name] = (start, end)
                 outputs[name][:rows*n].fill_(float("nan"))
+                if args.transforms:
+                    finals[name][:rows*n].fill_(float("nan"))
                 if publishes_partials(rows):
                     partials[name][:rows*splits*n].fill_(float("nan"))
                 graph.replay()
                 torch.cuda.synchronize()
                 if not torch.isfinite(outputs[name][:rows*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned output not overwritten")
+                if args.transforms and not torch.isfinite(finals[name][:rows*n]).all().item():
+                    raise RuntimeError(f"{name}: poisoned transformed output not overwritten")
                 if publishes_partials(rows) and not torch.isfinite(partials[name][:rows*splits*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned partial not overwritten")
                 graphs[name] = graph
