@@ -169,7 +169,7 @@ def compile_dsv4_shared_ffn_aot(geometry: DSV4Geometry = FLASH, *, max_rows: int
         launch, name="dsv4_shared_ffn", operands=operands, scalars=(Scalar("rows"),),
         key=(h, i, geometry.swiglu_limit, launch.w13.key(), launch.w2.key()),
         geometry={"hidden": h, "moe_inter": i, "max_rows": max_rows,
-                  "swiglu_limit": geometry.swiglu_limit},
+                  "swiglu_limit": geometry.swiglu_limit, "exact_row_cap": 2**31 - 1},
         scratch={"scratch": lambda rows: shared_ffn_scratch_bytes(geometry, rows, max_rows)},
         doc=__doc__,
     )
@@ -218,7 +218,7 @@ def compile_dsv4_router_scores_aot(geometry: DSV4Geometry = FLASH, experts: int 
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
         scalars=(Scalar("live_rows"),),
         key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.tiles_by_rows),
-        geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
+        geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS, "exact_row_cap": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
     )
 
 

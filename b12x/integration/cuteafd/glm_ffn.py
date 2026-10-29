@@ -285,7 +285,8 @@ def _compile_glm_ffn_w8(g: GLMGeometry, inter: int, max_rows: int, mode: str) ->
     return compile_program(
         launch, name="glm_ffn", operands=operands, scalars=w8_scalars(prefill),
         key=(int(max_rows), mode, launch.key()),
-        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": "only", "mode": mode},
+        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": "only", "mode": mode,
+                  "exact_row_cap": min(launch.gate_up.exact_row_cap, launch.down.exact_row_cap)},
         scratch={"scratch": launch.scratch_bytes},
         doc=__doc__,
     )
@@ -320,7 +321,8 @@ def compile_glm_ffn_aot(g: GLMGeometry = GLM53, *, inter: int, max_rows: int, fp
     return compile_program(
         launch, name="glm_ffn", operands=operands, scalars=(Scalar("rows"),),
         key=(int(max_rows), fp8, launch.key()),
-        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": fp8},
+        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": fp8,
+                  "exact_row_cap": min(launch.gate_up.exact_row_cap, launch.down.exact_row_cap)},
         scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)},
         doc=__doc__,
     )
@@ -340,7 +342,7 @@ def compile_glm_router_scores_aot(g: GLMGeometry = GLM53) -> AotProgram:
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
         scalars=(Scalar("live_rows"),),
         key=(e, h, ROUTER_SKINNY_MAX_ROWS, s.tiles_by_rows),
-        geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
+        geometry={"hidden": h, "experts": e, "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS, "exact_row_cap": ROUTER_SKINNY_MAX_ROWS}, doc=__doc__,
     )
 
 

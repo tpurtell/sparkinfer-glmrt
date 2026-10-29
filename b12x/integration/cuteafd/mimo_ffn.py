@@ -83,7 +83,7 @@ def compile_mimo_norm_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotProgram:
     )
     return compile_program(
         launch, name="mimo_norm", operands=operands, scalars=(Scalar("rows"), Scalar("deltas")),
-        key=(h, g.norm_eps), geometry={"hidden": h, "eps": g.norm_eps}, doc=__doc__,
+        key=(h, g.norm_eps), geometry={"hidden": h, "eps": g.norm_eps, "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
 
 
@@ -170,7 +170,8 @@ def compile_mimo_ffn_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, max_rows: int, inte
         return compile_program(
             launch, name="mimo_ffn", operands=operands, scalars=(Scalar("rows"), Scalar("fp8_rows")),
             key=(int(max_rows), fp8_only, launch.key()),
-            geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": "only", "mode": fp8_only},
+            geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": "only", "mode": fp8_only,
+                      "exact_row_cap": min(launch.gate_up.exact_row_cap, launch.down.exact_row_cap)},
             scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows) + mimo_w8_scratch_bytes(max(h, i), rows,
                                                                                                 prefill)},
             doc=__doc__,
@@ -190,7 +191,8 @@ def compile_mimo_ffn_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, max_rows: int, inte
         launch, name="mimo_ffn", operands=operands,
         scalars=(Scalar("rows"), Scalar("fp8_rows")) if fp8 else (Scalar("rows"),),
         key=(int(max_rows), fp8, launch.key()),
-        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": fp8},
+        geometry={"hidden": h, "inter": i, "max_rows": int(max_rows), "fp8_weights": fp8,
+                  "exact_row_cap": min(launch.gate_up.exact_row_cap, launch.down.exact_row_cap)},
         scratch={"scratch": lambda rows: ffn_scratch_bytes(i, rows)},
         doc=__doc__,
     )
@@ -259,7 +261,8 @@ def compile_mimo_router_scores_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotProgra
                   Operand("logits", torch.float32, f"[rows,{e}]", "out"),
                   Operand("scratch", torch.uint8, "[router_scratch_bytes]", "scratch")),
         scalars=(Scalar("rows"),), key=(launch.key(),),
-        geometry={"hidden": h, "experts": e, "top_k": g.top_k, "router_fp32": g.router_fp32},
+        geometry={"hidden": h, "experts": e, "top_k": g.top_k, "router_fp32": g.router_fp32,
+                  "exact_row_cap": launch.proj.exact_row_cap},
         scratch={"scratch": lambda rows: router_scratch_bytes(g, rows)}, doc=__doc__,
     )
 
@@ -276,6 +279,6 @@ def compile_mimo_expert_input_quant_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotP
                   Operand("scale_rows_ptr", torch.uint8, "values_ptr + H", "out"),
                   Operand("scale_mma_ptr", torch.uint8, "unused", "in")),
         scalars=(Scalar("m"), Scalar("grid_x")),
-        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4},
+        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4, "exact_row_cap": 2**31 - 1},
         doc=__doc__,
     )
