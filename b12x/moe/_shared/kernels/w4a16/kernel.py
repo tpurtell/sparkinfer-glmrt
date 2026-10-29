@@ -8914,6 +8914,7 @@ class W4A16TopKSumKernel:
         use_expert_map: bool = False,
         broadcast_svh: bool = False,
         float32_output: bool = False,
+        row_addresses: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -8934,6 +8935,9 @@ class W4A16TopKSumKernel:
         # shared-su artifacts); index it with a zero expert stride.
         self.broadcast_svh = bool(broadcast_svh)
         self.float32_output = bool(float32_output)
+        if row_addresses and (not full_rotation or coupled_hadamard):
+            raise ValueError("row-address combine requires uncoupled full rotation")
+        self.row_addresses = bool(row_addresses)
         if self.use_expert_map:
             if self.route_num_experts <= 0:
                 raise ValueError("expert-map top-k sum requires route_num_experts > 0")
@@ -9373,16 +9377,23 @@ class W4A16TopKSumKernel:
                         acc2 += route_values[value_base + Int32(2)] * weight
                         acc3 += route_values[value_base + Int32(3)] * weight
                     out_base = token * Int32(self.hidden_size) + col0
-                    if cutlass.const_expr(self.full_rotation_output_bf16):
-                        output_flat[out_base + Int32(0)] = cutlass.BFloat16(acc0)
-                        output_flat[out_base + Int32(1)] = cutlass.BFloat16(acc1)
-                        output_flat[out_base + Int32(2)] = cutlass.BFloat16(acc2)
-                        output_flat[out_base + Int32(3)] = cutlass.BFloat16(acc3)
+                    if cutlass.const_expr(self.row_addresses):
+                        output_dtype = cutlass.BFloat16 if self.full_rotation_output_bf16 else cutlass.Float32
+                        row_ptr = cute.make_ptr(output_dtype, output_flat[token], cute.AddressSpace.gmem, assumed_align=16)
+                        destination = cute.make_tensor(row_ptr, cute.make_layout((self.hidden_size,)))
+                        out_base = col0
                     else:
-                        output_flat[out_base + Int32(0)] = acc0
-                        output_flat[out_base + Int32(1)] = acc1
-                        output_flat[out_base + Int32(2)] = acc2
-                        output_flat[out_base + Int32(3)] = acc3
+                        destination = output_flat
+                    if cutlass.const_expr(self.full_rotation_output_bf16):
+                        destination[out_base + Int32(0)] = cutlass.BFloat16(acc0)
+                        destination[out_base + Int32(1)] = cutlass.BFloat16(acc1)
+                        destination[out_base + Int32(2)] = cutlass.BFloat16(acc2)
+                        destination[out_base + Int32(3)] = cutlass.BFloat16(acc3)
+                    else:
+                        destination[out_base + Int32(0)] = acc0
+                        destination[out_base + Int32(1)] = acc1
+                        destination[out_base + Int32(2)] = acc2
+                        destination[out_base + Int32(3)] = acc3
             return
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
         total = active_m * Int32(self.hidden_size)
@@ -10859,6 +10870,7 @@ def compile_w4a16_topk_sum(
     use_expert_map: bool = False,
     broadcast_svh: bool = False,
     float32_output: bool = False,
+    row_addresses: bool = False,
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if route_ids_dtype not in (torch.int32, torch.int64):
@@ -10881,6 +10893,8 @@ def compile_w4a16_topk_sum(
         bool(broadcast_svh),
         bool(float32_output),
     )
+    if row_addresses:
+        cache_key += (("row_addresses",),)
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
         return attach_programs(
@@ -10908,6 +10922,8 @@ def compile_w4a16_topk_sum(
                 "full_rotation_output_dtype is only valid with full_rotation=True"
             )
         output_dtype = cutlass.Float32 if float32_output else cutlass_dtype
+    if row_addresses:
+        output_dtype = cutlass.Int64
     output_fake = make_ptr(output_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     topk_weights_fake = make_ptr(
         cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
@@ -10935,6 +10951,7 @@ def compile_w4a16_topk_sum(
         use_expert_map=use_expert_map,
         broadcast_svh=broadcast_svh,
         float32_output=float32_output,
+        row_addresses=row_addresses,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
