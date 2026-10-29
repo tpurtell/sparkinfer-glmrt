@@ -80,6 +80,7 @@ __all__ = [
     "compile_qwen4_ple_aot",
     "compile_qwen4_ple_commit_aot",
     "compile_qwen4_router_scores_aot",
+    "compile_qwen4_prefill_router_scores_aot",
     "compile_qwen4_shared_aot",
     "hc_scratch_bytes",
     "mtp_feedback_scratch_bytes",
@@ -356,6 +357,22 @@ def compile_qwen4_mtp_feedback_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotP
 # ---------------------------------------------------------------------------
 # MoE front
 # ---------------------------------------------------------------------------
+
+
+def compile_qwen4_prefill_router_scores_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
+    """One BF16-input/F32-output MMA reduction at every prefill row count."""
+    from b12x.moe._shared.v41_router import _V41RouterScores
+
+    e, h = g.routed_experts, g.hidden
+    return compile_program(
+        _V41RouterScores(e, hidden=h), name="qwen4_prefill_router_scores",
+        operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("w", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight"),
+                  Operand("logits", torch.float32, f"[rows,{e}]", "out")),
+        scalars=(Scalar("rows"),), key=(e, h, "mma_prefill"),
+        geometry={"hidden": h, "experts": e, "top_k": g.top_k,
+                  "route": "mma_prefill", "exact_row_cap": 2**31 - 1}, doc=__doc__,
+    )
 
 
 def compile_qwen4_router_scores_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
