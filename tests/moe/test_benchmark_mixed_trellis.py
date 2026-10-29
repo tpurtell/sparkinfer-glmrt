@@ -195,6 +195,31 @@ def test_compact_prefill_fixture_requires_complete_ownership(tmp_path):
         bench.compact_prefill_fixture(path, 0, "qwen4", 256, 256)
 
 
+def test_compact_dsv4p_fixture_validates_tp5_geometry(tmp_path):
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    entries = [dict(global_expert=e, combined_local=e, width=640 if e % 5 else 512,
+                    projections=[dict(projection=p, tier=0, bits=2, tier_local=e,
+                                      payload_word_offset=0)
+                                 for p in ("gate", "up", "down")]) for e in range(384)]
+    rank = dict(rank=0, compiled_max_intermediate=640, experts=entries,
+                projection_counts=[[384] * 3, [0] * 3], unit_map_fingerprint="v4pro-tp5")
+    path = tmp_path / "dsv4p-ownership.json"
+    path.write_text(bench.json.dumps(dict(tiers=[2, 3], ranks=[rank])))
+    fixture = bench.compact_prefill_fixture(path, 0, "dsv4p", 640)
+    assert {e["width"] for e in fixture["entries"]} == {512, 640}
+    assert fixture["fingerprint"] == "v4pro-tp5"
+    with pytest.raises(ValueError, match="geometry"):
+        bench.compact_prefill_fixture(path, 0, "dsv4p", 512)
+    with pytest.raises(ValueError, match="geometry"):
+        bench.compact_prefill_fixture(path, 0, "dsv4p", 640, experts=256)
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    options = bench.prefill_compile_options("dsv4p", 640, 64, "ws", props, compact=True)
+    assert options["compact_weights"] and options["warp_specialized"]
+    assert options["route_num_experts"] == 384 and options["top_k"] == 6
+    assert (options["tier0_bits"], options["tier1_bits"]) == (2, 3)
+
+
 def test_compact_glm_fixture_uses_live_width_ownership(tmp_path):
     bench = _load_benchmark_module()
     entries = [dict(global_expert=e, combined_local=e, width=384 if e < 85 else 256,

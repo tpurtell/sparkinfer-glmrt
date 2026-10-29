@@ -831,8 +831,8 @@ def _make_prefill_layer(family, width, seed, device, bits=None):
 
 def compact_prefill_fixture(path, rank, family, width, experts=None, bits=None):
     """Validate a planner-replayed or deterministic rotated ownership fixture."""
-    if family not in ("qwen4", "glm", "glmf", "v41", "dsv4f"):
-        raise ValueError("compact prefill fixture currently requires Qwen, GLM, GLMF, V4.1, or DSV4F")
+    if family not in ("qwen4", "glm", "glmf", "v41", "dsv4f", "dsv4p"):
+        raise ValueError("compact prefill fixture currently requires Qwen, GLM, GLMF, V4.1, DSV4F, or DSV4P")
     if experts is None:
         experts = PREFILL_FAMILIES[family][1]
     data = json.loads(Path(path).read_text())
