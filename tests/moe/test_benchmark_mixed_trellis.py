@@ -118,6 +118,32 @@ def test_prefill_policy_separates_route_block_from_ws():
         bench.prefill_compile_options("kimik3", 384, 16, "ws", props)
 
 
+@pytest.mark.parametrize("bits", [(2, 3), (3, 4), (4, 5)])
+def test_prefill_bits_override_reaches_compile_and_compact_fixture(tmp_path, bits):
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    args = bench.benchmark_parser().parse_args(
+        ["--prefill-family", "v41", "--bits", *map(str, bits)])
+    assert args.bits == list(bits)
+    ordinary = bench.prefill_compile_options("v41", 640, 64, "ws", props, bits=bits)
+    compact = bench.prefill_compile_options("v41", 640, 64, "ws", props, compact=True, bits=bits)
+    coordinator = bench.coordinator_compile_options("rtx-tp1", 256, {}, props, "v41", bits=bits)
+    for options in (ordinary, compact, coordinator):
+        assert (options["tier0_bits"], options["tier1_bits"]) == bits
+    entries = [dict(combined_local=e, global_expert=e, width=640,
+                    projections=[dict(projection=p, tier=e % 2, bits=bits[e % 2], tier_local=e // 2)
+                                 for p in ("gate", "up", "down")]) for e in range(384)]
+    fixture = tmp_path / "compact.json"
+    fixture.write_text(bench.json.dumps(dict(ranks=[dict(
+        rank=0, compiled_max_intermediate=640, experts=entries,
+        projection_counts=[[192] * 3, [192] * 3], unit_map_fingerprint="override")])))
+    assert bench.compact_prefill_fixture(fixture, 0, "v41", 640, bits=bits)["counts"] == [[192] * 3] * 2
+    if bits != (3, 4):
+        with pytest.raises(ValueError, match="tier/bit mismatch"):
+            bench.compact_prefill_fixture(fixture, 0, "v41", 640)
+
+
 def test_prefill_route_fixture_is_family_specific(tmp_path):
     bench = _load_benchmark_module()
     path = tmp_path / "routes.json"
