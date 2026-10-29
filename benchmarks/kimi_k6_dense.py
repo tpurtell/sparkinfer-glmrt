@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 
-def exported(program, directory, stem):
+def exported(program, directory, stem, *, load_module=True):
     from b12x.integration.cuteafd import validate_exported_header
     program.export_to_c(str(directory), stem, stem)
     validate_exported_header(program, directory / f"{stem}.h", stem)
@@ -38,6 +38,8 @@ def exported(program, directory, stem):
         str(source), str(directory / f"{stem}.o"), "-L/usr/local/cuda/lib64", "-lcudart",
         f"-L{runtime}", "-lcute_dsl_runtime", f"-Wl,-rpath,{runtime}", "-Wl,-z,defs",
         "-o", str(library)], check=True)
+    if not load_module:
+        return None
     lib = C.CDLL(str(library))
     lib.load.argtypes, lib.load.restype = [], None
     lib.run.argtypes = [C.c_void_p] * len(pointers) + [C.c_int32] * len(scalars) + [C.c_void_p]
@@ -313,190 +315,171 @@ def benchmark_prefill_route(args):
 
 
 
-def benchmark_duel_ab(args):
+def benchmark_glmf_duel(args):
+    """Native baseline versus separately keyed K6 variants, through C exports."""
     import hashlib
     import torch
-    import cutlass.cute as cute
-    from cutlass import Int32
     from cuda.bindings import driver as cuda
-    from b12x.gemm.trellis_linear import _native
     from b12x.integration.cuteafd import exportable_compilation
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
 
-    class BaselineNative(_native.NativeTrellisLinear):
-        @cute.jit
-        def _decode(self, inputs: cute.Tensor, payload: cute.Tensor,
-                    scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
-                    rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
-            self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+    def snapshot():
+        return subprocess.check_output([
+            "nvidia-smi", "--query-gpu=name,clocks.sm,clocks.mem,power.draw,power.limit,temperature.gpu",
+            "--format=csv,noheader"], text=True).strip()
 
-    def gpu_telemetry():
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name,clocks.sm,clocks.mem,power.draw,temperature.gpu", "--format=csv,noheader"],
-                text=True,
-            ).strip()
-            return out
-        except Exception as exc:
-            return str(exc)
+    def boost_warmup():
+        warm_a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        warm_b = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm_a, warm_b)
+        torch.cuda.synchronize()
+        del warm_a, warm_b
 
-    rows_list = [int(r) for r in args.rows.split(",")]
-    shapes = [tuple(int(v) for v in s.split(":")) for s in args.shapes.split(",")]
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    sms = props.multi_processor_count
-    limit = sms * 4
-    flush = torch.empty((64 * 1024 * 1024,), dtype=torch.uint8, device="cuda")
-    telemetry_before = gpu_telemetry()
-    print(f"GPU_BEFORE: {telemetry_before}", flush=True)
+    def load(directory, stem):
+        lib = C.CDLL(str((directory / f"{stem}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        lib.run.argtypes = [C.c_void_p] * 5 + [C.c_int32] * 3 + [C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
 
-    records = []
-    for shape in shapes:
-        k, n, side = shape[:3]
-        shape_str = f"{k}:{n}:{side}"
-        shape_rows = [r for r in rows_list if not (n >= 81920 and r > 64)]
-        if not shape_rows:
-            continue
-        capacity = max(shape_rows)
-        splits = (k + 1023) // 1024
-        directory = args.output_dir / f"duel_k{k}_n{n}_s{side}_m{capacity}"
-        directory.mkdir(parents=True, exist_ok=True)
-
-        orig_cls = _native.NativeTrellisLinear
-        try:
-            _native.NativeTrellisLinear = BaselineNative
-            with exportable_compilation():
-                base_prog = compile_trellis_linear_aot(
-                    input_features=k, output_features=n, bits=6, codebook="mcg",
-                    sharded_side=side, rotation_count=1, max_rows=capacity,
-                )
-        finally:
-            _native.NativeTrellisLinear = orig_cls
-        base_lib = exported(base_prog, directory, "base_mcg")
-
-        with exportable_compilation():
-            cand_prog = compile_trellis_linear_aot(
-                input_features=k, output_features=n, bits=6, codebook="mcg",
-                sharded_side=side, rotation_count=1, max_rows=capacity,
-            )
-        cand_lib = exported(cand_prog, directory, "cand_mcg")
-
-        torch.manual_seed(273)
-        x = torch.randn((capacity, k), device="cuda", dtype=torch.float16)
-        inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
-        payload = torch.randint(256, (k * n * 6 // 8,), device="cuda", dtype=torch.uint8)
-        scales = torch.randn((k // 128,), device="cuda", dtype=torch.float16) * 0.25
-        base_partial = torch.empty((capacity, splits, n), device="cuda", dtype=torch.float32)
-        cand_partial = torch.empty((capacity, splits, n), device="cuda", dtype=torch.float32)
-        base_out = torch.empty((capacity, n), device="cuda", dtype=torch.float32)
-        cand_out = torch.empty((capacity, n), device="cuda", dtype=torch.float32)
-        prefix_out = torch.empty((capacity, n), device="cuda", dtype=torch.float32)
-
-        for rows in shape_rows:
-            stream = torch.cuda.current_stream().cuda_stream
-            base_out.zero_()
-            cand_out.zero_()
-            r0 = base_lib.run(
-                inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                base_partial.data_ptr(), base_out.data_ptr(), rows, 0, limit, stream
-            )
-            r1 = cand_lib.run(
-                inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                cand_partial.data_ptr(), cand_out.data_ptr(), rows, 0, limit, stream
-            )
-            torch.cuda.synchronize()
-            if r0 or r1:
-                raise RuntimeError(f"wrapper failed: base={r0} cand={r1}")
-            exact = bool(torch.equal(cand_out[:rows].view(torch.int32), base_out[:rows].view(torch.int32)))
-            row_inv = True
-            for pref in (1, 8, 16, 32, 64):
-                if pref < rows:
-                    prefix_out.zero_()
-                    cand_lib.run(
-                        inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                        cand_partial.data_ptr(), prefix_out.data_ptr(), pref, 0, limit, stream
-                    )
-                    torch.cuda.synchronize()
-                    if not torch.equal(prefix_out[:pref].view(torch.int32), cand_out[:pref].view(torch.int32)):
-                        row_inv = False
-            exact_all = exact and row_inv
-            base_sha = hashlib.sha256(base_out[:rows].detach().cpu().numpy().tobytes()).hexdigest()
-            cand_sha = hashlib.sha256(cand_out[:rows].detach().cpu().numpy().tobytes()).hexdigest()
-            if not exact_all or base_sha != cand_sha:
-                raise RuntimeError(f"MISMATCH at {shape_str} rows={rows}: exact={exact} row_inv={row_inv} base={base_sha} cand={cand_sha}")
-
-            def run_base(rows=rows):
-                s = torch.cuda.current_stream().cuda_stream
-                base_lib.run(
-                    inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                    base_partial.data_ptr(), base_out.data_ptr(), rows, 0, limit, s
-                )
-
-            def run_cand(rows=rows):
-                s = torch.cuda.current_stream().cuda_stream
-                cand_lib.run(
-                    inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                    cand_partial.data_ptr(), cand_out.data_ptr(), rows, 0, limit, s
-                )
-
-            graphs = {}
-            for name, fn, tgt in (("base", run_base, base_out[:rows]), ("cand", run_cand, cand_out[:rows])):
-                fn()
-                torch.cuda.synchronize()
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    fn()
-                tgt.fill_(float("nan"))
-                g.replay()
-                torch.cuda.synchronize()
-                if not torch.isfinite(tgt).all().item():
-                    raise RuntimeError(f"{name} graph failed poison check")
-                graphs[name] = g
-
-            samples = {"base": [], "cand": []}
-            for rep in range(args.samples):
-                order = ("base", "cand") if rep % 2 == 0 else ("cand", "base")
-                for name in order:
-                    if rows <= 64:
-                        flush.zero_()
-                    ev0 = torch.cuda.Event(enable_timing=True)
-                    ev1 = torch.cuda.Event(enable_timing=True)
-                    ev0.record()
-                    graphs[name].replay()
-                    ev1.record()
-                    ev1.synchronize()
-                    samples[name].append(ev0.elapsed_time(ev1) * 1000.0)
-
-            base_us = statistics.median(samples["base"])
-            cand_us = statistics.median(samples["cand"])
-            ratio = base_us / cand_us
-            weight_bytes = k * n * 6 // 8
-            gbps = (weight_bytes / (cand_us * 1e-6)) / 1e9
-            rec = dict(
-                shape=shape_str, k=k, n=n, side=side, rows=rows,
-                baseline_us=round(base_us, 3), candidate_us=round(cand_us, 3),
-                ratio=round(ratio, 4), exact=exact_all,
-                sha256=cand_sha, weight_gbps=round(gbps, 2),
-            )
-            records.append(rec)
-            print(json.dumps(rec), flush=True)
-            del graphs
-
-        del x, inputs, payload, scales, base_partial, cand_partial, base_out, cand_out, prefix_out
-        torch.cuda.empty_cache()
-
-    telemetry_after = gpu_telemetry()
-    print(f"GPU_AFTER: {telemetry_after}", flush=True)
-    report = dict(
-        metadata=dict(
-            device=props.name, sms=sms, codebook="mcg", bits=6,
-            samples=args.samples, telemetry_before=telemetry_before,
-            telemetry_after=telemetry_after,
-        ),
-        records=records,
+    default_shapes = "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,16384:4096:1,4096:154880:1,4096:6144:1,6144:4096:2"
+    shapes = [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
+    rows_list = list(map(int, args.rows.split(",")))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 1:
+        raise ValueError("duel requires rows 1..4096 and positive samples")
+    max_rows = max(129, max(rows_list))
+    arms = (
+        ("cta4", dict(decode_cta_warps=4, k6_variant=None)),
+        ("pair_shfl", dict(decode_cta_warps=4, k6_variant="pair_shfl")),
     )
-    out_json = args.output_dir / "duel_round1.json"
-    out_json.write_text(json.dumps(report, indent=2) + "\n")
-    print(f"WROTE_JSON: {out_json}", flush=True)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+    if int(status):
+        raise RuntimeError(status)
+    snapshot_idle = snapshot()
+    if not args.compile_only:
+        boost_warmup()
+        flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
+        flush.zero_()
+        torch.cuda.synchronize()
+    report = dict(metadata=dict(device=props.name, sms=props.multi_processor_count,
+        l2_bytes=l2, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=6,
+        input_dtype=args.input_dtype, codebook=args.codebook, exact_row_cap=max_rows,
+        ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[])
+    torch.manual_seed(273)
+    for k, n, side in shapes:
+        directory = args.output_dir / f"k{k}_n{n}_s{side}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
+        directory.mkdir(parents=True, exist_ok=True)
+        libs = {}
+        for stem, kw in arms:
+            if args.compile_only:
+                print(f"compile {k}:{n}:{side} {stem} max_rows={max_rows}", flush=True)
+                with exportable_compilation():
+                    program = compile_trellis_linear_aot(input_features=k, output_features=n,
+                        bits=6, codebook=args.codebook, sharded_side=side, rotation_count=1,
+                        max_rows=max_rows, input_dtype=args.input_dtype, **kw)
+                exported(program, directory, stem, load_module=False)
+                (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
+            else:
+                libs[stem] = load(directory, stem)
+        if args.compile_only:
+            continue
+        capacity = max(rows_list)
+        decode_cap = min(capacity, 129)
+        splits = (k + 1023) // 1024
+        x = torch.randn(capacity, k, device="cuda", dtype=getattr(torch, {"bf16":"bfloat16", "f16":"float16"}[args.input_dtype]))
+        inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
+        payload = torch.randint(256, (k*n*6//8,), device="cuda", dtype=torch.uint8)
+        scales = torch.rand(k//128, device="cuda", dtype=torch.float16) + .125
+        partials = {name: torch.empty(decode_cap*splits*n, device="cuda") for name in libs}
+        outputs = {name: torch.empty(capacity*n, device="cuda") for name in libs}
+        # Untimed boost warm-up before row 1 of each shape
+        boost_warmup()
+        for rows in rows_list:
+            graphs = {}
+            hashes = {}
+            events = {}
+            def call(name, count=rows):
+                result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
+                    partials[name].data_ptr(), outputs[name].data_ptr(), count, 0,
+                    props.multi_processor_count*4, torch.cuda.current_stream().cuda_stream)
+                if result:
+                    raise RuntimeError(f"{name} returned {result}")
+            for name in libs:
+                call(name)
+                graph = torch.cuda.CUDAGraph()
+                start = torch.cuda.Event(enable_timing=True, external=True)
+                end = torch.cuda.Event(enable_timing=True, external=True)
+                with torch.cuda.graph(graph):
+                    start.record()
+                    call(name)
+                    end.record()
+                events[name] = (start, end)
+                outputs[name].fill_(float("nan"))
+                if rows <= 129:
+                    partials[name].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                if not torch.isfinite(outputs[name][:rows*n]).all().item():
+                    raise RuntimeError(f"{name}: poisoned output not overwritten")
+                if rows <= 129 and not torch.isfinite(partials[name][:rows*splits*n]).all().item():
+                    raise RuntimeError(f"{name}: poisoned partial not overwritten")
+                graphs[name] = graph
+                hashes[name] = hashlib.sha256(outputs[name][:rows*n].cpu().numpy().tobytes()).hexdigest()
+            exact = {}
+            partials_exact = {}
+            for name in libs:
+                out_eq = torch.equal(outputs[name][:rows*n].view(torch.int32), outputs["cta4"][:rows*n].view(torch.int32))
+                part_eq = True if rows > 129 else torch.equal(partials[name][:rows*splits*n].view(torch.int32), partials["cta4"][:rows*splits*n].view(torch.int32))
+                exact[name] = out_eq and part_eq
+                partials_exact[name] = part_eq
+                if not exact[name]:
+                    raise RuntimeError(f"non-bit-exact {k}:{n}:{side} rows={rows} {name} (out_eq={out_eq}, part_eq={part_eq})")
+                saved = outputs[name][:n].clone()
+                call(name, 1)
+                if not torch.equal(saved.view(torch.int32), outputs[name][:n].view(torch.int32)):
+                    raise RuntimeError(f"row invariance failure: {name} rows={rows}")
+                graphs[name].replay()
+            intervals = 32 if rows <= 129 else (1 if n > 65536 else 4)
+            timing_graphs = {}
+            for name in libs:
+                pairs = [(torch.cuda.Event(enable_timing=True, external=True),
+                          torch.cuda.Event(enable_timing=True, external=True)) for _ in range(intervals)]
+                timed = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(timed):
+                    for start, end in pairs:
+                        flush.zero_()
+                        start.record()
+                        call(name)
+                        end.record()
+                timing_graphs[name] = timed
+                events[name] = pairs
+                timed.replay()
+            torch.cuda.synchronize()
+            samples = {name: [] for name in libs}
+            for repeat in range(args.samples):
+                order = list(libs) if repeat % 2 == 0 else list(reversed(libs))
+                for name in order:
+                    timing_graphs[name].replay()
+                    events[name][-1][1].synchronize()
+                    samples[name].append(statistics.mean(start.elapsed_time(end)*1000 for start, end in events[name]))
+            times = {name: statistics.median(v) for name, v in samples.items()}
+            name = "pair_shfl"
+            record = dict(k=k, n=n, side=side, splits=splits, rows=rows, variant=name,
+                baseline_us=times["cta4"], candidate_us=times[name], ratio=times["cta4"]/times[name],
+                exact=exact[name], sha256=hashes[name], partials_exact=partials_exact[name],
+                weight_gbs=(k*n*6/8)/(times[name]*1000),
+                baseline_samples_us=samples["cta4"], samples_us=samples[name], snapshot=snapshot())
+            report["records"].append(record)
+            print(json.dumps({key: value for key, value in record.items() if key not in ("samples_us", "baseline_samples_us")}), flush=True)
+            (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
+        del graphs, timing_graphs, partials, outputs, x, inputs, payload, scales
+        torch.cuda.empty_cache()
+    report["metadata"]["snapshot_after"] = snapshot()
+    if not args.compile_only:
+        (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
 
 
 def main():
@@ -507,11 +490,14 @@ def main():
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
-    parser.add_argument("--duel-ab", action="store_true", help="Run baseline vs candidate K6 duel A/B with exactness and SHA256")
+    parser.add_argument("--glmf-duel", action="store_true", help="bit-exact native CTA partition screen")
+    parser.add_argument("--compile-only", action="store_true", help="export duel arms without timing")
+    parser.add_argument("--input-dtype", choices=("f16", "bf16"), default="bf16")
+    parser.add_argument("--codebook", choices=("mcg", "mul1"), default="mcg")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    if args.duel_ab:
-        benchmark_duel_ab(args)
+    if args.glmf_duel:
+        benchmark_glmf_duel(args)
         return
     if args.prefill_route:
         benchmark_prefill_route(args)
