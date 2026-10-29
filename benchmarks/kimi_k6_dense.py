@@ -120,6 +120,88 @@ def glmf_aggregate(records):
     return aggregate
 
 
+def benchmark_layer_replay(args):
+    """Back-to-back projections with distinct weights, no timed cache flush."""
+    import torch
+    from cuda.bindings import driver as cuda
+    props = torch.cuda.get_device_properties(0)
+    status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+    if int(status):
+        raise RuntimeError(status)
+    flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+    max_rows = max(129, max(map(int, args.rows.split(","))))
+    mixes = {
+        "KDA": [(4096,4096,1)]*3 + [(4096,4096,2)],
+        "MLA": [(4096,1536,1), (4096,512,1), (1536,8192,1), (8192,4096,2)],
+    }
+    results = []
+    for layer, shapes in mixes.items():
+        shapes = shapes + [(4096,1024,1)]*2 + [(1024,4096,2)]
+        owned = []
+        runners = []
+        def load(directory, stem, pointers, scalars):
+            lib = C.CDLL(str((directory / f"{stem}.so").resolve()))
+            lib.load.argtypes, lib.load.restype = [], None
+            lib.run.argtypes = [C.c_void_p]*pointers + [C.c_int32]*scalars + [C.c_void_p]
+            lib.run.restype = C.c_int32
+            lib.load()
+            return lib
+        for k,n,side in shapes:
+            directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
+            libs = {name: load(directory,name,5,3) for name in ("baseline","candidate")}
+            ingress,egress = load(directory,"ingress",4,2),load(directory,"egress",3,2)
+            source = torch.randn(8,k,device="cuda",dtype=torch.bfloat16)
+            x = torch.empty(8,k,device="cuda",dtype=torch.bfloat16 if args.input_dtype=="bf16" else torch.float16)
+            inputs = torch.tensor([x.data_ptr()],device="cuda",dtype=torch.int64)
+            payload = torch.randint(256,(k*n*args.bits//8,),device="cuda",dtype=torch.uint8)
+            scales = torch.ones(k//128,device="cuda",dtype=torch.float16)
+            suh,svh = torch.rand(k,device="cuda",dtype=torch.float16),torch.rand(n,device="cuda",dtype=torch.float16)
+            parts = {a:torch.empty(8*((k+1023)//1024)*n,device="cuda") for a in libs}
+            outs = {a:torch.empty(8*n,device="cuda") for a in libs}
+            finals = {a:torch.empty(8*n,device="cuda",dtype=torch.bfloat16) for a in libs}
+            owned.append((source,x,inputs,payload,scales,suh,svh,parts,outs,finals,libs,ingress,egress))
+            def call(arm,rows, state=owned[-1]):
+                source,x,inputs,payload,scales,suh,svh,parts,outs,finals,libs,ingress,egress=state
+                stream=torch.cuda.current_stream().cuda_stream
+                codes=(ingress.run(source.data_ptr(),suh.data_ptr(),x.data_ptr(),scales.data_ptr(),rows,props.multi_processor_count*4,stream),
+                       libs[arm].run(inputs.data_ptr(),payload.data_ptr(),scales.data_ptr(),parts[arm].data_ptr(),outs[arm].data_ptr(),rows,0,props.multi_processor_count*4,stream),
+                       egress.run(outs[arm].data_ptr(),svh.data_ptr(),finals[arm].data_ptr(),rows,props.multi_processor_count*4,stream))
+                if any(codes):
+                    raise RuntimeError(codes)
+            runners.append(call)
+        for rows in (4,8):
+            graphs={}
+            for arm in ("baseline","candidate"):
+                for call in runners:
+                    call(arm,rows)
+                graph=torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for call in runners:
+                        call(arm,rows)
+                graphs[arm]=graph
+            torch.cuda.synchronize()
+            for state in owned:
+                finals=state[9]
+                if not torch.equal(finals["baseline"].view(torch.int16),finals["candidate"].view(torch.int16)):
+                    # Only the live rows are initialized for M4.
+                    n=finals["baseline"].numel()//8
+                    if not torch.equal(finals["baseline"][:rows*n].view(torch.int16),finals["candidate"][:rows*n].view(torch.int16)):
+                        raise RuntimeError("layer replay byte mismatch")
+            for mode in ("warm", "cold"):
+                samples={arm:[] for arm in graphs}
+                for repeat in range(args.samples):
+                    for arm in (list(graphs) if repeat%2==0 else list(reversed(graphs))):
+                        if mode=="cold":
+                            flush.zero_()
+                        begin,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+                        begin.record();graphs[arm].replay();end.record();end.synchronize()
+                        samples[arm].append(begin.elapsed_time(end)*1000)
+                base,cand=(statistics.median(samples[a]) for a in ("baseline","candidate"))
+                results.append(dict(layer=layer,rows=rows,cache=mode,baseline_us=base,candidate_us=cand,ratio=base/cand,exact=True,samples_us=samples))
+        del graphs,runners,owned
+    return results
+
+
 def benchmark_prefill_route(args):
     """Exact exported prefill routes; every replay uses preallocated storage."""
     import torch
@@ -462,7 +544,7 @@ def benchmark_native_comparison(args):
     if args.glmf_verify and not args.compile_only:
         report["metadata"]["streaming_read"] = streaming_read_bandwidth(l2, args.samples)
         report["metadata"]["mix"] = {":".join(map(str, s)): count for s, count in GLMF_VERIFY_MIX.items()}
-        report["metadata"]["aggregate_scope"] = ("ingress + multiply/reduce + F32 egress; one target + one draft head" if args.transforms else "native multiply/reduce only; one target + one draft head")
+        report["metadata"]["aggregate_scope"] = ("ingress + multiply/reduce + native egress; one target + one draft head" if args.transforms else "native multiply/reduce only; one target + one draft head")
     torch.manual_seed(273)
     for k, n, side in shapes:
         directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
@@ -489,7 +571,8 @@ def benchmark_native_comparison(args):
             if args.compile_only:
                 with exportable_compilation():
                     ip = compile_trellis_input_aot(features=k, max_rows=max_rows, output_dtype=args.input_dtype)
-                    op = compile_trellis_output_aot(features=n, max_rows=max_rows, output_dtype="f32")
+                    op = compile_trellis_output_aot(features=n, max_rows=max_rows,
+                                                    output_dtype="f32" if n > 65536 else "bf16")
                 exported(ip, directory, "ingress", load_module=False)
                 exported(op, directory, "egress", load_module=False)
             else:
@@ -522,7 +605,8 @@ def benchmark_native_comparison(args):
             source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
             suh = torch.rand(k, device="cuda", dtype=torch.float16) + .125
             svh = torch.rand(n, device="cuda", dtype=torch.float16) + .125
-            finals = {name: torch.empty_like(outputs[name]) for name in libs}
+            final_dtype = torch.float32 if n > 65536 else torch.bfloat16
+            finals = {name: torch.empty(capacity*n, device="cuda", dtype=final_dtype) for name in libs}
         # Untimed boost warm-up before row 1 of each shape
         boost_warmup()
         for rows in rows_list:
@@ -638,6 +722,8 @@ def benchmark_native_comparison(args):
         if "timing_graphs" in locals():
             del timing_graphs
         torch.cuda.empty_cache()
+    if args.layer_replay and not args.compile_only:
+        report["layer_replay"] = benchmark_layer_replay(args)
     report["metadata"]["snapshot_after"] = snapshot()
     if not args.compile_only:
         (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
@@ -651,6 +737,7 @@ def main():
     parser.add_argument("--rows", default="1,64,256")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
+    parser.add_argument("--layer-replay", action="store_true", help="time real seven-projection KDA/MLA graph sequences")
     parser.add_argument("--glmf-verify", action="store_true", help="GLMF verify mix, measured streaming bandwidth and round aggregate")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
     parser.add_argument("--baseline-native", type=Path, help="compare output and partial bytes against a previous _native.py")
