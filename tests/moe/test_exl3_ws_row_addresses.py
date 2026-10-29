@@ -73,7 +73,7 @@ def test_glmf_two_member_byte_gate_and_ceiling():
             top_k=topk, route_num_experts=experts, max_m_blocks=(slots + block - 1) // block,
             sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
             force_tile_config=(64, 256, 64, 256), tier0_bits=3, tier1_bits=4,
-            moe_block_size=block, full_rotation_output_dtype="bf16",
+            moe_block_size=block, full_rotation_output_dtype="bf16", swiglu_limit=10.0,
             warp_specialized=True, ws_dynamic_tiles=True, row_addresses=indirect)
         launches.append(launch)
         buffers.append(make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count))
