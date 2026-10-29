@@ -339,8 +339,9 @@ def benchmark_glmf_duel(args):
     default_shapes = "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,4096:154880:1"
     shapes = [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
     rows_list = list(map(int, args.rows.split(",")))
-    if not rows_list or min(rows_list) < 1 or max(rows_list) > 129 or args.samples < 1:
-        raise ValueError("decode duel requires rows 1..129 and positive samples")
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 1:
+        raise ValueError("decode duel requires rows 1..4096 and positive samples")
+    max_rows = max(129, max(rows_list))
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
     if int(status):
@@ -353,17 +354,19 @@ def benchmark_glmf_duel(args):
         ratio="baseline/candidate", cache="32 in-graph cold units, 2x runtime L2 eviction outside each timed interval"), records=[])
     torch.manual_seed(273)
     for k, n, side in shapes:
-        directory = args.output_dir / f"k{k}_n{n}_s{side}_{args.codebook}_{args.input_dtype}"
+        directory = args.output_dir / f"k{k}_n{n}_s{side}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
         directory.mkdir(parents=True, exist_ok=True)
         libs = {}
         variants = [("cta4", 4, False), ("cta2", 2, False), ("pair4", 4, True), ("pair2", 2, True)] if args.pair_loads else [(f"cta{w}", w, False) for w in (4, 2, 1)]
+        if args.combined:
+            variants = [("cta4", 4, False), ("combined", 2, True)]
         for stem, warps, pair_loads in variants:
             if args.compile_only:
                 print(f"compile {k}:{n}:{side} {stem}", flush=True)
                 with exportable_compilation():
                     program = compile_trellis_linear_aot(input_features=k, output_features=n,
                         bits=6, codebook=args.codebook, sharded_side=side, rotation_count=1,
-                        max_rows=129, input_dtype=args.input_dtype, decode_cta_warps=warps, decode_pair_loads=pair_loads)
+                        max_rows=max_rows, input_dtype=args.input_dtype, decode_cta_warps=warps, decode_pair_loads=pair_loads, k6_combined=stem == "combined")
                 exported(program, directory, stem)
                 (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
             else:
@@ -376,7 +379,7 @@ def benchmark_glmf_duel(args):
         inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
         payload = torch.randint(256, (k*n*6//8,), device="cuda", dtype=torch.uint8)
         scales = torch.rand(k//128, device="cuda", dtype=torch.float16) + .125
-        partials = {name: torch.empty(capacity*splits*n, device="cuda") for name in libs}
+        partials = {name: torch.empty(min(capacity, 129)*splits*n, device="cuda") for name in libs}
         outputs = {name: torch.empty(capacity*n, device="cuda") for name in libs}
         for rows in rows_list:
             graphs = {}
@@ -399,19 +402,20 @@ def benchmark_glmf_duel(args):
                     end.record()
                 events[name] = (start, end)
                 outputs[name].fill_(float("nan"))
-                partials[name].fill_(float("nan"))
+                partials[name].fill_(12345.0)
                 graph.replay()
                 torch.cuda.synchronize()
                 if not torch.isfinite(outputs[name][:rows*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned output not overwritten")
-                if not torch.isfinite(partials[name][:rows*splits*n]).all().item():
+                if rows <= 129 and not torch.isfinite(partials[name][:rows*splits*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned partial not overwritten")
                 graphs[name] = graph
                 hashes[name] = hashlib.sha256(outputs[name][:rows*n].cpu().numpy().tobytes()).hexdigest()
             exact = {}
+            expected_partials = partials["cta4"][:min(rows,129)*splits*n].clone()
             for name in libs:
                 exact[name] = (torch.equal(outputs[name][:rows*n].view(torch.int32), outputs["cta4"][:rows*n].view(torch.int32))
-                    and torch.equal(partials[name][:rows*splits*n].view(torch.int32), partials["cta4"][:rows*splits*n].view(torch.int32)))
+                    and torch.equal(partials[name][:min(rows,129)*splits*n].view(torch.int32), expected_partials.view(torch.int32)))
                 if not exact[name]:
                     raise RuntimeError(f"non-bit-exact {k}:{n}:{side} rows={rows} {name}")
                 saved = outputs[name][:n].clone()
@@ -421,8 +425,9 @@ def benchmark_glmf_duel(args):
                 graphs[name].replay()
             timing_graphs = {}
             for name in libs:
+                intervals = 32 if rows <= 129 else (1 if n > 65536 else 4)
                 pairs = [(torch.cuda.Event(enable_timing=True, external=True),
-                          torch.cuda.Event(enable_timing=True, external=True)) for _ in range(32)]
+                          torch.cuda.Event(enable_timing=True, external=True)) for _ in range(intervals)]
                 timed = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(timed):
                     for start, end in pairs:
@@ -451,14 +456,16 @@ def benchmark_glmf_duel(args):
                     sample_snapshots[name].append(snapshot())
             times = {name: statistics.median(v) for name, v in samples.items()}
             for name in libs:
+                if name == "cta4":
+                    continue
                 record = dict(k=k, n=n, side=side, splits=splits, rows=rows, variant=name,
                     baseline_us=times["cta4"], candidate_us=times[name], ratio=times["cta4"]/times[name],
-                    exact=exact[name], sha256=hashes[name], partials_exact=True,
-                    weight_gbs=(k*n*6/8)/(times[name]*1000), samples_us=samples[name], sample_snapshots=sample_snapshots[name], snapshot=snapshot())
+                    exact=exact[name], sha256=hashes[name], partials_exact=True, partials_written=rows <= 129,
+                    weight_gbs=(k*n*6/8)/(times[name]*1000), baseline_samples_us=samples["cta4"], samples_us=samples[name], sample_snapshots=sample_snapshots[name], snapshot=snapshot())
                 report["records"].append(record)
                 print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
             (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
-        del graphs, partials, outputs, x, inputs, payload, scales
+        del graphs, timing_graphs, partials, outputs, x, inputs, payload, scales
         torch.cuda.empty_cache()
     report["metadata"]["snapshot_after"] = snapshot()
     if not args.compile_only:
@@ -473,6 +480,7 @@ def main():
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
+    parser.add_argument("--combined", action="store_true", help="Astra narrow plus Gemini wide/prefill")
     parser.add_argument("--pair-loads", action="store_true", help="screen K6 lane-pair payload load reuse")
     parser.add_argument("--glmf-duel", action="store_true", help="bit-exact native CTA partition screen")
     parser.add_argument("--compile-only", action="store_true", help="export duel arms without timing")
