@@ -53,3 +53,29 @@ def test_rotation_is_stream_ordered_before_ws_fc1_without_cooperative_launch():
         assert any(k.arg == "stream" and isinstance(k.value, ast.Name)
                    and k.value.id == "stream" for k in call.keywords)
         assert not any(k.arg == "cooperative" for k in call.keywords)
+
+
+@pytest.mark.parametrize("lengths", [(1,), (3,), (1, 4, 2, 1), (64, 1, 32)])
+@pytest.mark.parametrize("n_tiles", [12, 14, 24, 48])
+def test_expert_major_claims_are_bijective_and_group_equal_weights(lengths, n_tiles):
+    cls = next(n for n in ast.parse(WS.read_text()).body if isinstance(n, ast.ClassDef))
+    node = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                and n.name == "_ws_expert_major_tile")
+    node.decorator_list = []
+    for arg in node.args.args:
+        arg.annotation = None
+    class DeviceInt(int):
+        def to(self, dtype):
+            return dtype(self)
+    scope = dict(Int32=int)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(WS), "exec"), scope)
+    experts = [DeviceInt(i) for i, length in enumerate(lengths) for _ in range(length)]
+    count = len(experts) * n_tiles
+    mapping = [scope[node.name](None, t, n_tiles, count, experts) for t in range(count)]
+    assert sorted(mapping) == list(range(count))
+    first = 0
+    for length in lengths:
+        expected = [(first + rb) * n_tiles + nt
+                    for nt in range(n_tiles) for rb in range(length)]
+        assert mapping[first * n_tiles:(first + length) * n_tiles] == expected
+        first += length

@@ -359,7 +359,7 @@ def _e4m3x4_scaled_to_f16x4(packed: Uint32, scale_bits: Uint32, *, loc=None, ip=
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
-    WS_ABI_VERSION = 5
+    WS_ABI_VERSION = 6
 
     def __init__(
         self,
@@ -1055,6 +1055,35 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         return size
 
     @cute.jit
+    def _ws_expert_major_tile(
+        self, t: Int32, n_tiles: Int32, total_tiles: Int32,
+        block_expert_ids: cute.Tensor,
+    ):
+        # Transpose only inside a contiguous expert run. Claims for one N tile
+        # then share its weight stream across route blocks without changing K.
+        rb = t // n_tiles
+        expert = block_expert_ids[rb].to(Int32)
+        first = rb
+        last = rb + Int32(1)
+        scanning = Int32(1)
+        while scanning != Int32(0):
+            scanning = Int32(0)
+            if first > Int32(0):
+                if block_expert_ids[first - Int32(1)].to(Int32) == expert:
+                    first -= Int32(1)
+                    scanning = Int32(1)
+        scanning = Int32(1)
+        while scanning != Int32(0):
+            scanning = Int32(0)
+            if last < total_tiles // n_tiles:
+                if block_expert_ids[last].to(Int32) == expert:
+                    last += Int32(1)
+                    scanning = Int32(1)
+        blocks = last - first
+        offset = t - first * n_tiles
+        return (first + offset % blocks) * n_tiles + offset // blocks
+
+    @cute.jit
     def _ws_next_claim(
         self,
         is_fc1: cutlass.Constexpr,
@@ -1114,8 +1143,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                             c = total_tiles
                             found = Int32(1)
                         else:
-                            _rb, _nt, _comb, c_tier, _local = self._ws_tile_meta(is_fc1, c, *meta)
+                            mapped = self._ws_expert_major_tile(
+                                c, n_tiles, total_tiles, block_expert_ids
+                            )
+                            _rb, _nt, _comb, c_tier, _local = self._ws_tile_meta(is_fc1, mapped, *meta)
                             if c_tier >= Int32(0):
+                                c = mapped
                                 found = Int32(1)
                             else:
                                 c = _atom_add_relaxed_gpu(counter_addr, Int32(1))
