@@ -82,6 +82,13 @@ def glmf_aggregate(records):
     return aggregate
 
 
+SIBLING_INGRESS_GROUPS = {
+    (4096, 4096, 1): ("qkv", 3),
+    (4096, 1024, 1): ("moe_gate_up", 2),
+    (4096, 6144, 1): ("dense_gate_up", 2),
+}
+
+
 def benchmark_layer_replay(args):
     """Back-to-back projections with distinct weights, warm and cold L2 cache."""
     import torch
@@ -96,6 +103,10 @@ def benchmark_layer_replay(args):
         "KDA": [(4096, 4096, 1)] * 3 + [(4096, 4096, 2)],
         "MLA": [(4096, 1536, 1), (4096, 512, 1), (1536, 8192, 1), (8192, 4096, 2)],
     }
+    sibling_spans = {
+        "KDA": {0: 3, 4: 2},
+        "MLA": {4: 2},
+    }
     results = []
     def load(directory, stem, pointers, scalars):
         lib = C.CDLL(str((directory / f"{stem}.so").resolve()))
@@ -104,67 +115,99 @@ def benchmark_layer_replay(args):
         lib.run.restype = C.c_int32
         lib.load()
         return lib
+    rot_dt = torch.bfloat16 if args.input_dtype == "bf16" else torch.float16
     for layer, shapes in mixes.items():
         shapes = shapes + [(4096, 1024, 1)] * 2 + [(1024, 4096, 2)]
+        spans = sibling_spans[layer]
+        sibling_root = {}
+        for start_idx, count in spans.items():
+            for off in range(1, count):
+                sibling_root[start_idx + off] = start_idx
         owned = []
-        runners = []
-        for k, n, side in shapes:
+        grouped_ingress = {}
+        for idx, (k, n, side) in enumerate(shapes):
             directory = args.output_dir / f"k{k}_n{n}_s{side}_b{args.bits}_{args.codebook}_{args.input_dtype}_mr{max_rows}"
-            libs = {}
-            fused_egress = {}
-            for name in ("baseline", "candidate"):
-                meta = json.loads((directory / f"{name}.json").read_text())
-                fused = bool(meta.get("output_transform_dtype"))
-                fused_egress[name] = fused
-                libs[name] = load(directory, name, 7 if fused else 5, 3)
+            libs = {name: load(directory, name, 5, 3) for name in ("baseline", "candidate")}
             ingress = load(directory, "ingress", 4, 2)
             egress = load(directory, "egress", 3, 2)
-            source = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
-            x = torch.empty(8, k, device="cuda", dtype=torch.bfloat16 if args.input_dtype == "bf16" else torch.float16)
-            inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
+            if idx in spans:
+                g = spans[idx]
+                grouped_ingress[idx] = load(directory, f"ingress_g{g}", 1 + 3 * g, 2)
+            if idx in sibling_root:
+                source = owned[sibling_root[idx]][2]
+            else:
+                source = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
+            xs = {a: torch.empty(8, k, device="cuda", dtype=rot_dt) for a in libs}
+            inputs = {a: torch.tensor([xs[a].data_ptr()], device="cuda", dtype=torch.int64) for a in libs}
             payload = torch.randint(256, (k * n * args.bits // 8,), device="cuda", dtype=torch.uint8)
-            scales = torch.ones(k // 128, device="cuda", dtype=torch.float16)
+            scales = {a: torch.ones(k // 128, device="cuda", dtype=torch.float16) for a in libs}
             suh = torch.rand(k, device="cuda", dtype=torch.float16) + 0.125
             svh = torch.rand(n, device="cuda", dtype=torch.float16) + 0.125
             parts = {a: torch.empty(8 * ((k + 1023) // 1024) * n, device="cuda") for a in libs}
             outs = {a: torch.empty(8 * n, device="cuda") for a in libs}
             finals = {a: torch.empty(8 * n, device="cuda", dtype=torch.bfloat16) for a in libs}
-            owned.append((k, n, source, x, inputs, payload, scales, suh, svh, parts, outs, finals, libs, fused_egress, ingress, egress))
-            def call(arm, rows, state=owned[-1]):
-                k, n, source, x, inputs, payload, scales, suh, svh, parts, outs, finals, libs, fused_egress, ingress, egress = state
-                stream = torch.cuda.current_stream().cuda_stream
-                c0 = ingress.run(source.data_ptr(), suh.data_ptr(), x.data_ptr(), scales.data_ptr(), rows, props.multi_processor_count * 4, stream)
-                if fused_egress[arm]:
-                    c1 = libs[arm].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                                       parts[arm].data_ptr(), outs[arm].data_ptr(),
-                                       svh.data_ptr(), finals[arm].data_ptr(),
-                                       rows, 0, props.multi_processor_count * 4, stream)
-                    codes = (c0, c1)
-                else:
-                    c1 = libs[arm].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
-                                       parts[arm].data_ptr(), outs[arm].data_ptr(),
-                                       rows, 0, props.multi_processor_count * 4, stream)
-                    c2 = egress.run(outs[arm].data_ptr(), svh.data_ptr(), finals[arm].data_ptr(),
-                                    rows, props.multi_processor_count * 4, stream)
-                    codes = (c0, c1, c2)
-                if any(codes):
-                    raise RuntimeError(codes)
-            runners.append(call)
+            owned.append((k, n, source, xs, inputs, payload, scales, suh, svh, parts, outs, finals, libs, ingress, egress))
+
+        def run_layer(arm, rows):
+            stream = torch.cuda.current_stream().cuda_stream
+            lim = props.multi_processor_count * 4
+            if arm == "baseline":
+                for state in owned:
+                    k, n, source, xs, inputs, payload, scales, suh, svh, parts, outs, finals, libs, ingress, egress = state
+                    c0 = ingress.run(source.data_ptr(), suh.data_ptr(), xs[arm].data_ptr(), scales[arm].data_ptr(), rows, lim, stream)
+                    c1 = libs[arm].run(inputs[arm].data_ptr(), payload.data_ptr(), scales[arm].data_ptr(),
+                                       parts[arm].data_ptr(), outs[arm].data_ptr(), rows, 0, lim, stream)
+                    c2 = egress.run(outs[arm].data_ptr(), svh.data_ptr(), finals[arm].data_ptr(), rows, lim, stream)
+                    if c0 or c1 or c2:
+                        raise RuntimeError((c0, c1, c2))
+            else:
+                idx = 0
+                while idx < len(owned):
+                    if idx in spans:
+                        g = spans[idx]
+                        grp = owned[idx:idx + g]
+                        c0 = grouped_ingress[idx].run(
+                            grp[0][2].data_ptr(),
+                            *(s[7].data_ptr() for s in grp),
+                            *(s[3][arm].data_ptr() for s in grp),
+                            *(s[6][arm].data_ptr() for s in grp),
+                            rows, lim, stream,
+                        )
+                        if c0:
+                            raise RuntimeError(c0)
+                        for state in grp:
+                            k, n, source, xs, inputs, payload, scales, suh, svh, parts, outs, finals, libs, ingress, egress = state
+                            c1 = libs[arm].run(inputs[arm].data_ptr(), payload.data_ptr(), scales[arm].data_ptr(),
+                                               parts[arm].data_ptr(), outs[arm].data_ptr(), rows, 0, lim, stream)
+                            c2 = egress.run(outs[arm].data_ptr(), svh.data_ptr(), finals[arm].data_ptr(), rows, lim, stream)
+                            if c1 or c2:
+                                raise RuntimeError((c1, c2))
+                        idx += g
+                    else:
+                        k, n, source, xs, inputs, payload, scales, suh, svh, parts, outs, finals, libs, ingress, egress = owned[idx]
+                        c0 = ingress.run(source.data_ptr(), suh.data_ptr(), xs[arm].data_ptr(), scales[arm].data_ptr(), rows, lim, stream)
+                        c1 = libs[arm].run(inputs[arm].data_ptr(), payload.data_ptr(), scales[arm].data_ptr(),
+                                           parts[arm].data_ptr(), outs[arm].data_ptr(), rows, 0, lim, stream)
+                        c2 = egress.run(outs[arm].data_ptr(), svh.data_ptr(), finals[arm].data_ptr(), rows, lim, stream)
+                        if c0 or c1 or c2:
+                            raise RuntimeError((c0, c1, c2))
+                        idx += 1
+
         for rows in (4, 8):
             graphs = {}
             for arm in ("baseline", "candidate"):
-                for call in runners:
-                    call(arm, rows)
+                run_layer(arm, rows)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    for call in runners:
-                        call(arm, rows)
+                    run_layer(arm, rows)
                 graphs[arm] = graph
             for state in owned:
                 k, n = state[0], state[1]
                 splits = (k + 1023) // 1024
-                parts, outs, finals = state[9], state[10], state[11]
+                xs, scales, parts, outs, finals = state[3], state[6], state[9], state[10], state[11]
                 for arm in ("baseline", "candidate"):
+                    xs[arm][:rows].fill_(float("nan"))
+                    scales[arm].fill_(float("nan"))
                     parts[arm][:rows * splits * n].fill_(float("nan"))
                     outs[arm][:rows * n].fill_(float("nan"))
                     finals[arm][:rows * n].fill_(float("nan"))
@@ -174,7 +217,13 @@ def benchmark_layer_replay(args):
             for state in owned:
                 k, n = state[0], state[1]
                 splits = (k + 1023) // 1024
-                parts, outs, finals = state[9], state[10], state[11]
+                xs, scales, parts, outs, finals = state[3], state[6], state[9], state[10], state[11]
+                if not torch.equal(xs["baseline"][:rows].view(torch.int16),
+                                   xs["candidate"][:rows].view(torch.int16)):
+                    raise RuntimeError(f"layer replay rotated input byte mismatch on {layer} {k}x{n} M={rows}")
+                if not torch.equal(scales["baseline"].view(torch.int16),
+                                   scales["candidate"].view(torch.int16)):
+                    raise RuntimeError(f"layer replay block scales byte mismatch on {layer} {k}x{n} M={rows}")
                 if not torch.equal(finals["baseline"][:rows * n].view(torch.int16),
                                    finals["candidate"][:rows * n].view(torch.int16)):
                     raise RuntimeError(f"layer replay final byte mismatch on {layer} {k}x{n} M={rows}")
@@ -197,10 +246,11 @@ def benchmark_layer_replay(args):
                         end.synchronize()
                         samples[arm].append(begin.elapsed_time(end) * 1000)
                 base, cand = (statistics.median(samples[a]) for a in ("baseline", "candidate"))
-                rec = dict(layer=layer, rows=rows, cache=mode, baseline_us=base, candidate_us=cand, ratio=base / cand, exact=True, samples_us=samples)
+                rec = dict(layer=layer, rows=rows, cache=mode, baseline_us=base, candidate_us=cand, ratio=base / cand,
+                           exact=True, transformed_exact=True, partials_exact=True, samples_us=samples)
                 print(json.dumps({k: v for k, v in rec.items() if k != "samples_us"}), flush=True)
                 results.append(rec)
-        del graphs, runners, owned
+        del graphs, owned, grouped_ingress
     return results
 
 
@@ -478,21 +528,24 @@ def benchmark_native_comparison(args):
         import multiprocessing
         from b12x._lib.compile_pool import _initialize_worker
         # Driver attributes do not create a CUDA context in this compiler process.
-        status, = cuda.cuInit(0)
-        if int(status):
-            raise RuntimeError(status)
-        def attribute(name):
-            status, value = cuda.cuDeviceGetAttribute(getattr(cuda.CUdevice_attribute, name), 0)
+        try:
+            status, = cuda.cuInit(0)
             if int(status):
                 raise RuntimeError(status)
-            return value
-        capability = tuple(attribute("CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_" + part)
-                           for part in ("MAJOR", "MINOR"))
+            def attribute(name):
+                status, value = cuda.cuDeviceGetAttribute(getattr(cuda.CUdevice_attribute, name), 0)
+                if int(status):
+                    raise RuntimeError(status)
+                return value
+            capability = tuple(attribute("CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_" + part)
+                               for part in ("MAJOR", "MINOR"))
+            sms = attribute("CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT")
+            smem_optin = attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN")
+            smem_mp = attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR")
+        except RuntimeError:
+            capability, sms, smem_optin, smem_mp = (12, 0), 188, 101376, 102400
         _initialize_worker(0, capability, "native-byte-comparison", "native-byte-comparison",
-                           attribute("CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT"),
-                           attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN"),
-                           attribute("CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR"),
-                           multiprocessing.Array("i", [0, 0]))
+                           sms, smem_optin, smem_mp, multiprocessing.Array("i", [0, 0]))
 
     def snapshot():
         if args.compile_only:
@@ -621,7 +674,7 @@ def benchmark_native_comparison(args):
     report = dict(metadata=dict(device=props.name if props else "CPU-only", sms=props.multi_processor_count if props else None,
         l2_bytes=l2, dram_read_gbs=dram_read_gbs, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
         input_dtype=args.input_dtype, codebook=args.codebook,
-        ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[], cta_limit_checks=[])
+        ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[], cta_limit_checks=[], sibling_ingress=[], sibling_aggregate=[])
     if not args.compile_only and streaming_read_info is not None:
         report["metadata"]["streaming_read"] = streaming_read_info
         report["metadata"]["mix"] = {":".join(map(str, s)): count for s, count in GLMF_VERIFY_MIX.items()}
@@ -636,29 +689,26 @@ def benchmark_native_comparison(args):
         directory.mkdir(parents=True, exist_ok=True)
         libs = {}
         fused_egress = {}
+        sibling_info = SIBLING_INGRESS_GROUPS.get((k, n, side))
         for stem, core in arms:
-            out_tf_dtype = (("f32" if n > 65536 else "bf16") if (use_transforms and stem == "candidate") else None)
             if args.compile_only:
-                if stem == "baseline" and (directory / "baseline.so").exists() and (directory / "baseline.json").exists():
+                if (directory / f"{stem}.so").exists() and (directory / f"{stem}.json").exists():
                     continue
-                print(f"compile {k}:{n}:{side} {stem} max_rows={max_rows} out_tf={out_tf_dtype}", flush=True)
+                print(f"compile {k}:{n}:{side} {stem} max_rows={max_rows}", flush=True)
                 _native.NativeTrellisLinear = core
                 try:
                     with exportable_compilation():
                         program = compile_trellis_linear_aot(input_features=k, output_features=n,
                             bits=args.bits, codebook=args.codebook, sharded_side=side, rotation_count=1,
-                            max_rows=max_rows, input_dtype=args.input_dtype,
-                            output_transform_dtype=out_tf_dtype)
+                            max_rows=max_rows, input_dtype=args.input_dtype)
                 finally:
                     _native.NativeTrellisLinear = candidate
                 exported(program, directory, stem, load_module=False)
                 (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
             else:
-                meta = json.loads((directory / f"{stem}.json").read_text())
-                fused = bool(meta.get("output_transform_dtype"))
-                fused_egress[stem] = fused
-                libs[stem] = load(directory, stem, pointers=7 if fused else 5, scalars=3)
-        ingress = egress = None
+                fused_egress[stem] = False
+                libs[stem] = load(directory, stem, pointers=5, scalars=3)
+        ingress = egress = sibling_ingress = None
         if use_transforms:
             from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
             if args.compile_only:
@@ -669,8 +719,17 @@ def benchmark_native_comparison(args):
                                                         output_dtype="f32" if n > 65536 else "bf16")
                     exported(ip, directory, "ingress", load_module=False)
                     exported(op, directory, "egress", load_module=False)
+                if sibling_info is not None:
+                    _, g = sibling_info
+                    if not (directory / f"ingress_g{g}.so").exists():
+                        with exportable_compilation():
+                            ip_g = compile_trellis_input_aot(features=k, max_rows=max_rows, output_dtype=args.input_dtype, groups=g)
+                        exported(ip_g, directory, f"ingress_g{g}", load_module=False)
             else:
                 ingress, egress = load(directory, "ingress", 4, 2), load(directory, "egress", 3, 2)
+                if sibling_info is not None:
+                    _, g = sibling_info
+                    sibling_ingress = load(directory, f"ingress_g{g}", 1 + 3 * g, 2)
         if args.compile_only:
             continue
         capacity = max(rows_list)
@@ -700,6 +759,30 @@ def benchmark_native_comparison(args):
             svh = torch.rand(n, device="cuda", dtype=torch.float16) + .125
             final_dtype = torch.float32 if n > 65536 else torch.bfloat16
             finals = {name: torch.empty(capacity*n, device="cuda", dtype=final_dtype) for name in libs}
+            sib_state = None
+            if sibling_info is not None:
+                sib_role, sib_g = sibling_info
+                sib_gen = torch.Generator(device="cuda").manual_seed(273000 + k * 17 + n * 3 + side)
+                rot_dt = getattr(torch, {"bf16": "bfloat16", "f16": "float16"}[args.input_dtype])
+                sib_payloads = [payload] + [
+                    torch.randint(256, (k * n * args.bits // 8,), generator=sib_gen, device="cuda", dtype=torch.uint8)
+                    for _ in range(sib_g - 1)
+                ]
+                sib_suhs = [suh] + [
+                    torch.rand(k, generator=sib_gen, device="cuda", dtype=torch.float16) + 0.125
+                    for _ in range(sib_g - 1)
+                ]
+                sib_svhs = [svh] + [
+                    torch.rand(n, generator=sib_gen, device="cuda", dtype=torch.float16) + 0.125
+                    for _ in range(sib_g - 1)
+                ]
+                sib_xs = {name: [torch.empty(capacity, k, device="cuda", dtype=rot_dt) for _ in range(sib_g)] for name in libs}
+                sib_inputs = {name: [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in sib_xs[name]] for name in libs}
+                sib_scales = {name: [torch.empty(k // 128, device="cuda", dtype=torch.float16) for _ in range(sib_g)] for name in libs}
+                sib_parts = {name: [torch.empty(decode_cap * splits * n, device="cuda") for _ in range(sib_g)] for name in libs}
+                sib_outs = {name: [torch.empty(capacity * n, device="cuda") for _ in range(sib_g)] for name in libs}
+                sib_finals = {name: [torch.empty(capacity * n, device="cuda", dtype=final_dtype) for _ in range(sib_g)] for name in libs}
+                sib_state = (sib_role, sib_g, sib_payloads, sib_suhs, sib_svhs, sib_xs, sib_inputs, sib_scales, sib_parts, sib_outs, sib_finals)
         boost_warmup()
         for rows in rows_list:
             graphs = {}
@@ -862,8 +945,120 @@ def benchmark_native_comparison(args):
                 pct_dram_bw=(100.0 * c_gbs / dram_read_gbs) if dram_read_gbs else None,
                 bandwidth_fraction=(c_gbs / dram_read_gbs) if dram_read_gbs else None,
                 baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot())
+            if args.transforms and sib_state is not None:
+                sib_role, sib_g, sib_payloads, sib_suhs, sib_svhs, sib_xs, sib_inputs, sib_scales, sib_parts, sib_outs, sib_finals = sib_state
+                def call_sib(name, count=rows, cta_limit=None):
+                    stream = torch.cuda.current_stream().cuda_stream
+                    lim = (props.multi_processor_count * 4) if cta_limit is None else cta_limit
+                    if name == "baseline":
+                        for g_idx in range(sib_g):
+                            c0 = ingress.run(source.data_ptr(), sib_suhs[g_idx].data_ptr(),
+                                             sib_xs[name][g_idx].data_ptr(), sib_scales[name][g_idx].data_ptr(),
+                                             count, lim, stream)
+                            c1 = libs[name].run(sib_inputs[name][g_idx].data_ptr(), sib_payloads[g_idx].data_ptr(),
+                                                sib_scales[name][g_idx].data_ptr(), sib_parts[name][g_idx].data_ptr(),
+                                                sib_outs[name][g_idx].data_ptr(), count, 0, lim, stream)
+                            c2 = egress.run(sib_outs[name][g_idx].data_ptr(), sib_svhs[g_idx].data_ptr(),
+                                            sib_finals[name][g_idx].data_ptr(), count, lim, stream)
+                            if c0 or c1 or c2:
+                                raise RuntimeError((c0, c1, c2))
+                    else:
+                        c0 = sibling_ingress.run(
+                            source.data_ptr(),
+                            *(s.data_ptr() for s in sib_suhs),
+                            *(t.data_ptr() for t in sib_xs[name]),
+                            *(s.data_ptr() for s in sib_scales[name]),
+                            count, lim, stream,
+                        )
+                        if c0:
+                            raise RuntimeError(c0)
+                        for g_idx in range(sib_g):
+                            c1 = libs[name].run(sib_inputs[name][g_idx].data_ptr(), sib_payloads[g_idx].data_ptr(),
+                                                sib_scales[name][g_idx].data_ptr(), sib_parts[name][g_idx].data_ptr(),
+                                                sib_outs[name][g_idx].data_ptr(), count, 0, lim, stream)
+                            c2 = egress.run(sib_outs[name][g_idx].data_ptr(), sib_svhs[g_idx].data_ptr(),
+                                            sib_finals[name][g_idx].data_ptr(), count, lim, stream)
+                            if c1 or c2:
+                                raise RuntimeError((c1, c2))
+
+                for check_lim in (None, 1, 2):
+                    for name in libs:
+                        for g_idx in range(sib_g):
+                            sib_xs[name][g_idx][:rows].fill_(float("nan"))
+                            sib_scales[name][g_idx].fill_(float("nan"))
+                            sib_parts[name][g_idx][:rows * splits * n].fill_(float("nan"))
+                            sib_outs[name][g_idx][:rows * n].fill_(float("nan"))
+                            sib_finals[name][g_idx][:rows * n].fill_(float("nan"))
+                        call_sib(name, count=rows, cta_limit=check_lim)
+                    torch.cuda.synchronize()
+                    for g_idx in range(sib_g):
+                        if not torch.equal(sib_xs["candidate"][g_idx][:rows].view(torch.int16),
+                                           sib_xs["baseline"][g_idx][:rows].view(torch.int16)):
+                            raise RuntimeError(f"sibling ingress rotated input mismatch {sib_role}[{g_idx}] rows={rows} lim={check_lim}")
+                        if not torch.equal(sib_scales["candidate"][g_idx].view(torch.int16),
+                                           sib_scales["baseline"][g_idx].view(torch.int16)):
+                            raise RuntimeError(f"sibling ingress block scales mismatch {sib_role}[{g_idx}] rows={rows} lim={check_lim}")
+                        if not torch.equal(sib_parts["candidate"][g_idx][:rows * splits * n].view(torch.int32),
+                                           sib_parts["baseline"][g_idx][:rows * splits * n].view(torch.int32)):
+                            raise RuntimeError(f"sibling ingress partial mismatch {sib_role}[{g_idx}] rows={rows} lim={check_lim}")
+                        if not torch.equal(sib_outs["candidate"][g_idx][:rows * n].view(torch.int32),
+                                           sib_outs["baseline"][g_idx][:rows * n].view(torch.int32)):
+                            raise RuntimeError(f"sibling ingress output mismatch {sib_role}[{g_idx}] rows={rows} lim={check_lim}")
+                        if not torch.equal(sib_finals["candidate"][g_idx][:rows * n].view(torch.int16),
+                                           sib_finals["baseline"][g_idx][:rows * n].view(torch.int16)):
+                            raise RuntimeError(f"sibling ingress transformed output mismatch {sib_role}[{g_idx}] rows={rows} lim={check_lim}")
+
+                sib_timing_graphs = {}
+                sib_events = {}
+                for name in libs:
+                    pairs = [(torch.cuda.Event(enable_timing=True, external=True),
+                              torch.cuda.Event(enable_timing=True, external=True)) for _ in range(intervals)]
+                    timed = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(timed):
+                        for start, end in pairs:
+                            flush.zero_()
+                            start.record()
+                            call_sib(name)
+                            end.record()
+                    sib_timing_graphs[name] = timed
+                    sib_events[name] = pairs
+                    timed.replay()
+                torch.cuda.synchronize()
+                sib_samples = {name: [] for name in libs}
+                for repeat in range(args.samples):
+                    order = list(libs) if repeat % 2 == 0 else list(reversed(libs))
+                    for name in order:
+                        sib_timing_graphs[name].replay()
+                        sib_events[name][-1][1].synchronize()
+                        sib_samples[name].append(statistics.mean(start.elapsed_time(end) * 1000 for start, end in sib_events[name]))
+                del sib_timing_graphs, sib_events
+                sib_group_times = {name: statistics.median(v) for name, v in sib_samples.items()}
+                sib_rec = dict(
+                    role=sib_role, groups=sib_g, k=k, n=n, side=side, splits=splits, rows=rows,
+                    baseline_group_us=sib_group_times["baseline"],
+                    candidate_group_us=sib_group_times["candidate"],
+                    baseline_per_proj_us=sib_group_times["baseline"] / sib_g,
+                    candidate_per_proj_us=sib_group_times["candidate"] / sib_g,
+                    single_proj_candidate_us=times["candidate"],
+                    saved_group_us=sib_g * times["candidate"] - sib_group_times["candidate"],
+                    ratio=sib_group_times["baseline"] / sib_group_times["candidate"],
+                    exact=True, output_exact=True, partials_exact=True, transformed_exact=True,
+                    rotated_input_exact=True, scales_exact=True, cta_limit_1_2_exact=True,
+                )
+                report["sibling_ingress"].append(sib_rec)
+
             report["records"].append(record)
             report["aggregate"] = glmf_aggregate(report["records"])
+            sib_by_cell = {(r["k"], r["n"], r["side"], r["rows"]): r for r in report["sibling_ingress"]}
+            sib_records = []
+            for r in report["records"]:
+                key = (r["k"], r["n"], r["side"], r["rows"])
+                if key in sib_by_cell:
+                    sr = sib_by_cell[key]
+                    sib_records.append({**r, "baseline_us": sr["baseline_per_proj_us"], "candidate_us": sr["candidate_per_proj_us"]})
+                else:
+                    sib_records.append(r)
+            report["sibling_aggregate"] = glmf_aggregate(sib_records)
             print(json.dumps({key: value for key, value in record.items() if key not in ("samples_us", "baseline_samples_us")}), flush=True)
             (args.output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
         (args.output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")

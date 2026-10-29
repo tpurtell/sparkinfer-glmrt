@@ -98,8 +98,8 @@ class _Output:
 
 
 class _GroupedTransform:
-    def __init__(self, features, max_rows, ingress):
-        self.features, self.max_rows, self.ingress = features, max_rows, ingress
+    def __init__(self, features, max_rows, ingress, groups=4):
+        self.features, self.max_rows, self.ingress, self.groups = features, max_rows, ingress, groups
         self.blocks = features // 128
 
     @cute.jit
@@ -111,7 +111,7 @@ class _GroupedTransform:
         if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
             self.kernel(sources, scales, outputs, block_scales, rows).launch(
                 grid=(min(rows * Int32(self.blocks), cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
+                block=(32 * self.groups, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, sources: tuple[cute.Pointer, cute.Pointer, cute.Pointer, cute.Pointer],
@@ -220,6 +220,71 @@ class _GroupedInput:
                   rows, cta_limit, stream)
 
 
+class _GroupedInput2:
+    def __init__(self, features, max_rows):
+        self.core = _GroupedTransform(features, max_rows, True, 2)
+
+    @cute.jit
+    def __call__(self, input: cute.Pointer,
+                 q_suh: cute.Pointer, k_suh: cute.Pointer,
+                 q_rotated: cute.Pointer, k_rotated: cute.Pointer,
+                 q_input_block_scales: cute.Pointer, k_input_block_scales: cute.Pointer,
+                 rows: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        self.core((input, input, input, input), (q_suh, k_suh, q_suh, q_suh),
+                  (q_rotated, k_rotated, q_rotated, q_rotated),
+                  (q_input_block_scales, k_input_block_scales,
+                   q_input_block_scales, q_input_block_scales),
+                  rows, cta_limit, stream)
+
+
+class _GroupedInput3:
+    def __init__(self, features, max_rows):
+        self.core = _GroupedTransform(features, max_rows, True, 3)
+
+    @cute.jit
+    def __call__(self, input: cute.Pointer,
+                 q_suh: cute.Pointer, k_suh: cute.Pointer, v_suh: cute.Pointer,
+                 q_rotated: cute.Pointer, k_rotated: cute.Pointer, v_rotated: cute.Pointer,
+                 q_input_block_scales: cute.Pointer, k_input_block_scales: cute.Pointer,
+                 v_input_block_scales: cute.Pointer,
+                 rows: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        self.core((input, input, input, input), (q_suh, k_suh, v_suh, q_suh),
+                  (q_rotated, k_rotated, v_rotated, q_rotated),
+                  (q_input_block_scales, k_input_block_scales,
+                   v_input_block_scales, q_input_block_scales),
+                  rows, cta_limit, stream)
+
+
+class _GroupedOutput2:
+    def __init__(self, features, max_rows):
+        self.core = _GroupedTransform(features, max_rows, False, 2)
+
+    @cute.jit
+    def __call__(self, q_input: cute.Pointer, k_input: cute.Pointer,
+                 q_svh: cute.Pointer, k_svh: cute.Pointer,
+                 q_output: cute.Pointer, k_output: cute.Pointer,
+                 rows: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        svh = (q_svh, k_svh, q_svh, q_svh)
+        self.core((q_input, k_input, q_input, q_input), svh,
+                  (q_output, k_output, q_output, q_output), svh,
+                  rows, cta_limit, stream)
+
+
+class _GroupedOutput3:
+    def __init__(self, features, max_rows):
+        self.core = _GroupedTransform(features, max_rows, False, 3)
+
+    @cute.jit
+    def __call__(self, q_input: cute.Pointer, k_input: cute.Pointer, v_input: cute.Pointer,
+                 q_svh: cute.Pointer, k_svh: cute.Pointer, v_svh: cute.Pointer,
+                 q_output: cute.Pointer, k_output: cute.Pointer, v_output: cute.Pointer,
+                 rows: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        svh = (q_svh, k_svh, v_svh, q_svh)
+        self.core((q_input, k_input, v_input, q_input), svh,
+                  (q_output, k_output, v_output, q_output), svh,
+                  rows, cta_limit, stream)
+
+
 class _GroupedOutput:
     def __init__(self, features, max_rows):
         self.core = _GroupedTransform(features, max_rows, False)
@@ -241,8 +306,8 @@ class _GroupedOutput:
 def _geometry(features, max_rows, groups=1):
     if any(type(v) is not int or v <= 0 for v in (features, max_rows)) or features % 128:
         raise ValueError("trellis transforms require positive H128-aligned features and rows")
-    if type(groups) is not int or groups not in (1, 4):
-        raise ValueError("trellis transform groups must be 1 or 4")
+    if type(groups) is not int or groups not in (1, 2, 3, 4):
+        raise ValueError("trellis transform groups must be 1, 2, 3, or 4")
     if max_rows * (features // 128) * groups > 2**31 - 1:
         raise ValueError("trellis transform task indexing exceeds signed int32")
 
@@ -267,11 +332,12 @@ def compile_trellis_input_aot(*, features, input_dtype="bf16", max_rows=4096, ou
                     Operand("rotated", out_dt, f"[rows,{features}]", "out"),
                     Operand("input_block_scales", torch.float16, f"[{features//128}]", "out"))
     else:
-        launch = _GroupedInput(features, max_rows)
+        names = GROUP_NAMES[:groups]
+        launch = {2: _GroupedInput2, 3: _GroupedInput3, 4: _GroupedInput}[groups](features, max_rows)
         operands = (Operand("input", in_dt, f"[rows,{features}]"),
-                    *(Operand(f"{p}_suh", torch.float16, f"[{features}]") for p in GROUP_NAMES),
-                    *(Operand(f"{p}_rotated", out_dt, f"[rows,{features}]", "out") for p in GROUP_NAMES),
-                    *(Operand(f"{p}_input_block_scales", torch.float16, f"[{features//128}]", "out") for p in GROUP_NAMES))
+                    *(Operand(f"{p}_suh", torch.float16, f"[{features}]") for p in names),
+                    *(Operand(f"{p}_rotated", out_dt, f"[rows,{features}]", "out") for p in names),
+                    *(Operand(f"{p}_input_block_scales", torch.float16, f"[{features//128}]", "out") for p in names))
     return compile_program(launch, name="trellis_input", operands=operands,
         scalars=(Scalar("rows"), Scalar("cta_limit")), key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1}, doc=__doc__)
 
@@ -290,9 +356,10 @@ def compile_trellis_output_aot(*, features, output_dtype="bf16", max_rows=4096, 
                     Operand("svh", torch.float16, f"[{features}]"),
                     Operand("output", out_dt, f"[rows,{features}]", "out"))
     else:
-        launch = _GroupedOutput(features, max_rows)
-        operands = (*(Operand(f"{p}_input", torch.float32, f"[rows,{features}]") for p in GROUP_NAMES),
-                    *(Operand(f"{p}_svh", torch.float16, f"[{features}]") for p in GROUP_NAMES),
-                    *(Operand(f"{p}_output", out_dt, f"[rows,{features}]", "out") for p in GROUP_NAMES))
+        names = GROUP_NAMES[:groups]
+        launch = {2: _GroupedOutput2, 3: _GroupedOutput3, 4: _GroupedOutput}[groups](features, max_rows)
+        operands = (*(Operand(f"{p}_input", torch.float32, f"[rows,{features}]") for p in names),
+                    *(Operand(f"{p}_svh", torch.float16, f"[{features}]") for p in names),
+                    *(Operand(f"{p}_output", out_dt, f"[rows,{features}]", "out") for p in names))
     return compile_program(launch, name="trellis_output", operands=operands,
         scalars=(Scalar("rows"), Scalar("cta_limit")), key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1}, doc=__doc__)

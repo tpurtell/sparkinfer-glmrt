@@ -27,7 +27,6 @@ from b12x._lib.intrinsics import (
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2, _side_value
-from b12x.moe._shared.kernels.w4a8_trellis_decode import _w4a8_had128_quad
 from b12x.moe._shared.kernels.w4a16.mixed_trellis_ws import (
     _cp_async_mbar_arrive_noinc,
     _fence_mbar_init,
@@ -750,9 +749,9 @@ class NativeTrellisLinear:
             self.multiply_wide_gemini(inputs, payload, scales, partial, rows, rotation_id, 4, 4).launch(
                 grid=(min(((rows + Int32(63)) // Int32(64)) * tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=2, stream=stream)
-        r_blocks = Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else Int32(self.n // 128)
+        r_tasks = rows * Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else (rows * Int32(self.n // 128) + Int32(3)) // Int32(4)
         self.reduce_gemini(partial, output, rows).launch(
-            grid=(min(rows * r_blocks, cta_limit), 1, 1), block=(128, 1, 1), stream=stream)
+            grid=(min(r_tasks, cta_limit), 1, 1), block=(128, 1, 1), stream=stream)
 
     @cute.kernel
     def reduce_gemini(self, partial: cute.Tensor, output: cute.Tensor, rows: Int32):
@@ -781,10 +780,14 @@ class NativeTrellisLinear:
             n_blocks = Int32(self.n // 128)
             p_ptr = partial.iterator.toint()
             o_ptr = output.iterator.toint()
-            while task < rows * n_blocks:
-                row = task // n_blocks
-                if Int32(tid) < Int32(32):
-                    col = (task % n_blocks) * Int32(128) + Int32(tid) * Int32(4)
+            warp = Int32(tid) >> Int32(5)
+            lane = Int32(tid) & Int32(31)
+            total_blocks = rows * n_blocks
+            while task * Int32(4) < total_blocks:
+                blk = task * Int32(4) + warp
+                if blk < total_blocks:
+                    row = blk // n_blocks
+                    col = (blk % n_blocks) * Int32(128) + lane * Int32(4)
                     t0, t1, t2, t3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
                     row_base = p_ptr + (row.to(Int64) * Int64(self.splits * self.n) + col.to(Int64)) * Int64(4)
                     for split in cutlass.range_constexpr(self.splits):
@@ -1189,6 +1192,86 @@ class NativeTrellisLinear:
                         for v in cutlass.range_constexpr(4):
                             result[v] += ld_shared_f32(fold + (Int32(sp*512+n*128+v*32) + lane) * Int32(4))
                     col = nb * Int32(32) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
+                    if row0 < rows:
+                        base = row0.to(Int64) * Int64(self.n) + col.to(Int64)
+                        output[base], output[base+Int64(1)] = result[0], result[1]
+                    if row1 < rows:
+                        base = row1.to(Int64) * Int64(self.n) + col.to(Int64)
+                        output[base], output[base+Int64(1)] = result[2], result[3]
+            cute.arch.sync_threads()
+            task += step
+
+    @cute.kernel
+    def multiply_k6_folded(self, inputs: cute.Tensor, payload: cute.Tensor,
+                        scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                        rows: Int32, rotation_id: Int32):
+        """Keep original split partials, then fold them in-CTA in split order."""
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, split = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        storage = cutlass_utils.SmemAllocator().allocate(self._fold_storage())
+        fold = shared_ptr_to_u32(storage.fold.data_ptr())
+        x = inputs[rotation_id]
+        while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // 16):
+            nb = task % Int32(self.n // 16)
+            group = task // Int32(self.n // 16)
+            policy = weight_stream_policy((group + Int32(1) == (rows + Int32(15)) // Int32(16)).to(Int32))
+            row0 = group * Int32(16) + lane // Int32(4)
+            row1 = row0 + Int32(8)
+            total = cute.make_rmem_tensor((2, 4), Float32)
+            total.fill(Float32(0.0))
+            for block in cutlass.range(8):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.k // 128):
+                    acc = cute.make_rmem_tensor((2, 4), Float32)
+                    acc.fill(Float32(0.0))
+                    for k16 in cutlass.range_constexpr(8):
+                        k = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
+                        a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        if row0 < rows:
+                            addr = x + (row0.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
+                            a0, a2 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
+                        if row1 < rows:
+                            addr = x + (row1.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
+                            a1, a3 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
+                        for n16 in cutlass.range_constexpr(1):
+                            tile = (nb // Int32(8)) * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + (nb % Int32(8)) + Int32(n16)
+                            if cutlass.const_expr(self.input_units):
+                                tile = kb * Int32(self.n // 16 * 8) + (nb // Int32(8)) * Int32(64) + Int32(k16 * 8) + (nb % Int32(8)) + Int32(n16)
+                            b0, b1, b2, b3 = decode_k6_pair(payload.iterator.toint(), tile, lane, self.e4m3, self.mul1, policy)
+                            d0, d1, d2, d3 = self.mma(
+                                acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
+                                a0, a1, a2, a3, b0, b1)
+                            acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
+                            d0, d1, d2, d3 = self.mma(
+                                acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
+                                a0, a1, a2, a3, b2, b3)
+                            acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
+                    scale = _side_value(scales.iterator.toint(), kb)
+                    for n in cutlass.range_constexpr(2):
+                        for v in cutlass.range_constexpr(4):
+                            total[n, v] = total[n, v] + acc[n, v] * scale
+            for n in cutlass.range_constexpr(2):
+                for v in cutlass.range_constexpr(4):
+                    st_shared_f32(fold + (split * Int32(512) + Int32(n*128+v*32) + lane) * Int32(4), total[n,v])
+            for n in cutlass.range_constexpr(2):
+                col = nb * Int32(16) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
+                base = (row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)
+                if row0 < rows:
+                    partial[base], partial[base+Int64(1)] = total[n, 0], total[n, 1]
+                if row1 < rows:
+                    base += Int64(8 * self.splits * self.n)
+                    partial[base], partial[base+Int64(1)] = total[n, 2], total[n, 3]
+            cute.arch.sync_threads()
+            if split == Int32(0):
+                for n in cutlass.range_constexpr(2):
+                    result = cute.make_rmem_tensor((4,), Float32)
+                    result.fill(Float32(0.0))
+                    for sp in cutlass.range_constexpr(self.splits):
+                        for v in cutlass.range_constexpr(4):
+                            result[v] += ld_shared_f32(fold + (Int32(sp*512+n*128+v*32) + lane) * Int32(4))
+                    col = nb * Int32(16) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
                     if row0 < rows:
                         base = row0.to(Int64) * Int64(self.n) + col.to(Int64)
                         output[base], output[base+Int64(1)] = result[0], result[1]
@@ -3441,7 +3524,6 @@ class NativeTrellisLinear:
                                     t0, t1 = ld_shared_v2_f32_offset(group_base, b_rem * 512 + n * 256)
                                     total[n, 0] = fma_rn_f32(t0, scale_rem, total[n, 0])
                                     total[n, 1] = fma_rn_f32(t1, scale_rem, total[n, 1])
-
             col_base = n16_global * Int32(16) + (lane & Int32(3)) * Int32(2)
             if sub == Int32(0):
                 if row0 < rows:
@@ -3642,7 +3724,6 @@ class NativeTrellisLinear:
                                     total[n, 1] = fma_rn_f32(t1, scale_rem, total[n, 1])
                                     total[n, 2] = fma_rn_f32(t2, scale_rem, total[n, 2])
                                     total[n, 3] = fma_rn_f32(t3, scale_rem, total[n, 3])
-
             col_base = n16_global * Int32(16) + (lane & Int32(3)) * Int32(2)
             if sub == Int32(0):
                 p_off = ((row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col_base.to(Int64)) * Int64(4)
@@ -3699,186 +3780,15 @@ class NativeTrellisLinear:
                 cute.arch.sync_threads()
             task += step
 
-    @cute.kernel
-    def reduce_egress(self, partial: cute.Tensor, output: cute.Tensor,
-                      svh: cute.Tensor, transformed_output: cute.Tensor, rows: Int32):
-        tid = Int32(cute.arch.thread_idx()[0])
-        lane, warp = tid & Int32(31), tid >> Int32(5)
-        task = Int32(cute.arch.block_idx()[0]) * Int32(4) + warp
-        step = Int32(cute.arch.grid_dim()[0]) * Int32(4)
-        blocks = Int32(self.n // 128)
-        p_ptr = partial.iterator.toint()
-        o_ptr = output.iterator.toint()
-        while task < rows * blocks:
-            row = task // blocks
-            col = (task % blocks) * Int32(128) + lane * Int32(4)
-            t0, t1, t2, t3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
-            row_base = p_ptr + (row.to(Int64) * Int64(self.splits * self.n) + col.to(Int64)) * Int64(4)
-            for split in cutlass.range_constexpr(self.splits):
-                v0, v1, v2, v3 = ld_global_nc_v4_u32(row_base + Int64(split * self.n * 4))
-                t0 = t0 + u32_as_f32(v0)
-                t1 = t1 + u32_as_f32(v1)
-                t2 = t2 + u32_as_f32(v2)
-                t3 = t3 + u32_as_f32(v3)
-            out_off = row.to(Int64) * Int64(self.n) + col.to(Int64)
-            st_global_v4_f32(o_ptr + out_off * Int64(4), t0, t1, t2, t3)
-            s0, s1 = svh[col].to(Float32), svh[col + Int32(1)].to(Float32)
-            s2, s3 = svh[col + Int32(2)].to(Float32), svh[col + Int32(3)].to(Float32)
-            h0, h1, h2, h3 = _w4a8_had128_quad(t0, t1, t2, t3, lane)
-            h0, h1, h2, h3 = h0 * s0, h1 * s1, h2 * s2, h3 * s3
-            transformed_output[out_off] = h0.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(1)] = h1.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(2)] = h2.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(3)] = h3.to(transformed_output.element_type)
-            task = task + step
-
-    @cute.kernel
-    def reduce_egress_1w(self, partial: cute.Tensor, output: cute.Tensor,
-                         svh: cute.Tensor, transformed_output: cute.Tensor, rows: Int32):
-        lane = Int32(cute.arch.thread_idx()[0])
-        task = Int32(cute.arch.block_idx()[0])
-        step = Int32(cute.arch.grid_dim()[0])
-        blocks = Int32(self.n // 128)
-        p_ptr = partial.iterator.toint()
-        o_ptr = output.iterator.toint()
-        while task < rows * blocks:
-            row = task // blocks
-            col = (task % blocks) * Int32(128) + lane * Int32(4)
-            t0, t1, t2, t3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
-            row_base = p_ptr + (row.to(Int64) * Int64(self.splits * self.n) + col.to(Int64)) * Int64(4)
-            for split in cutlass.range_constexpr(self.splits):
-                v0, v1, v2, v3 = ld_global_nc_v4_u32(row_base + Int64(split * self.n * 4))
-                t0 = t0 + u32_as_f32(v0)
-                t1 = t1 + u32_as_f32(v1)
-                t2 = t2 + u32_as_f32(v2)
-                t3 = t3 + u32_as_f32(v3)
-            out_off = row.to(Int64) * Int64(self.n) + col.to(Int64)
-            st_global_v4_f32(o_ptr + out_off * Int64(4), t0, t1, t2, t3)
-            s0, s1 = svh[col].to(Float32), svh[col + Int32(1)].to(Float32)
-            s2, s3 = svh[col + Int32(2)].to(Float32), svh[col + Int32(3)].to(Float32)
-            h0, h1, h2, h3 = _w4a8_had128_quad(t0, t1, t2, t3, lane)
-            h0, h1, h2, h3 = h0 * s0, h1 * s1, h2 * s2, h3 * s3
-            transformed_output[out_off] = h0.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(1)] = h1.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(2)] = h2.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(3)] = h3.to(transformed_output.element_type)
-            task = task + step
-
-    @cute.kernel
-    def egress_fused_1w(self, output: cute.Tensor, svh: cute.Tensor,
-                        transformed_output: cute.Tensor, rows: Int32):
-        lane = Int32(cute.arch.thread_idx()[0])
-        task = Int32(cute.arch.block_idx()[0])
-        step = Int32(cute.arch.grid_dim()[0])
-        blocks = Int32(self.n // 128)
-        o_ptr = output.iterator.toint()
-        while task < rows * blocks:
-            row = task // blocks
-            col = (task % blocks) * Int32(128) + lane * Int32(4)
-            out_off = row.to(Int64) * Int64(self.n) + col.to(Int64)
-            v0, v1, v2, v3 = ld_global_nc_v4_u32(o_ptr + out_off * Int64(4))
-            t0, t1, t2, t3 = u32_as_f32(v0), u32_as_f32(v1), u32_as_f32(v2), u32_as_f32(v3)
-            s0, s1 = svh[col].to(Float32), svh[col + Int32(1)].to(Float32)
-            s2, s3 = svh[col + Int32(2)].to(Float32), svh[col + Int32(3)].to(Float32)
-            h0, h1, h2, h3 = _w4a8_had128_quad(t0, t1, t2, t3, lane)
-            h0, h1, h2, h3 = h0 * s0, h1 * s1, h2 * s2, h3 * s3
-            transformed_output[out_off] = h0.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(1)] = h1.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(2)] = h2.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(3)] = h3.to(transformed_output.element_type)
-            task = task + step
-
-    @cute.kernel
-    def egress_fused(self, output: cute.Tensor, svh: cute.Tensor,
-                     transformed_output: cute.Tensor, rows: Int32):
-        tid = Int32(cute.arch.thread_idx()[0])
-        lane, warp = tid & Int32(31), tid >> Int32(5)
-        task = Int32(cute.arch.block_idx()[0]) * Int32(4) + warp
-        step = Int32(cute.arch.grid_dim()[0]) * Int32(4)
-        blocks = Int32(self.n // 128)
-        o_ptr = output.iterator.toint()
-        while task < rows * blocks:
-            row = task // blocks
-            col = (task % blocks) * Int32(128) + lane * Int32(4)
-            out_off = row.to(Int64) * Int64(self.n) + col.to(Int64)
-            v0, v1, v2, v3 = ld_global_nc_v4_u32(o_ptr + out_off * Int64(4))
-            t0, t1, t2, t3 = u32_as_f32(v0), u32_as_f32(v1), u32_as_f32(v2), u32_as_f32(v3)
-            s0, s1 = svh[col].to(Float32), svh[col + Int32(1)].to(Float32)
-            s2, s3 = svh[col + Int32(2)].to(Float32), svh[col + Int32(3)].to(Float32)
-            h0, h1, h2, h3 = _w4a8_had128_quad(t0, t1, t2, t3, lane)
-            h0, h1, h2, h3 = h0 * s0, h1 * s1, h2 * s2, h3 * s3
-            transformed_output[out_off] = h0.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(1)] = h1.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(2)] = h2.to(transformed_output.element_type)
-            transformed_output[out_off + Int64(3)] = h3.to(transformed_output.element_type)
-            task = task + step
-
     @cute.jit
     def _launch_k6_opt(self, inputs: cute.Tensor, payload: cute.Tensor,
                        scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                        rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream,
                        n16_narrow: cutlass.Constexpr, fuse_narrow: cutlass.Constexpr, b_sub_narrow: cutlass.Constexpr,
+                       write_out_narrow: cutlass.Constexpr, stream_narrow: cutlass.Constexpr,
                        n16_16: cutlass.Constexpr, fuse_16: cutlass.Constexpr, b_sub_16: cutlass.Constexpr,
-                       stream_narrow: cutlass.Constexpr = False, stream_16: cutlass.Constexpr = False,
+                       write_out_16: cutlass.Constexpr, stream_16: cutlass.Constexpr,
                        use_pair_16: cutlass.Constexpr = False):
-        if rows <= Int32(8):
-            n_tiles = self.n // (16 * n16_narrow)
-            tiles = Int32(n_tiles) if cutlass.const_expr(fuse_narrow) else Int32(n_tiles * self.splits)
-            warps = n16_narrow * (self.splits if fuse_narrow else 1) * b_sub_narrow
-            min_bmp = 2 if warps <= 4 else 1
-            self.multiply_k6_opt_narrow(
-                inputs, payload, scales, partial, output, rows, rotation_id,
-                n16_narrow, fuse_narrow, b_sub_narrow, fuse_narrow, stream_narrow
-            ).launch(
-                grid=(min(tiles, cta_limit), 1, 1),
-                block=(32 * warps, 1, 1),
-                min_blocks_per_mp=min_bmp, stream=stream)
-            if cutlass.const_expr((not fuse_narrow) and self.splits > 1):
-                r_blocks = Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else Int32(self.n // 128)
-                self.reduce_gemini(partial, output, rows).launch(
-                    grid=(min(rows * r_blocks, cta_limit), 1, 1),
-                    block=(128, 1, 1), stream=stream)
-        elif cutlass.const_expr(use_pair_16):
-            tiles = Int32(self.n // (32 * self.decode_cta_warps) * self.splits)
-            self.multiply_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id).launch(
-                grid=(min(tiles, cta_limit), 1, 1),
-                block=(32 * self.decode_cta_warps, 1, 1),
-                min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            r_blocks = Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else Int32(self.n // 128)
-            self.reduce_gemini(partial, output, rows).launch(
-                grid=(min(rows * r_blocks, cta_limit), 1, 1),
-                block=(128, 1, 1), stream=stream)
-        else:
-            n_tiles = self.n // (16 * n16_16)
-            tiles = Int32(n_tiles) if cutlass.const_expr(fuse_16) else Int32(n_tiles * self.splits)
-            warps = n16_16 * (self.splits if fuse_16 else 1) * b_sub_16
-            min_bmp = 2 if warps <= 4 else 1
-            self.multiply_k6_opt_16(
-                inputs, payload, scales, partial, output, rows, rotation_id,
-                n16_16, fuse_16, b_sub_16, fuse_16, stream_16
-            ).launch(
-                grid=(min(tiles, cta_limit), 1, 1),
-                block=(32 * warps, 1, 1),
-                min_blocks_per_mp=min_bmp, stream=stream)
-            if cutlass.const_expr((not fuse_16) and self.splits > 1):
-                r_blocks = Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else Int32(self.n // 128)
-                self.reduce_gemini(partial, output, rows).launch(
-                    grid=(min(rows * r_blocks, cta_limit), 1, 1),
-                    block=(128, 1, 1), stream=stream)
-
-    @cute.jit
-    def _launch_k6_opt_transformed(
-        self, inputs: cute.Tensor, payload: cute.Tensor,
-        scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
-        svh: cute.Tensor, transformed_output: cute.Tensor,
-        rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream,
-        n16_narrow: cutlass.Constexpr, fuse_narrow: cutlass.Constexpr, b_sub_narrow: cutlass.Constexpr,
-        write_out_narrow: cutlass.Constexpr, stream_narrow: cutlass.Constexpr,
-        n16_16: cutlass.Constexpr, fuse_16: cutlass.Constexpr, b_sub_16: cutlass.Constexpr,
-        write_out_16: cutlass.Constexpr, stream_16: cutlass.Constexpr,
-        use_pair_16: cutlass.Constexpr = False,
-    ):
-        eg_grid_1w = min(rows * Int32(self.n // 128), cta_limit)
         if rows <= Int32(8):
             n_tiles = self.n // (16 * n16_narrow)
             tiles = Int32(n_tiles) if cutlass.const_expr(fuse_narrow) else Int32(n_tiles * self.splits)
@@ -3891,20 +3801,21 @@ class NativeTrellisLinear:
                 grid=(min(tiles, cta_limit), 1, 1),
                 block=(32 * warps, 1, 1),
                 min_blocks_per_mp=min_bmp, stream=stream)
-            if cutlass.const_expr(write_out_narrow and (fuse_narrow or self.splits == 1)):
-                self.egress_fused_1w(output, svh, transformed_output, rows).launch(
-                    grid=(eg_grid_1w, 1, 1), block=(32, 1, 1), stream=stream)
-            else:
-                self.reduce_egress_1w(partial, output, svh, transformed_output, rows).launch(
-                    grid=(eg_grid_1w, 1, 1), block=(32, 1, 1), stream=stream)
+            if cutlass.const_expr((not (write_out_narrow and (fuse_narrow or self.splits == 1))) and self.splits > 1):
+                r_tasks = rows * Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else (rows * Int32(self.n // 128) + Int32(3)) // Int32(4)
+                self.reduce_gemini(partial, output, rows).launch(
+                    grid=(min(r_tasks, cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
         elif cutlass.const_expr(use_pair_16):
             tiles = Int32(self.n // (32 * self.decode_cta_warps) * self.splits)
             self.multiply_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id).launch(
                 grid=(min(tiles, cta_limit), 1, 1),
                 block=(32 * self.decode_cta_warps, 1, 1),
                 min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-            self.reduce_egress_1w(partial, output, svh, transformed_output, rows).launch(
-                grid=(eg_grid_1w, 1, 1), block=(32, 1, 1), stream=stream)
+            r_tasks = rows * Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else (rows * Int32(self.n // 128) + Int32(3)) // Int32(4)
+            self.reduce_gemini(partial, output, rows).launch(
+                grid=(min(r_tasks, cta_limit), 1, 1),
+                block=(128, 1, 1), stream=stream)
         else:
             n_tiles = self.n // (16 * n16_16)
             tiles = Int32(n_tiles) if cutlass.const_expr(fuse_16) else Int32(n_tiles * self.splits)
@@ -3917,74 +3828,11 @@ class NativeTrellisLinear:
                 grid=(min(tiles, cta_limit), 1, 1),
                 block=(32 * warps, 1, 1),
                 min_blocks_per_mp=min_bmp, stream=stream)
-            if cutlass.const_expr(write_out_16 and (fuse_16 or self.splits == 1)):
-                self.egress_fused_1w(output, svh, transformed_output, rows).launch(
-                    grid=(eg_grid_1w, 1, 1), block=(32, 1, 1), stream=stream)
-            else:
-                self.reduce_egress_1w(partial, output, svh, transformed_output, rows).launch(
-                    grid=(eg_grid_1w, 1, 1), block=(32, 1, 1), stream=stream)
-
-    @cute.jit
-    def call_transformed(self, inputs: cute.Tensor, payload: cute.Tensor,
-                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
-                         svh: cute.Tensor, transformed_output: cute.Tensor,
-                         rows: Int32, rotation_id: Int32, cta_limit: Int32,
-                         stream: cuda.CUstream):
-        if rows > Int32(0) and rows <= Int32(self.max_rows) and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations) and cta_limit > Int32(0):
-            eg_grid = min((rows * Int32(self.n // 128) + Int32(3)) // Int32(4), cta_limit)
-            if cutlass.const_expr(self.bits == 6):
-                if rows <= Int32(16):
-                    if cutlass.const_expr(self.n > 65536):
-                        tiles = Int32(self.n // 128 * self.splits)
-                        self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
-                            grid=(min(tiles, cta_limit), 1, 1),
-                            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                        self.reduce_egress(partial, output, svh, transformed_output, rows).launch(
-                            grid=(eg_grid, 1, 1), block=(128, 1, 1), stream=stream)
-                    elif cutlass.const_expr(self.splits == 1):
-                        self._launch_k6_opt_transformed(
-                            inputs, payload, scales, partial, output, svh, transformed_output,
-                            rows, rotation_id, cta_limit, stream,
-                            1, True, 4, False, False,
-                            1, True, 2, False, False, False,
-                        )
-                    elif cutlass.const_expr(self.splits <= 4):
-                        if cutlass.const_expr(self.n < 4096 or self.splits == 2):
-                            self._launch_k6_opt_transformed(
-                                inputs, payload, scales, partial, output, svh, transformed_output,
-                                rows, rotation_id, cta_limit, stream,
-                                1, True, 2, False, False,
-                                1, True, 2, False, False, False,
-                            )
-                        else:
-                            self._launch_k6_opt_transformed(
-                                inputs, payload, scales, partial, output, svh, transformed_output,
-                                rows, rotation_id, cta_limit, stream,
-                                1, True, 2, False, False,
-                                1, True, 1, False, False, True,
-                            )
-                    elif cutlass.const_expr(self.splits == 6):
-                        self._launch_k6_opt_transformed(
-                            inputs, payload, scales, partial, output, svh, transformed_output,
-                            rows, rotation_id, cta_limit, stream,
-                            1, True, 1, True, True,
-                            1, True, 1, True, True, False,
-                        )
-                    else:
-                        self._launch_k6_opt_transformed(
-                            inputs, payload, scales, partial, output, svh, transformed_output,
-                            rows, rotation_id, cta_limit, stream,
-                            1, True, 1, True, True,
-                            1, True, 1, True, True, True,
-                        )
-                else:
-                    self._generic_call(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
-                    self.egress_fused(output, svh, transformed_output, rows).launch(
-                        grid=(eg_grid, 1, 1), block=(128, 1, 1), stream=stream)
-            else:
-                self.__call__(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
-                self.egress_fused(output, svh, transformed_output, rows).launch(
-                    grid=(eg_grid, 1, 1), block=(128, 1, 1), stream=stream)
+            if cutlass.const_expr((not (write_out_16 and (fuse_16 or self.splits == 1))) and self.splits > 1):
+                r_tasks = rows * Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else (rows * Int32(self.n // 128) + Int32(3)) // Int32(4)
+                self.reduce_gemini(partial, output, rows).launch(
+                    grid=(min(r_tasks, cta_limit), 1, 1),
+                    block=(128, 1, 1), stream=stream)
 
     @cute.jit
     def _decode_k6(self, inputs: cute.Tensor, payload: cute.Tensor,
@@ -3996,21 +3844,47 @@ class NativeTrellisLinear:
                 self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
                     grid=(min(tiles, cta_limit), 1, 1),
                     block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-                r_blocks = Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else Int32(self.n // 128)
+                r_tasks = rows * Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else (rows * Int32(self.n // 128) + Int32(3)) // Int32(4)
                 self.reduce_gemini(partial, output, rows).launch(
-                    grid=(min(rows * r_blocks, cta_limit), 1, 1),
+                    grid=(min(r_tasks, cta_limit), 1, 1),
                     block=(128, 1, 1), stream=stream)
+            elif cutlass.const_expr(2 < self.splits <= 8 and (self.k & (self.k - 1)) != 0 and self.n <= 6144):
+                self.multiply_k6_folded(inputs, payload, scales, partial, output, rows, rotation_id).launch(
+                    grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
+                    block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
             elif cutlass.const_expr(self.splits == 1):
-                self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 4, 1, True, 2, False, False, False)
+                self._launch_k6_opt(
+                    inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream,
+                    1, True, 4, True, False,
+                    1, True, 2, True, False, False)
+            elif cutlass.const_expr(self.splits == 2):
+                self.multiply_k6_opt_16(
+                    inputs, payload, scales, partial, output, rows, rotation_id,
+                    1, True, 2, True, False
+                ).launch(
+                    grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
+                    block=(128, 1, 1), min_blocks_per_mp=2, stream=stream)
             elif cutlass.const_expr(self.splits <= 4):
-                if cutlass.const_expr(self.n < 4096 or self.splits == 2):
-                    self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2, False, False, False)
+                if cutlass.const_expr(self.n < 4096):
+                    self._launch_k6_opt(
+                        inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream,
+                        1, True, 2, True, False,
+                        1, True, 2, True, False, False)
                 else:
-                    self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1, False, False, True)
-            elif cutlass.const_expr(self.splits == 6):
-                self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 1, 1, True, 1, True, True, False)
+                    self._launch_k6_opt(
+                        inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream,
+                        1, True, 2, True, False,
+                        1, True, 1, True, False, True)
+            elif cutlass.const_expr(self.splits == 8):
+                self._launch_k6_opt(
+                    inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream,
+                    1, True, 1, True, True,
+                    1, True, 1, True, True, True)
             else:
-                self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 1, 1, True, 1, True, True, True)
+                self._launch_k6_opt(
+                    inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream,
+                    1, True, 1, True, False,
+                    1, True, 1, True, False, False)
         elif rows <= Int32(32):
             if cutlass.const_expr(self.n > 65536 or self.splits == 1):
                 self._decode_existing(inputs, payload, scales, partial, output,
