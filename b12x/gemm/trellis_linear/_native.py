@@ -133,6 +133,40 @@ def ld_global_nc_u32_offset(base_ptr: Int64, offset: int, *, loc=None, ip=None) 
 
 
 @dsl_user_op
+def _ld_global_nc_u32_l2hint_offset(
+    base_ptr: Int64, offset: int, policy: Int64, *, loc=None, ip=None
+) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip), Int64(policy).ir_value(loc=loc, ip=ip)],
+            f"ld.global.nc.L2::cache_hint.u32 $0, [$1 + {int(offset)}], $2;",
+            "=r,l,l",
+            has_side_effects=True, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _decode_k6_words(
+    z0: Uint32, z1: Uint32, z2: Uint32, shift: Int32, delta: Int32,
+    bits: cutlass.Constexpr, e4m3: cutlass.Constexpr, mul1: cutlass.Constexpr,
+):
+    wa, wb = trellis_align_stream_u32x2(z0, z1, z2, shift, delta)
+    if cutlass.const_expr(mul1):
+        b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, bits)
+    elif cutlass.const_expr(bits == 6):
+        b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, bits)
+    else:
+        b0, b1, b2, b3 = packed_dequant_trellis_to_half2x4(wa, wb, bits)
+    if cutlass.const_expr(e4m3):
+        b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+        b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+    return b0, b1, b2, b3
+
+
+@dsl_user_op
 def cp_async4_zfill_shared_global_offset(
     smem_base: Int32, smem_off: int, gmem_base: Int64, gmem_off: int, src_size: Int32,
     *, loc=None, ip=None
@@ -700,6 +734,8 @@ class NativeTrellisLinear:
                     self._gemini_decode(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             else:
                 self._gemini_decode(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+        elif cutlass.const_expr(self.bits == 6 and not self.e4m3):
+            self._gemini_decode(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
         else:
             self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
 
@@ -756,12 +792,23 @@ class NativeTrellisLinear:
                 st_global_v4_f32(out_addr, t0, t1, t2, t3)
                 task += step
         else:
-            while task < rows * Int32(self.n // 128):
-                row, col = task // Int32(self.n // 128), (task % Int32(self.n // 128)) * Int32(128) + Int32(tid)
-                total = Float32(0.0)
-                for split in cutlass.range(self.splits):
-                    total += partial[(row.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)]
-                output[row.to(Int64) * Int64(self.n) + col.to(Int64)] = total
+            n_blocks = Int32(self.n // 128)
+            p_ptr = partial.iterator.toint()
+            o_ptr = output.iterator.toint()
+            while task < rows * n_blocks:
+                row = task // n_blocks
+                if Int32(tid) < Int32(32):
+                    col = (task % n_blocks) * Int32(128) + Int32(tid) * Int32(4)
+                    t0, t1, t2, t3 = Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)
+                    row_base = p_ptr + (row.to(Int64) * Int64(self.splits * self.n) + col.to(Int64)) * Int64(4)
+                    for split in cutlass.range_constexpr(self.splits):
+                        v0, v1, v2, v3 = ld_global_nc_v4_u32(row_base + Int64(split * self.n * 4))
+                        t0 = t0 + u32_as_f32(v0)
+                        t1 = t1 + u32_as_f32(v1)
+                        t2 = t2 + u32_as_f32(v2)
+                        t3 = t3 + u32_as_f32(v3)
+                    out_addr = o_ptr + (row.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
+                    st_global_v4_f32(out_addr, t0, t1, t2, t3)
                 task += step
 
 
@@ -829,8 +876,15 @@ class NativeTrellisLinear:
         x = inputs[rotation_id]
         row0 = lane >> Int32(2)
         r0c = min(row0, rows - Int32(1))
+        has_r0 = row0 < rows
         x_row = x + (r0c.to(Int64) * Int64(self.k) + ((lane & Int32(3)) * Int32(2)).to(Int64)) * Int64(2)
+        i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, self.bits)
+        i1 = i0 + Int32(1)
+        i1 -= Int32(8 * self.bits) * (i1 >= Int32(8 * self.bits)).to(Int32)
         w_base_ptr = payload.iterator.toint() + (lane.to(Int64) * Int64(4) if cutlass.const_expr(self.bits == 4) else Int64(0))
+        w_off0 = i0.to(Int64) * Int64(4)
+        w_off1 = i1.to(Int64) * Int64(4)
+        w_off2 = i2.to(Int64) * Int64(4)
         policy = weight_stream_policy(Int32(1))
         tiles = Int32(self.n // 128 * self.splits)
         while task < tiles:
@@ -848,21 +902,59 @@ class NativeTrellisLinear:
                     if cutlass.const_expr(self.input_units):
                         tile_kb = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + warp * Int32(2)
                     w_kb = w_base_ptr + tile_kb.to(Int64) * Int64(32 * self.bits)
-                    for k16 in cutlass.range_constexpr(8):
-                        a0 = ld_global_nc_u32(x0_kb + Int64(k16 * 32))
-                        a2 = ld_global_nc_u32(x0_kb + Int64(k16 * 32 + 16))
-                        for n16 in cutlass.range_constexpr(2):
-                            w_addr = w_kb + Int64((k16 * 8 + n16) * (32 * self.bits))
-                            b0, b1, b2, b3 = decode_tile_from_base(
-                                w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
-                            d0, d1, _, _ = f16_mma_m16n8k16_f32(
-                                acc[2*n16, 0], acc[2*n16, 1], Float32(0.0), Float32(0.0),
-                                a0, Uint32(0), a2, Uint32(0), b0, b1)
-                            acc[2*n16, 0], acc[2*n16, 1] = d0, d1
-                            d0, d1, _, _ = f16_mma_m16n8k16_f32(
-                                acc[2*n16+1, 0], acc[2*n16+1, 1], Float32(0.0), Float32(0.0),
-                                a0, Uint32(0), a2, Uint32(0), b2, b3)
-                            acc[2*n16+1, 0], acc[2*n16+1, 1] = d0, d1
+                    if cutlass.const_expr(self.bits == 6):
+                        p0_kb = w_kb + w_off0
+                        p1_kb = w_kb + w_off1
+                        p2_kb = w_kb + w_off2
+                        for k16 in cutlass.range_constexpr(8):
+                            a0, a2 = Uint32(0), Uint32(0)
+                            if has_r0:
+                                a0 = ld_global_nc_u32_offset(x0_kb, k16 * 32)
+                                a2 = ld_global_nc_u32_offset(x0_kb, k16 * 32 + 16)
+                            off_n0 = (k16 * 8 + 0) * (32 * self.bits)
+                            off_n1 = (k16 * 8 + 1) * (32 * self.bits)
+                            z0_0 = _ld_global_nc_u32_l2hint_offset(p0_kb, off_n0, policy)
+                            z1_0 = _ld_global_nc_u32_l2hint_offset(p1_kb, off_n0, policy)
+                            z2_0 = _ld_global_nc_u32_l2hint_offset(p2_kb, off_n0, policy)
+                            z0_1 = _ld_global_nc_u32_l2hint_offset(p0_kb, off_n1, policy)
+                            z1_1 = _ld_global_nc_u32_l2hint_offset(p1_kb, off_n1, policy)
+                            z2_1 = _ld_global_nc_u32_l2hint_offset(p2_kb, off_n1, policy)
+                            b0_0, b1_0, b2_0, b3_0 = _decode_k6_words(
+                                z0_0, z1_0, z2_0, shift, delta, self.bits, self.e4m3, self.mul1)
+                            d0, d1, _, _ = self.mma(
+                                acc[0, 0], acc[0, 1], Float32(0.0), Float32(0.0),
+                                a0, Uint32(0), a2, Uint32(0), b0_0, b1_0)
+                            acc[0, 0], acc[0, 1] = d0, d1
+                            d0, d1, _, _ = self.mma(
+                                acc[1, 0], acc[1, 1], Float32(0.0), Float32(0.0),
+                                a0, Uint32(0), a2, Uint32(0), b2_0, b3_0)
+                            acc[1, 0], acc[1, 1] = d0, d1
+                            b0_1, b1_1, b2_1, b3_1 = _decode_k6_words(
+                                z0_1, z1_1, z2_1, shift, delta, self.bits, self.e4m3, self.mul1)
+                            d0, d1, _, _ = self.mma(
+                                acc[2, 0], acc[2, 1], Float32(0.0), Float32(0.0),
+                                a0, Uint32(0), a2, Uint32(0), b0_1, b1_1)
+                            acc[2, 0], acc[2, 1] = d0, d1
+                            d0, d1, _, _ = self.mma(
+                                acc[3, 0], acc[3, 1], Float32(0.0), Float32(0.0),
+                                a0, Uint32(0), a2, Uint32(0), b2_1, b3_1)
+                            acc[3, 0], acc[3, 1] = d0, d1
+                    else:
+                        for k16 in cutlass.range_constexpr(8):
+                            a0 = ld_global_nc_u32(x0_kb + Int64(k16 * 32))
+                            a2 = ld_global_nc_u32(x0_kb + Int64(k16 * 32 + 16))
+                            for n16 in cutlass.range_constexpr(2):
+                                w_addr = w_kb + Int64((k16 * 8 + n16) * (32 * self.bits))
+                                b0, b1, b2, b3 = decode_tile_from_base(
+                                    w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
+                                d0, d1, _, _ = self.mma(
+                                    acc[2*n16, 0], acc[2*n16, 1], Float32(0.0), Float32(0.0),
+                                    a0, Uint32(0), a2, Uint32(0), b0, b1)
+                                acc[2*n16, 0], acc[2*n16, 1] = d0, d1
+                                d0, d1, _, _ = self.mma(
+                                    acc[2*n16+1, 0], acc[2*n16+1, 1], Float32(0.0), Float32(0.0),
+                                    a0, Uint32(0), a2, Uint32(0), b2, b3)
+                                acc[2*n16+1, 0], acc[2*n16+1, 1] = d0, d1
                     scale = _side_value(scales.iterator.toint(), kb)
                     for n in cutlass.range_constexpr(4):
                         for v in cutlass.range_constexpr(2):
@@ -883,7 +975,13 @@ class NativeTrellisLinear:
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
         x = inputs[rotation_id]
+        i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, self.bits)
+        i1 = i0 + Int32(1)
+        i1 -= Int32(8 * self.bits) * (i1 >= Int32(8 * self.bits)).to(Int32)
         w_base_ptr = payload.iterator.toint() + (lane.to(Int64) * Int64(4) if cutlass.const_expr(self.bits == 4) else Int64(0))
+        w_off0 = i0.to(Int64) * Int64(4)
+        w_off1 = i1.to(Int64) * Int64(4)
+        w_off2 = i2.to(Int64) * Int64(4)
         while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // 128 * self.splits):
             split = task % Int32(self.splits)
             nb = (task // Int32(self.splits)) % Int32(self.n // 128)
@@ -896,6 +994,7 @@ class NativeTrellisLinear:
             r1c = min(row1, rows - Int32(1))
             x0_row = x + (r0c.to(Int64) * Int64(self.k) + ((lane & Int32(3)) * Int32(2)).to(Int64)) * Int64(2)
             x1_row = x + (r1c.to(Int64) * Int64(self.k) + ((lane & Int32(3)) * Int32(2)).to(Int64)) * Int64(2)
+            has_r0 = row0 < rows
             has_r1 = row1 < rows
             total = cute.make_rmem_tensor((4, 4), Float32)
             total.fill(Float32(0.0))
@@ -910,25 +1009,67 @@ class NativeTrellisLinear:
                     if cutlass.const_expr(self.input_units):
                         tile_kb = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + warp * Int32(2)
                     w_kb = w_base_ptr + tile_kb.to(Int64) * Int64(32 * self.bits)
-                    for k16 in cutlass.range_constexpr(8):
-                        a0 = ld_global_nc_u32(x0_kb + Int64(k16 * 32))
-                        a2 = ld_global_nc_u32(x0_kb + Int64(k16 * 32 + 16))
-                        a1, a3 = Uint32(0), Uint32(0)
-                        if has_r1:
-                            a1 = ld_global_nc_u32(x1_kb + Int64(k16 * 32))
-                            a3 = ld_global_nc_u32(x1_kb + Int64(k16 * 32 + 16))
-                        for n16 in cutlass.range_constexpr(2):
-                            w_addr = w_kb + Int64((k16 * 8 + n16) * (32 * self.bits))
-                            b0, b1, b2, b3 = decode_tile_from_base(
-                                w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
-                                a0, a1, a2, a3, b0, b1)
-                            acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
-                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
-                                acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
-                                a0, a1, a2, a3, b2, b3)
-                            acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
+                    if cutlass.const_expr(self.bits == 6):
+                        p0_kb = w_kb + w_off0
+                        p1_kb = w_kb + w_off1
+                        p2_kb = w_kb + w_off2
+                        for k16 in cutlass.range_constexpr(8):
+                            a0, a2 = Uint32(0), Uint32(0)
+                            if has_r0:
+                                a0 = ld_global_nc_u32_offset(x0_kb, k16 * 32)
+                                a2 = ld_global_nc_u32_offset(x0_kb, k16 * 32 + 16)
+                            a1, a3 = Uint32(0), Uint32(0)
+                            if has_r1:
+                                a1 = ld_global_nc_u32_offset(x1_kb, k16 * 32)
+                                a3 = ld_global_nc_u32_offset(x1_kb, k16 * 32 + 16)
+                            off_n0 = (k16 * 8 + 0) * (32 * self.bits)
+                            off_n1 = (k16 * 8 + 1) * (32 * self.bits)
+                            z0_0 = _ld_global_nc_u32_l2hint_offset(p0_kb, off_n0, policy)
+                            z1_0 = _ld_global_nc_u32_l2hint_offset(p1_kb, off_n0, policy)
+                            z2_0 = _ld_global_nc_u32_l2hint_offset(p2_kb, off_n0, policy)
+                            z0_1 = _ld_global_nc_u32_l2hint_offset(p0_kb, off_n1, policy)
+                            z1_1 = _ld_global_nc_u32_l2hint_offset(p1_kb, off_n1, policy)
+                            z2_1 = _ld_global_nc_u32_l2hint_offset(p2_kb, off_n1, policy)
+                            b0_0, b1_0, b2_0, b3_0 = _decode_k6_words(
+                                z0_0, z1_0, z2_0, shift, delta, self.bits, self.e4m3, self.mul1)
+                            d0, d1, d2, d3 = self.mma(
+                                acc[0, 0], acc[0, 1], acc[0, 2], acc[0, 3],
+                                a0, a1, a2, a3, b0_0, b1_0)
+                            acc[0, 0], acc[0, 1], acc[0, 2], acc[0, 3] = d0, d1, d2, d3
+                            d0, d1, d2, d3 = self.mma(
+                                acc[1, 0], acc[1, 1], acc[1, 2], acc[1, 3],
+                                a0, a1, a2, a3, b2_0, b3_0)
+                            acc[1, 0], acc[1, 1], acc[1, 2], acc[1, 3] = d0, d1, d2, d3
+                            b0_1, b1_1, b2_1, b3_1 = _decode_k6_words(
+                                z0_1, z1_1, z2_1, shift, delta, self.bits, self.e4m3, self.mul1)
+                            d0, d1, d2, d3 = self.mma(
+                                acc[2, 0], acc[2, 1], acc[2, 2], acc[2, 3],
+                                a0, a1, a2, a3, b0_1, b1_1)
+                            acc[2, 0], acc[2, 1], acc[2, 2], acc[2, 3] = d0, d1, d2, d3
+                            d0, d1, d2, d3 = self.mma(
+                                acc[3, 0], acc[3, 1], acc[3, 2], acc[3, 3],
+                                a0, a1, a2, a3, b2_1, b3_1)
+                            acc[3, 0], acc[3, 1], acc[3, 2], acc[3, 3] = d0, d1, d2, d3
+                    else:
+                        for k16 in cutlass.range_constexpr(8):
+                            a0 = ld_global_nc_u32(x0_kb + Int64(k16 * 32))
+                            a2 = ld_global_nc_u32(x0_kb + Int64(k16 * 32 + 16))
+                            a1, a3 = Uint32(0), Uint32(0)
+                            if has_r1:
+                                a1 = ld_global_nc_u32(x1_kb + Int64(k16 * 32))
+                                a3 = ld_global_nc_u32(x1_kb + Int64(k16 * 32 + 16))
+                            for n16 in cutlass.range_constexpr(2):
+                                w_addr = w_kb + Int64((k16 * 8 + n16) * (32 * self.bits))
+                                b0, b1, b2, b3 = decode_tile_from_base(
+                                    w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
+                                d0, d1, d2, d3 = self.mma(
+                                    acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
+                                    a0, a1, a2, a3, b0, b1)
+                                acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = self.mma(
+                                    acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
+                                    a0, a1, a2, a3, b2, b3)
+                                acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
                     scale = _side_value(scales.iterator.toint(), kb)
                     for n in cutlass.range_constexpr(4):
                         for v in cutlass.range_constexpr(4):
@@ -982,9 +1123,14 @@ class NativeTrellisLinear:
                     k_col = (kb * Int32(128) + c * Int32(8)).to(Int64)
                     for s in cutlass.range_constexpr(2 * active):
                         row = r_grp + Int32(s * 8) if cutlass.const_expr(active < 4) else group * Int32(M) + r_grp + Int32(s * 8)
-                        row_c = row if cutlass.const_expr(active in (2, 3) and s < 2 * (active - 1)) else min(row, rows - Int32(1))
-                        v0, v1, v2, v3 = ld_global_nc_v4_u32(
-                            x + (row_c.to(Int64) * Int64(self.k) + k_col) * Int64(2))
+                        v0, v1, v2, v3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        if cutlass.const_expr(active in (2, 3) and s < 2 * (active - 1)):
+                            v0, v1, v2, v3 = ld_global_nc_v4_u32(
+                                x + (row.to(Int64) * Int64(self.k) + k_col) * Int64(2))
+                        else:
+                            if row < rows:
+                                v0, v1, v2, v3 = ld_global_nc_v4_u32(
+                                    x + (row.to(Int64) * Int64(self.k) + k_col) * Int64(2))
                         st_shared_v4_u32(sx_store + Int32(s * 8 * 16), v0, v1, v2, v3)
                     cute.arch.sync_threads()
                     tile_kb = nb * Int32(self.k // 16 * 8) + kb * Int32(64) + warp * Int32(2)
@@ -1006,11 +1152,11 @@ class NativeTrellisLinear:
                                 b0, b1, b2, b3 = decode_tile_from_base(
                                     w_addr, lane, self.bits, self.e4m3, self.mul1, policy, self.bits == 4)
                                 for mb in cutlass.range_constexpr(active):
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = self.mma(
                                         acc[mb, 2 * n16, 0], acc[mb, 2 * n16, 1], acc[mb, 2 * n16, 2], acc[mb, 2 * n16, 3],
                                         a[mb, 0], a[mb, 1], a[mb, 2], a[mb, 3], b0, b1)
                                     acc[mb, 2 * n16, 0], acc[mb, 2 * n16, 1], acc[mb, 2 * n16, 2], acc[mb, 2 * n16, 3] = d0, d1, d2, d3
-                                    d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                    d0, d1, d2, d3 = self.mma(
                                         acc[mb, 2 * n16 + 1, 0], acc[mb, 2 * n16 + 1, 1], acc[mb, 2 * n16 + 1, 2], acc[mb, 2 * n16 + 1, 3],
                                         a[mb, 0], a[mb, 1], a[mb, 2], a[mb, 3], b2, b3)
                                     acc[mb, 2 * n16 + 1, 0], acc[mb, 2 * n16 + 1, 1], acc[mb, 2 * n16 + 1, 2], acc[mb, 2 * n16 + 1, 3] = d0, d1, d2, d3
@@ -1034,11 +1180,11 @@ class NativeTrellisLinear:
                                         a1 = ld_shared_u32(sx_read + Int32(((2 * k16) * M_PAD + mb * 16 + 8) * 16))
                                         a2 = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16) * 16))
                                         a3 = ld_shared_u32(sx_read + Int32(((2 * k16 + 1) * M_PAD + mb * 16 + 8) * 16))
-                                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        d0, d1, d2, d3 = self.mma(
                                             acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
                                             a0, a1, a2, a3, b0, b1)
                                         acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
-                                        d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                        d0, d1, d2, d3 = self.mma(
                                             acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
                                             a0, a1, a2, a3, b2, b3)
                                         acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
@@ -1055,11 +1201,11 @@ class NativeTrellisLinear:
                                             a1 = ld_shared_u32(sx_k + Int32(((2 * ki) * M_PAD + mb * 16 + 8) * 16))
                                             a2 = ld_shared_u32(sx_k + Int32(((2 * ki + 1) * M_PAD + mb * 16) * 16))
                                             a3 = ld_shared_u32(sx_k + Int32(((2 * ki + 1) * M_PAD + mb * 16 + 8) * 16))
-                                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                            d0, d1, d2, d3 = self.mma(
                                                 acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3],
                                                 a0, a1, a2, a3, b0, b1)
                                             acc[mb, 0, 0], acc[mb, 0, 1], acc[mb, 0, 2], acc[mb, 0, 3] = d0, d1, d2, d3
-                                            d0, d1, d2, d3 = f16_mma_m16n8k16_f32(
+                                            d0, d1, d2, d3 = self.mma(
                                                 acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3],
                                                 a0, a1, a2, a3, b2, b3)
                                             acc[mb, 1, 0], acc[mb, 1, 1], acc[mb, 1, 2], acc[mb, 1, 3] = d0, d1, d2, d3
