@@ -23,7 +23,8 @@ SCALARS = ("rows", "rotation_id", "cta_limit")
 
 
 def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
-             sharded_side=1, rotation_count=4, max_rows=4096, groups=1, input_dtype="f16"):
+             sharded_side=1, rotation_count=4, max_rows=4096, groups=1, input_dtype="f16",
+             output_transform_dtype=None):
     values = (input_features, output_features, rotation_count, max_rows)
     if any(type(v) is not int or not 0 < v <= 2**31-1 for v in values):
         raise ValueError("trellis geometry must contain positive int32 dimensions")
@@ -33,6 +34,8 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
         raise ValueError("trellis requires K2--K6, mcg/mul1/e4m3/f16, side 1/2 and groups 1/4")
     if input_dtype not in ("f16", "bf16"):
         raise ValueError("trellis input dtype must be f16 or bf16")
+    if output_transform_dtype is not None and output_transform_dtype not in ("f32", "bf16"):
+        raise ValueError("trellis output_transform_dtype must be f32 or bf16")
     splits = (input_features + 1023) // 1024
     tasks = (max_rows + 15) // 16 * (output_features // 128) * splits * groups
     if max(tasks, max_rows * (output_features // 128) * groups, input_features * output_features // 256) > (2**31-1)//2:
@@ -44,7 +47,9 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
                 output_features=output_features, bits=bits, codebook=codebook,
                 sharded_side=sharded_side, rotation_count=rotation_count,
                 max_rows=max_rows, split_k_blocks=8, splits=splits, input_dtype=input_dtype,
-                ctas_per_sm=CTAS_PER_SM, **({"groups": groups} if groups != 1 else {}))
+                ctas_per_sm=CTAS_PER_SM,
+                **({"groups": groups} if groups != 1 else {}),
+                **({"output_transform_dtype": output_transform_dtype} if output_transform_dtype is not None else {}))
 
 
 class _Pointers:
@@ -64,6 +69,30 @@ class _Pointers:
                   cute.make_tensor(partial, cute.make_layout(1, stride=1)),
                   cute.make_tensor(output, cute.make_layout(1, stride=1)),
                   rows, rotation_id, cta_limit, stream)
+
+
+class _TransformedPointers:
+    def __init__(self, g):
+        from b12x.gemm.trellis_linear._native import NativeTrellisLinear
+        self.core = NativeTrellisLinear(g)
+
+    @cute.jit
+    def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
+                 input_block_scales: cute.Pointer, partial: cute.Pointer,
+                 output: cute.Pointer, svh: cute.Pointer,
+                 transformed_output: cute.Pointer, rows: cutlass.Int32,
+                 rotation_id: cutlass.Int32, cta_limit: cutlass.Int32,
+                 stream: cuda.CUstream):
+        layout = cute.make_layout(1, stride=1)
+        self.core.call_transformed(
+            cute.make_tensor(rotated_inputs, layout),
+            cute.make_tensor(payload, layout),
+            cute.make_tensor(input_block_scales, layout),
+            cute.make_tensor(partial, layout),
+            cute.make_tensor(output, layout),
+            cute.make_tensor(svh, layout),
+            cute.make_tensor(transformed_output, layout),
+            rows, rotation_id, cta_limit, stream)
 
 
 GROUP_NAMES = ("q", "k", "v", "g")
@@ -100,12 +129,26 @@ class _GroupedPointers:
 
 def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
                                codebook="e4m3", sharded_side=1,
-                               rotation_count=4, max_rows=4096, groups=1, input_dtype="f16"):
+                               rotation_count=4, max_rows=4096, groups=1, input_dtype="f16",
+                               output_transform_dtype=None):
     g = geometry(input_features, output_features, bits=bits, codebook=codebook,
                  sharded_side=sharded_side, rotation_count=rotation_count,
-                 max_rows=max_rows, groups=groups, input_dtype=input_dtype)
+                 max_rows=max_rows, groups=groups, input_dtype=input_dtype,
+                 output_transform_dtype=output_transform_dtype)
     k, n, s = g["input_features"], g["output_features"], g["splits"]
-    if groups == 1:
+    if groups == 1 and output_transform_dtype is not None:
+        out_dtype = torch.bfloat16 if output_transform_dtype == "bf16" else torch.float32
+        operands = (
+            Operand("rotated_inputs", torch.int64, f"[{rotation_count}]"),
+            Operand("payload", torch.uint8, f"[{k*n*bits//8}]"),
+            Operand("input_block_scales", torch.float16, f"[{k//128}]"),
+            Operand("partial", torch.float32, f"[rows,{s},{n}]", "scratch"),
+            Operand("output", torch.float32, f"[rows,{n}]", "out"),
+            Operand("svh", torch.float16, f"[{n}]"),
+            Operand("transformed_output", out_dtype, f"[rows,{n}]", "out"),
+        )
+        pointers = _TransformedPointers(g)
+    elif groups == 1:
         operands = (
             Operand("rotated_inputs", torch.int64, f"[{rotation_count}]"),
             Operand("payload", torch.uint8, f"[{k*n*bits//8}]"),
