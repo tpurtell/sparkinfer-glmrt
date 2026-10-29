@@ -395,14 +395,19 @@ def test_grouped_geometry_fails_closed(groups, rotation_count):
 @pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("bits", [5, 6])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
-def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
+@pytest.mark.parametrize("input_dtype", ["f16", "bf16"])
+@pytest.mark.parametrize("k,n", [(1152, 256), pytest.param(7168, 6144,
+    marks=pytest.mark.skipif(__import__("os").environ.get("NATIVE_TRELLIS_FULL_SHAPES") != "1",
+                             reason="opt-in full Kimi grouped geometry gate"))])
+def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook, input_dtype, k, n):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
 
     rng = np.random.default_rng(273)
-    k, n, max_rows = 1152, 256, 512
+    max_rows = 512
     splits = (k + 1023) // 1024
-    rotations = [torch.tensor(rng.normal(0, 0.1, (max_rows, k)), device="cuda", dtype=torch.float16) for _ in range(4)]
+    dtype = torch.bfloat16 if input_dtype == "bf16" else torch.float16
+    rotations = [torch.tensor(rng.normal(0, 0.1, (max_rows, k)), device="cuda", dtype=dtype) for _ in range(4)]
     inputs = torch.tensor([t.data_ptr() for t in rotations], device="cuda", dtype=torch.int64)
     payloads = [torch.tensor(rng.integers(0, 256, k * n * bits // 8, dtype=np.uint8), device="cuda") for _ in range(4)]
     scales = [torch.tensor(rng.uniform(0.5, 2.0, k // 128), device="cuda", dtype=torch.float16) for _ in range(4)]
@@ -414,10 +419,12 @@ def test_grouped_qkvg_bitwise_equality_and_graph_replay(side, bits, codebook):
     standalone = compile_trellis_linear_aot(
         input_features=k, output_features=n, bits=bits, codebook=codebook,
         sharded_side=side, rotation_count=4, max_rows=max_rows, groups=1,
+        input_dtype=input_dtype,
     )
     grouped = compile_trellis_linear_aot(
         input_features=k, output_features=n, bits=bits, codebook=codebook,
         sharded_side=side, rotation_count=4, max_rows=max_rows, groups=4,
+        input_dtype=input_dtype,
     )
 
     def run_standalone(rows, limit):

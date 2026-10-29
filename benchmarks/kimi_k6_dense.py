@@ -362,7 +362,7 @@ def benchmark_native_comparison(args):
     shapes = [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
     rows_list = list(map(int, args.rows.split(",")))
     if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 1:
-        raise ValueError("duel requires rows 1..4096 and positive samples")
+        raise ValueError("native comparison requires rows 1..4096 and positive samples")
     max_rows = max(129, max(rows_list))
     arms = (("baseline", baseline), ("candidate", candidate))
     if args.compile_only:
@@ -382,7 +382,7 @@ def benchmark_native_comparison(args):
         torch.cuda.synchronize()
     report = dict(metadata=dict(device=props.name if props else "CPU-only", sms=props.multi_processor_count if props else None,
         l2_bytes=l2, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
-        input_dtype=args.input_dtype, codebook=args.codebook, exact_row_cap=baseline(dict(input_features=128, output_features=128, bits=args.bits, codebook=args.codebook, sharded_side=1, rotation_count=1, max_rows=max_rows, splits=1, input_dtype=args.input_dtype)).exact_row_cap,
+        input_dtype=args.input_dtype, codebook=args.codebook,
         ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[])
     torch.manual_seed(273)
     for k, n, side in shapes:
@@ -393,11 +393,13 @@ def benchmark_native_comparison(args):
             if args.compile_only:
                 print(f"compile {k}:{n}:{side} {stem} max_rows={max_rows}", flush=True)
                 _native.NativeTrellisLinear = core
-                with exportable_compilation():
-                    program = compile_trellis_linear_aot(input_features=k, output_features=n,
-                        bits=args.bits, codebook=args.codebook, sharded_side=side, rotation_count=1,
-                        max_rows=max_rows, input_dtype=args.input_dtype)
-                _native.NativeTrellisLinear = candidate
+                try:
+                    with exportable_compilation():
+                        program = compile_trellis_linear_aot(input_features=k, output_features=n,
+                            bits=args.bits, codebook=args.codebook, sharded_side=side, rotation_count=1,
+                            max_rows=max_rows, input_dtype=args.input_dtype)
+                finally:
+                    _native.NativeTrellisLinear = candidate
                 exported(program, directory, stem, load_module=False)
                 (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
             else:
@@ -407,6 +409,15 @@ def benchmark_native_comparison(args):
         capacity = max(rows_list)
         decode_cap = min(capacity, 129)
         splits = (k + 1023) // 1024
+        core = baseline(dict(input_features=k, output_features=n, bits=args.bits,
+            codebook=args.codebook, sharded_side=side, rotation_count=1,
+            max_rows=max_rows, splits=splits, input_dtype=args.input_dtype))
+        def publishes_partials(rows):
+            if rows > (64 if args.codebook == "e4m3" else 129):
+                return False
+            # The pre-existing short-K K4 E4M3 folded route writes output directly.
+            return not (args.bits == 4 and args.codebook == "e4m3"
+                        and splits <= 2 and rows <= 16)
         x = torch.randn(capacity, k, device="cuda", dtype=getattr(torch, {"bf16":"bfloat16", "f16":"float16"}[args.input_dtype]))
         inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
         payload = torch.randint(256, (k*n*args.bits//8,), device="cuda", dtype=torch.uint8)
@@ -436,13 +447,13 @@ def benchmark_native_comparison(args):
                     end.record()
                 events[name] = (start, end)
                 outputs[name][:rows*n].fill_(float("nan"))
-                if rows <= (64 if args.codebook == "e4m3" else 129):
+                if publishes_partials(rows):
                     partials[name][:rows*splits*n].fill_(float("nan"))
                 graph.replay()
                 torch.cuda.synchronize()
                 if not torch.isfinite(outputs[name][:rows*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned output not overwritten")
-                if rows <= (64 if args.codebook == "e4m3" else 129) and not torch.isfinite(partials[name][:rows*splits*n]).all().item():
+                if publishes_partials(rows) and not torch.isfinite(partials[name][:rows*splits*n]).all().item():
                     raise RuntimeError(f"{name}: poisoned partial not overwritten")
                 graphs[name] = graph
                 hashes[name] = hashlib.sha256(outputs[name][:rows*n].cpu().numpy().tobytes()).hexdigest()
@@ -450,7 +461,7 @@ def benchmark_native_comparison(args):
             partials_exact = {}
             for name in libs:
                 out_eq = torch.equal(outputs[name][:rows*n].view(torch.int32), outputs["baseline"][:rows*n].view(torch.int32))
-                part_eq = True if rows > (64 if args.codebook == "e4m3" else 129) else torch.equal(partials[name][:rows*splits*n].view(torch.int32), partials["baseline"][:rows*splits*n].view(torch.int32))
+                part_eq = not publishes_partials(rows) or torch.equal(partials[name][:rows*splits*n].view(torch.int32), partials["baseline"][:rows*splits*n].view(torch.int32))
                 exact[name] = out_eq and part_eq
                 partials_exact[name] = part_eq
                 if not exact[name]:
@@ -463,7 +474,9 @@ def benchmark_native_comparison(args):
             if args.check_only or (args.timing_rows and rows not in set(map(int, args.timing_rows.split(",")))):
                 record = dict(k=k, n=n, side=side, splits=splits, rows=rows,
                     bits=args.bits, codebook=args.codebook, input_dtype=args.input_dtype,
-                    exact=True, partials_exact=partials_exact["candidate"], sha256=hashes["candidate"])
+                    exact=True, partials_exact=partials_exact["candidate"],
+                    partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
+                    sha256=hashes["candidate"])
                 report["records"].append(record)
                 continue
             intervals = 32 if rows <= (64 if args.codebook == "e4m3" else 129) else (1 if n > 65536 else 4)
