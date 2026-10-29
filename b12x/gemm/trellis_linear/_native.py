@@ -3534,8 +3534,9 @@ class NativeTrellisLinear:
                             s1 = s1 + p1
                         st_global_v2_f32(o_addr + Int64(n * 32), s0, s1)
 
-            if cutlass.const_expr(self.n > 65536 and (b_sub > 1 or (fuse_splits and self.splits > 1))):
-                cute.arch.sync_threads()
+            if cutlass.const_expr(b_sub > 1 or (fuse_splits and self.splits > 1)):
+                if task + step < tiles:
+                    cute.arch.sync_threads()
             task += step
 
     @cute.kernel
@@ -3736,8 +3737,9 @@ class NativeTrellisLinear:
                                 s3 = s3 + p3
                             st_global_v2_f32(o_addr1 + Int64(n * 32), s2, s3)
 
-            if cutlass.const_expr(self.n > 65536 and (b_sub > 1 or (fuse_splits and self.splits > 1))):
-                cute.arch.sync_threads()
+            if cutlass.const_expr(b_sub > 1 or (fuse_splits and self.splits > 1)):
+                if task + step < tiles:
+                    cute.arch.sync_threads()
             task += step
 
     @cute.jit

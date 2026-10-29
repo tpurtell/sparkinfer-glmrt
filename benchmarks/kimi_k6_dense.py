@@ -164,10 +164,10 @@ def benchmark_layer_replay(args):
                 source,x,inputs,payload,scales,suh,svh,parts,outs,finals,libs,ingress,egress=state
                 stream=torch.cuda.current_stream().cuda_stream
                 extra=[svh.data_ptr(),finals[arm].data_ptr()] if args.fused_egress and arm=="candidate" else []
-                codes=[ingress.run(source.data_ptr(),suh.data_ptr(),x.data_ptr(),scales.data_ptr(),rows,props.multi_processor_count*4,stream),
-                       libs[arm].run(inputs.data_ptr(),payload.data_ptr(),scales.data_ptr(),parts[arm].data_ptr(),outs[arm].data_ptr(),*extra,rows,0,props.multi_processor_count*4,stream)]
+                codes=[ingress.run(source.data_ptr(),suh.data_ptr(),x.data_ptr(),scales.data_ptr(),rows,(args.cta_limit or props.multi_processor_count*4),stream),
+                       libs[arm].run(inputs.data_ptr(),payload.data_ptr(),scales.data_ptr(),parts[arm].data_ptr(),outs[arm].data_ptr(),*extra,rows,0,(args.cta_limit or props.multi_processor_count*4),stream)]
                 if not (args.fused_egress and arm=="candidate"):
-                    codes.append(egress.run(outs[arm].data_ptr(),svh.data_ptr(),finals[arm].data_ptr(),rows,props.multi_processor_count*4,stream))
+                    codes.append(egress.run(outs[arm].data_ptr(),svh.data_ptr(),finals[arm].data_ptr(),rows,(args.cta_limit or props.multi_processor_count*4),stream))
                 if any(codes):
                     raise RuntimeError(codes)
             runners.append(call)
@@ -623,18 +623,18 @@ def benchmark_native_comparison(args):
                 stream = torch.cuda.current_stream().cuda_stream
                 if args.transforms:
                     result = ingress.run(source.data_ptr(), suh.data_ptr(), x.data_ptr(), scales.data_ptr(),
-                                         count, props.multi_processor_count*4, stream)
+                                         count, (args.cta_limit or props.multi_processor_count*4), stream)
                     if result:
                         raise RuntimeError(f"ingress returned {result}")
                 extra = [svh.data_ptr(), finals[name].data_ptr()] if args.fused_egress and name == "candidate" else []
                 result = libs[name].run(inputs.data_ptr(), payload.data_ptr(), scales.data_ptr(),
                     partials[name].data_ptr(), outputs[name].data_ptr(), *extra, count, 0,
-                    props.multi_processor_count*4, stream)
+                    (args.cta_limit or props.multi_processor_count*4), stream)
                 if result:
                     raise RuntimeError(f"{name} returned {result}")
                 if args.transforms and not (args.fused_egress and name == "candidate"):
                     result = egress.run(outputs[name].data_ptr(), svh.data_ptr(), finals[name].data_ptr(),
-                                        count, props.multi_processor_count*4, stream)
+                                        count, (args.cta_limit or props.multi_processor_count*4), stream)
                     if result:
                         raise RuntimeError(f"egress returned {result}")
             for name in libs:
@@ -744,6 +744,7 @@ def main():
     parser.add_argument("--rows", default="1,64,256")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
+    parser.add_argument("--cta-limit", type=int, help="override runtime grid budget for exactness checks")
     parser.add_argument("--fused-egress", action="store_true", help="candidate core plus egress export; requires --transforms")
     parser.add_argument("--layer-replay", action="store_true", help="time real seven-projection KDA/MLA graph sequences")
     parser.add_argument("--glmf-verify", action="store_true", help="GLMF verify mix, measured streaming bandwidth and round aggregate")
