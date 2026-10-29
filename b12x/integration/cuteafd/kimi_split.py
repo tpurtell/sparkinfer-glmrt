@@ -16,7 +16,7 @@ from cutlass import BFloat16, Int32, Int64
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import BatchedBf16Gemm, glm_projection
 from ._glmf_kernels import kda_replay_layout
-from ._kda_contract import KDAGeometry
+from ._kda_contract import KDAGeometry, kda_layout
 from ._qwen4_attention_kernels import Qwen4GateMul
 from .glmf import (_Kda, _check_rows, _kda_state, _ptr, _state_geometry,
                    _replay_geometry, kda_scratch_bytes)
@@ -34,6 +34,7 @@ class _NoProjection:
 class _KdaPack:
     def __init__(self, g):
         self.d, self.hd, self.heads, self.p = g.kda_width, g.kda_head_dim, g.kda_heads, g.kda_in_width
+        self.full_rank_gate = kda_layout(g)["full_rank_gate"]
 
     @cute.jit
     def __call__(self, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
@@ -56,12 +57,16 @@ class _KdaPack:
                 value = k[r * d + col - d]
             elif col < Int64(3) * d:
                 value = v[r * d + col - Int64(2) * d]
-            elif col < Int64(3) * d + hd:
-                value = fab[r * Int64(self.hd + self.heads) + col - Int64(3) * d]
-            elif col < Int64(4) * d + hd:
-                value = gate[r * d + col - Int64(3) * d - hd]
             else:
-                value = fab[r * Int64(self.hd + self.heads) + col - Int64(4) * d]
+                if cutlass.const_expr(self.full_rank_gate):
+                    if col < Int64(3) * d + hd:
+                        value = fab[r * Int64(self.hd + self.heads) + col - Int64(3) * d]
+                    elif col < Int64(4) * d + hd:
+                        value = gate[r * d + col - Int64(3) * d - hd]
+                    else:
+                        value = fab[r * Int64(self.hd + self.heads) + col - Int64(4) * d]
+                else:
+                    value = fab[r * Int64(2 * self.hd + self.heads) + col - Int64(3) * d]
             proj[r * Int64(self.p) + col] = value
 
 
@@ -71,7 +76,8 @@ class _KdaCore:
                          state_rounding=state_rounding, decode=decode)
         self.core.in_proj = _NoProjection()
         self.core.output_norm = True
-        self.fab = glm_projection(g.kda_head_dim + g.kda_heads, g.hidden)
+        self.aux_width = (1 if kda_layout(g)["full_rank_gate"] else 2) * g.kda_head_dim + g.kda_heads
+        self.fab = glm_projection(self.aux_width, g.hidden)
         self.pack = _KdaPack(g)
         self.g = g
         self.fab_offset = _align(kda_scratch_bytes(g, max_rows, self.core.chunked_bytes))
@@ -104,18 +110,27 @@ def compile_kimi_kda_core_aot(g=KDAGeometry(hidden=7168, kda_heads=48), *,
     max_rows = _check_rows(max_rows)
     if not isinstance(g, KDAGeometry) or g.output_gate != "full_rank":
         raise ValueError("Kimi split KDA requires full-rank KDAGeometry")
+    return compile_kda_core_aot(g, max_rows=max_rows, decode=decode,
+        state_dtype=state_dtype, state_rounding=state_rounding)
+
+
+def compile_kda_core_aot(g, *, max_rows=64, decode=True, state_dtype="float32",
+                         state_rounding="window"):
+    """Shared projection-free KDA; retain the geometry's original gate/beta arithmetic."""
+    max_rows = _check_rows(max_rows)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
     launch = _KdaCore(g, max_rows, decode, state_dtype, state_rounding)
     h, d, heads = g.hidden, g.kda_width, g.kda_heads
+    full = kda_layout(g)["full_rank_gate"]
     operands = (
         Operand("x", torch.bfloat16, f"[rows,{h}]"),
         *(Operand(n, torch.bfloat16, f"[rows,{d}]") for n in ("q", "k", "v", "gate")),
-        Operand("w_fab", torch.bfloat16, f"[{128 + heads},{h}]"),
-        Operand("w_f", torch.bfloat16, f"[1,{d},128]"),
+        Operand("w_fab", torch.bfloat16, f"[{launch.aux_width},{h}]"),
+        Operand("w_f", torch.bfloat16, f"[{1 if full else 2},{d},128]"),
         Operand("conv_w", torch.float32, f"[{3 * d},4]", align=4),
         Operand("a_log", torch.float32, f"[{heads}]", align=4),
         Operand("dt_bias", torch.float32, f"[{d}]", align=4),
-        Operand("o_norm", getattr(torch, g.o_norm_dtype), "[128]"),
+        Operand("o_norm", getattr(torch, kda_layout(g)["o_norm_dtype"]), "[128]"),
         Operand("conv_state", torch.bfloat16, f"[slots,3,{3 * d}]", "inout", align=2),
         Operand("state", state_torch, f"[slots,{heads},128,128]", "inout"),
         Operand("slots", torch.int32, "[rows]", align=4),
@@ -127,7 +142,7 @@ def compile_kimi_kda_core_aot(g=KDAGeometry(hidden=7168, kda_heads=48), *,
     return compile_program(launch, name="kimi_kda_core", operands=operands,
         scalars=(Scalar("rows"), Scalar("spec")),
         key=(g, max_rows, decode, state_dtype, state_rounding, launch.fab.key()),
-        scratch={"scratch": lambda rows: launch.fab_offset + _align(rows * (128 + heads) * 2)},
+        scratch={"scratch": lambda rows: launch.fab_offset + _align(rows * launch.aux_width * 2)},
         geometry={**vars(g), "max_rows": max_rows, "decode": decode, "output_kind": "norm",
                   "fab_offset": launch.fab_offset, **_state_geometry(state_dtype, state_rounding),
                   **_replay_geometry(launch.core)})
