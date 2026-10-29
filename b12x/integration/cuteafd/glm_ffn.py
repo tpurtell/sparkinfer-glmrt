@@ -340,7 +340,7 @@ def compile_glm_prefill_router_scores_aot(g: GLMGeometry = GLM53) -> AotProgram:
                   Operand("w", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight"),
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
         scalars=(Scalar("live_rows"),), key=(e, h, "mma_prefill"),
-        geometry={"hidden": h, "experts": e, "top_k": g.top_k,
+        geometry={"hidden": h, "experts": e,
                   "route": "mma_prefill", "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
 

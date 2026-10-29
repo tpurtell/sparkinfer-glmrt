@@ -369,7 +369,7 @@ def compile_qwen4_prefill_router_scores_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT
         operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
                   Operand("w", torch.bfloat16, f"[{e},{h}]", note="mlp.gate.weight"),
                   Operand("logits", torch.float32, f"[rows,{e}]", "out")),
-        scalars=(Scalar("rows"),), key=(e, h, "mma_prefill"),
+        scalars=(Scalar("live_rows"),), key=(e, h, "mma_prefill"),
         geometry={"hidden": h, "experts": e, "top_k": g.top_k,
                   "route": "mma_prefill", "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
