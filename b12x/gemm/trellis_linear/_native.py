@@ -2804,12 +2804,39 @@ def select4(index: Int32, v0: Int64, v1: Int64, v2: Int64, v3: Int64) -> Int64:
     return out
 
 
+@cute.jit
+def decode_k6_pair(address: Int64, tile: Int32, lane: Int32,
+                   e4m3: cutlass.Constexpr, mul1: cutlass.Constexpr, policy):
+    # Even lanes borrow the next lane's first word; odd lanes reuse word two.
+    # The last even lane is 30, so no active lane reads past the warp.
+    base = address + tile.to(Int64) * Int64(192)
+    i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, 6)
+    i1 = i0 + Int32(1)
+    i1 -= Int32(48) * (i1 >= Int32(48)).to(Int32)
+    z0 = _load_word(base + i0.to(Int64) * Int64(4), policy)
+    z1 = _load_word(base + i1.to(Int64) * Int64(4), policy)
+    next_z0 = cute.arch.shuffle_sync(z0, lane ^ Int32(1))
+    z2 = next_z0
+    if (lane & Int32(1)) != Int32(0):
+        z2 = z1
+    wa, wb = trellis_align_stream_u32x2(z0, z1, z2, shift, delta)
+    if cutlass.const_expr(mul1):
+        b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 6)
+    else:
+        b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, 6)
+    if cutlass.const_expr(e4m3):
+        b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+        b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+    return b0, b1, b2, b3
+
+
 class PartitionedNativeTrellisLinear(NativeTrellisLinear):
     """Experimental CTA partitioning; each original warp keeps its arithmetic."""
 
     def __init__(self, g):
         super().__init__(g)
         self.decode_cta_warps = g["decode_cta_warps"]
+        self.decode_pair_loads = g.get("decode_pair_loads", False)
 
     @cute.jit
     def _decode(self, inputs: cute.Tensor, payload: cute.Tensor,
@@ -2867,7 +2894,10 @@ class PartitionedNativeTrellisLinear(NativeTrellisLinear):
                             tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp_n * Int32(2) + Int32(n16)
                             if cutlass.const_expr(self.input_units):
                                 tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp_n * Int32(2) + Int32(n16)
-                            b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
+                            if cutlass.const_expr(self.decode_pair_loads):
+                                b0, b1, b2, b3 = decode_k6_pair(payload.iterator.toint(), tile, lane, self.e4m3, self.mul1, policy)
+                            else:
+                                b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
                             d0, d1, d2, d3 = self.mma(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)

@@ -316,6 +316,7 @@ def benchmark_prefill_route(args):
 def benchmark_glmf_duel(args):
     """Native baseline versus separately keyed CTA variants, through C exports."""
     import hashlib
+    import time
     import torch
     from cuda.bindings import driver as cuda
     from b12x.integration.cuteafd import exportable_compilation
@@ -354,14 +355,14 @@ def benchmark_glmf_duel(args):
         directory = args.output_dir / f"k{k}_n{n}_s{side}_{args.codebook}_{args.input_dtype}"
         directory.mkdir(parents=True, exist_ok=True)
         libs = {}
-        for warps in (4, 2, 1):
-            stem = f"cta{warps}"
+        variants = [("cta4", 4, False), ("cta2", 2, False), ("pair4", 4, True), ("pair2", 2, True)] if args.pair_loads else [(f"cta{w}", w, False) for w in (4, 2, 1)]
+        for stem, warps, pair_loads in variants:
             if args.compile_only:
                 print(f"compile {k}:{n}:{side} {stem}", flush=True)
                 with exportable_compilation():
                     program = compile_trellis_linear_aot(input_features=k, output_features=n,
                         bits=6, codebook=args.codebook, sharded_side=side, rotation_count=1,
-                        max_rows=129, input_dtype=args.input_dtype, decode_cta_warps=warps)
+                        max_rows=129, input_dtype=args.input_dtype, decode_cta_warps=warps, decode_pair_loads=pair_loads)
                 exported(program, directory, stem)
                 (directory / f"{stem}.json").write_text(json.dumps(program.geometry))
             else:
@@ -432,19 +433,27 @@ def benchmark_glmf_duel(args):
                 events[name] = pairs
                 timed.replay()
             torch.cuda.synchronize()
+            # Bring the GPU out of idle before the first low-row sample.
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                for timed in timing_graphs.values():
+                    timed.replay()
+                torch.cuda.synchronize()
             samples = {name: [] for name in libs}
+            sample_snapshots = {name: [] for name in libs}
             for repeat in range(args.samples):
                 order = list(libs) if repeat % 2 == 0 else list(reversed(libs))
                 for name in order:
                     timing_graphs[name].replay()
                     events[name][-1][1].synchronize()
                     samples[name].append(statistics.mean(start.elapsed_time(end)*1000 for start, end in events[name]))
+                    sample_snapshots[name].append(snapshot())
             times = {name: statistics.median(v) for name, v in samples.items()}
             for name in libs:
                 record = dict(k=k, n=n, side=side, splits=splits, rows=rows, variant=name,
                     baseline_us=times["cta4"], candidate_us=times[name], ratio=times["cta4"]/times[name],
                     exact=exact[name], sha256=hashes[name], partials_exact=True,
-                    weight_gbs=(k*n*6/8)/(times[name]*1000), samples_us=samples[name], snapshot=snapshot())
+                    weight_gbs=(k*n*6/8)/(times[name]*1000), samples_us=samples[name], sample_snapshots=sample_snapshots[name], snapshot=snapshot())
                 report["records"].append(record)
                 print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
             (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
@@ -463,6 +472,7 @@ def main():
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     parser.add_argument("--prefill-route", action="store_true", help="MCG T2 versus dequant + F32-output BF16 GEMM, including grouped KDA")
+    parser.add_argument("--pair-loads", action="store_true", help="screen K6 lane-pair payload load reuse")
     parser.add_argument("--glmf-duel", action="store_true", help="bit-exact native CTA partition screen")
     parser.add_argument("--compile-only", action="store_true", help="export duel arms without timing")
     parser.add_argument("--input-dtype", choices=("f16", "bf16"), default="bf16")
