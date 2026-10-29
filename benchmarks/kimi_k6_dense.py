@@ -372,7 +372,91 @@ def benchmark_native_comparison(args):
         lib.load()
         return lib
 
-    default_shapes = "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,16384:4096:1,4096:154880:1,4096:6144:1,6144:4096:2"
+    default_shapes = (
+        "4096:4096:1,4096:4096:2,4096:1024:1,1024:4096:2,"
+        "4096:6144:1,6144:4096:2,4096:1536:1,4096:512:1,"
+        "1536:8192:1,8192:4096:2,4096:154880:1"
+    )
+    glmf_verify_calls = {
+        (4096, 4096, 1): 34 * 3,
+        (4096, 4096, 2): 34 * 1,
+        (4096, 1024, 1): 42 * 2,
+        (1024, 4096, 2): 42 * 1,
+        (4096, 6144, 1): 3 * 2,
+        (6144, 4096, 2): 3 * 1,
+        (4096, 1536, 1): 11 * 1,
+        (4096, 512, 1): 11 * 1,
+        (1536, 8192, 1): 11 * 1,
+        (8192, 4096, 2): 11 * 1,
+        (4096, 154880, 1): 2,
+    }
+    def ensure_dram_bw_lib(directory):
+        so_path = directory / "dram_read_bw.so"
+        if not so_path.exists():
+            cu_path = directory / "dram_read_bw.cu"
+            cu_path.write_text(
+                "#include <cuda_runtime.h>\n"
+                "#include <stdint.h>\n"
+                "__global__ void stream_read_v4(const uint4* __restrict__ src, size_t n_vec4, uint32_t* __restrict__ sink) {\n"
+                "    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;\n"
+                "    size_t stride = (size_t)gridDim.x * blockDim.x;\n"
+                "    uint32_t acc = 0;\n"
+                "    for (size_t i = tid; i + 3 * stride < n_vec4; i += stride * 4) {\n"
+                "        uint4 v0, v1, v2, v3;\n"
+                "        asm volatile(\"ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];\" : \"=r\"(v0.x),\"=r\"(v0.y),\"=r\"(v0.z),\"=r\"(v0.w) : \"l\"(src + i));\n"
+                "        asm volatile(\"ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];\" : \"=r\"(v1.x),\"=r\"(v1.y),\"=r\"(v1.z),\"=r\"(v1.w) : \"l\"(src + i + stride));\n"
+                "        asm volatile(\"ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];\" : \"=r\"(v2.x),\"=r\"(v2.y),\"=r\"(v2.z),\"=r\"(v2.w) : \"l\"(src + i + 2 * stride));\n"
+                "        asm volatile(\"ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];\" : \"=r\"(v3.x),\"=r\"(v3.y),\"=r\"(v3.z),\"=r\"(v3.w) : \"l\"(src + i + 3 * stride));\n"
+                "        acc ^= (v0.x ^ v0.y ^ v1.x ^ v2.x ^ v3.x);\n"
+                "    }\n"
+                "    if (acc == 0xdeadbeefU) *sink = acc;\n"
+                "}\n"
+                "extern \"C\" int run_stream_read(const void* src, size_t bytes, void* sink, int grid, cudaStream_t stream) {\n"
+                "    stream_read_v4<<<grid, 512, 0, stream>>>((const uint4*)src, bytes / 16, (uint32_t*)sink);\n"
+                "    return (int)cudaGetLastError();\n"
+                "}\n"
+            )
+            subprocess.run([
+                "/usr/local/cuda/bin/nvcc", "-O3", "-arch=sm_120", "--shared",
+                "-Xcompiler", "-fPIC", str(cu_path), "-o", str(so_path)
+            ], check=True)
+        return so_path
+
+    def measure_dram_read_gbs(directory, sms, l2_bytes):
+        so_path = ensure_dram_bw_lib(directory)
+        bw_lib = C.CDLL(str(so_path.resolve()))
+        bw_lib.run_stream_read.argtypes = [C.c_void_p, C.c_size_t, C.c_void_p, C.c_int32, C.c_void_p]
+        bw_lib.run_stream_read.restype = C.c_int32
+        buf_bytes = max(4 * l2_bytes, 512 * 1024 * 1024)
+        buf = torch.randint(256, (buf_bytes,), device="cuda", dtype=torch.uint8)
+        sink = torch.zeros(1, device="cuda", dtype=torch.uint32)
+        grid = sms * 8
+        stream = torch.cuda.current_stream().cuda_stream
+        if bw_lib.run_stream_read(buf.data_ptr(), buf_bytes, sink.data_ptr(), grid, stream):
+            raise RuntimeError("stream_read_v4 warmup failed")
+        torch.cuda.synchronize()
+        intervals = 16
+        pairs = [(torch.cuda.Event(enable_timing=True, external=True),
+                  torch.cuda.Event(enable_timing=True, external=True)) for _ in range(intervals)]
+        bw_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(bw_graph):
+            cap_stream = torch.cuda.current_stream().cuda_stream
+            for start, end in pairs:
+                start.record()
+                if bw_lib.run_stream_read(buf.data_ptr(), buf_bytes, sink.data_ptr(), grid, cap_stream):
+                    raise RuntimeError("stream_read_v4 graph capture failed")
+                end.record()
+        bw_graph.replay()
+        torch.cuda.synchronize()
+        bw_samples_us = []
+        for _ in range(7):
+            bw_graph.replay()
+            pairs[-1][1].synchronize()
+            bw_samples_us.append(statistics.mean(s.elapsed_time(e) * 1000.0 for s, e in pairs))
+        median_us = statistics.median(bw_samples_us)
+        del bw_graph, pairs, buf, sink
+        torch.cuda.empty_cache()
+        return buf_bytes / (median_us * 1000.0)
     shapes = [tuple(map(int, s.split(":"))) for s in (args.shapes or default_shapes).split(",")]
     rows_list = list(map(int, args.rows.split(",")))
     if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 1:
@@ -388,14 +472,18 @@ def benchmark_native_comparison(args):
         status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
         if int(status):
             raise RuntimeError(status)
+    if args.compile_only:
+        ensure_dram_bw_lib(args.output_dir)
     snapshot_idle = snapshot()
+    dram_read_gbs = None
     if not args.compile_only:
         boost_warmup()
         flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
         flush.zero_()
         torch.cuda.synchronize()
+        dram_read_gbs = measure_dram_read_gbs(args.output_dir, props.multi_processor_count, l2)
     report = dict(metadata=dict(device=props.name if props else "CPU-only", sms=props.multi_processor_count if props else None,
-        l2_bytes=l2, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
+        l2_bytes=l2, dram_read_gbs=dram_read_gbs, argv=sys.argv, snapshot_idle=snapshot_idle, snapshot_before=snapshot(), bits=args.bits,
         input_dtype=args.input_dtype, codebook=args.codebook,
         ratio="baseline/candidate", cache="32 in-graph cold units (decode) / 4 in-graph cold units (prefill), 2x runtime L2 eviction outside each timed interval"), records=[])
     torch.manual_seed(273)
@@ -405,6 +493,8 @@ def benchmark_native_comparison(args):
         libs = {}
         for stem, core in arms:
             if args.compile_only:
+                if stem == "baseline" and (directory / "baseline.so").exists() and (directory / "baseline.json").exists():
+                    continue
                 print(f"compile {k}:{n}:{side} {stem} max_rows={max_rows}", flush=True)
                 _native.NativeTrellisLinear = core
                 try:
@@ -525,11 +615,15 @@ def benchmark_native_comparison(args):
                     samples[name].append(statistics.mean(start.elapsed_time(end)*1000 for start, end in events[name]))
             times = {name: statistics.median(v) for name, v in samples.items()}
             name = "candidate"
+            b_gbs = (k*n*args.bits/8)/(times["baseline"]*1000)
+            c_gbs = (k*n*args.bits/8)/(times[name]*1000)
             record = dict(k=k, n=n, side=side, splits=splits, rows=rows, arm=name,
                 baseline_us=times["baseline"], candidate_us=times[name], ratio=times["baseline"]/times[name],
                 exact=exact[name], sha256=hashes[name], partials_exact=partials_exact[name],
                 partials_checked=publishes_partials(rows), exact_row_cap=core.exact_row_cap,
-                weight_gbs=(k*n*args.bits/8)/(times[name]*1000),
+                baseline_weight_gbs=b_gbs, weight_gbs=c_gbs,
+                baseline_pct_dram_bw=(100.0 * b_gbs / dram_read_gbs) if dram_read_gbs else None,
+                pct_dram_bw=(100.0 * c_gbs / dram_read_gbs) if dram_read_gbs else None,
                 baseline_samples_us=samples["baseline"], samples_us=samples[name], snapshot=snapshot())
             report["records"].append(record)
             print(json.dumps({key: value for key, value in record.items() if key not in ("samples_us", "baseline_samples_us")}), flush=True)
@@ -541,6 +635,36 @@ def benchmark_native_comparison(args):
         torch.cuda.empty_cache()
     report["metadata"]["snapshot_after"] = snapshot()
     if not args.compile_only:
+        by_cell = {(r["k"], r["n"], r["side"], r["rows"]): r for r in report["records"] if "candidate_us" in r}
+        aggregates = {}
+        total_weight_bytes = sum(calls * (k * n * args.bits / 8) for (k, n, _), calls in glmf_verify_calls.items())
+        for r in rows_list:
+            if all((k, n, s, r) in by_cell for (k, n, s) in glmf_verify_calls):
+                base_sum = sum(calls * by_cell[(k, n, s, r)]["baseline_us"] for (k, n, s), calls in glmf_verify_calls.items())
+                cand_sum = sum(calls * by_cell[(k, n, s, r)]["candidate_us"] for (k, n, s), calls in glmf_verify_calls.items())
+                b_gbs = total_weight_bytes / (base_sum * 1000.0)
+                c_gbs = total_weight_bytes / (cand_sum * 1000.0)
+                head_rec = by_cell[(4096, 154880, 1, r)]
+                base_1h = base_sum - head_rec["baseline_us"]
+                cand_1h = cand_sum - head_rec["candidate_us"]
+                aggregates[str(r)] = dict(
+                    rows=r,
+                    baseline_us=base_sum,
+                    candidate_us=cand_sum,
+                    saved_us=base_sum - cand_sum,
+                    ratio=base_sum / cand_sum,
+                    baseline_weight_gbs=b_gbs,
+                    weight_gbs=c_gbs,
+                    baseline_pct_dram_bw=(100.0 * b_gbs / dram_read_gbs) if dram_read_gbs else None,
+                    pct_dram_bw=(100.0 * c_gbs / dram_read_gbs) if dram_read_gbs else None,
+                    one_head_baseline_us=base_1h,
+                    one_head_candidate_us=cand_1h,
+                    one_head_saved_us=base_1h - cand_1h,
+                    one_head_ratio=base_1h / cand_1h,
+                )
+        if aggregates:
+            report["round_aggregate"] = aggregates
+            print(json.dumps({"round_aggregate": aggregates}), flush=True)
         (args.output_dir / "report.json").write_text(json.dumps(report, indent=2)+"\n")
 
 
