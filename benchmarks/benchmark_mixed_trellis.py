@@ -1556,7 +1556,8 @@ def _run_coordinator_benchmark(args, device, props):
                         tail_poison = float("nan") if wire.dtype.is_floating_point else 0x7F
                         tails = (wire[1:].clone(), decoded[1:].clone(), weights[1:].clone(), ids[1:].clone())
                         prefix_detail = {}
-                        probe_rows = sorted({1, 32, 33, 63, 64, 65, capacity // 2} - {capacity})
+                        probe_rows = (args.duel_probe_rows(capacity) if hasattr(args, "duel_probe_rows")
+                                      else sorted({1, 32, 33, 63, 64, 65, capacity // 2} - {capacity}))
                         for rows in probe_rows:
                             # Clean slate first: the previous, shorter row count
                             # poisoned rows this one must read.
@@ -1565,16 +1566,26 @@ def _run_coordinator_benchmark(args, device, props):
                             decoded[rows:].fill_(float("nan"))
                             weights[rows:].fill_(float("nan"))
                             ids[rows:].fill_(experts - 1)
-                            short = {}
+                            short, untouched = {}, {}
                             for name, _ in specs:
                                 workspace, _bindings = states[name]
-                                graph = _capture(lambda name=name: run(name, rows), 1)
-                                for _ in range(3):
-                                    workspace.fc1.fill_(float("nan"))
-                                    workspace.activated.fill_(float("nan"))
-                                    workspace.output.fill_(float("nan"))
-                                    graph.replay()
-                                short[name] = workspace.output[:rows].clone()
+                                with kernel_resolution_guard("frozen prefill prefix probes"):
+                                    graph = _capture(lambda name=name: run(name, rows), 1)
+                                    first_replay = None
+                                    for _ in range(3):
+                                        workspace.fc1.fill_(float("nan"))
+                                        workspace.activated.fill_(float("nan"))
+                                        workspace.output.fill_(float("nan"))
+                                        graph.replay()
+                                        current = workspace.output[:rows].clone()
+                                        if first_replay is None:
+                                            first_replay = current
+                                        if not torch.equal(current.view(bit_dtype), first_replay.view(bit_dtype)):
+                                            raise RuntimeError(f"{name} nondeterministic prefix graph replay at {rows}")
+                                        if not bool(torch.isnan(workspace.output[rows:]).all()):
+                                            raise RuntimeError(f"{name} wrote the output tail at {rows}")
+                                short[name] = current
+                                untouched[name] = True
                             oracle = short["coop"].view(bit_dtype)
                             prefix = expected[:rows].float()
                             detail, coop_gap = {}, None
@@ -1584,6 +1595,8 @@ def _run_coordinator_benchmark(args, device, props):
                                 row_gap = gap.amax(dim=1) if gap.numel() else gap
                                 worst = int(row_gap.argmax()) if row_gap.numel() else 0
                                 entry = dict(
+                                    sha256=hashlib.sha256(short[name].view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+                                    output_tail_untouched=untouched[name],
                                     finite=bool(torch.isfinite(values).all()),
                                     bitwise_vs_coop=torch.equal(short[name].view(bit_dtype), oracle),
                                     differ_rows=int((row_gap > 0).sum()),
