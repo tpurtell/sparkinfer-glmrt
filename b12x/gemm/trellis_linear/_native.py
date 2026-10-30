@@ -2934,6 +2934,10 @@ class NativeTrellisLinear:
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
         x = inputs[rotation_id]
+        idx0 = (lane >> Int32(1)) * Int32(3) + (lane & Int32(1))
+        w_base = payload.iterator.toint() + idx0.to(Int64) * Int64(4)
+        prev_lane = (lane + Int32(31)) & Int32(31)
+        shift = ((lane & Int32(1)) ^ Int32(1)) << Int32(4)
         while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // (32 * self.decode_cta_warps) * self.splits):
             split = task % Int32(self.splits)
             tile_n = (task // Int32(self.splits)) % Int32(self.n // (32 * self.decode_cta_warps))
@@ -2950,6 +2954,11 @@ class NativeTrellisLinear:
                 if kb < Int32(self.k // 128):
                     acc = cute.make_rmem_tensor((4, 4), Float32)
                     acc.fill(Float32(0.0))
+                    # Fixed tile offsets keep address arithmetic out of the MMA chain.
+                    tile_kb = nb * Int32(self.k // 16 * 8) + kb * Int32(64) + warp_n * Int32(2)
+                    if cutlass.const_expr(self.input_units):
+                        tile_kb = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + warp_n * Int32(2)
+                    w_kb = w_base + tile_kb.to(Int64) * Int64(192)
                     for k16 in cutlass.range_constexpr(8):
                         k = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
                         a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
@@ -2960,15 +2969,14 @@ class NativeTrellisLinear:
                             addr = x + (row1.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
                             a1, a3 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
                         for n16 in cutlass.range_constexpr(2):
-                            tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp_n * Int32(2) + Int32(n16)
-                            if cutlass.const_expr(self.input_units):
-                                tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp_n * Int32(2) + Int32(n16)
-                            b0, b1, b2, b3 = decode_k6_pair(payload.iterator.toint(), tile, lane, self.e4m3, self.mul1, policy)
-                            d0, d1, d2, d3 = self.mma(
+                            b0, b1, b2, b3 = _decode_k6_pair_shfl(
+                                w_kb, (k16 * 8 + n16) * 192, prev_lane, shift,
+                                self.e4m3, self.mul1, self.input_bf16, policy)
+                            d0, d1, d2, d3 = self.mma_ready(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)
                             acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
-                            d0, d1, d2, d3 = self.mma(
+                            d0, d1, d2, d3 = self.mma_ready(
                                 acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
                                 a0, a1, a2, a3, b2, b3)
                             acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
@@ -3863,7 +3871,7 @@ class NativeTrellisLinear:
                     else:
                         self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
                 else:
-                    self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                    self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             elif cutlass.const_expr(self.splits == 2):
                 if cutlass.const_expr(self.n > 8192):
                     if rows <= Int32(8):
