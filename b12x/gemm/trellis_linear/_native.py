@@ -610,7 +610,7 @@ class NativeTrellisLinear:
         self.input_units = g["sharded_side"] == 2
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         self.splits = g["splits"]
-        self.decode_cta_warps = 2
+        self.decode_cta_warps = 4
         self.ws_b_stage_bytes = 4096 if self.e4m3 else 8192
         self.ws_stage_bytes = _WS_A_STAGE_BYTES + self.ws_b_stage_bytes
         self.ws_bar_off = _WS_STAGES * self.ws_stage_bytes
