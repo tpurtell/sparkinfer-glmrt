@@ -357,6 +357,37 @@ def _e4m3x4_scaled_to_f16x4(packed: Uint32, scale_bits: Uint32, *, loc=None, ip=
     )
 
 
+def ws_prerotate_default(wire: bool, activations: str, capability=None) -> bool:
+    """Whether BF16 A16 warp-specialized FC1 hoists its input rotation.
+
+    The hoist writes route-major rotated gate and up rows once, ahead of FC1;
+    in-tile rotation has the FC1 producers rotate each staged block. Both are
+    bit-identical. The choice follows the compile target's hardware class,
+    because the hoist's extra route x hidden round trip is cheap against SM120
+    GDDR7 and expensive against GB10 LPDDR5X. Same-session interleaved
+    medians, every arm byte-exact against a WS oracle, synthetic weights,
+    random top-k routes, two cold layers (hoist / in-tile ratio, rows of a
+    compiled m2752 unit unless stated):
+
+    SM121 (GB10, kakapo/cassowary), in-tile faster at every cell:
+      GLM compact TP6 w384 1.38-1.42 (m4096 1.43, m256 1.06-1.13);
+      GLM Flash compact w384 1.37-1.48 (m256 1.06-1.13);
+      Kimi K3 TP6 w512 1.31-1.53 (m256 1.05-1.10);
+      GLM Flash TP2 w1024 1.12-1.22; V4 Pro TP6 w512 1.30-1.52,
+      TP4 w768 1.20-1.35; Qwen TP1 w640 1.16-1.28.
+    SM120 (RTX PRO 6000, 450-600 W), the hoist faster or tied:
+      Kimi K3 rtx-tp2 w1536 in-tile 0.95-0.97 (m256 0.95-0.96);
+      GLM rtx-tp1 w2048 0.95; GLM rtx-tp2 w1024 0.98-0.99;
+      GLM Flash rtx-tp1 w2048 0.94-0.96, rtx-tp2 w1024 0.97-0.99.
+    """
+    if wire or activations != "a16":
+        return False
+    if capability is None:
+        import torch
+        capability = tuple(torch.cuda.get_device_capability())
+    return tuple(capability) != (12, 1)
+
+
 class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
     """Warp-specialized two-tier mixed Trellis for packed-route prefill."""
 
@@ -391,10 +422,10 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.ws_wire = input_format == "e4m3_k32"
         # Hoisted token-major FC1 input rotation (one launch ahead of FC1)
         # versus in-tile rotation by the FC1 producers. Bit-identical; None
-        # keeps the default of every BF16 A16 export.
+        # resolves the measured hardware-class default (`ws_prerotate_default`).
         if prerotate and (self.ws_wire or activations != "a16"):
             raise ValueError("hoisted WS prerotation needs BF16 input rows and A16 activations")
-        self.ws_prerotate = (not self.ws_wire and activations == "a16"
+        self.ws_prerotate = (ws_prerotate_default(self.ws_wire, activations)
                              if prerotate is None else bool(prerotate))
         # Dynamic tile claims (a global counter in the zero-initialized
         # workspace, reset by the last CTA): the route blocks of one expert

@@ -55,13 +55,30 @@ def test_rotation_is_stream_ordered_before_ws_fc1_without_cooperative_launch():
         assert not any(k.arg == "cooperative" for k in call.keywords)
 
 
-def test_prerotate_selector_defaults_to_the_bf16_a16_predicate():
+def _prerotate_default():
+    tree = ast.parse(WS.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "ws_prerotate_default")
+    scope = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(WS), "exec"), scope)
+    return scope["ws_prerotate_default"]
+
+
+@pytest.mark.parametrize("capability,expected", [((12, 0), True), ((12, 1), False)])
+def test_prerotate_default_follows_the_measured_hardware_class(capability, expected):
+    default = _prerotate_default()
+    assert default(False, "a16", capability) is expected
+    # Wire rows and A8 activations always rotate in tile.
+    for wire, activations in ((True, "a16"), (False, "a8")):
+        assert default(wire, activations, capability) is False
+
+
+def test_prerotate_selector_resolves_the_class_default_only_when_unset():
     tree = ast.parse(WS.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
     init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
     assert any(a.arg == "prerotate" for a in init.args.kwonlyargs)
     source = ast.unparse(init)
-    assert "if prerotate is None" in source.replace("\n", " ") or "prerotate is None" in source
+    assert "ws_prerotate_default(self.ws_wire, activations) if prerotate is None else bool(prerotate)" in source
     compile_src = ast.unparse(next(n for n in ast.parse(SOURCE.read_text()).body
                                    if isinstance(n, ast.FunctionDef) and n.name == "compile_mixed_trellis"))
     assert "prerotate=ws_prerotate" in compile_src
