@@ -610,7 +610,7 @@ class NativeTrellisLinear:
         self.input_units = g["sharded_side"] == 2
         self.rotations, self.max_rows = g["rotation_count"], g["max_rows"]
         self.splits = g["splits"]
-        self.decode_cta_warps = 4
+        self.decode_cta_warps = 2
         self.ws_b_stage_bytes = 4096 if self.e4m3 else 8192
         self.ws_stage_bytes = _WS_A_STAGE_BYTES + self.ws_b_stage_bytes
         self.ws_bar_off = _WS_STAGES * self.ws_stage_bytes
@@ -1321,6 +1321,90 @@ class NativeTrellisLinear:
                                 acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
                                 a0, a1, a2, a3, b2, b3)
                             acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
+                    scale = _side_value(scales.iterator.toint(), kb)
+                    for n in cutlass.range_constexpr(4):
+                        for v in cutlass.range_constexpr(4):
+                            total[n, v] = total[n, v] + acc[n, v] * scale
+            for n in cutlass.range_constexpr(4):
+                col = nb * Int32(128) + warp * Int32(32) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
+                base = (row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)
+                if row0 < rows:
+                    partial[base], partial[base + Int64(1)] = total[n, 0], total[n, 1]
+                if row1 < rows:
+                    base += Int64(8 * self.splits * self.n)
+                    partial[base], partial[base + Int64(1)] = total[n, 2], total[n, 3]
+            task += step
+
+    @cute.kernel
+    def multiply_k6_direct(self, inputs: cute.Tensor, payload: cute.Tensor,
+                 scales: cute.Tensor, partial: cute.Tensor,
+                 rows: Int32, rotation_id: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
+        x = inputs[rotation_id]
+        i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, 6)
+        i1 = i0 + Int32(1)
+        i1 -= Int32(48) * (i1 >= Int32(48)).to(Int32)
+        while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // 128 * self.splits):
+            split = task % Int32(self.splits)
+            nb = (task // Int32(self.splits)) % Int32(self.n // 128)
+            group = task // Int32(self.splits * (self.n // 128))
+            # Each 16-row group re-reads the weights; the last one evicts them first.
+            policy = weight_stream_policy((group + Int32(1) == (rows + Int32(15)) // Int32(16)).to(Int32))
+            row0 = group * Int32(16) + lane // Int32(4)
+            row1 = row0 + Int32(8)
+            total = cute.make_rmem_tensor((4, 4), Float32)
+            total.fill(Float32(0.0))
+            for block in cutlass.range(8):
+                kb = split * Int32(8) + block
+                if kb < Int32(self.k // 128):
+                    acc = cute.make_rmem_tensor((4, 4), Float32)
+                    acc.fill(Float32(0.0))
+                    tile_kb = nb * Int32(self.k // 16 * 8) + kb * Int32(64) + warp * Int32(2)
+                    if cutlass.const_expr(self.input_units):
+                        tile_kb = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + warp * Int32(2)
+                    w_kb = payload.iterator.toint() + tile_kb.to(Int64) * Int64(192)
+                    w0 = w_kb + i0.to(Int64) * Int64(4)
+                    w1 = w_kb + i1.to(Int64) * Int64(4)
+                    w2 = w_kb + i2.to(Int64) * Int64(4)
+                    # Issue four independent K16 tiles before the dependent decode/MMAs.
+                    for kg in cutlass.range_constexpr(2):
+                        words = cute.make_rmem_tensor((4, 2, 3), Uint32)
+                        av = cute.make_rmem_tensor((4, 4), Uint32)
+                        av.fill(Uint32(0))
+                        for ki in cutlass.range_constexpr(4):
+                            k = kb * Int32(128) + Int32((kg * 4 + ki) * 16) + (lane & Int32(3)) * Int32(2)
+                            if row0 < rows:
+                                addr = x + (row0.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
+                                av[ki, 0], av[ki, 2] = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
+                            if row1 < rows:
+                                addr = x + (row1.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
+                                av[ki, 1], av[ki, 3] = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
+                            for n16 in cutlass.range_constexpr(2):
+                                words[ki, n16, 0] = _ld_global_nc_u32_l2hint_offset(w0, ((kg * 4 + ki) * 8 + n16) * 192, policy)
+                                words[ki, n16, 1] = _ld_global_nc_u32_l2hint_offset(w1, ((kg * 4 + ki) * 8 + n16) * 192, policy)
+                                words[ki, n16, 2] = _ld_global_nc_u32_l2hint_offset(w2, ((kg * 4 + ki) * 8 + n16) * 192, policy)
+                        for ki in cutlass.range_constexpr(4):
+                            a0, a1, a2, a3 = av[ki, 0], av[ki, 1], av[ki, 2], av[ki, 3]
+                            for n16 in cutlass.range_constexpr(2):
+                                wa, wb = trellis_align_stream_u32x2(words[ki, n16, 0], words[ki, n16, 1], words[ki, n16, 2], shift, delta)
+                                if cutlass.const_expr(self.mul1):
+                                    b0, b1, b2, b3 = packed_dequant_trellis_mul1_to_half2x4(wa, wb, 6)
+                                else:
+                                    b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(wa, wb, 6)
+                                if cutlass.const_expr(self.e4m3):
+                                    b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
+                                    b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
+                                d0, d1, d2, d3 = self.mma(
+                                    acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
+                                    a0, a1, a2, a3, b0, b1)
+                                acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
+                                d0, d1, d2, d3 = self.mma(
+                                    acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
+                                    a0, a1, a2, a3, b2, b3)
+                                acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
                     scale = _side_value(scales.iterator.toint(), kb)
                     for n in cutlass.range_constexpr(4):
                         for v in cutlass.range_constexpr(4):
@@ -2934,10 +3018,6 @@ class NativeTrellisLinear:
         step, _, _ = cute.arch.grid_dim()
         lane, warp = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
         x = inputs[rotation_id]
-        idx0 = (lane >> Int32(1)) * Int32(3) + (lane & Int32(1))
-        w_base = payload.iterator.toint() + idx0.to(Int64) * Int64(4)
-        prev_lane = (lane + Int32(31)) & Int32(31)
-        shift = ((lane & Int32(1)) ^ Int32(1)) << Int32(4)
         while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // (32 * self.decode_cta_warps) * self.splits):
             split = task % Int32(self.splits)
             tile_n = (task // Int32(self.splits)) % Int32(self.n // (32 * self.decode_cta_warps))
@@ -2954,11 +3034,6 @@ class NativeTrellisLinear:
                 if kb < Int32(self.k // 128):
                     acc = cute.make_rmem_tensor((4, 4), Float32)
                     acc.fill(Float32(0.0))
-                    # Fixed tile offsets keep address arithmetic out of the MMA chain.
-                    tile_kb = nb * Int32(self.k // 16 * 8) + kb * Int32(64) + warp_n * Int32(2)
-                    if cutlass.const_expr(self.input_units):
-                        tile_kb = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + warp_n * Int32(2)
-                    w_kb = w_base + tile_kb.to(Int64) * Int64(192)
                     for k16 in cutlass.range_constexpr(8):
                         k = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
                         a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
@@ -2969,14 +3044,15 @@ class NativeTrellisLinear:
                             addr = x + (row1.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
                             a1, a3 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
                         for n16 in cutlass.range_constexpr(2):
-                            b0, b1, b2, b3 = _decode_k6_pair_shfl(
-                                w_kb, (k16 * 8 + n16) * 192, prev_lane, shift,
-                                self.e4m3, self.mul1, self.input_bf16, policy)
-                            d0, d1, d2, d3 = self.mma_ready(
+                            tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp_n * Int32(2) + Int32(n16)
+                            if cutlass.const_expr(self.input_units):
+                                tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp_n * Int32(2) + Int32(n16)
+                            b0, b1, b2, b3 = decode_k6_pair(payload.iterator.toint(), tile, lane, self.e4m3, self.mul1, policy)
+                            d0, d1, d2, d3 = self.mma(
                                 acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
                                 a0, a1, a2, a3, b0, b1)
                             acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
-                            d0, d1, d2, d3 = self.mma_ready(
+                            d0, d1, d2, d3 = self.mma(
                                 acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
                                 a0, a1, a2, a3, b2, b3)
                             acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
@@ -3871,7 +3947,13 @@ class NativeTrellisLinear:
                     else:
                         self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
                 else:
-                    self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                    tiles = Int32(self.n // 128 * self.splits)
+                    self.multiply_k6_direct(inputs, payload, scales, partial, rows, rotation_id).launch(
+                        grid=(min(tiles, cta_limit), 1, 1), block=(128, 1, 1),
+                        min_blocks_per_mp=2, stream=stream)
+                    self.reduce(partial, output, rows).launch(
+                        grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                        block=(128, 1, 1), stream=stream)
             elif cutlass.const_expr(self.splits == 2):
                 if cutlass.const_expr(self.n > 8192):
                     if rows <= Int32(8):
