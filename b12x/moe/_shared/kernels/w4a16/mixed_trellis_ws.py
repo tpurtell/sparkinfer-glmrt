@@ -376,6 +376,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         dynamic_tiles: bool = False,
         activations: str = "a16",
         compact_weights: bool = False,
+        prerotate: bool | None = None,
     ):
         super().__init__(driver=driver, tier0=tier0, tier1=tier1,
                          descriptor_bits=descriptor_bits, compact_weights=compact_weights)
@@ -388,7 +389,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         # producers stage the raw bytes in the A slot and widen them to the
         # FP16 the BF16 path gets from decode-then-convert (same values).
         self.ws_wire = input_format == "e4m3_k32"
-        self.ws_prerotate = not self.ws_wire and activations == "a16"
+        # Hoisted token-major FC1 input rotation (one launch ahead of FC1)
+        # versus in-tile rotation by the FC1 producers. Bit-identical; None
+        # keeps the default of every BF16 A16 export.
+        if prerotate and (self.ws_wire or activations != "a16"):
+            raise ValueError("hoisted WS prerotation needs BF16 input rows and A16 activations")
+        self.ws_prerotate = (not self.ws_wire and activations == "a16"
+                             if prerotate is None else bool(prerotate))
         # Dynamic tile claims (a global counter in the zero-initialized
         # workspace, reset by the last CTA): the route blocks of one expert
         # start together, so the follower's weight reads hit L2 instead of

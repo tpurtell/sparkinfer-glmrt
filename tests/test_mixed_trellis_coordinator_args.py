@@ -414,3 +414,47 @@ def test_served_spark_width_coverage(family, widths):
             assert options["full_rotation_output_dtype"] == "bf16"
             assert options["moe_block_size"] == (8 if family in ("v41", "kimik3")
                                                 else 32 if family == "qwen4" else 64)
+
+
+def test_ws_oracle_prerotate_and_revision_arms():
+    b = benchmark()
+    args = arguments(b, "--no-coop", "--live-rows", "2048,1024,17",
+                     "--coordinator-arm", "hoist:mode=ws,route_block=64,dynamic=1,prerotate=1",
+                     "--coordinator-arm", "intile:mode=ws,route_block=64,dynamic=1,prerotate=0",
+                     "--coordinator-arm", "parent:mode=ws,route_block=64,dynamic=1,revision=561a0889",
+                     "--capacities", "2752")
+    capacities, specs, _, _, _ = b.coordinator_preflight(args)
+    assert [name for name, _ in specs] == ["hoist", "intile", "parent"]
+    assert args.live_rows == [2048, 1024, 17] and specs[2][1]["revision"] == "561a0889"
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    hoist = b.coordinator_compile_options(args.profile, 2752, specs[0][1], props)
+    intile = b.coordinator_compile_options(args.profile, 2752, specs[1][1], props)
+    parent = b.coordinator_compile_options(args.profile, 2752, specs[2][1], props)
+    assert hoist["ws_prerotate"] is True and intile["ws_prerotate"] is False
+    # Unset keeps the kernel default and stays callable on revisions without the option.
+    assert "ws_prerotate" not in parent and "revision" not in parent
+
+
+@pytest.mark.parametrize("extra", [
+    ["--no-coop", "--coordinator-arm", "a:mode=ws"],
+    ["--no-coop", "--coordinator-arm", "a:mode=cooperative", "--coordinator-arm", "b:mode=ws"],
+    ["--coordinator-arm", "a:mode=ws", "--live-rows", "300", "--capacities", "256"],
+])
+def test_ws_oracle_rejects_bad_requests(extra):
+    b = benchmark()
+    with pytest.raises(ValueError):
+        b.coordinator_preflight(arguments(b, *extra))
+
+
+@pytest.mark.parametrize("text", ["a:prerotate=2", "a:revision=HEAD", "a:revision=12ab"])
+def test_bad_audit_arm(text):
+    with pytest.raises(argparse.ArgumentTypeError):
+        benchmark().parse_coordinator_arm(text)
+
+
+def test_prerotate_requires_bf16_ws():
+    b = benchmark()
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for arm in ({"mode": "cooperative", "prerotate": 0}, {"mode": "ws", "wire": 1, "prerotate": 1}):
+        with pytest.raises(ValueError):
+            b.coordinator_compile_options("rtx-tp2", 2752, arm, props)

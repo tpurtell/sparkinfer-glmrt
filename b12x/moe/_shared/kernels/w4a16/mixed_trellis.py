@@ -2524,6 +2524,7 @@ def compile_mixed_trellis(
     activations: str = "a16",
     decode_schedule: str | None = None,
     workspace_sms: int | None = None,
+    ws_prerotate: bool | None = None,
 ) -> MixedTrellisCompileResult:
     if activations not in ("a16", "a8"):
         raise ValueError(f"unsupported EXL3 activations {activations!r}")
@@ -2649,6 +2650,7 @@ def compile_mixed_trellis(
                 dynamic_tiles=ws_dynamic_tiles,
                 activations=activations,
                 compact_weights=compact_weights,
+                prerotate=ws_prerotate,
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),

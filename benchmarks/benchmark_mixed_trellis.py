@@ -1265,10 +1265,16 @@ def parse_coordinator_arm(text):
                 value = tuple(map(int, value.split("/")))
                 if len(value) != 4 or any(v < 32 or v % 16 for v in value):
                     raise ValueError("tile needs four positive, 16-aligned dimensions")
-            elif key in ("route_block", "ctas", "stages", "wire", "dynamic"):
+            elif key == "revision":
+                # A frozen fork revision of the K4 sibling modules (WS kernel and
+                # its host/driver), compiled in its own namespace.
+                if not re.fullmatch(r"[0-9a-f]{7,40}", value):
+                    raise ValueError("revision must be a 7-40 digit lowercase commit SHA")
+            elif key in ("route_block", "ctas", "stages", "wire", "dynamic", "prerotate"):
                 value = int(value)
                 legal = {"route_block": (8, 16, 32, 64), "ctas": (1, 2, 3, 4),
-                         "stages": range(2, 7), "wire": (0, 1), "dynamic": (0, 1)}
+                         "stages": range(2, 7), "wire": (0, 1), "dynamic": (0, 1),
+                         "prerotate": (0, 1)}
                 if value not in legal[key]:
                     raise ValueError("invalid integer override")
             else:
@@ -1301,8 +1307,8 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         token = rotation == "token" or (rotation == "served" and SERVED_TOKEN_ROTATION[family](capacity))
         fused = rotation == "fused"
         if ((ws and (block < 16 or token or fused)) or (fused and block < 16)
-                or (not ws and any(arm.get(k) for k in ("wire", "stages", "dynamic")))):
-            raise ValueError("WS needs block >=16 and its own rotation; wire/stages/dynamic require WS")
+                or (not ws and any(k in arm for k in ("wire", "stages", "dynamic", "prerotate")))):
+            raise ValueError("WS needs block >=16 and its own rotation; wire/stages/dynamic/prerotate require WS")
         tile = arm.get("tile", (64, 128, 64, 128))
         if (tile[0], tile[2]) != (64, 64) or tile[1] not in ((128, 192) if ws else (128,)) or tile[3] not in (128, 256):
             raise ValueError("compact coordinator fixes the H128 K64 geometry and FC2 tile 128/256")
@@ -1317,8 +1323,8 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         token = rotation == "token" or (rotation == "served" and SERVED_TOKEN_ROTATION[family](capacity))
         fused = rotation == "fused"
         if ((ws and (block < 16 or token or fused)) or (fused and block < 16)
-                or (not ws and any(arm.get(k) for k in ("wire", "stages", "dynamic")))):
-            raise ValueError("WS needs block >=16 and its own rotation; wire/stages/dynamic require WS")
+                or (not ws and any(k in arm for k in ("wire", "stages", "dynamic", "prerotate")))):
+            raise ValueError("WS needs block >=16 and its own rotation; wire/stages/dynamic/prerotate require WS")
         # Same default the planner resolves for an unforced export: N256 only when the
         # rank's whole intermediate width and the geometry's hidden size are 256 tiles.
         default_n = 256 if width % 256 == 0 and hidden % 256 == 0 else 128
@@ -1327,7 +1333,10 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
             raise ValueError("coordinator tile must divide both projection geometries")
         if not ws and tile[1] != tile[3]:
             raise ValueError("cooperative FC1/FC2 tiles must have equal CTA thread counts")
+    if arm.get("prerotate") and arm.get("wire"):
+        raise ValueError("hoisted prerotation reads BF16 rows; wire input rotates in tile")
     slots = route_pack_capacity(capacity * topk, block, experts, topk=topk)[1]
+    extra = {} if "prerotate" not in arm else dict(ws_prerotate=bool(arm["prerotate"]))
     return dict(size_m=capacity, hidden_size=hidden, intermediate_size=width,
         tier0_num_experts=experts, tier1_num_experts=experts, tier0_bits=tier0_bits, tier1_bits=tier1_bits,
         route_num_experts=experts, top_k=topk, max_m_blocks=(slots + block - 1) // block,
@@ -1339,7 +1348,7 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         warp_specialized=ws, compact_weights=compact,
         input_format="e4m3_k32" if arm.get("wire") else "bf16",
         force_blocks_per_sm=arm.get("ctas"), ws_input_stages=arm.get("stages"),
-        ws_dynamic_tiles=bool(arm.get("dynamic", False)))
+        ws_dynamic_tiles=bool(arm.get("dynamic", False)), **extra)
 
 
 def coordinator_route_waves(path, layer=None, family="glm"):
@@ -1391,8 +1400,8 @@ def coordinator_preflight(args):
     unknown = sorted(set(capacities) - set(spec["capacities"]))
     if unknown:
         raise ValueError(f"{family} has no measured export at capacities {unknown}")
-    specs = [("coop", {})]
-    if args.role == "spark" and family == "glm" and args.profile in (
+    specs = [] if args.no_coop else [("coop", {})]
+    if not args.no_coop and args.role == "spark" and family == "glm" and args.profile in (
             "spark-tp6-width384", "spark-tp6-width256", "spark-tp4-width512"):
         specs.append(("served", (dict(mode="ws") if compact else
                                 dict(mode="ws", wire=1, stages=3, dynamic=1, ctas=1,
@@ -1401,6 +1410,10 @@ def coordinator_preflight(args):
     specs.extend(args.coordinator_arm)
     if len({name for name, _ in specs}) != len(specs):
         raise ValueError("coordinator arm names must be unique")
+    if args.no_coop and (len(specs) < 2 or specs[0][1].get("mode") != "ws"):
+        raise ValueError("--no-coop needs at least two arms; the first (a WS arm) is the oracle")
+    if args.live_rows and any(not 1 <= rows <= min(capacities) for rows in args.live_rows):
+        raise ValueError("--live-rows must be 1..smallest capacity")
     if min(args.layers, args.rounds, args.replays, args.warmup, args.memory_cap_gib) < 1:
         raise ValueError("layers/rounds/replays/warmup/memory cap must be positive")
     if not 0 <= args.k5_experts <= spec["experts"]:
@@ -1448,11 +1461,48 @@ def _make_coordinator_layer(width, k5_experts, seed, device, family="glm", bits=
     return *tiers, mapping, descriptor, rotations
 
 
+def coordinator_arm_modules(specs, current, source_dir=None):
+    """Mixed Trellis module per arm: the checkout's, or a frozen fork revision's
+    K4 sibling modules (`revision=SHA`) loaded in their own namespace."""
+    from benchmarks.benchmark_exlr8_a16 import materialize_k4_arm, load_k4_arm
+    modules, revisions, loaded = {}, {}, {}
+    for name, arm in specs:
+        revision = arm.get("revision")
+        if revision is None:
+            modules[name], revisions[name] = current, None
+            continue
+        if revision not in loaded:
+            if source_dir is not None:
+                matches = [p / "k4" for p in Path(source_dir).glob(revision + "*") if (p / "k4").is_dir()]
+                if len(matches) != 1:
+                    raise ValueError(f"missing or ambiguous frozen arm {revision} under {source_dir}")
+                bundle = matches[0]
+            else:
+                bundle = materialize_k4_arm(revision, Path(tempfile.mkdtemp(prefix="coordinator-arm-")))
+            loaded[revision] = load_k4_arm(bundle)
+        modules[name], manifest = loaded[revision]
+        revisions[name] = manifest["revision"]
+    return modules, revisions
+
+
+def _power_limit_w(props):
+    """Enforced board power limit in watts, or None where NVML has none (GB10)."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+        return pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0
+    except Exception:
+        return None
+
+
 def _run_coordinator_benchmark(args, device, props):
     from benchmarks.benchmark_exlr8_a16 import make_wire, real_route_ids, k4_noise_summary
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     capacities, specs, distributions, waves, compact = coordinator_preflight(args)
+    oracle_name = specs[0][0]
+    modules, revisions = coordinator_arm_modules(specs, mix, args.arm_source_dir)
     spec = COORDINATOR_FAMILIES[args.prefill_family]
     hidden, experts, topk = spec["hidden"], spec["experts"], spec["top_k"]
     target = (12, 1) if args.role == "spark" else (12, 0)
@@ -1479,11 +1529,13 @@ def _run_coordinator_benchmark(args, device, props):
         for name, arm in specs:
             options = coordinator_compile_options(args.profile, capacity, arm, props, args.prefill_family,
                                                   compact is not None, args.bits)
-            print(json.dumps(dict(compiling=name, capacity=capacity, options=options)), flush=True)
-            launch = mix.compile_mixed_trellis(**options)
-            workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
-            bindings = [mix.bind_mixed_trellis(*layer, launch, **bind_counts) for layer in layers]
-            mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
+            print(json.dumps(dict(compiling=name, capacity=capacity, options=options,
+                                  revision=revisions[name])), flush=True)
+            arm_mix = modules[name]
+            launch = arm_mix.compile_mixed_trellis(**options)
+            workspace = arm_mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
+            bindings = [arm_mix.bind_mixed_trellis(*layer, launch, **bind_counts) for layer in layers]
+            arm_mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
             states[name] = workspace, bindings
         generator = torch.Generator().manual_seed(args.seed + capacity)
         raw = (torch.randn((capacity, hidden), generator=generator) * 0.02).to(device=device, dtype=torch.bfloat16)
@@ -1504,43 +1556,60 @@ def _run_coordinator_benchmark(args, device, props):
                         workspace, bindings = states[name]
                         source = wire if bindings[layer].launch.input_format == "e4m3_k32" else decoded
                         count = capacity if rows is None else rows
-                        return mix.run_bound_mixed_trellis(
+                        return modules[name].run_bound_mixed_trellis(
                             source[:count], weights[:count], ids[:count], bindings[layer], workspace)
-                    expected = run("coop").clone()
+                    expected = run(oracle_name).clone()
                     if expected.dtype != output_dtype or not bool(torch.isfinite(expected).all()) or not bool(expected.any()):
-                        raise RuntimeError("cooperative oracle must use the role's sum dtype and be finite and nonzero")
-                    graphs, checks = {}, {}
-                    for name, _ in specs:
-                        actual = run(name)
-                        checks[name] = torch.equal(actual.view(bit_dtype), expected.view(bit_dtype))
-                        workspace, bindings = states[name]
-                        # Freeze routing outside the graph: time the real bound core + top-k sum
-                        # without copying its raw ABI or charging precomputed route-pack work.
-                        launch = bindings[layer].launch
-                        slots = route_pack_capacity(capacity * topk, launch.moe_block_size, experts, topk=topk)[1]
-                        packed = (workspace.packed_route_indices[:slots], workspace.block_expert_ids, workspace.packed_route_count)
-                        with patch.object(mix, "pack_topk_routes_by_expert", return_value=packed):
-                            graphs[name] = _capture(lambda name=name: run(name), args.warmup)
-                        # Compact descriptors carry per-claim row state; a frozen
-                        # graph must rebuild it every replay, not reuse a warm ring.
-                        for _ in range(3 if compact else 1):
-                            workspace.output.fill_(float("nan"))
-                            if compact:
-                                workspace.fc1.fill_(float("nan"))
-                                workspace.activated.fill_(float("nan"))
-                            graphs[name].replay()
-                            checks[name] &= torch.equal(workspace.output.view(bit_dtype), expected.view(bit_dtype))
-                    graphs["coop_control"] = graphs["coop"]
-                    samples = {name: [] for name in graphs}
-                    if all(checks.values()) and not args.correctness_only:
-                        names = list(graphs)
-                        with kernel_resolution_guard("SM120 coordinator frozen graph timing"):
-                            for repeat in range(args.rounds):
-                                order = names[repeat % len(names):] + names[:repeat % len(names)]
-                                if repeat % 2:
-                                    order.reverse()
-                                for name in order:
-                                    samples[name].append(statistics.median(_times(graphs[name], args.replays)))
+                        raise RuntimeError("oracle must use the role's sum dtype and be finite and nonzero")
+                    # Live rows below the compiled capacity time the same export at
+                    # the planner's partial units; each is checked against the oracle
+                    # at that row count and against the capacity batch's prefix.
+                    live_records = []
+                    for live in [capacity, *sorted({r for r in args.live_rows if r < capacity}, reverse=True)]:
+                        reference = expected if live == capacity else run(oracle_name, live).clone()
+                        graphs, checks = {}, {}
+                        if live != capacity:
+                            checks["oracle_prefix"] = torch.equal(reference.view(bit_dtype),
+                                                                  expected[:live].view(bit_dtype))
+                        for name, _ in specs:
+                            actual = run(name, live)
+                            checks[name] = torch.equal(actual.view(bit_dtype), reference.view(bit_dtype))
+                            workspace, bindings = states[name]
+                            # Freeze routing outside the graph: time the real bound core + top-k sum
+                            # without copying its raw ABI or charging precomputed route-pack work.
+                            launch = bindings[layer].launch
+                            slots = route_pack_capacity(live * topk, launch.moe_block_size, experts, topk=topk)[1]
+                            packed = (workspace.packed_route_indices[:slots], workspace.block_expert_ids, workspace.packed_route_count)
+                            with patch.object(modules[name], "pack_topk_routes_by_expert", return_value=packed):
+                                graphs[name] = _capture(lambda name=name: run(name, live), args.warmup)
+                            # Compact descriptors carry per-claim row state; a frozen
+                            # graph must rebuild it every replay, not reuse a warm ring.
+                            for _ in range(3 if compact else 1):
+                                workspace.output.fill_(float("nan"))
+                                if compact:
+                                    workspace.fc1.fill_(float("nan"))
+                                    workspace.activated.fill_(float("nan"))
+                                graphs[name].replay()
+                                checks[name] &= torch.equal(workspace.output[:live].view(bit_dtype),
+                                                            reference.view(bit_dtype))
+                        graphs[oracle_name + "_control"] = graphs[oracle_name]
+                        samples = {name: [] for name in graphs}
+                        if all(checks.values()) and not args.correctness_only:
+                            names = list(graphs)
+                            with kernel_resolution_guard("coordinator frozen graph timing"):
+                                for repeat in range(args.rounds):
+                                    order = names[repeat % len(names):] + names[:repeat % len(names)]
+                                    if repeat % 2:
+                                        order.reverse()
+                                    for name in order:
+                                        samples[name].append(statistics.median(_times(graphs[name], args.replays)))
+                        live_records.append(dict(rows=live, bitwise=checks, samples_us=samples,
+                            noise=(k4_noise_summary(samples, oracle_name) if all(samples.values()) else None)))
+                    first = live_records[0]
+                    checks, samples = dict(first["bitwise"]), first["samples_us"]
+                    for entry in live_records[1:]:
+                        for key, value in entry["bitwise"].items():
+                            checks[f"rows{entry['rows']}:{key}"] = value
                     # Timing runs before the prefix probe: the probe launches
                     # uncontrolled short-row kernels on these workspaces, which
                     # repack routes and reset claim state behind the frozen graph,
@@ -1551,7 +1620,7 @@ def _run_coordinator_benchmark(args, device, props):
                     prefix_detail = None
                     if all(checks.values()) and args.prefill_exhaustive:
                         for rows in range(1, capacity + 1):
-                            oracle = run("coop", rows).clone()
+                            oracle = run(oracle_name, rows).clone()
                             if not torch.equal(oracle.view(bit_dtype), expected[:rows].view(bit_dtype)):
                                 raise RuntimeError(f"oracle prefix differs at {rows}/{capacity}")
                             for name, _ in specs[1:]:
@@ -1599,7 +1668,7 @@ def _run_coordinator_benchmark(args, device, props):
                                     workspace.output.fill_(float("nan"))
                                     graph.replay()
                                 short[name] = workspace.output[:rows].clone()
-                            oracle = short["coop"].view(bit_dtype)
+                            oracle = short[oracle_name].view(bit_dtype)
                             prefix = expected[:rows].float()
                             detail, coop_gap = {}, None
                             for name, _ in specs:
@@ -1616,18 +1685,18 @@ def _run_coordinator_benchmark(args, device, props):
                                     if gap.numel() else 0.0,
                                     worst_row=worst)
                                 detail[name] = entry
-                                if name == "coop":
+                                if name == oracle_name:
                                     coop_gap = entry["max_abs_gap"]
                                     checks["prefix_coop_gap"] = (checks.get("prefix_coop_gap", True)
                                                                  and entry["finite"])
                             exact = all(entry["bitwise_vs_coop"] for name, entry in detail.items()
-                                        if name != "coop")
+                                        if name != oracle_name)
                             checks["prefix_rows"] = checks.get("prefix_rows", True) and exact
                             # An arm must never be further from the batch prefix than
                             # the cooperative kernel it replaces.
                             checks["prefix_gap"] = checks.get("prefix_gap", True) and all(
                                 entry["finite"] and entry["max_abs_gap"] <= coop_gap * (1 + 1e-9) + 1e-12
-                                for name, entry in detail.items() if name != "coop")
+                                for name, entry in detail.items() if name != oracle_name)
                             prefix_detail[str(rows)] = detail
                         wire[1:], decoded[1:], weights[1:], ids[1:] = tails
                     record = dict(capacity=capacity, distribution=distribution, weight_layer=layer,
@@ -1635,7 +1704,9 @@ def _run_coordinator_benchmark(args, device, props):
                         content=wave.get("content") if wave else None, bitwise=checks,
                         prefix=prefix_detail,
                         checked_rows=capacity if args.prefill_exhaustive else None,
-                        noise=(k4_noise_summary(samples, "coop") if all(samples.values()) else None),
+                        noise=(k4_noise_summary(samples, oracle_name) if all(samples.values()) else None),
+                        live_rows=[dict(rows=e["rows"], bitwise=e["bitwise"], noise=e["noise"],
+                                        samples_us=e["samples_us"]) for e in live_records[1:]],
                         samples_us=samples, median_us={name: statistics.median(v) for name, v in samples.items() if v},
                         output_sha256=hashlib.sha256(expected.view(torch.uint8).cpu().numpy().tobytes()).hexdigest())
                     records.append(record)
@@ -1654,7 +1725,8 @@ def _run_coordinator_benchmark(args, device, props):
                       unit_map_fingerprint=compact["fingerprint"],
                       sha256=hashlib.sha256(args.compact_fixture.read_bytes()).hexdigest())
                  if compact else None),
-        arms=specs,
+        arms=specs, oracle=oracle_name, arm_revisions=revisions,
+        power_limit_w=_power_limit_w(props), live_rows=sorted(set(args.live_rows)),
         source_sha256=PREFILL_SOURCE_SHA256,
         source_provenance=dict(snapshot="startup-before-torch-b12x", files=PREFILL_SOURCE_FILES,
                                scope="runner+b12x/**/*.py", digest="sha256(sorted(path:sha256\\n))"),
@@ -1716,6 +1788,12 @@ def benchmark_parser():
     parser.add_argument("--profile", choices=COORDINATOR_PROFILES, default="rtx-tp2")
     parser.add_argument("--capacities",
                         help="coordinator compile capacities; default is the family's measured export set")
+    parser.add_argument("--no-coop", action="store_true",
+                        help="no cooperative baseline: the first --coordinator-arm (WS) is the oracle")
+    parser.add_argument("--live-rows", type=lambda v: [int(x) for x in v.split(",")], default=[],
+                        help="extra live row counts timed below each compiled capacity")
+    parser.add_argument("--arm-source-dir", type=Path,
+                        help="pre-materialized frozen arm bundles (<sha>/k4) for revision=SHA arms")
     parser.add_argument("--coordinator-arm", action="append", type=parse_coordinator_arm, default=[],
                         help="NAME:mode=cooperative|ws,rotation=served|route|token|fused,tile=64/256/64/256,"
                              "route_block=64,ctas=1,stages=3,wire=1,dynamic=1; coop baseline is automatic")

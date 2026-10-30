@@ -53,3 +53,15 @@ def test_rotation_is_stream_ordered_before_ws_fc1_without_cooperative_launch():
         assert any(k.arg == "stream" and isinstance(k.value, ast.Name)
                    and k.value.id == "stream" for k in call.keywords)
         assert not any(k.arg == "cooperative" for k in call.keywords)
+
+
+def test_prerotate_selector_defaults_to_the_bf16_a16_predicate():
+    tree = ast.parse(WS.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    assert any(a.arg == "prerotate" for a in init.args.kwonlyargs)
+    source = ast.unparse(init)
+    assert "if prerotate is None" in source.replace("\n", " ") or "prerotate is None" in source
+    compile_src = ast.unparse(next(n for n in ast.parse(SOURCE.read_text()).body
+                                   if isinstance(n, ast.FunctionDef) and n.name == "compile_mixed_trellis"))
+    assert "prerotate=ws_prerotate" in compile_src
