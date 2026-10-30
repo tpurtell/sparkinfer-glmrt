@@ -439,6 +439,7 @@ def test_ws_oracle_prerotate_and_revision_arms():
     ["--no-coop", "--coordinator-arm", "a:mode=ws"],
     ["--no-coop", "--coordinator-arm", "a:mode=cooperative", "--coordinator-arm", "b:mode=ws"],
     ["--coordinator-arm", "a:mode=ws", "--live-rows", "300", "--capacities", "256"],
+    ["--coordinator-arm", "a:mode=ws", "--live-rows", "0", "--capacities", "256"],
 ])
 def test_ws_oracle_rejects_bad_requests(extra):
     b = benchmark()

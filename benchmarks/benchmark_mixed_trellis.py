@@ -1412,8 +1412,8 @@ def coordinator_preflight(args):
         raise ValueError("coordinator arm names must be unique")
     if args.no_coop and (len(specs) < 2 or specs[0][1].get("mode") != "ws"):
         raise ValueError("--no-coop needs at least two arms; the first (a WS arm) is the oracle")
-    if args.live_rows and any(not 1 <= rows <= min(capacities) for rows in args.live_rows):
-        raise ValueError("--live-rows must be 1..smallest capacity")
+    if args.live_rows and any(not 1 <= rows < max(capacities) for rows in args.live_rows):
+        raise ValueError("--live-rows must be 1..largest capacity; each capacity times the counts below it")
     if min(args.layers, args.rounds, args.replays, args.warmup, args.memory_cap_gib) < 1:
         raise ValueError("layers/rounds/replays/warmup/memory cap must be positive")
     if not 0 <= args.k5_experts <= spec["experts"]:
