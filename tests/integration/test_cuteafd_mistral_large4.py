@@ -364,3 +364,39 @@ def test_index_q_fp8_equals_the_bf16_projection_of_the_dequantized_weight(mode, 
     expected = qx @ wd.float().t()
     cos = torch.nn.functional.cosine_similarity(out.float().flatten(), expected.flatten(), dim=0)
     assert cos > 0.99999, float(cos)
+
+
+def _ml4_programs():
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+    g = ml4.ML4
+    out = []
+    for rope in (True, False):
+        out += [lambda rope=rope: ml4.compile_query_scale_aot(g, rope=rope, max_rows=64),
+                lambda rope=rope: ml4.compile_rank_pack_aot(g, rope=rope, max_rows=64),
+                lambda rope=rope: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope, max_rows=64),
+                lambda rope=rope: ml4.compile_index_post_aot(g, rope=rope, max_rows=64)]
+    out += [lambda: ml4.compile_kv_b_aot(g, stage="values", rope=True, max_rows=64),
+            lambda: ml4.compile_query_scale_aot(g, rope=False, max_rows=64, heads=g.index_heads,
+                                                head_dim=g.index_head_dim),
+            lambda: ml4.compile_layer_norm_aot(width=g.hidden, max_rows=64, eps=g.index_norm_eps),
+            lambda: ml4.compile_index_q_fp8_aot(g, mode="decode", max_rows=64),
+            lambda: ml4.compile_index_q_fp8_aot(g, mode="prefill", max_rows=256)]
+    return out
+
+
+@pytest.mark.parametrize("index", range(13))
+def test_every_ml4_program_exports_with_its_declared_abi(index, tmp_path):
+    """The exporter's header check (pointer names = the declared operands) on
+    every ml4 program: launches here pass pointers positionally, so only the
+    export sees a call parameter named differently from its operand."""
+    require_b12x()
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+
+    thunks = _ml4_programs()
+    assert len(thunks) == 13
+    with exportable_compilation():
+        program = thunks[index]()
+    label = f"ml4_export_check_{index}"
+    program.export_to_c(str(tmp_path), label, "cuteafd_" + label)
+    checked = validate_exported_header(program, tmp_path / f"{label}.h", "cuteafd_" + label)
+    assert checked["argument_count"] == len(program.operands) + len(program.scalars) + 1

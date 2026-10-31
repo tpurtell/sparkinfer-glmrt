@@ -351,24 +351,24 @@ class _IndexQueryFp8:
         return self.proj.prefill_scratch_bytes(rows)
 
     @cute.jit
-    def body(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+    def body(self, x: cute.Pointer, w_iq_fp8: cute.Pointer, w_iq_scale: cute.Pointer, out: cute.Pointer,
              scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
-        self.proj(x, w_fp8, scale, out, rows, fp8_rows, Int64(scratch.toint()), stream)
+        self.proj(x, w_iq_fp8, w_iq_scale, out, rows, fp8_rows, Int64(scratch.toint()), stream)
 
 
 class _IndexQueryFp8Decode(_IndexQueryFp8):
     @cute.jit
-    def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+    def __call__(self, x: cute.Pointer, w_iq_fp8: cute.Pointer, w_iq_scale: cute.Pointer, out: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         from ._fp8_weights import FP8_DECODE_ROWS
-        self.body(x, w_fp8, scale, out, scratch, rows, Int32(FP8_DECODE_ROWS), stream)
+        self.body(x, w_iq_fp8, w_iq_scale, out, scratch, rows, Int32(FP8_DECODE_ROWS), stream)
 
 
 class _IndexQueryFp8Prefill(_IndexQueryFp8):
     @cute.jit
-    def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+    def __call__(self, x: cute.Pointer, w_iq_fp8: cute.Pointer, w_iq_scale: cute.Pointer, out: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
-        self.body(x, w_fp8, scale, out, scratch, rows, fp8_rows, stream)
+        self.body(x, w_iq_fp8, w_iq_scale, out, scratch, rows, fp8_rows, stream)
 
 
 def compile_index_q_fp8_aot(g: Ml4Geometry = ML4, *, mode: str, max_rows: int):
