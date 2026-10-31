@@ -147,6 +147,26 @@ def test_existing_biased_matmul_epilogue_rounds_only_after_bias(rows):
     assert torch.equal(one, out[:1])
 
 
+@pytest.mark.parametrize("width", (256, 512, 1024, 2048))
+@pytest.mark.parametrize("rows", ROWS)
+def test_audio_builder_residual_is_bf16(width, rows):
+    require_b12x()
+    from b12x.integration.cuteafd.media import audio_programs
+    program = audio_programs()[f"residual_h{width}"]()
+    assert all(operand.dtype == torch.bfloat16 for operand in program.operands)
+    a = torch.randn(rows + 1, width, device="cuda").bfloat16()
+    b = torch.randn_like(a)
+    out = torch.full_like(a, 42)
+    program.launch(a, b, out, scalars=[rows])
+    assert torch.equal(out[:rows], a[:rows] + b[:rows])
+    assert (out[rows:] == 42).all()
+    one = torch.empty_like(out[:1])
+    program.launch(a, b, one, scalars=[1])
+    assert torch.equal(one, out[:1])
+    program.launch(a, b, a, scalars=[rows])
+    assert torch.equal(a[:rows], out[:rows])
+
+
 @pytest.mark.parametrize("width", (1024, 2048, 4096, 8192))
 def test_existing_gelu_audio_shapes(width):
     require_b12x()
