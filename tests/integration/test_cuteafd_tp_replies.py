@@ -85,7 +85,7 @@ def test_partial_record_alignment(format):
     with pytest.raises(ValueError, match="non-16-byte-aligned record"):
         partial_row_bytes(128, format)
     assert partial_row_bytes(512, format) % 16 == 0
-    assert partial_row_bytes(4096, format) % 16 == 0
+    assert [partial_row_bytes(4096, f) for f in FORMATS] == [8192, 2304, 4224]
 
 
 @pytest.mark.parametrize("wide_format", ("nvfp4", "fp8"))
@@ -135,6 +135,14 @@ def test_empty_regions_in_uniform_wave(wide_format, active_format):
         for _, _, reply, count in programs:
             if count == 0:
                 assert (reply == 7).all()
+        # A completely empty wave also reuses the same precompiled callables.
+        saved = combined.clone()
+        for p, c, reply, _ in programs:
+            before = reply.clone()
+            p.launch(data, empty, empty, empty, rowmap[:0], reply, scalars=[0, 0, 0, 0])
+            c.launch(reply, rowmap[:0], w, n, combined, scalars=[1, 0, 0])
+            assert torch.equal(reply, before)
+        assert torch.equal(combined, saved)
 
 
 @pytest.mark.parametrize("format", FORMATS)
