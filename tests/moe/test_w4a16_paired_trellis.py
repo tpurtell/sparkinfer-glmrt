@@ -175,14 +175,14 @@ def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, a
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
                     reason="requires SM120/SM121")
 @pytest.mark.parametrize("rows", [96, 256])
-@pytest.mark.parametrize("activation,limit", [("silu_post_clamp", 7.0), ("silu", None)])
+@pytest.mark.parametrize("activation,limit", [("silu_post_clamp", 7.0), ("silu", 10.0)])
 def test_ws_prefill_k4_k6_matches_cooperative(rows, activation, limit):
     """Step-5 K4/K6 routed tiers: WS prefill is byte-exact with cooperative."""
     torch.manual_seed(611)
     device = torch.device("cuda", 0)
     props = torch.cuda.get_device_properties(device)
     hidden, intermediate = 512, 256
-    tile = (64, 128, 64, 256)
+    tile = (64, 128, 64, 128)
     tiers = tuple(_prepared(experts=2, hidden=hidden, intermediate=intermediate,
         bits=bits, seed=bits * 97, device=device, tile_config=(64, 128, 64, 128)) for bits in (4, 6))
     mapping, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)

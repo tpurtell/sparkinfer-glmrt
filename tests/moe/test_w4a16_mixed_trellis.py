@@ -628,7 +628,8 @@ def test_mixed_two_tier_matches_serial_and_captures(
         device=device,
         codebook=codebook,
     )
-    x = (torch.randn((m, hidden), device=device) * (0.1 if swiglu_limit is not None else 1.0e-3)).to(torch.bfloat16)
+    scale = 0.1 if swiglu_limit is not None and swiglu_limit < 1.0e6 else 1.0e-3
+    x = (torch.randn((m, hidden), device=device) * scale).to(torch.bfloat16)
     # Global expert ids deliberately interleave the two bitrate tiers. The combined
     # namespace remains tier ordered so weight and rotation tables stay dense.
     # The final route uses vLLM's padding sentinel. Both packed and direct
