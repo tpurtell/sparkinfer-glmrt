@@ -183,6 +183,30 @@ def test_rotated_partial_and_mixed_maps(format):
         assert torch.equal(region, full[indices.cuda()])
 
 
+@pytest.mark.parametrize("format", ("nvfp4", "fp8"))
+def test_combine_scale_edges(format):
+    require_b12x()
+    from b12x.integration.cuteafd.muse_tp import compile_tp_combine_aot
+    width, topk = 4096, 8
+    partials = torch.zeros(1, 1, topk, width)
+    if format == "fp8":
+        partials[..., :32] = 2.0**-126
+        partials[..., 32:64] = 1.75
+        partials[..., 64:96] = 449.
+    else:
+        partials[..., :16] = 2.0**-12
+        partials[..., 16:32] = 6.
+    encoded = _encode(partials, format)
+    weights = torch.full((1, topk), 1.0 / topk)
+    norm = torch.zeros(width, dtype=torch.bfloat16)
+    expected = _combine(_decode(encoded, format, width), weights, norm)
+    out = torch.empty_like(expected, device="cuda")
+    program = compile_tp_combine_aot(format=format)
+    program.launch(encoded.cuda(), torch.zeros(1, dtype=torch.int32, device="cuda").view(torch.uint32),
+                   weights.cuda(), norm.cuda(), out, scalars=[1, 1, 1])
+    assert torch.equal(out.cpu(), expected)
+
+
 @pytest.mark.parametrize("ranks", (1, 3, 6, 8))
 def test_combine_format_neutrality_and_wave_mix(ranks):
     require_b12x()
