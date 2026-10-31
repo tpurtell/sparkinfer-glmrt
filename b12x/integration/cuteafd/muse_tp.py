@@ -33,8 +33,9 @@ class TpCombine:
     def __call__(self, data: cute.Pointer, row_map: cute.Pointer, weights: cute.Pointer,
                  norm: cute.Pointer, out: cute.Pointer, ranks: Int32, region_rows: Int32,
                  rows: Int32, stream: cuda.CUstream):
-        self.kernel(data, row_map, weights, norm, out, ranks, region_rows, rows).launch(
-            grid=(region_rows, 1, 1), block=(256, 1, 1), stream=stream)
+        if region_rows > Int32(0):
+            self.kernel(data, row_map, weights, norm, out, ranks, region_rows, rows).launch(
+                grid=(region_rows, 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.jit
     def partial(self, data: cute.Tensor, base: Int64, col: Int64):

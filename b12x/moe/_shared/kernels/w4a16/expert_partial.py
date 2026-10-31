@@ -26,8 +26,11 @@ FORMATS = ("bf16", "nvfp4", "fp8")
 def partial_row_bytes(width, format):
     if width <= 0 or width % 128 or format not in FORMATS:
         raise ValueError("expert partials require a positive H128 width and bf16/nvfp4/fp8")
-    return {"bf16": width * 2, "nvfp4": width // 2 + width // 16,
-            "fp8": width + width // 32}[format]
+    stride = {"bf16": width * 2, "nvfp4": width // 2 + width // 16,
+              "fp8": width + width // 32}[format]
+    if stride % 16:
+        raise ValueError(f"expert partial {format} width {width} has a non-16-byte-aligned record ({stride} bytes)")
+    return stride
 
 
 @dsl_user_op
@@ -96,8 +99,9 @@ class ExpertPartial:
                  expert_map: cute.Pointer, row_map: cute.Pointer, out: cute.Pointer,
                  region_rows: Int32, rows: Int32, local_experts: Int32, experts: Int32,
                  stream: cuda.CUstream):
-        self.kernel(fc2, svh, ids, expert_map, row_map, out, rows, local_experts, experts).launch(
-            grid=(region_rows, self.topk, self.width // 128), block=(32, 1, 1), stream=stream)
+        if region_rows > Int32(0):
+            self.kernel(fc2, svh, ids, expert_map, row_map, out, rows, local_experts, experts).launch(
+                grid=(region_rows, self.topk, self.width // 128), block=(32, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, fc2: cute.Pointer, svh: cute.Pointer, ids: cute.Pointer,

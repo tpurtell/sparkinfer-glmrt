@@ -79,6 +79,64 @@ def _combine(partials, weights, norm):
     return out.bfloat16()
 
 
+@pytest.mark.parametrize("format", ("nvfp4", "fp8"))
+def test_partial_record_alignment(format):
+    from b12x.moe._shared.kernels.w4a16.expert_partial import partial_row_bytes
+    with pytest.raises(ValueError, match="non-16-byte-aligned record"):
+        partial_row_bytes(128, format)
+    assert partial_row_bytes(512, format) % 16 == 0
+    assert partial_row_bytes(4096, format) % 16 == 0
+
+
+@pytest.mark.parametrize("wide_format", ("nvfp4", "fp8"))
+@pytest.mark.parametrize("active_format", ("bf16", "wide"))
+def test_empty_regions_in_uniform_wave(wide_format, active_format):
+    require_b12x()
+    from b12x.moe._shared.kernels.w4a16.expert_partial import compile_expert_partial_aot
+    from b12x.integration.cuteafd.muse_tp import compile_tp_combine_aot
+    rows, width, topk = 16, 4096, 8
+    gen = torch.Generator().manual_seed(155)
+    x = torch.randn(rows, topk, width, generator=gen)
+    weights = torch.full((rows, topk), 1.0 / topk)
+    norm = torch.zeros(width, dtype=torch.bfloat16)
+    selected = "bf16" if active_format == "bf16" else wide_format
+    expected = _combine(_decode(_encode(x, selected), selected, width).unsqueeze(0), weights, norm)
+    data, w, n = x.cuda(), weights.cuda(), norm.cuda()
+    empty = torch.empty(1, device="cuda")
+    rowmap = torch.arange(rows, dtype=torch.int32, device="cuda").view(torch.uint32)
+    combined = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+    programs = []
+    for format in ("bf16", wide_format):
+        p = compile_expert_partial_aot(width=width, topk=topk, format=format, rotated=False)
+        c = compile_tp_combine_aot(format=format)
+        reply = torch.full_like(_encode(x, format), 7, device="cuda")
+        count = rows if format == selected else 0
+        programs.append((p, c, reply, count))
+
+    def launch():
+        for p, c, reply, count in programs:
+            p.launch(data, empty, empty, empty, rowmap, reply, scalars=[count, rows, 0, 0])
+            c.launch(reply, rowmap, w, n, combined, scalars=[1, count, rows])
+
+    launch()
+    assert torch.equal(combined.cpu(), expected)
+    for _, _, reply, count in programs:
+        if count == 0:
+            assert (reply == 7).all()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    with kernel_resolution_guard("Uniform waves reuse empty and populated region programs"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        combined.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(combined.cpu(), expected)
+        for _, _, reply, count in programs:
+            if count == 0:
+                assert (reply == 7).all()
+
+
 @pytest.mark.parametrize("format", FORMATS)
 @pytest.mark.parametrize("rows", ROWS)
 def test_partial_codec(rows, format):
@@ -87,7 +145,8 @@ def test_partial_codec(rows, format):
     # Codec qualification takes the exact F32 partial as input; the worker
     # unrotation is qualified separately against the existing epilogue.
     gen = torch.Generator().manual_seed(51)
-    x = torch.randn(rows, 8, 128, generator=gen)
+    width = 512  # Every format's unpadded record is 16-byte aligned.
+    x = torch.randn(rows, 8, width, generator=gen)
     x[0, 0] = -0.
     x[0, 1, :16] = torch.linspace(-1e-5, 1e-5, 16)
     x[0, 2, :16] = torch.tensor([0., -.0, .25, .75, 1.25, 1.75, 2.5, 3.5, 5., 6., -6., -.25, -.75, -1.25, -3.5, -5.])
@@ -95,7 +154,7 @@ def test_partial_codec(rows, format):
         for route, value in enumerate((448., 449., 1.75, 2.0**-140, 2.0**-126, 2.0**120), 2):
             x[0, route] = value
     expect = _encode(x, format)
-    program = compile_expert_partial_aot(width=128, topk=8, format=format, rotated=False)
+    program = compile_expert_partial_aot(width=width, topk=8, format=format, rotated=False)
     data = x.cuda()
     rowmap = torch.arange(rows, dtype=torch.int32, device="cuda").view(torch.uint32)
     empty = torch.empty(1, device="cuda")
