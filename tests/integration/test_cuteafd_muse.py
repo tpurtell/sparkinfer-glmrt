@@ -36,6 +36,28 @@ def _bf16_ulp_close(actual, expected, count=1):
     assert ((a - e).abs() <= count * ulp).all(), ((a - e).abs().max(), ((a - e).abs() / ulp).max())
 
 
+def _attention_error_bound(actual, query, keys, values, *, row, expected=None):
+    """FP64 softmax/PV after the checkpoint's explicit BF16 score boundaries."""
+    q, k, v = query.cpu().double(), keys.cpu().double(), values.cpu().double()
+    score = torch.einsum("hd,khd->hk", q, k).bfloat16()
+    score = (score * .125).bfloat16().double()
+    probability = score.softmax(-1)
+    reference = torch.einsum("hk,khd->hd", probability, v)
+    terms = torch.einsum("hk,khd->hd", probability, v.abs())
+    ulp = torch.exp2(torch.floor(torch.log2(reference.abs().clamp_min(2.0 ** -126))) - 7)
+    bound = terms * (2.0 ** -7) + ulp
+    eager = (torch.einsum("hk,khd->hd", probability.bfloat16().double(), v).bfloat16().double()
+             if expected is None else expected.cpu().double())
+    ratios = []
+    for name, candidate in (("kernel", actual.cpu().double()), ("eager", eager)):
+        ratio = (candidate - reference).abs() / bound
+        worst = int(ratio.argmax())
+        index = (worst // ratio.shape[-1], worst % ratio.shape[-1])
+        assert ratio.max() <= 1, (name, (row, *index), ratio.max(), candidate[index], reference[index], bound[index])
+        ratios.append(float(ratio.max()))
+    return ratios
+
+
 @pytest.mark.parametrize("rows", ROWS)
 def test_residual_gate(rows):
     require_b12x()
@@ -277,18 +299,15 @@ def test_attention_oracle_and_unit_invariance(kind, history, heads):
             graph.replay()
             torch.cuda.synchronize()
             assert torch.equal(out, expected_graph)
-    k, v = keys.cuda().repeat_interleave(8, dim=1), values.cuda().repeat_interleave(8, dim=1)
+    k, v = keys.repeat_interleave(8, dim=1), values.repeat_interleave(8, dim=1)
+    ratios = []
     for row in range(rows):
         position = history + row
         first = max(0, position - 2047) if kind == "swa" else 0
-        q = query[row].float()
-        kk, vv = k[first:position + 1], v[first:position + 1]
-        # Official BF16 QK and scale boundaries; online PV normalization may reorder.
-        score = torch.einsum("hd,khd->hk", q, kk.float()).bfloat16()
-        score = (score * 0.125).bfloat16()
-        prob = torch.softmax(score.float(), -1).bfloat16()
-        expected = torch.einsum("hk,khd->hd", prob.float(), vv.float()).bfloat16()
-        torch.testing.assert_close(out[row].float(), expected.float(), atol=0.002, rtol=0.02)
+        ratios.append(_attention_error_bound(out[row], query[row],
+                        k[first:position + 1], v[first:position + 1], row=row))
+    print(f"random {kind} heads={heads} history={history}: kernel/eager max err/bound "
+          f"{np.max(ratios, axis=0).tolist()}")
 
 
 @pytest.mark.parametrize("layer,kind", ((0, "swa"), (1, "full")))
@@ -321,10 +340,16 @@ def test_engine_attention_exchange(layer, kind):
         ring = torch.zeros(64, 256, dtype=torch.bfloat16, device="cuda")
         first = torch.zeros(9, dtype=torch.int32, device="cuda")
         program.launch(q, records, ring, pos, pos, first, out, scratch, scalars=[9])
-    torch.testing.assert_close(out.float(), expected.float(), atol=0.002, rtol=0.02)
     destination = Path(os.environ["CUTEAFD_MUSE_ATTENTION_OUTPUT"])
     destination.mkdir(parents=True, exist_ok=True)
     out.cpu().view(torch.uint16).numpy().tofile(destination / f"layer{layer}.out.bin")
+    ratios = []
+    keys, values = k.repeat_interleave(4, dim=1), v.repeat_interleave(4, dim=1)
+    for row in range(9):
+        first_key = max(0, row - 4) if kind == "swa" else 0
+        ratios.append(_attention_error_bound(out[row], q[row],
+                      keys[first_key:row + 1], values[first_key:row + 1], row=row, expected=expected[row]))
+    print(f"fixture {kind}: kernel/eager max err/bound {np.max(ratios, axis=0).tolist()}")
 
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("kind", ("full", "swa"))
