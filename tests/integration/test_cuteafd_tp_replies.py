@@ -60,7 +60,8 @@ def _decode(data, format, width):
         return (values.reshape(*values.shape[:-1], width // 16, 16) *
                 scales.view(torch.float8_e4m3fn).float()[..., None]).reshape_as(values)
     values = data[..., :width].view(torch.float8_e4m3fn).float()
-    scales = torch.exp2(data[..., width:].float() - 127)
+    codes = data[..., width:].int()
+    scales = torch.where(codes == 0, 0x00400000, codes << 23).view(torch.float32)
     return (values.reshape(*values.shape[:-1], width // 32, 32) * scales[..., None]).reshape_as(values)
 
 
