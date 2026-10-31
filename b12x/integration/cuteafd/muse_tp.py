@@ -27,7 +27,7 @@ def _ue8m0_scale(code, *, loc=None, ip=None):
 class TpCombine:
     """Reduce rank-local regions whose device bases are each 16-byte aligned.
 
-    The caller owns the fixed-address uint64 table and updates it on the launch
+    The caller owns the fixed-address int64 table and updates it on the launch
     stream before replay. Region bases may belong to separate/P2P allocations.
     """
 
@@ -114,7 +114,7 @@ def compile_tp_combine_aot(*, format, width=4096, topk=8):
     if width % 1024 or topk <= 0:
         raise ValueError("Muse TP combine requires H1024 width and positive topk")
     return compile_program(TpCombine(width, topk, format), name=f"muse_tp_combine_{format}",
-        operands=(Operand("rank_regions", torch.uint64, "[ranks]", align=8),
+        operands=(Operand("rank_regions", torch.int64, "[ranks]", align=8),
                   Operand("row_map", torch.uint32, "[region_rows]", align=4),
                   Operand("weights", torch.float32, f"[rows,{topk}]"),
                   Operand("norm", torch.bfloat16, f"[{width}]"),

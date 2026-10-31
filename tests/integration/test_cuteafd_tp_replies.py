@@ -12,7 +12,7 @@ FORMATS = ("bf16", "nvfp4", "fp8")
 
 
 def _rank_regions(data):
-    return torch.tensor([plane.data_ptr() for plane in data], dtype=torch.uint64, device="cuda")
+    return torch.tensor([plane.data_ptr() for plane in data], dtype=torch.int64, device="cuda")
 
 
 def _encode(x, format):
@@ -368,7 +368,8 @@ def test_combine_disjoint_rank_regions_and_table_replay(ranks, format):
     planes.sort(key=lambda plane: plane.data_ptr(), reverse=True)
     assert all(plane.data_ptr() % 16 == 0 for plane in planes)
     if ranks == 3:
-        assert planes[2].data_ptr() < planes[0].data_ptr()
+        planes[1], planes[2] = planes[2], planes[1]
+        assert planes[1].data_ptr() < planes[2].data_ptr() < planes[0].data_ptr()
     for rank, plane in enumerate(planes):
         plane.copy_(contiguous[rank])
     table = _rank_regions(planes)
@@ -383,7 +384,7 @@ def test_combine_disjoint_rank_regions_and_table_replay(ranks, format):
     next_expected = torch.empty_like(expected)
     compile_contiguous_oracle_aot(format=format).launch(
         replacement, rowmap, w, n, next_expected, scalars=[ranks, rows, rows])
-    staging = torch.tensor([plane.data_ptr() for plane in replacement], dtype=torch.uint64,
+    staging = torch.tensor([plane.data_ptr() for plane in replacement], dtype=torch.int64,
                            pin_memory=True)
     with kernel_resolution_guard("Rank region addresses are runtime table contents"):
         graph = torch.cuda.CUDAGraph()
