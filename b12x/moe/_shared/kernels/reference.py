@@ -8,6 +8,7 @@ import torch
 # reference_flashinfer.py, kept separate so this module stays pure-torch.
 from b12x._lib.intrinsics import fp4_quantize_values_torch
 from b12x.moe._shared.kernels.activations import (
+    SILU_POST_CLAMP,
     SITU,
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
@@ -153,6 +154,10 @@ def _apply_gated_activation(
     swiglu_alpha: float,
     swiglu_beta: float,
 ) -> torch.Tensor:
+    if activation == SILU_POST_CLAMP:
+        limit = float(swiglu_limit)
+        silu = torch.clamp(gate * torch.sigmoid(gate), max=limit)
+        return silu * torch.clamp(up, min=-limit, max=limit)
     if swiglu_limit is not None:
         gate = torch.clamp(gate, max=float(swiglu_limit))
         up = torch.clamp(up, min=-float(swiglu_limit), max=float(swiglu_limit))

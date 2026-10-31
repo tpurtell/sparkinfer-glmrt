@@ -754,10 +754,16 @@ def _reference_full_rotation_decoded(
                 svh=up_svh[expert],
                 store_fp16=True,
             )
-            if swiglu_limit is not None:
+            if activation == "silu_post_clamp":
+                silu = (gate.float() * torch.sigmoid(gate.float())).clamp(max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+                activated = (silu * up.float()).to(torch.float16)
+            elif swiglu_limit is not None:
                 gate = gate.clamp(max=swiglu_limit)
                 up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-            if activation == "situ":
+            if activation == "silu_post_clamp":
+                pass
+            elif activation == "situ":
                 activated = (
                     4.0
                     * torch.tanh(gate.float() / 4.0)
@@ -1196,6 +1202,10 @@ def test_full_rotation_topk16_route_parallel_sum_matches_reference(bits: int) ->
         (torch.bfloat16, "situ", 3, None, torch.float32),
         (torch.float16, "silu", 3, None, torch.float32),
         (torch.float16, "situ", 3, None, torch.float32),
+        # Step-5: SiLU is bounded after activation; K4 experts and K6 tails.
+        (torch.bfloat16, "silu_post_clamp", 4, 7.0, torch.float32),
+        (torch.bfloat16, "silu_post_clamp", 6, 7.0, torch.float32),
+        (torch.bfloat16, "silu_post_clamp", 4, 7.0, torch.bfloat16),
     ],
 )
 def test_planned_full_rotation_matches_reference_and_captures(

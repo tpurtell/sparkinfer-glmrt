@@ -533,6 +533,7 @@ def _serial_tier(
     expert_map: torch.Tensor,
     block_size_m: int = 8,
     swiglu_limit: float | None = None,
+    activation: str = "silu",
 ) -> torch.Tensor:
     m, topk = int(topk_ids.shape[0]), int(topk_ids.shape[1])
     buffers = make_w4a16_packed_buffers(
@@ -552,7 +553,7 @@ def _serial_tier(
         prepared,
         topk_weights,
         topk_ids,
-        activation="silu",
+        activation=activation,
         swiglu_limit=swiglu_limit,
         intermediate_cache13=buffers.intermediate_cache13,
         intermediate_cache2=buffers.intermediate_cache2,
@@ -603,7 +604,8 @@ def test_mixed_two_tier_matches_serial_and_captures(
     tile_config: tuple[int, int, int, int] | None = None,
     swiglu_limit: float | None = None,
     workspace_sms: int | None = None,
-) -> None:
+    activation: str = "silu",
+) -> torch.Tensor:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
     hidden, intermediate = geometry
@@ -626,7 +628,8 @@ def test_mixed_two_tier_matches_serial_and_captures(
         device=device,
         codebook=codebook,
     )
-    x = (torch.randn((m, hidden), device=device) * (0.1 if swiglu_limit is not None else 1.0e-3)).to(torch.bfloat16)
+    scale = 0.1 if swiglu_limit is not None and swiglu_limit < 1.0e6 else 1.0e-3
+    x = (torch.randn((m, hidden), device=device) * scale).to(torch.bfloat16)
     # Global expert ids deliberately interleave the two bitrate tiers. The combined
     # namespace remains tier ordered so weight and rotation tables stay dense.
     # The final route uses vLLM's padding sentinel. Both packed and direct
@@ -637,12 +640,13 @@ def test_mixed_two_tier_matches_serial_and_captures(
     )
     map0 = torch.tensor([1, -1, 0, -1], dtype=torch.int32, device=device)
     map1 = torch.tensor([-1, 1, -1, 0], dtype=torch.int32, device=device)
-    serial = _serial_tier(x, tier0, topk_weights, topk_ids, map0, swiglu_limit=swiglu_limit)
-    serial = serial + _serial_tier(x, tier1, topk_weights, topk_ids, map1, swiglu_limit=swiglu_limit)
+    serial = _serial_tier(x, tier0, topk_weights, topk_ids, map0, swiglu_limit=swiglu_limit, activation=activation)
+    serial = serial + _serial_tier(x, tier1, topk_weights, topk_ids, map1, swiglu_limit=swiglu_limit, activation=activation)
     torch.cuda.synchronize(device)
 
-    if swiglu_limit is not None:
-        unclipped = _serial_tier(x, tier0, topk_weights, topk_ids, map0) + _serial_tier(x, tier1, topk_weights, topk_ids, map1)
+    if swiglu_limit is not None and swiglu_limit < 1.0e6:
+        unclipped = (_serial_tier(x, tier0, topk_weights, topk_ids, map0)
+                     + _serial_tier(x, tier1, topk_weights, topk_ids, map1))
         assert torch.isfinite(serial).all() and torch.isfinite(unclipped).all()
         assert float((serial - unclipped).norm() / unclipped.norm().clamp_min(1e-12)) > 0.01
 
@@ -668,6 +672,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
         route_ids_dtype=route_ids_dtype,
         trellis_codebook=codebook,
         swiglu_limit=swiglu_limit,
+        activation=activation,
         tier0_bits=bits[0],
         tier1_bits=bits[1],
         direct_topk_routes=direct_topk_routes,
@@ -773,7 +778,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
     skipped_map1[3] = -1
     skipped_serial = _serial_tier(
         x, tier0, topk_weights, topk_ids, map0, swiglu_limit=swiglu_limit
-    ) + _serial_tier(x, tier1, topk_weights, topk_ids, skipped_map1, swiglu_limit=swiglu_limit)
+    ) + _serial_tier(x, tier1, topk_weights, topk_ids, skipped_map1, swiglu_limit=swiglu_limit, activation=activation)
     skipped_global_to_combined = global_to_combined.clone()
     skipped_global_to_combined[3] = -1
     skipped_binding = bind_mixed_trellis(
@@ -796,6 +801,7 @@ def test_mixed_two_tier_matches_serial_and_captures(
         skipped - skipped_serial
     ).norm() / skipped_serial.norm().clamp_min(1.0e-12)
     assert float(skipped_relative) < 4.0e-3
+    return eager
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
@@ -2107,6 +2113,51 @@ def test_mixed_trellis_swiglu_limit_matches_clipped_serial(direct):
     test_mixed_two_tier_matches_serial_and_captures(
         torch.int32, "mcg", (3, 4), direct, "bf16", geometry=(5120, 640), swiglu_limit=10.0,
     )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires SM120/SM121")
+@pytest.mark.parametrize("direct", [False, True])
+def test_mixed_trellis_post_clamp_k4_k6_matches_serial(direct):
+    """Step-5 K4 experts with K6 tails: SiLU bounded after activation."""
+    test_mixed_two_tier_matches_serial_and_captures(
+        torch.int32, "mcg", (4, 6), direct, "bf16", geometry=(512, 256), swiglu_limit=7.0,
+        activation="silu_post_clamp",
+    )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires SM120/SM121")
+@pytest.mark.parametrize("direct", [False, True])
+def test_mixed_trellis_post_clamp_without_saturation_is_silu_bitwise(direct):
+    """An unreached post-SiLU bound leaves the SiLU arithmetic byte-identical."""
+    common = (torch.int32, "mcg", (4, 6), direct, "bf16")
+    silu = test_mixed_two_tier_matches_serial_and_captures(*common, geometry=(512, 256))
+    bounded = test_mixed_two_tier_matches_serial_and_captures(
+        *common, geometry=(512, 256), swiglu_limit=1.0e30, activation="silu_post_clamp")
+    assert torch.equal(silu, bounded)
+
+
+def test_post_clamp_reference_bounds_silu_not_gate():
+    from b12x.moe._shared.kernels.reference import _apply_gated_activation
+    gate = torch.tensor([8.0, 8.0, -1.0, 20.0])
+    up = torch.tensor([1.0, 9.0, 3.0, -9.0])
+    post = _apply_gated_activation(gate, up, activation="silu_post_clamp", swiglu_limit=7.0,
+                                   swiglu_alpha=1.0, swiglu_beta=0.0)
+    silu = gate * torch.sigmoid(gate)
+    expected = silu.clamp(max=7.0) * up.clamp(-7.0, 7.0)
+    assert torch.equal(post, expected)
+    pre = _apply_gated_activation(gate, up, activation="silu", swiglu_limit=7.0,
+                                  swiglu_alpha=1.0, swiglu_beta=0.0)
+    assert not torch.equal(post, pre)
+    from b12x.moe._shared.kernels.activations import normalize_swiglu_limit_for_activation
+    with pytest.raises(ValueError, match="requires a positive swiglu_limit"):
+        normalize_swiglu_limit_for_activation("silu_post_clamp", None)
+
+
+def test_post_clamp_is_rejected_by_kernels_that_do_not_implement_it():
+    from b12x.moe._shared.kernels.activations import reject_trellis_only_activation
+    with pytest.raises(ValueError, match="does not implement"):
+        reject_trellis_only_activation("silu_post_clamp", "micro MoE")
+    reject_trellis_only_activation("silu", "micro MoE")
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires SM120/SM121")

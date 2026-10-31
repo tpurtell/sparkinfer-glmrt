@@ -120,6 +120,7 @@ from b12x.moe._shared.kernels.activations import (
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     normalize_moe_activation,
+    reject_trellis_only_activation,
     normalize_swiglu_alpha_for_activation,
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
@@ -826,6 +827,7 @@ class MoEDynamicKernelBackend:
         ):
             raise ValueError("prequantized input requires V4.1 repacked W4A8")
         activation = normalize_moe_activation(activation)
+        reject_trellis_only_activation(activation, "dynamic MoE")
         if quant_recipe not in {
             "nvfp4",
             "w4a8_mx",

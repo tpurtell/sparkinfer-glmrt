@@ -903,9 +903,9 @@ def plan_moe_weight_preparation(
             continue
         if spec.quant_mode == "w4a16":
             if source_format in _TRELLIS_SOURCE_FORMATS:
-                if spec.activation not in {"silu", "situ"}:
+                if spec.activation not in {"silu", "situ", "silu_post_clamp"}:
                     raise ValueError(
-                        "Trellis W4A16 currently requires silu or situ"
+                        "Trellis W4A16 currently requires silu, situ or silu_post_clamp"
                     )
                 if requested_w4a16_layout not in {
                     None,
