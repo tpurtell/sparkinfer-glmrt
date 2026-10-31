@@ -6,12 +6,22 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics import cvt_e4m3_to_f32_via_f16, div_rn_f32
 from b12x.moe._shared.kernels.w4a16.expert_partial import decode_fp4, partial_row_bytes
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _bf16, _warp_sum
 from .pointwise import _add, _mul, _sqrt_rn, _view
+
+
+@dsl_user_op
+def _ue8m0_scale(code, *, loc=None, ip=None):
+    return Float32(llvm.inline_asm(T.f32(), [Uint32(code).ir_value()],
+        "{ .reg .b32 bits; .reg .pred zero; shl.b32 bits, $1, 23; "
+        "setp.eq.u32 zero, $1, 0; @zero mov.b32 bits, 4194304; mov.b32 $0, bits; }",
+        "=f,r", has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT))
 
 
 class TpCombine:
@@ -38,8 +48,7 @@ class TpCombine:
             value = _mul(decode_fp4(code), scale)
         else:
             code = Uint32(data[base + col])
-            exponent = Int32(data[base + Int64(self.width) + col // Int64(32)]) - Int32(127)
-            scale = cute.math.exp2(Float32(exponent), fastmath=False)
+            scale = _ue8m0_scale(Uint32(data[base + Int64(self.width) + col // Int64(32)]))
             value = _mul(cvt_e4m3_to_f32_via_f16(code), scale)
         return value
 

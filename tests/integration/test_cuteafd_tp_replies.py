@@ -189,6 +189,9 @@ def test_rotated_partial_and_mixed_maps(format):
 def test_combine_scale_edges(format):
     require_b12x()
     from b12x.integration.cuteafd.muse_tp import compile_tp_combine_aot
+    # PyTorch defaults to host FTZ on ARM; the contract is IEEE F32 and BF16,
+    # including the subnormal weighted route products at this edge.
+    torch.set_flush_denormal(False)
     width, topk = 4096, 8
     partials = torch.zeros(1, 1, topk, width)
     if format == "fp8":
