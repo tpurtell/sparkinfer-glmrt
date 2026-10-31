@@ -286,9 +286,11 @@ class GlmRankNormPackKV:
                 kv_square = kv_square + kv[e] * kv[e]
         q_total = _block_sum(square, sums, Int32(0), self.warps)
         kv_total = _block_sum(kv_square, sums, Int32(1), self.warps)
-        k_inv = _rsqrt(kv_total / Float32(512.0) + Float32(self.eps))
+        # q_rank 0 elides the q statements; otherwise they stay in their original order.
         if cutlass.const_expr(self.q_rank > 0):
             q_inv = _rsqrt(q_total / Float32(self.q_rank) + Float32(self.eps))
+        k_inv = _rsqrt(kv_total / Float32(512.0) + Float32(self.eps))
+        if cutlass.const_expr(self.q_rank > 0):
             for j in cutlass.range_constexpr(self.q_per_thread):
                 d = Int64(j * self.threads) + Int64(tidx)
                 q_resid[token, d] = (Float32(q_norm[d]) * _bf16(qv[j] * q_inv)).to(BFloat16)
