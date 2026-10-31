@@ -33,6 +33,26 @@ reference's order); ``query`` is unused.
 epilogue (``glm_stage_index_post`` ABI) with the query/key RoPE skipped on
 NoPE layers; ``iq`` is the SSMax-scaled ``wq_b`` output.
 
+``compile_rank_pack_aot(geometry, rope=..., max_rows=R)``: ``kv_a_norm`` and
+the FP8 latent record of ``wkv_a(x)`` (no q-LoRA): RoPE layers write the
+656-byte record (rotated key in its BF16 tail), NoPE layers the 528-byte one::
+
+    kv         bf16 [rows,576|512]  in     wkv_a_with_mqa output
+    kv_a_norm  bf16 [512]           in
+    positions  i64  [rows]          in
+    slots      i64  [rows]          in     page*64+row (<0 skips)
+    cos_sin    f32  [P,64]          in     (RoPE layers)
+    cache      u8   [pages,64*R]    inout
+    rows       int32
+
+``compile_kv_b_aot(geometry, stage="absorb"|"values", rope=..., max_rows=R)``:
+the per-head BF16 ``wkv_b`` GEMMs (``wkv_b`` is BF16 in the checkpoint)::
+
+    absorb:  a bf16 [rows,H,128] (q_nope leading)  w bf16 [H,512,nope]  out bf16 [rows,H,latent]
+    values:  a bf16 [rows,H,512]                   w bf16 [H,128,512]   out bf16 [rows,H,128]
+
+``latent`` 576 (RoPE layers; the tail is the query scale's) or 512 (NoPE).
+
 ``compile_layer_norm_aot(width=W, max_rows=R)``: LayerNorm with bias (the
 indexer's ``q_input_norm``), F32 statistics, BF16 out::
 
@@ -54,11 +74,13 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Int64
 
 from ._common import Operand, Scalar, compile_program
-from ._glm_kernels import GlmIndexPost, _block_sum, _bf16, _reduction_storage, _rsqrt
+from ._glm_kernels import (BatchedBf16Gemm, GlmIndexPost, GlmRankNormPackKV, _block_sum, _bf16, _reduction_storage,
+                           _rsqrt)
 from ._query_scale import QueryScale
 
 __all__ = ["ML4", "Ml4Geometry", "LayerNormBias", "compile_index_post_aot", "compile_layer_norm_aot",
-           "compile_query_scale_aot"]
+           "compile_kv_b_aot", "compile_query_scale_aot", "compile_rank_pack_aot", "compile_sparse_mla_aot",
+           "nope_attention", "rope_attention"]
 
 
 @dataclass(frozen=True)
@@ -101,6 +123,41 @@ class Ml4Geometry:
 
 
 ML4 = Ml4Geometry()
+
+
+def rope_attention(g: Ml4Geometry = ML4):
+    """The GLM 5.x program geometry of a RoPE layer: no q-LoRA, nope 64 + rope 64,
+    v 128, the 656-byte record, ``softmax_scale = 128**-0.5``."""
+    from ._common import GLMGeometry
+    return GLMGeometry(name="ml4", hidden=g.hidden, heads=g.heads, q_lora_rank=0, kv_lora_rank=g.kv_lora_rank,
+                       qk_nope_dim=g.qk_nope_dim, qk_rope_dim=g.qk_rope_dim, v_head_dim=g.v_head_dim,
+                       index_heads=g.index_heads, index_head_dim=g.index_head_dim, index_topk=g.index_topk,
+                       dense_inter=g.dense_inter, moe_inter=g.moe_inter, routed_experts=g.routed_experts,
+                       norm_eps=g.norm_eps, index_norm_eps=g.index_norm_eps, page_rows=g.page_rows)
+
+
+def nope_attention(g: Ml4Geometry = ML4):
+    """The GLM 5.3 Flash (NoPE MLA) program geometry of a NoPE layer: nope 128,
+    v 128, the 528-byte record and 512-wide absorbed query, plain top-k
+    (one-token index pools), ``softmax_scale = 128**-0.5``."""
+    from ._common import GLMFGeometry
+    return GLMFGeometry(name="ml4_nope", hidden=g.hidden, heads=g.heads, q_lora_rank=0,
+                        kv_lora_rank=g.kv_lora_rank, qk_nope_dim=g.qk_head_dim, v_head_dim=g.v_head_dim,
+                        index_heads=g.index_heads, index_head_dim=g.index_head_dim, index_topk=g.index_topk,
+                        index_kpool=1, dense_inter=g.dense_inter, moe_inter=g.moe_inter,
+                        routed_experts=g.routed_experts, top_k=g.top_k, swiglu_limit=0.0,
+                        norm_eps=g.norm_eps, index_norm_eps=g.index_norm_eps, page_rows=g.page_rows)
+
+
+def compile_sparse_mla_aot(g: Ml4Geometry = ML4, *, rope: bool, route: str, max_rows: int, **kwargs):
+    """GLM 5.x sparse MLA at a Mistral Large 4 layer's record contract. The
+    program name carries the family so its compile key never aliases a GLM
+    program of another softmax scale."""
+    from .glm_sparse_mla import compile_glm_sparse_mla_aot
+    attention = rope_attention(g) if rope else nope_attention(g)
+    assert abs(attention.softmax_scale - g.softmax_scale) < 1e-15
+    return compile_glm_sparse_mla_aot(attention, route=route, max_rows=max_rows,
+                                      name="ml4_sparse_mla" + ("" if rope else "_nope"), **kwargs)
 
 
 def compile_query_scale_aot(g: Ml4Geometry = ML4, *, rope: bool, max_rows: int,
@@ -213,3 +270,64 @@ def compile_index_post_aot(g: Ml4Geometry = ML4, *, rope: bool, max_rows: int):
         key=(g, bool(rope), int(max_rows)),
         geometry=dict(index_heads=i, rope=bool(rope), page_rows=g.page_rows, index_norm_eps=g.index_norm_eps,
                       max_rows=int(max_rows)), doc=__doc__)
+
+
+class _RankPack:
+    """``GlmRankNormPackKV`` without the q part (no q-LoRA, no q_resid)."""
+
+    def __init__(self, rope: bool, eps: float, page_rows: int):
+        self.pack = GlmRankNormPackKV(q_rank=0, eps=eps, page_rows=page_rows,
+                                      record_bytes=656 if rope else 528, rope=64 if rope else 0)
+
+    def key(self) -> tuple:
+        return ("rank_pack", self.pack.rope, self.pack.eps, self.pack.page_rows)
+
+    @cute.jit
+    def __call__(self, kv: cute.Pointer, kv_a_norm: cute.Pointer, positions: cute.Pointer, slots: cute.Pointer,
+                 cos_sin: cute.Pointer, cache: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        # q_norm / q_resid are never read or written at q_rank 0: bind live pointers.
+        self.pack(kv, kv_a_norm, kv_a_norm, positions, slots, cos_sin, kv, cache, rows, stream)
+
+
+def compile_rank_pack_aot(g: Ml4Geometry = ML4, *, rope: bool, max_rows: int):
+    if int(max_rows) <= 0:
+        raise ValueError("max_rows must be positive")
+    launch = _RankPack(rope, g.norm_eps, g.page_rows)
+    width = g.kv_lora_rank + (g.qk_rope_dim if rope else 0)
+    record = 656 if rope else 528
+    operands = (Operand("kv", torch.bfloat16, f"[rows,{width}]"),
+                Operand("kv_a_norm", torch.bfloat16, f"[{g.kv_lora_rank}]"),
+                Operand("positions", torch.int64, "[rows]", align=8),
+                Operand("slots", torch.int64, "[rows]", align=8),
+                Operand("cos_sin", torch.float32, "[P,64]" if rope else "unused", align=4),
+                Operand("cache", torch.uint8, f"[pages,{g.page_rows * record}]", "inout"))
+    return compile_program(
+        launch, name="ml4_rank_pack" + ("" if rope else "_nope"), operands=operands, scalars=(Scalar("rows"),),
+        key=(launch.key(), int(max_rows)),
+        geometry=dict(rope=bool(rope), record_bytes=record, page_rows=g.page_rows, norm_eps=g.norm_eps,
+                      max_rows=int(max_rows)), doc=__doc__)
+
+
+def compile_kv_b_aot(g: Ml4Geometry = ML4, *, stage: str, rope: bool, max_rows: int):
+    if int(max_rows) <= 0:
+        raise ValueError("max_rows must be positive")
+    n, c, head, nope = g.heads, g.kv_lora_rank, g.qk_head_dim, g.nope_dim(rope)
+    latent = c + (g.qk_rope_dim if rope else 0)
+    if stage == "absorb":
+        launch = BatchedBf16Gemm(n=c, k=nope, batch=n, a_row=n * head, a_batch=head, o_row=n * latent, o_batch=latent)
+        operands = (Operand("a", torch.bfloat16, f"[rows,{n},{head}]"),
+                    Operand("w", torch.bfloat16, f"[{n},{c},{nope}]", note="kv_b k rows per head, transposed"),
+                    Operand("out", torch.bfloat16, f"[rows,{n},{latent}]", "out"))
+    elif stage == "values":
+        v = g.v_head_dim
+        launch = BatchedBf16Gemm(n=v, k=c, batch=n, a_row=n * c, a_batch=c, o_row=n * v, o_batch=v)
+        operands = (Operand("a", torch.bfloat16, f"[rows,{n},{c}]"),
+                    Operand("w", torch.bfloat16, f"[{n},{v},{c}]", note="kv_b v rows per head"),
+                    Operand("out", torch.bfloat16, f"[rows,{n},{v}]", "out"))
+    else:
+        raise ValueError("kv_b stage must be absorb or values")
+    return compile_program(
+        launch, name=f"ml4_{stage}" + ("" if rope or stage == "values" else "_nope"), operands=operands,
+        scalars=(Scalar("rows"),), key=(launch.key(), int(max_rows)),
+        geometry=dict(stage=stage, rope=bool(rope), heads=n, nope=nope, latent=latent, max_rows=int(max_rows)),
+        doc=__doc__)

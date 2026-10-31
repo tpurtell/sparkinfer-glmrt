@@ -231,6 +231,7 @@ class GlmRankNormPackKV:
         self.rope = int(rope)
         if self.rope not in (0, 2 * ROPE_PAIRS):
             raise ValueError("the latent record carries 64 RoPE dims or none (GLM 5.3 Flash)")
+        # q_rank 0: MLA without q-LoRA (Mistral Large 4); no q_resid is written.
         self.q_rank = int(q_rank)
         if self.q_rank % self.threads:
             raise ValueError("q_lora_rank must divide by the CTA width")
@@ -248,12 +249,12 @@ class GlmRankNormPackKV:
         m = Int64(rows)
         self.kernel(
             cute.make_tensor(qkv, cute.make_layout((m, width), stride=(width, 1))),
-            cute.make_tensor(q_norm, cute.make_layout((self.q_rank,))),
+            cute.make_tensor(q_norm, cute.make_layout((max(self.q_rank, 1),))),
             cute.make_tensor(kv_norm, cute.make_layout((512,))),
             cute.make_tensor(positions, cute.make_layout((m,))),
             cute.make_tensor(slots, cute.make_layout((m,))),
             cos_sin,
-            cute.make_tensor(q_resid, cute.make_layout((m, self.q_rank), stride=(self.q_rank, 1))),
+            cute.make_tensor(q_resid, cute.make_layout((m, max(self.q_rank, 1)), stride=(max(self.q_rank, 1), 1))),
             cache,
         ).launch(grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
 
@@ -268,7 +269,7 @@ class GlmRankNormPackKV:
         storage = smem.allocate(_reduction_storage(2, self.warps))
         sums = storage.sums.get_tensor(cute.make_layout((2, self.warps), stride=(self.warps, 1)))
 
-        qv = cute.make_rmem_tensor(cute.make_layout((self.q_per_thread,), stride=(1,)), Float32)
+        qv = cute.make_rmem_tensor(cute.make_layout((max(self.q_per_thread, 1),), stride=(1,)), Float32)
         square = Float32(0.0)
         for j in cutlass.range_constexpr(self.q_per_thread):
             d = Int64(j * self.threads) + Int64(tidx)
@@ -285,11 +286,12 @@ class GlmRankNormPackKV:
                 kv_square = kv_square + kv[e] * kv[e]
         q_total = _block_sum(square, sums, Int32(0), self.warps)
         kv_total = _block_sum(kv_square, sums, Int32(1), self.warps)
-        q_inv = _rsqrt(q_total / Float32(self.q_rank) + Float32(self.eps))
         k_inv = _rsqrt(kv_total / Float32(512.0) + Float32(self.eps))
-        for j in cutlass.range_constexpr(self.q_per_thread):
-            d = Int64(j * self.threads) + Int64(tidx)
-            q_resid[token, d] = (Float32(q_norm[d]) * _bf16(qv[j] * q_inv)).to(BFloat16)
+        if cutlass.const_expr(self.q_rank > 0):
+            q_inv = _rsqrt(q_total / Float32(self.q_rank) + Float32(self.eps))
+            for j in cutlass.range_constexpr(self.q_per_thread):
+                d = Int64(j * self.threads) + Int64(tidx)
+                q_resid[token, d] = (Float32(q_norm[d]) * _bf16(qv[j] * q_inv)).to(BFloat16)
 
         slot = Int64(slots[token])
         if slot >= Int64(0):

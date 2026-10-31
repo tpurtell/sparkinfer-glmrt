@@ -206,3 +206,104 @@ def test_index_post_matches_epilogue_reference(rope):
     # The key's F32 LayerNorm statistics are warp-reduced: allow one E4M3 code step.
     assert (stored.view(torch.float8_e4m3fn).float() * scales[:, None]
             - key_codes.float() * key_scale).abs().max() <= (key_scale * 2 ** -3).max()
+
+
+# ---------------------------------------------------------------------------
+# One attention layer from the shared GLM programs at Mistral Large 4 geometry
+# ---------------------------------------------------------------------------
+
+def _official_attention(x, positions, w, rope, kv_source=None):
+    """``MistralLarge4TextAttention.forward`` (eager, no indexer: every causal key),
+    F32 from the BF16 operands: q = ssmax(cat(q_nope, rope(q_rot))), latent =
+    rms_norm(kv_a[:512]), k_rot = rope(kv_a[512:]), [k_nope | v] = kv_b(latent),
+    softmax(q k^T * 128^-0.5) v, wo. Returns (out [T, H], latent, k_rot)."""
+    T, H, nope = x.shape[0], 64, (64 if rope else 128)
+    q = (x.float() @ w["wq"].float().t()).bfloat16().view(T, H, 128)
+    q = _reference_query(q, positions.cpu(), w["s"], w["b"], nope, rope)
+    if kv_source is None:
+        kv = (x.float() @ w["wkv_a"].float().t()).bfloat16()
+        lat = kv[:, :512].float()
+        lat = (w["kv_a_norm"].float() * (lat * torch.rsqrt(lat.pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16().float()).bfloat16()
+        k_rot = None
+        if rope:
+            angles = positions.cpu().float()[:, None] * _inv_freq()[None, :]
+            c, s = angles.cos().bfloat16(), angles.sin().bfloat16()
+            even, odd = kv[:, 512::2], kv[:, 513::2]
+            k_rot = torch.cat([even * c - odd * s, odd * c + even * s], -1)
+    else:
+        lat, k_rot = kv_source
+    kvb = (lat.float() @ w["wkv_b"].float().t()).bfloat16().view(T, H, nope + 128)
+    k = kvb[..., :nope]
+    if rope:
+        k = torch.cat([k, k_rot[:, None, :].expand(T, H, 64)], -1)
+    v = kvb[..., nope:]
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * 128 ** -0.5
+    scores = scores.masked_fill(torch.ones(T, T, dtype=torch.bool).triu(1), float("-inf"))
+    attn = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float()).bfloat16()
+    return (attn.float().reshape(T, -1) @ w["wo"].float().t()), lat, k_rot
+
+
+def _attention_weights(rope, gen):
+    nope = 64 if rope else 128
+    scale = lambda *shape, s: (torch.randn(*shape, generator=gen) * s).bfloat16()  # noqa: E731
+    return dict(wq=scale(64 * 128, 6144, s=6144 ** -0.5), wkv_a=scale(512 + (64 if rope else 0), 6144, s=6144 ** -0.5),
+                kv_a_norm=(1 + torch.randn(512, generator=gen) * 0.1).bfloat16(),
+                wkv_b=scale(64 * (nope + 128), 512, s=512 ** -0.5), wo=scale(6144, 64 * 128, s=8192 ** -0.5),
+                s=(torch.rand(64, generator=gen) * 0.2).bfloat16(), b=(0.9 + torch.rand(64, generator=gen) * 0.2).bfloat16())
+
+
+@pytest.mark.parametrize("rope", [True, False])
+def test_attention_layer_chain_matches_official(rope):
+    """wq -> query_scale -> absorb; wkv_a -> rank_pack (no q-LoRA) -> FP8 records;
+    sparse MLA over every causal key (scale 128^-0.5) -> values -> wo: vs the
+    official layer's eager attention. RoPE layers run the GLM 5.3 656-byte
+    contract, NoPE layers GLM 5.3 Flash's 528-byte one."""
+    device = require_b12x()
+    from b12x.integration.cuteafd.mistral_large4 import (ML4, compile_kv_b_aot, compile_query_scale_aot,
+                                                         compile_rank_pack_aot,
+                                                         compile_sparse_mla_aot, nope_attention, rope_attention)
+
+    T, H = 256, 64
+    nope = 64 if rope else 128
+    gen = torch.Generator().manual_seed(21)
+    w = _attention_weights(rope, gen)
+    x = torch.randn(T, 6144, generator=gen).bfloat16()
+    positions = torch.arange(T, dtype=torch.int64)
+    expected, _, _ = _official_attention(x, positions, w, rope)
+
+    d = lambda t: t.to(device)  # noqa: E731
+    g = rope_attention() if rope else nope_attention()
+    latent = 576 if rope else 512
+    q = d((x.float() @ w["wq"].float().t()).bfloat16().view(T, H, 128).contiguous())
+    query = torch.zeros(T, H, latent, dtype=torch.bfloat16, device=device)
+    table = d(_cos_sin_table(positions))
+    compile_query_scale_aot(ML4, rope=rope, max_rows=T).launch(q, d(positions), table, d(w["s"]), d(w["b"]),
+                                                               query if rope else torch.empty(1, dtype=torch.bfloat16, device=device),
+                                                               scalars=(T,))
+    kv_b = w["wkv_b"].view(H, nope + 128, 512)
+    w_uk = d(kv_b[:, :nope, :].transpose(1, 2).contiguous())
+    w_uv = d(kv_b[:, nope:, :].contiguous())
+    # Absorb reads q_nope [rows, H, nope] with the head stride of the 128-wide q.
+    compile_kv_b_aot(ML4, stage="absorb", rope=rope, max_rows=T).launch(q, w_uk, query, scalars=(T,))
+    kv = (x.float() @ w["wkv_a"].float().t()).bfloat16()
+    pages = T // 64 + 1
+    cache = torch.zeros(pages * 64 * g.record_bytes, dtype=torch.uint8, device=device)
+    slots = d(torch.arange(T, dtype=torch.int64))
+    compile_rank_pack_aot(ML4, rope=rope, max_rows=T).launch(d(kv), d(w["kv_a_norm"]), d(positions), slots, table,
+                                                             cache, scalars=(T,))
+    mla = compile_sparse_mla_aot(ML4, rope=rope, route="prefill", max_rows=T)
+    topk = g.index_topk if rope else g.sparse_topk
+    indices = torch.full((T, topk), -1, dtype=torch.int32)
+    for row in range(T):
+        indices[row, :row + 1] = torch.arange(row + 1)
+    lengths = torch.arange(1, T + 1, dtype=torch.int32)
+    out = torch.empty(T, H, 512, dtype=torch.bfloat16, device=device)
+    mla.launch(query, cache, d(indices), d(lengths), out,
+               torch.empty(mla.scratch_bytes(T)["scratch"], dtype=torch.uint8, device=device), scalars=(T,))
+    values = torch.empty(T, H, 128, dtype=torch.bfloat16, device=device)
+    compile_kv_b_aot(ML4, stage="values", rope=rope, max_rows=T).launch(out, w_uv, values, scalars=(T,))
+    torch.cuda.synchronize()
+    actual = values.float().reshape(T, -1).cpu() @ w["wo"].float().t()
+    cosine = torch.nn.functional.cosine_similarity(actual, expected, dim=-1)
+    print(f"ML4 attention chain rope={rope}: cosine min {float(cosine.min()):.6f} mean {float(cosine.mean()):.6f}")
+    assert cosine.min() > 0.995, float(cosine.min())
