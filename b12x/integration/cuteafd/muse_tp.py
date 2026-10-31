@@ -5,7 +5,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -25,16 +25,22 @@ def _ue8m0_scale(code, *, loc=None, ip=None):
 
 
 class TpCombine:
+    """Reduce rank-local regions whose device bases are each 16-byte aligned.
+
+    The caller owns the fixed-address int64 table and updates it on the launch
+    stream before replay. Region bases may belong to separate/P2P allocations.
+    """
+
     def __init__(self, width, topk, format):
         self.width, self.topk, self.format = width, topk, format
         self.stride = partial_row_bytes(width, format)
 
     @cute.jit
-    def __call__(self, data: cute.Pointer, row_map: cute.Pointer, weights: cute.Pointer,
+    def __call__(self, rank_regions: cute.Pointer, row_map: cute.Pointer, weights: cute.Pointer,
                  norm: cute.Pointer, out: cute.Pointer, ranks: Int32, region_rows: Int32,
                  rows: Int32, stream: cuda.CUstream):
         if region_rows > Int32(0):
-            self.kernel(data, row_map, weights, norm, out, ranks, region_rows, rows).launch(
+            self.kernel(rank_regions, row_map, weights, norm, out, ranks, region_rows, rows).launch(
                 grid=(region_rows, 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.jit
@@ -54,9 +60,10 @@ class TpCombine:
         return value
 
     @cute.kernel
-    def kernel(self, data: cute.Pointer, row_map: cute.Pointer, weights: cute.Pointer,
+    def kernel(self, rank_regions: cute.Pointer, row_map: cute.Pointer, weights: cute.Pointer,
                norm: cute.Pointer, out: cute.Pointer, ranks: Int32, region_rows: Int32, rows: Int32):
-        data, row_map, weights, norm, out = (_view(p) for p in (data, row_map, weights, norm, out))
+        rank_regions, row_map, weights, norm, out = (
+            _view(p) for p in (rank_regions, row_map, weights, norm, out))
         region = Int64(cute.arch.block_idx()[0])
         row = Int64(row_map[region])
         tid = Int32(cute.arch.thread_idx()[0])
@@ -74,7 +81,11 @@ class TpCombine:
                         summed = Float32(0.0)
                         for rank in cutlass.range(ranks, unroll=1):
                             stride = self.width if self.format == "bf16" else self.stride
-                            base = ((Int64(rank) * Int64(region_rows) + region) * Int64(self.topk) + Int64(route)) * Int64(stride)
+                            data = _view(cute.make_ptr(
+                                BFloat16 if self.format == "bf16" else Uint8,
+                                Int64(rank_regions[Int64(rank)]), cute.AddressSpace.gmem,
+                                assumed_align=16))
+                            base = (region * Int64(self.topk) + Int64(route)) * Int64(stride)
                             summed = _add(summed, self.partial(data, base, col))
                         value = _bf16(_mul(_bf16(summed), _bf16(_add(Float32(1.0), Float32(norm[col])))))
                         values[slab * 4 + j] = value
@@ -99,12 +110,11 @@ class TpCombine:
 
 
 def compile_tp_combine_aot(*, format, width=4096, topk=8):
-    stride = partial_row_bytes(width, format)
+    partial_row_bytes(width, format)
     if width % 1024 or topk <= 0:
         raise ValueError("Muse TP combine requires H1024 width and positive topk")
     return compile_program(TpCombine(width, topk, format), name=f"muse_tp_combine_{format}",
-        operands=(Operand("data", torch.bfloat16 if format == "bf16" else torch.uint8,
-                          f"[ranks,region_rows,{topk},{width if format == 'bf16' else stride}]"),
+        operands=(Operand("rank_regions", torch.int64, "[ranks]", align=8),
                   Operand("row_map", torch.uint32, "[region_rows]", align=4),
                   Operand("weights", torch.float32, f"[rows,{topk}]"),
                   Operand("norm", torch.bfloat16, f"[{width}]"),
