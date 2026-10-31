@@ -56,7 +56,7 @@ class QueryScale:
 
     @cute.jit
     def __call__(self, q: cute.Pointer, positions: cute.Pointer, cos_sin: cute.Pointer,
-                 s: cute.Pointer, b: cute.Pointer, out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+                 s: cute.Pointer, b: cute.Pointer, query: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         m = Int64(rows)
         h, d = self.heads, self.head
         out_layout = cute.make_layout((m, h, max(self.out_row, 1)), stride=(h * max(self.out_row, 1), max(self.out_row, 1), 1))
@@ -66,7 +66,7 @@ class QueryScale:
             cos_sin,
             cute.make_tensor(s, cute.make_layout((h,))),
             cute.make_tensor(b, cute.make_layout((h,))),
-            cute.make_tensor(out, out_layout),
+            cute.make_tensor(query, out_layout),
         ).launch(grid=(rows, 1, 1), block=(self.warps * self.lanes, 1, 1), stream=stream)
 
     @cute.kernel
