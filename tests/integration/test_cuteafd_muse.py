@@ -137,8 +137,7 @@ def test_qk_norm_rope(rows, kind, heads):
                       dtype=torch.int16).view(torch.bfloat16)
     positions = torch.arange(rows, dtype=torch.int64)
     freq = positions.float()[:, None] / (500000 ** (torch.arange(0, 64, 2).float() / 64))
-    angle = torch.cat((freq, freq), -1)
-    cos, sin = angle.cos().bfloat16(), angle.sin().bfloat16()
+    cos, sin = freq.cos().bfloat16(), freq.sin().bfloat16()
 
     def norm(t):
         return _canonical_norm(t).bfloat16()
@@ -147,7 +146,7 @@ def test_qk_norm_rope(rows, kind, heads):
     if kind == "swa":
         def rope(t):
             half = torch.cat((-t[..., 32:], t[..., :32]), -1)
-            return t * cos[:, None] + half * sin[:, None]
+            return t * torch.cat((cos, cos), -1)[:, None] + half * torch.cat((sin, sin), -1)[:, None]
         expected_q, expected_k = rope(expected_q), rope(expected_k)
     operands = [t.cuda() for t in (q, k, v, positions, cos, sin)]
     # Discontiguous page-like records, including an untouched hole after each row.

@@ -288,10 +288,10 @@ class HeadNorm:
         if cutlass.const_expr(self.scale != 1.0):
             a, b = _bf16(_mul(a, Float32(self.scale))), _bf16(_mul(b, Float32(self.scale)))
         if cutlass.const_expr(self.rotary):
-            at = Int64(positions[row]) * Int64(64) + lane
+            at = Int64(positions[row]) * Int64(32) + lane
             ra = _bf16(_add(_bf16(_mul(a, Float32(cos[at]))), _bf16(_mul(-b, Float32(sin[at])))))
-            rb = _bf16(_add(_bf16(_mul(b, Float32(cos[at + Int64(32)]))),
-                            _bf16(_mul(a, Float32(sin[at + Int64(32)])))))
+            rb = _bf16(_add(_bf16(_mul(b, Float32(cos[at]))),
+                            _bf16(_mul(a, Float32(sin[at])))))
             a, b = ra, rb
         if cutlass.const_expr(self.gate):
             a = _bf16(_mul(a, _bf16(_sigmoid(Float32(gate[base + lane])))))
@@ -324,10 +324,10 @@ class KvRecordNorm:
             inv = div_rn_f32(Float32(1.0), _sqrt_rn(_add(_mul(squares, Float32(1.0 / 64)), Float32(1e-5))))
             a, b = _bf16(_mul(a, inv)), _bf16(_mul(b, inv))
             if cutlass.const_expr(self.rotary):
-                at = Int64(positions[row]) * Int64(64) + lane
+                at = Int64(positions[row]) * Int64(32) + lane
                 ra = _bf16(_add(_bf16(_mul(a, Float32(cos[at]))), _bf16(_mul(-b, Float32(sin[at])))))
-                rb = _bf16(_add(_bf16(_mul(b, Float32(cos[at + Int64(32)]))),
-                                _bf16(_mul(a, Float32(sin[at + Int64(32)])))))
+                rb = _bf16(_add(_bf16(_mul(b, Float32(cos[at]))),
+                                _bf16(_mul(a, Float32(sin[at])))))
                 a, b = ra, rb
             at = slot * Int64(self.heads * 128) + head * Int64(64) + lane
             dst[at], dst[at + Int64(32)] = BFloat16(a), BFloat16(b)
@@ -367,7 +367,7 @@ def compile_qk_norm_rope_aot(*, heads=128, kind="swa"):
             Operand("k_raw", torch.bfloat16, f"[rows,{kv_heads},64]"),
             Operand("v", torch.bfloat16, f"[rows,{kv_heads},64]"),
             Operand("positions", torch.int64, "[rows]", align=8),
-            Operand("cos", torch.bfloat16, "[P,64]"), Operand("sin", torch.bfloat16, "[P,64]"),
+            Operand("cos", torch.bfloat16, "[P,32]"), Operand("sin", torch.bfloat16, "[P,32]"),
             Operand("kv_slots", torch.int64, "[rows]", align=8),
             Operand("q", torch.bfloat16, f"[rows,{heads},64]", "out"),
             Operand("kv_dst", torch.bfloat16, f"[records,{kv_heads * 128}]", "inout")),
