@@ -59,10 +59,11 @@ def _decode(data, format, width):
         values = torch.where((code & 8) != 0, -values, values)
         return (values.reshape(*values.shape[:-1], width // 16, 16) *
                 scales.view(torch.float8_e4m3fn).float()[..., None]).reshape_as(values)
-    values = data[..., :width].view(torch.float8_e4m3fn).float()
-    codes = data[..., width:].int()
-    scales = torch.where(codes == 0, 0x00400000, codes << 23).view(torch.float32)
-    return (values.reshape(*values.shape[:-1], width // 32, 32) * scales[..., None]).reshape_as(values)
+    values = data[..., :width].view(torch.float8_e4m3fn).double()
+    scales = torch.exp2(data[..., width:].double() - 127)
+    # ARM host Torch may flush an F32 subnormal scale before multiplying it;
+    # widen the exact dyadic multiply, then round once to the F32 contract.
+    return (values.reshape(*values.shape[:-1], width // 32, 32) * scales[..., None]).reshape_as(values).float()
 
 
 def _combine(partials, weights, norm):
@@ -205,7 +206,10 @@ def test_combine_scale_edges(format):
     program = compile_tp_combine_aot(format=format)
     program.launch(encoded.cuda(), torch.zeros(1, dtype=torch.int32, device="cuda").view(torch.uint32),
                    weights.cuda(), norm.cuda(), out, scalars=[1, 1, 1])
-    assert torch.equal(out.cpu(), expected)
+    assert torch.equal(out.cpu(), expected), dict(
+        encoded=encoded.flatten()[:4], scales=encoded[..., width:].flatten()[:4],
+        decoded=_decode(encoded, format, width).flatten()[:4],
+        expected=expected.flatten()[:4], actual=out.cpu().flatten()[:4])
 
 
 @pytest.mark.parametrize("ranks", (1, 3, 6, 8))
