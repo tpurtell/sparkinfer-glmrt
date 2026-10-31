@@ -299,17 +299,56 @@ class HeadNorm:
         out[base + lane], out[base + lane + Int64(32)] = BFloat16(a), BFloat16(b)
 
 
+class KvRecordNorm:
+    def __init__(self, heads, rotary):
+        self.heads, self.rotary = heads, rotary
+
+    @cute.kernel
+    def kernel(self, k_raw: cute.Pointer, v: cute.Pointer, positions: cute.Pointer,
+               cos: cute.Pointer, sin: cute.Pointer, slots: cute.Pointer, dst: cute.Pointer):
+        k_raw, v, positions, cos, sin, slots, dst = (
+            _view(p) for p in (k_raw, v, positions, cos, sin, slots, dst))
+        row, head = Int64(cute.arch.block_idx()[0]), Int64(cute.arch.block_idx()[1])
+        lane = Int64(cute.arch.thread_idx()[0])
+        slot = Int64(slots[row])
+        if slot >= Int64(0):
+            base = (row * Int64(self.heads) + head) * Int64(64)
+            a, b = Float32(k_raw[base + lane]), Float32(k_raw[base + lane + Int64(32)])
+            # Match HeadNorm's arithmetic and BF16 boundaries before scattering.
+            squares = Float32(0.0)
+            if lane < Int64(16):
+                for j in cutlass.range_constexpr(4):
+                    value = Float32(k_raw[base + lane * Int64(4) + Int64(j)])
+                    squares = _add(squares, _mul(value, value))
+            squares = _warp_sum(squares)
+            inv = div_rn_f32(Float32(1.0), _sqrt_rn(_add(_mul(squares, Float32(1.0 / 64)), Float32(1e-5))))
+            a, b = _bf16(_mul(a, inv)), _bf16(_mul(b, inv))
+            if cutlass.const_expr(self.rotary):
+                at = Int64(positions[row]) * Int64(64) + lane
+                ra = _bf16(_add(_bf16(_mul(a, Float32(cos[at]))), _bf16(_mul(-b, Float32(sin[at])))))
+                rb = _bf16(_add(_bf16(_mul(b, Float32(cos[at + Int64(32)]))),
+                                _bf16(_mul(a, Float32(sin[at + Int64(32)])))))
+                a, b = ra, rb
+            at = slot * Int64(self.heads * 128) + head * Int64(64) + lane
+            dst[at], dst[at + Int64(32)] = BFloat16(a), BFloat16(b)
+            dst[at + Int64(self.heads * 64)] = v[base + lane]
+            dst[at + Int64(self.heads * 64 + 32)] = v[base + lane + Int64(32)]
+
+
 class QkNormRope:
     def __init__(self, heads, kv_heads, rotary):
         self.q = HeadNorm(heads, scale=5.4730064863875, rotary=rotary)
-        self.k = HeadNorm(kv_heads, rotary=rotary)
+        self.kv = KvRecordNorm(kv_heads, rotary)
 
     @cute.jit
-    def __call__(self, q_raw: cute.Pointer, k_raw: cute.Pointer, positions: cute.Pointer,
-                 cos: cute.Pointer, sin: cute.Pointer, q: cute.Pointer, k: cute.Pointer,
+    def __call__(self, q_raw: cute.Pointer, k_raw: cute.Pointer, v: cute.Pointer,
+                 positions: cute.Pointer, cos: cute.Pointer, sin: cute.Pointer,
+                 kv_slots: cute.Pointer, q: cute.Pointer, kv_dst: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.q(q_raw, positions, cos, sin, q_raw, q, rows, stream)
-        self.k(k_raw, positions, cos, sin, k_raw, k, rows, stream)
+        if rows > Int32(0):
+            self.q(q_raw, positions, cos, sin, q_raw, q, rows, stream)
+            self.kv.kernel(k_raw, v, positions, cos, sin, kv_slots, kv_dst).launch(
+                grid=(rows, self.kv.heads, 1), block=(32, 1, 1), stream=stream)
 
 
 def _heads(heads):
@@ -326,10 +365,12 @@ def compile_qk_norm_rope_aot(*, heads=128, kind="swa"):
         name="muse_qk_norm_rope_swa" if kind == "swa" else "muse_qk_norm_nope_full", operands=(
             Operand("q_raw", torch.bfloat16, f"[rows,{heads},64]"),
             Operand("k_raw", torch.bfloat16, f"[rows,{kv_heads},64]"),
+            Operand("v", torch.bfloat16, f"[rows,{kv_heads},64]"),
             Operand("positions", torch.int64, "[rows]", align=8),
             Operand("cos", torch.bfloat16, "[P,64]"), Operand("sin", torch.bfloat16, "[P,64]"),
+            Operand("kv_slots", torch.int64, "[rows]", align=8),
             Operand("q", torch.bfloat16, f"[rows,{heads},64]", "out"),
-            Operand("k", torch.bfloat16, f"[rows,{kv_heads},64]", "out")),
+            Operand("kv_dst", torch.bfloat16, f"[records,{kv_heads * 128}]", "inout")),
         scalars=(Scalar("rows"),), key=(heads, kind), geometry=dict(heads=heads, kv_heads=kv_heads, kind=kind))
 
 

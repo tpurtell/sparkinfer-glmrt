@@ -124,12 +124,17 @@ def test_route_select(rows):
 
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("kind", ("swa", "full"))
-def test_qk_norm_rope(rows, kind):
+@pytest.mark.parametrize("heads", (64, 128))
+def test_qk_norm_rope(rows, kind, heads):
     require_b12x()
     from b12x.integration.cuteafd.muse import compile_qk_norm_rope_aot
     gen = torch.Generator().manual_seed(33)
-    q = torch.randn(rows, 128, 64, generator=gen).bfloat16()
-    k = torch.randn(rows, 16, 64, generator=gen).bfloat16()
+    kv_heads = heads // 8
+    q = torch.randn(rows, heads, 64, generator=gen).bfloat16()
+    k = torch.randn(rows, kv_heads, 64, generator=gen).bfloat16()
+    # Include signed zeros, NaNs and subnormals: V is a bitwise copy, not math.
+    v = torch.randint(-32768, 32768, (rows, kv_heads, 64), generator=gen,
+                      dtype=torch.int16).view(torch.bfloat16)
     positions = torch.arange(rows, dtype=torch.int64)
     freq = positions.float()[:, None] / (500000 ** (torch.arange(0, 64, 2).float() / 64))
     angle = torch.cat((freq, freq), -1)
@@ -144,16 +149,46 @@ def test_qk_norm_rope(rows, kind):
             half = torch.cat((-t[..., 32:], t[..., :32]), -1)
             return t * cos[:, None] + half * sin[:, None]
         expected_q, expected_k = rope(expected_q), rope(expected_k)
-    operands = [t.cuda() for t in (q, k, positions, cos, sin)]
-    qo, ko = torch.empty_like(operands[0]), torch.empty_like(operands[1])
-    program = compile_qk_norm_rope_aot(kind=kind)
-    program.launch(*operands, qo, ko, scalars=[rows])
-    # Reduction differences are examined separately; all explicit BF16 steps are checked here.
-    for actual, expected in ((qo.cpu(), expected_q), (ko.cpu(), expected_k)):
-        assert torch.equal(actual, expected), ((actual != expected).sum(), (actual.float() - expected.float()).abs().max())
-    one_q, one_k = torch.empty_like(qo[:1]), torch.empty_like(ko[:1])
-    program.launch(operands[0][:1], operands[1][:1], *operands[2:], one_q, one_k, scalars=[1])
-    assert torch.equal(one_q, qo[:1]) and torch.equal(one_k, ko[:1])
+    operands = [t.cuda() for t in (q, k, v, positions, cos, sin)]
+    # Discontiguous page-like records, including an untouched hole after each row.
+    slots = (torch.randperm(rows, generator=gen).long() * 2 + 1).cuda()
+    qo = torch.empty_like(operands[0])
+    records = torch.full((rows * 2 + 2, kv_heads * 128), -17., dtype=torch.bfloat16, device="cuda")
+    expected_records = records.cpu()
+    expected_records[slots.cpu()] = torch.cat((expected_k.flatten(1), v.flatten(1)), -1)
+    program = compile_qk_norm_rope_aot(heads=heads, kind=kind)
+    program.launch(*operands, slots, qo, records, scalars=[rows])
+    assert torch.equal(qo.cpu(), expected_q)
+    assert torch.equal(records.cpu().view(torch.int16), expected_records.view(torch.int16))
+    # Fresh singleton prefills must produce identical complete record bytes.
+    one_q = torch.empty_like(qo[:1])
+    one_record = torch.empty_like(records[:1])
+    zero = torch.zeros(1, dtype=torch.int64, device="cuda")
+    for row in sorted({0, rows // 2, rows - 1}):
+        single = [t[row:row + 1] for t in operands[:4]] + operands[4:]
+        program.launch(*single, zero, one_q, one_record, scalars=[1])
+        assert torch.equal(one_q, qo[row:row + 1])
+        assert torch.equal(one_record.view(torch.int16), records[slots[row:row + 1]].view(torch.int16))
+    # Negative slots must leave every destination byte untouched, but still write Q.
+    before = records.clone()
+    skipped = torch.full_like(slots, -1)
+    program.launch(*operands, skipped, qo, records, scalars=[rows])
+    assert torch.equal(qo.cpu(), expected_q)
+    assert torch.equal(records.view(torch.int16), before.view(torch.int16))
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    with kernel_resolution_guard("KV producers are precompiled for all live row counts"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            program.launch(*operands, slots, qo, records, scalars=[rows])
+        records.fill_(-17.)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(records.cpu().view(torch.int16), expected_records.view(torch.int16))
+        # Zero rows must not launch an invalid zero grid or touch either output.
+        saved_q = qo.clone()
+        program.launch(*operands, slots, qo, records, scalars=[0])
+        assert torch.equal(qo, saved_q)
+        assert torch.equal(records.cpu().view(torch.int16), expected_records.view(torch.int16))
 
 
 @pytest.mark.parametrize("rows", ROWS)
