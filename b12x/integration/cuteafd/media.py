@@ -239,6 +239,18 @@ def compile_gelu_aot(*, width):
         scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width))
 
 
+def compile_bf16_residual_add_aot(*, width):
+    """Reuse the vectorized BF16 add, preserving its single BF16 store."""
+    from ._qwen4_kernels import Qwen4Add
+    if width <= 0 or width % 256 or width > 8192:
+        raise ValueError("BF16 residual width must be a multiple of 256 in 256..8192")
+    return compile_program(Qwen4Add(width), name="media_residual_add_bf16", operands=(
+        Operand("a", torch.bfloat16, f"[rows,{width}]"),
+        Operand("b", torch.bfloat16, f"[rows,{width}]"),
+        Operand("out", torch.bfloat16, f"[rows,{width}]", "out")),
+        scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width))
+
+
 def vision_programs(*, dim, hidden, bf16_products=False,
                     learned_position=False, bf16_before_gamma=False):
     """Geometry-only declarations; callers derive these values from tower config."""
@@ -258,14 +270,14 @@ def vision_programs(*, dim, hidden, bf16_products=False,
 
 def audio_programs(*, widths=(256, 512, 1024, 2048), output_width=8192):
     """Causal PCM support using config stage widths, never request extents."""
-    from .pointwise import compile_affine_norm_aot, compile_residual_add_aot
+    from .pointwise import compile_affine_norm_aot
     result = {}
     for width in widths:
         result[f"causal_conv7_h{width}"] = lambda w=width: compile_causal_depthwise_conv7_aot(width=w)
         result[f"rms_h{width}"] = lambda w=width: compile_affine_norm_aot(width=w, eps=1e-6,
             input_dtype=torch.bfloat16, parameter_dtype=torch.bfloat16)
         result[f"gelu_h{width * 4}"] = lambda w=width: compile_gelu_aot(width=w * 4)
-        result[f"residual_h{width}"] = lambda w=width: compile_residual_add_aot(width=w)
+        result[f"residual_h{width}"] = lambda w=width: compile_bf16_residual_add_aot(width=w)
     result[f"rms_h{output_width}"] = lambda: compile_affine_norm_aot(width=output_width, eps=1e-6,
         input_dtype=torch.bfloat16, parameter_dtype=torch.bfloat16)
     return result
