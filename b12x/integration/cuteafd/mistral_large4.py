@@ -79,8 +79,9 @@ from ._glm_kernels import (BatchedBf16Gemm, GlmIndexPost, GlmRankNormPackKV, _bl
 from ._query_scale import QueryScale
 
 __all__ = ["ML4", "Ml4Geometry", "LayerNormBias", "compile_index_post_aot", "compile_layer_norm_aot",
-           "compile_index_q_fp8_aot", "compile_kv_b_aot", "compile_query_scale_aot", "compile_rank_pack_aot",
-           "compile_sparse_mla_aot", "nope_attention", "rope_attention"]
+           "compile_draft_sparse_mla_aot", "compile_index_q_fp8_aot", "compile_kv_b_aot", "compile_query_scale_aot",
+           "compile_rank_pack_aot", "compile_sparse_mla_aot", "draft_attention", "nope_attention", "rope_attention",
+           "DRAFT_WINDOW", "DRAFT_DEPTH"]
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,33 @@ def compile_sparse_mla_aot(g: Ml4Geometry = ML4, *, rope: bool, route: str, max_
     assert abs(attention.softmax_scale - g.softmax_scale) < 1e-15
     return compile_glm_sparse_mla_aot(attention, route=route, max_rows=max_rows,
                                       name="ml4_sparse_mla" + ("" if rope else "_nope"), **kwargs)
+
+
+# The bundled mtp_dspark drafter (params.json mtp): block depth 3, every draft
+# layer attends its 2048 most recent context records plus the whole block.
+DRAFT_WINDOW = 2048
+DRAFT_DEPTH = 3
+
+
+def draft_attention(g: Ml4Geometry = ML4):
+    """The draft layers' sparse MLA geometry: the RoPE layer's 656-byte record and
+    ``softmax_scale = 128**-0.5`` (dense MLA with the target's attention geometry),
+    with ``window + depth`` selected slots per row padded to 64 (2112): the
+    context window and the non-causal block, as explicit record slots."""
+    import dataclasses
+    slots = -(-(DRAFT_WINDOW + DRAFT_DEPTH) // 64) * 64
+    return dataclasses.replace(rope_attention(g), name="ml4_draft", index_topk=slots)
+
+
+def compile_draft_sparse_mla_aot(g: Ml4Geometry = ML4, *, route: str, max_rows: int, **kwargs):
+    """Sparse MLA of the mtp_dspark draft layers (``ml4_draft_sparse_mla``): the GLM
+    5.x kernel over the draft geometry's 2112 slots per row (``-1`` past a row's
+    length is masked)."""
+    from .glm_sparse_mla import compile_glm_sparse_mla_aot
+    attention = draft_attention(g)
+    assert abs(attention.softmax_scale - g.softmax_scale) < 1e-15
+    return compile_glm_sparse_mla_aot(attention, route=route, max_rows=max_rows, name="ml4_draft_sparse_mla",
+                                      **kwargs)
 
 
 def compile_query_scale_aot(g: Ml4Geometry = ML4, *, rope: bool, max_rows: int,

@@ -380,11 +380,13 @@ def _ml4_programs():
                                                 head_dim=g.index_head_dim),
             lambda: ml4.compile_layer_norm_aot(width=g.hidden, max_rows=64, eps=g.index_norm_eps),
             lambda: ml4.compile_index_q_fp8_aot(g, mode="decode", max_rows=64),
-            lambda: ml4.compile_index_q_fp8_aot(g, mode="prefill", max_rows=256)]
+            lambda: ml4.compile_index_q_fp8_aot(g, mode="prefill", max_rows=256),
+            lambda: ml4.compile_draft_sparse_mla_aot(g, route="prefill", max_rows=64),
+            lambda: ml4.compile_draft_sparse_mla_aot(g, route="decode", max_rows=64)]
     return out
 
 
-@pytest.mark.parametrize("index", range(13))
+@pytest.mark.parametrize("index", range(15))
 def test_every_ml4_program_exports_with_its_declared_abi(index, tmp_path):
     """The exporter's header check (pointer names = the declared operands) on
     every ml4 program: launches here pass pointers positionally, so only the
@@ -393,10 +395,122 @@ def test_every_ml4_program_exports_with_its_declared_abi(index, tmp_path):
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
 
     thunks = _ml4_programs()
-    assert len(thunks) == 13
+    assert len(thunks) == 15
     with exportable_compilation():
         program = thunks[index]()
     label = f"ml4_export_check_{index}"
     program.export_to_c(str(tmp_path), label, "cuteafd_" + label)
     checked = validate_exported_header(program, tmp_path / f"{label}.h", "cuteafd_" + label)
     assert checked["argument_count"] == len(program.operands) + len(program.scalars) + 1
+
+
+def test_query_scale_with_unit_scale_is_exact_rope():
+    """The draft layers have no SSMax: s = 0, b = 1 makes the query scale the
+    identity, so ml4_query_scale_rope is the reference's plain interleaved RoPE."""
+    device = require_b12x()
+    from b12x.integration.cuteafd.mistral_large4 import ML4, compile_query_scale_aot
+
+    rows = 40
+    q = torch.randn(rows, 64, 128).bfloat16()
+    positions = _positions(rows, "cpu")
+    q_dev = q.to(device)
+    query = torch.zeros(rows, 64, 576, dtype=torch.bfloat16, device=device)
+    compile_query_scale_aot(ML4, rope=True, max_rows=64).launch(
+        q_dev, positions.to(device), _cos_sin_table(positions).to(device),
+        torch.zeros(64, dtype=torch.bfloat16, device=device), torch.ones(64, dtype=torch.bfloat16, device=device),
+        query, scalars=(rows,))
+    torch.cuda.synchronize()
+    angles = positions.float()[:, None] * _inv_freq()[None, :]
+    cos, sin = angles.cos().bfloat16()[:, None, :], angles.sin().bfloat16()[:, None, :]
+    even, odd = q[..., 64::2], q[..., 65::2]
+    expected = torch.cat([q[..., :64], even * cos - odd * sin, odd * cos + even * sin], -1)
+    assert torch.equal(q_dev.cpu(), expected)
+
+
+@pytest.mark.parametrize("route", ["prefill", "decode"])
+def test_draft_sparse_mla_attends_the_window_and_the_whole_block(route):
+    """mtp_dspark draft attention through the ml4 programs: context latents (no
+    input norm) and the block's own latents as FP8 records, each block row
+    selecting the 2048 most recent context records plus all three block records
+    (non-causal), 2112 slots with a masked tail; vs BF16 eager attention."""
+    device = require_b12x()
+    from b12x.integration.cuteafd.mistral_large4 import (DRAFT_DEPTH, DRAFT_WINDOW, ML4, compile_draft_sparse_mla_aot,
+                                                         compile_kv_b_aot, compile_rank_pack_aot, draft_attention)
+
+    H, seqs, depth = 64, 4, DRAFT_DEPTH
+    gen = torch.Generator().manual_seed(33)
+    w = _attention_weights(True, gen)
+    contexts = [2100, 700, 2048, 1]  # longer than, below, at the window; minimal
+    g = draft_attention()
+    assert g.index_topk == 2112
+    d = lambda t: t.to(device)  # noqa: E731
+    pages = sum(-(-(c + depth) // 64) for c in contexts) + 1
+    cache = torch.zeros(pages * 64 * g.record_bytes, dtype=torch.uint8, device=device)
+    rank_pack = compile_rank_pack_aot(ML4, rope=True, max_rows=4096)
+    rows = seqs * depth
+    q = torch.empty(rows, H, 128, dtype=torch.bfloat16)
+    indices = torch.full((rows, g.index_topk), -1, dtype=torch.int32)
+    lengths = torch.empty(rows, dtype=torch.int32)
+    keys, positions_all, page = [], [], 0
+    for s, c in enumerate(contexts):
+        n = c + depth
+        x = torch.randn(n, 6144, generator=gen).bfloat16()
+        positions = torch.arange(n, dtype=torch.int64)
+        kv = (x.float() @ w["wkv_a"].float().t()).bfloat16()
+        slots = page * 64 + torch.arange(n, dtype=torch.int64)
+        rank_pack.launch(d(kv), d(w["kv_a_norm"]), d(positions), d(slots), d(_cos_sin_table(positions)), cache,
+                         scalars=(n,))
+        page += -(-n // 64)
+        window = list(range(max(c - DRAFT_WINDOW, 0), c)) + list(range(c, n))
+        for k in range(depth):
+            r = s * depth + k
+            indices[r, :len(window)] = slots[window].int()
+            lengths[r] = len(window)
+            q[r] = (x[c + k].float() @ w["wq"].float().t()).bfloat16().view(H, 128)
+        keys.append((kv[window], positions[window], positions[c:n]))
+    # Query: plain RoPE (unit scale), then absorb into the 576-wide query.
+    query = torch.zeros(rows, H, 576, dtype=torch.bfloat16, device=device)
+    block_positions = torch.cat([k[2] for k in keys])
+    from b12x.integration.cuteafd.mistral_large4 import compile_query_scale_aot
+    q_dev = d(q)
+    compile_query_scale_aot(ML4, rope=True, max_rows=64).launch(
+        q_dev, d(block_positions), d(_cos_sin_table(torch.arange(int(block_positions.max()) + 1))),
+        torch.zeros(64, dtype=torch.bfloat16, device=device), torch.ones(64, dtype=torch.bfloat16, device=device),
+        query, scalars=(rows,))
+    kv_b = w["wkv_b"].view(H, 64 + 128, 512)
+    compile_kv_b_aot(ML4, stage="absorb", rope=True, max_rows=64).launch(
+        q_dev, d(kv_b[:, :64, :].transpose(1, 2).contiguous()), query, scalars=(rows,))
+    mla = compile_draft_sparse_mla_aot(ML4, route=route, max_rows=64)
+    out = torch.empty(rows, H, 512, dtype=torch.bfloat16, device=device)
+    scalars = (rows, 64) if route == "decode" else (rows,)
+    mla.launch(query, cache, d(indices), d(lengths), out,
+               torch.zeros(mla.scratch_bytes(64)["scratch"], dtype=torch.uint8, device=device), scalars=scalars)
+    values = torch.empty(rows, H, 128, dtype=torch.bfloat16, device=device)
+    compile_kv_b_aot(ML4, stage="values", rope=True, max_rows=64).launch(
+        out, d(kv_b[:, 64:, :].contiguous()), values, scalars=(rows,))
+    torch.cuda.synchronize()
+    actual = values.float().reshape(rows, -1).cpu() @ w["wo"].float().t()
+    # Reference: BF16 latent, non-causal over the selected keys (dspark.py's draft attention).
+    expected = []
+    for s, (kv, key_pos, block_pos) in enumerate(keys):
+        angles = key_pos.float()[:, None] * _inv_freq()[None, :]
+        cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+        latent = kv[:, :512].float()
+        latent = (latent * torch.rsqrt(latent.pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16() * w["kv_a_norm"]
+        rot = kv[:, 512:]
+        k_rot = torch.cat([rot[:, 0::2] * cos - rot[:, 1::2] * sin, rot[:, 1::2] * cos + rot[:, 0::2] * sin], -1)
+        kvb = (latent.float() @ w["wkv_b"].float().t()).bfloat16().view(-1, H, 192)
+        k = torch.cat([kvb[..., :64], k_rot[:, None, :].expand(-1, H, -1)], -1)
+        v = kvb[..., 64:]
+        qa = torch.cos(block_pos.float()[:, None] * _inv_freq()[None, :]).bfloat16()
+        qs = torch.sin(block_pos.float()[:, None] * _inv_freq()[None, :]).bfloat16()
+        qq = q[s * depth:(s + 1) * depth]
+        e, o = qq[..., 64::2], qq[..., 65::2]
+        qq = torch.cat([qq[..., :64], e * qa[:, None] - o * qs[:, None], o * qa[:, None] + e * qs[:, None]], -1)
+        scores = torch.einsum("rhd,khd->hrk", qq.float(), k.float()) * 128 ** -0.5
+        attn = torch.einsum("hrk,khd->rhd", scores.softmax(-1).bfloat16().float(), v.float()).bfloat16()
+        expected.append(attn.reshape(depth, -1).float() @ w["wo"].float().t())
+    expected = torch.cat(expected)
+    cosine = torch.nn.functional.cosine_similarity(actual, expected, dim=-1)
+    print(f"ML4 draft sparse MLA {route}: cosine min {float(cosine.min()):.6f}")
+    assert cosine.min() > 0.995, float(cosine.min())
