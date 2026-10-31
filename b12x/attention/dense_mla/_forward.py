@@ -62,6 +62,7 @@ class DenseMlaForwardKernel:
         window_size: int | None,
         noncausal_block: bool = False,
         ds_mla_record: bool = False,
+        block_window: bool = False,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -94,6 +95,12 @@ class DenseMlaForwardKernel:
         self.value_dim = int(value_dim)
         self.window_size = None if window_size is None else int(window_size)
         self.noncausal_block = bool(noncausal_block)
+        # Opt-in: every row of a non-causal block sees the window_size cache
+        # records before the block (the trained dSpark mask), instead of a
+        # window ending at its own position. Off keeps every existing program.
+        self.block_window = bool(block_window)
+        if self.block_window and (self.window_size is None or not self.noncausal_block):
+            raise ValueError("block_window needs a window and a non-causal block")
         self.kv_stages = int(layout.kv_stages)
         self.math_warps = self.math_warps_per_query * self.query_tile
         self.math_threads = self.math_warps * 32
@@ -517,6 +524,8 @@ class DenseMlaForwardKernel:
             visible_chunks_begin = (
                 causal_end - Int32(self.query_tile - 1) - Int32(self.window_size)
             )
+            if cutlass.const_expr(self.block_window):
+                visible_chunks_begin = cache_length - query_length - Int32(self.window_size)
             if visible_chunks_begin < Int32(0):
                 visible_chunks_begin = Int32(0)
             first_valid_chunk = visible_chunks_begin // Int32(
@@ -672,6 +681,8 @@ class DenseMlaForwardKernel:
             visible_begin = Int32(0)
             if cutlass.const_expr(self.window_size is not None):
                 visible_begin = visible_end - Int32(self.window_size)
+                if cutlass.const_expr(self.block_window):
+                    visible_begin = cache_length - query_length - Int32(self.window_size)
                 if visible_begin < Int32(0):
                     visible_begin = Int32(0)
 

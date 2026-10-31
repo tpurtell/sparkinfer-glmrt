@@ -75,12 +75,14 @@ from cutlass import BFloat16, Float32, Int32, Int64
 
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import (BatchedBf16Gemm, GlmIndexPost, GlmRankNormPackKV, _block_sum, _bf16, _reduction_storage,
+                           glm_projection,
                            _rsqrt)
 from ._query_scale import QueryScale
 
 __all__ = ["ML4", "Ml4Geometry", "LayerNormBias", "compile_index_post_aot", "compile_layer_norm_aot",
            "compile_index_q_fp8_aot", "compile_kv_b_aot", "compile_query_scale_aot", "compile_rank_pack_aot",
-           "compile_sparse_mla_aot", "nope_attention", "rope_attention"]
+           "compile_sparse_mla_aot", "nope_attention", "rope_attention", "ML4_DRAFT", "Ml4DraftGeometry",
+           "compile_draft_producer_aot", "compile_draft_attention_aot", "compile_draft_output_aot"]
 
 
 @dataclass(frozen=True)
@@ -392,3 +394,164 @@ def compile_index_q_fp8_aot(g: Ml4Geometry = ML4, *, mode: str, max_rows: int):
         launch, name="ml4_index_q", operands=operands, scalars=w8_scalars(prefill),
         key=(int(max_rows), mode, launch.key()), scratch={"scratch": launch.scratch_bytes},
         geometry=dict(outputs=n, width=k, max_rows=int(max_rows), fp8_weights="only", mode=mode), doc=__doc__)
+
+
+# --- mtp_dspark drafter on the shared MLA block-draft path ------------------------
+
+def _draft_base():
+    from .kimi_mla import MlaDraftGeometry
+    return MlaDraftGeometry
+
+
+class Ml4DraftGeometry(_draft_base()):
+    """The bundled mtp_dspark draft layers on the shared MLA block-draft path
+    (``kimi_mla``'s paged non-causal attention and UV/o output): dense MLA with
+    the target's attention geometry and no q-LoRA (q 64 x (64 nope + 64 rope),
+    latent 512, v 128), 656-byte FP8 records, and every block row seeing the
+    2048 records before its block (``block_window``, the trained mask)."""
+
+    def __init__(self, *, kv_cache: str = "fp8"):
+        # The base's dataclass __init__/__post_init__ admit only the Kimi-K3-sized
+        # draft; this geometry sets its own fields (frozen: through object.__setattr__).
+        for name, value in dict(name="ml4_draft", hidden=6144, heads=64, q_lora_rank=0, kv_lora_rank=512,
+                                qk_nope_dim=64, qk_rope_dim=64, v_head_dim=128, norm_eps=1e-5, page_rows=64,
+                                kv_cache=kv_cache, window_size=2048).items():
+            object.__setattr__(self, name, value)
+        if kv_cache not in ("bf16", "fp8"):
+            raise ValueError("ML4 draft KV cache must be bf16 or fp8")
+
+    @property
+    def softmax_scale(self):
+        return 128 ** -0.5
+
+    def __hash__(self):
+        return hash(tuple(sorted(vars(self).items())))
+
+    def __eq__(self, other):
+        return type(other) is type(self) and vars(other) == vars(self)
+
+
+ML4_DRAFT = Ml4DraftGeometry()
+
+
+@cute.jit
+def _align_bytes(n: Int64) -> Int64:
+    return (n + Int64(1023)) // Int64(1024) * Int64(1024)
+
+
+class _Ml4DraftProducer:
+    """The draft layer's query and its own records, as the ml4 target producer:
+    ``q = wq(x)``; RoPE on q's rope dims (QueryScale with s = 0, b = 1: exactly
+    the reference's plain interleaved RoPE) into the query tail; ``q_nope`` x
+    W_UK into the 512 latent dims; ``kv = wkv_a(x)`` -> RMSNorm(latent),
+    RoPE(rope) -> the 656-byte record at each row's slot (-1 skips)."""
+
+    def __init__(self, g):
+        self.g = g
+        self.q = glm_projection(g.heads * 128, g.hidden)
+        self.scale = QueryScale(heads=g.heads, head_dim=128, rope=64, out_row=576, out_offset=512)
+        self.uk = BatchedBf16Gemm(n=512, k=64, batch=g.heads, a_row=g.heads * 128, a_batch=128,
+                                  o_row=g.heads * 576, o_batch=576)
+        self.kv_a = glm_projection(576, g.hidden)
+        self.pack = _RankPack(rope=True, eps=g.norm_eps, page_rows=g.page_rows)
+
+    def key(self) -> tuple:
+        return ("ml4_draft_producer", self.g.kv_cache)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, kv_slots: cute.Pointer, positions: cute.Pointer, cos_sin: cute.Pointer,
+                 unit_s: cute.Pointer, unit_b: cute.Pointer, w_q: cute.Pointer, w_kv_a: cute.Pointer,
+                 kv_a_norm: cute.Pointer, w_uk: cute.Pointer, kv_cache: cute.Pointer, query: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        q = cute.recast_ptr(scratch, dtype=BFloat16)
+        kv = cute.make_ptr(BFloat16, Int64(scratch.toint()) + _align_bytes(Int64(rows) * Int64(self.g.heads * 128 * 2)),
+                           cute.AddressSpace.gmem, assumed_align=16)
+        self.q(x, w_q, q, rows, stream)
+        self.scale(q, positions, cos_sin, unit_s, unit_b, query, rows, stream)
+        self.uk(q, w_uk, query, rows, stream)
+        self.kv_a(x, w_kv_a, kv, rows, stream)
+        self.pack(kv, kv_a_norm, positions, kv_slots, cos_sin, kv_cache, rows, stream)
+
+
+def _draft_producer_scratch(g, rows):
+    align = lambda n: (int(n) + 1023) // 1024 * 1024  # noqa: E731
+    return align(rows * g.heads * 128 * 2) + align(rows * 576 * 2)
+
+
+def compile_draft_producer_aot(g: Ml4DraftGeometry = ML4_DRAFT, *, max_rows: int = 64):
+    """``ml4_draft_producer``: one draft layer's absorbed query and records."""
+    if int(max_rows) <= 0:
+        raise ValueError("max_rows must be positive")
+    record = "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]"
+    if g.kv_cache != "fp8":
+        raise ValueError("the ML4 draft producer packs the 656-byte FP8 record")
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("kv_slots", torch.int64, "[rows]", align=8),
+        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("cos_sin", torch.float32, "[P,64] (YaRN, no LeRoPE)", align=4),
+        Operand("unit_s", torch.bfloat16, f"[{g.heads}] zeros"),
+        Operand("unit_b", torch.bfloat16, f"[{g.heads}] ones"),
+        Operand("w_q", torch.bfloat16, f"[{g.heads * 128},{g.hidden}]"),
+        Operand("w_kv_a", torch.bfloat16, f"[576,{g.hidden}]"),
+        Operand("kv_a_norm", torch.bfloat16, "[512]"),
+        Operand("w_uk", torch.bfloat16, f"[{g.heads},512,64]"),
+        Operand("kv_cache", torch.uint8, record, "inout"),
+        Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
+        Operand("scratch", torch.uint8, "[draft_producer_scratch_bytes]", "scratch"))
+    return compile_program(_Ml4DraftProducer(g), name="ml4_draft_producer", operands=operands,
+        scalars=(Scalar("rows"),), key=(g.kv_cache, int(max_rows)),
+        scratch={"scratch": lambda rows: _draft_producer_scratch(g, rows)},
+        geometry={**vars(g), "max_rows": int(max_rows)})
+
+
+def compile_draft_attention_aot(g: Ml4DraftGeometry = ML4_DRAFT, *, max_rows: int = 64,
+                                max_context: int = 1048576):
+    """``ml4_draft_attention``: the shared MLA block-draft attention with every
+    block row windowed to the records before its block."""
+    from b12x.attention.dense_mla._forward import DenseMlaForwardKernel
+    from . import kimi_mla
+
+    class _Attention(kimi_mla._DraftAttention):
+        def __init__(self, g, rows, max_context, mode):
+            super().__init__(g, rows, max_context, mode)
+            self.forward = DenseMlaForwardKernel(layout=self.smem,
+                page_size=64, num_heads=g.heads, num_splits=self.splits,
+                chunks_per_split=self.layout["chunks_per_split"],
+                query_tile=self.smem.query_tile, fp8=False, qk_dim=576, value_dim=512,
+                window_size=g.window_size, noncausal_block=True, ds_mla_record=g.kv_cache == "fp8",
+                block_window=True)
+
+    layout = kimi_mla.attention_layout(g, max_rows, max_context=max_context, mode="verify")
+    operands = (
+        Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
+        Operand("kv_cache", torch.uint8, "[pages,64,656]"),
+        Operand("page_table", torch.int32, "[batch,page_table_width]", align=4),
+        Operand("cache_seqlens", torch.int32, "[batch]", align=4),
+        Operand("cu_seqlens_q", torch.int32, "[batch+1]", align=4),
+        Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]", "out"),
+        Operand("lse", torch.float32, f"[rows,{g.heads}]", "out"),
+        Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
+    return compile_program(_Attention(g, max_rows, max_context, "verify"), name="ml4_draft_attention",
+        operands=operands,
+        scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits"),
+                 Scalar("attention_scale", "float32")),
+        key=(g, max_rows, max_context, "block_window"),
+        scratch={"scratch": lambda rows: kimi_mla.attention_layout(
+            g, rows, max_context=max_context, mode="verify")["scratch_bytes"]},
+        geometry={**vars(g), **layout, "noncausal_block": True, "block_window": True, "max_context": max_context})
+
+
+def compile_draft_output_aot(g: Ml4DraftGeometry = ML4_DRAFT, *, max_rows: int = 64):
+    """``ml4_draft_output``: the shared MLA draft output (UV then o, no gate)."""
+    from . import kimi_mla
+    operands = (
+        Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]"),
+        Operand("w_uv", torch.bfloat16, f"[{g.heads},128,512]"),
+        Operand("w_o", torch.bfloat16, f"[{g.hidden},{g.heads * 128}]"),
+        Operand("out", torch.bfloat16, f"[rows,{g.hidden}]", "out"),
+        Operand("scratch", torch.uint8, "[output_scratch_bytes]", "scratch"))
+    return compile_program(kimi_mla._DraftOutput(g), name="ml4_draft_output", operands=operands,
+        scalars=(Scalar("rows"),), key=(g, max_rows),
+        scratch={"scratch": lambda rows: (rows * g.heads * 128 * 2 + 1023) // 1024 * 1024},
+        geometry={**vars(g), "output_gate": False})
