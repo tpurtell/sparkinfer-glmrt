@@ -38,7 +38,8 @@ class QueryScale:
 
     lanes = 32
 
-    def __init__(self, *, heads: int, head_dim: int, rope: int, out_row: int = 0, out_offset: int = 0):
+    def __init__(self, *, heads: int, head_dim: int, rope: int, out_row: int = 0, out_offset: int = 0,
+                 token_row: int | None = None):
         self.heads, self.head, self.rope = int(heads), int(head_dim), int(rope)
         if self.rope % 2 or not 0 <= self.rope <= self.head or self.head % self.lanes:
             raise ValueError("query scale needs an even rope width inside a 32-multiple head")
@@ -48,18 +49,25 @@ class QueryScale:
         self.out_row, self.out_offset = int(out_row), int(out_offset)
         if self.rope and (self.out_row < self.out_offset + self.rope or self.out_offset < 0):
             raise ValueError("the rope tail must fit its output row")
+        # Elements between output tokens: heads x out_row, or a wider combined query
+        # (a head-split share writing its heads into both GPUs' query rows).
+        self.token_row = None if token_row is None else int(token_row)
+        if self.token_row is not None and self.token_row < self.heads * max(self.out_row, 1):
+            raise ValueError("the token row must hold every head's output row")
         # Heads per CTA pass: 8 warps of one head each.
         self.warps = 8
 
     def key(self) -> tuple:
-        return ("query_scale", self.heads, self.head, self.rope, self.out_row, self.out_offset)
+        key = ("query_scale", self.heads, self.head, self.rope, self.out_row, self.out_offset)
+        return key if self.token_row is None else key + (self.token_row,)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, positions: cute.Pointer, cos_sin: cute.Pointer,
                  s: cute.Pointer, b: cute.Pointer, query: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         m = Int64(rows)
         h, d = self.heads, self.head
-        out_layout = cute.make_layout((m, h, max(self.out_row, 1)), stride=(h * max(self.out_row, 1), max(self.out_row, 1), 1))
+        token = h * max(self.out_row, 1) if cutlass.const_expr(self.token_row is None) else self.token_row
+        out_layout = cute.make_layout((m, h, max(self.out_row, 1)), stride=(token, max(self.out_row, 1), 1))
         self.kernel(
             cute.make_tensor(q, cute.make_layout((m, h, d), stride=(h * d, d, 1))),
             cute.make_tensor(positions, cute.make_layout((m,))),
