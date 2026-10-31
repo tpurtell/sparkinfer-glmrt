@@ -376,13 +376,14 @@ class GlmQueryRope:
 
 
 @cute.jit
-def _source_index(lane: Int32, e: cutlass.Constexpr) -> Int32:
+def _source_index(lane: Int32, e: cutlass.Constexpr, rope: cutlass.Constexpr = True) -> Int32:
     """Input dim ``e`` (0..7) of ``lane``: RoPE lanes (< 16) read the pairs of
-    frequencies ``4*(lane%8) .. +3``; pass-through lanes read ``4*lane + e``
-    (entries 4..7 repeat entries 0..3 there, unused)."""
+    frequencies ``4*(lane%8) .. +3``; pass-through lanes (every lane without
+    ``rope``) read ``4*lane + e`` (entries 4..7 repeat entries 0..3 there, unused)."""
     index = Int32(4) * lane + Int32(e % 4)
-    if lane < Int32(16):
-        index = Int32(8) * (lane % Int32(8)) + Int32(e)
+    if cutlass.const_expr(rope):
+        if lane < Int32(16):
+            index = Int32(8) * (lane % Int32(8)) + Int32(e)
     return index
 
 
@@ -391,7 +392,7 @@ class GlmIndexPost:
 
     ``iq`` BF16 ``[rows, H*128]`` = ``wq_b(q_resid)``; ``kw`` BF16
     ``[rows, 128 + H]`` = ``[wk(x) | weights_proj(x)]``. Per (row, head): RoPE
-    on dims 0:64, BF16 round, E4M3 with per-(row, head) scale ``amax/448``
+    on dims 0:64 (none when ``rope`` is False), BF16 round, E4M3 with per-(row, head) scale ``amax/448``
     into ``q_fp8 [rows, H, 128]``; ``head_weights = bf16(proj) * H^-0.5 *
     128^-0.5 * q_scale`` (the query scale folds out of ``relu``). Key:
     ``LayerNorm(wk(x))`` (weight, bias, eps), RoPE, BF16 round, E4M3 with a
@@ -402,12 +403,14 @@ class GlmIndexPost:
     four outputs ``4l..4l+3``.
     """
 
-    def __init__(self, *, heads: int, eps: float, weight_scale: float, page_rows: int = 64):
+    def __init__(self, *, heads: int, eps: float, weight_scale: float, page_rows: int = 64, rope: bool = True):
         self.heads = int(heads)
         self.eps = float(eps)
         self.weight_scale = float(weight_scale)
         self.page_rows = int(page_rows)
         self.page_bytes = self.page_rows * (128 + 4)
+        # NoPE layers (Mistral Large 4 every fourth layer) skip the query/key RoPE.
+        self.rope = bool(rope)
 
     @cute.jit
     def __call__(self, iq: cute.Pointer, kw: cute.Pointer, positions: cute.Pointer,
@@ -432,7 +435,7 @@ class GlmIndexPost:
     @cute.jit
     def _rotate(self, lane: Int32, src: cute.Tensor, cs: cute.Pointer, out: cute.Tensor):
         """Four outputs of ``lane`` from the eight inputs ``_source_index`` names."""
-        if lane < Int32(16):
+        if cutlass.const_expr(self.rope) and lane < Int32(16):
             for e in cutlass.range_constexpr(4):
                 pair = Int32(4) * (lane % Int32(8)) + Int32(e)
                 cos_v = Float32(cs[pair])
@@ -462,7 +465,7 @@ class GlmIndexPost:
             h64 = Int64(head)
             src = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
             for e in cutlass.range_constexpr(8):
-                src[e] = Float32(iq[token, h64, Int64(_source_index(lane, e))])
+                src[e] = Float32(iq[token, h64, Int64(_source_index(lane, e, self.rope))])
             self._rotate(lane, src, cs, out)
             local = fmax_f32(fmax_f32(fabs_f32(out[0]), fabs_f32(out[1])),
                              fmax_f32(fabs_f32(out[2]), fabs_f32(out[3])))
@@ -492,7 +495,7 @@ class GlmIndexPost:
 
             src = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
             for e in cutlass.range_constexpr(8):
-                dk = _source_index(lane, e)
+                dk = _source_index(lane, e, self.rope)
                 xk = Float32(kw[token, Int64(dk)])
                 src[e] = _bf16((xk - mean) * rstd * Float32(k_weight[dk]) + Float32(k_bias[dk]))
             self._rotate(lane, src, cs, out)
