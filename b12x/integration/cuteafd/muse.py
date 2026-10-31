@@ -12,11 +12,10 @@ import torch
 from cutlass import BFloat16, Float32, Float64, Int32, Int64
 
 from b12x._lib.intrinsics import div_rn_f32
-from b12x.moe._shared.kernels.w4a16.route_norm_sum import _sqrt_rn
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _bf16, _warp_sum, _warp_max
 from ._qwen4_kernels import _sigmoid
-from .pointwise import _add, _mul, _view
+from .pointwise import _add, _mul, _sqrt_rn, _view
 
 
 class RouterProjection:
