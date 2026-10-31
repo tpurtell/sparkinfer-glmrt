@@ -56,6 +56,13 @@ def _fma(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None):
         is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT))
 
 
+@dsl_user_op
+def _sqrt_rn(a: Float32, *, loc=None, ip=None):
+    return Float32(llvm.inline_asm(T.f32(), [Float32(a).ir_value(loc=loc, ip=ip)],
+        "sqrt.rn.f32 $0, $1;", "=f,f", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT))
+
+
 @cute.jit
 def _view(pointer: cute.Pointer):
     return cute.make_tensor(pointer, cute.make_layout((Int64(1) << Int64(50),)))
