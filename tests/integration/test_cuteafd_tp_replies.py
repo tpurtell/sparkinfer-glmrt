@@ -11,6 +11,10 @@ ROWS = (1, 8, 16, 64, 65, 80, 2752, 4096)
 FORMATS = ("bf16", "nvfp4", "fp8")
 
 
+def _rank_regions(data):
+    return torch.tensor([plane.data_ptr() for plane in data], dtype=torch.uint64, device="cuda")
+
+
 def _encode(x, format):
     x = x.cpu().float().contiguous()
     width = x.shape[-1]
@@ -111,16 +115,16 @@ def test_empty_regions_in_uniform_wave(wide_format, active_format):
         c = compile_tp_combine_aot(format=format)
         reply = torch.full_like(_encode(x, format), 7, device="cuda")
         count = rows if format == selected else 0
-        programs.append((p, c, reply, count))
+        programs.append((p, c, reply, count, _rank_regions(reply.unsqueeze(0))))
 
     def launch():
-        for p, c, reply, count in programs:
+        for p, c, reply, count, table in programs:
             p.launch(data, empty, empty, empty, rowmap, reply, scalars=[count, rows, 0, 0])
-            c.launch(reply, rowmap, w, n, combined, scalars=[1, count, rows])
+            c.launch(table, rowmap, w, n, combined, scalars=[1, count, rows])
 
     launch()
     assert torch.equal(combined.cpu(), expected)
-    for _, _, reply, count in programs:
+    for _, _, reply, count, _ in programs:
         if count == 0:
             assert (reply == 7).all()
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -132,15 +136,15 @@ def test_empty_regions_in_uniform_wave(wide_format, active_format):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(combined.cpu(), expected)
-        for _, _, reply, count in programs:
+        for _, _, reply, count, _ in programs:
             if count == 0:
                 assert (reply == 7).all()
         # A completely empty wave also reuses the same precompiled callables.
         saved = combined.clone()
-        for p, c, reply, _ in programs:
+        for p, c, reply, _, table in programs:
             before = reply.clone()
             p.launch(data, empty, empty, empty, rowmap[:0], reply, scalars=[0, 0, 0, 0])
-            c.launch(reply, rowmap[:0], w, n, combined, scalars=[1, 0, 0])
+            c.launch(table, rowmap[:0], w, n, combined, scalars=[1, 0, 0])
             assert torch.equal(reply, before)
         assert torch.equal(combined, saved)
 
@@ -193,13 +197,19 @@ def test_tp_combine(rows, format):
     data, w, n = encoded.cuda(), weights.cuda(), norm.cuda()
     rowmap = torch.arange(rows, dtype=torch.int32, device="cuda").view(torch.uint32)
     out = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
-    program.launch(data, rowmap, w, n, out, scalars=[ranks, rows, rows])
+    table = _rank_regions(data)
+    program.launch(table, rowmap, w, n, out, scalars=[ranks, rows, rows])
+    from ._muse_tp_contiguous_oracle import compile_contiguous_oracle_aot
+    old = torch.empty_like(out)
+    compile_contiguous_oracle_aot(format=format).launch(
+        data, rowmap, w, n, old, scalars=[ranks, rows, rows])
+    assert torch.equal(out.view(torch.int16), old.view(torch.int16))
     assert torch.equal(out.cpu(), expected), (out.cpu().float() - expected.float()).abs().max()
     small = torch.empty_like(out[:1])
     for row in sorted({0, rows // 2, rows - 1}):
         compact = data[:, row:row + 1].contiguous()
         zero = torch.zeros(1, dtype=torch.int32, device="cuda").view(torch.uint32)
-        program.launch(compact, zero, w[row:row + 1], n, small, scalars=[ranks, 1, 1])
+        program.launch(_rank_regions(compact), zero, w[row:row + 1], n, small, scalars=[ranks, 1, 1])
         assert torch.equal(small[0], out[row])
 
 
@@ -274,7 +284,8 @@ def test_combine_scale_edges(format):
     expected = _combine(_decode(encoded, format, width), weights, norm)
     out = torch.empty_like(expected, device="cuda")
     program = compile_tp_combine_aot(format=format)
-    program.launch(encoded.cuda(), torch.zeros(1, dtype=torch.int32, device="cuda").view(torch.uint32),
+    data = encoded.cuda()
+    program.launch(_rank_regions(data), torch.zeros(1, dtype=torch.int32, device="cuda").view(torch.uint32),
                    weights.cuda(), norm.cuda(), out, scalars=[1, 1, 1])
     assert torch.equal(out.cpu(), expected), dict(
         encoded=encoded.flatten()[:4], scales=encoded[..., width:].flatten()[:4],
@@ -302,7 +313,8 @@ def test_combine_format_neutrality_and_wave_mix(ranks):
         out = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
         rowmap = torch.arange(rows, dtype=torch.int32, device="cuda").view(torch.uint32)
         program = compile_tp_combine_aot(format=format)
-        program.launch(data, rowmap, weights.cuda(), norm, out, scalars=[ranks, rows, rows])
+        table = _rank_regions(data)
+        program.launch(table, rowmap, weights.cuda(), norm, out, scalars=[ranks, rows, rows])
         if reference is None:
             reference = out.clone()
         assert torch.equal(out, reference)
@@ -312,19 +324,78 @@ def test_combine_format_neutrality_and_wave_mix(ranks):
         with kernel_resolution_guard("TP replies use precompiled geometry only"):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                program.launch(data, rowmap, w, norm, out, scalars=[ranks, rows, rows])
+                program.launch(table, rowmap, w, norm, out, scalars=[ranks, rows, rows])
             out.zero_()
             graph.replay()
             torch.cuda.synchronize()
             assert torch.equal(out, reference)
             compact = data[:, :1].contiguous()
             one = torch.empty_like(out[:1])
-            program.launch(compact, rowmap[:1], w, norm, one, scalars=[ranks, 1, rows])
+            program.launch(_rank_regions(compact), rowmap[:1], w, norm, one, scalars=[ranks, 1, rows])
             assert torch.equal(one[0], reference[0])
         # Disjoint mixed regions write their original wave rows, no repacking output.
         out.fill_(float("nan"))
         for indices in (torch.cat((torch.arange(1), torch.arange(17, rows))), torch.arange(1, 17)):
             compact = data[:, indices.cuda()].contiguous()
             mapped = indices.int().cuda().view(torch.uint32)
-            program.launch(compact, mapped, weights.cuda(), norm, out, scalars=[ranks, len(indices), rows])
+            program.launch(_rank_regions(compact), mapped, weights.cuda(), norm, out, scalars=[ranks, len(indices), rows])
         assert torch.equal(out, reference)
+
+
+@pytest.mark.parametrize("format", FORMATS)
+@pytest.mark.parametrize("ranks", (1, 2, 3))
+def test_combine_disjoint_rank_regions_and_table_replay(ranks, format):
+    require_b12x()
+    from b12x.integration.cuteafd.muse_tp import compile_tp_combine_aot
+    from ._muse_tp_contiguous_oracle import compile_contiguous_oracle_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    gen = torch.Generator().manual_seed(156)
+    rows, topk, width = 17, 8, 4096
+    encoded = _encode(torch.randn(ranks, rows, topk, width, generator=gen), format)
+    contiguous = encoded.cuda()
+    w = torch.rand(rows, topk, generator=gen).cuda()
+    n = (torch.randn(width, generator=gen) * .1).bfloat16().cuda()
+    rowmap = torch.arange(rows, dtype=torch.int32, device="cuda").view(torch.uint32)
+    expected = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+    compile_contiguous_oracle_aot(format=format).launch(
+        contiguous, rowmap, w, n, expected, scalars=[ranks, rows, rows])
+    # Separate own/peer-shaped allocations, with gaps and a 256-byte wide offset.
+    size = contiguous[0].numel()
+    offset = 256 // contiguous.element_size()
+    buffers = [torch.full((size + offset + 128,), 7, dtype=contiguous.dtype, device="cuda")
+               for _ in range(ranks)]
+    planes = [buffer[offset:offset + size].view_as(contiguous[0]) for buffer in buffers]
+    planes.sort(key=lambda plane: plane.data_ptr(), reverse=True)
+    assert all(plane.data_ptr() % 16 == 0 for plane in planes)
+    if ranks == 3:
+        assert planes[2].data_ptr() < planes[0].data_ptr()
+    for rank, plane in enumerate(planes):
+        plane.copy_(contiguous[rank])
+    table = _rank_regions(planes)
+    table_address = table.data_ptr()
+    out = torch.empty_like(expected)
+    program = compile_tp_combine_aot(format=format)
+    program.launch(table, rowmap, w, n, out, scalars=[ranks, rows, rows])
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+    # Mutate the fixed-address table from pinned staging before graph replay.
+    # Different data proves the replay actually dereferences the new addresses.
+    replacement = _encode(torch.randn(ranks, rows, topk, width, generator=gen), format).cuda()
+    next_expected = torch.empty_like(expected)
+    compile_contiguous_oracle_aot(format=format).launch(
+        replacement, rowmap, w, n, next_expected, scalars=[ranks, rows, rows])
+    staging = torch.tensor([plane.data_ptr() for plane in replacement], dtype=torch.uint64,
+                           pin_memory=True)
+    with kernel_resolution_guard("Rank region addresses are runtime table contents"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            program.launch(table, rowmap, w, n, out, scalars=[ranks, rows, rows])
+        table.copy_(staging, non_blocking=True)
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+    assert table.data_ptr() == table_address
+    assert torch.equal(out.view(torch.int16), next_expected.view(torch.int16))
+    assert not torch.equal(expected, next_expected)
+    for buffer in buffers:
+        assert (buffer[:offset] == 7).all()
+        assert (buffer[offset + size:] == 7).all()
