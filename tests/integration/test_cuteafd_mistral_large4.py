@@ -380,11 +380,14 @@ def _ml4_programs():
                                                 head_dim=g.index_head_dim),
             lambda: ml4.compile_layer_norm_aot(width=g.hidden, max_rows=64, eps=g.index_norm_eps),
             lambda: ml4.compile_index_q_fp8_aot(g, mode="decode", max_rows=64),
-            lambda: ml4.compile_index_q_fp8_aot(g, mode="prefill", max_rows=256)]
+            lambda: ml4.compile_index_q_fp8_aot(g, mode="prefill", max_rows=256),
+            lambda: ml4.compile_draft_producer_aot(ml4.ML4_DRAFT, max_rows=64),
+            lambda: ml4.compile_draft_attention_aot(ml4.ML4_DRAFT, max_rows=64, max_context=8192),
+            lambda: ml4.compile_draft_output_aot(ml4.ML4_DRAFT, max_rows=64)]
     return out
 
 
-@pytest.mark.parametrize("index", range(13))
+@pytest.mark.parametrize("index", range(16))
 def test_every_ml4_program_exports_with_its_declared_abi(index, tmp_path):
     """The exporter's header check (pointer names = the declared operands) on
     every ml4 program: launches here pass pointers positionally, so only the
@@ -393,10 +396,135 @@ def test_every_ml4_program_exports_with_its_declared_abi(index, tmp_path):
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
 
     thunks = _ml4_programs()
-    assert len(thunks) == 13
+    assert len(thunks) == 16
     with exportable_compilation():
         program = thunks[index]()
     label = f"ml4_export_check_{index}"
     program.export_to_c(str(tmp_path), label, "cuteafd_" + label)
     checked = validate_exported_header(program, tmp_path / f"{label}.h", "cuteafd_" + label)
     assert checked["argument_count"] == len(program.operands) + len(program.scalars) + 1
+
+
+@pytest.mark.parametrize("kv_cache_requests", [((2100, 3), (65, 3)), ((2048, 3), (1, 3))])
+def test_draft_attention_windows_every_block_row_before_its_block(kv_cache_requests):
+    """ml4_draft_attention (the shared MLA block-draft attention, block_window):
+    each request's 3 block rows see the 2048 records before the block (the
+    trained dSpark mask, the same for every row) and the whole block,
+    non-causally; ragged requests, FP8 records, CUDA-graph replay bit-identical."""
+    device = require_b12x()
+    from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference, unpack_mla_kv_cache_reference
+    from b12x.integration.cuteafd.mistral_large4 import ML4_DRAFT, compile_draft_attention_aot
+
+    g = ML4_DRAFT
+    p = compile_draft_attention_aot(g, max_rows=16, max_context=4352)
+    contexts = [c for c, _ in kv_cache_requests]
+    counts = [n for _, n in kv_cache_requests]
+    lengths = [c + n for c, n in kv_cache_requests]
+    width = max(-(-length // 64) for length in lengths)
+    gen = torch.Generator(device="cuda").manual_seed(91)
+    latent = (torch.randn(2 * width * 64, 576, generator=gen, device="cuda") * 0.1).bfloat16()
+    packed = pack_mla_kv_cache_reference(latent[:, :512], latent[:, 512:])
+    oracle = unpack_mla_kv_cache_reference(packed).bfloat16().reshape(2 * width, 64, 576)
+    cache = packed.reshape(2 * width, 64, 656)
+    table = torch.arange(2 * width, dtype=torch.int32, device="cuda").flip(0).reshape(width, 2).T.contiguous()
+    rows = sum(counts)
+    q = (torch.randn(rows, 64, 576, generator=gen, device="cuda") * 0.5).bfloat16()
+    cu = torch.tensor([0, counts[0], rows], dtype=torch.int32, device="cuda")
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    out = torch.empty(rows, 64, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty(rows, 64, device="cuda")
+    scratch = torch.empty(p.scratch_bytes(16)["scratch"], dtype=torch.uint8, device="cuda")
+    scale = 128 ** -0.5
+
+    def run():
+        p.launch(q, cache, table, lens, cu, out, lse, scratch, scalars=(rows, 2, width, p.geometry["num_splits"], scale))
+
+    run()
+    torch.cuda.synchronize()
+    begin = 0
+    for index, (context, count, length) in enumerate(zip(contexts, counts, lengths)):
+        records = oracle[table[index].long()].flatten(0, 1)[:length].float()
+        scores = torch.einsum("thd,sd->hts", q[begin:begin + count].float(), records) * scale
+        keys = torch.arange(length, device="cuda")
+        visible = keys >= max(context - g.window_size, 0)  # every row: the window before the block, plus the block
+        scores.masked_fill_(~visible[None, None], -torch.inf)
+        expected = torch.einsum("hts,sd->thd", scores.softmax(-1), records[:, :512])
+        torch.testing.assert_close(out[begin:begin + count].float(), expected, atol=0.003, rtol=0.03)
+        torch.testing.assert_close(lse[begin:begin + count], scores.logsumexp(-1).T, atol=2e-4, rtol=2e-5)
+        begin += count
+    saved = out.clone(), lse.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    for actual, expected in zip((out, lse), saved):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_draft_layer_attention_through_the_shared_mla_draft_path():
+    """ml4_draft_producer (context rows, then the block) -> ml4_draft_attention ->
+    ml4_draft_output vs the drafter's BF16 attention (dspark.py: plain YaRN
+    RoPE, no SSMax, the trained window, non-causal block): one sequence,
+    context 2100, block 3."""
+    device = require_b12x()
+    from b12x.integration.cuteafd.mistral_large4 import (ML4_DRAFT, compile_draft_attention_aot,
+                                                         compile_draft_output_aot, compile_draft_producer_aot)
+
+    g, H, depth, context = ML4_DRAFT, 64, 3, 2100
+    gen = torch.Generator().manual_seed(57)
+    w = _attention_weights(True, gen)
+    n = context + depth
+    x = (torch.randn(n, 6144, generator=gen)).bfloat16()
+    positions = torch.arange(n, dtype=torch.int64)
+    kv_b = w["wkv_b"].view(H, 64 + 128, 512)
+    d = lambda t: t.to(device)  # noqa: E731
+    pages = -(-n // 64)
+    cache = torch.zeros(pages, 64, 656, dtype=torch.uint8, device=device)
+    table = torch.arange(pages, dtype=torch.int32, device=device)[None]
+    unit_s, unit_b = d(torch.zeros(H, dtype=torch.bfloat16)), d(torch.ones(H, dtype=torch.bfloat16))
+    weights = dict(w_q=d(w["wq"]), w_kv_a=d(w["wkv_a"]), kv_a_norm=d(w["kv_a_norm"]),
+                   w_uk=d(kv_b[:, :64, :].transpose(1, 2).contiguous()), w_uv=d(kv_b[:, 64:, :].contiguous()),
+                   w_o=d(w["wo"]))
+    table_cs = d(_cos_sin_table(positions))
+    producer = compile_draft_producer_aot(g, max_rows=4096)
+    query = torch.zeros(n, H, 576, dtype=torch.bfloat16, device=device)
+    scratch = torch.empty(producer.scratch_bytes(4096)["scratch"], dtype=torch.uint8, device=device)
+    # Context rows first (their queries are unused), then the block.
+    for first, count in ((0, context), (context, depth)):
+        producer.launch(d(x[first:first + count]), d(positions[first:first + count]), d(positions[first:first + count]),
+                        table_cs, unit_s, unit_b, weights["w_q"], weights["w_kv_a"], weights["kv_a_norm"],
+                        weights["w_uk"], cache, query[first:first + count], scratch, scalars=(count,))
+    attention = compile_draft_attention_aot(g, max_rows=16, max_context=4352)
+    out = torch.empty(depth, H, 512, dtype=torch.bfloat16, device=device)
+    lse = torch.empty(depth, H, device=device)
+    attention.launch(query[context:].contiguous(), cache, table, torch.tensor([n], dtype=torch.int32, device=device),
+                     torch.tensor([0, depth], dtype=torch.int32, device=device), out, lse,
+                     torch.empty(attention.scratch_bytes(16)["scratch"], dtype=torch.uint8, device=device),
+                     scalars=(depth, 1, pages, attention.geometry["num_splits"], 128 ** -0.5))
+    output = compile_draft_output_aot(g, max_rows=16)
+    actual = torch.empty(depth, 6144, dtype=torch.bfloat16, device=device)
+    output.launch(out, weights["w_uv"], weights["w_o"], actual,
+                  torch.empty(output.scratch_bytes(16)["scratch"], dtype=torch.uint8, device=device), scalars=(depth,))
+    torch.cuda.synchronize()
+    # Reference: dspark.py's draft attention in BF16 (keys of the window and the block).
+    angles = positions.float()[:, None] * _inv_freq()[None, :]
+    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+    kv = (x.float() @ w["wkv_a"].float().t()).bfloat16()
+    lat = kv[:, :512].float()
+    lat = (lat * torch.rsqrt(lat.pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16() * w["kv_a_norm"]
+    rot = kv[:, 512:]
+    k_rot = torch.cat([rot[:, 0::2] * cos - rot[:, 1::2] * sin, rot[:, 1::2] * cos + rot[:, 0::2] * sin], -1)
+    keep = torch.arange(n) >= context - 2048
+    kvb = (lat[keep].float() @ w["wkv_b"].float().t()).bfloat16().view(-1, H, 192)
+    k = torch.cat([kvb[..., :64], k_rot[keep][:, None, :].expand(-1, H, -1)], -1)
+    v = kvb[..., 64:]
+    q = (x[context:].float() @ w["wq"].float().t()).bfloat16().view(depth, H, 128)
+    c, s = cos[context:][:, None], sin[context:][:, None]
+    e, o = q[..., 64::2], q[..., 65::2]
+    q = torch.cat([q[..., :64], e * c - o * s, o * c + e * s], -1)
+    scores = torch.einsum("rhd,khd->hrk", q.float(), k.float()) * 128 ** -0.5
+    attn = torch.einsum("hrk,khd->rhd", scores.softmax(-1).bfloat16().float(), v.float()).bfloat16()
+    expected = attn.reshape(depth, -1).float() @ w["wo"].float().t()
+    cosine = torch.nn.functional.cosine_similarity(actual.float().cpu(), expected, dim=-1)
+    print(f"ML4 MLA draft layer attention: cosine min {float(cosine.min()):.6f}")
+    assert cosine.min() > 0.995, float(cosine.min())
