@@ -190,6 +190,40 @@ def test_qk_norm_rope(rows, kind, heads):
         assert torch.equal(records.cpu().view(torch.int16), expected_records.view(torch.int16))
 
 
+@pytest.mark.parametrize("heads", (64, 128))
+def test_qk_half_table_matches_full_above_million(heads):
+    require_b12x()
+    from b12x.integration.cuteafd.muse import compile_qk_norm_rope_aot
+    gen = torch.Generator().manual_seed(133)
+    position, kv_heads = (1 << 20) + 137, heads // 8
+    q = torch.randn(1, heads, 64, generator=gen).bfloat16()
+    k = torch.randn(1, kv_heads, 64, generator=gen).bfloat16()
+    v = torch.randn_like(k)
+    freq = torch.tensor(position, dtype=torch.float32) / (
+        500000 ** (torch.arange(0, 64, 2).float() / 64))
+    c, s = freq.cos().bfloat16(), freq.sin().bfloat16()
+    # The previous ABI's full-width row repeats each half-width table row.
+    full_cos, full_sin = torch.cat((c, c)), torch.cat((s, s))
+
+    def old_full_table(t, scale=1.0):
+        t = (_canonical_norm(t).bfloat16() * scale).bfloat16()
+        rotated = torch.cat((-t[..., 32:], t[..., :32]), -1)
+        return t * full_cos + rotated * full_sin
+
+    cos = torch.empty(position + 1, 32, dtype=torch.bfloat16, device="cuda")
+    sin = torch.empty_like(cos)
+    cos[position], sin[position] = c.cuda(), s.cuda()
+    qo = torch.empty_like(q, device="cuda")
+    record = torch.empty(1, kv_heads * 128, dtype=torch.bfloat16, device="cuda")
+    program = compile_qk_norm_rope_aot(heads=heads, kind="swa")
+    program.launch(q.cuda(), k.cuda(), v.cuda(),
+                   torch.tensor([position], dtype=torch.int64, device="cuda"), cos, sin,
+                   torch.zeros(1, dtype=torch.int64, device="cuda"), qo, record, scalars=[1])
+    assert torch.equal(qo.cpu(), old_full_table(q, 5.4730064863875))
+    expected_record = torch.cat((old_full_table(k).flatten(1), v.flatten(1)), -1)
+    assert torch.equal(record.cpu().view(torch.int16), expected_record.view(torch.int16))
+
+
 @pytest.mark.parametrize("rows", ROWS)
 def test_attention_output(rows):
     require_b12x()
