@@ -12,11 +12,21 @@ from ..conftest import require_b12x
 _PROGRAMS = {}
 
 
+def _geometry(family):
+    """The attention geometry of ``family``: GLM 5.3 / GLM Flash / V4, and Mistral Large 4's
+    RoPE (656-byte records) and NoPE (528-byte) layers at their 128^-0.5 scale."""
+    from b12x.integration.cuteafd import GLM53, GLM53_FLASH, FLASH, PRO
+    if family in ("ml4", "ml4nope"):
+        from b12x.integration.cuteafd import mistral_large4 as ml4
+        return ml4.rope_attention() if family == "ml4" else ml4.nope_attention()
+    return {"glm": GLM53, "glmf": GLM53_FLASH, "flash": FLASH, "pro": PRO}.get(family)
+
+
 def program(kind, family=None, **kw):
     require_b12x()
     from b12x.integration.cuteafd import GLM53, GLM53_FLASH, FLASH, PRO, exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd import context_split as k1
-    g = {"glm": GLM53, "glmf": GLM53_FLASH, "flash": FLASH, "pro": PRO}.get(family)
+    g = _geometry(family)
     key = (kind, family, tuple(sorted(kw.items())))
     if key not in _PROGRAMS:
         fn = getattr(k1, f"compile_{kind}_aot")
@@ -210,7 +220,7 @@ def test_gather_byte_exact_high_pages(row_bytes,page_rows,page_bytes):
 
 
 def pack_glm(records, family):
-    width = 528 if family == "glmf" else 656
+    width = 528 if family in ("glmf", "ml4nope") else 656
     n = len(records)
     # Exactly representable FP8 values and fixed scales; BF16 RoPE is kept.
     latent = records[:,:512].to(torch.float8_e4m3fn)
@@ -222,15 +232,14 @@ def pack_glm(records, family):
     return raw, torch.cat((latent.float(),records[:,512:].bfloat16().float()),dim=1) if width == 656 else latent.float()
 
 
-@pytest.mark.parametrize("family",["glm","glmf","flash","pro"])
+@pytest.mark.parametrize("family",["glm","glmf","flash","pro","ml4","ml4nope"])
 @pytest.mark.parametrize("rows",[1,8,64])
 @pytest.mark.parametrize("plan_sm_count",[170,188])
 def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
-    from b12x.integration.cuteafd import GLM53,GLM53_FLASH,FLASH,PRO
     from b12x.integration.cuteafd.glm_sparse_mla import compile_glm_sparse_mla_aot
     from b12x.integration.cuteafd.dsv4_sparse_mla import compile_dsv4_sparse_mla_aot
     v4 = family in ("flash","pro")
-    g = {"glm":GLM53,"glmf":GLM53_FLASH,"flash":FLASH,"pro":PRO}[family]
+    g = _geometry(family)
     from b12x.integration.cuteafd.context_split import sparse_mla_partial_split_plan
     splits = sparse_mla_partial_split_plan(g,max_rows=64,head_count=g.heads//2,sm_count=plan_sm_count)
     p = program("sparse_mla_partial",family,max_rows=64,head_begin=g.heads//2,head_count=g.heads//2,num_splits=splits)
@@ -305,6 +314,7 @@ def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
     sink=torch.randn((g.heads//2,),device="cuda") if v4 else None
     combined=torch.empty_like(outputs[0])
     combine.launch(outputs[0],lses[0],outputs[1],lses[1],sink,combined,scalars=(rows,))
+    oracle=[]
     for row in range(rows):
         # Row0 contains only GPU0's shard due to the explicit empty-shard case.
         indices=torch.arange(len(values),device="cuda")
@@ -321,6 +331,8 @@ def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
             # its dequantized-oracle contract is cosine > .998.
             cosine = torch.nn.functional.cosine_similarity(combined[row].float().flatten(), expected.float().flatten(), dim=0)
             assert cosine > .998
+        elif family in ("ml4","ml4nope"):
+            oracle.append((row,expected))
         else:
             torch.testing.assert_close(combined[row].float(),expected.float(),rtol=.025,atol=.002)
     # Match row0's deliberately empty second shard in the full selection too.
@@ -331,8 +343,14 @@ def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
         keep = full_ix[0, ((torch.arange(k,device="cuda")//64)%2)==0].clone()
         full_ix[0].fill_(-1); full_ix[0,:len(keep)] = keep; ml[0] = len(keep)
     # Existing full kernel agrees at its own BF16 split rounding tolerance.
-    full=(compile_dsv4_sparse_mla_aot(g,route="decode",max_rows=64,indexed_width=k)
-          if v4 else compile_glm_sparse_mla_aot(g,route="decode",max_rows=64))
+    if family in ("ml4","ml4nope"):
+        # The ML4 full program carries its family name: the GLM name and key would reuse a
+        # GLM 5.3 program compiled at 256^-0.5 (the aliasing the partial key now refuses).
+        from b12x.integration.cuteafd import mistral_large4 as ml4
+        full=ml4.compile_sparse_mla_aot(rope=family=="ml4",route="decode",max_rows=64)
+    else:
+        full=(compile_dsv4_sparse_mla_aot(g,route="decode",max_rows=64,indexed_width=k)
+              if v4 else compile_glm_sparse_mla_aot(g,route="decode",max_rows=64))
     fo=torch.empty((rows,g.heads,512),device="cuda",dtype=torch.bfloat16)
     fs=torch.empty(full.scratch_bytes(rows)["scratch"],device="cuda",dtype=torch.uint8)
     if v4:
@@ -342,6 +360,12 @@ def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
         full.launch(q,main,full_ix,ml,fo,fs,scalars=(rows,8))
     torch.testing.assert_close(combined.float(),fo[:,g.heads//2:].float(),rtol=.025,atol=.002)
     torch.cuda.synchronize()
+    if oracle:
+        # ML4's 128^-0.5 logits are sharper than GLM's 256^-0.5, so BF16 rounding reaches the
+        # FP64 oracle further. The split must be no worse than the serving full kernel there.
+        part=max((combined[r].double()-e).abs().max().item() for r,e in oracle)
+        whole=max((fo[r,g.heads//2:].double()-e).abs().max().item() for r,e in oracle)
+        assert part<=max(.002,1.25*whole),(part,whole)
 
 
 def test_frozen_resolution_graph_replay_live_rows():
@@ -568,3 +592,20 @@ def test_glmf_owned_expand_shards_union_the_full_selection(ties):
         n = int(full_len[r]) if positions[r] >= 0 else 0
         want = {page_logical[s // 64] * 64 + s % 64 for s in full_idx[r, :n].tolist()}
         assert selected[r] == want, f"row {r} position {int(positions[r])}"
+
+
+def test_partial_key_carries_the_softmax_scale(monkeypatch):
+    """Mistral Large 4's RoPE layers share GLM 5.3's 656-byte record and 576 latent at a
+    different scale (128^-0.5 vs 256^-0.5): the compile keys must differ."""
+    require_b12x()
+    from b12x.integration.cuteafd import GLM53
+    from b12x.integration.cuteafd import context_split as k1
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+    rope = ml4.rope_attention()
+    assert (rope.latent_dim, rope.record_bytes) == (GLM53.latent_dim, GLM53.record_bytes)
+    assert rope.softmax_scale != GLM53.softmax_scale
+    keys = []
+    monkeypatch.setattr(k1, "compile_program", lambda launch, **kw: keys.append((kw["name"], kw["key"])))
+    for g in (GLM53, rope):
+        k1.compile_sparse_mla_partial_aot(g, max_rows=64, head_begin=32, head_count=32, num_splits=4)
+    assert keys[0] != keys[1] and keys[1][1][-1] == rope.softmax_scale

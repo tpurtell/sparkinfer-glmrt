@@ -64,6 +64,7 @@ indexer's ``q_input_norm``), F32 statistics, BF16 out::
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
@@ -79,7 +80,7 @@ from ._glm_kernels import (BatchedBf16Gemm, GlmIndexPost, GlmRankNormPackKV, _bl
                            _rsqrt)
 from ._query_scale import QueryScale
 
-__all__ = ["ML4", "Ml4Geometry", "LayerNormBias", "compile_index_post_aot", "compile_layer_norm_aot",
+__all__ = ["ML4", "ML4_TP2", "Ml4Geometry", "LayerNormBias", "compile_index_post_aot", "compile_layer_norm_aot",
            "compile_index_q_fp8_aot", "compile_kv_b_aot", "compile_query_scale_aot", "compile_rank_pack_aot",
            "compile_sparse_mla_aot", "nope_attention", "rope_attention", "ML4_DRAFT", "Ml4DraftGeometry",
            "compile_draft_producer_aot", "compile_draft_attention_aot", "compile_draft_output_aot"]
@@ -125,6 +126,10 @@ class Ml4Geometry:
 
 
 ML4 = Ml4Geometry()
+# One GPU's share of a two-GPU head split (``ml4_2``): 32 heads, half the dense and
+# shared-expert intermediates; records, indexer and router stay the whole model's.
+ML4_TP2 = dataclasses.replace(ML4, name="mistral_large4_tp2", heads=ML4.heads // 2,
+                              dense_inter=ML4.dense_inter // 2, moe_inter=ML4.moe_inter // 2)
 
 
 def rope_attention(g: Ml4Geometry = ML4):
@@ -163,26 +168,34 @@ def compile_sparse_mla_aot(g: Ml4Geometry = ML4, *, rope: bool, route: str, max_
 
 
 def compile_query_scale_aot(g: Ml4Geometry = ML4, *, rope: bool, max_rows: int,
-                            heads: int | None = None, head_dim: int | None = None):
-    """Per-head SSMax with optional interleaved RoPE (see the module docstring)."""
+                            heads: int | None = None, head_dim: int | None = None, query_row: int | None = None):
+    """Per-head SSMax with optional interleaved RoPE (see the module docstring).
+    ``query_row``: elements between consecutive output tokens of ``query`` (default
+    heads x latent). A head-split context share writes its heads into the combined
+    two-GPU query (2 x heads x latent per token), as GLM's ``_context`` stages do."""
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
     heads = g.heads if heads is None else int(heads)
     head_dim = g.qk_head_dim if head_dim is None else int(head_dim)
     rope_dims = g.qk_rope_dim if rope else 0
     latent = g.kv_lora_rank + g.qk_rope_dim
+    if query_row is not None and (not rope or int(query_row) < heads * latent or int(query_row) % latent):
+        raise ValueError("a query row stride needs RoPE and whole latent rows of at least heads x latent")
     launch = QueryScale(heads=heads, head_dim=head_dim, rope=rope_dims,
-                        out_row=latent if rope else 0, out_offset=g.kv_lora_rank if rope else 0)
+                        out_row=latent if rope else 0, out_offset=g.kv_lora_rank if rope else 0,
+                        token_row=None if query_row is None else int(query_row))
     operands = (
         Operand("q", torch.bfloat16, f"[rows,{heads},{head_dim}]", "inout"),
         Operand("positions", torch.int64, "[rows]", align=8),
         Operand("cos_sin", torch.float32, "[P,64]", align=4),
         Operand("s", torch.bfloat16, f"[{heads}]"),
         Operand("b", torch.bfloat16, f"[{heads}]"),
-        Operand("query", torch.bfloat16, f"[rows,{heads},{latent}]" if rope else "unused", "out"),
+        Operand("query", torch.bfloat16, ("unused" if not rope else f"[rows,{heads},{latent}]" if query_row is None
+                                          else f"[rows,{int(query_row) // latent},{latent}] (first {heads} heads)"), "out"),
     )
     return compile_program(
-        launch, name="ml4_query_scale" + ("_rope" if rope else ""), operands=operands,
+        launch, name="ml4_query_scale" + ("_rope" if rope else "") + ("" if query_row is None else "_context"),
+        operands=operands,
         scalars=(Scalar("rows"),), key=(launch.key(), int(max_rows)),
         geometry=dict(heads=heads, head_dim=head_dim, rope=rope_dims, max_rows=int(max_rows),
                       out_offset=launch.out_offset), doc=__doc__)
@@ -310,16 +323,22 @@ def compile_rank_pack_aot(g: Ml4Geometry = ML4, *, rope: bool, max_rows: int):
                       max_rows=int(max_rows)), doc=__doc__)
 
 
-def compile_kv_b_aot(g: Ml4Geometry = ML4, *, stage: str, rope: bool, max_rows: int):
+def compile_kv_b_aot(g: Ml4Geometry = ML4, *, stage: str, rope: bool, max_rows: int, query_row: int | None = None):
+    """``query_row`` (absorb only): elements between consecutive output tokens (default
+    heads x latent); a head-split context share writes into the combined two-GPU query."""
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
     n, c, head, nope = g.heads, g.kv_lora_rank, g.qk_head_dim, g.nope_dim(rope)
     latent = c + (g.qk_rope_dim if rope else 0)
+    if query_row is not None and (stage != "absorb" or int(query_row) < n * latent or int(query_row) % latent):
+        raise ValueError("a query row stride applies to absorb with whole latent rows of at least heads x latent")
+    o_row = n * latent if query_row is None else int(query_row)
     if stage == "absorb":
-        launch = BatchedBf16Gemm(n=c, k=nope, batch=n, a_row=n * head, a_batch=head, o_row=n * latent, o_batch=latent)
+        launch = BatchedBf16Gemm(n=c, k=nope, batch=n, a_row=n * head, a_batch=head, o_row=o_row, o_batch=latent)
         operands = (Operand("a", torch.bfloat16, f"[rows,{n},{head}]"),
                     Operand("w", torch.bfloat16, f"[{n},{c},{nope}]", note="kv_b k rows per head, transposed"),
-                    Operand("out", torch.bfloat16, f"[rows,{n},{latent}]", "out"))
+                    Operand("out", torch.bfloat16, f"[rows,{n},{latent}]" if query_row is None
+                            else f"[rows,{o_row // latent},{latent}] (first {n} heads)", "out"))
     elif stage == "values":
         v = g.v_head_dim
         launch = BatchedBf16Gemm(n=v, k=c, batch=n, a_row=n * c, a_batch=c, o_row=n * v, o_batch=v)
@@ -329,7 +348,8 @@ def compile_kv_b_aot(g: Ml4Geometry = ML4, *, stage: str, rope: bool, max_rows: 
     else:
         raise ValueError("kv_b stage must be absorb or values")
     return compile_program(
-        launch, name=f"ml4_{stage}" + ("" if rope or stage == "values" else "_nope"), operands=operands,
+        launch, name=f"ml4_{stage}" + ("" if rope or stage == "values" else "_nope")
+        + ("" if query_row is None else "_context"), operands=operands,
         scalars=(Scalar("rows"),), key=(launch.key(), int(max_rows)),
         geometry=dict(stage=stage, rope=bool(rope), heads=n, nope=nope, latent=latent, max_rows=int(max_rows)),
         doc=__doc__)

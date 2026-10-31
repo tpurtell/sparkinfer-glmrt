@@ -529,7 +529,10 @@ def compile_sparse_mla_partial_aot(g=GLM53, *, max_rows: int, head_begin: int = 
     return compile_program(launch, name="sparse_mla_partial", operands=operands,
                            scalars=(Scalar("rows"),),
                            key=(g.heads, launch.qk, launch.topk, launch.extra_topk,
-                                head_begin, head_count, max_rows, launch.splits, launch.record_bytes),
+                                head_begin, head_count, max_rows, launch.splits, launch.record_bytes,
+                                # The softmax scale is a geometry fact (GLM's 256^-0.5, Mistral Large 4's
+                                # 128^-0.5 at the same record): two scales are two programs.
+                                float(launch.scale)),
                            geometry={"heads": g.heads, "head_begin": head_begin, "head_count": head_count,
                                      "record_bytes": launch.record_bytes, "num_splits": launch.splits},
                            scratch={"scratch": launch.scratch_bytes}, doc=compile_sparse_mla_partial_aot.__doc__)

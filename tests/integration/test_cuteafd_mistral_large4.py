@@ -528,3 +528,57 @@ def test_draft_layer_attention_through_the_shared_mla_draft_path():
     cosine = torch.nn.functional.cosine_similarity(actual.float().cpu(), expected, dim=-1)
     print(f"ML4 MLA draft layer attention: cosine min {float(cosine.min()):.6f}")
     assert cosine.min() > 0.995, float(cosine.min())
+
+
+@pytest.mark.parametrize("rope", [True, False])
+def test_head_split_context_query_equals_the_whole_query_of_its_heads(rope):
+    """Each 32-head share (``ml4_2``) writes its heads' absorbed query, RoPE tail included,
+    into the combined two-GPU query (``_context``: token rows 2 x 32 x latent apart). Both
+    shares together equal the 64-head programs' query exactly; the stride never moves bytes
+    outside a share's heads."""
+    device = require_b12x()
+    from b12x.integration.cuteafd.mistral_large4 import ML4, ML4_TP2, compile_kv_b_aot, compile_query_scale_aot
+
+    rows, heads, latent = 40, ML4.heads, 512 + (64 if rope else 0)
+    nope = ML4.nope_dim(rope)
+    gen = torch.Generator().manual_seed(21)
+    q = (torch.randn(rows, heads, 128, generator=gen) * 2).bfloat16()
+    s = (torch.rand(heads, generator=gen) * 0.3).bfloat16()
+    b = (0.8 + torch.rand(heads, generator=gen) * 0.4).bfloat16()
+    w_uk = (torch.randn(heads, 512, nope, generator=gen) * 0.05).bfloat16()
+    positions = _positions(rows, "cpu")
+    d = lambda t: t.to(device)
+    table = d(_cos_sin_table(positions))
+
+    whole_q, whole = d(q), torch.full((rows, heads, latent), float("nan"), dtype=torch.bfloat16, device=device)
+    compile_query_scale_aot(ML4, rope=rope, max_rows=64).launch(
+        whole_q, d(positions), table, d(s), d(b), whole if rope else d(torch.empty(1, dtype=torch.bfloat16)),
+        scalars=(rows,))
+    compile_kv_b_aot(ML4, stage="absorb", rope=rope, max_rows=64).launch(whole_q, d(w_uk), whole, scalars=(rows,))
+
+    row = heads * latent
+    combined = torch.full((rows, heads, latent), float("nan"), dtype=torch.bfloat16, device=device)
+    scale = (compile_query_scale_aot(ML4_TP2, rope=True, max_rows=64, query_row=row) if rope
+             else compile_query_scale_aot(ML4_TP2, rope=False, max_rows=64))
+    absorb = compile_kv_b_aot(ML4_TP2, stage="absorb", rope=rope, max_rows=64, query_row=row)
+    half = heads // 2
+    for share in (0, 1):
+        sl = slice(share * half, (share + 1) * half)
+        part_q = d(q[:, sl].contiguous())
+        out = combined[:, sl]
+        scale.launch(part_q, d(positions), table, d(s[sl].contiguous()), d(b[sl].contiguous()),
+                     out if rope else d(torch.empty(1, dtype=torch.bfloat16)), scalars=(rows,))
+        absorb.launch(part_q, d(w_uk[sl].contiguous()), out, scalars=(rows,))
+    torch.cuda.synchronize()
+    assert torch.equal(combined.cpu(), whole.cpu())
+
+
+def test_head_split_context_strides_refuse_misuse():
+    require_b12x()
+    from b12x.integration.cuteafd.mistral_large4 import ML4_TP2, compile_kv_b_aot, compile_query_scale_aot
+    with pytest.raises(ValueError):
+        compile_query_scale_aot(ML4_TP2, rope=False, max_rows=64, query_row=2 * 32 * 512)
+    with pytest.raises(ValueError):
+        compile_query_scale_aot(ML4_TP2, rope=True, max_rows=64, query_row=32 * 576 - 576)
+    with pytest.raises(ValueError):
+        compile_kv_b_aot(ML4_TP2, stage="values", rope=True, max_rows=64, query_row=2 * 32 * 128)
