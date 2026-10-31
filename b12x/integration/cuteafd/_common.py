@@ -593,6 +593,7 @@ _TORCH_TO_CUTE = {
     torch.int64: cutlass.Int64,
     torch.uint8: cutlass.Uint8,
     torch.uint32: cutlass.Uint32,
+    torch.uint64: cutlass.Uint64,
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
 }
 
