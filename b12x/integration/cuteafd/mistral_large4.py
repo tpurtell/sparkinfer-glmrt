@@ -79,8 +79,8 @@ from ._glm_kernels import (BatchedBf16Gemm, GlmIndexPost, GlmRankNormPackKV, _bl
 from ._query_scale import QueryScale
 
 __all__ = ["ML4", "Ml4Geometry", "LayerNormBias", "compile_index_post_aot", "compile_layer_norm_aot",
-           "compile_kv_b_aot", "compile_query_scale_aot", "compile_rank_pack_aot", "compile_sparse_mla_aot",
-           "nope_attention", "rope_attention"]
+           "compile_index_q_fp8_aot", "compile_kv_b_aot", "compile_query_scale_aot", "compile_rank_pack_aot",
+           "compile_sparse_mla_aot", "nope_attention", "rope_attention"]
 
 
 @dataclass(frozen=True)
@@ -331,3 +331,64 @@ def compile_kv_b_aot(g: Ml4Geometry = ML4, *, stage: str, rope: bool, max_rows: 
         scalars=(Scalar("rows"),), key=(launch.key(), int(max_rows)),
         geometry=dict(stage=stage, rope=bool(rope), heads=n, nope=nope, latent=latent, max_rows=int(max_rows)),
         doc=__doc__)
+
+
+class _IndexQueryFp8:
+    """``out = LayerNorm(h) @ dequant(wq_b)^T`` over the checkpoint's own FP8 block-128
+    ``wq_b`` (E4M3 ``[I*128, hidden]`` and its 128x128 FP32 scale grid): GLM's FP8-only
+    projection (``Fp8Projection``) at the direct indexer query's K = hidden. Decode runs
+    W8A16 at the decode GEMV capacity; prefill takes the W8A8/W8A16 switch scalar."""
+
+    def __init__(self, g: Ml4Geometry, prefill_rows: int | None):
+        from ._fp8_weights import Fp8Projection
+        self.g, self.prefill = g, prefill_rows is not None
+        self.proj = Fp8Projection(g.index_heads * g.index_head_dim, g.hidden, prefill_rows=prefill_rows)
+
+    def key(self) -> tuple:
+        return ("ml4_index_q_fp8", self.proj.key())
+
+    def scratch_bytes(self, rows: int) -> int:
+        return self.proj.prefill_scratch_bytes(rows)
+
+    @cute.jit
+    def body(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+             scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.proj(x, w_fp8, scale, out, rows, fp8_rows, Int64(scratch.toint()), stream)
+
+
+class _IndexQueryFp8Decode(_IndexQueryFp8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        from ._fp8_weights import FP8_DECODE_ROWS
+        self.body(x, w_fp8, scale, out, scratch, rows, Int32(FP8_DECODE_ROWS), stream)
+
+
+class _IndexQueryFp8Prefill(_IndexQueryFp8):
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w_fp8: cute.Pointer, scale: cute.Pointer, out: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, fp8_rows: Int32, stream: cuda.CUstream):
+        self.body(x, w_fp8, scale, out, scratch, rows, fp8_rows, stream)
+
+
+def compile_index_q_fp8_aot(g: Ml4Geometry = ML4, *, mode: str, max_rows: int):
+    """The indexer query projection over a checkpoint that keeps ``indexer.wq_b`` in its
+    shipped FP8 block-128 form (``ml4_index_q``): ``x`` is the indexer's LayerNorm output,
+    ``out`` BF16 ``[rows, I*128]`` (then the index query scale). ``mode`` ``decode`` or
+    ``prefill`` as GLM's FP8-only programs."""
+    from ._fp8_weights import check_w8_mode, fp8_only_operands, w8_scalars
+    if int(max_rows) <= 0:
+        raise ValueError("max_rows must be positive")
+    prefill = check_w8_mode(mode) == "prefill"
+    launch = (_IndexQueryFp8Prefill if prefill else _IndexQueryFp8Decode)(g, int(max_rows) if prefill else None)
+    n, k = g.index_heads * g.index_head_dim, g.hidden
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        *fp8_only_operands("w_iq", n, k, prefill=prefill),
+        Operand("out", torch.bfloat16, f"[rows,{n}]", "out"),
+        Operand("scratch", torch.uint8, "[index_q_scratch_bytes]", "scratch"),
+    )
+    return compile_program(
+        launch, name="ml4_index_q", operands=operands, scalars=w8_scalars(prefill),
+        key=(int(max_rows), mode, launch.key()), scratch={"scratch": launch.scratch_bytes},
+        geometry=dict(outputs=n, width=k, max_rows=int(max_rows), fp8_weights="only", mode=mode), doc=__doc__)

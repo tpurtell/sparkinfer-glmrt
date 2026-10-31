@@ -307,3 +307,60 @@ def test_attention_layer_chain_matches_official(rope):
     cosine = torch.nn.functional.cosine_similarity(actual, expected, dim=-1)
     print(f"ML4 attention chain rope={rope}: cosine min {float(cosine.min()):.6f} mean {float(cosine.mean()):.6f}")
     assert cosine.min() > 0.995, float(cosine.min())
+
+
+def _fp8_block_weights(n, k, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    w8 = (torch.randn((n, k), generator=gen, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    # Power-of-two block scales, like the official qscale_weight grid.
+    s = torch.exp2(torch.randint(-12, -6, ((n + 127) // 128, k // 128), generator=gen, device="cuda").float())
+    grown = s.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
+    return w8, s, (w8.float() * grown).bfloat16()
+
+
+@pytest.mark.parametrize("mode,rows", [("decode", 1), ("decode", 16), ("decode", 40), ("decode", 64),
+                                       ("prefill", 300)])
+def test_index_q_fp8_equals_the_bf16_projection_of_the_dequantized_weight(mode, rows):
+    """ml4_index_q over the shipped FP8 block-128 wq_b: decode (GEMV to 16 rows, W8A16
+    above) and prefill W8A16 equal the BF16 projection over bf16(w * s) bitwise, the
+    reference's Fp8Dequantize followed by its BF16 linear up to GEMM order; prefill W8A8
+    matches its own activation-quantized float reference."""
+    device = require_b12x()
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import RoutedFp8Projection
+    from b12x.integration.cuteafd.mistral_large4 import ML4, compile_index_q_fp8_aot
+
+    n, k = ML4.index_heads * ML4.index_head_dim, ML4.hidden
+    w8, s, wd = _fp8_block_weights(n, k, rows)
+    x = torch.randn((rows, k), device=device).bfloat16()
+    program = compile_index_q_fp8_aot(ML4, mode=mode, max_rows=64 if mode == "decode" else 4096)
+    scratch = torch.empty(max(program.scratch_bytes(rows)["scratch"], 16), dtype=torch.uint8, device=device)
+    out = torch.empty((rows, n), dtype=torch.bfloat16, device=device)
+    ref = torch.empty_like(out)
+    if mode == "decode":
+        program.launch(x, w8, s, out, scratch, scalars=(rows,))
+        routed = compile_program(RoutedFp8Projection(n, k), name="ml4_iq_ref", operands=(
+            Operand("x", torch.bfloat16, "x"), Operand("wb", torch.bfloat16, "wb"),
+            Operand("w", torch.float8_e4m3fn, "w"), Operand("s", torch.float32, "s", align=4),
+            Operand("o", torch.bfloat16, "o", "out")), scalars=(Scalar("rows"),), key=("ml4_iq_ref",))
+        routed.launch(x, wd, w8, s, ref, scalars=(rows,))
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref)
+        return
+    program.launch(x, w8, s, out, scratch, scalars=(rows, 0))
+    bf16 = compile_program(TmaBf16Projection(n, k), name="ml4_iq_bf16", operands=(
+        Operand("x", torch.bfloat16, "x"), Operand("w", torch.bfloat16, "w"),
+        Operand("o", torch.bfloat16, "o", "out")), scalars=(Scalar("rows"),), key=("ml4_iq_bf16",))
+    bf16.launch(x, wd, ref, scalars=(rows,))
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref), "prefill W8A16"
+    program.launch(x, w8, s, out, scratch, scalars=(rows, 1))
+    torch.cuda.synchronize()
+    xb = x.float().view(rows, k // 128, 128)
+    amax = xb.abs().amax(-1, keepdim=True)
+    sx = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+    qx = ((xb / sx).to(torch.float8_e4m3fn).float() * sx).view(rows, k)
+    expected = qx @ wd.float().t()
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), expected.flatten(), dim=0)
+    assert cos > 0.99999, float(cos)
