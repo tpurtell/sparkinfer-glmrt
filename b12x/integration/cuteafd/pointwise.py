@@ -87,7 +87,8 @@ class AffineNorm:
     values with zero padding. Both use ascending XOR reduction and FMA lanes.
     Other norms use a fixed striped scalar sum independent of live rows.
     """
-    def __init__(self, width, heads, eps, zero_centered, subtract_mean, bias, rotary):
+    def __init__(self, width, heads, eps, zero_centered, subtract_mean, bias, rotary,
+                 round_normalized_before_weight=False):
         if width <= 0 or heads <= 0 or rotary < 0 or rotary > width or rotary % 2:
             raise ValueError("invalid affine norm geometry")
         if width == 192 and rotary not in (0, 64, 192):
@@ -96,6 +97,7 @@ class AffineNorm:
         self.width, self.heads, self.eps = int(width), int(heads), float(eps)
         self.zero_centered, self.subtract_mean, self.bias = zero_centered, subtract_mean, bias
         self.rotary = int(rotary)
+        self.round_normalized_before_weight = bool(round_normalized_before_weight)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
@@ -110,7 +112,11 @@ class AffineNorm:
         w = Float32(weight[dim])
         if cutlass.const_expr(self.zero_centered):
             w = _add(w, Float32(1.0))
-        value = _mul(_mul(_sub(Float32(x[base + Int64(dim)]), mean), inv), w)
+        if cutlass.const_expr(self.round_normalized_before_weight):
+            normalized = _mul(_sub(Float32(x[base + Int64(dim)]), mean), inv)
+            value = _mul(Float32(normalized.to(BFloat16)), w)
+        else:
+            value = _mul(_mul(_sub(Float32(x[base + Int64(dim)]), mean), inv), w)
         if cutlass.const_expr(self.bias):
             value = _add(value, Float32(bias[dim]))
         return _bf16(value)
@@ -586,7 +592,25 @@ def compile_bf16_scaled_projection_aot(*, width, outputs, prescale):
 
 def compile_affine_norm_aot(*, width, heads=1, eps=1e-5, zero_centered=False,
                             subtract_mean=False, bias=False, rotary=0,
-                            input_dtype=torch.float32, parameter_dtype=torch.float32):
+                            input_dtype=torch.float32, parameter_dtype=torch.float32,
+                            round_normalized_before_weight=False):
+    if round_normalized_before_weight:
+        if (eps is None or zero_centered or subtract_mean or bias or rotary
+                or input_dtype is not torch.bfloat16 or parameter_dtype is not torch.bfloat16):
+            raise ValueError("BF16-before-gamma requires constant-epsilon plain BF16 RMSNorm")
+        launch = AffineNorm(width, heads, eps, False, False, False, 0,
+                            round_normalized_before_weight=True)
+        return compile_program(launch, name="affine_norm_bf16_before_gamma", operands=(
+            Operand("x", torch.bfloat16, f"[rows,{heads},{width}]"),
+            Operand("weight", torch.bfloat16, f"[{width}]"),
+            Operand("bias", torch.bfloat16, "ignored"),
+            Operand("cos", torch.bfloat16, "ignored"),
+            Operand("sin", torch.bfloat16, "ignored"),
+            Operand("positions", torch.int64, "ignored"),
+            Operand("out", torch.bfloat16, f"[rows,{heads},{width}]", "out")),
+            scalars=(Scalar("rows"),), key=(width, heads, eps),
+            geometry=dict(width=width, heads=heads, eps=eps,
+                          round_normalized_before_weight=True))
     # None explicitly selects the scalar ABI; the historical default stays constant.
     launch = (RuntimeAffineNorm(width, heads, 1.0, zero_centered, subtract_mean, bias, rotary,
                                 vector_io=input_dtype is torch.float32
