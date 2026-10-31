@@ -17,6 +17,7 @@ from .activations import (
     is_gated_moe_activation,
     moe_activation_w1_rows,
     normalize_moe_activation,
+    reject_trellis_only_activation,
 )
 from .reference import (
     _E8M0_K32_BF16_MAX_SCALE_BYTE,
@@ -79,6 +80,7 @@ def _interleave_flashinfer_w1_w3_rows(
     activation: str,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
+    reject_trellis_only_activation(activation, "FlashInfer reference")
     if not is_gated_moe_activation(activation):
         return tensor.contiguous()
     # This preparation helper has a fixed checkpoint-native source contract:
@@ -115,6 +117,7 @@ def prepare_flashinfer_trtllm_fp4_e8m0_k32_weights(
     FlashInfer's ABI carrier for the interleaved byte storage.
     """
     activation = normalize_moe_activation(activation)
+    reject_trellis_only_activation(activation, "FlashInfer reference")
     if activation in {SITU, SWIGLUOAI_UNINTERLEAVE}:
         raise NotImplementedError(
             f"FlashInfer TRT-LLM FP4 preparation does not support {activation}"
@@ -256,6 +259,7 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer(
     scale_byte_clamp: int | None = _E8M0_K32_BF16_MAX_SCALE_BYTE,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
+    reject_trellis_only_activation(activation, "FlashInfer reference")
     if activation in {SITU, SWIGLUOAI_UNINTERLEAVE}:
         raise NotImplementedError(
             f"FlashInfer TRT-LLM FP4 oracle does not support {activation}"
@@ -303,6 +307,7 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared(
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
+    reject_trellis_only_activation(activation, "FlashInfer reference")
     if activation == SWIGLUOAI_UNINTERLEAVE:
         raise NotImplementedError(
             "FlashInfer TRT-LLM FP4 oracle does not support swigluoai_uninterleave"

@@ -68,6 +68,7 @@ from b12x.moe._shared.kernels.activations import (
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     normalize_moe_activation,
+    reject_trellis_only_activation,
     normalize_swiglu_alpha_for_activation,
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
@@ -409,6 +410,7 @@ class MoEMicroKernelBackend:
         trellis_coupled: bool = False,
     ):
         activation = normalize_moe_activation(activation)
+        reject_trellis_only_activation(activation, "micro MoE")
         if int(compile_time_phase) not in {0, 1, 2}:
             raise ValueError(f"unsupported direct micro phase {compile_time_phase!r}")
         if scale_format not in {"e4m3_k16", "e8m0_k32"}:

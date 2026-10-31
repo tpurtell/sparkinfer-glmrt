@@ -170,3 +170,37 @@ def test_compact_true_width_weights_match_padded_control(intermediate, tile_k, a
             run_bound_mixed_trellis(x[:rows], weights[:rows], ids[:rows], *plans[1])
             torch.cuda.synchronize()
             assert torch.equal(saved[:rows], got[:rows])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+                    reason="requires SM120/SM121")
+@pytest.mark.parametrize("rows", [96, 256])
+@pytest.mark.parametrize("activation,limit", [("silu_post_clamp", 7.0), ("silu", None)])
+def test_ws_prefill_k4_k6_matches_cooperative(rows, activation, limit):
+    """Step-5 K4/K6 routed tiers: WS prefill is byte-exact with cooperative."""
+    torch.manual_seed(611)
+    device = torch.device("cuda", 0)
+    props = torch.cuda.get_device_properties(device)
+    hidden, intermediate = 512, 256
+    tile = (64, 128, 64, 256)
+    tiers = tuple(_prepared(experts=2, hidden=hidden, intermediate=intermediate,
+        bits=bits, seed=bits * 97, device=device, tile_config=(64, 128, 64, 128)) for bits in (4, 6))
+    mapping, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
+    rotations = combine_trellis_rotations(*tiers)
+    args = dict(size_m=rows, hidden_size=hidden, intermediate_size=intermediate,
+        tier0_num_experts=2, tier1_num_experts=2, top_k=2, max_m_blocks=64,
+        sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
+        force_tile_config=tile, full_rotation_output_dtype="bf16", swiglu_limit=limit,
+        activation=activation, tier0_bits=4, tier1_bits=6, moe_block_size=64)
+    outputs = []
+    x = (torch.randn(rows, hidden, device=device) * 2.0).to(torch.bfloat16)
+    ids = torch.randint(0, 4, (rows, 2), device=device, dtype=torch.int32)
+    weights = torch.softmax(torch.randn(rows, 2, device=device), dim=-1)
+    for ws in (False, True):
+        launch = compile_mixed_trellis(**args, warp_specialized=ws)
+        buffers = make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
+        binding = bind_mixed_trellis(*tiers, mapping, descriptor, rotations, launch)
+        outputs.append(run_bound_mixed_trellis(x, weights, ids, binding, buffers).clone())
+        torch.cuda.synchronize()
+    assert torch.isfinite(outputs[0]).all() and outputs[0].abs().max() > 0
+    assert torch.equal(outputs[0], outputs[1])

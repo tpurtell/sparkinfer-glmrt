@@ -127,6 +127,7 @@ from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
 )
 from b12x.moe._shared.kernels.activations import (
+    SILU_POST_CLAMP,
     SITU,
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
@@ -6690,6 +6691,7 @@ class W4A16FusedMoeKernel:
         self.activation_is_gated = is_gated
         self.activation_is_situ = activation == SITU
         self.activation_is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
+        self.activation_is_post_clamp = activation == SILU_POST_CLAMP
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
         self.swiglu_alpha = float(swiglu_alpha)
@@ -7017,8 +7019,10 @@ class W4A16FusedMoeKernel:
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             neg_limit = cutlass.Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
+            # silu_post_clamp bounds SiLU(gate) afterwards (``_gated_silu``).
+            if cutlass.const_expr(not self.activation_is_post_clamp):
+                if gate > limit:
+                    gate = limit
             if up > limit:
                 up = limit
             if up < neg_limit:
@@ -8186,10 +8190,10 @@ class W4A16FusedMoeKernel:
                         * cute.math.tanh(b3 / linear_beta, fastmath=self.fast_math)
                     )
                 else:
-                    aa0 = self._silu_f32(a0) * a1
-                    aa1 = self._silu_f32(a2) * a3
-                    bb0 = self._silu_f32(b0) * b1
-                    bb1 = self._silu_f32(b2) * b3
+                    aa0 = self._gated_silu(a0) * a1
+                    aa1 = self._gated_silu(a2) * a3
+                    bb0 = self._gated_silu(b0) * b1
+                    bb1 = self._gated_silu(b2) * b3
 
                 source0 = (lane & Int32(15)) << Int32(1)
                 source1 = source0 + Int32(1)
@@ -8359,10 +8363,10 @@ class W4A16FusedMoeKernel:
                         * sd3
                     )
                 else:
-                    a0 = self._silu_f32(ig0) * iu0 * sd0
-                    a1 = self._silu_f32(ig1) * iu1 * sd1
-                    a2 = self._silu_f32(ig2) * iu2 * sd2
-                    a3 = self._silu_f32(ig3) * iu3 * sd3
+                    a0 = self._gated_silu(ig0) * iu0 * sd0
+                    a1 = self._gated_silu(ig1) * iu1 * sd1
+                    a2 = self._gated_silu(ig2) * iu2 * sd2
+                    a3 = self._gated_silu(ig3) * iu3 * sd3
                 o0, o1, o2, o3 = self._had128_quad(a0, a1, a2, a3, lane)
                 if cutlass.const_expr(self.activation_output_a8):
                     # Quantize only after SVD/SwiGLU/SUD and H128. Each warp
@@ -8556,10 +8560,10 @@ class W4A16FusedMoeKernel:
                                     * sd3
                                 )
                             else:
-                                a0 = self._silu_f32(ig0) * iu0 * sd0
-                                a1 = self._silu_f32(ig1) * iu1 * sd1
-                                a2 = self._silu_f32(ig2) * iu2 * sd2
-                                a3 = self._silu_f32(ig3) * iu3 * sd3
+                                a0 = self._gated_silu(ig0) * iu0 * sd0
+                                a1 = self._gated_silu(ig1) * iu1 * sd1
+                                a2 = self._gated_silu(ig2) * iu2 * sd2
+                                a3 = self._gated_silu(ig3) * iu3 * sd3
                             o0, o1, o2, o3 = self._had128_quad(a0, a1, a2, a3, lane)
                             out_base = row * isz + col0
                             st_global_v2_u32(
@@ -8772,6 +8776,16 @@ class W4A16FusedMoeKernel:
         return x * self._sigmoid_f32(x)
 
     @cute.jit
+    def _gated_silu(self, x: cutlass.Float32) -> cutlass.Float32:
+        """SiLU of the (already clamped) gate; silu_post_clamp bounds it here."""
+        silu = self._silu_f32(x)
+        if cutlass.const_expr(self.activation_is_post_clamp):
+            limit = cutlass.Float32(self.swiglu_limit)
+            if silu > limit:
+                silu = limit
+        return silu
+
+    @cute.jit
     def _run_activation(
         self,
         fc1_bf16_flat: cute.Tensor,
@@ -8852,10 +8866,10 @@ class W4A16FusedMoeKernel:
                 sd1 = rot_scales_flat[s_base + d2 + Int32(1)].to(cutlass.Float32)
                 sd2 = rot_scales_flat[s_base + d2 + Int32(2)].to(cutlass.Float32)
                 sd3 = rot_scales_flat[s_base + d2 + Int32(3)].to(cutlass.Float32)
-                a0 = self._silu_f32(ig2_0) * iu2_0 * sd0
-                a1 = self._silu_f32(ig2_1) * iu2_1 * sd1
-                a2 = self._silu_f32(ig2_2) * iu2_2 * sd2
-                a3 = self._silu_f32(ig2_3) * iu2_3 * sd3
+                a0 = self._gated_silu(ig2_0) * iu2_0 * sd0
+                a1 = self._gated_silu(ig2_1) * iu2_1 * sd1
+                a2 = self._gated_silu(ig2_2) * iu2_2 * sd2
+                a3 = self._gated_silu(ig2_3) * iu2_3 * sd3
                 # blockwise-128 Hadamard on the activation (post-silu, input side)
                 o0, o1, o2, o3 = self._had128_quad(a0, a1, a2, a3, lane)
                 out_base = row * isz + col0
@@ -8904,6 +8918,11 @@ class W4A16FusedMoeKernel:
                     activated_bf16_flat[idx] = self._cast_elem(situ_gate * situ_up)
                 elif cutlass.const_expr(self.activation_is_swigluoai):
                     activated_bf16_flat[idx] = self._cast_elem(silu * up_term)
+                elif cutlass.const_expr(self.activation_is_post_clamp):
+                    limit = cutlass.Float32(self.swiglu_limit)
+                    if silu > limit:
+                        silu = limit
+                    activated_bf16_flat[idx] = self._cast_elem(silu * up_term)
                 else:
                     activated_bf16_flat[idx] = self._cast_elem(
                         self._cast_elem(silu) * self._cast_elem(up_term)
@@ -8949,6 +8968,7 @@ class W4A16ActivationKernel:
         self.is_gated = is_gated
         self.is_situ = activation == SITU
         self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
+        self.is_post_clamp = activation == SILU_POST_CLAMP
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_limit = 0.0 if swiglu_limit is None else swiglu_limit
         self.swiglu_alpha = float(swiglu_alpha)
@@ -8990,8 +9010,10 @@ class W4A16ActivationKernel:
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
             neg_limit = cutlass.Float32(-self.swiglu_limit)
-            if gate > limit:
-                gate = limit
+            # silu_post_clamp bounds SiLU(gate) afterwards (``_gated_silu``).
+            if cutlass.const_expr(not self.is_post_clamp):
+                if gate > limit:
+                    gate = limit
             if up > limit:
                 up = limit
             if up < neg_limit:
@@ -9060,6 +9082,11 @@ class W4A16ActivationKernel:
                     )
                     activated_flat[idx] = self._cast_elem(situ_gate * situ_up)
                 elif cutlass.const_expr(self.is_swigluoai):
+                    activated_flat[idx] = self._cast_elem(silu * up_term)
+                elif cutlass.const_expr(self.is_post_clamp):
+                    limit = cutlass.Float32(self.swiglu_limit)
+                    if silu > limit:
+                        silu = limit
                     activated_flat[idx] = self._cast_elem(silu * up_term)
                 else:
                     activated_flat[idx] = self._cast_elem(
