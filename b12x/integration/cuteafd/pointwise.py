@@ -386,6 +386,27 @@ class PostSilu:
                 Float32(gate_up[base + Int64(self.width)]), self.limit)).to(BFloat16)
 
 
+class PostSiluSplit:
+    """``PostSilu`` over separate gate and up planes: independently calibrated
+    native projections write separate rows; the arithmetic is identical."""
+    def __init__(self, width, limit):
+        self.width, self.limit = int(width), float(limit)
+
+    @cute.jit
+    def __call__(self, gate: cute.Pointer, up: cute.Pointer, out: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        self.kernel(gate, up, out, Int64(rows) * Int64(self.width)).launch(
+            grid=((Int64(rows) * Int64(self.width) + Int64(255)) // Int64(256), 1, 1),
+            block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, gate: cute.Pointer, up: cute.Pointer, out: cute.Pointer, count: Int64):
+        gate, up, out = _view(gate), _view(up), _view(out)
+        i = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
+        if i < count:
+            out[i] = Float32(_post_silu_product(Float32(gate[i]), Float32(up[i]), self.limit)).to(BFloat16)
+
+
 class ScaleProjection:
     def __init__(self, width, outputs, prescale):
         from ._glm_kernels import glm_projection
@@ -485,6 +506,17 @@ def compile_post_silu_aot(*, width, limit):
     _positive("limit", limit)
     return compile_program(PostSilu(width, limit), name="post_silu_product", operands=(
         Operand("gate_up", torch.bfloat16, f"[rows,{2 * width}] (gate first)"),
+        Operand("out", torch.bfloat16, f"[rows,{width}]", "out")),
+        scalars=(Scalar("rows"),), key=(width, limit), geometry=dict(width=width, limit=limit))
+
+
+def compile_post_silu_split_aot(*, width, limit):
+    if width <= 0:
+        raise ValueError("width must be positive")
+    _positive("limit", limit)
+    return compile_program(PostSiluSplit(width, limit), name="post_silu_split", operands=(
+        Operand("gate", torch.bfloat16, f"[rows,{width}]"),
+        Operand("up", torch.bfloat16, f"[rows,{width}]"),
         Operand("out", torch.bfloat16, f"[rows,{width}]", "out")),
         scalars=(Scalar("rows"),), key=(width, limit), geometry=dict(width=width, limit=limit))
 

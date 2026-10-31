@@ -119,6 +119,21 @@ def test_native_head_gate_and_post_silu(rows):
     assert torch.equal(product, ref)
 
 
+@pytest.mark.parametrize("rows,width,limit", [(1, 1536, 7.0), (17, 1536, 7.0), (33, 13824, 10.0)])
+def test_post_silu_split_matches_packed_bitwise(rows, width, limit):
+    """Separately stored gate/up planes (native K6 projections) give the packed result."""
+    require_b12x()
+    from b12x.integration.cuteafd.pointwise import compile_post_silu_aot, compile_post_silu_split_aot
+    gen = torch.Generator(device="cuda").manual_seed(911)
+    gu = (torch.randn(rows, 2 * width, generator=gen, device="cuda") * 9).bfloat16()
+    packed = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
+    split = torch.empty_like(packed)
+    compile_post_silu_aot(width=width, limit=limit).launch(gu, packed, scalars=[rows])
+    gate, up = (part.contiguous() for part in gu.chunk(2, dim=-1))
+    compile_post_silu_split_aot(width=width, limit=limit).launch(gate, up, split, scalars=[rows])
+    assert torch.equal(split, packed)
+
+
 def test_router_weights_keep_subtract_bias_rounding():
     require_b12x()
     from b12x.integration.cuteafd.pointwise import compile_route_weights_aot
