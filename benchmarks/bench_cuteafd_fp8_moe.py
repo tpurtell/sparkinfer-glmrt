@@ -193,6 +193,7 @@ def parse_args(argv=None):
     parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE[:SPLIT]",
                         help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
     parser.add_argument("--fc1-k-splits", help="development paired native K-team counts, comma-separated 1/2/4/8")
+    parser.add_argument("--fc1-cta-splits", help="development MiMo unification CTA splits, comma-separated 1/2/4/8")
     parser.add_argument("--control-repeats", type=int, default=2,
                         help="identical padded controls in the tiling screen, including its reference")
     args = parser.parse_args(argv)
@@ -206,6 +207,15 @@ def parse_args(argv=None):
         if (not splits or len(set(splits)) != len(splits) or any(value not in (1, 2, 4, 8) for value in splits)
                 or not args.mxfp4_pair or not (args.mxfp4_unify or args.native_slices)):
             parser.error("FC1 K splits require native paired mode and unique 1/2/4/8 values")
+    if args.fc1_cta_splits is not None:
+        try:
+            cta_splits = [int(value) for value in args.fc1_cta_splits.split(",")]
+        except ValueError:
+            parser.error("FC1 CTA splits must be comma-separated 1/2/4/8")
+        if (not cta_splits or len(set(cta_splits)) != len(cta_splits)
+                or any(value not in (1, 2, 4, 8) for value in cta_splits)
+                or not args.mxfp4_pair or not args.mxfp4_unify):
+            parser.error("FC1 CTA splits require MiMo unification mode and unique 1/2/4/8 values")
     if args.continue_on_fail and (not args.check or args.exact_sweep):
         parser.error("--continue-on-fail requires --check and no --exact-sweep")
     if args.exact_baseline and not args.exact_sweep:
@@ -269,6 +279,12 @@ def parse_args(argv=None):
             allowed |= {f"native-{precision}-t{tile}-k{split}"
                         for tile, split in fc1_split_tiles(4096 if args.geometry == "mimof" else 6144,
                                                          map(int, args.fc1_k_splits.split(",")))
+                        for precision in ("a8", "a16")}
+        if args.mxfp4_unify and args.fc1_cta_splits:
+            allowed |= {f"native-{precision}-t64-k{team}-z{cta}"
+                        for team in map(int, (args.fc1_k_splits or "1").split(","))
+                        for cta in map(int, args.fc1_cta_splits.split(","))
+                        if (32 if args.geometry == "mimof" else 48) % (team * cta) == 0
                         for precision in ("a8", "a16")}
         explicit_profile = bool(args.mxfp4_arm and args.mxfp4_tilings)
         if explicit_profile:
@@ -899,6 +915,7 @@ def mxfp4_pair_screen(g, args):
 
 def mxfp4_unify_screen(g, args, geometry_type):
     """Compare complete native wire-input arms to the installed mixed generic math."""
+    from b12x.moe._shared.kernels.v41_slice_pipeline import fc1_partial_words
     from b12x.integration.cuteafd.fp8_moe import (
         _Fp8Moe, DECODE_MAX_ROWS, auto_large_rows, fp8_moe_scratch_bytes, compile_fp8_moe_aot,
     )
@@ -964,19 +981,26 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 owned.append((buffers, execute))
             contract = dict(swiglu_limit=0., silu_bf16_product=True,
                             route_weight_before_fc2=False, round_fc2_bf16=True)
-            variants = {"native-" + precision: (precision, 128, 1) for precision in ("a8", "a16")}
+            variants = {"native-" + precision: (precision, 128, 1, 1) for precision in ("a8", "a16")}
             if args.fc1_k_splits:
                 for tile, split in fc1_split_tiles(g.hidden, map(int, args.fc1_k_splits.split(","))):
                     for precision in ("a8", "a16"):
-                        variants[f"native-{precision}-t{tile}-k{split}"] = (precision, tile, split)
+                        variants[f"native-{precision}-t{tile}-k{split}"] = (precision, tile, split, 1)
+            if args.fc1_cta_splits:
+                for team in map(int, (args.fc1_k_splits or "1").split(",")):
+                    for cta in map(int, args.fc1_cta_splits.split(",")):
+                        if (g.hidden // 128) % (team * cta) == 0:
+                            for precision in ("a8", "a16"):
+                                variants[f"native-{precision}-t64-k{team}-z{cta}"] = (precision, 64, team, cta)
             if args.profile_dir:
                 variants = {label: spec for label, spec in variants.items() if label == args.profile_arm}
-            for label, (precision, tile, split) in variants.items():
+            for label, (precision, tile, split, cta) in variants.items():
                 try:
                     runs[label], outputs[label], keep = native_pair_arm(
                         x, ids, routing, weights, scales, tile, True, False, False,
                         activation_precision=precision, projection_contract=contract,
-                        combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split)
+                        combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split,
+                        fc1_cta_splits=cta)
                 except AssertionError as error:
                     raise AssertionError(f"native {label}, rows={rows}, width={width}: {error}") from error
                 owned.append(keep)
@@ -997,7 +1021,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
             references = {"a16": oracle, "a8": mxfp4_f32_reference(
                 x, ids, routing, weights, scales, activation_precision="a8")}
             eligible = {}
-            for label, (precision, _, _) in variants.items():
+            for label, (precision, _, _, _) in variants.items():
                 matched = references[precision]
                 error = f32_errors(outputs[label], matched)
                 normalized_rms = error["rms"] / max(matched.square().mean().sqrt().item(), 1e-8)
@@ -1020,8 +1044,10 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           speedup={label: medians["current"] / medians[label] for label in runs},
                           f32_errors=errors, matched_f32_errors=matched_errors, comparisons=comparisons,
                           invariant_checks="poison/live/graph/row-mix", slice_width=128,
-                          fc1_variants={label: dict(precision=precision, tile=tile, k_splits=split)
-                                        for label, (precision, tile, split) in variants.items()},
+                          fc1_variants={label: dict(precision=precision, tile=tile, k_splits=split,
+                                                    cta_splits=cta, partial_bytes=4 * fc1_partial_words(
+                                                        rows, tile, g.top_k, width, precision, cta))
+                                        for label, (precision, tile, split, cta) in variants.items()},
                           quality_eligible=eligible)
             results.append(record)
             print(json.dumps(record), flush=True)
