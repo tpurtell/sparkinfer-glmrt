@@ -665,16 +665,17 @@ def test_oracle_requires_both_error_metrics_without_slack(error, accepted):
 
 
 @pytest.mark.parametrize("family", ["step5", "ml4"])
-def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family):
+@pytest.mark.parametrize("tier_bits", [(4, 4), (4, 6)])
+def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family, tier_bits):
     scope = oracle_helpers()
     torch = scope["torch"]
     scope["COORDINATOR_FAMILIES"] = {family: dict(hidden=128, experts=3, swiglu_limit=7.0)}
     generator = torch.Generator().manual_seed(12)
-    words = 8 * 8 * 8 * 4
     tiers = []
-    for _ in range(2):
+    for bits in tier_bits:
+        words = 8 * 8 * 8 * bits
         tiers.append(SimpleNamespace(
-            num_experts=3, intermediate_size=128, trellis_bits=4,
+            num_experts=3, intermediate_size=128, trellis_bits=bits,
             w13=torch.randint(-(1 << 31), (1 << 31) - 1, (3 * words,), generator=generator, dtype=torch.int32),
             w2=torch.randint(-(1 << 31), (1 << 31) - 1, (2 * words,), generator=generator, dtype=torch.int32),
             w13_global_scale=torch.tensor([0.8, 1.2, 1.1]), w2_global_scale=torch.tensor([1.3, 0.9])))
@@ -687,8 +688,16 @@ def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family):
     source = torch.randn((4, 128), generator=generator) * 4
     ids = torch.tensor([[0, 1], [1, 2], [2, 0], [0, 2]], dtype=torch.int32)
     weights = torch.tensor([[0.2, 0.8], [0.3, 0.7], [0.4, 0.6], [0.9, 0.1]])
+    native_decode = scope["decode_mcg_matrix"]
+    decoded_bits = []
+    def tracked_decode(payload, rows, columns, bits):
+        decoded_bits.append(bits)
+        assert payload.numel() == rows // 16 * (columns // 16) * 8 * bits
+        return native_decode(payload, rows, columns, bits)
+    scope["decode_mcg_matrix"] = tracked_decode
     actual = scope["coordinator_f32_oracle"]((*tiers, mapping, descriptors.flatten(), rotations),
                                             source, ids, weights, family)
+    assert set(decoded_bits) == set(tier_bits)
     # Independent scalar-route math with a parity-constructed normalized H128.
     h = torch.tensor([[(-1.0) ** ((i & j).bit_count()) for j in range(128)] for i in range(128)]) / 128 ** 0.5
     expected = torch.zeros_like(actual)
@@ -701,10 +710,11 @@ def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family):
                 code = int(descriptors[projection, combined])
                 tier, local = code >> 9, code & 511
                 t = tiers[tier]
+                words = 8 * 8 * 8 * t.trellis_bits
                 offset = (local + ([2, 1][tier] if projection == 1 else 0)) * words
                 payload = t.w13[offset:offset + words] if projection < 2 else t.w2[local * words:(local + 1) * words]
                 scale = t.w13_global_scale[local] if projection < 2 else t.w2_global_scale[local]
-                matrices.append(scope["decode_mcg_matrix"](payload, 128, 128, 4) * scale)
+                matrices.append(native_decode(payload, 128, 128, t.trellis_bits) * scale)
             scales = rotations.intermediate[combined].split(128)
             gate = (((source[row] * rotations.gate_suh[combined]) @ h) @ matrices[0]) @ h * scales[0]
             up = (((source[row] * rotations.up_suh[combined]) @ h) @ matrices[1]) @ h * scales[1]
