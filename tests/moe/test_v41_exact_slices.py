@@ -49,7 +49,8 @@ def pack(weights, scales, exact, *, w2_pitch=None):
     return result
 
 
-def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, coded=False, return_routes=False, fc1_k_splits=1):
+def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, coded=False,
+                 return_routes=False, activation_precision="a8", **contract):
     import cutlass
     import cutlass.cute as cute
     from b12x._lib.utils import current_cuda_stream
@@ -62,30 +63,36 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
     wire[:,:h] = (blocks/scale[...,None]).to(torch.float8_e4m3fn).view(torch.uint8).reshape(m,h)
     wire[:,h:] = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
     routes=m*topk
-    partial_words = 1 if atomic else ((n+width-1)//width)*routes*(width//4+width//32)
+    words_per_route = width // 2 if activation_precision == "a16" else width // 4 + width // 32
+    partial_words = 1 if atomic else ((n+width-1)//width)*routes*words_per_route
     partial_storage = torch.full((partial_words+16,), 12345., device='cuda')
     partial = partial_storage[:partial_words]
     output=torch.empty(m*h if atomic else (routes,h),device='cuda',dtype=torch.float32)
     scratch=[torch.empty(shape,device='cuda',dtype=dtype) for shape,dtype in [
         ((1,),torch.int32),((e*routes,),torch.int32),((e,),torch.int32),((e,2),torch.int32),
         ((routes,19),torch.int32),((routes,),torch.float32),((routes,),torch.int32)]]
-    tensors=[wire[:,:h].view(torch.uint32),wire[:,h:],*packed,ids.flatten(),routing.flatten(),*scratch,partial,output]
+    source = x.contiguous().view(torch.uint32) if activation_precision == "a16" else wire[:,:h].view(torch.uint32)
+    tensors=[source,wire[:,h:],*packed,ids.flatten(),routing.flatten(),*scratch,partial,output]
     def tensor(t):
         from cutlass.cute.runtime import from_dlpack
         return from_dlpack(t,assumed_align=16)
     args=[tensor(t) for t in tensors]
-    fn=cute.compile(V41SlicePipeline(m,width,experts=e,topk=topk,intermediate=n,hidden=h,exact_storage=exact,atomic_tokens=atomic,scale_codes=coded,fc1_k_splits=fc1_k_splits),*args,cutlass.Int32(m),current_cuda_stream())
+    pipeline = V41SlicePipeline(m, width, experts=e, topk=topk, intermediate=n, hidden=h,
+                                exact_storage=exact, atomic_tokens=atomic, scale_codes=coded,
+                                activation_precision=activation_precision, **contract)
+    fn=cute.compile(pipeline,*args,cutlass.Int32(m),current_cuda_stream())
     fn(*args,cutlass.Int32(m),current_cuda_stream())
     torch.cuda.synchronize()
     expected = output.clone()
-    for live in sorted({1, min(17, m), m}):
-        output.fill_(float("nan"))
-        partial.fill_(float("nan"))
+    # Poison persistent storage before a shorter live wave and full replay.
+    for live_rows in sorted({1, min(17, m), m}):
+        output.fill_(float('nan'))
+        partial.fill_(float('nan'))
         for storage in scratch:
             storage.fill_(255)
-        fn(*args,cutlass.Int32(live),current_cuda_stream())
+        fn(*args,cutlass.Int32(live_rows),current_cuda_stream())
         if not atomic:
-            assert torch.equal(output[:live * topk], expected[:live * topk])
+            assert torch.equal(output[:live_rows * topk], expected[:live_rows * topk])
     fn(*args,cutlass.Int32(m),current_cuda_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -103,6 +110,70 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
         assert not atomic
         return output.reshape(m, topk, h)
     return output.reshape(m,topk,h).sum(1) if not atomic else output.reshape(m,h)
+
+
+MIMO_WIDTHS = sorted({32 * (64 // world + extra)
+                      for world in range(2, 9)
+                      for extra in (0, int(64 % world != 0))} | {2048})
+
+
+@pytest.mark.parametrize("n", MIMO_WIDTHS)
+@pytest.mark.parametrize("activation_precision", ["a8", "a16"])
+@pytest.mark.parametrize("coded", [False, True])
+def test_mimo_native_activation_contract(n, activation_precision, coded):
+    require_b12x()
+    import json
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.manual_seed(928160 + n)
+    m, e, h, k, width = 17, 8, 4096, 8, 128
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    packed = pack(weights, scales, True)
+    if coded:
+        packed[1] = pack_scale_codes(torch.cat((scales["w3"], scales["w1"]), 1),
+                                    tensor_name="w13.scale", gated_half_rows=n).view(torch.uint32).flatten().cuda()
+        packed[3] = pack_scale_codes(scales["w2"], tensor_name="w2.scale").view(torch.uint32).flatten().cuda()
+    contract = dict(activation_precision=activation_precision, swiglu_limit=0.,
+                    silu_bf16_product=True, route_weight_before_fc2=False,
+                    round_fc2_bf16=True)
+    actual = run_pipeline(x, ids, routing, packed, width, True, n=n, coded=coded,
+                          return_routes=True, **contract)
+    for capacity in (1, 16):
+        prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed,
+                              width, True, n=n, coded=coded, return_routes=True, **contract)
+        assert torch.equal(prefix, actual[:capacity]), "capacity row invariance"
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], device="cuda")
+    qx = wire_rows(x)[1] if activation_precision == "a8" else x
+    oracle = torch.empty_like(actual)
+    for expert in range(e):
+        selected, slots = torch.where(ids == expert)
+        def dequant(name):
+            codes = weights[name][expert].cuda()
+            values = torch.stack((lut[(codes & 15).long()], lut[(codes >> 4).long()]), -1).flatten(-2)
+            factors = scales[name][expert].cuda().view(torch.float8_e8m0fnu).float()
+            return values * factors.repeat_interleave(32, -1)
+        gate = (qx[selected].float() @ dequant("w1").T).bfloat16()
+        up = (qx[selected].float() @ dequant("w3").T).bfloat16()
+        mid = (torch.nn.functional.silu(gate) * up).bfloat16()
+        if activation_precision == "a8":
+            mid = wire_rows(mid)[1]
+        down = mid.float() @ dequant("w2").T
+        oracle[selected, slots] = down * routing[selected, slots, None]
+    delta = actual - oracle
+    normalized = delta.square().mean().sqrt() / oracle.square().mean().sqrt().clamp_min(1e-8)
+    assert torch.isfinite(actual).all() and normalized < .02, normalized.item()
+    print("mxfp4_mimo_native " + json.dumps(dict(width=n, activation=activation_precision,
+          coded=coded, normalized_rms=normalized.item(), max_abs=delta.abs().max().item(),
+          poison_live_graph=True, capacity_row_invariance=True)), flush=True)
 
 
 @pytest.mark.parametrize('m,width,atomic', [(1,64,False),(16,192,False),(80,192,False),(16,128,False),(256,192,True)])
@@ -196,7 +267,7 @@ def test_ordered_tile32_decode_qualification(h, n, coded):
         operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales)
         control_tile = 192 if coded and n == 288 else 128
         control, control_output, control_owned = native_pair_arm(
-            *operands, control_tile, exact_control, False, coded, qualify=True, fc1_k_splits=1)
+            *operands, control_tile, False, False, coded, qualify=True)
         candidate, output, owned = native_pair_arm(
             *operands, 32, True, False, coded, qualify=True)
         control()
@@ -235,47 +306,7 @@ def test_ordered_tile32_synthetic_oracle_seeds(weight_seed, h, n, coded):
                             "mxfp4_tile32_synthetic_oracle")
 
 
-@pytest.mark.parametrize("n,exact", [(384, False), (384, True), (576, True)])
-def test_v41_fc1_k_split_capacity_invariance(n, exact):
-    require_b12x()
-    from b12x.moe._shared.scale_codes import pack_scale_codes
-    torch.manual_seed(928384)
-    m, e, k, h = 80, 8, 6, 5120
-    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
-    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
-    routing = torch.rand(m, k, device="cuda")
-    routing /= routing.sum(-1, keepdim=True)
-    weights, scales = {}, {}
-    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
-        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
-        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
-    packed = pack(weights, scales, exact)
-    packed[1] = pack_scale_codes(torch.cat((scales["w3"], scales["w1"]), 1),
-                                tensor_name="w13.scale", gated_half_rows=n).view(torch.uint32).flatten().cuda()
-    packed[3] = pack_scale_codes(scales["w2"], tensor_name="w2.scale").view(torch.uint32).flatten().cuda()
-    actual = run_pipeline(x, ids, routing, packed, 128, exact, n=n, coded=True,
-                          return_routes=True, fc1_k_splits=2)
-    for capacity in (1, 16):
-        prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed, 128, exact,
-                              n=n, coded=True, return_routes=True, fc1_k_splits=2)
-        assert torch.equal(prefix, actual[:capacity]), "K split changed with decode capacity"
-
-
-@pytest.mark.parametrize("n", [384, 576])
-@pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
-def test_v41_k_split_synthetic_oracle_seeds(weight_seed, n):
-    _synthetic_oracle_seeds(weight_seed, 5120, n, True, 128, 128,
-                            "mxfp4_k_split_synthetic_oracle", k_split=2, exact_control=True)
-
-
-@pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
-def test_v41_s384_shipped_k_split_oracle_seeds(weight_seed):
-    _synthetic_oracle_seeds(weight_seed, 5120, 384, True, 128, 192,
-                            "mxfp4_shipped_k_split_oracle", k_split=2, candidate_exact=False)
-
-
-def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker,
-                            k_split=1, exact_control=False, candidate_exact=True):
+def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker):
     require_b12x()
     import json
     from benchmarks.bench_cuteafd_fp8_moe import (
@@ -300,9 +331,9 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
         for capacity in (1, 16, 80):
             operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales)
             control, control_output, control_owned = native_pair_arm(
-                *operands, control_tile, exact_control, False, coded, qualify=True, fc1_k_splits=1)
+                *operands, control_tile, False, False, coded, qualify=True)
             candidate, output, owned = native_pair_arm(
-                *operands, tile, candidate_exact, False, coded, qualify=True, fc1_k_splits=k_split)
+                *operands, tile, True, False, coded, qualify=True)
             control()
             candidate()
             torch.cuda.synchronize()
@@ -310,13 +341,7 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
             oracle = reference[:capacity * k]
             print(marker + " " + json.dumps(dict(
                 weight_seed=weight_seed, activation_seed=activation_seed, capacity=capacity,
-                hidden=h, logical=n, coded=coded, tile=tile, control_tile=control_tile, k_split=k_split,
-                control_arm=dict(tile=control_tile, split=1, exact_storage=exact_control and
-                    (n % 128 != 0 or (n + control_tile - 1) // control_tile * control_tile > n)),
-                candidate_arm=dict(tile=tile, split=k_split, exact_storage=candidate_exact and
-                    (n % 128 != 0 or (n + tile - 1) // tile * tile > n)),
-                reference_rms=oracle.square().mean().sqrt().item(),
-                bitwise_equal=torch.equal(control_output, output),
+                hidden=h, logical=n, coded=coded, tile=tile, control_tile=control_tile,
                 control=f32_errors(control_output, oracle), candidate=f32_errors(output, oracle),
                 synthetic=True, timed=False)), flush=True)
 
