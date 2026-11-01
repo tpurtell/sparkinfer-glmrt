@@ -181,6 +181,8 @@ def parse_args(argv=None):
     parser.add_argument("--mxfp4-pair", action="store_true",
                         help="interleave identical logical weights in padded and exact K32 storage")
     parser.add_argument("--widths", help="paired-screen rank widths; defaults to every T2..8 adjacent width")
+    parser.add_argument("--mxfp4-unify", action="store_true",
+                        help="MiMo native A8/A16 against three exact-storage matching generic controls")
     parser.add_argument("--native-slices", action="store_true",
                         help="paired native V4.1/V4 slice pipelines instead of grouped programs")
     parser.add_argument("--mxfp4-tilings", action="store_true",
@@ -217,6 +219,10 @@ def parse_args(argv=None):
         parser.error("routes must be nonempty and unique")
     if args.compare_routes_exact and (args.exact_sweep or len(args.route.split(",")) < 2):
         parser.error("--compare-routes-exact requires at least two timing routes and no --exact-sweep")
+    if args.mxfp4_unify and (not args.mxfp4_pair or args.native_slices or args.mxfp4_tilings
+                             or args.geometry not in ("mimof", "mimop") or args.routes
+                             or args.capacity is not None):
+        parser.error("--mxfp4-unify requires MiMo paired mode without other screens or fixed capacity")
     if args.native_slices and not args.mxfp4_pair:
         parser.error("--native-slices requires --mxfp4-pair")
     if args.mxfp4_tilings and (not args.mxfp4_pair or args.capacity is not None):
@@ -474,7 +480,9 @@ def native_slice_width(family, rank_width):
 
 
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
-                    aligned_w2=False, aligned_w2_scales=False, stored_width=None):
+                    aligned_w2=False, aligned_w2_scales=False, stored_width=None,
+                    activation_precision="a8", projection_contract=None,
+                    combine_output=False, ingress="wire"):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -520,20 +528,25 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     wire = torch.cat(((groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
                       .view(torch.uint8).reshape(rows, hidden), (exponent + 127).to(torch.uint8)), 1)
     routes = rows * topk
+    words_per_route = width // 2 if activation_precision == "a16" else width // 4 + width // 32
     partial = torch.empty((1,) if atomic else
-                          ((logical + width - 1) // width, routes, width // 4 + width // 32), device="cuda")
+                          ((logical + width - 1) // width, routes, words_per_route), device="cuda")
     output = torch.empty(rows * hidden if atomic else (routes, hidden), device="cuda")
     scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
         ((1,), torch.int32), ((experts * routes,), torch.int32), ((experts,), torch.int32),
         ((experts, 2), torch.int32), ((routes, 19), torch.int32),
         ((routes,), torch.float32), ((routes,), torch.int32))]
-    tensors = [wire[:, :hidden].view(torch.uint32), wire[:, hidden:], *packed,
+    source = torch.empty_like(x) if activation_precision == "a16" and ingress == "wire" else x
+    activation = source.view(torch.uint32) if activation_precision == "a16" else wire[:, :hidden].view(torch.uint32)
+    tensors = [activation, wire[:, hidden:], *packed,
                ids.flatten(), routing.flatten(), *scratch, partial, output]
     args = [from_dlpack(tensor, assumed_align=16) for tensor in tensors]
     pipeline = V41SlicePipeline(rows, width, experts=experts, topk=topk,
                                 intermediate=intermediate, hidden=hidden,
                                 exact_storage=tail or stored_width is not None,
-                                atomic_tokens=atomic, scale_codes=coded)
+                                atomic_tokens=atomic, scale_codes=coded,
+                                activation_precision=activation_precision,
+                                **(projection_contract or {}))
     if stored_width is not None:
         # Physical strides come from P; the launch only visits the real S slices.
         for kernel in (pipeline.fc1, pipeline.fc2, pipeline.reduce):
@@ -546,16 +559,50 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
         if aligned_w2_scales:
             pipeline.fc2.w2_scale_columns = w2_pitch // 32
     launch = cute.compile(pipeline, *args, cutlass.Int32(rows), current_cuda_stream())
+    prepare = None
+    if activation_precision == "a16" and ingress == "wire":
+        from b12x.integration.cuteafd._fp8_moe_kernels import GatherRows
+        operands = [from_dlpack(tensor, assumed_align=16) for tensor in (wire, source)]
+        wire_tensor, source_tensor = operands
+        prepare = cute.compile(GatherRows(k=hidden, wire=True, gather=False),
+                               wire_tensor.iterator, args[8].iterator, args[8].iterator,
+                               source_tensor.iterator, cutlass.Int32(rows), current_cuda_stream())
+        def prepare_rows(live):
+            prepare(wire_tensor.iterator, args[8].iterator, args[8].iterator,
+                    source_tensor.iterator, cutlass.Int32(live), current_cuda_stream())
+    elif activation_precision == "a8" and ingress == "bf16":
+        from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
+        source_tensor = from_dlpack(x, assumed_align=16)
+        prepare = cute.compile(_MXFP8RowsQuantLaunch(hidden, cutlass.BFloat16, 4, 256, 32,
+                               False, 1e-4, wire_rows=True), source_tensor.iterator,
+                               args[0].iterator, args[1].iterator, args[1].iterator,
+                               cutlass.Int32(rows), cutlass.Int32(hidden), cutlass.Int32(rows),
+                               current_cuda_stream())
+        def prepare_rows(live):
+            prepare(source_tensor.iterator, args[0].iterator, args[1].iterator, args[1].iterator,
+                    cutlass.Int32(live), cutlass.Int32(hidden), cutlass.Int32(live), current_cuda_stream())
+    token_output = torch.empty_like(x) if combine_output else output
+    token_tensor = from_dlpack(token_output, assumed_align=16)
+    combine = None
+    if combine_output:
+        from b12x.moe._shared.kernels.v41_slice_pipeline import V41RouteCombine
+        combine = cute.compile(V41RouteCombine(hidden, topk), args[-1], token_tensor,
+                               cutlass.Int32(rows), current_cuda_stream())
     def execute(live):
+        if prepare is not None:
+            prepare_rows(live)
         launch(*args, cutlass.Int32(live), current_cuda_stream())
+        if combine is not None:
+            combine(args[-1], token_tensor, cutlass.Int32(live), current_cuda_stream())
     if qualify:
         if atomic:
             raise ValueError("tiling qualification requires ordered deterministic route output")
-        qualify_pair_replay(execute, ids, output, [partial, *scratch], tensors,
-                            lambda live: output[:live * topk])
+        qualify_pair_replay(execute, ids, token_output, [partial, *scratch, output] if combine_output else [partial, *scratch],
+                            [*tensors, wire, source, token_output],
+                            lambda live: token_output[:live if combine_output else live * topk])
     def run():
         execute(rows)
-    return run, output, (tensors, args, launch)
+    return run, token_output, (tensors, args, launch, wire, source, prepare, combine, token_tensor, execute)
 
 
 def mxfp4_decode_partitions(width):
@@ -673,6 +720,9 @@ def mxfp4_pair_screen(g, args):
 
     if g.weights != "mxfp4":
         raise ValueError("paired screen requires an MXFP4 geometry")
+    if args.mxfp4_unify:
+        mxfp4_unify_screen(g, args, Exact)
+        return
     if args.mxfp4_tilings:
         mxfp4_tiling_screen(g, args, Exact)
         return
@@ -766,6 +816,113 @@ def mxfp4_pair_screen(g, args):
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(dict(device=str(torch.cuda.get_device_properties(0)),
                                                torch=torch.__version__, results=results), indent=2) + "\n")
+
+
+def mxfp4_unify_screen(g, args, geometry_type):
+    """Compare complete native wire-input arms to the installed mixed generic math."""
+    from b12x.integration.cuteafd.fp8_moe import (
+        _Fp8Moe, DECODE_MAX_ROWS, auto_large_rows, fp8_moe_scratch_bytes, compile_fp8_moe_aot,
+    )
+    from b12x.integration.cuteafd._mxfp4_moe_kernels import GroupedMxfp4Gemv
+    from b12x.integration.cuteafd._common import compile_program
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+
+    properties = torch.cuda.get_device_properties(0)
+    l2_bytes = int(properties.L2_cache_size)
+    flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
+    results = []
+    for width in paired_widths(g.intermediate, args.widths):
+        expert_bytes = 3 * width * g.hidden // 2
+        experts = max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16)
+        generator = torch.Generator().manual_seed(args.seed + width)
+        weights, scales = {}, {}
+        for name, shape in (("w1", (experts, width, g.hidden // 2)),
+                            ("w3", (experts, width, g.hidden // 2)),
+                            ("w2", (experts, g.hidden, width // 2))):
+            weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+            scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
+                                        dtype=torch.uint8, generator=generator)
+        weight_hash = hashlib.sha256(b"".join(t.numpy().tobytes()
+                                     for t in (*weights.values(), *scales.values()))).hexdigest()
+        for rows in map(int, args.rows.split(",")):
+            torch.manual_seed(args.seed + rows)
+            x = (torch.randn(rows, g.hidden, device="cuda") * .5).bfloat16()
+            ids = torch.rand(rows, experts, device="cuda").topk(g.top_k, -1).indices.int()
+            if args.routing == "hot":
+                ids.copy_(ids[:1].expand_as(ids))
+            routing = torch.rand(rows, g.top_k, device="cuda")
+            routing /= routing.sum(-1, keepdim=True)
+            geometry = geometry_type(g.name, g.hidden, experts, g.top_k, g.intermediate,
+                                     weights="mxfp4", rank_width=width)
+            planes = tuple(t.cuda() for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"], weights["w2"]))
+            planes += (torch.nn.functional.pad(scales["w2"],
+                       (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda(),)
+            source, _ = wire_rows(x)
+            template = compile_fp8_moe_aot(geometry, route="auto", max_rows=rows, prefill=args.prefill)
+            launch = _Fp8Moe(geometry, "auto", rows, True, args.prefill)
+            blocks = (width + 127) // 128
+            matching = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
+            launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
+                                    max_rows=min(rows, DECODE_MAX_ROWS), warps=matching)
+            program = compile_program(launch, name=template.name + "_unify_control",
+                       operands=template.operands, scalars=template.scalars, key=launch.key(),
+                       geometry={**template.geometry, "screen_down_warps": matching}, scratch=template.scratch)
+            runs, outputs, owned = {}, {}, []
+            controls = ["current", "current-2", "current-3"]
+            for label in controls:
+                scratch = torch.empty(fp8_moe_scratch_bytes(geometry, "auto", rows, prefill=args.prefill),
+                                      dtype=torch.uint8, device="cuda")
+                output = torch.empty_like(x)
+                buffers = (source, ids, routing, *planes, output, scratch)
+                def bind(buffers):
+                    def execute(live):
+                        program.launch(*buffers, scalars=(live,))
+                    return execute
+                execute = bind(buffers)
+                qualify_pair_replay(execute, ids, output, [scratch], buffers, lambda live: output[:live])
+                runs[label] = lambda execute=execute: execute(rows)
+                outputs[label] = output
+                owned.append((buffers, execute))
+            contract = dict(swiglu_limit=0., silu_bf16_product=True,
+                            route_weight_before_fc2=False, round_fc2_bf16=True)
+            for precision in ("a8", "a16"):
+                label = "native-" + precision
+                runs[label], outputs[label], keep = native_pair_arm(
+                    x, ids, routing, weights, scales, 128, True, False, False,
+                    activation_precision=precision, projection_contract=contract,
+                    combine_output=True, ingress="wire", qualify=True)
+                owned.append(keep)
+            for label, run in list(runs.items()):
+                run()
+                if args.graph:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run()
+                    owned.append((run, graph))
+                    runs[label] = graph.replay
+            torch.cuda.synchronize()
+            comparisons = compare_route_outputs(outputs)
+            assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
+            oracle = mxfp4_f32_reference(x, ids, routing, weights, scales)
+            errors = {label: f32_errors(output, oracle) for label, output in outputs.items()}
+            samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
+            medians = {label: statistics.median(values) for label, values in samples.items()}
+            record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows,
+                          ingress="wire", wire_preparation_timed=False,
+                          a16_wire_dequant_timed=True, token_combine_timed=True,
+                          current_down="a8" if rows > auto_large_rows(True, "mxfp4", args.prefill)
+                                       and args.prefill != "w8a16" else "a16",
+                          matching_warps=matching, controls=controls, graph=args.graph,
+                          weight_sha256=weight_hash, samples_us=samples, median_us=medians,
+                          speedup={label: medians["current"] / medians[label] for label in runs},
+                          f32_errors=errors, comparisons=comparisons,
+                          invariant_checks="poison/live/graph/row-mix", slice_width=128)
+            results.append(record)
+            print(json.dumps(record), flush=True)
+            del owned, runs, outputs
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(dict(device=str(properties), results=results), indent=2) + "\n")
 
 
 def mxfp4_tiling_screen(g, args, geometry_type):

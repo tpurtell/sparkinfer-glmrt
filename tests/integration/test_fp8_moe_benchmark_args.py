@@ -27,6 +27,18 @@ def test_mxfp4_pair_widths_cover_all_worlds_without_padding():
         bench.paired_widths(2048, "2080")
 
 
+@pytest.mark.parametrize("family", ["mimof", "mimop"])
+def test_unify_screen_is_mimo_pair_only(family):
+    args = bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--geometry", family,
+                             "--widths", "256,288", "--graph"])
+    assert args.mxfp4_unify and args.input == "wire"
+    for extra in (["--native-slices"], ["--mxfp4-tilings"], ["--capacity", "80"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--geometry", family, *extra])
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--mxfp4-unify", "--geometry", family])
+
+
 @pytest.mark.parametrize("family,rank_width,expected", [
     ("v41", 288, 192), ("v41", 576, 192), ("v41", 768, 192),
     ("v41", 448, 128), ("dsv4f", 384, 128), ("dsv4p", 768, 128),

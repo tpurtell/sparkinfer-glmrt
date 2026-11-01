@@ -117,10 +117,11 @@ MIMO_WIDTHS = sorted({32 * (64 // world + extra)
                       for extra in (0, int(64 % world != 0))} | {2048})
 
 
+@pytest.mark.parametrize("h", [4096, 6144])
 @pytest.mark.parametrize("n", MIMO_WIDTHS)
 @pytest.mark.parametrize("activation_precision", ["a8", "a16"])
 @pytest.mark.parametrize("coded", [False, True])
-def test_mimo_native_activation_contract(n, activation_precision, coded):
+def test_mimo_native_activation_contract(h, n, activation_precision, coded):
     require_b12x()
     import json
     from b12x.moe._shared.scale_codes import pack_scale_codes
@@ -128,7 +129,7 @@ def test_mimo_native_activation_contract(n, activation_precision, coded):
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.manual_seed(928160 + n)
-    m, e, h, k, width = 17, 8, 4096, 8, 128
+    m, e, k, width = 17, 8, 8, 128
     x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
     ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
     routing = torch.rand(m, k, device="cuda")
