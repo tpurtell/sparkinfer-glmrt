@@ -475,8 +475,10 @@ def test_native_stream_weights_share_activation_completion_ring():
     cls = next(n for n in ast.parse(path.read_text()).body
                if isinstance(n, ast.ClassDef) and n.name == "StreamMxfp4GateUp")
     text = ast.unparse(cls)
-    assert "self.w_ring =" not in text
-    assert "w_ring = 3" in text
+    ring_defaults = {n.targets[0].id: ast.literal_eval(n.value) for n in cls.body
+                     if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
+                     and n.targets[0].id in ("a_ring", "w_ring")}
+    assert ring_defaults == {"a_ring": 3, "w_ring": 3}
     assert "self.load_native_weights(native_gate, native_up, sw, e, n0, p, tidx)" in text
     assert "step + Int32(self.w_ring - 1), tidx)" in text
     assert "native_base = sw + step % Int32(self.w_ring) * Int32(4096)" in text
