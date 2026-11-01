@@ -407,7 +407,8 @@ def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical
 
 
 def test_stream_decode_cli_contract():
-    args = bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--rows", "1,16,80", "--stream-decode"])
+    args = bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
+                             "--rows", "1,16,80", "--stream-decode"])
     assert args.stream_decode
     for argv in (["--stream-decode"], ["--mxfp4-pair", "--mxfp4-unify", "--rows", "256", "--stream-decode"]):
         with pytest.raises(SystemExit):
