@@ -862,6 +862,7 @@ class V41SliceFc1Kernel:
                             for part in cutlass.range_constexpr(1, self.k_splits):
                                 up[nf, elem] = fadd_rn_f32(up[nf, elem], fold[part, row, col])
                 cute.arch.sync_threads()
+            row, col, base = Int32(0), Int32(0), Int64(0)
             if cutlass.const_expr(self.cta_splits > 1):
                 raw = self.raw_projection(partial)
                 if team == 0:
