@@ -260,6 +260,8 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
 
             for p in cutlass.range_constexpr(self.a_ring - 1):
                 self._load_a(p, sa, ss, src, s_src, ch, r_base, tidx)
+                if cutlass.const_expr(self.native_resident):
+                    self.load_native_weights(native_gate, native_up, sw, e, n0, p, tidx)
                 cute.arch.cp_async_commit_group()
             if cutlass.const_expr(not self.native_resident):
                 if warp_id == Int32(0):
@@ -279,22 +281,22 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                 block = step // Int32(2)
                 slot = block % Int32(self.w_ring)
                 cute.arch.cp_async_wait_group(self.a_ring - 2)
-                if cutlass.const_expr(self.native_resident):
-                    self.load_native_weights(native_gate, native_up, sw, e, n0, step, tidx)
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
-                else:
+                if cutlass.const_expr(not self.native_resident):
                     cute.arch.mbarrier_wait(mbar + slot, (block // Int32(self.w_ring)) & Int32(1))
                 cute.arch.sync_threads()
                 if step + Int32(self.a_ring - 1) < Int32(self.k_steps):
                     self._load_a(step + Int32(self.a_ring - 1), sa, ss, src, s_src, ch, r_base, tidx)
+                    if cutlass.const_expr(self.native_resident):
+                        # A and native weights share one completion group per K128 step.
+                        self.load_native_weights(native_gate, native_up, sw, e, n0,
+                                                 step + Int32(self.w_ring - 1), tidx)
                 cute.arch.cp_async_commit_group()
                 if cutlass.const_expr(not self.native_resident):
-                  if warp_id == Int32(0):
-                    # Block `block` starts: every thread is past block - 1, whose slot takes
-                    # block + w_ring - 1.
-                    if (step % Int32(2) == Int32(0)) & (block + Int32(self.w_ring - 1) < Int32(self.w_blocks)):
-                        self._load_w(block + Int32(self.w_ring - 1), tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile)
+                    if warp_id == Int32(0):
+                        # Block `block` starts: every thread is past block - 1, whose slot takes
+                        # block + w_ring - 1.
+                        if (step % Int32(2) == Int32(0)) & (block + Int32(self.w_ring - 1) < Int32(self.w_blocks)):
+                            self._load_w(block + Int32(self.w_ring - 1), tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile)
                 if cutlass.const_expr(self.qmma):
                     if active:
                         stage = step % Int32(self.a_ring)
@@ -329,10 +331,11 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                 nrow = warp_n * Int32(16) + Int32((nt % 2) * 8) + g
                                 if cutlass.const_expr(self.native_resident):
                                     at = Int32((nt // 2) * 512 + ks * 128 + nrow % 8 * 16 + nrow // 8)
-                                    v0 = ld_shared_u32(sw + at * 4)
-                                    v1 = ld_shared_u32(sw + (at + 4) * 4)
-                                    v2 = ld_shared_u32(sw + (at + 8) * 4)
-                                    v3 = ld_shared_u32(sw + (at + 12) * 4)
+                                    native_base = sw + (step % Int32(self.w_ring)) * Int32(4096)
+                                    v0 = ld_shared_u32(native_base + at * 4)
+                                    v1 = ld_shared_u32(native_base + (at + 4) * 4)
+                                    v2 = ld_shared_u32(native_base + (at + 8) * 4)
+                                    v3 = ld_shared_u32(native_base + (at + 12) * 4)
                                 else:
                                     unit = half * Int32(4) + Int32(ks)
                                     v0, v1, v2, v3 = ld_shared_v4_u32(
@@ -519,7 +522,8 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                         word = (Int64(expert) * (2 * stored * self.hidden // 8)
                                 + Int64((n // 256) * (self.hidden // 128) + step) * 4096
                                 + Int64(kb * 1024 + (n % 256 // 32) * 128 + lane * 4))
-                    cp_async4_shared_global(shared + Int32(projection * 2048) + index * 16,
+                    cp_async4_shared_global(shared + (Int32(step) % Int32(self.w_ring)) * Int32(4096)
+                                            + Int32(projection * 2048) + index * 16,
                                             Int64(source.toint()) + word * 4)
 
     @cute.jit

@@ -470,6 +470,19 @@ def test_v4_stream_adapter_has_ordered_f32_output_and_weight_before_fc2():
     assert "geometry = ExactStreamGeometry(" in ast.unparse(helper)
 
 
+def test_native_stream_weights_share_activation_completion_ring():
+    path = _PATH.parents[1] / "b12x/integration/cuteafd/_mxfp4_moe_stream.py"
+    cls = next(n for n in ast.parse(path.read_text()).body
+               if isinstance(n, ast.ClassDef) and n.name == "StreamMxfp4GateUp")
+    text = ast.unparse(cls)
+    assert "self.w_ring =" not in text
+    assert "w_ring = 3" in text
+    assert "self.load_native_weights(native_gate, native_up, sw, e, n0, p, tidx)" in text
+    assert "step + Int32(self.w_ring - 1), tidx)" in text
+    assert "native_base = sw + step % Int32(self.w_ring) * Int32(4096)" in text
+    assert "shared + Int32(step) % Int32(self.w_ring) * Int32(4096)" in text
+
+
 def test_stream_decode_cli_contract():
     args = bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
                              "--rows", "1,16,80", "--stream-decode"])
