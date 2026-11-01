@@ -194,6 +194,8 @@ def parse_args(argv=None):
                         help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
     parser.add_argument("--stream-decode", action="store_true",
                         help="development A16 native register-streaming decode arm")
+    parser.add_argument("--row-major-a8", action="store_true",
+                        help="benchmark-only fixed-path ordered row-major A8 decode")
     parser.add_argument("--fc1-k-splits", help="development paired native K-team counts, comma-separated 1/2/4/8")
     parser.add_argument("--fc1-cta-splits", help="development MiMo unification CTA splits, comma-separated 1/2/4/8")
     parser.add_argument("--control-repeats", type=int, default=2,
@@ -248,6 +250,8 @@ def parse_args(argv=None):
                              or args.geometry not in ("mimof", "mimop") or args.routes
                              or args.capacity is not None):
         parser.error("--mxfp4-unify requires MiMo paired mode without other screens or fixed capacity")
+    if args.row_major_a8 and (not args.mxfp4_unify or max(rows) > 80):
+        parser.error("--row-major-a8 requires the unified decode screen at capacities <=80")
     if args.native_slices and not args.mxfp4_pair:
         parser.error("--native-slices requires --mxfp4-pair")
     if args.mxfp4_tilings and (not args.mxfp4_pair or args.capacity is not None):
@@ -639,9 +643,11 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                                 **(projection_contract or {}))
     if row_major_a8:
         from b12x.moe._shared.kernels.mxfp4_row_major_decode import RowMajorA8Fc1, RowMajorA8Fc2
+        fc1_contract = {key: value for key, value in (projection_contract or {}).items()
+                        if key != "round_fc2_bf16"}
         pipeline.fc1 = RowMajorA8Fc1(width, rows, topk=topk, intermediate=intermediate,
                                     hidden=hidden, exact_storage=True,
-                                    activation_precision="a8", **(projection_contract or {}))
+                                    activation_precision="a8", **fc1_contract)
         pipeline.fc2 = RowMajorA8Fc2(pipeline.fc1,
                            round_fc2_bf16=(projection_contract or {}).get("round_fc2_bf16", False))
         pipeline.partial_words = partial_words
@@ -1046,6 +1052,13 @@ def mxfp4_unify_screen(g, args, geometry_type):
                     activation_precision="a16", projection_contract=contract,
                     combine_output=True, ingress="wire", qualify=True, stream_decode=True)
                 owned.append(keep)
+            if args.row_major_a8:
+                label = "row-major-a8"
+                runs[label], outputs[label], keep = native_pair_arm(
+                    x, ids, routing, weights, scales, 64, True, False, False,
+                    activation_precision="a8", projection_contract=contract,
+                    combine_output=True, ingress="wire", qualify=True, row_major_a8=True)
+                owned.append(keep)
             for label, run in list(runs.items()):
                 run()
                 if args.graph:
@@ -1066,6 +1079,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
             quality_precisions = {label: spec[0] for label, spec in variants.items()}
             if args.stream_decode:
                 quality_precisions["native-stream-a16"] = "a16"
+            if args.row_major_a8:
+                quality_precisions["row-major-a8"] = "a8"
             for label, precision in quality_precisions.items():
                 matched = references[precision]
                 error = f32_errors(outputs[label], matched)
