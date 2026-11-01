@@ -435,6 +435,12 @@ def test_row_major_a8_is_benchmark_only_and_uses_raw_scratch():
     assert "pipeline.fc1 = RowMajorA8Fc1(" in text
     assert "pipeline.fc2 = RowMajorA8Fc2(" in text
     assert "rows > 80" in text
+    args = bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
+                             "--row-major-a8", "--rows", "1,16,80"])
+    assert args.row_major_a8
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
+                          "--row-major-a8", "--rows", "256"])
 
 
 def test_stream_decode_cli_contract():
