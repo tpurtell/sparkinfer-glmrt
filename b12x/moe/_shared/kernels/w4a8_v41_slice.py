@@ -855,6 +855,7 @@ class V41SliceFc1Kernel:
                             for part in cutlass.range_constexpr(1, self.k_splits):
                                 up[nf, elem] = fadd_rn_f32(up[nf, elem], fold[part, row, col])
                 cute.arch.sync_threads()
+            row, col = Int32(0), Int32(0)
             if team == 0:
                 for nf in cutlass.range_constexpr(self.width // 32):
                     for elem in cutlass.range_constexpr(4):
