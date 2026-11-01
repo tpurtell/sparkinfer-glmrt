@@ -462,6 +462,10 @@ def test_v4_stream_adapter_has_ordered_f32_output_and_weight_before_fc2():
     assert "self.down.round_output_bf16 = False" in text
     assert "fadd_rn_f32(value, down[" in text
     assert "atomic" not in text
+    helper = next(n for n in ast.parse(_PATH.read_text()).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "v4_stream_pair_arm")
+    assert "return self.intermediate" in ast.unparse(helper)
+    assert "geometry = ExactStreamGeometry(" in ast.unparse(helper)
 
 
 def test_stream_decode_cli_contract():

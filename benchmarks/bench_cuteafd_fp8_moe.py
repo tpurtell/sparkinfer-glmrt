@@ -967,7 +967,13 @@ def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True):
     rows, hidden = x.shape
     experts, width = weights["w1"].shape[:2]
     topk = ids.shape[1]
-    geometry = Fp8MoeGeometry("v41", hidden, experts, topk, width, weights="mxfp4", swiglu_limit=10.)
+    from dataclasses import dataclass
+    @dataclass(frozen=True)
+    class ExactStreamGeometry(Fp8MoeGeometry):
+        @property
+        def slice(self):
+            return self.intermediate
+    geometry = ExactStreamGeometry("v41", hidden, experts, topk, width, weights="mxfp4", swiglu_limit=10.)
     source, _ = wire_rows(x)
     planes = [t.cuda() for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"], weights["w2"])]
     planes.append(torch.nn.functional.pad(scales["w2"], (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda())
@@ -1364,7 +1370,7 @@ def main() -> None:
 
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, Fp8MoeGeometry
 
-    if args.native_slices:
+    if args.native_slices or (args.mxfp4_unify and args.geometry == "v41"):
         intermediate, hidden = {"v41": (2304, 5120), "dsv4f": (2048, 4096), "dsv4p": (3072, 7168)}[args.geometry]
         g = Fp8MoeGeometry(args.geometry, hidden, 384, 6, intermediate, weights="mxfp4")
     else:
