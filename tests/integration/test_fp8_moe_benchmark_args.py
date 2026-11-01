@@ -403,6 +403,37 @@ def test_invalid_explicit_extents_fail_before_cuda(value):
         bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings", "--mxfp4-arm", value])
 
 
+def test_explicit_legacy_split_and_profile_selection():
+    values = ["legacy128:384:0:128:2", "legacy192:384:0:192:2", "exact128:384:384:128"]
+    assert bench.native_screen_arms(values) == [
+        ("legacy128", 384, 0, 128, 2), ("legacy192", 384, 0, 192, 2),
+        ("exact128", 384, 384, 128, 1)]
+    argv = ["--mxfp4-pair", "--native-slices", "--mxfp4-tilings", "--control-repeats", "3"]
+    for value in values:
+        argv += ["--mxfp4-arm", value]
+    args = bench.parse_args(argv + ["--profile-dir", "out", "--profile-arm", "legacy128"])
+    specs, controls = bench.tiling_specs(args, 384, 192, (64, 128, 192))
+    assert specs == [(name, False, 192, None) for name in controls] + [
+        ("legacy128", False, 128, None), ("legacy192", False, 192, None),
+        ("exact128", True, 128, 384)]
+    with pytest.raises(SystemExit):
+        bench.parse_args(argv + ["--profile-dir", "out", "--profile-arm", "missing"])
+    for value in ["a:384:0:128:3", "a:384:0:192:4", "a:384:-32:128:2"]:
+        with pytest.raises(ValueError):
+            bench.native_screen_arms([value])
+
+
+def test_explicit_aligned_extent_uses_exact_staging():
+    function = next(node for node in ast.parse(_PATH.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "native_pair_arm")
+    branch = next(node for node in function.body if isinstance(node, ast.If)
+                  and isinstance(node.test, ast.Compare) and ast.unparse(node.test) == "stored_width is not None"
+                  and any(isinstance(child, ast.Assign) and any(isinstance(target, ast.Name)
+                      and target.id == "tail" for target in child.targets) for child in node.body))
+    assignment, = [child for child in branch.body if isinstance(child, ast.Assign)]
+    assert isinstance(assignment.value, ast.Constant) and assignment.value.value is True
+
+
 def test_explicit_tile32_is_benchmark_only():
     args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings",
                              "--mxfp4-arm", "tile32:288:288:32"])
