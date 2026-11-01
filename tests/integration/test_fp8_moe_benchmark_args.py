@@ -55,6 +55,17 @@ def test_unify_screen_is_mimo_pair_only(family):
         bench.parse_args(["--mxfp4-unify", "--geometry", family])
 
 
+def test_cross_cta_screen_and_profile_share_explicit_geometry(tmp_path):
+    args = bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--geometry", "mimof",
+                             "--fc1-k-splits", "1,2", "--fc1-cta-splits", "2,4,8",
+                             "--profile-dir", str(tmp_path), "--profile-arm", "native-a8-t64-k2-z4"])
+    assert args.fc1_cta_splits == "2,4,8"
+    for argv in (["--fc1-cta-splits", "2"],
+                 ["--mxfp4-pair", "--mxfp4-unify", "--geometry", "mimof", "--fc1-cta-splits", "3"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(argv)
+
+
 def test_fc1_k_split_screen_geometry_and_cli():
     args = bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--geometry", "mimof",
                              "--fc1-k-splits", "2,4,8"])
