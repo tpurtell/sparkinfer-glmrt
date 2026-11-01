@@ -8,11 +8,15 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import fadd_rn_f32
 
 
 class V4StreamContract(_StreamRoute):
-    def __init__(self, geometry, capacity, *, native_resident=False, native_exact=False, v4=True):
+    def __init__(self, geometry, capacity, *, native_resident=False, native_exact=False, v4=True,
+                 scale_codes=False):
         super().__init__(geometry, capacity, True, mxfp4_down_a8=True)
         self.v4 = bool(v4)
         for kernel in (self.gate_up, self.down):
             kernel.native_resident, kernel.native_exact = bool(native_resident), bool(native_exact)
+            kernel.scale_codes = bool(scale_codes)
+        if scale_codes and not native_resident:
+            raise ValueError("compact scale codes require native resident weights")
         self.gate_up.silu_bf16_product = not v4
         self.gate_up.route_weight_before_fc2 = v4
         self.down.round_output_bf16 = not v4
