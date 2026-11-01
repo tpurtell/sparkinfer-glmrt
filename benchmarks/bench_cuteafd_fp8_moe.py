@@ -766,12 +766,13 @@ def f32_errors(output, reference):
     return {"max_abs": difference.abs().max().item(), "rms": difference.square().mean().sqrt().item()}
 
 
-def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
+def qualify_pair_replay(run, ids, output, scratch, buffers, prefix, *, strict_prefix=True):
     """Poison, prefix/wave-mix invariance and fixed-address graph replay."""
     rows = ids.shape[0]
     addresses = tuple(t.data_ptr() for t in buffers)
     run(rows)
     expected = output.clone()
+    prefix_failures = []
     for live in sorted({1, min(17, rows), rows}):
         output.fill_(float("nan"))
         for tensor in scratch:
@@ -779,9 +780,11 @@ def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
         run(live)
         actual_prefix = prefix(live)
         expected_prefix = expected[:actual_prefix.shape[0]]
-        assert torch.equal(actual_prefix, expected_prefix), (
-            "live prefix", live, "max_abs", (actual_prefix.float() - expected_prefix.float()).abs().max().item(),
-            "actual", actual_prefix.flatten()[:8].tolist(), "expected", expected_prefix.flatten()[:8].tolist())
+        if not torch.equal(actual_prefix, expected_prefix):
+            failure = dict(rows=live, max_abs=(actual_prefix.float() - expected_prefix.float()).abs().max().item())
+            if strict_prefix:
+                raise AssertionError(("live prefix", failure))
+            prefix_failures.append(failure)
     if rows > 1:
         original = ids.clone()
         ids[1:] = ids[:1].expand_as(ids[1:])
@@ -801,7 +804,8 @@ def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
         assert torch.equal(output, expected), "graph replay"
     assert torch.cuda.memory_allocated() == allocated
     assert tuple(t.data_ptr() for t in buffers) == addresses
-    return {"deterministic": True, "row_invariant": True, "graph_reuse": True}
+    return {"deterministic": True, "row_invariant": not prefix_failures,
+            "prefix_failures": prefix_failures, "graph_reuse": True}
 
 
 def mxfp4_pair_screen(g, args):
@@ -961,8 +965,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
             planes += (torch.nn.functional.pad(scales["w2"],
                        (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda(),)
             source, _ = wire_rows(x)
-            template = compile_fp8_moe_aot(geometry, route="auto", max_rows=rows, prefill=args.prefill)
-            launch = _Fp8Moe(geometry, "auto", rows, True, args.prefill)
+            control_route = "stream" if rows > 80 else "auto"
+            template = compile_fp8_moe_aot(geometry, route=control_route, max_rows=rows, prefill=args.prefill)
+            launch = _Fp8Moe(geometry, control_route, rows, True, args.prefill)
             blocks = (width + 127) // 128
             matching = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
             launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
@@ -971,6 +976,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                        operands=template.operands, scalars=template.scalars, key=launch.key(),
                        geometry={**template.geometry, "screen_down_warps": matching}, scratch=template.scratch)
             runs, outputs, owned = {}, {}, []
+            control_qualification = {}
             controls = ["current", "current-2", "current-3"]
             for label in controls:
                 scratch = torch.empty(fp8_moe_scratch_bytes(geometry, "auto", rows, prefill=args.prefill),
@@ -982,7 +988,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
                         program.launch(*buffers, scalars=(live,))
                     return execute
                 execute = bind(buffers)
-                qualify_pair_replay(execute, ids, output, [scratch], buffers, lambda live: output[:live])
+                control_qualification[label] = qualify_pair_replay(
+                    execute, ids, output, [scratch], buffers, lambda live: output[:live],
+                    strict_prefix=rows <= 80)
                 runs[label] = lambda execute=execute: execute(rows)
                 outputs[label] = output
                 owned.append((buffers, execute))
@@ -1054,7 +1062,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
             record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows,
                           ingress="wire", wire_preparation_timed=False,
                           a16_wire_dequant_timed=True, token_combine_timed=True,
-                          current_down="a8" if rows > auto_large_rows(True, "mxfp4", args.prefill)
+                          control_route=control_route, control_qualification=control_qualification,
+                          current_down="a8" if control_route == "stream"
                                        and args.prefill != "w8a16" else "a16",
                           matching_warps=matching, controls=controls, graph=args.graph,
                           weight_sha256=weight_hash, samples_us=samples, median_us=medians,
