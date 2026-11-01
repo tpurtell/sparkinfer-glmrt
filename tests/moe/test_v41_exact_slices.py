@@ -64,7 +64,8 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
     wire[:,h:] = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
     routes=m*topk
     partial_words = 1 if atomic else fc1_partial_words(
-        m, width, topk, n, activation_precision, contract.get("fc1_cta_splits", 1))
+        m, width, topk, n, activation_precision, contract.get("fc1_cta_splits", 1),
+        contract.get("stream_decode", False))
     partial_storage = torch.full((partial_words+16,), 12345., device='cuda')
     partial = partial_storage[:partial_words]
     output=torch.empty(m*h if atomic else (routes,h),device='cuda',dtype=torch.float32)
@@ -182,6 +183,35 @@ def test_fc1_cross_cta_contract(cta, team, precision):
         prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed,
                               tile, False, n=n, **contract)
         assert torch.equal(prefix, candidate[:capacity]), "CTA split capacity row invariance"
+
+
+@pytest.mark.parametrize("n,exact", [(256, False), (288, True)])
+def test_stream_decode_a16_contract(n, exact):
+    require_b12x()
+    from benchmarks.bench_cuteafd_fp8_moe import mxfp4_f32_reference
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.manual_seed(928317 + n)
+    m, e, k, h, tile = 80, 8, 8, 4096, 64
+    x = wire_rows((torch.randn(m, h, device="cuda") * .5).bfloat16())[1]
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    packed = pack(weights, scales, exact)
+    contract = dict(activation_precision="a16", swiglu_limit=0., silu_bf16_product=True,
+                    route_weight_before_fc2=False, round_fc2_bf16=True, stream_decode=True)
+    candidate = run_pipeline(x, ids, routing, packed, tile, exact, n=n, **contract)
+    oracle = mxfp4_f32_reference(x, ids, routing, weights, scales, activation_precision="a16")
+    assert torch.isfinite(candidate).all()
+    assert (candidate - oracle).square().mean().sqrt() / oracle.square().mean().sqrt() < .02
+    for capacity in (1, 16):
+        prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed,
+                              tile, exact, n=n, **contract)
+        assert torch.equal(prefix, candidate[:capacity]), "streaming capacity row invariance"
 
 
 @pytest.mark.parametrize("h", [4096, 6144])
