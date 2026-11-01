@@ -178,25 +178,24 @@ class StreamMxfp4DownA8:
                                     offset = (Int64(first) + Int64(row)) * self.hidden + Int64(col)
                                     output[offset] = acc[f]
                                     output[offset + 1] = acc[f + 1]
-                return
-            if active:
-                for mt in cutlass.range_constexpr(2):
-                    for half in cutlass.range_constexpr(2):
-                        row = warp_m * Int32(32) + Int32(16 * mt + 8 * half) + g
-                        for nt in cutlass.range_constexpr(8):
-                            f = 4 * (8 * mt + nt) + 2 * half
-                            col = warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * j
-                            # Reuse the drained ring for the baseline's coalesced
-                            # BF16 epilogue; its output fits within two stages.
-                            st_shared_u32(ring + row * Int32(p.out_stride) + col * Int32(2),
-                                          pack_f32x2_to_bfloat2(acc[f], acc[f + 1]))
-            cute.arch.sync_threads()
-            segments = p.tile_n * 2 // 16
-            for q in cutlass.range_constexpr(STREAM_TILE_M * segments // p.threads):
-                c = tidx + Int32(p.threads * q)
-                row, seg = c // Int32(segments), c % Int32(segments)
-                if row < live:
-                    v0, v1, v2, v3 = ld_shared_v4_u32(ring + row * Int32(p.out_stride) + seg * Int32(16))
-                    st_global_v4_u32(Int64(y.toint()) + ((Int64(first) + Int64(row)) * Int64(self.hidden)
-                                                        + Int64(n0)) * Int64(2) + Int64(seg) * Int64(16),
-                                     v0, v1, v2, v3)
+            else:
+                if active:
+                    for mt in cutlass.range_constexpr(2):
+                        for half in cutlass.range_constexpr(2):
+                            row = warp_m * Int32(32) + Int32(16 * mt + 8 * half) + g
+                            for nt in cutlass.range_constexpr(8):
+                                f = 4 * (8 * mt + nt) + 2 * half
+                                col = warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * j
+                                # Reuse the drained ring for the coalesced BF16 epilogue.
+                                st_shared_u32(ring + row * Int32(p.out_stride) + col * Int32(2),
+                                              pack_f32x2_to_bfloat2(acc[f], acc[f + 1]))
+                cute.arch.sync_threads()
+                segments = p.tile_n * 2 // 16
+                for q in cutlass.range_constexpr(STREAM_TILE_M * segments // p.threads):
+                    c = tidx + Int32(p.threads * q)
+                    row, seg = c // Int32(segments), c % Int32(segments)
+                    if row < live:
+                        v0, v1, v2, v3 = ld_shared_v4_u32(ring + row * Int32(p.out_stride) + seg * Int32(16))
+                        st_global_v4_u32(Int64(y.toint()) + ((Int64(first) + Int64(row)) * Int64(self.hidden)
+                                                            + Int64(n0)) * Int64(2) + Int64(seg) * Int64(16),
+                                         v0, v1, v2, v3)
