@@ -52,14 +52,15 @@ def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
 
 def benchmark():
     names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
-             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm", "compact_prefill_fixture"}
+             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm", "compact_prefill_fixture",
+             "muse_route_waves", "coordinator_routes_sha256", "coordinator_output", "muse_partial_binding"}
     tables = {"GLM_CAPACITIES", "GLM_PROFILES", "GLM_ROUTES", "COORDINATOR_FAMILIES",
               "COORDINATOR_PROFILES", "SERVED_ROUTE_BLOCKS", "SERVED_TOKEN_ROTATION",
               "PREFILL_FAMILIES"}
     glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
                     "spark-tp6-width256": 256, "spark-tp4-width512": 512}
     glm_routes = SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json"
-    scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
+    scope = dict(argparse=argparse, hashlib=hashlib, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
                  __file__=str(SOURCE),
                  GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes)
     host_names = {"route_pack_capacity", "route_pack_numel_capacity", "route_pack_token_capacity",
@@ -451,6 +452,147 @@ def test_ws_oracle_rejects_bad_requests(extra):
 def test_bad_audit_arm(text):
     with pytest.raises(argparse.ArgumentTypeError):
         benchmark().parse_coordinator_arm(text)
+
+
+@pytest.mark.parametrize("family,hidden,experts,topk,widths,clamp", [
+    ("muse", 4096, 256, 8, {4096, 2048, 1024, 896, 768, 640, 512}, None),
+    ("step5", 4096, 352, 8, {1536, 768, 512, 384, 256}, 7.0),
+    ("ml4", 6144, 128, 4, {6144, 3072, 1280, 1152, 1024, 896, 768}, None),
+])
+def test_new_family_launchable_cells(family, hidden, experts, topk, widths, clamp):
+    b = benchmark()
+    spec = b.COORDINATOR_FAMILIES[family]
+    assert set(spec["profiles"].values()) == widths
+    assert len(spec["profiles"]) == len(widths)
+    assert spec["capacities"] == (256, 1024, 2048, 2752, 4096)
+    for profile, width in spec["profiles"].items():
+        for capacity in spec["capacities"]:
+            props = SimpleNamespace(multi_processor_count=48 if profile.startswith("spark-") else 170,
+                                    shared_memory_per_block_optin=101376)
+            opts = b.coordinator_compile_options(profile, capacity, {"mode": "ws"}, props, family)
+            assert (opts["hidden_size"], opts["route_num_experts"], opts["top_k"]) == (hidden, experts, topk)
+            assert opts["intermediate_size"] == width and opts["swiglu_limit"] == clamp
+            assert opts["activation"] == ("silu_post_clamp" if family == "step5" else "silu")
+            assert (opts["tier0_bits"], opts["tier1_bits"]) == (4, 5)
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", family, "--role", "coordinator", "--route-distributions", "random",
+        "--output", "result.json", "--coordinator-arm", "current:mode=ws"])
+    assert b.coordinator_preflight(args)[3] == []
+
+
+def muse_fixture(tmp_path, ids=None):
+    import struct
+    layer = tmp_path / "layer013"
+    layer.mkdir(exist_ok=True)
+    ids = list(range(8)) * 2 if ids is None else ids
+    payloads = {"a00.ids": struct.pack("<" + "h" * len(ids), *ids),
+                "a00.weights": struct.pack("<" + "f" * len(ids), *([0.125] * len(ids)))}
+    for name, value in payloads.items():
+        (layer / (name + ".bin")).write_bytes(value)
+    data = dict(schema="cuteafd.muse.routes/1", layer=13, experts=256, top_k=8,
+                ids_dtype="<i2", weights_dtype="<f4",
+                files={name: hashlib.sha256(value).hexdigest() for name, value in payloads.items()})
+    index = layer / "index.json"
+    index.write_text(json.dumps(data))
+    return index
+
+
+def test_muse_routes_histogram_and_checksums(tmp_path):
+    b = benchmark()
+    index = muse_fixture(tmp_path)
+    waves = b.coordinator_route_waves(tmp_path, 13, "muse")
+    assert waves == [dict(layer=13, rows=2, content="a00", expert_rows=[(e, 2) for e in range(8)])]
+    assert b.coordinator_route_waves(index, family="muse") == waves
+    digest = b.coordinator_routes_sha256(tmp_path)
+    assert len(digest) == 64
+    assert b.coordinator_routes_sha256(index) == hashlib.sha256(index.read_bytes()).hexdigest()
+    (index.parent / "a00.ids.bin").write_bytes(b"bad")
+    with pytest.raises(ValueError, match="checksum"):
+        b.coordinator_route_waves(tmp_path, family="muse")
+
+
+@pytest.mark.parametrize("ids,match", [(list(range(7)), "payload size"),
+    ([0] * 8, "distinct"), (list(range(7)) + [256], "outside")])
+def test_muse_routes_reject_bad_ids(tmp_path, ids, match):
+    b = benchmark()
+    muse_fixture(tmp_path, ids)
+    with pytest.raises(ValueError, match=match):
+        b.coordinator_route_waves(tmp_path, family="muse")
+
+
+def test_muse_routes_reject_metadata_and_empty_selection(tmp_path):
+    b = benchmark()
+    index = muse_fixture(tmp_path)
+    with pytest.raises(ValueError, match="no selected waves"):
+        b.coordinator_route_waves(tmp_path, 12, "muse")
+    data = json.loads(index.read_text())
+    data["ids_dtype"] = ">i2"
+    index.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="little-endian"):
+        b.coordinator_route_waves(tmp_path, family="muse")
+
+
+@pytest.mark.parametrize("family", ["glm", "qwen4", "kimik3"])
+def test_generic_output_accessor_and_metadata_unchanged(family, tmp_path):
+    b = benchmark()
+    # Identity preserves the generic tensor's storage, dtype and bytes; no Muse allocation/copy.
+    output = bytes(range(256))
+    workspace = SimpleNamespace(output=output, partial_output=b"not a summed output")
+    assert b.coordinator_output(workspace, family) is output
+    assert b.coordinator_output(workspace, "muse") is workspace.partial_output
+    result = next(node for node in ast.walk(TREE) if isinstance(node, ast.keyword) and node.arg == "conditions"
+                  and "partial_program" in ast.unparse(node.value))
+    conditions = eval(compile(ast.Expression(result.value), str(SOURCE), "eval"),
+                      dict(partial_program=None, compact=None))
+    expected = ("synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); "
+                "common E4M3/UE8M0 K32-roundtripped BF16 input; "
+                "histogram replay preserves rescaled expert counts, not original token co-occurrence; "
+                "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; "
+                "median of interleaved round medians, microseconds per layer")
+    assert conditions.encode() == expected.encode()
+    path = tmp_path / "routes.json"
+    path.write_bytes(b'{"fixture":"unchanged"}\n')
+    assert b.coordinator_routes_sha256(path) == hashlib.sha256(path.read_bytes()).hexdigest()
+    run = next(node for node in ast.walk(TREE) if isinstance(node, ast.FunctionDef) and node.name == "run"
+               and any(isinstance(n, ast.Name) and n.id == "partial_program" for n in ast.walk(node)))
+    returned = run.body[-1].value
+    assert isinstance(returned, ast.IfExp) and ast.unparse(returned.orelse) == "result"
+
+
+def test_muse_callback_uses_unweighted_partial_abi(monkeypatch):
+    import sys
+    from unittest.mock import Mock
+
+    b = benchmark()
+    namespace = b.muse_partial_binding.__globals__
+    row_map = SimpleNamespace(data_ptr=lambda: 11)
+    partial_output = SimpleNamespace(data_ptr=lambda: 22)
+    torch = SimpleNamespace(empty=Mock(return_value=partial_output), arange=Mock(return_value=row_map),
+                            bfloat16="bf16", int32="i32")
+    monkeypatch.setitem(namespace, "torch", torch)
+    monkeypatch.setitem(namespace, "replace", lambda obj, **kw: SimpleNamespace(**(vars(obj) | kw)))
+    cute = SimpleNamespace(AddressSpace=SimpleNamespace(gmem="gmem"))
+    cutlass = SimpleNamespace(Uint32="u32", BFloat16="bf16", cute=cute)
+    make_ptr = Mock(side_effect=lambda dtype, address, space, assumed_align: (dtype, address, assumed_align))
+    monkeypatch.setitem(sys.modules, "cutlass", cutlass)
+    monkeypatch.setitem(sys.modules, "cutlass.cute", cute)
+    monkeypatch.setitem(sys.modules, "b12x._lib.utils", SimpleNamespace(make_ptr=make_ptr))
+    summed = Mock()
+    launch = SimpleNamespace(size_m=256, top_k=8, hidden_size=4096,
+                             topk_sum=SimpleNamespace(compiled=summed))
+    binding = SimpleNamespace(launch=launch, device="cuda:0")
+    workspace = SimpleNamespace(output=b"sum-buffer")
+    program = SimpleNamespace(compiled=Mock())
+    bound = b.muse_partial_binding(binding, workspace, program)
+    callback = bound.launch.topk_sum.compiled
+    callback("fc2", "ignored-sum", "ignored-weights", "ids", "map", "svh", 256, 256, 17, "stream")
+    program.compiled.assert_called_once_with("fc2", "svh", "ids", "map", ("u32", 11, 4),
+                                             ("bf16", 22, 16), 17, 17, 256, 256, "stream")
+    summed.assert_not_called()
+    assert binding.launch is launch and launch.topk_sum.compiled is summed
+    assert workspace.output == b"sum-buffer" and workspace.partial_output is partial_output
+    torch.empty.assert_called_once_with((256, 8, 4096), dtype="bf16", device="cuda:0")
+    assert any(cell.cell_contents is row_map for cell in callback.__closure__)
 
 
 def test_prerotate_requires_bf16_ws():
