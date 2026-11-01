@@ -738,6 +738,9 @@ PREFILL_FAMILIES = {
     "dsv4f": (4096, 256, 6, (4, 5), "silu"),
     "dsv4p": (7168, 384, 6, (2, 3), "silu"),
     "v41": (5120, 384, 6, (3, 4), "silu"),
+    "muse": (4096, 256, 8, (4, 5), "silu"),
+    "step5": (4096, 352, 8, (4, 5), "silu_post_clamp"),
+    "ml4": (6144, 128, 4, (4, 5), "silu"),
 }
 
 PREFILL_SWIGLU_LIMITS = {
@@ -748,6 +751,9 @@ PREFILL_SWIGLU_LIMITS = {
     "dsv4f": 10.0,
     "dsv4p": 10.0,
     "v41": 10.0,
+    "muse": None,
+    "step5": 7.0,
+    "ml4": None,
 }
 
 PREFILL_TIER_COUNTS = {
@@ -758,6 +764,9 @@ PREFILL_TIER_COUNTS = {
     "dsv4f": (192, 64),
     "dsv4p": (288, 96),
     "v41": (288, 96),
+    "muse": (256, 0),
+    "step5": (352, 0),
+    "ml4": (128, 0),
 }
 
 
@@ -1223,6 +1232,27 @@ COORDINATOR_FAMILIES = {
                    profiles={"rtx-tp1": 3072, "rtx-tp2": 1536,
                             "spark-tp4-width768": 768, "spark-tp6-width512": 512},
                    capacities=GLM_CAPACITIES, routes=None),
+    # Launchable ordinary widths only; compact companions and native K6 are not screened.
+    "muse": dict(hidden=4096, experts=256, top_k=8, bits=(4, 5), activation="silu",
+                 swiglu_limit=None, model="meta-models/Muse-Spark-Open-816B-A42B",
+                 profiles={"rtx-tp1": 4096, "rtx-tp2": 2048,
+                           "spark-tp4-width1024": 1024, "spark-tp5-width896": 896,
+                           "spark-tp5-width768": 768, "spark-tp6-width640": 640,
+                           "spark-tp7-width512": 512},
+                 capacities=GLM_CAPACITIES, routes=None),
+    "step5": dict(hidden=4096, experts=352, top_k=8, bits=(4, 5), activation="silu_post_clamp",
+                  swiglu_limit=7.0, model="stepfun-ai/Step-5-Preview",
+                  profiles={"rtx-tp1": 1536, "rtx-tp2": 768,
+                            "spark-tp3-width512": 512, "spark-tp4-width384": 384,
+                            "spark-tp5-width256": 256},
+                  capacities=GLM_CAPACITIES, routes=None),
+    "ml4": dict(hidden=6144, experts=128, top_k=4, bits=(4, 5), activation="silu",
+                swiglu_limit=None, model="mistralai/Mistral-Large-4-1T-A52B",
+                profiles={"rtx-tp1": 6144, "rtx-tp2": 3072,
+                          "spark-tp5-width1280": 1280, "spark-tp5-width1152": 1152,
+                          "spark-tp6-width1024": 1024, "spark-tp7-width896": 896,
+                          "spark-tp7-width768": 768},
+                capacities=GLM_CAPACITIES, routes=None),
 }
 # Shipped cooperative coordinator policy (`package_exl3_aot.py`): the route
 # block and rotation a family's exports actually use, so `served` arms and the
@@ -1236,6 +1266,9 @@ SERVED_ROUTE_BLOCKS = {
     "v41": lambda capacity: 8,
     "dsv4p": lambda capacity: 8 if capacity <= 256 else 64,
     "kimik3": lambda capacity: 64 if capacity == 1024 else 8,
+    "muse": lambda capacity: 8,
+    "step5": lambda capacity: 8,
+    "ml4": lambda capacity: 8,
 }
 SERVED_TOKEN_ROTATION = {
     "glm": lambda capacity: capacity > 256,
@@ -1244,6 +1277,9 @@ SERVED_TOKEN_ROTATION = {
     "v41": lambda capacity: False,
     "dsv4p": lambda capacity: capacity > 256,
     "kimik3": lambda capacity: capacity == 1024,
+    "muse": lambda capacity: False,
+    "step5": lambda capacity: False,
+    "ml4": lambda capacity: False,
 }
 
 
@@ -1351,10 +1387,63 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         ws_dynamic_tiles=bool(arm.get("dynamic", False)), **extra)
 
 
+def muse_route_waves(path, layer=None):
+    """Adapt checksum-verified golden route dumps to the existing histogram replay."""
+    import struct
+    from collections import Counter
+
+    root = Path(path)
+    indices = sorted(root.glob("layer*/index.json")) if root.is_dir() else [root]
+    waves = []
+    for index in indices:
+        data = json.loads(index.read_text())
+        if (data.get("schema") != "cuteafd.muse.routes/1" or data.get("experts") != 256
+                or data.get("top_k") != 8 or data.get("ids_dtype") != "<i2"
+                or data.get("weights_dtype") != "<f4"):
+            raise ValueError("expected cuteafd.muse.routes/1 with E256/top8 and little-endian ids/weights")
+        if layer is not None and data.get("layer") != layer:
+            continue
+        files = data.get("files", {})
+        for name in sorted(files):
+            if not name.endswith(".ids") or not re.fullmatch(r"[A-Za-z0-9_]+\.ids", name):
+                continue
+            payloads = []
+            for key in (name, name[:-4] + ".weights"):
+                payload = (index.parent / (key + ".bin")).read_bytes()
+                if hashlib.sha256(payload).hexdigest() != files.get(key):
+                    raise ValueError(f"Muse route checksum mismatch: {index.parent / key}")
+                payloads.append(payload)
+            ids, weights = payloads
+            if not ids or len(ids) % 16 or len(weights) != len(ids) * 2:
+                raise ValueError("Muse route payload size does not match top8 ids/weights")
+            route_ids = [v[0] for v in struct.iter_unpack("<h", ids)]
+            if any(len(set(route_ids[i:i + 8])) != 8 for i in range(0, len(route_ids), 8)):
+                raise ValueError("Muse route row must contain eight distinct experts")
+            counts = Counter(route_ids)
+            if min(counts) < 0 or max(counts) >= 256:
+                raise ValueError("Muse route expert id outside E256")
+            waves.append(dict(layer=data["layer"], rows=len(ids) // 16,
+                              content=name[:-4], expert_rows=sorted(counts.items())))
+    if not waves:
+        raise ValueError("Muse route fixture has no selected waves")
+    return waves
+
+
+def coordinator_routes_sha256(path):
+    path = Path(path)
+    if not path.is_dir():
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    # The index contains every binary payload digest, verified by muse_route_waves.
+    return hashlib.sha256(b"".join(p.relative_to(path).as_posix().encode() + b"\0" + p.read_bytes()
+                                  for p in sorted(path.glob("layer*/index.json")))).hexdigest()
+
+
 def coordinator_route_waves(path, layer=None, family="glm"):
     spec = COORDINATOR_FAMILIES.get(family)
     if spec is None or path is None:
         raise ValueError(f"no realistic route fixture for coordinator family {family!r}")
+    if family == "muse":
+        return muse_route_waves(path, layer)
     data = json.loads(Path(path).read_text())
     if (data.get("schema") != 1 or data.get("model") != spec["model"]
             or data.get("family", family) != family
@@ -1496,6 +1585,35 @@ def _power_limit_w(props):
         return None
 
 
+def coordinator_output(workspace, family):
+    return workspace.partial_output if family == "muse" else workspace.output
+
+
+def muse_partial_binding(binding, workspace, program):
+    """Replace only the sum callback; keep the validated bound expert core intact."""
+    import cutlass
+    import cutlass.cute as cute
+    from b12x._lib.utils import make_ptr
+
+    launch = binding.launch
+    if not hasattr(workspace, "partial_output"):
+        workspace.partial_output = torch.empty((launch.size_m, launch.top_k, launch.hidden_size),
+                                               dtype=torch.bfloat16, device=binding.device)
+    row_map = torch.arange(launch.size_m, dtype=torch.int32, device=binding.device)
+    row_ptr = make_ptr(cutlass.Uint32, row_map.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+    out_ptr = make_ptr(cutlass.BFloat16, workspace.partial_output.data_ptr(),
+                       cute.AddressSpace.gmem, assumed_align=16)
+
+    def partial(fc2, _summed, _weights, ids, expert_map, svh, local_experts, experts, rows, stream):
+        # Retain the identity map throughout capture/replay, not just its raw pointer.
+        _ = row_map
+        program.compiled(fc2, svh, ids, expert_map, row_ptr, out_ptr,
+                         rows, rows, local_experts, experts, stream)
+
+    topk_sum = replace(launch.topk_sum, compiled=partial)
+    return replace(binding, launch=replace(launch, topk_sum=topk_sum))
+
+
 def _run_coordinator_benchmark(args, device, props):
     from benchmarks.benchmark_exlr8_a16 import make_wire, real_route_ids, k4_noise_summary
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -1510,8 +1628,12 @@ def _run_coordinator_benchmark(args, device, props):
         raise ValueError(f"{args.prefill_family} {args.role} benchmark requires SM{target[0]}{target[1]}")
     torch.cuda.set_per_process_memory_fraction(min(0.9, (args.memory_cap_gib << 30) / props.total_memory), device)
     width = spec["profiles"][args.profile]
-    output_dtype = torch.bfloat16 if args.role == "spark" else torch.float32
-    bit_dtype = torch.int16 if args.role == "spark" else torch.int32
+    partial_program = None
+    if args.prefill_family == "muse":
+        from b12x.moe._shared.kernels.w4a16.expert_partial import compile_expert_partial_aot
+        partial_program = compile_expert_partial_aot(width=hidden, topk=topk, format="bf16")
+    output_dtype = torch.bfloat16 if args.role == "spark" or partial_program else torch.float32
+    bit_dtype = torch.int16 if output_dtype == torch.bfloat16 else torch.int32
     layers = [(_make_compact_prefill_layer(compact, width, args.seed + 2*i, device, mix,
                                            hidden=hidden, experts=experts, bits=args.bits or spec["bits"],
                                            activation=spec["activation"], family=args.prefill_family)
@@ -1535,6 +1657,8 @@ def _run_coordinator_benchmark(args, device, props):
             launch = arm_mix.compile_mixed_trellis(**options)
             workspace = arm_mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
             bindings = [arm_mix.bind_mixed_trellis(*layer, launch, **bind_counts) for layer in layers]
+            if partial_program is not None:
+                bindings = [muse_partial_binding(binding, workspace, partial_program) for binding in bindings]
             arm_mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
             states[name] = workspace, bindings
         generator = torch.Generator().manual_seed(args.seed + capacity)
@@ -1556,8 +1680,9 @@ def _run_coordinator_benchmark(args, device, props):
                         workspace, bindings = states[name]
                         source = wire if bindings[layer].launch.input_format == "e4m3_k32" else decoded
                         count = capacity if rows is None else rows
-                        return modules[name].run_bound_mixed_trellis(
+                        result = modules[name].run_bound_mixed_trellis(
                             source[:count], weights[:count], ids[:count], bindings[layer], workspace)
+                        return coordinator_output(workspace, args.prefill_family)[:count] if partial_program else result
                     expected = run(oracle_name).clone()
                     if expected.dtype != output_dtype or not bool(torch.isfinite(expected).all()) or not bool(expected.any()):
                         raise RuntimeError("oracle must use the role's sum dtype and be finite and nonzero")
@@ -1585,12 +1710,12 @@ def _run_coordinator_benchmark(args, device, props):
                             # Compact descriptors carry per-claim row state; a frozen
                             # graph must rebuild it every replay, not reuse a warm ring.
                             for _ in range(3 if compact else 1):
-                                workspace.output.fill_(float("nan"))
+                                coordinator_output(workspace, args.prefill_family).fill_(float("nan"))
                                 if compact:
                                     workspace.fc1.fill_(float("nan"))
                                     workspace.activated.fill_(float("nan"))
                                 graphs[name].replay()
-                                checks[name] &= torch.equal(workspace.output[:live].view(bit_dtype),
+                                checks[name] &= torch.equal(coordinator_output(workspace, args.prefill_family)[:live].view(bit_dtype),
                                                             reference.view(bit_dtype))
                         graphs[oracle_name + "_control"] = graphs[oracle_name]
                         samples = {name: [] for name in graphs}
@@ -1665,16 +1790,16 @@ def _run_coordinator_benchmark(args, device, props):
                                 for _ in range(3):
                                     workspace.fc1.fill_(float("nan"))
                                     workspace.activated.fill_(float("nan"))
-                                    workspace.output.fill_(float("nan"))
+                                    coordinator_output(workspace, args.prefill_family).fill_(float("nan"))
                                     graph.replay()
-                                short[name] = workspace.output[:rows].clone()
+                                short[name] = coordinator_output(workspace, args.prefill_family)[:rows].clone()
                             oracle = short[oracle_name].view(bit_dtype)
                             prefix = expected[:rows].float()
                             detail, coop_gap = {}, None
                             for name, _ in specs:
                                 values = short[name][:rows].float()
                                 gap = (values - prefix).abs()
-                                row_gap = gap.amax(dim=1) if gap.numel() else gap
+                                row_gap = gap.flatten(1).amax(dim=1) if gap.numel() else gap
                                 worst = int(row_gap.argmax()) if row_gap.numel() else 0
                                 entry = dict(
                                     finite=bool(torch.isfinite(values).all()),
@@ -1730,12 +1855,15 @@ def _run_coordinator_benchmark(args, device, props):
         source_sha256=PREFILL_SOURCE_SHA256,
         source_provenance=dict(snapshot="startup-before-torch-b12x", files=PREFILL_SOURCE_FILES,
                                scope="runner+b12x/**/*.py", digest="sha256(sorted(path:sha256\\n))"),
-        route_sha256=hashlib.sha256((args.routes or spec["routes"]).read_bytes()).hexdigest() if waves else None,
+        route_sha256=coordinator_routes_sha256(args.routes or spec["routes"]) if waves else None,
         output_dtype=str(output_dtype),
-        conditions="synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); common E4M3/UE8M0 K32-roundtripped BF16 input; "
+        conditions=("synthetic projection-major weights; Muse unweighted per-expert BF16 partials; common E4M3/UE8M0 K32-roundtripped BF16 input; "
+                    if partial_program else "synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); common E4M3/UE8M0 K32-roundtripped BF16 input; ")
+                   + (
                    "histogram replay preserves rescaled expert counts, not original token co-occurrence; "
-                   "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; "
-                   "median of interleaved round medians, microseconds per layer"
+                   + ("warm CUDA graphs, core+expert-partial epilogue only, routing and wire preparation excluded; "
+                      if partial_program else "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; ")
+                   + "median of interleaved round medians, microseconds per layer")
                    + ("; compact tiers use planner-replayed rotated H128 ownership and poisoned graph replays"
                       if compact else ""),
         exact=not failures, failures=failures, rows=records)
