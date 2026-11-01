@@ -148,6 +148,10 @@ def test_mimo_native_activation_contract(h, n, activation_precision, coded):
                     round_fc2_bf16=True)
     actual = run_pipeline(x, ids, routing, packed, width, True, n=n, coded=coded,
                           return_routes=True, **contract)
+    if not coded and n % 128 == 0:
+        legacy = run_pipeline(x, ids, routing, pack(weights, scales, False), width, False,
+                              n=n, return_routes=True, **contract)
+        assert torch.equal(legacy, actual), "A8/A16 legacy/exact layout mismatch"
     for capacity in (1, 16):
         prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed,
                               width, True, n=n, coded=coded, return_routes=True, **contract)

@@ -694,7 +694,11 @@ def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
         for tensor in scratch:
             tensor.fill_(255)
         run(live)
-        assert torch.equal(prefix(live), expected[:prefix(live).shape[0]]), ("live prefix", live)
+        actual_prefix = prefix(live)
+        expected_prefix = expected[:actual_prefix.shape[0]]
+        assert torch.equal(actual_prefix, expected_prefix), (
+            "live prefix", live, "max_abs", (actual_prefix.float() - expected_prefix.float()).abs().max().item(),
+            "actual", actual_prefix.flatten()[:8].tolist(), "expected", expected_prefix.flatten()[:8].tolist())
     if rows > 1:
         original = ids.clone()
         ids[1:] = ids[:1].expand_as(ids[1:])

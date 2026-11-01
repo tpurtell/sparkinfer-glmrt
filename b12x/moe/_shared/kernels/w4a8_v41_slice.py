@@ -837,7 +837,10 @@ class V41SliceFc1Kernel:
                     mid[row, col] = value
             cute.arch.sync_threads()
             if cutlass.const_expr(self.a16):
-                partial_bf16 = cute.recast_tensor(partial, cutlass.BFloat16)
+                partial_bf16 = cute.make_tensor(
+                    cute.recast_ptr(partial.iterator, dtype=cutlass.BFloat16),
+                    cute.make_layout(self.slices * self.routes * self.width),
+                )
                 base = (Int64(slice_id) * Int64(self.routes) + route_base) * Int64(self.width)
                 for task in range(tid, 16 * self.width, 128):
                     row, col = task // self.width, task % self.width
