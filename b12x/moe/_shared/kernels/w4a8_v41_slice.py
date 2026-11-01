@@ -514,12 +514,20 @@ class V41SliceFc1Kernel:
 
     def __init__(self, width, capacity, *, topk=6, intermediate=576, hidden=5120,
                  exact_storage=False, scale_codes=False, activation_precision="a8",
-                 swiglu_limit=10.0, silu_bf16_product=False, route_weight_before_fc2=True):
+                 swiglu_limit=10.0, silu_bf16_product=False, route_weight_before_fc2=True,
+                 fc1_k_splits=1):
         assert width in (32, 64, 128, 192)
         assert capacity > 0 and topk > 0
         assert hidden > 0 and hidden % 128 == 0
         assert intermediate > 0 and intermediate % 32 == 0
         assert activation_precision in ("a8", "a16")
+        assert fc1_k_splits in (1, 2, 4, 8)
+        assert (hidden // 128) % fc1_k_splits == 0
+        self.k_splits = fc1_k_splits
+        self.threads = 128 * fc1_k_splits
+        self.shared_bytes = (fc1_k_splits * (width * 128 + max(width * 2, 256) * 4)
+                             + 16 * width * 4)
+        assert self.shared_bytes <= 96 * 1024, "FC1 split exceeds shared-memory budget"
         self.a16 = activation_precision == "a16"
         self.swiglu_limit = float(swiglu_limit)
         self.silu_bf16_product = bool(silu_bf16_product)
@@ -553,7 +561,7 @@ class V41SliceFc1Kernel:
     ):
         self.kernel(x, xs, w13, s13, routing, partial, metadata).launch(
             grid=(self.slices, groups, 1),
-            block=(128, 1, 1),
+            block=(self.threads, 1, 1),
             stream=stream,
         )
 
@@ -569,7 +577,9 @@ class V41SliceFc1Kernel:
         metadata: cute.Tensor,
     ):
         tid = cute.arch.thread_idx()[0]
-        warp = tid // 32
+        team = tid // 128
+        team_tid = tid % 128
+        warp = team_tid // 32
         lane = tid % 32
         c = lane % 4
         g = lane // 4
@@ -591,21 +601,30 @@ class V41SliceFc1Kernel:
             start = slice_id * Int32(self.width)
             smem = cutlass.utils.SmemAllocator()
             b = smem.allocate_tensor(
-                Uint32, cute.make_layout(self.width * 32), byte_alignment=16
+                Uint32, cute.make_layout(self.k_splits * self.width * 32), byte_alignment=16
             )
             sf = smem.allocate_tensor(
-                Uint32, cute.make_layout(max(self.width * 2, 256)), byte_alignment=16
+                Uint32, cute.make_layout(self.k_splits * max(self.width * 2, 256)), byte_alignment=16
             )
             mid = smem.allocate_tensor(
                 Float32, cute.make_layout((16, self.width)), byte_alignment=16
             )
-            bb = shared_ptr_to_u32(b.iterator)
-            sb = shared_ptr_to_u32(sf.iterator)
+            if cutlass.const_expr(self.k_splits > 1):
+                # Weight staging is dead before the fold, so reuse its arena.
+                fold = cute.make_tensor(cute.recast_ptr(b.iterator, dtype=Float32),
+                                        cute.make_layout((self.k_splits, 16, self.width)))
+            bbase = team * Int32(self.width * 32)
+            sbase = team * Int32(max(self.width * 2, 256))
+            bb = shared_ptr_to_u32(b.iterator) + bbase * Int32(4)
+            sb = shared_ptr_to_u32(sf.iterator) + sbase * Int32(4)
             gate = cute.make_rmem_tensor((self.width // 32, 4), Float32)
             gate.fill(0)
             up = cute.make_rmem_tensor((self.width // 32, 4), Float32)
             up.fill(0)
-            for kt in range(self.hidden_tiles):
+            # Each four-warp team owns disjoint K128 iterations; all teams
+            # synchronize uniformly and fold their FP32 sums in team order.
+            for step in range(self.hidden_tiles // self.k_splits):
+                kt = step * Int32(self.k_splits) + team
                 if cutlass.const_expr(self.exact_storage):
                     stage_v41_exact_b(
                         w13,
@@ -613,7 +632,7 @@ class V41SliceFc1Kernel:
                         expert * Int64(self.kernel_intermediate * self.hidden // 4),
                         start,
                         kt,
-                        tid,
+                        team_tid,
                         self.width,
                         self.intermediate,
                         self.hidden,
@@ -627,7 +646,7 @@ class V41SliceFc1Kernel:
                         Int32(self.hidden_tiles),
                         kt,
                         start,
-                        tid,
+                        team_tid,
                         128,
                         self.width,
                     )
@@ -638,7 +657,7 @@ class V41SliceFc1Kernel:
                         expert * Int64(self.kernel_intermediate * self.hidden // 4),
                         start,
                         kt,
-                        tid,
+                        team_tid,
                         self.width,
                         self.intermediate,
                         self.hidden,
@@ -653,12 +672,12 @@ class V41SliceFc1Kernel:
                         Int32(self.hidden_tiles),
                         kt,
                         start + self.kernel_intermediate,
-                        tid,
+                        team_tid,
                         128,
                         self.width,
                     )
                 if cutlass.const_expr(self.scale_codes):
-                    stage_scale_codes_slice(s13, sb, expert, kt, start, tid,
+                    stage_scale_codes_slice(s13, sb, expert, kt, start, team_tid,
                                             self.width, 2 * self.kernel_intermediate,
                                             self.hidden // 32,
                                             self.intermediate if self.exact_storage else 0)
@@ -669,7 +688,7 @@ class V41SliceFc1Kernel:
                         expert * Int64(self.kernel_intermediate * self.hidden // 64),
                         start,
                         kt,
-                        tid,
+                        team_tid,
                         self.width,
                         self.intermediate,
                         self.hidden,
@@ -683,13 +702,13 @@ class V41SliceFc1Kernel:
                         Int32(self.hidden_tiles),
                         kt,
                         start,
-                        tid,
+                        team_tid,
                         128,
                         self.width,
                     )
                 if cutlass.const_expr(self.scale_codes):
                     stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
-                                            start + self.kernel_intermediate, tid,
+                                            start + self.kernel_intermediate, team_tid,
                                             self.width, 2 * self.kernel_intermediate,
                                             self.hidden // 32,
                                             self.intermediate if self.exact_storage else 0)
@@ -700,7 +719,7 @@ class V41SliceFc1Kernel:
                         expert * Int64(self.kernel_intermediate * self.hidden // 64),
                         start,
                         kt,
-                        tid,
+                        team_tid,
                         self.width,
                         self.intermediate,
                         self.hidden,
@@ -715,7 +734,7 @@ class V41SliceFc1Kernel:
                         Int32(self.hidden_tiles),
                         kt,
                         start + self.kernel_intermediate,
-                        tid,
+                        team_tid,
                         128,
                         self.width,
                     )
@@ -733,12 +752,12 @@ class V41SliceFc1Kernel:
                                 a1, a3 = x[input_hi, at], x[input_hi, at + 4]
                             for nf in cutlass.range_constexpr(self.width // 32):
                                 index = ((kb * (self.width // 32) + nf) * 32 + g * 4 + half * 2) * 4 + warp
-                                su = (sf[nf * 32 + warp * 8 + g] >> Uint32(kb * 8)) & Uint32(255)
-                                sg = (sf[self.width + nf * 32 + warp * 8 + g] >> Uint32(kb * 8)) & Uint32(255)
-                                u0 = e2m1x2_scaled_bf16(b[index] >> Uint32(c * 8), su)
-                                u1 = e2m1x2_scaled_bf16(b[index + 4] >> Uint32(c * 8), su)
-                                g0 = e2m1x2_scaled_bf16(b[index + self.width * 16] >> Uint32(c * 8), sg)
-                                g1 = e2m1x2_scaled_bf16(b[index + self.width * 16 + 4] >> Uint32(c * 8), sg)
+                                su = (sf[sbase + nf * 32 + warp * 8 + g] >> Uint32(kb * 8)) & Uint32(255)
+                                sg = (sf[sbase + self.width + nf * 32 + warp * 8 + g] >> Uint32(kb * 8)) & Uint32(255)
+                                u0 = e2m1x2_scaled_bf16(b[bbase + index] >> Uint32(c * 8), su)
+                                u1 = e2m1x2_scaled_bf16(b[bbase + index + 4] >> Uint32(c * 8), su)
+                                g0 = e2m1x2_scaled_bf16(b[bbase + index + self.width * 16] >> Uint32(c * 8), sg)
+                                g1 = e2m1x2_scaled_bf16(b[bbase + index + self.width * 16 + 4] >> Uint32(c * 8), sg)
                                 d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
                                     gate[nf, 0], gate[nf, 1], gate[nf, 2], gate[nf, 3],
                                     a0, a1, a2, a3, g0, g1)
@@ -764,10 +783,10 @@ class V41SliceFc1Kernel:
                             scale = Uint32(xs[input_scale, kt * 4 + kb])
                         for nf in cutlass.range_constexpr(self.width // 32):
                             index = ((kb * (self.width // 32) + nf) * 32 + lane) * 4 + warp
-                            u0, u1 = e2m1x8_to_qmma_e2m1x8(b[index])
-                            g0, g1 = e2m1x8_to_qmma_e2m1x8(b[index + self.width * 16])
-                            su = sf[nf * 32 + warp * 8 + g]
-                            sg = sf[self.width + nf * 32 + warp * 8 + g]
+                            u0, u1 = e2m1x8_to_qmma_e2m1x8(b[bbase + index])
+                            g0, g1 = e2m1x8_to_qmma_e2m1x8(b[bbase + index + self.width * 16])
+                            su = sf[sbase + nf * 32 + warp * 8 + g]
+                            sg = sf[sbase + self.width + nf * 32 + warp * 8 + g]
                             d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
                                 gate[nf, 0],
                                 gate[nf, 1],
@@ -807,34 +826,64 @@ class V41SliceFc1Kernel:
                             up[nf, 2] = d2
                             up[nf, 3] = d3
                 cute.arch.sync_threads()
-            for nf in cutlass.range_constexpr(self.width // 32):
-                for elem in cutlass.range_constexpr(4):
-                    row = g + (elem // 2) * 8
-                    col = nf * 32 + warp * 8 + c * 2 + elem % 2
-                    gv = gate[nf, elem].to(cutlass.BFloat16).to(Float32)
-                    uv = up[nf, elem].to(cutlass.BFloat16).to(Float32)
-                    if cutlass.const_expr(self.swiglu_limit > 0):
-                        gv = fmin_f32(gv, Float32(self.swiglu_limit))
-                        uv = fmax_f32(Float32(-self.swiglu_limit), fmin_f32(uv, Float32(self.swiglu_limit)))
-                    value = Float32(0)
-                    if row < rows and start + col < self.intermediate:
-                        if cutlass.const_expr(self.silu_bf16_product):
-                            # Explicit packing preserves the BF16 store boundary through optimization.
-                            gv, uv = bfloat2_to_float2_scaled(
-                                pack_f32x2_to_bfloat2(gv, uv), Float32(1))
-                            silu = div_rn_f32(gv, Float32(1) + cute.math.exp(-gv, fastmath=False))
-                            silu, _ = bfloat2_to_float2_scaled(
-                                pack_f32x2_to_bfloat2(silu, silu), Float32(1))
-                            product = silu * uv
-                            product, _ = bfloat2_to_float2_scaled(
-                                pack_f32x2_to_bfloat2(product, product), Float32(1))
-                        else:
-                            sigmoid = cute.arch.rcp_approx(Float32(1) + cute.math.exp(-gv, fastmath=True))
-                            product = gv * sigmoid * uv
-                        if cutlass.const_expr(self.route_weight_before_fc2):
-                            product *= routing[route_base + Int64(row)]
-                        value = product.to(cutlass.BFloat16).to(Float32)
-                    mid[row, col] = value
+            if cutlass.const_expr(self.k_splits > 1):
+                for nf in cutlass.range_constexpr(self.width // 32):
+                    for elem in cutlass.range_constexpr(4):
+                        row = g + (elem // 2) * 8
+                        col = nf * 32 + warp * 8 + c * 2 + elem % 2
+                        fold[team, row, col] = gate[nf, elem]
+                cute.arch.sync_threads()
+                if team == 0:
+                    for nf in cutlass.range_constexpr(self.width // 32):
+                        for elem in cutlass.range_constexpr(4):
+                            row = g + (elem // 2) * 8
+                            col = nf * 32 + warp * 8 + c * 2 + elem % 2
+                            for part in cutlass.range_constexpr(1, self.k_splits):
+                                gate[nf, elem] = fadd_rn_f32(gate[nf, elem], fold[part, row, col])
+                cute.arch.sync_threads()
+                for nf in cutlass.range_constexpr(self.width // 32):
+                    for elem in cutlass.range_constexpr(4):
+                        row = g + (elem // 2) * 8
+                        col = nf * 32 + warp * 8 + c * 2 + elem % 2
+                        fold[team, row, col] = up[nf, elem]
+                cute.arch.sync_threads()
+                if team == 0:
+                    for nf in cutlass.range_constexpr(self.width // 32):
+                        for elem in cutlass.range_constexpr(4):
+                            row = g + (elem // 2) * 8
+                            col = nf * 32 + warp * 8 + c * 2 + elem % 2
+                            for part in cutlass.range_constexpr(1, self.k_splits):
+                                up[nf, elem] = fadd_rn_f32(up[nf, elem], fold[part, row, col])
+                cute.arch.sync_threads()
+            if team == 0:
+                for nf in cutlass.range_constexpr(self.width // 32):
+                    for elem in cutlass.range_constexpr(4):
+                        row = g + (elem // 2) * 8
+                        col = nf * 32 + warp * 8 + c * 2 + elem % 2
+                        gv = gate[nf, elem].to(cutlass.BFloat16).to(Float32)
+                        uv = up[nf, elem].to(cutlass.BFloat16).to(Float32)
+                        if cutlass.const_expr(self.swiglu_limit > 0):
+                            gv = fmin_f32(gv, Float32(self.swiglu_limit))
+                            uv = fmax_f32(Float32(-self.swiglu_limit), fmin_f32(uv, Float32(self.swiglu_limit)))
+                        value = Float32(0)
+                        if row < rows and start + col < self.intermediate:
+                            if cutlass.const_expr(self.silu_bf16_product):
+                                # Explicit packing preserves the BF16 store boundary through optimization.
+                                gv, uv = bfloat2_to_float2_scaled(
+                                    pack_f32x2_to_bfloat2(gv, uv), Float32(1))
+                                silu = div_rn_f32(gv, Float32(1) + cute.math.exp(-gv, fastmath=False))
+                                silu, _ = bfloat2_to_float2_scaled(
+                                    pack_f32x2_to_bfloat2(silu, silu), Float32(1))
+                                product = silu * uv
+                                product, _ = bfloat2_to_float2_scaled(
+                                    pack_f32x2_to_bfloat2(product, product), Float32(1))
+                            else:
+                                sigmoid = cute.arch.rcp_approx(Float32(1) + cute.math.exp(-gv, fastmath=True))
+                                product = gv * sigmoid * uv
+                            if cutlass.const_expr(self.route_weight_before_fc2):
+                                product *= routing[route_base + Int64(row)]
+                            value = product.to(cutlass.BFloat16).to(Float32)
+                        mid[row, col] = value
             cute.arch.sync_threads()
             if cutlass.const_expr(self.a16):
                 partial_bf16 = cute.make_tensor(
@@ -842,7 +891,7 @@ class V41SliceFc1Kernel:
                     cute.make_layout(self.slices * self.routes * self.width),
                 )
                 base = (Int64(slice_id) * Int64(self.routes) + route_base) * Int64(self.width)
-                for task in range(tid, 16 * self.width, 128):
+                for task in range(tid, 16 * self.width, self.threads):
                     row, col = task // self.width, task % self.width
                     if row < rows:
                         partial_bf16[base + Int64(task)] = mid[row, col].to(cutlass.BFloat16)
@@ -854,7 +903,7 @@ class V41SliceFc1Kernel:
                 qa_base = (Int64(slice_id) * Int64(self.routes) + route_base) * Int64(self.width // 4)
                 qs_offset = Int64(self.slices * self.routes * (self.width // 4))
                 qs_base = qs_offset + (Int64(slice_id) * Int64(self.routes) + route_base) * Int64(self.width // 32)
-                for task in range(tid, 16 * (self.width // 32), 128):
+                for task in range(tid, 16 * (self.width // 32), self.threads):
                     row = task // (self.width // 32)
                     block = task % (self.width // 32)
                     values = cute.make_rmem_tensor((32,), Float32)

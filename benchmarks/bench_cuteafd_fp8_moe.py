@@ -192,11 +192,21 @@ def parse_args(argv=None):
                         help="development native arm: exact W13 rows with only W2 payload pitch aligned to 128 columns")
     parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE",
                         help="explicit development native arm; repeat for each resident extent and slice tile")
+    parser.add_argument("--fc1-k-splits", help="development paired native K-team counts, comma-separated 1/2/4/8")
     parser.add_argument("--control-repeats", type=int, default=2,
                         help="identical padded controls in the tiling screen, including its reference")
     args = parser.parse_args(argv)
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.fc1_k_splits is not None:
+        try:
+            splits = [int(value) for value in args.fc1_k_splits.split(",")]
+        except ValueError:
+            parser.error("FC1 K splits must be comma-separated 1/2/4/8")
+        if (not splits or len(set(splits)) != len(splits) or any(value not in (1, 2, 4, 8) for value in splits)
+                or not args.mxfp4_pair or not (args.mxfp4_unify or args.native_slices)
+                or args.profile_dir):
+            parser.error("FC1 K splits require native paired mode without profiling, and unique 1/2/4/8 values")
     if args.continue_on_fail and (not args.check or args.exact_sweep):
         parser.error("--continue-on-fail requires --check and no --exact-sweep")
     if args.exact_baseline and not args.exact_sweep:
@@ -500,6 +510,13 @@ def paired_widths(intermediate, requested=None):
     return sorted(widths)
 
 
+def fc1_split_tiles(hidden, splits, tiles=(32, 64, 128, 192)):
+    """Feasible development arms; shared weight storage doubles as the FP32 fold."""
+    return [(tile, split) for split in tuple(splits) for tile in tiles
+            if hidden // 128 % split == 0
+            and split * (tile * 128 + max(tile * 2, 256) * 4) + 64 * tile <= 96 * 1024]
+
+
 def native_slice_width(family, rank_width):
     # Preserve V4.1 TP8's shipped width-192 fold across its masked final plane.
     return 192 if family == "v41" and (rank_width % 192 == 0 or rank_width == 288) else 128
@@ -508,7 +525,7 @@ def native_slice_width(family, rank_width):
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
                     aligned_w2=False, aligned_w2_scales=False, stored_width=None,
                     activation_precision="a8", projection_contract=None,
-                    combine_output=False, ingress="wire"):
+                    combine_output=False, ingress="wire", fc1_k_splits=1):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -571,7 +588,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                                 intermediate=intermediate, hidden=hidden,
                                 exact_storage=tail or stored_width is not None,
                                 atomic_tokens=atomic, scale_codes=coded,
-                                activation_precision=activation_precision,
+                                activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
                                 **(projection_contract or {}))
     if stored_width is not None:
         # Physical strides come from P; the launch only visits the real S slices.
@@ -933,15 +950,19 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 owned.append((buffers, execute))
             contract = dict(swiglu_limit=0., silu_bf16_product=True,
                             route_weight_before_fc2=False, round_fc2_bf16=True)
-            for precision in ("a8", "a16"):
-                label = "native-" + precision
+            variants = {"native-" + precision: (precision, 128, 1) for precision in ("a8", "a16")}
+            if args.fc1_k_splits:
+                for tile, split in fc1_split_tiles(g.hidden, map(int, args.fc1_k_splits.split(","))):
+                    for precision in ("a8", "a16"):
+                        variants[f"native-{precision}-t{tile}-k{split}"] = (precision, tile, split)
+            for label, (precision, tile, split) in variants.items():
                 try:
                     runs[label], outputs[label], keep = native_pair_arm(
-                        x, ids, routing, weights, scales, 128, True, False, False,
+                        x, ids, routing, weights, scales, tile, True, False, False,
                         activation_precision=precision, projection_contract=contract,
-                        combine_output=True, ingress="wire", qualify=True)
+                        combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split)
                 except AssertionError as error:
-                    raise AssertionError(f"native {precision}, rows={rows}, width={width}: {error}") from error
+                    raise AssertionError(f"native {label}, rows={rows}, width={width}: {error}") from error
                 owned.append(keep)
             for label, run in list(runs.items()):
                 run()
@@ -957,13 +978,17 @@ def mxfp4_unify_screen(g, args, geometry_type):
             oracle = mxfp4_f32_reference(x, ids, routing, weights, scales)
             errors = {label: f32_errors(output, oracle) for label, output in outputs.items()}
             matched_errors = {}
-            for precision in ("a8", "a16"):
-                matched = (mxfp4_f32_reference(x, ids, routing, weights, scales,
-                           activation_precision="a8") if precision == "a8" else oracle)
-                error = f32_errors(outputs["native-" + precision], matched)
+            references = {"a16": oracle, "a8": mxfp4_f32_reference(
+                x, ids, routing, weights, scales, activation_precision="a8")}
+            eligible = {}
+            for label, (precision, _, _) in variants.items():
+                matched = references[precision]
+                error = f32_errors(outputs[label], matched)
                 normalized_rms = error["rms"] / max(matched.square().mean().sqrt().item(), 1e-8)
-                assert normalized_rms < .02, ("native matched oracle", precision, normalized_rms)
-                matched_errors[precision] = dict(**error, normalized_rms=normalized_rms)
+                assert normalized_rms < .02, ("native matched oracle", label, normalized_rms)
+                matched_errors[label] = dict(**error, normalized_rms=normalized_rms)
+                baseline = f32_errors(outputs["native-" + precision], matched)
+                eligible[label] = all(error[key] <= baseline[key] for key in ("max_abs", "rms"))
             if args.profile_dir:
                 profile_pair_arm(runs, args, g.name, width, rows)
                 continue
@@ -978,7 +1003,10 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           weight_sha256=weight_hash, samples_us=samples, median_us=medians,
                           speedup={label: medians["current"] / medians[label] for label in runs},
                           f32_errors=errors, matched_f32_errors=matched_errors, comparisons=comparisons,
-                          invariant_checks="poison/live/graph/row-mix", slice_width=128)
+                          invariant_checks="poison/live/graph/row-mix", slice_width=128,
+                          fc1_variants={label: dict(precision=precision, tile=tile, k_splits=split)
+                                        for label, (precision, tile, split) in variants.items()},
+                          quality_eligible=eligible)
             results.append(record)
             print(json.dumps(record), flush=True)
             del owned, runs, outputs
@@ -1039,7 +1067,17 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                 baseline_tile = (native_slice_width(g.name, width) if args.native_slices else
                                  matching_warps if route == "decode" else None)
                 tiles = (64, 128, 192) if args.native_slices else (mxfp4_decode_partitions(width) if route == "decode" else (None,))
+                if args.fc1_k_splits and args.native_slices and not explicit:
+                    baseline_tile = 128
                 specs, controls = tiling_specs(args, width, baseline_tile, tiles)
+                k_splits = {label: 1 for label, _, _, _ in specs}
+                if args.fc1_k_splits:
+                    specs = [(label, True if label in controls else exact, tile, stored)
+                             for label, exact, tile, stored in specs]
+                    for tile, split in fc1_split_tiles(g.hidden, map(int, args.fc1_k_splits.split(","))):
+                        label = f"exact-t{tile}-k{split}"
+                        specs.append((label, True, tile, None))
+                        k_splits[label] = split
                 runs, outputs, keepalive, invariants, resident_widths = {}, {}, [], {}, {}
                 for label, exact, tile, stored in specs:
                     try:
@@ -1048,7 +1086,7 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                                                                 exact, False, g.name == "v41", qualify=True,
                                                                 aligned_w2=label.startswith("aligned-w2"),
                                                                 aligned_w2_scales=label == "aligned-w2-scales",
-                                                                stored_width=stored)
+                                                                stored_width=stored, fc1_k_splits=k_splits[label])
                         else:
                             stored = width if exact else padded
                             geometry = geometry_type(g.name, g.hidden, experts, topk, g.intermediate,
@@ -1115,7 +1153,7 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                               resident_payload_bytes=experts * expert_bytes, samples_us=samples,
                               resident_widths=resident_widths,
                               slice_widths={label: tile for label, _, tile, _ in specs if label in runs},
-                              controls=controls,
+                              controls=controls, fc1_k_splits=k_splits,
                               resident_payload_bytes_by_arm={label: experts * g.hidden *
                                   (2 * width + padded if label.startswith("aligned-w2") else
                                    3 * resident_widths[label]) // 2 for label in runs},
