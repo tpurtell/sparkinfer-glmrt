@@ -71,10 +71,12 @@ def test_invalid_pair_modes_fail_before_cuda(argv):
 
 
 @pytest.mark.parametrize("family,arm,mode", [("mimof", "current", "--mxfp4-unify"),
-    ("mimof", "native-a8", "--mxfp4-unify"), ("v41", "native-exact", "--native-slices")])
+    ("mimof", "native-a8", "--mxfp4-unify"),
+    ("mimof", "native-a8-t64-k2", "--mxfp4-unify"), ("v41", "native-exact", "--native-slices")])
 def test_paired_profile_selects_one_warmed_arm(tmp_path, monkeypatch, family, arm, mode):
     args = bench.parse_args(["--mxfp4-pair", mode, "--geometry", family, "--rows", "1",
-                             "--profile-dir", str(tmp_path), "--profile-arm", arm])
+                             "--profile-dir", str(tmp_path), "--profile-arm", arm,
+                             *(["--fc1-k-splits", "2"] if "-t64-k2" in arm else [])])
     events = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda name: events.append(name))
