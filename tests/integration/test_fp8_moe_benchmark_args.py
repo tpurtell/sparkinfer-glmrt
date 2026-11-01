@@ -33,8 +33,10 @@ def test_cross_cta_scratch_includes_every_raw_projection(precision, width, cta):
     assert namespace["fc1_partial_words"](80, width, 8, 288, precision, cta) == expected
 
 
-def test_mxfp4_pair_widths_cover_all_worlds_without_padding():
-    assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 480, 576, 768, 1152]
+def test_mxfp4_pair_widths_cover_all_worlds_without_padding(monkeypatch):
+    monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
+        ownership_unit=lambda intermediate, world: 64 if (intermediate, world) == (2304, 5) else 32))
+    assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 512, 576, 768, 1152]
     assert bench.paired_widths(2048) == [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]
     assert bench.paired_widths(3072) == [384, 416, 448, 512, 608, 640, 768, 1024, 1536]
     args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--geometry", "v41", "--widths", "448,480"])
@@ -654,3 +656,51 @@ def test_existing_jsonl_replays_exact_narrow_rows_and_wide_histograms(tmp_path):
 def test_malformed_jsonl_routes_fail_closed(tmp_path, record):
     with pytest.raises(ValueError):
         bench.recorded_waves(jsonl_routes(tmp_path, [record]), SimpleNamespace(name="v41", experts=4, top_k=2))
+
+
+@pytest.mark.parametrize("family,width,tile,atomic,coded", [
+    ("dsv4f", 256, 128, True, False), ("dsv4f", 512, 128, True, False),
+    ("dsv4f", 1024, 128, True, False), ("dsv4f", 320, 128, False, False),
+    ("v41", 288, 64, False, True), ("v41", 512, 128, False, True),
+    ("v41", 576, 192, False, True)])
+def test_shipped_prefill_recipe_uses_policy(monkeypatch, family, width, tile, atomic, coded):
+    calls = []
+    def select(hidden, width, sm, capacity, fallback):
+        calls.append((hidden, width, sm, capacity, fallback))
+        return 64 if hidden == 5120 and width == 288 else fallback
+    monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
+        native_slice_width=select, stored_width=lambda hidden, width: width))
+    hidden = 5120 if family == "v41" else 4096
+    assert bench.shipped_prefill_recipe(family, hidden, width, 256, "engine") == dict(
+        tile=tile, exact=True, atomic=atomic, coded=coded)
+    assert calls[0][2:4] == (121, 256)
+
+
+@pytest.mark.parametrize("family", ["v41", "dsv4f"])
+def test_shipped_prefill_cli_is_bounded(family):
+    args = ["--geometry", family, "--mxfp4-pair", "--mxfp4-unify", "--native-stream",
+            "--shipped-prefill", "--engine-policy-root", "engine", "--rows", "256,1024,4096"]
+    assert bench.parse_args(args).shipped_prefill
+    for extra in (["--rows", "80"], ["--capacity", "4096"], ["--row-major-mma"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(args + extra)
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--shipped-prefill"])
+
+
+def test_implicit_widths_require_shared_policy():
+    with pytest.raises(ValueError, match="engine-policy-root"):
+        bench.paired_widths(2304)
+    assert bench.paired_widths(2304, "448,512") == [448, 512]
+
+
+def test_atomic_controls_do_not_claim_determinism():
+    tree = ast.parse(_PATH.read_text())
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    atomic = ast.unparse(funcs["qualify_atomic_pair_replay"])
+    assert "assert_close" in atomic and "deterministic=False" in atomic
+    ordered = ast.unparse(funcs["qualify_pair_replay"])
+    assert "repeat determinism" in ordered and "torch.equal(output, expected)" in ordered
+    native = ast.unparse(funcs["native_pair_arm"])
+    assert "1 if atomic else topk" in native
+    assert "qualify_atomic_pair_replay if atomic else qualify_pair_replay" in native
