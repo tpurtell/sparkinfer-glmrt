@@ -560,7 +560,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                     aligned_w2=False, aligned_w2_scales=False, stored_width=None,
                     activation_precision="a8", projection_contract=None,
                     combine_output=False, ingress="wire", fc1_k_splits=1, fc1_cta_splits=1,
-                    stream_decode=False):
+                    stream_decode=False, row_major_a8=False):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -590,6 +590,16 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
         raise ValueError("aligned W2 scales require the aligned W2 payload arm")
     w2_pitch = (intermediate + 127) // 128 * 128 if aligned_w2 else None
     packed = pack(weights, scales, tail, w2_pitch=w2_pitch)
+    if row_major_a8:
+        if rows > 80 or activation_precision != "a8" or atomic or coded or stored_width is not None:
+            raise ValueError("row-major A8 benchmark requires ordered raw-scale decode <=80")
+        # Development input only; no resident pack or production layout changes.
+        up_gate = torch.cat((weights["w3"], weights["w1"]), 1)
+        up_gate_scales = torch.cat((scales["w3"], scales["w1"]), 1)
+        down_scales = torch.nn.functional.pad(scales["w2"],
+                      (0, (intermediate // 32 + 3) // 4 * 4 - intermediate // 32))
+        packed = [up_gate.cuda().view(torch.uint32).flatten(), up_gate_scales.cuda().flatten(),
+                  weights["w2"].cuda().view(torch.uint32).flatten(), down_scales.cuda().flatten()]
     if coded:
         stored = intermediate if exact else (intermediate + 127) // 128 * 128
         s13 = torch.cat(tuple(torch.nn.functional.pad(scales[name], (0, 0, 0, stored - intermediate))
@@ -608,7 +618,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     routes = rows * topk
     from b12x.moe._shared.kernels.v41_slice_pipeline import fc1_partial_words
     partial_words = 1 if atomic else fc1_partial_words(
-        rows, width, topk, logical, activation_precision, fc1_cta_splits, stream_decode)
+        rows, width, topk, logical, activation_precision, fc1_cta_splits, stream_decode or row_major_a8)
     partial = torch.empty((partial_words,), device="cuda")
     output = torch.empty(rows * hidden if atomic else (routes, hidden), device="cuda")
     scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
@@ -627,6 +637,14 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                                 activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
                                 fc1_cta_splits=fc1_cta_splits, stream_decode=stream_decode,
                                 **(projection_contract or {}))
+    if row_major_a8:
+        from b12x.moe._shared.kernels.mxfp4_row_major_decode import RowMajorA8Fc1, RowMajorA8Fc2
+        pipeline.fc1 = RowMajorA8Fc1(width, rows, topk=topk, intermediate=intermediate,
+                                    hidden=hidden, exact_storage=True,
+                                    activation_precision="a8", **(projection_contract or {}))
+        pipeline.fc2 = RowMajorA8Fc2(pipeline.fc1,
+                           round_fc2_bf16=(projection_contract or {}).get("round_fc2_bf16", False))
+        pipeline.partial_words = partial_words
     if stored_width is not None:
         # Physical strides come from P; the launch only visits the real S slices.
         for kernel in (pipeline.fc1, pipeline.fc2, pipeline.reduce):
