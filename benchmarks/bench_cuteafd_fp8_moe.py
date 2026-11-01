@@ -190,8 +190,8 @@ def parse_args(argv=None):
                         help="screen native tiles 64/128/192 (explicit arms also allow 32) or grouped decode warp partitions")
     parser.add_argument("--mxfp4-w2-pitch", action="store_true",
                         help="development native arm: exact W13 rows with only W2 payload pitch aligned to 128 columns")
-    parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE",
-                        help="explicit development native arm; repeat for each resident extent and slice tile")
+    parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE[:SPLIT]",
+                        help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
     parser.add_argument("--fc1-k-splits", help="development paired native K-team counts, comma-separated 1/2/4/8")
     parser.add_argument("--control-repeats", type=int, default=2,
                         help="identical padded controls in the tiling screen, including its reference")
@@ -270,7 +270,10 @@ def parse_args(argv=None):
                         for tile, split in fc1_split_tiles(4096 if args.geometry == "mimof" else 6144,
                                                          map(int, args.fc1_k_splits.split(",")))
                         for precision in ("a8", "a16")}
-        if args.profile_arm not in allowed or args.mxfp4_tilings:
+        explicit_profile = bool(args.mxfp4_arm and args.mxfp4_tilings)
+        if explicit_profile:
+            allowed = {arm[0] for arm in native_screen_arms(args.mxfp4_arm)}
+        if args.profile_arm not in allowed or (args.mxfp4_tilings and not explicit_profile):
             parser.error("paired profiling requires one --profile-arm from the native or unification screen")
     return args
 
@@ -413,18 +416,24 @@ def native_screen_arms(values):
     result = []
     for value in values:
         try:
-            name, logical, stored, tile = value.split(":")
+            fields = value.split(":")
+            if len(fields) not in (4, 5):
+                raise ValueError("invalid field count")
+            name, logical, stored, tile = fields[:4]
             logical, stored, tile = int(logical), int(stored), int(tile)
+            split = int(fields[4]) if len(fields) == 5 else 1
         except ValueError as error:
-            raise ValueError("native arm must be NAME:LOGICAL:STORED:TILE") from error
+            raise ValueError("native arm must be NAME:LOGICAL:STORED:TILE[:SPLIT]") from error
         if (not name or name.startswith(("padded", "matching", "exact-", "aligned-w2"))
                 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in name)
-                or not 0 < logical <= stored or logical % 32 or stored % 32
-                or tile not in (32, 64, 128, 192)):
-            raise ValueError("native arms need unique names, whole-K32 extents and tile32/64/128/192")
+                or logical <= 0 or logical % 32 or stored % 32 or stored < 0
+                or (stored != 0 and stored < logical) or tile not in (32, 64, 128, 192)
+                or split not in (1, 2, 4, 8)
+                or not fc1_split_tiles(1024, (split,), (tile,))):
+            raise ValueError("native arms need unique names, K32 extents (stored=0 for legacy), feasible tile/split")
         if name in {arm[0] for arm in result}:
             raise ValueError("duplicate native arm name")
-        result.append((name, logical, stored, tile))
+        result.append((name, logical, stored, tile, split))
     return result
 
 
@@ -466,7 +475,7 @@ def tiling_specs(args, width, baseline_tile, tiles):
     controls = ["padded", *(f"padded-control-{n}" for n in range(1, args.control_repeats))]
     specs = [(label, False, baseline_tile, None) for label in controls]
     if args.mxfp4_arm:
-        specs += [(name, True, tile, stored) for name, logical, stored, tile
+        specs += [(name, stored != 0, tile, stored or None) for name, logical, stored, tile, split
                   in native_screen_arms(args.mxfp4_arm) if logical == width]
     else:
         specs.append(("matching", True, baseline_tile, None))
@@ -552,7 +561,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     tail = exact and (intermediate % 128 != 0 or
                       (logical + width - 1) // width * width > intermediate)
     if stored_width is not None:
-        tail = intermediate % 128 != 0 or (logical + width - 1) // width * width > intermediate
+        tail = True
     if aligned_w2 and (not tail or atomic or not coded):
         raise ValueError("aligned W2 screen requires ordered coded-scale exact native tails")
     if aligned_w2_scales and not aligned_w2:
@@ -1077,6 +1086,10 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                     baseline_tile = 128
                 specs, controls = tiling_specs(args, width, baseline_tile, tiles)
                 k_splits = {label: 1 for label, _, _, _ in specs}
+                k_splits.update({name: split for name, logical, stored, tile, split in explicit
+                                 if logical == width})
+                if args.profile_dir:
+                    specs = [spec for spec in specs if spec[0] in controls or spec[0] == args.profile_arm]
                 if args.fc1_k_splits:
                     specs = [(label, True if label in controls else exact, tile, stored)
                              for label, exact, tile, stored in specs]
@@ -1145,6 +1158,9 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                             for label, error in errors.items()}
                 for output in outputs.values():
                     assert torch.isfinite(output).all() and torch.count_nonzero(output), "invalid tiling output"
+                if args.profile_dir:
+                    profile_pair_arm(runs, args, g.name, width, rows)
+                    continue
                 samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
                 comparisons = compare_route_outputs(outputs)
                 assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
@@ -1160,6 +1176,11 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                               resident_widths=resident_widths,
                               slice_widths={label: tile for label, _, tile, _ in specs if label in runs},
                               controls=controls, fc1_k_splits=k_splits,
+                              arm_specs={label: dict(tile=tile, split=k_splits[label],
+                                  stored_width=stored if stored is not None else (width if exact else padded),
+                                  exact_storage=stored is not None or (exact and
+                                      (width % 128 != 0 or (width + tile - 1) // tile * tile > width)))
+                                  for label, exact, tile, stored in specs if label in runs},
                               resident_payload_bytes_by_arm={label: experts * g.hidden *
                                   (2 * width + padded if label.startswith("aligned-w2") else
                                    3 * resident_widths[label]) // 2 for label in runs},
