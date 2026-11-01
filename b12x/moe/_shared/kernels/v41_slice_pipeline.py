@@ -20,12 +20,23 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import (
 
 class V41SlicePipeline:
     def __init__(self, capacity, width, atomic_tokens=False, *, experts=384, topk=6, intermediate=576,
-                 hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False):
+                 hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False,
+                 activation_precision="a8", swiglu_limit=10.0,
+                 silu_bf16_product=False, route_weight_before_fc2=True,
+                 round_fc2_bf16=False):
         self.capacity = capacity
         self.hidden = hidden
         self.atomic_tokens = atomic_tokens
         self.experts = experts
         self.topk = topk
+        if activation_precision not in ("a8", "a16"):
+            raise ValueError("native MXFP4 activation precision must be a8 or a16")
+        if swiglu_limit < 0:
+            raise ValueError("SwiGLU clamp must be nonnegative")
+        if atomic_tokens and (activation_precision != "a8" or swiglu_limit != 10.0
+                              or silu_bf16_product or not route_weight_before_fc2
+                              or round_fc2_bf16):
+            raise ValueError("atomic output requires the default activation contract")
         self.plan = V41RoutePlan(capacity, experts, topk, route_metadata=not atomic_tokens)
         if atomic_tokens:
             self.compute = V41FusedSliceKernel(width, grouped=True, atomic_tokens=True,
@@ -36,10 +47,15 @@ class V41SlicePipeline:
         else:
             self.compute = None
             self.fc1 = V41SliceFc1Kernel(width, capacity, topk=topk, intermediate=intermediate,
-                                         hidden=hidden, exact_storage=exact_storage, scale_codes=scale_codes)
+                                         hidden=hidden, exact_storage=exact_storage, scale_codes=scale_codes,
+                                         activation_precision=activation_precision, swiglu_limit=swiglu_limit,
+                                         silu_bf16_product=silu_bf16_product,
+                                         route_weight_before_fc2=route_weight_before_fc2)
             self.fc2 = V41SliceFc2Kernel(width, capacity, topk=topk, intermediate=intermediate,
                                          hidden=hidden, exact_storage=exact_storage, fc2_n_splits=fc2_n_splits,
-                                         scale_codes=scale_codes)
+                                         scale_codes=scale_codes, activation_precision=activation_precision,
+                                         route_weight_before_fc2=route_weight_before_fc2,
+                                         round_fc2_bf16=round_fc2_bf16)
         self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate, hidden=hidden)
 
     @cute.jit
@@ -100,7 +116,7 @@ class V41SlicePipeline:
             )
         else:
             self.fc1(x, xs, w13, s13, grouped, partial, metadata, groups, stream)
-            self.fc2(w2, s2, partial, output, metadata, inverse, live, groups, stream)
+            self.fc2(w2, s2, partial, output, metadata, inverse, live, groups, stream, grouped)
 
     @cute.kernel
     def publish(self, live: cute.Tensor, rows: Int32):
