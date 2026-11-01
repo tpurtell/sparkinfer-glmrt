@@ -406,6 +406,19 @@ def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical
         ((logical + tile - 1) // tile) * 96 * route_bytes)
 
 
+def test_prefill_unify_controls_are_fixed_stream_and_record_prefix_failures():
+    function = next(n for n in ast.parse(_PATH.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == "mxfp4_unify_screen")
+    text = ast.unparse(function)
+    assert "control_route = 'stream' if rows > 80 else 'auto'" in text
+    assert "strict_prefix=rows <= 80" in text
+    assert "control_qualification=control_qualification" in text
+    helper = next(n for n in ast.parse(_PATH.read_text()).body
+                  if isinstance(n, ast.FunctionDef) and n.name == "qualify_pair_replay")
+    assert helper.args.kw_defaults[0].value is True
+    assert "prefix_failures" in ast.unparse(helper)
+
+
 def test_stream_decode_cli_contract():
     args = bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
                              "--rows", "1,16,80", "--stream-decode"])
