@@ -192,6 +192,8 @@ def parse_args(argv=None):
                         help="development native arm: exact W13 rows with only W2 payload pitch aligned to 128 columns")
     parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE[:SPLIT]",
                         help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
+    parser.add_argument("--stream-decode", action="store_true",
+                        help="development A16 native register-streaming decode arm")
     parser.add_argument("--fc1-k-splits", help="development paired native K-team counts, comma-separated 1/2/4/8")
     parser.add_argument("--fc1-cta-splits", help="development MiMo unification CTA splits, comma-separated 1/2/4/8")
     parser.add_argument("--control-repeats", type=int, default=2,
@@ -199,6 +201,9 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.stream_decode and (not args.mxfp4_pair or not args.mxfp4_unify
+                               or any(int(row) > 80 for row in args.rows.split(","))):
+        parser.error("stream decode requires MiMo unification and capacities <=80")
     if args.fc1_k_splits is not None:
         try:
             splits = [int(value) for value in args.fc1_k_splits.split(",")]
@@ -554,7 +559,8 @@ def native_slice_width(family, rank_width):
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
                     aligned_w2=False, aligned_w2_scales=False, stored_width=None,
                     activation_precision="a8", projection_contract=None,
-                    combine_output=False, ingress="wire", fc1_k_splits=1, fc1_cta_splits=1):
+                    combine_output=False, ingress="wire", fc1_k_splits=1, fc1_cta_splits=1,
+                    stream_decode=False):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -602,7 +608,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     routes = rows * topk
     from b12x.moe._shared.kernels.v41_slice_pipeline import fc1_partial_words
     partial_words = 1 if atomic else fc1_partial_words(
-        rows, width, topk, logical, activation_precision, fc1_cta_splits)
+        rows, width, topk, logical, activation_precision, fc1_cta_splits, stream_decode)
     partial = torch.empty((partial_words,), device="cuda")
     output = torch.empty(rows * hidden if atomic else (routes, hidden), device="cuda")
     scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
@@ -619,7 +625,8 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                                 exact_storage=tail or stored_width is not None,
                                 atomic_tokens=atomic, scale_codes=coded,
                                 activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
-                                fc1_cta_splits=fc1_cta_splits, **(projection_contract or {}))
+                                fc1_cta_splits=fc1_cta_splits, stream_decode=stream_decode,
+                                **(projection_contract or {}))
     if stored_width is not None:
         # Physical strides come from P; the launch only visits the real S slices.
         for kernel in (pipeline.fc1, pipeline.fc2, pipeline.reduce):
@@ -1004,6 +1011,13 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 except AssertionError as error:
                     raise AssertionError(f"native {label}, rows={rows}, width={width}: {error}") from error
                 owned.append(keep)
+            if args.stream_decode:
+                label = "native-stream-a16"
+                runs[label], outputs[label], keep = native_pair_arm(
+                    x, ids, routing, weights, scales, 64, True, False, False,
+                    activation_precision="a16", projection_contract=contract,
+                    combine_output=True, ingress="wire", qualify=True, stream_decode=True)
+                owned.append(keep)
             for label, run in list(runs.items()):
                 run()
                 if args.graph:
@@ -1021,7 +1035,10 @@ def mxfp4_unify_screen(g, args, geometry_type):
             references = {"a16": oracle, "a8": mxfp4_f32_reference(
                 x, ids, routing, weights, scales, activation_precision="a8")}
             eligible = {}
-            for label, (precision, _, _, _) in variants.items():
+            quality_precisions = {label: spec[0] for label, spec in variants.items()}
+            if args.stream_decode:
+                quality_precisions["native-stream-a16"] = "a16"
+            for label, precision in quality_precisions.items():
                 matched = references[precision]
                 error = f32_errors(outputs[label], matched)
                 normalized_rms = error["rms"] / max(matched.square().mean().sqrt().item(), 1e-8)
@@ -1048,7 +1065,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
                                                     cta_splits=cta, partial_bytes=4 * fc1_partial_words(
                                                         rows, tile, g.top_k, width, precision, cta))
                                         for label, (precision, tile, split, cta) in variants.items()},
-                          quality_eligible=eligible)
+                          quality_eligible=eligible,
+                          stream_partial_bytes=(4 * fc1_partial_words(rows, 64, g.top_k, width,
+                                                "a16", stream_decode=True) if args.stream_decode else None))
             results.append(record)
             print(json.dumps(record), flush=True)
             del owned, runs, outputs

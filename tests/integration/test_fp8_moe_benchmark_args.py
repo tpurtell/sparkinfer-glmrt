@@ -406,6 +406,25 @@ def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical
         ((logical + tile - 1) // tile) * 96 * route_bytes)
 
 
+def test_stream_decode_cli_contract():
+    args = bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--rows", "1,16,80", "--stream-decode"])
+    assert args.stream_decode
+    for argv in (["--stream-decode"], ["--mxfp4-pair", "--mxfp4-unify", "--rows", "256", "--stream-decode"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args(argv)
+
+
+@pytest.mark.parametrize("width", [64, 128, 192])
+def test_stream_decode_scratch_contract(width):
+    path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v41_slice_pipeline.py"
+    node = next(n for n in ast.parse(path.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == "fc1_partial_words")
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    words = namespace["fc1_partial_words"](80, width, 8, 288, "a16", stream_decode=True)
+    assert words == ((288 + width - 1) // width) * 80 * 8 * (width // 2 + 2 * width)
+
+
 def test_explicit_rank_extents_and_identical_controls():
     args = bench.parse_args(["--mxfp4-pair", "--native-slices", "--mxfp4-tilings",
                              "--mxfp4-arm", "compact:288:288:128",
