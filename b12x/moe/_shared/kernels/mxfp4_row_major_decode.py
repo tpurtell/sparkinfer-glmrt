@@ -108,7 +108,7 @@ class RowMajorA8Linear:
                                 offset = (self.slices * self.routes * (self.width // 4)
                                           + (Int64(k // self.width) * self.routes + route_base + srow)
                                           * (self.width // 32) + k % self.width // 32)
-                                asc = data[offset]
+                                asc = Uint32(data[offset])
                     for gi in cutlass.range_constexpr(self.groups):
                         words = cute.make_rmem_tensor((4,), Uint32)
                         for t in cutlass.range_constexpr(4):
