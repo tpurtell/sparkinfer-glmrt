@@ -2140,7 +2140,7 @@ def benchmark_parser():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--prefill-family", choices=(*PREFILL_FAMILIES, *COORDINATOR_FAMILIES))
-    parser.add_argument("--bits", type=int, nargs=2, choices=(2, 3, 4, 5),
+    parser.add_argument("--bits", type=int, nargs=2, choices=(2, 3, 4, 5, 6),
                         metavar=("LOW", "HIGH"), help="prefill tier pair; defaults to the family's measured pair")
     parser.add_argument("--role", choices=("spark", "coordinator"), default="spark")
     parser.add_argument("--profile", choices=COORDINATOR_PROFILES, default="rtx-tp2")

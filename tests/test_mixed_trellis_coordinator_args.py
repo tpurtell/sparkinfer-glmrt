@@ -480,6 +480,24 @@ def test_new_family_launchable_cells(family, hidden, experts, topk, widths, clam
     assert b.coordinator_preflight(args)[3] == []
 
 
+@pytest.mark.parametrize("profile", ["rtx-tp1", "spark-tp3-width512"])
+def test_step_k6_tail_uses_existing_high_tier_selector(profile):
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", "step5", "--role", "spark" if profile.startswith("spark-") else "coordinator",
+        "--profile", profile, "--bits", "4", "6", "--k5-experts", "352",
+        "--route-distributions", "random", "--layers", "3", "--output", "result.json",
+        "--no-coop", "--coordinator-arm", "current:mode=ws", "--coordinator-arm", "candidate:mode=ws,dynamic=1"])
+    capacities, specs, _, _, _ = b.coordinator_preflight(args)
+    assert args.k5_experts == b.COORDINATOR_FAMILIES["step5"]["experts"]
+    assert args.layers == 3
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for capacity in capacities:
+        for _, arm in specs:
+            options = b.coordinator_compile_options(profile, capacity, arm, props, "step5", bits=args.bits)
+            assert (options["tier0_bits"], options["tier1_bits"]) == (4, 6)
+
+
 def muse_fixture(tmp_path, ids=None):
     import struct
     layer = tmp_path / "layer013"
