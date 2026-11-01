@@ -18,13 +18,14 @@ from b12x.moe._shared.kernels.w4a8_v41_slice import (
 )
 
 
-def fc1_partial_words(capacity, width, topk, intermediate, activation_precision="a8", cta_splits=1):
+def fc1_partial_words(capacity, width, topk, intermediate, activation_precision="a8", cta_splits=1,
+                      stream_decode=False):
     """Caller-owned compact activation words followed by raw FP32 split planes."""
     if cta_splits not in (1, 2, 4, 8) or activation_precision not in ("a8", "a16"):
         raise ValueError("invalid native FC1 scratch contract")
     slices = (intermediate + width - 1) // width
     compact = width // 2 if activation_precision == "a16" else width // 4 + width // 32
-    raw = 2 * width * cta_splits if cta_splits > 1 else 0
+    raw = 2 * width * cta_splits if cta_splits > 1 or stream_decode else 0
     return slices * capacity * topk * (compact + raw)
 
 
@@ -33,7 +34,9 @@ class V41SlicePipeline:
                  hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False,
                  activation_precision="a8", swiglu_limit=10.0,
                  silu_bf16_product=False, route_weight_before_fc2=True,
-                 round_fc2_bf16=False, fc1_k_splits=1, fc1_cta_splits=1):
+                 round_fc2_bf16=False, fc1_k_splits=1, fc1_cta_splits=1, stream_decode=False):
+        if stream_decode and (atomic_tokens or capacity > 80 or activation_precision != "a16"):
+            raise ValueError("streaming qualification requires ordered A16 decode capacity <=80")
         self.capacity = capacity
         self.hidden = hidden
         self.atomic_tokens = atomic_tokens
@@ -56,7 +59,11 @@ class V41SlicePipeline:
             self.fc2 = None
         else:
             self.compute = None
-            self.fc1 = V41SliceFc1Kernel(width, capacity, topk=topk, intermediate=intermediate,
+            fc1_type = V41SliceFc1Kernel
+            if stream_decode:
+                from b12x.moe._shared.kernels.mxfp4_stream_decode import V41StreamFc1Kernel
+                fc1_type = V41StreamFc1Kernel
+            self.fc1 = fc1_type(width, capacity, topk=topk, intermediate=intermediate,
                                          hidden=hidden, exact_storage=exact_storage, scale_codes=scale_codes,
                                          activation_precision=activation_precision, swiglu_limit=swiglu_limit,
                                          silu_bf16_product=silu_bf16_product,
@@ -67,9 +74,12 @@ class V41SlicePipeline:
                                          scale_codes=scale_codes, activation_precision=activation_precision,
                                          route_weight_before_fc2=route_weight_before_fc2,
                                          round_fc2_bf16=round_fc2_bf16)
+            if stream_decode:
+                from b12x.moe._shared.kernels.mxfp4_stream_decode import V41StreamFc2Kernel
+                self.fc2 = V41StreamFc2Kernel(self.fc1, round_fc2_bf16=round_fc2_bf16)
         self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate, hidden=hidden)
         self.partial_words = (1 if atomic_tokens else fc1_partial_words(
-            capacity, width, topk, intermediate, activation_precision, fc1_cta_splits))
+            capacity, width, topk, intermediate, activation_precision, fc1_cta_splits, stream_decode))
 
     @cute.jit
     def __call__(
