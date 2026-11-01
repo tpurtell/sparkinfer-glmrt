@@ -153,6 +153,26 @@ def test_mxfp4_f32_oracle_has_explicit_quantization_boundaries(native):
     assert torch.equal(output, torch.full((1, 32), expected.item()))
 
 
+def test_mimo_a8_oracle_quantizes_after_bf16_silu_product():
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+    x = torch.linspace(-.5, .5, 32).reshape(1, 32).bfloat16()
+    ids, routing = torch.zeros((1, 1), dtype=torch.int32), torch.full((1, 1), .5)
+    generator = torch.Generator().manual_seed(1608)
+    weights = {name: torch.randint(0, 256, (1, 32, 16), dtype=torch.uint8, generator=generator)
+               for name in ("w1", "w3", "w2")}
+    scales = {name: torch.full((1, 32, 1), 124, dtype=torch.uint8) for name in weights}
+    output = bench.mxfp4_f32_reference(x, ids, routing, weights, scales, activation_precision="a8")
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6])
+    def matrix(name):
+        packed = weights[name][0]
+        return torch.stack((lut[(packed & 15).long()], lut[(packed >> 4).long()]), -1).flatten(-2) / 8
+    qx = wire_rows(x)[1].float()
+    gate, up = (qx @ matrix("w1").T).bfloat16(), (qx @ matrix("w3").T).bfloat16()
+    mid = (torch.nn.functional.silu(gate).float() * up.float()).bfloat16()
+    expected = wire_rows(mid)[1].float() @ matrix("w2").T * .5
+    assert torch.equal(output, expected)
+
+
 def test_capacity_is_independent_of_live_rows():
     args = bench.parse_args(["--capacity", "4096", "--rows", "512,2048,2752,4096"])
     assert args.capacity == 4096

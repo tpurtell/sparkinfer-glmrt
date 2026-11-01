@@ -669,7 +669,8 @@ def grouped_pair_program(g, route, capacity, prefill="auto", *, down_warps=None,
                            scratch=template.scratch)
 
 
-def mxfp4_f32_reference(x, ids, routing, weights, scales, limit=0.0, *, native=False):
+def mxfp4_f32_reference(x, ids, routing, weights, scales, limit=0.0, *, native=False,
+                        activation_precision=None):
     """F32 products with checkpoint BF16 gate/up, SiLU and activation stores.
 
     The down product and slot-order weighted sum remain F32, without the
@@ -695,6 +696,8 @@ def mxfp4_f32_reference(x, ids, routing, weights, scales, limit=0.0, *, native=F
             _, act = wire_rows(act)
         else:
             act = (torch.nn.functional.silu(gate).bfloat16().float() * up).bfloat16()
+            if activation_precision == "a8":
+                _, act = wire_rows(act)
         routes[selected, slots] = act.float() @ dequant("w2").T
     if native:
         return routes.reshape(-1, x.shape[1])
@@ -953,6 +956,14 @@ def mxfp4_unify_screen(g, args, geometry_type):
             assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
             oracle = mxfp4_f32_reference(x, ids, routing, weights, scales)
             errors = {label: f32_errors(output, oracle) for label, output in outputs.items()}
+            matched_errors = {}
+            for precision in ("a8", "a16"):
+                matched = (mxfp4_f32_reference(x, ids, routing, weights, scales,
+                           activation_precision="a8") if precision == "a8" else oracle)
+                error = f32_errors(outputs["native-" + precision], matched)
+                normalized_rms = error["rms"] / max(matched.square().mean().sqrt().item(), 1e-8)
+                assert normalized_rms < .02, ("native matched oracle", precision, normalized_rms)
+                matched_errors[precision] = dict(**error, normalized_rms=normalized_rms)
             if args.profile_dir:
                 profile_pair_arm(runs, args, g.name, width, rows)
                 continue
@@ -966,7 +977,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           matching_warps=matching, controls=controls, graph=args.graph,
                           weight_sha256=weight_hash, samples_us=samples, median_us=medians,
                           speedup={label: medians["current"] / medians[label] for label in runs},
-                          f32_errors=errors, comparisons=comparisons,
+                          f32_errors=errors, matched_f32_errors=matched_errors, comparisons=comparisons,
                           invariant_checks="poison/live/graph/row-mix", slice_width=128)
             results.append(record)
             print(json.dumps(record), flush=True)
