@@ -5053,6 +5053,29 @@ def fp4_decode_2(byte_val: Uint32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def e2m1x2_scaled_bf16(codes: Uint32, exponent: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Widen the low E2M1 byte with its UE8M0 scale into one BF16 pair."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(codes).ir_value(loc=loc, ip=ip),
+                  Uint32(exponent).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b8 code, unused1, unused2, unused3;
+            .reg .b32 factor, pair;
+            .reg .pred zero;
+            mov.b32 {code, unused1, unused2, unused3}, $1;
+            shl.b32 factor, $2, 7;
+            setp.eq.u32 zero, $2, 0;
+            selp.b32 factor, 64, factor, zero;
+            prmt.b32 factor, factor, factor, 0x1010;
+            cvt.rn.bf16x2.e2m1x2 pair, code;
+            mul.rn.bf16x2 $0, pair, factor;
+        }
+        """, "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def e2m1x8_to_qmma_e2m1x8(
     packed_u32: Uint32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:

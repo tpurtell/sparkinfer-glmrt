@@ -3,8 +3,8 @@
 
 Use --graph for the serving replay path, --routing hot to put the requested
 row count in each selected expert, and --profile-dir for launch/stage traces.
-Use --capacity for a fixed export across live --rows and --routes for the
-schema-1 recorded histograms used by the EXL3/EXLR8 benches.
+Use --capacity for a fixed export across live --rows and --routes for
+schema-1 recorded histograms or existing expert-routes JSONL logs.
 NVFP4 and native BF16 require --input bf16. A historical checkout may be used to measure the
 old A16 ceiling; it is not a serving arithmetic override.
 """
@@ -12,6 +12,7 @@ old A16 ceiling; it is not a serving arithmetic override.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import replace
 import hashlib
 import json
@@ -157,7 +158,7 @@ def parse_args(argv=None):
                         help="explicit activation contract; defaults to the geometry contract")
     parser.add_argument("--rows", default="1,16,80,1024,4096")
     parser.add_argument("--capacity", type=int, help="fixed compiled export/workspace capacity; defaults to each live row count")
-    parser.add_argument("--routes", type=Path, help="recorded schema-1 histogram fixture (EXL3/EXLR8 format)")
+    parser.add_argument("--routes", type=Path, help="schema-1 histograms or an existing expert-routes JSONL")
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--check", action="store_true")
@@ -173,13 +174,60 @@ def parse_args(argv=None):
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--routing", choices=("random", "hot"), default="random")
     parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument("--profile-arm", help="paired screen: one warmed arm inside the mxfp4-pair NVTX range")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--exact-sweep", type=Path, help="correctness only: dump exact outputs and check row invariance (widths 1..64)")
     parser.add_argument("--exact-baseline", type=Path, help="compare --exact-sweep byte for byte with this baseline dump")
+    parser.add_argument("--mxfp4-pair", action="store_true",
+                        help="interleave identical logical weights in padded and exact K32 storage")
+    parser.add_argument("--widths", help="paired-screen rank widths; defaults to every T2..8 adjacent width")
+    parser.add_argument("--mxfp4-unify", action="store_true",
+                        help="MiMo native A8/A16 against three exact-storage matching generic controls")
+    parser.add_argument("--native-slices", action="store_true",
+                        help="paired native V4.1/V4 slice pipelines instead of grouped programs")
+    parser.add_argument("--mxfp4-tilings", action="store_true",
+                        help="screen native tiles 64/128/192 (explicit arms also allow 32) or grouped decode warp partitions")
+    parser.add_argument("--mxfp4-w2-pitch", action="store_true",
+                        help="development native arm: exact W13 rows with only W2 payload pitch aligned to 128 columns")
+    parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE[:SPLIT]",
+                        help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
+    parser.add_argument("--stream-decode", action="store_true",
+                        help="development A16 native register-streaming decode arm")
+    parser.add_argument("--native-stream", action="store_true", help="Benchmark STREAM prefill over native residency")
+    parser.add_argument("--generic-a8", action="store_true", help="Benchmark generic grouped row-major QMMA decode")
+    parser.add_argument("--row-major-mma", action="store_true", help="Benchmark native MMA with row-major resident staging")
+    parser.add_argument("--row-major-a8", action="store_true",
+                        help="benchmark-only fixed-path ordered row-major A8 decode")
+    parser.add_argument("--v4-stream", action="store_true",
+                        help="benchmark-only V4 semantic contract on STREAM prefill")
+    parser.add_argument("--fc1-k-splits", help="development paired native K-team counts, comma-separated 1/2/4/8")
+    parser.add_argument("--fc1-cta-splits", help="development MiMo unification CTA splits, comma-separated 1/2/4/8")
+    parser.add_argument("--control-repeats", type=int, default=2,
+                        help="identical padded controls in the tiling screen, including its reference")
     args = parser.parse_args(argv)
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.stream_decode and (not args.mxfp4_pair or not args.mxfp4_unify
+                               or any(int(row) > 80 for row in args.rows.split(","))):
+        parser.error("stream decode requires MiMo unification and capacities <=80")
+    if args.fc1_k_splits is not None:
+        try:
+            splits = [int(value) for value in args.fc1_k_splits.split(",")]
+        except ValueError:
+            parser.error("FC1 K splits must be comma-separated 1/2/4/8")
+        if (not splits or len(set(splits)) != len(splits) or any(value not in (1, 2, 4, 8) for value in splits)
+                or not args.mxfp4_pair or not (args.mxfp4_unify or args.native_slices)):
+            parser.error("FC1 K splits require native paired mode and unique 1/2/4/8 values")
+    if args.fc1_cta_splits is not None:
+        try:
+            cta_splits = [int(value) for value in args.fc1_cta_splits.split(",")]
+        except ValueError:
+            parser.error("FC1 CTA splits must be comma-separated 1/2/4/8")
+        if (not cta_splits or len(set(cta_splits)) != len(cta_splits)
+                or any(value not in (1, 2, 4, 8) for value in cta_splits)
+                or not args.mxfp4_pair or not args.mxfp4_unify):
+            parser.error("FC1 CTA splits require MiMo unification mode and unique 1/2/4/8 values")
     if args.continue_on_fail and (not args.check or args.exact_sweep):
         parser.error("--continue-on-fail requires --check and no --exact-sweep")
     if args.exact_baseline and not args.exact_sweep:
@@ -203,7 +251,82 @@ def parse_args(argv=None):
         parser.error("routes must be nonempty and unique")
     if args.compare_routes_exact and (args.exact_sweep or len(args.route.split(",")) < 2):
         parser.error("--compare-routes-exact requires at least two timing routes and no --exact-sweep")
+    if args.mxfp4_unify and (not args.mxfp4_pair or args.native_slices or args.mxfp4_tilings
+                             or args.geometry not in ("mimof", "mimop", "v41") or args.routes
+                             or (args.geometry == "v41" and not (args.row_major_a8 or args.row_major_mma or args.v4_stream or args.native_stream))
+                             or args.capacity is not None):
+        parser.error("--mxfp4-unify requires MiMo paired mode without other screens or fixed capacity")
+    if args.v4_stream and (not args.mxfp4_unify or args.geometry != "v41" or min(rows) <= 80):
+        parser.error("--v4-stream requires unified V4.1 prefill capacities >80")
+    if args.row_major_a8 and (not args.mxfp4_unify or max(rows) > 80):
+        parser.error("--row-major-a8 requires the unified decode screen at capacities <=80")
+    if args.native_slices and not args.mxfp4_pair:
+        parser.error("--native-slices requires --mxfp4-pair")
+    if args.mxfp4_tilings and (not args.mxfp4_pair or args.capacity is not None):
+        parser.error("--mxfp4-tilings requires --mxfp4-pair without fixed capacity")
+    if args.mxfp4_w2_pitch and not (args.mxfp4_tilings and args.native_slices):
+        parser.error("--mxfp4-w2-pitch requires --mxfp4-tilings and --native-slices")
+    if args.control_repeats < 2:
+        parser.error("control-repeats must be at least two")
+    if args.mxfp4_arm:
+        if not (args.native_slices and args.mxfp4_tilings) or args.mxfp4_w2_pitch or args.widths:
+            parser.error("explicit arms require the native tiling screen without --widths or W2 pitch arms")
+        try:
+            native_screen_arms(args.mxfp4_arm)
+        except ValueError as error:
+            parser.error(str(error))
+    if args.widths:
+        try:
+            widths = [int(width) for width in args.widths.split(",")]
+        except ValueError:
+            parser.error("widths must be comma-separated K32 widths")
+        if not args.mxfp4_pair or not widths or any(width <= 0 or width % 32 for width in widths):
+            parser.error("--widths requires --mxfp4-pair and positive K32 widths")
+    if args.routes and args.mxfp4_pair and not args.mxfp4_tilings:
+        parser.error("paired recorded routes require --mxfp4-tilings")
+    if args.mxfp4_pair and (args.exact_sweep or args.check_prefix_rows
+                           or args.compare_routes_exact or args.input != "wire"):
+        parser.error("paired MXFP4 screening requires wire input and no other sweep mode")
+    if args.profile_arm and not (args.mxfp4_pair and args.profile_dir):
+        parser.error("--profile-arm requires paired mode and --profile-dir")
+    if args.mxfp4_pair and args.profile_dir:
+        allowed = ({"current", "native-a8", "native-a16"} if args.mxfp4_unify
+                   else {"native-padded", "native-exact"} if args.native_slices else set())
+        if args.mxfp4_unify and args.fc1_k_splits:
+            allowed |= {f"native-{precision}-t{tile}-k{split}"
+                        for tile, split in fc1_split_tiles(4096 if args.geometry == "mimof" else 6144,
+                                                         map(int, args.fc1_k_splits.split(",")))
+                        for precision in ("a8", "a16")}
+        if args.mxfp4_unify and args.fc1_cta_splits:
+            allowed |= {f"native-{precision}-t64-k{team}-z{cta}"
+                        for team in map(int, (args.fc1_k_splits or "1").split(","))
+                        for cta in map(int, args.fc1_cta_splits.split(","))
+                        if (32 if args.geometry == "mimof" else 48) % (team * cta) == 0
+                        for precision in ("a8", "a16")}
+        explicit_profile = bool(args.mxfp4_arm and args.mxfp4_tilings)
+        if explicit_profile:
+            allowed = {arm[0] for arm in native_screen_arms(args.mxfp4_arm)}
+        if args.profile_arm not in allowed or (args.mxfp4_tilings and not explicit_profile):
+            parser.error("paired profiling requires one --profile-arm from the native or unification screen")
     return args
+
+
+def profile_pair_arm(runs, args, geometry, width, rows):
+    """One warmed launch: nsys capture range or ncu --nvtx-include mxfp4-pair/."""
+    run = runs[args.profile_arm]
+    run()
+    torch.cuda.synchronize()
+    args.profile_dir.mkdir(parents=True, exist_ok=True)
+    torch.cuda.nvtx.range_push("mxfp4-pair")
+    try:
+        run()
+        torch.cuda.synchronize()
+    finally:
+        torch.cuda.nvtx.range_pop()
+    path = args.profile_dir / f"{geometry}-w{width}-r{rows}-{args.profile_arm}.json"
+    path.write_text(json.dumps(dict(geometry=geometry, width=width, rows=rows,
+                                   arm=args.profile_arm, nvtx_range="mxfp4-pair",
+                                   warmed_launches=1, attribution_only=True)) + "\n")
 
 
 def compare_route_outputs(outputs):
@@ -279,15 +402,37 @@ def enforce_oracle(result, continue_on_fail):
 def recorded_waves(path, g):
     from benchmarks.benchmark_exlr8_a16 import load_route_waves
 
-    data = json.loads(path.read_text())
+    if path.suffix == ".jsonl":
+        waves = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            wave = json.loads(line)
+            if wave.get("event") != "expert_routes":
+                raise ValueError("not an expert-routes record")
+            if "topk" in wave:
+                ids = wave["topk"]
+                if (not isinstance(ids, list) or len(ids) != wave.get("rows")
+                        or any(not isinstance(row, list) or len(row) != g.top_k
+                               or any(type(e) is not int for e in row) or len(set(row)) != len(row)
+                               for row in ids)):
+                    raise ValueError("invalid recorded per-row top-k")
+                wave["expert_rows"] = sorted(Counter(e for row in ids for e in row).items())
+            waves.append(wave)
+        if not waves:
+            raise ValueError("empty expert-routes log")
+        # JSONLs do not attest checkpoint/family identity; preserve that limitation.
+        data = {}
+    else:
+        data = json.loads(path.read_text())
+        waves = load_route_waves(str(path))
     family = g.name.split("_")[0]
-    if data.get("family") != family:
+    if path.suffix != ".jsonl" and data.get("family") != family:
         # The original GLM histogram predates explicit family metadata.
         if not (family == "glm" and "family" not in data and data.get("model") == "zai-org/GLM-5.3"):
             raise ValueError("recorded route fixture family does not match geometry")
     if data.get("experts", g.experts) != g.experts or data.get("top_k", g.top_k) != g.top_k:
         raise ValueError("recorded route fixture expert/top-k metadata mismatch")
-    waves = load_route_waves(str(path))
     for wave in waves:
         rows, counts = wave.get("rows", 0), wave.get("expert_rows", [])
         if (type(rows) is not int or rows < 1 or not counts
@@ -297,6 +442,93 @@ def recorded_waves(path, g):
                 or sum(n for _, n in counts) != rows * g.top_k):
             raise ValueError("invalid recorded route histogram")
     return waves
+
+
+def native_screen_arms(values):
+    """Parse rank extents, not ownership or serving configuration."""
+    result = []
+    for value in values:
+        try:
+            fields = value.split(":")
+            if len(fields) not in (4, 5):
+                raise ValueError("invalid field count")
+            name, logical, stored, tile = fields[:4]
+            logical, stored, tile = int(logical), int(stored), int(tile)
+            split = int(fields[4]) if len(fields) == 5 else 1
+        except ValueError as error:
+            raise ValueError("native arm must be NAME:LOGICAL:STORED:TILE[:SPLIT]") from error
+        if (not name or name.startswith(("padded", "matching", "exact-", "aligned-w2"))
+                or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in name)
+                or logical <= 0 or logical % 32 or stored % 32 or stored < 0
+                or (stored != 0 and stored < logical) or tile not in (32, 64, 128, 192)
+                or split not in (1, 2, 4, 8)
+                or not fc1_split_tiles(1024, (split,), (tile,))):
+            raise ValueError("native arms need unique names, K32 extents (stored=0 for legacy), feasible tile/split")
+        if name in {arm[0] for arm in result}:
+            raise ValueError("duplicate native arm name")
+        result.append((name, logical, stored, tile, split))
+    return result
+
+
+def extend_native_weights(weights, scales, stored):
+    """Add zero columns without changing any real K32 activation block."""
+    logical = weights["w1"].shape[1]
+    if stored < logical or stored % 32:
+        raise ValueError("resident extent must cover logical whole-K32 columns")
+    pad = torch.nn.functional.pad
+    resident = {name: pad(value, (0, 0, 0, stored - logical))
+                for name, value in weights.items() if name != "w2"}
+    resident["w2"] = pad(weights["w2"], (0, (stored - logical) // 2))
+    factors = {name: pad(value, (0, 0, 0, stored - logical))
+               for name, value in scales.items() if name != "w2"}
+    # Keep the real down-scale range: zero payload needs no special exponent.
+    extra = stored // 32 - logical // 32
+    down = scales["w2"]
+    factors["w2"] = torch.cat((down, down.amin(-1, keepdim=True).expand(*down.shape[:-1], extra)), -1)
+    return resident, factors
+
+
+def screen_route_wave(waves, rows, seed):
+    matches = [wave for wave in waves if wave["rows"] == rows]
+    if not matches:
+        raise ValueError(f"recorded routes contain no wave with exactly {rows} live rows")
+    return matches[seed % len(matches)]
+
+
+def screen_route_ids(wave, experts, topk, seed):
+    if "topk" in wave:
+        return torch.tensor(wave["topk"], dtype=torch.int32)
+    from benchmarks.benchmark_exlr8_a16 import real_route_ids
+
+    return real_route_ids(wave["rows"], wave, torch.Generator().manual_seed(seed), experts, topk).int()
+
+
+def tiling_specs(args, width, baseline_tile, tiles):
+    """Keep identical controls separate from eligible candidate layouts."""
+    controls = ["padded", *(f"padded-control-{n}" for n in range(1, args.control_repeats))]
+    specs = [(label, False, baseline_tile, None) for label in controls]
+    if args.mxfp4_arm:
+        specs += [(name, stored != 0, tile, stored or None) for name, logical, stored, tile, split
+                  in native_screen_arms(args.mxfp4_arm) if logical == width]
+    else:
+        specs.append(("matching", True, baseline_tile, None))
+        specs += [(f"exact-{tile}", True, tile, None) for tile in tiles if tile != baseline_tile]
+        if args.mxfp4_w2_pitch:
+            specs = specs[:len(controls) + 1] + [("aligned-w2", True, baseline_tile, None),
+                                                ("aligned-w2-scales", True, baseline_tile, None)]
+    return specs, controls
+
+
+def tiling_timing_summary(samples, eligible, controls):
+    paired = {label: statistics.median(base / value for base, value in zip(samples["padded"], times))
+              for label, times in samples.items()}
+    candidates = [label for label in samples if label not in controls and eligible[label]]
+    winner = max(candidates, key=paired.get) if candidates else None
+    control_ratios = {label: [base / value for base, value in zip(samples["padded"], samples[label])]
+                      for label in controls if label != "padded"}
+    return dict(medians_us={label: statistics.median(times) for label, times in samples.items()},
+                paired_speedups=paired, winner=winner, speedup=paired[winner] if winner else None,
+                identical_control_speedups=control_ratios)
 
 
 def compiled_case(g, args, rows, route, cache):
@@ -314,13 +546,894 @@ def compiled_case(g, args, rows, route, cache):
     return cache[key]
 
 
+def paired_widths(intermediate, requested=None):
+    widths = ({int(width) for width in requested.split(",")} if requested else
+              {32 * (intermediate // 32 // world + extra)
+               for world in range(2, 9)
+               for extra in (0, int(intermediate // 32 % world != 0))})
+    if any(width <= 0 or width % 32 or width > intermediate for width in widths):
+        raise ValueError("paired widths must be whole K32 within the checkpoint intermediate")
+    return sorted(widths)
+
+
+def fc1_split_tiles(hidden, splits, tiles=(32, 64, 128, 192)):
+    """Feasible development arms; shared weight storage doubles as the FP32 fold."""
+    return [(tile, split) for split in tuple(splits) for tile in tiles
+            if hidden // 128 % split == 0
+            and split * (tile * 128 + max(tile * 2, 256) * 4) + 64 * tile <= 96 * 1024]
+
+
+def native_slice_width(family, rank_width):
+    # Preserve V4.1 TP8's shipped width-192 fold across its masked final plane.
+    return 192 if family == "v41" and (rank_width % 192 == 0 or rank_width == 288) else 128
+
+
+def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
+                    aligned_w2=False, aligned_w2_scales=False, stored_width=None,
+                    activation_precision="a8", projection_contract=None,
+                    combine_output=False, ingress="wire", fc1_k_splits=1, fc1_cta_splits=1,
+                    stream_decode=False, row_major_a8=False, row_major_mma=False):
+    """Resolve once; keep every pipeline operand alive through graph timing."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from b12x._lib.utils import current_cuda_stream
+    from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+    from tests.moe.test_v41_exact_slices import pack
+
+    rows, hidden = x.shape
+    experts, intermediate = weights["w1"].shape[:2]
+    logical = intermediate
+    if stored_width is not None:
+        if aligned_w2 or aligned_w2_scales or atomic:
+            raise ValueError("explicit extents require ordered native arms without W2 pitch overrides")
+        weights, scales = extend_native_weights(weights, scales, stored_width)
+        intermediate = stored_width
+    topk = ids.shape[1]
+    # Padded is a benchmark oracle, never an installed alternate role.
+    tail = exact and (intermediate % 128 != 0 or
+                      (logical + width - 1) // width * width > intermediate)
+    if stored_width is not None:
+        tail = True
+    if aligned_w2 and (not tail or atomic or not coded):
+        raise ValueError("aligned W2 screen requires ordered coded-scale exact native tails")
+    if aligned_w2_scales and not aligned_w2:
+        raise ValueError("aligned W2 scales require the aligned W2 payload arm")
+    w2_pitch = (intermediate + 127) // 128 * 128 if aligned_w2 else None
+    packed = pack(weights, scales, tail, w2_pitch=w2_pitch)
+    if row_major_a8 or row_major_mma:
+        if rows > 80 or activation_precision != "a8" or atomic or (coded and not row_major_mma) or stored_width is not None:
+            raise ValueError("row-major A8 benchmark requires ordered raw-scale decode <=80")
+        # Development input only; no resident pack or production layout changes.
+        up_gate = torch.cat((weights["w3"], weights["w1"]), 1)
+        up_gate_scales = torch.cat((scales["w3"], scales["w1"]), 1)
+        down_scales = torch.nn.functional.pad(scales["w2"],
+                      (0, (intermediate // 32 + 3) // 4 * 4 - intermediate // 32))
+        packed = [up_gate.cuda().view(torch.uint32).flatten(), up_gate_scales.cuda().flatten(),
+                  weights["w2"].cuda().view(torch.uint32).flatten(), down_scales.cuda().flatten()]
+    if coded and not row_major_mma:
+        stored = intermediate if exact else (intermediate + 127) // 128 * 128
+        s13 = torch.cat(tuple(torch.nn.functional.pad(scales[name], (0, 0, 0, stored - intermediate))
+                             for name in ("w3", "w1")), 1)
+        packed[1] = pack_scale_codes(s13, tensor_name="w13.scale", gated_half_rows=stored).view(torch.uint32).flatten().cuda()
+        down_scales = scales["w2"]
+        if aligned_w2_scales:
+            extra = w2_pitch // 32 - intermediate // 32
+            down_scales = torch.cat((down_scales, down_scales.amin(-1, keepdim=True)
+                                     .expand(*down_scales.shape[:-1], extra)), -1)
+        packed[3] = pack_scale_codes(down_scales, tensor_name="w2.scale").view(torch.uint32).flatten().cuda()
+    groups = x.float().reshape(rows, -1, 32)
+    exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448))
+    wire = torch.cat(((groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
+                      .view(torch.uint8).reshape(rows, hidden), (exponent + 127).to(torch.uint8)), 1)
+    routes = rows * topk
+    from b12x.moe._shared.kernels.v41_slice_pipeline import fc1_partial_words
+    partial_words = 1 if atomic else fc1_partial_words(
+        rows, width, topk, logical, activation_precision, fc1_cta_splits, stream_decode or row_major_a8)
+    partial = torch.empty((partial_words,), device="cuda")
+    output = torch.empty(rows * hidden if atomic else (routes, hidden), device="cuda")
+    scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
+        ((1,), torch.int32), ((experts * routes,), torch.int32), ((experts,), torch.int32),
+        ((experts, 2), torch.int32), ((routes, 19), torch.int32),
+        ((routes,), torch.float32), ((routes,), torch.int32))]
+    source = torch.empty_like(x) if activation_precision == "a16" and ingress == "wire" else x
+    activation = source.view(torch.uint32) if activation_precision == "a16" else wire[:, :hidden].view(torch.uint32)
+    tensors = [activation, wire[:, hidden:], *packed,
+               ids.flatten(), routing.flatten(), *scratch, partial, output]
+    args = [from_dlpack(tensor, assumed_align=16) for tensor in tensors]
+    pipeline = V41SlicePipeline(rows, width, experts=experts, topk=topk,
+                                intermediate=intermediate, hidden=hidden,
+                                exact_storage=tail or stored_width is not None,
+                                atomic_tokens=atomic, scale_codes=coded,
+                                activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
+                                fc1_cta_splits=fc1_cta_splits, stream_decode=stream_decode,
+                                **(projection_contract or {}))
+    if row_major_a8:
+        from b12x.moe._shared.kernels.mxfp4_row_major_decode import RowMajorA8Fc1, RowMajorA8Fc2
+        fc1_contract = {key: value for key, value in (projection_contract or {}).items()
+                        if key != "round_fc2_bf16"}
+        pipeline.fc1 = RowMajorA8Fc1(width, rows, topk=topk, intermediate=intermediate,
+                                    hidden=hidden, exact_storage=True,
+                                    activation_precision="a8", **fc1_contract)
+        pipeline.fc2 = RowMajorA8Fc2(pipeline.fc1,
+                           round_fc2_bf16=(projection_contract or {}).get("round_fc2_bf16", False))
+        pipeline.partial_words = partial_words
+    if row_major_mma:
+        for kernel in (pipeline.fc1, pipeline.fc2):
+            kernel.row_major_resident = True
+            kernel.scale_codes = False
+    if stored_width is not None:
+        # Physical strides come from P; the launch only visits the real S slices.
+        for kernel in (pipeline.fc1, pipeline.fc2, pipeline.reduce):
+            kernel.slices = (logical + width - 1) // width
+        for kernel in (pipeline.fc1, pipeline.fc2):
+            kernel.exact_storage = tail
+    if aligned_w2:
+        # Isolate W2 payload pitch; W13 and both coded scale planes stay exact.
+        pipeline.fc2.w2_intermediate = w2_pitch
+        if aligned_w2_scales:
+            pipeline.fc2.w2_scale_columns = w2_pitch // 32
+    launch = cute.compile(pipeline, *args, cutlass.Int32(rows), current_cuda_stream())
+    prepare = None
+    if activation_precision == "a16" and ingress == "wire":
+        from b12x.integration.cuteafd._fp8_moe_kernels import GatherRows
+        operands = [from_dlpack(tensor, assumed_align=16) for tensor in (wire, source)]
+        wire_tensor, source_tensor = operands
+        prepare = cute.compile(GatherRows(k=hidden, wire=True, gather=False),
+                               wire_tensor.iterator, args[8].iterator, args[8].iterator,
+                               source_tensor.iterator, cutlass.Int32(rows), current_cuda_stream())
+        def prepare_rows(live):
+            prepare(wire_tensor.iterator, args[8].iterator, args[8].iterator,
+                    source_tensor.iterator, cutlass.Int32(live), current_cuda_stream())
+    elif activation_precision == "a8" and ingress == "bf16":
+        from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
+        source_tensor = from_dlpack(x, assumed_align=16)
+        prepare = cute.compile(_MXFP8RowsQuantLaunch(hidden, cutlass.BFloat16, 4, 256, 32,
+                               False, 1e-4, wire_rows=True), source_tensor.iterator,
+                               args[0].iterator, args[1].iterator, args[1].iterator,
+                               cutlass.Int32(rows), cutlass.Int32(hidden), cutlass.Int32(rows),
+                               current_cuda_stream())
+        def prepare_rows(live):
+            prepare(source_tensor.iterator, args[0].iterator, args[1].iterator, args[1].iterator,
+                    cutlass.Int32(live), cutlass.Int32(hidden), cutlass.Int32(live), current_cuda_stream())
+    token_output = torch.empty_like(x) if combine_output else output
+    token_tensor = from_dlpack(token_output, assumed_align=16)
+    combine = None
+    if combine_output:
+        from b12x.moe._shared.kernels.v41_slice_pipeline import V41RouteCombine
+        combine = cute.compile(V41RouteCombine(hidden, topk), args[-1], token_tensor,
+                               cutlass.Int32(rows), current_cuda_stream())
+    def execute(live):
+        if prepare is not None:
+            prepare_rows(live)
+        launch(*args, cutlass.Int32(live), current_cuda_stream())
+        if combine is not None:
+            combine(args[-1], token_tensor, cutlass.Int32(live), current_cuda_stream())
+    if qualify:
+        if prepare is not None:
+            prepare_rows(rows)
+            from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+            expected_source = wire_rows(x)[1] if ingress == "wire" else None
+            if expected_source is not None:
+                assert torch.equal(source, expected_source), "wire A16 ingress differs from exact BF16 dequantization"
+        if atomic:
+            raise ValueError("tiling qualification requires ordered deterministic route output")
+        execute(rows)
+        if combine_output:
+            ordered = torch.zeros_like(x, dtype=torch.float32)
+            for slot in range(topk):
+                ordered += output.reshape(rows, topk, hidden)[:, slot]
+            assert torch.equal(token_output, ordered.bfloat16()), "native route combine differs from ordered slots"
+        qualify_pair_replay(execute, ids, token_output, [partial, *scratch, output] if combine_output else [partial, *scratch],
+                            [*tensors, wire, source, token_output],
+                            lambda live: token_output[:live if combine_output else live * topk])
+    def run():
+        execute(rows)
+    return run, token_output, (tensors, args, launch, wire, source, prepare, combine, token_tensor, execute)
+
+
+def mxfp4_decode_partitions(width):
+    blocks = (width + 127) // 128
+    matching = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
+    return sorted({1, 2, 4, 8, matching})
+
+
+def grouped_pair_program(g, route, capacity, prefill="auto", *, down_warps=None, template=None):
+    """Development-only tiling arms; no serving option or geometry override."""
+    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, _Fp8Moe, DECODE_MAX_ROWS
+    from b12x.integration.cuteafd._mxfp4_moe_kernels import GroupedMxfp4Gemv
+    from b12x.integration.cuteafd._common import compile_program
+
+    template = template or compile_fp8_moe_aot(g, route=route, max_rows=capacity, prefill=prefill)
+    if down_warps is None:
+        return template
+    if g.weights != "mxfp4" or route != "decode" or down_warps not in range(1, 9):
+        raise ValueError("partition arms require MXFP4 decode and 1..8 warps")
+    launch = _Fp8Moe(g, route, capacity, True, prefill)
+    launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=g.slice, experts=g.experts,
+                                         max_rows=min(capacity, DECODE_MAX_ROWS), warps=down_warps)
+    return compile_program(launch, name=template.name + f"_screen_w{down_warps}",
+                           operands=template.operands, scalars=template.scalars, key=launch.key(),
+                           geometry={**template.geometry, "screen_down_warps": down_warps},
+                           scratch=template.scratch)
+
+
+def mxfp4_f32_reference(x, ids, routing, weights, scales, limit=0.0, *, native=False,
+                        activation_precision=None):
+    """F32 products with checkpoint BF16 gate/up, SiLU and activation stores.
+
+    The down product and slot-order weighted sum remain F32, without the
+    kernel's BF16 down/output rounding. TF32 must be disabled by the caller.
+    """
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+    _, qx = wire_rows(x)
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], device=x.device)
+    routes = torch.empty((*ids.shape, x.shape[1]), device=x.device, dtype=torch.float32)
+    for expert in ids.unique().tolist():
+        selected, slots = torch.where(ids == expert)
+        def dequant(name):
+            codes = weights[name][expert].to(x.device)
+            values = torch.stack((lut[(codes & 15).long()], lut[(codes >> 4).long()]), -1).flatten(-2)
+            factors = scales[name][expert].to(x.device).view(torch.float8_e8m0fnu).float()
+            return values * factors.repeat_interleave(32, -1)
+        gate = (qx[selected].float() @ dequant("w1").T).bfloat16().float()
+        up = (qx[selected].float() @ dequant("w3").T).bfloat16().float()
+        if limit > 0:
+            gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+        if native:
+            act = (torch.nn.functional.silu(gate) * up * routing[selected, slots, None]).bfloat16()
+            _, act = wire_rows(act)
+        else:
+            act = (torch.nn.functional.silu(gate).bfloat16().float() * up).bfloat16()
+            if activation_precision == "a8":
+                _, act = wire_rows(act)
+        routes[selected, slots] = act.float() @ dequant("w2").T
+    if native:
+        return routes.reshape(-1, x.shape[1])
+    output = torch.zeros_like(x, dtype=torch.float32)
+    for slot in range(ids.shape[1]):
+        output += routes[:, slot] * routing[:, slot, None]
+    return output
+
+
+def f32_errors(output, reference):
+    difference = output.float() - reference.float()
+    return {"max_abs": difference.abs().max().item(), "rms": difference.square().mean().sqrt().item()}
+
+
+def qualify_pair_replay(run, ids, output, scratch, buffers, prefix, *, strict_prefix=True):
+    """Poison, prefix/wave-mix invariance and fixed-address graph replay."""
+    rows = ids.shape[0]
+    addresses = tuple(t.data_ptr() for t in buffers)
+    run(rows)
+    expected = output.clone()
+    prefix_failures = []
+    for live in sorted({1, min(17, rows), rows}):
+        output.fill_(float("nan"))
+        for tensor in scratch:
+            tensor.fill_(255)
+        run(live)
+        actual_prefix = prefix(live)
+        expected_prefix = expected[:actual_prefix.shape[0]]
+        if not torch.equal(actual_prefix, expected_prefix):
+            failure = dict(rows=live, max_abs=(actual_prefix.float() - expected_prefix.float()).abs().max().item())
+            if strict_prefix:
+                raise AssertionError(("live prefix", failure))
+            prefix_failures.append(failure)
+    if rows > 1:
+        original = ids.clone()
+        ids[1:] = ids[:1].expand_as(ids[1:])
+        run(rows)
+        assert torch.equal(prefix(1), expected[:prefix(1).shape[0]]), "wave-mix prefix"
+        ids.copy_(original)
+    run(rows)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(rows)
+    output.fill_(float("nan"))
+    for tensor in scratch:
+        tensor.fill_(255)
+    allocated = torch.cuda.memory_allocated()
+    for _ in range(3):
+        graph.replay()
+        assert torch.equal(output, expected), "graph replay"
+    assert torch.cuda.memory_allocated() == allocated
+    assert tuple(t.data_ptr() for t in buffers) == addresses
+    return {"deterministic": True, "row_invariant": not prefix_failures,
+            "prefix_failures": prefix_failures, "graph_reuse": True}
+
+
+def mxfp4_pair_screen(g, args):
+    """One warmed L2-cold interleaved session with identical rank weights."""
+    from dataclasses import dataclass
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+
+    @dataclass(frozen=True)
+    class Exact(Fp8MoeGeometry):
+        rank_width: int = 32
+        @property
+        def slice(self):
+            return self.rank_width
+
+    if g.weights != "mxfp4":
+        raise ValueError("paired screen requires an MXFP4 geometry")
+    if args.mxfp4_unify:
+        mxfp4_unify_screen(g, args, Exact)
+        return
+    if args.mxfp4_tilings:
+        mxfp4_tiling_screen(g, args, Exact)
+        return
+    results = []
+    properties = torch.cuda.get_device_properties(0)
+    l2_bytes = int(properties.L2_cache_size)
+    flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
+    topk = 6 if args.native_slices else 8
+    for width in paired_widths(g.intermediate, args.widths):
+        # Keep both arms' resident payloads beyond L2 on the actual card.
+        expert_payload_bytes = 3 * width * g.hidden // 2
+        experts = max(16, (2 * l2_bytes // (16 * expert_payload_bytes) + 1) * 16)
+        padded = (width + 127) // 128 * 128
+        gen = torch.Generator().manual_seed(args.seed + width)
+        weights, scales = {}, {}
+        for name, shape in (("w1", (experts, width, g.hidden // 2)),
+                            ("w3", (experts, width, g.hidden // 2)),
+                            ("w2", (experts, g.hidden, width // 2))):
+            weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=gen)
+            scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
+                                        dtype=torch.uint8, generator=gen)
+        weight_hash = hashlib.sha256(b"".join(t.numpy().tobytes() for t in (*weights.values(), *scales.values()))).hexdigest()
+        for rows in map(int, args.rows.split(",")):
+            torch.manual_seed(args.seed + rows)
+            x = (torch.randn(rows, g.hidden, device="cuda") * .5).bfloat16()
+            ids = torch.rand(rows, experts, device="cuda").topk(topk, -1).indices.int()
+            if args.routing == "hot":
+                ids.copy_(ids[:1].expand_as(ids))
+            routing = torch.rand(rows, topk, device="cuda")
+            routing /= routing.sum(-1, keepdim=True)
+            runs, outputs, keepalive = {}, {}, []
+            route_names = ["native"] if args.native_slices else args.route.split(",")
+            for route in route_names:
+                for exact in (False, True):
+                    label = route + ("-exact" if exact else "-padded")
+                    if args.native_slices:
+                        slice_width = native_slice_width(g.name, width)
+                        run, output, owned = native_pair_arm(x, ids, routing, weights, scales,
+                                                            slice_width, exact, g.name != "v41" and rows >= 256,
+                                                            g.name == "v41")
+                    else:
+                        stored = width if exact else padded
+                        geometry = Exact(g.name, g.hidden, experts, topk, g.intermediate,
+                                         weights="mxfp4", rank_width=stored)
+                        pad = torch.nn.functional.pad
+                        s2 = pad(scales["w2"], (0, (stored // 32 + 3) // 4 * 4 - width // 32)).cuda()
+                        planes = tuple(pad(t, (0, 0, 0, stored - width)).cuda()
+                                       for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"]))
+                        planes += (pad(weights["w2"], (0, (stored - width) // 2)).cuda(), s2)
+                        source, _ = wire_rows(x)
+                        program = compile_fp8_moe_aot(geometry, route=route, max_rows=rows, prefill=args.prefill)
+                        scratch = torch.empty(fp8_moe_scratch_bytes(geometry, route, rows, prefill=args.prefill),
+                                              dtype=torch.uint8, device="cuda")
+                        output = torch.empty_like(x)
+                        def bind(program, source, planes, output, scratch):
+                            return lambda: program.launch(source, ids, routing, *planes, output, scratch, scalars=(rows,))
+                        run = bind(program, source, planes, output, scratch)
+                        owned = (program, source, planes, scratch)
+                    run()
+                    torch.cuda.synchronize()
+                    if args.graph:
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            run()
+                        keepalive.append((run, graph))
+                        run = graph.replay
+                    runs[label], outputs[label] = run, output
+                    keepalive.append(owned)
+            for run in runs.values():
+                run()
+            torch.cuda.synchronize()
+            comparisons = {route: compare_route_outputs({arm: outputs[route + "-" + arm]
+                           for arm in ("padded", "exact")})["exact"] for route in route_names}
+            for output in outputs.values():
+                assert torch.isfinite(output).all() and torch.count_nonzero(output), "invalid paired output"
+            if args.profile_dir:
+                profile_pair_arm(runs, args, g.name, width, rows)
+                continue
+            samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
+            for route in route_names:
+                old, new = (statistics.median(samples[route + "-" + arm]) for arm in ("padded", "exact"))
+                record = dict(geometry=g.name, hidden=g.hidden, experts=experts, topk=topk,
+                              width=width, padded_width=padded, rows=rows, route=route,
+                              weight_sha256=weight_hash, graph=args.graph, routing=args.routing,
+                              l2_bytes=l2_bytes, resident_payload_bytes=experts * expert_payload_bytes,
+                              slice_width=native_slice_width(g.name, width) if args.native_slices else None,
+                              padded_us=old, exact_us=new, speedup=old/new,
+                              comparison=comparisons[route], samples_us={arm: samples[route + "-" + arm]
+                              for arm in ("padded", "exact")})
+                results.append(record)
+                print(json.dumps(record), flush=True)
+            del runs, outputs, keepalive
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(dict(device=str(torch.cuda.get_device_properties(0)),
+                                               torch=torch.__version__, results=results), indent=2) + "\n")
+
+
+def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True,
+                       native_resident=False, native_exact=False, v4=True):
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from b12x._lib.utils import current_cuda_stream
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry
+    from b12x.integration.cuteafd._fp8_moe_kernels import meta_words
+    from b12x.integration.cuteafd._fp8_moe_stream import stream_max_tiles
+    from b12x.integration.cuteafd._mxfp4_down_a8_plan import mxfp8_down_row_bytes
+    from b12x.moe._shared.kernels.mxfp4_stream_contract import V4StreamContract
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+    rows, hidden = x.shape
+    experts, width = weights["w1"].shape[:2]
+    topk = ids.shape[1]
+    from dataclasses import dataclass
+    @dataclass(frozen=True)
+    class ExactStreamGeometry(Fp8MoeGeometry):
+        @property
+        def slice(self):
+            return self.intermediate
+    geometry = ExactStreamGeometry("v41", hidden, experts, topk, width, weights="mxfp4", swiglu_limit=10. if v4 else 0.)
+    source, _ = wire_rows(x)
+    planes = [t.cuda() for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"], weights["w2"])]
+    planes.append(torch.nn.functional.pad(scales["w2"], (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda())
+    if native_resident:
+        from tests.moe.test_v41_exact_slices import pack
+        w13, s13, w2, s2 = pack(weights, scales, native_exact)
+        planes = [w13, s13, w13, s13, w2, s2]
+    pairs, tiles = rows * topk, stream_max_tiles(experts, rows * topk)
+    output = torch.empty_like(x)
+    scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
+        ((meta_words(experts, tiles),), torch.int32), ((pairs,), torch.int32), ((pairs,), torch.int32),
+        ((tiles * 128 * mxfp8_down_row_bytes(width),), torch.uint8),
+        ((pairs, hidden), torch.float32 if v4 else torch.bfloat16), ((pairs,), torch.float32))]
+    tensors = [source, ids.flatten(), routing.flatten(), *planes, output, *scratch]
+    views = [from_dlpack(t, assumed_align=16) for t in tensors]
+    pointers = [t.iterator for t in views]
+    launch = cute.compile(V4StreamContract(geometry, rows, native_resident=native_resident,
+                          native_exact=native_exact, v4=v4), *pointers,
+                          cutlass.Int32(rows), current_cuda_stream())
+    def execute(live):
+        launch(*pointers, cutlass.Int32(live), current_cuda_stream())
+    if qualify:
+        qualify_pair_replay(execute, ids, output, scratch, tensors, lambda live: output[:live])
+    def run(): execute(rows)
+    return run, output, (tensors, views, launch, execute)
+
+
+def mxfp4_unify_screen(g, args, geometry_type):
+    """Compare complete native wire-input arms to the installed mixed generic math."""
+    from b12x.moe._shared.kernels.v41_slice_pipeline import fc1_partial_words
+    from b12x.integration.cuteafd.fp8_moe import (
+        _Fp8Moe, DECODE_MAX_ROWS, auto_large_rows, fp8_moe_scratch_bytes, compile_fp8_moe_aot,
+    )
+    from b12x.integration.cuteafd._mxfp4_moe_kernels import GroupedMxfp4Gemv
+    from b12x.integration.cuteafd._common import compile_program
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+
+    properties = torch.cuda.get_device_properties(0)
+    l2_bytes = int(properties.L2_cache_size)
+    flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
+    results = []
+    for width in paired_widths(g.intermediate, args.widths):
+        expert_bytes = 3 * width * g.hidden // 2
+        experts = max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16)
+        generator = torch.Generator().manual_seed(args.seed + width)
+        weights, scales = {}, {}
+        for name, shape in (("w1", (experts, width, g.hidden // 2)),
+                            ("w3", (experts, width, g.hidden // 2)),
+                            ("w2", (experts, g.hidden, width // 2))):
+            weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+            scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
+                                        dtype=torch.uint8, generator=generator)
+        weight_hash = hashlib.sha256(b"".join(t.numpy().tobytes()
+                                     for t in (*weights.values(), *scales.values()))).hexdigest()
+        for rows in map(int, args.rows.split(",")):
+            torch.manual_seed(args.seed + rows)
+            x = (torch.randn(rows, g.hidden, device="cuda") * .5).bfloat16()
+            ids = torch.rand(rows, experts, device="cuda").topk(g.top_k, -1).indices.int()
+            if args.routing == "hot":
+                ids.copy_(ids[:1].expand_as(ids))
+            routing = torch.rand(rows, g.top_k, device="cuda")
+            routing /= routing.sum(-1, keepdim=True)
+            v4 = g.name == "v41"
+            contract = dict(swiglu_limit=10. if v4 else 0., silu_bf16_product=not v4,
+                            route_weight_before_fc2=v4, round_fc2_bf16=not v4)
+            geometry = geometry_type(g.name, g.hidden, experts, g.top_k, g.intermediate,
+                                     weights="mxfp4", rank_width=width)
+            planes = tuple(t.cuda() for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"], weights["w2"]))
+            planes += (torch.nn.functional.pad(scales["w2"],
+                       (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda(),)
+            source, _ = wire_rows(x)
+            control_route = "stream" if rows > 80 else "auto"
+            template = (None if v4 else compile_fp8_moe_aot(
+                geometry, route=control_route, max_rows=rows, prefill=args.prefill))
+            blocks = (width + 127) // 128
+            matching = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
+            program = template
+            if not v4 and control_route != "stream":
+                launch = _Fp8Moe(geometry, control_route, rows, True, args.prefill)
+                launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
+                                        max_rows=min(rows, DECODE_MAX_ROWS), warps=matching)
+                program = compile_program(launch, name=template.name + "_unify_control",
+                           operands=template.operands, scalars=template.scalars, key=launch.key(),
+                           geometry={**template.geometry, "screen_down_warps": matching}, scratch=template.scratch)
+            runs, outputs, owned = {}, {}, []
+            control_qualification = {}
+            controls = ["current", "current-2", "current-3"]
+            for label in controls:
+                if v4:
+                    # Shipped legacy prefill; decode retains its per-width tile.
+                    tile = 128 if rows <= 80 and width == 576 else 192
+                    runs[label], outputs[label], keep = native_pair_arm(
+                        x, ids, routing, weights, scales, tile, rows <= 80 and width == 576, False, True,
+                        projection_contract=contract, combine_output=True, qualify=True)
+                    owned.append(keep)
+                    control_qualification[label] = dict(deterministic=True, row_invariant=True,
+                                                       prefix_failures=[], graph_reuse=True)
+                    continue
+                scratch = torch.empty(fp8_moe_scratch_bytes(geometry, control_route, rows, prefill=args.prefill),
+                                      dtype=torch.uint8, device="cuda")
+                output = torch.empty_like(x)
+                buffers = (source, ids, routing, *planes, output, scratch)
+                def bind(buffers):
+                    def execute(live):
+                        program.launch(*buffers, scalars=(live,))
+                    return execute
+                execute = bind(buffers)
+                control_qualification[label] = qualify_pair_replay(
+                    execute, ids, output, [scratch], buffers, lambda live: output[:live],
+                    strict_prefix=rows <= 80)
+                runs[label] = lambda execute=execute: execute(rows)
+                outputs[label] = output
+                owned.append((buffers, execute))
+            if args.generic_a8:
+                assert not v4 and rows <= 80
+                launch = _Fp8Moe(geometry, control_route, rows, True, args.prefill)
+                launch.decode.gate_up = GroupedMxfp4Gemv(n=2 * width, k=g.hidden, experts=experts,
+                    split=width, max_rows=64, warps=4 if g.hidden < 6144 else 8, groups=1,
+                    gather=True, activation_a8=True)
+                launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
+                    max_rows=64, warps=matching, activation_a8=True)
+                a8_program = compile_program(launch, name=template.name + "_benchmark_generic_a8",
+                    operands=template.operands, scalars=template.scalars, key=launch.key(),
+                    geometry=template.geometry, scratch=template.scratch)
+                a8_scratch = torch.empty(fp8_moe_scratch_bytes(geometry, control_route, rows),
+                                         dtype=torch.uint8, device="cuda")
+                a8_output = torch.empty_like(x)
+                a8_buffers = (source, ids, routing, *planes, a8_output, a8_scratch)
+                def generic_execute(live, program=a8_program, buffers=a8_buffers):
+                    program.launch(*buffers, scalars=(live,))
+                control_qualification["generic-a8"] = qualify_pair_replay(
+                    generic_execute, ids, a8_output, [a8_scratch], a8_buffers,
+                    lambda live: a8_output[:live], strict_prefix=True)
+                runs["generic-a8"] = lambda execute=generic_execute, live=rows: execute(live)
+                outputs["generic-a8"] = a8_output
+                owned.append((a8_program, a8_buffers, generic_execute))
+            variants = ({"native-a8-t128-k2": ("a8", 128, 2, 1)} if v4 and rows <= 80 else
+                        {} if v4 else
+                        {"native-" + precision: (precision, 128, 1, 1) for precision in ("a8", "a16")})
+            if args.fc1_k_splits:
+                for tile, split in fc1_split_tiles(g.hidden, map(int, args.fc1_k_splits.split(","))):
+                    for precision in ("a8", "a16"):
+                        variants[f"native-{precision}-t{tile}-k{split}"] = (precision, tile, split, 1)
+            if args.fc1_cta_splits:
+                for team in map(int, (args.fc1_k_splits or "1").split(",")):
+                    for cta in map(int, args.fc1_cta_splits.split(",")):
+                        if (g.hidden // 128) % (team * cta) == 0:
+                            for precision in ("a8", "a16"):
+                                variants[f"native-{precision}-t64-k{team}-z{cta}"] = (precision, 64, team, cta)
+            if args.profile_dir:
+                variants = {label: spec for label, spec in variants.items() if label == args.profile_arm}
+            for label, (precision, tile, split, cta) in variants.items():
+                try:
+                    runs[label], outputs[label], keep = native_pair_arm(
+                        x, ids, routing, weights, scales, tile, not v4, False, v4,
+                        activation_precision=precision, projection_contract=contract,
+                        combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split,
+                        fc1_cta_splits=cta)
+                except AssertionError as error:
+                    raise AssertionError(f"native {label}, rows={rows}, width={width}: {error}") from error
+                owned.append(keep)
+            if args.row_major_mma:
+                tile, split, exact = (128, 2, False) if v4 and width == 384 else (128, 1, True)
+                for label in ("resident-control", "resident-control-2", "resident-control-3", "row-major-mma"):
+                    runs[label], outputs[label], keep = native_pair_arm(
+                        x, ids, routing, weights, scales, tile, exact, False, v4,
+                        projection_contract=contract, combine_output=True, qualify=True,
+                        fc1_k_splits=split, row_major_mma=label == "row-major-mma")
+                    owned.append(keep)
+            if args.native_stream:
+                for label, resident in (("native-stream-a8", True), ("row-major-stream-a8", False)):
+                    runs[label], outputs[label], keep = v4_stream_pair_arm(
+                        x, ids, routing, weights, scales, native_resident=resident,
+                        native_exact=width != 384, v4=v4)
+                    owned.append(keep)
+            if args.v4_stream:
+                runs["row-major-stream-a8"], outputs["row-major-stream-a8"], keep = v4_stream_pair_arm(
+                    x, ids, routing, weights, scales)
+                owned.append(keep)
+            if args.stream_decode:
+                label = "native-stream-a16"
+                runs[label], outputs[label], keep = native_pair_arm(
+                    x, ids, routing, weights, scales, 64, True, False, False,
+                    activation_precision="a16", projection_contract=contract,
+                    combine_output=True, ingress="wire", qualify=True, stream_decode=True)
+                owned.append(keep)
+            if args.row_major_a8:
+                label = "row-major-a8"
+                runs[label], outputs[label], keep = native_pair_arm(
+                    x, ids, routing, weights, scales, 64, True, False, False,
+                    activation_precision="a8", projection_contract=contract,
+                    combine_output=True, ingress="wire", qualify=True, row_major_a8=True)
+                owned.append(keep)
+            for label, run in list(runs.items()):
+                run()
+                if args.graph:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run()
+                    owned.append((run, graph))
+                    runs[label] = graph.replay
+            torch.cuda.synchronize()
+            comparisons = compare_route_outputs(outputs)
+            assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
+            def reference(precision=None):
+                value = mxfp4_f32_reference(x, ids, routing, weights, scales,
+                    limit=10. if v4 else 0., native=v4, activation_precision=precision)
+                if v4:
+                    routes = value.reshape(rows, g.top_k, g.hidden)
+                    value = torch.zeros_like(x, dtype=torch.float32)
+                    for slot in range(g.top_k):
+                        value += routes[:, slot]
+                return value
+            oracle = reference()
+            errors = {label: f32_errors(output, oracle) for label, output in outputs.items()}
+            matched_errors = {}
+            references = {"a16": oracle, "a8": reference("a8")}
+            eligible = {}
+            quality_precisions = {label: spec[0] for label, spec in variants.items()}
+            if args.native_stream:
+                quality_precisions.update({"native-stream-a8": "a8", "row-major-stream-a8": "a8"})
+            if args.generic_a8:
+                quality_precisions["generic-a8"] = "a8"
+            if args.stream_decode:
+                quality_precisions["native-stream-a16"] = "a16"
+            if args.row_major_mma:
+                quality_precisions["row-major-mma"] = "a8"
+            if args.row_major_a8:
+                quality_precisions["row-major-a8"] = "a8"
+            if args.v4_stream:
+                quality_precisions["row-major-stream-a8"] = "a8"
+            for label, precision in quality_precisions.items():
+                matched = references[precision]
+                error = f32_errors(outputs[label], matched)
+                normalized_rms = error["rms"] / max(matched.square().mean().sqrt().item(), 1e-8)
+                assert normalized_rms < .02, ("native matched oracle", label, normalized_rms)
+                matched_errors[label] = dict(**error, normalized_rms=normalized_rms)
+                baseline = f32_errors(outputs.get("native-" + precision, outputs[label]), matched)
+                eligible[label] = all(error[key] <= baseline[key] for key in ("max_abs", "rms"))
+            if args.profile_dir:
+                profile_pair_arm(runs, args, g.name, width, rows)
+                continue
+            samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
+            medians = {label: statistics.median(values) for label, values in samples.items()}
+            record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows,
+                          ingress="wire", wire_preparation_timed=False,
+                          a16_wire_dequant_timed=True, token_combine_timed=True,
+                          control_route="native-legacy" if v4 else control_route,
+                          control_tile=(128 if rows <= 80 and width == 576 else 192) if v4 else None,
+                          control_storage=("exact" if rows <= 80 and width == 576 else "legacy") if v4 else None,
+                          projection_contract=contract, control_qualification=control_qualification,
+                          current_down="a8" if v4 or (control_route == "stream"
+                                       and args.prefill != "w8a16") else "a16",
+                          matching_warps=matching, controls=controls, graph=args.graph,
+                          weight_sha256=weight_hash, samples_us=samples, median_us=medians,
+                          speedup={label: medians["current"] / medians[label] for label in runs},
+                          f32_errors=errors, matched_f32_errors=matched_errors, comparisons=comparisons,
+                          invariant_checks="poison/live/graph/row-mix", slice_width=128,
+                          fc1_variants={label: dict(precision=precision, tile=tile, k_splits=split,
+                                                    cta_splits=cta, partial_bytes=4 * fc1_partial_words(
+                                                        rows, tile, g.top_k, width, precision, cta))
+                                        for label, (precision, tile, split, cta) in variants.items()},
+                          quality_eligible=eligible,
+                          stream_partial_bytes=(4 * fc1_partial_words(rows, 64, g.top_k, width,
+                                                "a16", stream_decode=True) if args.stream_decode else None))
+            results.append(record)
+            print(json.dumps(record), flush=True)
+            del owned, runs, outputs
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(dict(device=str(properties), results=results), indent=2) + "\n")
+
+
+def mxfp4_tiling_screen(g, args, geometry_type):
+    """One development session: choose only quality/invariant-passing exact arms."""
+    from b12x.integration.cuteafd.fp8_moe import fp8_moe_scratch_bytes
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+
+    properties = torch.cuda.get_device_properties(0)
+    l2_bytes = int(properties.L2_cache_size)
+    flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
+    explicit = native_screen_arms(args.mxfp4_arm)
+    widths = sorted({arm[1] for arm in explicit}) if explicit else paired_widths(g.intermediate, args.widths)
+    if any(width > g.intermediate for width in widths):
+        raise ValueError("logical rank width exceeds the model intermediate")
+    waves = recorded_waves(args.routes, g) if args.routes else None
+    selected_waves = {rows: screen_route_wave(waves, rows, args.seed)
+                      for rows in map(int, args.rows.split(","))} if waves else {}
+    route_fixture = ({"path": str(args.routes), "sha256": hashlib.sha256(args.routes.read_bytes()).hexdigest(),
+                      "waves": len(waves), "family_attested": args.routes.suffix != ".jsonl"}
+                     if waves else None)
+    results = []
+    for width in widths:
+        expert_bytes = 3 * width * g.hidden // 2
+        experts = max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16,
+                      g.experts if waves else 0)
+        padded = (width + 127) // 128 * 128
+        generator = torch.Generator().manual_seed(args.seed + width)
+        weights, scales = {}, {}
+        for name, shape in (("w1", (experts, width, g.hidden // 2)),
+                            ("w3", (experts, width, g.hidden // 2)),
+                            ("w2", (experts, g.hidden, width // 2))):
+            weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+            scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
+                                        dtype=torch.uint8, generator=generator)
+        weight_hash = hashlib.sha256(b"".join(t.numpy().tobytes() for t in (*weights.values(), *scales.values()))).hexdigest()
+        for rows in map(int, args.rows.split(",")):
+            torch.manual_seed(args.seed + rows)
+            x = (torch.randn(rows, g.hidden, device="cuda") * .5).bfloat16()
+            topk = g.top_k
+            ids = (screen_route_ids(selected_waves[rows], experts, topk, args.seed).cuda()
+                   if waves else torch.rand(rows, experts, device="cuda").topk(topk, -1).indices.int())
+            if args.routing == "hot":
+                ids.copy_(ids[:1].expand_as(ids))
+            routing = torch.rand(rows, topk, device="cuda")
+            routing /= routing.sum(-1, keepdim=True)
+            oracle = mxfp4_f32_reference(x, ids, routing, weights, scales,
+                                         10.0 if args.native_slices else g.swiglu_limit,
+                                         native=args.native_slices)
+            for route in (["native"] if args.native_slices else args.route.split(",")):
+                blocks = (width + 127) // 128
+                matching_warps = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
+                baseline_tile = (native_slice_width(g.name, width) if args.native_slices else
+                                 matching_warps if route == "decode" else None)
+                tiles = (64, 128, 192) if args.native_slices else (mxfp4_decode_partitions(width) if route == "decode" else (None,))
+                if args.fc1_k_splits and args.native_slices and not explicit:
+                    baseline_tile = 128
+                specs, controls = tiling_specs(args, width, baseline_tile, tiles)
+                k_splits = {label: 1 for label, _, _, _ in specs}
+                k_splits.update({name: split for name, logical, stored, tile, split in explicit
+                                 if logical == width})
+                if args.profile_dir:
+                    specs = [spec for spec in specs if spec[0] in controls or spec[0] == args.profile_arm]
+                if args.fc1_k_splits:
+                    specs = [(label, True if label in controls else exact, tile, stored)
+                             for label, exact, tile, stored in specs]
+                    for tile, split in fc1_split_tiles(g.hidden, map(int, args.fc1_k_splits.split(","))):
+                        label = f"exact-t{tile}-k{split}"
+                        specs.append((label, True, tile, None))
+                        k_splits[label] = split
+                runs, outputs, keepalive, invariants, resident_widths = {}, {}, [], {}, {}
+                for label, exact, tile, stored in specs:
+                    try:
+                        if args.native_slices:
+                            run, output, owned = native_pair_arm(x, ids, routing, weights, scales, tile,
+                                                                exact, False, g.name == "v41", qualify=True,
+                                                                aligned_w2=label.startswith("aligned-w2"),
+                                                                aligned_w2_scales=label == "aligned-w2-scales",
+                                                                stored_width=stored, fc1_k_splits=k_splits[label])
+                        else:
+                            stored = width if exact else padded
+                            geometry = geometry_type(g.name, g.hidden, experts, topk, g.intermediate,
+                                                     weights="mxfp4", rank_width=stored)
+                            pad = torch.nn.functional.pad
+                            s2 = pad(scales["w2"], (0, (stored // 32 + 3) // 4 * 4 - width // 32)).cuda()
+                            planes = tuple(pad(t, (0, 0, 0, stored - width)).cuda()
+                                           for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"]))
+                            planes += (pad(weights["w2"], (0, (stored - width) // 2)).cuda(), s2)
+                            source, _ = wire_rows(x)
+                            program = grouped_pair_program(geometry, route, rows, args.prefill,
+                                                           down_warps=tile if exact else None)
+                            scratch = torch.empty(fp8_moe_scratch_bytes(geometry, route, rows, prefill=args.prefill),
+                                                  dtype=torch.uint8, device="cuda")
+                            output = torch.empty_like(x)
+                            buffers = (source, ids, routing, *planes, output, scratch)
+                            def bind(program, buffers):
+                                return lambda live: program.launch(*buffers, scalars=(live,))
+                            execute = bind(program, buffers)
+                            qualify_pair_replay(execute, ids, output, [scratch], buffers,
+                                                lambda live: output[:live])
+                            def bind_run(execute, rows):
+                                return lambda: execute(rows)
+                            run = bind_run(execute, rows)
+                            owned = (program, buffers)
+                        invariants[label] = True
+                    except AssertionError as error:
+                        print(json.dumps(dict(geometry=g.name, width=width, rows=rows, route=route,
+                                              arm=label, invariant_failure=str(error))), flush=True)
+                        if label in controls:
+                            raise
+                        continue
+                    resident_widths[label] = stored if stored is not None else (width if exact else padded)
+                    run()
+                    torch.cuda.synchronize()
+                    if args.graph:
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            run()
+                        keepalive.append((run, graph))
+                        run = graph.replay
+                    runs[label], outputs[label] = run, output
+                    keepalive.append(owned)
+                for run in runs.values():
+                    run()
+                torch.cuda.synchronize()
+                errors = {label: f32_errors(output, oracle) for label, output in outputs.items()}
+                baseline_error = errors["padded"]
+                eligible = {label: all(error[key] <= baseline_error[key] for key in ("max_abs", "rms"))
+                            for label, error in errors.items()}
+                for output in outputs.values():
+                    assert torch.isfinite(output).all() and torch.count_nonzero(output), "invalid tiling output"
+                if args.profile_dir:
+                    profile_pair_arm(runs, args, g.name, width, rows)
+                    continue
+                samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
+                comparisons = compare_route_outputs(outputs)
+                assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
+                wave = selected_waves.get(rows)
+                record = dict(geometry=g.name, hidden=g.hidden, width=width, padded_width=padded,
+                              rows=rows, route=route, experts=experts, topk=topk, graph=args.graph,
+                              routing=args.routing, weight_sha256=weight_hash, l2_bytes=l2_bytes,
+                              route_fixture=route_fixture,
+                              recorded_wave=({key: wave.get(key) for key in ("layer", "lane", "rows")}
+                                             if wave else None),
+                              route_histogram=sorted(Counter(ids.cpu().flatten().tolist()).items()),
+                              resident_payload_bytes=experts * expert_bytes, samples_us=samples,
+                              resident_widths=resident_widths,
+                              slice_widths={label: tile for label, _, tile, _ in specs if label in runs},
+                              controls=controls, fc1_k_splits=k_splits,
+                              arm_specs={label: dict(tile=tile, split=k_splits[label],
+                                  stored_width=stored if stored is not None else (width if exact else padded),
+                                  exact_storage=stored is not None or (exact and
+                                      (width % 128 != 0 or (width + tile - 1) // tile * tile > width)))
+                                  for label, exact, tile, stored in specs if label in runs},
+                              resident_payload_bytes_by_arm={label: experts * g.hidden *
+                                  (2 * width + padded if label.startswith("aligned-w2") else
+                                   3 * resident_widths[label]) // 2 for label in runs},
+                              f32_errors=errors, quality_eligible=eligible,
+                              within_version_invariants=invariants, comparisons=comparisons,
+                              **tiling_timing_summary(samples, eligible, controls))
+                results.append(record)
+                print(json.dumps(record), flush=True)
+                del runs, outputs, keepalive
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(dict(device=str(properties), torch=torch.__version__, results=results), indent=2) + "\n")
+
+
 def main() -> None:
     args = parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
 
-    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES
+    from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, Fp8MoeGeometry
 
-    g = GEOMETRIES[args.geometry].with_tp(args.tp)
+    if args.native_slices or (args.mxfp4_unify and args.geometry == "v41"):
+        intermediate, hidden = {"v41": (2304, 5120), "dsv4f": (2048, 4096), "dsv4p": (3072, 7168)}[args.geometry]
+        g = Fp8MoeGeometry(args.geometry, hidden, 384, 6, intermediate, weights="mxfp4")
+    else:
+        g = GEOMETRIES[args.geometry].with_tp(args.tp)
+    if args.mxfp4_pair:
+        mxfp4_pair_screen(g, args)
+        return
     if args.activation is not None:
         g = replace(g, activation=args.activation)
     if g.weights in ("nvfp4", "bf16") and args.input != "bf16":
