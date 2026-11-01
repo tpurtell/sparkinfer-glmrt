@@ -123,9 +123,10 @@ def test_fc1_k_split_contract(split, tile, precision):
     require_b12x()
     from benchmarks.bench_cuteafd_fp8_moe import mxfp4_f32_reference
     torch.backends.cuda.matmul.allow_tf32 = False
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
     torch.manual_seed(928320)
     m, e, k, h, n = 80, 8, 8, 4096, 288
-    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    x = wire_rows((torch.randn(m, h, device="cuda") * .5).bfloat16())[1]
     ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
     routing = torch.rand(m, k, device="cuda")
     routing /= routing.sum(-1, keepdim=True)
