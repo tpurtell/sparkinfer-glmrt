@@ -48,7 +48,7 @@ def test_unify_screen_is_mimo_pair_only(family):
     args = bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--geometry", family,
                              "--widths", "256,288", "--graph"])
     assert args.mxfp4_unify and args.input == "wire"
-    for extra in (["--native-slices"], ["--mxfp4-tilings"], ["--capacity", "80"]):
+    for extra in (["--native-slices"], ["--mxfp4-tilings"]):
         with pytest.raises(SystemExit):
             bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--geometry", family, *extra])
     with pytest.raises(SystemExit):
@@ -468,6 +468,30 @@ def test_v4_stream_adapter_has_ordered_f32_output_and_weight_before_fc2():
                   if isinstance(n, ast.FunctionDef) and n.name == "v4_stream_pair_arm")
     assert "return self.intermediate" in ast.unparse(helper)
     assert "geometry = ExactStreamGeometry(" in ast.unparse(helper)
+
+
+@pytest.mark.parametrize("family,capacity,rows", [
+    ("v41", 1, "1"), ("v41", 80, "8,16,40,80"),
+    ("mimof", 1, "1"), ("mimof", 16, "8,16"), ("mimop", 80, "32,48,64")])
+def test_unify_fixed_capacity_live_matrix(family, capacity, rows):
+    args = bench.parse_args(["--geometry", family, "--mxfp4-pair", "--mxfp4-unify",
+                             "--capacity", str(capacity), "--rows", rows])
+    assert args.capacity == capacity
+    assert max(map(int, args.rows.split(","))) <= capacity
+
+
+def test_unify_fixed_capacity_calls_preserve_live_rows():
+    text = _PATH.read_text()
+    cls = ast.parse(text)
+    native = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "native_pair_arm")
+    screen = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "mxfp4_unify_screen")
+    assert "execute(live_rows)" in ast.unparse(native)
+    calls = [n for n in ast.walk(screen) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "native_pair_arm"]
+    assert any(any(k.arg == "live_rows" and ast.unparse(k.value) == "rows" for k in n.keywords)
+               for n in calls)
+    assert "max_rows=capacity" in ast.unparse(screen)
+    assert "x[:rows], ids[:rows], routing[:rows]" in ast.unparse(screen)
 
 
 def test_native_stream_weights_share_activation_completion_ring():
