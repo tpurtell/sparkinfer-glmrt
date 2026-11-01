@@ -473,7 +473,7 @@ def test_new_family_launchable_cells(family, hidden, experts, topk, widths, clam
             assert (opts["hidden_size"], opts["route_num_experts"], opts["top_k"]) == (hidden, experts, topk)
             assert opts["intermediate_size"] == width and opts["swiglu_limit"] == clamp
             assert opts["activation"] == ("silu_post_clamp" if family == "step5" else "silu")
-            assert (opts["tier0_bits"], opts["tier1_bits"]) == (4, 5)
+            assert (opts["tier0_bits"], opts["tier1_bits"]) == ((4, 6) if family == "step5" else (4, 5))
     args = b.benchmark_parser().parse_args([
         "--prefill-family", family, "--role", "coordinator", "--route-distributions", "random",
         "--output", "result.json", "--coordinator-arm", "current:mode=ws"])
