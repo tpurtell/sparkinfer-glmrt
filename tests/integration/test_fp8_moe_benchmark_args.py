@@ -457,10 +457,12 @@ def test_v4_contract_benchmarks_are_explicit(flag, rows):
 def test_v4_stream_adapter_has_ordered_f32_output_and_weight_before_fc2():
     path = _PATH.parents[1] / "b12x/moe/_shared/kernels/mxfp4_stream_contract.py"
     text = path.read_text()
-    assert "self.gate_up.route_weight_before_fc2 = True" in text
-    assert "self.gate_up.silu_bf16_product = False" in text
-    assert "self.down.round_output_bf16 = False" in text
-    assert "fadd_rn_f32(value, down[" in text
+    assert "v4=True" in text
+    assert "self.gate_up.route_weight_before_fc2 = v4" in text
+    assert "self.gate_up.silu_bf16_product = not v4" in text
+    assert "self.down.round_output_bf16 = not v4" in text
+    assert "fadd_rn_f32(value, route)" in text
+    assert "route *= routing[row * self.g.top_k + slot]" in text
     assert "atomic" not in text
     helper = next(n for n in ast.parse(_PATH.read_text()).body
                   if isinstance(n, ast.FunctionDef) and n.name == "v4_stream_pair_arm")
