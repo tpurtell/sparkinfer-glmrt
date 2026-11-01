@@ -1232,7 +1232,7 @@ COORDINATOR_FAMILIES = {
                    profiles={"rtx-tp1": 3072, "rtx-tp2": 1536,
                             "spark-tp4-width768": 768, "spark-tp6-width512": 512},
                    capacities=GLM_CAPACITIES, routes=None),
-    # Launchable ordinary widths only; compact companions and native K6 are not screened.
+    # Launchable ordinary widths only; compact companions and dense K6 are not screened.
     "muse": dict(hidden=4096, experts=256, top_k=8, bits=(4, 5), activation="silu",
                  swiglu_limit=None, model="meta-models/Muse-Spark-Open-816B-A42B",
                  profiles={"rtx-tp1": 4096, "rtx-tp2": 2048,
@@ -1240,7 +1240,7 @@ COORDINATOR_FAMILIES = {
                            "spark-tp5-width768": 768, "spark-tp6-width640": 640,
                            "spark-tp7-width512": 512},
                  capacities=GLM_CAPACITIES, routes=None),
-    "step5": dict(hidden=4096, experts=352, top_k=8, bits=(4, 5), activation="silu_post_clamp",
+    "step5": dict(hidden=4096, experts=352, top_k=8, bits=(4, 6), activation="silu_post_clamp",
                   swiglu_limit=7.0, model="stepfun-ai/Step-5-Preview",
                   profiles={"rtx-tp1": 1536, "rtx-tp2": 768,
                             "spark-tp3-width512": 512, "spark-tp4-width384": 384,
