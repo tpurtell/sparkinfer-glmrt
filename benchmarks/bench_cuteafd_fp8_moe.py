@@ -174,6 +174,7 @@ def parse_args(argv=None):
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--routing", choices=("random", "hot"), default="random")
     parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument("--profile-arm", help="paired screen: one warmed arm inside the mxfp4-pair NVTX range")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--exact-sweep", type=Path, help="correctness only: dump exact outputs and check row invariance (widths 1..64)")
@@ -247,10 +248,35 @@ def parse_args(argv=None):
             parser.error("--widths requires --mxfp4-pair and positive K32 widths")
     if args.routes and args.mxfp4_pair and not args.mxfp4_tilings:
         parser.error("paired recorded routes require --mxfp4-tilings")
-    if args.mxfp4_pair and (args.exact_sweep or args.profile_dir or args.check_prefix_rows
+    if args.mxfp4_pair and (args.exact_sweep or args.check_prefix_rows
                            or args.compare_routes_exact or args.input != "wire"):
-        parser.error("paired MXFP4 screening requires wire input and no other sweep/profile mode")
+        parser.error("paired MXFP4 screening requires wire input and no other sweep mode")
+    if args.profile_arm and not (args.mxfp4_pair and args.profile_dir):
+        parser.error("--profile-arm requires paired mode and --profile-dir")
+    if args.mxfp4_pair and args.profile_dir:
+        allowed = ({"current", "native-a8", "native-a16"} if args.mxfp4_unify
+                   else {"native-padded", "native-exact"} if args.native_slices else set())
+        if args.profile_arm not in allowed or args.mxfp4_tilings:
+            parser.error("paired profiling requires one --profile-arm from the native or unification screen")
     return args
+
+
+def profile_pair_arm(runs, args, geometry, width, rows):
+    """One warmed launch, externally captured with nsys --capture-range=nvtx."""
+    run = runs[args.profile_arm]
+    run()
+    torch.cuda.synchronize()
+    args.profile_dir.mkdir(parents=True, exist_ok=True)
+    torch.cuda.nvtx.range_push("mxfp4-pair")
+    try:
+        run()
+        torch.cuda.synchronize()
+    finally:
+        torch.cuda.nvtx.range_pop()
+    path = args.profile_dir / f"{geometry}-w{width}-r{rows}-{args.profile_arm}.json"
+    path.write_text(json.dumps(dict(geometry=geometry, width=width, rows=rows,
+                                   arm=args.profile_arm, nvtx_range="mxfp4-pair",
+                                   warmed_launches=1, attribution_only=True)) + "\n")
 
 
 def compare_route_outputs(outputs):
@@ -814,6 +840,9 @@ def mxfp4_pair_screen(g, args):
                            for arm in ("padded", "exact")})["exact"] for route in route_names}
             for output in outputs.values():
                 assert torch.isfinite(output).all() and torch.count_nonzero(output), "invalid paired output"
+            if args.profile_dir:
+                profile_pair_arm(runs, args, g.name, width, rows)
+                continue
             samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
             for route in route_names:
                 old, new = (statistics.median(samples[route + "-" + arm]) for arm in ("padded", "exact"))
@@ -924,6 +953,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
             assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
             oracle = mxfp4_f32_reference(x, ids, routing, weights, scales)
             errors = {label: f32_errors(output, oracle) for label, output in outputs.items()}
+            if args.profile_dir:
+                profile_pair_arm(runs, args, g.name, width, rows)
+                continue
             samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
             medians = {label: statistics.median(values) for label, values in samples.items()}
             record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows,
