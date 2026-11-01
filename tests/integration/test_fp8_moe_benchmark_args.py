@@ -413,6 +413,13 @@ def test_prefill_unify_controls_are_fixed_stream_and_record_prefix_failures():
     assert "control_route = 'stream' if rows > 80 else 'auto'" in text
     assert "strict_prefix=rows <= 80" in text
     assert "if control_route != 'stream':" in text
+    assert "fp8_moe_scratch_bytes(geometry, control_route, rows, prefill=args.prefill)" in text
+    assert "program = template" in text
+    override = next(n for n in ast.walk(function) if isinstance(n, ast.If)
+                    and ast.unparse(n.test) == "control_route != 'stream'")
+    # Stream must retain the public compiler's A8-down selection and scratch ABI.
+    assert "launch = _Fp8Moe(" in ast.unparse(override)
+    assert "program = compile_program(" in ast.unparse(override)
     assert "control_qualification=control_qualification" in text
     helper = next(n for n in ast.parse(_PATH.read_text()).body
                   if isinstance(n, ast.FunctionDef) and n.name == "qualify_pair_replay")
