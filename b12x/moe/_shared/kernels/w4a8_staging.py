@@ -7,7 +7,71 @@ shared memory. Slice width is static geometry; position and strides are runtime.
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
-from b12x._lib.intrinsics import cp_async4_shared_global, get_ptr_as_int64, st_shared_u32
+from b12x._lib.intrinsics import cp_async4_shared_global, get_ptr_as_int64, st_shared_u32, shared_ptr_to_u32
+
+
+@cute.jit
+def stage_row_major_mma(source, scales, raw, destination, sf, expert, n_start, k_start,
+                        thread, width: cutlass.Constexpr, intermediate: cutlass.Constexpr,
+                        hidden: cutlass.Constexpr, gated: cutlass.Constexpr,
+                        bbase=0, sbase=0):
+    """Benchmark-only contiguous K32 copies followed by the native MMA permutation."""
+    rows = width if cutlass.const_expr(gated) else 128
+    depth = 128 if cutlass.const_expr(gated) else width
+    projections = 2 if cutlass.const_expr(gated) else 1
+    n_total = 2 * intermediate if cutlass.const_expr(gated) else hidden
+    k_total = hidden if cutlass.const_expr(gated) else intermediate
+    scale_pitch = (k_total // 32 + 3) // 4 * 4
+    words = rows * depth // 8
+    for projection in cutlass.range_constexpr(projections):
+        for iteration in cutlass.range_constexpr((words // 4 + 127) // 128):
+            index = thread + Int32(iteration * 128)
+            if index < Int32(words // 4):
+                row = index // Int32(depth // 32)
+                kb = index % Int32(depth // 32)
+                n = n_start + row
+                k = k_start + kb * 32
+                valid = n < intermediate if cutlass.const_expr(gated) else k < intermediate
+                target = bbase + projection * words + index * 4
+                if valid:
+                    source_word = ((expert * n_total + projection * intermediate + n)
+                                   * (k_total // 8) + k // 8)
+                    cp_async4_shared_global(shared_ptr_to_u32(raw.iterator) + target * 4,
+                                            get_ptr_as_int64(source, source_word))
+                else:
+                    for j in cutlass.range_constexpr(4):
+                        raw[target + j] = cutlass.Uint32(0)
+    cute.arch.cp_async_commit_group()
+    cute.arch.cp_async_wait_group(0)
+    cute.arch.sync_threads()
+    for projection in cutlass.range_constexpr(projections):
+        for iteration in cutlass.range_constexpr((words + 127) // 128):
+            index = thread + Int32(iteration * 128)
+            if index < Int32(words):
+                # Native [K32,N32,N8,K8,N4] shared layout.
+                n4 = index % 4
+                k8 = (index // 4) % 4
+                n8 = (index // 16) % 8
+                chunk = (index // 128) % (rows // 32)
+                kb = index // (128 * (rows // 32))
+                row = chunk * 32 + n4 * 8 + n8
+                src = row * (depth // 8) + kb * 4 + k8
+                destination[bbase + projection * words + index] = raw[bbase + projection * words + src]
+        for group in cutlass.range_constexpr((depth + 127) // 128):
+            for iteration in cutlass.range_constexpr((rows + 127) // 128):
+                row = thread + Int32(iteration * 128)
+                if row < rows:
+                    packed = cutlass.Uint32(0)
+                    for byte in cutlass.range_constexpr(min(4, depth // 32 - group * 4)):
+                        n = n_start + row
+                        k = k_start // 32 + group * 4 + byte
+                        valid = n < intermediate if cutlass.const_expr(gated) else k < intermediate // 32
+                        if valid:
+                            value = cutlass.Uint32(scales[(expert * n_total + projection * intermediate + n)
+                                                        * scale_pitch + k])
+                            packed |= value << cutlass.Uint32(byte * 8)
+                    sf[sbase + projection * rows + group * rows + row] = packed
+    cute.arch.sync_threads()
 
 
 @cute.jit

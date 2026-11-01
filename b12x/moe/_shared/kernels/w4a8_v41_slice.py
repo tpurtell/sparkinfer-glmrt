@@ -65,6 +65,7 @@ def fadd_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
         )
     )
 from b12x.moe._shared.kernels.w4a8_staging import (
+    stage_row_major_mma,
     stage_repacked_b_slice,
     stage_repacked_sfb_slice,
     stage_repacked_b_k_slice,
@@ -515,7 +516,7 @@ class V41SliceFc1Kernel:
     def __init__(self, width, capacity, *, topk=6, intermediate=576, hidden=5120,
                  exact_storage=False, scale_codes=False, activation_precision="a8",
                  swiglu_limit=10.0, silu_bf16_product=False, route_weight_before_fc2=True,
-                 fc1_k_splits=1, fc1_cta_splits=1):
+                 fc1_k_splits=1, fc1_cta_splits=1, row_major_resident=False):
         assert width in (32, 64, 128, 192)
         assert capacity > 0 and topk > 0
         assert hidden > 0 and hidden % 128 == 0
@@ -542,6 +543,7 @@ class V41SliceFc1Kernel:
         self.hidden_tiles = hidden // 128
         self.intermediate = intermediate
         self.exact_storage = bool(exact_storage)
+        self.row_major_resident = bool(row_major_resident)
         self.scale_codes = bool(scale_codes)
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.slices = (intermediate + width - 1) // width
@@ -609,6 +611,8 @@ class V41SliceFc1Kernel:
             b = smem.allocate_tensor(
                 Uint32, cute.make_layout(self.k_splits * self.width * 32), byte_alignment=16
             )
+            if cutlass.const_expr(self.row_major_resident):
+                raw = smem.allocate_tensor(Uint32, cute.make_layout(self.k_splits * self.width * 32), byte_alignment=16)
             sf = smem.allocate_tensor(
                 Uint32, cute.make_layout(self.k_splits * max(self.width * 2, 256)), byte_alignment=16
             )
@@ -632,119 +636,124 @@ class V41SliceFc1Kernel:
             for step in range(self.hidden_tiles // (self.k_splits * self.cta_splits)):
                 kt = ((step * Int32(self.cta_splits) + cute.arch.block_idx()[2])
                       * Int32(self.k_splits) + team)
-                if cutlass.const_expr(self.exact_storage):
-                    stage_v41_exact_b(
-                        w13,
-                        bb,
-                        expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                        start,
-                        kt,
-                        team_tid,
-                        self.width,
-                        self.intermediate,
-                        self.hidden,
-                        True,
-                    )
+                if cutlass.const_expr(self.row_major_resident):
+                    stage_row_major_mma(w13, s13, raw, b, sf, expert, start, kt * 128,
+                                        team_tid, self.width, self.intermediate, self.hidden,
+                                        True, bbase, sbase)
                 else:
-                    stage_repacked_b_slice(
-                        w13,
-                        bb,
-                        expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                        Int32(self.hidden_tiles),
-                        kt,
-                        start,
-                        team_tid,
-                        128,
-                        self.width,
-                    )
-                if cutlass.const_expr(self.exact_storage):
-                    stage_v41_exact_b(
-                        w13,
-                        bb + self.width * 64,
-                        expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                        start,
-                        kt,
-                        team_tid,
-                        self.width,
-                        self.intermediate,
-                        self.hidden,
-                        True,
-                        1,
-                    )
-                else:
-                    stage_repacked_b_slice(
-                        w13,
-                        bb + self.width * 64,
-                        expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                        Int32(self.hidden_tiles),
-                        kt,
-                        start + self.kernel_intermediate,
-                        team_tid,
-                        128,
-                        self.width,
-                    )
-                if cutlass.const_expr(self.scale_codes):
-                    stage_scale_codes_slice(s13, sb, expert, kt, start, team_tid,
-                                            self.width, 2 * self.kernel_intermediate,
-                                            self.hidden // 32,
-                                            self.intermediate if self.exact_storage else 0)
-                elif cutlass.const_expr(self.exact_storage):
-                    stage_v41_exact_sfb(
-                        s13,
-                        sb,
-                        expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                        start,
-                        kt,
-                        team_tid,
-                        self.width,
-                        self.intermediate,
-                        self.hidden,
-                        True,
-                    )
-                else:
-                    stage_repacked_sfb_slice(
-                        s13,
-                        sb,
-                        expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                        Int32(self.hidden_tiles),
-                        kt,
-                        start,
-                        team_tid,
-                        128,
-                        self.width,
-                    )
-                if cutlass.const_expr(self.scale_codes):
-                    stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
-                                            start + self.kernel_intermediate, team_tid,
-                                            self.width, 2 * self.kernel_intermediate,
-                                            self.hidden // 32,
-                                            self.intermediate if self.exact_storage else 0)
-                elif cutlass.const_expr(self.exact_storage):
-                    stage_v41_exact_sfb(
-                        s13,
-                        sb + self.width * 4,
-                        expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                        start,
-                        kt,
-                        team_tid,
-                        self.width,
-                        self.intermediate,
-                        self.hidden,
-                        True,
-                        1,
-                    )
-                else:
-                    stage_repacked_sfb_slice(
-                        s13,
-                        sb + self.width * 4,
-                        expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                        Int32(self.hidden_tiles),
-                        kt,
-                        start + self.kernel_intermediate,
-                        team_tid,
-                        128,
-                        self.width,
-                    )
+                    if cutlass.const_expr(self.exact_storage):
+                        stage_v41_exact_b(
+                            w13,
+                            bb,
+                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                            start,
+                            kt,
+                            team_tid,
+                            self.width,
+                            self.intermediate,
+                            self.hidden,
+                            True,
+                        )
+                    else:
+                        stage_repacked_b_slice(
+                            w13,
+                            bb,
+                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                            Int32(self.hidden_tiles),
+                            kt,
+                            start,
+                            team_tid,
+                            128,
+                            self.width,
+                        )
+                    if cutlass.const_expr(self.exact_storage):
+                        stage_v41_exact_b(
+                            w13,
+                            bb + self.width * 64,
+                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                            start,
+                            kt,
+                            team_tid,
+                            self.width,
+                            self.intermediate,
+                            self.hidden,
+                            True,
+                            1,
+                        )
+                    else:
+                        stage_repacked_b_slice(
+                            w13,
+                            bb + self.width * 64,
+                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                            Int32(self.hidden_tiles),
+                            kt,
+                            start + self.kernel_intermediate,
+                            team_tid,
+                            128,
+                            self.width,
+                        )
+                    if cutlass.const_expr(self.scale_codes):
+                        stage_scale_codes_slice(s13, sb, expert, kt, start, team_tid,
+                                                self.width, 2 * self.kernel_intermediate,
+                                                self.hidden // 32,
+                                                self.intermediate if self.exact_storage else 0)
+                    elif cutlass.const_expr(self.exact_storage):
+                        stage_v41_exact_sfb(
+                            s13,
+                            sb,
+                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                            start,
+                            kt,
+                            team_tid,
+                            self.width,
+                            self.intermediate,
+                            self.hidden,
+                            True,
+                        )
+                    else:
+                        stage_repacked_sfb_slice(
+                            s13,
+                            sb,
+                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                            Int32(self.hidden_tiles),
+                            kt,
+                            start,
+                            team_tid,
+                            128,
+                            self.width,
+                        )
+                    if cutlass.const_expr(self.scale_codes):
+                        stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
+                                                start + self.kernel_intermediate, team_tid,
+                                                self.width, 2 * self.kernel_intermediate,
+                                                self.hidden // 32,
+                                                self.intermediate if self.exact_storage else 0)
+                    elif cutlass.const_expr(self.exact_storage):
+                        stage_v41_exact_sfb(
+                            s13,
+                            sb + self.width * 4,
+                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                            start,
+                            kt,
+                            team_tid,
+                            self.width,
+                            self.intermediate,
+                            self.hidden,
+                            True,
+                            1,
+                        )
+                    else:
+                        stage_repacked_sfb_slice(
+                            s13,
+                            sb + self.width * 4,
+                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                            Int32(self.hidden_tiles),
+                            kt,
+                            start + self.kernel_intermediate,
+                            team_tid,
+                            128,
+                            self.width,
+                        )
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()
@@ -991,7 +1000,7 @@ class V41SliceFc2Kernel:
 
     def __init__(self, width, capacity, *, topk=6, intermediate=576, hidden=5120,
                  exact_storage=False, fc2_n_splits=1, scale_codes=False,
-                 activation_precision="a8", route_weight_before_fc2=True, round_fc2_bf16=False):
+                 activation_precision="a8", route_weight_before_fc2=True, round_fc2_bf16=False, row_major_resident=False):
         assert width in (32, 64, 128, 192)
         assert capacity > 0 and topk > 0
         assert hidden > 0 and hidden % 128 == 0
@@ -1010,6 +1019,7 @@ class V41SliceFc2Kernel:
         self.fc2_n_splits = 8 if (self.hidden_tiles % 8 == 0 and 8 % fc2_n_splits == 0) else fc2_n_splits
         self.intermediate = intermediate
         self.exact_storage = bool(exact_storage)
+        self.row_major_resident = bool(row_major_resident)
         self.scale_codes = bool(scale_codes)
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.w2_intermediate = self.kernel_intermediate
@@ -1073,6 +1083,8 @@ class V41SliceFc2Kernel:
             b = smem.allocate_tensor(
                 Uint32, cute.make_layout(self.width * 16), byte_alignment=16
             )
+            if cutlass.const_expr(self.row_major_resident):
+                raw = smem.allocate_tensor(Uint32, cute.make_layout(self.width * 16), byte_alignment=16)
             sf = smem.allocate_tensor(
                 Uint32, cute.make_layout(max(self.width * 2, 256)), byte_alignment=16
             )
@@ -1116,61 +1128,65 @@ class V41SliceFc2Kernel:
                 total.fill(0)
                 for slice_id in range(self.slices):
                     start = slice_id * Int32(self.width)
-                    if cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_b(
-                            w2,
-                            bb,
-                            expert * Int64(self.w2_intermediate * self.hidden // 8),
-                            ot * 128,
-                            start,
-                            tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            False,
-                            stored_intermediate=self.w2_intermediate,
-                        )
+                    if cutlass.const_expr(self.row_major_resident):
+                        stage_row_major_mma(w2, s2, raw, b, sf, expert, ot * 128, start,
+                                            tid, self.width, self.intermediate, self.hidden, False)
                     else:
-                        stage_repacked_b_k_slice(
-                            w2,
-                            bb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 8),
-                            Int32(self.kernel_intermediate // 128),
-                            start,
-                            ot * 128,
-                            tid,
-                            128,
-                            self.width,
-                        )
-                    if cutlass.const_expr(self.scale_codes):
-                        stage_scale_codes_k_slice(s2, sf, expert, start, ot * 128, tid,
-                                                  self.width, self.hidden,
-                                                  self.w2_scale_columns)
-                    elif cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_sfb(
-                            s2,
-                            sf,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 128),
-                            ot * 128,
-                            start,
-                            tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            False,
-                        )
-                    else:
-                        stage_repacked_sfb_k_slice(
-                            s2,
-                            sf,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 128),
-                            Int32(self.kernel_intermediate // 128),
-                            start,
-                            ot * 128,
-                            tid,
-                            128,
-                            self.width,
-                        )
+                        if cutlass.const_expr(self.exact_storage):
+                            stage_v41_exact_b(
+                                w2,
+                                bb,
+                                expert * Int64(self.w2_intermediate * self.hidden // 8),
+                                ot * 128,
+                                start,
+                                tid,
+                                self.width,
+                                self.intermediate,
+                                self.hidden,
+                                False,
+                                stored_intermediate=self.w2_intermediate,
+                            )
+                        else:
+                            stage_repacked_b_k_slice(
+                                w2,
+                                bb,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 8),
+                                Int32(self.kernel_intermediate // 128),
+                                start,
+                                ot * 128,
+                                tid,
+                                128,
+                                self.width,
+                            )
+                        if cutlass.const_expr(self.scale_codes):
+                            stage_scale_codes_k_slice(s2, sf, expert, start, ot * 128, tid,
+                                                      self.width, self.hidden,
+                                                      self.w2_scale_columns)
+                        elif cutlass.const_expr(self.exact_storage):
+                            stage_v41_exact_sfb(
+                                s2,
+                                sf,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 128),
+                                ot * 128,
+                                start,
+                                tid,
+                                self.width,
+                                self.intermediate,
+                                self.hidden,
+                                False,
+                            )
+                        else:
+                            stage_repacked_sfb_k_slice(
+                                s2,
+                                sf,
+                                expert * Int64(self.kernel_intermediate * self.hidden // 128),
+                                Int32(self.kernel_intermediate // 128),
+                                start,
+                                ot * 128,
+                                tid,
+                                128,
+                                self.width,
+                            )
                     cute.arch.cp_async_commit_group()
                     if cutlass.const_expr(self.slices > 8):
                         qa_base = (Int64(slice_id) * Int64(self.routes) + route_base) * Int64(qa_words)
