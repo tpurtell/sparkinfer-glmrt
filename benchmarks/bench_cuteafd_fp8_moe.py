@@ -970,8 +970,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
             launch = _Fp8Moe(geometry, control_route, rows, True, args.prefill)
             blocks = (width + 127) // 128
             matching = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
-            launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
-                                    max_rows=min(rows, DECODE_MAX_ROWS), warps=matching)
+            if control_route != "stream":
+                launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
+                                        max_rows=min(rows, DECODE_MAX_ROWS), warps=matching)
             program = compile_program(launch, name=template.name + "_unify_control",
                        operands=template.operands, scalars=template.scalars, key=launch.key(),
                        geometry={**template.geometry, "screen_down_warps": matching}, scratch=template.scratch)

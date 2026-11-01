@@ -412,6 +412,7 @@ def test_prefill_unify_controls_are_fixed_stream_and_record_prefix_failures():
     text = ast.unparse(function)
     assert "control_route = 'stream' if rows > 80 else 'auto'" in text
     assert "strict_prefix=rows <= 80" in text
+    assert "if control_route != 'stream':" in text
     assert "control_qualification=control_qualification" in text
     helper = next(n for n in ast.parse(_PATH.read_text()).body
                   if isinstance(n, ast.FunctionDef) and n.name == "qualify_pair_replay")
