@@ -113,11 +113,11 @@ class RowMajorA8Linear:
                         words = cute.make_rmem_tensor((4,), Uint32)
                         for t in cutlass.range_constexpr(4):
                             words[t] = cute.arch.shuffle_sync(cur[gi * 4 + t], g * 4 + Int32(ks))
-                        lo, hi = words[0], words[2]
-                        if j >= 2:
-                            lo, hi = words[1], words[3]
-                        shift = Uint32(j % 2) * Uint32(16)
-                        packed = ((lo >> shift) & Uint32(65535)) | (((hi >> shift) & Uint32(65535)) << Uint32(16))
+                        # Direct A fragments use consecutive K8 per lane, unlike ldmatrix's permutation.
+                        packed = Uint32(0)
+                        for t in cutlass.range_constexpr(4):
+                            if j == Int32(t):
+                                packed = Uint32(words[t])
                         b0, b1 = e2m1x8_to_qmma_e2m1x8(packed)
                         bsc = Uint32(cute.arch.shuffle_sync(fc[gi], g * 4 + Int32(ks)))
                         f = gi * 4
