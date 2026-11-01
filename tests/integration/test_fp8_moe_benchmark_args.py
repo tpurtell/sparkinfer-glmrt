@@ -55,6 +55,23 @@ def test_invalid_pair_modes_fail_before_cuda(argv):
         bench.parse_args(argv)
 
 
+@pytest.mark.parametrize("family,arm,mode", [("mimof", "current", "--mxfp4-unify"),
+    ("mimof", "native-a8", "--mxfp4-unify"), ("v41", "native-exact", "--native-slices")])
+def test_paired_profile_selects_one_warmed_arm(tmp_path, monkeypatch, family, arm, mode):
+    args = bench.parse_args(["--mxfp4-pair", mode, "--geometry", family, "--rows", "1",
+                             "--profile-dir", str(tmp_path), "--profile-arm", arm])
+    events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda name: events.append(name))
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: events.append("pop"))
+    bench.profile_pair_arm({arm: lambda: events.append(arm)}, args, family, 256, 1)
+    assert events == [arm, "sync", "mxfp4-pair", arm, "sync", "pop"]
+    record = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert record["arm"] == arm and record["warmed_launches"] == 1 and record["attribution_only"]
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--profile-arm", arm])
+
+
 @pytest.mark.parametrize("width,expected", [(288, [1, 2, 3, 4, 8]), (576, [1, 2, 4, 5, 8]),
                                           (672, [1, 2, 4, 6, 8]), (608, [1, 2, 4, 5, 8])])
 def test_tiling_screen_includes_old_four_warps_and_matching_partition(width, expected):
