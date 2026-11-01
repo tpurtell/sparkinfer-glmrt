@@ -23,7 +23,7 @@ class V41SlicePipeline:
                  hidden=5120, exact_storage=False, fc2_n_splits=1, scale_codes=False,
                  activation_precision="a8", swiglu_limit=10.0,
                  silu_bf16_product=False, route_weight_before_fc2=True,
-                 round_fc2_bf16=False):
+                 round_fc2_bf16=False, fc1_k_splits=1):
         self.capacity = capacity
         self.hidden = hidden
         self.atomic_tokens = atomic_tokens
@@ -35,7 +35,7 @@ class V41SlicePipeline:
             raise ValueError("SwiGLU clamp must be nonnegative")
         if atomic_tokens and (activation_precision != "a8" or swiglu_limit != 10.0
                               or silu_bf16_product or not route_weight_before_fc2
-                              or round_fc2_bf16):
+                              or round_fc2_bf16 or fc1_k_splits != 1):
             raise ValueError("atomic output requires the default activation contract")
         self.plan = V41RoutePlan(capacity, experts, topk, route_metadata=not atomic_tokens)
         if atomic_tokens:
@@ -50,7 +50,8 @@ class V41SlicePipeline:
                                          hidden=hidden, exact_storage=exact_storage, scale_codes=scale_codes,
                                          activation_precision=activation_precision, swiglu_limit=swiglu_limit,
                                          silu_bf16_product=silu_bf16_product,
-                                         route_weight_before_fc2=route_weight_before_fc2)
+                                         route_weight_before_fc2=route_weight_before_fc2,
+                                         fc1_k_splits=fc1_k_splits)
             self.fc2 = V41SliceFc2Kernel(width, capacity, topk=topk, intermediate=intermediate,
                                          hidden=hidden, exact_storage=exact_storage, fc2_n_splits=fc2_n_splits,
                                          scale_codes=scale_codes, activation_precision=activation_precision,

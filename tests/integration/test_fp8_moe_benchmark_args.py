@@ -39,6 +39,21 @@ def test_unify_screen_is_mimo_pair_only(family):
         bench.parse_args(["--mxfp4-unify", "--geometry", family])
 
 
+def test_fc1_k_split_screen_geometry_and_cli():
+    args = bench.parse_args(["--mxfp4-pair", "--mxfp4-unify", "--geometry", "mimof",
+                             "--fc1-k-splits", "2,4,8"])
+    assert args.fc1_k_splits == "2,4,8"
+    arms = bench.fc1_split_tiles(5120, [2, 4, 8])
+    assert (128, 2) in arms and (128, 4) in arms and (64, 8) in arms
+    assert (128, 8) not in arms and (192, 4) not in arms
+    assert bench.fc1_split_tiles(4096, iter([2, 4])) == bench.fc1_split_tiles(4096, [2, 4])
+    for values in ("", "0", "3", "2,2", "x"):
+        with pytest.raises(SystemExit):
+            bench.parse_args(["--mxfp4-pair", "--native-slices", "--fc1-k-splits", values])
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--mxfp4-pair", "--fc1-k-splits", "2"])
+
+
 @pytest.mark.parametrize("family,rank_width,expected", [
     ("v41", 288, 192), ("v41", 576, 192), ("v41", 768, 192),
     ("v41", 448, 128), ("dsv4f", 384, 128), ("dsv4p", 768, 128),

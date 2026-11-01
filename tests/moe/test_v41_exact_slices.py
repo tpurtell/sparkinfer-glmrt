@@ -117,6 +117,39 @@ MIMO_WIDTHS = sorted({32 * (64 // world + extra)
                       for extra in (0, int(64 % world != 0))} | {2048})
 
 
+@pytest.mark.parametrize("split,tile", [(2, 128), (4, 128), (8, 64)])
+@pytest.mark.parametrize("precision", ["a8", "a16"])
+def test_fc1_k_split_contract(split, tile, precision):
+    require_b12x()
+    from benchmarks.bench_cuteafd_fp8_moe import mxfp4_f32_reference
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.manual_seed(928320)
+    m, e, k, h, n = 80, 8, 8, 4096, 288
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    packed = pack(weights, scales, True)
+    contract = dict(activation_precision=precision, swiglu_limit=0., silu_bf16_product=True,
+                    route_weight_before_fc2=False, round_fc2_bf16=True)
+    candidate = run_pipeline(x, ids, routing, packed, tile, True, n=n,
+                             fc1_k_splits=split, **contract)
+    baseline = run_pipeline(x, ids, routing, packed, tile, True, n=n, **contract)
+    oracle = mxfp4_f32_reference(x, ids, routing, weights, scales, activation_precision=precision)
+    delta = candidate - oracle
+    base_delta = baseline - oracle
+    assert delta.square().mean() <= base_delta.square().mean(), "split worsens matched F32 RMS"
+    assert delta.abs().max() <= base_delta.abs().max(), "split worsens matched F32 maximum"
+    for capacity in (1, 16):
+        prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed, tile,
+                              True, n=n, fc1_k_splits=split, **contract)
+        assert torch.equal(prefix, candidate[:capacity]), "split capacity row invariance"
+
+
 @pytest.mark.parametrize("h", [4096, 6144])
 @pytest.mark.parametrize("n", MIMO_WIDTHS)
 @pytest.mark.parametrize("activation_precision", ["a8", "a16"])
