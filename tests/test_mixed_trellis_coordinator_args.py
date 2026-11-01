@@ -543,7 +543,7 @@ def test_generic_output_accessor_and_metadata_unchanged(family, tmp_path):
     result = next(node for node in ast.walk(TREE) if isinstance(node, ast.keyword) and node.arg == "conditions"
                   and "partial_program" in ast.unparse(node.value))
     conditions = eval(compile(ast.Expression(result.value), str(SOURCE), "eval"),
-                      dict(partial_program=None, compact=None))
+                      dict(partial_program=None, compact=None, args=SimpleNamespace(prefill_family=family)))
     expected = ("synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); "
                 "common E4M3/UE8M0 K32-roundtripped BF16 input; "
                 "histogram replay preserves rescaled expert counts, not original token co-occurrence; "
@@ -601,3 +601,161 @@ def test_prerotate_requires_bf16_ws():
     for arm in ({"mode": "cooperative", "prerotate": 0}, {"mode": "ws", "wire": 1, "prerotate": 1}):
         with pytest.raises(ValueError):
             b.coordinator_compile_options("rtx-tp2", 2752, arm, props)
+
+
+def oracle_helpers():
+    torch = pytest.importorskip("torch")
+    names = {"decode_mcg_matrix", "oracle_error", "oracle_error_no_worse",
+             "coordinator_f32_oracle", "coordinator_oracle_case"}
+    scope = dict(torch=torch, hashlib=hashlib)
+    nodes = [node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
+    return scope
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("shape", [(16, 16), (32, 48)])
+def test_oracle_decoder_matches_independent_native_reference(bits, shape):
+    import numpy as np
+    scope = oracle_helpers()
+    torch = scope["torch"]
+    reference_path = SOURCE.parents[1] / "tests/moe/test_fused_moe_trellis.py"
+    tree = ast.parse(reference_path.read_text())
+    names = {"_decode_mcg_fp16", "_decode_lane", "_reconstruct_native"}
+    reference = dict(np=np, torch=torch, _MCG=np.uint64(0xCBAC1FED),
+                     _MCG_MASK=np.uint32(0x8FFF8FFF), _MCG_OR=np.uint32(0x3B603B60))
+    exec(compile(ast.Module(body=[node for node in tree.body
+                                 if isinstance(node, ast.FunctionDef) and node.name in names],
+                            type_ignores=[]), str(reference_path), "exec"), reference)
+    rows, columns = shape
+    payload = torch.randint(-(1 << 31), (1 << 31) - 1, (rows // 16, columns // 16, 8 * bits),
+                            dtype=torch.int32, generator=torch.Generator().manual_seed(41 + bits))
+    expected = reference["_reconstruct_native"](payload.view(torch.int16)).float()
+    assert torch.equal(scope["decode_mcg_matrix"](payload.flatten(), rows, columns, bits), expected)
+
+
+@pytest.mark.parametrize("error,accepted", [
+    ({"max_abs": 0.9, "rms": 0.4}, True),
+    ({"max_abs": 1.0, "rms": 0.5}, True),
+    ({"max_abs": 1.00000001, "rms": 0.4}, False),
+    ({"max_abs": 0.9, "rms": 0.50000001}, False),
+    ({"max_abs": float("nan"), "rms": 0.0}, False),
+])
+def test_oracle_requires_both_error_metrics_without_slack(error, accepted):
+    scope = oracle_helpers()
+    assert scope["oracle_error_no_worse"](error, {"max_abs": 1.0, "rms": 0.5}) is accepted
+
+
+@pytest.mark.parametrize("family", ["step5", "ml4"])
+def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family):
+    scope = oracle_helpers()
+    torch = scope["torch"]
+    scope["COORDINATOR_FAMILIES"] = {family: dict(hidden=128, experts=3, swiglu_limit=7.0)}
+    generator = torch.Generator().manual_seed(12)
+    words = 8 * 8 * 8 * 4
+    tiers = []
+    for _ in range(2):
+        tiers.append(SimpleNamespace(
+            num_experts=3, intermediate_size=128, trellis_bits=4,
+            w13=torch.randint(-(1 << 31), (1 << 31) - 1, (3 * words,), generator=generator, dtype=torch.int32),
+            w2=torch.randint(-(1 << 31), (1 << 31) - 1, (2 * words,), generator=generator, dtype=torch.int32),
+            w13_global_scale=torch.tensor([0.8, 1.2, 1.1]), w2_global_scale=torch.tensor([1.3, 0.9])))
+    descriptors = torch.tensor([[0, 512, 1, -1, -1, -1], [512, 0, 513, -1, -1, -1],
+                                [0, 512, 1, -1, -1, -1]], dtype=torch.int32)
+    rotations = SimpleNamespace(**{name: 0.8 + torch.rand(shape, generator=generator) * 0.4
+        for name, shape in (("intermediate", (6, 384)), ("gate_suh", (6, 128)),
+                            ("up_suh", (6, 128)), ("down_svh", (6, 128)))})
+    mapping = torch.tensor([2, 0, 1], dtype=torch.int32)
+    source = torch.randn((4, 128), generator=generator) * 4
+    ids = torch.tensor([[0, 1], [1, 2], [2, 0], [0, 2]], dtype=torch.int32)
+    weights = torch.tensor([[0.2, 0.8], [0.3, 0.7], [0.4, 0.6], [0.9, 0.1]])
+    actual = scope["coordinator_f32_oracle"]((*tiers, mapping, descriptors.flatten(), rotations),
+                                            source, ids, weights, family)
+    # Independent scalar-route math with a parity-constructed normalized H128.
+    h = torch.tensor([[(-1.0) ** ((i & j).bit_count()) for j in range(128)] for i in range(128)]) / 128 ** 0.5
+    expected = torch.zeros_like(actual)
+    clamped = False
+    for row in range(4):
+        for slot in range(2):
+            combined = int(mapping[ids[row, slot]])
+            matrices = []
+            for projection in range(3):
+                code = int(descriptors[projection, combined])
+                tier, local = code >> 9, code & 511
+                t = tiers[tier]
+                offset = (local + ([2, 1][tier] if projection == 1 else 0)) * words
+                payload = t.w13[offset:offset + words] if projection < 2 else t.w2[local * words:(local + 1) * words]
+                scale = t.w13_global_scale[local] if projection < 2 else t.w2_global_scale[local]
+                matrices.append(scope["decode_mcg_matrix"](payload, 128, 128, 4) * scale)
+            scales = rotations.intermediate[combined].split(128)
+            gate = (((source[row] * rotations.gate_suh[combined]) @ h) @ matrices[0]) @ h * scales[0]
+            up = (((source[row] * rotations.up_suh[combined]) @ h) @ matrices[1]) @ h * scales[1]
+            active = gate * torch.sigmoid(gate)
+            if family == "step5":
+                clamped |= bool((active > 7).any() or (up.abs() > 7).any())
+                active, up = active.clamp(max=7), up.clamp(-7, 7)
+            down = ((((active * up * scales[2]) @ h) @ matrices[2]) @ h) * rotations.down_svh[combined]
+            expected[row] += down * weights[row, slot]
+    assert family != "step5" or clamped
+    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.0001)
+
+
+@pytest.mark.parametrize("defect", [None, "rows", "graph", "determinism", "oracle"])
+def test_arm_qualification_does_not_require_control_equality(monkeypatch, defect):
+    import contextlib
+    import statistics
+    import sys
+    import types
+    from unittest.mock import patch
+    scope = oracle_helpers()
+    torch = scope["torch"]
+    noise_module = types.ModuleType("benchmarks.benchmark_exlr8_a16")
+    noise_module.k4_noise_summary = lambda values, control: {"seen": sorted(values)}
+    runtime_module = types.ModuleType("b12x._lib.runtime_control")
+    runtime_module.kernel_resolution_guard = lambda label: contextlib.nullcontext()
+    monkeypatch.setitem(sys.modules, noise_module.__name__, noise_module)
+    monkeypatch.setitem(sys.modules, runtime_module.__name__, runtime_module)
+    source = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    ids, weights = torch.zeros((8, 1), dtype=torch.int32), torch.ones((8, 1))
+    graph_active = False
+    class Graph:
+        def __init__(self, fn): self.fn = fn
+        def replay(self):
+            nonlocal graph_active
+            graph_active = True
+            try: self.fn()
+            finally: graph_active = False
+    scope.update(statistics=statistics, patch=patch, _capture=lambda fn, warmup: Graph(fn),
+                 _times=lambda graph, replays: [1.0], route_pack_capacity=lambda *a, **kw: (1, 8),
+                 COORDINATOR_FAMILIES={"step5": {"experts": 3}},
+                 coordinator_f32_oracle=lambda *a: source.clone())
+    states, modules, calls = {}, {}, {}
+    for name in ("control", "candidate"):
+        workspace = SimpleNamespace(output=torch.empty_like(source), fc1=torch.empty_like(source),
+                                    activated=torch.empty_like(source), packed_route_indices=ids,
+                                    block_expert_ids=ids, packed_route_count=ids)
+        states[name] = workspace, [SimpleNamespace(launch=SimpleNamespace(moe_block_size=32))]
+        modules[name] = SimpleNamespace(pack_topk_routes_by_expert=None)
+        calls[name] = 0
+    def run(name, rows=None, start=0):
+        rows = 8 if rows is None else rows
+        calls[name] += 1
+        value = source[start:start + rows] + (0.25 if name == "control" else 0.125)
+        if name == "candidate":
+            if (defect == "rows" and (rows != 8 or start)) or (defect == "graph" and graph_active):
+                value = value + 0.01
+            if defect == "determinism": value = value + (calls[name] % 2) * 0.01
+            if defect == "oracle": value = value + 1
+        states[name][0].output[:rows].copy_(value)
+        return states[name][0].output[:rows]
+    args = SimpleNamespace(prefill_family="step5", prefill_exhaustive=False, live_rows=[3],
+                           warmup=0, correctness_only=False, rounds=2, replays=1)
+    result = scope["coordinator_oracle_case"](args, [("control", {}), ("candidate", {})], states,
+        modules, run, source, ids, weights, None, 0, 8, torch.int32)
+    assert result["arm_checks"]["control"]["qualified"]
+    candidate = result["arm_checks"]["candidate"]
+    assert not candidate["control_bitwise"]
+    assert candidate["qualified"] is (defect is None)
+    assert bool(result["samples_us"]["candidate"]) is (defect is None)
+    assert bool(candidate["oracle_regions"])
+    assert torch.equal(source, torch.arange(32, dtype=torch.float32).reshape(8, 4))

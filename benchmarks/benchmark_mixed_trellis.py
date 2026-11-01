@@ -1614,6 +1614,218 @@ def muse_partial_binding(binding, workspace, program):
     return replace(binding, launch=replace(launch, topk_sum=topk_sum))
 
 
+
+def decode_mcg_matrix(payload, rows, columns, bits):
+    """Independent native MCG tile decoder; no GEMM/materialization kernel oracle."""
+    import numpy as np
+    words = payload.detach().cpu().contiguous().numpy().view(np.uint32).reshape(
+        rows // 16, columns // 16, 8 * bits)
+    output = np.empty((rows // 16, columns // 16, 16, 16), dtype=np.float32)
+    for lane in range(32):
+        for weight in range(8):
+            end = (lane * 8 + weight + 257) * bits
+            first, last = (end - 16) // 32, (end - 1) // 32
+            merged = (words[..., first % (8 * bits)].astype(np.uint64) << np.uint64(32))
+            merged |= words[..., last % (8 * bits)].astype(np.uint64)
+            window = (merged >> np.uint64((last + 1) * 32 - end)) & np.uint64(65535)
+            value = ((window * np.uint64(0xCBAC1FED)) & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+            value = (value & np.uint32(0x8FFF8FFF)) ^ np.uint32(0x3B603B60)
+            low = (value & np.uint32(65535)).astype(np.uint16).view(np.float16)
+            high = (value >> np.uint32(16)).astype(np.uint16).view(np.float16)
+            decoded = (low + high).astype(np.float16).astype(np.float32)
+            row = (lane % 4) * 2 + (weight % 4 // 2) * 8 + weight % 2
+            column = 2 * (lane // 8 + (4 if weight >= 4 else 0)) + ((lane >> 2) & 1)
+            output[..., row, column] = decoded
+    return torch.from_numpy(output.transpose(0, 2, 1, 3).reshape(rows, columns).copy())
+
+
+def oracle_error(values, reference):
+    difference = values.double() - reference.double()
+    return dict(max_abs=float(difference.abs().max()), rms=float(difference.square().mean().sqrt()))
+
+
+def oracle_error_no_worse(error, control):
+    # No tolerance slack: fixtures are common to every arm, including identical-control repeats.
+    return all(error[key] <= control[key] for key in ("max_abs", "rms"))
+
+
+def coordinator_f32_oracle(layer, source, ids, weights, family):
+    """Full-F32 expert math from decoded checkpoint-layout weights, one expert at a time.
+
+    Native MCG labels are FP16 by definition; rotations, GEMMs, activation,
+    router weighting and ordered accumulation introduce no further low-precision rounding.
+    Decoded matrices are transient, so the oracle never retains an entire dense MoE.
+    """
+    tier0, tier1, mapping, descriptor, rotations = layer
+    tiers = (tier0, tier1)
+    hidden, experts = COORDINATOR_FAMILIES[family]["hidden"], COORDINATOR_FAMILIES[family]["experts"]
+    width = tier0.intermediate_size
+    stride = descriptor.numel() // 3
+    descriptors = descriptor.cpu().reshape(3, stride)
+    expert_map = mapping.cpu().tolist()
+    descriptor_bits = 9 if experts <= 512 else 10
+    cpu_ids = ids.cpu()
+    output_routes = torch.zeros((*ids.shape, hidden), dtype=torch.float32, device=source.device)
+    h = torch.ones((1, 1), dtype=torch.float32, device=source.device)
+    for _ in range(7):
+        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+    h /= 128 ** 0.5
+    def had(value):
+        return (value.reshape(-1, value.shape[-1] // 128, 128) @ h).reshape_as(value)
+    payloads = [(t.w13.cpu(), t.w2.cpu()) for t in tiers]
+    gate_counts = [int(((descriptors[0] >= 0) & (descriptors[0] >> descriptor_bits == tier)).sum())
+                   for tier in range(len(tiers))]
+    for expert in sorted(set(cpu_ids.flatten().tolist())):
+        combined = expert_map[expert]
+        token, slot = (cpu_ids == expert).nonzero(as_tuple=True)
+        token, slot = token.to(source.device), slot.to(source.device)
+        decoded = []
+        for projection in range(3):
+            code = int(descriptors[projection, combined])
+            if code < 0:
+                raise ValueError("oracle encountered an unowned expert")
+            tier, local = code >> descriptor_bits, code & ((1 << descriptor_bits) - 1)
+            t = tiers[tier]
+            k, n = (hidden, width) if projection < 2 else (width, hidden)
+            words = (k // 16) * (n // 16) * 8 * t.trellis_bits
+            if projection < 2:
+                offset = (local + (gate_counts[tier] if projection else 0)) * words
+                payload = payloads[tier][0][offset:offset + words]
+                scale = t.w13_global_scale[local]
+            else:
+                payload = payloads[tier][1][local * words:(local + 1) * words]
+                scale = t.w2_global_scale[local]
+            decoded.append(decode_mcg_matrix(payload, k, n, t.trellis_bits).to(source.device) * scale)
+        gate_svh, up_svh, down_suh = rotations.intermediate[combined].float().split(width)
+        x = source[token].float()
+        gate = had(had(x * rotations.gate_suh[combined].float()) @ decoded[0]) * gate_svh
+        up = had(had(x * rotations.up_suh[combined].float()) @ decoded[1]) * up_svh
+        activated = gate * torch.sigmoid(gate)
+        limit = COORDINATOR_FAMILIES[family]["swiglu_limit"]
+        if family == "step5":
+            activated = activated.clamp(max=limit)
+            up = up.clamp(-limit, limit)
+        activated *= up
+        down = had(had(activated * down_suh) @ decoded[2]) * rotations.down_svh[combined].float()
+        output_routes[token, slot] = down * weights[token, slot, None]
+    output = torch.zeros_like(output_routes[:, 0])
+    for slot in range(ids.shape[1]):
+        output += output_routes[:, slot]
+    return output
+
+
+def coordinator_oracle_case(args, specs, states, modules, run, decoded, ids, weights, layer,
+                            layer_index, capacity, bit_dtype):
+    """Qualify each arm independently; control equality is informational, not a gate."""
+    from benchmarks.benchmark_exlr8_a16 import k4_noise_summary
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    control = specs[0][0]
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        oracle = coordinator_f32_oracle(layer, decoded, ids, weights, args.prefill_family)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    full = {name: run(name).clone() for name, _ in specs}
+    same = lambda a, b: torch.equal(a.contiguous().view(bit_dtype), b.contiguous().view(bit_dtype))
+    errors = {name: oracle_error(value, oracle) for name, value in full.items()}
+    per_arm = {name: dict(control_bitwise=same(full[name], full[control]),
+                         oracle_error=errors[name], oracle_regions={},
+                         oracle_no_worse=oracle_error_no_worse(errors[name], errors[control]),
+                         finite=bool(torch.isfinite(full[name]).all()), deterministic=True,
+                         row_invariant=True, graph_eager=True) for name, _ in specs}
+    gates = ("finite", "deterministic", "row_invariant", "graph_eager", "oracle_no_worse")
+
+    def graph_for(name, rows, start=0):
+        workspace, bindings = states[name]
+        launch = bindings[layer_index].launch
+        slots = route_pack_capacity(rows * ids.shape[1], launch.moe_block_size,
+                                    COORDINATOR_FAMILIES[args.prefill_family]["experts"], topk=ids.shape[1])[1]
+        packed = workspace.packed_route_indices[:slots], workspace.block_expert_ids, workspace.packed_route_count
+        with patch.object(modules[name], "pack_topk_routes_by_expert", return_value=packed):
+            return _capture(lambda: run(name, rows, start), args.warmup)
+
+    def check_graph(name, graph, expected):
+        workspace, _ = states[name]
+        for _ in range(3):
+            for buffer in (workspace.output, workspace.fc1, workspace.activated):
+                buffer.fill_(float("nan"))
+            graph.replay()
+            per_arm[name]["graph_eager"] &= same(workspace.output[:expected.shape[0]], expected)
+
+    def check_region(rows, start=0):
+        reference = oracle[start:start + rows]
+        control_error = oracle_error(full[control][start:start + rows], reference)
+        for name, _ in specs:
+            check = per_arm[name]
+            eager = run(name, rows, start).clone()
+            check["finite"] &= bool(torch.isfinite(eager).all())
+            check["row_invariant"] &= same(eager, full[name][start:start + rows])
+            for _ in range(3):
+                check["deterministic"] &= same(run(name, rows, start), eager)
+            error = oracle_error(eager, reference)
+            check["oracle_regions"][f"{start}:{rows}"] = error
+            check["oracle_no_worse"] &= oracle_error_no_worse(error, control_error)
+            graph = graph_for(name, rows, start)
+            check_graph(name, graph, eager)
+            del graph
+
+    probe_rows = (range(1, capacity) if args.prefill_exhaustive else
+                  sorted({1, 32, 33, 63, 64, 65, capacity // 2, *args.live_rows} & set(range(1, capacity))))
+    # Every probed wave partition must match the arm's own capacity output,
+    # including non-prefix pieces and graph replay after dirty scratch.
+    check_region(capacity)
+    for rows in probe_rows:
+        check_region(rows)
+        check_region(capacity - rows, rows)
+    tails = decoded.clone(), ids.clone(), weights.clone()
+    for rows in probe_rows:
+        try:
+            decoded[rows:].fill_(float("nan"))
+            ids[rows:].fill_(COORDINATOR_FAMILIES[args.prefill_family]["experts"] - 1)
+            weights[rows:].fill_(float("nan"))
+            check_region(rows)
+        finally:
+            decoded[:], ids[:], weights[:] = tails
+    for check in per_arm.values():
+        check["qualified"] = all(check[key] for key in gates)
+
+    samples_by_rows = []
+    for live in [capacity, *sorted({r for r in args.live_rows if r < capacity}, reverse=True)]:
+        graphs = {}
+        for name, _ in specs:
+            # Repack after the invariant probes before freezing a timed graph.
+            eager = run(name, live).clone()
+            graphs[name] = graph_for(name, live)
+            check_graph(name, graphs[name], eager)
+            per_arm[name]["qualified"] = all(per_arm[name][key] for key in gates)
+        graphs[control + "_control"] = graphs[control]
+        samples = {name: [] for name in graphs}
+        if not args.correctness_only:
+            with kernel_resolution_guard("coordinator oracle-qualified graph timing"):
+                for repeat in range(args.rounds):
+                    order = list(graphs)
+                    order = order[repeat % len(order):] + order[:repeat % len(order)]
+                    if repeat % 2:
+                        order.reverse()
+                    for name in order:
+                        arm = control if name == control + "_control" else name
+                        if per_arm[arm]["qualified"]:
+                            samples[name].append(statistics.median(_times(graphs[name], args.replays)))
+        valid_samples = {name: values for name, values in samples.items() if values}
+        noise = (k4_noise_summary(valid_samples, control)
+                 if control in valid_samples and control + "_control" in valid_samples else None)
+        samples_by_rows.append(dict(rows=live, samples_us=samples, noise=noise))
+        del graphs
+    first = samples_by_rows[0]
+    return dict(arm_checks=per_arm, bitwise={name: check["control_bitwise"] for name, check in per_arm.items()},
+                oracle="decoded-MCG/full-F32/no-TF32", qualification_scope="per-arm; global qualified checks control only",
+                samples_us=first["samples_us"], noise=first["noise"], live_rows=samples_by_rows[1:],
+                median_us={name: statistics.median(v) for name, v in first["samples_us"].items() if v},
+                output_sha256={name: hashlib.sha256(value.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+                               for name, value in full.items()})
+
+
 def _run_coordinator_benchmark(args, device, props):
     from benchmarks.benchmark_exlr8_a16 import make_wire, real_route_ids, k4_noise_summary
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -1676,13 +1888,28 @@ def _run_coordinator_benchmark(args, device, props):
                 ids = (real_route_ids(capacity, wave, generator, experts, topk) if wave else
                        torch.rand((capacity, experts), generator=generator).topk(topk, dim=1).indices).to(device=device, dtype=torch.int32)
                 for layer in range(args.layers):
-                    def run(name, rows=None):
+                    def run(name, rows=None, start=0):
                         workspace, bindings = states[name]
                         source = wire if bindings[layer].launch.input_format == "e4m3_k32" else decoded
                         count = capacity if rows is None else rows
                         result = modules[name].run_bound_mixed_trellis(
-                            source[:count], weights[:count], ids[:count], bindings[layer], workspace)
+                            source[start:start + count], weights[start:start + count], ids[start:start + count], bindings[layer], workspace)
                         return coordinator_output(workspace, args.prefill_family)[:count] if partial_program else result
+                    if args.prefill_family in ("step5", "ml4"):
+                        if compact or any(binding.launch.input_format == "e4m3_k32"
+                                          for _, bindings in states.values() for binding in bindings):
+                            raise ValueError("F32 oracle qualification requires ordinary BF16-input experts")
+                        case = coordinator_oracle_case(args, specs, states, modules, run, decoded, ids, weights,
+                                                       layers[layer], layer, capacity, bit_dtype)
+                        record = dict(capacity=capacity, distribution=distribution, weight_layer=layer,
+                                      wave_index=wave_index, route_layer=wave.get("layer") if wave else None,
+                                      content=wave.get("content") if wave else None, **case)
+                        records.append(record)
+                        if not case["arm_checks"][oracle_name]["qualified"]:
+                            failures.append(dict(capacity=capacity, distribution=distribution,
+                                                 wave_index=wave_index, control=case["arm_checks"][oracle_name]))
+                        print(json.dumps(record), flush=True)
+                        continue
                     expected = run(oracle_name).clone()
                     if expected.dtype != output_dtype or not bool(torch.isfinite(expected).all()) or not bool(expected.any()):
                         raise RuntimeError("oracle must use the role's sum dtype and be finite and nonzero")
@@ -1865,12 +2092,15 @@ def _run_coordinator_benchmark(args, device, props):
                       if partial_program else "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; ")
                    + "median of interleaved round medians, microseconds per layer")
                    + ("; compact tiers use planner-replayed rotated H128 ownership and poisoned graph replays"
-                      if compact else ""),
-        exact=not failures, failures=failures, rows=records)
+                      if compact else "")
+                   + ("; per-arm deterministic, own-wave row-invariant, graph/eager identical, max-abs and RMS no worse than decoded-weight F32 oracle control; control-bitwise informational"
+                      if args.prefill_family in ("step5", "ml4") else ""),
+        exact=(not failures and all(all(row["bitwise"].values()) for row in records)),
+        qualified=not failures, failures=failures, rows=records)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     if failures:
-        raise RuntimeError(f"{len(failures)} coordinator cases differ bitwise; see {args.output}")
+        raise RuntimeError(f"{len(failures)} coordinator cases fail correctness; see {args.output}")
 
 
 def benchmark_parser():
