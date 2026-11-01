@@ -194,6 +194,7 @@ def parse_args(argv=None):
                         help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
     parser.add_argument("--stream-decode", action="store_true",
                         help="development A16 native register-streaming decode arm")
+    parser.add_argument("--row-major-mma", action="store_true", help="Benchmark native MMA with row-major resident staging")
     parser.add_argument("--row-major-a8", action="store_true",
                         help="benchmark-only fixed-path ordered row-major A8 decode")
     parser.add_argument("--v4-stream", action="store_true",
@@ -250,7 +251,7 @@ def parse_args(argv=None):
         parser.error("--compare-routes-exact requires at least two timing routes and no --exact-sweep")
     if args.mxfp4_unify and (not args.mxfp4_pair or args.native_slices or args.mxfp4_tilings
                              or args.geometry not in ("mimof", "mimop", "v41") or args.routes
-                             or (args.geometry == "v41" and not (args.row_major_a8 or args.v4_stream))
+                             or (args.geometry == "v41" and not (args.row_major_a8 or args.row_major_mma or args.v4_stream))
                              or args.capacity is not None):
         parser.error("--mxfp4-unify requires MiMo paired mode without other screens or fixed capacity")
     if args.v4_stream and (not args.mxfp4_unify or args.geometry != "v41" or min(rows) <= 80):
@@ -569,7 +570,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                     aligned_w2=False, aligned_w2_scales=False, stored_width=None,
                     activation_precision="a8", projection_contract=None,
                     combine_output=False, ingress="wire", fc1_k_splits=1, fc1_cta_splits=1,
-                    stream_decode=False, row_major_a8=False):
+                    stream_decode=False, row_major_a8=False, row_major_mma=False):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -599,8 +600,8 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
         raise ValueError("aligned W2 scales require the aligned W2 payload arm")
     w2_pitch = (intermediate + 127) // 128 * 128 if aligned_w2 else None
     packed = pack(weights, scales, tail, w2_pitch=w2_pitch)
-    if row_major_a8:
-        if rows > 80 or activation_precision != "a8" or atomic or coded or stored_width is not None:
+    if row_major_a8 or row_major_mma:
+        if rows > 80 or activation_precision != "a8" or atomic or (coded and not row_major_mma) or stored_width is not None:
             raise ValueError("row-major A8 benchmark requires ordered raw-scale decode <=80")
         # Development input only; no resident pack or production layout changes.
         up_gate = torch.cat((weights["w3"], weights["w1"]), 1)
@@ -609,7 +610,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                       (0, (intermediate // 32 + 3) // 4 * 4 - intermediate // 32))
         packed = [up_gate.cuda().view(torch.uint32).flatten(), up_gate_scales.cuda().flatten(),
                   weights["w2"].cuda().view(torch.uint32).flatten(), down_scales.cuda().flatten()]
-    if coded:
+    if coded and not row_major_mma:
         stored = intermediate if exact else (intermediate + 127) // 128 * 128
         s13 = torch.cat(tuple(torch.nn.functional.pad(scales[name], (0, 0, 0, stored - intermediate))
                              for name in ("w3", "w1")), 1)
@@ -656,6 +657,10 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
         pipeline.fc2 = RowMajorA8Fc2(pipeline.fc1,
                            round_fc2_bf16=(projection_contract or {}).get("round_fc2_bf16", False))
         pipeline.partial_words = partial_words
+    if row_major_mma:
+        for kernel in (pipeline.fc1, pipeline.fc2):
+            kernel.row_major_resident = True
+            kernel.scale_codes = False
     if stored_width is not None:
         # Physical strides come from P; the launch only visits the real S slices.
         for kernel in (pipeline.fc1, pipeline.fc2, pipeline.reduce):
@@ -1107,6 +1112,14 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 except AssertionError as error:
                     raise AssertionError(f"native {label}, rows={rows}, width={width}: {error}") from error
                 owned.append(keep)
+            if args.row_major_mma:
+                tile, split, exact = (128, 2, False) if v4 and width == 384 else (128, 1, True)
+                for label in ("resident-control", "resident-control-2", "resident-control-3", "row-major-mma"):
+                    runs[label], outputs[label], keep = native_pair_arm(
+                        x, ids, routing, weights, scales, tile, exact, False, v4,
+                        projection_contract=contract, combine_output=True, qualify=True,
+                        fc1_k_splits=split, row_major_mma=label == "row-major-mma")
+                    owned.append(keep)
             if args.v4_stream:
                 runs["row-major-stream-a8"], outputs["row-major-stream-a8"], keep = v4_stream_pair_arm(
                     x, ids, routing, weights, scales)
@@ -1153,6 +1166,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
             quality_precisions = {label: spec[0] for label, spec in variants.items()}
             if args.stream_decode:
                 quality_precisions["native-stream-a16"] = "a16"
+            if args.row_major_mma:
+                quality_precisions["row-major-mma"] = "a8"
             if args.row_major_a8:
                 quality_precisions["row-major-a8"] = "a8"
             if args.v4_stream:

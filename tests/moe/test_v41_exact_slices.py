@@ -550,3 +550,34 @@ def test_shipped_v41_width192_exact_route_bytes(world, n, m):
         "planes": (n + width - 1) // width, "rows": m, "coded": True,
         "route_bytes": candidate.numel() * candidate.element_size(), "bitwise_equal": True,
     }), flush=True)
+
+
+@pytest.mark.parametrize("h,n,k,split,exact", [(4096, 256, 8, 1, True),
+                                              (5120, 384, 6, 2, False),
+                                              (5120, 576, 6, 1, True)])
+def test_row_major_native_mma_contract(h, n, k, split, exact):
+    require_b12x()
+    from benchmarks.bench_cuteafd_fp8_moe import native_pair_arm
+    torch.manual_seed(92840 + n)
+    m, e = 80, 8
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    v4 = h == 5120
+    contract = dict(swiglu_limit=10. if v4 else 0., silu_bf16_product=not v4,
+                    route_weight_before_fc2=v4, round_fc2_bf16=not v4)
+    for capacity in (1, 16, 80):
+        operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales, 128, exact, False, v4)
+        run, expected, keep = native_pair_arm(*operands, qualify=True, combine_output=True,
+                                             projection_contract=contract, fc1_k_splits=split)
+        candidate, output, owned = native_pair_arm(*operands, qualify=True, combine_output=True,
+            projection_contract=contract, fc1_k_splits=split, row_major_mma=True)
+        run()
+        candidate()
+        torch.cuda.synchronize()
+        assert torch.equal(output, expected), (h, n, capacity, (output.float() - expected.float()).abs().max())
