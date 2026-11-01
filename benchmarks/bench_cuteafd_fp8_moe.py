@@ -967,20 +967,21 @@ def mxfp4_unify_screen(g, args, geometry_type):
             source, _ = wire_rows(x)
             control_route = "stream" if rows > 80 else "auto"
             template = compile_fp8_moe_aot(geometry, route=control_route, max_rows=rows, prefill=args.prefill)
-            launch = _Fp8Moe(geometry, control_route, rows, True, args.prefill)
             blocks = (width + 127) // 128
             matching = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
+            program = template
             if control_route != "stream":
+                launch = _Fp8Moe(geometry, control_route, rows, True, args.prefill)
                 launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
                                         max_rows=min(rows, DECODE_MAX_ROWS), warps=matching)
-            program = compile_program(launch, name=template.name + "_unify_control",
-                       operands=template.operands, scalars=template.scalars, key=launch.key(),
-                       geometry={**template.geometry, "screen_down_warps": matching}, scratch=template.scratch)
+                program = compile_program(launch, name=template.name + "_unify_control",
+                           operands=template.operands, scalars=template.scalars, key=launch.key(),
+                           geometry={**template.geometry, "screen_down_warps": matching}, scratch=template.scratch)
             runs, outputs, owned = {}, {}, []
             control_qualification = {}
             controls = ["current", "current-2", "current-3"]
             for label in controls:
-                scratch = torch.empty(fp8_moe_scratch_bytes(geometry, "auto", rows, prefill=args.prefill),
+                scratch = torch.empty(fp8_moe_scratch_bytes(geometry, control_route, rows, prefill=args.prefill),
                                       dtype=torch.uint8, device="cuda")
                 output = torch.empty_like(x)
                 buffers = (source, ids, routing, *planes, output, scratch)
