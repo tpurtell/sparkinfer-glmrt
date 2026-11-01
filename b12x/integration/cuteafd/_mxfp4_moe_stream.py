@@ -108,7 +108,9 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False,
                  act_mxfp8: bool = False, wire: bool = True, row_addresses: bool = False,
-                 silu_bf16_product: bool = True, route_weight_before_fc2: bool = False):
+                 silu_bf16_product: bool = True, route_weight_before_fc2: bool = False,
+                 native_resident: bool = False, native_exact: bool = False):
+        self.native_resident, self.native_exact = bool(native_resident), bool(native_exact)
         self.silu_bf16_product = bool(silu_bf16_product)
         self.route_weight_before_fc2 = bool(route_weight_before_fc2)
         super().__init__(inter=inter, hidden=hidden, experts=experts, limit=limit, row_addresses=row_addresses)
@@ -163,24 +165,32 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
         if cutlass.const_expr(grouped_routing is None):
             grouped_routing = x
         w_layout = self._w_layout()
-        rows_w = self.experts * self.inter
-        box = cute.slice_(w_layout, (None, None, 0))
-        tma_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w1, rows_w, self.hidden // 2), box,
-            (self.cols, self.k_step), num_multicast=1)
-        tma_u, tma_tensor_u = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w3, rows_w, self.hidden // 2), box,
-            (self.cols, self.k_step), num_multicast=1)
-        self.kernel(x, pair_row, meta, tma_tensor_g, tma_tensor_u, s1, s3, act, tma_g, tma_u, w_layout,
-                    self._storage(w_layout), grouped_routing).launch(
-            grid=(self.inter // self.cols, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
-            min_blocks_per_mp=1)
+        if cutlass.const_expr(self.native_resident):
+            dummy = cute.make_tensor(w1, cute.make_layout((1,)))
+            self.kernel(x, pair_row, meta, dummy, dummy, s1, s3, act, None, None, w_layout,
+                        self._storage(w_layout), grouped_routing, w1, w3).launch(
+                grid=(self.inter // self.cols, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+                min_blocks_per_mp=1)
+        else:
+            rows_w = self.experts * self.inter
+            box = cute.slice_(w_layout, (None, None, 0))
+            tma_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w1, rows_w, self.hidden // 2), box,
+                (self.cols, self.k_step), num_multicast=1)
+            tma_u, tma_tensor_u = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w3, rows_w, self.hidden // 2), box,
+                (self.cols, self.k_step), num_multicast=1)
+            self.kernel(x, pair_row, meta, tma_tensor_g, tma_tensor_u, s1, s3, act, tma_g, tma_u, w_layout,
+                        self._storage(w_layout), grouped_routing).launch(
+                grid=(self.inter // self.cols, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+                min_blocks_per_mp=1)
 
     @cute.kernel
     def kernel(self, x: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, weight_g: cute.Tensor,
                weight_u: cute.Tensor, s1: cute.Pointer, s3: cute.Pointer, act: cute.Pointer,
-               tma_g: cute.CopyAtom, tma_u: cute.CopyAtom, w_layout: cute.ComposedLayout,
-               Storage: cutlass.Constexpr, grouped_routing: cute.Pointer):
+               tma_g, tma_u, w_layout: cute.ComposedLayout,
+               Storage: cutlass.Constexpr, grouped_routing: cute.Pointer,
+               native_gate: cute.Pointer = None, native_up: cute.Pointer = None):
         n_blk = Int32(cute.arch.block_idx()[0])
         tile = Int32(cute.arch.block_idx()[1])
         smem = cutlass_utils.SmemAllocator()
@@ -199,13 +209,15 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
             h, i = self.hidden, self.inter
             n0 = n_blk * Int32(self.cols)
             w_tile = e * Int32(i // self.cols) + n_blk
-            t_ws, t_wg = cpasync.tma_partition(tma_g, 0, cute.make_layout(1), cute.group_modes(s_w, 0, 2),
-                                               cute.group_modes(cute.local_tile(weight_g, (self.cols, self.k_step),
-                                                                                (None, None)), 0, 2))
-            _, t_wu = cpasync.tma_partition(tma_u, 0, cute.make_layout(1), cute.group_modes(s_w, 0, 2),
-                                            cute.group_modes(cute.local_tile(weight_u, (self.cols, self.k_step),
-                                                                             (None, None)), 0, 2))
-            if tidx == Int32(0):
+            if cutlass.const_expr(not self.native_resident):
+                t_ws, t_wg = cpasync.tma_partition(tma_g, 0, cute.make_layout(1), cute.group_modes(s_w, 0, 2),
+                                                   cute.group_modes(cute.local_tile(weight_g, (self.cols, self.k_step),
+                                                                                    (None, None)), 0, 2))
+                _, t_wu = cpasync.tma_partition(tma_u, 0, cute.make_layout(1), cute.group_modes(s_w, 0, 2),
+                                                cute.group_modes(cute.local_tile(weight_u, (self.cols, self.k_step),
+                                                                                 (None, None)), 0, 2))
+            if cutlass.const_expr(not self.native_resident):
+              if tidx == Int32(0):
                 cpasync.prefetch_descriptor(tma_g)
                 cpasync.prefetch_descriptor(tma_u)
                 for slot in cutlass.range_constexpr(self.w_ring):
@@ -228,27 +240,31 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                     s_src = self.row_address(x, source) + Int64(h)
             # The CTA's scale rows (32 gate then 32 up columns, H/32 bytes each), once;
             # they join the first cp.async group.
-            units = self.scale_cols // 16
-            for q in cutlass.range_constexpr((2 * self.cols * units + self.threads - 1) // self.threads):
-                u = tidx + Int32(q * self.threads)
-                if u < Int32(2 * self.cols * units):
-                    r = u // Int32(units)
-                    c = u % Int32(units)
-                    base = Int64(s1.toint())
-                    col = r
-                    if r >= Int32(self.cols):
-                        base = Int64(s3.toint())
-                        col = r - Int32(self.cols)
-                    cp_async4_shared_global(
-                        sc + r * Int32(self.sc_stride) + c * Int32(16),
-                        base + (Int64(e) * Int64(i) + Int64(n0 + col)) * Int64(self.scale_cols) + Int64(c) * Int64(16))
+            if cutlass.const_expr(self.native_resident):
+                self.load_native_scales(s1, s3, sc, e, n0, tidx)
+            else:
+                units = self.scale_cols // 16
+                for q in cutlass.range_constexpr((2 * self.cols * units + self.threads - 1) // self.threads):
+                    u = tidx + Int32(q * self.threads)
+                    if u < Int32(2 * self.cols * units):
+                        r = u // Int32(units)
+                        c = u % Int32(units)
+                        base = Int64(s1.toint())
+                        col = r
+                        if r >= Int32(self.cols):
+                            base = Int64(s3.toint())
+                            col = r - Int32(self.cols)
+                        cp_async4_shared_global(
+                            sc + r * Int32(self.sc_stride) + c * Int32(16),
+                            base + (Int64(e) * Int64(i) + Int64(n0 + col)) * Int64(self.scale_cols) + Int64(c) * Int64(16))
 
             for p in cutlass.range_constexpr(self.a_ring - 1):
                 self._load_a(p, sa, ss, src, s_src, ch, r_base, tidx)
                 cute.arch.cp_async_commit_group()
-            if warp_id == Int32(0):
-                for p in cutlass.range_constexpr(self.w_ring - 1):
-                    self._load_w(p, tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile)
+            if cutlass.const_expr(not self.native_resident):
+                if warp_id == Int32(0):
+                    for p in cutlass.range_constexpr(self.w_ring - 1):
+                        self._load_w(p, tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile)
 
             warp_m = warp_id // Int32(2)
             warp_n = warp_id % Int32(2)
@@ -263,12 +279,18 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                 block = step // Int32(2)
                 slot = block % Int32(self.w_ring)
                 cute.arch.cp_async_wait_group(self.a_ring - 2)
-                cute.arch.mbarrier_wait(mbar + slot, (block // Int32(self.w_ring)) & Int32(1))
+                if cutlass.const_expr(self.native_resident):
+                    self.load_native_weights(native_gate, native_up, sw, e, n0, step, tidx)
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
+                else:
+                    cute.arch.mbarrier_wait(mbar + slot, (block // Int32(self.w_ring)) & Int32(1))
                 cute.arch.sync_threads()
                 if step + Int32(self.a_ring - 1) < Int32(self.k_steps):
                     self._load_a(step + Int32(self.a_ring - 1), sa, ss, src, s_src, ch, r_base, tidx)
                 cute.arch.cp_async_commit_group()
-                if warp_id == Int32(0):
+                if cutlass.const_expr(not self.native_resident):
+                  if warp_id == Int32(0):
                     # Block `block` starts: every thread is past block - 1, whose slot takes
                     # block + w_ring - 1.
                     if (step % Int32(2) == Int32(0)) & (block + Int32(self.w_ring - 1) < Int32(self.w_blocks)):
@@ -305,10 +327,17 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                 # Column g's K 4j..4j+3 (bytes 2j, 2j+1) and 16+4j.. (bytes 8+2j, 9+2j)
                                 # of the 32-K chunk's 16-byte unit.
                                 nrow = warp_n * Int32(16) + Int32((nt % 2) * 8) + g
-                                unit = half * Int32(4) + Int32(ks)
-                                v0, v1, v2, v3 = ld_shared_v4_u32(
-                                    w_base + Int32((nt // 2) * self.half_bytes) + nrow * Int32(self.k_step)
-                                    + ((unit ^ (nrow % Int32(8))) * Int32(16)))
+                                if cutlass.const_expr(self.native_resident):
+                                    at = Int32((nt // 2) * 512 + ks * 128 + nrow % 8 * 16 + nrow // 8)
+                                    v0 = ld_shared_u32(sw + at * 4)
+                                    v1 = ld_shared_u32(sw + (at + 4) * 4)
+                                    v2 = ld_shared_u32(sw + (at + 8) * 4)
+                                    v3 = ld_shared_u32(sw + (at + 12) * 4)
+                                else:
+                                    unit = half * Int32(4) + Int32(ks)
+                                    v0, v1, v2, v3 = ld_shared_v4_u32(
+                                        w_base + Int32((nt // 2) * self.half_bytes) + nrow * Int32(self.k_step)
+                                        + ((unit ^ (nrow % Int32(8))) * Int32(16)))
                                 lo_word = v0
                                 hi_word = v2
                                 if j >= Int32(2):
@@ -464,6 +493,64 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                          payload[4 * half], payload[4 * half + 1],
                                          payload[4 * half + 2], payload[4 * half + 3])
                     st_global_u8(at + Int64(i) + Int64(n0 // Int32(32)), cutlass.Uint8(scale))
+
+    @cute.jit
+    def load_native_weights(self, gate, up, shared, expert, n0, step, thread):
+        stored = self.inter if cutlass.const_expr(self.native_exact) else (self.inter + 127) // 128 * 128
+        tile_n = 128 if cutlass.const_expr(self.native_exact) else 256
+        for projection in cutlass.range_constexpr(2):
+            source = gate if cutlass.const_expr(projection == 0) else up
+            for q in cutlass.range_constexpr(128 // self.threads + 1):
+                index = thread + Int32(q * self.threads)
+                if index < 128:
+                    kb, lane = index // 32, index % 32
+                    tile = n0 // tile_n
+                    count = Int32(tile_n)
+                    if cutlass.const_expr(self.native_exact and self.inter % 128 != 0):
+                        if tile == self.inter // 128:
+                            count = Int32(self.inter % 128)
+                    word = (Int64(expert) * (2 * stored * self.hidden // 8)
+                            + Int64(projection == 0) * (stored * self.hidden // 8)
+                            + Int64(tile * tile_n * (self.hidden // 8))
+                            + Int64(step * count * 16 + kb * count * 4 + (n0 % tile_n // 32) * 128 + lane * 4))
+                    # Legacy packs both halves into the same N256 plane.
+                    if cutlass.const_expr(not self.native_exact):
+                        n = n0 + Int32(projection == 0) * stored
+                        word = (Int64(expert) * (2 * stored * self.hidden // 8)
+                                + Int64((n // 256) * (self.hidden // 128) + step) * 4096
+                                + Int64(kb * 1024 + (n % 256 // 32) * 128 + lane * 4))
+                    cp_async4_shared_global(shared + Int32(projection * 2048) + index * 16,
+                                            Int64(source.toint()) + word * 4)
+
+    @cute.jit
+    def load_native_scales(self, gate, up, shared, expert, n0, thread):
+        stored = self.inter if cutlass.const_expr(self.native_exact) else (self.inter + 127) // 128 * 128
+        for q in cutlass.range_constexpr((2 * self.cols * self.scale_cols + self.threads - 1) // self.threads):
+            index = thread + Int32(q * self.threads)
+            if index < 2 * self.cols * self.scale_cols:
+                row, k = index // self.scale_cols, index % self.scale_cols
+                projection, local = row // self.cols, row % self.cols
+                n = n0 + local
+                source = gate
+                if projection != 0:
+                    source = up
+                # Both pointers name the full native up-then-gate plane.
+                half = Int32(1) - projection
+                if cutlass.const_expr(self.native_exact):
+                    tile = n // 128
+                    count = Int32(128)
+                    if cutlass.const_expr(self.inter % 128 != 0):
+                        if tile == self.inter // 128:
+                            count = Int32(self.inter % 128)
+                    at = (Int64(expert * 2 * stored * self.scale_cols + half * stored * self.scale_cols)
+                          + Int64(tile * 128 * self.scale_cols + (k // 4) * count * 4 + (n % 128) * 4 + k % 4))
+                else:
+                    n += half * stored
+                    at = (Int64(expert * 2 * stored * self.scale_cols)
+                          + Int64(((n // 256) * (self.scale_cols // 4) + k // 4) * 1024 + n % 256 * 4 + k % 4))
+                source_byte = cute.make_ptr(cutlass.Uint8, Int64(source.toint()) + at, cute.AddressSpace.gmem, assumed_align=1)
+                target = cute.make_ptr(cutlass.Uint8, Int64(shared) + Int64(row * self.sc_stride + k), cute.AddressSpace.smem, assumed_align=1)
+                target[0] = source_byte[0]
 
     @cute.jit
     def activation(self, gate, up, grouped_routing, row):

@@ -194,6 +194,7 @@ def parse_args(argv=None):
                         help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
     parser.add_argument("--stream-decode", action="store_true",
                         help="development A16 native register-streaming decode arm")
+    parser.add_argument("--native-stream", action="store_true", help="Benchmark STREAM prefill over native residency")
     parser.add_argument("--generic-a8", action="store_true", help="Benchmark generic grouped row-major QMMA decode")
     parser.add_argument("--row-major-mma", action="store_true", help="Benchmark native MMA with row-major resident staging")
     parser.add_argument("--row-major-a8", action="store_true",
@@ -252,7 +253,7 @@ def parse_args(argv=None):
         parser.error("--compare-routes-exact requires at least two timing routes and no --exact-sweep")
     if args.mxfp4_unify and (not args.mxfp4_pair or args.native_slices or args.mxfp4_tilings
                              or args.geometry not in ("mimof", "mimop", "v41") or args.routes
-                             or (args.geometry == "v41" and not (args.row_major_a8 or args.row_major_mma or args.v4_stream))
+                             or (args.geometry == "v41" and not (args.row_major_a8 or args.row_major_mma or args.v4_stream or args.native_stream))
                              or args.capacity is not None):
         parser.error("--mxfp4-unify requires MiMo paired mode without other screens or fixed capacity")
     if args.v4_stream and (not args.mxfp4_unify or args.geometry != "v41" or min(rows) <= 80):
@@ -959,7 +960,8 @@ def mxfp4_pair_screen(g, args):
                                                torch=torch.__version__, results=results), indent=2) + "\n")
 
 
-def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True):
+def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True,
+                       native_resident=False, native_exact=False, v4=True):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -979,20 +981,25 @@ def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True):
         @property
         def slice(self):
             return self.intermediate
-    geometry = ExactStreamGeometry("v41", hidden, experts, topk, width, weights="mxfp4", swiglu_limit=10.)
+    geometry = ExactStreamGeometry("v41", hidden, experts, topk, width, weights="mxfp4", swiglu_limit=10. if v4 else 0.)
     source, _ = wire_rows(x)
     planes = [t.cuda() for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"], weights["w2"])]
     planes.append(torch.nn.functional.pad(scales["w2"], (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda())
+    if native_resident:
+        from tests.moe.test_v41_exact_slices import pack
+        w13, s13, w2, s2 = pack(weights, scales, native_exact)
+        planes = [w13, s13, w13, s13, w2, s2]
     pairs, tiles = rows * topk, stream_max_tiles(experts, rows * topk)
     output = torch.empty_like(x)
     scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
         ((meta_words(experts, tiles),), torch.int32), ((pairs,), torch.int32), ((pairs,), torch.int32),
         ((tiles * 128 * mxfp8_down_row_bytes(width),), torch.uint8),
-        ((pairs, hidden), torch.float32), ((pairs,), torch.float32))]
+        ((pairs, hidden), torch.float32 if v4 else torch.bfloat16), ((pairs,), torch.float32))]
     tensors = [source, ids.flatten(), routing.flatten(), *planes, output, *scratch]
     views = [from_dlpack(t, assumed_align=16) for t in tensors]
     pointers = [t.iterator for t in views]
-    launch = cute.compile(V4StreamContract(geometry, rows), *pointers,
+    launch = cute.compile(V4StreamContract(geometry, rows, native_resident=native_resident,
+                          native_exact=native_exact, v4=v4), *pointers,
                           cutlass.Int32(rows), current_cuda_stream())
     def execute(live):
         launch(*pointers, cutlass.Int32(live), current_cuda_stream())
@@ -1144,6 +1151,12 @@ def mxfp4_unify_screen(g, args, geometry_type):
                         projection_contract=contract, combine_output=True, qualify=True,
                         fc1_k_splits=split, row_major_mma=label == "row-major-mma")
                     owned.append(keep)
+            if args.native_stream:
+                for label, resident in (("native-stream-a8", True), ("row-major-stream-a8", False)):
+                    runs[label], outputs[label], keep = v4_stream_pair_arm(
+                        x, ids, routing, weights, scales, native_resident=resident,
+                        native_exact=width != 384, v4=v4)
+                    owned.append(keep)
             if args.v4_stream:
                 runs["row-major-stream-a8"], outputs["row-major-stream-a8"], keep = v4_stream_pair_arm(
                     x, ids, routing, weights, scales)
@@ -1188,6 +1201,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
             references = {"a16": oracle, "a8": reference("a8")}
             eligible = {}
             quality_precisions = {label: spec[0] for label, spec in variants.items()}
+            if args.native_stream:
+                quality_precisions.update({"native-stream-a8": "a8", "row-major-stream-a8": "a8"})
             if args.generic_a8:
                 quality_precisions["generic-a8"] = "a8"
             if args.stream_decode:
