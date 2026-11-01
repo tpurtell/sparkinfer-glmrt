@@ -130,6 +130,31 @@ class V41SlicePipeline:
             output[i] = Float32(0)
 
 
+class V41RouteCombine:
+    """Ordered original-slot FP32 sum, rounded once into BF16 token output."""
+
+    def __init__(self, hidden, topk):
+        self.hidden, self.topk = hidden, topk
+
+    @cute.jit
+    def __call__(self, source: cute.Tensor, output: cute.Tensor, rows: Int32,
+                 stream: cuda.CUstream):
+        self.kernel(source, output, rows).launch(
+            grid=(max(1, (rows * self.hidden + 255) // 256), 1, 1),
+            block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, source: cute.Tensor, output: cute.Tensor, rows: Int32):
+        from b12x.moe._shared.kernels.w4a8_v41_slice import fadd_rn_f32
+        index = Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
+        if index < Int64(rows) * self.hidden:
+            row, col = index // self.hidden, index % self.hidden
+            value = Float32(0)
+            for slot in cutlass.range_constexpr(self.topk):
+                value = fadd_rn_f32(value, source[row * self.topk + slot, col])
+            output[row, col] = value.to(cutlass.BFloat16)
+
+
 class V41DraftSlicePipeline:
     """Local dSpark BF16 input through FP8 quantization and ordered route output.
 

@@ -12,7 +12,6 @@ old A16 ceiling; it is not a serving arithmetic override.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 from collections import Counter
 from dataclasses import replace
 import hashlib
@@ -159,7 +158,6 @@ def parse_args(argv=None):
                         help="explicit activation contract; defaults to the geometry contract")
     parser.add_argument("--rows", default="1,16,80,1024,4096")
     parser.add_argument("--capacity", type=int, help="fixed compiled export/workspace capacity; defaults to each live row count")
-    parser.add_argument("--experts", type=int, help="MXFP4 screen resident experts; defaults to checkpoint count; overrides are diagnostic")
     parser.add_argument("--routes", type=Path, help="schema-1 histograms or an existing expert-routes JSONL")
     parser.add_argument("--route", default="auto")
     parser.add_argument("--iters", type=int, default=20)
@@ -183,25 +181,19 @@ def parse_args(argv=None):
     parser.add_argument("--mxfp4-pair", action="store_true",
                         help="interleave identical logical weights in padded and exact K32 storage")
     parser.add_argument("--widths", help="paired-screen rank widths; defaults to every T2..8 adjacent width")
-    parser.add_argument("--engine-policy-root", type=Path)
-    parser.add_argument("--shipped-prefill", action="store_true",
-                        help="qualify ordered native STREAM against shipped prefill recipes")
+    parser.add_argument("--mxfp4-unify", action="store_true",
+                        help="MiMo native A8/A16 against three exact-storage matching generic controls")
     parser.add_argument("--native-slices", action="store_true",
                         help="paired native V4.1/V4 slice pipelines instead of grouped programs")
     parser.add_argument("--mxfp4-tilings", action="store_true",
                         help="screen native tiles 64/128/192 (explicit arms also allow 32) or grouped decode warp partitions")
     parser.add_argument("--mxfp4-w2-pitch", action="store_true",
                         help="development native arm: exact W13 rows with only W2 payload pitch aligned to 128 columns")
-    parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE[:FC1_SPLITS]",
-                        help="explicit development native arm; optional FC1 split count defaults to one")
-    parser.add_argument("--mxfp4-control", help="explicit native arm to repeat as the identical control")
+    parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE",
+                        help="explicit development native arm; repeat for each resident extent and slice tile")
     parser.add_argument("--control-repeats", type=int, default=2,
                         help="identical padded controls in the tiling screen, including its reference")
     args = parser.parse_args(argv)
-    if args.shipped_prefill and (not args.native_slices or not args.mxfp4_pair
-            or args.geometry not in ("v41", "dsv4f", "dsv4p") or args.engine_policy_root is None
-            or args.mxfp4_tilings):
-        parser.error("shipped prefill requires native V4/V4.1 pairs, policy root and prefill capacities")
     if args.iters <= 0:
         parser.error("iters must be positive")
     if args.continue_on_fail and (not args.check or args.exact_sweep):
@@ -216,10 +208,6 @@ def parse_args(argv=None):
         parser.error("rows must be positive")
     if args.capacity is not None and (args.capacity < 1 or max(rows) > args.capacity):
         parser.error("capacity must be positive and cover every live row count")
-    if args.experts is not None and (not args.mxfp4_pair or args.experts < 1):
-        parser.error("--experts requires an MXFP4 pair screen and a positive count")
-    if args.shipped_prefill and any((args.capacity or row) not in (256, 1024, 4096) for row in rows):
-        parser.error("shipped prefill requires compiled capacities 256,1024,4096")
     if args.check_prefix_rows is not None and (not args.check or args.exact_sweep
             or args.capacity is None or not 1 <= args.check_prefix_rows < max(rows)):
         parser.error("--check-prefix-rows requires --check, fixed --capacity, a longer case and no --exact-sweep")
@@ -231,6 +219,10 @@ def parse_args(argv=None):
         parser.error("routes must be nonempty and unique")
     if args.compare_routes_exact and (args.exact_sweep or len(args.route.split(",")) < 2):
         parser.error("--compare-routes-exact requires at least two timing routes and no --exact-sweep")
+    if args.mxfp4_unify and (not args.mxfp4_pair or args.native_slices or args.mxfp4_tilings
+                             or args.geometry not in ("mimof", "mimop") or args.routes
+                             or args.capacity is not None):
+        parser.error("--mxfp4-unify requires MiMo paired mode without other screens or fixed capacity")
     if args.native_slices and not args.mxfp4_pair:
         parser.error("--native-slices requires --mxfp4-pair")
     if args.mxfp4_tilings and (not args.mxfp4_pair or args.capacity is not None):
@@ -246,8 +238,6 @@ def parse_args(argv=None):
             native_screen_arms(args.mxfp4_arm)
         except ValueError as error:
             parser.error(str(error))
-    if args.mxfp4_control and args.mxfp4_control not in {arm[0] for arm in native_screen_arms(args.mxfp4_arm)}:
-        parser.error("--mxfp4-control must name an explicit native arm")
     if args.widths:
         try:
             widths = [int(width) for width in args.widths.split(",")]
@@ -255,7 +245,7 @@ def parse_args(argv=None):
             parser.error("widths must be comma-separated K32 widths")
         if not args.mxfp4_pair or not widths or any(width <= 0 or width % 32 for width in widths):
             parser.error("--widths requires --mxfp4-pair and positive K32 widths")
-    if args.routes and args.mxfp4_pair and not (args.mxfp4_tilings or args.shipped_prefill):
+    if args.routes and args.mxfp4_pair and not args.mxfp4_tilings:
         parser.error("paired recorded routes require --mxfp4-tilings")
     if args.mxfp4_pair and (args.exact_sweep or args.profile_dir or args.check_prefix_rows
                            or args.compare_routes_exact or args.input != "wire"):
@@ -383,22 +373,18 @@ def native_screen_arms(values):
     result = []
     for value in values:
         try:
-            fields = value.split(":")
-            name, logical, stored, tile = fields[:4]
-            splits = int(fields[4]) if len(fields) == 5 else 1
-            if len(fields) not in (4, 5):
-                raise ValueError("invalid arm field count")
+            name, logical, stored, tile = value.split(":")
             logical, stored, tile = int(logical), int(stored), int(tile)
         except ValueError as error:
-            raise ValueError("native arm must be NAME:LOGICAL:STORED:TILE[:FC1_SPLITS]") from error
+            raise ValueError("native arm must be NAME:LOGICAL:STORED:TILE") from error
         if (not name or name.startswith(("padded", "matching", "exact-", "aligned-w2"))
                 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in name)
                 or not 0 < logical <= stored or logical % 32 or stored % 32
-                or tile not in (32, 64, 128, 192) or splits not in (1, 2, 4, 8)):
+                or tile not in (32, 64, 128, 192)):
             raise ValueError("native arms need unique names, whole-K32 extents and tile32/64/128/192")
         if name in {arm[0] for arm in result}:
             raise ValueError("duplicate native arm name")
-        result.append((name, logical, stored, tile, splits))
+        result.append((name, logical, stored, tile))
     return result
 
 
@@ -438,35 +424,26 @@ def screen_route_ids(wave, experts, topk, seed):
 def tiling_specs(args, width, baseline_tile, tiles):
     """Keep identical controls separate from eligible candidate layouts."""
     controls = ["padded", *(f"padded-control-{n}" for n in range(1, args.control_repeats))]
-    specs = [(label, False, baseline_tile, None, 1) for label in controls]
+    specs = [(label, False, baseline_tile, None) for label in controls]
     if args.mxfp4_arm:
-        specs += [(name, True, tile, stored, splits) for name, logical, stored, tile, splits
+        specs += [(name, True, tile, stored) for name, logical, stored, tile
                   in native_screen_arms(args.mxfp4_arm) if logical == width]
-        if args.mxfp4_control:
-            reference = next((spec for spec in specs if spec[0] == args.mxfp4_control), None)
-            if reference is None:
-                raise ValueError("explicit control must cover every screened logical width")
-            specs = [specs[0], *(spec for spec in specs if spec[1])]
-            controls = [reference[0], *(f"{reference[0]}-control-{n}" for n in range(1, args.control_repeats))]
-            if any(label in {spec[0] for spec in specs} for label in controls[1:]):
-                raise ValueError("explicit control repeat name collides with an arm")
-            specs += [(label, *reference[1:]) for label in controls[1:]]
     else:
-        specs.append(("matching", True, baseline_tile, None, 1))
-        specs += [(f"exact-{tile}", True, tile, None, 1) for tile in tiles if tile != baseline_tile]
+        specs.append(("matching", True, baseline_tile, None))
+        specs += [(f"exact-{tile}", True, tile, None) for tile in tiles if tile != baseline_tile]
         if args.mxfp4_w2_pitch:
-            specs = specs[:len(controls) + 1] + [("aligned-w2", True, baseline_tile, None, 1),
-                                                ("aligned-w2-scales", True, baseline_tile, None, 1)]
+            specs = specs[:len(controls) + 1] + [("aligned-w2", True, baseline_tile, None),
+                                                ("aligned-w2-scales", True, baseline_tile, None)]
     return specs, controls
 
 
 def tiling_timing_summary(samples, eligible, controls):
-    paired = {label: statistics.median(base / value for base, value in zip(samples[controls[0]], times))
+    paired = {label: statistics.median(base / value for base, value in zip(samples["padded"], times))
               for label, times in samples.items()}
     candidates = [label for label in samples if label not in controls and eligible[label]]
     winner = max(candidates, key=paired.get) if candidates else None
-    control_ratios = {label: [base / value for base, value in zip(samples[controls[0]], samples[label])]
-                      for label in controls if label != controls[0]}
+    control_ratios = {label: [base / value for base, value in zip(samples["padded"], samples[label])]
+                      for label in controls if label != "padded"}
     return dict(medians_us={label: statistics.median(times) for label, times in samples.items()},
                 paired_speedups=paired, winner=winner, speedup=paired[winner] if winner else None,
                 identical_control_speedups=control_ratios)
@@ -487,40 +464,14 @@ def compiled_case(g, args, rows, route, cache):
     return cache[key]
 
 
-def engine_layout_policy(root):
-    if root is None:
-        raise ValueError("implicit widths require --engine-policy-root; otherwise pass --widths")
-    path = Path(root) / "python/tools/lib/mxfp4_layouts.py"
-    spec = importlib.util.spec_from_file_location("benchmark_engine_mxfp4_layouts", path)
-    policy = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(policy)
-    return policy
-
-
-def paired_widths(intermediate, requested=None, policy_root=None):
-    if requested:
-        widths = {int(width) for width in requested.split(",")}
-    else:
-        policy = engine_layout_policy(policy_root)
-        widths = set()
-        for world in range(2, 9):
-            unit = policy.ownership_unit(intermediate, world)
-            units = intermediate // unit
-            widths.update((unit * (units // world), unit * -(-units // world)))
+def paired_widths(intermediate, requested=None):
+    widths = ({int(width) for width in requested.split(",")} if requested else
+              {32 * (intermediate // 32 // world + extra)
+               for world in range(2, 9)
+               for extra in (0, int(intermediate // 32 % world != 0))})
     if any(width <= 0 or width % 32 or width > intermediate for width in widths):
         raise ValueError("paired widths must be whole K32 within the checkpoint intermediate")
     return sorted(widths)
-
-
-def shipped_prefill_recipe(family, hidden, rank_width, capacity, policy_root):
-    policy = engine_layout_policy(policy_root)
-    matching = 128 if family == "dsv4f" else native_slice_width(family, rank_width)
-    # Only equal Pro roles pass atomic-min-capacity; Flash stays ordered.
-    atomic_widths = {"dsv4p": (384, 512, 768, 1024, 1536)}
-    return dict(tile=policy.native_slice_width(hidden, rank_width, 121, capacity, matching),
-                exact=policy.stored_width(hidden, rank_width) == rank_width,
-                atomic=capacity >= 256 and rank_width in atomic_widths.get(family, ()),
-                coded=family == "v41")
 
 
 def native_slice_width(family, rank_width):
@@ -530,7 +481,8 @@ def native_slice_width(family, rank_width):
 
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
                     aligned_w2=False, aligned_w2_scales=False, stored_width=None,
-                    combine_output=False, fc1_k_splits=1, capacity=None):
+                    activation_precision="a8", projection_contract=None,
+                    combine_output=False, ingress="wire"):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -540,8 +492,6 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     from b12x.moe._shared.scale_codes import pack_scale_codes
     from tests.moe.test_v41_exact_slices import pack
 
-    live_rows = x.shape[0]
-    x, ids, routing = screen_capacity_inputs(x, ids, routing, capacity)
     rows, hidden = x.shape
     experts, intermediate = weights["w1"].shape[:2]
     logical = intermediate
@@ -578,20 +528,25 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     wire = torch.cat(((groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
                       .view(torch.uint8).reshape(rows, hidden), (exponent + 127).to(torch.uint8)), 1)
     routes = rows * topk
+    words_per_route = width // 2 if activation_precision == "a16" else width // 4 + width // 32
     partial = torch.empty((1,) if atomic else
-                          ((logical + width - 1) // width, routes, width // 4 + width // 32), device="cuda")
+                          ((logical + width - 1) // width, routes, words_per_route), device="cuda")
     output = torch.empty(rows * hidden if atomic else (routes, hidden), device="cuda")
     scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
         ((1,), torch.int32), ((experts * routes,), torch.int32), ((experts,), torch.int32),
         ((experts, 2), torch.int32), ((routes, 19), torch.int32),
         ((routes,), torch.float32), ((routes,), torch.int32))]
-    tensors = [wire[:, :hidden].view(torch.uint32), wire[:, hidden:], *packed,
+    source = torch.empty_like(x) if activation_precision == "a16" and ingress == "wire" else x
+    activation = source.view(torch.uint32) if activation_precision == "a16" else wire[:, :hidden].view(torch.uint32)
+    tensors = [activation, wire[:, hidden:], *packed,
                ids.flatten(), routing.flatten(), *scratch, partial, output]
     args = [from_dlpack(tensor, assumed_align=16) for tensor in tensors]
     pipeline = V41SlicePipeline(rows, width, experts=experts, topk=topk,
                                 intermediate=intermediate, hidden=hidden,
                                 exact_storage=tail or stored_width is not None,
-                                atomic_tokens=atomic, scale_codes=coded, fc1_k_splits=fc1_k_splits)
+                                atomic_tokens=atomic, scale_codes=coded,
+                                activation_precision=activation_precision,
+                                **(projection_contract or {}))
     if stored_width is not None:
         # Physical strides come from P; the launch only visits the real S slices.
         for kernel in (pipeline.fc1, pipeline.fc2, pipeline.reduce):
@@ -604,28 +559,50 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
         if aligned_w2_scales:
             pipeline.fc2.w2_scale_columns = w2_pitch // 32
     launch = cute.compile(pipeline, *args, cutlass.Int32(rows), current_cuda_stream())
+    prepare = None
+    if activation_precision == "a16" and ingress == "wire":
+        from b12x.integration.cuteafd._fp8_moe_kernels import GatherRows
+        operands = [from_dlpack(tensor, assumed_align=16) for tensor in (wire, source)]
+        wire_tensor, source_tensor = operands
+        prepare = cute.compile(GatherRows(k=hidden, wire=True, gather=False),
+                               wire_tensor.iterator, args[8].iterator, args[8].iterator,
+                               source_tensor.iterator, cutlass.Int32(rows), current_cuda_stream())
+        def prepare_rows(live):
+            prepare(wire_tensor.iterator, args[8].iterator, args[8].iterator,
+                    source_tensor.iterator, cutlass.Int32(live), current_cuda_stream())
+    elif activation_precision == "a8" and ingress == "bf16":
+        from b12x._lib.quant.mxfp8_rows import _MXFP8RowsQuantLaunch
+        source_tensor = from_dlpack(x, assumed_align=16)
+        prepare = cute.compile(_MXFP8RowsQuantLaunch(hidden, cutlass.BFloat16, 4, 256, 32,
+                               False, 1e-4, wire_rows=True), source_tensor.iterator,
+                               args[0].iterator, args[1].iterator, args[1].iterator,
+                               cutlass.Int32(rows), cutlass.Int32(hidden), cutlass.Int32(rows),
+                               current_cuda_stream())
+        def prepare_rows(live):
+            prepare(source_tensor.iterator, args[0].iterator, args[1].iterator, args[1].iterator,
+                    cutlass.Int32(live), cutlass.Int32(hidden), cutlass.Int32(live), current_cuda_stream())
     token_output = torch.empty_like(x) if combine_output else output
+    token_tensor = from_dlpack(token_output, assumed_align=16)
     combine = None
     if combine_output:
-        from b12x.moe._shared.kernels.v4_stream_pipeline import NativeTokenCombine
-        source_tensor = from_dlpack(output.view(rows, hidden) if atomic else output,
-                                    assumed_align=16)
-        token_tensor = from_dlpack(token_output, assumed_align=16)
-        combine = cute.compile(NativeTokenCombine(hidden, 1 if atomic else topk),
-            source_tensor.iterator, token_tensor.iterator, cutlass.Int32(rows), current_cuda_stream())
+        from b12x.moe._shared.kernels.v41_slice_pipeline import V41RouteCombine
+        combine = cute.compile(V41RouteCombine(hidden, topk), args[-1], token_tensor,
+                               cutlass.Int32(rows), current_cuda_stream())
     def execute(live):
+        if prepare is not None:
+            prepare_rows(live)
         launch(*args, cutlass.Int32(live), current_cuda_stream())
         if combine is not None:
-            combine(source_tensor.iterator, token_tensor.iterator, cutlass.Int32(live), current_cuda_stream())
+            combine(args[-1], token_tensor, cutlass.Int32(live), current_cuda_stream())
     if qualify:
-        if atomic and not combine_output:
-            raise ValueError("atomic qualification requires combined token output")
-        qualifier = qualify_atomic_pair_replay if atomic else qualify_pair_replay
-        qualifier(execute, ids[:live_rows], token_output[:live_rows if combine_output else live_rows * topk], [partial, *scratch, output] if combine_output else [partial, *scratch],
-                  [*tensors, token_output], lambda live: token_output[:live if combine_output else live * topk])
+        if atomic:
+            raise ValueError("tiling qualification requires ordered deterministic route output")
+        qualify_pair_replay(execute, ids, token_output, [partial, *scratch, output] if combine_output else [partial, *scratch],
+                            [*tensors, wire, source, token_output],
+                            lambda live: token_output[:live if combine_output else live * topk])
     def run():
-        execute(live_rows)
-    return run, token_output[:live_rows if combine_output else live_rows * topk], (tensors, args, launch, combine, execute)
+        execute(rows)
+    return run, token_output, (tensors, args, launch, wire, source, prepare, combine, token_tensor, execute)
 
 
 def mxfp4_decode_partitions(width):
@@ -694,42 +671,12 @@ def f32_errors(output, reference):
     return {"max_abs": difference.abs().max().item(), "rms": difference.square().mean().sqrt().item()}
 
 
-def qualify_atomic_pair_replay(run, ids, output, scratch, buffers, prefix):
-    """Atomic controls may reorder FP32 additions; do not claim byte determinism."""
-    rows = ids.shape[0]
-    run(rows)
-    expected = output.clone()
-    original = ids.clone()
-    for live in sorted({1, min(17, rows), rows}):
-        output.fill_(float("nan"))
-        for tensor in scratch:
-            tensor.fill_(255)
-        run(live)
-        torch.testing.assert_close(prefix(live), expected[:live], rtol=.02, atol=.03125)
-    if rows > 1:
-        ids[1:] = ids[:1].expand_as(ids[1:])
-        run(rows)
-        torch.testing.assert_close(prefix(1), expected[:1], rtol=.02, atol=.03125)
-        ids.copy_(original)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run(rows)
-    for _ in range(3):
-        output.fill_(float("nan"))
-        graph.replay()
-        torch.testing.assert_close(output, expected, rtol=.02, atol=.03125)
-    return dict(deterministic=False, graph_reuse=True, comparison="tolerance-only")
-
-
 def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
     """Poison, prefix/wave-mix invariance and fixed-address graph replay."""
     rows = ids.shape[0]
     addresses = tuple(t.data_ptr() for t in buffers)
     run(rows)
     expected = output.clone()
-    for _ in range(3):
-        run(rows)
-        assert torch.equal(output, expected), "repeat determinism"
     for live in sorted({1, min(17, rows), rows}):
         output.fill_(float("nan"))
         for tensor in scratch:
@@ -758,182 +705,7 @@ def qualify_pair_replay(run, ids, output, scratch, buffers, prefix):
     return {"deterministic": True, "row_invariant": True, "graph_reuse": True}
 
 
-def screen_capacity_inputs(x, ids, routing, capacity):
-    """Pad dead rows while preserving the live launch scalar."""
-    capacity = capacity or x.shape[0]
-    if capacity < x.shape[0]:
-        raise ValueError("compiled capacity does not cover live rows")
-    extra = capacity - x.shape[0]
-    return (torch.nn.functional.pad(x, (0, 0, 0, extra)),
-            torch.nn.functional.pad(ids, (0, 0, 0, extra), value=-1),
-            torch.nn.functional.pad(routing, (0, 0, 0, extra))) if extra else (x, ids, routing)
-
-
-def production_stream_arm(x, ids, routing, weights, scales, coded, *, capacity=None):
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-    from b12x._lib.utils import current_cuda_stream
-    from b12x.moe._shared.kernels.v4_stream_pipeline import V4StreamPipeline, NativeTokenCombine
-    from b12x.moe._shared.scale_codes import pack_scale_codes
-    from tests.moe.test_v41_exact_slices import pack
-    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
-
-    live_rows = x.shape[0]
-    x, ids, routing = screen_capacity_inputs(x, ids, routing, capacity)
-    rows, hidden = x.shape
-    experts, width = weights["w1"].shape[:2]
-    topk = ids.shape[1]
-    packed = pack(weights, scales, width % 128 != 0)
-    if coded:
-        packed[1] = pack_scale_codes(torch.cat((scales["w3"], scales["w1"]), 1),
-            tensor_name="w13.scale", gated_half_rows=width).cuda().flatten()
-        packed[3] = pack_scale_codes(scales["w2"], tensor_name="w2.scale").cuda().flatten()
-    wire, _ = wire_rows(x)
-    pipeline = V4StreamPipeline(rows, hidden=hidden, intermediate=width,
-                               experts=experts, topk=topk, scale_codes=coded)
-    arena = torch.empty(pipeline.scratch_bytes, dtype=torch.uint8, device="cuda")
-    dtype = {"u8": torch.uint8, "i32": torch.int32, "f32": torch.float32}
-    scratch = [arena[spec["offset"]:spec["offset"] + spec["nbytes"]]
-               .view(dtype[spec["dtype"]]).reshape(spec["shape"]) for spec in pipeline.layout]
-    output = torch.empty_like(x)
-    tensors = [wire, *packed, ids.flatten(), routing.flatten(), *scratch]
-    views = [from_dlpack(t, assumed_align=16) for t in tensors]
-    pointers = [view.iterator for view in views]
-    launch = cute.compile(pipeline, *pointers, cutlass.Int32(rows), current_cuda_stream())
-    token_view = from_dlpack(output, assumed_align=16)
-    combine = cute.compile(NativeTokenCombine(hidden, topk), pointers[-1], token_view.iterator,
-                           cutlass.Int32(rows), current_cuda_stream())
-    def execute(live):
-        launch(*pointers, cutlass.Int32(live), current_cuda_stream())
-        combine(pointers[-1], token_view.iterator, cutlass.Int32(live), current_cuda_stream())
-    qualification = qualify_pair_replay(execute, ids[:live_rows], output[:live_rows], [arena], [*tensors, output],
-                                         lambda live: output[:live])
-    original_ids = ids.clone()
-    ids[0].fill_(-1)
-    ids[live_rows - 1, -1] = experts
-    execute(live_rows)
-    invalid_expected = output[:live_rows].clone()
-    assert torch.count_nonzero(output[0]) == 0, "invalid route row must be zero"
-    arena.fill_(255)
-    output.fill_(float("nan"))
-    execute(live_rows)
-    assert torch.equal(output[:live_rows], invalid_expected), "invalid route poison/repeat"
-    assert torch.isfinite(output[:live_rows]).all(), "invalid route output"
-    ids.copy_(original_ids)
-    execute(live_rows)
-    qualification["invalid_routes"] = True
-    return lambda: execute(live_rows), output[:live_rows], (arena, tensors, views, launch, combine, token_view), qualification
-
-
-def stream_screen_population(g, args):
-    """Only checkpoint-population, non-hot routes can qualify a kernel recipe."""
-    experts = args.experts if args.experts is not None else g.experts
-    if experts < g.top_k:
-        raise ValueError("resident expert count must cover checkpoint top-k")
-    if args.routes and experts != g.experts:
-        raise ValueError("recorded routes require the checkpoint expert count")
-    if experts != g.experts or args.routing == "hot":
-        print("DIAGNOSTIC ONLY: hot routing or non-checkpoint expert count cannot qualify a route", flush=True)
-    return experts, experts == g.experts and args.routing != "hot"
-
-
-def shipped_stream_screen(g, args):
-    properties = torch.cuda.get_device_properties(0)
-    sm = properties.major * 10 + properties.minor
-    if g.name == "dsv4p" and sm != 121:
-        raise ValueError("the V4 Pro shipped STREAM screen supports GB10 (SM121) only")
-    l2_bytes = int(properties.L2_cache_size)
-    flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
-    waves = recorded_waves(args.routes, g) if args.routes else None
-    selected_waves = {rows: screen_route_wave(waves, rows, args.seed)
-                      for rows in map(int, args.rows.split(","))} if waves else {}
-    route_fixture = ({"path": str(args.routes), "sha256": hashlib.sha256(args.routes.read_bytes()).hexdigest(),
-                      "family_attested": args.routes.suffix != ".jsonl"} if waves else None)
-    experts, route_qualification_eligible = stream_screen_population(g, args)
-    records = []
-    for width in paired_widths(g.intermediate, args.widths, args.engine_policy_root):
-        expert_bytes = 3 * width * g.hidden // 2
-        if experts * expert_bytes <= 2 * l2_bytes:
-            raise ValueError("resident expert payload must exceed twice L2")
-        generator = torch.Generator().manual_seed(args.seed + width)
-        weights, scales = {}, {}
-        for name, shape in (("w1", (experts, width, g.hidden // 2)),
-                            ("w3", (experts, width, g.hidden // 2)),
-                            ("w2", (experts, g.hidden, width // 2))):
-            weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
-            scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
-                                        dtype=torch.uint8, generator=generator)
-        for rows in map(int, args.rows.split(",")):
-            capacity = args.capacity or rows
-            torch.manual_seed(args.seed + rows)
-            x = (torch.randn(rows, g.hidden, device="cuda") * .5).bfloat16()
-            ids = (screen_route_ids(selected_waves[rows], experts, g.top_k, args.seed).cuda()
-                   if waves else torch.rand(rows, experts, device="cuda").topk(g.top_k, -1).indices.int())
-            if args.routing == "hot":
-                ids.copy_(ids[:1].expand_as(ids))
-            routing = torch.rand(rows, g.top_k, device="cuda")
-            routing /= routing.sum(-1, keepdim=True)
-            if sm == 120:
-                recipe = dict(tile=192 if g.name == "v41" else 128, exact=True,
-                              atomic=False, coded=g.name == "v41")
-            else:
-                recipe = shipped_prefill_recipe(g.name, g.hidden, width, capacity, args.engine_policy_root)
-            runs, outputs, keepalive, qualifications = {}, {}, [], {}
-            controls = ("current", "current-2", "current-3")
-            for label in controls:
-                runs[label], outputs[label], keep = native_pair_arm(x, ids, routing, weights, scales,
-                    recipe["tile"], recipe["exact"], recipe["atomic"], recipe["coded"],
-                    qualify=True, combine_output=True, capacity=capacity)
-                keepalive.append(keep)
-            runs["native-stream"], outputs["native-stream"], keep, qualifications["native-stream"] = (
-                production_stream_arm(x, ids, routing, weights, scales, recipe["coded"], capacity=capacity))
-            keepalive.append(keep)
-            oracle_routes = mxfp4_f32_reference(x, ids, routing, weights, scales, limit=10., native=True)
-            oracle = torch.zeros_like(x, dtype=torch.float32)
-            for slot in range(g.top_k):
-                oracle += oracle_routes.reshape(rows, g.top_k, g.hidden)[:, slot]
-            errors = {}
-            for label, output in outputs.items():
-                error = f32_errors(output, oracle)
-                error["normalized_rms"] = error["rms"] / max(oracle.square().mean().sqrt().item(), 1e-8)
-                assert error["normalized_rms"] < .02, (label, error)
-                errors[label] = error
-            if args.graph:
-                for label, run in list(runs.items()):
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        run()
-                    keepalive.append(graph)
-                    runs[label] = graph.replay
-            samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
-            medians = {label: statistics.median(values) for label, values in samples.items()}
-            control = [medians[label] for label in controls]
-            counts = torch.bincount(ids.flatten().long(), minlength=experts)
-            occupancy = dict(min=counts.min().item(), mean=counts.float().mean().item(), max=counts.max().item())
-            routing_mode = "recorded" if waves else args.routing
-            print(f"STREAM cell live={rows} compiled={capacity} experts={experts} routing={routing_mode} "
-                  f"rows/expert min/mean/max={occupancy['min']}/{occupancy['mean']:.3f}/{occupancy['max']}", flush=True)
-            record = dict(capacity=capacity, experts=experts, routing=routing_mode, rows_per_expert=occupancy,
-                route_qualification_eligible=route_qualification_eligible,
-                route_fixture=route_fixture, geometry=g.name, sm=sm, width=width, rows=rows, shipped_recipe=recipe,
-                controls=controls, samples_us=samples, median_us=medians,
-                speedup=min(control) / medians["native-stream"],
-                control_spread=max(control) / min(control) - 1,
-                regression_beyond_spread=medians["native-stream"] > max(control),
-                qualifications=qualifications, matched_f32_errors=errors,
-                scratch_bytes=keep[0].numel(), stream_scale_representation="codes" if recipe["coded"] else "raw")
-            records.append(record)
-            print(json.dumps(record), flush=True)
-            del keepalive, runs, outputs, keep
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(dict(device=str(properties), results=records), indent=2) + "\n")
-
-
 def mxfp4_pair_screen(g, args):
-    if args.shipped_prefill:
-        return shipped_stream_screen(g, args)
     """One warmed L2-cold interleaved session with identical rank weights."""
     from dataclasses import dataclass
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, compile_fp8_moe_aot, fp8_moe_scratch_bytes
@@ -948,6 +720,9 @@ def mxfp4_pair_screen(g, args):
 
     if g.weights != "mxfp4":
         raise ValueError("paired screen requires an MXFP4 geometry")
+    if args.mxfp4_unify:
+        mxfp4_unify_screen(g, args, Exact)
+        return
     if args.mxfp4_tilings:
         mxfp4_tiling_screen(g, args, Exact)
         return
@@ -955,13 +730,11 @@ def mxfp4_pair_screen(g, args):
     properties = torch.cuda.get_device_properties(0)
     l2_bytes = int(properties.L2_cache_size)
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
-    experts, route_qualification_eligible = stream_screen_population(g, args)
-    topk = g.top_k
-    for width in paired_widths(g.intermediate, args.widths, args.engine_policy_root):
+    topk = 6 if args.native_slices else 8
+    for width in paired_widths(g.intermediate, args.widths):
         # Keep both arms' resident payloads beyond L2 on the actual card.
         expert_payload_bytes = 3 * width * g.hidden // 2
-        if experts * expert_payload_bytes <= 2 * l2_bytes:
-            raise ValueError("resident expert payload must exceed twice L2")
+        experts = max(16, (2 * l2_bytes // (16 * expert_payload_bytes) + 1) * 16)
         padded = (width + 127) // 128 * 128
         gen = torch.Generator().manual_seed(args.seed + width)
         weights, scales = {}, {}
@@ -1031,8 +804,6 @@ def mxfp4_pair_screen(g, args):
                 record = dict(geometry=g.name, hidden=g.hidden, experts=experts, topk=topk,
                               width=width, padded_width=padded, rows=rows, route=route,
                               weight_sha256=weight_hash, graph=args.graph, routing=args.routing,
-                              route_qualification_eligible=route_qualification_eligible,
-                              route_histogram=sorted(Counter(ids.cpu().flatten().tolist()).items()),
                               l2_bytes=l2_bytes, resident_payload_bytes=experts * expert_payload_bytes,
                               slice_width=native_slice_width(g.name, width) if args.native_slices else None,
                               padded_us=old, exact_us=new, speedup=old/new,
@@ -1047,6 +818,113 @@ def mxfp4_pair_screen(g, args):
                                                torch=torch.__version__, results=results), indent=2) + "\n")
 
 
+def mxfp4_unify_screen(g, args, geometry_type):
+    """Compare complete native wire-input arms to the installed mixed generic math."""
+    from b12x.integration.cuteafd.fp8_moe import (
+        _Fp8Moe, DECODE_MAX_ROWS, auto_large_rows, fp8_moe_scratch_bytes, compile_fp8_moe_aot,
+    )
+    from b12x.integration.cuteafd._mxfp4_moe_kernels import GroupedMxfp4Gemv
+    from b12x.integration.cuteafd._common import compile_program
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+
+    properties = torch.cuda.get_device_properties(0)
+    l2_bytes = int(properties.L2_cache_size)
+    flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
+    results = []
+    for width in paired_widths(g.intermediate, args.widths):
+        expert_bytes = 3 * width * g.hidden // 2
+        experts = max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16)
+        generator = torch.Generator().manual_seed(args.seed + width)
+        weights, scales = {}, {}
+        for name, shape in (("w1", (experts, width, g.hidden // 2)),
+                            ("w3", (experts, width, g.hidden // 2)),
+                            ("w2", (experts, g.hidden, width // 2))):
+            weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+            scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
+                                        dtype=torch.uint8, generator=generator)
+        weight_hash = hashlib.sha256(b"".join(t.numpy().tobytes()
+                                     for t in (*weights.values(), *scales.values()))).hexdigest()
+        for rows in map(int, args.rows.split(",")):
+            torch.manual_seed(args.seed + rows)
+            x = (torch.randn(rows, g.hidden, device="cuda") * .5).bfloat16()
+            ids = torch.rand(rows, experts, device="cuda").topk(g.top_k, -1).indices.int()
+            if args.routing == "hot":
+                ids.copy_(ids[:1].expand_as(ids))
+            routing = torch.rand(rows, g.top_k, device="cuda")
+            routing /= routing.sum(-1, keepdim=True)
+            geometry = geometry_type(g.name, g.hidden, experts, g.top_k, g.intermediate,
+                                     weights="mxfp4", rank_width=width)
+            planes = tuple(t.cuda() for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"], weights["w2"]))
+            planes += (torch.nn.functional.pad(scales["w2"],
+                       (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda(),)
+            source, _ = wire_rows(x)
+            template = compile_fp8_moe_aot(geometry, route="auto", max_rows=rows, prefill=args.prefill)
+            launch = _Fp8Moe(geometry, "auto", rows, True, args.prefill)
+            blocks = (width + 127) // 128
+            matching = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
+            launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
+                                    max_rows=min(rows, DECODE_MAX_ROWS), warps=matching)
+            program = compile_program(launch, name=template.name + "_unify_control",
+                       operands=template.operands, scalars=template.scalars, key=launch.key(),
+                       geometry={**template.geometry, "screen_down_warps": matching}, scratch=template.scratch)
+            runs, outputs, owned = {}, {}, []
+            controls = ["current", "current-2", "current-3"]
+            for label in controls:
+                scratch = torch.empty(fp8_moe_scratch_bytes(geometry, "auto", rows, prefill=args.prefill),
+                                      dtype=torch.uint8, device="cuda")
+                output = torch.empty_like(x)
+                buffers = (source, ids, routing, *planes, output, scratch)
+                def bind(buffers):
+                    def execute(live):
+                        program.launch(*buffers, scalars=(live,))
+                    return execute
+                execute = bind(buffers)
+                qualify_pair_replay(execute, ids, output, [scratch], buffers, lambda live: output[:live])
+                runs[label] = lambda execute=execute: execute(rows)
+                outputs[label] = output
+                owned.append((buffers, execute))
+            contract = dict(swiglu_limit=0., silu_bf16_product=True,
+                            route_weight_before_fc2=False, round_fc2_bf16=True)
+            for precision in ("a8", "a16"):
+                label = "native-" + precision
+                runs[label], outputs[label], keep = native_pair_arm(
+                    x, ids, routing, weights, scales, 128, True, False, False,
+                    activation_precision=precision, projection_contract=contract,
+                    combine_output=True, ingress="wire", qualify=True)
+                owned.append(keep)
+            for label, run in list(runs.items()):
+                run()
+                if args.graph:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run()
+                    owned.append((run, graph))
+                    runs[label] = graph.replay
+            torch.cuda.synchronize()
+            comparisons = compare_route_outputs(outputs)
+            assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
+            oracle = mxfp4_f32_reference(x, ids, routing, weights, scales)
+            errors = {label: f32_errors(output, oracle) for label, output in outputs.items()}
+            samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
+            medians = {label: statistics.median(values) for label, values in samples.items()}
+            record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows,
+                          ingress="wire", wire_preparation_timed=False,
+                          a16_wire_dequant_timed=True, token_combine_timed=True,
+                          current_down="a8" if rows > auto_large_rows(True, "mxfp4", args.prefill)
+                                       and args.prefill != "w8a16" else "a16",
+                          matching_warps=matching, controls=controls, graph=args.graph,
+                          weight_sha256=weight_hash, samples_us=samples, median_us=medians,
+                          speedup={label: medians["current"] / medians[label] for label in runs},
+                          f32_errors=errors, comparisons=comparisons,
+                          invariant_checks="poison/live/graph/row-mix", slice_width=128)
+            results.append(record)
+            print(json.dumps(record), flush=True)
+            del owned, runs, outputs
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(dict(device=str(properties), results=results), indent=2) + "\n")
+
+
 def mxfp4_tiling_screen(g, args, geometry_type):
     """One development session: choose only quality/invariant-passing exact arms."""
     from b12x.integration.cuteafd.fp8_moe import fp8_moe_scratch_bytes
@@ -1056,7 +934,7 @@ def mxfp4_tiling_screen(g, args, geometry_type):
     l2_bytes = int(properties.L2_cache_size)
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
     explicit = native_screen_arms(args.mxfp4_arm)
-    widths = sorted({arm[1] for arm in explicit}) if explicit else paired_widths(g.intermediate, args.widths, args.engine_policy_root)
+    widths = sorted({arm[1] for arm in explicit}) if explicit else paired_widths(g.intermediate, args.widths)
     if any(width > g.intermediate for width in widths):
         raise ValueError("logical rank width exceeds the model intermediate")
     waves = recorded_waves(args.routes, g) if args.routes else None
@@ -1066,11 +944,10 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                       "waves": len(waves), "family_attested": args.routes.suffix != ".jsonl"}
                      if waves else None)
     results = []
-    experts, route_qualification_eligible = stream_screen_population(g, args)
     for width in widths:
         expert_bytes = 3 * width * g.hidden // 2
-        if experts * expert_bytes <= 2 * l2_bytes:
-            raise ValueError("resident expert payload must exceed twice L2")
+        experts = max(16, (2 * l2_bytes // (16 * expert_bytes) + 1) * 16,
+                      g.experts if waves else 0)
         padded = (width + 127) // 128 * 128
         generator = torch.Generator().manual_seed(args.seed + width)
         weights, scales = {}, {}
@@ -1102,14 +979,14 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                 tiles = (64, 128, 192) if args.native_slices else (mxfp4_decode_partitions(width) if route == "decode" else (None,))
                 specs, controls = tiling_specs(args, width, baseline_tile, tiles)
                 runs, outputs, keepalive, invariants, resident_widths = {}, {}, [], {}, {}
-                for label, exact, tile, stored, splits in specs:
+                for label, exact, tile, stored in specs:
                     try:
                         if args.native_slices:
                             run, output, owned = native_pair_arm(x, ids, routing, weights, scales, tile,
                                                                 exact, False, g.name == "v41", qualify=True,
                                                                 aligned_w2=label.startswith("aligned-w2"),
                                                                 aligned_w2_scales=label == "aligned-w2-scales",
-                                                                stored_width=stored, fc1_k_splits=splits)
+                                                                stored_width=stored)
                         else:
                             stored = width if exact else padded
                             geometry = geometry_type(g.name, g.hidden, experts, topk, g.intermediate,
@@ -1164,20 +1041,18 @@ def mxfp4_tiling_screen(g, args, geometry_type):
                     assert torch.isfinite(output).all() and torch.count_nonzero(output), "invalid tiling output"
                 samples = time_interleaved_samples(runs, args.iters, flush, lambda _: None)
                 comparisons = compare_route_outputs(outputs)
-                assert all(torch.equal(outputs[label], outputs[controls[0]]) for label in controls), "identical controls differ"
+                assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
                 wave = selected_waves.get(rows)
                 record = dict(geometry=g.name, hidden=g.hidden, width=width, padded_width=padded,
                               rows=rows, route=route, experts=experts, topk=topk, graph=args.graph,
                               routing=args.routing, weight_sha256=weight_hash, l2_bytes=l2_bytes,
-                              route_qualification_eligible=route_qualification_eligible,
                               route_fixture=route_fixture,
                               recorded_wave=({key: wave.get(key) for key in ("layer", "lane", "rows")}
                                              if wave else None),
                               route_histogram=sorted(Counter(ids.cpu().flatten().tolist()).items()),
                               resident_payload_bytes=experts * expert_bytes, samples_us=samples,
                               resident_widths=resident_widths,
-                              slice_widths={label: tile for label, _, tile, _, _ in specs if label in runs},
-                              fc1_k_splits={label: splits for label, _, _, _, splits in specs if label in runs},
+                              slice_widths={label: tile for label, _, tile, _ in specs if label in runs},
                               controls=controls,
                               resident_payload_bytes_by_arm={label: experts * g.hidden *
                                   (2 * width + padded if label.startswith("aligned-w2") else
@@ -1201,7 +1076,7 @@ def main() -> None:
 
     if args.native_slices:
         intermediate, hidden = {"v41": (2304, 5120), "dsv4f": (2048, 4096), "dsv4p": (3072, 7168)}[args.geometry]
-        g = Fp8MoeGeometry(args.geometry, hidden, 256 if args.geometry == "dsv4f" else 384, 6, intermediate, weights="mxfp4")
+        g = Fp8MoeGeometry(args.geometry, hidden, 384, 6, intermediate, weights="mxfp4")
     else:
         g = GEOMETRIES[args.geometry].with_tp(args.tp)
     if args.mxfp4_pair:

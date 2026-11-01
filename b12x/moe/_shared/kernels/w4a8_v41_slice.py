@@ -36,6 +36,8 @@ from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32,
     e2m1x2_scaled_bf16,
     div_rn_f32,
+    pack_f32x2_to_bfloat2,
+    bfloat2_to_float2_scaled,
     shared_ptr_to_u32,
     get_ptr_as_int64,
     red_add_global_f32,
@@ -817,8 +819,15 @@ class V41SliceFc1Kernel:
                     value = Float32(0)
                     if row < rows and start + col < self.intermediate:
                         if cutlass.const_expr(self.silu_bf16_product):
+                            # Explicit packing preserves the BF16 store boundary through optimization.
+                            gv, uv = bfloat2_to_float2_scaled(
+                                pack_f32x2_to_bfloat2(gv, uv), Float32(1))
                             silu = div_rn_f32(gv, Float32(1) + cute.math.exp(-gv, fastmath=False))
-                            product = silu.to(cutlass.BFloat16).to(Float32) * uv
+                            silu, _ = bfloat2_to_float2_scaled(
+                                pack_f32x2_to_bfloat2(silu, silu), Float32(1))
+                            product = silu * uv
+                            product, _ = bfloat2_to_float2_scaled(
+                                pack_f32x2_to_bfloat2(product, product), Float32(1))
                         else:
                             sigmoid = cute.arch.rcp_approx(Float32(1) + cute.math.exp(-gv, fastmath=True))
                             product = gv * sigmoid * uv
@@ -1125,7 +1134,8 @@ class V41SliceFc2Kernel:
                             route = route_lo if cutlass.const_expr(elem < 2) else route_hi
                             value = total[nf, elem]
                             if cutlass.const_expr(self.round_fc2_bf16):
-                                value = value.to(cutlass.BFloat16).to(Float32)
+                                value, _ = bfloat2_to_float2_scaled(
+                                    pack_f32x2_to_bfloat2(value, value), Float32(1))
                             if cutlass.const_expr(not self.route_weight_before_fc2):
                                 value *= routing[route_base + Int64(row)]
                             out[route, col] = value
