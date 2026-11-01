@@ -204,9 +204,8 @@ def parse_args(argv=None):
         except ValueError:
             parser.error("FC1 K splits must be comma-separated 1/2/4/8")
         if (not splits or len(set(splits)) != len(splits) or any(value not in (1, 2, 4, 8) for value in splits)
-                or not args.mxfp4_pair or not (args.mxfp4_unify or args.native_slices)
-                or args.profile_dir):
-            parser.error("FC1 K splits require native paired mode without profiling, and unique 1/2/4/8 values")
+                or not args.mxfp4_pair or not (args.mxfp4_unify or args.native_slices)):
+            parser.error("FC1 K splits require native paired mode and unique 1/2/4/8 values")
     if args.continue_on_fail and (not args.check or args.exact_sweep):
         parser.error("--continue-on-fail requires --check and no --exact-sweep")
     if args.exact_baseline and not args.exact_sweep:
@@ -266,13 +265,18 @@ def parse_args(argv=None):
     if args.mxfp4_pair and args.profile_dir:
         allowed = ({"current", "native-a8", "native-a16"} if args.mxfp4_unify
                    else {"native-padded", "native-exact"} if args.native_slices else set())
+        if args.mxfp4_unify and args.fc1_k_splits:
+            allowed |= {f"native-{precision}-t{tile}-k{split}"
+                        for tile, split in fc1_split_tiles(4096 if args.geometry == "mimof" else 6144,
+                                                         map(int, args.fc1_k_splits.split(",")))
+                        for precision in ("a8", "a16")}
         if args.profile_arm not in allowed or args.mxfp4_tilings:
             parser.error("paired profiling requires one --profile-arm from the native or unification screen")
     return args
 
 
 def profile_pair_arm(runs, args, geometry, width, rows):
-    """One warmed launch, externally captured with nsys --capture-range=nvtx."""
+    """One warmed launch: nsys capture range or ncu --nvtx-include mxfp4-pair/."""
     run = runs[args.profile_arm]
     run()
     torch.cuda.synchronize()
@@ -955,6 +959,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 for tile, split in fc1_split_tiles(g.hidden, map(int, args.fc1_k_splits.split(","))):
                     for precision in ("a8", "a16"):
                         variants[f"native-{precision}-t{tile}-k{split}"] = (precision, tile, split)
+            if args.profile_dir:
+                variants = {label: spec for label, spec in variants.items() if label == args.profile_arm}
             for label, (precision, tile, split) in variants.items():
                 try:
                     runs[label], outputs[label], keep = native_pair_arm(
@@ -987,7 +993,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 normalized_rms = error["rms"] / max(matched.square().mean().sqrt().item(), 1e-8)
                 assert normalized_rms < .02, ("native matched oracle", label, normalized_rms)
                 matched_errors[label] = dict(**error, normalized_rms=normalized_rms)
-                baseline = f32_errors(outputs["native-" + precision], matched)
+                baseline = f32_errors(outputs.get("native-" + precision, outputs[label]), matched)
                 eligible[label] = all(error[key] <= baseline[key] for key in ("max_abs", "rms"))
             if args.profile_dir:
                 profile_pair_arm(runs, args, g.name, width, rows)
