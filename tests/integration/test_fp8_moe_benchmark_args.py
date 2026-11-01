@@ -307,7 +307,8 @@ def test_legacy_glm_fixture_is_not_relabelled_for_other_families():
 @pytest.mark.parametrize("tile", [32, 64, 128, 192])
 @pytest.mark.parametrize("logical", [288, 416, 576, 608])
 @pytest.mark.parametrize("atomic", [False, True])
-def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical, atomic):
+@pytest.mark.parametrize("activation_precision", ["a8", "a16"])
+def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical, atomic, activation_precision):
     function = next(node for node in ast.parse(_PATH.read_text()).body
                     if isinstance(node, ast.FunctionDef) and node.name == "native_pair_arm")
     assignment, = [node for node in ast.walk(function) if isinstance(node, ast.Assign)
@@ -315,10 +316,13 @@ def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical
     expression = compile(ast.Expression(assignment.value), str(_PATH), "eval")
     # Run the real allocation expression on CPU; CUDA dataflow is GPU-qualified separately.
     allocator = SimpleNamespace(empty=lambda shape, **kwargs: torch.empty(shape))
+    words_per_route = tile // 2 if activation_precision == "a16" else tile // 4 + tile // 32
     partial = eval(expression, {"__builtins__": {}, "torch": allocator},
-                   dict(logical=logical, width=tile, routes=96, atomic=atomic))
+                   dict(logical=logical, width=tile, routes=96, atomic=atomic,
+                        words_per_route=words_per_route))
+    route_bytes = 2 * tile if activation_precision == "a16" else tile + tile // 8
     assert partial.numel() * 4 == (4 if atomic else
-        ((logical + tile - 1) // tile) * 96 * (tile + tile // 8))
+        ((logical + tile - 1) // tile) * 96 * route_bytes)
 
 
 def test_explicit_rank_extents_and_identical_controls():
