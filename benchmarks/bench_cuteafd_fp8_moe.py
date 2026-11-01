@@ -538,7 +538,7 @@ def native_slice_width(family, rank_width):
 def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, coded, *, qualify=False,
                     aligned_w2=False, aligned_w2_scales=False, stored_width=None,
                     activation_precision="a8", projection_contract=None,
-                    combine_output=False, ingress="wire", fc1_k_splits=1):
+                    combine_output=False, ingress="wire", fc1_k_splits=1, fc1_cta_splits=1):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -584,9 +584,10 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     wire = torch.cat(((groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
                       .view(torch.uint8).reshape(rows, hidden), (exponent + 127).to(torch.uint8)), 1)
     routes = rows * topk
-    words_per_route = width // 2 if activation_precision == "a16" else width // 4 + width // 32
-    partial = torch.empty((1,) if atomic else
-                          ((logical + width - 1) // width, routes, words_per_route), device="cuda")
+    from b12x.moe._shared.kernels.v41_slice_pipeline import fc1_partial_words
+    partial_words = 1 if atomic else fc1_partial_words(
+        rows, width, topk, logical, activation_precision, fc1_cta_splits)
+    partial = torch.empty((partial_words,), device="cuda")
     output = torch.empty(rows * hidden if atomic else (routes, hidden), device="cuda")
     scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
         ((1,), torch.int32), ((experts * routes,), torch.int32), ((experts,), torch.int32),
@@ -602,7 +603,7 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                                 exact_storage=tail or stored_width is not None,
                                 atomic_tokens=atomic, scale_codes=coded,
                                 activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
-                                **(projection_contract or {}))
+                                fc1_cta_splits=fc1_cta_splits, **(projection_contract or {}))
     if stored_width is not None:
         # Physical strides come from P; the launch only visits the real S slices.
         for kernel in (pipeline.fc1, pipeline.fc2, pipeline.reduce):

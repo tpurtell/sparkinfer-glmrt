@@ -54,7 +54,7 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
     import cutlass
     import cutlass.cute as cute
     from b12x._lib.utils import current_cuda_stream
-    from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline
+    from b12x.moe._shared.kernels.v41_slice_pipeline import V41SlicePipeline, fc1_partial_words
     m, h = x.shape
     e, topk = 8, ids.shape[1]
     wire = torch.zeros(m, h+h//32, dtype=torch.uint8, device='cuda')
@@ -63,8 +63,8 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
     wire[:,:h] = (blocks/scale[...,None]).to(torch.float8_e4m3fn).view(torch.uint8).reshape(m,h)
     wire[:,h:] = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
     routes=m*topk
-    words_per_route = width // 2 if activation_precision == "a16" else width // 4 + width // 32
-    partial_words = 1 if atomic else ((n+width-1)//width)*routes*words_per_route
+    partial_words = 1 if atomic else fc1_partial_words(
+        m, width, topk, n, activation_precision, contract.get("fc1_cta_splits", 1))
     partial_storage = torch.full((partial_words+16,), 12345., device='cuda')
     partial = partial_storage[:partial_words]
     output=torch.empty(m*h if atomic else (routes,h),device='cuda',dtype=torch.float32)
@@ -80,6 +80,7 @@ def run_pipeline(x, ids, routing, packed, width, exact, atomic=False, *, n=576, 
     pipeline = V41SlicePipeline(m, width, experts=e, topk=topk, intermediate=n, hidden=h,
                                 exact_storage=exact, atomic_tokens=atomic, scale_codes=coded,
                                 activation_precision=activation_precision, **contract)
+    assert pipeline.partial_words == partial_words
     fn=cute.compile(pipeline,*args,cutlass.Int32(m),current_cuda_stream())
     fn(*args,cutlass.Int32(m),current_cuda_stream())
     torch.cuda.synchronize()
@@ -149,6 +150,38 @@ def test_fc1_k_split_contract(split, tile, precision):
         prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed, tile,
                               True, n=n, fc1_k_splits=split, **contract)
         assert torch.equal(prefix, candidate[:capacity]), "split capacity row invariance"
+
+
+@pytest.mark.parametrize("cta,team", [(2, 1), (4, 1), (8, 1), (2, 2)])
+@pytest.mark.parametrize("precision", ["a8", "a16"])
+def test_fc1_cross_cta_contract(cta, team, precision):
+    require_b12x()
+    from benchmarks.bench_cuteafd_fp8_moe import mxfp4_f32_reference
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.manual_seed(928256)
+    m, e, k, h, n, tile = 80, 8, 8, 4096, 256, 64
+    x = wire_rows((torch.randn(m, h, device="cuda") * .5).bfloat16())[1]
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    packed = pack(weights, scales, False)
+    contract = dict(activation_precision=precision, swiglu_limit=0., silu_bf16_product=True,
+                    route_weight_before_fc2=False, round_fc2_bf16=True,
+                    fc1_k_splits=team, fc1_cta_splits=cta)
+    candidate = run_pipeline(x, ids, routing, packed, tile, False, n=n, **contract)
+    oracle = mxfp4_f32_reference(x, ids, routing, weights, scales, activation_precision=precision)
+    error = candidate - oracle
+    assert torch.isfinite(candidate).all()
+    assert error.square().mean().sqrt() / oracle.square().mean().sqrt() < .02
+    for capacity in (1, 16):
+        prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed,
+                              tile, False, n=n, **contract)
+        assert torch.equal(prefix, candidate[:capacity]), "CTA split capacity row invariance"
 
 
 @pytest.mark.parametrize("h", [4096, 6144])

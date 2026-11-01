@@ -17,6 +17,22 @@ bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
 
 
+@pytest.mark.parametrize("precision", ["a8", "a16"])
+@pytest.mark.parametrize("width", [32, 64, 128, 192])
+@pytest.mark.parametrize("cta", [1, 2, 4, 8])
+def test_cross_cta_scratch_includes_every_raw_projection(precision, width, cta):
+    path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v41_slice_pipeline.py"
+    tree = ast.parse(path.read_text())
+    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "fc1_partial_words")
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])), str(path), "exec"), namespace)
+    compact = width // 2 if precision == "a16" else width // 4 + width // 32
+    planes = (288 + width - 1) // width
+    expected = planes * 80 * 8 * (compact + (2 * width * cta if cta > 1 else 0))
+    assert namespace["fc1_partial_words"](80, width, 8, 288, precision, cta) == expected
+
+
 def test_native_oai_geometry_and_cache_keys():
     from dataclasses import replace
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, GEOMETRIES, _StreamNvfp4A4Route
