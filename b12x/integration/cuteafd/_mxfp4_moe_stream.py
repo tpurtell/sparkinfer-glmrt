@@ -38,6 +38,9 @@ from cutlass.utils import LayoutEnum
 
 from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32,
+    bfloat2_to_float2_scaled,
+    fmin_f32,
+    fmax_f32,
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     e2m1x8_to_qmma_e2m1x8,
@@ -104,7 +107,10 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     w_k = 256
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False,
-                 act_mxfp8: bool = False, wire: bool = True, row_addresses: bool = False):
+                 act_mxfp8: bool = False, wire: bool = True, row_addresses: bool = False,
+                 silu_bf16_product: bool = True, route_weight_before_fc2: bool = False):
+        self.silu_bf16_product = bool(silu_bf16_product)
+        self.route_weight_before_fc2 = bool(route_weight_before_fc2)
         super().__init__(inter=inter, hidden=hidden, experts=experts, limit=limit, row_addresses=row_addresses)
         # qmma: block-scaled E4M3 x E2M1 MMAs (m16n8k32, UE8M0 per 32 on both
         # operands) read the wire rows and the packed weights as they are.
@@ -133,6 +139,8 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     def key(self) -> tuple:
         key = ("stream_gate_up_mxfp4", 1, self.inter, self.hidden, self.experts, self.limit, self.a_ring,
                self.w_ring, self.qmma, self.wire) + (("row_addresses",) if self.row_addresses else ())
+        if not self.silu_bf16_product or self.route_weight_before_fc2:
+            key += (("semantic_contract", self.silu_bf16_product, self.route_weight_before_fc2),)
         return key + (("act_mxfp8", self.act_row_bytes),) if self.act_mxfp8 else key
 
     def _storage(self, w_layout):
@@ -151,7 +159,9 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     @cute.jit
     def __call__(self, x: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer,
                  s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer, act: cute.Pointer, max_tiles: Int32,
-                 stream: cuda.CUstream):
+                 stream: cuda.CUstream, grouped_routing: cute.Pointer = None):
+        if cutlass.const_expr(grouped_routing is None):
+            grouped_routing = x
         w_layout = self._w_layout()
         rows_w = self.experts * self.inter
         box = cute.slice_(w_layout, (None, None, 0))
@@ -162,7 +172,7 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
             cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w3, rows_w, self.hidden // 2), box,
             (self.cols, self.k_step), num_multicast=1)
         self.kernel(x, pair_row, meta, tma_tensor_g, tma_tensor_u, s1, s3, act, tma_g, tma_u, w_layout,
-                    self._storage(w_layout)).launch(
+                    self._storage(w_layout), grouped_routing).launch(
             grid=(self.inter // self.cols, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
             min_blocks_per_mp=1)
 
@@ -170,7 +180,7 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     def kernel(self, x: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, weight_g: cute.Tensor,
                weight_u: cute.Tensor, s1: cute.Pointer, s3: cute.Pointer, act: cute.Pointer,
                tma_g: cute.CopyAtom, tma_u: cute.CopyAtom, w_layout: cute.ComposedLayout,
-               Storage: cutlass.Constexpr):
+               Storage: cutlass.Constexpr, grouped_routing: cute.Pointer):
         n_blk = Int32(cute.arch.block_idx()[0])
         tile = Int32(cute.arch.block_idx()[1])
         smem = cutlass_utils.SmemAllocator()
@@ -426,8 +436,8 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                 fg = 4 * (4 * mt + nt) + 2 * half
                                 fu = 4 * (4 * mt + nt + 2) + 2 * half
                                 col = n0 + warp_n * Int32(16) + Int32(8 * nt) + Int32(2) * j
-                                v0 = _swiglu(acc[fg], acc[fu], self.limit)
-                                v1 = _swiglu(acc[fg + 1], acc[fu + 1], self.limit)
+                                v0 = self.activation(acc[fg], acc[fu], grouped_routing, first + row)
+                                v1 = self.activation(acc[fg + 1], acc[fu + 1], grouped_routing, first + row)
                                 if cutlass.const_expr(self.act_mxfp8):
                                     st_shared_u32(sa + row * Int32(self.act_stride) + (col - n0) * Int32(2),
                                                   pack_f32x2_to_bfloat2(v0, v1))
@@ -454,6 +464,21 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
                                          payload[4 * half], payload[4 * half + 1],
                                          payload[4 * half + 2], payload[4 * half + 3])
                     st_global_u8(at + Int64(i) + Int64(n0 // Int32(32)), cutlass.Uint8(scale))
+
+    @cute.jit
+    def activation(self, gate, up, grouped_routing, row):
+        if cutlass.const_expr(self.silu_bf16_product):
+            value = _swiglu(gate, up, self.limit)
+        else:
+            gate, up = bfloat2_to_float2_scaled(pack_f32x2_to_bfloat2(gate, up), Float32(1))
+            if cutlass.const_expr(self.limit > 0):
+                gate = fmin_f32(gate, Float32(self.limit))
+                up = fmax_f32(Float32(-self.limit), fmin_f32(up, Float32(self.limit)))
+            value = gate * cute.arch.rcp_approx(Float32(1) + cute.math.exp(-gate, fastmath=True)) * up
+        if cutlass.const_expr(self.route_weight_before_fc2):
+            value *= cute.make_ptr(Float32, Int64(grouped_routing.toint()), cute.AddressSpace.gmem,
+                                   assumed_align=4)[row]
+        return value
 
     @cute.jit
     def _load_a(self, step, sa, ss, src, s_src, ch, r_base, tidx):

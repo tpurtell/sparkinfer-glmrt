@@ -250,6 +250,31 @@ def test_row_major_a8_decode_contract(h, n, k, v4):
         assert torch.equal(prefix, candidate[:capacity * k if v4 else capacity])
 
 
+@pytest.mark.parametrize("n", [384, 576])
+def test_v4_stream_semantic_contract(n):
+    require_b12x()
+    from benchmarks.bench_cuteafd_fp8_moe import v4_stream_pair_arm, mxfp4_f32_reference
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.manual_seed(928500 + n)
+    m, e, h, k = 256, 8, 5120, 6
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    run, output, keep = v4_stream_pair_arm(x, ids, routing, weights, scales, qualify=True)
+    run()
+    routes = mxfp4_f32_reference(x, ids, routing, weights, scales, limit=10., native=True).reshape(m, k, h)
+    oracle = torch.zeros_like(x, dtype=torch.float32)
+    for slot in range(k):
+        oracle += routes[:, slot]
+    error = (output.float() - oracle).square().mean().sqrt() / oracle.square().mean().sqrt()
+    assert error < .02
+
+
 @pytest.mark.parametrize("h", [4096, 6144])
 @pytest.mark.parametrize("n", MIMO_WIDTHS)
 @pytest.mark.parametrize("activation_precision", ["a8", "a16"])

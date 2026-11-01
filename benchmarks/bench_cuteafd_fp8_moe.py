@@ -196,6 +196,8 @@ def parse_args(argv=None):
                         help="development A16 native register-streaming decode arm")
     parser.add_argument("--row-major-a8", action="store_true",
                         help="benchmark-only fixed-path ordered row-major A8 decode")
+    parser.add_argument("--v4-stream", action="store_true",
+                        help="benchmark-only V4 semantic contract on STREAM prefill")
     parser.add_argument("--fc1-k-splits", help="development paired native K-team counts, comma-separated 1/2/4/8")
     parser.add_argument("--fc1-cta-splits", help="development MiMo unification CTA splits, comma-separated 1/2/4/8")
     parser.add_argument("--control-repeats", type=int, default=2,
@@ -247,9 +249,12 @@ def parse_args(argv=None):
     if args.compare_routes_exact and (args.exact_sweep or len(args.route.split(",")) < 2):
         parser.error("--compare-routes-exact requires at least two timing routes and no --exact-sweep")
     if args.mxfp4_unify and (not args.mxfp4_pair or args.native_slices or args.mxfp4_tilings
-                             or args.geometry not in ("mimof", "mimop") or args.routes
+                             or args.geometry not in ("mimof", "mimop", "v41") or args.routes
+                             or (args.geometry == "v41" and not (args.row_major_a8 or args.v4_stream))
                              or args.capacity is not None):
         parser.error("--mxfp4-unify requires MiMo paired mode without other screens or fixed capacity")
+    if args.v4_stream and (not args.mxfp4_unify or args.geometry != "v41" or min(rows) <= 80):
+        parser.error("--v4-stream requires unified V4.1 prefill capacities >80")
     if args.row_major_a8 and (not args.mxfp4_unify or max(rows) > 80):
         parser.error("--row-major-a8 requires the unified decode screen at capacities <=80")
     if args.native_slices and not args.mxfp4_pair:
@@ -948,6 +953,43 @@ def mxfp4_pair_screen(g, args):
                                                torch=torch.__version__, results=results), indent=2) + "\n")
 
 
+def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True):
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from b12x._lib.utils import current_cuda_stream
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry
+    from b12x.integration.cuteafd._fp8_moe_kernels import meta_words
+    from b12x.integration.cuteafd._fp8_moe_stream import stream_max_tiles
+    from b12x.integration.cuteafd._mxfp4_down_a8_plan import mxfp8_down_row_bytes
+    from b12x.moe._shared.kernels.mxfp4_stream_contract import V4StreamContract
+    from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+    rows, hidden = x.shape
+    experts, width = weights["w1"].shape[:2]
+    topk = ids.shape[1]
+    geometry = Fp8MoeGeometry("v41", hidden, experts, topk, width, weights="mxfp4", swiglu_limit=10.)
+    source, _ = wire_rows(x)
+    planes = [t.cuda() for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"], weights["w2"])]
+    planes.append(torch.nn.functional.pad(scales["w2"], (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda())
+    pairs, tiles = rows * topk, stream_max_tiles(experts, rows * topk)
+    output = torch.empty_like(x)
+    scratch = [torch.empty(shape, dtype=dtype, device="cuda") for shape, dtype in (
+        ((meta_words(experts, tiles),), torch.int32), ((pairs,), torch.int32), ((pairs,), torch.int32),
+        ((tiles * 128 * mxfp8_down_row_bytes(width),), torch.uint8),
+        ((pairs, hidden), torch.float32), ((pairs,), torch.float32))]
+    tensors = [source, ids.flatten(), routing.flatten(), *planes, output, *scratch]
+    views = [from_dlpack(t, assumed_align=16) for t in tensors]
+    pointers = [t.iterator for t in views]
+    launch = cute.compile(V4StreamContract(geometry, rows), *pointers,
+                          cutlass.Int32(rows), current_cuda_stream())
+    def execute(live):
+        launch(*pointers, cutlass.Int32(live), current_cuda_stream())
+    if qualify:
+        qualify_pair_replay(execute, ids, output, scratch, tensors, lambda live: output[:live])
+    def run(): execute(rows)
+    return run, output, (tensors, views, launch, execute)
+
+
 def mxfp4_unify_screen(g, args, geometry_type):
     """Compare complete native wire-input arms to the installed mixed generic math."""
     from b12x.moe._shared.kernels.v41_slice_pipeline import fc1_partial_words
@@ -983,6 +1025,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 ids.copy_(ids[:1].expand_as(ids))
             routing = torch.rand(rows, g.top_k, device="cuda")
             routing /= routing.sum(-1, keepdim=True)
+            v4 = g.name == "v41"
+            contract = dict(swiglu_limit=10. if v4 else 0., silu_bf16_product=not v4,
+                            route_weight_before_fc2=v4, round_fc2_bf16=not v4)
             geometry = geometry_type(g.name, g.hidden, experts, g.top_k, g.intermediate,
                                      weights="mxfp4", rank_width=width)
             planes = tuple(t.cuda() for t in (weights["w1"], scales["w1"], weights["w3"], scales["w3"], weights["w2"]))
@@ -990,11 +1035,12 @@ def mxfp4_unify_screen(g, args, geometry_type):
                        (0, (width // 32 + 3) // 4 * 4 - width // 32)).cuda(),)
             source, _ = wire_rows(x)
             control_route = "stream" if rows > 80 else "auto"
-            template = compile_fp8_moe_aot(geometry, route=control_route, max_rows=rows, prefill=args.prefill)
+            template = (None if v4 else compile_fp8_moe_aot(
+                geometry, route=control_route, max_rows=rows, prefill=args.prefill))
             blocks = (width + 127) // 128
             matching = 4 if blocks % 4 == 0 else max(d for d in range(1, 9) if blocks % d == 0)
             program = template
-            if control_route != "stream":
+            if not v4 and control_route != "stream":
                 launch = _Fp8Moe(geometry, control_route, rows, True, args.prefill)
                 launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
                                         max_rows=min(rows, DECODE_MAX_ROWS), warps=matching)
@@ -1005,6 +1051,16 @@ def mxfp4_unify_screen(g, args, geometry_type):
             control_qualification = {}
             controls = ["current", "current-2", "current-3"]
             for label in controls:
+                if v4:
+                    # Shipped legacy prefill; decode retains its per-width tile.
+                    tile = 128 if rows <= 80 and width == 576 else 192
+                    runs[label], outputs[label], keep = native_pair_arm(
+                        x, ids, routing, weights, scales, tile, rows <= 80 and width == 576, False, True,
+                        projection_contract=contract, combine_output=True, qualify=True)
+                    owned.append(keep)
+                    control_qualification[label] = dict(deterministic=True, row_invariant=True,
+                                                       prefix_failures=[], graph_reuse=True)
+                    continue
                 scratch = torch.empty(fp8_moe_scratch_bytes(geometry, control_route, rows, prefill=args.prefill),
                                       dtype=torch.uint8, device="cuda")
                 output = torch.empty_like(x)
@@ -1020,9 +1076,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 runs[label] = lambda execute=execute: execute(rows)
                 outputs[label] = output
                 owned.append((buffers, execute))
-            contract = dict(swiglu_limit=0., silu_bf16_product=True,
-                            route_weight_before_fc2=False, round_fc2_bf16=True)
-            variants = {"native-" + precision: (precision, 128, 1, 1) for precision in ("a8", "a16")}
+            variants = ({"native-a8-t128-k2": ("a8", 128, 2, 1)} if v4 and rows <= 80 else
+                        {} if v4 else
+                        {"native-" + precision: (precision, 128, 1, 1) for precision in ("a8", "a16")})
             if args.fc1_k_splits:
                 for tile, split in fc1_split_tiles(g.hidden, map(int, args.fc1_k_splits.split(","))):
                     for precision in ("a8", "a16"):
@@ -1038,12 +1094,16 @@ def mxfp4_unify_screen(g, args, geometry_type):
             for label, (precision, tile, split, cta) in variants.items():
                 try:
                     runs[label], outputs[label], keep = native_pair_arm(
-                        x, ids, routing, weights, scales, tile, True, False, False,
+                        x, ids, routing, weights, scales, tile, not v4, False, v4,
                         activation_precision=precision, projection_contract=contract,
                         combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split,
                         fc1_cta_splits=cta)
                 except AssertionError as error:
                     raise AssertionError(f"native {label}, rows={rows}, width={width}: {error}") from error
+                owned.append(keep)
+            if args.v4_stream:
+                runs["row-major-stream-a8"], outputs["row-major-stream-a8"], keep = v4_stream_pair_arm(
+                    x, ids, routing, weights, scales)
                 owned.append(keep)
             if args.stream_decode:
                 label = "native-stream-a16"
@@ -1070,17 +1130,27 @@ def mxfp4_unify_screen(g, args, geometry_type):
             torch.cuda.synchronize()
             comparisons = compare_route_outputs(outputs)
             assert all(comparisons[label]["bitwise_equal"] for label in controls), "identical controls differ"
-            oracle = mxfp4_f32_reference(x, ids, routing, weights, scales)
+            def reference(precision=None):
+                value = mxfp4_f32_reference(x, ids, routing, weights, scales,
+                    limit=10. if v4 else 0., native=v4, activation_precision=precision)
+                if v4:
+                    routes = value.reshape(rows, g.top_k, g.hidden)
+                    value = torch.zeros_like(x, dtype=torch.float32)
+                    for slot in range(g.top_k):
+                        value += routes[:, slot]
+                return value
+            oracle = reference()
             errors = {label: f32_errors(output, oracle) for label, output in outputs.items()}
             matched_errors = {}
-            references = {"a16": oracle, "a8": mxfp4_f32_reference(
-                x, ids, routing, weights, scales, activation_precision="a8")}
+            references = {"a16": oracle, "a8": reference("a8")}
             eligible = {}
             quality_precisions = {label: spec[0] for label, spec in variants.items()}
             if args.stream_decode:
                 quality_precisions["native-stream-a16"] = "a16"
             if args.row_major_a8:
                 quality_precisions["row-major-a8"] = "a8"
+            if args.v4_stream:
+                quality_precisions["row-major-stream-a8"] = "a8"
             for label, precision in quality_precisions.items():
                 matched = references[precision]
                 error = f32_errors(outputs[label], matched)
@@ -1097,9 +1167,12 @@ def mxfp4_unify_screen(g, args, geometry_type):
             record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows,
                           ingress="wire", wire_preparation_timed=False,
                           a16_wire_dequant_timed=True, token_combine_timed=True,
-                          control_route=control_route, control_qualification=control_qualification,
-                          current_down="a8" if control_route == "stream"
-                                       and args.prefill != "w8a16" else "a16",
+                          control_route="native-legacy" if v4 else control_route,
+                          control_tile=(128 if rows <= 80 and width == 576 else 192) if v4 else None,
+                          control_storage=("exact" if rows <= 80 and width == 576 else "legacy") if v4 else None,
+                          projection_contract=contract, control_qualification=control_qualification,
+                          current_down="a8" if v4 or (control_route == "stream"
+                                       and args.prefill != "w8a16") else "a16",
                           matching_warps=matching, controls=controls, graph=args.graph,
                           weight_sha256=weight_hash, samples_us=samples, median_us=medians,
                           speedup={label: medians["current"] / medians[label] for label in runs},

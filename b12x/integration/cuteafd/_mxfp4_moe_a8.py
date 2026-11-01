@@ -18,14 +18,16 @@ from ._mxfp4_down_a8_plan import Mxfp4DownA8Plan, mxfp4_scale_row_bytes
 
 
 class StreamMxfp4DownA8:
-    def __init__(self, *, hidden: int, inter: int, experts: int):
+    def __init__(self, *, hidden: int, inter: int, experts: int, round_output_bf16: bool = True):
+        self.round_output_bf16 = bool(round_output_bf16)
         self.plan = Mxfp4DownA8Plan(int(hidden), int(inter), int(experts))
         self.hidden, self.inter, self.experts = self.plan.hidden, self.plan.inter, self.plan.experts
         self.blocks = (self.inter + self.plan.k_block - 1) // self.plan.k_block
         self.scale_row_bytes = mxfp4_scale_row_bytes(self.inter)
 
     def key(self) -> tuple:
-        return ("stream_down_mxfp4_a8", 2, self.hidden, self.inter, self.experts)
+        key = ("stream_down_mxfp4_a8", 2, self.hidden, self.inter, self.experts)
+        return key if self.round_output_bf16 else key + (("f32_output",),)
 
     def _storage(self):
         class Storage:
@@ -163,6 +165,20 @@ class StreamMxfp4DownA8:
                 cute.arch.sync_threads()
                 if block + Int32(2) < Int32(self.blocks):
                     self._load(block + Int32(2), ring, a_rows, w_rows, s_rows, tidx)
+            if const_expr(not self.round_output_bf16):
+                if active:
+                    output = cute.make_ptr(Float32, Int64(y.toint()), cute.AddressSpace.gmem, assumed_align=4)
+                    for mt in cutlass.range_constexpr(2):
+                        for half in cutlass.range_constexpr(2):
+                            row = warp_m * Int32(32) + Int32(16 * mt + 8 * half) + g
+                            if row < live:
+                                for nt in cutlass.range_constexpr(8):
+                                    f = 4 * (8 * mt + nt) + 2 * half
+                                    col = n0 + warp_n * Int32(64) + Int32(8 * nt) + Int32(2) * j
+                                    offset = (Int64(first) + Int64(row)) * self.hidden + Int64(col)
+                                    output[offset] = acc[f]
+                                    output[offset + 1] = acc[f + 1]
+                return
             if active:
                 for mt in cutlass.range_constexpr(2):
                     for half in cutlass.range_constexpr(2):

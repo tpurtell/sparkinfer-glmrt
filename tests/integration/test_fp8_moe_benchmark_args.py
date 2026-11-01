@@ -412,11 +412,11 @@ def test_prefill_unify_controls_are_fixed_stream_and_record_prefix_failures():
     text = ast.unparse(function)
     assert "control_route = 'stream' if rows > 80 else 'auto'" in text
     assert "strict_prefix=rows <= 80" in text
-    assert "if control_route != 'stream':" in text
+    assert "if not v4 and control_route != 'stream':" in text
     assert "fp8_moe_scratch_bytes(geometry, control_route, rows, prefill=args.prefill)" in text
     assert "program = template" in text
     override = next(n for n in ast.walk(function) if isinstance(n, ast.If)
-                    and ast.unparse(n.test) == "control_route != 'stream'")
+                    and ast.unparse(n.test) == "not v4 and control_route != 'stream'")
     # Stream must retain the public compiler's A8-down selection and scratch ABI.
     assert "launch = _Fp8Moe(" in ast.unparse(override)
     assert "program = compile_program(" in ast.unparse(override)
@@ -441,6 +441,27 @@ def test_row_major_a8_is_benchmark_only_and_uses_raw_scratch():
     with pytest.raises(SystemExit):
         bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
                           "--row-major-a8", "--rows", "256"])
+
+
+@pytest.mark.parametrize("flag,rows", [("--row-major-a8", "1,16,80"), ("--v4-stream", "256,1024,4096")])
+def test_v4_contract_benchmarks_are_explicit(flag, rows):
+    args = bench.parse_args(["--geometry", "v41", "--mxfp4-pair", "--mxfp4-unify", flag, "--rows", rows])
+    assert args.geometry == "v41"
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--geometry", "v41", "--mxfp4-pair", "--mxfp4-unify", "--rows", rows])
+    other_rows = "256" if flag == "--row-major-a8" else "80"
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--geometry", "v41", "--mxfp4-pair", "--mxfp4-unify", flag, "--rows", other_rows])
+
+
+def test_v4_stream_adapter_has_ordered_f32_output_and_weight_before_fc2():
+    path = _PATH.parents[1] / "b12x/moe/_shared/kernels/mxfp4_stream_contract.py"
+    text = path.read_text()
+    assert "self.gate_up.route_weight_before_fc2 = True" in text
+    assert "self.gate_up.silu_bf16_product = False" in text
+    assert "self.down.round_output_bf16 = False" in text
+    assert "fadd_rn_f32(value, down[" in text
+    assert "atomic" not in text
 
 
 def test_stream_decode_cli_contract():
