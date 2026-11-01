@@ -15,12 +15,16 @@ from b12x._lib.intrinsics import (
 from ._fp8_moe_kernels import _i32_at
 from ._fp8_moe_stream import STREAM_TILE_M, _chunk
 from ._mxfp4_down_a8_plan import Mxfp4DownA8Plan, mxfp4_scale_row_bytes
+from b12x.moe._shared.kernels.w4a8_staging import scale_code_word
 
 
 class StreamMxfp4DownA8:
     def __init__(self, *, hidden: int, inter: int, experts: int, round_output_bf16: bool = True,
-                 native_resident: bool = False, native_exact: bool = False):
+                 native_resident: bool = False, native_exact: bool = False, scale_codes: bool = False):
         self.native_resident, self.native_exact = bool(native_resident), bool(native_exact)
+        self.scale_codes = bool(scale_codes)
+        if self.scale_codes and not self.native_resident:
+            raise ValueError("compact scale codes require native resident weights")
         self.round_output_bf16 = bool(round_output_bf16)
         self.plan = Mxfp4DownA8Plan(int(hidden), int(inter), int(experts))
         self.hidden, self.inter, self.experts = self.plan.hidden, self.plan.inter, self.plan.experts
@@ -28,7 +32,8 @@ class StreamMxfp4DownA8:
         self.scale_row_bytes = mxfp4_scale_row_bytes(self.inter)
 
     def key(self) -> tuple:
-        key = ("stream_down_mxfp4_a8", 2, self.hidden, self.inter, self.experts)
+        key = ("stream_down_mxfp4_a8", 2, self.hidden, self.inter, self.experts,
+               self.native_resident, self.native_exact, self.scale_codes)
         return key if self.round_output_bf16 else key + (("f32_output",),)
 
     def _storage(self):
@@ -104,22 +109,30 @@ class StreamMxfp4DownA8:
                 stored = self.inter if const_expr(self.native_exact) else (self.inter + 127) // 128 * 128
                 base = s_rows - (Int64(expert) * self.hidden + n0) * self.scale_row_bytes
                 row = n0 + tidx
-                packed = Uint32(0)
-                for j in cutlass.range_constexpr(4):
-                    k = Int32(block) * 4 + Int32(j)
-                    if k < self.inter // 32:
-                        if const_expr(self.native_exact):
-                            columns = self.inter // 32
-                            count = Int32(4)
-                            if const_expr(self.inter % 128 != 0):
-                                if k // 4 == self.inter // 128:
-                                    count = Int32(columns % 4)
-                            offset = Int64(expert * self.hidden * columns + (row // 128) * 128 * columns + (k // 4) * 512 + (row % 128) * count + k % 4)
-                        else:
-                            columns = stored // 32
-                            offset = Int64(expert * self.hidden * columns + ((row // 256) * (columns // 4) + k // 4) * 1024 + (row % 256) * 4 + k % 4)
-                        ptr = cute.make_ptr(cutlass.Uint8, base + offset, cute.AddressSpace.gmem, assumed_align=1)
-                        packed |= Uint32(ptr[0]) << Uint32(j * 8)
+                if const_expr(self.scale_codes):
+                    tiles = (self.inter // 32 + 3) // 4
+                    scale_ptr = cute.make_ptr(cutlass.Uint8, base, cute.AddressSpace.gmem, assumed_align=1)
+                    scales = cute.make_tensor(scale_ptr, cute.make_layout(
+                        (self.experts * self.hidden * (2 * tiles + 1),)))
+                    packed = scale_code_word(scales, Int64(expert), Int64(row), Int64(block),
+                                             self.hidden, self.inter // 32)
+                else:
+                    packed = Uint32(0)
+                    for j in cutlass.range_constexpr(4):
+                        k = Int32(block) * 4 + Int32(j)
+                        if k < self.inter // 32:
+                            if const_expr(self.native_exact):
+                                columns = self.inter // 32
+                                count = Int32(4)
+                                if const_expr(self.inter % 128 != 0):
+                                    if k // 4 == self.inter // 128:
+                                        count = Int32(columns % 4)
+                                offset = Int64(expert * self.hidden * columns + (row // 128) * 128 * columns + (k // 4) * 512 + (row % 128) * count + k % 4)
+                            else:
+                                columns = stored // 32
+                                offset = Int64(expert * self.hidden * columns + ((row // 256) * (columns // 4) + k // 4) * 1024 + (row % 256) * 4 + k % 4)
+                            ptr = cute.make_ptr(cutlass.Uint8, base + offset, cute.AddressSpace.gmem, assumed_align=1)
+                            packed |= Uint32(ptr[0]) << Uint32(j * 8)
                 st_shared_u32(at + Int32(p.s_bytes), packed)
             else:
                 cp_async_u32_shared_global(at + Int32(p.s_bytes),

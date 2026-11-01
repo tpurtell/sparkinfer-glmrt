@@ -65,6 +65,7 @@ from ._fp8_weights import _e4m3x4_scaled_bf16x2x2
 from ._mxfp4_moe_kernels import e2m1x8_scaled_bf16, ue8m0_bf16x2
 from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
+from b12x.moe._shared.kernels.w4a8_staging import scale_code_word
 
 __all__ = ["StreamMxfp4Down", "StreamMxfp4GateUp"]
 
@@ -109,8 +110,11 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, qmma: bool = False,
                  act_mxfp8: bool = False, wire: bool = True, row_addresses: bool = False,
                  silu_bf16_product: bool = True, route_weight_before_fc2: bool = False,
-                 native_resident: bool = False, native_exact: bool = False):
+                 native_resident: bool = False, native_exact: bool = False, scale_codes: bool = False):
         self.native_resident, self.native_exact = bool(native_resident), bool(native_exact)
+        self.scale_codes = bool(scale_codes)
+        if self.scale_codes and not self.native_resident:
+            raise ValueError("compact scale codes require native resident weights")
         self.silu_bf16_product = bool(silu_bf16_product)
         self.route_weight_before_fc2 = bool(route_weight_before_fc2)
         super().__init__(inter=inter, hidden=hidden, experts=experts, limit=limit, row_addresses=row_addresses)
@@ -140,7 +144,8 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
 
     def key(self) -> tuple:
         key = ("stream_gate_up_mxfp4", 1, self.inter, self.hidden, self.experts, self.limit, self.a_ring,
-               self.w_ring, self.qmma, self.wire) + (("row_addresses",) if self.row_addresses else ())
+               self.w_ring, self.qmma, self.wire, self.native_resident, self.native_exact,
+               self.scale_codes) + (("row_addresses",) if self.row_addresses else ())
         if not self.silu_bf16_product or self.route_weight_before_fc2:
             key += (("semantic_contract", self.silu_bf16_product, self.route_weight_before_fc2),)
         return key + (("act_mxfp8", self.act_row_bytes),) if self.act_mxfp8 else key
@@ -529,32 +534,49 @@ class StreamMxfp4GateUp(StreamFp8GateUp):
     @cute.jit
     def load_native_scales(self, gate, up, shared, expert, n0, thread):
         stored = self.inter if cutlass.const_expr(self.native_exact) else (self.inter + 127) // 128 * 128
-        for q in cutlass.range_constexpr((2 * self.cols * self.scale_cols + self.threads - 1) // self.threads):
-            index = thread + Int32(q * self.threads)
-            if index < 2 * self.cols * self.scale_cols:
-                row, k = index // self.scale_cols, index % self.scale_cols
-                projection, local = row // self.cols, row % self.cols
-                n = n0 + local
-                source = gate
-                if projection != 0:
-                    source = up
-                # Both pointers name the full native up-then-gate plane.
-                half = Int32(1) - projection
-                if cutlass.const_expr(self.native_exact):
-                    tile = n // 128
-                    count = Int32(128)
-                    if cutlass.const_expr(self.inter % 128 != 0):
-                        if tile == self.inter // 128:
-                            count = Int32(self.inter % 128)
-                    at = (Int64(expert * 2 * stored * self.scale_cols + half * stored * self.scale_cols)
-                          + Int64(tile * 128 * self.scale_cols + (k // 4) * count * 4 + (n % 128) * 4 + k % 4))
-                else:
-                    n += half * stored
-                    at = (Int64(expert * 2 * stored * self.scale_cols)
-                          + Int64(((n // 256) * (self.scale_cols // 4) + k // 4) * 1024 + n % 256 * 4 + k % 4))
-                source_byte = cute.make_ptr(cutlass.Uint8, Int64(source.toint()) + at, cute.AddressSpace.gmem, assumed_align=1)
-                target = cute.make_ptr(cutlass.Uint8, Int64(shared) + Int64(row * self.sc_stride + k), cute.AddressSpace.smem, assumed_align=1)
-                target[0] = source_byte[0]
+        if cutlass.const_expr(self.scale_codes):
+            words = self.scale_cols // 4
+            for q in cutlass.range_constexpr((2 * self.cols * words + self.threads - 1) // self.threads):
+                index = thread + Int32(q * self.threads)
+                if index < 2 * self.cols * words:
+                    row, tile = index // words, index % words
+                    projection, local = row // self.cols, row % self.cols
+                    source = gate
+                    if projection != 0:
+                        source = up
+                    scales = cute.make_tensor(source, cute.make_layout(
+                        (self.experts * 2 * stored * (2 * words + 1),)))
+                    packed = scale_code_word(scales, Int64(expert),
+                        Int64(n0 + local + (1 - projection) * stored), Int64(tile),
+                        2 * stored, self.scale_cols)
+                    st_shared_u32(shared + row * self.sc_stride + tile * 4, packed)
+        else:
+            for q in cutlass.range_constexpr((2 * self.cols * self.scale_cols + self.threads - 1) // self.threads):
+                index = thread + Int32(q * self.threads)
+                if index < 2 * self.cols * self.scale_cols:
+                    row, k = index // self.scale_cols, index % self.scale_cols
+                    projection, local = row // self.cols, row % self.cols
+                    n = n0 + local
+                    source = gate
+                    if projection != 0:
+                        source = up
+                    # Both pointers name the full native up-then-gate plane.
+                    half = Int32(1) - projection
+                    if cutlass.const_expr(self.native_exact):
+                        tile = n // 128
+                        count = Int32(128)
+                        if cutlass.const_expr(self.inter % 128 != 0):
+                            if tile == self.inter // 128:
+                                count = Int32(self.inter % 128)
+                        at = (Int64(expert * 2 * stored * self.scale_cols + half * stored * self.scale_cols)
+                              + Int64(tile * 128 * self.scale_cols + (k // 4) * count * 4 + (n % 128) * 4 + k % 4))
+                    else:
+                        n += half * stored
+                        at = (Int64(expert * 2 * stored * self.scale_cols)
+                              + Int64(((n // 256) * (self.scale_cols // 4) + k // 4) * 1024 + n % 256 * 4 + k % 4))
+                    source_byte = cute.make_ptr(cutlass.Uint8, Int64(source.toint()) + at, cute.AddressSpace.gmem, assumed_align=1)
+                    target = cute.make_ptr(cutlass.Uint8, Int64(shared) + Int64(row * self.sc_stride + k), cute.AddressSpace.smem, assumed_align=1)
+                    target[0] = source_byte[0]
 
     @cute.jit
     def activation(self, gate, up, grouped_routing, row):

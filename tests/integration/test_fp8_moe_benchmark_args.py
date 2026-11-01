@@ -704,3 +704,28 @@ def test_atomic_controls_do_not_claim_determinism():
     native = ast.unparse(funcs["native_pair_arm"])
     assert "1 if atomic else topk" in native
     assert "qualify_atomic_pair_replay if atomic else qualify_pair_replay" in native
+
+
+def test_native_stream_decodes_resident_scale_codes_without_a_second_plane():
+    root = _PATH.parents[1]
+    for name, cls in (("_mxfp4_moe_stream.py", "StreamMxfp4GateUp"),
+                      ("_mxfp4_moe_a8.py", "StreamMxfp4DownA8")):
+        tree = ast.parse((root / "b12x/integration/cuteafd" / name).read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
+        methods = {n.name: n for n in node.body if isinstance(n, ast.FunctionDef)}
+        key = ast.unparse(methods["key"])
+        assert all(field in key for field in ("self.native_resident", "self.native_exact", "self.scale_codes"))
+        staging = methods["load_native_scales"] if cls == "StreamMxfp4GateUp" else methods["_load"]
+        assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                   and n.func.id == "scale_code_word" for n in ast.walk(staging))
+        assert "self.scale_codes" in ast.unparse(staging)
+    benchmark = ast.parse(_PATH.read_text())
+    arm = next(n for n in benchmark.body if isinstance(n, ast.FunctionDef)
+               and n.name == "v4_stream_pair_arm")
+    source = ast.unparse(arm)
+    assert 'pack_scale_codes' in source
+    assert 'unpack_scale_codes' not in source
+    assert 'scale_codes=scale_codes' in source
+    screen = next(n for n in benchmark.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "mxfp4_unify_screen")
+    assert "scale_codes=bool(recipe and recipe['coded'])" in ast.unparse(screen)

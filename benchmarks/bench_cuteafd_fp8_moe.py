@@ -1035,7 +1035,7 @@ def mxfp4_pair_screen(g, args):
 
 
 def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True,
-                       native_resident=False, native_exact=False, v4=True):
+                       native_resident=False, native_exact=False, v4=True, scale_codes=False):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
@@ -1062,6 +1062,14 @@ def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True,
     if native_resident:
         from tests.moe.test_v41_exact_slices import pack
         w13, s13, w2, s2 = pack(weights, scales, native_exact)
+        if scale_codes:
+            from b12x.moe._shared.scale_codes import pack_scale_codes
+            stored = width if native_exact else (width + 127) // 128 * 128
+            up_gate_scales = torch.cat(tuple(torch.nn.functional.pad(scales[name],
+                (0, 0, 0, stored - width)) for name in ("w3", "w1")), 1)
+            s13 = pack_scale_codes(up_gate_scales, tensor_name="stream.w13.scale",
+                                   gated_half_rows=stored).cuda().flatten()
+            s2 = pack_scale_codes(scales["w2"], tensor_name="stream.w2.scale").cuda().flatten()
         planes = [w13, s13, w13, s13, w2, s2]
     pairs, tiles = rows * topk, stream_max_tiles(experts, rows * topk)
     output = torch.empty_like(x)
@@ -1073,7 +1081,7 @@ def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True,
     views = [from_dlpack(t, assumed_align=16) for t in tensors]
     pointers = [t.iterator for t in views]
     launch = cute.compile(V4StreamContract(geometry, rows, native_resident=native_resident,
-                          native_exact=native_exact, v4=v4), *pointers,
+                          native_exact=native_exact, v4=v4, scale_codes=scale_codes), *pointers,
                           cutlass.Int32(rows), current_cuda_stream())
     def execute(live):
         launch(*pointers, cutlass.Int32(live), current_cuda_stream())
@@ -1243,7 +1251,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 for label, resident in stream_arms:
                     runs[label], outputs[label], keep = v4_stream_pair_arm(
                         x, ids, routing, weights, scales, native_resident=resident,
-                        native_exact=(recipe["exact"] and width % 128 != 0) if recipe else width != 384, v4=v4)
+                        native_exact=(recipe["exact"] and width % 128 != 0) if recipe else width != 384, v4=v4,
+                        scale_codes=bool(recipe and recipe["coded"]))
                     owned.append(keep)
             if args.v4_stream:
                 runs["row-major-stream-a8"], outputs["row-major-stream-a8"], keep = v4_stream_pair_arm(
@@ -1324,6 +1333,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           control_tile=control_tile if v4 else None,
                           control_storage=("exact" if recipe["exact"] and width % 128 else "legacy") if recipe else ("exact" if rows <= 80 and width == 576 else "legacy") if v4 else None,
                           shipped_recipe=recipe,
+                          stream_scale_representation="codes" if recipe and recipe["coded"] else "raw-ue8m0",
                           projection_contract=contract, control_qualification=control_qualification,
                           current_down="a8" if v4 or (control_route == "stream"
                                        and args.prefill != "w8a16") else "a16",
