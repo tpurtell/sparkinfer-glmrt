@@ -595,8 +595,20 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
         if combine is not None:
             combine(args[-1], token_tensor, cutlass.Int32(live), current_cuda_stream())
     if qualify:
+        if prepare is not None:
+            prepare_rows(rows)
+            from tests.integration.test_cuteafd_fp8_moe_aot import wire_rows
+            expected_source = wire_rows(x)[1] if ingress == "wire" else None
+            if expected_source is not None:
+                assert torch.equal(source, expected_source), "wire A16 ingress differs from exact BF16 dequantization"
         if atomic:
             raise ValueError("tiling qualification requires ordered deterministic route output")
+        execute(rows)
+        if combine_output:
+            ordered = torch.zeros_like(x, dtype=torch.float32)
+            for slot in range(topk):
+                ordered += output.reshape(rows, topk, hidden)[:, slot]
+            assert torch.equal(token_output, ordered.bfloat16()), "native route combine differs from ordered slots"
         qualify_pair_replay(execute, ids, token_output, [partial, *scratch, output] if combine_output else [partial, *scratch],
                             [*tensors, wire, source, token_output],
                             lambda live: token_output[:live if combine_output else live * topk])
@@ -887,10 +899,13 @@ def mxfp4_unify_screen(g, args, geometry_type):
                             route_weight_before_fc2=False, round_fc2_bf16=True)
             for precision in ("a8", "a16"):
                 label = "native-" + precision
-                runs[label], outputs[label], keep = native_pair_arm(
-                    x, ids, routing, weights, scales, 128, True, False, False,
-                    activation_precision=precision, projection_contract=contract,
-                    combine_output=True, ingress="wire", qualify=True)
+                try:
+                    runs[label], outputs[label], keep = native_pair_arm(
+                        x, ids, routing, weights, scales, 128, True, False, False,
+                        activation_precision=precision, projection_contract=contract,
+                        combine_output=True, ingress="wire", qualify=True)
+                except AssertionError as error:
+                    raise AssertionError(f"native {precision}, rows={rows}, width={width}: {error}") from error
                 owned.append(keep)
             for label, run in list(runs.items()):
                 run()
