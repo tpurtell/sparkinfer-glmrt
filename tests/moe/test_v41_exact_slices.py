@@ -214,6 +214,42 @@ def test_stream_decode_a16_contract(n, exact):
         assert torch.equal(prefix, candidate[:capacity]), "streaming capacity row invariance"
 
 
+@pytest.mark.parametrize("h,n,k,v4", [(4096, 256, 8, False), (5120, 576, 6, True),
+                                       (5120, 384, 6, True)])
+def test_row_major_a8_decode_contract(h, n, k, v4):
+    require_b12x()
+    from benchmarks.bench_cuteafd_fp8_moe import native_pair_arm, mxfp4_f32_reference
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.manual_seed(928401 + n)
+    m, e = 80, 8
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    contract = dict(swiglu_limit=10. if v4 else 0., silu_bf16_product=not v4,
+                    route_weight_before_fc2=v4, round_fc2_bf16=not v4)
+    run, output, keep = native_pair_arm(x, ids, routing, weights, scales, 64, True, False, False,
+        activation_precision="a8", projection_contract=contract, combine_output=not v4,
+        row_major_a8=True, qualify=True)
+    run()
+    candidate = output.clone()
+    oracle = mxfp4_f32_reference(x, ids, routing, weights, scales, limit=10. if v4 else 0.,
+                               native=v4, activation_precision="a8")
+    assert torch.isfinite(candidate).all()
+    assert (candidate - oracle).square().mean().sqrt() / oracle.square().mean().sqrt() < .02
+    for capacity in (1, 16):
+        prefix_run, prefix, prefix_keep = native_pair_arm(
+            x[:capacity], ids[:capacity], routing[:capacity], weights, scales, 64, True, False, False,
+            activation_precision="a8", projection_contract=contract, combine_output=not v4,
+            row_major_a8=True, qualify=True)
+        prefix_run()
+        assert torch.equal(prefix, candidate[:capacity * k if v4 else capacity])
+
+
 @pytest.mark.parametrize("h", [4096, 6144])
 @pytest.mark.parametrize("n", MIMO_WIDTHS)
 @pytest.mark.parametrize("activation_precision", ["a8", "a16"])

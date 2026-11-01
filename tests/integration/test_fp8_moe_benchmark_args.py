@@ -427,6 +427,16 @@ def test_prefill_unify_controls_are_fixed_stream_and_record_prefix_failures():
     assert "prefix_failures" in ast.unparse(helper)
 
 
+def test_row_major_a8_is_benchmark_only_and_uses_raw_scratch():
+    function = next(n for n in ast.parse(_PATH.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == "native_pair_arm")
+    text = ast.unparse(function)
+    assert "stream_decode or row_major_a8" in text
+    assert "pipeline.fc1 = RowMajorA8Fc1(" in text
+    assert "pipeline.fc2 = RowMajorA8Fc2(" in text
+    assert "rows > 80" in text
+
+
 def test_stream_decode_cli_contract():
     args = bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
                              "--rows", "1,16,80", "--stream-decode"])
