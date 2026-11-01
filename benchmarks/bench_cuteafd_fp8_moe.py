@@ -194,6 +194,7 @@ def parse_args(argv=None):
                         help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
     parser.add_argument("--stream-decode", action="store_true",
                         help="development A16 native register-streaming decode arm")
+    parser.add_argument("--generic-a8", action="store_true", help="Benchmark generic grouped row-major QMMA decode")
     parser.add_argument("--row-major-mma", action="store_true", help="Benchmark native MMA with row-major resident staging")
     parser.add_argument("--row-major-a8", action="store_true",
                         help="benchmark-only fixed-path ordered row-major A8 decode")
@@ -1087,6 +1088,29 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 runs[label] = lambda execute=execute: execute(rows)
                 outputs[label] = output
                 owned.append((buffers, execute))
+            if args.generic_a8:
+                assert not v4 and rows <= 80
+                launch = _Fp8Moe(geometry, control_route, rows, True, args.prefill)
+                launch.decode.gate_up = GroupedMxfp4Gemv(n=2 * width, k=g.hidden, experts=experts,
+                    split=width, max_rows=64, warps=4 if g.hidden < 6144 else 8, groups=1,
+                    gather=True, activation_a8=True)
+                launch.decode.down = GroupedMxfp4Gemv(n=g.hidden, k=width, experts=experts,
+                    max_rows=64, warps=matching, activation_a8=True)
+                a8_program = compile_program(launch, name=template.name + "_benchmark_generic_a8",
+                    operands=template.operands, scalars=template.scalars, key=launch.key(),
+                    geometry=template.geometry, scratch=template.scratch)
+                a8_scratch = torch.empty(fp8_moe_scratch_bytes(geometry, control_route, rows),
+                                         dtype=torch.uint8, device="cuda")
+                a8_output = torch.empty_like(x)
+                a8_buffers = (source, ids, routing, *planes, a8_output, a8_scratch)
+                def generic_execute(live, program=a8_program, buffers=a8_buffers):
+                    program.launch(*buffers, scalars=(live,))
+                control_qualification["generic-a8"] = qualify_pair_replay(
+                    generic_execute, ids, a8_output, [a8_scratch], a8_buffers,
+                    lambda live: a8_output[:live], strict_prefix=True)
+                runs["generic-a8"] = lambda execute=generic_execute, live=rows: execute(live)
+                outputs["generic-a8"] = a8_output
+                owned.append((a8_program, a8_buffers, generic_execute))
             variants = ({"native-a8-t128-k2": ("a8", 128, 2, 1)} if v4 and rows <= 80 else
                         {} if v4 else
                         {"native-" + precision: (precision, 128, 1, 1) for precision in ("a8", "a16")})
@@ -1164,6 +1188,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
             references = {"a16": oracle, "a8": reference("a8")}
             eligible = {}
             quality_precisions = {label: spec[0] for label, spec in variants.items()}
+            if args.generic_a8:
+                quality_precisions["generic-a8"] = "a8"
             if args.stream_decode:
                 quality_precisions["native-stream-a16"] = "a16"
             if args.row_major_mma:
