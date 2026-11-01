@@ -387,9 +387,9 @@ def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical
     # Run the real allocation expression on CPU; CUDA dataflow is GPU-qualified separately.
     allocator = SimpleNamespace(empty=lambda shape, **kwargs: torch.empty(shape))
     words_per_route = tile // 2 if activation_precision == "a16" else tile // 4 + tile // 32
+    partial_words = 1 if atomic else ((logical + tile - 1) // tile) * 96 * words_per_route
     partial = eval(expression, {"__builtins__": {}, "torch": allocator},
-                   dict(logical=logical, width=tile, routes=96, atomic=atomic,
-                        words_per_route=words_per_route))
+                   dict(partial_words=partial_words))
     route_bytes = 2 * tile if activation_precision == "a16" else tile + tile // 8
     assert partial.numel() * 4 == (4 if atomic else
         ((logical + tile - 1) // tile) * 96 * route_bytes)
