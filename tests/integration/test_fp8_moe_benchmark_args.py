@@ -17,6 +17,22 @@ bench = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(bench)
 
 
+@pytest.mark.parametrize("precision", ["a8", "a16"])
+@pytest.mark.parametrize("width", [32, 64, 128, 192])
+@pytest.mark.parametrize("cta", [1, 2, 4, 8])
+def test_cross_cta_scratch_includes_every_raw_projection(precision, width, cta):
+    path = _PATH.parents[1] / "b12x/moe/_shared/kernels/v41_slice_pipeline.py"
+    tree = ast.parse(path.read_text())
+    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "fc1_partial_words")
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])), str(path), "exec"), namespace)
+    compact = width // 2 if precision == "a16" else width // 4 + width // 32
+    planes = (288 + width - 1) // width
+    expected = planes * 80 * 8 * (compact + (2 * width * cta if cta > 1 else 0))
+    assert namespace["fc1_partial_words"](80, width, 8, 288, precision, cta) == expected
+
+
 def test_mxfp4_pair_widths_cover_all_worlds_without_padding():
     assert bench.paired_widths(2304) == [288, 320, 352, 384, 448, 480, 576, 768, 1152]
     assert bench.paired_widths(2048) == [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]
