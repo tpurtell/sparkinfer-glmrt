@@ -24,9 +24,10 @@ import torch
 
 from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
 from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
-    bind_mixed_trellis, build_compact_trellis_descriptor, build_tiered_maps,
-    combine_trellis_rotations, compile_mixed_trellis, make_mixed_trellis_buffers,
-    parse_decode_schedule, run_bound_mixed_trellis,
+    MixedTrellisRotations, bind_mixed_trellis, build_compact_trellis_descriptor,
+    build_projection_tiered_maps, build_tiered_maps, combine_trellis_rotations,
+    compile_mixed_trellis, make_mixed_trellis_buffers, parse_decode_schedule,
+    run_bound_mixed_trellis,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import prepare_trellis256_moe_weights
 
@@ -55,6 +56,9 @@ class Geometry:
     world: int = 4
     rank: int = 0
     compact: bool = False
+    # Shipping K4/empty-K6 layout: every expert routes to tier 0 and tier 1
+    # keeps its full slot allocation without payload planes.
+    empty_tier: bool = False
 
     def widths(self, layer: int) -> list[int]:
         if not self.compact:
@@ -87,11 +91,14 @@ def shipping_geometry(args) -> Geometry:
     if len(matches) != 1:
         raise ValueError(f"no unique shipping profile for {args.geometry} {destination}")
     _, width, experts, topk, dtype, _ = matches[0]
-    tier0 = TIER0_IDS if args.geometry == "glmf" else tuple(range(experts // 2))
-    tier1 = tuple(e for e in range(experts) if e not in tier0)
+    if args.empty_tier:
+        tier0 = tier1 = tuple(range(experts))
+    else:
+        tier0 = TIER0_IDS if args.geometry == "glmf" else tuple(range(experts // 2))
+        tier1 = tuple(e for e in range(experts) if e not in tier0)
     return Geometry(hidden, width, experts, topk, tuple(args.bits or (3, 4)), tier0, tier1,
                     policy.activation(args.geometry), policy.swiglu_limit(args.geometry),
-                    dtype, full, args.world, args.rank, args.compact_weights)
+                    dtype, full, args.world, args.rank, args.compact_weights, args.empty_tier)
 
 
 def expert_bytes(bits: int) -> int:
@@ -214,17 +221,34 @@ def make_layer(seed: int, device: torch.device, geometry: Geometry = Geometry(),
     g, tiers = geometry, []
     for offset, (ids, bits) in enumerate(zip((g.tier0_ids, g.tier1_ids), g.bits)):
         experts = len(ids)
-        tiers.append(prepare_trellis256_moe_weights(
-            hidden_size=g.hidden, intermediate_size=g.intermediate, num_experts=experts,
+        empty = g.empty_tier and offset == 1
+        # The empty tier ships one dummy gate plane and one dummy down expert:
+        # its payload planes are projection-tight, its slot count is not.
+        real = 1 if empty else experts
+        tier = prepare_trellis256_moe_weights(
+            hidden_size=g.hidden, intermediate_size=g.intermediate, num_experts=real,
             activation=g.activation, fc1_tile_n=128, fc2_tile_n=128, device=device,
             seed=seed + offset, params_dtype=torch.float16,
             w13_layout="trellis_t256_proj", trellis_bits=bits, codebook="mcg",
-            gate_suh=scales((experts, g.hidden)), up_suh=scales((experts, g.hidden)),
-            intermediate_rotations=scales((experts, 3 * g.intermediate)),
-            down_svh=scales((experts, g.hidden)), tile_config=(64, 128, 64, 128),
-        ))
-    mapping, descriptor = build_tiered_maps(g.tier0_ids, g.tier1_ids, device=device)
-    rotations = combine_trellis_rotations(*tiers)
+            gate_suh=scales((real, g.hidden)), up_suh=scales((real, g.hidden)),
+            intermediate_rotations=scales((real, 3 * g.intermediate)),
+            down_svh=scales((real, g.hidden)), tile_config=(64, 128, 64, 128),
+        )
+        if empty:
+            tier = dataclasses.replace(tier, num_experts=experts,
+                w13=tier.w13[:tier.w13.numel() // 2],
+                w13_global_scale=torch.ones(experts, dtype=torch.float32, device=device))
+        tiers.append(tier)
+    if g.empty_tier:
+        membership = [0] * g.experts
+        mapping, descriptor = build_projection_tiered_maps(
+            membership, membership, membership, tier_slots=(g.experts, g.experts), device=device)
+        rotations = MixedTrellisRotations(
+            scales((2 * g.experts, 3 * g.intermediate)), scales((2 * g.experts, g.hidden)),
+            scales((2 * g.experts, g.hidden)), scales((2 * g.experts, g.hidden)))
+    else:
+        mapping, descriptor = build_tiered_maps(g.tier0_ids, g.tier1_ids, device=device)
+        rotations = combine_trellis_rotations(*tiers)
     if g.compact:
         widths = g.widths(layer)
         for index, (tier, ids, bits) in enumerate(zip(tiers, (g.tier0_ids, g.tier1_ids), g.bits)):
@@ -260,11 +284,15 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--bits", type=int, nargs=2)
     parser.add_argument("--compact-weights", action="store_true")
+    parser.add_argument("--empty-tier", action="store_true",
+                        help="shipping K4/empty-K6 layout: tier 1 keeps slots, no payload planes")
     parser.add_argument("--check-bitwise", action="store_true")
     parser.add_argument("--check-row-invariance", action="store_true")
     parser.add_argument("--artifacts", type=Path, help="export actual timed cores, SASS and resources")
     args = parser.parse_args()
     try:
+        if args.empty_tier and args.package_policy is None:
+            raise ValueError("--empty-tier requires --package-policy")
         variants = parse_variants(args.variant or ["default", "gb10"])
         g = shipping_geometry(args)
         # Equal tiers are the K4/empty-K6 shipping layout screened as a K4/K4
@@ -332,7 +360,10 @@ def main() -> None:
             print(f"resource m{capacity} schedule={schedule} tile={tile} {json.dumps(info)}", flush=True)
             inspected.add(key)
         buffers = make_mixed_trellis_buffers(launch, device=device, sms=sms)
-        bindings = [bind_mixed_trellis(t0, t1, m, d, r, launch) for t0, t1, m, d, r in layers]
+        bounds = (dict(gate_experts=(g.experts, 0), up_experts=(g.experts, 0))
+                  if g.empty_tier else {})
+        bindings = [bind_mixed_trellis(t0, t1, m, d, r, launch, **bounds)
+                    for t0, t1, m, d, r in layers]
         return launch, buffers, bindings
 
     inspected, single_outputs, resource_baselines = set(), {}, {}
