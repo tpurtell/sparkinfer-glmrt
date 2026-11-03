@@ -621,6 +621,13 @@ def test_prerotate_requires_bf16_ws():
             b.coordinator_compile_options("rtx-tp2", 2752, arm, props)
 
 
+@pytest.fixture
+def f32_matmul(monkeypatch):
+    """The oracle is full-F32, so every caller runs it with TF32 disabled."""
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+
+
 def oracle_helpers():
     torch = pytest.importorskip("torch")
     names = {"decode_mcg_matrix", "oracle_error", "oracle_error_no_worse",
@@ -666,7 +673,7 @@ def test_oracle_requires_both_error_metrics_without_slack(error, accepted):
 
 @pytest.mark.parametrize("family", ["step5", "ml4"])
 @pytest.mark.parametrize("tier_bits", [(4, 4), (4, 6)])
-def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family, tier_bits):
+def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family, tier_bits, f32_matmul):
     scope = oracle_helpers()
     torch = scope["torch"]
     scope["COORDINATOR_FAMILIES"] = {family: dict(hidden=128, experts=3, swiglu_limit=7.0)}
