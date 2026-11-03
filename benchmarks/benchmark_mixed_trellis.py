@@ -842,13 +842,11 @@ def _make_prefill_layer(family, width, seed, device, bits=None):
             intermediate_rotations=scales((max(count, 1), 3 * width)),
             down_svh=scales((max(count, 1), hidden)), tile_config=(64, tile_n, 64, tile_n))
         if count == 0:
-            plane = prepared.w13.numel() // 2
-            prepared = replace(
-                prepared, num_experts=slots,
-                w13=torch.zeros(2 * slots * plane, dtype=torch.int32, device=device),
-                w2=torch.zeros(slots * prepared.w2.numel(), dtype=torch.int32, device=device),
-                w13_global_scale=torch.ones(slots, dtype=torch.float32, device=device),
-                w2_global_scale=torch.ones(slots, dtype=torch.float32, device=device))
+            # Projection-tight storage: the empty tier keeps one dummy gate
+            # plane and one dummy down expert, exactly like the export.
+            prepared = replace(prepared, num_experts=slots,
+                               w13=prepared.w13[:prepared.w13.numel() // 2],
+                               w13_global_scale=torch.ones(slots, dtype=torch.float32, device=device))
         tiers.append(prepared)
     if counts[1] == 0:
         membership = [0] * experts
@@ -1085,6 +1083,10 @@ def _run_prefill_benchmark(args, device, props):
         resources[name] = _kernel_resource_info(launch, props.shared_memory_per_block_optin)
         workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
         bounds = dict(gate_experts=(896, 0), up_experts=(896, 0)) if family == "kimik3" else {}
+        if PREFILL_TIER_COUNTS[family][1] == 0:
+            # Projection-tight storage for a single-tier family: every gate and
+            # up plane lives in tier 0, so tier 1 carries no payload planes.
+            bounds = dict(gate_experts=(experts, 0), up_experts=(experts, 0))
         if compact:
             bounds = dict(gate_experts=tuple(c[0] for c in compact["counts"]),
                           up_experts=tuple(c[1] for c in compact["counts"]))
