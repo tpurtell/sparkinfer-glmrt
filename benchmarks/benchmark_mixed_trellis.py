@@ -779,12 +779,12 @@ def parse_prefill_arm(text):
     tokens = mode.split("+")
     base = tokens[0]
     opts = set(tokens[1:])
-    allowed = {"dynamic", "static", "wire", "s2", "s3", "s4", "n128", "n256", "t384"}
+    allowed = {"dynamic", "static", "wire", "s2", "s3", "s4", "s5", "s6", "n128", "n256", "t384"}
     if (base not in ("cooperative", "ws")
             or (base == "cooperative" and opts)
             or (base == "ws" and int(parts[1]) < 16)
             or not opts <= allowed
-            or len(opts & {"s2", "s3", "s4"}) > 1
+            or len(opts & {"s2", "s3", "s4", "s5", "s6"}) > 1
             or len(opts & {"n128", "n256", "t384"}) > 1
             or len(opts & {"dynamic", "static"}) > 1):
         raise argparse.ArgumentTypeError("prefill arm must be NAME:BLOCK:cooperative|ws (WS block >=16)")
@@ -1013,7 +1013,7 @@ def prefill_compile_options(family, width, block, mode, props, *, compact=False,
         ws_dynamic_tiles=ws_dynamic)
     if compact:
         opts["compact_weights"] = True
-    for s in (2, 3, 4):
+    for s in (2, 3, 4, 5, 6):
         if f"s{s}" in tokens:
             opts["ws_input_stages"] = s
     if "wire" in tokens:
