@@ -705,34 +705,52 @@ def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family, ti
     actual = scope["coordinator_f32_oracle"]((*tiers, mapping, descriptors.flatten(), rotations),
                                             source, ids, weights, family)
     assert set(decoded_bits) == set(tier_bits)
-    # Independent scalar-route math with a parity-constructed normalized H128.
-    h = torch.tensor([[(-1.0) ** ((i & j).bit_count()) for j in range(128)] for i in range(128)]) / 128 ** 0.5
-    expected = torch.zeros_like(actual)
+    # Independent transcription of the same math, batched per routed expert at
+    # the shape the oracle uses (it streams one expert's routes together) and
+    # accumulated in slot order like the oracle. Keeping the GEMM shapes equal
+    # keeps the fp32 accumulation order equal, so this checks the descriptor,
+    # scale, rotation and clamp wiring exactly instead of to a tolerance: a
+    # per-route GEMV differs from the batched oracle by ulps that the down
+    # projection's cancellation amplifies well past any fixed tolerance.
+    h = torch.ones((1, 1), dtype=torch.float32)
+    for _ in range(7):
+        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+    h /= 128 ** 0.5
+    def had(value):
+        return (value.reshape(-1, value.shape[-1] // 128, 128) @ h).reshape_as(value)
+    width = tiers[0].intermediate_size
+    routes = torch.zeros((*ids.shape, 128), dtype=torch.float32)
     clamped = False
-    for row in range(4):
-        for slot in range(2):
-            combined = int(mapping[ids[row, slot]])
-            matrices = []
-            for projection in range(3):
-                code = int(descriptors[projection, combined])
-                tier, local = code >> 9, code & 511
-                t = tiers[tier]
-                words = 8 * 8 * 8 * t.trellis_bits
-                offset = (local + ([2, 1][tier] if projection == 1 else 0)) * words
-                payload = t.w13[offset:offset + words] if projection < 2 else t.w2[local * words:(local + 1) * words]
-                scale = t.w13_global_scale[local] if projection < 2 else t.w2_global_scale[local]
-                matrices.append(native_decode(payload, 128, 128, t.trellis_bits) * scale)
-            scales = rotations.intermediate[combined].split(128)
-            gate = (((source[row] * rotations.gate_suh[combined]) @ h) @ matrices[0]) @ h * scales[0]
-            up = (((source[row] * rotations.up_suh[combined]) @ h) @ matrices[1]) @ h * scales[1]
-            active = gate * torch.sigmoid(gate)
-            if family == "step5":
-                clamped |= bool((active > 7).any() or (up.abs() > 7).any())
-                active, up = active.clamp(max=7), up.clamp(-7, 7)
-            down = ((((active * up * scales[2]) @ h) @ matrices[2]) @ h) * rotations.down_svh[combined]
-            expected[row] += down * weights[row, slot]
+    for expert in sorted(set(ids.flatten().tolist())):
+        combined = int(mapping[expert])
+        rows, slots = (ids == expert).nonzero(as_tuple=True)
+        matrices = []
+        for projection in range(3):
+            code = int(descriptors[projection, combined])
+            tier, local = code >> 9, code & 511
+            t = tiers[tier]
+            words = 8 * 8 * 8 * t.trellis_bits
+            # The fixture's projection-0 descriptors own two experts in tier 0
+            # and one in tier 1, so the up section starts that far in.
+            offset = (local + ([2, 1][tier] if projection == 1 else 0)) * words
+            payload = t.w13[offset:offset + words] if projection < 2 else t.w2[local * words:(local + 1) * words]
+            scale = t.w13_global_scale[local] if projection < 2 else t.w2_global_scale[local]
+            matrices.append(native_decode(payload, 128, 128, t.trellis_bits) * scale)
+        gate_svh, up_svh, down_suh = rotations.intermediate[combined].float().split(width)
+        x = source[rows].float()
+        gate = had(had(x * rotations.gate_suh[combined].float()) @ matrices[0]) * gate_svh
+        up = had(had(x * rotations.up_suh[combined].float()) @ matrices[1]) * up_svh
+        active = gate * torch.sigmoid(gate)
+        if family == "step5":
+            clamped |= bool((active > 7).any() or (up.abs() > 7).any())
+            active, up = active.clamp(max=7), up.clamp(-7, 7)
+        down = had(had(active * up * down_suh) @ matrices[2]) * rotations.down_svh[combined].float()
+        routes[rows, slots] = down * weights[rows, slots, None]
+    expected = torch.zeros_like(routes[:, 0])
+    for slot in range(ids.shape[1]):
+        expected += routes[:, slot]
     assert family != "step5" or clamped
-    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.0001)
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("defect", [None, "rows", "graph", "determinism", "oracle"])
