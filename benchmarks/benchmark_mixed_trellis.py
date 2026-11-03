@@ -820,20 +820,39 @@ def _make_prefill_layer(family, width, seed, device, bits=None):
         return _make_kimi_layer(seed, device, bits or KIMI_BITS)
     hidden, experts, topk, default_bits, activation = PREFILL_FAMILIES[family]
     bits = bits or default_bits
+    counts = PREFILL_TIER_COUNTS[family]
     generator = torch.Generator(device=device).manual_seed(seed)
     tile_n = 256 if width % 256 == 0 else 128
     tiers = []
-    for i, (bit, count) in enumerate(zip(bits, (3 * experts // 4, experts // 4))):
+    for i, (bit, count) in enumerate(zip(bits, counts)):
         def scales(shape):
             return (0.875 + 0.25 * torch.rand(shape, generator=generator, device=device)).half()
-        tiers.append(prepare_trellis256_moe_weights(
-            hidden_size=hidden, intermediate_size=width, num_experts=count,
+        # A K4/empty-K5 family ships the full expert slots in both tiers and maps
+        # every expert to tier 0 (`descriptor_map`), exactly as the coordinator
+        # export does: the empty tier keeps its allocation, its w13 payload is
+        # truncated to the gate half and nothing routes into it.
+        slots = experts if count == 0 else count
+        prepared = prepare_trellis256_moe_weights(
+            hidden_size=hidden, intermediate_size=width, num_experts=max(count, 1),
             activation=activation, fc1_tile_n=tile_n, fc2_tile_n=tile_n,
             device=device, seed=seed + i, params_dtype=torch.float16,
             w13_layout="trellis_t256_proj", trellis_bits=bit, codebook="mcg",
-            gate_suh=scales((count, hidden)), up_suh=scales((count, hidden)),
-            intermediate_rotations=scales((count, 3 * width)),
-            down_svh=scales((count, hidden)), tile_config=(64, tile_n, 64, tile_n)))
+            gate_suh=scales((max(count, 1), hidden)), up_suh=scales((max(count, 1), hidden)),
+            intermediate_rotations=scales((max(count, 1), 3 * width)),
+            down_svh=scales((max(count, 1), hidden)), tile_config=(64, tile_n, 64, tile_n))
+        if count == 0:
+            prepared = replace(prepared, num_experts=slots,
+                               w13=prepared.w13[:prepared.w13.numel() // 2],
+                               w13_global_scale=torch.ones(slots, dtype=torch.float32, device=device))
+        tiers.append(prepared)
+    if counts[1] == 0:
+        membership = [0] * experts
+        mapping, descriptor = build_projection_tiered_maps(
+            membership, membership, membership, tier_slots=(experts, experts), device=device)
+        rotations = MixedTrellisRotations(
+            scales((2 * experts, 3 * width)), scales((2 * experts, hidden)),
+            scales((2 * experts, hidden)), scales((2 * experts, hidden)))
+        return *tiers, mapping, descriptor, rotations
     mapping, descriptor = build_ordered_maps(*(t.num_experts for t in tiers), device=device)
     return *tiers, mapping, descriptor, combine_trellis_rotations(*tiers)
 
@@ -962,6 +981,10 @@ def prefill_compile_options(family, width, block, mode, props, *, compact=False,
         ws_dynamic = ws and ("static" not in tokens)
     else:
         counts = PREFILL_TIER_COUNTS[family]
+        if counts[1] == 0:
+            # K4/empty-K5 export: both tiers carry the full expert slot count and
+            # every expert's descriptor routes to tier 0 (see `_make_prefill_layer`).
+            counts = (experts, experts)
         tile_n = 256 if width % 256 == 0 else 128
         if "t384" in tokens:
             if width % 192:
