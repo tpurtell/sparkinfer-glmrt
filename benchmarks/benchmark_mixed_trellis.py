@@ -827,10 +827,11 @@ def _make_prefill_layer(family, width, seed, device, bits=None):
     for i, (bit, count) in enumerate(zip(bits, counts)):
         def scales(shape):
             return (0.875 + 0.25 * torch.rand(shape, generator=generator, device=device)).half()
-        # A K4/empty-K5 family ships the full expert slots in both tiers and maps
-        # every expert to tier 0 (`descriptor_map`), exactly as the coordinator
-        # export does: the empty tier keeps its allocation, its w13 payload is
-        # truncated to the gate half and nothing routes into it.
+        # A K4/empty-K5 family ships the family's full expert slots in both
+        # tiers and maps every expert to tier 0 (`descriptor_map`), exactly as
+        # the coordinator export does: the empty tier keeps its full allocation
+        # (the tier validator counts projection planes) and nothing routes into
+        # it, so its payload can stay zero.
         slots = experts if count == 0 else count
         prepared = prepare_trellis256_moe_weights(
             hidden_size=hidden, intermediate_size=width, num_experts=max(count, 1),
@@ -841,9 +842,13 @@ def _make_prefill_layer(family, width, seed, device, bits=None):
             intermediate_rotations=scales((max(count, 1), 3 * width)),
             down_svh=scales((max(count, 1), hidden)), tile_config=(64, tile_n, 64, tile_n))
         if count == 0:
-            prepared = replace(prepared, num_experts=slots,
-                               w13=prepared.w13[:prepared.w13.numel() // 2],
-                               w13_global_scale=torch.ones(slots, dtype=torch.float32, device=device))
+            plane = prepared.w13.numel() // 2
+            prepared = replace(
+                prepared, num_experts=slots,
+                w13=torch.zeros(2 * slots * plane, dtype=torch.int32, device=device),
+                w2=torch.zeros(slots * prepared.w2.numel(), dtype=torch.int32, device=device),
+                w13_global_scale=torch.ones(slots, dtype=torch.float32, device=device),
+                w2_global_scale=torch.ones(slots, dtype=torch.float32, device=device))
         tiers.append(prepared)
     if counts[1] == 0:
         membership = [0] * experts
