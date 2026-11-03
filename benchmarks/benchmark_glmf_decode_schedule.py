@@ -267,8 +267,11 @@ def main() -> None:
     try:
         variants = parse_variants(args.variant or ["default", "gb10"])
         g = shipping_geometry(args)
-        if len(set(g.bits)) != 2 or any(b not in range(2, 6) for b in g.bits):
-            raise ValueError("bits must be two distinct shipping K2..K5 tiers")
+        # Equal tiers are the K4/empty-K6 shipping layout screened as a K4/K4
+        # split: the expert count, weight bytes and routing are unchanged, and
+        # the schedule decision does not read the tier payload layout.
+        if any(b not in range(2, 7) for b in g.bits):
+            raise ValueError("bits must be shipping K2..K6 tiers")
     except ValueError as error:
         parser.error(str(error))
     if min(args.layers, args.replays, args.rounds) < 1:
