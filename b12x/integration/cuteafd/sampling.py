@@ -88,7 +88,9 @@ class RelaxedAcceptanceStatsF32:
             base = row * row_stride
             best = Float32(float("-inf"))
             invalid = Int32(0)
-            for col in cutlass.range(Int64(tid), Int64(vocab), Int64(256)):
+            # Keep range direction static: a DSL Int64 step makes CuTe's
+            # generated negative-step offset merge an i64 value with i32 zero.
+            for col in cutlass.range(Int64(tid), Int64(vocab), 256):
                 value = Float32(logits[base + col])
                 if (value != value) | (value == Float32(float("inf"))) | (value == Float32(float("-inf"))):
                     invalid = Int32(1)
@@ -122,7 +124,7 @@ class RelaxedAcceptanceStatsF32:
                 code = Uint32(SKIPPED)
             else:
                 mass, moment = Float32(0.0), Float32(0.0)
-                for col in cutlass.range(Int64(tid), Int64(vocab), Int64(256)):
+                for col in cutlass.range(Int64(tid), Int64(vocab), 256):
                     delta = Float32(Float32(logits[base + col]) - best)
                     weight = cute.math.exp(delta, fastmath=False)
                     mass = Float32(mass + weight)
