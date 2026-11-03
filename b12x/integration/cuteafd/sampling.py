@@ -93,21 +93,26 @@ class RelaxedAcceptanceStatsF32:
                 if (value != value) | (value == Float32(float("inf"))) | (value == Float32(float("-inf"))):
                     invalid = Int32(1)
                 if (value > best) | ((value == best) & (Uint32(col) < best_id)):
-                    best, best_id = value, Uint32(col)
+                    best = Float32(value)
+                    best_id = Uint32(col)
             for shift in cutlass.range_constexpr(5):
                 other = Float32(cute.arch.shuffle_sync_bfly(best, offset=1 << shift))
                 other_id = Uint32(cute.arch.shuffle_sync_bfly(best_id, offset=1 << shift))
                 invalid = invalid | Int32(cute.arch.shuffle_sync_bfly(invalid, offset=1 << shift))
                 if (other > best) | ((other == best) & (other_id < best_id)):
-                    best, best_id = other, other_id
+                    best = Float32(other)
+                    best_id = Uint32(other_id)
             if lane == Int32(0):
-                maxima[warp], indices[warp], invalids[warp] = best, best_id, invalid
+                maxima[warp] = best
+                indices[warp] = best_id
+                invalids[warp] = invalid
             cute.arch.sync_threads()
             for w in cutlass.range_constexpr(8):
                 other, other_id = Float32(maxima[w]), Uint32(indices[w])
                 invalid = invalid | Int32(invalids[w])
                 if (other > best) | ((other == best) & (other_id < best_id)):
-                    best, best_id = other, other_id
+                    best = Float32(other)
+                    best_id = Uint32(other_id)
             raw_score = best
             if invalid != Int32(0):
                 code = Uint32(NONFINITE)
@@ -142,7 +147,9 @@ class RelaxedAcceptanceStatsF32:
             stats[row * Int64(3)] = p_draft
             stats[row * Int64(3) + Int64(1)] = p_max
             stats[row * Int64(3) + Int64(2)] = entropy
-            argmax_ids[row], argmax_scores[row], status[row] = best_id, raw_score, code
+            argmax_ids[row] = best_id
+            argmax_scores[row] = raw_score
+            status[row] = code
 
 
 def compile_relaxed_acceptance_stats_f32_aot():
