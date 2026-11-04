@@ -2278,8 +2278,6 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         a_regs = []
                         b_regs = []
                         if cutlass.const_expr("sched" in self.ws_exp):
-                            for mb in cutlass.range_constexpr(active):
-                                a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
                             wa0, wb0, wa1, wb1 = self._ws_windows_pair(
                                 gemm, row_addr, tbase0, tbase1, lane, prev_lane,
                                 ia, ib, i1, s2, delta, ib0, ib1, sb, ia0, ia1, sa, bits
@@ -2300,12 +2298,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                     frag, wa, wb, lut_addr, bits
                                 )
                                 b_regs.append((frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1]))
-                            for mb in cutlass.range_constexpr(active):
-                                a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
                         if cutlass.const_expr("splitbc" in self.ws_exp and q == 3):
                             _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
                         if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
                             _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
+                        for mb in cutlass.range_constexpr(active):
+                            a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
+                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
                             _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
                         for jj in cutlass.range_constexpr(2):
                             for mb in cutlass.range_constexpr(active):
@@ -2347,8 +2346,6 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     a_regs = []
                     b_regs = []
                     if cutlass.const_expr("sched" in self.ws_exp):
-                        for mb in cutlass.range_constexpr(active):
-                            a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
                         wa0, wb0, wa1, wb1 = self._ws_windows_pair(
                             gemm, row_addr, tbase0, tbase1, lane, prev_lane,
                             ia, ib, i1, s2, delta, ib0, ib1, sb, ia0, ia1, sa, bits
@@ -2359,11 +2356,6 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         gemm._scaled_dequant_b_fragment_trellis256_bits(frag1, wa1, wb1, lut_addr, bits)
                         b_regs.append((frag0[0, 0], frag0[0, 1], frag0[1, 0], frag0[1, 1]))
                         b_regs.append((frag1[0, 0], frag1[0, 1], frag1[1, 0], frag1[1, 1]))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 3):
-                            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
-                            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
-                            _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
                     else:
                         for jj in cutlass.range_constexpr(2):
                             wa, wb = self._ws_windows(
@@ -2380,14 +2372,14 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                     frag, wa, wb, lut_addr, bits
                                 )
                             b_regs.append((frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1]))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 3):
-                            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
-                            _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
-                        for mb in cutlass.range_constexpr(active):
-                            a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
-                            _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
+                    if cutlass.const_expr("splitbc" in self.ws_exp and q == 3):
+                        _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
+                    if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
+                        _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
+                    for mb in cutlass.range_constexpr(active):
+                        a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
+                    if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
+                        _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
                     for jj in cutlass.range_constexpr(0 if "nomma" in self.ws_exp else 2):
                         for mb in cutlass.range_constexpr(active):
                             for h in cutlass.range_constexpr(2):
