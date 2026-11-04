@@ -619,3 +619,14 @@ def test_prerotate_requires_bf16_ws():
     for arm in ({"mode": "cooperative", "prerotate": 0}, {"mode": "ws", "wire": 1, "prerotate": 1}):
         with pytest.raises(ValueError):
             b.coordinator_compile_options("rtx-tp2", 2752, arm, props)
+
+
+def test_masked_ws_n256_and_exp_arm():
+    b = benchmark()
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    name, arm = b.parse_coordinator_arm("n256:mode=ws,route_block=64,dynamic=1,tile=64/256/64/256,exp=bc5+splitbc")
+    assert name == "n256" and arm["exp"] == "bc5,splitbc"
+    opts = b.coordinator_compile_options("spark-tp6-width640", 2752, arm, props, "muse")
+    assert opts["force_tile_config"] == (64, 256, 64, 256) and opts["warp_specialized"]
+    with pytest.raises(ValueError):
+        b.coordinator_compile_options("spark-tp6-width640", 2752, {"mode": "cooperative", "tile": (64, 256, 64, 256)}, props, "muse")

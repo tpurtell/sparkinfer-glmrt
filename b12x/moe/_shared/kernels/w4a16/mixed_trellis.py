@@ -2563,10 +2563,15 @@ def compile_mixed_trellis(
     tier0_bits, tier1_bits = bits
     if activations == "a8" and trellis_codebook != "mcg":
         raise ValueError("EXL3 A8 INT8 weight conversion requires the MCG codebook")
-    # 192-wide and unequal FC1/FC2 N tiles exist only in the warp-specialized
-    # kernel; its cooperative sub-kernels (decode helpers, activation) keep 128.
+    # 192-wide, unequal, or masked non-divisible FC1/FC2 N tiles exist only in
+    # the warp-specialized kernel; its cooperative sub-kernels (decode helpers,
+    # activation) keep 128.
     ws_tile_n = None
-    if fc1_tile_n != fc2_tile_n or 192 in (fc1_tile_n, fc2_tile_n):
+    if (
+        fc1_tile_n != fc2_tile_n
+        or 192 in (fc1_tile_n, fc2_tile_n)
+        or (warp_specialized and int(intermediate_size) % fc1_tile_n != 0)
+    ):
         if not warp_specialized:
             raise ValueError("192-wide or unequal N tiles require the warp-specialized kernel")
         ws_tile_n = (fc1_tile_n, fc2_tile_n)

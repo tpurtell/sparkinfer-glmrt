@@ -1306,6 +1306,10 @@ def parse_coordinator_arm(text):
                 # its host/driver), compiled in its own namespace.
                 if not re.fullmatch(r"[0-9a-f]{7,40}", value):
                     raise ValueError("revision must be a 7-40 digit lowercase commit SHA")
+            elif key == "exp":
+                if not re.fullmatch(r"[A-Za-z0-9_+]+", value):
+                    raise ValueError("exp must be a +-separated list of experiment flags")
+                value = value.replace("+", ",")
             elif key in ("route_block", "ctas", "stages", "wire", "dynamic", "prerotate"):
                 value = int(value)
                 legal = {"route_block": (8, 16, 32, 64), "ctas": (1, 2, 3, 4),
@@ -1365,7 +1369,7 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         # rank's whole intermediate width and the geometry's hidden size are 256 tiles.
         default_n = 256 if width % 256 == 0 and hidden % 256 == 0 else 128
         tile = arm.get("tile", (64, default_n, 64, default_n))
-        if width % tile[1] or hidden % tile[3] or hidden % tile[0] or width % tile[2]:
+        if (width % tile[1] and not (ws and tile[1] in (192, 256) and width >= tile[1])) or hidden % tile[3] or hidden % tile[0] or width % tile[2]:
             raise ValueError("coordinator tile must divide both projection geometries")
         if not ws and tile[1] != tile[3]:
             raise ValueError("cooperative FC1/FC2 tiles must have equal CTA thread counts")
@@ -1652,9 +1656,18 @@ def _run_coordinator_benchmark(args, device, props):
             options = coordinator_compile_options(args.profile, capacity, arm, props, args.prefill_family,
                                                   compact is not None, args.bits)
             print(json.dumps(dict(compiling=name, capacity=capacity, options=options,
-                                  revision=revisions[name])), flush=True)
+                                  exp=arm.get("exp"), revision=revisions[name])), flush=True)
             arm_mix = modules[name]
-            launch = arm_mix.compile_mixed_trellis(**options)
+            with patch.dict(os.environ, {"B12X_WS_EXP": arm.get("exp", "")}):
+                launch = arm_mix.compile_mixed_trellis(**options)
+            if getattr(args, "stage_profile", False) and hasattr(launch.compiled, "dump_to_object"):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    obj_path = Path(tmpdir) / "core.o"
+                    obj_path.write_bytes(launch.compiled.dump_to_object("core"))
+                    res_text = subprocess.check_output(["cuobjdump", "-res-usage", str(obj_path)], text=True)
+                    print(json.dumps(dict(resource_usage=name, capacity=capacity,
+                                          shared_memory_bytes=launch.shared_memory_bytes,
+                                          cuobjdump=res_text)), flush=True)
             workspace = arm_mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
             bindings = [arm_mix.bind_mixed_trellis(*layer, launch, **bind_counts) for layer in layers]
             if partial_program is not None:
@@ -1719,6 +1732,7 @@ def _run_coordinator_benchmark(args, device, props):
                                                             reference.view(bit_dtype))
                         graphs[oracle_name + "_control"] = graphs[oracle_name]
                         samples = {name: [] for name in graphs}
+                        stage_profiles = {}
                         if all(checks.values()) and not args.correctness_only:
                             names = list(graphs)
                             with kernel_resolution_guard("coordinator frozen graph timing"):
@@ -1728,7 +1742,21 @@ def _run_coordinator_benchmark(args, device, props):
                                         order.reverse()
                                     for name in order:
                                         samples[name].append(statistics.median(_times(graphs[name], args.replays)))
+                            if getattr(args, "stage_profile", False):
+                                from benchmarks.benchmark_exlr8_a16 import stage_profile
+                                ws_stages = {
+                                    "rotation": ("ws_rotation_kernel",),
+                                    "fc1": ("fc1_kernel",),
+                                    "activation": ("ws_act_kernel", "activation_kernel"),
+                                    "fc2": ("fc2_kernel",),
+                                    "epilogue": ("topk_sum", "expert_partial"),
+                                }
+                                for name, _ in specs:
+                                    stage_profiles[name] = stage_profile(
+                                        graphs[name], tempfile.gettempdir(), stages=ws_stages
+                                    )
                         live_records.append(dict(rows=live, bitwise=checks, samples_us=samples,
+                            stage_profile=stage_profiles or None,
                             noise=(k4_noise_summary(samples, oracle_name) if all(samples.values()) else None)))
                     first = live_records[0]
                     checks, samples = dict(first["bitwise"]), first["samples_us"]
@@ -1828,6 +1856,7 @@ def _run_coordinator_benchmark(args, device, props):
                         wave_index=wave_index, route_layer=wave.get("layer") if wave else None,
                         content=wave.get("content") if wave else None, bitwise=checks,
                         prefix=prefix_detail,
+                        stage_profile=first.get("stage_profile"),
                         checked_rows=capacity if args.prefill_exhaustive else None,
                         noise=(k4_noise_summary(samples, oracle_name) if all(samples.values()) else None),
                         live_rows=[dict(rows=e["rows"], bitwise=e["bitwise"], noise=e["noise"],
@@ -1940,6 +1969,7 @@ def benchmark_parser():
     parser.add_argument("--routes", type=Path, help="family-labelled recorded histogram JSON; absent means correctness only")
     parser.add_argument("--route-layer", type=int, default=23)
     parser.add_argument("--prefill-exhaustive", action="store_true", help="check every prefix row count 1..compiled capacity")
+    parser.add_argument("--stage-profile", action="store_true", help="record per-stage kernel durations and cuobjdump resource usage")
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--prefill-revision", default="HEAD", help="freeze implementation from this git revision")
     parser.add_argument("--prefill-source-dir", type=Path, help="pre-materialized K4 sibling-module bundle")
