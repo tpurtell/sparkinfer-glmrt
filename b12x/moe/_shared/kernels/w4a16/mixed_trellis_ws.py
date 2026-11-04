@@ -2087,11 +2087,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         step: Int32,
         blk: Int32,
     ):
-        """One tile's K loop. Each 128-wide block waits once for its A slot
-        and both compressed units, then runs eight straight-line K16 steps
-        (window loads, t256 decode of this warp's two N16 records, ldmatrix of
-        the ``active`` occupied M16 fragments, MMAs into the step's chain) and
-        releases the slots."""
+        """One tile's K loop. Each 128-wide block waits once for its A slot and
+        its first compressed unit, runs the first four K16 steps (window loads,
+        t256 decode of this warp's two N16 records, ldmatrix of the ``active``
+        occupied M16 fragments, MMAs into the step's chain), waits for the
+        second unit where its first row is read, finishes the last four steps
+        and releases the slots."""
         bits = self.ws_bits[tier_idx]
         lane = tid & Int32(31)
         cw = tid >> Int32(5)
@@ -2114,10 +2115,6 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 (unit0 // Int32(nc)) & Int32(1),
             )
             _mbar_wait(
-                base + Int32(self.ws_bar_bc_full) + slot1 * Int32(_BARRIER_BYTES),
-                ((unit0 + Int32(1)) // Int32(nc)) & Int32(1),
-            )
-            _mbar_wait(
                 base + Int32(self.ws_bar_a_full) + a_slot * Int32(_BARRIER_BYTES),
                 (blk // Int32(na)) & Int32(1),
             )
@@ -2128,6 +2125,14 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 chain = (q % 4) // 2
                 row_addr = bc0 + Int32((q % 4) * row_bytes)
                 if cutlass.const_expr(q >= 4):
+                    if cutlass.const_expr(q == 4):
+                        # The second unit is issued one unit behind the first;
+                        # the four steps above need only the first, so its wait
+                        # sits here rather than ahead of them.
+                        _mbar_wait(
+                            base + Int32(self.ws_bar_bc_full) + slot1 * Int32(_BARRIER_BYTES),
+                            ((unit0 + Int32(1)) // Int32(nc)) & Int32(1),
+                        )
                     row_addr = bc1 + Int32((q % 4) * row_bytes)
                 gemm = (self.tier0, self.tier1)[tier_idx].fc2
                 if cutlass.const_expr(is_fc1):
