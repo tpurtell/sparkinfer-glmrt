@@ -1660,16 +1660,18 @@ def _run_coordinator_benchmark(args, device, props):
             print(json.dumps(dict(compiling=name, capacity=capacity, options=options,
                                   exp=arm.get("exp"), revision=revisions[name])), flush=True)
             arm_mix = modules[name]
-            with patch.dict(os.environ, {"B12X_WS_EXP": arm.get("exp", "")}):
+            env_overrides = {"B12X_WS_EXP": arm.get("exp", "")}
+            if getattr(args, "stage_profile", False):
+                env_overrides["B12X_COMPILE_DISK_CACHE"] = "0"
+            with patch.dict(os.environ, env_overrides):
                 launch = arm_mix.compile_mixed_trellis(**options)
-            if getattr(args, "stage_profile", False) and hasattr(launch.compiled, "dump_to_object"):
+            if getattr(args, "stage_profile", False) and hasattr(launch.compiled, "export_to_c"):
+                from benchmarks.benchmark_glmf_decode_schedule import inspect_kernel
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    obj_path = Path(tmpdir) / "core.o"
-                    obj_path.write_bytes(launch.compiled.dump_to_object("core"))
-                    res_text = subprocess.check_output(["cuobjdump", "-res-usage", str(obj_path)], text=True)
+                    info = inspect_kernel(launch, Path(tmpdir))
                     print(json.dumps(dict(resource_usage=name, capacity=capacity,
                                           shared_memory_bytes=launch.shared_memory_bytes,
-                                          cuobjdump=res_text)), flush=True)
+                                          resources=info["resources"])), flush=True)
             workspace = arm_mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
             bindings = [arm_mix.bind_mixed_trellis(*layer, launch, **bind_counts) for layer in layers]
             if partial_program is not None:
