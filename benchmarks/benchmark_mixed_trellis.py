@@ -1369,7 +1369,7 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         # rank's whole intermediate width and the geometry's hidden size are 256 tiles.
         default_n = 256 if width % 256 == 0 and hidden % 256 == 0 else 128
         tile = arm.get("tile", (64, default_n, 64, default_n))
-        if (width % tile[1] and not (ws and tile[1] in (192, 256) and width >= tile[1])) or hidden % tile[3] or hidden % tile[0] or width % tile[2]:
+        if (width % tile[1] and not (ws and tile[1] == 256 and width >= 256)) or hidden % tile[3] or hidden % tile[0] or width % tile[2]:
             raise ValueError("coordinator tile must divide both projection geometries")
         if not ws and tile[1] != tile[3]:
             raise ValueError("cooperative FC1/FC2 tiles must have equal CTA thread counts")

@@ -475,7 +475,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         inter = int(self.intermediate_size)
         if hidden % 128 or inter % 128:
             raise ValueError("warp-specialized mixed Trellis needs H128-aligned K")
-        if (inter < tile_fc1 if (compact_weights or tile_fc1 in (192, 256)) else inter % tile_fc1) or hidden % tile_fc2:
+        if (inter < tile_fc1 if (compact_weights or tile_fc1 == 256) else inter % tile_fc1) or hidden % tile_fc2:
             raise ValueError("gate/up halves and FC2 must hold whole N tiles")
         self.ws_m = block
         self.ws_mb = block // 16
