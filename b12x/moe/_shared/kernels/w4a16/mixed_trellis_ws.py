@@ -492,10 +492,27 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         self.ws_a8 = activations == "a8"
         self.ws_s_slot = 4 * block if self.ws_a8 else 0
         self.ws_exp = frozenset(filter(None, os.environ.get("B12X_WS_EXP", "").split(",")))
-        self.ws_tile_stages = 2 if "bc5" in self.ws_exp else _TILE_STAGES
+        self.ws_nondiv_n256 = (
+            not self.compact_weights
+            and self.ws_tiles[0] == 256
+            and self.intermediate_size % 256 != 0
+        )
+        self.ws_tailskip = (
+            (self.ws_nondiv_n256 and "notailskip" not in self.ws_exp)
+            or ("tailskip" in self.ws_exp)
+        )
+        self.ws_bc5 = (
+            (self.ws_nondiv_n256 and "nobc5" not in self.ws_exp)
+            or ("bc5" in self.ws_exp)
+        )
+        self.ws_splitbc = (
+            (self.ws_nondiv_n256 and "nosplitbc" not in self.ws_exp)
+            or ("splitbc" in self.ws_exp)
+        )
+        self.ws_tile_stages = 2 if self.ws_bc5 else _TILE_STAGES
 
         fixed = self.ws_tile_stages * (self.ws_tile_slot + 2 * _BARRIER_BYTES) + 4 * _CLAIM_SLOTS
-        budget = int(max_shared_mem) - (0 if "bc5" in self.ws_exp else 1024) - fixed
+        budget = int(max_shared_mem) - (0 if self.ws_bc5 else 1024) - fixed
         a_stages = 2
         bc_stages = 0
         # input_stages forces the input-row ring depth (weight ring >= 2).
@@ -1231,15 +1248,17 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         if cutlass.const_expr(is_fc1):
             # Projection-major W13: [gate plane | up plane], each [E, K16, N16/2].
             half_n16 = Int64(n_total // 32)
-            half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
             proj = Int64(0)
             if nt >= n_tiles // Int32(2):
                 proj = Int64(1)
-            local_n16 = Int64(nt - proj.to(Int32) * Int32(half_tiles)) * Int64(self.ws_n16)
             if cutlass.const_expr((n_total // 2) % self.ws_n != 0):
+                half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
+                local_n16 = Int64(nt - proj.to(Int32) * Int32(half_tiles)) * Int64(self.ws_n16)
                 rem_n16 = half_n16 - local_n16
                 if rem_n16 < Int64(self.ws_n16):
                     row_bytes = rem_n16.to(Int32) * Int32(32) * bits
+            else:
+                local_n16 = Int64(nt) * Int64(self.ws_n16) - proj * half_n16
             proj_expert_u32 = Int64(k_size // 16) * half_n16 * tile_u32
             plane_u32 = gate_count.to(Int64) * proj_expert_u32
             first_u32 = (
@@ -1297,7 +1316,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         smem_row_bytes = row_bytes
         if cutlass.const_expr(
             (self.compact_weights and self.ws_n == 192)
-            or (self.intermediate_size % self.ws_n != 0)
+            or self.ws_nondiv_n256
         ):
             bits = Int32(self.ws_bits[0])
             if ctier == Int32(1):
@@ -1805,7 +1824,11 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         lane = ptid & Int32(31)
         l16 = lane & Int32(15)
         half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
-        n_tiles = Int32(2 * half_tiles if is_fc1 else n_total // self.ws_n)
+        n_tiles = Int32(
+            2 * half_tiles
+            if ((self.compact_weights or self.ws_nondiv_n256) and is_fc1)
+            else n_total // self.ws_n
+        )
         route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(self.ws_m)
         total_tiles = route_blocks * n_tiles
         live = active_m * Int32(self.top_k)
@@ -1967,7 +1990,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 if blk >= Int32(1):
                     # Consumers finished block blk - 1: its A slot and two
                     # weight units are free.
-                    if cutlass.const_expr("splitbc" in self.ws_exp):
+                    if cutlass.const_expr(self.ws_splitbc):
                         for _u in cutlass.range_constexpr(2):
                             if ct < total_tiles:
                                 fill = bc_issued % Int32(nc)
@@ -2020,7 +2043,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                         is_fc1, k_size, rows, packed_route_indices, arb, ptid, live
                                     )
                                     prev_arb = arb
-                    if cutlass.const_expr("splitbc" not in self.ws_exp):
+                    if cutlass.const_expr(not self.ws_splitbc):
                         for _u in cutlass.range_constexpr(2):
                             if ct < total_tiles:
                                 fill = bc_issued % Int32(nc)
@@ -2111,75 +2134,6 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         return wa, wb
 
     @cute.jit
-    def _ws_windows_pair(
-        self,
-        gemm,
-        row_addr: Int32,
-        tbase0: Int32,
-        tbase1: Int32,
-        lane: Int32,
-        prev_lane: Int32,
-        ia: Int32,
-        ib: Int32,
-        i1: Int32,
-        s2: Int32,
-        delta: Int32,
-        ib0: Int32,
-        ib1: Int32,
-        sb: Int32,
-        ia0: Int32,
-        ia1: Int32,
-        sa: Int32,
-        bits: cutlass.Constexpr,
-    ):
-        """Batched per-lane t256 funnel windows for both N16 records of a warp."""
-        wa0 = Uint32(0)
-        wb0 = Uint32(0)
-        wa1 = Uint32(0)
-        wb1 = Uint32(0)
-        if cutlass.const_expr(bits == 4):
-            bw0 = ld_shared_u32(row_addr + (tbase0 + lane) * Int32(4))
-            bw1 = ld_shared_u32(row_addr + (tbase1 + lane) * Int32(4))
-            aw0 = cute.arch.shuffle_sync(bw0, prev_lane)
-            aw1 = cute.arch.shuffle_sync(bw1, prev_lane)
-            wa0 = bw0
-            wb0 = (aw0 << Uint32(16)) | (bw0 >> Uint32(16))
-            wa1 = bw1
-            wb1 = (aw1 << Uint32(16)) | (bw1 >> Uint32(16))
-        elif cutlass.const_expr(bits < 4):
-            aw0 = ld_shared_u32(row_addr + (tbase0 + ia) * Int32(4))
-            bw0 = ld_shared_u32(row_addr + (tbase0 + ib) * Int32(4))
-            aw1 = ld_shared_u32(row_addr + (tbase1 + ia) * Int32(4))
-            bw1 = ld_shared_u32(row_addr + (tbase1 + ib) * Int32(4))
-            wa0 = gemm._trellis_funnel256(aw0, bw0, s2)
-            wb0 = gemm._trellis_funnel256(aw0, bw0, s2 + Int32(4 * bits))
-            wa1 = gemm._trellis_funnel256(aw1, bw1, s2)
-            wb1 = gemm._trellis_funnel256(aw1, bw1, s2 + Int32(4 * bits))
-        elif cutlass.const_expr(bits == 5):
-            b0_0 = ld_shared_u32(row_addr + (tbase0 + ib0) * Int32(4))
-            b1_0 = ld_shared_u32(row_addr + (tbase0 + ib1) * Int32(4))
-            a0_0 = ld_shared_u32(row_addr + (tbase0 + ia0) * Int32(4))
-            a1_0 = ld_shared_u32(row_addr + (tbase0 + ia1) * Int32(4))
-            b0_1 = ld_shared_u32(row_addr + (tbase1 + ib0) * Int32(4))
-            b1_1 = ld_shared_u32(row_addr + (tbase1 + ib1) * Int32(4))
-            a0_1 = ld_shared_u32(row_addr + (tbase1 + ia0) * Int32(4))
-            a1_1 = ld_shared_u32(row_addr + (tbase1 + ia1) * Int32(4))
-            wb0 = gemm._trellis_funnel256(b0_0, b1_0, sb)
-            wa0 = gemm._trellis_funnel256(a0_0, a1_0, sa)
-            wb1 = gemm._trellis_funnel256(b0_1, b1_1, sb)
-            wa1 = gemm._trellis_funnel256(a0_1, a1_1, sa)
-        else:
-            z0_0 = ld_shared_u32(row_addr + (tbase0 + ia) * Int32(4))
-            z1_0 = ld_shared_u32(row_addr + (tbase0 + i1) * Int32(4))
-            z2_0 = ld_shared_u32(row_addr + (tbase0 + ib) * Int32(4))
-            z0_1 = ld_shared_u32(row_addr + (tbase1 + ia) * Int32(4))
-            z1_1 = ld_shared_u32(row_addr + (tbase1 + i1) * Int32(4))
-            z2_1 = ld_shared_u32(row_addr + (tbase1 + ib) * Int32(4))
-            wa0, wb0 = trellis_align_stream_u32x2(z0_0, z1_0, z2_0, s2, delta)
-            wa1, wb1 = trellis_align_stream_u32x2(z0_1, z1_1, z2_1, s2, delta)
-        return wa0, wb0, wa1, wb1
-
-    @cute.jit
     def _ws_kloop(
         self,
         is_fc1: cutlass.Constexpr,
@@ -2192,7 +2146,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         tid: Int32,
         step: Int32,
         blk: Int32,
-        col_active: Int32 = Int32(1),
+        col_active=None,
     ):
         """One tile's K loop. Each 128-wide block waits once for its A slot
         and both compressed units, then runs eight straight-line K16 steps
@@ -2210,31 +2164,6 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         lrow = lane & Int32(15)
         lrow7 = lane & Int32(7)
         lchunk = lane >> Int32(4)
-        tile_u32 = 8 * bits
-        tbase0 = cw * Int32(2 * tile_u32)
-        tbase1 = tbase0 + Int32(tile_u32)
-        prev_lane = (lane + Int32(31)) & Int32(31)
-        ia = Int32(0)
-        ib = Int32(0)
-        i1 = Int32(0)
-        s2 = Int32(0)
-        delta = Int32(0)
-        ib0 = Int32(0)
-        ib1 = Int32(0)
-        sb = Int32(0)
-        ia0 = Int32(0)
-        ia1 = Int32(0)
-        sa = Int32(0)
-        if cutlass.const_expr("sched" in self.ws_exp):
-            if cutlass.const_expr(bits < 4):
-                ia, ib, s2, _ = trellis256_lane_geom_bits(lane, 0, 8, bits)
-            elif cutlass.const_expr(bits == 5):
-                ib0, ib1, sb, _ = trellis256_lane_geom_bits(lane, 0, 4, bits)
-                ia0, ia1, sa, _ = trellis256_lane_geom_bits(lane, 4, 4, bits)
-            elif cutlass.const_expr(bits > 5):
-                ia, ib, s2, delta = trellis256_lane_geom_bits(lane, 0, 8, bits)
-                i1 = ia + Int32(1)
-                i1 = i1 - Int32(tile_u32) * (i1 >= Int32(tile_u32)).to(Int32)
         b = Int32(0)
         while b < blocks:
             a_slot = blk % Int32(na)
@@ -2245,7 +2174,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 base + Int32(self.ws_bar_bc_full) + slot0 * Int32(_BARRIER_BYTES),
                 (unit0 // Int32(nc)) & Int32(1),
             )
-            if cutlass.const_expr("splitbc" not in self.ws_exp):
+            if cutlass.const_expr(not self.ws_splitbc):
                 _mbar_wait(
                     base + Int32(self.ws_bar_bc_full) + slot1 * Int32(_BARRIER_BYTES),
                     ((unit0 + Int32(1)) // Int32(nc)) & Int32(1),
@@ -2258,13 +2187,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             bc0 = base + Int32(self.ws_bc_off) + slot0 * Int32(self.ws_bc_slot)
             bc1 = base + Int32(self.ws_bc_off) + slot1 * Int32(self.ws_bc_slot)
             for q in cutlass.range_constexpr(8):
-                if cutlass.const_expr("splitbc" in self.ws_exp and q == 4):
+                if cutlass.const_expr(self.ws_splitbc and q == 4):
                     _mbar_wait(
                         base + Int32(self.ws_bar_bc_full) + slot1 * Int32(_BARRIER_BYTES),
                         ((unit0 + Int32(1)) // Int32(nc)) & Int32(1),
                     )
                 if cutlass.const_expr(
-                    "tailskip" in self.ws_exp and is_fc1 and self.intermediate_size % self.ws_n != 0
+                    self.ws_tailskip and is_fc1 and self.intermediate_size % self.ws_n != 0
                 ):
                     if col_active != Int32(0):
                         chain = (q % 4) // 2
@@ -2277,34 +2206,22 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                         a_addr_q = a_base + lrow * Int32(256) + pos * Int32(16)
                         a_regs = []
                         b_regs = []
-                        if cutlass.const_expr("sched" in self.ws_exp):
-                            wa0, wb0, wa1, wb1 = self._ws_windows_pair(
-                                gemm, row_addr, tbase0, tbase1, lane, prev_lane,
-                                ia, ib, i1, s2, delta, ib0, ib1, sb, ia0, ia1, sa, bits
+                        for jj in cutlass.range_constexpr(2):
+                            wa, wb = self._ws_windows(
+                                gemm, row_addr, cw * Int32(2) + Int32(jj), lane, bits
                             )
-                            frag0 = cute.make_rmem_tensor((2, 2), Uint32)
-                            gemm._scaled_dequant_b_fragment_trellis256_bits(frag0, wa0, wb0, lut_addr, bits)
-                            frag1 = cute.make_rmem_tensor((2, 2), Uint32)
-                            gemm._scaled_dequant_b_fragment_trellis256_bits(frag1, wa1, wb1, lut_addr, bits)
-                            b_regs.append((frag0[0, 0], frag0[0, 1], frag0[1, 0], frag0[1, 1]))
-                            b_regs.append((frag1[0, 0], frag1[0, 1], frag1[1, 0], frag1[1, 1]))
-                        else:
-                            for jj in cutlass.range_constexpr(2):
-                                wa, wb = self._ws_windows(
-                                    gemm, row_addr, cw * Int32(2) + Int32(jj), lane, bits
-                                )
-                                frag = cute.make_rmem_tensor((2, 2), Uint32)
-                                gemm._scaled_dequant_b_fragment_trellis256_bits(
-                                    frag, wa, wb, lut_addr, bits
-                                )
-                                b_regs.append((frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1]))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 3):
+                            frag = cute.make_rmem_tensor((2, 2), Uint32)
+                            gemm._scaled_dequant_b_fragment_trellis256_bits(
+                                frag, wa, wb, lut_addr, bits
+                            )
+                            b_regs.append((frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1]))
+                        if cutlass.const_expr(self.ws_splitbc and q == 3):
                             _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
+                        if cutlass.const_expr(self.ws_splitbc and q == 7):
                             _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
                         for mb in cutlass.range_constexpr(active):
                             a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
+                        if cutlass.const_expr(self.ws_splitbc and q == 7):
                             _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
                         for jj in cutlass.range_constexpr(2):
                             for mb in cutlass.range_constexpr(active):
@@ -2327,9 +2244,9 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                     acc[o + 2][0] = d2
                                     acc[o + 3][0] = d3
                     else:
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 3):
+                        if cutlass.const_expr(self.ws_splitbc and q == 3):
                             _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
-                        if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
+                        if cutlass.const_expr(self.ws_splitbc and q == 7):
                             _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
                             _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
                 else:
@@ -2340,45 +2257,33 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     gemm = (self.tier0, self.tier1)[tier_idx].fc2
                     if cutlass.const_expr(is_fc1):
                         gemm = (self.tier0, self.tier1)[tier_idx].fc1
+                    b_regs = []
+                    for jj in cutlass.range_constexpr(2):
+                        wa, wb = self._ws_windows(
+                            gemm, row_addr, cw * Int32(2) + Int32(jj), lane, bits
+                        )
+                        frag = cute.make_rmem_tensor((2, 2), Uint32)
+                        if cutlass.const_expr("nodecode" in self.ws_exp):
+                            frag[0, 0] = wa
+                            frag[0, 1] = wb
+                            frag[1, 0] = wa
+                            frag[1, 1] = wb
+                        else:
+                            gemm._scaled_dequant_b_fragment_trellis256_bits(
+                                frag, wa, wb, lut_addr, bits
+                            )
+                        b_regs.append((frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1]))
+                    if cutlass.const_expr(self.ws_splitbc and q == 3):
+                        _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
+                    if cutlass.const_expr(self.ws_splitbc and q == 7):
+                        _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
                     c = Int32(2 * q) + lchunk
                     pos = (c & Int32(8)) | ((c & Int32(7)) ^ lrow7)
                     a_addr_q = a_base + lrow * Int32(256) + pos * Int32(16)
                     a_regs = []
-                    b_regs = []
-                    if cutlass.const_expr("sched" in self.ws_exp):
-                        wa0, wb0, wa1, wb1 = self._ws_windows_pair(
-                            gemm, row_addr, tbase0, tbase1, lane, prev_lane,
-                            ia, ib, i1, s2, delta, ib0, ib1, sb, ia0, ia1, sa, bits
-                        )
-                        frag0 = cute.make_rmem_tensor((2, 2), Uint32)
-                        gemm._scaled_dequant_b_fragment_trellis256_bits(frag0, wa0, wb0, lut_addr, bits)
-                        frag1 = cute.make_rmem_tensor((2, 2), Uint32)
-                        gemm._scaled_dequant_b_fragment_trellis256_bits(frag1, wa1, wb1, lut_addr, bits)
-                        b_regs.append((frag0[0, 0], frag0[0, 1], frag0[1, 0], frag0[1, 1]))
-                        b_regs.append((frag1[0, 0], frag1[0, 1], frag1[1, 0], frag1[1, 1]))
-                    else:
-                        for jj in cutlass.range_constexpr(2):
-                            wa, wb = self._ws_windows(
-                                gemm, row_addr, cw * Int32(2) + Int32(jj), lane, bits
-                            )
-                            frag = cute.make_rmem_tensor((2, 2), Uint32)
-                            if cutlass.const_expr("nodecode" in self.ws_exp):
-                                frag[0, 0] = wa
-                                frag[0, 1] = wb
-                                frag[1, 0] = wa
-                                frag[1, 1] = wb
-                            else:
-                                gemm._scaled_dequant_b_fragment_trellis256_bits(
-                                    frag, wa, wb, lut_addr, bits
-                                )
-                            b_regs.append((frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1]))
-                    if cutlass.const_expr("splitbc" in self.ws_exp and q == 3):
-                        _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
-                    if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
-                        _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
                     for mb in cutlass.range_constexpr(active):
                         a_regs.append(ldmatrix_m8n8x4_b16(a_addr_q + Int32(4096 * mb)))
-                    if cutlass.const_expr("splitbc" in self.ws_exp and q == 7):
+                    if cutlass.const_expr(self.ws_splitbc and q == 7):
                         _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
                     for jj in cutlass.range_constexpr(0 if "nomma" in self.ws_exp else 2):
                         for mb in cutlass.range_constexpr(active):
@@ -2400,7 +2305,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                                 acc[o + 1][0] = d1
                                 acc[o + 2][0] = d2
                                 acc[o + 3][0] = d3
-            if cutlass.const_expr("splitbc" not in self.ws_exp):
+            if cutlass.const_expr(not self.ws_splitbc):
                 _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot0 * Int32(_BARRIER_BYTES))
                 _mbar_arrive(base + Int32(self.ws_bar_bc_empty) + slot1 * Int32(_BARRIER_BYTES))
                 _mbar_arrive(base + Int32(self.ws_bar_a_empty) + a_slot * Int32(_BARRIER_BYTES))
@@ -2655,13 +2560,15 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                 live_k = Int32(k_size)
                 if cutlass.const_expr(self.compact_weights):
                     live_k = ld_shared_i32_relaxed(hdr + Int32(20))
-                col_active = Int32(1)
                 if cutlass.const_expr(
-                    "tailskip" in self.ws_exp and is_fc1 and (n_total // 2) % self.ws_n != 0
+                    self.ws_tailskip and is_fc1 and (n_total // 2) % self.ws_n != 0
                 ):
+                    col_active = Int32(1)
                     half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
                     if (nt % Int32(half_tiles)) * Int32(self.ws_n) + (tid >> Int32(5)) * Int32(32) >= Int32(n_total // 2):
                         col_active = Int32(0)
+                else:
+                    col_active = None
                 for i in cutlass.range_constexpr(n_acc):
                     acc[i][0] = cutlass.Float32(0.0)
                 occupied = (valid + Int32(15)) // Int32(16)
