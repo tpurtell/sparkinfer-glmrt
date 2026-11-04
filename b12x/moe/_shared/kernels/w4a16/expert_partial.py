@@ -18,6 +18,7 @@ from b12x._lib.intrinsics import (cvt_f32_to_e4m3, cvt_e4m3_to_f32_via_f16,
 from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
 from b12x.integration.cuteafd.pointwise import _view
 from .kernel import W4A16TopKSumKernel
+from .reply_quant import _fp4_pair, fp8_scale
 
 
 FORMATS = ("bf16", "nvfp4", "fp8")
@@ -31,47 +32,6 @@ def partial_row_bytes(width, format):
     if stride % 16:
         raise ValueError(f"expert partial {format} width {width} has a non-16-byte-aligned record ({stride} bytes)")
     return stride
-
-
-@dsl_user_op
-def _fp4_pair(lo, hi, *, loc=None, ip=None):
-    return Uint32(llvm.inline_asm(T.i32(),
-        [Float32(lo).ir_value(), Float32(hi).ir_value()],
-        "{ .reg .b8 v; cvt.rn.satfinite.e2m1x2.f32 v, $2, $1; cvt.u32.u8 $0, v; }",
-        "=r,f,f", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT))
-
-
-@dsl_user_op
-def fp8_scale(amax, *, loc=None, ip=None):
-    # Compare amax's significand to 448 / 256 exactly. Division/log2 can
-    # underflow or round across a power-of-two boundary before the ceil.
-    result = llvm.inline_asm(llvm.StructType.get_literal([T.f32(), T.i32()]),
-        [Float32(amax).ir_value()], """
-        { .reg .pred tiny, above; .reg .f32 x; .reg .b32 bits, mant;
-          .reg .s32 exponent, adjust;
-          mov.f32 x, $2;
-          setp.lt.f32 tiny, x, 0f00800000;
-          @tiny mul.rn.f32 x, x, 0f4B800000;
-          selp.s32 adjust, 24, 0, tiny;
-          mov.b32 bits, x;
-          bfe.u32 exponent, bits, 23, 8;
-          sub.s32 exponent, exponent, 135;
-          sub.s32 exponent, exponent, adjust;
-          and.b32 mant, bits, 8388607;
-          setp.gt.u32 above, mant, 6291456;
-          @above add.s32 exponent, exponent, 1;
-          max.s32 exponent, exponent, -127;
-          min.s32 exponent, exponent, 127;
-          add.s32 $1, exponent, 127;
-          shl.b32 bits, $1, 23;
-          setp.eq.u32 tiny, $1, 0;
-          @tiny mov.b32 bits, 4194304;
-          mov.b32 $0, bits;
-        }""", "=f,=r,f", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
-    return (Float32(llvm.extractvalue(T.f32(), result, [0])),
-            Uint32(llvm.extractvalue(T.i32(), result, [1])))
 
 
 @cute.jit

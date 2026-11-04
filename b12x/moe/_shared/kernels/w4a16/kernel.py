@@ -21,6 +21,13 @@ from b12x._lib.compiler import (
 )
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import register_program_cache
+from .reply_quant import (
+    FORMAT_BF16,
+    FORMAT_FP8,
+    FORMAT_NVFP4,
+    reply_wire_bytes,
+    store_compressed_reply,
+)
 from b12x._lib.intrinsics import (
     atomic_add_global_i32,
     bf16_mma_m16n8k16_f32,
@@ -752,6 +759,7 @@ class W4A16TopKSumCompileResult:
     use_expert_map: bool = False
     full_rotation_output_dtype: str = "fp32"
     broadcast_svh: bool = False
+    reply_format: int = 0
 
 
 @dataclass(frozen=True)
@@ -9114,6 +9122,7 @@ class W4A16TopKSumKernel:
         use_expert_map: bool = False,
         broadcast_svh: bool = False,
         float32_output: bool = False,
+        reply_format: int = 0,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -9134,6 +9143,14 @@ class W4A16TopKSumKernel:
         # shared-su artifacts); index it with a zero expert stride.
         self.broadcast_svh = bool(broadcast_svh)
         self.float32_output = bool(float32_output)
+        self.reply_format = int(reply_format)
+        if self.reply_format not in (FORMAT_BF16, FORMAT_FP8, FORMAT_NVFP4):
+            raise ValueError(f"unsupported fused reply format {reply_format!r}")
+        if self.reply_format != FORMAT_BF16:
+            if not self.full_rotation or self.coupled_hadamard:
+                raise ValueError(
+                    "fused reply quantization requires the plain full-rotation epilogue"
+                )
         if self.use_expert_map:
             if self.route_num_experts <= 0:
                 raise ValueError("expert-map top-k sum requires route_num_experts > 0")
@@ -9194,9 +9211,13 @@ class W4A16TopKSumKernel:
                 (active_m * Int32(self.topk * self.hidden_size),), stride=(1,)
             ),
         )
+        if cutlass.const_expr(self.reply_format == FORMAT_BF16):
+            output_extent = active_m * Int32(self.hidden_size)
+        else:
+            output_extent = active_m * Int32(reply_wire_bytes(self.hidden_size, self.reply_format))
         output_flat = cute.make_tensor(
             output_ptr,
-            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
+            layout=cute.make_layout((output_extent,), stride=(1,)),
         )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
@@ -9574,7 +9595,20 @@ class W4A16TopKSumKernel:
                         acc2 += route_values[value_base + Int32(2)] * weight
                         acc3 += route_values[value_base + Int32(3)] * weight
                     out_base = token * Int32(self.hidden_size) + col0
-                    if cutlass.const_expr(self.full_rotation_output_bf16):
+                    if cutlass.const_expr(self.reply_format != FORMAT_BF16):
+                        store_compressed_reply(
+                            output_flat,
+                            token,
+                            col0,
+                            lane,
+                            Int32(self.hidden_size),
+                            self.reply_format,
+                            acc0,
+                            acc1,
+                            acc2,
+                            acc3,
+                        )
+                    elif cutlass.const_expr(self.full_rotation_output_bf16):
                         output_flat[out_base + Int32(0)] = cutlass.BFloat16(acc0)
                         output_flat[out_base + Int32(1)] = cutlass.BFloat16(acc1)
                         output_flat[out_base + Int32(2)] = cutlass.BFloat16(acc2)
@@ -11063,6 +11097,7 @@ def compile_w4a16_topk_sum(
     use_expert_map: bool = False,
     broadcast_svh: bool = False,
     float32_output: bool = False,
+    reply_format: int = 0,
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     if route_ids_dtype not in (torch.int32, torch.int64):
@@ -11084,6 +11119,7 @@ def compile_w4a16_topk_sum(
         bool(use_expert_map),
         bool(broadcast_svh),
         bool(float32_output),
+        int(reply_format),
     )
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
@@ -11112,6 +11148,12 @@ def compile_w4a16_topk_sum(
                 "full_rotation_output_dtype is only valid with full_rotation=True"
             )
         output_dtype = cutlass.Float32 if float32_output else cutlass_dtype
+    if int(reply_format) != FORMAT_BF16:
+        if not full_rotation or coupled_hadamard:
+            raise ValueError(
+                "fused reply quantization requires the plain full-rotation epilogue"
+            )
+        output_dtype = cutlass.Uint8
     output_fake = make_ptr(output_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     topk_weights_fake = make_ptr(
         cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
@@ -11139,6 +11181,7 @@ def compile_w4a16_topk_sum(
         use_expert_map=use_expert_map,
         broadcast_svh=broadcast_svh,
         float32_output=float32_output,
+        reply_format=int(reply_format),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -11174,6 +11217,7 @@ def compile_w4a16_topk_sum(
         use_expert_map=bool(use_expert_map),
         full_rotation_output_dtype=str(full_rotation_output_dtype),
         broadcast_svh=bool(broadcast_svh),
+        reply_format=int(reply_format),
     )
     attach_programs(result, compiled)
     _SUM_CACHE[cache_key] = result
@@ -12201,11 +12245,20 @@ def _w4a16_topk_sum_launch_flat(
     expert_map: torch.Tensor | None = None,
     svh_table: torch.Tensor | None = None,
     launcher: W4A16TopKSumCompileResult | None = None,
+    reply_format: int = 0,
 ) -> None:
     full_rotation = bool(full_rotation)
-    full_rotation_output_dtype = (
-        "bf16" if full_rotation and output.dtype == torch.bfloat16 else "fp32"
-    )
+    reply_format = int(reply_format)
+    if reply_format:
+        if not full_rotation or bool(coupled_hadamard):
+            raise ValueError(
+                "fused reply quantization requires the plain full-rotation epilogue"
+            )
+        full_rotation_output_dtype = "fp32"
+    else:
+        full_rotation_output_dtype = (
+            "bf16" if full_rotation and output.dtype == torch.bfloat16 else "fp32"
+        )
     coupled_hadamard = bool(coupled_hadamard)
     route_ids_dtype = (
         torch.int32 if route_expert_ids is None else route_expert_ids.dtype
@@ -12232,6 +12285,7 @@ def _w4a16_topk_sum_launch_flat(
         use_expert_map=expert_map is not None,
         broadcast_svh=broadcast_svh,
         float32_output=output.dtype == torch.float32,
+        reply_format=reply_format,
     )
     dummy_addr = output.data_ptr()
     weights_addr = dummy_addr if topk_weights is None else topk_weights.data_ptr()
@@ -12253,12 +12307,16 @@ def _w4a16_topk_sum_launch_flat(
         ),
         make_ptr(
             (
-                cutlass.BFloat16
-                if full_rotation_output_dtype == "bf16"
+                cutlass.Uint8
+                if reply_format
                 else (
-                    cutlass.Float32
-                    if full_rotation or output.dtype == torch.float32
-                    else _cutlass_element_dtype(element_dtype)
+                    cutlass.BFloat16
+                    if full_rotation_output_dtype == "bf16"
+                    else (
+                        cutlass.Float32
+                        if full_rotation or output.dtype == torch.float32
+                        else _cutlass_element_dtype(element_dtype)
+                    )
                 )
             ),
             output.data_ptr(),
@@ -14055,6 +14113,7 @@ def run_w4a16_moe(
             topk_ids.dtype if full_rotation or sum_uses_map else torch.int32,
             sum_uses_map,
             full_rotation_output_dtype,
+            0,
         )
         actual_sum = (
             int(topk_sum_launch.topk),
@@ -14066,6 +14125,7 @@ def run_w4a16_moe(
             getattr(topk_sum_launch, "route_ids_dtype", torch.int32),
             bool(getattr(topk_sum_launch, "use_expert_map", False)),
             str(getattr(topk_sum_launch, "full_rotation_output_dtype", "fp32")),
+            int(getattr(topk_sum_launch, "reply_format", 0)),
         )
         if actual_sum != expected_sum:
             raise RuntimeError(
