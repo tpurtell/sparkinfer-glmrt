@@ -770,10 +770,17 @@ PREFILL_TIER_COUNTS = {
 }
 
 
+def _prefill_arm_block(text):
+    if not text.isdigit():
+        return False
+    value = int(text)
+    return value == 8 or (value >= 16 and value % 16 == 0)
+
+
 def parse_prefill_arm(text):
     parts = text.split(":")
     if (len(parts) != 3 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", parts[0])
-            or parts[0].endswith("_control") or parts[1] not in ("8", "16", "32", "64")):
+            or parts[0].endswith("_control") or not _prefill_arm_block(parts[1])):
         raise argparse.ArgumentTypeError("prefill arm must be NAME:BLOCK:cooperative|ws (WS block >=16)")
     mode = parts[2]
     tokens = mode.split("+")
@@ -1084,12 +1091,14 @@ def _run_prefill_benchmark(args, device, props):
               for i in range(args.layers)]
     states = {}
     resources = {}
+    launches = {}
     modules, arm_revisions = prefill_arm_modules(specs, mix, args.arm_source_dir)
     for name, block, mode, _revision in specs:
         options = prefill_compile_options(family, width, block, mode, props,
                                           compact=compact is not None, capacity=capacity, bits=bits)
         arm_mix = modules[name]
         launch = arm_mix.compile_mixed_trellis(**options)
+        launches[name] = launch
         resources[name] = _kernel_resource_info(launch, props.shared_memory_per_block_optin)
         workspace = arm_mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
         bounds = dict(gate_experts=(896, 0), up_experts=(896, 0)) if family == "kimik3" else {}
@@ -1131,6 +1140,11 @@ def _run_prefill_benchmark(args, device, props):
     for name in names:
         for rows in sorted({1, min(17, capacity), capacity}):
             run(name, rows)
+    # Registers and spills are only queryable once each arm has launched.
+    for name in names:
+        refreshed = _kernel_resource_info(launches[name], props.shared_memory_per_block_optin)
+        if refreshed.get("regs", -1) >= 0 or resources[name].get("regs", -1) < 0:
+            resources[name] = refreshed
     checked = list(range(1, capacity + 1)) if args.prefill_exhaustive else sorted({v for v in (1, 17, 63, 64, 65, capacity, *rows_list) if v <= capacity})
     records = []
     with kernel_resolution_guard("family prefill bitwise and frozen timing"):

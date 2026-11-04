@@ -444,8 +444,16 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         if d.sqg_xor_cheb_t12_smem:
             raise ValueError("warp-specialized mixed Trellis reads the T12 table from global memory")
         block = int(d.moe_block_size)
-        if block not in (16, 32, 64):
-            raise ValueError("warp-specialized mixed Trellis needs 16, 32 or 64-row route blocks")
+        # The route block is only a row partition: every output element runs
+        # the same K order through the same two chains, so any multiple of 16
+        # is bit-identical. Its width is the launch's tile granularity (fewer,
+        # taller tiles re-stream each expert's weights less often) and is
+        # bounded by the accumulator: 2 chains x 16 registers per M16
+        # fragment against the 208-register consumer budget.
+        if block < 16 or block % 16:
+            raise ValueError(
+                f"warp-specialized mixed Trellis needs a multiple-of-16 route block, got {block}"
+            )
         if int(d.fc2.moe_block_size) != block or int(d.fc2.schedule_route_block_factor) != 1:
             raise ValueError("warp-specialized FC2 shares the FC1 route block")
         if int(d.fc2.tile_n) != int(d.fc1.tile_n):
