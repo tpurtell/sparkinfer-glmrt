@@ -9,6 +9,8 @@ The output is packed uint8, with the existing ExpertReply row layout.
 from __future__ import annotations
 
 import argparse
+import atexit
+import ctypes
 import hashlib
 import importlib
 import json
@@ -24,6 +26,30 @@ import torch
 
 from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
 from b12x.moe._shared.kernels.w4a16.expert_reply import compile_expert_reply_aot
+
+
+def output_buffer(shape, fill, mapped):
+    if not mapped:
+        return torch.full(shape, fill, device="cuda", dtype=torch.uint8)
+    runtime = ctypes.CDLL("libcudart.so")
+    host, alias = ctypes.c_void_p(), ctypes.c_void_p()
+    size = 1
+    for extent in shape:
+        size *= extent
+    runtime.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+    runtime.cudaHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    runtime.cudaFreeHost.argtypes = [ctypes.c_void_p]
+    status = runtime.cudaHostAlloc(ctypes.byref(host), size, 3)  # Portable | Mapped, matching transport.
+    if status:
+        raise RuntimeError(f"cudaHostAlloc: {status}")
+    atexit.register(runtime.cudaFreeHost, host)
+    status = runtime.cudaHostGetDevicePointer(ctypes.byref(alias), host, 0)
+    if status or alias.value != host.value:
+        raise RuntimeError(f"mapped GB10 output requires identical UVA aliases: {status}")
+    storage = (ctypes.c_ubyte * size).from_address(host.value)
+    tensor = torch.frombuffer(storage, dtype=torch.uint8).view(shape)
+    tensor.fill_(fill)
+    return tensor
 
 
 def pointer(dtype, tensor, alignment=16):
@@ -129,8 +155,8 @@ def run(args):
             raise RuntimeError(f"invalid sum capture timing: {sum_ms:.6f} ms at {rows}x{width}; expected >=0.3 ms")
         for fmt in args.formats:
             stride = width + width // 32 if fmt == 1 else width // 2 + width // 16
-            expected = torch.full((rows, stride), 0xA5, device="cuda", dtype=torch.uint8)
-            guarded = torch.full((rows * stride + 512,), 0x5A, device="cuda", dtype=torch.uint8)
+            expected = output_buffer((rows, stride), 0xA5, args.mapped_output)
+            guarded = output_buffer((rows * stride + 512,), 0x5A, args.mapped_output)
             actual = guarded[256:-256].view(rows, stride)
 
             def unfused():
@@ -197,7 +223,8 @@ def run(args):
             record = dict(rows=rows, width=width, topk=topk, experts=experts,
                           reply_format=fmt, exact=exact, oracle_sha256=oracle_hash,
                           bf16_sha256=expected_bf16_hash, bf16_sum_ms=sum_ms,
-                          codec_only_ms=codec_ms, l2_bytes=l2_bytes, scrub_bytes=scrub_bytes,
+                          codec_only_ms=codec_ms, mapped_output=args.mapped_output,
+                          l2_bytes=l2_bytes, scrub_bytes=scrub_bytes,
                           clocks=clock_snapshot(), samples_ms=samples,
                           medians_ms={k: statistics.median(v) for k, v in samples.items()})
             records.append(record)
@@ -223,6 +250,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--mapped-output", action="store_true", help="use transport cudaHostAllocPortable|Mapped output instead of device memory")
     parser.add_argument("--scrub-l2", action="store_true", help="write >=2x runtime L2 before each timed replay (scrub excluded)")
     parser.add_argument("--scrub-l2-bytes", type=int, default=64 * 1024 * 1024,
                         help="minimum scrub allocation; runtime 2xL2 is always enforced")
