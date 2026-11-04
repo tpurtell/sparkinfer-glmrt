@@ -1251,12 +1251,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             proj = Int64(0)
             if nt >= n_tiles // Int32(2):
                 proj = Int64(1)
-            if cutlass.const_expr((n_total // 2) % self.ws_n != 0):
+            if cutlass.const_expr(self.ws_nondiv_n256):
                 half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
                 local_n16 = Int64(nt - proj.to(Int32) * Int32(half_tiles)) * Int64(self.ws_n16)
-                rem_n16 = half_n16 - local_n16
-                if rem_n16 < Int64(self.ws_n16):
-                    row_bytes = rem_n16.to(Int32) * Int32(32) * bits
+                tail_n16 = half_n16 - local_n16
+                if tail_n16 < Int64(self.ws_n16):
+                    row_bytes = tail_n16.to(Int32) * Int32(32) * bits
             else:
                 local_n16 = Int64(nt) * Int64(self.ws_n16) - proj * half_n16
             proj_expert_u32 = Int64(k_size // 16) * half_n16 * tile_u32
@@ -2473,12 +2473,13 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
         col_valid = Int32(1)
         if cutlass.const_expr(
             (self.compact_weights and self.ws_n == 192)
-            or (is_fc1 and (n_total // 2) % self.ws_n != 0)
+            or (self.ws_nondiv_n256 and is_fc1)
         ):
             half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
-            live_n = Int32(n_total // 2)
             if cutlass.const_expr(self.compact_weights and self.ws_n == 192):
                 live_n = ld_shared_i32_relaxed(hdr + Int32(24))
+            else:
+                live_n = Int32(n_total // 2)
             local_col = (nt % Int32(half_tiles)) * Int32(self.ws_n) + cw * Int32(32) + Int32(8) * q
             if cutlass.const_expr(n_total % (2 * self.ws_n) != 0):
                 col = (nt // Int32(half_tiles)) * Int32(n_total // 2) + local_col
@@ -2564,8 +2565,8 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
                     self.ws_tailskip and is_fc1 and (n_total // 2) % self.ws_n != 0
                 ):
                     col_active = Int32(1)
-                    half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
-                    if (nt % Int32(half_tiles)) * Int32(self.ws_n) + (tid >> Int32(5)) * Int32(32) >= Int32(n_total // 2):
+                    col_half_tiles = (n_total // 2 + self.ws_n - 1) // self.ws_n
+                    if (nt % Int32(col_half_tiles)) * Int32(self.ws_n) + (tid >> Int32(5)) * Int32(32) >= Int32(n_total // 2):
                         col_active = Int32(0)
                 else:
                     col_active = None
