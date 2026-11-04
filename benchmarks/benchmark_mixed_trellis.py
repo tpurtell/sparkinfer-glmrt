@@ -779,6 +779,11 @@ def parse_prefill_arm(text):
     tokens = mode.split("+")
     base = tokens[0]
     opts = set(tokens[1:])
+    # `rev=SHA` pins the arm's K4 sibling modules (WS kernel and its host/driver)
+    # to a frozen fork revision, so a kernel A/B keeps both variants in one
+    # session; it is not a compile option and stays out of the mode string.
+    revisions = [token.split("=", 1)[1] for token in tokens[1:] if token.startswith("rev=")]
+    opts = {token for token in opts if not token.startswith("rev=")}
     allowed = {"dynamic", "static", "wire", "s2", "s3", "s4", "s5", "s6", "n128", "n256", "t384"}
     if (base not in ("cooperative", "ws")
             or (base == "cooperative" and opts)
@@ -786,9 +791,12 @@ def parse_prefill_arm(text):
             or not opts <= allowed
             or len(opts & {"s2", "s3", "s4", "s5", "s6"}) > 1
             or len(opts & {"n128", "n256", "t384"}) > 1
-            or len(opts & {"dynamic", "static"}) > 1):
+            or len(opts & {"dynamic", "static"}) > 1
+            or len(revisions) > 1
+            or any(not re.fullmatch(r"[0-9a-f]{7,40}", rev) for rev in revisions)):
         raise argparse.ArgumentTypeError("prefill arm must be NAME:BLOCK:cooperative|ws (WS block >=16)")
-    return parts[0], int(parts[1]), mode
+    mode = "+".join(token for token in tokens if not token.startswith("rev="))
+    return parts[0], int(parts[1]), mode, (revisions[0] if revisions else None)
 
 
 def prefill_route_waves(path, family, layer):
@@ -1045,7 +1053,7 @@ def _run_prefill_benchmark(args, device, props):
     specs = args.prefill_arm or [parse_prefill_arm(v) for v in (
         ("coop:32:cooperative", "ws:32:ws") if args.prefill_family == "qwen4"
         else ("coop8:8:cooperative", "coop16:16:cooperative", "ws16:16:ws"))]
-    names = [name for name, _, _ in specs]
+    names = [name for name, _, _, _ in specs]
     if len(names) < 2 or len(names) != len(set(names)):
         raise ValueError("prefill needs at least two uniquely named arms")
     rows_spec = args.rows or (args.capacities if args.compact_fixture else str(capacity))
@@ -1076,12 +1084,14 @@ def _run_prefill_benchmark(args, device, props):
               for i in range(args.layers)]
     states = {}
     resources = {}
-    for name, block, mode in specs:
+    modules, arm_revisions = prefill_arm_modules(specs, mix, args.arm_source_dir)
+    for name, block, mode, _revision in specs:
         options = prefill_compile_options(family, width, block, mode, props,
                                           compact=compact is not None, capacity=capacity, bits=bits)
-        launch = mix.compile_mixed_trellis(**options)
+        arm_mix = modules[name]
+        launch = arm_mix.compile_mixed_trellis(**options)
         resources[name] = _kernel_resource_info(launch, props.shared_memory_per_block_optin)
-        workspace = mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
+        workspace = arm_mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
         bounds = dict(gate_experts=(896, 0), up_experts=(896, 0)) if family == "kimik3" else {}
         if PREFILL_TIER_COUNTS[family][1] == 0:
             # Projection-tight storage for a single-tier family: every gate and
@@ -1090,8 +1100,8 @@ def _run_prefill_benchmark(args, device, props):
         if compact:
             bounds = dict(gate_experts=tuple(c[0] for c in compact["counts"]),
                           up_experts=tuple(c[1] for c in compact["counts"]))
-        bindings = [mix.bind_mixed_trellis(*layer, launch, **bounds) for layer in layers]
-        mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
+        bindings = [arm_mix.bind_mixed_trellis(*layer, launch, **bounds) for layer in layers]
+        arm_mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
         states[name] = workspace, bindings
     generator = torch.Generator().manual_seed(args.seed)
     ids = [(real_route_ids(capacity, waves[i % len(waves)], generator, experts, topk)
@@ -1116,7 +1126,7 @@ def _run_prefill_benchmark(args, device, props):
     def run(name, rows, layer=0):
         workspace, bindings = states[name]
         inp = wire[:rows] if bindings[layer].launch.input_format == "e4m3_k32" else x[:rows]
-        return mix.run_bound_mixed_trellis(inp, weights[:rows], ids[layer][:rows], bindings[layer], workspace)
+        return modules[name].run_bound_mixed_trellis(inp, weights[:rows], ids[layer][:rows], bindings[layer], workspace)
 
     for name in names:
         for rows in sorted({1, min(17, capacity), capacity}):
@@ -1190,7 +1200,9 @@ def _run_prefill_benchmark(args, device, props):
             record = dict(rows=rows, samples_us=samples, **k4_noise_summary(samples, names[0]))
             records.append(record)
             print(json.dumps(record), flush=True)
-    result = dict(schema=1, capacity=capacity, family=family, bits=list(bits), intermediate=width, arms=specs, resources=resources, source=provenance,
+    result = dict(schema=1, capacity=capacity, family=family, bits=list(bits), intermediate=width,
+        arms=[[name, block, mode] for name, block, mode, _revision in specs],
+        arm_revisions=arm_revisions, resources=resources, source=provenance,
         fixture=(("synthetic weights; synthetic rotated compact ownership" if compact.get("synthetic")
                   else "synthetic weights; actual compact ownership") if compact else
                  "synthetic weights; K4/K5 expert split 384/128" if family == "qwen4"
@@ -1602,6 +1614,34 @@ def coordinator_arm_modules(specs, current, source_dir=None):
         modules[name], manifest = loaded[revision]
         revisions[name] = manifest["revision"]
     return modules, revisions
+
+
+def prefill_arm_modules(specs, current, source_dir):
+    """Mixed Trellis module per prefill arm: the run's frozen K4 bundle, or a
+    frozen fork revision's K4 sibling modules (`rev=SHA`) in their own
+    namespace, so a kernel variant and the shipped kernel time in one session."""
+    modules, revisions, loaded = {}, {}, {}
+    for name, _block, _mode, revision in specs:
+        if revision is None:
+            modules[name], revisions[name] = current, None
+            continue
+        if revision not in loaded:
+            loaded[revision] = prefill_revision_bundle(revision, source_dir)
+        modules[name], manifest = loaded[revision]
+        revisions[name] = manifest["revision"]
+    return modules, revisions
+
+
+def prefill_revision_bundle(revision, source_dir):
+    from benchmarks.benchmark_exlr8_a16 import materialize_k4_arm, load_k4_arm
+    if source_dir is not None:
+        matches = [p / "k4" for p in Path(source_dir).glob(revision + "*") if (p / "k4").is_dir()]
+        if len(matches) != 1:
+            raise ValueError(f"missing or ambiguous frozen arm {revision} under {source_dir}")
+        bundle = matches[0]
+    else:
+        bundle = materialize_k4_arm(revision, Path(tempfile.mkdtemp(prefix="prefill-arm-")))
+    return load_k4_arm(bundle)
 
 
 def _power_limit_w(props):
