@@ -132,8 +132,8 @@ def run(args):
     fc2[2 * topk:3 * topk].mul_(128)
     bf16 = torch.empty(capacity, width, device="cuda", dtype=torch.bfloat16)
 
-    def sum_only(rows):
-        baseline.compiled(pointer(cutlass.Float16, fc2), pointer(cutlass.BFloat16, bf16),
+    def sum_only(rows, output=None):
+        baseline.compiled(pointer(cutlass.Float16, fc2), pointer(cutlass.BFloat16, bf16 if output is None else output),
                           pointer(cutlass.Float32, weights, 4), pointer(cutlass.Int32, ids, 4),
                           pointer(cutlass.Int32, expert_map, 4), pointer(cutlass.Float16, svh),
                           cutlass.Int32(experts), cutlass.Int32(experts), rows, cu_stream())
@@ -153,6 +153,13 @@ def run(args):
         sum_ms = elapsed(sum_graph, args.iterations, scrub)
         if rows >= 2663 and sum_ms < 0.3:
             raise RuntimeError(f"invalid sum capture timing: {sum_ms:.6f} ms at {rows}x{width}; expected >=0.3 ms")
+        mapped_sum_ms = None
+        if args.mapped_output:
+            mapped_sum = output_buffer((rows, width * 2), 0xD3, True).view(torch.bfloat16)
+            mapped_sum_graph = capture(lambda: sum_only(rows, mapped_sum))
+            torch.cuda.synchronize()
+            assert digest(mapped_sum.view(torch.uint8)) == expected_bf16_hash, "mapped BF16 sum differs"
+            mapped_sum_ms = elapsed(mapped_sum_graph, args.iterations, scrub)
         for fmt in args.formats:
             stride = width + width // 32 if fmt == 1 else width // 2 + width // 16
             expected = output_buffer((rows, stride), 0xA5, args.mapped_output)
@@ -223,6 +230,7 @@ def run(args):
             record = dict(rows=rows, width=width, topk=topk, experts=experts,
                           reply_format=fmt, exact=exact, oracle_sha256=oracle_hash,
                           bf16_sha256=expected_bf16_hash, bf16_sum_ms=sum_ms,
+                          bf16_mapped_sum_ms=mapped_sum_ms,
                           codec_only_ms=codec_ms, mapped_output=args.mapped_output,
                           l2_bytes=l2_bytes, scrub_bytes=scrub_bytes,
                           clocks=clock_snapshot(), samples_ms=samples,
