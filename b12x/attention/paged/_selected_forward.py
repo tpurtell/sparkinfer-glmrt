@@ -454,15 +454,22 @@ class _SelectedPositionPagedForwardKernel:
         selection and page-table loads run while this tile's KV is in flight.
         """
         if const_expr(not self.kv_is_fp8):
+            # One token per warp instruction: a 384-byte Step-5 token slice is
+            # three 128-byte sectors from one region, where packing vectors
+            # linearly across lanes splits every warp instruction over two
+            # tokens. The 256-byte Qwen slice fills a warp either way.
             vectors_per_row = self.head_dim // 8
-            for vector_iter in cutlass.range_constexpr(
-                (self.tile_n * vectors_per_row + self.threads - 1) // self.threads
+            warps = self.threads // 32
+            warp = thread // Int32(32)
+            lane = thread % Int32(32)
+            for row_iter in cutlass.range_constexpr(
+                (self.tile_n + warps - 1) // warps
             ):
-                linear_vector = thread + Int32(vector_iter * self.threads)
-                if linear_vector < Int32(self.tile_n * vectors_per_row):
-                    token = linear_vector // Int32(vectors_per_row)
-                    vector = linear_vector % Int32(vectors_per_row)
-                    dimension_base = vector * Int32(8)
+                token = warp + Int32(row_iter * warps)
+                if (token < Int32(self.tile_n)) & (
+                    lane < Int32(vectors_per_row)
+                ):
+                    dimension_base = lane * Int32(8)
                     key_base = Int64(key_bases[buffer, token])
                     value_base = key_base
                     if const_expr(not self.shared_cache_strides):
