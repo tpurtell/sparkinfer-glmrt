@@ -86,9 +86,37 @@ _CASES = (
     ("qwen", "direct", (128,)),
 )
 
-_CASE_LABELS = tuple(
-    f"{family}-{route}-r{rows}" for family, route, rows_set in _CASES for rows in rows_set
+# Sparse, irregular selections. Every row keeps a different subset of the
+# 16-column groups, so rows have different live tiles, many tiles are empty
+# between live ones, some 32-column tiles are empty while their neighbours are
+# live, and rows differ from each other. A tile-compaction step that reorders
+# or over-skips tiles changes these rows' bits.
+_SPARSE_CASES = (
+    ("step5-csa", "direct", 1),
+    ("step5-csa", "direct", 16),
+    ("step5-swa", "direct", 16),
+    ("qwen", "split", 16),
 )
+
+
+def _case_label(family: str, route: str, rows: int, layout: str) -> str:
+    suffix = "" if layout == "base" else f"-{layout}"
+    return f"{family}-{route}{suffix}-r{rows}"
+
+
+# label -> (family, route, rows, layout)
+_CASE_SPEC = {
+    _case_label(family, route, rows, "base"): (family, route, rows, "base")
+    for family, route, rows_set in _CASES
+    for rows in rows_set
+}
+_CASE_SPEC.update(
+    {
+        _case_label(family, route, rows, "sparse"): (family, route, rows, "sparse")
+        for family, route, rows in _SPARSE_CASES
+    }
+)
+_CASE_LABELS = tuple(_CASE_SPEC)
 
 
 def _splits(family: str, rows: int) -> int:
@@ -107,6 +135,7 @@ def _spec() -> dict[str, object]:
         "history": _HISTORY,
         "geometries": _GEOMETRIES,
         "cases": [[family, route, list(rows)] for family, route, rows in _CASES],
+        "sparse_cases": [[family, route, rows] for family, route, rows in _SPARSE_CASES],
     }
 
 
@@ -145,7 +174,25 @@ def _fill_positions(positions: torch.Tensor, layout: str, live: int) -> None:
         raise ValueError(layout)
 
 
-def _build_case(family: str, rows: int, device: torch.device) -> dict[str, torch.Tensor]:
+def _fill_sparse(positions: torch.Tensor, live: int, row: int, group: int) -> None:
+    """Per-row irregular selection: different live groups, gaps, boundary splits.
+
+    Each row keeps two lanes inside a row-dependent two-in-seven subset of the
+    16-column groups, so adjacent groups often form a non-empty 32-column tile
+    beside empty ones, a live group can sit alone between long gaps, and the
+    last group always holds a live column.
+    """
+    positions.fill_(-1)
+    limit = min(live, positions.shape[0])
+    lanes = ((row * 3 + group) % 16, (row * 5 + 7 + group) % 16)
+    for column in range(limit):
+        group_index = column // 16
+        if ((group_index * 5 + row * 3 + group * 2) % 7) < 2 and column % 16 in lanes:
+            positions[column] = column
+    positions[limit - 1] = limit - 1
+
+
+def _build_case(family: str, rows: int, device: torch.device, layout: str = "base") -> dict[str, torch.Tensor]:
     """Deterministic inputs for one (family, rows) cell, built on the CPU."""
     geometry = _GEOMETRIES[family]
     page_rows = geometry["page_rows"]
@@ -169,7 +216,10 @@ def _build_case(family: str, rows: int, device: torch.device) -> dict[str, torch
     selected = torch.empty((rows, groups, width), dtype=torch.int32)
     for row in range(rows):
         for group in range(groups):
-            _fill_positions(selected[row, group], geometry["layout"], live)
+            if layout == "sparse":
+                _fill_sparse(selected[row, group], live, row, group)
+            else:
+                _fill_positions(selected[row, group], geometry["layout"], live)
     output = torch.zeros_like(query)
     splits = _splits(family, rows)
     partial_output = torch.zeros((rows, splits, q_heads, head_dim), dtype=torch.float32)
@@ -276,11 +326,14 @@ def _reference(family: str, case: dict, rows: int) -> torch.Tensor:
     pairs = q_heads // kv_heads
     device = case["output"].device
     reference = torch.empty((1, q_heads, head_dim), dtype=torch.float64, device=device)
-    live = int((case["selected_positions"][0, 0] >= 0).sum().item())
+    query_position = int(case["query_positions"][0])
     for kv_head in range(kv_heads):
         group = kv_head // (kv_heads // groups)
         logical = case["selected_positions"][0, group].long()
-        logical = logical[(logical >= 0) & (logical <= int(case["query_positions"][0]))]
+        live = int(((logical >= 0) & (logical <= query_position)).sum().item())
+        logical = logical[(logical >= 0) & (logical <= query_position)]
+        # Rows are independent (and the sparse cells give each group its own
+        # selection), so the count is per KV-head group, not one shared value.
         assert logical.numel() == live
         page = case["block_table"][0][logical // page_rows].long()
         offset = logical % page_rows
@@ -331,12 +384,10 @@ def test_capture_golden():
     impl = _impl()
     impl.clear_caches()
     cells = {}
-    for family, route, rows_set in _CASES:
-        for rows in rows_set:
-            label = f"{family}-{route}-r{rows}"
-            case = _build_case(family, rows, device)
-            cells[label] = _capture(impl, family, route, rows, case)
-            print(f"captured {label}", flush=True)
+    for label, (family, route, rows, layout) in _CASE_SPEC.items():
+        case = _build_case(family, rows, device, layout)
+        cells[label] = _capture(impl, family, route, rows, case)
+        print(f"captured {label}", flush=True)
     impl.clear_caches()
     path = Path(_GOLDEN)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,13 +408,12 @@ def test_cell_matches_baseline(label: str):
     """Candidate-tree arm: require the baseline's exact bits for this cell."""
     if _MODE != "check":
         pytest.skip("check mode only (PAGED_SELECTED_MODE=check)")
-    family, route, rows_text = label.rsplit("-", 2)
-    rows = int(rows_text[1:])
+    family, route, rows, layout = _CASE_SPEC[label]
     device = require_b12x()
     payload = _load_golden()
     impl = _impl()
     impl.clear_caches()
-    case = _build_case(family, rows, device)
+    case = _build_case(family, rows, device, layout)
     produced = _capture(impl, family, route, rows, case)
     _compare(label, produced, payload["cells"][label])
     if rows == 1:
