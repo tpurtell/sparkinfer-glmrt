@@ -379,6 +379,7 @@ class _SelectedPositionPagedForwardKernel:
         selected_positions: cute.Pointer,
         key_bases: cute.Tensor,
         value_bases: cute.Tensor,
+        buffer: Int32,
         num_cache_pages: Int64,
         table_width: Int64,
         thread: Int32,
@@ -428,13 +429,13 @@ class _SelectedPositionPagedForwardKernel:
                         + page_offset * Int64(self.value_token_stride)
                         + kv_head.to(Int64) * Int64(self.value_head_stride)
                     )
-            key_bases[column] = key_base
+            key_bases[buffer, column] = key_base
             if const_expr(not self.shared_cache_strides):
-                value_bases[column] = value_base
+                value_bases[buffer, column] = value_base
         cute.arch.sync_threads()
 
     @cute.jit
-    def _selected_tile_body(
+    def _issue_selected_tile_gather(
         self,
         kv_head: Int32,
         key_cache: cute.Pointer,
@@ -443,27 +444,15 @@ class _SelectedPositionPagedForwardKernel:
         value_bases: cute.Tensor,
         shared_key: cute.Tensor,
         shared_value: cute.Tensor,
-        shared_probability: cute.Tensor,
-        shared_row_scale: cute.Tensor,
         thread: Int32,
-        tiled_mma_qk: cute.TiledMma,
-        tiled_mma_pv: cute.TiledMma,
-        register_query: cute.Tensor,
-        register_key: cute.Tensor,
-        register_probability: cute.Tensor,
-        register_value: cute.Tensor,
-        copy_query: cute.TiledCopy,
-        copy_key: cute.TiledCopy,
-        copy_probability: cute.TiledCopy,
-        copy_value: cute.TiledCopy,
-        copy_source_query: cute.Tensor,
-        copy_source_key: cute.Tensor,
-        copy_source_probability: cute.Tensor,
-        copy_source_value: cute.Tensor,
-        accumulator_output: cute.Tensor,
-        softmax: Softmax,
-        is_first: cutlass.Constexpr,
+        buffer: Int32,
     ) -> None:
+        """Stage this tile's KV into shared memory from the bases resolved
+        for ``buffer`` and leave the copies in flight.
+
+        The wait moves to ``_finish_selected_tile`` so the next tile's
+        selection and page-table loads run while this tile's KV is in flight.
+        """
         if const_expr(not self.kv_is_fp8):
             vectors_per_row = self.head_dim // 8
             for vector_iter in cutlass.range_constexpr(
@@ -474,10 +463,10 @@ class _SelectedPositionPagedForwardKernel:
                     token = linear_vector // Int32(vectors_per_row)
                     vector = linear_vector % Int32(vectors_per_row)
                     dimension_base = vector * Int32(8)
-                    key_base = Int64(key_bases[token])
+                    key_base = Int64(key_bases[buffer, token])
                     value_base = key_base
                     if const_expr(not self.shared_cache_strides):
-                        value_base = Int64(value_bases[token])
+                        value_base = Int64(value_bases[buffer, token])
                     key_valid = key_base >= Int64(0)
                     value_valid = value_base >= Int64(0)
                     safe_key_base = Int64(cutlass.select_(key_valid, key_base, Int64(0)))
@@ -515,7 +504,6 @@ class _SelectedPositionPagedForwardKernel:
                         cutlass.select_(value_valid, Int32(16), Int32(0)),
                     )
             cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
         else:
             vectors_per_row = self.head_dim // 16
             for vector_iter in cutlass.range_constexpr(
@@ -525,10 +513,10 @@ class _SelectedPositionPagedForwardKernel:
                 if linear_vector < Int32(self.tile_n * vectors_per_row):
                     token = linear_vector // Int32(vectors_per_row)
                     dimension_base = (linear_vector % Int32(vectors_per_row)) * Int32(16)
-                    key_base = Int64(key_bases[token])
+                    key_base = Int64(key_bases[buffer, token])
                     value_base = key_base
                     if const_expr(not self.shared_cache_strides):
-                        value_base = Int64(value_bases[token])
+                        value_base = Int64(value_bases[buffer, token])
                     self._load_fp8_vector_to_bf16_shared(
                         key_cache,
                         key_base,
@@ -549,6 +537,35 @@ class _SelectedPositionPagedForwardKernel:
                         self.value_head_stride,
                         self.inline_scale_offsets[1] if self.inline_scale_offsets is not None else 0,
                     )
+
+    @cute.jit
+    def _finish_selected_tile(
+        self,
+        key_bases: cute.Tensor,
+        shared_probability: cute.Tensor,
+        shared_row_scale: cute.Tensor,
+        thread: Int32,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        register_query: cute.Tensor,
+        register_key: cute.Tensor,
+        register_probability: cute.Tensor,
+        register_value: cute.Tensor,
+        copy_query: cute.TiledCopy,
+        copy_key: cute.TiledCopy,
+        copy_probability: cute.TiledCopy,
+        copy_value: cute.TiledCopy,
+        copy_source_query: cute.Tensor,
+        copy_source_key: cute.Tensor,
+        copy_source_probability: cute.Tensor,
+        copy_source_value: cute.Tensor,
+        accumulator_output: cute.Tensor,
+        softmax: Softmax,
+        is_first: cutlass.Constexpr,
+        buffer: Int32,
+    ) -> None:
+        if const_expr(not self.kv_is_fp8):
+            cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
         if thread < Int32(self.qk_warps * 32):
@@ -580,7 +597,7 @@ class _SelectedPositionPagedForwardKernel:
                 for n in cutlass.range_constexpr(cute.size(score_mn.shape[1])):
                     coordinate = score_coordinates[m, n]
                     if (coordinate[0] >= Int32(self.heads_per_kv)) | (
-                        Int64(key_bases[coordinate[1]]) < Int64(0)
+                        Int64(key_bases[buffer, coordinate[1]]) < Int64(0)
                     ):
                         score_mn[m, n] = -Float32.inf
 
@@ -804,14 +821,17 @@ class _SelectedPositionPagedForwardKernel:
             layout=cute.make_layout((self.tile_m,), stride=(1,)),
             byte_alignment=16,
         )
+        # Two buffers so the next tile's per-row bases resolve while the
+        # current tile's KV copies are in flight.
+        base_layout = cute.make_layout((2, self.tile_n), stride=(self.tile_n, 1))
         key_bases = allocator.allocate_tensor(
             element_type=Int64,
-            layout=cute.make_layout((self.tile_n,), stride=(1,)),
+            layout=base_layout,
             byte_alignment=16,
         )
         value_bases = allocator.allocate_tensor(
             element_type=Int64,
-            layout=cute.make_layout((self.tile_n,), stride=(1,)),
+            layout=base_layout,
             byte_alignment=16,
         )
         tile_flags = allocator.allocate_tensor(
@@ -914,6 +934,11 @@ class _SelectedPositionPagedForwardKernel:
             thread,
         )
         cute.arch.sync_threads()
+        # One metadata chain per tile, overlapped with the tile in flight:
+        # resolve bases into the current ping-pong buffer, issue that buffer's
+        # shared-memory copies, then resolve the next tile's bases while those
+        # copies are still moving. The per-row arithmetic and the order each
+        # tile is reduced in are unchanged, so results stay bit-identical.
         self._resolve_selected_bases(
             split,
             row,
@@ -925,11 +950,12 @@ class _SelectedPositionPagedForwardKernel:
             selected_positions,
             key_bases,
             value_bases,
+            Int32(0),
             num_cache_pages,
             table_width,
             thread,
         )
-        self._selected_tile_body(
+        self._issue_selected_tile_gather(
             kv_head,
             key_cache,
             value_cache,
@@ -937,6 +963,29 @@ class _SelectedPositionPagedForwardKernel:
             value_bases,
             shared_key,
             shared_value,
+            thread,
+            Int32(0),
+        )
+        if tiles_per_split > Int32(1):
+            if tile_flags[split + splits] != Int32(0):
+                self._resolve_selected_bases(
+                    split + splits,
+                    row,
+                    kv_head,
+                    request_id,
+                    request_valid,
+                    query_position,
+                    block_table,
+                    selected_positions,
+                    key_bases,
+                    value_bases,
+                    Int32(1),
+                    num_cache_pages,
+                    table_width,
+                    thread,
+                )
+        self._finish_selected_tile(
+            key_bases,
             shared_probability,
             shared_row_scale,
             thread,
@@ -957,27 +1006,14 @@ class _SelectedPositionPagedForwardKernel:
             accumulator_output,
             softmax,
             is_first=True,
+            buffer=Int32(0),
         )
         for local_tile in cutlass.range(tiles_per_split - Int32(1), unroll=1):
             tile = split + (Int32(local_tile) + Int32(1)) * splits
+            buffer = (Int32(local_tile) + Int32(1)) % Int32(2)
             if tile_flags[tile] != Int32(0):
                 cute.arch.sync_threads()
-                self._resolve_selected_bases(
-                    tile,
-                    row,
-                    kv_head,
-                    request_id,
-                    request_valid,
-                    query_position,
-                    block_table,
-                    selected_positions,
-                    key_bases,
-                    value_bases,
-                    num_cache_pages,
-                    table_width,
-                    thread,
-                )
-                self._selected_tile_body(
+                self._issue_selected_tile_gather(
                     kv_head,
                     key_cache,
                     value_cache,
@@ -985,6 +1021,33 @@ class _SelectedPositionPagedForwardKernel:
                     value_bases,
                     shared_key,
                     shared_value,
+                    thread,
+                    buffer,
+                )
+            # Prefetching the next executed tile must not depend on this tile
+            # being executed: an unselected tile skips its own work but still
+            # resolves the bases for the tile after it.
+            if Int32(local_tile) + Int32(2) < tiles_per_split:
+                if tile_flags[tile + splits] != Int32(0):
+                    self._resolve_selected_bases(
+                        tile + splits,
+                        row,
+                        kv_head,
+                        request_id,
+                        request_valid,
+                        query_position,
+                        block_table,
+                        selected_positions,
+                        key_bases,
+                        value_bases,
+                        Int32(local_tile) % Int32(2),
+                        num_cache_pages,
+                        table_width,
+                        thread,
+                    )
+            if tile_flags[tile] != Int32(0):
+                self._finish_selected_tile(
+                    key_bases,
                     shared_probability,
                     shared_row_scale,
                     thread,
@@ -1005,6 +1068,7 @@ class _SelectedPositionPagedForwardKernel:
                     accumulator_output,
                     softmax,
                     is_first=False,
+                    buffer=buffer,
                 )
         cute.arch.sync_threads()
 
