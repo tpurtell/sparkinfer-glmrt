@@ -107,7 +107,13 @@ class DenseMlaForwardKernel:
         self.math_warps = self.math_warps_per_query * self.query_tile
         self.math_threads = self.math_warps * 32
         self.group_threads = self.math_warps_per_query * 32
-        self.block_threads = self.math_threads + 32
+        # The compact-record gather is the pace-setter: one warp pays a full
+        # global round trip per record it stages, so four warps stage a chunk
+        # in parallel. The other readers stay single-warp.
+        self.producer_warps = 4 if self.ds_mla_record else 1
+        if self.candidates_per_chunk % (self.producer_warps * 8):
+            raise ValueError("DS-MLA gather warps must split the chunk evenly")
+        self.block_threads = self.math_threads + self.producer_warps * 32
         self.value_tiles = self.value_dim // (16 * self.math_warps_per_query)
         self.accumulator_slots = (
             4 * self.value_tiles * self.head_tiles_per_row
@@ -597,16 +603,23 @@ class DenseMlaForwardKernel:
         if tid == Int32(0):
             for stage in cutlass.range_constexpr(self.kv_stages):
                 # Bulk copies complete on their byte total and one arrival;
-                # compact records publish synchronous stores from all 32 lanes.
-                cute.arch.mbarrier_init(mbar_base + stage, Int32(32 if self.ds_mla_record else 1))
+                # compact records publish synchronous stores from every lane of
+                # every gathering warp.
+                cute.arch.mbarrier_init(
+                    mbar_base + stage,
+                    Int32(32 * self.producer_warps if self.ds_mla_record else 1),
+                )
                 cute.arch.mbarrier_init(
                     mbar_base + Int32(self.kv_stages + stage),
                     Int32(self.query_tile),
                 )
         cute.arch.barrier()
 
-        if warp == Int32(self.math_warps):
+        if warp >= Int32(self.math_warps):
             io_lane = lane
+            io_warp = warp - Int32(self.math_warps)
+            records_per_warp = self.candidates_per_chunk // self.producer_warps
+            record_base = io_warp * Int32(records_per_warp)
             producer_phase = Int32(1)
             producer_index = Int32(0)
             kv_buffer_bytes = Int32(
@@ -629,6 +642,7 @@ class DenseMlaForwardKernel:
                         page_stride_bytes, cache_record_stride_bytes, page_table_stride,
                         page_size=self.page_size, record_stride_bytes=self.layout.record_stride_bytes,
                         candidates_per_chunk=self.candidates_per_chunk,
+                        record_base=record_base, record_count=records_per_warp,
                     )
                 else:
                     issue_dense_page_gather(
