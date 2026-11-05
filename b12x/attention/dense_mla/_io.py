@@ -96,26 +96,71 @@ def issue_ds_mla_page_gather(
     Only the current shared-memory window is widened; no global BF16 cache or
     query conversion is needed. Every producer lane publishes its own stores.
     """
-    for entry in cutlass.range(candidates_per_chunk, unroll=1):
-        token = token_begin + Int32(entry)
-        if token >= token_end:
-            token = Int32(0)
-        page = token // Int32(page_size)
-        physical = Int32(page_table[request.to(Int64) * page_table_stride + page.to(Int64)])
-        source = get_ptr_as_int64(cache_bytes, physical.to(Int64) * page_stride_bytes
-            + (token - page * Int32(page_size)).to(Int64) * record_stride_bytes_global)
-        words = cute.make_ptr(Uint32, source, cute.AddressSpace.gmem, assumed_align=4)
-        scales = cute.make_ptr(Float32, source + Int64(512), cute.AddressSpace.gmem, assumed_align=4)
-        destination = kv_dst_addr + Int32(entry) * Int32(record_stride_bytes)
-        for j in cutlass.range_constexpr(4):
-            group = Int32(j)
-            packed = words[group * Int32(32) + io_lane]
-            a, b, c, d = cvt_e4m3x4_to_f32x4(packed)
-            scale = Float32(scales[group])
-            offset = destination + (group * Int32(128) + io_lane * Int32(4)) * Int32(2)
-            st_shared_u32(offset, pack_f32x2_to_bfloat2(a * scale, b * scale))
-            st_shared_u32(offset + Int32(4), pack_f32x2_to_bfloat2(c * scale, d * scale))
-        st_shared_u32(destination + Int32(1024) + io_lane * Int32(4), words[Int32(132) + io_lane])
+    request_base = request.to(Int64) * page_table_stride
+    if cutlass.const_expr(candidates_per_chunk == page_size):
+        # The producer begins every chunk at ``chunk * candidates_per_chunk``,
+        # and a chunk is one page wide, so the whole chunk resolves through a
+        # single page-table entry instead of one dependent global page lookup
+        # per record. Candidates at or past ``token_end`` keep reading page
+        # zero's first record, exactly as the general path below does.
+        page = token_begin // Int32(page_size)
+        chunk_physical = Int32(page_table[request_base + page.to(Int64)])
+        zero_physical = Int32(page_table[request_base])
+        batch = 8
+        raw = cute.make_rmem_tensor((batch, 5), Uint32)
+        scale_v = cute.make_rmem_tensor((batch, 4), Float32)
+        for base in cutlass.range(candidates_per_chunk // batch, unroll=1):
+            # Issue the whole batch's global loads before its first shared
+            # store: the gather is latency bound, so eight independent round
+            # trips in flight cost about one.
+            for e in cutlass.range_constexpr(batch):
+                entry = base * Int32(batch) + Int32(e)
+                physical = chunk_physical
+                offset = Int32(e)
+                if token_begin + entry >= token_end:
+                    physical = zero_physical
+                    offset = Int32(0)
+                source = get_ptr_as_int64(
+                    cache_bytes,
+                    physical.to(Int64) * page_stride_bytes
+                    + offset.to(Int64) * record_stride_bytes_global,
+                )
+                words = cute.make_ptr(Uint32, source, cute.AddressSpace.gmem, assumed_align=4)
+                scales = cute.make_ptr(Float32, source + Int64(512), cute.AddressSpace.gmem, assumed_align=4)
+                for j in cutlass.range_constexpr(4):
+                    raw[e, j] = words[Int32(j) * Int32(32) + io_lane]
+                    scale_v[e, j] = Float32(scales[Int32(j)])
+                raw[e, 4] = words[Int32(132) + io_lane]
+            for e in cutlass.range_constexpr(batch):
+                destination = kv_dst_addr + (base * Int32(batch) + Int32(e)) * Int32(record_stride_bytes)
+                for j in cutlass.range_constexpr(4):
+                    a, b, c, d = cvt_e4m3x4_to_f32x4(raw[e, j])
+                    scale = scale_v[e, j]
+                    store = destination + (Int32(j) * Int32(128) + io_lane * Int32(4)) * Int32(2)
+                    st_shared_u32(store, pack_f32x2_to_bfloat2(a * scale, b * scale))
+                    st_shared_u32(store + Int32(4), pack_f32x2_to_bfloat2(c * scale, d * scale))
+                st_shared_u32(destination + Int32(1024) + io_lane * Int32(4), raw[e, 4])
+    else:
+        for entry in cutlass.range(candidates_per_chunk, unroll=1):
+            token = token_begin + Int32(entry)
+            if token >= token_end:
+                token = Int32(0)
+            page = token // Int32(page_size)
+            physical = Int32(page_table[request_base + page.to(Int64)])
+            source = get_ptr_as_int64(cache_bytes, physical.to(Int64) * page_stride_bytes
+                + (token - page * Int32(page_size)).to(Int64) * record_stride_bytes_global)
+            words = cute.make_ptr(Uint32, source, cute.AddressSpace.gmem, assumed_align=4)
+            scales = cute.make_ptr(Float32, source + Int64(512), cute.AddressSpace.gmem, assumed_align=4)
+            destination = kv_dst_addr + Int32(entry) * Int32(record_stride_bytes)
+            for j in cutlass.range_constexpr(4):
+                group = Int32(j)
+                packed = words[group * Int32(32) + io_lane]
+                a, b, c, d = cvt_e4m3x4_to_f32x4(packed)
+                scale = Float32(scales[group])
+                offset = destination + (group * Int32(128) + io_lane * Int32(4)) * Int32(2)
+                st_shared_u32(offset, pack_f32x2_to_bfloat2(a * scale, b * scale))
+                st_shared_u32(offset + Int32(4), pack_f32x2_to_bfloat2(c * scale, d * scale))
+            st_shared_u32(destination + Int32(1024) + io_lane * Int32(4), words[Int32(132) + io_lane])
     cute.arch.mbarrier_arrive(full_mbar_ptr)
 
 
