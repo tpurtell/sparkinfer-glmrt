@@ -90,15 +90,18 @@ def issue_ds_mla_page_gather(
     io_lane: Int32, page_stride_bytes: Int64, record_stride_bytes_global: Int64,
     page_table_stride: Int64, *, page_size: cutlass.Constexpr,
     record_stride_bytes: cutlass.Constexpr, candidates_per_chunk: cutlass.Constexpr,
-    record_base: Int32, record_count: cutlass.Constexpr,
+    record_base: Int32 = 0, record_count: cutlass.Constexpr = 0,
 ):
     """Read GLM's 656-byte record directly into the existing BF16 math tile.
 
     Only the current shared-memory window is widened; no global BF16 cache or
     query conversion is needed. Every producer lane publishes its own stores.
     ``record_base``/``record_count`` are one gathering warp's slice of the
-    chunk; each warp of a multi-warp gather stages its own records.
+    chunk; a multi-warp gather stages the chunk in parallel slices, and the
+    defaults stage all of it from one warp.
     """
+    if cutlass.const_expr(record_count == 0):
+        record_count = candidates_per_chunk
     request_base = request.to(Int64) * page_table_stride
     if cutlass.const_expr(candidates_per_chunk == page_size):
         # The producer begins every chunk at ``chunk * candidates_per_chunk``,
