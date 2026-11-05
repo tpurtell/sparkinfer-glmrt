@@ -116,7 +116,9 @@ def issue_ds_mla_page_gather(
             for e in cutlass.range_constexpr(batch):
                 entry = base * Int32(batch) + Int32(e)
                 physical = chunk_physical
-                offset = Int32(e)
+                # Chunk-local record index; token_begin is page aligned, so the
+                # in-page offset is the entry itself.
+                offset = entry
                 if token_begin + entry >= token_end:
                     physical = zero_physical
                     offset = Int32(0)
