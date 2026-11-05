@@ -172,12 +172,15 @@ def choose_layout(
     single_request: bool = True,
     windowed: bool = False,
     query_rows: int = 1,
+    heads_per_tile: int | None = None,
 ) -> SmemLayout:
     """Pick the SMEM specialization for one serving role.
 
     Decode and verify keep one query row per block: a single row already fills
     the machine and its gather is latency bound, not bandwidth bound.  A
     multi-row prefill tile amortizes the gathered KV window across query rows.
+    ``heads_per_tile`` overrides the decoded head width only; the prefill tile
+    keeps its own geometry.
     """
     if mode == "extend" and single_request and not windowed:
         if not fp8:
@@ -198,7 +201,13 @@ def choose_layout(
             qk_dim=qk_dim,
             value_dim=value_dim,
         )
-    return make_smem_layout(query_tile=1, fp8=fp8, qk_dim=qk_dim, value_dim=value_dim)
+    return make_smem_layout(
+        query_tile=1,
+        fp8=fp8,
+        qk_dim=qk_dim,
+        value_dim=value_dim,
+        **({} if heads_per_tile is None else {"heads_per_tile": heads_per_tile}),
+    )
 
 
 def get_shared_storage_cls(layout: SmemLayout):

@@ -106,7 +106,7 @@ def output_scratch_bytes(g, rows):
     return 2 * _align(rows * g.heads * 128 * 2)
 
 
-def dense_mla_layout(g, rows, *, mode):
+def dense_mla_layout(g, rows, *, mode, heads_per_tile=None):
     """The one specialization this geometry serves in this mode."""
     return choose_layout(
         mode=mode,
@@ -116,6 +116,7 @@ def dense_mla_layout(g, rows, *, mode):
         single_request=True,
         windowed=isinstance(g, MlaDraftGeometry),
         query_rows=rows,
+        heads_per_tile=heads_per_tile,
     )
 
 
@@ -604,7 +605,11 @@ class _ContextPartialMerge:
 class _ContextPartial:
     def __init__(self, g, max_rows, max_context, begin, heads, splits):
         self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
-        self.smem = dense_mla_layout(g, max_rows, mode="decode")
+        # Sixteen heads per block: the 48-head target splits into three blocks,
+        # so each owned page is gathered three times per row instead of six,
+        # and the PV fragment's sixteen M rows are all live (eight were zero
+        # padding at the shared eight-head width).
+        self.smem = dense_mla_layout(g, max_rows, mode="decode", heads_per_tile=16)
         chunks = (max_context + self.smem.candidates_per_chunk - 1) // self.smem.candidates_per_chunk
         self.chunks_per_split = (chunks + splits - 1) // splits
         self.forward = DenseMlaForwardKernel(
