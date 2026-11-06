@@ -477,7 +477,7 @@ class RowTiledBf16Projection:
     def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16, **base):
         self.n, self.k = int(n), int(k)
         self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
-        if not self.tiles_by_rows or any(len(entry) not in (4, 5, 6) for entry in self.tiles_by_rows):
+        if not self.tiles_by_rows or any(len(entry) not in (4, 5, 6, 7) for entry in self.tiles_by_rows):
             raise ValueError(
                 "tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages), "
                 "(rows, warp_m, warp_n, tile_n, num_stages) or "
@@ -492,7 +492,16 @@ class RowTiledBf16Projection:
         self.config = self.default.config
         self.tiled = []
         for entry in self.tiles_by_rows:
-            if len(entry) == 4:
+            if len(entry) == 7:
+                # The seventh field opts into register-A with this K tile.
+                from ._smallm import RegisterABf16Projection
+                _, warp_m, warp_n, tile_m, tile_n, stages, tile_k = entry
+                if warp_m != 1 or tile_m != 16 or warp_n != tile_n // 8 or self.base:
+                    raise ValueError('register-A requires 1 x N/8 warps, M16, uncompensated math')
+                self.tiled.append(RegisterABf16Projection(
+                    self.n, self.k, tile_n=tile_n, num_stages=stages,
+                    tile_k=tile_k, out_dtype=out_dtype))
+            elif len(entry) == 4:
                 _, warps, tile_n, stages = entry
                 self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
                                                     compute_warps=warps, tile_n=tile_n, num_stages=stages,
@@ -510,6 +519,11 @@ class RowTiledBf16Projection:
                                                     tile_n=tile_n, num_stages=stages, **self.base))
         capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
         for entry, launch in zip(self.tiles_by_rows, self.tiled):
+            if len(entry) == 7:
+                smem = launch.stage_bytes * launch.num_stages
+                if smem > capacity:
+                    raise ValueError(f'register-A tile needs {smem} B of shared memory')
+                continue
             kernel = launch.kernel
             # Bf16PrefillKernel's shared storage: the barriers' block, then the A and B stages.
             smem = kernel.buffer_align_bytes + (kernel.tile_m + kernel.tile_n) * kernel.tile_k * 2 * kernel.num_stages

@@ -43,7 +43,7 @@ class RegisterABf16Projection:
     @cute.jit
     def _issue(self, base: Int32, w: cute.Pointer, n0: Int32,
                chunk: Int32, lane: Int32):
-        for i in cutlass.range_constexpr(self.tile_k // 64):
+        for i in cutlass.range_constexpr(self.tile_k // 32):
             vector = lane + Int32(i * 32)
             col = vector // Int32(self.tile_k // 8)
             kv = vector % Int32(self.tile_k // 8)
