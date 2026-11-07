@@ -802,15 +802,25 @@ class MimoGqaAttention:
                                   seq_start, step_first, ring_base, key_addr, key_pos, thread)
                     cute.arch.sync_threads()
                     self._load_bf16(key_addr, Int32(1), kv_head, cache, s_k1, s_v1, wait=False)
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.sync_threads()
-                self._mask(Int32(0), token_pos, key_pos, s_p, s_scale, thread, tiled_mma_qk, tiled_mma_pv, r_q,
-                           r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p, cs_v, acc_o, softmax,
-                           is_first=True)
                 if my_tiles > Int32(1):
+                    # Tile 0's copy is its own, older commit group: release it and run tile 0's
+                    # compute while tile 1's cp.async is still in flight (the slots are disjoint).
+                    cute.arch.cp_async_wait_group(1)
+                    cute.arch.sync_threads()
+                    self._mask(Int32(0), token_pos, key_pos, s_p, s_scale, thread, tiled_mma_qk, tiled_mma_pv,
+                               r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p, cs_v, acc_o, softmax,
+                               is_first=True)
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.sync_threads()
                     self._mask(Int32(1), token_pos, key_pos, s_p, s_scale, thread, tiled_mma_qk, tiled_mma_pv,
                                r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k1, cs_p, cs_v1, acc_o,
                                softmax, is_first=False)
+                else:
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.sync_threads()
+                    self._mask(Int32(0), token_pos, key_pos, s_p, s_scale, thread, tiled_mma_qk, tiled_mma_pv,
+                               r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p, cs_v, acc_o, softmax,
+                               is_first=True)
         else:
             if my_tiles > Int32(0):
                 if const_expr(self.kv_fp8):
