@@ -11,15 +11,20 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 from cuda.bindings import driver as cuda
-from b12x._lib.intrinsics import half2_to_float2_scaled
+from b12x._lib.intrinsics import (
+    half2_to_float2_scaled, fabs_f32, fmax_f32, pow2_ceil_ue8m0,
+    ue8m0_to_output_scale,
+)
+from b12x.moe._shared.kernels.w4a16.exlr8 import _e4m3_round_half2
 from b12x.gemm.trellis_linear._native import decode_tile
 from ._common import Operand, Scalar, compile_program
 
 
 class _Dequant:
-    def __init__(self, k, n, columns, codebook, side):
+    def __init__(self, k, n, columns, codebook, side, experiment_e4m3=False):
         self.k, self.n, self.columns = k, n, columns
         self.mul1, self.side = codebook == "mul1", side
+        self.experiment_e4m3 = experiment_e4m3
 
     @cute.jit
     def __call__(self, payload: cute.Pointer, scales: cute.Pointer, output: cute.Pointer,
@@ -50,6 +55,9 @@ class _Dequant:
                 word = b2
             elif cutlass.const_expr(j == 3):
                 word = b3
+            if cutlass.const_expr(self.experiment_e4m3):
+                # Round decoded F16, not the scale-adjusted BF16 weight.
+                word = _e4m3_round_half2(word)
             lo, hi = half2_to_float2_scaled(word, factor)
             row = kt*Int32(16) + (lane%Int32(4))*Int32(2) + Int32((j%2)*8)
             col = nt*Int32(16) + lane//Int32(4) + Int32((j//2)*8)
@@ -59,13 +67,55 @@ class _Dequant:
 
 
 def compile_trellis_dequant_aot(*, input_features, output_features, chunk_columns,
-                               codebook="mcg", sharded_side=1):
+                               codebook="mcg", sharded_side=1, experiment_e4m3=False):
     k,n,c = input_features,output_features,chunk_columns
     if min(k,n,c) <= 0 or k%128 or n%128 or c%128 or n%c or codebook not in ("mcg","mul1") or sharded_side not in (1,2):
         raise ValueError("dequant requires H128 shapes, a dividing N-chunk, mcg/mul1 and side 1/2")
     g=dict(input_features=k,output_features=n,chunk_columns=c,codebook=codebook,sharded_side=sharded_side)
-    return compile_program(_Dequant(k,n,c,codebook,sharded_side),name="trellis_dequant",
+    if experiment_e4m3:
+        g["experiment_e4m3"] = True
+    return compile_program(_Dequant(k,n,c,codebook,sharded_side,experiment_e4m3),name="trellis_dequant",
         operands=(Operand("payload",torch.uint8,f"[{k*n*6//8}]"),
                   Operand("scales",torch.float16,f"[{k//128}]"),
                   Operand("output",torch.bfloat16,f"[{c},{k}]","out")),
         scalars=(Scalar("first_column"),),key=tuple(g.values()),geometry=g)
+
+
+class _ExperimentMxfp8Qdq:
+    def __init__(self, features, max_rows):
+        self.features, self.max_rows = features, max_rows
+
+    @cute.jit
+    def __call__(self, values: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(values, rows).launch(
+            grid=((rows * Int32(self.features // 32) + Int32(3)) // Int32(4), 1, 1),
+            block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, values: cute.Pointer, rows: Int32):
+        tid = Int32(cute.arch.thread_idx()[0])
+        task = Int32(cute.arch.block_idx()[0]) * Int32(4) + tid // Int32(32)
+        lane = tid % Int32(32)
+        if task < rows * Int32(self.features // 32):
+            x = cute.make_tensor(values, cute.make_layout(self.max_rows * self.features))
+            offset = task.to(Int64) * Int64(32) + lane.to(Int64)
+            value = x[offset].to(Float32)
+            amax = fabs_f32(value)
+            for shift in cutlass.range_constexpr(5):
+                amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, offset=1 << shift))
+            scale, code = pow2_ceil_ue8m0(amax * Float32(1.0 / 448.0))
+            inv = ue8m0_to_output_scale(code)
+            # Clamp explicitly: the conversion is OCP E4M3 RNE/satfinite.
+            scaled = cute.arch.fmax(Float32(-448.), cute.arch.fmin(Float32(448.), value * inv))
+            rounded = scaled.to(cutlass.Float8E4M3FN).to(Float32)
+            x[offset] = (rounded * scale).to(cutlass.BFloat16)
+
+
+def compile_experiment_mxfp8_qdq_aot(*, features, max_rows=4096):
+    """Experiment only: in-place MXFP8 QDQ of already rotated BF16 GEMM input."""
+    if features <= 0 or features % 128 or not 1 <= max_rows <= 4096:
+        raise ValueError("MXFP8 experiment requires H128 features and bounded rows")
+    g = dict(features=features, max_rows=max_rows, experiment_mxfp8_qdq=True)
+    return compile_program(_ExperimentMxfp8Qdq(features, max_rows), name="experiment_mxfp8_qdq",
+        operands=(Operand("values", torch.bfloat16, f"[{max_rows},{features}]", "inout"),),
+        scalars=(Scalar("rows"),), key=tuple(g.values()), geometry=g)
