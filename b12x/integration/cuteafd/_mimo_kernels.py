@@ -412,6 +412,11 @@ class MimoGqaAttention:
             raise ValueError("K/V tile vectors must divide across the CTA")
         if self.tile_n > self.threads:
             raise ValueError("tile_n must not exceed the CTA width")
+        # SWA decode spans at most two key tiles: prefetch both tiles' BF16 K/V before the
+        # single wait, so the second tile's latency overlaps the first tile's compute and
+        # the Q tile's load overlaps the key-range resolves.
+        self.pipe2 = (self.tokens == 1 and self.window > 0 and not self.kv_fp8
+                      and self.window <= 2 * self.tile_n)
 
     def key(self) -> tuple:
         return (self.heads, self.kv_heads, self.tokens, self.window, self.paged, self.sink, self.direct,
@@ -497,9 +502,19 @@ class MimoGqaAttention:
             self._resolve(tile, buf, lo, hi, cache, kv_step, page_table, table_base, seq_start, step_first,
                           ring_base, key_addr, key_pos, thread)
             cute.arch.sync_threads()
-            self._load_bf16(key_addr, kv_head, cache, s_k, s_v)
+            self._load_bf16(key_addr, buf, kv_head, cache, s_k, s_v)
             cute.arch.sync_threads()
+        self._mask(buf, token_pos, key_pos, s_p, s_scale, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v,
+                   c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p, cs_v, acc_o, softmax, is_first)
 
+    @cute.jit
+    def _mask(self, buf: Int32, token_pos: cute.Tensor, key_pos: cute.Tensor, s_p: cute.Tensor,
+              s_scale: cute.Tensor, thread: Int32, tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma,
+              r_q: cute.Tensor, r_k: cute.Tensor, r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy,
+              c_k: cute.TiledCopy, c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor, cs_k: cute.Tensor,
+              cs_p: cute.Tensor, cs_v: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax,
+              is_first: cutlass.Constexpr):
+        """QK over the staged tile in slot ``buf``'s positions: mask, online softmax, PV accumulate."""
         if thread < Int32(self.qk_warps * 32):
             acc_s = cute.make_rmem_tensor(
                 tiled_mma_qk.get_slice(thread).partition_shape_C((self.tile_m, self.tile_n)), Float32)
@@ -540,16 +555,17 @@ class MimoGqaAttention:
         cute.arch.sync_threads()
 
     @cute.jit
-    def _load_bf16(self, key_addr: cute.Tensor, kv_head: Int32, cache: cute.Pointer, s_k: cute.Tensor,
-                   s_v: cute.Tensor):
-        """BF16 records: each key's and value's 16-byte vectors by cp.async."""
+    def _load_bf16(self, key_addr: cute.Tensor, buf: Int32, kv_head: Int32, cache: cute.Pointer,
+                   s_k: cute.Tensor, s_v: cute.Tensor, wait: cutlass.Constexpr = True):
+        """BF16 records: each key's and value's 16-byte vectors by cp.async from slot ``buf``'s
+        addresses; committed as one group, waited here unless the caller overlaps it."""
         thread = Int32(cute.arch.thread_idx()[0])
         k_vectors = self.head // 8
         for it in cutlass.range_constexpr(self.tile_n * k_vectors // self.threads):
             linear = thread + Int32(it * self.threads)
             token = linear // Int32(k_vectors)
             dim = (linear % Int32(k_vectors)) * Int32(8)
-            base = Int64(key_addr[0, token])
+            base = Int64(key_addr[buf, token])
             valid = base >= Int64(0)
             source = cutlass.select_(valid, base + (Int64(kv_head) * Int64(self.head) + Int64(dim)) * Int64(2),
                                      Int64(cache.toint()))
@@ -561,7 +577,7 @@ class MimoGqaAttention:
             linear = thread + Int32(it * self.threads)
             token = linear // Int32(v_vectors)
             dim = (linear % Int32(v_vectors)) * Int32(8)
-            base = Int64(key_addr[0, token])
+            base = Int64(key_addr[buf, token])
             valid = base >= Int64(0)
             source = cutlass.select_(
                 valid, base + (Int64(v0) + Int64(kv_head) * Int64(self.v_head) + Int64(dim)) * Int64(2),
@@ -569,7 +585,8 @@ class MimoGqaAttention:
             _cp_async_load_128b_zfill(shared_ptr_to_u32(s_v.iterator + cute.crd2idx((token, dim), s_v.layout)),
                                       source, cutlass.select_(valid, Int32(16), Int32(0)))
         cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
+        if const_expr(wait):
+            cute.arch.cp_async_wait_group(0)
 
     @cute.jit
     def _load_raw(self, key_addr: cute.Tensor, buf: Int32, kv_head: Int32, cache: cute.Pointer, raw: cute.Tensor,
@@ -653,6 +670,11 @@ class MimoGqaAttention:
         s_q = allocator.allocate_tensor(element_type=BFloat16, layout=q_layout, byte_alignment=1024)
         s_k = allocator.allocate_tensor(element_type=BFloat16, layout=k_layout, byte_alignment=1024)
         s_v = allocator.allocate_tensor(element_type=BFloat16, layout=v_layout, byte_alignment=1024)
+        # Second K/V slot for the two-tile SWA decode pipeline; every other shape stages one tile.
+        s_k1, s_v1 = s_k, s_v
+        if const_expr(self.pipe2):
+            s_k1 = allocator.allocate_tensor(element_type=BFloat16, layout=k_layout, byte_alignment=1024)
+            s_v1 = allocator.allocate_tensor(element_type=BFloat16, layout=v_layout, byte_alignment=1024)
         s_p = allocator.allocate_tensor(element_type=BFloat16, layout=p_layout, byte_alignment=1024)
         s_scale = allocator.allocate_tensor(element_type=Float32, layout=cute.make_layout((self.tile_m,)),
                                             byte_alignment=16)
@@ -685,7 +707,8 @@ class MimoGqaAttention:
                 _cp_async_load_128b_zfill(shared_ptr_to_u32(s_q.iterator + cute.crd2idx((m, dim), s_q.layout)),
                                           source, cutlass.select_(valid, Int32(16), Int32(0)))
         cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
+        if const_expr(not self.pipe2):
+            cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
         # Key range and addressing bases of this CTA's sequence.
@@ -731,6 +754,10 @@ class MimoGqaAttention:
         cs_k = c_k.partition_S(s_k)
         cs_p = c_p.partition_S(s_p)
         cs_v = c_v.partition_S(s_vt)
+        cs_k1, cs_v1 = cs_k, cs_v
+        if const_expr(self.pipe2):
+            cs_k1 = c_k.partition_S(s_k1)
+            cs_v1 = c_v.partition_S(layout_utils.transpose_view(s_v1))
         acc_o = cute.make_rmem_tensor(thr_pv.partition_shape_C((self.tile_m, self.v_head)), Float32)
         acc_o.fill(0.0)
         s_layout = layout_utils.convert_layout_acc_mn(
@@ -745,27 +772,50 @@ class MimoGqaAttention:
         raw_words = max((self.k_iters + self.v_iters) * self.chunk // 4, 1) if self.kv_fp8 else 1
         raw = cute.make_rmem_tensor(cute.make_layout((raw_words,)), Uint32)
         raw_s = cute.make_rmem_tensor(cute.make_layout((max(self.k_iters + self.v_iters, 1),)), Float32)
-        if my_tiles > Int32(0):
-            if const_expr(self.kv_fp8):
+        if const_expr(self.pipe2):
+            # Two-tile SWA decode: stage both tiles (and the Q tile) before one wait, then run
+            # both tile accumulates back to back. Nothing between them serializes on a load.
+            if my_tiles > Int32(0):
                 self._resolve(split, Int32(0), lo, hi, cache, kv_step, page_table, table_base, seq_start,
                               step_first, ring_base, key_addr, key_pos, thread)
                 cute.arch.sync_threads()
-                self._load_raw(key_addr, Int32(0), kv_head, cache, raw, raw_s, thread)
-            self._tile(split, split + splits, my_tiles > Int32(1), Int32(0), lo, hi, row0, kv_head, cache, kv_step,
-                       page_table, table_base, seq_start,
-                       step_first, ring_base, token_pos, key_addr, key_pos, s_k, s_v, s_p, s_scale, thread,
-                       tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p,
-                       cs_v, acc_o, softmax, raw, raw_s, is_first=True)
-            for local in cutlass.range(my_tiles - Int32(1), unroll=1):
-                tile = split + (Int32(local) + Int32(1)) * splits
-                buf = (Int32(local) + Int32(1)) % Int32(2)
-                if const_expr(not self.kv_fp8):
-                    buf = Int32(0)
-                self._tile(tile, tile + splits, Int32(local) + Int32(2) < my_tiles, buf, lo, hi, row0, kv_head,
-                           cache, kv_step, page_table, table_base, seq_start,
+                self._load_bf16(key_addr, Int32(0), kv_head, cache, s_k, s_v, wait=False)
+                if my_tiles > Int32(1):
+                    self._resolve(split + splits, Int32(1), lo, hi, cache, kv_step, page_table, table_base,
+                                  seq_start, step_first, ring_base, key_addr, key_pos, thread)
+                    cute.arch.sync_threads()
+                    self._load_bf16(key_addr, Int32(1), kv_head, cache, s_k1, s_v1, wait=False)
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+                self._mask(Int32(0), token_pos, key_pos, s_p, s_scale, thread, tiled_mma_qk, tiled_mma_pv, r_q,
+                           r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p, cs_v, acc_o, softmax,
+                           is_first=True)
+                if my_tiles > Int32(1):
+                    self._mask(Int32(1), token_pos, key_pos, s_p, s_scale, thread, tiled_mma_qk, tiled_mma_pv,
+                               r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k1, cs_p, cs_v1, acc_o,
+                               softmax, is_first=False)
+        else:
+            if my_tiles > Int32(0):
+                if const_expr(self.kv_fp8):
+                    self._resolve(split, Int32(0), lo, hi, cache, kv_step, page_table, table_base, seq_start,
+                                  step_first, ring_base, key_addr, key_pos, thread)
+                    cute.arch.sync_threads()
+                    self._load_raw(key_addr, Int32(0), kv_head, cache, raw, raw_s, thread)
+                self._tile(split, split + splits, my_tiles > Int32(1), Int32(0), lo, hi, row0, kv_head, cache,
+                           kv_step, page_table, table_base, seq_start,
                            step_first, ring_base, token_pos, key_addr, key_pos, s_k, s_v, s_p, s_scale, thread,
                            tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k,
-                           cs_p, cs_v, acc_o, softmax, raw, raw_s, is_first=False)
+                           cs_p, cs_v, acc_o, softmax, raw, raw_s, is_first=True)
+                for local in cutlass.range(my_tiles - Int32(1), unroll=1):
+                    tile = split + (Int32(local) + Int32(1)) * splits
+                    buf = (Int32(local) + Int32(1)) % Int32(2)
+                    if const_expr(not self.kv_fp8):
+                        buf = Int32(0)
+                    self._tile(tile, tile + splits, Int32(local) + Int32(2) < my_tiles, buf, lo, hi, row0,
+                               kv_head, cache, kv_step, page_table, table_base, seq_start,
+                               step_first, ring_base, token_pos, key_addr, key_pos, s_k, s_v, s_p, s_scale,
+                               thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v,
+                               cs_q, cs_k, cs_p, cs_v, acc_o, softmax, raw, raw_s, is_first=False)
 
         # Final scale per M row (and LSE for split partials).
         if thread < Int32(self.qk_warps * 32):
