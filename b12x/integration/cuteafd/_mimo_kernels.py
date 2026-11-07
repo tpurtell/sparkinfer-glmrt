@@ -416,7 +416,7 @@ class MimoGqaAttention:
         # single wait, so the second tile's latency overlaps the first tile's compute and
         # the Q tile's load overlaps the key-range resolves.
         self.pipe2 = (self.tokens == 1 and self.window > 0 and not self.kv_fp8
-                      and self.window <= 2 * self.tile_n)
+                      and not self.paged and self.window <= 2 * self.tile_n)
 
     def key(self) -> tuple:
         return (self.heads, self.kv_heads, self.tokens, self.window, self.paged, self.sink, self.direct,
@@ -692,6 +692,15 @@ class MimoGqaAttention:
             if thread < live:
                 p = Int64(pos_t[row0 + Int64(thread)])
             token_pos[thread] = p
+        # SWA decode: issue the dependent key-base loads before the Q copy so their latency
+        # overlaps the Q issue and the first resolve instead of following them.
+        if const_expr(self.pipe2):
+            p_first_pre = Int64(pos_t[row0])
+            first_t_pre = cute.make_tensor(seq_first, cute.make_layout((Int64(rows),)))
+            ring_t_pre = cute.make_tensor(ring_slots, cute.make_layout((Int64(rows),)))
+            step_first_pre = Int64(first_t_pre[row0])
+            seq_start_pre = Int64(pos_t[step_first_pre])
+            ring_base_pre = Int64(ring_t_pre[row0]) - p_first_pre % Int64(self.ring_rows)
         # Query tile: M row m = (token m / group, head kv_head * group + m % group).
         q_t = cute.make_tensor(q, cute.make_layout((Int64(rows) * Int64(self.heads * self.head),)))
         for it in cutlass.range_constexpr(_ceil(self.tile_m * self.head // 8, self.threads)):
@@ -709,32 +718,40 @@ class MimoGqaAttention:
         cute.arch.cp_async_commit_group()
         if const_expr(not self.pipe2):
             cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+            cute.arch.sync_threads()
 
         # Key range and addressing bases of this CTA's sequence.
-        p_first = Int64(token_pos[0])
-        p_last = Int64(token_pos[0])
-        for t in cutlass.range_constexpr(self.tokens):
-            if Int32(t) < live:
-                p_last = Int64(token_pos[t])
-        hi = p_last
-        lo = Int64(0)
-        if const_expr(self.window > 0):
-            lo = p_first - Int64(self.window - 1)
+        if const_expr(self.pipe2):
+            # Loaded ahead of the Q issue above; SWA decode has one token and a ring cache.
+            p_first, hi, lo = p_first_pre, p_first_pre, p_first_pre - Int64(self.window - 1)
             if lo < Int64(0):
                 lo = Int64(0)
-        table_base = Int64(0)
-        seq_start = Int64(0)
-        step_first = Int64(0)
-        ring_base = Int64(0)
-        if const_expr(self.paged):
-            table_base = row0 * Int64(table_stride)
+            table_base = Int64(0)
+            seq_start, step_first, ring_base = seq_start_pre, step_first_pre, ring_base_pre
         else:
-            first_t = cute.make_tensor(seq_first, cute.make_layout((Int64(rows),)))
-            ring_t = cute.make_tensor(ring_slots, cute.make_layout((Int64(rows),)))
-            step_first = Int64(first_t[row0])
-            seq_start = Int64(pos_t[step_first])
-            ring_base = Int64(ring_t[row0]) - p_first % Int64(self.ring_rows)
+            p_first = Int64(token_pos[0])
+            p_last = Int64(token_pos[0])
+            for t in cutlass.range_constexpr(self.tokens):
+                if Int32(t) < live:
+                    p_last = Int64(token_pos[t])
+            hi = p_last
+            lo = Int64(0)
+            if const_expr(self.window > 0):
+                lo = p_first - Int64(self.window - 1)
+                if lo < Int64(0):
+                    lo = Int64(0)
+            table_base = Int64(0)
+            seq_start = Int64(0)
+            step_first = Int64(0)
+            ring_base = Int64(0)
+            if const_expr(self.paged):
+                table_base = row0 * Int64(table_stride)
+            else:
+                first_t = cute.make_tensor(seq_first, cute.make_layout((Int64(rows),)))
+                ring_t = cute.make_tensor(ring_slots, cute.make_layout((Int64(rows),)))
+                step_first = Int64(first_t[row0])
+                seq_start = Int64(pos_t[step_first])
+                ring_base = Int64(ring_t[row0]) - p_first % Int64(self.ring_rows)
 
         qk_thread = thread % Int32(self.qk_warps * 32)
         thr_qk = tiled_mma_qk.get_slice(qk_thread)
