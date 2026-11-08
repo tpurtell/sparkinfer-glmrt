@@ -216,7 +216,7 @@ def test_mimo_bf16_head_row_invariance():
     lib = C.CDLL(path)
     ptr = C.c_void_p
     create = lib.cuteafd_vocabulary_head_create_vocab
-    create.argtypes = [ptr, C.c_uint64, C.c_int32, C.c_int32, C.c_int32, C.POINTER(ptr)]
+    create.argtypes = [ptr, C.c_uint64, C.c_int32, C.c_int32, C.c_int32, C.c_int32, C.POINTER(ptr)]
     create.restype = C.c_int32
     launch = lib.cuteafd_vocabulary_head_launch_tensor_invariant
     launch.argtypes = [ptr, ptr, ptr, ptr, C.c_int32, ptr]
@@ -228,7 +228,8 @@ def test_mimo_bf16_head_row_invariance():
     x = torch.randn(10, g.hidden, device="cuda").bfloat16()
     workspace = torch.empty(4 << 20, device="cuda", dtype=torch.uint8)
     handle = ptr()
-    assert create(workspace.data_ptr(), workspace.numel(), g.hidden, 64, g.vocab_size, C.byref(handle)) == 0
+    # TensorLt-only: the fixed target projection never launches GEMM.
+    assert create(workspace.data_ptr(), workspace.numel(), g.hidden, 64, g.vocab_size, 1, C.byref(handle)) == 0
     stream = torch.cuda.current_stream().cuda_stream
 
     def run(first, count):
