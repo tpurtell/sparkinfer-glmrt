@@ -30,9 +30,15 @@ __all__ = [
     "SKINNY_TILES_BY_ROWS",
     "SkinnyBf16Gemv",
     "TmaBf16Projection",
+    "WIDE_PREFILL_CONFIG",
+    "WIDE_PREFILL_CONFIG_BY_SHAPE",
+    "WIDE_PREFILL_MIN_ROWS",
+    "WIDE_PREFILL_MIN_ROWS_BY_SHAPE",
     "prefill_config",
     "skinny_config",
     "skinny_max_rows",
+    "wide_prefill_min_rows",
+    "wide_prefill_projection",
 ]
 
 
@@ -309,6 +315,44 @@ class RowTiledSkinnyBf16Gemv:
 WIDE_PREFILL_CONFIG = dict(warp_layout=(2, 2), tile_m=128, tile_n=128, num_stages=2, compensated=False)
 WIDE_PREFILL_MIN_ROWS = 512
 
+# Per-shape wide-prefill kernel overrides where SM120 L2-cold paired replay
+# beats plain 2-stage WIDE_PREFILL_CONFIG bitwise (~3.0-3.3% across c5/c6/c7
+# at M=2752 on 6144x7168). Unverified shapes remain on plain WIDE_PREFILL_CONFIG.
+WIDE_PREFILL_CONFIG_BY_SHAPE = {
+    (6144, 7168): dict(
+        warp_layout=(2, 2),
+        tile_m=128,
+        tile_n=128,
+        num_stages=3,
+        compensated=False,
+        mbar_last=True,
+        cross_stage_pipe=True,
+        k_unroll=3,
+    ),
+}
+
+# Measured SM120 wide-prefill floor by weight shape [N, K]: from this many live
+# rows the wide tile beats prefill_config (interleaved, L2-cold, bitwise
+# identical). Narrow and small outputs need 1024 rows: four 128-row M tiles by
+# their few N tiles still underfill 188 SMs below it. 24752x7168 and 3584x7168
+# fill the card at 512 rows. A shape without an entry keeps prefill_config.
+WIDE_PREFILL_MIN_ROWS_BY_SHAPE = {
+    (24752, 7168): 512,
+    (3584, 7168): 512,
+    (6144, 7168): 1024,
+    (7168, 6144): 1024,
+    (7168, 3072): 1024,
+    (7168, 3584): 1024,
+    (2112, 7168): 1024,
+    (9216, 1536): 512,
+}
+
+
+def wide_prefill_min_rows(n: int, k: int, capacity: int) -> int | None:
+    """Wide-route floor for a measured shape whose program capacity reaches it."""
+    floor = WIDE_PREFILL_MIN_ROWS_BY_SHAPE.get((int(n), int(k)))
+    return floor if floor is not None and int(capacity) >= floor else None
+
 # Measured SM120 TMA tensor-core decode tiles by live rows, per weight shape [N, K]:
 # (rows, warp_m, warp_n, tile_n, num_stages) in ascending rows. Each entry retiles
 # the same uncompensated m16n8k16 MMA K-reduction as prefill_config and produces
@@ -488,12 +532,23 @@ class RowTiledBf16Projection:
 
     def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16, **base):
         self.n, self.k = int(n), int(k)
-        self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
-        if not self.tiles_by_rows or any(len(entry) not in (4, 5, 6) for entry in self.tiles_by_rows):
-            raise ValueError(
-                "tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages), "
-                "(rows, warp_m, warp_n, tile_n, num_stages) or "
-                "(rows, warp_m, warp_n, tile_m, tile_n, num_stages)")
+        normalized = []
+        for entry in tiles_by_rows:
+            if len(entry) == 2 and isinstance(entry[1], (dict, tuple, list)):
+                cfg = dict(entry[1])
+                if "warp_layout" in cfg and cfg["warp_layout"] is not None:
+                    cfg["warp_layout"] = tuple(int(v) for v in cfg["warp_layout"])
+                normalized.append((int(entry[0]), tuple(sorted(cfg.items()))))
+            elif len(entry) in (4, 5, 6):
+                normalized.append(tuple(int(v) for v in entry))
+            else:
+                raise ValueError(
+                    "tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages), "
+                    "(rows, warp_m, warp_n, tile_n, num_stages), "
+                    "(rows, warp_m, warp_n, tile_m, tile_n, num_stages), or (rows, config_dict)")
+        self.tiles_by_rows = tuple(normalized)
+        if not self.tiles_by_rows:
+            raise ValueError("tiles_by_rows must not be empty")
         self.limits = tuple(entry[0] for entry in self.tiles_by_rows)
         # Entry i serves floors[i] < rows <= limits[i].
         self.floors = (0,) + self.limits[:-1]
@@ -504,7 +559,11 @@ class RowTiledBf16Projection:
         self.config = self.default.config
         self.tiled = []
         for entry in self.tiles_by_rows:
-            if len(entry) == 4:
+            if len(entry) == 2:
+                _, cfg_items = entry
+                merged = dict(self.base, **dict(cfg_items))
+                self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(), **merged))
+            elif len(entry) == 4:
                 _, warps, tile_n, stages = entry
                 self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
                                                     compute_warps=warps, tile_n=tile_n, num_stages=stages,
@@ -521,12 +580,12 @@ class RowTiledBf16Projection:
                                                     warp_layout=(warp_m, warp_n), tile_m=tile_m,
                                                     tile_n=tile_n, num_stages=stages, **self.base))
         capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
-        for entry, launch in zip(self.tiles_by_rows, self.tiled):
+        for entry, launch in ((*zip(self.tiles_by_rows, self.tiled), ("default", self.default))):
             kernel = launch.kernel
-            # Bf16PrefillKernel's shared storage: the barriers' block, then the A and B stages.
-            smem = kernel.buffer_align_bytes + (kernel.tile_m + kernel.tile_n) * kernel.tile_k * 2 * kernel.num_stages
+            smem = kernel.smem_bytes()
             if smem > capacity:
-                raise ValueError(f"tiles_by_rows entry {entry} needs {smem} B of shared memory a CTA; SM120 has {capacity}")
+                raise ValueError(
+                    f"tiles_by_rows entry {entry} needs {smem} B of shared memory per CTA; SM120 has {capacity}")
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
@@ -539,6 +598,12 @@ class RowTiledBf16Projection:
             self.default(x, w, out, rows, stream)
 
 
+def wide_prefill_projection(n: int, k: int, *, out_dtype=cutlass.BFloat16) -> TmaBf16Projection:
+    """Build the wide-prefill TMA projection for ``(n, k)``."""
+    cfg = WIDE_PREFILL_CONFIG_BY_SHAPE.get((int(n), int(k)), WIDE_PREFILL_CONFIG)
+    return TmaBf16Projection(n, k, out_dtype=out_dtype, tiles_by_rows=(), **cfg)
+
+
 class RoutedBf16Projection:
     """``out = x @ w^T``: skinny GEMV for few live rows, TMA tensor-core GEMM above.
 
@@ -549,9 +614,12 @@ class RoutedBf16Projection:
     """
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, max_skinny_rows: int | None = None,
-                 wide: bool = False, tiles_by_rows: tuple = (), skinny_tiles_by_rows: tuple = ()):
+                 wide: bool = False, wide_min_rows: int | None = None, tiles_by_rows: tuple = (),
+                 skinny_tiles_by_rows: tuple = ()):
         """``wide`` adds the ``WIDE_PREFILL_CONFIG`` TMA route from
-        ``WIDE_PREFILL_MIN_ROWS`` live rows (prefill capacities).
+        ``WIDE_PREFILL_MIN_ROWS`` live rows (prefill capacities), or from
+        ``wide_min_rows`` when given (``wide_prefill_min_rows``'s measured
+        per-shape floor).
 
         ``tiles_by_rows`` (default none) picks the TMA route's tiles by live rows
         below that (``RowTiledBf16Projection``; its first entry's rows exceed
@@ -576,7 +644,10 @@ class RoutedBf16Projection:
         else:
             self.large = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=())
         self.tiles_by_rows = self.large.tiles_by_rows if tiles_by_rows else ()
-        self.wide = TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(), **WIDE_PREFILL_CONFIG) \
+        self.wide_min_rows = int(WIDE_PREFILL_MIN_ROWS if wide_min_rows is None else wide_min_rows)
+        if self.wide_min_rows < 1:
+            raise ValueError("wide_min_rows must be positive")
+        self.wide = wide_prefill_projection(self.n, self.k, out_dtype=out_dtype) \
             if wide and self.n % 2 == 0 else None
 
     @property
@@ -587,11 +658,14 @@ class RoutedBf16Projection:
 
     def key(self) -> tuple:
         s = self.skinny
-        # tiles_by_rows extends the key; projections without it keep theirs.
+        # tiles_by_rows / wide extend the key; projections without them keep theirs.
         return (self.n, self.k, str(self.out_dtype), self.max_skinny_rows, s.cols, s.rows_per_tile,
                 s.threads, tuple(sorted(self.large.config.items())), self.wide is not None) \
+            + ((("wide_min_rows", self.wide_min_rows),
+                ) if self.wide is not None and self.wide_min_rows != WIDE_PREFILL_MIN_ROWS else ()) \
             + ((("tiles_by_rows", self.tiles_by_rows),) if self.tiles_by_rows else ()) \
-            + ((("skinny_tiles_by_rows", self.skinny_tiles_by_rows),) if self.skinny_tiles_by_rows else ())
+            + ((("skinny_tiles_by_rows", self.skinny_tiles_by_rows),) if self.skinny_tiles_by_rows else ()) \
+            + ((("wide", self.wide.key()),) if self.wide is not None else ())
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
@@ -600,7 +674,7 @@ class RoutedBf16Projection:
             self.skinny(x, w, out, rows, stream)
         else:
             if cutlass.const_expr(self.wide is not None):
-                if rows >= Int32(WIDE_PREFILL_MIN_ROWS):
+                if rows >= Int32(self.wide_min_rows):
                     self.wide(x, w, out, rows, stream)
                 else:
                     self.large(x, w, out, rows, stream)
