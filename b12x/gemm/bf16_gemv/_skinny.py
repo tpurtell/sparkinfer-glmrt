@@ -323,7 +323,7 @@ DECODE_TMA_TILES = {
     (18432, 1536): ((16, 1, 4, 16, 64, 6),),
     (9216, 1536): ((2, 4, 128, 3), (16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
     (7168, 12288): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
-    (7168, 6144): ((16, 1, 4, 16, 64, 6), (32, 2, 2, 32, 32, 10)),
+    (7168, 6144): ((16, 1, 4, 16, 64, 6), (32, 2, 3, 32, 48, 4, 128), (64, 4, 1, 64, 48, 3, 128)),
     (8192, 8192): ((16, 1, 4, 16, 64, 6),),
     (8192, 4096): ((16, 1, 4, 16, 64, 6),),
     # HQA O: expose N parallelism at verify widths, preserving ordered K16.
@@ -349,6 +349,22 @@ DECODE_TMA_TILES = {
     (4096, 6144): ((64, 1, 4, 32, 12), (256, 1, 4, 64, 9)),
     (384, 4096): ((256, 1, 2, 16, 8),),
     (3072, 4096): ((64, 1, 4, 32, 8), (256, 1, 4, 32, 12)),
+    # Kimi K3 decode/verify (rows 1..64; rows > 64 stay on prefill_config /
+    # WIDE_PREFILL_CONFIG). SM120 RTX PRO 6000 L2-flushed cold medians
+    # (M=5 / 16 / 32 / 64 us, baseline -> shipped):
+    #   24752x7168: 262.14/262.14/262.14/264.19 -> 225.28/227.33/229.38/235.52
+    #   6144x7168:  69.63/69.63/69.63/69.63     -> 59.39/59.39/61.44/63.49
+    #   7168x6144:  59.39/59.39/61.44/67.58     -> 59.39/59.39/61.44/61.44 (above)
+    #   7168x3072:  34.82/34.82/34.82/34.82     -> 30.72/30.72/32.77/32.77
+    #   3584x7168:  53.25/53.25/53.25/53.25     -> 36.86/36.86/38.91/38.91
+    #   7168x3584:  38.91/38.91/38.91/38.91     -> 34.82/34.82/36.86/36.86
+    #   2112x7168:  51.20/51.20/51.20/51.20     -> 24.58/24.58/25.60/28.67
+    (24752, 7168): ((16, 1, 4, 16, 32, 6, 128), (64, 2, 2, 32, 32, 5, 128)),
+    (6144, 7168): ((16, 1, 3, 16, 48, 4, 128), (64, 4, 1, 64, 48, 6)),
+    (7168, 3072): ((16, 1, 4, 16, 64, 6), (32, 2, 3, 32, 48, 8), (64, 2, 2, 64, 64, 5)),
+    (3584, 7168): ((16, 1, 4, 16, 32, 7), (64, 4, 1, 64, 32, 7)),
+    (7168, 3584): ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 32, 5), (64, 2, 2, 64, 64, 5)),
+    (2112, 7168): ((16, 1, 4, 16, 32, 12), (32, 2, 2, 32, 16, 5, 128), (64, 4, 1, 64, 16, 9)),
 }
 
 
@@ -465,8 +481,9 @@ class RowTiledBf16Projection:
     """``TmaBf16Projection`` with its tiles picked by the live rows of a launch.
 
     ``tiles_by_rows`` entries are ``(rows, compute_warps, tile_n, num_stages)``,
-    ``(rows, warp_m, warp_n, tile_n, num_stages)`` or
-    ``(rows, warp_m, warp_n, tile_m, tile_n, num_stages)`` in
+    ``(rows, warp_m, warp_n, tile_n, num_stages)``,
+    ``(rows, warp_m, warp_n, tile_m, tile_n, num_stages)`` or
+    ``(rows, warp_m, warp_n, tile_m, tile_n, num_stages, tile_k)`` in
     ascending ``rows``: a launch runs the first entry whose ``rows`` it does
     not exceed (``16 * compute_warps`` x ``tile_n`` tiles, or ``warp_m`` x
     ``warp_n`` warps over a ``16 * warp_m`` or the explicit ``tile_m`` row
@@ -489,11 +506,12 @@ class RowTiledBf16Projection:
     def __init__(self, n: int, k: int, tiles_by_rows, *, out_dtype=cutlass.BFloat16, **base):
         self.n, self.k = int(n), int(k)
         self.tiles_by_rows = tuple(tuple(int(v) for v in entry) for entry in tiles_by_rows)
-        if not self.tiles_by_rows or any(len(entry) not in (4, 5, 6) for entry in self.tiles_by_rows):
+        if not self.tiles_by_rows or any(len(entry) not in (4, 5, 6, 7) for entry in self.tiles_by_rows):
             raise ValueError(
                 "tiles_by_rows entries are (rows, compute_warps, tile_n, num_stages), "
-                "(rows, warp_m, warp_n, tile_n, num_stages) or "
-                "(rows, warp_m, warp_n, tile_m, tile_n, num_stages)")
+                "(rows, warp_m, warp_n, tile_n, num_stages), "
+                "(rows, warp_m, warp_n, tile_m, tile_n, num_stages) or "
+                "(rows, warp_m, warp_n, tile_m, tile_n, num_stages, tile_k)")
         self.limits = tuple(entry[0] for entry in self.tiles_by_rows)
         # Entry i serves floors[i] < rows <= limits[i].
         self.floors = (0,) + self.limits[:-1]
@@ -510,16 +528,20 @@ class RowTiledBf16Projection:
                                                     compute_warps=warps, tile_n=tile_n, num_stages=stages,
                                                     **self.base))
             else:
+                extra = dict(self.base)
                 if len(entry) == 5:
                     _, warp_m, warp_n, tile_n, stages = entry
                     tile_m = 16 * warp_m
-                else:
+                elif len(entry) == 6:
                     _, warp_m, warp_n, tile_m, tile_n, stages = entry
+                else:
+                    _, warp_m, warp_n, tile_m, tile_n, stages, tile_k = entry
+                    extra["tile_k"] = tile_k
                 if tile_m % (16 * warp_m):
                     raise ValueError(f"tiles_by_rows entry {entry}: tile_m must be a multiple of 16 * warp_m")
                 self.tiled.append(TmaBf16Projection(self.n, self.k, out_dtype=out_dtype, tiles_by_rows=(),
                                                     warp_layout=(warp_m, warp_n), tile_m=tile_m,
-                                                    tile_n=tile_n, num_stages=stages, **self.base))
+                                                    tile_n=tile_n, num_stages=stages, **extra))
         capacity = cutlass_utils.get_smem_capacity_in_bytes("sm_120")
         for entry, launch in zip(self.tiles_by_rows, self.tiled):
             kernel = launch.kernel

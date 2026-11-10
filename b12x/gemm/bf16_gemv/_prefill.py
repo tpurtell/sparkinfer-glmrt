@@ -106,7 +106,7 @@ class Bf16PrefillKernel:
     def __init__(self, n: int, k: int, *, compute_warps: int | None = None,
                  tile_n: int | None = None, num_stages: int | None = None,
                  compensated: bool = True, warp_layout: tuple[int, int] | None = None,
-                 tile_m: int | None = None):
+                 tile_m: int | None = None, tile_k: int | None = None):
         """Defaults keep the original 64x64x64, two-stage, compensated kernel.
 
         ``compensated=False`` accumulates directly in the tensor-core FP32
@@ -114,6 +114,8 @@ class Bf16PrefillKernel:
         ``warp_layout`` ``(wm, wn)`` with ``tile_m`` arranges the MMA warps in
         a grid (each owns a ``tile_m / wm`` x ``tile_n / wn`` block): the same
         per-element K order, fewer shared-memory fragment reads per MMA.
+        ``tile_k`` (64 or 128) selects the TMA K stage width while keeping the
+        ordered K16 MMA accumulation unchanged.
         """
         self.warp_layout = None
         if compute_warps is not None:
@@ -129,12 +131,19 @@ class Bf16PrefillKernel:
             self.tile_m = int(tile_m)
         if tile_n is not None:
             self.tile_n = int(tile_n)
+        if tile_k is not None:
+            self.tile_k = int(tile_k)
         if num_stages is not None:
             self.num_stages = int(num_stages)
         self.compensated = bool(compensated)
         self.n, self.k = int(n), int(k)
+        wn = self.warp_layout[1] if self.warp_layout is not None else 1
+        if self.tile_n <= 0 or self.tile_n % 16 or self.tile_n % (8 * wn):
+            raise ValueError(f"tile_n={self.tile_n} must be positive and divisible by 16 and 8 * warp_n={8 * wn}")
+        if self.tile_k not in (64, 128):
+            raise ValueError(f"tile_k={self.tile_k} must be 64 or 128")
         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k:
-            raise ValueError("BF16 prefill needs positive N and K divisible by 64")
+            raise ValueError(f"BF16 prefill needs positive N and K divisible by {self.tile_k}")
         self.k_tiles = self.k // self.tile_k
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
 
@@ -335,8 +344,10 @@ class Bf16PrefillKernel:
             acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
             acc = cute.make_rmem_tensor(acc_shape, Float32)
             acc.fill(0.0)
-            correction = cute.make_rmem_tensor(acc_shape, Float32)
-            correction.fill(0.0)
+            correction = None
+            if const_expr(self.compensated):
+                correction = cute.make_rmem_tensor(acc_shape, Float32)
+                correction.fill(0.0)
             smem_copy_atom_A = cute.make_copy_atom(
                 warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
                 cutlass.BFloat16,
