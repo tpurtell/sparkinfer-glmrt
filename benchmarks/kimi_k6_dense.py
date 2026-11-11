@@ -1060,6 +1060,52 @@ def glm_full_core_operations(config, tensors, *, onboard_layers):
     return operations
 
 
+def glm_full_core_unique_operations(operations):
+    unique = {}
+    for operation in operations:
+        op = dict(operation, role=re.sub(r"^layer\d+\.", "", operation["role"]))
+        key = (op["role"], op["k"], op["packed_n"], op["batch"], op["split"],
+               op["fp8_scale_layout"], tuple((m["n"], m["k"]) for m in op["members"]))
+        if key not in unique:
+            unique[key] = dict(op, count=list(op["count"]), reduction_count=list(op["reduction_count"]))
+        else:
+            for field in ("count", "reduction_count"):
+                unique[key][field] = [a+b for a, b in zip(unique[key][field], op[field])]
+    return list(unique.values())
+
+
+def glm_full_core_fixture_shapes(operations):
+    shapes = {}
+    for op in operations:
+        if not op["hypothetical_trellis"]:
+            continue
+        for i, member in enumerate(op["members"]):
+            if member["k"] % 128 or member["stored_n"] % 128:
+                raise ValueError("GLM fixture needs independent K128/N128 storage")
+            key = (re.sub(r"^layer\d+\.", "", op["role"]), i, member["k"], member["n"])
+            shapes.setdefault(key, dict(role=key[0], member=i, k=member["k"],
+                n=member["stored_n"], logical_n=member["n"],
+                side=2 if op["split"] == "input" else 1, source_tensor=member["name"]))
+    return list(shapes.values())
+
+
+def glm_full_core_prefill_schedule(tokens, *, span=8256, unit=2752):
+    """The admitted three-wave span cuts each call into page-aligned row units."""
+    if tokens < 1 or span != 3*unit or unit % 64:
+        raise ValueError("GLM prefill schedule needs its actual three-wave span/unit")
+    histogram, heads = {}, 0
+    for begin in range(0, tokens, span):
+        count = min(tokens-begin, span)
+        # For these 8K/64K workloads every call exceeds unit, so no small-call rebalance.
+        if count <= unit:
+            raise ValueError("small GLM calls need the native waves_used rebalance")
+        for first in range(0, count, unit):
+            rows = min(unit, count-first)
+            histogram[rows] = histogram.get(rows, 0)+1
+        heads += 1
+    return dict(body_row_histogram=histogram, head_calls=heads, head_rows=1)
+
+
 def qwen_full_core_projection_spec(operation, *, prefill=False):
     """Describe the shipping projection route without importing CUDA libraries."""
     role = operation["role"].split(".", 1)[-1] if operation["role"].startswith("layer") else operation["role"]

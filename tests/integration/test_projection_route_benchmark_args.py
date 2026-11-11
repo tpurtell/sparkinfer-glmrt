@@ -619,6 +619,35 @@ def test_glm_context_core_keeps_head_shares_and_independent_rank_members():
     assert all(op["count"] == [1, 1] for op in operations if not op["role"].endswith("router") and op["role"] != "head")
 
 
+def test_glm_unique_calls_preserve_peer_router_and_shared_reduction_counts():
+    bench = _native_threshold_bench()
+    config, tensors = _glm_core_headers()
+    operations = bench.glm_full_core_operations(config, tensors, onboard_layers=1)
+    unique = {op["role"]: op for op in bench.glm_full_core_unique_operations(operations)}
+    assert unique["router"]["count"] == [3, 1]
+    assert unique["attn_out"]["count"] == [4, 4]
+    assert unique["attn_out"]["reduction_count"] == [4, 4]
+    assert unique["shared_down"]["count"] == [3, 3]
+    assert unique["shared_down"]["reduction_count"] == [3, 0]
+    assert unique["index_query"]["count"] == [2, 2]
+    fixtures = bench.glm_full_core_fixture_shapes(operations)
+    assert len(fixtures) == 11
+    rank = [f for f in fixtures if f["role"] == "rank_in"]
+    assert [(f["n"], f["logical_n"]) for f in rank] == [(2048, 2048), (640, 576)]
+    assert all(f["side"] == 2 for f in fixtures if f["role"].endswith("down") or f["role"] == "attn_out")
+    assert not any("index" in f["role"] for f in fixtures)
+
+
+def test_glm_prefill_uses_actual_span_and_final_tail():
+    bench = _native_threshold_bench()
+    assert bench.glm_full_core_prefill_schedule(8192) == dict(
+        body_row_histogram={2752: 2, 2688: 1}, head_calls=1, head_rows=1)
+    assert bench.glm_full_core_prefill_schedule(65536) == dict(
+        body_row_histogram={2752: 23, 2240: 1}, head_calls=8, head_rows=1)
+    with pytest.raises(ValueError, match="rebalance"):
+        bench.glm_full_core_prefill_schedule(1024)
+
+
 def test_glm_core_catalog_rejects_bad_original_headers_and_ownership():
     bench = _native_threshold_bench()
     config, tensors = _glm_core_headers()
