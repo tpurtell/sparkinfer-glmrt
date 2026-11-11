@@ -3585,6 +3585,9 @@ def benchmark_flash_full_core(args):
         _initialize_worker(0, (12, 0), "flash-core", "flash-core", args.export_sms,
                            101376, 102400, multiprocessing.Array("i", [0, 0]))
     else:
+        # Peer-add's serving ABI requires a non-null, explicitly owned stream.
+        run_stream = torch.cuda.Stream()
+        torch.cuda.set_stream(run_stream)
         props = torch.cuda.get_device_properties(0)
         status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
         if int(status):
