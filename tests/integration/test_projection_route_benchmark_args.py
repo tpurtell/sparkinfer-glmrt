@@ -1436,10 +1436,12 @@ def test_flash_catalog_covers_original_matrices_and_keeps_independent_members():
     assert {role: op['count'] for role, op in unique.items() if role != 'head'} == {
         role: [count, count] for role, count in expected.items()}
     assert unique['head']['count'] == [1, 0]
-    assert unique['kda_in']['packed_n'] == 12608
+    assert unique['kda_in']['packed_n'] == 12576
+    assert unique['kda_in']['packed_n'] == sum(m['n'] for m in
+        unique['kda_in']['members']+unique['kda_in']['native_aux'])
     assert [m['n'] for m in unique['kda_in']['members']] == [4096]*3
     assert [m['n'] for m in unique['kda_in']['native_aux']] == [128, 128, 32]
-    assert unique['kda_fg']['input_row'] == 12608 and unique['kda_fg']['output_row'] == 8192
+    assert unique['kda_fg']['input_row'] == 12576 and unique['kda_fg']['output_row'] == 8192
     for role, count in [('dense_down', 3), ('shared_down', 42)]:
         assert unique[role]['reduction_count'] == [count, 0]
         assert unique[role]['peer_zero_count'] == [0, count]
@@ -1464,9 +1466,9 @@ def test_flash_logical_bytes_include_native_aux_and_resident_f32_mhc():
     unique = {op['role']: op for op in ops}
     assert bench.flash_full_core_logical_bytes(unique['mhc_pre'])['native'] == 24*16384*4
     logical = bench.flash_full_core_logical_bytes(unique['kda_in'])
-    assert logical['bf16'] == 12608*4096*2
+    assert logical['bf16'] == 12576*4096*2
     assert logical['k6'] == 3*(4096*4096*6//8+2*(4096+4096))+288*4096*2
-    assert logical['fp8'] == 12608*4096+12608*32*4
+    assert logical['fp8'] == 12576*4096+12576*32*4
 
 
 def test_flash_aggregate_charges_attention_add_ffn_zero_and_native_mhc_once():
@@ -1533,7 +1535,7 @@ def test_flash_native_factories_match_mhc_routes_fg_pitches_and_fp8_head(monkeyp
     bench.flash_full_core_projection_program(unique['mhc_post_pre'], prefill=True)
     assert calls[-1][2] == dict(max_rows=4096, route='tf32')
     program = bench.flash_full_core_projection_program(unique['kda_fg'])
-    assert calls[-1][2] == dict(n=4096, k=128, batch=2, a_row=12608, a_batch=128,
+    assert calls[-1][2] == dict(n=4096, k=128, batch=2, a_row=12576, a_batch=128,
                                o_row=8192, o_batch=4096, compute_warps=64)
     assert len(program['operands']) == 3 and program['scalars'] == (('rows',),)
     assert [o[0][0] for o in program['operands']] == ['a', 'w', 'out']

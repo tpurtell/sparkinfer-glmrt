@@ -1189,13 +1189,13 @@ def flash_full_core_operations(config, tensors, *, onboard_layers):
                    (a+"b_proj.weight", (64, 4096))]
             for name, shape in aux:
                 check(name, shape)
-            op.update(packed_n=12608, output_row=12608,
+            op.update(packed_n=12576, output_row=12576,
                 native_aux=[dict(name=name, source_shape=list(shape), n=32 if i == 2 else 128, k=4096)
                             for i, (name, shape) in enumerate(aux)],
                 boundary="native fused q|k|v|f_a|g_a|b; trellis q/k/v independent then native aux and original KDA pack")
             add(f"layer{layer}.kda_fg", [a+"f_b_proj.weight", a+"g_b_proj.weight"],
                 [(8192, 128)]*2, split="output", batch=2, kind="fg",
-                input_row=12608, output_row=8192)
+                input_row=12576, output_row=8192)
             # Batched members describe one N per batch, not their concatenation.
             operations[-1]["packed_n"] = 4096
             add(f"layer{layer}.kda_o", [a+"o_proj.weight"], [(4096, 8192)],
@@ -1277,7 +1277,7 @@ def flash_full_core_projection_program(operation, *, prefill=False, fp8=False):
     if role == "head" and not fp8:
         raise ValueError("Flash BF16 head uses the shipping native DSO")
     if kind == "fg":
-        launch = BatchedBf16Gemm(n=4096, k=128, batch=2, a_row=12608, a_batch=128,
+        launch = BatchedBf16Gemm(n=4096, k=128, batch=2, a_row=12576, a_batch=128,
             o_row=8192, o_batch=4096, compute_warps=glmf._batched_warps(capacity))
     elif fp8:
         launch = glmf._w8(n, k, 4096 if prefill else None,
