@@ -979,6 +979,170 @@ def qwen_full_core_operations(config, tensors, owners):
     return operations
 
 
+def ml4_full_core_operations(config, tensors, scales, *, onboard_layers):
+    """Original ML4 FP8 versus K6, including NoPE and shared latent owners."""
+    c = config.get("text_config", config)
+    h, layers = c["hidden_size"], c["num_hidden_layers"]
+    heads, latent = c["num_attention_heads"], c["kv_lora_rank"]
+    nope, rope, value = c["qk_nope_head_dim"], c["qk_rope_head_dim"], c["v_head_dim"]
+    dense = c["first_k_dense_replace"]
+    if ((h, heads, latent, nope, rope, value) != (6144, 64, 512, 64, 64, 128)
+            or dense != 1 or not 0 <= onboard_layers <= layers-dense
+            or any(len(c[key]) != layers for key in
+                   ("indexer_types", "kv_source_layers", "no_rope_layers", "mlp_layer_types"))
+            or any(kind not in ("full", "shared") for kind in c["indexer_types"])
+            or c["mlp_layer_types"] != ["dense"]+["sparse"]*(layers-1)):
+        raise ValueError("ML4 full-core needs the qualified TP2 geometry and owner maps")
+    operations = []
+
+    def add(role, names, shapes, *, split="whole", trellis=False, dtype="BF16",
+            count=(1, 1), reduction=(0, 0), batch=1, n=None, k=None,
+            rope_layer=False, boundary="local"):
+        members = []
+        for name, shape in zip(names, shapes, strict=True):
+            tensor = tensors[name]
+            if tensor["dtype"] != dtype or tensor["shape"] != list(shape):
+                raise ValueError(f"ML4 original matrix differs: {name}; expected {dtype} {shape}")
+            sn, sk = shape
+            if dtype == "F8_E4M3":
+                scale_name = name.removesuffix(".weight")+".qscale_weight"
+                scale = scales.get(scale_name)
+                if not scale or scale["dtype"] != "F32" or scale["shape"] != [(sn+127)//128, (sk+127)//128]:
+                    raise ValueError(f"ML4 original block-128 scale differs: {scale_name}")
+            if (split == "output" and sn % 2) or (split == "input" and sk % 2):
+                raise ValueError(f"ML4 TP2 split differs: {name}")
+            ln, lk = sn//(2 if split == "output" else 1), sk//(2 if split == "input" else 1)
+            members.append(dict(name=name, source_shape=[sn, sk], n=ln, k=lk,
+                stored_n=(ln+127)//128*128 if trellis else ln,
+                hypothetical_trellis=trellis, split=split, source_dtype=dtype))
+        output = "f32" if role == "head" or role.endswith("router") else "bf16"
+        operations.append(dict(role=role, members=members, count=list(count),
+            k=members[0]["k"] if k is None else k,
+            packed_n=sum(m["n"] for m in members) if n is None else n,
+            batch=batch, split=split, hypothetical_trellis=trellis,
+            fp8_scale_layout="block128x128_f32" if dtype == "F8_E4M3" else None,
+            reduction_count=list(reduction), output=output, source_dtype=dtype,
+            rope=rope_layer, boundary=boundary))
+
+    for layer in range(layers):
+        a = f"layers.{layer}.attention."
+        prefix = f"layer{layer}."
+        has_rope = bool(c["no_rope_layers"][layer])
+        source = c["kv_source_layers"][layer]
+        if (not 0 <= source <= layer or c["kv_source_layers"][source] != source
+                or c["no_rope_layers"][source] != c["no_rope_layers"][layer]):
+            raise ValueError(f"ML4 latent source differs: layer{layer} -> {source}")
+        add(prefix+"query", [a+"wq.weight"], [(heads*(nope+rope), h)],
+            split="output", trellis=True, dtype="F8_E4M3")
+        if source == layer:
+            width = latent+(rope if has_rope else 0)
+            add(prefix+("kv_rope" if has_rope else "kv_nope"), [a+"wkv_a_with_mqa.weight"], [(width, h)],
+                trellis=True, rope_layer=has_rope,
+                boundary="independent H128 output cropped from padded640 to576" if has_rope else "local")
+        for stage, stage_n, stage_k in (("absorb", latent, nope if has_rope else nope+rope),
+                                        ("values", value, latent)):
+            add(prefix+stage+("_rope" if has_rope else "_nope"), [a+"wkv_b.weight"],
+                [(heads*((nope if has_rope else nope+rope)+value), latent)],
+                batch=heads//2, n=stage_n, k=stage_k, rope_layer=has_rope,
+                boundary="UK per-head transpose; only latent columns written" if stage == "absorb" else "UV per-head")
+        add(prefix+"attn_out", [a+"wo.weight"], [(h, heads*value)],
+            split="input", trellis=True, dtype="F8_E4M3", reduction=(1, 1),
+            boundary="K6 BF16 retained core/add/H128; native FP8 F32 retained partial/add/narrow")
+        if c["indexer_types"][layer] == "full":
+            add(prefix+"index_query", [a+"indexer.wq_b.weight"], [(4096, h)], trellis=True, dtype="F8_E4M3")
+            add(prefix+"index_kw", [a+"indexer.wk.weight", a+"indexer.weights_proj.weight"], [(128, h), (32, h)])
+        shared = layer >= dense
+        m = f"layers.{layer}."+("shared_experts." if shared else "feed_forward.")
+        inter = c["moe_intermediate_size"]*c["n_shared_experts"] if shared else c["intermediate_size"]
+        tag = "shared" if shared else "dense"
+        add(prefix+tag+"_in", [m+"w1.weight", m+"w3.weight"], [(inter, h)]*2,
+            split="output", trellis=True, dtype="F8_E4M3",
+            boundary="native packed gate/up; two independently calibrated K6 members")
+        add(prefix+tag+"_down", [m+"w2.weight"], [(h, inter)],
+            split="input", trellis=True, dtype="F8_E4M3", reduction=(1, 0) if shared else (1, 1),
+            boundary="K6 retained BF16/add/H128; original FP8 BF16 partial add fused in excluded norm")
+        if shared:
+            add(prefix+"router", [f"layers.{layer}.gate.weight"], [(c["n_routed_experts"], h)],
+                count=(1, int(layer < dense+onboard_layers)))
+    add("head", ["output.weight"], [(c["vocab_size"], h)], trellis=True, count=(1, 0),
+        boundary="F32 logits; original BF16 head retained in FP8 arm")
+    covered = {m["name"] for op in operations for m in op["members"]}
+    target = {name for name, tensor in tensors.items() if len(tensor["shape"]) == 2
+              and name != "tok_embeddings.weight" and ".experts." not in name}
+    if covered != target:
+        raise ValueError(f"ML4 uncovered target matrices: {sorted(target-covered)}; unexpected: {sorted(covered-target)}")
+    return operations
+
+
+def ml4_full_core_from_headers(path, scale_path, *, onboard_layers):
+    data = json.loads(Path(path).read_text())["ml4"]
+    scales = json.loads(Path(scale_path).read_text())["ml4"]
+    return ml4_full_core_operations(data["config"], data["tensors"], scales,
+                                    onboard_layers=onboard_layers)
+
+
+def ml4_full_core_projection_spec(operation, *, prefill=False):
+    role = re.sub(r"^layer\d+\.", "", operation["role"])
+    fp8 = operation["source_dtype"] == "F8_E4M3"
+    attention = role in ("query", "attn_out")
+    factory = ("native_head" if role == "head" else "kv_b" if operation["batch"] > 1 else
+               "router" if role == "router" else "index_kw" if role == "index_kw" else
+               "index_query" if role == "index_query" else "fp8" if fp8 else "draft_bf16")
+    return dict(role=role, n=operation["packed_n"], k=operation["k"], factory=factory,
+        output="f32" if role in ("attn_out", "head", "router") else "bf16",
+        prefill=bool(prefill), fp8=fp8, fp8_prefill_w8a8=fp8 and prefill and not attention,
+        fp8_decode_rows=64 if fp8 else None,
+        rope=operation["rope"], batch=operation["batch"],
+        query_row=64*(576 if operation["rope"] else 512) if role.startswith("absorb_") else None)
+
+
+def ml4_full_core_projection_program(operation, *, prefill=False):
+    """Original FP8/BF16 native factories, not an invented full-BF16 ML4 arm."""
+    import cutlass
+    import torch
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+    from b12x.integration.cuteafd.mistral_large4 import (
+        ML4, ML4_TP2, compile_kv_b_aot, compile_index_q_fp8_aot, rope_attention)
+    from b12x.integration.cuteafd.glm_ffn import compile_glm_router_scores_aot
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+
+    spec = ml4_full_core_projection_spec(operation, prefill=prefill)
+    role, n, k = spec["role"], spec["n"], spec["k"]
+    if spec["factory"] == "native_head":
+        raise ValueError("ML4 original BF16 head uses the shipping native DSO")
+    if spec["factory"] == "kv_b":
+        return compile_kv_b_aot(ML4_TP2, stage=role.split("_")[0], rope=spec["rope"],
+            max_rows=4096 if prefill else 64, query_row=spec["query_row"])
+    if spec["factory"] == "router":
+        return compile_glm_router_scores_aot(rope_attention(ML4))
+    if spec["factory"] == "index_kw":
+        return compile_bf16_projection_aot(width=k, outputs=n)
+    if spec["factory"] == "index_query":
+        return compile_index_q_fp8_aot(ML4, mode="prefill" if prefill else "decode",
+                                       max_rows=4096 if prefill else 64)
+    output = torch.float32 if spec["output"] == "f32" else torch.bfloat16
+    cute_dtype = cutlass.Float32 if spec["output"] == "f32" else cutlass.BFloat16
+    if not spec["fp8"]:
+        from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+        launch = TmaBf16Projection(n, k, out_dtype=cute_dtype,
+                                   tiles_by_rows=((16, 1, 4, 16, 64, 6),))
+        return compile_program(launch, name="ml4_native_bf16", operands=(
+            Operand("x", torch.bfloat16, f"[rows,{k}]"),
+            Operand("w", torch.bfloat16, f"[{n},{k}]"),
+            Operand("out", output, f"[rows,{n}]", "out")), scalars=(Scalar("rows"),),
+            key=(launch.key(),), geometry=spec)
+    launch = Fp8Projection(n, k, out_dtype=cute_dtype, decode_rows=spec["fp8_decode_rows"],
+                           prefill_rows=4096 if spec["fp8_prefill_w8a8"] else None)
+    return compile_program(launch, name="ml4_original_fp8", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("w_fp8", torch.uint8, f"[{n},{k}]"),
+        Operand("scale", torch.float32, f"[{(n+127)//128},{k//128}]", align=4),
+        Operand("out", output, f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"), Scalar("fp8_rows"), Scalar("qscratch", "int64")),
+        key=(tuple(sorted(spec.items())), launch.key()), geometry=spec)
+
+
 def muse_full_core_operations(config, tensors):
     """Muse TP2: native gate/router, independent cores, and F32 split meets."""
     c = config.get("text_config", config)
@@ -1531,7 +1695,10 @@ def encode_reference_fixtures(args):
     costs = torch.empty((256, 2, 65536 >> bits), device="cuda", dtype=torch.float16)
     edges = torch.empty((256, 256, 65536 >> bits), device="cuda", dtype=torch.int16)
     records = []
-    if getattr(args, "muse_core", None):
+    if getattr(args, "ml4_core", None):
+        operations = ml4_full_core_from_headers(args.ml4_core, args.ml4_scales, onboard_layers=args.onboard_layers)
+        shapes = glm_full_core_fixture_shapes(operations)
+    elif getattr(args, "muse_core", None):
         operations = muse_full_core_from_headers(args.muse_core)
         shapes = glm_full_core_fixture_shapes(operations)
     elif getattr(args, "glm_core", None):
@@ -1548,7 +1715,7 @@ def encode_reference_fixtures(args):
     for index, shape in enumerate(shapes):
         k, n, side = shape["k"], shape["n"], shape["side"]
         if (args.full_core or getattr(args, "qwen_core", None) or getattr(args, "glm_core", None)
-                or getattr(args, "muse_core", None)):
+                or getattr(args, "muse_core", None) or getattr(args, "ml4_core", None)):
             record = encode_chunked_fixture(args, index, shape, costs, edges, oracle)
             records.append(record)
             (args.output_dir / f"fixtures_k{bits}.json").write_text(json.dumps(records, indent=2) + "\n")
@@ -2373,6 +2540,319 @@ def benchmark_muse_full_core(args):
             del logical_weight
         del graphs, events, graph, expected, target, fixtures, weight, x, outs, retained, peer, reduced
         del raw, final, rotated, suh, scale, svh, table, payloads, partial, quantized, fp8_scale, qscratch, workspace
+        torch.cuda.empty_cache()
+
+
+def aggregate_ml4_full_core(operations, records, rows_list):
+    lookup = {(r["role"], r["rows"], r["phase"]): r["total_call_us"] for r in records}
+
+    def phases(op):
+        return ("producer", "reduce0", "reduce1") if op["split"] == "input" else ("producer",)
+
+    def available(op, rows):
+        return all((op["role"], rows, phase) in lookup for phase in phases(op))
+
+    def cost(op, rows, arm, rank):
+        key = "native" if arm == "original_fp8" or not op["hypothetical_trellis"] else "k6"
+        value = lookup[(op["role"], rows, "producer")][key]*op["count"][rank]
+        if op["split"] == "input" and (key == "k6" or op["role"] == "attn_out"):
+            value += lookup[(op["role"], rows, f"reduce{rank}")][key]*op["reduction_count"][rank]
+        return value
+
+    arms = ("original_fp8", "k6")
+    decode, prefill = [], []
+    for rows in rows_list:
+        if rows > 64 or not all(available(op, rows) for op in operations):
+            continue
+        sums = {arm: [sum(cost(op, rows, arm, rank) for op in operations) for rank in (0, 1)] for arm in arms}
+        decode.append(dict(rows=rows, local_dense_us_per_verify_step=sums,
+            kimi_rate_normalized_local_dense_us_per_emitted_token={
+                arm: [v*73/255 for v in values] for arm, values in sums.items()}))
+    for tokens in (8192, 65536):
+        schedule = glm_full_core_prefill_schedule(tokens)
+        histogram = schedule["body_row_histogram"]
+        if not all(available(op, row) for op in operations
+                   for row in ([1] if op["role"] == "head" else histogram)):
+            continue
+        sums = {arm: [sum(schedule["head_calls"]*cost(op, 1, arm, rank) if op["role"] == "head" else
+                         sum(count*cost(op, row, arm, rank) for row, count in histogram.items())
+                         for op in operations) for rank in (0, 1)] for arm in arms}
+        prefill.append(dict(tokens=tokens, **schedule, local_dense_us=sums))
+    return dict(decode=decode, prefill=prefill,
+        normalization="Kimi 73 verify steps / 255 emitted tokens; not measured ML4 speculation",
+        scope="Original native FP8/BF16 versus K6 only; local dense, native attention F32 meets and K6 BF16-core meets included; original FFN BF16 add fused in excluded norm; no peer transport")
+
+
+def benchmark_ml4_full_core(args):
+    """Measure the actual mixed original precision against independently encoded K6."""
+    import hashlib
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd._glmf_fp8 import quant_scratch_bytes
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+
+    rows_list = sorted(set(map(int, args.rows.split(","))))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 50:
+        raise ValueError("ML4 full-core requires rows 1..4096 and >=50 samples")
+    all_operations = ml4_full_core_from_headers(args.ml4_core, args.ml4_scales, onboard_layers=args.onboard_layers)
+    operations = glm_full_core_unique_operations(all_operations)
+    contract = dict(operations=operations, export_sms=args.export_sms,
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    if args.compile_only:
+        import multiprocessing
+        from b12x._lib.compile_pool import _initialize_worker
+        _initialize_worker(0, (12, 0), "ml4-core", "ml4-core", args.export_sms,
+                           101376, 102400, multiprocessing.Array("i", [0, 0]))
+    else:
+        props = torch.cuda.get_device_properties(0)
+        status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+        if int(status):
+            raise RuntimeError(status)
+        limit = props.multi_processor_count*4
+        flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+        manifest = json.loads((args.fixture_dir/"fixtures_k6.json").read_text())
+        shapes = glm_full_core_fixture_shapes(all_operations)
+        if len(manifest) != len(shapes) or any(not r["oracle_exact"] or
+                any(r[key] != s[key] for key in s) for r, s in zip(manifest, shapes)):
+            raise ValueError("ML4 independent K6 fixtures differ")
+        native = C.CDLL(str(args.native_library.resolve()))
+        signatures = {
+            "cuteafd_load_narrow_f32_bf16": [C.c_void_p, C.c_void_p, C.c_int64, C.c_int32, C.c_void_p],
+            "cuteafd_bf16_f32_add_async": [C.c_void_p]*3+[C.c_size_t, C.c_int32, C.c_void_p],
+            "cuteafd_cuda_residual_add_f32_async": [C.c_void_p]*3+[C.c_size_t, C.c_void_p],
+            "cuteafd_fp8_block_quant": [C.c_void_p]*3+[C.c_int32, C.c_int32, C.c_void_p],
+            "cuteafd_vocabulary_head_create_vocab": [C.c_void_p, C.c_uint64]+[C.c_int32]*4+[C.POINTER(C.c_void_p)],
+            "cuteafd_vocabulary_head_launch_tensor_invariant": [C.c_void_p]*4+[C.c_int32, C.c_void_p],
+            "cuteafd_v41_markov_destroy": [C.c_void_p],
+        }
+        for name, signature in signatures.items():
+            function = getattr(native, name)
+            function.argtypes, function.restype = signature, C.c_int32
+        runtime = C.CDLL("libcudart.so")
+        runtime.cudaMemcpy2DAsync.argtypes = [C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t,
+                                            C.c_size_t, C.c_size_t, C.c_int, C.c_void_p]
+        runtime.cudaMemcpy2DAsync.restype = C.c_int
+        report = dict(metadata=dict(contract=contract, device=props.name, sms=props.multi_processor_count,
+            l2_bytes=l2, samples=args.samples, fixture_manifests={6: manifest},
+            native_library_sha256=hashlib.sha256(args.native_library.read_bytes()).hexdigest(),
+            native_provenance=json.loads(args.native_library.with_name("COMPILER_PROVENANCE.json").read_text()),
+            cache="2x runtime L2 eviction outside each complete-operation interval",
+            numerics="genuine independently reference-encoded random K6; native block128 FP8 conversion outside timing; no quality claim",
+            arms="Original mixed FP8/BF16 versus K6 only; no fabricated original-BF16 or K8 arm",
+            exclusions="Peer transport, attention, norms, nonlinearities, experts, media and draft excluded; not end-to-end"), records=[])
+        torch.manual_seed(811)
+        warm = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm, warm)
+        torch.cuda.synchronize()
+        del warm
+
+    def checked(status):
+        if status:
+            raise RuntimeError(f"ML4 full-core launch failed: {status}")
+
+    def program(directory, name, builder):
+        if args.compile_only:
+            print("compile", directory.name, name, flush=True)
+            with exportable_compilation():
+                result = builder()
+            exported(result, directory, name, load_module=False)
+            (directory/f"{name}.json").write_text(json.dumps(dict(pointers=len(result.operands),
+                scalars=[s.ctype for s in result.scalars])))
+            return None
+        abi = json.loads((directory/f"{name}.json").read_text())
+        lib = C.CDLL(str((directory/f"{name}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        kinds = {"int32": C.c_int32, "int64": C.c_int64, "float32": C.c_float}
+        lib.run.argtypes = [C.c_void_p]*abi["pointers"]+[kinds[s] for s in abi["scalars"]]+[C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    def fixture(role, index):
+        record, = [r for r in manifest if r["role"] == role and r["member"] == index]
+        path = args.fixture_dir/record["path"]
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8*1024*1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != record["sha256"]:
+            raise ValueError("ML4 fixture checksum differs")
+        return torch.load(path, weights_only=True, map_location="cpu")
+
+    for op in operations:
+        role, k, n, batch = op["role"], op["k"], op["packed_n"], op["batch"]
+        head, split, absorb = role == "head", op["split"] == "input", role.startswith("absorb_")
+        fp8 = op["source_dtype"] == "F8_E4M3"
+        spec = ml4_full_core_projection_spec(op)
+        capacity = 64 if head else 4096
+        directory = args.output_dir/role
+        directory.mkdir(parents=True, exist_ok=True)
+        if args.compile_only:
+            (directory/"contract.json").write_text(json.dumps(contract, sort_keys=True))
+        elif json.loads((directory/"contract.json").read_text()) != contract:
+            raise ValueError("stale ML4 full-core exports")
+        baseline = {} if head else {p: program(directory, f"native_{int(p)}",
+            lambda p=p: ml4_full_core_projection_program(op, prefill=p)) for p in (False, True)}
+        members = op["members"] if op["hypothetical_trellis"] else []
+        sizes = [m["stored_n"] for m in members]
+        ingress, egress, cores = [], [], []
+        for i, sn in enumerate(sizes):
+            ingress.append(program(directory, f"ingress{i}", lambda: compile_trellis_input_aot(
+                features=k, max_rows=capacity, output_dtype="bf16")))
+            egress.append(program(directory, f"egress{i}", lambda sn=sn: compile_trellis_output_aot(
+                features=sn, max_rows=capacity, output_dtype="f32" if head else "bf16")))
+            cores.append(program(directory, f"core{i}_k6", lambda sn=sn: compile_trellis_linear_aot(
+                input_features=k, output_features=sn, bits=6, codebook="mcg",
+                sharded_side=2 if split else 1, max_rows=capacity, input_dtype="bf16")))
+        if args.compile_only:
+            continue
+        fixtures = [fixture(role, i) for i in range(len(members))]
+        weight = (torch.cat([f["weight"][:m["n"]] for f, m in zip(fixtures, members)]).cuda()
+                  if members else torch.randn(batch*n, k, device="cuda", dtype=torch.bfloat16))
+        input_width = batch*128 if absorb else batch*k
+        output_width = spec["query_row"] if absorb else batch*n
+        x = torch.randn(capacity, input_width, device="cuda", dtype=torch.bfloat16)
+        out_dtype = torch.float32 if spec["output"] == "f32" else torch.bfloat16
+        outs = {arm: torch.empty(capacity, output_width, device="cuda", dtype=out_dtype) for arm in ("native", "k6")}
+        raw = [torch.empty(capacity, sn, device="cuda", dtype=torch.float32) for sn in sizes]
+        final = [torch.empty(capacity, sn, device="cuda", dtype=torch.float32 if head else torch.bfloat16) for sn in sizes]
+        rotated = [torch.empty(capacity, k, device="cuda", dtype=torch.bfloat16) for _ in sizes]
+        suh = [torch.ones(k, device="cuda", dtype=torch.float16) for _ in sizes]
+        scale = [torch.ones(k//128, device="cuda", dtype=torch.float16) for _ in sizes]
+        svh = [torch.ones(sn, device="cuda", dtype=torch.float16) for sn in sizes]
+        tables = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in rotated]
+        payloads = [f["payload"].cuda() for f in fixtures]
+        partial = torch.empty(capacity*((k+1023)//1024)*max(sizes, default=128), device="cuda", dtype=torch.float32)
+        retained = {arm: torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16 if arm == "k6" else out_dtype)
+                    for arm in ("native", "k6")} if split else {}
+        peer = {arm: torch.randn_like(value) for arm, value in retained.items()}
+        reduced = torch.empty(capacity, n, device="cuda", dtype=torch.float32) if split else None
+        quantized, fp8_scale = None, None
+        qscratch = torch.empty(quant_scratch_bytes(k, capacity), device="cuda", dtype=torch.uint8) if fp8 else None
+        if fp8:
+            quantized = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+            fp8_scale = torch.empty((n+127)//128, (k+127)//128, device="cuda", dtype=torch.float32)
+            checked(native.cuteafd_fp8_block_quant(weight.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(), n, k,
+                                                   torch.cuda.current_stream().cuda_stream))
+        handle, workspace = C.c_void_p(), None
+        if head:
+            workspace = torch.empty(4<<20, device="cuda", dtype=torch.uint8)
+            checked(native.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), k, capacity, n, 1, C.byref(handle)))
+
+        def call(lib, *values):
+            checked(lib.run(*values, torch.cuda.current_stream().cuda_stream))
+
+        def crop(dst, src, rows, width):
+            element = dst.element_size()
+            checked(runtime.cudaMemcpy2DAsync(dst.data_ptr(), dst.shape[1]*element, src.data_ptr(),
+                src.shape[1]*element, width*element, rows, 3, torch.cuda.current_stream().cuda_stream))
+
+        def run(arm, rows, phase):
+            stream = torch.cuda.current_stream().cuda_stream
+            if phase.startswith("reduce"):
+                rank = int(phase[-1])
+                first, second = (retained[arm], peer[arm]) if rank == 0 else (peer[arm], retained[arm])
+                if arm == "native":
+                    checked(native.cuteafd_cuda_residual_add_f32_async(first.data_ptr(), second.data_ptr(), reduced.data_ptr(), rows*n, stream))
+                    checked(native.cuteafd_load_narrow_f32_bf16(reduced.data_ptr(), final[0].data_ptr(), rows*n, props.multi_processor_count, stream))
+                else:
+                    checked(native.cuteafd_bf16_f32_add_async(first.data_ptr(), second.data_ptr(), reduced.data_ptr(), rows*n, props.multi_processor_count, stream))
+                    call(egress[0], reduced.data_ptr(), svh[0].data_ptr(), final[0].data_ptr(), rows, limit)
+            elif arm == "native" or not members:
+                target = retained[arm] if split else outs["native"]
+                if head:
+                    checked(native.cuteafd_vocabulary_head_launch_tensor_invariant(handle, x.data_ptr(), weight.data_ptr(), target.data_ptr(), rows, stream))
+                elif spec["factory"] == "index_query":
+                    call(baseline[rows > 64], x.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(), target.data_ptr(),
+                         qscratch.data_ptr(), rows, *([255] if rows > 64 else []))
+                elif fp8:
+                    call(baseline[rows > 64], x.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(), target.data_ptr(),
+                         rows, 255 if ml4_full_core_projection_spec(op, prefill=rows > 64)["fp8_prefill_w8a8"] else 64, qscratch.data_ptr())
+                else:
+                    call(baseline[rows > 64], x.data_ptr(), weight.data_ptr(), target.data_ptr(), rows)
+            else:
+                for i, sn in enumerate(sizes):
+                    call(ingress[i], x.data_ptr(), suh[i].data_ptr(), rotated[i].data_ptr(), scale[i].data_ptr(), rows, limit)
+                    call(cores[i], tables[i].data_ptr(), payloads[i].data_ptr(), scale[i].data_ptr(),
+                         partial.data_ptr(), raw[i].data_ptr(), rows, 0, limit)
+                    if split:
+                        checked(native.cuteafd_load_narrow_f32_bf16(raw[i].data_ptr(), retained[arm].data_ptr(), rows*n, props.multi_processor_count, stream))
+                    else:
+                        call(egress[i], raw[i].data_ptr(), svh[i].data_ptr(), final[i].data_ptr(), rows, limit)
+                        if sizes[i] != members[i]["n"]:
+                            crop(outs[arm], final[i], rows, members[i]["n"])
+
+        active_rows = [r for r in rows_list if r <= 64] if head else rows_list
+        for rows in active_rows:
+            for phase in (("producer", "reduce0", "reduce1") if split else ("producer",)):
+                arms = ("native", "k6") if (members and (phase == "producer" or role == "attn_out")) else (("k6",) if members else ("native",))
+                graphs, events = {}, {}
+                for arm in arms:
+                    run(arm, rows, "producer")
+                    run(arm, rows, phase)
+                    if phase != "producer":
+                        targets = [final[0][:rows]]
+                    elif split:
+                        targets = [retained[arm][:rows]]
+                    elif arm == "k6":
+                        targets = ([outs[arm][:rows]] if any(m["stored_n"] != m["n"] for m in members) else
+                                   [value[:rows] for value in final])
+                    elif absorb:
+                        latent = 576 if op["rope"] else 512
+                        targets = [outs["native"].view(capacity, 64, latent)[:rows, :batch, :n]]
+                    else:
+                        targets = [outs["native"][:rows]]
+                    expected = [value.clone() for value in targets]
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run(arm, rows, phase)
+                    for value in targets:
+                        value.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    if not all(torch.equal(value.view(torch.uint8), reference.view(torch.uint8)) and torch.isfinite(value).all().item()
+                               for value, reference in zip(targets, expected)):
+                        raise RuntimeError(f"ML4 {role}/{arm}/{rows}/{phase}: poisoned replay differs")
+                    pairs = [(torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True))
+                             for _ in range(16 if rows <= 64 else 4)]
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        for start, end in pairs:
+                            flush.zero_()
+                            start.record()
+                            run(arm, rows, phase)
+                            end.record()
+                    graphs[arm], events[arm] = graph, pairs
+                    graph.replay()
+                torch.cuda.synchronize()
+                before = thermal_snapshot()
+                samples = {arm: [] for arm in arms}
+                for repeat in range(args.samples):
+                    for arm in (arms if repeat%2 == 0 else tuple(reversed(arms))):
+                        graphs[arm].replay()
+                        events[arm][-1][1].synchronize()
+                        samples[arm].append(statistics.mean(a.elapsed_time(b)*1000 for a, b in events[arm]))
+                times = {arm: statistics.median(values) for arm, values in samples.items()}
+                logical = dict(native=batch*n*k*(1 if fp8 else 2)+(fp8_scale.numel()*4 if fp8 else 0),
+                               k6=sum(k*sn*6//8+2*(k+sn) for sn in sizes))
+                if phase != "producer":
+                    logical = {arm: n*(8 if arm == "native" else 4) for arm in arms}
+                record = dict(role=role, rows=rows, phase=phase,
+                    total_call_us=times, samples_us=samples, logical_weight_bytes={arm: logical[arm] for arm in arms},
+                    logical_weight_gbs={arm: logical[arm]/(times[arm]*1000) for arm in arms},
+                    replay_exact=True, poisoned_outputs_overwritten=True,
+                    thermal_before=before, thermal_after=thermal_snapshot())
+                report["records"].append(record)
+                report["aggregate"] = aggregate_ml4_full_core(operations, report["records"], rows_list)
+                print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
+                (args.output_dir/"report.json").write_text(json.dumps(report, indent=2)+"\n")
+        if head:
+            checked(native.cuteafd_v41_markov_destroy(handle))
+        del graphs, events, graph, expected, targets, fixtures, weight, x, outs, raw, final, rotated
+        del suh, scale, svh, tables, payloads, partial, retained, peer, reduced, quantized, fp8_scale, qscratch, workspace
         torch.cuda.empty_cache()
 
 
@@ -3212,7 +3692,9 @@ def main():
     parser.add_argument("--qwen-core", type=Path, help="original Qwen config/header inventory; hypothetical K6/K8 full-core arms")
     parser.add_argument("--glm-core", type=Path, help="original GLM 5.3 config/header inventory; independent K6/K8 full-core arms")
     parser.add_argument("--muse-core", type=Path, help="original Muse config/header inventory; independent K6/K8 plus selectable and hypothetical full FP8")
-    parser.add_argument("--onboard-layers", type=int, help="actual GLM admitted sparse prefix, required for router owner counts")
+    parser.add_argument("--ml4-core", type=Path, help="original ML4 config/header inventory; native FP8/BF16 versus K6 only")
+    parser.add_argument("--ml4-scales", type=Path, help="original ML4 block-FP8 scale header audit")
+    parser.add_argument("--onboard-layers", type=int, help="actual admitted sparse prefix, required for GLM/ML4 router owner counts")
     parser.add_argument("--native-library", type=Path, help="shipping native DSO plus adjacent COMPILER_PROVENANCE.json")
     parser.add_argument("--fixture-dir", type=Path, help="independently reference-encoded K6/K8 fixture directory")
     parser.add_argument("--profile-catalog", type=Path, help="baseline kernel-catalog.json for per-emitted-token call counts")
@@ -3225,6 +3707,17 @@ def main():
         hashes = reference_encoder(args.encoder_source, args.output_dir / "encoder")
         (args.output_dir / "encoder_sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
         return
+    if args.ml4_core:
+        if (args.muse_core or args.qwen_core or args.glm_core or args.full_core or args.kimi_decision
+                or args.baseline_native or args.onboard_layers is None or args.ml4_scales is None):
+            parser.error("--ml4-core is separate from other family modes and requires --onboard-layers and --ml4-scales")
+        if args.encode_fixtures and args.bits != 6:
+            parser.error("--ml4-core compares original FP8 versus K6 only")
+        if not args.encode_fixtures:
+            if not args.compile_only and (args.fixture_dir is None or args.native_library is None):
+                parser.error("--ml4-core measurement requires --fixture-dir and --native-library")
+            benchmark_ml4_full_core(args)
+            return
     if args.muse_core:
         if args.qwen_core or args.glm_core or args.full_core or args.kimi_decision or args.baseline_native:
             parser.error("--muse-core is separate from other family modes")

@@ -924,6 +924,212 @@ def test_muse_measurement_refuses_incomplete_cli_before_cuda(monkeypatch, tmp_pa
     assert error.value.code == 2
 
 
+def _ml4_core_headers():
+    config = dict(hidden_size=6144, num_hidden_layers=4, num_attention_heads=64,
+        kv_lora_rank=512, qk_nope_head_dim=64, qk_rope_head_dim=64, v_head_dim=128,
+        first_k_dense_replace=1, intermediate_size=24576, moe_intermediate_size=6144,
+        n_shared_experts=1, n_routed_experts=128, vocab_size=204800,
+        no_rope_layers=[1, 0, 0, 1], kv_source_layers=[0, 1, 1, 3],
+        indexer_types=["full", "full", "shared", "shared"], mlp_layer_types=["dense"]+["sparse"]*3)
+    tensors, scales = {}, {}
+
+    def add(name, n, k, dtype="BF16"):
+        tensors[name] = dict(dtype=dtype, shape=[n, k])
+        if dtype == "F8_E4M3":
+            scales[name.removesuffix(".weight")+".qscale_weight"] = dict(
+                dtype="F32", shape=[(n+127)//128, (k+127)//128])
+
+    for layer in range(4):
+        a = f"layers.{layer}.attention."
+        add(a+"wq.weight", 8192, 6144, "F8_E4M3")
+        add(a+"wo.weight", 6144, 8192, "F8_E4M3")
+        if config["kv_source_layers"][layer] == layer:
+            add(a+"wkv_a_with_mqa.weight", 576 if config["no_rope_layers"][layer] else 512, 6144)
+        add(a+"wkv_b.weight", 12288 if config["no_rope_layers"][layer] else 16384, 512)
+        if config["indexer_types"][layer] == "full":
+            add(a+"indexer.wq_b.weight", 4096, 6144, "F8_E4M3")
+            add(a+"indexer.wk.weight", 128, 6144)
+            add(a+"indexer.weights_proj.weight", 32, 6144)
+        m = f"layers.{layer}."+("feed_forward." if layer == 0 else "shared_experts.")
+        inter = 24576 if layer == 0 else 6144
+        for leaf in ("w1", "w3"):
+            add(m+leaf+".weight", inter, 6144, "F8_E4M3")
+        add(m+"w2.weight", 6144, inter, "F8_E4M3")
+        if layer:
+            add(f"layers.{layer}.gate.weight", 128, 6144)
+    add("output.weight", 204800, 6144)
+    add("tok_embeddings.weight", 204800, 6144)
+    add("layers.1.experts.0.w1.weight", 6144, 6144, "F8_E4M3")
+    return config, tensors, scales
+
+
+def test_ml4_catalog_covers_original_fp8_bf16_and_exact_latent_owners():
+    bench = _native_threshold_bench()
+    config, tensors, scales = _ml4_core_headers()
+    ops = bench.ml4_full_core_operations(config, tensors, scales, onboard_layers=1)
+    unique = {op["role"]: op for op in bench.glm_full_core_unique_operations(ops)}
+    assert len(unique) == 16
+    assert unique["kv_rope"]["count"] == [2, 2]
+    assert unique["kv_nope"]["count"] == [1, 1]
+    assert unique["absorb_nope"]["count"] == [2, 2]
+    assert unique["absorb_nope"]["k"] == 128 and unique["absorb_rope"]["k"] == 64
+    assert unique["query"]["packed_n"] == 4096
+    assert unique["attn_out"]["k"] == 4096
+    assert unique["head"]["count"] == [1, 0]
+    assert unique["router"]["count"] == [3, 1]
+    assert unique["shared_down"]["reduction_count"] == [3, 0]
+    assert unique["dense_down"]["reduction_count"] == [1, 1]
+    assert unique["index_query"]["hypothetical_trellis"]
+    assert all(not unique[r]["hypothetical_trellis"] for r in
+               ("index_kw", "router", "absorb_rope", "values_rope", "absorb_nope", "values_nope"))
+    assert len(bench.glm_full_core_fixture_shapes(ops)) == 12
+    covered = {m["name"] for op in ops for m in op["members"]}
+    assert covered == set(tensors)-{"tok_embeddings.weight", "layers.1.experts.0.w1.weight"}
+    assert unique["kv_rope"]["members"][0]["stored_n"] == 640
+    assert "original FP8 BF16 partial add fused" in unique["shared_down"]["boundary"]
+
+
+@pytest.mark.parametrize("bad", ["scale", "dtype", "shape", "owner_rope", "owner_chain", "extra", "onboard"])
+def test_ml4_catalog_rejects_inexact_headers_scales_and_owner_maps(bad):
+    bench = _native_threshold_bench()
+    config, tensors, scales = _ml4_core_headers()
+    if bad == "scale":
+        scales["layers.0.attention.wq.qscale_weight"]["shape"] = [1, 1]
+    elif bad == "dtype":
+        tensors["layers.0.attention.wq.weight"]["dtype"] = "BF16"
+    elif bad == "shape":
+        tensors["layers.1.attention.wkv_b.weight"]["shape"] = [12288, 512]
+    elif bad == "owner_rope":
+        config["kv_source_layers"][2] = 0
+    elif bad == "owner_chain":
+        config["kv_source_layers"][3] = 2
+        config["no_rope_layers"][3] = 0
+    elif bad == "extra":
+        tensors["layers.0.extra.weight"] = dict(dtype="BF16", shape=[128, 128])
+    with pytest.raises(ValueError):
+        bench.ml4_full_core_operations(config, tensors, scales, onboard_layers=4 if bad == "onboard" else 1)
+
+
+def test_ml4_native_specs_preserve_original_fp8_and_no_invented_bf16_arm():
+    bench = _native_threshold_bench()
+    config, tensors, scales = _ml4_core_headers()
+    ops = bench.glm_full_core_unique_operations(
+        bench.ml4_full_core_operations(config, tensors, scales, onboard_layers=1))
+    for op in ops:
+        for prefill in (False, True):
+            spec = bench.ml4_full_core_projection_spec(op, prefill=prefill)
+            fp8 = op["source_dtype"] == "F8_E4M3"
+            assert spec["fp8"] == fp8
+            assert spec["fp8_decode_rows"] == (64 if fp8 else None)
+            assert spec["fp8_prefill_w8a8"] == (fp8 and prefill and op["role"] not in ("query", "attn_out"))
+            assert spec["output"] == ("f32" if op["role"] in ("attn_out", "head", "router") else "bf16")
+            if op["role"].startswith("absorb_"):
+                assert spec["query_row"] == 64*(576 if op["rope"] else 512)
+            if op["role"] == "head":
+                assert not spec["fp8"] and spec["factory"] == "native_head"
+
+
+def test_ml4_header_reader_uses_original_and_scale_inventories(tmp_path):
+    import json
+    bench = _native_threshold_bench()
+    config, tensors, scales = _ml4_core_headers()
+    headers, audit = tmp_path/"headers.json", tmp_path/"scales.json"
+    headers.write_text(json.dumps(dict(ml4=dict(config=config, tensors=tensors))))
+    audit.write_text(json.dumps(dict(ml4=scales)))
+    assert bench.ml4_full_core_from_headers(headers, audit, onboard_layers=1) == \
+        bench.ml4_full_core_operations(config, tensors, scales, onboard_layers=1)
+
+
+def test_ml4_factories_preserve_fp8_abi_f32_and_pitched_uk(monkeypatch):
+    bench = _native_threshold_bench()
+    calls = []
+
+    class Projection:
+        def __init__(self, n, k, **kwargs):
+            calls.append((n, k, kwargs))
+        def key(self):
+            return ("projection",)
+
+    def record(kind):
+        return lambda *args, **kwargs: (kind, args, kwargs)
+
+    monkeypatch.setitem(sys.modules, "cutlass", SimpleNamespace(BFloat16="bf16", Float32="f32"))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32", uint8="u8"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._common", SimpleNamespace(
+        Operand=lambda *a, **kw: a, Scalar=lambda *a: a,
+        compile_program=lambda launch, **kwargs: kwargs))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._fp8_weights", SimpleNamespace(Fp8Projection=Projection))
+    monkeypatch.setitem(sys.modules, "b12x.gemm.bf16_gemv._skinny", SimpleNamespace(TmaBf16Projection=Projection))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.mistral_large4", SimpleNamespace(
+        ML4="whole", ML4_TP2="half", compile_kv_b_aot=record("kv_b"),
+        compile_index_q_fp8_aot=record("index_q"), rope_attention=lambda g: g))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.glm_ffn", SimpleNamespace(
+        compile_glm_router_scores_aot=record("router")))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.pointwise", SimpleNamespace(
+        compile_bf16_projection_aot=record("pointwise")))
+    config, tensors, scales = _ml4_core_headers()
+    ops = {op["role"]: op for op in bench.glm_full_core_unique_operations(
+        bench.ml4_full_core_operations(config, tensors, scales, onboard_layers=1))}
+    for role in ("query", "attn_out", "dense_in", "shared_down"):
+        result = bench.ml4_full_core_projection_program(ops[role], prefill=True)
+        assert [x[0] for x in result["operands"]] == ["x", "w_fp8", "scale", "out"]
+        assert result["scalars"] == (("rows",), ("fp8_rows",), ("qscratch", "int64"))
+        assert calls[-1][2]["prefill_rows"] == (None if role in ("query", "attn_out") else 4096)
+        assert calls[-1][2]["out_dtype"] == ("f32" if role == "attn_out" else "bf16")
+        hash(result["key"])
+    for role, rope in (("absorb_rope", True), ("absorb_nope", False)):
+        result = bench.ml4_full_core_projection_program(ops[role], prefill=True)
+        assert result == ("kv_b", ("half",), dict(stage="absorb", rope=rope, max_rows=4096,
+                                                  query_row=64*(576 if rope else 512)))
+    assert bench.ml4_full_core_projection_program(ops["index_query"], prefill=True) == (
+        "index_q", ("whole",), dict(mode="prefill", max_rows=4096))
+    assert bench.ml4_full_core_projection_program(ops["router"], prefill=True) == ("router", ("whole",), {})
+    assert bench.ml4_full_core_projection_program(ops["index_kw"]) == ("pointwise", (), dict(width=6144, outputs=160))
+    result = bench.ml4_full_core_projection_program(ops["kv_rope"])
+    assert result["operands"][1] == ("w", "bf16", "[576,6144]")
+    assert calls[-1][2]["tiles_by_rows"] == ((16, 1, 4, 16, 64, 6),)
+
+
+def test_ml4_aggregate_charges_native_attention_and_k6_ffn_meets_only():
+    bench = _native_threshold_bench()
+    config, tensors, scales = _ml4_core_headers()
+    ops = bench.glm_full_core_unique_operations(
+        bench.ml4_full_core_operations(config, tensors, scales, onboard_layers=1))
+    records = []
+    for op in ops:
+        for rows in (1, 2, 2240, 2688, 2752):
+            if op["role"] == "head" and rows > 64:
+                continue
+            members = op["hypothetical_trellis"]
+            records.append(dict(role=op["role"], rows=rows, phase="producer",
+                total_call_us=dict(native=1, **({"k6": 2} if members else {}))))
+            if op["split"] == "input":
+                for rank in (0, 1):
+                    records.append(dict(role=op["role"], rows=rows, phase=f"reduce{rank}",
+                        total_call_us=dict(k6=3, **({"native": 4} if op["role"] == "attn_out" else {}))))
+    result = bench.aggregate_ml4_full_core(ops, records, [1, 2, 2240, 2688, 2752])
+    values = result["decode"][1]["local_dense_us_per_verify_step"]
+    for rank in (0, 1):
+        assert values["original_fp8"][rank] == sum(op["count"][rank] for op in ops)+4*4
+        assert values["k6"][rank] == sum(op["count"][rank]*(2 if op["hypothetical_trellis"] else 1) +
+            3*op["reduction_count"][rank] for op in ops)
+    assert len(result["prefill"]) == 2
+    assert set(values) == {"original_fp8", "k6"}
+    assert "not measured ML4 speculation" in result["normalization"]
+
+
+@pytest.mark.parametrize("extra", [[], ["--onboard-layers", "8"],
+    ["--onboard-layers", "8", "--ml4-scales", "scales.json"],
+    ["--onboard-layers", "8", "--ml4-scales", "scales.json", "--muse-core", "other.json"],
+    ["--onboard-layers", "8", "--ml4-scales", "scales.json", "--encode-fixtures", "--bits", "8"]])
+def test_ml4_cli_rejects_incomplete_or_fabricated_arms_before_cuda(monkeypatch, tmp_path, extra):
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path),
+                                     "--ml4-core", "headers.json", *extra])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
+
+
 def _native_route_policy():
     source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
     nodes = []
