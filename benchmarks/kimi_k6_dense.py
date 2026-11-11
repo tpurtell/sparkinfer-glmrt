@@ -979,6 +979,108 @@ def qwen_full_core_operations(config, tensors, owners):
     return operations
 
 
+def muse_full_core_operations(config, tensors):
+    """Muse TP2: native gate/router, independent cores, and F32 split meets."""
+    c = config.get("text_config", config)
+    h, layers = c["hidden_size"], c["num_hidden_layers"]
+    heads, kv, d = c["num_attention_heads"], c["num_key_value_heads"], c["head_dim"]
+    e, vocab = c["moe_hidden_size"], c["vocab_size"]
+    if ((h, heads, kv, d, e, c["num_local_experts"]) != (8192, 128, 16, 64, 4096, 256)
+            or layers < 1 or len(c["layer_types"]) != layers
+            or c["mlp_layer_types"] != ["sparse"]*layers or c["num_shared_experts"] != 0):
+        raise ValueError("Muse full-core needs the qualified sparse TP2 geometry")
+    operations = []
+
+    def add(role, name, shape, *, split="whole", trellis=False, attention=False,
+            count=(1, 1), weight_dtype="BF16"):
+        tensor = tensors[name]
+        if tensor["dtype"] != weight_dtype or tensor["shape"] != list(shape):
+            raise ValueError(f"Muse original matrix differs: {name}; expected {weight_dtype} {shape}")
+        n, k = shape
+        n //= 2 if split == "output" else 1
+        k //= 2 if split == "input" else 1
+        stored_n = (n+127)//128*128 if trellis else n
+        output = "f32" if split == "input" or role == "head" or weight_dtype == "F32" else "bf16"
+        operations.append(dict(role=role, members=[dict(name=name, source_shape=list(shape), n=n, k=k,
+            stored_n=stored_n, hypothetical_trellis=trellis, split=split)], count=list(count),
+            k=k, packed_n=n, batch=1, split=split, hypothetical_trellis=trellis,
+            fp8_scale_layout="block128x128_f32" if trellis else None,
+            shipping_fp8_attention=attention, reduction_count=list(count) if split == "input" else [0, 0],
+            weight_dtype=weight_dtype, output=output,
+            boundary=("F32 retained producer copy; rank-ordered F32 add; F32 H128/svh egress; BF16 narrow"
+                      if split == "input" else "F32 logits, rank1" if role == "head" else "local")))
+
+    for layer in range(layers):
+        p = f"model.language_model.layers.{layer}."
+        for leaf, n, k, split in (("q", heads*d, h, "output"), ("k", kv*d, h, "output"),
+                                  ("v", kv*d, h, "output"), ("o", h, heads*d, "input")):
+            add(f"layer{layer}.attn_{leaf}", p+f"self_attn.{leaf}_proj.weight", (n, k),
+                split=split, trellis=True, attention=True)
+        add(f"layer{layer}.attn_gate", p+"self_attn.gate_proj.weight", (heads*d, h), split="output")
+        add(f"layer{layer}.pre_expert", p+"mlp.pre_expert_proj.weight", (e, h), split="output", trellis=True)
+        add(f"layer{layer}.post_expert", p+"mlp.post_expert_proj.weight", (h, e), split="input", trellis=True)
+        add(f"layer{layer}.router", p+"mlp.gate.weight", (c["num_local_experts"], h), weight_dtype="F32")
+    add("head", "lm_head.weight", (vocab, h), trellis=True, count=(0, 1))
+    target = {name for name, tensor in tensors.items() if len(tensor["shape"]) == 2
+              and (name == "lm_head.weight" or re.match(r"model\.language_model\.layers\.\d+\.", name))
+              and ".experts." not in name}
+    covered = {m["name"] for op in operations for m in op["members"]}
+    if target != covered:
+        raise ValueError(f"Muse target matrices uncovered or unexpected: {sorted(target ^ covered)}")
+    return operations
+
+
+def muse_full_core_from_headers(path):
+    data = json.loads(Path(path).read_text())["muse"]
+    return muse_full_core_operations(data["config"], data["tensors"])
+
+
+def muse_full_core_projection_spec(operation, *, prefill=False, fp8=False, shipping=False):
+    """Keep F32 partials/logits; the existing W8A8 primitive writes only BF16."""
+    role = re.sub(r"^layer\d+\.", "", operation["role"])
+    native = role in ("router", "attn_gate")
+    if fp8 and (native or (shipping and not operation["shipping_fp8_attention"])):
+        raise ValueError("Muse role has no shipping-selectable FP8 conversion" if shipping else
+                         "Muse kept-native role has no hypothetical FP8 conversion")
+    f32 = operation["output"] == "f32"
+    w8a8 = fp8 and prefill and not shipping and not f32
+    return dict(role=role, k=operation["k"], n=operation["packed_n"],
+                output=operation["output"], capacity=64 if role == "head" else 4096,
+                factory="muse_router" if role == "router" else "fp8" if fp8 else "bf16",
+                weight_dtype=operation["weight_dtype"], fp8_prefill_w8a8=w8a8,
+                fp8_decode_rows=64, fp8_scale_layout="block128x128_f32" if fp8 else None,
+                shipping=shipping)
+
+
+def muse_full_core_projection_program(operation, *, prefill=False, fp8=False, shipping=False):
+    import cutlass
+    import torch
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+    from b12x.integration.cuteafd.muse import compile_router_aot
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+
+    spec = muse_full_core_projection_spec(operation, prefill=prefill, fp8=fp8, shipping=shipping)
+    n, k = spec["n"], spec["k"]
+    if spec["factory"] == "muse_router":
+        return compile_router_aot()
+    output = torch.float32 if spec["output"] == "f32" else torch.bfloat16
+    if not fp8:
+        return compile_bf16_projection_aot(width=k, outputs=n, output_dtype=output)
+    dtype = cutlass.Float32 if spec["output"] == "f32" else cutlass.BFloat16
+    n = (n+127)//128*128
+    launch = Fp8Projection(n, k, prefill_rows=4096 if prefill and not shipping else None,
+                          prefill_mask=255 if not spec["output"] == "f32" else 0,
+                          out_dtype=dtype, decode_rows=64)
+    return compile_program(launch, name="muse_fp8_member", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("weight", torch.uint8, f"[{n},{k}]"),
+        Operand("scales", torch.float32, f"[{(n+127)//128},{k//128}]", align=4),
+        Operand("out", output, f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"), Scalar("fp8_rows"), Scalar("qscratch", "int64")),
+        key=(tuple(sorted(spec.items())), prefill, launch.key()), geometry=spec)
+
+
 def glm_full_core_operations(config, tensors, *, onboard_layers):
     """GLM 5.3 TP2 context keeps head-split projections on both ranks."""
     c = config.get("text_config", config)
@@ -1419,7 +1521,10 @@ def encode_reference_fixtures(args):
     costs = torch.empty((256, 2, 65536 >> bits), device="cuda", dtype=torch.float16)
     edges = torch.empty((256, 256, 65536 >> bits), device="cuda", dtype=torch.int16)
     records = []
-    if getattr(args, "glm_core", None):
+    if getattr(args, "muse_core", None):
+        operations = muse_full_core_from_headers(args.muse_core)
+        shapes = glm_full_core_fixture_shapes(operations)
+    elif getattr(args, "glm_core", None):
         operations = glm_full_core_from_headers(args.glm_core, args.onboard_layers)
         shapes = glm_full_core_fixture_shapes(operations)
     elif getattr(args, "qwen_core", None):
@@ -1432,7 +1537,8 @@ def encode_reference_fixtures(args):
         shapes = [dict(k=7168, n=n, side=1) for n in [6144]*4 + [3072]*2]
     for index, shape in enumerate(shapes):
         k, n, side = shape["k"], shape["n"], shape["side"]
-        if args.full_core or getattr(args, "qwen_core", None) or getattr(args, "glm_core", None):
+        if (args.full_core or getattr(args, "qwen_core", None) or getattr(args, "glm_core", None)
+                or getattr(args, "muse_core", None)):
             record = encode_chunked_fixture(args, index, shape, costs, edges, oracle)
             records.append(record)
             (args.output_dir / f"fixtures_k{bits}.json").write_text(json.dumps(records, indent=2) + "\n")
@@ -1936,6 +2042,320 @@ def aggregate_glm_full_core(operations, records, rows_list):
     return dict(decode=decode, prefill=prefill,
         normalization="Kimi 73 verify steps / 255 emitted tokens; not measured GLM speculation",
         scope="per-rank local producers and mandatory trellis meets; no peer transport or residual norm; native BF16 partial addition is fused into excluded residual norm")
+
+
+def aggregate_muse_full_core(operations, records, rows_list):
+    """Include F32 meets for every format and expose the mixed FP8 ceiling."""
+    lookup = {(r["role"], r["rows"], r["phase"]): r["total_call_us"] for r in records}
+    arms = ("bf16", "k6", "k8", "fp8_selectable", "fp8_full")
+
+    def measured(op, arm):
+        if not op["hypothetical_trellis"]:
+            return "native"
+        if arm == "fp8_selectable":
+            return "fp8_attention" if op["shipping_fp8_attention"] else "k6"
+        return arm
+
+    def available(op, rows):
+        return all((op["role"], rows, phase) in lookup for phase in
+                   (("producer", "reduce0", "reduce1") if op["split"] == "input" else ("producer",)))
+
+    def cost(op, rows, arm, rank):
+        key = measured(op, arm)
+        value = lookup[(op["role"], rows, "producer")][key]*op["count"][rank]
+        if op["split"] == "input":
+            value += lookup[(op["role"], rows, f"reduce{rank}")][key]*op["reduction_count"][rank]
+        return value
+
+    def sums(work):
+        total = {arm: [sum(count*cost(op, row, arm, rank) for op, row, count in work)
+                       for rank in (0, 1)] for arm in arms}
+        f32 = [sum(count*cost(op, row, "fp8_full", rank) for op, row, count in work
+                   if op["hypothetical_trellis"] and op["output"] == "f32") for rank in (0, 1)]
+        producer = [sum(count*lookup[(op["role"], row, "producer")]["fp8_full"]*op["count"][rank]
+                       for op, row, count in work if op["hypothetical_trellis"] and op["output"] == "f32")
+                    for rank in (0, 1)]
+        return dict(local_dense_us=total, mixed_fp8_f32_roles=dict(complete_role_us=f32,
+            w8a16_producer_us=producer,
+            complete_role_share=[v/t if t else 0 for v, t in zip(f32, total["fp8_full"])],
+            w8a16_producer_share=[v/t if t else 0 for v, t in zip(producer, total["fp8_full"])],
+            zero_producer_cost_lower_bound_us=[t-v for t, v in zip(total["fp8_full"], producer)]))
+
+    decode, prefill = [], []
+    for rows in rows_list:
+        if rows > 64 or not all(available(op, rows) for op in operations):
+            continue
+        result = sums([(op, rows, 1) for op in operations])
+        result["kimi_rate_normalized_local_dense_us_per_emitted_token"] = {
+            arm: [v*73/255 for v in values] for arm, values in result["local_dense_us"].items()}
+        decode.append(dict(rows=rows, **result))
+    for tokens in (8192, 65536):
+        schedule = glm_full_core_prefill_schedule(tokens)
+        work = [(op, row, count) for op in operations for row, count in
+                ({1: schedule["head_calls"]} if op["role"] == "head" else schedule["body_row_histogram"]).items()]
+        if all(available(op, row) for op, row, count in work):
+            prefill.append(dict(tokens=tokens, **schedule, **sums(work)))
+    return dict(decode=decode, prefill=prefill,
+        normalization="Kimi 73 verify steps / 255 emitted tokens; not measured Muse speculation",
+        fp8_full="hypothetical: W8A8 on BF16-output roles, F32-output W8A16 on the split o/post-expert/head roles",
+        fp8_selectable="shipping attention-only canonical64/W8A16; pre/post-expert/head K6; gate BF16/router F32",
+        scope="per-rank dense producers, retained F32 copy and ordered meets/egress/narrow; no peer transport, norms, nonlinearities, experts, media or draft")
+
+
+def benchmark_muse_full_core(args):
+    """Muse full operations: retain F32 partials, and distinguish two FP8 arms."""
+    import hashlib
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd._glmf_fp8 import quant_scratch_bytes
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+
+    rows_list = sorted(set(map(int, args.rows.split(","))))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 50:
+        raise ValueError("Muse full-core requires rows 1..4096 and >=50 samples")
+    all_operations = muse_full_core_from_headers(args.muse_core)
+    operations = glm_full_core_unique_operations(all_operations)
+    contract = dict(operations=operations, export_sms=args.export_sms,
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    if args.compile_only:
+        import multiprocessing
+        from b12x._lib.compile_pool import _initialize_worker
+        _initialize_worker(0, (12, 0), "muse-core", "muse-core", args.export_sms,
+                           101376, 102400, multiprocessing.Array("i", [0, 0]))
+    else:
+        props = torch.cuda.get_device_properties(0)
+        status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+        if int(status):
+            raise RuntimeError(status)
+        limit = props.multi_processor_count*4
+        flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+        manifests = {bits: json.loads((args.fixture_dir/f"fixtures_k{bits}.json").read_text()) for bits in (6, 8)}
+        shapes = glm_full_core_fixture_shapes(all_operations)
+        for records in manifests.values():
+            if len(records) != len(shapes) or any(not r["oracle_exact"] or
+                    any(r[key] != s[key] for key in s) for r, s in zip(records, shapes)):
+                raise ValueError("Muse fixture geometry or independent oracle coverage differs")
+        native = C.CDLL(str(args.native_library.resolve()))
+        signatures = {
+            "cuteafd_load_narrow_f32_bf16": [C.c_void_p, C.c_void_p, C.c_int64, C.c_int32, C.c_void_p],
+            "cuteafd_cuda_residual_add_f32_async": [C.c_void_p]*3+[C.c_size_t, C.c_void_p],
+            "cuteafd_vocabulary_head_create_vocab": [C.c_void_p, C.c_uint64]+[C.c_int32]*4+[C.POINTER(C.c_void_p)],
+            "cuteafd_vocabulary_head_launch_tensor_invariant": [C.c_void_p]*4+[C.c_int32, C.c_void_p],
+            "cuteafd_v41_markov_destroy": [C.c_void_p],
+        }
+        for name, signature in signatures.items():
+            function = getattr(native, name)
+            function.argtypes, function.restype = signature, C.c_int32
+        runtime = C.CDLL("libcudart.so")
+        runtime.cudaMemcpy2DAsync.argtypes = [C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t,
+                                            C.c_size_t, C.c_size_t, C.c_int, C.c_void_p]
+        runtime.cudaMemcpy2DAsync.restype = C.c_int
+        report = dict(metadata=dict(contract=contract, device=props.name, sms=props.multi_processor_count,
+            l2_bytes=l2, samples=args.samples, fixture_manifests=manifests,
+            native_library_sha256=hashlib.sha256(args.native_library.read_bytes()).hexdigest(),
+            native_provenance=json.loads(args.native_library.with_name("COMPILER_PROVENANCE.json").read_text()),
+            cache="2x runtime L2 eviction outside each complete-operation interval",
+            numerics="independently reference-encoded random tensors; unit H128 scales; within-format replay only",
+            full_fp8="hypothetical: W8A8 on BF16-output roles, F32-output W8A16 on the split o/post-expert/head roles",
+            exclusions="No quality, loader support, fit or end-to-end claim; peer transport, norms, nonlinearities, experts, media and draft excluded"), records=[])
+        torch.manual_seed(811)
+        warm = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm, warm)
+        torch.cuda.synchronize()
+        del warm
+
+    def checked(status):
+        if status:
+            raise RuntimeError(f"Muse full-core launch failed: {status}")
+
+    def program(directory, name, builder):
+        if args.compile_only:
+            print("compile", directory.name, name, flush=True)
+            with exportable_compilation():
+                result = builder()
+            exported(result, directory, name, load_module=False)
+            (directory/f"{name}.json").write_text(json.dumps(dict(pointers=len(result.operands),
+                scalars=[s.ctype for s in result.scalars])))
+            return None
+        abi = json.loads((directory/f"{name}.json").read_text())
+        lib = C.CDLL(str((directory/f"{name}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        kinds = {"int32": C.c_int32, "int64": C.c_int64, "float32": C.c_float}
+        lib.run.argtypes = [C.c_void_p]*abi["pointers"]+[kinds[s] for s in abi["scalars"]]+[C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    def fixture(bits, role):
+        matches = [r for r in manifests[bits] if r["role"] == role and r["member"] == 0]
+        if len(matches) != 1:
+            raise ValueError(f"Muse fixture membership ambiguous: {role}")
+        record = matches[0]
+        path = args.fixture_dir/record["path"]
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8*1024*1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != record["sha256"]:
+            raise ValueError("Muse fixture checksum differs")
+        return torch.load(path, weights_only=True, map_location="cpu")
+
+    for op in operations:
+        role, k, n = op["role"], op["k"], op["packed_n"]
+        head, split, trellis = role == "head", op["split"] == "input", op["hypothetical_trellis"]
+        capacity = 64 if head else 4096
+        sn = op["members"][0]["stored_n"]
+        directory = args.output_dir/role
+        directory.mkdir(parents=True, exist_ok=True)
+        if args.compile_only:
+            (directory/"contract.json").write_text(json.dumps(contract, sort_keys=True))
+        elif json.loads((directory/"contract.json").read_text()) != contract:
+            raise ValueError("stale Muse full-core exports")
+        baseline = None if head else program(directory, "bf16", lambda: muse_full_core_projection_program(op))
+        fp8 = {arm: {prefill: program(directory, f"{arm}_{int(prefill)}",
+                    lambda prefill=prefill, arm=arm: muse_full_core_projection_program(op,
+                        prefill=prefill, fp8=True, shipping=arm == "fp8_attention")) for prefill in (False, True)}
+               for arm in (("fp8_full", "fp8_attention") if op["shipping_fp8_attention"] else ("fp8_full",))} if trellis else {}
+        ingress = egress = None
+        cores = {}
+        if trellis:
+            ingress = program(directory, "ingress", lambda: compile_trellis_input_aot(
+                features=k, max_rows=capacity, output_dtype="bf16"))
+            egress = program(directory, "egress", lambda: compile_trellis_output_aot(
+                features=sn, max_rows=capacity, output_dtype="f32" if head or split else "bf16"))
+            cores = {bits: program(directory, f"core_k{bits}", lambda bits=bits: compile_trellis_linear_aot(
+                input_features=k, output_features=sn, bits=bits, codebook="mcg", sharded_side=2 if split else 1,
+                max_rows=capacity, input_dtype="bf16")) for bits in (6, 8)}
+        if args.compile_only:
+            continue
+        fixtures = {bits: fixture(bits, role) for bits in (6, 8)} if trellis else {}
+        if fixtures and not torch.equal(fixtures[6]["weight"], fixtures[8]["weight"]):
+            raise ValueError("Muse K6/K8 source weights differ")
+        weight = (fixtures[6]["weight"].cuda() if trellis else
+                  torch.randn(n, k, device="cuda", dtype=torch.float32 if role == "router" else torch.bfloat16))
+        x = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+        arms = ("k6", "k8", "bf16", *fp8) if trellis else ("native",)
+        output_dtype = torch.float32 if head else torch.bfloat16
+        outs = {arm: torch.empty(capacity, n, device="cuda", dtype=output_dtype if trellis else
+                                torch.float32 if role == "router" else torch.bfloat16) for arm in arms}
+        retained = {arm: torch.empty(capacity, sn, device="cuda", dtype=torch.float32) for arm in arms} if split else {}
+        peer = torch.randn(capacity, sn, device="cuda", dtype=torch.float32) if split else None
+        reduced = torch.empty_like(peer) if split else None
+        raw = torch.empty(capacity, sn, device="cuda", dtype=torch.float32) if trellis else None
+        final = torch.empty(capacity, sn, device="cuda", dtype=torch.float32 if head or split else torch.bfloat16) if trellis else None
+        rotated = torch.empty_like(x) if trellis else None
+        suh = torch.ones(k, device="cuda", dtype=torch.float16) if trellis else None
+        scale = torch.ones(k//128, device="cuda", dtype=torch.float16) if trellis else None
+        svh = torch.ones(sn, device="cuda", dtype=torch.float16) if trellis else None
+        table = torch.tensor([rotated.data_ptr()], device="cuda", dtype=torch.int64) if trellis else None
+        payloads = {bits: fixtures[bits]["payload"].cuda() for bits in fixtures}
+        partial = torch.empty(capacity*((k+1023)//1024)*sn, device="cuda", dtype=torch.float32) if trellis else None
+        quantized = weight.to(torch.float8_e4m3fn) if fp8 else None
+        fp8_scale = torch.ones(sn//128, k//128, device="cuda", dtype=torch.float32) if fp8 else None
+        qscratch = torch.empty(quant_scratch_bytes(k, capacity), device="cuda", dtype=torch.uint8) if fp8 else None
+        handle, workspace = C.c_void_p(), None
+        if head:
+            workspace = torch.empty(4<<20, device="cuda", dtype=torch.uint8)
+            checked(native.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), k, capacity, n, 1, C.byref(handle)))
+            logical_weight = weight[:n].contiguous()
+
+        def call(lib, *values):
+            checked(lib.run(*values, torch.cuda.current_stream().cuda_stream))
+
+        def copy_rows(dst, src, rows, width):
+            element = dst.element_size()
+            checked(runtime.cudaMemcpy2DAsync(dst.data_ptr(), dst.shape[1]*element, src.data_ptr(),
+                src.shape[1]*element, width*element, rows, 3, torch.cuda.current_stream().cuda_stream))
+
+        def run(arm, rows, phase):
+            stream = torch.cuda.current_stream().cuda_stream
+            if phase.startswith("reduce"):
+                rank = int(phase[-1])
+                first, second = (retained[arm], peer) if rank == 0 else (peer, retained[arm])
+                checked(native.cuteafd_cuda_residual_add_f32_async(first.data_ptr(), second.data_ptr(), reduced.data_ptr(), rows*n, stream))
+                source = reduced
+                if arm in ("k6", "k8"):
+                    call(egress, reduced.data_ptr(), svh.data_ptr(), final.data_ptr(), rows, limit)
+                    source = final
+                checked(native.cuteafd_load_narrow_f32_bf16(source.data_ptr(), outs[arm].data_ptr(), rows*n, props.multi_processor_count, stream))
+            elif arm in ("native", "bf16"):
+                if head:
+                    checked(native.cuteafd_vocabulary_head_launch_tensor_invariant(handle, x.data_ptr(), logical_weight.data_ptr(), outs[arm].data_ptr(), rows, stream))
+                else:
+                    call(baseline, x.data_ptr(), weight.data_ptr(), (retained[arm] if split else outs[arm]).data_ptr(), rows)
+            elif arm in fp8:
+                target = retained[arm] if split else final if head else outs[arm]
+                call(fp8[arm][rows > 64], x.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(),
+                     target.data_ptr(), rows, 255 if rows > 64 else 64, qscratch.data_ptr())
+                if head:
+                    copy_rows(outs[arm], final, rows, n)
+            else:
+                call(ingress, x.data_ptr(), suh.data_ptr(), rotated.data_ptr(), scale.data_ptr(), rows, limit)
+                call(cores[int(arm[1:])], table.data_ptr(), payloads[int(arm[1:])].data_ptr(), scale.data_ptr(),
+                     partial.data_ptr(), raw.data_ptr(), rows, 0, limit)
+                if split:
+                    copy_rows(retained[arm], raw, rows, n)
+                else:
+                    call(egress, raw.data_ptr(), svh.data_ptr(), final.data_ptr(), rows, limit)
+                    copy_rows(outs[arm], final, rows, n) if head else None
+
+        live_rows = [r for r in sorted(set([1]+rows_list)) if r <= 64] if head else rows_list
+        for rows in live_rows:
+            for phase in (("producer", "reduce0", "reduce1") if split else ("producer",)):
+                graphs, events = {}, {}
+                for arm in arms:
+                    run(arm, rows, "producer")
+                    run(arm, rows, phase)
+                    target = retained[arm] if split and phase == "producer" else final if arm in ("k6", "k8") and not head and not split else outs[arm]
+                    target = target[:rows]
+                    expected = target.clone()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run(arm, rows, phase)
+                    target.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    if not torch.equal(target.view(torch.uint8), expected.view(torch.uint8)) or not torch.isfinite(target).all().item():
+                        raise RuntimeError(f"Muse {role}/{arm}/{rows}/{phase}: poisoned replay differs")
+                    pairs = [(torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True))
+                             for _ in range(16 if rows <= 64 else 4)]
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        for start, end in pairs:
+                            flush.zero_()
+                            start.record()
+                            run(arm, rows, phase)
+                            end.record()
+                    graphs[arm], events[arm] = graph, pairs
+                    graph.replay()
+                torch.cuda.synchronize()
+                before = thermal_snapshot()
+                samples = {arm: [] for arm in arms}
+                for repeat in range(args.samples):
+                    for arm in (arms if repeat%2 == 0 else tuple(reversed(arms))):
+                        graphs[arm].replay()
+                        events[arm][-1][1].synchronize()
+                        samples[arm].append(statistics.mean(a.elapsed_time(b)*1000 for a, b in events[arm]))
+                times = {arm: statistics.median(values) for arm, values in samples.items()}
+                logical = {arm: (n*k*(4 if role == "router" else 2) if arm in ("bf16", "native") else
+                                 sn*k*int(arm[1:])//8+2*(k+sn) if arm in ("k6", "k8") else sn*k+fp8_scale.numel()*4)
+                           if phase == "producer" else 2*rows*n*4 for arm in arms}
+                record = dict(role=role, rows=rows, phase=phase, total_call_us=times, samples_us=samples,
+                    logical_bytes=logical, logical_gbs={arm: logical[arm]/(times[arm]*1000) for arm in arms},
+                    replay_exact=True, poisoned_outputs_overwritten=True, thermal_before=before, thermal_after=thermal_snapshot())
+                report["records"].append(record)
+                report["aggregate"] = aggregate_muse_full_core(operations, report["records"], rows_list)
+                print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
+                (args.output_dir/"report.json").write_text(json.dumps(report, indent=2)+"\n")
+        if head:
+            checked(native.cuteafd_v41_markov_destroy(handle))
+            del logical_weight
+        del graphs, events, graph, expected, target, fixtures, weight, x, outs, retained, peer, reduced
+        del raw, final, rotated, suh, scale, svh, table, payloads, partial, quantized, fp8_scale, qscratch, workspace
+        torch.cuda.empty_cache()
 
 
 def benchmark_glm_full_core(args):
@@ -2773,6 +3193,7 @@ def main():
     parser.add_argument("--checkpoint-config", type=Path, help="actual checkpoint config.json for full-core multiplicities")
     parser.add_argument("--qwen-core", type=Path, help="original Qwen config/header inventory; hypothetical K6/K8 full-core arms")
     parser.add_argument("--glm-core", type=Path, help="original GLM 5.3 config/header inventory; independent K6/K8 full-core arms")
+    parser.add_argument("--muse-core", type=Path, help="original Muse config/header inventory; independent K6/K8 plus selectable and hypothetical full FP8")
     parser.add_argument("--onboard-layers", type=int, help="actual GLM admitted sparse prefix, required for router owner counts")
     parser.add_argument("--native-library", type=Path, help="shipping native DSO plus adjacent COMPILER_PROVENANCE.json")
     parser.add_argument("--fixture-dir", type=Path, help="independently reference-encoded K6/K8 fixture directory")
@@ -2786,6 +3207,14 @@ def main():
         hashes = reference_encoder(args.encoder_source, args.output_dir / "encoder")
         (args.output_dir / "encoder_sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
         return
+    if args.muse_core:
+        if args.qwen_core or args.glm_core or args.full_core or args.kimi_decision or args.baseline_native:
+            parser.error("--muse-core is separate from other family modes")
+        if not args.encode_fixtures:
+            if not args.compile_only and (args.fixture_dir is None or args.native_library is None):
+                parser.error("--muse-core measurement requires --fixture-dir and --native-library")
+            benchmark_muse_full_core(args)
+            return
     if args.glm_core:
         if args.qwen_core or args.full_core or args.kimi_decision or args.baseline_native or args.onboard_layers is None:
             parser.error("--glm-core is separate from other family modes and requires --onboard-layers")

@@ -782,6 +782,108 @@ def test_full_core_requires_config_before_cuda(monkeypatch,tmp_path):
     assert error.value.code == 2
 
 
+def _muse_core_headers():
+    config = dict(hidden_size=8192, num_hidden_layers=2, num_attention_heads=128,
+        num_key_value_heads=16, head_dim=64, moe_hidden_size=4096, vocab_size=202048,
+        num_local_experts=256, num_shared_experts=0,
+        layer_types=["sliding_attention", "full_attention"], mlp_layer_types=["sparse"]*2)
+    tensors = {"lm_head.weight": dict(dtype="BF16", shape=[202048, 8192])}
+    for layer in range(2):
+        p = f"model.language_model.layers.{layer}."
+        for leaf, shape in (("self_attn.q_proj", [8192, 8192]), ("self_attn.k_proj", [1024, 8192]),
+                ("self_attn.v_proj", [1024, 8192]), ("self_attn.o_proj", [8192, 8192]),
+                ("self_attn.gate_proj", [8192, 8192]), ("mlp.pre_expert_proj", [4096, 8192]),
+                ("mlp.post_expert_proj", [8192, 4096]), ("mlp.gate", [256, 8192])):
+            tensors[p+leaf+".weight"] = dict(dtype="F32" if leaf == "mlp.gate" else "BF16", shape=shape)
+    return config, tensors
+
+
+def test_muse_catalog_covers_all_original_target_matrices_and_exact_boundaries():
+    bench = _native_threshold_bench()
+    config, tensors = _muse_core_headers()
+    operations = bench.muse_full_core_operations(config, tensors)
+    assert len(operations) == 17
+    unique = {op["role"]: op for op in bench.glm_full_core_unique_operations(operations)}
+    assert len(unique) == 9
+    assert unique["head"]["count"] == [0, 1]
+    assert unique["head"]["members"][0]["stored_n"] == 202112
+    assert unique["attn_k"]["packed_n"] == 512
+    assert unique["pre_expert"]["packed_n"] == 2048
+    assert unique["post_expert"]["k"] == 2048
+    assert unique["post_expert"]["reduction_count"] == [2, 2]
+    assert "F32 retained producer copy" in unique["attn_o"]["boundary"]
+    assert all(not unique[role]["hypothetical_trellis"] for role in ("router", "attn_gate"))
+    assert unique["router"]["weight_dtype"] == "F32" and unique["router"]["count"] == [2, 2]
+    assert len(bench.glm_full_core_fixture_shapes(operations)) == 7
+    for name in ("model.language_model.layers.0.self_attn.k_proj.weight", "lm_head.weight"):
+        bad = {k: dict(v) for k, v in tensors.items()}
+        bad[name]["shape"] = [128, 128]
+        with pytest.raises(ValueError, match="original matrix differs"):
+            bench.muse_full_core_operations(config, bad)
+    tensors["model.language_model.layers.0.mlp.extra.weight"] = dict(dtype="BF16", shape=[128, 128])
+    with pytest.raises(ValueError, match="uncovered"):
+        bench.muse_full_core_operations(config, tensors)
+
+
+def test_muse_fp8_specs_keep_selectable_attention_separate_from_mixed_full_core():
+    bench = _native_threshold_bench()
+    config, tensors = _muse_core_headers()
+    operations = bench.glm_full_core_unique_operations(bench.muse_full_core_operations(config, tensors))
+    for op in operations:
+        if op["role"] in ("router", "attn_gate"):
+            with pytest.raises(ValueError, match="kept-native"):
+                bench.muse_full_core_projection_spec(op, fp8=True)
+            continue
+        spec = bench.muse_full_core_projection_spec(op, fp8=True, prefill=True)
+        assert spec["fp8_prefill_w8a8"] == (op["output"] == "bf16")
+        assert spec["fp8_scale_layout"] == "block128x128_f32"
+        if op["shipping_fp8_attention"]:
+            ship = bench.muse_full_core_projection_spec(op, fp8=True, prefill=True, shipping=True)
+            assert not ship["fp8_prefill_w8a8"] and ship["fp8_decode_rows"] == 64
+        else:
+            with pytest.raises(ValueError, match="shipping-selectable"):
+                bench.muse_full_core_projection_spec(op, fp8=True, shipping=True)
+
+
+def test_muse_aggregate_includes_all_format_meets_and_f32_fp8_ceiling():
+    bench = _native_threshold_bench()
+    ops = [dict(role="attn_o", split="input", hypothetical_trellis=True, shipping_fp8_attention=True,
+                output="f32", count=[2, 2], reduction_count=[2, 2]),
+           dict(role="head", split="whole", hypothetical_trellis=True, shipping_fp8_attention=False,
+                output="f32", count=[0, 1], reduction_count=[0, 0]),
+           dict(role="router", split="whole", hypothetical_trellis=False, shipping_fp8_attention=False,
+                output="f32", count=[2, 2], reduction_count=[0, 0])]
+    records = []
+    for row in (1, 2, 2240, 2688, 2752):
+        records.extend([
+            dict(role="attn_o", rows=row, phase="producer", total_call_us=dict(bf16=1, k6=2, k8=3, fp8_attention=4, fp8_full=5)),
+            dict(role="attn_o", rows=row, phase="reduce0", total_call_us=dict(bf16=6, k6=7, k8=8, fp8_attention=9, fp8_full=10)),
+            dict(role="attn_o", rows=row, phase="reduce1", total_call_us=dict(bf16=6, k6=7, k8=8, fp8_attention=9, fp8_full=10)),
+            dict(role="head", rows=row, phase="producer", total_call_us=dict(bf16=11, k6=12, k8=13, fp8_full=14)),
+            dict(role="router", rows=row, phase="producer", total_call_us=dict(native=1))])
+    result = bench.aggregate_muse_full_core(ops, records, [2, 64])
+    decode = result["decode"][0]
+    assert decode["local_dense_us"] == dict(bf16=[16, 27], k6=[20, 32], k8=[24, 37],
+                                          fp8_selectable=[28, 40], fp8_full=[32, 46])
+    f32 = decode["mixed_fp8_f32_roles"]
+    assert f32["complete_role_us"] == [30, 44]
+    assert f32["w8a16_producer_us"] == [10, 24]
+    assert f32["zero_producer_cost_lower_bound_us"] == [22, 22]
+    assert f32["complete_role_share"] == [30/32, 44/46]
+    assert decode["kimi_rate_normalized_local_dense_us_per_emitted_token"]["fp8_full"] == [32*73/255, 46*73/255]
+    assert result["prefill"][0]["local_dense_us"]["fp8_selectable"] == [84, 96]
+    assert "F32-output W8A16" in result["fp8_full"]
+
+
+@pytest.mark.parametrize("extra", [[], ["--glm-core", "headers.json"], ["--qwen-core", "headers.json"]])
+def test_muse_measurement_refuses_incomplete_cli_before_cuda(monkeypatch, tmp_path, extra):
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path),
+                                     "--muse-core", "headers.json", *extra])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
+
+
 def _native_route_policy():
     source = _PATH.parents[1] / "b12x/gemm/trellis_linear/_native.py"
     nodes = []
