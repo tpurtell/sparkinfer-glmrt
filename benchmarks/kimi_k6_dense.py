@@ -23,7 +23,9 @@ def exported(program, directory, stem, *, load_module=True):
     program.export_to_c(str(directory), stem, stem)
     validate_exported_header(program, directory / f"{stem}.h", stem)
     pointers = [f"void *p{i}" for i in range(len(program.operands))]
-    scalars = [f"int32_t s{i}" for i in range(len(program.scalars))]
+    scalar_c = {"int32": "int32_t", "int64": "int64_t", "float32": "float"}
+    scalar_ctypes = {"int32": C.c_int32, "int64": C.c_int64, "float32": C.c_float}
+    scalars = [f"{scalar_c[s.ctype]} s{i}" for i, s in enumerate(program.scalars)]
     arguments = [f"p{i}" for i in range(len(pointers))] + [f"s{i}" for i in range(len(scalars))]
     source = directory / f"{stem}_bridge.cc"
     source.write_text(f'#include "{stem}.h"\n'
@@ -42,7 +44,8 @@ def exported(program, directory, stem, *, load_module=True):
         return None
     lib = C.CDLL(str(library))
     lib.load.argtypes, lib.load.restype = [], None
-    lib.run.argtypes = [C.c_void_p] * len(pointers) + [C.c_int32] * len(scalars) + [C.c_void_p]
+    lib.run.argtypes = ([C.c_void_p] * len(pointers)
+                        + [scalar_ctypes[s.ctype] for s in program.scalars] + [C.c_void_p])
     lib.run.restype = C.c_int32
     lib.load()
     return lib
@@ -970,6 +973,89 @@ def qwen_full_core_operations(config, tensors, owners):
     if operations[-1]["k"] != h:
         raise ValueError("Qwen head input width disagrees with config")
     return operations
+
+
+def qwen_full_core_projection_spec(operation, *, prefill=False):
+    """Describe the shipping projection route without importing CUDA libraries."""
+    role = operation["role"].split(".", 1)[-1] if operation["role"].startswith("layer") else operation["role"]
+    k, n = operation["k"], operation["packed_n"]
+    router = role == "router"
+    if role == "head":
+        bf16 = "native_head"
+    elif router and prefill:
+        bf16 = "router_prefill"
+    elif role in ("gdn_in", "gdn_out", "attn_in", "attn_out"):
+        bf16 = "glm_projection"
+    else:
+        bf16 = "qwen_projection"
+    layout = operation["fp8_scale_layout"]
+    fp8 = ("head_fp8" if layout == "row_k128_f32" else
+           "prefill_w8a16" if layout and prefill and n % 128 else
+           "fp8_projection" if layout else None)
+    return dict(k=k, n=n, bf16_factory=bf16, fp8_factory=fp8,
+                output="f32" if router or role == "head" else "bf16",
+                fp8_scale_layout=layout, prefill=prefill,
+                head_capacity=64 if role == "head" else None,
+                fp8_prefill_w8a8=False)
+
+
+def qwen_full_core_projection_program(operation, *, prefill=False, fp8=False):
+    """Wrap the family's own projection object, not a substitute GEMM."""
+    import cutlass
+    import torch
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+    from b12x.integration.cuteafd._glm_kernels import glm_projection
+    from b12x.integration.cuteafd.qwen4 import _projection
+    from b12x.integration.cuteafd.qwen4_gdn import _PrefillW8A16
+    from b12x.integration.cuteafd.glmf import _HeadFp8
+    from b12x.moe._shared.v41_router import _V41RouterScores
+
+    spec = qwen_full_core_projection_spec(operation, prefill=prefill)
+    k, n = spec["k"], spec["n"]
+    factory = spec["fp8_factory"] if fp8 else spec["bf16_factory"]
+    if factory is None or factory == "native_head":
+        raise ValueError("projection requires the native head or has no FP8 representation")
+    dtype = cutlass.Float32 if spec["output"] == "f32" else cutlass.BFloat16
+    out_dtype = torch.float32 if spec["output"] == "f32" else torch.bfloat16
+    operands = [Operand("x", torch.bfloat16, f"[rows,{k}]")]
+    scalars = [Scalar("rows")]
+    if fp8:
+        launch = (_HeadFp8(n, k, max_rows=64) if factory == "head_fp8" else
+                  _PrefillW8A16(n, k) if factory == "prefill_w8a16" else
+                  Fp8Projection(n, k, prefill_rows=4096 if prefill else None))
+        scales = f"[{n},{k//128}]" if spec["fp8_scale_layout"] == "row_k128_f32" else f"[{(n+127)//128},{k//128}]"
+        operands.extend((Operand("w", torch.float8_e4m3fn, f"[{n},{k}]"),
+                         Operand("scale", torch.float32, scales, align=4),
+                         Operand("out", out_dtype, f"[rows,{n}]", "out")))
+        if factory != "head_fp8":
+            # Fp8Projection orders its scalar scratch address after the row selector.
+            scalars.extend((Scalar("fp8_rows"), Scalar("qscratch", "int64")))
+    else:
+        launch = (_V41RouterScores(n, hidden=k) if factory == "router_prefill" else
+                  glm_projection(n, k) if factory == "glm_projection" else
+                  _projection(n, k, out_dtype=dtype))
+        operands.extend((Operand("w", torch.bfloat16, f"[{n},{k}]"),
+                         Operand("out", out_dtype, f"[rows,{n}]", "out")))
+    return compile_program(launch, name="qwen_dense_member", operands=tuple(operands),
+                           scalars=tuple(scalars),
+                           key=(factory, launch.key() if hasattr(launch, "key") else (n, k)),
+                           geometry=spec)
+
+
+def qwen_full_core_unique_operations(operations):
+    """Collapse equal layer roles while retaining actual per-owner call counts."""
+    unique = {}
+    for operation in operations:
+        op = dict(operation)
+        op["role"] = re.sub(r"^layer\d+\.", "", op["role"])
+        key = (op["role"], op["k"], op["packed_n"], op["fp8_scale_layout"],
+               tuple((m["k"], m["n"]) for m in op["members"]))
+        if key in unique:
+            unique[key]["count"] = [a+b for a,b in zip(unique[key]["count"], op["count"])]
+        else:
+            unique[key] = dict(op, count=list(op["count"]))
+    return list(unique.values())
 
 
 def qwen_full_core_fixture_shapes(operations):

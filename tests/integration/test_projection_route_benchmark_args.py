@@ -421,6 +421,79 @@ def test_qwen_full_core_keeps_whole_owner_counts_and_independent_members():
         bench.qwen_full_core_operations(config, tensors, [0])
 
 
+def test_qwen_projection_specs_keep_actual_prefill_and_output_contracts():
+    bench = _native_threshold_bench()
+    def op(role, n, k=2560, scale=None):
+        return dict(role=role, k=k, packed_n=n, fp8_scale_layout=scale)
+    gdn = op("layer0.gdn_in", 16480, scale="block128x128_f32")
+    decode = bench.qwen_full_core_projection_spec(gdn)
+    prefill = bench.qwen_full_core_projection_spec(gdn, prefill=True)
+    assert decode["bf16_factory"] == "glm_projection"
+    assert decode["fp8_factory"] == "fp8_projection"
+    assert prefill["fp8_factory"] == "prefill_w8a16"
+    assert prefill["fp8_prefill_w8a8"] is False
+    attn = op("layer3.attn_in", 13952, scale="block128x128_f32")
+    assert bench.qwen_full_core_projection_spec(attn, prefill=True)["fp8_factory"] == "fp8_projection"
+    hc = op("layer0.attn.hc_up", 10240, k=320)
+    assert bench.qwen_full_core_projection_spec(hc)["bf16_factory"] == "qwen_projection"
+    assert bench.qwen_full_core_projection_spec(hc)["fp8_factory"] is None
+    router = op("layer0.router", 512)
+    assert bench.qwen_full_core_projection_spec(router)["output"] == "f32"
+    assert bench.qwen_full_core_projection_spec(router, prefill=True)["bf16_factory"] == "router_prefill"
+    head = op("head", 248320, scale="row_k128_f32")
+    assert bench.qwen_full_core_projection_spec(head)["head_capacity"] == 64
+    assert bench.qwen_full_core_projection_spec(head)["bf16_factory"] == "native_head"
+
+
+def test_qwen_unique_operations_sum_only_identical_role_geometries():
+    bench = _native_threshold_bench()
+    base = dict(k=2560, packed_n=6144, fp8_scale_layout="block128x128_f32",
+                members=[dict(name="first", k=2560, n=6144)])
+    ops = [dict(base, role="layer0.gdn_out", count=[1, 0]),
+           dict(base, role="layer1.gdn_out", count=[0, 1]),
+           dict(base, role="layer2.attn_out", count=[0, 1])]
+    merged = bench.qwen_full_core_unique_operations(ops)
+    assert len(merged) == 2
+    assert merged[0]["role"] == "gdn_out" and merged[0]["count"] == [1, 1]
+    assert ops[0]["count"] == [1, 0]
+
+
+def test_qwen_projection_program_uses_native_factories_and_i64_scratch(monkeypatch):
+    bench = _native_threshold_bench()
+    calls = []
+    class Launch:
+        def __init__(self, kind, *args, **kwargs):
+            calls.append((kind, args, kwargs))
+        def key(self):
+            return ("projection",)
+    def factory(kind):
+        return lambda *args, **kwargs: Launch(kind, *args, **kwargs)
+    for module, names in {
+        "b12x.integration.cuteafd._fp8_weights": {"Fp8Projection": factory("fp8")},
+        "b12x.integration.cuteafd._glm_kernels": {"glm_projection": factory("glm")},
+        "b12x.integration.cuteafd.qwen4": {"_projection": factory("qwen")},
+        "b12x.integration.cuteafd.qwen4_gdn": {"_PrefillW8A16": factory("w8a16")},
+        "b12x.integration.cuteafd.glmf": {"_HeadFp8": factory("head")},
+        "b12x.moe._shared.v41_router": {"_V41RouterScores": factory("router")},
+    }.items():
+        monkeypatch.setitem(sys.modules, module, SimpleNamespace(**names))
+    monkeypatch.setitem(sys.modules, "cutlass", SimpleNamespace(BFloat16="bf16", Float32="f32"))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32", float8_e4m3fn="fp8"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._common", SimpleNamespace(
+        Operand=lambda *a, **kw: (a, kw), Scalar=lambda *a: a,
+        compile_program=lambda launch, **kwargs: kwargs))
+    op = dict(role="gdn_in", k=2560, packed_n=16480, fp8_scale_layout="block128x128_f32")
+    result = bench.qwen_full_core_projection_program(op, prefill=True, fp8=True)
+    assert calls[-1] == ("w8a16", (16480, 2560), {})
+    assert result["scalars"] == (("rows",), ("fp8_rows",), ("qscratch", "int64"))
+    assert result["operands"][2][0][2] == "[129,20]"
+    bench.qwen_full_core_projection_program(op)
+    assert calls[-1] == ("glm", (16480, 2560), {})
+    router = dict(op, role="router", packed_n=512, fp8_scale_layout=None)
+    bench.qwen_full_core_projection_program(router, prefill=True)
+    assert calls[-1] == ("router", (512,), {"hidden": 2560})
+
+
 def test_full_core_requires_config_before_cuda(monkeypatch,tmp_path):
     monkeypatch.setattr(sys,"argv",["benchmark","--output-dir",str(tmp_path),"--full-core","--kimi-decision"])
     with pytest.raises(SystemExit) as error:
