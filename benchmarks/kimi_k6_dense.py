@@ -922,7 +922,11 @@ def qwen_full_core_operations(config, tensors, owners):
             if tensor["dtype"] != "BF16" or len(tensor["shape"]) != 2:
                 raise ValueError(f"Qwen original matrix is not BF16: {name}")
             n, k = tensor["shape"]
-            matrices.append(dict(name=name, k=k, n=n))
+            retained = (name.endswith(("in_proj_b.weight", "in_proj_a.weight",
+                                       "shared_expert_gate.weight")) or
+                        ".indexer.index_qk_proj.weight" in name)
+            matrices.append(dict(name=name, k=k, n=n,
+                                 hypothetical_trellis=hypothetical and not retained))
         if len({m["k"] for m in matrices}) != 1:
             raise ValueError(f"Qwen packed input widths disagree: {role}")
         operations.append(dict(role=role, members=matrices, count=count,
@@ -1065,7 +1069,7 @@ def qwen_full_core_fixture_shapes(operations):
         if not operation["hypothetical_trellis"]:
             continue
         for member in operation["members"]:
-            if member["n"] < 128:
+            if not member["hypothetical_trellis"]:
                 continue
             k, n = member["k"], member["n"]
             if k % 128:
@@ -1184,6 +1188,32 @@ def encode_chunked_fixture(args, index, shape, costs, edges, oracle):
                 oracle_tiles=oracle_tiles, oracle_exact=True, encoding_chunk_k=128)
 
 
+def qwen_full_core_from_headers(path):
+    """Use original header records and the serving planner's whole-layer cut."""
+    data = json.loads(path.read_text())
+    checkpoint = data.get("qwen", data)
+    config = checkpoint["config"]
+    layers = config.get("text_config", config)["num_hidden_layers"]
+    owners = [int(layer >= layers//2) for layer in range(layers)]
+    tensors = dict(checkpoint["tensors"])
+    # Older inventories omitted the final mixer; read only its original shard headers.
+    missing = [f"model.language_model.hyper_connection_mixer.input_mix_weight_{leaf}.weight"
+               for leaf in ("down", "up") if
+               f"model.language_model.hyper_connection_mixer.input_mix_weight_{leaf}.weight" not in tensors]
+    if missing:
+        import struct
+        snapshot = Path(checkpoint["snapshot"])
+        index = json.loads((snapshot/"model.safetensors.index.json").read_text())["weight_map"]
+        for shard in {index[name] for name in missing}:
+            with (snapshot/shard).open("rb") as stream:
+                size = struct.unpack("<Q", stream.read(8))[0]
+                header = json.loads(stream.read(size))
+            for name in missing:
+                if name in header:
+                    tensors[name] = header[name]
+    return qwen_full_core_operations(config, tensors, owners)
+
+
 def encode_reference_fixtures(args):
     """Encode each projection independently with unchanged official CUDA operators."""
     import hashlib
@@ -1201,14 +1231,17 @@ def encode_reference_fixtures(args):
     costs = torch.empty((256, 2, 65536 >> bits), device="cuda", dtype=torch.float16)
     edges = torch.empty((256, 256, 65536 >> bits), device="cuda", dtype=torch.int16)
     records = []
-    if args.full_core:
+    if getattr(args, "qwen_core", None):
+        operations = qwen_full_core_from_headers(args.qwen_core)
+        shapes = qwen_full_core_fixture_shapes(operations)
+    elif args.full_core:
         operations = kimi_full_core_operations(json.loads(args.checkpoint_config.read_text()))
         shapes = full_core_fixture_shapes(operations)
     else:
         shapes = [dict(k=7168, n=n, side=1) for n in [6144]*4 + [3072]*2]
     for index, shape in enumerate(shapes):
         k, n, side = shape["k"], shape["n"], shape["side"]
-        if args.full_core:
+        if args.full_core or getattr(args, "qwen_core", None):
             record = encode_chunked_fixture(args, index, shape, costs, edges, oracle)
             records.append(record)
             (args.output_dir / f"fixtures_k{bits}.json").write_text(json.dumps(records, indent=2) + "\n")
@@ -1335,6 +1368,274 @@ def aggregate_kimi_full_core(operations, records, accounting, rows_list):
                             head_calls=heads, local_dense_us=sums))
     return dict(decode=decode,prefill=prefill,
         scope="per-GPU local launch sums, not summed-across-GPU latency; communication and nondense work excluded")
+
+
+def benchmark_qwen_full_core(args):
+    """Actual native packed operands versus independent hypothetical core members."""
+    import hashlib
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+
+    rows_list = sorted(set(map(int, args.rows.split(","))))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 50:
+        raise ValueError("Qwen full-core requires rows 1..4096 and >=50 samples")
+    all_operations = qwen_full_core_from_headers(args.qwen_core)
+    operations = qwen_full_core_unique_operations(all_operations)
+    contract = dict(operations=operations, export_sms=args.export_sms,
+                    source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    if args.compile_only:
+        import multiprocessing
+        from b12x._lib.compile_pool import _initialize_worker
+        _initialize_worker(0, (12, 0), "qwen-core", "qwen-core", args.export_sms,
+                           101376, 102400, multiprocessing.Array("i", [0, 0]))
+    else:
+        props = torch.cuda.get_device_properties(0)
+        status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+        if int(status):
+            raise RuntimeError(status)
+        limit = props.multi_processor_count*4
+        flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+        manifests = {bits: json.loads((args.fixture_dir/f"fixtures_k{bits}.json").read_text()) for bits in (6, 8)}
+        shapes = qwen_full_core_fixture_shapes(all_operations)
+        for records in manifests.values():
+            if len(records) != len(shapes) or any(not r["oracle_exact"] or
+                    any(r[key] != s[key] for key in s) for r, s in zip(records, shapes)):
+                raise ValueError("Qwen fixture geometry or independent oracle coverage differs")
+        native = C.CDLL(str(args.native_library.resolve()))
+        native.cuteafd_vocabulary_head_create_vocab.argtypes = [C.c_void_p, C.c_uint64]+[C.c_int32]*4+[C.POINTER(C.c_void_p)]
+        native.cuteafd_vocabulary_head_launch_tensor_invariant.argtypes = [C.c_void_p]*4+[C.c_int32, C.c_void_p]
+        native.cuteafd_v41_markov_destroy.argtypes = [C.c_void_p]
+        for name in ("cuteafd_vocabulary_head_create_vocab", "cuteafd_vocabulary_head_launch_tensor_invariant", "cuteafd_v41_markov_destroy"):
+            getattr(native, name).restype = C.c_int32
+        report = dict(metadata=dict(contract=contract, device=props.name, sms=props.multi_processor_count,
+            l2_bytes=l2, samples=args.samples, fixture_manifests=manifests,
+            native_library_sha256=hashlib.sha256(args.native_library.read_bytes()).hexdigest(),
+            native_provenance=json.loads(args.native_library.with_name("COMPILER_PROVENANCE.json").read_text()),
+            cache="2x runtime L2 eviction outside each complete-operation interval",
+            arms="BF16 native; FP8 selectable attention/GDN and head, BF16 elsewhere; K6/K8 hypothetical independent members",
+            boundary="hypothetical member H128 ingress/core/egress plus explicit packed output copies and native tiny gates; all timed",
+            numerics="genuine reference-encoded random tiles, unit H128 scales; within-format replay only, no quality claim",
+            fp8_prefill_w8a8=False,
+            scope="local target dense work only; excludes transport, recurrence, norms, nonlinearities and MTP"), records=[])
+        torch.manual_seed(811)
+        warm = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm, warm)
+        torch.cuda.synchronize()
+        del warm
+
+    def program(directory, name, builder):
+        if args.compile_only:
+            print("compile", directory.name, name, flush=True)
+            with exportable_compilation():
+                result = builder()
+            exported(result, directory, name, load_module=False)
+            (directory/f"{name}.json").write_text(json.dumps(dict(pointers=len(result.operands),
+                scalars=[s.ctype for s in result.scalars])))
+            return None
+        abi = json.loads((directory/f"{name}.json").read_text())
+        lib = C.CDLL(str((directory/f"{name}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        kinds = {"int32": C.c_int32, "int64": C.c_int64, "float32": C.c_float}
+        lib.run.argtypes = [C.c_void_p]*abi["pointers"]+[kinds[s] for s in abi["scalars"]]+[C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    def checked(status):
+        if status:
+            raise RuntimeError(f"Qwen full-core launch failed: {status}")
+
+    def load_fixture(bits, member):
+        matches = [r for r in manifests[bits] if r["role"] == re.sub(r"^\d+\.", "", member["name"].split(".layers.", 1)[-1])
+                   and r["k"] == member["k"] and r["logical_n"] == member["n"]]
+        if len(matches) != 1:
+            raise ValueError(f"Qwen fixture membership ambiguous: {member}")
+        record = matches[0]
+        path = args.fixture_dir/record["path"]
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8*1024*1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != record["sha256"]:
+            raise ValueError("Qwen fixture checksum differs")
+        return torch.load(path, weights_only=True, map_location="cpu")
+
+    for op in operations:
+        role, k, n = op["role"], op["k"], op["packed_n"]
+        head = role == "head"
+        capacity = 64 if head else 4096
+        directory = args.output_dir/role
+        directory.mkdir(parents=True, exist_ok=True)
+        if args.compile_only:
+            (directory/"contract.json").write_text(json.dumps(contract, sort_keys=True))
+        elif json.loads((directory/"contract.json").read_text()) != contract:
+            raise ValueError("stale Qwen full-core exports")
+        baseline = {} if head else {prefill: program(directory, f"bf16_{int(prefill)}",
+            lambda prefill=prefill: qwen_full_core_projection_program(op, prefill=prefill)) for prefill in (False, True)}
+        fp8 = ({prefill: program(directory, f"fp8_{int(prefill)}",
+            lambda prefill=prefill: qwen_full_core_projection_program(op, prefill=prefill, fp8=True))
+            for prefill in ((False,) if head else (False, True))} if op["fp8_scale_layout"] else {})
+        members = [m for m in op["members"] if m["hypothetical_trellis"]]
+        sizes = [((m["n"]+127)//128)*128 for m in members]
+        ingress, egress, cores = [], [], {6: [], 8: []}
+        for i, sn in enumerate(sizes):
+            ingress.append(program(directory, f"ingress{i}", lambda: compile_trellis_input_aot(
+                features=k, max_rows=capacity, output_dtype="bf16")))
+            egress.append(program(directory, f"egress{i}", lambda sn=sn: compile_trellis_output_aot(
+                features=sn, max_rows=capacity, output_dtype="f32" if head else "bf16")))
+            for bits in (6, 8):
+                cores[bits].append(program(directory, f"core{i}_k{bits}", lambda bits=bits, sn=sn:
+                    compile_trellis_linear_aot(input_features=k, output_features=sn, bits=bits,
+                        codebook="mcg", sharded_side=1, max_rows=capacity, input_dtype="bf16")))
+        tiny_members = [m for m in op["members"] if op["hypothetical_trellis"] and not m["hypothetical_trellis"]]
+        tiny_n = sum(m["n"] for m in tiny_members)+op["native_padding_rows"]
+        tiny_op = dict(op, role="retained_gates", packed_n=tiny_n, fp8_scale_layout=None)
+        tiny = program(directory, "retained", lambda: qwen_full_core_projection_program(tiny_op)) if tiny_n else None
+        if args.compile_only:
+            continue
+        fixtures = {bits: [load_fixture(bits, m) for m in members] for bits in (6, 8)}
+        if any(not torch.equal(a["weight"], b["weight"]) for a, b in zip(fixtures[6], fixtures[8])):
+            raise ValueError("Qwen K6/K8 reference source weights differ")
+        weight = (torch.cat([f["weight"][:m["n"]] for f,m in zip(fixtures[6], members)] +
+                   ([torch.randn(tiny_n, k, dtype=torch.bfloat16)] if tiny_n else [])).cuda()
+                  if members else torch.randn(n, k, device="cuda", dtype=torch.bfloat16))
+        out_dtype = torch.float32 if head or role == "router" else torch.bfloat16
+        x = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+        outs = {arm: torch.empty(capacity, n, device="cuda", dtype=out_dtype) for arm in ("bf16", "fp8", "k6", "k8")}
+        raw = [torch.empty(capacity, sn, device="cuda", dtype=torch.float32) for sn in sizes]
+        final = [torch.empty(capacity, sn, device="cuda", dtype=out_dtype) for sn in sizes]
+        rotated = [torch.empty(capacity, k, device="cuda", dtype=torch.bfloat16) for _ in sizes]
+        suh = [torch.ones(k, device="cuda", dtype=torch.float16) for _ in sizes]
+        scale = [torch.ones(k//128, device="cuda", dtype=torch.float16) for _ in sizes]
+        svh = [torch.ones(sn, device="cuda", dtype=torch.float16) for sn in sizes]
+        tables = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in rotated]
+        payloads = {bits: [f["payload"].cuda() for f in fixtures[bits]] for bits in (6, 8)}
+        partial = torch.empty(129*((k+1023)//1024)*max(sizes, default=128), device="cuda", dtype=torch.float32)
+        tiny_weight = weight[-tiny_n:].contiguous() if tiny_n else None
+        tiny_out = torch.empty(capacity, tiny_n, device="cuda", dtype=torch.bfloat16) if tiny_n else None
+        quantized, fp8_scale = None, None
+        if fp8:
+            # Unit scales are a valid native FP8 representation; no quality comparison.
+            quantized = weight.to(torch.float8_e4m3fn)
+            fp8_scale = torch.ones((n if head else (n+127)//128, k//128), device="cuda", dtype=torch.float32)
+        handle, workspace = C.c_void_p(), None
+        if head:
+            workspace = torch.empty(4<<20, device="cuda", dtype=torch.uint8)
+            checked(native.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), k, capacity, n, 1, C.byref(handle)))
+        def call(lib, *values):
+            checked(lib.run(*values, torch.cuda.current_stream().cuda_stream))
+        def run(arm, rows):
+            prefill = rows > 64
+            if arm in ("native", "bf16") or (arm == "fp8" and not fp8):
+                out = outs["bf16"]
+                if head:
+                    checked(native.cuteafd_vocabulary_head_launch_tensor_invariant(handle, x.data_ptr(), weight.data_ptr(), out.data_ptr(), rows, torch.cuda.current_stream().cuda_stream))
+                else:
+                    call(baseline[prefill], x.data_ptr(), weight.data_ptr(), out.data_ptr(), rows)
+            elif arm == "fp8":
+                values = [x.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(), outs[arm].data_ptr(), rows]
+                call(fp8[prefill], *values, *([] if head else [64 if not prefill else 0, 0]))
+            else:
+                bits = int(arm[1:])
+                offset = 0
+                for i, (member, sn) in enumerate(zip(members, sizes)):
+                    call(ingress[i], x.data_ptr(), suh[i].data_ptr(), rotated[i].data_ptr(), scale[i].data_ptr(), rows, limit)
+                    call(cores[bits][i], tables[i].data_ptr(), payloads[bits][i].data_ptr(), scale[i].data_ptr(), partial.data_ptr(), raw[i].data_ptr(), rows, 0, limit)
+                    call(egress[i], raw[i].data_ptr(), svh[i].data_ptr(), final[i].data_ptr(), rows, limit)
+                    outs[arm][:rows, offset:offset+member["n"]].copy_(final[i][:rows, :member["n"]])
+                    offset += member["n"]
+                if tiny_n:
+                    call(tiny, x.data_ptr(), tiny_weight.data_ptr(), tiny_out.data_ptr(), rows)
+                    outs[arm][:rows, offset:].copy_(tiny_out[:rows])
+        arms = ("k6", "k8", "bf16", "fp8") if members else ("native",)
+        live_rows = sorted(set([1]+[r for r in rows_list if r <= 64])) if head else rows_list
+        for rows in live_rows:
+            graphs, events = {}, {}
+            for arm in arms:
+                target = outs["bf16" if arm == "native" or (arm == "fp8" and not fp8) else arm]
+                run(arm, rows)
+                expected = target[:rows].clone()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run(arm, rows)
+                target[:rows].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                if not torch.equal(target[:rows].view(torch.uint8), expected.view(torch.uint8)) or not torch.isfinite(target[:rows]).all().item():
+                    raise RuntimeError(f"Qwen {role}/{arm}/{rows}: poisoned replay differs")
+                pairs = [(torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True)) for _ in range(16 if rows <= 64 else 4)]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for start, end in pairs:
+                        flush.zero_()
+                        start.record()
+                        run(arm, rows)
+                        end.record()
+                graphs[arm], events[arm] = graph, pairs
+                graph.replay()
+            torch.cuda.synchronize()
+            before = thermal_snapshot()
+            samples = {arm: [] for arm in arms}
+            for repeat in range(args.samples):
+                for arm in (arms if repeat%2 == 0 else tuple(reversed(arms))):
+                    graphs[arm].replay()
+                    events[arm][-1][1].synchronize()
+                    samples[arm].append(statistics.mean(a.elapsed_time(b)*1000 for a,b in events[arm]))
+            times = {arm: statistics.median(values) for arm, values in samples.items()}
+            logical = dict(bf16=n*k*2, fp8=n*k+((n if head else (n+127)//128)*(k//128)*4) if fp8 else n*k*2)
+            logical.update({f"k{bits}": sum(k*sn*bits//8+2*(k+sn) for sn in sizes)+tiny_n*k*2 for bits in (6,8)})
+            if not members:
+                logical = dict(native=n*k*2)
+            record = dict(role=role, rows=rows, per_verify_step_calls=op["count"], total_call_us=times,
+                samples_us=samples, logical_weight_bytes=logical,
+                logical_weight_gbs={arm: logical[arm]/(times[arm]*1000) for arm in arms},
+                replay_exact=True, poisoned_outputs_overwritten=True,
+                thermal_before=before, thermal_after=thermal_snapshot())
+            report["records"].append(record)
+            report["aggregate"] = aggregate_qwen_full_core(operations, report["records"], rows_list)
+            print(json.dumps({k:v for k,v in record.items() if k != "samples_us"}), flush=True)
+            (args.output_dir/"report.json").write_text(json.dumps(report, indent=2)+"\n")
+        if head:
+            checked(native.cuteafd_v41_markov_destroy(handle))
+        del graphs, events, graph, expected, target, fixtures, weight, x, outs, raw, final, rotated
+        del suh, scale, svh, tables, payloads, partial, tiny_weight, tiny_out, quantized, fp8_scale, workspace
+        torch.cuda.empty_cache()
+
+
+def aggregate_qwen_full_core(operations, records, rows_list):
+    """Per-owner dense sums; token conversion is explicitly Kimi-rate-normalized."""
+    lookup = {(r["role"], r["rows"]): r["total_call_us"] for r in records}
+    arms = ("k6", "k8", "bf16", "fp8")
+    def cost(op, rows, arm):
+        times = lookup[(op["role"], rows)]
+        return times[arm if arm in times else "native"]
+    decode = []
+    for rows in rows_list:
+        if rows > 64 or any((op["role"], rows) not in lookup for op in operations):
+            continue
+        sums = {arm: [sum(cost(op, rows, arm)*op["count"][rank] for op in operations)
+                      for rank in (0, 1)] for arm in arms}
+        decode.append(dict(rows=rows, local_dense_us_per_verify_step=sums,
+            kimi_rate_normalized_local_dense_us_per_emitted_token={
+                arm: [v*73/255 for v in values] for arm, values in sums.items()}))
+    prefill = []
+    for tokens, histogram, heads in ((8192, {2752: 2, 2688: 1}, 1),
+                                      (65536, {2752: 23, 2240: 1}, 8)):
+        if any((op["role"], row) not in lookup for op in operations
+               for row in ([1] if op["role"] == "head" else histogram)):
+            continue
+        sums = {arm: [sum((heads*cost(op, 1, arm) if op["role"] == "head" else
+                            sum(count*cost(op, row, arm) for row, count in histogram.items()))
+                           * op["count"][rank] for op in operations) for rank in (0, 1)] for arm in arms}
+        prefill.append(dict(tokens=tokens, body_row_histogram=histogram,
+                            head_rows=1, head_calls=heads, local_dense_us=sums))
+    return dict(decode=decode, prefill=prefill,
+        normalization="Kimi 73 verify steps / 255 emitted tokens; not measured Qwen speculation",
+        scope="whole-layer owner local dense sums, not summed-across-GPU latency; nondense work excluded")
 
 
 def benchmark_kimi_full_core(args):
@@ -1902,6 +2203,7 @@ def main():
     parser.add_argument("--kimi-decision", action="store_true", help="full K6/K8/BF16 KDA and gate/up launch sums")
     parser.add_argument("--full-core", action="store_true", help="extend Kimi decision and fixtures to all local dense operations")
     parser.add_argument("--checkpoint-config", type=Path, help="actual checkpoint config.json for full-core multiplicities")
+    parser.add_argument("--qwen-core", type=Path, help="original Qwen config/header inventory; hypothetical K6/K8 full-core arms")
     parser.add_argument("--native-library", type=Path, help="shipping native DSO plus adjacent COMPILER_PROVENANCE.json")
     parser.add_argument("--fixture-dir", type=Path, help="independently reference-encoded K6/K8 fixture directory")
     parser.add_argument("--profile-catalog", type=Path, help="baseline kernel-catalog.json for per-emitted-token call counts")
@@ -1913,6 +2215,13 @@ def main():
             parser.error("--encoder-build-only requires --encoder-source")
         hashes = reference_encoder(args.encoder_source, args.output_dir / "encoder")
         (args.output_dir / "encoder_sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
+        return
+    if args.qwen_core and (args.full_core or args.kimi_decision or args.baseline_native):
+        parser.error("--qwen-core is a separate family measurement, not a Kimi mode")
+    if args.qwen_core and not args.encode_fixtures:
+        if not args.compile_only and (args.fixture_dir is None or args.native_library is None):
+            parser.error("--qwen-core measurement requires --fixture-dir and --native-library")
+        benchmark_qwen_full_core(args)
         return
     if args.full_core and (args.checkpoint_config is None or not (args.encode_fixtures or args.kimi_decision)):
         parser.error("--full-core requires --checkpoint-config and --encode-fixtures or --kimi-decision")

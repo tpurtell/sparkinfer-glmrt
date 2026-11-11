@@ -410,11 +410,14 @@ def test_qwen_full_core_keeps_whole_owner_counts_and_independent_members():
         "linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight",
         "linear_attn.out_proj.weight", "self_attn.q_proj.weight",
         "self_attn.k_proj.weight", "self_attn.v_proj.weight",
-        "self_attn.indexer.index_qk_proj.weight", "self_attn.o_proj.weight",
+        "self_attn.o_proj.weight",
         "mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.up_proj.weight",
         "mlp.shared_expert.down_proj.weight", "lm_head.weight",
     }
-    assert next(s for s in shapes if "index_qk" in s["role"])["n"] == 640
+    assert not any("index_qk" in s["role"] for s in shapes)
+    assert [m["hypothetical_trellis"] for m in roles["layer0.gdn_in"]["members"]] == [True, True, False, False]
+    assert [m["hypothetical_trellis"] for m in roles["layer1.attn_in"]["members"]] == [True, True, True, False]
+    assert [m["hypothetical_trellis"] for m in roles["layer0.shared_in"]["members"]] == [True, True, False]
     assert not any("in_proj_a" in s["role"] or "shared_expert_gate" in s["role"] for s in shapes)
     assert all(s["side"] == 1 for s in shapes)
     with pytest.raises(ValueError, match="owner map"):
@@ -492,6 +495,41 @@ def test_qwen_projection_program_uses_native_factories_and_i64_scratch(monkeypat
     router = dict(op, role="router", packed_n=512, fp8_scale_layout=None)
     bench.qwen_full_core_projection_program(router, prefill=True)
     assert calls[-1] == ("router", (512,), {"hidden": 2560})
+
+
+def test_qwen_core_aggregate_separates_owners_and_labels_token_projection():
+    bench = _native_threshold_bench()
+    ops = [dict(role="gdn", count=[18, 18]), dict(role="head", count=[1, 0])]
+    records = [dict(role="gdn", rows=2, total_call_us=dict(k6=10, k8=12, bf16=20, fp8=9)),
+               dict(role="head", rows=2, total_call_us=dict(k6=2, k8=3, bf16=4, fp8=1))]
+    result = bench.aggregate_qwen_full_core(ops, records, [2, 16])
+    assert len(result["decode"]) == 1
+    row = result["decode"][0]
+    assert row["local_dense_us_per_verify_step"]["k6"] == [182, 180]
+    assert row["kimi_rate_normalized_local_dense_us_per_emitted_token"]["k6"] == pytest.approx([182*73/255, 180*73/255])
+    assert "not measured Qwen speculation" in result["normalization"]
+    assert result["prefill"] == []
+
+
+def test_qwen_core_aggregate_native_cost_is_charged_once_per_owner():
+    bench = _native_threshold_bench()
+    ops = [dict(role="native", count=[24, 24]), dict(role="head", count=[1, 0])]
+    records = [dict(role="native", rows=r, total_call_us=dict(native=3)) for r in (2752, 2688)]
+    records.append(dict(role="head", rows=1, total_call_us=dict(k6=2, k8=3, bf16=4, fp8=1)))
+    result = bench.aggregate_qwen_full_core(ops, records, [1])
+    assert result["decode"] == []
+    prefill = result["prefill"][0]
+    assert prefill["tokens"] == 8192
+    assert prefill["local_dense_us"]["bf16"] == [220, 216]
+    assert prefill["local_dense_us"]["fp8"] == [217, 216]
+
+
+def test_qwen_measurement_requires_fixture_and_native_library_before_cuda(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path),
+                                     "--qwen-core", str(tmp_path/"headers.json")])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
 
 
 def test_full_core_requires_config_before_cuda(monkeypatch,tmp_path):
