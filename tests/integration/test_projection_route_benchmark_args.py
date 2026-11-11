@@ -1198,3 +1198,104 @@ def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
         if method.name not in ("__init__", "_legacy", "_generic_grouped"):
             assert ast.dump(method) == ast.dump(methods[method.name]), method.name
     assert source.read_text() == original
+
+
+def test_kimi_full_fp8_keeps_native_set_and_padded_projection_boundaries():
+    bench = _native_threshold_bench()
+    ops = {op['role']: op for op in bench.kimi_full_core_operations(_full_core_config())}
+    kda = bench.kimi_fp8_projection_spec(ops['kda'], prefill=True)
+    assert kda['n'] == kda['logical_n'] == 24576
+    assert kda['native_aux_rows'] == 176 and kda['prefill_w8a8']
+    rank = bench.kimi_fp8_projection_spec(ops['mla_rank'])
+    assert rank['logical_n'] == 2112 and rank['n'] == 2176
+    head = bench.kimi_fp8_projection_spec(ops['head'], prefill=True)
+    assert head['output'] == 'f32' and not head['prefill_w8a8'] and head['decode_rows'] == 64
+    for role in ('router', 'layer0_gate_up', 'layer0_down', 'kda_fb', 'mla_uk', 'mla_uv'):
+        with pytest.raises(ValueError, match='kept-native'):
+            bench.kimi_fp8_projection_spec(ops[role])
+
+
+def test_kimi_full_fp8_factory_uses_exact_existing_abi_and_no_f32_w8a8(monkeypatch):
+    bench = _native_threshold_bench()
+    calls = []
+    class Projection:
+        def __init__(self, n, k, **kwargs):
+            calls.append((n, k, kwargs))
+        def key(self):
+            return ()
+    monkeypatch.setitem(sys.modules, 'cutlass', SimpleNamespace(Float32='f32', BFloat16='bf16'))
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(bfloat16='bf16', float32='f32', uint8='u8'))
+    monkeypatch.setitem(sys.modules, 'b12x.integration.cuteafd._common', SimpleNamespace(
+        Operand=lambda *a, **kw: (a, kw), Scalar=lambda *a: a,
+        compile_program=lambda launch, **kw: kw))
+    monkeypatch.setitem(sys.modules, 'b12x.integration.cuteafd._fp8_weights', SimpleNamespace(Fp8Projection=Projection))
+    ops = {op['role']: op for op in bench.kimi_full_core_operations(_full_core_config())}
+    program = bench.kimi_fp8_projection_program(ops['head'], prefill=True)
+    assert calls[-1][2] == dict(prefill_rows=64, prefill_mask=0, out_dtype='f32', decode_rows=64)
+    assert program['scalars'] == (('rows',), ('fp8_rows',), ('qscratch', 'int64'))
+    assert [o[0][0] for o in program['operands']] == ['x', 'w_fp8', 'scale', 'out']
+    bench.kimi_fp8_projection_program(ops['gate_up'], prefill=True)
+    assert calls[-1][2]['prefill_mask'] == 255 and calls[-1][2]['prefill_rows'] == 4096
+
+
+def test_kimi_full_fp8_aggregate_uses_physical_calls_and_separate_rank_sums():
+    bench = _native_threshold_bench()
+    ops = bench.kimi_full_core_operations(_full_core_config())
+    rows = [1, 6, 2240, 2688, 2752]
+    records = [dict(role=o['role'], rows=r, total_call_us={'native': 1} if o['native'] else
+                    dict(bf16=2, fp8_full=3)) for o in ops for r in (rows[:2] if o['head'] else rows)]
+    result = bench.aggregate_kimi_fp8_core(ops, records, dict(verify_steps_per_emitted_token=73/255), rows)
+    d = result['decode'][1]
+    assert d['local_dense_us_per_verify_step']['fp8_full'][1]-d['local_dense_us_per_verify_step']['fp8_full'][0] == 3
+    assert d['local_dense_us_per_emitted_token']['fp8_full'][0] == pytest.approx(d['local_dense_us_per_verify_step']['fp8_full'][0]*73/255)
+    assert [p['head_calls'] for p in result['prefill']] == [1, 8]
+    assert 'k6' not in d['local_dense_us_per_verify_step']
+
+
+def test_kimi_full_fp8_requires_existing_fixtures_and_profile_before_cuda(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, 'argv', ['bench', '--output-dir', str(tmp_path), '--kimi-fp8-core', 'headers.json'])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
+
+
+def test_kimi_fp8_header_audit_uses_one_based_map_and_exact_projection_shapes():
+    bench = _native_threshold_bench()
+    config = _full_core_config()
+    config['linear_attn_config']['kda_layers'] = list(range(1, 70))
+    config['linear_attn_config']['full_attn_layers'] = list(range(70, 94))
+    class Headers(dict):
+        def __missing__(self, name):
+            if name == 'language_model.lm_head.weight':
+                shape = [163840, 7168]
+            elif name.endswith('self_attn.o_proj.weight'):
+                shape = [7168, 12288]
+            elif name.endswith('self_attn.q_a_proj.weight'):
+                shape = [1536, 7168]
+            elif name.endswith('self_attn.kv_a_proj_with_mqa.weight'):
+                shape = [576, 7168]
+            elif name.endswith('self_attn.q_b_proj.weight'):
+                shape = [18432, 1536]
+            elif '.self_attn.' in name:
+                shape = [12288, 7168]
+            elif name.endswith('shared_experts.down_proj.weight'):
+                shape = [7168, 6144]
+            elif name.endswith('routed_expert_down_proj.weight'):
+                shape = [3584, 7168]
+            elif name.endswith('routed_expert_up_proj.weight'):
+                shape = [7168, 3584]
+            else:
+                shape = [6144, 7168]
+            self[name] = dict(dtype='BF16', shape=shape)
+            return self[name]
+    headers = Headers()
+    audit = bench.validate_kimi_fp8_headers(config, headers)
+    assert len(audit['substituted_original_headers']) == 926
+    name = 'language_model.model.layers.0.self_attn.q_proj.weight'
+    assert name in audit['substituted_original_headers']
+    headers[name]['shape'] = [1, 7168]
+    with pytest.raises(ValueError, match='geometry/precision'):
+        bench.validate_kimi_fp8_headers(config, headers)
+    config['linear_attn_config']['full_attn_layers'][0] = 1
+    with pytest.raises(ValueError, match='partition'):
+        bench.validate_kimi_fp8_headers(config, Headers())

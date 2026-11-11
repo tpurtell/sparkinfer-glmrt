@@ -3416,6 +3416,351 @@ def benchmark_kimi_full_core(args):
         torch.cuda.empty_cache()
 
 
+def kimi_fp8_projection_spec(operation, *, prefill=False):
+    """Hypothetical block FP8 only on the completed trellis arm's converted set."""
+    if operation["native"]:
+        raise ValueError("Kimi kept-native operation has no hypothetical FP8 conversion")
+    n = operation["packed_n"]-176 if operation["role"] == "kda" else operation["packed_n"]
+    return dict(role=operation["role"], n=(n+127)//128*128, logical_n=n,
+                k=operation["k"], output=operation["output"], decode_rows=64,
+                prefill_w8a8=prefill and operation["output"] == "bf16",
+                capacity=64 if operation["head"] else 4096,
+                scale_layout="block128x128_f32", native_aux_rows=176 if operation["role"] == "kda" else 0)
+
+
+def kimi_fp8_projection_program(operation, *, prefill=False):
+    import cutlass
+    import torch
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+
+    spec = kimi_fp8_projection_spec(operation, prefill=prefill)
+    n, k = spec["n"], spec["k"]
+    dtype = cutlass.Float32 if spec["output"] == "f32" else cutlass.BFloat16
+    launch = Fp8Projection(n, k, prefill_rows=spec["capacity"] if prefill else None,
+                          prefill_mask=255 if spec["prefill_w8a8"] else 0,
+                          out_dtype=dtype, decode_rows=spec["decode_rows"])
+    return compile_program(launch, name="kimi_hypothetical_fp8", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("w_fp8", torch.uint8, f"[{n},{k}]"),
+        Operand("scale", torch.float32, f"[{n//128},{k//128}]", align=4),
+        Operand("out", torch.float32 if spec["output"] == "f32" else torch.bfloat16,
+                f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"), Scalar("fp8_rows"), Scalar("qscratch", "int64")),
+        key=(tuple(sorted(spec.items())), prefill, launch.key()), geometry=spec)
+
+
+def aggregate_kimi_fp8_core(operations, records, accounting, rows_list):
+    """Reuse the measured Kimi call ledger, without treating old trellis runs as paired."""
+    lookup = {(r["role"], r["rows"]): r["total_call_us"] for r in records}
+    def cost(op, rows, arm):
+        return lookup[(op["role"], rows)]["native" if op["native"] else arm]
+    decode, prefill = [], []
+    for rows in rows_list:
+        if rows > 64 or any((o["role"], rows) not in lookup for o in operations):
+            continue
+        sums = {arm: [sum(cost(o, rows, arm)*o["count"][rank] for o in operations)
+                      for rank in (0, 1)] for arm in ("bf16", "fp8_full")}
+        decode.append(dict(rows=rows, local_dense_us_per_verify_step=sums,
+            local_dense_us_per_emitted_token={arm: [v*accounting["verify_steps_per_emitted_token"] for v in values]
+                                             for arm, values in sums.items()}))
+    for tokens in (8192, 65536):
+        schedule = glm_full_core_prefill_schedule(tokens)
+        histogram = schedule["body_row_histogram"]
+        if (("head", 1) not in lookup or any((o["role"], row) not in lookup
+                for o in operations if not o["head"] for row in histogram)):
+            continue
+        sums = {arm: [sum((schedule["head_calls"]*cost(o, 1, arm) if o["head"] else
+                          sum(count*cost(o, row, arm) for row, count in histogram.items()))*o["count"][rank]
+                          for o in operations) for rank in (0, 1)] for arm in ("bf16", "fp8_full")}
+        prefill.append(dict(tokens=tokens, **schedule, local_dense_us=sums))
+    return dict(decode=decode, prefill=prefill,
+        scope="same-session BF16 versus hypothetical FP8, per-rank dense only; earlier K6/K8 not paired")
+
+
+def validate_kimi_fp8_headers(config, tensors):
+    """Check every substituted source against original checkpoint headers, not a quant side file."""
+    operations = kimi_full_core_operations(config)
+    c = config.get("text_config", config)
+    kda = {layer-1 for layer in c["linear_attn_config"]["kda_layers"]}
+    mla = {layer-1 for layer in c["linear_attn_config"]["full_attn_layers"]}
+    if kda & mla or kda | mla != set(range(c["num_hidden_layers"])):
+        raise ValueError("Kimi attention layer map is not a partition")
+    checked = []
+    def matrix(name, shape):
+        if tensors[name]["dtype"] != "BF16" or tensors[name]["shape"] != list(shape):
+            raise ValueError(f"Kimi original source geometry/precision differs: {name}")
+        checked.append(name)
+    for layer in range(c["num_hidden_layers"]):
+        p = f"language_model.model.layers.{layer}."
+        a = p+"self_attn."
+        matrix(a+"o_proj.weight", (7168, 12288))
+        matrix(a+"g_proj.weight", (12288, 7168))
+        if layer in kda:
+            for leaf in ("q_proj", "k_proj", "v_proj"):
+                matrix(a+leaf+".weight", (12288, 7168))
+        else:
+            matrix(a+"q_a_proj.weight", (1536, 7168))
+            matrix(a+"kv_a_proj_with_mqa.weight", (576, 7168))
+            matrix(a+"q_b_proj.weight", (18432, 1536))
+        if layer >= c.get("first_k_dense_replace", 1):
+            m = p+"block_sparse_moe."
+            for leaf in ("gate_proj", "up_proj"):
+                matrix(m+"shared_experts."+leaf+".weight", (6144, 7168))
+            matrix(m+"shared_experts.down_proj.weight", (7168, 6144))
+            matrix(m+"routed_expert_down_proj.weight", (3584, 7168))
+            matrix(m+"routed_expert_up_proj.weight", (7168, 3584))
+    matrix("language_model.lm_head.weight", (c["vocab_size"], 7168))
+    return dict(substituted_original_headers=checked, operations=operations)
+
+
+def benchmark_kimi_fp8_core(args):
+    """One new FP8/BF16 session, reusing original encoder inputs but not retiming trellis."""
+    import hashlib
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd._glmf_fp8 import quant_scratch_bytes
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+    from b12x.gemm.bf16_gemv._skinny import wide_prefill_min_rows
+
+    rows_list = sorted(set(map(int, args.rows.split(","))))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 50:
+        raise ValueError("Kimi FP8 requires rows1..4096 and >=50 samples")
+    data = json.loads(args.kimi_fp8_core.read_text())["kimi"]
+    audit = validate_kimi_fp8_headers(data["config"], data["tensors"])
+    operations = audit["operations"]
+    contract = dict(operations=operations, export_sms=args.export_sms, header_audit=audit,
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    if args.compile_only:
+        import multiprocessing
+        from b12x._lib.compile_pool import _initialize_worker
+        _initialize_worker(0, (12, 0), "kimi-fp8", "kimi-fp8", args.export_sms,
+                           101376, 102400, multiprocessing.Array("i", [0, 0]))
+    else:
+        props = torch.cuda.get_device_properties(0)
+        status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+        if int(status):
+            raise RuntimeError(status)
+        flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+        native = C.CDLL(str(args.native_library.resolve()))
+        signatures = {
+            "cuteafd_fp8_block_quant": [C.c_void_p]*3+[C.c_int32]*2+[C.c_void_p],
+            "cuteafd_add_tp2_shared_async": [C.c_void_p]*3+[C.c_size_t, C.c_void_p],
+            "cuteafd_vocabulary_head_create_vocab": [C.c_void_p, C.c_uint64]+[C.c_int32]*4+[C.POINTER(C.c_void_p)],
+            "cuteafd_vocabulary_head_launch_tensor_invariant": [C.c_void_p]*4+[C.c_int32, C.c_void_p],
+            "cuteafd_v41_markov_destroy": [C.c_void_p],
+        }
+        for name, signature in signatures.items():
+            function = getattr(native, name)
+            function.argtypes, function.restype = signature, C.c_int32
+        manifests = json.loads((args.fixture_dir/"fixtures_k6.json").read_text())
+        shapes = full_core_fixture_shapes(operations)
+        if len(manifests) != len(shapes) or any(not r["oracle_exact"] or
+                any(r[key] != shape[key] for key in shape) for r, shape in zip(manifests, shapes)):
+            raise ValueError("Kimi existing independent fixture manifest differs")
+        accounting = validate_kimi_full_core_catalog(operations, json.loads(args.profile_catalog.read_text()),
+                                                     json.loads(args.profile_inventory.read_text()))
+        report = dict(metadata=dict(contract=contract, samples=args.samples, device=props.name,
+            sms=props.multi_processor_count, l2_bytes=l2, accounting=accounting, fixture_manifest=manifests,
+            native_library_sha256=hashlib.sha256(args.native_library.read_bytes()).hexdigest(),
+            native_provenance=json.loads(args.native_library.with_name("COMPILER_PROVENANCE.json").read_text()),
+            cache="2x runtime L2 eviction outside every interval",
+            scope="same-session BF16 versus hypothetical full FP8 only; previous trellis timings not paired",
+            numerics="existing reference encoder source weights, native block128 amax/448 quantization outside timing; no quality claim",
+            boundary="keep native set identical to K6/K8; packed KDA excludes native176; crop padded MLA rank; split BF16 partial and shared ordered add",
+            exclusions="peer transport, recurrence, norms, nonlinearities, experts, media, draft; no loader/fit/onboarding/readiness claim"), records=[])
+        torch.manual_seed(811)
+        warm = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm, warm)
+        torch.cuda.synchronize()
+        del warm
+
+    def checked(status):
+        if status:
+            raise RuntimeError(f"Kimi FP8 launch failed: {status}")
+
+    def program(directory, name, builder):
+        if args.compile_only:
+            print("compile", directory.name, name, flush=True)
+            with exportable_compilation():
+                result = builder()
+            exported(result, directory, name, load_module=False)
+            (directory/f"{name}.json").write_text(json.dumps(dict(pointers=len(result.operands),
+                scalars=[s.ctype for s in result.scalars])))
+            return None
+        abi = json.loads((directory/f"{name}.json").read_text())
+        lib = C.CDLL(str((directory/f"{name}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        kinds = {"int32": C.c_int32, "int64": C.c_int64, "float32": C.c_float}
+        lib.run.argtypes = [C.c_void_p]*abi["pointers"]+[kinds[s] for s in abi["scalars"]]+[C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    def batched(op):
+        from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+        from b12x.integration.cuteafd._glm_kernels import BatchedBf16Gemm
+        uk, fb = op["role"] == "mla_uk", op["role"] == "kda_fb"
+        a_row, a_batch = (24752, 128) if fb else (48*192, 192) if uk else (48*512, 512)
+        o_row, o_batch = (6144, 6144) if fb else (48*576, 576) if uk else (48*128, 128)
+        batch = 1 if fb else 48
+        launch = BatchedBf16Gemm(n=op["n"], k=op["k"], batch=batch,
+            a_row=a_row, a_batch=a_batch, o_row=o_row, o_batch=o_batch,
+            compute_warps=op.get("compute_warps", 4))
+        return compile_program(launch, name="kimi_fp8_kept_native", operands=(
+            Operand("a", torch.bfloat16, f"[rows,{a_row}]"),
+            Operand("w", torch.bfloat16, f"[{batch},{op['n']},{op['k']}]"),
+            Operand("out", torch.bfloat16, f"[rows,{o_row}]", "out")),
+            scalars=(Scalar("rows"),), key=launch.key(), geometry=op)
+
+    for op in operations:
+        role, k, n = op["role"], op["k"], op["packed_n"]
+        capacity = 64 if op["head"] else 4096
+        directory = args.output_dir/role
+        directory.mkdir(parents=True, exist_ok=True)
+        if args.compile_only:
+            (directory/"contract.json").write_text(json.dumps(contract, sort_keys=True))
+        elif json.loads((directory/"contract.json").read_text()) != contract:
+            raise ValueError("stale Kimi FP8 exports")
+        use_batched = op["batch"] > 1 or role == "kda_fb"
+        output_dtype = torch.float32 if op["output"] == "f32" else torch.bfloat16
+        baseline = None if op["head"] else program(directory, "bf16", lambda: batched(op) if use_batched else
+            compile_bf16_projection_aot(width=k, outputs=n, output_dtype=output_dtype,
+                wide=role not in ("layer0_gate_up", "layer0_down", "router") and
+                     wide_prefill_min_rows(n, k, capacity) is not None))
+        baseline_prefill = program(directory, "bf16_prefill", lambda: batched(dict(op, compute_warps=8))) if role == "kda_fb" else None
+        remainder = program(directory, "remainder", lambda: compile_bf16_projection_aot(width=k, outputs=176)) if role == "kda" else None
+        fp8 = {} if op["native"] else {prefill: program(directory, f"fp8_{int(prefill)}",
+            lambda prefill=prefill: kimi_fp8_projection_program(op, prefill=prefill)) for prefill in (False, True)}
+        if args.compile_only:
+            continue
+        fixtures = []
+        for record in (r for r in manifests if r["role"] == role):
+            path = args.fixture_dir/record["path"]
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(8*1024*1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != record["sha256"]:
+                raise ValueError("Kimi FP8 source fixture checksum differs")
+            fixtures.append(torch.load(path, weights_only=True, map_location="cpu"))
+        weights = ([f["weight"].cuda() for f in fixtures] if not op["native"] else
+                   [torch.randn(op["batch"]*n, k, device="cuda", dtype=torch.bfloat16)])
+        remainder_weight = torch.randn(176, k, device="cuda", dtype=torch.bfloat16) if remainder else None
+        converted = torch.cat((weights[0], weights[1][:576])) if role == "mla_rank" else torch.cat(weights)
+        packed_weight = torch.cat((converted, remainder_weight)) if remainder else converted
+        input_width = 24752 if role == "kda_fb" else 48*192 if role == "mla_uk" else 48*512 if role == "mla_uv" else k
+        output_width = 48*576 if role == "mla_uk" else 48*128 if role == "mla_uv" else n
+        x = torch.randn(capacity, input_width, device="cuda", dtype=torch.bfloat16)
+        outs = {arm: torch.empty(capacity, output_width, device="cuda", dtype=output_dtype) for arm in ("bf16", "fp8_full")}
+        split = op["side"] == 2
+        peer = torch.randn(capacity, op["n"], device="cuda", dtype=torch.bfloat16) if split else None
+        finals = {arm: torch.empty(capacity, op["n"], device="cuda", dtype=torch.bfloat16) for arm in outs} if split else outs
+        quantized = scales = qscratch = fp8_out = padded_weight = None
+        if fp8:
+            spec = kimi_fp8_projection_spec(op)
+            padded_weight = torch.zeros(spec["n"], k, device="cuda", dtype=torch.bfloat16)
+            padded_weight[:spec["logical_n"]].copy_(converted)
+            quantized = torch.empty_like(padded_weight, dtype=torch.float8_e4m3fn)
+            scales = torch.empty(spec["n"]//128, k//128, device="cuda", dtype=torch.float32)
+            checked(native.cuteafd_fp8_block_quant(padded_weight.data_ptr(), quantized.data_ptr(), scales.data_ptr(),
+                                                  spec["n"], k, torch.cuda.current_stream().cuda_stream))
+            torch.cuda.synchronize()
+            if not torch.isfinite(scales).all().item() or not (scales > 0).all().item():
+                raise ValueError("Kimi FP8 native block conversion produced invalid scales")
+            qscratch = torch.empty(quant_scratch_bytes(k, capacity), device="cuda", dtype=torch.uint8)
+            fp8_out = (outs["fp8_full"] if spec["n"] == n and not remainder else
+                       torch.empty(capacity, spec["n"], device="cuda", dtype=output_dtype))
+        remainder_out = torch.empty(capacity, 176, device="cuda", dtype=torch.bfloat16) if remainder else None
+        handle, workspace = C.c_void_p(), None
+        if op["head"]:
+            workspace = torch.empty(4<<20, device="cuda", dtype=torch.uint8)
+            checked(native.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), k, capacity, n, 1, C.byref(handle)))
+
+        def call(lib, *values):
+            checked(lib.run(*values, torch.cuda.current_stream().cuda_stream))
+
+        def run(arm, rows):
+            stream = torch.cuda.current_stream().cuda_stream
+            if op["native"] or arm == "bf16":
+                if op["head"]:
+                    checked(native.cuteafd_vocabulary_head_launch_tensor_invariant(handle, x.data_ptr(), packed_weight.data_ptr(), outs["bf16"].data_ptr(), rows, stream))
+                else:
+                    selected = baseline_prefill if baseline_prefill is not None and rows > 64 else baseline
+                    call(selected, x.data_ptr(), packed_weight.data_ptr(), outs["bf16"].data_ptr(), rows)
+            else:
+                call(fp8[rows > 64], x.data_ptr(), quantized.data_ptr(), scales.data_ptr(), fp8_out.data_ptr(),
+                     rows, 255 if rows > 64 else 64, qscratch.data_ptr())
+                if remainder:
+                    call(remainder, x.data_ptr(), remainder_weight.data_ptr(), remainder_out.data_ptr(), rows)
+                    outs[arm][:rows, :spec["logical_n"]].copy_(fp8_out[:rows, :spec["logical_n"]])
+                    outs[arm][:rows, spec["logical_n"]:].copy_(remainder_out[:rows])
+                elif fp8_out is not outs[arm]:
+                    outs[arm][:rows].copy_(fp8_out[:rows, :n])
+            if split:
+                source = outs["bf16" if op["native"] else arm]
+                checked(native.cuteafd_add_tp2_shared_async(source.data_ptr(), peer.data_ptr(), finals["bf16" if op["native"] else arm].data_ptr(), rows*op["n"], stream))
+
+        arms = ("native",) if op["native"] else ("bf16", "fp8_full")
+        live_rows = [r for r in rows_list if r <= 64] if op["head"] else rows_list
+        for rows in live_rows:
+            graphs, events = {}, {}
+            for arm in arms:
+                target = finals["bf16" if arm == "native" else arm][:rows]
+                if role == "mla_uk":
+                    target = target.view(rows, 48, 576)[:, :, :512]
+                run(arm, rows)
+                expected = target.clone()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run(arm, rows)
+                target.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                if not torch.equal(target.view(torch.uint8), expected.view(torch.uint8)) or not torch.isfinite(target).all().item():
+                    raise RuntimeError(f"Kimi FP8 {role}/{arm}/{rows}: poisoned replay differs")
+                pairs = [(torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True))
+                         for _ in range(16 if rows <= 64 else 4)]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for start, end in pairs:
+                        flush.zero_()
+                        start.record()
+                        run(arm, rows)
+                        end.record()
+                graphs[arm], events[arm] = graph, pairs
+                graph.replay()
+            torch.cuda.synchronize()
+            before = thermal_snapshot()
+            samples = {arm: [] for arm in arms}
+            for repeat in range(args.samples):
+                for arm in (arms if repeat%2 == 0 else tuple(reversed(arms))):
+                    graphs[arm].replay()
+                    events[arm][-1][1].synchronize()
+                    samples[arm].append(statistics.mean(a.elapsed_time(b)*1000 for a, b in events[arm]))
+            times = {arm: statistics.median(values) for arm, values in samples.items()}
+            logical = dict(bf16=op["batch"]*n*k*2)
+            if fp8:
+                logical["fp8_full"] = quantized.numel()+4*scales.numel()+(176*k*2 if remainder else 0)
+            if op["native"]:
+                logical = dict(native=logical["bf16"])
+            record = dict(role=role, rows=rows, total_call_us=times, samples_us=samples,
+                logical_weight_bytes=logical, logical_weight_gbs={arm: logical[arm]/(times[arm]*1000) for arm in arms},
+                replay_exact=True, poisoned_outputs_overwritten=True,
+                thermal_before=before, thermal_after=thermal_snapshot())
+            report["records"].append(record)
+            report["aggregate"] = aggregate_kimi_fp8_core(operations, report["records"], accounting, rows_list)
+            print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
+            (args.output_dir/"report.json").write_text(json.dumps(report, indent=2)+"\n")
+        if handle.value:
+            checked(native.cuteafd_v41_markov_destroy(handle))
+        del graphs, events, expected, target, fixtures, weights, packed_weight, converted, x, outs, finals
+        del peer, quantized, scales, qscratch, fp8_out, padded_weight, remainder_weight, remainder_out, workspace
+        torch.cuda.empty_cache()
+
+
 def benchmark_kimi_decision(args):
     """Full independent-projection launch sums, not concatenated trellis tensors."""
     import hashlib
@@ -3693,6 +4038,7 @@ def main():
     parser.add_argument("--qwen-core", type=Path, help="original Qwen config/header inventory; hypothetical K6/K8 full-core arms")
     parser.add_argument("--glm-core", type=Path, help="original GLM 5.3 config/header inventory; independent K6/K8 full-core arms")
     parser.add_argument("--muse-core", type=Path, help="original Muse config/header inventory; independent K6/K8 plus selectable and hypothetical full FP8")
+    parser.add_argument("--kimi-fp8-core", type=Path, help="original Kimi headers; hypothetical full FP8 versus BF16 without rerunning trellis")
     parser.add_argument("--ml4-core", type=Path, help="original ML4 config/header inventory; native FP8/BF16 versus K6 only")
     parser.add_argument("--ml4-scales", type=Path, help="original ML4 block-FP8 scale header audit")
     parser.add_argument("--onboard-layers", type=int, help="actual admitted sparse prefix, required for GLM/ML4 router owner counts")
@@ -3707,6 +4053,15 @@ def main():
             parser.error("--encoder-build-only requires --encoder-source")
         hashes = reference_encoder(args.encoder_source, args.output_dir / "encoder")
         (args.output_dir / "encoder_sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
+        return
+    if args.kimi_fp8_core:
+        if (args.ml4_core or args.muse_core or args.glm_core or args.qwen_core or args.full_core
+                or args.kimi_decision or args.encode_fixtures or args.baseline_native):
+            parser.error("--kimi-fp8-core is a separate measurement; reuse existing fixtures")
+        if not args.compile_only and any(value is None for value in
+                (args.native_library, args.fixture_dir, args.profile_catalog, args.profile_inventory)):
+            parser.error("--kimi-fp8-core requires --native-library, --fixture-dir and profile catalog/inventory")
+        benchmark_kimi_fp8_core(args)
         return
     if args.ml4_core:
         if (args.muse_core or args.qwen_core or args.glm_core or args.full_core or args.kimi_decision
