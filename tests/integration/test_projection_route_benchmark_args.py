@@ -490,11 +490,19 @@ def test_qwen_projection_program_uses_native_factories_and_i64_scratch(monkeypat
     assert calls[-1] == ("w8a16", (16480, 2560), {})
     assert result["scalars"] == (("rows",), ("fp8_rows",), ("qscratch", "int64"))
     assert result["operands"][2][0][2] == "[129,20]"
+    assert [operand[0][0] for operand in result["operands"]] == ["x", "w_fp8", "scale", "out"]
+    head = dict(op, role="head", packed_n=248320, fp8_scale_layout="row_k128_f32")
+    result = bench.qwen_full_core_projection_program(head, fp8=True)
+    assert calls[-1] == ("head", (248320, 2560), {"max_rows": 64})
+    assert [operand[0][0] for operand in result["operands"]] == ["x", "w_fp8", "scale", "logits"]
+    assert result["scalars"] == (("rows",),)
     bench.qwen_full_core_projection_program(op)
     assert calls[-1] == ("glm", (16480, 2560), {})
     router = dict(op, role="router", packed_n=512, fp8_scale_layout=None)
-    bench.qwen_full_core_projection_program(router, prefill=True)
+    result = bench.qwen_full_core_projection_program(router, prefill=True)
     assert calls[-1] == ("router", (512,), {"hidden": 2560})
+    assert [operand[0][0] for operand in result["operands"]] == ["x", "w", "logits"]
+    assert result["scalars"] == (("live_rows",),)
 
 
 def test_qwen_core_aggregate_separates_owners_and_labels_token_projection():

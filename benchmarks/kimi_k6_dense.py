@@ -1029,9 +1029,10 @@ def qwen_full_core_projection_program(operation, *, prefill=False, fp8=False):
                   _PrefillW8A16(n, k) if factory == "prefill_w8a16" else
                   Fp8Projection(n, k, prefill_rows=4096 if prefill else None))
         scales = f"[{n},{k//128}]" if spec["fp8_scale_layout"] == "row_k128_f32" else f"[{(n+127)//128},{k//128}]"
-        operands.extend((Operand("w", torch.float8_e4m3fn, f"[{n},{k}]"),
+        operands.extend((Operand("w_fp8", torch.float8_e4m3fn, f"[{n},{k}]"),
                          Operand("scale", torch.float32, scales, align=4),
-                         Operand("out", out_dtype, f"[rows,{n}]", "out")))
+                         Operand("logits" if factory == "head_fp8" else "out",
+                                 out_dtype, f"[rows,{n}]", "out")))
         if factory != "head_fp8":
             # Fp8Projection orders its scalar scratch address after the row selector.
             scalars.extend((Scalar("fp8_rows"), Scalar("qscratch", "int64")))
@@ -1040,7 +1041,10 @@ def qwen_full_core_projection_program(operation, *, prefill=False, fp8=False):
                   glm_projection(n, k) if factory == "glm_projection" else
                   _projection(n, k, out_dtype=dtype))
         operands.extend((Operand("w", torch.bfloat16, f"[{n},{k}]"),
-                         Operand("out", out_dtype, f"[rows,{n}]", "out")))
+                         Operand("logits" if factory == "router_prefill" else "out",
+                                 out_dtype, f"[rows,{n}]", "out")))
+        if factory == "router_prefill":
+            scalars = [Scalar("live_rows")]
     return compile_program(launch, name="qwen_dense_member", operands=tuple(operands),
                            scalars=tuple(scalars),
                            key=(factory, launch.key() if hasattr(launch, "key") else (n, k)),
