@@ -1299,3 +1299,97 @@ def test_kimi_fp8_header_audit_uses_one_based_map_and_exact_projection_shapes():
     config['linear_attn_config']['full_attn_layers'][0] = 1
     with pytest.raises(ValueError, match='partition'):
         bench.validate_kimi_fp8_headers(config, Headers())
+
+
+def _step5_core_headers():
+    config = dict(hidden_size=4096, num_hidden_layers=92, num_attention_heads=64,
+        num_attention_groups=4, head_dim=192, intermediate_size=13824,
+        share_expert_dim=1536, moe_num_experts=352, vocab_size=128896,
+        layer_types=['full_attention' if i % 4 == 3 else 'sliding_attention' for i in range(92)],
+        moe_layer_list=list(range(3, 91)))
+    tensors = {'lm_head.weight': dict(dtype='BF16', shape=[128896, 4096])}
+    for layer in range(92):
+        p = f'model.layers.{layer}.'
+        shapes = {f'self_attn.{leaf}_proj.weight': [n, k] for leaf, n, k in
+                  [('q', 12288, 4096), ('k', 768, 4096), ('v', 768, 4096),
+                   ('o', 4096, 12288), ('g', 64, 4096)]}
+        if layer % 4 == 3:
+            shapes.update({f'self_attn.sparse_indexer_{leaf}.weight': [n, 4096]
+                           for leaf, n in [('q', 4096), ('k', 256), ('z', 256), ('w', 16)]})
+        shared = layer in config['moe_layer_list']
+        prefix, inter = ('share_expert', 1536) if shared else ('mlp', 13824)
+        shapes.update({f'{prefix}.{leaf}_proj.weight': shape for leaf, shape in
+                       [('gate', [inter, 4096]), ('up', [inter, 4096]), ('down', [4096, inter])]})
+        if shared:
+            shapes['moe.gate.weight'] = [352, 4096]
+        tensors.update({p+name: dict(dtype='F32' if 'sparse_indexer_w.' in name else 'BF16', shape=shape)
+                        for name, shape in shapes.items()})
+    return config, tensors
+
+
+def test_step5_catalog_uses_actual_csa_ranges_replicated_ffns_and_native_indexers():
+    bench = _native_threshold_bench()
+    config, tensors = _step5_core_headers()
+    ops = bench.step5_full_core_operations(config, tensors, csa_rank0_layers=9, onboard_layers=17)
+    assert sum(len(op['members']) for op in ops) == 917
+    unique = {op['role']: op for op in bench.glm_full_core_unique_operations(ops)}
+    assert len(unique) == 20
+    assert unique['csa_q']['count'] == [9, 14]
+    assert unique['swa_o']['count'] == unique['swa_o']['reduction_count'] == [69, 69]
+    assert unique['swa_o']['output'] == 'f32' and unique['swa_o']['k'] == 6144
+    assert unique['csa_o']['output'] == 'bf16' and unique['csa_o']['split'] == 'whole'
+    assert unique['dense_in']['count'] == [3, 4]
+    assert unique['shared_in']['count'] == [75, 79]
+    assert unique['router']['count'] == [75, 25]
+    assert unique['index_w']['source_dtype'] == 'F32' and unique['index_w']['weight_dtype'] == 'BF16'
+    assert unique['index_w']['scaled_index'] and unique['index_w']['count'] == [9, 14]
+    shapes = bench.glm_full_core_fixture_shapes(ops)
+    assert len(shapes) == 15
+    assert len([shape for shape in shapes if shape['role'] == 'shared_in']) == 2
+    assert all(not op['hypothetical_trellis'] for op in unique.values() if op['role'].startswith('index_'))
+    tensors['model.layers.0.self_attn.q_proj.weight']['dtype'] = 'F8_E4M3'
+    with pytest.raises(ValueError, match='original matrix'):
+        bench.step5_full_core_operations(config, tensors, csa_rank0_layers=9, onboard_layers=17)
+
+
+def test_step5_fp8_specs_keep_f32_partial_and_head_w8a16():
+    bench = _native_threshold_bench()
+    config, tensors = _step5_core_headers()
+    ops = {op['role']: op for op in bench.glm_full_core_unique_operations(
+        bench.step5_full_core_operations(config, tensors, csa_rank0_layers=9, onboard_layers=17))}
+    assert not bench.step5_full_core_projection_spec(ops['swa_o'], fp8=True, prefill=True)['fp8_prefill_w8a8']
+    assert not bench.step5_full_core_projection_spec(ops['head'], fp8=True, prefill=True)['fp8_prefill_w8a8']
+    assert bench.step5_full_core_projection_spec(ops['csa_o'], fp8=True, prefill=True)['fp8_prefill_w8a8']
+    assert not bench.step5_full_core_projection_spec(ops['csa_o'], fp8=True, prefill=True, shipping=True)['fp8_prefill_w8a8']
+    for role in ('router', 'index_q', 'index_k', 'index_z', 'index_w', 'swa_gate', 'csa_gate'):
+        with pytest.raises(ValueError, match='kept-native'):
+            bench.step5_full_core_projection_spec(ops[role], fp8=True)
+    with pytest.raises(ValueError, match='non-O'):
+        bench.step5_full_core_projection_spec(ops['swa_q'], fp8=True, shipping=True)
+
+
+def test_step5_aggregate_distinguishes_hqa_from_not_loadable_bf16_o_substitution():
+    bench = _native_threshold_bench()
+    config, tensors = _step5_core_headers()
+    ops = bench.glm_full_core_unique_operations(bench.step5_full_core_operations(
+        config, tensors, csa_rank0_layers=9, onboard_layers=17))
+    rows = [1, 6, 2240, 2688, 2752]
+    records = [dict(role=op['role'], rows=row, phase=phase,
+        total_call_us=dict(native=1) if not op['hypothetical_trellis'] else
+        dict(bf16=2, k6=3, k8=4, fp8_full=5, fp8_o=6))
+        for op in ops for row in (rows[:2] if op['role'] == 'head' else rows)
+        for phase in (('producer', 'reduce0', 'reduce1') if op['split'] == 'input' else ('producer',))]
+    result = bench.aggregate_step5_full_core(ops, records, rows)
+    sums = result['decode'][0]['local_dense_us']
+    for rank in (0, 1):
+        others = sum(op['count'][rank] for op in ops if op['hypothetical_trellis'] and not op['shipping_fp8_attention'])
+        assert sums['fp8_o_selectable'][rank]-sums['bf16_fp8_o_not_loadable'][rank] == others
+    assert [r['head_calls'] for r in result['prefill']] == [1, 8]
+    assert 'HQA' in result['fp8_o_selectable'] and 'not-loadable' in result['bf16_fp8_o_not_loadable']
+
+
+def test_step5_mode_requires_admitted_counts_before_importing_cuda(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, 'argv', ['bench', '--output-dir', str(tmp_path), '--step5-core', 'headers.json'])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2

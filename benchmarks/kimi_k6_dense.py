@@ -1144,6 +1144,158 @@ def ml4_full_core_projection_program(operation, *, prefill=False):
         key=(tuple(sorted(spec.items())), launch.key()), geometry=spec)
 
 
+def step5_full_core_operations(config, tensors, *, csa_rank0_layers, onboard_layers):
+    """Original BF16 boundaries with admitted CSA ranges and replicated SWA FFNs."""
+    c = config
+    h, layers = c["hidden_size"], c["num_hidden_layers"]
+    full = [i for i, kind in enumerate(c["layer_types"][:layers]) if kind == "full_attention"]
+    if ((h, layers, c["num_attention_heads"], c["num_attention_groups"], c["head_dim"],
+         c["intermediate_size"], c["share_expert_dim"], c["moe_num_experts"]) !=
+            (4096, 92, 64, 4, 192, 13824, 1536, 352) or len(full) != 23 or
+            not 0 <= csa_rank0_layers <= len(full) or not 0 <= onboard_layers <= 88):
+        raise ValueError("Step-5 requires original TP2 geometry and admitted CSA/onboard counts")
+    owners = {layer: int(index >= csa_rank0_layers) for index, layer in enumerate(full)}
+    routed = set(c["moe_layer_list"])
+    if routed != set(range(3, 91)):
+        raise ValueError("Step-5 routed target layers differ")
+    operations = []
+
+    def add(role, names, shapes, count, *, split="whole", trellis=False, output="bf16",
+            shipping_o=False, source_dtype="BF16", scaled=False):
+        members = []
+        for name, shape in zip(names, shapes):
+            tensor = tensors[name]
+            if tensor["shape"] != list(shape) or tensor["dtype"] != source_dtype:
+                raise ValueError(f"Step-5 original matrix geometry/precision differs: {name}")
+            n, k = shape
+            n //= 2 if split == "output" else 1
+            k //= 2 if split == "input" else 1
+            members.append(dict(name=name, source_shape=list(shape), n=n, k=k,
+                stored_n=(n+127)//128*128 if trellis else n,
+                hypothetical_trellis=trellis, split=split))
+        if len({m["k"] for m in members}) != 1:
+            raise ValueError("Step-5 packed members have different input widths")
+        operations.append(dict(role=role, members=members, count=list(count),
+            k=members[0]["k"], packed_n=sum(m["n"] for m in members), batch=1,
+            split=split, hypothetical_trellis=trellis,
+            fp8_scale_layout="block128x128_f32" if trellis else None,
+            shipping_fp8_attention=shipping_o, output=output,
+            source_dtype=source_dtype, weight_dtype="BF16", scaled_index=scaled,
+            reduction_count=list(count) if split == "input" else [0, 0],
+            boundary=("F32 retained core partial; ordered rank add; one H128/svh egress and BF16 narrow"
+                      if split == "input" else "native packed BF16 gate/up; independently calibrated trellis members"
+                      if len(members) > 1 else "BF16 scratch then F32 prescale0.5" if scaled else "local")))
+
+    for layer in range(layers):
+        whole = layer in owners
+        count = [int(owners[layer] == rank) for rank in (0, 1)] if whole else [1, 1]
+        tag = "csa" if whole else "swa"
+        p = f"model.layers.{layer}."
+        a = p+"self_attn."
+        for leaf, n, k in (("q", 12288, h), ("k", 768, h), ("v", 768, h), ("o", h, 12288)):
+            split = "whole" if whole else "input" if leaf == "o" else "output"
+            add(f"layer{layer}.{tag}_{leaf}", [a+leaf+"_proj.weight"], [(n, k)], count,
+                split=split, trellis=True, output="f32" if split == "input" else "bf16", shipping_o=leaf == "o")
+        add(f"layer{layer}.{tag}_gate", [a+"g_proj.weight"], [(64, h)], count,
+            split="whole" if whole else "output")
+        if whole:
+            for leaf, n in (("q", 4096), ("k", 256), ("z", 256), ("w", 16)):
+                add(f"layer{layer}.index_{leaf}", [a+f"sparse_indexer_{leaf}.weight"], [(n, h)], count,
+                    source_dtype="F32" if leaf == "w" else "BF16", scaled=leaf == "w",
+                    output="f32" if leaf == "w" else "bf16")
+        shared = layer in routed
+        f = p+("share_expert." if shared else "mlp.")
+        inter = c["share_expert_dim"] if shared else c["intermediate_size"]
+        name = "shared" if shared else "dense"
+        add(f"layer{layer}.{name}_in", [f+"gate_proj.weight", f+"up_proj.weight"], [(inter, h)]*2,
+            count, trellis=True)
+        add(f"layer{layer}.{name}_down", [f+"down_proj.weight"], [(h, inter)], count, trellis=True)
+        if shared:
+            router_count = list(count)
+            if not whole and layer >= 3+onboard_layers:
+                router_count = [1, 0]
+            add(f"layer{layer}.router", [p+"moe.gate.weight"], [(352, h)], router_count, output="f32")
+    add("head", ["lm_head.weight"], [(c["vocab_size"], h)], [1, 0], trellis=True, output="f32")
+    target = {name for name, tensor in tensors.items() if len(tensor["shape"]) == 2 and
+              (name == "lm_head.weight" or (name.startswith("model.layers.") and
+               int(name.split(".")[2]) < layers)) and ".experts." not in name}
+    covered = {m["name"] for op in operations for m in op["members"]}
+    if target != covered:
+        raise ValueError(f"Step-5 uncovered target matrices: {sorted(target-covered)}; unexpected: {sorted(covered-target)}")
+    return operations
+
+
+def step5_full_core_from_headers(path, *, csa_rank0_layers, onboard_layers):
+    checkpoint = json.loads(Path(path).read_text())["step5"]
+    if "Step-5-Preview-BF16/" not in checkpoint["snapshot"]:
+        raise ValueError("Step-5 authoritative origin must be Step-5-Preview-BF16")
+    return step5_full_core_operations(checkpoint["config"], checkpoint["tensors"],
+        csa_rank0_layers=csa_rank0_layers, onboard_layers=onboard_layers)
+
+
+def step5_full_core_projection_spec(operation, *, prefill=False, fp8=False, shipping=False):
+    role = re.sub(r"^layer\d+\.", "", operation["role"])
+    if fp8 and (not operation["hypothetical_trellis"] or (shipping and not operation["shipping_fp8_attention"])):
+        raise ValueError("Step-5 kept-native or non-O role has no requested FP8 conversion")
+    return dict(role=role, n=operation["packed_n"], k=operation["k"], output=operation["output"],
+        factory="scaled_index" if operation["scaled_index"] else "fp8" if fp8 else "native_head" if role == "head" else "bf16",
+        capacity=64 if role == "head" else 4096, decode_rows=64, shipping=shipping,
+        fp8_prefill_w8a8=fp8 and prefill and not shipping and operation["output"] == "bf16")
+
+
+def step5_full_core_projection_program(operation, *, prefill=False, fp8=False, shipping=False):
+    """Existing Step-5 pointwise producers and native block-FP8 math, no new kernels."""
+    import cutlass
+    import torch
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot, compile_bf16_scaled_projection_aot
+
+    spec = step5_full_core_projection_spec(operation, prefill=prefill, fp8=fp8, shipping=shipping)
+    n, k = spec["n"], spec["k"]
+    if fp8 and shipping:
+        # Match the native_attention export's pointer/scalar ABI, not just its math.
+        global cute, cuda, Int32, Int64
+        import cutlass.cute as cute
+        import cuda.bindings.driver as cuda
+        from cutlass import Int32, Int64
+
+        class NativeOutput:
+            def __init__(self):
+                self.projection = Fp8Projection(n, k, decode_rows=64,
+                    out_dtype=cutlass.Float32 if spec["output"] == "f32" else cutlass.BFloat16)
+
+            @cute.jit
+            def __call__(self, x: cute.Pointer, weight: cute.Pointer, scales: cute.Pointer,
+                         out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+                self.projection(x, weight, scales, out, rows, Int32(64), Int64(scratch.toint()), stream)
+
+        launch = NativeOutput()
+        return compile_program(launch, name="step5_native_fp8_o", operands=(
+            Operand("x", torch.bfloat16, f"[rows,{k}]"), Operand("weight", torch.uint8, f"[{n},{k}]"),
+            Operand("scales", torch.float32, f"[{n//128},{k//128}]"),
+            Operand("out", torch.float32 if spec["output"] == "f32" else torch.bfloat16, f"[rows,{n}]", "out"),
+            Operand("scratch", torch.uint8, "[projection_scratch]", "scratch")),
+            scalars=(Scalar("rows"),), key=(tuple(sorted(spec.items())), launch.projection.key()),
+            scratch={"scratch": lambda rows: max(256, launch.projection.prefill_scratch_bytes(rows))}, geometry=spec)
+    if spec["factory"] == "native_head":
+        raise ValueError("Step-5 original head uses the shipping native DSO")
+    if spec["factory"] == "scaled_index":
+        return compile_bf16_scaled_projection_aot(width=k, outputs=n, prescale=0.5)
+    output = torch.float32 if spec["output"] == "f32" else torch.bfloat16
+    if not fp8:
+        return compile_bf16_projection_aot(width=k, outputs=n, output_dtype=output)
+    launch = Fp8Projection(n, k, out_dtype=cutlass.Float32 if spec["output"] == "f32" else cutlass.BFloat16,
+        decode_rows=64, prefill_rows=spec["capacity"] if spec["fp8_prefill_w8a8"] else None,
+        prefill_mask=255 if spec["fp8_prefill_w8a8"] else 0)
+    return compile_program(launch, name="step5_dense_fp8", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"), Operand("w_fp8", torch.uint8, f"[{n},{k}]"),
+        Operand("scale", torch.float32, f"[{n//128},{k//128}]", align=4),
+        Operand("out", output, f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"), Scalar("fp8_rows"), Scalar("qscratch", "int64")),
+        key=(tuple(sorted(spec.items())), launch.key()), geometry=spec)
+
+
 def muse_full_core_operations(config, tensors):
     """Muse TP2: native gate/router, independent cores, and F32 split meets."""
     c = config.get("text_config", config)
@@ -1696,7 +1848,11 @@ def encode_reference_fixtures(args):
     costs = torch.empty((256, 2, 65536 >> bits), device="cuda", dtype=torch.float16)
     edges = torch.empty((256, 256, 65536 >> bits), device="cuda", dtype=torch.int16)
     records = []
-    if getattr(args, "ml4_core", None):
+    if getattr(args, "step5_core", None):
+        operations = step5_full_core_from_headers(args.step5_core,
+            csa_rank0_layers=args.csa_rank0_layers, onboard_layers=args.onboard_layers)
+        shapes = glm_full_core_fixture_shapes(operations)
+    elif getattr(args, "ml4_core", None):
         operations = ml4_full_core_from_headers(args.ml4_core, args.ml4_scales, onboard_layers=args.onboard_layers)
         shapes = glm_full_core_fixture_shapes(operations)
     elif getattr(args, "muse_core", None):
@@ -1716,7 +1872,8 @@ def encode_reference_fixtures(args):
     for index, shape in enumerate(shapes):
         k, n, side = shape["k"], shape["n"], shape["side"]
         if (args.full_core or getattr(args, "qwen_core", None) or getattr(args, "glm_core", None)
-                or getattr(args, "muse_core", None) or getattr(args, "ml4_core", None)):
+                or getattr(args, "muse_core", None) or getattr(args, "ml4_core", None)
+                or getattr(args, "step5_core", None)):
             record = encode_chunked_fixture(args, index, shape, costs, edges, oracle)
             records.append(record)
             (args.output_dir / f"fixtures_k{bits}.json").write_text(json.dumps(records, indent=2) + "\n")
@@ -2278,6 +2435,319 @@ def aggregate_muse_full_core(operations, records, rows_list):
         fp8_full="hypothetical: W8A8 on BF16-output roles, F32-output W8A16 on the split o/post-expert/head roles",
         fp8_selectable="shipping attention-only canonical64/W8A16; pre/post-expert/head K6; gate BF16/router F32",
         scope="per-rank dense producers, retained F32 copy and ordered meets/egress/narrow; no peer transport, norms, nonlinearities, experts, media or draft")
+
+
+def aggregate_step5_full_core(operations, records, rows_list):
+    """HQA fp8-compact retains K6 except O; BF16+FP8-O is not a loader claim."""
+    lookup = {(r["role"], r["rows"], r["phase"]): r["total_call_us"] for r in records}
+    arms = ("bf16", "k6", "k8", "fp8_full", "fp8_o_selectable", "bf16_fp8_o_not_loadable")
+
+    def key(op, arm):
+        if not op["hypothetical_trellis"]:
+            return "native"
+        if arm in ("fp8_o_selectable", "bf16_fp8_o_not_loadable"):
+            return "fp8_o" if op["shipping_fp8_attention"] else "k6" if arm == "fp8_o_selectable" else "bf16"
+        return arm
+
+    def phases(op):
+        return ("producer", "reduce0", "reduce1") if op["split"] == "input" else ("producer",)
+
+    def available(op, rows):
+        return all((op["role"], rows, phase) in lookup for phase in phases(op))
+
+    def cost(op, row, arm, rank):
+        measured = key(op, arm)
+        return sum(lookup[(op["role"], row, phase)][measured]*
+                   (op["count"] if phase == "producer" else op["reduction_count"])[rank]
+                   for phase in ("producer", f"reduce{rank}") if phase in phases(op))
+
+    def sums(work):
+        return {arm: [sum(count*cost(op, row, arm, rank) for op, row, count in work)
+                      for rank in (0, 1)] for arm in arms}
+
+    decode, prefill = [], []
+    for rows in rows_list:
+        if rows <= 64 and all(available(op, rows) for op in operations):
+            values = sums([(op, rows, 1) for op in operations])
+            decode.append(dict(rows=rows, local_dense_us=values,
+                kimi_rate_normalized_local_dense_us_per_emitted_token={
+                    arm: [v*73/255 for v in pair] for arm, pair in values.items()}))
+    for tokens in (8192, 65536):
+        schedule = glm_full_core_prefill_schedule(tokens)
+        work = [(op, row, count) for op in operations for row, count in
+                ({1: schedule["head_calls"]} if op["role"] == "head" else schedule["body_row_histogram"]).items()]
+        if all(available(op, row) for op, row, _ in work):
+            prefill.append(dict(tokens=tokens, **schedule, local_dense_us=sums(work)))
+    return dict(decode=decode, prefill=prefill,
+        normalization="Kimi 73 verify steps / 255 emitted tokens; not measured Step-5 speculation",
+        fp8_o_selectable="Step-5 HQA fp8-compact: K6 QKV/FFN/head plus native FP8 O; not all-Core-K6",
+        bf16_fp8_o_not_loadable="hypothetical BF16 plus FP8 O substitution, not-loadable",
+        fp8_full="hypothetical block128 FP8 converted core; F32 SWA O/head W8A16, BF16 prefill W8A8",
+        scope="local producers and mandatory ordered F32 SWA O meets/egress/narrow; no transport, norms, experts, media or MTP")
+
+
+def benchmark_step5_full_core(args):
+    """Complete Step-5 physical calls, including independent trellis gate/up."""
+    import hashlib
+    import multiprocessing
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd._glmf_fp8 import quant_scratch_bytes
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+
+    rows_list = sorted(set(map(int, args.rows.split(","))))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 50:
+        raise ValueError("Step-5 requires rows 1..4096 and >=50 samples")
+    all_operations = step5_full_core_from_headers(args.step5_core,
+        csa_rank0_layers=args.csa_rank0_layers, onboard_layers=args.onboard_layers)
+    operations = glm_full_core_unique_operations(all_operations)
+    contract = dict(operations=operations, export_sms=args.export_sms,
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        header_inputs_sha256=hashlib.sha256(args.step5_core.read_bytes()).hexdigest(),
+        csa_rank0_layers=args.csa_rank0_layers, onboard_layers=args.onboard_layers)
+    if args.compile_only:
+        from b12x._lib.compile_pool import _initialize_worker
+        _initialize_worker(0, (12, 0), "step5-core", "step5-core", args.export_sms,
+                           101376, 102400, multiprocessing.Array("i", [0, 0]))
+    else:
+        props = torch.cuda.get_device_properties(0)
+        status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+        if int(status):
+            raise RuntimeError(status)
+        limit = props.multi_processor_count*4
+        flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+        manifests = {bits: json.loads((args.fixture_dir/f"fixtures_k{bits}.json").read_text()) for bits in (6, 8)}
+        shapes = glm_full_core_fixture_shapes(all_operations)
+        for records in manifests.values():
+            if len(records) != len(shapes) or any(not r["oracle_exact"] or
+                    any(r[key] != shape[key] for key in shape) for r, shape in zip(records, shapes)):
+                raise ValueError("Step-5 fixture geometry or independent oracle coverage differs")
+        native = C.CDLL(str(args.native_library.resolve()))
+        signatures = {
+            "cuteafd_load_narrow_f32_bf16": [C.c_void_p, C.c_void_p, C.c_int64, C.c_int32, C.c_void_p],
+            "cuteafd_cuda_residual_add_f32_async": [C.c_void_p]*3+[C.c_size_t, C.c_void_p],
+            "cuteafd_fp8_block_quant": [C.c_void_p]*3+[C.c_int32, C.c_int32, C.c_void_p],
+            "cuteafd_vocabulary_head_create_vocab": [C.c_void_p, C.c_uint64]+[C.c_int32]*4+[C.POINTER(C.c_void_p)],
+            "cuteafd_vocabulary_head_launch_tensor_invariant": [C.c_void_p]*4+[C.c_int32, C.c_void_p],
+            "cuteafd_v41_markov_destroy": [C.c_void_p],
+        }
+        for name, signature in signatures.items():
+            function = getattr(native, name)
+            function.argtypes, function.restype = signature, C.c_int32
+        runtime = C.CDLL("libcudart.so")
+        runtime.cudaMemcpy2DAsync.argtypes = [C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t,
+                                            C.c_size_t, C.c_size_t, C.c_int, C.c_void_p]
+        runtime.cudaMemcpy2DAsync.restype = C.c_int
+        report = dict(metadata=dict(contract=contract, device=props.name, sms=props.multi_processor_count,
+            l2_bytes=l2, samples=args.samples, fixture_manifests=manifests,
+            native_library_sha256=hashlib.sha256(args.native_library.read_bytes()).hexdigest(),
+            native_provenance=json.loads(args.native_library.with_name("COMPILER_PROVENANCE.json").read_text()),
+            cache="2x runtime L2 eviction outside each complete-operation interval",
+            numerics="reference-encoded random source weights; unit H128 scales; within-format replay, not quality",
+            exclusions="No alternate loader/fit/end-to-end claim; transport, norms, nonlinearities, experts and MTP excluded"), records=[])
+        torch.manual_seed(811)
+        warm = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm, warm)
+        torch.cuda.synchronize()
+        del warm
+
+    def checked(status):
+        if status:
+            raise RuntimeError(f"Step-5 full-core launch failed: {status}")
+
+    def program(directory, name, builder):
+        if args.compile_only:
+            print("compile", directory.name, name, flush=True)
+            with exportable_compilation():
+                result = builder()
+            exported(result, directory, name, load_module=False)
+            (directory/f"{name}.json").write_text(json.dumps(dict(pointers=len(result.operands),
+                scalars=[s.ctype for s in result.scalars])))
+            return None
+        abi = json.loads((directory/f"{name}.json").read_text())
+        lib = C.CDLL(str((directory/f"{name}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        kinds = {"int32": C.c_int32, "int64": C.c_int64, "float32": C.c_float}
+        lib.run.argtypes = [C.c_void_p]*abi["pointers"]+[kinds[s] for s in abi["scalars"]]+[C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    def fixture(bits, role, index):
+        record, = [r for r in manifests[bits] if r["role"] == role and r["member"] == index]
+        path = args.fixture_dir/record["path"]
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8*1024*1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != record["sha256"]:
+            raise ValueError("Step-5 fixture checksum differs")
+        return torch.load(path, weights_only=True, map_location="cpu")
+
+    for op in operations:
+        role, k, n = op["role"], op["k"], op["packed_n"]
+        head, split, trellis = role == "head", op["split"] == "input", op["hypothetical_trellis"]
+        capacity = 64 if head else 4096
+        members = op["members"] if trellis else []
+        sizes = [m["stored_n"] for m in members]
+        directory = args.output_dir/role
+        directory.mkdir(parents=True, exist_ok=True)
+        if args.compile_only:
+            (directory/"contract.json").write_text(json.dumps(contract, sort_keys=True))
+        elif json.loads((directory/"contract.json").read_text()) != contract:
+            raise ValueError("stale Step-5 full-core exports")
+        baseline = None if head else program(directory, "bf16", lambda: step5_full_core_projection_program(op))
+        fp8 = {arm: {prefill: program(directory, f"{arm}_{int(prefill)}",
+            lambda prefill=prefill, arm=arm: step5_full_core_projection_program(op,
+                prefill=prefill, fp8=True, shipping=arm == "fp8_o")) for prefill in (False, True)}
+            for arm in (("fp8_full", "fp8_o") if op["shipping_fp8_attention"] else ("fp8_full",))} if trellis else {}
+        ingress, egress, cores = [], [], {6: [], 8: []}
+        for index, sn in enumerate(sizes):
+            ingress.append(program(directory, f"ingress{index}", lambda: compile_trellis_input_aot(
+                features=k, max_rows=capacity, output_dtype="bf16")))
+            egress.append(program(directory, f"egress{index}", lambda sn=sn: compile_trellis_output_aot(
+                features=sn, max_rows=capacity, output_dtype="f32" if head or split else "bf16")))
+            for bits in (6, 8):
+                cores[bits].append(program(directory, f"core{index}_k{bits}", lambda bits=bits, sn=sn:
+                    compile_trellis_linear_aot(input_features=k, output_features=sn, bits=bits,
+                        codebook="mcg", sharded_side=2 if split else 1, max_rows=capacity, input_dtype="bf16")))
+        if args.compile_only:
+            continue
+        fixtures = {bits: [fixture(bits, role, index) for index in range(len(members))] for bits in (6, 8)}
+        if any(not torch.equal(a["weight"], b["weight"]) for a, b in zip(fixtures[6], fixtures[8])):
+            raise ValueError("Step-5 K6/K8 source weights differ")
+        weight = (torch.cat([f["weight"][:m["n"]] for f, m in zip(fixtures[6], members)]).cuda() if trellis else
+                  torch.randn(n, k, device="cuda", dtype=torch.bfloat16))
+        x = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
+        arms = ("k6", "k8", "bf16", *fp8) if trellis else ("native",)
+        outs = {arm: torch.empty(capacity, n, device="cuda", dtype=torch.float32 if op["output"] == "f32" and not split else torch.bfloat16) for arm in arms}
+        retained = {arm: torch.empty(capacity, n, device="cuda", dtype=torch.float32) for arm in arms} if split else {}
+        peer = torch.randn(capacity, n, device="cuda", dtype=torch.float32) if split else None
+        reduced = torch.empty_like(peer) if split else None
+        raw = [torch.empty(capacity, sn, device="cuda", dtype=torch.float32) for sn in sizes]
+        final = [torch.empty(capacity, sn, device="cuda", dtype=torch.float32 if head or split else torch.bfloat16) for sn in sizes]
+        rotated = [torch.empty_like(x) for _ in sizes]
+        suh = [torch.ones(k, device="cuda", dtype=torch.float16) for _ in sizes]
+        scales = [torch.ones(k//128, device="cuda", dtype=torch.float16) for _ in sizes]
+        svh = [torch.ones(sn, device="cuda", dtype=torch.float16) for sn in sizes]
+        tables = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in rotated]
+        payloads = {bits: [f["payload"].cuda() for f in fixtures[bits]] for bits in (6, 8)}
+        partial = torch.empty(capacity*((k+1023)//1024)*max(sizes, default=128), device="cuda", dtype=torch.float32) if trellis else None
+        quantized = torch.empty(n, k, device="cuda", dtype=torch.float8_e4m3fn) if fp8 else None
+        fp8_scale = torch.empty(n//128, k//128, device="cuda", dtype=torch.float32) if fp8 else None
+        if fp8:
+            checked(native.cuteafd_fp8_block_quant(weight.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(), n, k, torch.cuda.current_stream().cuda_stream))
+            torch.cuda.synchronize()
+            if not torch.isfinite(fp8_scale).all().item() or not (fp8_scale > 0).all().item():
+                raise ValueError("Step-5 block-FP8 conversion produced invalid scales")
+        qscratch = torch.empty(quant_scratch_bytes(k, capacity), device="cuda", dtype=torch.uint8) if fp8 else None
+        index_scratch = torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16) if op["scaled_index"] else None
+        handle, workspace = C.c_void_p(), None
+        if head:
+            workspace = torch.empty(4<<20, device="cuda", dtype=torch.uint8)
+            checked(native.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), k, capacity, n, 1, C.byref(handle)))
+
+        def call(lib, *values):
+            checked(lib.run(*values, torch.cuda.current_stream().cuda_stream))
+
+        def copy_rows(dst, src, rows, width, column=0):
+            element = dst.element_size()
+            checked(runtime.cudaMemcpy2DAsync(dst.data_ptr()+column*element, dst.shape[1]*element,
+                src.data_ptr(), src.shape[1]*element, width*element, rows, 3, torch.cuda.current_stream().cuda_stream))
+
+        def run(arm, rows, phase):
+            stream = torch.cuda.current_stream().cuda_stream
+            if phase.startswith("reduce"):
+                rank = int(phase[-1])
+                first, second = (retained[arm], peer) if rank == 0 else (peer, retained[arm])
+                checked(native.cuteafd_cuda_residual_add_f32_async(first.data_ptr(), second.data_ptr(), reduced.data_ptr(), rows*n, stream))
+                source = reduced
+                if arm in ("k6", "k8"):
+                    call(egress[0], reduced.data_ptr(), svh[0].data_ptr(), final[0].data_ptr(), rows, limit)
+                    source = final[0]
+                checked(native.cuteafd_load_narrow_f32_bf16(source.data_ptr(), outs[arm].data_ptr(), rows*n, props.multi_processor_count, stream))
+            elif arm in ("native", "bf16"):
+                if head:
+                    checked(native.cuteafd_vocabulary_head_launch_tensor_invariant(handle, x.data_ptr(), weight.data_ptr(), outs[arm].data_ptr(), rows, stream))
+                elif op["scaled_index"]:
+                    call(baseline, x.data_ptr(), weight.data_ptr(), outs[arm].data_ptr(), index_scratch.data_ptr(), rows)
+                else:
+                    call(baseline, x.data_ptr(), weight.data_ptr(), (retained[arm] if split else outs[arm]).data_ptr(), rows)
+            elif arm in fp8:
+                values = (x.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(),
+                          (retained[arm] if split else outs[arm]).data_ptr())
+                if arm == "fp8_o":
+                    call(fp8[arm][rows > 64], *values, qscratch.data_ptr(), rows)
+                else:
+                    call(fp8[arm][rows > 64], *values, rows, 255 if rows > 64 else 64, qscratch.data_ptr())
+            else:
+                bits = int(arm[1:])
+                for index, member in enumerate(members):
+                    call(ingress[index], x.data_ptr(), suh[index].data_ptr(), rotated[index].data_ptr(), scales[index].data_ptr(), rows, limit)
+                    call(cores[bits][index], tables[index].data_ptr(), payloads[bits][index].data_ptr(), scales[index].data_ptr(), partial.data_ptr(), raw[index].data_ptr(), rows, 0, limit)
+                    if split:
+                        copy_rows(retained[arm], raw[index], rows, member["n"])
+                    else:
+                        call(egress[index], raw[index].data_ptr(), svh[index].data_ptr(), final[index].data_ptr(), rows, limit)
+
+        live_rows = [r for r in sorted(set([1]+rows_list)) if r <= 64] if head else rows_list
+        for rows in live_rows:
+            for phase in (("producer", "reduce0", "reduce1") if split else ("producer",)):
+                graphs, events = {}, {}
+                for arm in arms:
+                    run(arm, rows, "producer")
+                    run(arm, rows, phase)
+                    targets = ([retained[arm][:rows]] if split and phase == "producer" else
+                               [value[:rows] for value in final] if arm in ("k6", "k8") and not split else [outs[arm][:rows]])
+                    expected = [target.clone() for target in targets]
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run(arm, rows, phase)
+                    for target in targets:
+                        target.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    if any(not torch.equal(target.view(torch.uint8), value.view(torch.uint8)) or not torch.isfinite(target).all().item()
+                           for target, value in zip(targets, expected)):
+                        raise RuntimeError(f"Step-5 {role}/{arm}/{rows}/{phase}: poisoned replay differs")
+                    pairs = [(torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True))
+                             for _ in range(16 if rows <= 64 else 4)]
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        for start, end in pairs:
+                            flush.zero_()
+                            start.record()
+                            run(arm, rows, phase)
+                            end.record()
+                    graphs[arm], events[arm] = graph, pairs
+                    graph.replay()
+                torch.cuda.synchronize()
+                before = thermal_snapshot()
+                samples = {arm: [] for arm in arms}
+                for repeat in range(args.samples):
+                    for arm in (arms if repeat%2 == 0 else tuple(reversed(arms))):
+                        graphs[arm].replay()
+                        events[arm][-1][1].synchronize()
+                        samples[arm].append(statistics.mean(a.elapsed_time(b)*1000 for a, b in events[arm]))
+                times = {arm: statistics.median(values) for arm, values in samples.items()}
+                logical = {arm: (n*k*2 if arm in ("bf16", "native") else
+                           sum(m["stored_n"]*k*int(arm[1:])//8+2*(k+m["stored_n"]) for m in members) if arm in ("k6", "k8") else n*k+fp8_scale.numel()*4)
+                           if phase == "producer" else 2*rows*n*4 for arm in arms}
+                record = dict(role=role, rows=rows, phase=phase, total_call_us=times, samples_us=samples,
+                    logical_bytes=logical, logical_gbs={arm: logical[arm]/(times[arm]*1000) for arm in arms},
+                    replay_exact=True, poisoned_outputs_overwritten=True, thermal_before=before, thermal_after=thermal_snapshot())
+                report["records"].append(record)
+                report["aggregate"] = aggregate_step5_full_core(operations, report["records"], rows_list)
+                print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
+                (args.output_dir/"report.json").write_text(json.dumps(report, indent=2)+"\n")
+        if head:
+            checked(native.cuteafd_v41_markov_destroy(handle))
+        del graphs, events, graph, expected, targets, target, fixtures, weight, x, outs, retained, peer, reduced
+        del raw, final, rotated, suh, scales, svh, tables, payloads, partial, quantized, fp8_scale, qscratch, index_scratch, workspace
+        torch.cuda.empty_cache()
 
 
 def benchmark_muse_full_core(args):
@@ -4041,6 +4511,8 @@ def main():
     parser.add_argument("--kimi-fp8-core", type=Path, help="original Kimi headers; hypothetical full FP8 versus BF16 without rerunning trellis")
     parser.add_argument("--ml4-core", type=Path, help="original ML4 config/header inventory; native FP8/BF16 versus K6 only")
     parser.add_argument("--ml4-scales", type=Path, help="original ML4 block-FP8 scale header audit")
+    parser.add_argument("--step5-core", type=Path, help="authoritative Step-5 BF16 original config/header inventory")
+    parser.add_argument("--csa-rank0-layers", type=int, help="actual admitted contiguous Step-5 CSA count on rank0")
     parser.add_argument("--onboard-layers", type=int, help="actual admitted sparse prefix, required for GLM/ML4 router owner counts")
     parser.add_argument("--native-library", type=Path, help="shipping native DSO plus adjacent COMPILER_PROVENANCE.json")
     parser.add_argument("--fixture-dir", type=Path, help="independently reference-encoded K6/K8 fixture directory")
@@ -4054,6 +4526,16 @@ def main():
         hashes = reference_encoder(args.encoder_source, args.output_dir / "encoder")
         (args.output_dir / "encoder_sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
         return
+    if args.step5_core:
+        if (any((args.kimi_fp8_core, args.ml4_core, args.muse_core, args.glm_core, args.qwen_core,
+                 args.full_core, args.kimi_decision, args.baseline_native)) or
+                args.csa_rank0_layers is None or args.onboard_layers is None):
+            parser.error("--step5-core is separate and requires --csa-rank0-layers and --onboard-layers")
+        if not args.encode_fixtures:
+            if not args.compile_only and (args.fixture_dir is None or args.native_library is None):
+                parser.error("--step5-core measurement requires --fixture-dir and --native-library")
+            benchmark_step5_full_core(args)
+            return
     if args.kimi_fp8_core:
         if (args.ml4_core or args.muse_core or args.glm_core or args.qwen_core or args.full_core
                 or args.kimi_decision or args.encode_fixtures or args.baseline_native):
