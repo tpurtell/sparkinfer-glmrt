@@ -1287,7 +1287,8 @@ def flash_full_core_projection_program(operation, *, prefill=False, fp8=False):
             **(dict(warps=8, groups=2) if role == "kda_in" else {}))
     else:
         launch = glm_projection(n, k, wide=prefill and role == "index_q")
-    operands = [Operand("x", torch.bfloat16, f"[rows,{operation['input_row']}]")]
+    operands = [Operand("a" if kind == "fg" else "x", torch.bfloat16,
+        f"[rows,{operation['input_row']}]")]
     if fp8:
         operands.extend((Operand("w_fp8", torch.float8_e4m3fn, f"[{n},{k}]"),
             Operand("scale", torch.float32, "[native_scales]", align=4)))

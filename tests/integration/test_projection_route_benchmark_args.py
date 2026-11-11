@@ -1536,6 +1536,7 @@ def test_flash_native_factories_match_mhc_routes_fg_pitches_and_fp8_head(monkeyp
     assert calls[-1][2] == dict(n=4096, k=128, batch=2, a_row=12608, a_batch=128,
                                o_row=8192, o_batch=4096, compute_warps=64)
     assert len(program['operands']) == 3 and program['scalars'] == (('rows',),)
+    assert [o[0][0] for o in program['operands']] == ['a', 'w', 'out']
     bench.flash_full_core_projection_program(unique['absorb'])
     assert calls[-1][1][0].heads == 32 and calls[-1][2] == dict(stage='absorb', max_rows=64)
     program = bench.flash_full_core_projection_program(unique['head'], prefill=True, fp8=True)
