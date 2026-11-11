@@ -901,6 +901,77 @@ def kimi_full_core_operations(config):
     ]
 
 
+def qwen_full_core_operations(config, tensors, owners):
+    """Whole-owner target matrices; native packing never joins trellis fixtures."""
+    c = config.get("text_config", config)
+    layers, h = c["num_hidden_layers"], c["hidden_size"]
+    if len(owners) != layers or any(owner not in (0, 1) for owner in owners):
+        raise ValueError("Qwen full-core requires an explicit TP2 layer-owner map")
+    if len(c["layer_types"]) != layers:
+        raise ValueError("Qwen layer types do not cover the target")
+    prefix = "model.language_model."
+    operations = []
+
+    def add(role, names, count, *, fp8=None, padding=0, hypothetical=False):
+        matrices = []
+        for name in names:
+            tensor = tensors[name]
+            if tensor["dtype"] != "BF16" or len(tensor["shape"]) != 2:
+                raise ValueError(f"Qwen original matrix is not BF16: {name}")
+            n, k = tensor["shape"]
+            matrices.append(dict(name=name, k=k, n=n))
+        if len({m["k"] for m in matrices}) != 1:
+            raise ValueError(f"Qwen packed input widths disagree: {role}")
+        operations.append(dict(role=role, members=matrices, count=count,
+            k=matrices[0]["k"], packed_n=sum(m["n"] for m in matrices)+padding,
+            native_padding_rows=padding, fp8_scale_layout=fp8,
+            hypothetical_trellis=hypothetical, whole_layer_owner=True))
+
+    for layer, kind in enumerate(c["layer_types"]):
+        p = f"{prefix}layers.{layer}."
+        count = [int(owners[layer] == rank) for rank in (0, 1)]
+        for site in ("attn", "mlp"):
+            hc = p + site + "_hyper_connection."
+            add(f"layer{layer}.{site}.hc_down_inject", [hc+"input_mix_weight_down.weight",
+                hc+"block_inject_weight.weight"], count)
+            add(f"layer{layer}.{site}.hc_up", [hc+"input_mix_weight_up.weight"], count)
+        if kind == "linear_attention":
+            a = p+"linear_attn."
+            add(f"layer{layer}.gdn_in", [a+n+".weight" for n in
+                ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")], count,
+                fp8="block128x128_f32", hypothetical=True)
+            add(f"layer{layer}.gdn_out", [a+"out_proj.weight"], count,
+                fp8="block128x128_f32", hypothetical=True)
+        elif kind == "full_attention":
+            a = p+"self_attn."
+            add(f"layer{layer}.attn_in", [a+n+".weight" for n in
+                ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")], count,
+                fp8="block128x128_f32", hypothetical=True)
+            add(f"layer{layer}.attn_out", [a+"o_proj.weight"], count,
+                fp8="block128x128_f32", hypothetical=True)
+        else:
+            raise ValueError(f"unsupported Qwen target attention kind: {kind}")
+        m = p+"mlp."
+        add(f"layer{layer}.router", [m+"gate.weight"], count)
+        shared = [m+"shared_expert."+n+"_proj.weight" for n in ("gate", "up")]
+        shared.append(m+"shared_expert_gate.weight")
+        shared_rows = sum(tensors[name]["shape"][0] for name in shared)
+        if shared_rows > 1296:
+            raise ValueError("Qwen native shared operand exceeds 1296 rows")
+        add(f"layer{layer}.shared_in", shared, count, padding=1296-shared_rows,
+            hypothetical=True)
+        add(f"layer{layer}.shared_down", [m+"shared_expert.down_proj.weight"], count,
+            hypothetical=True)
+        if layer in c.get("ple_layer_ids", []):
+            add(f"layer{layer}.ple_kv", [p+"ple."+n+"_proj.weight" for n in ("key", "value")], count)
+    for role, leaf in (("final_hc_down", "down"), ("final_hc_up", "up")):
+        add(role, [prefix+"hyper_connection_mixer.input_mix_weight_"+leaf+".weight"], [1, 0])
+    add("head", ["lm_head.weight"], [1, 0], fp8="row_k128_f32", hypothetical=True)
+    if operations[-1]["k"] != h:
+        raise ValueError("Qwen head input width disagrees with config")
+    return operations
+
+
 def full_core_fixture_shapes(operations):
     """No tensor concatenation: rank q_a and padded kv_a have separate records."""
     shapes = []

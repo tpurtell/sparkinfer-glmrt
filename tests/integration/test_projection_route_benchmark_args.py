@@ -360,6 +360,55 @@ def test_full_core_aggregation_never_sums_concurrent_gpus_and_uses_actual_head_r
             for p in result["prefill"]] == [1,8]
 
 
+def test_qwen_full_core_keeps_whole_owner_counts_and_independent_members():
+    bench = _native_threshold_bench()
+    config = dict(hidden_size=2560, num_hidden_layers=2,
+                  layer_types=["linear_attention", "full_attention"], ple_layer_ids=[0])
+    tensors = {}
+    def tensor(name, n, k):
+        tensors[name] = dict(dtype="BF16", shape=[n, k])
+    for layer in range(2):
+        p = f"model.language_model.layers.{layer}."
+        for site in ("attn", "mlp"):
+            hc = p+site+"_hyper_connection."
+            tensor(hc+"input_mix_weight_down.weight", 320, 10240)
+            tensor(hc+"block_inject_weight.weight", 4, 10240)
+            tensor(hc+"input_mix_weight_up.weight", 10240, 320)
+        names = (("in_proj_qkv", 10240), ("in_proj_z", 6144), ("in_proj_b", 48),
+                 ("in_proj_a", 48)) if layer == 0 else (("q_proj", 12288),
+                 ("k_proj", 512), ("v_proj", 512), ("indexer.index_qk_proj", 640))
+        a = p+("linear_attn." if layer == 0 else "self_attn.")
+        for name, n in names:
+            tensor(a+name+".weight", n, 2560)
+        tensor(a+("out_proj" if layer == 0 else "o_proj")+".weight", 2560, 6144)
+        tensor(p+"mlp.gate.weight", 512, 2560)
+        for name in ("gate", "up"):
+            tensor(p+"mlp.shared_expert."+name+"_proj.weight", 640, 2560)
+        tensor(p+"mlp.shared_expert_gate.weight", 1, 2560)
+        tensor(p+"mlp.shared_expert.down_proj.weight", 2560, 640)
+    for name, n in (("key", 10240), ("value", 2560)):
+        tensor("model.language_model.layers.0.ple."+name+"_proj.weight", n, 2560)
+    tensor("model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", 320, 10240)
+    tensor("model.language_model.hyper_connection_mixer.input_mix_weight_up.weight", 10240, 320)
+    tensor("lm_head.weight", 248320, 2560)
+    operations = bench.qwen_full_core_operations(config, tensors, [0, 1])
+    roles = {op["role"]: op for op in operations}
+    assert roles["layer0.gdn_in"]["packed_n"] == 16480
+    assert [m["n"] for m in roles["layer0.gdn_in"]["members"]] == [10240, 6144, 48, 48]
+    assert roles["layer1.attn_in"]["packed_n"] == 13952
+    assert roles["layer0.shared_in"]["native_padding_rows"] == 15
+    assert roles["layer0.attn.hc_down_inject"]["packed_n"] == 324
+    assert roles["layer0.gdn_out"]["count"] == [1, 0]
+    assert roles["layer1.attn_out"]["count"] == [0, 1]
+    assert roles["head"]["count"] == [1, 0]
+    assert roles["head"]["fp8_scale_layout"] == "row_k128_f32"
+    assert roles["layer0.gdn_in"]["fp8_scale_layout"] == "block128x128_f32"
+    assert roles["layer0.ple_kv"]["fp8_scale_layout"] is None
+    assert len(operations) == 22
+    with pytest.raises(ValueError, match="owner map"):
+        bench.qwen_full_core_operations(config, tensors, [0])
+
+
 def test_full_core_requires_config_before_cuda(monkeypatch,tmp_path):
     monkeypatch.setattr(sys,"argv",["benchmark","--output-dir",str(tmp_path),"--full-core","--kimi-decision"])
     with pytest.raises(SystemExit) as error:
