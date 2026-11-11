@@ -1049,7 +1049,8 @@ def ml4_full_core_operations(config, tensors, scales, *, onboard_layers):
             split="input", trellis=True, dtype="F8_E4M3", reduction=(1, 1),
             boundary="K6 BF16 retained core/add/H128; native FP8 F32 retained partial/add/narrow")
         if c["indexer_types"][layer] == "full":
-            add(prefix+"index_query", [a+"indexer.wq_b.weight"], [(4096, h)], trellis=True, dtype="F8_E4M3")
+            add(prefix+"index_query", [a+"indexer.wq_b.weight"], [(4096, h)], dtype="F8_E4M3",
+                boundary="native FP8 indexer retained in both arms, matching shipping Core-K6")
             add(prefix+"index_kw", [a+"indexer.wk.weight", a+"indexer.weights_proj.weight"], [(128, h), (32, h)])
         shared = layer >= dense
         m = f"layers.{layer}."+("shared_experts." if shared else "feed_forward.")

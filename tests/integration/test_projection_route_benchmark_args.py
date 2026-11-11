@@ -979,10 +979,11 @@ def test_ml4_catalog_covers_original_fp8_bf16_and_exact_latent_owners():
     assert unique["router"]["count"] == [3, 1]
     assert unique["shared_down"]["reduction_count"] == [3, 0]
     assert unique["dense_down"]["reduction_count"] == [1, 1]
-    assert unique["index_query"]["hypothetical_trellis"]
+    assert not unique["index_query"]["hypothetical_trellis"]
+    assert "matching shipping Core-K6" in unique["index_query"]["boundary"]
     assert all(not unique[r]["hypothetical_trellis"] for r in
-               ("index_kw", "router", "absorb_rope", "values_rope", "absorb_nope", "values_nope"))
-    assert len(bench.glm_full_core_fixture_shapes(ops)) == 12
+               ("index_query", "index_kw", "router", "absorb_rope", "values_rope", "absorb_nope", "values_nope"))
+    assert len(bench.glm_full_core_fixture_shapes(ops)) == 11
     covered = {m["name"] for op in ops for m in op["members"]}
     assert covered == set(tensors)-{"tok_embeddings.weight", "layers.1.experts.0.w1.weight"}
     assert unique["kv_rope"]["members"][0]["stored_n"] == 640
