@@ -730,6 +730,29 @@ def test_glm_cli_rejects_incomplete_measurements_before_cuda(monkeypatch, tmp_pa
     assert error.value.code == 2
 
 
+def test_glm_output_checks_skip_per_head_rope_and_cover_all_members():
+    import numpy as np
+
+    bench = _native_threshold_bench()
+    output = np.full((3, 64*576), np.nan, dtype=np.float32)
+    targets = bench.glm_full_core_output_targets("absorb", output, [], rows=2, batch=32, n=512)
+    assert targets[0].shape == (2, 32, 512)
+    targets[0].fill(1)
+    pitched = output.reshape(3, 64, 576)
+    assert np.isfinite(pitched[:2, :32, :512]).all()
+    assert np.isnan(pitched[:2, :32, 512:]).all()
+    assert np.isnan(pitched[:2, 32:]).all()
+    assert np.isnan(pitched[2]).all()
+    finals = [np.zeros((3, 1024)), np.zeros((3, 1024))]
+    targets = bench.glm_full_core_output_targets("shared_in", output, finals, rows=2, batch=1, n=2048)
+    assert len(targets) == 2
+    for target in targets:
+        target.fill(7)
+    assert all(np.equal(value[:2], 7).all() and np.equal(value[2], 0).all() for value in finals)
+    packed = bench.glm_full_core_output_targets("rank_in", output, [], rows=2, batch=1, n=2624)
+    assert packed[0].shape == (2, 64*576)
+
+
 def test_glm_core_catalog_rejects_bad_original_headers_and_ownership():
     bench = _native_threshold_bench()
     config, tensors = _glm_core_headers()

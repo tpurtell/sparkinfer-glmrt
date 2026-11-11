@@ -1386,6 +1386,15 @@ def qwen_full_core_from_headers(path):
     return qwen_full_core_operations(config, tensors, owners)
 
 
+def glm_full_core_output_targets(role, target, finals, *, rows, batch, n):
+    """Only poison written columns, and cover every independent trellis output."""
+    if role == "absorb":
+        return [target.reshape(target.shape[0], 64, 576)[:rows, :batch, :n]]
+    if finals:
+        return [value[:rows] for value in finals]
+    return [target[:rows]]
+
+
 def glm_full_core_from_headers(path, onboard_layers):
     data = json.loads(path.read_text())
     checkpoint = data.get("glm", data)
@@ -2139,16 +2148,21 @@ def benchmark_glm_full_core(args):
                         target = retained if split else (outs[arm] if role == "rank_in" else final[0])
                     else:
                         target = outs["bf16" if arm == "native" or (arm == "fp8" and not fp8) else arm]
-                    # Absorb writes contiguous local latent heads, not the peer's query half.
-                    target = target[:rows, :batch*n]
-                    expected = target.clone()
+                    independent = (final if arm in ("k6", "k8") and members and not split
+                                   and role != "rank_in" and phase == "producer" else [])
+                    targets = glm_full_core_output_targets(role, target, independent,
+                        rows=rows, batch=batch, n=n)
+                    expected = [value.clone() for value in targets]
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
                         run(arm, rows, phase)
-                    target.fill_(float("nan"))
+                    for value in targets:
+                        value.fill_(float("nan"))
                     graph.replay()
                     torch.cuda.synchronize()
-                    if not torch.equal(target.view(torch.uint8), expected.view(torch.uint8)) or not torch.isfinite(target).all().item():
+                    if not all(torch.equal(value.view(torch.uint8), reference.view(torch.uint8))
+                               and torch.isfinite(value).all().item()
+                               for value, reference in zip(targets, expected)):
                         raise RuntimeError(f"GLM {role}/{arm}/{rows}/{phase}: poisoned replay differs")
                     pairs = [(torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True))
                              for _ in range(16 if rows <= 64 else 4)]
