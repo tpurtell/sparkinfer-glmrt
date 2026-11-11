@@ -1518,7 +1518,7 @@ def benchmark_qwen_full_core(args):
         svh = [torch.ones(sn, device="cuda", dtype=torch.float16) for sn in sizes]
         tables = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in rotated]
         payloads = {bits: [f["payload"].cuda() for f in fixtures[bits]] for bits in (6, 8)}
-        partial = torch.empty(129*((k+1023)//1024)*max(sizes, default=128), device="cuda", dtype=torch.float32)
+        partial = torch.empty(capacity*((k+1023)//1024)*max(sizes, default=128), device="cuda", dtype=torch.float32)
         tiny_weight = weight[-tiny_n:].contiguous() if tiny_n else None
         tiny_out = torch.empty(capacity, tiny_n, device="cuda", dtype=torch.bfloat16) if tiny_n else None
         quantized, fp8_scale = None, None
@@ -1627,8 +1627,9 @@ def aggregate_qwen_full_core(operations, records, rows_list):
             kimi_rate_normalized_local_dense_us_per_emitted_token={
                 arm: [v*73/255 for v in values] for arm, values in sums.items()}))
     prefill = []
-    for tokens, histogram, heads in ((8192, {2752: 2, 2688: 1}, 1),
-                                      (65536, {2752: 23, 2240: 1}, 8)):
+    # The Qwen TP2 plan uses 4096-row calls/units, each producing one tail logit.
+    for tokens, histogram, heads in ((8192, {4096: 2}, 2),
+                                      (65536, {4096: 16}, 16)):
         if any((op["role"], row) not in lookup for op in operations
                for row in ([1] if op["role"] == "head" else histogram)):
             continue

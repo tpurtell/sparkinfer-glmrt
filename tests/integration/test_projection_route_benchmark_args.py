@@ -522,14 +522,18 @@ def test_qwen_core_aggregate_separates_owners_and_labels_token_projection():
 def test_qwen_core_aggregate_native_cost_is_charged_once_per_owner():
     bench = _native_threshold_bench()
     ops = [dict(role="native", count=[24, 24]), dict(role="head", count=[1, 0])]
-    records = [dict(role="native", rows=r, total_call_us=dict(native=3)) for r in (2752, 2688)]
+    records = [dict(role="native", rows=4096, total_call_us=dict(native=3))]
     records.append(dict(role="head", rows=1, total_call_us=dict(k6=2, k8=3, bf16=4, fp8=1)))
     result = bench.aggregate_qwen_full_core(ops, records, [1])
     assert result["decode"] == []
     prefill = result["prefill"][0]
     assert prefill["tokens"] == 8192
-    assert prefill["local_dense_us"]["bf16"] == [220, 216]
-    assert prefill["local_dense_us"]["fp8"] == [217, 216]
+    assert prefill["body_row_histogram"] == {4096: 2}
+    assert prefill["head_calls"] == 2
+    assert prefill["local_dense_us"]["bf16"] == [152, 144]
+    assert prefill["local_dense_us"]["fp8"] == [146, 144]
+    assert result["prefill"][1]["body_row_histogram"] == {4096: 16}
+    assert result["prefill"][1]["head_calls"] == 16
 
 
 def test_qwen_measurement_requires_fixture_and_native_library_before_cuda(monkeypatch, tmp_path):
