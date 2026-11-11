@@ -687,6 +687,49 @@ def test_glm_factories_keep_prefill_kmajor_scales_and_context_query_pitch(monkey
         bench.glm_full_core_projection_program(dict(op, role="head"))
 
 
+def test_glm_aggregate_charges_shared_meet_only_on_rank_zero():
+    bench = _native_threshold_bench()
+    ops = [dict(role="shared_down", split="input", count=[3, 3], reduction_count=[3, 0]),
+           dict(role="head", split="whole", count=[1, 0], reduction_count=[0, 0]),
+           dict(role="router", split="whole", count=[3, 1], reduction_count=[0, 0])]
+    records = []
+    for row in (1, 2, 2240, 2688, 2752):
+        records.extend([
+            dict(role="shared_down", rows=row, phase="producer", total_call_us=dict(bf16=1, fp8=2, k6=3, k8=4)),
+            dict(role="shared_down", rows=row, phase="reduce0", total_call_us=dict(k6=5, k8=6)),
+            dict(role="shared_down", rows=row, phase="reduce1", total_call_us=dict(k6=7, k8=8)),
+            dict(role="router", rows=row, phase="producer", total_call_us=dict(native=10)),
+            dict(role="head", rows=row, phase="producer", total_call_us=dict(bf16=11, fp8=11, k6=12, k8=13))])
+    result = bench.aggregate_glm_full_core(ops, records, [2, 64])
+    assert len(result["decode"]) == 1
+    decode = result["decode"][0]
+    assert decode["local_dense_us_per_verify_step"] == dict(bf16=[44, 13], fp8=[47, 16], k6=[66, 19], k8=[73, 22])
+    assert decode["kimi_rate_normalized_local_dense_us_per_emitted_token"]["k6"] == [66*73/255, 19*73/255]
+    assert [r["local_dense_us"]["k6"] for r in result["prefill"]] == [[174, 57], [1392, 456]]
+    assert "fused" in result["scope"] and "not measured GLM" in result["normalization"]
+
+
+def test_glm_header_fixture_selection_uses_explicit_onboard_prefix(tmp_path):
+    import json
+    bench = _native_threshold_bench()
+    config, tensors = _glm_core_headers()
+    path = tmp_path / "headers.json"
+    path.write_text(json.dumps(dict(glm=dict(config=config, tensors=tensors))))
+    ops = bench.glm_full_core_from_headers(path, 1)
+    assert len(bench.glm_full_core_fixture_shapes(ops)) == 11
+    assert sum(o["count"][1] for o in ops if o["role"].endswith("router")) == 1
+
+
+@pytest.mark.parametrize("extra", [[], ["--onboard-layers", "9"],
+                                   ["--onboard-layers", "9", "--qwen-core", "headers.json"]])
+def test_glm_cli_rejects_incomplete_measurements_before_cuda(monkeypatch, tmp_path, extra):
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path),
+                                     "--glm-core", "headers.json", *extra])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
+
+
 def test_glm_core_catalog_rejects_bad_original_headers_and_ownership():
     bench = _native_threshold_bench()
     config, tensors = _glm_core_headers()
