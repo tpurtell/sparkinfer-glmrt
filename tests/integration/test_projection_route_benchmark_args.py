@@ -845,6 +845,46 @@ def test_muse_fp8_specs_keep_selectable_attention_separate_from_mixed_full_core(
                 bench.muse_full_core_projection_spec(op, fp8=True, shipping=True)
 
 
+def test_muse_factories_match_underlying_abi_and_preserve_f32_prefill(monkeypatch):
+    bench = _native_threshold_bench()
+    calls = []
+
+    class Projection:
+        def __init__(self, n, k, **kwargs):
+            calls.append((n, k, kwargs))
+
+        def key(self):
+            return ("projection",)
+
+    monkeypatch.setitem(sys.modules, "cutlass", SimpleNamespace(Float32="f32", BFloat16="bf16"))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(float32="f32", bfloat16="bf16", uint8="u8"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._common", SimpleNamespace(
+        Operand=lambda *a, **kw: (a, kw), Scalar=lambda *a: a,
+        compile_program=lambda launch, **kwargs: kwargs))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._fp8_weights", SimpleNamespace(Fp8Projection=Projection))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.muse", SimpleNamespace(compile_router_aot=lambda: "router"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.pointwise", SimpleNamespace(
+        compile_bf16_projection_aot=lambda **kw: ("gate", kw)))
+    monkeypatch.setitem(sys.modules, "b12x.gemm.bf16_gemv._skinny", SimpleNamespace(
+        DECODE_TMA_TILES={(8192, 4096): ("measured",)}, TmaBf16Projection=Projection))
+    config, tensors = _muse_core_headers()
+    ops = {o["role"]: o for o in bench.glm_full_core_unique_operations(bench.muse_full_core_operations(config, tensors))}
+    for role, w8a8 in (("attn_q", True), ("attn_o", False), ("head", False)):
+        program = bench.muse_full_core_projection_program(ops[role], prefill=True, fp8=True)
+        assert calls[-1][2]["prefill_mask"] == (255 if w8a8 else 0)
+        assert calls[-1][2]["out_dtype"] == ("bf16" if w8a8 else "f32")
+        assert calls[-1][2]["prefill_rows"] == 4096
+        assert [operand[0][0] for operand in program["operands"]] == ["x", "w_fp8", "scale", "out"]
+        assert program["scalars"] == (("rows",), ("fp8_rows",), ("qscratch", "int64"))
+        hash(program["key"])
+    bench.muse_full_core_projection_program(ops["attn_o"], prefill=True, fp8=True, shipping=True)
+    assert calls[-1][2]["prefill_rows"] is None and calls[-1][2]["decode_rows"] == 64
+    bench.muse_full_core_projection_program(ops["attn_o"])
+    assert calls[-1][2] == dict(out_dtype="f32", tiles_by_rows=("measured",))
+    assert bench.muse_full_core_projection_program(ops["attn_gate"])[0] == "gate"
+    assert bench.muse_full_core_projection_program(ops["router"]) == "router"
+
+
 def test_muse_aggregate_includes_all_format_meets_and_f32_fp8_ceiling():
     bench = _native_threshold_bench()
     ops = [dict(role="attn_o", split="input", hypothetical_trellis=True, shipping_fp8_attention=True,

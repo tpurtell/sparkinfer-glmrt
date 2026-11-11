@@ -1066,7 +1066,17 @@ def muse_full_core_projection_program(operation, *, prefill=False, fp8=False, sh
         return compile_router_aot()
     output = torch.float32 if spec["output"] == "f32" else torch.bfloat16
     if not fp8:
-        return compile_bf16_projection_aot(width=k, outputs=n, output_dtype=output)
+        if spec["role"] == "attn_gate":
+            return compile_bf16_projection_aot(width=k, outputs=n, output_dtype=output)
+        from b12x.gemm.bf16_gemv._skinny import DECODE_TMA_TILES, TmaBf16Projection
+        native_shapes = {(8192, 8192), (8192, 4096)}
+        tiles = DECODE_TMA_TILES.get((n, k), ()) if (n, k) in native_shapes else ((16, 1, 4, 16, 64, 6),)
+        launch = TmaBf16Projection(n, k, out_dtype=cutlass.Float32 if spec["output"] == "f32" else cutlass.BFloat16,
+                                  tiles_by_rows=tiles)
+        return compile_program(launch, name="muse_bf16_member", operands=(
+            Operand("x", torch.bfloat16, f"[rows,{k}]"), Operand("w", torch.bfloat16, f"[{n},{k}]"),
+            Operand("out", output, f"[rows,{n}]", "out")), scalars=(Scalar("rows"),),
+            key=(spec["output"], launch.key()), geometry=spec)
     dtype = cutlass.Float32 if spec["output"] == "f32" else cutlass.BFloat16
     n = (n+127)//128*128
     launch = Fp8Projection(n, k, prefill_rows=4096 if prefill and not shipping else None,
@@ -1074,8 +1084,8 @@ def muse_full_core_projection_program(operation, *, prefill=False, fp8=False, sh
                           out_dtype=dtype, decode_rows=64)
     return compile_program(launch, name="muse_fp8_member", operands=(
         Operand("x", torch.bfloat16, f"[rows,{k}]"),
-        Operand("weight", torch.uint8, f"[{n},{k}]"),
-        Operand("scales", torch.float32, f"[{(n+127)//128},{k//128}]", align=4),
+        Operand("w_fp8", torch.uint8, f"[{n},{k}]"),
+        Operand("scale", torch.float32, f"[{(n+127)//128},{k//128}]", align=4),
         Operand("out", output, f"[rows,{n}]", "out")),
         scalars=(Scalar("rows"), Scalar("fp8_rows"), Scalar("qscratch", "int64")),
         key=(tuple(sorted(spec.items())), prefill, launch.key()), geometry=spec)
@@ -2141,6 +2151,7 @@ def benchmark_muse_full_core(args):
         signatures = {
             "cuteafd_load_narrow_f32_bf16": [C.c_void_p, C.c_void_p, C.c_int64, C.c_int32, C.c_void_p],
             "cuteafd_cuda_residual_add_f32_async": [C.c_void_p]*3+[C.c_size_t, C.c_void_p],
+            "cuteafd_fp8_block_quant": [C.c_void_p]*3+[C.c_int32, C.c_int32, C.c_void_p],
             "cuteafd_vocabulary_head_create_vocab": [C.c_void_p, C.c_uint64]+[C.c_int32]*4+[C.POINTER(C.c_void_p)],
             "cuteafd_vocabulary_head_launch_tensor_invariant": [C.c_void_p]*4+[C.c_int32, C.c_void_p],
             "cuteafd_v41_markov_destroy": [C.c_void_p],
@@ -2253,8 +2264,14 @@ def benchmark_muse_full_core(args):
         table = torch.tensor([rotated.data_ptr()], device="cuda", dtype=torch.int64) if trellis else None
         payloads = {bits: fixtures[bits]["payload"].cuda() for bits in fixtures}
         partial = torch.empty(capacity*((k+1023)//1024)*sn, device="cuda", dtype=torch.float32) if trellis else None
-        quantized = weight.to(torch.float8_e4m3fn) if fp8 else None
-        fp8_scale = torch.ones(sn//128, k//128, device="cuda", dtype=torch.float32) if fp8 else None
+        quantized = torch.empty(sn, k, device="cuda", dtype=torch.float8_e4m3fn) if fp8 else None
+        fp8_scale = torch.empty(sn//128, k//128, device="cuda", dtype=torch.float32) if fp8 else None
+        if fp8:
+            checked(native.cuteafd_fp8_block_quant(weight.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(),
+                                                  sn, k, torch.cuda.current_stream().cuda_stream))
+            torch.cuda.synchronize()
+            if not torch.isfinite(fp8_scale).all().item() or not (fp8_scale > 0).all().item():
+                raise ValueError("Muse native block-FP8 conversion produced invalid scales")
         qscratch = torch.empty(quant_scratch_bytes(k, capacity), device="cuda", dtype=torch.uint8) if fp8 else None
         handle, workspace = C.c_void_p(), None
         if head:
@@ -2300,7 +2317,8 @@ def benchmark_muse_full_core(args):
                     copy_rows(retained[arm], raw, rows, n)
                 else:
                     call(egress, raw.data_ptr(), svh.data_ptr(), final.data_ptr(), rows, limit)
-                    copy_rows(outs[arm], final, rows, n) if head else None
+                    if head:
+                        copy_rows(outs[arm], final, rows, n)
 
         live_rows = [r for r in sorted(set([1]+rows_list)) if r <= 64] if head else rows_list
         for rows in live_rows:
