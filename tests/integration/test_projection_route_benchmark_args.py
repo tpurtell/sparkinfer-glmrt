@@ -648,6 +648,45 @@ def test_glm_prefill_uses_actual_span_and_final_tail():
         bench.glm_full_core_prefill_schedule(1024)
 
 
+def test_glm_factories_keep_prefill_kmajor_scales_and_context_query_pitch(monkeypatch):
+    from dataclasses import make_dataclass
+    bench = _native_threshold_bench()
+    geometry = make_dataclass("Geometry", ["heads", "kv_lora_rank", "qk_rope_dim"])(64, 512, 64)
+    calls = []
+    class Launch:
+        def key(self):
+            return ("native_glm",)
+    def projection(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Launch()
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16", float32="f32", float8_e4m3fn="fp8"))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._common", SimpleNamespace(
+        GLM53=geometry, Operand=lambda *a, **kw: (a, kw), Scalar=lambda *a: a,
+        compile_program=lambda launch, **kwargs: kwargs))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._glm_kernels", SimpleNamespace(glm_projection=projection))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.glm_attention", SimpleNamespace(
+        _w8_projection=projection, compile_glm_attention_stage_aot=lambda *a, **kw: (a, kw)))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.glm_ffn", SimpleNamespace(
+        compile_glm_router_scores_aot=lambda: "router_decode",
+        compile_glm_prefill_router_scores_aot=lambda: "router_prefill"))
+    op = dict(role="rank_in", k=6144, packed_n=2624, batch=1,
+              fp8_scale_layout="block128x128_f32_decode_kmajor_row_k128_f32_prefill")
+    result = bench.glm_full_core_projection_program(op, prefill=True, fp8=True)
+    assert calls[-1] == ((2624, 6144, 4096), dict(row_scales=True))
+    assert result["operands"][2][0][2] == "[48,2624]"
+    assert result["scalars"] == (("rows",), ("fp8_rows",), ("qscratch", "int64"))
+    result = bench.glm_full_core_projection_program(op, fp8=True)
+    assert result["operands"][2][0][2] == "[21,48]"
+    result = bench.glm_full_core_projection_program(dict(op, role="absorb", batch=32), prefill=True, fp8=True)
+    assert result[0][0].heads == 32
+    assert result[1] == dict(stage="absorb", max_rows=4096, fp8_only="prefill", query_row=64*576)
+    result = bench.glm_full_core_projection_program(dict(op, role="values", batch=32))
+    assert result[1]["query_row"] is None and result[1]["fp8_only"] is None
+    assert bench.glm_full_core_projection_program(dict(op, role="router"), prefill=True) == "router_prefill"
+    with pytest.raises(ValueError, match="native DSO"):
+        bench.glm_full_core_projection_program(dict(op, role="head"))
+
+
 def test_glm_core_catalog_rejects_bad_original_headers_and_ownership():
     bench = _native_threshold_bench()
     config, tensors = _glm_core_headers()

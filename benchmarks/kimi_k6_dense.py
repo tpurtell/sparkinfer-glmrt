@@ -1106,6 +1106,47 @@ def glm_full_core_prefill_schedule(tokens, *, span=8256, unit=2752):
     return dict(body_row_histogram=histogram, head_calls=heads, head_rows=1)
 
 
+def glm_full_core_projection_program(operation, *, prefill=False, fp8=False):
+    """Use GLM's own packed linears and per-head UK/UV primitive exports."""
+    import torch
+    from dataclasses import replace
+    from b12x.integration.cuteafd._common import GLM53, Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._glm_kernels import glm_projection
+    from b12x.integration.cuteafd.glm_attention import compile_glm_attention_stage_aot, _w8_projection
+    from b12x.integration.cuteafd.glm_ffn import compile_glm_router_scores_aot, compile_glm_prefill_router_scores_aot
+
+    role = re.sub(r"^layer\d+\.", "", operation["role"])
+    n, k = operation["packed_n"], operation["k"]
+    if role == "head":
+        raise ValueError("GLM BF16 head uses the shipping native DSO")
+    if role == "router":
+        return (compile_glm_prefill_router_scores_aot if prefill else compile_glm_router_scores_aot)()
+    if role in ("absorb", "values"):
+        return compile_glm_attention_stage_aot(replace(GLM53, heads=operation["batch"]),
+            stage=role, max_rows=4096 if prefill else 64,
+            fp8_only=("prefill" if prefill else "decode") if fp8 else None,
+            query_row=GLM53.heads*(GLM53.kv_lora_rank+GLM53.qk_rope_dim) if role == "absorb" else None)
+    if fp8 and not operation["fp8_scale_layout"]:
+        raise ValueError("GLM retained native operation has no FP8 arm")
+    operands = [Operand("x", torch.bfloat16, f"[rows,{k}]")]
+    scalars = [Scalar("rows")]
+    if fp8:
+        row = role == "rank_in" and prefill
+        launch = _w8_projection(n, k, 4096 if prefill else None, row_scales=role == "rank_in")
+        scales = f"[{k//128},{n}]" if row else f"[{(n+127)//128},{k//128}]"
+        operands.extend((Operand("w_fp8", torch.float8_e4m3fn, f"[{n},{k}]"),
+                         Operand("scale", torch.float32, scales, align=4)))
+        scalars.extend((Scalar("fp8_rows"), Scalar("qscratch", "int64")))
+    else:
+        launch = glm_projection(n, k)
+        operands.append(Operand("w", torch.bfloat16, f"[{n},{k}]"))
+    operands.append(Operand("out", torch.bfloat16, f"[rows,{n}]", "out"))
+    return compile_program(launch, name="glm_dense_member", operands=tuple(operands),
+        scalars=tuple(scalars), key=(role, prefill, fp8, launch.key()),
+        geometry=dict(role=role, n=n, k=k, prefill=prefill, fp8=fp8,
+                      fp8_prefill_w8a8=True, fp8_scale_layout=operation["fp8_scale_layout"]))
+
+
 def qwen_full_core_projection_spec(operation, *, prefill=False):
     """Describe the shipping projection route without importing CUDA libraries."""
     role = operation["role"].split(".", 1)[-1] if operation["role"].startswith("layer") else operation["role"]
