@@ -979,6 +979,87 @@ def qwen_full_core_operations(config, tensors, owners):
     return operations
 
 
+def glm_full_core_operations(config, tensors, *, onboard_layers):
+    """GLM 5.3 TP2 context keeps head-split projections on both ranks."""
+    c = config.get("text_config", config)
+    h, layers, heads = c["hidden_size"], c["num_hidden_layers"], c["num_attention_heads"]
+    q, latent = c["q_lora_rank"], c["kv_lora_rank"]
+    nope, rope, value = c["qk_nope_head_dim"], c["qk_rope_head_dim"], c["v_head_dim"]
+    dense = c["first_k_dense_replace"]
+    indexers = c["indexer_types"][:layers]
+    if ((h, heads, q, latent, nope, rope, value) != (6144, 64, 2048, 512, 192, 64, 256)
+            or len(indexers) != layers or not 0 <= onboard_layers <= layers-dense
+            or any(kind not in ("full", "shared") for kind in indexers)):
+        raise ValueError("GLM full-core needs the qualified TP2 geometry and onboarded prefix")
+    operations = []
+
+    def add(role, names, *, split="whole", trellis=False, fp8=None, count=(1, 1),
+            reduction_count=(0, 0), batch=1, n=None, k=None, boundary="local"):
+        members = []
+        for name in names:
+            tensor = tensors[name]
+            if tensor["dtype"] != "BF16" or len(tensor["shape"]) != 2:
+                raise ValueError(f"GLM original matrix is not BF16: {name}")
+            source_n, source_k = tensor["shape"]
+            if (split == "output" and source_n % 2) or (split == "input" and source_k % 2):
+                raise ValueError(f"GLM TP2 matrix cannot be split evenly: {name}")
+            local_n = source_n // (2 if split == "output" else 1)
+            local_k = source_k // (2 if split == "input" else 1)
+            members.append(dict(name=name, source_shape=[source_n, source_k],
+                n=local_n, k=local_k, stored_n=(local_n+127)//128*128 if trellis else local_n,
+                hypothetical_trellis=trellis, split=split))
+        if len({m["k"] for m in members}) != 1:
+            raise ValueError(f"GLM packed input widths disagree: {role}")
+        operations.append(dict(role=role, members=members, count=list(count),
+            k=k if k is not None else members[0]["k"],
+            packed_n=n if n is not None else sum(m["n"] for m in members),
+            batch=batch, split=split, hypothetical_trellis=trellis,
+            fp8_scale_layout=fp8, reduction_count=list(reduction_count), boundary=boundary,
+            prefill_w8a8=True, output="f32" if role.endswith("router") or role == "head" else "bf16"))
+
+    for layer in range(layers):
+        p = f"model.layers.{layer}."
+        a = p+"self_attn."
+        add(f"layer{layer}.rank_in", [a+"q_a_proj.weight", a+"kv_a_proj_with_mqa.weight"],
+            trellis=True, fp8="block128x128_f32_decode_kmajor_row_k128_f32_prefill",
+            boundary="independent H128 outputs, crop padded kv_a640 to576, pack q_a2048|kv_a576")
+        add(f"layer{layer}.query_up", [a+"q_b_proj.weight"], split="output",
+            trellis=True, fp8="block128x128_f32")
+        add(f"layer{layer}.absorb", [a+"kv_b_proj.weight"], batch=heads//2, n=latent, k=nope,
+            fp8="per_head_row_k64_f32", boundary="UK transpose per head, query pitch spans both ranks")
+        add(f"layer{layer}.values", [a+"kv_b_proj.weight"], batch=heads//2, n=value, k=latent,
+            fp8="per_head_row_k64_f32", boundary="UV per head")
+        add(f"layer{layer}.attn_out", [a+"o_proj.weight"], split="input", trellis=True,
+            fp8="block128x128_f32", reduction_count=(1, 1),
+            boundary="retain BF16 core partial; rank-ordered add then one full H128/svh egress per rank")
+        if indexers[layer] == "full":
+            add(f"layer{layer}.index_query", [a+"indexer.wq_b.weight"], fp8="block128x128_f32")
+            add(f"layer{layer}.index_kw", [a+"indexer.wk.weight", a+"indexer.weights_proj.weight"],
+                boundary="retained native BF16 packed wk128|weights32 in every arm")
+        shared = layer >= dense
+        m = p+("mlp.shared_experts." if shared else "mlp.")
+        prefix = "shared" if shared else "dense"
+        add(f"layer{layer}.{prefix}_in", [m+"gate_proj.weight", m+"up_proj.weight"],
+            split="output", trellis=True, fp8="block128x128_f32",
+            boundary="independently calibrated gate/up, separate BF16 outputs before SwiGLU")
+        add(f"layer{layer}.{prefix}_down", [m+"down_proj.weight"], split="input", trellis=True,
+            fp8="block128x128_f32", reduction_count=(1, 0) if shared else (1, 1),
+            boundary="retain BF16 core partial; rank-ordered add and one full H128/svh egress; shared only rank0")
+        if shared:
+            # Local TP2 experts independently route on both ranks; remote layers route on rank 0.
+            add(f"layer{layer}.router", [p+"mlp.gate.weight"], count=(1, int(layer < dense+onboard_layers)))
+    add("head", ["lm_head.weight"], trellis=True, count=(1, 0), boundary="F32 logits, native head capacity64")
+    if operations[-1]["k"] != h:
+        raise ValueError("GLM head input width disagrees with config")
+    for op in operations:
+        for member in op["members"]:
+            if op["role"].endswith("absorb") or op["role"].endswith("values"):
+                expected = [heads*(nope+value), latent]
+                if member["source_shape"] != expected:
+                    raise ValueError(f"GLM kv_b source geometry differs: {member['name']}")
+    return operations
+
+
 def qwen_full_core_projection_spec(operation, *, prefill=False):
     """Describe the shipping projection route without importing CUDA libraries."""
     role = operation["role"].split(".", 1)[-1] if operation["role"].startswith("layer") else operation["role"]

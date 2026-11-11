@@ -564,6 +564,75 @@ def test_qwen_memory_replaces_one_arena_and_tail_without_double_charging():
         bench.qwen_full_core_memory_forecast(ops, plan)
 
 
+def _glm_core_headers():
+    config = dict(hidden_size=6144, num_hidden_layers=4, num_attention_heads=64,
+        q_lora_rank=2048, kv_lora_rank=512, qk_nope_head_dim=192,
+        qk_rope_head_dim=64, v_head_dim=256, first_k_dense_replace=1,
+        indexer_types=["full", "shared", "full", "shared"])
+    tensors = {"lm_head.weight": dict(dtype="BF16", shape=[154880, 6144])}
+    for layer in range(5):
+        p = f"model.layers.{layer}."
+        for name, shape in {
+            "q_a_proj": [2048, 6144], "kv_a_proj_with_mqa": [576, 6144],
+            "q_b_proj": [16384, 2048], "kv_b_proj": [28672, 512],
+            "o_proj": [6144, 16384], "indexer.wq_b": [4096, 2048],
+            "indexer.wk": [128, 6144], "indexer.weights_proj": [32, 6144],
+        }.items():
+            tensors[p+"self_attn."+name+".weight"] = dict(dtype="BF16", shape=shape)
+        m = p+("mlp.shared_experts." if layer else "mlp.")
+        inter = 2048 if layer else 12288
+        for name in ("gate", "up"):
+            tensors[m+name+"_proj.weight"] = dict(dtype="BF16", shape=[inter, 6144])
+        tensors[m+"down_proj.weight"] = dict(dtype="BF16", shape=[6144, inter])
+        tensors[p+"mlp.gate.weight"] = dict(dtype="BF16", shape=[256, 6144])
+    return config, tensors
+
+
+def test_glm_context_core_keeps_head_shares_and_independent_rank_members():
+    bench = _native_threshold_bench()
+    config, tensors = _glm_core_headers()
+    operations = bench.glm_full_core_operations(config, tensors, onboard_layers=1)
+    roles = {op["role"]: op for op in operations}
+    assert roles["layer0.rank_in"]["packed_n"] == 2624
+    assert [(m["n"], m["stored_n"]) for m in roles["layer0.rank_in"]["members"]] == [(2048, 2048), (576, 640)]
+    assert roles["layer0.query_up"]["packed_n"] == 8192
+    assert roles["layer0.attn_out"]["k"] == 8192
+    assert roles["layer0.attn_out"]["reduction_count"] == [1, 1]
+    assert roles["layer0.dense_in"]["packed_n"] == 12288
+    assert [m["n"] for m in roles["layer0.dense_in"]["members"]] == [6144, 6144]
+    assert roles["layer1.shared_in"]["packed_n"] == 2048
+    assert roles["layer1.shared_down"]["k"] == 1024
+    assert roles["layer1.shared_down"]["reduction_count"] == [1, 0]
+    assert roles["layer0.absorb"]["batch"] == 32
+    assert (roles["layer0.absorb"]["packed_n"], roles["layer0.absorb"]["k"]) == (512, 192)
+    assert (roles["layer0.values"]["packed_n"], roles["layer0.values"]["k"]) == (256, 512)
+    assert roles["layer0.index_kw"]["packed_n"] == 160
+    assert not roles["layer0.index_query"]["hypothetical_trellis"]
+    assert roles["layer0.index_query"]["fp8_scale_layout"] == "block128x128_f32"
+    assert roles["layer1.router"]["count"] == [1, 1]
+    assert roles["layer2.router"]["count"] == [1, 0]
+    assert roles["head"]["count"] == [1, 0]
+    assert roles["head"]["output"] == "f32"
+    assert not any(role.startswith("layer4.") for role in roles)
+    assert "layer1.index_query" not in roles
+    assert all(op["prefill_w8a8"] for op in operations)
+    assert all(op["count"] == [1, 1] for op in operations if not op["role"].endswith("router") and op["role"] != "head")
+
+
+def test_glm_core_catalog_rejects_bad_original_headers_and_ownership():
+    bench = _native_threshold_bench()
+    config, tensors = _glm_core_headers()
+    with pytest.raises(ValueError, match="onboarded prefix"):
+        bench.glm_full_core_operations(config, tensors, onboard_layers=4)
+    tensors["model.layers.0.self_attn.q_a_proj.weight"]["dtype"] = "F8_E4M3"
+    with pytest.raises(ValueError, match="original matrix is not BF16"):
+        bench.glm_full_core_operations(config, tensors, onboard_layers=0)
+    tensors["model.layers.0.self_attn.q_a_proj.weight"]["dtype"] = "BF16"
+    tensors["model.layers.0.self_attn.kv_b_proj.weight"]["shape"] = [28671, 512]
+    with pytest.raises(ValueError, match="kv_b source geometry differs"):
+        bench.glm_full_core_operations(config, tensors, onboard_layers=0)
+
+
 def test_qwen_measurement_requires_fixture_and_native_library_before_cuda(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path),
                                      "--qwen-core", str(tmp_path/"headers.json")])
