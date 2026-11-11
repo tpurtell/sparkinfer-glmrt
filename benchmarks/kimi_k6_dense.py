@@ -972,6 +972,26 @@ def qwen_full_core_operations(config, tensors, owners):
     return operations
 
 
+def qwen_full_core_fixture_shapes(operations):
+    """Hypothetical core members stay independent; tiny gates remain native."""
+    shapes = {}
+    for operation in operations:
+        if not operation["hypothetical_trellis"]:
+            continue
+        for member in operation["members"]:
+            if member["n"] < 128:
+                continue
+            k, n = member["k"], member["n"]
+            if k % 128:
+                raise ValueError("Qwen hypothetical trellis member needs K128 storage")
+            stem = member["name"].split(".layers.", 1)[-1]
+            stem = re.sub(r"^\d+\.", "", stem)
+            key = stem, k, n
+            shapes.setdefault(key, dict(role=stem, k=k, n=((n+127)//128)*128,
+                                        logical_n=n, side=1, source_tensor=member["name"]))
+    return list(shapes.values())
+
+
 def full_core_fixture_shapes(operations):
     """No tensor concatenation: rank q_a and padded kv_a have separate records."""
     shapes = []

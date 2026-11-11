@@ -405,6 +405,18 @@ def test_qwen_full_core_keeps_whole_owner_counts_and_independent_members():
     assert roles["layer0.gdn_in"]["fp8_scale_layout"] == "block128x128_f32"
     assert roles["layer0.ple_kv"]["fp8_scale_layout"] is None
     assert len(operations) == 22
+    shapes = bench.qwen_full_core_fixture_shapes(operations)
+    assert {s["role"] for s in shapes} == {
+        "linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight",
+        "linear_attn.out_proj.weight", "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+        "self_attn.indexer.index_qk_proj.weight", "self_attn.o_proj.weight",
+        "mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.up_proj.weight",
+        "mlp.shared_expert.down_proj.weight", "lm_head.weight",
+    }
+    assert next(s for s in shapes if "index_qk" in s["role"])["n"] == 640
+    assert not any("in_proj_a" in s["role"] or "shared_expert_gate" in s["role"] for s in shapes)
+    assert all(s["side"] == 1 for s in shapes)
     with pytest.raises(ValueError, match="owner map"):
         bench.qwen_full_core_operations(config, tensors, [0])
 
