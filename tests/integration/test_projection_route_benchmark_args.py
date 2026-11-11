@@ -363,7 +363,7 @@ def test_full_core_aggregation_never_sums_concurrent_gpus_and_uses_actual_head_r
 def test_qwen_full_core_keeps_whole_owner_counts_and_independent_members():
     bench = _native_threshold_bench()
     config = dict(hidden_size=2560, num_hidden_layers=2,
-                  layer_types=["linear_attention", "full_attention"], ple_layer_ids=[0])
+                  layer_types=["linear_attention", "full_attention"], ple_layer_ids=[1])
     tensors = {}
     def tensor(name, n, k):
         tensors[name] = dict(dtype="BF16", shape=[n, k])

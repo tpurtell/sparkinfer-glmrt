@@ -962,7 +962,7 @@ def qwen_full_core_operations(config, tensors, owners):
             hypothetical=True)
         add(f"layer{layer}.shared_down", [m+"shared_expert.down_proj.weight"], count,
             hypothetical=True)
-        if layer in c.get("ple_layer_ids", []):
+        if layer + 1 in c.get("ple_layer_ids", []):
             add(f"layer{layer}.ple_kv", [p+"ple."+n+"_proj.weight" for n in ("key", "value")], count)
     for role, leaf in (("final_hc_down", "down"), ("final_hc_up", "up")):
         add(role, [prefix+"hyper_connection_mixer.input_mix_weight_"+leaf+".weight"], [1, 0])
