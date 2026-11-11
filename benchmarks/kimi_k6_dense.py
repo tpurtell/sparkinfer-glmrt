@@ -1374,6 +1374,75 @@ def aggregate_kimi_full_core(operations, records, accounting, rows_list):
         scope="per-GPU local launch sums, not summed-across-GPU latency; communication and nondense work excluded")
 
 
+def qwen_full_core_memory_forecast(operations, shipping_plan):
+    """Replace target-arena views only; all other measured plan owners stay fixed."""
+    def aligned(size):
+        return (size + 255) // 256 * 256
+
+    def extents(op, arm):
+        k, n = op["k"], op["packed_n"]
+        if arm == "fp8" and op["fp8_scale_layout"]:
+            scale_rows = n if op["fp8_scale_layout"] == "row_k128_f32" else (n + 127) // 128
+            return [n*k, scale_rows*(k//128)*4]
+        if arm in ("k6", "k8") and op["hypothetical_trellis"]:
+            bits = int(arm[1:])
+            sizes = []
+            retained = op["native_padding_rows"]
+            for member in op["members"]:
+                if member["hypothetical_trellis"]:
+                    sn = (member["n"] + 127) // 128 * 128
+                    sizes.extend((sn*k*bits//8, 2*k, 2*sn))
+                else:
+                    retained += member["n"]
+            if retained:
+                sizes.append(2*k*retained)
+            return sizes
+        return [2*n*k]
+
+    if shipping_plan["family"] != "qwen4" or not shipping_plan["fits"]:
+        raise ValueError("Qwen memory forecast requires the successful shipping plan")
+    base = []
+    for gpu in (0, 1):
+        devices = [d for d in shipping_plan["memory_layout"]["devices"]
+                   if d["kind"] == "rtx" and d["index"] == gpu]
+        if len(devices) != 1:
+            raise ValueError("Qwen memory forecast needs exactly two RTX owners")
+        items = devices[0]["items"]
+        arenas = [i["bytes"] for i in items if i["category"] == "weights" and i["group"] == "weight arena"]
+        tails = [i["bytes"] for i in items if i["category"] == "weights" and
+                 f"qwen4/target/rank{gpu}.tail" in i.get("format", "")]
+        if len(arenas) != 1 or len(tails) != 1:
+            raise ValueError("Qwen memory forecast needs one target arena and one allocation tail per GPU")
+        size = arenas[0]
+        tail = ((size + (2 << 20) - 1) // (2 << 20)) * (2 << 20) - size
+        if tails[0] != tail:
+            raise ValueError("Qwen shipping allocation-tail policy differs")
+        base.append(dict(arena_bytes=size, allocation_tail_bytes=tail,
+                         charged_bytes=size+tail))
+    baseline = [sum(sum(map(aligned, extents(op, "fp8" if op["role"] == "head" else "bf16")))*op["count"][gpu]
+                    for op in operations) for gpu in (0, 1)]
+    arms = {}
+    for arm in ("bf16", "fp8", "k6", "k8"):
+        owners = []
+        for gpu in (0, 1):
+            replacement = sum(sum(map(aligned, extents(op, arm)))*op["count"][gpu] for op in operations)
+            delta = replacement - baseline[gpu]
+            size = base[gpu]["arena_bytes"] + delta
+            if size <= 0:
+                raise ValueError("Qwen target arena replacement underflow")
+            tail = ((size + (2 << 20) - 1) // (2 << 20)) * (2 << 20) - size
+            owners.append(dict(arena_bytes=size, allocation_tail_bytes=tail,
+                charged_bytes=size+tail, arena_delta_bytes=delta,
+                charged_delta_bytes=size+tail-base[gpu]["charged_bytes"],
+                replaced_matrix_aligned_bytes=replacement))
+        arms[arm] = owners
+    return dict(shipping_target_arenas=base, shipping_matrix_aligned_bytes=baseline, arms=arms,
+        scope="Target arena substitutions only; shipping BF16 projections and FP8 head baseline. "
+              "256-byte view alignment and one 2MiB allocation tail per target arena; "
+              "MTP, experts, embedding, media, KV and workspaces unchanged. "
+              "K6/K8 synthetic static-weight deltas, not loader support, fit, or onboarding claims.")
+
+
 def benchmark_qwen_full_core(args):
     """Actual native packed operands versus independent hypothetical core members."""
     import hashlib

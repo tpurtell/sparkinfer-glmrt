@@ -536,6 +536,34 @@ def test_qwen_core_aggregate_native_cost_is_charged_once_per_owner():
     assert result["prefill"][1]["head_calls"] == 16
 
 
+def test_qwen_memory_replaces_one_arena_and_tail_without_double_charging():
+    bench = _native_threshold_bench()
+    ops = [dict(role="head", k=128, packed_n=128, count=[1, 0],
+                fp8_scale_layout="row_k128_f32", hypothetical_trellis=True,
+                native_padding_rows=0, members=[dict(n=128, hypothetical_trellis=True)]),
+           dict(role="sensitive", k=128, packed_n=1, count=[1, 1],
+                fp8_scale_layout=None, hypothetical_trellis=False, native_padding_rows=0,
+                members=[dict(n=1, hypothetical_trellis=False)])]
+    plan = dict(family="qwen4", fits=True, memory_layout=dict(devices=[
+        dict(kind="rtx", index=gpu, items=[
+            dict(category="weights", group="weight arena", bytes=100000),
+            dict(category="weights", group="allocation granularity",
+                 format=f"qwen4/target/rank{gpu}.tail (test)", bytes=(2 << 20)-100000)])
+        for gpu in (0, 1)]))
+    result = bench.qwen_full_core_memory_forecast(ops, plan)
+    assert result["arms"]["bf16"][0]["arena_delta_bytes"] == 32768 - (16384 + 512)
+    assert result["arms"]["k6"][0]["arena_delta_bytes"] == 12288 + 256 + 256 - (16384 + 512)
+    assert result["arms"]["k8"][0]["arena_delta_bytes"] == 0
+    for owners in result["arms"].values():
+        assert owners[1]["arena_delta_bytes"] == 0
+        for owner in owners:
+            assert owner["charged_bytes"] == 2 << 20
+            assert owner["charged_delta_bytes"] == 0
+    plan["memory_layout"]["devices"][0]["items"][1]["bytes"] += 1
+    with pytest.raises(ValueError, match="allocation-tail policy"):
+        bench.qwen_full_core_memory_forecast(ops, plan)
+
+
 def test_qwen_measurement_requires_fixture_and_native_library_before_cuda(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["benchmark", "--output-dir", str(tmp_path),
                                      "--qwen-core", str(tmp_path/"headers.json")])
