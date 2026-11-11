@@ -1144,6 +1144,192 @@ def ml4_full_core_projection_program(operation, *, prefill=False):
         key=(tuple(sorted(spec.items())), launch.key()), geometry=spec)
 
 
+def flash_full_core_operations(config, tensors, *, onboard_layers):
+    """Mixed KDA-heads/DSA-context executor: projections remain head split on both ranks."""
+    c = config
+    if ((c["hidden_size"], c["num_hidden_layers"], c["num_attention_heads"],
+         c["q_lora_rank"], c["kv_lora_rank"], c["qk_nope_head_dim"], c["v_head_dim"],
+         c["intermediate_size"], c["moe_intermediate_size"], c["hc_mult"]) !=
+            (4096, 45, 64, 1536, 512, 256, 256, 12288, 2048, 4) or
+            c["layer_types"][:45].count("linear_attention") != 34 or onboard_layers != 42):
+        raise ValueError("Flash requires admitted TP2 KDA-heads/DSA-context geometry and onboard42")
+    operations, covered = [], set()
+
+    def check(name, shape):
+        if tensors[name]["shape"] != list(shape) or tensors[name]["dtype"] != "BF16":
+            raise ValueError(f"Flash original matrix geometry/precision differs: {name}")
+        covered.add(name)
+
+    def add(role, names, shapes, *, split="whole", trellis=False, batch=1,
+            count=(1, 1), fp8=None, kind="linear", input_row=None, output_row=None):
+        members = []
+        for name, (n, k) in zip(names, shapes):
+            check(name, (n, k))
+            n //= 2 if split == "output" else 1
+            k //= 2 if split == "input" else 1
+            members.append(dict(name=name, source_shape=list(tensors[name]["shape"]), n=n, k=k,
+                stored_n=n, split=split, hypothetical_trellis=trellis))
+        n, k = sum(m["n"] for m in members), members[0]["k"]
+        operations.append(dict(role=role, members=members, k=k, packed_n=n, batch=batch,
+            split=split, hypothetical_trellis=trellis, fp8_scale_layout=fp8,
+            count=list(count), reduction_count=list(count) if split == "input" else [0, 0],
+            kind=kind, input_row=input_row or batch*k, output_row=output_row or batch*n))
+        if split == "input" and role.endswith(("dense_down", "shared_down")):
+            operations[-1]["reduction_count"][1] = 0
+            operations[-1]["peer_zero_count"] = [0, 1]
+        return operations[-1]
+
+    for layer, kind in enumerate(c["layer_types"][:45]):
+        p = f"model.language_model.layers.{layer}."
+        a = p+"self_attn."
+        if kind == "linear_attention":
+            op = add(f"layer{layer}.kda_in", [a+leaf+"_proj.weight" for leaf in ("q", "k", "v")],
+                [(8192, 4096)]*3, split="output", trellis=True, fp8="row_k128_kmajor_f32")
+            aux = [(a+"f_a_proj.weight", (128, 4096)), (a+"g_a_proj.weight", (128, 4096)),
+                   (a+"b_proj.weight", (64, 4096))]
+            for name, shape in aux:
+                check(name, shape)
+            op.update(packed_n=12608, output_row=12608,
+                native_aux=[dict(name=name, source_shape=list(shape), n=32 if i == 2 else 128, k=4096)
+                            for i, (name, shape) in enumerate(aux)],
+                boundary="native fused q|k|v|f_a|g_a|b; trellis q/k/v independent then native aux and original KDA pack")
+            add(f"layer{layer}.kda_fg", [a+"f_b_proj.weight", a+"g_b_proj.weight"],
+                [(8192, 128)]*2, split="output", batch=2, kind="fg",
+                input_row=12608, output_row=8192)
+            # Batched members describe one N per batch, not their concatenation.
+            operations[-1]["packed_n"] = 4096
+            add(f"layer{layer}.kda_o", [a+"o_proj.weight"], [(4096, 8192)],
+                split="input", trellis=True, fp8="row_k128_kmajor_f32")
+        else:
+            add(f"layer{layer}.rank_in", [a+"q_a_proj.weight", a+"kv_a_proj_with_mqa.weight"],
+                [(1536, 4096), (512, 4096)], trellis=True, fp8="block128x128_f32")
+            add(f"layer{layer}.q_b", [a+"q_b_proj.weight"], [(16384, 1536)],
+                split="output", trellis=True, fp8="block128x128_f32")
+            check(a+"kv_b_proj.weight", (32768, 512))
+            for role, n, k in (("absorb", 512, 256), ("values", 256, 512)):
+                operations.append(dict(role=f"layer{layer}.{role}", members=[dict(name=a+"kv_b_proj.weight",
+                    source_shape=[32768, 512], n=n, k=k, stored_n=n, hypothetical_trellis=False)],
+                    k=k, packed_n=n, batch=32, split="whole", hypothetical_trellis=False,
+                    fp8_scale_layout=None, count=[1, 1], reduction_count=[0, 0], kind=role,
+                    input_row=32*k, output_row=32*n))
+            add(f"layer{layer}.mla_o", [a+"o_proj.weight"], [(4096, 16384)],
+                split="input", trellis=True, fp8="block128x128_f32")
+            add(f"layer{layer}.index_q", [a+"indexer.wq_b.weight"], [(4096, 1536)])
+            add(f"layer{layer}.index_k", [a+"indexer."+leaf for leaf in
+                ("wk.weight", "weights_proj.weight", "index_kpool_compress_gate")],
+                [(128, 4096), (32, 4096), (128, 4096)])
+            # APE is positional data, not an independently applied projection.
+            check(a+"indexer.index_kpool_compress_ape", (4, 128))
+        inter = 12288 if layer < 3 else 2048
+        f = p+("mlp." if layer < 3 else "mlp.shared_experts.")
+        tag = "dense" if layer < 3 else "shared"
+        add(f"layer{layer}.{tag}_in", [f+leaf+"_proj.weight" for leaf in ("gate", "up")],
+            [(inter, 4096)]*2, split="output", trellis=True, fp8="block128x128_f32")
+        add(f"layer{layer}.{tag}_down", [f+"down_proj.weight"], [(4096, inter)],
+            split="input", trellis=True, fp8="block128x128_f32")
+        if layer >= 3:
+            add(f"layer{layer}.router", [p+"mlp.gate.weight"], [(288, 4096)], kind="router")
+        for site in ("attn", "ffn"):
+            add(f"layer{layer}.mhc_"+("pre" if layer == 0 and site == "attn" else "post_pre"),
+                [p+f"hc_{site}_fn"], [(24, 16384)], kind="mhc_"+
+                ("pre" if layer == 0 and site == "attn" else "post_pre"))
+    add("head", ["lm_head.weight"], [(c["vocab_size"], 4096)], trellis=True, count=(1, 0), fp8="row_k128_kmajor_f32")
+    target = {name for name, t in tensors.items() if len(t["shape"]) == 2 and
+        (name == "lm_head.weight" or (name.startswith("model.language_model.layers.") and
+        int(name.split(".")[3]) < 45)) and ".experts." not in name}
+    if target != covered:
+        raise ValueError(f"Flash uncovered matrices: {sorted(target-covered)}; unexpected: {sorted(covered-target)}")
+    return operations
+
+
+def flash_full_core_from_headers(path, missing_path, *, onboard_layers):
+    checkpoint = json.loads(Path(path).read_text())["glmf"]
+    tensors = dict(checkpoint["tensors"])
+    tensors.update(json.loads(Path(missing_path).read_text())["glmf"])
+    return flash_full_core_operations(checkpoint["config"], tensors, onboard_layers=onboard_layers)
+
+
+def flash_full_core_projection_program(operation, *, prefill=False, fp8=False):
+    """Shipping Flash factories and pitches, including the native fused mHC boundary."""
+    import cutlass
+    import torch
+    from dataclasses import replace
+    from b12x.integration.cuteafd._common import GLM53_FLASH, Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._glm_kernels import BatchedBf16Gemm, glm_projection
+    from b12x.integration.cuteafd import dsv4_mhc, glmf
+    from b12x.integration.cuteafd.glmf_split import compile_glmf_stage_aot
+
+    role = re.sub(r"^layer\d+\.", "", operation["role"])
+    n, k, kind = operation["packed_n"], operation["k"], operation["kind"]
+    capacity = 4096 if prefill else 64
+    if fp8 and not operation["fp8_scale_layout"]:
+        raise ValueError("Flash retained-native role has no FP8 substitution")
+    if kind.startswith("mhc_"):
+        g = glmf.mhc_geometry(GLM53_FLASH)
+        return (dsv4_mhc.compile_dsv4_mhc_pre_aot(g) if kind == "mhc_pre" else
+            dsv4_mhc.compile_dsv4_mhc_post_pre_aot(g, max_rows=capacity,
+                route="tf32" if prefill else "decode",
+                **({} if prefill else dict(wide_partials_per_cta=25, wide_min_rows=64))))
+    if kind in ("absorb", "values"):
+        return compile_glmf_stage_aot(replace(GLM53_FLASH, heads=32), stage=kind, max_rows=capacity)
+    if kind == "router":
+        return (glmf.compile_glmf_prefill_router_scores_aot if prefill else glmf.compile_glmf_router_scores_aot)()
+    if role == "head" and not fp8:
+        raise ValueError("Flash BF16 head uses the shipping native DSO")
+    if kind == "fg":
+        launch = BatchedBf16Gemm(n=4096, k=128, batch=2, a_row=12608, a_batch=128,
+            o_row=8192, o_batch=4096, compute_warps=glmf._batched_warps(capacity))
+    elif fp8:
+        launch = glmf._w8(n, k, 4096 if prefill else None,
+            row_scales=operation["fp8_scale_layout"] == "row_k128_kmajor_f32", decode_rows=64,
+            out_dtype=cutlass.Float32 if role == "head" else cutlass.BFloat16,
+            prefill_mask=0 if role == "head" else 255,
+            **(dict(warps=8, groups=2) if role == "kda_in" else {}))
+    else:
+        launch = glm_projection(n, k, wide=prefill and role == "index_q")
+    operands = [Operand("x", torch.bfloat16, f"[rows,{operation['input_row']}]")]
+    if fp8:
+        operands.extend((Operand("w_fp8", torch.float8_e4m3fn, f"[{n},{k}]"),
+            Operand("scale", torch.float32, "[native_scales]", align=4)))
+    else:
+        operands.append(Operand("w", torch.bfloat16, f"[{operation['batch']},{n},{k}]"))
+    operands.append(Operand("out", torch.float32 if role == "head" else torch.bfloat16,
+        f"[rows,{operation['output_row']}]", "out"))
+    return compile_program(launch, name="flash_dense_member", operands=tuple(operands),
+        scalars=(Scalar("rows"), Scalar("fp8_rows"), Scalar("qscratch", "int64")) if fp8 else (Scalar("rows"),),
+        key=(role, prefill, fp8, launch.key()), geometry=dict(role=role, prefill=prefill, fp8=fp8))
+
+
+def flash_full_core_logical_bytes(operation):
+    """Resident projection operands, not measured DRAM traffic or auxiliary state."""
+    n, k, batch = operation["packed_n"], operation["k"], operation["batch"]
+    native = batch*n*k*(4 if operation["kind"].startswith("mhc_") else 2)
+    row_scales = operation["fp8_scale_layout"] == "row_k128_kmajor_f32"
+    scales = (n if row_scales else (n+127)//128)*(k//128)*4
+    result = dict(bf16=native, native=native, fp8=n*k+scales)
+    aux = sum(m["n"]*m["k"]*2 for m in operation.get("native_aux", []))
+    for bits in (6, 8):
+        result[f"k{bits}"] = aux+sum(m["k"]*m["stored_n"]*bits//8+
+            2*(m["k"]+m["stored_n"]) for m in operation["members"])
+    return result
+
+
+def flash_full_core_aux_program(*, pack=False):
+    import torch
+    from dataclasses import replace
+    from b12x.integration.cuteafd._common import GLM53_FLASH, Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._glm_kernels import glm_projection
+    from b12x.integration.cuteafd.kimi_split import _KdaPack
+    g = replace(GLM53_FLASH, kda_heads=32)
+    launch = _KdaPack(g) if pack else glm_projection(288, 4096)
+    operands = (tuple(Operand(name, torch.bfloat16, "[native_extent]", "out" if name == "proj" else "in")
+        for name in ("q", "k", "v", "gate", "fab", "proj")) if pack else
+        (Operand("x", torch.bfloat16, "[rows,4096]"), Operand("w", torch.bfloat16, "[288,4096]"),
+         Operand("out", torch.bfloat16, "[rows,288]", "out")))
+    return compile_program(launch, name="flash_kda_pack" if pack else "flash_kda_aux",
+        operands=operands, scalars=(Scalar("rows"),), key=(pack, g, None if pack else launch.key()))
+
+
 def step5_full_core_operations(config, tensors, *, csa_rank0_layers, onboard_layers):
     """Original BF16 boundaries with admitted CSA ranges and replicated SWA FFNs."""
     c = config
@@ -1498,8 +1684,9 @@ def glm_full_core_unique_operations(operations):
         if key not in unique:
             unique[key] = dict(op, count=list(op["count"]), reduction_count=list(op["reduction_count"]))
         else:
-            for field in ("count", "reduction_count"):
-                unique[key][field] = [a+b for a, b in zip(unique[key][field], op[field])]
+            for field in ("count", "reduction_count", "peer_zero_count"):
+                if field in op:
+                    unique[key][field] = [a+b for a, b in zip(unique[key][field], op[field])]
     return list(unique.values())
 
 
@@ -1848,7 +2035,10 @@ def encode_reference_fixtures(args):
     costs = torch.empty((256, 2, 65536 >> bits), device="cuda", dtype=torch.float16)
     edges = torch.empty((256, 256, 65536 >> bits), device="cuda", dtype=torch.int16)
     records = []
-    if getattr(args, "step5_core", None):
+    if getattr(args, "flash_core", None):
+        operations = flash_full_core_from_headers(args.flash_core, args.flash_missing, onboard_layers=args.onboard_layers)
+        shapes = glm_full_core_fixture_shapes(operations)
+    elif getattr(args, "step5_core", None):
         operations = step5_full_core_from_headers(args.step5_core,
             csa_rank0_layers=args.csa_rank0_layers, onboard_layers=args.onboard_layers)
         shapes = glm_full_core_fixture_shapes(operations)
@@ -1873,7 +2063,7 @@ def encode_reference_fixtures(args):
         k, n, side = shape["k"], shape["n"], shape["side"]
         if (args.full_core or getattr(args, "qwen_core", None) or getattr(args, "glm_core", None)
                 or getattr(args, "muse_core", None) or getattr(args, "ml4_core", None)
-                or getattr(args, "step5_core", None)):
+                or getattr(args, "step5_core", None) or getattr(args, "flash_core", None)):
             record = encode_chunked_fixture(args, index, shape, costs, edges, oracle)
             records.append(record)
             (args.output_dir / f"fixtures_k{bits}.json").write_text(json.dumps(records, indent=2) + "\n")
@@ -2377,6 +2567,50 @@ def aggregate_glm_full_core(operations, records, rows_list):
     return dict(decode=decode, prefill=prefill,
         normalization="Kimi 73 verify steps / 255 emitted tokens; not measured GLM speculation",
         scope="per-rank local producers and mandatory trellis meets; no peer transport or residual norm; native BF16 partial addition is fused into excluded residual norm")
+
+
+def aggregate_flash_full_core(operations, records, rows_list):
+    """Charge local producers and mandatory trellis meets to their actual ranks."""
+    lookup = {(r["role"], r["rows"], r["phase"]): r["total_call_us"] for r in records}
+    arms = ("bf16", "fp8", "k6", "k8")
+
+    def available(op, rows):
+        return all((op["role"], rows, phase) in lookup for phase in
+                   (["producer", "reduce0", "reduce1"] if op["split"] == "input" else ["producer"]))
+
+    def cost(op, rows, arm, rank):
+        times = lookup[(op["role"], rows, "producer")]
+        value = times[arm if arm in times else "native"] * op["count"][rank]
+        if op["split"] == "input":
+            if arm in ("k6", "k8"):
+                count = op["count"][rank]
+            else:
+                count = op["count"][rank] if op["role"] in ("kda_o", "mla_o") else 0
+            value += lookup[(op["role"], rows, f"reduce{rank}")][arm] * count if count else 0
+        return value
+
+    decode, prefill = [], []
+    for rows in rows_list:
+        if rows > 64 or not all(available(op, rows) for op in operations):
+            continue
+        sums = {arm: [sum(cost(op, rows, arm, rank) for op in operations) for rank in (0, 1)] for arm in arms}
+        decode.append(dict(rows=rows, local_dense_us_per_verify_step=sums,
+            kimi_rate_normalized_local_dense_us_per_emitted_token={
+                arm: [v*73/255 for v in values] for arm, values in sums.items()}))
+    for tokens in (8192, 65536):
+        schedule = glm_full_core_prefill_schedule(tokens)
+        histogram = schedule["body_row_histogram"]
+        if not all(available(op, row) for op in operations
+                   for row in ([1] if op["role"] == "head" else histogram)):
+            continue
+        sums = {arm: [sum(schedule["head_calls"]*cost(op, 1, arm, rank) if op["role"] == "head" else
+                         sum(count*cost(op, row, arm, rank) for row, count in histogram.items())
+                         for op in operations) for rank in (0, 1)] for arm in arms}
+        prefill.append(dict(tokens=tokens, **schedule, local_dense_us=sums))
+    return dict(decode=decode, prefill=prefill,
+        normalization="Kimi 73 verify steps / 255 emitted tokens; not measured Flash speculation",
+        scope="per-rank local producers and mandatory trellis meets; no peer transport or residual norm; native attention BF16 add included; native FFN add retained in excluded expert join; mHC fused norm included")
+
 
 
 def aggregate_muse_full_core(operations, records, rows_list):
@@ -3325,6 +3559,343 @@ def benchmark_ml4_full_core(args):
         del graphs, events, graph, expected, targets, fixtures, weight, x, outs, raw, final, rotated
         del suh, scale, svh, tables, payloads, partial, retained, peer, reduced, quantized, fp8_scale, qscratch, workspace
         torch.cuda.empty_cache()
+
+
+def benchmark_flash_full_core(args):
+    """Flash packed native operands and independent trellis members, with split meets."""
+    import hashlib
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd._glmf_fp8 import quant_scratch_bytes
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import compile_trellis_input_aot, compile_trellis_output_aot
+
+    rows_list = sorted(set(map(int, args.rows.split(","))))
+    if not rows_list or min(rows_list) < 1 or max(rows_list) > 4096 or args.samples < 50:
+        raise ValueError("Flash full-core requires rows 1..4096 and >=50 samples")
+    all_operations = flash_full_core_from_headers(args.flash_core, args.flash_missing, onboard_layers=args.onboard_layers)
+    operations = glm_full_core_unique_operations(all_operations)
+    contract = dict(operations=operations, export_sms=args.export_sms,
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    if args.compile_only:
+        import multiprocessing
+        from b12x._lib.compile_pool import _initialize_worker
+        _initialize_worker(0, (12, 0), "flash-core", "flash-core", args.export_sms,
+                           101376, 102400, multiprocessing.Array("i", [0, 0]))
+    else:
+        props = torch.cuda.get_device_properties(0)
+        status, l2 = cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 0)
+        if int(status):
+            raise RuntimeError(status)
+        limit = props.multi_processor_count*4
+        flush = torch.empty(2*l2, device="cuda", dtype=torch.uint8)
+        manifests = {bits: json.loads((args.fixture_dir/f"fixtures_k{bits}.json").read_text()) for bits in (6, 8)}
+        shapes = glm_full_core_fixture_shapes(all_operations)
+        for records in manifests.values():
+            if len(records) != len(shapes) or any(not r["oracle_exact"] or
+                    any(r[key] != s[key] for key in s) for r, s in zip(records, shapes)):
+                raise ValueError("Flash fixture geometry or independent oracle coverage differs")
+        native = C.CDLL(str(args.native_library.resolve()))
+        signatures = {
+            "cuteafd_load_narrow_f32_bf16": [C.c_void_p, C.c_void_p, C.c_int64, C.c_int32, C.c_void_p],
+            "cuteafd_cuda_zero_bytes_async": [C.c_void_p, C.c_size_t, C.c_void_p],
+            "cuteafd_peer_add_bf16_async": [C.c_void_p]*3+[C.c_uint64, C.c_void_p],
+            "cuteafd_fp8_block_quant": [C.c_void_p]*3+[C.c_int32, C.c_int32, C.c_void_p],
+            "cuteafd_bf16_f32_add_async": [C.c_void_p]*3+[C.c_size_t, C.c_int32, C.c_void_p],
+            "cuteafd_vocabulary_head_create_vocab": [C.c_void_p, C.c_uint64]+[C.c_int32]*4+[C.POINTER(C.c_void_p)],
+            "cuteafd_vocabulary_head_launch_tensor_invariant": [C.c_void_p]*4+[C.c_int32, C.c_void_p],
+            "cuteafd_v41_markov_destroy": [C.c_void_p],
+        }
+        for name, signature in signatures.items():
+            function = getattr(native, name)
+            function.argtypes, function.restype = signature, C.c_int32
+        report = dict(metadata=dict(contract=contract, device=props.name, sms=props.multi_processor_count,
+            l2_bytes=l2, samples=args.samples, fixture_manifests=manifests,
+            native_library_sha256=hashlib.sha256(args.native_library.read_bytes()).hexdigest(),
+            native_provenance=json.loads(args.native_library.with_name("COMPILER_PROVENANCE.json").read_text()),
+            cache="2x runtime L2 eviction outside each complete-operation interval",
+            arms="BF16; K6/K8 independent cores; hypothetical FP8 full core including F32 W8A16 head; native UK/UV/indexer/fg/router/mHC retained",
+            boundary="trellis split core retained BF16, ordered F32 sum, one H128/svh egress; FFN reduce rank0 and zero rank1; native split BF16 add; actual fused mHC pre/post_pre including norm",
+            numerics="genuine independent reference fixtures; unit H128 scales; within-format replay only, no quality claim",
+            scope="local dense operation costs, mHC fused normalization included; excludes transport, experts, recurrence, other norms/nonlinearities and draft"), records=[])
+        torch.manual_seed(811)
+        warm = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+        for _ in range(128):
+            torch.mm(warm, warm)
+        torch.cuda.synchronize()
+        del warm
+
+    def program(directory, name, builder):
+        if args.compile_only:
+            print("compile", directory.name, name, flush=True)
+            with exportable_compilation():
+                result = builder()
+            exported(result, directory, name, load_module=False)
+            (directory/f"{name}.json").write_text(json.dumps(dict(pointers=len(result.operands),
+                scalars=[s.ctype for s in result.scalars])))
+            return None
+        abi = json.loads((directory/f"{name}.json").read_text())
+        lib = C.CDLL(str((directory/f"{name}.so").resolve()))
+        lib.load.argtypes, lib.load.restype = [], None
+        kinds = {"int32": C.c_int32, "int64": C.c_int64, "float32": C.c_float}
+        lib.run.argtypes = [C.c_void_p]*abi["pointers"]+[kinds[s] for s in abi["scalars"]]+[C.c_void_p]
+        lib.run.restype = C.c_int32
+        lib.load()
+        return lib
+
+    def checked(status):
+        if status:
+            raise RuntimeError(f"Flash full-core launch failed: {status}")
+
+    def load_fixture(bits, role, index):
+        matches = [r for r in manifests[bits] if r["role"] == role and r["member"] == index]
+        if len(matches) != 1:
+            raise ValueError(f"Flash fixture membership ambiguous: {role}/{index}")
+        record = matches[0]
+        path = args.fixture_dir/record["path"]
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8*1024*1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != record["sha256"]:
+            raise ValueError("Flash fixture checksum differs")
+        return torch.load(path, weights_only=True, map_location="cpu")
+
+    from b12x.integration.cuteafd._common import GLM53_FLASH, Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._glmf_fp8 import QuantRows128
+    def quant_program(k):
+        launch = QuantRows128(k)
+        return compile_program(launch, name="flash_reference_row_quant", operands=(
+            Operand("x", torch.bfloat16, "[N,K]"), Operand("q", torch.float8_e4m3fn, "[N,K]", "out"),
+            Operand("scale", torch.float32, "[N,K/128]", "out")), scalars=(Scalar("rows"),), key=launch.key())
+
+    for op in operations:
+        role, k, n, batch = op["role"], op["k"], op["packed_n"], op["batch"]
+        head, batched, split = role == "head", batch > 1, op["split"] == "input"
+        capacity = 64 if head else 4096
+        mhc = op["kind"].startswith("mhc_")
+        ffn_split = role in ("dense_down", "shared_down")
+        directory = args.output_dir/role
+        directory.mkdir(parents=True, exist_ok=True)
+        if args.compile_only:
+            (directory/"contract.json").write_text(json.dumps(contract, sort_keys=True))
+        elif json.loads((directory/"contract.json").read_text()) != contract:
+            raise ValueError("stale Flash full-core exports")
+        baseline = {} if head else {prefill: program(directory, f"bf16_{int(prefill)}",
+            lambda prefill=prefill: flash_full_core_projection_program(op, prefill=prefill)) for prefill in (False, True)}
+        fp8 = ({prefill: program(directory, f"fp8_{int(prefill)}",
+            lambda prefill=prefill: flash_full_core_projection_program(op, prefill=prefill, fp8=True))
+            for prefill in (False, True)} if op["fp8_scale_layout"] else {})
+        members = op["members"] if op["hypothetical_trellis"] else []
+        sizes = [m["stored_n"] for m in members]
+        ingress, egress, cores = [], [], {6: [], 8: []}
+        for i, sn in enumerate(sizes):
+            ingress.append(program(directory, f"ingress{i}", lambda: compile_trellis_input_aot(
+                features=k, max_rows=capacity, output_dtype="bf16")))
+            egress.append(program(directory, f"egress{i}", lambda sn=sn: compile_trellis_output_aot(
+                features=sn, max_rows=capacity, output_dtype="f32" if head else "bf16")))
+            for bits in (6, 8):
+                cores[bits].append(program(directory, f"core{i}_k{bits}", lambda bits=bits, sn=sn:
+                    compile_trellis_linear_aot(input_features=k, output_features=sn, bits=bits,
+                        codebook="mcg", sharded_side=2 if split else 1, max_rows=capacity, input_dtype="bf16")))
+        aux = program(directory, "aux", lambda: flash_full_core_aux_program()) if role == "kda_in" else None
+        pack = program(directory, "pack", lambda: flash_full_core_aux_program(pack=True)) if role == "kda_in" else None
+        row_quant = (program(directory, "row_quant", lambda: quant_program(k))
+                     if op["fp8_scale_layout"] == "row_k128_kmajor_f32" else None)
+        if args.compile_only:
+            continue
+        fixtures = {bits: [load_fixture(bits, role, i) for i in range(len(members))] for bits in (6, 8)}
+        if any(not torch.equal(a["weight"], b["weight"]) for a, b in zip(fixtures[6], fixtures[8])):
+            raise ValueError("Flash K6/K8 source weights differ")
+        aux_weight = torch.randn(288, k, dtype=torch.bfloat16) if role == "kda_in" else None
+        weight = (torch.cat([f["weight"][:m["n"]] for f, m in zip(fixtures[6], members)] +
+                  ([aux_weight] if aux_weight is not None else [])).cuda()
+                  if members else torch.randn(batch*n, k, device="cuda", dtype=torch.bfloat16))
+        aux_weight = aux_weight.cuda() if aux_weight is not None else None
+        aux_out = torch.empty(capacity, 288, device="cuda", dtype=torch.bfloat16) if aux is not None else None
+        input_width, output_width = op["input_row"], op["output_row"]
+        x = torch.randn(capacity, input_width, device="cuda", dtype=torch.bfloat16)
+        out_dtype = torch.float32 if head or role == "router" else torch.bfloat16
+        outs = {arm: torch.empty(capacity, output_width, device="cuda", dtype=out_dtype)
+                for arm in ("bf16", "fp8", "k6", "k8")}
+        raw = [torch.empty(capacity, sn, device="cuda", dtype=torch.float32) for sn in sizes]
+        final = [torch.empty(capacity, sn, device="cuda", dtype=out_dtype) for sn in sizes]
+        rotated = [torch.empty(capacity, k, device="cuda", dtype=torch.bfloat16) for _ in sizes]
+        suh = [torch.ones(k, device="cuda", dtype=torch.float16) for _ in sizes]
+        scale = [torch.ones(k//128, device="cuda", dtype=torch.float16) for _ in sizes]
+        svh = [torch.ones(sn, device="cuda", dtype=torch.float16) for sn in sizes]
+        tables = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in rotated]
+        payloads = {bits: [f["payload"].cuda() for f in fixtures[bits]] for bits in (6, 8)}
+        partial = torch.empty(capacity*((k+1023)//1024)*max(sizes, default=128), device="cuda", dtype=torch.float32)
+        retained = torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16) if split else None
+        peer = torch.randn(capacity, n, device="cuda", dtype=torch.bfloat16) if split else None
+        reduced = torch.empty(capacity, n, device="cuda", dtype=torch.float32) if split else None
+        quantized = torch.empty_like(weight, dtype=torch.float8_e4m3fn) if fp8 else None
+        fp8_scale = None
+        if fp8:
+            if row_quant is not None:
+                row_scale = torch.empty(n, k//128, device="cuda", dtype=torch.float32)
+                checked(row_quant.run(weight.data_ptr(), quantized.data_ptr(), row_scale.data_ptr(), n,
+                    torch.cuda.current_stream().cuda_stream))
+                fp8_scale = row_scale.T.contiguous()
+            else:
+                fp8_scale = torch.empty((n+127)//128, k//128, device="cuda", dtype=torch.float32)
+                checked(native.cuteafd_fp8_block_quant(weight.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(),
+                    n, k, torch.cuda.current_stream().cuda_stream))
+            torch.cuda.synchronize()
+            if not torch.isfinite(fp8_scale).all().item() or not (fp8_scale > 0).all().item():
+                raise ValueError("Flash native FP8 weight conversion produced invalid scales")
+        qscratch = torch.empty(quant_scratch_bytes(k, capacity), device="cuda", dtype=torch.uint8) if fp8 and not batched else None
+        handle, workspace = C.c_void_p(), None
+        if head:
+            workspace = torch.empty(4<<20, device="cuda", dtype=torch.uint8)
+            checked(native.cuteafd_vocabulary_head_create_vocab(workspace.data_ptr(), workspace.numel(), k, capacity, n, 1, C.byref(handle)))
+
+        mhc_values = None
+        if mhc:
+            mhc_values = dict(x=torch.randn(capacity, 4096, device="cuda", dtype=torch.bfloat16),
+                residual=torch.randn(capacity, 4, 4096, device="cuda", dtype=torch.bfloat16),
+                prev_post=torch.full((capacity, 4), 0.5, device="cuda", dtype=torch.float32),
+                prev_comb=torch.eye(4, device="cuda", dtype=torch.float32).expand(capacity, 4, 4).contiguous(),
+                fn=(torch.randn(24, 16384, device="cuda", dtype=torch.bfloat16)*0.01).float(),
+                scale=torch.ones(3, device="cuda", dtype=torch.float32),
+                base=torch.zeros(24, device="cuda", dtype=torch.float32),
+                norm=torch.ones(4096, device="cuda", dtype=torch.bfloat16),
+                residual_out=torch.empty(capacity, 4, 4096, device="cuda", dtype=torch.bfloat16),
+                post=torch.empty(capacity, 4, device="cuda", dtype=torch.float32),
+                comb=torch.empty(capacity, 4, 4, device="cuda", dtype=torch.float32),
+                y=torch.empty(capacity, 4096, device="cuda", dtype=torch.bfloat16),
+                scratch=torch.empty(capacity*64*25, device="cuda", dtype=torch.float32))
+
+        def call(lib, *values):
+            checked(lib.run(*values, torch.cuda.current_stream().cuda_stream))
+
+        def run(arm, rows, phase):
+            stream = torch.cuda.current_stream().cuda_stream
+            prefill = rows > 64
+            if phase.startswith("reduce"):
+                rank = int(phase[-1])
+                if arm in ("bf16", "fp8"):
+                    if ffn_split and rank == 1:
+                        return
+                    first, second = (outs[arm], peer) if rank == 0 else (peer, outs[arm])
+                    checked(native.cuteafd_peer_add_bf16_async(first.data_ptr(), second.data_ptr(),
+                        native_sum[arm].data_ptr(), rows*n, stream))
+                    return
+                if ffn_split and rank == 1:
+                    checked(native.cuteafd_cuda_zero_bytes_async(outs[arm].data_ptr(), rows*n*2, stream))
+                    return
+                first, second = (retained, peer) if rank == 0 else (peer, retained)
+                checked(native.cuteafd_bf16_f32_add_async(first.data_ptr(), second.data_ptr(), reduced.data_ptr(),
+                    rows*n, props.multi_processor_count, stream))
+                call(egress[0], reduced.data_ptr(), svh[0].data_ptr(), outs[arm].data_ptr(), rows, limit)
+            elif mhc:
+                names = (["residual"] if op["kind"] == "mhc_pre" else
+                    ["x", "residual", "prev_post", "prev_comb"])
+                names += ["fn", "scale", "base", "norm"]
+                if op["kind"] != "mhc_pre":
+                    names += ["residual_out"]
+                names += ["post", "comb", "y", "scratch"]
+                call(baseline[prefill], *[mhc_values[name].data_ptr() for name in names], rows)
+            elif arm in ("native", "bf16") or (arm in ("k6", "k8") and not members) or (arm == "fp8" and not fp8):
+                if head:
+                    checked(native.cuteafd_vocabulary_head_launch_tensor_invariant(handle, x.data_ptr(), weight.data_ptr(), outs["bf16"].data_ptr(), rows, stream))
+                else:
+                    call(baseline[prefill], x.data_ptr()+(3*4096*2 if role == "kda_fg" else 0), weight.data_ptr(), outs["bf16"].data_ptr(), rows)
+            elif arm == "fp8":
+                values = [x.data_ptr(), quantized.data_ptr(), fp8_scale.data_ptr(), outs[arm].data_ptr(), rows]
+                call(fp8[prefill], *values, *([] if batched else [255 if prefill else 64, qscratch.data_ptr()]))
+            else:
+                offset = 0
+                for i, (member, sn) in enumerate(zip(members, sizes)):
+                    call(ingress[i], x.data_ptr(), suh[i].data_ptr(), rotated[i].data_ptr(), scale[i].data_ptr(), rows, limit)
+                    call(cores[int(arm[1:])][i], tables[i].data_ptr(), payloads[int(arm[1:])][i].data_ptr(),
+                         scale[i].data_ptr(), partial.data_ptr(), raw[i].data_ptr(), rows, 0, limit)
+                    if split:
+                        checked(native.cuteafd_load_narrow_f32_bf16(raw[i].data_ptr(), retained.data_ptr(), rows*n, props.multi_processor_count, stream))
+                    else:
+                        call(egress[i], raw[i].data_ptr(), svh[i].data_ptr(), final[i].data_ptr(), rows, limit)
+                        if role == "rank_in":
+                            outs[arm][:rows, offset:offset+member["n"]].copy_(final[i][:rows, :member["n"]])
+                    offset += member["n"]
+                if role == "kda_in":
+                    call(aux, x.data_ptr(), aux_weight.data_ptr(), aux_out.data_ptr(), rows)
+                    call(pack, *[v.data_ptr() for v in final], final[0].data_ptr(), aux_out.data_ptr(),
+                        outs[arm].data_ptr(), rows)
+
+        native_sum = {arm: torch.empty_like(peer) for arm in ("bf16", "fp8")} if split else {}
+        arms = ("k6", "k8", "bf16", "fp8") if members else (("native", "fp8") if fp8 else ("native",))
+        live_rows = sorted(set([1]+[r for r in rows_list if r <= 64])) if head else rows_list
+        for rows in live_rows:
+            for phase in (("producer", "reduce0", "reduce1") if split else ("producer",)):
+                active = arms if phase == "producer" or not ffn_split else ("k6", "k8")
+                graphs, events = {}, {}
+                for arm in active:
+                    run(arm, rows, "producer")
+                    run(arm, rows, phase)
+                    if mhc:
+                        targets = [mhc_values[name][:rows] for name in
+                            (["post", "comb", "y"] if op["kind"] == "mhc_pre" else ["residual_out", "post", "comb", "y"])]
+                    elif phase != "producer":
+                        targets = [(native_sum[arm] if arm in ("bf16", "fp8") else outs[arm])[:rows]]
+                    elif arm in ("k6", "k8"):
+                        targets = ([retained[:rows]] if split else [outs[arm][:rows]] if role in ("rank_in", "kda_in")
+                                   else [v[:rows] for v in final])
+                    else:
+                        targets = [outs["bf16" if arm == "native" else arm][:rows]]
+                    expected = [value.clone() for value in targets]
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run(arm, rows, phase)
+                    for value in targets:
+                        value.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    if not all(torch.equal(value.view(torch.uint8), reference.view(torch.uint8))
+                               and torch.isfinite(value).all().item()
+                               for value, reference in zip(targets, expected)):
+                        raise RuntimeError(f"Flash {role}/{arm}/{rows}/{phase}: poisoned replay differs")
+                    pairs = [(torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True))
+                             for _ in range(16 if rows <= 64 else 4)]
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        for start, end in pairs:
+                            flush.zero_()
+                            start.record()
+                            run(arm, rows, phase)
+                            end.record()
+                    graphs[arm], events[arm] = graph, pairs
+                    graph.replay()
+                torch.cuda.synchronize()
+                before = thermal_snapshot()
+                samples = {arm: [] for arm in active}
+                for repeat in range(args.samples):
+                    for arm in (active if repeat%2 == 0 else tuple(reversed(active))):
+                        graphs[arm].replay()
+                        events[arm][-1][1].synchronize()
+                        samples[arm].append(statistics.mean(a.elapsed_time(b)*1000 for a, b in events[arm]))
+                times = {arm: statistics.median(values) for arm, values in samples.items()}
+                logical = flash_full_core_logical_bytes(op)
+                if phase != "producer":
+                    logical = {arm: rows*n*(2 if ffn_split and arm in ("k6", "k8") and phase == "reduce1" else 4) for arm in active}
+                record = dict(role=role, rows=rows, phase=phase, per_verify_step_calls=op["count"] if phase == "producer" else op["reduction_count"],
+                    total_call_us=times, samples_us=samples, logical_weight_bytes={arm: logical[arm] for arm in active},
+                    logical_weight_gbs={arm: logical[arm]/(times[arm]*1000) for arm in active},
+                    replay_exact=True, poisoned_outputs_overwritten=True, thermal_before=before, thermal_after=thermal_snapshot())
+                report["records"].append(record)
+                report["aggregate"] = aggregate_flash_full_core(operations, report["records"], rows_list)
+                print(json.dumps({key: value for key, value in record.items() if key != "samples_us"}), flush=True)
+                (args.output_dir/"report.json").write_text(json.dumps(report, indent=2)+"\n")
+        if head:
+            checked(native.cuteafd_v41_markov_destroy(handle))
+        del graphs, events, graph, expected, targets, fixtures, weight, x, outs, raw, final, rotated
+        del suh, scale, svh, tables, payloads, partial, retained, peer, reduced, quantized, fp8_scale, qscratch, workspace
+        del native_sum, mhc_values, aux_weight, aux_out
+        if fp8 and row_quant is not None:
+            del row_scale
+        torch.cuda.empty_cache()
+
 
 
 def benchmark_glm_full_core(args):
@@ -4511,6 +5082,8 @@ def main():
     parser.add_argument("--kimi-fp8-core", type=Path, help="original Kimi headers; hypothetical full FP8 versus BF16 without rerunning trellis")
     parser.add_argument("--ml4-core", type=Path, help="original ML4 config/header inventory; native FP8/BF16 versus K6 only")
     parser.add_argument("--ml4-scales", type=Path, help="original ML4 block-FP8 scale header audit")
+    parser.add_argument("--flash-core", type=Path, help="original Flash BF16 config/header inventory")
+    parser.add_argument("--flash-missing", type=Path, help="original Flash mHC/compressor matrix header audit")
     parser.add_argument("--step5-core", type=Path, help="authoritative Step-5 BF16 original config/header inventory")
     parser.add_argument("--csa-rank0-layers", type=int, help="actual admitted contiguous Step-5 CSA count on rank0")
     parser.add_argument("--onboard-layers", type=int, help="actual admitted sparse prefix, required for GLM/ML4 router owner counts")
@@ -4526,6 +5099,16 @@ def main():
         hashes = reference_encoder(args.encoder_source, args.output_dir / "encoder")
         (args.output_dir / "encoder_sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
         return
+    if args.flash_core:
+        if (any((args.step5_core, args.kimi_fp8_core, args.ml4_core, args.muse_core, args.glm_core,
+                 args.qwen_core, args.full_core, args.kimi_decision, args.baseline_native)) or
+                args.flash_missing is None or args.onboard_layers != 42):
+            parser.error("--flash-core is separate and requires --flash-missing and --onboard-layers 42")
+        if not args.encode_fixtures:
+            if not args.compile_only and (args.fixture_dir is None or args.native_library is None):
+                parser.error("--flash-core measurement requires --fixture-dir and --native-library")
+            benchmark_flash_full_core(args)
+            return
     if args.step5_core:
         if (any((args.kimi_fp8_core, args.ml4_core, args.muse_core, args.glm_core, args.qwen_core,
                  args.full_core, args.kimi_decision, args.baseline_native)) or

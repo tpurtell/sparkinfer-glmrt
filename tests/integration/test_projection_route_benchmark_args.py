@@ -1388,6 +1388,172 @@ def test_step5_aggregate_distinguishes_hqa_from_not_loadable_bf16_o_substitution
     assert 'HQA' in result['fp8_o_selectable'] and 'not-loadable' in result['bf16_fp8_o_not_loadable']
 
 
+def _flash_core_headers():
+    config = dict(hidden_size=4096, num_hidden_layers=45, num_attention_heads=64,
+        q_lora_rank=1536, kv_lora_rank=512, qk_nope_head_dim=256, v_head_dim=256,
+        intermediate_size=12288, moe_intermediate_size=2048, hc_mult=4, vocab_size=154880,
+        layer_types=['full_attention' if i % 4 == 3 else 'linear_attention' for i in range(45)])
+    tensors = {'lm_head.weight': dict(dtype='BF16', shape=[154880, 4096])}
+    for layer, kind in enumerate(config['layer_types']):
+        p = f'model.language_model.layers.{layer}.'
+        if kind == 'linear_attention':
+            shapes = {f'self_attn.{leaf}_proj.weight': [n, k] for leaf, n, k in
+                [('q', 8192, 4096), ('k', 8192, 4096), ('v', 8192, 4096),
+                 ('f_a', 128, 4096), ('g_a', 128, 4096), ('b', 64, 4096),
+                 ('f_b', 8192, 128), ('g_b', 8192, 128), ('o', 4096, 8192)]}
+        else:
+            shapes = {f'self_attn.{leaf}.weight': [n, k] for leaf, n, k in
+                [('q_a_proj', 1536, 4096), ('kv_a_proj_with_mqa', 512, 4096),
+                 ('q_b_proj', 16384, 1536), ('kv_b_proj', 32768, 512),
+                 ('o_proj', 4096, 16384), ('indexer.wq_b', 4096, 1536),
+                 ('indexer.wk', 128, 4096), ('indexer.weights_proj', 32, 4096)]}
+            shapes.update({'self_attn.indexer.index_kpool_compress_gate': [128, 4096],
+                           'self_attn.indexer.index_kpool_compress_ape': [4, 128]})
+        f, inter = ('mlp.', 12288) if layer < 3 else ('mlp.shared_experts.', 2048)
+        shapes.update({f+leaf+'_proj.weight': shape for leaf, shape in
+            [('gate', [inter, 4096]), ('up', [inter, 4096]), ('down', [4096, inter])]})
+        if layer >= 3:
+            shapes['mlp.gate.weight'] = [288, 4096]
+        shapes.update({f'hc_{site}_fn': [24, 16384] for site in ('attn', 'ffn')})
+        tensors.update({p+name: dict(dtype='BF16', shape=shape) for name, shape in shapes.items()})
+    return config, tensors
+
+
+def _flash_core_ops():
+    bench = _native_threshold_bench()
+    config, tensors = _flash_core_headers()
+    return bench, bench.glm_full_core_unique_operations(
+        bench.flash_full_core_operations(config, tensors, onboard_layers=42))
+
+
+def test_flash_catalog_covers_original_matrices_and_keeps_independent_members():
+    bench, ops = _flash_core_ops()
+    unique = {op['role']: op for op in ops}
+    expected = dict(kda_in=34, kda_fg=34, kda_o=34, dense_in=3, dense_down=3,
+        mhc_pre=1, mhc_post_pre=89, rank_in=11, q_b=11, absorb=11, values=11,
+        mla_o=11, index_q=11, index_k=11, shared_in=42, shared_down=42, router=42)
+    assert len(unique) == 18
+    assert {role: op['count'] for role, op in unique.items() if role != 'head'} == {
+        role: [count, count] for role, count in expected.items()}
+    assert unique['head']['count'] == [1, 0]
+    assert unique['kda_in']['packed_n'] == 12608
+    assert [m['n'] for m in unique['kda_in']['members']] == [4096]*3
+    assert [m['n'] for m in unique['kda_in']['native_aux']] == [128, 128, 32]
+    assert unique['kda_fg']['input_row'] == 12608 and unique['kda_fg']['output_row'] == 8192
+    for role, count in [('dense_down', 3), ('shared_down', 42)]:
+        assert unique[role]['reduction_count'] == [count, 0]
+        assert unique[role]['peer_zero_count'] == [0, count]
+    assert unique['mla_o']['reduction_count'] == [11, 11]
+    shapes = bench.glm_full_core_fixture_shapes(ops)
+    assert len(shapes) == 15 and len([s for s in shapes if s['role'] == 'kda_in']) == 3
+    assert all(s['k'] % 128 == s['n'] % 128 == 0 for s in shapes)
+    for role in ('absorb', 'values', 'index_q', 'index_k', 'router', 'mhc_pre', 'mhc_post_pre', 'kda_fg'):
+        assert not unique[role]['hypothetical_trellis'] and unique[role]['fp8_scale_layout'] is None
+    config, tensors = _flash_core_headers()
+    tensors['model.language_model.layers.0.hc_attn_fn']['dtype'] = 'F32'
+    with pytest.raises(ValueError, match='geometry/precision'):
+        bench.flash_full_core_operations(config, tensors, onboard_layers=42)
+    config, tensors = _flash_core_headers()
+    tensors['model.language_model.layers.0.extra.weight'] = dict(dtype='BF16', shape=[128, 128])
+    with pytest.raises(ValueError, match='uncovered matrices'):
+        bench.flash_full_core_operations(config, tensors, onboard_layers=42)
+
+
+def test_flash_logical_bytes_include_native_aux_and_resident_f32_mhc():
+    bench, ops = _flash_core_ops()
+    unique = {op['role']: op for op in ops}
+    assert bench.flash_full_core_logical_bytes(unique['mhc_pre'])['native'] == 24*16384*4
+    logical = bench.flash_full_core_logical_bytes(unique['kda_in'])
+    assert logical['bf16'] == 12608*4096*2
+    assert logical['k6'] == 3*(4096*4096*6//8+2*(4096+4096))+288*4096*2
+    assert logical['fp8'] == 12608*4096+12608*32*4
+
+
+def test_flash_aggregate_charges_attention_add_ffn_zero_and_native_mhc_once():
+    bench, ops = _flash_core_ops()
+    rows = [1, 6, 2240, 2688, 2752]
+    records = []
+    for op in ops:
+        for row in (rows[:2] if op['role'] == 'head' else rows):
+            records.append(dict(role=op['role'], rows=row, phase='producer', total_call_us=(
+                dict(k6=2, k8=3, bf16=4, fp8=5) if op['hypothetical_trellis'] else dict(native=1))))
+            if op['split'] == 'input':
+                for rank in (0, 1):
+                    records.append(dict(role=op['role'], rows=row, phase=f'reduce{rank}',
+                        total_call_us=(dict(k6=11+rank, k8=21+rank) if op['role'].endswith('down') else
+                                      dict(k6=11+rank, k8=21+rank, bf16=31+rank, fp8=41+rank))))
+    result = bench.aggregate_flash_full_core(ops, records, rows)
+    sums = result['decode'][0]['local_dense_us_per_verify_step']
+    for rank in (0, 1):
+        for arm, producer, meet in [('k6', 2, 11), ('k8', 3, 21), ('bf16', 4, 31), ('fp8', 5, 41)]:
+            expected = sum((producer if o['hypothetical_trellis'] else 1)*o['count'][rank] for o in ops)
+            expected += (meet+rank)*sum(o['count'][rank] for o in ops if o['split'] == 'input' and
+                                      (arm in ('k6', 'k8') or o['role'] in ('kda_o', 'mla_o')))
+            assert sums[arm][rank] == expected
+            assert result['decode'][0]['kimi_rate_normalized_local_dense_us_per_emitted_token'][arm][rank] == pytest.approx(expected*73/255)
+    assert [r['head_calls'] for r in result['prefill']] == [1, 8]
+    assert result['prefill'][0]['body_row_histogram'] == {2752: 2, 2688: 1}
+    assert result['prefill'][1]['body_row_histogram'] == {2752: 23, 2240: 1}
+    assert 'not measured Flash speculation' in result['normalization']
+
+
+def test_flash_native_factories_match_mhc_routes_fg_pitches_and_fp8_head(monkeypatch):
+    from dataclasses import dataclass
+    bench, ops = _flash_core_ops()
+    unique = {o['role']: o for o in ops}
+    calls = []
+    @dataclass(frozen=True)
+    class Geometry:
+        heads: int = 64
+    class Launch:
+        def key(self):
+            return ()
+    def record(name):
+        def build(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return Launch()
+        return build
+    monkeypatch.setitem(sys.modules, 'cutlass', SimpleNamespace(Float32='f32', BFloat16='bf16'))
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(bfloat16='bf16', float32='f32', float8_e4m3fn='fp8'))
+    monkeypatch.setitem(sys.modules, 'b12x.integration.cuteafd._common', SimpleNamespace(
+        GLM53_FLASH=Geometry(), Operand=lambda *a, **kw: (a, kw), Scalar=lambda *a: a,
+        compile_program=lambda launch, **kw: kw))
+    dsv4_mhc = SimpleNamespace(compile_dsv4_mhc_pre_aot=record('pre'),
+        compile_dsv4_mhc_post_pre_aot=record('post_pre'))
+    glmf = SimpleNamespace(mhc_geometry=lambda g: 'mhc_geometry', _w8=record('fp8'), _batched_warps=lambda rows: rows)
+    monkeypatch.setitem(sys.modules, 'b12x.integration.cuteafd', SimpleNamespace(dsv4_mhc=dsv4_mhc, glmf=glmf))
+    monkeypatch.setitem(sys.modules, 'b12x.integration.cuteafd._glm_kernels', SimpleNamespace(
+        BatchedBf16Gemm=record('batched'), glm_projection=record('linear')))
+    monkeypatch.setitem(sys.modules, 'b12x.integration.cuteafd.glmf_split', SimpleNamespace(
+        compile_glmf_stage_aot=record('stage')))
+    bench.flash_full_core_projection_program(unique['mhc_pre'])
+    assert calls[-1] == ('pre', ('mhc_geometry',), {})
+    bench.flash_full_core_projection_program(unique['mhc_post_pre'])
+    assert calls[-1][2] == dict(max_rows=64, route='decode', wide_partials_per_cta=25, wide_min_rows=64)
+    bench.flash_full_core_projection_program(unique['mhc_post_pre'], prefill=True)
+    assert calls[-1][2] == dict(max_rows=4096, route='tf32')
+    program = bench.flash_full_core_projection_program(unique['kda_fg'])
+    assert calls[-1][2] == dict(n=4096, k=128, batch=2, a_row=12608, a_batch=128,
+                               o_row=8192, o_batch=4096, compute_warps=64)
+    assert len(program['operands']) == 3 and program['scalars'] == (('rows',),)
+    bench.flash_full_core_projection_program(unique['absorb'])
+    assert calls[-1][1][0].heads == 32 and calls[-1][2] == dict(stage='absorb', max_rows=64)
+    program = bench.flash_full_core_projection_program(unique['head'], prefill=True, fp8=True)
+    assert calls[-1][2] == dict(row_scales=True, decode_rows=64, out_dtype='f32', prefill_mask=0)
+    assert len(program['operands']) == 4 and program['scalars'] == (('rows',), ('fp8_rows',), ('qscratch', 'int64'))
+    bench.flash_full_core_projection_program(unique['kda_in'], fp8=True)
+    assert calls[-1][2]['warps'] == 8 and calls[-1][2]['groups'] == 2
+    with pytest.raises(ValueError, match='retained-native'):
+        bench.flash_full_core_projection_program(unique['mhc_pre'], fp8=True)
+
+
+def test_flash_mode_requires_admitted_counts_before_importing_cuda(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, 'argv', ['bench', '--output-dir', str(tmp_path), '--flash-core', 'headers.json'])
+    with pytest.raises(SystemExit) as error:
+        _native_threshold_bench().main()
+    assert error.value.code == 2
+
+
 def test_step5_mode_requires_admitted_counts_before_importing_cuda(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, 'argv', ['bench', '--output-dir', str(tmp_path), '--step5-core', 'headers.json'])
     with pytest.raises(SystemExit) as error:
