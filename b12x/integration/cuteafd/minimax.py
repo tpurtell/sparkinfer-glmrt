@@ -172,7 +172,12 @@ class _KvPack:
 
 def compile_minimax_norm_aot():
     """FP32 residual to BF16 Gemma norm, with the shared seven-pointer ABI."""
-    return compile_program(_ResidualNorm(width=6144, eps=1e-6), name="minimax_residual_norm",
+    # Same program name, ABI and geometry dict the shared AffineNorm exported:
+    # the engine's ForwardLayout reads heads, bias and rotary alongside width,
+    # epsilon, zero_centered and subtract_mean. Version 2 keeps this
+    # block-per-row kernel off the old scalar kernel's compile identity, which
+    # pairs the identical key tuple with version 1.
+    return compile_program(_ResidualNorm(width=6144, eps=1e-6), name="affine_norm",
         operands=(
             Operand("x", torch.float32, "[rows,6144]"),
             Operand("weight", torch.bfloat16, "[6144]"),
@@ -181,9 +186,11 @@ def compile_minimax_norm_aot():
             Operand("sin", torch.bfloat16, "ignored"),
             Operand("positions", torch.int64, "ignored"),
             Operand("out", torch.bfloat16, "[rows,6144]", "out")),
-        scalars=(Scalar("rows"),), key=(6144, 1e-6),
-        geometry=dict(width=6144, eps=1e-6, zero_centered=True, subtract_mean=False,
-                      input_dtype=torch.float32, parameter_dtype=torch.bfloat16))
+        scalars=(Scalar("rows"),),
+        key=(6144, 1, 1e-6, True, False, False, 0, torch.float32, torch.bfloat16),
+        version=2,
+        geometry=dict(width=6144, heads=1, eps=1e-6, zero_centered=True,
+                      subtract_mean=False, bias=False, rotary=0))
 
 
 def compile_minimax_router_scores_aot():
