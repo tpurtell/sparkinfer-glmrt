@@ -172,20 +172,20 @@ class _KvPack:
 
 def compile_minimax_norm_aot():
     """FP32 residual to BF16 Gemma norm, with the shared seven-pointer ABI."""
-    # Same program name, ABI and geometry dict the shared AffineNorm exported:
-    # the engine's ForwardLayout reads heads, bias and rotary alongside width,
-    # epsilon, zero_centered and subtract_mean. Version 2 keeps this
-    # block-per-row kernel off the old scalar kernel's compile identity, which
-    # pairs the identical key tuple with version 1.
+    # Same program name, operand records and geometry dict the shared AffineNorm
+    # exported: the engine validates the manifest's pointers and reads heads,
+    # bias and rotary alongside width, epsilon, zero_centered and subtract_mean.
+    # Version 2 keeps this block-per-row kernel off the old scalar kernel's
+    # compile identity, which pairs the identical key tuple with version 1.
     return compile_program(_ResidualNorm(width=6144, eps=1e-6), name="affine_norm",
         operands=(
-            Operand("x", torch.float32, "[rows,6144]"),
+            Operand("x", torch.float32, "[rows,1,6144]"),
             Operand("weight", torch.bfloat16, "[6144]"),
-            Operand("bias", torch.bfloat16, "ignored"),
-            Operand("cos", torch.bfloat16, "ignored"),
-            Operand("sin", torch.bfloat16, "ignored"),
-            Operand("positions", torch.int64, "ignored"),
-            Operand("out", torch.bfloat16, "[rows,6144]", "out")),
+            Operand("bias", torch.bfloat16, "[6144] (ignored unless bias)"),
+            Operand("cos", torch.bfloat16, "[positions,0] (ignored unless rotary)"),
+            Operand("sin", torch.bfloat16, "[positions,0] (ignored unless rotary)"),
+            Operand("positions", torch.int64, "[rows] (ignored unless rotary)"),
+            Operand("out", torch.bfloat16, "[rows,1,6144]", "out")),
         scalars=(Scalar("rows"),),
         key=(6144, 1, 1e-6, True, False, False, 0, torch.float32, torch.bfloat16),
         version=2,
