@@ -24,11 +24,11 @@ Every tile shape of a shape shares one CTA thread count and one K partition,
 so a logit is bitwise identical at every live row count: the tile shape
 changes only which CTA and which thread index store it, never how its
 K values are summed or folded.  A partial tail tile keeps that property by
-sliding its window back to a full tile: it re-reads the rows the previous
-window already covers and writes the same bits again, so it runs the
-full-tile address pattern instead of a per-row clamped one.  Only a launch
-with fewer live rows than the tile (a single-tile launch) still pairs dead
-slots with row 0 and drops their accumulators.
+sliding its window back to a full tile and running the full-tile address
+pattern; it stores only the rows its own (unshifted) window owns, so the
+earlier rows are written once, by the previous tile.  Only a launch with
+fewer live rows than the tile (a single-tile launch) still pairs dead slots
+with row 0 and drops their accumulators.
 """
 
 from __future__ import annotations
@@ -151,7 +151,6 @@ class RouterF32Gemv:
         tile0 = Int32(cute.arch.block_idx()[1]) * Int32(self.rows_per_tile)
         live = rows - tile0
         row0 = tile0
-        store_rows = live
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
         partial = storage.partial.get_tensor(
@@ -185,13 +184,12 @@ class RouterF32Gemv:
                     handled = Int32(1)
             if handled == Int32(0):
                 if rows >= Int32(self.rows_per_tile):
-                    # Slide the partial tail back to a full tile and rewrite the
-                    # rows the previous window also covers.  The overlap runs the
-                    # same K partition and fold, so it stores identical bytes,
-                    # and the tile keeps the full-tile address pattern instead of
-                    # a per-row clamped one.
+                    # Slide the partial tail back to a full tile: same K
+                    # partition and fold, full-tile address pattern instead of a
+                    # per-row clamped one.  The store keeps the unshifted window
+                    # as its lower bound, so the rows the previous tile owns are
+                    # written once and the shift adds no duplicate writes.
                     row0 = rows - Int32(self.rows_per_tile)
-                    store_rows = Int32(self.rows_per_tile)
                     shifted_base = (Int64(x.toint()) + Int64(row0) * Int64(self.k * 2)
                                     + Int64(tidx) * Int64(8))
                     self._loop(acc, w_base, shifted_base, self.rows_per_tile)
@@ -207,7 +205,7 @@ class RouterF32Gemv:
                 partial[warp, i] = acc[i]
         cute.arch.sync_threads()
         if tidx < Int32(self.outputs):
-            self._store(partial, out, col0, row0, store_rows, tidx)
+            self._store(partial, out, col0, row0, tile0, rows, tidx)
 
     @cute.jit
     def _loop(self, acc: cute.Tensor, w_base: Int64, x_base: Int64,
@@ -265,18 +263,19 @@ class RouterF32Gemv:
 
     @cute.jit
     def _store(self, partial: cute.Tensor, out: cute.Pointer, col0: Int64,
-               row0: Int32, keep: Int32, index: Int32):
+               row0: Int32, tile0: Int32, rows: Int32, index: Int32):
         m = index // Int32(self.cols)
         c = index % Int32(self.cols)
+        row = row0 + m
         total = Float32(0.0)
         for src in cutlass.range_constexpr(self.warps):
             total = total + partial[src, index]
         address = (Int64(out.toint())
-                   + ((Int64(row0) + Int64(m)) * Int64(self.n) + col0 + Int64(c))
-                   * Int64(4))
+                   + (Int64(row) * Int64(self.n) + col0 + Int64(c)) * Int64(4))
         target = cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=4)
-        if m < keep:
-            target[0] = total
+        if row >= tile0:
+            if row < rows:
+                target[0] = total
 
 
 # Router tile shapes for MiniMax's [128, 6144] FP32 weight, ascending live rows:
