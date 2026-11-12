@@ -23,7 +23,9 @@ FP32-accumulated dot product.
 Every tile shape of a shape shares one CTA thread count and one K partition,
 so a logit is bitwise identical at every live row count: the tile shape
 changes only which CTA and which thread index store it, never how its
-K values are summed or folded.
+K values are summed or folded.  A tail tile keeps that property without a
+per-row branch: slots past the live count re-read row 0 and the store drops
+their accumulators, so the tail path costs the same as a full tile.
 """
 
 from __future__ import annotations
@@ -177,7 +179,7 @@ class RouterF32Gemv:
                     self._loop(acc, w_base, x_base, 1)
                     handled = Int32(1)
             if handled == Int32(0):
-                self._loop_masked(acc, w_base, x_base, live)
+                self._loop_partial(acc, w_base, x_base, live)
         for i in cutlass.range_constexpr(self.outputs):
             value = acc[i]
             for shift in cutlass.range_constexpr(5):
@@ -206,8 +208,14 @@ class RouterF32Gemv:
                 self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + x_offset), m)
 
     @cute.jit
-    def _loop_masked(self, acc: cute.Tensor, w_base: Int64, x_base: Int64,
-                     live: Int32):
+    def _loop_partial(self, acc: cute.Tensor, w_base: Int64, x_base: Int64,
+                      live: Int32):
+        """Tail tile: dead rows re-read row 0 and are dropped by the store.
+
+        Clamping the row offset (instead of branching around each row's
+        loads and FMAs) keeps the tail path branch-free and as fast as a
+        full tile, and cannot change a live row's accumulation.
+        """
         for step in cutlass.range_constexpr(self.steps):
             w_offset = step * self.threads * 16
             x_offset = step * self.threads * 8
@@ -218,8 +226,10 @@ class RouterF32Gemv:
                 for j in cutlass.range_constexpr(4):
                     wv[4 * c + j] = u32_as_f32(words[j])
             for m in cutlass.range_constexpr(self.rows_per_tile):
-                if Int32(m) < live:
-                    self._accumulate(acc, wv, x_base + Int64(m * self.k * 2 + x_offset), m)
+                row_bytes = Int64(m) * Int64(self.k * 2)
+                if Int32(m) >= live:
+                    row_bytes = Int64(0)
+                self._accumulate(acc, wv, x_base + row_bytes + Int64(x_offset), m)
 
     @cute.jit
     def _accumulate(self, acc: cute.Tensor, wv: cute.Tensor, x_address: Int64,
@@ -254,8 +264,11 @@ class RouterF32Gemv:
 
 # Router tile shapes for MiniMax's [128, 6144] FP32 weight, ascending live rows:
 # (rows up to, cols, rows_per_tile). Every entry keeps threads=128 and one
-# K partition, so all shapes produce bitwise identical logits. Wide tiles cut
-# weight re-reads as rows grow; narrow tiles keep decode's CTA count high.
+# K partition, so all shapes produce bitwise identical logits. Narrow tiles
+# keep the CTA count high while rows are few; wide tiles cut weight re-reads
+# as rows grow. The 4x16 tier's full tiles measured the best rate of any shape
+# (24.1 us for 256 rows); its per-row collapse came from the tail path, which
+# is branch-free now, so the shape stays.
 MINIMAX_ROUTER_TILES = ((16, 2, 8), (64, 4, 8), (256, 4, 16), (4096, 8, 16))
 
 
