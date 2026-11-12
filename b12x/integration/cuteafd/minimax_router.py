@@ -23,9 +23,12 @@ FP32-accumulated dot product.
 Every tile shape of a shape shares one CTA thread count and one K partition,
 so a logit is bitwise identical at every live row count: the tile shape
 changes only which CTA and which thread index store it, never how its
-K values are summed or folded.  A tail tile keeps that property without a
-per-row branch: slots past the live count re-read row 0 and the store drops
-their accumulators, so the tail path costs the same as a full tile.
+K values are summed or folded.  A partial tail tile keeps that property by
+sliding its window back to a full tile: it re-reads the rows the previous
+window already covers and writes the same bits again, so it runs the
+full-tile address pattern instead of a per-row clamped one.  Only a launch
+with fewer live rows than the tile (a single-tile launch) still pairs dead
+slots with row 0 and drops their accumulators.
 """
 
 from __future__ import annotations
@@ -145,8 +148,10 @@ class RouterF32Gemv:
         warp = tidx // Int32(32)
         lane = tidx % Int32(32)
         col0 = Int64(cute.arch.block_idx()[0]) * Int64(self.cols)
-        row0 = Int32(cute.arch.block_idx()[1]) * Int32(self.rows_per_tile)
-        live = rows - row0
+        tile0 = Int32(cute.arch.block_idx()[1]) * Int32(self.rows_per_tile)
+        live = rows - tile0
+        row0 = tile0
+        store_rows = live
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
         partial = storage.partial.get_tensor(
@@ -156,7 +161,7 @@ class RouterF32Gemv:
             acc[i] = Float32(0.0)
         w_base = (Int64(w.toint()) + col0 * Int64(self.k * 4)
                   + Int64(tidx) * Int64(16))
-        x_base = (Int64(x.toint()) + Int64(row0) * Int64(self.k * 2)
+        x_base = (Int64(x.toint()) + Int64(tile0) * Int64(self.k * 2)
                   + Int64(tidx) * Int64(8))
         if live >= Int32(self.rows_per_tile):
             self._loop(acc, w_base, x_base, self.rows_per_tile)
@@ -179,7 +184,19 @@ class RouterF32Gemv:
                     self._loop(acc, w_base, x_base, 1)
                     handled = Int32(1)
             if handled == Int32(0):
-                self._loop_partial(acc, w_base, x_base, live)
+                if rows >= Int32(self.rows_per_tile):
+                    # Slide the partial tail back to a full tile and rewrite the
+                    # rows the previous window also covers.  The overlap runs the
+                    # same K partition and fold, so it stores identical bytes,
+                    # and the tile keeps the full-tile address pattern instead of
+                    # a per-row clamped one.
+                    row0 = rows - Int32(self.rows_per_tile)
+                    store_rows = Int32(self.rows_per_tile)
+                    shifted_base = (Int64(x.toint()) + Int64(row0) * Int64(self.k * 2)
+                                    + Int64(tidx) * Int64(8))
+                    self._loop(acc, w_base, shifted_base, self.rows_per_tile)
+                else:
+                    self._loop_partial(acc, w_base, x_base, live)
         for i in cutlass.range_constexpr(self.outputs):
             value = acc[i]
             for shift in cutlass.range_constexpr(5):
@@ -190,7 +207,7 @@ class RouterF32Gemv:
                 partial[warp, i] = acc[i]
         cute.arch.sync_threads()
         if tidx < Int32(self.outputs):
-            self._store(partial, out, col0, row0, live, tidx)
+            self._store(partial, out, col0, row0, store_rows, tidx)
 
     @cute.jit
     def _loop(self, acc: cute.Tensor, w_base: Int64, x_base: Int64,
@@ -210,11 +227,11 @@ class RouterF32Gemv:
     @cute.jit
     def _loop_partial(self, acc: cute.Tensor, w_base: Int64, x_base: Int64,
                       live: Int32):
-        """Tail tile: dead rows re-read row 0 and are dropped by the store.
+        """Single-tile launch: dead slots re-read row 0 and are dropped by the store.
 
-        Clamping the row offset (instead of branching around each row's
-        loads and FMAs) keeps the tail path branch-free and as fast as a
-        full tile, and cannot change a live row's accumulation.
+        Only reached when the live count is smaller than the tile, where a full
+        window cannot slide back; clamping the row offset keeps the path
+        branch-free and cannot change a live row's accumulation.
         """
         for step in cutlass.range_constexpr(self.steps):
             w_offset = step * self.threads * 16
@@ -248,7 +265,7 @@ class RouterF32Gemv:
 
     @cute.jit
     def _store(self, partial: cute.Tensor, out: cute.Pointer, col0: Int64,
-               row0: Int32, live: Int32, index: Int32):
+               row0: Int32, keep: Int32, index: Int32):
         m = index // Int32(self.cols)
         c = index % Int32(self.cols)
         total = Float32(0.0)
@@ -258,18 +275,18 @@ class RouterF32Gemv:
                    + ((Int64(row0) + Int64(m)) * Int64(self.n) + col0 + Int64(c))
                    * Int64(4))
         target = cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=4)
-        if m < live:
+        if m < keep:
             target[0] = total
 
 
 # Router tile shapes for MiniMax's [128, 6144] FP32 weight, ascending live rows:
 # (rows up to, cols, rows_per_tile). Every entry keeps threads=128 and one
 # K partition, so all shapes produce bitwise identical logits. Narrow tiles
-# keep the CTA count high while rows are few; wide tiles cut weight re-reads
-# as rows grow. The 4x16 tier's full tiles measured the best rate of any shape
-# (24.1 us for 256 rows); its per-row collapse came from the tail path, which
-# is branch-free now, so the shape stays.
-MINIMAX_ROUTER_TILES = ((16, 2, 8), (64, 4, 8), (256, 4, 16), (4096, 8, 16))
+# keep the CTA count high while rows are few; wide tiles cut activation
+# re-reads as rows grow (each column group reads the whole tile of x). The
+# 4x16 shape was dropped: at 256 rows it measured 21.7-24.5 us against
+# 19.2-19.4 us for 8x16 at 257-258 rows, so the wider shape serves 65+ rows.
+MINIMAX_ROUTER_TILES = ((16, 2, 8), (64, 4, 8), (4096, 8, 16))
 
 
 class RowTiledRouterF32:
