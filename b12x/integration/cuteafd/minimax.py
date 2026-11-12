@@ -1,9 +1,9 @@
 """MiniMax residual norm, FP32 router and paged attention KV producers.
 
 Arithmetic/layout reference: Hugh Madden, hughmadden/cuteafd@2cbf6873e,
-with hughmadden/sparkinfer-glmrt@4390f106. The residual norm is the
-MiniMax-specific block-per-row norm below; the router reuses the shared GEMV.
-KV packing preserves request/head descales and skips negative token slots.
+with hughmadden/sparkinfer-glmrt@4390f106. The residual norm and FP32-weight
+router use MiniMax-specific kernels; KV packing preserves request/head
+descales and skips negative token slots.
 All live counts are launch scalars; callers own buffers and graph lifetimes.
 """
 from __future__ import annotations
@@ -18,9 +18,9 @@ from cutlass import Float32, Int32, Int64, Uint32
 from b12x._lib.intrinsics import (
     cvt_f32x4_to_e4m3x4, div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, st_global_v4_u32,
 )
-from b12x.gemm.bf16_gemv._kernel import SmallNGemvKernel
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached
 from ._common import Operand, Scalar, compile_program
+from .minimax_router import minimax_router_scores
 from ._glm_kernels import _block_sum, _reduction_storage, _rsqrt
 from .pointwise import _add, _fma, _mul, _view
 
@@ -127,13 +127,12 @@ class _ResidualNorm:
 
 class _RouterScores:
     def __init__(self):
-        self.project = SmallNGemvKernel(128, 6144, False, False)
+        self.project = minimax_router_scores(128, 6144)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, logits: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.project(x, weight, weight, logits, rows, Int64(6144), Int64(6144), Int64(128),
-                     Int64(1), Int64(1), Int32(0), stream)
+        self.project(x, weight, logits, rows, stream)
 
 
 class _KvPack:
