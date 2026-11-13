@@ -115,46 +115,64 @@ def _assert_selected_attention(query, key, value, kd, vd, table, lengths, cu,
             assert (lse[row] - expected_lse).abs().max().item() <= .02, (request, row)
 
 
-@pytest.mark.parametrize("mode", ["decode", "extend"])
-def test_half_head_attention_is_byte_exact_whole_head_slice(mode):
+@pytest.mark.parametrize("mode,rows", [
+    *(('decode', rows) for rows in range(1, 65)),
+    *(('extend', rows) for rows in (1, 63, 64, 65, 2047, 2048, 2049,
+                                   2751, 2752, 2753, 4095, 4096)),
+])
+def test_half_head_attention_is_byte_exact_whole_head_slice(mode, rows):
     require_b12x()
     from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
 
     generator = torch.Generator(device="cuda").manual_seed(20261113)
-    lengths = [65, 257, 2700]
-    cu = [0, 1, 2, 3] if mode == "decode" else [0, 1, 14, 33]
-    rows, pool, stride = cu[-1], 80, 44
+    capacity = 64 if mode == "decode" else 4096
+    batch = rows if mode == "decode" else min(rows, 3)
+    counts = [1] * rows if mode == "decode" else [
+        rows // batch + int(request < rows % batch) for request in range(batch)]
+    cu = [0]
+    for count in counts:
+        cu.append(cu[-1] + count)
+    lengths = [count + (64, 256, 2699)[request % 3]
+               for request, count in enumerate(counts)]
+    pool = stride = 96
     key, value = _cache(generator, pool), _cache(generator, pool)
     query = torch.randn((rows, 64, 128), generator=generator, device="cuda").bfloat16()
-    kd, vd = [torch.rand((3, 4), generator=generator, device="cuda") + .5 for _ in range(2)]
-    table = torch.full((3, stride), -1, dtype=torch.int32, device="cuda")
-    selected = torch.full((4, rows, 16), -1, dtype=torch.int32, device="cuda")
+    kd, vd = [torch.rand((batch, 4), generator=generator, device="cuda") + .5 for _ in range(2)]
+    table = torch.full((batch, stride), -1, dtype=torch.int32)
+    selected = torch.full((4, capacity, 16), -1, dtype=torch.int32)
+    picker = torch.Generator().manual_seed(20261113)
     for request, length in enumerate(lengths):
         width = (length + 63) // 64
-        table[request, :width] = torch.randperm(pool, generator=generator, device="cuda")[:width].int()
+        table[request, :width] = torch.randperm(pool, generator=picker)[:width].int()
         start, end = cu[request:request + 2]
         for row in range(start, end):
             own = (length - (end - start) + row - start) // 128
             for head in range(4):
                 blocks = sorted(sorted(range(own), key=lambda b: ((b + head + row) % 3, b))[:15] + [own])
-                selected[head, row, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device="cuda")
+                selected[head, row, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
     lengths_gpu = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     offsets = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    table, selected = table.cuda(), selected.cuda()
 
     def run(first, heads):
-        program = compile_minimax_attention_aot(max_rows=rows, max_batch=3, mode=mode,
+        program = compile_minimax_attention_aot(max_rows=capacity, max_batch=64, mode=mode,
                                                query_heads=heads * 16, kv_heads=heads)
-        output = torch.empty((rows, heads * 16, 128), dtype=torch.bfloat16, device="cuda")
-        lse = torch.empty((rows, heads * 16), device="cuda")
-        scratch = torch.empty(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
-        program.launch(query[:, first * 16:(first + heads) * 16].contiguous(),
-                       key[:, :, first:first + heads].contiguous().view(torch.uint8),
-                       value[:, :, first:first + heads].contiguous().view(torch.uint8),
-                       kd[:, first:first + heads].contiguous(), vd[:, first:first + heads].contiguous(),
-                       table, lengths_gpu, offsets, selected[first:first + heads].contiguous(),
-                       output, lse, scratch, scalars=(rows, 3, stride, pool))
+        output = torch.full((capacity, heads * 16, 128), -7, dtype=torch.bfloat16, device="cuda")
+        lse = torch.full((capacity, heads * 16), -7., device="cuda")
+        scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda")
+        operands = (query[:, first * 16:(first + heads) * 16].contiguous(),
+                    key[:, :, first:first + heads].contiguous().view(torch.uint8),
+                    value[:, :, first:first + heads].contiguous().view(torch.uint8),
+                    kd[:, first:first + heads].contiguous(), vd[:, first:first + heads].contiguous(),
+                    table, lengths_gpu, offsets, selected[first:first + heads].contiguous())
+        frozen = [tensor.clone() for tensor in operands]
+        program.launch(*operands, output, lse, scratch, scalars=(rows, batch, stride, pool))
         torch.cuda.synchronize()
-        return output, lse
+        assert (output[rows:] == -7).all() and (lse[rows:] == -7).all()
+        assert torch.isfinite(output[:rows]).all() and torch.count_nonzero(output[:rows]) > 0
+        for actual, expected in zip(operands, frozen):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        return output[:rows], lse[:rows]
 
     whole = run(0, 4)
     for first in (0, 2):

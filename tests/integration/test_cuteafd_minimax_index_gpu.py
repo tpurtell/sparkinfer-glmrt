@@ -83,19 +83,23 @@ def test_balanced_scoring_selects_exactly_what_the_row_schedule_did(programs, ca
         assert (new_q2k[:, row] == own).any(dim=-1).all(), f"row {row} lost its own block"
 
 
-@pytest.mark.parametrize("mode", ["decode", "prefill"])
-def test_half_head_scores_and_selections_are_byte_exact_whole_head_slices(mode):
+@pytest.mark.parametrize("mode,rows", [
+    *(('decode', rows) for rows in range(1, 65)),
+    *(('prefill', rows) for rows in (1, 63, 64, 65, 2047, 2048, 2049,
+                                    2751, 2752, 2753, 4095, 4096)),
+])
+def test_half_head_scores_and_selections_are_byte_exact_whole_head_slices(mode, rows):
     require_b12x()
     from b12x.integration.cuteafd.minimax_indexer import _layout, compile_minimax_index_aot
 
-    capacity, pages, rows = 33, 96, 33
+    capacity, pages = (64 if mode == "decode" else 4096), 96
     gen = torch.Generator(device="cuda").manual_seed(20261113)
     query = torch.randn((rows, 4, 128), generator=gen, device="cuda").to(torch.float8_e4m3fn)
     scales = torch.rand((rows, 4), generator=gen, device="cuda") + .5
     key = torch.randn((pages * 64, 128), generator=gen, device="cuda").to(torch.float8_e4m3fn)
     key_scales = torch.rand(pages * 64, generator=gen, device="cuda") + .5
     starts = torch.tensor([0 if r % 2 else 2816 for r in range(rows)], dtype=torch.int32, device="cuda")
-    lengths = torch.tensor([2600 + r for r in range(rows)], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([2600 + r % 100 for r in range(rows)], dtype=torch.int32, device="cuda")
     ends = starts + lengths
     table = torch.stack([torch.randperm(pages, generator=gen, device="cuda").int() for _ in range(rows)])
     cache = torch.empty((pages, 8448), dtype=torch.uint8, device="cuda")
@@ -108,13 +112,16 @@ def test_half_head_scores_and_selections_are_byte_exact_whole_head_slices(mode):
         output = torch.full((heads, capacity, 16), -7, dtype=torch.int32, device="cuda")
         scratch = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
         q, qs = query[:, first:first + heads].contiguous(), scales[:, first:first + heads].contiguous()
-        if mode == "decode":
-            program.launch(q, qs, cache, table, lengths, output, scratch,
-                           scalars=(rows, pages, pages, pages))
-        else:
-            program.launch(q, qs, key, key_scales, starts, ends, output, scratch,
-                           scalars=(rows, int(ends.max().item())))
+        operands = ((q, qs, cache, table, lengths) if mode == "decode" else
+                    (q, qs, key, key_scales, starts, ends))
+        frozen = [tensor.clone() for tensor in operands]
+        scalars = (rows, pages, pages, pages) if mode == "decode" else (rows, int(ends.max().item()))
+        program.launch(*operands, output, scratch, scalars=scalars)
         torch.cuda.synchronize()
+        assert (output[:, rows:] == -7).all(), "inactive index rows were overwritten"
+        assert (output[:, :rows] >= 0).all(), "live rows must select 16 nonempty blocks"
+        for actual, expected in zip(operands, frozen):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
         scores = scratch[offsets["scores"]:offsets["scores"] + heads * rows * blocks * 4]
         result = [output.view(torch.uint8).reshape(heads, -1), scores.reshape(heads, -1)]
         if mode == "decode":

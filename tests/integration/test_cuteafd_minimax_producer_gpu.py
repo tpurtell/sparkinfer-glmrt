@@ -167,30 +167,37 @@ def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_pag
     assert pointers == [t.data_ptr() for t in tensors]
 
 
-def test_half_head_index_producer_preserves_query_bits_and_replicated_key_cache():
+@pytest.mark.parametrize("rows", [*range(1, 65), 65, 2047, 2048, 2049,
+                                  2751, 2752, 2753, 4095, 4096])
+def test_half_head_index_producer_preserves_query_bits_and_replicated_key_cache(rows):
     require_b12x()
     from b12x.integration.cuteafd.minimax_producer import compile_minimax_index_producer_aot
 
-    rows = 7
+    capacity = 4096
     gen = torch.Generator(device="cuda").manual_seed(20261113)
     iq = torch.randn((rows, 4, 128), generator=gen, device="cuda").bfloat16()
     ik = torch.randn((rows, 128), generator=gen, device="cuda").bfloat16()
     qn, kn = [(torch.randn(128, generator=gen, device="cuda") * .1).bfloat16() for _ in range(2)]
-    positions = torch.arange(rows, dtype=torch.int64, device="cuda") * 31
-    slots = torch.tensor([65, 127, -1, 128, 255, 2, 0], dtype=torch.int64, device="cuda")
+    positions = torch.arange(rows, dtype=torch.int64, device="cuda") * 31 % 257
+    slots = torch.arange(rows, dtype=torch.int64, device="cuda") * 17 % capacity
+    slots[torch.arange(rows, device="cuda") % 7 == 2] = -1
     cs = _cos_sin("cuda")
 
     def run(first, heads):
         program = compile_minimax_index_producer_aot(heads=heads)
-        query = torch.empty((rows, heads, 128), dtype=torch.float8_e4m3fn, device="cuda")
-        qs = torch.empty((rows, heads), device="cuda")
-        key = torch.empty((rows, 128), dtype=torch.float8_e4m3fn, device="cuda")
-        ks = torch.empty(rows, device="cuda")
-        cache = torch.full((4, 8448), 173, dtype=torch.uint8, device="cuda")
-        scratch = torch.empty(program.scratch_bytes(rows)["scratch"] // 2, dtype=torch.bfloat16, device="cuda")
+        query = torch.full((capacity, heads, 128), -7, dtype=torch.float8_e4m3fn, device="cuda")
+        qs = torch.full((capacity, heads), -7., device="cuda")
+        key = torch.full((capacity, 128), -7, dtype=torch.float8_e4m3fn, device="cuda")
+        ks = torch.full((capacity,), -7., device="cuda")
+        cache = torch.full((capacity // 64, 8448), 173, dtype=torch.uint8, device="cuda")
+        scratch = torch.empty(program.scratch_bytes(capacity)["scratch"] // 2, dtype=torch.bfloat16, device="cuda")
         program.launch(iq[:, first:first + heads].contiguous(), ik, qn, kn, positions, slots,
                        cs, query, qs, key, ks, cache, scratch, scalars=(rows,))
         torch.cuda.synchronize()
+        for output in (query, qs, key, ks):
+            assert (output[rows:].float() == -7).all(), "inactive producer rows were overwritten"
+            assert torch.isfinite(output[:rows].float()).all()
+            assert torch.count_nonzero(output[:rows].float()) > 0
         return query, qs, key, ks, cache
 
     whole = run(0, 4)
@@ -199,6 +206,67 @@ def test_half_head_index_producer_preserves_query_bits_and_replicated_key_cache(
         expected = (whole[0][:, first:first + 2].contiguous(), whole[1][:, first:first + 2].contiguous(), *whole[2:])
         for actual, reference in zip(half, expected):
             assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8)), first
+
+
+@pytest.mark.parametrize("rows", [*range(1, 65), 65, 2047, 2048, 2049,
+                                  2751, 2752, 2753, 4095, 4096])
+@pytest.mark.parametrize("heads", [4, 64])
+def test_half_head_norm_rope_is_byte_exact_whole_head_slice(rows, heads):
+    require_b12x()
+    from b12x.integration.cuteafd.minimax_producer import compile_minimax_norm_rope_aot
+
+    capacity = 4096
+    gen = torch.Generator(device="cuda").manual_seed(20261114)
+    x = torch.randn((rows, heads, 128), generator=gen, device="cuda").bfloat16()
+    weight = (torch.randn(128, generator=gen, device="cuda") * .1).bfloat16()
+    positions = torch.arange(rows, dtype=torch.int64, device="cuda") % 257
+    cs = _cos_sin("cuda")
+
+    def run(first, count):
+        program = compile_minimax_norm_rope_aot(heads=count)
+        source = x[:, first:first + count].contiguous()
+        out = torch.full((capacity, count, 128), -7, dtype=torch.bfloat16, device="cuda")
+        scratch = torch.empty_like(out)
+        program.launch(source, weight, positions, cs, out, scratch, scalars=(rows,))
+        torch.cuda.synchronize()
+        assert (out[rows:] == -7).all(), "inactive norm rows were overwritten"
+        assert torch.isfinite(out[:rows]).all() and torch.count_nonzero(out[:rows]) > 0
+        return out
+
+    whole = run(0, heads)
+    for first in (0, heads // 2):
+        half = run(first, heads // 2)
+        expected = whole[:, first:first + heads // 2].contiguous()
+        assert torch.equal(half.view(torch.uint8), expected.view(torch.uint8)), first
+
+
+@pytest.mark.parametrize("rows", [*range(1, 65), 65, 2047, 2048, 2049,
+                                  2751, 2752, 2753, 4095, 4096])
+@pytest.mark.parametrize("width", [3072, 12288])
+def test_half_width_oai_is_byte_exact_whole_width_slice(rows, width):
+    require_b12x()
+    from b12x.integration.cuteafd.minimax_producer import compile_minimax_oai_split_aot
+
+    capacity = 4096
+    gen = torch.Generator(device="cuda").manual_seed(20261114)
+    gate, up = [(torch.randn((rows, width), generator=gen, device="cuda") * 4).bfloat16()
+                for _ in range(2)]
+
+    def run(first, count):
+        program = compile_minimax_oai_split_aot(width=count)
+        out = torch.full((capacity, count), -7, dtype=torch.bfloat16, device="cuda")
+        program.launch(gate[:, first:first + count].contiguous(),
+                       up[:, first:first + count].contiguous(), out, scalars=(rows,))
+        torch.cuda.synchronize()
+        assert (out[rows:] == -7).all(), "inactive activation rows were overwritten"
+        assert torch.isfinite(out[:rows]).all() and torch.count_nonzero(out[:rows]) > 0
+        return out
+
+    whole = run(0, width)
+    for first in (0, width // 2):
+        half = run(first, width // 2)
+        expected = whole[:, first:first + width // 2].contiguous()
+        assert torch.equal(half.view(torch.uint8), expected.view(torch.uint8)), first
 
 
 @pytest.mark.parametrize("width", [1536, 3072, 6144, 12288])
