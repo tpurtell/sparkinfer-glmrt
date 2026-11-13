@@ -74,6 +74,46 @@ def test_fp32_router_weights_fp64_oracle_live_rows_and_replay():
         check(17)
 
 
+@pytest.mark.parametrize("rows", [*range(1, 65), 65, 2047, 2048, 2049,
+                                  2751, 2752, 2753, 4095, 4096])
+def test_half_head_kv_pack_is_byte_exact_whole_head_cache_slice(rows):
+    device = require_b12x()
+    from b12x.integration.cuteafd.minimax import compile_minimax_kv_pack_aot
+
+    capacity = 4096
+    gen = torch.Generator(device=device).manual_seed(20261114)
+    key, value = [torch.randn((rows, 4, 128), generator=gen, device=device).bfloat16()
+                  for _ in range(2)]
+    slots = torch.arange(rows, dtype=torch.int64, device=device) * 17 % capacity
+    slots[torch.arange(rows, device=device) % 7 == 2] = -1
+    batch_ids = torch.arange(rows, dtype=torch.int32, device=device) % 3
+    kd, vd = [torch.rand((3, 4), generator=gen, device=device) + .25 for _ in range(2)]
+
+    def run(first, heads):
+        program = compile_minimax_kv_pack_aot(heads=heads)
+        operands = (key[:, first:first + heads].contiguous(),
+                    value[:, first:first + heads].contiguous(), slots, batch_ids,
+                    kd[:, first:first + heads].contiguous(), vd[:, first:first + heads].contiguous())
+        frozen = [tensor.clone() for tensor in operands]
+        caches = [torch.full((capacity, heads, 128), 173, dtype=torch.uint8, device=device)
+                  for _ in range(2)]
+        program.launch(*operands, *caches, scalars=(rows,))
+        torch.cuda.synchronize()
+        for actual, expected in zip(operands, frozen):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        untouched = torch.ones(capacity, dtype=torch.bool, device=device)
+        untouched[slots[slots >= 0]] = False
+        for cache in caches:
+            assert (cache[untouched] == 173).all(), "unwritten cache slots were modified"
+            assert (cache[~untouched] != 173).any(), "cache writes are missing"
+        return caches
+
+    whole = run(0, 4)
+    for first in (0, 2):
+        for actual, reference in zip(run(first, 2), whole):
+            assert torch.equal(actual, reference[:, first:first + 2].contiguous()), first
+
+
 @pytest.mark.parametrize("heads", [2, 4])
 @pytest.mark.parametrize("big_slot", [False, True])
 def test_kv_pack_exact_bits_descales_negative_slots_live_rows_and_replay(big_slot, heads):
