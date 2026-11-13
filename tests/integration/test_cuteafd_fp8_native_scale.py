@@ -7,19 +7,18 @@ block, so the weight operand carries no rounding beyond the checkpoint's own.
 ``bf16(w * s)``, the pre-native form, rounds the dequantized weight before the
 MMA and adds error the checkpoint does not ship.
 
-The oracle dequantizes with the unrounded ``w * s`` in FP64 (``exact=True``
-semantics) and keeps the program's own BF16 product/rounding points. The
-fixture is one real checkpoint layer: expert-stacked E4M3
-``moe.{gate,up,down}_proj.weight`` and ``weight_scale_inv`` sliced to the first
-experts, stored by ``CUTEAFD_FP8_LAYER_FIXTURE`` as ``torch.save`` of ``name``,
-``hidden``, ``intermediate``, ``experts``, ``top_k``, ``swiglu_limit``,
-``activation`` and ``w1/s1`` (gate), ``w3/s3`` (up), ``w2/s2`` (down) with the
-checkpoint's bytes kept as ``w.view(torch.uint8)``.
+The oracle dequantizes with the unrounded ``w * s`` in FP64 and keeps the
+program's BF16 rounding points. A synthetic nonuniform-scale case always runs
+on SM12x. The real case reads only the first expert of Step-5-Preview layer 10
+from the local HF cache (or ``CUTEAFD_FP8_SNAPSHOT``), without downloads or a
+private fixture format. It skips only when the checkpoint is absent.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -27,18 +26,55 @@ import torch
 from ..conftest import require_b12x
 
 
-def _fixture():
-    path = os.environ.get("CUTEAFD_FP8_LAYER_FIXTURE")
-    if not path:
-        pytest.skip("set CUTEAFD_FP8_LAYER_FIXTURE to a real-layer expert fixture")
+def _fixture(source):
     from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry
 
-    data = torch.load(path, map_location="cpu", weights_only=True)
-    g = Fp8MoeGeometry(data["name"], hidden=int(data["hidden"]), experts=int(data["experts"]),
-                       top_k=int(data["top_k"]), intermediate=int(data["intermediate"]),
-                       swiglu_limit=float(data["swiglu_limit"]), activation=data["activation"])
-    tensors = tuple(data[name] for name in ("w1", "s1", "w3", "s3", "w2", "s2"))
-    return g, tensors
+    if source == "synthetic":
+        g = Fp8MoeGeometry("native_scale_synthetic", hidden=512, intermediate=512,
+                           experts=2, top_k=2, swiglu_limit=7.,
+                           activation="silu_post_clamp_fp32_product")
+        gen = torch.Generator().manual_seed(475)
+        tensors = []
+        for n, k in ((512, 512),) * 3:
+            weight = (torch.randn(g.experts, n, k, generator=gen) * 100).clamp(-448, 448)
+            scale = torch.rand(g.experts, n // 128, k // 128, generator=gen) * 9e-4 + 1e-4
+            tensors.extend((weight.to(torch.float8_e4m3fn).view(torch.uint8), scale))
+        return g, tuple(tensors)
+
+    from safetensors import safe_open
+
+    override = os.environ.get("CUTEAFD_FP8_SNAPSHOT")
+    if override:
+        snapshot = Path(override)
+        assert (snapshot / "config.json").is_file(), f"missing checkpoint: {snapshot}"
+    else:
+        home = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
+        cache = Path(os.environ.get("HF_HUB_CACHE", home / "hub"))
+        snapshots = sorted((cache / "models--stepfun-ai--Step-5-Preview" / "snapshots").glob("*"))
+        if not snapshots:
+            pytest.skip("Step-5-Preview is not cached; set CUTEAFD_FP8_SNAPSHOT")
+        snapshot = snapshots[-1]
+    config = json.loads((snapshot / "config.json").read_text())["text_config"]
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
+    g = Fp8MoeGeometry("step5_layer10_expert0", hidden=int(config["hidden_size"]),
+                       intermediate=int(config["moe_intermediate_size"]), experts=1, top_k=1,
+                       swiglu_limit=float(config["swiglu_limits"][10]),
+                       activation="silu_post_clamp_fp32_product")
+    tensors = []
+    for projection, shape in (("gate", (g.intermediate, g.hidden)),
+                              ("up", (g.intermediate, g.hidden)),
+                              ("down", (g.hidden, g.intermediate))):
+        for suffix, dtype, dims in (("weight", "F8_E4M3", shape),
+                                    ("weight_scale_inv", "F32", tuple(d // 128 for d in shape))):
+            name = f"model.layers.10.moe.{projection}_proj.{suffix}"
+            with safe_open(snapshot / index[name], framework="pt", device="cpu") as shard:
+                view = shard.get_slice(name)
+                assert view.get_dtype() == dtype, (name, view.get_dtype())
+                assert tuple(view.get_shape()[1:]) == dims, (name, view.get_shape())
+                tensor = view[:1].contiguous()
+            tensors.append(tensor.view(torch.uint8) if suffix == "weight" else tensor)
+    print(f"fp8_native_scale checkpoint={snapshot} layer=10 expert=0")
+    return g, tuple(tensors)
 
 
 def _dequant(w, s):
@@ -91,11 +127,11 @@ def _weight_error(tensors):
     return worst, total / count
 
 
-def test_native_scale_real_layer_exact_oracle():
-    """Real layer weights, rows 1/16/64: the native route matches the exact-weight
-    oracle, and a row's bytes do not depend on the live row count."""
+@pytest.mark.parametrize("source", ["synthetic", "checkpoint"])
+def test_native_scale_real_layer_exact_oracle(source):
+    """Match exact weights and preserve bytes under changing live row counts."""
     require_b12x()
-    g, tensors = _fixture()
+    g, tensors = _fixture(source)
     from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
 
     device = "cuda"
