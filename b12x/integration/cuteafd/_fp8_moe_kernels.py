@@ -384,15 +384,19 @@ class MoeCombine:
     """``out[r] = bf16(sum_k weights[r, k] * y[pair_pos[r, k]])`` (FP32, slot
     order; invalid routes skip). One CTA per row, 8 BF16 per thread-step."""
 
-    def __init__(self, *, hidden: int, top_k: int, row_addresses: bool = False):
+    def __init__(self, *, hidden: int, top_k: int, row_addresses: bool = False, unit_weights: bool = False):
         self.hidden, self.top_k = int(hidden), int(top_k)
         self.row_addresses = bool(row_addresses)
+        # unit_weights: the route weight was applied upstream (before the FC2
+        # quantization); the combine is a plain sum over the row's slots.
+        self.unit_weights = bool(unit_weights)
         if self.hidden % 8:
             raise ValueError("hidden must be a multiple of 8")
         self.threads = min(512, self.hidden // 8)
 
     def key(self) -> tuple:
-        return (self.hidden, self.top_k) + (("row_addresses",) if self.row_addresses else ())
+        return (self.hidden, self.top_k) + (("row_addresses",) if self.row_addresses else ()) \
+            + (("unit_weights",) if self.unit_weights else ())
 
     @cute.jit
     def __call__(self, y: cute.Pointer, pair_pos: cute.Pointer, weights: cute.Pointer, out: cute.Pointer,
@@ -416,7 +420,9 @@ class MoeCombine:
                 for k in cutlass.range_constexpr(self.top_k):
                     p = _i32_at(Int64(pos_base(pair_pos)), row * Int32(self.top_k) + Int32(k))
                     if p >= Int32(0):
-                        w = _ld_f32(Int64(weights.toint()) + (Int64(row) * Int64(self.top_k) + Int64(k)) * Int64(4))
+                        w = Float32(1.0)
+                        if const_expr(not self.unit_weights):
+                            w = _ld_f32(Int64(weights.toint()) + (Int64(row) * Int64(self.top_k) + Int64(k)) * Int64(4))
                         words = ld_global_v4_u32(Int64(y.toint()) + (Int64(p) * Int64(self.hidden)
                                                                     + Int64(v) * Int64(8)) * Int64(2))
                         for j in cutlass.range_constexpr(4):
