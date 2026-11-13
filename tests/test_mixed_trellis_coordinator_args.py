@@ -52,14 +52,15 @@ def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
 
 def benchmark():
     names = {"parse_coordinator_arm", "coordinator_compile_options", "coordinator_route_waves",
-             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm", "compact_prefill_fixture"}
+             "coordinator_preflight", "benchmark_parser", "parse_prefill_arm", "compact_prefill_fixture",
+             "muse_route_waves", "coordinator_routes_sha256", "coordinator_output", "muse_partial_binding"}
     tables = {"GLM_CAPACITIES", "GLM_PROFILES", "GLM_ROUTES", "COORDINATOR_FAMILIES",
               "COORDINATOR_PROFILES", "SERVED_ROUTE_BLOCKS", "SERVED_TOKEN_ROTATION",
               "PREFILL_FAMILIES"}
     glm_profiles = {"rtx-tp1": 2048, "rtx-tp2": 1024, "spark-tp6-width384": 384,
                     "spark-tp6-width256": 256, "spark-tp4-width512": 512}
     glm_routes = SOURCE.parent / "fixtures/glm53_prefill_routes_realistic.json"
-    scope = dict(argparse=argparse, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
+    scope = dict(argparse=argparse, hashlib=hashlib, json=json, Path=Path, re=re, SimpleNamespace=SimpleNamespace,
                  __file__=str(SOURCE),
                  GLM_PROFILES=glm_profiles, GLM_ROUTES=glm_routes)
     host_names = {"route_pack_capacity", "route_pack_numel_capacity", "route_pack_token_capacity",
@@ -453,9 +454,336 @@ def test_bad_audit_arm(text):
         benchmark().parse_coordinator_arm(text)
 
 
+@pytest.mark.parametrize("family,hidden,experts,topk,widths,clamp", [
+    ("muse", 4096, 256, 8, {4096, 2048, 1024, 896, 768, 640, 512}, None),
+    ("step5", 4096, 352, 8, {1536, 768, 512, 384, 256}, 7.0),
+    ("ml4", 6144, 128, 4, {6144, 3072, 1280, 1152, 1024, 896, 768}, None),
+])
+def test_new_family_launchable_cells(family, hidden, experts, topk, widths, clamp):
+    b = benchmark()
+    spec = b.COORDINATOR_FAMILIES[family]
+    assert set(spec["profiles"].values()) == widths
+    assert len(spec["profiles"]) == len(widths)
+    assert spec["capacities"] == (256, 1024, 2048, 2752, 4096)
+    for profile, width in spec["profiles"].items():
+        for capacity in spec["capacities"]:
+            props = SimpleNamespace(multi_processor_count=48 if profile.startswith("spark-") else 170,
+                                    shared_memory_per_block_optin=101376)
+            opts = b.coordinator_compile_options(profile, capacity, {"mode": "ws"}, props, family)
+            assert (opts["hidden_size"], opts["route_num_experts"], opts["top_k"]) == (hidden, experts, topk)
+            assert opts["intermediate_size"] == width and opts["swiglu_limit"] == clamp
+            assert opts["activation"] == ("silu_post_clamp" if family == "step5" else "silu")
+            assert (opts["tier0_bits"], opts["tier1_bits"]) == ((4, 6) if family == "step5" else (4, 5))
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", family, "--role", "coordinator", "--route-distributions", "random",
+        "--output", "result.json", "--coordinator-arm", "current:mode=ws"])
+    assert b.coordinator_preflight(args)[3] == []
+
+
+@pytest.mark.parametrize("profile", ["rtx-tp1", "spark-tp3-width512"])
+def test_step_k6_tail_uses_existing_high_tier_selector(profile):
+    b = benchmark()
+    args = b.benchmark_parser().parse_args([
+        "--prefill-family", "step5", "--role", "spark" if profile.startswith("spark-") else "coordinator",
+        "--profile", profile, "--bits", "4", "6", "--k5-experts", "352",
+        "--route-distributions", "random", "--layers", "3", "--output", "result.json",
+        "--no-coop", "--coordinator-arm", "current:mode=ws", "--coordinator-arm", "candidate:mode=ws,dynamic=1"])
+    capacities, specs, _, _, _ = b.coordinator_preflight(args)
+    assert args.k5_experts == b.COORDINATOR_FAMILIES["step5"]["experts"]
+    assert args.layers == 3
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    for capacity in capacities:
+        for _, arm in specs:
+            options = b.coordinator_compile_options(profile, capacity, arm, props, "step5", bits=args.bits)
+            assert (options["tier0_bits"], options["tier1_bits"]) == (4, 6)
+
+
+def muse_fixture(tmp_path, ids=None):
+    import struct
+    layer = tmp_path / "layer013"
+    layer.mkdir(exist_ok=True)
+    ids = list(range(8)) * 2 if ids is None else ids
+    payloads = {"a00.ids": struct.pack("<" + "h" * len(ids), *ids),
+                "a00.weights": struct.pack("<" + "f" * len(ids), *([0.125] * len(ids)))}
+    for name, value in payloads.items():
+        (layer / (name + ".bin")).write_bytes(value)
+    data = dict(schema="cuteafd.muse.routes/1", layer=13, experts=256, top_k=8,
+                ids_dtype="<i2", weights_dtype="<f4",
+                files={name: hashlib.sha256(value).hexdigest() for name, value in payloads.items()})
+    index = layer / "index.json"
+    index.write_text(json.dumps(data))
+    return index
+
+
+def test_muse_routes_histogram_and_checksums(tmp_path):
+    b = benchmark()
+    index = muse_fixture(tmp_path)
+    waves = b.coordinator_route_waves(tmp_path, 13, "muse")
+    assert waves == [dict(layer=13, rows=2, content="a00", expert_rows=[(e, 2) for e in range(8)])]
+    assert b.coordinator_route_waves(index, family="muse") == waves
+    digest = b.coordinator_routes_sha256(tmp_path)
+    assert len(digest) == 64
+    assert b.coordinator_routes_sha256(index) == hashlib.sha256(index.read_bytes()).hexdigest()
+    (index.parent / "a00.ids.bin").write_bytes(b"bad")
+    with pytest.raises(ValueError, match="checksum"):
+        b.coordinator_route_waves(tmp_path, family="muse")
+
+
+@pytest.mark.parametrize("ids,match", [(list(range(7)), "payload size"),
+    ([0] * 8, "distinct"), (list(range(7)) + [256], "outside")])
+def test_muse_routes_reject_bad_ids(tmp_path, ids, match):
+    b = benchmark()
+    muse_fixture(tmp_path, ids)
+    with pytest.raises(ValueError, match=match):
+        b.coordinator_route_waves(tmp_path, family="muse")
+
+
+def test_muse_routes_reject_metadata_and_empty_selection(tmp_path):
+    b = benchmark()
+    index = muse_fixture(tmp_path)
+    with pytest.raises(ValueError, match="no selected waves"):
+        b.coordinator_route_waves(tmp_path, 12, "muse")
+    data = json.loads(index.read_text())
+    data["ids_dtype"] = ">i2"
+    index.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="little-endian"):
+        b.coordinator_route_waves(tmp_path, family="muse")
+
+
+@pytest.mark.parametrize("family", ["glm", "qwen4", "kimik3"])
+def test_generic_output_accessor_and_metadata_unchanged(family, tmp_path):
+    b = benchmark()
+    # Identity preserves the generic tensor's storage, dtype and bytes; no Muse allocation/copy.
+    output = bytes(range(256))
+    workspace = SimpleNamespace(output=output, partial_output=b"not a summed output")
+    assert b.coordinator_output(workspace, family) is output
+    assert b.coordinator_output(workspace, "muse") is workspace.partial_output
+    result = next(node for node in ast.walk(TREE) if isinstance(node, ast.keyword) and node.arg == "conditions"
+                  and "partial_program" in ast.unparse(node.value))
+    conditions = eval(compile(ast.Expression(result.value), str(SOURCE), "eval"),
+                      dict(partial_program=None, compact=None, args=SimpleNamespace(prefill_family=family)))
+    expected = ("synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); "
+                "common E4M3/UE8M0 K32-roundtripped BF16 input; "
+                "histogram replay preserves rescaled expert counts, not original token co-occurrence; "
+                "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; "
+                "median of interleaved round medians, microseconds per layer")
+    assert conditions.encode() == expected.encode()
+    path = tmp_path / "routes.json"
+    path.write_bytes(b'{"fixture":"unchanged"}\n')
+    assert b.coordinator_routes_sha256(path) == hashlib.sha256(path.read_bytes()).hexdigest()
+    run = next(node for node in ast.walk(TREE) if isinstance(node, ast.FunctionDef) and node.name == "run"
+               and any(isinstance(n, ast.Name) and n.id == "partial_program" for n in ast.walk(node)))
+    returned = run.body[-1].value
+    assert isinstance(returned, ast.IfExp) and ast.unparse(returned.orelse) == "result"
+
+
+def test_muse_callback_uses_unweighted_partial_abi(monkeypatch):
+    import sys
+    from unittest.mock import Mock
+
+    b = benchmark()
+    namespace = b.muse_partial_binding.__globals__
+    row_map = SimpleNamespace(data_ptr=lambda: 11)
+    partial_output = SimpleNamespace(data_ptr=lambda: 22)
+    torch = SimpleNamespace(empty=Mock(return_value=partial_output), arange=Mock(return_value=row_map),
+                            bfloat16="bf16", int32="i32")
+    monkeypatch.setitem(namespace, "torch", torch)
+    monkeypatch.setitem(namespace, "replace", lambda obj, **kw: SimpleNamespace(**(vars(obj) | kw)))
+    cute = SimpleNamespace(AddressSpace=SimpleNamespace(gmem="gmem"))
+    cutlass = SimpleNamespace(Uint32="u32", BFloat16="bf16", cute=cute)
+    make_ptr = Mock(side_effect=lambda dtype, address, space, assumed_align: (dtype, address, assumed_align))
+    monkeypatch.setitem(sys.modules, "cutlass", cutlass)
+    monkeypatch.setitem(sys.modules, "cutlass.cute", cute)
+    monkeypatch.setitem(sys.modules, "b12x._lib.utils", SimpleNamespace(make_ptr=make_ptr))
+    summed = Mock()
+    launch = SimpleNamespace(size_m=256, top_k=8, hidden_size=4096,
+                             topk_sum=SimpleNamespace(compiled=summed))
+    binding = SimpleNamespace(launch=launch, device="cuda:0")
+    workspace = SimpleNamespace(output=b"sum-buffer")
+    program = SimpleNamespace(compiled=Mock())
+    bound = b.muse_partial_binding(binding, workspace, program)
+    callback = bound.launch.topk_sum.compiled
+    callback("fc2", "ignored-sum", "ignored-weights", "ids", "map", "svh", 256, 256, 17, "stream")
+    program.compiled.assert_called_once_with("fc2", "svh", "ids", "map", ("u32", 11, 4),
+                                             ("bf16", 22, 16), 17, 17, 256, 256, "stream")
+    summed.assert_not_called()
+    assert binding.launch is launch and launch.topk_sum.compiled is summed
+    assert workspace.output == b"sum-buffer" and workspace.partial_output is partial_output
+    torch.empty.assert_called_once_with((256, 8, 4096), dtype="bf16", device="cuda:0")
+    assert any(cell.cell_contents is row_map for cell in callback.__closure__)
+
+
 def test_prerotate_requires_bf16_ws():
     b = benchmark()
     props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
     for arm in ({"mode": "cooperative", "prerotate": 0}, {"mode": "ws", "wire": 1, "prerotate": 1}):
         with pytest.raises(ValueError):
             b.coordinator_compile_options("rtx-tp2", 2752, arm, props)
+
+
+def oracle_helpers():
+    torch = pytest.importorskip("torch")
+    names = {"decode_mcg_matrix", "oracle_error", "oracle_error_no_worse",
+             "coordinator_f32_oracle", "coordinator_oracle_case"}
+    scope = dict(torch=torch, hashlib=hashlib)
+    nodes = [node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
+    return scope
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("shape", [(16, 16), (32, 48)])
+def test_oracle_decoder_matches_independent_native_reference(bits, shape):
+    import numpy as np
+    scope = oracle_helpers()
+    torch = scope["torch"]
+    reference_path = SOURCE.parents[1] / "tests/moe/test_fused_moe_trellis.py"
+    tree = ast.parse(reference_path.read_text())
+    names = {"_decode_mcg_fp16", "_decode_lane", "_reconstruct_native"}
+    reference = dict(np=np, torch=torch, _MCG=np.uint64(0xCBAC1FED),
+                     _MCG_MASK=np.uint32(0x8FFF8FFF), _MCG_OR=np.uint32(0x3B603B60))
+    exec(compile(ast.Module(body=[node for node in tree.body
+                                 if isinstance(node, ast.FunctionDef) and node.name in names],
+                            type_ignores=[]), str(reference_path), "exec"), reference)
+    rows, columns = shape
+    payload = torch.randint(-(1 << 31), (1 << 31) - 1, (rows // 16, columns // 16, 8 * bits),
+                            dtype=torch.int32, generator=torch.Generator().manual_seed(41 + bits))
+    expected = reference["_reconstruct_native"](payload.view(torch.int16)).float()
+    assert torch.equal(scope["decode_mcg_matrix"](payload.flatten(), rows, columns, bits), expected)
+
+
+@pytest.mark.parametrize("error,accepted", [
+    ({"max_abs": 0.9, "rms": 0.4}, True),
+    ({"max_abs": 1.0, "rms": 0.5}, True),
+    ({"max_abs": 1.00000001, "rms": 0.4}, False),
+    ({"max_abs": 0.9, "rms": 0.50000001}, False),
+    ({"max_abs": float("nan"), "rms": 0.0}, False),
+])
+def test_oracle_requires_both_error_metrics_without_slack(error, accepted):
+    scope = oracle_helpers()
+    assert scope["oracle_error_no_worse"](error, {"max_abs": 1.0, "rms": 0.5}) is accepted
+
+
+@pytest.mark.parametrize("family", ["step5", "ml4"])
+@pytest.mark.parametrize("tier_bits", [(4, 4), (4, 6)])
+def test_f32_oracle_projection_descriptors_scales_rotations_and_clamp(family, tier_bits):
+    scope = oracle_helpers()
+    torch = scope["torch"]
+    scope["COORDINATOR_FAMILIES"] = {family: dict(hidden=128, experts=3, swiglu_limit=7.0)}
+    generator = torch.Generator().manual_seed(12)
+    tiers = []
+    for bits in tier_bits:
+        words = 8 * 8 * 8 * bits
+        tiers.append(SimpleNamespace(
+            num_experts=3, intermediate_size=128, trellis_bits=bits,
+            w13=torch.randint(-(1 << 31), (1 << 31) - 1, (3 * words,), generator=generator, dtype=torch.int32),
+            w2=torch.randint(-(1 << 31), (1 << 31) - 1, (2 * words,), generator=generator, dtype=torch.int32),
+            w13_global_scale=torch.tensor([0.8, 1.2, 1.1]), w2_global_scale=torch.tensor([1.3, 0.9])))
+    descriptors = torch.tensor([[0, 512, 1, -1, -1, -1], [512, 0, 513, -1, -1, -1],
+                                [0, 512, 1, -1, -1, -1]], dtype=torch.int32)
+    rotations = SimpleNamespace(**{name: 0.8 + torch.rand(shape, generator=generator) * 0.4
+        for name, shape in (("intermediate", (6, 384)), ("gate_suh", (6, 128)),
+                            ("up_suh", (6, 128)), ("down_svh", (6, 128)))})
+    mapping = torch.tensor([2, 0, 1], dtype=torch.int32)
+    source = torch.randn((4, 128), generator=generator) * 4
+    ids = torch.tensor([[0, 1], [1, 2], [2, 0], [0, 2]], dtype=torch.int32)
+    weights = torch.tensor([[0.2, 0.8], [0.3, 0.7], [0.4, 0.6], [0.9, 0.1]])
+    native_decode = scope["decode_mcg_matrix"]
+    decoded_bits = []
+    def tracked_decode(payload, rows, columns, bits):
+        decoded_bits.append(bits)
+        assert payload.numel() == rows // 16 * (columns // 16) * 8 * bits
+        return native_decode(payload, rows, columns, bits)
+    scope["decode_mcg_matrix"] = tracked_decode
+    actual = scope["coordinator_f32_oracle"]((*tiers, mapping, descriptors.flatten(), rotations),
+                                            source, ids, weights, family)
+    assert set(decoded_bits) == set(tier_bits)
+    # Independent scalar-route math with a parity-constructed normalized H128.
+    h = torch.tensor([[(-1.0) ** ((i & j).bit_count()) for j in range(128)] for i in range(128)]) / 128 ** 0.5
+    expected = torch.zeros_like(actual)
+    clamped = False
+    for row in range(4):
+        for slot in range(2):
+            combined = int(mapping[ids[row, slot]])
+            matrices = []
+            for projection in range(3):
+                code = int(descriptors[projection, combined])
+                tier, local = code >> 9, code & 511
+                t = tiers[tier]
+                words = 8 * 8 * 8 * t.trellis_bits
+                offset = (local + ([2, 1][tier] if projection == 1 else 0)) * words
+                payload = t.w13[offset:offset + words] if projection < 2 else t.w2[local * words:(local + 1) * words]
+                scale = t.w13_global_scale[local] if projection < 2 else t.w2_global_scale[local]
+                matrices.append(native_decode(payload, 128, 128, t.trellis_bits) * scale)
+            scales = rotations.intermediate[combined].split(128)
+            gate = (((source[row] * rotations.gate_suh[combined]) @ h) @ matrices[0]) @ h * scales[0]
+            up = (((source[row] * rotations.up_suh[combined]) @ h) @ matrices[1]) @ h * scales[1]
+            active = gate * torch.sigmoid(gate)
+            if family == "step5":
+                clamped |= bool((active > 7).any() or (up.abs() > 7).any())
+                active, up = active.clamp(max=7), up.clamp(-7, 7)
+            down = ((((active * up * scales[2]) @ h) @ matrices[2]) @ h) * rotations.down_svh[combined]
+            expected[row] += down * weights[row, slot]
+    assert family != "step5" or clamped
+    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.0001)
+
+
+@pytest.mark.parametrize("defect", [None, "rows", "graph", "determinism", "oracle"])
+def test_arm_qualification_does_not_require_control_equality(monkeypatch, defect):
+    import contextlib
+    import statistics
+    import sys
+    import types
+    from unittest.mock import patch
+    scope = oracle_helpers()
+    torch = scope["torch"]
+    noise_module = types.ModuleType("benchmarks.benchmark_exlr8_a16")
+    noise_module.k4_noise_summary = lambda values, control: {"seen": sorted(values)}
+    runtime_module = types.ModuleType("b12x._lib.runtime_control")
+    runtime_module.kernel_resolution_guard = lambda label: contextlib.nullcontext()
+    monkeypatch.setitem(sys.modules, noise_module.__name__, noise_module)
+    monkeypatch.setitem(sys.modules, runtime_module.__name__, runtime_module)
+    source = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    ids, weights = torch.zeros((8, 1), dtype=torch.int32), torch.ones((8, 1))
+    graph_active = False
+    class Graph:
+        def __init__(self, fn): self.fn = fn
+        def replay(self):
+            nonlocal graph_active
+            graph_active = True
+            try: self.fn()
+            finally: graph_active = False
+    scope.update(statistics=statistics, patch=patch, _capture=lambda fn, warmup: Graph(fn),
+                 _times=lambda graph, replays: [1.0], route_pack_capacity=lambda *a, **kw: (1, 8),
+                 COORDINATOR_FAMILIES={"step5": {"experts": 3}},
+                 coordinator_f32_oracle=lambda *a: source.clone())
+    states, modules, calls = {}, {}, {}
+    for name in ("control", "candidate"):
+        workspace = SimpleNamespace(output=torch.empty_like(source), fc1=torch.empty_like(source),
+                                    activated=torch.empty_like(source), packed_route_indices=ids,
+                                    block_expert_ids=ids, packed_route_count=ids)
+        states[name] = workspace, [SimpleNamespace(launch=SimpleNamespace(moe_block_size=32))]
+        modules[name] = SimpleNamespace(pack_topk_routes_by_expert=None)
+        calls[name] = 0
+    def run(name, rows=None, start=0):
+        rows = 8 if rows is None else rows
+        calls[name] += 1
+        value = source[start:start + rows] + (0.25 if name == "control" else 0.125)
+        if name == "candidate":
+            if (defect == "rows" and (rows != 8 or start)) or (defect == "graph" and graph_active):
+                value = value + 0.01
+            if defect == "determinism": value = value + (calls[name] % 2) * 0.01
+            if defect == "oracle": value = value + 1
+        states[name][0].output[:rows].copy_(value)
+        return states[name][0].output[:rows]
+    args = SimpleNamespace(prefill_family="step5", prefill_exhaustive=False, live_rows=[3],
+                           warmup=0, correctness_only=False, rounds=2, replays=1)
+    result = scope["coordinator_oracle_case"](args, [("control", {}), ("candidate", {})], states,
+        modules, run, source, ids, weights, None, 0, 8, torch.int32)
+    assert result["arm_checks"]["control"]["qualified"]
+    candidate = result["arm_checks"]["candidate"]
+    assert not candidate["control_bitwise"]
+    assert candidate["qualified"] is (defect is None)
+    assert bool(result["samples_us"]["candidate"]) is (defect is None)
+    assert bool(candidate["oracle_regions"])
+    assert torch.equal(source, torch.arange(32, dtype=torch.float32).reshape(8, 4))
