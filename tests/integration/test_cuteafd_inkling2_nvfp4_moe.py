@@ -153,16 +153,17 @@ def _weights(g, real: int):
     return _WEIGHTS[key]
 
 
-def _dequant_expert(meta, expert) -> torch.Tensor:
+def _dequant_expert(meta, expert, device="cuda") -> torch.Tensor:
     """F64 ``[rows, k]`` of one expert from its packed codes, E4M3 block scales, amax and the
     denominator: q * s * amax / denominator (the vendor's (x_amax * w_amax) / (1536 * denominator)
-    split into its activation and weight halves)."""
+    split into its activation and weight halves). Decoded on ``device`` (exact; the CPU path took
+    seconds per expert)."""
     packed, scales, amax, denominator = meta
-    p = packed[expert].long()
+    p = packed[expert].to(device).long()
     codes = torch.stack([p & 0xF, p >> 4], -1).flatten(-2)
-    table = torch.cat([E2M1, -E2M1]).double()
+    table = torch.cat([E2M1, -E2M1]).double().to(device)
     q = table[codes]
-    s = scales[expert].view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)
+    s = scales[expert].to(device).view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)
     return q * s * (amax[expert].double() / denominator)
 
 
@@ -182,12 +183,12 @@ def reference(g, x, ids, gammas, dequant):
         _, _, amax, xq = quantize_rows(xr)
         xq = xq * (amax.double() / 1536.0)[:, None]  # q*s*outer: the dequantized activation
         # Dequantize this expert only (one [rows, k] F64 slab at a time).
-        gate = (xq @ _dequant_expert(m1, expert).to(dev).T).float().bfloat16().double()
-        up = (xq @ _dequant_expert(m3, expert).to(dev).T).float().bfloat16().double()
+        gate = (xq @ _dequant_expert(m1, expert, dev).T).float().bfloat16().double()
+        up = (xq @ _dequant_expert(m3, expert, dev).T).float().bfloat16().double()
         act = (_situ(gate, up, g.situ_gate_cap, g.situ_up_cap) * gammas[rows, slots][:, None]).float().bfloat16().double()
         _, _, a_amax, aq = quantize_rows(act)
         aq = aq * (a_amax.double() / 1536.0)[:, None]
-        y = (aq @ _dequant_expert(m2, expert).to(dev).T).float().bfloat16().double()
+        y = (aq @ _dequant_expert(m2, expert, dev).T).float().bfloat16().double()
         out.index_add_(0, rows, y)
     return out.float().bfloat16()
 
