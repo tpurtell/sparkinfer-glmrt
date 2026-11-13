@@ -43,6 +43,7 @@ from cutlass import Float32, Int32, Int64, Uint32, Uint64, const_expr
 
 from b12x._lib.activation import situ_vendor
 from b12x._lib.intrinsics import (
+    ld_shared_u32 as ld_shared_u32_at,
     cvt_e2m1x8_f32,
     cvt_f32_to_e4m3,
     div_rn_f32,
@@ -366,10 +367,19 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,
                  w3: cute.Pointer, s3: cute.Pointer, s2: cute.Pointer, act: cute.Pointer, act_s: cute.Pointer,
                  max_tiles: Int32, stream: cuda.CUstream, row_amax: cute.Pointer = None,
-                 gamma: cute.Pointer = None, act_bf16: cute.Pointer = None, act_amax_part: cute.Pointer = None):
+                 gamma: cute.Pointer = None, act_bf16: cute.Pointer = None, act_amax_part: cute.Pointer = None,
+                 exchange: cute.Pointer = None, exchange_rows: cute.Pointer = None, pair_row: cute.Pointer = None):
         if cutlass.const_expr(row_amax is None or gamma is None or act_bf16 is None or act_amax_part is None):
             raise ValueError("the dynamic NVFP4 gate/up needs row_amax, gamma, act_bf16 and act_amax_part")
-        self.fused_dyn(aq, a_s, meta, w1, s1, w3, s3, row_amax, gamma, act_bf16, act_amax_part).launch(
+        # Diagnostics: exchange [padded, 2I] BF16 (gate then up columns, post factor, pre SiTU) and
+        # exchange_rows [padded, 4] int32 = (tile, row in chunk, grouped position, source row).
+        dump = exchange is not None
+        if cutlass.const_expr(not dump):
+            exchange = act_bf16
+            exchange_rows = meta
+            pair_row = meta
+        self.fused_dyn(aq, a_s, meta, w1, s1, w3, s3, row_amax, gamma, act_bf16, act_amax_part,
+                       exchange, exchange_rows, pair_row, dump).launch(
             grid=(self.inter // self.half_n, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
             min_blocks_per_mp=1)
 
@@ -382,7 +392,8 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
     @cute.kernel
     def fused_dyn(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,
                   w3: cute.Pointer, s3: cute.Pointer, row_amax: cute.Pointer, gamma: cute.Pointer,
-                  act_bf16: cute.Pointer, act_amax_part: cute.Pointer):
+                  act_bf16: cute.Pointer, act_amax_part: cute.Pointer, exchange: cute.Pointer,
+                  exchange_rows: cute.Pointer, pair_row: cute.Pointer, dump: cutlass.Constexpr):
         n_blk = Int32(cute.arch.block_idx()[0])
         tile = Int32(cute.arch.block_idx()[1])
         smem = cutlass_utils.SmemAllocator()
@@ -448,6 +459,29 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                                 st_shared_u32(ring + row * Int32(self.x_stride) + col * Int32(2),
                                               pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
                 cute.arch.sync_threads()
+                if const_expr(dump):
+                    # Each live row's gate/up columns of this CTA, plus (tile, row, grouped pos, source row).
+                    words = self.half_n // 2
+                    for it in cutlass.range_constexpr(_ceil(self.tile_m * words, self.threads)):
+                        gi = tidx + Int32(it * self.threads)
+                        row = gi // Int32(words)
+                        wd = gi % Int32(words)
+                        if row < live:
+                            i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(row)
+                            gw = ld_shared_u32_at(ring + row * Int32(self.x_stride) + wd * Int32(4))
+                            uw = ld_shared_u32_at(ring + row * Int32(self.x_stride) + Int32(self.half_n * 2) + wd * Int32(4))
+                            base = Int64(exchange.toint()) + (i * Int64(2 * self.inter) + Int64(n0)) * Int64(2)
+                            st_global_u32(base + Int64(wd) * Int64(4), gw)
+                            st_global_u32(base + Int64(self.inter) * Int64(2) + Int64(wd) * Int64(4), uw)
+                    if n_blk == Int32(0):
+                        if tidx < live:
+                            i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(tidx)
+                            rec = cute.make_ptr(Int32, Int64(exchange_rows.toint()) + i * Int64(16), cute.AddressSpace.gmem,
+                                                assumed_align=4)
+                            rec[0] = Int32(tile)
+                            rec[1] = tidx
+                            rec[2] = first + tidx
+                            rec[3] = _i32_at(Int64(pair_row.toint()), first + tidx)
                 # SiTU x gamma per 16 columns -> BF16 act slice + the slice's amax per row.
                 groups = self.half_n // 16
                 gamma_t = Int64(gamma.toint())
