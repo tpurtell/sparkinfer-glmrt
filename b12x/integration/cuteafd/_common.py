@@ -281,6 +281,57 @@ MIMO_V26_PRO = MiMoGeometry(
 
 
 @dataclass(frozen=True)
+class Inkling2Geometry:
+    """Static Inkling 2 Small (``inkling2``) attention geometry baked into the ``inkling2_*`` programs.
+
+    48 query / 8 KV heads of 128 on every layer; no RoPE (positions enter only
+    through the relative bias). ``local`` layers attend a ``window`` of 1024
+    keys with a per-(token, head) bias table of ``window`` distances; ``global``
+    layers attend every key with a table of ``rel_extent`` distances (zero
+    bias beyond). Every layer has one unscaled attention sink per (token,
+    head). KV records are BF16, one per token: every KV head's key, then every
+    head's value (``record_elems``). Global layers keep records in a paged
+    cache (``page_rows`` per page); local layers keep a per-sequence ring of
+    ``ring_rows`` records: the window plus one 64-row decode step, page
+    aligned, the engine's ``swa_ring(window, 64, 64)`` (slot ``pos %
+    ring_rows``; the kernel's modulus must equal the engine's).
+    """
+
+    name: str = "inkling2"
+    hidden: int = 4608
+    heads: int = 48
+    kv_heads: int = 8
+    head_dim: int = 128
+    window: int = 1024
+    rel_extent: int = 1024
+    ring_rows: int = 1088
+    page_rows: int = 64
+
+    def __post_init__(self) -> None:
+        if self.head_dim != 128:
+            raise ValueError("Inkling 2 programs require head dim 128")
+        if self.heads % self.kv_heads:
+            raise ValueError("query heads must divide into KV groups")
+        if self.ring_rows <= self.window or self.ring_rows % self.page_rows:
+            raise ValueError("ring_rows must cover the window plus a step, in whole pages")
+
+    def extent(self, kind: str) -> int:
+        """Distances of one bias row: the window (local) or ``rel_extent`` (global)."""
+        return {"local": self.window, "global": self.rel_extent}[kind]
+
+    @property
+    def record_elems(self) -> int:
+        return self.kv_heads * 2 * self.head_dim
+
+    @property
+    def softmax_scale(self) -> float:
+        return self.head_dim ** -0.5
+
+
+INKLING2_SMALL = Inkling2Geometry()
+
+
+@dataclass(frozen=True)
 class GLMFGeometry:
     """Static GLM 5.3 Flash (``glm5_next``) geometry baked into the ``glmf_*`` programs.
 
