@@ -81,6 +81,11 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
     grid ``(I / 32, max_tiles)``, 256 threads, 128-K steps (see module docstring)."""
 
     inter_alignment = 32
+    # Shared memory on SM120 (101,376 B max): A ring 3 x 16 KiB, weights 3 x 8 KiB,
+    # A scales 3 x 512 B, weight scales 64 x 148 B. A 4-deep A ring with the scale
+    # tile added overran the limit by 2 KiB; the W8A8 stream measured a 3-deep ring
+    # at ~4% (its a 3 / w 5 vs a 4 / w 3 note).
+    a_ring = 3
 
     def __init__(self, *, inter: int, hidden: int, experts: int, gate_cap: float = SITU_GATE_CAP,
                  up_cap: float = SITU_UP_CAP, row_addresses: bool = False):
@@ -89,14 +94,17 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
         self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
         if self.gate_cap <= 0 or self.up_cap <= 0:
             raise ValueError("SiTU caps must be positive")
-        if self.hidden % 512:
-            raise ValueError("MXFP8 stream gate/up needs H % 512 == 0 (16-byte scale rows)")
+        if self.hidden % 128:
+            raise ValueError("MXFP8 stream gate/up needs H % 128 == 0 (whole scale words per K step)")
         self.act_row_bytes = mxfp8_down_row_bytes(self.inter)
         # Drained A ring reused for the BF16 activation tile before the K32 quantization.
         self.act_stride = self.cols * 2 + 16
         self.scale_cols = self.hidden // 32
-        # Padded scale rows: the 8 column rows of a fragment hit distinct banks.
-        self.sc_stride = self.scale_cols + 16
+        # Scale rows padded by one word: the stride in words (37 for H 4608) is odd,
+        # so a fragment's 8 column rows hit 8 distinct banks.
+        self.sc_stride = self.scale_cols + 4
+        if (self.sc_stride // 4) % 2 == 0:
+            raise ValueError("the weight scale row stride must be an odd number of words")
 
     def key(self) -> tuple:
         return ("stream_gate_up_mxfp8", 1, self.inter, self.hidden, self.experts, self.a_ring, self.w_ring,
@@ -247,22 +255,23 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
             if tidx < live:
                 source = _i32_at(Int64(pair_row.toint()), first + tidx)
                 s_src = self.row_address(x, source) + Int64(h)
-            # The CTA's weight scale rows (32 gate then 32 up columns, H/32 bytes each),
-            # once; they join the first cp.async group.
-            units = self.scale_cols // 16
-            for q in cutlass.range_constexpr((2 * self.cols * units + self.threads - 1) // self.threads):
+            # The CTA's weight scale rows (32 gate then 32 up columns, H/32 bytes each) as
+            # 4-byte words (the padded rows are word-aligned, not 16-byte-aligned), once;
+            # they join the first cp.async group.
+            words = self.scale_cols // 4
+            for q in cutlass.range_constexpr((2 * self.cols * words + self.threads - 1) // self.threads):
                 u = tidx + Int32(q * self.threads)
-                if u < Int32(2 * self.cols * units):
-                    r = u // Int32(units)
-                    c = u % Int32(units)
+                if u < Int32(2 * self.cols * words):
+                    r = u // Int32(words)
+                    c = u % Int32(words)
                     base = Int64(s1.toint())
                     col = r
                     if r >= Int32(self.cols):
                         base = Int64(s3.toint())
                         col = r - Int32(self.cols)
-                    cp_async4_shared_global(
-                        sc + r * Int32(self.sc_stride) + c * Int32(16),
-                        base + (Int64(e) * Int64(i) + Int64(n0 + col)) * Int64(self.scale_cols) + Int64(c) * Int64(16))
+                    cp_async_u32_shared_global(
+                        sc + r * Int32(self.sc_stride) + c * Int32(4),
+                        base + (Int64(e) * Int64(i) + Int64(n0 + col)) * Int64(self.scale_cols) + Int64(c) * Int64(4))
 
             # Prologue: rows of steps 0 .. a_ring-2 (cp.async groups), weights of
             # steps 0 .. w_ring-2 (TMA).

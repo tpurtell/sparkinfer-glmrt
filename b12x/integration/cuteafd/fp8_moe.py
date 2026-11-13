@@ -328,8 +328,8 @@ class Fp8MoeGeometry:
             raise ValueError("FP8 experts need a 128-aligned hidden and intermediate with a 128-block per rank")
         if self.weights == "mxfp4" and (self.hidden % 128 or self.intermediate % 32 or self.intermediate // 32 < self.tp):
             raise ValueError("MXFP4 experts need a 128-aligned hidden and whole 32-blocks per rank")
-        if self.weights == "mxfp8" and (self.hidden % 512 or self.intermediate % 32 or self.intermediate // 32 < self.tp):
-            raise ValueError("MXFP8 experts need a 512-aligned hidden and whole 32-blocks per rank")
+        if self.weights == "mxfp8" and (self.hidden % 128 or self.intermediate % 32 or self.intermediate // 32 < self.tp):
+            raise ValueError("MXFP8 experts need a 128-aligned hidden and whole 32-blocks per rank")
         if not 1 <= self.top_k <= 16:
             raise ValueError("top_k must be 1..16")
 
@@ -972,9 +972,9 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
     elif g.weights == "mxfp8":
         weights = (
             Operand("w1", torch.float8_e4m3fn, f"[{e},{i},{h}]", note="gate rows (w13 de-interleaved)"),
-            Operand("s1", torch.uint8, f"[{e},{i},{h // 32}]", align=16, note="UE8M0 per 32"),
+            Operand("s1", torch.uint8, f"[{e},{i},{h // 32}]", align=4, note="UE8M0 per 32"),
             Operand("w3", torch.float8_e4m3fn, f"[{e},{i},{h}]", note="up rows"),
-            Operand("s3", torch.uint8, f"[{e},{i},{h // 32}]", align=16),
+            Operand("s3", torch.uint8, f"[{e},{i},{h // 32}]", align=4),
             Operand("w2", torch.float8_e4m3fn, f"[{e},{h},{i}]"),
             Operand("s2", torch.uint8, f"[{e},{h},{mxfp4_scale_row_bytes(i)}]", align=4,
                     note="UE8M0 per 32, rows padded to whole u32"),
