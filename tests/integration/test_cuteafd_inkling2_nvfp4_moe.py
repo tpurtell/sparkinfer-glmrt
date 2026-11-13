@@ -128,12 +128,14 @@ def _weights(g, real: int):
         denominator = torch.tensor([DENOMINATOR], dtype=torch.float32)
 
         def operand(seed, rows, k, real_rows=None, real_k=None):
-            packed = torch.empty((e, rows, k // 2), dtype=torch.uint8)
-            scales = torch.empty((e, rows, k // 16), dtype=torch.uint8)
-            amax = torch.empty(e, dtype=torch.float32)
+            # On the GPU: this test runs under the hardware lock, so its CPU-side work must stay
+            # negligible (the per-expert F64 loop took minutes on the CPU).
+            packed = torch.empty((e, rows, k // 2), dtype=torch.uint8, device="cuda")
+            scales = torch.empty((e, rows, k // 16), dtype=torch.uint8, device="cuda")
+            amax = torch.empty(e, dtype=torch.float32, device="cuda")
             for expert in range(e):
-                gen = torch.Generator(device="cpu").manual_seed(seed * 100003 + expert)
-                w = torch.randn((rows, k), generator=gen, dtype=torch.float64) * 0.02
+                gen = torch.Generator(device="cuda").manual_seed(seed * 100003 + expert)
+                w = torch.randn((rows, k), generator=gen, dtype=torch.float64, device="cuda") * 0.02
                 if real_rows is not None:
                     w[real_rows:] = 0
                 if real_k is not None:
@@ -142,8 +144,8 @@ def _weights(g, real: int):
                 packed[expert] = p_.reshape(rows, k // 2)
                 scales[expert] = s_.reshape(rows, k // 16)
                 amax[expert] = a_[0]
-            tail = torch.cat([amax.view(torch.uint8), denominator.view(torch.uint8)])
-            return (packed.contiguous().cuda(), torch.cat([scales.flatten(), tail]).contiguous().cuda(),
+            tail = torch.cat([amax.view(torch.uint8), denominator.to("cuda").view(torch.uint8)])
+            return (packed.contiguous(), torch.cat([scales.flatten(), tail]).contiguous(),
                     (packed, scales, amax, DENOMINATOR))
 
         w1, s1, m1 = operand(1, i, h, real_rows=real)
@@ -159,7 +161,7 @@ def _dequant_expert(meta, expert, device="cuda") -> torch.Tensor:
     split into its activation and weight halves). Decoded on ``device`` (exact; the CPU path took
     seconds per expert)."""
     packed, scales, amax, denominator = meta
-    p = packed[expert].to(device).long()
+    p = packed[expert].to(device).long()  # no-op copy when already resident on the device
     codes = torch.stack([p & 0xF, p >> 4], -1).flatten(-2)
     table = torch.cat([E2M1, -E2M1]).double().to(device)
     q = table[codes]
