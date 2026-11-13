@@ -12,7 +12,7 @@ nvfp4.py`` — reproduced in F64 on the CPU with the kernel's documented roundin
                   q_k = e2m1_rn(x / (s_k/enc)); keep the candidate with the smaller
                   sum |x - q_k*s_k*outer| (ties -> 6)
     FC1 out = bf16(sum (q_a s_a)(q_w s_w) * (amax * w_amax) / (1536 * denominator))
-    act     = bf16(situ(gate, up) * gamma);  quantize act by the same rule (its own amax)
+    act     = bf16(situ(gate, up) * gamma)  with the vendor's own PTX (ex2/rcp/tanh .approx);  same row rule
     FC2 out = bf16(... * (amax_act * w2_amax) / (1536 * denominator));  out = sum over slots
 
 Weights follow the checkpoint's convention (probed on ``aac97412``): each expert matrix is
@@ -188,8 +188,61 @@ def _dequant_expert(meta, expert, device="cuda") -> torch.Tensor:
     return q * s * (amax[expert].double() / denominator)
 
 
-def _situ(gate, up, gate_cap, up_cap):
-    return ((gate_cap * torch.tanh(gate / gate_cap)) * torch.sigmoid(gate)) * (up_cap * torch.tanh(up / up_cap))
+_SITU_PROGRAM: dict = {}
+
+
+def _situ_program(gate_cap: float, up_cap: float):
+    """Elementwise ``situ_vendor`` over BF16 gate/up rows and an F32 gamma per row -> BF16 act.
+    The oracle's SiTU step runs the format's own PTX (ex2/rcp/tanh .approx) rather than torch's
+    exact transcendentals: the reference kernels define SiTU that way (vLLM d664cd1e
+    ops/activation.py:20-28, :48-58), so an exact-math oracle is not the format's rule."""
+    key = (gate_cap, up_cap)
+    if key not in _SITU_PROGRAM:
+        import cutlass
+        import cutlass.cute as cute
+        import cuda.bindings.driver as cuda
+        from cutlass import Float32, Int32, Int64
+        from b12x._lib.activation import situ_vendor
+        from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+
+        class Situ:
+            def key(self):
+                return ("situ_vendor_rows", gate_cap, up_cap)
+
+            @cute.jit
+            def __call__(self, gate: cute.Pointer, up: cute.Pointer, gamma: cute.Pointer, act: cute.Pointer,
+                         rows: Int32, cols: Int32, stream: cuda.CUstream):
+                self.kernel(gate, up, gamma, act, cols).launch(grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
+
+            @cute.kernel
+            def kernel(self, gate: cute.Pointer, up: cute.Pointer, gamma: cute.Pointer, act: cute.Pointer, cols: Int32):
+                row = Int64(cute.arch.block_idx()[0])
+                g_t = cute.make_tensor(gate, cute.make_layout((Int64(1) << Int64(40),)))
+                u_t = cute.make_tensor(up, cute.make_layout((Int64(1) << Int64(40),)))
+                a_t = cute.make_tensor(act, cute.make_layout((Int64(1) << Int64(40),)))
+                gm = Float32(cute.make_tensor(gamma, cute.make_layout((Int64(1) << Int64(40),)))[row])
+                c = Int32(cute.arch.thread_idx()[0])
+                while c < cols:
+                    at = row * Int64(cols) + Int64(c)
+                    a_t[at] = cutlass.BFloat16(situ_vendor(Float32(g_t[at]), Float32(u_t[at]), gm,
+                                                           gate_cap=gate_cap, up_cap=up_cap))
+                    c = c + Int32(256)
+
+        _SITU_PROGRAM[key] = compile_program(Situ(), name="situ_vendor_rows", operands=(
+            Operand("gate", torch.bfloat16, "[rows,cols]", align=2), Operand("up", torch.bfloat16, "[rows,cols]", align=2),
+            Operand("gamma", torch.float32, "[rows]", align=4), Operand("act", torch.bfloat16, "[rows,cols]", "out", align=2)),
+            scalars=(Scalar("rows"), Scalar("cols")), key=("situ_vendor_rows", gate_cap, up_cap))
+    return _SITU_PROGRAM[key]
+
+
+def _situ(gate, up, gamma, gate_cap=4.0, up_cap=25.0):
+    """BF16 act = situ_vendor(bf16 gate, bf16 up) * gamma on the GPU: the format's own arithmetic."""
+    gate_b, up_b = gate.to(torch.bfloat16).contiguous(), up.to(torch.bfloat16).contiguous()
+    act = torch.empty_like(gate_b)
+    _situ_program(gate_cap, up_cap).launch(gate_b, up_b, gamma.float().contiguous(), act,
+                                           scalars=(gate_b.shape[0], gate_b.shape[1]))
+    torch.cuda.synchronize()
+    return act
 
 
 def reference(g, x, ids, gammas, dequant):
@@ -206,7 +259,7 @@ def reference(g, x, ids, gammas, dequant):
         # Dequantize this expert only (one [rows, k] F64 slab at a time).
         gate = (xq @ _dequant_expert(m1, expert, dev).T).float().bfloat16().double()
         up = (xq @ _dequant_expert(m3, expert, dev).T).float().bfloat16().double()
-        act = (_situ(gate, up, g.situ_gate_cap, g.situ_up_cap) * gammas[rows, slots][:, None]).float().bfloat16().double()
+        act = _situ(gate, up, gammas[rows, slots], g.situ_gate_cap, g.situ_up_cap).double()
         _, _, a_amax, aq = quantize_rows(act)
         aq = aq * (a_amax.double() / 1536.0)[:, None]
         y = (aq @ _dequant_expert(m2, expert, dev).T).float().bfloat16().double()

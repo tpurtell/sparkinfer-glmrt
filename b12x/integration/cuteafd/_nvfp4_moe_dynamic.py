@@ -13,7 +13,7 @@ implement it (vLLM ``d664cd1e`` ``ops/{nvfp4,moe,activation}.py``, SGLang
                   sum |x - q_k * s_k * outer| is smaller (ties -> 6)
     GEMM:       acc = sum (q_a * s_a) . (q_w * s_w)            (kind::mxf4nvf4, FP32)
     FC1 out:    bf16(acc * (amax_r * w_amax_e) / (1536 * denominator))
-    act:        bf16(situ(gate, up) * gamma_r);   then the same row quantization on act
+    act:        bf16(situ(gate, up) * gamma_r)  (vendor PTX: ex2/rcp/tanh .approx);  same row quantization on act
     FC2 out:    bf16(acc * (amax_act * w2_amax_e) / (1536 * denominator));  out = sum over slots
 
 So the block scales the MMA consumes are the raw E4M3 bytes on both sides;
@@ -41,7 +41,7 @@ import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Float32, Int32, Int64, Uint32, Uint64, const_expr
 
-from b12x._lib.activation import gated_activation_value
+from b12x._lib.activation import situ_vendor
 from b12x._lib.intrinsics import (
     cvt_e2m1x8_f32,
     cvt_f32_to_e4m3,
@@ -375,8 +375,9 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
 
     @cute.jit
     def _situ(self, gate: Float32, up: Float32, gamma: Float32) -> Float32:
-        value = gated_activation_value(gate, up, is_situ=True, situ_beta=self.gate_cap, situ_linear_beta=self.up_cap)
-        return _round_bf16(value * gamma)
+        # The checkpoint's SiTU as its reference kernels evaluate it (approximate ex2/rcp/tanh): the
+        # format's rule, so the oracle can be the same arithmetic rather than a tolerance.
+        return situ_vendor(gate, up, gamma, gate_cap=self.gate_cap, up_cap=self.up_cap)
 
     @cute.kernel
     def fused_dyn(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,
