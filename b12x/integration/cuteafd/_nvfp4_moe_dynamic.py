@@ -475,8 +475,9 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                             st_global_u32(out_at + Int64(16 * half + 12), packed[3])
                         # Per-(row, 16-column group) amax straight to global: act_amax_part is
                         # [padded rows, parts * groups]; ChunkActDyn takes the row max.
+                        # Partial index = this 16-column group's position in the row: n0/16 + grp (tile-independent).
                         st_global_f32(Int64(act_amax_part.toint())
-                                      + ((i * Int64(self.parts) + Int64(n_blk)) * Int64(groups) + Int64(grp)) * Int64(4),
+                                      + (i * Int64(self.inter // 16) + Int64(n0 // Int32(16)) + Int64(grp)) * Int64(4),
                                       local)
 
 

@@ -855,16 +855,25 @@ class _StreamNvfp4DynRoute:
                             chunked=True)
         self.rows_in = ChunkRowsDyn(k=h, experts=e)
         self.gamma = GroupedGamma(top_k=k)
-        self.gate_up = StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, gate_cap=g.situ_gate_cap,
-                                            up_cap=g.situ_up_cap)
+        # The calibrated A4 route's split: chunks of <= 16 live rows take the sparse 16-row tiles
+        # (narrowest N whose grid fills the device), chunks of >= 17 the wide 128-row tile. The
+        # masks are complementary, so exactly one tile runs per compact expert chunk.
+        caps = dict(gate_cap=g.situ_gate_cap, up_cap=g.situ_up_cap)
+        self.gate_up = StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, live_min=17, **caps)
+        self.small_gate = tuple(StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, tile_m=16, tile_n=n,
+                                                     live_max=16, stages=SMALL_GATE_STAGES, **caps)
+                                for n in (32, 64, 128))
         self.act = ChunkActDyn(inter=i, experts=e, parts=i // 64)
-        self.down = StreamNvfp4LinearDyn(n=h, k=i, experts=e)
+        self.down = StreamNvfp4LinearDyn(n=h, k=i, experts=e, live_min=17)
+        self.small_down = tuple(StreamNvfp4LinearDyn(n=h, k=i, experts=e, tile_m=16, tile_n=n, live_max=16)
+                                for n in (32, 64, 128))
         self.core_only = False
         self.combine = MoeCombine(hidden=h, top_k=k, unit_weights=True)
 
     def key(self) -> tuple:
         return ("stream_nvfp4_dyn", self.max_tiles, self.rows_in.key(), self.gamma.key(), self.gate_up.key(),
-                self.act.key(), self.down.key(), self.combine.key())
+                self.act.key(), self.down.key(), self.combine.key(),
+                tuple(p.key() for p in self.small_gate), tuple(p.key() for p in self.small_down))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
@@ -904,10 +913,26 @@ class _StreamNvfp4DynRoute:
         self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
         self.gamma(pair_pos, weights, gamma, rows, stream)
         self.rows_in(x, pair_row, meta, xq, xs, xamax, pairs, stream)
-        self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, row_amax=xamax, gamma=gamma,
-                     act_bf16=act16, act_amax_part=part)
+        dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part)
+        sms = runtime_num_sm()
+        target = sms * Int32(SMALL_GATE_CTAS_PER_SM)
+        if Int32(g.top_k * (g.slice // 16)) >= target:
+            self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+        elif Int32(g.top_k * (g.slice // 32)) >= target:
+            self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+        else:
+            self.small_gate[2](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+        if pairs > Int32(16):
+            self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
         self.act(act16, part, meta, aq, a_s, aamax, max_tiles, stream)
-        self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+        if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
+            self.small_down[2](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+        elif Int32(g.top_k * (g.hidden // 64)) >= sms * Int32(2):
+            self.small_down[1](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+        else:
+            self.small_down[0](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+        if pairs > Int32(16):
+            self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
         if cutlass.const_expr(not self.core_only):
             self.combine(y, pair_pos, weights, out, rows, stream)
 
