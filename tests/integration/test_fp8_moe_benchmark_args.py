@@ -38,8 +38,13 @@ def test_native_oai_geometry_and_cache_keys():
             replace(oai, **changes)
     with pytest.raises(ValueError, match="alpha/beta"):
         replace(base, swiglu_alpha=1.702)
-    assert all(g.activation != "swigluoai" and g.swiglu_alpha is None
-               and g.swiglu_beta is None for g in GEOMETRIES.values())
+    oai_geometries = {name: g for name, g in GEOMETRIES.items() if g.activation == "swigluoai"}
+    assert set(oai_geometries) == {"minimax_nvfp4a4"}
+    minimax = oai_geometries["minimax_nvfp4a4"]
+    assert (minimax.weights, minimax.activations, minimax.swiglu_limit,
+            minimax.swiglu_alpha, minimax.swiglu_beta) == ("nvfp4", "a4", 7.0, 1.702, 1.0)
+    assert all(g.swiglu_alpha is None and g.swiglu_beta is None
+               for name, g in GEOMETRIES.items() if name not in oai_geometries)
 
 
 def test_v41_fc1_split_is_explicit_and_defaults_to_one():
