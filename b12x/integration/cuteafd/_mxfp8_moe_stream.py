@@ -258,12 +258,12 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
             # The CTA's weight scale rows (32 gate then 32 up columns, H/32 bytes each) as
             # 4-byte words (the padded rows are word-aligned, not 16-byte-aligned), once;
             # they join the first cp.async group.
-            words = self.scale_cols // 4
-            for q in cutlass.range_constexpr((2 * self.cols * words + self.threads - 1) // self.threads):
+            scale_words = self.scale_cols // 4
+            for q in cutlass.range_constexpr((2 * self.cols * scale_words + self.threads - 1) // self.threads):
                 u = tidx + Int32(q * self.threads)
-                if u < Int32(2 * self.cols * words):
-                    r = u // Int32(words)
-                    c = u % Int32(words)
+                if u < Int32(2 * self.cols * scale_words):
+                    r = u // Int32(scale_words)
+                    c = u % Int32(scale_words)
                     base = Int64(s1.toint())
                     col = r
                     if r >= Int32(self.cols):
