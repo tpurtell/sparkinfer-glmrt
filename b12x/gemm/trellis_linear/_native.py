@@ -4806,7 +4806,10 @@ class NativeTrellisLinear:
                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                         rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         tiles = Int32(self.n // 128 * self.splits)
-        if cutlass.const_expr(self.n > 65536 or (480 < (self.n // 128) * self.splits <= 640)):
+        # 481-672 tiles keep the shuffle-free 2-CTA/SM wave (576 and 672 tiles
+        # measured); K1536 x N>=16384 (12 K blocks, wide N) loses 4-7% to shuffles.
+        if cutlass.const_expr(self.n > 65536 or (480 < (self.n // 128) * self.splits <= 672)
+                              or (self.k == 1536 and self.n >= 16384)):
             self.multiply(inputs, payload, scales, partial, rows, rotation_id, False).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
@@ -4823,7 +4826,7 @@ class NativeTrellisLinear:
             self.multiply(inputs, payload, scales, partial, rows, rotation_id, True).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-        if cutlass.const_expr(480 < (self.n // 128) * self.splits <= 640):
+        if cutlass.const_expr(480 < (self.n // 128) * self.splits <= 672):
             if rows <= Int32(2):
                 self.reduce_nc_128(partial, output, rows).launch(
                     grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
@@ -4837,6 +4840,15 @@ class NativeTrellisLinear:
             self.reduce_gemini(partial, output, rows).launch(
                 grid=(min(rows * r_blocks, cta_limit), 1, 1),
                 block=(128, 1, 1), stream=stream)
+
+    def _k8_wide_wins(self):
+        """multiply_k8_wide rows 9-32: measured wins at 257-480 and >672 tiles.
+
+        At <=256 tiles it underfills (8192x4096 0.94x) and at 512-672 it
+        loses to multiply_wide(2, 8) (12288x7168 0.85-0.99x), so those keep
+        the shipped route."""
+        tiles = (self.n // 128) * self.splits
+        return 256 < tiles <= 480 or tiles > 672
 
     @cute.jit
     def _decode_k8(self, inputs: cute.Tensor, payload: cute.Tensor,
@@ -4873,7 +4885,9 @@ class NativeTrellisLinear:
                         block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
                     self.reduce_gemini(partial, output, rows).launch(
                         grid=(min(rows * r_blocks, cta_limit), 1, 1), block=(128, 1, 1), stream=stream)
-            elif cutlass.const_expr(480 < (self.n // 128) * self.splits <= 640):
+            elif cutlass.const_expr(480 < (self.n // 128) * self.splits <= 640
+                                    or (self.splits >= 8 and self.n <= 65536
+                                        and not self._k8_wide_wins())):
                 tiles = Int32(self.n // 128 * self.splits)
                 self.multiply_wide(inputs, payload, scales, partial, rows, rotation_id, 2, 8).launch(
                     grid=(min(tiles, cta_limit), 1, 1),
