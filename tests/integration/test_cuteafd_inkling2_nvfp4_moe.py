@@ -296,11 +296,29 @@ def reference(g, x, ids, gammas, dequant):
 _STAGE_PROGRAMS: dict = {}
 
 
-def _bf16_ulps(a: torch.Tensor, b: torch.Tensor) -> float:
-    """max |a - b| in BF16 ulps at the magnitude of the larger operand (floor: BF16's smallest normal ulp)."""
+LARGE = 1e-2  # elements this large must be within 1 ulp outright: a real error there can't hide behind the metric
+
+
+def _bf16_ulps(a: torch.Tensor, b: torch.Tensor) -> dict:
+    """|a - b| in BF16 ulps at the magnitude of the larger operand (floor: BF16's smallest normal ulp).
+    Returns the max ulps overall, the max ulps over elements with |a| >= LARGE, the absolute max |d| and
+    the magnitude of the element carrying it."""
     mag = torch.maximum(a.abs(), b.abs()).clamp_min(2.0 ** -126)
     ulp = torch.exp2(torch.floor(torch.log2(mag)) - 7)
-    return float(((a - b).abs() / ulp).max())
+    d = (a - b).abs()
+    ulps = d / ulp
+    large = a.abs() >= LARGE
+    at = int(d.argmax())
+    return {"ulp": float(ulps.max()), "ulp_large": float(ulps[large].max()) if large.any() else 0.0,
+            "abs": float(d.flatten()[at]), "abs_at": float(a.flatten()[at].abs())}
+
+
+def _worst(acc: dict, m: dict) -> dict:
+    if not acc:
+        return dict(m)
+    out = {"ulp": max(acc["ulp"], m["ulp"]), "ulp_large": max(acc["ulp_large"], m["ulp_large"])}
+    out.update({"abs": m["abs"], "abs_at": m["abs_at"]} if m["abs"] > acc["abs"] else {"abs": acc["abs"], "abs_at": acc["abs_at"]})
+    return out
 
 
 def _stage_program(g, capacity):
@@ -450,7 +468,7 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     _, _, am_x, xqd = quantize_rows(xd)
     report["input_ties"] = int(quantize_rows.last_tie.sum())
     xqd = xqd * (am_x.double() / 1536.0)[:, None]
-    ulp_max = 0.0
+    fc1 = {}
     oracle_act = torch.empty(pairs, i, dtype=torch.bfloat16, device=dev)
     for ex in sorted(set(expert_of)):
         sel = [p for p in range(pairs) if expert_of[p] == ex]
@@ -458,13 +476,14 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
         og = (xqd[rr] @ _dequant_expert(m1, ex, dev).T).float()
         ou = (xqd[rr] @ _dequant_expert(m3, ex, dev).T).float()
         kg, ku = exch_g[sel].float(), exch_u[sel].float()
-        ulp_max = max(ulp_max, _bf16_ulps(kg, og), _bf16_ulps(ku, ou))
+        fc1 = _worst(_worst(fc1, _bf16_ulps(kg, og)), _bf16_ulps(ku, ou))
         # (3) from the kernel's own exchange: vendor SiTU (GPU) -> oracle act-quant -> F64 down.
         slots = torch.tensor([p % k for p in sel], device=dev)
         act = _situ(kg, ku, gammas[rr, slots], g.situ_gate_cap, g.situ_up_cap)
         oracle_act[torch.tensor(sel, device=dev)] = act
-    report["fc1_ulp_max"] = ulp_max
-    assert ulp_max <= 1.0 + 1e-6, f"FC1 exchange is {ulp_max:.3f} BF16 ulps from the F64 FC1 (bar 1)"
+    report["fc1"] = fc1
+    assert fc1["ulp"] <= 1.0 + 1e-6 and fc1["ulp_large"] <= 1.0 + 1e-6, \
+        f"FC1 exchange vs F64 FC1: {fc1['ulp']:.3f} ulp (large elements {fc1['ulp_large']:.3f}), max|d| {fc1['abs']:.3e} at |v| {fc1['abs_at']:.3e}"
     # (2) quantizers exact on non-tie blocks.
     _, sc_x, _, _ = quantize_rows(xd)
     tie_x = quantize_rows.last_tie
@@ -486,16 +505,17 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     codes = torch.stack([aq_k & 0xF, aq_k >> 4], -1).flatten(-2)
     qk = (table[codes] * t["a_s"][pi].view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)) * (t["aamax"][pi].double() / 1536.0)[:, None]
     y_k = t["y"][gp].float()
-    down_ulp = 0.0
+    down = {}
     o3 = torch.zeros(rows, h, dtype=torch.float64, device=dev)
     for ex in sorted(set(expert_of)):
         sel = torch.tensor([p for p in range(pairs) if expert_of[p] == ex], device=dev)
         yo = (qk[sel] @ _dequant_expert(m2, ex, dev).T).float()
-        down_ulp = max(down_ulp, _bf16_ulps(y_k[sel], yo))
+        down = _worst(down, _bf16_ulps(y_k[sel], yo))
         yo3 = ((aqd[sel] * (am_a[sel].double() / 1536.0)[:, None]) @ _dequant_expert(m2, ex, dev).T).float().bfloat16().double()
         o3.index_add_(0, sel // k, yo3)
-    report["down_ulp_max"] = down_ulp
-    assert down_ulp <= 1.0 + 1e-6, f"down is {down_ulp:.3f} BF16 ulps from the F64 down (bar 1)"
+    report["down"] = down
+    assert down["ulp"] <= 1.0 + 1e-6 and down["ulp_large"] <= 1.0 + 1e-6, \
+        f"down vs F64 down: {down['ulp']:.3f} ulp (large elements {down['ulp_large']:.3f}), max|d| {down['abs']:.3e} at |v| {down['abs_at']:.3e}"
     ysum = torch.zeros(rows, h, dtype=torch.float32, device=dev).index_add_(0, torch.arange(pairs, device=dev) // k, y_k)
     assert torch.equal(t["out"], ysum.bfloat16()), "combine differs from the F32 slot sum of the kernel's own y rows"
     # (3) gate: kernel exchange -> oracle act-quant -> F64 down -> sum vs the route's output.
@@ -513,9 +533,12 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
 
 
 def _print(label, r):
+    f, d = r["fc1"], r["down"]
     print(f"{label}: stage-exact cos {r['stage_exact_cos']:.7f} worst row {r['stage_exact_worst_row']:.6f}; "
-          f"FC1 {r['fc1_ulp_max']:.2f} ulp, down {r['down_ulp_max']:.2f} ulp; non-tie mismatches input {r['input_nontie_mismatch']} act {r['act_nontie_mismatch']}; "
-          f"ties input {r['input_ties']} act {r['act_ties']}; e2e F64 diagnostic cos {r['e2e_cos']:.7f} worst row {r['e2e_worst_row']:.6f}")
+          f"FC1 {f['ulp']:.2f} ulp (|v|>=1e-2: {f['ulp_large']:.2f}; max|d| {f['abs']:.3e} at |v| {f['abs_at']:.3e}); "
+          f"down {d['ulp']:.2f} ulp (|v|>=1e-2: {d['ulp_large']:.2f}; max|d| {d['abs']:.3e} at |v| {d['abs_at']:.3e}); "
+          f"non-tie mismatches input {r['input_nontie_mismatch']} act {r['act_nontie_mismatch']}; ties input {r['input_ties']} act {r['act_ties']}; "
+          f"e2e F64 diagnostic cos {r['e2e_cos']:.7f} worst row {r['e2e_worst_row']:.6f}")
 
 
 @pytest.fixture(scope="module", autouse=True)
