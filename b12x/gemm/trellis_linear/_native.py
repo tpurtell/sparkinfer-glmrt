@@ -2067,7 +2067,17 @@ class NativeTrellisLinear:
             _fence_mbar_init()
         cute.arch.sync_threads()
         n_tiles = Int32(self.n // _PREFILL_BN)
-        total_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * n_tiles
+        m_tiles = (rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)
+        total_tiles = m_tiles * n_tiles
+        # Tile order. A weight matrix near or below L2 is cheaper A-tile-major:
+        # one 128-row A slab stays hot across the whole n sweep. Once the
+        # matrix is several times any supported L2 (96 MiB on a 5090, 128 MiB on
+        # a PRO 6000) every row tile re-fetches it from DRAM, and streaming one
+        # 64-column band across all row tiles wins instead. 256 MiB marks the
+        # measured crossover (951 MB gains 17%; 100 MB is neutral at 2752 rows
+        # and loses at 4096). The cutoff is a fixed size, not a card query, so
+        # one SM120 build keeps the same order on both cards.
+        band_major = self.k * self.n * self.bits > 256 * 1024 * 1024 * 8
         x_ptr = inputs[rotation_id]
         payload_ptr = payload.iterator.toint()
         scales_ptr = scales.iterator.toint()
@@ -2078,8 +2088,13 @@ class NativeTrellisLinear:
             p_tid = tid - Int32(_PREFILL_CONSUMER_THREADS)
             stage_cnt = Int32(0)
             while task < total_tiles:
-                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = task % n_tiles
+                m0, nb64 = Int32(0), Int32(0)
+                if band_major:
+                    m0 = (task % m_tiles) * Int32(_PREFILL_BM)
+                    nb64 = task // m_tiles
+                else:
+                    m0 = (task // n_tiles) * Int32(_PREFILL_BM)
+                    nb64 = task % n_tiles
                 stage_cnt = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, stage_cnt)
                 task += step
         else:
@@ -2087,8 +2102,13 @@ class NativeTrellisLinear:
                 cute.arch.warpgroup_reg_alloc(_PREFILL_CONSUMER_REGS)
             stage_cnt = Int32(0)
             while task < total_tiles:
-                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = task % n_tiles
+                m0, nb64 = Int32(0), Int32(0)
+                if band_major:
+                    m0 = (task % m_tiles) * Int32(_PREFILL_BM)
+                    nb64 = task // m_tiles
+                else:
+                    m0 = (task // n_tiles) * Int32(_PREFILL_BM)
+                    nb64 = task % n_tiles
                 stage_cnt = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, stage_cnt)
                 task += step
 
