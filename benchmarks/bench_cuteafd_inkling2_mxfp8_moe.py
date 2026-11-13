@@ -50,24 +50,41 @@ def _mxfp8_codes(x):
     return q.reshape(x.shape), exponent.to(torch.uint8).reshape(*x.shape[:-1], x.shape[-1] // 32)
 
 
-def mxfp8_weights(g, gen):
+def mxfp8_weights(g, seed: int):
+    """E4M3 + UE8M0 weights quantized one expert at a time from a seeded generator: the full
+    F32 tensor never exists (peak = quantized tensors + one expert slab)."""
     from b12x.integration.cuteafd._mxfp4_down_a8_plan import mxfp4_scale_row_bytes
 
     h, i, e = g.hidden, g.slice, g.experts
-    w1, s1 = _mxfp8_codes(torch.randn((e, i, h), device="cuda", generator=gen) * 0.02)
-    w3, s3 = _mxfp8_codes(torch.randn((e, i, h), device="cuda", generator=gen) * 0.02)
-    w2, s2 = _mxfp8_codes(torch.randn((e, h, i), device="cuda", generator=gen) * 0.02)
-    s2_rows = torch.zeros((e, h, mxfp4_scale_row_bytes(i)), dtype=torch.uint8, device="cuda")
-    s2_rows[:, :, :i // 32] = s2
-    return (w1.contiguous(), s1.contiguous(), w3.contiguous(), s3.contiguous(), w2.contiguous(), s2_rows)
+
+    def operand(tag, rows, k, scale_cols=None):
+        scale_cols = k // 32 if scale_cols is None else scale_cols
+        w = torch.empty((e, rows, k), dtype=torch.float8_e4m3fn, device="cuda")
+        s = torch.zeros((e, rows, scale_cols), dtype=torch.uint8, device="cuda")
+        for expert in range(e):
+            gen = torch.Generator(device="cuda").manual_seed(seed * 1000003 + tag * 100003 + expert)
+            q, sc = _mxfp8_codes(torch.randn((rows, k), device="cuda", generator=gen) * 0.02)
+            w[expert] = q
+            s[expert, :, :k // 32] = sc
+        return w.contiguous(), s.contiguous()
+
+    w1, s1 = operand(1, i, h)
+    w3, s3 = operand(3, i, h)
+    w2, s2 = operand(2, h, i, scale_cols=mxfp4_scale_row_bytes(i))
+    return (w1, s1, w3, s3, w2, s2)
 
 
-def fp8_weights(g, gen):
+def fp8_weights(g, seed: int):
+    """FP8 block-scaled control weights, one expert at a time."""
     h, i, e = g.hidden, g.slice, g.experts
-    f = lambda *shape: (torch.randn(shape, device="cuda", generator=gen) * 0.5).to(torch.float8_e4m3fn)  # noqa
-    s = lambda *shape: (torch.rand(shape, device="cuda", generator=gen) * 0.02 + 0.01).float()  # noqa
-    return (f(e, i, h), s(e, i // 128, h // 128), f(e, i, h), s(e, i // 128, h // 128),
-            f(e, h, i), s(e, h // 128, i // 128))
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    w = lambda rows, k: torch.empty((e, rows, k), dtype=torch.float8_e4m3fn, device="cuda")  # noqa: E731
+    w1, w3, w2 = w(i, h), w(i, h), w(h, i)
+    for expert in range(e):
+        for t, (rows, k) in zip((w1, w3, w2), ((i, h), (i, h), (h, i))):
+            t[expert] = (torch.randn((rows, k), device="cuda", generator=gen) * 0.5).to(torch.float8_e4m3fn)
+    sc = lambda *shape: (torch.rand(shape, device="cuda", generator=gen) * 0.02 + 0.01).float()  # noqa: E731
+    return (w1, sc(e, i // 128, h // 128), w3, sc(e, i // 128, h // 128), w2, sc(e, h // 128, i // 128))
 
 
 def wire_rows(x):
@@ -123,14 +140,25 @@ def main():
               "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "tp": args.tp, "slice": g.slice, "rows": []}
     print(f"inkling2_mxfp8 tp{args.tp} slice {g.slice}; control: {'fp8 W8A8 stream' if control else 'none'}")
     print(f"{'rows':>6} {'mxfp8 us':>10} {'/row':>8} {'W GB/s':>7} {'fp8 us':>10} {'/row':>8} {'W GB/s':>7} {'ratio':>6}")
-    weights = mxfp8_weights(g, gen)
-    control_weights = fp8_weights(control, gen) if control else None
-    for rows in (int(r) for r in args.rows.split(",")):
-        a = arm(g, weights, rows, args.capacity, args.samples, flush, gen)
+    row_list = [int(r) for r in args.rows.split(",")]
+    # One arm resident at a time (two TP1 sets are ~25 GB together: too much for a 16g Spark
+    # container): the full mxfp8 curve first, then free it, then the control's curve.
+    weights = mxfp8_weights(g, 7)
+    first = [arm(g, weights, rows, args.capacity, args.samples, flush, gen) for rows in row_list]
+    del weights
+    torch.cuda.empty_cache()
+    second = []
+    if control:
+        control_weights = fp8_weights(control, 11)
+        second = [arm(control, control_weights, rows, args.capacity, args.samples, flush, gen) for rows in row_list]
+        del control_weights
+        torch.cuda.empty_cache()
+    for idx, rows in enumerate(row_list):
+        a = first[idx]
         row = {"rows": rows, "mxfp8": a}
         line = f"{rows:>6} {a['us']:>10.1f} {a['us_per_row']:>8.3f} {a['weight_gbps']:>7.0f}"
         if control:
-            b = arm(control, control_weights, rows, args.capacity, args.samples, flush, gen)
+            b = second[idx]
             row["fp8_control"] = b
             row["ratio"] = a["us"] / b["us"]
             line += f" {b['us']:>10.1f} {b['us_per_row']:>8.3f} {b['weight_gbps']:>7.0f} {row['ratio']:>6.3f}"

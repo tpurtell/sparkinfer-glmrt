@@ -51,26 +51,35 @@ def _mxfp8(x: torch.Tensor):
 
 
 def _weights(g, real: int):
+    """MXFP8 weights synthesized and quantized one expert at a time from a seeded generator (the
+    full F32 tensor never exists: peak = the quantized tensors + one [rows, k] F32 slab). The
+    cache holds one geometry's set; a TP switch clears it before building the next."""
     key = (g, real)
     if key not in _WEIGHTS:
         _WEIGHTS.clear()
-        gen = torch.Generator(device="cuda").manual_seed(0)
         h, i, e = g.hidden, g.slice, g.experts
-        # Realistic magnitudes: BF16-ish rows quantized by the checkpoint's own rule.
-        w1, s1, _ = _mxfp8(torch.randn((e, i, h), device="cuda", generator=gen) * 0.02)
-        w3, s3, _ = _mxfp8(torch.randn((e, i, h), device="cuda", generator=gen) * 0.02)
-        w2, s2, _ = _mxfp8(torch.randn((e, h, i), device="cuda", generator=gen) * 0.02)
         from b12x.integration.cuteafd._mxfp4_down_a8_plan import mxfp4_scale_row_bytes
 
-        s2_rows = torch.zeros((e, h, mxfp4_scale_row_bytes(i)), dtype=torch.uint8, device="cuda")
-        s2_rows[:, :, :i // 32] = s2
-        # Zero padding past the rank's real rows, as the loader stores it.
-        for w in (w1, s1, w3, s3):
-            w[:, real:] = 0
-        w2[:, :, real:] = 0
-        s2_rows[:, :, real // 32:] = 0
-        _WEIGHTS[key] = (w1.contiguous(), s1.contiguous(), w3.contiguous(), s3.contiguous(), w2.contiguous(),
-                         s2_rows.contiguous())
+        def operand(seed, rows, k, real_rows=None, real_k=None, scale_cols=None):
+            scale_cols = k // 32 if scale_cols is None else scale_cols
+            w = torch.empty((e, rows, k), dtype=torch.float8_e4m3fn, device="cuda")
+            s = torch.zeros((e, rows, scale_cols), dtype=torch.uint8, device="cuda")
+            for expert in range(e):
+                gen = torch.Generator(device="cuda").manual_seed(seed * 100003 + expert)
+                slab = torch.randn((rows, k), device="cuda", generator=gen) * 0.02
+                if real_rows is not None:
+                    slab[real_rows:] = 0
+                if real_k is not None:
+                    slab[:, real_k:] = 0
+                q, sc, _ = _mxfp8(slab)
+                w[expert] = q
+                s[expert, :, :k // 32] = sc
+            return w.contiguous(), s.contiguous()
+
+        w1, s1 = operand(1, i, h, real_rows=real)
+        w3, s3 = operand(3, i, h, real_rows=real)
+        w2, s2 = operand(2, h, i, real_k=real, scale_cols=mxfp4_scale_row_bytes(i))
+        _WEIGHTS[key] = (w1, s1, w3, s3, w2, s2)
     return _WEIGHTS[key]
 
 
