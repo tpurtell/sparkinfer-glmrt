@@ -83,6 +83,108 @@ def test_balanced_scoring_selects_exactly_what_the_row_schedule_did(programs, ca
         assert (new_q2k[:, row] == own).any(dim=-1).all(), f"row {row} lost its own block"
 
 
+@pytest.mark.parametrize("heads", [2, 4])
+@pytest.mark.parametrize("high_pages", [False, True], ids=["small-pid", "int64-pid"])
+def test_partial_page_tail_poison_cannot_change_live_scores_or_selections(heads, high_pages):
+    require_b12x()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.minimax_indexer import _layout, compile_minimax_index_aot
+
+    capacity, max_pages, stride = 8, 4, 7
+    frontiers = [65, 129, 201]
+    rows = len(frontiers)
+    widths = [(length + 63) // 64 for length in frontiers]
+    # Only nine pages are initialized, even for a pool beyond signed byte addressing.
+    first_pid = 2**31 // 8448 + 17 if high_pages else 3
+    ids = torch.arange(sum(widths), device="cuda", dtype=torch.int64).flip(0) * 3 + first_pid
+    pool_pages = first_pid + sum(widths) * 3 + 1
+    cache = torch.empty((pool_pages, 8448), dtype=torch.uint8, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(20261114)
+    keys = torch.randn((sum(widths), 64, 128), generator=generator, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.rand((sum(widths), 64), generator=generator, device="cuda") + .5
+    clean = torch.empty((sum(widths), 8448), dtype=torch.uint8, device="cuda")
+    clean[:, :8192] = keys.view(torch.uint8).reshape(-1, 8192)
+    clean[:, 8192:] = scales.view(torch.uint8).reshape(-1, 256)
+    table = torch.full((rows, stride), -1, dtype=torch.int32, device="cuda")
+    tails, cursor = [], 0
+    for row, (length, width) in enumerate(zip(frontiers, widths)):
+        table[row, :width] = ids[cursor:cursor + width].int()
+        last, valid = cursor + width - 1, length % 64
+        clean[last, valid * 128:8192] = 0
+        clean[last, 8192 + valid * 4:] = 0
+        tails.append((last, valid))
+        cursor += width
+    lengths = torch.tensor(frontiers, dtype=torch.int32, device="cuda")
+    query = torch.randn((rows, heads, 128), generator=generator, device="cuda").to(torch.float8_e4m3fn)
+    query_scales = torch.rand((rows, heads), generator=generator, device="cuda") + .5
+    immutable = [tensor.clone() for tensor in (query, query_scales, table, lengths)]
+    blocks, offsets, nbytes = _layout(capacity, max_pages, "decode", heads)
+    program = compile_minimax_index_aot(max_rows=capacity, max_pages=max_pages, mode="decode", heads=heads)
+    output = torch.full((heads, capacity, 16), -7, dtype=torch.int32, device="cuda")
+    scratch = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+
+    def launch():
+        program.launch(query, query_scales, cache, table, lengths, output, scratch,
+                       scalars=(rows, max_pages, stride, pool_pages))
+
+    def snapshot():
+        torch.cuda.synchronize()
+        page_scores = scratch[offsets["pages"]:offsets["pages"] + heads * rows * max_pages * 4].view(
+            torch.float32).reshape(heads, rows, max_pages)
+        for row, width in enumerate(widths):
+            assert torch.isfinite(page_scores[:, row, :width]).all(), (row, "nonfinite live page score")
+            assert torch.isneginf(page_scores[:, row, width:]).all(), (row, "non-live page scored")
+        assert (output[:, rows:] == -7).all(), "inactive capacity rows were overwritten"
+        for row, length in enumerate(frontiers):
+            count = (length + 127) // 128
+            expected = list(range(count)) + [-1] * (16 - count)
+            assert output[:, row].cpu().tolist() == [expected] * heads
+        result = [output.view(torch.uint8).clone(), (output[:, :rows] >= 0).sum(-1)]
+        for name, size in (("pages", heads * rows * max_pages * 4),
+                           ("scores", heads * rows * blocks * 4),
+                           ("starts", heads * rows * 4), ("lengths", heads * rows * 4)):
+            result.append(scratch[offsets[name]:offsets[name] + size].clone())
+        return result
+
+    cache.index_copy_(0, ids, clean)
+    launch()
+    eager = snapshot()
+    with kernel_resolution_guard("MiniMax scalar packed-page poison noninterference"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        graph.replay()
+        baseline = snapshot()
+        for actual, expected in zip(baseline, eager):
+            assert torch.equal(actual, expected), "clean eager/replay mismatch"
+        # E4M3FN +/-NaN and +/-448, paired with nonfinite or enormous scales.
+        for key_byte, scale in ((0x7f, 1e30), (0xff, float("inf")), (0x7e, float("nan")),
+                                (0xfe, 1e30), (0x7e, float("inf")), (0xff, float("nan"))):
+            poisoned = clean.clone()
+            for last, valid in tails:
+                poisoned[last, valid * 128:8192] = key_byte
+                poisoned[last, 8192:].view(torch.float32)[valid:] = scale
+            assert not torch.equal(poisoned, clean)
+            cache.index_copy_(0, ids, poisoned)
+            graph.replay()
+            actual = snapshot()
+            for got, expected in zip(actual, baseline):
+                assert torch.equal(got, expected), (key_byte, scale, "tail changed a published result")
+            assert torch.equal(cache.index_select(0, ids), poisoned), "index scoring mutated packed pages"
+        # Replay must recompute scores rather than retaining a clean result.
+        cache.index_copy_(0, ids, clean)
+        query.copy_((-query.float()).to(torch.float8_e4m3fn))
+        graph.replay()
+        changed = snapshot()
+        assert not torch.equal(changed[2], baseline[2]), "query mutation did not change live page scores"
+        query.copy_(immutable[0])
+        graph.replay()
+        for actual, expected in zip(snapshot(), baseline):
+            assert torch.equal(actual, expected), "restored query did not restore exact scores"
+    for actual, expected in zip((query, query_scales, table, lengths), immutable):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
 @pytest.mark.parametrize("mode,rows", [
     *(('decode', rows) for rows in range(1, 65)),
     *(('prefill', rows) for rows in (1, 63, 64, 65, 2047, 2048, 2049,
