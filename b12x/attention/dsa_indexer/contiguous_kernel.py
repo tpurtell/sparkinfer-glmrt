@@ -1718,29 +1718,19 @@ class DSAContiguousLogitsPrefillKernel:
             # Overlap: issue weight loads before TMA sync (no K dependency)
             w_linear = tx * Int32(4)
             while w_linear < Int32(_PREFILL_BLOCK_Q * _MAX_Q_HEADS):
-                w_q_local = w_linear // num_heads
-                w_head = w_linear % num_heads
-                w_q_row = q_tile_base + w_q_local
-                w0 = (
-                    Float32(weights[w_q_row, w_head])
-                    if (w_q_row < valid_q_rows and w_head < num_heads)
-                    else Float32(0.0)
-                )
-                w1 = (
-                    Float32(weights[w_q_row, w_head + Int32(1)])
-                    if (w_q_row < valid_q_rows and w_head + Int32(1) < num_heads)
-                    else Float32(0.0)
-                )
-                w2 = (
-                    Float32(weights[w_q_row, w_head + Int32(2)])
-                    if (w_q_row < valid_q_rows and w_head + Int32(2) < num_heads)
-                    else Float32(0.0)
-                )
-                w3 = (
-                    Float32(weights[w_q_row, w_head + Int32(3)])
-                    if (w_q_row < valid_q_rows and w_head + Int32(3) < num_heads)
-                    else Float32(0.0)
-                )
+                # A four-wide store can cross query rows when heads is not a multiple of four.
+                w_q_row0 = q_tile_base + w_linear // num_heads
+                w_head0 = w_linear % num_heads
+                w_q_row1 = q_tile_base + (w_linear + Int32(1)) // num_heads
+                w_head1 = (w_linear + Int32(1)) % num_heads
+                w_q_row2 = q_tile_base + (w_linear + Int32(2)) // num_heads
+                w_head2 = (w_linear + Int32(2)) % num_heads
+                w_q_row3 = q_tile_base + (w_linear + Int32(3)) // num_heads
+                w_head3 = (w_linear + Int32(3)) % num_heads
+                w0 = Float32(weights[w_q_row0, w_head0]) if w_q_row0 < valid_q_rows else Float32(0.0)
+                w1 = Float32(weights[w_q_row1, w_head1]) if w_q_row1 < valid_q_rows else Float32(0.0)
+                w2 = Float32(weights[w_q_row2, w_head2]) if w_q_row2 < valid_q_rows else Float32(0.0)
+                w3 = Float32(weights[w_q_row3, w_head3]) if w_q_row3 < valid_q_rows else Float32(0.0)
                 st_shared_v4_f32(
                     w_smem_base + w_linear * Int32(4),
                     w0,
