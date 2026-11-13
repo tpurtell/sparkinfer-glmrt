@@ -25,13 +25,13 @@ CASES = {
 }
 
 
-@pytest.fixture(scope="module")
-def programs():
+@pytest.fixture(scope="module", params=[2, 4])
+def programs(request):
     require_b12x()
     from b12x.integration.cuteafd.minimax_indexer import compile_minimax_index_aot
 
-    new = compile_minimax_index_aot(max_rows=MAX_ROWS, max_pages=MAX_PAGES, mode="decode")
-    reference = compile_minimax_index_aot(max_rows=MAX_ROWS, max_pages=MAX_PAGES, mode="decode", reference=True)
+    new = compile_minimax_index_aot(max_rows=MAX_ROWS, max_pages=MAX_PAGES, mode="decode", heads=request.param)
+    reference = compile_minimax_index_aot(max_rows=MAX_ROWS, max_pages=MAX_PAGES, mode="decode", reference=True, heads=request.param)
     return new, reference
 
 
@@ -48,12 +48,13 @@ def _cache(generator):
 def test_balanced_scoring_selects_exactly_what_the_row_schedule_did(programs, case):
     from b12x.integration.cuteafd.minimax_indexer import _layout
 
+    heads = programs[0].geometry["heads"]
     lengths = CASES[case]
     rows = len(lengths)
     generator = torch.Generator(device="cuda").manual_seed(rows * 7919 + lengths[0])
     cache = _cache(generator)
-    q = (torch.rand((rows, 4, 128), generator=generator, device="cuda") * 4 - 2).to(torch.float8_e4m3fn)
-    q_scale = torch.rand((rows, 4), generator=generator, device="cuda") + 0.5
+    q = (torch.rand((rows, heads, 128), generator=generator, device="cuda") * 4 - 2).to(torch.float8_e4m3fn)
+    q_scale = torch.rand((rows, heads), generator=generator, device="cuda") + 0.5
     widths = [(n + 63) // 64 for n in lengths]
     stride = max(widths) + 3  # a table pitch wider than its live width
     table = torch.full((rows, stride), -1, dtype=torch.int32)
@@ -62,16 +63,16 @@ def test_balanced_scoring_selects_exactly_what_the_row_schedule_did(programs, ca
         table[row, :width] = torch.randperm(POOL, generator=picker)[:width].to(torch.int32)
     table = table.cuda().contiguous()
     cache_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
-    _, offsets, nbytes = _layout(MAX_ROWS, MAX_PAGES, "decode")
+    _, offsets, nbytes = _layout(MAX_ROWS, MAX_PAGES, "decode", heads)
     results = []
     for program in programs:
-        q2k = torch.full((4, MAX_ROWS, 16), -7, dtype=torch.int32, device="cuda")
+        q2k = torch.full((heads, MAX_ROWS, 16), -7, dtype=torch.int32, device="cuda")
         scratch = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
         program.launch(q.view(torch.uint8), q_scale, cache, table, cache_lengths, q2k, scratch,
                        scalars=(rows, max(widths), stride, POOL))
         torch.cuda.synchronize()
-        pages = scratch[offsets["pages"]:offsets["pages"] + 4 * rows * MAX_PAGES * 4]
-        scores = scratch[offsets["scores"]:offsets["scores"] + 4 * rows * ((MAX_PAGES + 1) // 2) * 4]
+        pages = scratch[offsets["pages"]:offsets["pages"] + heads * rows * MAX_PAGES * 4]
+        scores = scratch[offsets["scores"]:offsets["scores"] + heads * rows * ((MAX_PAGES + 1) // 2) * 4]
         results.append((q2k[:, :rows].clone(), pages.clone(), scores.clone()))
     (new_q2k, new_pages, new_scores), (ref_q2k, ref_pages, ref_scores) = results
     assert torch.equal(new_pages, ref_pages), "per-page head maxima differ"
@@ -82,9 +83,56 @@ def test_balanced_scoring_selects_exactly_what_the_row_schedule_did(programs, ca
         assert (new_q2k[:, row] == own).any(dim=-1).all(), f"row {row} lost its own block"
 
 
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_half_head_scores_and_selections_are_byte_exact_whole_head_slices(mode):
+    require_b12x()
+    from b12x.integration.cuteafd.minimax_indexer import _layout, compile_minimax_index_aot
+
+    capacity, pages, rows = 33, 96, 33
+    gen = torch.Generator(device="cuda").manual_seed(20261113)
+    query = torch.randn((rows, 4, 128), generator=gen, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.rand((rows, 4), generator=gen, device="cuda") + .5
+    key = torch.randn((pages * 64, 128), generator=gen, device="cuda").to(torch.float8_e4m3fn)
+    key_scales = torch.rand(pages * 64, generator=gen, device="cuda") + .5
+    starts = torch.tensor([0 if r % 2 else 2816 for r in range(rows)], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([2600 + r for r in range(rows)], dtype=torch.int32, device="cuda")
+    ends = starts + lengths
+    table = torch.stack([torch.randperm(pages, generator=gen, device="cuda").int() for _ in range(rows)])
+    cache = torch.empty((pages, 8448), dtype=torch.uint8, device="cuda")
+    cache[:, :8192] = key.view(torch.uint8).reshape(pages, 8192)
+    cache[:, 8192:] = key_scales.view(torch.uint8).reshape(pages, 256)
+
+    def run(first, heads):
+        program = compile_minimax_index_aot(max_rows=capacity, max_pages=pages, mode=mode, heads=heads)
+        blocks, offsets, nbytes = _layout(capacity, pages, mode, heads)
+        output = torch.full((heads, capacity, 16), -7, dtype=torch.int32, device="cuda")
+        scratch = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
+        q, qs = query[:, first:first + heads].contiguous(), scales[:, first:first + heads].contiguous()
+        if mode == "decode":
+            program.launch(q, qs, cache, table, lengths, output, scratch,
+                           scalars=(rows, pages, pages, pages))
+        else:
+            program.launch(q, qs, key, key_scales, starts, ends, output, scratch,
+                           scalars=(rows, int(ends.max().item())))
+        torch.cuda.synchronize()
+        scores = scratch[offsets["scores"]:offsets["scores"] + heads * rows * blocks * 4]
+        result = [output.view(torch.uint8).reshape(heads, -1), scores.reshape(heads, -1)]
+        if mode == "decode":
+            page_scores = scratch[offsets["pages"]:offsets["pages"] + heads * rows * pages * 4]
+            result.append(page_scores.reshape(heads, -1))
+        return result
+
+    whole = run(0, 4)
+    for first in (0, 2):
+        half = run(first, 2)
+        for actual, reference in zip(half, whole):
+            assert torch.equal(actual, reference[first:first + 2]), (mode, first)
+
+
 @pytest.mark.parametrize("tied", [False, True])
 def test_signed_heads_and_low_id_ties_match_independent_oracle(programs, tied):
     program = programs[0]
+    heads = program.geometry["heads"]
     blocks, length = 21, 20 * 128 + 17
     pages = (length + 63) // 64
     cache = torch.zeros((pages, 8448), dtype=torch.uint8, device="cuda")
@@ -95,12 +143,12 @@ def test_signed_heads_and_low_id_ties_match_independent_oracle(programs, tied):
     keys = torch.nn.functional.pad(keys, (0, 0, 0, pages * 64 - keys.shape[0]))
     cache[:, :8192] = keys.to(torch.float8_e4m3fn).contiguous().view(torch.uint8).reshape(pages, 8192)
     cache[:, 8192:] = torch.ones((pages, 64), device="cuda").view(torch.uint8).reshape(pages, 256)
-    signs = torch.tensor([1., -1., 1., -1.], device="cuda")
-    q = signs[:, None].expand(4, 128).contiguous().to(torch.float8_e4m3fn)[None]
-    scales = torch.ones((1, 4), device="cuda")
+    signs = torch.tensor([1., -1., 1., -1.][:heads], device="cuda")
+    q = signs[:, None].expand(heads, 128).contiguous().to(torch.float8_e4m3fn)[None]
+    scales = torch.ones((1, heads), device="cuda")
     table = torch.arange(pages, dtype=torch.int32, device="cuda")[None]
     lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
-    output = torch.full((4, MAX_ROWS, 16), -7, dtype=torch.int32, device="cuda")
+    output = torch.full((heads, MAX_ROWS, 16), -7, dtype=torch.int32, device="cuda")
     scratch = torch.empty(program.scratch_bytes(MAX_ROWS)["scratch"], dtype=torch.uint8, device="cuda")
 
     def launch():
@@ -113,10 +161,10 @@ def test_signed_heads_and_low_id_ties_match_independent_oracle(programs, tied):
         launch()
     # Mutate input under stable pointers: replay must compute, not reuse old scores.
     for multiplier in [1., -1.]:
-        q.copy_((signs[:, None] * multiplier).expand(4, 128).to(torch.float8_e4m3fn)[None])
+        q.copy_((signs[:, None] * multiplier).expand(heads, 128).to(torch.float8_e4m3fn)[None])
         graph.replay()
         actual = output[:, 0].cpu().tolist()
-        for head, sign in enumerate([1., -1., 1., -1.]):
+        for head, sign in enumerate([1., -1., 1., -1.][:heads]):
             scores = [(float(block_values[b]) * sign * multiplier, b) for b in range(blocks - 1)]
             picked = [b for _, b in sorted(scores, key=lambda item: (-item[0], item[1]))[:15]]
             expected = sorted(picked + [blocks - 1])
@@ -124,14 +172,15 @@ def test_signed_heads_and_low_id_ties_match_independent_oracle(programs, tied):
         assert (output[:, 1:] == -7).all(), "inactive capacity rows were overwritten"
 
 
+@pytest.mark.parametrize("heads", [2, 4])
 @pytest.mark.parametrize("tied", [False, True])
-def test_contiguous_prefill_matches_independent_signed_block_oracle(tied):
+def test_contiguous_prefill_matches_independent_signed_block_oracle(tied, heads):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.minimax_indexer import compile_minimax_index_aot
 
     capacity, max_pages = 16, 96
-    program = compile_minimax_index_aot(max_rows=capacity, max_pages=max_pages, mode="prefill")
+    program = compile_minimax_index_aot(max_rows=capacity, max_pages=max_pages, mode="prefill", heads=heads)
     extent = max_pages * 64
     generator = torch.Generator(device="cuda").manual_seed(20261112)
     keys = torch.randn((extent, 128), generator=generator, device="cuda").to(torch.float8_e4m3fn)
@@ -140,17 +189,17 @@ def test_contiguous_prefill_matches_independent_signed_block_oracle(tied):
     key_scales = torch.rand(extent, generator=generator, device="cuda") + .5
     if tied:
         key_scales.fill_(1)
-    query = torch.empty((capacity, 4, 128), dtype=torch.float8_e4m3fn, device="cuda")
-    query_scales = torch.rand((capacity, 4), generator=generator, device="cuda") + .5
+    query = torch.empty((capacity, heads, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    query_scales = torch.rand((capacity, heads), generator=generator, device="cuda") + .5
     starts = torch.empty(capacity, dtype=torch.int32, device="cuda")
     ends = torch.empty_like(starts)
-    output = torch.full((4, capacity, 16), -7, dtype=torch.int32, device="cuda")
+    output = torch.full((heads, capacity, 16), -7, dtype=torch.int32, device="cuda")
     scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda")
     cases = [([0], [65]), ([0, 2816, 2816, 0], [2700, 2817, 2816 + 129, 257])]
-    signs = torch.tensor([1., -1., 1., -1.], device="cuda")
+    signs = torch.tensor([1., -1., 1., -1.][:heads], device="cuda")
     for first, last in cases:
         rows, k_rows = len(first), max(last)
-        query.copy_(signs[None, :, None].expand(capacity, 4, 128).to(torch.float8_e4m3fn))
+        query.copy_(signs[None, :, None].expand(capacity, heads, 128).to(torch.float8_e4m3fn))
         starts[:rows] = torch.tensor(first, dtype=torch.int32, device="cuda")
         ends[:rows] = torch.tensor(last, dtype=torch.int32, device="cuda")
         output.fill_(-7)
@@ -174,7 +223,7 @@ def test_contiguous_prefill_matches_independent_signed_block_oracle(tied):
                     scores = (query[row].float() @ k.T) * query_scales[row, :, None] * 128 ** -.5
                     block_scores = torch.stack([scores[:, p:p + 128].amax(-1)
                                                 for p in range(0, end - begin, 128)], dim=-1).cpu().tolist()
-                    for head in range(4):
+                    for head in range(heads):
                         own = len(block_scores[head]) - 1
                         history = sorted(range(own), key=lambda b: (-block_scores[head][b], b))[:15]
                         picked = sorted(history + [own])

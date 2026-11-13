@@ -23,16 +23,18 @@ from b12x.attention.dsa_indexer.kernel import PAGED_MQA_LOGITS_SCHEDULE_PAGES_PE
 from ._common import Operand, Scalar, compile_program
 
 
-def _layout(max_rows, max_pages, mode):
+def _layout(max_rows, max_pages, mode, heads=4):
     if mode not in ("decode", "prefill") or min(max_rows, max_pages) <= 0:
         raise ValueError("positive capacities and decode/prefill mode required")
+    if type(heads) is not int or heads not in (2, 4):
+        raise ValueError("MiniMax index requires 2 or 4 heads")
     blocks = (max_pages + 1) // 2
-    if 4 * max_rows * blocks >= 2**31:
+    if heads * max_rows * blocks >= 2**31:
         raise ValueError("MSA score scratch exceeds the row selector's signed indexing extent")
-    sizes = dict(weights=4 * max_rows * 4, scores=4 * max_rows * blocks * 4,
-                 pages=4 * max_rows * max_pages * 4 if mode == "decode" else 0,
-                 starts=4 * max_rows * 4, lengths=4 * max_rows * 4,
-                 indices=4 * max_rows * 16 * 4, values=4 * max_rows * 16 * 4,
+    sizes = dict(weights=heads * max_rows * 4, scores=heads * max_rows * blocks * 4,
+                 pages=heads * max_rows * max_pages * 4 if mode == "decode" else 0,
+                 starts=heads * max_rows * 4, lengths=heads * max_rows * 4,
+                 indices=heads * max_rows * 16 * 4, values=heads * max_rows * 16 * 4,
                  schedule=(max_rows + 1) * 2 * 4, controls=256)
     offsets, cursor = {}, 0
     for key, size in sizes.items():
@@ -41,23 +43,24 @@ def _layout(max_rows, max_pages, mode):
     return blocks, offsets, cursor
 
 
-def minimax_index_scratch_bytes(*, max_rows, max_pages, mode="decode"):
-    return _layout(int(max_rows), int(max_pages), mode)[2]
+def minimax_index_scratch_bytes(*, max_rows, max_pages, mode="decode", heads=4):
+    return _layout(int(max_rows), int(max_pages), mode, heads)[2]
 
 
 class _Index:
-    def __init__(self, max_rows, max_pages, mode, reference=False):
+    def __init__(self, max_rows, max_pages, mode, reference=False, heads=4):
         from b12x.attention.dsa_indexer.kernel import (
             DSAScheduledMultiRowLogitsKernel, IndexerOutputMode, IndexerScoreMode)
         from b12x.attention.dsa_indexer.contiguous_kernel import DSAContiguousLogitsPrefillKernelBlockScores
         from b12x.attention.dsa_indexer.tiled_topk import DSATiledTopkKernel
 
         self.rows, self.pages, self.mode = max_rows, max_pages, mode
+        self.heads = heads
         # The former decode scoring (one interval per row, scalar byte page
         # loads): an exactness reference for tests, never exported.
         self.reference = bool(reference)
-        self.blocks, self.offsets, self.nbytes = _layout(max_rows, max_pages, mode)
-        self.scorer = (DSAScheduledMultiRowLogitsKernel(4, 4,
+        self.blocks, self.offsets, self.nbytes = _layout(max_rows, max_pages, mode, heads)
+        self.scorer = (DSAScheduledMultiRowLogitsKernel(4, heads,
             score_mode=IndexerScoreMode.MSA_BILINEAR, output_mode=IndexerOutputMode.PAGE_HEAD_MAX)
             if mode == "decode" else DSAContiguousLogitsPrefillKernelBlockScores(
                 score_mode=IndexerScoreMode.MSA_BILINEAR, block_score_output=True))
@@ -77,7 +80,7 @@ class _Index:
         tx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         idx = bx * 128 + tx
-        if idx < rows * 4:
+        if idx < rows * self.heads:
             weights[idx] = scale[idx] * Float32(128 ** -0.5)
         if const_expr(self.mode == "decode" and not self.reference):
             # The decode scorer's max_rows intervals split the rows' live pages
@@ -152,7 +155,7 @@ class _Index:
         tx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         idx = bx * 128 + tx
-        if idx < rows * 4 * 16:
+        if idx < rows * self.heads * 16:
             rh, slot = idx // 16, idx % 16
             head, row = rh // rows, rh % rows
             value = indices[idx]
@@ -169,8 +172,8 @@ class _Index:
     def select(self, source, scores, starts, lengths, k_start, k_end, indices, values,
                output, rows: Int32, width: Int32, stream: cuda.CUstream):
         self.finish_scores(source, scores, starts, lengths, k_start, k_end, rows, width).launch(
-            grid=(rows * 4, 1, 1), block=(128, 1, 1), stream=stream)
-        n = rows * 4
+            grid=(rows * self.heads, 1, 1), block=(128, 1, 1), stream=stream)
+        n = rows * self.heads
         score_t = self._tensor(scores, (n * self.blocks,), (1,))
         start_t = self._tensor(starts, (n,), (1,))
         len_t = self._tensor(lengths, (n,), (1,))
@@ -180,7 +183,7 @@ class _Index:
             Int32(0), n, Int32(self.blocks), Int32(1), Int32(0), Int32(1), Int32(1),
             Int32(16), Int32(0), Int32(self.blocks), Int32(0), Int32(1), Int32(1), Int32(0), stream)
         self.publish(indices, starts, output, rows).launch(
-            grid=((rows * 4 * 16 + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
+            grid=((rows * self.heads * 16 + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
 
 
 class _Decode(_Index):
@@ -196,15 +199,15 @@ class _Decode(_Index):
         pages = self._ptr(scratch, self.offsets["pages"], Float32)
         # Threads for every row's head weights and every schedule boundary.
         self.init(q_scale, weights, schedule, controls, cache_lengths, rows, table_width * 64).launch(
-            grid=((rows * 4 + 127) // 128 + (self.rows + 128) // 128, 1, 1), block=(128, 1, 1), stream=stream)
+            grid=((rows * self.heads + 127) // 128 + (self.rows + 128) // 128, 1, 1), block=(128, 1, 1), stream=stream)
         # The scoring kernel visits only live pages; initialize the padded page scores.
-        self.clear_pages(pages, rows).launch(grid=((rows * 4 * self.pages + 127) // 128, 1, 1),
+        self.clear_pages(pages, rows).launch(grid=((rows * self.heads * self.pages + 127) // 128, 1, 1),
                                            block=(128, 1, 1), stream=stream)
         cache_bytes = cute.recast_ptr(index_k_cache, dtype=cutlass.Uint8)
         self.scorer(
             cute.recast_tensor(self._tensor(cute.recast_ptr(q_fp8, dtype=cutlass.Uint8),
-                (rows, 4, 128), (512, 128, 1)), cutlass.Uint8),
-            self._tensor(weights, (rows, 4), (4, 1)),
+                (rows, self.heads, 128), (self.heads * 128, 128, 1)), cutlass.Uint8),
+            self._tensor(weights, (rows, self.heads), (self.heads, 1)),
             cute.recast_tensor(self._tensor(cache_bytes,
                 (Int32(pool_pages), 64, 128), (8448, 128, 1)), cutlass.Uint8),
             self._tensor(cute.recast_ptr(controls + 2, dtype=Int64), (1,), (1,)),
@@ -215,7 +218,7 @@ class _Decode(_Index):
             self._tensor(cache_lengths, (rows,), (1,)),
             self._tensor(schedule, (rows + 1 if const_expr(self.reference) else self.rows + 1, 2), (2, 1)),
             self._tensor(controls, (1,), (1,)),
-            self._tensor(pages, (4, rows, self.pages), (Int64(rows) * self.pages, self.pages, 1)), stream)
+            self._tensor(pages, (self.heads, rows, self.pages), (Int64(rows) * self.pages, self.pages, 1)), stream)
         self.select(pages, scores, self._ptr(scratch, self.offsets["starts"], Int32),
             self._ptr(scratch, self.offsets["lengths"], Int32), cache_lengths, cache_lengths,
             self._ptr(scratch, self.offsets["indices"], Int32),
@@ -226,7 +229,7 @@ class _Decode(_Index):
         tx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         idx = Int64(bx) * 128 + tx
-        if idx < Int64(rows) * 4 * self.pages:
+        if idx < Int64(rows) * self.heads * self.pages:
             pages[idx] = Float32(-Float32.inf)
 
 
@@ -241,19 +244,19 @@ class _Prefill(_Index):
         controls = self._ptr(scratch, self.offsets["controls"], Int32)
         self.init(q_scale, weights, self._ptr(scratch, self.offsets["schedule"], Int32),
                   controls, k_end, rows, k_rows).launch(
-            grid=((rows * 4 + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
+            grid=((rows * self.heads + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream)
         padded_k_rows = (k_rows + 255) // 256 * 256
         dummy = self._tensor(cute.recast_ptr(controls, dtype=Float32), (1, 1), (1, 1))
         self.scorer(
-            self._tensor(cute.recast_ptr(q_fp8, dtype=cutlass.Uint32), (rows, 4, 32), (128, 32, 1)),
-            self._tensor(weights, (rows, 4), (4, 1)),
+            self._tensor(cute.recast_ptr(q_fp8, dtype=cutlass.Uint32), (rows, self.heads, 32), (self.heads * 32, 32, 1)),
+            self._tensor(weights, (rows, self.heads), (self.heads, 1)),
             cute.recast_tensor(self._tensor(cute.recast_ptr(k_fp8, dtype=cutlass.Uint8),
                 (padded_k_rows, 128), (128, 1)), cutlass.Uint8),
             self._tensor(cute.recast_ptr(controls + 2, dtype=Int64), (1,), (1,)),
             self._tensor(k_scale, (padded_k_rows,), (1,)),
             self._tensor(k_start, (rows,), (1,)), self._tensor(k_end, (rows,), (1,)),
             dummy, dummy,
-            self._tensor(scores, (4, rows, self.blocks), (Int64(rows) * self.blocks, self.blocks, 1)),
+            self._tensor(scores, (self.heads, rows, self.blocks), (Int64(rows) * self.blocks, self.blocks, 1)),
             rows, k_rows, Int32(self.blocks), Int32(0), (k_rows + 255) // 256, Int32(0), stream)
         self.select(scores, scores, self._ptr(scratch, self.offsets["starts"], Int32),
             self._ptr(scratch, self.offsets["lengths"], Int32), k_start, k_end,
@@ -261,14 +264,14 @@ class _Prefill(_Index):
             self._ptr(scratch, self.offsets["values"], Float32), q2k_indices, rows, k_rows, stream)
 
 
-def compile_minimax_index_aot(*, max_rows, max_pages, mode="decode", reference=False):
+def compile_minimax_index_aot(*, max_rows, max_pages, mode="decode", reference=False, heads=4):
     """``reference``: the former decode scoring (tests only; same ABI and results)."""
-    _layout(int(max_rows), int(max_pages), mode)
+    _layout(int(max_rows), int(max_pages), mode, heads)
     if reference and mode != "decode":
         raise ValueError("the reference arm is a decode program")
-    launch = (_Decode if mode == "decode" else _Prefill)(int(max_rows), int(max_pages), mode, reference)
-    operands = [Operand("q_fp8", torch.float8_e4m3fn, "[rows,4,128]"),
-                Operand("q_scale", torch.float32, "[rows,4]")]
+    launch = (_Decode if mode == "decode" else _Prefill)(int(max_rows), int(max_pages), mode, reference, heads)
+    operands = [Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{heads},128]"),
+                Operand("q_scale", torch.float32, f"[rows,{heads}]")]
     if mode == "decode":
         operands += [Operand("index_k_cache", torch.uint8, "[pool_pages,8448]"),
             Operand("page_table", torch.int32, "[rows,table_stride]", align=4),
@@ -280,11 +283,12 @@ def compile_minimax_index_aot(*, max_rows, max_pages, mode="decode", reference=F
             Operand("k_start", torch.int32, "[rows] request base, multiple of 128", align=4),
             Operand("k_end", torch.int32, "[rows] exclusive causal end", align=4)]
         scalars = (Scalar("rows"), Scalar("k_rows"))
-    operands += [Operand("q2k_indices", torch.int32, f"[4,{max_rows},16]", "out", align=4),
+    operands += [Operand("q2k_indices", torch.int32, f"[{heads},{max_rows},16]", "out", align=4),
                  Operand("scratch", torch.uint8, f"[{launch.nbytes}]", "scratch")]
     return compile_program(launch, name=f"minimax_index_{mode}" + ("_reference" if reference else ""),
         operands=tuple(operands), scalars=scalars,
-        key=(int(max_rows), int(max_pages), mode) + (("reference",) if reference else ()),
-        geometry=dict(max_rows=int(max_rows), max_pages=int(max_pages), heads=4,
+        key=(int(max_rows), int(max_pages), mode) + (("reference",) if reference else ())
+            + ((heads,) if heads != 4 else ()),
+        geometry=dict(max_rows=int(max_rows), max_pages=int(max_pages), heads=heads,
                       head_dim=128, block_tokens=128, topk=16, mode=mode),
         scratch={"scratch": lambda rows: launch.nbytes}, doc=__doc__)

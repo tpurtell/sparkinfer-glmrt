@@ -136,13 +136,16 @@ class _RouterScores:
 
 
 class _KvPack:
+    def __init__(self, heads=4):
+        self.heads = heads
+
     @cute.jit
     def __call__(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
                  batch_ids: cute.Pointer, k_descale: cute.Pointer, v_descale: cute.Pointer,
                  key_cache: cute.Pointer, value_cache: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
         self.kernel(k, v, slots, batch_ids, k_descale, v_descale, key_cache, value_cache).launch(
-            grid=(rows, 4, 1), block=(32, 1, 1), stream=stream)
+            grid=(rows, self.heads, 1), block=(32, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
@@ -154,11 +157,11 @@ class _KvPack:
         k_descale, v_descale = _view(k_descale), _view(v_descale)
         slot = Int64(slots[Int64(row)])
         if slot >= Int64(0):
-            scale_at = Int64(batch_ids[Int64(row)]) * Int64(4) + Int64(head)
+            scale_at = Int64(batch_ids[Int64(row)]) * Int64(self.heads) + Int64(head)
             ki = div_rn_f32(Float32(1.0), Float32(k_descale[scale_at]))
             vi = div_rn_f32(Float32(1.0), Float32(v_descale[scale_at]))
-            src = (Int64(row) * Int64(4) + Int64(head)) * Int64(128) + lane * Int64(4)
-            dst = (slot * Int64(4) + Int64(head)) * Int64(128)
+            src = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(128) + lane * Int64(4)
+            dst = (slot * Int64(self.heads) + Int64(head)) * Int64(128)
             kp = cute.make_ptr(Uint32, Int64(key_cache.toint()) + dst,
                                cute.AddressSpace.gmem, assumed_align=16)
             vp = cute.make_ptr(Uint32, Int64(value_cache.toint()) + dst,
@@ -201,15 +204,17 @@ def compile_minimax_router_scores_aot():
         scalars=(Scalar("rows"),), key=(), geometry=dict(hidden=6144, experts=128))
 
 
-def compile_minimax_kv_pack_aot():
+def compile_minimax_kv_pack_aot(*, heads=4):
     """Positive request/head descales must match attention and remain fixed."""
-    return compile_program(_KvPack(), name="minimax_kv_pack", operands=(
-        Operand("k", torch.bfloat16, "[rows,4,128]"),
-        Operand("v", torch.bfloat16, "[rows,4,128]"),
+    if type(heads) is not int or heads not in (2, 4):
+        raise ValueError("MiniMax KV pack requires 2 or 4 heads")
+    return compile_program(_KvPack(heads), name="minimax_kv_pack", operands=(
+        Operand("k", torch.bfloat16, f"[rows,{heads},128]"),
+        Operand("v", torch.bfloat16, f"[rows,{heads},128]"),
         Operand("slots", torch.int64, "[rows] (physical slots; negative skips writes)"),
         Operand("batch_ids", torch.int32, "[rows]"),
-        Operand("k_descale", torch.float32, "[batch,4]"),
-        Operand("v_descale", torch.float32, "[batch,4]"),
-        Operand("key_cache", torch.uint8, "[pages,64,4,128]", "out"),
-        Operand("value_cache", torch.uint8, "[pages,64,4,128]", "out")),
-        scalars=(Scalar("rows"),), key=(), geometry=dict(heads=4, head_dim=128, page_rows=64))
+        Operand("k_descale", torch.float32, f"[batch,{heads}]"),
+        Operand("v_descale", torch.float32, f"[batch,{heads}]"),
+        Operand("key_cache", torch.uint8, f"[pages,64,{heads},128]", "out"),
+        Operand("value_cache", torch.uint8, f"[pages,64,{heads},128]", "out")),
+        scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (), geometry=dict(heads=heads, head_dim=128, page_rows=64))

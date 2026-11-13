@@ -24,21 +24,24 @@ GROUPS = {
 }
 
 
-@pytest.fixture(scope="module")
-def program():
+@pytest.fixture(scope="module", params=[2, 4])
+def program(request):
     require_b12x()
     from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
 
-    return compile_minimax_attention_aot(max_rows=ROWS, max_batch=ROWS, mode="decode")
+    return compile_minimax_attention_aot(max_rows=ROWS, max_batch=ROWS, mode="decode",
+                                         query_heads=16 * request.param, kv_heads=request.param)
 
 
-def _cache(generator, pages):
-    values = torch.randn((pages, PAGE, 4, 128), generator=generator, device="cuda") * 2
+def _cache(generator, pages, heads=4):
+    values = torch.randn((pages, PAGE, heads, 128), generator=generator, device="cuda") * 2
     return values.to(torch.float8_e4m3fn)
 
 
 @pytest.mark.parametrize("group", list(GROUPS))
 def test_decode_rows_match_dense_attention_across_page_fills(program, group):
+    heads = program.geometry["kv_heads"]
+    query_heads = heads * 16
     lengths = GROUPS[group]
     generator = torch.Generator(device="cuda").manual_seed(20261024)
     batch = len(lengths)
@@ -50,17 +53,17 @@ def test_decode_rows_match_dense_attention_across_page_fills(program, group):
     for row, width in enumerate(widths):
         table[row, :width] = torch.tensor(order[cursor:cursor + width], dtype=torch.int32)
         cursor += width
-    key, value = _cache(generator, pool), _cache(generator, pool)
-    k_descale = (torch.rand((batch, 4), generator=generator, device="cuda") * .5 + .25).contiguous()
-    v_descale = (torch.rand((batch, 4), generator=generator, device="cuda") * .5 + .25).contiguous()
-    query = (torch.randn((batch, 64, 128), generator=generator, device="cuda") * .5).bfloat16()
-    q2k = torch.full((4, ROWS, 16), -1, dtype=torch.int32)
+    key, value = _cache(generator, pool, heads), _cache(generator, pool, heads)
+    k_descale = (torch.rand((batch, heads), generator=generator, device="cuda") * .5 + .25).contiguous()
+    v_descale = (torch.rand((batch, heads), generator=generator, device="cuda") * .5 + .25).contiguous()
+    query = (torch.randn((batch, query_heads, 128), generator=generator, device="cuda") * .5).bfloat16()
+    q2k = torch.full((heads, ROWS, 16), -1, dtype=torch.int32)
     for row, length in enumerate(lengths):
         blocks = (length + 127) // 128
         assert blocks <= 16
         q2k[:, row, :blocks] = torch.arange(blocks, dtype=torch.int32)
-    output = torch.zeros((batch, 64, 128), dtype=torch.bfloat16, device="cuda")
-    lse = torch.zeros((batch, 64), dtype=torch.float32, device="cuda")
+    output = torch.zeros((batch, query_heads, 128), dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros((batch, query_heads), dtype=torch.float32, device="cuda")
     scratch = torch.zeros(program.scratch_bytes(ROWS)["scratch"], dtype=torch.uint8, device="cuda")
     cache_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
@@ -72,10 +75,10 @@ def test_decode_rows_match_dense_attention_across_page_fills(program, group):
     failures = []
     for row, length in enumerate(lengths):
         pages = table[row, :widths[row]].tolist()
-        k = key[pages].float().reshape(-1, 4, 128)[:length] * k_descale[row][None, :, None]
-        v = value[pages].float().reshape(-1, 4, 128)[:length] * v_descale[row][None, :, None]
+        k = key[pages].float().reshape(-1, key.shape[2], 128)[:length] * k_descale[row][None, :, None]
+        v = value[pages].float().reshape(-1, key.shape[2], 128)[:length] * v_descale[row][None, :, None]
         q = query[row].float()
-        kv_head = torch.arange(64, device="cuda") // 16
+        kv_head = torch.arange(query.shape[1], device="cuda") // 16
         scores = torch.einsum("hd,thd->ht", q, k[:, kv_head]) * 128 ** -0.5
         expected = torch.einsum("ht,thd->hd", scores.softmax(-1), v[:, kv_head])
         expected_lse = torch.logsumexp(scores, -1) / torch.log(torch.tensor(2.0))
@@ -90,11 +93,11 @@ def test_decode_rows_match_dense_attention_across_page_fills(program, group):
 
 def _assert_selected_attention(query, key, value, kd, vd, table, lengths, cu,
                                selections, output, lse):
-    kv_head = torch.arange(64, device="cuda") // 16
+    kv_head = torch.arange(query.shape[1], device="cuda") // 16
     for request, length in enumerate(lengths):
         pages = table[request, :(length + PAGE - 1) // PAGE].tolist()
-        k = key[pages].float().reshape(-1, 4, 128)[:length] * kd[request][None, :, None]
-        v = value[pages].float().reshape(-1, 4, 128)[:length] * vd[request][None, :, None]
+        k = key[pages].float().reshape(-1, key.shape[2], 128)[:length] * kd[request][None, :, None]
+        v = value[pages].float().reshape(-1, key.shape[2], 128)[:length] * vd[request][None, :, None]
         positions = torch.arange(length, device="cuda")
         start, end = cu[request:request + 2]
         for row in range(start, end):
@@ -110,6 +113,55 @@ def _assert_selected_attention(query, key, value, kd, vd, table, lengths, cu,
             assert torch.isfinite(actual).all() and relative <= .03, (request, row, relative)
             expected_lse = torch.logsumexp(scores, -1) / torch.log(torch.tensor(2.0))
             assert (lse[row] - expected_lse).abs().max().item() <= .02, (request, row)
+
+
+@pytest.mark.parametrize("mode", ["decode", "extend"])
+def test_half_head_attention_is_byte_exact_whole_head_slice(mode):
+    require_b12x()
+    from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
+
+    generator = torch.Generator(device="cuda").manual_seed(20261113)
+    lengths = [65, 257, 2700]
+    cu = [0, 1, 2, 3] if mode == "decode" else [0, 1, 14, 33]
+    rows, pool, stride = cu[-1], 80, 44
+    key, value = _cache(generator, pool), _cache(generator, pool)
+    query = torch.randn((rows, 64, 128), generator=generator, device="cuda").bfloat16()
+    kd, vd = [torch.rand((3, 4), generator=generator, device="cuda") + .5 for _ in range(2)]
+    table = torch.full((3, stride), -1, dtype=torch.int32, device="cuda")
+    selected = torch.full((4, rows, 16), -1, dtype=torch.int32, device="cuda")
+    for request, length in enumerate(lengths):
+        width = (length + 63) // 64
+        table[request, :width] = torch.randperm(pool, generator=generator, device="cuda")[:width].int()
+        start, end = cu[request:request + 2]
+        for row in range(start, end):
+            own = (length - (end - start) + row - start) // 128
+            for head in range(4):
+                blocks = sorted(sorted(range(own), key=lambda b: ((b + head + row) % 3, b))[:15] + [own])
+                selected[head, row, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device="cuda")
+    lengths_gpu = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    offsets = torch.tensor(cu, dtype=torch.int32, device="cuda")
+
+    def run(first, heads):
+        program = compile_minimax_attention_aot(max_rows=rows, max_batch=3, mode=mode,
+                                               query_heads=heads * 16, kv_heads=heads)
+        output = torch.empty((rows, heads * 16, 128), dtype=torch.bfloat16, device="cuda")
+        lse = torch.empty((rows, heads * 16), device="cuda")
+        scratch = torch.empty(program.scratch_bytes(rows)["scratch"], dtype=torch.uint8, device="cuda")
+        program.launch(query[:, first * 16:(first + heads) * 16].contiguous(),
+                       key[:, :, first:first + heads].contiguous().view(torch.uint8),
+                       value[:, :, first:first + heads].contiguous().view(torch.uint8),
+                       kd[:, first:first + heads].contiguous(), vd[:, first:first + heads].contiguous(),
+                       table, lengths_gpu, offsets, selected[first:first + heads].contiguous(),
+                       output, lse, scratch, scalars=(rows, 3, stride, pool))
+        torch.cuda.synchronize()
+        return output, lse
+
+    whole = run(0, 4)
+    for first in (0, 2):
+        half = run(first, 2)
+        for actual, reference in zip(half, whole):
+            expected = reference[:, first * 16:(first + 2) * 16].contiguous()
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), (mode, first)
 
 
 @pytest.mark.parametrize("boundary", [2**31, 2**32])
@@ -145,25 +197,28 @@ def test_recycled_physical_pages_cross_byte_offset_boundary(boundary):
                                selected, output, lse)
 
 
+@pytest.mark.parametrize("heads", [2, 4])
 @pytest.mark.parametrize("mode", ["decode", "extend"])
-def test_sparse_selections_reuse_program_and_graph_with_live_shapes(mode):
+def test_sparse_selections_reuse_program_and_graph_with_live_shapes(mode, heads):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
 
-    program = compile_minimax_attention_aot(max_rows=ROWS, max_batch=16, mode=mode)
+    query_heads = heads * 16
+    program = compile_minimax_attention_aot(max_rows=ROWS, max_batch=16, mode=mode,
+                                          query_heads=query_heads, kv_heads=heads)
     generator = torch.Generator(device="cuda").manual_seed(20261111)
     pool, stride = 96, 44
-    key, value = _cache(generator, pool), _cache(generator, pool)
-    query = torch.empty((ROWS, 64, 128), dtype=torch.bfloat16, device="cuda")
+    key, value = _cache(generator, pool, heads), _cache(generator, pool, heads)
+    query = torch.empty((ROWS, query_heads, 128), dtype=torch.bfloat16, device="cuda")
     output = torch.empty_like(query)
-    lse = torch.empty((ROWS, 64), device="cuda")
-    kd = (torch.rand((16, 4), generator=generator, device="cuda") * .5 + .25).contiguous()
-    vd = (torch.rand((16, 4), generator=generator, device="cuda") * .5 + .25).contiguous()
+    lse = torch.empty((ROWS, query_heads), device="cuda")
+    kd = (torch.rand((16, heads), generator=generator, device="cuda") * .5 + .25).contiguous()
+    vd = (torch.rand((16, heads), generator=generator, device="cuda") * .5 + .25).contiguous()
     table = torch.full((16, stride), -1, dtype=torch.int32, device="cuda")
     cache_lengths = torch.zeros(16, dtype=torch.int32, device="cuda")
     offsets = torch.zeros(17, dtype=torch.int32, device="cuda")
-    selected = torch.full((4, ROWS, 16), -1, dtype=torch.int32, device="cuda")
+    selected = torch.full((heads, ROWS, 16), -1, dtype=torch.int32, device="cuda")
     scratch = torch.empty(program.scratch_bytes(ROWS)["scratch"], dtype=torch.uint8, device="cuda")
     cases = ([([1], [65]), ([1] * 3, [129, 257, 2700]),
               ([1] * 16, [65 + 137 * i for i in range(16)])] if mode == "decode" else
@@ -185,7 +240,7 @@ def test_sparse_selections_reuse_program_and_graph_with_live_shapes(mode):
             start, end = cu[request:request + 2]
             for row in range(start, end):
                 current = (length - (end - start) + row - start) // 128
-                for head in range(4):
+                for head in range(heads):
                     # Different sparse histories per row/head exercise union masks,
                     # not merely the all-blocks/dense special case.
                     history = sorted(range(current), key=lambda b: ((b + head + row) % 3, b))[:15]
