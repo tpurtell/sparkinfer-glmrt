@@ -22,8 +22,95 @@ route before it is timed.
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
+from statistics import median
 
 import torch
+
+
+def warmed_samples(fn, args):
+    """Batch native invocations to exclude Python graph-submission gaps."""
+    from benchmarks.common import nvidia_smi_gpu_mode_snapshot
+
+    for _ in range(10):
+        fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(args.replays):
+            fn()
+    graph.replay()
+    torch.cuda.synchronize()
+    flush = torch.zeros(512 << 20, dtype=torch.uint8, device="cuda") if args.l2_cold else None
+    samples = []
+    for _ in range(args.samples):
+        before = nvidia_smi_gpu_mode_snapshot()
+        if flush is not None:
+            flush.max()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        samples.append(dict(us=start.elapsed_time(end) * 1000 / args.replays,
+                            gpu_before=before, gpu_after=nvidia_smi_gpu_mode_snapshot()))
+    graph.reset()
+    return samples
+
+
+def sparse_mla_mode(args):
+    from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
+    from b12x.integration.cuteafd._common import GLM53, GLM53_FLASH
+    from b12x.integration.cuteafd.glm_sparse_mla import compile_glm_sparse_mla_aot
+    from b12x.integration.cuteafd.mistral_large4 import rope_attention, nope_attention
+
+    geometries = dict(glm=GLM53, glmf=GLM53_FLASH, ml4=rope_attention(), ml4_nope=nope_attention())
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    report = dict(device=torch.cuda.get_device_name(), arguments=vars(args).copy(), results=[])
+    report["arguments"]["output"] = str(args.output)
+    for name in args.geometries.split(","):
+        g = geometries[name]
+        topk = getattr(g, "sparse_topk", g.index_topk)
+        context = args.decode_context // 64 * 64
+        if context < topk:
+            raise ValueError("context must hold every selected slot")
+        latent = torch.randn(context, 512, generator=generator, device="cuda") * 0.5
+        rope = (torch.randn(context, 64, generator=generator, device="cuda").bfloat16()
+                if g.latent_dim == 576 else None)
+        cache = pack_mla_kv_cache_reference(latent, rope).view(context // 64, 64 * g.record_bytes)
+        for route, capacity, rows_list in (("decode", 64, args.decode_rows), ("prefill", 4096, args.prefill_rows)):
+            counts = [int(r) for r in rows_list.split(",") if r]
+            if not counts:
+                continue
+            if min(counts) < 1 or max(counts) > capacity:
+                raise ValueError("live rows exceed the fixed program capacity")
+            program = compile_glm_sparse_mla_aot(g, route=route, max_rows=capacity,
+                name=name + "_sparse_mla", fp32_partials=name == "glmf" and route == "decode")
+            if args.output:
+                directory = args.output.parent / (args.output.stem + "-objects")
+                directory.mkdir(parents=True, exist_ok=True)
+                stem = f"{name}_{route}"
+                program.export_to_c(str(directory), stem, stem)
+            q = (torch.randn(capacity, g.heads, g.latent_dim, generator=generator, device="cuda") * 0.5).bfloat16()
+            indices = torch.stack([torch.randperm(context, generator=generator, device="cuda")[:topk]
+                                   for _ in range(capacity)]).int()
+            lengths = torch.full((capacity,), topk, dtype=torch.int32, device="cuda")
+            out = torch.empty(capacity, g.heads, 512, dtype=torch.bfloat16, device="cuda")
+            scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda")
+            for rows in counts:
+                operands = q[:rows], cache, indices[:rows], lengths[:rows], out[:rows], scratch
+                def launch():
+                    program.launch(*operands, scalars=(rows, 8) if route == "decode" else (rows,))
+                samples = warmed_samples(launch, args)
+                assert torch.isfinite(out[:rows]).all() and torch.count_nonzero(out[:rows]) > 0
+                entry = dict(program=program.name, geometry=name, route=route, rows=rows,
+                             capacity=capacity, selected_slots=topk, plan_rows=8 if route == "decode" else None,
+                             median_us=median(s["us"] for s in samples), samples=samples)
+                report["results"].append(entry)
+                print(json.dumps({k: v for k, v in entry.items() if k != "samples"}), flush=True)
+                if args.output:
+                    args.output.write_text(json.dumps(report, indent=2) + "\n")
 
 
 def time_us(fn, iters: int, flush: torch.Tensor) -> float:
@@ -127,6 +214,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--decode-context", type=int, default=8192)
+    parser.add_argument("--sparse-mla", action="store_true", help="only native sparse MLA with synthetic prepared queries/cache")
+    parser.add_argument("--geometries", default="glm,glmf,ml4,ml4_nope")
+    parser.add_argument("--decode-rows", default="1,8,16,64")
+    parser.add_argument("--prefill-rows", default="2048,2752,4096")
+    parser.add_argument("--samples", type=int, default=7)
+    parser.add_argument("--replays", type=int, default=16)
+    parser.add_argument("--l2-cold", action="store_true", help="flush before each batch; default warmed graph replay")
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--muse-router", action="store_true",
                         help="time the Muse native F32 router instead of the GLM programs")
     parser.add_argument("--muse-rows", default="1,16,64,256,2721,2752")
@@ -135,6 +230,10 @@ def main() -> None:
     parser.add_argument("--muse-thresholds", default="16,64,128,256",
                         help="row-count dispatch thresholds for the winning tile")
     args = parser.parse_args()
+
+    if args.sparse_mla:
+        sparse_mla_mode(args)
+        return
 
     if args.muse_router:
         muse_router_mode(args)
