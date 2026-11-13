@@ -45,19 +45,21 @@ def _geometry(tp):
 
 
 def _e2m1_rn(x: torch.Tensor) -> torch.Tensor:
-    """Round to nearest E2M1 (ties to even at the representable midpoints), saturating at 6."""
-    mag = x.abs().clamp(max=6.0)
+    """Round to nearest E2M1 with ties to even (the ``cvt.rn.satfinite.e2m1x2.f32`` rule), saturating at 6.
+
+    Nearest of the eight magnitudes; an exact midpoint goes to the code with an even mantissa
+    (codes 0, 2, 4, 6: values 0, 1, 2, 4). The rounding is applied to the F32 value the
+    hardware sees, so callers pass F32-rounded inputs.
+    """
     table = E2M1.to(x.device, x.dtype)
-    # Midpoints between consecutive codes; ties go to the even code (the one with mantissa 0).
-    mids = (table[:-1] + table[1:]) / 2  # 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
-    idx = torch.bucketize(mag, mids, right=False)  # mag < mid -> lower code
-    tie = torch.isin(mag, mids)
-    # Even codes (mantissa 0): 0.0, 1.0, 2.0, 4.0 at indices 0, 2, 4, 6. On a tie, choose the even neighbour.
-    lower = torch.bucketize(mag, mids, right=True) - 1
-    lower = lower.clamp(min=0)
-    even_lower = (lower % 2) == 0
-    idx = torch.where(tie, torch.where(even_lower, lower, lower + 1), idx)
-    return torch.sign(x) * table[idx.clamp(max=7)]
+    mag = x.abs().clamp(max=6.0)
+    dist = (mag[..., None] - table).abs()                      # [..., 8]
+    best = dist.min(-1, keepdim=True).values
+    near = dist <= best                                        # candidates at the minimum (1 or 2 on a tie)
+    even = torch.tensor([True, False, True, False, True, False, True, False], device=x.device)
+    pick = near & (near.sum(-1, keepdim=True) == 1) | (near & even)
+    idx = pick.float().argmax(-1)
+    return torch.sign(x) * table[idx]
 
 
 def _e4m3(x: torch.Tensor) -> torch.Tensor:
@@ -77,27 +79,34 @@ def quantize_rows(x: torch.Tensor, encoder: float = 1536.0):
     outer = amax / encoder
     blocks = x.reshape(rows, k // 16, 16)
     bmax = blocks.abs().amax(-1, keepdim=True)
-    s6 = _e4m3((bmax * (enc[:, None, None] / 6.0)).clamp(max=448.0))
-    s4 = _e4m3((bmax * (enc[:, None, None] * 0.25)).clamp(max=448.0))
+    # The vendor forms these in F32 (Triton fp32): mirror it exactly, then widen for the error sum.
+    enc32, dec32, bmax32 = enc.float(), dec.float(), bmax.float()
+    s6 = _e4m3((bmax32 * (enc32[:, None, None] * (1.0 / 6.0))).clamp(max=448.0))
+    s4 = _e4m3((bmax32 * (enc32[:, None, None] * 0.25)).clamp(max=448.0))
 
-    def candidate(s):
-        inv = torch.clamp(1.0 / (s * dec[:, None, None]), max=3.4028234663852886e38)
-        inv = torch.where(s == 0, torch.zeros_like(inv), inv)
-        q = _e2m1_rn(blocks * inv)
+    def candidate(s32):
+        inv32 = torch.clamp(1.0 / (s32 * dec32[:, None, None]), max=3.4028234663852886e38)
+        inv32 = torch.where(s32 == 0, torch.zeros_like(inv32), inv32)
+        scaled32 = blocks.float() * inv32                      # the F32 value cvt.rn sees
+        q = _e2m1_rn(scaled32).double()
+        s = s32.double()
         err = (q * s * outer[:, None, None] - blocks).abs().sum(-1, keepdim=True)
-        return q, err
+        return q, err, s
 
-    q6, e6 = candidate(s6)
-    q4, e4 = candidate(s4)
+    q6, e6, s6d = candidate(s6)
+    q4, e4, s4d = candidate(s4)
     choose4 = e4 < e6
     q = torch.where(choose4, q4, q6)
-    s = torch.where(choose4, s4, s6)
+    s = torch.where(choose4, s4d, s6d)
     zero = bmax == 0
     q = torch.where(zero, torch.zeros_like(q), q)
     s = torch.where(zero, torch.zeros_like(s), s)
     codes = torch.bucketize(q.abs(), E2M1.to(q.device, q.dtype), right=False)
     codes = torch.where(q.abs() == 0, torch.zeros_like(codes), codes)
-    codes = codes.clamp(max=7) | torch.where(q < 0, 8, 0)
+    # Sign nibble as cvt.rn.satfinite.e2m1x2 emits it: a negative value that rounds to zero keeps
+    # its sign (0x8, decoding to -0), so byte-level probes against the kernel are exact.
+    negative = (q < 0) | ((q == 0) & (blocks < 0))
+    codes = codes.clamp(max=7) | torch.where(negative, 8, 0)
     packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8).reshape(rows, k // 2)
     exact = (q * s).reshape(rows, k)
     return packed, s.squeeze(-1).to(torch.float8_e4m3fn).view(torch.uint8), amax.float(), exact
@@ -164,20 +173,21 @@ def _situ(gate, up, gate_cap, up_cap):
 def reference(g, x, ids, gammas, dequant):
     """F64 CPU: the contract above with the kernel's BF16 rounding points."""
     m1, m3, m2 = dequant
-    x, ids, gammas = x.cpu().double(), ids.cpu(), gammas.cpu().double()
-    out = torch.zeros((x.shape[0], g.hidden), dtype=torch.float64)
+    dev = x.device
+    x, ids, gammas = x.double(), ids, gammas.double()
+    out = torch.zeros((x.shape[0], g.hidden), dtype=torch.float64, device=dev)
     for expert in ids.unique().tolist():
         rows, slots = torch.where(ids == expert)
         xr = x[rows]
         _, _, amax, xq = quantize_rows(xr)
         xq = xq * (amax.double() / 1536.0)[:, None]  # q*s*outer: the dequantized activation
         # Dequantize this expert only (one [rows, k] F64 slab at a time).
-        gate = (xq @ _dequant_expert(m1, expert).T).float().bfloat16().double()
-        up = (xq @ _dequant_expert(m3, expert).T).float().bfloat16().double()
+        gate = (xq @ _dequant_expert(m1, expert).to(dev).T).float().bfloat16().double()
+        up = (xq @ _dequant_expert(m3, expert).to(dev).T).float().bfloat16().double()
         act = (_situ(gate, up, g.situ_gate_cap, g.situ_up_cap) * gammas[rows, slots][:, None]).float().bfloat16().double()
         _, _, a_amax, aq = quantize_rows(act)
         aq = aq * (a_amax.double() / 1536.0)[:, None]
-        y = (aq @ _dequant_expert(m2, expert).T).float().bfloat16().double()
+        y = (aq @ _dequant_expert(m2, expert).to(dev).T).float().bfloat16().double()
         out.index_add_(0, rows, y)
     return out.float().bfloat16()
 
@@ -208,7 +218,7 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     scratch = torch.empty(fp8_moe_scratch_bytes(g, "stream", capacity, False), dtype=torch.uint8, device="cuda")
     program.launch(x, ids, gammas, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
-    expected = reference(g, x, ids, gammas, dequant).cuda()
+    expected = reference(g, x, ids, gammas, dequant)
     a, b = out.float(), expected.float()
     assert torch.isfinite(a).all()
     c = float((a * b).sum() / (a.norm() * b.norm()))
