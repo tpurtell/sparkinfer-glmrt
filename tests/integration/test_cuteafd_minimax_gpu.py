@@ -74,23 +74,24 @@ def test_fp32_router_weights_fp64_oracle_live_rows_and_replay():
         check(17)
 
 
+@pytest.mark.parametrize("heads", [2, 4])
 @pytest.mark.parametrize("big_slot", [False, True])
-def test_kv_pack_exact_bits_descales_negative_slots_live_rows_and_replay(big_slot):
+def test_kv_pack_exact_bits_descales_negative_slots_live_rows_and_replay(big_slot, heads):
     device = require_b12x()
     from b12x.integration.cuteafd.minimax import compile_minimax_kv_pack_aot
     from b12x._lib.runtime_control import kernel_resolution_guard
 
-    program = compile_minimax_kv_pack_aot()
+    program = compile_minimax_kv_pack_aot(heads=heads)
     rows = 7
-    k, v = [torch.randn(rows, 4, 128, device=device).bfloat16() for _ in range(2)]
+    k, v = [torch.randn(rows, heads, 128, device=device).bfloat16() for _ in range(2)]
     k[0].zero_()
-    base = 2**31 // 512 + 64 if big_slot else 64
+    base = 2**31 // (heads * 128) + 64 if big_slot else 64
     slots = torch.tensor([base, base + 63, base + 64, -1, base + 129, base + 11, base + 130],
                          device=device, dtype=torch.int64)
     batch_ids = torch.tensor([0, 1, 2, 0, 2, 1, 0], device=device, dtype=torch.int32)
-    kd = torch.tensor([[1, 0.5, 2, 0.25], [0.75, 1.5, 3, 0.125], [2.5, 0.3, 1, 0.2]], device=device)
+    kd = torch.tensor([[1, 0.5, 2, 0.25], [0.75, 1.5, 3, 0.125], [2.5, 0.3, 1, 0.2]], device=device)[:, :heads].contiguous()
     vd = kd.flip(0).contiguous()
-    caches = [torch.empty((base + 192, 4, 128), dtype=torch.uint8, device=device) for _ in range(2)]
+    caches = [torch.empty((base + 192, heads, 128), dtype=torch.uint8, device=device) for _ in range(2)]
     tensors = (k, v, slots, batch_ids, kd, vd, *caches)
     # Initialize only the touched tail, keeping the >2 GiB offset test cheap.
     def reset():
@@ -103,7 +104,7 @@ def test_kv_pack_exact_bits_descales_negative_slots_live_rows_and_replay(big_slo
             scales = descale[batch_ids.long()].cpu().numpy()
             scaled = source * (np.float32(1) / scales[..., None])
             reference = torch.from_numpy(scaled).to(torch.float8_e4m3fn).view(torch.uint8)
-            expected = torch.full((192, 4, 128), 173, dtype=torch.uint8)
+            expected = torch.full((192, heads, 128), 173, dtype=torch.uint8)
             for row in range(live):
                 slot = int(slots[row].item())
                 if slot >= 0:

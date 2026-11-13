@@ -41,7 +41,7 @@ def _equal_except_signed_zero(actual, expected):
     return int((different & zero).sum().item())
 
 
-@pytest.mark.parametrize("heads", [1, 4, 64])
+@pytest.mark.parametrize("heads", [1, 2, 4, 32, 64])
 def test_norm_rope_matches_reference_and_reuses_live_counts(heads):
     require_b12x()
     from b12x.integration.cuteafd.minimax_producer import compile_minimax_norm_rope_aot
@@ -76,15 +76,16 @@ def test_norm_rope_matches_reference_and_reuses_live_counts(heads):
     assert torch.count_nonzero(out[0]) == 0
 
 
+@pytest.mark.parametrize("heads", [2, 4])
 @pytest.mark.parametrize("big_page", [False, True])
-def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_page):
+def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_page, heads):
     require_b12x()
     from b12x.integration.cuteafd.minimax_producer import compile_minimax_index_producer_aot
     from b12x._lib.runtime_control import kernel_resolution_guard
 
-    program = compile_minimax_index_producer_aot()
+    program = compile_minimax_index_producer_aot(heads=heads)
     gen = torch.Generator(device="cuda").manual_seed(241)
-    iq = torch.randn((7, 4, 128), generator=gen, device="cuda").bfloat16()
+    iq = torch.randn((7, heads, 128), generator=gen, device="cuda").bfloat16()
     ik = torch.randn((7, 1, 128), generator=gen, device="cuda").bfloat16()
     iq[0].zero_()
     ik[0].zero_()
@@ -99,7 +100,7 @@ def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_pag
                          device="cuda", dtype=torch.int64)
     qout = torch.empty_like(iq, dtype=torch.float8_e4m3fn)
     kout = torch.empty((7, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    qs = torch.empty((7, 4), device="cuda")
+    qs = torch.empty((7, heads), device="cuda")
     ks = torch.empty(7, device="cuda")
     scratch = torch.empty(program.scratch_bytes(7)["scratch"] // 2, device="cuda", dtype=torch.bfloat16)
     tensors = (iq, ik, qn, kn, positions, slots, cs, qout, qs, kout, ks, cache, scratch)
@@ -125,8 +126,8 @@ def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_pag
         assert (cache[page, 8192 + 3 * 4:8192 + 4 * 4] == 173).all()
         # Check the quantizer's exact bits against its actual BF16 input,
         # separately from the independent norm/RoPE reduction comparison.
-        q_at, k_at = rows * 4 * 128, rows * 8 * 128
-        actual_q = scratch[q_at:k_at].reshape(rows, 4, 128)
+        q_at, k_at = rows * heads * 128, rows * 2 * heads * 128
+        actual_q = scratch[q_at:k_at].reshape(rows, heads, 128)
         actual_k = scratch[k_at:k_at + rows * 128].reshape(rows, 128)
         exact_q, exact_qs = _quantize(actual_q)
         exact_k, exact_ks = _quantize(actual_k)
@@ -166,7 +167,41 @@ def test_index_producer_plain_scales_zero_rows_negative_slots_and_replay(big_pag
     assert pointers == [t.data_ptr() for t in tensors]
 
 
-@pytest.mark.parametrize("width", [3072, 12288])
+def test_half_head_index_producer_preserves_query_bits_and_replicated_key_cache():
+    require_b12x()
+    from b12x.integration.cuteafd.minimax_producer import compile_minimax_index_producer_aot
+
+    rows = 7
+    gen = torch.Generator(device="cuda").manual_seed(20261113)
+    iq = torch.randn((rows, 4, 128), generator=gen, device="cuda").bfloat16()
+    ik = torch.randn((rows, 128), generator=gen, device="cuda").bfloat16()
+    qn, kn = [(torch.randn(128, generator=gen, device="cuda") * .1).bfloat16() for _ in range(2)]
+    positions = torch.arange(rows, dtype=torch.int64, device="cuda") * 31
+    slots = torch.tensor([65, 127, -1, 128, 255, 2, 0], dtype=torch.int64, device="cuda")
+    cs = _cos_sin("cuda")
+
+    def run(first, heads):
+        program = compile_minimax_index_producer_aot(heads=heads)
+        query = torch.empty((rows, heads, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        qs = torch.empty((rows, heads), device="cuda")
+        key = torch.empty((rows, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        ks = torch.empty(rows, device="cuda")
+        cache = torch.full((4, 8448), 173, dtype=torch.uint8, device="cuda")
+        scratch = torch.empty(program.scratch_bytes(rows)["scratch"] // 2, dtype=torch.bfloat16, device="cuda")
+        program.launch(iq[:, first:first + heads].contiguous(), ik, qn, kn, positions, slots,
+                       cs, query, qs, key, ks, cache, scratch, scalars=(rows,))
+        torch.cuda.synchronize()
+        return query, qs, key, ks, cache
+
+    whole = run(0, 4)
+    for first in (0, 2):
+        half = run(first, 2)
+        expected = (whole[0][:, first:first + 2].contiguous(), whole[1][:, first:first + 2].contiguous(), *whole[2:])
+        for actual, reference in zip(half, expected):
+            assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8)), first
+
+
+@pytest.mark.parametrize("width", [1536, 3072, 6144, 12288])
 def test_split_oai_uses_shared_native_activation(width):
     require_b12x()
     from b12x.integration.cuteafd.minimax_producer import compile_minimax_oai_split_aot

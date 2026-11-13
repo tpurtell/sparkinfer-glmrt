@@ -1,6 +1,6 @@
-"""MSA paged GQA pointer ABI: FP8 planar KV, D128, 64 Q / 4 KV heads.
+"""MSA paged GQA pointer ABI: FP8 planar KV, D128, 16 Q heads per KV head.
 
-Selections retain a fixed [4,max_rows,16] allocation. pool_pages must fit
+Selections retain a fixed [kv_heads,max_rows,16] allocation. pool_pages must fit
 signed Int32; physical page offsets use Int64. Cache pages contain 64
 rows; each selected 128-token block addresses two logical pages. Descales are
 per request and KV head. Output LSE is base 2, as in PagedForwardKernel.
@@ -16,13 +16,15 @@ from cutlass import Int32, Int64, const_expr
 from ._common import Operand, Scalar, compile_program
 
 
-def _layout(max_rows, max_batch, mode):
+def _layout(max_rows, max_batch, mode, query_heads=64, kv_heads=4):
     if mode not in ("decode", "extend") or min(max_rows, max_batch) <= 0:
         raise ValueError("positive capacities and decode/extend mode required")
+    if type(kv_heads) is not int or kv_heads not in (2, 4) or type(query_heads) is not int or query_heads != 16 * kv_heads:
+        raise ValueError("MiniMax attention requires 32 Q / 2 KV or 64 Q / 4 KV heads")
     work = max_rows if mode == "decode" else (max_rows + 7) // 8 + max_batch
     sizes = dict(requests=work * 4, tiles=work * 4, zeros=max(work, max_batch + 1) * 4,
-                 valid=work * 4, union_blocks=work * 4 * 128 * 4,
-                 union_masks=work * 4 * 128 * 4, union_counts=work * 4 * 4)
+                 valid=work * 4, union_blocks=work * kv_heads * 128 * 4,
+                 union_masks=work * kv_heads * 128 * 4, union_counts=work * kv_heads * 4)
     if mode == "decode":
         sizes.update(union_blocks=0, union_masks=0, union_counts=0)
     offsets, cursor = {}, 0
@@ -32,17 +34,18 @@ def _layout(max_rows, max_batch, mode):
     return work, offsets, cursor
 
 
-def minimax_attention_scratch_bytes(*, max_rows, max_batch, mode="decode"):
-    return _layout(int(max_rows), int(max_batch), mode)[2]
+def minimax_attention_scratch_bytes(*, max_rows, max_batch, mode="decode", query_heads=64, kv_heads=4):
+    return _layout(int(max_rows), int(max_batch), mode, query_heads, kv_heads)[2]
 
 
 class _Attention:
-    def __init__(self, max_rows, max_batch, mode):
+    def __init__(self, max_rows, max_batch, mode, query_heads=64, kv_heads=4):
         from b12x.attention.paged.forward_extend_generic import PagedForwardKernel
         from b12x.attention.paged.traits import PagedForwardTraits
 
         self.rows, self.batch, self.mode = max_rows, max_batch, mode
-        self.work, self.offsets, self.nbytes = _layout(max_rows, max_batch, mode)
+        self.query_heads, self.kv_heads = query_heads, kv_heads
+        self.work, self.offsets, self.nbytes = _layout(max_rows, max_batch, mode, query_heads, kv_heads)
         union = mode == "extend"
         self.tokens = 8 if union else 1
         # Static D128 tiles fit every supported SM120/SM121 device.
@@ -89,18 +92,19 @@ class _Attention:
         if const_expr(self.mode == "extend"):
             self.union(q2k_indices, cache_lengths, cu_seqlens_q, requests, tiles, valid,
                        blocks, masks, counts, work).launch(
-                grid=(work, 4, 1), block=(32, 1, 1), stream=stream)
-            union_blocks = self._tensor(blocks, (work, 4, 128), (512, 128, 1))
-            union_masks = self._tensor(masks, (work, 4, 128), (512, 128, 1))
-            union_counts = self._tensor(counts, (work, 4), (4, 1))
-        cache_layout = cute.make_layout((Int32(pool_pages), 64, 4, 128), stride=(32768, 512, 128, 1))
+                grid=(work, self.kv_heads, 1), block=(32, 1, 1), stream=stream)
+            union_blocks = self._tensor(blocks, (work, self.kv_heads, 128), (self.kv_heads * 128, 128, 1))
+            union_masks = self._tensor(masks, (work, self.kv_heads, 128), (self.kv_heads * 128, 128, 1))
+            union_counts = self._tensor(counts, (work, self.kv_heads), (self.kv_heads, 1))
+        cache_layout = cute.make_layout((Int32(pool_pages), 64, self.kv_heads, 128),
+                                        stride=(64 * self.kv_heads * 128, self.kv_heads * 128, 128, 1))
         # Raw-pointer lowering erases byte signedness; restore it at the adapter boundary.
         k = cute.recast_tensor(cute.make_tensor(key_cache, cache_layout), cutlass.Uint8)
         v = cute.recast_tensor(cute.make_tensor(value_cache, cache_layout), cutlass.Uint8)
         dummy_float = self._tensor(cute.recast_ptr(zeros, dtype=cutlass.Float32), (1,), (1,))
         dummy_desc = self._tensor(cute.recast_ptr(zeros, dtype=Int64), (1,), (1,))
         self.forward(
-            self._tensor(query, (rows, 64, 128), (8192, 128, 1)), k, v,
+            self._tensor(query, (rows, self.query_heads, 128), (self.query_heads * 128, 128, 1)), k, v,
             self._tensor(page_table, (batch, table_stride), (Int64(table_stride), 1)),
             self._tensor(cache_lengths, (batch,), (1,)),
             self._tensor(cu_seqlens_q, (batch + 1,), (1,)),
@@ -108,13 +112,13 @@ class _Attention:
             self._tensor(zeros, (work,), (1,)), self._tensor(zeros, (batch + 1,), (1,)),
             self._tensor(zeros, (1,), (1,)), self._tensor(zeros, (batch,), (1,)),
             self._tensor(valid, (work,), (1,)),
-            self._tensor(q2k_indices, (4, self.rows, 16), (self.rows * 16, 16, 1)),
+            self._tensor(q2k_indices, (self.kv_heads, self.rows, 16), (self.rows * 16, 16, 1)),
             union_blocks, union_masks, union_counts, dummy_float, None,
-            self._tensor(output, (rows, 64, 128), (8192, 128, 1)),
-            # The kernel indexes LSE as [head, row]; the ABI stores [rows,64].
-            self._tensor(lse, (64, rows), (1, 64)),
-            self._tensor(k_descale, (batch, 4), (4, 1)),
-            self._tensor(v_descale, (batch, 4), (4, 1)), dummy_desc, dummy_desc, stream)
+            self._tensor(output, (rows, self.query_heads, 128), (self.query_heads * 128, 128, 1)),
+            # The kernel indexes LSE as [head, row]; the ABI stores [rows,heads].
+            self._tensor(lse, (self.query_heads, rows), (1, self.query_heads)),
+            self._tensor(k_descale, (batch, self.kv_heads), (self.kv_heads, 1)),
+            self._tensor(v_descale, (batch, self.kv_heads), (self.kv_heads, 1)), dummy_desc, dummy_desc, stream)
 
     @cute.kernel
     def metadata(self, cu, requests, tiles, zeros, valid, work: Int32, batch: Int32):
@@ -143,7 +147,7 @@ class _Attention:
         wi, head, _ = cute.arch.block_idx()
         if tx == 0:
             count = Int32(0)
-            base = (Int64(wi) * 4 + head) * 128
+            base = (Int64(wi) * self.kv_heads + head) * 128
             if valid[wi] != 0:
                 req = requests[wi]
                 start, end = cu[req], cu[req + 1]
@@ -175,27 +179,28 @@ class _Attention:
                                     count += 1
                                 else:
                                     masks[base + found] = masks[base + found] | Int32(1 << token)
-            counts[Int64(wi) * 4 + head] = count
+            counts[Int64(wi) * self.kv_heads + head] = count
 
 
-def compile_minimax_attention_aot(*, max_rows, max_batch, mode="decode"):
-    launch = _Attention(int(max_rows), int(max_batch), mode)
+def compile_minimax_attention_aot(*, max_rows, max_batch, mode="decode", query_heads=64, kv_heads=4):
+    launch = _Attention(int(max_rows), int(max_batch), mode, query_heads, kv_heads)
     operands = (
-        Operand("query", torch.bfloat16, "[rows,64,128]"),
-        Operand("key_cache", torch.uint8, "[pool_pages,64,4,128] E4M3 bytes"),
-        Operand("value_cache", torch.uint8, "[pool_pages,64,4,128] E4M3 bytes"),
-        Operand("k_descale", torch.float32, "[batch,4]"),
-        Operand("v_descale", torch.float32, "[batch,4]"),
+        Operand("query", torch.bfloat16, f"[rows,{query_heads},128]"),
+        Operand("key_cache", torch.uint8, f"[pool_pages,64,{kv_heads},128] E4M3 bytes"),
+        Operand("value_cache", torch.uint8, f"[pool_pages,64,{kv_heads},128] E4M3 bytes"),
+        Operand("k_descale", torch.float32, f"[batch,{kv_heads}]"),
+        Operand("v_descale", torch.float32, f"[batch,{kv_heads}]"),
         Operand("page_table", torch.int32, "[batch,table_stride]", align=4),
         Operand("cache_lengths", torch.int32, "[batch] including appended queries", align=4),
         Operand("cu_seqlens_q", torch.int32, "[batch+1] packed query offsets; decode arange", align=4),
-        Operand("q2k_indices", torch.int32, f"[4,{max_rows},16]", align=4),
-        Operand("output", torch.bfloat16, "[rows,64,128]", "out"),
-        Operand("lse", torch.float32, "[rows,64] base-2", "out"),
+        Operand("q2k_indices", torch.int32, f"[{kv_heads},{max_rows},16]", align=4),
+        Operand("output", torch.bfloat16, f"[rows,{query_heads},128]", "out"),
+        Operand("lse", torch.float32, f"[rows,{query_heads}] base-2", "out"),
         Operand("scratch", torch.uint8, f"[{launch.nbytes}]", "scratch"))
     return compile_program(launch, name=f"minimax_attention_{mode}", operands=operands,
         scalars=(Scalar("rows"), Scalar("batch"), Scalar("table_stride"), Scalar("pool_pages", "int64", "must fit signed int32 page extent")),
-        key=(int(max_rows), int(max_batch), mode), scratch={"scratch": lambda rows: launch.nbytes},
+        key=(int(max_rows), int(max_batch), mode) + ((query_heads, kv_heads) if kv_heads != 4 else ()),
+        scratch={"scratch": lambda rows: launch.nbytes},
         geometry=dict(max_rows=int(max_rows), max_batch=int(max_batch), page_rows=64,
-                      query_heads=64, kv_heads=4, head_dim=128, block_tokens=128,
+                      query_heads=query_heads, kv_heads=kv_heads, head_dim=128, block_tokens=128,
                       topk=16, mode=mode, softmax_scale=128 ** -0.5), doc=__doc__)

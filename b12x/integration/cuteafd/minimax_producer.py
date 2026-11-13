@@ -74,10 +74,9 @@ class _NormRope:
 
 
 class _Index:
-    heads = 4
-
-    def __init__(self):
-        self.query, self.key = _NormRope(4), _NormRope(1)
+    def __init__(self, heads=4):
+        self.heads = heads
+        self.query, self.key = _NormRope(heads), _NormRope(1)
 
     @cute.jit
     def __call__(self, iq: cute.Pointer, ik: cute.Pointer, iq_norm: cute.Pointer,
@@ -87,12 +86,12 @@ class _Index:
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         m = Int64(rows)
         # Normalized temporary followed by rotated Q and K, all BF16.
-        rotated_q = scratch + m * Int64(4 * 128)
-        rotated_k = rotated_q + m * Int64(4 * 128)
+        rotated_q = scratch + m * Int64(self.heads * 128)
+        rotated_k = rotated_q + m * Int64(self.heads * 128)
         self.query(iq, iq_norm, positions, cos_sin, rotated_q, scratch, rows, stream)
         self.key(ik, ik_norm, positions, cos_sin, rotated_k, scratch, rows, stream)
         self.pack(rotated_q, rotated_k, slots, q_fp8, q_scale, k_fp8, k_scale, cache).launch(
-            grid=(rows, 5, 1), block=(32, 1, 1), stream=stream)
+            grid=(rows, self.heads + 1, 1), block=(32, 1, 1), stream=stream)
 
     @cute.kernel
     def pack(self, iq: cute.Pointer, ik: cute.Pointer, slots: cute.Pointer,
@@ -101,8 +100,8 @@ class _Index:
         row, head = Int64(cute.arch.block_idx()[0]), Int64(cute.arch.block_idx()[1])
         lane = Int64(cute.arch.thread_idx()[0])
         source = ik + row * Int64(128)
-        if head < Int64(4):
-            source = iq + (row * Int64(4) + head) * Int64(128)
+        if head < Int64(self.heads):
+            source = iq + (row * Int64(self.heads) + head) * Int64(128)
         value = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
         maximum = Float32(0.0)
         for j in cutlass.range_constexpr(4):
@@ -113,10 +112,10 @@ class _Index:
         packed = cvt_f32x4_to_e4m3x4(value[0] * inverse, value[1] * inverse,
                                     value[2] * inverse, value[3] * inverse)
         destination = Int64(k_fp8.toint()) + row * Int64(128)
-        if head < Int64(4):
-            destination = Int64(q_fp8.toint()) + (row * Int64(4) + head) * Int64(128)
+        if head < Int64(self.heads):
+            destination = Int64(q_fp8.toint()) + (row * Int64(self.heads) + head) * Int64(128)
             if lane == Int64(0):
-                q_scale[row * Int64(4) + head] = scale
+                q_scale[row * Int64(self.heads) + head] = scale
         else:
             if lane == Int64(0):
                 k_scale[row] = scale
@@ -175,24 +174,26 @@ def compile_minimax_norm_rope_aot(*, heads):
         geometry=dict(heads=heads, head_dim=128, rotary_dim=64, eps=1e-6))
 
 
-def compile_minimax_index_producer_aot():
-    return compile_program(_Index(), name="minimax_index_producer", operands=(
-        Operand("iq", torch.bfloat16, "[rows,4,128]"),
+def compile_minimax_index_producer_aot(*, heads=4):
+    if type(heads) is not int or heads not in (2, 4):
+        raise ValueError("MiniMax index producer requires 2 or 4 heads")
+    return compile_program(_Index(heads), name="minimax_index_producer", operands=(
+        Operand("iq", torch.bfloat16, f"[rows,{heads},128]"),
         Operand("ik", torch.bfloat16, "[rows,128]"),
         Operand("iq_norm", torch.bfloat16, "[128] Gemma offset"),
         Operand("ik_norm", torch.bfloat16, "[128] Gemma offset"),
         Operand("positions", torch.int64, "[rows]"),
         Operand("slots", torch.int64, "[rows] negative skips paged write"),
         Operand("cos_sin", torch.float32, "[positions,64] (cos32 then sin32)"),
-        Operand("q_fp8", torch.float8_e4m3fn, "[rows,4,128]", "out"),
-        Operand("q_scale", torch.float32, "[rows,4]", "out"),
+        Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{heads},128]", "out"),
+        Operand("q_scale", torch.float32, f"[rows,{heads}]", "out"),
         Operand("k_fp8", torch.float8_e4m3fn, "[rows,128]", "out"),
         Operand("k_scale", torch.float32, "[rows]", "out"),
         Operand("cache", torch.uint8, "[pool_pages,8448] keys then FP32 scales", "inout"),
-        Operand("scratch", torch.bfloat16, "[rows,9,128]", "scratch")),
-        scalars=(Scalar("rows"),), key=(),
-        scratch={"scratch": lambda rows: int(rows) * 9 * 128 * 2},
-        geometry=dict(heads=4, head_dim=128, rotary_dim=64, eps=1e-6, page_rows=64))
+        Operand("scratch", torch.bfloat16, f"[rows,{2 * heads + 1},128]", "scratch")),
+        scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (),
+        scratch={"scratch": lambda rows: int(rows) * (2 * heads + 1) * 128 * 2},
+        geometry=dict(heads=heads, head_dim=128, rotary_dim=64, eps=1e-6, page_rows=64))
 
 
 def compile_minimax_oai_split_aot(*, width):
