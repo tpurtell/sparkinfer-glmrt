@@ -181,7 +181,7 @@ def compile_inkling2_attention_aot(g: Inkling2Geometry = INKLING2_SMALL, *, kind
         raise ValueError(f"max_splits must be in 1..{MAX_SPLITS}")
     n, d, r, extent = g.heads, g.head_dim, g.record_elems, g.extent(kind)
     q = Operand("q", torch.bfloat16, f"[rows,{n},{d}]")
-    rel = Operand("rel", torch.bfloat16, f"[rows,{n},{extent}]", align=2,
+    rel = Operand("rel", torch.bfloat16, f"[rows,{n},{extent}]", align=16,
                   note="additive bias per (row, head, distance back); zero beyond the extent")
     sinks = Operand("sinks", torch.float32, f"[rows,{n}]", align=4, note="unscaled sink logit per (row, head)")
     out = Operand("out", torch.bfloat16, f"[rows,{n},{d}]", "out")

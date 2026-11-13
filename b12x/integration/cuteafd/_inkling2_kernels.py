@@ -24,7 +24,8 @@ heads]`` tensor instead of per head. The split merge reads the same per-row
 sink. Ring/paged key addressing, cp.async staging, the MMA shapes and the
 base-2 FP32 online softmax with BF16 probabilities into the PV MMA are
 MiMo's, inherited unchanged (``_resolve``, ``_load_bf16``, ``_layouts``,
-``_tiled_mma_*``). Only BF16 records, one K/V tile staged at a time.
+``_tiled_mma_*``). Only BF16 records, one K/V tile staged at a time; each
+tile's bias slices are staged into shared memory by cp.async next to K/V.
 """
 from __future__ import annotations
 
@@ -71,6 +72,12 @@ class InklingGqaAttention(MimoGqaAttention):
         # The online softmax multiplies the raw accumulator by scale, so the
         # bias enters the accumulator as bias / scale (the reference's order).
         self.bias_scale = 1.0 / float(softmax_scale)
+        # Bias staging per M row: the tile's tile_n distances start at an 8-aligned
+        # distance, so up to tile_n + 7 elements, rounded to whole 16-byte vectors.
+        self.rel_stage = _ceil(self.tile_n + 7, 8) * 8
+        self.rel_vectors = self.rel_stage // 8
+        if self.extent % 8:
+            raise ValueError("the bias extent must be a multiple of 8 (16-byte staging vectors)")
 
     def key(self) -> tuple:
         return (*super().key(), "inkling2", self.extent)
@@ -93,8 +100,13 @@ class InklingGqaAttention(MimoGqaAttention):
                      r_k: cute.Tensor, r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy, c_k: cute.TiledCopy,
                      c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor, cs_k: cute.Tensor,
                      cs_p: cute.Tensor, cs_v: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax,
-                     is_first: cutlass.Constexpr, kv_head: Int32, rel: cute.Pointer, row0: Int64, rows: Int32):
-        """QK over the staged tile: add the gathered bias, mask, online softmax, PV accumulate."""
+                     is_first: cutlass.Constexpr, kv_head: Int32, s_rel: cute.Tensor, k0: Int64):
+        """QK over the staged tile: add the staged bias, mask, online softmax, PV accumulate.
+
+        ``s_rel[m, i]`` holds this M row's bias at distance ``base_m + i`` with
+        ``base_m = ((p_m - k0 - (tile_n - 1)) & ~7)``; key column ``j`` is at
+        distance ``p_m - k0 - j``.
+        """
         if thread < Int32(self.qk_warps * 32):
             acc_s = cute.make_rmem_tensor(
                 tiled_mma_qk.get_slice(thread).partition_shape_C((self.tile_m, self.tile_n)), Float32)
@@ -103,30 +115,28 @@ class InklingGqaAttention(MimoGqaAttention):
             s_mn = layout_utils.reshape_acc_to_mn(acc_s)
             coords = layout_utils.reshape_acc_to_mn(
                 tiled_mma_qk.get_slice(thread).partition_C(cute.make_identity_tensor((self.tile_m, self.tile_n))))
-            rel_t = cute.make_tensor(rel, cute.make_layout((Int64(rows) * Int64(self.heads * self.extent),)))
             for m in cutlass.range_constexpr(cute.size(s_mn.shape[0])):
                 m_row = coords[m, 0][0]
                 t_local = m_row // Int32(self.group)
-                head = Int64(kv_head * Int32(self.group) + m_row % Int32(self.group))
                 p = Int64(-1)
                 if t_local < Int32(self.tokens):
                     p = Int64(token_pos[t_local])
-                # This (live row, head)'s bias row; padded rows read row 0 and are masked below.
-                rel_row = cutlass.select_(
-                    p >= Int64(0), ((row0 + Int64(t_local)) * Int64(self.heads) + head) * Int64(self.extent),
-                    Int64(0))
+                # Distance of key column 0 and the staged slice's first distance (both Int32: tile-local).
+                d0 = Int32(p - k0)
+                base = (d0 - Int32(self.tile_n - 1)) & ~Int32(7)
                 for n in cutlass.range_constexpr(cute.size(s_mn.shape[1])):
-                    kp = Int64(key_pos[0, coords[m, n][1]])
+                    col = Int32(coords[m, n][1])
+                    kp = Int64(key_pos[0, col])
                     masked = (p < Int64(0)) | (kp < Int64(0)) | (kp > p)
                     if const_expr(self.window > 0):
                         masked = masked | (kp <= p - Int64(self.window))
-                    distance = p - kp
-                    biased = (distance >= Int64(0)) & (distance < Int64(self.extent))
-                    # Branchless gather: the index is clamped into the row, the value selected
-                    # (masked pairs may add a bias; they become -inf right after).
-                    index = cutlass.select_(distance < Int64(0), Int64(0), distance)
-                    index = cutlass.select_(index >= Int64(self.extent), Int64(self.extent - 1), index)
-                    bias = Float32(rel_t[rel_row + index]) * Float32(self.bias_scale)
+                    distance = d0 - col
+                    biased = (distance >= Int32(0)) & (distance < Int32(self.extent))
+                    # Staged slots outside the extent are zero-filled; the select keeps the
+                    # read in bounds for padded rows (p < 0, masked right after).
+                    slot = distance - base
+                    slot = cutlass.select_((slot >= Int32(0)) & (slot < Int32(self.rel_stage)), slot, Int32(0))
+                    bias = Float32(s_rel[m_row, slot]) * Float32(self.bias_scale)
                     s_mn[m, n] = s_mn[m, n] + cutlass.select_(biased, bias, Float32(0.0))
                     if masked:
                         s_mn[m, n] = -Float32.inf
@@ -158,16 +168,43 @@ class InklingGqaAttention(MimoGqaAttention):
                      r_q: cute.Tensor, r_k: cute.Tensor, r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy,
                      c_k: cute.TiledCopy, c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor,
                      cs_k: cute.Tensor, cs_p: cute.Tensor, cs_v: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax,
-                     is_first: cutlass.Constexpr, rel: cute.Pointer, rows: Int32):
-        """One BF16 key tile: resolve addresses, stage K/V, then the biased QK/softmax/PV step."""
+                     is_first: cutlass.Constexpr, rel: cute.Pointer, rows: Int32, s_rel: cute.Tensor, live: Int32):
+        """One BF16 key tile: resolve addresses, stage K/V and the bias slices, then the biased
+        QK/softmax/PV step."""
         self._resolve(tile, Int32(0), lo, hi, cache, kv_step, page_table, table_base, seq_start, step_first,
                       ring_base, key_addr, key_pos, thread)
         cute.arch.sync_threads()
-        self._load_bf16(key_addr, kv_head, cache, s_k, s_v, buf=Int32(0))
+        self._load_bf16(key_addr, kv_head, cache, s_k, s_v, buf=Int32(0), wait=False)
+        # Bias slices: M row m (token t, head h) needs rel[row0 + t, h, p_t - k] for the
+        # tile's keys k = k0 .. k0 + tile_n - 1, a contiguous run of distances staged as
+        # whole 16-byte vectors from the 8-aligned distance below the run; vectors
+        # outside [0, extent) are zero-filled (extent is a multiple of 8, so none straddles).
+        k0 = lo + Int64(tile) * Int64(self.tile_n)
+        for it in cutlass.range_constexpr(_ceil(self.tile_m * self.rel_vectors, self.threads)):
+            linear = thread + Int32(it * self.threads)
+            if linear < Int32(self.tile_m * self.rel_vectors):
+                m = linear // Int32(self.rel_vectors)
+                vec = linear % Int32(self.rel_vectors)
+                t_local = m // Int32(self.group)
+                head = Int64(kv_head * Int32(self.group) + m % Int32(self.group))
+                valid = (t_local < live) & (m < Int32(self.tokens * self.group))
+                p = Int64(0)
+                if valid:
+                    p = Int64(token_pos[t_local])
+                base = (Int32(p - k0) - Int32(self.tile_n - 1)) & ~Int32(7)
+                distance = base + vec * Int32(8)
+                valid = valid & (distance >= Int32(0)) & (distance < Int32(self.extent))
+                source = Int64(rel.toint()) + ((((row0 + Int64(t_local)) * Int64(self.heads) + head)
+                                                * Int64(self.extent)) + Int64(distance)) * Int64(2)
+                source = cutlass.select_(valid, source, Int64(rel.toint()))
+                _cp_async_load_128b_zfill(
+                    shared_ptr_to_u32(s_rel.iterator + cute.crd2idx((m, vec * Int32(8)), s_rel.layout)), source,
+                    cutlass.select_(valid, Int32(16), Int32(0)))
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
         self._biased_mask(token_pos, key_pos, s_p, s_scale, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v,
-                          c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p, cs_v, acc_o, softmax, is_first, kv_head, rel, row0,
-                          rows)
+                          c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p, cs_v, acc_o, softmax, is_first, kv_head, s_rel, k0)
 
     @cute.kernel
     def kernel(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
@@ -192,6 +229,10 @@ class InklingGqaAttention(MimoGqaAttention):
         s_p = allocator.allocate_tensor(element_type=BFloat16, layout=p_layout, byte_alignment=1024)
         s_scale = allocator.allocate_tensor(element_type=Float32, layout=cute.make_layout((self.tile_m,)),
                                             byte_alignment=16)
+        # Each M row's bias slice for the staged key tile: REL_STAGE BF16 (the tile's
+        # tile_n distances, aligned down to 8), 16-byte rows.
+        s_rel = allocator.allocate_tensor(element_type=BFloat16, layout=cute.make_layout(
+            (self.tile_m, self.rel_stage), stride=(self.rel_stage, 1)), byte_alignment=16)
         # Slot 0 only (the inherited _resolve/_load_bf16 take a slot index); the (2, tile_n) shape is theirs.
         key_addr = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
             (2, self.tile_n), stride=(self.tile_n, 1)), byte_alignment=16)
@@ -281,13 +322,13 @@ class InklingGqaAttention(MimoGqaAttention):
             self._biased_tile(split, lo, hi, row0, kv_head, cache, kv_step, page_table, table_base, seq_start,
                               step_first, ring_base, token_pos, key_addr, key_pos, s_k, s_v, s_p, s_scale, thread,
                               tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k, cs_p,
-                              cs_v, acc_o, softmax, True, rel, rows)
+                              cs_v, acc_o, softmax, True, rel, rows, s_rel, live)
             for local in cutlass.range(my_tiles - Int32(1), unroll=1):
                 tile = split + (Int32(local) + Int32(1)) * splits
                 self._biased_tile(tile, lo, hi, row0, kv_head, cache, kv_step, page_table, table_base, seq_start,
                                   step_first, ring_base, token_pos, key_addr, key_pos, s_k, s_v, s_p, s_scale,
                                   thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q,
-                                  cs_k, cs_p, cs_v, acc_o, softmax, False, rel, rows)
+                                  cs_k, cs_p, cs_v, acc_o, softmax, False, rel, rows, s_rel, live)
 
         # Final scale per M row with its (row, head) sink (direct), or the LSE for split partials.
         if thread < Int32(self.qk_warps * 32):
@@ -297,11 +338,12 @@ class InklingGqaAttention(MimoGqaAttention):
                 sink_t = cute.make_tensor(sinks, cute.make_layout((Int64(rows) * Int64(self.heads),)))
                 sink_vals = cute.make_rmem_tensor(cute.size(s_layout.shape[0]), Float32)
                 for m in cutlass.range_constexpr(cute.size(s_layout.shape[0])):
-                    m_row = coords[m, 0][0]
-                    t_local = m_row // Int32(self.group)
-                    head = Int64(kv_head * Int32(self.group) + m_row % Int32(self.group))
-                    valid = (t_local < live) & (m_row < Int32(self.tokens * self.group))
-                    sink_row = cutlass.select_(valid, (row0 + Int64(t_local)) * Int64(self.heads) + head, Int64(0))
+                    sink_m = coords[m, 0][0]
+                    sink_t_local = sink_m // Int32(self.group)
+                    sink_head = Int64(kv_head * Int32(self.group) + sink_m % Int32(self.group))
+                    sink_valid = (sink_t_local < live) & (sink_m < Int32(self.tokens * self.group))
+                    sink_row = cutlass.select_(
+                        sink_valid, (row0 + Int64(sink_t_local)) * Int64(self.heads) + sink_head, Int64(0))
                     sink_vals[m] = Float32(sink_t[sink_row])
                 scale = softmax.finalize(sink_val=sink_vals)
             else:
