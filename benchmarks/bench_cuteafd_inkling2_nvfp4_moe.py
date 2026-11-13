@@ -65,13 +65,20 @@ def packed_weights(g, gen, dynamic: bool):
     return (w1, s1, w3, s3, w2, s2)
 
 
-def arm(g, weights, rows, capacity, samples, flush, gen):
-    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
-
-    program = compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False)
+def routing(g, rows, seed):
+    """One routing draw per row count, shared by both arms so they touch the same experts."""
+    gen = torch.Generator(device="cuda").manual_seed(seed * 7919 + rows)
     x = torch.randn(rows, g.hidden, device="cuda", generator=gen).bfloat16()
     ids = torch.rand(rows, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
     gammas = (torch.rand(rows, g.top_k, device="cuda", generator=gen) * 2).contiguous()
+    return x, ids, gammas
+
+
+def arm(g, weights, rows, capacity, samples, flush, inputs):
+    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
+
+    program = compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False)
+    x, ids, gammas = inputs
     out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
     scratch = torch.empty(fp8_moe_scratch_bytes(g, "stream", capacity, False), dtype=torch.uint8, device="cuda")
     us = time_us(lambda: program.launch(x, ids, gammas, *weights, out, scratch, scalars=(rows,)), samples, flush)
@@ -106,14 +113,26 @@ def main():
     print(f"inkling2_nvfp4 (dynamic amax) tp{args.tp} slice {g.slice}; control: "
           f"{'calibrated A4 stream' if control else 'none'}")
     print(f"{'rows':>6} {'dyn us':>10} {'/row':>8} {'W GB/s':>7} {'a4 us':>10} {'/row':>8} {'W GB/s':>7} {'ratio':>6}")
+    row_list = [int(r) for r in args.rows.split(",")]
+    inputs = {rows: routing(g, rows, 7) for rows in row_list}
+    # One arm resident at a time (two TP1 packed sets together exceed a 16g Spark container).
     weights = packed_weights(g, gen, dynamic=True)
-    control_weights = packed_weights(control, gen, dynamic=False) if control else None
-    for rows in (int(r) for r in args.rows.split(",")):
-        a = arm(g, weights, rows, args.capacity, args.samples, flush, gen)
+    first = [arm(g, weights, rows, args.capacity, args.samples, flush, inputs[rows]) for rows in row_list]
+    del weights
+    torch.cuda.empty_cache()
+    second = []
+    if control:
+        control_weights = packed_weights(control, gen, dynamic=False)
+        second = [arm(control, control_weights, rows, args.capacity, args.samples, flush, inputs[rows])
+                  for rows in row_list]
+        del control_weights
+        torch.cuda.empty_cache()
+    for idx, rows in enumerate(row_list):
+        a = first[idx]
         row = {"rows": rows, "dynamic": a}
         line = f"{rows:>6} {a['us']:>10.1f} {a['us_per_row']:>8.3f} {a['weight_gbps']:>7.0f}"
         if control:
-            b = arm(control, control_weights, rows, args.capacity, args.samples, flush, gen)
+            b = second[idx]
             row["a4_control"] = b
             row["ratio"] = a["us"] / b["us"]
             line += f" {b['us']:>10.1f} {b['us_per_row']:>8.3f} {b['weight_gbps']:>7.0f} {row['ratio']:>6.3f}"
