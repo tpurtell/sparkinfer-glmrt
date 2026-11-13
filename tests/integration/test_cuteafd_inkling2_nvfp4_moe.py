@@ -42,6 +42,15 @@ import torch
 
 from ..conftest import require_b12x
 
+try:  # DSL imports at module scope: the decorated bodies below are re-evaluated by source there.
+    import cutlass
+    import cutlass.cute as cute
+    import cuda.bindings.driver as cuda
+    from cutlass import Float32, Int32, Int64
+    from b12x._lib.activation import situ_vendor
+except ImportError:  # collection on a host without the DSL; the fixture skips the tests
+    cutlass = cute = cuda = None
+
 COS, ROW_COS = 0.9999, 0.999
 TIE_REL = 2 ** -16  # two F32 pairwise sums of 16 terms agree to this relative gap only at a genuine tie
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -191,6 +200,36 @@ def _dequant_expert(meta, expert, device="cuda") -> torch.Tensor:
 _SITU_PROGRAM: dict = {}
 
 
+if cute is not None:
+    class _Situ:
+        """Elementwise situ_vendor over BF16 gate/up rows with one F32 gamma per row -> BF16 act."""
+
+        def __init__(self, gate_cap: float, up_cap: float):
+            self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
+
+        def key(self):
+            return ("situ_vendor_rows", self.gate_cap, self.up_cap)
+
+        @cute.jit
+        def __call__(self, gate: cute.Pointer, up: cute.Pointer, gamma: cute.Pointer, act: cute.Pointer,
+                     rows: Int32, cols: Int32, stream: cuda.CUstream):
+            self.kernel(gate, up, gamma, act, cols).launch(grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
+
+        @cute.kernel
+        def kernel(self, gate: cute.Pointer, up: cute.Pointer, gamma: cute.Pointer, act: cute.Pointer, cols: Int32):
+            row = Int64(cute.arch.block_idx()[0])
+            g_t = cute.make_tensor(gate, cute.make_layout((Int64(1) << Int64(40),)))
+            u_t = cute.make_tensor(up, cute.make_layout((Int64(1) << Int64(40),)))
+            a_t = cute.make_tensor(act, cute.make_layout((Int64(1) << Int64(40),)))
+            gm = Float32(cute.make_tensor(gamma, cute.make_layout((Int64(1) << Int64(40),)))[row])
+            c = Int32(cute.arch.thread_idx()[0])
+            while c < cols:
+                at = row * Int64(cols) + Int64(c)
+                a_t[at] = cutlass.BFloat16(situ_vendor(Float32(g_t[at]), Float32(u_t[at]), gm,
+                                                       gate_cap=self.gate_cap, up_cap=self.up_cap))
+                c = c + Int32(256)
+
+
 def _situ_program(gate_cap: float, up_cap: float):
     """Elementwise ``situ_vendor`` over BF16 gate/up rows and an F32 gamma per row -> BF16 act.
     The oracle's SiTU step runs the format's own PTX (ex2/rcp/tanh .approx) rather than torch's
@@ -198,37 +237,9 @@ def _situ_program(gate_cap: float, up_cap: float):
     ops/activation.py:20-28, :48-58), so an exact-math oracle is not the format's rule."""
     key = (gate_cap, up_cap)
     if key not in _SITU_PROGRAM:
-        import cutlass
-        import cutlass.cute as cute
-        import cuda.bindings.driver as cuda
-        from cutlass import Float32, Int32, Int64
-        from b12x._lib.activation import situ_vendor
         from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
 
-        class Situ:
-            def key(self):
-                return ("situ_vendor_rows", gate_cap, up_cap)
-
-            @cute.jit
-            def __call__(self, gate: cute.Pointer, up: cute.Pointer, gamma: cute.Pointer, act: cute.Pointer,
-                         rows: Int32, cols: Int32, stream: cuda.CUstream):
-                self.kernel(gate, up, gamma, act, cols).launch(grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
-
-            @cute.kernel
-            def kernel(self, gate: cute.Pointer, up: cute.Pointer, gamma: cute.Pointer, act: cute.Pointer, cols: Int32):
-                row = Int64(cute.arch.block_idx()[0])
-                g_t = cute.make_tensor(gate, cute.make_layout((Int64(1) << Int64(40),)))
-                u_t = cute.make_tensor(up, cute.make_layout((Int64(1) << Int64(40),)))
-                a_t = cute.make_tensor(act, cute.make_layout((Int64(1) << Int64(40),)))
-                gm = Float32(cute.make_tensor(gamma, cute.make_layout((Int64(1) << Int64(40),)))[row])
-                c = Int32(cute.arch.thread_idx()[0])
-                while c < cols:
-                    at = row * Int64(cols) + Int64(c)
-                    a_t[at] = cutlass.BFloat16(situ_vendor(Float32(g_t[at]), Float32(u_t[at]), gm,
-                                                           gate_cap=gate_cap, up_cap=up_cap))
-                    c = c + Int32(256)
-
-        _SITU_PROGRAM[key] = compile_program(Situ(), name="situ_vendor_rows", operands=(
+        _SITU_PROGRAM[key] = compile_program(_Situ(gate_cap, up_cap), name="situ_vendor_rows", operands=(
             Operand("gate", torch.bfloat16, "[rows,cols]", align=2), Operand("up", torch.bfloat16, "[rows,cols]", align=2),
             Operand("gamma", torch.float32, "[rows]", align=4), Operand("act", torch.bfloat16, "[rows,cols]", "out", align=2)),
             scalars=(Scalar("rows"), Scalar("cols")), key=("situ_vendor_rows", gate_cap, up_cap))
