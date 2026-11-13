@@ -191,9 +191,21 @@ def test_half_head_index_producer_preserves_query_bits_and_replicated_key_cache(
         ks = torch.full((capacity,), -7., device="cuda")
         cache = torch.full((capacity // 64, 8448), 173, dtype=torch.uint8, device="cuda")
         scratch = torch.empty(program.scratch_bytes(capacity)["scratch"] // 2, dtype=torch.bfloat16, device="cuda")
-        program.launch(iq[:, first:first + heads].contiguous(), ik, qn, kn, positions, slots,
-                       cs, query, qs, key, ks, cache, scratch, scalars=(rows,))
+        operands = (iq[:, first:first + heads].contiguous(), ik, qn, kn, positions, slots, cs)
+        frozen = [tensor.clone() for tensor in operands]
+        program.launch(*operands, query, qs, key, ks, cache, scratch, scalars=(rows,))
         torch.cuda.synchronize()
+        for actual, expected in zip(operands, frozen):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        touched = torch.zeros(capacity, dtype=torch.bool, device="cuda")
+        touched[slots[slots >= 0]] = True
+        cache_keys = cache[:, :8192].reshape(-1, 128)
+        cache_scales = cache[:, 8192:].contiguous().view(torch.float32).flatten()
+        assert (cache_keys[~touched] == 173).all()
+        assert (cache_scales.view(torch.uint8).reshape(capacity, 4)[~touched] == 173).all()
+        live = slots >= 0
+        assert torch.equal(cache_keys[slots[live]], key[:rows][live].view(torch.uint8))
+        assert torch.equal(cache_scales[slots[live]], ks[:rows][live])
         for output in (query, qs, key, ks):
             assert (output[rows:].float() == -7).all(), "inactive producer rows were overwritten"
             assert torch.isfinite(output[:rows].float()).all()
