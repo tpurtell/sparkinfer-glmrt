@@ -1881,7 +1881,8 @@ class NativeTrellisLinear:
             _fence_mbar_init()
         cute.arch.sync_threads()
         n_tiles = Int32(self.n // _PREFILL_BN)
-        total_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * n_tiles
+        m_tiles = (rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)
+        total_tiles = m_tiles * n_tiles
         x_ptr = inputs[rotation_id]
         payload_ptr = payload.iterator.toint()
         scales_ptr = scales.iterator.toint()
@@ -1890,15 +1891,19 @@ class NativeTrellisLinear:
             p_tid = tid - Int32(_PREFILL_CONSUMER_THREADS)
             stage_cnt = Int32(0)
             while task < total_tiles:
-                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = task % n_tiles
+                # Weight-band-major order: every CTA streams one 64-column weight
+                # band across all row tiles before moving on, so a band (64*k
+                # bytes) is fetched once and reused for the other row tiles from
+                # L2 instead of being re-read once per row tile.
+                m0 = (task % m_tiles) * Int32(_PREFILL_BM)
+                nb64 = task // m_tiles
                 stage_cnt = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, stage_cnt)
                 task += step
         else:
             stage_cnt = Int32(0)
             while task < total_tiles:
-                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = task % n_tiles
+                m0 = (task % m_tiles) * Int32(_PREFILL_BM)
+                nb64 = task // m_tiles
                 stage_cnt = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, stage_cnt)
                 task += step
 
