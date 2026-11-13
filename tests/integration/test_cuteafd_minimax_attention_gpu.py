@@ -163,8 +163,16 @@ def test_half_head_attention_is_byte_exact_whole_head_slice(mode, rows):
         operands = (query[:, first * 16:(first + heads) * 16].contiguous(),
                     key[:, :, first:first + heads].contiguous().view(torch.uint8),
                     value[:, :, first:first + heads].contiguous().view(torch.uint8),
-                    kd[:, first:first + heads].contiguous(), vd[:, first:first + heads].contiguous(),
+                    kd[:, first:first + heads].clone(memory_format=torch.contiguous_format),
+                    vd[:, first:first + heads].clone(memory_format=torch.contiguous_format),
                     table, lengths_gpu, offsets, selected[first:first + heads].contiguous())
+        if rows == 1 and first == 2:
+            # contiguous() can retain this offset-eight single-row view.
+            unaligned = kd[:, first:first + heads].contiguous()
+            assert unaligned.data_ptr() % 16 == 8
+            rejected = (*operands[:3], unaligned, *operands[4:])
+            with pytest.raises(ValueError, match=r"k_descale is not 16-byte aligned"):
+                program.launch(*rejected, output, lse, scratch, scalars=(rows, batch, stride, pool))
         frozen = [tensor.clone() for tensor in operands]
         program.launch(*operands, output, lse, scratch, scalars=(rows, batch, stride, pool))
         torch.cuda.synchronize()

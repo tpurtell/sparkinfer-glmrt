@@ -111,7 +111,8 @@ def test_half_head_scores_and_selections_are_byte_exact_whole_head_slices(mode, 
         blocks, offsets, nbytes = _layout(capacity, pages, mode, heads)
         output = torch.full((heads, capacity, 16), -7, dtype=torch.int32, device="cuda")
         scratch = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
-        q, qs = query[:, first:first + heads].contiguous(), scales[:, first:first + heads].contiguous()
+        q = query[:, first:first + heads].contiguous()
+        qs = scales[:, first:first + heads].clone(memory_format=torch.contiguous_format)
         operands = ((q, qs, cache, table, lengths) if mode == "decode" else
                     (q, qs, key, key_scales, starts, ends))
         frozen = [tensor.clone() for tensor in operands]
