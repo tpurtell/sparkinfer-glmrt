@@ -544,13 +544,14 @@ def test_msa_q2k_indices_decode_cuda_matches_reference() -> None:
     not torch.cuda.is_available(),
     reason="CUDA required for MSA contiguous scorer coverage",
 )
-@pytest.mark.parametrize("rows", [4, 257])
-def test_msa_contiguous_block_scores_cuda_matches_reference(rows: int) -> None:
+@pytest.mark.parametrize("rows", [4, 31, 33, 257])
+@pytest.mark.parametrize("heads", [1, 2, 3, 4, 8])
+def test_msa_contiguous_block_scores_cuda_matches_reference(rows: int, heads: int) -> None:
     clear_indexer_caches()
     device = torch.device("cuda")
     q_fp8, q_scale, kv_fp8, metadata = _make_msa_contiguous_case(
         rows=rows,
-        heads=4,
+        heads=heads,
         k_rows=384,
         device=device,
         seed=92_401 + rows,
@@ -571,18 +572,39 @@ def test_msa_contiguous_block_scores_cuda_matches_reference(rows: int) -> None:
     )
 
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
-    assert actual.shape[0] == 4
+    assert actual.shape[0] == heads
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for MSA heads slicing")
+@pytest.mark.parametrize("rows", [33, 257])
+def test_msa_contiguous_two_head_slices_match_four_heads_exactly(rows: int) -> None:
+    clear_indexer_caches()
+    q_fp8, q_scale, kv_fp8, metadata = _make_msa_contiguous_case(
+        rows=rows, heads=4, k_rows=384, device=torch.device("cuda"), seed=92_503 + rows,
+    )
+    full = msa_contiguous_block_scores(
+        q_fp8=q_fp8, q_scale=q_scale, kv_fp8=kv_fp8, metadata=metadata,
+    )
+    for first in [0, 2]:
+        sliced = msa_contiguous_block_scores(
+            q_fp8=q_fp8[:, first:first + 2].contiguous(),
+            q_scale=q_scale[:, first:first + 2].contiguous(),
+            kv_fp8=kv_fp8, metadata=metadata,
+        )
+        torch.testing.assert_close(sliced, full[first:first + 2], atol=0, rtol=0)
+        finite = sliced.isfinite()
+        assert finite.any() and torch.any(sliced[finite] != 0)
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA required for MSA contiguous graph coverage",
 )
-def test_msa_contiguous_block_scores_graph_replay_tracks_live_weights() -> None:
+@pytest.mark.parametrize("heads", [2, 4])
+def test_msa_contiguous_block_scores_graph_replay_tracks_live_weights(heads: int) -> None:
     clear_indexer_caches()
     device = torch.device("cuda")
     rows = 257
-    heads = 4
     k_rows = 384
     q_fp8, q_scale, kv_fp8, metadata = _make_msa_contiguous_case(
         rows=rows,
