@@ -441,7 +441,7 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
             padded * 4,                                # input row amax
             pairs * 4,                                 # grouped route weights (gamma)
             padded * g.slice * 2,                      # BF16 act rows (SiTU x gamma)
-            padded * parts * 4,                        # act amax partials per 64-column CTA
+            padded * (g.slice // 16) * 4,              # act amax partials per 16-column group
             padded * g.slice // 2,                     # packed act rows
             padded * g.slice // 16,                    # their scales
             padded * 4,                                # act row amax
@@ -877,7 +877,7 @@ class _StreamNvfp4DynRoute:
             groups = Int32(g.experts)
         max_tiles = (pairs + Int32(STREAM_TILE_M - 1)) // Int32(STREAM_TILE_M) + groups
         padded = Int64(max_tiles) * Int64(STREAM_TILE_M)
-        parts = Int64(g.slice // 64)
+        groups16 = Int64(g.slice // 16)
         base = Int64(scratch.toint())
         pair_row_at = base + _al(Int64(4 * meta_words(g.experts, self.max_tiles)))
         pair_pos_at = pair_row_at + _al(Int64(pairs) * Int64(4))
@@ -887,7 +887,7 @@ class _StreamNvfp4DynRoute:
         gamma_at = xamax_at + _al(padded * Int64(4))
         act16_at = gamma_at + _al(Int64(pairs) * Int64(4))
         part_at = act16_at + _al(padded * Int64(g.slice * 2))
-        aq_at = part_at + _al(padded * parts * Int64(4))
+        aq_at = part_at + _al(padded * groups16 * Int64(4))
         as_at = aq_at + _al(padded * Int64(g.slice // 2))
         aamax_at = as_at + _al(padded * Int64(g.slice // 16))
         y_at = aamax_at + _al(padded * Int64(4))

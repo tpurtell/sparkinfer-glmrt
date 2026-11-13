@@ -343,10 +343,10 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
     ``amax_row * w_amax_e / (1536 * denominator)`` (gate rows with ``s1``'s amax, up rows
     with ``s3``'s), rounds to BF16 into the exchange, computes
     ``bf16(situ(g, u) * gamma_row)`` per 16 columns, then — needing the whole act row's
-    amax before any block can be quantized — reduces the row amax of the CTA's
-    ``half_n`` columns into ``act_amax_part [rows, I / half_n]`` and leaves the
-    quantization to :class:`ChunkActDyn`, which runs once per row after every column
-    CTA has written its BF16 act slice to ``act_bf16 [max_tiles * 128, I]``."""
+    amax before any block can be quantized — writes each 16-column group's amax to
+    ``act_amax_part [rows, I / 16]`` and leaves the quantization to :class:`ChunkActDyn`,
+    which runs once per row after every column CTA has written its BF16 act slice to
+    ``act_bf16 [max_tiles * 128, I]``."""
 
     def __init__(self, *, inter: int, hidden: int, experts: int, gate_cap: float = 4.0, up_cap: float = 25.0,
                  k_block: int | None = None, stages: int = 2, tile_m: int = 128, tile_n: int = 128,
@@ -359,7 +359,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
         self.parts = self.inter // self.half_n
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_dyn", 1, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_dyn", 2, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.gate_cap, self.up_cap, self.tile_m, self.tile_n, self.live_min, self.live_max)
 
     @cute.jit
@@ -386,9 +386,6 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
         tile = Int32(cute.arch.block_idx()[1])
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
-        partial = smem.allocate_tensor(element_type=Float32,
-                                       layout=cute.make_layout((self.tile_m * (self.half_n // 16),)),
-                                       byte_alignment=16)
         if tile < _i32_at(Int64(meta.toint()), 1):
             e, first, live = _chunk(meta, self.experts, tile)
             if (live >= Int32(self.live_min)) & (live <= Int32(self.live_max)):
@@ -476,15 +473,11 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                             st_global_u32(out_at + Int64(16 * half + 4), packed[1])
                             st_global_u32(out_at + Int64(16 * half + 8), packed[2])
                             st_global_u32(out_at + Int64(16 * half + 12), packed[3])
-                        # Per-(row, group) amax, reduced per row below.
-                        partial[row * Int32(groups) + grp] = local
-                cute.arch.sync_threads()
-                if tidx < live:
-                    part = Float32(0.0)
-                    for grp in cutlass.range_constexpr(groups):
-                        part = fmax_f32(part, Float32(partial[tidx * Int32(groups) + Int32(grp)]))
-                    i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(tidx)
-                    st_global_f32(Int64(act_amax_part.toint()) + (i * Int64(self.parts) + Int64(n_blk)) * Int64(4), part)
+                        # Per-(row, 16-column group) amax straight to global: act_amax_part is
+                        # [padded rows, parts * groups]; ChunkActDyn takes the row max.
+                        st_global_f32(Int64(act_amax_part.toint())
+                                      + ((i * Int64(self.parts) + Int64(n_blk)) * Int64(groups) + Int64(grp)) * Int64(4),
+                                      local)
 
 
 class ChunkActDyn:
@@ -496,11 +489,13 @@ class ChunkActDyn:
 
     def __init__(self, *, inter: int, experts: int, parts: int):
         self.inter, self.experts, self.parts = int(inter), int(experts), int(parts)
-        if self.inter % 16:
-            raise ValueError("I must be a multiple of 16")
+        if self.inter % 16 or self.inter % self.parts or (self.inter // self.parts) % 16:
+            raise ValueError("I must be a multiple of 16 and of 16 * parts")
+        # One partial per 16-column group of the row (the gate/up CTAs write parts * (half_n/16) of them).
+        self.partials = self.inter // 16
 
     def key(self) -> tuple:
-        return ("chunk_act_dyn", 1, self.inter, self.experts, self.parts)
+        return ("chunk_act_dyn", 2, self.inter, self.experts, self.parts)
 
     @cute.jit
     def __call__(self, act_bf16: cute.Pointer, act_amax_part: cute.Pointer, meta: cute.Pointer, aq: cute.Pointer,
@@ -520,9 +515,9 @@ class ChunkActDyn:
             if r < live:
                 i = Int64(i32)
                 row_amax = Float32(0.0)
-                for part in cutlass.range_constexpr(self.parts):
+                for part in cutlass.range_constexpr(self.partials):
                     row_amax = fmax_f32(row_amax, _ld_f32(Int64(act_amax_part.toint())
-                                                          + (i * Int64(self.parts) + Int64(part)) * Int64(4)))
+                                                          + (i * Int64(self.partials) + Int64(part)) * Int64(4)))
                 if tidx == Int32(0):
                     st_global_f32(Int64(amax.toint()) + i * Int64(4), row_amax)
                 encoder, decoder, outer = _row_factors(row_amax)
