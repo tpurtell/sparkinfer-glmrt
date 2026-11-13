@@ -21,6 +21,16 @@ quantized as one row with encoder ``denominator / amax`` (2688 here, as the rele
 ``(x_amax * w_amax) / (1536 * denominator)`` splits into the activation outer ``x_amax / 1536``
 and the weight outer ``w_amax / denominator``. Dequantization is exact in F64.
 
+The 6-vs-4 candidate choice is the format's rule as both pinned vendor kernels fix it:
+reconstruction errors in F32 (vLLM ``d664cd1e`` ``ops/nvfp4.py:190`` loads x ``.to(tl.float32)``;
+SGLang ``ec5e7ff5`` ``nvfp4.py:93``), summed pairwise over 8, 4, 2, 1 (``_block_error``, vLLM
+``:39-45`` / SGLang ``:31-38``), strict ``error4 < error6`` (vLLM ``:77``). The checkpoint names
+only the rule (``scale_selection_rule: fouroversix_mae``); the vendor kernels define its precision,
+and the oracle mirrors them, not the kernel. A block whose two candidate errors agree within
+``TIE_REL`` of their magnitude is a tie: either choice is the rule's answer up to the summation's
+last ulp, so such blocks are counted, not judged. Every non-tie block must match the kernel's
+scale byte exactly (``test_inkling2_nvfp4_quantizer_exact``).
+
 Bound: cosine >= 0.9999 overall and >= 0.999 per row (the fork's NVFP4 bar), plus a
 tanh-saturation case, a gamma-spread case (route weight placement) and a bimodal-row
 case (rows with one large block, where the 4.0 candidate wins for the small blocks).
@@ -33,6 +43,7 @@ import torch
 from ..conftest import require_b12x
 
 COS, ROW_COS = 0.9999, 0.999
+TIE_REL = 2 ** -16  # two F32 pairwise sums of 16 terms agree to this relative gap only at a genuine tie
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 _PROGRAMS: dict = {}
 _WEIGHTS: dict = {}
@@ -90,12 +101,19 @@ def quantize_rows(x: torch.Tensor, encoder: float = 1536.0):
         scaled32 = blocks.float() * inv32                      # the F32 value cvt.rn sees
         q = _e2m1_rn(scaled32).double()
         s = s32.double()
-        err = (q * s * outer[:, None, None] - blocks).abs().sum(-1, keepdim=True)
-        return q, err, s
+        # The 6-vs-4 choice compares F32 reconstruction errors summed pairwise (vendor _block_error,
+        # the kernel's order): |q*s*outer - x| in F32, then 8 pairs, 4, 2, 1. Near-ties flip with
+        # any other precision or order, so the oracle mirrors it exactly.
+        recon32 = (q.float() * s32) * outer.float()[:, None, None]
+        err32 = (recon32 - blocks.float()).abs()
+        for width in (8, 4, 2, 1):
+            err32 = err32[..., :width] + err32[..., width:2 * width]
+        return q, err32.double(), s
 
     q6, e6, s6d = candidate(s6)
     q4, e4, s4d = candidate(s4)
     choose4 = e4 < e6
+    tie = (e4 - e6).abs() <= TIE_REL * torch.maximum(e4, e6).clamp_min(1e-30)
     q = torch.where(choose4, q4, q6)
     s = torch.where(choose4, s4d, s6d)
     zero = bmax == 0
@@ -109,6 +127,7 @@ def quantize_rows(x: torch.Tensor, encoder: float = 1536.0):
     codes = codes.clamp(max=7) | torch.where(negative, 8, 0)
     packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8).reshape(rows, k // 2)
     exact = (q * s).reshape(rows, k)
+    quantize_rows.last_tie = tie.squeeze(-1)  # [rows, K/16] bool: blocks at a candidate tie
     return packed, s.squeeze(-1).to(torch.float8_e4m3fn).view(torch.uint8), amax.float(), exact
 
 
@@ -222,11 +241,17 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     program.launch(x, ids, gammas, *w, out, scratch, scalars=(rows,))
     torch.cuda.synchronize()
     expected = reference(g, x, ids, gammas, dequant)
+    # Tie blocks in the input rows' quantization: candidate errors within TIE_REL; either scale is
+    # the rule's answer there, so they are reported, not judged (see test_inkling2_nvfp4_quantizer_exact).
+    quantize_rows(x.double())
+    ties = int(quantize_rows.last_tie.sum())
+    blocks = int(quantize_rows.last_tie.numel())
     a, b = out.float(), expected.float()
     assert torch.isfinite(a).all()
     c = float((a * b).sum() / (a.norm() * b.norm()))
     worst = float(torch.nn.functional.cosine_similarity(a, b, dim=1).min())
     delta = float((a - b).abs().max())
+    _run.last_ties = (ties, blocks)
     return c, worst, delta, float(b.abs().max())
 
 
@@ -249,22 +274,26 @@ CASES = [
 def test_inkling2_nvfp4_moe(tp, real, capacity, rows, hot):
     g = _geometry(tp)
     c, worst, delta, scale = _run(g, real, capacity, rows, hot=hot)
+    ties, blocks = _run.last_ties
     print(f"inkling2_nvfp4 tp{tp} real {real} capacity {capacity} rows {rows} hot {hot}: "
-          f"cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e} (max|ref| {scale:.3e})")
+          f"cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e} (max|ref| {scale:.3e}); "
+          f"input tie blocks {ties}/{blocks}")
     assert c >= COS and worst >= ROW_COS
 
 
 def test_inkling2_nvfp4_route_weight_before_fc2():
     g = _geometry(1)
     c, worst, delta, _ = _run(g, 2304, 256, 256, seed=3, gamma_spread=8.0)
-    print(f"inkling2_nvfp4 gamma spread: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}")
+    print(f"inkling2_nvfp4 gamma spread: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}; "
+          f"input tie blocks {_run.last_ties[0]}/{_run.last_ties[1]}")
     assert c >= COS and worst >= ROW_COS
 
 
 def test_inkling2_nvfp4_situ_saturation():
     g = _geometry(1)
     c, worst, delta, _ = _run(g, 2304, 256, 256, seed=5, scale=40.0)
-    print(f"inkling2_nvfp4 saturation: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}")
+    print(f"inkling2_nvfp4 saturation: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}; "
+          f"input tie blocks {_run.last_ties[0]}/{_run.last_ties[1]}")
     assert c >= COS and worst >= ROW_COS
 
 
@@ -273,7 +302,8 @@ def test_inkling2_nvfp4_fouroversix_selection():
     would lose ~0.3 bits there and miss the per-row bound."""
     g = _geometry(1)
     c, worst, delta, _ = _run(g, 2304, 256, 256, seed=7, bimodal=True)
-    print(f"inkling2_nvfp4 fouroversix: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}")
+    print(f"inkling2_nvfp4 fouroversix: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}; "
+          f"input tie blocks {_run.last_ties[0]}/{_run.last_ties[1]}")
     assert c >= COS and worst >= ROW_COS
 
 
@@ -286,3 +316,72 @@ def test_inkling2_nvfp4_geometry():
     assert _resolve("auto", 1, False, "nvfp4dyn", "auto") == "stream"
     with pytest.raises(ValueError):
         _resolve("auto", 1, True, "nvfp4dyn", "auto")
+
+
+def _scratch_regions(g, rows, capacity):
+    """Byte offsets of the stream route's scratch regions (mirrors _StreamNvfp4DynRoute.__call__)."""
+    from b12x.integration.cuteafd.fp8_moe import meta_words, stream_max_tiles
+    from b12x.integration.cuteafd._fp8_moe_stream import STREAM_TILE_M
+
+    def al(v):
+        return (v + 1023) // 1024 * 1024
+
+    e, k, h, i = g.experts, g.top_k, g.hidden, g.slice
+    pairs = rows * k
+    max_tiles = min(pairs, e) + -(-pairs // STREAM_TILE_M)
+    padded = max_tiles * STREAM_TILE_M
+    meta = 4 * meta_words(e, stream_max_tiles(e, capacity * k))
+    pair_row = al(meta)
+    pair_pos = pair_row + al(pairs * 4)
+    xq = pair_pos + al(pairs * 4)
+    xs = xq + al(padded * h // 2)
+    xamax = xs + al(padded * h // 16)
+    return dict(meta=meta, pair_pos=pair_pos, xq=xq, xs=xs, xamax=xamax, padded=padded, pairs=pairs)
+
+
+def test_inkling2_nvfp4_quantizer_exact():
+    """The input quantizer's scale bytes and amax match the oracle on every non-tie block; tie
+    blocks (two F32 candidate errors within TIE_REL) are counted and reported, not judged."""
+    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
+
+    g, rows, capacity = _geometry(1), 128, 128
+    (w, _) = _weights(g, 2304)
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    x = torch.randn(rows, g.hidden, device="cuda", generator=gen).bfloat16()
+    ids = torch.rand(rows, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
+    gammas = torch.rand(rows, g.top_k, device="cuda", generator=gen).float().contiguous()
+    program = _PROGRAMS.setdefault((g, capacity), compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False))
+    out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
+    scratch = torch.zeros(fp8_moe_scratch_bytes(g, "stream", capacity, False), dtype=torch.uint8, device="cuda")
+    program.launch(x, ids, gammas, *w, out, scratch, scalars=(rows,))
+    torch.cuda.synchronize()
+    R = _scratch_regions(g, rows, capacity)
+    e, k, h = g.experts, g.top_k, g.hidden
+    meta = scratch[:R["meta"]].view(torch.int32).cpu().tolist()
+    pair_pos = scratch[R["pair_pos"]:R["pair_pos"] + R["pairs"] * 4].view(torch.int32).long()
+    xs = scratch[R["xs"]:R["xs"] + R["padded"] * h // 16].view(R["padded"], h // 16)
+    xamax = scratch[R["xamax"]:R["xamax"] + R["padded"] * 4].view(torch.float32)
+    offsets = meta[4 + e:4 + 2 * e]
+    tiles = meta[4 + 3 * e:4 + 3 * e + meta[1]]
+    tile_of = {((c & 0xFFFF), c >> 16): t for t, c in enumerate(tiles)}
+    _, sc_o, am_o, _ = quantize_rows(x.double())
+    ties = quantize_rows.last_tie
+    checked = tie_blocks = flips_at_ties = non_tie_mismatch = amax_mismatch = 0
+    ids_c = ids.cpu()
+    for p in range(R["pairs"]):
+        r, slot = divmod(p, k)
+        ex = int(ids_c[r, slot])
+        local = int(pair_pos[p]) - offsets[ex]
+        i = tile_of[(ex, local // 128)] * 128 + local % 128
+        mism = xs[i] != sc_o[r]
+        tie = ties[r]
+        checked += int(mism.numel())
+        tie_blocks += int(tie.sum())
+        flips_at_ties += int((mism & tie).sum())
+        non_tie_mismatch += int((mism & ~tie).sum())
+        amax_mismatch += int(float(xamax[i]) != float(am_o[r]))
+    print(f"inkling2_nvfp4 quantizer: {checked} blocks over {R['pairs']} pairs; tie blocks {tie_blocks} "
+          f"(kernel chose the other candidate on {flips_at_ties}); non-tie scale mismatches {non_tie_mismatch}; "
+          f"amax mismatches {amax_mismatch}")
+    assert non_tie_mismatch == 0 and amax_mismatch == 0
+
