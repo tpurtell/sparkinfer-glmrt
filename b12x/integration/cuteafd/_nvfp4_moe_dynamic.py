@@ -145,12 +145,13 @@ def _quantize_row16_dyn(values: cute.Tensor, encoder: Float32, decoder: Float32,
     packed6, err6 = _candidate(values, s6, decoder, outer)
     packed4, err4 = _candidate(values, s4, decoder, outer)
     choose4 = err4 < err6
-    packed = cutlass.select_(choose4, packed4, packed6)
-    scale = cutlass.select_(choose4, s4_u32, s6_u32)
-    # A zero block: scale 0 and payload 0 (every candidate reconstructs to zero).
-    if bmax == Float32(0.0):
-        packed = Uint64(0)
-        scale = Uint32(0)
+    # A zero block: scale 0 and payload 0 (every candidate reconstructs to zero). Selects
+    # only: the DSL requires one type per value across branches.
+    zero = bmax == Float32(0.0)
+    packed = Uint64(cutlass.select_(choose4, packed4, packed6))
+    packed = Uint64(cutlass.select_(zero, Uint64(0), packed))
+    scale = Uint32(cutlass.select_(choose4, s4_u32, s6_u32))
+    scale = Uint32(cutlass.select_(zero, Uint32(0), scale))
     st_global_u64(packed_at, packed)
     st_global_u8(scale_at, cutlass.Uint8(scale & Uint32(0xFF)))
 

@@ -99,38 +99,51 @@ def quantize_rows(x: torch.Tensor):
 
 
 def _weights(g, real: int):
+    """Packed NVFP4 weights synthesized one expert at a time (the full F64 tensor never exists:
+    peak = the quantized tensors + one expert slab) from a seeded CPU generator; one amax per
+    expert (the checkpoint's amax/denominator rule applied to the whole expert matrix as one
+    "row"), denominator 1. Returns the device operands and a per-expert dequantizer."""
     key = (g, real)
     if key not in _WEIGHTS:
         _WEIGHTS.clear()
-        gen = torch.Generator(device="cpu").manual_seed(0)
         h, i, e = g.hidden, g.slice, g.experts
         denominator = torch.tensor([1.0], dtype=torch.float32)
 
-        def operand(rows, k, real_rows=None, real_k=None):
-            w = torch.randn((e, rows, k), generator=gen, dtype=torch.float64) * 0.02
-            if real_rows is not None:
-                w[:, real_rows:] = 0
-            if real_k is not None:
-                w[:, :, real_k:] = 0
-            # Weight rows share one amax per expert (the checkpoint's amax/denominator): the
-            # rule applied to the whole expert matrix as one "row".
-            packed, scales, amax, exact = [], [], [], []
+        def operand(seed, rows, k, real_rows=None, real_k=None):
+            packed = torch.empty((e, rows, k // 2), dtype=torch.uint8)
+            scales = torch.empty((e, rows, k // 16), dtype=torch.uint8)
+            amax = torch.empty(e, dtype=torch.float32)
             for expert in range(e):
-                flat = w[expert].reshape(1, -1)
-                p, s, a, x = quantize_rows(flat)
-                packed.append(p.reshape(rows, k // 2)); scales.append(s.reshape(rows, k // 16))
-                amax.append(a); exact.append(x.reshape(rows, k) * (a.double() / 1536.0))
-            packed, scales = torch.stack(packed).contiguous(), torch.stack(scales).contiguous()
-            amax = torch.cat(amax).float()
+                gen = torch.Generator(device="cpu").manual_seed(seed * 100003 + expert)
+                w = torch.randn((rows, k), generator=gen, dtype=torch.float64) * 0.02
+                if real_rows is not None:
+                    w[real_rows:] = 0
+                if real_k is not None:
+                    w[:, real_k:] = 0
+                p_, s_, a_, _ = quantize_rows(w.reshape(1, -1))
+                packed[expert] = p_.reshape(rows, k // 2)
+                scales[expert] = s_.reshape(rows, k // 16)
+                amax[expert] = a_[0]
             tail = torch.cat([amax.view(torch.uint8), denominator.view(torch.uint8)])
-            return (packed.cuda(), torch.cat([scales.flatten(), tail]).contiguous().cuda(),
-                    torch.stack(exact))  # exact F64 dequantized weights [E, rows, k]
+            return (packed.contiguous().cuda(), torch.cat([scales.flatten(), tail]).contiguous().cuda(),
+                    (packed, scales, amax))
 
-        w1, s1, d1 = operand(i, h, real_rows=real)
-        w3, s3, d3 = operand(i, h, real_rows=real)
-        w2, s2, d2 = operand(h, i, real_k=real)
-        _WEIGHTS[key] = ((w1, s1, w3, s3, w2, s2), (d1, d3, d2))
+        w1, s1, m1 = operand(1, i, h, real_rows=real)
+        w3, s3, m3 = operand(3, i, h, real_rows=real)
+        w2, s2, m2 = operand(2, h, i, real_k=real)
+        _WEIGHTS[key] = ((w1, s1, w3, s3, w2, s2), (m1, m3, m2))
     return _WEIGHTS[key]
+
+
+def _dequant_expert(meta, expert) -> torch.Tensor:
+    """F64 ``[rows, k]`` of one expert from its packed codes, E4M3 block scales and amax: q * s * amax / 1536."""
+    packed, scales, amax = meta
+    p = packed[expert].long()
+    codes = torch.stack([p & 0xF, p >> 4], -1).flatten(-2)
+    table = torch.cat([E2M1, -E2M1]).double()
+    q = table[codes]
+    s = scales[expert].view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)
+    return q * s * (amax[expert].double() / 1536.0)
 
 
 def _situ(gate, up, gate_cap, up_cap):
@@ -139,7 +152,7 @@ def _situ(gate, up, gate_cap, up_cap):
 
 def reference(g, x, ids, gammas, dequant):
     """F64 CPU: the contract above with the kernel's BF16 rounding points."""
-    d1, d3, d2 = dequant
+    m1, m3, m2 = dequant
     x, ids, gammas = x.cpu().double(), ids.cpu(), gammas.cpu().double()
     out = torch.zeros((x.shape[0], g.hidden), dtype=torch.float64)
     for expert in ids.unique().tolist():
@@ -147,12 +160,13 @@ def reference(g, x, ids, gammas, dequant):
         xr = x[rows]
         _, _, amax, xq = quantize_rows(xr)
         xq = xq * (amax.double() / 1536.0)[:, None]  # q*s*outer: the dequantized activation
-        gate = (xq @ d1[expert].T).float().bfloat16().double()
-        up = (xq @ d3[expert].T).float().bfloat16().double()
+        # Dequantize this expert only (one [rows, k] F64 slab at a time).
+        gate = (xq @ _dequant_expert(m1, expert).T).float().bfloat16().double()
+        up = (xq @ _dequant_expert(m3, expert).T).float().bfloat16().double()
         act = (_situ(gate, up, g.situ_gate_cap, g.situ_up_cap) * gammas[rows, slots][:, None]).float().bfloat16().double()
         _, _, a_amax, aq = quantize_rows(act)
         aq = aq * (a_amax.double() / 1536.0)[:, None]
-        y = (aq @ d2[expert].T).float().bfloat16().double()
+        y = (aq @ _dequant_expert(m2, expert).T).float().bfloat16().double()
         out.index_add_(0, rows, y)
     return out.float().bfloat16()
 
