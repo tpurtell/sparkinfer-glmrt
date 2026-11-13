@@ -1119,11 +1119,11 @@ class NativeTrellisLinear:
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         tiles = Int32(self.n // 128 * self.splits)
         if cutlass.const_expr(self.bits < 5):
-            self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id, False).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
         elif rows <= Int32(self.decode_rows):
-            self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id, False).launch(
                 grid=(min(tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
         elif rows <= Int32(32):
@@ -1572,7 +1572,7 @@ class NativeTrellisLinear:
     @cute.kernel
     def multiply(self, inputs: cute.Tensor, payload: cute.Tensor,
                  scales: cute.Tensor, partial: cute.Tensor,
-                 rows: Int32, rotation_id: Int32):
+                 rows: Int32, rotation_id: Int32, use_k8_shfl: cutlass.Constexpr):
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
@@ -1606,7 +1606,7 @@ class NativeTrellisLinear:
                             tile = nb * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + warp * Int32(2) + Int32(n16)
                             if cutlass.const_expr(self.input_units):
                                 tile = kb * Int32(self.n // 16 * 8) + nb * Int32(64) + Int32(k16 * 8) + warp * Int32(2) + Int32(n16)
-                            if cutlass.const_expr(self.bits == 8):
+                            if cutlass.const_expr(self.bits == 8 and use_k8_shfl):
                                 b0, b1, b2, b3 = decode_tile_k8(payload.iterator.toint(), tile, lane, self.e4m3, self.mul1, policy)
                             else:
                                 b0, b1, b2, b3 = decode_tile(payload.iterator.toint(), tile, lane, self.bits, self.e4m3, self.mul1, policy)
@@ -4428,9 +4428,23 @@ class NativeTrellisLinear:
                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                         rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         tiles = Int32(self.n // 128 * self.splits)
-        self.multiply(inputs, payload, scales, partial, rows, rotation_id).launch(
-            grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
-            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        if cutlass.const_expr(self.n > 65536):
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id, False).launch(
+                grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        elif cutlass.const_expr(self.splits >= 16):
+            if rows <= Int32(2):
+                self.multiply(inputs, payload, scales, partial, rows, rotation_id, False).launch(
+                    grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+            else:
+                self.multiply(inputs, payload, scales, partial, rows, rotation_id, True).launch(
+                    grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                    block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        else:
+            self.multiply(inputs, payload, scales, partial, rows, rotation_id, True).launch(
+                grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
+                block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
         r_blocks = Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else Int32(self.n // 128)
         self.reduce_gemini(partial, output, rows).launch(
             grid=(min(rows * r_blocks, cta_limit), 1, 1),
