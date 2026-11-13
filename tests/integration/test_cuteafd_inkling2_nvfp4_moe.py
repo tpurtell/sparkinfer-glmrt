@@ -15,8 +15,11 @@ nvfp4.py`` — reproduced in F64 on the CPU with the kernel's documented roundin
     act     = bf16(situ(gate, up) * gamma);  quantize act by the same rule (its own amax)
     FC2 out = bf16(... * (amax_act * w2_amax) / (1536 * denominator));  out = sum over slots
 
-Weights are synthesized by the same rule from BF16-scale randoms (block scales E4M3,
-one amax per expert, one denominator), so dequantization is exact in F64.
+Weights follow the checkpoint's convention (probed on ``aac97412``): each expert matrix is
+quantized as one row with encoder ``denominator / amax`` (2688 here, as the release), so
+``dequant = q * s * amax / denominator`` and the vendor's output factor
+``(x_amax * w_amax) / (1536 * denominator)`` splits into the activation outer ``x_amax / 1536``
+and the weight outer ``w_amax / denominator``. Dequantization is exact in F64.
 
 Bound: cosine >= 0.9999 overall and >= 0.999 per row (the fork's NVFP4 bar), plus a
 tanh-saturation case, a gamma-spread case (route weight placement) and a bimodal-row
@@ -61,15 +64,17 @@ def _e4m3(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.float8_e4m3fn).to(x.dtype)
 
 
-def quantize_rows(x: torch.Tensor):
-    """Per-token fouroversix NVFP4 of F64 ``[rows, K]``: (packed codes u8 [rows, K/2], e4m3 bytes [rows, K/16],
-    amax [rows] F32, exact dequantized value F64 [rows, K] without the outer scale, i.e. q*s)."""
+def quantize_rows(x: torch.Tensor, encoder: float = 1536.0):
+    """Per-row fouroversix NVFP4 of F64 ``[rows, K]`` with encoder constant ``encoder``
+    (activations: 1536; weights: the checkpoint's ``outer_scale_denominator``, e.g. 2688, the
+    whole expert matrix as one row): (packed codes u8 [rows, K/2], e4m3 bytes [rows, K/16],
+    amax [rows] F32, q*s F64 [rows, K] without the outer scale amax/encoder)."""
     rows, k = x.shape
     amax = x.abs().amax(-1)
-    enc = torch.clamp(1536.0 / amax, max=3.4028234663852886e38)
+    enc = torch.clamp(encoder / amax, max=3.4028234663852886e38)
     enc = torch.where(amax == 0, torch.full_like(enc, 3.4028234663852886e38), enc)
     dec = 1.0 / enc
-    outer = amax / 1536.0
+    outer = amax / encoder
     blocks = x.reshape(rows, k // 16, 16)
     bmax = blocks.abs().amax(-1, keepdim=True)
     s6 = _e4m3((bmax * (enc[:, None, None] / 6.0)).clamp(max=448.0))
@@ -107,7 +112,11 @@ def _weights(g, real: int):
     if key not in _WEIGHTS:
         _WEIGHTS.clear()
         h, i, e = g.hidden, g.slice, g.experts
-        denominator = torch.tensor([1.0], dtype=torch.float32)
+        # The checkpoint's weight convention (probed on aac97412 layer 0: block scales 52..448 with
+        # 32k blocks at exactly 1536/6 = 256, q*s max == denominator 2688): the expert matrix is
+        # one "row" encoded with denominator/amax; dequant = q * s * amax / denominator.
+        DENOMINATOR = 2688.0
+        denominator = torch.tensor([DENOMINATOR], dtype=torch.float32)
 
         def operand(seed, rows, k, real_rows=None, real_k=None):
             packed = torch.empty((e, rows, k // 2), dtype=torch.uint8)
@@ -120,13 +129,13 @@ def _weights(g, real: int):
                     w[real_rows:] = 0
                 if real_k is not None:
                     w[:, real_k:] = 0
-                p_, s_, a_, _ = quantize_rows(w.reshape(1, -1))
+                p_, s_, a_, _ = quantize_rows(w.reshape(1, -1), encoder=DENOMINATOR)
                 packed[expert] = p_.reshape(rows, k // 2)
                 scales[expert] = s_.reshape(rows, k // 16)
                 amax[expert] = a_[0]
             tail = torch.cat([amax.view(torch.uint8), denominator.view(torch.uint8)])
             return (packed.contiguous().cuda(), torch.cat([scales.flatten(), tail]).contiguous().cuda(),
-                    (packed, scales, amax))
+                    (packed, scales, amax, DENOMINATOR))
 
         w1, s1, m1 = operand(1, i, h, real_rows=real)
         w3, s3, m3 = operand(3, i, h, real_rows=real)
@@ -136,14 +145,16 @@ def _weights(g, real: int):
 
 
 def _dequant_expert(meta, expert) -> torch.Tensor:
-    """F64 ``[rows, k]`` of one expert from its packed codes, E4M3 block scales and amax: q * s * amax / 1536."""
-    packed, scales, amax = meta
+    """F64 ``[rows, k]`` of one expert from its packed codes, E4M3 block scales, amax and the
+    denominator: q * s * amax / denominator (the vendor's (x_amax * w_amax) / (1536 * denominator)
+    split into its activation and weight halves)."""
+    packed, scales, amax, denominator = meta
     p = packed[expert].long()
     codes = torch.stack([p & 0xF, p >> 4], -1).flatten(-2)
     table = torch.cat([E2M1, -E2M1]).double()
     q = table[codes]
     s = scales[expert].view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)
-    return q * s * (amax[expert].double() / 1536.0)
+    return q * s * (amax[expert].double() / denominator)
 
 
 def _situ(gate, up, gate_cap, up_cap):
