@@ -296,6 +296,13 @@ def reference(g, x, ids, gammas, dequant):
 _STAGE_PROGRAMS: dict = {}
 
 
+def _bf16_ulps(a: torch.Tensor, b: torch.Tensor) -> float:
+    """max |a - b| in BF16 ulps at the magnitude of the larger operand (floor: BF16's smallest normal ulp)."""
+    mag = torch.maximum(a.abs(), b.abs()).clamp_min(2.0 ** -126)
+    ulp = torch.exp2(torch.floor(torch.log2(mag)) - 7)
+    return float(((a - b).abs() / ulp).max())
+
+
 def _stage_program(g, capacity):
     """The route's stages as _StreamNvfp4DynRoute runs them, with every intermediate returned by name and the
     fused gate/up's exchange dumped (diagnostics hook); plus the standalone dynamic linears' FC1."""
@@ -451,10 +458,7 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
         og = (xqd[rr] @ _dequant_expert(m1, ex, dev).T).float()
         ou = (xqd[rr] @ _dequant_expert(m3, ex, dev).T).float()
         kg, ku = exch_g[sel].float(), exch_u[sel].float()
-        # ulps of BF16 at the oracle value's magnitude: |d| / 2^(floor(log2|v|) - 7)
-        for kv, ov in ((kg, og), (ku, ou)):
-            scale_ = torch.exp2(torch.floor(torch.log2(ov.abs().clamp_min(1e-30))) - 7)
-            ulp_max = max(ulp_max, float(((kv - ov).abs() / scale_).max()))
+        ulp_max = max(ulp_max, _bf16_ulps(kg, og), _bf16_ulps(ku, ou))
         # (3) from the kernel's own exchange: vendor SiTU (GPU) -> oracle act-quant -> F64 down.
         slots = torch.tensor([p % k for p in sel], device=dev)
         act = _situ(kg, ku, gammas[rr, slots], g.situ_gate_cap, g.situ_up_cap)
@@ -487,8 +491,7 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     for ex in sorted(set(expert_of)):
         sel = torch.tensor([p for p in range(pairs) if expert_of[p] == ex], device=dev)
         yo = (qk[sel] @ _dequant_expert(m2, ex, dev).T).float()
-        scale_ = torch.exp2(torch.floor(torch.log2(yo.abs().clamp_min(1e-30))) - 7)
-        down_ulp = max(down_ulp, float(((y_k[sel] - yo).abs() / scale_).max()))
+        down_ulp = max(down_ulp, _bf16_ulps(y_k[sel], yo))
         yo3 = ((aqd[sel] * (am_a[sel].double() / 1536.0)[:, None]) @ _dequant_expert(m2, ex, dev).T).float().bfloat16().double()
         o3.index_add_(0, sel // k, yo3)
     report["down_ulp_max"] = down_ulp
