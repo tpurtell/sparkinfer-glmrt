@@ -21,6 +21,21 @@ quantized as one row with encoder ``denominator / amax`` (2688 here, as the rele
 ``(x_amax * w_amax) / (1536 * denominator)`` splits into the activation outer ``x_amax / 1536``
 and the weight outer ``w_amax / denominator``. Dequantization is exact in F64.
 
+Oracle form (stage-exact, main's decision on #295): the one input taken from the kernel, its own FC1
+gate/up exchange, is independently pinned, so the end-to-end check is legitimate. Four gates, each strict:
+
+  (1) FC1 exchange bit-exact against the standalone dynamic linears, and at most 1 BF16 ulp from the F64
+      FC1, asserted per row (max reported);
+  (2) input and act quantizers exact on every non-tie block (tie counts reported);
+  (3) from the kernel's own FC1 exchange: oracle act-quant -> F64 down -> unweighted sum matches the
+      route's output at cosine >= 0.9999 / per row >= 0.999 (measured 0.999996);
+  (4) down GEMM at most 1 BF16 ulp from the F64 down over the kernel's own packed act; combine exact.
+
+The end-to-end F64 cosine (full oracle from BF16 x) is reported, not gated: the per-token re-quantization
+amplifies FC1's F32-accumulation ulps into whole-row re-quantizations (0.99988 / 0.9982 at 128 rows), which
+no oracle short of the MMA's accumulation order reproduces. The model-level golden and fidelity are the
+backstop once serving exists.
+
 The 6-vs-4 candidate choice is the format's rule as both pinned vendor kernels fix it:
 reconstruction errors in F32 (vLLM ``d664cd1e`` ``ops/nvfp4.py:190`` loads x ``.to(tl.float32)``;
 SGLang ``ec5e7ff5`` ``nvfp4.py:93``), summed pairwise over 8, 4, 2, 1 (``_block_error``, vLLM
@@ -278,14 +293,94 @@ def reference(g, x, ids, gammas, dequant):
     return out.float().bfloat16()
 
 
+_STAGE_PROGRAMS: dict = {}
+
+
+def _stage_program(g, capacity):
+    """The route's stages as _StreamNvfp4DynRoute runs them, with every intermediate returned by name and the
+    fused gate/up's exchange dumped (diagnostics hook); plus the standalone dynamic linears' FC1."""
+    key = (g, capacity)
+    if key in _STAGE_PROGRAMS:
+        return _STAGE_PROGRAMS[key]
+    from b12x.integration.cuteafd.fp8_moe import _make_route, SMALL_GATE_CTAS_PER_SM
+    from b12x.integration.cuteafd._fp8_moe_stream import STREAM_TILE_M
+    from b12x.integration.cuteafd._nvfp4_moe_dynamic import StreamNvfp4LinearDyn
+    from b12x._lib.utils import runtime_num_sm
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+
+    route = _make_route(g, "stream", capacity, False)
+    e, k, h, i = g.experts, g.top_k, g.hidden, g.slice
+    lin = StreamNvfp4LinearDyn(n=i, k=h, experts=e)
+
+    class Stages:
+        def key(self):
+            return ("inkling2_nvfp4_stages", route.key(), lin.key())
+
+        @cute.jit
+        def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,
+                     w3: cute.Pointer, s3: cute.Pointer, w2: cute.Pointer, s2: cute.Pointer,
+                     meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer, xq: cute.Pointer, xs: cute.Pointer,
+                     xamax: cute.Pointer, gamma: cute.Pointer, act16: cute.Pointer, part: cute.Pointer, aq: cute.Pointer,
+                     a_s: cute.Pointer, aamax: cute.Pointer, y: cute.Pointer, out: cute.Pointer, exch: cute.Pointer,
+                     exch_rows: cute.Pointer, lin_g: cute.Pointer, lin_u: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+            pairs = rows * Int32(k)
+            groups = cutlass.min(pairs, Int32(e))
+            mt = (pairs + Int32(STREAM_TILE_M - 1)) // Int32(STREAM_TILE_M) + groups
+            ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
+            route.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
+            route.gamma(pair_pos, weights, gamma, rows, stream)
+            route.rows_in(x, pair_row, meta, xq, xs, xamax, pairs, stream)
+            dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part,
+                       exchange=exch, exchange_rows=exch_rows, pair_row=pair_row)
+            sms = runtime_num_sm()
+            target = sms * Int32(SMALL_GATE_CTAS_PER_SM)
+            if Int32(k * (i // 16)) >= target:
+                route.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, mt, stream, **dyn)
+            elif Int32(k * (i // 32)) >= target:
+                route.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, mt, stream, **dyn)
+            else:
+                route.small_gate[2](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, mt, stream, **dyn)
+            if pairs > Int32(16):
+                route.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, mt, stream, **dyn)
+            route.act(act16, part, meta, aq, a_s, aamax, mt, stream)
+            if Int32(k * (h // 128)) >= sms * Int32(2):
+                route.small_down[2](aq, a_s, meta, w2, s2, y, mt, stream, row_amax=aamax)
+            elif Int32(k * (h // 64)) >= sms * Int32(2):
+                route.small_down[1](aq, a_s, meta, w2, s2, y, mt, stream, row_amax=aamax)
+            else:
+                route.small_down[0](aq, a_s, meta, w2, s2, y, mt, stream, row_amax=aamax)
+            if pairs > Int32(16):
+                route.down(aq, a_s, meta, w2, s2, y, mt, stream, row_amax=aamax)
+            route.combine(y, pair_pos, weights, out, rows, stream)
+            lin(xq, xs, meta, w1, s1, lin_g, mt, stream, row_amax=xamax)
+            lin(xq, xs, meta, w3, s3, lin_u, mt, stream, row_amax=xamax)
+
+    O = Operand
+    ops = (O("x", torch.bfloat16, "[rows,H]"), O("ids", torch.int32, "[rows,k]", align=4), O("weights", torch.float32, "[rows,k]", align=4),
+           O("w1", torch.uint8, "[w]"), O("s1", torch.uint8, "[s]", align=4), O("w3", torch.uint8, "[w]"), O("s3", torch.uint8, "[s]", align=4),
+           O("w2", torch.uint8, "[w]"), O("s2", torch.uint8, "[s]", align=4),
+           O("meta", torch.int32, "[m]", "out", align=4), O("pair_row", torch.int32, "[p]", "out", align=4), O("pair_pos", torch.int32, "[p]", "out", align=4),
+           O("xq", torch.uint8, "[P,H/2]", "out"), O("xs", torch.uint8, "[P,H/16]", "out"), O("xamax", torch.float32, "[P]", "out", align=4),
+           O("gamma", torch.float32, "[p]", "out", align=4), O("act16", torch.bfloat16, "[P,I]", "out"), O("part", torch.float32, "[P,I/16]", "out", align=4),
+           O("aq", torch.uint8, "[P,I/2]", "out"), O("a_s", torch.uint8, "[P,I/16]", "out"), O("aamax", torch.float32, "[P]", "out", align=4),
+           O("y", torch.bfloat16, "[p,H]", "out"), O("out", torch.bfloat16, "[rows,H]", "out"),
+           O("exch", torch.bfloat16, "[P,2I]", "out"), O("exch_rows", torch.int32, "[P,4]", "out", align=4),
+           O("lin_g", torch.bfloat16, "[p,I]", "out"), O("lin_u", torch.bfloat16, "[p,I]", "out"))
+    _STAGE_PROGRAMS[key] = compile_program(Stages(), name="inkling2_nvfp4_stages", operands=ops, scalars=(Scalar("rows"),),
+                                           key=("inkling2_nvfp4_stages", capacity, route.key(), lin.key()))
+    return _STAGE_PROGRAMS[key]
+
+
 def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bimodal=False):
-    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
+    """Run the route's stages on one case and judge the four strict gates; return the report dict."""
+    from b12x.integration.cuteafd.fp8_moe import meta_words, stream_max_tiles
+    from b12x.integration.cuteafd._fp8_moe_stream import STREAM_TILE_M
 
     gen = torch.Generator(device="cuda").manual_seed(seed)
     (w, dequant) = _weights(g, real)
+    m1, m3, m2 = dequant
     x = torch.randn(rows, g.hidden, device="cuda", generator=gen) * scale
     if bimodal:
-        # One 16-block per row 30x larger than the rest: the 4.0 candidate wins for the small blocks.
         x[:, :16] *= 30.0
     x = x.bfloat16()
     scores = torch.rand(rows, g.experts, device="cuda", generator=gen)
@@ -296,27 +391,128 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     if gamma_spread != 1.0:
         gammas = torch.exp((gammas * 2 - 1) * torch.log(torch.tensor(gamma_spread, device="cuda")))
     gammas = gammas.float().contiguous()
-    key = (g, capacity)
-    if key not in _PROGRAMS:
-        _PROGRAMS[key] = compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False)
-    program = _PROGRAMS[key]
-    out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
-    scratch = torch.empty(fp8_moe_scratch_bytes(g, "stream", capacity, False), dtype=torch.uint8, device="cuda")
-    program.launch(x, ids, gammas, *w, out, scratch, scalars=(rows,))
+    e, k, h, i = g.experts, g.top_k, g.hidden, g.slice
+    pairs = rows * k
+    max_tiles = stream_max_tiles(e, pairs)
+    padded = max_tiles * STREAM_TILE_M
+    dev = "cuda"
+    # Sentinels: 0xFF for packed/scale bytes (an E4M3 scale of 0xFF is NaN, never written), NaN elsewhere.
+    ff = lambda *shape: torch.full(shape, 0xFF, dtype=torch.uint8, device=dev)  # noqa: E731
+    nan = lambda *shape, dt=torch.float32: torch.full(shape, float("nan"), dtype=dt, device=dev)  # noqa: E731
+    t = dict(meta=torch.zeros(meta_words(e, max_tiles), dtype=torch.int32, device=dev),
+             pair_row=torch.full((pairs,), -7, dtype=torch.int32, device=dev), pair_pos=torch.full((pairs,), -7, dtype=torch.int32, device=dev),
+             xq=ff(padded, h // 2), xs=ff(padded, h // 16), xamax=nan(padded), gamma=nan(pairs),
+             act16=nan(padded, i, dt=torch.bfloat16), part=nan(padded, i // 16), aq=ff(padded, i // 2), a_s=ff(padded, i // 16),
+             aamax=nan(padded), y=nan(pairs, h, dt=torch.bfloat16), out=nan(rows, h, dt=torch.bfloat16),
+             exch=nan(padded, 2 * i, dt=torch.bfloat16), exch_rows=torch.full((padded, 4), -1, dtype=torch.int32, device=dev),
+             lin_g=nan(pairs, i, dt=torch.bfloat16), lin_u=nan(pairs, i, dt=torch.bfloat16))
+    program = _stage_program(g, capacity)
+    program.launch(x, ids, gammas, *w, *t.values(), scalars=(rows,))
     torch.cuda.synchronize()
-    expected = reference(g, x, ids, gammas, dequant)
-    # Tie blocks in the input rows' quantization: candidate errors within TIE_REL; either scale is
-    # the rule's answer there, so they are reported, not judged (see test_inkling2_nvfp4_quantizer_exact).
-    quantize_rows(x.double())
-    ties = int(quantize_rows.last_tie.sum())
-    blocks = int(quantize_rows.last_tie.numel())
-    a, b = out.float(), expected.float()
-    assert torch.isfinite(a).all()
-    c = float((a * b).sum() / (a.norm() * b.norm()))
-    worst = float(torch.nn.functional.cosine_similarity(a, b, dim=1).min())
-    delta = float((a - b).abs().max())
-    _run.last_ties = (ties, blocks)
-    return c, worst, delta, float(b.abs().max())
+    # Grouped position -> padded index.
+    meta = t["meta"].cpu().tolist()
+    offsets = meta[4 + e:4 + 2 * e]
+    tiles = meta[4 + 3 * e:4 + 3 * e + meta[1]]
+    tile_of = {((c & 0xFFFF), c >> 16): tt for tt, c in enumerate(tiles)}
+    ids_c, pos = ids.cpu(), t["pair_pos"].cpu().long()
+    padded_of, expert_of = [], []
+    for p in range(pairs):
+        rr, slot = divmod(p, k)
+        ex = int(ids_c[rr, slot])
+        local = int(pos[p]) - offsets[ex]
+        padded_of.append(tile_of[(ex, local // 128)] * 128 + local % 128)
+        expert_of.append(ex)
+    pi = torch.tensor(padded_of, device=dev)
+    gp = pos.to(dev)
+    # Written-row assertions (the sentinel discipline): every claimed row of every stage.
+    for name, tens, idx, kind in (("xq", t["xq"], pi, "ff"), ("xs", t["xs"], pi, "ff"), ("xamax", t["xamax"], pi, "nan"),
+                                  ("gamma", t["gamma"], gp, "nan"), ("act16", t["act16"], pi, "nan"), ("aq", t["aq"], pi, "ff"),
+                                  ("a_s", t["a_s"], pi, "ff"), ("aamax", t["aamax"], pi, "nan"), ("y", t["y"], gp, "nan"),
+                                  ("exch", t["exch"], pi, "nan"), ("lin_g", t["lin_g"], gp, "nan"), ("lin_u", t["lin_u"], gp, "nan")):
+        sel = tens[idx]
+        unwritten = (sel == 0xFF).all(-1) if kind == "ff" else torch.isnan(sel.float()).any(-1) if sel.dim() > 1 else torch.isnan(sel.float())
+        assert not unwritten.any(), f"{name}: {int(unwritten.sum())} claimed rows still hold their sentinel"
+    assert not torch.isnan(t["out"].float()).any(), "out holds its NaN sentinel"
+    assert torch.equal(t["exch_rows"][pi, 2].cpu(), pos) and torch.equal(t["exch_rows"][pi, 3].cpu(), t["pair_row"].cpu()[pos]), \
+        "exchange row records disagree with the grouping (misaddressed rows)"
+    report = {}
+    # (1) FC1 exchange: bit-exact vs the standalone linears; <= 1 BF16 ulp from the F64 FC1, per row.
+    exch_g, exch_u = t["exch"][pi, :i], t["exch"][pi, i:]
+    assert torch.equal(exch_g, t["lin_g"][gp]) and torch.equal(exch_u, t["lin_u"][gp]), "fused exchange differs from the standalone linears"
+    xd = x.double()
+    _, _, am_x, xqd = quantize_rows(xd)
+    report["input_ties"] = int(quantize_rows.last_tie.sum())
+    xqd = xqd * (am_x.double() / 1536.0)[:, None]
+    ulp_max = 0.0
+    oracle_act = torch.empty(pairs, i, dtype=torch.bfloat16, device=dev)
+    for ex in sorted(set(expert_of)):
+        sel = [p for p in range(pairs) if expert_of[p] == ex]
+        rr = torch.tensor([p // k for p in sel], device=dev)
+        og = (xqd[rr] @ _dequant_expert(m1, ex, dev).T).float()
+        ou = (xqd[rr] @ _dequant_expert(m3, ex, dev).T).float()
+        kg, ku = exch_g[sel].float(), exch_u[sel].float()
+        # ulps of BF16 at the oracle value's magnitude: |d| / 2^(floor(log2|v|) - 7)
+        for kv, ov in ((kg, og), (ku, ou)):
+            scale_ = torch.exp2(torch.floor(torch.log2(ov.abs().clamp_min(1e-30))) - 7)
+            ulp_max = max(ulp_max, float(((kv - ov).abs() / scale_).max()))
+        # (3) from the kernel's own exchange: vendor SiTU (GPU) -> oracle act-quant -> F64 down.
+        slots = torch.tensor([p % k for p in sel], device=dev)
+        act = _situ(kg, ku, gammas[rr, slots], g.situ_gate_cap, g.situ_up_cap)
+        oracle_act[torch.tensor(sel, device=dev)] = act
+    report["fc1_ulp_max"] = ulp_max
+    assert ulp_max <= 1.0 + 1e-6, f"FC1 exchange is {ulp_max:.3f} BF16 ulps from the F64 FC1 (bar 1)"
+    # (2) quantizers exact on non-tie blocks.
+    _, sc_x, _, _ = quantize_rows(xd)
+    tie_x = quantize_rows.last_tie
+    mism = (t["xs"][pi].cpu() != sc_x.cpu()[torch.arange(pairs) // k]) & ~tie_x.cpu()[torch.arange(pairs) // k]
+    report["input_nontie_mismatch"] = int(mism.sum())
+    assert report["input_nontie_mismatch"] == 0 and torch.equal(t["xamax"][pi].cpu(), am_x.float().cpu()[torch.arange(pairs) // k]), \
+        "input quantizer differs from the oracle on a non-tie block or an amax"
+    kernel_act = t["act16"][pi]
+    assert torch.equal(kernel_act, oracle_act), "kernel act rows differ from vendor SiTU of the kernel's own exchange"
+    _, sc_a, am_a, aqd = quantize_rows(kernel_act.double())
+    tie_a = quantize_rows.last_tie
+    report["act_ties"] = int(tie_a.sum())
+    mism_a = (t["a_s"][pi] != sc_a) & ~tie_a
+    report["act_nontie_mismatch"] = int(mism_a.sum())
+    assert report["act_nontie_mismatch"] == 0 and torch.equal(t["aamax"][pi], am_a.float()), "act quantizer differs on a non-tie block or an amax"
+    # (4) down <= 1 ulp over the kernel's own packed act; combine exact.
+    table = torch.cat([E2M1, -E2M1]).double().to(dev)
+    aq_k = t["aq"][pi].long()
+    codes = torch.stack([aq_k & 0xF, aq_k >> 4], -1).flatten(-2)
+    qk = (table[codes] * t["a_s"][pi].view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)) * (t["aamax"][pi].double() / 1536.0)[:, None]
+    y_k = t["y"][gp].float()
+    down_ulp = 0.0
+    o3 = torch.zeros(rows, h, dtype=torch.float64, device=dev)
+    for ex in sorted(set(expert_of)):
+        sel = torch.tensor([p for p in range(pairs) if expert_of[p] == ex], device=dev)
+        yo = (qk[sel] @ _dequant_expert(m2, ex, dev).T).float()
+        scale_ = torch.exp2(torch.floor(torch.log2(yo.abs().clamp_min(1e-30))) - 7)
+        down_ulp = max(down_ulp, float(((y_k[sel] - yo).abs() / scale_).max()))
+        yo3 = ((aqd[sel] * (am_a[sel].double() / 1536.0)[:, None]) @ _dequant_expert(m2, ex, dev).T).float().bfloat16().double()
+        o3.index_add_(0, sel // k, yo3)
+    report["down_ulp_max"] = down_ulp
+    assert down_ulp <= 1.0 + 1e-6, f"down is {down_ulp:.3f} BF16 ulps from the F64 down (bar 1)"
+    ysum = torch.zeros(rows, h, dtype=torch.float32, device=dev).index_add_(0, torch.arange(pairs, device=dev) // k, y_k)
+    assert torch.equal(t["out"], ysum.bfloat16()), "combine differs from the F32 slot sum of the kernel's own y rows"
+    # (3) gate: kernel exchange -> oracle act-quant -> F64 down -> sum vs the route's output.
+    out_f = t["out"].float()
+    ref3 = o3.float().bfloat16().float()
+    c3 = float((out_f.double() * ref3.double()).sum() / (out_f.double().norm() * ref3.double().norm()))
+    w3_ = float(torch.nn.functional.cosine_similarity(out_f, ref3, dim=1).min())
+    report["stage_exact_cos"], report["stage_exact_worst_row"] = c3, w3_
+    assert c3 >= COS and w3_ >= ROW_COS, f"stage-exact reference: cosine {c3:.7f} worst row {w3_:.6f}"
+    # Diagnostic (not gated): the full F64 oracle end to end.
+    expected = reference(g, x, ids, gammas, dequant).float()
+    report["e2e_cos"] = float((out_f.double() * expected.double()).sum() / (out_f.double().norm() * expected.double().norm()))
+    report["e2e_worst_row"] = float(torch.nn.functional.cosine_similarity(out_f, expected, dim=1).min())
+    return report
+
+
+def _print(label, r):
+    print(f"{label}: stage-exact cos {r['stage_exact_cos']:.7f} worst row {r['stage_exact_worst_row']:.6f}; "
+          f"FC1 {r['fc1_ulp_max']:.2f} ulp, down {r['down_ulp_max']:.2f} ulp; non-tie mismatches input {r['input_nontie_mismatch']} act {r['act_nontie_mismatch']}; "
+          f"ties input {r['input_ties']} act {r['act_ties']}; e2e F64 diagnostic cos {r['e2e_cos']:.7f} worst row {r['e2e_worst_row']:.6f}")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -326,7 +522,7 @@ def _setup():
 
 
 CASES = [
-    # (tp, real rows of the slice, capacity, rows, hot)
+    # (tp, real rows of the slice, capacity, rows, hot); 17 rows: ~one row per expert
     (1, 2304, 128, 17, 0), (1, 2304, 128, 128, 0), (1, 2304, 1024, 1000, 0),
     (1, 2304, 4096, 2752, 0), (1, 2304, 4096, 4096, 8),
     (2, 1152, 256, 256, 0), (2, 1152, 4096, 4096, 0),
@@ -337,38 +533,19 @@ CASES = [
 @pytest.mark.parametrize("tp,real,capacity,rows,hot", CASES)
 def test_inkling2_nvfp4_moe(tp, real, capacity, rows, hot):
     g = _geometry(tp)
-    c, worst, delta, scale = _run(g, real, capacity, rows, hot=hot)
-    ties, blocks = _run.last_ties
-    print(f"inkling2_nvfp4 tp{tp} real {real} capacity {capacity} rows {rows} hot {hot}: "
-          f"cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e} (max|ref| {scale:.3e}); "
-          f"input tie blocks {ties}/{blocks}")
-    assert c >= COS and worst >= ROW_COS
+    _print(f"inkling2_nvfp4 tp{tp} real {real} capacity {capacity} rows {rows} hot {hot}", _run(g, real, capacity, rows, hot=hot))
 
 
 def test_inkling2_nvfp4_route_weight_before_fc2():
-    g = _geometry(1)
-    c, worst, delta, _ = _run(g, 2304, 256, 256, seed=3, gamma_spread=8.0)
-    print(f"inkling2_nvfp4 gamma spread: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}; "
-          f"input tie blocks {_run.last_ties[0]}/{_run.last_ties[1]}")
-    assert c >= COS and worst >= ROW_COS
+    _print("inkling2_nvfp4 gamma spread", _run(_geometry(1), 2304, 256, 256, seed=3, gamma_spread=8.0))
 
 
 def test_inkling2_nvfp4_situ_saturation():
-    g = _geometry(1)
-    c, worst, delta, _ = _run(g, 2304, 256, 256, seed=5, scale=40.0)
-    print(f"inkling2_nvfp4 saturation: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}; "
-          f"input tie blocks {_run.last_ties[0]}/{_run.last_ties[1]}")
-    assert c >= COS and worst >= ROW_COS
+    _print("inkling2_nvfp4 saturation", _run(_geometry(1), 2304, 256, 256, seed=5, scale=40.0))
 
 
 def test_inkling2_nvfp4_fouroversix_selection():
-    """Bimodal rows: the 4.0-based block scale is chosen for the small blocks; a 6-only quantizer
-    would lose ~0.3 bits there and miss the per-row bound."""
-    g = _geometry(1)
-    c, worst, delta, _ = _run(g, 2304, 256, 256, seed=7, bimodal=True)
-    print(f"inkling2_nvfp4 fouroversix: cosine {c:.7f} worst row {worst:.6f} max|d| {delta:.3e}; "
-          f"input tie blocks {_run.last_ties[0]}/{_run.last_ties[1]}")
-    assert c >= COS and worst >= ROW_COS
+    _print("inkling2_nvfp4 fouroversix", _run(_geometry(1), 2304, 256, 256, seed=7, bimodal=True))
 
 
 def test_inkling2_nvfp4_geometry():
@@ -380,72 +557,3 @@ def test_inkling2_nvfp4_geometry():
     assert _resolve("auto", 1, False, "nvfp4dyn", "auto") == "stream"
     with pytest.raises(ValueError):
         _resolve("auto", 1, True, "nvfp4dyn", "auto")
-
-
-def _scratch_regions(g, rows, capacity):
-    """Byte offsets of the stream route's scratch regions (mirrors _StreamNvfp4DynRoute.__call__)."""
-    from b12x.integration.cuteafd.fp8_moe import meta_words, stream_max_tiles
-    from b12x.integration.cuteafd._fp8_moe_stream import STREAM_TILE_M
-
-    def al(v):
-        return (v + 1023) // 1024 * 1024
-
-    e, k, h, i = g.experts, g.top_k, g.hidden, g.slice
-    pairs = rows * k
-    max_tiles = min(pairs, e) + -(-pairs // STREAM_TILE_M)
-    padded = max_tiles * STREAM_TILE_M
-    meta = 4 * meta_words(e, stream_max_tiles(e, capacity * k))
-    pair_row = al(meta)
-    pair_pos = pair_row + al(pairs * 4)
-    xq = pair_pos + al(pairs * 4)
-    xs = xq + al(padded * h // 2)
-    xamax = xs + al(padded * h // 16)
-    return dict(meta=meta, pair_pos=pair_pos, xq=xq, xs=xs, xamax=xamax, padded=padded, pairs=pairs)
-
-
-def test_inkling2_nvfp4_quantizer_exact():
-    """The input quantizer's scale bytes and amax match the oracle on every non-tie block; tie
-    blocks (two F32 candidate errors within TIE_REL) are counted and reported, not judged."""
-    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
-
-    g, rows, capacity = _geometry(1), 128, 128
-    (w, _) = _weights(g, 2304)
-    gen = torch.Generator(device="cuda").manual_seed(1)
-    x = torch.randn(rows, g.hidden, device="cuda", generator=gen).bfloat16()
-    ids = torch.rand(rows, g.experts, device="cuda", generator=gen).topk(g.top_k, -1).indices.int().contiguous()
-    gammas = torch.rand(rows, g.top_k, device="cuda", generator=gen).float().contiguous()
-    program = _PROGRAMS.setdefault((g, capacity), compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False))
-    out = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device="cuda")
-    scratch = torch.zeros(fp8_moe_scratch_bytes(g, "stream", capacity, False), dtype=torch.uint8, device="cuda")
-    program.launch(x, ids, gammas, *w, out, scratch, scalars=(rows,))
-    torch.cuda.synchronize()
-    R = _scratch_regions(g, rows, capacity)
-    e, k, h = g.experts, g.top_k, g.hidden
-    meta = scratch[:R["meta"]].view(torch.int32).cpu().tolist()
-    pair_pos = scratch[R["pair_pos"]:R["pair_pos"] + R["pairs"] * 4].view(torch.int32).long()
-    xs = scratch[R["xs"]:R["xs"] + R["padded"] * h // 16].view(R["padded"], h // 16)
-    xamax = scratch[R["xamax"]:R["xamax"] + R["padded"] * 4].view(torch.float32)
-    offsets = meta[4 + e:4 + 2 * e]
-    tiles = meta[4 + 3 * e:4 + 3 * e + meta[1]]
-    tile_of = {((c & 0xFFFF), c >> 16): t for t, c in enumerate(tiles)}
-    _, sc_o, am_o, _ = quantize_rows(x.double())
-    ties = quantize_rows.last_tie
-    checked = tie_blocks = flips_at_ties = non_tie_mismatch = amax_mismatch = 0
-    ids_c = ids.cpu()
-    for p in range(R["pairs"]):
-        r, slot = divmod(p, k)
-        ex = int(ids_c[r, slot])
-        local = int(pair_pos[p]) - offsets[ex]
-        i = tile_of[(ex, local // 128)] * 128 + local % 128
-        mism = xs[i] != sc_o[r]
-        tie = ties[r]
-        checked += int(mism.numel())
-        tie_blocks += int(tie.sum())
-        flips_at_ties += int((mism & tie).sum())
-        non_tie_mismatch += int((mism & ~tie).sum())
-        amax_mismatch += int(float(xamax[i]) != float(am_o[r]))
-    print(f"inkling2_nvfp4 quantizer: {checked} blocks over {R['pairs']} pairs; tie blocks {tie_blocks} "
-          f"(kernel chose the other candidate on {flips_at_ties}); non-tie scale mismatches {non_tie_mismatch}; "
-          f"amax mismatches {amax_mismatch}")
-    assert non_tie_mismatch == 0 and amax_mismatch == 0
-
