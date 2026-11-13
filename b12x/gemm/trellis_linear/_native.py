@@ -121,7 +121,9 @@ DECODE_ROWS_BY_SHAPE = {
 def decode_rows(g):
     measured = DECODE_ROWS_BY_SHAPE.get((g["bits"], g["output_features"], g["input_features"]))
     if (measured is not None and g.get("groups", 1) == 1 and g["codebook"] == "mcg"
-            and g.get("input_dtype", "f16") == "bf16" and g["sharded_side"] in measured[1]):
+            and (g.get("input_dtype", "f16") == "bf16"
+                 or (g["bits"] == 8 and g.get("input_dtype", "f16") == "f16"))
+            and g["sharded_side"] in measured[1]):
         return measured[0]
     return _K6_DECODE_ROWS
 
@@ -2067,7 +2069,9 @@ class NativeTrellisLinear:
             _fence_mbar_init()
         cute.arch.sync_threads()
         n_tiles = Int32(self.n // _PREFILL_BN)
-        total_tiles = ((rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)) * n_tiles
+        m_tiles = (rows + Int32(_PREFILL_BM - 1)) // Int32(_PREFILL_BM)
+        total_tiles = m_tiles * n_tiles
+        band_major = self.k * self.n * self.bits > 256 * 1024 * 1024 * 8
         x_ptr = inputs[rotation_id]
         payload_ptr = payload.iterator.toint()
         scales_ptr = scales.iterator.toint()
@@ -2078,8 +2082,12 @@ class NativeTrellisLinear:
             p_tid = tid - Int32(_PREFILL_CONSUMER_THREADS)
             stage_cnt = Int32(0)
             while task < total_tiles:
-                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = task % n_tiles
+                if cutlass.const_expr(band_major):
+                    m0 = (task % m_tiles) * Int32(_PREFILL_BM)
+                    nb64 = task // m_tiles
+                else:
+                    m0 = (task // n_tiles) * Int32(_PREFILL_BM)
+                    nb64 = task % n_tiles
                 stage_cnt = self._prefill_produce_tile(p_tid, base, x_ptr, payload_ptr, rows, m0, nb64, stage_cnt)
                 task += step
         else:
@@ -2087,8 +2095,12 @@ class NativeTrellisLinear:
                 cute.arch.warpgroup_reg_alloc(_PREFILL_CONSUMER_REGS)
             stage_cnt = Int32(0)
             while task < total_tiles:
-                m0 = (task // n_tiles) * Int32(_PREFILL_BM)
-                nb64 = task % n_tiles
+                if cutlass.const_expr(band_major):
+                    m0 = (task % m_tiles) * Int32(_PREFILL_BM)
+                    nb64 = task // m_tiles
+                else:
+                    m0 = (task // n_tiles) * Int32(_PREFILL_BM)
+                    nb64 = task % n_tiles
                 stage_cnt = self._prefill_consume_tile(tid, base, scales_ptr, output_ptr, rows, m0, nb64, stage_cnt)
                 task += step
 
