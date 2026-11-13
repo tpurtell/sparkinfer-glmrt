@@ -213,3 +213,36 @@ def test_fp8_projection_decode_matches_routed(rows):
     old.launch(x, wd, w8, s, b, scalars=(rows,))
     torch.cuda.synchronize()
     assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("scales", ["block", "row", "row_kmajor"])
+@pytest.mark.parametrize("kind,rows", [("gemv", 1), ("gemv", 17), ("gemv", 64), ("tma", 17), ("tma", 129)])
+def test_experimental_dense_native_scale(scales, kind, rows):
+    """Diagnostic #2057 arm: exact E4M3 dot products, then F32 block scales."""
+    import cutlass
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv, TmaFp8Gemm
+
+    n, k = 256, 512
+    torch.manual_seed(2057)
+    w8, s, _ = _weights(n, k, 2057, row_scales=scales != "block")
+    x = torch.randn((rows, k), device="cuda").bfloat16()
+    scale = s.t().contiguous() if scales == "row_kmajor" else s
+    launch = (MmaFp8Gemv(n, k, max_rows=64, warps=4, groups=4,
+                        row_scales=scales != "block", kmajor=scales == "row_kmajor",
+                        out_dtype=cutlass.Float32) if kind == "gemv" else
+              TmaFp8Gemm(n, k, scales=scales, out_dtype=cutlass.Float32))
+    program = compile_program(launch, name=f"native_scale_{kind}_{scales}",
+        operands=(Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),
+                  Operand("s", torch.float32, "s", align=4), Operand("o", torch.float32, "o", "out")),
+        scalars=(Scalar("rows"),), key=(kind, scales, rows))
+    out = torch.empty((rows, n), device="cuda", dtype=torch.float32)
+    program.launch(x, w8, scale, out, scalars=(rows,))
+    grown = s.repeat_interleave(128, 1) if scales != "block" else s.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    ref = x.double() @ (w8.double() * grown.double()).t()
+    error = (out.double() - ref).norm() / ref.norm()
+    rounded = x.double() @ (w8.float() * grown).bfloat16().double().t()
+    old_error = (rounded - ref).norm() / ref.norm()
+    print(f"native-scale {kind} {scales} rows={rows}: relL2={error.item():.8g} rounded-weight={old_error.item():.8g}")
+    assert error.item() < 3e-6
+    assert error.item() < old_error.item() / 100
