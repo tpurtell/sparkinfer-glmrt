@@ -420,7 +420,9 @@ def test_measured_decode_rows_are_scoped_to_qualified_format_and_storage_sides()
                      codebook="mcg", input_dtype="bf16", groups=1)
             assert build(g) == (edge if side in sides else 16)
             for key, value in (("codebook", "mul1"), ("input_dtype", "f16"), ("groups", 4)):
-                assert build(dict(g, **{key: value})) == 16
+                # K8 F16 MCG shares the BF16 table (opt-in input dtype, same routes).
+                shared = bits == 8 and key == "input_dtype" and side in sides
+                assert build(dict(g, **{key: value})) == (edge if shared else 16)
     assert build(dict(bits=6, output_features=3072, input_features=7168,
                       sharded_side=1, codebook="mcg", input_dtype="bf16")) == 16
 
