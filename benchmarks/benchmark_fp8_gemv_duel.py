@@ -322,7 +322,7 @@ def run_native_route(spec, rows, route, samples, seed, row_scales):
     import torch
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     from b12x.integration.cuteafd._fp8_weights import (
-        MmaFp8Gemv, TmaFp8Gemm, fp8_gemv_tuning, fp8_gemv_wide, gemv_warps)
+        MmaFp8Gemv, TmaFp8Gemm, fp8_gemv_tuning, fp8_gemv_wide, fp8_gemv_wide_kernel, gemv_warps)
     from b12x.integration.cuteafd._fp8_gemv_nc import NcMmaFp8Gemv
     from b12x.integration.cuteafd._glmf_prefill_w8 import ExpandedW8Prefill
 
@@ -337,10 +337,13 @@ def run_native_route(spec, rows, route, samples, seed, row_scales):
     warps = _shipped_config().get((n, k), (gemv_warps(k), 4))[0]
     groups = fp8_gemv_tuning(n, k, warps=warps)[1]
     cta_tiles = None
-    if route in ("base", "nc"):
+    if route in ("base", "nc", "selected"):
         if rows > 16:
             groups, cta_tiles = fp8_gemv_wide(n, k, warps=warps, groups=groups)
-        op = (NcMmaFp8Gemv if route == "nc" else MmaFp8Gemv)(
+        cls = (fp8_gemv_wide_kernel(n, k, warps=warps, row_scales=per_row)
+               if route == "selected" and rows > 16 else
+               NcMmaFp8Gemv if route == "nc" else MmaFp8Gemv)
+        op = cls(
             n, k, max_rows=16 if rows <= 16 else 64, warps=warps, groups=groups,
             cta_tiles=cta_tiles, row_scales=per_row)
     elif route == "tma":
@@ -393,7 +396,7 @@ def main():
     parser.add_argument("--rows2", type=int, default=16,
                         help="second batch width timed on the same program (0 disables)")
     parser.add_argument("--tag", default="")
-    parser.add_argument("--native-route", choices=("base", "nc", "tma", "expanded"),
+    parser.add_argument("--native-route", choices=("base", "nc", "selected", "tma", "expanded"),
                         help="time one dense route, with F64 sample and prefix checks")
     parser.add_argument("--source-root", type=Path,
                         help="import b12x from this read-only baseline/candidate source")

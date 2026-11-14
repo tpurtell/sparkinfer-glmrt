@@ -285,6 +285,7 @@ def _e4m3x4_scaled_bf16x2x2_fast(word, s, *, loc=None, ip=None):
 
 
 class NcMmaFp8Gemv(MmaFp8Gemv):
+    native_scale = False
     # Interim scaled-BF16 fallback: native NC regresses SM120 wide rows.
     # Preserve this measured path until cuteafd#2068 reaches parity.
     """Bit-identical ``MmaFp8Gemv`` with 2-chunk rotating weight pipeline, 8-register half-chunk

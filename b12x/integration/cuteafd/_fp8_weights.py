@@ -7,7 +7,7 @@ powers of two costs 0.025 nats, so these kernels apply them exactly:
 ``MmaFp8Gemv``   decode rows (one thin 16-row tile, then multi-tile rows to the
     program's capacity on the same ``warps``/``groups``): m16n8k16 BF16 MMAs fed
     straight from global memory, exact E4M3 widening in registers and FP32
-    block scales applied to K128 accumulator segments; reads half the weight
+    block scales applied to reusable K64 accumulator segments; reads half the weight
     bytes of the BF16 GEMV without rounding the scaled weight.
 ``TmaFp8Gemm``    interim W8A16 fallback with scaled-BF16 weights, pending
     a native-scale implementation that reaches speed parity (cuteafd#2068).
@@ -232,6 +232,8 @@ class Fp8Projection:
                                       cta_tiles=wide_t if wide_groups is None else None,
                                       row_scales=self.row_scales, kmajor=self.kmajor,
                                       out_dtype=out_dtype) if cap > int(gemv_rows) else None
+            assert self.gemv_wide is None or self.gemv.native_scale == self.gemv_wide.native_scale, \
+                "decode widths must not switch weight-scale arithmetic"
             # HQA block-scale o projections: only M16 won the direct-widen screen.
             if (self.n, self.k, warps) in ((4096, 16384, 4), (4096, 8192, 8)) \
                     and not self.row_scales and out_dtype == cutlass.BFloat16 \
@@ -512,14 +514,9 @@ def fp8_gemv_wide_kernel(n: int, k: int, *, warps: int, row_scales: bool = False
     measured nc entry at the warps it was measured at, else the base kernel.  The nc kernel
     was measured on block-scale weights only, so a per-row-scale or K-block-major shape never
     leaves the base kernel."""
-    if FP8_GEMV_WIDE_KERNEL.get((int(n), int(k))) != "nc" or row_scales or kmajor:
-        return MmaFp8Gemv
-    entry = FP8_GEMV_WIDE.get((int(n), int(k)))
-    if entry is None or entry[0] != int(warps):
-        return MmaFp8Gemv
-    from ._fp8_gemv_nc import NcMmaFp8Gemv
-
-    return NcMmaFp8Gemv
+    # Native base preserves one arithmetic across the decode width band. The
+    # rounded NC fallback cannot follow an exact-scale thin tile (cuteafd#2068).
+    return MmaFp8Gemv
 
 
 def fp8_gemv_tuning(n: int, k: int, *, warps: int | None = None) -> tuple[int, int]:
@@ -924,6 +921,8 @@ def _ld_stream_l2_256(address, *, loc=None, ip=None):
 
 
 class MmaFp8Gemv:
+    native_scale = True
+
     """Decode-row GEMM on tensor cores straight from global memory.
 
     A CTA owns ``8 * groups`` output columns and ``m_tiles`` 16-row tiles of the
@@ -938,7 +937,7 @@ class MmaFp8Gemv:
     is 0..3), so each lane reads one contiguous 16-byte weight run per group
     (row ``lane/4``) and two contiguous 32-byte activation runs per tile,
     reused by every group. Weights enter the MMA as exact E4M3 values; each
-    K128 FP32 segment receives its checkpoint scale before accumulating.
+    K64 FP32 partial receives its checkpoint K128 scale before accumulating.
     Warps reduce
     through shared memory (one tile at a time when a CTA holds more than two,
     ``sync_threads`` between tiles, and the same ascending warp order either
