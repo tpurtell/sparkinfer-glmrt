@@ -1,6 +1,8 @@
 """W4A4 kernels of the NVFP4 stream route (``fp8_moe`` ``weights="nvfp4"``,
 ``activations="a4"``): the numerics NVIDIA calibrated its ModelOpt NVFP4
-checkpoints for.
+checkpoints for. Compressed-tensors globals instead remain checkpoint-native
+divisors: the input global directly encodes activations, and projection
+accumulators divide by the weight and input globals without a reciprocal round trip.
 
 Activations are quantized to NVFP4 with the checkpoint's static
 ``input_scale`` (one per projection and expert, stored after the experts'
@@ -55,6 +57,7 @@ from b12x._lib.intrinsics import (
     st_global_u64,
     st_global_u8,
     st_shared_u32,
+    div_rn_f32,
 )
 
 from b12x._lib.activation import gated_activation_value
@@ -86,7 +89,8 @@ class ChunkRowsA4:
 
     threads = 128
 
-    def __init__(self, *, k: int, wire: bool, experts: int, scale_rows: int):
+    def __init__(self, *, k: int, wire: bool, experts: int, scale_rows: int, scale_convention: str = "multiplier"):
+        self.divisor = scale_convention == "divisor"
         self.k, self.wire, self.experts = int(k), bool(wire), int(experts)
         # The scale operand whose input scales quantize these rows (gate: rows I, K = H).
         self.in_offset = nvfp4_input_scale_offset(experts, scale_rows, k)
@@ -94,7 +98,7 @@ class ChunkRowsA4:
             raise ValueError("K must be a multiple of 32")
 
     def key(self) -> tuple:
-        return ("chunk_rows_a4", 2, self.k, self.wire, self.experts, self.in_offset)
+        return ("chunk_rows_a4", 2, self.k, self.wire, self.experts, self.in_offset) + (("divisor",) if self.divisor else ())
 
     @cute.jit
     def __call__(self, src: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, scales: cute.Pointer,
@@ -124,7 +128,10 @@ class ChunkRowsA4:
             i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(r)
             if r < live:
                 source = _i32_at(Int64(pair_row.toint()), first + r)
-                gs = Float32(1.0) / _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
+                if const_expr(self.divisor):
+                    gs = _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
+                else:
+                    gs = Float32(1.0) / _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
                 groups = self.k // 16
                 for it in cutlass.range_constexpr(_ceil(groups, self.threads)):
                     grp = Int32(it * self.threads) + tidx
@@ -157,7 +164,9 @@ class ChunkSwiGLUA4:
     threads = 128
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0,
-                 activation: str = "silu_bf16_product", alpha: float | None = None, beta: float | None = None):
+                 activation: str = "silu_bf16_product", alpha: float | None = None, beta: float | None = None,
+                 scale_convention: str = "multiplier"):
+        self.divisor = scale_convention == "divisor"
         self.inter, self.experts, self.limit = int(inter), int(experts), float(limit)
         self.post_silu = activation == "silu_post_clamp_fp32_product"
         self.oai = activation == "swigluoai"
@@ -167,7 +176,7 @@ class ChunkSwiGLUA4:
     def key(self) -> tuple:
         return ("chunk_swiglu_a4", self.inter, self.experts, self.limit, self.in_offset) + (
             ("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (
-                ("swigluoai", self.alpha, self.beta) if self.oai else ())
+                ("swigluoai", self.alpha, self.beta) if self.oai else ()) + (("divisor",) if self.divisor else ())
 
     @cute.jit
     def __call__(self, g: cute.Pointer, u: cute.Pointer, meta: cute.Pointer, scales: cute.Pointer,
@@ -187,7 +196,10 @@ class ChunkSwiGLUA4:
         if (tile < _i32_at(Int64(meta.toint()), 1)) & (grp < Int32(groups)):
             e, first, live = _chunk(meta, self.experts, tile)
             if r < live:
-                gs = Float32(1.0) / _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
+                if const_expr(self.divisor):
+                    gs = _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
+                else:
+                    gs = Float32(1.0) / _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
                 at = (Int64(first + r) * Int64(self.inter) + Int64(grp) * Int64(16)) * Int64(2)
                 values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
                 for half in cutlass.range_constexpr(2):
@@ -230,7 +242,8 @@ class StreamNvfp4LinearA4:
     tile_n = 128
 
     def __init__(self, *, n: int, k: int, experts: int, tile_m: int = 128, tile_n: int = 128,
-                 live_min: int = 1, live_max: int = 128):
+                 live_min: int = 1, live_max: int = 128, scale_convention: str = "multiplier"):
+        self.divisor = scale_convention == "divisor"
         self.n, self.k, self.experts = int(n), int(k), int(experts)
         self.tile_m, self.tile_n = int(tile_m), int(tile_n)
         self.live_min, self.live_max = int(live_min), int(live_max)
@@ -265,7 +278,7 @@ class StreamNvfp4LinearA4:
 
     def key(self) -> tuple:
         return ("stream_linear_nvfp4_a4", 5, self.n, self.k, self.experts, self.k_block,
-                self.tile_m, self.tile_n, self.live_min, self.live_max)
+                self.tile_m, self.tile_n, self.live_min, self.live_max) + (("divisor",) if self.divisor else ())
 
     def _storage(self):
         class Storage:
@@ -402,8 +415,13 @@ class StreamNvfp4LinearA4:
                 as_rows = Int64(a_s.toint()) + Int64(tile) * Int64(STREAM_TILE_M) * Int64(self.k // 16)
                 w_rows = Int64(w.toint()) + (Int64(e) * Int64(self.n) + Int64(n0)) * Int64(self.k // 2)
                 s_rows = Int64(s.toint()) + (Int64(e) * Int64(self.n) + Int64(n0)) * Int64(self.k // 16)
-                factor = _ld_f32(Int64(s.toint()) + Int64(self.alpha_offset) + Int64(e) * Int64(4)) \
-                    * _ld_f32(Int64(s.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
+                if const_expr(self.divisor):
+                    factor = Float32(1.0)
+                    weight_global = _ld_f32(Int64(s.toint()) + Int64(self.alpha_offset) + Int64(e) * Int64(4))
+                    input_global = _ld_f32(Int64(s.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
+                else:
+                    factor = _ld_f32(Int64(s.toint()) + Int64(self.alpha_offset) + Int64(e) * Int64(4)) \
+                        * _ld_f32(Int64(s.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
                 self._load(0, ring, a_rows, as_rows, w_rows, s_rows, live, tidx)
                 if const_expr(self.blocks > 1):
                     self._load(1, ring, a_rows, as_rows, w_rows, s_rows, live, tidx)
@@ -437,6 +455,9 @@ class StreamNvfp4LinearA4:
                                 for nt in cutlass.range_constexpr(self.n_tiles):
                                     f = 4 * (self.n_tiles * mt + nt) + 2 * half
                                     col = n0 + warp_n * Int32(self.warp_cols) + Int32(8 * nt) + Int32(2) * c
+                                    if const_expr(self.divisor):
+                                        acc[f] = div_rn_f32(div_rn_f32(acc[f], weight_global), input_global)
+                                        acc[f + 1] = div_rn_f32(div_rn_f32(acc[f + 1], weight_global), input_global)
                                     st_global_u32(Int64(y.toint()) + (Int64(first + row) * Int64(self.n) + Int64(col))
                                                   * Int64(2), pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
 
@@ -484,9 +505,10 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
 
     def __init__(self, *, inter: int, hidden: int, experts: int, limit: float = 0.0, k_block: int | None = None,
                  stages: int = 2, tile_m: int = 128, tile_n: int = 128,
-                 live_min: int = 1, live_max: int = 128, activation: str = "silu_bf16_product", alpha: float | None = None, beta: float | None = None):
+                 live_min: int = 1, live_max: int = 128, activation: str = "silu_bf16_product", alpha: float | None = None, beta: float | None = None,
+                 scale_convention: str = "multiplier"):
         super().__init__(n=2 * int(inter), k=hidden, experts=experts, tile_m=tile_m, tile_n=tile_n,
-                         live_min=live_min, live_max=live_max)
+                         live_min=live_min, live_max=live_max, scale_convention=scale_convention)
         self.half_n = self.tile_n // 2
         self.x_stride = 2 * self.tile_n + 16
         self.inter, self.limit = int(inter), float(limit)
@@ -525,7 +547,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         return ("stream_gate_up_nvfp4_a4", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max) + (
                     ("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (
-                ("swigluoai", self.alpha, self.beta) if self.oai else ())
+                ("swigluoai", self.alpha, self.beta) if self.oai else ()) + (("divisor",) if self.divisor else ())
 
     def _storage(self):
         class Storage:
@@ -592,8 +614,13 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                 warp_n = warp_id % Int32(2)
                 # warp_n 0: gate columns (w1 / s1); 1: up columns (w3 / s3).
                 sp = cutlass.select_(warp_n == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
-                factor = _ld_f32(sp + Int64(self.alpha_offset) + Int64(e) * Int64(4)) \
-                    * _ld_f32(sp + Int64(self.in_offset) + Int64(e) * Int64(4))
+                if const_expr(self.divisor):
+                    factor = Float32(1.0)
+                    weight_global = _ld_f32(sp + Int64(self.alpha_offset) + Int64(e) * Int64(4))
+                    input_global = _ld_f32(sp + Int64(self.in_offset) + Int64(e) * Int64(4))
+                else:
+                    factor = _ld_f32(sp + Int64(self.alpha_offset) + Int64(e) * Int64(4)) \
+                        * _ld_f32(sp + Int64(self.in_offset) + Int64(e) * Int64(4))
                 active = warp_m * Int32(self.warp_rows) < live
                 q = lane // Int32(4)
                 c = lane % Int32(4)
@@ -624,10 +651,16 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                             for nt in cutlass.range_constexpr(self.n_tiles):
                                 f = 4 * (self.n_tiles * mt + nt) + 2 * half
                                 col = warp_n * Int32(self.warp_cols) + Int32(8 * nt) + Int32(2) * c
+                                if const_expr(self.divisor):
+                                    acc[f] = div_rn_f32(div_rn_f32(acc[f], weight_global), input_global)
+                                    acc[f + 1] = div_rn_f32(div_rn_f32(acc[f + 1], weight_global), input_global)
                                 st_shared_u32(ring + row * Int32(self.x_stride) + col * Int32(2),
                                               pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
                 cute.arch.sync_threads()
-                gs = Float32(1.0) / _ld_f32(Int64(s2.toint()) + Int64(self.down_in_offset) + Int64(e) * Int64(4))
+                if const_expr(self.divisor):
+                    gs = _ld_f32(Int64(s2.toint()) + Int64(self.down_in_offset) + Int64(e) * Int64(4))
+                else:
+                    gs = Float32(1.0) / _ld_f32(Int64(s2.toint()) + Int64(self.down_in_offset) + Int64(e) * Int64(4))
                 groups = self.half_n // 16
                 for it in cutlass.range_constexpr(_ceil(self.tile_m * groups, self.threads)):
                     gi = tidx + Int32(it * self.threads)
