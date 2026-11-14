@@ -393,7 +393,8 @@ def _launch_resources(run):
 
 
 def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
-                     warps_override=None, kmajor=False, output='bf16', resources=False):
+                     warps_override=None, kmajor=False, output='bf16', resources=False,
+                     scale_granularity='row128', expanded_fallback=False):
     """One actual shipped route; cross-source interleaving belongs to the caller."""
     import cutlass
     import torch
@@ -411,6 +412,8 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
         w = (torch.randn(n, k, generator=generator, device="cuda") * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
         s = torch.rand(n if per_row else (n + 127) // 128, k // 128,
                        generator=generator, device="cuda") * 2e-4 + 1e-4
+        if scale_granularity == 'channel':
+            s = s[:, :1].expand(s.shape[0], k // 128).contiguous()
         scale = s.t().contiguous() if route == "expanded" or kmajor else s
     else:
         x, w, s, scale = shared['x'], shared['w'], shared['s'], shared['scale']
@@ -454,7 +457,9 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
         op = TmaFp8Gemm(n, k, scales="row" if per_row else "block",
                         compute_warps=8, num_stages=3)
     else:
-        op = ExpandedW8Prefill(n, k)
+        op = ExpandedW8Prefill(n, k, out_dtype=cute_output,
+                              scale_granularity='row128' if expanded_fallback else scale_granularity,
+                              qualify_native=not expanded_fallback)
     out = (torch.empty(rows, n, device="cuda", dtype=torch_output)
            if shared is None else shared['out'])
     operands = [Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),
@@ -494,8 +499,8 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
                 kernel=type(selected_op if selected_op is not None else op).__name__,
                 native_scale=getattr(selected_op if selected_op is not None else op, 'native_scale', None),
                 subroute=subroute, resources=resource_info,
-                kmajor=kmajor, output_dtype=output,
-                median_read_us=median, min_read_us=best, us_per_row=median / rows,
+                kmajor=kmajor, output_dtype=output, scale_granularity=scale_granularity,
+                expanded_fallback=expanded_fallback, median_read_us=median, min_read_us=best, us_per_row=median / rows,
                 max_sample_row_rel_l2=float(relative.max()), digest=digest, prefix_exact=True)
 
 
@@ -542,7 +547,12 @@ def main():
                         help="time one dense route, with F64 sample and prefix checks")
     parser.add_argument("--source-root", type=Path,
                         help="import b12x from this read-only baseline/candidate source")
+    parser.add_argument('--scale-granularity', choices=('row128', 'channel'), default='row128')
+    parser.add_argument('--expanded-fallback', action='store_true',
+                        help='time master scaled-BF16 expansion on identical channel-scale inputs')
     args = parser.parse_args()
+    if (args.scale_granularity != 'row128' or args.expanded_fallback) and args.native_route != 'expanded':
+        parser.error('scale granularity and fallback overrides require expanded route')
     if args.resources and args.native_route is None:
         parser.error('--resources requires --native-route')
     if args.kmajor and not args.row_scales:
@@ -577,7 +587,9 @@ def main():
                                          args.row_scales, args.warps, args.kmajor, args.out_dtype, args.resources) if widths else
                        (run_native_route(spec, args.rows, args.native_route, args.samples, args.seed,
                                          args.row_scales, warps_override=args.warps,
-                                         kmajor=args.kmajor, output=args.out_dtype, resources=args.resources),))
+                                         kmajor=args.kmajor, output=args.out_dtype, resources=args.resources,
+                                         scale_granularity=args.scale_granularity,
+                                         expanded_fallback=args.expanded_fallback),))
             for rec in records:
                 rec.update(tag=args.tag, source_root=str(args.source_root))
                 print(json.dumps(rec), flush=True)

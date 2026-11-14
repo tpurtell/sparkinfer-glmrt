@@ -348,10 +348,10 @@ class _W8Run:
 class _ExpandedW8Run(_W8Run):
     """Expand the weight once for wide W8A16 prefill; retain W8A8 and narrow routes."""
 
-    def __init__(self, proj, n: int, k: int, out_dtype=cutlass.BFloat16):
+    def __init__(self, proj, n: int, k: int, out_dtype=cutlass.BFloat16, scale_granularity="row128"):
         super().__init__(proj)
         from ._glmf_prefill_w8 import ExpandedW8Prefill
-        self.expanded = ExpandedW8Prefill(n, k, out_dtype=out_dtype)
+        self.expanded = ExpandedW8Prefill(n, k, out_dtype=out_dtype, scale_granularity=scale_granularity)
 
     def key(self) -> tuple:
         return ("expanded_w8run", self.proj.key(), self.expanded.key())
@@ -741,7 +741,7 @@ class _KdaW8(_Kda):
 
     def __init__(self, g: GLMFGeometry, max_rows: int, prefill: bool, out_dtype=cutlass.BFloat16,
                  prefill_expanded: bool = False, output_kind: str = "projection", state_dtype: str = "float32",
-                 state_rounding: str = "window", seq_ctas: int = 1, decode_rows: int | None = None):
+                 state_rounding: str = "window", seq_ctas: int = 1, decode_rows: int | None = None, scale_granularity: str = "row128"):
         super().__init__(g, max_rows, False, state_dtype, state_rounding, decode=not prefill, seq_ctas=seq_ctas)
         self.output_norm = output_kind == "norm"
         prefill_rows = int(max_rows) if prefill else None
@@ -761,8 +761,8 @@ class _KdaW8(_Kda):
                                prefill_mask=2 if out_dtype == cutlass.BFloat16 else 0,
                                out_dtype=out_dtype, decode_rows=decode_rows))
         if prefill_expanded:
-            self.in_proj = _ExpandedW8Run(self.in_proj.proj, self.p, g.hidden)
-            self.o_proj = _ExpandedW8Run(self.o_proj.proj, g.hidden, self.d, out_dtype)
+            self.in_proj = _ExpandedW8Run(self.in_proj.proj, self.p, g.hidden, scale_granularity=scale_granularity)
+            self.o_proj = _ExpandedW8Run(self.o_proj.proj, g.hidden, self.d, out_dtype, scale_granularity)
 
     def key(self) -> tuple:
         return ("w8", self.prefill) + super().key()
@@ -792,7 +792,8 @@ class _KdaW8Prefill(_KdaW8):
 def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
                        output_dtype: str = "bfloat16", prefill_expanded: bool = False,
                        output_kind: str = "projection", state_dtype: str = "float32",
-                       state_rounding: str = "window", seq_ctas: int = 1) -> AotProgram:
+                       state_rounding: str = "window", seq_ctas: int = 1,
+                       scale_granularity: str = "row128") -> AotProgram:
     from ._fp8_weights import FP8_DECODE_ROWS
 
     prefill = _w8_mode(fp8_only)
@@ -810,7 +811,7 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
     cute_dtype, torch_dtype = types[output_dtype]
     launch = (_KdaW8Prefill if prefill else _KdaW8)(g, max_rows, prefill,
                                                 cute_dtype, prefill_expanded, output_kind,
-                                                state_dtype, state_rounding, seq_ctas)
+                                                state_dtype, state_rounding, seq_ctas, scale_granularity=scale_granularity)
     chunked = 0 if launch.chunked is None else launch.chunked.nbytes
     h, d, p, heads = g.hidden, g.kda_width, g.kda_in_width, g.kda_heads
     from ._fp8_weights import fp8_only_operands
@@ -846,6 +847,7 @@ def _compile_glmf_kda_w8(g: GLMFGeometry, max_rows: int, fp8_only: str,
         geometry={"hidden": h, "heads": heads, "head_dim": g.kda_head_dim, "max_rows": max_rows,
                   "in_width": p, "lower_bound": g.gate_lower_bound, "eps": g.norm_eps, "fp8_weights": "only",
                   "output_dtype": output_dtype, "output_kind": output_kind, "prefill_expanded": prefill_expanded,
+                  **({"scale_granularity": "channel"} if scale_granularity == "channel" else {}),
                   "decode_gemv_rows": FP8_DECODE_ROWS,
                   "chunked_min_rows": CHUNKED_MIN_ROWS if chunked else None,
                   **_state_geometry(state_dtype, state_rounding), **_replay_geometry(launch),
@@ -860,7 +862,7 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
                          prefill_expanded: bool = False, output_kind: str = "projection",
                          state_dtype: str = "float32", state_rounding: str = "window",
                          seq_ctas: int = 1, decode_tiles: bool = False, decode: bool = False,
-                         bf16_wide: bool = False) -> AotProgram:
+                         bf16_wide: bool = False, scale_granularity: str = "row128") -> AotProgram:
     """One shared KDA layer for GLMFGeometry or KDAGeometry.
 
     ``decode=True`` exposes BF16-only replay and the ``rows, spec`` scalars.
@@ -923,7 +925,7 @@ def compile_glmf_kda_aot(g: GLMFGeometry = GLM53_FLASH, *, max_rows: int, fp8=Fa
         if decode_tiles:
             raise ValueError("decode_tiles takes a decode KDA program over BF16 projections (fp8=True)")
         return _compile_glmf_kda_w8(g, max_rows, fp8_only, output_dtype, prefill_expanded, output_kind,
-                                    state_dtype, state_rounding, seq_ctas)
+                                    state_dtype, state_rounding, seq_ctas, scale_granularity)
     if output_dtype != "bfloat16" or prefill_expanded or output_kind not in ("projection", "norm"):
         raise ValueError("BF16 KDA supports projection or norm output, without prefill_expanded")
     fp8_on, prefill = _fp8_mode(fp8)
@@ -1746,10 +1748,12 @@ def compile_glmf_join_aot(half_width: int) -> AotProgram:
 
 
 def compile_glmf_kda_output_shard_aot(g_half: GLMFGeometry, *, max_rows: int,
-                                    fp8_only: str = "decode", prefill_expanded: bool = False) -> AotProgram:
+                                    fp8_only: str = "decode", prefill_expanded: bool = False,
+                                    scale_granularity: str = "row128") -> AotProgram:
     """Full K reduction for half the KDA output columns."""
     from ._glmf_output_shard import compile_glmf_kda_output_shard_aot as compile_shard
-    return compile_shard(g_half, max_rows=max_rows, fp8_only=fp8_only, prefill_expanded=prefill_expanded)
+    return compile_shard(g_half, max_rows=max_rows, fp8_only=fp8_only, prefill_expanded=prefill_expanded,
+                         scale_granularity=scale_granularity)
 
 
 def compile_glmf_join_rows_aot(width: int) -> AotProgram:
@@ -1759,10 +1763,12 @@ def compile_glmf_join_rows_aot(width: int) -> AotProgram:
 
 
 def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
-                                   fp8_only: str = "decode", prefill_expanded: bool = False) -> AotProgram:
+                                   fp8_only: str = "decode", prefill_expanded: bool = False,
+                                    scale_granularity: str = "row128") -> AotProgram:
     """Full KDA output for owned token rows; global rows determine math and scratch."""
     from ._glmf_output_rows import compile_glmf_kda_output_rows_aot as compile_rows
-    return compile_rows(g_half, max_rows=max_rows, fp8_only=fp8_only, prefill_expanded=prefill_expanded)
+    return compile_rows(g_half, max_rows=max_rows, fp8_only=fp8_only, prefill_expanded=prefill_expanded,
+                         scale_granularity=scale_granularity)
 
 
 def compile_glmf_mla_values_aot(g_half: GLMFGeometry, *, max_rows: int) -> AotProgram:

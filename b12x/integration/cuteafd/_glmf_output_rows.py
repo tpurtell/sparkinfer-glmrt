@@ -13,14 +13,14 @@ from .glmf import _check_rows, _ptr
 
 
 class GlmfOutputRows:
-    def __init__(self, n: int, k: int, max_rows: int, prefill: bool, expanded: bool):
+    def __init__(self, n: int, k: int, max_rows: int, prefill: bool, expanded: bool, scale_granularity: str = "row128"):
         self.prefill = bool(prefill)
         self.proj = Fp8Projection(n, k, prefill_rows=max_rows if prefill else None,
             row_scales=True, kmajor=True, warps=8, groups=2, prefill_mask=0)
         self.expanded = None
         if expanded:
             from ._glmf_prefill_w8 import ExpandedW8Prefill
-            self.expanded = ExpandedW8Prefill(n, k)
+            self.expanded = ExpandedW8Prefill(n, k, scale_granularity=scale_granularity)
 
     def key(self):
         return (self.proj.key(), None if self.expanded is None else self.expanded.key())
@@ -87,7 +87,8 @@ def compile_glmf_join_rows_aot(width: int):
 
 
 def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
-                                   fp8_only: str = "decode", prefill_expanded: bool = False):
+                                   fp8_only: str = "decode", prefill_expanded: bool = False,
+                                    scale_granularity: str = "row128"):
     """Full-N/full-K BF16 output for owned token rows over FP8 row128 weights.
 
     Decode always uses the 8-warp/2-group GEMV, at every width up to the
@@ -106,7 +107,7 @@ def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
     if prefill_expanded and not prefill:
         raise ValueError("expanded output rows requires prefill")
     n, k = g_half.hidden, 2 * g_half.kda_width
-    fn = GlmfOutputRows(n, k, max_rows, prefill, prefill_expanded)
+    fn = GlmfOutputRows(n, k, max_rows, prefill, prefill_expanded, scale_granularity)
     return compile_program(fn, name="glmf_kda_output_rows",
         operands=(Operand("x", torch.bfloat16, f"[owned_rows,{k}]"),
                   Operand("w_fp8", torch.float8_e4m3fn, f"[{n},{k}]"),
@@ -115,7 +116,7 @@ def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
                   Operand("scratch", torch.uint8, "[scratch_bytes]", "scratch")),
         scalars=(Scalar("owned_rows"), Scalar("total_rows")), key=(max_rows, fp8_only, fn.key()),
         geometry={"n": n, "k": k, "max_rows": max_rows, "fp8_only": fp8_only,
-                  "prefill_expanded": prefill_expanded, "decode_gemv_rows": FP8_DECODE_ROWS,
+                  "prefill_expanded": prefill_expanded, **({"scale_granularity": "channel"} if scale_granularity == "channel" else {}), "decode_gemv_rows": FP8_DECODE_ROWS,
                   "scratch_rows": "total_rows"},
         scratch={"scratch": lambda total_rows: n * k * 2 if prefill_expanded and total_rows >= 512 else 0},
         doc=compile_glmf_kda_output_rows_aot.__doc__)

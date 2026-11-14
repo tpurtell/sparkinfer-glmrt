@@ -129,3 +129,48 @@ def test_join_rows_preserves_bits_canaries_and_changed_input_graph(a_rows, b_row
     else:
         assert (guard == 0xA5).all()
     _guard(guard)
+
+
+@pytest.mark.parametrize('total', [512, 513])
+def test_channel_output_rows_exact_weight_graph_and_zero_owner(total):
+    require_b12x()
+    from b12x.integration.cuteafd import GLM53_FLASH, glmf
+    g = replace(GLM53_FLASH, kda_heads=32)
+    program = glmf.compile_glmf_kda_output_rows_aot(g, max_rows=4096,
+        fp8_only='prefill', prefill_expanded=True, scale_granularity='channel')
+    assert program.geometry['scale_granularity'] == 'channel'
+    owned, n, k = (total + 1) // 2, 4096, 8192
+    gen = torch.Generator(device='cuda').manual_seed(2068)
+    w = (torch.randn(n, k, device='cuda', generator=gen) * .5).to(torch.float8_e4m3fn)
+    channels = torch.rand(n, device='cuda', generator=gen) * .01 + .001
+    scales = channels.expand(k // 128, n).contiguous()
+    x = torch.randn(owned, k, device='cuda', generator=gen).bfloat16()
+    out, guard = _guarded(owned, n)
+    size = program.scratch_bytes(total)['scratch']
+    scratch = torch.full((size + 2048,), 0xA5, device='cuda', dtype=torch.uint8)
+    workspace = scratch[1024:-1024]
+    def run():
+        program.launch(x, w, scales, out, workspace, scalars=(owned, total))
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.mul_(1.125)
+    out.fill_(float('nan'))
+    workspace.fill_(0xA5)
+    graph.replay()
+    torch.cuda.synchronize()
+    sample = 128
+    weight = w[:sample].double() * channels[:sample, None].double()
+    if torch.cuda.get_device_capability() != (12, 0):
+        weight = weight.float().bfloat16().double()
+    expected = x.double() @ weight.T
+    error = (out[:, :sample].double() - expected).norm(dim=1) / expected.norm(dim=1)
+    assert float(error.max()) < .003
+    assert torch.isfinite(out).all() and out.abs().max() > 0
+    _guard(guard)
+    _guard(scratch)
+    before = scratch.clone()
+    program.launch(x, w, scales, out, workspace, scalars=(0, total))
+    torch.cuda.synchronize()
+    assert torch.equal(before, scratch)

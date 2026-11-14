@@ -240,6 +240,7 @@ class Bf16PrefillKernel:
         output: cute.Tensor,
         num_tokens: Int32,
         stream: cuda.CUstream,
+        channel_scales: cute.Pointer | None = None,
     ):
         if const_expr(source.element_type != cutlass.BFloat16):
             raise TypeError("source must be BFloat16")
@@ -281,6 +282,7 @@ class Bf16PrefillKernel:
             tiled_mma,
             SharedStorage,
             num_tokens,
+            channel_scales,
         ).launch(
             grid=(grid_m, self.n_tiles, 1),
             block=[self.num_threads, 1, 1],
@@ -301,6 +303,7 @@ class Bf16PrefillKernel:
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
         num_tokens: Int32,
+        channel_scales: cute.Pointer | None = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         m_tile, n_tile, _ = cute.arch.block_idx()
@@ -314,6 +317,18 @@ class Bf16PrefillKernel:
         storage = smem.allocate(SharedStorage)
         sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner)
         sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner)
+        if const_expr(channel_scales is not None):
+            # Publish one scale per column with the pipeline's existing CTA sync.
+            s_scales = smem.allocate_tensor(element_type=Float32,
+                layout=cute.make_layout((self.tile_n,)), byte_alignment=16)
+            for scale_index in cutlass.range_constexpr((self.tile_n + self.num_threads - 1) // self.num_threads):
+                scale_column = tidx + Int32(scale_index * self.num_threads)
+                if scale_column < Int32(self.tile_n):
+                    global_column = n_tile * Int32(self.tile_n) + scale_column
+                    if global_column < Int32(self.n):
+                        s_scales[scale_column] = channel_scales[Int64(global_column)]
+                    else:
+                        s_scales[scale_column] = Float32(0)
 
         tma_copy_bytes = (
             (self.tile_m + self.tile_n) * self.tile_k * cutlass.BFloat16.width // 8
@@ -502,15 +517,21 @@ class Bf16PrefillKernel:
                     column = n_tile * Int32(self.tile_n) + coord[1]
                     if token < num_tokens and column < Int32(self.n):
                         at = Int64(cute.crd2idx((Int64(token), Int64(column)), output.layout)) * Int64(2)
-                        st_global_u32(base + at, pack_f32x2_to_bfloat2(acc[2 * pair], acc[2 * pair + 1]))
+                        a, b = acc[2 * pair], acc[2 * pair + 1]
+                        if const_expr(channel_scales is not None):
+                            a = a * s_scales[coord[1]]
+                            b = b * s_scales[coord[1] + Int32(1)]
+                        st_global_u32(base + at, pack_f32x2_to_bfloat2(a, b))
             else:
                 for index in cutlass.range_constexpr(cute.size(acc)):
                     coord = coordinates[index]
                     token = m_tile * Int32(self.tile_m) + coord[0]
                     column = n_tile * Int32(self.tile_n) + coord[1]
                     if token < num_tokens and column < Int32(self.n):
-                        output[Int64(token), Int64(column)] = acc[index].to(
-                            output.element_type)
+                        value = acc[index]
+                        if const_expr(channel_scales is not None):
+                            value = value * s_scales[coord[1]]
+                        output[Int64(token), Int64(column)] = value.to(output.element_type)
 
         elif warp_idx == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(

@@ -1,24 +1,28 @@
-"""W8A16 prefill with one transient BF16 expansion per projection launch."""
+"""W8A16 prefill with one graph-owned BF16 weight expansion per launch."""
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass import Int32, Int64
 
 from b12x._lib.intrinsics import ld_global_nc_v2_u32, st_global_v4_u32
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, WIDE_PREFILL_CONFIG
-from ._fp8_weights import _e4m3x8_scaled_bf16
+from ._fp8_weights import _e4m3x4_bf16x2x2, _e4m3x8_scaled_bf16
 
 
 class ExpandRow128Weight:
-    """Expand row-major E4M3 with ``scale[K/128, N]`` into BF16 scratch."""
+    """Expand E4M3; channel scales stay separate until the MMA epilogue."""
 
     threads = 256
     elements = 2048
 
-    def __init__(self, n: int, k: int):
+    def __init__(self, n: int, k: int, *, scale_granularity: str = "row128"):
         self.n, self.k = int(n), int(k)
         if self.k % 128:
             raise ValueError("row128 expansion requires K % 128 == 0")
+        if scale_granularity not in ("row128", "channel"):
+            raise ValueError("scale_granularity must be row128 or channel")
+        self.channel = scale_granularity == "channel"
 
     @cute.jit
     def __call__(self, weight: cute.Pointer, scales: cute.Pointer, out: cute.Pointer, stream: cuda.CUstream):
@@ -30,31 +34,59 @@ class ExpandRow128Weight:
     def kernel(self, weight: cute.Pointer, scales: cute.Pointer, out: cute.Pointer):
         at = Int64(cute.arch.block_idx()[0]) * Int64(self.elements) + Int64(cute.arch.thread_idx()[0]) * Int64(8)
         if at < Int64(self.n * self.k):
-            row, kb = at // Int64(self.k), (at % Int64(self.k)) // Int64(128)
-            scale = scales[kb * Int64(self.n) + row]
-            lo, hi = ld_global_nc_v2_u32(Int64(weight.toint()) + at)
-            words = _e4m3x8_scaled_bf16(lo, hi, scale)
-            st_global_v4_u32(Int64(out.toint()) + at * Int64(2), *words)
+            if cutlass.const_expr(self.channel):
+                lo, hi = ld_global_nc_v2_u32(Int64(weight.toint()) + at)
+                a, b = _e4m3x4_bf16x2x2(lo)
+                c, d = _e4m3x4_bf16x2x2(hi)
+                st_global_v4_u32(Int64(out.toint()) + at * Int64(2), a, b, c, d)
+            else:
+                # Interim Row128 fallback: full-fragment native scaling regressed
+                # both architectures; channel-only epilogue scaling is not valid here.
+                row, kb = at // Int64(self.k), (at % Int64(self.k)) // Int64(128)
+                scale = scales[kb * Int64(self.n) + row]
+                lo, hi = ld_global_nc_v2_u32(Int64(weight.toint()) + at)
+                words = _e4m3x8_scaled_bf16(lo, hi, scale)
+                st_global_v4_u32(Int64(out.toint()) + at * Int64(2), *words)
+
+
+def native_channel_prefill(n: int, k: int, scale_granularity: str, out_dtype) -> bool:
+    """Measured opt-in descriptor; no tensor-content or live-row inference."""
+    return (scale_granularity == "channel" and out_dtype == cutlass.BFloat16
+            and (int(n), int(k)) in ((12576, 4096), (4096, 4096), (4096, 8192))
+            and tuple(torch.cuda.get_device_capability()) == (12, 0))
 
 
 class ExpandedW8Prefill:
-    """Expand once in graph-owned scratch, then reuse across all row tiles.
+    """Reuse one transient weight arena; explicit channel scales apply once in F32.
 
-    Interim scaled-BF16 fallback: native K128 full-fragment accumulation regressed
-    this opt-in route. Preserve channel-vs-row128 metadata before specializing the
-    epilogue or a lower-pressure native row128 kernel (cuteafd#2068).
+    Row128 keeps the marked scaled-BF16 fallback (cuteafd#2068). Channel must
+    come from checkpoint/conversion metadata, never inferred from scale layout.
+    Program geometry omits scale_granularity for Row128 (the schema default);
+    only explicit Channel siblings emit scale_granularity="channel".
     """
 
-    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16):
+    def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16,
+                 scale_granularity: str = "row128", qualify_native: bool = False):
         self.n, self.k = int(n), int(k)
-        self.expand = ExpandRow128Weight(n, k)
+        self.scale_granularity = scale_granularity
+        self.native_scale = (scale_granularity == "channel" and (qualify_native or
+            native_channel_prefill(n, k, scale_granularity, out_dtype)))
+        self.expand = ExpandRow128Weight(n, k,
+            scale_granularity="channel" if self.native_scale else "row128")
         self.projection = TmaBf16Projection(n, k, out_dtype=out_dtype, **WIDE_PREFILL_CONFIG)
 
     def key(self):
-        return (self.n, self.k, str(self.projection.out_dtype), tuple(sorted(self.projection.config.items())))
+        return (self.n, self.k, self.scale_granularity, self.native_scale, str(self.projection.out_dtype),
+                tuple(sorted(self.projection.config.items())))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, scales: cute.Pointer, out: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
         self.expand(weight, scales, scratch, stream)
-        self.projection(x, scratch, out, rows, stream)
+        if cutlass.const_expr(self.native_scale):
+            xt = cute.make_tensor(x, cute.make_layout((rows, self.k), stride=(self.k, 1)))
+            wt = cute.make_tensor(scratch, cute.make_layout((self.n, self.k), stride=(self.k, 1)))
+            ot = cute.make_tensor(out, cute.make_layout((rows, self.n), stride=(self.n, 1)))
+            self.projection.kernel(xt, wt, ot, rows, stream, scales)
+        else:
+            self.projection(x, scratch, out, rows, stream)
