@@ -458,7 +458,8 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
                         compute_warps=8, num_stages=3)
     else:
         op = ExpandedW8Prefill(n, k, out_dtype=cute_output,
-                              scale_granularity='row128' if expanded_fallback else scale_granularity)
+                              scale_granularity='row128' if expanded_fallback else scale_granularity,
+                              qualify_native=not expanded_fallback)
     out = (torch.empty(rows, n, device="cuda", dtype=torch_output)
            if shared is None else shared['out'])
     operands = [Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),

@@ -42,13 +42,13 @@ class GlmfJoin:
 
 
 class GlmfOutputShard:
-    def __init__(self, n: int, k: int, max_rows: int, prefill: bool, expanded: bool):
+    def __init__(self, n: int, k: int, max_rows: int, prefill: bool, expanded: bool, scale_granularity: str = "row128"):
         self.proj = Fp8Projection(n, k, prefill_rows=max_rows if prefill else None,
             row_scales=True, kmajor=True, warps=8, groups=2, prefill_mask=0)
         self.expanded = None
         if expanded:
             from ._glmf_prefill_w8 import ExpandedW8Prefill
-            self.expanded = ExpandedW8Prefill(n, k)
+            self.expanded = ExpandedW8Prefill(n, k, scale_granularity=scale_granularity)
 
     def key(self):
         return (self.proj.key(), None if self.expanded is None else self.expanded.key())
@@ -78,7 +78,8 @@ def compile_glmf_join_aot(half_width: int):
 
 
 def compile_glmf_kda_output_shard_aot(g_half: GLMFGeometry = GLM53_FLASH, *, max_rows: int,
-                                    fp8_only: str = "decode", prefill_expanded: bool = False):
+                                    fp8_only: str = "decode", prefill_expanded: bool = False,
+                                    scale_granularity: str = "row128"):
     """Full K reduction for half the output columns, over FP8 row128 weights."""
     max_rows = _check_rows(max_rows)
     if fp8_only not in ("decode", "prefill"):
@@ -89,7 +90,7 @@ def compile_glmf_kda_output_shard_aot(g_half: GLMFGeometry = GLM53_FLASH, *, max
     if prefill_expanded and not prefill:
         raise ValueError("expanded output shard requires prefill")
     n, k = g_half.hidden // 2, 2 * g_half.kda_width
-    fn = GlmfOutputShard(n, k, max_rows, prefill, prefill_expanded)
+    fn = GlmfOutputShard(n, k, max_rows, prefill, prefill_expanded, scale_granularity)
     return compile_program(fn, name="glmf_kda_output_shard",
         operands=(Operand("x", torch.bfloat16, f"[rows,{k}]"),
                   Operand("w_fp8", torch.float8_e4m3fn, f"[{n},{k}]"),
@@ -98,6 +99,6 @@ def compile_glmf_kda_output_shard_aot(g_half: GLMFGeometry = GLM53_FLASH, *, max
                   Operand("scratch", torch.uint8, "[scratch_bytes]", "scratch")),
         scalars=(Scalar("rows"),), key=(max_rows, fp8_only, fn.key()),
         geometry={"n": n, "k": k, "max_rows": max_rows, "fp8_only": fp8_only,
-                  "prefill_expanded": prefill_expanded, "decode_gemv_rows": FP8_DECODE_ROWS},
+                  "prefill_expanded": prefill_expanded, "scale_granularity": scale_granularity, "decode_gemv_rows": FP8_DECODE_ROWS},
         scratch={"scratch": lambda rows: n * k * 2 if prefill_expanded and rows >= 512 else 0},
         doc=compile_glmf_kda_output_shard_aot.__doc__)

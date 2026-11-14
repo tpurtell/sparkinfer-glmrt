@@ -2,6 +2,7 @@
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass import Int32, Int64
 
 from b12x._lib.intrinsics import ld_global_nc_v2_u32, st_global_v4_u32
@@ -47,6 +48,13 @@ class ExpandRow128Weight:
                 st_global_v4_u32(Int64(out.toint()) + at * Int64(2), *words)
 
 
+def native_channel_prefill(n: int, k: int, scale_granularity: str, out_dtype) -> bool:
+    """Measured opt-in descriptor; no tensor-content or live-row inference."""
+    return (scale_granularity == "channel" and out_dtype == cutlass.BFloat16
+            and (int(n), int(k)) in ((12576, 4096), (4096, 4096), (4096, 8192))
+            and tuple(torch.cuda.get_device_capability()) == (12, 0))
+
+
 class ExpandedW8Prefill:
     """Reuse one transient weight arena; explicit channel scales apply once in F32.
 
@@ -55,15 +63,17 @@ class ExpandedW8Prefill:
     """
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16,
-                 scale_granularity: str = "row128"):
+                 scale_granularity: str = "row128", qualify_native: bool = False):
         self.n, self.k = int(n), int(k)
-        self.expand = ExpandRow128Weight(n, k, scale_granularity=scale_granularity)
         self.scale_granularity = scale_granularity
-        self.native_scale = self.expand.channel
+        self.native_scale = (scale_granularity == "channel" and (qualify_native or
+            native_channel_prefill(n, k, scale_granularity, out_dtype)))
+        self.expand = ExpandRow128Weight(n, k,
+            scale_granularity="channel" if self.native_scale else "row128")
         self.projection = TmaBf16Projection(n, k, out_dtype=out_dtype, **WIDE_PREFILL_CONFIG)
 
     def key(self):
-        return (self.n, self.k, self.scale_granularity, str(self.projection.out_dtype),
+        return (self.n, self.k, self.scale_granularity, self.native_scale, str(self.projection.out_dtype),
                 tuple(sorted(self.projection.config.items())))
 
     @cute.jit

@@ -223,6 +223,18 @@ def test_fp8_projection_decode_native(rows):
         _assert_native_projection(a, expected)
 
 
+@pytest.mark.parametrize("cc", [(12, 0), (12, 1), (10, 0)])
+@pytest.mark.parametrize("shape", [(12576, 4096), (4096, 4096), (4096, 8192), (4096, 16384)])
+def test_expanded_channel_descriptor_scope(monkeypatch, cc, shape):
+    import cutlass
+    from b12x.integration.cuteafd._glmf_prefill_w8 import native_channel_prefill
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: cc)
+    expected = cc == (12, 0) and shape != (4096, 16384)
+    assert native_channel_prefill(*shape, "channel", cutlass.BFloat16) == expected
+    assert not native_channel_prefill(*shape, "row128", cutlass.BFloat16)
+    assert not native_channel_prefill(*shape, "channel", cutlass.Float32)
+
+
 def _assert_native_projection(out, expected):
     actual = out.double()
     relative = (actual - expected).norm(dim=1) / expected.norm(dim=1).clamp_min(1e-30)
@@ -262,7 +274,8 @@ def test_native_dense_scale_f64(route, rows, scales):
     elif route == "tma":
         launch = TmaFp8Gemm(n, k, scales=scales, **kwargs)
     else:
-        launch = ExpandedW8Prefill(n, k, scale_granularity="channel" if scales == "channel" else "row128", **kwargs)
+        launch = ExpandedW8Prefill(n, k, scale_granularity="channel" if scales == "channel" else "row128",
+                                  qualify_native=True, **kwargs)
     operands = [Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),
                 Operand("s", torch.float32, "s", align=16), Operand("o", torch.float32, "o", "out")]
     args = [x, w, scale, out]
