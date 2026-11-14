@@ -317,6 +317,18 @@ class Bf16PrefillKernel:
         storage = smem.allocate(SharedStorage)
         sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner)
         sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner)
+        if const_expr(channel_scales is not None):
+            # Publish one scale per column with the pipeline's existing CTA sync.
+            s_scales = smem.allocate_tensor(element_type=Float32,
+                layout=cute.make_layout((self.tile_n,)), byte_alignment=16)
+            for index in cutlass.range_constexpr((self.tile_n + self.num_threads - 1) // self.num_threads):
+                column = tidx + Int32(index * self.num_threads)
+                if column < Int32(self.tile_n):
+                    global_column = n_tile * Int32(self.tile_n) + column
+                    if global_column < Int32(self.n):
+                        s_scales[column] = channel_scales[Int64(global_column)]
+                    else:
+                        s_scales[column] = Float32(0)
 
         tma_copy_bytes = (
             (self.tile_m + self.tile_n) * self.tile_k * cutlass.BFloat16.width // 8
@@ -507,8 +519,8 @@ class Bf16PrefillKernel:
                         at = Int64(cute.crd2idx((Int64(token), Int64(column)), output.layout)) * Int64(2)
                         a, b = acc[2 * pair], acc[2 * pair + 1]
                         if const_expr(channel_scales is not None):
-                            a = a * channel_scales[Int64(column)]
-                            b = b * channel_scales[Int64(column) + Int64(1)]
+                            a = a * s_scales[coord[1]]
+                            b = b * s_scales[coord[1] + Int32(1)]
                         st_global_u32(base + at, pack_f32x2_to_bfloat2(a, b))
             else:
                 for index in cutlass.range_constexpr(cute.size(acc)):
@@ -518,7 +530,7 @@ class Bf16PrefillKernel:
                     if token < num_tokens and column < Int32(self.n):
                         value = acc[index]
                         if const_expr(channel_scales is not None):
-                            value = value * channel_scales[Int64(column)]
+                            value = value * s_scales[coord[1]]
                         output[Int64(token), Int64(column)] = value.to(output.element_type)
 
         elif warp_idx == Int32(self.producer_warp):
