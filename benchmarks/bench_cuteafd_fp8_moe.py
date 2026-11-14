@@ -1439,9 +1439,12 @@ def mxfp4_unify_screen(g, args, geometry_type):
                         program.launch(*buffers, scalars=(live,))
                     return execute
                 execute = bind(buffers)
+                crosses_routes = (control_route == "auto" and capacity > auto_large_rows(
+                    True, geometry.kind, args.prefill, geometry=geometry))
                 control_qualification[label] = qualify_pair_replay(
                     execute, ids, output, [scratch], buffers, lambda live: output[:live],
-                    strict_prefix=True)
+                    strict_prefix=not crosses_routes)
+                control_qualification[label]["auto_route_switch"] = crosses_routes
                 executions[label] = execute
                 runs[label] = lambda execute=execute: execute(rows)
                 outputs[label] = output[:rows]

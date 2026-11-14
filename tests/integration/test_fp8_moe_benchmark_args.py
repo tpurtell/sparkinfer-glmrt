@@ -1089,6 +1089,15 @@ def test_shipped_decode_recipe_uses_device_capacity_policy(monkeypatch, capacity
     assert calls == [(5120, 384, 121, capacity, 128)]
 
 
+def test_unified_auto_route_switch_records_cross_route_prefix_without_relaxing_forced_routes():
+    screen = next(node for node in ast.parse(_PATH.read_text()).body
+                  if isinstance(node, ast.FunctionDef) and node.name == "mxfp4_unify_screen")
+    source = ast.unparse(screen)
+    assert "control_route == 'auto' and capacity > auto_large_rows" in source
+    assert "strict_prefix=not crosses_routes" in source
+    assert "['auto_route_switch'] = crosses_routes" in source
+
+
 def test_tensor_payload_hash_matches_concatenation_for_noncontiguous_inputs():
     import hashlib
     tensors = [torch.arange(24, dtype=torch.uint8).reshape(4, 6).T,
