@@ -556,8 +556,14 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     report["down"] = down
     assert down["ulp"] <= 1.0 + 1e-6 and down["ulp_large"] <= 1.0 + 1e-6, \
         f"down vs F64 down: {down['ulp']:.3f} ulp (large elements {down['ulp_large']:.3f}), max|d| {down['abs']:.3e} at |v| {down['abs_at']:.3e}; worst-ulp element kernel {down['ulp_pair'][0]:.9e} oracle {down['ulp_pair'][1]:.9e}"
-    ysum = torch.zeros(rows, h, dtype=torch.float32, device=dev).index_add_(0, torch.arange(pairs, device=dev) // k, y_k)
-    assert torch.equal(t["out"], ysum.bfloat16()), "combine differs from the F32 slot sum of the kernel's own y rows"
+    # MoeCombine accumulates each row's slots in slot order in F32 (acc += y[slot], no weights). Mirror that
+    # order: a device index_add_ leaves the order of repeated indices unspecified, and an F32 sum of eight
+    # BF16 values depends on it in the last bit.
+    ysum = torch.zeros(rows, h, dtype=torch.float32, device=dev)
+    for slot in range(k):
+        ysum = ysum + y_k[slot::k]
+    combine_differs = int((t["out"] != ysum.bfloat16()).sum())
+    assert combine_differs == 0, f"combine differs from the slot-order F32 sum of the kernel's own y rows on {combine_differs} elements"
     # (3) gate: kernel exchange -> oracle act-quant -> F64 down -> sum vs the route's output.
     out_f = t["out"].float()
     ref3 = o3.float().bfloat16().float()
