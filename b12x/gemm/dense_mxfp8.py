@@ -20,6 +20,8 @@ from b12x._lib.intrinsics import (
     ld_global_nc_u8,
     ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
+    ld_shared_f32,
+    st_shared_f32,
     ldmatrix_m8n8x4_b16,
     mxfp8_mma_m16n8k32_f32_e4m3,
     packed_dequant_trellis_to_half2x4,
@@ -451,7 +453,10 @@ class NativeMxfp8Decode:
     M256 rows and require no weight staging or CTA-wide barriers.
     """
 
-    def __init__(self, g):
+    def __init__(self, g, *, k_warps=1):
+        if k_warps not in (1, 4):
+            raise ValueError("native MXFP8 decode K warps must be 1 or 4")
+        self.k_warps = k_warps
         if g["encoding"] != "mxfp8":
             raise ValueError("native MXFP8 decode requires group32 weights")
         self.k, self.n = g["input_features"], g["output_features"]
@@ -528,6 +533,55 @@ class NativeMxfp8Decode:
                 st_global_v2_f32(address + Int64(8 * self.n * 4), total[2], total[3])
             task += step
 
+    @cute.kernel
+    def split_decode(self, payload: cute.Tensor, scales: cute.Tensor,
+                     records: cute.Tensor, output: cute.Tensor, rows: Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        tid, task, step = Int32(tid), Int32(task), Int32(step)
+        lane, warp = tid & Int32(31), tid >> Int32(5)
+        ntiles = Int32(self.n // 8)
+        total_tasks = ((rows + Int32(15)) // Int32(16)) * ntiles
+        wbase, sbase = payload.iterator.toint(), scales.iterator.toint()
+        abase, obase = records.iterator.toint(), output.iterator.toint()
+        storage = cutlass_utils.SmemAllocator().allocate_tensor(Float32,
+            cute.make_layout((self.k // 128, 32, 4)))
+        partial = shared_ptr_to_u32(storage.iterator)
+        srow = (lane >> Int32(2)) + (lane & Int32(1)) * Int32(8)
+        while task < total_tasks:
+            nb, mb = task % ntiles, task // ntiles
+            col = nb * Int32(8) + (lane >> Int32(2))
+            for kb in cutlass.range(warp, self.k // 128, 4, unroll=1):
+                values = self._block(wbase, sbase, abase, mb, col, kb, lane, srow)
+                acc = cute.make_rmem_tensor((4,), Float32)
+                acc.fill(Float32(0))
+                for k32 in cutlass.range_constexpr(4):
+                    d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                        acc[0], acc[1], acc[2], acc[3], values[k32, 0], values[k32, 1],
+                        values[k32, 2], values[k32, 3], values[k32, 5], values[k32, 6],
+                        values[k32, 4], values[k32, 7])
+                    acc[0], acc[1], acc[2], acc[3] = d0, d1, d2, d3
+                for i in cutlass.range_constexpr(4):
+                    st_shared_f32(partial + (kb * Int32(128) + lane * Int32(4) + Int32(i)) * Int32(4), acc[i])
+            cute.arch.sync_threads()
+            if warp == Int32(0):
+                total = cute.make_rmem_tensor((4,), Float32)
+                total.fill(Float32(0))
+                for kb in cutlass.range(self.k // 128, unroll=1):
+                    for i in cutlass.range_constexpr(4):
+                        total[i] = total[i] + ld_shared_f32(partial
+                            + (kb * Int32(128) + lane * Int32(4) + Int32(i)) * Int32(4))
+                row = mb * Int32(16) + (lane >> Int32(2))
+                col = nb * Int32(8) + (lane & Int32(3)) * Int32(2)
+                address = obase + (row.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
+                if row < rows:
+                    st_global_v2_f32(address, total[0], total[1])
+                if row + Int32(8) < rows:
+                    st_global_v2_f32(address + Int64(8 * self.n * 4), total[2], total[3])
+            cute.arch.sync_threads()
+            task += step
+
     @cute.jit
     def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
                  scales: cute.Pointer, records: cute.Pointer, output: cute.Pointer,
@@ -538,6 +592,11 @@ class NativeMxfp8Decode:
                 and cta_limit > Int32(0)):
             layout = cute.make_layout(1, stride=1)
             tasks = ((rows + Int32(15)) // Int32(16)) * Int32(self.n // 8)
-            self.decode(cute.make_tensor(payload, layout), cute.make_tensor(scales, layout),
-                        cute.make_tensor(records, layout), cute.make_tensor(output, layout), rows).launch(
-                grid=(min(tasks, cta_limit), 1, 1), block=(32, 1, 1), stream=stream)
+            if cutlass.const_expr(self.k_warps == 4):
+                self.split_decode(cute.make_tensor(payload, layout), cute.make_tensor(scales, layout),
+                    cute.make_tensor(records, layout), cute.make_tensor(output, layout), rows).launch(
+                    grid=(min(tasks, cta_limit), 1, 1), block=(128, 1, 1), stream=stream)
+            else:
+                self.decode(cute.make_tensor(payload, layout), cute.make_tensor(scales, layout),
+                    cute.make_tensor(records, layout), cute.make_tensor(output, layout), rows).launch(
+                    grid=(min(tasks, cta_limit), 1, 1), block=(32, 1, 1), stream=stream)
