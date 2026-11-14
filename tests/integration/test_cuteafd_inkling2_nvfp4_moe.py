@@ -152,9 +152,10 @@ def quantize_rows(x: torch.Tensor, encoder: float = 1536.0):
     s = torch.where(zero, torch.zeros_like(s), s)
     codes = torch.bucketize(q.abs(), E2M1.to(q.device, q.dtype), right=False)
     codes = torch.where(q.abs() == 0, torch.zeros_like(codes), codes)
-    # Sign nibble as cvt.rn.satfinite.e2m1x2 emits it: a negative value that rounds to zero keeps
-    # its sign (0x8, decoding to -0), so byte-level probes against the kernel are exact.
-    negative = (q < 0) | ((q == 0) & (blocks < 0))
+    # Sign nibble as cvt.rn.satfinite.e2m1x2 emits it: the sign bit of the scaled input, so a negative value
+    # that rounds to zero and a -0.0 input (SiTU underflow in act rows) both keep 0x8, decoding to -0. A block
+    # that is all zeros is the kernel's canonical zero block (payload 0, scale 0): the same values.
+    negative = torch.signbit(blocks) & ~zero
     codes = codes.clamp(max=7) | torch.where(negative, 8, 0)
     packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8).reshape(rows, k // 2)
     exact = (q * s).reshape(rows, k)
@@ -518,8 +519,13 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
         report[f"{name}_nontie_mismatch"] = int((block_differs & ~tie).sum())
         report[f"{name}_tie_mismatch"] = int((block_differs & tie).sum())
         assert torch.equal(amax_k, amax_o), f"{name} quantizer: row amax differs from the oracle"
-        assert report[f"{name}_nontie_mismatch"] == 0, \
-            f"{name} quantizer differs from the oracle on {report[f'{name}_nontie_mismatch']} non-tie blocks (scale byte or packed codes)"
+        if report[f"{name}_nontie_mismatch"]:
+            # What kind: scale bytes, code magnitudes, or only the sign nibble of zero codes (the same values).
+            pk, po = packed_k.long(), packed_o.long()
+            magnitude = (((pk ^ po) & 0x77) != 0).reshape(*scales_o.shape, 8).any(-1)
+            detail = (f"scale bytes {int(((scales_k != scales_o) & ~tie).sum())}, code magnitudes {int((magnitude & ~tie).sum())}, "
+                      f"sign nibbles only {int((block_differs & ~tie & ~magnitude & (scales_k == scales_o)).sum())}")
+            raise AssertionError(f"{name} quantizer differs from the oracle on {report[f'{name}_nontie_mismatch']} non-tie blocks: {detail}")
         assert report[f"{name}_tie_mismatch"] == 0, \
             f"{name} quantizer resolves {report[f'{name}_tie_mismatch']} of {report[f'{name}_ties']} tie blocks differently from the vendor arithmetic"
 
