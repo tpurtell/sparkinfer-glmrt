@@ -40,6 +40,37 @@ def test_gemm_abi(monkeypatch, encoding, n, side):
     assert core.scratch_bytes == dense.record_bytes(4096,2048)
 
 
+def test_native_decode_cutovers_preserve_abi_and_capacity_only_keys(monkeypatch):
+    monkeypatch.setattr(dense, "compile_program", lambda launch, **kw: (launch, kw))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
+    expected = {(6144, 8192): 32, (6144, 512): 64, (6144, 128): 64,
+        (8192, 6144): 32, (6144, 3072): 64, (3072, 6144): 32,
+        (6144, 12288): 32, (12288, 6144): 32, (6144, 4096): 64,
+        (6144, 256): 64, (4096, 6144): 64, (6144, 1536): 64,
+        (1536, 6144): 32, (6144, 6144): 32}
+    assert dense.NATIVE_DECODE_ROWS == expected
+    for (k, n), threshold in expected.items():
+        args = dict(input_features=k, output_features=n, encoding="mxfp8",
+            input_dtype="bf16", rotation_count=1)
+        prefill, old = dense.compile_dense_mxfp8_aot(**args)
+        routed, new = dense.compile_dense_mxfp8_aot(**args, decode="auto")
+        assert routed.decode_rows == threshold
+        assert routed.scratch_bytes == prefill.scratch_bytes
+        for field in ("name", "operands", "scalars", "geometry"):
+            assert new[field] == old[field]
+        assert new["key"] != old["key"]
+    routed, _ = dense.compile_dense_mxfp8_aot(input_features=128, output_features=32,
+        encoding="mxfp8", decode="auto")
+    assert routed.decode_rows == 0
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 1))
+    routed, _ = dense.compile_dense_mxfp8_aot(input_features=6144, output_features=8192,
+        encoding="mxfp8", decode="auto")
+    assert routed.decode_rows == 0
+    for mode in (True, "auto"):
+        with pytest.raises(ValueError, match="group32 weights"):
+            dense.compile_dense_mxfp8_aot(input_features=128, output_features=128, decode=mode)
+
+
 @pytest.mark.parametrize("kwargs", [dict(input_features=127),dict(input_features=128,max_rows=0),
     dict(input_features=128,output_features=33),dict(input_features=128,encoding="fp8_row"),dict(input_features=128,encoding="int4_g32"),
     dict(input_features=128,output_features=64),dict(input_features=128,input_dtype="f32")])
