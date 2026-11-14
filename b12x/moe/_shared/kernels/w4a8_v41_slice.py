@@ -71,6 +71,30 @@ from b12x.moe._shared.kernels.w4a8_staging import (
 )
 
 
+def v41_compact_decode_pipeline_qualified(
+    *, scale_codes, hidden, intermediate, activation_precision, capacity,
+    compute_capability=None,
+):
+    """Qualification selector for the measured two-stage V4.1 decode cells.
+
+    The overlapped weight staging is qualified only for the shipped V4.1
+    compact-scale decode recipe on SM121: hidden 5120, per-rank intermediate
+    384 or 768, compact scale codes, A8 activations and planned capacity at
+    most 80. The compute capability is queried from the compilation target
+    (the offline compiler supplies its own), never from an environment knob
+    or a hard-coded device count. Every other recipe keeps the single-slot
+    schedule, so its program is unchanged.
+    """
+    if not (scale_codes and activation_precision == "a8" and capacity <= 80
+            and hidden == 5120 and intermediate in (384, 768)):
+        return False
+    if compute_capability is None:
+        from b12x._lib.gating import get_compute_capability
+
+        compute_capability = get_compute_capability()
+    return compute_capability is not None and tuple(compute_capability) == (12, 1)
+
+
 class V41FusedSliceKernel:
     def __init__(self, width, *, grouped=False, atomic_tokens=False, intermediate=576, hidden=5120,
                  exact_storage=False, fc2_n_splits=1, scale_codes=False):
@@ -520,9 +544,15 @@ class V41SliceFc1Kernel:
         slot_bytes = fc1_k_splits * (width * 128 + max(width * 2, 256) * 4)
         # Two-stage weight staging keeps the next K tile's copies in flight
         # while the current tile's MMAs run. Arithmetic, copy order and the K
-        # accumulation order are unchanged; configurations where the second
-        # slot would exceed the established budget keep the single slot.
-        self.two_stage = capacity <= 80 and 2 * slot_bytes + 64 * width <= 96 * 1024
+        # accumulation order are unchanged. The qualification-only selector
+        # enables the measured V4.1 compact-code SM121 decode recipe; every
+        # other recipe keeps the single slot, so prefill and other cards
+        # compile unchanged programs, and the shared budget still applies.
+        self.two_stage = (
+            v41_compact_decode_pipeline_qualified(
+                scale_codes=scale_codes, hidden=hidden, intermediate=intermediate,
+                activation_precision="a8", capacity=capacity)
+            and 2 * slot_bytes + 64 * width <= 96 * 1024)
         self.shared_bytes = ((2 if self.two_stage else 1) * slot_bytes + 64 * width)
         assert self.shared_bytes <= 96 * 1024, "FC1 split exceeds shared-memory budget"
         self.width = width
@@ -914,11 +944,13 @@ class V41SliceFc2Kernel:
         self.intermediate = intermediate
         self.exact_storage = bool(exact_storage)
         self.scale_codes = bool(scale_codes)
-        # One N128 output tile's K slice is staged at a time; at decode
-        # capacity a second small weight slot lets the next slice's copies run
-        # under the current slice's MMAs without changing slice or K order.
-        # Prefill keeps the original single slot.
-        self.two_stage = capacity <= 80
+        # One N128 output tile's K slice is staged at a time; for the measured
+        # V4.1 compact-code SM121 decode recipe a second small weight slot lets
+        # the next slice's copies run under the current slice's MMAs without
+        # changing slice or K order. Other recipes keep the single slot.
+        self.two_stage = v41_compact_decode_pipeline_qualified(
+            scale_codes=scale_codes, hidden=hidden, intermediate=intermediate,
+            activation_precision="a8", capacity=capacity)
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.w2_intermediate = self.kernel_intermediate
         self.w2_scale_columns = intermediate // 32
