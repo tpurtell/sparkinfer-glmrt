@@ -1057,3 +1057,28 @@ def test_bounded_decode_occupancy_recipe_is_explicit():
         assert recipe == dict(tile=32, k_splits=1, cta_splits=cta, fc2_n_splits=32)
     with pytest.raises(ValueError):
         bench.decode_occupancy_recipe(4096, 256, 8, 0)
+
+
+@pytest.mark.parametrize("family", ["mimof", "mimop"])
+def test_unified_recorded_routes_preserve_live_ids_and_capacity(tmp_path, family):
+    path = jsonl_routes(tmp_path, [dict(event="expert_routes", rows=2,
+                                      topk=[[0, 3], [2, 1]])])
+    args = bench.parse_args(["--geometry", family, "--mxfp4-pair", "--mxfp4-unify",
+                             "--capacity", "16", "--rows", "2", "--routes", str(path)])
+    waves = bench.recorded_waves(path, SimpleNamespace(name=family, experts=4, top_k=2))
+    ids = bench.unified_screen_ids(waves, 2, args.capacity, 4, 2, 2129, "cpu")
+    assert ids.dtype == torch.int32 and ids.shape == (16, 2)
+    assert ids[:2].tolist() == [[0, 3], [2, 1]]
+    assert (ids[2:] == -1).all()
+    with pytest.raises(ValueError, match="exactly 3"):
+        bench.unified_screen_ids(waves, 3, 16, 4, 2, 2129, "cpu")
+    with pytest.raises(ValueError, match="planned capacity"):
+        bench.unified_screen_ids(waves, 2, 1, 4, 2, 2129, "cpu")
+
+
+def test_unified_random_routes_retain_capacity_seed_contract():
+    torch.manual_seed(2129)
+    expected = torch.rand(16, 8).topk(2, -1).indices.int()
+    torch.manual_seed(2129)
+    actual = bench.unified_screen_ids(None, 2, 16, 8, 2, 2129, "cpu")
+    assert torch.equal(actual, expected)

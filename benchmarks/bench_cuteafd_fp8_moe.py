@@ -272,7 +272,7 @@ def parse_args(argv=None):
     if args.compare_routes_exact and (args.exact_sweep or (not args.mxfp4_unify and len(args.route.split(",")) < 2)):
         parser.error("--compare-routes-exact requires at least two timing routes and no --exact-sweep")
     if args.mxfp4_unify and (not args.mxfp4_pair or args.native_slices or args.mxfp4_tilings
-                             or args.geometry not in ("mimof", "mimop", "v41", "dsv4f") or args.routes
+                             or args.geometry not in ("mimof", "mimop", "v41", "dsv4f")
                              or (args.geometry in ("v41", "dsv4f") and not (args.row_major_a8 or args.row_major_mma
                                      or args.v4_stream or args.native_stream or args.capacity is not None))):
         parser.error("--mxfp4-unify requires paired mode without other screens")
@@ -535,6 +535,17 @@ def screen_route_ids(wave, experts, topk, seed):
     from benchmarks.benchmark_exlr8_a16 import real_route_ids
 
     return real_route_ids(wave["rows"], wave, torch.Generator().manual_seed(seed), experts, topk).int()
+
+
+def unified_screen_ids(waves, rows, capacity, experts, topk, seed, device):
+    """Keep fixture live rows intact while masking unused planned capacity."""
+    if not 1 <= rows <= capacity:
+        raise ValueError("live rows must fit planned capacity")
+    if waves is None:
+        return torch.rand(capacity, experts, device=device).topk(topk, -1).indices.int()
+    wave = screen_route_wave(waves, rows, seed)
+    live = screen_route_ids(wave, experts, topk, seed).to(device)
+    return torch.nn.functional.pad(live, (0, 0, 0, capacity - rows), value=-1)
 
 
 def tiling_specs(args, width, baseline_tile, tiles):
@@ -1331,6 +1342,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
     results = []
     experts, route_qualification_eligible = stream_screen_population(g, args)
+    waves = recorded_waves(args.routes, g) if args.routes else None
+    route_fixture = ({"path": str(args.routes), "sha256": hashlib.sha256(args.routes.read_bytes()).hexdigest(),
+                      "family_attested": args.routes.suffix != ".jsonl"} if waves else None)
     for width in paired_widths(g.intermediate, args.widths, args.engine_policy_root):
         occupancy_recipe = decode_occupancy_recipe(g.hidden, width, g.top_k, properties.multi_processor_count)
         expert_bytes = 3 * width * g.hidden // 2
@@ -1348,7 +1362,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
             capacity = args.capacity if args.capacity is not None else rows
             torch.manual_seed(args.seed + capacity)
             x = (torch.randn(capacity, g.hidden, device="cuda") * .5).bfloat16()
-            ids = torch.rand(capacity, experts, device="cuda").topk(g.top_k, -1).indices.int()
+            ids = unified_screen_ids(waves, rows, capacity, experts, g.top_k, args.seed, "cuda")
             if args.routing == "hot":
                 ids.copy_(ids[:1].expand_as(ids))
             routing = torch.rand(capacity, g.top_k, device="cuda")
@@ -1589,6 +1603,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
             medians = {label: statistics.median(values) for label, values in samples.items()}
             record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows, capacity=capacity,
                           experts=experts, routing=args.routing, route_qualification_eligible=route_qualification_eligible,
+                          route_fixture=route_fixture,
                           sm_count=properties.multi_processor_count, occupancy_recipe=occupancy_recipe if args.decode_occupancy else None,
                           prefix_checks=prefix_checks, route_comparisons=route_comparisons,
                           ingress="wire", wire_preparation_timed=False,
