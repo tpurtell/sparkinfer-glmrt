@@ -2906,7 +2906,28 @@ class DenseGemmKernel:
                         tile_sched.advance_to_next_work()
                         work_tile = tile_sched.get_current_work()
 
-                if cutlass.const_expr(not self.swap_ab):
+                if cutlass.const_expr(self.block_fp8 and self.c_dtype == cutlass.Float32
+                        and self.split_k_slices == 1 and not self.quantize_c and not self.row_scale):
+                    # Native TP partials retain the FP32 accumulator. Its MMA
+                    # coordinates avoid the 16-bit shared-store retile entirely.
+                    result_mn = _reshape_acc_to_mn(accumulators)
+                    for acc_m in cutlass.range_constexpr(cute.size(result_mn.shape[0])):
+                        for acc_n in cutlass.range_constexpr(cute.size(result_mn.shape[1])):
+                            coord = block_fp8_coord_mn[acc_m, acc_n]
+                            m_coord = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
+                            n_coord = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1]) + coord[1]
+                            if m_coord < Int32(directC_mnl.shape[0]) and n_coord < Int32(directC_mnl.shape[1]):
+                                value = result_mn[acc_m, acc_n]
+                                if cutlass.const_expr(not self.alpha_is_one):
+                                    value = alpha_value * value
+                                directC_mnl[(m_coord, n_coord, tile_coord_mnl[2])] = epilogue_op(value)
+                    if cutlass.const_expr(self.single_work_tile_per_cta):
+                        work_tile = WorkTileInfo(work_tile.tile_idx, cutlass.Boolean(0))
+                    else:
+                        tile_sched.advance_to_next_work()
+                        work_tile = tile_sched.get_current_work()
+
+                elif cutlass.const_expr(not self.swap_ab):
                     # EPILOGUE
                     _is_m_major = self.c_layout.is_m_major_c()
                     if cutlass.const_expr(self.c_dtype.width == 16):

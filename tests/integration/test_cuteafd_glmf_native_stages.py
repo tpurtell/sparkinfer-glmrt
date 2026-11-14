@@ -349,3 +349,98 @@ def test_flash_standalone_block_fp8_matches_fused(heads, mode, rows, flag):
             run()
         graph.replay(); graph.replay()
         same(projected, reference); same(actual, expected)
+
+
+# [N,K] layouts already served by shared native-attention stages. F32 is the
+# input-column-sharded TP2 output, never a narrowed BF16 partial.
+NATIVE_PREFILL_SHAPES = [
+    (16384,2048,"bf16"), (8192,2048,"bf16"), (6144,16384,"bf16"), (6144,8192,"f32"),
+    (18432,1536,"bf16"), (9216,1536,"bf16"), (7168,12288,"bf16"), (7168,6144,"f32"),
+    (4096,12288,"bf16"), (4096,6144,"f32"),
+    (8192,8192,"bf16"), (4096,8192,"bf16"), (1024,8192,"bf16"), (512,8192,"bf16"),
+    (8192,4096,"f32"),
+]
+
+
+def native_prefill_oracle(source, weight, scales, actual):
+    """F64 dot-product bound after checking the exact K128 activation QDQ."""
+    rows, k = source.shape
+    blocks = source.float().view(rows, k//128, 128)
+    amax = blocks.abs().amax(-1)
+    activation_scale = torch.where(amax > 0, amax / torch.full_like(amax,448.), torch.ones_like(amax))
+    quant = (blocks / activation_scale[..., None]).clamp(-448,448).to(torch.float8_e4m3fn)
+    # Sample independent row/output indices: full dot products, not a cosine
+    # surrogate that could hide a scale or output-rounding error.
+    ri = torch.linspace(0,rows-1,min(rows,8),device=source.device).long()
+    ni = torch.linspace(0,weight.shape[0]-1,min(weight.shape[0],128),device=source.device).long()
+    a = (quant.float() * activation_scale[...,None]).reshape(rows,k)[ri].double()
+    b = weight.double()[ni] * scales[ni//128].double().repeat_interleave(128,-1)
+    expected = a @ b.T
+    products = a.abs() @ b.abs().T
+    observed = actual[ri[:,None],ni[None,:]]
+    observed64 = observed.double()
+    epsilon = 2.**-24
+    gamma = (k + 3*(k//128))*epsilon / (1.-(k + 3*(k//128))*epsilon)
+    rounding = .5*torch.maximum(
+        torch.nextafter(observed,torch.full_like(observed,float("inf"))).double()-observed64,
+        observed64-torch.nextafter(observed,torch.full_like(observed,-float("inf"))).double())
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual) > 0
+    assert torch.all((observed64-expected).abs() <= gamma*products + rounding)
+    return quant.reshape(rows,k), activation_scale
+
+
+@pytest.mark.parametrize("n,k,output", NATIVE_PREFILL_SHAPES)
+def test_native_fp8_prefill_quantization_oracle_and_graph_lifetimes(n,k,output):
+    from b12x.integration.cuteafd._fp8_weights import compile_native_fp8_prefill_aot
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    program = compile_native_fp8_prefill_aot(input_features=k,output_features=n,output=output)
+    dtype = torch.bfloat16 if output == "bf16" else torch.float32
+    cap = 4096
+    x = (torch.randn(cap+1,k,device="cuda")*.25).bfloat16()
+    x[0,:128] = 0
+    weight = (torch.randn(n,k,device="cuda")*.125).to(torch.float8_e4m3fn)
+    scales = torch.rand(n//128,k//128,device="cuda")*.3+.03
+    out = torch.empty(cap+1,n,device="cuda",dtype=dtype)
+    workspace = scratch(program,cap)
+    widest = None
+    for rows in [4096,2048,2049,2752,2753,4095]:
+        out.fill_(float("nan")); workspace.fill_(255)
+        program.launch(x,weight,scales,out,workspace,scalars=(rows,1))
+        torch.cuda.synchronize()
+        actual = out[:rows].clone()
+        quant, activation_scale = native_prefill_oracle(x[:rows],weight,scales,actual)
+        qbytes = workspace[:rows*k].view(torch.float8_e4m3fn).reshape(rows,k)
+        scale_offset = (rows*k+1023)//1024*1024
+        quant_scales = workspace[scale_offset:scale_offset+rows*(k//128)*4].view(torch.float32).reshape(rows,k//128)
+        assert torch.equal(qbytes.view(torch.uint8),quant.view(torch.uint8))
+        assert torch.equal(quant_scales,activation_scale)
+        assert torch.isnan(out[rows:]).all()
+        if widest is None: widest = actual
+        else: assert torch.equal(actual,widest[:rows])
+        with kernel_resolution_guard("native FP8 prefill fixed callable"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                program.launch(x,weight,scales,out,workspace,scalars=(rows,1))
+            out.fill_(float("nan")); workspace.fill_(255)
+            graph.replay(); graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out[:rows],actual)
+            assert torch.isnan(out[rows:]).all()
+        graph.reset()
+
+
+@pytest.mark.parametrize("rows", [1,17,129])
+def test_native_fp8_prefill_f32_writes_every_output_column(rows):
+    from b12x.integration.cuteafd._fp8_weights import compile_native_fp8_prefill_aot
+    n,k = 256,256
+    program = compile_native_fp8_prefill_aot(input_features=k,output_features=n,output="f32")
+    source = torch.ones(rows+1,k,device="cuda",dtype=torch.bfloat16)
+    weight = torch.ones(n,k,device="cuda",dtype=torch.float8_e4m3fn)
+    scales = torch.full((n//128,k//128),.25,device="cuda")
+    out = torch.full((rows+1,n),float("nan"),device="cuda")
+    workspace = scratch(program,4096)
+    program.launch(source,weight,scales,out,workspace,scalars=(rows,1))
+    torch.cuda.synchronize()
+    assert torch.equal(out[:rows],torch.full_like(out[:rows],float(k)*.25))
+    assert torch.isnan(out[rows:]).all()

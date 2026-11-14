@@ -20,9 +20,10 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shapes", default="4096x4096", help="comma-separated output N x input K")
     parser.add_argument("--rows", default="1,8,9,10,16,32,64")
-    parser.add_argument("--recipes", choices=("routes", "compensation", "decode", "trellis"), default="routes",
+    parser.add_argument("--recipes", choices=("routes", "compensation", "decode", "trellis", "fp8-prefill"), default="routes",
                         help="BF16 route comparisons, the decode/verify tile sweep, "
                              "or the unchanged native K6 prefill baseline")
+    parser.add_argument("--output-dtype", choices=("bf16", "f32"), default="bf16")
     parser.add_argument("--tiles-file", type=Path,
                         help="decode recipe only: JSON {NxK: [{name, tiles: [[rows, ...], ...]}]} "
                              "candidates raced against the shipped route")
@@ -42,7 +43,7 @@ def parse_args(argv=None):
         parser.error("shapes must be NxK and rows must be comma-separated integers")
     if any(len(shape) != 2 or any(v <= 0 or v % 8 for v in shape) for shape in args.shapes):
         parser.error("projection dimensions must be positive multiples of eight")
-    row_limit = 4096 if args.recipes in ("compensation", "trellis") else 128
+    row_limit = 4096 if args.recipes in ("compensation", "trellis", "fp8-prefill") else 128
     if args.samples < 1 or any(v < 1 or v > row_limit for v in args.rows):
         parser.error(f"positive samples and live rows in 1..{row_limit} required")
     if args.recipes == "decode" and args.tiles_file is None:
@@ -450,8 +451,135 @@ def _trellis_baseline(args):
         save()
 
 
+class _PrefillThermal:
+    """Bounded NVML samples and cumulative slowdown counters, never a timing source."""
+    def __init__(self):
+        import pynvml
+        import torch
+        self.nvml = pynvml
+        pynvml.nvmlInit()
+        uuid = str(torch.cuda.get_device_properties(0).uuid)
+        if not uuid.startswith("GPU-"): uuid = "GPU-"+uuid
+        self.handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+        self.samples, self.errors = [], []
+        self.stop = threading.Event()
+        self.before = self.counters()
+        self.thread = threading.Thread(target=self.sample)
+        self.thread.start()
+
+    def optional(self, function, *args):
+        try: return function(self.handle,*args)
+        except Exception: return None
+
+    def counters(self):
+        get = getattr(self.nvml,"nvmlDeviceGetViolationStatus",None)
+        result = {}
+        for name,policy in [("power",0),("thermal",1)]:
+            value = self.optional(get,policy) if get else None
+            result[name] = None if value is None else value.violationTime
+        return result
+
+    def sample(self):
+        n = self.nvml
+        while not self.stop.is_set():
+            try:
+                margin = None
+                get = getattr(n,"nvmlDeviceGetMarginTemperature",None)
+                if get:
+                    info = self.optional(get)
+                    if info is not None: margin = getattr(info,"marginTemperature",None)
+                self.samples.append(dict(time=time.monotonic(),
+                    clock=self.optional(n.nvmlDeviceGetClockInfo,n.NVML_CLOCK_SM),
+                    utilization=getattr(self.optional(n.nvmlDeviceGetUtilizationRates),"gpu",None),
+                    temperature=self.optional(n.nvmlDeviceGetTemperature,n.NVML_TEMPERATURE_GPU),
+                    margin=margin,reasons=self.optional(n.nvmlDeviceGetCurrentClocksThrottleReasons)))
+            except Exception as error: self.errors.append(str(error))
+            self.stop.wait(.01)
+
+    def finish(self):
+        self.stop.set(); self.thread.join()
+        after = self.counters()
+        busy = [v["clock"] for v in self.samples if v["clock"] is not None and (v["utilization"] or 0)>=50]
+        values = lambda field:[v[field] for v in self.samples if v[field] is not None]
+        seconds = {name:sum((b["time"]-a["time"]) for a,b in zip(self.samples,self.samples[1:])
+            if a["reasons"] is not None and a["reasons"]&mask) for name,mask in [("power_cap",4),("thermal",0x60)]}
+        return dict(samples=self.samples,errors=self.errors,sampled_reason_seconds=seconds,
+            counter_seconds={name:(None if self.before[name] is None or after[name] is None
+                else (after[name]-self.before[name])/1e9) for name in after},
+            busy_sm_clock_mhz=statistics.median(busy) if busy else None,
+            max_temperature_c=max(values("temperature"),default=None),
+            min_tlimit_headroom_c=min(values("margin"),default=None))
+
+
+def _fp8_prefill_bench(args):
+    """One fixed-capacity callable, real FP8 weights, matched A8/A16 row curves."""
+    import torch
+    from benchmarks.common import make_l2_flush_fn, nvidia_smi_gpu_mode_snapshot
+    from b12x.integration.cuteafd._fp8_weights import compile_native_fp8_prefill_aot
+    from tests.integration.test_cuteafd_glmf_native_stages import native_prefill_oracle
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    torch.manual_seed(1972)
+    flush = make_l2_flush_fn(True)
+    dtype = torch.bfloat16 if args.output_dtype == "bf16" else torch.float32
+    results = []
+    for n,k in args.shapes:
+        program = compile_native_fp8_prefill_aot(input_features=k,output_features=n,output=args.output_dtype)
+        x = (torch.randn(4097,k,device="cuda")*.25).bfloat16()
+        x[0,:128] = 0
+        w = (torch.randn(n,k,device="cuda")*.125).to(torch.float8_e4m3fn)
+        scales = torch.rand(n//128,k//128,device="cuda")*.3+.03
+        out = torch.empty(4097,n,device="cuda",dtype=dtype)
+        workspace = torch.empty(program.scratch_bytes(4096)["scratch"],device="cuda",dtype=torch.uint8)
+        # Compile both branches once, before any graph or timed row curve.
+        for flag in (0,1):
+            program.launch(x,w,scales,out,workspace,scalars=(4096,flag))
+        torch.cuda.synchronize()
+        for rows in args.rows:
+            graphs = {}
+            for label,flag in [("w8a16",0),("w8a8",1)]:
+                out.fill_(float("nan")); workspace.fill_(255)
+                program.launch(x,w,scales,out,workspace,scalars=(rows,flag))
+                torch.cuda.synchronize()
+                if flag: native_prefill_oracle(x[:rows],w,scales,out[:rows])
+                expected = out[:rows].clone()
+                assert torch.isfinite(expected).all() and torch.count_nonzero(expected)>0
+                assert torch.isnan(out[rows:]).all()
+                with kernel_resolution_guard("native FP8 prefill row curve"):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        program.launch(x,w,scales,out,workspace,scalars=(rows,flag))
+                out.fill_(float("nan")); workspace.fill_(255)
+                graph.replay(); graph.replay(); torch.cuda.synchronize()
+                assert torch.equal(out[:rows],expected) and torch.isnan(out[rows:]).all()
+                graphs[label] = graph
+            samples = {name:[] for name in graphs}
+            before = nvidia_smi_gpu_mode_snapshot()
+            thermal = _PrefillThermal()
+            for sample in range(args.samples):
+                for label in (["w8a16","w8a8"] if sample%2==0 else ["w8a8","w8a16"]):
+                    flush()
+                    start,end = torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+                    start.record(); graphs[label].replay(); end.record(); end.synchronize()
+                    samples[label].append(start.elapsed_time(end)*1000)
+            entry = dict(n=n,k=k,rows=rows,output=args.output_dtype,samples_us=samples,
+                median_us={label:statistics.median(values) for label,values in samples.items()},
+                thermal=thermal.finish(),telemetry_before=before,telemetry_after=nvidia_smi_gpu_mode_snapshot())
+            entry["us_per_row"] = {label:value/rows for label,value in entry["median_us"].items()}
+            results.append(entry)
+            print(json.dumps(entry),flush=True)
+            for graph in graphs.values(): graph.reset()
+        del program,x,w,scales,out,workspace,graphs
+    properties = torch.cuda.get_device_properties(0)
+    result = dict(kind="native-fp8-prefill",device=properties.name,sms=properties.multi_processor_count,
+        capacity=4096,conditions="one launch session; warmed interleaved L2-cold CUDA graph samples; FP64 sampled dot-product oracle; poisoned replay/tails",results=results)
+    if args.output: args.output.write_text(json.dumps(result,indent=2)+"\n")
+
+
 def main():
     args = parse_args()
+    if args.recipes == "fp8-prefill":
+        return _fp8_prefill_bench(args)
     if args.recipes == "trellis":
         return _trellis_baseline(args)
     if args.recipes == "decode":

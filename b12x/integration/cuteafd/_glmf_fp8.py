@@ -104,14 +104,17 @@ class QuantRows128:
                 at[0] = s
 
 
-def block_fp8_gemm_launch(n: int, k: int, max_rows: int, *, row_scales: bool = False, sm_count: int | None = None):
-    """The ``dense_gemm(..., block_fp8=True)`` launch for ``[rows <= max_rows, K] x [N, K]^T`` to BF16,
+def block_fp8_gemm_launch(n: int, k: int, max_rows: int, *, row_scales: bool = False, sm_count: int | None = None,
+                          out_dtype=cutlass.BFloat16):
+    """The ``dense_gemm(..., block_fp8=True)`` launch for ``[rows <= max_rows, K] x [N, K]^T`` to BF16/F32,
     as a pointer ABI: ``(a, b, sfa, sfb, c, qc_values, qc_rows, qc_mma, alpha, rows, stream)``."""
     import torch
 
     from b12x._lib import dense_gemm as dg
     from b12x._lib.utils import get_num_sm
 
+    if out_dtype not in (cutlass.BFloat16, cutlass.Float32):
+        raise ValueError("block-FP8 output must be BF16 or F32")
     n, k, max_rows = int(n), int(k), int(max_rows)
     if sm_count is None:
         sm_count = get_num_sm(torch.device("cuda", torch.cuda.current_device()))
@@ -121,14 +124,14 @@ def block_fp8_gemm_launch(n: int, k: int, max_rows: int, *, row_scales: bool = F
     if plan.swap_ab or plan.load_path != "tma":
         raise ValueError(f"block-FP8 prefill wants the unswapped TMA plan, got {plan}")
     policy = dg._dense_gemm_policy_for(
-        m=max_rows, n=plan_n, k=k, l=1, ab_dtype=cutlass.Float8E4M3FN, c_dtype=cutlass.BFloat16,
+        m=max_rows, n=plan_n, k=k, l=1, ab_dtype=cutlass.Float8E4M3FN, c_dtype=out_dtype,
         mma_tiler_mn=plan.mma_tiler_mn, cluster_shape_mn=(1, 1), sm_count=sm_count, tile_k=128,
         expected_m=max_rows, generalize_block_fp8_split_k=True)
     if policy.split_k_slices != 1:
         raise ValueError(f"block-FP8 prefill at {max_rows} rows chose split-K {policy.split_k_slices}")
     return dg._new_dense_gemm_launch(
         n=n, k=k, l=1, c_l=1, a_major="k", b_major="k", c_major="n", ab_dtype=cutlass.Float8E4M3FN,
-        sf_dtype=cutlass.Float32, c_dtype=cutlass.BFloat16, alpha_dtype=cutlass.Float32, sf_vec_size=128,
+        sf_dtype=cutlass.Float32, c_dtype=out_dtype, alpha_dtype=cutlass.Float32, sf_vec_size=128,
         mma_k=32, tile_k=128, mma_tiler_mn=plan.mma_tiler_mn, cluster_shape_mn=(1, 1), policy=policy,
         sm_count=sm_count, sm_version="sm_120", load_path="tma", swap_ab=False, sfb_k_reuse=False,
         b_tile_major=False, alpha_is_one=True, plain_fp8=True, block_fp8=True, block_fp8_row_b=row_scales)
@@ -142,13 +145,15 @@ def quant_scratch_bytes(k: int, rows: int) -> int:
 
 class BlockFp8Projection:
     """``out = x @ dequant(w)^T`` over E4M3 weights: ``x`` quantized per row and 128-K block into
-    ``scratch`` (``quant_scratch_bytes``), then the block-FP8 GEMM into BF16 ``out [rows, N]``."""
+    ``scratch`` (``quant_scratch_bytes``), then the block-FP8 GEMM into BF16/F32 ``out [rows, N]``."""
 
-    def __init__(self, n: int, k: int, max_rows: int, *, row_scales: bool = False, x_stride: int | None = None):
+    def __init__(self, n: int, k: int, max_rows: int, *, row_scales: bool = False, x_stride: int | None = None,
+                 out_dtype=cutlass.BFloat16):
         self.n, self.k = int(n), int(k)
         self.row_scales = bool(row_scales)
+        self.out_dtype = out_dtype
         self.quant = QuantRows128(self.k, x_stride)
-        self.gemm = block_fp8_gemm_launch(self.n, self.k, max_rows, row_scales=row_scales)
+        self.gemm = block_fp8_gemm_launch(self.n, self.k, max_rows, row_scales=row_scales, out_dtype=out_dtype)
 
     def key(self) -> tuple:
         return (self.n, self.k, self.row_scales, self.quant.key(), self.gemm.compile_key())
@@ -163,7 +168,7 @@ class BlockFp8Projection:
         self.quant(x, q, s, rows, stream)
         b = cute.make_ptr(cutlass.Float8E4M3FN, Int64(w_fp8.toint()), gmem, assumed_align=16)
         sb = cute.make_ptr(Float32, Int64(w_scale.toint()), gmem, assumed_align=16)
-        c = cute.make_ptr(cutlass.BFloat16, Int64(out.toint()), gmem, assumed_align=16)
+        c = cute.make_ptr(self.out_dtype, Int64(out.toint()), gmem, assumed_align=16)
         # The quantized-output and alpha operands are unused (alpha is one).
         unused = Int64(w_scale.toint())
         self.gemm(q, b, s, sb, c, cute.make_ptr(cutlass.Float8E4M3FN, unused, gmem, assumed_align=16),
