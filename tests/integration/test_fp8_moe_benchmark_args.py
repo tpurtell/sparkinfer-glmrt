@@ -624,9 +624,9 @@ def test_explicit_legacy_split_and_profile_selection():
         argv += ["--mxfp4-arm", value]
     args = bench.parse_args(argv + ["--profile-dir", "out", "--profile-arm", "legacy128"])
     specs, controls = bench.tiling_specs(args, 384, 192, (64, 128, 192))
-    assert specs == [(name, False, 192, None) for name in controls] + [
-        ("legacy128", False, 128, None), ("legacy192", False, 192, None),
-        ("exact128", True, 128, 384)]
+    assert specs == [(name, False, 192, None, 1) for name in controls] + [
+        ("legacy128", False, 128, None, 2), ("legacy192", False, 192, None, 2),
+        ("exact128", True, 128, 384, 1)]
     with pytest.raises(SystemExit):
         bench.parse_args(argv + ["--profile-dir", "out", "--profile-arm", "missing"])
     for value in ["a:384:0:128:3", "a:384:0:192:4", "a:384:-32:128:2"]:
@@ -954,8 +954,8 @@ def test_explicit_control_requires_matching_arm():
     with pytest.raises(SystemExit):
         bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings", "--mxfp4-control", "absent"])
 @pytest.mark.parametrize("family,width,tile,atomic,coded", [
-    ("dsv4f", 256, 128, True, False), ("dsv4f", 512, 128, True, False),
-    ("dsv4f", 1024, 128, True, False), ("dsv4f", 320, 128, False, False),
+    ("dsv4f", 256, 128, False, False), ("dsv4f", 512, 128, False, False),
+    ("dsv4f", 1024, 128, False, False), ("dsv4f", 320, 128, False, False),
     ("v41", 288, 64, False, True), ("v41", 512, 128, False, True),
     ("v41", 576, 192, False, True)])
 def test_shipped_prefill_recipe_uses_policy(monkeypatch, family, width, tile, atomic, coded):

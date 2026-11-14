@@ -430,7 +430,7 @@ def test_ordered_tile32_decode_qualification(h, n, coded):
         operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales)
         control_tile = 192 if coded and n == 288 else 128
         control, control_output, control_owned = native_pair_arm(
-            *operands, control_tile, False, False, coded, qualify=True)
+            *operands, control_tile, exact_control, False, coded, qualify=True, fc1_k_splits=1)
         candidate, output, owned = native_pair_arm(
             *operands, 32, True, False, coded, qualify=True)
         control()
@@ -453,6 +453,7 @@ def test_ordered_tile32_decode_qualification(h, n, coded):
         decode_capacity_row_invariance=True, results=results)), flush=True)
 
 
+
 @pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
 def test_v41_s576_tile128_synthetic_oracle_seeds(weight_seed):
     _synthetic_oracle_seeds(weight_seed, 5120, 576, True, 128, 192,
@@ -469,7 +470,8 @@ def test_ordered_tile32_synthetic_oracle_seeds(weight_seed, h, n, coded):
                             "mxfp4_tile32_synthetic_oracle")
 
 
-def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker):
+def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker,
+                            k_split=1, exact_control=False, candidate_exact=True):
     require_b12x()
     import json
     from benchmarks.bench_cuteafd_fp8_moe import (
@@ -494,9 +496,9 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
         for capacity in (1, 16, 80):
             operands = (x[:capacity], ids[:capacity], routing[:capacity], weights, scales)
             control, control_output, control_owned = native_pair_arm(
-                *operands, control_tile, False, False, coded, qualify=True)
+                *operands, control_tile, exact_control, False, coded, qualify=True, fc1_k_splits=1)
             candidate, output, owned = native_pair_arm(
-                *operands, tile, True, False, coded, qualify=True)
+                *operands, tile, candidate_exact, False, coded, qualify=True, fc1_k_splits=k_split)
             control()
             candidate()
             torch.cuda.synchronize()
@@ -504,9 +506,16 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
             oracle = reference[:capacity * k]
             print(marker + " " + json.dumps(dict(
                 weight_seed=weight_seed, activation_seed=activation_seed, capacity=capacity,
-                hidden=h, logical=n, coded=coded, tile=tile, control_tile=control_tile,
+                hidden=h, logical=n, coded=coded, tile=tile, control_tile=control_tile, k_split=k_split,
+                control_arm=dict(tile=control_tile, split=1, exact_storage=exact_control and
+                    (n % 128 != 0 or (n + control_tile - 1) // control_tile * control_tile > n)),
+                candidate_arm=dict(tile=tile, split=k_split, exact_storage=candidate_exact and
+                    (n % 128 != 0 or (n + tile - 1) // tile * tile > n)),
+                reference_rms=oracle.square().mean().sqrt().item(),
+                bitwise_equal=torch.equal(control_output, output),
                 control=f32_errors(control_output, oracle), candidate=f32_errors(output, oracle),
                 synthetic=True, timed=False)), flush=True)
+
 
 
 @pytest.mark.parametrize("world,n", [(4, 576), (8, 288)])
@@ -581,3 +590,44 @@ def test_row_major_native_mma_contract(h, n, k, split, exact):
         candidate()
         torch.cuda.synchronize()
         assert torch.equal(output, expected), (h, n, capacity, (output.float() - expected.float()).abs().max())
+
+
+@pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
+def test_v41_s384_shipped_k_split_oracle_seeds(weight_seed):
+    _synthetic_oracle_seeds(weight_seed, 5120, 384, True, 128, 192,
+                            "mxfp4_shipped_k_split_oracle", k_split=2, candidate_exact=False)
+
+
+
+@pytest.mark.parametrize("n", [384, 576])
+@pytest.mark.parametrize("weight_seed", [92800, 92801, 92802, 92803])
+def test_v41_k_split_synthetic_oracle_seeds(weight_seed, n):
+    _synthetic_oracle_seeds(weight_seed, 5120, n, True, 128, 128,
+                            "mxfp4_k_split_synthetic_oracle", k_split=2, exact_control=True)
+
+
+
+@pytest.mark.parametrize("n,exact", [(384, False), (384, True), (576, True)])
+def test_v41_fc1_k_split_capacity_invariance(n, exact):
+    require_b12x()
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+    torch.manual_seed(928384)
+    m, e, k, h = 80, 8, 6, 5120
+    x = (torch.randn(m, h, device="cuda") * .5).bfloat16()
+    ids = torch.rand(m, e, device="cuda").topk(k, -1).indices.int()
+    routing = torch.rand(m, k, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weights, scales = {}, {}
+    for name, shape in [("w1", (e, n, h // 2)), ("w3", (e, n, h // 2)), ("w2", (e, h, n // 2))]:
+        weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
+        scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
+    packed = pack(weights, scales, exact)
+    packed[1] = pack_scale_codes(torch.cat((scales["w3"], scales["w1"]), 1),
+                                tensor_name="w13.scale", gated_half_rows=n).view(torch.uint32).flatten().cuda()
+    packed[3] = pack_scale_codes(scales["w2"], tensor_name="w2.scale").view(torch.uint32).flatten().cuda()
+    actual = run_pipeline(x, ids, routing, packed, 128, exact, n=n, coded=True,
+                          return_routes=True, fc1_k_splits=2)
+    for capacity in (1, 16):
+        prefix = run_pipeline(x[:capacity], ids[:capacity], routing[:capacity], packed, 128, exact,
+                              n=n, coded=True, return_routes=True, fc1_k_splits=2)
+        assert torch.equal(prefix, actual[:capacity]), "K split changed with decode capacity"
