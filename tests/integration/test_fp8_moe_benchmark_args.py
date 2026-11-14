@@ -467,17 +467,17 @@ def test_native_partial_allocation_has_exact_fc1_activation_extent(tile, logical
         ((logical + tile - 1) // tile) * 96 * route_bytes)
 
 
-def test_prefill_unify_controls_are_fixed_stream_and_record_prefix_failures():
+def test_prefill_unify_controls_preserve_public_route_math_and_strict_prefix():
     function = next(n for n in ast.parse(_PATH.read_text()).body
                     if isinstance(n, ast.FunctionDef) and n.name == "mxfp4_unify_screen")
     text = ast.unparse(function)
-    assert "control_route = 'stream' if rows > 80 else 'auto'" in text
-    assert "strict_prefix=rows <= 80" in text
-    assert "if not v4 and control_route != 'stream':" in text
+    assert ast.unparse(ast.parse("control_route = args.route.split(',')[0]")) in text
+    assert "strict_prefix=True" in text
+    assert "if not v4 and control_route == 'decode':" in text
     assert "fp8_moe_scratch_bytes(geometry, control_route, capacity, prefill=args.prefill)" in text
     assert "program = template" in text
     override = next(n for n in ast.walk(function) if isinstance(n, ast.If)
-                    and ast.unparse(n.test) == "not v4 and control_route != 'stream'")
+                    and ast.unparse(n.test) == "not v4 and control_route == 'decode'")
     # Stream must retain the public compiler's A8-down selection and scratch ABI.
     assert "launch = _Fp8Moe(" in ast.unparse(override)
     assert "program = compile_program(" in ast.unparse(override)
@@ -1024,3 +1024,19 @@ def test_native_stream_decodes_resident_scale_codes_without_a_second_plane():
     screen = next(n for n in benchmark.body if isinstance(n, ast.FunctionDef)
                   and n.name == "mxfp4_unify_screen")
     assert "scale_codes=bool(recipe and recipe['coded'])" in ast.unparse(screen)
+
+
+@pytest.mark.parametrize("capacity", [80, 2048, 2752, 4096])
+def test_unified_curve_flags_and_production_population(capacity):
+    args = bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
+                             "--capacity", str(capacity), "--rows", f"1,16,{capacity}",
+                             "--check", "--check-prefix-rows", "1", "--compare-routes-exact",
+                             "--route", "auto,stream"])
+    assert args.capacity == capacity and args.check_prefix_rows == 1
+    assert args.compare_routes_exact and args.route == "auto,stream"
+    assert bench.stream_screen_population(SimpleNamespace(experts=256, top_k=8), args) == (256, True)
+    node = next(node for node in ast.parse(_PATH.read_text()).body
+                if isinstance(node, ast.FunctionDef) and node.name == "mxfp4_unify_screen")
+    calls = {node.func.id for node in ast.walk(node)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert {"stream_screen_population", "check_shared_prefix", "compare_route_outputs"} <= calls
