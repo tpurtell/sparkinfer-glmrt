@@ -316,6 +316,34 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
 
 
 
+def _production_subroute(projection, rows):
+    """Evaluate the projection's own decode dispatch with recording callables."""
+    import ast
+    import inspect
+    import textwrap
+    from types import SimpleNamespace
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(type(projection))))
+    body = next(node for node in tree.body[0].body
+                if isinstance(node, ast.FunctionDef) and node.name == '__call__')
+    body.decorator_list = []
+    body.returns = None
+    for argument in body.args.args:
+        argument.annotation = None
+    module = ast.fix_missing_locations(ast.Module(body=[body], type_ignores=[]))
+    selected = []
+    attributes = dict(vars(projection))
+    for name in ('gemv', 'gemv_wide', 'gemv_m16', 'gemv_m64', 'w8a16', 'w8a8'):
+        op = attributes.get(name)
+        if op is not None:
+            attributes[name] = lambda *args, name=name: selected.append(name)
+    scope = dict(cutlass=SimpleNamespace(const_expr=bool), Int32=int)
+    exec(compile(module, '<production projection dispatch>', 'exec'), scope)
+    scope['__call__'](SimpleNamespace(**attributes), None, None, None, None, rows, 64, 0, None)
+    assert len(selected) == 1, selected
+    return selected[0], getattr(projection, selected[0])
+
+
 def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
                      warps_override=None, kmajor=False, output='bf16'):
     """One actual shipped route; cross-source interleaving belongs to the caller."""
@@ -363,12 +391,7 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
                 self.projection(x, w, s, out, live_rows, cutlass.Int32(64), cutlass.Int64(0), stream)
 
         op = ProductionLaunch()
-        if rows == 16 and projection.gemv_m16 is not None:
-            selected_op, subroute = projection.gemv_m16, 'm16_direct_widen'
-        elif rows == 64 and projection.gemv_m64 is not None:
-            selected_op, subroute = projection.gemv_m64, 'm64_special'
-        else:
-            selected_op = projection.gemv if rows <= 16 else projection.gemv_wide
+        subroute, selected_op = _production_subroute(projection, rows)
         groups, cta_tiles = selected_op.groups, selected_op.m_tiles
     elif route in ("base", "nc", "selected"):
         if rows > 16:
@@ -485,7 +508,7 @@ def main():
         if not widths or min(widths) < 1 or max(widths) > 64:
             parser.error('--rows-list widths must be in 1..64')
         if args.native_route not in ('base', 'nc', 'selected', 'production'):
-            parser.error('--rows-list requires --native-route base, nc or selected')
+            parser.error('--rows-list requires --native-route base, nc, selected or production')
     if args.source_root:
         sys.path.insert(0, str(args.source_root.resolve()))
     if args.shapes in SETS:
