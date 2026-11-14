@@ -46,7 +46,7 @@ def _geometry(name, tp):
 
 
 def _weights(g, real: int):
-    key = (g.name, g.tp, real)
+    key = (g.name, g.tp, real, g.scale_convention)
     if key not in _WEIGHTS:
         _WEIGHTS.clear()
         gen = torch.Generator(device="cuda").manual_seed(0)
@@ -76,6 +76,8 @@ def _weights(g, real: int):
             # Nonuniform expert calibration catches accidentally shared FC1 scales.
             inscale = (float(k_scale[0]) * torch.pow(2.0,
                 torch.arange(e, device="cuda", dtype=torch.float32).remainder(7) - 3)).contiguous()
+            if g.scale_convention == "divisor":
+                alpha, inscale = alpha.reciprocal(), inscale.reciprocal()
             return w, torch.cat([s.flatten(), alpha.view(torch.uint8), inscale.view(torch.uint8)]).contiguous()
 
         k_scale = [5.0 / (6 * 448)]
@@ -90,10 +92,12 @@ def _weights(g, real: int):
 _THRESHOLDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
-def quantize_nvfp4(x: torch.Tensor, inscale: float, *, include_input_scale: bool = True) -> torch.Tensor:
+def quantize_nvfp4(x: torch.Tensor, inscale: float, *, include_input_scale: bool = True, scale_convention: str = "multiplier") -> torch.Tensor:
     """FP32 ``[rows, K]`` -> its NVFP4 value (``quantize_block_fp4``: E4M3 scale of
     ``amax * gs / 6`` per 16, E2M1 nearest-even), dequantized with ``input_scale``."""
-    gs = torch.tensor(1.0, dtype=torch.float32) / torch.tensor(inscale, dtype=torch.float32)
+    gs = torch.tensor(inscale, dtype=torch.float32)
+    if scale_convention == "multiplier":
+        gs = torch.tensor(1.0, dtype=torch.float32) / gs
     gs = gs.to(x.device)
     blocks = x.float().reshape(x.shape[0], -1, 16)
     amax = blocks.abs().amax(-1, keepdim=True)
@@ -111,7 +115,9 @@ def quantize_nvfp4(x: torch.Tensor, inscale: float, *, include_input_scale: bool
     code = torch.where(mag > t[6], 6.0, code)
     code = torch.where(sf == 0, 0.0, code)
     value = torch.sign(blocks) * code * sf
-    return (value * inscale if include_input_scale else value).reshape(x.shape)
+    if include_input_scale:
+        value = value / inscale if scale_convention == "divisor" else value * inscale
+    return value.reshape(x.shape)
 
 
 def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
@@ -133,15 +139,20 @@ def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
         rows, slots = torch.where(ids == expert)
         xr = x[rows].float()
         if a4:
-            xr = quantize_nvfp4(xr, float(in1[expert]), include_input_scale=False)
+            xr = quantize_nvfp4(xr, float(in1[expert]), include_input_scale=False, scale_convention=g.scale_convention)
         xr = xr.to(dtype)
         operand = lambda w, q: dequant(w[expert].cpu() if a4 else w[expert],
                                       q[expert].cpu() if a4 else q[expert]).to(dtype)
         # Independent FP64 products, then the kernel's FP32 accumulator/factor
         # boundary before BF16 projection stores. Do not pre-round dequantized
         # activations by folding the global input scale into every element.
-        project = lambda a, w, alpha, inscale: ((a @ w.T).float() *
-            (alpha * inscale if a4 else alpha)).bfloat16().to(dtype)
+        def project(a, w, alpha, inscale):
+            acc = (a @ w.T).float()
+            if g.scale_convention == "divisor":
+                result = (acc / alpha) / inscale
+            else:
+                result = acc * (alpha * inscale if a4 else alpha)
+            return result.bfloat16().to(dtype)
         gate = project(xr, operand(w1, q1), a1[expert], in1[expert])
         up = project(xr, operand(w3, q3), a3[expert], in1[expert])
         if g.activation == "swigluoai":
@@ -162,7 +173,7 @@ def reference(g, x, ids, weights, w1, s1, w3, s3, w2, s2, a4=False):
                 gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
             act = (torch.nn.functional.silu(gate.float()).bfloat16().to(dtype) * up).bfloat16().to(dtype)
         if a4:
-            act = quantize_nvfp4(act, float(in2[expert]), include_input_scale=False).to(dtype)
+            act = quantize_nvfp4(act, float(in2[expert]), include_input_scale=False, scale_convention=g.scale_convention).to(dtype)
         y = project(act, operand(w2, q2), a2[expert], in2[expert]).bfloat16()
         if a4:
             routes[rows, slots] = y.float()
@@ -362,13 +373,16 @@ def test_nvfp4_moe_a4_fused_exact(name, tp, real, capacity, rows, wire, hot, sca
     assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
 
 
-@pytest.mark.parametrize("activation", ["silu_bf16_product", "swigluoai"])
-def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch, activation):
+@pytest.mark.parametrize("activation,scale_convention", [("silu_bf16_product", "multiplier"),
+                                                        ("swigluoai", "multiplier"),
+                                                        ("swigluoai", "divisor")])
+def test_nvfp4_sparse_tiles_reuse_and_graph(monkeypatch, activation, scale_convention):
     """One capacity program covers sparse/dense chunks under frozen resolution."""
     from b12x.integration.cuteafd import fp8_moe
 
-    g = fp8_moe.Fp8MoeGeometry("nvfp4_sparse_test_" + activation, hidden=256, experts=32, top_k=2,
+    g = fp8_moe.Fp8MoeGeometry("nvfp4_sparse_test_" + activation + scale_convention, hidden=256, experts=32, top_k=2,
                               intermediate=256, weights="nvfp4", activations="a4", activation=activation,
+                              scale_convention=scale_convention,
                               **(dict(swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0)
                                  if activation == "swigluoai" else {}))
     capacity = 256
@@ -440,7 +454,7 @@ def test_nvfp4_geometry():
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, Fp8MoeGeometry, _resolve, auto_large_rows
 
     for g in GEOMETRIES.values():
-        if g.weights != "nvfp4":
+        if g.weights != "nvfp4" or g.dynamic_nvfp4:
             continue
         assert g.activations == "a4" and g.kind == "nvfp4a4"
         for rows in (1, 16, 80, 1024, 4096):
@@ -451,6 +465,8 @@ def test_nvfp4_geometry():
         assert auto_large_rows(False, g.kind) == 0
     with pytest.raises(ValueError, match="W4A16 is not a serving mode"):
         Fp8MoeGeometry("bad", hidden=128, experts=1, top_k=1, intermediate=128, weights="nvfp4")
+    assert _geometry("minimax_nvfp4a4", 2).scale_convention == "divisor"
+    assert _geometry("glmf_nvfp4", 2).scale_convention == "multiplier"
     assert [_geometry("glmf_nvfp4", tp).slice for tp in (1, 2, 3, 4, 6)] == [2048, 1024, 768, 512, 384]
     assert [_geometry("qwen4_nvfp4", tp).slice for tp in (1, 2, 3, 4, 6)] == [640, 384, 256, 256, 128]
 

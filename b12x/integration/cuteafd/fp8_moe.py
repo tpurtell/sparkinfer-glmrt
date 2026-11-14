@@ -292,6 +292,7 @@ class Fp8MoeGeometry:
     # weight multiplies the activation before the FC2 quantization.
     situ_gate_cap: float = 4.0
     situ_up_cap: float = 25.0
+    scale_convention: str = "multiplier"
 
     def __post_init__(self) -> None:
         import math
@@ -300,6 +301,10 @@ class Fp8MoeGeometry:
             raise ValueError("unknown expert activation contract")
         # SiTU (route weight before FC2) is the Inkling contract: MXFP8 W8A8 experts always carry it,
         # and NVFP4 carries it only as the dynamic-amax W4A4 route.
+        if self.scale_convention not in ("multiplier", "divisor"):
+            raise ValueError("NVFP4 scale convention must be multiplier or divisor")
+        if self.scale_convention == "divisor" and (self.weights != "nvfp4" or self.activation == "situ"):
+            raise ValueError("divisor globals require static NVFP4 W4A4 experts")
         situ = self.activation == "situ"
         if self.weights == "mxfp8" and not situ:
             raise ValueError("MXFP8 experts carry the SiTU contract (route weight before FC2)")
@@ -371,7 +376,7 @@ class Fp8MoeGeometry:
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
         return Fp8MoeGeometry(self.name, self.hidden, self.experts, self.top_k, self.intermediate, int(tp),
                               self.swiglu_limit, self.weights, self.activations, self.activation, self.projection,
-                              self.swiglu_alpha, self.swiglu_beta, self.situ_gate_cap, self.situ_up_cap)
+                              self.swiglu_alpha, self.swiglu_beta, self.situ_gate_cap, self.situ_up_cap, self.scale_convention)
 
 
 # MiMo V2 Flash (no SwiGLU clamp in its config) and the GLM 5.3 MTP layer.
@@ -404,7 +409,7 @@ GEOMETRIES = {
     # MiniMax M3 vendor experts: calibrated W4A4 with the shared OAI epilogue.
     "minimax_nvfp4a4": Fp8MoeGeometry("minimax_nvfp4a4", hidden=6144, experts=128, top_k=4, intermediate=3072,
                                      swiglu_limit=7.0, weights="nvfp4", activations="a4",
-                                     activation="swigluoai", swiglu_alpha=1.702, swiglu_beta=1.0),
+                                     activation="swigluoai", swiglu_alpha=1.702, swiglu_beta=1.0, scale_convention="divisor"),
     # NVIDIA ModelOpt NVFP4 releases: native W4A4 at every row count.
     "glm_nvfp4": Fp8MoeGeometry("glm_nvfp4", hidden=6144, experts=256, top_k=8, intermediate=2048, weights="nvfp4", activations="a4"),
     "glmf_nvfp4": Fp8MoeGeometry("glmf_nvfp4", hidden=4096, experts=288, top_k=8, intermediate=2048,
@@ -768,34 +773,35 @@ class _StreamNvfp4A4Route:
 
     def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
         self.g = g
+        convention = {"scale_convention": g.scale_convention}
         h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
         self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
-        self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i)
+        self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i, **convention)
         self.fused = nvfp4_a4_fused()
         if self.fused:
             self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
-                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta)
+                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta, **convention)
             self.swiglu = None
         else:
-            self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e)
+            self.gate_up = StreamNvfp4LinearA4(n=i, k=h, experts=e, **convention)
             self.swiglu = ChunkSwiGLUA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
-                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta)
-        self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e)
+                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta, **convention)
+        self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e, **convention)
         self.small_gate = ()
         self.small_down = ()
         if self.fused:
             # Separate kernels keep the wide tile's SMEM reservation out of the
             # sparse-expert launch. Every specialization is planned before capture.
             self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
-                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta, live_min=17)
-            self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e, live_min=17)
+                                               alpha=g.swiglu_alpha, beta=g.swiglu_beta, live_min=17, **convention)
+            self.down = StreamNvfp4LinearA4(n=h, k=i, experts=e, live_min=17, **convention)
             self.small_gate = tuple(StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
-                                                        alpha=g.swiglu_alpha, beta=g.swiglu_beta, tile_m=16, tile_n=n, live_max=16, stages=SMALL_GATE_STAGES)
+                                                        alpha=g.swiglu_alpha, beta=g.swiglu_beta, tile_m=16, tile_n=n, live_max=16, stages=SMALL_GATE_STAGES, **convention)
                                     for n in (32, 64, 128))
             self.small_down = tuple(StreamNvfp4LinearA4(n=h, k=i, experts=e, tile_m=16, tile_n=n,
-                                                        live_max=16) for n in (32, 64, 128))
+                                                        live_max=16, **convention) for n in (32, 64, 128))
         self.core_only = False
         self.combine = MoeCombine(hidden=h, top_k=k)
 
@@ -1178,6 +1184,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
                   "wire": bool(wire), "weights": g.weights, "activations": g.activations,
                   "activation": g.activation, "projection": g.projection,
+                  **({"scale_convention": g.scale_convention}
+                     if g.weights == "nvfp4" and not g.dynamic_nvfp4 else {}),
                   **({"swiglu_alpha": g.swiglu_alpha, "swiglu_beta": g.swiglu_beta}
                      if g.activation == "swigluoai" else {}),
                   **({"situ_gate_cap": g.situ_gate_cap, "situ_up_cap": g.situ_up_cap,
