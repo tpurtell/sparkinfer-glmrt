@@ -314,8 +314,8 @@ def parse_args(argv=None):
             parser.error("widths must be comma-separated K32 widths")
         if not args.mxfp4_pair or not widths or any(width <= 0 or width % 32 for width in widths):
             parser.error("--widths requires --mxfp4-pair and positive K32 widths")
-    if args.routes and args.mxfp4_pair and not (args.mxfp4_tilings or args.shipped_prefill):
-        parser.error("paired recorded routes require --mxfp4-tilings")
+    if args.routes and args.mxfp4_pair and not (args.mxfp4_tilings or args.shipped_prefill or args.mxfp4_unify):
+        parser.error("paired recorded routes require a tiling, shipped-prefill or unified screen")
     if args.mxfp4_pair and (args.exact_sweep or ((args.check_prefix_rows or args.compare_routes_exact)
                            and not args.mxfp4_unify) or args.input != "wire"):
         parser.error("paired MXFP4 screening requires wire input and no other sweep mode")
