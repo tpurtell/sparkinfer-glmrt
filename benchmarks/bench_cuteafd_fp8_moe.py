@@ -645,6 +645,15 @@ def fc1_split_tiles(hidden, splits, tiles=(32, 64, 128, 192)):
             and split * (tile * 128 + max(tile * 2, 256) * 4) + 64 * tile <= 96 * 1024]
 
 
+def shipped_decode_recipe(family, hidden, rank_width, sm, capacity, policy_root):
+    policy = engine_layout_policy(policy_root)
+    tile = policy.native_slice_width(hidden, rank_width, sm, capacity, 128)
+    splits = policy.native_fc1_k_splits(hidden, rank_width, sm, capacity)
+    return dict(tile=tile, k_splits=splits,
+                fc2_n_splits=2 if capacity == 1 and tile == 128 and hidden % 256 == 0 else 1,
+                coded=family == "v41")
+
+
 def native_slice_width(family, rank_width):
     # Preserve V4.1 TP8's shipped width-192 fold across its masked final plane.
     return 192 if family == "v41" and (rank_width % 192 == 0 or rank_width == 288) else 128
@@ -1394,16 +1403,22 @@ def mxfp4_unify_screen(g, args, geometry_type):
             controls = ["current", "current-2", "current-3"]
             recipe = (shipped_prefill_recipe(g.name, g.hidden, width, capacity, args.engine_policy_root)
                       if args.shipped_prefill else None)
+            decode_recipe = (shipped_decode_recipe(g.name, g.hidden, width,
+                                properties.major * 10 + properties.minor, capacity, args.engine_policy_root)
+                             if v4 and capacity <= 80 and args.engine_policy_root else None)
             for label in controls:
                 if v4:
-                    # Production decode exports cap1 tile64, otherwise tile192.
+                    # Without engine metadata retain the historical diagnostic reference.
                     tile = (64 if capacity == 1 else 192) if args.capacity is not None else (128 if rows <= 80 and width == 576 else 192)
-                    tile = recipe["tile"] if recipe else tile
+                    tile = recipe["tile"] if recipe else decode_recipe["tile"] if decode_recipe else tile
                     control_tile = tile
                     runs[label], outputs[label], keep = native_pair_arm(
-                        x, ids, routing, weights, scales, tile, recipe["exact"] if recipe else rows <= 80 and width == 576,
+                        x, ids, routing, weights, scales, tile, recipe["exact"] if recipe else True if decode_recipe else rows <= 80 and width == 576,
                         recipe["atomic"] if recipe else False, recipe["coded"] if recipe else True,
-                        projection_contract=contract, combine_output=True, qualify=True, live_rows=rows)
+                        projection_contract={**contract, **({"fc2_n_splits": decode_recipe["fc2_n_splits"]} if decode_recipe else {})},
+                        fc1_k_splits=decode_recipe["k_splits"] if decode_recipe else 1,
+                        combine_output=True, qualify=True, live_rows=rows)
+                    executions[label] = keep[-1]
                     owned.append(keep)
                     control_qualification[label] = dict(deterministic=not (recipe and recipe["atomic"]), row_invariant=not (recipe and recipe["atomic"]),
                                                        prefix_failures=[], graph_reuse=True)
@@ -1611,7 +1626,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           control_route=("native-atomic" if recipe["atomic"] else "native-ordered") if recipe else "native-legacy" if v4 else control_route,
                           control_tile=control_tile if v4 else None,
                           control_storage=("exact" if recipe["exact"] and width % 128 else "legacy") if recipe else ("exact" if rows <= 80 and width == 576 else "legacy") if v4 else None,
-                          shipped_recipe=recipe,
+                          shipped_recipe=recipe, shipped_decode_recipe=decode_recipe,
                           stream_scale_representation="codes" if recipe and recipe["coded"] else "raw-ue8m0",
                           projection_contract=contract, control_qualification=control_qualification,
                           current_down="a8" if v4 or ((control_route == "stream" or

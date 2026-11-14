@@ -1076,6 +1076,19 @@ def test_unified_recorded_routes_preserve_live_ids_and_capacity(tmp_path, family
         bench.unified_screen_ids(waves, 2, 1, 4, 2, 2129, "cpu")
 
 
+@pytest.mark.parametrize("capacity,tile,splits,fc2", [(1, 128, 2, 2), (80, 128, 2, 1)])
+def test_shipped_decode_recipe_uses_device_capacity_policy(monkeypatch, capacity, tile, splits, fc2):
+    calls = []
+    def select(hidden, width, sm, cap, fallback):
+        calls.append((hidden, width, sm, cap, fallback))
+        return 128
+    monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
+        native_slice_width=select, native_fc1_k_splits=lambda *args: 2))
+    assert bench.shipped_decode_recipe("v41", 5120, 384, 121, capacity, "engine") == dict(
+        tile=tile, k_splits=splits, fc2_n_splits=fc2, coded=True)
+    assert calls == [(5120, 384, 121, capacity, 128)]
+
+
 def test_unified_random_routes_retain_capacity_seed_contract():
     torch.manual_seed(2129)
     expected = torch.rand(16, 8).topk(2, -1).indices.int()
