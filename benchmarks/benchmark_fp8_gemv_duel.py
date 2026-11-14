@@ -316,7 +316,7 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
 
 
 
-def run_native_route(spec, rows, route, samples, seed, row_scales):
+def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None):
     """One actual shipped route; cross-source interleaving belongs to the caller."""
     import cutlass
     import torch
@@ -328,12 +328,15 @@ def run_native_route(spec, rows, route, samples, seed, row_scales):
 
     n, k = map(int, spec.split("x"))
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn(rows, k, generator=generator, device="cuda").bfloat16()
-    w = (torch.randn(n, k, generator=generator, device="cuda") * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
     per_row = row_scales or route == "expanded"
-    s = torch.rand(n if per_row else (n + 127) // 128, k // 128,
-                   generator=generator, device="cuda") * 2e-4 + 1e-4
-    scale = s.t().contiguous() if route == "expanded" else s
+    if shared is None:
+        x = torch.randn(rows, k, generator=generator, device="cuda").bfloat16()
+        w = (torch.randn(n, k, generator=generator, device="cuda") * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
+        s = torch.rand(n if per_row else (n + 127) // 128, k // 128,
+                       generator=generator, device="cuda") * 2e-4 + 1e-4
+        scale = s.t().contiguous() if route == "expanded" else s
+    else:
+        x, w, s, scale = shared['x'], shared['w'], shared['s'], shared['scale']
     warps = _shipped_config().get((n, k), (gemv_warps(k), 4))[0]
     groups = fp8_gemv_tuning(n, k, warps=warps)[1]
     cta_tiles = None
@@ -351,27 +354,34 @@ def run_native_route(spec, rows, route, samples, seed, row_scales):
                         compute_warps=8, num_stages=3)
     else:
         op = ExpandedW8Prefill(n, k)
-    out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+    out = (torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+           if shared is None else shared['out'])
     operands = [Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),
                 Operand("s", torch.float32, "s", align=16), Operand("out", torch.bfloat16, "out", "out")]
     args = [x, w, scale, out]
     if route == "expanded":
         operands.append(Operand("scratch", torch.bfloat16, "scratch", "scratch"))
         args.append(torch.empty(n, k, device="cuda", dtype=torch.bfloat16))
-    program = compile_program(op, name=f"native_curve_{route}_{n}_{k}", operands=operands,
-                              scalars=(Scalar("rows"),), key=(route, n, k, per_row, op.key()))
+    cache_key = (route, n, k, per_row, op.key())
+    programs = {} if shared is None else shared['programs']
+    if cache_key not in programs:
+        programs[cache_key] = compile_program(
+            op, name=f"native_curve_{route}_{n}_{k}", operands=operands,
+            scalars=(Scalar("rows"),), key=cache_key)
+    program = programs[cache_key]
     def run():
         program.launch(*args, scalars=(rows,))
     l2 = torch.cuda.get_device_properties(0).L2_cache_size
-    flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
-    median, best, digest = _time(run, samples, flush, [out], "read")
-    assert torch.isfinite(out).all()
+    flush = (torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
+             if shared is None else shared['flush'])
+    median, best, digest = _time(run, samples, flush, [out[:rows]], "read")
+    assert torch.isfinite(out[:rows]).all()
     # Avoid a full F64 model matrix on the 16GiB build host: check real leading output columns.
     sample = min(128, n)
     grown = (s[:sample].repeat_interleave(128, 1) if per_row else
              s[:1].repeat_interleave(128, 0)[:sample].repeat_interleave(128, 1))
-    expected = x.double() @ (w[:sample].double() * grown.double()).t()
-    relative = (out[:, :sample].double() - expected).norm(dim=1) / expected.norm(dim=1).clamp_min(1e-30)
+    expected = x[:rows].double() @ (w[:sample].double() * grown.double()).t()
+    relative = (out[:rows, :sample].double() - expected).norm(dim=1) / expected.norm(dim=1).clamp_min(1e-30)
     assert float(relative.max()) < .008, float(relative.max())
     first = out[:1].clone()
     program.launch(*args, scalars=(1,))
@@ -379,13 +389,33 @@ def run_native_route(spec, rows, route, samples, seed, row_scales):
     assert torch.equal(first, out[:1]), "live row count changed the prefix"
     return dict(case=spec, route=route, rows=rows, per_row_scales=per_row,
                 warps=warps, groups=groups, cta_tiles=cta_tiles,
+                kernel=type(op).__name__, native_scale=getattr(op, 'native_scale', None),
                 median_read_us=median, min_read_us=best, us_per_row=median / rows,
                 max_sample_row_rel_l2=float(relative.max()), digest=digest, prefix_exact=True)
+
+
+def run_native_widths(spec, widths, route, samples, seed, row_scales):
+    """Reuse weights, inputs and the two capacity programs across live widths."""
+    import torch
+    n, k = map(int, spec.split('x'))
+    generator = torch.Generator(device='cuda').manual_seed(seed)
+    x = torch.randn(max(widths), k, generator=generator, device='cuda').bfloat16()
+    w = (torch.randn(n, k, generator=generator, device='cuda') * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
+    s = torch.rand(n if row_scales else (n + 127) // 128, k // 128,
+                   generator=generator, device='cuda') * 2e-4 + 1e-4
+    shared = dict(x=x, w=w, s=s, scale=s,
+                  out=torch.empty(max(widths), n, device='cuda', dtype=torch.bfloat16),
+                  flush=torch.empty(2 * torch.cuda.get_device_properties(0).L2_cache_size,
+                                    device='cuda', dtype=torch.uint8), programs={})
+    for rows in widths:
+        yield run_native_route(spec, rows, route, samples, seed, row_scales, shared)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shapes", default="qwen", help=f"{','.join(SETS)}, or a semicolon list of NxK")
     parser.add_argument("--rows", type=int, default=1)
+    parser.add_argument("--rows-list", help="comma-separated live decode widths; reuse inputs/programs (native routes only)")
     parser.add_argument("--variants", default="groups",
                         choices=("groups", "groups_wide", "hints", "depth", "combo", "prod", "gem", "wide"))
     parser.add_argument("--flush", default="zero", choices=("zero", "read"))
@@ -401,6 +431,16 @@ def main():
     parser.add_argument("--source-root", type=Path,
                         help="import b12x from this read-only baseline/candidate source")
     args = parser.parse_args()
+    widths = None
+    if args.rows_list:
+        try:
+            widths = tuple(int(value) for value in args.rows_list.split(','))
+        except ValueError:
+            parser.error('--rows-list requires comma-separated integers')
+        if not widths or min(widths) < 1 or max(widths) > 64:
+            parser.error('--rows-list widths must be in 1..64')
+        if args.native_route not in ('base', 'nc', 'selected'):
+            parser.error('--rows-list requires --native-route base, nc or selected')
     if args.source_root:
         sys.path.insert(0, str(args.source_root.resolve()))
     if args.shapes in SETS:
@@ -413,9 +453,13 @@ def main():
                           sms=torch.cuda.get_device_properties(0).multi_processor_count)), flush=True)
     for spec in specs:
         if args.native_route:
-            rec = run_native_route(spec, args.rows, args.native_route, args.samples, args.seed, args.row_scales)
-            rec.update(tag=args.tag, source_root=str(args.source_root))
-            print(json.dumps(rec), flush=True)
+            records = (run_native_widths(spec, widths, args.native_route, args.samples, args.seed,
+                                         args.row_scales) if widths else
+                       (run_native_route(spec, args.rows, args.native_route, args.samples, args.seed,
+                                         args.row_scales),))
+            for rec in records:
+                rec.update(tag=args.tag, source_root=str(args.source_root))
+                print(json.dumps(rec), flush=True)
             continue
         for rec in run_shape(spec, args.rows, args.variants, args.samples, args.seed, args.flush,
                              args.rows2 if args.rows2 > 0 else args.rows, args.row_scales):
