@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--rows", default="1,2,4,8,16,32,64")
     parser.add_argument("--shapes", default="query,key_value,output,shared_gate_up,shared_down")
     parser.add_argument("--samples", type=int, default=9)
-    parser.add_argument("--k-warps", type=int, choices=(1, 4), default=1)
+    parser.add_argument("--routed", action="store_true", help="measure the selected decode/prefill cutovers")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     rows_list = [int(v) for v in args.rows.split(",")]
@@ -54,7 +54,7 @@ def main():
         sm_count=properties.multi_processor_count, conditions=dict(
             cold_l2=True, graph_replay=True, quantization_excluded=True,
             native_group_size=32, accumulation="fixed K128", samples=args.samples,
-            k_warps=args.k_warps),
+            k_warps=4, routed=args.routed),
         source_sha256=hashlib.sha256((Path(__file__).resolve().parents[1] /
             "b12x/gemm/dense_mxfp8.py").read_bytes()).hexdigest(), measurements=[])
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -71,7 +71,8 @@ def main():
             for arm in ("prefill", "decode")}
         programs = {arm: compile_dense_mxfp8_aot(input_features=k, output_features=n,
             encoding="mxfp8", input_dtype="bf16", rotation_count=1, max_rows=capacity,
-            decode=arm == "decode", decode_k_warps=args.k_warps) for arm in outputs}
+            decode=("auto" if args.routed else True) if arm == "decode" else False)
+            for arm in outputs}
         quant = compile_dense_mxfp8_quant_aot(input_features=k, input_dtype="bf16",
             rotation_count=1, max_rows=capacity)
         with kernel_resolution_guard("MiniMax decode curve: frozen M=1..64"):

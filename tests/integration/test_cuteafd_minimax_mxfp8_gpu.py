@@ -6,9 +6,9 @@ from ..conftest import require_b12x
 torch = pytest.importorskip("torch")
 
 
-@pytest.mark.parametrize("decode,decode_k_warps", [(False, 1), (True, 1), (True, 4)])
+@pytest.mark.parametrize("decode", [False, True, "auto"])
 @pytest.mark.parametrize("k,n,side", [(6144, 512, 1), (3072, 6144, 2)])
-def test_bf16_ingress_native_mxfp8_reuses_records_and_live_rows(k, n, side, decode, decode_k_warps):
+def test_bf16_ingress_native_mxfp8_reuses_records_and_live_rows(k, n, side, decode):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.dense_mxfp8 import (
@@ -33,7 +33,7 @@ def test_bf16_ingress_native_mxfp8_reuses_records_and_live_rows(k, n, side, deco
     quant = compile_dense_mxfp8_quant_aot(input_features=k, input_dtype="bf16", rotation_count=1)
     core = compile_dense_mxfp8_aot(input_features=k, output_features=n, encoding="mxfp8",
                                  sharded_side=side, input_dtype="bf16", rotation_count=1,
-                                 decode=decode, decode_k_warps=decode_k_warps)
+                                 decode=decode)
     baseline = compile_dense_mxfp8_aot(input_features=k, output_features=n, encoding="mxfp8",
         sharded_side=side, input_dtype="bf16", rotation_count=1) if decode else core
     records = torch.empty(record_bytes(capacity, k), dtype=torch.uint8, device="cuda")
@@ -73,7 +73,7 @@ def test_bf16_ingress_native_mxfp8_reuses_records_and_live_rows(k, n, side, deco
         baseline.launch(table, payload, scales, records, output, scalars=(capacity, 0, limit))
         torch.cuda.synchronize()
         frozen = output.clone()
-        live_rows = range(1, 65) if decode else (1, 16, 17, 65, capacity)
+        live_rows = (*range(1, 65), 65, capacity) if decode else (1, 16, 17, 65, capacity)
         for rows in live_rows:
             output.fill_(float("nan"))
             launch(rows)

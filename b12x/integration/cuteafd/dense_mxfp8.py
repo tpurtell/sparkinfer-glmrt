@@ -6,6 +6,10 @@ Records have ceil(rows/16) * (K/32) * 528 bytes; capacity is planned, rows is li
 """
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass import Int32
 import torch
 from ._common import Operand, Scalar, compile_program
 
@@ -47,9 +51,40 @@ def compile_dense_mxfp8_quant_aot(*, input_features, max_rows=4096,
         key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1})
 
 
+# SM120 cold-L2 M1/2/4/8/16/32/64 curve, exact native group32 routes.
+# Entries are (K, N): largest decode M; unmeasured shapes keep prefill.
+NATIVE_DECODE_ROWS = {
+    (6144, 8192): 32, (6144, 512): 64, (6144, 128): 64,
+    (8192, 6144): 32, (6144, 3072): 64, (3072, 6144): 32,
+    (6144, 12288): 32, (12288, 6144): 32, (6144, 4096): 64,
+    (6144, 256): 64, (4096, 6144): 64, (6144, 1536): 64,
+    (1536, 6144): 32, (6144, 6144): 32,
+}
+
+
+class RoutedNativeMxfp8:
+    def __init__(self, g):
+        from b12x.gemm.dense_mxfp8 import NativeMxfp8Decode, TrellisPrefillMxfp8
+        self.decode = NativeMxfp8Decode(g)
+        self.prefill = TrellisPrefillMxfp8(g)
+        self.decode_rows = NATIVE_DECODE_ROWS.get((g["input_features"], g["output_features"]), 0)
+        self.scratch_bytes = self.prefill.scratch_bytes
+
+    @cute.jit
+    def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
+                 scales: cute.Pointer, records: cute.Pointer, output: cute.Pointer,
+                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        if rows <= Int32(self.decode_rows):
+            self.decode(rotated_inputs, payload, scales, records, output,
+                        rows, rotation_id, cta_limit, stream)
+        else:
+            self.prefill(rotated_inputs, payload, scales, records, output,
+                         rows, rotation_id, cta_limit, stream)
+
+
 def compile_dense_mxfp8_aot(*, input_features, output_features, encoding="trellis",
                           sharded_side=1, max_rows=4096, rotation_count=4,
-                          input_dtype="f16", decode=False, decode_k_warps=1):
+                          input_dtype="f16", decode=False):
     from b12x.gemm.dense_mxfp8 import NativeMxfp8Decode, TrellisPrefillMxfp8
     g = geometry(input_features, output_features, encoding=encoding,
                  sharded_side=sharded_side, max_rows=max_rows,
@@ -57,7 +92,14 @@ def compile_dense_mxfp8_aot(*, input_features, output_features, encoding="trelli
     k, n = input_features, output_features
     scale_dtype = torch.uint8 if encoding == "mxfp8" else torch.float16
     scale_count = k//128 if encoding == "trellis" else n*k//32
-    core = NativeMxfp8Decode(g, k_warps=decode_k_warps) if decode else TrellisPrefillMxfp8(g)
+    if decode not in (False, True, "auto"):
+        raise ValueError("native MXFP8 decode mode must be false, true or auto")
+    if decode and encoding != "mxfp8":
+        raise ValueError("native MXFP8 decode requires group32 weights")
+    core = (RoutedNativeMxfp8(g) if decode == "auto" else
+            NativeMxfp8Decode(g) if decode else TrellisPrefillMxfp8(g))
+    if decode == "auto" and torch.cuda.get_device_capability()[1] != 0:
+        core.decode_rows = 0
     return compile_program(core, name="dense_mxfp8", operands=(
         Operand("rotated_inputs", torch.int64, f"[{rotation_count}]"),
         Operand("payload", torch.uint8, f"[{k*n//(1 if encoding == 'mxfp8' else 2)}]"),
@@ -65,4 +107,4 @@ def compile_dense_mxfp8_aot(*, input_features, output_features, encoding="trelli
         Operand("records", torch.uint8, "[record_bytes]"),
         Operand("output", torch.float32, f"[rows,{n}]", "out")),
         scalars=(Scalar("rows"), Scalar("rotation_id"), Scalar("cta_limit")),
-        key=(*g.values(), decode, decode_k_warps), geometry={**g, "exact_row_cap": 2**31 - 1})
+        key=(*g.values(), decode), geometry={**g, "exact_row_cap": 2**31 - 1})
