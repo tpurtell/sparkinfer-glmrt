@@ -2916,8 +2916,10 @@ class DenseGemmKernel:
                             m_coord = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
                             n_coord = tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1]) + coord[1]
                             if m_coord < Int32(directC_mnl.shape[0]) and n_coord < Int32(directC_mnl.shape[1]):
-                                directC_mnl[(m_coord, n_coord, tile_coord_mnl[2])] = epilogue_op(
-                                    alpha_value * result_mn[acc_m, acc_n])
+                                value = result_mn[acc_m, acc_n]
+                                if cutlass.const_expr(not self.alpha_is_one):
+                                    value = alpha_value * value
+                                directC_mnl[(m_coord, n_coord, tile_coord_mnl[2])] = epilogue_op(value)
                     if cutlass.const_expr(self.single_work_tile_per_cta):
                         work_tile = WorkTileInfo(work_tile.tile_idx, cutlass.Boolean(0))
                     else:
