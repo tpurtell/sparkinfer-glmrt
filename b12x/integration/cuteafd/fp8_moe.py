@@ -92,6 +92,8 @@ from ._mxfp8_moe_stream import GroupedGamma, StreamMxfp8Down, StreamMxfp8GateUp
 from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
+from ._nvfp4_moe_dynamic import (ChunkActDyn, ChunkRowsDyn, StreamNvfp4GateUpDyn,
+                                 StreamNvfp4LinearDyn, nvfp4_amax_offset)
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
            "prefill_forms", "fp8_moe_segment_scratch_bytes"]
@@ -230,7 +232,7 @@ def _streams(wire: bool, weights: str = "fp8", prefill: str = "auto") -> bool:
     bound); otherwise the grouped GEMM SM120 was measured with."""
     if weights in ("mxfp4", "mxfp8"):
         return True
-    if weights in ("nvfp4", "nvfp4a4"):
+    if weights in ("nvfp4", "nvfp4a4", "nvfp4dyn"):
         return True
     if _w8a8(wire, weights, prefill):
         return True
@@ -239,7 +241,7 @@ def _streams(wire: bool, weights: str = "fp8", prefill: str = "auto") -> bool:
 
 def auto_large_rows(wire: bool, weights: str = "fp8", prefill: str = "auto") -> int:
     """Live-row threshold of ``auto``'s large route (``stream`` or ``prefill``)."""
-    if weights in ("nvfp4", "nvfp4a4", "mxfp8"):
+    if weights in ("nvfp4", "nvfp4a4", "nvfp4dyn", "mxfp8"):
         return 0  # Declared W4A4 / MXFP8 W8A8 arithmetic is independent of the live-row count.
     if weights == "mxfp4":
         return AUTO_MXFP4_STREAM_ROWS_SM121 if _sm121() else AUTO_MXFP4_STREAM_ROWS
@@ -286,7 +288,8 @@ class Fp8MoeGeometry:
     projection: str = "bf16"
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
-    # SiTU (``activation="situ"``): gate softcap and up softcap (Inkling 2: 4, 25).
+    # SiTU (``activation="situ"``, Inkling 2: 4, 25): gate softcap and up softcap; the route
+    # weight multiplies the activation before the FC2 quantization.
     situ_gate_cap: float = 4.0
     situ_up_cap: float = 25.0
 
@@ -295,8 +298,13 @@ class Fp8MoeGeometry:
 
         if self.activation not in ("silu_bf16_product", "silu_post_clamp_fp32_product", "swigluoai", "situ"):
             raise ValueError("unknown expert activation contract")
-        if (self.activation == "situ") != (self.weights == "mxfp8"):
-            raise ValueError("MXFP8 experts carry the SiTU contract (route weight before FC2), and only they do")
+        # SiTU (route weight before FC2) is the Inkling contract: MXFP8 W8A8 experts always carry it,
+        # and NVFP4 carries it only as the dynamic-amax W4A4 route.
+        situ = self.activation == "situ"
+        if self.weights == "mxfp8" and not situ:
+            raise ValueError("MXFP8 experts carry the SiTU contract (route weight before FC2)")
+        if situ and not (self.weights == "mxfp8" or (self.weights == "nvfp4" and self.activations == "a4")):
+            raise ValueError("SiTU is the Inkling contract: MXFP8 W8A8 or dynamic-amax NVFP4 W4A4 experts")
         if self.activation == "swigluoai":
             if self.weights != "nvfp4" or self.swiglu_limit <= 0:
                 raise ValueError("SwiGLU-OAI requires native NVFP4 and a positive limit")
@@ -349,8 +357,15 @@ class Fp8MoeGeometry:
         return -(-(self.intermediate // 128) // self.tp) * 128
 
     @property
+    def dynamic_nvfp4(self) -> bool:
+        """Inkling's native NVFP4: per-token amax, fouroversix block scales, amax/denominator weights."""
+        return self.weights == "nvfp4" and self.activation == "situ"
+
+    @property
     def kind(self) -> str:
-        """The weight format, ``nvfp4a4`` for NVFP4 with the W4A4 stream route."""
+        """The weight format, ``nvfp4a4`` for NVFP4 with the W4A4 stream route (``nvfp4dyn``: dynamic amax)."""
+        if self.dynamic_nvfp4:
+            return "nvfp4dyn"
         return "nvfp4a4" if self.activations == "a4" else self.weights
 
     def with_tp(self, tp: int) -> "Fp8MoeGeometry":
@@ -377,6 +392,11 @@ GEOMETRIES = {
     # MiMo V2.6 Pro: MXFP4 experts, 384 of them, top-8, unclamped SiLU.
     "mimop": Fp8MoeGeometry("mimop", hidden=6144, experts=384, top_k=8, intermediate=2048, weights="mxfp4"),
     "mimof": Fp8MoeGeometry("mimof", hidden=4096, experts=256, top_k=8, intermediate=2048, weights="mxfp4"),
+    # Inkling 2 Small native NVFP4: per-token amax (fouroversix) W4A4, SiTU (4 / 25) with the
+    # route weight before the FC2 quantization, amax/denominator weight scales (``_nvfp4_moe_dynamic``).
+    "inkling2_nvfp4": Fp8MoeGeometry("inkling2_nvfp4", hidden=4608, experts=384, top_k=8, intermediate=2304,
+                                     weights="nvfp4", activations="a4", activation="situ",
+                                     situ_gate_cap=4.0, situ_up_cap=25.0),
     # Inkling 2 Small: MXFP8 W8A8 experts, 384 of them, top-8, SiTU (4 / 25) with the
     # route weight applied before the FC2 quantization (``_mxfp8_moe_stream``).
     "inkling2_mxfp8": Fp8MoeGeometry("inkling2_mxfp8", hidden=4608, experts=384, top_k=8, intermediate=2304,
@@ -421,6 +441,25 @@ def _grouped_rows(g: Fp8MoeGeometry, route: str, rows: int) -> int:
 def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
              mxfp4_down_a8: bool = False) -> list[int]:
     rows = max(int(rows), 1)
+    if route == "stream" and g.dynamic_nvfp4:
+        pairs = rows * g.top_k
+        padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
+        parts = g.slice // 64
+        return [
+            meta_words(g.experts, stream_max_tiles(g.experts, pairs)) * 4,
+            pairs * 4,                                 # pair_row
+            pairs * 4,                                 # pair_pos
+            padded * g.hidden // 2,                    # packed input rows
+            padded * g.hidden // 16,                   # their E4M3 scales
+            padded * 4,                                # input row amax
+            pairs * 4,                                 # grouped route weights (gamma)
+            padded * g.slice * 2,                      # BF16 act rows (SiTU x gamma)
+            padded * (g.slice // 16) * 4,              # act amax partials per 16-column group
+            padded * g.slice // 2,                     # packed act rows
+            padded * g.slice // 16,                    # their scales
+            padded * 4,                                # act row amax
+            pairs * g.hidden * 2,                      # down output
+        ]
     if route == "stream" and g.activations == "a4":
         pairs = rows * g.top_k
         padded = stream_max_tiles(g.experts, pairs) * STREAM_TILE_M
@@ -503,9 +542,9 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8",
     other formats retain their row-count-dependent policies."""
     # A4 is a numerical contract, not a large-row optimization. Chunk padding
     # also supports a single live row; never fall back to the A16 GEMV.
-    if weights in ("nvfp4", "nvfp4a4"):
+    if weights in ("nvfp4", "nvfp4a4", "nvfp4dyn"):
         if wire:
-            raise ValueError("calibrated NVFP4 A4 requires original BF16 input")
+            raise ValueError("NVFP4 A4 requires original BF16 input")
         return "stream"
     if weights == "bf16":
         if wire or route == "stream":
@@ -834,8 +873,109 @@ class _StreamNvfp4A4Route:
             self.combine(y, pair_pos, weights, out, rows, stream)
 
 
+class _StreamNvfp4DynRoute:
+    """The dynamic-amax NVFP4 ``stream`` route (``_nvfp4_moe_dynamic``, Inkling 2 native):
+    BF16 rows quantized per token (fouroversix), fused gate/up with the per-row FC1
+    factor and SiTU x gamma, the act rows quantized per token, the down with the
+    per-row FC2 factor, an unweighted combine. Wide tiles only (the sparse 16-row
+    tiles of the calibrated route are a later specialization)."""
+
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
+        if wire:
+            raise ValueError("dynamic NVFP4 takes original BF16 rows")
+        self.g = g
+        h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
+        self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
+        self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
+                            chunked=True)
+        self.rows_in = ChunkRowsDyn(k=h, experts=e)
+        self.gamma = GroupedGamma(top_k=k)
+        # The calibrated A4 route's split: chunks of <= 16 live rows take the sparse 16-row tiles
+        # (narrowest N whose grid fills the device), chunks of >= 17 the wide 128-row tile. The
+        # masks are complementary, so exactly one tile runs per compact expert chunk.
+        caps = dict(gate_cap=g.situ_gate_cap, up_cap=g.situ_up_cap)
+        self.gate_up = StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, live_min=17, **caps)
+        self.small_gate = tuple(StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, tile_m=16, tile_n=n,
+                                                     live_max=16, stages=SMALL_GATE_STAGES, **caps)
+                                for n in (32, 64, 128))
+        self.act = ChunkActDyn(inter=i, experts=e, parts=i // 64)
+        self.down = StreamNvfp4LinearDyn(n=h, k=i, experts=e, live_min=17)
+        self.small_down = tuple(StreamNvfp4LinearDyn(n=h, k=i, experts=e, tile_m=16, tile_n=n, live_max=16)
+                                for n in (32, 64, 128))
+        self.core_only = False
+        self.combine = MoeCombine(hidden=h, top_k=k, unit_weights=True)
+
+    def key(self) -> tuple:
+        return ("stream_nvfp4_dyn", self.max_tiles, self.rows_in.key(), self.gamma.key(), self.gate_up.key(),
+                self.act.key(), self.down.key(), self.combine.key(),
+                tuple(p.key() for p in self.small_gate), tuple(p.key() for p in self.small_down))
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
+                 s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer, w2: cute.Pointer, s2: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        g = self.g
+        pairs = rows * Int32(g.top_k)
+        groups = pairs
+        if groups > Int32(g.experts):
+            groups = Int32(g.experts)
+        max_tiles = (pairs + Int32(STREAM_TILE_M - 1)) // Int32(STREAM_TILE_M) + groups
+        padded = Int64(max_tiles) * Int64(STREAM_TILE_M)
+        groups16 = Int64(g.slice // 16)
+        base = Int64(scratch.toint())
+        pair_row_at = base + _al(Int64(4 * meta_words(g.experts, self.max_tiles)))
+        pair_pos_at = pair_row_at + _al(Int64(pairs) * Int64(4))
+        xq_at = pair_pos_at + _al(Int64(pairs) * Int64(4))
+        xs_at = xq_at + _al(padded * Int64(g.hidden // 2))
+        xamax_at = xs_at + _al(padded * Int64(g.hidden // 16))
+        gamma_at = xamax_at + _al(padded * Int64(4))
+        act16_at = gamma_at + _al(Int64(pairs) * Int64(4))
+        part_at = act16_at + _al(padded * Int64(g.slice * 2))
+        aq_at = part_at + _al(padded * groups16 * Int64(4))
+        as_at = aq_at + _al(padded * Int64(g.slice // 2))
+        aamax_at = as_at + _al(padded * Int64(g.slice // 16))
+        y_at = aamax_at + _al(padded * Int64(4))
+        ptr = lambda dtype, at: cute.make_ptr(dtype, at, cute.AddressSpace.gmem, assumed_align=16)  # noqa: E731
+        meta = ptr(cutlass.Int32, base)
+        pair_row = ptr(cutlass.Int32, pair_row_at)
+        pair_pos = ptr(cutlass.Int32, pair_pos_at)
+        xq, xs, xamax = ptr(cutlass.Uint8, xq_at), ptr(cutlass.Uint8, xs_at), ptr(cutlass.Float32, xamax_at)
+        gamma = ptr(cutlass.Float32, gamma_at)
+        act16, part = ptr(cutlass.BFloat16, act16_at), ptr(cutlass.Float32, part_at)
+        aq, a_s, aamax = ptr(cutlass.Uint8, aq_at), ptr(cutlass.Uint8, as_at), ptr(cutlass.Float32, aamax_at)
+        y = ptr(cutlass.BFloat16, y_at)
+        ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
+        self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
+        self.gamma(pair_pos, weights, gamma, rows, stream)
+        self.rows_in(x, pair_row, meta, xq, xs, xamax, pairs, stream)
+        dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part)
+        sms = runtime_num_sm()
+        target = sms * Int32(SMALL_GATE_CTAS_PER_SM)
+        if Int32(g.top_k * (g.slice // 16)) >= target:
+            self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+        elif Int32(g.top_k * (g.slice // 32)) >= target:
+            self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+        else:
+            self.small_gate[2](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+        if pairs > Int32(16):
+            self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+        self.act(act16, part, meta, aq, a_s, aamax, max_tiles, stream)
+        if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
+            self.small_down[2](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+        elif Int32(g.top_k * (g.hidden // 64)) >= sms * Int32(2):
+            self.small_down[1](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+        else:
+            self.small_down[0](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+        if pairs > Int32(16):
+            self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+        if cutlass.const_expr(not self.core_only):
+            self.combine(y, pair_pos, weights, out, rows, stream)
+
+
 def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
                 mxfp4_down_a8: bool = False):
+    if route == "stream" and g.dynamic_nvfp4:
+        return _StreamNvfp4DynRoute(g, max_rows, wire)
     if route == "stream" and g.activations == "a4":
         return _StreamNvfp4A4Route(g, max_rows, wire)
     if route == "stream":
@@ -956,7 +1096,20 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
          else Operand("x", torch.bfloat16, f"[rows,{h}]"))
-    if g.weights == "nvfp4":
+    if g.dynamic_nvfp4:
+        gate_up_scales = nvfp4_amax_offset(e, i, h) + 4 * e + 4
+        down_scales = nvfp4_amax_offset(e, h, i) + 4 * e + 4
+        weights = (
+            Operand("w1", torch.uint8, f"[{e},{i},{h // 2}]", note="packed E2M1 (even element low); w13 gate rows"),
+            Operand("s1", torch.uint8, f"[{gate_up_scales}]", align=4,
+                    note=f"E4M3 [{e},{i},{h // 16}] then FP32 weight amax [{e}] and outer_scale_denominator [1]"),
+            Operand("w3", torch.uint8, f"[{e},{i},{h // 2}]", note="w13 up rows"),
+            Operand("s3", torch.uint8, f"[{gate_up_scales}]", align=4),
+            Operand("w2", torch.uint8, f"[{e},{h},{i // 2}]"),
+            Operand("s2", torch.uint8, f"[{down_scales}]", align=4,
+                    note=f"E4M3 [{e},{h},{i // 16}] then FP32 weight amax [{e}] and outer_scale_denominator [1]"),
+        )
+    elif g.weights == "nvfp4":
         gate_up_scales = nvfp4_alpha_offset(e, i, h) + 8 * e
         down_scales = nvfp4_alpha_offset(e, h, i) + 8 * e
         weights = (
@@ -1029,6 +1182,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
                      if g.activation == "swigluoai" else {}),
                   **({"situ_gate_cap": g.situ_gate_cap, "situ_up_cap": g.situ_up_cap,
                       "route_weight_before_fc2": True} if g.activation == "situ" else {}),
+                  **({"activation_scale": "per_token_amax_fouroversix", "weight_scale": "amax_denominator"}
+                     if g.dynamic_nvfp4 else {}),
                   "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8),
                   "weight_read_grouping": ({"contract": "exact_grouping", "segments": [{"end_rows": int(max_rows), "group_rows": STREAM_TILE_M}]}
                                            if row_addresses else launch.weight_read_grouping(g.weights, max_rows)),
