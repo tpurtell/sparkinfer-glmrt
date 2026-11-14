@@ -28,11 +28,16 @@ class KimiDsaGeometry:
     index_topk: int = 2048
     index_norm_eps: float = 1e-5
     page_rows: int = 64
+    # SM120 same-row exact oracle and warmed 2048/2752/4096-row curve.
+    sparse_mla_row_chunk_size: int = 64
 
     def __post_init__(self):
         if (self.hidden, self.q_lora_rank, self.index_heads, self.index_head_dim,
             self.index_topk, self.page_rows) != (7168, 1536, 32, 128, 2048, 64):
             raise ValueError("unsupported Kimi K3.1 indexer geometry")
+        if (type(self.sparse_mla_row_chunk_size) is not int
+                or not 1 <= self.sparse_mla_row_chunk_size <= 4096):
+            raise ValueError("sparse MLA row chunk size must be an integer in 1..4096")
         if not math.isfinite(self.index_norm_eps) or self.index_norm_eps <= 0:
             raise ValueError("indexer epsilon must be finite and positive")
 

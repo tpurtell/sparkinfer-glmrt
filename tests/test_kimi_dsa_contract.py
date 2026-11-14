@@ -56,6 +56,11 @@ def test_kimi_index_post_explicit_qdq_abi():
     assert core.page_bytes == 8448 and not core.rope
     assert result["scalars"] == ("rows",)
     assert result["geometry"]["scale_storage"] == "float32"
+    assert result["geometry"]["sparse_mla_row_chunk_size"] == 64
+    assert ns["KimiDsaGeometry"](sparse_mla_row_chunk_size=512).sparse_mla_row_chunk_size == 512
+    for invalid in (0, -1, 4097, 1.5, True):
+        with pytest.raises(ValueError, match="row chunk size"):
+            ns["KimiDsaGeometry"](sparse_mla_row_chunk_size=invalid)
     assert [op[0][0] for op in result["operands"]] == ["iq", "kw", "positions", "slots", "cos_sin",
         "k_weight", "k_bias", "q_fp8", "head_weights", "cache"]
     for eps in (0, -1, float("inf"), float("nan")):
