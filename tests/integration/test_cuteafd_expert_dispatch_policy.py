@@ -12,12 +12,14 @@ SOURCE = Path(__file__).resolve().parents[2] / "b12x/integration/cuteafd/fp8_moe
 
 def policy(sm):
     tree = ast.parse(SOURCE.read_text())
-    names = {"_w8a8", "_mxfp4_down_a8", "_streams", "auto_large_rows", "_large_route", "prefill_forms", "_resolve"}
+    names = {"_w8a8", "_mxfp4_down_a8", "_streams", "_bf16_fp8_prefill_rows",
+             "auto_large_rows", "_large_route", "prefill_forms", "_resolve"}
     nodes = [n for n in tree.body if isinstance(n, ast.Assign)
              and all(isinstance(t, ast.Name) for t in n.targets)
              and isinstance(n.value, (ast.Constant, ast.Tuple))]
     nodes += [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
-    env = {"_sm121": lambda: sm == 121}
+    env = {"_sm121": lambda: sm == 121,
+           "torch": SimpleNamespace(cuda=SimpleNamespace(get_device_capability=lambda: divmod(sm, 10)))}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), env)
     return tree, env
 
@@ -54,6 +56,28 @@ def test_coordinator_auto_covers_decode_and_prefill(sm, weights):
     for rows in [1, 16, 80, threshold or 128, max(threshold + 1, 256), 4096]:
         env["__call__"](plan, *([None] * 11), rows, None)
         assert calls[-1] == ("decode" if resolved == "auto" and rows <= threshold else expected_large)
+
+
+@pytest.mark.parametrize("sm,glm,step", [(120, 2752, 4096), (121, 4096, 4096), (100, 2048, 2048)])
+def test_measured_bf16_fp8_cutoffs_follow_cc_and_actual_slice(sm, glm, step):
+    _, env = policy(sm)
+    shapes = [(6144, 512, 256, "silu_bf16_product", 0, glm),
+              (4096, 384, 352, "silu_post_clamp_fp32_product", 7.0, step)]
+    for hidden, width, experts, activation, limit, expected in shapes:
+        g = SimpleNamespace(hidden=hidden, slice=width, experts=experts, top_k=8,
+                            activation=activation, swiglu_limit=limit, projection="bf16", activations="a16")
+        cutoff = env["auto_large_rows"]
+        assert cutoff(False, geometry=g) == expected
+        assert cutoff(False, prefill="w8a16", geometry=g) == expected
+        assert env["_resolve"]("auto", expected, False, geometry=g) == "decode"
+        assert env["_resolve"]("auto", expected + 1, False, geometry=g) == "auto"
+        for field, value in [("slice", width + 128), ("experts", experts + 1), ("top_k", 4),
+                             ("activation", "unknown"), ("swiglu_limit", limit + 1), ("projection", "other")]:
+            changed = SimpleNamespace(**(vars(g) | {field: value}))
+            assert cutoff(False, geometry=changed) == 2048
+        assert cutoff(False, "bf16", geometry=g) == 2048
+        assert cutoff(True, geometry=g) == cutoff(True)
+        assert cutoff(False, prefill="w8a8", geometry=g) == cutoff(False, prefill="w8a8")
 
 
 def grouping_method():
@@ -188,7 +212,7 @@ def test_segment_scratch_uses_live_rows_but_compiled_metadata_offset(weights, fo
                mxfp8_down_row_bytes=lambda width: (width + width // 32 + 15) // 16 * 16)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), env)
     geometry = SimpleNamespace(weights=weights, kind=weights, hidden=4096, experts=256,
-                               top_k=8, slice=384, activations="a16")
+                               top_k=8, slice=384, activations="a16", dynamic_nvfp4=False)
     scratch = env["fp8_moe_segment_scratch_bytes"]
     align = env["_align"]
     pairs = 8256 * 8
