@@ -2906,7 +2906,8 @@ class DenseGemmKernel:
                         tile_sched.advance_to_next_work()
                         work_tile = tile_sched.get_current_work()
 
-                if cutlass.const_expr(self.block_fp8 and self.c_dtype == cutlass.Float32):
+                if cutlass.const_expr(self.block_fp8 and self.c_dtype == cutlass.Float32
+                        and self.split_k_slices == 1 and not self.quantize_c and not self.row_scale):
                     # Native TP partials retain the FP32 accumulator. Its MMA
                     # coordinates avoid the 16-bit shared-store retile entirely.
                     result_mn = _reshape_acc_to_mn(accumulators)
