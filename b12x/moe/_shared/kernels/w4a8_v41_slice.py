@@ -528,7 +528,18 @@ class V41SliceFc1Kernel:
         self.cta_splits = fc1_cta_splits
         self.k_splits = fc1_k_splits
         self.threads = 128 * fc1_k_splits
-        self.shared_bytes = (fc1_k_splits * (width * 128 + max(width * 2, 256) * 4)
+        self.row_major_resident = bool(row_major_resident)
+        slot_bytes = fc1_k_splits * (width * 128 + max(width * 2, 256) * 4)
+        # Two-stage weight staging keeps the next K tile's copies in flight
+        # while the current tile's MMAs run. Arithmetic, copy order and the
+        # K accumulation order are unchanged; configurations where the second
+        # slot would exceed the established budget keep the single-slot
+        # schedule.
+        # Decode-only: prefill capacities keep the original single slot so
+        # their resident-CTA count cannot change.
+        self.two_stage = (capacity <= 80
+                          and 2 * slot_bytes + 16 * width * 4 <= 96 * 1024)
+        self.shared_bytes = ((2 if self.two_stage else 1) * slot_bytes
                              + 16 * width * 4)
         assert self.shared_bytes <= 96 * 1024, "FC1 split exceeds shared-memory budget"
         self.a16 = activation_precision == "a16"
@@ -543,7 +554,6 @@ class V41SliceFc1Kernel:
         self.hidden_tiles = hidden // 128
         self.intermediate = intermediate
         self.exact_storage = bool(exact_storage)
-        self.row_major_resident = bool(row_major_resident)
         self.scale_codes = bool(scale_codes)
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.slices = (intermediate + width - 1) // width
@@ -572,6 +582,129 @@ class V41SliceFc1Kernel:
             self.fold_kernel(routing, partial, metadata).launch(
                 grid=(self.slices, groups, 1), block=(128, 1, 1), stream=stream)
 
+    @cute.jit
+    def stage_fc1_tile(self, w13, s13, raw, b, sf, expert: Int64, start: Int32,
+                       kt: Int32, thread: Int32, bb: Int32, sb: Int32,
+                       bbase: Int32, sbase: Int32):
+        """Issue one K tile's FC1 weight and scale copies into one shared slot."""
+        if cutlass.const_expr(self.row_major_resident):
+            stage_row_major_mma(w13, s13, raw, b, sf, expert, start, kt * 128,
+                                thread, self.width, self.intermediate, self.hidden,
+                                True, bbase, sbase)
+            return
+        if cutlass.const_expr(self.exact_storage):
+            stage_v41_exact_b(
+                w13,
+                bb,
+                expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                start,
+                kt,
+                thread,
+                self.width,
+                self.intermediate,
+                self.hidden,
+                True,
+            )
+        else:
+            stage_repacked_b_slice(
+                w13,
+                bb,
+                expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                Int32(self.hidden_tiles),
+                kt,
+                start,
+                thread,
+                128,
+                self.width,
+            )
+        if cutlass.const_expr(self.exact_storage):
+            stage_v41_exact_b(
+                w13,
+                bb + self.width * 64,
+                expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                start,
+                kt,
+                thread,
+                self.width,
+                self.intermediate,
+                self.hidden,
+                True,
+                1,
+            )
+        else:
+            stage_repacked_b_slice(
+                w13,
+                bb + self.width * 64,
+                expert * Int64(self.kernel_intermediate * self.hidden // 4),
+                Int32(self.hidden_tiles),
+                kt,
+                start + self.kernel_intermediate,
+                thread,
+                128,
+                self.width,
+            )
+        if cutlass.const_expr(self.scale_codes):
+            stage_scale_codes_slice(s13, sb, expert, kt, start, thread,
+                                    self.width, 2 * self.kernel_intermediate,
+                                    self.hidden // 32,
+                                    self.intermediate if self.exact_storage else 0)
+        elif cutlass.const_expr(self.exact_storage):
+            stage_v41_exact_sfb(
+                s13,
+                sb,
+                expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                start,
+                kt,
+                thread,
+                self.width,
+                self.intermediate,
+                self.hidden,
+                True,
+            )
+        else:
+            stage_repacked_sfb_slice(
+                s13,
+                sb,
+                expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                Int32(self.hidden_tiles),
+                kt,
+                start,
+                thread,
+                128,
+                self.width,
+            )
+        if cutlass.const_expr(self.scale_codes):
+            stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
+                                    start + self.kernel_intermediate, thread,
+                                    self.width, 2 * self.kernel_intermediate,
+                                    self.hidden // 32,
+                                    self.intermediate if self.exact_storage else 0)
+        elif cutlass.const_expr(self.exact_storage):
+            stage_v41_exact_sfb(
+                s13,
+                sb + self.width * 4,
+                expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                start,
+                kt,
+                thread,
+                self.width,
+                self.intermediate,
+                self.hidden,
+                True,
+                1,
+            )
+        else:
+            stage_repacked_sfb_slice(
+                s13,
+                sb + self.width * 4,
+                expert * Int64(self.kernel_intermediate * self.hidden // 64),
+                Int32(self.hidden_tiles),
+                kt,
+                start + self.kernel_intermediate,
+                thread,
+                128,
+                self.width,
+            )
 
     @cute.kernel
     def kernel(
@@ -607,14 +740,17 @@ class V41SliceFc1Kernel:
             input_scale = Int32(metadata[group, 3 + g + c * 8]) // Int32(self.topk)
         if rows > 0:
             start = slice_id * Int32(self.width)
+            pipeline = self.two_stage and not self.row_major_resident
+            stages = 2 if pipeline else 1
             smem = cutlass.utils.SmemAllocator()
             b = smem.allocate_tensor(
-                Uint32, cute.make_layout(self.k_splits * self.width * 32), byte_alignment=16
+                Uint32, cute.make_layout(stages * self.k_splits * self.width * 32), byte_alignment=16
             )
+            raw = b
             if cutlass.const_expr(self.row_major_resident):
                 raw = smem.allocate_tensor(Uint32, cute.make_layout(self.k_splits * self.width * 32), byte_alignment=16)
             sf = smem.allocate_tensor(
-                Uint32, cute.make_layout(self.k_splits * max(self.width * 2, 256)), byte_alignment=16
+                Uint32, cute.make_layout(stages * self.k_splits * max(self.width * 2, 256)), byte_alignment=16
             )
             mid = smem.allocate_tensor(
                 Float32, cute.make_layout((16, self.width)), byte_alignment=16
@@ -625,138 +761,49 @@ class V41SliceFc1Kernel:
                                         cute.make_layout((self.k_splits, 16, self.width)))
             bbase = team * Int32(self.width * 32)
             sbase = team * Int32(max(self.width * 2, 256))
-            bb = shared_ptr_to_u32(b.iterator) + bbase * Int32(4)
-            sb = shared_ptr_to_u32(sf.iterator) + sbase * Int32(4)
+            b_addr = shared_ptr_to_u32(b.iterator)
+            s_addr = shared_ptr_to_u32(sf.iterator)
+            bb = b_addr + bbase * Int32(4)
+            sb = s_addr + sbase * Int32(4)
             gate = cute.make_rmem_tensor((self.width // 32, 4), Float32)
             gate.fill(0)
             up = cute.make_rmem_tensor((self.width // 32, 4), Float32)
             up.fill(0)
+            steps = self.hidden_tiles // (self.k_splits * self.cta_splits)
             # Each four-warp team owns disjoint K128 iterations; all teams
             # synchronize uniformly and fold their FP32 sums in team order.
-            for step in range(self.hidden_tiles // (self.k_splits * self.cta_splits)):
+            # The two-stage schedule keeps the next tile's copies in flight
+            # while the current tile's MMAs run; write order, K order and the
+            # in-register accumulation are identical. Splits whose second slot
+            # would exceed the shared budget keep the original single slot.
+            if cutlass.const_expr(pipeline):
+                self.stage_fc1_tile(w13, s13, raw, b, sf, expert, start,
+                                    cute.arch.block_idx()[2] * Int32(self.k_splits) + team,
+                                    team_tid, bb, sb, bbase, sbase)
+                cute.arch.cp_async_commit_group()
+            for step in range(steps):
                 kt = ((step * Int32(self.cta_splits) + cute.arch.block_idx()[2])
                       * Int32(self.k_splits) + team)
-                if cutlass.const_expr(self.row_major_resident):
-                    stage_row_major_mma(w13, s13, raw, b, sf, expert, start, kt * 128,
-                                        team_tid, self.width, self.intermediate, self.hidden,
-                                        True, bbase, sbase)
+                if cutlass.const_expr(pipeline):
+                    slot = Int32(step % 2)
+                    next_base = Int32((step + 1) % 2) * Int32(self.k_splits) + team
+                    if step + 1 < steps:
+                        self.stage_fc1_tile(
+                            w13, s13, raw, b, sf, expert, start,
+                            kt + Int32(self.cta_splits * self.k_splits), team_tid,
+                            b_addr + next_base * Int32(self.width * 128),
+                            s_addr + next_base * Int32(max(self.width * 2, 256) * 4),
+                            next_base * Int32(self.width * 32),
+                            next_base * Int32(max(self.width * 2, 256)))
                 else:
-                    if cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_b(
-                            w13,
-                            bb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                            start,
-                            kt,
-                            team_tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            True,
-                        )
-                    else:
-                        stage_repacked_b_slice(
-                            w13,
-                            bb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                            Int32(self.hidden_tiles),
-                            kt,
-                            start,
-                            team_tid,
-                            128,
-                            self.width,
-                        )
-                    if cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_b(
-                            w13,
-                            bb + self.width * 64,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                            start,
-                            kt,
-                            team_tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            True,
-                            1,
-                        )
-                    else:
-                        stage_repacked_b_slice(
-                            w13,
-                            bb + self.width * 64,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 4),
-                            Int32(self.hidden_tiles),
-                            kt,
-                            start + self.kernel_intermediate,
-                            team_tid,
-                            128,
-                            self.width,
-                        )
-                    if cutlass.const_expr(self.scale_codes):
-                        stage_scale_codes_slice(s13, sb, expert, kt, start, team_tid,
-                                                self.width, 2 * self.kernel_intermediate,
-                                                self.hidden // 32,
-                                                self.intermediate if self.exact_storage else 0)
-                    elif cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_sfb(
-                            s13,
-                            sb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                            start,
-                            kt,
-                            team_tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            True,
-                        )
-                    else:
-                        stage_repacked_sfb_slice(
-                            s13,
-                            sb,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                            Int32(self.hidden_tiles),
-                            kt,
-                            start,
-                            team_tid,
-                            128,
-                            self.width,
-                        )
-                    if cutlass.const_expr(self.scale_codes):
-                        stage_scale_codes_slice(s13, sb + self.width * 4, expert, kt,
-                                                start + self.kernel_intermediate, team_tid,
-                                                self.width, 2 * self.kernel_intermediate,
-                                                self.hidden // 32,
-                                                self.intermediate if self.exact_storage else 0)
-                    elif cutlass.const_expr(self.exact_storage):
-                        stage_v41_exact_sfb(
-                            s13,
-                            sb + self.width * 4,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                            start,
-                            kt,
-                            team_tid,
-                            self.width,
-                            self.intermediate,
-                            self.hidden,
-                            True,
-                            1,
-                        )
-                    else:
-                        stage_repacked_sfb_slice(
-                            s13,
-                            sb + self.width * 4,
-                            expert * Int64(self.kernel_intermediate * self.hidden // 64),
-                            Int32(self.hidden_tiles),
-                            kt,
-                            start + self.kernel_intermediate,
-                            team_tid,
-                            128,
-                            self.width,
-                        )
+                    self.stage_fc1_tile(w13, s13, raw, b, sf, expert, start, kt,
+                                        team_tid, bb, sb, bbase, sbase)
                 cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
+                cute.arch.cp_async_wait_group(1 if pipeline else 0)
                 cute.arch.sync_threads()
+                if cutlass.const_expr(pipeline):
+                    bbase = (slot * Int32(self.k_splits) + team) * Int32(self.width * 32)
+                    sbase = (slot * Int32(self.k_splits) + team) * Int32(max(self.width * 2, 256))
                 if cutlass.const_expr(self.a16):
                     for kb in cutlass.range_constexpr(4):
                         for half in cutlass.range_constexpr(2):
@@ -1021,6 +1068,11 @@ class V41SliceFc2Kernel:
         self.exact_storage = bool(exact_storage)
         self.row_major_resident = bool(row_major_resident)
         self.scale_codes = bool(scale_codes)
+        # One N128 output tile's K slice is staged at a time; at decode
+        # capacity a second small weight slot lets the next slice's copies run
+        # under the current slice's MMAs without changing slice or K order.
+        # Prefill keeps the original single slot.
+        self.two_stage = capacity <= 80
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.w2_intermediate = self.kernel_intermediate
         self.w2_scale_columns = intermediate // 32
@@ -1047,6 +1099,70 @@ class V41SliceFc2Kernel:
             block=(128, 1, 1),
             stream=stream,
         )
+
+    @cute.jit
+    def stage_fc2_slice(self, w2, s2, raw, b, sf_slot, expert: Int64, output_tile: Int32,
+                        slice_id: Int32, thread: Int32, bb: Int32):
+        """Issue one N128 output tile's K slice into one shared weight slot."""
+        start = slice_id * Int32(self.width)
+        if cutlass.const_expr(self.row_major_resident):
+            stage_row_major_mma(w2, s2, raw, b, sf_slot, expert, output_tile * 128, start,
+                                thread, self.width, self.intermediate, self.hidden, False)
+            return
+        if cutlass.const_expr(self.exact_storage):
+            stage_v41_exact_b(
+                w2,
+                bb,
+                expert * Int64(self.w2_intermediate * self.hidden // 8),
+                output_tile * 128,
+                start,
+                thread,
+                self.width,
+                self.intermediate,
+                self.hidden,
+                False,
+                stored_intermediate=self.w2_intermediate,
+            )
+        else:
+            stage_repacked_b_k_slice(
+                w2,
+                bb,
+                expert * Int64(self.kernel_intermediate * self.hidden // 8),
+                Int32(self.kernel_intermediate // 128),
+                start,
+                output_tile * 128,
+                thread,
+                128,
+                self.width,
+            )
+        if cutlass.const_expr(self.scale_codes):
+            stage_scale_codes_k_slice(s2, sf_slot, expert, start, output_tile * 128, thread,
+                                      self.width, self.hidden, self.w2_scale_columns)
+        elif cutlass.const_expr(self.exact_storage):
+            stage_v41_exact_sfb(
+                s2,
+                sf_slot,
+                expert * Int64(self.kernel_intermediate * self.hidden // 128),
+                output_tile * 128,
+                start,
+                thread,
+                self.width,
+                self.intermediate,
+                self.hidden,
+                False,
+            )
+        else:
+            stage_repacked_sfb_k_slice(
+                s2,
+                sf_slot,
+                expert * Int64(self.kernel_intermediate * self.hidden // 128),
+                Int32(self.kernel_intermediate // 128),
+                start,
+                output_tile * 128,
+                thread,
+                128,
+                self.width,
+            )
 
     @cute.kernel
     def kernel(
@@ -1079,14 +1195,17 @@ class V41SliceFc2Kernel:
                 route_lo = Int64(metadata[group, 3 + g])
             if g + 8 < rows:
                 route_hi = Int64(metadata[group, 3 + g + 8])
+            pipeline = self.two_stage and not self.row_major_resident
+            stages = 2 if pipeline else 1
             smem = cutlass.utils.SmemAllocator()
             b = smem.allocate_tensor(
-                Uint32, cute.make_layout(self.width * 16), byte_alignment=16
+                Uint32, cute.make_layout(stages * self.width * 16), byte_alignment=16
             )
+            raw = b
             if cutlass.const_expr(self.row_major_resident):
                 raw = smem.allocate_tensor(Uint32, cute.make_layout(self.width * 16), byte_alignment=16)
             sf = smem.allocate_tensor(
-                Uint32, cute.make_layout(max(self.width * 2, 256)), byte_alignment=16
+                Uint32, cute.make_layout(stages * max(self.width * 2, 256)), byte_alignment=16
             )
             qa_slots = self.slices if self.slices <= 8 else 1
             qa_words = self.width // 2 if self.a16 else self.width // 4
@@ -1126,67 +1245,25 @@ class V41SliceFc2Kernel:
                 ot = output_begin + local_ot
                 total = cute.make_rmem_tensor((4, 4), Float32)
                 total.fill(0)
+                if cutlass.const_expr(pipeline):
+                    self.stage_fc2_slice(w2, s2, raw, b, sf, expert, ot, Int32(0), tid, bb)
+                    cute.arch.cp_async_commit_group()
                 for slice_id in range(self.slices):
-                    start = slice_id * Int32(self.width)
-                    if cutlass.const_expr(self.row_major_resident):
-                        stage_row_major_mma(w2, s2, raw, b, sf, expert, ot * 128, start,
-                                            tid, self.width, self.intermediate, self.hidden, False)
+                    if cutlass.const_expr(pipeline):
+                        slot = Int32(slice_id % 2)
+                        next_slot = Int32((slice_id + 1) % 2)
+                        if slice_id + 1 < self.slices:
+                            next_scales = cute.make_tensor(
+                                sf.iterator + next_slot * Int32(max(self.width * 2, 256)),
+                                cute.make_layout(max(self.width * 2, 256)))
+                            self.stage_fc2_slice(
+                                w2, s2, raw, b, next_scales, expert, ot,
+                                slice_id + Int32(1), tid,
+                                bb + next_slot * Int32(self.width * 64))
                     else:
-                        if cutlass.const_expr(self.exact_storage):
-                            stage_v41_exact_b(
-                                w2,
-                                bb,
-                                expert * Int64(self.w2_intermediate * self.hidden // 8),
-                                ot * 128,
-                                start,
-                                tid,
-                                self.width,
-                                self.intermediate,
-                                self.hidden,
-                                False,
-                                stored_intermediate=self.w2_intermediate,
-                            )
-                        else:
-                            stage_repacked_b_k_slice(
-                                w2,
-                                bb,
-                                expert * Int64(self.kernel_intermediate * self.hidden // 8),
-                                Int32(self.kernel_intermediate // 128),
-                                start,
-                                ot * 128,
-                                tid,
-                                128,
-                                self.width,
-                            )
-                        if cutlass.const_expr(self.scale_codes):
-                            stage_scale_codes_k_slice(s2, sf, expert, start, ot * 128, tid,
-                                                      self.width, self.hidden,
-                                                      self.w2_scale_columns)
-                        elif cutlass.const_expr(self.exact_storage):
-                            stage_v41_exact_sfb(
-                                s2,
-                                sf,
-                                expert * Int64(self.kernel_intermediate * self.hidden // 128),
-                                ot * 128,
-                                start,
-                                tid,
-                                self.width,
-                                self.intermediate,
-                                self.hidden,
-                                False,
-                            )
-                        else:
-                            stage_repacked_sfb_k_slice(
-                                s2,
-                                sf,
-                                expert * Int64(self.kernel_intermediate * self.hidden // 128),
-                                Int32(self.kernel_intermediate // 128),
-                                start,
-                                ot * 128,
-                                tid,
-                                128,
-                                self.width,
-                            )
+                        slot = Int32(0)
+                        self.stage_fc2_slice(w2, s2, raw, b, sf, expert, ot,
+                                             Int32(slice_id), tid, bb)
                     cute.arch.cp_async_commit_group()
                     if cutlass.const_expr(self.slices > 8):
                         qa_base = (Int64(slice_id) * Int64(self.routes) + route_base) * Int64(qa_words)
@@ -1206,8 +1283,14 @@ class V41SliceFc2Kernel:
                                     qs[0, r_idx, w_idx] = Uint32(partial_u32[qs_base + Int64(idx)])
                                 else:
                                     qs[0, r_idx, w_idx] = Uint32(0)
-                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.cp_async_wait_group(1 if pipeline else 0)
                     cute.arch.sync_threads()
+                    b_slot = cute.make_tensor(
+                        b.iterator + slot * Int32(self.width * 16),
+                        cute.make_layout(self.width * 16))
+                    sf_slot = cute.make_tensor(
+                        sf.iterator + slot * Int32(max(self.width * 2, 256)),
+                        cute.make_layout(max(self.width * 2, 256)))
                     acc = cute.make_rmem_tensor((4, 4), Float32)
                     acc.fill(0)
                     qa_slot = slice_id if cutlass.const_expr(self.slices <= 8) else Int32(0)
@@ -1219,9 +1302,9 @@ class V41SliceFc2Kernel:
                                 a1, a3 = qa[qa_slot, g + 8, at], qa[qa_slot, g + 8, at + 4]
                                 for nf in cutlass.range_constexpr(4):
                                     index = ((kb * 4 + nf) * 32 + g * 4 + half * 2) * 4 + warp
-                                    sw = (sf[(kb // 4) * 128 + nf * 32 + warp * 8 + g] >> Uint32((kb % 4) * 8)) & Uint32(255)
-                                    b0 = e2m1x2_scaled_bf16(b[index] >> Uint32(c * 8), sw)
-                                    b1 = e2m1x2_scaled_bf16(b[index + 4] >> Uint32(c * 8), sw)
+                                    sw = (sf_slot[(kb // 4) * 128 + nf * 32 + warp * 8 + g] >> Uint32((kb % 4) * 8)) & Uint32(255)
+                                    b0 = e2m1x2_scaled_bf16(b_slot[index] >> Uint32(c * 8), sw)
+                                    b1 = e2m1x2_scaled_bf16(b_slot[index + 4] >> Uint32(c * 8), sw)
                                     d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
                                         acc[nf, 0], acc[nf, 1], acc[nf, 2], acc[nf, 3],
                                         a0, a1, a2, a3, b0, b1)
@@ -1237,8 +1320,8 @@ class V41SliceFc2Kernel:
                                 scale = Uint32(qs[qa_slot, g + c * 8, kb])
                             for nf in cutlass.range_constexpr(4):
                                 index = ((kb * 4 + nf) * 32 + lane) * 4 + warp
-                                b0, b1 = e2m1x8_to_qmma_e2m1x8(b[index])
-                                sw = sf[(kb // 4) * 128 + nf * 32 + warp * 8 + g]
+                                b0, b1 = e2m1x8_to_qmma_e2m1x8(b_slot[index])
+                                sw = sf_slot[(kb // 4) * 128 + nf * 32 + warp * 8 + g]
                                 d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
                                     acc[nf, 0],
                                     acc[nf, 1],
