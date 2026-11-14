@@ -40,6 +40,26 @@ h = _load_harness()
 FIXTURES_SHA256 = "a42073d1e8bafa1c652e25cbb3d66a9589774f46156915fc3e88587914906530"
 
 
+def test_dense_benchmark_compiles_and_reports_requested_width():
+    import ast
+
+    path = ROOT / 'benchmarks/kimi_k6_dense.py'
+    tree = ast.parse(path.read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+    calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name) and node.func.id == 'compile_trellis_linear_aot']
+    assert len(calls) == 2
+    for call in calls:
+        bits = next(keyword.value for keyword in call.keywords if keyword.arg == 'bits')
+        assert ast.unparse(bits) == 'args.bits'
+    text = ast.get_source_segment(path.read_text(), main)
+    assert 'k*n*6//8' not in text
+    assert text.count('k*n*args.bits//8') == 2
+    assert 'bits=args.bits' in text
+    assert text.count('program.geometry.get("bits") != metadata["bits"]') == 2
+    assert '--prefill-route is a K6-only dequant diagnostic' in text
+
+
 def test_frozen_blobs_are_the_pin_literals():
     assert h.PIN_COMMIT == "26a1e5072fb707864845b88db65ddf1e80c5c872"
     assert h.FROZEN_BLOBS["b12x/moe/_shared/kernels/w4a16/mixed_trellis.py"] == (

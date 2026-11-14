@@ -469,7 +469,7 @@ def benchmark_prefill_route(args):
                     end.synchronize()
                     samples[name].append(start.elapsed_time(end) * 1000)
             medians = {name: statistics.median(values) for name, values in samples.items()}
-            record = dict(k=k, n=n, side=side, rows=rows, us=medians, samples_us=samples,
+            record = dict(k=k, n=n, side=side, bits=args.bits, rows=rows, us=medians, samples_us=samples,
                 speedup=medians["route"]/medians["t2"], component_sum_us=medians["dequant"]+medians["gemm"],
                 bitwise_base=True, row_invariant=True, resources=resources)
             if grouped:
@@ -1759,6 +1759,8 @@ def main():
         benchmark_native_comparison(args)
         return
     if args.prefill_route:
+        if args.bits != 6:
+            parser.error("--prefill-route is a K6-only dequant diagnostic; use normal mode for other widths")
         benchmark_prefill_route(args)
         return
     if args.shapes is None:
@@ -1778,7 +1780,7 @@ def main():
     flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
     rows_list = [int(x) for x in args.rows.split(",")]
     records = []
-    metadata = dict(device=torch.cuda.get_device_name(), sms=sms, l2_bytes=l2,
+    metadata = dict(device=torch.cuda.get_device_name(), sms=sms, l2_bytes=l2, bits=args.bits,
                     samples=args.samples, kernel_path="exported shared trellis ABI v1",
                     transforms_included=args.transforms, decode_cache="cold, 2x runtime L2 bytes")
     for shape in args.shapes.split(","):
@@ -1792,7 +1794,7 @@ def main():
         x_bf16 = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16)
         x = x_bf16.half()
         inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
-        payload = torch.randint(256, (k*n*6//8,), device="cuda", dtype=torch.uint8)
+        payload = torch.randint(256, (k*n*args.bits//8,), device="cuda", dtype=torch.uint8)
         scales = torch.ones(k//128, device="cuda", dtype=torch.float16)
         partial = torch.empty(capacity*splits*n, device="cuda", dtype=torch.float32)
         output = torch.empty(capacity*n, device="cuda", dtype=torch.float32)
@@ -1813,8 +1815,10 @@ def main():
             print(f"compiling {shape} {codebook}", flush=True)
             with exportable_compilation():
                 program = compile_bf16_projection_aot(width=k, outputs=n) if codebook == "bf16" else \
-                    compile_trellis_linear_aot(input_features=k, output_features=n, bits=6,
+                    compile_trellis_linear_aot(input_features=k, output_features=n, bits=args.bits,
                         codebook=codebook, sharded_side=side, rotation_count=1, max_rows=capacity)
+            if codebook != "bf16" and program.geometry.get("bits") != metadata["bits"]:
+                raise RuntimeError("recorded bits differ from compiled trellis program")
             arms[codebook] = exported(program, directory, codebook)
         if grouped:
             qkvg_suh = [torch.randn(k, device="cuda", dtype=torch.float16) * 0.2 for _ in range(4)]
@@ -1823,7 +1827,7 @@ def main():
             qkvg_x_grp = [t.clone() for t in qkvg_x_4x]
             qkvg_inputs_4x = [torch.tensor([t.data_ptr()], device="cuda", dtype=torch.int64) for t in qkvg_x_4x]
             qkvg_inputs_grp = torch.tensor([t.data_ptr() for t in qkvg_x_grp], device="cuda", dtype=torch.int64)
-            qkvg_payloads = [torch.randint(256, (k*n*6//8,), device="cuda", dtype=torch.uint8) for _ in range(4)]
+            qkvg_payloads = [torch.randint(256, (k*n*args.bits//8,), device="cuda", dtype=torch.uint8) for _ in range(4)]
             qkvg_scales_4x = [torch.ones(k//128, device="cuda", dtype=torch.float16) * (0.75 + 0.25 * i) for i in range(4)]
             qkvg_scales_grp = [t.clone() for t in qkvg_scales_4x]
             qkvg_partial = torch.empty(4*capacity*splits*n, device="cuda", dtype=torch.float32)
@@ -1842,8 +1846,10 @@ def main():
                 print(f"compiling {shape} {codebook}_qkvg", flush=True)
                 with exportable_compilation():
                     program = compile_trellis_linear_aot(
-                        input_features=k, output_features=n, bits=6, codebook=codebook,
+                        input_features=k, output_features=n, bits=args.bits, codebook=codebook,
                         sharded_side=side, rotation_count=4, max_rows=capacity, groups=4)
+                if program.geometry.get("bits") != metadata["bits"]:
+                    raise RuntimeError("recorded bits differ from compiled grouped trellis program")
                 grp_libs[codebook] = exported(program, directory, f"{codebook}_qkvg")
         for rows in rows_list:
             runners = {}
@@ -1940,7 +1946,7 @@ def main():
                     end.synchronize()
                     samples[name].append(start.elapsed_time(end)*1000)
             medians = {name: statistics.median(values) for name, values in samples.items()}
-            record = dict(k=k, n=n, side=side, rows=rows, us=medians, samples_us=samples,
+            record = dict(k=k, n=n, side=side, bits=args.bits, rows=rows, us=medians, samples_us=samples,
                           speedup={name: medians["bf16"]/medians[name] for name in ("mcg", "mul1")})
             if grouped:
                 record["saved_us"] = {name: medians[f"{name}_4x"] - medians[f"{name}_qkvg"] for name in ("mcg", "mul1")}
