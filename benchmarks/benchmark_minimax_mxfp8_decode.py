@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--shapes", default="query,key_value,output,shared_gate_up,shared_down")
     parser.add_argument("--samples", type=int, default=9)
     parser.add_argument("--routed", action="store_true", help="measure the selected decode/prefill cutovers")
+    parser.add_argument("--cta-limit", type=int, help="override runtime grid cap for scheduling qualification")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     rows_list = [int(v) for v in args.rows.split(",")]
@@ -48,13 +49,15 @@ def main():
         parser.error("unknown projection shape")
     capacity = 64
     properties = torch.cuda.get_device_properties(0)
-    limit = properties.multi_processor_count * 4
+    limit = args.cta_limit or properties.multi_processor_count * 4
+    if limit < 1:
+        parser.error("CTA limit must be positive")
     flush = make_l2_flush_fn(True)
     report = dict(device=properties.name, uuid=str(properties.uuid),
         sm_count=properties.multi_processor_count, conditions=dict(
             cold_l2=True, graph_replay=True, quantization_excluded=True,
             native_group_size=32, accumulation="fixed K128", samples=args.samples,
-            k_warps=4, routed=args.routed),
+            k_warps=4, routed=args.routed, cta_limit=limit),
         source_sha256=hashlib.sha256((Path(__file__).resolve().parents[1] /
             "b12x/gemm/dense_mxfp8.py").read_bytes()).hexdigest(), measurements=[])
     args.output.parent.mkdir(parents=True, exist_ok=True)
