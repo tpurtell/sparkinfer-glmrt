@@ -233,7 +233,7 @@ def _assert_native_projection(out, expected):
 @pytest.mark.parametrize("route,rows", [("base", 1), ("base", 17), ("base", 64),
                                        ("nc", 17), ("nc", 64), ("tma", 129),
                                        ("expanded", 512), ("expanded", 513)])
-@pytest.mark.parametrize("scales", ["block", "row", "row_kmajor"])
+@pytest.mark.parametrize("scales", ["block", "row", "row_kmajor", "channel"])
 def test_native_dense_scale_f64(route, rows, scales):
     """Exact checkpoint product, nonuniform scales, live-row reuse and graph replay."""
     import cutlass
@@ -242,11 +242,15 @@ def test_native_dense_scale_f64(route, rows, scales):
     from b12x.integration.cuteafd._fp8_gemv_nc import NcMmaFp8Gemv
     from b12x.integration.cuteafd._glmf_prefill_w8 import ExpandedW8Prefill
 
-    if route == "expanded" and scales != "row_kmajor":
+    if route == "expanded" and scales not in ("row_kmajor", "channel"):
         pytest.skip("expanded ABI is row/K128-major only")
+    if scales == "channel" and route != "expanded":
+        pytest.skip("channel descriptor belongs to expanded prefill")
     n, k = 256, 512
     w, s, _ = _weights(n, k, 2057, row_scales=scales != "block")
-    scale = s.t().contiguous() if scales == "row_kmajor" else s
+    if scales == "channel":
+        s = s[:, :1].expand(n, k // 128).contiguous()
+    scale = s.t().contiguous() if scales in ("row_kmajor", "channel") else s
     grown = s.repeat_interleave(128, 1) if scales != "block" else s.repeat_interleave(128, 0).repeat_interleave(128, 1)
     x = torch.randn(rows, k, device="cuda").bfloat16()
     out = torch.empty(rows, n, device="cuda", dtype=torch.float32)
@@ -258,7 +262,7 @@ def test_native_dense_scale_f64(route, rows, scales):
     elif route == "tma":
         launch = TmaFp8Gemm(n, k, scales=scales, **kwargs)
     else:
-        launch = ExpandedW8Prefill(n, k, **kwargs)
+        launch = ExpandedW8Prefill(n, k, scale_granularity="channel" if scales == "channel" else "row128", **kwargs)
     operands = [Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),
                 Operand("s", torch.float32, "s", align=16), Operand("o", torch.float32, "o", "out")]
     args = [x, w, scale, out]
@@ -270,7 +274,7 @@ def test_native_dense_scale_f64(route, rows, scales):
     program.launch(*args, scalars=(rows,))
     torch.cuda.synchronize()
     exact_weight = w.double() * grown.double()
-    if route in ("expanded", "tma") or getattr(launch, 'native_scale', None) is False:
+    if route == "tma" or getattr(launch, 'native_scale', None) is False:
         # Only interim routes round the scaled weight; native routes keep the
         # strict F32 oracle against the checkpoint's exact product.
         exact_weight = exact_weight.float().bfloat16().double()
