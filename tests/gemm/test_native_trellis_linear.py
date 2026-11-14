@@ -251,7 +251,7 @@ KIMI_SHAPES = sorted({
 })
 
 
-@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("bits", [5, 6, 8])
 @pytest.mark.parametrize("codebook", ["mcg", "mul1"])
 @pytest.mark.parametrize("side", [1, 2])
 @pytest.mark.parametrize("k,n", KIMI_SHAPES)
