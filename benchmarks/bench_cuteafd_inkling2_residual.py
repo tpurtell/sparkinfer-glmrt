@@ -14,10 +14,12 @@ def main():
     parser.add_argument("--rows", default="2048,2752,4096")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--json", required=True)
+    parser.add_argument("--cold-l2", action="store_true", help="read192MiB before each timed sample")
     args = parser.parse_args()
     from b12x.integration.cuteafd.inkling2_residual import compile_inkling2_residual_aot
     rows = [int(n) for n in args.rows.split(",")]
     records = []
+    flush = torch.zeros(192*1024*1024//4, device="cuda") if args.cold_l2 else None
     for queries in (1, 3):
         p = compile_inkling2_residual_aot(queries=queries, max_rows=max(rows))
         for candidates in (2, 9):
@@ -34,6 +36,9 @@ def main():
                     run()
                 times = []
                 for _ in range(args.samples):
+                    if flush is not None:
+                        flush.max()
+                        torch.cuda._sleep(3_000_000)
                     begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                     begin.record()
                     graph.replay()
@@ -47,7 +52,7 @@ def main():
                 records.append(result)
     with open(args.json, "w") as stream:
         json.dump(dict(host=platform.node(), gpu=torch.cuda.get_device_name(), samples=args.samples,
-                       method="one warm launch, captured replay events, median", records=records), stream, indent=2)
+                       method="one warm launch, captured replay events, median", cold_l2=args.cold_l2, records=records), stream, indent=2)
 
 
 if __name__ == "__main__":
