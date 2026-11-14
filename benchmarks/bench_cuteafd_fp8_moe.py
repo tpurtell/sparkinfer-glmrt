@@ -655,7 +655,9 @@ def fc1_split_tiles(hidden, splits, tiles=(32, 64, 128, 192)):
 
 def shipped_decode_recipe(family, hidden, rank_width, sm, capacity, policy_root):
     policy = engine_layout_policy(policy_root)
-    tile = policy.native_slice_width(hidden, rank_width, sm, capacity, 128)
+    # V4.1 Spark CMake defaults to 192; measured policy overrides selected widths.
+    fallback = 192 if family == "v41" else 128
+    tile = policy.native_slice_width(hidden, rank_width, sm, capacity, fallback)
     splits = policy.native_fc1_k_splits(hidden, rank_width, sm, capacity)
     return dict(tile=tile, k_splits=splits,
                 fc2_n_splits=2 if capacity == 1 and tile == 128 and hidden % 256 == 0 else 1,

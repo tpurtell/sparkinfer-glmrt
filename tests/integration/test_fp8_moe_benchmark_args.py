@@ -1086,7 +1086,15 @@ def test_shipped_decode_recipe_uses_device_capacity_policy(monkeypatch, capacity
         native_slice_width=select, native_fc1_k_splits=lambda *args: 2))
     assert bench.shipped_decode_recipe("v41", 5120, 384, 121, capacity, "engine") == dict(
         tile=tile, k_splits=splits, fc2_n_splits=fc2, coded=True)
-    assert calls == [(5120, 384, 121, capacity, 128)]
+    assert calls == [(5120, 384, 121, capacity, 192)]
+
+
+def test_shipped_v41_unoverridden_width_keeps_cmake_tile192(monkeypatch):
+    monkeypatch.setattr(bench, "engine_layout_policy", lambda root: SimpleNamespace(
+        native_slice_width=lambda h, w, sm, c, fallback: fallback,
+        native_fc1_k_splits=lambda *args: 1))
+    assert bench.shipped_decode_recipe("v41", 5120, 768, 121, 1, "engine") == dict(
+        tile=192, k_splits=1, fc2_n_splits=1, coded=True)
 
 
 def test_unified_auto_route_switch_records_cross_route_prefix_without_relaxing_forced_routes():
