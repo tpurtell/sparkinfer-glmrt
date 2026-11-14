@@ -105,6 +105,11 @@ _NATIVE_SHAPES = (
     ('kimi_o', 7168, 12288), ('kimi_o_half', 7168, 6144),
     ('step_o', 4096, 12288), ('step_o_half', 4096, 6144),
     ('muse_o', 8192, 8192), ('muse_o_half', 8192, 4096),
+    ('muse_q', 8192, 8192), ('muse_q_half', 4096, 8192),
+    ('muse_kv', 1024, 8192), ('muse_kv_half', 512, 8192),
+    ('muse_pre_expert', 4096, 8192), ('muse_pre_expert_half', 2048, 8192),
+    ('muse_post_expert', 8192, 4096), ('muse_post_expert_half', 8192, 2048),
+    ('muse_head', 202112, 8192),
     ('glm_q_b', 16384, 2048), ('glm_q_b_half', 8192, 2048),
     ('glm_o', 6144, 16384), ('glm_o_half', 6144, 8192),
 )
@@ -616,8 +621,10 @@ def test_native_attention_fp8_projection(case, output):
     program = _compile(case_id + '_' + output, kind, n, k, proj, out_dtype=dtype)
     seed = 31_027 + n + k
     w8, scale, dequant = _weights(n, k, 'block', seed, dequant=True)
-    x, row0 = _rows(k, 2048, seed + 3)
-    offsets = (0, 1, 17, 63, 64, 65, 127, 139, 511, 1023, 2047)
+    # Vocabulary heads are called in at most64-row microbatches by the engine.
+    capacity = 64 if case_id == 'native_muse_head' else 2048
+    x, row0 = _rows(k, capacity, seed + 3)
+    offsets = tuple(i for i in (0, 1, 17, 63, 64, 65, 127, 139, 511, 1023, 2047) if i < capacity)
     for offset in offsets:
         x[offset].copy_(row0)
     # Disable TF32 for the independent FP32 accumulation oracle, restoring it for other tests.
@@ -627,9 +634,10 @@ def test_native_attention_fp8_projection(case, output):
         reference = x.float() @ dequant.float().T
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
-    out = torch.empty((2049, n), device='cuda', dtype=dtype)
+    out = torch.empty((capacity + 1, n), device='cuda', dtype=dtype)
     first = None
-    for rows in (*range(1, 65), 128, 2048):
+    row_counts = tuple(range(1, 65)) + (() if capacity == 64 else (128, capacity))
+    for rows in row_counts:
         out.view(bits_dtype).fill_(sentinel)
         _launch(program, kind, x, w8, scale, None, out, rows, 64)
         torch.cuda.synchronize()
