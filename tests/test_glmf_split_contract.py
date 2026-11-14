@@ -342,3 +342,36 @@ def test_hqa_m64_only_measured_recipe(n, k, warps, groups, rows, cap,
                 if isinstance(node, ast.FunctionDef) and node.name == "__call__")
     assert any(isinstance(node, ast.If) and ast.unparse(node.test) == "rows == Int32(64)"
                for node in ast.walk(call))
+
+
+@pytest.mark.parametrize("output", ["bf16", "f32"])
+def test_native_fp8_prefill_projection_abi(output, monkeypatch):
+    import sys
+    import types
+    torch = types.ModuleType("torch")
+    torch.bfloat16, torch.float32, torch.uint8 = "bf16", "f32", "u8"
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    common = types.ModuleType("native_prefill_contract._common")
+    common.Operand, common.Scalar = Operand, lambda name: name
+    common.compile_program = lambda launch, **kw: dict(launch=launch, **kw)
+    monkeypatch.setitem(sys.modules, "native_prefill_contract._common", common)
+    class Projection:
+        def key(self): return ("projection", output)
+        def prefill_scratch_bytes(self, rows): return rows * 256
+    ns = extracted(ROOT / "b12x/integration/cuteafd/_fp8_weights.py",
+        {"compile_native_fp8_prefill_aot"}, dict(__package__="native_prefill_contract",
+            cutlass=SimpleNamespace(BFloat16="bf16", Float32="f32"),
+            _NativeFp8Prefill=lambda n,k,cap,dtype: SimpleNamespace(projection=Projection())))
+    compile_projection = ns["compile_native_fp8_prefill_aot"]
+    p = compile_projection(input_features=6144, output_features=4096, output=output)
+    assert [o.name for o in p["operands"]] == ["x", "weight", "scales", "out", "scratch"]
+    assert p["operands"][3].dtype == output
+    assert p["scalars"] == ("rows", "fp8_rows")
+    assert p["geometry"]["max_rows"] == 4096
+    assert p["geometry"]["reduction"] == "block_fp8_a8_or_w8a16"
+    assert p["scratch"]["scratch"](2752) == 2752 * 256
+    for bad in (0, -128, 129, True):
+        with pytest.raises(ValueError, match="H128"):
+            compile_projection(input_features=bad, output_features=4096, output=output)
+    with pytest.raises(ValueError, match="output"):
+        compile_projection(input_features=6144, output_features=4096, output="f16")

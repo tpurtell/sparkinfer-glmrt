@@ -199,9 +199,7 @@ class Fp8Projection:
         if self.prefill:
             from ._glmf_fp8 import BlockFp8Projection
 
-            if out_dtype != cutlass.BFloat16 and self.prefill_mask:
-                raise ValueError("non-BF16 prefill output requires W8A16 (prefill_mask=0)")
-            self.w8a8 = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=self.row_scales) \
+            self.w8a8 = BlockFp8Projection(self.n, self.k, int(prefill_rows), row_scales=self.row_scales, out_dtype=out_dtype) \
                 if self.prefill_mask else None
             # 128-row tiles: the E4M3 tile is widened once per 128 rows (SM120 at 325 W, 4096 rows,
             # 6144x16384: 4 warps 3650 us, 8 warps 2779 us; BF16 TMA 128x128 tiles 2244 us).
@@ -622,6 +620,47 @@ def _e4m3x8_scaled_bf16(lo, hi, s, *, loc=None, ip=None):
         has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc, ip=ip)
     return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+class _NativeFp8Prefill:
+    def __init__(self, n, k, max_rows, out_dtype):
+        self.projection = Fp8Projection(n, k, prefill_rows=max_rows, out_dtype=out_dtype)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, scales: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 fp8_rows: Int32, stream: cuda.CUstream):
+        self.projection(x, weight, scales, out, rows, fp8_rows,
+                        Int64(scratch.toint()), stream)
+
+
+def compile_native_fp8_prefill_aot(*, input_features, output_features, max_rows=4096, output="bf16"):
+    """Native block-128 FP8 weights with launch-selected A8/A16, including F32 TP partials."""
+    import torch
+    from ._common import Operand, Scalar, compile_program
+
+    k, n = input_features, output_features
+    if any(type(value) is not int or value <= 0 or value % 128 for value in (k, n)):
+        raise ValueError("native FP8 prefill needs positive H128 geometry")
+    if type(max_rows) is not int or not 1 <= max_rows <= 4096:
+        raise ValueError("native FP8 prefill capacity must be 1..4096")
+    if output not in ("bf16", "f32"):
+        raise ValueError("native FP8 prefill output must be bf16 or f32")
+    dtype = torch.bfloat16 if output == "bf16" else torch.float32
+    launch = _NativeFp8Prefill(n, k, max_rows,
+        cutlass.BFloat16 if output == "bf16" else cutlass.Float32)
+    return compile_program(launch, name="native_fp8_prefill", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("weight", torch.uint8, f"[{n},{k}]"),
+        Operand("scales", torch.float32, f"[{n//128},{k//128}]"),
+        Operand("out", dtype, f"[rows,{n}]", "out"),
+        Operand("scratch", torch.uint8, "[projection_scratch]", "scratch")),
+        scalars=(Scalar("rows"), Scalar("fp8_rows")),
+        key=(k, n, max_rows, output, launch.projection.key()),
+        scratch={"scratch": lambda rows: max(256, launch.projection.prefill_scratch_bytes(rows))},
+        geometry=dict(input_features=k, output_features=n, output_dtype=str(dtype),
+            max_rows=max_rows, scale_block=128, storage="row_major_e4m3",
+            reduction="block_fp8_a8_or_w8a16", activation_block=128))
 
 
 class TmaFp8Gemm:
