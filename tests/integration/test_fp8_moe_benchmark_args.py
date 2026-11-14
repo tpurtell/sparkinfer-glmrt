@@ -1040,3 +1040,20 @@ def test_unified_curve_flags_and_production_population(capacity):
     calls = {node.func.id for node in ast.walk(node)
              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
     assert {"stream_screen_population", "check_shared_prefix", "compare_route_outputs"} <= calls
+
+
+def test_bounded_decode_occupancy_recipe_is_explicit():
+    args = bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
+                             "--capacity", "16", "--rows", "1,16", "--decode-occupancy"])
+    assert args.decode_occupancy
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--geometry", "mimof", "--mxfp4-pair", "--mxfp4-unify",
+                          "--rows", "2048", "--decode-occupancy"])
+    source = ast.unparse(next(node for node in ast.parse(_PATH.read_text()).body
+                            if isinstance(node, ast.FunctionDef) and node.name == "mxfp4_unify_screen"))
+    assert "properties.multi_processor_count" in source
+    for sm_count, cta in [(48, 1), (170, 4), (188, 4)]:
+        recipe = bench.decode_occupancy_recipe(4096, 256, 8, sm_count)
+        assert recipe == dict(tile=32, k_splits=1, cta_splits=cta, fc2_n_splits=32)
+    with pytest.raises(ValueError):
+        bench.decode_occupancy_recipe(4096, 256, 8, 0)

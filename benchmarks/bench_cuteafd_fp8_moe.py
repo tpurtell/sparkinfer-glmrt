@@ -195,6 +195,8 @@ def parse_args(argv=None):
                         help="development native arm: exact W13 rows with only W2 payload pitch aligned to 128 columns")
     parser.add_argument("--mxfp4-arm", action="append", default=[], metavar="NAME:LOGICAL:STORED:TILE[:SPLIT]",
                         help="explicit native arm; STORED=0 selects legacy storage, otherwise exact")
+    parser.add_argument("--decode-occupancy", action="store_true",
+                        help="bounded native tile32/team1 and one-output-tile-per-CTA recipe")
     parser.add_argument("--stream-decode", action="store_true",
                         help="development A16 native register-streaming decode arm")
     parser.add_argument("--native-stream", action="store_true", help="Benchmark STREAM prefill over native residency")
@@ -221,6 +223,9 @@ def parse_args(argv=None):
         parser.error("shipped prefill requires native V4/V4.1 pairs and engine policy root")
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.decode_occupancy and (not args.mxfp4_unify or args.geometry not in ("mimof", "mimop")
+                                  or max(map(int, args.rows.split(","))) > 80):
+        parser.error("decode occupancy recipe requires MiMo unified rows <=80")
     if args.stream_decode and (not args.mxfp4_pair or not args.mxfp4_unify
                                or any(int(row) > 80 for row in args.rows.split(","))):
         parser.error("stream decode requires MiMo unification and capacities <=80")
@@ -1299,6 +1304,18 @@ def v4_stream_pair_arm(x, ids, routing, weights, scales, *, qualify=True,
     return run, output, (tensors, views, launch, execute)
 
 
+def decode_occupancy_recipe(hidden, intermediate, topk, sm_count):
+    """Plan a low-row launch from device SM count, never the live request count."""
+    if sm_count <= 0:
+        raise ValueError("device SM count must be positive")
+    tile = 32
+    base_ctas = ((intermediate + tile - 1) // tile) * topk
+    splits = [value for value in (1, 2, 4, 8) if hidden // 128 % value == 0]
+    cta_splits = next((value for value in splits if base_ctas * value >= sm_count), splits[-1])
+    # Independent output tiles retain their K-order and require no partial fold.
+    return dict(tile=tile, k_splits=1, cta_splits=cta_splits, fc2_n_splits=hidden // 128)
+
+
 def mxfp4_unify_screen(g, args, geometry_type):
     """Compare complete native wire-input arms to the installed mixed generic math."""
     from b12x.moe._shared.kernels.v41_slice_pipeline import fc1_partial_words
@@ -1315,6 +1332,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
     results = []
     experts, route_qualification_eligible = stream_screen_population(g, args)
     for width in paired_widths(g.intermediate, args.widths, args.engine_policy_root):
+        occupancy_recipe = decode_occupancy_recipe(g.hidden, width, g.top_k, properties.multi_processor_count)
         expert_bytes = 3 * width * g.hidden // 2
         generator = torch.Generator().manual_seed(args.seed + width)
         weights, scales = {}, {}
@@ -1439,6 +1457,10 @@ def mxfp4_unify_screen(g, args, geometry_type):
                             else {"928-a8-t128-k1": ("a8", 128, 1, 1)} if v4
                             else {"native-" + precision + "-t64-k2": (precision, 64, 2, 1)
                                   for precision in ("a8", "a16")})
+            if args.decode_occupancy:
+                variants = {"occupancy-" + precision: (precision, occupancy_recipe["tile"],
+                            occupancy_recipe["k_splits"], occupancy_recipe["cta_splits"])
+                            for precision in ("a8", "a16")}
             if args.shipped_prefill:
                 variants = {}
             if args.fc1_k_splits:
@@ -1457,7 +1479,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
                 try:
                     runs[label], outputs[label], keep = native_pair_arm(
                         x, ids, routing, weights, scales, tile, not v4 or width == 576, False, v4,
-                        activation_precision=precision, projection_contract=contract,
+                        activation_precision=precision, projection_contract={**contract,
+                            **({"fc2_n_splits": occupancy_recipe["fc2_n_splits"]} if args.decode_occupancy else {})},
                         combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split,
                         fc1_cta_splits=cta, live_rows=rows)
                 except AssertionError as error:
@@ -1566,6 +1589,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
             medians = {label: statistics.median(values) for label, values in samples.items()}
             record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows, capacity=capacity,
                           experts=experts, routing=args.routing, route_qualification_eligible=route_qualification_eligible,
+                          sm_count=properties.multi_processor_count, occupancy_recipe=occupancy_recipe if args.decode_occupancy else None,
                           prefix_checks=prefix_checks, route_comparisons=route_comparisons,
                           ingress="wire", wire_preparation_timed=False,
                           a16_wire_dequant_timed=True, token_combine_timed=True,
@@ -1584,6 +1608,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           f32_errors=errors, matched_f32_errors=matched_errors, comparisons=comparisons,
                           invariant_checks="poison/live/graph/row-mix", slice_width=128,
                           fc1_variants={label: dict(precision=precision, tile=tile, k_splits=split,
+                                                    fc2_n_splits=occupancy_recipe["fc2_n_splits"] if args.decode_occupancy else 8,
                                                     cta_splits=cta, partial_bytes=4 * fc1_partial_words(
                                                         capacity, tile, g.top_k, width, precision, cta))
                                         for label, (precision, tile, split, cta) in variants.items()},
