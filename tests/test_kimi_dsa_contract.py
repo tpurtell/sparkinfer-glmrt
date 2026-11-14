@@ -80,12 +80,16 @@ def test_kimi_sparse_context_reuses_partial_and_global_selection():
     assert "Int64(self.page_size * g.record_bytes)" in ast.unparse(cls)
 
 
+@pytest.mark.parametrize("row_chunk_size", [None, 1, 64, 512, 4096])
 @pytest.mark.parametrize("partial", [False, True], ids=["ordinary", "context-partial"])
-def test_kimi_sparse_mla_descriptor_matches_generated_header(partial):
+def test_kimi_sparse_mla_descriptor_matches_generated_header(partial, row_chunk_size):
     tree = ast.parse((ROOT / "kimi_dsa.py").read_text())
     name = "compile_kimi_sparse_mla" + ("_partial" if partial else "") + "_aot"
     function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
-    function.body = [n for n in function.body if not isinstance(n, ast.ImportFrom)]
+    for parent in ast.walk(function):
+        for field in ("body", "orelse"):
+            if isinstance(getattr(parent, field, None), list):
+                setattr(parent, field, [n for n in getattr(parent, field) if not isinstance(n, ast.ImportFrom)])
 
     @dataclass
     class Geometry:
@@ -97,12 +101,20 @@ def test_kimi_sparse_mla_descriptor_matches_generated_header(partial):
     launch = SimpleNamespace(scratch_bytes=lambda rows: 0, layout={"scratch_bytes": 0})
     ns = dict(KimiMlaGeometry=Geometry, _Attention=lambda *a, **k: launch,
         _ContextPartial=lambda *a, **k: launch,
+        _SparseAttentionChunks=lambda *a, **k: launch,
+        _SparsePartialChunks=lambda *a, **k: launch,
         torch=SimpleNamespace(bfloat16="bf16", uint8="u8", int32="i32", float32="f32"),
         Operand=lambda name, *a, **k: SimpleNamespace(name=name),
         Scalar=lambda name, ctype="int32": SimpleNamespace(name=name, ctype=ctype),
         compile_program=lambda launch, **kwargs: SimpleNamespace(**kwargs))
     exec(compile(ast.Module(body=[function], type_ignores=[]), "kimi", "exec"), ns)
-    program = ns[name]()
+    program = ns[name](row_chunk_size=row_chunk_size)
+    if partial:
+        assert program.geometry.get("row_chunk_size") == (None if row_chunk_size is None else min(64, row_chunk_size))
+    assert ("row-chunks" in program.key) == (row_chunk_size is not None)
+    for invalid in (0, -1, 4097):
+        with pytest.raises(ValueError, match="row chunk size"):
+            ns[name](row_chunk_size=invalid)
 
     # Derive the simulated generated header from the reused launcher's signature,
     # independently of the descriptor names the exporter passes to its validator.
@@ -132,6 +144,29 @@ def test_kimi_sparse_mla_descriptor_matches_generated_header(partial):
     program.operands[2].name = "indices"
     with pytest.raises(ValueError, match="unexpected wrapper signature"):
         scope["validate_exported_header"](program, header, symbol)
+
+
+def test_sparse_chunk_layout_uses_static_capacity_and_runtime_rows():
+    tree = ast.parse((ROOT / "kimi_mla.py").read_text())
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    for name, parent in (("_SparseAttentionChunks", "_Attention"), ("_SparsePartialChunks", "_ContextPartial")):
+        cls = classes[name]
+        assert ast.unparse(cls.bases[0]) == parent
+        call = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__call__")
+        loop = next(n for n in ast.walk(call) if isinstance(n, ast.For))
+        assert ast.unparse(loop.iter) == "cutlass.range(0, rows, self.row_chunk_size)"
+        assert "row = Int64(first)" in ast.unparse(loop)
+        assert "singleton_requests=True" in ast.unparse(cls)
+    partial = classes["_ContextPartial"]
+    method = next(n for n in partial.body if isinstance(n, ast.FunctionDef) and n.name == "scratch_bytes")
+    method.decorator_list = []
+    wrapper = ast.ClassDef(name="Layout", bases=[], keywords=[], body=[method], decorator_list=[])
+    ns = {"_align": lambda n: (n + 1023) // 1024 * 1024}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), "layout", "exec"), ns)
+    layout = ns["Layout"]()
+    layout.heads, layout.splits = 48, 16
+    for rows in (1, 6, 16, 64, 512, 513, 2752):
+        assert layout.scratch_bytes(rows) == rows * 48 * 16 * 1028
 
 
 def test_kimi_rank_norm_accepts_checkpoint_epsilon_without_changing_k3_default():

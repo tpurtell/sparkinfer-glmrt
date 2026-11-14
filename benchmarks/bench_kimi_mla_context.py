@@ -298,9 +298,16 @@ def sparse_chunk_screen(args):
                                     baseline_work, scalars=scalars)
                 base()
                 torch.cuda.synchronize()
-                assert torch.isfinite(expected[:rows]).all() and expected[:rows].abs().max() > 0
+                assert torch.isfinite(expected[:rows]).all()
+                if partial:
+                    assert torch.count_nonzero(expected[0]) == 0 and torch.isneginf(expected_lse[0]).all()
+                if not partial or rows > 1:
+                    assert expected[:rows].abs().max() > 0
+                from benchmarks.kimi_k6_dense import thermal_snapshot
+                base_thermal_before = thermal_snapshot()
                 with kernel_resolution_guard("K3.1 unchanged sparse MLA is resolved"):
                     base_time = timed(base, args.iters)
+                base_time.update(thermal_before=base_thermal_before, thermal_after=thermal_snapshot())
                 for chunk, program in programs.items():
                     size = program.scratch_bytes(rows)["scratch"]
                     work.fill_(173)
@@ -318,8 +325,12 @@ def sparse_chunk_screen(args):
                     assert torch.all(work[size:] == 173), (cache_format, kind, rows, chunk, "scratch overrun")
                     if rows < max_rows:
                         assert torch.isnan(output[rows:]).all() and torch.isnan(lse[rows:]).all()
+                    if partial:
+                        assert torch.count_nonzero(output[0]) == 0 and torch.isneginf(lse[0]).all()
+                    candidate_thermal_before = thermal_snapshot()
                     with kernel_resolution_guard("K3.1 chunked sparse MLA is resolved"):
                         candidate_time = timed(candidate, args.iters)
+                    candidate_time.update(thermal_before=candidate_thermal_before, thermal_after=thermal_snapshot())
                     assert torch.equal(output[:rows].view(torch.uint8), expected[:rows].view(torch.uint8))
                     assert torch.equal(lse[:rows].view(torch.uint8), expected_lse[:rows].view(torch.uint8))
                     row = dict(mode="sparse_chunks", kv_cache=cache_format, kind=kind, rows=rows,
