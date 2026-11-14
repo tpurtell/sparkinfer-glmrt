@@ -38,7 +38,12 @@ class ExpandRow128Weight:
 
 
 class ExpandedW8Prefill:
-    """Expand once in graph-owned scratch, then reuse across all row tiles."""
+    """Expand once in graph-owned scratch, then reuse across all row tiles.
+
+    Interim scaled-BF16 fallback: native K128 full-fragment accumulation regressed
+    this opt-in route. Preserve channel-vs-row128 metadata before specializing the
+    epilogue or a lower-pressure native row128 kernel (cuteafd#2068).
+    """
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16):
         self.n, self.k = int(n), int(k)

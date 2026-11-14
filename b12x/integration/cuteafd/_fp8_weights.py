@@ -6,12 +6,11 @@ powers of two costs 0.025 nats, so these kernels apply them exactly:
 
 ``MmaFp8Gemv``   decode rows (one thin 16-row tile, then multi-tile rows to the
     program's capacity on the same ``warps``/``groups``): m16n8k16 BF16 MMAs fed
-    straight from global memory, weights widened in registers to
-    ``bf16(w * s)`` (exactly the BF16 program's dequantized weight), FP32
-    accumulation; reads half the weight bytes of the BF16 GEMV.
-``TmaFp8Gemm``    the BF16 TMA tensor-core GEMM with E4M3 weight tiles widened
-    to ``bf16(w * s)`` in shared memory; bitwise equal to the BF16 kernel over
-    dequantized weights (W8A16; block, per-row or K-block-major per-row scales).
+    straight from global memory, exact E4M3 widening in registers and FP32
+    block scales applied to reusable K64 accumulator segments; reads half the weight
+    bytes of the BF16 GEMV without rounding the scaled weight.
+``TmaFp8Gemm``    interim W8A16 fallback with scaled-BF16 weights, pending
+    a native-scale implementation that reaches speed parity (cuteafd#2068).
 ``RoutedFp8Projection``  ``MmaFp8Gemv`` up to ``decode_rows`` live rows, the
     BF16 TMA GEMM over the BF16 copy of the weight above.
 ``Fp8Projection``  a weight held only as E4M3 + scales (no BF16 copy): decode
@@ -233,6 +232,8 @@ class Fp8Projection:
                                       cta_tiles=wide_t if wide_groups is None else None,
                                       row_scales=self.row_scales, kmajor=self.kmajor,
                                       out_dtype=out_dtype) if cap > int(gemv_rows) else None
+            assert self.gemv_wide is None or self.gemv.native_scale == self.gemv_wide.native_scale, \
+                "decode widths must not switch weight-scale arithmetic"
             # HQA block-scale o projections: only M16 won the direct-widen screen.
             if (self.n, self.k, warps) in ((4096, 16384, 4), (4096, 8192, 8)) \
                     and not self.row_scales and out_dtype == cutlass.BFloat16 \
@@ -507,6 +508,9 @@ FP8_GEMV_WIDE_KERNEL = {
 }
 
 
+FP8_NATIVE_SCALE_DEFERRED = frozenset(FP8_GEMV_WIDE_KERNEL)
+
+
 def fp8_gemv_wide_kernel(n: int, k: int, *, warps: int, row_scales: bool = False,
                          kmajor: bool = False):
     """``MmaFp8Gemv`` subclass for the rows 17..64 tile of an ``N x K`` projection: the
@@ -628,6 +632,8 @@ class TmaFp8Gemm:
 
     tile_k = 64
     buffer_align_bytes = 1024
+    # Interim scaled-BF16 fallback: native segment scaling has not reached parity
+    # on default native-attention prefill. Track the optimized path in cuteafd#2068.
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, compute_warps: int = 4,
                  num_stages: int = 4, scales: str = "block", tile_n: int = 128):
@@ -936,9 +942,10 @@ class MmaFp8Gemv:
     16 * quad(s) + 4t + idx(s)`` (``idx`` of slots ``2j, 2j+1, 2j+8, 2j+9``
     is 0..3), so each lane reads one contiguous 16-byte weight run per group
     (row ``lane/4``) and two contiguous 32-byte activation runs per tile,
-    reused by every group. Weights enter the MMA as ``bf16(w * s)`` (the BF16
-    program's dequantized weight; one scale per 128-wide K block since a
-    CTA's columns share a 128-row block), FP32 accumulation; warps reduce
+    reused by every group. Weights enter the MMA as exact E4M3 values; each
+    K64 FP32 partial receives its checkpoint K128 scale before accumulating
+    except the whole-shape deferred NC set, which retains scaled-BF16 operands.
+    Warps reduce
     through shared memory (one tile at a time when a CTA holds more than two,
     ``sync_threads`` between tiles, and the same ascending warp order either
     way); output BF16 or FP32 ``[rows, N]``. Nothing here depends on the live
@@ -948,7 +955,8 @@ class MmaFp8Gemv:
 
     ``row_scales``: the scale grid is ``[N, K/128]`` FP32, one scale per
     output row and 128-wide K block (per-channel or row-block quantization of
-    a BF16 weight); each lane scales its own row's weights. ``kmajor``: those
+    a BF16 weight); the scale follows the MMA accumulator's column mapping.
+    ``kmajor``: those
     per-row scales stored K-block major, ``[K/128, N]``.
     """
 
@@ -957,8 +965,11 @@ class MmaFp8Gemv:
                  load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024,
                  cta_tiles: int | None = None, direct_widen: bool = False):
         self.direct_widen = bool(direct_widen)
-        self.widen = _e4m3x4_scaled_bf16x2x2
-        if self.direct_widen:
+        # Whole-shape fallback preserves thin/wide arithmetic identity while NC
+        # native scaling exceeds the measured 10% bar (cuteafd#2068).
+        self.native_scale = (int(n), int(k)) not in FP8_NATIVE_SCALE_DEFERRED
+        self.widen = _e4m3x4_bf16x2x2 if self.native_scale else _e4m3x4_scaled_bf16x2x2
+        if self.direct_widen and not self.native_scale:
             from ._fp8_gemv_nc import _e4m3x4_scaled_bf16x2x2_fast
             self.widen = _e4m3x4_scaled_bf16x2x2_fast
         if load_hint not in ("stream", "l2_128b", "l2_256b"):
@@ -1143,8 +1154,11 @@ class MmaFp8Gemv:
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
                 for gi in cutlass.range_constexpr(self.groups):
                     for t in cutlass.range_constexpr(4):
-                        b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t],
-                                           s_cur[gi if self.row_scales else 0])
+                        if const_expr(self.native_scale):
+                            b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t])
+                        else:
+                            b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t],
+                                               s_cur[gi if self.row_scales else 0])
                         bw[8 * gi + 2 * t] = b0
                         bw[8 * gi + 2 * t + 1] = b1
                 for mt in cutlass.range_constexpr(self.m_tiles):
@@ -1170,15 +1184,31 @@ class MmaFp8Gemv:
                                 xa[12 + i] = hi[i]
                         for gi in cutlass.range_constexpr(self.groups):
                             f = 4 * (mt * self.groups + gi)
-                            for t in cutlass.range_constexpr(4):
-                                d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
-                                    xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
-                                    bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
-                                acc[f] = d0
-                                acc[f + 1] = d1
-                                acc[f + 2] = d2
-                                acc[f + 3] = d3
+                            if const_expr(self.native_scale):
+                                part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                                part.fill(0.0)
+                                for t in cutlass.range_constexpr(4):
+                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                        part[0], part[1], part[2], part[3],
+                                        xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
+                                        bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
+                                    part[0], part[1], part[2], part[3] = d0, d1, d2, d3
+                                for v in cutlass.range_constexpr(4):
+                                    block_scale = s_cur[gi if self.row_scales else 0]
+                                    if const_expr(self.row_scales):
+                                        block_scale = cute.arch.shuffle_sync(block_scale,
+                                            Int32(4) * (Int32(2) * j + Int32(v % 2)))
+                                    acc[f + v] = acc[f + v] + part[v] * block_scale
+                            else:
+                                for t in cutlass.range_constexpr(4):
+                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                        xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
+                                        bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
+                                    acc[f] = d0
+                                    acc[f + 1] = d1
+                                    acc[f + 2] = d2
+                                    acc[f + 3] = d3
             for i in cutlass.range_constexpr(per_block):
                 cur[i] = nxt[i]
             for si in cutlass.range_constexpr(s_rows):
