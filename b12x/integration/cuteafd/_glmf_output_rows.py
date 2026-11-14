@@ -116,7 +116,7 @@ def compile_glmf_kda_output_rows_aot(g_half: GLMFGeometry, *, max_rows: int,
                   Operand("scratch", torch.uint8, "[scratch_bytes]", "scratch")),
         scalars=(Scalar("owned_rows"), Scalar("total_rows")), key=(max_rows, fp8_only, fn.key()),
         geometry={"n": n, "k": k, "max_rows": max_rows, "fp8_only": fp8_only,
-                  "prefill_expanded": prefill_expanded, "scale_granularity": scale_granularity, "decode_gemv_rows": FP8_DECODE_ROWS,
+                  "prefill_expanded": prefill_expanded, **({"scale_granularity": "channel"} if scale_granularity == "channel" else {}), "decode_gemv_rows": FP8_DECODE_ROWS,
                   "scratch_rows": "total_rows"},
         scratch={"scratch": lambda total_rows: n * k * 2 if prefill_expanded and total_rows >= 512 else 0},
         doc=compile_glmf_kda_output_rows_aot.__doc__)

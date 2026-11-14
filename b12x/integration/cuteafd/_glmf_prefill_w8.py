@@ -61,6 +61,8 @@ class ExpandedW8Prefill:
 
     Row128 keeps the marked scaled-BF16 fallback (cuteafd#2068). Channel must
     come from checkpoint/conversion metadata, never inferred from scale layout.
+    Program geometry omits scale_granularity for Row128 (the schema default);
+    only explicit Channel siblings emit scale_granularity="channel".
     """
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16,
