@@ -518,7 +518,7 @@ def _synthetic_oracle_seeds(weight_seed, h, n, coded, tile, control_tile, marker
 
 
 
-@pytest.mark.parametrize("world,n", [(4, 576), (8, 288)])
+@pytest.mark.parametrize("world,n", [(3, 768), (4, 576), (8, 288)])
 @pytest.mark.parametrize("m", [1, 16, 80, 256, 1024, 4096])
 def test_shipped_v41_width192_exact_route_bytes(world, n, m):
     require_b12x()
