@@ -25,7 +25,7 @@ def test_router_oracle_and_replay():
         def run():
             p.launch(logits, bias, ids, weights, scalars=(count,))
         run()
-        expected_ids = (logits.sigmoid() + bias).argsort(-1, descending=True, stable=True)[:, :8]
+        expected_ids = (logits.sigmoid() + bias).argsort(dim=-1, descending=True, stable=True)[:, :8]
         assert torch.equal(ids, expected_ids)
         expected = F.logsigmoid(logits.gather(-1, expected_ids)).softmax(-1) * 2.5
         torch.testing.assert_close(weights, expected, atol=2e-6, rtol=2e-6)
@@ -36,7 +36,7 @@ def test_router_oracle_and_replay():
         logits.mul_(.5)
         bias.copy_(torch.arange(384, device="cuda") * .001)
         graph.replay()
-        expected_ids = (logits.sigmoid() + bias).argsort(-1, descending=True, stable=True)[:, :8]
+        expected_ids = (logits.sigmoid() + bias).argsort(dim=-1, descending=True, stable=True)[:, :8]
         assert torch.equal(ids, expected_ids)
         expected = F.logsigmoid(logits.gather(-1, expected_ids)).softmax(-1) * 2.5
         torch.testing.assert_close(weights, expected, atol=2e-6, rtol=2e-6)
