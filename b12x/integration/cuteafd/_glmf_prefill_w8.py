@@ -34,8 +34,8 @@ class ExpandRow128Weight:
     def kernel(self, weight: cute.Pointer, scales: cute.Pointer, out: cute.Pointer):
         at = Int64(cute.arch.block_idx()[0]) * Int64(self.elements) + Int64(cute.arch.thread_idx()[0]) * Int64(8)
         if at < Int64(self.n * self.k):
-            lo, hi = ld_global_nc_v2_u32(Int64(weight.toint()) + at)
             if cutlass.const_expr(self.channel):
+                lo, hi = ld_global_nc_v2_u32(Int64(weight.toint()) + at)
                 a, b = _e4m3x4_bf16x2x2(lo)
                 c, d = _e4m3x4_bf16x2x2(hi)
                 st_global_v4_u32(Int64(out.toint()) + at * Int64(2), a, b, c, d)
@@ -44,6 +44,7 @@ class ExpandRow128Weight:
                 # both architectures; channel-only epilogue scaling is not valid here.
                 row, kb = at // Int64(self.k), (at % Int64(self.k)) // Int64(128)
                 scale = scales[kb * Int64(self.n) + row]
+                lo, hi = ld_global_nc_v2_u32(Int64(weight.toint()) + at)
                 words = _e4m3x8_scaled_bf16(lo, hi, scale)
                 st_global_v4_u32(Int64(out.toint()) + at * Int64(2), *words)
 
