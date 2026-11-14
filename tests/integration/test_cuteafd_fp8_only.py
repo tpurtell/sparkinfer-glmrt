@@ -287,3 +287,12 @@ def test_native_dense_scale_f64(route, rows, scales):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(first, out)
+
+
+@pytest.mark.parametrize("n,k,warps", [(5120,17408,4),(16384,1536,2),(4096,16384,4)])
+def test_deferred_nc_shape_keeps_one_scale_arithmetic(n, k, warps):
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+    projection = Fp8Projection(n, k, warps=warps)
+    assert not projection.gemv.native_scale
+    assert projection.gemv_wide is not None
+    assert not projection.gemv_wide.native_scale

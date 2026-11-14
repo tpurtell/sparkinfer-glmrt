@@ -508,15 +508,23 @@ FP8_GEMV_WIDE_KERNEL = {
 }
 
 
+FP8_NATIVE_SCALE_DEFERRED = frozenset(FP8_GEMV_WIDE_KERNEL)
+
+
 def fp8_gemv_wide_kernel(n: int, k: int, *, warps: int, row_scales: bool = False,
                          kmajor: bool = False):
     """``MmaFp8Gemv`` subclass for the rows 17..64 tile of an ``N x K`` projection: the
     measured nc entry at the warps it was measured at, else the base kernel.  The nc kernel
     was measured on block-scale weights only, so a per-row-scale or K-block-major shape never
     leaves the base kernel."""
-    # Native base preserves one arithmetic across the decode width band. The
-    # rounded NC fallback cannot follow an exact-scale thin tile (cuteafd#2068).
-    return MmaFp8Gemv
+    if FP8_GEMV_WIDE_KERNEL.get((int(n), int(k))) != "nc" or row_scales or kmajor:
+        return MmaFp8Gemv
+    entry = FP8_GEMV_WIDE.get((int(n), int(k)))
+    if entry is None or entry[0] != int(warps):
+        return MmaFp8Gemv
+    from ._fp8_gemv_nc import NcMmaFp8Gemv
+
+    return NcMmaFp8Gemv
 
 
 def fp8_gemv_tuning(n: int, k: int, *, warps: int | None = None) -> tuple[int, int]:
@@ -958,7 +966,13 @@ class MmaFp8Gemv:
                  load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024,
                  cta_tiles: int | None = None, direct_widen: bool = False):
         self.direct_widen = bool(direct_widen)
-        self.widen = _e4m3x4_bf16x2x2
+        # Whole-shape fallback preserves thin/wide arithmetic identity while NC
+        # native scaling exceeds the measured 10% bar (cuteafd#2068).
+        self.native_scale = (int(n), int(k)) not in FP8_NATIVE_SCALE_DEFERRED
+        self.widen = _e4m3x4_bf16x2x2 if self.native_scale else _e4m3x4_scaled_bf16x2x2
+        if self.direct_widen and not self.native_scale:
+            from ._fp8_gemv_nc import _e4m3x4_scaled_bf16x2x2_fast
+            self.widen = _e4m3x4_scaled_bf16x2x2_fast
         if load_hint not in ("stream", "l2_128b", "l2_256b"):
             raise ValueError("load_hint is stream, l2_128b or l2_256b")
         if prefetch_blocks and (prefetch_bytes % 128 or prefetch_bytes > 4096):
@@ -1141,7 +1155,11 @@ class MmaFp8Gemv:
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
                 for gi in cutlass.range_constexpr(self.groups):
                     for t in cutlass.range_constexpr(4):
-                        b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t])
+                        if const_expr(self.native_scale):
+                            b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t])
+                        else:
+                            b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t],
+                                               s_cur[gi if self.row_scales else 0])
                         bw[8 * gi + 2 * t] = b0
                         bw[8 * gi + 2 * t + 1] = b1
                 for mt in cutlass.range_constexpr(self.m_tiles):
@@ -1167,20 +1185,31 @@ class MmaFp8Gemv:
                                 xa[12 + i] = hi[i]
                         for gi in cutlass.range_constexpr(self.groups):
                             f = 4 * (mt * self.groups + gi)
-                            part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
-                            part.fill(0.0)
-                            for t in cutlass.range_constexpr(4):
-                                d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                    part[0], part[1], part[2], part[3],
-                                    xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
-                                    bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
-                                part[0], part[1], part[2], part[3] = d0, d1, d2, d3
-                            for v in cutlass.range_constexpr(4):
-                                block_scale = s_cur[gi if self.row_scales else 0]
-                                if const_expr(self.row_scales):
-                                    block_scale = cute.arch.shuffle_sync(block_scale,
-                                        Int32(4) * (Int32(2) * j + Int32(v % 2)))
-                                acc[f + v] = acc[f + v] + part[v] * block_scale
+                            if const_expr(self.native_scale):
+                                part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                                part.fill(0.0)
+                                for t in cutlass.range_constexpr(4):
+                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                        part[0], part[1], part[2], part[3],
+                                        xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
+                                        bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
+                                    part[0], part[1], part[2], part[3] = d0, d1, d2, d3
+                                for v in cutlass.range_constexpr(4):
+                                    block_scale = s_cur[gi if self.row_scales else 0]
+                                    if const_expr(self.row_scales):
+                                        block_scale = cute.arch.shuffle_sync(block_scale,
+                                            Int32(4) * (Int32(2) * j + Int32(v % 2)))
+                                    acc[f + v] = acc[f + v] + part[v] * block_scale
+                            else:
+                                for t in cutlass.range_constexpr(4):
+                                    d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                        xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
+                                        bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
+                                    acc[f] = d0
+                                    acc[f + 1] = d1
+                                    acc[f + 2] = d2
+                                    acc[f + 3] = d3
             for i in cutlass.range_constexpr(per_block):
                 cur[i] = nxt[i]
             for si in cutlass.range_constexpr(s_rows):
