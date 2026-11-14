@@ -29,13 +29,16 @@ gate/up exchange, is independently pinned, so the end-to-end check is legitimate
   (2) input and act quantizers exact (row amax, scale bytes, packed codes) on every block; tie blocks counted
       and their mismatches reported separately (zero);
   (3) from the kernel's own FC1 exchange: oracle act-quant -> F64 down -> unweighted sum matches the
-      route's output at cosine >= 0.9999 / per row >= 0.999 (measured 0.999996);
-  (4) down GEMM at most 1 BF16 ulp from the F64 down over the kernel's own packed act; combine exact.
+      route's output at cosine >= 0.9999 / per row >= 0.999 (measured 1.0000000);
+  (4) down GEMM at most 1 BF16 ulp from the F64 down over the kernel's own packed act; combine exact
+      against the slot-order F32 sum. Both F64 references sum the raw q*s grid products first (exact) and
+      apply the row and expert factors afterwards, as the kernel and the vendor do.
 
-The end-to-end F64 cosine (full oracle from BF16 x) is reported, not gated: the per-token re-quantization
-amplifies FC1's F32-accumulation ulps into whole-row re-quantizations (0.99988 / 0.9982 at 128 rows), which
-no oracle short of the MMA's accumulation order reproduces. The model-level golden and fidelity are the
-backstop once serving exists.
+The end-to-end F64 cosine (full oracle from BF16 x) is reported, not gated. With the oracle on the vendor's
+F32 quantizer arithmetic it reads 1.0000000 overall and >= 0.9999 per row in every case here; a one-BF16-ulp
+FC1 difference (F32 accumulation order against F64) can still re-quantize a whole act row, which is why the
+gate is the stage-exact form and this number is a diagnostic. An earlier reading of 0.99988 / 0.9982 at 128
+rows was the oracle's own quantizer rounding (see below), not the kernel.
 
 The quantizer is the format's rule as both pinned vendor kernels fix it, in F32 with no FP fusion
 (vLLM ``d664cd1e`` ``ops/nvfp4.py``; SGLang ``ec5e7ff5`` ``nvfp4.py:95-97``): ``encoder =
