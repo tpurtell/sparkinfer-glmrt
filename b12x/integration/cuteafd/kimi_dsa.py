@@ -134,7 +134,7 @@ def compile_kimi_context_index_topk_aot(g=KimiDsaGeometry(), *, max_rows, max_pa
     return compile_scored_index_topk_aot(g, max_rows=max_rows, max_pages=max_pages, mode=mode)
 
 
-def compile_kimi_sparse_mla_partial_aot(g=None, *, max_rows=64, head_begin=0):
+def compile_kimi_sparse_mla_partial_aot(g=None, *, max_rows=64, head_begin=0, row_chunk_size=None):
     """Parity-local selected-token MLA partial with base2 LSE for peer combine.
 
     Global index selection and shared candidate parity compaction precede this
@@ -148,7 +148,14 @@ def compile_kimi_sparse_mla_partial_aot(g=None, *, max_rows=64, head_begin=0):
         raise ValueError("Kimi sparse Context partial requires an aligned h48 range of h96")
     if not 1 <= int(max_rows) <= 4096:
         raise ValueError("sparse MLA row capacity must be in 1..4096")
-    launch = _ContextPartial(g, int(max_rows), 2048, head_begin, 48, 16, page_size=1)
+    chunk = None if row_chunk_size is None else int(row_chunk_size)
+    if chunk is not None and not 1 <= chunk <= 4096:
+        raise ValueError("sparse MLA row chunk size must be in 1..4096")
+    if chunk is None:
+        launch = _ContextPartial(g, int(max_rows), 2048, head_begin, 48, 16, page_size=1)
+    else:
+        from .kimi_mla import _SparsePartialChunks
+        launch = _SparsePartialChunks(g, int(max_rows), chunk, head_begin)
     operands = (
         Operand("query", torch.bfloat16, "[rows,96,576]"),
         Operand("kv_cache", torch.uint8, f"[pool_tokens,{g.record_bytes}]"),
@@ -161,14 +168,16 @@ def compile_kimi_sparse_mla_partial_aot(g=None, *, max_rows=64, head_begin=0):
     )
     return compile_program(launch, name="kimi_sparse_mla_partial", operands=operands,
         scalars=(Scalar("rows"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
-        key=(g, int(max_rows), head_begin, "selected-token-gather", "base2"),
+        key=((g, int(max_rows), head_begin, "selected-token-gather", "base2")
+             + (() if chunk is None else ("row-chunks", min(int(max_rows), chunk)))),
         geometry={**vars(g), "max_rows": int(max_rows), "topk": 2048,
                   "head_begin": head_begin, "head_count": 48, "num_splits": 16,
-                  "page_size": 1, "lse_base": 2},
+                  "page_size": 1, "lse_base": 2,
+                  **({} if chunk is None else {"row_chunk_size": min(int(max_rows), chunk)})},
         scratch={"scratch": launch.scratch_bytes}, doc=compile_kimi_sparse_mla_partial_aot.__doc__)
 
 
-def compile_kimi_sparse_mla_aot(g=None, *, max_rows=64):
+def compile_kimi_sparse_mla_aot(g=None, *, max_rows=64, row_chunk_size=None):
     """Selected-token MLA using the existing Kimi BF16 attention pipeline.
 
     Each query is one request. Its table contains physical token slots, so
@@ -181,7 +190,14 @@ def compile_kimi_sparse_mla_aot(g=None, *, max_rows=64):
     g = g or KimiMlaGeometry(name="kimi_k31_mla", norm_eps=1e-5)
     if not 1 <= int(max_rows) <= 4096:
         raise ValueError("sparse MLA row capacity must be in 1..4096")
-    launch = _Attention(g, int(max_rows), 2048, "decode", page_size=1)
+    chunk = None if row_chunk_size is None else int(row_chunk_size)
+    if chunk is not None and not 1 <= chunk <= 4096:
+        raise ValueError("sparse MLA row chunk size must be in 1..4096")
+    if chunk is None:
+        launch = _Attention(g, int(max_rows), 2048, "decode", page_size=1)
+    else:
+        from .kimi_mla import _SparseAttentionChunks
+        launch = _SparseAttentionChunks(g, int(max_rows), chunk)
     operands = (
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
         Operand("kv_cache", torch.uint8, f"[pool_tokens,{g.record_bytes}]"),
@@ -194,7 +210,8 @@ def compile_kimi_sparse_mla_aot(g=None, *, max_rows=64):
     )
     return compile_program(launch, name="kimi_sparse_mla", operands=operands,
         scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
-        key=(g, int(max_rows), "selected-token-gather"),
+        key=((g, int(max_rows), "selected-token-gather")
+             + (() if chunk is None else ("row-chunks", min(int(max_rows), chunk)))),
         geometry={**vars(g), **launch.layout, "max_rows": int(max_rows), "topk": 2048,
                   "page_size": 1, "lse_base": "e"},
         scratch={"scratch": lambda rows: launch.layout["scratch_bytes"]},

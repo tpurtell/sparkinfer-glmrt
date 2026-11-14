@@ -228,6 +228,114 @@ def draft_screen(args, sm_count):
     return results
 
 
+def sparse_chunk_screen(args):
+    """Compare the chunk + singleton route directly to the unchanged exports."""
+    from b12x.integration.cuteafd.kimi_dsa import (
+        compile_kimi_sparse_mla_aot, compile_kimi_sparse_mla_partial_aot,
+    )
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    max_rows = max(args.sparse_rows)
+    results = []
+    for cache_format in args.sparse_caches:
+        record_bytes = 1152 if cache_format == "bf16" else 656
+        # Touch only the tail, beyond a 32-bit byte offset, just as a recycled
+        # serving allocation can. All table entries address finite native KV.
+        first_token = 2 ** 31 // record_bytes + 64
+        tokens = 4096
+        cache = torch.empty((first_token + tokens, record_bytes), device="cuda", dtype=torch.uint8)
+        records = (torch.randn(tokens, 576, device="cuda") * .25).bfloat16()
+        if cache_format == "bf16":
+            cache[first_token:] = records.view(torch.uint8)
+        else:
+            group = records[:, :512].float().reshape(tokens, 4, 128)
+            scale = group.abs().amax(-1).clamp_min(1e-6) / 448
+            cache[first_token:, :512] = (group / scale[..., None]).to(
+                torch.float8_e4m3fn).view(torch.uint8).reshape(tokens, 512)
+            cache[first_token:, 512:528] = scale.view(torch.uint8)
+            cache[first_token:, 528:] = records[:, 512:].contiguous().view(torch.uint8)
+        query = (torch.randn(max_rows, 96, 576, device="cuda") * .25).bfloat16()
+        cu = torch.arange(max_rows + 1, device="cuda", dtype=torch.int32)
+        lengths = torch.full((max_rows,), 2048, device="cuda", dtype=torch.int32)
+        # Row-specific shuffled physical selections and padded table strides
+        # exercise every pointer shift, including the final partial chunk.
+        table_width = 2052
+        table = torch.full((max_rows, table_width), -1, device="cuda", dtype=torch.int32)
+        table[:, :2048] = torch.stack([
+            torch.randperm(tokens, device="cuda")[:2048].int() + first_token
+            for _ in range(max_rows)])
+        for kind in args.sparse_kinds:
+            partial = kind.startswith("partial")
+            head_begin = 48 if kind == "partial48" else 0
+            heads = 48 if partial or kind == "heads48" else 96
+            g = KimiMlaGeometry(name="kimi_k31_mla", heads=96 if partial else heads,
+                                norm_eps=1e-5, kv_cache=cache_format)
+            q = query if g.heads == 96 else query[:, :48].contiguous()
+            compile_fn = compile_kimi_sparse_mla_partial_aot if partial else compile_kimi_sparse_mla_aot
+            kwargs = {"head_begin": head_begin} if partial else {}
+            baseline = compile_fn(g, max_rows=max_rows, **kwargs)
+            assert baseline.geometry["num_splits"] == 16
+            programs = {chunk: compile_fn(g, max_rows=max_rows, row_chunk_size=chunk, **kwargs)
+                        for chunk in args.sparse_chunks}
+            expected = torch.empty((max_rows, heads, 512), device="cuda", dtype=torch.bfloat16)
+            expected_lse = torch.empty((max_rows, heads), device="cuda")
+            output, lse = torch.empty_like(expected), torch.empty_like(expected_lse)
+            baseline_work = torch.empty(baseline.scratch_bytes(max_rows)["scratch"],
+                                        device="cuda", dtype=torch.uint8)
+            max_work = max(p.scratch_bytes(max_rows)["scratch"] for p in programs.values())
+            # Canary immediately follows each program's advertised workspace.
+            work = torch.empty(max_work + 256, device="cuda", dtype=torch.uint8)
+            for rows in args.sparse_rows:
+                scalars = (rows, table_width, 16) if partial else (rows, rows, table_width, 16)
+                lengths.fill_(2048)
+                # Short/empty streams stress causal and -inf merge handling.
+                boundary_lengths = [0 if partial else 1, 63, 777, 2047, 2048]
+                lengths[:min(rows, 5)] = torch.tensor(boundary_lengths[:min(rows, 5)],
+                                                       device="cuda", dtype=torch.int32)
+                def base():
+                    baseline.launch(q, cache, table, lengths, cu, expected, expected_lse,
+                                    baseline_work, scalars=scalars)
+                base()
+                torch.cuda.synchronize()
+                assert torch.isfinite(expected[:rows]).all() and expected[:rows].abs().max() > 0
+                with kernel_resolution_guard("K3.1 unchanged sparse MLA is resolved"):
+                    base_time = timed(base, args.iters)
+                for chunk, program in programs.items():
+                    size = program.scratch_bytes(rows)["scratch"]
+                    work.fill_(173)
+                    output.fill_(float("nan"))
+                    lse.fill_(float("nan"))
+                    def candidate():
+                        program.launch(q, cache, table, lengths, cu, output, lse, work,
+                                       scalars=scalars)
+                    candidate()
+                    torch.cuda.synchronize()
+                    assert torch.equal(output[:rows].view(torch.uint8), expected[:rows].view(torch.uint8)), (
+                        cache_format, kind, rows, chunk, "attention")
+                    assert torch.equal(lse[:rows].view(torch.uint8), expected_lse[:rows].view(torch.uint8)), (
+                        cache_format, kind, rows, chunk, "LSE")
+                    assert torch.all(work[size:] == 173), (cache_format, kind, rows, chunk, "scratch overrun")
+                    if rows < max_rows:
+                        assert torch.isnan(output[rows:]).all() and torch.isnan(lse[rows:]).all()
+                    with kernel_resolution_guard("K3.1 chunked sparse MLA is resolved"):
+                        candidate_time = timed(candidate, args.iters)
+                    assert torch.equal(output[:rows].view(torch.uint8), expected[:rows].view(torch.uint8))
+                    assert torch.equal(lse[:rows].view(torch.uint8), expected_lse[:rows].view(torch.uint8))
+                    row = dict(mode="sparse_chunks", kv_cache=cache_format, kind=kind, rows=rows,
+                        row_chunk_size=chunk, active_splits=16, bit_identical=True,
+                        scratch_bytes=size, baseline_scratch_bytes=baseline.scratch_bytes(rows)["scratch"],
+                        baseline=base_time, chunked=candidate_time,
+                        baseline_us_per_row=base_time["median_us"] / rows,
+                        chunked_us_per_row=candidate_time["median_us"] / rows,
+                        baseline_over_chunked=base_time["median_us"] / candidate_time["median_us"])
+                    results.append(row)
+                    print(json.dumps(row), flush=True)
+            del expected, expected_lse, output, lse, baseline_work, work
+        del query, cache
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owned-contexts", type=int, nargs="+", default=[512, 4096, 32768, 131072])
@@ -247,6 +355,12 @@ def main():
     parser.add_argument("--bandwidth-gbs", type=float, default=1792.0,
                         help="HBM spec bandwidth used for the draft roofline")
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument("--sparse-chunks", type=int, nargs="*", default=[],
+                        help="Screen sparse row chunks instead of dense Context attention")
+    parser.add_argument("--sparse-rows", type=int, nargs="+",
+                        default=[1, 6, 16, 64, 512, 513, 2048, 2752, 4096])
+    parser.add_argument("--sparse-caches", nargs="+", default=["bf16", "fp8"])
+    parser.add_argument("--sparse-kinds", nargs="+", default=["heads96", "heads48", "partial0", "partial48"])
     parser.add_argument("--output", required=True)
     parser.add_argument("--source-revision", help="Pinned fork SHA when Git metadata is not container-mounted")
     args = parser.parse_args()
@@ -267,7 +381,13 @@ def main():
                      "windows 0/4096, caches fp8/bf16 and a positive bandwidth required")
     torch.manual_seed(42)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-    results = [] if args.draft_only else target_screen(args, sm_count)
+    if (any(not 1 <= c <= 4096 for c in args.sparse_chunks)
+            or any(not 1 <= r <= 4096 for r in args.sparse_rows)
+            or any(c not in DRAFT_RECORD_BYTES for c in args.sparse_caches)
+            or any(k not in ("heads96", "heads48", "partial0", "partial48") for k in args.sparse_kinds)):
+        parser.error("sparse: rows/chunks in 1..4096, caches bf16/fp8, kinds heads96/heads48/partial0/partial48")
+    results = (sparse_chunk_screen(args) if args.sparse_chunks else
+               [] if args.draft_only else target_screen(args, sm_count))
     draft_results = draft_screen(args, sm_count) if (args.draft or args.draft_only) else []
     props = torch.cuda.get_device_properties(0)
     result = dict(scope=__doc__, source_revision=revision, device=str(props),
