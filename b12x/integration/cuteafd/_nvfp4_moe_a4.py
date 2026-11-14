@@ -416,6 +416,7 @@ class StreamNvfp4LinearA4:
                 w_rows = Int64(w.toint()) + (Int64(e) * Int64(self.n) + Int64(n0)) * Int64(self.k // 2)
                 s_rows = Int64(s.toint()) + (Int64(e) * Int64(self.n) + Int64(n0)) * Int64(self.k // 16)
                 if const_expr(self.divisor):
+                    factor = Float32(1.0)
                     weight_global = _ld_f32(Int64(s.toint()) + Int64(self.alpha_offset) + Int64(e) * Int64(4))
                     input_global = _ld_f32(Int64(s.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
                 else:
@@ -457,7 +458,6 @@ class StreamNvfp4LinearA4:
                                     if const_expr(self.divisor):
                                         acc[f] = div_rn_f32(div_rn_f32(acc[f], weight_global), input_global)
                                         acc[f + 1] = div_rn_f32(div_rn_f32(acc[f + 1], weight_global), input_global)
-                                        factor = Float32(1.0)
                                     st_global_u32(Int64(y.toint()) + (Int64(first + row) * Int64(self.n) + Int64(col))
                                                   * Int64(2), pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
 
@@ -615,6 +615,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                 # warp_n 0: gate columns (w1 / s1); 1: up columns (w3 / s3).
                 sp = cutlass.select_(warp_n == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
                 if const_expr(self.divisor):
+                    factor = Float32(1.0)
                     weight_global = _ld_f32(sp + Int64(self.alpha_offset) + Int64(e) * Int64(4))
                     input_global = _ld_f32(sp + Int64(self.in_offset) + Int64(e) * Int64(4))
                 else:
@@ -653,7 +654,6 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                                 if const_expr(self.divisor):
                                     acc[f] = div_rn_f32(div_rn_f32(acc[f], weight_global), input_global)
                                     acc[f + 1] = div_rn_f32(div_rn_f32(acc[f + 1], weight_global), input_global)
-                                    factor = Float32(1.0)
                                 st_shared_u32(ring + row * Int32(self.x_stride) + col * Int32(2),
                                               pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
                 cute.arch.sync_threads()

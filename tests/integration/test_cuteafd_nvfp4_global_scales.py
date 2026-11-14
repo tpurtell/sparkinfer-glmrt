@@ -61,19 +61,19 @@ def test_real_minimax_divisor_slice(projection):
     a_s = torch.full((128, k // 16), 0x38, dtype=torch.uint8, device="cuda")
     from b12x.integration.cuteafd._fp8_moe_kernels import META_HEAD
     from b12x.integration.cuteafd._nvfp4_moe_a4 import StreamNvfp4LinearA4
-    from b12x.integration.cuteafd._common import Operand, compile_program
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
 
     meta = torch.zeros(META_HEAD + 4, dtype=torch.int32)
     meta[1], meta[META_HEAD] = 1, 1
     meta = meta.cuda()
     kernel = StreamNvfp4LinearA4(n=n, k=k, experts=1, scale_convention="divisor")
     program = compile_program(kernel, name="nvfp4_real_divisor_slice", operands=(
-        Operand("meta", torch.int32, "[meta]"), Operand("aq", torch.uint8, "[128,K/2]"),
-        Operand("a_s", torch.uint8, "[128,K/16]"), Operand("w", torch.uint8, "[N,K/2]"),
+        Operand("aq", torch.uint8, "[128,K/2]"), Operand("a_s", torch.uint8, "[128,K/16]"),
+        Operand("meta", torch.int32, "[meta]"), Operand("w", torch.uint8, "[N,K/2]"),
         Operand("s", torch.uint8, "[scales]"), Operand("y", torch.bfloat16, "[1,N]", "out")),
-        scalars=(), key=kernel.key())
+        scalars=(Scalar("max_tiles"),), key=kernel.key())
     out = torch.full((1, n), float("nan"), dtype=torch.bfloat16, device="cuda")
-    program.launch(meta, aq, a_s, weights, scales, out)
+    program.launch(aq, a_s, meta, weights, scales, out, scalars=(1,))
     # The raw GPU operand has the checkpoint's bits, not a reciprocal round trip.
     assert bytes(scales[-8:].cpu().tolist()) == global_bytes + input_bytes
     expected = (dequant(w, s).double().sum(-1) / float(weight_global) / float(input_global)).bfloat16()
