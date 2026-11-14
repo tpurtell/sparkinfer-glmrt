@@ -285,10 +285,7 @@ def _e4m3x4_scaled_bf16x2x2_fast(word, s, *, loc=None, ip=None):
 
 
 class NcMmaFp8Gemv(MmaFp8Gemv):
-    native_scale = False
-    # Interim scaled-BF16 fallback: native NC regresses SM120 wide rows.
-    # Preserve this measured path until cuteafd#2068 reaches parity.
-    """Bit-identical ``MmaFp8Gemv`` with 2-chunk rotating weight pipeline, 8-register half-chunk
+    """Rounded-scale NC fallback with 2-chunk rotating weight pipeline, 8-register half-chunk
     ping-pong activation prefetching, 32-bit clamped row byte offsets (no 64-bit offset hoisting),
     SM120 direct ``cvt.rn.bf16x2.e4m3x2`` dequant, M-band-first grid ordering, and vectorized
     ``v2.f32`` shared fold + packed ``bf16x2`` stores."""
@@ -298,6 +295,9 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
                  cta_tiles: int | None = None):
         super().__init__(n, k, max_rows=max_rows, warps=warps, groups=groups, out_dtype=out_dtype,
                          row_scales=row_scales, kmajor=kmajor)
+        # Interim scaled-BF16 fallback; every thin tile for a selected NC shape
+        # must share this arithmetic (cuteafd#2068).
+        self.native_scale = False
         target_tiles = (nc_gemv_cta_tiles(self.n, self.k, groups=self.groups, warps=self.warps)
                         if cta_tiles is None else int(cta_tiles))
         self.m_tiles = min(self.total_m_tiles, target_tiles)

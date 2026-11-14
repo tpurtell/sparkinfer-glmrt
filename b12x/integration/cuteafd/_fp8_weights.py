@@ -929,8 +929,6 @@ def _ld_stream_l2_256(address, *, loc=None, ip=None):
 
 
 class MmaFp8Gemv:
-    native_scale = True
-
     """Decode-row GEMM on tensor cores straight from global memory.
 
     A CTA owns ``8 * groups`` output columns and ``m_tiles`` 16-row tiles of the
@@ -945,7 +943,8 @@ class MmaFp8Gemv:
     is 0..3), so each lane reads one contiguous 16-byte weight run per group
     (row ``lane/4``) and two contiguous 32-byte activation runs per tile,
     reused by every group. Weights enter the MMA as exact E4M3 values; each
-    K64 FP32 partial receives its checkpoint K128 scale before accumulating.
+    K64 FP32 partial receives its checkpoint K128 scale before accumulating
+    except the whole-shape deferred NC set, which retains scaled-BF16 operands.
     Warps reduce
     through shared memory (one tile at a time when a CTA holds more than two,
     ``sync_threads`` between tiles, and the same ascending warp order either

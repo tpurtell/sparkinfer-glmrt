@@ -1,7 +1,6 @@
 """FP8-only weight kernels for the cuteafd coordinator programs (no BF16 copies).
 
-* ``TmaFp8Gemm`` with block/per-row scales matches the exact FP64 checkpoint
-  product without BF16 scaled-weight rounding.
+* ``TmaFp8Gemm`` retains the interim scaled-BF16 contract (cuteafd#2068).
 * ``BatchedFp8Gemm`` (per-row x 64-K scales) equals ``BatchedBf16Gemm`` over
   the dequantized weights bitwise (GLM ``kv_b_proj`` absorb / up-projection).
 * ``Fp8Projection``: native-scale decode and W8A16 fallback match the exact
