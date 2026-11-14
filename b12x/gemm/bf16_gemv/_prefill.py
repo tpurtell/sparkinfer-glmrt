@@ -321,14 +321,14 @@ class Bf16PrefillKernel:
             # Publish one scale per column with the pipeline's existing CTA sync.
             s_scales = smem.allocate_tensor(element_type=Float32,
                 layout=cute.make_layout((self.tile_n,)), byte_alignment=16)
-            for index in cutlass.range_constexpr((self.tile_n + self.num_threads - 1) // self.num_threads):
-                column = tidx + Int32(index * self.num_threads)
-                if column < Int32(self.tile_n):
-                    global_column = n_tile * Int32(self.tile_n) + column
+            for scale_index in cutlass.range_constexpr((self.tile_n + self.num_threads - 1) // self.num_threads):
+                scale_column = tidx + Int32(scale_index * self.num_threads)
+                if scale_column < Int32(self.tile_n):
+                    global_column = n_tile * Int32(self.tile_n) + scale_column
                     if global_column < Int32(self.n):
-                        s_scales[column] = channel_scales[Int64(global_column)]
+                        s_scales[scale_column] = channel_scales[Int64(global_column)]
                     else:
-                        s_scales[column] = Float32(0)
+                        s_scales[scale_column] = Float32(0)
 
         tma_copy_bytes = (
             (self.tile_m + self.tile_n) * self.tile_k * cutlass.BFloat16.width // 8
