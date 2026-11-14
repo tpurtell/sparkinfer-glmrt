@@ -442,3 +442,82 @@ class TrellisPrefillMxfp8:
                          rows, rotation_id).launch(
                 grid=(min(tasks, cta_limit), 1, 1), block=(32 * NWARP, 1, 1),
                 stream=stream)
+
+
+class NativeMxfp8Decode:
+    """One N8/M16 warp streams unchanged native group32 weights and records.
+
+    Keep the prefill K128 reset/fold order, but spend no warps on synthetic
+    M256 rows and require no weight staging or CTA-wide barriers.
+    """
+
+    def __init__(self, g):
+        if g["encoding"] != "mxfp8":
+            raise ValueError("native MXFP8 decode requires group32 weights")
+        self.k, self.n = g["input_features"], g["output_features"]
+        self.nk32 = self.k // 32
+        self.max_rows, self.rotations = g["max_rows"], g["rotation_count"]
+        self.input_units = g["sharded_side"] == 2
+        self.scratch_bytes = ((self.max_rows + 15) // 16) * self.nk32 * MX8_REC
+
+    @cute.kernel
+    def decode(self, payload: cute.Tensor, scales: cute.Tensor,
+               records: cute.Tensor, output: cute.Tensor, rows: Int32):
+        lane, _, _ = cute.arch.thread_idx()
+        task, _, _ = cute.arch.block_idx()
+        step, _, _ = cute.arch.grid_dim()
+        lane, task, step = Int32(lane), Int32(task), Int32(step)
+        ntiles = Int32(self.n // 8)
+        total_tasks = ((rows + Int32(15)) // Int32(16)) * ntiles
+        wbase, sbase = payload.iterator.toint(), scales.iterator.toint()
+        abase, obase = records.iterator.toint(), output.iterator.toint()
+        srow = (lane >> Int32(2)) + (lane & Int32(1)) * Int32(8)
+        while task < total_tasks:
+            nb, mb = task % ntiles, task // ntiles
+            col = nb * Int32(8) + (lane >> Int32(2))
+            total = cute.make_rmem_tensor((4,), Float32)
+            total.fill(Float32(0))
+            for kb in cutlass.range(self.k // 128, unroll=1):
+                acc = cute.make_rmem_tensor((4,), Float32)
+                acc.fill(Float32(0))
+                for k32 in cutlass.range_constexpr(4):
+                    rec = abase + (mb.to(Int64) * Int64(self.nk32)
+                        + kb.to(Int64) * Int64(4) + Int64(k32)) * Int64(MX8_REC)
+                    a0, a1, a2, a3 = ld_global_nc_v4_u32(rec + lane.to(Int64) * Int64(16))
+                    sa = ld_global_nc_u8(rec + Int64(512) + srow.to(Int64))
+                    k = Int32(k32 * 32) + (lane & Int32(3)) * Int32(4)
+                    offset = col.to(Int64) * Int64(self.k) + kb.to(Int64) * Int64(128) + k.to(Int64)
+                    scale = col.to(Int64) * Int64(self.nk32) + kb.to(Int64) * Int64(4) + Int64(k32)
+                    if cutlass.const_expr(self.input_units):
+                        offset = (kb.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(128) + k.to(Int64)
+                        scale = (kb.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4) + Int64(k32)
+                    b0 = ld_global_nc_u32(wbase + offset)
+                    b1 = ld_global_nc_u32(wbase + offset + Int64(16))
+                    sb = ld_global_nc_u8(sbase + scale)
+                    d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                        acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sa, sb)
+                    acc[0], acc[1], acc[2], acc[3] = d0, d1, d2, d3
+                for i in cutlass.range_constexpr(4):
+                    total[i] = total[i] + acc[i]
+            row = mb * Int32(16) + (lane >> Int32(2))
+            col = nb * Int32(8) + (lane & Int32(3)) * Int32(2)
+            address = obase + (row.to(Int64) * Int64(self.n) + col.to(Int64)) * Int64(4)
+            if row < rows:
+                st_global_v2_f32(address, total[0], total[1])
+            if row + Int32(8) < rows:
+                st_global_v2_f32(address + Int64(8 * self.n * 4), total[2], total[3])
+            task += step
+
+    @cute.jit
+    def __call__(self, rotated_inputs: cute.Pointer, payload: cute.Pointer,
+                 scales: cute.Pointer, records: cute.Pointer, output: cute.Pointer,
+                 rows: Int32, rotation_id: Int32, cta_limit: Int32,
+                 stream: cuda.CUstream):
+        if (rows > Int32(0) and rows <= Int32(self.max_rows)
+                and rotation_id >= Int32(0) and rotation_id < Int32(self.rotations)
+                and cta_limit > Int32(0)):
+            layout = cute.make_layout(1, stride=1)
+            tasks = ((rows + Int32(15)) // Int32(16)) * Int32(self.n // 8)
+            self.decode(cute.make_tensor(payload, layout), cute.make_tensor(scales, layout),
+                        cute.make_tensor(records, layout), cute.make_tensor(output, layout), rows).launch(
+                grid=(min(tasks, cta_limit), 1, 1), block=(32, 1, 1), stream=stream)

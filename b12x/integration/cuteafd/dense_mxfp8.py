@@ -49,19 +49,20 @@ def compile_dense_mxfp8_quant_aot(*, input_features, max_rows=4096,
 
 def compile_dense_mxfp8_aot(*, input_features, output_features, encoding="trellis",
                           sharded_side=1, max_rows=4096, rotation_count=4,
-                          input_dtype="f16"):
-    from b12x.gemm.dense_mxfp8 import TrellisPrefillMxfp8
+                          input_dtype="f16", decode=False):
+    from b12x.gemm.dense_mxfp8 import NativeMxfp8Decode, TrellisPrefillMxfp8
     g = geometry(input_features, output_features, encoding=encoding,
                  sharded_side=sharded_side, max_rows=max_rows,
                  rotation_count=rotation_count, input_dtype=input_dtype)
     k, n = input_features, output_features
     scale_dtype = torch.uint8 if encoding == "mxfp8" else torch.float16
     scale_count = k//128 if encoding == "trellis" else n*k//32
-    return compile_program(TrellisPrefillMxfp8(g), name="dense_mxfp8", operands=(
+    core = NativeMxfp8Decode(g) if decode else TrellisPrefillMxfp8(g)
+    return compile_program(core, name="dense_mxfp8", operands=(
         Operand("rotated_inputs", torch.int64, f"[{rotation_count}]"),
         Operand("payload", torch.uint8, f"[{k*n//(1 if encoding == 'mxfp8' else 2)}]"),
         Operand("scales", scale_dtype, f"[{scale_count}]"),
         Operand("records", torch.uint8, "[record_bytes]"),
         Operand("output", torch.float32, f"[rows,{n}]", "out")),
         scalars=(Scalar("rows"), Scalar("rotation_id"), Scalar("cta_limit")),
-        key=tuple(g.values()), geometry={**g, "exact_row_cap": 2**31 - 1})
+        key=(*g.values(), decode), geometry={**g, "exact_row_cap": 2**31 - 1})
