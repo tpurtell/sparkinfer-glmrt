@@ -219,6 +219,20 @@ def _dequant_expert(meta, expert, device="cuda") -> torch.Tensor:
     return q * s * (amax[expert].double() / denominator)
 
 
+def _grid_expert(meta, expert, device="cuda"):
+    """One expert as the MMA consumes it: the raw ``q * s`` grid values F64 ``[rows, k]`` and the expert's
+    outer factor ``amax / denominator``, kept apart. A dot product of two ``q * s`` grids is exact in F64 (each
+    value has at most 6 significant bits), so summing first and applying the row and expert factors afterwards
+    -- the kernel's and the vendor's order -- makes an output whose true sum is 0 exactly 0, where folding the
+    factors into the operands first leaves F64 rounding residue (~1e-16) that reads as hundreds of "ulps"."""
+    packed, scales, amax, denominator = meta
+    p = packed[expert].to(device).long()
+    codes = torch.stack([p & 0xF, p >> 4], -1).flatten(-2)
+    table = torch.cat([E2M1, -E2M1]).double().to(device)
+    s = scales[expert].to(device).view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)
+    return table[codes] * s, float(amax[expert].double() / denominator)
+
+
 _SITU_PROGRAM: dict = {}
 
 
@@ -474,15 +488,18 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     exch_g, exch_u = t["exch"][pi, :i], t["exch"][pi, i:]
     assert torch.equal(exch_g, t["lin_g"][gp]) and torch.equal(exch_u, t["lin_u"][gp]), "fused exchange differs from the standalone linears"
     xd = x.double()
-    _, _, am_x, xqd = quantize_rows(xd)
-    xqd = xqd * (am_x.double() / 1536.0)[:, None]
+    _, _, am_x, xgrid = quantize_rows(xd)
+    x_outer = (am_x.double() / 1536.0)[:, None]
     fc1 = {}
     oracle_act = torch.empty(pairs, i, dtype=torch.bfloat16, device=dev)
     for ex in sorted(set(expert_of)):
         sel = [p for p in range(pairs) if expert_of[p] == ex]
         rr = torch.tensor([p // k for p in sel], device=dev)
-        og = (xqd[rr] @ _dequant_expert(m1, ex, dev).T).float()
-        ou = (xqd[rr] @ _dequant_expert(m3, ex, dev).T).float()
+        # Grid sum first (exact), then the row and expert factors: see _grid_expert.
+        wg, fg = _grid_expert(m1, ex, dev)
+        wu, fu = _grid_expert(m3, ex, dev)
+        og = ((xgrid[rr] @ wg.T) * x_outer[rr] * fg).float()
+        ou = ((xgrid[rr] @ wu.T) * x_outer[rr] * fu).float()
         kg, ku = exch_g[sel].float(), exch_u[sel].float()
         fc1 = _worst(_worst(fc1, _bf16_ulps(kg, og)), _bf16_ulps(ku, ou))
         # (3) from the kernel's own exchange: vendor SiTU (GPU) -> oracle act-quant -> F64 down.
@@ -518,13 +535,15 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     table = torch.cat([E2M1, -E2M1]).double().to(dev)
     aq_k = t["aq"][pi].long()
     codes = torch.stack([aq_k & 0xF, aq_k >> 4], -1).flatten(-2)
-    qk = (table[codes] * t["a_s"][pi].view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)) * (t["aamax"][pi].double() / 1536.0)[:, None]
+    qk = table[codes] * t["a_s"][pi].view(torch.float8_e4m3fn).double().repeat_interleave(16, -1)   # the kernel's act grid
+    a_outer = (t["aamax"][pi].double() / 1536.0)[:, None]
     y_k = t["y"][gp].float()
     down = {}
     o3 = torch.zeros(rows, h, dtype=torch.float64, device=dev)
     for ex in sorted(set(expert_of)):
         sel = torch.tensor([p for p in range(pairs) if expert_of[p] == ex], device=dev)
-        yo = (qk[sel] @ _dequant_expert(m2, ex, dev).T).float()
+        wd, fd = _grid_expert(m2, ex, dev)
+        yo = ((qk[sel] @ wd.T) * a_outer[sel] * fd).float()
         down = _worst(down, _bf16_ulps(y_k[sel], yo))
         yo3 = ((aqd[sel] * (am_a[sel].double() / 1536.0)[:, None]) @ _dequant_expert(m2, ex, dev).T).float().bfloat16().double()
         o3.index_add_(0, sel // k, yo3)
