@@ -26,7 +26,8 @@ gate/up exchange, is independently pinned, so the end-to-end check is legitimate
 
   (1) FC1 exchange bit-exact against the standalone dynamic linears, and at most 1 BF16 ulp from the F64
       FC1, asserted per row (max reported);
-  (2) input and act quantizers exact on every non-tie block (tie counts reported);
+  (2) input and act quantizers exact (row amax, scale bytes, packed codes) on every block; tie blocks counted
+      and their mismatches reported separately (zero);
   (3) from the kernel's own FC1 exchange: oracle act-quant -> F64 down -> unweighted sum matches the
       route's output at cosine >= 0.9999 / per row >= 0.999 (measured 0.999996);
   (4) down GEMM at most 1 BF16 ulp from the F64 down over the kernel's own packed act; combine exact.
@@ -36,15 +37,19 @@ amplifies FC1's F32-accumulation ulps into whole-row re-quantizations (0.99988 /
 no oracle short of the MMA's accumulation order reproduces. The model-level golden and fidelity are the
 backstop once serving exists.
 
-The 6-vs-4 candidate choice is the format's rule as both pinned vendor kernels fix it:
-reconstruction errors in F32 (vLLM ``d664cd1e`` ``ops/nvfp4.py:190`` loads x ``.to(tl.float32)``;
-SGLang ``ec5e7ff5`` ``nvfp4.py:93``), summed pairwise over 8, 4, 2, 1 (``_block_error``, vLLM
-``:39-45`` / SGLang ``:31-38``), strict ``error4 < error6`` (vLLM ``:77``). The checkpoint names
-only the rule (``scale_selection_rule: fouroversix_mae``); the vendor kernels define its precision,
-and the oracle mirrors them, not the kernel. A block whose two candidate errors agree within
-``TIE_REL`` of their magnitude is a tie: either choice is the rule's answer up to the summation's
-last ulp, so such blocks are counted, not judged. Every non-tie block must match the kernel's
-scale byte exactly (``test_inkling2_nvfp4_quantizer_exact``).
+The quantizer is the format's rule as both pinned vendor kernels fix it, in F32 with no FP fusion
+(vLLM ``d664cd1e`` ``ops/nvfp4.py``; SGLang ``ec5e7ff5`` ``nvfp4.py:95-97``): ``encoder =
+min(div.rn(1536, amax), FP32_MAX)``, ``decoder = div.rn(1, encoder)``, ``outer = amax * f32(1/1536)``
+(vLLM ``:185-187``); ``inverse = min(div.rn(1, scale * decoder), FP32_MAX)`` (``:57-58``); reconstruction
+error ``|(q * scale) * outer - x|`` (``:108-110``) summed over adjacent pairs, 4s, 8s, 16 (``_block_error``
+``:39-45``), every step rounded (``enable_fp_fusion=False``, ``:231``); strict ``error4 < error6`` (``:77``).
+The oracle mirrors that chain operation for operation, not the kernel. Two things that look harmless are
+not: forming ``decoder`` in F64 and rounding it moves elements whose scaled value sits on an E2M1 rounding
+midpoint to the neighbouring code, and contracting the error's multiply-subtract into an FMA flips the
+6-vs-4 choice on blocks whose two errors tie (both measured on the 128-row case: 9 and 3 of 128 source rows,
+up to 452 BF16 ulps on FC1). So the gate is exact: row amax, scale byte and packed codes on every block.
+A block whose two candidate errors agree within ``TIE_REL`` is still counted as a tie and its mismatches
+reported separately (zero expected), which says whether a failure is a rounding-order one.
 
 Bound: cosine >= 0.9999 overall and >= 0.999 per row (the fork's NVFP4 bar), plus a
 tanh-saturation case, a gamma-spread case (route weight placement) and a bimodal-row
@@ -108,30 +113,32 @@ def quantize_rows(x: torch.Tensor, encoder: float = 1536.0):
     amax [rows] F32, q*s F64 [rows, K] without the outer scale amax/encoder)."""
     rows, k = x.shape
     amax = x.abs().amax(-1)
-    enc = torch.clamp(encoder / amax, max=3.4028234663852886e38)
-    enc = torch.where(amax == 0, torch.full_like(enc, 3.4028234663852886e38), enc)
-    dec = 1.0 / enc
-    outer = amax / encoder
     blocks = x.reshape(rows, k // 16, 16)
     bmax = blocks.abs().amax(-1, keepdim=True)
-    # The vendor forms these in F32 (Triton fp32): mirror it exactly, then widen for the error sum.
-    enc32, dec32, bmax32 = enc.float(), dec.float(), bmax.float()
-    s6 = _e4m3((bmax32 * (enc32[:, None, None] * (1.0 / 6.0))).clamp(max=448.0))
+    # The vendor forms every factor in F32 (Triton fp32, enable_fp_fusion=False; vLLM d664cd1e ops/nvfp4.py
+    # :185-187): encoder = min(div.rn(E, amax), FP32_MAX), decoder = div.rn(1, encoder), outer = amax * f32(1/E).
+    # Each is one correctly rounded F32 operation, mirrored as such: forming them in F64 and rounding afterwards
+    # differs in the last ulp, which moves an element sitting on an E2M1 rounding midpoint to the other code.
+    f32max = 3.4028234663852886e38
+    amax32, bmax32, x32 = amax.float(), bmax.float(), blocks.float()
+    enc32 = torch.clamp(torch.tensor(encoder, dtype=torch.float32, device=x.device) / amax32, max=f32max)
+    dec32 = torch.tensor(1.0, dtype=torch.float32, device=x.device) / enc32
+    outer32 = amax32 * torch.tensor(1.0 / encoder, dtype=torch.float32, device=x.device)
+    s6 = _e4m3((bmax32 * (enc32[:, None, None] * torch.tensor(1.0 / 6.0, dtype=torch.float32, device=x.device))).clamp(max=448.0))
     s4 = _e4m3((bmax32 * (enc32[:, None, None] * 0.25)).clamp(max=448.0))
 
     def candidate(s32):
-        inv32 = torch.clamp(1.0 / (s32 * dec32[:, None, None]), max=3.4028234663852886e38)
-        inv32 = torch.where(s32 == 0, torch.zeros_like(inv32), inv32)
-        scaled32 = blocks.float() * inv32                      # the F32 value cvt.rn sees
-        q = _e2m1_rn(scaled32).double()
+        # inverse = min(div.rn(1, s * decoder), FP32_MAX) (:57-58): a zero scale gives FP32_MAX, so a nonzero
+        # element of such a block saturates to +-6 (its value is still 0: the scale is 0).
+        inv32 = torch.clamp(torch.tensor(1.0, dtype=torch.float32, device=x.device) / (s32 * dec32[:, None, None]), max=f32max)
+        scaled32 = x32 * inv32                                 # the F32 value cvt.rn.satfinite sees
+        q = _e2m1_rn(torch.nan_to_num(scaled32, posinf=f32max, neginf=-f32max)).double()
         s = s32.double()
-        # The 6-vs-4 choice compares F32 reconstruction errors summed pairwise (vendor _block_error,
-        # the kernel's order): |q*s*outer - x| in F32, then 8 pairs, 4, 2, 1. Near-ties flip with
-        # any other precision or order, so the oracle mirrors it exactly.
-        recon32 = (q.float() * s32) * outer.float()[:, None, None]
-        err32 = (recon32 - blocks.float()).abs()
-        for width in (8, 4, 2, 1):
-            err32 = err32[..., :width] + err32[..., width:2 * width]
+        # The 6-vs-4 choice compares F32 reconstruction errors |(q*s)*outer - x| (:108-110), every step
+        # rounded, summed over adjacent pairs, then 4s, 8s, 16 (_block_error :39-45).
+        err32 = ((q.float() * s32) * outer32[:, None, None] - x32).abs()
+        for _ in range(4):
+            err32 = err32[..., 0::2] + err32[..., 1::2]
         return q, err32.double(), s
 
     q6, e6, s6d = candidate(s6)
@@ -466,7 +473,6 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     assert torch.equal(exch_g, t["lin_g"][gp]) and torch.equal(exch_u, t["lin_u"][gp]), "fused exchange differs from the standalone linears"
     xd = x.double()
     _, _, am_x, xqd = quantize_rows(xd)
-    report["input_ties"] = int(quantize_rows.last_tie.sum())
     xqd = xqd * (am_x.double() / 1536.0)[:, None]
     fc1 = {}
     oracle_act = torch.empty(pairs, i, dtype=torch.bfloat16, device=dev)
@@ -484,21 +490,28 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
     report["fc1"] = fc1
     assert fc1["ulp"] <= 1.0 + 1e-6 and fc1["ulp_large"] <= 1.0 + 1e-6, \
         f"FC1 exchange vs F64 FC1: {fc1['ulp']:.3f} ulp (large elements {fc1['ulp_large']:.3f}), max|d| {fc1['abs']:.3e} at |v| {fc1['abs_at']:.3e}"
-    # (2) quantizers exact on non-tie blocks.
-    _, sc_x, _, _ = quantize_rows(xd)
-    tie_x = quantize_rows.last_tie
-    mism = (t["xs"][pi].cpu() != sc_x.cpu()[torch.arange(pairs) // k]) & ~tie_x.cpu()[torch.arange(pairs) // k]
-    report["input_nontie_mismatch"] = int(mism.sum())
-    assert report["input_nontie_mismatch"] == 0 and torch.equal(t["xamax"][pi].cpu(), am_x.float().cpu()[torch.arange(pairs) // k]), \
-        "input quantizer differs from the oracle on a non-tie block or an amax"
+    # (2) quantizers: amax, scale bytes and packed codes exact on every non-tie block; tie blocks (the two
+    # candidates' F32 errors within TIE_REL) are counted and their mismatches reported and asserted zero too:
+    # with the kernel and the oracle both on the vendor's F32 arithmetic an exact tie resolves the same way.
+    def quantizer_gate(name, packed_k, scales_k, amax_k, packed_o, scales_o, amax_o, tie):
+        block_differs = (scales_k != scales_o) | (packed_k != packed_o).reshape(*scales_o.shape, 8).any(-1)
+        report[f"{name}_ties"] = int(tie.sum())
+        report[f"{name}_nontie_mismatch"] = int((block_differs & ~tie).sum())
+        report[f"{name}_tie_mismatch"] = int((block_differs & tie).sum())
+        assert torch.equal(amax_k, amax_o), f"{name} quantizer: row amax differs from the oracle"
+        assert report[f"{name}_nontie_mismatch"] == 0, \
+            f"{name} quantizer differs from the oracle on {report[f'{name}_nontie_mismatch']} non-tie blocks (scale byte or packed codes)"
+        assert report[f"{name}_tie_mismatch"] == 0, \
+            f"{name} quantizer resolves {report[f'{name}_tie_mismatch']} of {report[f'{name}_ties']} tie blocks differently from the vendor arithmetic"
+
+    src_row = torch.arange(pairs, device=dev) // k
+    pk_x, sc_x, _, _ = quantize_rows(xd)
+    quantizer_gate("input", t["xq"][pi], t["xs"][pi], t["xamax"][pi], pk_x.to(dev)[src_row], sc_x.to(dev)[src_row],
+                   am_x.float().to(dev)[src_row], quantize_rows.last_tie.to(dev)[src_row])
     kernel_act = t["act16"][pi]
     assert torch.equal(kernel_act, oracle_act), "kernel act rows differ from vendor SiTU of the kernel's own exchange"
-    _, sc_a, am_a, aqd = quantize_rows(kernel_act.double())
-    tie_a = quantize_rows.last_tie
-    report["act_ties"] = int(tie_a.sum())
-    mism_a = (t["a_s"][pi] != sc_a) & ~tie_a
-    report["act_nontie_mismatch"] = int(mism_a.sum())
-    assert report["act_nontie_mismatch"] == 0 and torch.equal(t["aamax"][pi], am_a.float()), "act quantizer differs on a non-tie block or an amax"
+    pk_a, sc_a, am_a, aqd = quantize_rows(kernel_act.double())
+    quantizer_gate("act", t["aq"][pi], t["a_s"][pi], t["aamax"][pi], pk_a, sc_a, am_a.float(), quantize_rows.last_tie)
     # (4) down <= 1 ulp over the kernel's own packed act; combine exact.
     table = torch.cat([E2M1, -E2M1]).double().to(dev)
     aq_k = t["aq"][pi].long()
@@ -537,7 +550,8 @@ def _print(label, r):
     print(f"{label}: stage-exact cos {r['stage_exact_cos']:.7f} worst row {r['stage_exact_worst_row']:.6f}; "
           f"FC1 {f['ulp']:.2f} ulp (|v|>=1e-2: {f['ulp_large']:.2f}; max|d| {f['abs']:.3e} at |v| {f['abs_at']:.3e}); "
           f"down {d['ulp']:.2f} ulp (|v|>=1e-2: {d['ulp_large']:.2f}; max|d| {d['abs']:.3e} at |v| {d['abs_at']:.3e}); "
-          f"non-tie mismatches input {r['input_nontie_mismatch']} act {r['act_nontie_mismatch']}; ties input {r['input_ties']} act {r['act_ties']}; "
+          f"quantizer mismatches (scale or codes) non-tie input {r['input_nontie_mismatch']} act {r['act_nontie_mismatch']}, "
+          f"tie input {r['input_tie_mismatch']}/{r['input_ties']} act {r['act_tie_mismatch']}/{r['act_ties']}; "
           f"e2e F64 diagnostic cos {r['e2e_cos']:.7f} worst row {r['e2e_worst_row']:.6f}")
 
 

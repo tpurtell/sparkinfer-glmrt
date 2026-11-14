@@ -41,7 +41,7 @@ import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Float32, Int32, Int64, Uint32, Uint64, const_expr
 
-from b12x._lib.activation import situ_vendor
+from b12x._lib.activation import _f32_asm, situ_vendor
 from b12x._lib.intrinsics import (
     ld_shared_u32 as ld_shared_u32_at,
     cvt_e2m1x8_f32,
@@ -120,17 +120,24 @@ def _candidate(values: cute.Tensor, scale: Float32, decoder: Float32, outer: Flo
         q[i] = values[i] * inverse
     lo = cvt_e2m1x8_f32(q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7])
     hi = cvt_e2m1x8_f32(q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15])
-    recon = scale * outer
-    # Pairwise-summed error, as the vendor's _block_error (tree over 2, 4, 8, 16).
+    # Reconstruction error |(q * scale) * outer - x|: the vendor's operation order with every step
+    # rounded separately. vLLM d664cd1e ops/nvfp4.py:108-110 (`_pair`: `(low * scale) * outer_scale - x`),
+    # launched with enable_fp_fusion=False (:231; SGLang ec5e7ff5 nvfp4.py:145). Keep it as explicit
+    # mul.rn / mul.rn / sub.rn PTX: the DSL's `q * (scale * outer) - x` reorders the products and NVPTX
+    # contracts the multiply-subtract into an FMA, and either changes the error's last ulp, which is
+    # what decides the 6-vs-4 choice on blocks whose two errors tie (measured: 3 of 36,864 blocks at
+    # 128 rows, 100-290 BF16 ulps on those rows' FC1). The sums are add.rn over adjacent pairs, then
+    # 4s, 8s, 16, as the vendor's `_block_error` (:39-45).
     err = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
     for i in cutlass.range_constexpr(16):
         word = lo if i < 8 else hi
         nibble = (word >> Uint32(4 * (i % 8))) & Uint32(0xF)
-        err[i] = fabs_f32(_e2m1_decode(nibble) * recon - values[i])
+        err[i] = _f32_asm("{ .reg .f32 t; mul.rn.f32 t, $1, $2; mul.rn.f32 t, t, $3; sub.rn.f32 t, t, $4; abs.f32 $0, t; }",
+                          _e2m1_decode(nibble), scale, outer, values[i])
     for width in cutlass.range_constexpr(4):
         step = 1 << width
         for i in cutlass.range_constexpr(0, 16, 2 * step):
-            err[i] = err[i] + err[i + step]
+            err[i] = _f32_asm("add.rn.f32 $0, $1, $2;", err[i], err[i + step])
     return (Uint64(hi) << Uint64(32)) | Uint64(lo), err[0]
 
 
@@ -180,7 +187,7 @@ class ChunkRowsDyn:
             raise ValueError("K must be a multiple of 16")
 
     def key(self) -> tuple:
-        return ("chunk_rows_dyn", 1, self.k, self.experts)
+        return ("chunk_rows_dyn", 2, self.k, self.experts)
 
     @cute.jit
     def __call__(self, src: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, aq: cute.Pointer,
@@ -531,7 +538,7 @@ class ChunkActDyn:
         self.partials = self.inter // 16
 
     def key(self) -> tuple:
-        return ("chunk_act_dyn", 2, self.inter, self.experts, self.parts)
+        return ("chunk_act_dyn", 3, self.inter, self.experts, self.parts)
 
     @cute.jit
     def __call__(self, act_bf16: cute.Pointer, act_amax_part: cute.Pointer, meta: cute.Pointer, aq: cute.Pointer,
