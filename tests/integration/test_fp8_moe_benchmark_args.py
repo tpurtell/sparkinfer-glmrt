@@ -1116,6 +1116,29 @@ def test_tensor_payload_hash_matches_concatenation_for_noncontiguous_inputs():
     assert bench.tensor_payload_sha256([]) == hashlib.sha256(b"").hexdigest()
 
 
+def test_native_baseline_kernel_swap_restores_candidate_on_exception():
+    candidate = SimpleNamespace(V41SliceFc1Kernel=object(), V41SliceFc2Kernel=object())
+    before = vars(candidate).copy()
+    baseline = SimpleNamespace(V41SliceFc1Kernel=object(), V41SliceFc2Kernel=object())
+    with pytest.raises(RuntimeError):
+        with bench.native_kernel_classes(candidate, baseline):
+            assert vars(candidate) == vars(baseline)
+            raise RuntimeError("compile failed")
+    assert vars(candidate) == before
+    with bench.native_kernel_classes(candidate, None):
+        assert vars(candidate) == before
+
+
+def test_native_baseline_requires_shipped_v41_decode_contract():
+    args = ["--geometry", "v41", "--mxfp4-pair", "--mxfp4-unify", "--capacity", "80",
+            "--rows", "1,16", "--engine-policy-root", "engine", "--native-baseline-source", "base"]
+    assert bench.parse_args(args).native_baseline_source == Path("base")
+    with pytest.raises(SystemExit):
+        bench.parse_args(args + ["--capacity", "4096"])
+    with pytest.raises(SystemExit):
+        bench.parse_args(args + ["--geometry", "mimof"])
+
+
 def test_unified_random_routes_retain_capacity_seed_contract():
     torch.manual_seed(2129)
     expected = torch.rand(16, 8).topk(2, -1).indices.int()

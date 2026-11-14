@@ -12,6 +12,7 @@ old A16 ceiling; it is not a serving arithmetic override.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from collections import Counter
 from dataclasses import replace
 import hashlib
@@ -201,6 +202,8 @@ def parse_args(argv=None):
                         help="development A16 native register-streaming decode arm")
     parser.add_argument("--native-stream", action="store_true", help="Benchmark STREAM prefill over native residency")
     parser.add_argument("--engine-policy-root", type=Path, help="engine checkout supplying shared MXFP4 recipes and ownership")
+    parser.add_argument("--native-baseline-source", type=Path,
+                        help="sealed fork source supplying native FC1/FC2 controls for interleaved V4 decode A/B")
     parser.add_argument("--shipped-prefill", action="store_true", help="native STREAM versus actual shipped V4/V4.1 prefill")
     parser.add_argument("--generic-a8", action="store_true", help="Benchmark generic grouped row-major QMMA decode")
     parser.add_argument("--row-major-mma", action="store_true", help="Benchmark native MMA with row-major resident staging")
@@ -223,6 +226,9 @@ def parse_args(argv=None):
         parser.error("shipped prefill requires native V4/V4.1 pairs and engine policy root")
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.native_baseline_source and (not args.mxfp4_unify or args.geometry != "v41"
+            or args.engine_policy_root is None or args.capacity is None or args.capacity > 80):
+        parser.error("native baseline requires V4.1 unified decode, fixed capacity <=80 and engine policy")
     if args.decode_occupancy and (not args.mxfp4_unify or args.geometry not in ("mimof", "mimop")
                                   or max(map(int, args.rows.split(","))) > 80):
         parser.error("decode occupancy recipe requires MiMo unified rows <=80")
@@ -653,6 +659,29 @@ def fc1_split_tiles(hidden, splits, tiles=(32, 64, 128, 192)):
             and split * (tile * 128 + max(tile * 2, 256) * 4) + 64 * tile <= 96 * 1024]
 
 
+def load_native_baseline(source):
+    path = Path(source) / "b12x/moe/_shared/kernels/w4a8_v41_slice.py"
+    spec = importlib.util.spec_from_file_location("benchmark_native_baseline", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@contextmanager
+def native_kernel_classes(module, baseline):
+    """Resolve baseline kernels once, restoring candidate globals even on failure."""
+    names = ("V41SliceFc1Kernel", "V41SliceFc2Kernel")
+    previous = tuple(getattr(module, name) for name in names)
+    try:
+        if baseline is not None:
+            for name in names:
+                setattr(module, name, getattr(baseline, name))
+        yield
+    finally:
+        for name, value in zip(names, previous):
+            setattr(module, name, value)
+
+
 def shipped_decode_recipe(family, hidden, rank_width, sm, capacity, policy_root):
     policy = engine_layout_policy(policy_root)
     # V4.1 Spark CMake defaults to 192; measured policy overrides selected widths.
@@ -673,7 +702,8 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                     aligned_w2=False, aligned_w2_scales=False, stored_width=None,
                     activation_precision="a8", projection_contract=None,
                     combine_output=False, ingress="wire", fc1_k_splits=1, fc1_cta_splits=1,
-                    stream_decode=False, row_major_a8=False, row_major_mma=False, live_rows=None, capacity=None):
+                    stream_decode=False, row_major_a8=False, row_major_mma=False, live_rows=None, capacity=None,
+                    baseline_kernels=None):
     """Resolve once; keep every pipeline operand alive through graph timing."""
     import cutlass
     import cutlass.cute as cute
@@ -752,13 +782,15 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
     tensors = [activation, wire[:, hidden:], *packed,
                ids.flatten(), routing.flatten(), *scratch, partial, output]
     args = [from_dlpack(tensor, assumed_align=16) for tensor in tensors]
-    pipeline = V41SlicePipeline(rows, width, experts=experts, topk=topk,
-                                intermediate=intermediate, hidden=hidden,
-                                exact_storage=tail or stored_width is not None,
-                                atomic_tokens=atomic, scale_codes=coded,
-                                activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
-                                fc1_cta_splits=fc1_cta_splits, stream_decode=stream_decode,
-                                **(projection_contract or {}))
+    from b12x.moe._shared.kernels import v41_slice_pipeline as pipeline_module
+    with native_kernel_classes(pipeline_module, baseline_kernels):
+        pipeline = V41SlicePipeline(rows, width, experts=experts, topk=topk,
+                                    intermediate=intermediate, hidden=hidden,
+                                    exact_storage=tail or stored_width is not None,
+                                    atomic_tokens=atomic, scale_codes=coded,
+                                    activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
+                                    fc1_cta_splits=fc1_cta_splits, stream_decode=stream_decode,
+                                    **(projection_contract or {}))
     if row_major_a8:
         from b12x.moe._shared.kernels.mxfp4_row_major_decode import RowMajorA8Fc1, RowMajorA8Fc2
         fc1_contract = {key: value for key, value in (projection_contract or {}).items()
@@ -1360,6 +1392,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
     l2_bytes = int(properties.L2_cache_size)
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
     results = []
+    baseline_kernels = load_native_baseline(args.native_baseline_source) if args.native_baseline_source else None
     experts, route_qualification_eligible = stream_screen_population(g, args)
     waves = recorded_waves(args.routes, g) if args.routes else None
     route_fixture = ({"path": str(args.routes), "sha256": hashlib.sha256(args.routes.read_bytes()).hexdigest(),
@@ -1426,7 +1459,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                         recipe["atomic"] if recipe else False, recipe["coded"] if recipe else True,
                         projection_contract={**contract, **({"fc2_n_splits": decode_recipe["fc2_n_splits"]} if decode_recipe else {})},
                         fc1_k_splits=decode_recipe["k_splits"] if decode_recipe else 1,
-                        combine_output=True, qualify=True, live_rows=rows)
+                        combine_output=True, qualify=True, live_rows=rows, baseline_kernels=baseline_kernels)
                     executions[label] = keep[-1]
                     owned.append(keep)
                     control_qualification[label] = dict(deterministic=not (recipe and recipe["atomic"]), row_invariant=not (recipe and recipe["atomic"]),
@@ -1498,6 +1531,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
                             else {"928-a8-t128-k1": ("a8", 128, 1, 1)} if v4
                             else {"native-" + precision + "-t64-k2": (precision, 64, 2, 1)
                                   for precision in ("a8", "a16")})
+            if baseline_kernels:
+                variants = {"candidate-shipped-a8": ("a8", decode_recipe["tile"], decode_recipe["k_splits"], 1)}
             if args.decode_occupancy:
                 variants.update({"occupancy-" + precision: (precision, occupancy_recipe["tile"],
                             occupancy_recipe["k_splits"], occupancy_recipe["cta_splits"])
@@ -1521,7 +1556,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
                     runs[label], outputs[label], keep = native_pair_arm(
                         x, ids, routing, weights, scales, tile, not v4 or width == 576, False, v4,
                         activation_precision=precision, projection_contract={**contract,
-                            **({"fc2_n_splits": occupancy_recipe["fc2_n_splits"]} if label.startswith("occupancy-") else {})},
+                            **({"fc2_n_splits": occupancy_recipe["fc2_n_splits"]} if label.startswith("occupancy-") else
+                               {"fc2_n_splits": decode_recipe["fc2_n_splits"]} if label == "candidate-shipped-a8" else {})},
                         combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split,
                         fc1_cta_splits=cta, live_rows=rows)
                 except AssertionError as error:
@@ -1631,6 +1667,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
             record = dict(geometry=g.name, width=width, hidden=g.hidden, rows=rows, capacity=capacity,
                           experts=experts, routing=args.routing, route_qualification_eligible=route_qualification_eligible,
                           route_fixture=route_fixture,
+                          native_baseline_source=str(args.native_baseline_source) if baseline_kernels else None,
                           sm_count=properties.multi_processor_count, occupancy_recipe=occupancy_recipe if args.decode_occupancy else None,
                           prefix_checks=prefix_checks, route_comparisons=route_comparisons,
                           ingress="wire", wire_preparation_timed=False,
@@ -1650,7 +1687,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           f32_errors=errors, matched_f32_errors=matched_errors, comparisons=comparisons,
                           invariant_checks="poison/live/graph/row-mix", slice_width=128,
                           fc1_variants={label: dict(precision=precision, tile=tile, k_splits=split,
-                                                    fc2_n_splits=occupancy_recipe["fc2_n_splits"] if label.startswith("occupancy-") else 8,
+                                                    fc2_n_splits=occupancy_recipe["fc2_n_splits"] if label.startswith("occupancy-") else
+                                                        decode_recipe["fc2_n_splits"] if label == "candidate-shipped-a8" else 8,
                                                     cta_splits=cta, partial_bytes=4 * fc1_partial_words(
                                                         capacity, tile, g.top_k, width, precision, cta))
                                         for label, (precision, tile, split, cta) in variants.items()},
