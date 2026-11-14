@@ -9,9 +9,8 @@ powers of two costs 0.025 nats, so these kernels apply them exactly:
     straight from global memory, exact E4M3 widening in registers and FP32
     block scales applied to K128 accumulator segments; reads half the weight
     bytes of the BF16 GEMV without rounding the scaled weight.
-``TmaFp8Gemm``    the BF16 TMA tensor-core GEMM with E4M3 weight tiles widened
-    exactly to BF16 in shared memory, with FP32 block scales applied to K128
-    accumulator segments (W8A16; block, per-row or K-block-major scales).
+``TmaFp8Gemm``    interim W8A16 fallback with scaled-BF16 weights, pending
+    a native-scale implementation that reaches speed parity (cuteafd#2068).
 ``RoutedFp8Projection``  ``MmaFp8Gemv`` up to ``decode_rows`` live rows, the
     BF16 TMA GEMM over the BF16 copy of the weight above.
 ``Fp8Projection``  a weight held only as E4M3 + scales (no BF16 copy): decode
@@ -616,9 +615,9 @@ class TmaFp8Gemm:
 
     The Bf16PrefillKernel pipeline (TMA producer warp, warp MMA m16n8k16,
     FP32 accumulators) with the weight tile fetched as E4M3 (half the bytes).
-    After each stage lands, compute warps widen E4M3 exactly into a swizzled
-    BF16 tile. Two K64 stages form one K128 FP32 segment, scaled once before
-    adding it to the projection accumulator (no BF16 scaled-weight rounding).
+    After each stage lands, the compute warps widen it to ``bf16(w * s)``
+    into a swizzled BF16 tile and run the MMAs from it, so results equal the
+    BF16 program over ``bf16(w * s)`` weights (W8A16, bitwise).
 
     ``scales``: ``"block"`` the checkpoint's 128x128 grid ``[ceil(N/128),
     K/128]`` (one scale per 128x64 tile); ``"row"`` one scale per output row
@@ -628,6 +627,8 @@ class TmaFp8Gemm:
 
     tile_k = 64
     buffer_align_bytes = 1024
+    # Interim scaled-BF16 fallback: native segment scaling has not reached parity
+    # on default native-attention prefill. Track the optimized path in cuteafd#2068.
 
     def __init__(self, n: int, k: int, *, out_dtype=cutlass.BFloat16, compute_warps: int = 4,
                  num_stages: int = 4, scales: str = "block", tile_n: int = 128):
@@ -764,7 +765,6 @@ class TmaFp8Gemm:
             t_crb = thr_mma.make_fragment_B(t_csb)
             acc = cute.make_rmem_tensor(thr_mma.partition_shape_C((self.tile_m, self.tile_n)), Float32)
             acc.fill(0.0)
-            coordinates = thr_mma.partition_C(cute.make_identity_tensor((self.tile_m, self.tile_n)))
             copy_a = cute.make_tiled_copy_A(
                 cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.BFloat16),
                 tiled_mma).get_slice(tidx)
@@ -776,15 +776,17 @@ class TmaFp8Gemm:
             w_base = shared_ptr_to_u32(storage.sW.data_ptr())
             b_base = shared_ptr_to_u32(storage.sB.data_ptr())
             for k_tile in cutlass.range(self.k_tiles, unroll_full=False):
+                s = self._scale(scale, n_tile, Int32(0), k_tile)
                 load_pipeline.consumer_wait(consumer_state)
                 stage = w_base + Int32(consumer_state.index) * Int32(self.tile_n * self.tile_k)
                 for i in cutlass.range_constexpr(self.chunks):
                     chunk = Int32(i * self.compute_threads) + Int32(tidx)
                     n = chunk // Int32(self.tile_k // 8)
                     c = chunk % Int32(self.tile_k // 8)
+                    if cutlass.const_expr(self.scales != "block"):
+                        s = self._scale(scale, n_tile, n, k_tile)
                     lo, hi = ld_shared_v2_u32(stage + n * Int32(self.tile_k) + c * Int32(8))
-                    v0, v1 = _e4m3x4_bf16x2x2(lo)
-                    v2, v3 = _e4m3x4_bf16x2x2(hi)
+                    v0, v1, v2, v3 = _e4m3x8_scaled_bf16(lo, hi, s)
                     # 128-byte swizzle: 16-byte chunk c of row n sits at chunk c ^ (n % 8).
                     st_shared_v4_u32(b_base + n * Int32(128) + ((c ^ (n % Int32(8))) * Int32(16)), v0, v1, v2, v3)
                 cute.arch.barrier(barrier_id=1, number_of_threads=self.compute_threads)
@@ -793,26 +795,11 @@ class TmaFp8Gemm:
                 target_b = copy_b.retile(t_crb)
                 cute.copy(copy_a, shared_a[None, None, 0], target_a[None, None, 0])
                 cute.copy(copy_b, t_ssb[None, None, 0], target_b[None, None, 0])
-                for kk in cutlass.range_constexpr(1, cute.size(shared_a.shape[2])):
-                    cute.copy(copy_a, shared_a[None, None, kk], target_a[None, None, kk])
-                    cute.copy(copy_b, t_ssb[None, None, kk], target_b[None, None, kk])
-                a_words = cute.recast_tensor(t_cra, Uint32)
-                b_words = cute.recast_tensor(t_crb, Uint32)
-                block_scale = self._scale(scale, n_tile, Int32(0), k_tile)
-                for mi in cutlass.range_constexpr(cute.size(acc.shape[1])):
-                    for ni in cutlass.range_constexpr(cute.size(acc.shape[2])):
-                        part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
-                        part.fill(0.0)
-                        for kk in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
-                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                part[0], part[1], part[2], part[3],
-                                a_words[0, mi, kk], a_words[1, mi, kk], a_words[2, mi, kk], a_words[3, mi, kk],
-                                b_words[0, ni, kk], b_words[1, ni, kk])
-                            part[0], part[1], part[2], part[3] = d0, d1, d2, d3
-                        for v in cutlass.range_constexpr(4):
-                            if cutlass.const_expr(self.scales != "block"):
-                                block_scale = self._scale(scale, n_tile, coordinates[v, mi, ni][1], k_tile)
-                            acc[v, mi, ni] = acc[v, mi, ni] + part[v] * block_scale
+                for kk in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
+                    if kk < cute.size(shared_a.shape[2]) - 1:
+                        cute.copy(copy_a, shared_a[None, None, kk + 1], target_a[None, None, kk + 1])
+                        cute.copy(copy_b, t_ssb[None, None, kk + 1], target_b[None, None, kk + 1])
+                    cute.gemm(thr_mma, acc, t_cra[None, None, kk], t_crb[None, None, kk], acc)
                 cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()

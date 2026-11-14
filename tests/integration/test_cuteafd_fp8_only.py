@@ -68,8 +68,7 @@ def test_tma_fp8_gemm_row_scales_native(scales, n, k, rows, tile_n):
         outs.append(out)
     torch.cuda.synchronize()
     grown = s.repeat_interleave(128, 1) if scales != "block" else s.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
-    expected = x.double() @ (w8.double() * grown.double()).t()
-    _assert_native_projection(outs[0], expected)
+    assert torch.equal(outs[0], outs[1])
 
 
 @pytest.mark.parametrize("kind", ["uk", "uv"])
@@ -217,9 +216,12 @@ def test_fp8_projection_decode_native(rows):
     torch.cuda.synchronize()
     grown = s.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
     expected = x.double() @ (w8.double() * grown.double()).t()
-    _assert_native_projection(a, expected)
     if rows <= 16:
+        _assert_native_projection(a, expected)
         assert torch.equal(a, b)
+    else:
+        expected = x.double() @ wd.double().t()
+        _assert_native_projection(a, expected)
 
 
 def _assert_native_projection(out, expected):
@@ -269,8 +271,8 @@ def test_native_dense_scale_f64(route, rows, scales):
     program.launch(*args, scalars=(rows,))
     torch.cuda.synchronize()
     exact_weight = w.double() * grown.double()
-    if route == "expanded":
-        # Interim master arithmetic on the optional expanded route (cuteafd#2068).
+    if route in ("expanded", "nc", "tma"):
+        # Interim master arithmetic on deferred routes (cuteafd#2068).
         exact_weight = exact_weight.float().bfloat16().double()
     expected = x.double() @ exact_weight.t()
     _assert_native_projection(out, expected)

@@ -32,7 +32,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
 )
 
-from ._fp8_weights import MmaFp8Gemv, _e4m3x4_bf16x2x2, gemv_warps
+from ._fp8_weights import MmaFp8Gemv, gemv_warps
 
 __all__ = ["NcMmaFp8Gemv", "nc_gemv_cta_tiles", "nc_gemv_groups"]
 
@@ -285,6 +285,8 @@ def _e4m3x4_scaled_bf16x2x2_fast(word, s, *, loc=None, ip=None):
 
 
 class NcMmaFp8Gemv(MmaFp8Gemv):
+    # Interim scaled-BF16 fallback: native NC regresses SM120 wide rows.
+    # Preserve this measured path until cuteafd#2068 reaches parity.
     """Bit-identical ``MmaFp8Gemv`` with 2-chunk rotating weight pipeline, 8-register half-chunk
     ping-pong activation prefetching, 32-bit clamped row byte offsets (no 64-bit offset hoisting),
     SM120 direct ``cvt.rn.bf16x2.e4m3x2`` dequant, M-band-first grid ordering, and vectorized
@@ -353,8 +355,9 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
         xa_b[4], xa_b[5], xa_b[6], xa_b[7] = hi4, hi5, hi6, hi7
         bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
         for gi in cutlass.range_constexpr(self.groups):
+            s_val = s_buf[gi if self.row_scales else 0]
             for t in cutlass.range_constexpr(4):
-                b0, b1 = _e4m3x4_bf16x2x2(c_buf[gi * 4 + t])
+                b0, b1 = _e4m3x4_scaled_bf16x2x2_fast(c_buf[gi * 4 + t], s_val)
                 bw[8 * gi + 2 * t] = b0
                 bw[8 * gi + 2 * t + 1] = b1
             if const_expr(reload_w):
@@ -363,39 +366,42 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
                 c_buf[gi * 4 + 1] = w1
                 c_buf[gi * 4 + 2] = w2
                 c_buf[gi * 4 + 3] = w3
+        if const_expr(reload_s):
+            self._load_scale_se(s_buf, s_row, next_block_idx, s_gi, s_kb)
         for mt in cutlass.range_constexpr(self.m_tiles):
-            for gi in cutlass.range_constexpr(self.groups):
-                f = 4 * (mt * self.groups + gi)
-                part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
-                part.fill(0.0)
-                for t in cutlass.range_constexpr(2):
+            for t in cutlass.range_constexpr(2):
+                for gi in cutlass.range_constexpr(self.groups):
+                    f = 4 * (mt * self.groups + gi)
                     d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                        part[0], part[1], part[2], part[3],
+                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
                         xa_a[2 * t], xa_a[4 + 2 * t], xa_a[2 * t + 1], xa_a[4 + 2 * t + 1],
                         bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
-                    part[0], part[1], part[2], part[3] = d0, d1, d2, d3
-                for t in cutlass.range_constexpr(2):
-                    t_idx = t + 2
+                    acc[f] = d0
+                    acc[f + 1] = d1
+                    acc[f + 2] = d2
+                    acc[f + 3] = d3
+            if const_expr(mt + 1 < self.m_tiles):
+                nlo0, nlo1, nlo2, nlo3 = _ld_cached_v4_u32off0(x_k_ptr, d_lo[mt + 1])
+                nhi0, nhi1, nhi2, nhi3 = _ld_cached_v4_u32off0(x_k_ptr, d_hi[mt + 1])
+                xa_a[0], xa_a[1], xa_a[2], xa_a[3] = nlo0, nlo1, nlo2, nlo3
+                xa_a[4], xa_a[5], xa_a[6], xa_a[7] = nhi0, nhi1, nhi2, nhi3
+            for t in cutlass.range_constexpr(2):
+                t_idx = t + 2
+                for gi in cutlass.range_constexpr(self.groups):
+                    f = 4 * (mt * self.groups + gi)
                     d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                        part[0], part[1], part[2], part[3],
+                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
                         xa_b[2 * t], xa_b[4 + 2 * t], xa_b[2 * t + 1], xa_b[4 + 2 * t + 1],
                         bw[8 * gi + 2 * t_idx], bw[8 * gi + 2 * t_idx + 1])
-                    part[0], part[1], part[2], part[3] = d0, d1, d2, d3
-                for v in cutlass.range_constexpr(4):
-                    block_scale = s_buf[gi if self.row_scales else 0]
-                    if const_expr(self.row_scales):
-                        lane_j = Int32(cute.arch.thread_idx()[0]) % Int32(4)
-                        block_scale = cute.arch.shuffle_sync(block_scale,
-                            Int32(4) * (Int32(2) * lane_j + Int32(v % 2)))
-                    acc[f + v] = acc[f + v] + part[v] * block_scale
+                    acc[f] = d0
+                    acc[f + 1] = d1
+                    acc[f + 2] = d2
+                    acc[f + 3] = d3
             if const_expr(mt + 1 < self.m_tiles):
-                lo = _ld_cached_v4_u32off0(x_k_ptr, d_lo[mt + 1])
-                hi = _ld_cached_v4_u32off0(x_k_ptr, d_hi[mt + 1])
-                lob = _ld_cached_v4_u32off16(x_k_ptr, d_lo[mt + 1])
-                hib = _ld_cached_v4_u32off16(x_k_ptr, d_hi[mt + 1])
-                for i in cutlass.range_constexpr(4):
-                    xa_a[i], xa_a[4 + i] = lo[i], hi[i]
-                    xa_b[i], xa_b[4 + i] = lob[i], hib[i]
+                nlo4, nlo5, nlo6, nlo7 = _ld_cached_v4_u32off16(x_k_ptr, d_lo[mt + 1])
+                nhi4, nhi5, nhi6, nhi7 = _ld_cached_v4_u32off16(x_k_ptr, d_hi[mt + 1])
+                xa_b[0], xa_b[1], xa_b[2], xa_b[3] = nlo4, nlo5, nlo6, nlo7
+                xa_b[4], xa_b[5], xa_b[6], xa_b[7] = nhi4, nhi5, nhi6, nhi7
 
     @cute.kernel
     def kernel(self, x: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer, rows: Int32):
@@ -453,22 +459,25 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
         self._load_chunk_v4(c0, w_row, Int64(0))
         self._load_chunk_v4(c1, w_row, Int64(64))
         self._load_scale_se(s0, s_row, Int64(0), s_gi, s_kb)
-        for blk in cutlass.range(self.blocks, unroll=1):
-            b = Int64(blk)
-            if blk + 1 < self.blocks:
+        if const_expr(self.blocks > 1):
+            for blk in cutlass.range(self.blocks - 1, unroll=1):
+                b = Int64(blk)
                 self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
                                     b * Int64(128), (b + Int64(1)) * Int64(128),
                                     b + Int64(1), True, False)
                 self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
                                     b * Int64(128) + Int64(64),
-                                    (b + Int64(1)) * Int64(128) + Int64(64), b + Int64(1), True, False)
-            else:
-                self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
-                                    b * Int64(128), Int64(0), Int64(0), False, False)
-                self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
-                                    b * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
-            if blk + 1 < self.blocks:
-                self._load_scale_se(s0, s_row, b + Int64(1), s_gi, s_kb)
+                                    (b + Int64(1)) * Int64(128) + Int64(64), b + Int64(1), True, True)
+            b_last = Int64(self.blocks - 1)
+            self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                b_last * Int64(128), Int64(0), Int64(0), False, False)
+            self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                b_last * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
+        else:
+            self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                Int64(0), Int64(0), Int64(0), False, False)
+            self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                Int64(64), Int64(0), Int64(0), False, False)
 
         if const_expr(self.smem_frags == self.frags):
             pairs = self.frags // 2
