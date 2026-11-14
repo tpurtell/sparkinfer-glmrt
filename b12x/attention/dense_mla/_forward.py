@@ -78,6 +78,7 @@ class DenseMlaForwardKernel:
         dynamic_split_chunks: bool = False,
         device_splits: bool = False,
         explicit_intervals: bool = False,
+        singleton_requests: bool = False,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -96,6 +97,9 @@ class DenseMlaForwardKernel:
         if self.device_splits and not self.dynamic_split_chunks:
             raise ValueError("device splits require dynamic split chunks")
         self.query_tile = int(query_tile)
+        self.singleton_requests = bool(singleton_requests)
+        if self.singleton_requests and self.query_tile != 1:
+            raise ValueError("singleton requests require one query per tile")
         self.explicit_intervals = bool(explicit_intervals)
         if self.explicit_intervals and (self.query_tile != 1 or window_size is not None or noncausal_block):
             raise ValueError("explicit intervals require one already-masked query per request")
@@ -577,7 +581,10 @@ class DenseMlaForwardKernel:
         request = Int32(0)
         query_start = Int32(0)
         query_valid_tile = Int32(1)
-        if cutlass.const_expr(self.query_tile == 1):
+        if cutlass.const_expr(self.singleton_requests):
+            query_start = query_tile_index
+            request = query_tile_index
+        elif cutlass.const_expr(self.query_tile == 1):
             query_start = query_tile_index
             lower = Int32(0)
             upper = batch
@@ -614,8 +621,12 @@ class DenseMlaForwardKernel:
             query_start = Int32(cu_seqlens_q[request]) + tile_offset * Int32(
                 self.query_tile
             )
-        query_begin = Int32(cu_seqlens_q[request])
-        query_end = Int32(cu_seqlens_q[request + Int32(1)])
+        if cutlass.const_expr(self.singleton_requests):
+            query_begin = request
+            query_end = request + Int32(1)
+        else:
+            query_begin = Int32(cu_seqlens_q[request])
+            query_end = Int32(cu_seqlens_q[request + Int32(1)])
         query_length = query_end - query_begin
         if cutlass.const_expr(self.explicit_intervals):
             # Draft Context supplies compact-owner bounds after its global mask.

@@ -270,6 +270,85 @@ def test_kimi_sparse_mla_selected_tokens(cache_format, rows, heads):
 
 
 @pytest.mark.parametrize("cache_format", ["bf16", "fp8"])
+@pytest.mark.parametrize("kind", ["heads96", "heads48", "partial0", "partial48"])
+def test_kimi_sparse_chunk_same_row_cross_width(cache_format, kind):
+    require_b12x()
+    from b12x.integration.cuteafd.kimi_dsa import (
+        compile_kimi_sparse_mla_aot, compile_kimi_sparse_mla_partial_aot,
+    )
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    partial = kind.startswith("partial")
+    heads = 96 if partial or kind == "heads96" else 48
+    output_heads = 48 if partial else heads
+    g = KimiMlaGeometry(name="kimi_k31_mla", heads=heads, kv_cache=cache_format, norm_eps=1e-5)
+    compile_fn = compile_kimi_sparse_mla_partial_aot if partial else compile_kimi_sparse_mla_aot
+    kwargs = {"head_begin": 48 if kind == "partial48" else 0} if partial else {}
+    capacity, tokens, stride = 2752, 4096, 2052
+    baseline = compile_fn(g, max_rows=capacity, **kwargs)
+    # Qualify every policy candidate, not just the eventual curve winner.
+    programs = [compile_fn(g, max_rows=capacity, row_chunk_size=c, **kwargs)
+                for c in (64, 128, 256, 512, 1024, 2048)]
+    records = (torch.randn(tokens, 576, device="cuda") * .25).bfloat16()
+    if cache_format == "bf16":
+        cache = records.view(torch.uint8)
+    else:
+        group = records[:, :512].float().reshape(tokens, 4, 128)
+        scale = group.abs().amax(-1).clamp_min(1e-6) / 448
+        cache = torch.empty(tokens, 656, device="cuda", dtype=torch.uint8)
+        cache[:, :512] = (group / scale[..., None]).to(torch.float8_e4m3fn).view(torch.uint8).reshape(tokens, 512)
+        cache[:, 512:528] = scale.view(torch.uint8)
+        cache[:, 528:] = records[:, 512:].contiguous().view(torch.uint8)
+    query = (torch.randn(capacity, heads, 576, device="cuda") * .25).bfloat16()
+    table = torch.full((capacity, stride), -1, device="cuda", dtype=torch.int32)
+    table[:, :2048] = torch.stack([torch.randperm(tokens, device="cuda")[:2048].int()
+                                  for _ in range(capacity)])
+    lengths = torch.full((capacity,), 2048, device="cuda", dtype=torch.int32)
+    cu = torch.arange(capacity + 1, device="cuda", dtype=torch.int32)
+    output = torch.empty(capacity, output_heads, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(capacity, output_heads, device="cuda")
+    scratch = torch.empty(baseline.scratch_bytes(capacity)["scratch"], device="cuda", dtype=torch.uint8)
+    shared_query, shared_table = query[0].clone(), table[0].clone()
+    cases = [(1, 0), (6, 5), (16, 15), (64, 63), (512, 511), (513, 512),
+             (700, 600), (2752, 600), (2752, 2048), (2752, 2751)]
+    for length in ([0, 777, 2048] if partial else [1, 777, 2048]):
+        canonical = None
+        for rows, index in cases:
+            query[index].copy_(shared_query)
+            table[index].copy_(shared_table)
+            lengths[index] = length
+            scalars = (rows, stride, 16) if partial else (rows, rows, stride, 16)
+            args = (query, cache, table, lengths, cu, output, lse, scratch)
+            baseline.launch(*args, scalars=scalars)
+            torch.cuda.synchronize()
+            expected = (output[index].clone(), lse[index].clone())
+            if canonical is None:
+                canonical = expected
+            assert torch.equal(expected[0].view(torch.uint8), canonical[0].view(torch.uint8))
+            assert torch.equal(expected[1].view(torch.uint8), canonical[1].view(torch.uint8))
+            if length == 0:
+                assert torch.count_nonzero(expected[0]) == 0 and torch.isneginf(expected[1]).all()
+            else:
+                assert torch.isfinite(expected[0]).all() and expected[0].abs().max() > 0
+            for program in programs:
+                output.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                program.launch(*args, scalars=scalars)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with kernel_resolution_guard("cross-width sparse MLA precompiled"), torch.cuda.graph(graph):
+                    program.launch(*args, scalars=scalars)
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(output[index].view(torch.uint8), canonical[0].view(torch.uint8)), (
+                    kind, cache_format, length, rows, index, program.geometry["row_chunk_size"], "attention")
+                assert torch.equal(lse[index].view(torch.uint8), canonical[1].view(torch.uint8)), (
+                    kind, cache_format, length, rows, index, program.geometry["row_chunk_size"], "LSE")
+            lengths[index] = 2048
+
+
+@pytest.mark.parametrize("cache_format", ["bf16", "fp8"])
 @pytest.mark.parametrize("head_begin", [0, 48])
 def test_kimi_sparse_context_global_selection_parity_and_combine(cache_format, head_begin):
     require_b12x()
