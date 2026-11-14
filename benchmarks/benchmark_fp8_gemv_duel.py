@@ -316,7 +316,8 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
 
 
 
-def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None):
+def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
+                     warps_override=None, kmajor=False, output='bf16'):
     """One actual shipped route; cross-source interleaving belongs to the caller."""
     import cutlass
     import torch
@@ -334,30 +335,33 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None):
         w = (torch.randn(n, k, generator=generator, device="cuda") * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
         s = torch.rand(n if per_row else (n + 127) // 128, k // 128,
                        generator=generator, device="cuda") * 2e-4 + 1e-4
-        scale = s.t().contiguous() if route == "expanded" else s
+        scale = s.t().contiguous() if route == "expanded" or kmajor else s
     else:
         x, w, s, scale = shared['x'], shared['w'], shared['s'], shared['scale']
-    warps = _shipped_config().get((n, k), (gemv_warps(k), 4))[0]
+    warps = (_shipped_config().get((n, k), (gemv_warps(k), 4))[0]
+             if warps_override is None else warps_override)
+    torch_output = torch.bfloat16 if output == 'bf16' else torch.float32
+    cute_output = cutlass.BFloat16 if output == 'bf16' else cutlass.Float32
     groups = fp8_gemv_tuning(n, k, warps=warps)[1]
     cta_tiles = None
     if route in ("base", "nc", "selected"):
         if rows > 16:
             groups, cta_tiles = fp8_gemv_wide(n, k, warps=warps, groups=groups)
-        cls = (fp8_gemv_wide_kernel(n, k, warps=warps, row_scales=per_row)
+        cls = (fp8_gemv_wide_kernel(n, k, warps=warps, row_scales=per_row, kmajor=kmajor)
                if route == "selected" and rows > 16 else
                NcMmaFp8Gemv if route == "nc" else MmaFp8Gemv)
         op = cls(
             n, k, max_rows=16 if rows <= 16 else 64, warps=warps, groups=groups,
-            cta_tiles=cta_tiles, row_scales=per_row)
+            cta_tiles=cta_tiles, row_scales=per_row, kmajor=kmajor, out_dtype=cute_output)
     elif route == "tma":
         op = TmaFp8Gemm(n, k, scales="row" if per_row else "block",
                         compute_warps=8, num_stages=3)
     else:
         op = ExpandedW8Prefill(n, k)
-    out = (torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+    out = (torch.empty(rows, n, device="cuda", dtype=torch_output)
            if shared is None else shared['out'])
     operands = [Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),
-                Operand("s", torch.float32, "s", align=16), Operand("out", torch.bfloat16, "out", "out")]
+                Operand("s", torch.float32, "s", align=16), Operand("out", torch_output, "out", "out")]
     args = [x, w, scale, out]
     if route == "expanded":
         operands.append(Operand("scratch", torch.bfloat16, "scratch", "scratch"))
@@ -390,11 +394,13 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None):
     return dict(case=spec, route=route, rows=rows, per_row_scales=per_row,
                 warps=warps, groups=groups, cta_tiles=cta_tiles,
                 kernel=type(op).__name__, native_scale=getattr(op, 'native_scale', None),
+                kmajor=kmajor, output_dtype=output,
                 median_read_us=median, min_read_us=best, us_per_row=median / rows,
                 max_sample_row_rel_l2=float(relative.max()), digest=digest, prefix_exact=True)
 
 
-def run_native_widths(spec, widths, route, samples, seed, row_scales):
+def run_native_widths(spec, widths, route, samples, seed, row_scales,
+                      warps_override=None, kmajor=False, output='bf16'):
     """Reuse weights, inputs and the two capacity programs across live widths."""
     import torch
     n, k = map(int, spec.split('x'))
@@ -403,12 +409,14 @@ def run_native_widths(spec, widths, route, samples, seed, row_scales):
     w = (torch.randn(n, k, generator=generator, device='cuda') * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
     s = torch.rand(n if row_scales else (n + 127) // 128, k // 128,
                    generator=generator, device='cuda') * 2e-4 + 1e-4
-    shared = dict(x=x, w=w, s=s, scale=s,
-                  out=torch.empty(max(widths), n, device='cuda', dtype=torch.bfloat16),
+    shared = dict(x=x, w=w, s=s, scale=s.t().contiguous() if kmajor else s,
+                  out=torch.empty(max(widths), n, device='cuda',
+                                  dtype=torch.bfloat16 if output == 'bf16' else torch.float32),
                   flush=torch.empty(2 * torch.cuda.get_device_properties(0).L2_cache_size,
                                     device='cuda', dtype=torch.uint8), programs={})
     for rows in widths:
-        yield run_native_route(spec, rows, route, samples, seed, row_scales, shared)
+        yield run_native_route(spec, rows, route, samples, seed, row_scales, shared,
+                               warps_override, kmajor, output)
 
 
 def main():
@@ -416,6 +424,9 @@ def main():
     parser.add_argument("--shapes", default="qwen", help=f"{','.join(SETS)}, or a semicolon list of NxK")
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--rows-list", help="comma-separated live decode widths; reuse inputs/programs (native routes only)")
+    parser.add_argument('--warps', type=int, help='exported K-partition override (native routes only)')
+    parser.add_argument('--kmajor', action='store_true', help='per-row scale grid is K-block major')
+    parser.add_argument('--out-dtype', choices=('bf16', 'f32'), default='bf16')
     parser.add_argument("--variants", default="groups",
                         choices=("groups", "groups_wide", "hints", "depth", "combo", "prod", "gem", "wide"))
     parser.add_argument("--flush", default="zero", choices=("zero", "read"))
@@ -431,6 +442,12 @@ def main():
     parser.add_argument("--source-root", type=Path,
                         help="import b12x from this read-only baseline/candidate source")
     args = parser.parse_args()
+    if args.kmajor and not args.row_scales:
+        parser.error('--kmajor requires --row-scales')
+    if args.warps is not None and args.warps not in (2, 4, 8):
+        parser.error('--warps must be 2, 4 or 8')
+    if (args.warps is not None or args.kmajor or args.out_dtype != 'bf16') and args.native_route not in ('base', 'nc', 'selected'):
+        parser.error('layout/warp/output overrides require --native-route base, nc or selected')
     widths = None
     if args.rows_list:
         try:
@@ -454,9 +471,10 @@ def main():
     for spec in specs:
         if args.native_route:
             records = (run_native_widths(spec, widths, args.native_route, args.samples, args.seed,
-                                         args.row_scales) if widths else
+                                         args.row_scales, args.warps, args.kmajor, args.out_dtype) if widths else
                        (run_native_route(spec, args.rows, args.native_route, args.samples, args.seed,
-                                         args.row_scales),))
+                                         args.row_scales, warps_override=args.warps,
+                                         kmajor=args.kmajor, output=args.out_dtype),))
             for rec in records:
                 rec.update(tag=args.tag, source_root=str(args.source_root))
                 print(json.dumps(rec), flush=True)
