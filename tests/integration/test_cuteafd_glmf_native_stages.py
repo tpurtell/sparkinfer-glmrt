@@ -428,3 +428,19 @@ def test_native_fp8_prefill_quantization_oracle_and_graph_lifetimes(n,k,output):
             assert torch.equal(out[:rows],actual)
             assert torch.isnan(out[rows:]).all()
         graph.reset()
+
+
+@pytest.mark.parametrize("rows", [1,17,129])
+def test_native_fp8_prefill_f32_writes_every_output_column(rows):
+    from b12x.integration.cuteafd._fp8_weights import compile_native_fp8_prefill_aot
+    n,k = 256,256
+    program = compile_native_fp8_prefill_aot(input_features=k,output_features=n,output="f32")
+    source = torch.ones(rows+1,k,device="cuda",dtype=torch.bfloat16)
+    weight = torch.ones(n,k,device="cuda",dtype=torch.float8_e4m3fn)
+    scales = torch.ones(n//128,k//128,device="cuda")
+    out = torch.full((rows+1,n),float("nan"),device="cuda")
+    workspace = scratch(program,4096)
+    program.launch(source,weight,scales,out,workspace,scalars=(rows,1))
+    torch.cuda.synchronize()
+    assert torch.equal(out[:rows],torch.full_like(out[:rows],float(k)))
+    assert torch.isnan(out[rows:]).all()
