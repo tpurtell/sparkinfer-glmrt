@@ -352,12 +352,15 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
                                    out_dtype=cute_output, decode_rows=64)
 
         class ProductionLaunch:
+            def __init__(self):
+                self.projection = projection
+
             def key(self):
-                return projection.key()
+                return self.projection.key()
 
             @cutlass.cute.jit
             def __call__(self, x, w, s, out, live_rows, stream):
-                projection(x, w, s, out, live_rows, cutlass.Int32(64), cutlass.Int64(0), stream)
+                self.projection(x, w, s, out, live_rows, cutlass.Int32(64), cutlass.Int64(0), stream)
 
         op = ProductionLaunch()
         if rows == 16 and projection.gemv_m16 is not None:
