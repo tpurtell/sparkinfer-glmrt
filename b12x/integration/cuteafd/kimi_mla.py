@@ -348,7 +348,7 @@ class _Output:
 
 
 class _Attention:
-    def __init__(self, g, rows, max_context, mode, *, page_size=64):
+    def __init__(self, g, rows, max_context, mode, *, page_size=64, singleton_requests=False):
         self.g = g
         self.page_size = int(page_size)
         self.layout = attention_layout(g, rows, max_context=max_context, mode=mode)
@@ -363,7 +363,7 @@ class _Attention:
             qk_dim=576, value_dim=512,
             window_size=g.window_size if isinstance(g, MlaDraftGeometry) else None,
             noncausal_block=isinstance(g, MlaDraftGeometry),
-            ds_mla_record=g.kv_cache == "fp8")
+            ds_mla_record=g.kv_cache == "fp8", singleton_requests=singleton_requests)
         self.merge = DenseMlaMergeKernel(num_splits=self.splits, value_dim=512) if self.splits > 1 else None
 
     @cute.jit
@@ -688,7 +688,8 @@ class _ContextPartialMerge:
 
 class _ContextPartial:
     def __init__(self, g, max_rows, max_context, begin, heads, splits,
-                 device_splits=False, heads_per_tile=16, explicit_intervals=False, page_size=64):
+                 device_splits=False, heads_per_tile=16, explicit_intervals=False, page_size=64,
+                 singleton_requests=False):
         self.g, self.begin, self.heads, self.splits = g, begin, heads, splits
         self.page_size = int(page_size)
         self.device_splits = device_splits
@@ -700,7 +701,7 @@ class _ContextPartial:
             num_splits=splits, chunks_per_split=self.chunks_per_split,
             query_tile=1, fp8=False, qk_dim=576, value_dim=512, window_size=None,
             ds_mla_record=g.kv_cache == "fp8", dynamic_split_chunks=True, device_splits=device_splits,
-            explicit_intervals=explicit_intervals)
+            explicit_intervals=explicit_intervals, singleton_requests=singleton_requests)
         self.merge = _ContextPartialMerge(heads, splits, device_splits)
 
     def scratch_bytes(self, rows):
@@ -712,6 +713,14 @@ class _ContextPartial:
                  cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
                  lse: cute.Pointer, scratch: cute.Pointer, rows: Int32,
                  page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
+        self.run_partial(query, kv_cache, page_table, cache_seqlens, cu_seqlens_q,
+                         attn, lse, scratch, rows, page_table_width, active_splits, stream)
+
+    @cute.jit
+    def run_partial(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                    cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                    lse: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                    page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
         g, h, s = self.g, self.heads, self.splits
         q = cute.make_tensor(cute.recast_ptr(query + Int64(self.begin * 576), dtype=cutlass.Uint8),
                              cute.make_layout((1,)))
@@ -734,6 +743,54 @@ class _ContextPartial:
             Int64(self.page_size * g.record_bytes), Int64(g.record_bytes), page_table_width,
             rows, rows, active_splits, stream)
         self.merge(po, pl, attn, lse, rows, active_splits, stream)
+
+
+class _SparseAttentionChunks(_Attention):
+    def __init__(self, g, max_rows, row_chunk_size):
+        self.row_chunk_size = min(max_rows, row_chunk_size)
+        super().__init__(g, self.row_chunk_size, 2048, "decode", page_size=1,
+                         singleton_requests=True)
+        self.layout = {**self.layout, "row_chunk_size": self.row_chunk_size}
+
+    @cute.jit
+    def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                 cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                 lse: cute.Pointer, scratch: cute.Pointer, rows: Int32, batch: Int32,
+                 page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
+        # Each selected-token table is already one independent query request.
+        # The singleton variant synthesizes local cu offsets; no metadata copy
+        # or different split/MMA/merge reduction is needed between chunks.
+        for first in cutlass.range(0, rows, self.row_chunk_size):
+            count = min(Int32(self.row_chunk_size), rows - first)
+            row = Int64(first)
+            self.run_attention(query + row * Int64(self.g.heads * 576), kv_cache,
+                page_table + row * page_table_width, cache_seqlens + row, cu_seqlens_q,
+                attn + row * Int64(self.g.heads * 512), lse + row * Int64(self.g.heads),
+                scratch, count, count, page_table_width, active_splits,
+                Float32(self.g.softmax_scale * math.log2(math.e)), stream)
+
+
+class _SparsePartialChunks(_ContextPartial):
+    def __init__(self, g, max_rows, row_chunk_size, head_begin):
+        self.row_chunk_size = min(max_rows, row_chunk_size)
+        super().__init__(g, self.row_chunk_size, 2048, head_begin, 48, 16,
+                         page_size=1, singleton_requests=True)
+
+    def scratch_bytes(self, rows):
+        return super().scratch_bytes(min(int(rows), self.row_chunk_size))
+
+    @cute.jit
+    def __call__(self, query: cute.Pointer, kv_cache: cute.Pointer, page_table: cute.Pointer,
+                 cache_seqlens: cute.Pointer, cu_seqlens_q: cute.Pointer, attn: cute.Pointer,
+                 lse: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 page_table_width: Int64, active_splits: Int32, stream: cuda.CUstream):
+        for first in cutlass.range(0, rows, self.row_chunk_size):
+            count = min(Int32(self.row_chunk_size), rows - first)
+            row = Int64(first)
+            self.run_partial(query + row * Int64(self.g.heads * 576), kv_cache,
+                page_table + row * page_table_width, cache_seqlens + row, cu_seqlens_q,
+                attn + row * Int64(self.heads * 512), lse + row * Int64(self.heads),
+                scratch, count, page_table_width, active_splits, stream)
 
 
 class _DraftContextPartial(_ContextPartial):
