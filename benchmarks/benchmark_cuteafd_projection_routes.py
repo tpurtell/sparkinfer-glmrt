@@ -451,6 +451,66 @@ def _trellis_baseline(args):
         save()
 
 
+class _PrefillThermal:
+    """Bounded NVML samples and cumulative slowdown counters, never a timing source."""
+    def __init__(self):
+        import pynvml
+        import torch
+        self.nvml = pynvml
+        pynvml.nvmlInit()
+        uuid = str(torch.cuda.get_device_properties(0).uuid)
+        if not uuid.startswith("GPU-"): uuid = "GPU-"+uuid
+        self.handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+        self.samples, self.errors = [], []
+        self.stop = threading.Event()
+        self.before = self.counters()
+        self.thread = threading.Thread(target=self.sample)
+        self.thread.start()
+
+    def optional(self, function, *args):
+        try: return function(self.handle,*args)
+        except Exception: return None
+
+    def counters(self):
+        get = getattr(self.nvml,"nvmlDeviceGetViolationStatus",None)
+        result = {}
+        for name,policy in [("power",0),("thermal",1)]:
+            value = self.optional(get,policy) if get else None
+            result[name] = None if value is None else value.violationTime
+        return result
+
+    def sample(self):
+        n = self.nvml
+        while not self.stop.is_set():
+            try:
+                margin = None
+                get = getattr(n,"nvmlDeviceGetMarginTemperature",None)
+                if get:
+                    info = self.optional(get)
+                    if info is not None: margin = getattr(info,"marginTemperature",None)
+                self.samples.append(dict(time=time.monotonic(),
+                    clock=self.optional(n.nvmlDeviceGetClockInfo,n.NVML_CLOCK_SM),
+                    utilization=getattr(self.optional(n.nvmlDeviceGetUtilizationRates),"gpu",None),
+                    temperature=self.optional(n.nvmlDeviceGetTemperature,n.NVML_TEMPERATURE_GPU),
+                    margin=margin,reasons=self.optional(n.nvmlDeviceGetCurrentClocksThrottleReasons)))
+            except Exception as error: self.errors.append(str(error))
+            self.stop.wait(.01)
+
+    def finish(self):
+        self.stop.set(); self.thread.join()
+        after = self.counters()
+        busy = [v["clock"] for v in self.samples if v["clock"] is not None and (v["utilization"] or 0)>=50]
+        values = lambda field:[v[field] for v in self.samples if v[field] is not None]
+        seconds = {name:sum((b["time"]-a["time"]) for a,b in zip(self.samples,self.samples[1:])
+            if a["reasons"] is not None and a["reasons"]&mask) for name,mask in [("power_cap",4),("thermal",0x60)]}
+        return dict(samples=self.samples,errors=self.errors,sampled_reason_seconds=seconds,
+            counter_seconds={name:(None if self.before[name] is None or after[name] is None
+                else (after[name]-self.before[name])/1e9) for name in after},
+            busy_sm_clock_mhz=statistics.median(busy) if busy else None,
+            max_temperature_c=max(values("temperature"),default=None),
+            min_tlimit_headroom_c=min(values("margin"),default=None))
+
+
 def _fp8_prefill_bench(args):
     """One fixed-capacity callable, real FP8 weights, matched A8/A16 row curves."""
     import torch
@@ -495,6 +555,7 @@ def _fp8_prefill_bench(args):
                 graphs[label] = graph
             samples = {name:[] for name in graphs}
             before = nvidia_smi_gpu_mode_snapshot()
+            thermal = _PrefillThermal()
             for sample in range(args.samples):
                 for label in (["w8a16","w8a8"] if sample%2==0 else ["w8a8","w8a16"]):
                     flush()
@@ -503,7 +564,7 @@ def _fp8_prefill_bench(args):
                     samples[label].append(start.elapsed_time(end)*1000)
             entry = dict(n=n,k=k,rows=rows,output=args.output_dtype,samples_us=samples,
                 median_us={label:statistics.median(values) for label,values in samples.items()},
-                telemetry_before=before,telemetry_after=nvidia_smi_gpu_mode_snapshot())
+                thermal=thermal.finish(),telemetry_before=before,telemetry_after=nvidia_smi_gpu_mode_snapshot())
             entry["us_per_row"] = {label:value/rows for label,value in entry["median_us"].items()}
             results.append(entry)
             print(json.dumps(entry),flush=True)
