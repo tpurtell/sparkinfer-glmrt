@@ -1458,9 +1458,9 @@ def mxfp4_unify_screen(g, args, geometry_type):
                             else {"native-" + precision + "-t64-k2": (precision, 64, 2, 1)
                                   for precision in ("a8", "a16")})
             if args.decode_occupancy:
-                variants = {"occupancy-" + precision: (precision, occupancy_recipe["tile"],
+                variants.update({"occupancy-" + precision: (precision, occupancy_recipe["tile"],
                             occupancy_recipe["k_splits"], occupancy_recipe["cta_splits"])
-                            for precision in ("a8", "a16")}
+                            for precision in ("a8", "a16")})
             if args.shipped_prefill:
                 variants = {}
             if args.fc1_k_splits:
@@ -1480,7 +1480,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                     runs[label], outputs[label], keep = native_pair_arm(
                         x, ids, routing, weights, scales, tile, not v4 or width == 576, False, v4,
                         activation_precision=precision, projection_contract={**contract,
-                            **({"fc2_n_splits": occupancy_recipe["fc2_n_splits"]} if args.decode_occupancy else {})},
+                            **({"fc2_n_splits": occupancy_recipe["fc2_n_splits"]} if label.startswith("occupancy-") else {})},
                         combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split,
                         fc1_cta_splits=cta, live_rows=rows)
                 except AssertionError as error:
@@ -1608,7 +1608,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           f32_errors=errors, matched_f32_errors=matched_errors, comparisons=comparisons,
                           invariant_checks="poison/live/graph/row-mix", slice_width=128,
                           fc1_variants={label: dict(precision=precision, tile=tile, k_splits=split,
-                                                    fc2_n_splits=occupancy_recipe["fc2_n_splits"] if args.decode_occupancy else 8,
+                                                    fc2_n_splits=occupancy_recipe["fc2_n_splits"] if label.startswith("occupancy-") else 8,
                                                     cta_splits=cta, partial_bytes=4 * fc1_partial_words(
                                                         capacity, tile, g.top_k, width, precision, cta))
                                         for label, (precision, tile, split, cta) in variants.items()},
