@@ -1,13 +1,13 @@
 """FP8-only weight kernels for the cuteafd coordinator programs (no BF16 copies).
 
-* ``TmaFp8Gemm`` with per-row scales (``row`` / ``row_kmajor``) equals the BF16
-  TMA GEMM over ``bf16(w * s)`` bitwise, as the block-scale form does.
+* ``TmaFp8Gemm`` with block/per-row scales matches the exact FP64 checkpoint
+  product without BF16 scaled-weight rounding.
 * ``BatchedFp8Gemm`` (per-row x 64-K scales) equals ``BatchedBf16Gemm`` over
   the dequantized weights bitwise (GLM ``kv_b_proj`` absorb / up-projection).
-* ``Fp8Projection``: decode rows equal ``RoutedFp8Projection`` with the BF16
-  copy bitwise (GEMV up to 16 rows, W8A16 TMA above); prefill rows run W8A8
+* ``Fp8Projection``: native-scale decode and W8A16 fallback match the exact
+  checkpoint product; prefill rows run W8A8
   (E4M3 activations per row and 128-K block, FP32 scales) against a float
-  reference of the same quantization, or W8A16 bitwise with ``fp8_rows`` 0.
+  reference of the same quantization, or native W8A16 with ``fp8_rows`` 0.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def _weights(n, k, seed, row_scales=False):
 @pytest.mark.parametrize("tile_n", [128, 64, 32])
 @pytest.mark.parametrize("scales", ["block", "row", "row_kmajor"])
 @pytest.mark.parametrize("n,k,rows", [(13568, 4096, 40), (2624, 6144, 300), (1000, 1024, 17)])
-def test_tma_fp8_gemm_row_scales_bitwise(scales, n, k, rows, tile_n):
+def test_tma_fp8_gemm_row_scales_native(scales, n, k, rows, tile_n):
     from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     from b12x.integration.cuteafd._fp8_weights import TmaFp8Gemm
@@ -67,7 +67,9 @@ def test_tma_fp8_gemm_row_scales_bitwise(scales, n, k, rows, tile_n):
         program.launch(x, *([w8, scale] if fp8 else [wd]), out, scalars=(rows,))
         outs.append(out)
     torch.cuda.synchronize()
-    assert torch.equal(outs[0], outs[1])
+    grown = s.repeat_interleave(128, 1) if scales != "block" else s.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
+    expected = x.double() @ (w8.double() * grown.double()).t()
+    _assert_native_projection(outs[0], expected)
 
 
 @pytest.mark.parametrize("kind", ["uk", "uv"])
@@ -166,18 +168,19 @@ def test_fp8_projection_prefill(row_scales, n, k, rows):
     program.launch(x, w8, scale, out16, scratch, scalars=(rows, 0))
     torch.cuda.synchronize()
     ref8 = _w8a8_reference(x, w8, s, row_scales)
-    ref16 = (x.float() @ wd.float().t())
+    grown = s.repeat_interleave(128, 1) if row_scales else s.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
+    ref16 = x.double() @ (w8.double() * grown.double()).t()
     cos = torch.nn.functional.cosine_similarity(out8.float().flatten(), ref8.float().flatten(), dim=0).item()
     err = (out8.float() - ref8.float()).abs().max().item() / ref8.float().abs().max().item()
     print(f"W8A8 n={n} k={k} rows={rows} row_scales={row_scales}: cosine {cos:.7f} max rel err {err:.2e}")
     assert cos > 0.99998 and err < 2e-2
-    cos16 = torch.nn.functional.cosine_similarity(out16.float().flatten(), ref16.flatten(), dim=0).item()
+    cos16 = torch.nn.functional.cosine_similarity(out16.float().flatten(), ref16.float().flatten(), dim=0).item()
     assert cos16 > 0.99999
 
 
 @pytest.mark.parametrize("rows", [1, 16, 17, 40, 64])
-def test_fp8_projection_decode_matches_routed(rows):
-    """Decode rows: GEMV up to 16 then W8A16 TMA, bitwise the BF16-copy program."""
+def test_fp8_projection_decode_native(rows):
+    """Decode GEMV and W8A16 fallback honor the exact checkpoint weight."""
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     from b12x.integration.cuteafd._fp8_weights import Fp8Projection, RoutedFp8Projection
 
@@ -212,4 +215,69 @@ def test_fp8_projection_decode_matches_routed(rows):
     new.launch(x, w8, s, a, scalars=(rows,))
     old.launch(x, wd, w8, s, b, scalars=(rows,))
     torch.cuda.synchronize()
-    assert torch.equal(a, b)
+    grown = s.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)
+    expected = x.double() @ (w8.double() * grown.double()).t()
+    _assert_native_projection(a, expected)
+    if rows <= 16:
+        assert torch.equal(a, b)
+
+
+def _assert_native_projection(out, expected):
+    actual = out.double()
+    relative = (actual - expected).norm(dim=1) / expected.norm(dim=1).clamp_min(1e-30)
+    tolerance = 3e-3 if out.dtype == torch.bfloat16 else 3e-5
+    assert float(relative.max()) < tolerance, (float(relative.mean()), float(relative.max()))
+
+
+@pytest.mark.parametrize("route,rows", [("base", 1), ("base", 17), ("base", 64),
+                                       ("nc", 17), ("nc", 64), ("tma", 129),
+                                       ("expanded", 512), ("expanded", 513)])
+@pytest.mark.parametrize("scales", ["block", "row", "row_kmajor"])
+def test_native_dense_scale_f64(route, rows, scales):
+    """Exact checkpoint product, nonuniform scales, live-row reuse and graph replay."""
+    import cutlass
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import MmaFp8Gemv, TmaFp8Gemm
+    from b12x.integration.cuteafd._fp8_gemv_nc import NcMmaFp8Gemv
+    from b12x.integration.cuteafd._glmf_prefill_w8 import ExpandedW8Prefill
+
+    if route == "expanded" and scales != "row_kmajor":
+        pytest.skip("expanded ABI is row/K128-major only")
+    n, k = 256, 512
+    w, s, _ = _weights(n, k, 2057, row_scales=scales != "block")
+    scale = s.t().contiguous() if scales == "row_kmajor" else s
+    grown = s.repeat_interleave(128, 1) if scales != "block" else s.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    x = torch.randn(rows, k, device="cuda").bfloat16()
+    out = torch.empty(rows, n, device="cuda", dtype=torch.float32)
+    kwargs = dict(out_dtype=cutlass.Float32)
+    if route in ("base", "nc"):
+        launch = (MmaFp8Gemv if route == "base" else NcMmaFp8Gemv)(
+            n, k, max_rows=64, warps=2, groups=2, row_scales=scales != "block",
+            kmajor=scales == "row_kmajor", **kwargs)
+    elif route == "tma":
+        launch = TmaFp8Gemm(n, k, scales=scales, **kwargs)
+    else:
+        launch = ExpandedW8Prefill(n, k, **kwargs)
+    operands = [Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),
+                Operand("s", torch.float32, "s", align=16), Operand("o", torch.float32, "o", "out")]
+    args = [x, w, scale, out]
+    if route == "expanded":
+        operands.append(Operand("scratch", torch.bfloat16, "scratch", "scratch"))
+        args.append(torch.empty(n, k, device="cuda", dtype=torch.bfloat16))
+    program = compile_program(launch, name=f"native_{route}_{scales}", operands=operands,
+                              scalars=(Scalar("rows"),), key=(route, scales, n, k))
+    program.launch(*args, scalars=(rows,))
+    torch.cuda.synchronize()
+    expected = x.double() @ (w.double() * grown.double()).t()
+    _assert_native_projection(out, expected)
+    first = out.clone()
+    program.launch(*args, scalars=(1,))
+    torch.cuda.synchronize()
+    assert torch.equal(first[:1], out[:1])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        program.launch(*args, scalars=(rows,))
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(first, out)

@@ -32,7 +32,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
 )
 
-from ._fp8_weights import MmaFp8Gemv, gemv_warps
+from ._fp8_weights import MmaFp8Gemv, _e4m3x4_bf16x2x2, gemv_warps
 
 __all__ = ["NcMmaFp8Gemv", "nc_gemv_cta_tiles", "nc_gemv_groups"]
 
@@ -353,9 +353,8 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
         xa_b[4], xa_b[5], xa_b[6], xa_b[7] = hi4, hi5, hi6, hi7
         bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
         for gi in cutlass.range_constexpr(self.groups):
-            s_val = s_buf[gi if self.row_scales else 0]
             for t in cutlass.range_constexpr(4):
-                b0, b1 = _e4m3x4_scaled_bf16x2x2_fast(c_buf[gi * 4 + t], s_val)
+                b0, b1 = _e4m3x4_bf16x2x2(c_buf[gi * 4 + t])
                 bw[8 * gi + 2 * t] = b0
                 bw[8 * gi + 2 * t + 1] = b1
             if const_expr(reload_w):
@@ -364,8 +363,6 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
                 c_buf[gi * 4 + 1] = w1
                 c_buf[gi * 4 + 2] = w2
                 c_buf[gi * 4 + 3] = w3
-        if const_expr(reload_s):
-            self._load_scale_se(s_buf, s_row, next_block_idx, s_gi, s_kb)
         for mt in cutlass.range_constexpr(self.m_tiles):
             for t in cutlass.range_constexpr(2):
                 for gi in cutlass.range_constexpr(self.groups):
@@ -457,25 +454,29 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
         self._load_chunk_v4(c0, w_row, Int64(0))
         self._load_chunk_v4(c1, w_row, Int64(64))
         self._load_scale_se(s0, s_row, Int64(0), s_gi, s_kb)
-        if const_expr(self.blocks > 1):
-            for blk in cutlass.range(self.blocks - 1, unroll=1):
-                b = Int64(blk)
-                self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+        block_acc = cute.make_rmem_tensor(cute.make_layout((self.frags,), stride=(1,)), Float32)
+        for blk in cutlass.range(self.blocks, unroll=1):
+            b = Int64(blk)
+            block_acc.fill(0.0)
+            if blk + 1 < self.blocks:
+                self._consume_chunk(block_acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
                                     b * Int64(128), (b + Int64(1)) * Int64(128),
                                     b + Int64(1), True, False)
-                self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                self._consume_chunk(block_acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
                                     b * Int64(128) + Int64(64),
-                                    (b + Int64(1)) * Int64(128) + Int64(64), b + Int64(1), True, True)
-            b_last = Int64(self.blocks - 1)
-            self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
-                                b_last * Int64(128), Int64(0), Int64(0), False, False)
-            self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
-                                b_last * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
-        else:
-            self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
-                                Int64(0), Int64(0), Int64(0), False, False)
-            self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
-                                Int64(64), Int64(0), Int64(0), False, False)
+                                    (b + Int64(1)) * Int64(128) + Int64(64), b + Int64(1), True, False)
+            else:
+                self._consume_chunk(block_acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                    b * Int64(128), Int64(0), Int64(0), False, False)
+                self._consume_chunk(block_acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                                    b * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
+            for i in cutlass.range_constexpr(self.frags):
+                block_scale = s0[(i // 4) % self.groups if self.row_scales else 0]
+                if const_expr(self.row_scales):
+                    block_scale = cute.arch.shuffle_sync(block_scale, Int32(4) * (Int32(2) * j + Int32(i % 2)))
+                acc[i] = acc[i] + block_acc[i] * block_scale
+            if blk + 1 < self.blocks:
+                self._load_scale_se(s0, s_row, b + Int64(1), s_gi, s_kb)
 
         if const_expr(self.smem_frags == self.frags):
             pairs = self.frags // 2

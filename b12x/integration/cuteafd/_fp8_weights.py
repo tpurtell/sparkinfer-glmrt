@@ -6,12 +6,12 @@ powers of two costs 0.025 nats, so these kernels apply them exactly:
 
 ``MmaFp8Gemv``   decode rows (one thin 16-row tile, then multi-tile rows to the
     program's capacity on the same ``warps``/``groups``): m16n8k16 BF16 MMAs fed
-    straight from global memory, weights widened in registers to
-    ``bf16(w * s)`` (exactly the BF16 program's dequantized weight), FP32
-    accumulation; reads half the weight bytes of the BF16 GEMV.
+    straight from global memory, exact E4M3 widening in registers and FP32
+    block scales applied to K128 accumulator segments; reads half the weight
+    bytes of the BF16 GEMV without rounding the scaled weight.
 ``TmaFp8Gemm``    the BF16 TMA tensor-core GEMM with E4M3 weight tiles widened
-    to ``bf16(w * s)`` in shared memory; bitwise equal to the BF16 kernel over
-    dequantized weights (W8A16; block, per-row or K-block-major per-row scales).
+    exactly to BF16 in shared memory, with FP32 block scales applied to K128
+    accumulator segments (W8A16; block, per-row or K-block-major scales).
 ``RoutedFp8Projection``  ``MmaFp8Gemv`` up to ``decode_rows`` live rows, the
     BF16 TMA GEMM over the BF16 copy of the weight above.
 ``Fp8Projection``  a weight held only as E4M3 + scales (no BF16 copy): decode
@@ -616,9 +616,9 @@ class TmaFp8Gemm:
 
     The Bf16PrefillKernel pipeline (TMA producer warp, warp MMA m16n8k16,
     FP32 accumulators) with the weight tile fetched as E4M3 (half the bytes).
-    After each stage lands, the compute warps widen it to ``bf16(w * s)``
-    into a swizzled BF16 tile and run the MMAs from it, so results equal the
-    BF16 program over ``bf16(w * s)`` weights (W8A16, bitwise).
+    After each stage lands, compute warps widen E4M3 exactly into a swizzled
+    BF16 tile. Two K64 stages form one K128 FP32 segment, scaled once before
+    adding it to the projection accumulator (no BF16 scaled-weight rounding).
 
     ``scales``: ``"block"`` the checkpoint's 128x128 grid ``[ceil(N/128),
     K/128]`` (one scale per 128x64 tile); ``"row"`` one scale per output row
@@ -764,6 +764,8 @@ class TmaFp8Gemm:
             t_crb = thr_mma.make_fragment_B(t_csb)
             acc = cute.make_rmem_tensor(thr_mma.partition_shape_C((self.tile_m, self.tile_n)), Float32)
             acc.fill(0.0)
+            block_acc = cute.make_rmem_tensor(thr_mma.partition_shape_C((self.tile_m, self.tile_n)), Float32)
+            coordinates = thr_mma.partition_C(cute.make_identity_tensor((self.tile_m, self.tile_n)))
             copy_a = cute.make_tiled_copy_A(
                 cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.BFloat16),
                 tiled_mma).get_slice(tidx)
@@ -775,17 +777,17 @@ class TmaFp8Gemm:
             w_base = shared_ptr_to_u32(storage.sW.data_ptr())
             b_base = shared_ptr_to_u32(storage.sB.data_ptr())
             for k_tile in cutlass.range(self.k_tiles, unroll_full=False):
-                s = self._scale(scale, n_tile, Int32(0), k_tile)
+                if k_tile % Int32(2) == Int32(0):
+                    block_acc.fill(0.0)
                 load_pipeline.consumer_wait(consumer_state)
                 stage = w_base + Int32(consumer_state.index) * Int32(self.tile_n * self.tile_k)
                 for i in cutlass.range_constexpr(self.chunks):
                     chunk = Int32(i * self.compute_threads) + Int32(tidx)
                     n = chunk // Int32(self.tile_k // 8)
                     c = chunk % Int32(self.tile_k // 8)
-                    if cutlass.const_expr(self.scales != "block"):
-                        s = self._scale(scale, n_tile, n, k_tile)
                     lo, hi = ld_shared_v2_u32(stage + n * Int32(self.tile_k) + c * Int32(8))
-                    v0, v1, v2, v3 = _e4m3x8_scaled_bf16(lo, hi, s)
+                    v0, v1 = _e4m3x4_bf16x2x2(lo)
+                    v2, v3 = _e4m3x4_bf16x2x2(hi)
                     # 128-byte swizzle: 16-byte chunk c of row n sits at chunk c ^ (n % 8).
                     st_shared_v4_u32(b_base + n * Int32(128) + ((c ^ (n % Int32(8))) * Int32(16)), v0, v1, v2, v3)
                 cute.arch.barrier(barrier_id=1, number_of_threads=self.compute_threads)
@@ -798,7 +800,11 @@ class TmaFp8Gemm:
                     if kk < cute.size(shared_a.shape[2]) - 1:
                         cute.copy(copy_a, shared_a[None, None, kk + 1], target_a[None, None, kk + 1])
                         cute.copy(copy_b, t_ssb[None, None, kk + 1], target_b[None, None, kk + 1])
-                    cute.gemm(thr_mma, acc, t_cra[None, None, kk], t_crb[None, None, kk], acc)
+                    cute.gemm(thr_mma, block_acc, t_cra[None, None, kk], t_crb[None, None, kk], block_acc)
+                if k_tile % Int32(2) == Int32(1):
+                    for index in cutlass.range_constexpr(cute.size(acc)):
+                        block_scale = self._scale(scale, n_tile, coordinates[index][1], k_tile)
+                        acc[index] = acc[index] + block_acc[index] * block_scale
                 cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
@@ -936,9 +942,9 @@ class MmaFp8Gemv:
     16 * quad(s) + 4t + idx(s)`` (``idx`` of slots ``2j, 2j+1, 2j+8, 2j+9``
     is 0..3), so each lane reads one contiguous 16-byte weight run per group
     (row ``lane/4``) and two contiguous 32-byte activation runs per tile,
-    reused by every group. Weights enter the MMA as ``bf16(w * s)`` (the BF16
-    program's dequantized weight; one scale per 128-wide K block since a
-    CTA's columns share a 128-row block), FP32 accumulation; warps reduce
+    reused by every group. Weights enter the MMA as exact E4M3 values; each
+    K128 FP32 segment receives its checkpoint scale before accumulating.
+    Warps reduce
     through shared memory (one tile at a time when a CTA holds more than two,
     ``sync_threads`` between tiles, and the same ascending warp order either
     way); output BF16 or FP32 ``[rows, N]``. Nothing here depends on the live
@@ -948,7 +954,8 @@ class MmaFp8Gemv:
 
     ``row_scales``: the scale grid is ``[N, K/128]`` FP32, one scale per
     output row and 128-wide K block (per-channel or row-block quantization of
-    a BF16 weight); each lane scales its own row's weights. ``kmajor``: those
+    a BF16 weight); the scale follows the MMA accumulator's column mapping.
+    ``kmajor``: those
     per-row scales stored K-block major, ``[K/128, N]``.
     """
 
@@ -957,10 +964,7 @@ class MmaFp8Gemv:
                  load_hint: str = "stream", prefetch_blocks: int = 0, prefetch_bytes: int = 1024,
                  cta_tiles: int | None = None, direct_widen: bool = False):
         self.direct_widen = bool(direct_widen)
-        self.widen = _e4m3x4_scaled_bf16x2x2
-        if self.direct_widen:
-            from ._fp8_gemv_nc import _e4m3x4_scaled_bf16x2x2_fast
-            self.widen = _e4m3x4_scaled_bf16x2x2_fast
+        self.widen = _e4m3x4_bf16x2x2
         if load_hint not in ("stream", "l2_128b", "l2_256b"):
             raise ValueError("load_hint is stream, l2_128b or l2_256b")
         if prefetch_blocks and (prefetch_bytes % 128 or prefetch_bytes > 4096):
@@ -1130,6 +1134,8 @@ class MmaFp8Gemv:
         for si in cutlass.range_constexpr(s_rows):
             s_cur[si] = _ld_f32(s_row + Int64(si) * s_gi)
         for block in cutlass.range(self.blocks, unroll=1):
+            block_acc = cute.make_rmem_tensor(cute.make_layout((self.frags,), stride=(1,)), Float32)
+            block_acc.fill(0.0)
             for si in cutlass.range_constexpr(s_rows):
                 s_nxt[si] = s_cur[si]
             if block + 1 < self.blocks:
@@ -1143,8 +1149,7 @@ class MmaFp8Gemv:
                 bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
                 for gi in cutlass.range_constexpr(self.groups):
                     for t in cutlass.range_constexpr(4):
-                        b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t],
-                                           s_cur[gi if self.row_scales else 0])
+                        b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t])
                         bw[8 * gi + 2 * t] = b0
                         bw[8 * gi + 2 * t + 1] = b1
                 for mt in cutlass.range_constexpr(self.m_tiles):
@@ -1172,13 +1177,19 @@ class MmaFp8Gemv:
                             f = 4 * (mt * self.groups + gi)
                             for t in cutlass.range_constexpr(4):
                                 d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                    block_acc[f], block_acc[f + 1], block_acc[f + 2], block_acc[f + 3],
                                     xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
                                     bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
-                                acc[f] = d0
-                                acc[f + 1] = d1
-                                acc[f + 2] = d2
-                                acc[f + 3] = d3
+                                block_acc[f] = d0
+                                block_acc[f + 1] = d1
+                                block_acc[f + 2] = d2
+                                block_acc[f + 3] = d3
+            for i in cutlass.range_constexpr(self.frags):
+                block_scale = s_cur[(i // 4) % self.groups if self.row_scales else 0]
+                if const_expr(self.row_scales):
+                    # MMA C columns live at 2*j + parity, not weight-loading row g.
+                    block_scale = cute.arch.shuffle_sync(block_scale, Int32(4) * (Int32(2) * j + Int32(i % 2)))
+                acc[i] = acc[i] + block_acc[i] * block_scale
             for i in cutlass.range_constexpr(per_block):
                 cur[i] = nxt[i]
             for si in cutlass.range_constexpr(s_rows):
