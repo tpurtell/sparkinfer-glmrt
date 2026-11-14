@@ -379,6 +379,54 @@ def test_fp8_projection_row_invariance(case, rows):
     )
 
 
+@pytest.mark.parametrize('variant', (
+    (5120, 17408, False, False), (16384, 1536, False, False),
+    (4096, 16384, False, False), (4096, 16384, True, False),
+    (4096, 16384, True, True)),
+    ids=('5120x17408-block', '16384x1536-block', '4096x16384-block',
+         '4096x16384-row', '4096x16384-kmajor'))
+def test_selected_wide_fp8_projection_row_offsets(variant):
+    """Every distinct row must match its own thin launch at every live width."""
+    import torch
+    from b12x.integration.cuteafd._fp8_weights import (
+        Fp8Projection, fp8_gemv_shipped_warps)
+
+    n, k, row_scales, kmajor = variant
+    case_id = f'selected_wide_{n}x{k}_{int(row_scales)}_{int(kmajor)}'
+    proj = Fp8Projection(n, k, warps=fp8_gemv_shipped_warps(n, k),
+                         row_scales=row_scales, kmajor=kmajor, decode_rows=64)
+    _check_shape(proj, 'plain')
+    assert proj.gemv_wide is not None
+    assert proj.gemv.native_scale == proj.gemv_wide.native_scale
+    program = _compile(case_id, 'plain', n, k, proj)
+    seed = 20_057 + n + k
+    scale_kind = 'kmajor' if kmajor else 'row' if row_scales else 'block'
+    w8, scale, _ = _weights(n, k, scale_kind, seed, dequant=False)
+    generator = torch.Generator(device='cuda').manual_seed(seed + 3)
+    x = torch.randn(64, k, generator=generator, device='cuda').bfloat16()
+    reference = _fresh(64, n)
+    for offset in range(64):
+        _launch(program, 'plain', x[offset:offset + 1], w8, scale, None,
+                reference[offset:offset + 1], 1, 64)
+    torch.cuda.synchronize()
+    assert torch.isfinite(reference).all() and torch.count_nonzero(reference)
+    for rows in _WIDTHS:
+        out = _fresh(rows + 1, n)
+        _launch(program, 'plain', x, w8, scale, None, out, rows, 64)
+        torch.cuda.synchronize()
+        expected = reference[:rows].view(torch.int16)
+        assert torch.equal(out[:rows].view(torch.int16), expected), (variant, rows, 'row offsets')
+        assert (out[rows:].view(torch.int16) == _SENTINEL).all(), (variant, rows, 'tail')
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _launch(program, 'plain', x, w8, scale, None, out, rows, 64)
+        out.view(torch.int16).fill_(_SENTINEL)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out[:rows].view(torch.int16), expected), (variant, rows, 'graph replay')
+        assert (out[rows:].view(torch.int16) == _SENTINEL).all(), (variant, rows, 'graph tail')
+
+
 @pytest.mark.parametrize('output', ('bf16', 'f32'))
 @pytest.mark.parametrize('case', [c for c in _CASES if c[1] == 'native'],
                          ids=[c[0] for c in _CASES if c[1] == 'native'])

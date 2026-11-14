@@ -270,8 +270,9 @@ def test_native_dense_scale_f64(route, rows, scales):
     program.launch(*args, scalars=(rows,))
     torch.cuda.synchronize()
     exact_weight = w.double() * grown.double()
-    if route in ("expanded", "nc", "tma"):
-        # Interim master arithmetic on deferred routes (cuteafd#2068).
+    if route in ("expanded", "tma") or getattr(launch, 'native_scale', None) is False:
+        # Only interim routes round the scaled weight; native routes keep the
+        # strict F32 oracle against the checkpoint's exact product.
         exact_weight = exact_weight.float().bfloat16().double()
     expected = x.double() @ exact_weight.t()
     _assert_native_projection(out, expected)
@@ -290,8 +291,9 @@ def test_native_dense_scale_f64(route, rows, scales):
 
 @pytest.mark.parametrize("n,k,warps", [(5120,17408,4),(16384,1536,2),(4096,16384,4)])
 def test_deferred_nc_shape_keeps_one_scale_arithmetic(n, k, warps):
-    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection, FP8_NATIVE_SCALE_DEFERRED
     projection = Fp8Projection(n, k, warps=warps)
-    assert not projection.gemv.native_scale
+    expected_native = (n, k) not in FP8_NATIVE_SCALE_DEFERRED
+    assert projection.gemv.native_scale == expected_native
     assert projection.gemv_wide is not None
-    assert not projection.gemv_wide.native_scale
+    assert projection.gemv_wide.native_scale == expected_native
