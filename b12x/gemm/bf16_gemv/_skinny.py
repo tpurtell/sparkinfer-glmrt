@@ -522,17 +522,14 @@ class TmaBf16Projection:
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
-                 stream: cuda.CUstream, weight_scale: cute.Pointer = None):
+                 stream: cuda.CUstream):
         if cutlass.const_expr(self.row_tiled is not None):
             self.row_tiled(x, w, out, rows, stream)
         else:
             xt = cute.make_tensor(x, cute.make_layout((rows, self.k), stride=(self.k, 1)))
             wt = cute.make_tensor(w, cute.make_layout((self.n, self.k), stride=(self.k, 1)))
             ot = cute.make_tensor(out, cute.make_layout((rows, self.n), stride=(self.n, 1)))
-            if cutlass.const_expr(self.kernel.native_weight_scale):
-                self.kernel(xt, wt, ot, rows, stream, weight_scale)
-            else:
-                self.kernel(xt, wt, ot, rows, stream)
+            self.kernel(xt, wt, ot, rows, stream)
 
 
 class RowTiledBf16Projection:

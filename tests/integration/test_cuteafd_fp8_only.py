@@ -268,7 +268,11 @@ def test_native_dense_scale_f64(route, rows, scales):
                               scalars=(Scalar("rows"),), key=(route, scales, n, k))
     program.launch(*args, scalars=(rows,))
     torch.cuda.synchronize()
-    expected = x.double() @ (w.double() * grown.double()).t()
+    exact_weight = w.double() * grown.double()
+    if route == "expanded":
+        # Interim master arithmetic on the optional expanded route (cuteafd#2068).
+        exact_weight = exact_weight.float().bfloat16().double()
+    expected = x.double() @ exact_weight.t()
     _assert_native_projection(out, expected)
     first = out.clone()
     program.launch(*args, scalars=(1,))

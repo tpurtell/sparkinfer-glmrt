@@ -764,7 +764,6 @@ class TmaFp8Gemm:
             t_crb = thr_mma.make_fragment_B(t_csb)
             acc = cute.make_rmem_tensor(thr_mma.partition_shape_C((self.tile_m, self.tile_n)), Float32)
             acc.fill(0.0)
-            block_acc = cute.make_rmem_tensor(thr_mma.partition_shape_C((self.tile_m, self.tile_n)), Float32)
             coordinates = thr_mma.partition_C(cute.make_identity_tensor((self.tile_m, self.tile_n)))
             copy_a = cute.make_tiled_copy_A(
                 cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.BFloat16),
@@ -777,8 +776,6 @@ class TmaFp8Gemm:
             w_base = shared_ptr_to_u32(storage.sW.data_ptr())
             b_base = shared_ptr_to_u32(storage.sB.data_ptr())
             for k_tile in cutlass.range(self.k_tiles, unroll_full=False):
-                if k_tile % Int32(2) == Int32(0):
-                    block_acc.fill(0.0)
                 load_pipeline.consumer_wait(consumer_state)
                 stage = w_base + Int32(consumer_state.index) * Int32(self.tile_n * self.tile_k)
                 for i in cutlass.range_constexpr(self.chunks):
@@ -796,15 +793,26 @@ class TmaFp8Gemm:
                 target_b = copy_b.retile(t_crb)
                 cute.copy(copy_a, shared_a[None, None, 0], target_a[None, None, 0])
                 cute.copy(copy_b, t_ssb[None, None, 0], target_b[None, None, 0])
-                for kk in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
-                    if kk < cute.size(shared_a.shape[2]) - 1:
-                        cute.copy(copy_a, shared_a[None, None, kk + 1], target_a[None, None, kk + 1])
-                        cute.copy(copy_b, t_ssb[None, None, kk + 1], target_b[None, None, kk + 1])
-                    cute.gemm(thr_mma, block_acc, t_cra[None, None, kk], t_crb[None, None, kk], block_acc)
-                if k_tile % Int32(2) == Int32(1):
-                    for index in cutlass.range_constexpr(cute.size(acc)):
-                        block_scale = self._scale(scale, n_tile, coordinates[index][1], k_tile)
-                        acc[index] = acc[index] + block_acc[index] * block_scale
+                for kk in cutlass.range_constexpr(1, cute.size(shared_a.shape[2])):
+                    cute.copy(copy_a, shared_a[None, None, kk], target_a[None, None, kk])
+                    cute.copy(copy_b, t_ssb[None, None, kk], target_b[None, None, kk])
+                a_words = cute.recast_tensor(t_cra, Uint32)
+                b_words = cute.recast_tensor(t_crb, Uint32)
+                block_scale = self._scale(scale, n_tile, Int32(0), k_tile)
+                for mi in cutlass.range_constexpr(cute.size(acc.shape[1])):
+                    for ni in cutlass.range_constexpr(cute.size(acc.shape[2])):
+                        part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                        part.fill(0.0)
+                        for kk in cutlass.range_constexpr(cute.size(shared_a.shape[2])):
+                            d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
+                                part[0], part[1], part[2], part[3],
+                                a_words[0, mi, kk], a_words[1, mi, kk], a_words[2, mi, kk], a_words[3, mi, kk],
+                                b_words[0, ni, kk], b_words[1, ni, kk])
+                            part[0], part[1], part[2], part[3] = d0, d1, d2, d3
+                        for v in cutlass.range_constexpr(4):
+                            if cutlass.const_expr(self.scales != "block"):
+                                block_scale = self._scale(scale, n_tile, coordinates[v, mi, ni][1], k_tile)
+                            acc[v, mi, ni] = acc[v, mi, ni] + part[v] * block_scale
                 cute.arch.fence_view_async_shared()
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
@@ -1134,8 +1142,6 @@ class MmaFp8Gemv:
         for si in cutlass.range_constexpr(s_rows):
             s_cur[si] = _ld_f32(s_row + Int64(si) * s_gi)
         for block in cutlass.range(self.blocks, unroll=1):
-            block_acc = cute.make_rmem_tensor(cute.make_layout((self.frags,), stride=(1,)), Float32)
-            block_acc.fill(0.0)
             for si in cutlass.range_constexpr(s_rows):
                 s_nxt[si] = s_cur[si]
             if block + 1 < self.blocks:
@@ -1175,21 +1181,20 @@ class MmaFp8Gemv:
                                 xa[12 + i] = hi[i]
                         for gi in cutlass.range_constexpr(self.groups):
                             f = 4 * (mt * self.groups + gi)
+                            part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                            part.fill(0.0)
                             for t in cutlass.range_constexpr(4):
                                 d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                                    block_acc[f], block_acc[f + 1], block_acc[f + 2], block_acc[f + 3],
+                                    part[0], part[1], part[2], part[3],
                                     xa[2 * t], xa[8 + 2 * t], xa[2 * t + 1], xa[8 + 2 * t + 1],
                                     bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
-                                block_acc[f] = d0
-                                block_acc[f + 1] = d1
-                                block_acc[f + 2] = d2
-                                block_acc[f + 3] = d3
-            for i in cutlass.range_constexpr(self.frags):
-                block_scale = s_cur[(i // 4) % self.groups if self.row_scales else 0]
-                if const_expr(self.row_scales):
-                    # MMA C columns live at 2*j + parity, not weight-loading row g.
-                    block_scale = cute.arch.shuffle_sync(block_scale, Int32(4) * (Int32(2) * j + Int32(i % 2)))
-                acc[i] = acc[i] + block_acc[i] * block_scale
+                                part[0], part[1], part[2], part[3] = d0, d1, d2, d3
+                            for v in cutlass.range_constexpr(4):
+                                block_scale = s_cur[gi if self.row_scales else 0]
+                                if const_expr(self.row_scales):
+                                    block_scale = cute.arch.shuffle_sync(block_scale,
+                                        Int32(4) * (Int32(2) * j + Int32(v % 2)))
+                                acc[f + v] = acc[f + v] + part[v] * block_scale
             for i in cutlass.range_constexpr(per_block):
                 cur[i] = nxt[i]
             for si in cutlass.range_constexpr(s_rows):

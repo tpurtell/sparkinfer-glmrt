@@ -364,39 +364,38 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
                 c_buf[gi * 4 + 2] = w2
                 c_buf[gi * 4 + 3] = w3
         for mt in cutlass.range_constexpr(self.m_tiles):
-            for t in cutlass.range_constexpr(2):
-                for gi in cutlass.range_constexpr(self.groups):
-                    f = 4 * (mt * self.groups + gi)
+            for gi in cutlass.range_constexpr(self.groups):
+                f = 4 * (mt * self.groups + gi)
+                part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                part.fill(0.0)
+                for t in cutlass.range_constexpr(2):
                     d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                        part[0], part[1], part[2], part[3],
                         xa_a[2 * t], xa_a[4 + 2 * t], xa_a[2 * t + 1], xa_a[4 + 2 * t + 1],
                         bw[8 * gi + 2 * t], bw[8 * gi + 2 * t + 1])
-                    acc[f] = d0
-                    acc[f + 1] = d1
-                    acc[f + 2] = d2
-                    acc[f + 3] = d3
-            if const_expr(mt + 1 < self.m_tiles):
-                nlo0, nlo1, nlo2, nlo3 = _ld_cached_v4_u32off0(x_k_ptr, d_lo[mt + 1])
-                nhi0, nhi1, nhi2, nhi3 = _ld_cached_v4_u32off0(x_k_ptr, d_hi[mt + 1])
-                xa_a[0], xa_a[1], xa_a[2], xa_a[3] = nlo0, nlo1, nlo2, nlo3
-                xa_a[4], xa_a[5], xa_a[6], xa_a[7] = nhi0, nhi1, nhi2, nhi3
-            for t in cutlass.range_constexpr(2):
-                t_idx = t + 2
-                for gi in cutlass.range_constexpr(self.groups):
-                    f = 4 * (mt * self.groups + gi)
+                    part[0], part[1], part[2], part[3] = d0, d1, d2, d3
+                for t in cutlass.range_constexpr(2):
+                    t_idx = t + 2
                     d0, d1, d2, d3 = bf16_mma_m16n8k16_f32(
-                        acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                        part[0], part[1], part[2], part[3],
                         xa_b[2 * t], xa_b[4 + 2 * t], xa_b[2 * t + 1], xa_b[4 + 2 * t + 1],
                         bw[8 * gi + 2 * t_idx], bw[8 * gi + 2 * t_idx + 1])
-                    acc[f] = d0
-                    acc[f + 1] = d1
-                    acc[f + 2] = d2
-                    acc[f + 3] = d3
+                    part[0], part[1], part[2], part[3] = d0, d1, d2, d3
+                for v in cutlass.range_constexpr(4):
+                    block_scale = s_buf[gi if self.row_scales else 0]
+                    if const_expr(self.row_scales):
+                        lane_j = Int32(cute.arch.thread_idx()[0]) % Int32(4)
+                        block_scale = cute.arch.shuffle_sync(block_scale,
+                            Int32(4) * (Int32(2) * lane_j + Int32(v % 2)))
+                    acc[f + v] = acc[f + v] + part[v] * block_scale
             if const_expr(mt + 1 < self.m_tiles):
-                nlo4, nlo5, nlo6, nlo7 = _ld_cached_v4_u32off16(x_k_ptr, d_lo[mt + 1])
-                nhi4, nhi5, nhi6, nhi7 = _ld_cached_v4_u32off16(x_k_ptr, d_hi[mt + 1])
-                xa_b[0], xa_b[1], xa_b[2], xa_b[3] = nlo4, nlo5, nlo6, nlo7
-                xa_b[4], xa_b[5], xa_b[6], xa_b[7] = nhi4, nhi5, nhi6, nhi7
+                lo = _ld_cached_v4_u32off0(x_k_ptr, d_lo[mt + 1])
+                hi = _ld_cached_v4_u32off0(x_k_ptr, d_hi[mt + 1])
+                lob = _ld_cached_v4_u32off16(x_k_ptr, d_lo[mt + 1])
+                hib = _ld_cached_v4_u32off16(x_k_ptr, d_hi[mt + 1])
+                for i in cutlass.range_constexpr(4):
+                    xa_a[i], xa_a[4 + i] = lo[i], hi[i]
+                    xa_b[i], xa_b[4 + i] = lob[i], hib[i]
 
     @cute.kernel
     def kernel(self, x: cute.Pointer, w: cute.Pointer, scale: cute.Pointer, out: cute.Pointer, rows: Int32):
@@ -454,27 +453,20 @@ class NcMmaFp8Gemv(MmaFp8Gemv):
         self._load_chunk_v4(c0, w_row, Int64(0))
         self._load_chunk_v4(c1, w_row, Int64(64))
         self._load_scale_se(s0, s_row, Int64(0), s_gi, s_kb)
-        block_acc = cute.make_rmem_tensor(cute.make_layout((self.frags,), stride=(1,)), Float32)
         for blk in cutlass.range(self.blocks, unroll=1):
             b = Int64(blk)
-            block_acc.fill(0.0)
             if blk + 1 < self.blocks:
-                self._consume_chunk(block_acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
                                     b * Int64(128), (b + Int64(1)) * Int64(128),
                                     b + Int64(1), True, False)
-                self._consume_chunk(block_acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
                                     b * Int64(128) + Int64(64),
                                     (b + Int64(1)) * Int64(128) + Int64(64), b + Int64(1), True, False)
             else:
-                self._consume_chunk(block_acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                self._consume_chunk(acc, c0, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
                                     b * Int64(128), Int64(0), Int64(0), False, False)
-                self._consume_chunk(block_acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
+                self._consume_chunk(acc, c1, s0, x_row0, d_lo, d_hi, w_row, s_row, s_gi, s_kb,
                                     b * Int64(128) + Int64(64), Int64(0), Int64(0), False, False)
-            for i in cutlass.range_constexpr(self.frags):
-                block_scale = s0[(i // 4) % self.groups if self.row_scales else 0]
-                if const_expr(self.row_scales):
-                    block_scale = cute.arch.shuffle_sync(block_scale, Int32(4) * (Int32(2) * j + Int32(i % 2)))
-                acc[i] = acc[i] + block_acc[i] * block_scale
             if blk + 1 < self.blocks:
                 self._load_scale_se(s0, s_row, b + Int64(1), s_gi, s_kb)
 

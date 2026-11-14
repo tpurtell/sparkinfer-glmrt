@@ -108,7 +108,7 @@ class Bf16PrefillKernel:
                  compensated: bool = True, warp_layout: tuple[int, int] | None = None,
                  tile_m: int | None = None, tile_k: int | None = None,
                  mbar_last: bool = False, cross_stage_pipe: bool = False,
-                 k_unroll: int = 1, native_weight_scale: bool = False):
+                 k_unroll: int = 1):
         """Defaults keep the original 64x64x64, two-stage, compensated kernel.
 
         ``compensated=False`` accumulates directly in the tensor-core FP32
@@ -142,10 +142,6 @@ class Bf16PrefillKernel:
         self.mbar_last = bool(mbar_last)
         self.cross_stage_pipe = bool(cross_stage_pipe) and not self.compensated
         self.k_unroll = max(1, int(k_unroll))
-        self.native_weight_scale = bool(native_weight_scale)
-        if self.native_weight_scale and (self.compensated or self.cross_stage_pipe
-                                         or self.tile_k not in (64, 128) or int(k) % 128):
-            raise ValueError("native weight scales need uncompensated K128 blocks without cross-stage pipelining")
         self.n, self.k = int(n), int(k)
         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k or self.tile_k % 16:
             raise ValueError("BF16 prefill needs positive N and a K divisible by its K tile")
@@ -244,7 +240,6 @@ class Bf16PrefillKernel:
         output: cute.Tensor,
         num_tokens: Int32,
         stream: cuda.CUstream,
-        weight_scale: cute.Pointer = None,
     ):
         if const_expr(source.element_type != cutlass.BFloat16):
             raise TypeError("source must be BFloat16")
@@ -286,7 +281,6 @@ class Bf16PrefillKernel:
             tiled_mma,
             SharedStorage,
             num_tokens,
-            weight_scale,
         ).launch(
             grid=(grid_m, self.n_tiles, 1),
             block=[self.num_threads, 1, 1],
@@ -307,7 +301,6 @@ class Bf16PrefillKernel:
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
         num_tokens: Int32,
-        weight_scale: cute.Pointer = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         m_tile, n_tile, _ = cute.arch.block_idx()
@@ -377,9 +370,6 @@ class Bf16PrefillKernel:
             acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
             acc = cute.make_rmem_tensor(acc_shape, Float32)
             acc.fill(0.0)
-            if const_expr(self.native_weight_scale):
-                native_acc = cute.make_rmem_tensor(acc_shape, Float32)
-                native_coordinates = thr_mma.partition_C(cute.make_identity_tensor((self.tile_m, self.tile_n)))
             if const_expr(not self.cross_stage_pipe):
                 correction = cute.make_rmem_tensor(acc_shape, Float32)
                 correction.fill(0.0)
@@ -472,24 +462,7 @@ class Bf16PrefillKernel:
             else:
                 for _k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
                     load_pipeline.consumer_wait(consumer_state)
-                    if const_expr(self.native_weight_scale):
-                        if _k_tile % Int32(128 // self.tile_k) == Int32(0):
-                            native_acc.fill(0.0)
-                        _warp_gemm_direct(
-                            thr_mma, native_acc, tCrA, tCrB,
-                            tSsA[None, None, None, consumer_state.index],
-                            tSsB[None, None, None, consumer_state.index],
-                            smem_thr_copy_A, smem_thr_copy_B,
-                        )
-                        if _k_tile % Int32(128 // self.tile_k) == Int32(128 // self.tile_k - 1):
-                            for index in cutlass.range_constexpr(cute.size(acc)):
-                                column = n_tile * Int32(self.tile_n) + native_coordinates[index][1]
-                                if column >= Int32(self.n):
-                                    column = Int32(self.n - 1)
-                                scale = weight_scale[Int64(_k_tile // Int32(128 // self.tile_k))
-                                                     * Int64(self.n) + Int64(column)]
-                                acc[index] = acc[index] + native_acc[index] * scale
-                    elif const_expr(self.compensated):
+                    if const_expr(self.compensated):
                         _warp_gemm(
                             thr_mma,
                             acc,
