@@ -315,15 +315,17 @@ def _bf16_ulps(a: torch.Tensor, b: torch.Tensor) -> dict:
     d = (a - b).abs()
     ulps = d / ulp
     large = a.abs() >= LARGE
-    at = int(d.argmax())
+    at, ua = int(d.argmax()), int(ulps.argmax())
     return {"ulp": float(ulps.max()), "ulp_large": float(ulps[large].max()) if large.any() else 0.0,
-            "abs": float(d.flatten()[at]), "abs_at": float(a.flatten()[at].abs())}
+            "abs": float(d.flatten()[at]), "abs_at": float(a.flatten()[at].abs()),
+            "ulp_pair": (float(a.flatten()[ua]), float(b.flatten()[ua]))}
 
 
 def _worst(acc: dict, m: dict) -> dict:
     if not acc:
         return dict(m)
-    out = {"ulp": max(acc["ulp"], m["ulp"]), "ulp_large": max(acc["ulp_large"], m["ulp_large"])}
+    out = {"ulp": max(acc["ulp"], m["ulp"]), "ulp_large": max(acc["ulp_large"], m["ulp_large"]),
+           "ulp_pair": m["ulp_pair"] if m["ulp"] > acc["ulp"] else acc["ulp_pair"]}
     out.update({"abs": m["abs"], "abs_at": m["abs_at"]} if m["abs"] > acc["abs"] else {"abs": acc["abs"], "abs_at": acc["abs_at"]})
     return out
 
@@ -489,7 +491,7 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
         oracle_act[torch.tensor(sel, device=dev)] = act
     report["fc1"] = fc1
     assert fc1["ulp"] <= 1.0 + 1e-6 and fc1["ulp_large"] <= 1.0 + 1e-6, \
-        f"FC1 exchange vs F64 FC1: {fc1['ulp']:.3f} ulp (large elements {fc1['ulp_large']:.3f}), max|d| {fc1['abs']:.3e} at |v| {fc1['abs_at']:.3e}"
+        f"FC1 exchange vs F64 FC1: {fc1['ulp']:.3f} ulp (large elements {fc1['ulp_large']:.3f}), max|d| {fc1['abs']:.3e} at |v| {fc1['abs_at']:.3e}; worst-ulp element kernel {fc1['ulp_pair'][0]:.9e} oracle {fc1['ulp_pair'][1]:.9e}"
     # (2) quantizers: amax, scale bytes and packed codes exact on every non-tie block; tie blocks (the two
     # candidates' F32 errors within TIE_REL) are counted and their mismatches reported and asserted zero too:
     # with the kernel and the oracle both on the vendor's F32 arithmetic an exact tie resolves the same way.
@@ -528,7 +530,7 @@ def _run(g, real, capacity, rows, seed=1, hot=0, scale=1.0, gamma_spread=1.0, bi
         o3.index_add_(0, sel // k, yo3)
     report["down"] = down
     assert down["ulp"] <= 1.0 + 1e-6 and down["ulp_large"] <= 1.0 + 1e-6, \
-        f"down vs F64 down: {down['ulp']:.3f} ulp (large elements {down['ulp_large']:.3f}), max|d| {down['abs']:.3e} at |v| {down['abs_at']:.3e}"
+        f"down vs F64 down: {down['ulp']:.3f} ulp (large elements {down['ulp_large']:.3f}), max|d| {down['abs']:.3e} at |v| {down['abs_at']:.3e}; worst-ulp element kernel {down['ulp_pair'][0]:.9e} oracle {down['ulp_pair'][1]:.9e}"
     ysum = torch.zeros(rows, h, dtype=torch.float32, device=dev).index_add_(0, torch.arange(pairs, device=dev) // k, y_k)
     assert torch.equal(t["out"], ysum.bfloat16()), "combine differs from the F32 slot sum of the kernel's own y rows"
     # (3) gate: kernel exchange -> oracle act-quant -> F64 down -> sum vs the route's output.
