@@ -344,7 +344,30 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
     cute_output = cutlass.BFloat16 if output == 'bf16' else cutlass.Float32
     groups = fp8_gemv_tuning(n, k, warps=warps)[1]
     cta_tiles = None
-    if route in ("base", "nc", "selected"):
+    selected_op = None
+    subroute = 'wide' if rows > 16 else 'thin'
+    if route == 'production':
+        from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+        projection = Fp8Projection(n, k, warps=warps, row_scales=per_row, kmajor=kmajor,
+                                   out_dtype=cute_output, decode_rows=64)
+
+        class ProductionLaunch:
+            def key(self):
+                return projection.key()
+
+            @cutlass.cute.jit
+            def __call__(self, x, w, s, out, live_rows, stream):
+                projection(x, w, s, out, live_rows, cutlass.Int32(64), cutlass.Int64(0), stream)
+
+        op = ProductionLaunch()
+        if rows == 16 and projection.gemv_m16 is not None:
+            selected_op, subroute = projection.gemv_m16, 'm16_direct_widen'
+        elif rows == 64 and projection.gemv_m64 is not None:
+            selected_op, subroute = projection.gemv_m64, 'm64_special'
+        else:
+            selected_op = projection.gemv if rows <= 16 else projection.gemv_wide
+        groups, cta_tiles = selected_op.groups, selected_op.m_tiles
+    elif route in ("base", "nc", "selected"):
         if rows > 16:
             groups, cta_tiles = fp8_gemv_wide(n, k, warps=warps, groups=groups)
         cls = (fp8_gemv_wide_kernel(n, k, warps=warps, row_scales=per_row, kmajor=kmajor)
@@ -393,7 +416,9 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
     assert torch.equal(first, out[:1]), "live row count changed the prefix"
     return dict(case=spec, route=route, rows=rows, per_row_scales=per_row,
                 warps=warps, groups=groups, cta_tiles=cta_tiles,
-                kernel=type(op).__name__, native_scale=getattr(op, 'native_scale', None),
+                kernel=type(selected_op if selected_op is not None else op).__name__,
+                native_scale=getattr(selected_op if selected_op is not None else op, 'native_scale', None),
+                subroute=subroute,
                 kmajor=kmajor, output_dtype=output,
                 median_read_us=median, min_read_us=best, us_per_row=median / rows,
                 max_sample_row_rel_l2=float(relative.max()), digest=digest, prefix_exact=True)
@@ -437,7 +462,7 @@ def main():
     parser.add_argument("--rows2", type=int, default=16,
                         help="second batch width timed on the same program (0 disables)")
     parser.add_argument("--tag", default="")
-    parser.add_argument("--native-route", choices=("base", "nc", "selected", "tma", "expanded"),
+    parser.add_argument("--native-route", choices=("base", "nc", "selected", "production", "tma", "expanded"),
                         help="time one dense route, with F64 sample and prefix checks")
     parser.add_argument("--source-root", type=Path,
                         help="import b12x from this read-only baseline/candidate source")
@@ -446,7 +471,7 @@ def main():
         parser.error('--kmajor requires --row-scales')
     if args.warps is not None and args.warps not in (2, 4, 8):
         parser.error('--warps must be 2, 4 or 8')
-    if (args.warps is not None or args.kmajor or args.out_dtype != 'bf16') and args.native_route not in ('base', 'nc', 'selected'):
+    if (args.warps is not None or args.kmajor or args.out_dtype != 'bf16') and args.native_route not in ('base', 'nc', 'selected', 'production'):
         parser.error('layout/warp/output overrides require --native-route base, nc or selected')
     widths = None
     if args.rows_list:
@@ -456,7 +481,7 @@ def main():
             parser.error('--rows-list requires comma-separated integers')
         if not widths or min(widths) < 1 or max(widths) > 64:
             parser.error('--rows-list widths must be in 1..64')
-        if args.native_route not in ('base', 'nc', 'selected'):
+        if args.native_route not in ('base', 'nc', 'selected', 'production'):
             parser.error('--rows-list requires --native-route base, nc or selected')
     if args.source_root:
         sys.path.insert(0, str(args.source_root.resolve()))
