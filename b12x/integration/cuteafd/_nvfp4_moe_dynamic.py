@@ -584,37 +584,4 @@ class ChunkActDyn:
                                             Int64(a_s.toint()) + i * Int64(groups) + Int64(grp))
 
 
-
-
-class GroupedGamma:
-    """``gamma[pair_pos[p]] = weights[p]`` for every (row, slot) pair ``p``: the route
-    weight of each grouped row, read by the gate/up epilogue before the FC2 quantization."""
-
-    threads = 256
-
-    def __init__(self, *, top_k: int):
-        self.top_k = int(top_k)
-
-    def key(self) -> tuple:
-        return ("grouped_gamma", self.top_k)
-
-    @cute.jit
-    def __call__(self, pair_pos: cute.Pointer, weights: cute.Pointer, gamma: cute.Pointer, rows: Int32,
-                 stream: cuda.CUstream):
-        pairs = rows * Int32(self.top_k)
-        self.kernel(pair_pos, weights, gamma, pairs).launch(
-            grid=((pairs + Int32(self.threads - 1)) // Int32(self.threads), 1, 1), block=(self.threads, 1, 1),
-            stream=stream)
-
-    @cute.kernel
-    def kernel(self, pair_pos: cute.Pointer, weights: cute.Pointer, gamma: cute.Pointer, pairs: Int32):
-        p = Int32(cute.arch.block_idx()[0]) * Int32(self.threads) + Int32(cute.arch.thread_idx()[0])
-        if p < pairs:
-            position = _i32_at(Int64(pair_pos.toint()), p)
-            if position >= Int32(0):
-                src = cute.make_ptr(Float32, Int64(weights.toint()), cute.AddressSpace.gmem, assumed_align=4)
-                dst = cute.make_ptr(Float32, Int64(gamma.toint()), cute.AddressSpace.gmem, assumed_align=4)
-                dst[position] = Float32(src[p])
-
-
-__all__ += ["ChunkActDyn", "GroupedGamma"]
+__all__ += ["ChunkActDyn"]

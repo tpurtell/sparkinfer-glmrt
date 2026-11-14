@@ -738,6 +738,9 @@ PREFILL_FAMILIES = {
     "dsv4f": (4096, 256, 6, (4, 5), "silu"),
     "dsv4p": (7168, 384, 6, (2, 3), "silu"),
     "v41": (5120, 384, 6, (3, 4), "silu"),
+    "muse": (4096, 256, 8, (4, 5), "silu"),
+    "step5": (4096, 352, 8, (4, 5), "silu_post_clamp"),
+    "ml4": (6144, 128, 4, (4, 5), "silu"),
 }
 
 PREFILL_SWIGLU_LIMITS = {
@@ -748,6 +751,9 @@ PREFILL_SWIGLU_LIMITS = {
     "dsv4f": 10.0,
     "dsv4p": 10.0,
     "v41": 10.0,
+    "muse": None,
+    "step5": 7.0,
+    "ml4": None,
 }
 
 PREFILL_TIER_COUNTS = {
@@ -758,6 +764,9 @@ PREFILL_TIER_COUNTS = {
     "dsv4f": (192, 64),
     "dsv4p": (288, 96),
     "v41": (288, 96),
+    "muse": (256, 0),
+    "step5": (352, 0),
+    "ml4": (128, 0),
 }
 
 
@@ -1223,6 +1232,27 @@ COORDINATOR_FAMILIES = {
                    profiles={"rtx-tp1": 3072, "rtx-tp2": 1536,
                             "spark-tp4-width768": 768, "spark-tp6-width512": 512},
                    capacities=GLM_CAPACITIES, routes=None),
+    # Launchable ordinary widths only; compact companions and dense K6 are not screened.
+    "muse": dict(hidden=4096, experts=256, top_k=8, bits=(4, 5), activation="silu",
+                 swiglu_limit=None, model="meta-models/Muse-Spark-Open-816B-A42B",
+                 profiles={"rtx-tp1": 4096, "rtx-tp2": 2048,
+                           "spark-tp4-width1024": 1024, "spark-tp5-width896": 896,
+                           "spark-tp5-width768": 768, "spark-tp6-width640": 640,
+                           "spark-tp7-width512": 512},
+                 capacities=GLM_CAPACITIES, routes=None),
+    "step5": dict(hidden=4096, experts=352, top_k=8, bits=(4, 6), activation="silu_post_clamp",
+                  swiglu_limit=7.0, model="stepfun-ai/Step-5-Preview",
+                  profiles={"rtx-tp1": 1536, "rtx-tp2": 768,
+                            "spark-tp3-width512": 512, "spark-tp4-width384": 384,
+                            "spark-tp5-width256": 256},
+                  capacities=GLM_CAPACITIES, routes=None),
+    "ml4": dict(hidden=6144, experts=128, top_k=4, bits=(4, 5), activation="silu",
+                swiglu_limit=None, model="mistralai/Mistral-Large-4-1T-A52B",
+                profiles={"rtx-tp1": 6144, "rtx-tp2": 3072,
+                          "spark-tp5-width1280": 1280, "spark-tp5-width1152": 1152,
+                          "spark-tp6-width1024": 1024, "spark-tp7-width896": 896,
+                          "spark-tp7-width768": 768},
+                capacities=GLM_CAPACITIES, routes=None),
 }
 # Shipped cooperative coordinator policy (`package_exl3_aot.py`): the route
 # block and rotation a family's exports actually use, so `served` arms and the
@@ -1236,6 +1266,9 @@ SERVED_ROUTE_BLOCKS = {
     "v41": lambda capacity: 8,
     "dsv4p": lambda capacity: 8 if capacity <= 256 else 64,
     "kimik3": lambda capacity: 64 if capacity == 1024 else 8,
+    "muse": lambda capacity: 8,
+    "step5": lambda capacity: 8,
+    "ml4": lambda capacity: 8,
 }
 SERVED_TOKEN_ROTATION = {
     "glm": lambda capacity: capacity > 256,
@@ -1244,6 +1277,9 @@ SERVED_TOKEN_ROTATION = {
     "v41": lambda capacity: False,
     "dsv4p": lambda capacity: capacity > 256,
     "kimik3": lambda capacity: capacity == 1024,
+    "muse": lambda capacity: False,
+    "step5": lambda capacity: False,
+    "ml4": lambda capacity: False,
 }
 
 
@@ -1351,10 +1387,63 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
         ws_dynamic_tiles=bool(arm.get("dynamic", False)), **extra)
 
 
+def muse_route_waves(path, layer=None):
+    """Adapt checksum-verified golden route dumps to the existing histogram replay."""
+    import struct
+    from collections import Counter
+
+    root = Path(path)
+    indices = sorted(root.glob("layer*/index.json")) if root.is_dir() else [root]
+    waves = []
+    for index in indices:
+        data = json.loads(index.read_text())
+        if (data.get("schema") != "cuteafd.muse.routes/1" or data.get("experts") != 256
+                or data.get("top_k") != 8 or data.get("ids_dtype") != "<i2"
+                or data.get("weights_dtype") != "<f4"):
+            raise ValueError("expected cuteafd.muse.routes/1 with E256/top8 and little-endian ids/weights")
+        if layer is not None and data.get("layer") != layer:
+            continue
+        files = data.get("files", {})
+        for name in sorted(files):
+            if not name.endswith(".ids") or not re.fullmatch(r"[A-Za-z0-9_]+\.ids", name):
+                continue
+            payloads = []
+            for key in (name, name[:-4] + ".weights"):
+                payload = (index.parent / (key + ".bin")).read_bytes()
+                if hashlib.sha256(payload).hexdigest() != files.get(key):
+                    raise ValueError(f"Muse route checksum mismatch: {index.parent / key}")
+                payloads.append(payload)
+            ids, weights = payloads
+            if not ids or len(ids) % 16 or len(weights) != len(ids) * 2:
+                raise ValueError("Muse route payload size does not match top8 ids/weights")
+            route_ids = [v[0] for v in struct.iter_unpack("<h", ids)]
+            if any(len(set(route_ids[i:i + 8])) != 8 for i in range(0, len(route_ids), 8)):
+                raise ValueError("Muse route row must contain eight distinct experts")
+            counts = Counter(route_ids)
+            if min(counts) < 0 or max(counts) >= 256:
+                raise ValueError("Muse route expert id outside E256")
+            waves.append(dict(layer=data["layer"], rows=len(ids) // 16,
+                              content=name[:-4], expert_rows=sorted(counts.items())))
+    if not waves:
+        raise ValueError("Muse route fixture has no selected waves")
+    return waves
+
+
+def coordinator_routes_sha256(path):
+    path = Path(path)
+    if not path.is_dir():
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    # The index contains every binary payload digest, verified by muse_route_waves.
+    return hashlib.sha256(b"".join(p.relative_to(path).as_posix().encode() + b"\0" + p.read_bytes()
+                                  for p in sorted(path.glob("layer*/index.json")))).hexdigest()
+
+
 def coordinator_route_waves(path, layer=None, family="glm"):
     spec = COORDINATOR_FAMILIES.get(family)
     if spec is None or path is None:
         raise ValueError(f"no realistic route fixture for coordinator family {family!r}")
+    if family == "muse":
+        return muse_route_waves(path, layer)
     data = json.loads(Path(path).read_text())
     if (data.get("schema") != 1 or data.get("model") != spec["model"]
             or data.get("family", family) != family
@@ -1496,6 +1585,247 @@ def _power_limit_w(props):
         return None
 
 
+def coordinator_output(workspace, family):
+    return workspace.partial_output if family == "muse" else workspace.output
+
+
+def muse_partial_binding(binding, workspace, program):
+    """Replace only the sum callback; keep the validated bound expert core intact."""
+    import cutlass
+    import cutlass.cute as cute
+    from b12x._lib.utils import make_ptr
+
+    launch = binding.launch
+    if not hasattr(workspace, "partial_output"):
+        workspace.partial_output = torch.empty((launch.size_m, launch.top_k, launch.hidden_size),
+                                               dtype=torch.bfloat16, device=binding.device)
+    row_map = torch.arange(launch.size_m, dtype=torch.int32, device=binding.device)
+    row_ptr = make_ptr(cutlass.Uint32, row_map.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+    out_ptr = make_ptr(cutlass.BFloat16, workspace.partial_output.data_ptr(),
+                       cute.AddressSpace.gmem, assumed_align=16)
+
+    def partial(fc2, _summed, _weights, ids, expert_map, svh, local_experts, experts, rows, stream):
+        # Retain the identity map throughout capture/replay, not just its raw pointer.
+        _ = row_map
+        program.compiled(fc2, svh, ids, expert_map, row_ptr, out_ptr,
+                         rows, rows, local_experts, experts, stream)
+
+    topk_sum = replace(launch.topk_sum, compiled=partial)
+    return replace(binding, launch=replace(launch, topk_sum=topk_sum))
+
+
+
+def decode_mcg_matrix(payload, rows, columns, bits):
+    """Independent native MCG tile decoder; no GEMM/materialization kernel oracle."""
+    import numpy as np
+    words = payload.detach().cpu().contiguous().numpy().view(np.uint32).reshape(
+        rows // 16, columns // 16, 8 * bits)
+    output = np.empty((rows // 16, columns // 16, 16, 16), dtype=np.float32)
+    for lane in range(32):
+        for weight in range(8):
+            end = (lane * 8 + weight + 257) * bits
+            first, last = (end - 16) // 32, (end - 1) // 32
+            merged = (words[..., first % (8 * bits)].astype(np.uint64) << np.uint64(32))
+            merged |= words[..., last % (8 * bits)].astype(np.uint64)
+            window = (merged >> np.uint64((last + 1) * 32 - end)) & np.uint64(65535)
+            value = ((window * np.uint64(0xCBAC1FED)) & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+            value = (value & np.uint32(0x8FFF8FFF)) ^ np.uint32(0x3B603B60)
+            low = (value & np.uint32(65535)).astype(np.uint16).view(np.float16)
+            high = (value >> np.uint32(16)).astype(np.uint16).view(np.float16)
+            decoded = (low + high).astype(np.float16).astype(np.float32)
+            row = (lane % 4) * 2 + (weight % 4 // 2) * 8 + weight % 2
+            column = 2 * (lane // 8 + (4 if weight >= 4 else 0)) + ((lane >> 2) & 1)
+            output[..., row, column] = decoded
+    return torch.from_numpy(output.transpose(0, 2, 1, 3).reshape(rows, columns).copy())
+
+
+def oracle_error(values, reference):
+    difference = values.double() - reference.double()
+    return dict(max_abs=float(difference.abs().max()), rms=float(difference.square().mean().sqrt()))
+
+
+def oracle_error_no_worse(error, control):
+    # No tolerance slack: fixtures are common to every arm, including identical-control repeats.
+    return all(error[key] <= control[key] for key in ("max_abs", "rms"))
+
+
+def coordinator_f32_oracle(layer, source, ids, weights, family):
+    """Full-F32 expert math from decoded checkpoint-layout weights, one expert at a time.
+
+    Native MCG labels are FP16 by definition; rotations, GEMMs, activation,
+    router weighting and ordered accumulation introduce no further low-precision rounding.
+    Decoded matrices are transient, so the oracle never retains an entire dense MoE.
+    """
+    tier0, tier1, mapping, descriptor, rotations = layer
+    tiers = (tier0, tier1)
+    hidden, experts = COORDINATOR_FAMILIES[family]["hidden"], COORDINATOR_FAMILIES[family]["experts"]
+    width = tier0.intermediate_size
+    stride = descriptor.numel() // 3
+    descriptors = descriptor.cpu().reshape(3, stride)
+    expert_map = mapping.cpu().tolist()
+    descriptor_bits = 9 if experts <= 512 else 10
+    cpu_ids = ids.cpu()
+    output_routes = torch.zeros((*ids.shape, hidden), dtype=torch.float32, device=source.device)
+    h = torch.ones((1, 1), dtype=torch.float32, device=source.device)
+    for _ in range(7):
+        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+    h /= 128 ** 0.5
+    def had(value):
+        return (value.reshape(-1, value.shape[-1] // 128, 128) @ h).reshape_as(value)
+    payloads = [(t.w13.cpu(), t.w2.cpu()) for t in tiers]
+    gate_counts = [int(((descriptors[0] >= 0) & (descriptors[0] >> descriptor_bits == tier)).sum())
+                   for tier in range(len(tiers))]
+    for expert in sorted(set(cpu_ids.flatten().tolist())):
+        combined = expert_map[expert]
+        token, slot = (cpu_ids == expert).nonzero(as_tuple=True)
+        token, slot = token.to(source.device), slot.to(source.device)
+        decoded = []
+        for projection in range(3):
+            code = int(descriptors[projection, combined])
+            if code < 0:
+                raise ValueError("oracle encountered an unowned expert")
+            tier, local = code >> descriptor_bits, code & ((1 << descriptor_bits) - 1)
+            t = tiers[tier]
+            k, n = (hidden, width) if projection < 2 else (width, hidden)
+            words = (k // 16) * (n // 16) * 8 * t.trellis_bits
+            if projection < 2:
+                offset = (local + (gate_counts[tier] if projection else 0)) * words
+                payload = payloads[tier][0][offset:offset + words]
+                scale = t.w13_global_scale[local]
+            else:
+                payload = payloads[tier][1][local * words:(local + 1) * words]
+                scale = t.w2_global_scale[local]
+            decoded.append(decode_mcg_matrix(payload, k, n, t.trellis_bits).to(source.device) * scale)
+        gate_svh, up_svh, down_suh = rotations.intermediate[combined].float().split(width)
+        x = source[token].float()
+        gate = had(had(x * rotations.gate_suh[combined].float()) @ decoded[0]) * gate_svh
+        up = had(had(x * rotations.up_suh[combined].float()) @ decoded[1]) * up_svh
+        activated = gate * torch.sigmoid(gate)
+        limit = COORDINATOR_FAMILIES[family]["swiglu_limit"]
+        if family == "step5":
+            activated = activated.clamp(max=limit)
+            up = up.clamp(-limit, limit)
+        activated *= up
+        down = had(had(activated * down_suh) @ decoded[2]) * rotations.down_svh[combined].float()
+        output_routes[token, slot] = down * weights[token, slot, None]
+    output = torch.zeros_like(output_routes[:, 0])
+    for slot in range(ids.shape[1]):
+        output += output_routes[:, slot]
+    return output
+
+
+def coordinator_oracle_case(args, specs, states, modules, run, decoded, ids, weights, layer,
+                            layer_index, capacity, bit_dtype):
+    """Qualify each arm independently; control equality is informational, not a gate."""
+    from benchmarks.benchmark_exlr8_a16 import k4_noise_summary
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    control = specs[0][0]
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        oracle = coordinator_f32_oracle(layer, decoded, ids, weights, args.prefill_family)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    full = {name: run(name).clone() for name, _ in specs}
+    same = lambda a, b: torch.equal(a.contiguous().view(bit_dtype), b.contiguous().view(bit_dtype))
+    errors = {name: oracle_error(value, oracle) for name, value in full.items()}
+    per_arm = {name: dict(control_bitwise=same(full[name], full[control]),
+                         oracle_error=errors[name], oracle_regions={},
+                         oracle_no_worse=oracle_error_no_worse(errors[name], errors[control]),
+                         finite=bool(torch.isfinite(full[name]).all()), deterministic=True,
+                         row_invariant=True, graph_eager=True) for name, _ in specs}
+    gates = ("finite", "deterministic", "row_invariant", "graph_eager", "oracle_no_worse")
+
+    def graph_for(name, rows, start=0):
+        workspace, bindings = states[name]
+        launch = bindings[layer_index].launch
+        slots = route_pack_capacity(rows * ids.shape[1], launch.moe_block_size,
+                                    COORDINATOR_FAMILIES[args.prefill_family]["experts"], topk=ids.shape[1])[1]
+        packed = workspace.packed_route_indices[:slots], workspace.block_expert_ids, workspace.packed_route_count
+        with patch.object(modules[name], "pack_topk_routes_by_expert", return_value=packed):
+            return _capture(lambda: run(name, rows, start), args.warmup)
+
+    def check_graph(name, graph, expected):
+        workspace, _ = states[name]
+        for _ in range(3):
+            for buffer in (workspace.output, workspace.fc1, workspace.activated):
+                buffer.fill_(float("nan"))
+            graph.replay()
+            per_arm[name]["graph_eager"] &= same(workspace.output[:expected.shape[0]], expected)
+
+    def check_region(rows, start=0):
+        reference = oracle[start:start + rows]
+        control_error = oracle_error(full[control][start:start + rows], reference)
+        for name, _ in specs:
+            check = per_arm[name]
+            eager = run(name, rows, start).clone()
+            check["finite"] &= bool(torch.isfinite(eager).all())
+            check["row_invariant"] &= same(eager, full[name][start:start + rows])
+            for _ in range(3):
+                check["deterministic"] &= same(run(name, rows, start), eager)
+            error = oracle_error(eager, reference)
+            check["oracle_regions"][f"{start}:{rows}"] = error
+            check["oracle_no_worse"] &= oracle_error_no_worse(error, control_error)
+            graph = graph_for(name, rows, start)
+            check_graph(name, graph, eager)
+            del graph
+
+    probe_rows = (range(1, capacity) if args.prefill_exhaustive else
+                  sorted({1, 32, 33, 63, 64, 65, capacity // 2, *args.live_rows} & set(range(1, capacity))))
+    # Every probed wave partition must match the arm's own capacity output,
+    # including non-prefix pieces and graph replay after dirty scratch.
+    check_region(capacity)
+    for rows in probe_rows:
+        check_region(rows)
+        check_region(capacity - rows, rows)
+    tails = decoded.clone(), ids.clone(), weights.clone()
+    for rows in probe_rows:
+        try:
+            decoded[rows:].fill_(float("nan"))
+            ids[rows:].fill_(COORDINATOR_FAMILIES[args.prefill_family]["experts"] - 1)
+            weights[rows:].fill_(float("nan"))
+            check_region(rows)
+        finally:
+            decoded[:], ids[:], weights[:] = tails
+    for check in per_arm.values():
+        check["qualified"] = all(check[key] for key in gates)
+
+    samples_by_rows = []
+    for live in [capacity, *sorted({r for r in args.live_rows if r < capacity}, reverse=True)]:
+        graphs = {}
+        for name, _ in specs:
+            # Repack after the invariant probes before freezing a timed graph.
+            eager = run(name, live).clone()
+            graphs[name] = graph_for(name, live)
+            check_graph(name, graphs[name], eager)
+            per_arm[name]["qualified"] = all(per_arm[name][key] for key in gates)
+        graphs[control + "_control"] = graphs[control]
+        samples = {name: [] for name in graphs}
+        if not args.correctness_only:
+            with kernel_resolution_guard("coordinator oracle-qualified graph timing"):
+                for repeat in range(args.rounds):
+                    order = list(graphs)
+                    order = order[repeat % len(order):] + order[:repeat % len(order)]
+                    if repeat % 2:
+                        order.reverse()
+                    for name in order:
+                        arm = control if name == control + "_control" else name
+                        if per_arm[arm]["qualified"]:
+                            samples[name].append(statistics.median(_times(graphs[name], args.replays)))
+        valid_samples = {name: values for name, values in samples.items() if values}
+        noise = (k4_noise_summary(valid_samples, control)
+                 if control in valid_samples and control + "_control" in valid_samples else None)
+        samples_by_rows.append(dict(rows=live, samples_us=samples, noise=noise))
+        del graphs
+    first = samples_by_rows[0]
+    return dict(arm_checks=per_arm, bitwise={name: check["control_bitwise"] for name, check in per_arm.items()},
+                oracle="decoded-MCG/full-F32/no-TF32", qualification_scope="per-arm; global qualified checks control only",
+                samples_us=first["samples_us"], noise=first["noise"], live_rows=samples_by_rows[1:],
+                median_us={name: statistics.median(v) for name, v in first["samples_us"].items() if v},
+                output_sha256={name: hashlib.sha256(value.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+                               for name, value in full.items()})
+
+
 def _run_coordinator_benchmark(args, device, props):
     from benchmarks.benchmark_exlr8_a16 import make_wire, real_route_ids, k4_noise_summary
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -1510,8 +1840,12 @@ def _run_coordinator_benchmark(args, device, props):
         raise ValueError(f"{args.prefill_family} {args.role} benchmark requires SM{target[0]}{target[1]}")
     torch.cuda.set_per_process_memory_fraction(min(0.9, (args.memory_cap_gib << 30) / props.total_memory), device)
     width = spec["profiles"][args.profile]
-    output_dtype = torch.bfloat16 if args.role == "spark" else torch.float32
-    bit_dtype = torch.int16 if args.role == "spark" else torch.int32
+    partial_program = None
+    if args.prefill_family == "muse":
+        from b12x.moe._shared.kernels.w4a16.expert_partial import compile_expert_partial_aot
+        partial_program = compile_expert_partial_aot(width=hidden, topk=topk, format="bf16")
+    output_dtype = torch.bfloat16 if args.role == "spark" or partial_program else torch.float32
+    bit_dtype = torch.int16 if output_dtype == torch.bfloat16 else torch.int32
     layers = [(_make_compact_prefill_layer(compact, width, args.seed + 2*i, device, mix,
                                            hidden=hidden, experts=experts, bits=args.bits or spec["bits"],
                                            activation=spec["activation"], family=args.prefill_family)
@@ -1535,6 +1869,8 @@ def _run_coordinator_benchmark(args, device, props):
             launch = arm_mix.compile_mixed_trellis(**options)
             workspace = arm_mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
             bindings = [arm_mix.bind_mixed_trellis(*layer, launch, **bind_counts) for layer in layers]
+            if partial_program is not None:
+                bindings = [muse_partial_binding(binding, workspace, partial_program) for binding in bindings]
             arm_mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
             states[name] = workspace, bindings
         generator = torch.Generator().manual_seed(args.seed + capacity)
@@ -1552,12 +1888,28 @@ def _run_coordinator_benchmark(args, device, props):
                 ids = (real_route_ids(capacity, wave, generator, experts, topk) if wave else
                        torch.rand((capacity, experts), generator=generator).topk(topk, dim=1).indices).to(device=device, dtype=torch.int32)
                 for layer in range(args.layers):
-                    def run(name, rows=None):
+                    def run(name, rows=None, start=0):
                         workspace, bindings = states[name]
                         source = wire if bindings[layer].launch.input_format == "e4m3_k32" else decoded
                         count = capacity if rows is None else rows
-                        return modules[name].run_bound_mixed_trellis(
-                            source[:count], weights[:count], ids[:count], bindings[layer], workspace)
+                        result = modules[name].run_bound_mixed_trellis(
+                            source[start:start + count], weights[start:start + count], ids[start:start + count], bindings[layer], workspace)
+                        return coordinator_output(workspace, args.prefill_family)[:count] if partial_program else result
+                    if args.prefill_family in ("step5", "ml4"):
+                        if compact or any(binding.launch.input_format == "e4m3_k32"
+                                          for _, bindings in states.values() for binding in bindings):
+                            raise ValueError("F32 oracle qualification requires ordinary BF16-input experts")
+                        case = coordinator_oracle_case(args, specs, states, modules, run, decoded, ids, weights,
+                                                       layers[layer], layer, capacity, bit_dtype)
+                        record = dict(capacity=capacity, distribution=distribution, weight_layer=layer,
+                                      wave_index=wave_index, route_layer=wave.get("layer") if wave else None,
+                                      content=wave.get("content") if wave else None, **case)
+                        records.append(record)
+                        if not case["arm_checks"][oracle_name]["qualified"]:
+                            failures.append(dict(capacity=capacity, distribution=distribution,
+                                                 wave_index=wave_index, control=case["arm_checks"][oracle_name]))
+                        print(json.dumps(record), flush=True)
+                        continue
                     expected = run(oracle_name).clone()
                     if expected.dtype != output_dtype or not bool(torch.isfinite(expected).all()) or not bool(expected.any()):
                         raise RuntimeError("oracle must use the role's sum dtype and be finite and nonzero")
@@ -1585,12 +1937,12 @@ def _run_coordinator_benchmark(args, device, props):
                             # Compact descriptors carry per-claim row state; a frozen
                             # graph must rebuild it every replay, not reuse a warm ring.
                             for _ in range(3 if compact else 1):
-                                workspace.output.fill_(float("nan"))
+                                coordinator_output(workspace, args.prefill_family).fill_(float("nan"))
                                 if compact:
                                     workspace.fc1.fill_(float("nan"))
                                     workspace.activated.fill_(float("nan"))
                                 graphs[name].replay()
-                                checks[name] &= torch.equal(workspace.output[:live].view(bit_dtype),
+                                checks[name] &= torch.equal(coordinator_output(workspace, args.prefill_family)[:live].view(bit_dtype),
                                                             reference.view(bit_dtype))
                         graphs[oracle_name + "_control"] = graphs[oracle_name]
                         samples = {name: [] for name in graphs}
@@ -1665,16 +2017,16 @@ def _run_coordinator_benchmark(args, device, props):
                                 for _ in range(3):
                                     workspace.fc1.fill_(float("nan"))
                                     workspace.activated.fill_(float("nan"))
-                                    workspace.output.fill_(float("nan"))
+                                    coordinator_output(workspace, args.prefill_family).fill_(float("nan"))
                                     graph.replay()
-                                short[name] = workspace.output[:rows].clone()
+                                short[name] = coordinator_output(workspace, args.prefill_family)[:rows].clone()
                             oracle = short[oracle_name].view(bit_dtype)
                             prefix = expected[:rows].float()
                             detail, coop_gap = {}, None
                             for name, _ in specs:
                                 values = short[name][:rows].float()
                                 gap = (values - prefix).abs()
-                                row_gap = gap.amax(dim=1) if gap.numel() else gap
+                                row_gap = gap.flatten(1).amax(dim=1) if gap.numel() else gap
                                 worst = int(row_gap.argmax()) if row_gap.numel() else 0
                                 entry = dict(
                                     finite=bool(torch.isfinite(values).all()),
@@ -1730,19 +2082,25 @@ def _run_coordinator_benchmark(args, device, props):
         source_sha256=PREFILL_SOURCE_SHA256,
         source_provenance=dict(snapshot="startup-before-torch-b12x", files=PREFILL_SOURCE_FILES,
                                scope="runner+b12x/**/*.py", digest="sha256(sorted(path:sha256\\n))"),
-        route_sha256=hashlib.sha256((args.routes or spec["routes"]).read_bytes()).hexdigest() if waves else None,
+        route_sha256=coordinator_routes_sha256(args.routes or spec["routes"]) if waves else None,
         output_dtype=str(output_dtype),
-        conditions="synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); common E4M3/UE8M0 K32-roundtripped BF16 input; "
+        conditions=("synthetic projection-major weights; Muse unweighted per-expert BF16 partials; common E4M3/UE8M0 K32-roundtripped BF16 input; "
+                    if partial_program else "synthetic projection-major weights; role-native sums (RTX FP32, Spark BF16); common E4M3/UE8M0 K32-roundtripped BF16 input; ")
+                   + (
                    "histogram replay preserves rescaled expert counts, not original token co-occurrence; "
-                   "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; "
-                   "median of interleaved round medians, microseconds per layer"
+                   + ("warm CUDA graphs, core+expert-partial epilogue only, routing and wire preparation excluded; "
+                      if partial_program else "warm CUDA graphs, core+top-k sum only, routing and wire preparation excluded; ")
+                   + "median of interleaved round medians, microseconds per layer")
                    + ("; compact tiers use planner-replayed rotated H128 ownership and poisoned graph replays"
-                      if compact else ""),
-        exact=not failures, failures=failures, rows=records)
+                      if compact else "")
+                   + ("; per-arm deterministic, own-wave row-invariant, graph/eager identical, max-abs and RMS no worse than decoded-weight F32 oracle control; control-bitwise informational"
+                      if args.prefill_family in ("step5", "ml4") else ""),
+        exact=(not failures and all(all(row["bitwise"].values()) for row in records)),
+        qualified=not failures, failures=failures, rows=records)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     if failures:
-        raise RuntimeError(f"{len(failures)} coordinator cases differ bitwise; see {args.output}")
+        raise RuntimeError(f"{len(failures)} coordinator cases fail correctness; see {args.output}")
 
 
 def benchmark_parser():
@@ -1782,7 +2140,7 @@ def benchmark_parser():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--prefill-family", choices=(*PREFILL_FAMILIES, *COORDINATOR_FAMILIES))
-    parser.add_argument("--bits", type=int, nargs=2, choices=(2, 3, 4, 5),
+    parser.add_argument("--bits", type=int, nargs=2, choices=(2, 3, 4, 5, 6),
                         metavar=("LOW", "HIGH"), help="prefill tier pair; defaults to the family's measured pair")
     parser.add_argument("--role", choices=("spark", "coordinator"), default="spark")
     parser.add_argument("--profile", choices=COORDINATOR_PROFILES, default="rtx-tp2")
