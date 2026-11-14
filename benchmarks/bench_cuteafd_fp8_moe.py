@@ -537,6 +537,14 @@ def screen_route_ids(wave, experts, topk, seed):
     return real_route_ids(wave["rows"], wave, torch.Generator().manual_seed(seed), experts, topk).int()
 
 
+def tensor_payload_sha256(tensors):
+    """Hash the original ordered bytes without a model-sized concatenation."""
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        digest.update(memoryview(tensor.detach().contiguous().numpy()).cast("B"))
+    return digest.hexdigest()
+
+
 def unified_screen_ids(waves, rows, capacity, experts, topk, seed, device):
     """Keep fixture live rows intact while masking unused planned capacity."""
     if not 1 <= rows <= capacity:
@@ -1365,8 +1373,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
             weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
             scales[name] = torch.randint(121, 124, (*shape[:-1], shape[-1] // 16),
                                         dtype=torch.uint8, generator=generator)
-        weight_hash = hashlib.sha256(b"".join(t.numpy().tobytes()
-                                     for t in (*weights.values(), *scales.values()))).hexdigest()
+        weight_hash = tensor_payload_sha256((*weights.values(), *scales.values()))
         for rows in map(int, args.rows.split(",")):
             capacity = args.capacity if args.capacity is not None else rows
             torch.manual_seed(args.seed + capacity)

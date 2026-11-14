@@ -1089,6 +1089,16 @@ def test_shipped_decode_recipe_uses_device_capacity_policy(monkeypatch, capacity
     assert calls == [(5120, 384, 121, capacity, 128)]
 
 
+def test_tensor_payload_hash_matches_concatenation_for_noncontiguous_inputs():
+    import hashlib
+    tensors = [torch.arange(24, dtype=torch.uint8).reshape(4, 6).T,
+               torch.arange(16, dtype=torch.float32).reshape(4, 4),
+               torch.empty(0, dtype=torch.int32)]
+    expected = hashlib.sha256(b"".join(t.numpy().tobytes() for t in tensors)).hexdigest()
+    assert bench.tensor_payload_sha256(tensors) == expected
+    assert bench.tensor_payload_sha256([]) == hashlib.sha256(b"").hexdigest()
+
+
 def test_unified_random_routes_retain_capacity_seed_contract():
     torch.manual_seed(2129)
     expected = torch.rand(16, 8).topk(2, -1).indices.int()
