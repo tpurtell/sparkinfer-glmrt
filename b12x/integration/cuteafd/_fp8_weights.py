@@ -51,6 +51,7 @@ from b12x._lib.intrinsics import (bf16_mma_m16n8k16_f32, ld_shared_v2_u32, prefe
                                   shared_ptr_to_u32, st_shared_v4_u32)
 
 from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, _ld_cached, _ld_stream
+from ._fp8_native_consumer import native_k64
 
 __all__ = ["FP8_DECODE_ROWS", "FP8_GEMV_CONFIG", "FP8_GEMV_GROUPS_DEFAULT", "FP8_GEMV_ROWS", "FP8_GEMV_WIDE",
            "FP8_GEMV_WIDE_KERNEL",
@@ -509,6 +510,14 @@ FP8_GEMV_WIDE_KERNEL = {
 
 
 FP8_NATIVE_SCALE_DEFERRED = frozenset(FP8_GEMV_WIDE_KERNEL)
+
+# Astra native-consumer duel: exact exported contracts qualified on both SM12x
+# architectures. One arithmetic and consumer covers every decode width.
+FP8_PACKED_NATIVE_CONSUMERS = frozenset((
+    (6784, 4096, 4, True, False, "BFloat16"),
+    (7424, 4096, 4, True, False, "BFloat16"),
+    (8192, 2048, 4, False, False, "BFloat16"),
+))
 
 
 def fp8_gemv_wide_kernel(n: int, k: int, *, warps: int, row_scales: bool = False,
@@ -1007,9 +1016,16 @@ class MmaFp8Gemv:
         # 8-warp CTA otherwise needs 32 KiB for a fold that reuses one tile anyway).
         self.smem_frags = self.frags if self.m_tiles <= 2 else self.tile_frags
 
+    @property
+    def packed_native(self):
+        return self.native_scale and (self.n, self.k, self.warps, self.row_scales,
+            self.kmajor, str(self.out_dtype)) in FP8_PACKED_NATIVE_CONSUMERS
+
     def key(self) -> tuple:
         key = (self.n, self.k, self.warps, self.groups, self.total_m_tiles, self.m_tiles,
                str(self.out_dtype), self.row_scales, self.kmajor)
+        if self.packed_native:
+            key += ("native_k64_packed",)
         if self.load_hint != "stream" or self.prefetch_blocks:
             key += (self.load_hint, self.prefetch_blocks, self.prefetch_bytes)
         if self.direct_widen:
@@ -1151,16 +1167,17 @@ class MmaFp8Gemv:
                 self._prefetch_window(w_row, block, j)
             for chunk in cutlass.range_constexpr(2):
                 k_off = Int64(block) * Int64(128) + Int64(chunk * 64)
-                bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
-                for gi in cutlass.range_constexpr(self.groups):
-                    for t in cutlass.range_constexpr(4):
-                        if const_expr(self.native_scale):
-                            b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t])
-                        else:
-                            b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t],
-                                               s_cur[gi if self.row_scales else 0])
-                        bw[8 * gi + 2 * t] = b0
-                        bw[8 * gi + 2 * t + 1] = b1
+                if const_expr(not self.packed_native):
+                    bw = cute.make_rmem_tensor(cute.make_layout((8 * self.groups,), stride=(1,)), Uint32)
+                    for gi in cutlass.range_constexpr(self.groups):
+                        for t in cutlass.range_constexpr(4):
+                            if const_expr(self.native_scale):
+                                b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t])
+                            else:
+                                b0, b1 = self.widen(cur[(chunk * self.groups + gi) * 4 + t],
+                                                   s_cur[gi if self.row_scales else 0])
+                            bw[8 * gi + 2 * t] = b0
+                            bw[8 * gi + 2 * t + 1] = b1
                 for mt in cutlass.range_constexpr(self.m_tiles):
                     if Int32(mt) < live_tiles:
                         r_lo = m0 + Int32(16 * mt) + g
@@ -1184,7 +1201,22 @@ class MmaFp8Gemv:
                                 xa[12 + i] = hi[i]
                         for gi in cutlass.range_constexpr(self.groups):
                             f = 4 * (mt * self.groups + gi)
-                            if const_expr(self.native_scale):
+                            if const_expr(self.packed_native):
+                                s_even = s_cur[gi if self.row_scales else 0]
+                                s_odd = s_even
+                                if const_expr(self.row_scales):
+                                    s_even = cute.arch.shuffle_sync(s_even, Int32(8) * j)
+                                    s_odd = cute.arch.shuffle_sync(s_odd, Int32(8) * j + Int32(4))
+                                wi = (chunk * self.groups + gi) * 4
+                                d0, d1, d2, d3 = native_k64(
+                                    acc[f], acc[f + 1], acc[f + 2], acc[f + 3],
+                                    cur[wi], cur[wi + 1], cur[wi + 2], cur[wi + 3],
+                                    xa[0], xa[8], xa[1], xa[9],
+                                    xa[2], xa[10], xa[3], xa[11],
+                                    xa[4], xa[12], xa[5], xa[13],
+                                    xa[6], xa[14], xa[7], xa[15], s_even, s_odd)
+                                acc[f], acc[f + 1], acc[f + 2], acc[f + 3] = d0, d1, d2, d3
+                            elif const_expr(self.native_scale):
                                 part = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
                                 part.fill(0.0)
                                 for t in cutlass.range_constexpr(4):
