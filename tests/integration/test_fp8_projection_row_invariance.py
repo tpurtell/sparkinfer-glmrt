@@ -379,52 +379,225 @@ def test_fp8_projection_row_invariance(case, rows):
     )
 
 
-@pytest.mark.parametrize('variant', (
-    (5120, 17408, False, False), (16384, 1536, False, False),
-    (4096, 16384, False, False), (4096, 16384, True, False),
-    (4096, 16384, True, True)),
-    ids=('5120x17408-block', '16384x1536-block', '4096x16384-block',
-         '4096x16384-row', '4096x16384-kmajor'))
+# Exported decode contracts: (N, K, warps, row_scales, kmajor, output).
+# Sources are exporter group/stem names, not an external runtime manifest.
+_EXPORTED_DECODE_VARIANTS = (
+    # glmf/mla_producer_m64, glmf2/ffn_i1024_m64 (and shared stems)
+    (2048, 4096, 8, False, False, 'bf16'),
+    # glm2/ffn_i1024_m64
+    (2048, 6144, 8, False, False, 'bf16'),
+    # qwen4/attn_o_fp8_m64, qwen4/attn_o_w8_m64 (and shared stems)
+    (2560, 6144, 8, False, False, 'bf16'),
+    # glm/producer_m64, glm2/producer_m64
+    (2624, 6144, 8, False, False, 'bf16'),
+    # native-attention-fp8/n3072_k6144_m4096, native-attention-fp8/n3072_k6144_m64
+    (3072, 6144, 8, False, False, 'bf16'),
+    # glmf2/ffn_i1024_m64
+    (4096, 1024, 4, False, False, 'bf16'),
+    # glmf/ffn_i2048_m64
+    (4096, 2048, 2, False, False, 'bf16'),
+    # glm/index_producer_m64
+    (4096, 2048, 4, False, False, 'bf16'),
+    # glmf/ffn_i2048_m64
+    (4096, 4096, 8, False, False, 'bf16'),
+    # glmf2/kda_m64, mimo2/o_m64 (and shared stems)
+    (4096, 4096, 8, True, False, 'bf16'),
+    # glmf2/kda_w8_m64, glmf2/kda_w8_norm_m64
+    (4096, 4096, 8, True, True, 'bf16'),
+    # glmf2/kda_w8_f32_m64
+    (4096, 4096, 8, True, True, 'f32'),
+    # glm/ffn_i2048_m64, glmf2/ffn_i6144_m64 (and shared stems)
+    (4096, 6144, 8, False, False, 'bf16'),
+    # native-attention-fp8/n4096_k6144_m4096_f32, native-attention-fp8/n4096_k6144_m64_f32
+    (4096, 6144, 8, False, False, 'f32'),
+    # glmf2/o_m64
+    (4096, 8192, 8, False, False, 'bf16'),
+    # glmf/kda_m64, glmf/kda_s16_m64 (and shared stems)
+    (4096, 8192, 8, True, False, 'bf16'),
+    # glmf/kda_w8_m64, glmf/kda_w8_s16_m64 (and shared stems)
+    (4096, 8192, 8, True, True, 'bf16'),
+    # native-attention-fp8/n4096_k12288_m4096, native-attention-fp8/n4096_k12288_m64
+    (4096, 12288, 4, False, False, 'bf16'),
+    # glmf/ffn_i12288_m64
+    (4096, 12288, 8, False, False, 'bf16'),
+    # glmf/o_m64
+    (4096, 16384, 4, False, False, 'bf16'),
+    # mimo/ffn_m64, mimof/ffn_m64
+    (4096, 16384, 4, True, False, 'bf16'),
+    # qwen38/attn_o_fp8_m64, qwen38/gdn_fp8_m64
+    (5120, 6144, 8, False, False, 'bf16'),
+    # qwen38/ffn_fp8_m64
+    (5120, 17408, 4, False, False, 'bf16'),
+    # glm2/ffn_i1024_m64
+    (6144, 1024, 4, False, False, 'bf16'),
+    # glm/ffn_i2048_m64
+    (6144, 2048, 4, False, False, 'bf16'),
+    # native-attention-fp8/n6144_k3072_m4096, native-attention-fp8/n6144_k3072_m64
+    (6144, 3072, 4, False, False, 'bf16'),
+    # native-attention-fp8/n6144_k3072_m4096_f32, native-attention-fp8/n6144_k3072_m64_f32
+    (6144, 3072, 4, False, False, 'f32'),
+    # native-attention-fp8/n6144_k4096_m4096, native-attention-fp8/n6144_k4096_m64
+    (6144, 4096, 4, False, False, 'bf16'),
+    # native-attention-fp8/n6144_k4096_m4096_f32, native-attention-fp8/n6144_k4096_m64_f32
+    (6144, 4096, 4, False, False, 'f32'),
+    # glm2/ffn_i6144_m64, native-attention-fp8/n6144_k6144_m4096 (and shared stems)
+    (6144, 6144, 8, False, False, 'bf16'),
+    # glm2/o_m64, native-attention-fp8/n6144_k8192_m4096 (and shared stems)
+    (6144, 8192, 4, False, False, 'bf16'),
+    # native-attention-fp8/n6144_k8192_m4096_f32, native-attention-fp8/n6144_k8192_m64_f32
+    (6144, 8192, 4, False, False, 'f32'),
+    # mimop2/ffn_m64, mimop2/o_m64 (and shared stems)
+    (6144, 8192, 4, True, False, 'bf16'),
+    # glm/ffn_i12288_m64, native-attention-fp8/n6144_k12288_m4096 (and shared stems)
+    (6144, 12288, 4, False, False, 'bf16'),
+    # native-attention-fp8/n6144_k12288_m4096_f32, native-attention-fp8/n6144_k12288_m64_f32
+    (6144, 12288, 4, False, False, 'f32'),
+    # glm/o_m64, native-attention-fp8/n6144_k16384_m4096 (and shared stems)
+    (6144, 16384, 4, False, False, 'bf16'),
+    # mimop/ffn_m64, mimop/o_m64 (and shared stems)
+    (6144, 16384, 4, True, False, 'bf16'),
+    # native-attention-fp8/n6144_k24576_m4096, native-attention-fp8/n6144_k24576_m64
+    (6144, 24576, 4, False, False, 'bf16'),
+    # mimo2/full_producer_kvint8_m64, mimo2/full_producer_m64 (and shared stems)
+    (6784, 4096, 4, True, False, 'bf16'),
+    # native-attention-fp8/n7168_k6144_m4096, native-attention-fp8/n7168_k6144_m64
+    (7168, 6144, 8, False, False, 'bf16'),
+    # native-attention-fp8/n7168_k6144_m4096_f32, native-attention-fp8/n7168_k6144_m64_f32
+    (7168, 6144, 8, False, False, 'f32'),
+    # native-attention-fp8/n7168_k12288_m4096, native-attention-fp8/n7168_k12288_m64
+    (7168, 12288, 4, False, False, 'bf16'),
+    # mimo2/swa_producer_kvfp8_m64, mimo2/swa_producer_kvint8_m64 (and shared stems)
+    (7424, 4096, 4, True, False, 'bf16'),
+    # glmf2/mla_producer_m64
+    (8192, 1536, 4, False, False, 'bf16'),
+    # glm2/producer_m64, native-attention-fp8/n8192_k2048_m4096 (and shared stems)
+    (8192, 2048, 4, False, False, 'bf16'),
+    # native-attention-fp8/n8192_k4096_m4096, native-attention-fp8/n8192_k4096_m64
+    (8192, 4096, 4, False, False, 'bf16'),
+    # native-attention-fp8/n8192_k4096_m4096_f32, native-attention-fp8/n8192_k4096_m64_f32
+    (8192, 4096, 4, False, False, 'f32'),
+    # native-attention-fp8/n8192_k6144_m4096, native-attention-fp8/n8192_k6144_m64
+    (8192, 6144, 8, False, False, 'bf16'),
+    # native-attention-fp8/n8192_k8192_m4096, native-attention-fp8/n8192_k8192_m64
+    (8192, 8192, 4, False, False, 'bf16'),
+    # native-attention-fp8/n9216_k1536_m4096, native-attention-fp8/n9216_k1536_m64
+    (9216, 1536, 4, False, False, 'bf16'),
+    # glmf2/ffn_i6144_m64
+    (12288, 4096, 4, False, False, 'bf16'),
+    # glm2/ffn_i6144_m64, native-attention-fp8/n12288_k6144_m4096 (and shared stems)
+    (12288, 6144, 8, False, False, 'bf16'),
+    # glmf2/kda_m64
+    (12576, 4096, 4, True, False, 'bf16'),
+    # glmf2/kda_w8_f32_m64, glmf2/kda_w8_m64 (and shared stems)
+    (12576, 4096, 8, True, True, 'bf16'),
+    # mimo/full_producer_kvint8_m64, mimo/full_producer_m64 (and shared stems)
+    (13568, 4096, 2, True, False, 'bf16'),
+    # mimop2/full_producer_kvint8_m64, mimop2/full_producer_m64 (and shared stems)
+    (13824, 6144, 8, True, False, 'bf16'),
+    # qwen4/attn_producer_fp8_kv_fp8_m64, qwen4/attn_producer_fp8_m64 (and shared stems)
+    (13952, 2560, 4, False, False, 'bf16'),
+    # qwen38/attn_producer_fp8_kv_fp8_m64, qwen38/attn_producer_fp8_m64
+    (14336, 5120, 4, False, False, 'bf16'),
+    # mimo/swa_producer_kvfp8_m64, mimo/swa_producer_kvint8_m64 (and shared stems)
+    (14848, 4096, 2, True, False, 'bf16'),
+    # glmf/mla_producer_m64
+    (16384, 1536, 2, False, False, 'bf16'),
+    # glm/producer_m64, native-attention-fp8/n16384_k2048_m4096 (and shared stems)
+    (16384, 2048, 4, False, False, 'bf16'),
+    # mimo2/ffn_m64, mimof2/ffn_m64
+    (16384, 4096, 4, True, False, 'bf16'),
+    # qwen38/gdn_fp8_m64
+    (16384, 5120, 4, False, False, 'bf16'),
+    # mimop2/ffn_m64
+    (16384, 6144, 8, True, False, 'bf16'),
+    # qwen4/gdn_fp8_m64, qwen4/gdn_w8_m64
+    (16480, 2560, 4, False, False, 'bf16'),
+    # native-attention-fp8/n18432_k1536_m4096, native-attention-fp8/n18432_k1536_m64
+    (18432, 1536, 4, False, False, 'bf16'),
+    # glmf/ffn_i12288_m64
+    (24576, 4096, 8, False, False, 'bf16'),
+    # glm/ffn_i12288_m64, native-attention-fp8/n24576_k6144_m4096 (and shared stems)
+    (24576, 6144, 8, False, False, 'bf16'),
+    # glmf/kda_m64, glmf/kda_s16_m64
+    (24896, 4096, 8, True, False, 'bf16'),
+    # glmf/kda_w8_m64, glmf/kda_w8_s16_m64
+    (24896, 4096, 8, True, True, 'bf16'),
+    # mimop/full_producer_kvint8_m64, mimop/full_producer_m64 (and shared stems)
+    (27648, 6144, 8, True, False, 'bf16'),
+    # mimo/ffn_m64, mimof/ffn_m64
+    (32768, 4096, 8, True, False, 'bf16'),
+    # mimop/ffn_m64
+    (32768, 6144, 8, True, False, 'bf16'),
+    # qwen38/ffn_fp8_m64
+    (34816, 5120, 4, False, False, 'bf16'),
+    # mimo/head_fp8, mimof/head_fp8
+    (152576, 4096, 8, True, False, 'f32'),
+    # mimop/head_fp8
+    (152576, 6144, 4, True, False, 'f32'),
+    # glmf/head_block_fp8
+    (154880, 4096, 8, False, False, 'f32'),
+    # glmf/head_fp8
+    (154880, 4096, 8, True, False, 'f32'),
+    # qwen4/head_fp8
+    (248320, 2560, 4, True, False, 'f32'),
+    # Additional K-major target coverage retained from the original duel gate.
+    (4096, 16384, 4, True, True, 'bf16'),
+)
+
+
+@pytest.mark.parametrize('variant', _EXPORTED_DECODE_VARIANTS,
+    ids=[f'{n}x{k}-w{w}-{int(row)}-{int(km)}-{out}'
+         for n, k, w, row, km, out in _EXPORTED_DECODE_VARIANTS])
 def test_selected_wide_fp8_projection_row_offsets(variant):
     """Every distinct row must match its own thin launch at every live width."""
+    import cutlass
     import torch
     from b12x.integration.cuteafd._fp8_weights import (
-        Fp8Projection, fp8_gemv_shipped_warps)
+        Fp8Projection)
 
-    n, k, row_scales, kmajor = variant
-    case_id = f'selected_wide_{n}x{k}_{int(row_scales)}_{int(kmajor)}'
-    proj = Fp8Projection(n, k, warps=fp8_gemv_shipped_warps(n, k),
+    n, k, warps, row_scales, kmajor, output = variant
+    dtype = torch.bfloat16 if output == 'bf16' else torch.float32
+    cute_dtype = cutlass.BFloat16 if output == 'bf16' else cutlass.Float32
+    bits_dtype = torch.int16 if output == 'bf16' else torch.int32
+    sentinel = _SENTINEL if output == 'bf16' else 0x7FFFFFFF
+
+    def fresh(rows):
+        tensor = torch.empty((rows, n), dtype=dtype, device='cuda')
+        tensor.view(bits_dtype).fill_(sentinel)
+        return tensor
+    case_id = f'selected_wide_{n}x{k}_{warps}_{int(row_scales)}_{int(kmajor)}_{output}'
+    proj = Fp8Projection(n, k, warps=warps, out_dtype=cute_dtype,
                          row_scales=row_scales, kmajor=kmajor, decode_rows=64)
     _check_shape(proj, 'plain')
     assert proj.gemv_wide is not None
     assert proj.gemv.native_scale == proj.gemv_wide.native_scale
-    program = _compile(case_id, 'plain', n, k, proj)
+    program = _compile(case_id, 'plain', n, k, proj, out_dtype=dtype)
     seed = 20_057 + n + k
     scale_kind = 'kmajor' if kmajor else 'row' if row_scales else 'block'
     w8, scale, _ = _weights(n, k, scale_kind, seed, dequant=False)
     generator = torch.Generator(device='cuda').manual_seed(seed + 3)
     x = torch.randn(64, k, generator=generator, device='cuda').bfloat16()
-    reference = _fresh(64, n)
+    reference = fresh(64)
     for offset in range(64):
         _launch(program, 'plain', x[offset:offset + 1], w8, scale, None,
                 reference[offset:offset + 1], 1, 64)
     torch.cuda.synchronize()
     assert torch.isfinite(reference).all() and torch.count_nonzero(reference)
     for rows in _WIDTHS:
-        out = _fresh(rows + 1, n)
+        out = fresh(rows + 1)
         _launch(program, 'plain', x, w8, scale, None, out, rows, 64)
         torch.cuda.synchronize()
-        expected = reference[:rows].view(torch.int16)
-        assert torch.equal(out[:rows].view(torch.int16), expected), (variant, rows, 'row offsets')
-        assert (out[rows:].view(torch.int16) == _SENTINEL).all(), (variant, rows, 'tail')
+        expected = reference[:rows].view(bits_dtype)
+        assert torch.equal(out[:rows].view(bits_dtype), expected), (variant, rows, 'row offsets')
+        assert (out[rows:].view(bits_dtype) == sentinel).all(), (variant, rows, 'tail')
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             _launch(program, 'plain', x, w8, scale, None, out, rows, 64)
-        out.view(torch.int16).fill_(_SENTINEL)
+        out.view(bits_dtype).fill_(sentinel)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(out[:rows].view(torch.int16), expected), (variant, rows, 'graph replay')
-        assert (out[rows:].view(torch.int16) == _SENTINEL).all(), (variant, rows, 'graph tail')
+        assert torch.equal(out[:rows].view(bits_dtype), expected), (variant, rows, 'graph replay')
+        assert (out[rows:].view(bits_dtype) == sentinel).all(), (variant, rows, 'graph tail')
 
 
 @pytest.mark.parametrize('output', ('bf16', 'f32'))

@@ -344,8 +344,56 @@ def _production_subroute(projection, rows):
     return selected[0], getattr(projection, selected[0])
 
 
+def _launch_resources(run):
+    """Query actual captured launch functions, including dispatch and dynamic SMEM."""
+    import torch
+    from cuda.bindings import driver as cuda
+
+    def checked(result):
+        error, *values = result
+        if int(error):
+            raise RuntimeError(f'CUDA resource query failed: {error}')
+        return values[0] if len(values) == 1 else values
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        run()
+    handle = cuda.CUgraph(graph.raw_cuda_graph())
+    _, count = checked(cuda.cuGraphGetNodes(handle, 0))
+    nodes, _ = checked(cuda.cuGraphGetNodes(handle, count))
+    device = checked(cuda.cuCtxGetDevice())
+    device_attributes = cuda.CUdevice_attribute
+    limits = {name: int(checked(cuda.cuDeviceGetAttribute(getattr(device_attributes, enum), device)))
+              for name, enum in (
+                  ('shared_bytes_per_sm', 'CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR'),
+                  ('registers_per_sm', 'CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR'),
+                  ('threads_per_sm', 'CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR'),
+                  ('sms', 'CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT'))}
+    kernels = []
+    for node in nodes:
+        if checked(cuda.cuGraphNodeGetType(node)) != cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            continue
+        launch = checked(cuda.cuGraphKernelNodeGetParams(node))
+        function = launch.func
+        attributes = cuda.CUfunction_attribute
+        regs = int(checked(cuda.cuFuncGetAttribute(attributes.CU_FUNC_ATTRIBUTE_NUM_REGS, function)))
+        static = int(checked(cuda.cuFuncGetAttribute(attributes.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function)))
+        local = int(checked(cuda.cuFuncGetAttribute(attributes.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function)))
+        threads = int(launch.blockDimX * launch.blockDimY * launch.blockDimZ)
+        dynamic = int(launch.sharedMemBytes)
+        occupancy = int(checked(cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(function, threads, dynamic)))
+        kernels.append(dict(registers_per_thread=regs, static_shared_bytes=static,
+                            dynamic_shared_bytes=dynamic, local_bytes_per_thread=local,
+                            threads=threads, active_blocks_per_sm=occupancy,
+                            grid=[int(launch.gridDimX), int(launch.gridDimY), int(launch.gridDimZ)]))
+    assert kernels, 'captured launch contains no kernel nodes'
+    return dict(method='queried_cuda_graph_function', device_limits=limits, kernels=kernels)
+
+
 def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
-                     warps_override=None, kmajor=False, output='bf16'):
+                     warps_override=None, kmajor=False, output='bf16', resources=False):
     """One actual shipped route; cross-source interleaving belongs to the caller."""
     import cutlass
     import torch
@@ -440,18 +488,19 @@ def run_native_route(spec, rows, route, samples, seed, row_scales, shared=None,
     program.launch(*args, scalars=(1,))
     torch.cuda.synchronize()
     assert torch.equal(first, out[:1]), "live row count changed the prefix"
+    resource_info = _launch_resources(run) if resources else None
     return dict(case=spec, route=route, rows=rows, per_row_scales=per_row,
                 warps=warps, groups=groups, cta_tiles=cta_tiles,
                 kernel=type(selected_op if selected_op is not None else op).__name__,
                 native_scale=getattr(selected_op if selected_op is not None else op, 'native_scale', None),
-                subroute=subroute,
+                subroute=subroute, resources=resource_info,
                 kmajor=kmajor, output_dtype=output,
                 median_read_us=median, min_read_us=best, us_per_row=median / rows,
                 max_sample_row_rel_l2=float(relative.max()), digest=digest, prefix_exact=True)
 
 
 def run_native_widths(spec, widths, route, samples, seed, row_scales,
-                      warps_override=None, kmajor=False, output='bf16'):
+                      warps_override=None, kmajor=False, output='bf16', resources=False):
     """Reuse weights, inputs and the two capacity programs across live widths."""
     import torch
     n, k = map(int, spec.split('x'))
@@ -467,7 +516,7 @@ def run_native_widths(spec, widths, route, samples, seed, row_scales,
                                     device='cuda', dtype=torch.uint8), programs={})
     for rows in widths:
         yield run_native_route(spec, rows, route, samples, seed, row_scales, shared,
-                               warps_override, kmajor, output)
+                               warps_override, kmajor, output, resources)
 
 
 def main():
@@ -478,6 +527,7 @@ def main():
     parser.add_argument('--warps', type=int, help='exported K-partition override (native routes only)')
     parser.add_argument('--kmajor', action='store_true', help='per-row scale grid is K-block major')
     parser.add_argument('--out-dtype', choices=('bf16', 'f32'), default='bf16')
+    parser.add_argument('--resources', action='store_true', help='query actual graph kernel resources and active CTAs/SM')
     parser.add_argument("--variants", default="groups",
                         choices=("groups", "groups_wide", "hints", "depth", "combo", "prod", "gem", "wide"))
     parser.add_argument("--flush", default="zero", choices=("zero", "read"))
@@ -493,12 +543,14 @@ def main():
     parser.add_argument("--source-root", type=Path,
                         help="import b12x from this read-only baseline/candidate source")
     args = parser.parse_args()
+    if args.resources and args.native_route is None:
+        parser.error('--resources requires --native-route')
     if args.kmajor and not args.row_scales:
         parser.error('--kmajor requires --row-scales')
     if args.warps is not None and args.warps not in (2, 4, 8):
         parser.error('--warps must be 2, 4 or 8')
     if (args.warps is not None or args.kmajor or args.out_dtype != 'bf16') and args.native_route not in ('base', 'nc', 'selected', 'production'):
-        parser.error('layout/warp/output overrides require --native-route base, nc or selected')
+        parser.error('layout/warp/output overrides require --native-route base, nc, selected or production')
     widths = None
     if args.rows_list:
         try:
@@ -522,10 +574,10 @@ def main():
     for spec in specs:
         if args.native_route:
             records = (run_native_widths(spec, widths, args.native_route, args.samples, args.seed,
-                                         args.row_scales, args.warps, args.kmajor, args.out_dtype) if widths else
+                                         args.row_scales, args.warps, args.kmajor, args.out_dtype, args.resources) if widths else
                        (run_native_route(spec, args.rows, args.native_route, args.samples, args.seed,
                                          args.row_scales, warps_override=args.warps,
-                                         kmajor=args.kmajor, output=args.out_dtype),))
+                                         kmajor=args.kmajor, output=args.out_dtype, resources=args.resources),))
             for rec in records:
                 rec.update(tag=args.tag, source_root=str(args.source_root))
                 print(json.dumps(rec), flush=True)
