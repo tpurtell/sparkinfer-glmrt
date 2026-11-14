@@ -315,6 +315,70 @@ def run_shape(spec: str, rows: int, kind: str, samples: int, seed: int, flush_mo
     return records
 
 
+
+def run_native_route(spec, rows, route, samples, seed, row_scales):
+    """One actual shipped route; cross-source interleaving belongs to the caller."""
+    import cutlass
+    import torch
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._fp8_weights import (
+        MmaFp8Gemv, TmaFp8Gemm, fp8_gemv_tuning, fp8_gemv_wide, gemv_warps)
+    from b12x.integration.cuteafd._fp8_gemv_nc import NcMmaFp8Gemv
+    from b12x.integration.cuteafd._glmf_prefill_w8 import ExpandedW8Prefill
+
+    n, k = map(int, spec.split("x"))
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(rows, k, generator=generator, device="cuda").bfloat16()
+    w = (torch.randn(n, k, generator=generator, device="cuda") * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
+    per_row = row_scales or route == "expanded"
+    s = torch.rand(n if per_row else (n + 127) // 128, k // 128,
+                   generator=generator, device="cuda") * 2e-4 + 1e-4
+    scale = s.t().contiguous() if route == "expanded" else s
+    warps = _shipped_config().get((n, k), (gemv_warps(k), 4))[0]
+    groups = fp8_gemv_tuning(n, k, warps=warps)[1]
+    cta_tiles = None
+    if route in ("base", "nc"):
+        if rows > 16:
+            groups, cta_tiles = fp8_gemv_wide(n, k, warps=warps, groups=groups)
+        op = (NcMmaFp8Gemv if route == "nc" else MmaFp8Gemv)(
+            n, k, max_rows=16 if rows <= 16 else 64, warps=warps, groups=groups,
+            cta_tiles=cta_tiles, row_scales=per_row)
+    elif route == "tma":
+        op = TmaFp8Gemm(n, k, scales="row" if per_row else "block",
+                        compute_warps=8, num_stages=3)
+    else:
+        op = ExpandedW8Prefill(n, k)
+    out = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+    operands = [Operand("x", torch.bfloat16, "x"), Operand("w", torch.float8_e4m3fn, "w"),
+                Operand("s", torch.float32, "s", align=16), Operand("out", torch.bfloat16, "out", "out")]
+    args = [x, w, scale, out]
+    if route == "expanded":
+        operands.append(Operand("scratch", torch.bfloat16, "scratch", "scratch"))
+        args.append(torch.empty(n, k, device="cuda", dtype=torch.bfloat16))
+    program = compile_program(op, name=f"native_curve_{route}_{n}_{k}", operands=operands,
+                              scalars=(Scalar("rows"),), key=(route, n, k, per_row, op.key()))
+    def run():
+        program.launch(*args, scalars=(rows,))
+    l2 = torch.cuda.get_device_properties(0).L2_cache_size
+    flush = torch.empty(2 * l2, device="cuda", dtype=torch.uint8)
+    median, best, digest = _time(run, samples, flush, [out], "read")
+    assert torch.isfinite(out).all()
+    # Avoid a full F64 model matrix on the 16GiB build host: check real leading output columns.
+    sample = min(128, n)
+    grown = (s[:sample].repeat_interleave(128, 1) if per_row else
+             s[:1].repeat_interleave(128, 0)[:sample].repeat_interleave(128, 1))
+    expected = x.double() @ (w[:sample].double() * grown.double()).t()
+    relative = (out[:, :sample].double() - expected).norm(dim=1) / expected.norm(dim=1).clamp_min(1e-30)
+    assert float(relative.max()) < .008, float(relative.max())
+    first = out[:1].clone()
+    program.launch(*args, scalars=(1,))
+    torch.cuda.synchronize()
+    assert torch.equal(first, out[:1]), "live row count changed the prefix"
+    return dict(case=spec, route=route, rows=rows, per_row_scales=per_row,
+                warps=warps, groups=groups, cta_tiles=cta_tiles,
+                median_read_us=median, min_read_us=best, us_per_row=median / rows,
+                max_sample_row_rel_l2=float(relative.max()), digest=digest, prefix_exact=True)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shapes", default="qwen", help=f"{','.join(SETS)}, or a semicolon list of NxK")
@@ -329,7 +393,13 @@ def main():
     parser.add_argument("--rows2", type=int, default=16,
                         help="second batch width timed on the same program (0 disables)")
     parser.add_argument("--tag", default="")
+    parser.add_argument("--native-route", choices=("base", "nc", "tma", "expanded"),
+                        help="time one dense route, with F64 sample and prefix checks")
+    parser.add_argument("--source-root", type=Path,
+                        help="import b12x from this read-only baseline/candidate source")
     args = parser.parse_args()
+    if args.source_root:
+        sys.path.insert(0, str(args.source_root.resolve()))
     if args.shapes in SETS:
         specs = SETS[args.shapes]
     else:
@@ -339,6 +409,11 @@ def main():
                           l2_bytes=torch.cuda.get_device_properties(0).L2_cache_size,
                           sms=torch.cuda.get_device_properties(0).multi_processor_count)), flush=True)
     for spec in specs:
+        if args.native_route:
+            rec = run_native_route(spec, args.rows, args.native_route, args.samples, args.seed, args.row_scales)
+            rec.update(tag=args.tag, source_root=str(args.source_root))
+            print(json.dumps(rec), flush=True)
+            continue
         for rec in run_shape(spec, args.rows, args.variants, args.samples, args.seed, args.flush,
                              args.rows2 if args.rows2 > 0 else args.rows, args.row_scales):
             rec["tag"] = args.tag
