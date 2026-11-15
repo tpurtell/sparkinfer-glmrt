@@ -135,7 +135,7 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink, native_curve=False):
         lse = torch.empty(rows,heads,10,device=q.device)
         output = torch.empty_like(q)
         kernel = UnifiedDecodeKernel(traits,make_smem_layout(traits),64,1,h_blocks=heads//16,num_splits=10,num_heads=heads,q_head_dim=512,
-            topk=128,extra_topk=512,q_stride=q.stride(),swa_indices_stride0=512 if native else 128,extra_indices_stride0=512,
+            topk=128,extra_topk=512,q_stride=q.stride(),swa_indices_stride0=512 if native or native_curve else 128,extra_indices_stride0=512,
             mid_out_stride=partial.stride(),mid_lse_stride=lse.stride(),has_extra=True,pbs_extra=256,valid_hpb=16,native_dsv41_fp8=native)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         scale = cutlass.Float32(512**-.5 * math.log2(math.e))
