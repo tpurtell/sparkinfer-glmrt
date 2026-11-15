@@ -700,3 +700,28 @@ def test_invalid_native_split_fails_before_cuda(arm):
 def test_explicit_control_requires_matching_arm():
     with pytest.raises(SystemExit):
         bench.parse_args(["--mxfp4-pair", "--mxfp4-tilings", "--mxfp4-control", "absent"])
+
+
+@pytest.mark.parametrize("cc", [(12, 0), (12, 1)])
+@pytest.mark.parametrize("hidden,intermediate", [(5120, 384), (5120, 768), (5120, 576),
+                                               (4096, 512), (6144, 320)])
+@pytest.mark.parametrize("capacity", [1, 16, 64, 80, 256])
+@pytest.mark.parametrize("coded,precision", [(True, "a8"), (False, "a8"), (True, "a16")])
+def test_v41_decode_pipeline_descriptor_keeps_other_programs_unchanged(cc, hidden, intermediate,
+                                                                     capacity, coded, precision):
+    from b12x.moe._shared.kernels import w4a8_v41_slice as kernels
+    selected = kernels.v41_compact_decode_pipeline_qualified(
+        scale_codes=coded, hidden=hidden, intermediate=intermediate,
+        activation_precision=precision, capacity=capacity, compute_capability=cc)
+    assert selected == (cc == (12, 1) and coded and precision == "a8" and capacity <= 80
+                        and hidden == 5120 and intermediate == 384)
+
+
+def test_v41_decode_pipeline_selector_queries_target_cc_and_fails_closed(monkeypatch):
+    from b12x._lib import gating
+    from b12x.moe._shared.kernels import w4a8_v41_slice as kernels
+    values = dict(scale_codes=True, hidden=5120, intermediate=384,
+                  activation_precision="a8", capacity=16)
+    for cc, expected in [((12, 1), True), ((12, 0), False), (None, False)]:
+        monkeypatch.setattr(gating, "get_compute_capability", lambda: cc)
+        assert kernels.v41_compact_decode_pipeline_qualified(**values) == expected
