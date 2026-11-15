@@ -4,9 +4,8 @@ GLM_NSA has exactly Kimi's absorbed query and cache layout. Reuse its traits,
 not its model softmax scale. BF16 attention (BF16 Q, exact K with its FP32
 group scale applied to the FP32 partial, BF16 V and P, FP32 accumulate) is the
 mode that meets Kimi's oracle bounds against the exact decoded record; FP8 QK
-does not and stays a diagnostic arm. ``exact_k=False`` rounds each dequantized
-key to BF16 first, as Kimi's split decode kernels still do (a known
-decode-side difference). Dense causal extend builds one shared physical-slot
+does not and stays a diagnostic arm. Kimi's split decode kernels still round
+each dequantized key to BF16: a known decode-side difference. Dense causal extend builds one shared physical-slot
 vector plus per-query visible lengths; sparse takes the selector's native slots.
 No split partials or cache conversion. The public Kimi routes are unchanged.
 """
@@ -49,7 +48,7 @@ class _DenseMetadata:
 
 
 class _MG:
-    def __init__(self, g, capacity, *, sparse, bf16_compute, exact_k=True):
+    def __init__(self, g, capacity, *, sparse, bf16_compute):
         from b12x.attention._shared.mla.prefill import _mg_head_partitions
         from b12x.attention._shared.mla.prefill_mg import UnifiedPrefillMGKernel
         from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg, max_mg_head_groups
@@ -61,7 +60,7 @@ class _MG:
         traits = make_unified_traits(ModelType.GLM_NSA, ComputeMode.FP8,
                                      ScaleFormat.ARBITRARY_FP32)
         if bf16_compute:
-            traits = with_bf16_attention(traits, rounded_k=not exact_k)
+            traits = with_bf16_attention(traits)
         self.metadata = _DenseMetadata(capacity)
         self.kernels = []
         for groups, active, offset in _mg_head_partitions(
@@ -107,24 +106,21 @@ class _MG:
 
 
 def compile_kimi_mg_prefill_aot(g, *, max_rows=4096, max_context=131072,
-                                 sparse=False, bf16_compute=False, exact_k=True):
+                                 sparse=False, bf16_compute=False):
     """MG candidate. LSE is base 2, unlike ordinary Kimi's natural LSE.
 
     Dense: one request; table is the ordinary 64-record page table and lengths
     contains total cache length (including query rows). Sparse: selector slots
     [rows,2048] with valid leading lengths [rows], including zero-length rows.
-    ``bf16_compute`` selects BF16 QK and PV over the same FP8 records;
-    ``exact_k`` (default) or BF16-rounded keys within it.
+    ``bf16_compute`` selects BF16 QK and PV with exact keys over the same
+    FP8 records.
     """
-    if not exact_k and not bf16_compute:
-        raise ValueError("rounded K qualifies BF16 compute; FP8 QK has no key dequant")
     if g.kv_cache != "fp8":
         raise ValueError("MG traits support the 656-byte FP8 record, not raw BF16 KV")
     if not 1 <= int(max_rows) <= 4096 or not int(max_rows) <= int(max_context) <= 1048576:
         raise ValueError("invalid planned row/context capacity")
     capacity = 2048 if sparse else int(max_context)
-    launch = _MG(g, capacity, sparse=bool(sparse), bf16_compute=bool(bf16_compute),
-                 exact_k=bool(exact_k))
+    launch = _MG(g, capacity, sparse=bool(sparse), bf16_compute=bool(bf16_compute))
     return compile_program(launch, name="kimi_mg_prefill_experiment",
         operands=(Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
                   Operand("cache", torch.uint8, "[pool_tokens,656]"),
@@ -134,9 +130,7 @@ def compile_kimi_mg_prefill_aot(g, *, max_rows=4096, max_context=131072,
                   Operand("lse", torch.float32, f"[rows,{g.heads}]", "out"),
                   Operand("scratch", torch.uint8, "[scratch_bytes]", "scratch")),
         scalars=(Scalar("rows"),),
-        key=(g, int(max_rows), capacity, bool(sparse), bool(bf16_compute))
-            + (() if exact_k else ("rounded_k",)),
+        key=(g, int(max_rows), capacity, bool(sparse), bool(bf16_compute)),
         geometry={**vars(g), "max_rows": int(max_rows), "capacity": capacity,
-                  "sparse": bool(sparse), "bf16_compute": bool(bf16_compute), "lse_base": 2,
-                  **({"exact_k": bool(exact_k)} if bf16_compute else {})},
+                  "sparse": bool(sparse), "bf16_compute": bool(bf16_compute), "lse_base": 2},
         scratch={"scratch": lambda rows: 0 if sparse else 4 * (capacity + int(rows))})

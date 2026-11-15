@@ -109,11 +109,7 @@ class SmemLayoutMG:
 def max_mg_head_groups(traits: UnifiedMLATraits) -> int:
     """Head groups one CTA can stage: BF16 Q for two groups plus the 528-byte
     double-buffered KV rows exceeds the SM120 carveout."""
-    inline_bf16 = (
-        traits.compute_mode == ComputeMode.BF16
-        and traits.scale_format == ScaleFormat.ARBITRARY_FP32
-    )
-    return 1 if inline_bf16 else _MG_N_HG
+    return 1 if traits.pv_bf16 else _MG_N_HG
 
 
 def make_smem_layout_mg(
@@ -606,7 +602,6 @@ def _run_module_asserts() -> None:
         ModelType.GLM_NEXT, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32
     )):
         assert max_mg_head_groups(base) == _MG_N_HG
-        assert max_mg_head_groups(with_bf16_attention(base, fp8_pv=True)) == 1
         bf16_traits = with_bf16_attention(base)
         assert max_mg_head_groups(bf16_traits) == 1
         gl = make_smem_layout_mg(bf16_traits, mg_n_hg=1)

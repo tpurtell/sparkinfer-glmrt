@@ -21,11 +21,8 @@ Routes (both take the live row count as a launch scalar):
 ``route="prefill"`` the single-pass multi-head-group (MG) kernel; scratch
     holds the base-2 LSE. ``precision="fp8"`` (default): FP8 QK and PV, one
     CTA per (row, 32-head group). ``precision="bf16"``: BF16 Q, exact K with
-    its inline FP32 group scale applied to the FP32 partial (``exact_k=False``
-    rounds the dequantized key to BF16 instead), BF16 V and P, FP32
-    accumulate, one CTA per (row, 16-head group); same records and ABI.
-    ``precision="bf16-qk"`` keeps the FP8 route's two-pass E4M3 PV after that
-    BF16 QK.
+    its inline FP32 group scale applied to the FP32 partial, BF16 V and P,
+    FP32 accumulate, one CTA per (row, 16-head group); same records and ABI.
 
 Masked slots (``-1``, or past a row's length) stage record slot 0, page 0's
 first record, and are weighted by zero. By default, ``zero_masked_v`` zeroes
@@ -163,7 +160,7 @@ def sparse_mla_scratch_bytes(g: GLMGeometry, *, route: str, rows: int, buckets=(
 
 
 class _Prefill:
-    def __init__(self, g: GLMGeometry, zero_masked_v=False, precision="fp8", exact_k=True):
+    def __init__(self, g: GLMGeometry, zero_masked_v=False, precision="fp8"):
         from dataclasses import replace
 
         from b12x.attention._shared.mla.prefill import _mg_head_partitions
@@ -174,10 +171,9 @@ class _Prefill:
         self.g = g
         self.heads, self.topk, self.qk = g.heads, _topk(g), _qk(g)
         traits = replace(_traits(g), compute_mode=ComputeMode.FP8)
-        if precision != "fp8":
-            traits = with_bf16_attention(traits, rounded_k=not exact_k, fp8_pv=precision == "bf16-qk")
         if precision == "bf16":
-            zero_masked_v = False  # BF16 P.V zeroes a masked candidate's V itself.
+            # BF16 P.V zeroes a masked candidate's V itself.
+            traits, zero_masked_v = with_bf16_attention(traits), False
         partitions = _mg_head_partitions(self.heads, int(traits.hpb), max_mg_head_groups(traits))
         tiles = -(-self.topk // _CAND)
         self.kernels = []
@@ -199,8 +195,8 @@ class _Prefill:
         self.key = ("prefill", tiles, tuple(partitions))
         if zero_masked_v:
             self.key += ("zero_masked_v",)
-        if precision != "fp8":
-            self.key += (precision,) + (() if exact_k else ("rounded_k",))
+        if precision == "bf16":
+            self.key += ("bf16",)
         self.zero_masked_v = zero_masked_v
 
     @cute.jit
@@ -326,8 +322,7 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
                                name: str = "glm_sparse_mla", fp32_partials: bool = False,
                                full_launch_splits: int | None = None, sm_count: int | None = None,
                                plan_capacity_rows: int | None = None, zero_masked_v: bool = True,
-                               elide_single_split: bool = True, precision: str = "fp8",
-                               exact_k: bool = True):
+                               elide_single_split: bool = True, precision: str = "fp8"):
     """GLM latent sparse MLA; see the module docstring for the ABI. A GLM 5.3
     Flash geometry (``GLMFGeometry``) selects the 512-wide query, 528-byte
     records (``ModelType.GLM_NEXT``) and its 2112-slot index rows. The opt-in
@@ -350,12 +345,10 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         raise ValueError("fp32_partials is supported only for GLM Flash decode")
     if full_launch_splits is not None and (route != "decode" or int(full_launch_splits) < 1):
         raise ValueError("full_launch_splits plans decode buckets: a split count of at least 1")
-    if precision not in ("fp8", "bf16-qk", "bf16") or (precision != "fp8" and route != "prefill"):
-        raise ValueError("precision is 'fp8' or, for the prefill route, 'bf16-qk' or 'bf16'")
-    if not exact_k and precision == "fp8":
-        raise ValueError("rounded K qualifies BF16 QK; FP8 QK has no key dequant")
+    if precision not in ("fp8", "bf16") or (precision == "bf16" and route != "prefill"):
+        raise ValueError("precision is 'fp8' or, for the prefill route, 'bf16'")
     if route == "prefill":
-        launch = _Prefill(g, zero_masked_v, precision, exact_k)
+        launch = _Prefill(g, zero_masked_v, precision)
         zero_masked_v = launch.zero_masked_v
         buckets = ()
     elif route == "decode":
@@ -387,8 +380,7 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
                   **({"elide_single_split": True} if route == "decode" and elide_single_split
                      and any(s == 1 for _, s, _ in buckets) else {}),
                   **({"zero_masked_v": True} if zero_masked_v else {}),
-                  **({"attention_precision": precision, "exact_k": bool(exact_k)}
-                     if precision != "fp8" else {})},
+                  **({"attention_precision": "bf16"} if precision == "bf16" else {})},
         scratch={"scratch": lambda rows: sparse_mla_scratch_bytes(g, route=route, rows=rows, buckets=buckets,
                                                                fp32_partials=fp32_partials)},
         doc=__doc__,

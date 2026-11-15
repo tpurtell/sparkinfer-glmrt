@@ -3,9 +3,8 @@
 DSV4 584B changes QK only (PV is FP8 NoPE / BF16 RoPE). Native DSV41
 changes canonical KV staging and PV only; both arms retain BF16 QK.
 Inline-FP32-scale records (glm 656B, glmf 528B, kimi 656B with 96 or 48 heads
-and 192^-0.5) compare FP8 QK/PV, BF16 QK with the FP8 kernel's two-pass FP8 PV,
-and BF16 QK/PV; they also check ragged, empty and masked rows, slot-0 poison
-and row invariance.
+and 192^-0.5) compare FP8 QK/PV with BF16 QK/PV (exact keys); they also check
+ragged, empty and masked rows, slot-0 poison and row invariance.
 Synthetic full selected sets model long-context attention, not a model forward.
 """
 from __future__ import annotations
@@ -42,14 +41,11 @@ def fork_sha():
 def arm_traits(fmt, arm):
     if fmt in INLINE:
         from b12x.attention._shared.mla.traits import with_bf16_attention
-        if arm not in ("fp8", "bf16-qk", "bf16", "bf16-rounded-k"):
+        if arm not in ("fp8", "bf16"):
             raise ValueError((fmt, arm))
         traits = make_unified_traits(ModelType.GLM_NEXT if fmt == "glmf" else ModelType.GLM_NSA,
             ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
-        if arm == "fp8":
-            return traits
-        # bf16-rounded-k: BF16/BF16 with ATTENTION_EXACT_K=off numerics.
-        return with_bf16_attention(traits, fp8_pv=arm == "bf16-qk", rounded_k=arm == "bf16-rounded-k")
+        return with_bf16_attention(traits) if arm == "bf16" else traits
     if fmt == "dsv4":
         if arm not in ("fp8-qk", "bf16-qk"):
             raise ValueError(arm)
@@ -172,7 +168,7 @@ def inline_main(args):
     cache = cache.reshape(pool // 64, -1).contiguous()
     row = torch.arange(max_rows, device=device)[:, None]
     indices = (1 + (row * 37 + torch.arange(topk, device=device)[None] * 17) % (pool - 1)).int().contiguous()
-    arms = ("fp8", "bf16-qk", "bf16", "bf16-rounded-k")
+    arms = ("fp8", "bf16")
     traits = {arm: arm_traits(args.format, arm) for arm in arms}
     report = {"format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "fork_sha": fork_sha(),
@@ -268,8 +264,8 @@ def inline_main(args):
     report["checks"] = checks
     print(json.dumps({"checks": checks}), flush=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
-    # The FP8-PV arms launched here do not zero masked V (their exports opt
-    # in), so their poison result is recorded only; BF16 PV always zeroes it.
+    # The FP8 arm launched here does not zero masked V (its exports opt in),
+    # so its poison result is recorded only; BF16 PV always zeroes it.
     bad = [f"{arm}.{key}" for arm in arms for key in ("empty_rows_zero", "slot0_poison_bytes_equal", "row_invariant")
            if not checks[arm][key] and (traits[arm].pv_bf16 or key != "slot0_poison_bytes_equal")]
     if bad:
