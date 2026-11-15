@@ -2657,7 +2657,8 @@ def compile_mixed_trellis(
                 activations=activations,
                 compact_weights=compact_weights,
                 prerotate=ws_prerotate,
-                row_addresses=row_addresses,            )
+                row_addresses=row_addresses,
+            )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
             tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
