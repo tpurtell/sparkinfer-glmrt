@@ -7,7 +7,6 @@ No split partials or cache conversion. The public Kimi routes are unchanged.
 """
 from __future__ import annotations
 
-from dataclasses import replace
 import math
 
 import cuda.bindings.driver as cuda
@@ -107,8 +106,11 @@ def compile_kimi_mg_prefill_aot(g, *, max_rows=4096, max_context=131072,
     Dense: one request; table is the ordinary 64-record page table and lengths
     contains total cache length (including query rows). Sparse: selector slots
     [rows,2048] with valid leading lengths [rows], including zero-length rows.
-    BF16 compute still reads native FP8 records; raw BF16 cache is unsupported.
+    Only FP8 compute is supported: the shared BF16-QK arm reads UE8M0 footer
+    scales and is not valid for Kimi's inline arbitrary-FP32 scales.
     """
+    if bf16_compute:
+        raise ValueError("MG BF16-QK requires UE8M0 footer scales; Kimi uses inline FP32 scales")
     if g.kv_cache != "fp8":
         raise ValueError("MG traits support the 656-byte FP8 record, not raw BF16 KV")
     if not 1 <= int(max_rows) <= 4096 or not int(max_rows) <= int(max_context) <= 1048576:
