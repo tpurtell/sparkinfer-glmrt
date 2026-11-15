@@ -21,6 +21,7 @@ import argparse
 from dataclasses import asdict, replace
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import subprocess
@@ -199,7 +200,7 @@ def main(argv=None):
     if args.mode == "decode":
         arms = ("fp8-decode", "bf16-decode", "fp8-f32-partials")
     report = {"mode": args.mode, "lse_unit": "natural_log", "format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
-        "fork_sha": subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True).strip(),
+        "fork_sha": subprocess.check_output(["git", "-C", os.environ.get("CUTEAFD_SPARKINFER_SOURCE_DIR", str(Path(__file__).resolve().parents[1])), "rev-parse", "HEAD"], text=True).strip(),
         "device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
         "traits": {arm: asdict(arm_traits(args.format, arm) if args.mode == "prefill" else decode_arm_traits(arm)) for arm in arms}, "records": []}
     args.output.parent.mkdir(parents=True, exist_ok=True)
