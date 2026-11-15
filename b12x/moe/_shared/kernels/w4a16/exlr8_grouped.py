@@ -930,6 +930,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
             raise ValueError("EXLR8 grouped activations must be 'a16' or 'a8'")
         if reply_format not in (0, 1, 2):
             raise ValueError("EXLR8 reply format must be 0/1/2")
+        self.max_rows = 8192 if row_addresses else 4096
         self.row_addresses = bool(row_addresses)
         if self.row_addresses and reply_format:
             raise ValueError("row-addressed EXLR8 replies are BF16 only")
@@ -1145,7 +1146,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 group_count: cute.Tensor, unit_count: cute.Tensor,
                 unit_map: cute.Tensor, cta_limit: Int32, unit_limit: Int32,
                 l2_bytes: Int32, stream: cuda.CUstream):
-        if (rows > Int32(0) and rows <= Int32(4096) and cta_limit > Int32(0)
+        if (rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0)
                 and unit_limit > Int32(0)):
             if cutlass.const_expr(self.quantize_pass):
                 # Borrow fc2 for A8 records until FC1 finishes; same-stream FC2
