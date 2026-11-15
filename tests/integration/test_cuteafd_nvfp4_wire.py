@@ -113,6 +113,8 @@ def test_wire_program_exact(name, tp, raw_scale):
                                        scale_convention=g.scale_convention)
     bf16 = compile_fp8_moe_aot(g, route="auto", max_rows=capacity, wire=False)
     wire = compile_fp8_moe_aot(g, route="auto", max_rows=capacity, input_kind="nvfp4")
+    addressed = (None if g.dynamic_nvfp4 else compile_fp8_moe_aot(
+        g, route="auto", max_rows=capacity, input_kind="nvfp4", row_addresses=True))
     assert bf16.scratch_bytes(capacity) == wire.scratch_bytes(capacity)
     assert fp8_moe_scratch_bytes(g, "auto", capacity, False) == fp8_moe_scratch_bytes(
         g, "auto", capacity, input_kind="nvfp4")
@@ -127,6 +129,14 @@ def test_wire_program_exact(name, tp, raw_scale):
     weights = _weights(g, raw_scale)
     out_a, out_b = (torch.empty_like(x) for _ in range(2))
     scratch_a, scratch_b = (torch.empty(bf16.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda") for _ in range(2))
+    if addressed is not None:
+        assert addressed.scratch_bytes(capacity) == wire.scratch_bytes(capacity)
+        out_addressed = torch.empty_like(x)
+        # Reverse the physical row storage: the address table must not be ignored.
+        retained = packed.clone()
+        order = torch.arange(capacity - 1, -1, -1, device="cuda", dtype=torch.int64)
+        addresses = retained.data_ptr() + order * retained.stride(0)
+        output_addresses = out_addressed.data_ptr() + torch.arange(capacity, device="cuda", dtype=torch.int64) * g.hidden * 2
     timing = []
     with kernel_resolution_guard("NVFP4 wire live rows reuse fixed planned capacity"):
         # Zero-row quantization must not touch the destination.
@@ -144,6 +154,11 @@ def test_wire_program_exact(name, tp, raw_scale):
             assert torch.equal(out_a[:rows].view(torch.uint8), out_b[:rows].view(torch.uint8)), (name, tp, rows)
             assert torch.isfinite(out_a[:rows]).all()
             assert out_a[:rows].count_nonzero() > 0
+            if addressed is not None:
+                retained[order[:rows]] = packed[:rows]
+                addressed.launch(addresses, ids, gamma, *weights, output_addresses, scratch_b, scalars=(rows,))
+                torch.cuda.synchronize()
+                assert torch.equal(out_a[:rows].view(torch.uint8), out_addressed[:rows].view(torch.uint8))
             src, q, s, amax = _scratch_rows(g, scratch_a, rows, capacity)
             assert torch.equal(q, packed[src, :g.hidden // 2]), (name, tp, rows, "packed")
             assert torch.equal(s, packed[src, g.hidden // 2:g.hidden // 2 + g.hidden // 16]), (name, tp, rows, "scales")
@@ -198,3 +213,18 @@ def test_wire_validation_and_legacy_keys():
         with pytest.raises(ValueError):
             compile_nvfp4_wire_rows_aot(hidden=6144, max_rows=8192, **kwargs)
     assert "nonuniform" in compile_nvfp4_wire_rows_aot.__doc__
+
+
+@pytest.mark.parametrize("mode,convention", [("calibrated", "multiplier"), ("calibrated", "divisor"), ("dynamic", "multiplier")])
+def test_wire_exported_abi(tmp_path, mode, convention):
+    require_b12x()
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+    from b12x.integration.cuteafd.nvfp4_wire import compile_nvfp4_wire_rows_aot
+
+    with exportable_compilation():
+        program = compile_nvfp4_wire_rows_aot(hidden=6144, max_rows=8192, mode=mode, scale_convention=convention)
+    stem = f"nvfp4_wire_{mode}_{convention}"
+    program.export_to_c(str(tmp_path), stem, stem)
+    checked = validate_exported_header(program, tmp_path / (stem + ".h"), stem)
+    assert checked["argument_count"] == (4 if mode == "dynamic" else 5)
+    assert program.scratch_bytes(8192) == {}
