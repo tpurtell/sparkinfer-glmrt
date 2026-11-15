@@ -277,7 +277,7 @@ def test_chunked_beta_matches_bf16_decode_reference(rows):
     from b12x.integration.cuteafd.glmf import _KdaChunked
     from b12x.sequence._shared.delta_prefill.workspace import WorkspaceRecord as REC
 
-    g = KDAGeometry(hidden=7168, kda_heads=2)
+    g = KDAGeometry(hidden=7168, kda_heads=8)
     core = _KdaChunked(g, rows)
     h, d = g.kda_heads, g.kda_width
 
