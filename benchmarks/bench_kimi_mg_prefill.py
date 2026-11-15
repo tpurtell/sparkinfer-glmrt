@@ -147,6 +147,7 @@ def oracle(args, report):
         physical = table[logical // 64].long() * 64 + logical % 64
         ordered = torch.empty_like(cache)
         ordered[physical] = cache
+        dense_baseline_lse = 0.
         for n, prefix in ((1, 0), (17, 0), (65, 127), (65, 2048)):
             length = torch.tensor([prefix + n], device="cuda", dtype=torch.int32)
             offsets = torch.tensor([0, n], device="cuda", dtype=torch.int32)
@@ -159,10 +160,13 @@ def oracle(args, report):
             for row in (0, n - 1):
                 kv = values[:prefix + row + 1]
                 score = q[row].float() @ kv.T * g.softmax_scale
-                comparison(out[row], score.softmax(-1) @ kv[:, :512])
-                comparison(lse[row] * torch.log(torch.tensor(2.)), score.logsumexp(-1), lse=True)
-                comparison(out[row], bo[row])
-                comparison(lse[row] * torch.log(torch.tensor(2.)), bl[row], lse=True)
+                expected, natural = score.softmax(-1) @ kv[:, :512], score.logsumexp(-1)
+                comparison(out[row], expected)
+                comparison(lse[row] * torch.log(torch.tensor(2.)), natural, lse=True)
+                # The shipping extend route is held to the same reference, not
+                # to the candidate: its own error is recorded, never inherited.
+                dense_baseline_lse = max(dense_baseline_lse, float((bl[row] - natural).abs().max()))
+                comparison(bo[row], expected)
             before = out[:n].clone(), lse[:n].clone()
             old = ordered[physical[prefix+n:]].clone()
             ordered[physical[prefix+n:]] = 255
@@ -171,7 +175,8 @@ def oracle(args, report):
             assert torch.equal(out[:n].view(torch.uint8), before[0].view(torch.uint8))
             assert torch.equal(lse[:n].view(torch.uint8), before[1].view(torch.uint8))
             ordered[physical[prefix+n:]] = old
-        results.append(dict(route="dense", heads=heads, causal=True, poison=True, graph=True))
+        results.append(dict(route="dense", heads=heads, causal=True, poison=True, graph=True,
+                            baseline_lse_max_abs=dense_baseline_lse))
         print(json.dumps(results[-2:]), flush=True)
     report["oracle"] = results
     return results

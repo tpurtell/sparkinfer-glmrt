@@ -28,6 +28,16 @@ INLINE = {  # heads, absorbed query width, selected slots, softmax scale
 }
 
 
+def fork_sha():
+    """Source revision; a submodule checkout inside a container has no reachable gitdir."""
+    import os
+    try:
+        return subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
+                                       text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return os.environ.get("B12X_SOURCE_REVISION", "unknown")
+
+
 def arm_traits(fmt, arm):
     if fmt in INLINE:
         from b12x.attention._shared.mla.traits import with_bf16_attention
@@ -157,7 +167,7 @@ def inline_main(args):
     arms = ("fp8", "bf16")
     traits = {arm: arm_traits(args.format, arm) for arm in arms}
     report = {"format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-        "fork_sha": subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True).strip(),
+        "fork_sha": fork_sha(),
         "device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
         "sm_count": torch.cuda.get_device_properties(device).multi_processor_count,
         "traits": {arm: asdict(t) for arm, t in traits.items()}, "lse_unit": "log2", "records": []}
@@ -300,7 +310,7 @@ def main(argv=None):
     sink = torch.linspace(-1, 1, args.heads, device=device)
     arms = ("fp8-qk", "bf16-qk") if args.format == "dsv4" else ("bf16-pv", "fp8-pv")
     report = {"format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
-        "fork_sha": subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True).strip(),
+        "fork_sha": fork_sha(),
         "device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
         "traits": {arm: asdict(arm_traits(args.format, arm)) for arm in arms}, "records": []}
     args.output.parent.mkdir(parents=True, exist_ok=True)
