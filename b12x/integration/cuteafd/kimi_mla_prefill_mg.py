@@ -121,7 +121,7 @@ def compile_kimi_mg_prefill_aot(g, *, max_rows=4096, max_context=131072,
         raise ValueError("invalid planned row/context capacity")
     capacity = 2048 if sparse else int(max_context)
     launch = _MG(g, capacity, sparse=bool(sparse), bf16_compute=bool(bf16_compute))
-    return compile_program(launch, name="kimi_mg_prefill_experiment",
+    return compile_program(launch, name="kimi_sparse_mla_mg" if sparse else "kimi_dense_mla_mg",
         operands=(Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
                   Operand("cache", torch.uint8, "[pool_tokens,656]"),
                   Operand("table", torch.int32, "[rows,2048] or [pages]", align=4),
