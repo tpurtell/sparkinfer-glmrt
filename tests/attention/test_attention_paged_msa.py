@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -10,7 +14,7 @@ from b12x.attention.paged.reference import (
     msa_attention_reference,
 )
 from b12x.attention._shared.contiguous.api import clear_attention_caches
-from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._forward import paged_attention_forward as _paged_attention_forward
 from b12x.attention.paged._scratch import B12XPagedAttentionScratchCaps, plan_paged_attention_scratch
 from b12x.attention.paged.planner import create_paged_plan
 
@@ -20,6 +24,28 @@ from tests._reference.paged_attention_helpers import (
     make_paged_inputs,
     quantize_paged_kv_cache_e4m3,
 )
+
+
+def paged_attention_forward(*args, **kwargs):
+    result = _paged_attention_forward(*args, **kwargs)
+    path = os.environ.get("MINIMAX_SPARSE_RECEIPT")
+    if path and not torch.cuda.is_current_stream_capturing():
+        import b12x.attention.paged.forward_extend_generic as kernel
+
+        source = Path(kernel.__file__).resolve()
+        assert source == Path(os.environ["MINIMAX_ATTENTION_SOURCE"]).resolve()
+        output, lse = result
+        record = dict(
+            test=os.environ["PYTEST_CURRENT_TEST"].removesuffix(" (call)"),
+            kernel_source=str(source),
+            kernel_source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            shape=list(output.shape),
+            output_sha256=hashlib.sha256(output.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+            lse_sha256=hashlib.sha256(lse.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+        )
+        with Path(path).open("a") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+    return result
 
 
 def _msa_dense_mask_reference(
