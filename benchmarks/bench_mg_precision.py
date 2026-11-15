@@ -87,8 +87,10 @@ def parse_args(argv=None):
         args.heads = INLINE[args.format][0] if args.format in INLINE else 64
     if args.format in INLINE and not 1 <= (args.selected or 1) <= INLINE[args.format][2]:
         p.error("selected exceeds the format's slots per row")
-    if set(args.scores) - {"spread", "peaked"}:
-        p.error("scores must be spread,peaked")
+    if set(args.scores) - {"spread", "peaked", "medium"}:
+        p.error("scores must be spread, peaked or medium")
+    if "medium" in args.scores and args.format not in INLINE:
+        p.error("medium scores are measured on the inline-FP32 formats")
     if args.heads < 16 or args.heads % 16 or min(args.indexed_width, args.samples, args.replays, args.warmup) < 1:
         p.error("heads must be a positive multiple of 16; counts must be positive")
     if args.indexed_width > 4096:
@@ -202,7 +204,9 @@ def inline_main(args):
 
     def pattern(name):
         def prepare():
-            q = (torch.randn(max_rows, heads, qdim, device=device) * (.03 if name == "spread" else .2)).bfloat16()
+            # medium: a few dozen keys carry the mass, where score error moves the output most.
+            q = (torch.randn(max_rows, heads, qdim, device=device)
+                 * {"spread": .03, "medium": 1.2, "peaked": .2}[name]).bfloat16()
             if name == "peaked":
                 target = keys[indices[:, 0].long()][:, :qdim]
                 q = (q.float() + target[:, None] * (14 / sm_scale / target.square().sum(-1))[:, None, None]).bfloat16()

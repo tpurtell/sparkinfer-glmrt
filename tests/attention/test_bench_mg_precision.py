@@ -36,6 +36,13 @@ def test_native_internal_fp8_does_not_select_fp8_qk():
     assert not bf16.fp8_internal and fp8.fp8_internal
 
 
+def test_medium_scores_are_inline_only(tmp_path):
+    args = parse_args(["--format", "glm", "--scores", "medium", "--output", str(tmp_path / "o.json")])
+    assert args.scores == ["medium"]
+    with pytest.raises(SystemExit):
+        parse_args(["--format", "dsv4", "--scores", "medium", "--output", str(tmp_path / "o.json")])
+
+
 def test_wrong_format_arm_rejected():
     with pytest.raises(ValueError):
         arm_traits("dsv41", "fp8-qk")
