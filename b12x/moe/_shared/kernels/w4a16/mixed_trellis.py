@@ -123,6 +123,7 @@ class MixedTrellisCompileResult:
     # bytes (E4M3 values, then one UE8M0 scale per 32) that the
     # warp-specialized producers widen in shared memory.
     input_format: str = field(default="bf16", kw_only=True)
+    row_addresses: bool = field(default=False, kw_only=True)
     # Warp-specialized input-row ring depth (None: the kernel's default).
     ws_input_stages: int | None = field(default=None, kw_only=True)
     # Opt-in INT8 activations/decoded weights for warp-specialized prefill.
@@ -2525,7 +2526,12 @@ def compile_mixed_trellis(
     decode_schedule: str | None = None,
     workspace_sms: int | None = None,
     ws_prerotate: bool | None = None,
+    row_addresses: bool = False,
 ) -> MixedTrellisCompileResult:
+    if row_addresses and not 0 < int(size_m) <= 8192:
+        raise ValueError("row-address WS capacity must be in 1..8192")
+    if row_addresses and (not warp_specialized or activations != "a16"):
+        raise ValueError("row addresses require WS A16 (BF16 or E4M3 K32 input)")
     if activations not in ("a16", "a8"):
         raise ValueError(f"unsupported EXL3 activations {activations!r}")
     if activations == "a8" and not warp_specialized:
@@ -2651,6 +2657,7 @@ def compile_mixed_trellis(
                 activations=activations,
                 compact_weights=compact_weights,
                 prerotate=ws_prerotate,
+                row_addresses=row_addresses,
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
@@ -2705,6 +2712,7 @@ def compile_mixed_trellis(
         route_ids_dtype=route_ids_dtype,
         use_expert_map=True,
         broadcast_svh=broadcast_svh,
+        row_addresses=row_addresses,
     )
     # The schedule this program runs, as built: a prefetch depth past a GEMM's
     # K tiles builds the same program as that bound, and reports the bound.
@@ -2735,6 +2743,9 @@ def compile_mixed_trellis(
         if input_format == "e4m3_k32"
         else _cutlass_element_dtype(rotation_input_dtype)
     )
+
+    if row_addresses:
+        rotation_dtype = cutlass.Int64
 
     def tensor(dtype, elements: int, *, align: int = 16):
         return cute.runtime.make_fake_compact_tensor(
@@ -2853,6 +2864,7 @@ def compile_mixed_trellis(
         warp_specialized=bool(warp_specialized),
         ws_prerotate=bool(getattr(kernel, "ws_prerotate", False)),
         input_format=str(input_format),
+        row_addresses=bool(row_addresses),
         ws_input_stages=ws_input_stages,
         activations=activations,
         decode_schedule=decode_schedule,
@@ -3202,11 +3214,12 @@ def _make_mixed_trellis_buffers(
         ),
         fc2=rotation_gate,
         output=torch.empty(
-            (launch.size_m, launch.hidden_size),
+            (launch.size_m,) if launch.row_addresses else (launch.size_m, launch.hidden_size),
             dtype=(
-                torch.bfloat16
-                if launch.topk_sum.full_rotation_output_dtype == "bf16"
-                else torch.float32
+                torch.int64 if launch.row_addresses else (
+                    torch.bfloat16 if launch.topk_sum.full_rotation_output_dtype == "bf16"
+                    else torch.float32
+                )
             ),
             device=device,
         ),
@@ -3243,6 +3256,49 @@ def _make_mixed_trellis_buffers(
             device=device,
         ),
     )
+
+
+def make_mixed_trellis_segment_buffers(
+    launch: MixedTrellisCompileResult, *, rows: int, device: torch.device, sms: int,
+    scratch: torch.Tensor | None = None,
+) -> MixedTrellisBuffers:
+    """Bind a live-sized WS row-address arena; the caller retains its backing.
+
+    Graph replay must retain this arena and both external address tables until
+    queued GPU work drains. No allocation happens when ``scratch`` is supplied.
+    """
+    from .host import exl3_ws_segment_scratch_regions
+
+    if not launch.row_addresses or not launch.warp_specialized or launch.ws_prerotate:
+        raise ValueError("segment buffers require row-address WS with in-tile rotation")
+    sms = int(launch.workspace_sms or sms)
+    regions = exl3_ws_segment_scratch_regions(
+        rows=rows, maximum=launch.size_m, hidden=launch.hidden_size,
+        intermediate=launch.intermediate_size, topk=launch.top_k,
+        experts=int(launch.topk_sum.route_num_experts), block=launch.moe_block_size,
+        max_m_blocks=launch.max_m_blocks, sms=sms)
+    total = sum((n + 255) & ~255 for n in regions.values())
+    if scratch is None:
+        scratch = torch.empty(total, dtype=torch.uint8, device=device)
+    if (scratch.dtype != torch.uint8 or scratch.device != torch.device(device)
+            or not scratch.is_contiguous() or scratch.numel() < total
+            or scratch.data_ptr() % 256):
+        raise ValueError("EXL3 segment scratch must be contiguous, 256B-aligned uint8 with sufficient bytes")
+    tensors = {}
+    offset = 0
+    routes = rows * launch.top_k
+    shapes = dict(rotation_gate=(routes, launch.hidden_size),
+                  fc1=(routes, 2 * launch.intermediate_size),
+                  activated=(routes, launch.intermediate_size))
+    for name, size in regions.items():
+        dtype = (torch.float16 if name in shapes else torch.int64 if name == "output"
+                 else torch.float32 if name.endswith("scratch") else torch.int32)
+        view = scratch[offset:offset + size].view(dtype)
+        tensors[name] = view.reshape(shapes[name]) if name in shapes else view
+        offset += (size + 255) & ~255
+    tensors["workspace"].zero_()
+    tensors["rotation_up"] = tensors["fc2"] = tensors["rotation_gate"]
+    return MixedTrellisBuffers(**tensors)
 
 
 def make_mixed_trellis_buffers(
@@ -3944,7 +4000,9 @@ def run_bound_mixed_trellis(
     input_cols = int(launch.hidden_size) + (
         int(launch.hidden_size) // 32 if wire_input else 0
     )
-    if x.ndim != 2 or int(x.shape[1]) != input_cols:
+    expected_shape = (int(x.shape[0]),) if launch.row_addresses and x.ndim else None
+    valid_shape = tuple(x.shape) == expected_shape if launch.row_addresses else (x.ndim == 2 and int(x.shape[1]) == input_cols)
+    if not valid_shape:
         raise ValueError(
             "mixed Trellis input must have shape "
             f"[M, {input_cols}], got {tuple(x.shape)}"
@@ -3966,6 +4024,8 @@ def run_bound_mixed_trellis(
         if wire_input
         else torch.bfloat16 if launch.rotation_input_dtype == "bf16" else torch.float16
     )
+    if launch.row_addresses:
+        expected_input_dtype = torch.int64
     for name, tensor, expected_dtype in (
         ("input", x, expected_input_dtype),
         ("topk_ids", topk_ids, launch.route_ids_dtype),
@@ -3990,6 +4050,9 @@ def run_bound_mixed_trellis(
         (m, launch.hidden_size),
         (launch.size_m, launch.hidden_size),
     }
+    if launch.row_addresses:
+        expected_output_dtype = torch.int64
+        expected_output_shapes = {(m,), (launch.size_m,)}
     if (
         tuple(buffers.output.shape) not in expected_output_shapes
         or buffers.output.dtype != expected_output_dtype
@@ -4058,7 +4121,7 @@ def run_bound_mixed_trellis(
     stream = current_cuda_stream()
     launch.compiled(
         make_ptr(
-            cutlass.Uint8 if wire_input else _cutlass_element_dtype(launch.rotation_input_dtype),
+            cutlass.Int64 if launch.row_addresses else cutlass.Uint8 if wire_input else _cutlass_element_dtype(launch.rotation_input_dtype),
             x.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
@@ -4115,7 +4178,7 @@ def run_bound_mixed_trellis(
             assumed_align=16,
         ),
         make_ptr(
-            (
+            cutlass.Int64 if launch.row_addresses else (
                 cutlass.BFloat16
                 if launch.topk_sum.full_rotation_output_dtype == "bf16"
                 else cutlass.Float32

@@ -2103,8 +2103,118 @@ def _run_coordinator_benchmark(args, device, props):
         raise RuntimeError(f"{len(failures)} coordinator cases fail correctness; see {args.output}")
 
 
+def _run_row_address_curve(args, device, props):
+    """Compare the same compiled WS math with strided and table row views."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
+    from b12x.moe._shared.kernels.w4a16.host import exl3_ws_segment_scratch_bytes
+    from benchmarks.benchmark_exlr8_a16 import make_wire, load_route_waves, real_route_ids
+    from benchmarks.bench_cuteafd_minimax import NvmlWindow
+
+    if (props.major, props.minor) != (12, 1):
+        raise ValueError("row-address curve requires SM121")
+    if args.prefill_family != "glm" or args.profile != "spark-tp4-width512" or args.routes is None:
+        raise ValueError("row-address curve requires GLM spark-tp4-width512 and --routes")
+    rows_list = [int(v) for v in (args.rows or "2048,2752,4096,5504").split(",")]
+    if not 0 < min(rows_list) <= max(rows_list) <= args.capacity <= 8192:
+        raise ValueError("row-address curve rows must fit --capacity <= 8192")
+    torch.cuda.set_per_process_memory_fraction(min(0.9, (args.memory_cap_gib << 30) / props.total_memory))
+    layer = _make_coordinator_layer(512, 64, args.seed, device, "glm")
+    arm = dict(mode="ws", wire=1, dynamic=1, stages=3, prerotate=0)
+    options = coordinator_compile_options(args.profile, 4096, arm, props, "glm")
+    options["size_m"] = args.capacity
+    options["max_m_blocks"] = route_pack_capacity(args.capacity * 8, 64, 256, topk=8)[2]
+    launches = {name: mix.compile_mixed_trellis(**options, row_addresses=indirect)
+               for name, indirect in (("ordinary", False), ("addressed", True))}
+    bindings = {name: mix.bind_mixed_trellis(*layer, launch,
+                gate_experts=(192, 64), up_experts=(192, 64)) for name, launch in launches.items()}
+    ordinary = mix.make_mixed_trellis_buffers(launches["ordinary"], device=device,
+                                             sms=props.multi_processor_count)
+    mix.warmup_mixed_trellis_route_pack(launches["ordinary"], ordinary,
+                                      expert_map=bindings["ordinary"].global_to_combined)
+    waves = [wave for wave in load_route_waves(str(args.routes)) if wave.get("layer") == args.route_layer]
+    if not waves:
+        raise ValueError("no recorded route wave at --route-layer")
+    wave = waves[0]
+    generator = torch.Generator().manual_seed(args.seed)
+    raw = (torch.randn(args.capacity, 6144, generator=generator) * 0.02).to(device).bfloat16()
+    wire = make_wire(raw)
+    weights = torch.rand(args.capacity, 8, generator=generator).to(device)
+    weights /= weights.sum(-1, keepdim=True)
+    report = dict(gpu=props.name, uuid=str(props.uuid), sms=props.multi_processor_count,
+        source_sha256=PREFILL_SOURCE_SHA256, capacity=args.capacity,
+        geometry=options, route_fixture=str(args.routes), route_wave=wave,
+        conditions="warmed graph replay, WS core+sum, route packing excluded, synthetic K4/K5 weights, recorded routes",
+        ceiling="row-table overhead should be noise versus weight decode; stop if >10% per-row regression or adjacent-size collapse",
+        points=[])
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    for rows in rows_list:
+        ids = real_route_ids(rows, wave, generator, 256, 8).to(device=device, dtype=torch.int32)
+        addressed = mix.make_mixed_trellis_segment_buffers(launches["addressed"], rows=rows,
+            device=device, sms=props.multi_processor_count)
+        result = torch.empty(rows, 6144, dtype=torch.bfloat16, device=device)
+        permutation = torch.randperm(rows, device=device)
+        x_table = wire.data_ptr() + permutation.long() * wire.shape[1]
+        y_table = result.data_ptr() + permutation.long() * 6144 * 2
+        addressed = replace(addressed, output=y_table)
+        reordered_ids, reordered_weights = ids[permutation], weights[:rows][permutation]
+        calls = {
+            "ordinary": lambda: mix.run_bound_mixed_trellis(wire[:rows], weights[:rows], ids,
+                                                           bindings["ordinary"], ordinary),
+            "addressed": lambda: mix.run_bound_mixed_trellis(x_table, reordered_weights, reordered_ids,
+                                                            bindings["addressed"], addressed),
+        }
+        expected = calls["ordinary"]().clone()
+        calls["addressed"]()
+        torch.cuda.synchronize()
+        assert torch.equal(expected.view(torch.uint8), result.view(torch.uint8))
+        assert torch.isfinite(expected).all() and expected.count_nonzero()
+        if args.check_prefix_rows:
+            for count in (1, 33, rows // 2):
+                actual = mix.run_bound_mixed_trellis(wire[:count], weights[:count], ids[:count],
+                                                    bindings["ordinary"], ordinary)
+                assert torch.equal(actual.view(torch.uint8), expected[:count].view(torch.uint8))
+        graphs = {}
+        # Resolve and pack each arm, then freeze its packed routes for core-only timing.
+        for name, workspace in (("ordinary", ordinary), ("addressed", addressed)):
+            calls[name]()
+            slots = route_pack_capacity(rows * 8, 64, 256, topk=8, bucket_tokens=False)[1]
+            packed = workspace.packed_route_indices[:slots], workspace.block_expert_ids, workspace.packed_route_count
+            with patch.object(mix, "pack_topk_routes_by_expert", return_value=packed):
+                with kernel_resolution_guard("row-address curve frozen launch"):
+                    graphs[name] = _capture(calls[name], args.warmup)
+        samples = {name: [] for name in graphs}
+        with NvmlWindow() as thermal:
+            for repeat in range(args.rounds):
+                for name in (("ordinary", "addressed") if repeat % 2 == 0 else ("addressed", "ordinary")):
+                    samples[name].extend(_times(graphs[name], args.replays))
+        median = {name: statistics.median(values) for name, values in samples.items()}
+        for graph in graphs.values():
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(expected.view(torch.uint8), result.view(torch.uint8))
+        point = dict(rows=rows, routed_rows=rows * 8, byte_identical=True,
+            median_us=median, us_per_routed_row={name: us / (rows * 8) for name, us in median.items()},
+            addressed_over_ordinary=median["addressed"] / median["ordinary"], samples_us=samples,
+            scratch_bytes=exl3_ws_segment_scratch_bytes(rows=rows, maximum=args.capacity,
+                hidden=6144, intermediate=512, topk=8, experts=256, block=64,
+                max_m_blocks=launches["addressed"].max_m_blocks, sms=props.multi_processor_count),
+            nvml=thermal.result())
+        report["points"].append(point)
+        args.output.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps({k: v for k, v in point.items() if k not in ("samples_us", "nvml")}), flush=True)
+        for graph in graphs.values():
+            graph.reset()
+        del graphs, calls, addressed, result
+    return report
+
+
 def benchmark_parser():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--row-address-curve", action="store_true", help="SM121 GLM WS strided versus row-table curve")
+    parser.add_argument("--capacity", type=int, default=8192, help="compiled extent for --row-address-curve")
+    parser.add_argument("--compare-routes-exact", action="store_true", help="require ordinary/addressed byte equality (always on for row curve)")
+    parser.add_argument("--check-prefix-rows", action="store_true", help="check ordinary WS prefix row invariance")
     parser.add_argument("--m", type=int, nargs="+", default=[1, 2, 4, 8, 32])
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--replays", type=int, default=100)
@@ -2181,6 +2291,12 @@ def benchmark_parser():
 def main() -> None:
     parser = benchmark_parser()
     args = parser.parse_args()
+    if args.row_address_curve:
+        if args.output is None:
+            parser.error("--row-address-curve requires --output")
+        device = torch.device("cuda", torch.cuda.current_device())
+        _run_row_address_curve(args, device, torch.cuda.get_device_properties(device))
+        return
     if args.bits and (not args.prefill_family or args.bits[0] >= args.bits[1]):
         parser.error("--bits requires --prefill-family and an increasing tier pair")
     if args.prefill_family and (args.kimi or args.output is None or args.memory_cap_gib <= 0):
