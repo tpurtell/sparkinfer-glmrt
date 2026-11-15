@@ -139,6 +139,22 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink, native_curve=False):
             mid_out_stride=partial.stride(),mid_lse_stride=lse.stride(),has_extra=True,pbs_extra=256,valid_hpb=16,native_dsv41_fp8=native)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         scale = cutlass.Float32(512**-.5 * math.log2(math.e))
+        if native_curve:
+            from b12x.attention._shared.mla.native_v41_aot import NativeV41Attention
+            from b12x._lib.utils import make_ptr, current_cuda_stream
+            launch = NativeV41Attention(heads)
+            if native:
+                launch.decode = kernel
+            tensors = (q,desc,meta,ei,bounds,sink,partial,lse,output)
+            types = (cutlass.BFloat16,cutlass.Uint64,cutlass.Uint64,cutlass.Int32,cutlass.Uint64,cutlass.Float32,cutlass.BFloat16,cutlass.Float32,cutlass.BFloat16)
+            aligns = (16,8,8,4,8,4,16,4,16)
+            pointers = tuple(make_ptr(t,x.data_ptr(),cute.AddressSpace.gmem,assumed_align=a) for x,t,a in zip(tensors,types,aligns))
+            compiled = cute.compile(launch,*pointers,cutlass.Int32(1),current_cuda_stream())
+            def run(live_rows=None,compiled=compiled,pointers=pointers,retained=retained):
+                compiled(*pointers,cutlass.Int32(rows if live_rows is None else live_rows),current_cuda_stream())
+            runs[arm] = (run,output)
+            lses[arm] = lse
+            continue
         if native or native_curve:
             params = tuple(from_dlpack(x) for x in (q,desc,meta,ei,bounds,partial,lse))
             compiled = cute.compile(kernel.call_native_v41,*params,scale,cutlass.Int32(1 if native_curve else rows),stream)
