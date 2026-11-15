@@ -2,6 +2,14 @@
 
 Both routes use one query token per CTA: a row's key tiles and reduction order
 cannot depend on how prefill units were split. Shared MiMo code stays untouched.
+
+The 8-bit KV route keeps the reference's per-element BF16 dequantization: the
+MMAs consume ``bf16(kv * scale)``, exactly the bytes the BF16 route consumes
+when it is handed the same-scale QDQ records, so the two routes are
+bit-identical. Each tile's bytes are converted straight from global memory into
+its shared BF16 tile at the QK/PV phase boundaries (see ``_stage``) instead of
+being staged in registers at the previous tile's start, which keeps a tile's
+raw words and scales out of the MMA register lifetime.
 """
 from __future__ import annotations
 
@@ -9,18 +17,69 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
+from b12x._lib.intrinsics import ld_global_nc_v4_u32, shared_ptr_to_u32, st_shared_v4_u32
 from b12x.attention._shared.contiguous import layout_utils
 from b12x.attention._shared.contiguous.forward import warp_mma_gemm
 from b12x.attention._shared.contiguous.softmax import Softmax
 from ._common import Operand, Scalar, compile_program
+from ._fp8_weights import _e4m3x8_scaled_bf16, _ld_f32
 from ._glm_kernels import _bf16
-from ._mimo_kernels import MimoGqaAttention, MimoRingCommit
+from ._mimo_kernels import MimoGqaAttention, MimoRingCommit, _s8x8_scaled_bf16
 from .pointwise import _mul
 
 
 class MuseGqaAttention(MimoGqaAttention):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # _stage converts whole 16-byte pieces of one head at a fixed offset; every supported
+        # Muse geometry (head = v_head = 64, one 64-dim scale group) divides that way.
+        if self.kv_fp8 and (self.chunk != 16 or self.head != self.v_head
+                            or self.threads % (self.head // 16)):
+            raise ValueError("Muse 8-bit attention stages whole 16-byte pieces")
+
+    @cute.jit
+    def _stage(self, key_addr: cute.Tensor, buf: Int32, kv_head: Int32, cache: cute.Pointer,
+               value: cutlass.Constexpr, s_k: cute.Tensor, s_v: cute.Tensor, thread: Int32):
+        """Convert one tile's 8-bit keys (``value`` false) or values of slot ``buf`` into their
+        shared BF16 tile, one 16-byte piece at a time.
+
+        Byte-for-byte what ``_load_raw`` + ``_widen`` produce -- ``bf16(q * scale)`` per
+        element, missing keys zero-filled -- but each piece's words and scale are consumed as
+        they are loaded, so a tile's staging registers never stay live into an MMA phase."""
+        k_scale_off = self.kv_heads * (self.head + self.v_head)
+        v_scale_off = k_scale_off + 4 * self.kv_heads * self.k_scales
+        widen = _e4m3x8_scaled_bf16 if self.kv8 == "e4m3" else _s8x8_scaled_bf16
+        if cutlass.const_expr(value):
+            plane = Int64(self.kv_heads * self.head) + Int64(kv_head) * Int64(self.v_head)
+            scale_base = Int64(v_scale_off) + Int64(4 * self.v_scales) * Int64(kv_head)
+            per_scale = self.v_head if self.kv_group == 0 else self.kv_group
+            vectors, tile = self.v_head // 16, s_v
+        else:
+            plane = Int64(kv_head) * Int64(self.head)
+            scale_base = Int64(k_scale_off) + Int64(4 * self.k_scales) * Int64(kv_head)
+            per_scale = self.head if self.kv_group == 0 else self.kv_group
+            vectors, tile = self.head // 16, s_k
+        fallback = Int64(cache.toint())
+        # Every piece this thread owns sits at the same head offset (threads is a multiple of
+        # `vectors`), so one loop-invariant piece and scale index serves them all.
+        dim = (thread % Int32(vectors)) * Int32(16)
+        scale_off = scale_base + Int64(4) * Int64(dim // Int32(per_scale))
+        for it in cutlass.range_constexpr(self.tile_n * vectors // self.threads):
+            token = (thread + Int32(it * self.threads)) // Int32(vectors)
+            base = Int64(key_addr[buf, token])
+            valid = base >= Int64(0)
+            words = ld_global_nc_v4_u32(cutlass.select_(valid, base + plane + Int64(dim), fallback))
+            scale = cutlass.select_(
+                valid, _ld_f32(cutlass.select_(valid, base + scale_off, fallback)), Float32(0.0))
+            words = (cutlass.select_(valid, words[0], Uint32(0)), cutlass.select_(valid, words[1], Uint32(0)),
+                     cutlass.select_(valid, words[2], Uint32(0)), cutlass.select_(valid, words[3], Uint32(0)))
+            for half in cutlass.range_constexpr(2):
+                w0, w1, w2, w3 = widen(words[2 * half], words[2 * half + 1], scale)
+                st_shared_v4_u32(shared_ptr_to_u32(tile.iterator + cute.crd2idx(
+                    (token, dim + Int32(8 * half)), tile.layout)), w0, w1, w2, w3)
+
     @cute.jit
     def _tile(self, tile: Int32, next_tile: Int32, has_next, buf: Int32, lo: Int64, hi: Int64, row0: Int64,
               kv_head: Int32, cache: cute.Pointer,
@@ -33,13 +92,16 @@ class MuseGqaAttention(MimoGqaAttention):
               cs_v: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax, raw: cute.Tensor, raw_s: cute.Tensor,
               is_first: cutlass.Constexpr):
         if cutlass.const_expr(self.kv_fp8):
-            self._widen(raw, raw_s, s_k, s_v, thread)
+            # The next tile's addresses go to their own key_addr slot, so resolving them here
+            # costs nothing and leaves its conversion to this tile's QK/PV boundaries.
             if has_next:
                 self._resolve(next_tile, Int32(1) - buf, lo, hi, cache, kv_step, page_table, table_base,
                               seq_start, step_first, ring_base, key_addr, key_pos, thread)
-            cute.arch.sync_threads()
-            if has_next:
-                self._load_raw(key_addr, Int32(1) - buf, kv_head, cache, raw, raw_s, thread)
+            if cutlass.const_expr(is_first):
+                # The prologue staged this tile's bytes in registers; every later tile arrives
+                # already converted (the previous call's _stage at its QK/PV boundaries).
+                self._widen(raw, raw_s, s_k, s_v, thread)
+                cute.arch.sync_threads()
         else:
             self._resolve(tile, buf, lo, hi, cache, kv_step, page_table, table_base, seq_start, step_first,
                           ring_base, key_addr, key_pos, thread)
@@ -76,6 +138,11 @@ class MuseGqaAttention(MimoGqaAttention):
                 if coords[m, 0][1] == Int32(0):
                     s_scale[coords[m, 0][0]] = row_scale[m]
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.kv_fp8):
+            if has_next:
+                # Every warp has finished reading this tile's shared keys, so the next tile's
+                # keys convert now, under the PV MMA.
+                self._stage(key_addr, Int32(1) - buf, kv_head, cache, False, s_k, s_v, thread)
         o_mn = layout_utils.reshape_acc_to_mn(acc_o)
         o_coords = layout_utils.reshape_acc_to_mn(
             tiled_mma_pv.get_slice(thread).partition_C(cute.make_identity_tensor((self.tile_m, self.v_head))))
@@ -85,6 +152,10 @@ class MuseGqaAttention(MimoGqaAttention):
                 o_mn[m, None].store(o_mn[m, None].load() * scale)
         warp_mma_gemm(tiled_mma_pv, acc_o, r_p, r_v, cs_p, cs_v, c_p, c_v)
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.kv_fp8):
+            if has_next:
+                # Values are free too; the next tile's QK and softmax hide these loads.
+                self._stage(key_addr, Int32(1) - buf, kv_head, cache, True, s_k, s_v, thread)
 
 
 class FullAttention:
