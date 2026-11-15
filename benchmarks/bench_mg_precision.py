@@ -150,7 +150,7 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink, native_curve=False):
             aligns = (16,8,8,4,8,4,16,4,16)
             pointers = tuple(make_ptr(t,x.data_ptr(),cute.AddressSpace.gmem,assumed_align=a) for x,t,a in zip(tensors,types,aligns))
             compiled = cute.compile(launch,*pointers,cutlass.Int32(1),current_cuda_stream())
-            def run(live_rows=None,compiled=compiled,pointers=pointers,retained=retained):
+            def run(live_rows=None,compiled=compiled,pointers=pointers,retained=(retained,tensors)):
                 compiled(*pointers,cutlass.Int32(rows if live_rows is None else live_rows),current_cuda_stream())
             runs[arm] = (run,output)
             lses[arm] = lse
