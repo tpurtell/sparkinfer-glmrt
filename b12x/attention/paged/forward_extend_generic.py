@@ -3329,6 +3329,38 @@ class PagedForwardKernel:
                 else 1
             )
         )
+        self.inline_scale_row_elems = 4
+        self.inline_scale_row_bytes = self.inline_scale_row_elems * 4
+        self.use_staged_inline_scales = (
+            inline_scale_offsets is not None
+            and inline_scale_stride == self.inline_scale_row_bytes
+            and all(
+                offset % self.inline_scale_row_bytes == 0
+                for offset in inline_scale_offsets
+            )
+            and self.stage_tile_rows <= traits.num_threads
+        )
+        smem_kv_stage_bytes = (
+            self.stage_tile_rows
+            * (traits.upcast_stride_k + traits.upcast_stride_v)
+            * 16
+        )
+        if (
+            self.use_staged_inline_scales
+            and traits.num_warps_kv > 1
+            and (
+                q_stage_bytes
+                + self.num_stages
+                * (
+                    smem_kv_stage_bytes
+                    + 2 * self.stage_tile_rows * self.inline_scale_row_bytes
+                )
+                > traits.shared_storage_bytes
+            )
+        ):
+            raise ValueError(
+                "inline scale shared staging exceeds decode payload shared_storage_bytes"
+            )
         # The extend TMA path indexes one 64-row source tile per page-table
         # entry. Page-128 uses the byte-addressed copy path until extend TMA
         # gets the decode kernel's page-entry flattening.
@@ -3645,6 +3677,20 @@ class PagedForwardKernel:
                         ],
                         128,
                     ]
+                if self.use_staged_inline_scales:
+                    scale_struct = cute.struct.Align[
+                        cute.struct.MemRange[
+                            Float32,
+                            int(
+                                self.num_stages
+                                * self.stage_tile_rows
+                                * self.inline_scale_row_elems
+                            ),
+                        ],
+                        128,
+                    ]
+                    SharedStorage.__annotations__["sKScale"] = scale_struct
+                    SharedStorage.__annotations__["sVScale"] = scale_struct
 
         return cute.struct(SharedStorage)
 
@@ -3858,6 +3904,51 @@ class PagedForwardKernel:
         return Float32(scale[0])
 
     @cute.jit
+    def _async_copy_inline_scale_tile_128b(
+        self,
+        mCacheBytes: cute.Tensor,
+        page_id,
+        tile_token_base,
+        page_stride_bytes,
+        scale_offset: cutlass.Constexpr,
+        sScaleBytes: cute.Tensor,
+        stage_byte_offset,
+        tidx,
+        valid_rows,
+    ):
+        page_size = Int32(self.page_size)
+        if tidx < Int32(self.stage_tile_rows):
+            row_idx = Int32(tidx)
+            entry_idx = (
+                row_idx
+                if const_expr(
+                    self.msa_block_sparse
+                    and not self.split_kv
+                    and self.stage_tile_rows == self.page_size
+                )
+                else (
+                    tile_token_base - (tile_token_base // page_size) * page_size
+                )
+                + row_idx
+            )
+            page_valid = page_id >= Int32(0)
+            safe_page_id = cutlass.select_(page_valid, page_id, Int32(0))
+            row_valid = (row_idx < valid_rows) and page_valid
+            src_byte_idx = (
+                Int64(safe_page_id) * Int64(page_stride_bytes)
+                + Int64(scale_offset)
+                + Int64(entry_idx) * Int64(self.inline_scale_row_bytes)
+            )
+            dst_byte_idx = stage_byte_offset + row_idx * Int32(
+                self.inline_scale_row_bytes
+            )
+            _cp_async_load_128b_zfill(
+                shared_ptr_to_u32(sScaleBytes.iterator + dst_byte_idx),
+                get_ptr_as_int64(mCacheBytes, src_byte_idx),
+                cutlass.select_(row_valid, Int32(16), Int32(0)),
+            )
+
+    @cute.jit
     def _async_copy_paged_tile_permuted_128b(
         self,
         mCacheBytes: cute.Tensor,
@@ -3878,71 +3969,126 @@ class PagedForwardKernel:
         valid_rows,
         upcast_stride,
         fill_zero: cutlass.Constexpr,
+        preloaded_page_id=None,
     ):
         page_size = Int32(self.page_size)
         lane_row = lane // 8
         lane_col = lane % 8
-        for tile_iter in cutlass.range_constexpr(
-            self.traits.num_mma_kv * 4 // self.traits.num_warps_q
-        ):
-            row_idx = Int32(
-                warp_linear_idx * 4 + lane_row + tile_iter * self.total_warps * 4
+        if const_expr(self.msa_block_sparse):
+            sparse_page_id = (
+                mPageTable[request_idx, page_idx]
+                if const_expr(preloaded_page_id is None)
+                else preloaded_page_id
             )
-            if const_expr(self.use_kv_repack):
-                token_idx = Uint32(tile_token_base + row_idx)
-                page_iter = token_idx >> Uint32(7)
-                entry_idx = token_idx & Uint32(127)
-            else:
-                token_idx = Int32(tile_token_base + row_idx)
-                page_iter = (
-                    page_idx
-                    if const_expr(self.msa_block_sparse)
-                    else token_idx // page_size
+            sparse_page_row_base = (
+                Int32(0)
+                if const_expr(
+                    not self.split_kv and self.stage_tile_rows == self.page_size
                 )
-                entry_idx = (
-                    (
-                        tile_token_base
-                        - (tile_token_base // page_size) * page_size
-                    )
-                    + row_idx
-                    if const_expr(self.msa_block_sparse)
-                    else token_idx - page_iter * page_size
+                else tile_token_base - (tile_token_base // page_size) * page_size
+            )
+            sparse_page_valid = sparse_page_id >= Int32(0)
+            safe_sparse_page_id = cutlass.select_(
+                sparse_page_valid, sparse_page_id, Int32(0)
+            )
+            sparse_page_byte_base = (
+                Int64(safe_sparse_page_id) * Int64(page_stride_bytes)
+                + Int64(kv_head_idx) * Int64(head_stride_bytes)
+            )
+            for tile_iter in cutlass.range_constexpr(
+                self.traits.num_mma_kv * 4 // self.traits.num_warps_q
+            ):
+                row_idx = Int32(
+                    warp_linear_idx * 4 + lane_row + tile_iter * self.total_warps * 4
                 )
-            page_id = mPageTable[request_idx, page_iter]
-            row_valid = row_idx < valid_rows
-            row_byte_base = (
-                (
-                    Int64(Uint32(page_id)) * Int64(page_stride_bytes)
-                    + Int64(Uint32(entry_idx)) * Int64(token_stride_bytes)
-                    + Int64(Uint32(kv_head_idx)) * Int64(head_stride_bytes)
-                )
-                if const_expr(self.use_kv_repack)
-                else (
-                    Int64(page_id) * Int64(page_stride_bytes)
+                entry_idx = sparse_page_row_base + row_idx
+                row_valid = (row_idx < valid_rows) and sparse_page_valid
+                row_byte_base = (
+                    sparse_page_byte_base
                     + Int64(entry_idx) * Int64(token_stride_bytes)
-                    + Int64(kv_head_idx) * Int64(head_stride_bytes)
                 )
-            )
-            for vec_iter in cutlass.range_constexpr((row_bytes + 127) // 128):
-                vec_idx = Int32(lane_col + vec_iter * 8)
-                src_byte_idx = row_byte_base + vec_idx * 16
-                dst_byte_idx = (
-                    stage_byte_offset
-                    + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
-                )
-                vec_valid = row_valid and (vec_idx * Int32(16) < row_bytes)
-                if const_expr(fill_zero):
-                    _cp_async_load_128b_zfill(
-                        shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
-                        get_ptr_as_int64(mCacheBytes, src_byte_idx),
-                        cutlass.select_(vec_valid, Int32(16), Int32(0)),
+                for vec_iter in cutlass.range_constexpr((row_bytes + 127) // 128):
+                    vec_idx = Int32(lane_col + vec_iter * 8)
+                    src_byte_idx = row_byte_base + vec_idx * 16
+                    dst_byte_idx = (
+                        stage_byte_offset
+                        + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
                     )
+                    vec_valid = row_valid and (vec_idx * Int32(16) < row_bytes)
+                    if const_expr(fill_zero):
+                        _cp_async_load_128b_zfill(
+                            shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
+                            get_ptr_as_int64(mCacheBytes, src_byte_idx),
+                            cutlass.select_(vec_valid, Int32(16), Int32(0)),
+                        )
+                    else:
+                        _cp_async_load_128b_pred(
+                            shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
+                            get_ptr_as_int64(mCacheBytes, src_byte_idx),
+                            Int32(vec_valid),
+                        )
+        else:
+            for tile_iter in cutlass.range_constexpr(
+                self.traits.num_mma_kv * 4 // self.traits.num_warps_q
+            ):
+                row_idx = Int32(
+                    warp_linear_idx * 4 + lane_row + tile_iter * self.total_warps * 4
+                )
+                if const_expr(self.use_kv_repack):
+                    token_idx = Uint32(tile_token_base + row_idx)
+                    page_iter = token_idx >> Uint32(7)
+                    entry_idx = token_idx & Uint32(127)
                 else:
-                    _cp_async_load_128b_pred(
-                        shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
-                        get_ptr_as_int64(mCacheBytes, src_byte_idx),
-                        Int32(vec_valid),
+                    token_idx = Int32(tile_token_base + row_idx)
+                    page_iter = (
+                        page_idx
+                        if const_expr(self.msa_block_sparse)
+                        else token_idx // page_size
                     )
+                    entry_idx = (
+                        (
+                            tile_token_base
+                            - (tile_token_base // page_size) * page_size
+                        )
+                        + row_idx
+                        if const_expr(self.msa_block_sparse)
+                        else token_idx - page_iter * page_size
+                    )
+                page_id = mPageTable[request_idx, page_iter]
+                row_valid = row_idx < valid_rows
+                row_byte_base = (
+                    (
+                        Int64(Uint32(page_id)) * Int64(page_stride_bytes)
+                        + Int64(Uint32(entry_idx)) * Int64(token_stride_bytes)
+                        + Int64(Uint32(kv_head_idx)) * Int64(head_stride_bytes)
+                    )
+                    if const_expr(self.use_kv_repack)
+                    else (
+                        Int64(page_id) * Int64(page_stride_bytes)
+                        + Int64(entry_idx) * Int64(token_stride_bytes)
+                        + Int64(kv_head_idx) * Int64(head_stride_bytes)
+                    )
+                )
+                for vec_iter in cutlass.range_constexpr((row_bytes + 127) // 128):
+                    vec_idx = Int32(lane_col + vec_iter * 8)
+                    src_byte_idx = row_byte_base + vec_idx * 16
+                    dst_byte_idx = (
+                        stage_byte_offset
+                        + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
+                    )
+                    vec_valid = row_valid and (vec_idx * Int32(16) < row_bytes)
+                    if const_expr(fill_zero):
+                        _cp_async_load_128b_zfill(
+                            shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
+                            get_ptr_as_int64(mCacheBytes, src_byte_idx),
+                            cutlass.select_(vec_valid, Int32(16), Int32(0)),
+                        )
+                    else:
+                        _cp_async_load_128b_pred(
+                            shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
+                            get_ptr_as_int64(mCacheBytes, src_byte_idx),
+                            Int32(vec_valid),
+                        )
 
     @cute.jit
     def _issue_paged_kv_tma_copy_planes(
@@ -4494,6 +4640,20 @@ class PagedForwardKernel:
             * (self.dtype_kv_storage.width // 8)
         )
         kv_plane_total_bytes = self.num_stages * kv_plane_stage_bytes
+        scale_stage_bytes = stage_tile_rows * self.inline_scale_row_bytes
+        scale_bytes = self.num_stages * scale_stage_bytes
+        scale_layout = cute.make_layout(
+            (stage_tile_rows, self.inline_scale_row_elems, self.num_stages),
+            stride=(
+                self.inline_scale_row_elems,
+                1,
+                stage_tile_rows * self.inline_scale_row_elems,
+            ),
+        )
+        sKScale = None
+        sKScaleBytes = None
+        sVScale = None
+        sVScaleBytes = None
         warp_linear_idx = warp_kv_idx * self.traits.num_warps_q + warp_q_idx
         tidx = lane + 32 * (warp_q_idx + self.traits.num_warps_q * warp_kv_idx)
 
@@ -4568,6 +4728,44 @@ class PagedForwardKernel:
                 q_bytes + k_bytes,
                 cute.make_layout((v_bytes,), stride=(1,)),
             )
+            if const_expr(self.use_staged_inline_scales):
+                # Decode payload_u8 alias lifetimes (shared_storage_bytes = 65536 B):
+                # - Mainloop phase: sQ uses [0, q_bytes), sK [q_bytes, +k_bytes),
+                #   sV [q_bytes + k_bytes, +v_bytes), sKScale [q_bytes + k_bytes + v_bytes,
+                #   +scale_bytes), and sVScale [..., +scale_bytes) (20480..22528 B for D128 N64).
+                #   Each iteration drains cp.async via cp_async_wait_group(0) + sync_threads()
+                #   before reading sKScale/sVScale, then executes both the pre-PV sync_threads()
+                #   and the post-PV sync_threads(); on the final tile (next_tile_base >= chunk_end)
+                #   no new cp.async is issued, and when chunk_start >= chunk_end neither preload
+                #   nor mainloop touches sKScale/sVScale after the post-sQ sync_threads().
+                # - Epilogue phase: sSyncO [0, sync_o_bytes) and sSyncMD [sync_o_bytes, +sync_md_bytes)
+                #   reuse payload_u8 only after the mainloop exits past those CTA barriers.
+                k_scale_payload_offset = q_bytes + k_bytes + v_bytes
+                v_scale_payload_offset = k_scale_payload_offset + scale_bytes
+                sKScale = _make_payload_tensor(
+                    payload_u8,
+                    Float32,
+                    k_scale_payload_offset,
+                    scale_layout,
+                )
+                sKScaleBytes = _make_payload_tensor(
+                    payload_u8,
+                    cutlass.Uint8,
+                    k_scale_payload_offset,
+                    cute.make_layout((scale_bytes,), stride=(1,)),
+                )
+                sVScale = _make_payload_tensor(
+                    payload_u8,
+                    Float32,
+                    v_scale_payload_offset,
+                    scale_layout,
+                )
+                sVScaleBytes = _make_payload_tensor(
+                    payload_u8,
+                    cutlass.Uint8,
+                    v_scale_payload_offset,
+                    cute.make_layout((scale_bytes,), stride=(1,)),
+                )
             sKTma = None
             sVTma = None
             if const_expr(self.use_paged_kv_tma_exact_plane_bf16_layout):
@@ -4822,6 +5020,17 @@ class PagedForwardKernel:
                     cute.recast_tensor(sV, cutlass.Uint8).iterator,
                     cute.make_layout((v_bytes,), stride=(1,)),
                 )
+                if const_expr(self.use_staged_inline_scales):
+                    sKScale = storage.sKScale.get_tensor(scale_layout)
+                    sVScale = storage.sVScale.get_tensor(scale_layout)
+                    sKScaleBytes = cute.make_tensor(
+                        cute.recast_tensor(sKScale, cutlass.Uint8).iterator,
+                        cute.make_layout((scale_bytes,), stride=(1,)),
+                    )
+                    sVScaleBytes = cute.make_tensor(
+                        cute.recast_tensor(sVScale, cutlass.Uint8).iterator,
+                        cute.make_layout((scale_bytes,), stride=(1,)),
+                    )
                 sKTma = None
                 sVTma = None
                 sKPlane0 = None
@@ -5598,6 +5807,11 @@ class PagedForwardKernel:
                     prefetch_base,
                     page_size,
                 )
+                prefetch_page_id = (
+                    mPageTable[request_idx, prefetch_page_idx]
+                    if const_expr(self.msa_block_sparse)
+                    else None
+                )
                 self._async_copy_paged_tile_permuted_128b(
                     mKBytes,
                     mPageTable,
@@ -5617,7 +5831,20 @@ class PagedForwardKernel:
                     tile_tokens,
                     self.traits.upcast_stride_k,
                     False,
+                    prefetch_page_id,
                 )
+                if const_expr(self.use_staged_inline_scales):
+                    self._async_copy_inline_scale_tile_128b(
+                        mKBytes,
+                        prefetch_page_id,
+                        prefetch_base,
+                        k_page_stride_bytes,
+                        self.inline_scale_offsets[0],
+                        sKScaleBytes,
+                        Int32(preload_stage_idx * scale_stage_bytes),
+                        tidx,
+                        tile_tokens,
+                    )
                 self._async_copy_paged_tile_permuted_128b(
                     mVBytes,
                     mPageTable,
@@ -5637,7 +5864,20 @@ class PagedForwardKernel:
                     tile_tokens,
                     self.traits.upcast_stride_v,
                     True,
+                    prefetch_page_id,
                 )
+                if const_expr(self.use_staged_inline_scales):
+                    self._async_copy_inline_scale_tile_128b(
+                        mVBytes,
+                        prefetch_page_id,
+                        prefetch_base,
+                        v_page_stride_bytes,
+                        self.inline_scale_offsets[1],
+                        sVScaleBytes,
+                        Int32(preload_stage_idx * scale_stage_bytes),
+                        tidx,
+                        tile_tokens,
+                    )
                 cute.arch.cp_async_commit_group()
                 prefetch_base += stage_tile_rows
                 preload_count += 1
@@ -5808,19 +6048,34 @@ class PagedForwardKernel:
                 _exit_thread()
 
             if const_expr(self.inline_scale_offsets is not None):
-                # An MSA tile never crosses a physical page. Resolve it once,
-                # then reuse each token's K scale across both query row slots.
-                scale_page = mPageTable[request_idx, tile_key_base // self.page_size]
-                scale_row = tile_key_base % self.page_size
                 token_k_scales = cute.make_rmem_tensor(cute.make_layout((num_mma_kv, 4)), Float32)
                 token_k_scales.fill(Float32(0.0))
-                for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                    for column in cutlass.range_constexpr(4):
-                        local = warp_kv_base + mma_kv * 16 + lane_pair_base + (column // 2) * 8 + column % 2
-                        if local < tile_tokens:
-                            token_k_scales[mma_kv, column] = self._inline_scale(
-                                mKBytes, scale_page, scale_row + local, kv_head_idx,
-                                k_page_stride_bytes, k_token_stride_bytes, self.inline_scale_offsets[0])
+                if const_expr(self.use_staged_inline_scales):
+                    for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                        for column in cutlass.range_constexpr(4):
+                            local = (
+                                warp_kv_base
+                                + mma_kv * 16
+                                + lane_pair_base
+                                + (column // 2) * 8
+                                + column % 2
+                            )
+                            if local < tile_tokens:
+                                token_k_scales[mma_kv, column] = Float32(
+                                    sKScale[local, kv_head_idx, consume_stage_idx]
+                                )
+                else:
+                    # An MSA tile never crosses a physical page. Resolve it once,
+                    # then reuse each token's K scale across both query row slots.
+                    scale_page = mPageTable[request_idx, tile_key_base // self.page_size]
+                    scale_row = tile_key_base % self.page_size
+                    for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                        for column in cutlass.range_constexpr(4):
+                            local = warp_kv_base + mma_kv * 16 + lane_pair_base + (column // 2) * 8 + column % 2
+                            if local < tile_tokens:
+                                token_k_scales[mma_kv, column] = self._inline_scale(
+                                    mKBytes, scale_page, scale_row + local, kv_head_idx,
+                                    k_page_stride_bytes, k_token_stride_bytes, self.inline_scale_offsets[0])
             subtile_base = (
                 Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
             )
@@ -6470,16 +6725,30 @@ class PagedForwardKernel:
                         for pair in cutlass.range_constexpr(2):
                             key_local = warp_kv_base + mma_kv * 16 + lane_pair_base + pair * 8
                             vs0, vs1 = Float32(0.0), Float32(0.0)
-                            if key_local < tile_tokens:
-                                vs0 = self._inline_scale(
-                                    mVBytes, scale_page, scale_row + key_local,
-                                    kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
-                                    self.inline_scale_offsets[1])
-                            if key_local + 1 < tile_tokens:
-                                vs1 = self._inline_scale(
-                                    mVBytes, scale_page, scale_row + key_local + 1,
-                                    kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
-                                    self.inline_scale_offsets[1])
+                            if const_expr(self.use_staged_inline_scales):
+                                if key_local < tile_tokens:
+                                    vs0 = Float32(
+                                        sVScale[key_local, kv_head_idx, consume_stage_idx]
+                                    )
+                                if key_local + 1 < tile_tokens:
+                                    vs1 = Float32(
+                                        sVScale[
+                                            key_local + 1,
+                                            kv_head_idx,
+                                            consume_stage_idx,
+                                        ]
+                                    )
+                            else:
+                                if key_local < tile_tokens:
+                                    vs0 = self._inline_scale(
+                                        mVBytes, scale_page, scale_row + key_local,
+                                        kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
+                                        self.inline_scale_offsets[1])
+                                if key_local + 1 < tile_tokens:
+                                    vs1 = self._inline_scale(
+                                        mVBytes, scale_page, scale_row + key_local + 1,
+                                        kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
+                                        self.inline_scale_offsets[1])
                             for mma_q in cutlass.range_constexpr(num_mma_q):
                                 for row_slot in cutlass.range_constexpr(2):
                                     index = row_slot + pair * 2
@@ -6558,6 +6827,7 @@ class PagedForwardKernel:
                 next_tile_base = prefetch_base
                 next_tile_tokens = Int32(0)
                 next_page_idx = Int32(0)
+                next_page_id = Int32(0)
                 if const_expr(not self.use_paged_k_tma):
                     # Every query warp reads the same K stage.  Do not let an
                     # early warp recycle it while another warp is still in QK.
@@ -6579,6 +6849,8 @@ class PagedForwardKernel:
                                 next_tile_base,
                                 page_size,
                             )
+                            if const_expr(self.msa_block_sparse):
+                                next_page_id = mPageTable[request_idx, next_page_idx]
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
                                 mPageTable,
@@ -6598,7 +6870,20 @@ class PagedForwardKernel:
                                 next_tile_tokens,
                                 self.traits.upcast_stride_k,
                                 False,
+                                next_page_id if const_expr(self.msa_block_sparse) else None,
                             )
+                            if const_expr(self.use_staged_inline_scales):
+                                self._async_copy_inline_scale_tile_128b(
+                                    mKBytes,
+                                    next_page_id,
+                                    next_tile_base,
+                                    k_page_stride_bytes,
+                                    self.inline_scale_offsets[0],
+                                    sKScaleBytes,
+                                    Int32(consume_stage_idx * scale_stage_bytes),
+                                    tidx,
+                                    next_tile_tokens,
+                                )
                     elif const_expr(self.traits.num_warps_kv == 1):
                         if next_tile_base < chunk_end:
                             next_tile_limit = cutlass.select_(
@@ -6616,6 +6901,8 @@ class PagedForwardKernel:
                                 next_tile_base,
                                 page_size,
                             )
+                            if const_expr(self.msa_block_sparse):
+                                next_page_id = mPageTable[request_idx, next_page_idx]
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
                                 mPageTable,
@@ -6635,7 +6922,20 @@ class PagedForwardKernel:
                                 next_tile_tokens,
                                 self.traits.upcast_stride_k,
                                 False,
+                                next_page_id if const_expr(self.msa_block_sparse) else None,
                             )
+                            if const_expr(self.use_staged_inline_scales):
+                                self._async_copy_inline_scale_tile_128b(
+                                    mKBytes,
+                                    next_page_id,
+                                    next_tile_base,
+                                    k_page_stride_bytes,
+                                    self.inline_scale_offsets[0],
+                                    sKScaleBytes,
+                                    Int32(consume_stage_idx * scale_stage_bytes),
+                                    tidx,
+                                    next_tile_tokens,
+                                )
 
                 if const_expr(self.use_paged_v_tma):
                     if const_expr(self.use_paged_kv_tma_fp8_raw_issue):
@@ -7161,7 +7461,20 @@ class PagedForwardKernel:
                             next_tile_tokens,
                             self.traits.upcast_stride_v,
                             True,
+                            next_page_id if const_expr(self.msa_block_sparse) else None,
                         )
+                        if const_expr(self.use_staged_inline_scales):
+                            self._async_copy_inline_scale_tile_128b(
+                                mVBytes,
+                                next_page_id,
+                                next_tile_base,
+                                v_page_stride_bytes,
+                                self.inline_scale_offsets[1],
+                                sVScaleBytes,
+                                Int32(consume_stage_idx * scale_stage_bytes),
+                                tidx,
+                                next_tile_tokens,
+                            )
                         cute.arch.cp_async_commit_group()
                         prefetch_base += stage_tile_rows
                 elif const_expr(self.traits.num_warps_kv == 1):
@@ -7186,7 +7499,20 @@ class PagedForwardKernel:
                             next_tile_tokens,
                             self.traits.upcast_stride_v,
                             True,
+                            next_page_id if const_expr(self.msa_block_sparse) else None,
                         )
+                        if const_expr(self.use_staged_inline_scales):
+                            self._async_copy_inline_scale_tile_128b(
+                                mVBytes,
+                                next_page_id,
+                                next_tile_base,
+                                v_page_stride_bytes,
+                                self.inline_scale_offsets[1],
+                                sVScaleBytes,
+                                Int32(consume_stage_idx * scale_stage_bytes),
+                                tidx,
+                                next_tile_tokens,
+                            )
                         cute.arch.cp_async_commit_group()
                         prefetch_base += stage_tile_rows
 
