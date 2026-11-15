@@ -212,7 +212,10 @@ def main(argv=None):
         out = {arm: torch.empty_like(q) for arm in arms}
         lse = {arm: torch.empty((max_rows, args.heads), device=device) for arm in arms}
         def run(arm, rows):
-            for n_hg, active_heads, offset in _mg_head_partitions(args.heads, 16):
+            # Native mixed KV needs more SMEM: use the existing single-group
+            # specialization, since paired groups exceed SM120's per-CTA cap.
+            partitions = [(1, args.heads, 0)] if args.format == "dsv41" else _mg_head_partitions(args.heads, 16)
+            for n_hg, active_heads, offset in partitions:
                 run_unified_prefill_mg(q=q[:rows], kv_cache=main_cache, topk_indices=mi[:rows],
                     topk_length=ml[:rows], sm_scale=512**-.5, page_block_size=main_page,
                     attn_sink=sink, output=out[arm][:rows], lse_out=lse[arm][:rows],
