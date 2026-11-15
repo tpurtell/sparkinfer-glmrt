@@ -18,6 +18,7 @@ Decode/verify example::
 from __future__ import annotations
 
 import argparse
+import hashlib
 from dataclasses import asdict, replace
 import json
 import math
@@ -82,6 +83,8 @@ def parse_args(argv=None):
         p.error("indexed width exceeds the 4096-key synthetic pool")
     if args.mode == "decode" and (args.format != "dsv41" or args.indexed_width != 512):
         p.error("native decode requires dsv41 with indexed width512")
+    if args.native_row_curve and (args.mode != "decode" or args.heads not in (32, 64)):
+        p.error("native row curves require decode mode and 32 or 64 heads")
     return args
 
 
@@ -323,7 +326,9 @@ def main(argv=None):
                         raise RuntimeError(f"nonfinite result: {arm}/{rows}/{pattern}")
                     record["arms"][arm] = {"output_rel_rms": float(delta.square().mean().sqrt() / ref[:rows].square().mean().sqrt()),
                         "output_max_abs": float(delta.abs().max()), "lse_max_abs": float(ld.abs().max()),
-                        "lse_rms": float(ld.square().mean().sqrt())}
+                        "lse_rms": float(ld.square().mean().sqrt()),
+                        "output_sha256": hashlib.sha256(actual.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+                        "lse_sha256": hashlib.sha256(actual_lse.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()}
                     if rows in args.timing_rows:
                         for _ in range(args.warmup):
                             execute(arm)

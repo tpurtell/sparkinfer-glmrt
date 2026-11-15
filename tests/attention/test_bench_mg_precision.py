@@ -54,6 +54,16 @@ def test_decode_contract_and_accuracy_only(tmp_path):
         parse_args(["--format", "dsv4", "--mode", "decode", "--output", str(tmp_path / "o.json")])
 
 
+def test_native_row_curve_controls(tmp_path):
+    base = ["--format", "dsv41", "--mode", "decode", "--output", str(tmp_path / "o.json")]
+    args = parse_args(base + ["--native-row-curve", "--heads", "32", "--rows", "1,64"])
+    assert args.native_row_curve and args.heads == 32
+    with pytest.raises(SystemExit):
+        parse_args(base + ["--native-row-curve", "--heads", "48"])
+    with pytest.raises(SystemExit):
+        parse_args(base + ["--native-row-curve", "--mode", "prefill"])
+
+
 def test_wrong_format_arm_rejected():
     with pytest.raises(ValueError):
         arm_traits("dsv41", "fp8-qk")
