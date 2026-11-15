@@ -408,12 +408,14 @@ def test_glm_next_accepts_inline_scale_nvfp4_without_rope() -> None:
             fp8_rope=True,
             latent_scale_per_token=True,
         )
-    with pytest.raises(ValueError, match="ComputeMode.FP8"):
-        make_unified_traits(
-            ModelType.GLM_NEXT,
-            ComputeMode.BF16,
-            ScaleFormat.ARBITRARY_FP32,
-        )
+    # BF16 attention over the same 528-byte FP8 records is a compute mode,
+    # not a cache format.
+    bf16_traits = make_unified_traits(
+        ModelType.GLM_NEXT,
+        ComputeMode.BF16,
+        ScaleFormat.ARBITRARY_FP32,
+    )
+    assert (bf16_traits.kv_gmem_stride, bf16_traits.kv_smem_stride) == (528, 528)
 
 
 def test_glm_next_nvfp4_unplanned_traits_enable_inline_latent_scale() -> None:

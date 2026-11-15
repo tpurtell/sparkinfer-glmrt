@@ -80,14 +80,26 @@ def _cache_block_stride_bytes(
     return expected
 
 
-def _mg_head_partitions(heads: int, hpb: int = 16) -> tuple[tuple[int, int, int], ...]:
-    """Return ``(mg_n_hg, active_heads, head_offset)`` partitions for 8-aligned heads."""
+def _mg_head_partitions(
+    heads: int, hpb: int = 16, max_groups: int = 2
+) -> tuple[tuple[int, int, int], ...]:
+    """Return ``(mg_n_hg, active_heads, head_offset)`` partitions for 8-aligned heads.
+
+    ``max_groups=1`` keeps one head group per CTA (``smem_mg.max_mg_head_groups``):
+    every full group goes to one launch."""
     heads = int(heads)
     hpb = int(hpb)
     if heads <= 0 or heads % (hpb // 2) != 0:
         return ()
 
     parts: list[tuple[int, int, int]] = []
+    if int(max_groups) == 1:
+        full = heads // hpb * hpb
+        if full:
+            parts.append((1, full, 0))
+        if heads - full:
+            parts.append((1, heads - full, full))
+        return tuple(parts)
     paired_width = 2 * hpb
     paired_heads = (heads // paired_width) * paired_width
     if paired_heads:

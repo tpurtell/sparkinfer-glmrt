@@ -11,7 +11,7 @@ are DROPPED per `.sm120port/scope_decisions.md`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 
 
@@ -89,6 +89,12 @@ class UnifiedMLATraits:
     # This is not a cache ABI change: it exists only after the gathered row is
     # owned by the math CTA.
     fp8_internal: bool = False
+    # Inline-FP32-scale (ARBITRARY_FP32) records with ComputeMode.BF16: BF16
+    # attention. K enters the QK MMA as its exact BF16 widening and the FP32
+    # group scale applies to each group's FP32 partial; P.V runs as a BF16 MMA
+    # over V dequantized in registers. False keeps every existing
+    # specialization's layout and PTX.
+    pv_bf16: bool = False
 
 
 def make_unified_traits(
@@ -340,11 +346,6 @@ def make_unified_traits(
                 "ScaleFormat.NVFP4_E4M3; "
                 f"got scale_format={scale_format!r}"
             )
-        if compute_mode != ComputeMode.FP8:
-            raise ValueError(
-                "GLM_NEXT currently requires ComputeMode.FP8; "
-                f"got compute_mode={compute_mode!r}"
-            )
         if fp8_rope is not None and bool(fp8_rope):
             raise ValueError("GLM_NEXT has no RoPE cache payload")
         # GLM-5.3 Flash keeps the 512-dimensional absorbed latent used by the
@@ -434,6 +435,23 @@ def infer_model_type(
         f"unsupported q_head_dim={q_head_dim!r}; expected 512 (DSV4 or explicit "
         "GLM_NEXT) or 576 (GLM_NSA)"
     )
+
+
+def with_bf16_attention(traits: UnifiedMLATraits) -> UnifiedMLATraits:
+    """BF16 QK and PV with exact keys over an inline-FP32-scale FP8 record.
+
+    The record, its staging stride and the cache ABI are unchanged. Q stays
+    BF16; K enters QK as its exact BF16 widening and each scale group's FP32
+    partial takes the inline FP32 scale, so QK carries no key rounding. V is
+    dequantized to BF16 in registers, P is BF16 and both products accumulate
+    in FP32.
+    """
+    if int(traits.scale_format) != int(ScaleFormat.ARBITRARY_FP32):
+        raise ValueError(
+            "with_bf16_attention applies to inline-FP32-scale records; "
+            f"got scale_format={traits.scale_format!r}"
+        )
+    return replace(traits, compute_mode=ComputeMode.BF16, pv_bf16=True)
 
 
 def is_glm_model_type(model_type: int) -> bool:

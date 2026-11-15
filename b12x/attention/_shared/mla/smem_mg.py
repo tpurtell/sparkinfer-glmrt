@@ -106,6 +106,12 @@ class SmemLayoutMG:
     total_bytes: int
 
 
+def max_mg_head_groups(traits: UnifiedMLATraits) -> int:
+    """Head groups one CTA can stage: BF16 Q for two groups plus the 528-byte
+    double-buffered KV rows exceeds the SM120 carveout."""
+    return 1 if traits.pv_bf16 else _MG_N_HG
+
+
 def make_smem_layout_mg(
     traits: UnifiedMLATraits, mg_n_hg: int = _MG_N_HG
 ) -> SmemLayoutMG:
@@ -589,6 +595,24 @@ def _run_module_asserts() -> None:
             f"{SM120_SMEM_CARVEOUT_BYTES}B (mg_n_hg={nhg})"
         )
         get_prefill_mg_shared_storage_cls(glm, mg_n_hg=nhg)
+
+    from .traits import with_bf16_attention
+
+    for base in (glm, make_unified_traits(
+        ModelType.GLM_NEXT, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32
+    )):
+        assert max_mg_head_groups(base) == _MG_N_HG
+        bf16_traits = with_bf16_attention(base)
+        assert max_mg_head_groups(bf16_traits) == 1
+        gl = make_smem_layout_mg(bf16_traits, mg_n_hg=1)
+        assert gl.bf16_qk and gl.kv_smem_stride == 528 and gl.kv_sc_buf_bytes == 0
+        assert gl.q_nope_bf16_stride == 520
+        assert gl.total_bytes < SM120_SMEM_CARVEOUT_BYTES
+        assert (
+            make_smem_layout_mg(bf16_traits, mg_n_hg=2).total_bytes
+            > SM120_SMEM_CARVEOUT_BYTES
+        )
+        get_prefill_mg_shared_storage_cls(bf16_traits, mg_n_hg=1)
 
     glm_next = make_unified_traits(
         ModelType.GLM_NEXT, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32
