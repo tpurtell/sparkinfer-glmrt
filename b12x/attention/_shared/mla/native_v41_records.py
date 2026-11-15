@@ -120,8 +120,9 @@ def issue_native_v41_gather(
     token_indices: cute.Tensor, full_mbar: cute.Pointer,
     start: Int32, io_lane: Int32, *, swa: cutlass.Constexpr,
     kv_stride: cutlass.Constexpr, io_threads: cutlass.Constexpr,
+    fp8_internal: cutlass.Constexpr = True,
 ):
-    """Stage native FP8-window/FP4-source records into upstream FP8 decode SMEM.
+    """Stage native FP8-window/FP4-source records for BF16 or canonical FP8 math.
 
     Payload planes must be 16-byte aligned. Uses the existing 64-key producer
     stage and one arrival per IO warp. Native descriptor format must be FP4.
@@ -142,11 +143,20 @@ def issue_native_v41_gather(
             token_indices[entry] = index
             row_addr = kv_addr + entry * Int32(kv_stride)
             st_shared_u32(row_addr + Int32(528), tag)
-            stage_dsv41_fp8_scales(
-                descriptor, Int64(0), row_addr + Int32(544),
-                scale_addr + entry * Int32(8), valid,
-                swa=swa, scale_address=Int64(scale),
-            )
+            if cutlass.const_expr(fp8_internal):
+                stage_dsv41_fp8_scales(
+                    descriptor, Int64(0), row_addr + Int32(544),
+                    scale_addr + entry * Int32(8), valid,
+                    swa=swa, scale_address=Int64(scale),
+                )
+            else:
+                # Preserve native group-32 SWA / group-16 indexed scales;
+                # BF16 math dequantizes these original records in registers.
+                for word in cutlass.range_constexpr(4 if swa else 8):
+                    bits = Uint32(0)
+                    if valid:
+                        bits = ld_global_nc_u32(Int64(scale) + Int64(word * 4))
+                    st_shared_u32(row_addr + Int32(payload_bytes + word * 4), bits)
             cp_async_bulk_g2s_mbar(row_addr, Int64(value), Int32(payload_bytes), shared_ptr_to_u32(full_mbar))
     cute.arch.fence_acq_rel_cta()
     if (io_lane & Int32(31)) == Int32(0):
