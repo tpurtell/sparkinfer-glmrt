@@ -177,6 +177,58 @@ def oracle(args, report):
     return results
 
 
+def diagnose(args, report):
+    """Bounded baseline control and failure receipt; never interpret as a timing gate."""
+    from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry
+    from b12x.integration.cuteafd.kimi_dsa import compile_kimi_sparse_mla_aot
+    from b12x.integration.cuteafd.kimi_mla_prefill_mg import compile_kimi_mg_prefill_aot
+    cache, values = records(4096)
+    results = report.setdefault("diagnostic", [])
+    for heads in args.heads:
+        g = KimiMlaGeometry(heads=heads, kv_cache="fp8")
+        base = compile_kimi_sparse_mla_aot(g, max_rows=64, row_chunk_size=64)
+        mg = compile_kimi_mg_prefill_aot(g, max_rows=64, max_context=4096, sparse=True)
+        q = torch.randn(5, heads, 576, device="cuda").bfloat16()
+        lengths = torch.tensor([0, 1, 63, 777, 2048], device="cuda", dtype=torch.int32)
+        table = torch.full((5, 2048), -1, device="cuda", dtype=torch.int32)
+        for row, length in enumerate(lengths.tolist()):
+            table[row, :length] = torch.randperm(4095, device="cuda")[:length].sort().values.int() + 1
+        cu = torch.arange(6, device="cuda", dtype=torch.int32)
+        out = [torch.empty(5, heads, 512, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+        lse = [torch.empty(5, heads, device="cuda") for _ in range(2)]
+        scratch = torch.empty(base.scratch_bytes(64)["scratch"], device="cuda", dtype=torch.uint8)
+        base.launch(q, cache, table, lengths, cu, out[0], lse[0], scratch, scalars=(5, 5, 2048, 16))
+        graph = capture(lambda: mg.launch(q, cache, table, lengths, out[1], lse[1], None, scalars=(5,)))
+        graph.replay()
+        torch.cuda.synchronize()
+        for row, length in enumerate(lengths.tolist()):
+            cell = dict(heads=heads, length=length)
+            if length == 0:
+                cell["mg_empty_zero_output"] = bool(torch.count_nonzero(out[1][row]) == 0)
+                cell["mg_empty_negative_inf_lse"] = bool(torch.isneginf(lse[1][row]).all())
+            else:
+                kv = values[table[row, :length].long()]
+                score = q[row].float() @ kv.T * g.softmax_scale
+                expected_o, expected_l = score.softmax(-1) @ kv[:, :512], score.logsumexp(-1)
+                for arm in (0, 1):
+                    name = "baseline" if arm == 0 else "mg"
+                    actual_l = lse[arm][row] * (0.6931471805599453 if arm else 1.)
+                    for field, actual, expected in (("output", out[arm][row].float(), expected_o),
+                                                     ("lse", actual_l, expected_l)):
+                        allowed = ((.0003 + .0003 * expected.abs()) if field == "lse" else
+                                   (.012 + .035 * expected.abs()))
+                        delta = (actual - expected).abs()
+                        cell[name + "_" + field + "_max_abs"] = float(delta.max())
+                        cell[name + "_" + field + "_mismatches"] = int((delta > allowed).sum())
+                    if arm == 0:
+                        comparison(out[arm][row], expected_o)
+                        comparison(actual_l, expected_l, lse=True)
+            results.append(cell)
+            print(json.dumps(cell), flush=True)
+    report["correctness_passed"] = False
+    report["timings_skipped"] = "MG FP8 QK fails unchanged Kimi oracle; BF16 MG cannot read inline FP32 scales"
+
+
 def curve(args, report):
     from b12x.integration.cuteafd.kimi_mla import KimiMlaGeometry, compile_kimi_dense_mla_aot
     from b12x.integration.cuteafd.kimi_dsa import compile_kimi_sparse_mla_aot
@@ -248,6 +300,7 @@ def main():
     p.add_argument("--rows", type=int, nargs="+", default=[2048, 2752, 4096, 2673, 65])
     p.add_argument("--prefixes", type=int, nargs="+", default=[0, 8192, 32768, 65536])
     p.add_argument("--routes", nargs="+", default=["sparse", "dense"], choices=["sparse", "dense"])
+    p.add_argument("--diagnose", action="store_true", help="record bounded correctness failure, no timings")
     p.add_argument("--oracle-only", action="store_true")
     p.add_argument("--curve-only", action="store_true")
     p.add_argument("--bf16-compute", action="store_true")
@@ -262,10 +315,13 @@ def main():
         source_sha256={str(f.relative_to(ROOT)): hashlib.sha256(f.read_bytes()).hexdigest()
             for f in [Path(__file__), ROOT / "b12x/integration/cuteafd/kimi_mla_prefill_mg.py"]})
     try:
-        if not args.curve_only:
-            oracle(args, report)
-        if not args.oracle_only:
-            curve(args, report)
+        if args.diagnose:
+            diagnose(args, report)
+        else:
+            if not args.curve_only:
+                oracle(args, report)
+            if not args.oracle_only:
+                curve(args, report)
     finally:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n")
