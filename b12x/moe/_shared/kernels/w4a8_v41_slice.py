@@ -533,12 +533,14 @@ class V41SliceFc1Kernel:
         # A ring of shared weight slots keeps the next tiles' copies in flight
         # while the current tile's MMAs run. Arithmetic, copy order and the K
         # accumulation order are unchanged. Decode-only: prefill capacities
-        # keep the single slot so their resident-CTA count cannot change, and
-        # the ring depth is the largest that fits the established budget.
+        # keep the single slot so their resident-CTA count cannot change.
+        # R2 measured the deeper ring only for A8 on the long-chain Pro
+        # geometry; every other recipe keeps R1's two-slot lookahead.
+        deepest = 4 if activation_precision == "a8" and hidden >= 6144 else 2
         budget = 96 * 1024 - 16 * width * 4
         self.stages = 1
         if capacity <= 80:
-            for depth in range(4, 0, -1):
+            for depth in range(deepest, 0, -1):
                 if depth * slot_bytes <= budget:
                     self.stages = depth
                     break
@@ -1085,7 +1087,8 @@ class V41SliceFc2Kernel:
         # capacity a ring of small weight slots lets later slices' copies run
         # under the current slice's MMAs without changing slice or K order.
         # Prefill keeps the original single slot.
-        self.stages = (min(4, (intermediate + width - 1) // width)
+        deepest = 4 if activation_precision == "a8" and hidden >= 6144 else 2
+        self.stages = (min(deepest, (intermediate + width - 1) // width)
                        if capacity <= 80 else 1)
         self.two_stage = self.stages > 1
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
