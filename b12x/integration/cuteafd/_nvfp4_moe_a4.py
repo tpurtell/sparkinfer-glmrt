@@ -89,16 +89,29 @@ class ChunkRowsA4:
 
     threads = 128
 
-    def __init__(self, *, k: int, wire: bool, experts: int, scale_rows: int, scale_convention: str = "multiplier"):
+    def __init__(self, *, k: int, wire: bool, experts: int, scale_rows: int, scale_convention: str = "multiplier",
+                 row_addresses: bool = False):
         self.divisor = scale_convention == "divisor"
         self.k, self.wire, self.experts = int(k), bool(wire), int(experts)
+        # ``src`` is an Int64 table of retained per-row input addresses (merged
+        # Spark waves): the same values are read, only from where each row landed.
+        self.row_addresses = bool(row_addresses)
         # The scale operand whose input scales quantize these rows (gate: rows I, K = H).
         self.in_offset = nvfp4_input_scale_offset(experts, scale_rows, k)
         if self.k % 32:
             raise ValueError("K must be a multiple of 32")
 
     def key(self) -> tuple:
-        return ("chunk_rows_a4", 2, self.k, self.wire, self.experts, self.in_offset) + (("divisor",) if self.divisor else ())
+        return ("chunk_rows_a4", 2, self.k, self.wire, self.experts, self.in_offset) + (("divisor",) if self.divisor else ()) \
+            + (("row_addresses",) if self.row_addresses else ())
+
+    @cute.jit
+    def row_base(self, src: cute.Pointer, row: Int32) -> Int64:
+        """Byte address of input row ``row``: a strided plane, or its retained address."""
+        if const_expr(self.row_addresses):
+            return cute.make_ptr(Int64, Int64(src.toint()), cute.AddressSpace.gmem, assumed_align=8)[row]
+        else:
+            return Int64(src.toint()) + Int64(row) * Int64(self.k + self.k // 32 if self.wire else 2 * self.k)
 
     @cute.jit
     def __call__(self, src: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, scales: cute.Pointer,
@@ -128,6 +141,7 @@ class ChunkRowsA4:
             i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(r)
             if r < live:
                 source = _i32_at(Int64(pair_row.toint()), first + r)
+                row = self.row_base(src, source)
                 if const_expr(self.divisor):
                     gs = _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
                 else:
@@ -140,12 +154,11 @@ class ChunkRowsA4:
                         for half in cutlass.range_constexpr(2):
                             v = grp * Int32(2) + Int32(half)
                             if const_expr(self.wire):
-                                row = Int64(src.toint()) + Int64(source) * Int64(self.k + self.k // 32)
                                 lo, hi = _ld_v2_u32(row + Int64(v) * Int64(8))
                                 exponent = _ld_u8(row + Int64(self.k) + Int64(v // Int32(4)))
                                 w = _e4m3x8_scaled_bf16(lo, hi, _u32_as_f32(exponent << Uint32(23)))
                             else:
-                                at = Int64(src.toint()) + (Int64(source) * Int64(self.k) + Int64(v) * Int64(8)) * Int64(2)
+                                at = row + Int64(v) * Int64(16)
                                 lo, hi = _ld_v2_u32(at)
                                 lo2, hi2 = _ld_v2_u32(at + Int64(8))
                                 w = (lo, hi, lo2, hi2)
