@@ -72,8 +72,8 @@ __all__ = [
 ]
 
 
-def compile_mimo_norm_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotProgram:
-    launch = GlmAddRmsNorm(g.hidden, g.norm_eps)
+def compile_mimo_norm_aot(g: MiMoGeometry = MIMO_V2_FLASH, *, head_split: bool = False) -> AotProgram:
+    launch = GlmAddRmsNorm(g.hidden, g.norm_eps, head_split=head_split)
     h = g.hidden
     operands = (
         Operand("residual", torch.bfloat16, f"[rows,{h}]", "inout"),
@@ -83,8 +83,8 @@ def compile_mimo_norm_aot(g: MiMoGeometry = MIMO_V2_FLASH) -> AotProgram:
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
     )
     return compile_program(
-        launch, name="mimo_norm", operands=operands, scalars=(Scalar("rows"), Scalar("deltas")),
-        key=(h, g.norm_eps), geometry={"hidden": h, "eps": g.norm_eps, "exact_row_cap": 2**31 - 1}, doc=__doc__,
+        launch, name="mimo_norm_head_split" if head_split else "mimo_norm", operands=operands, scalars=(Scalar("rows"), Scalar("deltas")),
+        key=(h, g.norm_eps) + (("head_split",) if head_split else ()), geometry={"hidden": h, "eps": g.norm_eps, "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
 
 

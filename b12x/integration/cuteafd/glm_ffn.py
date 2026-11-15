@@ -93,9 +93,9 @@ def _align_i64(value: Int64) -> Int64:
     return (value + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
 
 
-def compile_glm_norm_aot(g: GLMGeometry = GLM53) -> AotProgram:
+def compile_glm_norm_aot(g: GLMGeometry = GLM53, *, head_split: bool = False) -> AotProgram:
     """Residual add + RMSNorm at the model width; see the module docstring."""
-    launch = GlmAddRmsNorm(g.hidden, g.norm_eps)
+    launch = GlmAddRmsNorm(g.hidden, g.norm_eps, head_split=head_split)
     h = g.hidden
     operands = (
         Operand("residual", torch.bfloat16, f"[rows,{h}]", "inout"),
@@ -105,8 +105,8 @@ def compile_glm_norm_aot(g: GLMGeometry = GLM53) -> AotProgram:
         Operand("out", torch.bfloat16, f"[rows,{h}]", "out"),
     )
     return compile_program(
-        launch, name="glm_norm", operands=operands, scalars=(Scalar("rows"), Scalar("deltas")),
-        key=(h, g.norm_eps), geometry={"hidden": h, "eps": g.norm_eps, "exact_row_cap": 2**31 - 1}, doc=__doc__,
+        launch, name="glm_norm_head_split" if head_split else "glm_norm", operands=operands, scalars=(Scalar("rows"), Scalar("deltas")),
+        key=(h, g.norm_eps) + (("head_split",) if head_split else ()), geometry={"hidden": h, "eps": g.norm_eps, "exact_row_cap": 2**31 - 1}, doc=__doc__,
     )
 
 
