@@ -761,7 +761,7 @@ class UnifiedDecodeKernel:
                         sm_scale_log2: Float32, rows: Int32, stream: cuda.CUstream):
         # Internal native entry: host binding must validate FP4 descriptors,
         # aligned planes, live-row bounds and disjoint caller-owned scratch.
-        assert self.native_dsv41_fp8 and self.valid_hpb == 16
+        assert self.traits.model_type == ModelType.DSV41 and self.valid_hpb == 16
         assert self.topk == 128 and self.extra_topk == 512
         assert self.chunks_per_split == 1 and self.num_splits == 10
         assert self.swa_indices_stride_row == self.extra_indices_stride_row
@@ -1321,14 +1321,16 @@ class UnifiedDecodeKernel:
                             extra_row, native_bounds[token_idx],
                             kv_fp8_addr + buf * kv_fp8_buf, kv_sc_addr + buf * kv_sc_buf,
                             tok_buf_view, mbar_base + buf, (ci - num_main_chunks) * Int32(64), io_lane,
-                            swa=False, kv_stride=staged_kv_stride, io_threads=self.io_threads)
+                            swa=False, kv_stride=staged_kv_stride, io_threads=self.io_threads,
+                            fp8_internal=self.native_dsv41_fp8)
                     else:
                         issue_native_v41_gather(
                             native_descriptors[token_idx, None], native_metadata[token_idx, None],
                             extra_row, native_bounds[token_idx],
                             kv_fp8_addr + buf * kv_fp8_buf, kv_sc_addr + buf * kv_sc_buf,
                             tok_buf_view, mbar_base + buf, ci * Int32(64), io_lane,
-                            swa=True, kv_stride=staged_kv_stride, io_threads=self.io_threads)
+                            swa=True, kv_stride=staged_kv_stride, io_threads=self.io_threads,
+                            fp8_internal=self.native_dsv41_fp8)
                 elif cutlass.const_expr(has_extra):
                     if ci >= num_main_chunks:
                         cis = ci - num_main_chunks
