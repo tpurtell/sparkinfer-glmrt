@@ -2528,6 +2528,8 @@ def compile_mixed_trellis(
     ws_prerotate: bool | None = None,
     row_addresses: bool = False,
 ) -> MixedTrellisCompileResult:
+    if row_addresses and not 0 < int(size_m) <= 8192:
+        raise ValueError("row-address WS capacity must be in 1..8192")
     if row_addresses and (not warp_specialized or activations != "a16"):
         raise ValueError("row addresses require WS A16 (BF16 or E4M3 K32 input)")
     if activations not in ("a16", "a8"):
@@ -3253,6 +3255,49 @@ def _make_mixed_trellis_buffers(
             device=device,
         ),
     )
+
+
+def make_mixed_trellis_segment_buffers(
+    launch: MixedTrellisCompileResult, *, rows: int, device: torch.device, sms: int,
+    scratch: torch.Tensor | None = None,
+) -> MixedTrellisBuffers:
+    """Bind a live-sized WS row-address arena; the caller retains its backing.
+
+    Graph replay must retain this arena and both external address tables until
+    queued GPU work drains. No allocation happens when ``scratch`` is supplied.
+    """
+    from .host import exl3_ws_segment_scratch_regions
+
+    if not launch.row_addresses or not launch.warp_specialized or launch.ws_prerotate:
+        raise ValueError("segment buffers require row-address WS with in-tile rotation")
+    sms = int(launch.workspace_sms or sms)
+    regions = exl3_ws_segment_scratch_regions(
+        rows=rows, maximum=launch.size_m, hidden=launch.hidden_size,
+        intermediate=launch.intermediate_size, topk=launch.top_k,
+        experts=int(launch.topk_sum.route_num_experts), block=launch.moe_block_size,
+        max_m_blocks=launch.max_m_blocks, sms=sms)
+    total = sum((n + 255) & ~255 for n in regions.values())
+    if scratch is None:
+        scratch = torch.empty(total, dtype=torch.uint8, device=device)
+    if (scratch.dtype != torch.uint8 or scratch.device != torch.device(device)
+            or not scratch.is_contiguous() or scratch.numel() < total
+            or scratch.data_ptr() % 256):
+        raise ValueError("EXL3 segment scratch must be contiguous, 256B-aligned uint8 with sufficient bytes")
+    tensors = {}
+    offset = 0
+    routes = rows * launch.top_k
+    shapes = dict(rotation_gate=(routes, launch.hidden_size),
+                  fc1=(routes, 2 * launch.intermediate_size),
+                  activated=(routes, launch.intermediate_size))
+    for name, size in regions.items():
+        dtype = (torch.float16 if name in shapes else torch.int64 if name == "output"
+                 else torch.float32 if name.endswith("scratch") else torch.int32)
+        view = scratch[offset:offset + size].view(dtype)
+        tensors[name] = view.reshape(shapes[name]) if name in shapes else view
+        offset += (size + 255) & ~255
+    tensors["workspace"].zero_()
+    tensors["rotation_up"] = tensors["fc2"] = tensors["rotation_gate"]
+    return MixedTrellisBuffers(**tensors)
 
 
 def make_mixed_trellis_buffers(

@@ -1370,12 +1370,12 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             for i in cutlass.range_constexpr(self.ws_m // 8):
                 r = (ptid >> Int32(4)) + Int32(8 * i)
                 idx = packed_route_indices[rb * Int32(self.ws_m) + r].to(Int32)
-                row_off = Int64(-1) if is_fc1 and self.row_addresses else Int32(-1)
+                row_off = Int64(-1) if is_fc1 and not self.ws_prerotate else Int32(-1)
                 if idx < live:
                     row_id = idx
                     if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
                         row_id = idx // Int32(self.top_k)
-                    if cutlass.const_expr(is_fc1 and self.row_addresses):
+                    if cutlass.const_expr(is_fc1 and not self.ws_prerotate):
                         row_off = self._ws_input_row_base(a_src, row_id) + Int64(c_off) * Int64(2)
                     else:
                         row_off = row_id * Int32(k_size) + c_off
@@ -1567,7 +1567,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
             self._ws_issue_a8(k_size, a_src, rows, base, slot, kblock, ptid, bar)
         else:
             self._ws_issue_a(k_size, a_src, rows, base, slot, kblock, ptid, bar,
-                             is_fc1 and self.row_addresses)
+                             is_fc1 and not self.ws_prerotate)
 
     @cute.jit
     def _ws_issue_a8(
@@ -1895,7 +1895,7 @@ class W4A16MixedTrellisWSKernel(W4A16MixedTrellisKernel):
 
         # Input-row cursor and prologue.
         rows = cute.make_rmem_tensor((self.ws_m // 8,),
-            Int64 if is_fc1 and (self.row_addresses or self.ws_wire) else Int32)
+            Int64 if is_fc1 and not self.ws_prerotate else Int32)
         ja, nclaimed, at, arb, _ant, _acomb, _atier, _alocal = self._ws_next_claim(
             is_fc1, Int32(0), nclaimed, *claim, *meta
         )
