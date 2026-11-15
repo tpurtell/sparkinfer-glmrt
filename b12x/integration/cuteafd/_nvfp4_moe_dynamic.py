@@ -66,7 +66,7 @@ from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 from ._fp8_moe_kernels import _ceil, _i32_at, _ld_v2_u32, _round_bf16
 from ._fp8_moe_stream import STREAM_TILE_M, _chunk
 from ._fp8_weights import _ld_f32
-from ._nvfp4_moe_a4 import StreamNvfp4GateUpA4, StreamNvfp4LinearA4
+from ._nvfp4_moe_a4 import StreamNvfp4GateUpA4, StreamNvfp4LinearA4, _copy_nvfp4_group
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
 
 __all__ = ["ChunkRowsDyn", "StreamNvfp4GateUpDyn", "StreamNvfp4LinearDyn", "nvfp4_amax_offset",
@@ -173,6 +173,29 @@ def _row_factors(amax: Float32):
     return encoder, decoder, outer
 
 
+@cute.jit
+def _bf16_row_amax(row_at: Int64, k: cutlass.Constexpr, threads: cutlass.Constexpr,
+                   tidx: Int32, red: cute.Tensor):
+    local = Float32(0.0)
+    pieces = k // 8
+    for it in cutlass.range_constexpr(_ceil(pieces, threads)):
+        v = Int32(it * threads) + tidx
+        if v < Int32(pieces):
+            lo, hi = _ld_v2_u32(row_at + Int64(v) * Int64(16))
+            lo2, hi2 = _ld_v2_u32(row_at + Int64(v) * Int64(16) + Int64(8))
+            for w in (lo, hi, lo2, hi2):
+                local = fmax_f32(local, fmax_f32(fabs_f32(_bf16_lo(w)), fabs_f32(_bf16_hi(w))))
+    red[tidx] = local
+    cute.arch.sync_threads()
+    stride = threads // 2
+    while stride > 0:
+        if tidx < Int32(stride):
+            red[tidx] = fmax_f32(Float32(red[tidx]), Float32(red[tidx + Int32(stride)]))
+        cute.arch.sync_threads()
+        stride = stride // 2
+    return Float32(red[0])
+
+
 class ChunkRowsDyn:
     """Chunk-padded dynamic NVFP4 activations of the chunk rows from BF16 ``[rows, K]``:
     packed ``[max_tiles * 128, K/2]``, E4M3 scales ``[max_tiles * 128, K/16]`` and the
@@ -181,13 +204,17 @@ class ChunkRowsDyn:
 
     threads = 128
 
-    def __init__(self, *, k: int, experts: int):
+    def __init__(self, *, k: int, experts: int, input_kind: str = "bf16"):
         self.k, self.experts = int(k), int(experts)
+        if input_kind not in ("bf16", "nvfp4"):
+            raise ValueError("dynamic NVFP4 input_kind must be bf16 or nvfp4")
+        self.input_kind = input_kind
+        self.row_bytes = self.k // 2 + self.k // 16 + 16 if input_kind == "nvfp4" else self.k * 2
         if self.k % 16 or self.k % 8:
             raise ValueError("K must be a multiple of 16")
 
     def key(self) -> tuple:
-        return ("chunk_rows_dyn", 2, self.k, self.experts)
+        return ("chunk_rows_dyn", 2, self.k, self.experts) + (("nvfp4_input",) if self.input_kind == "nvfp4" else ())
 
     @cute.jit
     def __call__(self, src: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, aq: cute.Pointer,
@@ -217,26 +244,11 @@ class ChunkRowsDyn:
             i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(r)
             if r < live:
                 source = _i32_at(Int64(pair_row.toint()), first + r)
-                row_at = Int64(src.toint()) + Int64(source) * Int64(self.k) * Int64(2)
-                # Row amax: each thread over its 8-element pieces, then a shared reduction.
-                local = Float32(0.0)
-                pieces = self.k // 8
-                for it in cutlass.range_constexpr(_ceil(pieces, self.threads)):
-                    v = Int32(it * self.threads) + tidx
-                    if v < Int32(pieces):
-                        lo, hi = _ld_v2_u32(row_at + Int64(v) * Int64(16))
-                        lo2, hi2 = _ld_v2_u32(row_at + Int64(v) * Int64(16) + Int64(8))
-                        for w in (lo, hi, lo2, hi2):
-                            local = fmax_f32(local, fmax_f32(fabs_f32(_bf16_lo(w)), fabs_f32(_bf16_hi(w))))
-                red[tidx] = local
-                cute.arch.sync_threads()
-                stride = self.threads // 2
-                while stride > 0:
-                    if tidx < Int32(stride):
-                        red[tidx] = fmax_f32(Float32(red[tidx]), Float32(red[tidx + Int32(stride)]))
-                    cute.arch.sync_threads()
-                    stride = stride // 2
-                row_amax = Float32(red[0])
+                row_at = Int64(src.toint()) + Int64(source) * Int64(self.row_bytes)
+                if const_expr(self.input_kind == "nvfp4"):
+                    row_amax = _ld_f32(row_at + Int64(self.k // 2 + self.k // 16))
+                else:
+                    row_amax = _bf16_row_amax(row_at, self.k, self.threads, tidx, red)
                 if tidx == Int32(0):
                     st_global_f32(Int64(amax.toint()) + i * Int64(4), row_amax)
                 encoder, decoder, outer = _row_factors(row_amax)
@@ -244,19 +256,22 @@ class ChunkRowsDyn:
                 for it in cutlass.range_constexpr(_ceil(groups, self.threads)):
                     grp = Int32(it * self.threads) + tidx
                     if grp < Int32(groups):
-                        values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
-                        at = row_at + Int64(grp) * Int64(32)
-                        lo, hi = _ld_v2_u32(at)
-                        lo2, hi2 = _ld_v2_u32(at + Int64(8))
-                        lo3, hi3 = _ld_v2_u32(at + Int64(16))
-                        lo4, hi4 = _ld_v2_u32(at + Int64(24))
-                        words = (lo, hi, lo2, hi2, lo3, hi3, lo4, hi4)
-                        for q in cutlass.range_constexpr(8):
-                            values[2 * q] = _bf16_lo(words[q])
-                            values[2 * q + 1] = _bf16_hi(words[q])
-                        _quantize_row16_dyn(values, encoder, decoder, outer,
-                                            Int64(aq.toint()) + i * Int64(self.k // 2) + Int64(grp) * Int64(8),
-                                            Int64(a_s.toint()) + i * Int64(groups) + Int64(grp))
+                        packed_at = Int64(aq.toint()) + i * Int64(self.k // 2) + Int64(grp) * Int64(8)
+                        scale_at = Int64(a_s.toint()) + i * Int64(groups) + Int64(grp)
+                        if const_expr(self.input_kind == "nvfp4"):
+                            _copy_nvfp4_group(row_at, self.k, grp, packed_at, scale_at)
+                        else:
+                            values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
+                            at = row_at + Int64(grp) * Int64(32)
+                            lo, hi = _ld_v2_u32(at)
+                            lo2, hi2 = _ld_v2_u32(at + Int64(8))
+                            lo3, hi3 = _ld_v2_u32(at + Int64(16))
+                            lo4, hi4 = _ld_v2_u32(at + Int64(24))
+                            words = (lo, hi, lo2, hi2, lo3, hi3, lo4, hi4)
+                            for q in cutlass.range_constexpr(8):
+                                values[2 * q] = _bf16_lo(words[q])
+                                values[2 * q + 1] = _bf16_hi(words[q])
+                            _quantize_row16_dyn(values, encoder, decoder, outer, packed_at, scale_at)
 
 
 class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):

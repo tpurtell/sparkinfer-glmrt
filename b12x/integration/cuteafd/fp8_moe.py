@@ -526,12 +526,14 @@ def _regions(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
 def fp8_moe_reply_layout(g: Fp8MoeGeometry, *, route: str, rows: int,
                          max_rows: int, wire: bool = True, prefill: str = "auto",
                          mxfp4_down_a8: "bool | None" = None,
-                         row_addresses: bool = False) -> dict:
+                         row_addresses: bool = False, input_kind: str | None = None) -> dict:
     """Describe existing scratch offsets; does not allocate or alter the layout."""
     if not 0 < rows <= max_rows:
         raise ValueError("reply layout rows exceed planned capacity")
+    kind = _input_kind(wire, input_kind, g.kind)
+    wire = kind == "fp8"
     a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
-    selected = _resolve(route, max_rows, wire, g.kind, prefill, geometry=g)
+    selected = _resolve(route, max_rows, wire, g.kind, prefill, geometry=g, input_kind=kind)
     if selected == "auto":
         selected = "decode" if rows <= auto_large_rows(wire, g.kind, prefill, geometry=g) else _large_route(wire, g.kind, prefill)
     regions = _regions(g, selected, rows, wire, a8)
@@ -561,15 +563,26 @@ def nvfp4_a4_fused() -> bool:
     return os.environ.get("B12X_NVFP4_A4_FUSED", "1") != "0"
 
 
+def _input_kind(wire: bool, input_kind: str | None, weights: str) -> str:
+    kind = ("fp8" if wire else "bf16") if input_kind is None else input_kind
+    if kind not in ("bf16", "fp8", "nvfp4"):
+        raise ValueError("input_kind must be bf16, fp8 or nvfp4")
+    if kind == "nvfp4" and weights not in ("nvfp4a4", "nvfp4dyn"):
+        raise ValueError("NVFP4 wire input requires NVFP4 W4A4 weights")
+    return kind
+
+
 def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8", prefill: str = "auto", *,
-             geometry: "Fp8MoeGeometry | None" = None) -> str:
+             geometry: "Fp8MoeGeometry | None" = None, input_kind: str | None = None) -> str:
     """Select one serving route. NVFP4 always streams calibrated A4 from BF16;
     other formats retain their row-count-dependent policies."""
+    kind = _input_kind(wire, input_kind, weights)
+    wire = kind == "fp8"
     # A4 is a numerical contract, not a large-row optimization. Chunk padding
     # also supports a single live row; never fall back to the A16 GEMV.
     if weights in ("nvfp4", "nvfp4a4", "nvfp4dyn"):
         if wire:
-            raise ValueError("NVFP4 A4 requires original BF16 input")
+            raise ValueError("NVFP4 A4 requires original BF16 or exact NVFP4 input")
         return "stream"
     if weights == "bf16":
         if wire or route == "stream":
@@ -588,9 +601,12 @@ def _resolve(route: str, max_rows: int, wire: bool = True, weights: str = "fp8",
 
 
 def fp8_moe_scratch_bytes(g: Fp8MoeGeometry, route: str, rows: int, wire: bool = True,
-                          prefill: str = "auto", mxfp4_down_a8: "bool | None" = None) -> int:
+                          prefill: str = "auto", mxfp4_down_a8: "bool | None" = None, *,
+                          input_kind: str | None = None) -> int:
+    kind = _input_kind(wire, input_kind, g.kind)
+    wire = kind == "fp8"
     mxfp4_down_a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
-    route = _resolve(route, rows, wire, g.kind, prefill, geometry=g)
+    route = _resolve(route, rows, wire, g.kind, prefill, geometry=g, input_kind=kind)
     if route == "auto":
         return max(fp8_moe_scratch_bytes(g, "decode", rows, wire, prefill, mxfp4_down_a8),
                    fp8_moe_scratch_bytes(g, _large_route(wire, g.kind, prefill), rows, wire, prefill, mxfp4_down_a8))
@@ -791,14 +807,15 @@ class _StreamNvfp4A4Route:
     quantization fused (``StreamNvfp4GateUpA4``; ``nvfp4_a4_fused``), the down
     GEMM, route combine."""
 
-    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool, row_addresses: bool = False):
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool, input_kind: str | None = None,
+                 row_addresses: bool = False):
         self.g = g
         convention = {"scale_convention": g.scale_convention}
         h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
         self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
-        self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i, row_addresses=row_addresses, **convention)
+        self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i, input_kind=input_kind, row_addresses=row_addresses, **convention)
         self.fused = nvfp4_a4_fused()
         if self.fused:
             self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
@@ -906,7 +923,7 @@ class _StreamNvfp4DynRoute:
     per-row FC2 factor, an unweighted combine. Wide tiles only (the sparse 16-row
     tiles of the calibrated route are a later specialization)."""
 
-    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool, input_kind: str | None = None):
         if wire:
             raise ValueError("dynamic NVFP4 takes original BF16 rows")
         self.g = g
@@ -914,7 +931,7 @@ class _StreamNvfp4DynRoute:
         self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
-        self.rows_in = ChunkRowsDyn(k=h, experts=e)
+        self.rows_in = ChunkRowsDyn(k=h, experts=e, input_kind=input_kind or "bf16")
         self.gamma = GroupedGamma(top_k=k)
         # The calibrated A4 route's split: chunks of <= 16 live rows take the sparse 16-row tiles
         # (narrowest N whose grid fills the device), chunks of >= 17 the wide 128-row tile. The
@@ -1015,11 +1032,11 @@ def _segmented_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, p
 
 
 def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
-                mxfp4_down_a8: bool = False):
+                mxfp4_down_a8: bool = False, input_kind: str | None = None):
     if route == "stream" and g.dynamic_nvfp4:
-        return _StreamNvfp4DynRoute(g, max_rows, wire)
+        return _StreamNvfp4DynRoute(g, max_rows, wire, input_kind)
     if route == "stream" and g.activations == "a4":
-        return _StreamNvfp4A4Route(g, max_rows, wire)
+        return _StreamNvfp4A4Route(g, max_rows, wire, input_kind)
     if route == "stream":
         return _StreamRoute(g, max_rows, wire, prefill, mxfp4_down_a8)
     return _Route(g, route, max_rows, wire)
@@ -1027,12 +1044,12 @@ def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefil
 
 class _Fp8Moe:
     def __init__(self, g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
-                 mxfp4_down_a8: bool = False):
+                 mxfp4_down_a8: bool = False, input_kind: str | None = None):
         self.route = route
         self.threshold = auto_large_rows(wire, g.kind, prefill, geometry=g)
         self.decode = _Route(g, "decode", max_rows, wire) if route in ("decode", "auto") else None
         large = _large_route(wire, g.kind, prefill) if route == "auto" else route
-        self.prefill = (_make_route(g, large, max_rows, wire, prefill, mxfp4_down_a8)
+        self.prefill = (_make_route(g, large, max_rows, wire, prefill, mxfp4_down_a8, input_kind)
                         if route in ("prefill", "stream", "auto") else None)
 
     def key(self) -> tuple:
@@ -1115,19 +1132,22 @@ class _Fp8Moe:
 
 def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: bool = True,
                         prefill: str = "auto", mxfp4_down_a8: "bool | None" = None,
-                        row_addresses: bool = False, core_only: bool = False) -> AotProgram:
+                        row_addresses: bool = False, core_only: bool = False,
+                        input_kind: str | None = None) -> AotProgram:
     """Routed FP8 experts of ``g`` for ``rows <= max_rows``; see the module docstring
     (``prefill``: the large-row form of FP8 programs, "auto", "w8a8" or "w8a16")."""
     if route not in ("decode", "prefill", "stream", "auto"):
         raise ValueError("route is 'decode', 'prefill', 'stream' or 'auto'")
     if int(max_rows) <= 0:
         raise ValueError("max_rows must be positive")
+    kind = _input_kind(wire, input_kind, g.kind)
+    wire = kind == "fp8"
     mxfp4_down_a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
-    requested, route = route, _resolve(route, max_rows, wire, g.kind, prefill, geometry=g)
+    requested, route = route, _resolve(route, max_rows, wire, g.kind, prefill, geometry=g, input_kind=kind)
     if row_addresses:
         launch = _segmented_route(g, route, max_rows, wire, prefill, mxfp4_down_a8)
     else:
-        launch = _Fp8Moe(g, route, max_rows, wire, prefill, mxfp4_down_a8)
+        launch = _Fp8Moe(g, route, max_rows, wire, prefill, mxfp4_down_a8, kind)
     if core_only:
         parts = (launch,) if row_addresses else (launch.decode, launch.prefill)
         for part in parts:
@@ -1136,6 +1156,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
     h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
     x = (Operand("x", torch.uint8, f"[rows,{h + h // 32}]", note="FP8 K32 wire rows") if wire
          else Operand("x", torch.bfloat16, f"[rows,{h}]"))
+    if kind == "nvfp4":
+        x = Operand("x", torch.uint8, f"[rows,{h // 2 + h // 16 + 16}]", note="packed E2M1, E4M3 K16, F32 amax, 12 zero bytes")
     if g.dynamic_nvfp4:
         gate_up_scales = nvfp4_amax_offset(e, i, h) + 4 * e + 4
         down_scales = nvfp4_amax_offset(e, h, i) + 4 * e + 4
@@ -1216,7 +1238,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
         key=launch.key() + (("core_only",) if core_only else ()),
         geometry={"requested_route": requested, "hidden": h, "experts": e, "top_k": k, "intermediate": g.intermediate, "tp": g.tp,
                   "slice": i, "swiglu_limit": g.swiglu_limit, "route": route, "max_rows": int(max_rows),
-                  "wire": bool(wire), "weights": g.weights, "activations": g.activations,
+                  "wire": bool(wire), **({"input_kind": "nvfp4"} if kind == "nvfp4" else {}), "weights": g.weights, "activations": g.activations,
                   "activation": g.activation, "projection": g.projection,
                   **({"scale_convention": g.scale_convention}
                      if g.weights == "nvfp4" and not g.dynamic_nvfp4 else {}),
@@ -1233,8 +1255,8 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
                                         if row_addresses else launch.arithmetic_routes(g.weights, max_rows)),
                   "row_addresses": bool(row_addresses),
                   **({"core_only": True, "reply_layout_version": 1} if core_only else {})},
-        scratch={"scratch": lambda rows: (fp8_moe_segment_scratch_bytes(g, rows, max_rows, prefill, mxfp4_down_a8, wire=wire)
-                                         if row_addresses else fp8_moe_scratch_bytes(g, route, rows, wire, prefill, mxfp4_down_a8))},
+        scratch={"scratch": lambda rows: (fp8_moe_segment_scratch_bytes(g, rows, max_rows, prefill, mxfp4_down_a8)
+                                         if row_addresses else fp8_moe_scratch_bytes(g, route, rows, wire, prefill, mxfp4_down_a8, input_kind=kind))},
         doc=__doc__,
     )
 
