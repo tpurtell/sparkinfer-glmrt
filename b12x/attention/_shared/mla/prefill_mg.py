@@ -2207,6 +2207,7 @@ class UnifiedPrefillMGKernel:
         valid_hpb=None,
         pack_hilo_rows=False,
         zero_masked_v=False,
+        natural_lse=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -2218,6 +2219,9 @@ class UnifiedPrefillMGKernel:
         # ARBITRARY_FP32 rows: the E4M3 V and its inline FP32 group scales. Off
         # by default: every existing specialization keeps its trace and PTX.
         self.zero_masked_v = bool(zero_masked_v)
+        # LSE in natural log instead of base 2. Off by default: every existing
+        # specialization keeps its trace and PTX.
+        self.natural_lse = bool(natural_lse)
         if self.zero_masked_v and not (
             int(traits.model_type) in (int(ModelType.GLM_NSA), int(ModelType.GLM_NEXT))
             and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
@@ -4011,6 +4015,7 @@ class UnifiedPrefillMGKernel:
                 coalesced_output=cutlass.const_expr(
                     self.output_stride_dim == 1 and self.output_stride_head == t.d_v
                 ),
+                natural_lse=self.natural_lse,
             )
 
             # Group-1 epilogue: const_expr-elided for n_hg==1 (single-group MG ->
@@ -4075,6 +4080,7 @@ class UnifiedPrefillMGKernel:
                     coalesced_output=cutlass.const_expr(
                         self.output_stride_dim == 1 and self.output_stride_head == t.d_v
                     ),
+                    natural_lse=self.natural_lse,
                 )
 
 

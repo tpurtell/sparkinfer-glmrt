@@ -74,7 +74,7 @@ class _MG:
                 output_stride=(g.heads * 512, 512, 1),
                 out_lse_stride=(g.heads, 1), has_sink=False, topk=capacity,
                 head_offset=offset, valid_hpb=traits.hpb,
-                zero_masked_v=not bf16_compute,
+                zero_masked_v=not bf16_compute, natural_lse=True,
             ))
 
     @cute.jit
@@ -107,7 +107,7 @@ class _MG:
 
 def compile_kimi_mg_prefill_aot(g, *, max_rows=4096, max_context=131072,
                                  sparse=False, bf16_compute=False):
-    """MG candidate. LSE is base 2, unlike ordinary Kimi's natural LSE.
+    """MG prefill. LSE is natural log, as ordinary Kimi attention emits.
 
     Dense: one request; table is the ordinary 64-record page table and lengths
     contains total cache length (including query rows). Sparse: selector slots
@@ -132,5 +132,5 @@ def compile_kimi_mg_prefill_aot(g, *, max_rows=4096, max_context=131072,
         scalars=(Scalar("rows"),),
         key=(g, int(max_rows), capacity, bool(sparse), bool(bf16_compute)),
         geometry={**vars(g), "max_rows": int(max_rows), "capacity": capacity,
-                  "sparse": bool(sparse), "bf16_compute": bool(bf16_compute), "lse_base": 2},
+                  "sparse": bool(sparse), "bf16_compute": bool(bf16_compute), "lse_base": "e"},
         scratch={"scratch": lambda rows: 0 if sparse else 4 * (capacity + int(rows))})

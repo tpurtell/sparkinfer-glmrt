@@ -22,7 +22,6 @@ import sys
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-LN2 = 0.6931471805599453
 sys.path.insert(0, str(ROOT))
 
 
@@ -118,7 +117,7 @@ def oracle(args, report):
                 if length:
                     slots = indices[row, :length].long()
                     expected, natural = attention(q[row], values[slots], g.softmax_scale)
-                    mg_lse = lse[row] * LN2
+                    mg_lse = lse[row]
                     max_o = max(max_o, comparison(out[row], expected))
                     max_l = max(max_l, comparison(mg_lse, natural, lse=True))
                     old = attention(q[row], ROUNDED[id(values)][slots], g.softmax_scale)
@@ -182,7 +181,7 @@ def oracle(args, report):
             torch.cuda.synchronize()
             for row in (0, n - 1):
                 expected, natural = attention(q[row], values[:prefix + row + 1], g.softmax_scale)
-                mg_lse = lse[row] * LN2
+                mg_lse = lse[row]
                 note(recorded, "mg", out[row], mg_lse, expected, natural)
                 comparison(out[row], expected)
                 comparison(mg_lse, natural, lse=True)
@@ -240,7 +239,7 @@ def diagnose(args, report):
                 expected_o, expected_l = score.softmax(-1) @ kv[:, :512], score.logsumexp(-1)
                 for arm in (0, 1):
                     name = "baseline" if arm == 0 else "mg"
-                    actual_l = lse[arm][row] * (0.6931471805599453 if arm else 1.)
+                    actual_l = lse[arm][row]
                     for field, actual, expected in (("output", out[arm][row].float(), expected_o),
                                                      ("lse", actual_l, expected_l)):
                         allowed = ((.0003 + .0003 * expected.abs()) if field == "lse" else
@@ -295,7 +294,7 @@ def curve(args, report):
                     graphs = [capture(baseline), capture(candidate)]
                     # Algorithms differ in key rounding: recorded, the oracle gates MG.
                     cross_output = float((out[1][:rows].float() - out[0][:rows].float()).abs().max())
-                    cross_lse = float((lse[1][:rows] * LN2 - lse[0][:rows]).abs().max())
+                    cross_lse = float((lse[1][:rows] - lse[0][:rows]).abs().max())
                     assert torch.isfinite(out[1][:rows]).all() and out[1][:rows].abs().max() > 0
                     before = torch.cuda.memory_allocated()
                     samples = [[], []]

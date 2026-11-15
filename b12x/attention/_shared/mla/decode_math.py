@@ -283,6 +283,7 @@ _FP8_MIN = -448.0
 _NVFP4_SCALE_OFFSET = 256
 _NVFP4_SCALE_GROUP = 16
 _NEG_INF = float("-inf")
+_LN2 = 0.6931471805599453
 # Intra-kernel softmax mask sentinel (FlashInfer decode_dsv4 :443). Large FINITE
 # negative so a fully-invalid warp's (qk - local_max) is 0, not inf - inf = nan.
 # The merge -inf sentinel is emitted only at S7 (empty-block LSE).
@@ -3109,6 +3110,7 @@ def s7_epilogue(
     barrier_id: cutlass.Constexpr = 0,
     coalesced_output: cutlass.Constexpr = False,
     single_split_partial_bf16: cutlass.Constexpr = None,
+    natural_lse: cutlass.Constexpr = False,
 ):
     """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
     selects the destination + normalizer convention; the (gid, d0) output-write
@@ -3341,6 +3343,10 @@ def s7_epilogue(
                     )
                 else:
                     lse1 = sink1
+        if cutlass.const_expr(natural_lse):
+            # Natural-log LSE for consumers on that contract (-inf stays -inf).
+            lse0 = lse0 * Float32(_LN2)
+            lse1 = lse1 * Float32(_LN2)
         out_lse[gid] = lse0
         if cutlass.const_expr(valid_hpb > 8):
             out_lse[gid + Int32(8)] = lse1
