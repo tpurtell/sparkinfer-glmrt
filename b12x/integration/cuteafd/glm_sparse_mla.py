@@ -18,8 +18,11 @@ Routes (both take the live row count as a launch scalar):
     already exceeds the planner's waves; see ``decode_buckets``. A set
     ``B12X_MLA_SM120_NUM_SPLITS`` pins every bucket's split count and so
     overrides it.
-``route="prefill"`` the single-pass multi-head-group (MG) kernel (FP8 QK),
-    one CTA per (row, 32-head group); scratch holds the base-2 LSE.
+``route="prefill"`` the single-pass multi-head-group (MG) kernel; scratch
+    holds the base-2 LSE. ``precision="fp8"`` (default): FP8 QK and PV, one
+    CTA per (row, 32-head group). ``precision="bf16"``: BF16 Q, K and V
+    dequantized in registers (E4M3 x inline FP32 group scale), BF16 P, FP32
+    accumulate, one CTA per (row, 16-head group); same records and ABI.
 
 Masked slots (``-1``, or past a row's length) stage record slot 0, page 0's
 first record, and are weighted by zero. By default, ``zero_masked_v`` zeroes
@@ -157,20 +160,24 @@ def sparse_mla_scratch_bytes(g: GLMGeometry, *, route: str, rows: int, buckets=(
 
 
 class _Prefill:
-    def __init__(self, g: GLMGeometry, zero_masked_v=False):
+    def __init__(self, g: GLMGeometry, zero_masked_v=False, precision="fp8"):
         from dataclasses import replace
 
         from b12x.attention._shared.mla.prefill import _mg_head_partitions
         from b12x.attention._shared.mla.prefill_mg import UnifiedPrefillMGKernel
-        from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg
-        from b12x.attention._shared.mla.traits import ComputeMode
+        from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg, max_mg_head_groups
+        from b12x.attention._shared.mla.traits import ComputeMode, with_bf16_attention
 
         self.g = g
         self.heads, self.topk, self.qk = g.heads, _topk(g), _qk(g)
         traits = replace(_traits(g), compute_mode=ComputeMode.FP8)
+        if precision == "bf16":
+            # BF16 P.V zeroes a masked candidate's V itself.
+            traits, zero_masked_v = with_bf16_attention(traits), False
+        partitions = _mg_head_partitions(self.heads, int(traits.hpb), max_mg_head_groups(traits))
         tiles = -(-self.topk // _CAND)
         self.kernels = []
-        for mg_n_hg, active, offset in _mg_head_partitions(self.heads, int(traits.hpb)):
+        for mg_n_hg, active, offset in partitions:
             layout = make_smem_layout_mg(traits, int(mg_n_hg))
             per_cta = int(layout.heads_per_cta)
             if active % per_cta == 0:
@@ -185,9 +192,12 @@ class _Prefill:
                 extra_topk=0, extra_indices_stride0=self.topk, row_xor=False, head_offset=offset,
                 valid_hpb=valid_hpb, pack_hilo_rows=False, zero_masked_v=zero_masked_v,
             ))
-        self.key = ("prefill", tiles, tuple(_mg_head_partitions(self.heads, int(traits.hpb))))
+        self.key = ("prefill", tiles, tuple(partitions))
         if zero_masked_v:
             self.key += ("zero_masked_v",)
+        if precision == "bf16":
+            self.key += ("bf16",)
+        self.zero_masked_v = zero_masked_v
 
     @cute.jit
     def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, indices: cute.Pointer,
@@ -312,7 +322,7 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
                                name: str = "glm_sparse_mla", fp32_partials: bool = False,
                                full_launch_splits: int | None = None, sm_count: int | None = None,
                                plan_capacity_rows: int | None = None, zero_masked_v: bool = True,
-                               elide_single_split: bool = True):
+                               elide_single_split: bool = True, precision: str = "fp8"):
     """GLM latent sparse MLA; see the module docstring for the ABI. A GLM 5.3
     Flash geometry (``GLMFGeometry``) selects the 512-wide query, 528-byte
     records (``ModelType.GLM_NEXT``) and its 2112-slot index rows. The opt-in
@@ -335,8 +345,11 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         raise ValueError("fp32_partials is supported only for GLM Flash decode")
     if full_launch_splits is not None and (route != "decode" or int(full_launch_splits) < 1):
         raise ValueError("full_launch_splits plans decode buckets: a split count of at least 1")
+    if precision not in ("fp8", "bf16") or (precision == "bf16" and route != "prefill"):
+        raise ValueError("precision is 'fp8' or, for the prefill route, 'bf16'")
     if route == "prefill":
-        launch = _Prefill(g, zero_masked_v)
+        launch = _Prefill(g, zero_masked_v, precision)
+        zero_masked_v = launch.zero_masked_v
         buckets = ()
     elif route == "decode":
         launch = _Decode(g, int(max_rows), fp32_partials, full_launch_splits, sm_count,
@@ -366,7 +379,8 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
                   **({"partial_dtype": "float32"} if fp32_partials else {}),
                   **({"elide_single_split": True} if route == "decode" and elide_single_split
                      and any(s == 1 for _, s, _ in buckets) else {}),
-                  **({"zero_masked_v": True} if zero_masked_v else {})},
+                  **({"zero_masked_v": True} if zero_masked_v else {}),
+                  **({"attention_precision": "bf16"} if precision == "bf16" else {})},
         scratch={"scratch": lambda rows: sparse_mla_scratch_bytes(g, route=route, rows=rows, buckets=buckets,
                                                                fp32_partials=fp32_partials)},
         doc=__doc__,

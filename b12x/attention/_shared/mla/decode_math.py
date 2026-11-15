@@ -1548,6 +1548,28 @@ def _nvfp4_pair_bfloat2(
 
 
 @cute.jit
+def _e4m3_fp32_pair_bfloat2(
+    kv_base_addr: Int32,
+    entry: Int32,
+    dim_even: Int32,
+    scale_group: Int32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,
+    scale_offset: cutlass.Constexpr,
+) -> Uint32:
+    """Dequant one E4M3 pair x its inline FP32 group scale to bf16x2.
+
+    Inline-FP32-scale record staging: E4M3 latent at ``entry * stride`` and the
+    FP32 group scales at ``+ scale_offset``. The single BF16 P.V dequant point
+    for these records.
+    """
+    row = kv_base_addr + entry * Int32(kv_smem_stride)
+    v0, v1 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(_ld_u16_zext(row, dim_even)))
+    scale = ld_shared_f32(row + Int32(scale_offset) + scale_group * Int32(4))
+    return pack_f32x2_to_bfloat2(v0 * scale, v1 * scale)
+
+
+@cute.jit
 def s0_normalize_dsv41_kv_to_fp8(
     kv_base_addr: Int32,
     ratio_base_addr: Int32,
@@ -2455,8 +2477,12 @@ def s6_xv_nope_nvfp4_bf16(
     sm_p_stride: cutlass.Constexpr = 0,  # bf16 elems per sm_p row (0 -> BI)
     latent_scale_per_token: cutlass.Constexpr = False,
     kv_sc_base_addr: Int32 = Int32(0),
+    inline_fp32_scale_offset: cutlass.Constexpr = 0,
 ):
     """S6 (NVFP4): BF16 P.V over in-register dequantized E2M1 V.
+
+    ``inline_fp32_scale_offset`` (nonzero) instead reads an inline-FP32-scale
+    FP8 row: E4M3 V times the FP32 scale of its V chunk at that row offset.
 
     V is the same 512-dim MLA latent as K-NoPE. Adjacent output-column lanes
     exchange decoded pairs, so each pair is dequantized once rather than once
@@ -2484,21 +2510,33 @@ def s6_xv_nope_nvfp4_bf16(
                 a_byte = (a_row * Int32(p_stride) + (k_base + a_col)) * Int32(2)
                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
                 ent0 = k_base + tid * Int32(2)
-                pair0 = _nvfp4_pair_bfloat2(
-                    kv_fp4_base_addr, ent0 + entry_parity, col & ~Int32(1),
-                    latent_scale, kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                pair8 = _nvfp4_pair_bfloat2(
-                    kv_fp4_base_addr,
-                    ent0 + Int32(8) + entry_parity,
-                    col & ~Int32(1),
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
+                if cutlass.const_expr(inline_fp32_scale_offset):
+                    pair0 = _e4m3_fp32_pair_bfloat2(
+                        kv_fp4_base_addr, ent0 + entry_parity, col & ~Int32(1),
+                        Int32(vc), kv_smem_stride=kv_smem_stride,
+                        scale_offset=inline_fp32_scale_offset,
+                    )
+                    pair8 = _e4m3_fp32_pair_bfloat2(
+                        kv_fp4_base_addr, ent0 + Int32(8) + entry_parity,
+                        col & ~Int32(1), Int32(vc), kv_smem_stride=kv_smem_stride,
+                        scale_offset=inline_fp32_scale_offset,
+                    )
+                else:
+                    pair0 = _nvfp4_pair_bfloat2(
+                        kv_fp4_base_addr, ent0 + entry_parity, col & ~Int32(1),
+                        latent_scale, kv_smem_stride=kv_smem_stride,
+                        latent_scale_per_token=latent_scale_per_token,
+                        kv_sc_base_addr=kv_sc_base_addr,
+                    )
+                    pair8 = _nvfp4_pair_bfloat2(
+                        kv_fp4_base_addr,
+                        ent0 + Int32(8) + entry_parity,
+                        col & ~Int32(1),
+                        latent_scale,
+                        kv_smem_stride=kv_smem_stride,
+                        latent_scale_per_token=latent_scale_per_token,
+                        kv_sc_base_addr=kv_sc_base_addr,
+                    )
                 peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
                 peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
                 b0 = byte_perm(pair0, peer0, pair_selector)

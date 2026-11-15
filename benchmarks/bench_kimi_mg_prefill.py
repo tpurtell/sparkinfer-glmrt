@@ -226,7 +226,7 @@ def diagnose(args, report):
             results.append(cell)
             print(json.dumps(cell), flush=True)
     report["correctness_passed"] = False
-    report["timings_skipped"] = "MG FP8 QK fails unchanged Kimi oracle; BF16 MG cannot read inline FP32 scales"
+    report["timings_skipped"] = "MG FP8 QK fails unchanged Kimi oracle; use --bf16-compute"
 
 
 def curve(args, report):

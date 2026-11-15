@@ -71,6 +71,7 @@ from .decode_math import (
     s0_normalize_dsv41_kv_to_fp8,
     s1_qk_nope_block_scaled,
     s6_xv_nope,
+    s6_xv_nope_nvfp4_bf16,
     st_shared_f32,
     s7_epilogue,
 )
@@ -806,9 +807,14 @@ def s1_qk_nope_bf16_mg2(
     kv_smem_stride: cutlass.Constexpr,  # 448 (BF16 layout)
     scale_bytes_per_token: cutlass.Constexpr,  # 8
     n_hg: cutlass.Constexpr = 2,
+    inline_fp32_scale_offset: cutlass.Constexpr = 0,
 ):
     """S1 (BF16): fused QK-NoPE bf16 m16n8k16 MMA with per-thread inline
     FP8->BF16 K dequant.
+
+    ``inline_fp32_scale_offset`` (nonzero) reads the per-(token,blk) scale as
+    the record's inline FP32 group scale at that staged-row offset instead of
+    the UE8M0 footer byte; the dequant and MMAs are the same.
 
     Byte-for-byte mirror of FlashInfer prefill_kernel.cuh:883-932. The K B
     operand (b0/b1) and the per-(token,blk) UE8M0 scale depend only on the
@@ -830,8 +836,15 @@ def s1_qk_nope_bf16_mg2(
     kv_sc_row_base = kv_sc_base_addr + kv_gid_row * Int32(scale_bytes_per_token)
 
     for blk in cutlass.range_constexpr(num_scales):
-        # DSV4 UE8M0_BYTE: per-(token,blk) fp32 scale from the K footer scale buf.
-        scale_f = _ue8m0_zext_byte_to_fp32(ld_shared_u8_offset(kv_sc_row_base, blk))
+        if cutlass.const_expr(inline_fp32_scale_offset):
+            scale_f = ld_shared_f32(
+                kv_fp8_base_addr
+                + kv_gid_row * Int32(kv_smem_stride)
+                + Int32(inline_fp32_scale_offset + blk * 4)
+            )
+        else:
+            # DSV4 UE8M0_BYTE: per-(token,blk) fp32 scale from the K footer scale buf.
+            scale_f = _ue8m0_zext_byte_to_fp32(ld_shared_u8_offset(kv_sc_row_base, blk))
         for ks in cutlass.range_constexpr(quant_tile // 16):
             ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
             # K dequant B operand: two e4m3 byte-pairs (u16) -> bf16x2 b0/b1.
@@ -2177,6 +2190,21 @@ class UnifiedPrefillMGKernel:
                 "zero_masked_v applies to GLM ARBITRARY_FP32 records (UE8M0 "
                 "records always zero a masked candidate's V)"
             )
+        inline_fp32 = int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+        if bool(traits.pv_bf16) != (
+            inline_fp32 and int(traits.compute_mode) == int(ComputeMode.BF16)
+        ):
+            raise ValueError(
+                "inline-FP32-scale MG prefill is FP8 QK/PV or BF16 QK/PV "
+                "(traits.with_bf16_attention); got "
+                f"compute_mode={traits.compute_mode!r}, pv_bf16={traits.pv_bf16!r}, "
+                f"scale_format={traits.scale_format!r}"
+            )
+        if traits.pv_bf16 and int(layout.mg_n_hg) != 1:
+            raise ValueError(
+                "BF16 Q for two head groups plus the 528-byte double-buffered KV "
+                "stage exceeds the SM120 shared-memory carveout; use mg_n_hg=1"
+            )
         self.replicate_h = int(replicate_h)
         self.num_heads = int(num_heads)
         self.q_stride_row = int(q_stride[0])
@@ -2472,6 +2500,10 @@ class UnifiedPrefillMGKernel:
         # the 432B/288B record geometry. is_glm stays true for NVFP4 so the
         # shared GLM staging (io gather / kv_sc absence / q_rope alias) applies.
         is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
+        # Inline-FP32-scale FP8 records with BF16 QK and BF16 PV: K and V are
+        # dequantized in registers (E4M3 x inline FP32 group scale) into the
+        # BF16 MMAs the UE8M0 and NVFP4 arms already use.
+        glm_bf16 = cutlass.const_expr(t.pv_bf16)
         dsv41_fp8_pv = cutlass.const_expr(
             t.model_type == ModelType.DSV41 and t.fp8_internal
         )
@@ -2885,7 +2917,7 @@ class UnifiedPrefillMGKernel:
                     n_hg=n_hg,
                     valid_hpb=self.valid_hpb,
                 )
-                if cutlass.const_expr(is_nvfp4 and has_rope):
+                if cutlass.const_expr((is_nvfp4 or glm_bf16) and has_rope):
                     # NVFP4 QK-RoPE uses the GLM B-operand packing, so keep the
                     # Q-rope A operands as the GLM-style register ARRAYS (not
                     # the DSV4 scalar snapshot). W_FP8 is then free for the
@@ -2906,7 +2938,9 @@ class UnifiedPrefillMGKernel:
                     else:
                         q_rope_regs1 = q_rope_regs0  # never read when n_hg==1.
                     cute.arch.barrier(barrier_id=2, number_of_threads=self.math_threads)
-                elif cutlass.const_expr(not is_nvfp4 and not reload_bf16_qrope):
+                elif cutlass.const_expr(
+                    not is_nvfp4 and not glm_bf16 and not reload_bf16_qrope
+                ):
                     (
                         q000,
                         q001,
@@ -3180,6 +3214,23 @@ class UnifiedPrefillMGKernel:
                             valid_hpb=self.valid_hpb,
                             scale_format=t.scale_format,
                             fp8_rope=t.fp8_rope,
+                        )
+                elif cutlass.const_expr(glm_bf16):
+                    qk0, qk1 = s1_qk_nope_bf16_mg2(
+                        qk0, qk1, q_nope_bf16_g0, q_nope_bf16_g1,
+                        kv_fp8_b, kv_sc_b, warp_first_cand, lane,
+                        num_scales=t.num_scales, quant_tile=t.quant_tile,
+                        q_nope_bf16_stride=L.q_nope_bf16_stride,
+                        kv_smem_stride=L.kv_smem_stride, scale_bytes_per_token=8,
+                        n_hg=n_hg, inline_fp32_scale_offset=t.d_nope,
+                    )
+                    if cutlass.const_expr(has_rope):
+                        qk0, qk1 = s2_qk_rope_regs_mg_glm(
+                            qk0, qk1, q_rope_regs0, q_rope_regs1,
+                            rope_cache_base_ptr, index_base_ptr, warp_first_cand,
+                            lane, rope_pbs, rope_stride, d_rope=t.d_rope,
+                            n_hg=n_hg, valid_hpb=self.valid_hpb,
+                            scale_format=t.scale_format, fp8_rope=t.fp8_rope,
                         )
                 elif cutlass.const_expr(bf16_qk):
                     if cutlass.const_expr(reload_bf16_qrope):
@@ -3538,6 +3589,41 @@ class UnifiedPrefillMGKernel:
                             sm_p_stride=L.sm_p_full_stride,
                             latent_scale_per_token=t.latent_scale_per_token,
                         )
+                elif cutlass.const_expr(glm_bf16):
+                    # BF16 P.V over E4M3 V x inline FP32 group scale. A masked
+                    # candidate stages record slot 0 and is weighted by zero;
+                    # zero its V and scales first (0 x NaN = NaN). S4's barriers
+                    # retired this tile's QK reads, and S5's leading barrier
+                    # orders these stores before S6.
+                    tile_length = split_cand_end - split_cand_start
+                    for part in cutlass.range_constexpr(
+                        (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                    ):
+                        entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                        if entry < Int32(t.bi):
+                            index = Int32(-1)
+                            if entry < tile_length:
+                                index = _ld_global_index_i32(index_base_ptr, entry)
+                            if index < Int32(0):
+                                for chunk in cutlass.range_constexpr(_GLM_NOPE_SCALE_BYTES // 16):
+                                    offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                    st_shared_u32(
+                                        kv_fp8_b + entry * Int32(L.kv_smem_stride) + offset,
+                                        Uint32(0),
+                                    )
+                    s5_fill_sm_p_full_mg2_nvfp4(
+                        w_pre0, w_pre1, w_fp8_addr, warp_id, lane,
+                        bi=t.bi, hpb=t.hpb, sm_p_stride=L.sm_p_full_stride,
+                        num_threads=self.math_threads, barrier_id=3, n_hg=n_hg,
+                    )
+                    acc0 = s6_xv_nope_nvfp4_bf16(
+                        acc0, w_fp8_addr, kv_fp8_b, warp_id, lane, latent_scale,
+                        n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, bi=t.bi,
+                        kv_smem_stride=L.kv_smem_stride, n_warps=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        sm_p_stride=L.sm_p_full_stride,
+                        inline_fp32_scale_offset=t.d_nope,
+                    )
                 elif cutlass.const_expr(is_glm):
                     # GLM XV-NoPE: the per-group decode s6_xv_nope (raw-e4m3 V +
                     # per-(cand,vc) inline fp32 group scale + 2-pass W HIGH+LOW
@@ -3990,6 +4076,7 @@ def _sparse_mla_prefill_mg_flat_launch(
     head_offset: int = 0,
     latent_scale_per_token: bool = False,
     fp8_internal: bool = False,
+    pv_bf16: bool = False,
     prepared: object | None = None,
 ) -> None:
     traits = make_unified_traits(
@@ -3999,7 +4086,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         fp8_rope=bool(fp8_rope),
         latent_scale_per_token=bool(latent_scale_per_token),
     )
-    traits = replace(traits, fp8_internal=bool(fp8_internal))
+    traits = replace(traits, fp8_internal=bool(fp8_internal), pv_bf16=bool(pv_bf16))
     layout = make_smem_layout_mg(traits, int(mg_n_hg))
     q_head_dim = int(q.shape[2])
     total_heads = int(q.shape[1])
@@ -4131,6 +4218,8 @@ def _sparse_mla_prefill_mg_flat_launch(
             "out_lse", lse_out, dims=(DimKey.dynamic(), DimKey.exact(total_heads))
         ),
     ]
+    if traits.pv_bf16:
+        spec_fields.append(key_field("pv_bf16", 1))
     if active_heads != total_heads or head_offset != 0:
         spec_fields.extend(
             [
@@ -4593,6 +4682,7 @@ def run_unified_prefill_mg(
         and active_heads == total_heads
         and head_offset == 0
         and not traits.fp8_internal
+        and not traits.pv_bf16
         and prepared is None
         and not compile_only_launches_enabled()
     ):
@@ -4652,6 +4742,7 @@ def run_unified_prefill_mg(
             head_offset=head_offset,
             latent_scale_per_token=bool(latent_scale_per_token),
             fp8_internal=bool(traits.fp8_internal),
+            pv_bf16=bool(traits.pv_bf16),
             prepared=prepared,
         )
         if compile_only_launches_enabled():

@@ -1,7 +1,9 @@
-"""Experimental Kimi MLA MG prefill over native 656-byte FP8 records.
+"""Kimi MLA MG prefill over native 656-byte FP8 records.
 
 GLM_NSA has exactly Kimi's absorbed query and cache layout. Reuse its traits,
-not its model softmax scale. Dense causal extend builds one shared physical-slot
+not its model softmax scale. BF16 attention (BF16 Q, K and V dequantized in
+registers, FP32 accumulate) is the mode that meets Kimi's oracle bounds; FP8
+QK does not and stays a diagnostic arm. Dense causal extend builds one shared physical-slot
 vector plus per-query visible lengths; sparse takes the selector's native slots.
 No split partials or cache conversion. The public Kimi routes are unchanged.
 """
@@ -47,18 +49,20 @@ class _MG:
     def __init__(self, g, capacity, *, sparse, bf16_compute):
         from b12x.attention._shared.mla.prefill import _mg_head_partitions
         from b12x.attention._shared.mla.prefill_mg import UnifiedPrefillMGKernel
-        from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg
+        from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg, max_mg_head_groups
         from b12x.attention._shared.mla.traits import (
-            ComputeMode, ModelType, ScaleFormat, make_unified_traits,
+            ComputeMode, ModelType, ScaleFormat, make_unified_traits, with_bf16_attention,
         )
 
         self.g, self.capacity, self.sparse = g, capacity, sparse
-        traits = make_unified_traits(ModelType.GLM_NSA,
-            ComputeMode.BF16 if bf16_compute else ComputeMode.FP8,
-            ScaleFormat.ARBITRARY_FP32)
+        traits = make_unified_traits(ModelType.GLM_NSA, ComputeMode.FP8,
+                                     ScaleFormat.ARBITRARY_FP32)
+        if bf16_compute:
+            traits = with_bf16_attention(traits)
         self.metadata = _DenseMetadata(capacity)
         self.kernels = []
-        for groups, active, offset in _mg_head_partitions(g.heads, traits.hpb):
+        for groups, active, offset in _mg_head_partitions(
+                g.heads, traits.hpb, max_mg_head_groups(traits)):
             layout = make_smem_layout_mg(traits, groups)
             self.kernels.append(UnifiedPrefillMGKernel(
                 traits, layout, 1 if sparse else 64, -(-capacity // 64),
@@ -68,7 +72,7 @@ class _MG:
                 output_stride=(g.heads * 512, 512, 1),
                 out_lse_stride=(g.heads, 1), has_sink=False, topk=capacity,
                 head_offset=offset, valid_hpb=traits.hpb,
-                zero_masked_v=True,
+                zero_masked_v=not bf16_compute,
             ))
 
     @cute.jit
@@ -101,16 +105,13 @@ class _MG:
 
 def compile_kimi_mg_prefill_aot(g, *, max_rows=4096, max_context=131072,
                                  sparse=False, bf16_compute=False):
-    """Fork-only MG candidate. LSE is base 2, unlike ordinary Kimi's natural LSE.
+    """MG candidate. LSE is base 2, unlike ordinary Kimi's natural LSE.
 
     Dense: one request; table is the ordinary 64-record page table and lengths
     contains total cache length (including query rows). Sparse: selector slots
     [rows,2048] with valid leading lengths [rows], including zero-length rows.
-    Only FP8 compute is supported: the shared BF16-QK arm reads UE8M0 footer
-    scales and is not valid for Kimi's inline arbitrary-FP32 scales.
+    ``bf16_compute`` selects BF16 QK and PV over the same FP8 records.
     """
-    if bf16_compute:
-        raise ValueError("MG BF16-QK requires UE8M0 footer scales; Kimi uses inline FP32 scales")
     if g.kv_cache != "fp8":
         raise ValueError("MG traits support the 656-byte FP8 record, not raw BF16 KV")
     if not 1 <= int(max_rows) <= 4096 or not int(max_rows) <= int(max_context) <= 1048576:
