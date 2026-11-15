@@ -148,12 +148,14 @@ def test_wire_program_exact(name, tp, raw_scale):
             assert torch.equal(q, packed[src, :g.hidden // 2]), (name, tp, rows, "packed")
             assert torch.equal(s, packed[src, g.hidden // 2:g.hidden // 2 + g.hidden // 16]), (name, tp, rows, "scales")
             src_b, qb, sb, amax_b = _scratch_rows(g, scratch_b, rows, capacity)
-            assert torch.equal(src, src_b) and torch.equal(q, qb) and torch.equal(s, sb)
+            # MoePrep atomics may permute rows inside each expert between launches.
+            assert torch.equal(qb, packed[src_b, :g.hidden // 2])
+            assert torch.equal(sb, packed[src_b, g.hidden // 2:g.hidden // 2 + g.hidden // 16])
             tail = packed[:rows, g.hidden // 2 + g.hidden // 16:]
             assert bool((tail[:, 4:] == 0).all())
             if g.dynamic_nvfp4:
                 assert torch.equal(amax.view(torch.uint8), tail[:, :4].contiguous().view(torch.float32)[src].view(torch.uint8))
-                assert torch.equal(amax.view(torch.uint8), amax_b.view(torch.uint8))
+                assert torch.equal(amax_b.view(torch.uint8), tail[:, :4].contiguous().view(torch.float32)[src_b].view(torch.uint8))
             else:
                 assert bool((tail == 0).all())
             if rows in (1, 16, 2048, 8192):
