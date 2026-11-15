@@ -13,18 +13,24 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics import (
     cp_async_bulk_g2s_mbar,
+    fmax_f32,
     get_ptr_as_int64,
     ld_global_nc_u32,
     ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
+    ld_shared_f32,
     ld_shared_u8_offset,
     ld_shared_u32,
     ld_shared_v2_u32,
+    ld_shared_v4_u32,
     mma_m16n8k16_f32_bf16,
     shared_ptr_to_u32,
+    st_shared_f32,
     st_shared_u32,
     st_shared_v4_u32,
+    store_bf16x2,
 )
+from .decode_math import _exp2_approx_ftz_f32, _log2_approx_ftz_f32
 from .io import stage_dsv41_fp8_scales
 
 # Disjoint per-candidate tile layout inside the existing 69,632-byte kv_fp8
@@ -33,6 +39,11 @@ from .io import stage_dsv41_fp8_scales
 # [0, 1024), reused across both QK (ldmatrix.x2) and PV (ldmatrix.trans.x2).
 DSV41_BF16_TILE_ROW_STRIDE = 1088
 DSV41_BF16_RAW_ROW_OFFSET = 544
+
+# Compact 2-CTA/SM feature-sliced (D_SLICE=64) layout constants.
+DSV41_COMPACT_RAW_STRIDE = 576
+DSV41_COMPACT_SLICE_STRIDE = 128
+DSV41_COMPACT_QP_STRIDE = 72
 
 
 @cute.jit
@@ -583,3 +594,300 @@ def s6_pv_dsv41_bf16_smem(
         acc_nope[vc][2] = acc_nope[vc][2] + x2
         acc_nope[vc][3] = acc_nope[vc][3] + x3
     return acc_nope
+
+
+@dsl_user_op
+def _st_shared_v2_u32(smem_addr: Int32, v0: Uint32, v1: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v2.b32 [$0], {$1, $2};",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def load_q_slice_bf16_smem(
+    q_token: cute.Tensor,
+    qp_base_addr: Int32,
+    head_base: Int32,
+    slice_idx: Int32,
+    tid: Int32,
+    *,
+    qp_stride: cutlass.Constexpr = DSV41_COMPACT_QP_STRIDE,
+):
+    """Stage one [16, 64] BF16 query feature slice into padded q_or_p shared memory."""
+    h = tid >> Int32(4)
+    t_col = tid & Int32(15)
+    d = slice_idx * Int32(64) + t_col * Int32(4)
+    q_off = cute.crd2idx((head_base + h, d), q_token.layout)
+    w0, w1 = ld_global_nc_v2_u32(get_ptr_as_int64(q_token, q_off))
+    _st_shared_v2_u32(
+        qp_base_addr + h * Int32(qp_stride * 2) + t_col * Int32(8),
+        w0,
+        w1,
+    )
+
+
+@cute.jit
+def decode_dsv41_slice_to_bf16_smem(
+    kv_raw_addr: Int32,
+    kv_slice_addr: Int32,
+    slice_idx: Int32,
+    tid: Int32,
+    *,
+    raw_stride: cutlass.Constexpr = DSV41_COMPACT_RAW_STRIDE,
+    slice_stride: cutlass.Constexpr = DSV41_COMPACT_SLICE_STRIDE,
+):
+    """Decode one 64-feature slice of all 64 staged KV rows into swizzled BF16 SMEM."""
+    entry = tid >> Int32(2)
+    g = tid & Int32(3)
+    raw_row = kv_raw_addr + entry * Int32(raw_stride)
+    swz = entry & Int32(7)
+    row_dst = kv_slice_addr + entry * Int32(slice_stride)
+    dst0 = row_dst + ((g * Int32(2)) ^ swz) * Int32(16)
+    dst1 = row_dst + ((g * Int32(2) + Int32(1)) ^ swz) * Int32(16)
+    tag = ld_shared_u32(raw_row + Int32(528))
+    if tag == Uint32(1):
+        w00, w01, w10, w11 = ld_shared_v4_u32(
+            raw_row + slice_idx * Int32(64) + g * Int32(16)
+        )
+        sc = ld_shared_u8_offset(
+            raw_row + slice_idx * Int32(2) + (g >> Int32(1)), 512
+        )
+        d00, d01, d02, d03 = _mxfp8x8_to_bf16x2x4_sm120(w00, w01, sc)
+        st_shared_v4_u32(dst0, d00, d01, d02, d03)
+        d10, d11, d12, d13 = _mxfp8x8_to_bf16x2x4_sm120(w10, w11, sc)
+        st_shared_v4_u32(dst1, d10, d11, d12, d13)
+    elif tag == Uint32(0):
+        w0, w1 = ld_shared_v2_u32(
+            raw_row + slice_idx * Int32(32) + g * Int32(8)
+        )
+        sc = ld_shared_u8_offset(
+            raw_row + slice_idx * Int32(4) + g, 256
+        )
+        d00, d01, d02, d03 = _nvfp4x8_to_bf16x2x4_sm120(w0, sc)
+        st_shared_v4_u32(dst0, d00, d01, d02, d03)
+        d10, d11, d12, d13 = _nvfp4x8_to_bf16x2x4_sm120(w1, sc)
+        st_shared_v4_u32(dst1, d10, d11, d12, d13)
+    else:
+        z = Uint32(0)
+        st_shared_v4_u32(dst0, z, z, z, z)
+        st_shared_v4_u32(dst1, z, z, z, z)
+
+
+@cute.jit
+def s1_qk_dsv41_bf16_slice(
+    qk,
+    qp_a_base: Int32,
+    b_ptr0: Int32,
+    b_ptr1: Int32,
+    b_ptr2: Int32,
+    b_ptr3: Int32,
+):
+    """Accumulate one 64-feature BF16 QK slice (4 m16n8k16 steps) into qk[0..3]."""
+    b_ptrs = (b_ptr0, b_ptr1, b_ptr2, b_ptr3)
+    for sub in cutlass.range_constexpr(4):
+        a0, a1, a2, a3 = _ldmatrix_m8n8x4_b16_offset(qp_a_base, sub * 32)
+        b0, b1 = _ldmatrix_m8n8x2_b16_offset(b_ptrs[sub], 0)
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
+        )
+    return qk
+
+
+@cute.jit
+def s4_single_chunk_dsv41(
+    qk,
+    reduce_max_addr: Int32,
+    reduce_sum_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    hpb: cutlass.Constexpr = 16,
+    n_warps: cutlass.Constexpr = 8,
+    num_threads: cutlass.Constexpr = 256,
+    barrier_id: cutlass.Constexpr = 3,
+):
+    """Low-register single-chunk cross-warp softmax bit-identical to s4_online_softmax."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+
+    local_max0 = fmax_f32(qk[0], qk[1])
+    local_max1 = fmax_f32(qk[2], qk[3])
+    local_max0 = fmax_f32(local_max0, cute.arch.shuffle_sync_bfly(local_max0, offset=2))
+    local_max1 = fmax_f32(local_max1, cute.arch.shuffle_sync_bfly(local_max1, offset=2))
+    local_max0 = fmax_f32(local_max0, cute.arch.shuffle_sync_bfly(local_max0, offset=1))
+    local_max1 = fmax_f32(local_max1, cute.arch.shuffle_sync_bfly(local_max1, offset=1))
+
+    p0 = _exp2_approx_ftz_f32(qk[0] - local_max0)
+    p1 = _exp2_approx_ftz_f32(qk[1] - local_max0)
+    p2 = _exp2_approx_ftz_f32(qk[2] - local_max1)
+    p3 = _exp2_approx_ftz_f32(qk[3] - local_max1)
+
+    local_sum0 = p0 + p1
+    local_sum1 = p2 + p3
+    local_sum0 = local_sum0 + cute.arch.shuffle_sync_bfly(local_sum0, offset=2)
+    local_sum1 = local_sum1 + cute.arch.shuffle_sync_bfly(local_sum1, offset=2)
+    local_sum0 = local_sum0 + cute.arch.shuffle_sync_bfly(local_sum0, offset=1)
+    local_sum1 = local_sum1 + cute.arch.shuffle_sync_bfly(local_sum1, offset=1)
+
+    if tid == Int32(0):
+        st_shared_f32(
+            reduce_max_addr + (warp_id * Int32(hpb) + gid) * Int32(4), local_max0
+        )
+        st_shared_f32(
+            reduce_max_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
+            local_max1,
+        )
+        st_shared_f32(
+            reduce_sum_addr + (warp_id * Int32(hpb) + gid) * Int32(4), local_sum0
+        )
+        st_shared_f32(
+            reduce_sum_addr + (warp_id * Int32(hpb) + gid + Int32(8)) * Int32(4),
+            local_sum1,
+        )
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
+
+    h1 = gid + Int32(8)
+    block_local_max0 = Float32(-1e30)
+    block_local_max1 = Float32(-1e30)
+    for w in cutlass.range_constexpr(n_warps):
+        wm0 = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + gid) * Int32(4))
+        wm1 = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h1) * Int32(4))
+        block_local_max0 = fmax_f32(block_local_max0, wm0)
+        block_local_max1 = fmax_f32(block_local_max1, wm1)
+
+    block_local_sum0 = Float32(0.0)
+    block_local_sum1 = Float32(0.0)
+    for w in cutlass.range_constexpr(n_warps):
+        wm0 = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + gid) * Int32(4))
+        ws0 = ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + gid) * Int32(4))
+        wm1 = ld_shared_f32(reduce_max_addr + (Int32(w) * Int32(hpb) + h1) * Int32(4))
+        ws1 = ld_shared_f32(reduce_sum_addr + (Int32(w) * Int32(hpb) + h1) * Int32(4))
+        block_local_sum0 = block_local_sum0 + ws0 * _exp2_approx_ftz_f32(
+            wm0 - block_local_max0
+        )
+        block_local_sum1 = block_local_sum1 + ws1 * _exp2_approx_ftz_f32(
+            wm1 - block_local_max1
+        )
+
+    new_gmax0 = fmax_f32(Float32(-1e30), block_local_max0)
+    new_gmax1 = fmax_f32(Float32(-1e30), block_local_max1)
+    block_rescale0 = _exp2_approx_ftz_f32(block_local_max0 - new_gmax0)
+    block_rescale1 = _exp2_approx_ftz_f32(block_local_max1 - new_gmax1)
+    warp_rescale0 = _exp2_approx_ftz_f32(local_max0 - new_gmax0)
+    warp_rescale1 = _exp2_approx_ftz_f32(local_max1 - new_gmax1)
+
+    gsum0 = Float32(0.0) + block_local_sum0 * block_rescale0
+    gsum1 = Float32(0.0) + block_local_sum1 * block_rescale1
+    w_pre = [
+        p0 * warp_rescale0,
+        p1 * warp_rescale0,
+        p2 * warp_rescale1,
+        p3 * warp_rescale1,
+    ]
+    return w_pre, new_gmax0, new_gmax1, gsum0, gsum1
+
+
+@cute.jit
+def write_dsv41_split_lse(
+    out_lse: cute.Tensor,
+    gmax0: Float32,
+    gmax1: Float32,
+    gsum0: Float32,
+    gsum1: Float32,
+    warp_id: Int32,
+    lane: Int32,
+):
+    """Write base-2 partial LSE matching s7_epilogue PARTIAL_WRITEBACK."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    if warp_id == Int32(0) and tid == Int32(0):
+        neg_inf = Float32(float("-inf"))
+        lse0 = neg_inf
+        lse1 = neg_inf
+        if gsum0 > Float32(0.0):
+            lse0 = _log2_approx_ftz_f32(gsum0) + gmax0
+        if gsum1 > Float32(0.0):
+            lse1 = _log2_approx_ftz_f32(gsum1) + gmax1
+        out_lse[gid] = lse0
+        out_lse[gid + Int32(8)] = lse1
+
+
+@cute.jit
+def load_dsv41_p_frags_bf16(
+    p_base: Int32,
+    *,
+    bi: cutlass.Constexpr = 64,
+):
+    """Load the 4 m16n8k16 BF16 P fragments once across all 8 PV feature slices."""
+    p_rmem = cute.make_rmem_tensor((bi // 16, 4), Uint32)
+    for ks in cutlass.range_constexpr(bi // 16):
+        a0, a1, a2, a3 = _ldmatrix_m8n8x4_b16_offset(p_base, ks * 32)
+        p_rmem[ks, 0] = a0
+        p_rmem[ks, 1] = a1
+        p_rmem[ks, 2] = a2
+        p_rmem[ks, 3] = a3
+    return p_rmem
+
+
+@cute.jit
+def s6_s7_pv_epilogue_dsv41_bf16_slice(
+    out_o: cute.Tensor,
+    p_rmem: cute.Tensor,
+    v_base: Int32,
+    vc: Int32,
+    inv_g0: Float32,
+    inv_g1: Float32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    bi: cutlass.Constexpr = 64,
+    slice_stride: cutlass.Constexpr = DSV41_COMPACT_SLICE_STRIDE,
+):
+    """Accumulate one 64-feature BF16 PV slice and stream normalized partial to out_o."""
+    x0 = Float32(0.0)
+    x1 = Float32(0.0)
+    x2 = Float32(0.0)
+    x3 = Float32(0.0)
+    for ks in cutlass.range_constexpr(bi // 16):
+        b0, b1 = _ldmatrix_m8n8x2_trans_b16_offset(v_base, ks * (16 * slice_stride))
+        x0, x1, x2, x3 = mma_m16n8k16_f32_bf16(
+            x0, x1, x2, x3, p_rmem[ks, 0], p_rmem[ks, 1], p_rmem[ks, 2], p_rmem[ks, 3], b0, b1
+        )
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    d0 = vc * Int32(64) + warp_id * Int32(8) + tid * Int32(2)
+    y0 = (Float32(0.0) + x0) * inv_g0
+    y1 = (Float32(0.0) + x1) * inv_g0
+    y2 = (Float32(0.0) + x2) * inv_g1
+    y3 = (Float32(0.0) + x3) * inv_g1
+    _ot = out_o.element_type
+    if cutlass.const_expr(_ot == cutlass.BFloat16):
+        store_bf16x2(
+            get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),
+            y0,
+            y1,
+        )
+        store_bf16x2(
+            get_ptr_as_int64(
+                out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)
+            ),
+            y2,
+            y3,
+        )
+    else:
+        out_o[gid, d0] = y0.to(_ot)
+        out_o[gid, d0 + Int32(1)] = y1.to(_ot)
+        out_o[gid + Int32(8), d0] = y2.to(_ot)
+        out_o[gid + Int32(8), d0 + Int32(1)] = y3.to(_ot)

@@ -62,15 +62,29 @@ from .io import io_issue_gather, io_issue_gather_packed, io_issue_packed_payload
 from .native_v41_records import (
     DSV41_BF16_RAW_ROW_OFFSET,
     DSV41_BF16_TILE_ROW_STRIDE,
+    DSV41_COMPACT_QP_STRIDE,
+    DSV41_COMPACT_RAW_STRIDE,
+    DSV41_COMPACT_SLICE_STRIDE,
     decode_dsv41_kv_to_bf16_smem,
+    decode_dsv41_slice_to_bf16_smem,
     issue_native_v41_gather,
+    load_q_slice_bf16_smem,
     native_v41_metadata_valid,
     s0_load_q_bf16_vec,
+    s1_qk_dsv41_bf16_slice,
     s1_qk_dsv41_bf16_smem,
+    s4_single_chunk_dsv41,
     s5_fill_sm_p_bf16,
     s6_pv_dsv41_bf16_smem,
+    s6_s7_pv_epilogue_dsv41_bf16_slice,
+    load_dsv41_p_frags_bf16,
+    write_dsv41_split_lse,
 )
-from .smem import get_unified_shared_storage_cls, make_smem_layout
+from .smem import (
+    get_native_v41_compact_shared_storage_cls,
+    get_unified_shared_storage_cls,
+    make_smem_layout,
+)
 from .traits import (
     ComputeMode,
     ModelType,
@@ -421,10 +435,18 @@ class UnifiedDecodeKernel:
         vector_q=False,
         zero_masked_v=False,
         single_split_partial_bf16=None,
+        native_v41_2cta=False,
+        min_blocks_per_mp=1,
+        preferred_smem_carveout=None,
     ):
         if single_split_partial_bf16 is not None and (num_splits != 1 or traits.v_has_rope):
             raise ValueError("direct single-split output requires one split and no V RoPE")
         self.single_split_partial_bf16 = single_split_partial_bf16
+        self.native_v41_2cta = bool(native_v41_2cta)
+        self.min_blocks_per_mp = int(min_blocks_per_mp)
+        self.preferred_smem_carveout = (
+            None if preferred_smem_carveout is None else int(preferred_smem_carveout)
+        )
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -788,18 +810,274 @@ class UnifiedDecodeKernel:
         self.kernel_native_v41(q, descriptors, metadata, selected, bounds,
                                mid_out, mid_lse, sm_scale_log2).launch(
             grid=(rows, self.h_blocks, self.num_splits),
-            block=(self.block_threads, 1, 1), min_blocks_per_mp=1, stream=stream)
+            block=(self.block_threads, 1, 1),
+            min_blocks_per_mp=self.min_blocks_per_mp,
+            preferred_smem_carveout=self.preferred_smem_carveout,
+            stream=stream)
 
     @cute.kernel
     def kernel_native_v41(self, q: cute.Tensor, descriptors: cute.Tensor,
                           metadata: cute.Tensor, selected: cute.Tensor,
                           bounds: cute.Tensor, mid_out: cute.Tensor, mid_lse: cute.Tensor,
                           sm_scale_log2: Float32):
-        self._kernel_body(q, descriptors, selected, mid_out, mid_lse,
-            sm_scale_log2, Float32(1), Int32(128), Int64(0), descriptors,
-            selected, Int32(512), Int32(2), Int64(0), selected, selected,
-            has_extra=True, per_token_len=False, native_descriptors=descriptors,
-            native_metadata=metadata, native_bounds=bounds)
+        if cutlass.const_expr(self.native_v41_2cta):
+            self._kernel_body_native_v41_compact(
+                q, descriptors, metadata, selected, bounds, mid_out, mid_lse, sm_scale_log2
+            )
+        else:
+            self._kernel_body(q, descriptors, selected, mid_out, mid_lse,
+                sm_scale_log2, Float32(1), Int32(128), Int64(0), descriptors,
+                selected, Int32(512), Int32(2), Int64(0), selected, selected,
+                has_extra=True, per_token_len=False, native_descriptors=descriptors,
+                native_metadata=metadata, native_bounds=bounds)
+
+    @cute.jit
+    def _kernel_body_native_v41_compact(
+        self,
+        q_all: cute.Tensor,
+        descriptors: cute.Tensor,
+        metadata: cute.Tensor,
+        selected: cute.Tensor,
+        bounds: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+    ):
+        t = self.traits
+        L = self.layout
+        tid = Int32(cute.arch.thread_idx()[0])
+        lane = cute.arch.lane_idx()
+        warp_id = tid >> Int32(5)
+
+        token_idx, head_block, split_idx = cute.arch.block_idx()
+        token_idx = Int32(token_idx)
+        head_block = Int32(head_block)
+        split_idx = Int32(split_idx)
+        head_base = head_block * Int32(t.hpb)
+
+        valid_request = native_v41_metadata_valid(
+            descriptors[token_idx, None], metadata[token_idx, None], bounds[token_idx]
+        )
+        if not valid_request:
+            if tid < Int32(self.valid_hpb):
+                mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
+            for index in cutlass.range(tid, self.valid_hpb * 512, self.block_threads):
+                mid_out[
+                    token_idx,
+                    head_base + index // Int32(512),
+                    split_idx,
+                    index % Int32(512),
+                ] = cutlass.BFloat16(0)
+            _exit_thread()
+
+        smem = cutlass_utils.SmemAllocator()
+        SharedStorage = get_native_v41_compact_shared_storage_cls(t)
+        st = smem.allocate(SharedStorage)
+
+        kv_raw_addr = shared_ptr_to_u32(st.kv_raw.data_ptr())
+        kv_slice_addr = shared_ptr_to_u32(st.kv_bf16_slice.data_ptr())
+        qp_addr = shared_ptr_to_u32(st.q_or_p.data_ptr())
+        reduce_max_addr = shared_ptr_to_u32(st.reduce.data_ptr())
+        reduce_sum_addr = reduce_max_addr + Int32(L.reduce_warp_sum_off - L.reduce_off)
+        token_idx_view = st.token_idx.get_tensor(
+            cute.make_layout(int(L.token_idx_buf_bytes // 4))
+        )
+        mbar_base = st.mbar.data_ptr()
+
+        if tid == Int32(0):
+            cute.arch.mbarrier_init(mbar_base, Int32(1))
+        cute.arch.barrier()
+
+        is_io = warp_id >= Int32(self.math_threads // 32)
+        if is_io:
+            io_lane = tid - Int32(self.math_threads)
+            extra_row = cute.make_tensor(
+                selected.iterator
+                + token_idx.to(Int64) * Int64(self.extra_indices_stride_row),
+                cute.make_layout(self.extra_topk),
+            )
+            if split_idx < Int32(2):
+                issue_native_v41_gather(
+                    descriptors[token_idx, None],
+                    metadata[token_idx, None],
+                    extra_row,
+                    bounds[token_idx],
+                    kv_raw_addr,
+                    Int32(0),
+                    token_idx_view,
+                    mbar_base,
+                    split_idx * Int32(64),
+                    io_lane,
+                    swa=True,
+                    kv_stride=DSV41_COMPACT_RAW_STRIDE,
+                    io_threads=self.io_threads,
+                    fp8_internal=False,
+                )
+            else:
+                issue_native_v41_gather(
+                    descriptors[token_idx, None],
+                    metadata[token_idx, None],
+                    extra_row,
+                    bounds[token_idx],
+                    kv_raw_addr,
+                    Int32(0),
+                    token_idx_view,
+                    mbar_base,
+                    (split_idx - Int32(2)) * Int32(64),
+                    io_lane,
+                    swa=False,
+                    kv_stride=DSV41_COMPACT_RAW_STRIDE,
+                    io_threads=self.io_threads,
+                    fp8_internal=False,
+                )
+        else:
+            q_token = cute.make_tensor(
+                q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
+                cute.make_layout(
+                    (self.num_heads, self.q_head_dim),
+                    stride=(self.q_stride_head, self.q_stride_dim),
+                ),
+            )
+            # Overlap the first [16, 64] BF16 Q slice copy with producer KV DMA.
+            load_q_slice_bf16_smem(q_token, qp_addr, head_base, Int32(0), tid)
+
+            warp_first_cand = warp_id * Int32(8)
+            a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+            a_col = (lane >> Int32(4)) * Int32(8)
+            qp_a_base = qp_addr + (
+                a_row * Int32(DSV41_COMPACT_QP_STRIDE) + a_col
+            ) * Int32(2)
+
+            lane_r = lane & Int32(7)
+            lane_sub = (lane >> Int32(3)) & Int32(1)
+            b_row_base = kv_slice_addr + (warp_first_cand + lane_r) * Int32(
+                DSV41_COMPACT_SLICE_STRIDE
+            )
+            swz_base = lane_sub ^ lane_r
+            b_ptr0 = b_row_base + swz_base * Int32(16)
+            b_ptr1 = b_row_base + (swz_base ^ Int32(2)) * Int32(16)
+            b_ptr2 = b_row_base + (swz_base ^ Int32(4)) * Int32(16)
+            b_ptr3 = b_row_base + (swz_base ^ Int32(6)) * Int32(16)
+
+            qk_frag = cute.make_rmem_tensor(4, Float32)
+            for k in cutlass.range_constexpr(4):
+                qk_frag[k] = Float32(0.0)
+
+            cute.arch.mbarrier_wait(mbar_base, phase=Int32(0))
+
+            for seg in cutlass.range(t.d_nope // 64, unroll=1):
+                s_idx = Int32(seg)
+                if s_idx > Int32(0):
+                    cute.arch.barrier(
+                        barrier_id=2, number_of_threads=self.math_threads
+                    )
+                    load_q_slice_bf16_smem(q_token, qp_addr, head_base, s_idx, tid)
+                decode_dsv41_slice_to_bf16_smem(
+                    kv_raw_addr, kv_slice_addr, s_idx, tid
+                )
+                cute.arch.barrier(
+                    barrier_id=2, number_of_threads=self.math_threads
+                )
+                qk = [qk_frag[0], qk_frag[1], qk_frag[2], qk_frag[3]]
+                qk = s1_qk_dsv41_bf16_slice(
+                    qk, qp_a_base, b_ptr0, b_ptr1, b_ptr2, b_ptr3
+                )
+                qk_frag[0] = qk[0]
+                qk_frag[1] = qk[1]
+                qk_frag[2] = qk[2]
+                qk_frag[3] = qk[3]
+
+            sc_start = split_idx * Int32(64)
+            sec_len = Int32(128)
+            if split_idx >= Int32(2):
+                sc_start = (split_idx - Int32(2)) * Int32(64)
+                sec_len = Int32(512)
+            sc_end = sc_start + Int32(64)
+
+            qk = [qk_frag[0], qk_frag[1], qk_frag[2], qk_frag[3]]
+            qk = s3_mask_and_scale(
+                qk,
+                token_idx_view,
+                warp_first_cand,
+                sc_start,
+                sc_end,
+                sec_len,
+                sm_scale_log2,
+                lane,
+            )
+            w_pre, gmax0, gmax1, gsum0, gsum1 = s4_single_chunk_dsv41(
+                qk,
+                reduce_max_addr,
+                reduce_sum_addr,
+                warp_id,
+                lane,
+                hpb=t.hpb,
+                n_warps=8,
+                num_threads=self.math_threads,
+                barrier_id=3,
+            )
+            s5_fill_sm_p_bf16(
+                w_pre, qp_addr, warp_id, lane, sm_p_stride=DSV41_COMPACT_QP_STRIDE
+            )
+            cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+
+            out_o = cute.make_tensor(
+                mid_out.iterator
+                + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_out_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
+                cute.make_layout(
+                    (t.hpb, t.d_v),
+                    stride=(self.mid_out_stride_head, self.mid_out_stride_dim),
+                ),
+            )
+            out_lse = cute.make_tensor(
+                mid_lse.iterator
+                + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
+                + head_base.to(Int64) * Int64(self.mid_lse_stride_head)
+                + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
+                cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
+            )
+            write_dsv41_split_lse(out_lse, gmax0, gmax1, gsum0, gsum1, warp_id, lane)
+
+            inv_g0 = Float32(0.0)
+            inv_g1 = Float32(0.0)
+            if gsum0 > Float32(0.0):
+                inv_g0 = Float32(1.0) / gsum0
+            if gsum1 > Float32(0.0):
+                inv_g1 = Float32(1.0) / gsum1
+
+            p_rmem = load_dsv41_p_frags_bf16(qp_a_base, bi=t.bi)
+            v_base = (
+                kv_slice_addr
+                + (lane_sub * Int32(8) + lane_r) * Int32(DSV41_COMPACT_SLICE_STRIDE)
+                + (warp_id ^ lane_r) * Int32(16)
+            )
+            for step in cutlass.range(t.n_v_chunks, unroll=1):
+                st_i = Int32(step)
+                vc = Int32(t.n_v_chunks - 1) - st_i
+                if st_i > Int32(0):
+                    cute.arch.barrier(
+                        barrier_id=3, number_of_threads=self.math_threads
+                    )
+                    decode_dsv41_slice_to_bf16_smem(
+                        kv_raw_addr, kv_slice_addr, vc, tid
+                    )
+                    cute.arch.barrier(
+                        barrier_id=3, number_of_threads=self.math_threads
+                    )
+                s6_s7_pv_epilogue_dsv41_bf16_slice(
+                    out_o,
+                    p_rmem,
+                    v_base,
+                    vc,
+                    inv_g0,
+                    inv_g1,
+                    warp_id,
+                    lane,
+                    bi=t.bi,
+                    slice_stride=DSV41_COMPACT_SLICE_STRIDE,
+                )
 
     @cute.kernel
     def kernel_extra(
