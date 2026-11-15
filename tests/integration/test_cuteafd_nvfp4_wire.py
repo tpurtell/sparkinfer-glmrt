@@ -102,7 +102,7 @@ def _scratch_rows(g, scratch, rows, capacity):
 ])
 def test_wire_program_exact(name, tp, raw_scale):
     require_b12x()
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES, compile_fp8_moe_aot, fp8_moe_scratch_bytes
     from b12x.integration.cuteafd.nvfp4_wire import compile_nvfp4_wire_rows_aot, nvfp4_wire_row_bytes
 
@@ -128,8 +128,7 @@ def test_wire_program_exact(name, tp, raw_scale):
     out_a, out_b = (torch.empty_like(x) for _ in range(2))
     scratch_a, scratch_b = (torch.empty(bf16.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda") for _ in range(2))
     timing = []
-    freeze_kernel_resolution("NVFP4 wire live rows reuse fixed planned capacity")
-    try:
+    with kernel_resolution_guard("NVFP4 wire live rows reuse fixed planned capacity"):
         # Zero-row quantization must not touch the destination.
         quant.launch(x, packed, scalars=(0,) if g.dynamic_nvfp4 else (0, raw_scale))
         assert bool((packed == 0xa5).all())
@@ -161,8 +160,6 @@ def test_wire_program_exact(name, tp, raw_scale):
                 point = dict(rows=rows, quant_us=_warm_us(qrun), bf16_us=_warm_us(arun), nvfp4_us=_warm_us(brun))
                 timing.append(point)
                 print(name, tp, raw_scale, point, flush=True)
-    finally:
-        unfreeze_kernel_resolution()
     receipt_dir = os.environ.get("B12X_NVFP4_WIRE_RECEIPTS")
     if receipt_dir:
         root = Path(receipt_dir)
