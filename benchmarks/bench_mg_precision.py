@@ -48,8 +48,7 @@ def arm_traits(fmt, arm):
             ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
         if arm == "fp8":
             return traits
-        # Kimi's split kernels widen each dequantized key to BF16; its MG modes keep that.
-        return with_bf16_attention(traits, rounded_k=fmt == "kimi", fp8_pv=arm == "bf16-qk")
+        return with_bf16_attention(traits, fp8_pv=arm == "bf16-qk")
     if fmt == "dsv4":
         if arm not in ("fp8-qk", "bf16-qk"):
             raise ValueError(arm)

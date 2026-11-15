@@ -2,8 +2,12 @@
 """Fork-only Kimi MG oracle and interleaved warmed graph row curve.
 
 Baselines are the shipping FP8 dense extend and split16/chunk64 sparse exports.
-The MG oracle uses #305's existing output/LSE bounds, not byte identity between
-algorithms. Same-row cross-width checks are byte exact within each MG variant.
+The MG oracle holds MG to #305's existing output/LSE bounds against FP32
+attention over the exact decoded record (E4M3 x FP32 group scale, no BF16 key
+rounding, TF32 off). The shipping routes round each dequantized key to BF16, a
+known decode-side difference: their errors, and every error against the former
+rounded-key reference, are recorded beside MG's, never asserted. Same-row
+cross-width checks are byte exact within each MG variant.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import sys
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+LN2 = 0.6931471805599453
 sys.path.insert(0, str(ROOT))
 
 
@@ -26,11 +31,29 @@ def records(tokens, seed=7321):
     torch.manual_seed(seed)
     raw = torch.randn(tokens, 576, device="cuda").bfloat16()
     cache = pack_mla_kv_cache_reference(raw[:, :512], raw[:, 512:]).reshape(tokens, 656)
-    # Baseline widens each grouped value to BF16 before QK/PV. The independent
-    # reference follows that native computation rather than treating FP8 as BF16.
+    # The reference is the exact decoded record. ``ROUNDED`` keeps the former
+    # reference (each value widened to BF16, as the shipping routes compute)
+    # for the recorded comparison only.
     from b12x.attention._shared.mla.reference import unpack_mla_kv_cache_reference
-    values = unpack_mla_kv_cache_reference(cache).squeeze(1).bfloat16().float()
+    values = unpack_mla_kv_cache_reference(cache).squeeze(1).float()
+    ROUNDED[id(values)] = values.bfloat16().float()
     return cache, values
+
+
+ROUNDED = {}
+
+
+def attention(q_row, kv, scale):
+    score = q_row.float() @ kv.T * scale
+    return score.softmax(-1) @ kv[:, :512], score.logsumexp(-1)
+
+
+def note(record, name, out_row, lse_row, expected, natural):
+    """Recorded (not asserted) maximum errors of one arm against one reference."""
+    record[name + "_output_max_abs"] = max(record.get(name + "_output_max_abs", 0.),
+                                           float((out_row.float() - expected).abs().max()))
+    record[name + "_lse_max_abs"] = max(record.get(name + "_lse_max_abs", 0.),
+                                        float((lse_row - natural).abs().max()))
 
 
 def capture(fn):
@@ -76,7 +99,7 @@ def oracle(args, report):
         bo, bl = torch.empty_like(out), torch.empty_like(lse)
         scratch = torch.empty(base.scratch_bytes(capacity)["scratch"], device="cuda", dtype=torch.uint8)
         cu = torch.arange(capacity + 1, device="cuda", dtype=torch.int32)
-        max_o, max_l = 0., 0.
+        max_o, max_l, recorded = 0., 0., {}
         for start in range(0, len(edges), capacity):
             active = edges[start:start + capacity]
             n = len(active)
@@ -93,16 +116,15 @@ def oracle(args, report):
             torch.cuda.synchronize()
             for row, length in enumerate(active):
                 if length:
-                    kv = values[indices[row, :length].long()]
-                    score = q[row].float() @ kv.T * g.softmax_scale
-                    expected = score.softmax(-1) @ kv[:, :512]
-                    natural = score.logsumexp(-1)
+                    slots = indices[row, :length].long()
+                    expected, natural = attention(q[row], values[slots], g.softmax_scale)
+                    mg_lse = lse[row] * LN2
                     max_o = max(max_o, comparison(out[row], expected))
-                    max_l = max(max_l, comparison(lse[row] * torch.log(torch.tensor(2.)), natural, lse=True))
-                    comparison(bo[row], expected)
-                    comparison(bl[row], natural, lse=True)
-                    comparison(out[row], bo[row])
-                    comparison(lse[row] * torch.log(torch.tensor(2.)), bl[row], lse=True)
+                    max_l = max(max_l, comparison(mg_lse, natural, lse=True))
+                    old = attention(q[row], ROUNDED[id(values)][slots], g.softmax_scale)
+                    note(recorded, "mg_vs_rounded_reference", out[row], mg_lse, *old)
+                    note(recorded, "baseline_vs_exact_reference", bo[row], bl[row], expected, natural)
+                    note(recorded, "baseline_vs_rounded_reference", bo[row], bl[row], *old)
                 else:
                     assert torch.count_nonzero(out[row]) == 0
                     assert torch.isneginf(lse[row]).all()
@@ -136,7 +158,8 @@ def oracle(args, report):
             for got, expected in zip(now, canonical):
                 assert torch.equal(got, expected[None].expand_as(got))
         results.append(dict(route="sparse", heads=heads, edges=edges, output_max_abs=max_o,
-                            lse_max_abs=max_l, row_invariant=True, poison=True, graph=True))
+                            lse_max_abs=max_l, row_invariant=True, poison=True, graph=True,
+                            reference="exact decoded record", **recorded))
         # Causal dense extend, randomized page table, partial page and future poison.
         dense = compile_kimi_mg_prefill_aot(g, max_rows=capacity, max_context=4096,
                                           bf16_compute=args.bf16_compute)
@@ -147,7 +170,7 @@ def oracle(args, report):
         physical = table[logical // 64].long() * 64 + logical % 64
         ordered = torch.empty_like(cache)
         ordered[physical] = cache
-        dense_baseline_lse = 0.
+        recorded = {}
         for n, prefix in ((1, 0), (17, 0), (65, 127), (65, 2048)):
             length = torch.tensor([prefix + n], device="cuda", dtype=torch.int32)
             offsets = torch.tensor([0, n], device="cuda", dtype=torch.int32)
@@ -158,15 +181,15 @@ def oracle(args, report):
                               scalars=(n, 1, 64, 1))
             torch.cuda.synchronize()
             for row in (0, n - 1):
-                kv = values[:prefix + row + 1]
-                score = q[row].float() @ kv.T * g.softmax_scale
-                expected, natural = score.softmax(-1) @ kv[:, :512], score.logsumexp(-1)
+                expected, natural = attention(q[row], values[:prefix + row + 1], g.softmax_scale)
+                mg_lse = lse[row] * LN2
+                note(recorded, "mg", out[row], mg_lse, expected, natural)
                 comparison(out[row], expected)
-                comparison(lse[row] * torch.log(torch.tensor(2.)), natural, lse=True)
-                # The shipping extend route is held to the same reference, not
-                # to the candidate: its own error is recorded, never inherited.
-                dense_baseline_lse = max(dense_baseline_lse, float((bl[row] - natural).abs().max()))
-                comparison(bo[row], expected)
+                comparison(mg_lse, natural, lse=True)
+                old = attention(q[row], ROUNDED[id(values)][:prefix + row + 1], g.softmax_scale)
+                note(recorded, "mg_vs_rounded_reference", out[row], mg_lse, *old)
+                note(recorded, "baseline_vs_exact_reference", bo[row], bl[row], expected, natural)
+                note(recorded, "baseline_vs_rounded_reference", bo[row], bl[row], *old)
             before = out[:n].clone(), lse[:n].clone()
             old = ordered[physical[prefix+n:]].clone()
             ordered[physical[prefix+n:]] = 255
@@ -176,7 +199,7 @@ def oracle(args, report):
             assert torch.equal(lse[:n].view(torch.uint8), before[1].view(torch.uint8))
             ordered[physical[prefix+n:]] = old
         results.append(dict(route="dense", heads=heads, causal=True, poison=True, graph=True,
-                            baseline_lse_max_abs=dense_baseline_lse))
+                            reference="exact decoded record", **recorded))
         print(json.dumps(results[-2:]), flush=True)
     report["oracle"] = results
     return results
@@ -225,9 +248,6 @@ def diagnose(args, report):
                         delta = (actual - expected).abs()
                         cell[name + "_" + field + "_max_abs"] = float(delta.max())
                         cell[name + "_" + field + "_mismatches"] = int((delta > allowed).sum())
-                    if arm == 0:
-                        comparison(out[arm][row], expected_o)
-                        comparison(actual_l, expected_l, lse=True)
             results.append(cell)
             print(json.dumps(cell), flush=True)
     report["correctness_passed"] = False
@@ -273,8 +293,9 @@ def curve(args, report):
                     def candidate():
                         mg.launch(q, cache, table, lengths, out[1], lse[1], ms, scalars=(rows,))
                     graphs = [capture(baseline), capture(candidate)]
-                    comparison(out[1][:rows], out[0][:rows])
-                    comparison(lse[1][:rows] * torch.log(torch.tensor(2.)), lse[0][:rows], lse=True)
+                    # Algorithms differ in key rounding: recorded, the oracle gates MG.
+                    cross_output = float((out[1][:rows].float() - out[0][:rows].float()).abs().max())
+                    cross_lse = float((lse[1][:rows] * LN2 - lse[0][:rows]).abs().max())
                     assert torch.isfinite(out[1][:rows]).all() and out[1][:rows].abs().max() > 0
                     before = torch.cuda.memory_allocated()
                     samples = [[], []]
@@ -292,7 +313,8 @@ def curve(args, report):
                     cell = dict(route=route, heads=heads, rows=rows, prefix=prefix,
                         baseline_ms=medians[0], mg_ms=medians[1], speedup=medians[0]/medians[1],
                         raw_ms=samples, baseline_scratch_bytes=bs.numel(), mg_scratch_bytes=ms.numel(),
-                        mg_lse_bytes=capacity*heads*4, allocation_stable=allocation_stable)
+                        mg_lse_bytes=capacity*heads*4, allocation_stable=allocation_stable,
+                        mg_vs_baseline_output_max_abs=cross_output, mg_vs_baseline_lse_max_abs=cross_lse)
                     results.append(cell)
                     print(json.dumps(cell), flush=True)
                     args.output.write_text(json.dumps(report, indent=2) + "\n")

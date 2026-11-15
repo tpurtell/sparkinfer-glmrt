@@ -1,10 +1,11 @@
 """Kimi MLA MG prefill over native 656-byte FP8 records.
 
 GLM_NSA has exactly Kimi's absorbed query and cache layout. Reuse its traits,
-not its model softmax scale. BF16 attention (BF16 Q, K and V dequantized to
-BF16 in registers as Kimi's split kernels widen them, FP32 accumulate) is the
-mode that meets Kimi's oracle bounds; FP8 QK does not and stays a diagnostic
-arm. Dense causal extend builds one shared physical-slot
+not its model softmax scale. BF16 attention (BF16 Q, exact K with its FP32
+group scale applied to the FP32 partial, BF16 V and P, FP32 accumulate) is the
+mode that meets Kimi's oracle bounds against the exact decoded record; FP8 QK
+does not and stays a diagnostic arm. Kimi's split decode kernels still round
+each dequantized key to BF16: a known decode-side difference. Dense causal extend builds one shared physical-slot
 vector plus per-query visible lengths; sparse takes the selector's native slots.
 No split partials or cache conversion. The public Kimi routes are unchanged.
 """
@@ -59,7 +60,7 @@ class _MG:
         traits = make_unified_traits(ModelType.GLM_NSA, ComputeMode.FP8,
                                      ScaleFormat.ARBITRARY_FP32)
         if bf16_compute:
-            traits = with_bf16_attention(traits, rounded_k=True)
+            traits = with_bf16_attention(traits)
         self.metadata = _DenseMetadata(capacity)
         self.kernels = []
         for groups, active, offset in _mg_head_partitions(
