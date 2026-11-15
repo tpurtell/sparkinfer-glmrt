@@ -43,6 +43,8 @@ ROUNDED = {}
 
 
 def attention(q_row, kv, scale):
+    # The reference must be true FP32: TF32 matmuls move its LSE by more than the bound.
+    torch.backends.cuda.matmul.allow_tf32 = False
     score = q_row.float() @ kv.T * scale
     return score.softmax(-1) @ kv[:, :512], score.logsumexp(-1)
 
@@ -235,8 +237,7 @@ def diagnose(args, report):
                 cell["mg_empty_negative_inf_lse"] = bool(torch.isneginf(lse[1][row]).all())
             else:
                 kv = values[table[row, :length].long()]
-                score = q[row].float() @ kv.T * g.softmax_scale
-                expected_o, expected_l = score.softmax(-1) @ kv[:, :512], score.logsumexp(-1)
+                expected_o, expected_l = attention(q[row], kv, g.softmax_scale)
                 for arm in (0, 1):
                     name = "baseline" if arm == 0 else "mg"
                     actual_l = lse[arm][row]
