@@ -15,7 +15,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64, Uint8
 import torch
 
 from b12x._lib.intrinsics import div_rn_f32
@@ -78,6 +78,56 @@ class _Pack:
         if slot >= Int64(0) and col < Int64(self.width):
             cache[slot*Int64(2*self.width)+col] = Float32(k[row*Int64(self.width)+col])
             cache[slot*Int64(2*self.width)+Int64(self.width)+col] = Float32(v[row*Int64(self.width)+col])
+
+
+class _PaddedTranspose:
+    threads = 256
+
+    def __init__(self, rows, cols, padded_cols, element_bytes):
+        self.rows, self.cols, self.padded_cols = rows, cols, padded_cols
+        self.element_bytes = element_bytes
+
+    @cute.jit
+    def __call__(self, source: cute.Pointer, output: cute.Pointer, stream: cuda.CUstream):
+        source = cute.recast_ptr(source, dtype=Uint8)
+        output = cute.recast_ptr(output, dtype=Uint8)
+        total = self.cols*self.padded_cols*self.element_bytes
+        self.kernel(source, output).launch(grid=((total+self.threads-1)//self.threads, 1, 1),
+            block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, source: cute.Pointer, output: cute.Pointer):
+        index = Int64(cute.arch.block_idx()[0])*Int64(self.threads)+Int64(cute.arch.thread_idx()[0])
+        if index < Int64(self.cols*self.padded_cols*self.element_bytes):
+            byte = index%Int64(self.element_bytes)
+            element = index//Int64(self.element_bytes)
+            row, col = element//Int64(self.padded_cols), element%Int64(self.padded_cols)
+            value = Uint8(0)
+            if col < Int64(self.rows):
+                value = Uint8(source[(col*Int64(self.cols)+row)*Int64(self.element_bytes)+byte])
+            output[index] = value
+
+
+def compile_padded_transpose_aot(*, dtype=torch.bfloat16, rows=16, cols=1024, padded_cols=64):
+    """Bit-exact static tensor transpose+zero-pad in one device pass.
+
+    Input [rows,cols] becomes output [cols,padded_cols]. No floating-point
+    conversion occurs: signed zeros, NaN payloads and every storage bit survive.
+    Geometry is immutable weight metadata, never a live request quantity.
+    """
+    if (dtype not in (torch.bfloat16, torch.float16, torch.float32, torch.int8, torch.uint8,
+                      torch.int32, torch.int64) or type(rows) is not int or type(cols) is not int
+            or type(padded_cols) is not int or min(rows, cols, padded_cols) <= 0 or rows > padded_cols):
+        raise ValueError("invalid padded transpose dtype/geometry")
+    element_bytes = torch.empty((), dtype=dtype).element_size()
+    if cols*padded_cols*element_bytes > 2**63-1:
+        raise ValueError("padded transpose extent exceeds signed 64-bit indexing")
+    return compile_program(_PaddedTranspose(rows, cols, padded_cols, element_bytes), name="padded_transpose",
+        operands=(Operand("source", dtype, f"[{rows},{cols}]"),
+                  Operand("output", dtype, f"[{cols},{padded_cols}]", "out")),
+        scalars=(), key=(dtype, rows, cols, padded_cols),
+        geometry=dict(rows=rows, cols=cols, padded_cols=padded_cols, element_bytes=element_bytes,
+                      dtype=str(dtype)), doc=__doc__)
 
 
 def compile_inkling2_norm_aot(*, width=4608, heads=1, weighted=True, eps=1e-6,
