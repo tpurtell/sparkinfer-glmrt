@@ -16,8 +16,7 @@ from b12x.moe._shared.kernels.v4_stream_pipeline import (
 from tests.moe.test_v41_exact_slices import pack
 
 
-@pytest.mark.parametrize("hidden,intermediate,coded", [(5120, 576, True), (4096, 512, False), (7168, 768, False)])
-def test_native_segments_match_singletons_and_row_curve(hidden, intermediate, coded):
+def _run_native_segments(hidden, intermediate, coded, profile=None):
     torch.manual_seed(844)
     experts, topk, capacity = 384 if coded else 256, 6, 8192
     weights, scales = {}, {}
@@ -74,6 +73,17 @@ def test_native_segments_match_singletons_and_row_curve(hidden, intermediate, co
     def staged(rows):
         program.launch(*args, scalars=(rows,))
 
+    if profile is not None:
+        baseline(8192)
+        staged(8192)
+        torch.cuda.synchronize()
+        assert torch.equal(output[1:8193].view(torch.int16), expected.view(torch.int16))
+        torch.cuda.cudart().cudaProfilerStart()
+        (baseline if profile == "ordinary" else staged)(8192)
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        return
+
     for rows in (1, 333, 2048, 2752, 4096, 5504, 8192):
         baseline(rows)
         staged(rows)
@@ -113,3 +123,13 @@ def test_native_segments_match_singletons_and_row_curve(hidden, intermediate, co
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(output[1:2753].view(torch.int16), first.view(torch.int16))
+
+
+@pytest.mark.parametrize("hidden,intermediate,coded", [(5120, 576, True), (4096, 512, False), (7168, 768, False)])
+def test_native_segments_match_singletons_and_row_curve(hidden, intermediate, coded):
+    _run_native_segments(hidden, intermediate, coded)
+
+
+@pytest.mark.parametrize("arm", ["ordinary", "segments"])
+def test_profile_8192_flash(arm):
+    _run_native_segments(4096, 512, False, profile=arm)
