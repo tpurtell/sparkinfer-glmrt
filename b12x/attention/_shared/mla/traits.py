@@ -89,6 +89,12 @@ class UnifiedMLATraits:
     # This is not a cache ABI change: it exists only after the gathered row is
     # owned by the math CTA.
     fp8_internal: bool = False
+    # Staged KV record buffers. Two buffers keep the producer one chunk ahead of
+    # the math warps. A single-chunk split (one active chunk per CTA) has nothing
+    # to overlap, so a caller that will never run a second chunk can stage into
+    # one buffer and hand the freed bytes to a resident decode tile. The default
+    # keeps every existing layout and export byte-identical.
+    kv_bufs: int = 2
 
 
 def make_unified_traits(

@@ -205,7 +205,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     n_v_chunks = traits.n_v_chunks
     kv_smem_stride = traits.kv_smem_stride
     q_nope_stride = traits.q_nope_stride
-    bufs = _KV_BUF_COUNT
+    bufs = int(traits.kv_bufs)
 
     off = 0
 
@@ -280,7 +280,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # --- P6 mbarrier pair placeholder (16B aligned; reserved, unused in P5). ---
     off = _align_up(off, 16)
     mbar_off = off
-    mbar_bytes = _MBAR_BYTES
+    mbar_bytes = 2 * bufs * 8
     off = mbar_off + mbar_bytes
 
     # --- cross-warp softmax reduce scratch: warp_max | warp_sum (fp32). ---
@@ -315,7 +315,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     off = _align_up(off, 16)
     token_idx_off = off
     token_idx_buf_bytes = bi * 4
-    token_idx_bufs = _TOKEN_IDX_BUF_COUNT
+    token_idx_bufs = bufs
     off = token_idx_off + token_idx_buf_bytes * token_idx_bufs
 
     # --- static sm_p_full (bf16), 128B-aligned for the S6b ldmatrix.x4 read. ---
