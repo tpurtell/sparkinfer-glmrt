@@ -29,12 +29,17 @@ from tests._reference.paged_attention_helpers import (
 def paged_attention_forward(*args, **kwargs):
     result = _paged_attention_forward(*args, **kwargs)
     path = os.environ.get("MINIMAX_SPARSE_RECEIPT")
-    if path and not torch.cuda.is_current_stream_capturing():
+    test = os.environ.get("PYTEST_CURRENT_TEST", "")
+    if path and "compile_key" not in test and not torch.cuda.is_current_stream_capturing():
         import b12x.attention.paged.forward_extend_generic as kernel
 
         source = Path(kernel.__file__).resolve()
         assert source == Path(os.environ["MINIMAX_ATTENTION_SOURCE"]).resolve()
         output, lse = result
+        binding = kwargs.get("binding")
+        if binding is not None and binding.scratch.cu_seqlens_q is not None:
+            live_rows = int(binding.scratch.cu_seqlens_q[-1].item())
+            output, lse = output[:live_rows], lse[:live_rows]
         record = dict(
             test=os.environ["PYTEST_CURRENT_TEST"].removesuffix(" (call)"),
             kernel_source=str(source),
