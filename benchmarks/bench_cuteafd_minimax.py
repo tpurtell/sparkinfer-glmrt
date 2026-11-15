@@ -179,10 +179,20 @@ def producer_cases(args):
             batch = (torch.arange(capacity, device=dev) % 3).int()
             kd = torch.tensor([[1, .5, 2, .25], [.75, 1.5, 3, .125], [2.5, .3, 1, .2]], device=dev)
             vd = kd.flip(0).contiguous()
-            caches = [torch.empty((capacity * 2 + 128, 4, 128), device=dev, dtype=torch.uint8) for _ in range(2)]
+            from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
+            record = fp8_kv_plane_bytes(4, 128)
+            caches = [torch.empty((capacity * 2 + 128, record), device=dev, dtype=torch.uint8) for _ in range(2)]
             operands = (k, v, slots, batch, kd, vd, *caches)
-            refs = [(value.float() * (1 / scale[batch.long(), :, None])).to(torch.float8_e4m3fn).view(torch.uint8)
-                    for value, scale in zip((k, v), (kd, vd))]
+            refs = []
+            for value in (k, v):
+                source = value.float().cpu()
+                scale = source.abs().amax(-1) / 448
+                scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+                codes = (source * (1 / scale[..., None])).to(torch.float8_e4m3fn)
+                reference = torch.zeros((capacity, record), dtype=torch.uint8)
+                reference[:, :512] = codes.view(torch.uint8).reshape(capacity, 512)
+                reference[:, 512:528] = scale.view(torch.uint8)
+                refs.append(reference.to(dev))
         full_bits = None
         if name != "kv_pack":
             program.launch(*operands, scalars=(max(args.rows),))
@@ -204,7 +214,7 @@ def producer_cases(args):
                     assert torch.equal(cache, expected), "KV byte oracle or untouched suffix"
                 outputs = caches
                 row_bits = [cache[64].view(torch.uint8).clone() for cache in caches]
-                byte_count, flops = rows * 3072, 0
+                byte_count, flops = rows * (2048 + 2 * record), 0
             else:
                 torch.testing.assert_close(out[:rows], ref[:rows], rtol=rtol, atol=atol)
                 assert torch.isnan(out[rows:]).all(), "writes beyond live rows"
