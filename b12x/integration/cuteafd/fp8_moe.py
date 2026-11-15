@@ -791,14 +791,14 @@ class _StreamNvfp4A4Route:
     quantization fused (``StreamNvfp4GateUpA4``; ``nvfp4_a4_fused``), the down
     GEMM, route combine."""
 
-    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool):
+    def __init__(self, g: Fp8MoeGeometry, max_rows: int, wire: bool, row_addresses: bool = False):
         self.g = g
         convention = {"scale_convention": g.scale_convention}
         h, i, e, k = g.hidden, g.slice, g.experts, g.top_k
         self.max_tiles = stream_max_tiles(e, int(max_rows) * k)
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
-        self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i, **convention)
+        self.rows_in = ChunkRowsA4(k=h, wire=wire, experts=e, scale_rows=i, row_addresses=row_addresses, **convention)
         self.fused = nvfp4_a4_fused()
         if self.fused:
             self.gate_up = StreamNvfp4GateUpA4(inter=i, hidden=h, experts=e, limit=g.swiglu_limit, activation=g.activation,
@@ -823,7 +823,7 @@ class _StreamNvfp4A4Route:
             self.small_down = tuple(StreamNvfp4LinearA4(n=h, k=i, experts=e, tile_m=16, tile_n=n,
                                                         live_max=16, **convention) for n in (32, 64, 128))
         self.core_only = False
-        self.combine = MoeCombine(hidden=h, top_k=k)
+        self.combine = MoeCombine(hidden=h, top_k=k, row_addresses=row_addresses)
 
     def key(self) -> tuple:
         return ("stream_nvfp4_a4", self.max_tiles, self.rows_in.key(), self.gate_up.key(),
@@ -998,6 +998,22 @@ class _StreamNvfp4DynRoute:
             self.combine(y, pair_pos, weights, out, rows, stream)
 
 
+def _segmented_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
+                     mxfp4_down_a8: bool = False):
+    """The ``stream`` route reading retained per-row input addresses and storing
+    per-row output addresses (one merged Spark wave of several received units).
+    Arithmetic is the ordinary stream's, so members are byte-identical to singletons."""
+    if route != "stream":
+        raise ValueError("row addresses require the stream route")
+    if g.activations == "a4" and not g.dynamic_nvfp4:
+        if wire:
+            raise ValueError("NVFP4 A4 row addresses take original BF16 rows")
+        return _StreamNvfp4A4Route(g, max_rows, wire, row_addresses=True)
+    if not wire or g.weights not in ("fp8", "mxfp4", "mxfp8"):
+        raise ValueError("row addresses require an FP8/MXFP4/MXFP8 wire stream or NVFP4 A4 BF16 rows")
+    return _StreamRoute(g, max_rows, wire, prefill, mxfp4_down_a8, row_addresses=True)
+
+
 def _make_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
                 mxfp4_down_a8: bool = False):
     if route == "stream" and g.dynamic_nvfp4:
@@ -1109,9 +1125,7 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
     mxfp4_down_a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
     requested, route = route, _resolve(route, max_rows, wire, g.kind, prefill, geometry=g)
     if row_addresses:
-        if route != "stream" or not wire or g.weights not in ("fp8", "mxfp4", "mxfp8"):
-            raise ValueError("row addresses require an FP8/MXFP4/MXFP8 wire stream")
-        launch = _StreamRoute(g, max_rows, wire, prefill, mxfp4_down_a8, row_addresses=True)
+        launch = _segmented_route(g, route, max_rows, wire, prefill, mxfp4_down_a8)
     else:
         launch = _Fp8Moe(g, route, max_rows, wire, prefill, mxfp4_down_a8)
     if core_only:
@@ -1213,24 +1227,35 @@ def compile_fp8_moe_aot(g: Fp8MoeGeometry, *, route: str, max_rows: int, wire: b
                   **({"activation_scale": "per_token_amax_fouroversix", "weight_scale": "amax_denominator"}
                      if g.dynamic_nvfp4 else {}),
                   "prefill": prefill, "mxfp4_down_a8": bool(mxfp4_down_a8),
-                  "weight_read_grouping": ({"contract": "exact_grouping", "segments": [{"end_rows": int(max_rows), "group_rows": STREAM_TILE_M}]}
+                  "weight_read_grouping": (_segmented_weight_read_grouping(g, max_rows)
                                            if row_addresses else launch.weight_read_grouping(g.weights, max_rows)),
-                  "arithmetic_routes": ([{"end_rows": int(max_rows), "route_id": 3}]
+                  "arithmetic_routes": ([{"end_rows": int(max_rows), "route_id": 0 if g.weights == "nvfp4" else 3}]
                                         if row_addresses else launch.arithmetic_routes(g.weights, max_rows)),
                   "row_addresses": bool(row_addresses),
                   **({"core_only": True, "reply_layout_version": 1} if core_only else {})},
-        scratch={"scratch": lambda rows: (fp8_moe_segment_scratch_bytes(g, rows, max_rows, prefill, mxfp4_down_a8)
+        scratch={"scratch": lambda rows: (fp8_moe_segment_scratch_bytes(g, rows, max_rows, prefill, mxfp4_down_a8, wire=wire)
                                          if row_addresses else fp8_moe_scratch_bytes(g, route, rows, wire, prefill, mxfp4_down_a8))},
         doc=__doc__,
     )
 
 
+def _segmented_weight_read_grouping(g: Fp8MoeGeometry, max_rows: int) -> dict:
+    """Static accounting of a row-address stream: 128-row chunks, except NVFP4,
+    whose occupancy-dependent sparse/wide tiles keep the explicit route bound."""
+    if g.weights == "nvfp4":
+        return {"contract": "conservative_route_upper_bound",
+                "segments": [{"end_rows": int(max_rows), "group_rows": 1}]}
+    return {"contract": "exact_grouping", "segments": [{"end_rows": int(max_rows), "group_rows": STREAM_TILE_M}]}
+
+
 def fp8_moe_segment_scratch_bytes(g: Fp8MoeGeometry, rows: int, maximum: int, prefill: str = "auto",
-                                  mxfp4_down_a8: "bool | None" = None) -> int:
-    """Live extent with the compiled tile-table offset, not maximum-row allocation."""
-    if not 0 < rows <= maximum or g.weights not in ("fp8", "mxfp4"):
+                                  mxfp4_down_a8: "bool | None" = None, wire: bool = True) -> int:
+    """Live extent with the compiled tile-table offset, not maximum-row allocation.
+    FP8/MXFP4 take wire rows; calibrated NVFP4 A4 takes BF16 rows (its own regions)."""
+    a4 = g.weights == "nvfp4" and g.activations == "a4" and not g.dynamic_nvfp4
+    if not 0 < rows <= maximum or not (g.weights in ("fp8", "mxfp4") and wire or a4 and not wire):
         raise ValueError("invalid segmented stream extent")
-    a8 = _mxfp4_down_a8(True, g.kind, prefill, mxfp4_down_a8)
-    regions = _regions(g, "stream", rows, True, a8)
+    a8 = _mxfp4_down_a8(wire, g.kind, prefill, mxfp4_down_a8)
+    regions = _regions(g, "stream", rows, wire, a8)
     regions[0] = 4 * meta_words(g.experts, stream_max_tiles(g.experts, maximum * g.top_k))
     return sum(_align(b) for b in regions)

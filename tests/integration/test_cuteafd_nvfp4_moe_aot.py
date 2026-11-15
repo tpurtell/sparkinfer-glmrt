@@ -478,3 +478,85 @@ def test_e4m3_scale_is_exact():
     scales = scales[torch.isfinite(scales)]
     products = table[:, None] * scales[None, :]
     assert torch.equal(products.bfloat16().float(), products)
+
+
+@pytest.mark.parametrize("name,tp,real", [("minimax_nvfp4a4", 3, 1024), ("glmf_nvfp4a4", 2, 1024)])
+@pytest.mark.parametrize("hot", [0, 8])
+def test_nvfp4_a4_stream_segment_row_invariance(name, tp, real, hot):
+    """A merged W4A4 wave over retained mapped BF16 rows (ring-like offsets, reordered
+    rows, two members) writes every member's reply byte-identical to its singleton
+    stream launch, and touches neither guard bytes nor nonmembers (#844 for NVFP4)."""
+    from itertools import permutations
+
+    from b12x.integration.cuteafd.fp8_moe import (compile_fp8_moe_aot, fp8_moe_scratch_bytes,
+                                                   fp8_moe_segment_scratch_bytes)
+    from b12x.sequence._shared.disk_table import MappedHostAllocation
+
+    g = _geometry(name, tp)
+    w = _weights(g, real)
+    capacity, maximum = 2752, 8192
+    row_counts = (2752, 2487, 1900)
+    device = torch.device("cuda", torch.cuda.current_device())
+    gen = torch.Generator(device=device).manual_seed(844)
+    direct = compile_fp8_moe_aot(g, route="stream", max_rows=capacity, wire=False)
+    indirect = compile_fp8_moe_aot(g, route="stream", max_rows=maximum, wire=False, row_addresses=True)
+    assert indirect.geometry["row_addresses"] and indirect.geometry["route"] == "stream"
+    direct_scratch = torch.empty(fp8_moe_scratch_bytes(g, "stream", capacity, False), dtype=torch.uint8, device=device)
+    stride = g.hidden * 2
+    sentinel = 173
+    allocations, segments = [], []
+    try:
+        for slot, rows in enumerate(row_counts):
+            x = (torch.randn(rows, g.hidden, device=device, generator=gen) * (1.0 + 10.0 * slot)).bfloat16()
+            scores = torch.rand(rows, g.experts, device=device, generator=gen)
+            if hot:
+                scores[:, :hot] += 2.0
+            ids = scores.topk(g.top_k, -1).indices.int().contiguous()
+            weights = torch.rand(rows, g.top_k, device=device, generator=gen)
+            baseline = torch.empty(rows, g.hidden, dtype=torch.bfloat16, device=device)
+            direct.launch(x, ids, weights, *w, baseline, direct_scratch, scalars=(rows,))
+            torch.cuda.synchronize()
+            assert torch.isfinite(baseline).all() and baseline.count_nonzero() > 0
+            # Transport-like frames: a 16-byte-aligned payload after a header.
+            input_offset, output_offset = 96 + 16 * slot, 96
+            source = MappedHostAllocation((input_offset + rows * stride + 64,), torch.uint8, device)
+            response = MappedHostAllocation((output_offset + rows * stride + 64,), torch.uint8, device)
+            allocations += [source, response]
+            source.host_view.fill_(sentinel)
+            source.host_view[input_offset:input_offset + rows * stride].copy_(x.cpu().view(torch.uint8).flatten())
+            snapshot = source.host_view.clone()
+            segments.append((source, response, ids, weights, baseline.cpu(), snapshot, input_offset, output_offset, rows))
+        for count in (1, 2):
+            for order in permutations(range(3), count):
+                live = sum(row_counts[s] for s in order)
+                scratch = torch.empty(fp8_moe_segment_scratch_bytes(g, live, maximum, wire=False),
+                                      dtype=torch.uint8, device=device)
+                for _, response, *_ in segments:
+                    response.host_view.fill_(sentinel)
+                xs, ys, routed_ids, routed_weights = [], [], [], []
+                for position, s in enumerate(order):
+                    source, response, ids, weights, _, _, input_offset, output_offset, rows = segments[s]
+                    permutation = (torch.arange(rows, device=device) if position == 0 else
+                                   torch.randperm(rows, device=device, generator=gen))
+                    xs.append(source.device_view.data_ptr() + input_offset + permutation.long() * stride)
+                    ys.append(response.device_view.data_ptr() + output_offset + permutation.long() * stride)
+                    routed_ids.append(ids[permutation])
+                    routed_weights.append(weights[permutation])
+                indirect.launch(torch.cat(xs), torch.cat(routed_ids), torch.cat(routed_weights), *w,
+                                torch.cat(ys), scratch, scalars=(live,))
+                torch.cuda.synchronize()
+                for s, (source, response, _, _, baseline, snapshot, _, offset, rows) in enumerate(segments):
+                    assert torch.equal(source.host_view, snapshot), "input/guards modified"
+                    raw = response.host_view
+                    end = offset + rows * stride
+                    assert (raw[:offset] == sentinel).all() and (raw[end:] == sentinel).all(), "reply guard overwritten"
+                    if s in order:
+                        actual = raw[offset:end].view(torch.bfloat16).reshape(rows, g.hidden)
+                        different = int((actual.view(torch.int16) != baseline.view(torch.int16)).sum())
+                        assert different == 0, f"{name} tp{tp} hot={hot} order={order} member={s}: {different} words differ"
+                    else:
+                        assert (raw == sentinel).all(), "nonmember reply modified"
+                print(f"nvfp4 a4 row_addresses {name} tp{tp} hot={hot} order={order} rows={live}: byte-identical")
+    finally:
+        for allocation in reversed(allocations):
+            allocation.close()
