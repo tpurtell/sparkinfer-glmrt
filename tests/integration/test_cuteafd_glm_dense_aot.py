@@ -76,6 +76,36 @@ def test_glm_norm(g, rows, deltas):
     assert c >= COS and mismatch < 1e-2
 
 
+@pytest.mark.parametrize("family", ["glm", "mimo"])
+@pytest.mark.parametrize("head_split", [False, True])
+@pytest.mark.parametrize("deltas", [0, 1, 2])
+def test_norm_projection_sum_rounds_only_at_residual(family, head_split, deltas):
+    require_b12x()
+    from b12x.integration.cuteafd import GLM53, MIMO_V2_FLASH, glm_ffn, mimo_ffn
+
+    geometry, compiler = (GLM53, glm_ffn.compile_glm_norm_aot) if family == "glm" else (
+        MIMO_V2_FLASH, mimo_ffn.compile_mimo_norm_aot)
+    program = compiler(geometry, head_split=head_split)
+    # -1 + (1 + 2^-8) distinguishes one BF16 rounding from two.
+    residual = -torch.ones((1, geometry.hidden), dtype=torch.bfloat16, device="cuda")
+    first = torch.ones_like(residual)
+    second = torch.full_like(residual, 2**-8)
+    weight = torch.ones(geometry.hidden, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty_like(residual)
+    expected = residual.clone()
+    if deltas:
+        add = first.float()
+        if deltas == 2:
+            add = add + second.float()
+            if not head_split:
+                add = add.bfloat16().float()
+        expected = (expected.float() + add).bfloat16()
+    program.launch(residual, first, second, weight, out, scalars=(1, deltas))
+    torch.cuda.synchronize()
+    assert torch.equal(residual, expected)
+    assert torch.isfinite(out).all()
+
+
 @pytest.mark.parametrize("layer,inter", [(0, 12288), (3, 2048)])
 @pytest.mark.parametrize("capacity,rows", ROWS)
 def test_glm_ffn(g, layer, inter, capacity, rows):

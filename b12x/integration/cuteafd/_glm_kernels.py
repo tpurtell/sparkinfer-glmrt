@@ -135,14 +135,17 @@ class GlmAddRmsNorm:
 
     ``deltas`` (runtime): 0 normalizes ``residual`` as is; 1 adds ``delta0``;
     2 adds ``bf16(delta0 + delta1)`` (routed + shared expert outputs, the
-    reference MoE order). The updated residual is written back in BF16.
+    reference MoE order). ``head_split=True`` instead sums the two projection
+    partials in FP32 before the single residual BF16 rounding. The updated
+    residual is written back in BF16.
     One CTA per row; each thread owns 16-byte vectors ``t, t+256, ...``, all
     loads issue before any store.
     """
 
     threads = 256
 
-    def __init__(self, width: int, eps: float):
+    def __init__(self, width: int, eps: float, *, head_split: bool = False):
+        self.head_split = bool(head_split)
         self.width = int(width)
         if self.width % (8 * self.threads):
             raise ValueError("RMSNorm width must be a multiple of 8 * CTA width")
@@ -197,7 +200,10 @@ class GlmAddRmsNorm:
                 other = cute.make_rmem_tensor(cute.make_layout((count,), stride=(1,)), Float32)
                 self._load(Int64(delta1.toint()) + row, other, True)
                 for k in cutlass.range_constexpr(count):
-                    add[k] = _bf16(add[k] + other[k])
+                    if cutlass.const_expr(self.head_split):
+                        add[k] = add[k] + other[k]
+                    else:
+                        add[k] = _bf16(add[k] + other[k])
             for k in cutlass.range_constexpr(count):
                 values[k] = _bf16(values[k] + add[k])
             self._store(Int64(residual.toint()) + row, values)
