@@ -9,11 +9,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Float64, Int32, Int64
+from cutlass import BFloat16, Float32, Float64, Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import div_rn_f32
+from b12x._lib.intrinsics import cvt_f32x4_to_e4m3x4, div_rn_f32
 from ._common import Operand, Scalar, compile_program
-from ._glm_kernels import _bf16, _warp_sum, _warp_max
+from ._glm_kernels import _bf16, _fp8_scale, _warp_sum, _warp_max
 from ._qwen4_kernels import _sigmoid
 from .pointwise import _add, _mul, _sqrt_rn, _view
 
@@ -437,12 +437,13 @@ class HeadNorm:
 
 
 class KvRecordNorm:
-    def __init__(self, heads, rotary):
-        self.heads, self.rotary = heads, rotary
+    def __init__(self, heads, rotary, kv_cache="bf16"):
+        self.heads, self.rotary, self.fp8 = heads, rotary, kv_cache == "fp8"
 
     @cute.kernel
     def kernel(self, k_raw: cute.Pointer, v: cute.Pointer, positions: cute.Pointer,
                cos: cute.Pointer, sin: cute.Pointer, slots: cute.Pointer, dst: cute.Pointer):
+        destination = dst
         k_raw, v, positions, cos, sin, slots, dst = (
             _view(p) for p in (k_raw, v, positions, cos, sin, slots, dst))
         row, head = Int64(cute.arch.block_idx()[0]), Int64(cute.arch.block_idx()[1])
@@ -466,16 +467,45 @@ class KvRecordNorm:
                 rb = _bf16(_add(_bf16(_mul(b, Float32(cos[at]))),
                                 _bf16(_mul(a, Float32(sin[at])))))
                 a, b = ra, rb
-            at = slot * Int64(self.heads * 128) + head * Int64(64) + lane
-            dst[at], dst[at + Int64(32)] = BFloat16(a), BFloat16(b)
-            dst[at + Int64(self.heads * 64)] = v[base + lane]
-            dst[at + Int64(self.heads * 64 + 32)] = v[base + lane + Int64(32)]
+            if cutlass.const_expr(self.fp8):
+                va, vb = Float32(v[base + lane]), Float32(v[base + lane + Int64(32)])
+                ks = _fp8_scale(_warp_max(cutlass.max(cute.math.abs(a), cute.math.abs(b))))
+                vs = _fp8_scale(_warp_max(cutlass.max(cute.math.abs(va), cute.math.abs(vb))))
+                ki, vi = div_rn_f32(Float32(1.0), ks), div_rn_f32(Float32(1.0), vs)
+                record = Int64(destination.toint()) + slot * Int64(self.heads * 136)
+                scales = cute.make_tensor(cute.make_ptr(Float32, record + Int64(self.heads * 128),
+                    cute.AddressSpace.gmem, assumed_align=16), cute.make_layout((self.heads * 2,)))
+                if lane == Int64(0):
+                    scales[head], scales[head + Int64(self.heads)] = ks, vs
+                words = cute.make_tensor(cute.make_ptr(Uint32, record, cute.AddressSpace.gmem,
+                    assumed_align=16), cute.make_layout((self.heads * 32,)))
+                for item in cutlass.range_constexpr(4):
+                    value = a * ki
+                    if cutlass.const_expr(item == 1):
+                        value = b * ki
+                    elif cutlass.const_expr(item == 2):
+                        value = va * vi
+                    elif cutlass.const_expr(item == 3):
+                        value = vb * vi
+                    v1 = cute.arch.shuffle_sync_bfly(value, offset=1)
+                    v2 = cute.arch.shuffle_sync_bfly(value, offset=2)
+                    v3 = cute.arch.shuffle_sync_bfly(v1, offset=2)
+                    if lane % Int64(4) == Int64(0):
+                        at = head * Int64(16) + lane // Int64(4) + Int64((item % 2) * 8)
+                        if cutlass.const_expr(item >= 2):
+                            at += Int64(self.heads * 16)
+                        words[at] = cvt_f32x4_to_e4m3x4(value, v1, v2, v3)
+            else:
+                at = slot * Int64(self.heads * 128) + head * Int64(64) + lane
+                dst[at], dst[at + Int64(32)] = BFloat16(a), BFloat16(b)
+                dst[at + Int64(self.heads * 64)] = v[base + lane]
+                dst[at + Int64(self.heads * 64 + 32)] = v[base + lane + Int64(32)]
 
 
 class QkNormRope:
-    def __init__(self, heads, kv_heads, rotary):
+    def __init__(self, heads, kv_heads, rotary, kv_cache="bf16"):
         self.q = HeadNorm(heads, scale=5.4730064863875, rotary=rotary)
-        self.kv = KvRecordNorm(kv_heads, rotary)
+        self.kv = KvRecordNorm(kv_heads, rotary, kv_cache)
 
     @cute.jit
     def __call__(self, q_raw: cute.Pointer, k_raw: cute.Pointer, v: cute.Pointer,
@@ -494,11 +524,14 @@ def _heads(heads):
     return heads, heads // 8
 
 
-def compile_qk_norm_rope_aot(*, heads=128, kind="swa"):
+def compile_qk_norm_rope_aot(*, heads=128, kind="swa", kv_cache="bf16"):
     heads, kv_heads = _heads(heads)
     if kind not in ("swa", "full"):
         raise ValueError("Muse attention kind must be swa or full")
-    return compile_program(QkNormRope(heads, kv_heads, kind == "swa"),
+    if kv_cache not in ("bf16", "fp8"):
+        raise ValueError("Muse KV cache must be bf16 or fp8")
+    record = kv_heads * (136 if kv_cache == "fp8" else 256)
+    return compile_program(QkNormRope(heads, kv_heads, kind == "swa", kv_cache),
         name="muse_qk_norm_rope_swa" if kind == "swa" else "muse_qk_norm_nope_full", operands=(
             Operand("q_raw", torch.bfloat16, f"[rows,{heads},64]"),
             Operand("k_raw", torch.bfloat16, f"[rows,{kv_heads},64]"),
@@ -507,8 +540,10 @@ def compile_qk_norm_rope_aot(*, heads=128, kind="swa"):
             Operand("cos", torch.bfloat16, "[P,32]"), Operand("sin", torch.bfloat16, "[P,32]"),
             Operand("kv_slots", torch.int64, "[rows]", align=8),
             Operand("q", torch.bfloat16, f"[rows,{heads},64]", "out"),
-            Operand("kv_dst", torch.bfloat16, f"[records,{kv_heads * 128}]", "inout")),
-        scalars=(Scalar("rows"),), key=(heads, kind), geometry=dict(heads=heads, kv_heads=kv_heads, kind=kind))
+            Operand("kv_dst", torch.uint8 if kv_cache == "fp8" else torch.bfloat16,
+                    f"[records,{record if kv_cache == 'fp8' else record // 2}]", "inout")),
+        scalars=(Scalar("rows"),), key=(heads, kind, kv_cache), geometry=dict(heads=heads,
+            kv_heads=kv_heads, kind=kind, kv_cache=kv_cache, record_bytes=record))
 
 
 class AttentionOutput:
