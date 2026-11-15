@@ -3849,12 +3849,19 @@ class PagedForwardKernel:
         return True
 
     @cute.jit
-    def _inline_scale(self, cache: cute.Tensor, page, row, head, page_stride, token_stride,
-                      offset: cutlass.Constexpr):
-        address = (Int64(cache.iterator.toint()) + Int64(page) * Int64(page_stride)
-                   + Int64(row) * Int64(self.inline_scale_stride if const_expr(self.inline_scale_stride is not None) else token_stride)
-                   + Int64(offset) + Int64(head) * Int64(4))
-        scale = cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=4)
+    def _inline_scale_addr(self, cache: cute.Tensor, page, row, head, page_stride,
+                           token_stride, offset: cutlass.Constexpr):
+        # One address per tile (and lane quad), not one per scale value: the
+        # page product stays Int64 for pool-scaled pages, while every value a
+        # lane reads inside the tile is a byte delta from here.
+        return (Int64(cache.iterator.toint()) + Int64(page) * Int64(page_stride)
+                + Int64(row) * Int64(self.inline_scale_stride if const_expr(self.inline_scale_stride is not None) else token_stride)
+                + Int64(offset) + Int64(head) * Int64(4))
+
+    @cute.jit
+    def _inline_scale_value(self, base_address, byte_delta):
+        scale = cute.make_ptr(Float32, base_address + Int64(byte_delta),
+                              cute.AddressSpace.gmem, assumed_align=4)
         return Float32(scale[0])
 
     @cute.jit
@@ -5728,6 +5735,50 @@ class PagedForwardKernel:
                     tile_key_base_uniform + Int32(stage_tile_rows - 1)
                     <= cute.arch.make_warp_uniform(tile_causal_start)
                 )
+            if const_expr(self.inline_scale_offsets is not None):
+                # Resolve the page once, hoist one base pointer per plane, and
+                # issue every scale load before the payload consumer wait: the
+                # token scales depend only on the page table, so their latency
+                # overlaps the K/V stage copy instead of stacking a second
+                # dependent round trip behind the barrier. An MSA tile never
+                # crosses a physical page, so each lane's four values are
+                # compile-time element deltas from the hoisted base.
+                scale_page = mPageTable[request_idx, tile_key_base // self.page_size]
+                scale_row = tile_key_base % self.page_size
+                quad_row = scale_row + warp_kv_base + lane_pair_base
+                k_scale_addr = self._inline_scale_addr(
+                    mKBytes, scale_page, quad_row, kv_head_idx,
+                    k_page_stride_bytes, k_token_stride_bytes,
+                    self.inline_scale_offsets[0])
+                v_scale_addr = self._inline_scale_addr(
+                    mVBytes, scale_page, quad_row, kv_head_idx,
+                    v_page_stride_bytes, v_token_stride_bytes,
+                    self.inline_scale_offsets[1])
+                k_scale_step = (
+                    self.inline_scale_stride
+                    if self.inline_scale_stride is not None
+                    else k_token_stride_bytes
+                )
+                v_scale_step = (
+                    self.inline_scale_stride
+                    if self.inline_scale_stride is not None
+                    else v_token_stride_bytes
+                )
+                token_k_scales = cute.make_rmem_tensor(
+                    cute.make_layout((num_mma_kv, 4)), Float32)
+                token_k_scales.fill(Float32(0.0))
+                token_v_scales = cute.make_rmem_tensor(
+                    cute.make_layout((num_mma_kv, 4)), Float32)
+                token_v_scales.fill(Float32(0.0))
+                for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                    for column in cutlass.range_constexpr(4):
+                        local = warp_kv_base + mma_kv * 16 + lane_pair_base + (column // 2) * 8 + column % 2
+                        if local < tile_tokens:
+                            token_delta = mma_kv * 16 + (column // 2) * 8 + column % 2
+                            token_k_scales[mma_kv, column] = self._inline_scale_value(
+                                k_scale_addr, token_delta * k_scale_step)
+                            token_v_scales[mma_kv, column] = self._inline_scale_value(
+                                v_scale_addr, token_delta * v_scale_step)
             if const_expr(self.use_paged_k_tma):
                 if const_expr(self.use_paged_kv_tma_fp8_raw_issue):
                     cute.arch.mbarrier_wait(
@@ -5807,20 +5858,6 @@ class PagedForwardKernel:
                     )
                 _exit_thread()
 
-            if const_expr(self.inline_scale_offsets is not None):
-                # An MSA tile never crosses a physical page. Resolve it once,
-                # then reuse each token's K scale across both query row slots.
-                scale_page = mPageTable[request_idx, tile_key_base // self.page_size]
-                scale_row = tile_key_base % self.page_size
-                token_k_scales = cute.make_rmem_tensor(cute.make_layout((num_mma_kv, 4)), Float32)
-                token_k_scales.fill(Float32(0.0))
-                for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                    for column in cutlass.range_constexpr(4):
-                        local = warp_kv_base + mma_kv * 16 + lane_pair_base + (column // 2) * 8 + column % 2
-                        if local < tile_tokens:
-                            token_k_scales[mma_kv, column] = self._inline_scale(
-                                mKBytes, scale_page, scale_row + local, kv_head_idx,
-                                k_page_stride_bytes, k_token_stride_bytes, self.inline_scale_offsets[0])
             subtile_base = (
                 Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
             )
@@ -6468,18 +6505,11 @@ class PagedForwardKernel:
                 if const_expr(self.inline_scale_offsets is not None):
                     for mma_kv in cutlass.range_constexpr(num_mma_kv):
                         for pair in cutlass.range_constexpr(2):
-                            key_local = warp_kv_base + mma_kv * 16 + lane_pair_base + pair * 8
-                            vs0, vs1 = Float32(0.0), Float32(0.0)
-                            if key_local < tile_tokens:
-                                vs0 = self._inline_scale(
-                                    mVBytes, scale_page, scale_row + key_local,
-                                    kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
-                                    self.inline_scale_offsets[1])
-                            if key_local + 1 < tile_tokens:
-                                vs1 = self._inline_scale(
-                                    mVBytes, scale_page, scale_row + key_local + 1,
-                                    kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
-                                    self.inline_scale_offsets[1])
+                            # Loaded with the K scales at tile entry, so the
+                            # global latency overlaps QK/softmax instead of
+                            # stalling the tensor-core PV issue.
+                            vs0 = token_v_scales[mma_kv, pair * 2 + 0]
+                            vs1 = token_v_scales[mma_kv, pair * 2 + 1]
                             for mma_q in cutlass.range_constexpr(num_mma_q):
                                 for row_slot in cutlass.range_constexpr(2):
                                     index = row_slot + pair * 2
