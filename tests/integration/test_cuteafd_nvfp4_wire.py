@@ -154,8 +154,8 @@ def test_wire_program_exact(name, tp, raw_scale):
             tail = packed[:rows, g.hidden // 2 + g.hidden // 16:]
             assert bool((tail[:, 4:] == 0).all())
             if g.dynamic_nvfp4:
-                assert torch.equal(amax.view(torch.uint8), tail[:, :4].contiguous().view(torch.float32)[src].view(torch.uint8))
-                assert torch.equal(amax_b.view(torch.uint8), tail[:, :4].contiguous().view(torch.float32)[src_b].view(torch.uint8))
+                assert torch.equal(amax.view(torch.uint8), tail[:, :4].contiguous().view(torch.float32).flatten()[src].view(torch.uint8))
+                assert torch.equal(amax_b.view(torch.uint8), tail[:, :4].contiguous().view(torch.float32).flatten()[src_b].view(torch.uint8))
             else:
                 assert bool((tail == 0).all())
             if rows in (1, 16, 2048, 8192):
