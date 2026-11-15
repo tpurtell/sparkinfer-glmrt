@@ -787,3 +787,35 @@ def test_arm_qualification_does_not_require_control_equality(monkeypatch, defect
     assert bool(result["samples_us"]["candidate"]) is (defect is None)
     assert bool(candidate["oracle_regions"])
     assert torch.equal(source, torch.arange(32, dtype=torch.float32).reshape(8, 4))
+
+
+@pytest.mark.parametrize("rows,expected", [(2048, 251813888), (2752, 338349568),
+                                         (4096, 503554048), (5504, 676625408)])
+def test_exl3_ws_segment_formula_without_cuda(rows, expected):
+    names = {"max_packed_route_slots", "exl3_ws_segment_scratch_regions",
+             "exl3_ws_segment_scratch_bytes"}
+    tree = ast.parse(HOST.read_text())
+    scope = {}
+    exec(compile(ast.Module(body=[node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names], type_ignores=[]),
+        str(HOST), "exec"), scope)
+    geometry = dict(rows=rows, maximum=8192, hidden=6144, intermediate=512, topk=8,
+                    experts=256, block=64, max_m_blocks=1276, sms=48)
+    regions = scope["exl3_ws_segment_scratch_regions"](**geometry)
+    assert next(iter(regions)) == "block_expert_ids"
+    assert regions["block_expert_ids"] == 4 * 1276
+    assert regions["rotation_gate"] == rows * 8 * 6144 * 2
+    assert scope["exl3_ws_segment_scratch_bytes"](**geometry) == expected
+    with pytest.raises(ValueError, match="extent"):
+        scope["exl3_ws_segment_scratch_bytes"](**{**geometry, "rows": 8193})
+    with pytest.raises(ValueError, match="too small"):
+        scope["exl3_ws_segment_scratch_bytes"](**{**geometry, "max_m_blocks": 1})
+
+
+def test_exl3_ws_row_curve_arguments():
+    args = benchmark().benchmark_parser().parse_args([
+        "--row-address-curve", "--prefill-family", "glm", "--profile", "spark-tp4-width512",
+        "--capacity", "8192", "--rows", "2048,2752,4096,5504", "--routes", str(SOURCE.parent /
+        "fixtures/glm53_prefill_routes_realistic.json"), "--compare-routes-exact", "--check-prefix-rows"])
+    assert args.row_address_curve and args.capacity == 8192
+    assert args.compare_routes_exact and args.check_prefix_rows
