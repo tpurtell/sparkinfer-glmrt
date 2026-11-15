@@ -34,6 +34,35 @@ def test_norm_reference_replay(width, heads, weighted, dtype):
                                    rtol=2e-6 if dtype==torch.float32 else .008)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.int8, torch.uint8,
+                                   torch.int32, torch.int64])
+@pytest.mark.parametrize("shape", [(16, 1024, 64), (3, 7, 5), (9, 17, 9)])
+def test_padded_transpose_is_byte_exact_and_graph_replayable(dtype, shape):
+    require_b12x()
+    from b12x.integration.cuteafd.inkling2_glue import compile_padded_transpose_aot
+    rows, cols, padded = shape
+    element_bytes = torch.empty((), dtype=dtype).element_size()
+    # Arbitrary bit patterns include nonfinite floats and signed-zero payloads;
+    # compare bytes, never floating-point equality or a dequantized reference.
+    raw = ((torch.arange(rows*cols*element_bytes, dtype=torch.int64)*37+17)%256).to(torch.uint8)
+    source = raw.view(dtype).reshape(rows, cols).cuda()
+    guard = torch.full((cols*padded*element_bytes+32,), 0x5a, dtype=torch.uint8, device="cuda")
+    output = guard[16:-16].view(dtype).reshape(cols, padded)
+    program = compile_padded_transpose_aot(dtype=dtype, rows=rows, cols=cols, padded_cols=padded)
+    program.launch(source, output)
+    want = torch.zeros(cols, padded, element_bytes, dtype=torch.uint8)
+    want[:, :rows] = raw.reshape(rows, cols, element_bytes).permute(1, 0, 2)
+    assert torch.equal(output.view(torch.uint8).cpu().reshape(cols, padded, element_bytes), want)
+    assert torch.all(guard[:16] == 0x5a) and torch.all(guard[-16:] == 0x5a)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        program.launch(source, output)
+    source.view(torch.uint8).bitwise_xor_(0xff)
+    graph.replay()
+    want[:, :rows] = raw.bitwise_xor(0xff).reshape(rows, cols, element_bytes).permute(1, 0, 2)
+    assert torch.equal(output.view(torch.uint8).cpu().reshape(cols, padded, element_bytes), want)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("big", [False, True])
 def test_kv_records_exact_big_slot(dtype, big):
