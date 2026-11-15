@@ -105,9 +105,13 @@ class MuseGqaAttention(MimoGqaAttention):
               c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor, cs_k: cute.Tensor, cs_p: cute.Tensor,
               cs_v: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax, raw: cute.Tensor, raw_s: cute.Tensor,
               is_first: cutlass.Constexpr):
-        self._resolve(tile, Int32(0), lo, hi, cache, kv_step, page_table, table_base, seq_start, step_first,
-                      ring_base, key_addr, key_pos, thread)
-        cute.arch.sync_threads()
+        # 8-bit records resolve the next tile in this tile's post-softmax slack (below), so
+        # only the first tile resolves here: the dependent page-table load stays off the
+        # critical path of every later tile. BF16 records keep their per-tile resolve.
+        if cutlass.const_expr(is_first or not self.scaled_records):
+            self._resolve(tile, Int32(0), lo, hi, cache, kv_step, page_table, table_base, seq_start, step_first,
+                          ring_base, key_addr, key_pos, thread)
+            cute.arch.sync_threads()
         if cutlass.const_expr(self.scaled_records):
             # K/V and P are not read by MMA until this ingress completes.
             self._load_scaled(key_addr, kv_head, cache, s_k, s_v, s_p, thread)
@@ -144,6 +148,14 @@ class MuseGqaAttention(MimoGqaAttention):
                 if coords[m, 0][1] == Int32(0):
                     s_scale[coords[m, 0][0]] = row_scale[m]
         cute.arch.sync_threads()
+        if cutlass.const_expr(self.scaled_records):
+            if has_next:
+                # This tile's ingress and mask have consumed slot 0's addresses, and the
+                # barrier above orders the write: issue the next tile's page-table resolve
+                # here so its dependent global load overlaps this tile's PV path instead of
+                # serializing ahead of the next tile's ingress.
+                self._resolve(next_tile, Int32(0), lo, hi, cache, kv_step, page_table, table_base,
+                              seq_start, step_first, ring_base, key_addr, key_pos, thread)
         o_mn = layout_utils.reshape_acc_to_mn(acc_o)
         o_coords = layout_utils.reshape_acc_to_mn(
             tiled_mma_pv.get_slice(thread).partition_C(cute.make_identity_tensor((self.tile_m, self.v_head))))
