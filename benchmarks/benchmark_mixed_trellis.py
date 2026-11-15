@@ -2121,7 +2121,9 @@ def _run_row_address_curve(args, device, props):
     torch.cuda.set_per_process_memory_fraction(min(0.9, (args.memory_cap_gib << 30) / props.total_memory))
     layer = _make_coordinator_layer(512, 64, args.seed, device, "glm")
     arm = dict(mode="ws", wire=1, dynamic=1, stages=3, prerotate=0)
-    options = coordinator_compile_options(args.profile, args.capacity, arm, props, "glm")
+    options = coordinator_compile_options(args.profile, 4096, arm, props, "glm")
+    options["size_m"] = args.capacity
+    options["max_m_blocks"] = route_pack_capacity(args.capacity * 8, 64, 256, topk=8)[2]
     launches = {name: mix.compile_mixed_trellis(**options, row_addresses=indirect)
                for name, indirect in (("ordinary", False), ("addressed", True))}
     bindings = {name: mix.bind_mixed_trellis(*layer, launch,
