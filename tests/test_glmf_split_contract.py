@@ -155,6 +155,30 @@ def test_kda_reuses_original_geometry_and_clamped_activation():
     assert "self.core.in_proj = _NoProjection()" in shared
 
 
+def test_chunked_kda_rounds_beta_without_changing_other_prepare_callers():
+    source = ROOT / "b12x/sequence/_shared/delta_prefill/_cute_kernels.py"
+    tree = ast.parse(source.read_text())
+    prepare = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_PrepareKernel")
+    init = next(n for n in prepare.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    defaults = dict(zip((a.arg for a in init.args.kwonlyargs), init.args.kw_defaults))
+    assert ast.literal_eval(defaults["round_beta"]) is False
+    modes = [n for n in ast.walk(prepare) if isinstance(n, ast.If)
+             and ast.unparse(n.test) == "cutlass.const_expr(self.is_gdn or self.round_beta)"]
+    assert len(modes) == 1
+    assert ast.unparse(modes[0].body[0]) == "beta = Float32(BFloat16(beta))"
+
+    integration = ast.parse((ROOT / "b12x/integration/cuteafd/glmf.py").read_text())
+    chunked = next(n for n in integration.body if isinstance(n, ast.ClassDef) and n.name == "_KdaChunked")
+    call = next(n for n in ast.walk(chunked) if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "dk._PrepareKernel")
+    assert ast.literal_eval(next(k.value for k in call.keywords if k.arg == "round_beta")) is True
+    # GDN already rounds beta, and the standalone KDA API retains its original policy.
+    for path in (source, ROOT / "b12x/integration/cuteafd/qwen4_gdn.py"):
+        for call in ast.walk(ast.parse(path.read_text())):
+            if isinstance(call, ast.Call) and ast.unparse(call.func) in ("_PrepareKernel", "dk._PrepareKernel"):
+                assert "round_beta" not in {k.arg for k in call.keywords}
+
+
 def extracted(source, names, ns):
     tree = ast.parse(source.read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]

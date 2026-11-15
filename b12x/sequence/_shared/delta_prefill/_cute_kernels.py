@@ -528,7 +528,9 @@ class _PrepareKernel:
         qk_l2norm: bool,
         a_log_type: type[cutlass.Numeric],
         dt_bias_type: type[cutlass.Numeric],
+        round_beta: bool = False,
     ) -> None:
+        self.round_beta = bool(round_beta)
         self.heads = int(heads)
         self.head_ratio = int(heads) // int(key_heads)
         self.is_gdn = bool(is_gdn)
@@ -794,7 +796,7 @@ class _PrepareKernel:
                     beta = cute.arch.rcp_approx(
                         Float32(1.0) + _exp2_approx_ftz_f32(-beta_raw * Float32(_LOG2E))
                     )
-                    if cutlass.const_expr(self.is_gdn):
+                    if cutlass.const_expr(self.is_gdn or self.round_beta):
                         beta = Float32(BFloat16(beta))
                 s_beta[column] = beta
             cute.arch.sync_threads()
