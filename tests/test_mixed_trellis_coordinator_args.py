@@ -821,3 +821,38 @@ def test_exl3_ws_row_curve_arguments():
         "fixtures/glm53_prefill_routes_realistic.json"), "--compare-routes-exact", "--check-prefix-rows"])
     assert args.row_address_curve and args.capacity == 8192
     assert args.compare_routes_exact and args.check_prefix_rows
+
+
+def test_ordinary_ws_fc1_lowering_is_independent_of_row_address_code():
+    """Row-address merged waves must not change ordinary WS programs (v52b
+    audit: #342's absolute-address FC1 cursor recompiled every in-tile-rotation
+    and wire core). Every use of the row-address input base, and every Int64
+    FC1 row cursor, sits under a compile-time branch on ``self.row_addresses``."""
+    source = (HOST.parent / "mixed_trellis_ws.py").read_text()
+    tree = ast.parse(source)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def guarded(node):
+        while node in parents:
+            node = parents[node]
+            test = getattr(node, "test", None)
+            if isinstance(node, (ast.If, ast.IfExp)) and test is not None and "row_addresses" in ast.unparse(test):
+                return True
+        return False
+
+    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_ws_input_row_base")
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "_ws_input_row_base"]
+    assert calls and all(guarded(call) for call in calls), "ordinary WS FC1 reads the row-address base"
+    # The FC1 row cursor and its sentinels are Int64 only for row-address programs.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.IfExp) and "Int64" in ast.unparse(node.body) and "is_fc1" in ast.unparse(node.test):
+            assert "row_addresses" in ast.unparse(node.test), ast.unparse(node)
+    # The ordinary A-issue and wire-issue paths keep base + row * stride addressing.
+    issue_wire = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_ws_issue_a_wire")
+    text = ast.unparse(issue_wire)
+    assert "Int64(row_id) * Int64(self.ws_wire_row)" in text and "get_ptr_as_int64(a_src, src)" in text
+    assert method is not None
