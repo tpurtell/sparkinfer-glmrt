@@ -34,8 +34,9 @@ class _WireRows:
     @cute.jit
     def __call__(self, src: cute.Pointer, dst: cute.Pointer, rows: Int32,
                  input_scale: Float32, stream: cuda.CUstream):
-        self.kernel(src, dst, input_scale).launch(
-            grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+        if rows > Int32(0):
+            self.kernel(src, dst, input_scale).launch(
+                grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, src: cute.Pointer, dst: cute.Pointer, input_scale: Float32):
@@ -80,8 +81,9 @@ class _WireRows:
 class _DynamicWireRows(_WireRows):
     @cute.jit
     def __call__(self, src: cute.Pointer, dst: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.kernel(src, dst, Float32(1.0)).launch(
-            grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
+        if rows > Int32(0):
+            self.kernel(src, dst, Float32(1.0)).launch(
+                grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
 
 
 def nvfp4_wire_row_bytes(hidden: int) -> int:
