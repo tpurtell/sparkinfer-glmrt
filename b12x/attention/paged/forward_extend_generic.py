@@ -5916,7 +5916,7 @@ class PagedForwardKernel:
                                         token_k_scale = k_scale
                                         if const_expr(self.inline_scale_offsets is not None):
                                             token_k_scale = self._inline_scale(
-                                                mKBytes, mPageTable, request_idx, key_pos,
+                                                mKBytes, mPageTable, request_idx, tile_key_base + key_local,
                                                 kv_head_idx, k_page_stride_bytes, k_token_stride_bytes,
                                                 self.inline_scale_offsets[0])
                                         frag_S[mma_q, mma_kv, reg_id] = (
@@ -6127,7 +6127,7 @@ class PagedForwardKernel:
                                         token_k_scale = k_scale
                                         if const_expr(self.inline_scale_offsets is not None):
                                             token_k_scale = self._inline_scale(
-                                                mKBytes, mPageTable, request_idx, key_pos,
+                                                mKBytes, mPageTable, request_idx, tile_key_base + key_local,
                                                 kv_head_idx, k_page_stride_bytes, k_token_stride_bytes,
                                                 self.inline_scale_offsets[0])
                                         frag_S[mma_q, mma_kv, reg_id] = (
