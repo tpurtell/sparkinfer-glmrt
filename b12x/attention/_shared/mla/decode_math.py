@@ -1849,6 +1849,165 @@ def s4_online_softmax(
 
 
 @cute.jit
+def s4_online_softmax_two_slot(
+    qk_a,
+    qk_b,
+    p_a,
+    p_b,
+    acc_nope,
+    acc_rope,
+    global_max,
+    global_sum,
+    reduce_max_addr: Int32,
+    reduce_sum_addr: Int32,
+    is_first_chunk: cutlass.Constexpr,
+    warp_id: Int32,
+    lane: Int32,
+    tid_flat: Int32,
+    *,
+    n_v_chunks: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
+    valid_hpb: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+    n_acc_tiles: cutlass.Constexpr = None,
+):
+    """S4 for a candidate-split tile: two eight-candidate slots per warp.
+
+    A resident half tile forces two candidate passes over the same warp set, so
+    each warp owns sixteen candidates: slot A holds the first eight and slot B
+    the next eight. Both slots reduce with the tree's original shape and the
+    cross-slot fold walks the slots in candidate order, so the per-chunk max,
+    the per-chunk sum and the accumulator rescale are the SAME expressions the
+    single-tile kernel evaluates over eight warps -- the split is bit-exact, not
+    merely equivalent.
+
+    ``global_{max,sum}[0:2]`` track the head pair ``(gid, gid+8)``; each slot
+    contributes its own warp-local frame and rescale factor.
+    """
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    _NI = Float32(-1e29)
+
+    # Per-slot local max over the two physical rows (gid heads, gid+8 heads).
+    local_max0_a = fmax_f32(qk_a[0], qk_a[1])
+    local_max1_a = fmax_f32(qk_a[2], qk_a[3])
+    local_max0_b = fmax_f32(qk_b[0], qk_b[1])
+    local_max1_b = fmax_f32(qk_b[2], qk_b[3])
+    local_max0_a = fmax_f32(local_max0_a, cute.arch.shuffle_sync_bfly(local_max0_a, offset=2))
+    local_max1_a = fmax_f32(local_max1_a, cute.arch.shuffle_sync_bfly(local_max1_a, offset=2))
+    local_max0_b = fmax_f32(local_max0_b, cute.arch.shuffle_sync_bfly(local_max0_b, offset=2))
+    local_max1_b = fmax_f32(local_max1_b, cute.arch.shuffle_sync_bfly(local_max1_b, offset=2))
+    local_max0_a = fmax_f32(local_max0_a, cute.arch.shuffle_sync_bfly(local_max0_a, offset=1))
+    local_max1_a = fmax_f32(local_max1_a, cute.arch.shuffle_sync_bfly(local_max1_a, offset=1))
+    local_max0_b = fmax_f32(local_max0_b, cute.arch.shuffle_sync_bfly(local_max0_b, offset=1))
+    local_max1_b = fmax_f32(local_max1_b, cute.arch.shuffle_sync_bfly(local_max1_b, offset=1))
+
+    p_a[0] = _exp2_approx_ftz_f32(qk_a[0] - local_max0_a)
+    p_a[1] = _exp2_approx_ftz_f32(qk_a[1] - local_max0_a)
+    p_a[2] = _exp2_approx_ftz_f32(qk_a[2] - local_max1_a)
+    p_a[3] = _exp2_approx_ftz_f32(qk_a[3] - local_max1_a)
+    p_b[0] = _exp2_approx_ftz_f32(qk_b[0] - local_max0_b)
+    p_b[1] = _exp2_approx_ftz_f32(qk_b[1] - local_max0_b)
+    p_b[2] = _exp2_approx_ftz_f32(qk_b[2] - local_max1_b)
+    p_b[3] = _exp2_approx_ftz_f32(qk_b[3] - local_max1_b)
+
+    local_sum0_a = p_a[0] + p_a[1]
+    local_sum1_a = p_a[2] + p_a[3]
+    local_sum0_b = p_b[0] + p_b[1]
+    local_sum1_b = p_b[2] + p_b[3]
+    local_sum0_a = local_sum0_a + cute.arch.shuffle_sync_bfly(local_sum0_a, offset=2)
+    local_sum1_a = local_sum1_a + cute.arch.shuffle_sync_bfly(local_sum1_a, offset=2)
+    local_sum0_b = local_sum0_b + cute.arch.shuffle_sync_bfly(local_sum0_b, offset=2)
+    local_sum1_b = local_sum1_b + cute.arch.shuffle_sync_bfly(local_sum1_b, offset=2)
+    local_sum0_a = local_sum0_a + cute.arch.shuffle_sync_bfly(local_sum0_a, offset=1)
+    local_sum1_a = local_sum1_a + cute.arch.shuffle_sync_bfly(local_sum1_a, offset=1)
+    local_sum0_b = local_sum0_b + cute.arch.shuffle_sync_bfly(local_sum0_b, offset=1)
+    local_sum1_b = local_sum1_b + cute.arch.shuffle_sync_bfly(local_sum1_b, offset=1)
+
+    # Slot index: slot 0 is candidates [0, 8*n_warps), slot 1 the next block.
+    slot_a = warp_id
+    slot_b = warp_id + Int32(n_warps)
+    if tid == Int32(0):
+        st_shared_f32(reduce_max_addr + (slot_a * Int32(hpb) + gid) * Int32(4), local_max0_a)
+        st_shared_f32(
+            reduce_max_addr + (slot_a * Int32(hpb) + gid + Int32(8)) * Int32(4), local_max1_a
+        )
+        st_shared_f32(reduce_sum_addr + (slot_a * Int32(hpb) + gid) * Int32(4), local_sum0_a)
+        st_shared_f32(
+            reduce_sum_addr + (slot_a * Int32(hpb) + gid + Int32(8)) * Int32(4), local_sum1_a
+        )
+        st_shared_f32(reduce_max_addr + (slot_b * Int32(hpb) + gid) * Int32(4), local_max0_b)
+        st_shared_f32(
+            reduce_max_addr + (slot_b * Int32(hpb) + gid + Int32(8)) * Int32(4), local_max1_b
+        )
+        st_shared_f32(reduce_sum_addr + (slot_b * Int32(hpb) + gid) * Int32(4), local_sum0_b)
+        st_shared_f32(
+            reduce_sum_addr + (slot_b * Int32(hpb) + gid + Int32(8)) * Int32(4), local_sum1_b
+        )
+    cute.arch.barrier(**bar_kw)
+
+    # Fold the two slots per warp in candidate order: slot 0 group first.
+    h1 = gid + Int32(8)
+    block_local_max0 = Float32(-1e30)
+    block_local_max1 = Float32(-1e30)
+    block_local_sum0 = Float32(0.0)
+    block_local_sum1 = Float32(0.0)
+    for slot in cutlass.range_constexpr(2 * n_warps):
+        wmax0 = ld_shared_f32(reduce_max_addr + (Int32(slot) * Int32(hpb) + gid) * Int32(4))
+        wmax1 = ld_shared_f32(reduce_max_addr + (Int32(slot) * Int32(hpb) + h1) * Int32(4))
+        wsum0 = ld_shared_f32(reduce_sum_addr + (Int32(slot) * Int32(hpb) + gid) * Int32(4))
+        wsum1 = ld_shared_f32(reduce_sum_addr + (Int32(slot) * Int32(hpb) + h1) * Int32(4))
+        block_local_max0 = fmax_f32(block_local_max0, wmax0)
+        block_local_max1 = fmax_f32(block_local_max1, wmax1)
+        block_local_sum0 = block_local_sum0 + wsum0 * _exp2_approx_ftz_f32(
+            wmax0 - block_local_max0
+        )
+        block_local_sum1 = block_local_sum1 + wsum1 * _exp2_approx_ftz_f32(
+            wmax1 - block_local_max1
+        )
+
+    new_gmax0 = fmax_f32(global_max[0], block_local_max0)
+    new_gmax1 = fmax_f32(global_max[1], block_local_max1)
+    alpha0 = Float32(0.0)
+    alpha1 = Float32(0.0)
+    if global_max[0] > _NI:
+        alpha0 = _exp2_approx_ftz_f32(global_max[0] - new_gmax0)
+    if global_max[1] > _NI:
+        alpha1 = _exp2_approx_ftz_f32(global_max[1] - new_gmax1)
+    block_rescale0 = _exp2_approx_ftz_f32(block_local_max0 - new_gmax0)
+    block_rescale1 = _exp2_approx_ftz_f32(block_local_max1 - new_gmax1)
+    # Row 0 (heads gid) rescales against the first global slot, row 1 (gid+8)
+    # against the second, exactly as the single-tile S4 does.
+    warp_rescale0_a = _exp2_approx_ftz_f32(local_max0_a - new_gmax0)
+    warp_rescale1_a = _exp2_approx_ftz_f32(local_max1_a - new_gmax1)
+    warp_rescale0_b = _exp2_approx_ftz_f32(local_max0_b - new_gmax0)
+    warp_rescale1_b = _exp2_approx_ftz_f32(local_max1_b - new_gmax1)
+
+    _n_acc = cutlass.const_expr(n_acc_tiles if n_acc_tiles is not None else n_v_chunks)
+    if cutlass.const_expr(not is_first_chunk):
+        for vc in cutlass.range_constexpr(_n_acc):
+            acc_nope[vc][0] = acc_nope[vc][0] * alpha0
+            acc_nope[vc][1] = acc_nope[vc][1] * alpha0
+            acc_nope[vc][2] = acc_nope[vc][2] * alpha1
+            acc_nope[vc][3] = acc_nope[vc][3] * alpha1
+        acc_rope[0] = acc_rope[0] * alpha0
+        acc_rope[1] = acc_rope[1] * alpha0
+        acc_rope[2] = acc_rope[2] * alpha1
+        acc_rope[3] = acc_rope[3] * alpha1
+        global_sum[0] = global_sum[0] * alpha0 + block_local_sum0 * block_rescale0
+        global_sum[1] = global_sum[1] * alpha1 + block_local_sum1 * block_rescale1
+    else:
+        global_sum[0] = block_local_sum0 * block_rescale0
+        global_sum[1] = block_local_sum1 * block_rescale1
+    global_max[0] = new_gmax0
+    global_max[1] = new_gmax1
+    return (p_a, p_b, warp_rescale0_a, warp_rescale1_a, warp_rescale0_b, warp_rescale1_b)
+
+
+@cute.jit
 def s4_online_softmax_glm_h8_swap_ab(
     qk,
     p,
