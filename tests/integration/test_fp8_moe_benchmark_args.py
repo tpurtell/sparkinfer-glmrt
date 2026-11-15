@@ -1139,6 +1139,21 @@ def test_native_baseline_requires_shipped_v41_decode_contract():
         bench.parse_args(args + ["--geometry", "mimof"])
 
 
+def test_native_source_loader_keeps_each_pipeline_own_kernel_classes(tmp_path):
+    directory = tmp_path / "b12x/moe/_shared/kernels"
+    directory.mkdir(parents=True)
+    (directory / "w4a8_v41_slice.py").write_text(
+        "class V41SliceFc1Kernel: pass\nclass V41SliceFc2Kernel: pass\n")
+    (directory / "v41_slice_pipeline.py").write_text(
+        "class V41SlicePipeline:\n"
+        "    def __init__(self): self.fc1 = V41SliceFc1Kernel()\n")
+    first = bench.load_native_baseline(tmp_path)
+    second = bench.load_native_baseline(tmp_path)
+    assert type(first.pipeline_type().fc1) is first.V41SliceFc1Kernel
+    assert type(second.pipeline_type().fc1) is second.V41SliceFc1Kernel
+    assert first.V41SliceFc1Kernel is not second.V41SliceFc1Kernel
+
+
 def test_unified_random_routes_retain_capacity_seed_contract():
     torch.manual_seed(2129)
     expected = torch.rand(16, 8).topk(2, -1).indices.int()

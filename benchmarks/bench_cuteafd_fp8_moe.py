@@ -20,6 +20,7 @@ import importlib.util
 import json
 from pathlib import Path
 import statistics
+import inspect
 
 import torch
 
@@ -204,6 +205,8 @@ def parse_args(argv=None):
     parser.add_argument("--engine-policy-root", type=Path, help="engine checkout supplying shared MXFP4 recipes and ownership")
     parser.add_argument("--native-baseline-source", type=Path,
                         help="sealed fork source supplying native FC1/FC2 controls for interleaved V4 decode A/B")
+    parser.add_argument("--native-candidate-source", type=Path,
+                        help="sealed native candidate source paired with --native-baseline-source")
     parser.add_argument("--shipped-prefill", action="store_true", help="native STREAM versus actual shipped V4/V4.1 prefill")
     parser.add_argument("--generic-a8", action="store_true", help="Benchmark generic grouped row-major QMMA decode")
     parser.add_argument("--row-major-mma", action="store_true", help="Benchmark native MMA with row-major resident staging")
@@ -226,6 +229,8 @@ def parse_args(argv=None):
         parser.error("shipped prefill requires native V4/V4.1 pairs and engine policy root")
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.native_candidate_source and not args.native_baseline_source:
+        parser.error("native candidate source requires a baseline source")
     if args.native_baseline_source and (not args.mxfp4_unify or args.geometry != "v41"
             or args.engine_policy_root is None or args.capacity is None or args.capacity > 80):
         parser.error("native baseline requires V4.1 unified decode, fixed capacity <=80 and engine policy")
@@ -664,6 +669,13 @@ def load_native_baseline(source):
     spec = importlib.util.spec_from_file_location("benchmark_native_baseline", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    pipeline_path = Path(source) / "b12x/moe/_shared/kernels/v41_slice_pipeline.py"
+    pipeline_spec = importlib.util.spec_from_file_location("benchmark_native_baseline_pipeline", pipeline_path)
+    pipeline_module = importlib.util.module_from_spec(pipeline_spec)
+    pipeline_spec.loader.exec_module(pipeline_module)
+    pipeline_module.V41SliceFc1Kernel = module.V41SliceFc1Kernel
+    pipeline_module.V41SliceFc2Kernel = module.V41SliceFc2Kernel
+    module.pipeline_type = pipeline_module.V41SlicePipeline
     return module
 
 
@@ -783,14 +795,21 @@ def native_pair_arm(x, ids, routing, weights, scales, width, exact, atomic, code
                ids.flatten(), routing.flatten(), *scratch, partial, output]
     args = [from_dlpack(tensor, assumed_align=16) for tensor in tensors]
     from b12x.moe._shared.kernels import v41_slice_pipeline as pipeline_module
+    pipeline_type = baseline_kernels.pipeline_type if baseline_kernels is not None else V41SlicePipeline
+    kwargs = dict(experts=experts, topk=topk, intermediate=intermediate, hidden=hidden,
+                  exact_storage=tail or stored_width is not None, atomic_tokens=atomic, scale_codes=coded,
+                  activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
+                  fc1_cta_splits=fc1_cta_splits, stream_decode=stream_decode, **(projection_contract or {}))
+    parameters = inspect.signature(pipeline_type).parameters
+    if "activation_precision" not in parameters:
+        # Master's canonical V4 ABI predates the experimental MiMo contracts.
+        assert activation_precision == "a8" and fc1_cta_splits == 1 and not stream_decode
+        assert not (projection_contract or {}).get("silu_bf16_product", False)
+        assert (projection_contract or {}).get("route_weight_before_fc2", True)
+        assert not (projection_contract or {}).get("round_fc2_bf16", False)
+        kwargs = {name: value for name, value in kwargs.items() if name in parameters}
     with native_kernel_classes(pipeline_module, baseline_kernels):
-        pipeline = V41SlicePipeline(rows, width, experts=experts, topk=topk,
-                                    intermediate=intermediate, hidden=hidden,
-                                    exact_storage=tail or stored_width is not None,
-                                    atomic_tokens=atomic, scale_codes=coded,
-                                    activation_precision=activation_precision, fc1_k_splits=fc1_k_splits,
-                                    fc1_cta_splits=fc1_cta_splits, stream_decode=stream_decode,
-                                    **(projection_contract or {}))
+        pipeline = pipeline_type(rows, width, **kwargs)
     if row_major_a8:
         from b12x.moe._shared.kernels.mxfp4_row_major_decode import RowMajorA8Fc1, RowMajorA8Fc2
         fc1_contract = {key: value for key, value in (projection_contract or {}).items()
@@ -1393,6 +1412,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
     flush = torch.zeros(max(256 << 20, 2 * l2_bytes), dtype=torch.uint8, device="cuda")
     results = []
     baseline_kernels = load_native_baseline(args.native_baseline_source) if args.native_baseline_source else None
+    candidate_kernels = load_native_baseline(args.native_candidate_source) if args.native_candidate_source else None
     experts, route_qualification_eligible = stream_screen_population(g, args)
     waves = recorded_waves(args.routes, g) if args.routes else None
     route_fixture = ({"path": str(args.routes), "sha256": hashlib.sha256(args.routes.read_bytes()).hexdigest(),
@@ -1559,7 +1579,8 @@ def mxfp4_unify_screen(g, args, geometry_type):
                             **({"fc2_n_splits": occupancy_recipe["fc2_n_splits"]} if label.startswith("occupancy-") else
                                {"fc2_n_splits": decode_recipe["fc2_n_splits"]} if label == "candidate-shipped-a8" else {})},
                         combine_output=True, ingress="wire", qualify=True, fc1_k_splits=split,
-                        fc1_cta_splits=cta, live_rows=rows)
+                        fc1_cta_splits=cta, live_rows=rows,
+                        baseline_kernels=candidate_kernels if label == "candidate-shipped-a8" else None)
                 except AssertionError as error:
                     raise AssertionError(f"native {label}, rows={rows}, width={width}: {error}") from error
                 owned.append(keep)
@@ -1668,6 +1689,7 @@ def mxfp4_unify_screen(g, args, geometry_type):
                           experts=experts, routing=args.routing, route_qualification_eligible=route_qualification_eligible,
                           route_fixture=route_fixture,
                           native_baseline_source=str(args.native_baseline_source) if baseline_kernels else None,
+                          native_candidate_source=str(args.native_candidate_source) if candidate_kernels else None,
                           sm_count=properties.multi_processor_count, occupancy_recipe=occupancy_recipe if args.decode_occupancy else None,
                           prefix_checks=prefix_checks, route_comparisons=route_comparisons,
                           ingress="wire", wire_preparation_timed=False,
