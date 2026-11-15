@@ -927,6 +927,14 @@ def s1_qk_nope_nvfp4_bf16(
     kv_gid_row = warp_first_cand + gid
     if cutlass.const_expr(latent_scale_per_token):
         latent_scale = ld_shared_f32(kv_sc_base_addr + kv_gid_row * Int32(4))
+    # Mixed-source tag: this candidate row is fixed for the whole QK pass, so
+    # load its source tag once instead of once per dequantized pair. DSV41 is
+    # the only 544-byte staging specialization; every other caller elides it.
+    source_tag = None
+    if cutlass.const_expr(kv_smem_stride == 544):
+        source_tag = ld_shared_u32(
+            kv_fp4_base_addr + kv_gid_row * Int32(544) + Int32(528)
+        ).to(Int32)
 
     for blk in cutlass.range_constexpr(num_scales):
         for ks in cutlass.range_constexpr(quant_tile // 16):
@@ -937,6 +945,7 @@ def s1_qk_nope_nvfp4_bf16(
                 ko + tid * Int32(2),
                 latent_scale,
                 kv_smem_stride=kv_smem_stride,
+                source_tag=source_tag,
             )
             b1 = _nvfp4_pair_bfloat2(
                 kv_fp4_base_addr,
@@ -944,6 +953,7 @@ def s1_qk_nope_nvfp4_bf16(
                 ko + tid * Int32(2) + Int32(8),
                 latent_scale,
                 kv_smem_stride=kv_smem_stride,
+                source_tag=source_tag,
             )
             a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
@@ -1469,6 +1479,7 @@ def _nvfp4_pair_bfloat2(
     kv_smem_stride: cutlass.Constexpr,
     latent_scale_per_token: cutlass.Constexpr = False,
     kv_sc_base_addr: Int32 = Int32(0),
+    source_tag: "Int32 | None" = None,
 ) -> Uint32:
     """Dequant E2M1 * inline E4M3 * outer scale to bf16x2.
 
@@ -1484,10 +1495,15 @@ def _nvfp4_pair_bfloat2(
     """
     swa = Int32(0)
     if cutlass.const_expr(kv_smem_stride == 544):
-        # DSV41's sources share a staging layout, never a cache ABI.
-        swa = ld_shared_u32(kv_fp4_base_addr + entry * Int32(544) + Int32(528)).to(
-            Int32
-        )
+        # DSV41's sources share a staging layout, never a cache ABI. The tag is
+        # per staged candidate row, so a caller whose row is loop-invariant can
+        # hoist the load and pass it in; the branch decision is unchanged.
+        if source_tag is None:
+            swa = ld_shared_u32(
+                kv_fp4_base_addr + entry * Int32(544) + Int32(528)
+            ).to(Int32)
+        else:
+            swa = source_tag
         result = Uint32(0)
         if swa == Int32(1):
             packed = _ld_u16_zext(kv_fp4_base_addr, entry * Int32(544) + dim_even)
@@ -2461,6 +2477,14 @@ def s6_xv_nope_nvfp4_bf16(
     V is the same 512-dim MLA latent as K-NoPE. Adjacent output-column lanes
     exchange decoded pairs, so each pair is dequantized once rather than once
     per scalar consumer. MMA operands and their BF16 rounding remain unchanged.
+
+    The probability A tile is a function of the K step alone: every V chunk and
+    every N tile re-consume the same head x sixteen-candidate fragments of
+    ``sm_p``. ``ldmatrix`` is an intrinsic with declared side effects, so the
+    compiler cannot common-subexpression-eliminate the repeats; load the
+    ``bi // 16`` fragments once per chunk and hold them in registers instead of
+    re-reading ``sm_p`` for all ``n_v_chunks * nt_per_warp_xv`` tiles. Operand
+    values, MMA order and accumulation order are unchanged (bit-identical).
     """
     p_stride = cutlass.const_expr(sm_p_stride if sm_p_stride else bi)
     gid = lane >> Int32(2)
@@ -2469,6 +2493,34 @@ def s6_xv_nope_nvfp4_bf16(
     pair_selector = Int32(0x5410 if entry_parity == Int32(0) else 0x3276)
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
+    a_row_bytes = a_row * Int32(p_stride)
+    a_frag = [
+        ldmatrix_m8n8x4_b16(
+            sm_p_full_addr
+            + (a_row_bytes + (Int32(ks) * Int32(16) + a_col)) * Int32(2)
+        )
+        for ks in range(int(bi) // 16)
+    ]
+    # Mixed-source tags depend on the staged candidate row (K step) alone, not
+    # on the V chunk or the N tile: load them once per chunk. DSV41 is the only
+    # 544-byte staging specialization; every other caller elides this.
+    ks_count = int(bi) // 16
+    tag0 = [None] * ks_count
+    tag8 = [None] * ks_count
+    if cutlass.const_expr(kv_smem_stride == 544):
+        for ks in range(ks_count):
+            tag0[ks] = ld_shared_u32(
+                kv_fp4_base_addr
+                + (Int32(ks) * Int32(16) + tid * Int32(2) + entry_parity)
+                * Int32(544)
+                + Int32(528)
+            ).to(Int32)
+            tag8[ks] = ld_shared_u32(
+                kv_fp4_base_addr
+                + (Int32(ks) * Int32(16) + Int32(8) + tid * Int32(2) + entry_parity)
+                * Int32(544)
+                + Int32(528)
+            ).to(Int32)
     for vc in cutlass.range_constexpr(n_v_chunks):
         for nt in cutlass.range_constexpr(nt_per_warp_xv):
             dim_base = Int32(vc) * Int32(v_chunk) + (
@@ -2481,14 +2533,14 @@ def s6_xv_nope_nvfp4_bf16(
             xv3 = Float32(0.0)
             for ks in cutlass.range_constexpr(bi // 16):
                 k_base = Int32(ks) * Int32(16)
-                a_byte = (a_row * Int32(p_stride) + (k_base + a_col)) * Int32(2)
-                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
+                a0, a1, a2, a3 = a_frag[ks]
                 ent0 = k_base + tid * Int32(2)
                 pair0 = _nvfp4_pair_bfloat2(
                     kv_fp4_base_addr, ent0 + entry_parity, col & ~Int32(1),
                     latent_scale, kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
+                    source_tag=tag0[ks],
                 )
                 pair8 = _nvfp4_pair_bfloat2(
                     kv_fp4_base_addr,
@@ -2498,6 +2550,7 @@ def s6_xv_nope_nvfp4_bf16(
                     kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
+                    source_tag=tag8[ks],
                 )
                 peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
                 peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
