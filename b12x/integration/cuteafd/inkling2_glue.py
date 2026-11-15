@@ -104,7 +104,7 @@ class _PaddedTranspose:
             row, col = element//Int64(self.padded_cols), element%Int64(self.padded_cols)
             value = Uint8(0)
             if col < Int64(self.rows):
-                value = source[(col*Int64(self.cols)+row)*Int64(self.element_bytes)+byte]
+                value = Uint8(source[(col*Int64(self.cols)+row)*Int64(self.element_bytes)+byte])
             output[index] = value
 
 
