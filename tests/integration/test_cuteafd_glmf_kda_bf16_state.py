@@ -19,6 +19,9 @@ commit, and in the chunked prefill where each window of tiles stores it (or, wit
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
+import cutlass.cute as cute
+from cutlass import Int32, Int64
 import pytest
 import torch
 
@@ -269,9 +272,6 @@ def test_kda_s16_prefill_past_a_window_and_per_tile():
 
 @pytest.mark.parametrize("rows", [65, 128])
 def test_chunked_beta_matches_bf16_decode_reference(rows):
-    import cuda.bindings.driver as cuda
-    import cutlass.cute as cute
-    from cutlass import Int32, Int64
     from b12x.integration.cuteafd import KDAGeometry
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     from b12x.integration.cuteafd.glmf import _KdaChunked
