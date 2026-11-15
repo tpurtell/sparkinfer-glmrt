@@ -1319,6 +1319,9 @@ class UnifiedDecodeKernel:
             #    and math warps strictly alternate; the per-burst CTA barriers
             #    hold the producer until the math warps finish reading the tile.
             ht_kv_b = kv_fp8_addr
+            # The gather lands the raw record at the tile's +544 half; the
+            # decode writes BF16 over [0,1024) of the same 1,088-byte row.
+            ht_kv_raw = kv_raw_addr
             ht_tok_buf = cute.make_tensor(
                 token_idx_view.iterator,
                 cute.make_layout(int(L.token_idx_buf_bytes // 4)),
@@ -1326,15 +1329,21 @@ class UnifiedDecodeKernel:
             ht_io_lane = tid - Int32(self.math_threads)
             ht_ci0 = split_first_chunk
             ht_in_main = ht_ci0 < num_main_chunks
-            ht_base_key = ht_ci0 * Int32(2 * _CAND_WINDOW)
+            # Candidate key start of this split's one chunk, and its offset
+            # within the main or extra section for the scoring mask.
+            ht_base_key = ht_ci0 * Int32(_CAND_WINDOW)
+            ht_sec_start = ht_base_key
+            ht_sec_len = section_len
             if not ht_in_main:
-                ht_base_key = (ht_ci0 - num_main_chunks) * Int32(2 * _CAND_WINDOW)
+                ht_base_key = (ht_ci0 - num_main_chunks) * Int32(_CAND_WINDOW)
+                ht_sec_start = ht_base_key
+                ht_sec_len = extra_section_len
             if is_io:
                 if ht_in_main:
                     issue_native_v41_gather(
                         native_descriptors[token_idx, None],
                         native_metadata[token_idx, None], extra_row,
-                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        native_bounds[token_idx], ht_kv_raw, kv_sc_addr,
                         ht_tok_buf, mbar_base,
                         ht_base_key + Int32(0), ht_io_lane,
                         swa=True, kv_stride=staged_kv_stride,
@@ -1344,51 +1353,7 @@ class UnifiedDecodeKernel:
                     issue_native_v41_gather(
                         native_descriptors[token_idx, None],
                         native_metadata[token_idx, None], extra_row,
-                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
-                        ht_tok_buf, mbar_base,
-                        ht_base_key + Int32(0), ht_io_lane,
-                        swa=False, kv_stride=staged_kv_stride,
-                        io_threads=self.io_threads, fp8_internal=False,
-                        entries=32)
-                cute.arch.barrier()
-                cute.arch.barrier()
-                if ht_in_main:
-                    issue_native_v41_gather(
-                        native_descriptors[token_idx, None],
-                        native_metadata[token_idx, None], extra_row,
-                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
-                        ht_tok_buf, mbar_base,
-                        ht_base_key + Int32(32), ht_io_lane,
-                        swa=True, kv_stride=staged_kv_stride,
-                        io_threads=self.io_threads, fp8_internal=False,
-                        entries=32)
-                else:
-                    issue_native_v41_gather(
-                        native_descriptors[token_idx, None],
-                        native_metadata[token_idx, None], extra_row,
-                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
-                        ht_tok_buf, mbar_base,
-                        ht_base_key + Int32(32), ht_io_lane,
-                        swa=False, kv_stride=staged_kv_stride,
-                        io_threads=self.io_threads, fp8_internal=False,
-                        entries=32)
-                cute.arch.barrier()
-                cute.arch.barrier()
-                if ht_in_main:
-                    issue_native_v41_gather(
-                        native_descriptors[token_idx, None],
-                        native_metadata[token_idx, None], extra_row,
-                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
-                        ht_tok_buf, mbar_base,
-                        ht_base_key + Int32(0), ht_io_lane,
-                        swa=True, kv_stride=staged_kv_stride,
-                        io_threads=self.io_threads, fp8_internal=False,
-                        entries=32)
-                else:
-                    issue_native_v41_gather(
-                        native_descriptors[token_idx, None],
-                        native_metadata[token_idx, None], extra_row,
-                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        native_bounds[token_idx], ht_kv_raw, kv_sc_addr,
                         ht_tok_buf, mbar_base,
                         ht_base_key + Int32(0), ht_io_lane,
                         swa=False, kv_stride=staged_kv_stride,
@@ -1400,7 +1365,7 @@ class UnifiedDecodeKernel:
                     issue_native_v41_gather(
                         native_descriptors[token_idx, None],
                         native_metadata[token_idx, None], extra_row,
-                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        native_bounds[token_idx], ht_kv_raw, kv_sc_addr,
                         ht_tok_buf, mbar_base,
                         ht_base_key + Int32(32), ht_io_lane,
                         swa=True, kv_stride=staged_kv_stride,
@@ -1410,7 +1375,51 @@ class UnifiedDecodeKernel:
                     issue_native_v41_gather(
                         native_descriptors[token_idx, None],
                         native_metadata[token_idx, None], extra_row,
-                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        native_bounds[token_idx], ht_kv_raw, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(32), ht_io_lane,
+                        swa=False, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                cute.arch.barrier()
+                cute.arch.barrier()
+                if ht_in_main:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_raw, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(0), ht_io_lane,
+                        swa=True, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                else:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_raw, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(0), ht_io_lane,
+                        swa=False, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                cute.arch.barrier()
+                cute.arch.barrier()
+                if ht_in_main:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_raw, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(32), ht_io_lane,
+                        swa=True, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                else:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_raw, kv_sc_addr,
                         ht_tok_buf, mbar_base,
                         ht_base_key + Int32(32), ht_io_lane,
                         swa=False, kv_stride=staged_kv_stride,
@@ -1449,6 +1458,12 @@ class UnifiedDecodeKernel:
                     ht_qk_a, q_fp8_addr, ht_kv_b, warp_id * Int32(8), lane,
                     d_nope=t.d_nope, q_nope_bf16_stride=t.q_nope_stride,
                     kv_bf16_stride=staged_kv_stride)
+                ht_sc_end_a = ht_sec_start + Int32(32)
+                if ht_sc_end_a > ht_sec_len:
+                    ht_sc_end_a = ht_sec_len
+                ht_qk_a = s3_mask_and_scale(
+                    ht_qk_a, ht_tok_buf, warp_id * Int32(8), ht_sec_start,
+                    ht_sc_end_a, ht_sec_len, sm_scale_log2, lane)
                 cute.arch.barrier()
                 cute.arch.mbarrier_wait(mbar_base, phase=Int32(1))
                 if ht_in_main:
@@ -1468,6 +1483,13 @@ class UnifiedDecodeKernel:
                     ht_qk_b, q_fp8_addr, ht_kv_b, warp_id * Int32(8), lane,
                     d_nope=t.d_nope, q_nope_bf16_stride=t.q_nope_stride,
                     kv_bf16_stride=staged_kv_stride)
+                ht_sc_start_b = ht_sec_start + Int32(32)
+                ht_sc_end_b = ht_sc_start_b + Int32(32)
+                if ht_sc_end_b > ht_sec_len:
+                    ht_sc_end_b = ht_sec_len
+                ht_qk_b = s3_mask_and_scale(
+                    ht_qk_b, ht_tok_buf, warp_id * Int32(8), ht_sc_start_b,
+                    ht_sc_end_b, ht_sec_len, sm_scale_log2, lane)
                 cute.arch.barrier()
                 cute.arch.mbarrier_wait(mbar_base, phase=Int32(0))
                 if ht_in_main:
@@ -1509,7 +1531,7 @@ class UnifiedDecodeKernel:
                     n_v_chunks=t.n_v_chunks, bi=32,
                     sm_p_stride=L.sm_p_full_stride,
                     kv_bf16_stride=staged_kv_stride,
-                    n_warps=self.math_threads // 32, n_tiles=2)
+                    n_warps=self.math_threads // 32, n_tiles=2, p_column_offset=0)
                 cute.arch.barrier()
                 cute.arch.mbarrier_wait(mbar_base, phase=Int32(1))
                 if ht_in_main:
@@ -1530,7 +1552,7 @@ class UnifiedDecodeKernel:
                     n_v_chunks=t.n_v_chunks, bi=32,
                     sm_p_stride=L.sm_p_full_stride,
                     kv_bf16_stride=staged_kv_stride,
-                    n_warps=self.math_threads // 32, n_tiles=2)
+                    n_warps=self.math_threads // 32, n_tiles=2, p_column_offset=32)
                 cute.arch.barrier()
                 ht_out_o = cute.make_tensor(
                     mid_out.iterator

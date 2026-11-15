@@ -557,6 +557,7 @@ def s6_pv_dsv41_bf16_smem(
     kv_bf16_stride: cutlass.Constexpr = DSV41_BF16_TILE_ROW_STRIDE,
     n_warps: cutlass.Constexpr = 8,
     n_tiles: cutlass.Constexpr = 1,
+    p_column_offset: cutlass.Constexpr = 0,
 ):
     """BF16 P.V reusing decoded swizzled V via ldmatrix.trans.m8n8.x2 and hoisted P loads."""
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
@@ -566,8 +567,13 @@ def s6_pv_dsv41_bf16_smem(
     lane_r = lane & Int32(7)
     lane_sub = (lane >> Int32(3)) & Int32(1)
 
+    # A candidate-split tile pairs the second V half with the matching P
+    # columns; the offset stays out of the trace entirely at its default.
+    p_frag_base = p_base
+    if cutlass.const_expr(p_column_offset != 0):
+        p_frag_base = p_base + Int32(p_column_offset * 2)
     p_frags = [
-        _ldmatrix_m8n8x4_b16_offset(p_base, ks * 32)
+        _ldmatrix_m8n8x4_b16_offset(p_frag_base, ks * 32)
         for ks in range(bi // 16)
     ]
     for vc in cutlass.range_constexpr(n_v_chunks):
