@@ -3847,12 +3847,10 @@ class PagedForwardKernel:
         return True
 
     @cute.jit
-    def _inline_scale(self, cache: cute.Tensor, table: cute.Tensor, request,
-                      key_pos, head, page_stride, token_stride,
+    def _inline_scale(self, cache: cute.Tensor, page, row, head, page_stride, token_stride,
                       offset: cutlass.Constexpr):
-        page = table[request, key_pos // self.page_size]
         address = (Int64(cache.iterator.toint()) + Int64(page) * Int64(page_stride)
-                   + Int64(key_pos % self.page_size) * Int64(token_stride)
+                   + Int64(row) * Int64(token_stride)
                    + Int64(offset) + Int64(head) * Int64(4))
         scale = cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=4)
         return Float32(scale[0])
@@ -5807,6 +5805,20 @@ class PagedForwardKernel:
                     )
                 _exit_thread()
 
+            if const_expr(self.inline_scale_offsets is not None):
+                # An MSA tile never crosses a physical page. Resolve it once,
+                # then reuse each token's K scale across both query row slots.
+                scale_page = mPageTable[request_idx, tile_key_base // self.page_size]
+                scale_row = tile_key_base % self.page_size
+                token_k_scales = cute.make_rmem_tensor(cute.make_layout((num_mma_kv, 4)), Float32)
+                token_k_scales.fill(Float32(0.0))
+                for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                    for column in cutlass.range_constexpr(4):
+                        local = warp_kv_base + mma_kv * 16 + lane_pair_base + (column // 2) * 8 + column % 2
+                        if local < tile_tokens:
+                            token_k_scales[mma_kv, column] = self._inline_scale(
+                                mKBytes, scale_page, scale_row + local, kv_head_idx,
+                                k_page_stride_bytes, k_token_stride_bytes, self.inline_scale_offsets[0])
             subtile_base = (
                 Int32(0) if const_expr(self.traits.num_warps_kv == 1) else warp_kv_base
             )
@@ -5915,10 +5927,7 @@ class PagedForwardKernel:
                                     if valid:
                                         token_k_scale = k_scale
                                         if const_expr(self.inline_scale_offsets is not None):
-                                            token_k_scale = self._inline_scale(
-                                                mKBytes, mPageTable, request_idx, tile_key_base + key_local,
-                                                kv_head_idx, k_page_stride_bytes, k_token_stride_bytes,
-                                                self.inline_scale_offsets[0])
+                                            token_k_scale = token_k_scales[mma_kv, (reg_id // 4) * 2 + reg_id % 2]
                                         frag_S[mma_q, mma_kv, reg_id] = (
                                             frag_S[mma_q, mma_kv, reg_id] * token_k_scale
                                         )
@@ -6126,10 +6135,7 @@ class PagedForwardKernel:
                                     if valid:
                                         token_k_scale = k_scale
                                         if const_expr(self.inline_scale_offsets is not None):
-                                            token_k_scale = self._inline_scale(
-                                                mKBytes, mPageTable, request_idx, tile_key_base + key_local,
-                                                kv_head_idx, k_page_stride_bytes, k_token_stride_bytes,
-                                                self.inline_scale_offsets[0])
+                                            token_k_scale = token_k_scales[mma_kv, (reg_id // 4) * 2 + reg_id % 2]
                                         frag_S[mma_q, mma_kv, reg_id] = (
                                             frag_S[mma_q, mma_kv, reg_id] * token_k_scale
                                         )
@@ -6464,12 +6470,12 @@ class PagedForwardKernel:
                             vs0, vs1 = Float32(0.0), Float32(0.0)
                             if key_local < tile_tokens:
                                 vs0 = self._inline_scale(
-                                    mVBytes, mPageTable, request_idx, tile_key_base + key_local,
+                                    mVBytes, scale_page, scale_row + key_local,
                                     kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
                                     self.inline_scale_offsets[1])
                             if key_local + 1 < tile_tokens:
                                 vs1 = self._inline_scale(
-                                    mVBytes, mPageTable, request_idx, tile_key_base + key_local + 1,
+                                    mVBytes, scale_page, scale_row + key_local + 1,
                                     kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
                                     self.inline_scale_offsets[1])
                             for mma_q in cutlass.range_constexpr(num_mma_q):
