@@ -151,6 +151,17 @@ def test_muse_fp8_attention_same_scale_qdq(heads, kind, rows):
         graph_args[fmt] = (prefill, args, scalars)
     assert torch.equal(outputs["bf16"], outputs["fp8"]), (outputs["bf16"].float() - outputs["fp8"].float()).abs().max()
     assert torch.equal(singles["bf16"], singles["fp8"])
+    profile = os.environ.get("CUTEAFD_MUSE_KV_PROFILE")
+    if profile:
+        assert profile in graph_args and kind == "full" and rows == 1
+        _, args, _ = graph_args[profile]
+        program = compile_attention_aot(heads=heads, kind=kind, route="decode", ring_rows=ring_rows,
+                                        window=window, kv_cache=profile)
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStart()
+        program.launch(*args, scalars=[rows, 0, 1])
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
     if os.environ.get("CUTEAFD_MUSE_KV_BENCH") == "1":
         timings = {}
         for fmt, (program, args, scalars) in graph_args.items():
