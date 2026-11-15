@@ -141,7 +141,7 @@ def issue_native_v41_gather(
     token_indices: cute.Tensor, full_mbar: cute.Pointer,
     start: Int32, io_lane: Int32, *, swa: cutlass.Constexpr,
     kv_stride: cutlass.Constexpr, io_threads: cutlass.Constexpr,
-    fp8_internal: cutlass.Constexpr = True,
+    fp8_internal: cutlass.Constexpr = True, entries: cutlass.Constexpr = 64,
 ):
     """Stage native FP8-window/FP4-source records for BF16 or canonical FP8 math.
 
@@ -151,9 +151,12 @@ def issue_native_v41_gather(
     canonical metadata mask that payload. No full-pool or selected-pool repack.
     """
     payload_bytes = 512 if swa else 256
-    for part in cutlass.range_constexpr((64 + io_threads - 1) // io_threads):
+    # ``entries`` bounds one staging burst: the full chunk stages 64 keys, a
+    # resident half-tile stages 32 and consumes them before the next burst, so
+    # the destination row window is 0..entries-1 either way.
+    for part in cutlass.range_constexpr((entries + io_threads - 1) // io_threads):
         entry = io_lane + Int32(part * io_threads)
-        if entry < Int32(64):
+        if entry < Int32(entries):
             key = start + entry + Int32(0 if swa else 128)
             value, scale = resolve_native_v41_record(descriptor, metadata, selected, key, window_begin)
             valid = value != Uint64(0)
@@ -186,7 +189,7 @@ def issue_native_v41_gather(
                     st_shared_v4_u32(row_addr + Int32(payload_bytes + 16), s4, s5, s6, s7)
     cute.arch.fence_acq_rel_cta()
     if (io_lane & Int32(31)) == Int32(0):
-        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar, Int32(64 * payload_bytes // (io_threads // 32)))
+        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar, Int32(entries * payload_bytes // (io_threads // 32)))
 
 
 @dsl_user_op
@@ -518,11 +521,16 @@ def s5_fill_sm_p_bf16(
     lane: Int32,
     *,
     sm_p_stride: cutlass.Constexpr,
+    column_offset: cutlass.Constexpr = 0,
 ):
-    """Store packed bf16x2 softmax weights to sm_p_full without FP8 scratch init."""
+    """Store packed bf16x2 softmax weights to sm_p_full without FP8 scratch init.
+
+    ``column_offset`` places this warp's probabilities at their candidate column;
+    a two-pass tile consumes the same warp set on two candidate halves.
+    """
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
-    c0 = warp_id * Int32(8) + tid * Int32(2)
+    c0 = warp_id * Int32(8) + tid * Int32(2) + Int32(column_offset)
     _st_shared_bf16x2_from_f32(
         sm_p_full_addr + (gid * Int32(sm_p_stride) + c0) * Int32(2),
         w_pre[0],
@@ -547,6 +555,8 @@ def s6_pv_dsv41_bf16_smem(
     bi: cutlass.Constexpr = 64,
     sm_p_stride: cutlass.Constexpr = 72,
     kv_bf16_stride: cutlass.Constexpr = DSV41_BF16_TILE_ROW_STRIDE,
+    n_warps: cutlass.Constexpr = 8,
+    n_tiles: cutlass.Constexpr = 1,
 ):
     """BF16 P.V reusing decoded swizzled V via ldmatrix.trans.m8n8.x2 and hoisted P loads."""
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
@@ -555,31 +565,34 @@ def s6_pv_dsv41_bf16_smem(
 
     lane_r = lane & Int32(7)
     lane_sub = (lane >> Int32(3)) & Int32(1)
-    v_base = (
-        kv_bf16_base_addr
-        + (lane_sub * Int32(8) + lane_r) * Int32(kv_bf16_stride)
-        + (warp_id ^ lane_r) * Int32(16)
-    )
 
     p_frags = [
         _ldmatrix_m8n8x4_b16_offset(p_base, ks * 32)
         for ks in range(bi // 16)
     ]
     for vc in cutlass.range_constexpr(n_v_chunks):
-        x0 = Float32(0.0)
-        x1 = Float32(0.0)
-        x2 = Float32(0.0)
-        x3 = Float32(0.0)
-        for ks in cutlass.range_constexpr(bi // 16):
-            a0, a1, a2, a3 = p_frags[ks]
-            b0, b1 = _ldmatrix_m8n8x2_trans_b16_offset(
-                v_base, ks * (16 * kv_bf16_stride) + vc * 128
-            )
-            x0, x1, x2, x3 = mma_m16n8k16_f32_bf16(
-                x0, x1, x2, x3, a0, a1, a2, a3, b0, b1
-            )
-        acc_nope[vc][0] = acc_nope[vc][0] + x0
-        acc_nope[vc][1] = acc_nope[vc][1] + x1
-        acc_nope[vc][2] = acc_nope[vc][2] + x2
-        acc_nope[vc][3] = acc_nope[vc][3] + x3
+        for nt in cutlass.range_constexpr(n_tiles):
+            # A warp covers NT consecutive eight-dim groups of this V chunk; the
+            # transpose-ldmatrix swizzle follows the resulting dimension group.
+            x0 = Float32(0.0)
+            x1 = Float32(0.0)
+            x2 = Float32(0.0)
+            x3 = Float32(0.0)
+            v_tile = nt * n_warps + warp_id
+            v_ptr = kv_bf16_base_addr + (
+                lane_sub * Int32(8) + lane_r
+            ) * Int32(kv_bf16_stride) + (v_tile ^ lane_r) * Int32(16)
+            for ks in cutlass.range_constexpr(bi // 16):
+                a0, a1, a2, a3 = p_frags[ks]
+                b0, b1 = _ldmatrix_m8n8x2_trans_b16_offset(
+                    v_ptr, ks * (16 * kv_bf16_stride) + vc * 128
+                )
+                x0, x1, x2, x3 = mma_m16n8k16_f32_bf16(
+                    x0, x1, x2, x3, a0, a1, a2, a3, b0, b1
+                )
+            at = vc * n_tiles + nt
+            acc_nope[at][0] = acc_nope[at][0] + x0
+            acc_nope[at][1] = acc_nope[at][1] + x1
+            acc_nope[at][2] = acc_nope[at][2] + x2
+            acc_nope[at][3] = acc_nope[at][3] + x3
     return acc_nope
