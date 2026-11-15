@@ -139,7 +139,7 @@ class _KvPack:
     def __init__(self, heads=4):
         from .pointwise import PackFp8KvPlane
         self.heads = heads
-        self.plane = PackFp8KvPlane(heads, 128)
+        self.plane = PackFp8KvPlane(heads, 128, page_rows=64)
 
     @cute.jit
     def __call__(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
@@ -202,6 +202,7 @@ def compile_minimax_kv_pack_aot(*, heads=4):
         Operand("slots", torch.int64, "[rows] (physical slots; negative skips writes)"),
         Operand("key_cache", torch.uint8, f"[pages,64,{record_bytes}] scaled E4M3 records", "out"),
         Operand("value_cache", torch.uint8, f"[pages,64,{record_bytes}] scaled E4M3 records", "out")),
-        scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (), version=2,
+        scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (), version=3,
         geometry=dict(heads=heads, head_dim=128, page_rows=64,
-                      record_bytes=record_bytes, scale_offset=heads * 128))
+                      record_bytes=record_bytes, scale_offset=64 * heads * 128,
+                      scale_stride=record_bytes - heads * 128))

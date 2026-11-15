@@ -3277,6 +3277,7 @@ class PagedForwardKernel:
         page_size: int = 64,
         use_fp8_pv_repack: bool = False,
         inline_scale_offsets: tuple[int, int] | None = None,
+        inline_scale_stride: int | None = None,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -3290,6 +3291,7 @@ class PagedForwardKernel:
         self.msa_block_sparse = bool(msa_block_sparse)
         self.msa_union_tile = bool(msa_union_tile)
         self.inline_scale_offsets = inline_scale_offsets
+        self.inline_scale_stride = inline_scale_stride
         if inline_scale_offsets is not None and (
             not msa_block_sparse or dtype_kv != cutlass.Float8E4M3FN
             or enable_paged_kv_tma or use_native_fp8_qk or use_native_fp8_pv
@@ -3850,7 +3852,7 @@ class PagedForwardKernel:
     def _inline_scale(self, cache: cute.Tensor, page, row, head, page_stride, token_stride,
                       offset: cutlass.Constexpr):
         address = (Int64(cache.iterator.toint()) + Int64(page) * Int64(page_stride)
-                   + Int64(row) * Int64(token_stride)
+                   + Int64(row) * Int64(self.inline_scale_stride if const_expr(self.inline_scale_stride is not None) else token_stride)
                    + Int64(offset) + Int64(head) * Int64(4))
         scale = cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=4)
         return Float32(scale[0])

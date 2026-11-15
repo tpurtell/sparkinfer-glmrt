@@ -102,15 +102,24 @@ def test_half_head_kv_pack_is_byte_exact_whole_head_cache_slice(rows):
         untouched = torch.ones(capacity, dtype=torch.bool, device=device)
         untouched[slots[slots >= 0]] = False
         for cache in caches:
-            assert (cache[untouched] == 173).all(), "unwritten cache slots were modified"
-            assert (cache[~untouched] != 173).any(), "cache writes are missing"
+            payload = cache.view(-1).as_strided((capacity // 64, 64, heads * 128),
+                (64 * cache.shape[-1], heads * 128, 1)).flatten(0, 1)
+            assert (payload[untouched] == 173).all(), "unwritten cache slots were modified"
+            assert (payload[~untouched] != 173).any(), "cache writes are missing"
         return caches
 
     whole = run(0, 4)
     for first in (0, 2):
         for actual, reference in zip(run(first, 2), whole):
-            assert torch.equal(actual[:, :256], reference[:, first * 128:(first + 2) * 128]), first
-            assert torch.equal(actual[:, 256:264], reference[:, 512 + first * 4:512 + (first + 2) * 4]), first
+            def planes(raw, heads):
+                record = raw.shape[-1]
+                payload = raw.view(-1).as_strided((capacity // 64, 64, heads, 128),
+                    (64 * record, heads * 128, 128, 1))
+                scale = raw.view(-1).as_strided((capacity // 64, 64, heads, 4),
+                    (64 * record, record - heads * 128, 4, 1), storage_offset=64 * heads * 128)
+                return payload, scale
+            for half, whole_plane in zip(planes(actual, 2), planes(reference, 4)):
+                assert torch.equal(half, whole_plane[:, :, first:first + 2]), first
 
 
 @pytest.mark.parametrize("heads", [2, 4])
@@ -126,7 +135,7 @@ def test_kv_pack_exact_bits_scales_negative_slots_live_rows_and_replay(big_slot,
     k, v = [torch.randn(rows, heads, 128, device=device).bfloat16() for _ in range(2)]
     k[0].zero_()
     record = fp8_kv_plane_bytes(heads, 128)
-    base = 2**31 // record + 64 if big_slot else 64
+    base = ((2**31 // (64 * record) + 1) * 64) if big_slot else 64
     slots = torch.tensor([base, base + 63, base + 64, -1, base + 129, base + 11, base + 130],
                          device=device, dtype=torch.int64)
     caches = [torch.empty((base + 192, record), dtype=torch.uint8, device=device) for _ in range(2)]
@@ -151,7 +160,11 @@ def test_kv_pack_exact_bits_scales_negative_slots_live_rows_and_replay(big_slot,
                 slot = int(slots[row].item())
                 if slot >= 0:
                     expected[slot - base] = reference[row]
-            assert torch.equal(cache[base:].cpu(), expected)
+            split = torch.full((3, 64 * record), 173, dtype=torch.uint8)
+            token_records = expected.view(3, 64, record)
+            split[:, :64 * heads * 128] = token_records[..., :heads * 128].reshape(3, -1)
+            split[:, 64 * heads * 128:] = token_records[..., heads * 128:].reshape(3, -1)
+            assert torch.equal(cache[base:].cpu().reshape(3, -1), split)
 
     reset()
     program.launch(*tensors, scalars=(rows,))

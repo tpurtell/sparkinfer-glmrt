@@ -34,13 +34,21 @@ def test_inline_scales_outliers_and_rows(heads, mode):
     torch.cuda.synchronize()
     decoded = []
     for source, raw in zip((key, value), packed):
-        scale = raw[:-1, heads * 128:heads * 132].contiguous().view(torch.float32)
+        scale_bytes = raw.view(-1).as_strided((pages, 64, heads * 4),
+            (64 * record, record - heads * 128, 1), storage_offset=64 * heads * 128)
+        scale = scale_bytes.contiguous().view(torch.float32).reshape(-1, heads)[:-1]
         expected_scale = source[:-1].float().abs().amax(-1) / 448
         torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=1e-10)
-        payload = raw[:-1, :heads * 128].contiguous().view(torch.float8_e4m3fn).reshape(-1, heads, 128)
+        payload = raw.view(-1).as_strided((pages, 64, heads, 128),
+            (64 * record, heads * 128, 128, 1)).contiguous().view(torch.float8_e4m3fn).reshape(-1, heads, 128)[:-1]
         decoded.append(payload.float() * scale[..., None])
-        assert (raw[-1] == 213).all(), "negative slot changed"
-        assert (raw[:-1, heads * 132:] == 0).all(), "padding is not deterministic"
+        payload_bytes = raw.view(-1).as_strided((pages, 64, heads * 128),
+            (64 * record, heads * 128, 1))
+        assert (payload_bytes[-1, -1] == 213).all(), "negative slot payload changed"
+        assert (scale_bytes[-1, -1] == 213).all(), "negative slot scales changed"
+        padding = raw.view(-1).as_strided((pages, 64, record - heads * 132),
+            (64 * record, record - heads * 128, 1), storage_offset=64 * heads * 128 + heads * 4)
+        assert (padding.flatten(0, 1)[:-1] == 0).all(), "padding is not deterministic"
     q = (torch.randn((capacity, heads * 16, 128), generator=g, device="cuda") * .5).bfloat16()
     q[:] = q[0].clone()
     program = compile_minimax_attention_aot(max_rows=capacity, max_batch=capacity, mode=mode,
@@ -95,9 +103,13 @@ def _inline_cache(values):
     from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
     pages, _, heads, dim = values.shape
     raw = torch.zeros((pages, PAGE, fp8_kv_plane_bytes(heads, dim)), dtype=torch.uint8, device=values.device)
-    raw[..., :heads * dim] = values.contiguous().view(torch.uint8).reshape(pages, PAGE, heads * dim)
+    record = raw.shape[-1]
+    payload = raw.view(-1).as_strided((pages, PAGE, heads * dim), (PAGE * record, heads * dim, 1))
+    payload[:] = values.contiguous().view(torch.uint8).reshape(pages, PAGE, heads * dim)
     scales = torch.ones((pages, PAGE, heads), device=values.device)
-    raw[..., heads * dim:heads * (dim + 4)] = scales.view(torch.uint8)
+    scale_bytes = raw.view(-1).as_strided((pages, PAGE, heads * 4),
+        (PAGE * record, record - heads * dim, 1), storage_offset=PAGE * heads * dim)
+    scale_bytes[:] = scales.view(torch.uint8)
     return raw
 
 

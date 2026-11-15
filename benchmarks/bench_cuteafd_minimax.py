@@ -179,7 +179,8 @@ def producer_cases(args):
             from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
             scaled_records = "record_bytes" in program.geometry
             record = fp8_kv_plane_bytes(4, 128) if scaled_records else 512
-            caches = [torch.empty((capacity * 2 + 128, record), device=dev, dtype=torch.uint8) for _ in range(2)]
+            cache_rows = (capacity * 2 + 191) // 64 * 64
+            caches = [torch.empty((cache_rows, record), device=dev, dtype=torch.uint8) for _ in range(2)]
             operands = ((k, v, slots, *caches) if scaled_records else
                         (k, v, slots, torch.zeros(capacity, dtype=torch.int32, device=dev),
                          torch.ones((1, 4), device=dev), torch.ones((1, 4), device=dev), *caches))
@@ -212,6 +213,12 @@ def producer_cases(args):
                     expected = torch.full_like(cache, 173)
                     active = slots[:rows] >= 0
                     expected[slots[:rows][active]] = reference[:rows][active]
+                    if scaled_records and program.geometry.get("scale_stride") is not None:
+                        records = expected.view(-1, 64, record)
+                        split = torch.empty_like(records).reshape(-1, 64 * record)
+                        split[:, :64 * 512] = records[..., :512].reshape(-1, 64 * 512)
+                        split[:, 64 * 512:] = records[..., 512:].reshape(-1, 64 * (record - 512))
+                        expected = split.reshape_as(cache)
                     assert torch.equal(cache, expected), "KV byte oracle or untouched suffix"
                 outputs = caches
                 row_bits = [cache[64].view(torch.uint8).clone() for cache in caches]

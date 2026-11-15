@@ -65,7 +65,8 @@ class _Attention:
         self.forward = PagedForwardKernel(cutlass.BFloat16, cutlass.Float8E4M3FN,
             cutlass.Uint8, cutlass.BFloat16, traits=traits,
             msa_block_sparse=True, msa_union_tile=union, page_size=64,
-            inline_scale_offsets=(kv_heads * 128, kv_heads * 128))
+            inline_scale_offsets=(64 * kv_heads * 128, 64 * kv_heads * 128),
+            inline_scale_stride=self.record_bytes - kv_heads * 128)
 
     @cute.jit
     def _tensor(self, ptr, shape, strides):
@@ -101,7 +102,7 @@ class _Attention:
             union_masks = self._tensor(masks, (work, self.kv_heads, 128), (self.kv_heads * 128, 128, 1))
             union_counts = self._tensor(counts, (work, self.kv_heads), (self.kv_heads, 1))
         cache_layout = cute.make_layout((Int32(pool_pages), 64, self.kv_heads, 128),
-                                        stride=(64 * self.record_bytes, self.record_bytes, 128, 1))
+                                        stride=(64 * self.record_bytes, self.kv_heads * 128, 128, 1))
         # Raw-pointer lowering erases byte signedness; restore it at the adapter boundary.
         k = cute.recast_tensor(cute.make_tensor(key_cache, cache_layout), cutlass.Uint8)
         v = cute.recast_tensor(cute.make_tensor(value_cache, cache_layout), cutlass.Uint8)
@@ -202,8 +203,9 @@ def compile_minimax_attention_aot(*, max_rows, max_batch, mode="decode", query_h
     return compile_program(launch, name=f"minimax_attention_{mode}", operands=operands,
         scalars=(Scalar("rows"), Scalar("batch"), Scalar("table_stride"), Scalar("pool_pages", "int64", "must fit signed int32 page extent")),
         key=(int(max_rows), int(max_batch), mode) + ((query_heads, kv_heads) if kv_heads != 4 else ()),
-        scratch={"scratch": lambda rows: launch.nbytes}, version=2,
+        scratch={"scratch": lambda rows: launch.nbytes}, version=3,
         geometry=dict(max_rows=int(max_rows), max_batch=int(max_batch), page_rows=64,
                       query_heads=query_heads, kv_heads=kv_heads, head_dim=128, block_tokens=128,
                       topk=16, mode=mode, softmax_scale=128 ** -0.5,
-                      record_bytes=record_bytes, scale_offset=kv_heads * 128), doc=__doc__)
+                      record_bytes=record_bytes, scale_offset=64 * kv_heads * 128,
+                      scale_stride=record_bytes - kv_heads * 128), doc=__doc__)

@@ -453,7 +453,8 @@ def fp8_kv_plane_bytes(kv_heads, head_dim):
 class PackFp8KvPlane:
     """Qwen's per-token/head FP8 contract with a planar, aligned storage owner."""
 
-    def __init__(self, kv_heads, head_dim):
+    def __init__(self, kv_heads, head_dim, page_rows=0):
+        self.page_rows = int(page_rows)
         self.heads, self.dim = int(kv_heads), int(head_dim)
         self.row_bytes = fp8_kv_plane_bytes(kv_heads, head_dim)
         self.payload_bytes = self.heads * self.dim
@@ -481,9 +482,16 @@ class PackFp8KvPlane:
         scale = _fp8_scale(_warp_max(amax))
         inverse = div_rn_f32(Float32(1.0), scale)
         row_address = Int64(out.toint()) + slot * Int64(self.row_bytes)
+        scale_address = row_address + Int64(self.payload_bytes)
+        if cutlass.const_expr(self.page_rows > 0):
+            page = slot // Int64(self.page_rows)
+            token = slot % Int64(self.page_rows)
+            page_address = Int64(out.toint()) + page * Int64(self.page_rows * self.row_bytes)
+            row_address = page_address + token * Int64(self.payload_bytes)
+            scale_address = page_address + Int64(self.page_rows * self.payload_bytes) + token * Int64(self.row_bytes - self.payload_bytes)
         if lane == Int32(0):
             scales = cute.make_tensor(cute.make_ptr(Float32,
-                row_address + Int64(self.payload_bytes), cute.AddressSpace.gmem, assumed_align=4),
+                scale_address, cute.AddressSpace.gmem, assumed_align=4),
                 cute.make_layout((self.heads,)))
             scales[head] = scale
         words = cute.make_tensor(cute.make_ptr(Uint32,
@@ -502,7 +510,7 @@ class PackFp8KvPlane:
             tail = self.row_bytes - self.payload_bytes - self.heads * 4
             if lane < Int32(tail):
                 padding = cute.make_tensor(cute.make_ptr(Uint8,
-                    row_address + Int64(self.payload_bytes + self.heads * 4),
+                    scale_address + Int64(self.heads * 4),
                     cute.AddressSpace.gmem, assumed_align=1), cute.make_layout((max(1, tail),)))
                 padding[lane] = Uint8(0)
 
