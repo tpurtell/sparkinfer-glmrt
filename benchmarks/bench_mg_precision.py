@@ -45,7 +45,8 @@ def arm_traits(fmt, arm):
             raise ValueError((fmt, arm))
         traits = make_unified_traits(ModelType.GLM_NEXT if fmt == "glmf" else ModelType.GLM_NSA,
             ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
-        return with_bf16_attention(traits) if arm == "bf16" else traits
+        # Kimi's split kernels widen each dequantized key to BF16; its MG mode keeps that.
+        return with_bf16_attention(traits, rounded_k=fmt == "kimi") if arm == "bf16" else traits
     if fmt == "dsv4":
         if arm not in ("fp8-qk", "bf16-qk"):
             raise ValueError(arm)

@@ -415,7 +415,7 @@ def test_glm_next_accepts_inline_scale_nvfp4_without_rope() -> None:
         ComputeMode.BF16,
         ScaleFormat.ARBITRARY_FP32,
     )
-    assert bf16_traits.kv_gmem_stride == traits.kv_gmem_stride
+    assert (bf16_traits.kv_gmem_stride, bf16_traits.kv_smem_stride) == (528, 528)
 
 
 def test_glm_next_nvfp4_unplanned_traits_enable_inline_latent_scale() -> None:

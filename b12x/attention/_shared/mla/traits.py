@@ -94,6 +94,10 @@ class UnifiedMLATraits:
     # FP32 group scale) instead of the two-pass E4M3 W.V. False keeps every
     # existing specialization's layout and PTX.
     pv_bf16: bool = False
+    # With pv_bf16: K is dequantized to BF16 before the QK MMA, rounding each
+    # key as Kimi's split kernels do. False feeds K as its exact BF16 widening
+    # and applies the FP32 group scale to each group's FP32 partial.
+    qk_rounded_k: bool = False
 
 
 def make_unified_traits(
@@ -436,19 +440,24 @@ def infer_model_type(
     )
 
 
-def with_bf16_attention(traits: UnifiedMLATraits) -> UnifiedMLATraits:
+def with_bf16_attention(
+    traits: UnifiedMLATraits, *, rounded_k: bool = False
+) -> UnifiedMLATraits:
     """BF16 QK and BF16 PV over an inline-FP32-scale FP8 record.
 
     The record, its staging stride and the cache ABI are unchanged: Q stays
     BF16, K and V are dequantized in registers (E4M3 x inline FP32 group
-    scale), P is BF16 and both products accumulate in FP32.
+    scale), P is BF16 and both products accumulate in FP32. ``rounded_k``
+    rounds the dequantized K to BF16 (see ``qk_rounded_k``).
     """
     if int(traits.scale_format) != int(ScaleFormat.ARBITRARY_FP32):
         raise ValueError(
             "with_bf16_attention applies to inline-FP32-scale records; "
             f"got scale_format={traits.scale_format!r}"
         )
-    return replace(traits, compute_mode=ComputeMode.BF16, pv_bf16=True)
+    return replace(
+        traits, compute_mode=ComputeMode.BF16, pv_bf16=True, qk_rounded_k=bool(rounded_k)
+    )
 
 
 def is_glm_model_type(model_type: int) -> bool:

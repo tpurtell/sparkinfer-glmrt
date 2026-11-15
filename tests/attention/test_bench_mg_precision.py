@@ -52,6 +52,7 @@ def test_inline_fp32_modes_preserve_cache_format(fmt, model, stride):
     assert fp8.kv_gmem_stride == bf16.kv_gmem_stride == stride
     assert (fp8.compute_mode, fp8.pv_bf16) == (ComputeMode.FP8, False)
     assert (bf16.compute_mode, bf16.pv_bf16) == (ComputeMode.BF16, True)
+    assert bf16.qk_rounded_k == (fmt == "kimi") and not fp8.qk_rounded_k
     assert (max_mg_head_groups(fp8), max_mg_head_groups(bf16)) == (2, 1)
     assert make_smem_layout_mg(bf16, 1).total_bytes < SM120_SMEM_CARVEOUT_BYTES
 
