@@ -7,10 +7,59 @@ rows leave whole 16-key warp slices empty.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+from pathlib import Path
+
 import pytest
 import torch
 
 from ..conftest import require_b12x
+
+
+def _receipt(label, output, expected, lse, expected_lse):
+    path = os.environ.get("MINIMAX_ATTENTION_RECEIPT")
+    if not path:
+        return
+    actual, reference = output.float(), expected.float()
+    difference = actual - reference
+    record = dict(
+        test=os.environ["PYTEST_CURRENT_TEST"].removesuffix(" (call)"), cell=label,
+        output_shape=list(output.shape),
+        output_rms_error=difference.square().mean().sqrt().item(),
+        output_relative_l2=(difference.norm() / reference.norm()).item(),
+        lse_max_abs=(lse.float() - expected_lse.float()).abs().max().item(),
+        output_sha256=hashlib.sha256(output.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+        lse_sha256=hashlib.sha256(lse.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+    )
+    with Path(path).open("a") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _half_head_receipt(label, query, key, value, table, lengths, cu, selections, output, lse):
+    if not os.environ.get("MINIMAX_ATTENTION_RECEIPT"):
+        return
+    kv_head = torch.arange(query.shape[1], device="cuda") // 16
+    expected, expected_lse = [], []
+    for request, length in enumerate(lengths):
+        pages = table[request, :(length + PAGE - 1) // PAGE].tolist()
+        k = key[pages].float().reshape(-1, key.shape[2], 128)[:length, kv_head]
+        v = value[pages].float().reshape(-1, value.shape[2], 128)[:length, kv_head]
+        positions = torch.arange(length, device="cuda")
+        start, end = cu[request:request + 2]
+        # Bound reference workspace while checking every live row against dense attention.
+        for first in range(start, end, 32):
+            last = min(first + 32, end)
+            chosen = selections[:, first:last].permute(1, 0, 2)[:, kv_head]
+            mask = (positions[None, None, :, None] // 128 == chosen[:, :, None]).any(-1)
+            visible = length - (end - start) + torch.arange(first, last, device="cuda") - start + 1
+            mask &= positions[None, None] < visible[:, None, None]
+            scores = torch.einsum("rhd,thd->rht", query[first:last].float(), k) * 128 ** -.5
+            scores.masked_fill_(~mask, -torch.inf)
+            expected.append(torch.einsum("rht,thd->rhd", scores.softmax(-1), v))
+            expected_lse.append(torch.logsumexp(scores, -1) / torch.log(torch.tensor(2.)))
+    _receipt(label, output, torch.cat(expected), lse, torch.cat(expected_lse))
 
 @pytest.mark.parametrize("heads", [2, 4])
 @pytest.mark.parametrize("mode", ["decode", "extend"])
@@ -74,6 +123,8 @@ def test_inline_scales_outliers_and_rows(heads, mode):
         print(f"inline scales {mode} h{heads} rows={rows}: relative error={error:.8f}")
         assert torch.isfinite(output[:rows]).all() and error < .03
         torch.testing.assert_close(lse[0], torch.logsumexp(scores, -1) / torch.log(torch.tensor(2.)), atol=.02, rtol=.002)
+        _receipt(f"rows={rows}", output[0], expected, lse[0],
+                 torch.logsumexp(scores, -1) / torch.log(torch.tensor(2.)))
         results.append(output[0].clone())
     assert all(torch.equal(results[0], item) for item in results)
 
@@ -166,6 +217,7 @@ def test_decode_rows_match_dense_attention_across_page_fills(program, group):
             failures.append((length, "lse"))
         actual = output[row].float()
         relative = ((actual - expected).norm() / expected.norm()).item()
+        _receipt(f"request={row}", output[row], expected, lse[row], expected_lse)
         if not torch.isfinite(actual).all() or relative > .03:
             failures.append((length, round(relative, 4)))
     assert not failures, f"rows (length, relative L2) differ from dense attention: {failures}"
@@ -193,6 +245,7 @@ def _assert_selected_attention(query, key, value, kd, vd, table, lengths, cu,
             assert torch.isfinite(actual).all() and relative <= .03, (request, row, relative)
             expected_lse = torch.logsumexp(scores, -1) / torch.log(torch.tensor(2.0))
             assert (lse[row] - expected_lse).abs().max().item() <= .02, (request, row)
+            _receipt(f"request={request},row={row}", output[row], expected, lse[row], expected_lse)
 
 
 @pytest.mark.parametrize("mode,rows", [
@@ -250,6 +303,9 @@ def test_half_head_attention_is_byte_exact_whole_head_slice(mode, rows):
         assert torch.isfinite(output[:rows]).all() and torch.count_nonzero(output[:rows]) > 0
         for actual, expected in zip(operands, frozen):
             assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        _half_head_receipt(f"first={first},heads={heads}", operands[0],
+                           key[:, :, first:first + heads], value[:, :, first:first + heads],
+                           table, lengths, cu, operands[-1], output[:rows], lse[:rows])
         return output[:rows], lse[:rows]
 
     whole = run(0, 4)
