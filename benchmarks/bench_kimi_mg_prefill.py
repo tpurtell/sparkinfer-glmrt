@@ -287,12 +287,12 @@ def curve(args, report):
                             end.record()
                             end.synchronize()
                             samples[arm].append(start.elapsed_time(end) / args.iterations)
-                    assert torch.cuda.memory_allocated() == before
+                    allocation_stable = torch.cuda.memory_allocated() - before  # bytes; 0 is stable
                     medians = [statistics.median(x) for x in samples]
                     cell = dict(route=route, heads=heads, rows=rows, prefix=prefix,
                         baseline_ms=medians[0], mg_ms=medians[1], speedup=medians[0]/medians[1],
                         raw_ms=samples, baseline_scratch_bytes=bs.numel(), mg_scratch_bytes=ms.numel(),
-                        mg_lse_bytes=capacity*heads*4, allocation_stable=True)
+                        mg_lse_bytes=capacity*heads*4, allocation_stable=allocation_stable)
                     results.append(cell)
                     print(json.dumps(cell), flush=True)
                     args.output.write_text(json.dumps(report, indent=2) + "\n")

@@ -35,6 +35,7 @@ from b12x._lib.intrinsics import (
     create_l2_evict_first_policy,
     cvt_e4m3_to_f32_via_f16,
     dequant_kv_e4m3_pair_to_bf16x2,
+    e4m3_pair_to_bf16x2_sm120,
     f16x2_to_f32x2,
     fmax_f32,
     fmin_f32,
@@ -812,9 +813,11 @@ def s1_qk_nope_bf16_mg2(
     """S1 (BF16): fused QK-NoPE bf16 m16n8k16 MMA with per-thread inline
     FP8->BF16 K dequant.
 
-    ``inline_fp32_scale_offset`` (nonzero) reads the per-(token,blk) scale as
-    the record's inline FP32 group scale at that staged-row offset instead of
-    the UE8M0 footer byte; the dequant and MMAs are the same.
+    ``inline_fp32_scale_offset`` (nonzero): the per-(token,blk) scale is the
+    record's inline FP32 group scale at that staged-row offset. An arbitrary
+    FP32 scale times E4M3 does not fit BF16, so K enters the MMA as its exact
+    BF16 widening and each scale group's partial is scaled in FP32 afterwards:
+    QK then carries no K rounding at all.
 
     Byte-for-byte mirror of FlashInfer prefill_kernel.cuh:883-932. The K B
     operand (b0/b1) and the per-(token,blk) UE8M0 scale depend only on the
@@ -837,37 +840,70 @@ def s1_qk_nope_bf16_mg2(
 
     for blk in cutlass.range_constexpr(num_scales):
         if cutlass.const_expr(inline_fp32_scale_offset):
-            scale_f = ld_shared_f32(
-                kv_fp8_base_addr
-                + kv_gid_row * Int32(kv_smem_stride)
-                + Int32(inline_fp32_scale_offset + blk * 4)
-            )
+            t0 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+            t1 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+            for ks in cutlass.range_constexpr(quant_tile // 16):
+                ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+                b0 = e4m3_pair_to_bf16x2_sm120(
+                    ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16)
+                )
+                b1 = e4m3_pair_to_bf16x2_sm120(
+                    ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16 + 8)
+                )
+                a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+                a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
+                    _smem_byte(q_nope_bf16_g0_addr, a_byte)
+                )
+                t0[0], t0[1], t0[2], t0[3] = mma_m16n8k16_f32_bf16(
+                    t0[0], t0[1], t0[2], t0[3], a00, a01, a02, a03, b0, b1
+                )
+                if cutlass.const_expr(n_hg == 2):
+                    a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
+                        _smem_byte(q_nope_bf16_g1_addr, a_byte)
+                    )
+                    t1[0], t1[1], t1[2], t1[3] = mma_m16n8k16_f32_bf16(
+                        t1[0], t1[1], t1[2], t1[3], a10, a11, a12, a13, b0, b1
+                    )
+            # Fragment columns are this lane's two candidates.
+            c0 = warp_first_cand + tid * Int32(2)
+            scale_at = kv_fp8_base_addr + Int32(inline_fp32_scale_offset + blk * 4)
+            ks0 = ld_shared_f32(scale_at + c0 * Int32(kv_smem_stride))
+            ks1 = ld_shared_f32(scale_at + (c0 + Int32(1)) * Int32(kv_smem_stride))
+            qk0[0] = qk0[0] + t0[0] * ks0
+            qk0[1] = qk0[1] + t0[1] * ks1
+            qk0[2] = qk0[2] + t0[2] * ks0
+            qk0[3] = qk0[3] + t0[3] * ks1
+            if cutlass.const_expr(n_hg == 2):
+                qk1[0] = qk1[0] + t1[0] * ks0
+                qk1[1] = qk1[1] + t1[1] * ks1
+                qk1[2] = qk1[2] + t1[2] * ks0
+                qk1[3] = qk1[3] + t1[3] * ks1
         else:
             # DSV4 UE8M0_BYTE: per-(token,blk) fp32 scale from the K footer scale buf.
             scale_f = _ue8m0_zext_byte_to_fp32(ld_shared_u8_offset(kv_sc_row_base, blk))
-        for ks in cutlass.range_constexpr(quant_tile // 16):
-            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
-            # K dequant B operand: two e4m3 byte-pairs (u16) -> bf16x2 b0/b1.
-            # _ld_u16_zext handles the 2-byte (non-4-aligned) offsets safely.
-            p0 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16)
-            p1 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16 + 8)
-            b0, b1 = dequant_kv_e4m3_pair_to_bf16x2(p0, p1, scale_f)
-            # Group 0 A operand + MMA.
-            a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
-            a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
-                _smem_byte(q_nope_bf16_g0_addr, a_byte)
-            )
-            qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
-                qk0[0], qk0[1], qk0[2], qk0[3], a00, a01, a02, a03, b0, b1
-            )
-            # Group 1 A operand + MMA (same b0/b1). Elided when n_hg==1.
-            if cutlass.const_expr(n_hg == 2):
-                a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
-                    _smem_byte(q_nope_bf16_g1_addr, a_byte)
+            for ks in cutlass.range_constexpr(quant_tile // 16):
+                ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+                # K dequant B operand: two e4m3 byte-pairs (u16) -> bf16x2 b0/b1.
+                # _ld_u16_zext handles the 2-byte (non-4-aligned) offsets safely.
+                p0 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16)
+                p1 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16 + 8)
+                b0, b1 = dequant_kv_e4m3_pair_to_bf16x2(p0, p1, scale_f)
+                # Group 0 A operand + MMA.
+                a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+                a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
+                    _smem_byte(q_nope_bf16_g0_addr, a_byte)
                 )
-                qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
-                    qk1[0], qk1[1], qk1[2], qk1[3], a10, a11, a12, a13, b0, b1
+                qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+                    qk0[0], qk0[1], qk0[2], qk0[3], a00, a01, a02, a03, b0, b1
                 )
+                # Group 1 A operand + MMA (same b0/b1). Elided when n_hg==1.
+                if cutlass.const_expr(n_hg == 2):
+                    a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
+                        _smem_byte(q_nope_bf16_g1_addr, a_byte)
+                    )
+                    qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+                        qk1[0], qk1[1], qk1[2], qk1[3], a10, a11, a12, a13, b0, b1
+                    )
     return qk0, qk1
 
 

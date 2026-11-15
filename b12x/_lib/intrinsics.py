@@ -3221,6 +3221,23 @@ def mxfp8_pair_to_bf16x2_sm120(
 
 
 @dsl_user_op
+def e4m3_pair_to_bf16x2_sm120(packed: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Widen one packed E4M3 pair to bf16x2 (exact) with SM120a's direct conversion."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 q;
+            cvt.u16.u32 q, $1;
+            cvt.rn.bf16x2.e4m3x2 $0, q;
+        }
+        """,
+        "=r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
+@dsl_user_op
 def fp8x4_e4m3_to_bfloat2x2_native_sm120(
     packed: Uint32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:
