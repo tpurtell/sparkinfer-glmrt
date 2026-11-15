@@ -83,6 +83,22 @@ def _quantize_row16(values: cute.Tensor, gs: Float32, packed_at: Int64, scale_at
     st_global_u8(scale_at, scale)
 
 
+@cute.jit
+def _input_global_scale(raw: Float32, divisor: cutlass.Constexpr):
+    if const_expr(divisor):
+        gs = raw
+    else:
+        gs = Float32(1.0) / raw
+    return gs
+
+
+@cute.jit
+def _copy_nvfp4_group(row: Int64, k: cutlass.Constexpr, grp: Int32, packed_at: Int64, scale_at: Int64):
+    lo, hi = _ld_v2_u32(row + Int64(grp) * Int64(8))
+    st_global_u64(packed_at, (Uint64(hi) << Uint64(32)) | Uint64(lo))
+    st_global_u8(scale_at, _ld_u8(row + Int64(k // 2) + Int64(grp)))
+
+
 class ChunkRowsA4:
     """Chunk-padded NVFP4 activations of the chunk rows (see module docstring);
     one CTA per live grouped pair, one thread per 16-value group."""
@@ -90,28 +106,33 @@ class ChunkRowsA4:
     threads = 128
 
     def __init__(self, *, k: int, wire: bool, experts: int, scale_rows: int, scale_convention: str = "multiplier",
-                 row_addresses: bool = False):
+                 input_kind: str | None = None, row_addresses: bool = False):
         self.divisor = scale_convention == "divisor"
-        self.k, self.wire, self.experts = int(k), bool(wire), int(experts)
-        # ``src`` is an Int64 table of retained per-row input addresses (merged
-        # Spark waves): the same values are read, only from where each row landed.
         self.row_addresses = bool(row_addresses)
+        self.input_kind = input_kind or ("fp8" if wire else "bf16")
+        if self.input_kind not in ("bf16", "fp8", "nvfp4"):
+            raise ValueError("input_kind must be bf16, fp8 or nvfp4")
+        self.k, self.wire, self.experts = int(k), self.input_kind == "fp8", int(experts)
+        self.row_bytes = (self.k // 2 + self.k // 16 + 16 if self.input_kind == "nvfp4"
+                          else self.k + self.k // 32 if self.wire else self.k * 2)
         # The scale operand whose input scales quantize these rows (gate: rows I, K = H).
         self.in_offset = nvfp4_input_scale_offset(experts, scale_rows, k)
         if self.k % 32:
             raise ValueError("K must be a multiple of 32")
 
     def key(self) -> tuple:
-        return ("chunk_rows_a4", 2, self.k, self.wire, self.experts, self.in_offset) + (("divisor",) if self.divisor else ()) \
-            + (("row_addresses",) if self.row_addresses else ())
+        return (("chunk_rows_a4", 2, self.k, self.wire, self.experts, self.in_offset)
+                + (("divisor",) if self.divisor else ())
+                + (("row_addresses",) if self.row_addresses else ())
+                + (("nvfp4_input",) if self.input_kind == "nvfp4" else ()))
 
     @cute.jit
     def row_base(self, src: cute.Pointer, row: Int32) -> Int64:
-        """Byte address of input row ``row``: a strided plane, or its retained address."""
+        """Byte address of an input row, orthogonal to its wire representation."""
         if const_expr(self.row_addresses):
             return cute.make_ptr(Int64, Int64(src.toint()), cute.AddressSpace.gmem, assumed_align=8)[row]
         else:
-            return Int64(src.toint()) + Int64(row) * Int64(self.k + self.k // 32 if self.wire else 2 * self.k)
+            return Int64(src.toint()) + Int64(row) * Int64(self.row_bytes)
 
     @cute.jit
     def __call__(self, src: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer, scales: cute.Pointer,
@@ -142,31 +163,34 @@ class ChunkRowsA4:
             if r < live:
                 source = _i32_at(Int64(pair_row.toint()), first + r)
                 row = self.row_base(src, source)
-                if const_expr(self.divisor):
-                    gs = _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
-                else:
-                    gs = Float32(1.0) / _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4))
+                if const_expr(self.input_kind != "nvfp4"):
+                    gs = _input_global_scale(
+                        _ld_f32(Int64(scales.toint()) + Int64(self.in_offset) + Int64(e) * Int64(4)), self.divisor)
                 groups = self.k // 16
                 for it in cutlass.range_constexpr(_ceil(groups, self.threads)):
                     grp = Int32(it * self.threads) + tidx
                     if grp < Int32(groups):
-                        values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
-                        for half in cutlass.range_constexpr(2):
-                            v = grp * Int32(2) + Int32(half)
-                            if const_expr(self.wire):
-                                lo, hi = _ld_v2_u32(row + Int64(v) * Int64(8))
-                                exponent = _ld_u8(row + Int64(self.k) + Int64(v // Int32(4)))
-                                w = _e4m3x8_scaled_bf16(lo, hi, _u32_as_f32(exponent << Uint32(23)))
-                            else:
-                                at = row + Int64(v) * Int64(16)
-                                lo, hi = _ld_v2_u32(at)
-                                lo2, hi2 = _ld_v2_u32(at + Int64(8))
-                                w = (lo, hi, lo2, hi2)
-                            for q in cutlass.range_constexpr(4):
-                                values[8 * half + 2 * q] = _bf16_lo(w[q])
-                                values[8 * half + 2 * q + 1] = _bf16_hi(w[q])
-                        _quantize_row16(values, gs, Int64(aq.toint()) + Int64(i) * Int64(self.k // 2) + Int64(grp) * Int64(8),
-                                        Int64(a_s.toint()) + Int64(i) * Int64(groups) + Int64(grp))
+                        packed_at = Int64(aq.toint()) + i * Int64(self.k // 2) + Int64(grp) * Int64(8)
+                        scale_at = Int64(a_s.toint()) + i * Int64(groups) + Int64(grp)
+                        if const_expr(self.input_kind == "nvfp4"):
+                            _copy_nvfp4_group(row, self.k, grp, packed_at, scale_at)
+                        else:
+                            values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
+                            for half in cutlass.range_constexpr(2):
+                                v = grp * Int32(2) + Int32(half)
+                                if const_expr(self.wire):
+                                    lo, hi = _ld_v2_u32(row + Int64(v) * Int64(8))
+                                    exponent = _ld_u8(row + Int64(self.k) + Int64(v // Int32(4)))
+                                    w = _e4m3x8_scaled_bf16(lo, hi, _u32_as_f32(exponent << Uint32(23)))
+                                else:
+                                    at = row + Int64(v) * Int64(16)
+                                    lo, hi = _ld_v2_u32(at)
+                                    lo2, hi2 = _ld_v2_u32(at + Int64(8))
+                                    w = (lo, hi, lo2, hi2)
+                                for q in cutlass.range_constexpr(4):
+                                    values[8 * half + 2 * q] = _bf16_lo(w[q])
+                                    values[8 * half + 2 * q + 1] = _bf16_hi(w[q])
+                            _quantize_row16(values, gs, packed_at, scale_at)
 
 
 class ChunkSwiGLUA4:

@@ -13,7 +13,7 @@ SOURCE = Path(__file__).resolve().parents[2] / "b12x/integration/cuteafd/fp8_moe
 def policy(sm):
     tree = ast.parse(SOURCE.read_text())
     names = {"_w8a8", "_mxfp4_down_a8", "_streams", "_bf16_fp8_prefill_rows",
-             "auto_large_rows", "_large_route", "prefill_forms", "_resolve"}
+             "auto_large_rows", "_large_route", "prefill_forms", "_resolve", "_input_kind"}
     nodes = [n for n in tree.body if isinstance(n, ast.Assign)
              and all(isinstance(t, ast.Name) for t in n.targets)
              and isinstance(n.value, (ast.Constant, ast.Tuple))]
@@ -253,6 +253,11 @@ def test_nvfp4_a4_segment_scratch_is_bf16_row_stream_at_live_rows(fused):
                 + align(padded * h // 2) + align(padded * h // 16) + 2 * align(split)
                 + align(padded * i // 2) + align(padded * i // 16) + align(pairs * h * 2))
     assert scratch(g, rows, 8192, wire=False) == expected
+    assert scratch(g, rows, 8192, input_kind="nvfp4") == expected
+    assert env["_resolve"]("auto", 8192, weights="nvfp4a4", input_kind="nvfp4") == "stream"
+    for weights in ("fp8", "mxfp4", "mxfp8", "bf16"):
+        with pytest.raises(ValueError, match="NVFP4 wire input requires"):
+            env["_resolve"]("auto", 8192, weights=weights, input_kind="nvfp4")
     assert scratch(g, rows, 8192, wire=False) < scratch(g, 8192, 8192, wire=False)
     for bad in [dict(wire=True), dict(wire=False, rows=0), dict(wire=False, rows=8193)]:
         with pytest.raises(ValueError):
