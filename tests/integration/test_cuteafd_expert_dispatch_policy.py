@@ -228,6 +228,37 @@ def test_segment_scratch_uses_live_rows_but_compiled_metadata_offset(weights, fo
             scratch(geometry, rows, 16384, form)
 
 
+@pytest.mark.parametrize("fused", [True, False])
+def test_nvfp4_a4_segment_scratch_is_bf16_row_stream_at_live_rows(fused):
+    """Calibrated W4A4 segments take BF16 rows: packed input/act planes at the live
+    chunk-padded rows, the compiled maximum's tile table, and no wire plane."""
+    tree, env = policy(121)
+    names = {"_regions", "fp8_moe_segment_scratch_bytes"}
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    env.update(Fp8MoeGeometry=object, STREAM_TILE_M=128, nvfp4_a4_fused=lambda: fused,
+               stream_max_tiles=lambda experts, pairs: (pairs + 127) // 128 + min(experts, pairs),
+               meta_words=lambda experts, tiles: 4 + 3 * experts + tiles,
+               _align=lambda value: (value + 1023) // 1024 * 1024,
+               mxfp8_down_row_bytes=lambda width: (width + width // 32 + 15) // 16 * 16)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), env)
+    h, e, k, i = 6144, 128, 4, 1024
+    g = SimpleNamespace(weights="nvfp4", kind="nvfp4a4", hidden=h, experts=e, top_k=k, slice=i,
+                        activations="a4", dynamic_nvfp4=False)
+    align, scratch = env["_align"], env["fp8_moe_segment_scratch_bytes"]
+    rows = 5504
+    pairs = rows * k
+    padded = ((pairs + 127) // 128 + min(e, pairs)) * 128
+    split = 0 if fused else pairs * i * 2
+    expected = (align(4 * (4 + 3 * e + 8192 * k // 128 + e)) + 2 * align(pairs * 4)
+                + align(padded * h // 2) + align(padded * h // 16) + 2 * align(split)
+                + align(padded * i // 2) + align(padded * i // 16) + align(pairs * h * 2))
+    assert scratch(g, rows, 8192, wire=False) == expected
+    assert scratch(g, rows, 8192, wire=False) < scratch(g, 8192, 8192, wire=False)
+    for bad in [dict(wire=True), dict(wire=False, rows=0), dict(wire=False, rows=8193)]:
+        with pytest.raises(ValueError):
+            scratch(g, bad.pop("rows", rows), 8192, **bad)
+
+
 def test_indirect_row_address_resolver_and_singleton_key_contract():
     source = SOURCE.with_name("_fp8_moe_stream.py")
     tree = ast.parse(source.read_text())
