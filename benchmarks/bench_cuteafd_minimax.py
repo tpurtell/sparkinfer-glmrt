@@ -177,18 +177,22 @@ def producer_cases(args):
             slots = torch.arange(capacity, device=dev, dtype=torch.int64) * 2 + 64
             slots[3::7] = -1
             from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
-            record = fp8_kv_plane_bytes(4, 128)
+            scaled_records = "record_bytes" in program.geometry
+            record = fp8_kv_plane_bytes(4, 128) if scaled_records else 512
             caches = [torch.empty((capacity * 2 + 128, record), device=dev, dtype=torch.uint8) for _ in range(2)]
-            operands = (k, v, slots, *caches)
+            operands = ((k, v, slots, *caches) if scaled_records else
+                        (k, v, slots, torch.zeros(capacity, dtype=torch.int32, device=dev),
+                         torch.ones((1, 4), device=dev), torch.ones((1, 4), device=dev), *caches))
             refs = []
             for value in (k, v):
                 source = value.float().cpu()
-                scale = source.abs().amax(-1) / 448
+                scale = source.abs().amax(-1) / 448 if scaled_records else torch.ones_like(source[..., 0])
                 scale = torch.where(scale > 0, scale, torch.ones_like(scale))
                 codes = (source * (1 / scale[..., None])).to(torch.float8_e4m3fn)
                 reference = torch.zeros((capacity, record), dtype=torch.uint8)
                 reference[:, :512] = codes.view(torch.uint8).reshape(capacity, 512)
-                reference[:, 512:528] = scale.view(torch.uint8)
+                if scaled_records:
+                    reference[:, 512:528] = scale.view(torch.uint8)
                 refs.append(reference.to(dev))
         full_bits = None
         if name != "kv_pack":
@@ -239,17 +243,46 @@ def attention_cases(args):
     torch.manual_seed(20261115)
     context, heads = 8192, 4
     pool = context // 64
-    record = fp8_kv_plane_bytes(heads, 128)
     key = torch.randn((context, heads, 128), device="cuda").bfloat16()
     value = (torch.randn_like(key) * .01).bfloat16()
     value[::127, :, 0] = 1024
-    packed = [torch.empty((context, record), dtype=torch.uint8, device="cuda") for _ in range(2)]
     pack = compile_minimax_kv_pack_aot(heads=heads)
-    pack.launch(key, value, torch.arange(context, dtype=torch.int64, device="cuda"), *packed,
-                scalars=(context,))
-    for mode in ("decode", "extend"):
+    scaled_records = "record_bytes" in pack.geometry
+    desc = torch.ones((max(args.rows), heads), device="cuda")
+    if args.attention_kv == "bf16":
+        packed = [x.reshape(pool, 64, heads, 128) for x in (key, value)]
+    elif scaled_records:
+        record = fp8_kv_plane_bytes(heads, 128)
+        packed = [torch.empty((context, record), dtype=torch.uint8, device="cuda") for _ in range(2)]
+        pack.launch(key, value, torch.arange(context, dtype=torch.int64, device="cuda"), *packed,
+                    scalars=(context,))
+    else:
+        packed = [x.float().clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8).reshape(pool, 64, heads, 128)
+                  for x in (key, value)]
+    for mode in args.attention_modes.split(","):
         capacity = min(64, max(args.rows)) if mode == "decode" else max(args.rows)
-        program = compile_minimax_attention_aot(max_rows=capacity, max_batch=64, mode=mode)
+        if args.attention_kv == "bf16":
+            from minimax_bf16_attention import Bf16Attention
+            from b12x._lib.compiler import compile as compile_cute, KernelCompileSpec
+            from b12x._lib.utils import make_ptr, current_cuda_stream
+            import cutlass
+            import cutlass.cute as cute
+            from b12x.integration.cuteafd._common import AotProgram, Operand, Scalar
+            adapter = Bf16Attention(capacity, 64, mode)
+            operands = [Operand("query", torch.bfloat16, "query"),
+                        Operand("key", torch.bfloat16, "key"), Operand("value", torch.bfloat16, "value")]
+            operands += [Operand(name, torch.int32, name, align=4)
+                         for name in ("table", "lengths", "offsets", "selected")]
+            operands += [Operand("output", torch.bfloat16, "output", "out"),
+                         Operand("lse", torch.float32, "lse", "out"), Operand("scratch", torch.uint8, "scratch", "scratch")]
+            scalars = [Scalar("rows"), Scalar("batch"), Scalar("stride"), Scalar("pages", "int64")]
+            pointers = [make_ptr(o.cute_dtype, 16, cute.AddressSpace.gmem, assumed_align=o.align) for o in operands]
+            compiled = compile_cute(adapter, *pointers, *(x.placeholder() for x in scalars), current_cuda_stream(),
+                compile_spec=KernelCompileSpec.from_key("bench.minimax.bf16", 1, (capacity, mode)))
+            program = AotProgram(name="bench_minimax_bf16", compiled=compiled, operands=tuple(operands),
+                                 scalars=tuple(scalars), geometry={}, scratch={"scratch":lambda rows:adapter.nbytes})
+        else:
+            program = compile_minimax_attention_aot(max_rows=capacity, max_batch=64, mode=mode)
         query = (torch.randn((capacity, 64, 128), device="cuda") * .5).bfloat16()
         output = torch.empty_like(query)
         lse = torch.empty((capacity, 64), device="cuda")
@@ -266,11 +299,24 @@ def attention_cases(args):
             cu = (torch.arange(batch + 1, dtype=torch.int32, device="cuda") if mode == "decode"
                   else torch.tensor([0, rows], dtype=torch.int32, device="cuda"))
             def launch():
-                program.launch(query, *packed, table, lengths, cu, selected, output, lse, scratch,
+                prefix = (query, *packed)
+                if args.attention_kv != "bf16" and not scaled_records:
+                    prefix += (desc, desc)
+                program.launch(*prefix, table, lengths, cu, selected, output, lse, scratch,
                                scalars=(rows, batch, pool, pool))
             launch()
             torch.cuda.synchronize()
             assert torch.isfinite(output[:rows]).all() and output[:rows].count_nonzero() > 0
+            if args.attention_kv == "bf16":
+                k = key[:2048].float().repeat_interleave(16, dim=1)
+                v = value[:2048].float().repeat_interleave(16, dim=1)
+                score = torch.einsum("hd,thd->ht", query[0].float(), k) * 128 ** -.5
+                reference = torch.einsum("ht,thd->hd", score.softmax(-1), v)
+                relative = ((output[0].float() - reference).norm() / reference.norm()).item()
+                assert relative < .01, (mode, rows, relative)
+                print(f"BF16 oracle {mode} rows={rows}: relative_l2={relative}", flush=True)
+            if args.oracle_only:
+                continue
             us, raw = measure(launch, args.iterations, args.samples)
             yield dict(kernel="attention", mode=mode, rows=rows, median_us=us,
                        us_per_row=us / rows, samples_us=raw, context=context, selected_tokens=2048)
@@ -331,6 +377,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--rows", default="1,2,4,8,16,32,64,127,257,2048,2752,4096")
     p.add_argument("--kernels", default="norm,router,kv_pack,gather")
+    p.add_argument("--attention-kv", choices=("fp8", "bf16"), default="fp8")
+    p.add_argument("--attention-modes", default="decode,extend")
+    p.add_argument("--oracle-only", action="store_true")
     p.add_argument("--gather-contexts", default="8192")
     p.add_argument("--gather-live", type=int)
     p.add_argument("--gather-page-begin", type=int, default=0)
