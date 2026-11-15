@@ -93,6 +93,16 @@ def program(request):
                                          query_heads=16 * request.param, kv_heads=request.param)
 
 
+def _inline_cache(values):
+    from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
+    pages, _, heads, dim = values.shape
+    raw = torch.zeros((pages, PAGE, fp8_kv_plane_bytes(heads, dim)), dtype=torch.uint8, device=values.device)
+    raw[..., :heads * dim] = values.contiguous().view(torch.uint8).reshape(pages, PAGE, heads * dim)
+    scales = torch.ones((pages, PAGE, heads), device=values.device)
+    raw[..., heads * dim:heads * (dim + 4)] = scales.view(torch.uint8)
+    return raw
+
+
 def _cache(generator, pages, heads=4):
     values = torch.randn((pages, PAGE, heads, 128), generator=generator, device="cuda") * 2
     return values.to(torch.float8_e4m3fn)
@@ -114,8 +124,8 @@ def test_decode_rows_match_dense_attention_across_page_fills(program, group):
         table[row, :width] = torch.tensor(order[cursor:cursor + width], dtype=torch.int32)
         cursor += width
     key, value = _cache(generator, pool, heads), _cache(generator, pool, heads)
-    k_descale = (torch.rand((batch, heads), generator=generator, device="cuda") * .5 + .25).contiguous()
-    v_descale = (torch.rand((batch, heads), generator=generator, device="cuda") * .5 + .25).contiguous()
+    k_descale = torch.ones((batch, heads), device="cuda")
+    v_descale = torch.ones((batch, heads), device="cuda")
     query = (torch.randn((batch, query_heads, 128), generator=generator, device="cuda") * .5).bfloat16()
     q2k = torch.full((heads, ROWS, 16), -1, dtype=torch.int32)
     for row, length in enumerate(lengths):
@@ -127,7 +137,7 @@ def test_decode_rows_match_dense_attention_across_page_fills(program, group):
     scratch = torch.zeros(program.scratch_bytes(ROWS)["scratch"], dtype=torch.uint8, device="cuda")
     cache_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
-    program.launch(query, key.view(torch.uint8), value.view(torch.uint8), k_descale, v_descale,
+    program.launch(query, _inline_cache(key), _inline_cache(value), k_descale, v_descale,
                    table.cuda().contiguous(), cache_lengths, cu, q2k.cuda().contiguous(), output, lse, scratch,
                    scalars=(batch, batch, table.shape[1], pool))
     torch.cuda.synchronize()
@@ -197,7 +207,7 @@ def test_half_head_attention_is_byte_exact_whole_head_slice(mode, rows):
     pool = stride = 96
     key, value = _cache(generator, pool), _cache(generator, pool)
     query = torch.randn((rows, 64, 128), generator=generator, device="cuda").bfloat16()
-    kd, vd = [torch.rand((batch, 4), generator=generator, device="cuda") + .5 for _ in range(2)]
+    kd, vd = [torch.ones((batch, 4), device="cuda") for _ in range(2)]
     table = torch.full((batch, stride), -1, dtype=torch.int32)
     selected = torch.full((4, capacity, 16), -1, dtype=torch.int32)
     picker = torch.Generator().manual_seed(20261113)
@@ -221,8 +231,8 @@ def test_half_head_attention_is_byte_exact_whole_head_slice(mode, rows):
         lse = torch.full((capacity, heads * 16), -7., device="cuda")
         scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda")
         operands = (query[:, first * 16:(first + heads) * 16].contiguous(),
-                    key[:, :, first:first + heads].contiguous().view(torch.uint8),
-                    value[:, :, first:first + heads].contiguous().view(torch.uint8),
+                    _inline_cache(key[:, :, first:first + heads]),
+                    _inline_cache(value[:, :, first:first + heads]),
                     kd[:, first:first + heads].clone(memory_format=torch.contiguous_format),
                     vd[:, first:first + heads].clone(memory_format=torch.contiguous_format),
                     table, lengths_gpu, offsets, selected[first:first + heads].contiguous())
@@ -255,7 +265,7 @@ def test_recycled_physical_pages_cross_byte_offset_boundary(boundary):
     require_b12x()
     from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
 
-    page_bytes = PAGE * 4 * 128
+    page_bytes = PAGE * 528
     high = boundary // page_bytes + 13
     pool = high + 2
     program = compile_minimax_attention_aot(max_rows=1, max_batch=1, mode="decode")
@@ -275,7 +285,11 @@ def test_recycled_physical_pages_cross_byte_offset_boundary(boundary):
     output = torch.empty_like(query)
     lse = torch.empty((1, 64), device="cuda")
     scratch = torch.empty(program.scratch_bytes(1)["scratch"], dtype=torch.uint8, device="cuda")
-    program.launch(query, key.view(torch.uint8), value.view(torch.uint8), descale, descale,
+    packed_key = torch.empty((pool, PAGE, 528), dtype=torch.uint8, device="cuda")
+    packed_value = torch.empty_like(packed_key)
+    packed_key[high:] = _inline_cache(key[high:])
+    packed_value[high:] = _inline_cache(value[high:])
+    program.launch(query, packed_key, packed_value, descale, descale,
                    table, lengths, cu, selected, output, lse, scratch,
                    scalars=(1, 1, 2, pool))
     torch.cuda.synchronize()
@@ -299,8 +313,8 @@ def test_sparse_selections_reuse_program_and_graph_with_live_shapes(mode, heads)
     query = torch.empty((ROWS, query_heads, 128), dtype=torch.bfloat16, device="cuda")
     output = torch.empty_like(query)
     lse = torch.empty((ROWS, query_heads), device="cuda")
-    kd = (torch.rand((16, heads), generator=generator, device="cuda") * .5 + .25).contiguous()
-    vd = (torch.rand((16, heads), generator=generator, device="cuda") * .5 + .25).contiguous()
+    kd = torch.ones((16, heads), device="cuda")
+    vd = torch.ones((16, heads), device="cuda")
     table = torch.full((16, stride), -1, dtype=torch.int32, device="cuda")
     cache_lengths = torch.zeros(16, dtype=torch.int32, device="cuda")
     offsets = torch.zeros(17, dtype=torch.int32, device="cuda")
@@ -333,8 +347,10 @@ def test_sparse_selections_reuse_program_and_graph_with_live_shapes(mode, heads)
                     blocks = sorted(history + [current])
                     selected[head, row, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device="cuda")
 
+        packed_key, packed_value = _inline_cache(key), _inline_cache(value)
+
         def launch():
-            program.launch(query, key.view(torch.uint8), value.view(torch.uint8), kd, vd,
+            program.launch(query, packed_key, packed_value, kd, vd,
                            table, cache_lengths, offsets, selected, output, lse, scratch,
                            scalars=(rows, batch, stride, pool))
 

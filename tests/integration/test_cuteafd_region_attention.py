@@ -78,7 +78,7 @@ def _pack_reference(values):
     return record.to(values.device), dequantized.to(values.device)
 
 
-@pytest.mark.parametrize("heads,dim", [(2, 192), (4, 192), (2, 256)])
+@pytest.mark.parametrize("heads,dim", [(2, 128), (4, 128), (2, 192), (4, 192), (2, 256)])
 def test_planar_fp8_writer_exact_bytes_zero_tail_and_graph(heads, dim):
     require_b12x()
     from b12x._lib.runtime_control import kernel_resolution_guard

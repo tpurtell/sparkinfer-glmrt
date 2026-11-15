@@ -2,8 +2,9 @@
 
 Selections retain a fixed [kv_heads,max_rows,16] allocation. pool_pages must fit
 signed Int32; physical page offsets use Int64. Cache pages contain 64
-rows; each selected 128-token block addresses two logical pages. Descales are
-per request and KV head. Output LSE is base 2, as in PagedForwardKernel.
+rows; each selected 128-token block addresses two logical pages. Each token's
+record stores E4M3 payloads and inline FP32 descales per KV head. Output LSE
+is base 2, as in PagedForwardKernel.
 """
 from __future__ import annotations
 
@@ -187,10 +188,11 @@ class _Attention:
 
 def compile_minimax_attention_aot(*, max_rows, max_batch, mode="decode", query_heads=64, kv_heads=4):
     launch = _Attention(int(max_rows), int(max_batch), mode, query_heads, kv_heads)
+    record_bytes = (kv_heads * 132 + 15) // 16 * 16
     operands = (
         Operand("query", torch.bfloat16, f"[rows,{query_heads},128]"),
-        Operand("key_cache", torch.uint8, f"[pool_pages,64,{kv_heads},128] E4M3 bytes"),
-        Operand("value_cache", torch.uint8, f"[pool_pages,64,{kv_heads},128] E4M3 bytes"),
+        Operand("key_cache", torch.uint8, f"[pool_pages,64,{record_bytes}] scaled E4M3 records"),
+        Operand("value_cache", torch.uint8, f"[pool_pages,64,{record_bytes}] scaled E4M3 records"),
         Operand("k_descale", torch.float32, f"[batch,{kv_heads}]"),
         Operand("v_descale", torch.float32, f"[batch,{kv_heads}]"),
         Operand("page_table", torch.int32, "[batch,table_stride]", align=4),
@@ -203,7 +205,8 @@ def compile_minimax_attention_aot(*, max_rows, max_batch, mode="decode", query_h
     return compile_program(launch, name=f"minimax_attention_{mode}", operands=operands,
         scalars=(Scalar("rows"), Scalar("batch"), Scalar("table_stride"), Scalar("pool_pages", "int64", "must fit signed int32 page extent")),
         key=(int(max_rows), int(max_batch), mode) + ((query_heads, kv_heads) if kv_heads != 4 else ()),
-        scratch={"scratch": lambda rows: launch.nbytes},
+        scratch={"scratch": lambda rows: launch.nbytes}, version=2,
         geometry=dict(max_rows=int(max_rows), max_batch=int(max_batch), page_rows=64,
                       query_heads=query_heads, kv_heads=kv_heads, head_dim=128, block_tokens=128,
-                      topk=16, mode=mode, softmax_scale=128 ** -0.5), doc=__doc__)
+                      topk=16, mode=mode, softmax_scale=128 ** -0.5,
+                      record_bytes=record_bytes, scale_offset=kv_heads * 128), doc=__doc__)

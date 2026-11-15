@@ -79,6 +79,7 @@ def test_fp32_router_weights_fp64_oracle_live_rows_and_replay():
 def test_half_head_kv_pack_is_byte_exact_whole_head_cache_slice(rows):
     device = require_b12x()
     from b12x.integration.cuteafd.minimax import compile_minimax_kv_pack_aot
+    from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
 
     capacity = 4096
     gen = torch.Generator(device=device).manual_seed(20261114)
@@ -95,7 +96,7 @@ def test_half_head_kv_pack_is_byte_exact_whole_head_cache_slice(rows):
                     value[:, first:first + heads].contiguous(), slots, batch_ids,
                     kd[:, first:first + heads].contiguous(), vd[:, first:first + heads].contiguous())
         frozen = [tensor.clone() for tensor in operands]
-        caches = [torch.full((capacity, heads, 128), 173, dtype=torch.uint8, device=device)
+        caches = [torch.full((capacity, fp8_kv_plane_bytes(heads, 128)), 173, dtype=torch.uint8, device=device)
                   for _ in range(2)]
         program.launch(*operands, *caches, scalars=(rows,))
         torch.cuda.synchronize()
@@ -111,27 +112,30 @@ def test_half_head_kv_pack_is_byte_exact_whole_head_cache_slice(rows):
     whole = run(0, 4)
     for first in (0, 2):
         for actual, reference in zip(run(first, 2), whole):
-            assert torch.equal(actual, reference[:, first:first + 2].contiguous()), first
+            assert torch.equal(actual[:, :256], reference[:, first * 128:(first + 2) * 128]), first
+            assert torch.equal(actual[:, 256:264], reference[:, 512 + first * 4:512 + (first + 2) * 4]), first
 
 
 @pytest.mark.parametrize("heads", [2, 4])
 @pytest.mark.parametrize("big_slot", [False, True])
-def test_kv_pack_exact_bits_descales_negative_slots_live_rows_and_replay(big_slot, heads):
+def test_kv_pack_exact_bits_scales_negative_slots_live_rows_and_replay(big_slot, heads):
     device = require_b12x()
     from b12x.integration.cuteafd.minimax import compile_minimax_kv_pack_aot
+    from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
     from b12x._lib.runtime_control import kernel_resolution_guard
 
     program = compile_minimax_kv_pack_aot(heads=heads)
     rows = 7
     k, v = [torch.randn(rows, heads, 128, device=device).bfloat16() for _ in range(2)]
     k[0].zero_()
-    base = 2**31 // (heads * 128) + 64 if big_slot else 64
+    record = fp8_kv_plane_bytes(heads, 128)
+    base = 2**31 // record + 64 if big_slot else 64
     slots = torch.tensor([base, base + 63, base + 64, -1, base + 129, base + 11, base + 130],
                          device=device, dtype=torch.int64)
     batch_ids = torch.tensor([0, 1, 2, 0, 2, 1, 0], device=device, dtype=torch.int32)
     kd = torch.tensor([[1, 0.5, 2, 0.25], [0.75, 1.5, 3, 0.125], [2.5, 0.3, 1, 0.2]], device=device)[:, :heads].contiguous()
     vd = kd.flip(0).contiguous()
-    caches = [torch.empty((base + 192, heads, 128), dtype=torch.uint8, device=device) for _ in range(2)]
+    caches = [torch.empty((base + 192, record), dtype=torch.uint8, device=device) for _ in range(2)]
     tensors = (k, v, slots, batch_ids, kd, vd, *caches)
     # Initialize only the touched tail, keeping the >2 GiB offset test cheap.
     def reset():
@@ -139,12 +143,16 @@ def test_kv_pack_exact_bits_descales_negative_slots_live_rows_and_replay(big_slo
             cache[base:].fill_(173)
 
     def check(live):
-        for value, descale, cache in zip((k, v), (kd, vd), caches):
+        for value, cache in zip((k, v), caches):
             source = value.float().cpu().numpy()
-            scales = descale[batch_ids.long()].cpu().numpy()
+            scales = np.max(np.abs(source), axis=-1) / np.float32(448)
+            scales = np.where(scales > 0, scales, np.float32(1))
             scaled = source * (np.float32(1) / scales[..., None])
-            reference = torch.from_numpy(scaled).to(torch.float8_e4m3fn).view(torch.uint8)
-            expected = torch.full((192, heads, 128), 173, dtype=torch.uint8)
+            payload = torch.from_numpy(scaled).to(torch.float8_e4m3fn).view(torch.uint8)
+            reference = torch.zeros((rows, record), dtype=torch.uint8)
+            reference[:, :heads * 128] = payload.reshape(rows, heads * 128)
+            reference[:, heads * 128:heads * 132] = torch.from_numpy(scales).view(torch.uint8)
+            expected = torch.full((192, record), 173, dtype=torch.uint8)
             for row in range(live):
                 slot = int(slots[row].item())
                 if slot >= 0:

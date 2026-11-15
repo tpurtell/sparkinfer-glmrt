@@ -194,9 +194,10 @@ def compile_minimax_router_scores_aot():
 
 
 def compile_minimax_kv_pack_aot(*, heads=4):
-    """Positive request/head descales must match attention and remain fixed."""
+    """Write immutable per-token/head scaled records, skipping negative slots."""
     if type(heads) is not int or heads not in (2, 4):
         raise ValueError("MiniMax KV pack requires 2 or 4 heads")
+    record_bytes = (heads * 132 + 15) // 16 * 16
     return compile_program(_KvPack(heads), name="minimax_kv_pack", operands=(
         Operand("k", torch.bfloat16, f"[rows,{heads},128]"),
         Operand("v", torch.bfloat16, f"[rows,{heads},128]"),
@@ -204,6 +205,8 @@ def compile_minimax_kv_pack_aot(*, heads=4):
         Operand("batch_ids", torch.int32, "[rows]"),
         Operand("k_descale", torch.float32, f"[batch,{heads}]"),
         Operand("v_descale", torch.float32, f"[batch,{heads}]"),
-        Operand("key_cache", torch.uint8, f"[pages,64,{heads},128]", "out"),
-        Operand("value_cache", torch.uint8, f"[pages,64,{heads},128]", "out")),
-        scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (), geometry=dict(heads=heads, head_dim=128, page_rows=64))
+        Operand("key_cache", torch.uint8, f"[pages,64,{record_bytes}] scaled E4M3 records", "out"),
+        Operand("value_cache", torch.uint8, f"[pages,64,{record_bytes}] scaled E4M3 records", "out")),
+        scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (), version=2,
+        geometry=dict(heads=heads, head_dim=128, page_rows=64,
+                      record_bytes=record_bytes, scale_offset=heads * 128))
