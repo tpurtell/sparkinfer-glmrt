@@ -3,8 +3,9 @@
 DSV4 584B changes QK only (PV is FP8 NoPE / BF16 RoPE). Native DSV41
 changes canonical KV staging and PV only; both arms retain BF16 QK.
 Inline-FP32-scale records (glm 656B, glmf 528B, kimi 656B with 96 or 48 heads
-and 192^-0.5) compare FP8 QK/PV with BF16 QK/PV, and also check ragged, empty
-and masked rows, slot-0 poison and row invariance on the BF16 arm.
+and 192^-0.5) compare FP8 QK/PV, BF16 QK with the FP8 kernel's two-pass FP8 PV,
+and BF16 QK/PV; they also check ragged, empty and masked rows, slot-0 poison
+and row invariance.
 Synthetic full selected sets model long-context attention, not a model forward.
 """
 from __future__ import annotations
@@ -41,12 +42,14 @@ def fork_sha():
 def arm_traits(fmt, arm):
     if fmt in INLINE:
         from b12x.attention._shared.mla.traits import with_bf16_attention
-        if arm not in ("fp8", "bf16"):
+        if arm not in ("fp8", "bf16-qk", "bf16"):
             raise ValueError((fmt, arm))
         traits = make_unified_traits(ModelType.GLM_NEXT if fmt == "glmf" else ModelType.GLM_NSA,
             ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
-        # Kimi's split kernels widen each dequantized key to BF16; its MG mode keeps that.
-        return with_bf16_attention(traits, rounded_k=fmt == "kimi") if arm == "bf16" else traits
+        if arm == "fp8":
+            return traits
+        # Kimi's split kernels widen each dequantized key to BF16; its MG modes keep that.
+        return with_bf16_attention(traits, rounded_k=fmt == "kimi", fp8_pv=arm == "bf16-qk")
     if fmt == "dsv4":
         if arm not in ("fp8-qk", "bf16-qk"):
             raise ValueError(arm)
@@ -140,6 +143,8 @@ def measure(args, report, arms, patterns):
                     record["arms"][arm].update(samples_us=samples[arm], median_us=statistics.median(samples[arm]))
                 if graphs:
                     record["second_over_first"] = record["arms"][arms[1]]["median_us"] / record["arms"][arms[0]]["median_us"]
+                    record["over_first"] = {arm: record["arms"][arm]["median_us"] / record["arms"][arms[0]]["median_us"]
+                                            for arm in arms[1:]}
             finally:
                 torch.cuda.synchronize()
                 for graph in graphs.values():
@@ -167,7 +172,7 @@ def inline_main(args):
     cache = cache.reshape(pool // 64, -1).contiguous()
     row = torch.arange(max_rows, device=device)[:, None]
     indices = (1 + (row * 37 + torch.arange(topk, device=device)[None] * 17) % (pool - 1)).int().contiguous()
-    arms = ("fp8", "bf16")
+    arms = ("fp8", "bf16-qk", "bf16")
     traits = {arm: arm_traits(args.format, arm) for arm in arms}
     report = {"format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "fork_sha": fork_sha(),
@@ -204,9 +209,9 @@ def inline_main(args):
 
     def pattern(name):
         def prepare():
-            # medium: a few dozen keys carry the mass, where score error moves the output most.
+            # medium: tens of keys carry the mass, where score error moves the output most.
             q = (torch.randn(max_rows, heads, qdim, device=device)
-                 * {"spread": .03, "medium": 1.2, "peaked": .2}[name]).bfloat16()
+                 * {"spread": .03, "medium": 1.6, "peaked": .2}[name]).bfloat16()
             if name == "peaked":
                 target = keys[indices[:, 0].long()][:, :qdim]
                 q = (q.float() + target[:, None] * (14 / sm_scale / target.square().sum(-1))[:, None, None]).bfloat16()
@@ -263,10 +268,10 @@ def inline_main(args):
     report["checks"] = checks
     print(json.dumps({"checks": checks}), flush=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
-    # The FP8 arm launched here does not zero masked V (its exports opt in), so
-    # only its record is kept; the BF16 arm always does and gates.
-    bad = [f"bf16.{key}" for key in ("empty_rows_zero", "slot0_poison_bytes_equal", "row_invariant")
-           if not checks["bf16"][key]]
+    # The FP8-PV arms launched here do not zero masked V (their exports opt
+    # in), so their poison result is recorded only; BF16 PV always zeroes it.
+    bad = [f"{arm}.{key}" for arm in arms for key in ("empty_rows_zero", "slot0_poison_bytes_equal", "row_invariant")
+           if not checks[arm][key] and (arm == "bf16" or key != "slot0_poison_bytes_equal")]
     if bad:
         raise RuntimeError(f"structural checks failed: {bad}")
     measure(args, report, arms, [pattern(name) for name in args.scores])

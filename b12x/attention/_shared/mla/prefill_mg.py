@@ -2235,19 +2235,17 @@ class UnifiedPrefillMGKernel:
                 "zero_masked_v applies to GLM ARBITRARY_FP32 records (UE8M0 "
                 "records always zero a masked candidate's V)"
             )
-        inline_fp32 = int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
-        if bool(traits.pv_bf16) != (
-            inline_fp32 and int(traits.compute_mode) == int(ComputeMode.BF16)
-        ):
+        inline_bf16 = int(traits.scale_format) == int(
+            ScaleFormat.ARBITRARY_FP32
+        ) and int(traits.compute_mode) == int(ComputeMode.BF16)
+        if (traits.pv_bf16 or traits.qk_rounded_k) and not inline_bf16:
             raise ValueError(
-                "inline-FP32-scale MG prefill is FP8 QK/PV or BF16 QK/PV "
-                "(traits.with_bf16_attention); got "
+                "pv_bf16 and qk_rounded_k qualify BF16 QK over inline-FP32-scale "
+                "records (traits.with_bf16_attention); FP8 QK has no BF16 PV. Got "
                 f"compute_mode={traits.compute_mode!r}, pv_bf16={traits.pv_bf16!r}, "
                 f"scale_format={traits.scale_format!r}"
             )
-        if traits.qk_rounded_k and not traits.pv_bf16:
-            raise ValueError("qk_rounded_k qualifies BF16 attention (pv_bf16)")
-        if traits.pv_bf16 and int(layout.mg_n_hg) != 1:
+        if inline_bf16 and int(layout.mg_n_hg) != 1:
             raise ValueError(
                 "BF16 Q for two head groups plus the 528-byte double-buffered KV "
                 "stage exceeds the SM120 shared-memory carveout; use mg_n_hg=1"
@@ -2547,10 +2545,13 @@ class UnifiedPrefillMGKernel:
         # the 432B/288B record geometry. is_glm stays true for NVFP4 so the
         # shared GLM staging (io gather / kv_sc absence / q_rope alias) applies.
         is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
-        # Inline-FP32-scale FP8 records with BF16 QK and BF16 PV: K and V are
-        # dequantized in registers (E4M3 x inline FP32 group scale) into the
-        # BF16 MMAs the UE8M0 and NVFP4 arms already use.
-        glm_bf16 = cutlass.const_expr(t.pv_bf16)
+        # Inline-FP32-scale FP8 records with BF16 QK: K (and, for pv_bf16, V)
+        # is dequantized in registers (E4M3 x inline FP32 group scale) into the
+        # BF16 MMAs the UE8M0 and NVFP4 arms already use. Without pv_bf16 the
+        # FP8 kernel's two-pass E4M3 W.V follows the BF16 QK.
+        glm_bf16 = cutlass.const_expr(
+            bf16_qk and t.scale_format == ScaleFormat.ARBITRARY_FP32
+        )
         dsv41_fp8_pv = cutlass.const_expr(
             t.model_type == ModelType.DSV41 and t.fp8_internal
         )
@@ -3637,7 +3638,7 @@ class UnifiedPrefillMGKernel:
                             sm_p_stride=L.sm_p_full_stride,
                             latent_scale_per_token=t.latent_scale_per_token,
                         )
-                elif cutlass.const_expr(glm_bf16):
+                elif cutlass.const_expr(t.pv_bf16):
                     # BF16 P.V over E4M3 V x inline FP32 group scale. A masked
                     # candidate stages record slot 0 and is weighted by zero;
                     # zero its V and scales first (0 x NaN = NaN). S4's barriers
@@ -4268,8 +4269,8 @@ def _sparse_mla_prefill_mg_flat_launch(
             "out_lse", lse_out, dims=(DimKey.dynamic(), DimKey.exact(total_heads))
         ),
     ]
-    if traits.pv_bf16:
-        spec_fields.append(key_field("pv_bf16", 1))
+    if traits.pv_bf16 or traits.qk_rounded_k:
+        spec_fields.append(key_field("pv_bf16", int(traits.pv_bf16)))
         spec_fields.append(key_field("qk_rounded_k", int(traits.qk_rounded_k)))
     if active_heads != total_heads or head_offset != 0:
         spec_fields.extend(
@@ -4733,7 +4734,7 @@ def run_unified_prefill_mg(
         and active_heads == total_heads
         and head_offset == 0
         and not traits.fp8_internal
-        and not traits.pv_bf16
+        and not (traits.pv_bf16 or traits.qk_rounded_k)
         and prepared is None
         and not compile_only_launches_enabled()
     ):

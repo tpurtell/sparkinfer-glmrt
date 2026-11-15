@@ -54,14 +54,16 @@ def test_inline_fp32_modes_preserve_cache_format(fmt, model, stride):
     from b12x.attention._shared.mla.smem import SM120_SMEM_CARVEOUT_BYTES
     from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg, max_mg_head_groups
 
-    fp8, bf16 = arm_traits(fmt, "fp8"), arm_traits(fmt, "bf16")
-    assert fp8.model_type == bf16.model_type == model
-    assert fp8.kv_gmem_stride == bf16.kv_gmem_stride == stride
+    fp8, middle, bf16 = (arm_traits(fmt, arm) for arm in ("fp8", "bf16-qk", "bf16"))
+    assert fp8.model_type == middle.model_type == bf16.model_type == model
+    assert fp8.kv_gmem_stride == middle.kv_gmem_stride == bf16.kv_gmem_stride == stride
     assert (fp8.compute_mode, fp8.pv_bf16) == (ComputeMode.FP8, False)
+    assert (middle.compute_mode, middle.pv_bf16) == (ComputeMode.BF16, False)
     assert (bf16.compute_mode, bf16.pv_bf16) == (ComputeMode.BF16, True)
-    assert bf16.qk_rounded_k == (fmt == "kimi") and not fp8.qk_rounded_k
-    assert (max_mg_head_groups(fp8), max_mg_head_groups(bf16)) == (2, 1)
-    assert make_smem_layout_mg(bf16, 1).total_bytes < SM120_SMEM_CARVEOUT_BYTES
+    assert bf16.qk_rounded_k == middle.qk_rounded_k == (fmt == "kimi") and not fp8.qk_rounded_k
+    assert [max_mg_head_groups(t) for t in (fp8, middle, bf16)] == [2, 1, 1]
+    for traits in (middle, bf16):
+        assert make_smem_layout_mg(traits, 1).total_bytes < SM120_SMEM_CARVEOUT_BYTES
 
 
 def test_inline_defaults_and_mixed_mode_rejected(tmp_path):
@@ -75,14 +77,16 @@ def test_inline_defaults_and_mixed_mode_rejected(tmp_path):
     with pytest.raises(SystemExit):
         parse_args(["--format", "glm", "--selected", "2049", "--output", str(tmp_path / "o.json")])
     with pytest.raises(ValueError):
-        arm_traits("glm", "bf16-qk")
+        arm_traits("glm", "fp8-qk/bf16-pv")
     shape = dict(page_block_size=64, num_tiles=32, replicate_h=4, num_heads=64, q_stride=(64 * 576, 576, 1),
                  indices_stride0=2048, output_stride=(64 * 512, 512, 1), out_lse_stride=(64, 1), has_sink=False,
                  topk=2048)
-    for traits in (replace(arm_traits("glm", "bf16"), pv_bf16=False),          # BF16 QK / FP8 PV
-                   replace(arm_traits("glm", "fp8"), pv_bf16=True)):           # FP8 QK / BF16 PV
-        with pytest.raises(ValueError, match="FP8 QK/PV or BF16 QK/PV"):
+    for traits in (replace(arm_traits("glm", "fp8"), pv_bf16=True),            # FP8 QK / BF16 PV
+                   replace(arm_traits("glm", "fp8"), qk_rounded_k=True)):
+        with pytest.raises(ValueError, match="FP8 QK has no BF16 PV"):
             UnifiedPrefillMGKernel(traits, make_smem_layout_mg(traits, 1), **shape)
-    bf16 = arm_traits("glm", "bf16")
-    with pytest.raises(ValueError, match="mg_n_hg=1"):
-        UnifiedPrefillMGKernel(bf16, make_smem_layout_mg(bf16, 2), **{**shape, "replicate_h": 2})
+    for arm in ("bf16-qk", "bf16"):
+        traits = arm_traits("glm", arm)
+        UnifiedPrefillMGKernel(traits, make_smem_layout_mg(traits, 1), **shape)
+        with pytest.raises(ValueError, match="mg_n_hg=1"):
+            UnifiedPrefillMGKernel(traits, make_smem_layout_mg(traits, 2), **{**shape, "replicate_h": 2})

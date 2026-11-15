@@ -89,14 +89,15 @@ class UnifiedMLATraits:
     # This is not a cache ABI change: it exists only after the gathered row is
     # owned by the math CTA.
     fp8_internal: bool = False
-    # Inline-FP32-scale (ARBITRARY_FP32) records only, with ComputeMode.BF16:
-    # P.V runs as a BF16 MMA over V dequantized in registers (E4M3 x its inline
-    # FP32 group scale) instead of the two-pass E4M3 W.V. False keeps every
-    # existing specialization's layout and PTX.
+    # Inline-FP32-scale (ARBITRARY_FP32) records only, with ComputeMode.BF16
+    # (BF16 Q, FP32-accumulated QK): P.V runs as a BF16 MMA over V dequantized
+    # in registers (E4M3 x its inline FP32 group scale) instead of the two-pass
+    # E4M3 W.V. False keeps every existing specialization's layout and PTX.
     pv_bf16: bool = False
-    # With pv_bf16: K is dequantized to BF16 before the QK MMA, rounding each
-    # key as Kimi's split kernels do. False feeds K as its exact BF16 widening
-    # and applies the FP32 group scale to each group's FP32 partial.
+    # Same records and compute mode: K is dequantized to BF16 before the QK
+    # MMA, rounding each key as Kimi's split kernels do. False feeds K as its
+    # exact BF16 widening and applies the FP32 group scale to each group's
+    # FP32 partial.
     qk_rounded_k: bool = False
 
 
@@ -441,14 +442,15 @@ def infer_model_type(
 
 
 def with_bf16_attention(
-    traits: UnifiedMLATraits, *, rounded_k: bool = False
+    traits: UnifiedMLATraits, *, rounded_k: bool = False, fp8_pv: bool = False
 ) -> UnifiedMLATraits:
-    """BF16 QK and BF16 PV over an inline-FP32-scale FP8 record.
+    """BF16 QK, and BF16 PV unless ``fp8_pv``, over an inline-FP32-scale FP8 record.
 
     The record, its staging stride and the cache ABI are unchanged: Q stays
     BF16, K and V are dequantized in registers (E4M3 x inline FP32 group
     scale), P is BF16 and both products accumulate in FP32. ``rounded_k``
-    rounds the dequantized K to BF16 (see ``qk_rounded_k``).
+    rounds the dequantized K to BF16 (see ``qk_rounded_k``). ``fp8_pv`` keeps
+    the FP8 kernel's two-pass E4M3 W.V after the BF16 QK.
     """
     if int(traits.scale_format) != int(ScaleFormat.ARBITRARY_FP32):
         raise ValueError(
@@ -456,7 +458,10 @@ def with_bf16_attention(
             f"got scale_format={traits.scale_format!r}"
         )
     return replace(
-        traits, compute_mode=ComputeMode.BF16, pv_bf16=True, qk_rounded_k=bool(rounded_k)
+        traits,
+        compute_mode=ComputeMode.BF16,
+        pv_bf16=not fp8_pv,
+        qk_rounded_k=bool(rounded_k),
     )
 
 
