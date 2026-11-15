@@ -34,7 +34,7 @@ class NativeV41Attention:
             topk=128, extra_topk=512, q_stride=(heads*512, 512, 1),
             swa_indices_stride0=512, extra_indices_stride0=512,
             mid_out_stride=(heads*5120, 5120, 512, 1), mid_lse_stride=(heads*10, 10, 1),
-            has_extra=True, pbs_extra=256, valid_hpb=16)
+            has_extra=True, pbs_extra=256, valid_hpb=16, vector_q=True)
         self.merge = SparseMLASplitDecodeSinkMergeKernel(static_num_chunks=10)
 
     @cute.jit
@@ -67,4 +67,4 @@ def compile_native_v41_attention_aot(heads: int = 64):
     pointers = tuple(make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
                      for dtype, align in zip(types, alignments))
     return compile_cute(launch, *pointers, Int32(1), current_cuda_stream(),
-                        compile_spec=KernelCompileSpec.from_key("attention.native_v41", 2, key))
+                        compile_spec=KernelCompileSpec.from_key("attention.native_v41", 3, key))
