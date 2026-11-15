@@ -530,17 +530,20 @@ class V41SliceFc1Kernel:
         self.threads = 128 * fc1_k_splits
         self.row_major_resident = bool(row_major_resident)
         slot_bytes = fc1_k_splits * (width * 128 + max(width * 2, 256) * 4)
-        # Two-stage weight staging keeps the next K tile's copies in flight
-        # while the current tile's MMAs run. Arithmetic, copy order and the
-        # K accumulation order are unchanged; configurations where the second
-        # slot would exceed the established budget keep the single-slot
-        # schedule.
-        # Decode-only: prefill capacities keep the original single slot so
-        # their resident-CTA count cannot change.
-        self.two_stage = (capacity <= 80
-                          and 2 * slot_bytes + 16 * width * 4 <= 96 * 1024)
-        self.shared_bytes = ((2 if self.two_stage else 1) * slot_bytes
-                             + 16 * width * 4)
+        # A ring of shared weight slots keeps the next tiles' copies in flight
+        # while the current tile's MMAs run. Arithmetic, copy order and the K
+        # accumulation order are unchanged. Decode-only: prefill capacities
+        # keep the single slot so their resident-CTA count cannot change, and
+        # the ring depth is the largest that fits the established budget.
+        budget = 96 * 1024 - 16 * width * 4
+        self.stages = 1
+        if capacity <= 80:
+            for depth in range(4, 0, -1):
+                if depth * slot_bytes <= budget:
+                    self.stages = depth
+                    break
+        self.two_stage = self.stages > 1
+        self.shared_bytes = self.stages * slot_bytes + 16 * width * 4
         assert self.shared_bytes <= 96 * 1024, "FC1 split exceeds shared-memory budget"
         self.a16 = activation_precision == "a16"
         self.swiglu_limit = float(swiglu_limit)
@@ -740,8 +743,8 @@ class V41SliceFc1Kernel:
             input_scale = Int32(metadata[group, 3 + g + c * 8]) // Int32(self.topk)
         if rows > 0:
             start = slice_id * Int32(self.width)
-            pipeline = self.two_stage and not self.row_major_resident
-            stages = 2 if pipeline else 1
+            stages = (min(self.stages, self.hidden_tiles // (self.k_splits * self.cta_splits))
+                      if not self.row_major_resident else 1)
             smem = cutlass.utils.SmemAllocator()
             b = smem.allocate_tensor(
                 Uint32, cute.make_layout(stages * self.k_splits * self.width * 32), byte_alignment=16
@@ -776,34 +779,44 @@ class V41SliceFc1Kernel:
             # while the current tile's MMAs run; write order, K order and the
             # in-register accumulation are identical. Splits whose second slot
             # would exceed the shared budget keep the original single slot.
-            if cutlass.const_expr(pipeline):
-                self.stage_fc1_tile(w13, s13, raw, b, sf, expert, start,
-                                    cute.arch.block_idx()[2] * Int32(self.k_splits) + team,
-                                    team_tid, bb, sb, bbase, sbase)
+            # Ring depth `stages` keeps stages-1 tiles' copies in flight; the
+            # depth is sized by the device's FC1 shared budget.
+            for warmup in range(stages - 1):
+                warmup_kt = ((warmup * Int32(self.cta_splits)
+                              + cute.arch.block_idx()[2]) * Int32(self.k_splits) + team)
+                warmup_base = Int32(warmup * self.k_splits) + team
+                self.stage_fc1_tile(
+                    w13, s13, raw, b, sf, expert, start, warmup_kt, team_tid,
+                    b_addr + warmup_base * Int32(self.width * 128),
+                    s_addr + warmup_base * Int32(max(self.width * 2, 256) * 4),
+                    warmup_base * Int32(self.width * 32),
+                    warmup_base * Int32(max(self.width * 2, 256)))
                 cute.arch.cp_async_commit_group()
             for step in range(steps):
                 kt = ((step * Int32(self.cta_splits) + cute.arch.block_idx()[2])
                       * Int32(self.k_splits) + team)
-                if cutlass.const_expr(pipeline):
-                    slot = Int32(step % 2)
-                    next_base = Int32((step + 1) % 2) * Int32(self.k_splits) + team
-                    if step + 1 < steps:
+                if cutlass.const_expr(stages > 1):
+                    slot = Int32(step % stages)
+                    ahead = step + stages - 1
+                    next_base = Int32(ahead % stages) * Int32(self.k_splits) + team
+                    if ahead < steps:
                         self.stage_fc1_tile(
                             w13, s13, raw, b, sf, expert, start,
-                            kt + Int32(self.cta_splits * self.k_splits), team_tid,
+                            kt + Int32((stages - 1) * self.cta_splits * self.k_splits),
+                            team_tid,
                             b_addr + next_base * Int32(self.width * 128),
                             s_addr + next_base * Int32(max(self.width * 2, 256) * 4),
                             next_base * Int32(self.width * 32),
                             next_base * Int32(max(self.width * 2, 256)))
                 else:
+                    slot = Int32(0)
                     self.stage_fc1_tile(w13, s13, raw, b, sf, expert, start, kt,
                                         team_tid, bb, sb, bbase, sbase)
                 cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(1 if pipeline else 0)
+                cute.arch.cp_async_wait_group(stages - 1)
                 cute.arch.sync_threads()
-                if cutlass.const_expr(pipeline):
-                    bbase = (slot * Int32(self.k_splits) + team) * Int32(self.width * 32)
-                    sbase = (slot * Int32(self.k_splits) + team) * Int32(max(self.width * 2, 256))
+                bbase = (slot * Int32(self.k_splits) + team) * Int32(self.width * 32)
+                sbase = (slot * Int32(self.k_splits) + team) * Int32(max(self.width * 2, 256))
                 if cutlass.const_expr(self.a16):
                     for kb in cutlass.range_constexpr(4):
                         for half in cutlass.range_constexpr(2):
@@ -1069,10 +1082,12 @@ class V41SliceFc2Kernel:
         self.row_major_resident = bool(row_major_resident)
         self.scale_codes = bool(scale_codes)
         # One N128 output tile's K slice is staged at a time; at decode
-        # capacity a second small weight slot lets the next slice's copies run
+        # capacity a ring of small weight slots lets later slices' copies run
         # under the current slice's MMAs without changing slice or K order.
         # Prefill keeps the original single slot.
-        self.two_stage = capacity <= 80
+        self.stages = (min(4, (intermediate + width - 1) // width)
+                       if capacity <= 80 else 1)
+        self.two_stage = self.stages > 1
         self.kernel_intermediate = intermediate if self.exact_storage else (intermediate + 127) // 128 * 128
         self.w2_intermediate = self.kernel_intermediate
         self.w2_scale_columns = intermediate // 32
@@ -1195,8 +1210,7 @@ class V41SliceFc2Kernel:
                 route_lo = Int64(metadata[group, 3 + g])
             if g + 8 < rows:
                 route_hi = Int64(metadata[group, 3 + g + 8])
-            pipeline = self.two_stage and not self.row_major_resident
-            stages = 2 if pipeline else 1
+            stages = self.stages if not self.row_major_resident else 1
             smem = cutlass.utils.SmemAllocator()
             b = smem.allocate_tensor(
                 Uint32, cute.make_layout(stages * self.width * 16), byte_alignment=16
@@ -1245,20 +1259,26 @@ class V41SliceFc2Kernel:
                 ot = output_begin + local_ot
                 total = cute.make_rmem_tensor((4, 4), Float32)
                 total.fill(0)
-                if cutlass.const_expr(pipeline):
-                    self.stage_fc2_slice(w2, s2, raw, b, sf, expert, ot, Int32(0), tid, bb)
+                for warmup in range(stages - 1):
+                    warmup_scales = cute.make_tensor(
+                        sf.iterator + Int32(warmup * max(self.width * 2, 256)),
+                        cute.make_layout(max(self.width * 2, 256)))
+                    self.stage_fc2_slice(w2, s2, raw, b, warmup_scales, expert, ot,
+                                         Int32(warmup), tid,
+                                         bb + Int32(warmup * self.width * 64))
                     cute.arch.cp_async_commit_group()
                 for slice_id in range(self.slices):
-                    if cutlass.const_expr(pipeline):
-                        slot = Int32(slice_id % 2)
-                        next_slot = Int32((slice_id + 1) % 2)
-                        if slice_id + 1 < self.slices:
+                    if cutlass.const_expr(stages > 1):
+                        slot = Int32(slice_id % stages)
+                        ahead = slice_id + stages - 1
+                        next_slot = Int32(ahead % stages)
+                        if ahead < self.slices:
                             next_scales = cute.make_tensor(
                                 sf.iterator + next_slot * Int32(max(self.width * 2, 256)),
                                 cute.make_layout(max(self.width * 2, 256)))
                             self.stage_fc2_slice(
                                 w2, s2, raw, b, next_scales, expert, ot,
-                                slice_id + Int32(1), tid,
+                                slice_id + Int32(stages - 1), tid,
                                 bb + next_slot * Int32(self.width * 64))
                     else:
                         slot = Int32(0)
@@ -1283,7 +1303,7 @@ class V41SliceFc2Kernel:
                                     qs[0, r_idx, w_idx] = Uint32(partial_u32[qs_base + Int64(idx)])
                                 else:
                                     qs[0, r_idx, w_idx] = Uint32(0)
-                    cute.arch.cp_async_wait_group(1 if pipeline else 0)
+                    cute.arch.cp_async_wait_group(stages - 1)
                     cute.arch.sync_threads()
                     b_slot = cute.make_tensor(
                         b.iterator + slot * Int32(self.width * 16),
