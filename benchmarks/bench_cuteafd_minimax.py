@@ -50,6 +50,8 @@ class NvmlWindow:
                 power_w=self._read(lambda: n.nvmlDeviceGetPowerUsage(h) / 1000),
                 power_limit_w=self._read(lambda: n.nvmlDeviceGetEnforcedPowerLimit(h) / 1000),
                 temperature_c=self._read(lambda: n.nvmlDeviceGetTemperature(h, n.NVML_TEMPERATURE_GPU)),
+                t_limit_headroom_c=(self._read(lambda: n.nvmlDeviceGetMarginTemperature(h))
+                                    if hasattr(n, "nvmlDeviceGetMarginTemperature") else None),
                 sm_clock_mhz=self._read(lambda: n.nvmlDeviceGetClockInfo(h, n.NVML_CLOCK_SM)),
                 memory_clock_mhz=self._read(lambda: n.nvmlDeviceGetClockInfo(h, n.NVML_CLOCK_MEM)),
                 throttle_reasons=self._read(lambda: n.nvmlDeviceGetCurrentClocksThrottleReasons(h)),
