@@ -17,8 +17,10 @@ def _quantize(records, heads):
     """Independent QDQ oracle after Muse's checkpoint BF16 boundaries."""
     kv = records.reshape(-1, 2, heads, 64).float()
     amax = kv.abs().amax(-1)
-    scales = torch.where(amax > 0, amax / 448, torch.ones_like(amax))
-    payload = (kv * scales.reciprocal()[..., None]).to(torch.float8_e4m3fn)
+    # Match div.rn.f32 rather than CUDA's approximate reciprocal optimization.
+    scales = torch.where(amax > 0, (amax.double() / 448).float(), torch.ones_like(amax))
+    inverse = (1.0 / scales.double()).float()
+    payload = (kv * inverse[..., None]).to(torch.float8_e4m3fn)
     packed = torch.cat((payload.view(torch.uint8).flatten(1),
                         scales.contiguous().view(torch.uint8).flatten(1)), dim=1)
     qdq = (payload.float() * scales[..., None]).bfloat16().flatten(1)
@@ -59,7 +61,7 @@ def test_muse_fp8_kv_record_exact(heads, kind, rows):
     expected[slots] = _quantize(bf16[slots], kv_heads)[0]
     new.launch(*args, new_q, fp8, scalars=[rows])
     assert torch.equal(new_q, old_q)
-    assert torch.equal(fp8, expected), int((fp8 != expected).sum())
+    assert torch.equal(fp8, expected), (int((fp8 != expected).sum()), torch.nonzero(fp8 != expected)[:16].tolist())
     saved = fp8.clone()
     new.launch(q, k, v, positions, cos, sin, torch.full_like(slots, -1), new_q, fp8, scalars=[rows])
     assert torch.equal(fp8, saved)
