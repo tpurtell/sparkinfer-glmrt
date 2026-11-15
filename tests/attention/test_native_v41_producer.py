@@ -7,6 +7,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from cuda.bindings import driver as cuda
 import torch
+import pytest
 
 from b12x.attention._shared.mla.compressed_reference import pack_deepseek_v41_cache_reference as pack
 from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
@@ -15,7 +16,8 @@ from b12x.attention._shared.mla.smem import make_smem_layout
 from tests.conftest import require_b12x
 
 
-def test_native_producer_all_sources_and_graph_replay():
+@pytest.mark.parametrize("fp8_internal", [False, True])
+def test_native_producer_all_sources_and_graph_replay(fp8_internal):
     require_b12x()
     torch.manual_seed(4151)
     rows = 3
@@ -45,8 +47,9 @@ def test_native_producer_all_sources_and_graph_replay():
     partials = [torch.empty(rows, 64, 10, 512, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
     lses = [torch.empty(rows, 64, 10, device="cuda") for _ in range(2)]
     traits = make_unified_traits(ModelType.DSV41, ComputeMode.FP8, ScaleFormat.NVFP4_E4M3, fp8_rope=False)
-    traits = replace(traits, compute_mode=ComputeMode.FP8, fp8_internal=True,
-                     q_nope_stride=528, kv_smem_stride=624, nt_per_warp_xv=traits.nt_per_warp_xv*2)
+    if fp8_internal:
+        traits = replace(traits, compute_mode=ComputeMode.FP8, fp8_internal=True,
+                         q_nope_stride=528, kv_smem_stride=624, nt_per_warp_xv=traits.nt_per_warp_xv*2)
 
     def kernel(swa_stride):
         return UnifiedDecodeKernel(traits, make_smem_layout(traits), 64, 1,
@@ -54,7 +57,7 @@ def test_native_producer_all_sources_and_graph_replay():
             topk=128, extra_topk=512, q_stride=q.stride(), swa_indices_stride0=swa_stride,
             extra_indices_stride0=512, mid_out_stride=partials[0].stride(),
             mid_lse_stride=lses[0].stride(), has_extra=True, pbs_extra=256,
-            valid_hpb=16, native_dsv41_fp8=True)
+            valid_hpb=16, native_dsv41_fp8=fp8_internal)
 
     nt = tuple(from_dlpack(x) for x in (q, descriptors, metadata, selected, bounds, partials[0], lses[0]))
     ut = tuple(from_dlpack(x) for x in (q, swa.flatten(), swa_indices, partials[1], lses[1]))
@@ -107,6 +110,9 @@ def test_native_producer_all_sources_and_graph_replay():
     check(invalid_row=True)
     assert torch.isneginf(lses[0][1]).all()
     assert torch.equal(partials[0][1], torch.zeros_like(partials[0][1]))
+
+    if fp8_internal:
+        return
 
     # Static 32-head TP2 AOT geometry must preserve the 64-head producer and
     # sink merge, including invalid requests and live row-count transitions.

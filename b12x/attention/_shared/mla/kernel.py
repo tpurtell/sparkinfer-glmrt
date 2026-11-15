@@ -59,7 +59,17 @@ from .decode_math import (
     s7_epilogue,
 )
 from .io import io_issue_gather, io_issue_gather_packed, io_issue_packed_payload
-from .native_v41_records import issue_native_v41_gather, native_v41_metadata_valid
+from .native_v41_records import (
+    DSV41_BF16_RAW_ROW_OFFSET,
+    DSV41_BF16_TILE_ROW_STRIDE,
+    decode_dsv41_kv_to_bf16_smem,
+    issue_native_v41_gather,
+    native_v41_metadata_valid,
+    s0_load_q_bf16_vec,
+    s1_qk_dsv41_bf16_smem,
+    s5_fill_sm_p_bf16,
+    s6_pv_dsv41_bf16_smem,
+)
 from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import (
     ComputeMode,
@@ -454,6 +464,10 @@ class UnifiedDecodeKernel:
         # V4 uses two H8 groups per H16 CTA; V4.1 schedules independent H8 CTAs.
         self.native_dsv4_h16 = bool(native_dsv4_h16)
         self.native_dsv41_fp8 = bool(native_dsv41_fp8)
+        self.dsv41_bf16_tile = bool(
+            int(traits.model_type) == int(ModelType.DSV41)
+            and not self.native_dsv41_fp8
+        )
         self.native_h16 = self.native_dsv4_h16 or (
             self.native_dsv41_fp8 and int(valid_hpb) == 16
         )
@@ -498,6 +512,12 @@ class UnifiedDecodeKernel:
             vector_q
             and not self.native_h16
             and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
+        )
+        self.vector_q_bf16 = bool(
+            vector_q
+            and self.dsv41_bf16_tile
+            and not self.native_h16
+            and int(traits.d_rope) == 0
         )
         self.vector_q_hpb = 8 if self.native_h8 else int(traits.hpb)
         # A masked candidate stages record slot 0 (the producer copies row 0
@@ -761,7 +781,7 @@ class UnifiedDecodeKernel:
                         sm_scale_log2: Float32, rows: Int32, stream: cuda.CUstream):
         # Internal native entry: host binding must validate FP4 descriptors,
         # aligned planes, live-row bounds and disjoint caller-owned scratch.
-        assert self.native_dsv41_fp8 and self.valid_hpb == 16
+        assert self.traits.model_type == ModelType.DSV41 and self.valid_hpb == 16
         assert self.topk == 128 and self.extra_topk == 512
         assert self.chunks_per_split == 1 and self.num_splits == 10
         assert self.swa_indices_stride_row == self.extra_indices_stride_row
@@ -1012,6 +1032,10 @@ class UnifiedDecodeKernel:
 
         # Match the single-cache body's allocation-preserving packed H8 layout.
         staged_kv_stride = t.kv_smem_stride
+        kv_raw_addr = kv_fp8_addr
+        if cutlass.const_expr(self.dsv41_bf16_tile):
+            staged_kv_stride = DSV41_BF16_TILE_ROW_STRIDE
+            kv_raw_addr = kv_fp8_addr + Int32(DSV41_BF16_RAW_ROW_OFFSET)
         if cutlass.const_expr(self.native_glm_h8 or self.packed_glm_generic):
             staged_kv_stride = _GLM_KV_GMEM_STRIDE
         if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
@@ -1029,9 +1053,9 @@ class UnifiedDecodeKernel:
             kv_rope_buf = kv_fp8_buf
         tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
 
-        # mbarrier array: full[0], full[1], empty[0], empty[1] (u64 each).
+        # mbarrier array: full[0..n_buf-1], empty[0..n_buf-1] (u64 each).
         mbar_base = st.mbar.data_ptr()
-        n_buf = int(L.kv_bufs)
+        n_buf = 1 if self.dsv41_bf16_tile else int(L.kv_bufs)
 
         # swa_indices for THIS token row: a 1-D (topk,) slice.
         # ZERO-WIDTH MAIN (DSV4 dual-cache, all KV in the EXTRA cache):
@@ -1122,6 +1146,20 @@ class UnifiedDecodeKernel:
                     num_threads=self.math_threads,
                     barrier_id=2,
                     hpb_local=self.vector_q_hpb,
+                )
+        elif cutlass.const_expr(self.vector_q_bf16):
+            if not is_io:
+                s0_load_q_bf16_vec(
+                    q_token,
+                    q_fp8_addr,
+                    head_base,
+                    tid,
+                    d_nope=t.d_nope,
+                    hpb=t.hpb,
+                    valid_hpb_static=self.valid_hpb,
+                    q_nope_bf16_stride=t.q_nope_stride,
+                    num_threads=self.math_threads,
+                    barrier_id=2,
                 )
         pre_idx0 = Int32(-1)
         pre_idx1 = Int32(-1)
@@ -1268,7 +1306,7 @@ class UnifiedDecodeKernel:
                 if cutlass.const_expr(has_extra):
                     if active_idx >= main_chunk_count:
                         ci = extra_first_chunk + active_idx - main_chunk_count
-                buf = Int32(lc) & Int32(1)
+                buf = Int32(0) if cutlass.const_expr(self.dsv41_bf16_tile) else (Int32(lc) & Int32(1))
 
                 cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
 
@@ -1319,16 +1357,18 @@ class UnifiedDecodeKernel:
                         issue_native_v41_gather(
                             native_descriptors[token_idx, None], native_metadata[token_idx, None],
                             extra_row, native_bounds[token_idx],
-                            kv_fp8_addr + buf * kv_fp8_buf, kv_sc_addr + buf * kv_sc_buf,
+                            kv_raw_addr + buf * kv_fp8_buf, kv_sc_addr + buf * kv_sc_buf,
                             tok_buf_view, mbar_base + buf, (ci - num_main_chunks) * Int32(64), io_lane,
-                            swa=False, kv_stride=staged_kv_stride, io_threads=self.io_threads)
+                            swa=False, kv_stride=staged_kv_stride, io_threads=self.io_threads,
+                            fp8_internal=self.native_dsv41_fp8)
                     else:
                         issue_native_v41_gather(
                             native_descriptors[token_idx, None], native_metadata[token_idx, None],
                             extra_row, native_bounds[token_idx],
-                            kv_fp8_addr + buf * kv_fp8_buf, kv_sc_addr + buf * kv_sc_buf,
+                            kv_raw_addr + buf * kv_fp8_buf, kv_sc_addr + buf * kv_sc_buf,
                             tok_buf_view, mbar_base + buf, ci * Int32(64), io_lane,
-                            swa=True, kv_stride=staged_kv_stride, io_threads=self.io_threads)
+                            swa=True, kv_stride=staged_kv_stride, io_threads=self.io_threads,
+                            fp8_internal=self.native_dsv41_fp8)
                 elif cutlass.const_expr(has_extra):
                     if ci >= num_main_chunks:
                         cis = ci - num_main_chunks
@@ -1359,7 +1399,7 @@ class UnifiedDecodeKernel:
                             io_issue_gather(
                                 extra_kv_cache_u8,
                                 extra_row,
-                                kv_fp8_addr + buf * kv_fp8_buf,
+                                kv_raw_addr + buf * kv_fp8_buf,
                                 kv_rope_addr + buf * kv_rope_buf,
                                 kv_sc_addr + buf * kv_sc_buf,
                                 tok_buf_view,
@@ -1400,7 +1440,7 @@ class UnifiedDecodeKernel:
                             io_issue_gather(
                                 kv_cache_u8,
                                 topk_row,
-                                kv_fp8_addr + buf * kv_fp8_buf,
+                                kv_raw_addr + buf * kv_fp8_buf,
                                 kv_rope_addr + buf * kv_rope_buf,
                                 kv_sc_addr + buf * kv_sc_buf,
                                 tok_buf_view,
@@ -1440,7 +1480,7 @@ class UnifiedDecodeKernel:
                         io_issue_gather(
                             kv_cache_u8,
                             topk_row,
-                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_raw_addr + buf * kv_fp8_buf,
                             kv_rope_addr + buf * kv_rope_buf,
                             kv_sc_addr + buf * kv_sc_buf,
                             tok_buf_view,
@@ -1504,7 +1544,7 @@ class UnifiedDecodeKernel:
                     cute.make_layout(int(L.w_head_sc_bytes // 4)),
                 )
 
-            if cutlass.const_expr(self.vector_q):
+            if cutlass.const_expr(self.vector_q or self.vector_q_bf16):
                 pass
             elif cutlass.const_expr(
                 t.scale_format == ScaleFormat.NVFP4_E4M3 and not self.native_dsv41_fp8
@@ -1556,7 +1596,7 @@ class UnifiedDecodeKernel:
                     if active_idx >= main_chunk_count:
                         ci = extra_first_chunk + active_idx - main_chunk_count
                 split_cand_start = ci * Int32(_CAND_WINDOW)
-                buf = Int32(lc) & Int32(1)
+                buf = Int32(0) if cutlass.const_expr(self.dsv41_bf16_tile) else (Int32(lc) & Int32(1))
 
                 kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
                 kv_rope_b = kv_rope_addr + buf * kv_rope_buf
@@ -1580,6 +1620,41 @@ class UnifiedDecodeKernel:
                 global_sum = [gsum_frag[0], gsum_frag[1]]
 
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
+                if cutlass.const_expr(self.dsv41_bf16_tile):
+                    if cutlass.const_expr(has_extra):
+                        if ci >= num_main_chunks:
+                            decode_dsv41_kv_to_bf16_smem(
+                                kv_fp8_b,
+                                warp_id,
+                                lane,
+                                swa=False,
+                                bi=t.bi,
+                                row_stride=staged_kv_stride,
+                                raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                                math_warps=self.math_threads // 32,
+                            )
+                        else:
+                            decode_dsv41_kv_to_bf16_smem(
+                                kv_fp8_b,
+                                warp_id,
+                                lane,
+                                swa=True,
+                                bi=t.bi,
+                                row_stride=staged_kv_stride,
+                                raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                                math_warps=self.math_threads // 32,
+                            )
+                    else:
+                        decode_dsv41_kv_to_bf16_smem(
+                            kv_fp8_b,
+                            warp_id,
+                            lane,
+                            swa=True,
+                            bi=t.bi,
+                            row_stride=staged_kv_stride,
+                            raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                            math_warps=self.math_threads // 32,
+                        )
                 if cutlass.const_expr(self.native_dsv41_fp8):
                     s0_normalize_dsv41_kv_to_fp8(
                         kv_fp8_b,
@@ -1784,18 +1859,30 @@ class UnifiedDecodeKernel:
                             packed_footer_words=self.native_h16 or self.native_dsv41_fp8,
                         )
                 else:
-                    qk = s1_qk_nope_block_scaled(
-                        qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
-                        warp_first_cand, lane, latent_scale,
-                        num_scales=t.num_scales, quant_tile=t.quant_tile,
-                        q_nope_stride=t.q_nope_stride,
-                        kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
-                        scale_format=(
-                            ScaleFormat.UE8M0_BYTE
-                            if self.native_dsv41_fp8 else t.scale_format
-                        ),
-                        latent_scale_per_token=t.latent_scale_per_token,
-                    )
+                    if cutlass.const_expr(self.dsv41_bf16_tile):
+                        qk = s1_qk_dsv41_bf16_smem(
+                            qk,
+                            q_fp8_addr,
+                            kv_fp8_b,
+                            warp_first_cand,
+                            lane,
+                            d_nope=t.d_nope,
+                            q_nope_bf16_stride=t.q_nope_stride,
+                            kv_bf16_stride=staged_kv_stride,
+                        )
+                    else:
+                        qk = s1_qk_nope_block_scaled(
+                            qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
+                            warp_first_cand, lane, latent_scale,
+                            num_scales=t.num_scales, quant_tile=t.quant_tile,
+                            q_nope_stride=t.q_nope_stride,
+                            kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
+                            scale_format=(
+                                ScaleFormat.UE8M0_BYTE
+                                if self.native_dsv41_fp8 else t.scale_format
+                            ),
+                            latent_scale_per_token=t.latent_scale_per_token,
+                        )
                     qk = s2_qk_rope_bf16(
                         qk,
                         q_rope_addr,
@@ -1876,37 +1963,58 @@ class UnifiedDecodeKernel:
                         p[2] * wr1,
                         p[3] * wr1,
                     ]
-                    s5_fill_sm_p_full(
-                        w_pre,
-                        sm_p_full_addr,
-                        w_head_sc_view,
-                        warp_id,
-                        lane,
-                        tid,
-                        bi=t.bi,
-                        sm_p_stride=L.sm_p_full_stride,
-                        n_v_chunks=t.n_v_chunks,
-                        hpb=t.hpb,
-                        num_threads=self.math_threads,
-                        barrier_id=3,
-                    )
-                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-                    acc_nope = s6_xv_nope(
-                        w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view,
-                        w_fp8_addr, warp_id, lane, tid, latent_scale,
-                        n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb,
-                        bi=t.bi, kv_smem_stride=staged_kv_stride,
-                        w_fp8_stride=t.bi + 16, n_warps=8,
-                        scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
-                        scale_format=(
-                            ScaleFormat.UE8M0_BYTE
-                            if self.native_dsv41_fp8 else t.scale_format
-                        ),
-                        num_threads=self.math_threads, barrier_id=3,
-                        sm_p_full_addr=sm_p_full_addr, sm_p_stride=L.sm_p_full_stride,
-                        latent_scale_per_token=t.latent_scale_per_token,
-                        w_fp8_bufs=L.w_fp8_bufs,
-                    )
+                    if cutlass.const_expr(self.dsv41_bf16_tile):
+                        s5_fill_sm_p_bf16(
+                            w_pre,
+                            sm_p_full_addr,
+                            warp_id,
+                            lane,
+                            sm_p_stride=L.sm_p_full_stride,
+                        )
+                        cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                        acc_nope = s6_pv_dsv41_bf16_smem(
+                            acc_nope,
+                            sm_p_full_addr,
+                            kv_fp8_b,
+                            warp_id,
+                            lane,
+                            n_v_chunks=t.n_v_chunks,
+                            bi=t.bi,
+                            sm_p_stride=L.sm_p_full_stride,
+                            kv_bf16_stride=staged_kv_stride,
+                        )
+                    else:
+                        s5_fill_sm_p_full(
+                            w_pre,
+                            sm_p_full_addr,
+                            w_head_sc_view,
+                            warp_id,
+                            lane,
+                            tid,
+                            bi=t.bi,
+                            sm_p_stride=L.sm_p_full_stride,
+                            n_v_chunks=t.n_v_chunks,
+                            hpb=t.hpb,
+                            num_threads=self.math_threads,
+                            barrier_id=3,
+                        )
+                        cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                        acc_nope = s6_xv_nope(
+                            w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view,
+                            w_fp8_addr, warp_id, lane, tid, latent_scale,
+                            n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb,
+                            bi=t.bi, kv_smem_stride=staged_kv_stride,
+                            w_fp8_stride=t.bi + 16, n_warps=8,
+                            scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
+                            scale_format=(
+                                ScaleFormat.UE8M0_BYTE
+                                if self.native_dsv41_fp8 else t.scale_format
+                            ),
+                            num_threads=self.math_threads, barrier_id=3,
+                            sm_p_full_addr=sm_p_full_addr, sm_p_stride=L.sm_p_full_stride,
+                            latent_scale_per_token=t.latent_scale_per_token,
+                            w_fp8_bufs=L.w_fp8_bufs,
+                        )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
                 if cutlass.const_expr(t.v_has_rope):
@@ -2435,7 +2543,8 @@ def _sparse_mla_decode_grid_flat_launch(
         # v34: one packed load/conversion per V4.1 SWA pair.
         # v35: native shared byte loads for packed dequantization.
         # v53: V4.1 execution precision and head grouping are plan-specialized.
-        53,
+        # v54: V4.1 BF16 tile-once swizzled SMEM decode and ldmatrix QK/PV reuse.
+        54,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),

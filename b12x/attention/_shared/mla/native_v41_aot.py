@@ -4,7 +4,6 @@ Internal AOT surface: host integration validates all pointers, capacities,
 alignment, immutable leases and scratch disjointness. All row counts are live
 launch arguments. No allocation, compilation or host synchronization in replay.
 """
-from dataclasses import replace
 import math
 
 import cuda.bindings.driver as cuda
@@ -26,17 +25,16 @@ class NativeV41Attention:
         if heads not in (32, 64):
             raise ValueError("native V4.1 attention requires 32 or 64 local heads")
         self.heads = heads
-        traits = make_unified_traits(ModelType.DSV41, ComputeMode.FP8,
+        # Keep checkpoint-native scales and BF16 QK/PV for decode/verify,
+        # matching the prefill arithmetic without canonical FP8 requantization.
+        traits = make_unified_traits(ModelType.DSV41, ComputeMode.BF16,
                                      ScaleFormat.NVFP4_E4M3, fp8_rope=False)
-        traits = replace(traits, compute_mode=ComputeMode.FP8, fp8_internal=True,
-                         q_nope_stride=528, kv_smem_stride=624,
-                         nt_per_warp_xv=traits.nt_per_warp_xv*2)
         self.decode = UnifiedDecodeKernel(traits, make_smem_layout(traits), 64, 1,
             h_blocks=heads//16, num_splits=10, num_heads=heads, q_head_dim=512,
             topk=128, extra_topk=512, q_stride=(heads*512, 512, 1),
             swa_indices_stride0=512, extra_indices_stride0=512,
             mid_out_stride=(heads*5120, 5120, 512, 1), mid_lse_stride=(heads*10, 10, 1),
-            has_extra=True, pbs_extra=256, valid_hpb=16, native_dsv41_fp8=True)
+            has_extra=True, pbs_extra=256, valid_hpb=16, vector_q=True)
         self.merge = SparseMLASplitDecodeSinkMergeKernel(static_num_chunks=10)
 
     @cute.jit
@@ -69,4 +67,4 @@ def compile_native_v41_attention_aot(heads: int = 64):
     pointers = tuple(make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
                      for dtype, align in zip(types, alignments))
     return compile_cute(launch, *pointers, Int32(1), current_cuda_stream(),
-                        compile_spec=KernelCompileSpec.from_key("attention.native_v41", 1, key))
+                        compile_spec=KernelCompileSpec.from_key("attention.native_v41", 3, key))
