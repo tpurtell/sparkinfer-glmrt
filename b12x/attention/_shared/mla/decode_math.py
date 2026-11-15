@@ -1498,7 +1498,9 @@ def _nvfp4_pair_bfloat2(
         # DSV41's sources share a staging layout, never a cache ABI. The tag is
         # per staged candidate row, so a caller whose row is loop-invariant can
         # hoist the load and pass it in; the branch decision is unchanged.
-        if source_tag is None:
+        # ``source_tag is None`` is a trace-time predicate: a plain ``if`` would
+        # be staged control flow and could not join None with an Int32.
+        if cutlass.const_expr(source_tag is None):
             swa = ld_shared_u32(
                 kv_fp4_base_addr + entry * Int32(544) + Int32(528)
             ).to(Int32)
@@ -2503,24 +2505,31 @@ def s6_xv_nope_nvfp4_bf16(
     ]
     # Mixed-source tags depend on the staged candidate row (K step) alone, not
     # on the V chunk or the N tile: load them once per chunk. DSV41 is the only
-    # 544-byte staging specialization; every other caller elides this.
+    # 544-byte staging specialization; every other caller elides this. Build the
+    # lists by comprehension: a plain ``for`` in a traced body is a staged
+    # dynamic loop and cannot index a Python list.
     ks_count = int(bi) // 16
     tag0 = [None] * ks_count
     tag8 = [None] * ks_count
     if cutlass.const_expr(kv_smem_stride == 544):
-        for ks in range(ks_count):
-            tag0[ks] = ld_shared_u32(
+        tag0 = [
+            ld_shared_u32(
                 kv_fp4_base_addr
                 + (Int32(ks) * Int32(16) + tid * Int32(2) + entry_parity)
                 * Int32(544)
                 + Int32(528)
             ).to(Int32)
-            tag8[ks] = ld_shared_u32(
+            for ks in range(ks_count)
+        ]
+        tag8 = [
+            ld_shared_u32(
                 kv_fp4_base_addr
                 + (Int32(ks) * Int32(16) + Int32(8) + tid * Int32(2) + entry_parity)
                 * Int32(544)
                 + Int32(528)
             ).to(Int32)
+            for ks in range(ks_count)
+        ]
     for vc in cutlass.range_constexpr(n_v_chunks):
         for nt in cutlass.range_constexpr(nt_per_warp_xv):
             dim_base = Int32(vc) * Int32(v_chunk) + (

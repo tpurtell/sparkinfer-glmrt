@@ -89,9 +89,11 @@ def resolve_native_v41_record(
     This fixed boundary pads short windows, independently of the native
     implementation's optional compact physical tile schedule. ``context`` is
     the tuple from :func:`native_v41_record_context` for this token row; when
-    omitted the helper resolves it here (per-key callers only).
+    omitted the helper resolves it here (per-key callers only). ``context is
+    None`` is a trace-time predicate: a plain ``if`` would be staged control
+    flow and could not join ``None`` with the twelve-scalar tuple.
     """
-    if context is None:
+    if cutlass.const_expr(context is None):
         context = native_v41_record_context(descriptor, metadata, window_begin)
     (valid, m0, offset, position, logical_count, committed, private_count,
      private_offset, private_stride, source_capacity, page_stride,
