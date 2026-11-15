@@ -46,9 +46,8 @@ def stream_scratch_layout(capacity, hidden, intermediate, experts, topk, *, row_
 class NativeTokenCombine:
     """Benchmark equivalent of native compact_routes<Hidden, Routes>."""
 
-    def __init__(self, hidden, topk, *, row_addresses=False):
+    def __init__(self, hidden, topk):
         self.hidden, self.topk = hidden, topk
-        self.row_addresses = bool(row_addresses)
 
     @cute.jit
     def __call__(self, source: cute.Pointer, output: cute.Pointer, rows: Int32, stream):
@@ -64,12 +63,32 @@ class NativeTokenCombine:
             value = Float32(source[row * self.topk * self.hidden + col])
             for slot in cutlass.range_constexpr(1, self.topk):
                 value = fadd_rn_f32(value, Float32(source[(row * self.topk + slot) * self.hidden + col]))
-            if cutlass.const_expr(self.row_addresses):
-                address = cute.make_tensor(cute.recast_ptr(output, dtype=Int64), cute.make_layout(1))[row]
-                target = cute.make_ptr(cutlass.BFloat16, address, cute.AddressSpace.gmem, assumed_align=16)
-                cute.make_tensor(target, cute.make_layout(self.hidden))[col] = value.to(cutlass.BFloat16)
-            else:
-                output[index] = value.to(cutlass.BFloat16)
+            output[index] = value.to(cutlass.BFloat16)
+
+
+class NativeTokenScatter:
+    """Ordered native compaction into independently retained BF16 reply rows."""
+
+    def __init__(self, hidden, topk):
+        self.hidden, self.topk = hidden, topk
+
+    @cute.jit
+    def __call__(self, source: cute.Pointer, output: cute.Pointer, rows: Int32, stream):
+        self.kernel(source, output, rows).launch(
+            grid=(max(1, (rows * self.hidden + 255) // 256), 1, 1),
+            block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, source: cute.Pointer, output: cute.Pointer, rows: Int32):
+        index = Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
+        if index < Int64(rows) * self.hidden:
+            row, col = index // self.hidden, index % self.hidden
+            value = Float32(source[row * self.topk * self.hidden + col])
+            for slot in cutlass.range_constexpr(1, self.topk):
+                value = fadd_rn_f32(value, Float32(source[(row * self.topk + slot) * self.hidden + col]))
+            address = cute.make_ptr(Int64, Int64(output.toint()), cute.AddressSpace.gmem, assumed_align=8)[row]
+            target = cute.make_ptr(cutlass.BFloat16, address, cute.AddressSpace.gmem, assumed_align=16)
+            target[col] = value.to(cutlass.BFloat16)
 
 
 class V4StreamPipeline:
@@ -132,7 +151,7 @@ class V4StreamSegments:
     def __init__(self, capacity, *, hidden, intermediate, experts, topk=6, scale_codes=False):
         self.pipeline = V4StreamPipeline(capacity, hidden=hidden, intermediate=intermediate,
             experts=experts, topk=topk, scale_codes=scale_codes, row_addresses=True)
-        self.combine = NativeTokenCombine(hidden, topk, row_addresses=True)
+        self.combine = NativeTokenScatter(hidden, topk)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, w13: cute.Pointer, s13: cute.Pointer,
