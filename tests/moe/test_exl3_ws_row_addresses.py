@@ -32,9 +32,10 @@ def test_compressed_reply_addresses_refused():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires SM121")
-@pytest.mark.parametrize("family,input_format", [("glm", "e4m3_k32"),
-    ("glmf", "e4m3_k32"), ("glm", "bf16")])
-def test_mapped_frame_member_orders(family, input_format):
+@pytest.mark.parametrize("family,input_format,reply_dtype", [("glm", "e4m3_k32", "bf16"),
+    ("glmf", "e4m3_k32", "bf16"), ("glm", "bf16", "bf16"),
+    ("glm", "e4m3_k32", "fp32")])
+def test_mapped_frame_member_orders(family, input_format, reply_dtype):
     device = torch.device("cuda", 0)
     props = torch.cuda.get_device_properties(device)
     if (props.major, props.minor) != (12, 1):
@@ -44,6 +45,7 @@ def test_mapped_frame_member_orders(family, input_format):
     hidden, intermediate, experts, bits, clamp = ((6144, 512, 256, (4, 5), None)
         if family == "glm" else (4096, 512, 288, (3, 4), 10.0))
     topk, block, maximum = 8, 64, 8192
+    reply_bytes = 2 if reply_dtype == "bf16" else 4
     high = experts // 4
     counts = (experts - high, high)
     tiers = tuple(_prepared(experts=count, hidden=hidden, intermediate=intermediate,
@@ -60,7 +62,7 @@ def test_mapped_frame_member_orders(family, input_format):
             top_k=topk, route_num_experts=experts, max_m_blocks=blocks,
             sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
             force_tile_config=(64, 256, 64, 256), tier0_bits=bits[0], tier1_bits=bits[1],
-            moe_block_size=block, full_rotation_output_dtype="bf16", swiglu_limit=clamp,
+            moe_block_size=block, full_rotation_output_dtype=reply_dtype, swiglu_limit=clamp,
             warp_specialized=True, ws_dynamic_tiles=True, ws_prerotate=False,
             input_format=input_format, row_addresses=indirect)
         launches.append(launch)
@@ -96,7 +98,7 @@ def test_mapped_frame_member_orders(family, input_format):
     lengths = (2752, 2752, 2487, 1900, 333)
     stride = hidden + hidden // 32 if input_format == "e4m3_k32" else 2 * hidden
     request_stride = (96 + 4096 * (40 + 12 * topk + stride) + 4095) & ~4095
-    response_stride = (96 + 4096 * (2 * hidden + 4) + 4095) & ~4095
+    response_stride = (96 + 4096 * (reply_bytes * hidden + 4) + 4095) & ~4095
     allocations = []
     segments = []
     cases = identical_members = identical_bytes = 0
@@ -138,7 +140,7 @@ def test_mapped_frame_member_orders(family, input_format):
                         rows = s["rows"]
                         permutation = torch.arange(rows - 1, -1, -1, device=device) if position else torch.randperm(rows, device=device)
                         x_addresses.append(s["inp"].device_view.data_ptr() + s["start"] + permutation.long() * stride)
-                        y_addresses.append(s["out"].device_view.data_ptr() + s["out_start"] + permutation.long() * hidden * 2)
+                        y_addresses.append(s["out"].device_view.data_ptr() + s["out_start"] + permutation.long() * hidden * reply_bytes)
                         route_ids.append(s["ids"][permutation])
                         route_weights.append(s["weights"][permutation])
                     addresses, output = torch.cat(x_addresses), torch.cat(y_addresses)
@@ -165,7 +167,7 @@ def test_mapped_frame_member_orders(family, input_format):
                     for member, s in enumerate(segments):
                         assert torch.equal(s["inp"].host_view, s["snapshot"]), "input/guards modified"
                         raw = s["out"].host_view
-                        start, end = s["out_start"], s["out_start"] + s["rows"] * hidden * 2
+                        start, end = s["out_start"], s["out_start"] + s["rows"] * hidden * reply_bytes
                         assert (raw[:start] == 173).all() and (raw[end:] == 173).all(), "reply guards modified"
                         if member in order:
                             assert torch.equal(raw[start:end], s["reference"].view(torch.uint8).flatten()), (family, input_format, hot, order, member)
@@ -174,9 +176,9 @@ def test_mapped_frame_member_orders(family, input_format):
                         else:
                             assert (raw == 173).all(), "nonmember reply modified"
                     cases += 1
-                    print(json.dumps(dict(family=family, input_format=input_format, hot=hot,
+                    print(json.dumps(dict(family=family, input_format=input_format, reply_dtype=reply_dtype, hot=hot,
                         order=order, rows=len(addresses), byte_identical=True)), flush=True)
-        print(json.dumps(dict(family=family, input_format=input_format, cases=cases,
+        print(json.dumps(dict(family=family, input_format=input_format, reply_dtype=reply_dtype, cases=cases,
             identical_members=identical_members, identical_bytes=identical_bytes,
             capacity=maximum, gpu=props.name)), flush=True)
     finally:
