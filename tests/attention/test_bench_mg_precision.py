@@ -1,7 +1,7 @@
 """CPU-only contracts for the MG precision diagnostic."""
 import pytest
 
-from benchmarks.bench_mg_precision import arm_traits, parse_args
+from benchmarks.bench_mg_precision import arm_traits, decode_arm_traits, parse_args
 from b12x.attention._shared.mla.traits import ComputeMode, ModelType
 
 
@@ -34,6 +34,15 @@ def test_native_internal_fp8_does_not_select_fp8_qk():
     assert bf16.model_type == fp8.model_type == ModelType.DSV41
     assert bf16.compute_mode == fp8.compute_mode == ComputeMode.BF16
     assert not bf16.fp8_internal and fp8.fp8_internal
+
+
+def test_decode_traits_match_native_aot():
+    fp8 = decode_arm_traits("fp8-decode")
+    assert fp8.compute_mode == ComputeMode.FP8 and fp8.fp8_internal
+    assert (fp8.q_nope_stride, fp8.kv_smem_stride, fp8.nt_per_warp_xv) == (528, 624, 2)
+    assert decode_arm_traits("fp8-f32-partials") == fp8
+    bf16 = decode_arm_traits("bf16-decode")
+    assert bf16.compute_mode == ComputeMode.BF16 and not bf16.fp8_internal
 
 
 def test_decode_contract_and_accuracy_only(tmp_path):

@@ -1,8 +1,19 @@
 """MG precision diagnostic: unchanged kernels, native packing, FP32 attention oracle.
 
-DSV4 584B changes QK only (PV is FP8 NoPE / BF16 RoPE). Native DSV41
-changes canonical KV staging and PV only; both arms retain BF16 QK.
-Synthetic full selected sets model long-context attention, not a model forward.
+DSV4 584B prefill changes QK only (PV is FP8 NoPE / BF16 RoPE). Native
+DSV41 prefill changes canonical KV staging/PV; both arms retain BF16 QK.
+Native decode compares shipped E4M3 QK/PV with BF16 QK/PV, and optionally
+FP32 split partials. Synthetic full selected sets are not a model forward.
+
+Prefill examples::
+
+    python benchmarks/bench_mg_precision.py --format dsv4 --output dsv4.json
+    python benchmarks/bench_mg_precision.py --format dsv41 --output dsv41.json
+
+Decode/verify example::
+
+    python benchmarks/bench_mg_precision.py --format dsv41 --mode decode \
+        --rows 1,2,4,8,16,64 --timing-rows 1,2,4,8,16,64 --output decode.json
 """
 from __future__ import annotations
 
@@ -70,6 +81,17 @@ def parse_args(argv=None):
     return args
 
 
+def decode_arm_traits(arm):
+    if arm not in ("fp8-decode", "bf16-decode", "fp8-f32-partials"):
+        raise ValueError(arm)
+    native = arm != "bf16-decode"
+    traits = arm_traits("dsv41", "fp8-pv" if native else "bf16-pv")
+    if native:
+        traits = replace(traits, compute_mode=ComputeMode.FP8, q_nope_stride=528,
+            kv_smem_stride=624, nt_per_warp_xv=traits.nt_per_warp_xv * 2)
+    return traits
+
+
 def build_decode(q, main_cache, extra_cache, mi, ei, sink):
     """Compile existing native producer and generic BF16 producer, same10 splits.
 
@@ -103,9 +125,7 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink):
     runs, lses = {}, {}
     for arm in ("fp8-decode", "bf16-decode", "fp8-f32-partials"):
         native = arm != "bf16-decode"
-        traits = arm_traits("dsv41", "fp8-pv" if native else "bf16-pv")
-        if native:
-            traits = replace(traits,compute_mode=ComputeMode.FP8,q_nope_stride=528,kv_smem_stride=624,nt_per_warp_xv=traits.nt_per_warp_xv*2)
+        traits = decode_arm_traits(arm)
         partial = torch.empty(rows,heads,10,512,device=q.device,dtype=torch.float32 if arm == "fp8-f32-partials" else torch.bfloat16)
         lse = torch.empty(rows,heads,10,device=q.device)
         output = torch.empty_like(q)
@@ -181,7 +201,7 @@ def main(argv=None):
     report = {"mode": args.mode, "lse_unit": "natural_log", "format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
         "fork_sha": subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True).strip(),
         "device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
-        "traits": {arm: asdict(arm_traits(args.format, arm)) for arm in arms} if args.mode == "prefill" else {}, "records": []}
+        "traits": {arm: asdict(arm_traits(args.format, arm) if args.mode == "prefill" else decode_arm_traits(arm)) for arm in arms}, "records": []}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for pattern in args.scores:
         q = (torch.randn(max_rows, args.heads, 512, device=device) * (.03 if pattern == "spread" else .2)).bfloat16()
