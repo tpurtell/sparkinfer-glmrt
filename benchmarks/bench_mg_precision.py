@@ -42,13 +42,14 @@ def fork_sha():
 def arm_traits(fmt, arm):
     if fmt in INLINE:
         from b12x.attention._shared.mla.traits import with_bf16_attention
-        if arm not in ("fp8", "bf16-qk", "bf16"):
+        if arm not in ("fp8", "bf16-qk", "bf16", "bf16-rounded-k"):
             raise ValueError((fmt, arm))
         traits = make_unified_traits(ModelType.GLM_NEXT if fmt == "glmf" else ModelType.GLM_NSA,
             ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
         if arm == "fp8":
             return traits
-        return with_bf16_attention(traits, fp8_pv=arm == "bf16-qk")
+        # bf16-rounded-k: BF16/BF16 with ATTENTION_EXACT_K=off numerics.
+        return with_bf16_attention(traits, fp8_pv=arm == "bf16-qk", rounded_k=arm == "bf16-rounded-k")
     if fmt == "dsv4":
         if arm not in ("fp8-qk", "bf16-qk"):
             raise ValueError(arm)
@@ -171,7 +172,7 @@ def inline_main(args):
     cache = cache.reshape(pool // 64, -1).contiguous()
     row = torch.arange(max_rows, device=device)[:, None]
     indices = (1 + (row * 37 + torch.arange(topk, device=device)[None] * 17) % (pool - 1)).int().contiguous()
-    arms = ("fp8", "bf16-qk", "bf16")
+    arms = ("fp8", "bf16-qk", "bf16", "bf16-rounded-k")
     traits = {arm: arm_traits(args.format, arm) for arm in arms}
     report = {"format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "fork_sha": fork_sha(),
@@ -270,7 +271,7 @@ def inline_main(args):
     # The FP8-PV arms launched here do not zero masked V (their exports opt
     # in), so their poison result is recorded only; BF16 PV always zeroes it.
     bad = [f"{arm}.{key}" for arm in arms for key in ("empty_rows_zero", "slot0_poison_bytes_equal", "row_invariant")
-           if not checks[arm][key] and (arm == "bf16" or key != "slot0_poison_bytes_equal")]
+           if not checks[arm][key] and (traits[arm].pv_bf16 or key != "slot0_poison_bytes_equal")]
     if bad:
         raise RuntimeError(f"structural checks failed: {bad}")
     measure(args, report, arms, [pattern(name) for name in args.scores])

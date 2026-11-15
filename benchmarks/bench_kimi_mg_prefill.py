@@ -5,9 +5,11 @@ Baselines are the shipping FP8 dense extend and split16/chunk64 sparse exports.
 The MG oracle holds MG to #305's existing output/LSE bounds against FP32
 attention over the exact decoded record (E4M3 x FP32 group scale, no BF16 key
 rounding, TF32 off). The shipping routes round each dequantized key to BF16, a
-known decode-side difference: their errors, and every error against the former
-rounded-key reference, are recorded beside MG's, never asserted. Same-row
-cross-width checks are byte exact within each MG variant.
+known decode-side difference: their errors, and every error against the other
+reference, are recorded beside MG's, never asserted. ``--rounded-k`` runs the
+ATTENTION_EXACT_K=off arm and gates it against the former rounded-key
+reference instead. Same-row cross-width checks are byte exact within each MG
+variant.
 """
 from __future__ import annotations
 
@@ -84,13 +86,15 @@ def oracle(args, report):
     from b12x.integration.cuteafd.kimi_dsa import compile_kimi_sparse_mla_aot
     from b12x.integration.cuteafd.kimi_mla_prefill_mg import compile_kimi_mg_prefill_aot
     results = []
+    rounded = bool(getattr(args, "rounded_k", False))
     capacity = 65
     cache, values = records(4096)
     for heads in args.heads:
         g = KimiMlaGeometry(heads=heads, kv_cache="fp8")
         base = compile_kimi_sparse_mla_aot(g, max_rows=capacity, row_chunk_size=64)
         candidate = compile_kimi_mg_prefill_aot(g, max_rows=capacity, max_context=4096,
-                                              sparse=True, bf16_compute=args.bf16_compute)
+                                              sparse=True, bf16_compute=args.bf16_compute,
+                exact_k=not getattr(args, "rounded_k", False))
         q = torch.randn(capacity, heads, 576, device="cuda").bfloat16()
         # Every ragged final 64-key tile is covered (0..65, plus distant edges).
         edges = list(range(66)) + [127, 128, 129, 777, 2047, 2048]
@@ -119,9 +123,11 @@ def oracle(args, report):
                     slots = indices[row, :length].long()
                     expected, natural = attention(q[row], values[slots], g.softmax_scale)
                     mg_lse = lse[row] * LN2
-                    max_o = max(max_o, comparison(out[row], expected))
-                    max_l = max(max_l, comparison(mg_lse, natural, lse=True))
                     old = attention(q[row], ROUNDED[id(values)][slots], g.softmax_scale)
+                    gate = old if rounded else (expected, natural)
+                    max_o = max(max_o, comparison(out[row], gate[0]))
+                    max_l = max(max_l, comparison(mg_lse, gate[1], lse=True))
+                    note(recorded, "mg_vs_exact_reference", out[row], mg_lse, expected, natural)
                     note(recorded, "mg_vs_rounded_reference", out[row], mg_lse, *old)
                     note(recorded, "baseline_vs_exact_reference", bo[row], bl[row], expected, natural)
                     note(recorded, "baseline_vs_rounded_reference", bo[row], bl[row], *old)
@@ -159,10 +165,11 @@ def oracle(args, report):
                 assert torch.equal(got, expected[None].expand_as(got))
         results.append(dict(route="sparse", heads=heads, edges=edges, output_max_abs=max_o,
                             lse_max_abs=max_l, row_invariant=True, poison=True, graph=True,
-                            reference="exact decoded record", **recorded))
+                            reference="rounded-key record" if rounded else "exact decoded record", **recorded))
         # Causal dense extend, randomized page table, partial page and future poison.
         dense = compile_kimi_mg_prefill_aot(g, max_rows=capacity, max_context=4096,
-                                          bf16_compute=args.bf16_compute)
+                                          bf16_compute=args.bf16_compute,
+                exact_k=not getattr(args, "rounded_k", False))
         dense_base = compile_kimi_dense_mla_aot(g, max_rows=capacity, max_context=4096, mode="extend")
         work = torch.empty(dense.scratch_bytes(capacity)["scratch"], device="cuda", dtype=torch.uint8)
         table = torch.randperm(64, device="cuda").int()
@@ -183,10 +190,11 @@ def oracle(args, report):
             for row in (0, n - 1):
                 expected, natural = attention(q[row], values[:prefix + row + 1], g.softmax_scale)
                 mg_lse = lse[row] * LN2
-                note(recorded, "mg", out[row], mg_lse, expected, natural)
-                comparison(out[row], expected)
-                comparison(mg_lse, natural, lse=True)
                 old = attention(q[row], ROUNDED[id(values)][:prefix + row + 1], g.softmax_scale)
+                gate = old if rounded else (expected, natural)
+                comparison(out[row], gate[0])
+                comparison(mg_lse, gate[1], lse=True)
+                note(recorded, "mg_vs_exact_reference", out[row], mg_lse, expected, natural)
                 note(recorded, "mg_vs_rounded_reference", out[row], mg_lse, *old)
                 note(recorded, "baseline_vs_exact_reference", bo[row], bl[row], expected, natural)
                 note(recorded, "baseline_vs_rounded_reference", bo[row], bl[row], *old)
@@ -199,7 +207,7 @@ def oracle(args, report):
             assert torch.equal(lse[:n].view(torch.uint8), before[1].view(torch.uint8))
             ordered[physical[prefix+n:]] = old
         results.append(dict(route="dense", heads=heads, causal=True, poison=True, graph=True,
-                            reference="exact decoded record", **recorded))
+                            reference="rounded-key record" if rounded else "exact decoded record", **recorded))
         print(json.dumps(results[-2:]), flush=True)
     report["oracle"] = results
     return results
@@ -266,7 +274,8 @@ def curve(args, report):
             sparse = route == "sparse"
             max_context = max(4096, max(args.prefixes) + capacity)
             mg = compile_kimi_mg_prefill_aot(g, max_rows=capacity, max_context=max_context,
-                                           sparse=sparse, bf16_compute=args.bf16_compute)
+                                           sparse=sparse, bf16_compute=args.bf16_compute,
+                exact_k=not getattr(args, "rounded_k", False))
             base = (compile_kimi_sparse_mla_aot(g, max_rows=capacity, row_chunk_size=64) if sparse else
                     compile_kimi_dense_mla_aot(g, max_rows=capacity, max_context=max_context, mode="extend"))
             cache, _ = records(8192 if sparse else -(-max_context // 64) * 64)
@@ -331,6 +340,7 @@ def main():
     p.add_argument("--oracle-only", action="store_true")
     p.add_argument("--curve-only", action="store_true")
     p.add_argument("--bf16-compute", action="store_true")
+    p.add_argument("--rounded-k", action="store_true", help="BF16-rounded keys, gated on the rounded-key reference")
     p.add_argument("--samples", type=int, default=6)
     p.add_argument("--iterations", type=int, default=3)
     p.add_argument("--output", required=True, type=Path)
@@ -338,7 +348,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     props = torch.cuda.get_device_properties()
     report = dict(command=sys.argv, device=props.name, uuid=str(props.uuid),
-        sm_count=props.multi_processor_count, bf16_compute=args.bf16_compute,
+        sm_count=props.multi_processor_count, bf16_compute=args.bf16_compute, rounded_k=args.rounded_k,
         source_sha256={str(f.relative_to(ROOT)): hashlib.sha256(f.read_bytes()).hexdigest()
             for f in [Path(__file__), ROOT / "b12x/integration/cuteafd/kimi_mla_prefill_mg.py"]})
     try:

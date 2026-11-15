@@ -809,6 +809,7 @@ def s1_qk_nope_bf16_mg2(
     scale_bytes_per_token: cutlass.Constexpr,  # 8
     n_hg: cutlass.Constexpr = 2,
     inline_fp32_scale_offset: cutlass.Constexpr = 0,
+    inline_fp32_rounded_k: cutlass.Constexpr = False,
 ):
     """S1 (BF16): fused QK-NoPE bf16 m16n8k16 MMA with per-thread inline
     FP8->BF16 K dequant.
@@ -817,7 +818,8 @@ def s1_qk_nope_bf16_mg2(
     record's inline FP32 group scale at that staged-row offset. An arbitrary
     FP32 scale times E4M3 does not fit BF16, so K enters the MMA as its exact
     BF16 widening and each scale group's partial is scaled in FP32 afterwards:
-    QK then carries no K rounding at all.
+    QK then carries no K rounding at all. ``inline_fp32_rounded_k`` instead
+    dequantizes K to BF16 with that scale first, through the UE8M0 arm's MMAs.
 
     Byte-for-byte mirror of FlashInfer prefill_kernel.cuh:883-932. The K B
     operand (b0/b1) and the per-(token,blk) UE8M0 scale depend only on the
@@ -839,7 +841,7 @@ def s1_qk_nope_bf16_mg2(
     kv_sc_row_base = kv_sc_base_addr + kv_gid_row * Int32(scale_bytes_per_token)
 
     for blk in cutlass.range_constexpr(num_scales):
-        if cutlass.const_expr(inline_fp32_scale_offset):
+        if cutlass.const_expr(inline_fp32_scale_offset and not inline_fp32_rounded_k):
             t0 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
             t1 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
             for ks in cutlass.range_constexpr(quant_tile // 16):
@@ -879,8 +881,15 @@ def s1_qk_nope_bf16_mg2(
                 qk1[2] = qk1[2] + t1[2] * ks0
                 qk1[3] = qk1[3] + t1[3] * ks1
         else:
-            # DSV4 UE8M0_BYTE: per-(token,blk) fp32 scale from the K footer scale buf.
-            scale_f = _ue8m0_zext_byte_to_fp32(ld_shared_u8_offset(kv_sc_row_base, blk))
+            if cutlass.const_expr(inline_fp32_scale_offset):
+                scale_f = ld_shared_f32(
+                    kv_fp8_base_addr
+                    + kv_gid_row * Int32(kv_smem_stride)
+                    + Int32(inline_fp32_scale_offset + blk * 4)
+                )
+            else:
+                # DSV4 UE8M0_BYTE: per-(token,blk) fp32 scale from the K footer scale buf.
+                scale_f = _ue8m0_zext_byte_to_fp32(ld_shared_u8_offset(kv_sc_row_base, blk))
             for ks in cutlass.range_constexpr(quant_tile // 16):
                 ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
                 # K dequant B operand: two e4m3 byte-pairs (u16) -> bf16x2 b0/b1.
@@ -2229,10 +2238,10 @@ class UnifiedPrefillMGKernel:
         inline_bf16 = int(traits.scale_format) == int(
             ScaleFormat.ARBITRARY_FP32
         ) and int(traits.compute_mode) == int(ComputeMode.BF16)
-        if traits.pv_bf16 and not inline_bf16:
+        if (traits.pv_bf16 or traits.qk_rounded_k) and not inline_bf16:
             raise ValueError(
-                "pv_bf16 qualifies BF16 QK over inline-FP32-scale records "
-                "(traits.with_bf16_attention); FP8 QK has no BF16 PV. Got "
+                "pv_bf16 and qk_rounded_k qualify BF16 QK over inline-FP32-scale "
+                "records (traits.with_bf16_attention); FP8 QK has no BF16 PV. Got "
                 f"compute_mode={traits.compute_mode!r}, pv_bf16={traits.pv_bf16!r}, "
                 f"scale_format={traits.scale_format!r}"
             )
@@ -3262,6 +3271,7 @@ class UnifiedPrefillMGKernel:
                         q_nope_bf16_stride=L.q_nope_bf16_stride,
                         kv_smem_stride=L.kv_smem_stride, scale_bytes_per_token=8,
                         n_hg=n_hg, inline_fp32_scale_offset=t.d_nope,
+                        inline_fp32_rounded_k=t.qk_rounded_k,
                     )
                     if cutlass.const_expr(has_rope):
                         qk0, qk1 = s2_qk_rope_regs_mg_glm(
@@ -4116,6 +4126,7 @@ def _sparse_mla_prefill_mg_flat_launch(
     latent_scale_per_token: bool = False,
     fp8_internal: bool = False,
     pv_bf16: bool = False,
+    qk_rounded_k: bool = False,
     prepared: object | None = None,
 ) -> None:
     traits = make_unified_traits(
@@ -4125,7 +4136,8 @@ def _sparse_mla_prefill_mg_flat_launch(
         fp8_rope=bool(fp8_rope),
         latent_scale_per_token=bool(latent_scale_per_token),
     )
-    traits = replace(traits, fp8_internal=bool(fp8_internal), pv_bf16=bool(pv_bf16))
+    traits = replace(traits, fp8_internal=bool(fp8_internal), pv_bf16=bool(pv_bf16),
+                     qk_rounded_k=bool(qk_rounded_k))
     layout = make_smem_layout_mg(traits, int(mg_n_hg))
     q_head_dim = int(q.shape[2])
     total_heads = int(q.shape[1])
@@ -4257,8 +4269,9 @@ def _sparse_mla_prefill_mg_flat_launch(
             "out_lse", lse_out, dims=(DimKey.dynamic(), DimKey.exact(total_heads))
         ),
     ]
-    if traits.pv_bf16:
-        spec_fields.append(key_field("pv_bf16", 1))
+    if traits.pv_bf16 or traits.qk_rounded_k:
+        spec_fields.append(key_field("pv_bf16", int(traits.pv_bf16)))
+        spec_fields.append(key_field("qk_rounded_k", int(traits.qk_rounded_k)))
     if active_heads != total_heads or head_offset != 0:
         spec_fields.extend(
             [
@@ -4721,7 +4734,7 @@ def run_unified_prefill_mg(
         and active_heads == total_heads
         and head_offset == 0
         and not traits.fp8_internal
-        and not traits.pv_bf16
+        and not (traits.pv_bf16 or traits.qk_rounded_k)
         and prepared is None
         and not compile_only_launches_enabled()
     ):
@@ -4782,6 +4795,7 @@ def run_unified_prefill_mg(
             latent_scale_per_token=bool(latent_scale_per_token),
             fp8_internal=bool(traits.fp8_internal),
             pv_bf16=bool(traits.pv_bf16),
+            qk_rounded_k=bool(traits.qk_rounded_k),
             prepared=prepared,
         )
         if compile_only_launches_enabled():

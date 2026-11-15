@@ -1,4 +1,6 @@
 """CPU-only contracts for the MG precision diagnostic."""
+from dataclasses import replace
+
 import pytest
 
 from benchmarks.bench_mg_precision import arm_traits, parse_args
@@ -60,7 +62,10 @@ def test_inline_fp32_modes_preserve_cache_format(fmt, model, stride):
     assert (fp8.compute_mode, fp8.pv_bf16) == (ComputeMode.FP8, False)
     assert (middle.compute_mode, middle.pv_bf16) == (ComputeMode.BF16, False)
     assert (bf16.compute_mode, bf16.pv_bf16) == (ComputeMode.BF16, True)
-    assert [max_mg_head_groups(t) for t in (fp8, middle, bf16)] == [2, 1, 1]
+    assert not (fp8.qk_rounded_k or middle.qk_rounded_k or bf16.qk_rounded_k)
+    rounded = arm_traits(fmt, "bf16-rounded-k")
+    assert rounded == replace(bf16, qk_rounded_k=True)
+    assert [max_mg_head_groups(t) for t in (fp8, middle, bf16, rounded)] == [2, 1, 1, 1]
     for traits in (middle, bf16):
         assert make_smem_layout_mg(traits, 1).total_bytes < SM120_SMEM_CARVEOUT_BYTES
 
@@ -80,9 +85,10 @@ def test_inline_defaults_and_mixed_mode_rejected(tmp_path):
     shape = dict(page_block_size=64, num_tiles=32, replicate_h=4, num_heads=64, q_stride=(64 * 576, 576, 1),
                  indices_stride0=2048, output_stride=(64 * 512, 512, 1), out_lse_stride=(64, 1), has_sink=False,
                  topk=2048)
-    traits = replace(arm_traits("glm", "fp8"), pv_bf16=True)                   # FP8 QK / BF16 PV
-    with pytest.raises(ValueError, match="FP8 QK has no BF16 PV"):
-        UnifiedPrefillMGKernel(traits, make_smem_layout_mg(traits, 1), **shape)
+    for traits in (replace(arm_traits("glm", "fp8"), pv_bf16=True),            # FP8 QK / BF16 PV
+                   replace(arm_traits("glm", "fp8"), qk_rounded_k=True)):
+        with pytest.raises(ValueError, match="FP8 QK has no BF16 PV"):
+            UnifiedPrefillMGKernel(traits, make_smem_layout_mg(traits, 1), **shape)
     for arm in ("bf16-qk", "bf16"):
         traits = arm_traits("glm", arm)
         UnifiedPrefillMGKernel(traits, make_smem_layout_mg(traits, 1), **shape)
