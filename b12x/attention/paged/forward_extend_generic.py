@@ -3276,6 +3276,7 @@ class PagedForwardKernel:
         msa_union_tile: bool = False,
         page_size: int = 64,
         use_fp8_pv_repack: bool = False,
+        inline_scale_offsets: tuple[int, int] | None = None,
     ):
         self.dtype_q = dtype_q
         self.dtype_kv = dtype_kv
@@ -3288,6 +3289,15 @@ class PagedForwardKernel:
         self.has_relative_attention_bias = bool(has_relative_attention_bias)
         self.msa_block_sparse = bool(msa_block_sparse)
         self.msa_union_tile = bool(msa_union_tile)
+        self.inline_scale_offsets = inline_scale_offsets
+        if inline_scale_offsets is not None and (
+            not msa_block_sparse or dtype_kv != cutlass.Float8E4M3FN
+            or enable_paged_kv_tma or use_native_fp8_qk or use_native_fp8_pv
+            or use_fp8_pv_repack
+            or len(inline_scale_offsets) != 2
+            or any(offset < 0 or offset % 4 for offset in inline_scale_offsets)
+        ):
+            raise ValueError("inline scales require FP8 MSA byte-copy tiles and aligned offsets")
         self.MSA_BLOCK_TOKENS = 128
         self.MSA_TOPK = 16
         self.MSA_UNION_TOKENS_PER_TILE = 8
@@ -3835,6 +3845,17 @@ class PagedForwardKernel:
             mask_word = mMSAUnionMasks[work_idx, kv_head_idx, block_j]
             return ((mask_word >> local_token) & Int32(1)) != Int32(0)
         return True
+
+    @cute.jit
+    def _inline_scale(self, cache: cute.Tensor, table: cute.Tensor, request,
+                      key_pos, head, page_stride, token_stride,
+                      offset: cutlass.Constexpr):
+        page = table[request, key_pos // self.page_size]
+        address = (Int64(cache.iterator.toint()) + Int64(page) * Int64(page_stride)
+                   + Int64(key_pos % self.page_size) * Int64(token_stride)
+                   + Int64(offset) + Int64(head) * Int64(4))
+        scale = cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=4)
+        return Float32(scale[0])
 
     @cute.jit
     def _async_copy_paged_tile_permuted_128b(
@@ -5892,8 +5913,14 @@ class PagedForwardKernel:
                                             )
                                             valid = valid and key_pos >= window_start
                                     if valid:
+                                        token_k_scale = k_scale
+                                        if const_expr(self.inline_scale_offsets is not None):
+                                            token_k_scale = self._inline_scale(
+                                                mKBytes, mPageTable, request_idx, key_pos,
+                                                kv_head_idx, k_page_stride_bytes, k_token_stride_bytes,
+                                                self.inline_scale_offsets[0])
                                         frag_S[mma_q, mma_kv, reg_id] = (
-                                            frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                            frag_S[mma_q, mma_kv, reg_id] * token_k_scale
                                         )
                                     else:
                                         frag_S[mma_q, mma_kv, reg_id] = Float32(
@@ -6097,8 +6124,14 @@ class PagedForwardKernel:
                                             )
                                             valid = valid and key_pos >= window_start
                                     if valid:
+                                        token_k_scale = k_scale
+                                        if const_expr(self.inline_scale_offsets is not None):
+                                            token_k_scale = self._inline_scale(
+                                                mKBytes, mPageTable, request_idx, key_pos,
+                                                kv_head_idx, k_page_stride_bytes, k_token_stride_bytes,
+                                                self.inline_scale_offsets[0])
                                         frag_S[mma_q, mma_kv, reg_id] = (
-                                            frag_S[mma_q, mma_kv, reg_id] * k_scale
+                                            frag_S[mma_q, mma_kv, reg_id] * token_k_scale
                                         )
                                     else:
                                         frag_S[mma_q, mma_kv, reg_id] = Float32(
@@ -6422,6 +6455,30 @@ class PagedForwardKernel:
                             )
                         d_frag[mma_q, 0] = d0
                         d_frag[mma_q, 1] = d1
+                # Preserve the unscaled softmax denominator, then fold each
+                # token's V descale into P, before the existing tensor-core PV.
+                if const_expr(self.inline_scale_offsets is not None):
+                    for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                        for pair in cutlass.range_constexpr(2):
+                            key_local = warp_kv_base + mma_kv * 16 + lane_pair_base + pair * 8
+                            vs0, vs1 = Float32(0.0), Float32(0.0)
+                            if key_local < tile_tokens:
+                                vs0 = self._inline_scale(
+                                    mVBytes, mPageTable, request_idx, tile_key_base + key_local,
+                                    kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
+                                    self.inline_scale_offsets[1])
+                            if key_local + 1 < tile_tokens:
+                                vs1 = self._inline_scale(
+                                    mVBytes, mPageTable, request_idx, tile_key_base + key_local + 1,
+                                    kv_head_idx, v_page_stride_bytes, v_token_stride_bytes,
+                                    self.inline_scale_offsets[1])
+                            for mma_q in cutlass.range_constexpr(num_mma_q):
+                                for row_slot in cutlass.range_constexpr(2):
+                                    index = row_slot + pair * 2
+                                    p0, p1 = bfloat2_to_float2_scaled(
+                                        p_frag[mma_q, mma_kv, index], Float32(1.0))
+                                    p_frag[mma_q, mma_kv, index] = pack_f32x2_to_bfloat2(
+                                        p0 * vs0, p1 * vs1)
                 # Inactive KV warps have zero P for this tile and skip the
                 # softmax update. Preserve their accumulated earlier-page state.
 

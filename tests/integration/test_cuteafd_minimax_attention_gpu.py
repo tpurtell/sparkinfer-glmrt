@@ -12,6 +12,66 @@ import torch
 
 from ..conftest import require_b12x
 
+@pytest.mark.parametrize("heads", [2, 4])
+@pytest.mark.parametrize("mode", ["decode", "extend"])
+def test_inline_scales_outliers_and_rows(heads, mode):
+    require_b12x()
+    from b12x.integration.cuteafd.minimax import compile_minimax_kv_pack_aot
+    from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
+    from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
+
+    g = torch.Generator(device="cuda").manual_seed(20261115)
+    pages, capacity, count = 5, 16, 257
+    record = fp8_kv_plane_bytes(heads, 128)
+    key = torch.randn((pages * 64, heads, 128), generator=g, device="cuda").bfloat16()
+    value = (torch.randn(key.shape, generator=g, device="cuda") * .003).bfloat16()
+    value[::17, :, 0] = 1024
+    slots = torch.arange(pages * 64, dtype=torch.int64, device="cuda")
+    slots[-1] = -1
+    packed = [torch.full((pages * 64, record), 213, dtype=torch.uint8, device="cuda") for _ in range(2)]
+    pack = compile_minimax_kv_pack_aot(heads=heads)
+    desc = torch.ones((capacity, heads), device="cuda")
+    batch_ids = torch.zeros(pages * 64, dtype=torch.int32, device="cuda")
+    pack.launch(key, value, slots, batch_ids, desc, desc, *packed, scalars=(pages * 64,))
+    torch.cuda.synchronize()
+    decoded = []
+    for source, raw in zip((key, value), packed):
+        scale = raw[:-1, heads * 128:heads * 132].contiguous().view(torch.float32)
+        expected_scale = source[:-1].float().abs().amax(-1) / 448
+        torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=1e-10)
+        payload = raw[:-1, :heads * 128].contiguous().view(torch.float8_e4m3fn).reshape(-1, heads, 128)
+        decoded.append(payload.float() * scale[..., None])
+        assert (raw[-1] == 213).all(), "negative slot changed"
+        assert (raw[:-1, heads * 132:] == 0).all(), "padding is not deterministic"
+    q = (torch.randn((capacity, heads * 16, 128), generator=g, device="cuda") * .5).bfloat16()
+    q[:] = q[0].clone()
+    program = compile_minimax_attention_aot(max_rows=capacity, max_batch=capacity, mode=mode,
+                                           query_heads=heads * 16, kv_heads=heads)
+    table = torch.arange(pages, dtype=torch.int32, device="cuda").repeat(capacity, 1)
+    selected = torch.full((heads, capacity, 16), -1, dtype=torch.int32, device="cuda")
+    selected[:, :, :3] = torch.arange(3, device="cuda", dtype=torch.int32)
+    output = torch.empty_like(q)
+    lse = torch.empty((capacity, heads * 16), device="cuda")
+    scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda")
+    results = []
+    for rows in (1, 3, 16):
+        # One-token independent requests keep arithmetic identical as live rows vary.
+        lengths = torch.full((rows,), count, dtype=torch.int32, device="cuda")
+        cu = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
+        program.launch(q, *packed, desc, desc, table, lengths, cu, selected, output, lse, scratch,
+                       scalars=(rows, rows, pages, pages))
+        torch.cuda.synchronize()
+        k, v = [torch.repeat_interleave(x[:count], 16, dim=1) for x in decoded]
+        scores = torch.einsum("hd,thd->ht", q[0].float(), k) * 128 ** -.5
+        expected = torch.einsum("ht,thd->hd", scores.softmax(-1), v)
+        error = ((output[0].float() - expected).norm() / expected.norm()).item()
+        print(f"inline scales {mode} h{heads} rows={rows}: relative error={error:.8f}")
+        assert torch.isfinite(output[:rows]).all() and error < .03
+        torch.testing.assert_close(lse[0], torch.logsumexp(scores, -1) / torch.log(torch.tensor(2.)), atol=.02, rtol=.002)
+        results.append(output[0].clone())
+    assert all(torch.equal(results[0], item) for item in results)
+
+
 ROWS = 64
 PAGE = 64
 GROUPS = {

@@ -445,8 +445,8 @@ class ScaleProjection:
 
 def fp8_kv_plane_bytes(kv_heads, head_dim):
     """One planar K or V token: E4M3 heads, FP32 descales, zero alignment tail."""
-    if kv_heads <= 0 or head_dim not in (192, 256):
-        raise ValueError("positive KV heads and D192/D256 required")
+    if kv_heads <= 0 or head_dim not in (128, 192, 256):
+        raise ValueError("positive KV heads and D128/D192/D256 required")
     return (int(kv_heads) * (int(head_dim) + 4) + 15) // 16 * 16
 
 
@@ -467,6 +467,10 @@ class PackFp8KvPlane:
     def kernel(self, x: cute.Pointer, out: cute.Pointer):
         row, head, _ = cute.arch.block_idx()
         lane, _, _ = cute.arch.thread_idx()
+        self.pack_row(x, out, row, head, lane, Int64(row))
+
+    @cute.jit
+    def pack_row(self, x: cute.Pointer, out: cute.Pointer, row, head, lane, slot: Int64):
         source = _view(x)
         values = cute.make_rmem_tensor(cute.make_layout((self.values_per_lane,)), Float32)
         base = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(self.dim)
@@ -476,7 +480,7 @@ class PackFp8KvPlane:
             amax = cutlass.max(amax, cute.math.abs(values[item]))
         scale = _fp8_scale(_warp_max(amax))
         inverse = div_rn_f32(Float32(1.0), scale)
-        row_address = Int64(out.toint()) + Int64(row) * Int64(self.row_bytes)
+        row_address = Int64(out.toint()) + slot * Int64(self.row_bytes)
         if lane == Int32(0):
             scales = cute.make_tensor(cute.make_ptr(Float32,
                 row_address + Int64(self.payload_bytes), cute.AddressSpace.gmem, assumed_align=4),

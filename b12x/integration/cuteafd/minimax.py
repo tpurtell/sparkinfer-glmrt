@@ -137,7 +137,9 @@ class _RouterScores:
 
 class _KvPack:
     def __init__(self, heads=4):
+        from .pointwise import PackFp8KvPlane
         self.heads = heads
+        self.plane = PackFp8KvPlane(heads, 128)
 
     @cute.jit
     def __call__(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
@@ -152,24 +154,11 @@ class _KvPack:
                batch_ids: cute.Pointer, k_descale: cute.Pointer, v_descale: cute.Pointer,
                key_cache: cute.Pointer, value_cache: cute.Pointer):
         row, head, _ = cute.arch.block_idx()
-        lane = Int64(cute.arch.thread_idx()[0])
-        k, v, slots, batch_ids = _view(k), _view(v), _view(slots), _view(batch_ids)
-        k_descale, v_descale = _view(k_descale), _view(v_descale)
-        slot = Int64(slots[Int64(row)])
+        lane = cute.arch.thread_idx()[0]
+        slot = Int64(_view(slots)[Int64(row)])
         if slot >= Int64(0):
-            scale_at = Int64(batch_ids[Int64(row)]) * Int64(self.heads) + Int64(head)
-            ki = div_rn_f32(Float32(1.0), Float32(k_descale[scale_at]))
-            vi = div_rn_f32(Float32(1.0), Float32(v_descale[scale_at]))
-            src = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(128) + lane * Int64(4)
-            dst = (slot * Int64(self.heads) + Int64(head)) * Int64(128)
-            kp = cute.make_ptr(Uint32, Int64(key_cache.toint()) + dst,
-                               cute.AddressSpace.gmem, assumed_align=16)
-            vp = cute.make_ptr(Uint32, Int64(value_cache.toint()) + dst,
-                               cute.AddressSpace.gmem, assumed_align=16)
-            kp[lane] = cvt_f32x4_to_e4m3x4(Float32(k[src]) * ki, Float32(k[src + Int64(1)]) * ki,
-                                          Float32(k[src + Int64(2)]) * ki, Float32(k[src + Int64(3)]) * ki)
-            vp[lane] = cvt_f32x4_to_e4m3x4(Float32(v[src]) * vi, Float32(v[src + Int64(1)]) * vi,
-                                          Float32(v[src + Int64(2)]) * vi, Float32(v[src + Int64(3)]) * vi)
+            self.plane.pack_row(k, key_cache, row, head, lane, slot)
+            self.plane.pack_row(v, value_cache, row, head, lane, slot)
 
 
 def compile_minimax_norm_aot():

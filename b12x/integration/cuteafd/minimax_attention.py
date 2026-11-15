@@ -44,7 +44,9 @@ class _Attention:
         from b12x.attention.paged.traits import PagedForwardTraits
 
         self.rows, self.batch, self.mode = max_rows, max_batch, mode
+        from .pointwise import fp8_kv_plane_bytes
         self.query_heads, self.kv_heads = query_heads, kv_heads
+        self.record_bytes = fp8_kv_plane_bytes(kv_heads, 128)
         self.work, self.offsets, self.nbytes = _layout(max_rows, max_batch, mode, query_heads, kv_heads)
         union = mode == "extend"
         self.tokens = 8 if union else 1
@@ -61,7 +63,8 @@ class _Attention:
             max_smem_per_sm=102400, num_ctas_per_sm=1, max_smem_per_threadblock=101376)
         self.forward = PagedForwardKernel(cutlass.BFloat16, cutlass.Float8E4M3FN,
             cutlass.Uint8, cutlass.BFloat16, traits=traits,
-            msa_block_sparse=True, msa_union_tile=union, page_size=64)
+            msa_block_sparse=True, msa_union_tile=union, page_size=64,
+            inline_scale_offsets=(kv_heads * 128, kv_heads * 128))
 
     @cute.jit
     def _tensor(self, ptr, shape, strides):
@@ -97,7 +100,7 @@ class _Attention:
             union_masks = self._tensor(masks, (work, self.kv_heads, 128), (self.kv_heads * 128, 128, 1))
             union_counts = self._tensor(counts, (work, self.kv_heads), (self.kv_heads, 1))
         cache_layout = cute.make_layout((Int32(pool_pages), 64, self.kv_heads, 128),
-                                        stride=(64 * self.kv_heads * 128, self.kv_heads * 128, 128, 1))
+                                        stride=(64 * self.record_bytes, self.record_bytes, 128, 1))
         # Raw-pointer lowering erases byte signedness; restore it at the adapter boundary.
         k = cute.recast_tensor(cute.make_tensor(key_cache, cache_layout), cutlass.Uint8)
         v = cute.recast_tensor(cute.make_tensor(value_cache, cache_layout), cutlass.Uint8)
