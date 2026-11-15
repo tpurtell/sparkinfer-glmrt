@@ -50,6 +50,7 @@ from .decode_math import (
     s3_mask_and_scale_glm_h8_swap_ab,
     s4_online_softmax,
     s4_online_softmax_glm_h8_swap_ab,
+    s4_online_softmax_two_slot,
     s5_fill_sm_p_full,
     s6_xv_nope,
     s6_xv_nope_dsv4_h8_swap_ab,
@@ -418,6 +419,7 @@ class UnifiedDecodeKernel:
         native_dsv4_h8=False,
         native_dsv4_h16=False,
         native_dsv41_fp8=False,
+        dsv41_half_tile=False,
         vector_q=False,
         zero_masked_v=False,
         single_split_partial_bf16=None,
@@ -468,6 +470,16 @@ class UnifiedDecodeKernel:
             int(traits.model_type) == int(ModelType.DSV41)
             and not self.native_dsv41_fp8
         )
+        # Resident-half-tile arm: eight heads per CTA, four math warps, one
+        # staged KV buffer holding a 32-candidate decode tile, and two
+        # candidate passes per chunk. Two CTAs then fit one SM on both the
+        # shared-memory and register budgets.
+        self.dsv41_half_tile = bool(dsv41_half_tile)
+        if self.dsv41_half_tile:
+            if not self.dsv41_bf16_tile or int(valid_hpb) != 8 or int(traits.hpb) != 8:
+                raise ValueError(
+                    "dsv41_half_tile requires the DSV41 BF16 tile path at hpb=8"
+                )
         self.native_h16 = self.native_dsv4_h16 or (
             self.native_dsv41_fp8 and int(valid_hpb) == 16
         )
@@ -781,14 +793,15 @@ class UnifiedDecodeKernel:
                         sm_scale_log2: Float32, rows: Int32, stream: cuda.CUstream):
         # Internal native entry: host binding must validate FP4 descriptors,
         # aligned planes, live-row bounds and disjoint caller-owned scratch.
-        assert self.traits.model_type == ModelType.DSV41 and self.valid_hpb == 16
+        assert self.traits.model_type == ModelType.DSV41 and self.valid_hpb in (8, 16)
         assert self.topk == 128 and self.extra_topk == 512
         assert self.chunks_per_split == 1 and self.num_splits == 10
         assert self.swa_indices_stride_row == self.extra_indices_stride_row
         self.kernel_native_v41(q, descriptors, metadata, selected, bounds,
                                mid_out, mid_lse, sm_scale_log2).launch(
             grid=(rows, self.h_blocks, self.num_splits),
-            block=(self.block_threads, 1, 1), min_blocks_per_mp=1, stream=stream)
+            block=(self.block_threads, 1, 1),
+            min_blocks_per_mp=(2 if self.dsv41_half_tile else 1), stream=stream)
 
     @cute.kernel
     def kernel_native_v41(self, q: cute.Tensor, descriptors: cute.Tensor,
@@ -965,7 +978,9 @@ class UnifiedDecodeKernel:
         # const_expr is elided (==0) for the full-block / base path -> byte-identical.
         if cutlass.const_expr(self.head_block_offset != 0):
             head_block = head_block + Int32(self.head_block_offset)
-        head_base = head_block * Int32(8 if self.native_h8 else t.hpb)
+        head_base = head_block * Int32(
+            8 if (self.native_h8 or self.dsv41_half_tile) else t.hpb
+        )
 
         if cutlass.const_expr(native_descriptors is not None):
             valid_request = native_v41_metadata_valid(
@@ -1296,6 +1311,255 @@ class UnifiedDecodeKernel:
         # ════════════════════════════════════════════════════════════════════
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
         # ════════════════════════════════════════════════════════════════════
+        if cutlass.const_expr(self.dsv41_half_tile):
+            # ── Resident half tile: one staged buffer, four 32-key bursts per
+            #    chunk (K halves then V halves), written straight-line because a
+            #    constexpr loop would create staging values per iteration that
+            #    later iterations cannot see. One chunk per split means producer
+            #    and math warps strictly alternate; the per-burst CTA barriers
+            #    hold the producer until the math warps finish reading the tile.
+            ht_kv_b = kv_fp8_addr
+            ht_tok_buf = cute.make_tensor(
+                token_idx_view.iterator,
+                cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+            )
+            ht_io_lane = tid - Int32(self.math_threads)
+            ht_ci0 = split_first_chunk
+            ht_in_main = ht_ci0 < num_main_chunks
+            ht_base_key = ht_ci0 * Int32(2 * _CAND_WINDOW)
+            if not ht_in_main:
+                ht_base_key = (ht_ci0 - num_main_chunks) * Int32(2 * _CAND_WINDOW)
+            if is_io:
+                if ht_in_main:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(0), ht_io_lane,
+                        swa=True, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                else:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(0), ht_io_lane,
+                        swa=False, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                cute.arch.barrier()
+                cute.arch.barrier()
+                if ht_in_main:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(32), ht_io_lane,
+                        swa=True, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                else:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(32), ht_io_lane,
+                        swa=False, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                cute.arch.barrier()
+                cute.arch.barrier()
+                if ht_in_main:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(0), ht_io_lane,
+                        swa=True, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                else:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(0), ht_io_lane,
+                        swa=False, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                cute.arch.barrier()
+                cute.arch.barrier()
+                if ht_in_main:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(32), ht_io_lane,
+                        swa=True, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                else:
+                    issue_native_v41_gather(
+                        native_descriptors[token_idx, None],
+                        native_metadata[token_idx, None], extra_row,
+                        native_bounds[token_idx], ht_kv_b, kv_sc_addr,
+                        ht_tok_buf, mbar_base,
+                        ht_base_key + Int32(32), ht_io_lane,
+                        swa=False, kv_stride=staged_kv_stride,
+                        io_threads=self.io_threads, fp8_internal=False,
+                        entries=32)
+                cute.arch.barrier()
+                cute.arch.barrier()
+            else:
+                ht_qk_a = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                ht_qk_b = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                ht_p_a = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                ht_p_b = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                ht_gmax = [Float32(-1e30), Float32(-1e30)]
+                ht_gsum = [Float32(0.0), Float32(0.0)]
+                ht_n_acc = 2 * int(t.n_v_chunks)
+                ht_acc = [
+                    [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                    for _ in range(ht_n_acc)
+                ]
+                ht_accr = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                cute.arch.mbarrier_wait(mbar_base, phase=Int32(0))
+                if ht_in_main:
+                    decode_dsv41_kv_to_bf16_smem(
+                        ht_kv_b, warp_id, lane, swa=True, bi=32,
+                        row_stride=staged_kv_stride,
+                        raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                        math_warps=self.math_threads // 32)
+                else:
+                    decode_dsv41_kv_to_bf16_smem(
+                        ht_kv_b, warp_id, lane, swa=False, bi=32,
+                        row_stride=staged_kv_stride,
+                        raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                        math_warps=self.math_threads // 32)
+                cute.arch.barrier()
+                ht_qk_a = s1_qk_dsv41_bf16_smem(
+                    ht_qk_a, q_fp8_addr, ht_kv_b, warp_id * Int32(8), lane,
+                    d_nope=t.d_nope, q_nope_bf16_stride=t.q_nope_stride,
+                    kv_bf16_stride=staged_kv_stride)
+                cute.arch.barrier()
+                cute.arch.mbarrier_wait(mbar_base, phase=Int32(1))
+                if ht_in_main:
+                    decode_dsv41_kv_to_bf16_smem(
+                        ht_kv_b, warp_id, lane, swa=True, bi=32,
+                        row_stride=staged_kv_stride,
+                        raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                        math_warps=self.math_threads // 32)
+                else:
+                    decode_dsv41_kv_to_bf16_smem(
+                        ht_kv_b, warp_id, lane, swa=False, bi=32,
+                        row_stride=staged_kv_stride,
+                        raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                        math_warps=self.math_threads // 32)
+                cute.arch.barrier()
+                ht_qk_b = s1_qk_dsv41_bf16_smem(
+                    ht_qk_b, q_fp8_addr, ht_kv_b, warp_id * Int32(8), lane,
+                    d_nope=t.d_nope, q_nope_bf16_stride=t.q_nope_stride,
+                    kv_bf16_stride=staged_kv_stride)
+                cute.arch.barrier()
+                cute.arch.mbarrier_wait(mbar_base, phase=Int32(0))
+                if ht_in_main:
+                    decode_dsv41_kv_to_bf16_smem(
+                        ht_kv_b, warp_id, lane, swa=True, bi=32,
+                        row_stride=staged_kv_stride,
+                        raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                        math_warps=self.math_threads // 32)
+                else:
+                    decode_dsv41_kv_to_bf16_smem(
+                        ht_kv_b, warp_id, lane, swa=False, bi=32,
+                        row_stride=staged_kv_stride,
+                        raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                        math_warps=self.math_threads // 32)
+                cute.arch.barrier()
+                ht_p_a, ht_p_b, ht_wr0a, ht_wr1a, ht_wr0b, ht_wr1b = (
+                    s4_online_softmax_two_slot(
+                        ht_qk_a, ht_qk_b, ht_p_a, ht_p_b, ht_acc, ht_accr,
+                        ht_gmax, ht_gsum, reduce_max_addr, reduce_sum_addr,
+                        False, warp_id, lane, tid,
+                        n_v_chunks=t.n_v_chunks, hpb=int(t.hpb),
+                        n_warps=self.math_threads // 32,
+                        valid_hpb=self.valid_hpb,
+                        num_threads=self.math_threads,
+                        barrier_id=3, n_acc_tiles=ht_n_acc))
+                ht_w_pre_a = [ht_p_a[0] * ht_wr0a, ht_p_a[1] * ht_wr0a,
+                              ht_p_a[2] * ht_wr1a, ht_p_a[3] * ht_wr1a]
+                ht_w_pre_b = [ht_p_b[0] * ht_wr0b, ht_p_b[1] * ht_wr0b,
+                              ht_p_b[2] * ht_wr1b, ht_p_b[3] * ht_wr1b]
+                s5_fill_sm_p_bf16(
+                    ht_w_pre_a, sm_p_full_addr, warp_id, lane,
+                    sm_p_stride=L.sm_p_full_stride, column_offset=0)
+                s5_fill_sm_p_bf16(
+                    ht_w_pre_b, sm_p_full_addr, warp_id, lane,
+                    sm_p_stride=L.sm_p_full_stride, column_offset=32)
+                cute.arch.barrier()
+                ht_acc = s6_pv_dsv41_bf16_smem(
+                    ht_acc, sm_p_full_addr, ht_kv_b, warp_id, lane,
+                    n_v_chunks=t.n_v_chunks, bi=32,
+                    sm_p_stride=L.sm_p_full_stride,
+                    kv_bf16_stride=staged_kv_stride,
+                    n_warps=self.math_threads // 32, n_tiles=2)
+                cute.arch.barrier()
+                cute.arch.mbarrier_wait(mbar_base, phase=Int32(1))
+                if ht_in_main:
+                    decode_dsv41_kv_to_bf16_smem(
+                        ht_kv_b, warp_id, lane, swa=True, bi=32,
+                        row_stride=staged_kv_stride,
+                        raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                        math_warps=self.math_threads // 32)
+                else:
+                    decode_dsv41_kv_to_bf16_smem(
+                        ht_kv_b, warp_id, lane, swa=False, bi=32,
+                        row_stride=staged_kv_stride,
+                        raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                        math_warps=self.math_threads // 32)
+                cute.arch.barrier()
+                ht_acc = s6_pv_dsv41_bf16_smem(
+                    ht_acc, sm_p_full_addr, ht_kv_b, warp_id, lane,
+                    n_v_chunks=t.n_v_chunks, bi=32,
+                    sm_p_stride=L.sm_p_full_stride,
+                    kv_bf16_stride=staged_kv_stride,
+                    n_warps=self.math_threads // 32, n_tiles=2)
+                cute.arch.barrier()
+                ht_out_o = cute.make_tensor(
+                    mid_out.iterator
+                    + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
+                    + head_base.to(Int64) * Int64(self.mid_out_stride_head)
+                    + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
+                    cute.make_layout(
+                        (t.hpb, t.d_v),
+                        stride=(self.mid_out_stride_head,
+                                self.mid_out_stride_dim),
+                    ),
+                )
+                ht_out_lse = cute.make_tensor(
+                    mid_lse.iterator
+                    + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
+                    + head_base.to(Int64) * Int64(self.mid_lse_stride_head)
+                    + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
+                    cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
+                )
+                s7_epilogue(
+                    ht_acc, ht_accr, ht_gmax, ht_gsum, ht_out_o, ht_out_lse,
+                    warp_id, lane,
+                    n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile,
+                    d_nope=t.d_nope, d_rope=t.d_rope,
+                    n_warps=self.math_threads // 32, valid_hpb=self.valid_hpb,
+                    nt_per_warp_xv=2, v_has_rope=False,
+                    single_split_partial_bf16=None, rope_tiles_per_warp=1)
+            _exit_thread()
+
         if is_io:
             io_lane = tid - Int32(self.math_threads)
             prod_phase = Int32(1)

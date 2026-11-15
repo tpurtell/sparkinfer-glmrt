@@ -5,6 +5,7 @@ alignment, immutable leases and scratch disjointness. All row counts are live
 launch arguments. No allocation, compilation or host synchronization in replay.
 """
 import math
+from dataclasses import replace
 
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
@@ -21,7 +22,7 @@ from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
 
 
 class NativeV41Attention:
-    def __init__(self, heads: int = 64):
+    def __init__(self, heads: int = 64, half_tile: bool = False):
         if heads not in (32, 64):
             raise ValueError("native V4.1 attention requires 32 or 64 local heads")
         self.heads = heads
@@ -29,12 +30,22 @@ class NativeV41Attention:
         # matching the prefill arithmetic without canonical FP8 requantization.
         traits = make_unified_traits(ModelType.DSV41, ComputeMode.BF16,
                                      ScaleFormat.NVFP4_E4M3, fp8_rope=False)
-        self.decode = UnifiedDecodeKernel(traits, make_smem_layout(traits), 64, 1,
-            h_blocks=heads//16, num_splits=10, num_heads=heads, q_head_dim=512,
+        # Half-tile arm: eight heads per CTA, four math warps, one staged KV
+        # buffer holding a 32-candidate decode tile. Its 49,152 B dynamic
+        # shared memory and 160 threads leave room for two resident CTAs.
+        self.half_tile = bool(half_tile)
+        if self.half_tile:
+            traits = replace(traits, hpb=8, kv_bufs=1, math_threads=128,
+                             block_threads=160, nt_per_warp_xv=2)
+        self.decode = UnifiedDecodeKernel(
+            traits, make_smem_layout(traits), 64, 1,
+            h_blocks=heads//(8 if self.half_tile else 16), num_splits=10,
+            num_heads=heads, q_head_dim=512,
             topk=128, extra_topk=512, q_stride=(heads*512, 512, 1),
             swa_indices_stride0=512, extra_indices_stride0=512,
             mid_out_stride=(heads*5120, 5120, 512, 1), mid_lse_stride=(heads*10, 10, 1),
-            has_extra=True, pbs_extra=256, valid_hpb=16, vector_q=True)
+            has_extra=True, pbs_extra=256, valid_hpb=8 if self.half_tile else 16,
+            vector_q=not self.half_tile, dsv41_half_tile=self.half_tile)
         self.merge = SparseMLASplitDecodeSinkMergeKernel(static_num_chunks=10)
 
     @cute.jit
@@ -57,10 +68,10 @@ class NativeV41Attention:
         self.merge(p, lse, begins, sinks, out, stream)
 
 
-def compile_native_v41_attention_aot(heads: int = 64):
+def compile_native_v41_attention_aot(heads: int = 64, half_tile: bool = False):
     """Compile static local-head geometry; live row counts never enter the key."""
-    launch = NativeV41Attention(heads)
-    key = (heads, 512, 128, 512, 10, torch.cuda.current_device())
+    launch = NativeV41Attention(heads, half_tile)
+    key = (heads, 512, 128, 512, 10, int(half_tile), torch.cuda.current_device())
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     types = (BFloat16, Uint64, Uint64, Int32, Uint64, Float32, BFloat16, Float32, BFloat16)
     alignments = (16, 8, 8, 4, 8, 4, 16, 4, 16)
