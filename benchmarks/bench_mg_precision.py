@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, replace
 import json
+import math
 from pathlib import Path
 import statistics
 import subprocess
@@ -42,11 +43,13 @@ def parse_args(argv=None):
         return v
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--format", choices=("dsv4", "dsv41"), required=True)
+    p.add_argument("--mode", choices=("prefill", "decode"), default="prefill")
     p.add_argument("--heads", type=int, default=64)
     p.add_argument("--indexed-width", type=int, default=512)
     p.add_argument("--rows", type=ints, default=ints("1,64,2048,2752,4096"))
     p.add_argument("--timing-rows", type=ints, default=ints("64,1536,2048,2752,4096"))
     p.add_argument("--scores", default="spread,peaked")
+    p.add_argument("--accuracy-only", action="store_true")
     p.add_argument("--samples", type=int, default=7)
     p.add_argument("--replays", type=int, default=20)
     p.add_argument("--warmup", type=int, default=10)
@@ -54,13 +57,83 @@ def parse_args(argv=None):
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args(argv)
     args.scores = args.scores.split(",")
+    if args.accuracy_only:
+        args.timing_rows = []
     if set(args.scores) - {"spread", "peaked"}:
         p.error("scores must be spread,peaked")
     if args.heads < 16 or args.heads % 16 or min(args.indexed_width, args.samples, args.replays, args.warmup) < 1:
         p.error("heads must be a positive multiple of 16; counts must be positive")
     if args.indexed_width > 4096:
         p.error("indexed width exceeds the 4096-key synthetic pool")
+    if args.mode == "decode" and (args.format != "dsv41" or args.indexed_width != 512):
+        p.error("native decode requires dsv41 with indexed width512")
     return args
+
+
+def build_decode(q, main_cache, extra_cache, mi, ei, sink):
+    """Compile existing native producer and generic BF16 producer, same10 splits.
+
+    The optional F32 partial arm changes only the typed tensor supplied to the
+    existing epilogue/merge, not their implementation. Native producer mapping
+    uses the same committed-ring/private-window ABI as test_native_v41_producer.
+    """
+    import torch
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from cuda.bindings import driver as cuda
+    from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
+    from b12x.attention._shared.mla.smem import make_smem_layout
+    from b12x.attention._shared.mla.merge import SparseMLASplitDecodeSinkMergeKernel
+    rows, heads, _ = q.shape
+    sr, cr = main_cache.view(-1,528), extra_cache.view(-1,288)
+    values = [sr[:128,:512].contiguous(), sr[128:128+rows,:512].contiguous(), cr[:,:256].contiguous(), cr[:1,:256].contiguous()]
+    scales = [sr[:128,512:].contiguous(), sr[128:128+rows,512:].contiguous(), cr[:,256:].contiguous(), cr[:1,256:].contiguous()]
+    end = torch.tensor([128], device=q.device, dtype=torch.uint64)
+    source_end = torch.tensor([cr.shape[0]], device=q.device, dtype=torch.uint64)
+    pages = torch.arange(cr.shape[0]//256, device=q.device).to(torch.uint32)
+    descriptor = [x.data_ptr() for x in values+scales] + [end.data_ptr(),pages.data_ptr(),source_end.data_ptr(),rows,cr.shape[0],1,(2<<32)|(cr.shape[0]//256)]
+    desc = torch.tensor([descriptor]*rows, device=q.device, dtype=torch.uint64)
+    meta = torch.tensor([[128,0,rows,128+r,0,cr.shape[0],cr.shape[0],0,0,1] for r in range(rows)], device=q.device, dtype=torch.uint64)
+    bounds = torch.zeros(rows,device=q.device,dtype=torch.uint64)
+    # Native ring uses committed first128 plus private rows; same logical keys
+    # as generic main-cache slots1..128, then2..129, etc.
+    assert torch.equal(mi, torch.arange(128,device=q.device)[None] + torch.arange(rows,device=q.device)[:,None] + 1)
+    retained = [values,scales,end,source_end,pages,desc,meta,bounds]
+    runs, lses = {}, {}
+    for arm in ("fp8-decode", "bf16-decode", "fp8-f32-partials"):
+        native = arm != "bf16-decode"
+        traits = arm_traits("dsv41", "fp8-pv" if native else "bf16-pv")
+        if native:
+            traits = replace(traits,compute_mode=ComputeMode.FP8,q_nope_stride=528,kv_smem_stride=624,nt_per_warp_xv=traits.nt_per_warp_xv*2)
+        partial = torch.empty(rows,heads,10,512,device=q.device,dtype=torch.float32 if arm == "fp8-f32-partials" else torch.bfloat16)
+        lse = torch.empty(rows,heads,10,device=q.device)
+        output = torch.empty_like(q)
+        kernel = UnifiedDecodeKernel(traits,make_smem_layout(traits),64,1,h_blocks=heads//16,num_splits=10,num_heads=heads,q_head_dim=512,
+            topk=128,extra_topk=512,q_stride=q.stride(),swa_indices_stride0=512 if native else 128,extra_indices_stride0=512,
+            mid_out_stride=partial.stride(),mid_lse_stride=lse.stride(),has_extra=True,pbs_extra=256,valid_hpb=16,native_dsv41_fp8=native)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        scale = cutlass.Float32(512**-.5 * math.log2(math.e))
+        if native:
+            params = tuple(from_dlpack(x) for x in (q,desc,meta,ei,bounds,partial,lse))
+            compiled = cute.compile(kernel.call_native_v41,*params,scale,cutlass.Int32(rows),stream)
+            decode_args = (*params,scale,cutlass.Int32(rows))
+        else:
+            params = tuple(from_dlpack(x) for x in (q,main_cache.flatten(),mi,partial,lse))
+            extra = tuple(from_dlpack(x) for x in (extra_cache.flatten(),ei))
+            decode_args = (*params,scale,cutlass.Float32(1),cutlass.Int32(128),cutlass.Int64(main_cache.stride(0)),*extra,
+                cutlass.Int32(512),cutlass.Int32(2),cutlass.Int64(extra_cache.stride(0)),cutlass.Int32(rows))
+            compiled = cute.compile(kernel.call_extra,*decode_args,stream)
+        merge = SparseMLASplitDecodeSinkMergeKernel(static_num_chunks=10)
+        merge_args = tuple(from_dlpack(x) for x in (partial,lse,bounds,sink,output))
+        merged = cute.compile(merge,*merge_args,stream)
+        def run(compiled=compiled,decode_args=decode_args,merged=merged,merge_args=merge_args,retained=retained):
+            current = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            compiled(*decode_args,current)
+            merged(*merge_args,current)
+        runs[arm] = (run,output)
+        lses[arm] = lse
+    return runs, lses
 
 
 def main(argv=None):
@@ -90,19 +163,25 @@ def main(argv=None):
         c = pack_compressed_sparse_mla_kv_cache_reference(v[:, :448], v[:, 448:], page_size=page)
         k, val = unpack_compressed_sparse_mla_kv_cache_reference(c, page_size=page)
         return c, k, val
+    if args.mode == "decode":
+        if max_rows > 64:
+            raise ValueError("decode diagnostic is bounded to64 rows")
+        main_page = 64
     main_cache, mk, mv = pack(values[0], main_page, "swa")
     extra_cache, ek, ev = pack(values[1], extra_page, "indexed")
     row = torch.arange(max_rows, device=device)[:, None]
-    mi = ((row + torch.arange(window, device=device)[None]) % pool).int().contiguous()
+    mi = ((row + (1 if args.mode == "decode" else 0) + torch.arange(window, device=device)[None]) % pool).int().contiguous()
     ei = ((row * 37 + torch.arange(args.indexed_width, device=device)[None] * 17) % pool).int().contiguous()
     ml = torch.full((max_rows,), window, device=device, dtype=torch.int32)
     el = torch.full((max_rows,), args.indexed_width, device=device, dtype=torch.int32)
     sink = torch.linspace(-1, 1, args.heads, device=device)
     arms = ("fp8-qk", "bf16-qk") if args.format == "dsv4" else ("bf16-pv", "fp8-pv")
-    report = {"format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
+    if args.mode == "decode":
+        arms = ("fp8-decode", "bf16-decode", "fp8-f32-partials")
+    report = {"mode": args.mode, "lse_unit": "natural_log", "format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
         "fork_sha": subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True).strip(),
         "device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
-        "traits": {arm: asdict(arm_traits(args.format, arm)) for arm in arms}, "records": []}
+        "traits": {arm: asdict(arm_traits(args.format, arm)) for arm in arms} if args.mode == "prefill" else {}, "records": []}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for pattern in args.scores:
         q = (torch.randn(max_rows, args.heads, 512, device=device) * (.03 if pattern == "spread" else .2)).bfloat16()
@@ -142,11 +221,19 @@ def main(argv=None):
             record = {"scores": pattern, "rows": rows, "distribution": distribution, "arms": {}}
             graphs = {}
             try:
+                decode_runs, decode_lses = build_decode(q[:rows], main_cache, extra_cache, mi[:rows], ei[:rows], sink) if args.mode == "decode" else ({}, {})
+                def execute(arm):
+                    if decode_runs:
+                        decode_runs[arm][0]()
+                    else:
+                        run(arm, rows)
                 for arm in arms:
-                    run(arm, rows)
+                    execute(arm)
                     torch.cuda.synchronize()
-                    delta = out[arm][:rows].float() - ref[:rows]
-                    ld = lse[arm][:rows] - ref_lse[:rows]
+                    actual = decode_runs[arm][1] if decode_runs else out[arm][:rows]
+                    actual_lse = torch.logaddexp(torch.logsumexp(decode_lses[arm] * math.log(2), -1), sink[None]) if decode_runs else lse[arm][:rows] * math.log(2)
+                    delta = actual.float() - ref[:rows]
+                    ld = actual_lse - ref_lse[:rows]
                     if not bool(torch.isfinite(delta).all() & torch.isfinite(ld).all()):
                         raise RuntimeError(f"nonfinite result: {arm}/{rows}/{pattern}")
                     record["arms"][arm] = {"output_rel_rms": float(delta.square().mean().sqrt() / ref[:rows].square().mean().sqrt()),
@@ -154,11 +241,11 @@ def main(argv=None):
                         "lse_rms": float(ld.square().mean().sqrt())}
                     if rows in args.timing_rows:
                         for _ in range(args.warmup):
-                            run(arm, rows)
+                            execute(arm)
                         torch.cuda.synchronize()
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph):
-                            run(arm, rows)
+                            execute(arm)
                         graphs[arm] = graph
                         graph.replay()
                 torch.cuda.synchronize()

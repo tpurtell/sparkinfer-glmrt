@@ -36,6 +36,15 @@ def test_native_internal_fp8_does_not_select_fp8_qk():
     assert not bf16.fp8_internal and fp8.fp8_internal
 
 
+def test_decode_contract_and_accuracy_only(tmp_path):
+    args = parse_args(["--format", "dsv41", "--mode", "decode", "--rows", "1,2,4,8,16,64",
+        "--accuracy-only", "--output", str(tmp_path / "out.json")])
+    assert args.timing_rows == []
+    assert args.rows == [1, 2, 4, 8, 16, 64]
+    with pytest.raises(SystemExit):
+        parse_args(["--format", "dsv4", "--mode", "decode", "--output", str(tmp_path / "o.json")])
+
+
 def test_wrong_format_arm_rejected():
     with pytest.raises(ValueError):
         arm_traits("dsv41", "fp8-qk")
