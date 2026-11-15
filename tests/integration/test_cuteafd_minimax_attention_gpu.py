@@ -24,7 +24,15 @@ def _receipt(label, output, expected, lse, expected_lse):
         return
     actual, reference = output.float(), expected.float()
     difference = actual - reference
+    import b12x.attention.paged.forward_extend_generic as kernel
+
+    source = Path(kernel.__file__).resolve()
+    expected_source = os.environ.get("MINIMAX_ATTENTION_SOURCE")
+    if expected_source:
+        assert source == Path(expected_source).resolve(), (source, expected_source)
     record = dict(
+        kernel_source=str(source),
+        kernel_source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         test=os.environ["PYTEST_CURRENT_TEST"].removesuffix(" (call)"), cell=label,
         output_shape=list(output.shape),
         output_rms_error=difference.square().mean().sqrt().item(),
