@@ -519,6 +519,148 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
     return storage_cls
 
 
+NATIVE_V41_COMPACT_RAW_STRIDE = 576
+NATIVE_V41_COMPACT_SLICE_STRIDE = 128
+NATIVE_V41_COMPACT_QP_STRIDE = 72
+
+
+def make_native_v41_compact_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
+    """Compact feature-sliced (D_SLICE=64) SMEM layout for NativeV41Attention.
+
+    Stages all 64 raw mixed FP8/FP4 records once per split at a 576B row stride
+    (16B-aligned, 16-bank half-row rotation for conflict-free LDS.128), plus one
+    reusable [64, 64] swizzled BF16 slice buffer (8,192B) and lifetime-aliased
+    q_slice / sm_p_full staging (2,304B).
+    """
+    if traits.model_type != ModelType.DSV41 or traits.fp8_internal:
+        raise ValueError("compact V4.1 slice SMEM layout requires native BF16 DSV41 traits")
+    bi = traits.bi
+    hpb = traits.hpb
+
+    kv_raw_off = 0
+    kv_raw_bytes = bi * NATIVE_V41_COMPACT_RAW_STRIDE  # 36,864 B
+
+    kv_slice_off = _align_up(kv_raw_off + kv_raw_bytes, 128)  # 36,864
+    kv_slice_bytes = bi * NATIVE_V41_COMPACT_SLICE_STRIDE  # 8,192 B
+
+    qp_off = _align_up(kv_slice_off + kv_slice_bytes, 128)  # 45,056
+    qp_bytes = hpb * NATIVE_V41_COMPACT_QP_STRIDE * 2  # 2,304 B
+
+    reduce_off = _align_up(qp_off + qp_bytes, 16)  # 47,360
+    reduce_warp_max_off = reduce_off
+    reduce_warp_sum_off = reduce_off + _MATH_WARPS * hpb * 4
+    reduce_bytes = 2 * _MATH_WARPS * hpb * 4  # 1,024 B
+
+    token_idx_off = _align_up(reduce_off + reduce_bytes, 16)  # 48,384
+    token_idx_bytes = bi * 4  # 256 B
+
+    mbar_off = _align_up(token_idx_off + token_idx_bytes, 16)  # 48,640
+    mbar_bytes = 16  # full[0], empty[0]
+
+    total_bytes = _align_up(mbar_off + mbar_bytes, 128)  # 48,768 B
+
+    return SmemLayout(
+        q_rope_off=0,
+        q_rope_bytes=0,
+        q_rope_stride=0,
+        q_fp8_off=qp_off,
+        q_fp8_bytes=qp_bytes,
+        q_nope_stride=NATIVE_V41_COMPACT_QP_STRIDE,
+        q_sc_off=0,
+        q_sc_bytes=0,
+        q_sc_stride=0,
+        kv_fp8_off=kv_raw_off,
+        kv_fp8_buf_bytes=kv_raw_bytes,
+        kv_smem_stride=NATIVE_V41_COMPACT_RAW_STRIDE,
+        kv_sc_off=kv_slice_off,
+        kv_sc_buf_bytes=kv_slice_bytes,
+        kv_sc_stride=NATIVE_V41_COMPACT_SLICE_STRIDE,
+        kv_rope_off=0,
+        kv_rope_buf_bytes=0,
+        kv_rope_stride=0,
+        kv_bufs=1,
+        mbar_off=mbar_off,
+        mbar_bytes=mbar_bytes,
+        reduce_off=reduce_off,
+        reduce_bytes=reduce_bytes,
+        reduce_warp_max_off=reduce_warp_max_off,
+        reduce_warp_sum_off=reduce_warp_sum_off,
+        w_head_sc_off=0,
+        w_head_sc_bytes=0,
+        w_head_sc_stride=0,
+        w_fp8_off=0,
+        w_fp8_buf_bytes=0,
+        w_fp8_stride=0,
+        w_fp8_bufs=0,
+        token_idx_off=token_idx_off,
+        token_idx_buf_bytes=token_idx_bytes,
+        token_idx_bufs=1,
+        sm_p_full_off=qp_off,
+        sm_p_full_bytes=qp_bytes,
+        sm_p_full_stride=NATIVE_V41_COMPACT_QP_STRIDE,
+        w_head_sc2_off=0,
+        w_head_sc2_bytes=0,
+        total_bytes=total_bytes,
+    )
+
+
+def get_native_v41_compact_shared_storage_cls(traits: UnifiedMLATraits):
+    """Typed SharedStorage matching make_native_v41_compact_smem_layout."""
+    layout = make_native_v41_compact_smem_layout(traits)
+
+    class CompactSharedStorage:
+        pass
+
+    CompactSharedStorage.__annotations__ = {
+        "kv_raw": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(layout.kv_fp8_buf_bytes)],
+            128,
+        ],
+        "kv_bf16_slice": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(layout.kv_sc_buf_bytes)],
+            128,
+        ],
+        "q_or_p": cute.struct.Align[
+            cute.struct.MemRange[cutlass.BFloat16, int(layout.sm_p_full_bytes // 2)],
+            128,
+        ],
+        "reduce": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, int(layout.reduce_bytes // 4)],
+            16,
+        ],
+        "token_idx": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Int32, int(layout.token_idx_buf_bytes // 4)],
+            16,
+        ],
+        "mbar": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint64, int(layout.mbar_bytes // 8)],
+            16,
+        ],
+    }
+    storage_cls = cute.struct(CompactSharedStorage)
+    expected_offsets = {
+        "kv_raw": layout.kv_fp8_off,
+        "kv_bf16_slice": layout.kv_sc_off,
+        "q_or_p": layout.sm_p_full_off,
+        "reduce": layout.reduce_off,
+        "token_idx": layout.token_idx_off,
+        "mbar": layout.mbar_off,
+    }
+    actual_offsets = dict(storage_cls._offsets)
+    if actual_offsets != expected_offsets:
+        raise ValueError(
+            "compact V4.1 SharedStorage offsets diverge from SmemLayout: "
+            f"typed={actual_offsets}, logical={expected_offsets}"
+        )
+    typed_bytes = int(storage_cls.size_in_bytes())
+    if typed_bytes != layout.total_bytes:
+        raise ValueError(
+            "compact V4.1 SharedStorage size diverges from SmemLayout: "
+            f"typed={typed_bytes}, logical={layout.total_bytes}"
+        )
+    return storage_cls
+
+
 # ---------------------------------------------------------------------------
 # Module-level size + stride assertions for BOTH validated models. These run at
 # import time (pure Python) and guard against a layout change blowing the SM120
