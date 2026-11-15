@@ -176,13 +176,25 @@ def producer_cases(args):
             k, v = [torch.randn(capacity, 4, 128, device=dev).bfloat16() for _ in range(2)]
             slots = torch.arange(capacity, device=dev, dtype=torch.int64) * 2 + 64
             slots[3::7] = -1
-            batch = (torch.arange(capacity, device=dev) % 3).int()
-            kd = torch.tensor([[1, .5, 2, .25], [.75, 1.5, 3, .125], [2.5, .3, 1, .2]], device=dev)
-            vd = kd.flip(0).contiguous()
-            caches = [torch.empty((capacity * 2 + 128, 4, 128), device=dev, dtype=torch.uint8) for _ in range(2)]
-            operands = (k, v, slots, batch, kd, vd, *caches)
-            refs = [(value.float() * (1 / scale[batch.long(), :, None])).to(torch.float8_e4m3fn).view(torch.uint8)
-                    for value, scale in zip((k, v), (kd, vd))]
+            from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
+            scaled_records = "record_bytes" in program.geometry
+            record = fp8_kv_plane_bytes(4, 128) if scaled_records else 512
+            cache_rows = (capacity * 2 + 191) // 64 * 64
+            caches = [torch.empty((cache_rows, record), device=dev, dtype=torch.uint8) for _ in range(2)]
+            operands = ((k, v, slots, *caches) if scaled_records else
+                        (k, v, slots, torch.zeros(capacity, dtype=torch.int32, device=dev),
+                         torch.ones((1, 4), device=dev), torch.ones((1, 4), device=dev), *caches))
+            refs = []
+            for value in (k, v):
+                source = value.float().cpu()
+                scale = source.abs().amax(-1) / 448 if scaled_records else torch.ones_like(source[..., 0])
+                scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+                codes = (source * (1 / scale[..., None])).to(torch.float8_e4m3fn)
+                reference = torch.zeros((capacity, record), dtype=torch.uint8)
+                reference[:, :512] = codes.view(torch.uint8).reshape(capacity, 512)
+                if scaled_records:
+                    reference[:, 512:528] = scale.view(torch.uint8)
+                refs.append(reference.to(dev))
         full_bits = None
         if name != "kv_pack":
             program.launch(*operands, scalars=(max(args.rows),))
@@ -201,10 +213,16 @@ def producer_cases(args):
                     expected = torch.full_like(cache, 173)
                     active = slots[:rows] >= 0
                     expected[slots[:rows][active]] = reference[:rows][active]
+                    if scaled_records and program.geometry.get("scale_stride") is not None:
+                        records = expected.view(-1, 64, record)
+                        split = torch.empty_like(records).reshape(-1, 64 * record)
+                        split[:, :64 * 512] = records[..., :512].reshape(-1, 64 * 512)
+                        split[:, 64 * 512:] = records[..., 512:].reshape(-1, 64 * (record - 512))
+                        expected = split.reshape_as(cache)
                     assert torch.equal(cache, expected), "KV byte oracle or untouched suffix"
                 outputs = caches
                 row_bits = [cache[64].view(torch.uint8).clone() for cache in caches]
-                byte_count, flops = rows * 3072, 0
+                byte_count, flops = rows * (2048 + 2 * record), 0
             else:
                 torch.testing.assert_close(out[:rows], ref[:rows], rtol=rtol, atol=atol)
                 assert torch.isnan(out[rows:]).all(), "writes beyond live rows"
@@ -220,6 +238,95 @@ def producer_cases(args):
             us, raw = measure(fn, args.iterations, args.samples)
             yield dict(kernel=name, rows=rows, median_us=us, samples_us=raw,
                        nominal_bytes=byte_count, nominal_flops=flops, manifest=manifest, **comparison)
+
+
+def attention_cases(args):
+    if "attention" not in args.kernels:
+        return
+    from b12x.integration.cuteafd.minimax import compile_minimax_kv_pack_aot
+    from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
+    from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
+
+    torch.manual_seed(20261115)
+    context, heads = 8192, 4
+    pool = context // 64
+    key = torch.randn((context, heads, 128), device="cuda").bfloat16()
+    value = (torch.randn_like(key) * .01).bfloat16()
+    value[::127, :, 0] = 1024
+    pack = compile_minimax_kv_pack_aot(heads=heads)
+    scaled_records = "record_bytes" in pack.geometry
+    desc = torch.ones((max(args.rows), heads), device="cuda")
+    if args.attention_kv == "bf16":
+        packed = [x.reshape(pool, 64, heads, 128) for x in (key, value)]
+    elif scaled_records:
+        record = fp8_kv_plane_bytes(heads, 128)
+        packed = [torch.empty((context, record), dtype=torch.uint8, device="cuda") for _ in range(2)]
+        pack.launch(key, value, torch.arange(context, dtype=torch.int64, device="cuda"), *packed,
+                    scalars=(context,))
+    else:
+        packed = [x.float().clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8).reshape(pool, 64, heads, 128)
+                  for x in (key, value)]
+    for mode in args.attention_modes.split(","):
+        capacity = min(64, max(args.rows)) if mode == "decode" else max(args.rows)
+        if args.attention_kv == "bf16":
+            from minimax_bf16_attention import Bf16Attention
+            from b12x._lib.compiler import compile as compile_cute, KernelCompileSpec
+            from b12x._lib.utils import make_ptr, current_cuda_stream
+            import cutlass
+            import cutlass.cute as cute
+            from b12x.integration.cuteafd._common import AotProgram, Operand, Scalar
+            adapter = Bf16Attention(capacity, 64, mode)
+            operands = [Operand("query", torch.bfloat16, "query"),
+                        Operand("key", torch.bfloat16, "key"), Operand("value", torch.bfloat16, "value")]
+            operands += [Operand(name, torch.int32, name, align=4)
+                         for name in ("table", "lengths", "offsets", "selected")]
+            operands += [Operand("output", torch.bfloat16, "output", "out"),
+                         Operand("lse", torch.float32, "lse", "out"), Operand("scratch", torch.uint8, "scratch", "scratch")]
+            scalars = [Scalar("rows"), Scalar("batch"), Scalar("stride"), Scalar("pages", "int64")]
+            pointers = [make_ptr(o.cute_dtype, 16, cute.AddressSpace.gmem, assumed_align=o.align) for o in operands]
+            compiled = compile_cute(adapter, *pointers, *(x.placeholder() for x in scalars), current_cuda_stream(),
+                compile_spec=KernelCompileSpec.from_key("bench.minimax.bf16", 1, (capacity, mode)))
+            program = AotProgram(name="bench_minimax_bf16", compiled=compiled, operands=tuple(operands),
+                                 scalars=tuple(scalars), geometry={}, scratch={"scratch":lambda rows:adapter.nbytes})
+        else:
+            program = compile_minimax_attention_aot(max_rows=capacity, max_batch=64, mode=mode)
+        query = (torch.randn((capacity, 64, 128), device="cuda") * .5).bfloat16()
+        output = torch.empty_like(query)
+        lse = torch.empty((capacity, 64), device="cuda")
+        scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda")
+        table = torch.arange(pool, dtype=torch.int32, device="cuda").repeat(64, 1)
+        selected = torch.full((heads, capacity, 16), -1, dtype=torch.int32, device="cuda")
+        # A fixed set of prior blocks is visible to every query, including tails.
+        selected[:] = torch.arange(16, device="cuda", dtype=torch.int32)
+        for rows in args.rows:
+            if rows > capacity:
+                continue
+            batch = rows if mode == "decode" else 1
+            lengths = torch.full((batch,), context, dtype=torch.int32, device="cuda")
+            cu = (torch.arange(batch + 1, dtype=torch.int32, device="cuda") if mode == "decode"
+                  else torch.tensor([0, rows], dtype=torch.int32, device="cuda"))
+            def launch():
+                prefix = (query, *packed)
+                if args.attention_kv != "bf16" and not scaled_records:
+                    prefix += (desc, desc)
+                program.launch(*prefix, table, lengths, cu, selected, output, lse, scratch,
+                               scalars=(rows, batch, pool, pool))
+            launch()
+            torch.cuda.synchronize()
+            assert torch.isfinite(output[:rows]).all() and output[:rows].count_nonzero() > 0
+            if args.attention_kv == "bf16":
+                k = key[:2048].float().repeat_interleave(16, dim=1)
+                v = value[:2048].float().repeat_interleave(16, dim=1)
+                score = torch.einsum("hd,thd->ht", query[0].float(), k) * 128 ** -.5
+                reference = torch.einsum("ht,thd->hd", score.softmax(-1), v)
+                relative = ((output[0].float() - reference).norm() / reference.norm()).item()
+                assert relative < .01, (mode, rows, relative)
+                print(f"BF16 oracle {mode} rows={rows}: relative_l2={relative}", flush=True)
+            if args.oracle_only:
+                continue
+            us, raw = measure(launch, args.iterations, args.samples)
+            yield dict(kernel="attention", mode=mode, rows=rows, median_us=us,
+                       us_per_row=us / rows, samples_us=raw, context=context, selected_tokens=2048)
 
 
 def gather_cases(args):
@@ -277,6 +384,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--rows", default="1,2,4,8,16,32,64,127,257,2048,2752,4096")
     p.add_argument("--kernels", default="norm,router,kv_pack,gather")
+    p.add_argument("--attention-kv", choices=("fp8", "bf16"), default="fp8")
+    p.add_argument("--attention-modes", default="decode,extend")
+    p.add_argument("--oracle-only", action="store_true")
     p.add_argument("--gather-contexts", default="8192")
     p.add_argument("--gather-live", type=int)
     p.add_argument("--gather-page-begin", type=int, default=0)
@@ -309,7 +419,7 @@ def main():
     props = torch.cuda.get_device_properties(0)
     results = []
     with NvmlWindow() as window:
-        for result in itertools.chain(producer_cases(args), gather_cases(args)):
+        for result in itertools.chain(producer_cases(args), gather_cases(args), attention_cases(args)):
             results.append(result)
             print(json.dumps(result), flush=True)
     payload = dict(device=dict(name=props.name, uuid=str(props.uuid), sm_count=props.multi_processor_count,

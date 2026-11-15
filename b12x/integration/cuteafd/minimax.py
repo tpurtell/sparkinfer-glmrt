@@ -2,7 +2,7 @@
 
 Arithmetic/layout reference: Hugh Madden, hughmadden/cuteafd@2cbf6873e,
 with hughmadden/sparkinfer-glmrt@4390f106. The residual norm and FP32-weight
-router use MiniMax-specific kernels; KV packing preserves request/head
+router use MiniMax-specific kernels; KV packing stores per-token/head
 descales and skips negative token slots.
 All live counts are launch scalars; callers own buffers and graph lifetimes.
 """
@@ -16,7 +16,7 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
-    cvt_f32x4_to_e4m3x4, div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, st_global_v4_u32,
+    div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, st_global_v4_u32,
 )
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached
 from ._common import Operand, Scalar, compile_program
@@ -137,39 +137,26 @@ class _RouterScores:
 
 class _KvPack:
     def __init__(self, heads=4):
+        from .pointwise import PackFp8KvPlane
         self.heads = heads
+        self.plane = PackFp8KvPlane(heads, 128, page_rows=64)
 
     @cute.jit
     def __call__(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
-                 batch_ids: cute.Pointer, k_descale: cute.Pointer, v_descale: cute.Pointer,
                  key_cache: cute.Pointer, value_cache: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.kernel(k, v, slots, batch_ids, k_descale, v_descale, key_cache, value_cache).launch(
+        self.kernel(k, v, slots, key_cache, value_cache).launch(
             grid=(rows, self.heads, 1), block=(32, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
-               batch_ids: cute.Pointer, k_descale: cute.Pointer, v_descale: cute.Pointer,
                key_cache: cute.Pointer, value_cache: cute.Pointer):
         row, head, _ = cute.arch.block_idx()
-        lane = Int64(cute.arch.thread_idx()[0])
-        k, v, slots, batch_ids = _view(k), _view(v), _view(slots), _view(batch_ids)
-        k_descale, v_descale = _view(k_descale), _view(v_descale)
-        slot = Int64(slots[Int64(row)])
+        lane = cute.arch.thread_idx()[0]
+        slot = Int64(_view(slots)[Int64(row)])
         if slot >= Int64(0):
-            scale_at = Int64(batch_ids[Int64(row)]) * Int64(self.heads) + Int64(head)
-            ki = div_rn_f32(Float32(1.0), Float32(k_descale[scale_at]))
-            vi = div_rn_f32(Float32(1.0), Float32(v_descale[scale_at]))
-            src = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(128) + lane * Int64(4)
-            dst = (slot * Int64(self.heads) + Int64(head)) * Int64(128)
-            kp = cute.make_ptr(Uint32, Int64(key_cache.toint()) + dst,
-                               cute.AddressSpace.gmem, assumed_align=16)
-            vp = cute.make_ptr(Uint32, Int64(value_cache.toint()) + dst,
-                               cute.AddressSpace.gmem, assumed_align=16)
-            kp[lane] = cvt_f32x4_to_e4m3x4(Float32(k[src]) * ki, Float32(k[src + Int64(1)]) * ki,
-                                          Float32(k[src + Int64(2)]) * ki, Float32(k[src + Int64(3)]) * ki)
-            vp[lane] = cvt_f32x4_to_e4m3x4(Float32(v[src]) * vi, Float32(v[src + Int64(1)]) * vi,
-                                          Float32(v[src + Int64(2)]) * vi, Float32(v[src + Int64(3)]) * vi)
+            self.plane.pack_row(k, key_cache, row, head, lane, slot)
+            self.plane.pack_row(v, value_cache, row, head, lane, slot)
 
 
 def compile_minimax_norm_aot():
@@ -205,16 +192,17 @@ def compile_minimax_router_scores_aot():
 
 
 def compile_minimax_kv_pack_aot(*, heads=4):
-    """Positive request/head descales must match attention and remain fixed."""
+    """Write immutable per-token/head scaled records, skipping negative slots."""
     if type(heads) is not int or heads not in (2, 4):
         raise ValueError("MiniMax KV pack requires 2 or 4 heads")
+    record_bytes = (heads * 132 + 15) // 16 * 16
     return compile_program(_KvPack(heads), name="minimax_kv_pack", operands=(
         Operand("k", torch.bfloat16, f"[rows,{heads},128]"),
         Operand("v", torch.bfloat16, f"[rows,{heads},128]"),
         Operand("slots", torch.int64, "[rows] (physical slots; negative skips writes)"),
-        Operand("batch_ids", torch.int32, "[rows]"),
-        Operand("k_descale", torch.float32, f"[batch,{heads}]"),
-        Operand("v_descale", torch.float32, f"[batch,{heads}]"),
-        Operand("key_cache", torch.uint8, f"[pages,64,{heads},128]", "out"),
-        Operand("value_cache", torch.uint8, f"[pages,64,{heads},128]", "out")),
-        scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (), geometry=dict(heads=heads, head_dim=128, page_rows=64))
+        Operand("key_cache", torch.uint8, f"[pages,64,{record_bytes}] scaled E4M3 records", "out"),
+        Operand("value_cache", torch.uint8, f"[pages,64,{record_bytes}] scaled E4M3 records", "out")),
+        scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (), version=3,
+        geometry=dict(heads=heads, head_dim=128, page_rows=64,
+                      record_bytes=record_bytes, scale_offset=64 * heads * 128,
+                      scale_stride=record_bytes - heads * 128))
