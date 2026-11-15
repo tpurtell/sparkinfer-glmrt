@@ -254,6 +254,38 @@ def max_w4a16_route_capacity(routed_rows: int, num_experts: int) -> tuple[int, i
     return max(route_slots, 1), max(route_blocks, 1)
 
 
+def exl3_ws_segment_scratch_regions(*, rows: int, maximum: int, hidden: int,
+                                    intermediate: int, topk: int, experts: int,
+                                    block: int, max_m_blocks: int, sms: int) -> dict[str, int]:
+    """Pure byte extents, in arena order; each region starts on a 256B boundary.
+
+    WS has no STREAM tile table. Its block-expert metadata uses the compiled
+    maximum, fixing the first live-data offset across all merged row counts.
+    FC2 aliases rotation_gate; rotation_up aliases it with in-tile rotation.
+    FC1/FC2 cooperative scratch arguments are unused by WS (one word each).
+    """
+    if not 0 < rows <= maximum <= 8192 or min(hidden, intermediate, topk, experts, sms) < 1:
+        raise ValueError("invalid EXL3 WS segment extent (maximum <= 8192)")
+    if block not in (16, 32, 64):
+        raise ValueError("EXL3 WS segment route block must be 16, 32 or 64")
+    routes = rows * topk
+    slots = max_packed_route_slots(routes, block, experts)
+    maximum_slots = max_packed_route_slots(maximum * topk, block, experts)
+    if max_m_blocks < (maximum_slots + block - 1) // block:
+        raise ValueError("compiled EXL3 route-block table is too small")
+    return dict(block_expert_ids=4 * max_m_blocks,
+                packed_route_indices=4 * slots, packed_route_count=4,
+                expert_offsets=4 * (experts + 1), expert_counts=4 * experts,
+                rotation_gate=2 * routes * hidden, fc1=4 * routes * intermediate,
+                activated=2 * routes * intermediate, output=8 * rows,
+                fc1_scratch=4, fc2_scratch=4, workspace=4 * (4 * sms + 2))
+
+
+def exl3_ws_segment_scratch_bytes(**geometry: int) -> int:
+    """Live-row arena size; mirror with sum((n + 255) & ~255 for n in regions)."""
+    return sum((n + 255) & ~255 for n in exl3_ws_segment_scratch_regions(**geometry).values())
+
+
 def packed_gemm_scratch_elements(
     *,
     size_n: int,
