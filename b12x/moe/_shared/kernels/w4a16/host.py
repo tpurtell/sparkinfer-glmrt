@@ -259,8 +259,11 @@ def exl3_ws_segment_scratch_regions(*, rows: int, maximum: int, hidden: int,
                                     block: int, max_m_blocks: int, sms: int) -> dict[str, int]:
     """Pure byte extents, in arena order; each region starts on a 256B boundary.
 
-    WS has no STREAM tile table. Its block-expert metadata uses the compiled
-    maximum, fixing the first live-data offset across all merged row counts.
+    WS has no STREAM tile table. Its route metadata (block-expert ids and the
+    packed route indices) uses the compiled maximum: the AOT route-pack
+    program compiled at ``maximum`` validates and initializes its whole bucket,
+    padding included, so live-row tables would be refused or overrun. This
+    also fixes the first live-data offset across all merged row counts.
     FC2 aliases rotation_gate; rotation_up aliases it with in-tile rotation.
     FC1/FC2 cooperative scratch arguments are unused by WS (one word each).
     """
@@ -269,12 +272,11 @@ def exl3_ws_segment_scratch_regions(*, rows: int, maximum: int, hidden: int,
     if block not in (16, 32, 64):
         raise ValueError("EXL3 WS segment route block must be 16, 32 or 64")
     routes = rows * topk
-    slots = max_packed_route_slots(routes, block, experts)
     maximum_slots = max_packed_route_slots(maximum * topk, block, experts)
     if max_m_blocks < (maximum_slots + block - 1) // block:
         raise ValueError("compiled EXL3 route-block table is too small")
     return dict(block_expert_ids=4 * max_m_blocks,
-                packed_route_indices=4 * slots, packed_route_count=4,
+                packed_route_indices=4 * maximum_slots, packed_route_count=4,
                 expert_offsets=4 * (experts + 1), expert_counts=4 * experts,
                 rotation_gate=2 * routes * hidden, fc1=4 * routes * intermediate,
                 activated=2 * routes * intermediate, output=8 * rows,
