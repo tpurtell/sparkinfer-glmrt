@@ -1405,6 +1405,7 @@ class UnifiedDecodeKernel:
                         entries=32)
                 cute.arch.barrier()
                 cute.arch.barrier()
+                cute.arch.barrier()
                 if ht_in_main:
                     issue_native_v41_gather(
                         native_descriptors[token_idx, None],
