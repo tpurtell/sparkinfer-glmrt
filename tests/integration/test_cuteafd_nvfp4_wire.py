@@ -233,3 +233,44 @@ def test_wire_exported_abi(tmp_path, mode, convention):
     checked = validate_exported_header(program, tmp_path / (stem + ".h"), stem)
     assert checked["argument_count"] == (4 if mode == "dynamic" else 5)
     assert program.scratch_bytes(8192) == {}
+
+
+@pytest.mark.parametrize("name", ["inkling2_nvfp4", "minimax_nvfp4a4"])
+@pytest.mark.parametrize("rows", [1, 16, 17, 2752, 8192])
+def test_stream_reply_layout_names_the_route_down_output(name, rows):
+    """#2187: the reply layout's y_offset is the region each NVFP4 stream route writes its
+    down output to. The dynamic route's addresses are recomputed here exactly as
+    ``_StreamNvfp4DynRoute.__call__`` derives them (its region 12, not the calibrated A4
+    route's 9), and its combine is unweighted, so a reply epilogue must not reweight it."""
+    from b12x.integration.cuteafd.fp8_moe import (
+        GEOMETRIES, STREAM_TILE_M, _ALIGN, fp8_moe_reply_layout, meta_words, nvfp4_a4_fused, stream_max_tiles)
+
+    al = lambda n: (n + _ALIGN - 1) // _ALIGN * _ALIGN  # noqa: E731
+    g = GEOMETRIES[name]
+    max_rows = 8192
+    layout = fp8_moe_reply_layout(g, route="stream", rows=rows, max_rows=max_rows, wire=False)
+    pairs = rows * g.top_k
+    groups = min(pairs, g.experts)
+    padded = ((pairs + STREAM_TILE_M - 1) // STREAM_TILE_M + groups) * STREAM_TILE_M
+    pair_row = al(4 * meta_words(g.experts, stream_max_tiles(g.experts, max_rows * g.top_k)))
+    pair_pos = pair_row + al(4 * pairs)
+    xq = pair_pos + al(4 * pairs)
+    xs = xq + al(padded * g.hidden // 2)
+    after_scales = xs + al(padded * g.hidden // 16)
+    if g.dynamic_nvfp4:
+        gamma = after_scales + al(padded * 4)
+        act16 = gamma + al(4 * pairs)
+        part = act16 + al(padded * g.slice * 2)
+        aq = part + al(padded * (g.slice // 16) * 4)
+        a_s = aq + al(padded * g.slice // 2)
+        aamax = a_s + al(padded * g.slice // 16)
+        y = aamax + al(padded * 4)
+    else:
+        split = 0 if nvfp4_a4_fused() else pairs * g.slice * 2
+        aq = after_scales + 2 * al(split)
+        y = aq + al(padded * g.slice // 2) + al(padded * g.slice // 16)
+    assert layout["route"] == "stream"
+    assert layout["pair_pos_offset"] == pair_pos
+    assert layout["y_offset"] == y, (layout["y_offset"], y)
+    assert layout["weighted"] is (not g.dynamic_nvfp4)
+    assert layout["y_offset"] + pairs * g.hidden * 2 <= layout["scratch_bytes"]

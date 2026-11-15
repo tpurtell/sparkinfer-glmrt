@@ -548,10 +548,19 @@ def fp8_moe_reply_layout(g: Fp8MoeGeometry, *, route: str, rows: int,
     for size in regions:
         offsets.append(at)
         at += _align(size)
-    y_index = 9 if selected == "stream" and g.activations == "a4" else 4 if selected == "stream" else 3
+    # The down output's region: the dynamic route (route weights applied before the FC2
+    # quantization, so its combine is unweighted) and the calibrated A4 route each have
+    # their own list; the other stream and grouped routes keep it at 4 and 3.
+    if selected == "stream" and g.dynamic_nvfp4:
+        y_index = 12
+    elif selected == "stream" and g.activations == "a4":
+        y_index = 9
+    else:
+        y_index = 4 if selected == "stream" else 3
     return dict(version=1, route=selected, pair_pos_offset=offsets[2],
                 y_offset=offsets[y_index], y_dtype="bf16", hidden=g.hidden,
-                top_k=g.top_k, scratch_bytes=at)
+                top_k=g.top_k, scratch_bytes=at,
+                weighted=not (selected == "stream" and g.dynamic_nvfp4))
 
 
 def nvfp4_a4_fused() -> bool:
