@@ -789,8 +789,8 @@ def test_arm_qualification_does_not_require_control_equality(monkeypatch, defect
     assert torch.equal(source, torch.arange(32, dtype=torch.float32).reshape(8, 4))
 
 
-@pytest.mark.parametrize("rows,expected", [(2048, 251813888), (2752, 338349568),
-                                         (4096, 503554048), (5504, 676625408)])
+@pytest.mark.parametrize("rows,expected", [(2048, 252010496), (2752, 338523648),
+                                         (4096, 503685120), (5504, 676711424)])
 def test_exl3_ws_segment_formula_without_cuda(rows, expected):
     names = {"max_packed_route_slots", "exl3_ws_segment_scratch_regions",
              "exl3_ws_segment_scratch_bytes"}
@@ -804,6 +804,8 @@ def test_exl3_ws_segment_formula_without_cuda(rows, expected):
     regions = scope["exl3_ws_segment_scratch_regions"](**geometry)
     assert next(iter(regions)) == "block_expert_ids"
     assert regions["block_expert_ids"] == 4 * 1276
+    # The compiled-maximum route-pack plan's table, at every live row count.
+    assert regions["packed_route_indices"] == 4 * (8192 * 8 + 256 * 63)
     assert regions["rotation_gate"] == rows * 8 * 6144 * 2
     assert scope["exl3_ws_segment_scratch_bytes"](**geometry) == expected
     with pytest.raises(ValueError, match="extent"):

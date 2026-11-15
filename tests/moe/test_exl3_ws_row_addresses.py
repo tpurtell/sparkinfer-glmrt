@@ -185,3 +185,52 @@ def test_mapped_frame_member_orders(family, input_format, reply_dtype):
         torch.cuda.synchronize()
         for allocation in reversed(allocations):
             allocation.close()
+
+
+@pytest.mark.parametrize("rows", [333, 2752, 5504])
+def test_live_segment_arena_holds_the_compiled_maximum_route_pack(rows):
+    """Engines run ONE route-pack plan compiled at the segment maximum (the AOT
+    route bridge), not the Python packer's live-bucket plan. That plan packs
+    into every live-row arena: its packed-route and block tables are sized at
+    the compiled maximum, so a merged wave below the maximum is never refused
+    or overrun (the bridge validates, and post-prefix initializes, the bucket)."""
+    device = torch.device("cuda", 0)
+    props = torch.cuda.get_device_properties(device)
+    if (props.major, props.minor) != (12, 1):
+        pytest.skip("requires SM121")
+    from b12x.moe._shared.kernels.w4a16.route_pack import (
+        compile_w4a16_route_pack_launches, pack_topk_routes_by_expert)
+
+    maximum, hidden, intermediate, topk, experts, block = 8192, 6144, 512, 8, 256, 64
+    launches = compile_w4a16_route_pack_launches(tokens=maximum, topk=topk, block_size=block,
+                                                 num_experts=experts, ordinal=0)
+    regions = exl3_ws_segment_scratch_regions(rows=rows, maximum=maximum, hidden=hidden,
+        intermediate=intermediate, topk=topk, experts=experts, block=block,
+        max_m_blocks=launches.max_route_blocks, sms=props.multi_processor_count)
+    assert regions["packed_route_indices"] == 4 * launches.max_packed_routes
+    assert regions["block_expert_ids"] == 4 * launches.max_route_blocks
+    arena = torch.zeros(exl3_ws_segment_scratch_bytes(rows=rows, maximum=maximum, hidden=hidden,
+        intermediate=intermediate, topk=topk, experts=experts, block=block,
+        max_m_blocks=launches.max_route_blocks, sms=props.multi_processor_count), dtype=torch.uint8, device=device)
+    views, offset = {}, 0
+    for name, size in regions.items():
+        views[name] = arena[offset:offset + size]
+        offset += (size + 255) & ~255
+    sentinel = 0x5A
+    guard = views["rotation_gate"][:4096]
+    guard.fill_(sentinel)
+    gen = torch.Generator(device=device).manual_seed(rows)
+    ids = torch.rand(rows, experts, device=device, generator=gen).topk(topk, -1).indices.int().contiguous()
+    packed, blocks, count = pack_topk_routes_by_expert(ids, block, experts,
+        packed_route_indices=views["packed_route_indices"].view(torch.int32),
+        block_expert_ids=views["block_expert_ids"].view(torch.int32),
+        packed_route_count=views["packed_route_count"].view(torch.int32),
+        expert_offsets=views["expert_offsets"].view(torch.int32),
+        expert_counts=views["expert_counts"].view(torch.int32), launches=launches)
+    torch.cuda.synchronize()
+    assert int(count.item()) >= rows * topk
+    assert (guard == sentinel).all(), "route pack wrote past its tables into the live data regions"
+    # Every live route lands exactly once.
+    live = packed[:int(count.item())]
+    real = live[live < rows * topk]
+    assert torch.equal(torch.sort(real).values, torch.arange(rows * topk, device=device, dtype=real.dtype))
