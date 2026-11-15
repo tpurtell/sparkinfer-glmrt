@@ -26,6 +26,8 @@ from pathlib import Path
 import statistics
 import subprocess
 import sys
+import threading
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from b12x.attention._shared.mla.traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
@@ -67,6 +69,7 @@ def parse_args(argv=None):
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--seed", type=int, default=41512)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--native-row-curve", action="store_true", help="Fixed-capacity native pointer ABI for both arms")
     args = p.parse_args(argv)
     args.scores = args.scores.split(",")
     if args.accuracy_only:
@@ -93,7 +96,7 @@ def decode_arm_traits(arm):
     return traits
 
 
-def build_decode(q, main_cache, extra_cache, mi, ei, sink):
+def build_decode(q, main_cache, extra_cache, mi, ei, sink, native_curve=False):
     """Compile existing native producer and generic BF16 producer, same10 splits.
 
     The optional F32 partial arm changes only the typed tensor supplied to the
@@ -124,7 +127,8 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink):
     assert torch.equal(mi, torch.arange(128,device=q.device)[None] + torch.arange(rows,device=q.device)[:,None] + 1)
     retained = [values,scales,end,source_end,pages,desc,meta,bounds]
     runs, lses = {}, {}
-    for arm in ("fp8-decode", "bf16-decode", "fp8-f32-partials"):
+    arms = ("fp8-decode", "bf16-decode") if native_curve else ("fp8-decode", "bf16-decode", "fp8-f32-partials")
+    for arm in arms:
         native = arm != "bf16-decode"
         traits = decode_arm_traits(arm)
         partial = torch.empty(rows,heads,10,512,device=q.device,dtype=torch.float32 if arm == "fp8-f32-partials" else torch.bfloat16)
@@ -135,9 +139,9 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink):
             mid_out_stride=partial.stride(),mid_lse_stride=lse.stride(),has_extra=True,pbs_extra=256,valid_hpb=16,native_dsv41_fp8=native)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         scale = cutlass.Float32(512**-.5 * math.log2(math.e))
-        if native:
+        if native or native_curve:
             params = tuple(from_dlpack(x) for x in (q,desc,meta,ei,bounds,partial,lse))
-            compiled = cute.compile(kernel.call_native_v41,*params,scale,cutlass.Int32(rows),stream)
+            compiled = cute.compile(kernel.call_native_v41,*params,scale,cutlass.Int32(1 if native_curve else rows),stream)
             decode_args = (*params,scale,cutlass.Int32(rows))
         else:
             params = tuple(from_dlpack(x) for x in (q,main_cache.flatten(),mi,partial,lse))
@@ -148,13 +152,46 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink):
         merge = SparseMLASplitDecodeSinkMergeKernel(static_num_chunks=10)
         merge_args = tuple(from_dlpack(x) for x in (partial,lse,bounds,sink,output))
         merged = cute.compile(merge,*merge_args,stream)
-        def run(compiled=compiled,decode_args=decode_args,merged=merged,merge_args=merge_args,retained=retained):
+        def run(live_rows=None, compiled=compiled,decode_args=decode_args,merged=merged,merge_args=merge_args,retained=retained):
             current = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-            compiled(*decode_args,current)
+            launch_args = (*decode_args[:-1],cutlass.Int32(live_rows)) if live_rows is not None else decode_args
+            compiled(*launch_args,current)
             merged(*merge_args,current)
         runs[arm] = (run,output)
         lses[arm] = lse
     return runs, lses
+
+
+class Telemetry:
+    """Point-bounded NVML-backed telemetry at a 200 ms cadence."""
+    def __init__(self):
+        self.samples = []
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.collect, daemon=True)
+
+    def collect(self):
+        fields = "uuid,pstate,clocks.sm,clocks.mem,temperature.gpu,temperature.gpu.tlimit,power.draw,power.limit,utilization.gpu,clocks_event_reasons.sw_power_cap,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown"
+        try:
+            while True:
+                result = subprocess.check_output(["nvidia-smi", "--query-gpu="+fields,"--format=csv,noheader,nounits"],text=True)
+                self.samples.append({"time_s":time.time(),"fields":fields,"csv":result.strip()})
+                if self.stop.wait(.2):
+                    return
+        except Exception as exc:
+            self.error = str(exc)
+
+    def __enter__(self):
+        self.error = None
+        self.before = subprocess.check_output(["nvidia-smi","-q"],text=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self,*unused):
+        self.stop.set()
+        self.thread.join()
+        self.after = subprocess.check_output(["nvidia-smi","-q"],text=True)
+        if self.error:
+            raise RuntimeError(self.error)
 
 
 def main(argv=None):
@@ -198,7 +235,7 @@ def main(argv=None):
     sink = torch.linspace(-1, 1, args.heads, device=device)
     arms = ("fp8-qk", "bf16-qk") if args.format == "dsv4" else ("bf16-pv", "fp8-pv")
     if args.mode == "decode":
-        arms = ("fp8-decode", "bf16-decode", "fp8-f32-partials")
+        arms = ("fp8-decode", "bf16-decode") if args.native_row_curve else ("fp8-decode", "bf16-decode", "fp8-f32-partials")
     report = {"mode": args.mode, "lse_unit": "natural_log", "format": args.format, "args": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
         "fork_sha": subprocess.check_output(["git", "-C", os.environ.get("CUTEAFD_SPARKINFER_SOURCE_DIR", str(Path(__file__).resolve().parents[1])), "rev-parse", "HEAD"], text=True).strip(),
         "device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
@@ -241,21 +278,29 @@ def main(argv=None):
         distribution = {"mean_pmax": float(torch.stack(pmax).mean()),
             "mean_entropy_nats": float(torch.stack(entropy).mean()),
             "probability_fraction_below_e4m3_min": float(torch.stack(tiny).mean())}
+        fixed_runs, fixed_lses = build_decode(q,main_cache,extra_cache,mi,ei,sink,True) if args.native_row_curve else ({},{})
+        full_outputs = {}
+        if fixed_runs:
+            for arm in arms:
+                fixed_runs[arm][0](max_rows)
+                full_outputs[arm] = fixed_runs[arm][1].clone()
         for rows in sorted(set(args.rows + args.timing_rows)):
             record = {"scores": pattern, "rows": rows, "distribution": distribution, "arms": {}}
             graphs = {}
             try:
-                decode_runs, decode_lses = build_decode(q[:rows], main_cache, extra_cache, mi[:rows], ei[:rows], sink) if args.mode == "decode" else ({}, {})
+                decode_runs, decode_lses = (fixed_runs,fixed_lses) if fixed_runs else (build_decode(q[:rows], main_cache, extra_cache, mi[:rows], ei[:rows], sink) if args.mode == "decode" else ({}, {}))
                 def execute(arm):
                     if decode_runs:
-                        decode_runs[arm][0]()
+                        decode_runs[arm][0](rows if fixed_runs else None)
                     else:
                         run(arm, rows)
                 for arm in arms:
                     execute(arm)
                     torch.cuda.synchronize()
-                    actual = decode_runs[arm][1] if decode_runs else out[arm][:rows]
-                    actual_lse = torch.logaddexp(torch.logsumexp(decode_lses[arm] * math.log(2), -1), sink[None]) if decode_runs else lse[arm][:rows] * math.log(2)
+                    actual = decode_runs[arm][1][:rows] if decode_runs else out[arm][:rows]
+                    actual_lse = torch.logaddexp(torch.logsumexp(decode_lses[arm][:rows] * math.log(2), -1), sink[None]) if decode_runs else lse[arm][:rows] * math.log(2)
+                    if fixed_runs:
+                        assert torch.equal(actual,full_outputs[arm][:rows]), (arm,rows,"row invariance")
                     delta = actual.float() - ref[:rows]
                     ld = actual_lse - ref_lse[:rows]
                     if not bool(torch.isfinite(delta).all() & torch.isfinite(ld).all()):
@@ -274,14 +319,16 @@ def main(argv=None):
                         graph.replay()
                 torch.cuda.synchronize()
                 samples = {arm: [] for arm in arms}
-                for sample in range(args.samples if graphs else 0):
-                    for arm in arms[::1 if sample % 2 == 0 else -1]:
-                        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                        start.record()
-                        for _ in range(args.replays):
-                            graphs[arm].replay()
-                        end.record(); end.synchronize()
-                        samples[arm].append(start.elapsed_time(end) * 1000 / args.replays)
+                with Telemetry() as telemetry:
+                    for sample in range(args.samples if graphs else 0):
+                        for arm in arms[::1 if sample % 2 == 0 else -1]:
+                            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                            start.record()
+                            for _ in range(args.replays):
+                                graphs[arm].replay()
+                            end.record(); end.synchronize()
+                            samples[arm].append(start.elapsed_time(end) * 1000 / args.replays)
+                record["thermal"] = {"before":telemetry.before,"after":telemetry.after,"samples":telemetry.samples}
                 for arm in graphs:
                     record["arms"][arm].update(samples_us=samples[arm], median_us=statistics.median(samples[arm]))
                 if graphs:
