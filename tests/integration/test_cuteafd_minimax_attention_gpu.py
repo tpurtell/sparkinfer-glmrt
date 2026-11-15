@@ -30,9 +30,7 @@ def test_inline_scales_outliers_and_rows(heads, mode):
     slots[-1] = -1
     packed = [torch.full((pages * 64, record), 213, dtype=torch.uint8, device="cuda") for _ in range(2)]
     pack = compile_minimax_kv_pack_aot(heads=heads)
-    desc = torch.ones((capacity, heads), device="cuda")
-    batch_ids = torch.zeros(pages * 64, dtype=torch.int32, device="cuda")
-    pack.launch(key, value, slots, batch_ids, desc, desc, *packed, scalars=(pages * 64,))
+    pack.launch(key, value, slots, *packed, scalars=(pages * 64,))
     torch.cuda.synchronize()
     decoded = []
     for source, raw in zip((key, value), packed):
@@ -58,7 +56,7 @@ def test_inline_scales_outliers_and_rows(heads, mode):
         # One-token independent requests keep arithmetic identical as live rows vary.
         lengths = torch.full((rows,), count, dtype=torch.int32, device="cuda")
         cu = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
-        program.launch(q, *packed, desc, desc, table, lengths, cu, selected, output, lse, scratch,
+        program.launch(q, *packed, table, lengths, cu, selected, output, lse, scratch,
                        scalars=(rows, rows, pages, pages))
         torch.cuda.synchronize()
         k, v = [torch.repeat_interleave(x[:count], 16, dim=1) for x in decoded]
@@ -137,7 +135,7 @@ def test_decode_rows_match_dense_attention_across_page_fills(program, group):
     scratch = torch.zeros(program.scratch_bytes(ROWS)["scratch"], dtype=torch.uint8, device="cuda")
     cache_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
-    program.launch(query, _inline_cache(key), _inline_cache(value), k_descale, v_descale,
+    program.launch(query, _inline_cache(key), _inline_cache(value),
                    table.cuda().contiguous(), cache_lengths, cu, q2k.cuda().contiguous(), output, lse, scratch,
                    scalars=(batch, batch, table.shape[1], pool))
     torch.cuda.synchronize()
@@ -207,7 +205,6 @@ def test_half_head_attention_is_byte_exact_whole_head_slice(mode, rows):
     pool = stride = 96
     key, value = _cache(generator, pool), _cache(generator, pool)
     query = torch.randn((rows, 64, 128), generator=generator, device="cuda").bfloat16()
-    kd, vd = [torch.ones((batch, 4), device="cuda") for _ in range(2)]
     table = torch.full((batch, stride), -1, dtype=torch.int32)
     selected = torch.full((4, capacity, 16), -1, dtype=torch.int32)
     picker = torch.Generator().manual_seed(20261113)
@@ -233,16 +230,7 @@ def test_half_head_attention_is_byte_exact_whole_head_slice(mode, rows):
         operands = (query[:, first * 16:(first + heads) * 16].contiguous(),
                     _inline_cache(key[:, :, first:first + heads]),
                     _inline_cache(value[:, :, first:first + heads]),
-                    kd[:, first:first + heads].clone(memory_format=torch.contiguous_format),
-                    vd[:, first:first + heads].clone(memory_format=torch.contiguous_format),
                     table, lengths_gpu, offsets, selected[first:first + heads].contiguous())
-        if rows == 1 and first == 2:
-            # contiguous() can retain this offset-eight single-row view.
-            unaligned = kd[:, first:first + heads].contiguous()
-            assert unaligned.data_ptr() % 16 == 8
-            rejected = (*operands[:3], unaligned, *operands[4:])
-            with pytest.raises(ValueError, match=r"k_descale is not 16-byte aligned"):
-                program.launch(*rejected, output, lse, scratch, scalars=(rows, batch, stride, pool))
         frozen = [tensor.clone() for tensor in operands]
         program.launch(*operands, output, lse, scratch, scalars=(rows, batch, stride, pool))
         torch.cuda.synchronize()
@@ -289,7 +277,7 @@ def test_recycled_physical_pages_cross_byte_offset_boundary(boundary):
     packed_value = torch.empty_like(packed_key)
     packed_key[high:] = _inline_cache(key[high:])
     packed_value[high:] = _inline_cache(value[high:])
-    program.launch(query, packed_key, packed_value, descale, descale,
+    program.launch(query, packed_key, packed_value,
                    table, lengths, cu, selected, output, lse, scratch,
                    scalars=(1, 1, 2, pool))
     torch.cuda.synchronize()
@@ -350,7 +338,7 @@ def test_sparse_selections_reuse_program_and_graph_with_live_shapes(mode, heads)
         packed_key, packed_value = _inline_cache(key), _inline_cache(value)
 
         def launch():
-            program.launch(query, packed_key, packed_value, kd, vd,
+            program.launch(query, packed_key, packed_value,
                            table, cache_lengths, offsets, selected, output, lse, scratch,
                            scalars=(rows, batch, stride, pool))
 

@@ -87,14 +87,11 @@ def test_half_head_kv_pack_is_byte_exact_whole_head_cache_slice(rows):
                   for _ in range(2)]
     slots = torch.arange(rows, dtype=torch.int64, device=device) * 17 % capacity
     slots[torch.arange(rows, device=device) % 7 == 2] = -1
-    batch_ids = torch.arange(rows, dtype=torch.int32, device=device) % 3
-    kd, vd = [torch.rand((3, 4), generator=gen, device=device) + .25 for _ in range(2)]
 
     def run(first, heads):
         program = compile_minimax_kv_pack_aot(heads=heads)
         operands = (key[:, first:first + heads].contiguous(),
-                    value[:, first:first + heads].contiguous(), slots, batch_ids,
-                    kd[:, first:first + heads].contiguous(), vd[:, first:first + heads].contiguous())
+                    value[:, first:first + heads].contiguous(), slots)
         frozen = [tensor.clone() for tensor in operands]
         caches = [torch.full((capacity, fp8_kv_plane_bytes(heads, 128)), 173, dtype=torch.uint8, device=device)
                   for _ in range(2)]
@@ -132,11 +129,8 @@ def test_kv_pack_exact_bits_scales_negative_slots_live_rows_and_replay(big_slot,
     base = 2**31 // record + 64 if big_slot else 64
     slots = torch.tensor([base, base + 63, base + 64, -1, base + 129, base + 11, base + 130],
                          device=device, dtype=torch.int64)
-    batch_ids = torch.tensor([0, 1, 2, 0, 2, 1, 0], device=device, dtype=torch.int32)
-    kd = torch.tensor([[1, 0.5, 2, 0.25], [0.75, 1.5, 3, 0.125], [2.5, 0.3, 1, 0.2]], device=device)[:, :heads].contiguous()
-    vd = kd.flip(0).contiguous()
     caches = [torch.empty((base + 192, record), dtype=torch.uint8, device=device) for _ in range(2)]
-    tensors = (k, v, slots, batch_ids, kd, vd, *caches)
+    tensors = (k, v, slots, *caches)
     # Initialize only the touched tail, keeping the >2 GiB offset test cheap.
     def reset():
         for cache in caches:

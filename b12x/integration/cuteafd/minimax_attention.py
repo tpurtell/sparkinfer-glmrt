@@ -77,7 +77,7 @@ class _Attention:
 
     @cute.jit
     def __call__(self, query: cute.Pointer, key_cache: cute.Pointer, value_cache: cute.Pointer,
-                 k_descale: cute.Pointer, v_descale: cute.Pointer, page_table: cute.Pointer,
+                 page_table: cute.Pointer,
                  cache_lengths: cute.Pointer, cu_seqlens_q: cute.Pointer,
                  q2k_indices: cute.Pointer, output: cute.Pointer, lse: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, batch: Int32, table_stride: Int32,
@@ -121,8 +121,7 @@ class _Attention:
             self._tensor(output, (rows, self.query_heads, 128), (self.query_heads * 128, 128, 1)),
             # The kernel indexes LSE as [head, row]; the ABI stores [rows,heads].
             self._tensor(lse, (self.query_heads, rows), (1, self.query_heads)),
-            self._tensor(k_descale, (batch, self.kv_heads), (self.kv_heads, 1)),
-            self._tensor(v_descale, (batch, self.kv_heads), (self.kv_heads, 1)), dummy_desc, dummy_desc, stream)
+            None, None, dummy_desc, dummy_desc, stream)
 
     @cute.kernel
     def metadata(self, cu, requests, tiles, zeros, valid, work: Int32, batch: Int32):
@@ -193,8 +192,6 @@ def compile_minimax_attention_aot(*, max_rows, max_batch, mode="decode", query_h
         Operand("query", torch.bfloat16, f"[rows,{query_heads},128]"),
         Operand("key_cache", torch.uint8, f"[pool_pages,64,{record_bytes}] scaled E4M3 records"),
         Operand("value_cache", torch.uint8, f"[pool_pages,64,{record_bytes}] scaled E4M3 records"),
-        Operand("k_descale", torch.float32, f"[batch,{kv_heads}]"),
-        Operand("v_descale", torch.float32, f"[batch,{kv_heads}]"),
         Operand("page_table", torch.int32, "[batch,table_stride]", align=4),
         Operand("cache_lengths", torch.int32, "[batch] including appended queries", align=4),
         Operand("cu_seqlens_q", torch.int32, "[batch+1] packed query offsets; decode arange", align=4),

@@ -2,7 +2,7 @@
 
 Arithmetic/layout reference: Hugh Madden, hughmadden/cuteafd@2cbf6873e,
 with hughmadden/sparkinfer-glmrt@4390f106. The residual norm and FP32-weight
-router use MiniMax-specific kernels; KV packing preserves request/head
+router use MiniMax-specific kernels; KV packing stores per-token/head
 descales and skips negative token slots.
 All live counts are launch scalars; callers own buffers and graph lifetimes.
 """
@@ -16,7 +16,7 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import (
-    cvt_f32x4_to_e4m3x4, div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, st_global_v4_u32,
+    div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, st_global_v4_u32,
 )
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo, _ld_cached
 from ._common import Operand, Scalar, compile_program
@@ -143,15 +143,13 @@ class _KvPack:
 
     @cute.jit
     def __call__(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
-                 batch_ids: cute.Pointer, k_descale: cute.Pointer, v_descale: cute.Pointer,
                  key_cache: cute.Pointer, value_cache: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
-        self.kernel(k, v, slots, batch_ids, k_descale, v_descale, key_cache, value_cache).launch(
+        self.kernel(k, v, slots, key_cache, value_cache).launch(
             grid=(rows, self.heads, 1), block=(32, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
-               batch_ids: cute.Pointer, k_descale: cute.Pointer, v_descale: cute.Pointer,
                key_cache: cute.Pointer, value_cache: cute.Pointer):
         row, head, _ = cute.arch.block_idx()
         lane = cute.arch.thread_idx()[0]
@@ -202,9 +200,6 @@ def compile_minimax_kv_pack_aot(*, heads=4):
         Operand("k", torch.bfloat16, f"[rows,{heads},128]"),
         Operand("v", torch.bfloat16, f"[rows,{heads},128]"),
         Operand("slots", torch.int64, "[rows] (physical slots; negative skips writes)"),
-        Operand("batch_ids", torch.int32, "[rows]"),
-        Operand("k_descale", torch.float32, f"[batch,{heads}]"),
-        Operand("v_descale", torch.float32, f"[batch,{heads}]"),
         Operand("key_cache", torch.uint8, f"[pages,64,{record_bytes}] scaled E4M3 records", "out"),
         Operand("value_cache", torch.uint8, f"[pages,64,{record_bytes}] scaled E4M3 records", "out")),
         scalars=(Scalar("rows"),), key=(heads,) if heads != 4 else (), version=2,

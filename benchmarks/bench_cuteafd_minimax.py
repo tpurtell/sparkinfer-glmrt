@@ -176,13 +176,10 @@ def producer_cases(args):
             k, v = [torch.randn(capacity, 4, 128, device=dev).bfloat16() for _ in range(2)]
             slots = torch.arange(capacity, device=dev, dtype=torch.int64) * 2 + 64
             slots[3::7] = -1
-            batch = (torch.arange(capacity, device=dev) % 3).int()
-            kd = torch.tensor([[1, .5, 2, .25], [.75, 1.5, 3, .125], [2.5, .3, 1, .2]], device=dev)
-            vd = kd.flip(0).contiguous()
             from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
             record = fp8_kv_plane_bytes(4, 128)
             caches = [torch.empty((capacity * 2 + 128, record), device=dev, dtype=torch.uint8) for _ in range(2)]
-            operands = (k, v, slots, batch, kd, vd, *caches)
+            operands = (k, v, slots, *caches)
             refs = []
             for value in (k, v):
                 source = value.float().cpu()
@@ -230,6 +227,53 @@ def producer_cases(args):
             us, raw = measure(fn, args.iterations, args.samples)
             yield dict(kernel=name, rows=rows, median_us=us, samples_us=raw,
                        nominal_bytes=byte_count, nominal_flops=flops, manifest=manifest, **comparison)
+
+
+def attention_cases(args):
+    if "attention" not in args.kernels:
+        return
+    from b12x.integration.cuteafd.minimax import compile_minimax_kv_pack_aot
+    from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
+    from b12x.integration.cuteafd.pointwise import fp8_kv_plane_bytes
+
+    torch.manual_seed(20261115)
+    context, heads = 8192, 4
+    pool = context // 64
+    record = fp8_kv_plane_bytes(heads, 128)
+    key = torch.randn((context, heads, 128), device="cuda").bfloat16()
+    value = (torch.randn_like(key) * .01).bfloat16()
+    value[::127, :, 0] = 1024
+    packed = [torch.empty((context, record), dtype=torch.uint8, device="cuda") for _ in range(2)]
+    pack = compile_minimax_kv_pack_aot(heads=heads)
+    pack.launch(key, value, torch.arange(context, dtype=torch.int64, device="cuda"), *packed,
+                scalars=(context,))
+    for mode in ("decode", "extend"):
+        capacity = min(64, max(args.rows)) if mode == "decode" else max(args.rows)
+        program = compile_minimax_attention_aot(max_rows=capacity, max_batch=64, mode=mode)
+        query = (torch.randn((capacity, 64, 128), device="cuda") * .5).bfloat16()
+        output = torch.empty_like(query)
+        lse = torch.empty((capacity, 64), device="cuda")
+        scratch = torch.empty(program.scratch_bytes(capacity)["scratch"], dtype=torch.uint8, device="cuda")
+        table = torch.arange(pool, dtype=torch.int32, device="cuda").repeat(64, 1)
+        selected = torch.full((heads, capacity, 16), -1, dtype=torch.int32, device="cuda")
+        # A fixed set of prior blocks is visible to every query, including tails.
+        selected[:] = torch.arange(16, device="cuda", dtype=torch.int32)
+        for rows in args.rows:
+            if rows > capacity:
+                continue
+            batch = rows if mode == "decode" else 1
+            lengths = torch.full((batch,), context, dtype=torch.int32, device="cuda")
+            cu = (torch.arange(batch + 1, dtype=torch.int32, device="cuda") if mode == "decode"
+                  else torch.tensor([0, rows], dtype=torch.int32, device="cuda"))
+            def launch():
+                program.launch(query, *packed, table, lengths, cu, selected, output, lse, scratch,
+                               scalars=(rows, batch, pool, pool))
+            launch()
+            torch.cuda.synchronize()
+            assert torch.isfinite(output[:rows]).all() and output[:rows].count_nonzero() > 0
+            us, raw = measure(launch, args.iterations, args.samples)
+            yield dict(kernel="attention", mode=mode, rows=rows, median_us=us,
+                       us_per_row=us / rows, samples_us=raw, context=context, selected_tokens=2048)
 
 
 def gather_cases(args):
@@ -319,7 +363,7 @@ def main():
     props = torch.cuda.get_device_properties(0)
     results = []
     with NvmlWindow() as window:
-        for result in itertools.chain(producer_cases(args), gather_cases(args)):
+        for result in itertools.chain(producer_cases(args), gather_cases(args), attention_cases(args)):
             results.append(result)
             print(json.dumps(result), flush=True)
     payload = dict(device=dict(name=props.name, uuid=str(props.uuid), sm_count=props.multi_processor_count,
