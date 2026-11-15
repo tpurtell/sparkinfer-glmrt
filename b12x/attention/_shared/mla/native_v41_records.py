@@ -75,50 +75,24 @@ def native_v41_metadata_valid(descriptor: cute.Tensor, metadata: cute.Tensor, wi
 
 
 @cute.jit
-def native_v41_record_context(
-    descriptor: cute.Tensor, metadata: cute.Tensor, window_begin: Uint64,
-):
-    """Read the key-independent descriptor/metadata words once per token row.
-
-    ``resolve_native_v41_record`` re-read all twelve metadata words, five
-    descriptor words and the whole validation load chain for every one of the
-    sixty-four keys a gather stages. Every one of those words is a property of
-    the token's descriptor row, not of the key, so the producer evaluates them
-    once per chunk and threads them through the per-key address resolution.
-    """
-    m0, offset, position = metadata[0], metadata[1], metadata[3]
-    logical_count = metadata[5]
-    committed, private_count = metadata[6], metadata[7]
-    private_offset, private_stride = metadata[8], metadata[9]
-    source_capacity = descriptor[12]
-    page_stride = descriptor[14] & Uint64(0xFFFFFFFF)
-    compressed = descriptor[14] >> Uint64(32)
-    valid = native_v41_metadata_valid(descriptor, metadata, window_begin)
-    return (valid, m0, offset, position, logical_count, committed, private_count,
-            private_offset, private_stride, source_capacity, page_stride,
-            compressed)
-
-
-@cute.jit
 def resolve_native_v41_record(
     descriptor: cute.Tensor, metadata: cute.Tensor, selected: cute.Tensor,
-    key: Int32, window_begin: Uint64, context=None,
+    key: Int32, window_begin: Uint64,
 ):
     """Return (value address, scale address); (0, 0) means a masked key.
 
     Keys 0..127 are the causal window, 128..639 are selected source IDs.
     This fixed boundary pads short windows, independently of the native
-    implementation's optional compact physical tile schedule. ``context`` is
-    the tuple from :func:`native_v41_record_context` for this token row; when
-    omitted the helper resolves it here (per-key callers only). ``context is
-    None`` is a trace-time predicate: a plain ``if`` would be staged control
-    flow and could not join ``None`` with the twelve-scalar tuple.
+    implementation's optional compact physical tile schedule.
     """
-    if cutlass.const_expr(context is None):
-        context = native_v41_record_context(descriptor, metadata, window_begin)
-    (valid, m0, offset, position, logical_count, committed, private_count,
-     private_offset, private_stride, source_capacity, page_stride,
-     compressed) = context
+    m0, offset, count, position = metadata[0], metadata[1], metadata[2], metadata[3]
+    committed, private_count = metadata[6], metadata[7]
+    private_offset, private_stride = metadata[8], metadata[9]
+    window_capacity = descriptor[11]
+    source_capacity, private_capacity = descriptor[12], descriptor[13]
+    page_stride = descriptor[14] & Uint64(0xFFFFFFFF)
+    compressed = descriptor[14] >> Uint64(32)
+    valid = native_v41_metadata_valid(descriptor, metadata, window_begin)
     value_address, scale_address = Uint64(0), Uint64(0)
     source, row = Int32(0), Uint64(0)
     if valid:
@@ -135,7 +109,7 @@ def resolve_native_v41_record(
                 row = offset + logical - m0
         elif key >= Int32(128) and key < Int32(640) and compressed != Uint64(0):
             logical_id = Int32(selected[key - Int32(128)])
-            valid = (logical_id >= Int32(0)) & (Uint64(logical_id) < logical_count)
+            valid = (logical_id >= Int32(0)) & (Uint64(logical_id) < metadata[5])
             if valid:
                 logical = Uint64(logical_id)
                 if logical >= committed:
@@ -177,17 +151,11 @@ def issue_native_v41_gather(
     canonical metadata mask that payload. No full-pool or selected-pool repack.
     """
     payload_bytes = 512 if swa else 256
-    # One token row per gather: resolve its key-independent metadata once and
-    # share it across all sixty-four key resolutions instead of reloading the
-    # descriptor words and re-running the validation chain per key.
-    context = native_v41_record_context(descriptor, metadata, window_begin)
     for part in cutlass.range_constexpr((64 + io_threads - 1) // io_threads):
         entry = io_lane + Int32(part * io_threads)
         if entry < Int32(64):
             key = start + entry + Int32(0 if swa else 128)
-            value, scale = resolve_native_v41_record(
-                descriptor, metadata, selected, key, window_begin, context
-            )
+            value, scale = resolve_native_v41_record(descriptor, metadata, selected, key, window_begin)
             valid = value != Uint64(0)
             index, tag = key, Uint32(1 if swa else 0)
             if not valid:
