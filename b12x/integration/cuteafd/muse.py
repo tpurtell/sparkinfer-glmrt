@@ -490,11 +490,11 @@ class KvRecordNorm:
                     v1 = cute.arch.shuffle_sync_bfly(value, offset=1)
                     v2 = cute.arch.shuffle_sync_bfly(value, offset=2)
                     v3 = cute.arch.shuffle_sync_bfly(v1, offset=2)
+                    word_at = head * Int64(16) + lane // Int64(4) + Int64((item % 2) * 8)
+                    if cutlass.const_expr(item >= 2):
+                        word_at += Int64(self.heads * 16)
                     if lane % Int64(4) == Int64(0):
-                        at = head * Int64(16) + lane // Int64(4) + Int64((item % 2) * 8)
-                        if cutlass.const_expr(item >= 2):
-                            at += Int64(self.heads * 16)
-                        words[at] = cvt_f32x4_to_e4m3x4(value, v1, v2, v3)
+                        words[word_at] = cvt_f32x4_to_e4m3x4(value, v1, v2, v3)
             else:
                 at = slot * Int64(self.heads * 128) + head * Int64(64) + lane
                 dst[at], dst[at + Int64(32)] = BFloat16(a), BFloat16(b)
