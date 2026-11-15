@@ -714,7 +714,7 @@ def test_v41_decode_pipeline_descriptor_keeps_other_programs_unchanged(cc, hidde
         scale_codes=coded, hidden=hidden, intermediate=intermediate,
         activation_precision=precision, capacity=capacity, compute_capability=cc)
     assert selected == (cc == (12, 1) and coded and precision == "a8" and capacity <= 80
-                        and hidden == 5120 and intermediate in (384, 768))
+                        and hidden == 5120 and intermediate == 384)
 
 
 def test_v41_decode_pipeline_selector_queries_target_cc_and_fails_closed(monkeypatch):

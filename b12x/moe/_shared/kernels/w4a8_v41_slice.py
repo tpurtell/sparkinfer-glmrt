@@ -79,14 +79,14 @@ def v41_compact_decode_pipeline_qualified(
 
     The overlapped weight staging is qualified only for the shipped V4.1
     compact-scale decode recipe on SM121: hidden 5120, per-rank intermediate
-    384 or 768, compact scale codes, A8 activations and planned capacity at
+    384, compact scale codes, A8 activations and planned capacity at
     most 80. The compute capability is queried from the compilation target
     (the offline compiler supplies its own), never from an environment knob
     or a hard-coded device count. Every other recipe keeps the single-slot
     schedule, so its program is unchanged.
     """
     if not (scale_codes and activation_precision == "a8" and capacity <= 80
-            and hidden == 5120 and intermediate in (384, 768)):
+            and hidden == 5120 and intermediate == 384):
         return False
     if compute_capability is None:
         from b12x._lib.gating import get_compute_capability
