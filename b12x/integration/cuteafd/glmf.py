@@ -421,8 +421,8 @@ class _KdaChunked:
     """One sequence's KDA recurrence through b12x's chunked delta-rule
     prefill (prologue, then prepare + recurrence per window of tiles on one
     stream), over the same q|k|v, gate, beta, state and output buffers as
-    ``GlmfKdaRecurrent``. Beta is ``sigmoid(b)`` in FP32 (the reference rounds
-    it to BF16 first). A BF16 state (``state_dtype``) is loaded into FP32 and
+    ``GlmfKdaRecurrent``. Beta is ``bf16(sigmoid(b))``, matching the recurrent
+    decode/verify path and the reference. A BF16 state (``state_dtype``) is loaded into FP32 and
     rounded where each window stores it (``round_tiles``: after every 16-row tile)."""
 
     def __init__(self, g: GLMFGeometry, max_rows: int, state_dtype=Float32, round_tiles: bool = False):
@@ -447,7 +447,7 @@ class _KdaChunked:
         self.prepare = dk._PrepareKernel(
             heads=heads, key_heads=heads, is_gdn=False, tiles_capacity=caps.tiles_capacity,
             window_tiles=layout.window_tiles, qk_l2norm=True, a_log_type=cutlass.Float32,
-            dt_bias_type=cutlass.Float32)
+            dt_bias_type=cutlass.Float32, round_beta=True)
         self.recurrence = dk._RecurrenceKernel(
             heads=heads, tiles_capacity=caps.tiles_capacity, window_tiles=layout.window_tiles,
             rows=layout.recurrence_rows, v_split=64, k_split=1, stages=3, checkpoint_export=False,

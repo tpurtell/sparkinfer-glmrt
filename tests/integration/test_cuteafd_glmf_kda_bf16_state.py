@@ -19,6 +19,9 @@ commit, and in the chunked prefill where each window of tiles stores it (or, wit
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
+import cutlass.cute as cute
+from cutlass import Int32, Int64
 import pytest
 import torch
 
@@ -265,6 +268,60 @@ def test_kda_s16_prefill_past_a_window_and_per_tile():
         print(f"1500-row prefill, BF16 state ({rounding}) against FP32: out {_rel(out16, out32):.2e} "
               f"state {_rel(s16, s32):.2e}")
         assert _rel(out16, out32) < 2e-2 and _rel(s16, s32) < 2e-2
+
+
+@pytest.mark.parametrize("rows", [65, 128])
+def test_chunked_beta_matches_bf16_decode_reference(rows):
+    from b12x.integration.cuteafd import KDAGeometry
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd.glmf import _KdaChunked
+    from b12x.sequence._shared.delta_prefill.workspace import WorkspaceRecord as REC
+
+    g = KDAGeometry(hidden=7168, kda_heads=8)
+    core = _KdaChunked(g, rows)
+    h, d = g.kda_heads, g.kda_width
+
+    class Chunked:
+        @cute.jit
+        def __call__(self, qkv: cute.Pointer, gate: cute.Pointer, beta: cute.Pointer,
+                     a_log: cute.Pointer, bias: cute.Pointer, state: cute.Pointer,
+                     slots: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer,
+                     live: Int32, stream: cuda.CUstream):
+            core(qkv, gate, beta, a_log, bias, state, slots, out, Int64(scratch.toint()),
+                 3 * d, d, h, live, stream)
+
+    program = compile_program(Chunked(), name="test_chunked_beta",
+        operands=(Operand("qkv", torch.bfloat16, f"[rows,{3 * d}]"),
+                  Operand("gate", torch.bfloat16, f"[rows,{d}]"),
+                  Operand("beta", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("a_log", torch.float32, f"[{h}]"),
+                  Operand("bias", torch.float32, f"[{d}]"),
+                  Operand("state", torch.float32, f"[1,{h},128,128]", "inout"),
+                  Operand("slots", torch.int32, "[rows]"),
+                  Operand("out", torch.bfloat16, f"[rows,{d}]", "out"),
+                  Operand("scratch", torch.uint8, "[scratch_bytes]", "scratch")),
+        scalars=(Scalar("live"),), key=(rows,))
+    gen = torch.Generator(device="cuda").manual_seed(801 + rows)
+    qkv = torch.randn(rows, 3 * d, generator=gen, device="cuda").bfloat16()
+    gate = torch.full((rows, d), -2.0, dtype=torch.bfloat16, device="cuda")
+    # A fixed grid avoids approximate-sigmoid rounding ties while spanning its range.
+    beta = torch.linspace(-4, 4, rows * h, device="cuda").reshape(rows, h).bfloat16()
+    a_log = torch.zeros(h, device="cuda")
+    bias = torch.zeros(d, device="cuda")
+    state = torch.zeros(1, h, 128, 128, device="cuda")
+    slots = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    out = torch.empty(rows, d, dtype=torch.bfloat16, device="cuda")
+    scratch = torch.empty(core.nbytes, dtype=torch.uint8, device="cuda")
+    program.launch(qkv, gate, beta, a_log, bias, state, slots, out, scratch, scalars=(rows,))
+    torch.cuda.synchronize()
+    tiles = (rows + 15) // 16
+    ws = scratch[core.layout.offsets["ws"]:]
+    records = ws[:tiles * h * REC.BYTES].view(tiles, h, REC.BYTES)
+    actual = records[..., REC.BETA:REC.BETA + 64].contiguous().view(torch.float32)
+    actual = actual.permute(0, 2, 1).reshape(-1, h)[:rows]
+    expected = torch.sigmoid(beta.float()).bfloat16().float()
+    assert torch.equal(actual, expected)
+    assert torch.isfinite(out).all() and torch.isfinite(state).all()
 
 
 def test_kda_s16_tile_rounding_does_not_depend_on_the_chunk_plan():
