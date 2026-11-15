@@ -19,6 +19,11 @@ LIVE_ROWS = (1, 2, 16, 17, 127, 128, 129, 2048, 4096, 8192)
 
 
 def _inputs(hidden, capacity):
+    shared = os.environ.get("B12X_NVFP4_WIRE_INPUTS")
+    if shared:
+        x = torch.load(Path(shared) / f"input-{hidden}.pt", weights_only=True)
+        assert x.shape == (capacity, hidden) and x.dtype == torch.bfloat16
+        return x
     gen = torch.Generator(device="cpu").manual_seed(20261115)
     x = torch.randn((capacity, hidden), generator=gen).bfloat16()
     # Every live count includes zero, tiny/subnormal blocks and huge magnitudes.
