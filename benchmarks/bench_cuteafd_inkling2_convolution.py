@@ -38,7 +38,7 @@ def main():
             slots = torch.zeros(count, dtype=torch.int64, device="cuda")
             out = torch.empty_like(x)
             def run():
-                program.launch(x, weights, coefficients, history, first, slots, out, scalars=(count,))
+                program.launch(x, weights, coefficients, history, first, slots, out, scalars=(count,3*width))
             run()
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()

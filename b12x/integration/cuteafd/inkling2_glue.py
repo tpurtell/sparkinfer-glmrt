@@ -15,12 +15,12 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-from cutlass import Float32, Int32, Int64, Uint8
+from cutlass import Float32, Int32, Int64, Uint8, Uint32
 import torch
 
-from b12x._lib.intrinsics import div_rn_f32
+from b12x._lib.intrinsics import cvt_f32x4_to_e4m3x4, div_rn_f32
 from ._common import Operand, Scalar, compile_program
-from ._glm_kernels import _block_sum, _reduction_storage, _rsqrt
+from ._glm_kernels import _block_sum, _reduction_storage, _rsqrt, _fp8_scale, _warp_max
 
 
 class _Norm:
@@ -78,6 +78,40 @@ class _Pack:
         if slot >= Int64(0) and col < Int64(self.width):
             cache[slot*Int64(2*self.width)+col] = Float32(k[row*Int64(self.width)+col])
             cache[slot*Int64(2*self.width)+Int64(self.width)+col] = Float32(v[row*Int64(self.width)+col])
+
+
+class _PackFp8:
+    """One warp per token/head/plane; scales share each 2112-byte record."""
+    @cute.jit
+    def __call__(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
+                 cache: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(k, v, slots, cache).launch(grid=(rows, 8, 2), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer, cache: cute.Pointer):
+        row, head, plane = cute.arch.block_idx()
+        lane = Int64(cute.arch.thread_idx()[0])
+        source = k
+        if plane == Int32(1):
+            source = v
+        values = cute.make_rmem_tensor((4,), Float32)
+        maximum = Float32(0.0)
+        for j in cutlass.range_constexpr(4):
+            values[j] = Float32(source[(Int64(row)*Int64(8)+Int64(head))*Int64(128)+lane*Int64(4)+Int64(j)])
+            maximum = cutlass.max(maximum, cute.math.abs(values[j]))
+        scale = _fp8_scale(_warp_max(maximum))
+        inverse = div_rn_f32(Float32(1.0), scale)
+        packed = cvt_f32x4_to_e4m3x4(values[0]*inverse, values[1]*inverse,
+                                    values[2]*inverse, values[3]*inverse)
+        slot = Int64(slots[Int64(row)])
+        if slot >= Int64(0):
+            base = Int64(cache.toint())+slot*Int64(2112)
+            destination = cute.make_ptr(Uint32, base+(Int64(plane)*Int64(8)+Int64(head))*Int64(128)
+                                        +lane*Int64(4), cute.AddressSpace.gmem, assumed_align=4)
+            destination[0] = packed
+            if lane == Int64(0):
+                scales = cute.make_ptr(Float32, base+Int64(2048), cute.AddressSpace.gmem, assumed_align=4)
+                scales[Int64(plane)*Int64(8)+Int64(head)] = scale
 
 
 class _PaddedTranspose:
@@ -146,16 +180,20 @@ def compile_inkling2_norm_aot(*, width=4608, heads=1, weighted=True, eps=1e-6,
                       output_dtype=str(output_dtype), max_rows=max_rows), doc=__doc__)
 
 
-def compile_inkling2_kv_pack_aot(*, heads=8, dim=128, input_dtype=torch.float32, max_rows=4096):
-    if (type(heads) is not int or heads <= 0 or type(dim) is not int or dim <= 0
+def compile_inkling2_kv_pack_aot(*, heads=8, dim=128, input_dtype=torch.float32, max_rows=4096, kv_format="bf16"):
+    if (kv_format not in ("bf16", "fp8") or (kv_format == "fp8" and (heads, dim) != (8, 128))
+            or type(heads) is not int or heads <= 0 or type(dim) is not int or dim <= 0
             or input_dtype not in (torch.float32, torch.bfloat16) or type(max_rows) is not int
             or not 1 <= max_rows <= 2**31-1):
         raise ValueError("invalid Inkling KV pack geometry")
     width = heads*dim
-    return compile_program(_Pack(width), name="inkling2_kv_pack",
+    return compile_program(_PackFp8() if kv_format == "fp8" else _Pack(width), name="inkling2_kv_pack",
         operands=(Operand("k", input_dtype, f"[rows,{heads},{dim}]"),
                   Operand("v", input_dtype, f"[rows,{heads},{dim}]"),
                   Operand("slots", torch.int64, "[rows]", align=8),
-                  Operand("cache", torch.bfloat16, f"[slots,{2*width}]", "inout")),
-        scalars=(Scalar("rows"),), key=(heads, dim, input_dtype, max_rows),
-        geometry=dict(heads=heads, dim=dim, input_dtype=str(input_dtype), max_rows=max_rows), doc=__doc__)
+                  Operand("cache", torch.uint8 if kv_format == "fp8" else torch.bfloat16,
+                          "[slots,2112]" if kv_format == "fp8" else f"[slots,{2*width}]", "inout")),
+        scalars=(Scalar("rows"),), key=("cache_v2", heads, dim, input_dtype, max_rows, kv_format),
+        geometry=dict(heads=heads, dim=dim, input_dtype=str(input_dtype), max_rows=max_rows,
+                      cache_abi=2, kv_format=kv_format, record_bytes=2112 if kv_format == "fp8" else 4*width,
+                      scale_offset=2048 if kv_format == "fp8" else 0), doc=__doc__)

@@ -8,8 +8,9 @@ cuteafd's #1915 short_conv; normalization is 1/sqrt(taps+1) for static and
 1/sqrt(2*taps+1) for dynamic.
 
 Rows form contiguous sequence segments. first[row] is that segment's first
-row; slots[row] selects its exclusive history [slots, taps-1, width], stored
-newest-first. History must be zeroed for fresh sequences. The convolution
+row; slots[row] selects its exclusive history at slot*history_stride_elements,
+stored newest-first. The i64 runtime stride addresses the complete request
+state bank; history points at the selected layer/field in request slot zero. History must be zeroed for fresh sequences. The convolution
 reads the entire old history before a second kernel commits the final
 (taps-1) inputs. This ordering supports arbitrary short chunks, graph replay,
 and packed sequences without host work. A slot occurs in only one segment.
@@ -48,18 +49,18 @@ class _Convolution:
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, dynamic: cute.Pointer,
                  history: cute.Pointer, first: cute.Pointer, slots: cute.Pointer,
-                 out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.convolve(x, weight, dynamic, history, first, slots, out, rows).launch(
+                 out: cute.Pointer, rows: Int32, history_stride_elements: Int64, stream: cuda.CUstream):
+        self.convolve(x, weight, dynamic, history, first, slots, out, rows, history_stride_elements).launch(
             grid=(rows, (self.width + self.threads - 1) // self.threads, 1),
             block=(self.threads, 1, 1), stream=stream)
-        self.commit(x, history, first, slots, rows).launch(
+        self.commit(x, history, first, slots, rows, history_stride_elements).launch(
             grid=(rows, (self.width + self.threads - 1) // self.threads, 1),
             block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def convolve(self, x: cute.Pointer, weight: cute.Pointer, dynamic: cute.Pointer,
                  history: cute.Pointer, first: cute.Pointer, slots: cute.Pointer,
-                 out: cute.Pointer, rows: Int32):
+                 out: cute.Pointer, rows: Int32, history_stride_elements: Int64):
         row = Int64(cute.arch.block_idx()[0])
         col = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
         if row < Int64(rows) and col < Int64(self.width):
@@ -72,7 +73,7 @@ class _Convolution:
                     value = Float32(x[(row - Int64(lag)) * Int64(self.width) + col])
                 else:
                     prior = Int64(lag) - (row - begin) - Int64(1)
-                    value = Float32(history[(slot * Int64(self.taps - 1) + prior) * Int64(self.width) + col])
+                    value = Float32(history[slot * history_stride_elements + prior * Int64(self.width) + col])
                 tap = Float32(0)
                 if cutlass.const_expr(self.dynamic):
                     head = col // Int64(self.width // self.heads)
@@ -85,7 +86,7 @@ class _Convolution:
 
     @cute.kernel
     def commit(self, x: cute.Pointer, history: cute.Pointer, first: cute.Pointer,
-               slots: cute.Pointer, rows: Int32):
+               slots: cute.Pointer, rows: Int32, history_stride_elements: Int64):
         row = Int64(cute.arch.block_idx()[0])
         col = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
         if row < Int64(rows) and col < Int64(self.width):
@@ -103,8 +104,8 @@ class _Convolution:
                         value = Float32(x[(row - Int64(lag)) * Int64(self.width) + col])
                     else:
                         prior = Int64(lag) - (row - begin) - Int64(1)
-                        value = Float32(history[(slot * Int64(self.taps - 1) + prior) * Int64(self.width) + col])
-                    history[(slot * Int64(self.taps - 1) + Int64(lag)) * Int64(self.width) + col] = value
+                        value = Float32(history[slot * history_stride_elements + prior * Int64(self.width) + col])
+                    history[slot * history_stride_elements + Int64(lag * self.width) + col] = value
 
 
 def compile_inkling2_convolution_aot(*, width: int, taps: int = 4, heads: int = 1,
@@ -132,8 +133,8 @@ def compile_inkling2_convolution_aot(*, width: int, taps: int = 4, heads: int = 
     )
     return compile_program(
         _Convolution(width, taps, heads, dynamic), name=f"inkling2_{kind}_convolution",
-        operands=operands, scalars=(Scalar("rows"),),
-        key=(width, taps, heads, kind, dtype, max_rows),
+        operands=operands, scalars=(Scalar("rows"), Scalar("history_stride_elements", "int64")),
+        key=("cache_v2", width, taps, heads, kind, dtype, max_rows),
         geometry={"width": width, "taps": taps, "heads": heads, "dynamic": bool(dynamic),
-                  "history": "newest_first", "max_rows": max_rows},
+                  "history": "newest_first", "cache_abi": 2, "max_rows": max_rows},
         doc=__doc__)

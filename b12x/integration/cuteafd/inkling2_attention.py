@@ -1,46 +1,22 @@
-"""Inkling 2 Small attention AOT programs (``inkling2_*``) for cuteafd.
+"""Inkling cache ABI v2: segmented biased-sink GQA with native global FP8.
 
-One biased-sink GQA tile (``_inkling2_kernels.InklingGqaAttention``) in four
-exports, selected by layer kind and route; see that module for the arithmetic
-and :class:`Inkling2Geometry` for the static shapes (48 / 8 heads of 128,
-window 1024, bias extent 1024, BF16 records of 4096 bytes).
+Global operands are q, kv_cache, positions, page_table, table_indices,
+seq_first, tile_rows, rel, sinks, out, scratch; runtime scalars are rows,
+table_stride, tiles, and (decode only) splits. Each row selects the request
+page table at table_indices[row]*table_stride. FP8 records contain K[1024]
+and V[1024] E4M3 payloads then K-scale[8] and V-scale[8] FP32 descales in
+one 2112-byte physical record. BF16 records retain their 4096-byte layout.
 
-Inputs common to every program, per live row ``r`` (``rows <= max_rows``):
+Local operands are q, kv_step, ring, positions, ring_slots, seq_first,
+tile_rows, rel, sinks, out, scratch; scalars are rows and tiles. Local
+records remain BF16. ring_slots are absolute record indices into a strided
+request bank, not a dense array of fixed-sized rings.
 
-* ``q``      BF16 ``[rows, 48, 128]``: the L2-clipped (and on global layers
-             log-scaled) query.
-* ``rel``    BF16 ``[rows, 48, extent]``: ``rel[r, h, d]`` is the additive
-             bias of head ``h`` for a key ``d`` positions back (``r_proj`` x
-             L2 clip x ``rel_logits_proj.proj``, computed upstream).
-* ``sinks``  F32 ``[rows, 48]``: the unscaled sink logit per (token, head).
-* ``positions`` I64 ``[rows]``: the row's position in its sequence.
-* ``out``    BF16 ``[rows, 48, 128]``: attention output before the gate.
-
-``compile_inkling2_attention_aot(g, kind="global", route=..., max_rows=M)``::
-
-    inkling2_global_attention(q, kv_cache, positions, page_table, rel, sinks, out, scratch,
-                              rows, table_stride[, splits], stream)
-
-Paged BF16 records ``kv_cache [pages*64, 2048]``; ``page_table`` is per row
-(``[rows, table_stride]``, decode) or one row shared by the whole step
-(``table_stride == 0``, prefill: one sequence per step). Decode (one row per
-CTA) splits the key range over ``splits <= max_splits`` CTAs and merges the
-FP32 partials in ``scratch`` with the sink once (``InklingSplitMerge``);
-prefill (10 rows per CTA) attends directly.
-
-``compile_inkling2_attention_aot(g, kind="local", route=..., max_rows=M)``::
-
-    inkling2_local_attention(q, kv_step, ring, positions, ring_slots, seq_first, rel, sinks, out,
-                             scratch, rows, stream)
-
-Sliding window over this step's records ``kv_step [rows, 2048]`` and each
-sequence's ring (``ring [rings*2048, 2048]``, slot ``ring_slots[row]``);
-``seq_first[row]`` is the step's first row of the row's sequence. The step's
-records are then committed into the rings (``MimoRingCommit``), so a row's
-record must be in ``kv_step`` before the launch, not in the ring.
-
-Scratch: ``attention_scratch_bytes(g, kind, route, rows)``; 1 KiB except for
-the global decode partials (``rows * max_splits * 48 * (128 * 4 + 4)``).
+tile_rows[cta] gives the absolute packed query start; seq_first[row] is
+the segment's absolute first row. Ten-row prefill tiles clamp at the next
+segment boundary. Decode uses one row per CTA. KV packing completes before
+attention; the local commit runs afterward. The relative bias and per-row
+sink follow the checkpoint's native arithmetic in _inkling2_kernels.
 """
 from __future__ import annotations
 
@@ -81,9 +57,9 @@ def _check(kind: str, route: str, max_rows: int) -> int:
     return int(max_rows)
 
 
-def record_bytes(g: Inkling2Geometry) -> int:
+def record_bytes(g: Inkling2Geometry, kv_format: str = "bf16") -> int:
     """Bytes of one token's BF16 KV record."""
-    return g.record_elems * 2
+    return g.record_elems + g.kv_heads * 8 if kv_format == "fp8" else g.record_elems * 2
 
 
 def prefill_tokens(g: Inkling2Geometry) -> int:
@@ -100,13 +76,13 @@ def attention_scratch_bytes(g: Inkling2Geometry, kind: str, route: str, rows: in
 
 
 class _GlobalAttention:
-    def __init__(self, g: Inkling2Geometry, route: str, max_splits: int):
+    def __init__(self, g: Inkling2Geometry, route: str, max_splits: int, kv_format: str):
         self.g, self.route = g, route
         decode = route == "decode"
         self.attn = InklingGqaAttention(
             heads=g.heads, kv_heads=g.kv_heads, tokens=1 if decode else prefill_tokens(g), window=0, paged=True,
             extent=g.extent("global"), softmax_scale=g.softmax_scale, direct=not decode, page_rows=g.page_rows,
-            ring_rows=g.ring_rows)
+            ring_rows=g.ring_rows, kv_format=kv_format)
         self.merge = InklingSplitMerge(heads=g.heads, v_head=g.head_dim) if decode else None
         self.max_splits = int(max_splits)
 
@@ -115,16 +91,17 @@ class _GlobalAttention:
 
     @cute.jit
     def run(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
+            table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
             rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-            table_stride: Int32, splits: Int32, stream: cuda.CUstream):
+            table_stride: Int32, tiles: Int32, splits: Int32, stream: cuda.CUstream):
         base = Int64(scratch.toint())
         partials = cute.make_ptr(cutlass.Float32, base, cute.AddressSpace.gmem, assumed_align=16)
         lse_off = base + (Int64(rows) * Int64(self.max_splits * self.g.heads * self.g.head_dim * 4)
                           + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
         lse = cute.make_ptr(cutlass.Float32, lse_off, cute.AddressSpace.gmem, assumed_align=16)
         # The ring operands (kv_step, ring_slots, seq_first) are unused on the paged route.
-        self.attn(q, kv_cache, kv_cache, positions, page_table, page_table, page_table, rel, sinks, out, partials,
-                  lse, rows, table_stride, splits, stream)
+        self.attn(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, seq_first, seq_first, rel, sinks, out, partials,
+                  lse, rows, table_stride, tiles, splits, stream)
         if cutlass.const_expr(self.merge is not None):
             self.merge(partials, lse, sinks, out, rows, splits, stream)
 
@@ -132,22 +109,24 @@ class _GlobalAttention:
 class _GlobalAttentionDecode(_GlobalAttention):
     @cute.jit
     def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
+                 table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
                  rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 table_stride: Int32, splits: Int32, stream: cuda.CUstream):
+                 table_stride: Int32, tiles: Int32, splits: Int32, stream: cuda.CUstream):
         clamped = splits
         if clamped > Int32(self.max_splits):
             clamped = Int32(self.max_splits)
         if clamped < Int32(1):
             clamped = Int32(1)
-        self.run(q, kv_cache, positions, page_table, rel, sinks, out, scratch, rows, table_stride, clamped, stream)
+        self.run(q, kv_cache, positions, page_table, table_indices, seq_first, tile_rows, rel, sinks, out, scratch, rows, table_stride, tiles, clamped, stream)
 
 
 class _GlobalAttentionPrefill(_GlobalAttention):
     @cute.jit
     def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
+                 table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
                  rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 table_stride: Int32, stream: cuda.CUstream):
-        self.run(q, kv_cache, positions, page_table, rel, sinks, out, scratch, rows, table_stride, Int32(1), stream)
+                 table_stride: Int32, tiles: Int32, stream: cuda.CUstream):
+        self.run(q, kv_cache, positions, page_table, table_indices, seq_first, tile_rows, rel, sinks, out, scratch, rows, table_stride, tiles, Int32(1), stream)
 
 
 class _LocalAttention:
@@ -164,19 +143,21 @@ class _LocalAttention:
 
     @cute.jit
     def __call__(self, q: cute.Pointer, kv_step: cute.Pointer, ring: cute.Pointer, positions: cute.Pointer,
-                 ring_slots: cute.Pointer, seq_first: cute.Pointer, rel: cute.Pointer, sinks: cute.Pointer,
-                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+                 ring_slots: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer, rel: cute.Pointer, sinks: cute.Pointer,
+                 out: cute.Pointer, scratch: cute.Pointer, rows: Int32, tiles: Int32, stream: cuda.CUstream):
         f32 = cute.make_ptr(cutlass.Float32, Int64(scratch.toint()), cute.AddressSpace.gmem, assumed_align=16)
         i32 = cute.make_ptr(cutlass.Int32, Int64(seq_first.toint()), cute.AddressSpace.gmem, assumed_align=4)
-        self.attn(q, ring, kv_step, positions, i32, ring_slots, seq_first, rel, sinks, out, f32, f32, rows,
-                  Int32(0), Int32(1), stream)
+        self.attn(q, ring, kv_step, positions, i32, i32, tile_rows, ring_slots, seq_first, rel, sinks, out, f32, f32, rows,
+                  Int32(0), tiles, Int32(1), stream)
         self.commit(kv_step, ring, ring_slots, seq_first, rows, stream)
 
 
 def compile_inkling2_attention_aot(g: Inkling2Geometry = INKLING2_SMALL, *, kind: str, route: str, max_rows: int,
-                                   max_splits: int = DEFAULT_MAX_SPLITS):
+                                   max_splits: int = DEFAULT_MAX_SPLITS, kv_format: str = "bf16"):
     """Biased-sink GQA attention of ``kind`` for ``rows <= max_rows``; see the module docstring."""
     max_rows = _check(kind, route, max_rows)
+    if kv_format not in ("bf16", "fp8") or (kind == "local" and kv_format != "bf16"):
+        raise ValueError("FP8 KV is global only")
     if not 1 <= int(max_splits) <= MAX_SPLITS:
         raise ValueError(f"max_splits must be in 1..{MAX_SPLITS}")
     n, d, r, extent = g.heads, g.head_dim, g.record_elems, g.extent(kind)
@@ -188,11 +169,15 @@ def compile_inkling2_attention_aot(g: Inkling2Geometry = INKLING2_SMALL, *, kind
     scratch = Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch")
     if kind == "global":
         cls = _GlobalAttentionDecode if route == "decode" else _GlobalAttentionPrefill
-        launch = cls(g, route, max_splits)
-        operands = (q, Operand("kv_cache", torch.bfloat16, f"[pages*{g.page_rows},{r}]"),
+        launch = cls(g, route, max_splits, kv_format)
+        operands = (q, Operand("kv_cache", torch.uint8 if kv_format == "fp8" else torch.bfloat16,
+                                  f"[pages*{g.page_rows},{record_bytes(g, kv_format)} bytes]"),
                     Operand("positions", torch.int64, "[rows]", align=8),
-                    Operand("page_table", torch.int32, "[rows|1,table_stride]", align=4), rel, sinks, out, scratch)
-        scalars = (Scalar("rows"), Scalar("table_stride"))
+                    Operand("page_table", torch.int32, "[tables,table_stride]", align=4),
+                    Operand("table_indices", torch.int32, "[rows]", align=4),
+                    Operand("seq_first", torch.int32, "[rows]", align=4),
+                    Operand("tile_rows", torch.int32, "[tiles]", align=4), rel, sinks, out, scratch)
+        scalars = (Scalar("rows"), Scalar("table_stride"), Scalar("tiles"))
         if route == "decode":
             scalars += (Scalar("splits"),)
     else:
@@ -201,13 +186,15 @@ def compile_inkling2_attention_aot(g: Inkling2Geometry = INKLING2_SMALL, *, kind
                     Operand("ring", torch.bfloat16, f"[rings*{g.ring_rows},{r}]", "inout"),
                     Operand("positions", torch.int64, "[rows]", align=8),
                     Operand("ring_slots", torch.int64, "[rows]", align=8),
-                    Operand("seq_first", torch.int32, "[rows]", align=4), rel, sinks, out, scratch)
-        scalars = (Scalar("rows"),)
+                    Operand("seq_first", torch.int32, "[rows]", align=4),
+                    Operand("tile_rows", torch.int32, "[tiles]", align=4), rel, sinks, out, scratch)
+        scalars = (Scalar("rows"), Scalar("tiles"))
     return compile_program(
         launch, name=f"inkling2_{kind}_attention", operands=operands, scalars=scalars,
-        key=(max_rows, kind, route, launch.key()),
+        key=("cache_v2", max_rows, kind, route, kv_format, launch.key()),
         geometry={"kind": kind, "route": route, "heads": n, "kv_heads": g.kv_heads, "head_dim": d,
-                  "record_elems": r, "record_bytes": record_bytes(g), "max_rows": max_rows,
+                  "record_elems": r, "record_bytes": record_bytes(g, kv_format),
+                  "cache_abi": 2, "kv_format": kv_format, "scale_offset": g.record_elems if kv_format == "fp8" else 0, "max_rows": max_rows,
                   "window": g.window if kind == "local" else 0, "extent": extent, "ring_rows": g.ring_rows,
                   "page_rows": g.page_rows, "sinks": "per_row_head",
                   "max_splits": int(max_splits) if kind == "global" and route == "decode" else 1,
