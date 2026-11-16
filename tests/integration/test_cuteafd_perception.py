@@ -85,6 +85,11 @@ def test_rotary_matches_adjacent_pair_xy_reference(dim,class_token,height,width)
     assert torch.equal(v,qkv[:,2])
     if class_token:
         assert torch.equal(q[0],qkv[0,0]) and torch.equal(k[0],qkv[0,1])
+    # A second immutable frequency table proves theta is caller data, not an
+    # accidentally hidden static constant in the compiled program.
+    alternate = freq*2
+    program.launch(qkv,alternate,q,k,v,scalars=[rows,width])
+    assert not torch.equal(q,reference_q)
 
 
 @pytest.mark.parametrize("channels", [16,1536,3072])
@@ -98,8 +103,21 @@ def test_conv_lowering_matches_torch_unfold(channels,height,width):
     program = compile_conv3_stride2_lower_aot(channels=channels)
     program.launch(x,out,scalars=[height,width])
     ref = torch.nn.functional.unfold(x.permute(2,0,1)[None].float(),3,padding=1,stride=2)[0].T.bfloat16()
-    assert vendor.metrics(f"conv_lower_c{channels}_{height}x{width}",out[:rows],ref)==0
+    assert vendor.metrics(f"conv_lower_c{channels}_{height}x{width}",out[:rows],ref,source="torch.unfold-layout-only")==0
     assert (out[rows:] == 42).all()
+    # A small exact dyadic contraction verifies the official Conv2d boundary,
+    # not merely a self-consistent lowering layout. Large tower GEMMs qualify
+    # with the full encoder and its own checkpoint later.
+    if channels == 16:
+        from b12x.integration.cuteafd.media import compile_biased_projection_aot
+        weight = ((torch.arange(32*channels*9,device="cuda")%5).float()/16).bfloat16().reshape(32,channels,3,3)
+        bias = torch.linspace(-.05,.05,32,device="cuda").bfloat16()
+        projected = torch.empty(rows,32,device="cuda",dtype=torch.bfloat16)
+        projection = compile_biased_projection_aot(width=channels*9,outputs=32)
+        projection.launch(out,weight,bias,projected,scalars=[rows])
+        reference = torch.nn.functional.conv2d(x.permute(2,0,1)[None].float(),weight.float(),bias.float(),stride=2,padding=1)
+        reference = reference[0].permute(1,2,0).reshape_as(projected).bfloat16()
+        assert vendor.metrics(f"conv3s2_c{channels}_{height}x{width}",projected,reference,source="torch.conv2d-vendor-geometry")==0
 
 
 @pytest.mark.parametrize("class_token", [False,True])

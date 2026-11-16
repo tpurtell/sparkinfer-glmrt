@@ -57,7 +57,7 @@ def step5():
     nodes = [node for node in _tree("step_vl.py").body if isinstance(node,(ast.FunctionDef,ast.ClassDef)) and node.name in names]
     if {node.name for node in nodes} != names:
         raise ValueError("incomplete pinned Step PE definitions")
-    namespace = dict(torch=torch,nn=nn,rearrange=rearrange,repeat=repeat)
+    namespace = dict(torch=torch,nn=nn,rearrange=rearrange,repeat=repeat,__name__="perception_vendor_step5")
     filename = str(Path(os.environ["CUTEAFD_PE_VENDOR_DIR"])/"step_vl.py")
     exec(compile(ast.Module(body=nodes,type_ignores=[]),filename,"exec"),namespace)
     quick = next(node for node in _tree("activation.py").body if isinstance(node,ast.ClassDef) and node.name=="QuickGELU")
@@ -83,11 +83,13 @@ def merge(hidden,height,width,channels,class_token):
     return namespace["pooled"]
 
 
-def metrics(name,actual,reference):
+def metrics(name,actual,reference,source=REVISION):
     import torch
     a,r = actual.contiguous().view(torch.int16).int(),reference.contiguous().view(torch.int16).int()
     # Monotonic ordered BF16 encodings, including the negative half interval.
     a = torch.where(a<0,-32768-a,a);r = torch.where(r<0,-32768-r,r)
     ulp = (a-r).abs()
-    print(f"PE_ORACLE {name} vendor={REVISION} bit_equal={float((actual==reference).float().mean()):.9f} max_ulp={int(ulp.max())}",flush=True)
+    equal = int((actual.contiguous().view(torch.int16)==reference.contiguous().view(torch.int16)).sum())
+    fraction = equal/actual.numel()
+    print(f"PE_ORACLE {name} reference={source} bit_equal={fraction:.12f} equal={equal}/{actual.numel()} max_ulp={int(ulp.max())}",flush=True)
     return int(ulp.max())

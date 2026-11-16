@@ -200,7 +200,7 @@ def compile_quick_gelu_aot(*, width, bf16_intermediates=False):
         Operand("x", torch.bfloat16, f"[rows,{width}]"),
         Operand("out", torch.bfloat16, f"[rows,{width}]", "out")),
         scalars=(Scalar("rows"),), key=(width,rounded),
-        geometry=dict(width=width, activation="quick_gelu", bf16_intermediates=rounded))
+        geometry=dict(width=width, activation="quick_gelu", bf16_intermediates=rounded),version=2)
 
 
 def compile_rotary_2d_aot(*, heads, dim, class_token=False):
@@ -213,7 +213,7 @@ def compile_rotary_2d_aot(*, heads, dim, class_token=False):
         Operand("k", torch.bfloat16, f"[rows,{heads},{dim}]", "out"),
         Operand("v", torch.bfloat16, f"[rows,{heads},{dim}]", "out")),
         scalars=(Scalar("rows"), Scalar("grid_width")), key=(heads,dim,bool(class_token)),
-        geometry=dict(heads=heads,dim=dim,class_token=bool(class_token),pairing="adjacent",axes="x_y"))
+        geometry=dict(heads=heads,dim=dim,class_token=bool(class_token),pairing="adjacent",axes="x_y"),version=2)
 
 
 def compile_conv3_stride2_lower_aot(*, channels):
