@@ -167,6 +167,23 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         down.launch(mlp,state[base+"mlp.c_proj.weight"],state[base+"mlp.c_proj.bias"],delta,scalars=[n])
         residual.launch(middle,delta,state[base+"ls_2.gamma"],output,scalars=[n])
         return output
+    def projection_arms(name,source,weight,bias,native,default):
+        old_tf32=torch.backends.cuda.matmul.allow_tf32
+        old_reduce=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        try:
+            torch.backends.cuda.matmul.allow_tf32=False
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False
+            strict=torch.nn.functional.linear(source,weight,bias)
+            fp32=(source.float()@weight.float().T+bias.float()).bfloat16()
+            separate=(source@weight.T)+bias
+            _metric(name+"_native_vs_vendor_default",native,default)
+            _metric(name+"_native_vs_strict",native,strict)
+            _metric(name+"_native_vs_explicit_fp32",native,fp32)
+            _metric(name+"_native_vs_separate_bf16_bias",native,separate)
+            _metric(name+"_vendor_default_vs_strict",default,strict)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32=old_tf32
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=old_reduce
     def probe_layer0(source):
         layer=reference.backbone.layers[0];base="backbone.layers.0."
         def compare(stage,a,r):return _metric("substage0_"+stage,a,r)
@@ -189,6 +206,7 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         compare("reference_bf16_vs_fp32_math",rattention,rattention32)
         rprojection=layer.self_attn.out_proj(rattention.reshape(n,1024))
         oproj.launch(rattention,state[base+"self_attn.out_proj.weight"],state[base+"self_attn.out_proj.bias"],delta,scalars=[n]);compare("o_projection",delta,rprojection)
+        projection_arms("o_projection",rattention.reshape(n,1024),state[base+"self_attn.out_proj.weight"],state[base+"self_attn.out_proj.bias"],delta,rprojection)
         rmid=source.clone();vendor.inkling().scaled_residual_norm_(rmid,rprojection,layer.ls_1.gamma,None)
         residual.launch(source,rprojection,state[base+"ls_1.gamma"],tmp,scalars=[n]);compare("attention_scale_residual",tmp,rmid)
         rnorm2=layer.ln_2(rmid)
@@ -199,6 +217,7 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         gelu.launch(rfc1,mlp,scalars=[n]);compare("gelu",mlp,rgelu)
         rfc2=layer.mlp.c_proj(rgelu)
         down.launch(rgelu,state[base+"mlp.c_proj.weight"],state[base+"mlp.c_proj.bias"],delta,scalars=[n]);compare("mlp_fc2",delta,rfc2)
+        projection_arms("mlp_fc2",rgelu,state[base+"mlp.c_proj.weight"],state[base+"mlp.c_proj.bias"],delta,rfc2)
         rfinal=rmid.clone();vendor.inkling().scaled_residual_norm_(rfinal,rfc2,layer.ls_2.gamma,None)
         residual.launch(rmid,rfc2,state[base+"ls_2.gamma"],tmp,scalars=[n]);compare("mlp_scale_residual",tmp,rfinal)
     with torch.inference_mode():probe_layer0(xref)
