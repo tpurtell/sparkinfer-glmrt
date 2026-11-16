@@ -100,6 +100,86 @@ def _run_exlr8_segments(activation, aot_dir=None):
     assert torch.equal(reply[1:5505].view(torch.int16), expected[:5504].view(torch.int16))
 
 
+def test_glmf_288_expert_segments_exported_grouping_matches_ordinary(tmp_path):
+    """The real GLMF expert domain crosses the 256-thread prefix-scan boundary."""
+    from b12x.integration.cuteafd import exportable_compilation
+    from tests.moe.segment_aot import ExportedProgram
+
+    rows, hidden, experts, topk = 8192, 4096, 288, 8
+    group_rows = 64
+    groups = (rows * topk + group_rows - 1) // group_rows + experts
+    torch.manual_seed(2282)
+    wire, _ = make_wire(torch.randn((rows, hidden), device="cuda") * 0.02)
+    ids = torch.randint(0, experts, (rows, topk), device="cuda", dtype=torch.int32)
+    # Exercise every expert above 255 even in the first live-row tail.
+    ids[0] = torch.tensor([0, 255, 256, 257, 284, 285, 286, 287], device="cuda")
+    signs = torch.ones(hidden, dtype=torch.int8, device="cuda")
+    physical = torch.arange(rows - 1, -1, -1, device="cuda")
+    resident = wire[physical].contiguous()
+    input_rows = (resident.data_ptr() + physical * (hidden * 33 // 32)).to(torch.int64)
+
+    def buffers_for_group():
+        return [torch.full((groups + 8,), -99, dtype=torch.int32, device="cuda"),
+            torch.full((groups + 8, group_rows), -99, dtype=torch.int32, device="cuda"),
+            torch.full((rows + 8, topk), -99, dtype=torch.int32, device="cuda"),
+            torch.full((9,), -99, dtype=torch.int32, device="cuda"),
+            torch.full((rows + 8, hidden), 11, dtype=torch.float16, device="cuda")]
+
+    expected, actual = buffers_for_group(), buffers_for_group()
+    guard_rows = 4
+    ordinary = compile_exlr8_group_aot(experts=experts, top_k=topk, max_groups=groups,
+        hidden=hidden, max_rows=4096, group_rows=group_rows)
+    with exportable_compilation():
+        program = compile_exlr8_group_aot(experts=experts, top_k=topk, max_groups=groups,
+            hidden=hidden, max_rows=8192, group_rows=group_rows, row_addresses=True)
+    candidate = ExportedProgram(program, tmp_path, "exlr8_glmf_group_segments")
+    limit = torch.cuda.get_device_properties(0).multi_processor_count * 2
+
+    def launch(program, inputs, state, count):
+        program.launch(ids, inputs, signs, *(tensor[guard_rows:-guard_rows] for tensor in state),
+            scalars=(count, limit))
+
+    def check(count):
+        torch.cuda.synchronize()
+        checked = [tensor[guard_rows:-guard_rows] for tensor in actual]
+        reference = [tensor[guard_rows:-guard_rows] for tensor in expected]
+        total = int(checked[3][0].item())
+        assert 0 < total <= groups, (count, total)
+        live_ids = ids[:count].cpu().flatten().tolist()
+        expected_experts, expected_slots = [], []
+        for expert in range(experts):
+            routes = [route for route, value in enumerate(live_ids) if value == expert]
+            for first in range(0, len(routes), group_rows):
+                chunk = routes[first:first + group_rows]
+                expected_experts.append(expert)
+                expected_slots.append(chunk + [-1] * (group_rows - len(chunk)))
+        assert total == len(expected_experts), (count, total, len(expected_experts))
+        assert checked[0][:total].cpu().tolist() == expected_experts
+        assert checked[1][:total].cpu().tolist() == expected_slots
+        for state in actual:
+            guard = 11 if state.dtype == torch.float16 else -99
+            assert (state[:guard_rows] == guard).all() and (state[-guard_rows:] == guard).all()
+        if count <= 4096:
+            assert int(reference[3][0].item()) == total
+            assert torch.equal(checked[0][:total], reference[0][:total])
+            assert torch.equal(checked[1][:total], reference[1][:total])
+            assert torch.equal(checked[2][:count], reference[2][:count])
+            assert torch.equal(checked[4][:count], reference[4][:count])
+        assert torch.isfinite(checked[4][:count]).all()
+        print(json.dumps(dict(experts=experts, rows=count, groups=total, exported_object=True)), flush=True)
+
+    for count in (1, 333, 2048, 2752, 4096, 5504, 8192):
+        if count <= 4096:
+            launch(ordinary, wire, expected, count)
+        launch(candidate, input_rows, actual, count)
+        check(count)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(candidate, input_rows, actual, 5504)
+    graph.replay()
+    check(5504)
+
+
 @pytest.mark.parametrize("activation", ["a16", "a8"])
 def test_real_checkpoint_segments_are_byte_identical_and_row_curve(activation):
     _run_exlr8_segments(activation)
