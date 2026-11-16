@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 from ..conftest import require_b12x
+from . import perception_vendor as vendor
 
 
 @pytest.mark.parametrize("width", [1024,1536])
@@ -16,11 +17,17 @@ def test_scaled_residual_rounds_product_before_add(width, rows):
     gamma = torch.randn(width,device="cuda",generator=gen).bfloat16()
     # Chosen values distinguish separately rounded multiply from fused addition.
     x[0,0], delta[0,0], gamma[0] = 1.0, 1.0078125, .5
-    expected = x[:rows] + delta[:rows]*gamma
+    if width == 1024:
+        expected = x[:rows].clone()
+        vendor.inkling().scaled_residual_norm_(expected,delta[:rows],gamma,None)
+    else:
+        scale = vendor.step5().PerceptionEncoderLayerScale(width).cuda().bfloat16()
+        scale.gamma.data.copy_(gamma)
+        expected = x[:rows]+scale(delta[:rows])
     out = torch.full_like(x,42)
     program = compile_scaled_residual_aot(width=width)
     program.launch(x,delta,gamma,out,scalars=[rows])
-    assert torch.equal(out[:rows],expected)
+    assert vendor.metrics(f"scale_h{width}_r{rows}",out[:rows],expected)==0
     assert (out[rows:] == 42).all()
     one = torch.empty_like(out[:1])
     program.launch(x,delta,gamma,one,scalars=[1])
@@ -35,11 +42,12 @@ def test_quick_gelu_preserves_bf16_boundaries(width,bf16_intermediates):
     require_b12x()
     from b12x.integration.cuteafd.perception import compile_quick_gelu_aot
     x = torch.linspace(-12,12,width*17,device="cuda").bfloat16().reshape(17,width)
-    ref = x*torch.sigmoid(1.702*x) if bf16_intermediates else (x.float()*torch.sigmoid(1.702*x.float())).bfloat16()
+    reference_input = x if bf16_intermediates else x.float()
+    ref = vendor.step5().forward_native(None,reference_input).bfloat16()
     out = torch.empty_like(x)
     program = compile_quick_gelu_aot(width=width,bf16_intermediates=bf16_intermediates)
     program.launch(x,out,scalars=[17])
-    torch.testing.assert_close(out,ref,atol=0,rtol=0.008)
+    assert vendor.metrics(f"quick_gelu_h{width}_bf16_{bf16_intermediates}",out,ref)<=1
     program.launch(x,x,scalars=[17])
     assert torch.equal(x,out)
 
@@ -54,18 +62,26 @@ def test_rotary_matches_adjacent_pair_xy_reference(dim,class_token,height,width)
     qkv = torch.randn(rows,3,16,dim,device="cuda",generator=gen).bfloat16()
     q,k,v = [torch.empty((rows,16,dim),device="cuda",dtype=torch.bfloat16) for _ in range(3)]
     program = compile_rotary_2d_aot(heads=16,dim=dim,class_token=class_token)
-    program.launch(qkv,q,k,v,scalars=[rows,width])
-    y,x = torch.meshgrid(torch.arange(height,device="cuda"),torch.arange(width,device="cuda"),indexing="ij")
-    coords = torch.stack((x.flatten(),y.flatten()),-1).float()+int(class_token)
     if class_token:
-        coords = torch.cat((torch.zeros(1,2,device="cuda"),coords))
-    freq = 10000.0**(-torch.arange(0,dim,4,device="cuda").float()/dim)
-    angle = torch.cat((coords[:,:1]*freq,coords[:,1:]*freq),-1)[:,None]
-    for index,out in [(0,q),(1,k)]:
-        source = qkv[:,index].float()
-        even,odd = source[...,0::2],source[...,1::2]
-        ref = torch.stack((even*angle.cos()-odd*angle.sin(),even*angle.sin()+odd*angle.cos()),-1).flatten(-2).bfloat16()
-        torch.testing.assert_close(out,ref,atol=0.03125,rtol=0.008)
+        official = vendor.inkling()
+        freq = official._rope_inv_freq(dim,qkv.device)
+        y,x = torch.meshgrid(torch.arange(height,device="cuda"),torch.arange(width,device="cuda"),indexing="ij")
+        meta = torch.empty(rows,4,device="cuda",dtype=torch.int32)
+        meta[0,:2] = -1;meta[1:,0] = y.flatten();meta[1:,1] = x.flatten()
+        meta[:,2],meta[:,3] = height,width
+        ref = qkv.clone().flatten(1)
+        official.apply_rotary_qk_(ref,meta,16)
+        ref = ref.reshape(rows,3,16,dim)
+        reference_q,reference_k = ref[:,0],ref[:,1]
+    else:
+        rope = vendor.step5().PerceptionEncoderRope2D(dim,height,width)
+        freq = rope._compute_inv_freq(rope.theta,dim//2).cuda()
+        rope = rope.cuda()
+        reference_q,reference_k = rope(qkv[:,0].transpose(0,1)[None],qkv[:,1].transpose(0,1)[None],(height,width))
+        reference_q,reference_k = reference_q[0].transpose(0,1),reference_k[0].transpose(0,1)
+    program.launch(qkv,freq,q,k,v,scalars=[rows,width])
+    for name,out,ref in [("q",q,reference_q),("k",k,reference_k)]:
+        assert vendor.metrics(f"rotary_d{dim}_cls{class_token}_{height}x{width}_{name}",out,ref)<=1
     assert torch.equal(v,qkv[:,2])
     if class_token:
         assert torch.equal(q[0],qkv[0,0]) and torch.equal(k[0],qkv[0,1])
@@ -82,7 +98,7 @@ def test_conv_lowering_matches_torch_unfold(channels,height,width):
     program = compile_conv3_stride2_lower_aot(channels=channels)
     program.launch(x,out,scalars=[height,width])
     ref = torch.nn.functional.unfold(x.permute(2,0,1)[None].float(),3,padding=1,stride=2)[0].T.bfloat16()
-    assert torch.equal(out[:rows],ref)
+    assert vendor.metrics(f"conv_lower_c{channels}_{height}x{width}",out[:rows],ref)==0
     assert (out[rows:] == 42).all()
 
 
@@ -95,8 +111,11 @@ def test_merge_is_spatial_major_and_excludes_class_token(class_token):
     out = torch.empty((h*w//4,c*4),device="cuda",dtype=torch.bfloat16)
     program = compile_merge2_aot(width=c,class_token=class_token)
     program.launch(x,out,scalars=[h,w])
-    ref = x[int(class_token):].reshape(h//2,2,w//2,2,c).permute(0,2,1,3,4).reshape_as(out)
-    assert torch.equal(out,ref)
+    ref = vendor.merge(x,h,w,c,class_token)
+    assert vendor.metrics(f"merge_cls{class_token}",out,ref)==0
+    for invalid in [(h+1,w),(h,w+1),(0,w)]:
+        with pytest.raises(ValueError,match="positive even"):
+            program.launch(x,out,scalars=invalid)
 
 
 @pytest.mark.parametrize("width", [1024,1536])

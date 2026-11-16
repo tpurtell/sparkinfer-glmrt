@@ -13,7 +13,8 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Int64
 
 from ._common import Operand, Scalar, compile_program
-from .pointwise import _add, _mul, _sub, _view
+from b12x._lib.intrinsics import div_rn_f32
+from .pointwise import _add, _fma, _mul, _sub, _view
 
 
 class ScaledResidual:
@@ -57,7 +58,7 @@ class QuickGelu:
             scaled = _mul(value, Float32(1.702))
             if cutlass.const_expr(self.bf16_intermediates):
                 scaled = Float32(scaled.to(BFloat16))
-            sigmoid = Float32(1.0) / _add(Float32(1.0), cute.math.exp(-scaled))
+            sigmoid = div_rn_f32(Float32(1.0), _add(Float32(1.0), cute.math.exp(-scaled, fastmath=False)))
             if cutlass.const_expr(self.bf16_intermediates):
                 sigmoid = Float32(sigmoid.to(BFloat16))
             out[at] = _mul(value, sigmoid).to(BFloat16)
@@ -68,16 +69,16 @@ class Rotary2D:
         self.heads, self.dim, self.class_token = heads, dim, class_token
 
     @cute.jit
-    def __call__(self, qkv: cute.Pointer, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
+    def __call__(self, qkv: cute.Pointer, inv_freq: cute.Pointer, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
                  rows: Int32, grid_width: Int32, stream: cuda.CUstream):
         count = Int64(rows) * Int64(self.heads * self.dim)
-        self.kernel(qkv, q, k, v, count, grid_width).launch(
+        self.kernel(qkv, inv_freq, q, k, v, count, grid_width).launch(
             grid=((count + Int64(255)) // Int64(256), 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, qkv: cute.Pointer, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
+    def kernel(self, qkv: cute.Pointer, inv_freq: cute.Pointer, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
                count: Int64, grid_width: Int32):
-        qkv, q, k, v = _view(qkv), _view(q), _view(k), _view(v)
+        qkv, inv_freq, q, k, v = _view(qkv), _view(inv_freq), _view(q), _view(k), _view(v)
         at = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
         if at < count:
             row = at // Int64(self.heads * self.dim)
@@ -91,10 +92,9 @@ class Rotary2D:
                 if row == Int64(0):
                     position = Int64(0)
             pair_index = (dim % Int64(self.dim // 2)) // Int64(2)
-            exponent = Float32(pair_index * Int64(4)) / Float32(self.dim)
-            frequency = cute.math.exp2(_mul(-exponent, Float32(13.287712379549449)))
-            angle = _mul(Float32(position), frequency)
-            cosine, sine = cute.math.cos(angle), cute.math.sin(angle)
+            angle = _mul(Float32(position), Float32(inv_freq[pair_index]))
+            cosine = cute.math.cos(angle, fastmath=False)
+            sine = cute.math.sin(angle, fastmath=False)
             pair = col + Int64(1)
             sign = Float32(-1.0)
             if dim % Int64(2) != Int64(0):
@@ -102,9 +102,14 @@ class Rotary2D:
                 sign = Float32(1.0)
             base = row * Int64(3 * self.heads * self.dim)
             for offset, out in ((0, q), (self.heads * self.dim, k)):
-                a = _mul(Float32(qkv[base + Int64(offset) + col]), cosine)
-                b = _mul(_mul(sign, Float32(qkv[base + Int64(offset) + pair])), sine)
-                out[at] = _add(a, b).to(BFloat16)
+                value = Float32(qkv[base + Int64(offset) + col])
+                partner = Float32(qkv[base + Int64(offset) + pair])
+                b = _mul(_mul(sign, partner), sine)
+                if cutlass.const_expr(self.class_token):
+                    # Inkling's pinned Triton _rotate_pair explicitly uses FMA.
+                    out[at] = _fma(value,cosine,b).to(BFloat16)
+                else:
+                    out[at] = _add(_mul(value,cosine),b).to(BFloat16)
             v[at] = qkv[base + Int64(2 * self.heads * self.dim) + col]
 
 
@@ -134,6 +139,20 @@ class Conv3Stride2Lower:
             if y >= Int64(0) and y < Int64(height) and w >= Int64(0) and w < Int64(width):
                 value = x[(y * Int64(width) + w) * Int64(self.channels) + col // Int64(9)]
             out[at] = value
+
+
+class Merge2Program:
+    """Checked Python launch facade; native callers validate before the raw ABI."""
+    def __init__(self, program):
+        self.program = program
+
+    def __getattr__(self, name):
+        return getattr(self.program,name)
+
+    def launch(self, *tensors, scalars, stream=None):
+        if len(scalars) != 2 or min(scalars) <= 0 or any(value%2 for value in scalars):
+            raise ValueError("PE merge2 requires positive even height and width")
+        return self.program.launch(*tensors,scalars=scalars,stream=stream)
 
 
 class Merge2:
@@ -189,6 +208,7 @@ def compile_rotary_2d_aot(*, heads, dim, class_token=False):
         raise ValueError("PE rotary requires positive heads and dimension divisible by four")
     return compile_program(Rotary2D(heads, dim, bool(class_token)), name="perception_rotary_2d", operands=(
         Operand("qkv", torch.bfloat16, f"[rows,{3*heads*dim}]"),
+        Operand("inv_freq", torch.float32, f"[{dim//4}]"),
         Operand("q", torch.bfloat16, f"[rows,{heads},{dim}]", "out"),
         Operand("k", torch.bfloat16, f"[rows,{heads},{dim}]", "out"),
         Operand("v", torch.bfloat16, f"[rows,{heads},{dim}]", "out")),
@@ -209,8 +229,8 @@ def compile_conv3_stride2_lower_aot(*, channels):
 def compile_merge2_aot(*, width, class_token=False):
     if width <= 0:
         raise ValueError("merge width must be positive")
-    return compile_program(Merge2(width, bool(class_token)), name="perception_merge2", operands=(
+    return Merge2Program(compile_program(Merge2(width, bool(class_token)), name="perception_merge2", operands=(
         Operand("x", torch.bfloat16, f"[height*width+{int(class_token)},{width}]"),
         Operand("out", torch.bfloat16, f"[height*width/4,{width*4}]", "out")),
         scalars=(Scalar("height"), Scalar("width")), key=(width,bool(class_token)),
-        geometry=dict(width=width,class_token=bool(class_token),layout="spatial_channel"))
+        geometry=dict(width=width,class_token=bool(class_token),layout="spatial_channel")))
