@@ -155,11 +155,29 @@ class _ScoredIndex:
         self.order(values, indices, scores, indices, rows, page_stride, page_offset, stream)
 
 
+
+class _ScoredDecodeIndex(_ScoredIndex):
+    @cute.jit
+    def __call__(self, q: cute.Pointer, weights: cute.Pointer, cache: cute.Pointer,
+                 table: cute.Pointer, lengths: cute.Pointer, indices: cute.Pointer,
+                 scores: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 table_width: Int32, table_stride: Int32, page_stride: Int32,
+                 page_offset: Int32, admitted_pages: Int32, stream: cuda.CUstream):
+        self.topk._decode_scored(q, weights, cache, table, lengths, indices, scratch,
+                                rows, table_width, table_stride, admitted_pages, stream)
+        values = cute.make_ptr(Float32, Int64(scratch.toint()) + Int64(self.topk.layout.topk_values_offset_bytes),
+                               cute.AddressSpace.gmem, assumed_align=16)
+        self.order(values, indices, scores, indices, rows, page_stride, page_offset, stream)
+
+
 def compile_scored_index_topk_aot(g=GLM53, *, max_rows: int, max_pages: int, mode="decode"):
     """ABI: q FP8 [R,I,128], weights f32 [R,I], cache u8 [P,8448],
     table i32 [R,stride] (prefill: shared [width]), lengths i32 [R] in compact
     shard coordinates, indices i32 [R,K] out, scores f32 [R,K] out, scratch u8.
-    Scalars: rows, table_width, table_stride, page_stride, page_offset.
+    Scalars: rows, table_width, table_stride, page_stride, page_offset;
+    decode adds admitted_pages, fixed for the deployment before graph capture.
+    Decode scratch is admitted_tile.prefix_bytes plus ceil(rows_capacity/32)
+    *32*ceil(admitted_pages*64/512)*512*4 bytes (logits last).
     Use (2,rank) for an interleaved half table and (1,0) for a full table.
     GLM Flash K=512 pools; V4 K=512/1024; GLM K=2048.
     """
@@ -170,7 +188,7 @@ def compile_scored_index_topk_aot(g=GLM53, *, max_rows: int, max_pages: int, mod
         g = _PoolTopK(g.index_topk, 64)
     if mode not in ("decode", "prefill") or min(max_rows, max_pages) <= 0:
         raise ValueError("positive capacities and mode=decode|prefill required")
-    launch = _ScoredIndex(g, int(max_rows), int(max_pages), mode)
+    launch = (_ScoredDecodeIndex if mode == "decode" else _ScoredIndex)(g, int(max_rows), int(max_pages), mode)
     k, h = g.index_topk, g.index_heads
     operands = (Operand("q", torch.float8_e4m3fn, f"[rows,{h},128]"),
                 Operand("weights", torch.float32, f"[rows,{h}]"),
@@ -181,13 +199,18 @@ def compile_scored_index_topk_aot(g=GLM53, *, max_rows: int, max_pages: int, mod
                 Operand("scores", torch.float32, f"[rows,{k}]", "out", align=4),
                 Operand("scratch", torch.uint8, "[scratch_bytes]", "scratch"))
     return compile_program(launch, name="scored_index_topk", operands=operands,
-                           scalars=tuple(Scalar(x) for x in ("rows", "table_width", "table_stride", "page_stride", "page_offset")),
+                           scalars=tuple(Scalar(x) for x in ("rows", "table_width", "table_stride", "page_stride", "page_offset"))
+                               + ((Scalar("admitted_pages"),) if mode == "decode" else ()),
                            key=(launch.topk.key(), "scored-logical", mode),
                            geometry={"topk": k, "heads": h, "route": launch.topk.route,
                                      "stream_scorer_ctas": int(launch.topk.layout.stream_scorer_ctas),
                                      "supertile_tokens": int(launch.topk.layout.supertile_tokens),
                                      "tile_logits_bytes": int(launch.topk.layout.tile_logits_elements) * 4,
-                                     "device_live_width": launch.topk.route == "paged_tiled"},
+                                     "device_live_width": launch.topk.route == "paged_tiled",
+                                     **({"admitted_tile": {"prefix_bytes": launch.topk.layout.tile_logits_offset_bytes,
+                                         "page_rows": 64, "tile_rows": 32, "tile_columns": 512,
+                                         "element_bytes": 4, "capacity_rows": int(max_rows),
+                                         "capacity_pages": int(max_pages)}} if mode == "decode" else {})},
                            scratch={"scratch": lambda rows: launch.topk.layout.nbytes}, doc=compile_scored_index_topk_aot.__doc__)
 
 

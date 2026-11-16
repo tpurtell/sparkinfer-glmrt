@@ -12,17 +12,21 @@ from ..conftest import require_b12x
 
 
 @pytest.mark.parametrize('rows', [1, 16, 64])
-def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows):
+def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows, tmp_path):
     require_b12x()
     from b12x.integration.cuteafd import exportable_compilation
     from b12x.integration.cuteafd.kimi_dsa import KimiDsaGeometry
     from b12x.integration.cuteafd.context_split import compile_scored_index_topk_aot
     from b12x.attention.dsa_indexer.reference import pack_index_k_cache_reference
 
-    capacity = 8192
+    from ..moe.segment_aot import ExportedProgram
+
+    capacity = 1025
+    compiled_capacity = 16384
     with exportable_compilation():
         program = compile_scored_index_topk_aot(KimiDsaGeometry(), max_rows=64,
-                                                max_pages=capacity, mode='decode')
+                                                max_pages=compiled_capacity, mode='decode')
+    exported = ExportedProgram(program, tmp_path, "selector")
     device = torch.device('cuda')
     generator = torch.Generator().manual_seed(9241 + rows)
     # Include a supertile crossing so dead carry folds and live folds both run.
@@ -37,11 +41,17 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows)
     lengths = torch.zeros(rows, dtype=torch.int32, device=device)
     indices = torch.empty((rows, 2048), dtype=torch.int32, device=device)
     scores = torch.empty((rows, 2048), dtype=torch.float32, device=device)
-    scratch = torch.empty(program.scratch_bytes(rows)['scratch'], dtype=torch.uint8, device=device)
+    contract = program.geometry["admitted_tile"]
+    assert contract["capacity_pages"] == compiled_capacity
+    prefix = contract["prefix_bytes"]
+    scratch_bytes = prefix + 64 * ((capacity * 64 + 511) // 512) * 512 * 4
+    assert scratch_bytes < program.scratch_bytes(rows)["scratch"]
+    backing = torch.full((scratch_bytes + 1024,), 0xA5, dtype=torch.uint8, device=device)
+    scratch = backing[:scratch_bytes]
 
-    def launch(width, out_indices=indices, out_scores=scores):
-        program.launch(q, weights, cache, table, lengths, out_indices, out_scores, scratch,
-                       scalars=(rows, width, capacity, 2, 1))
+    def launch(width, out_indices=indices, out_scores=scores, admitted=capacity):
+        exported.launch(q, weights, cache, table, lengths, out_indices, out_scores, scratch,
+                       scalars=(rows, width, capacity, 2, 1, admitted))
 
     launch(capacity)
     graph = torch.cuda.CUDAGraph()
@@ -53,10 +63,11 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows)
     for pages in live_pages:
         ends = torch.arange(rows, device=device, dtype=torch.int32)
         lengths.copy_((pages * 64 - ends).clamp(min=0))
-        launch(max(1, pages), expected_indices, expected_scores)
+        launch(max(1, pages), expected_indices, expected_scores, max(1, pages))
         expected_i, expected_s = expected_indices.clone(), expected_scores.clone()
         graph.replay()
         torch.cuda.synchronize()
+        assert torch.all(backing[scratch_bytes:] == 0xA5), (rows, pages, 'scratch guard')
         assert torch.equal(indices, expected_i), (rows, pages, 'indices')
         assert torch.equal(scores.view(torch.uint8), expected_s.view(torch.uint8)), (rows, pages, 'scores')
         for row in range(rows):
@@ -64,7 +75,7 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows)
         if pages in (10, 20, 65, 130, 513, 1025):
             exact_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(exact_graph):
-                launch(pages)
+                launch(pages, admitted=pages)
             for _ in range(3):
                 graph.replay()
                 exact_graph.replay()
