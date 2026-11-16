@@ -44,6 +44,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32, Uint64, const_expr
 from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
+    cp_async_u64_shared_global,
     div_rn_f32,
     ld_shared_u32,
     ld_shared_v4_u32,
@@ -117,8 +118,8 @@ class ChunkRowsA4:
                           else self.k + self.k // 32 if self.wire else self.k * 2)
         # The scale operand whose input scales quantize these rows (gate: rows I, K = H).
         self.in_offset = nvfp4_input_scale_offset(experts, scale_rows, k)
-        if self.k % 32:
-            raise ValueError("K must be a multiple of 32")
+        if self.k <= 0 or self.k % 16 or (self.wire and self.k % 32):
+            raise ValueError("K must be positive and K16-aligned (K32 for FP8 wire)")
 
     def key(self) -> tuple:
         return (("chunk_rows_a4", 2, self.k, self.wire, self.experts, self.in_offset)
@@ -294,10 +295,10 @@ class StreamNvfp4LinearA4:
         self.warp_cols = self.tile_n // 2
         self.n_tiles = self.warp_cols // 8
         self.frags = 4 * self.m_tiles * self.n_tiles
-        if self.n % self.tile_n or self.k % 64:
-            raise ValueError("NVFP4 A4 linear needs N % tile_n == 0 and K % 64 == 0")
-        self.k_block = 256 if self.k % 256 == 0 else 128 if self.k % 128 == 0 else 64
-        self.blocks = self.k // self.k_block
+        if self.n <= 0 or self.n % 16 or self.k <= 0 or self.k % 16:
+            raise ValueError("NVFP4 A4 linear needs positive K16-aligned N and K % 16 == 0")
+        self.k_block = 256 if self.k % 256 == 0 else 128 if self.k % 64 else 64
+        self.blocks = _ceil(self.k, self.k_block)
         self.row_bytes = self.k_block // 2
         # Unpadded rows with a 32B-sector-preserving XOR swizzle on 16B pieces:
         # both cp.async.cg.128 and ldmatrix.x4 hit all 32 banks without splitting
@@ -314,7 +315,7 @@ class StreamNvfp4LinearA4:
         self.in_offset = nvfp4_input_scale_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_a4", 5, self.n, self.k, self.experts, self.k_block,
+        return ("stream_linear_nvfp4_a4", 6, self.n, self.k, self.experts, self.k_block,
                 self.tile_m, self.tile_n, self.live_min, self.live_max) + (("divisor",) if self.divisor else ())
 
     def _storage(self):
@@ -329,16 +330,12 @@ class StreamNvfp4LinearA4:
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
                  y: cute.Pointer, max_tiles: Int32, stream: cuda.CUstream):
-        self.kernel(aq, a_s, meta, w, s, y).launch(grid=(self.n // self.tile_n, max_tiles, 1),
+        self.kernel(aq, a_s, meta, w, s, y).launch(grid=(_ceil(self.n, self.tile_n), max_tiles, 1),
                                                    block=(self.threads, 1, 1), stream=stream, min_blocks_per_mp=1)
 
     @cute.jit
     def _swizzle(self, row):
-        if const_expr(self.row_bytes >= 128):
-            return ((row & Int32(3)) << Int32(1)) | ((row >> Int32(2)) & Int32(1))
-        if const_expr(self.row_bytes == 32):
-            return (row >> Int32(1)) & Int32(1)
-        return (row >> Int32(1)) & Int32(3)
+        return (((row & Int32(3)) << Int32(1)) | ((row >> Int32(2)) & Int32(1))) & Int32(self.row_bytes // 16 - 1)
 
     @cute.jit
     def _load(self, block, ring, a_rows: Int64, as_rows: Int64, w_rows: Int64, s_rows: Int64, live: Int32, tidx):
@@ -346,44 +343,60 @@ class StreamNvfp4LinearA4:
         self._load_operand(stage, a_rows, as_rows, block, tidx, self.tile_m, 0,
                            self.tile_bytes + self.weight_bytes, live)
         self._load_operand(stage, w_rows, s_rows, block, tidx, self.tile_n, self.tile_bytes,
-                           self.tile_bytes + self.weight_bytes + self.sc_bytes, Int32(self.tile_n))
+                           self.tile_bytes + self.weight_bytes + self.sc_bytes,
+                           Int32(self.n) - Int32(cute.arch.block_idx()[0]) * Int32(self.tile_n))
         cute.arch.cp_async_commit_group()
 
     @cute.jit
     def _load_operand(self, stage, rows_at: Int64, scales_at: Int64, block, tidx,
                       count: cutlass.Constexpr, packed_offset: cutlass.Constexpr, scale_offset: cutlass.Constexpr,
                       row_limit: Int32):
-        """Stage ``count`` packed rows (and their scale records) of this K block.
+        """Stage native rows; only shared memory contains K/N tail zeros.
 
-        ``row_limit`` bounds the activation tile to the chunk's live rows: a
-        sparse tile's M is 16 rows of a chunk that may hold as few as one, and
-        every row staged is fetched by every N-split CTA of the chunk. Rows past
-        the limit only feed output rows the epilogue drops, so leaving them out
-        of the ring is bit-exact for every output the kernel writes. Weight rows
-        (and their scales) always stage in full -- every one of them is read."""
-        chunks = self.row_bytes // 16
-        r0 = tidx // Int32(chunks)
-        piece = tidx % Int32(chunks)
-        smem_piece = piece ^ self._swizzle(r0)
-        row_step = self.threads // chunks
-        rows = row_limit
+        K16 rows can be only eight-byte aligned, and their scale rows can be
+        byte aligned. Keep the aligned vector path compile-time specialized;
+        never read a neighbouring row to manufacture an aligned transaction.
+        """
+        copy_bytes = 16 if self.k % 32 == 0 else 8
+        chunks = self.row_bytes // copy_bytes
         for q in cutlass.range_constexpr(_ceil(count * chunks, self.threads)):
-            row = r0 + Int32(q * row_step)
-            if row < rows:
-                cp_async4_shared_global(
-                    stage + Int32(packed_offset + q * row_step * self.stride)
-                    + r0 * Int32(self.stride) + smem_piece * Int32(16),
-                    rows_at + Int64(row) * Int64(self.k // 2) + Int64(block) * Int64(self.row_bytes)
-                    + Int64(piece) * Int64(16))
+            idx = tidx + Int32(q * self.threads)
+            row = idx // Int32(chunks)
+            piece = idx % Int32(chunks)
+            byte = piece * Int32(copy_bytes)
+            dst = stage + Int32(packed_offset) + row * Int32(self.stride) \
+                + ((byte // Int32(16)) ^ self._swizzle(row)) * Int32(16) + byte % Int32(16)
+            if row < Int32(count):
+                if (row < row_limit) & (Int32(block) * Int32(self.row_bytes) + byte < Int32(self.k // 2)):
+                    src = rows_at + Int64(row) * Int64(self.k // 2) \
+                        + Int64(block) * Int64(self.row_bytes) + Int64(byte)
+                    if const_expr(copy_bytes == 16):
+                        cp_async4_shared_global(dst, src)
+                    else:
+                        cp_async_u64_shared_global(dst, src)
+                else:
+                    for z in cutlass.range_constexpr(copy_bytes // 4):
+                        st_shared_u32(dst + Int32(4 * z), Uint32(0))
         words = self.s_bytes // 4
         for q in cutlass.range_constexpr(_ceil(count * words, self.threads)):
-            c = tidx + Int32(q * self.threads)
-            if c < rows * Int32(words):
-                row = c // Int32(words)
-                word = c % Int32(words)
-                cp_async_u32_shared_global(stage + Int32(scale_offset) + row * Int32(self.s_stride) + word * Int32(4),
-                                           scales_at + Int64(row) * Int64(self.k // 16) + Int64(block) * Int64(self.s_bytes)
-                                           + Int64(word) * Int64(4))
+            idx = tidx + Int32(q * self.threads)
+            row = idx // Int32(words)
+            word = idx % Int32(words)
+            col = Int32(block) * Int32(self.s_bytes) + word * Int32(4)
+            dst = stage + Int32(scale_offset) + row * Int32(self.s_stride) + word * Int32(4)
+            if row < Int32(count):
+                if const_expr(self.k % 64 == 0):
+                    if (row < row_limit) & (col < Int32(self.k // 16)):
+                        cp_async_u32_shared_global(dst, scales_at + Int64(row) * Int64(self.k // 16) + Int64(col))
+                    else:
+                        st_shared_u32(dst, Uint32(0))
+                else:
+                    value = Uint32(0)
+                    for byte in cutlass.range_constexpr(4):
+                        if (row < row_limit) & (col + Int32(byte) < Int32(self.k // 16)):
+                            value = value | (Uint32(_ld_u8(scales_at + Int64(row) * Int64(self.k // 16)
+                                                          + Int64(col) + Int64(byte))) << Uint32(8 * byte))
+                    st_shared_u32(dst, value)
 
     @cute.jit
     def _mma_stage(self, stage, acc: cute.Tensor, warp_m, warp_n, q, c, mat, mrow):
@@ -497,8 +510,9 @@ class StreamNvfp4LinearA4:
                                     if const_expr(self.divisor):
                                         acc[f] = div_rn_f32(div_rn_f32(acc[f], weight_global), input_global)
                                         acc[f + 1] = div_rn_f32(div_rn_f32(acc[f + 1], weight_global), input_global)
-                                    st_global_u32(Int64(y.toint()) + (Int64(first + row) * Int64(self.n) + Int64(col))
-                                                  * Int64(2), pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
+                                    if col < Int32(self.n):
+                                        st_global_u32(Int64(y.toint()) + (Int64(first + row) * Int64(self.n) + Int64(col))
+                                                      * Int64(2), pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
 
 
 @cute.jit
@@ -556,22 +570,22 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.alpha, self.beta = alpha, beta
         if k_block is None:
             k_block = self.k_block
-        if self.k % k_block or k_block % 64:
-            raise ValueError(f"K {self.k} is not a multiple of the {k_block}-wide K block")
+        if k_block not in (64, 128, 256):
+            raise ValueError("NVFP4 K block must be 64, 128 or 256")
         self._set_k_block(k_block)
         self.stages = int(stages)
-        if self.inter % self.half_n:
-            raise ValueError("the fused NVFP4 A4 gate/up needs I % 64 == 0")
+        if self.inter <= 0 or self.inter % 16:
+            raise ValueError("the fused NVFP4 A4 gate/up needs positive I % 16 == 0")
         # Gate and up scale operands share the [E, I, H/16] shape.
         self.alpha_offset = nvfp4_alpha_offset(experts, self.inter, self.k)
         self.in_offset = nvfp4_input_scale_offset(experts, self.inter, self.k)
         self.down_in_offset = nvfp4_input_scale_offset(experts, hidden, self.inter)
-        if self.tile_m * self.x_stride > self.stages * self.stage_bytes:
-            raise ValueError("the gate/up exchange does not fit the ring")
+        if self.stages < 2 or self.stages > 8:
+            raise ValueError("NVFP4 gate/up needs 2..8 pipeline stages")
 
     def _set_k_block(self, k_block: int):
         self.k_block = int(k_block)
-        self.blocks = self.k // self.k_block
+        self.blocks = _ceil(self.k, self.k_block)
         self.row_bytes = self.k_block // 2
         self.stride = self.row_bytes
         self.s_bytes = self.k_block // 16
@@ -583,7 +597,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_a4", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_a4", 6, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max) + (
                     ("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (
                 ("swigluoai", self.alpha, self.beta) if self.oai else ()) + (("divisor",) if self.divisor else ())
@@ -593,7 +607,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
             pass
 
         Storage.__annotations__ = {
-            "ring": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, self.stages * self.stage_bytes], 128],
+            "ring": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, max(self.stages * self.stage_bytes, self.tile_m * self.x_stride)], 128],
         }
         return cute.struct(Storage)
 
@@ -602,7 +616,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                  w3: cute.Pointer, s3: cute.Pointer, s2: cute.Pointer, act: cute.Pointer, act_s: cute.Pointer,
                  max_tiles: Int32, stream: cuda.CUstream):
         self.fused(aq, a_s, meta, w1, s1, w3, s3, s2, act, act_s).launch(
-            grid=(self.inter // self.half_n, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+            grid=(_ceil(self.inter, self.half_n), max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
             min_blocks_per_mp=1)
 
     @cute.jit
@@ -612,11 +626,12 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self._load_operand(stage, a_rows, as_rows, block, tidx, self.tile_m, 0,
                            self.tile_bytes + self.weight_bytes, live)
         self._load_operand(stage, w_rows, s_rows, block, tidx, self.half_n, self.tile_bytes,
-                           self.tile_bytes + self.weight_bytes + self.sc_bytes, Int32(self.half_n))
+                           self.tile_bytes + self.weight_bytes + self.sc_bytes,
+                           Int32(self.inter) - Int32(cute.arch.block_idx()[0]) * Int32(self.half_n))
         self._load_operand(stage, w_up, s_up, block, tidx, self.half_n,
                            self.tile_bytes + self.half_n * self.stride,
                            self.tile_bytes + self.weight_bytes + self.sc_bytes + self.half_n * self.s_stride,
-                           Int32(self.half_n))
+                           Int32(self.inter) - Int32(cute.arch.block_idx()[0]) * Int32(self.half_n))
         cute.arch.cp_async_commit_group()
 
     @cute.kernel
@@ -705,7 +720,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                     gi = tidx + Int32(it * self.threads)
                     row = gi // Int32(groups)
                     grp = gi % Int32(groups)
-                    if row < live:
+                    if (row < live) & (n0 + grp * Int32(16) < Int32(self.inter)):
                         values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
                         at = ring + row * Int32(self.x_stride) + grp * Int32(32)
                         for half in cutlass.range_constexpr(2):
