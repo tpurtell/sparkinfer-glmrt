@@ -18,9 +18,11 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cuda.bindings import driver as cuda
 
 from b12x._lib.intrinsics import (
-    block_reduce, cvt_f32_to_bf16_bits, div_rn_f32, u32_as_f32, warp_reduce,
+    block_reduce, cvt_f32_to_bf16_bits, cvt_f32_to_e4m3, div_rn_f32,
+    fabs_f32, fmax_f32, u32_as_f32, warp_reduce,
 )
 from ._common import Operand, Scalar, compile_program
+from .pointwise import _mul, _add as add_rn, _sub
 
 _HIDDEN = 4608
 _TAPS = 8
@@ -342,7 +344,6 @@ class _QKNormRope:
         angle = Float32(positions[row]) * Float32(inv_freq[half_column])
         cosine = cute.math.cos(angle, fastmath=False)
         sine = cute.math.sin(angle, fastmath=False)
-        from .pointwise import _mul, _add as add_rn, _sub
         first = normalized[half_column]
         second = normalized[half_column + 64]
         result = _sub(_mul(first, cosine), _mul(second, sine))
@@ -418,3 +419,108 @@ def compile_inkling_silu_mul_aot(*, intermediate=18432):
         Operand("activated", torch.bfloat16, f"[rows,{intermediate}]", "out"),
     ), scalars=(Scalar("rows"),), key=(intermediate,),
         geometry={"intermediate": intermediate}, doc=__doc__)
+
+
+class _BiasAdd:
+    def __init__(self, width, bf16_output):
+        self.width, self.bf16_output = width, bf16_output
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, bias: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        if rows > 0 and rows <= 448:
+            self.kernel(x, bias, out, rows).launch(
+                grid=((rows * self.width + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, bias: cute.Pointer, out: cute.Pointer, rows: Int32):
+        tile, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        index = Int64(tile) * 256 + Int64(thread)
+        if index < Int64(rows) * Int64(self.width):
+            value = Float32(x[index]) + Float32(bias[index % self.width])
+            if cutlass.const_expr(self.bf16_output):
+                out[index] = BFloat16(value)
+            else:
+                out[index] = value
+
+
+def compile_inkling_bias_add_aot(*, width=768):
+    if width not in (768, 201024):
+        raise ValueError("Inkling bias add width must be 768 or 201024")
+    dtype = torch.bfloat16 if width == 201024 else torch.float32
+    return compile_program(_BiasAdd(width, width == 201024), name="inkling_bias_add", operands=(
+        Operand("x", torch.float32, f"[rows,{width}]"),
+        Operand("bias", torch.bfloat16, f"[{width}]"),
+        Operand("out", dtype, f"[rows,{width}]", "out"),
+    ), scalars=(Scalar("rows"),), key=(width, str(dtype)),
+        geometry={"width": width, "output_dtype": str(dtype)}, doc=__doc__)
+
+
+class _KVStore:
+    def __init__(self, kv_heads, fp8):
+        self.kv_heads, self.fp8 = kv_heads, fp8
+        self.stride = (kv_heads * 132 + 15) // 16 * 16
+
+    @cute.jit
+    def __call__(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
+                 k_plane: cute.Pointer, v_plane: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        if rows > 0 and rows <= 4096:
+            self.kernel(k, v, slots, k_plane, v_plane).launch(
+                grid=(rows, self.kv_heads, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, k: cute.Pointer, v: cute.Pointer, slots: cute.Pointer,
+               k_plane: cute.Pointer, v_plane: cute.Pointer):
+        row, head, _ = cute.arch.block_idx()
+        lane, _, _ = cute.arch.thread_idx()
+        slot = Int64(slots[row])
+        if slot >= 0:
+            for plane in cutlass.range_constexpr(2):
+                source, destination = k, k_plane
+                if cutlass.const_expr(plane == 1):
+                    source, destination = v, v_plane
+                values = cute.make_rmem_tensor(cute.make_layout(4), Float32)
+                maximum = Float32(0)
+                for item in cutlass.range_constexpr(4):
+                    column = Int64(lane) + Int64(item * 32)
+                    index = (Int64(row) * Int64(self.kv_heads) + Int64(head)) * 128 + column
+                    values[item] = Float32(source[index])
+                    maximum = fmax_f32(maximum, fabs_f32(values[item]))
+                if cutlass.const_expr(self.fp8):
+                    maximum = warp_reduce(maximum, fmax_f32)
+                    scale = Float32(1)
+                    if maximum > Float32(0):
+                        scale = div_rn_f32(maximum, Float32(448))
+                    inverse = div_rn_f32(Float32(1), scale)
+                    record = destination + slot * Int64(self.stride)
+                    scales = cute.recast_ptr(record + self.kv_heads * 128, dtype=Float32)
+                    if lane == 0:
+                        scales[head] = scale
+                    for item in cutlass.range_constexpr(4):
+                        column = Int64(lane) + Int64(item * 32)
+                        record[Int64(head) * 128 + column] = cutlass.Uint8(
+                            cvt_f32_to_e4m3(values[item] * inverse))
+                    if head == 0 and lane < self.stride - self.kv_heads * 132:
+                        record[self.kv_heads * 132 + lane] = cutlass.Uint8(0)
+                else:
+                    for item in cutlass.range_constexpr(4):
+                        column = Int64(lane) + Int64(item * 32)
+                        destination[(slot * Int64(self.kv_heads) + Int64(head)) * 128 + column] = BFloat16(values[item])
+
+
+def compile_inkling_kv_store_aot(*, kv_heads=8, kv_format="fp8"):
+    if kv_heads not in (8, 4) or kv_format not in ("fp8", "bf16"):
+        raise ValueError("Inkling KV store requires 8/4 heads and fp8/bf16")
+    fp8 = kv_format == "fp8"
+    dtype = torch.uint8 if fp8 else torch.bfloat16
+    return compile_program(_KVStore(kv_heads, fp8), name="inkling_kv_store", operands=(
+        Operand("k", torch.bfloat16, f"[rows,{kv_heads},128]"),
+        Operand("v", torch.bfloat16, f"[rows,{kv_heads},128]"),
+        Operand("slots", torch.int64, "[rows]"),
+        Operand("k_plane", dtype, "[slots,plane_stride]", "out"),
+        Operand("v_plane", dtype, "[slots,plane_stride]", "out"),
+    ), scalars=(Scalar("rows"),), key=(kv_heads, kv_format),
+        geometry={"kv_heads": kv_heads, "kv_format": kv_format,
+                  "plane_bytes": (kv_heads*132+15)//16*16 if fp8 else kv_heads*256}, doc=__doc__)

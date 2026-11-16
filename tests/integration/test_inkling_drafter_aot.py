@@ -16,13 +16,15 @@ from b12x.integration.cuteafd import exportable_compilation, validate_exported_h
 from b12x.integration.cuteafd import inkling_drafter as kernels
 
 
-@pytest.fixture(scope="module", params=["dflare_mix", "mask_init", "recurrent_gate", "head_fold", "logit_finish", "residual_norm", ("qk_norm_rope", 48, 8), ("qk_norm_rope", 24, 4), ("qk_norm_rope", 0, 8), ("qk_norm_rope", 0, 4), ("silu_mul", 18432), ("silu_mul", 9216)])
+@pytest.fixture(scope="module", params=["dflare_mix", "mask_init", "recurrent_gate", "head_fold", "logit_finish", "residual_norm", ("qk_norm_rope", 48, 8), ("qk_norm_rope", 24, 4), ("qk_norm_rope", 0, 8), ("qk_norm_rope", 0, 4), ("silu_mul", 18432), ("silu_mul", 9216), ("bias_add", 768), ("bias_add", 201024), ("kv_store", 8, "fp8"), ("kv_store", 4, "fp8"), ("kv_store", 8, "bf16"), ("kv_store", 4, "bf16")])
 def program(request, tmp_path_factory):
     kind = request.param
     geometry = kind[1:] if isinstance(kind, tuple) else None
     kind = kind[0] if geometry else kind
     with exportable_compilation():
         kwargs = ({"intermediate": geometry[0]} if kind == "silu_mul" else
+                  {"width": geometry[0]} if kind == "bias_add" else
+                  dict(kv_heads=geometry[0], kv_format=geometry[1]) if kind == "kv_store" else
                   dict(q_heads=geometry[0], kv_heads=geometry[1]) if geometry else {})
         compiled = getattr(kernels, f"compile_inkling_{kind}_aot")(**kwargs)
     directory = tmp_path_factory.mktemp(kind)
@@ -91,6 +93,12 @@ def test_oracle_and_graph(program):
         return
     if kind == "silu_mul":
         _check_silu_program(exported, module, compiled.geometry["intermediate"])
+        return
+    if kind == "bias_add":
+        _check_bias_program(exported, module, compiled.geometry["width"])
+        return
+    if kind == "kv_store":
+        _check_kv_program(exported, module, compiled.geometry)
         return
     maximum = 4096 if kind == "dflare_mix" else 64
     if kind == "dflare_mix":
@@ -384,3 +392,78 @@ def _check_silu_program(exported, module, intermediate):
     output.fill_(float("nan"))
     graph.replay()
     assert torch.equal(output[:64], expected[:64])
+
+
+def _check_bias_program(exported, module, width):
+    source = torch.randn(448, width, device="cuda")
+    bias = torch.randn(width, device="cuda", dtype=torch.bfloat16)
+    dtype = torch.bfloat16 if width == 201024 else torch.float32
+    output = torch.full((448, width), float("nan"), device="cuda", dtype=dtype)
+    expected = (source + bias.float()).to(dtype)
+
+    def launch(rows):
+        assert exported.launch(ctypes.byref(module), source.data_ptr(), bias.data_ptr(),
+                               output.data_ptr(), rows, torch.cuda.current_stream().cuda_stream) == 0
+
+    for rows in (0, 1, 64, 448):
+        output.fill_(float("nan"))
+        launch(rows)
+        assert torch.equal(output[:rows].view(torch.uint8), expected[:rows].view(torch.uint8))
+        assert torch.isnan(output[rows:]).all()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(64)
+    output.fill_(float("nan"))
+    graph.replay()
+    assert torch.equal(output[:64], expected[:64])
+
+
+def _check_kv_program(exported, module, geometry):
+    heads, fp8, stride = geometry["kv_heads"], geometry["kv_format"] == "fp8", geometry["plane_bytes"]
+    high = (2**31 // stride) + 2
+    sources = [torch.randn(64, heads, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    for source in sources:
+        source[0].zero_()
+    slots = torch.arange(64, device="cuda", dtype=torch.int64) * 2
+    slots[1], slots[-1] = -1, high
+    # Sparse writes into mostly-uninitialized backing exercise >2GiB offsets.
+    dtype = torch.uint8 if fp8 else torch.bfloat16
+    elements = stride if fp8 else stride // 2
+    planes = [torch.empty(high+1, elements, device="cuda", dtype=dtype) for _ in range(2)]
+    for plane in planes:
+        plane[:128].zero_()
+        plane[-1].zero_()
+
+    def launch(rows):
+        tensors = (*sources, slots, *planes)
+        assert exported.launch(ctypes.byref(module), *(t.data_ptr() for t in tensors), rows,
+                               torch.cuda.current_stream().cuda_stream) == 0
+
+    def check(rows):
+        for source, plane in zip(sources, planes):
+            for row in range(rows):
+                slot = int(slots[row])
+                if slot < 0:
+                    continue
+                if not fp8:
+                    assert torch.equal(plane[slot].reshape(heads, 128), source[row])
+                else:
+                    value = source[row].float()
+                    maximum = value.abs().amax(-1)
+                    scale = torch.where(maximum > 0, maximum / 448, 1)
+                    inverse = 1 / scale
+                    codes = (value * inverse[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
+                    expected = torch.zeros(stride, device="cuda", dtype=torch.uint8)
+                    expected[:heads*128] = codes.flatten()
+                    expected[heads*128:heads*132] = scale.view(torch.uint8)
+                    assert torch.equal(plane[slot], expected)
+            assert torch.count_nonzero(plane[1]) == 0
+
+    for rows in (0, 1, 64):
+        launch(rows)
+        check(rows)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(64)
+    graph.replay()
+    check(64)
