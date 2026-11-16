@@ -19,6 +19,7 @@ def _exact_geometry(name):
     spec = importlib.util.spec_from_file_location('inkling_tp4_packager',
         root / 'python/tools/aot/package_fp8_moe_aot.py')
     packager = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = packager
     spec.loader.exec_module(packager)
     tp, geometry = packager.layout_geometry(GEOMETRIES[name], 'tp4-w576')
     assert tp == 4
