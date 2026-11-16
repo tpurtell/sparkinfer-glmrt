@@ -155,6 +155,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--geometry", default="mimo")
     parser.add_argument("--tp", type=int, default=4)
+    parser.add_argument("--exact-width", type=int, help="exact stored rank width; no H128 staging padding")
     parser.add_argument("--activation", choices=("silu_bf16_product", "silu_post_clamp_fp32_product"),
                         help="explicit activation contract; defaults to the geometry contract")
     parser.add_argument("--rows", default="1,16,80,1024,4096")
@@ -204,6 +205,8 @@ def parse_args(argv=None):
         parser.error("shipped prefill requires native V4/V4.1 pairs, policy root and prefill capacities")
     if args.iters <= 0:
         parser.error("iters must be positive")
+    if args.exact_width is not None and (args.exact_width < 1 or args.exact_width % 16 or args.mxfp4_pair):
+        parser.error("--exact-width requires a positive multiple of 16 and no pair screen")
     if args.continue_on_fail and (not args.check or args.exact_sweep):
         parser.error("--continue-on-fail requires --check and no --exact-sweep")
     if args.exact_baseline and not args.exact_sweep:
@@ -1207,6 +1210,16 @@ def main() -> None:
     if args.mxfp4_pair:
         mxfp4_pair_screen(g, args)
         return
+    if args.exact_width is not None:
+        from dataclasses import dataclass, fields
+
+        @dataclass(frozen=True)
+        class ExactGeometry(type(g)):
+            @property
+            def slice(self):
+                return args.exact_width
+
+        g = ExactGeometry(**{field.name: getattr(g, field.name) for field in fields(g)})
     if args.activation is not None:
         g = replace(g, activation=args.activation)
     if g.weights in ("nvfp4", "bf16") and args.input != "bf16":
@@ -1225,7 +1238,12 @@ def main() -> None:
     def scales(shape):
         return torch.rand(shape, device=dev, generator=gen) * 2e-4 + 1e-4
 
-    if g.weights == "nvfp4":
+    if g.dynamic_nvfp4:
+        from tests.integration.test_cuteafd_inkling2_nvfp4_moe import _weights
+
+        w, dynamic_dequant = _weights(g, i)
+        per_expert = 3 * i * h * 9 // 16 + 12 + 12 / e
+    elif g.weights == "nvfp4":
         # The integration oracle supplies nonuniform per-expert calibration and
         # independent CPU FP64 products, including exact quantizer boundaries.
         from tests.integration.test_cuteafd_nvfp4_moe_aot import _weights, reference
@@ -1247,6 +1265,12 @@ def main() -> None:
              codes((e, i, h // 2)), mxfp4_scales((e, i, h // 32)),
              codes((e, h, i // 2)), s2)
         per_expert = 2 * i * (h // 2 + h // 32) + h * (i // 2 + mxfp4_scale_row_bytes(i))
+    elif g.weights == "mxfp8":
+        from tests.integration.test_cuteafd_inkling2_mxfp8_moe import _weights
+        from b12x.integration.cuteafd._mxfp4_down_a8_plan import mxfp4_scale_row_bytes
+
+        w = _weights(g, i)
+        per_expert = 2 * i * (h + h // 32) + h * (i + mxfp4_scale_row_bytes(i))
     elif g.weights == "fp8":
         w = (fp8((e, i, h)), scales((e, i // 128, h // 128)), fp8((e, i, h)), scales((e, i // 128, h // 128)),
              fp8((e, h, i)), scales((e, h // 128, i // 128)))
@@ -1314,7 +1338,13 @@ def main() -> None:
                 run()
             torch.cuda.synchronize()
             if args.check:
-                if g.weights == "nvfp4":
+                if g.dynamic_nvfp4:
+                    from tests.integration.test_cuteafd_inkling2_nvfp4_moe import reference as dynamic_reference
+
+                    ref = cached_ref.get('dynamic_nvfp4')
+                    if ref is None:
+                        ref = cached_ref['dynamic_nvfp4'] = dynamic_reference(g, x_exact, ids, weights, dynamic_dequant)
+                elif g.weights == "nvfp4":
                     ref = cached_ref.get(g.activations)
                     if ref is None:
                         ref = cached_ref[g.activations] = reference(g, x_exact, ids, weights, *w, a4=g.activations == "a4")
@@ -1329,6 +1359,12 @@ def main() -> None:
                     if ref is None:
                         ref = cached_ref[a8] = mxfp4_reference(x_exact, ids, weights, *w[:5], w[5][..., :i // 32],
                                                                mxfp4_down_a8=a8)
+                elif g.weights == "mxfp8":
+                    from tests.integration.test_cuteafd_inkling2_mxfp8_moe import reference as mxfp8_reference
+
+                    ref = cached_ref.get('mxfp8')
+                    if ref is None:
+                        ref = cached_ref['mxfp8'] = mxfp8_reference(x_exact, ids, weights, *w, g)
                 elif g.weights == "bf16":
                     from tests.integration.test_cuteafd_expert_contract import bf16_reference
 
@@ -1412,7 +1448,7 @@ def main() -> None:
             us = statistics.median(samples)
             scratch = scratches[route_name]
             run = runs[route_name]
-            record = {"geometry": g.name, "tp": g.tp, "input": args.input, "arithmetic": g.activations,
+            record = {"geometry": g.name, "tp": g.tp, "stored_width": g.slice, "input": args.input, "arithmetic": g.activations,
                       "activation": g.activation, "projection": g.projection, "weight_format": g.weights,
                       "route": route_name, "routing": "recorded" if waves else args.routing, "graph": args.graph, "rows": rows,
                       "capacity": args.capacity if args.capacity is not None else rows,

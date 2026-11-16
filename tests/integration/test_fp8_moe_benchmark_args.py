@@ -725,3 +725,13 @@ def test_v41_decode_pipeline_selector_queries_target_cc_and_fails_closed(monkeyp
     for cc, expected in [((12, 1), True), ((12, 0), False), (None, False)]:
         monkeypatch.setattr(gating, "get_compute_capability", lambda: cc)
         assert kernels.v41_compact_decode_pipeline_qualified(**values) == expected
+
+
+def test_exact_width_is_opt_in_and_validated():
+    assert bench.parse_args([]).exact_width is None
+    assert bench.parse_args(['--exact-width', '576']).exact_width == 576
+    for width in ['0', '-64', '575']:
+        with pytest.raises(SystemExit):
+            bench.parse_args(['--exact-width', width])
+    with pytest.raises(SystemExit):
+        bench.parse_args(['--exact-width', '576', '--mxfp4-pair'])
