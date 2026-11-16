@@ -345,9 +345,11 @@ class StreamNvfp4LinearA4:
         stage = ring + (Int32(block) % Int32(2)) * Int32(self.stage_bytes)
         self._load_operand(stage, a_rows, as_rows, block, tidx, self.tile_m, 0,
                            self.tile_bytes + self.weight_bytes, live)
+        weight_rows = Int32(self.tile_n)
+        if const_expr(self.n % self.tile_n):
+            weight_rows = Int32(self.n) - Int32(cute.arch.block_idx()[0]) * Int32(self.tile_n)
         self._load_operand(stage, w_rows, s_rows, block, tidx, self.tile_n, self.tile_bytes,
-                           self.tile_bytes + self.weight_bytes + self.sc_bytes,
-                           Int32(self.n) - Int32(cute.arch.block_idx()[0]) * Int32(self.tile_n))
+                           self.tile_bytes + self.weight_bytes + self.sc_bytes, weight_rows)
         cute.arch.cp_async_commit_group()
 
     @cute.jit
@@ -370,7 +372,10 @@ class StreamNvfp4LinearA4:
             dst = stage + Int32(packed_offset) + row * Int32(self.stride) \
                 + ((byte // Int32(16)) ^ self._swizzle(row)) * Int32(16) + byte % Int32(16)
             if (row < Int32(count)) & (row < row_limit):
-                if Int32(block) * Int32(self.row_bytes) + byte < Int32(self.k // 2):
+                valid = Int32(1)
+                if const_expr(self.k % self.k_block):
+                    valid = Int32(Int32(block) * Int32(self.row_bytes) + byte < Int32(self.k // 2))
+                if valid != Int32(0):
                     src = rows_at + Int64(row) * Int64(self.k // 2) \
                         + Int64(block) * Int64(self.row_bytes) + Int64(byte)
                     if const_expr(copy_bytes == 16):
@@ -389,7 +394,10 @@ class StreamNvfp4LinearA4:
             dst = stage + Int32(scale_offset) + row * Int32(self.s_stride) + word * Int32(4)
             if (row < Int32(count)) & (row < row_limit):
                 if const_expr(self.k % 64 == 0):
-                    if col < Int32(self.k // 16):
+                    valid = Int32(1)
+                    if const_expr(self.k % self.k_block):
+                        valid = Int32(col < Int32(self.k // 16))
+                    if valid != Int32(0):
                         cp_async_u32_shared_global(dst, scales_at + Int64(row) * Int64(self.k // 16) + Int64(col))
                     else:
                         st_shared_u32(dst, Uint32(0))
@@ -628,13 +636,16 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         stage = ring + (Int32(block) % Int32(self.stages)) * Int32(self.stage_bytes)
         self._load_operand(stage, a_rows, as_rows, block, tidx, self.tile_m, 0,
                            self.tile_bytes + self.weight_bytes, live)
+        weight_rows = Int32(self.half_n)
+        if const_expr(self.inter % self.half_n):
+            weight_rows = Int32(self.inter) - Int32(cute.arch.block_idx()[0]) * Int32(self.half_n)
         self._load_operand(stage, w_rows, s_rows, block, tidx, self.half_n, self.tile_bytes,
                            self.tile_bytes + self.weight_bytes + self.sc_bytes,
-                           Int32(self.inter) - Int32(cute.arch.block_idx()[0]) * Int32(self.half_n))
+                           weight_rows)
         self._load_operand(stage, w_up, s_up, block, tidx, self.half_n,
                            self.tile_bytes + self.half_n * self.stride,
                            self.tile_bytes + self.weight_bytes + self.sc_bytes + self.half_n * self.s_stride,
-                           Int32(self.inter) - Int32(cute.arch.block_idx()[0]) * Int32(self.half_n))
+                           weight_rows)
         cute.arch.cp_async_commit_group()
 
     @cute.kernel
