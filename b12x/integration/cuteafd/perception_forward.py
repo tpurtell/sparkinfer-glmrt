@@ -51,6 +51,51 @@ class CenteredLayerNorm:
                 out[base+Int64(col)]=_fma(Float32(weight[col]),value,Float32(bias[col])).to(BFloat16)
 
 
+class InklingLayerNorm:
+    """Pinned Triton layout: four warps, eight adjacent values per thread;
+    local order 1,0,2..7, descending XOR16..1, then cross-warp XOR2,1.
+    Squared differences use the vendor PTX's explicit FMA accumulation.
+    """
+    @cute.jit
+    def __call__(self,x:cute.Pointer,weight:cute.Pointer,bias:cute.Pointer,out:cute.Pointer,
+                 rows:Int32,epsilon:Float32,stream:cuda.CUstream):
+        self.kernel(x,weight,bias,out,epsilon).launch(grid=(rows,1,1),block=(128,1,1),stream=stream)
+
+    @cute.jit
+    def reduce(self,value:Float32,partials:cute.Tensor,lane:Int32,warp:Int32):
+        for shift in cutlass.range_constexpr(5):
+            value=_add(value,Float32(cute.arch.shuffle_sync_bfly(value,offset=16>>shift)))
+        if lane==Int32(0):partials[warp]=value
+        cute.arch.sync_threads()
+        total=Float32(partials[lane%Int32(4)])
+        total=_add(total,Float32(cute.arch.shuffle_sync_bfly(total,offset=2)))
+        total=_add(total,Float32(cute.arch.shuffle_sync_bfly(total,offset=1)))
+        cute.arch.sync_threads()
+        return total
+
+    @cute.kernel
+    def kernel(self,x:cute.Pointer,weight:cute.Pointer,bias:cute.Pointer,out:cute.Pointer,epsilon:Float32):
+        x,weight,bias,out=_view(x),_view(weight),_view(bias),_view(out)
+        row=Int64(cute.arch.block_idx()[0]);tid=Int32(cute.arch.thread_idx()[0])
+        lane,warp=tid%32,tid//32;base=row*1024+Int64(tid)*8
+        values=[]
+        for item in cutlass.range_constexpr(8):values.append(Float32(x[base+item]))
+        partials=cutlass.utils.SmemAllocator().allocate_tensor(Float32,cute.make_layout((4,)))
+        total=_add(values[0],values[1])
+        for item in cutlass.range_constexpr(2,8):total=_add(total,values[item])
+        mean=div_rn_f32(self.reduce(total,partials,lane,warp),Float32(1024.0))
+        differences=[]
+        for item in cutlass.range_constexpr(8):differences.append(_sub(values[item],mean))
+        squares=_mul(differences[1],differences[1])
+        squares=_fma(differences[0],differences[0],squares)
+        for item in cutlass.range_constexpr(2,8):squares=_fma(differences[item],differences[item],squares)
+        variance=_add(div_rn_f32(self.reduce(squares,partials,lane,warp),Float32(1024.0)),epsilon)
+        inv=rsqrt_approx_ftz_f32(variance)
+        for item in cutlass.range_constexpr(8):
+            col=tid*8+item
+            out[base+item]=_fma(Float32(weight[col]),_mul(differences[item],inv),Float32(bias[col])).to(BFloat16)
+
+
 class NormalizedPatches:
     def __init__(self,patch,hwc):
         self.patch,self.hwc=patch,hwc
@@ -137,11 +182,14 @@ class LearnedPosition:
 def compile_layer_norm_aot(*,hidden,vendor_rsqrt=False):
     if hidden<=0 or hidden>16384:
         raise ValueError("PE norm width must be in1..16384")
-    return compile_program(CenteredLayerNorm(hidden,bool(vendor_rsqrt)),name="perception_centered_norm",operands=(
+    if vendor_rsqrt and hidden!=1024:
+        raise ValueError("pinned Inkling LayerNorm requires width1024")
+    launch=InklingLayerNorm() if vendor_rsqrt else CenteredLayerNorm(hidden,False)
+    return compile_program(launch,name="perception_centered_norm",operands=(
         Operand("x",torch.bfloat16,f"[rows,{hidden}]"),Operand("weight",torch.bfloat16,f"[{hidden}]"),
         Operand("bias",torch.bfloat16,f"[{hidden}]"),Operand("out",torch.bfloat16,f"[rows,{hidden}]","out")),
         scalars=(Scalar("rows"),Scalar("epsilon","float32")),key=(hidden,bool(vendor_rsqrt)),
-        geometry=dict(hidden=hidden,centered_variance=True,vendor_rsqrt=bool(vendor_rsqrt)))
+        geometry=dict(hidden=hidden,centered_variance=True,vendor_rsqrt=bool(vendor_rsqrt)),version=2)
 
 
 def compile_normalized_patches_aot(*,patch,hwc=False):

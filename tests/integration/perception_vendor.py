@@ -47,6 +47,13 @@ def inkling():
     # the original AST nodes with the original source filename/line positions.
     filename = str(Path(os.environ["CUTEAFD_PE_VENDOR_DIR"])/"vision.py")
     exec(compile(ast.Module(body=nodes,type_ignores=[]),filename,"exec"),namespace)
+    import atexit
+    def dump_norm_layout():
+        root=Path(os.environ["TORCH_EXTENSIONS_DIR"])
+        for index,kernel in enumerate(namespace["_scaled_residual_norm_kernel"].cache[torch.cuda.current_device()].values()):
+            (root/f"inkling-layernorm-{index}.ttgir").write_text(kernel.asm.get("ttgir",""))
+            (root/f"inkling-layernorm-{index}.ptx").write_text(kernel.asm.get("ptx",""))
+    atexit.register(dump_norm_layout)
     return types.SimpleNamespace(**namespace)
 
 
