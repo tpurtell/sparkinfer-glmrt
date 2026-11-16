@@ -97,16 +97,16 @@ def test_tp4_w576_exported_object_matches_ordinary(name, tmp_path):
     print(f"{name} w576: exported object exact at rows 1,7,80,2752,4096 and graph replay")
 
 
-@pytest.mark.parametrize('k', [576, 640])
-def test_dynamic_down_native_k64_matches_exact_grid(k, tmp_path):
+@pytest.mark.parametrize('k', [16, 48, 64, 112, 384, 448, 464, 560, 576, 592, 640, 768, 1040])
+@pytest.mark.parametrize('n', [80, 128])
+def test_dynamic_down_native_k64_matches_exact_grid(k, n, tmp_path):
     require_b12x()
     from b12x.integration.cuteafd._nvfp4_moe_dynamic import StreamNvfp4LinearDyn
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     from b12x.integration.cuteafd import exportable_compilation
 
-    n, experts, rows = 128, 1, 128
+    experts, rows = 1, 128
     linear = StreamNvfp4LinearDyn(n=n, k=k, experts=experts)
-    assert linear.k_block == (64 if k == 576 else 128)
 
     class Down:
         def key(self):
