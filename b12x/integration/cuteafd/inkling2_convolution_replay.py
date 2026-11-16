@@ -47,13 +47,15 @@ class _ConvolutionReplay:
     def convolve(self, x: cute.Pointer, weight: cute.Pointer, dynamic: cute.Pointer,
                  history: cute.Pointer, first: cute.Pointer, slots: cute.Pointer,
                  out: cute.Pointer, rows: Int32, history_slot_stride_elements: Int64, history_lag_stride_elements: Int64,
-                 replay: cute.Pointer, replay_row_stride_elements: Int64):
+                 replay: cute.Pointer, replay_row_stride_elements: Int64,
+                 replay_sink: cutlass.Constexpr = True):
         row = Int64(cute.arch.block_idx()[0])
         col = Int64(cute.arch.block_idx()[1]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
         if row < Int64(rows) and col < Int64(self.width):
-            # Capture the source bits in the producing launch before workspace reuse.
-            cute.recast_ptr(replay, dtype=Uint32)[row * replay_row_stride_elements + col] = (
-                cute.recast_ptr(x, dtype=Uint32)[row * Int64(self.width) + col])
+            if cutlass.const_expr(replay_sink):
+                # Capture the source bits before workspace reuse; absent in prefill.
+                cute.recast_ptr(replay, dtype=Uint32)[row * replay_row_stride_elements + col] = (
+                    cute.recast_ptr(x, dtype=Uint32)[row * Int64(self.width) + col])
             begin = Int64(first[row])
             slot = Int64(slots[row])
             acc = Float32(0)
