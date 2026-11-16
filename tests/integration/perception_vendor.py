@@ -32,7 +32,8 @@ def inkling():
     import triton.language as tl
     import triton.language.extra.cuda.libdevice as tldevice
     names = {"_rope_inv_freq","_bf16","_layer_norm","_rotate_pair","_rotary_qk_kernel",
-        "apply_rotary_qk_","_scaled_residual_norm_kernel","scaled_residual_norm_"}
+        "apply_rotary_qk_","_scaled_residual_norm_kernel","scaled_residual_norm_",
+        "_source_coords","_lerp","_embed_kernel","embed_tokens"}
     module = types.ModuleType("perception_vendor_inkling")
     module.__file__ = str(Path(os.environ["CUTEAFD_PE_VENDOR_DIR"])/"vision.py")
     import sys
@@ -64,6 +65,11 @@ def step5():
     quick = next(node for node in _tree("activation.py").body if isinstance(node,ast.ClassDef) and node.name=="QuickGELU")
     method = next(node for node in quick.body if isinstance(node,ast.FunctionDef) and node.name=="forward_native")
     exec(compile(ast.Module(body=[method],type_ignores=[]),filename,"exec"),namespace)
+    tower = next(node for node in _tree("step_vl.py").body if isinstance(node,ast.ClassDef) and node.name=="PerceptionEncoder")
+    position = next(node for node in tower.body if isinstance(node,ast.FunctionDef) and node.name=="sample_abs_posemb")
+    import torch.nn.functional as F
+    namespace["F"]=F
+    exec(compile(ast.Module(body=[position],type_ignores=[]),filename,"exec"),namespace)
     return types.SimpleNamespace(**namespace)
 
 
