@@ -123,7 +123,7 @@ def test_scored_index_shards_equal_full(family, ties, mode):
     scratch = torch.zeros(p.scratch_bytes(rows)["scratch"],device="cuda",dtype=torch.uint8)
     full_i = torch.empty((rows,k),device="cuda",dtype=torch.int32)
     full_v = torch.empty((rows,k),device="cuda")
-    p.launch(q,weights,cache,table[0] if mode == "prefill" else table,lengths,full_i,full_v,scratch,scalars=(rows,pages,pages,1,0))
+    p.launch(q,weights,cache,table[0] if mode == "prefill" else table,lengths,full_i,full_v,scratch,scalars=(rows,pages,pages,1,0) + ((pages,) if mode == "decode" else ()))
     ref_scores = torch.einsum("rhd,nd->rhn",q.double(),keys.double()).relu().sum(1)/32
     logical = torch.arange(pages*64,device="cuda",dtype=torch.int32)[None].expand(rows,-1)
     valid_i = torch.where(logical < lengths[:,None],logical,-1)
@@ -137,7 +137,7 @@ def test_scored_index_shards_equal_full(family, ties, mode):
         half_lengths = units*64 + (tail-rank*64).clamp(0,64)
         oi = torch.empty_like(full_i); ov = torch.empty_like(full_v)
         p.launch(q,weights,cache,half_table[0] if mode == "prefill" else half_table,half_lengths,oi,ov,scratch,
-                 scalars=(rows,pages//2,pages//2,2,rank))
+                 scalars=(rows,pages//2,pages//2,2,rank) + ((pages//2,) if mode == "decode" else ()))
         cv.append(ov); ci.append(oi)
     merge = program("dsa_candidate_merge",topk=k)
     v, i = torch.cat(cv,1),torch.cat(ci,1)
@@ -405,7 +405,7 @@ def test_frozen_resolution_graph_replay_live_rows():
         combine.launch(o0,l,o1,l,None,out,scalars=(n,))
         gather.launch(pool,gt,staging,scalars=(n*4,1,0))
         partial.launch(q,pool,ix,ln,None,None,None,po,pl,ps,scalars=(n,))
-        index.launch(iq,iw,ic,table,il,ii,iv,isc,scalars=(n,96,96,2,0))
+        index.launch(iq,iw,ic,table,il,ii,iv,isc,scalars=(n,96,96,2,0,96))
     launch(rows)
     torch.cuda.synchronize()
     with kernel_resolution_guard("K1 graph gate"):
@@ -561,7 +561,7 @@ def test_glmf_owned_expand_shards_union_the_full_selection(ties):
         u, r = (pools_seen // 64), (pools_seen % 64)
         shard = ((u + 1 - rank) // 2) * 64 + torch.where(u % 2 == rank, r, torch.zeros_like(r))
         oi = torch.empty_like(top_i); ov = torch.empty_like(top_v)
-        index.launch(q, weights, cache, half, shard.int(), oi, ov, scratch, scalars=(rows, n, n, 2, rank))
+        index.launch(q, weights, cache, half, shard.int(), oi, ov, scratch, scalars=(rows, n, n, 2, rank, n))
         halves_v.append(ov); halves_i.append(oi)
     v, i = torch.cat(halves_v, 1), torch.cat(halves_i, 1)
     selected = [set() for _ in range(rows)]

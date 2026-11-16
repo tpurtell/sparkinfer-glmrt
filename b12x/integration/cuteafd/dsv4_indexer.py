@@ -39,6 +39,8 @@ merge state must start zeroed and restores itself after every launch).
 
 from __future__ import annotations
 
+from dataclasses import fields, replace
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -151,6 +153,17 @@ class _TopK:
             # A capacity bound, not a card identity. Live grouping uses the launch device.
             layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route, sm_count=256,
                                       supertile_tokens=supertile_tokens)
+        self.admitted_tile = scored_logical and mode == "decode"
+        if self.admitted_tile:
+            # Fixed-size metadata first; the deployment-sized logits are last.
+            # No generated pointer then depends on the compiled maximum width.
+            logits_bytes = int(layout.tile_logits_elements) * 4
+            offsets = {field.name: getattr(layout, field.name) - logits_bytes
+                       for field in fields(layout)
+                       if field.name.endswith("_offset_bytes")
+                       and getattr(layout, field.name) > layout.tile_logits_offset_bytes}
+            layout = replace(layout, **offsets,
+                             tile_logits_offset_bytes=layout.nbytes - logits_bytes)
         self.layout = layout
         self.route = layout.route
         self.runtime_sm_count = self.route == "paged_fused" or self.runtime_tiled
@@ -219,6 +232,8 @@ class _TopK:
                L.stream_scorer_ctas, L.max_chunks, L.nbytes, self.num_sms)
         key = key if self.heads == _HEADS else key + (self.heads,)
         key = key + ("scored-logical",) if self.scored_logical else key
+        if self.admitted_tile:
+            key = key + ("admitted-tile-v1",)
         if self.route == "paged_tiled":
             key = key + ("device-live-width-v1",)
         return key if getattr(self, "deterministic", True) else key + ("arrival-order",)
@@ -316,7 +331,8 @@ class _TopK:
             token_begin = page_begin * Int32(_PAGE)
             tokens_here = pages_here * Int32(_PAGE)
             self._score(q_fp8, w, cache, q_bytes, page_table, lengths, cache_lengths, base,
-                        rows, table_width, table_stride, page_begin, tile_logits, dummy_desc, stream, device_sm_count)
+                        rows, table_width, table_stride, page_begin, tile_logits, dummy_desc,
+                        Int32(self.supertile), stream, device_sm_count)
             is_first = chunk == Int32(0)
             is_last = chunk == chunks - Int32(1)
             odd = (chunk % Int32(2)) == Int32(1)
@@ -324,30 +340,30 @@ class _TopK:
                 if is_last:
                     self._fold(True, True, tile_logits, lengths, final_values, final_indices,
                                final_values, final_indices, table_flat, table_row_stride, rows,
-                               token_begin, tokens_here, stream)
+                               token_begin, tokens_here, Int32(self.k_tiles), stream)
                 else:
                     self._fold(True, False, tile_logits, lengths, carry_v0, carry_i0,
                                carry_v0, carry_i0, table_flat, table_row_stride, rows,
-                               token_begin, tokens_here, stream)
+                               token_begin, tokens_here, Int32(self.k_tiles), stream)
             else:
                 if is_last:
                     if odd:
                         self._fold(False, True, tile_logits, lengths, final_values, final_indices,
                                    carry_v0, carry_i0, table_flat, table_row_stride, rows,
-                                   token_begin, tokens_here, stream)
+                                   token_begin, tokens_here, Int32(self.k_tiles), stream)
                     else:
                         self._fold(False, True, tile_logits, lengths, final_values, final_indices,
                                    carry_v1, carry_i1, table_flat, table_row_stride, rows,
-                                   token_begin, tokens_here, stream)
+                                   token_begin, tokens_here, Int32(self.k_tiles), stream)
                 else:
                     if odd:
                         self._fold(False, False, tile_logits, lengths, carry_v1, carry_i1,
                                    carry_v0, carry_i0, table_flat, table_row_stride, rows,
-                                   token_begin, tokens_here, stream)
+                                   token_begin, tokens_here, Int32(self.k_tiles), stream)
                     else:
                         self._fold(False, False, tile_logits, lengths, carry_v0, carry_i0,
                                    carry_v1, carry_i1, table_flat, table_row_stride, rows,
-                                   token_begin, tokens_here, stream)
+                                   token_begin, tokens_here, Int32(self.k_tiles), stream)
             chunk = chunk + Int32(1)
 
     @cute.jit
@@ -355,7 +371,7 @@ class _TopK:
                page_table: cute.Pointer, lengths: cute.Tensor, cache_lengths: cute.Pointer,
                base: Int64, rows: Int32, table_width: Int32, table_stride: Int32,
                page_begin: Int32, tile_logits: cute.Tensor, dummy_desc: cute.Tensor,
-               stream: cuda.CUstream, device_sm_count: Int32):
+               width_tokens: Int32, stream: cuda.CUstream, device_sm_count: Int32):
         L = self.layout
         m = rows
         if const_expr(self.route == "packed_contiguous"):
@@ -402,29 +418,59 @@ class _TopK:
             scalar_flag = active
             if const_expr(self.runtime_tiled):
                 self.scorer(q_bytes, w, k_quant, dummy_desc, scalar_flag, k_scales, table, lengths,
-                            active, page_begin, Int32(self.supertile), tile_logits, stream,
+                            active, page_begin, width_tokens, tile_logits, stream,
                             cute.max(Int32(1), (device_sm_count + Int32(self.max_rows - 1)) // Int32(self.max_rows)))
             else:
                 self.scorer(q_bytes, w, k_quant, dummy_desc, scalar_flag, k_scales, table, lengths,
-                            active, page_begin, Int32(self.supertile), tile_logits, stream)
+                            active, page_begin, width_tokens, tile_logits, stream)
 
     @cute.jit
     def _fold(self, first: cutlass.Constexpr, phys: cutlass.Constexpr, tile_logits: cute.Tensor,
               lengths: cute.Tensor, values: cute.Tensor, indices: cute.Tensor,
               carry_values: cute.Tensor, carry_indices: cute.Tensor, table_flat: cute.Tensor,
               table_row_stride: Int32, rows: Int32, token_begin: Int32, tokens_here: Int32,
-              stream: cuda.CUstream):
+              tiles: Int32, stream: cuda.CUstream):
         kernel = self.topk_kernels[(first, phys)]
         if const_expr(phys):
             kernel(tile_logits, lengths, lengths, values, indices, carry_values, carry_indices,
-                   table_flat, table_row_stride, rows, Int32(0), Int32(self.k_tiles), Int32(0),
+                   table_flat, table_row_stride, rows, Int32(0), tiles, Int32(0),
                    Int32(_TILE_BLOCK_Q), Int32(self.block_k), Int32(self.topk), token_begin,
                    tokens_here, token_begin, Int32(_PAGE), Int32(1), Int32(0), stream)
         else:
             kernel(tile_logits, lengths, lengths, values, indices, carry_values, carry_indices,
-                   lengths, Int32(0), rows, Int32(0), Int32(self.k_tiles), Int32(0),
+                   lengths, Int32(0), rows, Int32(0), tiles, Int32(0),
                    Int32(_TILE_BLOCK_Q), Int32(self.block_k), Int32(self.topk), token_begin,
                    tokens_here, token_begin, Int32(1), Int32(1), Int32(0), stream)
+
+
+    @cute.jit
+    def _decode_scored(self, q: cute.Pointer, weights: cute.Pointer, cache: cute.Pointer,
+                       table: cute.Pointer, lengths: cute.Pointer, indices: cute.Pointer,
+                       scratch: cute.Pointer, rows: Int32, table_width: Int32,
+                       table_stride: Int32, admitted_pages: Int32, stream: cuda.CUstream):
+        L = self.layout
+        base = Int64(scratch.toint())
+        # admitted_pages is immutable deployment capacity, never a live frontier.
+        tiles = (admitted_pages * Int32(_PAGE) + Int32(self.block_k - 1)) // Int32(self.block_k)
+        tokens = tiles * Int32(self.block_k)
+        logits = self._flat(cutlass.Float32, base, L.tile_logits_offset_bytes,
+                            ((rows + Int32(31)) // Int32(32)) * Int32(32) * tokens)
+        weights_tensor = cute.make_tensor(weights, cute.make_layout((rows, self.heads), stride=(self.heads, 1)))
+        lengths_tensor = cute.make_tensor(lengths, cute.make_layout((rows,)))
+        q_bytes = cute.make_tensor(
+            cute.make_ptr(cutlass.Uint8, Int64(q.toint()), cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout((rows, self.heads, _HEAD_DIM), stride=(self.heads * _HEAD_DIM, _HEAD_DIM, 1)))
+        self.active_width(self._ptr(cutlass.Int32, base, L.active_width_offset_bytes, 4),
+                          lengths, rows, cute.min(table_width, admitted_pages), stream)
+        dummy = cute.make_tensor(self._ptr(cutlass.Int64, base, L.active_width_offset_bytes, 8),
+                                 cute.make_layout((1,)))
+        self._score(q, weights_tensor, Int64(cache.toint()), q_bytes, table, lengths_tensor, lengths,
+                    base, rows, table_width, table_stride, Int32(0), logits, dummy, tokens, stream, Int32(0))
+        values = self._flat(cutlass.Float32, base, L.topk_values_offset_bytes, rows * Int32(self.topk))
+        output = cute.make_tensor(indices, cute.make_layout((rows * Int32(self.topk),)))
+        table_flat = cute.make_tensor(table, cute.make_layout((rows * table_stride,)))
+        self._fold(True, True, logits, lengths_tensor, values, output, values, output, table_flat,
+                   table_stride, rows, Int32(0), admitted_pages * Int32(_PAGE), tiles, stream)
 
 
 

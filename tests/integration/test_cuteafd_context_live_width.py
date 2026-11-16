@@ -11,18 +11,27 @@ import torch
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize('geometry_name', ['glm-k31-ml4', 'glmf', 'dsv4f', 'dsv4p'])
 @pytest.mark.parametrize('rows', [1, 16, 64])
-def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows):
+def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows, geometry_name, tmp_path):
     require_b12x()
     from b12x.integration.cuteafd import exportable_compilation
-    from b12x.integration.cuteafd.kimi_dsa import KimiDsaGeometry
     from b12x.integration.cuteafd.context_split import compile_scored_index_topk_aot
     from b12x.attention.dsa_indexer.reference import pack_index_k_cache_reference
 
-    capacity = 8192
+    from ..moe.segment_aot import ExportedProgram
+
+    from b12x.integration.cuteafd._common import GLM53, GLM53_FLASH, FLASH, PRO
+
+    geometry = {'glm-k31-ml4': GLM53, 'glmf': GLM53_FLASH, 'dsv4f': FLASH, 'dsv4p': PRO}[geometry_name]
+    heads = 64 if geometry_name.startswith('dsv4') else 32
+    topk = geometry.index_topk // (4 if geometry_name == 'glmf' else 1)
+    capacity = 1025
+    compiled_capacity = 16384 if geometry_name == 'glm-k31-ml4' else 4096
     with exportable_compilation():
-        program = compile_scored_index_topk_aot(KimiDsaGeometry(), max_rows=64,
-                                                max_pages=capacity, mode='decode')
+        program = compile_scored_index_topk_aot(geometry, max_rows=64,
+                                                max_pages=compiled_capacity, mode='decode')
+    exported = ExportedProgram(program, tmp_path, "selector")
     device = torch.device('cuda')
     generator = torch.Generator().manual_seed(9241 + rows)
     # Include a supertile crossing so dead carry folds and live folds both run.
@@ -32,16 +41,22 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows)
     cache = pack_index_k_cache_reference(keys)
     table = torch.full((rows, capacity), -1, dtype=torch.int32, device=device)
     table[:, :maximum] = torch.arange(maximum, device=device, dtype=torch.int32)
-    q = torch.randn((rows, 32, 128), generator=generator).to(device).to(torch.float8_e4m3fn)
-    weights = (torch.randn((rows, 32), generator=generator) * .02).to(device)
+    q = torch.randn((rows, heads, 128), generator=generator).to(device).to(torch.float8_e4m3fn)
+    weights = (torch.randn((rows, heads), generator=generator) * .02).to(device)
     lengths = torch.zeros(rows, dtype=torch.int32, device=device)
-    indices = torch.empty((rows, 2048), dtype=torch.int32, device=device)
-    scores = torch.empty((rows, 2048), dtype=torch.float32, device=device)
-    scratch = torch.empty(program.scratch_bytes(rows)['scratch'], dtype=torch.uint8, device=device)
+    indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    contract = program.geometry["admitted_tile"]
+    assert contract["capacity_pages"] == compiled_capacity
+    prefix = contract["prefix_bytes"]
+    scratch_bytes = prefix + 64 * ((capacity * 64 + 511) // 512) * 512 * 4
+    assert scratch_bytes < program.scratch_bytes(rows)["scratch"]
+    backing = torch.full((scratch_bytes + 1024,), 0xA5, dtype=torch.uint8, device=device)
+    scratch = backing[:scratch_bytes]
 
-    def launch(width, out_indices=indices, out_scores=scores):
-        program.launch(q, weights, cache, table, lengths, out_indices, out_scores, scratch,
-                       scalars=(rows, width, capacity, 2, 1))
+    def launch(width, out_indices=indices, out_scores=scores, admitted=capacity):
+        exported.launch(q, weights, cache, table, lengths, out_indices, out_scores, scratch,
+                       scalars=(rows, width, capacity, 2, 1, admitted))
 
     launch(capacity)
     graph = torch.cuda.CUDAGraph()
@@ -53,18 +68,19 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows)
     for pages in live_pages:
         ends = torch.arange(rows, device=device, dtype=torch.int32)
         lengths.copy_((pages * 64 - ends).clamp(min=0))
-        launch(max(1, pages), expected_indices, expected_scores)
+        launch(max(1, pages), expected_indices, expected_scores, max(1, pages))
         expected_i, expected_s = expected_indices.clone(), expected_scores.clone()
         graph.replay()
         torch.cuda.synchronize()
+        assert torch.all(backing[scratch_bytes:] == 0xA5), (rows, pages, 'scratch guard')
         assert torch.equal(indices, expected_i), (rows, pages, 'indices')
         assert torch.equal(scores.view(torch.uint8), expected_s.view(torch.uint8)), (rows, pages, 'scores')
         for row in range(rows):
-            assert int((indices[row] >= 0).sum()) == min(int(lengths[row]), 2048)
+            assert int((indices[row] >= 0).sum()) == min(int(lengths[row]), topk)
         if pages in (10, 20, 65, 130, 513, 1025):
             exact_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(exact_graph):
-                launch(pages)
+                launch(pages, admitted=pages)
             for _ in range(3):
                 graph.replay()
                 exact_graph.replay()
@@ -78,9 +94,9 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows)
                 return start.elapsed_time(end) * 1000 / 20
             exact_us = measure(exact_graph.replay)
             capacity_us = measure(graph.replay)
-            curve.append(dict(rows=rows, pages=pages, exact_live_us=exact_us,
+            curve.append(dict(geometry=geometry_name, rows=rows, pages=pages, exact_live_us=exact_us,
                               admitted_us=capacity_us, admitted_over_exact=capacity_us / exact_us))
     print('CONTEXT_LIVE_WIDTH_CURVE=' + json.dumps(curve), flush=True)
     if output := os.environ.get('CUTEAFD_CONTEXT_WIDTH_RECEIPTS'):
         Path(output).mkdir(parents=True, exist_ok=True)
-        (Path(output) / f'rows-{rows}.json').write_text(json.dumps(curve, indent=2) + '\n')
+        (Path(output) / f'{geometry_name}-rows-{rows}.json').write_text(json.dumps(curve, indent=2) + '\n')
