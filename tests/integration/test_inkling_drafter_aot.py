@@ -354,12 +354,13 @@ def _check_norm_program(kind, exported, module, geometry):
         k_expected = norm_rope(qkv[:, q_heads:q_heads+kv_heads], k_gamma)
         for live in (1, 64, rows):
             invoke(tensors, live)
-            torch.testing.assert_close(q_out[:live], q_expected[:live], atol=2e-2, rtol=1e-2)
-            torch.testing.assert_close(k_out[:live], k_expected[:live], atol=2e-2, rtol=1e-2)
+            torch.testing.assert_close(q_out[:live], q_expected[:live], atol=0, rtol=1e-2)
+            torch.testing.assert_close(k_out[:live], k_expected[:live], atol=0, rtol=1e-2)
             assert torch.equal(v_out[:live], qkv[:live, q_heads+kv_heads:])
         for name, actual, expected in (("q", q_out, q_expected), ("k", k_out, k_expected)):
             a, b = actual.view(torch.int16).int(), expected.view(torch.int16).int()
             if a.numel():
+                assert float((a == b).float().mean()) >= .9999
                 ordered_a = torch.where(a < 0, -32768-a, a)
                 ordered_b = torch.where(b < 0, -32768-b, b)
                 print("INKLING_ROPE " + json.dumps({"kind": name, "rows": rows,
@@ -371,7 +372,7 @@ def _check_norm_program(kind, exported, module, geometry):
         with torch.cuda.graph(graph):
             invoke(tensors, 64)
         graph.replay()
-        torch.testing.assert_close(q_out[:64], q_expected[:64], atol=2e-2, rtol=1e-2)
+        torch.testing.assert_close(q_out[:64], q_expected[:64], atol=0, rtol=1e-2)
         # Feed identical reference-normalized BF16 operands into the same
         # rotation body to distinguish norm reduction effects from trig/order.
         from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
