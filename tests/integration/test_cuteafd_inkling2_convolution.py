@@ -66,7 +66,7 @@ def test_reference_and_chunk_state(dynamic, width, dtype, chunks):
         first = torch.zeros(count, dtype=torch.int32, device="cuda")
         slots = torch.zeros(count, dtype=torch.int64, device="cuda")
         p.launch(x[start:start + count], weight, coefficients[start:start + count] if dynamic else None,
-                 history, first, slots, out, scalars=(count,))
+                 history, first, slots, out, scalars=(count,3*width))
         expected = reference[start:start + count]
         torch.testing.assert_close(out[:count], expected, rtol=0 if dtype == torch.bfloat16 else 2e-6,
                                    atol=0 if dtype == torch.bfloat16 else 2e-6)
@@ -91,7 +91,7 @@ def test_packed_replay_and_parameter_mutation(dynamic):
     out = torch.empty_like(x)
     def launch():
         history.zero_()
-        p.launch(x, weights, coefficients, history, first, slots, out, scalars=(count,))
+        p.launch(x, weights, coefficients, history, first, slots, out, scalars=(count,3*width))
     launch()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

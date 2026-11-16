@@ -165,26 +165,29 @@ def _step(g, kind, route, sequences, splits=8):
         slots = torch.cat([s.slots(torch.arange(s.len, s.len + n, device="cuda")) for s, _, n in sequences])
         cache[slots] = records
         stride = max(len(s.pages) for s, _, _ in sequences)
-        if route == "prefill":
-            page_table, table_stride = sequences[0][0].pages.contiguous(), 0
-        else:
-            page_table = torch.zeros((rows, stride), dtype=torch.int32, device="cuda")
-            r0 = 0
-            for s, _, n in sequences:
-                page_table[r0:r0 + n, :len(s.pages)] = s.pages
-                r0 += n
-            table_stride = stride
-        scalars = (rows, table_stride) + ((splits,) if route == "decode" else ())
-        program.launch(q, cache, positions, page_table, rel, sinks, out, _scratch(program, rows), scalars=scalars)
+        page_table = torch.zeros((len(sequences), stride), dtype=torch.int32, device="cuda")
+        indices, firsts, tiles, r0 = [], [], [], 0
+        for member, (seq, _, n) in enumerate(sequences):
+            page_table[member, :len(seq.pages)] = seq.pages
+            indices.extend([member]*n)
+            firsts.extend([r0]*n)
+            tiles.extend(range(r0, r0+n, 1 if route == "decode" else 10))
+            r0 += n
+        i32 = lambda values: torch.tensor(values, dtype=torch.int32, device="cuda")
+        scalars = (rows, stride, len(tiles)) + ((splits,) if route == "decode" else ())
+        program.launch(q, cache, positions, page_table, i32(indices), i32(firsts), i32(tiles), rel, sinks,
+                       out, _scratch(program, rows), scalars=scalars)
     else:
         kv_step = records.contiguous()
         ring_slots = torch.cat([s.slots(torch.arange(s.len, s.len + n, device="cuda")) for s, _, n in sequences])
-        firsts, r0 = [], 0
+        firsts, tiles, r0 = [], [], 0
         for _, _, n in sequences:
             firsts.append(torch.full((n,), r0, dtype=torch.int32, device="cuda"))
+            tiles.extend(range(r0, r0+n, 1 if route == "decode" else 10))
             r0 += n
-        program.launch(q, kv_step, sequences[0][0].cache, positions, ring_slots, torch.cat(firsts), rel, sinks,
-                       out, _scratch(program, rows), scalars=(rows,))
+        tile_rows = torch.tensor(tiles, dtype=torch.int32, device="cuda")
+        program.launch(q, kv_step, sequences[0][0].cache, positions, ring_slots, torch.cat(firsts), tile_rows, rel, sinks,
+                       out, _scratch(program, rows), scalars=(rows,len(tiles)))
     for s, _, n in sequences:
         s.len += n
     return out

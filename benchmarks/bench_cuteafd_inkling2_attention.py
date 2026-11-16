@@ -98,6 +98,7 @@ def bench_prefill(g, rows: int, samples: int, flush, gen, max_rows: int) -> dict
 
     q, rel, sinks, records, out = _inputs(g, rows, "local", gen)
     positions = torch.arange(rows, device="cuda")
+    tile_rows = torch.arange(0, rows, 10, dtype=torch.int32, device="cuda")
     result = {"rows": rows}
 
     # Local: this step's records plus an (initially empty) ring.
@@ -106,8 +107,8 @@ def bench_prefill(g, rows: int, samples: int, flush, gen, max_rows: int) -> dict
     slots = positions % g.ring_rows
     first = torch.zeros(rows, dtype=torch.int32, device="cuda")
     scratch = torch.empty(1024, dtype=torch.uint8, device="cuda")
-    result["local_us"] = time_us(lambda: local.launch(q, records, ring, positions, slots, first, rel, sinks, out,
-                                                      scratch, scalars=(rows,)), samples, flush)
+    result["local_us"] = time_us(lambda: local.launch(q, records, ring, positions, slots, first, tile_rows, rel, sinks, out,
+                                                      scratch, scalars=(rows, len(tile_rows))), samples, flush)
 
     control = compile_control(g, "prefill", max_rows)
     ring2 = torch.zeros((2048, g.record_elems), dtype=torch.bfloat16, device="cuda")
@@ -123,8 +124,8 @@ def bench_prefill(g, rows: int, samples: int, flush, gen, max_rows: int) -> dict
     cache[table.long()[positions // g.page_rows] * g.page_rows + positions % g.page_rows] = records
     rel_g = rel if g.extent("global") == g.extent("local") else _inputs(g, rows, "global", gen)[1]
     gscratch = torch.empty(max(glob.scratch_bytes(rows)["scratch"], 1024), dtype=torch.uint8, device="cuda")
-    result["global_us"] = time_us(lambda: glob.launch(q, cache, positions, table, rel_g, sinks, out, gscratch,
-                                                      scalars=(rows, 0)), samples, flush)
+    result["global_us"] = time_us(lambda: glob.launch(q, cache, positions, table, first, first, tile_rows, rel_g, sinks, out, gscratch,
+                                                      scalars=(rows, pages, len(tile_rows))), samples, flush)
     for key in ("local", "control", "global"):
         result[f"{key}_us_per_row"] = result[f"{key}_us"] / rows
     result["local_over_control"] = result["local_us"] / result["control_us"]
@@ -139,13 +140,14 @@ def bench_decode(g, concurrency: int, context: int, samples: int, flush, gen, sp
     positions = torch.full((rows,), context, dtype=torch.int64, device="cuda")
     first = torch.arange(rows, dtype=torch.int32, device="cuda")
     scratch = torch.empty(1024, dtype=torch.uint8, device="cuda")
+    tile_rows = torch.arange(rows, dtype=torch.int32, device="cuda")
     result = {"concurrency": rows, "context": context}
 
     local = compile_inkling2_attention_aot(g, kind="local", route="decode", max_rows=64)
     ring = torch.randn((rows * g.ring_rows, g.record_elems), generator=gen, device="cuda").bfloat16()
     slots = torch.arange(rows, device="cuda") * g.ring_rows + context % g.ring_rows
-    result["local_us"] = time_us(lambda: local.launch(q, records, ring, positions, slots, first, rel, sinks, out,
-                                                      scratch, scalars=(rows,)), samples, flush)
+    result["local_us"] = time_us(lambda: local.launch(q, records, ring, positions, slots, first, tile_rows, rel, sinks, out,
+                                                      scratch, scalars=(rows, len(tile_rows))), samples, flush)
 
     control = compile_control(g, "decode", 64)
     ring2 = torch.randn((rows * 2048, g.record_elems), generator=gen, device="cuda").bfloat16()
@@ -160,8 +162,8 @@ def bench_decode(g, concurrency: int, context: int, samples: int, flush, gen, sp
     table = (torch.arange(rows, device="cuda")[:, None] * pages + torch.arange(pages, device="cuda")[None]).int()
     rel_g = rel if g.extent("global") == g.extent("local") else _inputs(g, rows, "global", gen)[1]
     gscratch = torch.empty(max(glob.scratch_bytes(rows)["scratch"], 1024), dtype=torch.uint8, device="cuda")
-    result["global_us"] = time_us(lambda: glob.launch(q, cache, positions, table, rel_g, sinks, out, gscratch,
-                                                      scalars=(rows, pages, splits)), samples, flush)
+    result["global_us"] = time_us(lambda: glob.launch(q, cache, positions, table, first, first, tile_rows, rel_g, sinks, out, gscratch,
+                                                      scalars=(rows, pages, len(tile_rows), splits)), samples, flush)
     result["local_over_control"] = result["local_us"] / result["control_us"]
     # Bytes the local decode must stream: K/V of the window for every row (bias is 96 KiB/row on top).
     kv_bytes = rows * g.window * g.record_elems * 2

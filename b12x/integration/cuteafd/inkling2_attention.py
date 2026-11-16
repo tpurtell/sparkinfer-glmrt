@@ -115,7 +115,7 @@ class _GlobalAttention:
 
     @cute.jit
     def run(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
-            table_indices: cute.Pointer, first: cute.Pointer, tile_rows: cute.Pointer,
+            table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
             rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
             table_stride: Int32, tiles: Int32, splits: Int32, stream: cuda.CUstream):
         base = Int64(scratch.toint())
@@ -124,7 +124,7 @@ class _GlobalAttention:
                           + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
         lse = cute.make_ptr(cutlass.Float32, lse_off, cute.AddressSpace.gmem, assumed_align=16)
         # The ring operands (kv_step, ring_slots, seq_first) are unused on the paged route.
-        self.attn(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, first, first, rel, sinks, out, partials,
+        self.attn(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, seq_first, seq_first, rel, sinks, out, partials,
                   lse, rows, table_stride, tiles, splits, stream)
         if cutlass.const_expr(self.merge is not None):
             self.merge(partials, lse, sinks, out, rows, splits, stream)
@@ -133,7 +133,7 @@ class _GlobalAttention:
 class _GlobalAttentionDecode(_GlobalAttention):
     @cute.jit
     def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
-                 table_indices: cute.Pointer, first: cute.Pointer, tile_rows: cute.Pointer,
+                 table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
                  rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
                  table_stride: Int32, tiles: Int32, splits: Int32, stream: cuda.CUstream):
         clamped = splits
@@ -141,16 +141,16 @@ class _GlobalAttentionDecode(_GlobalAttention):
             clamped = Int32(self.max_splits)
         if clamped < Int32(1):
             clamped = Int32(1)
-        self.run(q, kv_cache, positions, page_table, table_indices, first, tile_rows, rel, sinks, out, scratch, rows, table_stride, tiles, clamped, stream)
+        self.run(q, kv_cache, positions, page_table, table_indices, seq_first, tile_rows, rel, sinks, out, scratch, rows, table_stride, tiles, clamped, stream)
 
 
 class _GlobalAttentionPrefill(_GlobalAttention):
     @cute.jit
     def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
-                 table_indices: cute.Pointer, first: cute.Pointer, tile_rows: cute.Pointer,
+                 table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
                  rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
                  table_stride: Int32, tiles: Int32, stream: cuda.CUstream):
-        self.run(q, kv_cache, positions, page_table, table_indices, first, tile_rows, rel, sinks, out, scratch, rows, table_stride, tiles, Int32(1), stream)
+        self.run(q, kv_cache, positions, page_table, table_indices, seq_first, tile_rows, rel, sinks, out, scratch, rows, table_stride, tiles, Int32(1), stream)
 
 
 class _LocalAttention:
