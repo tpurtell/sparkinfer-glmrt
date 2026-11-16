@@ -383,3 +383,38 @@ def compile_inkling_qk_norm_rope_aot(*, q_heads=48, kv_heads=8):
         Operand("v_out", torch.bfloat16, f"[rows,{kv_heads},128]", "out"),
     ), scalars=(Scalar("rows"), Scalar("eps", "float32")), key=(q_heads, kv_heads, 128),
         geometry={"q_heads": q_heads, "kv_heads": kv_heads, "head_dim": 128}, doc=__doc__)
+
+
+class _SiluMul:
+    def __init__(self, intermediate):
+        self.intermediate = intermediate
+
+    @cute.jit
+    def __call__(self, gate_up: cute.Pointer, activated: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        if rows > 0 and rows <= 4096:
+            self.kernel(gate_up, activated, rows).launch(
+                grid=((rows * self.intermediate + 255) // 256, 1, 1),
+                block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, gate_up: cute.Pointer, activated: cute.Pointer, rows: Int32):
+        tile, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        index = Int64(tile) * 256 + Int64(thread)
+        if index < Int64(rows) * Int64(self.intermediate):
+            source = (index // self.intermediate) * Int64(2 * self.intermediate) + index % self.intermediate
+            gate = Float32(gate_up[source])
+            up = Float32(gate_up[source + self.intermediate])
+            silu = div_rn_f32(gate, Float32(1) + cute.math.exp(-gate, fastmath=False))
+            activated[index] = BFloat16(silu * up)
+
+
+def compile_inkling_silu_mul_aot(*, intermediate=18432):
+    if intermediate not in (18432, 9216):
+        raise ValueError("Inkling SiLU intermediate must be TP1=18432 or TP2=9216")
+    return compile_program(_SiluMul(intermediate), name="inkling_silu_mul", operands=(
+        Operand("gate_up", torch.bfloat16, f"[rows,{2*intermediate}]"),
+        Operand("activated", torch.bfloat16, f"[rows,{intermediate}]", "out"),
+    ), scalars=(Scalar("rows"),), key=(intermediate,),
+        geometry={"intermediate": intermediate}, doc=__doc__)

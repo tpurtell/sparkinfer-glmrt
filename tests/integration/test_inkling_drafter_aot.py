@@ -16,11 +16,15 @@ from b12x.integration.cuteafd import exportable_compilation, validate_exported_h
 from b12x.integration.cuteafd import inkling_drafter as kernels
 
 
-@pytest.fixture(scope="module", params=["dflare_mix", "mask_init", "recurrent_gate", "head_fold", "logit_finish", "residual_norm", "qk_norm_rope"])
+@pytest.fixture(scope="module", params=["dflare_mix", "mask_init", "recurrent_gate", "head_fold", "logit_finish", "residual_norm", ("qk_norm_rope", 48, 8), ("qk_norm_rope", 24, 4), ("qk_norm_rope", 0, 8), ("qk_norm_rope", 0, 4), ("silu_mul", 18432), ("silu_mul", 9216)])
 def program(request, tmp_path_factory):
     kind = request.param
+    geometry = kind[1:] if isinstance(kind, tuple) else None
+    kind = kind[0] if geometry else kind
     with exportable_compilation():
-        compiled = getattr(kernels, f"compile_inkling_{kind}_aot")()
+        kwargs = ({"intermediate": geometry[0]} if kind == "silu_mul" else
+                  dict(q_heads=geometry[0], kv_heads=geometry[1]) if geometry else {})
+        compiled = getattr(kernels, f"compile_inkling_{kind}_aot")(**kwargs)
     directory = tmp_path_factory.mktemp(kind)
     stem = "inkling_" + kind
     compiled.export_to_c(str(directory), stem, stem)
@@ -83,7 +87,10 @@ def test_oracle_and_graph(program):
         _check_head_program(kind, exported, module)
         return
     if kind in ("residual_norm", "qk_norm_rope"):
-        _check_norm_program(kind, exported, module)
+        _check_norm_program(kind, exported, module, compiled.geometry)
+        return
+    if kind == "silu_mul":
+        _check_silu_program(exported, module, compiled.geometry["intermediate"])
         return
     maximum = 4096 if kind == "dflare_mix" else 64
     if kind == "dflare_mix":
@@ -276,7 +283,7 @@ def test_vendor_double_rounding_cast():
         assert torch.equal(x.bfloat16(), x.float().bfloat16())
 
 
-def _check_norm_program(kind, exported, module):
+def _check_norm_program(kind, exported, module, geometry):
     def invoke(tensors, rows):
         assert exported.launch(ctypes.byref(module), *(t.data_ptr() for t in tensors), rows,
                                1e-6, torch.cuda.current_stream().cuda_stream) == 0
@@ -294,13 +301,17 @@ def _check_norm_program(kind, exported, module):
             invoke(tensors, rows)
             assert torch.equal(residual_out[:rows], value[:rows].bfloat16())
             torch.testing.assert_close(norm_out[:rows], expected[:rows], atol=0, rtol=1e-2)
+        a, b = norm_out.view(torch.int16).int(), expected.view(torch.int16).int()
+        print("INKLING_RESIDUAL_NORM " + json.dumps({
+              "bit_equal_fraction": float((a == b).float().mean()),
+              "max_ulp": int((a-b).abs().max())}), flush=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             invoke(tensors, 64)
         graph.replay()
         torch.testing.assert_close(norm_out[:64], expected[:64], atol=0, rtol=1e-2)
     else:
-        rows, q_heads, kv_heads = 4096, 48, 8
+        rows, q_heads, kv_heads = 4096, geometry["q_heads"], geometry["kv_heads"]
         qkv = torch.randn(rows, q_heads + 2*kv_heads, 128, device="cuda", dtype=torch.bfloat16)
         q_gamma = (.5 + torch.rand(128, device="cuda")).bfloat16()
         k_gamma = (.5 + torch.rand(128, device="cuda")).bfloat16()
@@ -308,10 +319,16 @@ def _check_norm_program(kind, exported, module):
         positions_cpu[:8] = torch.tensor([0, 1, 1023, 1024, 65535, 65536, 1048574, 1048575])
         positions = positions_cpu.cuda()
         # Pinned vLLM base.py builds the FP32 cache with a CPU outer product.
-        inv_freq_cpu = 1. / (10000. ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128))
+        inv_freq_cpu = 1. / (1e6 ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128))
         inv_freq = inv_freq_cpu.cuda()
-        angle = torch.einsum("i,j->ij", positions_cpu.float(), inv_freq_cpu)
-        cosine, sine = angle.cos().cuda()[:, None], angle.sin().cuda()[:, None]
+        angle = torch.einsum("i,j->ij", positions.float(), inv_freq)
+        cosine, sine = angle.cos()[:, None], angle.sin()[:, None]
+        cpu_angle = torch.einsum("i,j->ij", positions_cpu.float(), inv_freq_cpu)
+        for name, gpu, cpu in (("cos", cosine[:, 0], cpu_angle.cos().cuda()),
+                               ("sin", sine[:, 0], cpu_angle.sin().cuda())):
+            print("INKLING_TRIG_CPU " + json.dumps({"kind": name,
+                  "bit_equal_fraction": float((gpu == cpu).float().mean()),
+                  "max_abs": float((gpu-cpu).abs().max())}), flush=True)
         q_out = torch.empty(rows, q_heads, 128, device="cuda", dtype=torch.bfloat16)
         k_out = torch.empty(rows, kv_heads, 128, device="cuda", dtype=torch.bfloat16)
         v_out = torch.empty_like(k_out)
@@ -334,11 +351,36 @@ def _check_norm_program(kind, exported, module):
             assert torch.equal(v_out[:live], qkv[:live, q_heads+kv_heads:])
         for name, actual, expected in (("q", q_out, q_expected), ("k", k_out, k_expected)):
             a, b = actual.view(torch.int16).int(), expected.view(torch.int16).int()
-            print("INKLING_ROPE " + json.dumps({"kind": name, "rows": rows,
-                  "bit_equal_fraction": float((a == b).float().mean()),
-                  "max_ulp": int((a-b).abs().max())}), flush=True)
+            if a.numel():
+                print("INKLING_ROPE " + json.dumps({"kind": name, "rows": rows,
+                      "heads": [q_heads, kv_heads],
+                      "bit_equal_fraction": float((a == b).float().mean()),
+                      "max_ulp": int((a-b).abs().max())}), flush=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             invoke(tensors, 64)
         graph.replay()
         torch.testing.assert_close(q_out[:64], q_expected[:64], atol=2e-2, rtol=1e-2)
+
+
+def _check_silu_program(exported, module, intermediate):
+    source = (torch.randn(4096, 2 * intermediate, device="cuda") * 4).bfloat16()
+    output = torch.full((4096, intermediate), float("nan"), device="cuda", dtype=torch.bfloat16)
+    gate, up = source.float().chunk(2, -1)
+    expected = (gate / (1 + (-gate).exp()) * up).bfloat16()
+
+    def launch(rows):
+        assert exported.launch(ctypes.byref(module), source.data_ptr(), output.data_ptr(), rows,
+                               torch.cuda.current_stream().cuda_stream) == 0
+
+    for rows in (0, 1, 64, 512, 4096):
+        output.fill_(float("nan"))
+        launch(rows)
+        assert torch.equal(output[:rows].view(torch.int16), expected[:rows].view(torch.int16))
+        assert torch.isnan(output[rows:]).all()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(64)
+    output.fill_(float("nan"))
+    graph.replay()
+    assert torch.equal(output[:64], expected[:64])
