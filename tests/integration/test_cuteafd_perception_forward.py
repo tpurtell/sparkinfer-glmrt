@@ -36,6 +36,24 @@ def test_centered_layer_norm_matches_vendor(hidden,vendor_rsqrt,rows):
         torch.testing.assert_close(out,ref,atol=.015625,rtol=.008)
 
 
+def test_forward_rejects_invalid_extents_before_launch():
+    require_b12x()
+    from b12x.integration.cuteafd.perception_forward import (compile_layer_norm_aot,
+        compile_normalized_patches_aot,compile_learned_position_aot)
+    dummy=torch.zeros(1024,device="cuda",dtype=torch.bfloat16)
+    norm=compile_layer_norm_aot(hidden=1024,vendor_rsqrt=True)
+    for scalars in [[0,1e-5],[1,0],[1,float("nan")],[2,1e-5]]:
+        with pytest.raises(ValueError):norm.launch(dummy,dummy,dummy,dummy,scalars=scalars)
+    patches=compile_normalized_patches_aot(patch=20,hwc=True)
+    pixels=torch.zeros(40,40,3,device="cuda")
+    out=torch.zeros(4,1200,device="cuda",dtype=torch.bfloat16)
+    for shape in [[39,40],[40,41],[0,40]]:
+        with pytest.raises(ValueError):patches.launch(pixels,out,scalars=shape)
+    position=compile_learned_position_aot(hidden=1024,grid=32,class_token=True)
+    with pytest.raises(ValueError,match="storage"):
+        position.launch(dummy,dummy,dummy,dummy,dummy,scalars=[2,2])
+
+
 @pytest.mark.parametrize("patch,hwc",[(20,True),(14,False)])
 def test_normalized_patch_order(patch,hwc):
     require_b12x()
@@ -48,6 +66,25 @@ def test_normalized_patch_order(patch,hwc):
     order=(0,2,1,3,4) if hwc else (0,2,4,1,3)
     ref=x.reshape(4,patch,6,patch,3).permute(order).reshape_as(out).bfloat16()
     assert vendor.metrics(f"patch_p{patch}_hwc{hwc}",out,ref,source="vendor-native-patch-layout")==0
+
+
+@pytest.mark.parametrize("height,width",[(36,36),(52,52),(12,20)])
+def test_step5_learned_absolute_position_resized_grid(height,width):
+    require_b12x()
+    from types import SimpleNamespace
+    from b12x.integration.cuteafd.perception_forward import compile_learned_position_aot
+    hidden=1536
+    gen=torch.Generator(device="cuda").manual_seed(2327)
+    patch=torch.randn(height*width,hidden,device="cuda",generator=gen).bfloat16()
+    table=torch.randn(52*52,hidden,device="cuda",generator=gen).bfloat16()
+    owner=SimpleNamespace(posemb_grid_size=52,positional_embedding=table,use_cls_token=False,width=hidden)
+    position=vendor.step5().sample_abs_posemb(owner,height,width)[0]
+    ref=patch+position
+    out=torch.empty_like(patch);dummy=torch.zeros(hidden,device="cuda",dtype=torch.bfloat16)
+    program=compile_learned_position_aot(hidden=hidden,grid=52,class_token=False)
+    program.launch(patch,table,dummy,dummy,out,scalars=[height,width])
+    assert vendor.metrics(f"position_step5_{height}x{width}",out,ref)<=2
+    torch.testing.assert_close(out,ref,atol=.015625,rtol=.008)
 
 
 @pytest.mark.parametrize("height,width",[(2,4),(32,32),(36,36),(52,52)])

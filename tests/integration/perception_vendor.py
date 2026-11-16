@@ -47,13 +47,6 @@ def inkling():
     # the original AST nodes with the original source filename/line positions.
     filename = str(Path(os.environ["CUTEAFD_PE_VENDOR_DIR"])/"vision.py")
     exec(compile(ast.Module(body=nodes,type_ignores=[]),filename,"exec"),namespace)
-    import atexit
-    def dump_norm_layout():
-        root=Path(os.environ["TORCH_EXTENSIONS_DIR"])
-        for index,kernel in enumerate(namespace["_scaled_residual_norm_kernel"].cache[torch.cuda.current_device()].values()):
-            (root/f"inkling-layernorm-{index}.ttgir").write_text(kernel.asm.get("ttgir",""))
-            (root/f"inkling-layernorm-{index}.ptx").write_text(kernel.asm.get("ptx",""))
-    atexit.register(dump_norm_layout)
     return types.SimpleNamespace(**namespace)
 
 
@@ -72,6 +65,11 @@ def step5():
     quick = next(node for node in _tree("activation.py").body if isinstance(node,ast.ClassDef) and node.name=="QuickGELU")
     method = next(node for node in quick.body if isinstance(node,ast.FunctionDef) and node.name=="forward_native")
     exec(compile(ast.Module(body=[method],type_ignores=[]),filename,"exec"),namespace)
+    tower = next(node for node in _tree("step_vl.py").body if isinstance(node,ast.ClassDef) and node.name=="PerceptionEncoder")
+    position = next(node for node in tower.body if isinstance(node,ast.FunctionDef) and node.name=="sample_abs_posemb")
+    import torch.nn.functional as F
+    namespace["F"]=F
+    exec(compile(ast.Module(body=[position],type_ignores=[]),filename,"exec"),namespace)
     return types.SimpleNamespace(**namespace)
 
 

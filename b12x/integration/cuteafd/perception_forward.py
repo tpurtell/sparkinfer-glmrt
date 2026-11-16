@@ -1,5 +1,6 @@
 """PE centered LayerNorm, native patch rows and learned position/CLS boundaries."""
 from __future__ import annotations
+import math
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -9,6 +10,40 @@ from b12x._lib.intrinsics import div_rn_f32,rsqrt_approx_ftz_f32
 from ._common import Operand,Scalar,compile_program
 from ._glm_kernels import _warp_sum
 from .pointwise import _add,_sub,_mul,_fma,_sqrt_rn,_view
+
+
+class CheckedForward:
+    """Host validation for pointer ABI tests; native owners admit the same extents."""
+    def __init__(self,program,kind,**geometry):
+        self.program,self.kind,self.geometry=program,kind,geometry
+
+    def __getattr__(self,name):
+        return getattr(self.program,name)
+
+    def launch(self,*tensors,scalars,stream=None):
+        if self.kind=="norm":
+            if len(scalars)!=2 or scalars[0]<=0 or not math.isfinite(scalars[1]) or scalars[1]<=0:
+                raise ValueError("PE norm requires positive rows and finite positive epsilon")
+            rows,epsilon=scalars;hidden=self.geometry["hidden"]
+            expected=[rows*hidden,hidden,hidden,rows*hidden]
+        else:
+            if len(scalars)!=2 or not all(isinstance(value,int) and value>0 for value in scalars):
+                raise ValueError("PE image extents must be positive integers")
+            height,width=scalars
+            if height*width>16384:
+                raise ValueError("PE image grid exceeds admitted capacity")
+            if self.kind=="patch":
+                patch=self.geometry["patch"]
+                if height%patch or width%patch:
+                    raise ValueError("PE normalized image extents must divide the patch size")
+                expected=[height*width*3,height*width*3]
+            else:
+                hidden,grid=self.geometry["hidden"],self.geometry["grid"]
+                expected=[height*width*hidden,grid*grid*hidden,hidden,hidden,
+                    (height*width+int(self.geometry["class_token"]))*hidden]
+        if len(tensors)!=len(expected) or any(tensor is None or tensor.numel()<size for tensor,size in zip(tensors,expected)):
+            raise ValueError("PE forward operand storage below admitted extent")
+        return self.program.launch(*tensors,scalars=scalars,stream=stream)
 
 
 class CenteredLayerNorm:
@@ -103,6 +138,8 @@ class NormalizedPatches:
     @cute.jit
     def __call__(self,pixels:cute.Pointer,out:cute.Pointer,height:Int32,width:Int32,stream:cuda.CUstream):
         count=Int64(height)*Int64(width)*Int64(3)
+        if height%Int32(self.patch)!=Int32(0) or width%Int32(self.patch)!=Int32(0):
+            count=Int64(0)
         self.kernel(pixels,out,width,count).launch(grid=((count+255)//256,1,1),block=(256,1,1),stream=stream)
 
     @cute.kernel
@@ -185,27 +222,27 @@ def compile_layer_norm_aot(*,hidden,vendor_rsqrt=False):
     if vendor_rsqrt and hidden!=1024:
         raise ValueError("pinned Inkling LayerNorm requires width1024")
     launch=InklingLayerNorm() if vendor_rsqrt else CenteredLayerNorm(hidden,False)
-    return compile_program(launch,name="perception_centered_norm",operands=(
+    return CheckedForward(compile_program(launch,name="perception_centered_norm",operands=(
         Operand("x",torch.bfloat16,f"[rows,{hidden}]"),Operand("weight",torch.bfloat16,f"[{hidden}]"),
         Operand("bias",torch.bfloat16,f"[{hidden}]"),Operand("out",torch.bfloat16,f"[rows,{hidden}]","out")),
         scalars=(Scalar("rows"),Scalar("epsilon","float32")),key=(hidden,bool(vendor_rsqrt)),
-        geometry=dict(hidden=hidden,centered_variance=True,vendor_rsqrt=bool(vendor_rsqrt)),version=2)
+        geometry=dict(hidden=hidden,centered_variance=True,vendor_rsqrt=bool(vendor_rsqrt)),version=2),"norm",hidden=hidden)
 
 
 def compile_normalized_patches_aot(*,patch,hwc=False):
     if patch<=0 or patch>64:
         raise ValueError("patch size must be in1..64")
-    return compile_program(NormalizedPatches(patch,bool(hwc)),name="perception_normalized_patches",operands=(
+    return CheckedForward(compile_program(NormalizedPatches(patch,bool(hwc)),name="perception_normalized_patches",operands=(
         Operand("pixels",torch.float32,"[height,width,3]"),Operand("out",torch.bfloat16,f"[height*width/{patch*patch},{3*patch*patch}]","out")),
-        scalars=(Scalar("height"),Scalar("width")),key=(patch,bool(hwc)),geometry=dict(patch=patch,hwc=bool(hwc)))
+        scalars=(Scalar("height"),Scalar("width")),key=(patch,bool(hwc)),geometry=dict(patch=patch,hwc=bool(hwc)),version=2),"patch",patch=patch)
 
 
 def compile_learned_position_aot(*,hidden,grid,class_token=False):
     if min(hidden,grid)<=0:
         raise ValueError("PE position geometry must be positive")
-    return compile_program(LearnedPosition(hidden,grid,bool(class_token)),name="perception_learned_position",operands=(
+    return CheckedForward(compile_program(LearnedPosition(hidden,grid,bool(class_token)),name="perception_learned_position",operands=(
         Operand("patch",torch.bfloat16,f"[height*width,{hidden}]"),Operand("table",torch.bfloat16,f"[{grid*grid},{hidden}]"),
         Operand("cls",torch.bfloat16,f"[{hidden}]"),Operand("cls_position",torch.bfloat16,f"[{hidden}]"),
         Operand("out",torch.bfloat16,f"[height*width+{int(class_token)},{hidden}]","out")),
         scalars=(Scalar("height"),Scalar("width")),key=(hidden,grid,bool(class_token)),
-        geometry=dict(hidden=hidden,grid=grid,class_token=bool(class_token),mode="bilinear"))
+        geometry=dict(hidden=hidden,grid=grid,class_token=bool(class_token),mode="bilinear")),"position",hidden=hidden,grid=grid,class_token=bool(class_token))
