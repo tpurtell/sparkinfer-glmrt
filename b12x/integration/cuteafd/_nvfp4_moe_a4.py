@@ -294,9 +294,9 @@ class StreamNvfp4LinearA4:
         self.warp_cols = self.tile_n // 2
         self.n_tiles = self.warp_cols // 8
         self.frags = 4 * self.m_tiles * self.n_tiles
-        if self.n % self.tile_n or self.k % 128:
-            raise ValueError("NVFP4 A4 linear needs N % tile_n == 0 and K % 128 == 0")
-        self.k_block = 256 if self.k % 256 == 0 else 128
+        if self.n % self.tile_n or self.k % 64:
+            raise ValueError("NVFP4 A4 linear needs N % tile_n == 0 and K % 64 == 0")
+        self.k_block = 256 if self.k % 256 == 0 else 128 if self.k % 128 == 0 else 64
         self.blocks = self.k // self.k_block
         self.row_bytes = self.k_block // 2
         # Unpadded rows with a 32B-sector-preserving XOR swizzle on 16B pieces:
@@ -336,6 +336,8 @@ class StreamNvfp4LinearA4:
     def _swizzle(self, row):
         if const_expr(self.row_bytes >= 128):
             return ((row & Int32(3)) << Int32(1)) | ((row >> Int32(2)) & Int32(1))
+        if const_expr(self.row_bytes == 32):
+            return (row >> Int32(1)) & Int32(1)
         return (row >> Int32(1)) & Int32(3)
 
     @cute.jit

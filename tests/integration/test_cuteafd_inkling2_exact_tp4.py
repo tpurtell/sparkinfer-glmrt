@@ -10,6 +10,14 @@ import torch
 from ..conftest import require_b12x
 from tests.moe.segment_aot import ExportedProgram
 
+try:
+    import cutlass
+    import cutlass.cute as cute
+    import cuda.bindings.driver as cuda
+    from cutlass import Int32
+except ImportError:
+    cute = None
+
 
 def _exact_geometry(name):
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES
@@ -87,3 +95,51 @@ def test_tp4_w576_exported_object_matches_ordinary(name, tmp_path):
     torch.cuda.synchronize()
     assert torch.equal(outputs[0][1:81], outputs[1][1:81])
     print(f"{name} w576: exported object exact at rows 1,7,80,2752,4096 and graph replay")
+
+
+@pytest.mark.parametrize('k', [576, 640])
+def test_dynamic_down_native_k64_matches_exact_grid(k, tmp_path):
+    require_b12x()
+    from b12x.integration.cuteafd._nvfp4_moe_dynamic import StreamNvfp4LinearDyn
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd import exportable_compilation
+
+    n, experts, rows = 128, 1, 128
+    linear = StreamNvfp4LinearDyn(n=n, k=k, experts=experts)
+    assert linear.k_block == (64 if k == 576 else 128)
+
+    class Down:
+        def key(self):
+            return ('inkling_native_down_oracle', linear.key())
+
+        @cute.jit
+        def __call__(self, aq: cute.Pointer, scales: cute.Pointer, meta: cute.Pointer,
+                     weight: cute.Pointer, ws: cute.Pointer, output: cute.Pointer,
+                     amax: cute.Pointer, live: Int32, stream: cuda.CUstream):
+            linear(aq, scales, meta, weight, ws, output, Int32(1), stream, row_amax=amax)
+
+    ops = (Operand('aq', torch.uint8, '[128,K/2]'), Operand('scales', torch.uint8, '[128,K/16]'),
+        Operand('meta', torch.int32, '[8]', align=4), Operand('weight', torch.uint8, '[N,K/2]'),
+        Operand('ws', torch.uint8, '[S]', align=4), Operand('output', torch.bfloat16, '[128,N]', 'out'),
+        Operand('amax', torch.float32, '[128]', align=4))
+    with exportable_compilation():
+        program = compile_program(Down(), name=f'inkling_down_k{k}', operands=ops,
+            scalars=(Scalar('live'),), key=('inkling_native_down_oracle', linear.key()))
+    exported = ExportedProgram(program, tmp_path, f'inkling_down_k{k}')
+    torch.manual_seed(k)
+    aq = torch.randint(0, 256, (rows, k // 2), device='cuda', dtype=torch.uint8)
+    weight = torch.randint(0, 256, (n, k // 2), device='cuda', dtype=torch.uint8)
+    scales = torch.ones(rows, k // 16, device='cuda').to(torch.float8_e4m3fn).view(torch.uint8)
+    ws = torch.cat([torch.ones(n * k // 16, device='cuda').to(torch.float8_e4m3fn).view(torch.uint8),
+        torch.tensor([1536.0, 1.0], device='cuda').view(torch.uint8)])
+    amax = torch.ones(rows, device='cuda')
+    meta = torch.tensor([0, 1, 0, 0, rows, 0, 0, 0], device='cuda', dtype=torch.int32)
+    output = torch.empty(rows, n, device='cuda', dtype=torch.bfloat16)
+    exported.launch(aq, scales, meta, weight, ws, output, amax, scalars=(rows,))
+    torch.cuda.synchronize()
+    table = torch.tensor([0,.5,1,1.5,2,3,4,6,0,-.5,-1,-1.5,-2,-3,-4,-6], device='cuda')
+    def decode(packed):
+        return table[torch.stack([packed.long() & 15, packed.long() >> 4], -1).flatten(-2)]
+    expected = (decode(aq).double() @ decode(weight).double().T).float().bfloat16()
+    assert torch.equal(output, expected), (k, (output.float() - expected.float()).abs().max().item())
+    print(f'NVFP4 dynamic down K{k}: exact integer-grid F64 reference, stored K{k}')
