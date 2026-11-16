@@ -8,7 +8,7 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Int64
 
 from ._common import Operand, Scalar, compile_program
-from .pointwise import _add, _sub, _mul, _view
+from .pointwise import _add, _sub, _mul, _fma, _view
 
 
 class VisionQkvRotary:
@@ -46,11 +46,20 @@ class VisionQkvRotary:
                     negative = local < half
                 c, s = Float32(cos[table]), Float32(sin[table])
                 for offset, out in ((Int64(0), q), (width, k)):
-                    first = _mul(Float32(qkv[base + offset]), c)
-                    second = _mul(Float32(qkv[row * Int64(3) * width + pair + offset]), s)
-                    result = _add(first, second)
-                    if negative:
-                        result = _sub(first, second)
+                    value = Float32(qkv[base + offset])
+                    partner = Float32(qkv[row * Int64(3) * width + pair + offset])
+                    second = _mul(partner, s)
+                    if cutlass.const_expr(self.adjacent):
+                        # Installed ATen complex64 mul SASS: FMUL(b,d)/FMUL(a,d),
+                        # then FFMA(a,c,-bd)/FFMA(b,c,ad), one BF16 cast afterward.
+                        if negative:
+                            second = -second
+                        result = _fma(value, c, second)
+                    else:
+                        first = _mul(value, c)
+                        result = _add(first, second)
+                        if negative:
+                            result = _sub(first, second)
                     out[at] = result.to(BFloat16)
             else:
                 q[at], k[at] = qkv[base], qkv[base + width]
