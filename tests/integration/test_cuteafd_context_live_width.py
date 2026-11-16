@@ -11,20 +11,25 @@ import torch
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize('geometry_name', ['glm-k31-ml4', 'glmf', 'dsv4f', 'dsv4p'])
 @pytest.mark.parametrize('rows', [1, 16, 64])
-def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows, tmp_path):
+def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows, geometry_name, tmp_path):
     require_b12x()
     from b12x.integration.cuteafd import exportable_compilation
-    from b12x.integration.cuteafd.kimi_dsa import KimiDsaGeometry
     from b12x.integration.cuteafd.context_split import compile_scored_index_topk_aot
     from b12x.attention.dsa_indexer.reference import pack_index_k_cache_reference
 
     from ..moe.segment_aot import ExportedProgram
 
+    from b12x.integration.cuteafd._common import GLM53, GLM53_FLASH, FLASH, PRO
+
+    geometry = {'glm-k31-ml4': GLM53, 'glmf': GLM53_FLASH, 'dsv4f': FLASH, 'dsv4p': PRO}[geometry_name]
+    heads = 64 if geometry_name.startswith('dsv4') else 32
+    topk = geometry.index_topk // (4 if geometry_name == 'glmf' else 1)
     capacity = 1025
-    compiled_capacity = 16384
+    compiled_capacity = 16384 if geometry_name == 'glm-k31-ml4' else 4096
     with exportable_compilation():
-        program = compile_scored_index_topk_aot(KimiDsaGeometry(), max_rows=64,
+        program = compile_scored_index_topk_aot(geometry, max_rows=64,
                                                 max_pages=compiled_capacity, mode='decode')
     exported = ExportedProgram(program, tmp_path, "selector")
     device = torch.device('cuda')
@@ -36,11 +41,11 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows,
     cache = pack_index_k_cache_reference(keys)
     table = torch.full((rows, capacity), -1, dtype=torch.int32, device=device)
     table[:, :maximum] = torch.arange(maximum, device=device, dtype=torch.int32)
-    q = torch.randn((rows, 32, 128), generator=generator).to(device).to(torch.float8_e4m3fn)
-    weights = (torch.randn((rows, 32), generator=generator) * .02).to(device)
+    q = torch.randn((rows, heads, 128), generator=generator).to(device).to(torch.float8_e4m3fn)
+    weights = (torch.randn((rows, heads), generator=generator) * .02).to(device)
     lengths = torch.zeros(rows, dtype=torch.int32, device=device)
-    indices = torch.empty((rows, 2048), dtype=torch.int32, device=device)
-    scores = torch.empty((rows, 2048), dtype=torch.float32, device=device)
+    indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
     contract = program.geometry["admitted_tile"]
     assert contract["capacity_pages"] == compiled_capacity
     prefix = contract["prefix_bytes"]
@@ -71,7 +76,7 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows,
         assert torch.equal(indices, expected_i), (rows, pages, 'indices')
         assert torch.equal(scores.view(torch.uint8), expected_s.view(torch.uint8)), (rows, pages, 'scores')
         for row in range(rows):
-            assert int((indices[row] >= 0).sum()) == min(int(lengths[row]), 2048)
+            assert int((indices[row] >= 0).sum()) == min(int(lengths[row]), topk)
         if pages in (10, 20, 65, 130, 513, 1025):
             exact_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(exact_graph):
@@ -89,9 +94,9 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows,
                 return start.elapsed_time(end) * 1000 / 20
             exact_us = measure(exact_graph.replay)
             capacity_us = measure(graph.replay)
-            curve.append(dict(rows=rows, pages=pages, exact_live_us=exact_us,
+            curve.append(dict(geometry=geometry_name, rows=rows, pages=pages, exact_live_us=exact_us,
                               admitted_us=capacity_us, admitted_over_exact=capacity_us / exact_us))
     print('CONTEXT_LIVE_WIDTH_CURVE=' + json.dumps(curve), flush=True)
     if output := os.environ.get('CUTEAFD_CONTEXT_WIDTH_RECEIPTS'):
         Path(output).mkdir(parents=True, exist_ok=True)
-        (Path(output) / f'rows-{rows}.json').write_text(json.dumps(curve, indent=2) + '\n')
+        (Path(output) / f'{geometry_name}-rows-{rows}.json').write_text(json.dumps(curve, indent=2) + '\n')
