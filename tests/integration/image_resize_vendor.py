@@ -10,14 +10,16 @@ SHA256="0d91b9e2b3f76a18c2028aa98232c20e45fc7759d40acb60c4385156bf338e1e"
 
 
 @functools.cache
-def coefficients():
+def coefficients(filter="bicubic"):
     from torch.utils.cpp_extension import load_inline
     path=Path(os.environ["CUTEAFD_PE_VENDOR_DIR"])/"UpSample-pinned.cuh"
     raw=path.read_bytes()
     if hashlib.sha256(raw).hexdigest()!=SHA256:
         raise ValueError("installed ATen CUDA resize source differs")
     source=raw.decode()
-    start=source.index("struct BicubicFilterFunctor")
+    if filter not in ("bicubic","bilinear"):
+        raise ValueError("unsupported vendor tensor filter")
+    start=source.index("struct BilinearFilterFunctor")
     end=source.index("template <typename scalar_t, typename accscalar_t>\n__device__ __forceinline__ accscalar_t interpolate_aa_single_dim",start)
     definitions=source[start:end]
     cuda="""
@@ -42,8 +44,10 @@ std::vector<torch::Tensor> resize_weights(int64_t input,int64_t output,int64_t t
  return {indices,sizes,weights};
 }
 """
+    if filter=="bilinear":
+        cuda=cuda.replace("2.f*scale:2.f","1.f*scale:1.f").replace("BicubicFilterFunctor{}","BilinearFilterFunctor{}")
     os.environ.setdefault("MAX_JOBS","2")
-    module=load_inline(name="pe_aten_weights_"+SHA256[:12],
+    module=load_inline(name="pe_aten_weights_"+filter+"_"+SHA256[:12],
         cpp_sources="std::vector<torch::Tensor> resize_weights(int64_t input,int64_t output,int64_t taps);",
         cuda_sources=cuda,functions=["resize_weights"],extra_cuda_cflags=["-O2"],verbose=False)
     return module.resize_weights
