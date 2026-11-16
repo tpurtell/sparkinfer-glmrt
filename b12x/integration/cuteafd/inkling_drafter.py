@@ -303,10 +303,10 @@ class _ResidualNorm:
 
 
 class _QKNormRope:
-    def __init__(self, q_heads, kv_heads, normalize=True):
+    def __init__(self, q_heads, kv_heads, normalize=True, rotate=True):
         self.q_heads, self.kv_heads = q_heads, kv_heads
         self.heads = q_heads + 2 * kv_heads
-        self.normalize = normalize
+        self.normalize, self.rotate = normalize, rotate
 
     @cute.jit
     def __call__(self, qkv: cute.Pointer, q_gamma: cute.Pointer,
@@ -353,6 +353,8 @@ class _QKNormRope:
         result = _sub(_mul(first, cosine), _mul(second, sine))
         if column >= 64:
             result = add_rn(_mul(second, cosine), _mul(first, sine))
+        if cutlass.const_expr(not self.rotate):
+            result = normalized[column]
         if head < self.q_heads:
             q_out[(Int64(row) * Int64(self.q_heads) + Int64(head)) * 128 + Int64(column)] = BFloat16(result)
         else:

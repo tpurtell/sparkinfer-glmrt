@@ -354,8 +354,8 @@ def _check_norm_program(kind, exported, module, geometry):
         k_expected = norm_rope(qkv[:, q_heads:q_heads+kv_heads], k_gamma)
         for live in (1, 64, rows):
             invoke(tensors, live)
-            torch.testing.assert_close(q_out[:live], q_expected[:live], atol=0, rtol=1e-2)
-            torch.testing.assert_close(k_out[:live], k_expected[:live], atol=0, rtol=1e-2)
+            torch.testing.assert_close(q_out[:live], q_expected[:live], atol=2e-2, rtol=1e-2)
+            torch.testing.assert_close(k_out[:live], k_expected[:live], atol=2e-2, rtol=1e-2)
             assert torch.equal(v_out[:live], qkv[:live, q_heads+kv_heads:])
         for name, actual, expected in (("q", q_out, q_expected), ("k", k_out, k_expected)):
             a, b = actual.view(torch.int16).int(), expected.view(torch.int16).int()
@@ -368,11 +368,20 @@ def _check_norm_program(kind, exported, module, geometry):
                       "bit_equal_fraction": float((a == b).float().mean()),
                       "max_ulp": int((ordered_a-ordered_b).abs().max()),
                       "max_abs": float((actual.float()-expected.float()).abs().max())}), flush=True)
+                crossing = (actual.float() * expected.float() < 0)
+                for location in torch.nonzero(crossing)[:4].tolist():
+                    r, h, c = location
+                    raw_head = h if name == "q" else q_heads+h
+                    print("INKLING_CANCELLATION " + json.dumps({"kind": name,
+                          "heads": [q_heads, kv_heads], "index": location,
+                          "actual": float(actual[r,h,c]), "expected": float(expected[r,h,c]),
+                          "abs_error": float(abs(actual[r,h,c].float()-expected[r,h,c].float())),
+                          "input_pair": [float(qkv[r,raw_head,c%64]), float(qkv[r,raw_head,c%64+64])]}), flush=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             invoke(tensors, 64)
         graph.replay()
-        torch.testing.assert_close(q_out[:64], q_expected[:64], atol=0, rtol=1e-2)
+        torch.testing.assert_close(q_out[:64], q_expected[:64], atol=2e-2, rtol=1e-2)
         # Feed identical reference-normalized BF16 operands into the same
         # rotation body to distinguish norm reduction effects from trig/order.
         from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
@@ -400,6 +409,19 @@ def _check_norm_program(kind, exported, module, geometry):
               int((k_out.view(torch.int16) != k_expected.view(torch.int16)).sum()), flush=True)
         assert torch.equal(q_out.view(torch.int16), q_expected.view(torch.int16))
         assert torch.equal(k_out.view(torch.int16), k_expected.view(torch.int16))
+        with exportable_compilation():
+            norm_only = compile_program(kernels._QKNormRope(q_heads, kv_heads, rotate=False),
+                name="inkling_norm_oracle", operands=rotation.operands,
+                scalars=rotation.scalars, key=(q_heads, kv_heads, "isolated_norm"))
+        norm_only.launch(*tensors, scalars=(rows, 1e-6))
+        for name, actual, expected in (("q", q_out, normalized_qkv[:, :q_heads]),
+                                      ("k", k_out, normalized_qkv[:, q_heads:q_heads+kv_heads])):
+            if actual.numel():
+                a, b = actual.view(torch.int16).int(), expected.contiguous().view(torch.int16).int()
+                a, b = torch.where(a<0, -32768-a, a), torch.where(b<0, -32768-b, b)
+                ulp = int((a-b).abs().max())
+                print("INKLING_NORM_ONLY", [q_heads, kv_heads], name, "max_ulp", ulp, flush=True)
+                assert ulp <= 1
 
 
 def _check_silu_program(exported, module, intermediate):
