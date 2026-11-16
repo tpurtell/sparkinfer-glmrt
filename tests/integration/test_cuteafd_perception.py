@@ -42,8 +42,7 @@ def test_quick_gelu_preserves_bf16_boundaries(width,bf16_intermediates):
     require_b12x()
     from b12x.integration.cuteafd.perception import compile_quick_gelu_aot
     x = torch.linspace(-12,12,width*17,device="cuda").bfloat16().reshape(17,width)
-    reference_input = x if bf16_intermediates else x.float()
-    ref = vendor.step5().forward_native(None,reference_input).bfloat16()
+    ref = vendor.step5().forward_native(None,x) if bf16_intermediates else vendor.fused_quick_gelu()(x)
     out = torch.empty_like(x)
     program = compile_quick_gelu_aot(width=width,bf16_intermediates=bf16_intermediates)
     program.launch(x,out,scalars=[17])

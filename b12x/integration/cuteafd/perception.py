@@ -58,10 +58,12 @@ class QuickGelu:
             scaled = _mul(value, Float32(1.702))
             if cutlass.const_expr(self.bf16_intermediates):
                 scaled = Float32(scaled.to(BFloat16))
-            sigmoid = div_rn_f32(Float32(1.0), _add(Float32(1.0), cute.math.exp(-scaled, fastmath=False)))
+            denominator = _add(Float32(1.0), cute.math.exp(-scaled, fastmath=False))
             if cutlass.const_expr(self.bf16_intermediates):
-                sigmoid = Float32(sigmoid.to(BFloat16))
-            out[at] = _mul(value, sigmoid).to(BFloat16)
+                sigmoid = Float32(div_rn_f32(Float32(1.0),denominator).to(BFloat16))
+                out[at] = _mul(value,sigmoid).to(BFloat16)
+            else:
+                out[at] = div_rn_f32(value,denominator).to(BFloat16)
 
 
 class Rotary2D:

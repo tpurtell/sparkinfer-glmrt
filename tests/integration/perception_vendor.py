@@ -13,6 +13,7 @@ SOURCES = {
     "step_vl.py":"348a7e4d5260d68232d91fe13a3b1a9a6badca4799457f1b7c8a1a8a112adcb2",
     "activation.py":"ad0c12977ac901c38bffd94b0068236a639647e5f65e9c1b78d97e30d27d590a",
     "test_vision.py":"1eddd2ebd456927558a2fd3217335c35d2b3ef2dcbf9af8b76748cf592622f97",
+    "activation_kernels.cu":"27ba079b069fab4fa633b0ed23aad7fee6428c2a31330013dc98a1e2a6ef1e08",
 }
 
 
@@ -64,6 +65,39 @@ def step5():
     method = next(node for node in quick.body if isinstance(node,ast.FunctionDef) and node.name=="forward_native")
     exec(compile(ast.Module(body=[method],type_ignores=[]),filename,"exec"),namespace)
     return types.SimpleNamespace(**namespace)
+
+
+@functools.cache
+def fused_quick_gelu():
+    """Compile the actual pinned CUDA scalar body, not its eager approximation."""
+    from torch.utils.cpp_extension import load_inline
+    raw = (Path(os.environ["CUTEAFD_PE_VENDOR_DIR"])/"activation_kernels.cu").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != SOURCES["activation_kernels.cu"]:
+        raise ValueError("PE vendor CUDA source hash mismatch")
+    source = raw.decode()
+    start = source.index("template <typename T>\n__device__ __forceinline__ T gelu_quick_kernel")
+    end = source.index("\n}",start)+2
+    definition = source[start:end]
+    cuda_source = """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+"""+definition+"""
+__global__ void invoke(const at::BFloat16* x,at::BFloat16* out,int64_t count) {
+ int64_t at=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+ if(at<count)out[at]=gelu_quick_kernel(x[at]);
+}
+torch::Tensor vendor_quick(torch::Tensor x) {
+ auto out=torch::empty_like(x);
+ invoke<<<(x.numel()+255)/256,256,0,at::cuda::getCurrentCUDAStream()>>>(
+  x.data_ptr<at::BFloat16>(),out.data_ptr<at::BFloat16>(),x.numel());
+ return out;
+}
+"""
+    os.environ.setdefault("MAX_JOBS","2")
+    module = load_inline(name="pe_vendor_quick_"+SOURCES["activation_kernels.cu"][:12],
+        cpp_sources="torch::Tensor vendor_quick(torch::Tensor x);",cuda_sources=cuda_source,
+        functions=["vendor_quick"],extra_cuda_cflags=["-O2"],verbose=False)
+    return module.vendor_quick
 
 
 def merge(hidden,height,width,channels,class_token):
