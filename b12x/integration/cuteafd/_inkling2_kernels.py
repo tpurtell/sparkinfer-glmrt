@@ -85,10 +85,15 @@ class InklingGqaAttention(MimoGqaAttention):
 
     def __init__(self, *, heads: int, kv_heads: int, tokens: int, window: int, paged: bool, extent: int,
                  softmax_scale: float, direct: bool = True, page_rows: int = 64, ring_rows: int = 2048,
-                 kv_warps: int = 4):
+                 kv_warps: int = 4, kv_format: str = "bf16"):
         super().__init__(heads=heads, kv_heads=kv_heads, tokens=tokens, window=window, paged=paged, sink=True,
                          direct=direct, softmax_scale=softmax_scale, page_rows=page_rows, ring_rows=ring_rows,
                          head=128, v_head=128, kv_warps=kv_warps)
+        self.kv_format = kv_format
+        if kv_format not in ("bf16", "fp8") or (kv_format == "fp8" and not paged):
+            raise ValueError("Inkling FP8 records are global only")
+        self.record_bytes = 2112 if kv_format == "fp8" else 4096
+        self.scale_offset = 2048 if kv_format == "fp8" else 0
         self.extent = int(extent)
         if self.extent <= 0:
             raise ValueError("the relative bias extent must be positive")
@@ -109,20 +114,20 @@ class InklingGqaAttention(MimoGqaAttention):
         self.pipe_kv = self.tile_m == self.tile_n
 
     def key(self) -> tuple:
-        return (*super().key(), "inkling2", self.extent)
+        return (*super().key(), "inkling2_cache_v2", self.extent, self.kv_format)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
-                 page_table: cute.Pointer, ring_slots: cute.Pointer, seq_first: cute.Pointer,
+                 page_table: cute.Pointer, table_indices: cute.Pointer, tile_rows: cute.Pointer, ring_slots: cute.Pointer, seq_first: cute.Pointer,
                  rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, partial_out: cute.Pointer,
-                 partial_lse: cute.Pointer, rows: Int32, table_stride: Int32, splits: Int32, stream: cuda.CUstream):
+                 partial_lse: cute.Pointer, rows: Int32, table_stride: Int32, tiles: Int32, splits: Int32, stream: cuda.CUstream):
         q_layout, k_layout, v_layout, p_layout = self._layouts()
         if const_expr(self.pipe_kv):
             q_layout = k_layout
-        self.kernel(q, cache, kv_step, positions, page_table, ring_slots, seq_first, rel, sinks, out, partial_out,
-                    partial_lse, rows, table_stride, splits, q_layout, k_layout, v_layout, p_layout,
+        self.kernel(q, cache, kv_step, positions, page_table, table_indices, tile_rows, ring_slots, seq_first, rel, sinks, out, partial_out,
+                    partial_lse, rows, table_stride, tiles, splits, q_layout, k_layout, v_layout, p_layout,
                     self._tiled_mma_qk(), self._tiled_mma_pv()).launch(
-            grid=((rows + Int32(self.tokens - 1)) // Int32(self.tokens), self.kv_heads, splits),
+            grid=(tiles, self.kv_heads, splits),
             block=(self.threads, 1, 1), stream=stream)
 
     @cute.jit
@@ -134,21 +139,23 @@ class InklingGqaAttention(MimoGqaAttention):
         group 2 stages ``V``."""
         k_vectors = self.head // 8
         cache_fallback = Int64(cache.toint())
-        for it_k in cutlass.range_constexpr(self.tile_n * k_vectors // self.threads):
-            linear_k = thread + Int32(it_k * self.threads)
-            token = linear_k // Int32(k_vectors)
-            dim = (linear_k % Int32(k_vectors)) * Int32(8)
-            base_addr = Int64(key_addr[buf, token])
-            valid_k = base_addr >= Int64(0)
-            src_k = cutlass.select_(
-                valid_k, base_addr + (Int64(kv_head) * Int64(self.head) + Int64(dim)) * Int64(2), cache_fallback
-            )
-            _cp_async_load_128b_zfill(
-                shared_ptr_to_u32(s_k.iterator + cute.crd2idx((token, dim), s_k.layout)),
-                src_k,
-                cutlass.select_(valid_k, Int32(16), Int32(0)),
-            )
-
+        if const_expr(self.kv_format == "fp8"):
+            self._stage_fp8_plane(key_addr, buf, kv_head, s_k, thread, False)
+        else:
+            for it_k in cutlass.range_constexpr(self.tile_n * k_vectors // self.threads):
+                linear_k = thread + Int32(it_k * self.threads)
+                token = linear_k // Int32(k_vectors)
+                dim = (linear_k % Int32(k_vectors)) * Int32(8)
+                base_addr = Int64(key_addr[buf, token])
+                valid_k = base_addr >= Int64(0)
+                src_k = cutlass.select_(
+                    valid_k, base_addr + (Int64(kv_head) * Int64(self.head) + Int64(dim)) * Int64(2), cache_fallback
+                )
+                _cp_async_load_128b_zfill(
+                    shared_ptr_to_u32(s_k.iterator + cute.crd2idx((token, dim), s_k.layout)),
+                    src_k,
+                    cutlass.select_(valid_k, Int32(16), Int32(0)),
+                )
         k0 = lo + Int64(tile) * Int64(self.tile_n)
         skip_rel = Int32(0)
         if const_expr(self.window == 0):
@@ -189,23 +196,43 @@ class InklingGqaAttention(MimoGqaAttention):
 
         v_vectors = self.v_head // 8
         v0 = self.kv_heads * self.head
-        for it_v in cutlass.range_constexpr(self.tile_n * v_vectors // self.threads):
-            linear_v = thread + Int32(it_v * self.threads)
-            token_v = linear_v // Int32(v_vectors)
-            dim_v = (linear_v % Int32(v_vectors)) * Int32(8)
-            base_addr_v = Int64(key_addr[buf, token_v])
-            valid_v = base_addr_v >= Int64(0)
-            src_v = cutlass.select_(
-                valid_v,
-                base_addr_v + (Int64(v0) + Int64(kv_head) * Int64(self.v_head) + Int64(dim_v)) * Int64(2),
-                cache_fallback,
-            )
-            _cp_async_load_128b_zfill(
-                shared_ptr_to_u32(s_v.iterator + cute.crd2idx((token_v, dim_v), s_v.layout)),
-                src_v,
-                cutlass.select_(valid_v, Int32(16), Int32(0)),
-            )
+        if const_expr(self.kv_format == "fp8"):
+            self._stage_fp8_plane(key_addr, buf, kv_head, s_v, thread, True)
+        else:
+            for it_v in cutlass.range_constexpr(self.tile_n * v_vectors // self.threads):
+                linear_v = thread + Int32(it_v * self.threads)
+                token_v = linear_v // Int32(v_vectors)
+                dim_v = (linear_v % Int32(v_vectors)) * Int32(8)
+                base_addr_v = Int64(key_addr[buf, token_v])
+                valid_v = base_addr_v >= Int64(0)
+                src_v = cutlass.select_(
+                    valid_v,
+                    base_addr_v + (Int64(v0) + Int64(kv_head) * Int64(self.v_head) + Int64(dim_v)) * Int64(2),
+                    cache_fallback,
+                )
+                _cp_async_load_128b_zfill(
+                    shared_ptr_to_u32(s_v.iterator + cute.crd2idx((token_v, dim_v), s_v.layout)),
+                    src_v,
+                    cutlass.select_(valid_v, Int32(16), Int32(0)),
+                )
         cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def _stage_fp8_plane(self, key_addr: cute.Tensor, buf: Int32, kv_head: Int32,
+                         shared: cute.Tensor, thread: Int32, value: cutlass.Constexpr):
+        for it in cutlass.range_constexpr(self.tile_n * 128 // self.threads):
+            index = thread + Int32(it * self.threads)
+            token, dim = index // Int32(128), index % Int32(128)
+            base = Int64(key_addr[buf, token])
+            result = Float32(0.0)
+            if base >= Int64(0):
+                plane = 8 if value else 0
+                payload = cute.make_ptr(cutlass.Float8E4M3FN, base, cute.AddressSpace.gmem, assumed_align=16)
+                scales = cute.make_ptr(Float32, base + Int64(self.scale_offset),
+                                       cute.AddressSpace.gmem, assumed_align=4)
+                result = Float32(payload[Int64(plane * 128) + Int64(kv_head) * Int64(128) + Int64(dim)]) \
+                    * Float32(scales[Int64(plane) + Int64(kv_head)])
+            shared[token, dim] = result.to(BFloat16)
 
     @cute.jit
     def _qk_bias_softmax(self, buf: Int32, k0: Int64, p_min: Int64, p_max: Int64, live: Int32,
@@ -441,19 +468,24 @@ class InklingGqaAttention(MimoGqaAttention):
 
     @cute.kernel
     def kernel(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
-               page_table: cute.Pointer, ring_slots: cute.Pointer, seq_first: cute.Pointer, rel: cute.Pointer,
+               page_table: cute.Pointer, table_indices: cute.Pointer, tile_rows: cute.Pointer, ring_slots: cute.Pointer, seq_first: cute.Pointer, rel: cute.Pointer,
                sinks: cute.Pointer, out: cute.Pointer, partial_out: cute.Pointer, partial_lse: cute.Pointer,
-               rows: Int32, table_stride: Int32, splits: Int32, q_layout: cute.ComposedLayout,
+               rows: Int32, table_stride: Int32, tiles: Int32, splits: Int32, q_layout: cute.ComposedLayout,
                k_layout: cute.ComposedLayout, v_layout: cute.ComposedLayout, p_layout: cute.ComposedLayout,
                tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma):
         block, kv_head_idx, split_idx = cute.arch.block_idx()
         thread = Int32(cute.arch.thread_idx()[0])
         kv_head = Int32(kv_head_idx)
         split = Int32(split_idx)
-        row0 = Int64(block) * Int64(self.tokens)
+        row0 = Int64(tile_rows[Int64(block)])
         live = Int32(rows) - Int32(row0)
         if live > Int32(self.tokens):
             live = Int32(self.tokens)
+        # Segment starts are absolute packed-row indices, not logical positions.
+        for t in cutlass.range_constexpr(1, self.tokens):
+            if Int32(t) < live:
+                if seq_first[row0 + Int64(t)] != seq_first[row0]:
+                    live = Int32(t)
 
         allocator = cutlass.utils.SmemAllocator()
         s_k0 = allocator.allocate_tensor(element_type=BFloat16, layout=k_layout, byte_alignment=1024)
@@ -526,7 +558,7 @@ class InklingGqaAttention(MimoGqaAttention):
         step_first = Int64(0)
         ring_base = Int64(0)
         if const_expr(self.paged):
-            table_base = row0 * Int64(table_stride)
+            table_base = Int64(table_indices[row0]) * Int64(table_stride)
         else:
             first_t = cute.make_tensor(seq_first, cute.make_layout((Int64(rows),)))
             ring_t = cute.make_tensor(ring_slots, cute.make_layout((Int64(rows),)))
