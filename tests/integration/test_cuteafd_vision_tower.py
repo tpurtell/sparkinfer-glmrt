@@ -34,7 +34,8 @@ def test_compiled_bilinear_position_reuses_one_program_across_grids():
             assert digest == "271f0789a7cc129ade052b640f64de0c0f9eaa398d9904b3926a8a03070c6d53"
     # Live geometry changes use the resolved callable, including frozen replay.
     expected = _official_shape(table, (14, 28))
-    out = torch.empty_like(expected)
+    # Compiled permute output may be a noncontiguous view; the raw ABI requires raster storage.
+    out = torch.empty(expected.shape, device=expected.device, dtype=expected.dtype)
     with kernel_resolution_guard():
         program.launch(table, out, scalars=[14, 28])
     assert torch.equal(out, expected)
