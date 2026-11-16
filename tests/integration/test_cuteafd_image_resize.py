@@ -24,6 +24,16 @@ def _coeff(program,size,out):
     sizes=torch.empty_like(indices)
     weights=torch.empty(out,taps,device="cuda")
     program.launch(indices,sizes,weights,scalars=[size,out,taps])
+    from .image_resize_vendor import coefficients
+    ri,rn,rw=coefficients()(size,out,taps)
+    error=(weights-rw).abs()
+    equal=int((weights.view(torch.int32)==rw.view(torch.int32)).sum())
+    worst=int(error.flatten().argmax())
+    print(f"RESIZE_WEIGHTS input={size} output={out} max_abs={float(error.max()):.9g} bit_equal={equal/weights.numel():.12f} worst_row={worst//taps} ours={weights[worst//taps].tolist()} vendor={rw[worst//taps].tolist()}",flush=True)
+    dump=Path(os.environ["TORCH_EXTENSIONS_DIR"])/f"resize-weights-{size}-{out}.pt"
+    torch.save(dict(indices=indices.cpu(),sizes=sizes.cpu(),weights=weights.cpu(),vendor_indices=ri.cpu(),vendor_sizes=rn.cpu(),vendor_weights=rw.cpu()),dump)
+    assert torch.equal(indices,ri) and torch.equal(sizes,rn)
+    assert torch.equal(weights,rw)
     return indices,sizes,weights,taps
 
 
