@@ -94,9 +94,11 @@ def test_oracle_and_graph(program):
     else:
         inputs = [torch.randn(maximum, 768, device="cuda") * 4,
                   torch.randn(maximum, 256, device="cuda", dtype=torch.bfloat16)]
+        inputs[0][0] = torch.linspace(-90, 90, 768, device="cuda")
         outputs = [torch.empty_like(inputs[1]), torch.empty_like(inputs[1])]
         expected = list(_reference_gate(*inputs))
     tensors = inputs + outputs
+    saved_inputs = [tensor.clone() for tensor in inputs]
 
     def launch(rows):
         scalars = (rows, 1e-6) if kind == "dflare_mix" else (rows,)
@@ -112,11 +114,11 @@ def test_oracle_and_graph(program):
             assert torch.isnan(actual[rows:]).all()
 
     with kernel_resolution_guard("Inkling primitives compiled before all live row counts"):
-        for rows in (0, 1, 17, maximum):
+        for rows in (0, 1, 17, maximum, maximum + 1):
             for out in outputs:
                 out.fill_(float("nan"))
             launch(rows)
-            check(rows)
+            check(rows if rows <= maximum else 0)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch(maximum)
@@ -126,27 +128,51 @@ def test_oracle_and_graph(program):
             graph.replay()
             check(maximum)
 
-    # Queue many kernel nodes in one replay: Python/ctypes submission gaps are
-    # larger than these tiny decode operations and are not device execution.
-    timed_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(timed_graph):
-        for _ in range(100):
-            launch(maximum)
-    timed_graph.replay()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
-    timed_graph.replay()
-    end.record()
-    end.synchronize()
-    receipt = {"primitive": kind, "rows": maximum, "warmed_us": start.elapsed_time(end) * 10,
-               "device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
-               "oracle": "vendor tolerance" if kind == "dflare_mix" else "bit-exact"}
+    for actual, saved in zip(inputs, saved_inputs):
+        assert torch.equal(actual.view(torch.uint8), saved.view(torch.uint8))
+    # A captured object must read the current input, not an accidental constant
+    # fixture or stale temporary. Restore before taking timing receipts.
+    inputs[0].zero_()
     if kind == "dflare_mix":
-        a, e = outputs[0].view(torch.int16).int(), expected[0].view(torch.int16).int()
-        receipt.update(bit_equal_fraction=float((a == e).float().mean()), max_ulp=int((a - e).abs().max()))
-    print("INKLING_RECEIPT " + json.dumps(receipt, sort_keys=True), flush=True)
-    destination = os.environ.get("INKLING_RECEIPTS")
-    if destination:
-        path = Path(destination)
-        path.mkdir(parents=True, exist_ok=True)
-        (path / (kind + ".json")).write_text(json.dumps(receipt, indent=2) + "\n")
+        expected = [_reference_mix(*inputs)]
+    elif kind == "mask_init":
+        expected[0][:, 0].zero_()
+    else:
+        expected = list(_reference_gate(*inputs))
+    graph.replay()
+    check(maximum)
+    for actual, saved in zip(inputs, saved_inputs):
+        actual.copy_(saved)
+    launch(maximum)
+
+    # Queue many nodes in one replay to exclude Python/ctypes submission gaps.
+    # Bandwidth is logical device traffic (cache reuse allowed), not DRAM BW.
+    for rows in (1, maximum):
+        timed_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(timed_graph):
+            for _ in range(100):
+                launch(rows)
+        timed_graph.replay()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        timed_graph.replay()
+        end.record()
+        end.synchronize()
+        elapsed = start.elapsed_time(end) * 10
+        logical_bytes = {"dflare_mix": rows * 4608 * 18 + 2 * (4608 + 8),
+                         "mask_init": rows * 8 * 4608 * 4,
+                         "recurrent_gate": rows * 256 * (3 * 4 + 3 * 2)}[kind]
+        receipt = {"primitive": kind, "rows": rows, "warmed_us": elapsed,
+                   "logical_bytes": logical_bytes, "logical_gbps": logical_bytes / (elapsed * 1000),
+                   "device": torch.cuda.get_device_name(), "capability": torch.cuda.get_device_capability(),
+                   "oracle": "vendor tolerance" if kind == "dflare_mix" else "bit-exact"}
+        if kind == "dflare_mix":
+            reference = _reference_mix(*inputs)
+            a, e = outputs[0][:rows].view(torch.int16).int(), reference[:rows].view(torch.int16).int()
+            receipt.update(bit_equal_fraction=float((a == e).float().mean()), max_ulp=int((a - e).abs().max()))
+        print("INKLING_RECEIPT " + json.dumps(receipt, sort_keys=True), flush=True)
+        destination = os.environ.get("INKLING_RECEIPTS")
+        if destination:
+            path = Path(destination)
+            path.mkdir(parents=True, exist_ok=True)
+            (path / f"{kind}-{rows}.json").write_text(json.dumps(receipt, indent=2) + "\n")
