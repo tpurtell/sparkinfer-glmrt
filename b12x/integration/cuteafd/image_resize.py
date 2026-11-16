@@ -27,7 +27,7 @@ class NormalizeRgb:
         at=Int64(cute.arch.block_idx()[0])*256+Int64(cute.arch.thread_idx()[0])
         if at<count:
             channel=at%3
-            value=div_rn_f32(Float32(Uint32(rgb[at])),Float32(255.0))
+            value=_mul(Float32(Uint32(rgb[at])),Float32(1.0/255.0))
             out[at]=div_rn_f32(_sub(value,Float32(mean[channel])),Float32(std[channel]))
 
 
@@ -143,7 +143,7 @@ def compile_rgb_normalize_aot():
     return compile_program(NormalizeRgb(),name="image_rgb_normalize",operands=(
         Operand("rgb",torch.uint8,"[height,width,3]"),Operand("mean",torch.float32,"[3]",align=4),
         Operand("std",torch.float32,"[3]",align=4),Operand("out",torch.float32,"[height,width,3]","out")),
-        scalars=(Scalar("height"),Scalar("width")),key=(),geometry=dict(channels=3),version=2)
+        scalars=(Scalar("height"),Scalar("width")),key=(),geometry=dict(channels=3),version=3)
 
 
 def compile_resize_coefficients_aot(*,filter="bicubic",antialias=True):
