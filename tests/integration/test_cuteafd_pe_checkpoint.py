@@ -38,11 +38,15 @@ def _official(cfg):
     # this full-transformer oracle begins at normalized native patch rows.
     def flash(q,k,v,**kwargs):
         assert kwargs["causal"] is False
-        out=F.scaled_dot_product_attention(q.transpose(0,1)[None],k.transpose(0,1)[None],v.transpose(0,1)[None],scale=kwargs["softmax_scale"])
+        from torch.nn.attention import sdpa_kernel,SDPBackend
+        with sdpa_kernel(SDPBackend.MATH):
+            out=F.scaled_dot_product_attention(q.transpose(0,1)[None],k.transpose(0,1)[None],v.transpose(0,1)[None],scale=kwargs["softmax_scale"])
         return out[0].transpose(0,1).contiguous(),None
     namespace["flash_attn_varlen_func"]=flash
     def fp32_flash(q,k,v,**kwargs):
-        out=F.scaled_dot_product_attention(q.float().transpose(0,1)[None],k.float().transpose(0,1)[None],v.float().transpose(0,1)[None],scale=kwargs["softmax_scale"])
+        from torch.nn.attention import sdpa_kernel,SDPBackend
+        with sdpa_kernel(SDPBackend.MATH):
+            out=F.scaled_dot_product_attention(q.float().transpose(0,1)[None],k.float().transpose(0,1)[None],v.float().transpose(0,1)[None],scale=kwargs["softmax_scale"])
         return out[0].transpose(0,1).contiguous().bfloat16(),None
     namespace["fp32_flash_attn_varlen_func"]=fp32_flash
     tree=ast.parse(raw)
@@ -65,6 +69,9 @@ def _weights(snapshot):
     return result
 
 
+FINDINGS=[]
+
+
 def _metric(name,actual,reference,*,teacher=False,final=False):
     a,r=actual.float(),reference.float()
     error=(a-r).abs()
@@ -74,14 +81,19 @@ def _metric(name,actual,reference,*,teacher=False,final=False):
     result=dict(name=name,max_abs=error.max().item(),relative_l2=relative.item(),min_token_cosine=cosine,bit_equal=equal)
     print("PE_CHECKPOINT "+json.dumps(result,sort_keys=True),flush=True)
     assert torch.isfinite(a).all()
-    if teacher:assert relative<=2e-3 and equal>=.85,result
-    if final:assert relative<=1e-2 and cosine>=.9999,result
+    if teacher and not (relative<=2e-3 and equal>=.85):FINDINGS.append(result)
+    if final and not (relative<=1e-2 and cosine>=.9999):FINDINGS.append(result)
     return result
 
 
 @pytest.mark.parametrize("image_index",[0])
 def test_inkling_full_checkpoint_native_transformer(image_index):
     require_b12x()
+    FINDINGS.clear()
+    print("PE_REFERENCE_BACKENDS "+json.dumps(dict(bf16="SDPBackend.MATH",fp32="SDPBackend.MATH",
+        device=torch.cuda.get_device_name(),capability=torch.cuda.get_device_capability(),
+        matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+        allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)),flush=True)
     from PIL import Image
     import numpy as np
     from b12x.integration.cuteafd.media import compile_biased_projection_aot,compile_patch_projection_aot,compile_gelu_aot,compile_vision_attention_aot
@@ -155,6 +167,41 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         down.launch(mlp,state[base+"mlp.c_proj.weight"],state[base+"mlp.c_proj.bias"],delta,scalars=[n])
         residual.launch(middle,delta,state[base+"ls_2.gamma"],output,scalars=[n])
         return output
+    def probe_layer0(source):
+        layer=reference.backbone.layers[0];base="backbone.layers.0."
+        def compare(stage,a,r):return _metric("substage0_"+stage,a,r)
+        rnorm=layer.ln_1(source)
+        norm.launch(source,state[base+"ln_1.weight"],state[base+"ln_1.bias"],normed,scalars=[n,1e-5]);compare("norm1",normed,rnorm)
+        rqkv=layer.self_attn.qkv_proj(rnorm)
+        qproj.launch(rnorm,state[base+"self_attn.qkv_proj.weight"],state[base+"self_attn.qkv_proj.bias"],qkv,scalars=[n]);compare("qkv",qkv,rqkv)
+        print("PE_SUBSTAGE qk_norm=absent activation=exact_erf_GELU",flush=True)
+        rotated=rqkv.clone();vendor.inkling().apply_rotary_qk_(rotated,metadata.meta,16)
+        rotary.launch(rqkv,freq,q,k,v,scalars=[n,gw])
+        rq,rk,rv=rotated.reshape(n,3,16,64).unbind(1)
+        compare("rotary_q",q[:n],rq);compare("rotary_k",k[:n],rk)
+        bf16=reference._reference_globals["flash_attn_varlen_func"]
+        fp32=reference._reference_globals["fp32_flash_attn_varlen_func"]
+        args=dict(causal=False,softmax_scale=64**-.5)
+        rattention=bf16(rq,rk,rv,**args)[0];rattention32=fp32(rq,rk,rv,**args)[0]
+        q[:n].copy_(rq);k[:n].copy_(rk);v[:n].copy_(rv)
+        attention.launch(q,k,v,o,lse,cu,scalars=[64**-.5,l2])
+        compare("attention_vs_bf16_math",o[:n],rattention);compare("attention_vs_fp32_math",o[:n],rattention32)
+        compare("reference_bf16_vs_fp32_math",rattention,rattention32)
+        rprojection=layer.self_attn.out_proj(rattention.reshape(n,1024))
+        oproj.launch(rattention,state[base+"self_attn.out_proj.weight"],state[base+"self_attn.out_proj.bias"],delta,scalars=[n]);compare("o_projection",delta,rprojection)
+        rmid=source.clone();vendor.inkling().scaled_residual_norm_(rmid,rprojection,layer.ls_1.gamma,None)
+        residual.launch(source,rprojection,state[base+"ls_1.gamma"],tmp,scalars=[n]);compare("attention_scale_residual",tmp,rmid)
+        rnorm2=layer.ln_2(rmid)
+        norm.launch(rmid,state[base+"ln_2.weight"],state[base+"ln_2.bias"],normed,scalars=[n,1e-5]);compare("norm2",normed,rnorm2)
+        rfc1=layer.mlp.c_fc(rnorm2)
+        up.launch(rnorm2,state[base+"mlp.c_fc.weight"],state[base+"mlp.c_fc.bias"],mlp,scalars=[n]);compare("mlp_fc1",mlp,rfc1)
+        rgelu=torch.nn.functional.gelu(rfc1)
+        gelu.launch(rfc1,mlp,scalars=[n]);compare("gelu",mlp,rgelu)
+        rfc2=layer.mlp.c_proj(rgelu)
+        down.launch(rgelu,state[base+"mlp.c_proj.weight"],state[base+"mlp.c_proj.bias"],delta,scalars=[n]);compare("mlp_fc2",delta,rfc2)
+        rfinal=rmid.clone();vendor.inkling().scaled_residual_norm_(rfinal,rfc2,layer.ls_2.gamma,None)
+        residual.launch(rmid,rfc2,state[base+"ls_2.gamma"],tmp,scalars=[n]);compare("mlp_scale_residual",tmp,rfinal)
+    with torch.inference_mode():probe_layer0(xref)
     xref32=xref.clone();scope=reference._reference_globals
     bf16_attention=scope["flash_attn_varlen_func"]
     with torch.inference_mode():
@@ -186,3 +233,4 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         _metric("projected_embeddings_vs_bf16_attention",final,ref_final,final=True)
         _metric("projected_embeddings_vs_fp32_attention",final,ref_final32)
         _metric("reference_bf16_vs_fp32_attention",ref_final,ref_final32)
+        assert not FINDINGS,FINDINGS
