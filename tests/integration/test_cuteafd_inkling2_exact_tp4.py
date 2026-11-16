@@ -97,7 +97,7 @@ def test_tp4_w576_exported_object_matches_ordinary(name, tmp_path):
     print(f"{name} w576: exported object exact at rows 1,7,80,2752,4096 and graph replay")
 
 
-@pytest.mark.parametrize('k', [16, 48, 64, 112, 384, 448, 464, 560, 576, 592, 640, 768, 1040])
+@pytest.mark.parametrize('k', [16, 48, 64, 96, 112, 160, 208, 224, 320, 336, 352, 384, 400, 416, 432, 448, 464, 560, 576, 592, 608, 624, 640, 672, 688, 768, 1040])
 @pytest.mark.parametrize('n', [80, 128])
 def test_dynamic_down_native_k64_matches_exact_grid(k, n, tmp_path):
     require_b12x()

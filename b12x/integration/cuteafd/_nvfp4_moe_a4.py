@@ -296,13 +296,11 @@ class StreamNvfp4LinearA4:
         self.n_tiles = self.warp_cols // 8
         self.frags = 4 * self.m_tiles * self.n_tiles
         if self.n <= 0 or self.n % 16 or self.k <= 0 or self.k % 16:
-            raise ValueError("NVFP4 A4 linear needs positive K16-aligned N and K % 16 == 0")
+            raise ValueError("NVFP4 A4 linear needs positive N16-aligned N and K % 16 == 0")
         self.k_block = 256 if self.k % 256 == 0 else 128 if self.k % 128 == 0 else 64 if self.k % 64 == 0 else 128
         self.blocks = _ceil(self.k, self.k_block)
         self.row_bytes = self.k_block // 2
-        # Unpadded rows with a 32B-sector-preserving XOR swizzle on 16B pieces:
-        # both cp.async.cg.128 and ldmatrix.x4 hit all 32 banks without splitting
-        # odd rows across 32-byte L2 sectors.
+        # Shared rows retain a power-of-two pitch; global rows never gain padding.
         self.stride = self.row_bytes
         self.s_bytes = self.k_block // 16
         self.s_stride = self.s_bytes + 4
@@ -335,7 +333,12 @@ class StreamNvfp4LinearA4:
 
     @cute.jit
     def _swizzle(self, row):
-        return (((row & Int32(3)) << Int32(1)) | ((row >> Int32(2)) & Int32(1))) & Int32(self.row_bytes // 16 - 1)
+        # Rotate the three row bits within the actual row, never into its
+        # neighbour. For narrow rows the row stride supplies the high banks.
+        mask = min(self.row_bytes // 16 - 1, 7)
+        shift = min(self.row_bytes // 64, 2)
+        return (((row & Int32(3)) << Int32(1)) & Int32(mask if self.row_bytes >= 128 else 0)) \
+            | ((row >> Int32(max(shift, 1))) & Int32(1 if self.row_bytes >= 128 else mask))
 
     @cute.jit
     def _load(self, block, ring, a_rows: Int64, as_rows: Int64, w_rows: Int64, s_rows: Int64, live: Int32, tidx):
