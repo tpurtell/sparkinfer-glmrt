@@ -24,8 +24,9 @@ def test_checkpoint_selected_step5_processor_uses_actual_global_and_local_filter
         filters.append(resize.interpolation.value)
     print(f"STEP5_PROCESSOR filters={filters} global={chosen.image_size} local={chosen.patch_size}",flush=True)
     assert filters==["bilinear","bilinear"]
-    files=sorted(Path(os.environ["CUTEAFD_PE_REAL_IMAGES"]).glob("*.png"))
-    image=Image.open(files[-1]).convert("RGB")
+    root=Path(os.environ["CUTEAFD_PE_REAL_IMAGES"])
+    files=sorted(root.glob("*.png"))+sorted(root.glob("*.jpg"))
+    image=max((Image.open(path).convert("RGB") for path in files),key=lambda value:max(value.size))
     # Actual natural fixture already has a long side>728 and triggers crops.
     assert max(image.size)>=728
     result=chosen(image,return_tensors="pt")
