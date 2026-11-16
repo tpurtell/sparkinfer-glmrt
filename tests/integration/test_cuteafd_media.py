@@ -312,7 +312,11 @@ def test_vision_attention_segments(dim, windowed):
     offsets += [n] * (segments + 1 - len(offsets))
     cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
     program = compile_vision_attention_aot(dim=dim, windowed=windowed)
-    program.launch(q, k, v, out, lse, cu, scalars=[dim ** -.5])
+    # Match native owner admission: L2 size is launch data, never an export key.
+    from cuda.bindings import runtime
+    status,l2=runtime.cudaDeviceGetAttribute(runtime.cudaDeviceAttr.cudaDevAttrL2CacheSize,torch.cuda.current_device())
+    assert int(status)==0 and l2>0
+    program.launch(q, k, v, out, lse, cu, scalars=[dim ** -.5,l2])
     for start, end in zip(offsets[:len(lengths)], offsets[1:len(lengths)+1]):
         qq, kk, vv = [t[start:end].double().transpose(0, 1) for t in (q, k, v)]
         p = (qq @ kk.transpose(-1, -2) * (dim ** -.5)).softmax(-1)
@@ -325,5 +329,5 @@ def test_vision_attention_segments(dim, windowed):
     if windowed:
         singleton = out.clone().fill_(42)
         one_cu = torch.tensor([0, lengths[0]] + [lengths[0]] * 511, device="cuda", dtype=torch.int32)
-        program.launch(q, k, v, singleton, lse, one_cu, scalars=[dim ** -.5])
+        program.launch(q, k, v, singleton, lse, one_cu, scalars=[dim ** -.5,l2])
         assert torch.equal(singleton[:lengths[0]], out[:lengths[0]])
