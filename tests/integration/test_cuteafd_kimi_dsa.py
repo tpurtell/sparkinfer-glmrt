@@ -149,7 +149,7 @@ def test_kimi_index_topk_matches_qdq_selection(mode, ties):
     score_out = torch.empty(rows, 2048, device="cuda")
     work = torch.zeros(scored.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
     scored.launch(queries, weights, cache, page_table, lengths, logical_out, score_out, work,
-                  scalars=(rows, width, stride, 1, 0))
+                  scalars=(rows, width, stride, 1, 0) + ((width,) if mode == "decode" else ()))
     torch.cuda.synchronize()
     for row, length in enumerate(lengths.tolist()):
         logical = torch.arange(length, device="cuda")
