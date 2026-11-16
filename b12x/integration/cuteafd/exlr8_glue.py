@@ -84,7 +84,8 @@ def _f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None):
 
 
 class _Group:
-    def __init__(self, experts, top_k, max_groups, hidden, input_format, max_rows=64, group_rows=16):
+    def __init__(self, experts, top_k, max_groups, hidden, input_format, max_rows=64, group_rows=16, row_addresses=False):
+        self.row_addresses = bool(row_addresses)
         self.experts, self.top_k, self.max_groups = experts, top_k, max_groups
         self.expert_domain = max(256, 1 << (experts - 1).bit_length())
         self.scan_steps = self.expert_domain.bit_length() - 1
@@ -142,6 +143,8 @@ class _Group:
             row, block = task // Int32(self.blocks), task % Int32(self.blocks)
             col = block * Int32(128) + lane * Int32(4)
             row_base = source + row.to(Int64) * Int64(self.row_bytes)
+            if cutlass.const_expr(self.row_addresses):
+                row_base = cute.make_ptr(Int64, source, cute.AddressSpace.gmem, assumed_align=8)[row]
             if cutlass.const_expr(self.input_format == "fp8_k32"):
                 packed = ld_global_nc_u32(row_base + col.to(Int64))
                 # The block's four UE8M0 bytes; lanes 8j..8j+7 share byte j.
@@ -381,8 +384,8 @@ class _GroupPrefill(_Group):
 
 def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144,
                             input_format="fp8_k32", shared_expert=False,
-                            max_rows=64, group_rows=16):
-    if max_rows not in (64, 4096) or group_rows not in (16, 32, 64):
+                            max_rows=64, group_rows=16, row_addresses=False):
+    if max_rows not in ((8192,) if row_addresses else (64, 4096)) or group_rows not in (16, 32, 64):
         raise ValueError("EXLR8 grouping supports planned rows 64/4096 and group rows 16/32/64")
     if max_rows == 64 and group_rows != 16:
         raise ValueError("EXLR8 decode grouping requires 16-row groups")
@@ -400,11 +403,15 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
     row = f"[rows,{hidden + hidden // 32}]" if input_format == "fp8_k32" else f"[rows,{hidden}]"
     x = (Operand("x", torch.uint8, row, note="E4M3 bytes then UE8M0 per-32 scales per row")
          if input_format == "fp8_k32" else Operand("x", torch.bfloat16, row))
+    if row_addresses:
+        if shared_expert: raise ValueError("row-addressed EXLR8 is routed prefill only")
+        x = Operand("input_rows", torch.int64, "[rows]")
     metadata = {"group_rows": group_rows} if max_rows > 64 else {}
+    if row_addresses: metadata["row_addresses"] = True
     group_cls = _GroupPrefill if max_rows > 64 else _Group
-    return compile_program(group_cls(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows),
+    return compile_program(group_cls(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows, row_addresses),
         name=("exlr8_grouped_group" if max_rows > 64 else
-              "exlr8_shared_group" if shared_expert else "exlr8_group"),
+              "exlr8_shared_group" if shared_expert else "exlr8_group") + ("_segments" if row_addresses else ""),
         operands=(Operand("ids", torch.int32, f"[rows,{top_k}]"),
                   x,
                   Operand("signs_in", torch.int8, f"[{hidden}]", align=4),
@@ -414,7 +421,8 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
                   Operand("group_count", torch.int32, "[1]", "out"),
                   Operand("activation", torch.float16, f"[rows,{hidden}]", "out")),
         scalars=(Scalar("rows"), Scalar("cta_limit")),
-        key=(experts, top_k, max_groups, hidden, input_format, shared_expert, max_rows, group_rows),
+        key=(experts, top_k, max_groups, hidden, input_format, shared_expert, max_rows, group_rows)
+            + (("row_addresses",) if row_addresses else ()),
         geometry=dict(abi_version=2, experts=experts, top_k=top_k, max_groups=max_groups,
                       max_rows=max_rows, hidden=hidden, input_format=input_format, **metadata,
                       input_row_bytes=_Group(experts, top_k, max_groups, hidden, input_format).row_bytes,
@@ -494,3 +502,19 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
         # contract as Spark experts; every grid is bounded by runtime cta_limit.
         return result[1:] + grouped + replies
     return result + grouped + replies
+
+
+def exlr8_segment_programs(*, hidden=6144, units=16, top_k=8, experts=256, swiglu_limit=0):
+    """Separate inventory: ordinary program order and objects remain unchanged."""
+    from .exlr8 import compile_exlr8_a16_aot
+    rows = 8192
+    groups = (rows * top_k + 63) // 64 + experts
+    result = [("grouped_group_segments", "exlr8_group", {"max_rows": rows},
+        lambda: compile_exlr8_group_aot(experts=experts, top_k=top_k, max_groups=groups,
+            hidden=hidden, max_rows=rows, group_rows=64, row_addresses=True))]
+    for activation in ("a16", "a8"):
+        result.append((f"{activation}_grouped_segments", "exlr8_a16", {"max_rows": rows},
+            lambda a=activation: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+                max_groups=groups, device_count=True, grouped=True, grouped_rows=rows,
+                activations=a, row_addresses=True, swiglu_limit=swiglu_limit)))
+    return result

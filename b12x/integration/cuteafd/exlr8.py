@@ -132,7 +132,8 @@ class _Exlr8GroupedServingPointers:
                                        activations=g.get("activations", "a16"),
                                        quantize_pass=g.get("quantize_pass", True),
                                        fc2_f32=g.get("fc2_partials", "f16") == "f32",
-                                       swiglu_limit=g.get("swiglu_limit", 0), reply_format=g.get("reply_format", 0))
+                                       swiglu_limit=g.get("swiglu_limit", 0), reply_format=g.get("reply_format", 0),
+                                       row_addresses=g.get("row_addresses", False))
 
     @cute.jit
     def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
@@ -231,7 +232,7 @@ DEFAULT_SERVING_VARIANT = "k1_k23_coalesced"
 def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                          device_count=False, shared_expert=False, grouped=False, group_rows=64,
                          grouped_rows=4096, fc2_partials="f16", compact_units=False,
-                         activations="a16", quantize_pass=True, serving_variant=None, swiglu_limit=0, reply_format=0, core_only=False):
+                         activations="a16", quantize_pass=True, serving_variant=None, swiglu_limit=0, reply_format=0, core_only=False, row_addresses=False):
     if core_only and (grouped or not device_count):
         raise ValueError("core-only EXLR8 requires unsliced device-count decode")
     if reply_format not in (0, 1, 2) or (reply_format and not grouped):
@@ -260,11 +261,15 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
             raise ValueError("shared EXLR8 requires device-count serving ABI")
         if top_k != 1 or max_groups != 4:
             raise ValueError("shared EXLR8 requires top_k=1 and max_groups=4")
-    if grouped_rows not in (64, 4096):
+    if row_addresses and (not grouped or reply_format):
+        raise ValueError("row-addressed EXLR8 requires grouped BF16 replies")
+    if grouped_rows not in ((8192,) if row_addresses else (64, 4096)):
         raise ValueError("EXLR8 grouped instances support 64 or 4096 planned rows")
     if fc2_partials not in ("f16", "f32"):
         raise ValueError("EXLR8 FC2 partials must be f16 or f32")
     g = geometry(hidden, units, top_k, max_groups)
+    if row_addresses:
+        g["row_addresses"] = True
     if core_only:
         g["core_only"] = True
     if reply_format:
@@ -312,6 +317,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
         Operand("output", torch.uint8 if reply_format else torch.bfloat16,
                 f"[rows,{h + h // 32 if reply_format == 1 else h // 2 + h // 16}]" if reply_format else f"[rows,{h}]", "out"),
     )
+    if row_addresses:
+        operands = operands[:-1] + (Operand("output_rows", torch.int64, "[rows]", "out"),)
     sizes = scratch_bytes(g)
     if device_count:
         operands += (Operand("group_count", torch.int32, "[1]"),)
@@ -329,7 +336,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  f"exlr8_{activations}_grouped" if grouped else
                                  "exlr8_a16_serving_compact" if compact_units else
                                  "exlr8_shared_a16_serving" if shared_expert else
-                                 "exlr8_a16_serving" if device_count else "exlr8_a16_decode") + (f"_reply{reply_format}" if reply_format else "") + ("_core" if core_only else ""), operands=operands,
+                                 "exlr8_a16_serving" if device_count else "exlr8_a16_decode") + (f"_reply{reply_format}" if reply_format else "") + ("_core" if core_only else "") + ("_segments" if row_addresses else ""), operands=operands,
                            scalars=tuple(Scalar(n) for n in (("rows", "cta_limit", "unit_limit", "l2_bytes") if grouped else
                                                             ("rows", "cta_limit", "unit_limit") if compact_units else
                                                             ("rows", "cta_limit") if device_count
@@ -339,6 +346,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  # source: bump the tag when decode's weight-load
                                  # cache policy changes.
                                  "decode_l2_fc2_prefetch_v9")
+                                + (("row_addresses",) if row_addresses else ())
                                 + (("runtime_l2_v1",) if grouped else ())
                                 + (("grouped_compact_units",) if grouped else ())
                                 + (("k1_compact_units",) if compact_units else ())

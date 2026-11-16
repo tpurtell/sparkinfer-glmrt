@@ -923,13 +923,17 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
     CTAS_PER_SM = 2
 
     def __init__(self, hidden_size, units_per_expert, top_k, max_groups, group_rows=64,
-                 activations: str = "a16", quantize_pass: bool = True, fc2_f32: bool | None = None, swiglu_limit: float = 0, reply_format: int = 0):
+                 activations: str = "a16", quantize_pass: bool = True, fc2_f32: bool | None = None, swiglu_limit: float = 0, reply_format: int = 0, row_addresses: bool = False):
         super().__init__(hidden_size, units_per_expert, top_k, max_groups, device_count=True,
                          swiglu_limit=swiglu_limit)
         if activations not in ("a16", "a8"):
             raise ValueError("EXLR8 grouped activations must be 'a16' or 'a8'")
         if reply_format not in (0, 1, 2):
             raise ValueError("EXLR8 reply format must be 0/1/2")
+        self.max_rows = 8192 if row_addresses else 4096
+        self.row_addresses = bool(row_addresses)
+        if self.row_addresses and reply_format:
+            raise ValueError("row-addressed EXLR8 replies are BF16 only")
         self.reply_format = int(reply_format)
         if reply_format:
             from .reply_store import ReplyStore
@@ -1142,7 +1146,7 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                 group_count: cute.Tensor, unit_count: cute.Tensor,
                 unit_map: cute.Tensor, cta_limit: Int32, unit_limit: Int32,
                 l2_bytes: Int32, stream: cuda.CUstream):
-        if (rows > Int32(0) and rows <= Int32(4096) and cta_limit > Int32(0)
+        if (rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0)
                 and unit_limit > Int32(0)):
             if cutlass.const_expr(self.quantize_pass):
                 # Borrow fc2 for A8 records until FC1 finishes; same-stream FC2
@@ -3712,6 +3716,9 @@ class Exlr8GroupedKernel(Exlr8A16Kernel):
                             values[3] = values[3] + weight * u32_as_f32(w3)
             h0, h1, h2, h3 = _w4a8_had128_quad(values[0], values[1], values[2], values[3], lane)
             out_ptr = output_address + (row.to(Int64) * Int64(self.hidden_size) + col.to(Int64)) * Int64(2)
+            if cutlass.const_expr(self.row_addresses):
+                row_address = cute.make_ptr(Int64, Int64(output_address), cute.AddressSpace.gmem, assumed_align=8)[row]
+                out_ptr = row_address + col.to(Int64) * Int64(2)
             o0 = h0 * signed_byte(signs, 0)
             o1 = h1 * signed_byte(signs, 1)
             o2 = h2 * signed_byte(signs, 2)
