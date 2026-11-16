@@ -369,11 +369,11 @@ def audio_programs(*, widths=(256, 512, 1024, 2048), output_width=8192):
 
 
 class VisionAttention:
-    def __init__(self, dim, capacity, segments, max_segment_rows):
+    def __init__(self, dim, capacity, segments, max_segment_rows, heads=16):
         from b12x.attention._shared.contiguous.api import _VarlenAttentionForwardLaunch
         self.launch = _VarlenAttentionForwardLaunch(
-            q_shape=(capacity, 16, dim), k_shape=(capacity, 16, dim),
-            v_shape=(capacity, 16, dim), cu_seqlens_q_shape=(segments + 1,),
+            q_shape=(capacity, heads, dim), k_shape=(capacity, heads, dim),
+            v_shape=(capacity, heads, dim), cu_seqlens_q_shape=(segments + 1,),
             cu_seqlens_k_shape=(segments + 1,), dtype=torch.bfloat16,
             causal=False, window_size_left=-1, window_size_right=-1,
             has_attention_sink_bias=False, max_seqlen_q=max_segment_rows,
@@ -386,7 +386,7 @@ class VisionAttention:
         self.launch(q, k, v, out, lse, cu, cu, lse, scale, l2_cache_size, stream)
 
 
-def compile_vision_attention_aot(*, dim, windowed=False):
+def compile_vision_attention_aot(*, dim, windowed=False, heads=16):
     """Fixed admission capacities, never compile from live image/window counts.
 
     Windowed input is already permuted into independent spatial32x32 segments;
@@ -394,18 +394,22 @@ def compile_vision_attention_aot(*, dim, windowed=False):
     Full attention uses a single segment; multi-image callers launch per image.
     Empty segments must not write O/LSE. Q/K/V/O storage capacity is 16384 rows.
     """
-    if dim not in (64, 96, 128) or (windowed and dim != 96):
-        raise ValueError("vision attention requires d64/d96/d128; windows require d96")
+    if (heads, dim) not in ((16,64),(16,80),(16,96),(16,128),(12,128)) or (windowed and (heads,dim)!=(16,96)):
+        raise ValueError("vision attention requires existing16-head geometry or12x128; windows require16x96")
     capacity, segments = 16384, 512 if windowed else 1
     limit = 1024 if windowed else capacity
-    return compile_program(VisionAttention(dim, capacity, segments, limit),
+    # Preserve the exact historical constructor and compile key for16-head entries.
+    launch = (VisionAttention(dim, capacity, segments, limit) if heads==16 else
+              VisionAttention(dim, capacity, segments, limit, heads=heads))
+    key = (dim, bool(windowed)) if heads==16 else (dim, bool(windowed), heads)
+    return compile_program(launch,
         name="media_vision_attention", operands=(
-            Operand("q", torch.bfloat16, f"[{capacity},16,{dim}]"),
-            Operand("k", torch.bfloat16, f"[{capacity},16,{dim}]"),
-            Operand("v", torch.bfloat16, f"[{capacity},16,{dim}]"),
-            Operand("out", torch.bfloat16, f"[{capacity},16,{dim}]", "out"),
-            Operand("lse", torch.float32, f"[16,{capacity}]", "scratch"),
+            Operand("q", torch.bfloat16, f"[{capacity},{heads},{dim}]"),
+            Operand("k", torch.bfloat16, f"[{capacity},{heads},{dim}]"),
+            Operand("v", torch.bfloat16, f"[{capacity},{heads},{dim}]"),
+            Operand("out", torch.bfloat16, f"[{capacity},{heads},{dim}]", "out"),
+            Operand("lse", torch.float32, f"[{heads},{capacity}]", "scratch"),
             Operand("cu", torch.int32, f"[{segments + 1}]")),
-        scalars=(Scalar("scale", "float32"), Scalar("l2_cache_size", "int32")), key=(dim, bool(windowed)),
-        geometry=dict(dim=dim, heads=16, capacity=capacity, segments=segments,
+        scalars=(Scalar("scale", "float32"), Scalar("l2_cache_size", "int32")), key=key,
+        geometry=dict(dim=dim, heads=heads, capacity=capacity, segments=segments,
                       max_segment_rows=limit, windowed=bool(windowed)))
