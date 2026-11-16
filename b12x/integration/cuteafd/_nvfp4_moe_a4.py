@@ -431,10 +431,10 @@ class StreamNvfp4LinearA4:
                         st_shared_u32(dst, Uint32(0))
                 else:
                     value = Uint32(0)
-                    for byte in cutlass.range_constexpr(4):
-                        if col + Int32(byte) < Int32(self.k // 16):
+                    for scale_byte in cutlass.range_constexpr(4):
+                        if col + Int32(scale_byte) < Int32(self.k // 16):
                             value = value | (Uint32(_ld_u8(scales_at + Int64(row) * Int64(self.k // 16)
-                                                          + Int64(col) + Int64(byte))) << Uint32(8 * byte))
+                                                          + Int64(col) + Int64(scale_byte))) << Uint32(8 * scale_byte))
                     st_shared_u32(dst, value)
 
     @cute.jit
