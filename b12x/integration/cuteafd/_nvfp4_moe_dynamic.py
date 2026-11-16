@@ -286,7 +286,7 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_dyn", 1, *super().key()[2:])
+        return ("stream_linear_nvfp4_dyn", 2, *super().key()[2:])
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
@@ -294,7 +294,7 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
         if cutlass.const_expr(row_amax is None):
             raise ValueError("the dynamic NVFP4 linear needs the activation rows' amax")
         self.kernel_dyn(aq, a_s, meta, w, s, y, row_amax).launch(
-            grid=(self.n // self.tile_n, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+            grid=(_ceil(self.n, self.tile_n), max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
             min_blocks_per_mp=1)
 
     @cute.kernel
@@ -355,8 +355,9 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
                                 for nt in cutlass.range_constexpr(self.n_tiles):
                                     f = 4 * (self.n_tiles * mt + nt) + 2 * half
                                     col = n0 + warp_n * Int32(self.warp_cols) + Int32(8 * nt) + Int32(2) * c
-                                    st_global_u32(Int64(y.toint()) + (Int64(first + row) * Int64(self.n) + Int64(col))
-                                                  * Int64(2), pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
+                                    if col < Int32(self.n):
+                                        st_global_u32(Int64(y.toint()) + (Int64(first + row) * Int64(self.n) + Int64(col))
+                                                      * Int64(2), pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
 
 
 class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
@@ -379,10 +380,10 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
         self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
         self.amax_offset = nvfp4_amax_offset(experts, self.inter, self.k)
         self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.k)
-        self.parts = self.inter // self.half_n
+        self.parts = _ceil(self.inter, self.half_n)
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_dyn", 2, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_dyn", 3, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.gate_cap, self.up_cap, self.tile_m, self.tile_n, self.live_min, self.live_max)
 
     @cute.jit
@@ -402,7 +403,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
             pair_row = meta
         self.fused_dyn(aq, a_s, meta, w1, s1, w3, s3, row_amax, gamma, act_bf16, act_amax_part,
                        exchange, exchange_rows, pair_row, dump).launch(
-            grid=(self.inter // self.half_n, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+            grid=(_ceil(self.inter, self.half_n), max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
             min_blocks_per_mp=1)
 
     @cute.jit
@@ -488,7 +489,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                         gi = tidx + Int32(it * self.threads)
                         row = gi // Int32(words)
                         wd = gi % Int32(words)
-                        if row < live:
+                        if (row < live) & (n0 + wd * Int32(2) < Int32(self.inter)):
                             i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(row)
                             gw = ld_shared_u32_at(ring + row * Int32(self.x_stride) + wd * Int32(4))
                             uw = ld_shared_u32_at(ring + row * Int32(self.x_stride) + Int32(self.half_n * 2) + wd * Int32(4))
@@ -511,7 +512,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                     gi = tidx + Int32(it * self.threads)
                     row = gi // Int32(groups)
                     grp = gi % Int32(groups)
-                    if row < live:
+                    if (row < live) & (n0 + grp * Int32(16) < Int32(self.inter)):
                         g_row = _ld_f32(gamma_t + Int64(first + row) * Int64(4))
                         at = ring + row * Int32(self.x_stride) + grp * Int32(32)
                         i = Int64(tile) * Int64(STREAM_TILE_M) + Int64(row)
@@ -547,8 +548,8 @@ class ChunkActDyn:
 
     def __init__(self, *, inter: int, experts: int, parts: int):
         self.inter, self.experts, self.parts = int(inter), int(experts), int(parts)
-        if self.inter % 16 or self.inter % self.parts or (self.inter // self.parts) % 16:
-            raise ValueError("I must be a multiple of 16 and of 16 * parts")
+        if self.inter <= 0 or self.inter % 16 or self.parts <= 0:
+            raise ValueError("I must be a positive multiple of 16; parts must be positive")
         # One partial per 16-column group of the row (the gate/up CTAs write parts * (half_n/16) of them).
         self.partials = self.inter // 16
 
