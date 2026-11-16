@@ -13,8 +13,7 @@ from tests.moe.exlr8_oracle import Case, make_wire
 from tests.moe.test_exlr8_grouped import buffers, run
 
 
-@pytest.mark.parametrize("activation", ["a16", "a8"])
-def test_real_checkpoint_segments_are_byte_identical_and_row_curve(activation):
+def _run_exlr8_segments(activation, aot_dir=None):
     case = Case(os.environ["CUTEAFD_EXLR8_SNAPSHOT"], layer=40, hidden=6144, units=4)
     rows, hidden, topk = 8192, case.h, case.topk
     torch.manual_seed(844)
@@ -32,10 +31,16 @@ def test_real_checkpoint_segments_are_byte_identical_and_row_curve(activation):
         hidden=hidden, max_rows=4096, group_rows=64),
         compile_exlr8_a16_aot(hidden=hidden, units=case.u, top_k=topk, max_groups=groups,
             device_count=True, grouped=True, activations=activation))
-    group = compile_exlr8_group_aot(experts=4, top_k=topk, max_groups=groups,
-        hidden=hidden, max_rows=8192, group_rows=64, row_addresses=True)
-    core = compile_exlr8_a16_aot(hidden=hidden, units=case.u, top_k=topk, max_groups=groups,
-        device_count=True, grouped=True, grouped_rows=8192, activations=activation, row_addresses=True)
+    from b12x.integration.cuteafd import exportable_compilation
+    with exportable_compilation():
+        group = compile_exlr8_group_aot(experts=4, top_k=topk, max_groups=groups,
+            hidden=hidden, max_rows=8192, group_rows=64, row_addresses=True)
+        core = compile_exlr8_a16_aot(hidden=hidden, units=case.u, top_k=topk, max_groups=groups,
+            device_count=True, grouped=True, grouped_rows=8192, activations=activation, row_addresses=True)
+    if aot_dir is not None:
+        from tests.moe.segment_aot import ExportedProgram
+        group = ExportedProgram(group, aot_dir, "exlr8_group_segments")
+        core = ExportedProgram(core, aot_dir, "exlr8_core_segments")
     physical = torch.arange(rows - 1, -1, -1, device="cuda")
     resident = wire[physical].contiguous()
     input_rows = (resident.data_ptr() + physical * (hidden * 33 // 32)).to(torch.int64)
@@ -93,3 +98,13 @@ def test_real_checkpoint_segments_are_byte_identical_and_row_curve(activation):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(reply[1:5505].view(torch.int16), expected[:5504].view(torch.int16))
+
+
+@pytest.mark.parametrize("activation", ["a16", "a8"])
+def test_real_checkpoint_segments_are_byte_identical_and_row_curve(activation):
+    _run_exlr8_segments(activation)
+
+
+@pytest.mark.parametrize("activation", ["a16", "a8"])
+def test_exlr8_segments_exported_header_and_byte_oracle(activation, tmp_path):
+    _run_exlr8_segments(activation, aot_dir=tmp_path)

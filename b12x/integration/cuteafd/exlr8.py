@@ -183,6 +183,26 @@ class _Exlr8GroupedServingPointers:
                       cta_limit, unit_limit, stream)
 
 
+class _Exlr8SegmentServingPointers:
+    """Keep ordinary wrapper names unchanged; segment ABI names its row table."""
+
+    def __init__(self, g):
+        self.ordinary = _Exlr8GroupedServingPointers(g)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, pointers: cute.Pointer, bits: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, route_weights: cute.Pointer,
+                 fc1: cute.Pointer, intermediate: cute.Pointer, fc2: cute.Pointer,
+                 signs_out: cute.Pointer, output_rows: cute.Pointer, group_count: cute.Pointer,
+                 unit_count: cute.Pointer, unit_map: cute.Pointer,
+                 rows: cutlass.Int32, cta_limit: cutlass.Int32,
+                 unit_limit: cutlass.Int32, l2_bytes: cutlass.Int32, stream: cuda.CUstream):
+        self.ordinary(x, pointers, bits, group_expert, route_slots, route_group_lane,
+                      route_weights, fc1, intermediate, fc2, signs_out, output_rows,
+                      group_count, unit_count, unit_map, rows, cta_limit, unit_limit, l2_bytes, stream)
+
+
 class _Exlr8CompactServingPointers:
     """K1 serving ABI plus the compact owned-unit tables and runtime unit limit.
 
@@ -326,7 +346,8 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
         # Compact owned-unit tables appended after the existing prefix.
         operands += (Operand("unit_count", torch.int32, "[E]"),
                      Operand("unit_map", torch.int32, f"[E,{u}]"))
-    launch = (_Exlr8GroupedServingPointers(g) if grouped else
+    launch = (_Exlr8SegmentServingPointers(g) if row_addresses else
+              _Exlr8GroupedServingPointers(g) if grouped else
               _Exlr8CompactServingPointers(g) if compact_units else
               _Exlr8ServingPointers(g) if device_count else _Exlr8Pointers(g))
     if core_only:
@@ -346,7 +367,7 @@ def compile_exlr8_a16_aot(*, hidden=6144, units=16, top_k=8, max_groups=512,
                                  # source: bump the tag when decode's weight-load
                                  # cache policy changes.
                                  "decode_l2_fc2_prefetch_v9")
-                                + (("row_addresses",) if row_addresses else ())
+                                + (("row_addresses", "aot_operand_names_v2") if row_addresses else ())
                                 + (("runtime_l2_v1",) if grouped else ())
                                 + (("grouped_compact_units",) if grouped else ())
                                 + (("k1_compact_units",) if compact_units else ())

@@ -154,14 +154,14 @@ class V4StreamSegments:
         self.combine = NativeTokenScatter(hidden, topk)
 
     @cute.jit
-    def __call__(self, x: cute.Pointer, w13: cute.Pointer, s13: cute.Pointer,
+    def __call__(self, input_rows: cute.Pointer, w13: cute.Pointer, s13: cute.Pointer,
                  w2: cute.Pointer, s2: cute.Pointer, ids: cute.Pointer, routing: cute.Pointer,
                  meta: cute.Pointer, pair_row: cute.Pointer, pair_pos: cute.Pointer,
                  act: cute.Pointer, grouped_routing: cute.Pointer, grouped_route: cute.Pointer,
-                 partial: cute.Pointer, output: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.pipeline(x, w13, s13, w2, s2, ids, routing, meta, pair_row, pair_pos,
+                 partial: cute.Pointer, output_rows: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.pipeline(input_rows, w13, s13, w2, s2, ids, routing, meta, pair_row, pair_pos,
                       act, grouped_routing, grouped_route, partial, rows, stream)
-        self.combine(partial, output, rows, stream)
+        self.combine(partial, output_rows, rows, stream)
 
 
 def compile_v4_stream_segments_aot(*, hidden=5120, intermediate=576, experts=384, topk=6,
@@ -186,7 +186,7 @@ def compile_v4_stream_segments_aot(*, hidden=5120, intermediate=576, experts=384
     return compile_program(V4StreamSegments(capacity, hidden=hidden, intermediate=intermediate,
         experts=experts, topk=topk, scale_codes=scale_codes), name="v4_native_stream_segments",
         operands=operands, scalars=(Scalar("rows"),),
-        key=(capacity, hidden, intermediate, experts, topk, bool(scale_codes)),
+        key=(capacity, hidden, intermediate, experts, topk, bool(scale_codes), "aot_operand_names_v2"),
         geometry=dict(max_rows=capacity, hidden=hidden, intermediate=intermediate, experts=experts,
             topk=topk, row_addresses=True, scale_codes=bool(scale_codes)),
         scratch={name: (lambda _rows, size=size: size) for name, size in sizes.items()})
