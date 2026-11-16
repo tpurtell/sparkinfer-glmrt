@@ -71,7 +71,8 @@ def _descriptor(shape, dtype, strides=None):
 
 
 def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode: str,
-                     heads: int = _HEADS, route: str = "auto", *, sm_count: int | None = None):
+                     heads: int = _HEADS, route: str = "auto", *, sm_count: int | None = None,
+                     supertile_tokens: int = 0):
     """The scratch layout (and route) of the prepared plan for this capacity."""
     from b12x.attention import dsa_indexer
     from b12x.attention.dsa_indexer import _preparation as prep
@@ -83,7 +84,7 @@ def _prepared_layout(geometry: DSV4Geometry, max_rows: int, max_pages: int, mode
     rows, pages, topk = int(max_rows), int(max_pages), int(geometry.index_topk)
     caps = dsa_indexer.Caps(device=device, num_q_heads=heads, max_q_rows=rows,
                             max_page_table_width=pages, topk=topk, mode=mode,
-                            output_index_space="physical", route=route)
+                            output_index_space="physical", route=route, supertile_k=int(supertile_tokens))
     operands = dict(
         q_fp8=_descriptor((rows, heads, _HEAD_DIM), "float8_e4m3fn"),
         query_weights=_descriptor((rows, heads), "float32"),
@@ -140,11 +141,16 @@ class _TopK:
         # The tiled selector has the total logical-index tie order. The fused
         # arrival-order selector cannot provide this context-split contract.
         route = "paged_tiled" if scored_logical and mode == "decode" else "auto"
-        layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route)
+        # Scored Context decode captures one capacity-wide scan. The scorer reads
+        # live lengths on device; a single fold avoids dead supertile launches.
+        supertile_tokens = int(max_pages) * _PAGE if scored_logical and mode == "decode" else 0
+        layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route,
+                                  supertile_tokens=supertile_tokens)
         self.runtime_tiled = layout.route == "paged_tiled" and mode == "decode" and max_rows < 64
         if layout.route == "paged_fused" or self.runtime_tiled:
             # A capacity bound, not a card identity. Live grouping uses the launch device.
-            layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route, sm_count=256)
+            layout = _prepared_layout(geometry, max_rows, max_pages, mode, self.heads, route, sm_count=256,
+                                      supertile_tokens=supertile_tokens)
         self.layout = layout
         self.route = layout.route
         self.runtime_sm_count = self.route == "paged_fused" or self.runtime_tiled

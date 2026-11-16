@@ -184,7 +184,10 @@ def compile_scored_index_topk_aot(g=GLM53, *, max_rows: int, max_pages: int, mod
                            scalars=tuple(Scalar(x) for x in ("rows", "table_width", "table_stride", "page_stride", "page_offset")),
                            key=(launch.topk.key(), "scored-logical", mode),
                            geometry={"topk": k, "heads": h, "route": launch.topk.route,
-                                     "stream_scorer_ctas": int(launch.topk.layout.stream_scorer_ctas)},
+                                     "stream_scorer_ctas": int(launch.topk.layout.stream_scorer_ctas),
+                                     "supertile_tokens": int(launch.topk.layout.supertile_tokens),
+                                     "tile_logits_bytes": int(launch.topk.layout.tile_logits_elements) * 4,
+                                     "device_live_width": launch.topk.route == "paged_tiled"},
                            scratch={"scratch": lambda rows: launch.topk.layout.nbytes}, doc=compile_scored_index_topk_aot.__doc__)
 
 

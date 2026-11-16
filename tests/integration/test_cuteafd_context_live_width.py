@@ -61,7 +61,7 @@ def test_context_selector_graph_grows_from_empty_without_changing_capacity(rows)
         assert torch.equal(scores.view(torch.uint8), expected_s.view(torch.uint8)), (rows, pages, 'scores')
         for row in range(rows):
             assert int((indices[row] >= 0).sum()) == min(int(lengths[row]), 2048)
-        if 10 <= pages <= 130:
+        if pages in (10, 20, 65, 130, 513, 1025):
             exact_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(exact_graph):
                 launch(pages)
