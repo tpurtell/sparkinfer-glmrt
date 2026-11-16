@@ -94,7 +94,9 @@ def test_step_full_checkpoint_native_tower(side):
     cfg=SimpleNamespace(**settings);mode=["math"]
     old_tf32=torch.backends.cuda.matmul.allow_tf32;old_reduce=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False
-    tensors=_load(snapshot);reference=_reference(cfg,mode).cuda().eval()
+    tensors=_load(snapshot)
+    with torch.device("meta"):reference=_reference(cfg,mode)
+    reference.eval()
     state={}
     for name,tensor in tensors.items():
         if not name.startswith("vision_model."):continue
@@ -102,7 +104,11 @@ def test_step_full_checkpoint_native_tower(side):
         name=name.replace(".attn.in_proj_weight",".attn.qkv_proj.weight").replace(".attn.in_proj_bias",".attn.qkv_proj.bias")
         name=name.replace(".mlp.c_fc.",".mlp.fc1.").replace(".mlp.c_proj.",".mlp.fc2.")
         state[name]=tensor.cuda()
-    reference.load_state_dict(state,strict=True)
+    reference.load_state_dict(state,strict=True,assign=True)
+    # Nonpersistent RoPE cache is not a checkpoint tensor; rebuild on CPU using
+    # the vendor builder before moving only that small immutable table to GPU.
+    for layer in reference.transformer.resblocks:
+        layer.attn.rope=vendor.step5().PerceptionEncoderRope2D(96,52,52).cuda()
     # Natural crop source; the official PIL crop source stage is separately
     # qualified. Exercise the actual504local tower grid first.
     files=list(Path(os.environ["CUTEAFD_PE_REAL_IMAGES"]).glob("*.jpg"))
