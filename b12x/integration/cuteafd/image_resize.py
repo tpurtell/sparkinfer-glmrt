@@ -8,7 +8,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32,Int32,Int64
+from cutlass import Float32,Int32,Int64,Uint32
 from b12x._lib.intrinsics import div_rn_f32
 from ._common import Operand,Scalar,compile_program
 from .pointwise import _add,_fma,_mul,_sub,_view
@@ -27,7 +27,7 @@ class NormalizeRgb:
         at=Int64(cute.arch.block_idx()[0])*256+Int64(cute.arch.thread_idx()[0])
         if at<count:
             channel=at%3
-            value=div_rn_f32(Float32(rgb[at]),Float32(255.0))
+            value=div_rn_f32(Float32(Uint32(rgb[at])),Float32(255.0))
             out[at]=div_rn_f32(_sub(value,Float32(mean[channel])),Float32(std[channel]))
 
 
@@ -143,7 +143,7 @@ def compile_rgb_normalize_aot():
     return compile_program(NormalizeRgb(),name="image_rgb_normalize",operands=(
         Operand("rgb",torch.uint8,"[height,width,3]"),Operand("mean",torch.float32,"[3]",align=4),
         Operand("std",torch.float32,"[3]",align=4),Operand("out",torch.float32,"[height,width,3]","out")),
-        scalars=(Scalar("height"),Scalar("width")),key=(),geometry=dict(channels=3))
+        scalars=(Scalar("height"),Scalar("width")),key=(),geometry=dict(channels=3),version=2)
 
 
 def compile_resize_coefficients_aot(*,filter="bicubic",antialias=True):

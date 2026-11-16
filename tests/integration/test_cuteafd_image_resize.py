@@ -27,6 +27,19 @@ def _coeff(program,size,out):
     return indices,sizes,weights,taps
 
 
+def test_rgb_normalize_all_unsigned_byte_values():
+    require_b12x()
+    from b12x.integration.cuteafd.image_resize import compile_rgb_normalize_aot
+    rgb=torch.arange(256,device="cuda",dtype=torch.int32).to(torch.uint8)[:,None,None].expand(256,1,3).contiguous()
+    mean=torch.tensor([.48145466,.4578275,.40821073],device="cuda")
+    std=torch.tensor([.26862954,.26130258,.27577711],device="cuda")
+    out=torch.empty(256,1,3,device="cuda")
+    compile_rgb_normalize_aot().launch(rgb,mean,std,out,scalars=[256,1])
+    expected=(rgb.float()/255-mean)/std
+    print(f"RGB_LUT max_abs={float((out-expected).abs().max()):.9g}",flush=True)
+    assert torch.equal(out,expected)
+
+
 @pytest.mark.parametrize("out_size",[728,504])
 def test_real_image_resize_matches_tensor_antialias(out_size):
     require_b12x()
