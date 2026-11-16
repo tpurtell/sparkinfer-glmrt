@@ -8,8 +8,9 @@ cuteafd's #1915 short_conv; normalization is 1/sqrt(taps+1) for static and
 1/sqrt(2*taps+1) for dynamic.
 
 Rows form contiguous sequence segments. first[row] is that segment's first
-row; slots[row] selects its exclusive history [slots, taps-1, width], stored
-newest-first. History must be zeroed for fresh sequences. The convolution
+row; slots[row] selects its exclusive history at slot*history_stride_elements,
+stored newest-first. The i64 runtime stride addresses the complete request
+state bank; history points at the selected layer/field in request slot zero. History must be zeroed for fresh sequences. The convolution
 reads the entire old history before a second kernel commits the final
 (taps-1) inputs. This ordering supports arbitrary short chunks, graph replay,
 and packed sequences without host work. A slot occurs in only one segment.

@@ -1,46 +1,22 @@
-"""Inkling 2 Small attention AOT programs (``inkling2_*``) for cuteafd.
+"""Inkling cache ABI v2: segmented biased-sink GQA with native global FP8.
 
-One biased-sink GQA tile (``_inkling2_kernels.InklingGqaAttention``) in four
-exports, selected by layer kind and route; see that module for the arithmetic
-and :class:`Inkling2Geometry` for the static shapes (48 / 8 heads of 128,
-window 1024, bias extent 1024, BF16 records of 4096 bytes).
+Global operands are q, kv_cache, positions, page_table, table_indices,
+seq_first, tile_rows, rel, sinks, out, scratch; runtime scalars are rows,
+table_stride, tiles, and (decode only) splits. Each row selects the request
+page table at table_indices[row]*table_stride. FP8 records contain K[1024]
+and V[1024] E4M3 payloads then K-scale[8] and V-scale[8] FP32 descales in
+one 2112-byte physical record. BF16 records retain their 4096-byte layout.
 
-Inputs common to every program, per live row ``r`` (``rows <= max_rows``):
+Local operands are q, kv_step, ring, positions, ring_slots, seq_first,
+tile_rows, rel, sinks, out, scratch; scalars are rows and tiles. Local
+records remain BF16. ring_slots are absolute record indices into a strided
+request bank, not a dense array of fixed-sized rings.
 
-* ``q``      BF16 ``[rows, 48, 128]``: the L2-clipped (and on global layers
-             log-scaled) query.
-* ``rel``    BF16 ``[rows, 48, extent]``: ``rel[r, h, d]`` is the additive
-             bias of head ``h`` for a key ``d`` positions back (``r_proj`` x
-             L2 clip x ``rel_logits_proj.proj``, computed upstream).
-* ``sinks``  F32 ``[rows, 48]``: the unscaled sink logit per (token, head).
-* ``positions`` I64 ``[rows]``: the row's position in its sequence.
-* ``out``    BF16 ``[rows, 48, 128]``: attention output before the gate.
-
-``compile_inkling2_attention_aot(g, kind="global", route=..., max_rows=M)``::
-
-    inkling2_global_attention(q, kv_cache, positions, page_table, rel, sinks, out, scratch,
-                              rows, table_stride[, splits], stream)
-
-Paged BF16 records ``kv_cache [pages*64, 2048]``; ``page_table`` is per row
-(``[rows, table_stride]``, decode) or one row shared by the whole step
-(``table_stride == 0``, prefill: one sequence per step). Decode (one row per
-CTA) splits the key range over ``splits <= max_splits`` CTAs and merges the
-FP32 partials in ``scratch`` with the sink once (``InklingSplitMerge``);
-prefill (10 rows per CTA) attends directly.
-
-``compile_inkling2_attention_aot(g, kind="local", route=..., max_rows=M)``::
-
-    inkling2_local_attention(q, kv_step, ring, positions, ring_slots, seq_first, rel, sinks, out,
-                             scratch, rows, stream)
-
-Sliding window over this step's records ``kv_step [rows, 2048]`` and each
-sequence's ring (``ring [rings*2048, 2048]``, slot ``ring_slots[row]``);
-``seq_first[row]`` is the step's first row of the row's sequence. The step's
-records are then committed into the rings (``MimoRingCommit``), so a row's
-record must be in ``kv_step`` before the launch, not in the ring.
-
-Scratch: ``attention_scratch_bytes(g, kind, route, rows)``; 1 KiB except for
-the global decode partials (``rows * max_splits * 48 * (128 * 4 + 4)``).
+tile_rows[cta] gives the absolute packed query start; seq_first[row] is
+the segment's absolute first row. Ten-row prefill tiles clamp at the next
+segment boundary. Decode uses one row per CTA. KV packing completes before
+attention; the local commit runs afterward. The relative bias and per-row
+sink follow the checkpoint's native arithmetic in _inkling2_kernels.
 """
 from __future__ import annotations
 
