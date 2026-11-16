@@ -26,7 +26,13 @@ def _run_native_segments(hidden, intermediate, coded, profile=None, *, experts=N
                         ("w2", (experts, hidden, intermediate // 2))):
         weights[name] = torch.randint(0, 256, shape, dtype=torch.uint8)
         scales[name] = torch.randint(119, 124, (*shape[:-1], shape[-1] // 16), dtype=torch.uint8)
-    packed = pack(weights, scales, intermediate % 128 != 0)
+    # Bound CPU packing transients on unified-memory Sparks under the 16 GiB
+    # oracle container cap; the final native device operands are unchanged.
+    chunks = [pack({name: tensor[first:first + 32] for name, tensor in weights.items()},
+                   {name: tensor[first:first + 32] for name, tensor in scales.items()},
+                   intermediate % 128 != 0) for first in range(0, experts, 32)]
+    packed = [torch.cat([chunk[plane] for chunk in chunks]) for plane in range(4)]
+    del chunks
     if coded:
         from b12x.moe._shared.scale_codes import pack_scale_codes
         packed[1] = pack_scale_codes(torch.cat((scales["w3"], scales["w1"]), 1),
