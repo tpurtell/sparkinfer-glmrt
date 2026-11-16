@@ -54,17 +54,17 @@ def test_forward_rejects_invalid_extents_before_launch():
         position.launch(dummy,dummy,dummy,dummy,dummy,scalars=[2,2])
 
 
-@pytest.mark.parametrize("patch,hwc",[(20,True),(14,False)])
-def test_normalized_patch_order(patch,hwc):
+@pytest.mark.parametrize("patch,hwc,gh,gw",[(20,True,4,6),(14,False,4,6),(14,False,52,52),(14,False,36,36)])
+def test_normalized_patch_order(patch,hwc,gh,gw):
     require_b12x()
     from b12x.integration.cuteafd.perception_forward import compile_normalized_patches_aot
-    h,w=patch*4,patch*6
+    h,w=patch*gh,patch*gw
     x=(torch.arange(h*w*3,device="cuda")%255).float().reshape(h,w,3)/100
-    out=torch.empty(24,3*patch*patch,device="cuda",dtype=torch.bfloat16)
+    out=torch.empty(gh*gw,3*patch*patch,device="cuda",dtype=torch.bfloat16)
     program=compile_normalized_patches_aot(patch=patch,hwc=hwc)
     program.launch(x,out,scalars=[h,w])
     order=(0,2,1,3,4) if hwc else (0,2,4,1,3)
-    ref=x.reshape(4,patch,6,patch,3).permute(order).reshape_as(out).bfloat16()
+    ref=x.reshape(gh,patch,gw,patch,3).permute(order).reshape_as(out).bfloat16()
     assert vendor.metrics(f"patch_p{patch}_hwc{hwc}",out,ref,source="vendor-native-patch-layout")==0
 
 

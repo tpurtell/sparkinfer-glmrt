@@ -30,14 +30,16 @@ class CheckedForward:
             if len(scalars)!=2 or not all(isinstance(value,int) and value>0 for value in scalars):
                 raise ValueError("PE image extents must be positive integers")
             height,width=scalars
-            if height*width>16384:
-                raise ValueError("PE image grid exceeds admitted capacity")
             if self.kind=="patch":
                 patch=self.geometry["patch"]
                 if height%patch or width%patch:
                     raise ValueError("PE normalized image extents must divide the patch size")
+                if height*width//(patch*patch)>16384:
+                    raise ValueError("PE patch grid exceeds admitted capacity")
                 expected=[height*width*3,height*width*3]
             else:
+                if height*width>16384:
+                    raise ValueError("PE image grid exceeds admitted capacity")
                 hidden,grid=self.geometry["hidden"],self.geometry["grid"]
                 expected=[height*width*hidden,grid*grid*hidden,hidden,hidden,
                     (height*width+int(self.geometry["class_token"]))*hidden]
