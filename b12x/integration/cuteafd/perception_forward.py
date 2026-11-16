@@ -160,8 +160,8 @@ class NormalizedPatches:
 
 
 class LearnedPosition:
-    def __init__(self,hidden,grid,class_token):
-        self.hidden,self.grid,self.class_token=hidden,grid,class_token
+    def __init__(self,hidden,grid,class_token,torch_bilinear):
+        self.hidden,self.grid,self.class_token,self.torch_bilinear=hidden,grid,class_token,torch_bilinear
 
     @cute.jit
     def __call__(self,patch:cute.Pointer,table:cute.Pointer,cls:cute.Pointer,cls_position:cute.Pointer,
@@ -199,6 +199,11 @@ class LearnedPosition:
         y=div_rn_f32(_mul(Float32(self.grid),_add(Float32(p//Int64(width)),Float32(.5))),Float32(height))
         x=div_rn_f32(_mul(Float32(self.grid),_add(Float32(p%Int64(width)),Float32(.5))),Float32(width))
         y=_sub(y,Float32(.5));x=_sub(x,Float32(.5))
+        if cutlass.const_expr(self.torch_bilinear):
+            sy=div_rn_f32(Float32(self.grid),Float32(height))
+            sx=div_rn_f32(Float32(self.grid),Float32(width))
+            y=_fma(sy,_add(Float32(p//Int64(width)),Float32(.5)),Float32(-.5))
+            x=_fma(sx,_add(Float32(p%Int64(width)),Float32(.5)),Float32(-.5))
         if y<Float32(0.0):y=Float32(0.0)
         if x<Float32(0.0):x=Float32(0.0)
         if y>Float32(self.grid-1):y=Float32(self.grid-1)
@@ -213,6 +218,13 @@ class LearnedPosition:
         bottom=self.lerp(Float32(table[(y1*self.grid+x0)*self.hidden+col]),
             Float32(table[(y1*self.grid+x1)*self.hidden+col]),_sub(Float32(1.0),wx),wx)
         position=self.lerp(top,bottom,_sub(Float32(1.0),wy),wy).to(BFloat16)
+        if cutlass.const_expr(self.torch_bilinear):
+            wx0,wy0=_sub(Float32(1.0),wx),_sub(Float32(1.0),wy)
+            top=_fma(wx0,Float32(table[(y0*self.grid+x0)*self.hidden+col]),
+                _mul(wx,Float32(table[(y0*self.grid+x1)*self.hidden+col])))
+            bottom=_fma(wx0,Float32(table[(y1*self.grid+x0)*self.hidden+col]),
+                _mul(wx,Float32(table[(y1*self.grid+x1)*self.hidden+col])))
+            position=_fma(wy0,top,_mul(wy,bottom)).to(BFloat16)
         out[at]=_add(Float32(patch[p*Int64(self.hidden)+col]),Float32(position)).to(BFloat16)
 
 
@@ -237,12 +249,12 @@ def compile_normalized_patches_aot(*,patch,hwc=False):
         scalars=(Scalar("height"),Scalar("width")),key=(patch,bool(hwc)),geometry=dict(patch=patch,hwc=bool(hwc)),version=2),"patch",patch=patch)
 
 
-def compile_learned_position_aot(*,hidden,grid,class_token=False):
+def compile_learned_position_aot(*,hidden,grid,class_token=False,torch_bilinear=False):
     if min(hidden,grid)<=0:
         raise ValueError("PE position geometry must be positive")
-    return CheckedForward(compile_program(LearnedPosition(hidden,grid,bool(class_token)),name="perception_learned_position",operands=(
+    return CheckedForward(compile_program(LearnedPosition(hidden,grid,bool(class_token),bool(torch_bilinear)),name="perception_learned_position",operands=(
         Operand("patch",torch.bfloat16,f"[height*width,{hidden}]"),Operand("table",torch.bfloat16,f"[{grid*grid},{hidden}]"),
         Operand("cls",torch.bfloat16,f"[{hidden}]"),Operand("cls_position",torch.bfloat16,f"[{hidden}]"),
         Operand("out",torch.bfloat16,f"[height*width+{int(class_token)},{hidden}]","out")),
-        scalars=(Scalar("height"),Scalar("width")),key=(hidden,grid,bool(class_token)),
-        geometry=dict(hidden=hidden,grid=grid,class_token=bool(class_token),mode="bilinear")),"position",hidden=hidden,grid=grid,class_token=bool(class_token))
+        scalars=(Scalar("height"),Scalar("width")),key=(hidden,grid,bool(class_token),bool(torch_bilinear)),
+        geometry=dict(hidden=hidden,grid=grid,class_token=bool(class_token),mode="bilinear",torch_bilinear=bool(torch_bilinear)),version=2),"position",hidden=hidden,grid=grid,class_token=bool(class_token))

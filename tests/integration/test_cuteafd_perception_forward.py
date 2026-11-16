@@ -81,7 +81,7 @@ def test_step5_learned_absolute_position_resized_grid(height,width):
     position=vendor.step5().sample_abs_posemb(owner,height,width)[0]
     ref=patch+position
     out=torch.empty_like(patch);dummy=torch.zeros(hidden,device="cuda",dtype=torch.bfloat16)
-    program=compile_learned_position_aot(hidden=hidden,grid=52,class_token=False)
+    program=compile_learned_position_aot(hidden=hidden,grid=52,class_token=False,torch_bilinear=True)
     program.launch(patch,table,dummy,dummy,out,scalars=[height,width])
     assert vendor.metrics(f"position_step5_{height}x{width}",out,ref)<=2
     torch.testing.assert_close(out,ref,atol=.015625,rtol=.008)
