@@ -41,10 +41,16 @@ def _official(cfg):
         out=F.scaled_dot_product_attention(q.transpose(0,1)[None],k.transpose(0,1)[None],v.transpose(0,1)[None],scale=kwargs["softmax_scale"])
         return out[0].transpose(0,1).contiguous(),None
     namespace["flash_attn_varlen_func"]=flash
+    def fp32_flash(q,k,v,**kwargs):
+        out=F.scaled_dot_product_attention(q.float().transpose(0,1)[None],k.float().transpose(0,1)[None],v.float().transpose(0,1)[None],scale=kwargs["softmax_scale"])
+        return out[0].transpose(0,1).contiguous().bfloat16(),None
+    namespace["fp32_flash_attn_varlen_func"]=fp32_flash
     tree=ast.parse(raw)
     nodes=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef))]
     exec(compile(ast.Module(body=nodes,type_ignores=[]),str(path),"exec"),namespace)
-    return namespace["Inkling2VisionEncoder"](cfg["vision_config"],cfg["text_config"]["hidden_size"])
+    tower=namespace["Inkling2VisionEncoder"](cfg["vision_config"],cfg["text_config"]["hidden_size"])
+    tower._reference_globals=namespace
+    return tower
 
 
 def _weights(snapshot):
@@ -59,13 +65,18 @@ def _weights(snapshot):
     return result
 
 
-def _metric(name,actual,reference):
+def _metric(name,actual,reference,*,teacher=False,final=False):
     a,r=actual.float(),reference.float()
-    error=(a-r).abs();cos=torch.nn.functional.cosine_similarity(a.flatten()[None],r.flatten()[None]).item()
-    rms=error.square().mean().sqrt().item()
-    print(f"PE_CHECKPOINT {name} max_abs={error.max().item():.9g} rms={rms:.9g} cosine={cos:.12f} finite={bool(torch.isfinite(a).all())}",flush=True)
-    assert torch.isfinite(a).all() and cos>=.999
-    assert rms<=.025
+    error=(a-r).abs()
+    relative=torch.linalg.vector_norm(a-r)/torch.linalg.vector_norm(r).clamp_min(1e-30)
+    cosine=torch.nn.functional.cosine_similarity(a,r,dim=-1).min().item()
+    equal=int((actual.contiguous().view(torch.int16)==reference.contiguous().view(torch.int16)).sum())/actual.numel()
+    result=dict(name=name,max_abs=error.max().item(),relative_l2=relative.item(),min_token_cosine=cosine,bit_equal=equal)
+    print("PE_CHECKPOINT "+json.dumps(result,sort_keys=True),flush=True)
+    assert torch.isfinite(a).all()
+    if teacher:assert relative<=2e-3 and equal>=.85,result
+    if final:assert relative<=1e-2 and cosine>=.9999,result
+    return result
 
 
 @pytest.mark.parametrize("image_index",[0])
@@ -130,21 +141,36 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
     down=compile_biased_projection_aot(width=4096,outputs=1024)
     gelu=compile_gelu_aot(width=4096);residual=compile_scaled_residual_aot(width=1024)
     delta=torch.empty_like(x);mlp=torch.empty(n,4096,device="cuda",dtype=torch.bfloat16)
+    def candidate_layer(source,i):
+        base=f"backbone.layers.{i}."
+        middle=torch.empty_like(source);output=torch.empty_like(source)
+        norm.launch(source,state[base+"ln_1.weight"],state[base+"ln_1.bias"],normed,scalars=[n,1e-5])
+        qproj.launch(normed,state[base+"self_attn.qkv_proj.weight"],state[base+"self_attn.qkv_proj.bias"],qkv,scalars=[n])
+        rotary.launch(qkv,freq,q,k,v,scalars=[n,gw])
+        attention.launch(q,k,v,o,lse,cu,scalars=[64**-.5,l2])
+        oproj.launch(o,state[base+"self_attn.out_proj.weight"],state[base+"self_attn.out_proj.bias"],delta,scalars=[n])
+        residual.launch(source,delta,state[base+"ls_1.gamma"],middle,scalars=[n])
+        norm.launch(middle,state[base+"ln_2.weight"],state[base+"ln_2.bias"],normed,scalars=[n,1e-5])
+        up.launch(normed,state[base+"mlp.c_fc.weight"],state[base+"mlp.c_fc.bias"],mlp,scalars=[n]);gelu.launch(mlp,mlp,scalars=[n])
+        down.launch(mlp,state[base+"mlp.c_proj.weight"],state[base+"mlp.c_proj.bias"],delta,scalars=[n])
+        residual.launch(middle,delta,state[base+"ls_2.gamma"],output,scalars=[n])
+        return output
+    xref32=xref.clone();scope=reference._reference_globals
+    bf16_attention=scope["flash_attn_varlen_func"]
     with torch.inference_mode():
         for i,layer in enumerate(reference.backbone.layers):
-            base=f"backbone.layers.{i}."
-            norm.launch(x,state[base+"ln_1.weight"],state[base+"ln_1.bias"],normed,scalars=[n,1e-5])
-            qproj.launch(normed,state[base+"self_attn.qkv_proj.weight"],state[base+"self_attn.qkv_proj.bias"],qkv,scalars=[n])
-            rotary.launch(qkv,freq,q,k,v,scalars=[n,gw])
-            attention.launch(q,k,v,o,lse,cu,scalars=[64**-.5,l2])
-            oproj.launch(o,state[base+"self_attn.out_proj.weight"],state[base+"self_attn.out_proj.bias"],delta,scalars=[n])
-            residual.launch(x,delta,state[base+"ls_1.gamma"],tmp,scalars=[n]);x,tmp=tmp,x
-            norm.launch(x,state[base+"ln_2.weight"],state[base+"ln_2.bias"],normed,scalars=[n,1e-5])
-            up.launch(normed,state[base+"mlp.c_fc.weight"],state[base+"mlp.c_fc.bias"],mlp,scalars=[n]);gelu.launch(mlp,mlp,scalars=[n])
-            down.launch(mlp,state[base+"mlp.c_proj.weight"],state[base+"mlp.c_proj.bias"],delta,scalars=[n])
-            residual.launch(x,delta,state[base+"ls_2.gamma"],tmp,scalars=[n]);x,tmp=tmp,x
+            teacher=candidate_layer(xref,i)
+            x=candidate_layer(x,i)
+            ref32_teacher=xref.clone()
+            scope["flash_attn_varlen_func"]=scope["fp32_flash_attn_varlen_func"]
+            layer(ref32_teacher,layer.ln_1(ref32_teacher),metadata,None)
+            layer(xref32,layer.ln_1(xref32),metadata,None)
+            scope["flash_attn_varlen_func"]=bf16_attention
             layer(xref,layer.ln_1(xref),metadata,None)
-            _metric(f"layer{i}",x,xref)
+            _metric(f"teacher_layer{i}",teacher,xref,teacher=True)
+            _metric(f"reference_attention_variance_layer{i}",ref32_teacher,xref)
+            _metric(f"free_layer{i}",x,xref)
+            _metric(f"free_vs_fp32_attention_layer{i}",x,xref32)
         units=gh*gw//4
         merged=torch.empty(units,4096,device="cuda",dtype=torch.bfloat16)
         compile_merge2_aot(width=1024,class_token=True).launch(x,merged,scalars=[gh,gw])
@@ -155,4 +181,8 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         compile_patch_projection_aot(width=4096,outputs=4608).launch(adapted,state["proj_out.weight"],final,scalars=[units])
         pooled=xref.index_select(0,metadata.pool_rows).reshape(units,4096)
         ref_final=reference.proj_out(torch.nn.functional.gelu(reference.proj_in(pooled)))
-        _metric("projected_embeddings",final,ref_final)
+        pooled32=xref32.index_select(0,metadata.pool_rows).reshape(units,4096)
+        ref_final32=reference.proj_out(torch.nn.functional.gelu(reference.proj_in(pooled32)))
+        _metric("projected_embeddings_vs_bf16_attention",final,ref_final,final=True)
+        _metric("projected_embeddings_vs_fp32_attention",final,ref_final32)
+        _metric("reference_bf16_vs_fp32_attention",ref_final,ref_final32)
