@@ -357,3 +357,81 @@ def test_aligned_exported_baseline_bytes(k, tmp_path):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(*outputs)
+
+
+def test_glmf_identical_logical_operands(tmp_path, monkeypatch):
+    """Test-only zero extension compares native688 with pristine master768.
+
+    CPU generation makes both architectures consume byte-identical operands;
+    hashes cover native inputs before the baseline is extended on device.
+    """
+    require_b12x()
+    import hashlib
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd import fp8_moe
+
+    baseline_path = os.environ.get('NVFP4_DUEL_BASELINE_A4')
+    if not baseline_path:
+        pytest.skip('set NVFP4_DUEL_BASELINE_A4 to pristine master A4 module')
+    name = 'b12x.integration.cuteafd._nvfp4_identical_baseline'
+    spec = importlib.util.spec_from_file_location(name, baseline_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    native, padded = 688, 768
+    g = _native_geometry('glmf_nvfp4', 3, native)
+    bg = _native_geometry('glmf_nvfp4', 3, padded)
+    capacity, h, e = 4096, g.hidden, g.experts
+    gen = torch.Generator(device='cpu').manual_seed(688768)
+    hashes = {}
+    def device(label, tensor):
+        cpu = tensor.contiguous()
+        hashes[label] = hashlib.sha256(cpu.view(torch.uint8).numpy().tobytes()).hexdigest()
+        return cpu.cuda()
+    weights, baseline_weights = [], []
+    for label, rows, k, input_scale in [('gate', native, h, 5/(6*448)),
+                                       ('up', native, h, 5/(6*448)),
+                                       ('down', h, native, 100/(6*448))]:
+        w = device(label + '_codes', torch.randint(0, 256, (e, rows, k // 2), generator=gen, dtype=torch.uint8))
+        sc = device(label + '_scales', torch.randint(32, 88, (e, rows, k // 16), generator=gen, dtype=torch.uint8))
+        tail = device(label + '_globals', torch.cat([
+            torch.rand(e, generator=gen) * .004 + .001,
+            input_scale * torch.pow(2., torch.arange(e).float().remainder(7)-3)]).view(torch.uint8))
+        weights.extend([w, torch.cat([sc.flatten(), tail])])
+        # Only the reference arm receives zeros; native allocation remains exact.
+        if label == 'down':
+            bw = torch.nn.functional.pad(w, (0, (padded-native)//2))
+            bs = torch.nn.functional.pad(sc, (0, (padded-native)//16))
+        else:
+            bw = torch.nn.functional.pad(w, (0, 0, 0, padded-native))
+            bs = torch.nn.functional.pad(sc, (0, 0, 0, padded-native))
+        baseline_weights.extend([bw, torch.cat([bs.flatten(), tail])])
+    x = device('x', torch.randn(capacity, h, generator=gen).bfloat16())
+    ids = device('ids', torch.rand(capacity, e, generator=gen).topk(g.top_k, -1).indices.int())
+    gamma = device('gamma', torch.rand(capacity, g.top_k, generator=gen))
+    print('identical_logical_sha256', hashes, flush=True)
+    with exportable_compilation():
+        candidate = fp8_moe.compile_fp8_moe_aot(g, route='auto', max_rows=capacity, wire=False)
+    candidate = ExportedProgram(candidate, tmp_path, 'glmf_native688')
+    for symbol in ['StreamNvfp4LinearA4', 'StreamNvfp4GateUpA4', 'ChunkRowsA4', 'ChunkSwiGLUA4']:
+        monkeypatch.setattr(fp8_moe, symbol, getattr(module, symbol))
+    with exportable_compilation():
+        baseline = fp8_moe.compile_fp8_moe_aot(bg, route='auto', max_rows=capacity, wire=False)
+    baseline = ExportedProgram(baseline, tmp_path, 'glmf_master768')
+    scratches = [torch.empty(fp8_moe.fp8_moe_scratch_bytes(geometry, 'auto', capacity, False),
+                             device='cuda', dtype=torch.uint8) for geometry in [g, bg]]
+    outputs = [torch.empty(capacity, h, device='cuda', dtype=torch.bfloat16) for _ in range(2)]
+    for rows in [1, 7, 80, 2048, 2752, 4096]:
+        for program, w, scratch, out in zip([candidate, baseline], [weights, baseline_weights], scratches, outputs):
+            scratch.fill_(0xa5)
+            program.launch(x, ids, gamma, *w, out, scratch, scalars=(rows,))
+        torch.cuda.synchronize()
+        different = (outputs[0][:rows] != outputs[1][:rows]).nonzero()
+        print('identical_logical_result', rows, 'differing_elements', len(different), flush=True)
+        assert not len(different), (rows, different[:20].tolist())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        candidate.launch(x, ids, gamma, *weights, outputs[0], scratches[0], scalars=(4096,))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(*outputs)
