@@ -502,3 +502,19 @@ def exlr8_export_programs(role="all", *, hidden=6144, units=16, top_k=8, max_gro
         # contract as Spark experts; every grid is bounded by runtime cta_limit.
         return result[1:] + grouped + replies
     return result + grouped + replies
+
+
+def exlr8_segment_programs(*, hidden=6144, units=16, top_k=8, experts=256, swiglu_limit=0):
+    """Separate inventory: ordinary program order and objects remain unchanged."""
+    from .exlr8 import compile_exlr8_a16_aot
+    rows = 8192
+    groups = (rows * top_k + 63) // 64 + experts
+    result = [("grouped_group_segments", "exlr8_group", {"max_rows": rows},
+        lambda: compile_exlr8_group_aot(experts=experts, top_k=top_k, max_groups=groups,
+            hidden=hidden, max_rows=rows, group_rows=64, row_addresses=True))]
+    for activation in ("a16", "a8"):
+        result.append((f"{activation}_grouped_segments", "exlr8_a16", {"max_rows": rows},
+            lambda a=activation: compile_exlr8_a16_aot(hidden=hidden, units=units, top_k=top_k,
+                max_groups=groups, device_count=True, grouped=True, grouped_rows=rows,
+                activations=a, row_addresses=True, swiglu_limit=swiglu_limit)))
+    return result
