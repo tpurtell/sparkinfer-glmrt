@@ -15,6 +15,7 @@ ids) is read. Pool offsets are 64-bit.
 from __future__ import annotations
 
 import cuda.bindings.driver as cuda
+import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32
 
@@ -178,4 +179,24 @@ class WriteActiveWidth:
             active_width[0] = table_width * Int32(_PAGE)
 
 
-__all__ = ["SharedSupertileGather", "WriteActiveWidth"]
+class WriteLiveActiveWidth:
+    """Clamp a captured table capacity to the largest device-resident row frontier."""
+
+    @cute.jit
+    def __call__(self, active_width: cute.Pointer, lengths: cute.Pointer,
+                 rows: Int32, table_width: Int32, stream: cuda.CUstream):
+        self.kernel(active_width, lengths, rows, table_width).launch(
+            grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, active_width: cute.Pointer, lengths: cute.Pointer,
+               rows: Int32, table_width: Int32):
+        if Int32(cute.arch.thread_idx()[0]) == Int32(0):
+            live = Int32(0)
+            for row in cutlass.range(rows, unroll=1):
+                live = cute.max(live, Int32(lengths[row]))
+            pages = cute.max(Int32(1), (live + Int32(_PAGE - 1)) // Int32(_PAGE))
+            active_width[0] = cute.min(pages, table_width) * Int32(_PAGE)
+
+
+__all__ = ["SharedSupertileGather", "WriteActiveWidth", "WriteLiveActiveWidth"]

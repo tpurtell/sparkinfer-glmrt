@@ -45,7 +45,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64, const_expr
 
-from b12x.attention.dsa_indexer._gather_cute import SharedSupertileGather, WriteActiveWidth
+from b12x.attention.dsa_indexer._gather_cute import SharedSupertileGather, WriteLiveActiveWidth
 
 from ._common import FLASH, DSV4Geometry, Operand, Scalar, compile_program
 
@@ -189,7 +189,7 @@ class _TopK:
             self.scorer = _build_dsa_paged_stream_supertile_kernel(
                 int(layout.stream_scorer_ctas), self.heads, _TILE_BLOCK_Q, _PAGED_TILE_BLOCK_K,
                 _PAGE_BYTES, _PAGE_BYTES // 4, runtime_ctas=self.runtime_tiled)
-            self.active_width = WriteActiveWidth()
+            self.active_width = WriteLiveActiveWidth()
         else:
             raise NotImplementedError(f"unsupported indexer route {self.route!r}")
         self.k_tiles = self.supertile // self.block_k
@@ -213,6 +213,8 @@ class _TopK:
                L.stream_scorer_ctas, L.max_chunks, L.nbytes, self.num_sms)
         key = key if self.heads == _HEADS else key + (self.heads,)
         key = key + ("scored-logical",) if self.scored_logical else key
+        if self.route == "paged_tiled":
+            key = key + ("device-live-width-v1",)
         return key if getattr(self, "deterministic", True) else key + ("arrival-order",)
 
     # -- helpers ------------------------------------------------------------
@@ -295,7 +297,8 @@ class _TopK:
         else:
             table_flat = cute.make_tensor(page_table, cute.make_layout((m * table_stride,)))
             table_row_stride = table_stride
-            self.active_width(self._ptr(cutlass.Int32, base, L.active_width_offset_bytes, 4), table_width, stream)
+            self.active_width(self._ptr(cutlass.Int32, base, L.active_width_offset_bytes, 4),
+                              cache_lengths, rows, table_width, stream)
         dummy_desc = cute.make_tensor(self._ptr(cutlass.Int64, base, L.active_width_offset_bytes, 8), cute.make_layout((1,)))
         chunks = (table_width + Int32(self.supertile_pages - 1)) // Int32(self.supertile_pages)
         chunk = Int32(0)
