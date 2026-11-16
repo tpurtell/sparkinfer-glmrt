@@ -26,7 +26,7 @@ def test_centered_layer_norm_matches_vendor(hidden,vendor_rsqrt,rows):
     program=compile_layer_norm_aot(hidden=hidden,vendor_rsqrt=vendor_rsqrt)
     program.launch(x,gamma,beta,out,scalars=[rows,1e-5])
     ulp=vendor.metrics(f"centered_norm_h{hidden}_rows{rows}",out,ref,source="vendor-Triton" if vendor_rsqrt else "torch.nn.LayerNorm")
-    assert ulp<=2
+    assert ulp<=(0 if vendor_rsqrt else 1)
     torch.testing.assert_close(out,ref,atol=.015625,rtol=.008)
     from b12x._lib.runtime_control import kernel_resolution_guard
     with kernel_resolution_guard("PE centered norm live rows"):
@@ -83,7 +83,7 @@ def test_step5_learned_absolute_position_resized_grid(height,width):
     out=torch.empty_like(patch);dummy=torch.zeros(hidden,device="cuda",dtype=torch.bfloat16)
     program=compile_learned_position_aot(hidden=hidden,grid=52,class_token=False,torch_bilinear=True)
     program.launch(patch,table,dummy,dummy,out,scalars=[height,width])
-    assert vendor.metrics(f"position_step5_{height}x{width}",out,ref)<=2
+    assert vendor.metrics(f"position_step5_{height}x{width}",out,ref)==0
     torch.testing.assert_close(out,ref,atol=.015625,rtol=.008)
 
 
@@ -109,5 +109,5 @@ def test_inkling_learned_positions_class_and_pre_norm(height,width):
     program.launch(patch,table,cls,cls_pos,raw,scalars=[height,width])
     normalized=compile_layer_norm_aot(hidden=hidden,vendor_rsqrt=True)
     normalized.launch(raw,norm.weight,norm.bias,out,scalars=[rows,1e-5])
-    assert vendor.metrics(f"position_norm_inkling_{height}x{width}",out,ref)<=2
+    assert vendor.metrics(f"position_norm_inkling_{height}x{width}",out,ref)==0
     torch.testing.assert_close(out,ref,atol=.015625,rtol=.008)
