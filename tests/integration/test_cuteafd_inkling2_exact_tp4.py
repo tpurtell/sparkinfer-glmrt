@@ -236,3 +236,75 @@ def test_native_dynamic_stage_reference(width, tmp_path, monkeypatch):
     for rows in [1, 7, 80]:
         report = oracle._run(g, width, 80, rows, gamma_spread=2, bimodal=True)
         oracle._print(f'exported native width {width}, rows {rows}', report)
+
+
+@pytest.mark.parametrize('hidden,inter', [(16, 16), (560, 80), (592, 112), (1040, 176), (512, 128)])
+def test_gate_input_and_column_tails(hidden, inter, tmp_path):
+    require_b12x()
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._nvfp4_moe_a4 import (
+        StreamNvfp4GateUpA4, StreamNvfp4LinearA4, ChunkSwiGLUA4)
+
+    gate = StreamNvfp4GateUpA4(inter=inter, hidden=hidden, experts=1)
+    linear = StreamNvfp4LinearA4(n=inter, k=hidden, experts=1)
+    quant = ChunkSwiGLUA4(inter=inter, hidden=hidden, experts=1)
+
+    class Pair:
+        def key(self):
+            return ('native_gate_tail_pair', gate.key(), linear.key(), quant.key())
+
+        @cute.jit
+        def __call__(self, aq: cute.Pointer, scales: cute.Pointer, meta: cute.Pointer,
+                     w1: cute.Pointer, s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer,
+                     s2: cute.Pointer, g: cute.Pointer, u: cute.Pointer, fq: cute.Pointer,
+                     fs: cute.Pointer, rq: cute.Pointer, rs: cute.Pointer,
+                     live: Int32, stream: cuda.CUstream):
+            gate(aq, scales, meta, w1, s1, w3, s3, s2, fq, fs, Int32(1), stream)
+            linear(aq, scales, meta, w1, s1, g, Int32(1), stream)
+            linear(aq, scales, meta, w3, s3, u, Int32(1), stream)
+            quant(g, u, meta, s2, rq, rs, Int32(1), stream)
+
+    inputs = ['aq', 'scales', 'meta', 'w1', 's1', 'w3', 's3', 's2']
+    outputs = ['g', 'u', 'fq', 'fs', 'rq', 'rs']
+    ops = tuple(Operand(n, torch.int32 if n == 'meta' else torch.uint8, '[bytes]', align=4)
+                for n in inputs) + tuple(Operand(n, torch.bfloat16 if n in ('g', 'u') else torch.uint8,
+                                                '[bytes]', 'out', align=4) for n in outputs)
+    pair = Pair()
+    with exportable_compilation():
+        program = compile_program(pair, name='native_gate_tail_pair', operands=ops,
+                                  scalars=(Scalar('live'),), key=pair.key())
+    exported = ExportedProgram(program, tmp_path, 'gate_tail_pair')
+    torch.manual_seed(hidden)
+    codes = lambda *shape: torch.randint(0, 256, shape, device='cuda', dtype=torch.uint8)
+    def scale(rows, k):
+        return torch.cat([torch.ones(rows * k // 16, device='cuda').to(torch.float8_e4m3fn).view(torch.uint8),
+                          torch.tensor([1.0, 1.0], device='cuda').view(torch.uint8)])
+    aq = codes(128, hidden // 2)
+    scales = torch.ones(128, hidden // 16, device='cuda').to(torch.float8_e4m3fn).view(torch.uint8)
+    w1, w3 = codes(inter, hidden // 2), codes(inter, hidden // 2)
+    s1, s3, s2 = scale(inter, hidden), scale(inter, hidden), scale(hidden, inter)
+    meta = torch.tensor([0, 1, 0, 0, 128, 0, 0, 0], device='cuda', dtype=torch.int32)
+    g, u = [torch.empty(128, inter, device='cuda', dtype=torch.bfloat16) for _ in range(2)]
+    fq, rq = [torch.full((128, inter // 2), 255, device='cuda', dtype=torch.uint8) for _ in range(2)]
+    fs, rs = [torch.full((128, inter // 16), 255, device='cuda', dtype=torch.uint8) for _ in range(2)]
+    args = (aq, scales, meta, w1, s1, w3, s3, s2, g, u, fq, fs, rq, rs)
+    table = torch.tensor([0,.5,1,1.5,2,3,4,6,0,-.5,-1,-1.5,-2,-3,-4,-6], device='cuda')
+    def decode(p):
+        return table[torch.stack([p.long() & 15, p.long() >> 4], -1).flatten(-2)]
+    expected_g = (decode(aq).double() @ decode(w1).double().T).bfloat16()
+    expected_u = (decode(aq).double() @ decode(w3).double().T).bfloat16()
+    for rows in [1, 7, 80, 128]:
+        meta[4] = rows
+        exported.launch(*args, scalars=(rows,))
+        torch.cuda.synchronize()
+        assert torch.equal(g[:rows], expected_g[:rows])
+        assert torch.equal(u[:rows], expected_u[:rows])
+        assert torch.equal(fq[:rows], rq[:rows])
+        assert torch.equal(fs[:rows], rs[:rows])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        exported.launch(*args, scalars=(128,))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(fq, rq) and torch.equal(fs, rs)
