@@ -16,9 +16,10 @@ from b12x.moe._shared.kernels.v4_stream_pipeline import (
 from tests.moe.test_v41_exact_slices import pack
 
 
-def _run_native_segments(hidden, intermediate, coded, profile=None):
+def _run_native_segments(hidden, intermediate, coded, profile=None, *, experts=None, routing_mode="two_hot"):
     torch.manual_seed(844)
-    experts, topk, capacity = 384 if coded else 256, 6, 8192
+    experts = experts if experts is not None else 384 if coded or hidden == 7168 else 256
+    topk, capacity = 6, 8192
     weights, scales = {}, {}
     for name, shape in (("w1", (experts, intermediate, hidden // 2)),
                         ("w3", (experts, intermediate, hidden // 2)),
@@ -37,7 +38,10 @@ def _run_native_segments(hidden, intermediate, coded, profile=None):
     wire[:, hidden:] = torch.randint(119, 124, (capacity, hidden // 32), device="cuda", dtype=torch.uint8)
     ids = torch.randint(experts, (capacity, topk), device="cuda", dtype=torch.int32)
     # Two shared hot experts exercise crossing a member boundary within a group.
-    ids[:, :2] = torch.arange(2, device="cuda", dtype=torch.int32)
+    if routing_mode == "two_hot":
+        ids[:, :2] = torch.arange(2, device="cuda", dtype=torch.int32)
+    elif routing_mode != "uniform":
+        raise ValueError("routing_mode must be uniform or two_hot")
     routing = torch.rand((capacity, topk), device="cuda") / topk
     output = torch.full((capacity + 2, hidden), 11, dtype=torch.bfloat16, device="cuda")
     # Reverse the physical row layout to catch accidental contiguous accesses.
@@ -105,7 +109,7 @@ def _run_native_segments(hidden, intermediate, coded, profile=None):
                     samples.append(start.elapsed_time(end) * 1000)
                 measurements[name] = statistics.median(samples)
             print(json.dumps(dict(hidden=hidden, intermediate=intermediate, coded=coded,
-                rows=rows, byte_identical=True, us=measurements,
+                rows=rows, experts=experts, routing=routing_mode, byte_identical=True, us=measurements,
                 us_per_row={name: value / rows for name, value in measurements.items()})), flush=True)
     # A merged pair with a non-4096 boundary must equal separate ordinary units.
     baseline(2752)
@@ -133,3 +137,7 @@ def test_native_segments_match_singletons_and_row_curve(hidden, intermediate, co
 @pytest.mark.parametrize("arm", ["ordinary", "segments"])
 def test_profile_8192_flash(arm):
     _run_native_segments(4096, 512, False, profile=arm)
+
+
+def test_native_pro384_uniform_segments_curve():
+    _run_native_segments(7168, 768, False, experts=384, routing_mode="uniform")
