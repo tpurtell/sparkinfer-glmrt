@@ -52,6 +52,23 @@ def _official(cfg):
     tree=ast.parse(raw)
     nodes=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef))]
     exec(compile(ast.Module(body=nodes,type_ignores=[]),str(path),"exec"),namespace)
+    # Model nn.Linear denotes one projection with a fused bias; library
+    # heuristic BF16 partial/epilogue choices are context, not canonical math.
+    class CanonicalLinear(nn.Linear):
+        def forward(self,x):
+            old_tf32=torch.backends.cuda.matmul.allow_tf32
+            old_reduce=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+            try:
+                torch.backends.cuda.matmul.allow_tf32=False
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False
+                value=x.float()@self.weight.float().T
+                if self.bias is not None:value=value+self.bias.float()
+                return value.bfloat16()
+            finally:
+                torch.backends.cuda.matmul.allow_tf32=old_tf32
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=old_reduce
+    namespace["vendor_default_linear"]=namespace["_linear"]
+    namespace["_linear"]=lambda input,output,bias=True:CanonicalLinear(input,output,bias=bias,dtype=torch.bfloat16)
     tower=namespace["Inkling2VisionEncoder"](cfg["vision_config"],cfg["text_config"]["hidden_size"])
     tower._reference_globals=namespace
     return tower
@@ -90,7 +107,7 @@ def _metric(name,actual,reference,*,teacher=False,final=False):
 def test_inkling_full_checkpoint_native_transformer(image_index):
     require_b12x()
     FINDINGS.clear()
-    print("PE_REFERENCE_BACKENDS "+json.dumps(dict(bf16="SDPBackend.MATH",fp32="SDPBackend.MATH",
+    print("PE_REFERENCE_BACKENDS "+json.dumps(dict(bf16="SDPBackend.MATH",fp32="SDPBackend.MATH",projection="FP32 GEMM + FP32 bias + single BF16 store",
         device=torch.cuda.get_device_name(),capability=torch.cuda.get_device_capability(),
         matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
         allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)),flush=True)
@@ -126,7 +143,7 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
     pixels=(2*(pixels*std+mean)-1).bfloat16().float()
     patches=torch.empty(gh*gw,1200,device="cuda",dtype=torch.bfloat16)
     compile_normalized_patches_aot(patch=20,hwc=True).launch(pixels,patches,scalars=[h,w])
-    plain=patches@state["backbone.embeddings.patch_embedding.weight"].T
+    plain=reference.backbone.embeddings.patch_embedding(patches)
     metadata=reference.metadata([[1,gh//2,gw//2]],torch.device("cuda",torch.cuda.current_device()))
     embeddings=reference.backbone.embeddings
     xref,_=vendor.inkling().embed_tokens(plain,metadata.patch_rows,embeddings.position_embedding.view(32,32,-1),metadata.meta,
@@ -167,7 +184,8 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         down.launch(mlp,state[base+"mlp.c_proj.weight"],state[base+"mlp.c_proj.bias"],delta,scalars=[n])
         residual.launch(middle,delta,state[base+"ls_2.gamma"],output,scalars=[n])
         return output
-    def projection_arms(name,source,weight,bias,native,default):
+    def projection_arms(name,source,weight,bias,native,canonical):
+        default=torch.nn.functional.linear(source,weight,bias)
         old_tf32=torch.backends.cuda.matmul.allow_tf32
         old_reduce=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
         try:
@@ -176,6 +194,7 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
             strict=torch.nn.functional.linear(source,weight,bias)
             fp32=(source.float()@weight.float().T+bias.float()).bfloat16()
             separate=(source@weight.T)+bias
+            _metric(name+"_native_vs_canonical",native,canonical)
             _metric(name+"_native_vs_vendor_default",native,default)
             _metric(name+"_native_vs_strict",native,strict)
             _metric(name+"_native_vs_explicit_fp32",native,fp32)
