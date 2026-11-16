@@ -98,7 +98,7 @@ def test_oracle_and_graph(program):
         _check_bias_program(exported, module, compiled.geometry["width"])
         return
     if kind == "kv_store":
-        _check_kv_program(exported, module, compiled.geometry)
+        _check_kv_program(exported, module, compiled.geometry, Path(exported._name).parent)
         return
     maximum = 4096 if kind == "dflare_mix" else 64
     if kind == "dflare_mix":
@@ -360,15 +360,45 @@ def _check_norm_program(kind, exported, module, geometry):
         for name, actual, expected in (("q", q_out, q_expected), ("k", k_out, k_expected)):
             a, b = actual.view(torch.int16).int(), expected.view(torch.int16).int()
             if a.numel():
+                ordered_a = torch.where(a < 0, -32768-a, a)
+                ordered_b = torch.where(b < 0, -32768-b, b)
                 print("INKLING_ROPE " + json.dumps({"kind": name, "rows": rows,
                       "heads": [q_heads, kv_heads],
                       "bit_equal_fraction": float((a == b).float().mean()),
-                      "max_ulp": int((a-b).abs().max())}), flush=True)
+                      "max_ulp": int((ordered_a-ordered_b).abs().max()),
+                      "max_abs": float((actual.float()-expected.float()).abs().max())}), flush=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             invoke(tensors, 64)
         graph.replay()
         torch.testing.assert_close(q_out[:64], q_expected[:64], atol=2e-2, rtol=1e-2)
+        # Feed identical reference-normalized BF16 operands into the same
+        # rotation body to distinguish norm reduction effects from trig/order.
+        from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+        normalized_qkv = qkv.clone()
+        for start, count, gamma in ((0, q_heads, q_gamma), (q_heads, kv_heads, k_gamma)):
+            value = qkv[:, start:start+count].float()
+            inverse = 1 / (value.square().mean(-1, keepdim=True) + 1e-6).sqrt()
+            normalized_qkv[:, start:start+count] = (value * inverse * gamma.float()).bfloat16()
+        with exportable_compilation():
+            rotation = compile_program(kernels._QKNormRope(q_heads, kv_heads, normalize=False),
+                name="inkling_rotation_oracle", operands=(
+                    Operand("qkv", torch.bfloat16, "[rows,heads,128]"),
+                    Operand("q_gamma", torch.bfloat16, "[128]"),
+                    Operand("k_gamma", torch.bfloat16, "[128]"),
+                    Operand("positions", torch.int64, "[rows]"),
+                    Operand("inv_freq", torch.float32, "[64]"),
+                    Operand("q_out", torch.bfloat16, "[rows,q,128]", "out"),
+                    Operand("k_out", torch.bfloat16, "[rows,k,128]", "out"),
+                    Operand("v_out", torch.bfloat16, "[rows,k,128]", "out"),
+                ), scalars=(Scalar("rows"), Scalar("eps", "float32")),
+                key=(q_heads, kv_heads, "isolated_rotation"))
+        rotation.launch(normalized_qkv, *tensors[1:], scalars=(rows, 1e-6))
+        print("INKLING_ROTATION_ONLY", [q_heads, kv_heads],
+              int((q_out.view(torch.int16) != q_expected.view(torch.int16)).sum()),
+              int((k_out.view(torch.int16) != k_expected.view(torch.int16)).sum()), flush=True)
+        assert torch.equal(q_out.view(torch.int16), q_expected.view(torch.int16))
+        assert torch.equal(k_out.view(torch.int16), k_expected.view(torch.int16))
 
 
 def _check_silu_program(exported, module, intermediate):
@@ -418,7 +448,7 @@ def _check_bias_program(exported, module, width):
     assert torch.equal(output[:64], expected[:64])
 
 
-def _check_kv_program(exported, module, geometry):
+def _check_kv_program(exported, module, geometry, directory):
     heads, fp8, stride = geometry["kv_heads"], geometry["kv_format"] == "fp8", geometry["plane_bytes"]
     high = (2**31 // stride) + 2
     sources = [torch.randn(64, heads, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
@@ -439,8 +469,25 @@ def _check_kv_program(exported, module, geometry):
         assert exported.launch(ctypes.byref(module), *(t.data_ptr() for t in tensors), rows,
                                torch.cuda.current_stream().cuda_stream) == 0
 
+    codec = None
+    references = None
+    if fp8:
+        library = directory / "codec.so"
+        arch = "sm_" + "".join(map(str, torch.cuda.get_device_capability()))
+        subprocess.run(["nvcc", "-shared", "-Xcompiler", "-fPIC", "-arch=" + arch,
+                        str(Path(__file__).with_name("inkling_kv_codec.cu")),
+                        "-o", str(library)], check=True)
+        codec = ctypes.CDLL(str(library))
+        codec.launch_codec.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        codec.launch_codec.restype = ctypes.c_int
+        references = [torch.zeros(128, elements, device="cuda", dtype=torch.uint8) for _ in range(2)]
+        small_slots = slots.clone()
+        small_slots[-1] = 127
+        assert codec.launch_codec(*(t.data_ptr() for t in (*sources, small_slots, *references)),
+                                  64, heads, torch.cuda.current_stream().cuda_stream) == 0
+
     def check(rows):
-        for source, plane in zip(sources, planes):
+        for plane_index, (source, plane) in enumerate(zip(sources, planes)):
             for row in range(rows):
                 slot = int(slots[row])
                 if slot < 0:
@@ -450,13 +497,19 @@ def _check_kv_program(exported, module, geometry):
                 else:
                     value = source[row].float()
                     maximum = value.abs().amax(-1)
-                    scale = torch.where(maximum > 0, maximum / 448, 1)
-                    inverse = 1 / scale
+                    scale = torch.where(maximum > 0, (maximum.double() / 448).float(), 1)
+                    inverse = (1 / scale.double()).float()
                     codes = (value * inverse[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
                     expected = torch.zeros(stride, device="cuda", dtype=torch.uint8)
                     expected[:heads*128] = codes.flatten()
                     expected[heads*128:heads*132] = scale.view(torch.uint8)
-                    assert torch.equal(plane[slot], expected)
+                    native_expected = references[plane_index][127 if row == 63 else slot]
+                    if not torch.equal(plane[slot], native_expected):
+                        mismatch = plane[slot] != native_expected
+                        print("KV_CODEC_MISMATCH", heads, row, int(mismatch.sum()),
+                              torch.nonzero(mismatch).flatten()[:24].tolist(), flush=True)
+                    assert torch.equal(plane[slot], native_expected)
+                    assert torch.equal(expected, native_expected)
             assert torch.count_nonzero(plane[1]) == 0
 
     for rows in (0, 1, 64):

@@ -303,9 +303,10 @@ class _ResidualNorm:
 
 
 class _QKNormRope:
-    def __init__(self, q_heads, kv_heads):
+    def __init__(self, q_heads, kv_heads, normalize=True):
         self.q_heads, self.kv_heads = q_heads, kv_heads
         self.heads = q_heads + 2 * kv_heads
+        self.normalize = normalize
 
     @cute.jit
     def __call__(self, qkv: cute.Pointer, q_gamma: cute.Pointer,
@@ -338,7 +339,10 @@ class _QKNormRope:
         gamma = Float32(k_gamma[column])
         if head < self.q_heads:
             gamma = Float32(q_gamma[column])
-        normalized[column] = _round_bf16(value * inverse[0] * gamma)
+        if cutlass.const_expr(self.normalize):
+            normalized[column] = _round_bf16(value * inverse[0] * gamma)
+        else:
+            normalized[column] = value
         cute.arch.sync_threads()
         half_column = Int32(column) % 64
         angle = Float32(positions[row]) * Float32(inv_freq[half_column])
