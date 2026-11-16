@@ -81,13 +81,12 @@ def _metrics(name,a,r):
     return value
 
 
-@pytest.mark.parametrize("side",[504])
+@pytest.mark.parametrize("side",[504,728])
 def test_step_full_checkpoint_native_tower(side):
     require_b12x()
     from PIL import Image
     import numpy as np
     from b12x.integration.cuteafd import media,perception,perception_forward,image_resize
-    from .test_cuteafd_image_resize import _coeff
     from cuda.bindings import runtime
     snapshot=Path(os.environ["CUTEAFD_PE_STEP5_SNAPSHOT"]);config=json.loads((snapshot/"config.json").read_text())
     settings=dict(config["vision_config"],use_abs_posemb=True,use_rope2d=True,use_ln_pre=True,mlp_ratio=8960/1536)
@@ -103,8 +102,15 @@ def test_step_full_checkpoint_native_tower(side):
         name=name[len("vision_model."):]
         name=name.replace(".attn.in_proj_weight",".attn.qkv_proj.weight").replace(".attn.in_proj_bias",".attn.qkv_proj.bias")
         name=name.replace(".mlp.c_fc.",".mlp.fc1.").replace(".mlp.c_proj.",".mlp.fc2.")
-        state[name]=tensor.cuda()
+        state[name]=tensor
     reference.load_state_dict(state,strict=True,assign=True)
+    # Keep the 47 checkpoint layers on CPU; only one reference/native weight
+    # set is resident at a time so the same oracle fits a 16 GiB GB10 lease.
+    for name, child in reference.named_children():
+        if name != "transformer":child.cuda()
+    for parameter in reference.parameters(recurse=False):parameter.data=parameter.data.cuda()
+    for name, tensor in reference.state_dict().items():
+        if not name.startswith("transformer."):state[name]=tensor
     # Nonpersistent RoPE cache is not a checkpoint tensor; rebuild on CPU using
     # the vendor builder before moving only that small immutable table to GPU.
     for layer in reference.transformer.resblocks:
@@ -114,8 +120,20 @@ def test_step_full_checkpoint_native_tower(side):
     files=list(Path(os.environ["CUTEAFD_PE_REAL_IMAGES"]).glob("*.jpg"))
     raw=Image.open(files[0]).convert("RGB").crop((0,0,504,504));rgb=torch.from_numpy(np.array(raw)).cuda()
     mean=torch.tensor([.48145466,.4578275,.40821073],device="cuda");std=torch.tensor([.26862954,.26130258,.27577711],device="cuda")
-    pixels=torch.empty(side,side,3,device="cuda")
-    image_resize.compile_rgb_normalize_aot().launch(rgb,mean,std,pixels,scalars=[side,side])
+    normalized=torch.empty(504,504,3,device="cuda")
+    image_resize.compile_rgb_normalize_aot().launch(rgb,mean,std,normalized,scalars=[504,504])
+    if side==504:pixels=normalized
+    else:
+        from .test_cuteafd_image_resize import _coeff
+        coefficients=image_resize.compile_resize_coefficients_aot(filter="bilinear")
+        taps=image_resize.resize_max_taps(504,side,filter="bilinear")
+        def coefficient():
+            indices=torch.empty(side,device="cuda",dtype=torch.int32);sizes=torch.empty_like(indices);weights=torch.empty(side,taps,device="cuda")
+            coefficients.launch(indices,sizes,weights,scalars=[504,side,taps]);return indices,sizes,weights
+        ix,nx,wx=coefficient();iy,ny,wy=coefficient()
+        horizontal=torch.empty(504,side,3,device="cuda");pixels=torch.empty(side,side,3,device="cuda")
+        image_resize.compile_resize_pass_aot(vertical=False).launch(normalized,ix,nx,wx,horizontal,scalars=[504,504,side,taps])
+        image_resize.compile_resize_pass_aot(vertical=True).launch(horizontal,iy,ny,wy,pixels,scalars=[504,side,side,taps])
     gh=gw=side//14;n=gh*gw;units=n//16
     patches=torch.empty(n,588,device="cuda",dtype=torch.bfloat16)
     perception_forward.compile_normalized_patches_aot(patch=14).launch(pixels,patches,scalars=[side,side])
@@ -155,11 +173,18 @@ def test_step_full_checkpoint_native_tower(side):
     native_teacher=[];class_teacher=[]
     with torch.inference_mode():
         for i,layer in enumerate(reference.transformer.resblocks):
+            base=f"transformer.resblocks.{i}."
+            cpu_state={name:tensor for name,tensor in state.items() if name.startswith(base)}
+            layer.cuda()
+            for name,tensor in layer.state_dict().items():state[base+name]=tensor
             teacher=candidate(xref,i);x=candidate(x,i);class_forced=xref.clone()
             mode[0]="flash_class";class_forced=layer(class_forced[None],(gh,gw))[0];xref_class=layer(xref_class[None],(gh,gw))[0]
             mode[0]="math";xref=layer(xref[None],(gh,gw))[0]
             native_teacher.append(_metrics(f"teacher{i}",teacher,xref)["relative_l2"])
             class_teacher.append(_metrics(f"class_teacher{i}",class_forced,xref)["relative_l2"])
+            torch.cuda.synchronize()
+            layer.load_state_dict({name[len(base):]:value for name,value in cpu_state.items()},strict=True,assign=True)
+            state.update(cpu_state)
         # Actual native conv lowering/projection agrees with the checkpoint
         # conv module's canonical FP32accumulate output boundary.
         lower=torch.empty((n//4,1536*9),device="cuda",dtype=torch.bfloat16)
