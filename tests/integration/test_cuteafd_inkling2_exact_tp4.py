@@ -406,7 +406,7 @@ def test_glmf_identical_logical_operands(tmp_path, monkeypatch):
             bw = torch.nn.functional.pad(w, (0, 0, 0, padded-native))
             bs = torch.nn.functional.pad(sc, (0, 0, 0, padded-native))
         baseline_weights.extend([bw, torch.cat([bs.flatten(), tail])])
-    x = device('x', torch.randn(capacity, h, generator=gen).bfloat16())
+    x = device('x', (torch.randint(-256, 257, (capacity, h), generator=gen).float() / 128).bfloat16())
     ids = device('ids', torch.rand(capacity, e, generator=gen).topk(g.top_k, -1).indices.int())
     gamma = device('gamma', torch.rand(capacity, g.top_k, generator=gen))
     print('identical_logical_sha256', hashes, flush=True)
