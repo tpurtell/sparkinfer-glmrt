@@ -81,7 +81,7 @@ class ResizeCoefficients:
             indices[row]=first;sizes[row]=size
             invscale=div_rn_f32(Float32(1.0),factor)
             total=Float32(0.0)
-            first_minus_center=_sub(Float32(first),center)
+            first_minus_center=_fma(-scale,_add(Float32(row),Float32(.5)),Float32(first))
             for tap in cutlass.range(size):
                 offset=_mul(_add(_add(Float32(tap),first_minus_center),Float32(.5)),invscale)
                 value=Float32(0.0)
@@ -156,7 +156,7 @@ def compile_resize_coefficients_aot(*,filter="bicubic",antialias=True):
         Operand("indices",torch.int32,"[output_size]","out"),Operand("sizes",torch.int32,"[output_size]","out"),
         Operand("weights",torch.float32,"[output_size,taps]","out")),
         scalars=(Scalar("input_size"),Scalar("output_size"),Scalar("taps")),key=(filter,bool(antialias)),
-        geometry=dict(filter=filter,antialias=bool(antialias),coefficient=-.5 if filter=="bicubic" else None),version=2)
+        geometry=dict(filter=filter,antialias=bool(antialias),coefficient=-.5 if filter=="bicubic" else None),version=3)
 
 
 def compile_resize_pass_aot(*,vertical):

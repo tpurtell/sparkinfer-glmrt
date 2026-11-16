@@ -27,7 +27,7 @@ def coefficients():
 __global__ void vendor_weights(int32_t* indices,int32_t* sizes,float* weights,int input,int output,int taps) {
  int row=blockIdx.x*blockDim.x+threadIdx.x;
  if(row>=output)return;
- float scale=float(input)/float(output);
+ float scale=__fdiv_rn(float(input),float(output));
  float support=scale>=1.f?2.f*scale:2.f;
  int first,count;float center;
  _compute_weights_span(row,input,scale,support,first,count,center);
