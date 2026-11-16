@@ -1,5 +1,8 @@
 """Real Inkling TP4 K16/K32 width-576 exported objects versus ordinary routes."""
-from dataclasses import dataclass, fields
+import importlib.util
+import os
+from pathlib import Path
+import sys
 
 import pytest
 import torch
@@ -11,15 +14,15 @@ from tests.moe.segment_aot import ExportedProgram
 def _exact_geometry(name):
     from b12x.integration.cuteafd.fp8_moe import GEOMETRIES
 
-    base = GEOMETRIES[name].with_tp(4)
-
-    @dataclass(frozen=True)
-    class ExactSlice(type(base)):
-        @property
-        def slice(self):
-            return 576
-
-    return ExactSlice(**{field.name: getattr(base, field.name) for field in fields(base)})
+    root = Path(os.environ['CUTEAFD_SOURCE_ROOT'])
+    sys.path.insert(0, str(root / 'python/tools/lib'))
+    spec = importlib.util.spec_from_file_location('inkling_tp4_packager',
+        root / 'python/tools/aot/package_fp8_moe_aot.py')
+    packager = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packager)
+    tp, geometry = packager.layout_geometry(GEOMETRIES[name], 'tp4-w576')
+    assert tp == 4
+    return geometry
 
 
 def _weights(g):
