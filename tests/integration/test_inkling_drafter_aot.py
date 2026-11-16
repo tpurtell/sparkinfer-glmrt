@@ -16,7 +16,7 @@ from b12x.integration.cuteafd import exportable_compilation, validate_exported_h
 from b12x.integration.cuteafd import inkling_drafter as kernels
 
 
-@pytest.fixture(scope="module", params=["dflare_mix", "mask_init", "recurrent_gate", "head_fold", "logit_finish"])
+@pytest.fixture(scope="module", params=["dflare_mix", "mask_init", "recurrent_gate", "head_fold", "logit_finish", "residual_norm", "qk_norm_rope"])
 def program(request, tmp_path_factory):
     kind = request.param
     with exportable_compilation():
@@ -81,6 +81,9 @@ def test_oracle_and_graph(program):
     torch.manual_seed(851)
     if kind in ("head_fold", "logit_finish"):
         _check_head_program(kind, exported, module)
+        return
+    if kind in ("residual_norm", "qk_norm_rope"):
+        _check_norm_program(kind, exported, module)
         return
     maximum = 4096 if kind == "dflare_mix" else 64
     if kind == "dflare_mix":
@@ -199,7 +202,15 @@ def _check_head_program(kind, exported, module):
             launch(first, rows)
             reference = (lm[first:first+rows].double() @ projection.double()).bfloat16()
             ref_bias = (lm[first:first+rows].double() @ bias.double()).bfloat16()
-            assert torch.equal(weight[first:first+rows].view(torch.int16), reference.view(torch.int16))
+            actual = weight[first:first+rows]
+            if not torch.equal(actual.view(torch.int16), reference.view(torch.int16)):
+                mismatch = actual.view(torch.int16) != reference.view(torch.int16)
+                precise = lm[first:first+rows].double() @ projection.double()
+                print("FOLD_MISMATCH", int(mismatch.sum()),
+                      precise[mismatch][:16].tolist(), actual[mismatch][:16].float().tolist(),
+                      reference[mismatch][:16].float().tolist(), flush=True)
+                print("FOLD_DOUBLE_ROUND_REFERENCE", torch.equal(reference, precise.float().bfloat16()), flush=True)
+            assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
             assert torch.equal(folded_bias[first:first+rows].view(torch.int16), ref_bias.view(torch.int16))
         assert torch.isnan(weight[20:201024-4096]).all()
         graph = torch.cuda.CUDAGraph()
@@ -251,3 +262,83 @@ def _check_head_program(kind, exported, module):
         output.fill_(float("nan"))
         graph.replay()
         assert torch.equal(output[:64], reference[:64])
+
+
+def test_vendor_double_rounding_cast():
+    # These exact FP64 values straddle BF16 midpoint ties after narrowing F32.
+    values = torch.tensor([-0.00214385989420407, 0.020568848382026772,
+                           0.05627441587694193, 0.047729490797792096], dtype=torch.float64)
+    expected = torch.tensor([-0.00213623046875, 0.0205078125,
+                            0.05615234375, 0.0478515625], dtype=torch.bfloat16)
+    for device in ("cpu", "cuda"):
+        x = values.to(device)
+        assert torch.equal(x.bfloat16().cpu(), expected)
+        assert torch.equal(x.bfloat16(), x.float().bfloat16())
+
+
+def _check_norm_program(kind, exported, module):
+    def invoke(tensors, rows):
+        assert exported.launch(ctypes.byref(module), *(t.data_ptr() for t in tensors), rows,
+                               1e-6, torch.cuda.current_stream().cuda_stream) == 0
+
+    if kind == "residual_norm":
+        residual = torch.randn(4096, 4608, device="cuda", dtype=torch.bfloat16)
+        delta = torch.randn_like(residual)
+        gamma = (.5 + torch.rand(4608, device="cuda")).bfloat16()
+        residual_out, norm_out = torch.empty_like(residual), torch.empty_like(residual)
+        tensors = (residual, delta, gamma, residual_out, norm_out)
+        value = residual.float() + delta.float()
+        expected = (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+                    * gamma.float()).bfloat16()
+        for rows in (1, 64, 4096):
+            invoke(tensors, rows)
+            assert torch.equal(residual_out[:rows], value[:rows].bfloat16())
+            torch.testing.assert_close(norm_out[:rows], expected[:rows], atol=0, rtol=1e-2)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            invoke(tensors, 64)
+        graph.replay()
+        torch.testing.assert_close(norm_out[:64], expected[:64], atol=0, rtol=1e-2)
+    else:
+        rows, q_heads, kv_heads = 4096, 48, 8
+        qkv = torch.randn(rows, q_heads + 2*kv_heads, 128, device="cuda", dtype=torch.bfloat16)
+        q_gamma = (.5 + torch.rand(128, device="cuda")).bfloat16()
+        k_gamma = (.5 + torch.rand(128, device="cuda")).bfloat16()
+        positions_cpu = torch.linspace(0, 1048575, rows).long()
+        positions_cpu[:8] = torch.tensor([0, 1, 1023, 1024, 65535, 65536, 1048574, 1048575])
+        positions = positions_cpu.cuda()
+        # Pinned vLLM base.py builds the FP32 cache with a CPU outer product.
+        inv_freq_cpu = 1. / (10000. ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128))
+        inv_freq = inv_freq_cpu.cuda()
+        angle = torch.einsum("i,j->ij", positions_cpu.float(), inv_freq_cpu)
+        cosine, sine = angle.cos().cuda()[:, None], angle.sin().cuda()[:, None]
+        q_out = torch.empty(rows, q_heads, 128, device="cuda", dtype=torch.bfloat16)
+        k_out = torch.empty(rows, kv_heads, 128, device="cuda", dtype=torch.bfloat16)
+        v_out = torch.empty_like(k_out)
+        tensors = (qkv, q_gamma, k_gamma, positions, inv_freq, q_out, k_out, v_out)
+
+        def norm_rope(source, gamma):
+            value = source.float()
+            inv = 1 / (value.square().mean(-1, keepdim=True) + 1e-6).sqrt()
+            value = (value * inv * gamma.float()).bfloat16().float()
+            first, second = value.chunk(2, dim=-1)
+            return torch.cat((first * cosine - second * sine,
+                              second * cosine + first * sine), -1).bfloat16()
+
+        q_expected = norm_rope(qkv[:, :q_heads], q_gamma)
+        k_expected = norm_rope(qkv[:, q_heads:q_heads+kv_heads], k_gamma)
+        for live in (1, 64, rows):
+            invoke(tensors, live)
+            torch.testing.assert_close(q_out[:live], q_expected[:live], atol=2e-2, rtol=1e-2)
+            torch.testing.assert_close(k_out[:live], k_expected[:live], atol=2e-2, rtol=1e-2)
+            assert torch.equal(v_out[:live], qkv[:live, q_heads+kv_heads:])
+        for name, actual, expected in (("q", q_out, q_expected), ("k", k_out, k_expected)):
+            a, b = actual.view(torch.int16).int(), expected.view(torch.int16).int()
+            print("INKLING_ROPE " + json.dumps({"kind": name, "rows": rows,
+                  "bit_equal_fraction": float((a == b).float().mean()),
+                  "max_ulp": int((a-b).abs().max())}), flush=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            invoke(tensors, 64)
+        graph.replay()
+        torch.testing.assert_close(q_out[:64], q_expected[:64], atol=2e-2, rtol=1e-2)

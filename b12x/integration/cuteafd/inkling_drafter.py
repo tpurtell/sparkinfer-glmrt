@@ -159,9 +159,10 @@ def compile_inkling_recurrent_gate_aot():
 
 @dsl_user_op
 def _narrow_double(value: Float64, *, loc=None, ip=None) -> Float32:
-    """Direct FP64 -> BF16 RNE: FP32 as an intermediate can double-round."""
+    """Match vendor Torch's FP64 -> FP32 -> BF16 cast, including double rounds."""
     return Float32(llvm.inline_asm(T.f32(), [Float64(value).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b16 b; cvt.rn.bf16.f64 b, $1; cvt.f32.bf16 $0, b; }", "=f,d",
+        "{ .reg .f32 f; .reg .b16 b; cvt.rn.f32.f64 f, $1; "
+        "cvt.rn.bf16.f32 b, f; cvt.f32.bf16 $0, b; }", "=f,d",
         has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT))
 
 
@@ -259,3 +260,126 @@ def compile_inkling_logit_finish_aot():
         Operand("output", torch.bfloat16, "[rows,200058]", "out", align=2),
     ), scalars=(Scalar("rows"),), key=(201024, 200058, 30),
         geometry={"vocab": 201024, "valid_vocab": 200058, "softcap": 30}, doc=__doc__)
+
+
+class _ResidualNorm:
+    @cute.jit
+    def __call__(self, residual: cute.Pointer, delta: cute.Pointer,
+                 gamma: cute.Pointer, residual_out: cute.Pointer,
+                 norm_out: cute.Pointer, rows: Int32, eps: Float32,
+                 stream: cuda.CUstream):
+        if rows > 0 and rows <= 4096:
+            self.kernel(residual, delta, gamma, residual_out, norm_out, eps).launch(
+                grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, residual: cute.Pointer, delta: cute.Pointer,
+               gamma: cute.Pointer, residual_out: cute.Pointer,
+               norm_out: cute.Pointer, eps: Float32):
+        row, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        values = cute.make_rmem_tensor(cute.make_layout(18), Float32)
+        squares = Float32(0)
+        for item in cutlass.range_constexpr(18):
+            column = Int64(thread) + Int64(item * 256)
+            index = Int64(row) * 4608 + column
+            value = Float32(residual[index]) + Float32(delta[index])
+            values[item] = value
+            residual_out[index] = BFloat16(value)
+            squares += value * value
+        allocator = cutlass.utils.SmemAllocator()
+        scratch = allocator.allocate_tensor(Float32, cute.make_layout((1, 8)), byte_alignment=16)
+        inverse = allocator.allocate_tensor(Float32, cute.make_layout(1), byte_alignment=4)
+        total = block_reduce(warp_reduce(squares, _add), _add, scratch, Float32(0))
+        if thread == 0:
+            inverse[0] = cute.math.rsqrt(total / Float32(4608) + eps, fastmath=True)
+        cute.arch.sync_threads()
+        for item in cutlass.range_constexpr(18):
+            column = Int64(thread) + Int64(item * 256)
+            norm_out[Int64(row) * 4608 + column] = BFloat16(
+                values[item] * inverse[0] * Float32(gamma[column]))
+
+
+class _QKNormRope:
+    def __init__(self, q_heads, kv_heads):
+        self.q_heads, self.kv_heads = q_heads, kv_heads
+        self.heads = q_heads + 2 * kv_heads
+
+    @cute.jit
+    def __call__(self, qkv: cute.Pointer, q_gamma: cute.Pointer,
+                 k_gamma: cute.Pointer, positions: cute.Pointer,
+                 inv_freq: cute.Pointer, q_out: cute.Pointer,
+                 k_out: cute.Pointer, v_out: cute.Pointer, rows: Int32,
+                 eps: Float32, stream: cuda.CUstream):
+        if rows > 0 and rows <= 4096:
+            self.kernel(qkv, q_gamma, k_gamma, positions, inv_freq,
+                        q_out, k_out, v_out, eps).launch(
+                grid=(rows, self.q_heads + self.kv_heads, 1), block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, qkv: cute.Pointer, q_gamma: cute.Pointer,
+               k_gamma: cute.Pointer, positions: cute.Pointer,
+               inv_freq: cute.Pointer, q_out: cute.Pointer,
+               k_out: cute.Pointer, v_out: cute.Pointer, eps: Float32):
+        row, head, _ = cute.arch.block_idx()
+        column, _, _ = cute.arch.thread_idx()
+        base = (Int64(row) * Int64(self.heads) + Int64(head)) * 128
+        value = Float32(qkv[base + Int64(column)])
+        allocator = cutlass.utils.SmemAllocator()
+        scratch = allocator.allocate_tensor(Float32, cute.make_layout((1, 4)), byte_alignment=16)
+        normalized = allocator.allocate_tensor(Float32, cute.make_layout(128), byte_alignment=16)
+        inverse = allocator.allocate_tensor(Float32, cute.make_layout(1), byte_alignment=4)
+        total = block_reduce(warp_reduce(value * value, _add), _add, scratch, Float32(0))
+        if column == 0:
+            inverse[0] = div_rn_f32(Float32(1), cute.math.sqrt(total / Float32(128) + eps, fastmath=False))
+        cute.arch.sync_threads()
+        gamma = Float32(k_gamma[column])
+        if head < self.q_heads:
+            gamma = Float32(q_gamma[column])
+        normalized[column] = _round_bf16(value * inverse[0] * gamma)
+        cute.arch.sync_threads()
+        half_column = Int32(column) % 64
+        angle = Float32(positions[row]) * Float32(inv_freq[half_column])
+        cosine = cute.math.cos(angle, fastmath=False)
+        sine = cute.math.sin(angle, fastmath=False)
+        from .pointwise import _mul, _add as add_rn, _sub
+        first = normalized[half_column]
+        second = normalized[half_column + 64]
+        result = _sub(_mul(first, cosine), _mul(second, sine))
+        if column >= 64:
+            result = add_rn(_mul(second, cosine), _mul(first, sine))
+        if head < self.q_heads:
+            q_out[(Int64(row) * Int64(self.q_heads) + Int64(head)) * 128 + Int64(column)] = BFloat16(result)
+        else:
+            kv_head = Int32(head) - self.q_heads
+            offset = (Int64(row) * Int64(self.kv_heads) + Int64(kv_head)) * 128 + Int64(column)
+            k_out[offset] = BFloat16(result)
+            source = (Int64(row) * Int64(self.heads) + Int64(self.q_heads + self.kv_heads) + Int64(kv_head)) * 128 + Int64(column)
+            v_out[offset] = qkv[source]
+
+
+def compile_inkling_residual_norm_aot():
+    return compile_program(_ResidualNorm(), name="inkling_residual_norm", operands=(
+        Operand("residual", torch.bfloat16, "[rows,4608]"),
+        Operand("delta", torch.bfloat16, "[rows,4608]"),
+        Operand("gamma", torch.bfloat16, "[4608]"),
+        Operand("residual_out", torch.bfloat16, "[rows,4608]", "out"),
+        Operand("norm_out", torch.bfloat16, "[rows,4608]", "out"),
+    ), scalars=(Scalar("rows"), Scalar("eps", "float32")), key=(4608,),
+        geometry={"hidden": 4608}, doc=__doc__)
+
+
+def compile_inkling_qk_norm_rope_aot(*, q_heads=48, kv_heads=8):
+    if (q_heads, kv_heads) not in ((48, 8), (24, 4), (0, 8), (0, 4)):
+        raise ValueError("Inkling Q/K heads require TP1, TP2 or context-only geometry")
+    return compile_program(_QKNormRope(q_heads, kv_heads), name="inkling_qk_norm_rope", operands=(
+        Operand("qkv", torch.bfloat16, f"[rows,{(q_heads+2*kv_heads)*128}]"),
+        Operand("q_gamma", torch.bfloat16, "[128]"),
+        Operand("k_gamma", torch.bfloat16, "[128]"),
+        Operand("positions", torch.int64, "[rows]"),
+        Operand("inv_freq", torch.float32, "[64]"),
+        Operand("q_out", torch.bfloat16, f"[rows,{q_heads},128]", "out"),
+        Operand("k_out", torch.bfloat16, f"[rows,{kv_heads},128]", "out"),
+        Operand("v_out", torch.bfloat16, f"[rows,{kv_heads},128]", "out"),
+    ), scalars=(Scalar("rows"), Scalar("eps", "float32")), key=(q_heads, kv_heads, 128),
+        geometry={"q_heads": q_heads, "kv_heads": kv_heads, "head_dim": 128}, doc=__doc__)
