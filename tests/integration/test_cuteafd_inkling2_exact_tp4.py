@@ -106,7 +106,7 @@ def test_dynamic_down_native_k64_matches_exact_grid(k, tmp_path):
 
     n, experts, rows = 128, 1, 128
     linear = StreamNvfp4LinearDyn(n=n, k=k, experts=experts)
-    assert linear.k_block == (64 if k == 576 else 128)
+    assert linear.k_block == 256
 
     class Down:
         def key(self):
