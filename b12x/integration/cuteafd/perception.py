@@ -39,8 +39,8 @@ class ScaledResidual:
 
 
 class QuickGelu:
-    def __init__(self, width):
-        self.width = width
+    def __init__(self, width, bf16_intermediates):
+        self.width, self.bf16_intermediates = width, bf16_intermediates
 
     @cute.jit
     def __call__(self, x: cute.Pointer, out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
@@ -54,10 +54,12 @@ class QuickGelu:
         at = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
         if at < count:
             value = Float32(x[at])
-            # torch's unfused quick_gelu materializes both the scalar product
-            # and sigmoid in BF16 before the final BF16 multiplication.
-            scaled = Float32(_mul(value, Float32(1.702)).to(BFloat16))
-            sigmoid = Float32((Float32(1.0) / _add(Float32(1.0), cute.math.exp(-scaled))).to(BFloat16))
+            scaled = _mul(value, Float32(1.702))
+            if cutlass.const_expr(self.bf16_intermediates):
+                scaled = Float32(scaled.to(BFloat16))
+            sigmoid = Float32(1.0) / _add(Float32(1.0), cute.math.exp(-scaled))
+            if cutlass.const_expr(self.bf16_intermediates):
+                sigmoid = Float32(sigmoid.to(BFloat16))
             out[at] = _mul(value, sigmoid).to(BFloat16)
 
 
@@ -170,13 +172,16 @@ def compile_scaled_residual_aot(*, width):
         scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width, bf16_product=True))
 
 
-def compile_quick_gelu_aot(*, width):
+def compile_quick_gelu_aot(*, width, bf16_intermediates=False):
+    """Fused vendor CUDA math by default; explicit eager-Torch rounding variant."""
     if width <= 0:
         raise ValueError("quick-GELU width must be positive")
-    return compile_program(QuickGelu(width), name="perception_quick_gelu", operands=(
+    rounded = bool(bf16_intermediates)
+    return compile_program(QuickGelu(width, rounded), name="perception_quick_gelu", operands=(
         Operand("x", torch.bfloat16, f"[rows,{width}]"),
         Operand("out", torch.bfloat16, f"[rows,{width}]", "out")),
-        scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width, activation="quick_gelu"))
+        scalars=(Scalar("rows"),), key=(width,rounded),
+        geometry=dict(width=width, activation="quick_gelu", bf16_intermediates=rounded))
 
 
 def compile_rotary_2d_aot(*, heads, dim, class_token=False):

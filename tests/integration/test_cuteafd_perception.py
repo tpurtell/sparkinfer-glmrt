@@ -30,13 +30,14 @@ def test_scaled_residual_rounds_product_before_add(width, rows):
 
 
 @pytest.mark.parametrize("width", [4096,8960])
-def test_quick_gelu_preserves_bf16_boundaries(width):
+@pytest.mark.parametrize("bf16_intermediates", [False,True])
+def test_quick_gelu_preserves_bf16_boundaries(width,bf16_intermediates):
     require_b12x()
     from b12x.integration.cuteafd.perception import compile_quick_gelu_aot
     x = torch.linspace(-12,12,width*17,device="cuda").bfloat16().reshape(17,width)
-    ref = x*torch.sigmoid(1.702*x)
+    ref = x*torch.sigmoid(1.702*x) if bf16_intermediates else (x.float()*torch.sigmoid(1.702*x.float())).bfloat16()
     out = torch.empty_like(x)
-    program = compile_quick_gelu_aot(width=width)
+    program = compile_quick_gelu_aot(width=width,bf16_intermediates=bf16_intermediates)
     program.launch(x,out,scalars=[17])
     torch.testing.assert_close(out,ref,atol=0,rtol=0.008)
     program.launch(x,x,scalars=[17])
@@ -96,3 +97,25 @@ def test_merge_is_spatial_major_and_excludes_class_token(class_token):
     program.launch(x,out,scalars=[h,w])
     ref = x[int(class_token):].reshape(h//2,2,w//2,2,c).permute(0,2,1,3,4).reshape_as(out)
     assert torch.equal(out,ref)
+
+
+@pytest.mark.parametrize("width", [1024,1536])
+def test_scaled_residual_frozen_resolution_graph_and_live_rows(width):
+    require_b12x()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.integration.cuteafd.perception import compile_scaled_residual_aot
+    x = torch.randn(257,width,device="cuda").bfloat16()
+    delta = torch.randn_like(x)
+    gamma = torch.randn(width,device="cuda").bfloat16()
+    expected = x+delta*gamma
+    out = torch.empty_like(x)
+    program = compile_scaled_residual_aot(width=width)
+    program.launch(x,delta,gamma,out,scalars=[257])
+    with kernel_resolution_guard("PE scaled residual live rows"):
+        for live in [1,17,257]:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                program.launch(x,delta,gamma,out,scalars=[live])
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out[:live],expected[:live])
