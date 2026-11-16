@@ -382,6 +382,20 @@ class _GroupPrefill(_Group):
                 r_base += Int32(32)
 
 
+class _GroupSegments(_GroupPrefill):
+    @cute.jit
+    def __call__(self, ids: cute.Pointer, input_rows: cute.Pointer, signs_in: cute.Pointer,
+                 group_expert: cute.Pointer, route_slots: cute.Pointer,
+                 route_group_lane: cute.Pointer, group_count: cute.Pointer,
+                 activation: cute.Pointer, rows: Int32, cta_limit: Int32,
+                 stream: cuda.CUstream):
+        if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
+            ingress = (rows * Int32(self.blocks) + Int32(INGRESS_WARPS - 1)) // Int32(INGRESS_WARPS)
+            self.kernel(ids, input_rows, signs_in, group_expert, route_slots, route_group_lane,
+                        group_count, activation, rows).launch(
+                grid=(Int32(1) + min(ingress, cta_limit), 1, 1), block=(256, 1, 1), stream=stream)
+
+
 def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144,
                             input_format="fp8_k32", shared_expert=False,
                             max_rows=64, group_rows=16, row_addresses=False):
@@ -408,7 +422,7 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
         x = Operand("input_rows", torch.int64, "[rows]")
     metadata = {"group_rows": group_rows} if max_rows > 64 else {}
     if row_addresses: metadata["row_addresses"] = True
-    group_cls = _GroupPrefill if max_rows > 64 else _Group
+    group_cls = _GroupSegments if row_addresses else _GroupPrefill if max_rows > 64 else _Group
     return compile_program(group_cls(experts, top_k, max_groups, hidden, input_format, max_rows, group_rows, row_addresses),
         name=("exlr8_grouped_group" if max_rows > 64 else
               "exlr8_shared_group" if shared_expert else "exlr8_group") + ("_segments" if row_addresses else ""),
@@ -422,7 +436,7 @@ def compile_exlr8_group_aot(*, experts=256, top_k=8, max_groups=512, hidden=6144
                   Operand("activation", torch.float16, f"[rows,{hidden}]", "out")),
         scalars=(Scalar("rows"), Scalar("cta_limit")),
         key=(experts, top_k, max_groups, hidden, input_format, shared_expert, max_rows, group_rows)
-            + (("row_addresses",) if row_addresses else ()),
+            + (("row_addresses", "aot_operand_names_v2") if row_addresses else ()),
         geometry=dict(abi_version=2, experts=experts, top_k=top_k, max_groups=max_groups,
                       max_rows=max_rows, hidden=hidden, input_format=input_format, **metadata,
                       input_row_bytes=_Group(experts, top_k, max_groups, hidden, input_format).row_bytes,

@@ -16,7 +16,7 @@ from b12x.moe._shared.kernels.v4_stream_pipeline import (
 from tests.moe.test_v41_exact_slices import pack
 
 
-def _run_native_segments(hidden, intermediate, coded, profile=None, *, experts=None, routing_mode="two_hot"):
+def _run_native_segments(hidden, intermediate, coded, profile=None, *, experts=None, routing_mode="two_hot", aot_dir=None):
     torch.manual_seed(844)
     experts = experts if experts is not None else 384 if coded or hidden == 7168 else 256
     topk, capacity = 6, 8192
@@ -55,8 +55,13 @@ def _run_native_segments(hidden, intermediate, coded, profile=None, *, experts=N
     resident = wire[physical].contiguous()
     input_rows = (resident.data_ptr() + physical * pitch).to(torch.int64)
     output_rows = (output.data_ptr() + (torch.arange(capacity, device="cuda") + 1) * hidden * 2).to(torch.int64)
-    program = compile_v4_stream_segments_aot(hidden=hidden, intermediate=intermediate,
-        experts=experts, topk=topk, scale_codes=coded)
+    from b12x.integration.cuteafd import exportable_compilation
+    with exportable_compilation():
+        program = compile_v4_stream_segments_aot(hidden=hidden, intermediate=intermediate,
+            experts=experts, topk=topk, scale_codes=coded)
+    if aot_dir is not None:
+        from tests.moe.segment_aot import ExportedProgram
+        program = ExportedProgram(program, aot_dir, "native_segments")
     sizes = {"i32": torch.int32, "u8": torch.uint8, "f32": torch.float32}
     scratch = [torch.empty(shape, dtype=sizes[dtype], device="cuda") for _, dtype, shape in
         stream_scratch_specs(capacity, hidden, intermediate, experts, topk, row_addresses=True)]
@@ -147,3 +152,7 @@ def test_profile_8192_flash(arm):
 
 def test_native_pro384_uniform_segments_curve():
     _run_native_segments(7168, 768, False, experts=384, routing_mode="uniform")
+
+
+def test_native_segments_exported_header_and_byte_oracle(tmp_path):
+    _run_native_segments(5120, 288, True, experts=384, routing_mode="uniform", aot_dir=tmp_path)
