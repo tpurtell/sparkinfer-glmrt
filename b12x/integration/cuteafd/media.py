@@ -394,8 +394,8 @@ def compile_vision_attention_aot(*, dim, windowed=False):
     Full attention uses a single segment; multi-image callers launch per image.
     Empty segments must not write O/LSE. Q/K/V/O storage capacity is 16384 rows.
     """
-    if dim not in (96, 128) or (windowed and dim != 96):
-        raise ValueError("vision attention requires d96/d128; windows require d96")
+    if dim not in (64, 96, 128) or (windowed and dim != 96):
+        raise ValueError("vision attention requires d64/d96/d128; windows require d96")
     capacity, segments = 16384, 512 if windowed else 1
     limit = 1024 if windowed else capacity
     return compile_program(VisionAttention(dim, capacity, segments, limit),

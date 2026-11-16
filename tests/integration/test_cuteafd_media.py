@@ -293,7 +293,7 @@ def test_spatial_merge_adapter_matches_official_channel_major_pixel_shuffle(heig
             assert torch.equal(out[:live], expected[:live])
 
 
-@pytest.mark.parametrize("dim,windowed", [(96, False), (96, True), (128, False)])
+@pytest.mark.parametrize("dim,windowed", [(64, False), (96, False), (96, True), (128, False)])
 def test_vision_attention_segments(dim, windowed):
     require_b12x()
     from b12x.integration.cuteafd.media import compile_vision_attention_aot
