@@ -23,8 +23,9 @@ rounding.
 ``StreamNvfp4LinearA4``  ``y[p] = alpha_e * in_e * (a_p . w_e^T)`` over the
     packed operands: a CTA owns either a sparse 16-row tile with 32/64/128
     output columns, or a wide 128-row tile with 128 columns. Both stream
-    256-K (or 128-K) operand blocks and scales through a two-stage
-    ``cp.async`` ring with conflict-free ``ldmatrix`` loads. Complementary
+    256/128/64-K operand blocks and scales through a two-stage
+    ``cp.async`` ring with conflict-free ``ldmatrix`` loads. Native K16 tails
+    are zero-filled only in shared memory; partial output tiles are masked. Complementary
     live-count masks select exactly one tile per compact expert chunk.
 ``StreamNvfp4GateUpA4``  gate/up, SwiGLU and the down-input quantization in
     one launch: half the CTA's weight rows are gate and half are matching
@@ -356,7 +357,7 @@ class StreamNvfp4LinearA4:
     def _load_operand(self, stage, rows_at: Int64, scales_at: Int64, block, tidx,
                       count: cutlass.Constexpr, packed_offset: cutlass.Constexpr, scale_offset: cutlass.Constexpr,
                       row_limit: Int32):
-        """Stage native rows; only shared memory contains K/N tail zeros.
+        """Stage native rows; zero-fill K tails and skip output-masked rows.
 
         K16 rows can be only eight-byte aligned, and their scale rows can be
         byte aligned. Keep the aligned vector path compile-time specialized;
