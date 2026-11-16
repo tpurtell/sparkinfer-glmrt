@@ -46,8 +46,6 @@ from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     cp_async_u64_shared_global,
-    byte_perm,
-    ld_global_nc_u32,
     div_rn_f32,
     ld_shared_u32,
     ld_shared_v4_u32,
@@ -316,7 +314,7 @@ class StreamNvfp4LinearA4:
         self.in_offset = nvfp4_input_scale_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_a4", 7, self.n, self.k, self.experts, self.k_block,
+        return ("stream_linear_nvfp4_a4", 6, self.n, self.k, self.experts, self.k_block,
                 self.tile_m, self.tile_n, self.live_min, self.live_max) + (("divisor",) if self.divisor else ())
 
     def _storage(self):
@@ -406,20 +404,10 @@ class StreamNvfp4LinearA4:
                         st_shared_u32(dst, Uint32(0))
                 else:
                     value = Uint32(0)
-                    src = scales_at + Int64(row) * Int64(self.k // 16) + Int64(col)
-                    # Interior windows can use two aligned words and one byte
-                    # permutation. The row end stays byte-masked: no overread
-                    # of the allocation is needed, even for the final row.
-                    if col + Int32(7) < Int32(self.k // 16):
-                        shift = Int32(src & Int64(3))
-                        aligned = src - Int64(shift)
-                        lo = ld_global_nc_u32(aligned)
-                        hi = ld_global_nc_u32(aligned + Int64(4))
-                        value = byte_perm(lo, hi, Int32(0x3210) + shift * Int32(0x1111))
-                    else:
-                        for byte in cutlass.range_constexpr(4):
-                            if col + Int32(byte) < Int32(self.k // 16):
-                                value = value | (Uint32(_ld_u8(src + Int64(byte))) << Uint32(8 * byte))
+                    for byte in cutlass.range_constexpr(4):
+                        if col + Int32(byte) < Int32(self.k // 16):
+                            value = value | (Uint32(_ld_u8(scales_at + Int64(row) * Int64(self.k // 16)
+                                                          + Int64(col) + Int64(byte))) << Uint32(8 * byte))
                     st_shared_u32(dst, value)
 
     @cute.jit
@@ -621,7 +609,7 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_a4", 7, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_a4", 6, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max) + (
                     ("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (
                 ("swigluoai", self.alpha, self.beta) if self.oai else ()) + (("divisor",) if self.divisor else ())
