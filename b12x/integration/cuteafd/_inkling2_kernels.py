@@ -40,13 +40,14 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import warp
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from b12x._lib.intrinsics import ld_shared_bf16_to_f32, shared_ptr_to_u32
+from b12x._lib.intrinsics import ld_global_v2_u32, ld_shared_bf16_to_f32, shared_ptr_to_u32, st_shared_v4_u32
 from b12x.attention._shared.contiguous import layout_utils
 from b12x.attention._shared.contiguous.forward import warp_mma_gemm
 from b12x.attention._shared.contiguous.softmax import Softmax
 from b12x.attention.paged._selected_forward import _cp_async_load_128b_zfill
 
 from ._mimo_kernels import LOG2_E, MAX_SPLITS, MimoGqaAttention, MimoSplitMerge, _ceil
+from ._fp8_weights import _e4m3x8_scaled_bf16, _ld_f32
 
 __all__ = ["InklingGqaAttention", "InklingSplitMerge"]
 
@@ -220,19 +221,21 @@ class InklingGqaAttention(MimoGqaAttention):
     @cute.jit
     def _stage_fp8_plane(self, key_addr: cute.Tensor, buf: Int32, kv_head: Int32,
                          shared: cute.Tensor, thread: Int32, value: cutlass.Constexpr):
-        for it in cutlass.range_constexpr(self.tile_n * 128 // self.threads):
+        # Eight E4M3 values widen into one aligned 16-byte BF16 shared store,
+        # reusing the existing native MiMo conversion instruction sequence.
+        for it in cutlass.range_constexpr(self.tile_n * 16 // self.threads):
             index = thread + Int32(it * self.threads)
-            token, dim = index // Int32(128), index % Int32(128)
+            token, dim = index // Int32(16), (index % Int32(16))*Int32(8)
             base = Int64(key_addr[buf, token])
-            result = Float32(0.0)
+            lo, hi = cutlass.Uint32(0), cutlass.Uint32(0)
+            scale = Float32(1.0)
             if base >= Int64(0):
                 plane = 8 if value else 0
-                payload = cute.make_ptr(cutlass.Float8E4M3FN, base, cute.AddressSpace.gmem, assumed_align=16)
-                scales = cute.make_ptr(Float32, base + Int64(self.scale_offset),
-                                       cute.AddressSpace.gmem, assumed_align=4)
-                result = Float32(payload[Int64(plane * 128) + Int64(kv_head) * Int64(128) + Int64(dim)]) \
-                    * Float32(scales[Int64(plane) + Int64(kv_head)])
-            shared[token, dim] = result.to(BFloat16)
+                lo, hi = ld_global_v2_u32(base + (Int64(plane)+Int64(kv_head))*Int64(128)+Int64(dim))
+                scale = _ld_f32(base+Int64(self.scale_offset)+(Int64(plane)+Int64(kv_head))*Int64(4))
+            w0, w1, w2, w3 = _e4m3x8_scaled_bf16(lo, hi, scale)
+            st_shared_v4_u32(shared_ptr_to_u32(shared.iterator + cute.crd2idx((token, dim), shared.layout)),
+                             w0, w1, w2, w3)
 
     @cute.jit
     def _qk_bias_softmax(self, buf: Int32, k0: Int64, p_min: Int64, p_max: Int64, live: Int32,

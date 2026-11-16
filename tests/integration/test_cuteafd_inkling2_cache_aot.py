@@ -118,6 +118,26 @@ def test_exported_global_cache(tmp_path, rows, route, kv_format):
     torch.cuda.synchronize()
     # FP8 also matches exactly: baseline reads the same dequantized BF16 operands.
     assert torch.equal(out, expected), (out.float() - expected.float()).abs().max().item()
+    # Independent dequantized-KV reference; verify causal/bias/sink addressing
+    # rather than relying solely on the old exported attention implementation.
+    start = 0
+    for member, count in enumerate(counts):
+        physical = tables[member].long().repeat_interleave(64)*64 + torch.arange(
+            stride*64, device="cuda") % 64
+        records = reference_cache[physical[:context]].float()
+        keys = records[:, :1024].reshape(context, 8, 128).repeat_interleave(6, dim=1)
+        values = records[:, 1024:].reshape(context, 8, 128).repeat_interleave(6, dim=1)
+        for row in range(start, start+count):
+            pos = int(positions[row])
+            score = torch.einsum("hd,khd->hk", q[row].float(), keys[:pos+1]) * (128**-0.5)
+            distance = pos-torch.arange(pos+1, device="cuda")
+            bias = rel[row].float()[:, distance.clamp_max(1023)]
+            score += torch.where(distance[None] < 1024, bias, 0.0)
+            probability = torch.softmax(torch.cat([score, sinks[row,:,None]], dim=1), dim=1)[:,:-1]
+            reference = torch.einsum("hk,khd->hd", probability, values[:pos+1])
+            cosine = torch.nn.functional.cosine_similarity(out[row].float().flatten(), reference.flatten(), dim=0)
+            assert float(cosine) >= 0.9999
+        start += count
 
 
 @pytest.mark.parametrize("route", ["decode", "prefill"])
@@ -209,3 +229,35 @@ def test_exported_convolution_history_stride(tmp_path, width, dynamic, rows):
     torch.cuda.synchronize()
     assert torch.equal(out, expected)
     assert torch.equal(history, initial)
+
+
+@pytest.mark.parametrize("rows", [1, 16, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_exported_fp8_pack_scatter_zero_and_skipped_slots(tmp_path, rows, dtype):
+    require_b12x()
+    from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_kv_pack_aot
+
+    torch.manual_seed(693 + rows)
+    k = torch.randn(rows, 8, 128, device="cuda").to(dtype)
+    v = torch.randn_like(k)
+    k[0].zero_()
+    v[0].zero_()
+    slots = torch.randperm(rows+5, device="cuda")[:rows].long()
+    if rows > 1:
+        slots[-1] = -1
+    cache = torch.full((rows+5, 2112), 0x5A, device="cuda", dtype=torch.uint8)
+    expected = cache.clone()
+    scale = [(source.float().abs().amax(dim=-1).double()/448).float() for source in (k,v)]
+    scale = [torch.where(values > 0, values, 1.0) for values in scale]
+    for row in range(rows):
+        slot = int(slots[row])
+        if slot < 0:
+            continue
+        for plane, source in enumerate((k,v)):
+            payload = (source[row].float()*scale[plane][row].reciprocal()[:,None]).to(torch.float8_e4m3fn)
+            expected[slot, plane*1024:(plane+1)*1024] = payload.view(torch.uint8).flatten()
+            expected[slot, 2048+plane*32:2048+(plane+1)*32] = scale[plane][row].view(torch.uint8)
+    program = compile_inkling2_kv_pack_aot(input_dtype=dtype, kv_format="fp8")
+    ExportedProgram(program, tmp_path, "scatter").launch(k,v,slots,cache,scalars=(rows,))
+    torch.cuda.synchronize()
+    assert torch.equal(cache, expected)
