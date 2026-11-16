@@ -286,7 +286,7 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_dyn", 5, *super().key()[2:])
+        return ("stream_linear_nvfp4_dyn", 2, *super().key()[2:])
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
@@ -339,7 +339,6 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
                     else:
                         cute.arch.cp_async_wait_group(0)
                     cute.arch.sync_threads()
-                    self._realign_stage(ring + (block % Int32(2)) * Int32(self.stage_bytes), tidx)
                     if active:
                         self._mma_stage(ring + (block % Int32(2)) * Int32(self.stage_bytes), acc, warp_m, warp_n,
                                         q, c, mat, mrow)
@@ -384,7 +383,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
         self.parts = _ceil(self.inter, self.half_n)
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_dyn", 6, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_dyn", 3, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.gate_cap, self.up_cap, self.tile_m, self.tile_n, self.live_min, self.live_max)
 
     @cute.jit
@@ -458,7 +457,6 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                 for block in cutlass.range(self.blocks, unroll=1):
                     cute.arch.cp_async_wait_group(self.stages - 2)
                     cute.arch.sync_threads()
-                    self._realign_stage(ring + (block % Int32(self.stages)) * Int32(self.stage_bytes), tidx)
                     if block + Int32(self.stages - 1) < Int32(self.blocks):
                         self._load2(block + Int32(self.stages - 1), ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up,
                                     live, tidx)

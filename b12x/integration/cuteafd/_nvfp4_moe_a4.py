@@ -309,14 +309,12 @@ class StreamNvfp4LinearA4:
         self.weight_bytes = self.tile_n * self.stride
         self.sc_bytes = self.tile_m * self.s_stride
         self.weight_sc_bytes = self.tile_n * self.s_stride
-        self.raw_offset = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
-        self.raw_stride = self.row_bytes + 16
-        self.stage_bytes = self.raw_offset + ((self.tile_m + self.tile_n) * self.raw_stride if self.k % 32 else 0)
+        self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
         self.alpha_offset = nvfp4_alpha_offset(experts, self.n, self.k)
         self.in_offset = nvfp4_input_scale_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_a4", 8, self.n, self.k, self.experts, self.k_block,
+        return ("stream_linear_nvfp4_a4", 6, self.n, self.k, self.experts, self.k_block,
                 self.tile_m, self.tile_n, self.live_min, self.live_max) + (("divisor",) if self.divisor else ())
 
     def _storage(self):
@@ -365,54 +363,29 @@ class StreamNvfp4LinearA4:
         byte aligned. Keep the aligned vector path compile-time specialized;
         never read a neighbouring row to manufacture an aligned transaction.
         """
-        if const_expr(self.k % 32):
-            # Copy aligned sectors into a temporary shared row. Odd native rows
-            # start eight bytes into the first sector; only the previous row's
-            # final eight bytes are fetched, never bytes before the allocation.
-            raw_base = self.raw_offset + (packed_offset // self.stride) * self.raw_stride
-            chunks = self.raw_stride // 16
-            for q in cutlass.range_constexpr(_ceil(count * chunks, self.threads)):
-                idx = tidx + Int32(q * self.threads)
-                row = idx // Int32(chunks)
-                piece = idx % Int32(chunks)
-                shift = (row & Int32(1)) * Int32(8)
-                logical = Int32(block) * Int32(self.row_bytes) + piece * Int32(16) - shift
-                dst = stage + Int32(raw_base) + row * Int32(self.raw_stride) + piece * Int32(16)
-                if (row < Int32(count)) & (row < row_limit):
-                    src = rows_at + Int64(row) * Int64(self.k // 2) + Int64(logical)
-                    if logical + Int32(16) <= Int32(self.k // 2):
+        copy_bytes = 16 if self.k % 32 == 0 else 8
+        chunks = self.row_bytes // copy_bytes
+        for q in cutlass.range_constexpr(_ceil(count * chunks, self.threads)):
+            idx = tidx + Int32(q * self.threads)
+            row = idx // Int32(chunks)
+            piece = idx % Int32(chunks)
+            byte = piece * Int32(copy_bytes)
+            dst = stage + Int32(packed_offset) + row * Int32(self.stride) \
+                + ((byte // Int32(16)) ^ self._swizzle(row)) * Int32(16) + byte % Int32(16)
+            if (row < Int32(count)) & (row < row_limit):
+                valid = Int32(1)
+                if const_expr(self.k % self.k_block):
+                    valid = Int32(Int32(block) * Int32(self.row_bytes) + byte < Int32(self.k // 2))
+                if valid != Int32(0):
+                    src = rows_at + Int64(row) * Int64(self.k // 2) \
+                        + Int64(block) * Int64(self.row_bytes) + Int64(byte)
+                    if const_expr(copy_bytes == 16):
                         cp_async4_shared_global(dst, src)
-                    elif logical < Int32(self.k // 2):
+                    else:
                         cp_async_u64_shared_global(dst, src)
-                        st_shared_u32(dst + Int32(8), Uint32(0))
-                        st_shared_u32(dst + Int32(12), Uint32(0))
-                    else:
-                        for z in cutlass.range_constexpr(4):
-                            st_shared_u32(dst + Int32(4 * z), Uint32(0))
-        else:
-            copy_bytes = 16
-            chunks = self.row_bytes // copy_bytes
-            for q in cutlass.range_constexpr(_ceil(count * chunks, self.threads)):
-                idx = tidx + Int32(q * self.threads)
-                row = idx // Int32(chunks)
-                piece = idx % Int32(chunks)
-                byte = piece * Int32(copy_bytes)
-                dst = stage + Int32(packed_offset) + row * Int32(self.stride) \
-                    + ((byte // Int32(16)) ^ self._swizzle(row)) * Int32(16) + byte % Int32(16)
-                if (row < Int32(count)) & (row < row_limit):
-                    valid = Int32(1)
-                    if const_expr(self.k % self.k_block):
-                        valid = Int32(Int32(block) * Int32(self.row_bytes) + byte < Int32(self.k // 2))
-                    if valid != Int32(0):
-                        src = rows_at + Int64(row) * Int64(self.k // 2) \
-                            + Int64(block) * Int64(self.row_bytes) + Int64(byte)
-                        if const_expr(copy_bytes == 16):
-                            cp_async4_shared_global(dst, src)
-                        else:
-                            cp_async_u64_shared_global(dst, src)
-                    else:
-                        for z in cutlass.range_constexpr(copy_bytes // 4):
-                            st_shared_u32(dst + Int32(4 * z), Uint32(0))
+                else:
+                    for z in cutlass.range_constexpr(copy_bytes // 4):
+                        st_shared_u32(dst + Int32(4 * z), Uint32(0))
         words = self.s_bytes // 4
         for q in cutlass.range_constexpr(_ceil(count * words, self.threads)):
             idx = tidx + Int32(q * self.threads)
@@ -436,23 +409,6 @@ class StreamNvfp4LinearA4:
                             value = value | (Uint32(_ld_u8(scales_at + Int64(row) * Int64(self.k // 16)
                                                           + Int64(col) + Int64(byte))) << Uint32(8 * byte))
                     st_shared_u32(dst, value)
-
-    @cute.jit
-    def _realign_stage(self, stage, tidx):
-        if const_expr(self.k % 32):
-            chunks = self.row_bytes // 16
-            for q in cutlass.range_constexpr(_ceil((self.tile_m + self.tile_n) * chunks, self.threads)):
-                idx = tidx + Int32(q * self.threads)
-                row = idx // Int32(chunks)
-                piece = idx % Int32(chunks)
-                if row < Int32(self.tile_m + self.tile_n):
-                    src = stage + Int32(self.raw_offset) + row * Int32(self.raw_stride) \
-                        + (row & Int32(1)) * Int32(8) + piece * Int32(16)
-                    dst = stage + row * Int32(self.stride) + (piece ^ self._swizzle(row)) * Int32(16)
-                    # src may be eight-byte aligned, so use four natural words.
-                    for word in cutlass.range_constexpr(4):
-                        st_shared_u32(dst + Int32(4 * word), ld_shared_u32(src + Int32(4 * word)))
-            cute.arch.sync_threads()
 
     @cute.jit
     def _mma_stage(self, stage, acc: cute.Tensor, warp_m, warp_n, q, c, mat, mrow):
@@ -549,7 +505,6 @@ class StreamNvfp4LinearA4:
                     else:
                         cute.arch.cp_async_wait_group(0)
                     cute.arch.sync_threads()
-                    self._realign_stage(ring + (block % Int32(2)) * Int32(self.stage_bytes), tidx)
                     if active:
                         stage = ring + (block % Int32(2)) * Int32(self.stage_bytes)
                         self._mma_stage(stage, acc, warp_m, warp_n, q, c, mat, mrow)
@@ -651,12 +606,10 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
         self.weight_bytes = self.tile_n * self.stride
         self.sc_bytes = self.tile_m * self.s_stride
         self.weight_sc_bytes = self.tile_n * self.s_stride
-        self.raw_offset = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
-        self.raw_stride = self.row_bytes + 16
-        self.stage_bytes = self.raw_offset + ((self.tile_m + self.tile_n) * self.raw_stride if self.k % 32 else 0)
+        self.stage_bytes = self.tile_bytes + self.weight_bytes + self.sc_bytes + self.weight_sc_bytes
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_a4", 8, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_a4", 6, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.limit, self.down_in_offset, self.tile_m, self.tile_n, self.live_min, self.live_max) + (
                     ("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (
                 ("swigluoai", self.alpha, self.beta) if self.oai else ()) + (("divisor",) if self.divisor else ())
@@ -748,7 +701,6 @@ class StreamNvfp4GateUpA4(StreamNvfp4LinearA4):
                 for block in cutlass.range(self.blocks, unroll=1):
                     cute.arch.cp_async_wait_group(self.stages - 2)
                     cute.arch.sync_threads()
-                    self._realign_stage(ring + (block % Int32(self.stages)) * Int32(self.stage_bytes), tidx)
                     if block + Int32(self.stages - 1) < Int32(self.blocks):
                         self._load2(block + Int32(self.stages - 1), ring, a_rows, as_rows, w_rows, w_up, s_rows, s_up,
                                     live, tidx)
