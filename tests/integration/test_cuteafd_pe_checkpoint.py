@@ -99,6 +99,7 @@ def _weights(snapshot):
 
 
 FINDINGS=[]
+METRICS={}
 
 
 def _metric(name,actual,reference,*,teacher=False,final=False):
@@ -108,6 +109,7 @@ def _metric(name,actual,reference,*,teacher=False,final=False):
     cosine=torch.nn.functional.cosine_similarity(a,r,dim=-1).min().item()
     equal=int((actual.contiguous().view(torch.int16)==reference.contiguous().view(torch.int16)).sum())/actual.numel()
     result=dict(name=name,max_abs=error.max().item(),relative_l2=relative.item(),min_token_cosine=cosine,bit_equal=equal)
+    METRICS[name]=result
     print("PE_CHECKPOINT "+json.dumps(result,sort_keys=True),flush=True)
     assert torch.isfinite(a).all()
     if teacher and not (relative<=2e-3 and equal>=.85):FINDINGS.append(result)
@@ -118,7 +120,7 @@ def _metric(name,actual,reference,*,teacher=False,final=False):
 @pytest.mark.parametrize("image_index",[0])
 def test_inkling_full_checkpoint_native_transformer(image_index):
     require_b12x()
-    FINDINGS.clear()
+    FINDINGS.clear();METRICS.clear()
     print("PE_REFERENCE_BACKENDS "+json.dumps(dict(bf16="SDPBackend.MATH",fp32="SDPBackend.MATH",projection="FP32 GEMM + FP32 bias + single BF16 store",
         device=torch.cuda.get_device_name(),capability=torch.cuda.get_device_capability(),
         matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
@@ -296,4 +298,14 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         final_fa=reference.proj_out(torch.nn.functional.gelu(reference.proj_in(pooled_fa)))
         _metric("vendor_class_final_vs_math",final_fa,ref_final)
         _metric("native_final_vs_vendor_class",final,final_fa)
-        assert not FINDINGS,FINDINGS
+        # #1930 coordinator decision: compare to the vendor BF16-P kernel
+        # class, not a nonexistent bit-exact datacenter FA4 block ordering.
+        teacher=max(value["relative_l2"] for name,value in METRICS.items() if name.startswith("teacher_layer"))
+        teacher_class=max(value["relative_l2"] for name,value in METRICS.items() if name.startswith("vendor_class_vs_math_teacher_layer"))
+        native_final=METRICS["projected_embeddings_vs_bf16_attention"]
+        class_final=METRICS["vendor_class_final_vs_math"]
+        ratios=dict(teacher_relative=teacher/max(teacher_class,1e-30),
+            final_relative=native_final["relative_l2"]/max(class_final["relative_l2"],1e-30),
+            final_cosine_drift=(1-native_final["min_token_cosine"])/max(1-class_final["min_token_cosine"],1e-30))
+        print("PE_ACCEPTANCE "+json.dumps(ratios,sort_keys=True),flush=True)
+        assert all(ratio<=1.1 for ratio in ratios.values()),ratios
