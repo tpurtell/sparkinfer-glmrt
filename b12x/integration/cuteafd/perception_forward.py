@@ -15,7 +15,7 @@ from .pointwise import _add,_sub,_mul,_fma,_sqrt_rn,_view
 class CheckedForward:
     """Host validation for pointer ABI tests; native owners admit the same extents."""
     def __init__(self,program,kind,**geometry):
-        self.program,self.kind,self.geometry=program,kind,geometry
+        self.program,self.kind,self._geometry=program,kind,geometry
 
     def __getattr__(self,name):
         return getattr(self.program,name)
@@ -24,14 +24,14 @@ class CheckedForward:
         if self.kind=="norm":
             if len(scalars)!=2 or scalars[0]<=0 or not math.isfinite(scalars[1]) or scalars[1]<=0:
                 raise ValueError("PE norm requires positive rows and finite positive epsilon")
-            rows,epsilon=scalars;hidden=self.geometry["hidden"]
+            rows,epsilon=scalars;hidden=self._geometry["hidden"]
             expected=[rows*hidden,hidden,hidden,rows*hidden]
         else:
             if len(scalars)!=2 or not all(isinstance(value,int) and value>0 for value in scalars):
                 raise ValueError("PE image extents must be positive integers")
             height,width=scalars
             if self.kind=="patch":
-                patch=self.geometry["patch"]
+                patch=self._geometry["patch"]
                 if height%patch or width%patch:
                     raise ValueError("PE normalized image extents must divide the patch size")
                 if height*width//(patch*patch)>16384:
@@ -40,9 +40,9 @@ class CheckedForward:
             else:
                 if height*width>16384:
                     raise ValueError("PE image grid exceeds admitted capacity")
-                hidden,grid=self.geometry["hidden"],self.geometry["grid"]
+                hidden,grid=self._geometry["hidden"],self._geometry["grid"]
                 expected=[height*width*hidden,grid*grid*hidden,hidden,hidden,
-                    (height*width+int(self.geometry["class_token"]))*hidden]
+                    (height*width+int(self._geometry["class_token"]))*hidden]
         if len(tensors)!=len(expected) or any(tensor is None or tensor.numel()<size for tensor,size in zip(tensors,expected)):
             raise ValueError("PE forward operand storage below admitted extent")
         return self.program.launch(*tensors,scalars=scalars,stream=stream)
@@ -142,7 +142,8 @@ class NormalizedPatches:
         count=Int64(height)*Int64(width)*Int64(3)
         if height%Int32(self.patch)!=Int32(0) or width%Int32(self.patch)!=Int32(0):
             count=Int64(0)
-        self.kernel(pixels,out,width,count).launch(grid=((count+255)//256,1,1),block=(256,1,1),stream=stream)
+        if count>Int64(0):
+            self.kernel(pixels,out,width,count).launch(grid=((count+255)//256,1,1),block=(256,1,1),stream=stream)
 
     @cute.kernel
     def kernel(self,pixels:cute.Pointer,out:cute.Pointer,width:Int32,count:Int64):
