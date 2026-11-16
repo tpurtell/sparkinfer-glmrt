@@ -32,7 +32,8 @@ def inkling():
     import triton.language as tl
     import triton.language.extra.cuda.libdevice as tldevice
     names = {"_rope_inv_freq","_bf16","_layer_norm","_rotate_pair","_rotary_qk_kernel",
-        "apply_rotary_qk_","_scaled_residual_norm_kernel","scaled_residual_norm_"}
+        "apply_rotary_qk_","_scaled_residual_norm_kernel","scaled_residual_norm_",
+        "_source_coords","_lerp","_embed_kernel","embed_tokens"}
     module = types.ModuleType("perception_vendor_inkling")
     module.__file__ = str(Path(os.environ["CUTEAFD_PE_VENDOR_DIR"])/"vision.py")
     import sys
