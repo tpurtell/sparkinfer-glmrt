@@ -60,9 +60,9 @@ class _HistoryCommit:
             value = Uint32(0)
             if keep > lag:
                 source = cute.recast_ptr(replay, dtype=Uint32)
-                value = source[layer * replay_layer_stride + (first + keep - 1 - lag) * replay_row_stride + col]
+                value = Uint32(source[layer * replay_layer_stride + (first + keep - 1 - lag) * replay_row_stride + col])
             else:
-                value = source[base + (lag - keep) * lag_stride]
+                value = Uint32(source[base + (lag - keep) * lag_stride])
             cute.recast_ptr(live, dtype=Uint32)[base + lag * lag_stride] = value
 
 
