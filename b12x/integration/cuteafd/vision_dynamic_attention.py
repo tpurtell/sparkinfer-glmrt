@@ -1,0 +1,54 @@
+"""Runtime-row view of the existing contiguous varlen vision attention kernel.
+
+Legacy static wrappers are deliberately unchanged. TMA tensor extents, LSE head
+stride and launch upper bound all use the caller's admitted live row extent.
+"""
+from __future__ import annotations
+
+import cuda.bindings.driver as cuda
+import cutlass.cute as cute
+import torch
+from cutlass import BFloat16, Float32, Int32
+
+from ._common import Operand, Scalar, compile_program
+
+
+class DynamicVisionAttention:
+    def __init__(self, heads, dim):
+        from b12x.attention._shared.contiguous.forward import ContiguousAttentionForwardKernel
+        self.heads, self.dim = heads, dim
+        self.kernel = ContiguousAttentionForwardKernel(
+            BFloat16, dim, head_dim_v=dim, qhead_per_kvhead=1,
+            is_causal=False, is_local=False, pack_gqa=False, tile_m=128, tile_n=64)
+
+    @cute.jit
+    def __call__(self, q: cute.Pointer, k: cute.Pointer, v: cute.Pointer,
+                 out: cute.Pointer, lse: cute.Pointer, lengths: cute.Pointer,
+                 rows: Int32, scale: Float32, l2_bytes: Int32, stream: cuda.CUstream):
+        shape = (rows, self.heads, self.dim)
+        stride = (self.heads * self.dim, self.dim, 1)
+        tensors = tuple(cute.make_tensor(pointer,cute.make_layout(shape,stride=stride))
+                        for pointer in (q,k,v,out))
+        lse_tensor = cute.make_tensor(lse,cute.make_layout((self.heads,rows),stride=(rows,1)))
+        cumulative = cute.make_tensor(lengths,cute.make_layout((2,),stride=(1,)))
+        # With cumulative lengths both SeqlenInfo and the varlen scheduler read
+        # the real sequence extent from device memory. Static non-varlen bounds
+        # are unused; the dynamic Q extent controls the launch upper bound.
+        self.kernel(*tensors,lse_tensor,scale,mCuSeqlensQ=cumulative,mCuSeqlensK=cumulative,
+            has_attention_sink_bias=False,logical_num_batch_static=1,
+            logical_seqlen_q_static=0,logical_seqlen_k_static=0,
+            l2_cache_size=l2_bytes,window_size_left=None,window_size_right=None,stream=stream)
+
+
+def compile_dynamic_vision_attention_aot(*, heads, dim):
+    if (heads,dim) not in ((12,128),(16,80),(16,128)):
+        raise ValueError("dynamic vision attention requires12x128,16x80 or shared16x128")
+    return compile_program(DynamicVisionAttention(heads,dim),name="dynamic_vision_attention",
+        operands=(Operand("q",torch.bfloat16,f"[rows,{heads},{dim}]"),
+                  Operand("k",torch.bfloat16,f"[rows,{heads},{dim}]"),
+                  Operand("v",torch.bfloat16,f"[rows,{heads},{dim}]"),
+                  Operand("out",torch.bfloat16,f"[rows,{heads},{dim}]","out"),
+                  Operand("lse",torch.float32,f"[{heads},rows]","scratch"),
+                  Operand("lengths",torch.int32,"[2]")),
+        scalars=(Scalar("rows"),Scalar("scale","float32"),Scalar("l2_bytes","int32")),
+        key=(heads,dim),geometry=dict(heads=heads,dim=dim,rows="runtime",causal=False))
