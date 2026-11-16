@@ -49,6 +49,18 @@ def _official(cfg):
             out=F.scaled_dot_product_attention(q.float().transpose(0,1)[None],k.float().transpose(0,1)[None],v.float().transpose(0,1)[None],scale=kwargs["softmax_scale"])
         return out[0].transpose(0,1).contiguous().bfloat16(),None
     namespace["fp32_flash_attn_varlen_func"]=fp32_flash
+    def vendor_class_flash(q,k,v,**kwargs):
+        old=torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32=False
+            qq,kk,vv=[tensor.float().transpose(0,1) for tensor in (q,k,v)]
+            scores=(qq@kk.transpose(-1,-2))*kwargs["softmax_scale"]
+            probabilities=(scores-scores.max(-1,keepdim=True).values).exp()
+            denominator=probabilities.sum(-1,keepdim=True)
+            numerator=probabilities.bfloat16().float()@vv
+            return (numerator/denominator).transpose(0,1).contiguous().bfloat16(),None
+        finally:torch.backends.cuda.matmul.allow_tf32=old
+    namespace["vendor_class_flash_attn_varlen_func"]=vendor_class_flash
     tree=ast.parse(raw)
     nodes=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef))]
     exec(compile(ast.Module(body=nodes,type_ignores=[]),str(path),"exec"),namespace)
@@ -223,6 +235,9 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         attention.launch(q,k,v,o,lse,cu,scalars=[64**-.5,l2])
         compare("attention_vs_bf16_math",o[:n],rattention);compare("attention_vs_fp32_math",o[:n],rattention32)
         compare("reference_bf16_vs_fp32_math",rattention,rattention32)
+        rfa=reference._reference_globals["vendor_class_flash_attn_varlen_func"](rq,rk,rv,**args)[0]
+        compare("native_vs_vendor_class",o[:n],rfa)
+        compare("vendor_class_vs_math",rfa,rattention)
         rprojection=layer.self_attn.out_proj(rattention.reshape(n,1024))
         oproj.launch(rattention,state[base+"self_attn.out_proj.weight"],state[base+"self_attn.out_proj.bias"],delta,scalars=[n]);compare("o_projection",delta,rprojection)
         projection_arms("o_projection",rattention.reshape(n,1024),state[base+"self_attn.out_proj.weight"],state[base+"self_attn.out_proj.bias"],delta,rprojection)
@@ -240,7 +255,7 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         rfinal=rmid.clone();vendor.inkling().scaled_residual_norm_(rfinal,rfc2,layer.ls_2.gamma,None)
         residual.launch(rmid,rfc2,state[base+"ls_2.gamma"],tmp,scalars=[n]);compare("mlp_scale_residual",tmp,rfinal)
     with torch.inference_mode():probe_layer0(xref)
-    xref32=xref.clone();scope=reference._reference_globals
+    xref32=xref.clone();xref_fa=xref.clone();scope=reference._reference_globals
     bf16_attention=scope["flash_attn_varlen_func"]
     with torch.inference_mode():
         for i,layer in enumerate(reference.backbone.layers):
@@ -250,8 +265,14 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
             scope["flash_attn_varlen_func"]=scope["fp32_flash_attn_varlen_func"]
             layer(ref32_teacher,layer.ln_1(ref32_teacher),metadata,None)
             layer(xref32,layer.ln_1(xref32),metadata,None)
+            scope["flash_attn_varlen_func"]=scope["vendor_class_flash_attn_varlen_func"]
+            fa_teacher=xref.clone()
+            layer(fa_teacher,layer.ln_1(fa_teacher),metadata,None)
+            layer(xref_fa,layer.ln_1(xref_fa),metadata,None)
             scope["flash_attn_varlen_func"]=bf16_attention
             layer(xref,layer.ln_1(xref),metadata,None)
+            _metric(f"vendor_class_vs_math_teacher_layer{i}",fa_teacher,xref)
+            _metric(f"native_vs_vendor_class_teacher_layer{i}",teacher,fa_teacher)
             _metric(f"teacher_layer{i}",teacher,xref,teacher=True)
             _metric(f"reference_attention_variance_layer{i}",ref32_teacher,xref)
             _metric(f"free_layer{i}",x,xref)
@@ -271,4 +292,8 @@ def test_inkling_full_checkpoint_native_transformer(image_index):
         _metric("projected_embeddings_vs_bf16_attention",final,ref_final,final=True)
         _metric("projected_embeddings_vs_fp32_attention",final,ref_final32)
         _metric("reference_bf16_vs_fp32_attention",ref_final,ref_final32)
+        pooled_fa=xref_fa.index_select(0,metadata.pool_rows).reshape(units,4096)
+        final_fa=reference.proj_out(torch.nn.functional.gelu(reference.proj_in(pooled_fa)))
+        _metric("vendor_class_final_vs_math",final_fa,ref_final)
+        _metric("native_final_vs_vendor_class",final,final_fa)
         assert not FINDINGS,FINDINGS
