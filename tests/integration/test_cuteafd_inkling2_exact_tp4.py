@@ -143,3 +143,96 @@ def test_dynamic_down_native_k64_matches_exact_grid(k, n, tmp_path):
     expected = (decode(aq).double() @ decode(weight).double().T).float().bfloat16()
     assert torch.equal(output, expected), (k, (output.float() - expected.float()).abs().max().item())
     print(f'NVFP4 dynamic down K{k}: exact integer-grid F64 reference, stored K{k}')
+
+
+# Native shard widths, including the rotated remainder ranks. Keep the family's
+# real hidden/expert/top-k geometry; only the stored rank width changes.
+FAMILY_WIDTHS = [
+    ('inkling2_nvfp4', 3, 768), ('inkling2_nvfp4', 4, 576),
+    ('inkling2_nvfp4', 5, 448), ('inkling2_nvfp4', 5, 464),
+    ('inkling2_nvfp4', 6, 384),
+    ('glmf_nvfp4', 3, 688), ('glmf_nvfp4', 3, 672),
+    ('glmf_nvfp4', 5, 416), ('glmf_nvfp4', 5, 400),
+    ('glmf_nvfp4', 6, 352), ('glmf_nvfp4', 6, 336),
+    ('glm_nvfp4', 3, 688), ('glm_nvfp4', 3, 672),
+    ('qwen4_nvfp4', 2, 320), ('qwen4_nvfp4', 3, 224),
+    ('qwen4_nvfp4', 3, 208), ('qwen4_nvfp4', 4, 160),
+    ('qwen4_nvfp4', 6, 112), ('qwen4_nvfp4', 6, 96),
+    ('minimax_nvfp4a4', 2, 1536), ('minimax_nvfp4a4', 3, 1024),
+    ('minimax_nvfp4a4', 4, 768), ('minimax_nvfp4a4', 6, 512),
+    ('minimax_nvfp4a4', 5, 624), ('minimax_nvfp4a4', 5, 608),
+    ('minimax_nvfp4a4', 7, 448), ('minimax_nvfp4a4', 7, 432),
+    ('inkling2_nvfp4', 4, 560), ('inkling2_nvfp4', 4, 592),
+    ('inkling2_nvfp4', 4, 1040),
+]
+
+
+def _native_geometry(name, tp, width):
+    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry, GEOMETRIES
+
+    class NativeWidth(Fp8MoeGeometry):
+        @property
+        def slice(self):
+            return width
+
+    return NativeWidth(**{**vars(GEOMETRIES[name]), 'tp': tp})
+
+
+@pytest.mark.parametrize('name,tp,width', FAMILY_WIDTHS)
+def test_native_family_exported_route(name, tp, width, tmp_path):
+    require_b12x()
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.fp8_moe import compile_fp8_moe_aot, fp8_moe_scratch_bytes
+
+    g = _native_geometry(name, tp, width)
+    torch.manual_seed(142)
+    if g.dynamic_nvfp4:
+        w = _weights(g)
+    else:
+        from .test_cuteafd_nvfp4_moe_aot import _weights as static_weights
+        w = static_weights(g, width)
+    capacity = 4096
+    x = torch.randn(capacity, g.hidden, device='cuda', dtype=torch.bfloat16)
+    ids = torch.rand(capacity, g.experts, device='cuda').topk(g.top_k, -1).indices.int().contiguous()
+    gamma = torch.rand(capacity, g.top_k, device='cuda')
+    ordinary = compile_fp8_moe_aot(g, route='auto', max_rows=capacity, wire=False)
+    with exportable_compilation():
+        program = compile_fp8_moe_aot(g, route='auto', max_rows=capacity, wire=False)
+    exported = ExportedProgram(program, tmp_path, f'{name}_w{width}')
+    scratch_bytes = fp8_moe_scratch_bytes(g, 'auto', capacity, False)
+    scratch = [torch.empty(scratch_bytes, dtype=torch.uint8, device='cuda') for _ in range(2)]
+    outputs = [torch.full((capacity + 2, g.hidden), 11, dtype=torch.bfloat16, device='cuda') for _ in range(2)]
+    for rows in [1, 7, 80, 2752, 4096]:
+        for route, output, workspace in zip([ordinary, exported], outputs, scratch):
+            route.launch(x, ids, gamma, *w, output[1:-1], workspace, scalars=(rows,))
+        torch.cuda.synchronize()
+        assert torch.equal(outputs[0][1:rows + 1], outputs[1][1:rows + 1]), (name, width, rows)
+        assert torch.isfinite(outputs[1][1:rows + 1]).all()
+        assert outputs[1][1:rows + 1].abs().max() > 0
+        assert all(torch.all(output[[0, -1]] == 11) for output in outputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        exported.launch(x, ids, gamma, *w, outputs[1][1:-1], scratch[1], scalars=(80,))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(outputs[0][1:81], outputs[1][1:81])
+    print(f'{name} native width {width}: exported exact rows 1/7/80/2752/4096 + replay')
+
+
+@pytest.mark.parametrize('width', [560, 592, 1040])
+def test_native_dynamic_stage_reference(width, tmp_path, monkeypatch):
+    require_b12x()
+    from dataclasses import replace
+    from b12x.integration.cuteafd import exportable_compilation
+    from . import test_cuteafd_inkling2_nvfp4_moe as oracle
+
+    # Independent F64 stage checks are intentionally small; the full resident
+    # family tests above separately exercise real H/E and serving row counts.
+    g = replace(_native_geometry('inkling2_nvfp4', 4, width), hidden=128, experts=4, top_k=2)
+    with exportable_compilation():
+        program = oracle._stage_program(g, 80)
+    exported = ExportedProgram(program, tmp_path, f'dynamic_stages_w{width}')
+    monkeypatch.setattr(oracle, '_stage_program', lambda *_: exported)
+    for rows in [1, 7, 80]:
+        report = oracle._run(g, width, 80, rows, gamma_spread=2, bimodal=True)
+        oracle._print(f'exported native width {width}, rows {rows}', report)

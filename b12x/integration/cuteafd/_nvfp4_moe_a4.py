@@ -369,8 +369,8 @@ class StreamNvfp4LinearA4:
             byte = piece * Int32(copy_bytes)
             dst = stage + Int32(packed_offset) + row * Int32(self.stride) \
                 + ((byte // Int32(16)) ^ self._swizzle(row)) * Int32(16) + byte % Int32(16)
-            if row < Int32(count):
-                if (row < row_limit) & (Int32(block) * Int32(self.row_bytes) + byte < Int32(self.k // 2)):
+            if (row < Int32(count)) & (row < row_limit):
+                if Int32(block) * Int32(self.row_bytes) + byte < Int32(self.k // 2):
                     src = rows_at + Int64(row) * Int64(self.k // 2) \
                         + Int64(block) * Int64(self.row_bytes) + Int64(byte)
                     if const_expr(copy_bytes == 16):
@@ -387,16 +387,16 @@ class StreamNvfp4LinearA4:
             word = idx % Int32(words)
             col = Int32(block) * Int32(self.s_bytes) + word * Int32(4)
             dst = stage + Int32(scale_offset) + row * Int32(self.s_stride) + word * Int32(4)
-            if row < Int32(count):
+            if (row < Int32(count)) & (row < row_limit):
                 if const_expr(self.k % 64 == 0):
-                    if (row < row_limit) & (col < Int32(self.k // 16)):
+                    if col < Int32(self.k // 16):
                         cp_async_u32_shared_global(dst, scales_at + Int64(row) * Int64(self.k // 16) + Int64(col))
                     else:
                         st_shared_u32(dst, Uint32(0))
                 else:
                     value = Uint32(0)
                     for byte in cutlass.range_constexpr(4):
-                        if (row < row_limit) & (col + Int32(byte) < Int32(self.k // 16)):
+                        if col + Int32(byte) < Int32(self.k // 16):
                             value = value | (Uint32(_ld_u8(scales_at + Int64(row) * Int64(self.k // 16)
                                                           + Int64(col) + Int64(byte))) << Uint32(8 * byte))
                     st_shared_u32(dst, value)
