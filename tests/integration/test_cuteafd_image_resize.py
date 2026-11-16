@@ -19,7 +19,8 @@ def _images():
 
 
 def _coeff(program,size,out):
-    taps=2*math.ceil(2*max(1,size/out))+1
+    from b12x.integration.cuteafd.image_resize import resize_max_taps
+    taps=resize_max_taps(size,out,filter="bicubic",antialias=True)
     indices=torch.empty(out,device="cuda",dtype=torch.int32)
     sizes=torch.empty_like(indices)
     weights=torch.empty(out,taps,device="cuda")
@@ -48,6 +49,28 @@ def test_rgb_normalize_all_unsigned_byte_values():
     expected=(rgb.float()/255-mean)/std
     print(f"RGB_LUT max_abs={float((out-expected).abs().max()):.9g}",flush=True)
     assert torch.equal(out,expected)
+
+
+def test_resize_coefficients_reject_undersized_storage_and_pass_zero_span():
+    require_b12x()
+    from b12x.integration.cuteafd.image_resize import (resize_max_taps,
+        compile_resize_coefficients_aot,compile_resize_pass_aot)
+    taps=resize_max_taps(640,504)
+    program=compile_resize_coefficients_aot()
+    indices=torch.empty(504,device="cuda",dtype=torch.int32)
+    sizes=torch.empty_like(indices)
+    weights=torch.empty(504,taps,device="cuda")
+    for scalars in [(640,504,taps-1),(0,504,taps),(640,0,taps)]:
+        with pytest.raises(ValueError):
+            program.launch(indices,sizes,weights,scalars=scalars)
+    with pytest.raises(ValueError,match="storage"):
+        program.launch(indices,sizes,weights[:1],scalars=[640,504,taps])
+    x=torch.randn(1,1,3,device="cuda")
+    zero=torch.zeros(1,device="cuda",dtype=torch.int32)
+    weights=torch.full((1,5),float("nan"),device="cuda")
+    out=torch.full_like(x,42)
+    compile_resize_pass_aot(vertical=False).launch(x,zero,zero,weights,out,scalars=[1,1,1,5])
+    assert torch.equal(out,torch.zeros_like(out))
 
 
 @pytest.mark.parametrize("out_size",[728,504])

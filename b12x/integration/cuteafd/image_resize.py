@@ -4,6 +4,8 @@ Follows ATen CUDA upsample_antialias weights and horizontal-then-vertical
 accumulation. Caller owns all storage; image sizes are runtime launch values.
 """
 from __future__ import annotations
+import math
+import struct
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -12,6 +14,37 @@ from cutlass import Float32,Int32,Int64,Uint32
 from b12x._lib.intrinsics import div_rn_f32
 from ._common import Operand,Scalar,compile_program
 from .pointwise import _add,_fma,_mul,_sub,_view
+
+
+def resize_max_taps(input_size,output_size,*,filter="bicubic",antialias=True):
+    if (not isinstance(input_size,int) or not isinstance(output_size,int)
+            or min(input_size,output_size)<=0 or max(input_size,output_size)>2**24):
+        raise ValueError("resize extents must be positive integers no greater than 2**24")
+    if filter not in ("bicubic","bilinear") or not antialias:
+        raise ValueError("only antialiased bicubic/bilinear resize is qualified")
+    fp32=lambda value:struct.unpack("<f",struct.pack("<f",value))[0]
+    scale=fp32(input_size/output_size)
+    support=fp32((2 if filter=="bicubic" else 1)*max(1.0,scale))
+    return 2*math.ceil(support)+1
+
+
+class CoefficientProgram:
+    def __init__(self,program,filter,antialias):
+        self.program,self.filter,self.antialias=program,filter,antialias
+
+    def __getattr__(self,name):
+        return getattr(self.program,name)
+
+    def launch(self,*tensors,scalars,stream=None):
+        if len(scalars)!=3 or len(tensors)!=3:
+            raise ValueError("resize coefficients need three pointers and three scalars")
+        input_size,output_size,taps=scalars
+        required=resize_max_taps(input_size,output_size,filter=self.filter,antialias=self.antialias)
+        if taps!=required:
+            raise ValueError(f"resize taps must equal admitted maximum span {required}, found {taps}")
+        if tensors[0].numel()<output_size or tensors[1].numel()<output_size or tensors[2].numel()<output_size*taps:
+            raise ValueError("resize coefficient storage is below admitted extent")
+        return self.program.launch(*tensors,scalars=scalars,stream=stream)
 
 
 class NormalizeRgb:
@@ -27,6 +60,8 @@ class NormalizeRgb:
         at=Int64(cute.arch.block_idx()[0])*256+Int64(cute.arch.thread_idx()[0])
         if at<count:
             channel=at%3
+            # Torch scalar /255 uses its FP32 reciprocal 0x3b808081;
+            # the complete 256-value oracle checks this exact rounding boundary.
             value=_mul(Float32(Uint32(rgb[at])),Float32(1.0/255.0))
             out[at]=div_rn_f32(_sub(value,Float32(mean[channel])),Float32(std[channel]))
 
@@ -78,6 +113,12 @@ class ResizeCoefficients:
             if end>input_size:
                 end=input_size
             size=end-first
+            # Native raw-ABI callers must admit max_taps first. Clamp defensively
+            # so malformed metadata can never write beyond its passed row span.
+            if size>taps:
+                size=taps
+            if size<Int32(0):
+                size=Int32(0)
             indices[row]=first;sizes[row]=size
             invscale=div_rn_f32(Float32(1.0),factor)
             total=Float32(0.0)
@@ -133,10 +174,14 @@ class ResizePass:
                 base=(pixel%Int64(input_width))*3+channel
                 stride=Int64(input_width)*3
             first=Int64(indices[axis]);size=Int32(sizes[axis])
-            value=_mul(Float32(x[base+first*stride]),Float32(weights[axis*Int64(taps)]))
-            for tap in cutlass.range(1,size):
-                value=_fma(Float32(x[base+(first+Int64(tap))*stride]),
-                    Float32(weights[axis*Int64(taps)+Int64(tap)]),value)
+            if size>taps:
+                size=taps
+            value=Float32(0.0)
+            if size>Int32(0):
+                value=_mul(Float32(x[base+first*stride]),Float32(weights[axis*Int64(taps)]))
+                for tap in cutlass.range(1,size):
+                    value=_fma(Float32(x[base+(first+Int64(tap))*stride]),
+                        Float32(weights[axis*Int64(taps)+Int64(tap)]),value)
             out[at]=value
 
 
@@ -152,11 +197,11 @@ def compile_resize_coefficients_aot(*,filter="bicubic",antialias=True):
         raise ValueError("tensor resize filter must be bicubic or bilinear")
     if not antialias:
         raise ValueError("non-antialiased tensor resize needs its distinct boundary rule")
-    return compile_program(ResizeCoefficients(filter,bool(antialias)),name="image_resize_coefficients",operands=(
+    return CoefficientProgram(compile_program(ResizeCoefficients(filter,bool(antialias)),name="image_resize_coefficients",operands=(
         Operand("indices",torch.int32,"[output_size]","out"),Operand("sizes",torch.int32,"[output_size]","out"),
         Operand("weights",torch.float32,"[output_size,taps]","out")),
         scalars=(Scalar("input_size"),Scalar("output_size"),Scalar("taps")),key=(filter,bool(antialias)),
-        geometry=dict(filter=filter,antialias=bool(antialias),coefficient=-.5 if filter=="bicubic" else None),version=3)
+        geometry=dict(filter=filter,antialias=bool(antialias),coefficient=-.5 if filter=="bicubic" else None),version=4),filter,bool(antialias))
 
 
 def compile_resize_pass_aot(*,vertical):
@@ -165,4 +210,4 @@ def compile_resize_pass_aot(*,vertical):
         Operand("sizes",torch.int32,"[output_size]"),Operand("weights",torch.float32,"[output_size,taps]"),
         Operand("out",torch.float32,"[output_height,output_width,3]","out")),
         scalars=(Scalar("input_height"),Scalar("input_width"),Scalar("output_size"),Scalar("taps")),
-        key=(bool(vertical),),geometry=dict(channels=3,vertical=bool(vertical),accumulator="float32",clamp=False))
+        key=(bool(vertical),),geometry=dict(channels=3,vertical=bool(vertical),accumulator="float32",clamp=False),version=2)
