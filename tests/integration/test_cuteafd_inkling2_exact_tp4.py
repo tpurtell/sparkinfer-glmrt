@@ -308,3 +308,52 @@ def test_gate_input_and_column_tails(hidden, inter, tmp_path):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(fq, rq) and torch.equal(fs, rs)
+
+
+@pytest.mark.parametrize('k', [128, 256, 640, 1536])
+def test_aligned_exported_baseline_bytes(k, tmp_path):
+    require_b12x()
+    baseline_path = os.environ.get('NVFP4_DUEL_BASELINE_A4')
+    if not baseline_path:
+        pytest.skip('set NVFP4_DUEL_BASELINE_A4 to the pristine master A4 module')
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._nvfp4_moe_a4 import StreamNvfp4LinearA4
+
+    name = 'b12x.integration.cuteafd._nvfp4_duel_baseline'
+    spec = importlib.util.spec_from_file_location(name, baseline_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    ops = tuple(Operand(n, torch.int32 if n == 'meta' else torch.uint8, '[bytes]', align=4)
+                for n in ['aq', 'a_s', 'meta', 'w', 's']) + (
+                    Operand('y', torch.bfloat16, '[rows,N]', 'out'),)
+    torch.manual_seed(k)
+    n, rows = 128, 128
+    aq = torch.randint(0, 256, (rows, k // 2), device='cuda', dtype=torch.uint8)
+    w = torch.randint(0, 256, (n, k // 2), device='cuda', dtype=torch.uint8)
+    a_s = torch.randint(16, 80, (rows, k // 16), device='cuda', dtype=torch.uint8)
+    s = torch.cat([torch.randint(16, 80, (n * k // 16,), device='cuda', dtype=torch.uint8),
+                   torch.tensor([0.003, 0.002], device='cuda').view(torch.uint8)])
+    meta = torch.tensor([0, 1, 0, 0, rows, 0, 0, 0], device='cuda', dtype=torch.int32)
+    outputs, programs = [], []
+    for label, cls in [('candidate', StreamNvfp4LinearA4), ('baseline', module.StreamNvfp4LinearA4)]:
+        kernel = cls(n=n, k=k, experts=1)
+        with exportable_compilation():
+            program = compile_program(kernel, name=label, operands=ops, scalars=(Scalar('max_tiles'),),
+                                      key=(label, kernel.key()))
+        exported = ExportedProgram(program, tmp_path, label)
+        programs.append(exported)
+        outputs.append(torch.empty(rows, n, device='cuda', dtype=torch.bfloat16))
+    for live in [1, 7, 80, 128]:
+        meta[4] = live
+        for exported, output in zip(programs, outputs):
+            exported.launch(aq, a_s, meta, w, s, output, scalars=(1,))
+        torch.cuda.synchronize()
+        assert torch.equal(outputs[0][:live], outputs[1][:live]), (k, live)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        programs[0].launch(aq, a_s, meta, w, s, outputs[0], scalars=(1,))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(*outputs)
