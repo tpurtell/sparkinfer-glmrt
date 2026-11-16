@@ -16,7 +16,7 @@ from b12x.integration.cuteafd import exportable_compilation, validate_exported_h
 from b12x.integration.cuteafd import inkling_drafter as kernels
 
 
-@pytest.fixture(scope="module", params=["dflare_mix", "mask_init", "recurrent_gate"])
+@pytest.fixture(scope="module", params=["dflare_mix", "mask_init", "recurrent_gate", "head_fold", "logit_finish"])
 def program(request, tmp_path_factory):
     kind = request.param
     with exportable_compilation():
@@ -79,6 +79,9 @@ def _reference_gate(raw, state):
 def test_oracle_and_graph(program):
     kind, compiled, exported, module = program
     torch.manual_seed(851)
+    if kind in ("head_fold", "logit_finish"):
+        _check_head_program(kind, exported, module)
+        return
     maximum = 4096 if kind == "dflare_mix" else 64
     if kind == "dflare_mix":
         inputs = [torch.randn(maximum, 8, 4608, device="cuda", dtype=torch.bfloat16),
@@ -176,3 +179,75 @@ def test_oracle_and_graph(program):
             path = Path(destination)
             path.mkdir(parents=True, exist_ok=True)
             (path / f"{kind}-{rows}.json").write_text(json.dumps(receipt, indent=2) + "\n")
+
+
+def _check_head_program(kind, exported, module):
+    def invoke(tensors, *scalars):
+        assert exported.launch(ctypes.byref(module), *(t.data_ptr() for t in tensors),
+                               *scalars, torch.cuda.current_stream().cuda_stream) == 0
+
+    if kind == "head_fold":
+        # Real K/N geometry and padded vocab, including an absolute-offset tail.
+        lm = torch.randn(201024, 4608, device="cuda", dtype=torch.bfloat16) * .03
+        projection = torch.randn(4608, 256, device="cuda", dtype=torch.bfloat16) * .03
+        bias = torch.randn(4608, device="cuda", dtype=torch.bfloat16) * .03
+        weight = torch.full((201024, 256), float("nan"), device="cuda", dtype=torch.bfloat16)
+        folded_bias = torch.full((201024,), float("nan"), device="cuda", dtype=torch.bfloat16)
+        tensors = (lm, projection, bias, weight, folded_bias)
+        launch = lambda first, rows: invoke(tensors, first, rows)
+        for first, rows in ((0, 1), (3, 17), (201024 - 4096, 4096)):
+            launch(first, rows)
+            reference = (lm[first:first+rows].double() @ projection.double()).bfloat16()
+            ref_bias = (lm[first:first+rows].double() @ bias.double()).bfloat16()
+            assert torch.equal(weight[first:first+rows].view(torch.int16), reference.view(torch.int16))
+            assert torch.equal(folded_bias[first:first+rows].view(torch.int16), ref_bias.view(torch.int16))
+        assert torch.isnan(weight[20:201024-4096]).all()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch(0, 17)
+        graph.replay()
+        assert torch.equal(weight[:17], (lm[:17].double() @ projection.double()).bfloat16())
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        launch(0, 4096)
+        start.record()
+        launch(0, 4096)
+        end.record()
+        end.synchronize()
+        tile_ms = start.elapsed_time(end)
+        print("INKLING_FOLD " + json.dumps({"tile_rows": 4096, "tile_ms": tile_ms,
+              "projected_full_ms": tile_ms * 201024 / 4096, "device": torch.cuda.get_device_name(),
+              "scratch_bytes": 0, "cta_smem_bytes": 512}), flush=True)
+        if torch.cuda.get_device_capability() == (12, 0):
+            # Startup runs once, not a 100-replay timing of a huge operation.
+            start.record()
+            for first in range(0, 201024, 4096):
+                launch(first, min(4096, 201024-first))
+            end.record()
+            end.synchronize()
+            full_ms = start.elapsed_time(end)
+            print("INKLING_FULL_FOLD " + json.dumps({"ms": full_ms, "device": torch.cuda.get_device_name()}), flush=True)
+            for first in range(0, 201024, 4096):
+                count = min(4096, 201024-first)
+                head = lm[first:first+count].double()
+                assert torch.equal(weight[first:first+count], (head @ projection.double()).bfloat16())
+                assert torch.equal(folded_bias[first:first+count], (head @ bias.double()).bfloat16())
+    else:
+        maximum = 448
+        base = (torch.randn(maximum, 201024, device="cuda") * 20).bfloat16()
+        correction = (torch.randn_like(base.float()) * 20).bfloat16()
+        # Padded vocabulary is poison and must never appear in the output.
+        base[:, 200058:] = float("nan")
+        output = torch.full((maximum, 200058), float("nan"), device="cuda", dtype=torch.bfloat16)
+        tensors = (base, correction, output)
+        reference = ((base[:, :200058] + correction[:, :200058]).float() / 30).tanh().mul(30).bfloat16()
+        for rows in (0, 1, 64, 448):
+            output.fill_(float("nan"))
+            invoke(tensors, rows)
+            assert torch.equal(output[:rows].view(torch.int16), reference[:rows].view(torch.int16))
+            assert torch.isnan(output[rows:]).all()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            invoke(tensors, 64)
+        output.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(output[:64], reference[:64])

@@ -1,4 +1,4 @@
-"""Inkling 2's three allocation-free MTP companion programs.
+"""Inkling 2's allocation-free MTP companion programs.
 
 Pinned math: WoosukKwon/vllm d664cd1e, inkling2/ops/dspark.py and
 inkling2/dspark.py. All arrays are contiguous, all outputs are disjoint from
@@ -12,7 +12,9 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Float64, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cuda.bindings import driver as cuda
 
 from b12x._lib.intrinsics import (
@@ -153,3 +155,107 @@ def compile_inkling_recurrent_gate_aot():
         Operand("latent", torch.bfloat16, "[sequences,256]", "out"),
     ), scalars=(Scalar("sequences"),), key=(_RANK,),
         geometry={"rank": _RANK}, doc=__doc__)
+
+
+@dsl_user_op
+def _narrow_double(value: Float64, *, loc=None, ip=None) -> Float32:
+    """Direct FP64 -> BF16 RNE: FP32 as an intermediate can double-round."""
+    return Float32(llvm.inline_asm(T.f32(), [Float64(value).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 b; cvt.rn.bf16.f64 b, $1; cvt.f32.bf16 $0, b; }", "=f,d",
+        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT))
+
+
+class _HeadFold:
+    @cute.jit
+    def __call__(self, lm_head: cute.Pointer, hidden_out: cute.Pointer,
+                 hidden_bias: cute.Pointer, folded_weight: cute.Pointer,
+                 folded_bias: cute.Pointer, first_row: Int32, rows: Int32,
+                 stream: cuda.CUstream):
+        if rows > 0 and rows <= 4096 and first_row >= 0 and first_row <= 201024 - rows:
+            self.kernel(lm_head, hidden_out, hidden_bias, folded_weight, folded_bias,
+                        first_row, rows).launch(grid=((rows + 3) // 4, 1, 1),
+                                               block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, lm_head: cute.Pointer, hidden_out: cute.Pointer,
+               hidden_bias: cute.Pointer, folded_weight: cute.Pointer,
+               folded_bias: cute.Pointer, first_row: Int32, rows: Int32):
+        tile, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        allocator = cutlass.utils.SmemAllocator()
+        head = allocator.allocate_tensor(BFloat16, cute.make_layout((4, 64)), byte_alignment=16)
+        sums = cute.make_rmem_tensor(cute.make_layout(4), Float64)
+        for r in cutlass.range_constexpr(4):
+            sums[r] = Float64(0)
+        bias_sum = Float64(0)
+        # A 4x64 head tile is shared across all rank columns. FP64 products
+        # of BF16 inputs are exact; the only output narrowing is after K.
+        for k_tile in range(72):
+            local_r = Int32(thread) // 64
+            k = Int32(k_tile) * 64 + Int32(thread) % 64
+            relative = Int32(tile) * 4 + local_r
+            value = BFloat16(0)
+            if relative < rows:
+                value = lm_head[(Int64(first_row) + Int64(relative)) * 4608 + Int64(k)]
+            head[local_r, Int32(thread) % 64] = value
+            cute.arch.sync_threads()
+            for inner in cutlass.range_constexpr(64):
+                k_index = Int64(k_tile) * 64 + Int64(inner)
+                weight = Float64(hidden_out[k_index * 256 + Int64(thread)])
+                for r in cutlass.range_constexpr(4):
+                    sums[r] += Float64(head[r, inner]) * weight
+                if thread < 4:
+                    bias_sum += Float64(head[Int32(thread), inner]) * Float64(hidden_bias[k_index])
+            cute.arch.sync_threads()
+        for r in cutlass.range_constexpr(4):
+            relative = Int32(tile) * 4 + r
+            if relative < rows:
+                absolute = Int64(first_row) + Int64(relative)
+                folded_weight[absolute * 256 + Int64(thread)] = BFloat16(_narrow_double(sums[r]))
+        if thread < 4:
+            relative = Int32(tile) * 4 + Int32(thread)
+            if relative < rows:
+                folded_bias[Int64(first_row) + Int64(relative)] = BFloat16(_narrow_double(bias_sum))
+
+
+class _LogitFinish:
+    @cute.jit
+    def __call__(self, base: cute.Pointer, correction: cute.Pointer,
+                 output: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        if rows > 0 and rows <= 448:
+            self.kernel(base, correction, output, rows).launch(
+                grid=((rows * 200058 + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, base: cute.Pointer, correction: cute.Pointer,
+               output: cute.Pointer, rows: Int32):
+        tile, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        index = Int64(tile) * 256 + Int64(thread)
+        if index < Int64(rows) * 200058:
+            source = (index // 200058) * 201024 + index % 200058
+            value = _round_bf16(Float32(base[source]) + Float32(correction[source]))
+            output[index] = BFloat16(Float32(30) * cute.math.tanh(
+                div_rn_f32(value, Float32(30)), fastmath=False))
+
+
+def compile_inkling_head_fold_aot():
+    """FP64 startup fold, absolute output rows; zero device scratch, 512B/CTA SMEM."""
+    return compile_program(_HeadFold(), name="inkling_head_fold", operands=(
+        Operand("lm_head", torch.bfloat16, "[201024,4608]"),
+        Operand("hidden_out", torch.bfloat16, "[4608,256]"),
+        Operand("hidden_bias", torch.bfloat16, "[4608]"),
+        Operand("folded_weight", torch.bfloat16, "[201024,256]", "out"),
+        Operand("folded_bias", torch.bfloat16, "[201024]", "out"),
+    ), scalars=(Scalar("first_row"), Scalar("rows")), key=(201024, 4608, 256),
+        geometry={"vocab": 201024, "hidden": 4608, "rank": 256}, doc=__doc__)
+
+
+def compile_inkling_logit_finish_aot():
+    """BF16 sum before FP32 softcap30; output uses logical 200058 pitch."""
+    return compile_program(_LogitFinish(), name="inkling_logit_finish", operands=(
+        Operand("base", torch.bfloat16, "[rows,201024]"),
+        Operand("correction", torch.bfloat16, "[rows,201024]"),
+        Operand("output", torch.bfloat16, "[rows,200058]", "out", align=2),
+    ), scalars=(Scalar("rows"),), key=(201024, 200058, 30),
+        geometry={"vocab": 201024, "valid_vocab": 200058, "softcap": 30}, doc=__doc__)
