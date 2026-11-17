@@ -100,6 +100,31 @@ class MlaDraftGeometry(KimiMlaGeometry):
             raise ValueError("MLA block draft supports full context or window 4096")
 
 
+@dataclass(frozen=True)
+class CausalMlaDraftGeometry(MlaDraftGeometry):
+    """The h96, 1024-window MLA drafter; kernels and interleaved RoPE are shared.
+
+    Keep the noncausal geometry's fields and serialized identity unchanged:
+    existing lightseek exports must retain their original ABI and cache keys.
+    """
+
+    heads: int = 96
+    window_size: int | None = 1024
+
+    @property
+    def is_causal(self):
+        return True
+
+    def __post_init__(self):
+        if self.kv_cache not in ("bf16", "fp8"):
+            raise ValueError("MLA draft KV cache must be bf16 or fp8")
+        if (self.hidden, self.heads, self.q_lora_rank, self.kv_lora_rank,
+            self.qk_nope_dim, self.qk_rope_dim, self.v_head_dim,
+            self.page_rows, self.norm_eps, self.window_size) != (
+                7168, 96, 1536, 512, 128, 64, 128, 64, 1e-5, 1024):
+            raise ValueError("unsupported causal MLA block-draft geometry")
+
+
 def _align(n):
     return (int(n) + 1023) // 1024 * 1024
 
@@ -362,7 +387,7 @@ class _Attention:
             query_tile=self.smem.query_tile, fp8=False,
             qk_dim=576, value_dim=512,
             window_size=g.window_size if isinstance(g, MlaDraftGeometry) else None,
-            noncausal_block=isinstance(g, MlaDraftGeometry),
+            noncausal_block=isinstance(g, MlaDraftGeometry) and not isinstance(g, CausalMlaDraftGeometry),
             ds_mla_record=g.kv_cache == "fp8", singleton_requests=singleton_requests)
         self.merge = DenseMlaMergeKernel(num_splits=self.splits, value_dim=512) if self.splits > 1 else None
 
@@ -476,7 +501,8 @@ def compile_mla_draft_attention_aot(g: MlaDraftGeometry, *, max_rows=64, max_con
                  Scalar("attention_scale", "float32")),
         key=(g, max_rows, max_context),
         scratch={"scratch": lambda rows: attention_layout(g, rows, max_context=max_context, mode="verify")["scratch_bytes"]},
-        geometry={**vars(g), **layout, "noncausal_block": True, "max_context": max_context})
+        geometry={**vars(g), **layout, "noncausal_block": not isinstance(g, CausalMlaDraftGeometry),
+                  "max_context": max_context})
 
 
 def compile_kimi_mla_producer_aot(g=KimiMlaGeometry(), *, max_rows=64):

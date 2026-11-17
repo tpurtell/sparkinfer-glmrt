@@ -37,6 +37,33 @@ def test_draft_geometry_is_explicit_and_target_unchanged():
 
 
 @pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+def test_causal_draft_geometry_and_abi(monkeypatch, kv_cache):
+    for args in ({"heads": 64}, {"window_size": 4096}, {"window_size": None}, {"norm_eps": 1e-6}):
+        with pytest.raises(ValueError):
+            mla.CausalMlaDraftGeometry(**args)
+    with pytest.raises(ValueError, match="cache must be"):
+        mla.CausalMlaDraftGeometry(kv_cache="int8")
+    monkeypatch.setattr(mla, "compile_program", lambda launch, **kwargs: (launch, kwargs))
+    g = mla.CausalMlaDraftGeometry(kv_cache=kv_cache)
+    assert (g.heads, g.window_size, g.is_causal) == (96, 1024, True)
+    for op in ("producer", "attention", "output"):
+        launch, spec = getattr(mla, f"compile_mla_draft_{op}_aot")(g)
+        assert spec["key"][0] == g
+        assert spec["geometry"]["heads"] == 96
+        if op == "attention":
+            assert spec["geometry"]["noncausal_block"] is False
+            assert launch.forward.noncausal_block is False
+            assert launch.forward.window_size == 1024
+        if op == "producer":
+            assert spec["geometry"]["rotary_style"] == "interleaved"
+        operands = {v.name: v.shape for v in spec["operands"]}
+        if op != "output":
+            assert operands["query"] == "[rows,96,576]"
+        else:
+            assert operands["attn"] == "[rows,96,512]"
+
+
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
 def test_draft_abi_and_capacity_not_live_counts(monkeypatch, kv_cache):
     monkeypatch.setattr(mla, "compile_program", lambda launch, **kwargs: (launch, kwargs))
     g = geometry(kv_cache=kv_cache)
@@ -66,14 +93,14 @@ def test_draft_abi_and_capacity_not_live_counts(monkeypatch, kv_cache):
             compile_fn(mla.KimiMlaGeometry())
 
 
-@pytest.mark.parametrize("window", [None, 4096])
+@pytest.mark.parametrize("window,heads,causal", [(None, 64, False), (4096, 64, False), (1024, 96, True)])
 @pytest.mark.parametrize("high_pages", [False, True])
 @pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
 @pytest.mark.parametrize("query_amplitude", [0.1, 8.0])
-def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_pages, kv_cache, query_amplitude):
+def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, heads, causal, high_pages, kv_cache, query_amplitude):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    g = geometry(window_size=window, kv_cache=kv_cache)
+    g = (mla.CausalMlaDraftGeometry if causal else geometry)(window_size=window, kv_cache=kv_cache)
     p = mla.compile_mla_draft_attention_aot(g, max_rows=16, max_context=4352)
     counts, lengths = [8, 3], [4101, 65]
     width = 68
@@ -87,7 +114,7 @@ def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_page
         cache = packed.reshape(2 * width, 64, 656)
     else:
         oracle_cache = cache
-    q = (torch.randn(11, 64, 576, generator=generator, device="cuda") * query_amplitude).bfloat16()
+    q = (torch.randn(11, heads, 576, generator=generator, device="cuda") * query_amplitude).bfloat16()
     if high_pages:
         # Tail pages beyond the signed-32-bit byte-offset boundary. Allocate
         # uninitialized prefix storage, never initialize the whole large pool.
@@ -100,8 +127,8 @@ def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_page
     table = (torch.arange(2 * width - 1, -1, -1, dtype=torch.int32, device="cuda") + first_page).reshape(width, 2).T.contiguous()
     lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     cu = torch.tensor([0, 8, 11], dtype=torch.int32, device="cuda")
-    out = torch.empty(11, 64, 512, dtype=torch.bfloat16, device="cuda")
-    lse = torch.empty(11, 64, device="cuda")
+    out = torch.empty(11, heads, 512, dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty(11, heads, device="cuda")
     scratch = torch.empty(p.scratch_bytes(16)["scratch"], dtype=torch.uint8, device="cuda")
 
     def run():
@@ -113,6 +140,10 @@ def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_page
     for index, (count, length, begin) in enumerate(zip(counts, lengths, [0, 8])):
         records = oracle_cache[(table[index] - first_page).long()].flatten(0, 1)[:length].float()
         scores = torch.einsum("thd,sd->hts", q[begin:begin + count].float(), records) * SCORE_SCALE
+        if causal:
+            positions = torch.arange(length, device="cuda")
+            high = length - count + torch.arange(count, device="cuda")
+            scores.masked_fill_(positions[None, None] > high[None, :, None], -torch.inf)
         if window:
             positions = torch.arange(length, device="cuda")
             low = length - count + torch.arange(count, device="cuda") - window + 1
@@ -131,11 +162,14 @@ def test_draft_attention_gpu_ragged_noncausal_window_and_graph(window, high_page
 
 
 @pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
-def test_draft_real_weights_gpu_hf_eager_absorption_and_output(kv_cache):
+@pytest.mark.parametrize("candidate", ["lightseek", "radixark"])
+def test_draft_real_weights_gpu_hf_eager_absorption_and_output(kv_cache, candidate):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     hf = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
     snapshot = hf / "hub/models--lightseekorg--kimi-k3-dflash2/snapshots/e77935fb4804e17eb55085bffd045eae1d779769"
+    if candidate == "radixark":
+        snapshot = hf / "hub/models--RadixArk--Kimi-K3.1-Dflash2-Preview/snapshots/ea257b38a8ee755b65287bb8ccd0938b519ce26b"
     if not (snapshot / "model.safetensors").is_file():
         pytest.skip("DFlash2 checkpoint not mounted")
     # Execute only the pinned, reviewed HF eager attention definition, not
@@ -158,13 +192,15 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output(kv_cache):
     mscale = lambda m: 1 + 0.1 * m * math.log(rope["factor"])
     factor = mscale(rope["mscale"]) / mscale(rope["mscale_all_dim"])
     scale = 192 ** -0.5 * mscale(rope["mscale_all_dim"]) ** 2
-    g = mla.MlaDraftGeometry(kv_cache=kv_cache)
+    heads = config["num_attention_heads"]
+    causal = config["is_causal"]
+    g = (mla.CausalMlaDraftGeometry if causal else mla.MlaDraftGeometry)(kv_cache=kv_cache)
     from safetensors import safe_open
     with safe_open(snapshot / "model.safetensors", framework="pt", device="cpu") as tensors:
         w = {name: tensors.get_tensor("layers.0.self_attn." + name).cuda() for name in (
             "q_a_proj.weight", "kv_a_proj_with_mqa.weight", "q_a_layernorm.weight",
             "kv_a_layernorm.weight", "q_b_proj.weight", "kv_b_proj.weight", "o_proj.weight")}
-    uk, uv = w["kv_b_proj.weight"].reshape(64, 256, 512).split(128, dim=1)
+    uk, uv = w["kv_b_proj.weight"].reshape(heads, 256, 512).split(128, dim=1)
     uk, uv = uk.transpose(1, 2).contiguous(), uv.contiguous()
     combined = torch.cat((w["q_a_proj.weight"], w["kv_a_proj_with_mqa.weight"])).contiguous()
     producer = mla.compile_mla_draft_producer_aot(g, max_rows=64)
@@ -177,10 +213,10 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output(kv_cache):
     cache = (torch.full((2, 64, 656), 173, device="cuda", dtype=torch.uint8)
              if kv_cache == "fp8" else
              torch.full((2, 64, 576), float("nan"), device="cuda", dtype=torch.bfloat16))
-    query = torch.empty(16, 64, 576, device="cuda", dtype=torch.bfloat16)
+    query = torch.empty(16, heads, 576, device="cuda", dtype=torch.bfloat16)
     residual = torch.empty(16, 1536, device="cuda", dtype=torch.bfloat16)
-    attn = torch.empty(16, 64, 512, device="cuda", dtype=torch.bfloat16)
-    lse = torch.empty(16, 64, device="cuda")
+    attn = torch.empty(16, heads, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(16, heads, device="cuda")
     out = torch.empty(16, 7168, device="cuda", dtype=torch.bfloat16)
     scratch = [torch.empty(p.scratch_bytes(16)["scratch"], device="cuda", dtype=torch.uint8) for p in (producer, attention, output)]
     lengths = torch.tensor([16], device="cuda", dtype=torch.int32)
@@ -197,7 +233,7 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output(kv_cache):
     run()
     norm = lambda value, weight: weight * (value.float() * torch.rsqrt(value.float().square().mean(-1, keepdim=True) + 1e-5)).bfloat16()
     qa = norm(torch.nn.functional.linear(x, w["q_a_proj.weight"]), w["q_a_layernorm.weight"])
-    q = torch.nn.functional.linear(qa, w["q_b_proj.weight"]).reshape(16, 64, 192)
+    q = torch.nn.functional.linear(qa, w["q_b_proj.weight"]).reshape(16, heads, 192)
     kv = torch.nn.functional.linear(x, w["kv_a_proj_with_mqa.weight"])
     latent = norm(kv[:, :512], w["kv_a_layernorm.weight"])
     phase = positions.float()[:, None] * inv[None]
@@ -211,11 +247,14 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output(kv_cache):
         return rotated
 
     q = torch.cat((q[..., :128], rotate(q[..., 128:])), -1)
-    keys = torch.nn.functional.linear(latent, w["kv_b_proj.weight"]).reshape(16, 64, 256)
-    k = torch.cat((keys[..., :128], rotate(kv[:, None, 512:]).expand(-1, 64, -1)), -1)
+    keys = torch.nn.functional.linear(latent, w["kv_b_proj.weight"]).reshape(16, heads, 256)
+    k = torch.cat((keys[..., :128], rotate(kv[:, None, 512:]).expand(-1, heads, -1)), -1)
+    mask = None
+    if causal:
+        mask = torch.full((16, 16), -torch.inf, device="cuda").triu(1)[None, None]
     expected, _ = ns["eager_attention_forward"](types.SimpleNamespace(num_key_value_groups=1, training=False),
-        q.transpose(0, 1)[None], k.transpose(0, 1)[None], keys[..., 128:].transpose(0, 1)[None], None, scale)
-    expected = torch.nn.functional.linear(expected.reshape(16, 8192), w["o_proj.weight"])
+        q.transpose(0, 1)[None], k.transpose(0, 1)[None], keys[..., 128:].transpose(0, 1)[None], mask, scale)
+    expected = torch.nn.functional.linear(expected.reshape(16, heads * 128), w["o_proj.weight"])
     relative = (out.float() - expected.float()).norm() / expected.float().norm()
     cosine = torch.nn.functional.cosine_similarity(out.float().flatten(), expected.float().flatten(), dim=0)
     if kv_cache == "bf16":
