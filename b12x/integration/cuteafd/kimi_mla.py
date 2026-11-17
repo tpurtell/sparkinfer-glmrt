@@ -349,6 +349,59 @@ class _DraftOutput:
         self.o(values, w_o, out, rows, stream)
 
 
+class _DraftProducerFp8:
+    """Single-copy FP8 matrices; cache records and rank norms stay independent."""
+
+    def __init__(self, g):
+        from ._fp8_weights import Fp8Projection
+        from ._glm_kernels import BatchedFp8Gemm
+
+        self.g = g
+        self.qkv = Fp8Projection(g.qkv_a_width, g.hidden, row_scales=True)
+        self.norm = _RankNormPack(g)
+        self.q_b = Fp8Projection(g.heads * 192, g.q_lora_rank, row_scales=True)
+        self.uk = BatchedFp8Gemm(n=512, k=128, batch=g.heads, a_row=g.heads * 192,
+                                a_batch=192, o_row=g.heads * 576, o_batch=576)
+        self.tail = _QueryTail(g.heads)
+        self.rotary = _DraftRotary(g)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, kv_slots: cute.Pointer, positions: cute.Pointer,
+                 inv_freq: cute.Pointer, w_qkv_a: cute.Pointer, s_qkv_a: cute.Pointer,
+                 q_a_norm: cute.Pointer, kv_a_norm: cute.Pointer, w_q_b: cute.Pointer,
+                 s_q_b: cute.Pointer, w_uk: cute.Pointer, s_uk: cute.Pointer,
+                 kv_cache: cute.Pointer, query: cute.Pointer, q_resid: cute.Pointer,
+                 scratch: cute.Pointer, rotary_factor: Float32, rows: Int32, stream: cuda.CUstream):
+        qkv = cute.recast_ptr(scratch, dtype=BFloat16)
+        q = cute.make_ptr(BFloat16, Int64(scratch.toint()) + _offset(Int64(rows) * Int64(self.g.qkv_a_width * 2)),
+                          cute.AddressSpace.gmem, assumed_align=16)
+        self.qkv(x, w_qkv_a, s_qkv_a, qkv, rows, Int32(64), Int64(0), stream)
+        self.norm(qkv, q_a_norm, kv_a_norm, kv_slots, q_resid, kv_cache, rows, stream)
+        self.q_b(q_resid, w_q_b, s_q_b, q, rows, Int32(64), Int64(0), stream)
+        self.uk(q, w_uk, s_uk, query, rows, stream)
+        self.tail(q, query, rows, stream)
+        self.rotary(query, kv_cache, kv_slots, positions, inv_freq, rotary_factor, rows, stream)
+
+
+class _DraftOutputFp8:
+    def __init__(self, g):
+        from ._fp8_weights import Fp8Projection
+        from ._glm_kernels import BatchedFp8Gemm
+
+        self.g = g
+        self.uv = BatchedFp8Gemm(n=128, k=512, batch=g.heads, a_row=g.heads * 512,
+                                a_batch=512, o_row=g.heads * 128, o_batch=128)
+        self.o = Fp8Projection(g.hidden, g.heads * 128, row_scales=True)
+
+    @cute.jit
+    def __call__(self, attn: cute.Pointer, w_uv: cute.Pointer, s_uv: cute.Pointer,
+                 w_o: cute.Pointer, s_o: cute.Pointer, out: cute.Pointer,
+                 scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        values = cute.recast_ptr(scratch, dtype=BFloat16)
+        self.uv(attn, w_uv, s_uv, values, rows, stream)
+        self.o(values, w_o, s_o, out, rows, Int32(64), Int64(0), stream)
+
+
 class _Output:
     def __init__(self, g, wide_capacity: int = 0):
         self.g = g
@@ -479,6 +532,54 @@ def compile_mla_draft_output_aot(g: MlaDraftGeometry, *, max_rows=64):
         scalars=(Scalar("rows"),), key=(g, max_rows),
         scratch={"scratch": lambda rows: _align(rows * g.heads * 128 * 2)},
         geometry={**vars(g), "output_gate": False})
+
+
+def compile_mla_draft_producer_fp8_weights_aot(g: MlaDraftGeometry, *, max_rows=64):
+    """FP8 projection weights with row/K128 scales, batched UK row/K64 scales."""
+    if not isinstance(g, MlaDraftGeometry):
+        raise TypeError("MLA draft requires MlaDraftGeometry")
+    operands = (
+        Operand("x", torch.bfloat16, f"[rows,{g.hidden}]"),
+        Operand("kv_slots", torch.int64, "[rows]", align=8),
+        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("inv_freq", torch.float32, "[32]", align=4),
+        Operand("w_qkv_a", torch.uint8, f"[{g.qkv_a_width},{g.hidden}]"),
+        Operand("s_qkv_a", torch.float32, f"[{g.qkv_a_width},{g.hidden // 128}]"),
+        Operand("q_a_norm", torch.bfloat16, "[1536]"),
+        Operand("kv_a_norm", torch.bfloat16, "[512]"),
+        Operand("w_q_b", torch.uint8, f"[{g.heads * 192},1536]"),
+        Operand("s_q_b", torch.float32, f"[{g.heads * 192},12]"),
+        Operand("w_uk", torch.uint8, f"[{g.heads},512,128]"),
+        Operand("s_uk", torch.float32, f"[{g.heads},512,2]"),
+        Operand("kv_cache", torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+                "[pages,64,656]" if g.kv_cache == "fp8" else "[pages,64,576]", "inout"),
+        Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
+        Operand("q_resid", torch.bfloat16, "[rows,1536]", "out"),
+        Operand("scratch", torch.uint8, "[producer_scratch_bytes]", "scratch"))
+    return compile_program(_DraftProducerFp8(g), name="mla_draft_producer_fp8_weights", operands=operands,
+        scalars=(Scalar("rotary_factor", "float32"), Scalar("rows")), key=(g, max_rows, "fp8_weights"),
+        scratch={"scratch": lambda rows: producer_scratch_bytes(g, rows)},
+        geometry={**vars(g), "rotary_style": "interleaved", "rotary_dim": 64,
+                  "weight_dtype": "fp8", "projection_scale_k": 128, "batched_scale_k": 64})
+
+
+def compile_mla_draft_output_fp8_weights_aot(g: MlaDraftGeometry, *, max_rows=64):
+    """FP8 UV/o projections; caller owns all values, scales and BF16 scratch."""
+    if not isinstance(g, MlaDraftGeometry):
+        raise TypeError("MLA draft requires MlaDraftGeometry")
+    operands = (
+        Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]"),
+        Operand("w_uv", torch.uint8, f"[{g.heads},128,512]"),
+        Operand("s_uv", torch.float32, f"[{g.heads},128,8]"),
+        Operand("w_o", torch.uint8, f"[{g.hidden},{g.heads * 128}]"),
+        Operand("s_o", torch.float32, f"[{g.hidden},{g.heads}]"),
+        Operand("out", torch.bfloat16, f"[rows,{g.hidden}]", "out"),
+        Operand("scratch", torch.uint8, "[output_scratch_bytes]", "scratch"))
+    return compile_program(_DraftOutputFp8(g), name="mla_draft_output_fp8_weights", operands=operands,
+        scalars=(Scalar("rows"),), key=(g, max_rows, "fp8_weights"),
+        scratch={"scratch": lambda rows: _align(rows * g.heads * 128 * 2)},
+        geometry={**vars(g), "output_gate": False, "weight_dtype": "fp8",
+                  "projection_scale_k": 128, "batched_scale_k": 64})
 
 
 def compile_mla_draft_attention_aot(g: MlaDraftGeometry, *, max_rows=64, max_context=1048576):
