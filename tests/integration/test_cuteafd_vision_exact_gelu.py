@@ -29,6 +29,21 @@ def test_exact_vision_gelu_all_finite_bf16(width):
     assert not bool(mismatch.any())
 
 
+def test_exact_gelu_pins_libdevice_graph_not_build_toolkit():
+    import ast
+    import inspect
+    from b12x.integration.cuteafd import vision_exact_gelu
+    text = inspect.getsource(vision_exact_gelu)
+    tree = ast.parse(text)
+    calls = [ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    assert "cute.math.erf" not in calls
+    assert "91334d6e12748f6cb5bbf0a1cd965a56bcd93dc4f496d2e5c5f8c6e523094356" in text
+    assert "1.002959966659546" in text
+    assert "ex2.approx.ftz.f32" in text
+    assert "0.00011219871521461755" in text
+    assert "0.12837915122509003" in text
+
+
 def test_invalid_exact_vision_gelu_width():
     from b12x.integration.cuteafd.vision_exact_gelu import compile_exact_vision_gelu_aot
     with pytest.raises(ValueError):

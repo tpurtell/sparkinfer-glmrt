@@ -1,4 +1,11 @@
-"""ATen erf-GELU operation order, separate from legacy media GELU."""
+"""ATen cu130 erf-GELU, independent of the build image's libdevice.
+
+Provenance: nvidia-nvvm==13.0.88, nvvm/libdevice/libdevice.10.bc SHA256
+91334d6e12748f6cb5bbf0a1cd965a56bcd93dc4f496d2e5c5f8c6e523094356.
+The __nv_erff polynomial/threshold and RN-FMA/ex2 graph match the real ATen
+Torch2.14.1+cu130 BF16 GELU SASS. CUDA13.2 changes these coefficients, so keep
+this explicit graph separate from legacy media GELU and never call math.erf.
+"""
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 import torch
