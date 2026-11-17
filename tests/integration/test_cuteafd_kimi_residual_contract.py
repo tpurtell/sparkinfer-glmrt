@@ -78,3 +78,21 @@ def test_no_live_count_compile_keys(capture):
         assert "rows" not in params and "arena_rows" not in params
     with pytest.raises(ValueError):
         module.compile_kimi_situ_aot(4096)
+
+
+@pytest.mark.parametrize("candidates", range(2, 10))
+def test_stream_capture_is_read_only_and_pre_norm(capture, candidates):
+    kernel, info = module.compile_kimi_attn_res_stream_aot(candidates=candidates)
+    assert kernel.capture_stream and not kernel.append
+    assert info["operands"][0].role == "in"
+    assert info["key"] == (7168, candidates)
+    assert info["geometry"]["capture_stream"] is True
+    assert info["geometry"]["prefix_mode"] == "add"
+    assert [(x.name, x.ctype) for x in info["scalars"]] == [
+        ("rows", "int32"), ("arena_rows", "int32"), ("eps", "float32")]
+
+
+def test_stream_capture_rejects_mutating_modes(capture):
+    for mode, append, mix in [("keep", False, True), ("add", True, True), ("add", False, False)]:
+        with pytest.raises(ValueError):
+            module.KimiAttnResRmsNorm(7168, 2, mode, append, mix, capture_stream=True)

@@ -73,7 +73,7 @@ class KimiRmsNorm:
 class KimiAttnResRmsNorm:
     threads = 512
 
-    def __init__(self, hidden, candidates, prefix_mode, append, has_mix):
+    def __init__(self, hidden, candidates, prefix_mode, append, has_mix, capture_stream=False):
         if hidden != 7168 or not 1 <= candidates <= 9:
             raise ValueError("Kimi residual requires H7168 and 1..9 candidates")
         if prefix_mode not in ("keep", "add", "replace"):
@@ -82,6 +82,9 @@ class KimiAttnResRmsNorm:
             raise ValueError("all eight immutable block slots are already occupied")
         if not has_mix and candidates != 1:
             raise ValueError("no-mix is only valid for the initial single prefix")
+        if capture_stream and (prefix_mode != "add" or append or not has_mix):
+            raise ValueError("stream capture requires add, mix and no append")
+        self.capture_stream = capture_stream
         self.hidden, self.candidates = hidden, candidates
         self.prefix_mode, self.append, self.has_mix = prefix_mode, append, has_mix
         self.elements = hidden // self.threads
@@ -134,7 +137,7 @@ class KimiAttnResRmsNorm:
                         value = Float32(arena[Int64(8) * stride + at])
                         if cutlass.const_expr(self.prefix_mode == "add"):
                             value = _bf16(value + Float32(delta[at]))
-                    if cutlass.const_expr(self.prefix_mode != "keep"):
+                    if cutlass.const_expr(self.prefix_mode != "keep" and not self.capture_stream):
                         arena[Int64(8) * stride + at] = value.to(BFloat16)
                 else:
                     value = Float32(arena[Int64(c) * stride + at])
@@ -184,8 +187,12 @@ class KimiAttnResRmsNorm:
             if cutlass.const_expr(self.append):
                 at = base + tid + Int64(j * self.threads)
                 arena[Int64(self.candidates - 1) * stride + at] = current[j].to(BFloat16)
-        _normalize_bf16(mixed, norm_weight, out, base, tid, sums,
-                        Int32(2 * self.candidates), eps, self.hidden, self.threads)
+        if cutlass.const_expr(self.capture_stream):
+            for j in cutlass.range_constexpr(self.elements):
+                out[base + tid + Int64(j * self.threads)] = mixed[j].to(BFloat16)
+        else:
+            _normalize_bf16(mixed, norm_weight, out, base, tid, sums,
+                            Int32(2 * self.candidates), eps, self.hidden, self.threads)
 
 
 class KimiSitu:
@@ -232,6 +239,26 @@ def compile_kimi_attn_res_rmsnorm_aot(hidden=7168, candidates=2, prefix_mode="ke
         geometry=dict(hidden=hidden, candidates=candidates, prefix_mode=prefix_mode,
                       append=append, has_mix=has_mix),
         doc="Fixed-stride BF16 prefix update, optional unmixed append, residual mix and RMSNorm.")
+
+
+def compile_kimi_attn_res_stream_aot(hidden=7168, candidates=2):
+    """Read-only post-FFN bank snapshot for DSpark/DFlash, before input norm.
+
+    The arena prefix has not yet folded the FFN delta. Match the following
+    attention/output consumer's BF16 add and mix without advancing its bank.
+    norm_weight retains the residual ABI but is not read by this specialization.
+    """
+    kernel = KimiAttnResRmsNorm(hidden, candidates, "add", False, True, capture_stream=True)
+    return compile_program(kernel, name="kimi_attn_res_stream", operands=(
+        Operand("arena", torch.bfloat16, f"[9,arena_rows,{hidden}]"),
+        Operand("delta", torch.bfloat16, f"[rows,{hidden}]"),
+        Operand("score_weight", torch.float32, f"[{hidden}]"),
+        Operand("norm_weight", torch.bfloat16, f"[{hidden}]"),
+        Operand("out", torch.bfloat16, f"[rows,{hidden}]", "out")),
+        scalars=(Scalar("rows"), Scalar("arena_rows"), Scalar("eps", "float32")),
+        key=(hidden, candidates), geometry=dict(hidden=hidden, candidates=candidates,
+            prefix_mode="add", append=False, has_mix=True, capture_stream=True),
+        doc="Read-only BF16 bank aggregate before the next consumer's RMSNorm.")
 
 
 def compile_kimi_rmsnorm_aot(hidden=3584):
