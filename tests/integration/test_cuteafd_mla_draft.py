@@ -23,6 +23,25 @@ def geometry(**kwargs):
     return mla.MlaDraftGeometry(**kwargs)
 
 
+@pytest.mark.parametrize("cls", [mla.MlaDraftGeometry, mla.CausalMlaDraftGeometry])
+@pytest.mark.parametrize("cache", ["bf16", "fp8"])
+def test_fp8_weight_abi_and_coverage(monkeypatch, cls, cache):
+    monkeypatch.setattr(mla, "compile_program", lambda launch, **kwargs: (launch, kwargs))
+    g = cls(kv_cache=cache)
+    for op in ("producer", "output"):
+        _, spec = getattr(mla, f"compile_mla_draft_{op}_fp8_weights_aot")(g)
+        tensors = {o.name: o for o in spec["operands"]}
+        weights = [o for name, o in tensors.items() if name.startswith("w_")]
+        scales = [o for name, o in tensors.items() if name.startswith("s_")]
+        assert len(weights) == len(scales) == (3 if op == "producer" else 2)
+        assert all(o.dtype == torch.uint8 for o in weights)
+        assert all(o.dtype == torch.float32 for o in scales)
+        assert spec["geometry"]["weight_dtype"] == "fp8"
+        assert spec["geometry"]["projection_scale_k"] == 128
+        assert spec["geometry"]["batched_scale_k"] == 64
+        assert "fp8_weights" in spec["key"]
+
+
 def test_draft_geometry_is_explicit_and_target_unchanged():
     target = mla.KimiMlaGeometry()
     assert (target.heads, target.norm_eps, target.softmax_scale) == (96, 1e-6, 192 ** -0.5)
@@ -294,6 +313,71 @@ def test_draft_real_weights_gpu_hf_eager_absorption_and_output(kv_cache, candida
     run()
     for actual, expected in zip((cache, query, residual, out, lse), continued):
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("cls", [mla.MlaDraftGeometry, mla.CausalMlaDraftGeometry])
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+def test_fp8_weights_gpu_shared_producer_output_and_graph(cls, kv_cache):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    g = cls(kv_cache=kv_cache)
+    generator = torch.Generator(device="cuda").manual_seed(328)
+
+    def weight(shape, block):
+        # Small, exactly representable weights isolate wrapper layout and scale math.
+        raw = torch.randint(-4, 5, shape, generator=generator, device="cuda").to(torch.float8_e4m3fn)
+        scale = torch.full((*shape[:-1], shape[-1] // block), 2 ** -10, device="cuda")
+        widened = (raw.float().unflatten(-1, (-1, block)) * scale[..., None]).flatten(-2).bfloat16()
+        return raw, scale, widened
+
+    qkv, sqkv, bqkv = weight((g.qkv_a_width, g.hidden), 128)
+    qb, sqb, bqb = weight((g.heads * 192, 1536), 128)
+    uk, suk, buk = weight((g.heads, 512, 128), 64)
+    uv, suv, buv = weight((g.heads, 128, 512), 64)
+    wo, swo, bwo = weight((g.hidden, g.heads * 128), 128)
+    producer = mla.compile_mla_draft_producer_fp8_weights_aot(g)
+    output = mla.compile_mla_draft_output_fp8_weights_aot(g)
+    reference_producer = mla.compile_mla_draft_producer_aot(g)
+    reference_output = mla.compile_mla_draft_output_aot(g)
+    scratch = torch.empty(max(producer.scratch_bytes(64)["scratch"], output.scratch_bytes(64)["scratch"]),
+                          dtype=torch.uint8, device="cuda")
+    for rows in (5, 17):
+        x = torch.randn(rows, g.hidden, generator=generator, device="cuda").bfloat16()
+        attn = torch.randn(rows, g.heads, 512, generator=generator, device="cuda").bfloat16()
+        norm_q, norm_kv = torch.ones(1536, device="cuda", dtype=torch.bfloat16), torch.ones(512, device="cuda", dtype=torch.bfloat16)
+        slots = torch.arange(rows, device="cuda", dtype=torch.int64)
+        positions = slots + 32764
+        inv = 1 / (50000 ** (torch.arange(32, device="cuda").float() / 32))
+        cache = torch.zeros((1, 64, 656 if kv_cache == "fp8" else 576), device="cuda",
+                            dtype=torch.uint8 if kv_cache == "fp8" else torch.bfloat16)
+        reference_cache = torch.empty_like(cache)
+        query = torch.empty(rows, g.heads, 576, device="cuda", dtype=torch.bfloat16)
+        reference_query = torch.empty_like(query)
+        residual = torch.empty(rows, 1536, device="cuda", dtype=torch.bfloat16)
+        reference_residual = torch.empty_like(residual)
+        out = torch.empty(rows, g.hidden, device="cuda", dtype=torch.bfloat16)
+        reference_out = torch.empty_like(out)
+
+        def run():
+            producer.launch(x, slots, positions, inv, qkv, sqkv, norm_q, norm_kv, qb, sqb, uk, suk,
+                            cache, query, residual, scratch, scalars=(1.0, rows))
+            output.launch(attn, uv, suv, wo, swo, out, scratch, scalars=(rows,))
+
+        run()
+        reference_producer.launch(x, slots, positions, inv, bqkv, norm_q, norm_kv, bqb, buk,
+                                 reference_cache, reference_query, reference_residual, scratch, scalars=(1.0, rows))
+        reference_output.launch(attn, buv, bwo, reference_out, scratch, scalars=(rows,))
+        for actual, expected in ((query, reference_query), (residual, reference_residual), (out, reference_out)):
+            relative = (actual.float() - expected.float()).norm() / expected.float().norm()
+            assert relative < 0.02, (cls.__name__, kv_cache, rows, float(relative))
+            assert torch.isfinite(actual).all() and actual.abs().sum() > 0
+        saved = [t.clone() for t in (cache, query, residual, out)]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+        for actual, expected in zip((cache, query, residual, out), saved):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 @pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
