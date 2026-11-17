@@ -18,28 +18,31 @@ def _ex2_ftz(value: Float32, *, loc=None, ip=None):
 
 @cute.jit
 def _libdevice_erff(value):
-    # CUDA13.2 libdevice __nv_erff polynomial and branch, explicit RN FMAs.
-    # This avoids MLIR math.erf selecting a different libdevice approximation.
+    # CUDA13.0.88 libdevice __nv_erff, matching the ATen cu130 wheel's SASS.
+    # CUDA13.2 changed coefficients and threshold; don't inherit host tooling.
     absolute = cute.math.abs(value)
     argument = _mul(value, value)
-    c0, c1 = Float32(6.749860040144995e-05), Float32(-0.0007647646707482636)
-    c2, c3 = Float32(0.005143017042428255), Float32(-0.026827244088053703)
-    c4, c5, c6 = Float32(0.11282869428396225), Float32(-0.3761255741119385), Float32(0.12837916612625122)
-    large = absolute >= Float32(1.003758430480957)
+    c0, c1 = Float32(8.483494457323104e-05), Float32(-0.0008213091641664505)
+    c2, c3 = Float32(0.005213488824665546), Float32(-0.026868773624300957)
+    c4, c5, c6 = Float32(0.11284004896879196), Float32(-0.37612664699554443), Float32(0.12837915122509003)
+    large = absolute >= Float32(1.002959966659546)
     if large:
         argument = absolute
-        c0, c1 = Float32(6.7848181060981e-05), Float32(-0.0009299388038925827)
-        c2, c3 = Float32(0.006954224780201912), Float32(-0.03752800449728966)
-        c4, c5, c6 = Float32(0.1566874235868454), Float32(0.9144431948661804), Float32(0.6287218928337097)
+        c0, c1 = Float32(0.00011219871521461755), Float32(-0.0013275252422317863)
+        c2, c3 = Float32(0.00839653518050909), Float32(-0.04024658352136612)
+        c4, c5, c6 = Float32(0.15950430929660797), Float32(0.9129176735877991), Float32(0.6290600299835205)
     polynomial = _fma(c0, argument, c1)
     polynomial = _fma(polynomial, argument, c2)
     polynomial = _fma(polynomial, argument, c3)
     polynomial = _fma(polynomial, argument, c4)
     polynomial = _fma(polynomial, argument, c5)
     polynomial = _fma(polynomial, argument, c6)
-    result = _fma(polynomial, value, value)
+    factor = value
     if large:
-        result = _sub(Float32(1.0), _ex2_ftz(-cute.math.abs(result)))
+        factor = -absolute
+    result = _fma(polynomial, factor, factor)
+    if large:
+        result = _sub(Float32(1.0), _ex2_ftz(result))
         result = cute.math.copysign(result, value)
     return result
 
