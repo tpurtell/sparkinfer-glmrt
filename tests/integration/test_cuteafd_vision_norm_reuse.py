@@ -16,6 +16,9 @@ def test_existing_affine_norm_matches_tower_reference_exact(width,layernorm,epsi
     if width==7168:
         from b12x.integration.cuteafd.vision_rms import compile_vectorized_vision_rms_aot
         program=compile_vectorized_vision_rms_aot(width=width)
+    elif layernorm:
+        from b12x.integration.cuteafd.vision_layer_norm import compile_vectorized_vision_layer_norm_aot
+        program=compile_vectorized_vision_layer_norm_aot(width=width)
     else:
         program=compile_affine_norm_aot(width=width,eps=None,subtract_mean=layernorm,bias=layernorm,
             input_dtype=torch.bfloat16,parameter_dtype=torch.bfloat16)
@@ -26,6 +29,7 @@ def test_existing_affine_norm_matches_tower_reference_exact(width,layernorm,epsi
             out=torch.empty_like(x)
             with kernel_resolution_guard():
                 if width==7168:program.launch(x,gamma,out,scalars=[rows,epsilon])
+                elif layernorm:program.launch(x,gamma,bias,out,scalars=[rows,epsilon])
                 else:program.launch(x,gamma,bias,None,None,None,out,scalars=[rows,epsilon])
             diff=(out.view(torch.int16)!=expected.view(torch.int16)).sum().item()
             print(f"VISION_NORM width={width} layernorm={layernorm} eps={epsilon} rows={rows} magnitude={magnitude} mismatched={diff} max_abs={(out.float()-expected.float()).abs().max().item()}",flush=True)
