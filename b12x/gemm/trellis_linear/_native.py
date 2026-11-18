@@ -1099,7 +1099,10 @@ class NativeTrellisLinear:
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if cutlass.const_expr(self.compact_head):
             if rows <= Int32(16):
-                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 1)
+                if cutlass.const_expr(self.bits == 8):
+                    self._decode_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                else:
+                    self._decode_k6(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
             elif rows <= Int32(32):
                 self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 2)
             elif rows <= Int32(48):
@@ -5011,7 +5014,7 @@ class NativeTrellisLinear:
                           output: cute.Tensor, rows: Int32, rotation_id: Int32,
                           cta_limit: Int32, stream: cuda.CUstream, frags: cutlass.Constexpr):
         self.multiply_head_tile(inputs, payload, scales, output, rows, rotation_id, frags).launch(
-            grid=(min(Int32(self.n // (64 if frags >= 4 else 128)), cta_limit), 1, 1), block=(256, 1, 1),
+            grid=(min(Int32(self.n // (64 if frags >= 5 else 128)), cta_limit), 1, 1), block=(256, 1, 1),
             min_blocks_per_mp=1, stream=stream)
 
     @cute.jit
@@ -5036,9 +5039,9 @@ class NativeTrellisLinear:
         tid = Int32(tid)
         warp, lane = tid >> Int32(5), tid & Int32(31)
         x = inputs[rotation_id]
-        # Above 48 rows each warp reconstructs only its own four values (N8).
+        # Above 64 rows each warp reconstructs only its own four values (N8).
         # Half as many accumulator columns permit more CTAs to reside per SM.
-        n8 = 1 if frags >= 4 else 2
+        n8 = 1 if frags >= 5 else 2
         stage_bytes = frags * 4096
         buf = cutlass_utils.SmemAllocator().allocate(self._k6_opt_storage(2 * stage_bytes // 4))
         sa = shared_ptr_to_u32(buf.smem.data_ptr())
