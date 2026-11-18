@@ -404,7 +404,7 @@ def _native_route_policy():
                  t.id in ("DECODE_ROWS_BY_SHAPE", "_FOLDED_DECODE_ROWS", "_GEMINI_NARROW_ROWS"))
                 for t in node.targets):
             nodes.append(node)
-        elif isinstance(node, ast.FunctionDef) and node.name in ("decode_rows", "decode_route_thresholds"):
+        elif isinstance(node, ast.FunctionDef) and node.name in ("decode_rows", "decode_route_thresholds", "_k6_selective_routes"):
             nodes.append(node)
     namespace = {}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
@@ -430,7 +430,7 @@ def test_measured_decode_rows_are_scoped_to_qualified_format_and_storage_sides()
 @pytest.mark.parametrize("bits,n,k,groups,expected", [
     (6, 6144, 7168, 1, (8, 32, 48)),
     (6, 6144, 7168, 4, (16, 32, 48)),
-    (6, 3072, 7168, 1, (16, 32, 48)),
+    (6, 3072, 7168, 1, (8, 16, 32, 48)),
     (6, 163840, 7168, 1, (16, 32, 48)),
     (8, 6144, 7168, 1, (8, 32, 48)),
     (8, 6144, 7168, 4, (16, 32, 48)),
@@ -444,6 +444,26 @@ def test_native_route_metadata_describes_each_actual_program(bits, n, k, groups,
     assert policy["decode_route_thresholds"](g) == expected
     g["max_rows"] = 8
     assert policy["decode_route_thresholds"](g) == ()
+
+
+@pytest.mark.parametrize("book,k,n,side,expected", [
+    ("mcg", 7168, 3072, 1, ("fused_narrow", True)),
+    ("mul1", 7168, 3072, 1, ("", True)),
+    ("mcg", 3072, 7168, 2, ("folded_three", False)),
+    ("mcg", 7168, 3584, 1, ("fused_narrow", False)),
+    ("mul1", 7168, 3584, 1, ("", False)),
+    ("mcg", 7168, 1536, 1, ("fused_narrow", False)),
+    ("mcg", 7168, 640, 1, ("fused_narrow", False)),
+    ("mcg", 1536, 18432, 1, ("wide_one", False)),
+    ("mcg", 4608, 201088, 1, ("", False)),
+])
+def test_selective_k6_routes_are_scoped_to_measured_geometries(book, k, n, side, expected):
+    choose = _native_route_policy()["_k6_selective_routes"]
+    g = dict(bits=6, input_features=k, output_features=n, sharded_side=side,
+             codebook=book, input_dtype="bf16", groups=1)
+    assert choose(g) == expected
+    for overrides in (dict(bits=8), dict(groups=4), dict(input_dtype="f16"), dict(sharded_side=3-side)):
+        assert choose(dict(g, **overrides)) == ("", False)
 
 
 def test_native_threshold_variants_only_change_legal_dispatch(tmp_path):
