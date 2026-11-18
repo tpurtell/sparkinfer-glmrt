@@ -208,7 +208,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     if traits.pv_bf16 and traits.scale_format == ScaleFormat.UE8M0_BYTE:
         kv_smem_stride = 2 * (traits.d_nope + (d_rope if traits.packed_bf16_decode else 0))
     q_nope_stride = traits.q_nope_stride
-    bufs = 1 if traits.pv_bf16 else _KV_BUF_COUNT
+    bufs = 1 if traits.pv_bf16 and not traits.glm_record_ring else _KV_BUF_COUNT
 
     off = 0
 
@@ -240,7 +240,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # --- Q per-head scales: FP32 power-of-2 (converted to UE8M0 sfa at use). ---
     q_sc_off = off
     q_sc_stride = num_scales
-    q_sc_bytes = hpb * num_scales * 4
+    q_sc_bytes = 16 if traits.glm_record_ring else hpb * num_scales * 4
     off = q_sc_off + q_sc_bytes
 
     # 128B-align the start of the (large) KV region for clean vectorized stores.
@@ -296,13 +296,13 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # --- per-vc per-head output scale (fp32), N_V_CHUNKS rows of HPB. ---
     w_head_sc_off = off
     w_head_sc_stride = hpb
-    w_head_sc_bytes = n_v_chunks * hpb * 4
+    w_head_sc_bytes = 16 if traits.glm_record_ring else n_v_chunks * hpb * 4
     off = w_head_sc_off + w_head_sc_bytes
 
     # --- re-quantized-P staging for XV MMA: HPB x (BI + 16), double-buffered. ---
     w_fp8_off = off
     w_fp8_stride = bi + _W_FP8_PAD
-    w_fp8_buf_bytes = hpb * w_fp8_stride
+    w_fp8_buf_bytes = 16 if traits.glm_record_ring else hpb * w_fp8_stride
     # GLM_NEXT has no RoPE stage and sits well under the carveout, so it can
     # afford separate HIGH and LOW W buffers per V-group parity: the two-pass
     # PV then stages both passes behind one barrier per V group.

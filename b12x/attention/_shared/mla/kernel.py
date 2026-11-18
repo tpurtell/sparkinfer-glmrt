@@ -44,6 +44,7 @@ from .decode_math import (
     s1_qk_nope_block_scaled,
     s1_qk_nope_bf16_mg2,
     expand_v4_tile,
+    load_glm_q_prefix,
     snapshot_glm_pv,
     snapshot_glm_scales,
     apply_glm_pv,
@@ -1410,7 +1411,7 @@ class UnifiedDecodeKernel:
         if tid == Int32(0):
             for s in cutlass.range_constexpr(n_buf):
                 cute.arch.mbarrier_init(mbar_base + s, Int32(full_arrivals))
-                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))  # empty[s]
+                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(8 if t.glm_record_ring else 1))  # empty[s]
         cute.arch.barrier()  # Full-CTA structural fence.
 
         # ── Length-independent prologue work. The Q staging and the first
@@ -1445,6 +1446,7 @@ class UnifiedDecodeKernel:
                     d_nope=(512 if t.packed_bf16_decode else t.d_nope),
                     d_rope=(0 if t.packed_bf16_decode else t.d_rope), hpb=t.hpb, valid_hpb=self.valid_hpb, q_stride=t.q_nope_stride,
                     rope_stride=L.q_rope_stride, threads=self.math_threads,
+                    skip=(192 if t.glm_record_ring and t.d_rope else 0),
                 )
         elif cutlass.const_expr(self.vector_q_bf16):
             if not is_io:
@@ -1871,6 +1873,10 @@ class UnifiedDecodeKernel:
                     packed_q_scale_words=self.native_h16 or self.native_dsv41_fp8,
                 )
 
+            q_prefix = None
+            if cutlass.const_expr(t.glm_record_ring and t.d_rope):
+                q_prefix = load_glm_q_prefix(q_token, head_base, lane)
+
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
             rope_acc_elems = 8 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 4
             accr_frag = cute.make_rmem_tensor(rope_acc_elems, Float32)
@@ -2175,7 +2181,7 @@ class UnifiedDecodeKernel:
                             num_scales=t.num_scales, quant_tile=t.quant_tile,
                             q_nope_bf16_stride=t.q_nope_stride,
                             kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
-                            n_hg=1, inline_fp32_scale_offset=(
+                            n_hg=1, reg_prefix=q_prefix, inline_fp32_scale_offset=(
                                 t.d_nope if t.scale_format == ScaleFormat.ARBITRARY_FP32 else 0),
                         )
                     elif cutlass.const_expr(self.dsv41_bf16_tile):
@@ -2265,7 +2271,7 @@ class UnifiedDecodeKernel:
                         if tid == Int32(0):
                             cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
 
-                    elif cutlass.const_expr(self.glm_bf16):
+                    elif cutlass.const_expr(self.glm_bf16 and not t.glm_record_ring):
                         v_codes = snapshot_glm_pv(kv_fp8_b, warp_id, lane, stride=staged_kv_stride)
                         v_scales = snapshot_glm_scales(kv_fp8_b, warp_id, lane, stride=staged_kv_stride)
                         cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
@@ -2292,7 +2298,7 @@ class UnifiedDecodeKernel:
                         valid_hpb=self.valid_hpb,
                         num_threads=self.math_threads,
                         barrier_id=3,
-                        n_acc_tiles=n_acc_tiles,
+                        n_acc_tiles=n_acc_tiles, vector_fold=t.glm_record_ring,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -2314,6 +2320,16 @@ class UnifiedDecodeKernel:
                                 acc_nope, acc_rope, v_fragments, sm_p_full_addr, lane,
                                 sm_p_stride=L.sm_p_full_stride,
                             )
+                        elif cutlass.const_expr(t.glm_record_ring):
+                            # The other record buffer is already being filled. Read
+                            # V as each MMA needs it instead of carrying it over S4.
+                            v_scales = snapshot_glm_scales(kv_fp8_b, warp_id, lane, stride=staged_kv_stride)
+                            acc_nope = apply_glm_pv(
+                                acc_nope, None, v_scales, sm_p_full_addr, lane, pstride=L.sm_p_full_stride,
+                                ring_base=kv_fp8_b, warp=warp_id, record_stride=staged_kv_stride)
+                            cute.arch.sync_warp()
+                            if lane == Int32(0):
+                                cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
                         elif cutlass.const_expr(self.glm_bf16):
                             acc_nope = apply_glm_pv(acc_nope, v_codes, v_scales, sm_p_full_addr,
                                                     lane, pstride=L.sm_p_full_stride)

@@ -97,6 +97,8 @@ class UnifiedMLATraits:
     pv_bf16: bool = False
     # Indexed V4 split decode packs raw RoPE into the same 512-wide tile.
     packed_bf16_decode: bool = False
+    # Multi-chunk GLM BF16 producer runs one full raw record tile ahead.
+    glm_record_ring: bool = False
 
 
 def make_unified_traits(
